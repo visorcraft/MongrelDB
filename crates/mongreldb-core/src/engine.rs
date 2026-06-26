@@ -1,0 +1,4260 @@
+//! The engine tying the write and read paths together.
+//!
+//! Sub-ms writes: [`Db::put`] appends to the WAL **without fsyncing**, upserts
+//! the skip-list memtable, and updates the in-memory HOT index + secondary
+//! indexes. A batch-driven [`Db::commit`] does the group `fsync` and bumps the
+//! epoch. [`Db::flush`] commits, drains the memtable into an immutable sorted
+//! run, and rotates the WAL. Reads merge versions across the live memtable and
+//! all sorted runs ([`Db::get`], [`Db::visible_rows`]).
+
+use crate::columnar;
+use crate::cursor::NativePageCursor;
+use crate::encryption::Kek;
+use crate::epoch::{Epoch, EpochClock, Snapshot};
+use crate::global_idx;
+use crate::index::{AnnIndex, BitmapIndex, ColumnLearnedRange, FmIndex, HotIndex, SparseIndex};
+use crate::manifest::{self, Manifest, RunRef};
+use crate::memtable::{Memtable, Row, Value};
+use crate::mutable_run::MutableRun;
+use crate::rowid::{RowId, RowIdAllocator};
+use crate::schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
+use crate::sorted_run::{RunReader, RunWriter};
+use crate::wal::{Op, Wal};
+use crate::{MongrelError, Result};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+pub const WAL_DIR: &str = "_wal";
+pub const RUNS_DIR: &str = "_runs";
+pub const CACHE_DIR: &str = "_cache";
+pub const META_DIR: &str = "_meta";
+pub const RCACHE_DIR: &str = "_rcache";
+pub const KEYS_FILENAME: &str = "keys";
+pub const SCHEMA_FILENAME: &str = "schema.json";
+const DEFAULT_SYNC_BYTE_THRESHOLD: u64 = 0; // manual commit only (pure group commit)
+const PAGE_CACHE_CAPACITY: u64 = 64 * 1024 * 1024; // 64 MiB shared page cache
+const DECODED_CACHE_CAPACITY: u64 = 64 * 1024 * 1024; // 64 MiB shared decoded-page cache (Phase 15.4)
+/// Default byte watermark at which the PMA mutable-run tier spills to an
+/// immutable `.sr` sorted run (Phase 11.1). Coalesces many small flushes into
+/// one larger run so the read path merges fewer readers.
+const DEFAULT_MUTABLE_RUN_SPILL_BYTES: u64 = 8 * 1024 * 1024;
+
+/// An open MongrelDB table.
+pub struct Db {
+    dir: PathBuf,
+    table_id: u64,
+    wal: Wal,
+    memtable: Memtable,
+    /// PMA-backed mutable-run LSM tier (Phase 11.1). A flush drains the
+    /// memtable into this in-memory sorted tier instead of immediately writing
+    /// a `.sr` run; once it crosses `mutable_run_spill_bytes` it spills to an
+    /// immutable run. Purely in-memory — rebuilt from WAL replay on reopen.
+    mutable_run: MutableRun,
+    /// Byte watermark controlling when `mutable_run` spills to a sorted run.
+    mutable_run_spill_bytes: u64,
+    /// Zstd compression level for compaction output (Phase 18.1: default 3;
+    /// higher = better ratio but slower compaction).
+    compaction_zstd_level: i32,
+    allocator: RowIdAllocator,
+    clock: EpochClock,
+    schema: Schema,
+    hot: HotIndex,
+    /// Table Key-Encryption Key (Argon2id+HKDF from the passphrase). Each run
+    /// stores a fresh DEK wrapped by this KEK (see §7). `None` when plaintext.
+    kek: Option<Arc<Kek>>,
+    /// Per-column indexable-encryption keys + scheme (Phase 10.2) for every
+    /// ENCRYPTED_INDEXABLE column, derived deterministically from the KEK so
+    /// tokens are identical across runs. Empty when the table is plaintext.
+    column_keys: HashMap<u16, ([u8; 32], u8)>,
+    run_refs: Vec<RunRef>,
+    next_run_id: u64,
+    sync_byte_threshold: u64,
+    bitmap: HashMap<u16, BitmapIndex>,
+    ann: HashMap<u16, AnnIndex>,
+    fm: HashMap<u16, FmIndex>,
+    sparse: HashMap<u16, SparseIndex>,
+    /// Per-column learned (PGM) range indexes for `IndexKind::LearnedRange`
+    /// columns, built from the single sorted run.
+    learned_range: HashMap<u16, ColumnLearnedRange>,
+    /// Refcounted pinned read snapshots (epoch → count); compaction must not GC
+    /// versions an active snapshot still needs.
+    pinned: BTreeMap<Epoch, usize>,
+    /// Live (non-deleted) row count — maintained incrementally for O(1)
+    /// `Db::count()` without a scan.
+    pub(crate) live_count: u64,
+    /// Uniform reservoir sample of row ids for approximate analytics
+    /// (Phase 8.2). Maintained incrementally on insert; repopulated on open.
+    reservoir: crate::reservoir::Reservoir,
+    /// True once any row has been deleted. The incremental aggregate cache
+    /// (Phase 8.3) is only valid for append-only tables, so a single delete
+    /// permanently disables incremental maintenance for this table.
+    had_deletes: bool,
+    /// Incremental aggregate cache (Phase 8.3): caller-supplied key → the
+    /// mergeable aggregate state, the row-id watermark it covers, and the
+    /// epoch. A re-query after more inserts processes only the delta and merges.
+    agg_cache: HashMap<u64, CachedAgg>,
+    /// The manifest epoch the on-disk `_idx/global.idx` checkpoint covers (0 if
+    /// there is no checkpoint). Updated by [`Db::checkpoint_indexes`]; persisted
+    /// in the manifest so reopen loads the checkpoint instead of rebuilding.
+    global_idx_epoch: u64,
+    /// False when the live in-memory indexes are known to be incomplete (e.g.
+    /// after [`Db::bulk_load_columns`], which bypasses per-row indexing). A
+    /// flush in that state must NOT checkpoint; reopen rebuilds complete indexes
+    /// from the runs and resets this to true.
+    indexes_complete: bool,
+    /// Shared, MVCC content-addressed page cache (Phase 9.2). Fed by every
+    /// `RunReader::read_page` so all readers share raw (decrypted) page bytes.
+    page_cache: Arc<parking_lot::Mutex<crate::cache::PageCache>>,
+    /// Shared decoded-page cache (Phase 15.4): the post-decompress/decrypt typed
+    /// page, so repeat scans skip decode. Keyed by `(run_id, column_id, page)`.
+    decoded_cache: Arc<parking_lot::Mutex<crate::cache::DecodedPageCache>>,
+    /// Db-level result cache (Phase 19.1): `canonical_query_key(conditions,
+    /// projection, epoch)` → the survivor columns as typed `NativeColumn`s. Shared
+    /// by the native `Condition` API and (via `query_cached`) the tool-call path,
+    /// which previously had no caching (only the SQL `MongrelSession` cache did).
+    /// Hardening (c): epoch is no longer in the key; instead, a `commit()`
+    /// invalidates only entries whose footprint or condition-columns intersect
+    /// the committed mutations, tracked in `pending_delete_rids` and
+    /// `pending_put_cols`.
+    result_cache: Arc<parking_lot::Mutex<ResultCache>>,
+    /// RowIds deleted since the last `commit()` — used by fine-grained cache
+    /// invalidation to check footprint intersection.
+    pending_delete_rids: roaring::RoaringBitmap,
+    /// Column IDs touched by `put`/`put_batch` since the last `commit()` — used
+    /// by conservative insert-newly-matches invalidation.
+    pending_put_cols: std::collections::HashSet<u16>,
+}
+
+/// A cached query result — either survivor `Row`s (the tool-call/`query` path)
+/// or typed survivor columns (the pushdown/`query_columns_native` path). One
+/// canonical key maps to exactly one variant (a `query` with no projection vs a
+/// `query_columns_native` with a specific projection produce different keys), so
+/// there is no representation collision.
+enum CachedData {
+    Rows(Arc<Vec<Row>>),
+    Columns(Arc<Vec<(u16, columnar::NativeColumn)>>),
+}
+
+impl CachedData {
+    fn approx_bytes(&self) -> u64 {
+        match self {
+            CachedData::Rows(r) => r.iter().map(|r| r.estimated_bytes()).sum::<u64>(),
+            CachedData::Columns(c) => c
+                .iter()
+                .map(|(_, c)| c.approx_bytes())
+                .sum::<u64>()
+                .saturating_add(c.len() as u64 * 16),
+        }
+    }
+}
+
+/// A cached entry carrying the survivor `RowId` **footprint** (for precise
+/// delete-based invalidation) and the condition column IDs (for conservative
+/// insert-based invalidation). Hardening (c).
+struct CachedEntry {
+    data: CachedData,
+    footprint: roaring::RoaringBitmap,
+    condition_cols: Vec<u16>,
+}
+
+/// Size-bounded **access-order LRU** result cache (Phase 19.1 + hardening (a)).
+/// Every `get_*` promotes the key to the back (most-recently-used); eviction
+/// pops from the front (least-recently-used) — a true LRU, not FIFO.
+///
+/// Hardening (b): an optional on-disk persistent tier (`dir = Some(_)`). On a
+/// memory miss, the cache tries disk before falling through to re-resolution.
+/// On `insert`, the entry is also written to disk atomically (write + fsync +
+/// rename). On `invalidate`/`clear`, the matching disk files are deleted. On
+/// `Db::open`, existing disk entries are pre-loaded so fine-grained invalidation
+/// resumes across restart.
+struct ResultCache {
+    entries: std::collections::HashMap<u64, CachedEntry>,
+    order: std::collections::VecDeque<u64>,
+    bytes: u64,
+    max_bytes: u64,
+    dir: Option<std::path::PathBuf>,
+}
+
+/// Serialised form of a [`CachedEntry`] for the persistent on-disk tier (b).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SerializedEntry {
+    condition_cols: Vec<u16>,
+    footprint_bits: Vec<u32>,
+    data: SerializedData,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+enum SerializedData {
+    Rows(Vec<Row>),
+    Columns(Vec<(u16, columnar::NativeColumn)>),
+}
+
+impl SerializedEntry {
+    fn from_entry(entry: &CachedEntry) -> Self {
+        let footprint_bits: Vec<u32> = entry.footprint.iter().collect();
+        let data = match &entry.data {
+            CachedData::Rows(r) => SerializedData::Rows((**r).clone()),
+            CachedData::Columns(c) => SerializedData::Columns((**c).clone()),
+        };
+        Self {
+            condition_cols: entry.condition_cols.clone(),
+            footprint_bits,
+            data,
+        }
+    }
+
+    fn into_entry(self) -> Option<CachedEntry> {
+        let footprint: roaring::RoaringBitmap = self.footprint_bits.into_iter().collect();
+        let data = match self.data {
+            SerializedData::Rows(r) => CachedData::Rows(Arc::new(r)),
+            SerializedData::Columns(c) => {
+                // Validate deserialized columns (hardening (b)): reject corrupt
+                // data instead of panicking on access.
+                if !c.iter().all(|(_, col)| col.validate()) {
+                    return None;
+                }
+                CachedData::Columns(Arc::new(c))
+            }
+        };
+        Some(CachedEntry {
+            data,
+            footprint,
+            condition_cols: self.condition_cols,
+        })
+    }
+}
+
+impl ResultCache {
+    const DEFAULT_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+    fn new() -> Self {
+        Self::with_max_bytes(Self::DEFAULT_MAX_BYTES)
+    }
+
+    fn with_max_bytes(max_bytes: u64) -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            bytes: 0,
+            max_bytes,
+            dir: None,
+        }
+    }
+
+    fn with_dir(mut self, dir: std::path::PathBuf) -> Self {
+        let _ = std::fs::create_dir_all(&dir);
+        self.dir = Some(dir);
+        self
+    }
+
+    fn disk_path(&self, key: u64) -> Option<std::path::PathBuf> {
+        self.dir.as_ref().map(|d| d.join(format!("{key:016x}.bin")))
+    }
+
+    /// Atomically write `entry` to disk (write + rename). Best-effort: silently
+    /// ignores I/O errors (the in-memory cache is authoritative; the cache is
+    /// disposable — missing/stale files fall through to re-resolution).
+    fn store_to_disk(&self, key: u64, entry: &CachedEntry) {
+        let Some(path) = self.disk_path(key) else {
+            return;
+        };
+        let serialized = match bincode::serialize(&SerializedEntry::from_entry(entry)) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let tmp = path.with_extension("tmp");
+        use std::io::Write;
+        let write = || -> std::io::Result<()> {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&serialized)?;
+            f.flush()?;
+            Ok(())
+        };
+        if write().is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return;
+        }
+        let _ = std::fs::rename(&tmp, &path);
+    }
+
+    /// Try loading `key` from disk. Returns `None` on miss or error.
+    fn load_from_disk(&self, key: u64) -> Option<CachedEntry> {
+        let path = self.disk_path(key)?;
+        let bytes = std::fs::read(&path).ok()?;
+        let serialized: SerializedEntry = bincode::deserialize(&bytes).ok()?;
+        serialized.into_entry()
+    }
+
+    /// Delete the on-disk file for `key` if it exists. Best-effort.
+    fn remove_from_disk(&self, key: u64) {
+        if let Some(path) = self.disk_path(key) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// Scan the cache directory and pre-load all entries into memory. Called
+    /// once on `Db::open`. Best-effort: corrupt/unreadable files are deleted.
+    fn load_persistent(&mut self) {
+        let Some(dir) = self.dir.as_ref().cloned() else {
+            return;
+        };
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // Clean up orphan .tmp files from crashed store_to_disk calls.
+            if path.extension().and_then(|e| e.to_str()) == Some("tmp") {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("bin") {
+                continue;
+            }
+            let stem = match path.file_stem().and_then(|s| s.to_str()) {
+                Some(s) => s,
+                None => continue,
+            };
+            let key = match u64::from_str_radix(stem, 16) {
+                Ok(k) => k,
+                Err(_) => continue,
+            };
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            match bincode::deserialize::<SerializedEntry>(&bytes) {
+                Ok(serialized) => {
+                    if let Some(entry) = serialized.into_entry() {
+                        self.bytes = self.bytes.saturating_add(entry.data.approx_bytes());
+                        self.entries.insert(key, entry);
+                        self.order.push_back(key);
+                    } else {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+                Err(_) => {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+        self.evict();
+    }
+
+    fn set_max_bytes(&mut self, max_bytes: u64) {
+        self.max_bytes = max_bytes;
+        self.evict();
+    }
+
+    /// Promote `key` to most-recently-used position (back of the deque).
+    fn touch(&mut self, key: u64) {
+        self.order.retain(|k| *k != key);
+        self.order.push_back(key);
+    }
+
+    fn get_rows(&mut self, key: u64) -> Option<Arc<Vec<Row>>> {
+        let res = self.entries.get(&key).and_then(|e| match &e.data {
+            CachedData::Rows(r) => Some(r.clone()),
+            CachedData::Columns(_) => None,
+        });
+        if res.is_some() {
+            self.touch(key);
+            return res;
+        }
+        // Memory miss → try the persistent tier (b).
+        if let Some(entry) = self.load_from_disk(key) {
+            let res = match &entry.data {
+                CachedData::Rows(r) => Some(r.clone()),
+                CachedData::Columns(_) => None,
+            };
+            if res.is_some() {
+                let approx = entry.data.approx_bytes();
+                self.bytes = self.bytes.saturating_add(approx);
+                self.entries.insert(key, entry);
+                self.order.push_back(key);
+                self.evict();
+                return res;
+            }
+        }
+        None
+    }
+
+    fn get_columns(&mut self, key: u64) -> Option<Arc<Vec<(u16, columnar::NativeColumn)>>> {
+        let res = self.entries.get(&key).and_then(|e| match &e.data {
+            CachedData::Columns(c) => Some(c.clone()),
+            CachedData::Rows(_) => None,
+        });
+        if res.is_some() {
+            self.touch(key);
+            return res;
+        }
+        // Memory miss → try the persistent tier (b).
+        if let Some(entry) = self.load_from_disk(key) {
+            let res = match &entry.data {
+                CachedData::Columns(c) => Some(c.clone()),
+                CachedData::Rows(_) => None,
+            };
+            if res.is_some() {
+                let approx = entry.data.approx_bytes();
+                self.bytes = self.bytes.saturating_add(approx);
+                self.entries.insert(key, entry);
+                self.order.push_back(key);
+                self.evict();
+                return res;
+            }
+        }
+        None
+    }
+
+    fn insert(&mut self, key: u64, entry: CachedEntry) {
+        let approx = entry.data.approx_bytes();
+        if self.entries.remove(&key).is_some() {
+            self.order.retain(|k| *k != key);
+            self.bytes = self.entries.values().map(|e| e.data.approx_bytes()).sum();
+        }
+        // Write to the persistent tier (b) before memory insert.
+        self.store_to_disk(key, &entry);
+        self.bytes = self.bytes.saturating_add(approx);
+        self.entries.insert(key, entry);
+        self.order.push_back(key);
+        self.evict();
+    }
+
+    /// Fine-grained invalidation (hardening (c)). Drop only entries that are
+    /// actually affected by the committed mutations:
+    /// - **Delete path**: if `delete_rids` intersects an entry's footprint, a
+    ///   survivor was deleted → stale. If the footprint is empty (multi-run or
+    ///   non-empty memtable — we couldn't resolve it), **any** delete
+    ///   conservatively invalidates the entry (correctness over precision).
+    /// - **Insert path**: if `put_cols` intersects an entry's `condition_cols`,
+    ///   a newly-inserted row might match the query → conservatively stale.
+    fn invalidate(
+        &mut self,
+        delete_rids: &roaring::RoaringBitmap,
+        put_cols: &std::collections::HashSet<u16>,
+    ) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let has_deletes = !delete_rids.is_empty();
+        let to_remove: std::collections::HashSet<u64> = self
+            .entries
+            .iter()
+            .filter(|(_, e)| {
+                let delete_hit = if e.footprint.is_empty() {
+                    has_deletes
+                } else {
+                    e.footprint.intersection_len(delete_rids) > 0
+                };
+                let col_hit = e.condition_cols.iter().any(|c| put_cols.contains(c));
+                delete_hit || col_hit
+            })
+            .map(|(&k, _)| k)
+            .collect();
+        for key in &to_remove {
+            if let Some(e) = self.entries.remove(key) {
+                self.bytes = self.bytes.saturating_sub(e.data.approx_bytes());
+            }
+            self.remove_from_disk(*key);
+        }
+        if !to_remove.is_empty() {
+            self.order.retain(|k| !to_remove.contains(k));
+        }
+    }
+
+    fn clear(&mut self) {
+        // Delete all persistent files (b).
+        if let Some(dir) = &self.dir {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|e| e.to_str()) == Some("bin") {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            }
+        }
+        self.entries.clear();
+        self.order.clear();
+        self.bytes = 0;
+    }
+
+    fn evict(&mut self) {
+        while self.bytes > self.max_bytes {
+            let Some(k) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(e) = self.entries.remove(&k) {
+                self.bytes = self.bytes.saturating_sub(e.data.approx_bytes());
+                // Also delete the disk file (hardening (b)): an evicted entry's
+                // disk file must not survive, or invalidate() — which only scans
+                // in-memory entries — would miss it and allow a stale disk hit.
+                self.remove_from_disk(k);
+            }
+        }
+    }
+}
+
+/// Derive per-column indexable-encryption keys (Phase 10.2) for every
+/// ENCRYPTED_INDEXABLE column from the KEK. Scheme is `OPE_RANGE` if the column
+/// has a `LearnedRange` index, else `HMAC_EQ` (equality). Keys are derived
+/// deterministically from the KEK so tokens are stable across runs. Empty when
+/// the table is plaintext (no KEK).
+fn build_column_keys(kek: Option<&Kek>, schema: &Schema) -> HashMap<u16, ([u8; 32], u8)> {
+    let Some(kek) = kek else {
+        return HashMap::new();
+    };
+    #[cfg(feature = "encryption")]
+    {
+        use crate::encryption::{SCHEME_HMAC_EQ, SCHEME_OPE_RANGE};
+        schema
+            .columns
+            .iter()
+            .filter(|c| c.flags.contains(ColumnFlags::ENCRYPTED_INDEXABLE))
+            .map(|c| {
+                let scheme = if schema
+                    .indexes
+                    .iter()
+                    .any(|i| i.column_id == c.id && i.kind == IndexKind::LearnedRange)
+                {
+                    SCHEME_OPE_RANGE
+                } else {
+                    SCHEME_HMAC_EQ
+                };
+                let key: [u8; 32] = *kek.derive_column_key(c.id);
+                (c.id, (key, scheme))
+            })
+            .collect()
+    }
+    #[cfg(not(feature = "encryption"))]
+    {
+        let _ = (kek, schema);
+        HashMap::new()
+    }
+}
+
+impl Db {
+    pub fn create(dir: impl AsRef<Path>, schema: Schema, table_id: u64) -> Result<Self> {
+        Self::create_inner(dir, schema, table_id, None)
+    }
+
+    /// Create a new encrypted table, deriving the table Key-Encryption Key
+    /// (KEK) from `passphrase` via Argon2id + HKDF (§7). A fresh random salt is
+    /// generated and persisted under `_meta/keys` so the same passphrase
+    /// recreates the KEK on reopen. Each run gets its own wrapped DEK.
+    ///
+    /// **Scope (§7):** encryption is *page-granular* — only sorted-run page
+    /// payloads are encrypted. The live WAL (`_wal/`) holds rows as plaintext
+    /// between `put` and `flush`; call `flush()` (which rotates the WAL) before
+    /// treating sensitive data as fully at-rest-protected. Full WAL encryption
+    /// is deferred.
+    #[cfg(feature = "encryption")]
+    pub fn create_encrypted(
+        dir: impl AsRef<Path>,
+        schema: Schema,
+        table_id: u64,
+        passphrase: &str,
+    ) -> Result<Self> {
+        let dir = dir.as_ref();
+        std::fs::create_dir_all(dir.join(META_DIR))?;
+        let salt = crate::encryption::random_salt();
+        std::fs::write(dir.join(META_DIR).join(KEYS_FILENAME), salt)?;
+        let kek: Arc<Kek> = Arc::new(Kek::derive(passphrase, &salt)?);
+        Self::create_inner(dir, schema, table_id, Some(kek))
+    }
+
+    fn create_inner(
+        dir: impl AsRef<Path>,
+        schema: Schema,
+        table_id: u64,
+        kek: Option<Arc<Kek>>,
+    ) -> Result<Self> {
+        let dir = dir.as_ref().to_path_buf();
+        std::fs::create_dir_all(dir.join(WAL_DIR))?;
+        std::fs::create_dir_all(dir.join(RUNS_DIR))?;
+        write_schema(&dir, &schema)?;
+        let mut wal = Wal::create(dir.join(WAL_DIR).join("seg-000000.wal"), Epoch(0))?;
+        wal.set_sync_byte_threshold(DEFAULT_SYNC_BYTE_THRESHOLD);
+        let mut manifest = Manifest::new(table_id, schema.schema_id);
+        manifest::write_atomic(&dir, &mut manifest)?;
+        let (bitmap, ann, fm, sparse) = empty_indexes(&schema);
+        let column_keys = build_column_keys(kek.as_deref(), &schema);
+        let cache_dir = dir.join(CACHE_DIR);
+        let rcache_dir = dir.join(RCACHE_DIR);
+        Ok(Self {
+            dir,
+            table_id,
+            wal,
+            memtable: Memtable::new(),
+            mutable_run: MutableRun::new(),
+            mutable_run_spill_bytes: DEFAULT_MUTABLE_RUN_SPILL_BYTES,
+            compaction_zstd_level: 3,
+            allocator: RowIdAllocator::new(0),
+            clock: EpochClock::new(0),
+            schema,
+            hot: HotIndex::new(),
+            kek,
+            column_keys,
+            run_refs: Vec::new(),
+            next_run_id: 1,
+            sync_byte_threshold: DEFAULT_SYNC_BYTE_THRESHOLD,
+            bitmap,
+            ann,
+            fm,
+            sparse,
+            learned_range: HashMap::new(),
+            pinned: BTreeMap::new(),
+            live_count: 0,
+            reservoir: crate::reservoir::Reservoir::default(),
+            had_deletes: false,
+            agg_cache: HashMap::new(),
+            global_idx_epoch: 0,
+            indexes_complete: true,
+            page_cache: Arc::new(parking_lot::Mutex::new(
+                crate::cache::PageCache::new(PAGE_CACHE_CAPACITY).with_persistence(cache_dir),
+            )),
+            decoded_cache: Arc::new(parking_lot::Mutex::new(
+                crate::cache::DecodedPageCache::new(DECODED_CACHE_CAPACITY),
+            )),
+            result_cache: Arc::new(parking_lot::Mutex::new(
+                ResultCache::new().with_dir(rcache_dir),
+            )),
+            pending_delete_rids: roaring::RoaringBitmap::new(),
+            pending_put_cols: std::collections::HashSet::new(),
+        })
+    }
+
+    /// Open an existing table: load the manifest, replay the active WAL segment
+    /// into the memtable, and rebuild the HOT + secondary indexes from the runs
+    /// and replayed rows.
+    pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_cipher(dir, None)
+    }
+
+    /// Open an existing encrypted table. `passphrase` must match the one used at
+    /// create time (combined with the persisted salt to re-derive the KEK).
+    #[cfg(feature = "encryption")]
+    pub fn open_encrypted(dir: impl AsRef<Path>, passphrase: &str) -> Result<Self> {
+        let dir = dir.as_ref();
+        let salt_path = dir.join(META_DIR).join(KEYS_FILENAME);
+        let salt_bytes = std::fs::read(&salt_path).map_err(|e| {
+            MongrelError::NotFound(format!(
+                "encryption salt file {:?}: {e} (table not encrypted, or corrupted)",
+                salt_path
+            ))
+        })?;
+        let salt_len = crate::encryption::SALT_LEN;
+        if salt_bytes.len() != salt_len {
+            return Err(MongrelError::InvalidArgument(format!(
+                "encryption salt is {} bytes, expected {salt_len}",
+                salt_bytes.len()
+            )));
+        }
+        let mut salt = [0u8; 16];
+        salt.copy_from_slice(&salt_bytes);
+        let kek: Arc<Kek> = Arc::new(Kek::derive(passphrase, &salt)?);
+        Self::open_with_cipher(dir, Some(kek))
+    }
+
+    fn open_with_cipher(dir: impl AsRef<Path>, kek: Option<Arc<Kek>>) -> Result<Self> {
+        let dir = dir.as_ref().to_path_buf();
+        let manifest = manifest::read(&dir)?;
+        let schema: Schema = read_schema(&dir)?;
+        let active = latest_wal_segment(&dir.join(WAL_DIR))?;
+        let replay_epoch = Epoch(manifest.current_epoch);
+        // Replay BEFORE truncating: `Wal::create` would erase the segment.
+        let replayed = match &active {
+            Some(path) => crate::wal::replay(path)?,
+            None => Vec::new(),
+        };
+        let mut wal = match &active {
+            Some(path) => Wal::create(path, replay_epoch)?,
+            None => Wal::create(dir.join(WAL_DIR).join("seg-000000.wal"), replay_epoch)?,
+        };
+        wal.set_sync_byte_threshold(DEFAULT_SYNC_BYTE_THRESHOLD);
+
+        let mut memtable = Memtable::new();
+        let mut allocator = RowIdAllocator::new(manifest.next_row_id);
+        let clock = EpochClock::new(manifest.current_epoch);
+
+        // 1. Apply the replayed records to the memtable + allocator, collecting
+        //    the Put rows for index insertion. Indexing happens AFTER loading
+        //    any checkpoint / run data (below) so the newer replayed versions
+        //    overwrite the older run versions in the HOT index.
+        let mut replayed_puts: Vec<Row> = Vec::new();
+        let mut saw_delete = false;
+        for record in replayed {
+            match record.op {
+                Op::Put { rows, .. } => {
+                    let rows: Vec<Row> = bincode::deserialize(&rows)?;
+                    for row in rows {
+                        allocator.advance_to(row.row_id);
+                        memtable.upsert(row.clone());
+                        replayed_puts.push(row);
+                    }
+                }
+                Op::Delete { epoch, row_ids, .. } => {
+                    saw_delete = true;
+                    for rid in row_ids {
+                        memtable.tombstone(rid, epoch);
+                    }
+                }
+                Op::TruncateTable { .. } => {}
+                Op::Flush { .. } => {}
+            }
+        }
+
+        let cache_dir = dir.join(CACHE_DIR);
+        let rcache_dir = dir.join(RCACHE_DIR);
+        let column_keys = build_column_keys(kek.as_deref(), &schema);
+        let mut db = Self {
+            dir,
+            table_id: manifest.table_id,
+            wal,
+            memtable,
+            mutable_run: MutableRun::new(),
+            mutable_run_spill_bytes: DEFAULT_MUTABLE_RUN_SPILL_BYTES,
+            compaction_zstd_level: 3,
+            allocator,
+            clock,
+            schema,
+            hot: HotIndex::new(),
+            kek,
+            column_keys,
+            run_refs: manifest.runs.clone(),
+            next_run_id: manifest
+                .runs
+                .iter()
+                .map(|r| r.run_id as u64 + 1)
+                .max()
+                .unwrap_or(1),
+            sync_byte_threshold: DEFAULT_SYNC_BYTE_THRESHOLD,
+            bitmap: HashMap::new(),
+            ann: HashMap::new(),
+            fm: HashMap::new(),
+            sparse: HashMap::new(),
+            learned_range: HashMap::new(),
+            pinned: BTreeMap::new(),
+            live_count: manifest.live_count,
+            reservoir: crate::reservoir::Reservoir::default(),
+            had_deletes: saw_delete,
+            agg_cache: HashMap::new(),
+            global_idx_epoch: manifest.global_idx_epoch,
+            indexes_complete: true,
+            page_cache: Arc::new(parking_lot::Mutex::new(
+                crate::cache::PageCache::new(PAGE_CACHE_CAPACITY).with_persistence(cache_dir),
+            )),
+            decoded_cache: Arc::new(parking_lot::Mutex::new(
+                crate::cache::DecodedPageCache::new(DECODED_CACHE_CAPACITY),
+            )),
+            result_cache: Arc::new(parking_lot::Mutex::new(
+                ResultCache::new().with_dir(rcache_dir),
+            )),
+            pending_delete_rids: roaring::RoaringBitmap::new(),
+            pending_put_cols: std::collections::HashSet::new(),
+        };
+
+        // 2. Fast path: load the persisted global-index checkpoint (Phase 9.1).
+        //    Valid only when its embedded epoch matches the manifest-endorsed
+        //    `global_idx_epoch` and every run was created at or before it, so the
+        //    checkpoint covers all run data. Otherwise rebuild from the runs.
+        let checkpoint = global_idx::read(&db.dir)?;
+        let checkpoint_valid = checkpoint.as_ref().is_some_and(|c| {
+            c.epoch_built == manifest.global_idx_epoch
+                && manifest.global_idx_epoch > 0
+                && manifest
+                    .runs
+                    .iter()
+                    .all(|r| r.epoch_created <= manifest.global_idx_epoch)
+        });
+        if let Some(loaded) = checkpoint {
+            if checkpoint_valid {
+                db.hot = loaded.hot;
+                db.bitmap = loaded.bitmap;
+                db.ann = loaded.ann;
+                db.fm = loaded.fm;
+                db.sparse = loaded.sparse;
+                db.learned_range = loaded.learned_range;
+            }
+        }
+        if !checkpoint_valid {
+            let (bitmap, ann, fm, sparse) = empty_indexes(&db.schema);
+            db.bitmap = bitmap;
+            db.ann = ann;
+            db.fm = fm;
+            db.sparse = sparse;
+            db.rebuild_indexes_from_runs()?;
+            db.build_learned_ranges()?;
+        }
+
+        // 3. Index the replayed (newest) WAL rows on top so updates overwrite.
+        for row in &replayed_puts {
+            db.index_row(row);
+        }
+
+        let _ = db.rebuild_reservoir();
+        // Load the persistent result-cache tier (hardening (b)) so fine-grained
+        // invalidation resumes across restart.
+        db.result_cache.lock().load_persistent();
+        Ok(db)
+    }
+
+    /// Repopulate the reservoir sample from all visible rows (used on open so a
+    /// reopened table has an analytics sample without further inserts).
+    fn rebuild_reservoir(&mut self) -> Result<()> {
+        let snap = self.snapshot();
+        let rows = self.visible_rows(snap)?;
+        self.reservoir.reset();
+        for r in rows {
+            self.reservoir.offer(r.row_id.0);
+        }
+        Ok(())
+    }
+
+    fn rebuild_indexes_from_runs(&mut self) -> Result<()> {
+        let snapshot = Epoch(u64::MAX);
+        for rr in self.run_refs.clone() {
+            let mut reader = self.open_reader(rr.run_id)?;
+            for row in reader.visible_versions(snapshot)? {
+                let tok_row = self.tokenized_for_indexes(&row);
+                index_into(
+                    &self.schema,
+                    &tok_row,
+                    &mut self.hot,
+                    &mut self.bitmap,
+                    &mut self.ann,
+                    &mut self.fm,
+                    &mut self.sparse,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// (Re)build per-column learned (PGM) range indexes for `LearnedRange`
+    /// columns from the single sorted run. Serves `Condition::Range` sub-linearly
+    /// on the fast path; no-op when there isn't exactly one run.
+    pub(crate) fn build_learned_ranges(&mut self) -> Result<()> {
+        self.learned_range.clear();
+        if self.run_refs.len() != 1 {
+            return Ok(());
+        }
+        let cols: Vec<u16> = self
+            .schema
+            .indexes
+            .iter()
+            .filter(|i| i.kind == IndexKind::LearnedRange)
+            .map(|i| i.column_id)
+            .collect();
+        if cols.is_empty() {
+            return Ok(());
+        }
+        let mut reader = self.open_reader(self.run_refs[0].run_id)?;
+        let row_ids: Vec<u64> = match reader.column_native(crate::sorted_run::SYS_ROW_ID)? {
+            columnar::NativeColumn::Int64 { data, .. } => data.iter().map(|x| *x as u64).collect(),
+            _ => return Ok(()),
+        };
+        for cid in cols {
+            let ty = self
+                .schema
+                .columns
+                .iter()
+                .find(|c| c.id == cid)
+                .map(|c| c.ty)
+                .unwrap_or(TypeId::Int64);
+            match ty {
+                TypeId::Int64 | TypeId::TimestampNanos | TypeId::Date32 => {
+                    if let columnar::NativeColumn::Int64 { data, .. } = reader.column_native(cid)? {
+                        let pairs: Vec<(i64, u64)> = data
+                            .iter()
+                            .zip(row_ids.iter())
+                            .map(|(v, r)| (*v, *r))
+                            .collect();
+                        self.learned_range
+                            .insert(cid, ColumnLearnedRange::build_i64(&pairs));
+                    }
+                }
+                TypeId::Float64 => {
+                    if let columnar::NativeColumn::Float64 { data, .. } =
+                        reader.column_native(cid)?
+                    {
+                        let pairs: Vec<(f64, u64)> = data
+                            .iter()
+                            .zip(row_ids.iter())
+                            .map(|(v, r)| (*v, *r))
+                            .collect();
+                        self.learned_range
+                            .insert(cid, ColumnLearnedRange::build_f64(&pairs));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Phase 14.7: if the live indexes are known incomplete (after a bulk
+    /// ingest that deferred index building), rebuild them from the runs now.
+    /// Called lazily by `query` / `query_columns_native` / `flush`.
+    fn ensure_indexes_complete(&mut self) -> Result<()> {
+        if self.indexes_complete {
+            return Ok(());
+        }
+        self.rebuild_indexes_from_runs()?;
+        self.build_learned_ranges()?;
+        self.indexes_complete = true;
+        let epoch = self.current_epoch();
+        self.checkpoint_indexes(epoch);
+        Ok(())
+    }
+
+    fn pending_epoch(&self) -> Epoch {
+        Epoch(self.clock.now().0 + 1)
+    }
+
+    /// Upsert a row. Allocates a [`RowId`], appends a (non-fsynced) WAL record,
+    /// and updates the memtable + indexes. Returns the new row id. Durability
+    /// arrives at the next [`Db::commit`] (or [`Db::flush`]).
+    pub fn put(&mut self, columns: Vec<(u16, Value)>) -> Result<RowId> {
+        let row_id = self.allocator.alloc();
+        let epoch = self.pending_epoch();
+        let mut row = Row::new(row_id, epoch);
+        for (col_id, val) in columns {
+            row.columns.insert(col_id, val);
+        }
+        self.commit_rows(vec![row])?;
+        Ok(row_id)
+    }
+
+    /// Bulk upsert: many rows under a single WAL record + one index pass. Far
+    /// cheaper than `put` in a loop for batch ingest.
+    pub fn put_batch(&mut self, batch: Vec<Vec<(u16, Value)>>) -> Result<Vec<RowId>> {
+        let epoch = self.pending_epoch();
+        let mut rows = Vec::with_capacity(batch.len());
+        let mut ids = Vec::with_capacity(batch.len());
+        for cols in batch {
+            let row_id = self.allocator.alloc();
+            let mut row = Row::new(row_id, epoch);
+            for (c, v) in cols {
+                row.columns.insert(c, v);
+            }
+            ids.push(row_id);
+            rows.push(row);
+        }
+        self.commit_rows(rows)?;
+        Ok(ids)
+    }
+
+    /// Append `rows` (all sharing the pending epoch) under one WAL record, index
+    /// them, and fold them into the memtable.
+    fn commit_rows(&mut self, rows: Vec<Row>) -> Result<()> {
+        let n = rows.len();
+        // Track mutated columns for fine-grained cache invalidation (c).
+        for r in &rows {
+            for &cid in r.columns.keys() {
+                self.pending_put_cols.insert(cid);
+            }
+        }
+        let payload = bincode::serialize(&rows)?;
+        self.wal.append(Op::Put {
+            table_id: self.table_id,
+            rows: payload,
+        })?;
+        if let Some(pk_col) = self.schema.primary_key() {
+            for r in &rows {
+                if let Some(pk_val) = r.columns.get(&pk_col.id) {
+                    let key = self.index_lookup_key(pk_col.id, pk_val);
+                    self.hot.insert(key, r.row_id);
+                }
+            }
+        } else {
+            for r in &rows {
+                self.hot.insert(r.row_id.0.to_be_bytes().to_vec(), r.row_id);
+            }
+        }
+        for r in &rows {
+            self.index_row(r);
+        }
+        for r in &rows {
+            self.reservoir.offer(r.row_id.0);
+        }
+        for r in rows {
+            self.memtable.upsert(r);
+        }
+        self.live_count = self.live_count.saturating_add(n as u64);
+        Ok(())
+    }
+
+    /// Logically delete `row_id` (effective at the next commit).
+    pub fn delete(&mut self, row_id: RowId) -> Result<()> {
+        let epoch = self.pending_epoch();
+        self.wal.append(Op::Delete {
+            table_id: self.table_id,
+            epoch,
+            row_ids: vec![row_id],
+        })?;
+        self.memtable.tombstone(row_id, epoch);
+        self.live_count = self.live_count.saturating_sub(1);
+        // Track for fine-grained cache invalidation (c).
+        self.pending_delete_rids.insert(row_id.0 as u32);
+        // A delete makes the incremental aggregate cache (row-id watermark
+        // delta) unsafe — permanently disable it for this table.
+        self.had_deletes = true;
+        self.agg_cache.clear();
+        Ok(())
+    }
+
+    fn index_row(&mut self, row: &Row) {
+        if row.deleted {
+            return;
+        }
+        let effective_row = self.tokenized_for_indexes(row);
+        index_into(
+            &self.schema,
+            &effective_row,
+            &mut self.hot,
+            &mut self.bitmap,
+            &mut self.ann,
+            &mut self.fm,
+            &mut self.sparse,
+        );
+    }
+
+    /// Produce the row view that indexes should see. For ENCRYPTED_INDEXABLE
+    /// equality (HMAC-eq) columns the plaintext value is replaced by its token,
+    /// so the bitmap/HOT indexes store tokens. OPE-range columns keep their raw
+    /// value (their range index is rebuilt from runs over plaintext). Plaintext
+    /// tables return the row unchanged.
+    fn tokenized_for_indexes(&self, row: &Row) -> Row {
+        if self.column_keys.is_empty() {
+            return row.clone();
+        }
+        #[cfg(feature = "encryption")]
+        {
+            use crate::encryption::SCHEME_HMAC_EQ;
+            let mut tok = row.clone();
+            for (&cid, &(_, scheme)) in &self.column_keys {
+                if scheme != SCHEME_HMAC_EQ {
+                    continue;
+                }
+                if let Some(v) = tok.columns.get(&cid).cloned() {
+                    if let Some(t) = self.tokenize_value(cid, &v) {
+                        tok.columns.insert(cid, t);
+                    }
+                }
+            }
+            tok
+        }
+        #[cfg(not(feature = "encryption"))]
+        {
+            row.clone()
+        }
+    }
+
+    /// Group-commit: fsync the WAL, advance the epoch so all pending writes
+    /// become durable and visible, and persist the manifest.
+    pub fn commit(&mut self) -> Result<Epoch> {
+        self.wal.sync()?;
+        let new_epoch = self.clock.bump();
+        // Hardening (c): fine-grained invalidation replaces the whole-cache
+        // wipe. Only entries whose footprint intersects a deleted RowId, or
+        // whose condition-columns intersect a mutated column, are dropped.
+        self.result_cache
+            .lock()
+            .invalidate(&self.pending_delete_rids, &self.pending_put_cols);
+        self.pending_delete_rids.clear();
+        self.pending_put_cols.clear();
+        self.persist_manifest(new_epoch)?;
+        Ok(new_epoch)
+    }
+
+    /// Commit, then drain the memtable into the mutable-run LSM tier (Phase
+    /// 11.1). The tier absorbs flushes in place and only spills to an immutable
+    /// `.sr` sorted run once it crosses the spill watermark — coalescing many
+    /// small flushes into fewer, larger runs. While the tier holds un-spilled
+    /// data the WAL is **not** rotated: the Flush marker / WAL rotation is
+    /// deferred until the data is durably in a run, so crash recovery replays
+    /// those rows back into the memtable (the tier rebuilds from replay).
+    pub fn flush(&mut self) -> Result<Epoch> {
+        self.ensure_indexes_complete()?;
+        let epoch = self.commit()?;
+        let rows = self.memtable.drain_sorted();
+        if !rows.is_empty() {
+            self.mutable_run.insert_many(rows);
+        }
+        if self.mutable_run.approx_bytes() >= self.mutable_run_spill_bytes {
+            self.spill_mutable_run(epoch)?;
+            // The tier is now empty and its data is durably in a run → safe to
+            // mark the WAL flushed and rotate to a fresh segment.
+            self.wal.append(Op::Flush { last_seq: epoch })?;
+            self.wal.sync()?;
+            self.rotate_wal(epoch)?;
+            self.persist_manifest(epoch)?;
+            self.build_learned_ranges()?;
+            // Memtable is drained and runs are stable → checkpoint the indexes so
+            // the next open skips the full run scan (Phase 9.1).
+            self.checkpoint_indexes(epoch);
+        }
+        // else: data coalesced in the in-memory tier; the WAL still covers it
+        // and the manifest epoch was already persisted by `commit`.
+        Ok(epoch)
+    }
+
+    /// Spill the mutable-run tier to a new immutable level-0 sorted run. The
+    /// caller owns the Flush-marker / WAL-rotation / manifest steps (only valid
+    /// once all in-flight data is in runs). No-op when the tier is empty.
+    fn spill_mutable_run(&mut self, epoch: Epoch) -> Result<()> {
+        let rows = self.mutable_run.drain_sorted();
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let run_id = self.next_run_id;
+        self.next_run_id += 1;
+        let path = self.run_path(run_id);
+        let mut writer = RunWriter::new(&self.schema, run_id as u128, epoch, 0);
+        if let Some(kek) = &self.kek {
+            writer = writer.with_encryption(kek.as_ref(), self.indexable_column_specs());
+        }
+        let header = writer.write(&path, &rows)?;
+        self.run_refs.push(RunRef {
+            run_id: run_id as u128,
+            level: 0,
+            epoch_created: epoch.0,
+            row_count: header.row_count,
+        });
+        Ok(())
+    }
+
+    /// Tune the mutable-run spill watermark (bytes). A smaller threshold spills
+    /// sooner (more, smaller runs — closer to the pre-Phase-11.1 behavior); a
+    /// larger one coalesces more flushes in memory.
+    pub fn set_mutable_run_spill_bytes(&mut self, bytes: u64) {
+        self.mutable_run_spill_bytes = bytes.max(1);
+    }
+
+    /// Set the zstd compression level for compaction output (Phase 18.1).
+    /// Default 3; higher values give better compression ratio at the cost of
+    /// slower compaction.
+    pub fn set_compaction_zstd_level(&mut self, level: i32) {
+        self.compaction_zstd_level = level;
+    }
+
+    /// Set the result-cache byte budget (Phase 19.1 hardening (a)). Entries are
+    /// evicted in access-order LRU past this limit. Takes effect immediately
+    /// (may evict entries if the new limit is smaller than the current footprint).
+    pub fn set_result_cache_max_bytes(&mut self, max_bytes: u64) {
+        self.result_cache.lock().set_max_bytes(max_bytes);
+    }
+
+    /// Drop every cached result (used by compaction, schema evolution, and bulk
+    /// load — paths that change run layout or data without going through the
+    /// fine-grained `pending_*` tracking).
+    pub(crate) fn clear_result_cache(&mut self) {
+        self.result_cache.lock().clear();
+    }
+
+    /// Number of versions currently held in the mutable-run tier.
+    pub fn mutable_run_len(&self) -> usize {
+        self.mutable_run.len()
+    }
+
+    /// Drain every version from the mutable-run tier (ascending `(RowId,
+    /// Epoch)` order). Used by compaction to fold the tier into its merge.
+    pub(crate) fn drain_mutable_run(&mut self) -> Vec<Row> {
+        self.mutable_run.drain_sorted()
+    }
+
+    /// Bulk-load: write `batch` directly to a new sorted run, bypassing the WAL
+    /// and the memtable entirely (no per-row bincode, no skip-list inserts). The
+    /// run + a rotated WAL + the manifest are fsynced once — the fast ingest
+    /// path for large analytical loads. Indexes are still maintained.
+    pub fn bulk_load(&mut self, batch: Vec<Vec<(u16, Value)>>) -> Result<Epoch> {
+        let epoch = self.commit()?;
+        let n = batch.len();
+        if n == 0 {
+            return Ok(epoch);
+        }
+        // Spill any pending mutable-run data first: bulk_load writes a Flush
+        // marker + rotates the WAL below, which is only safe once all in-flight
+        // data is durably in a run.
+        self.spill_mutable_run(epoch)?;
+        // Phase 14.7: route the legacy Value API through the same parallel
+        // encode + typed batch-index path as `bulk_load_columns`. Transpose the
+        // row-major sparse batch → column-major typed columns (in parallel),
+        // then `write_native` + `index_columns_bulk`, instead of per-row
+        // `Row { HashMap }` + `index_into` + the sequential `Value` writer.
+        let first = self.allocator.alloc_range(n as u64).0;
+        for rid in first..first + n as u64 {
+            self.reservoir.offer(rid);
+        }
+        let user_columns: Vec<(u16, columnar::NativeColumn)> = {
+            use rayon::prelude::*;
+            use std::collections::HashMap;
+            let mut by_col: HashMap<u16, Vec<Value>> = HashMap::new();
+            for cdef in &self.schema.columns {
+                by_col.insert(cdef.id, vec![Value::Null; n]);
+            }
+            for (i, row) in batch.iter().enumerate() {
+                for (id, v) in row {
+                    if let Some(col) = by_col.get_mut(id) {
+                        col[i] = v.clone();
+                    }
+                }
+            }
+            self.schema
+                .columns
+                .par_iter()
+                .map(|cdef| {
+                    let vals = by_col.get(&cdef.id).map(|v| v.as_slice()).unwrap_or(&[]);
+                    (cdef.id, columnar::values_to_native(cdef.ty, vals))
+                })
+                .collect::<Vec<_>>()
+        };
+        let run_id = self.next_run_id;
+        self.next_run_id += 1;
+        let path = self.run_path(run_id);
+        let mut writer = RunWriter::new(&self.schema, run_id as u128, epoch, 0)
+            .clean(true)
+            .with_lz4()
+            .with_native_endian();
+        if let Some(kek) = &self.kek {
+            writer = writer.with_encryption(kek.as_ref(), self.indexable_column_specs());
+        }
+        let header = writer.write_native(&path, &user_columns, n, first)?;
+        self.run_refs.push(RunRef {
+            run_id: run_id as u128,
+            level: 0,
+            epoch_created: epoch.0,
+            row_count: header.row_count,
+        });
+        self.live_count = self.live_count.saturating_add(n as u64);
+        self.indexes_complete = false;
+        self.wal.append(Op::Flush { last_seq: epoch })?;
+        self.wal.sync()?;
+        self.rotate_wal(epoch)?;
+        self.persist_manifest(epoch)?;
+        self.clear_result_cache();
+        Ok(epoch)
+    }
+
+    fn rotate_wal(&mut self, epoch: Epoch) -> Result<()> {
+        let segment = next_wal_segment(&self.dir.join(WAL_DIR))?;
+        let mut wal = Wal::create(segment, epoch)?;
+        wal.set_sync_byte_threshold(self.sync_byte_threshold);
+        wal.sync()?; // durably persist the new segment's header before swapping in
+        self.wal = wal;
+        Ok(())
+    }
+
+    pub(crate) fn persist_manifest(&self, epoch: Epoch) -> Result<()> {
+        let mut m = Manifest::new(self.table_id, self.schema.schema_id);
+        m.current_epoch = epoch.0;
+        m.next_row_id = self.allocator.current().0;
+        m.runs = self.run_refs.clone();
+        m.live_count = self.live_count;
+        m.global_idx_epoch = self.global_idx_epoch;
+        manifest::write_atomic(&self.dir, &mut m)?;
+        Ok(())
+    }
+
+    /// Checkpoint the in-memory secondary indexes to `_idx/global.idx` and stamp
+    /// the manifest's `global_idx_epoch` (Phase 9.1). Call after the runs are
+    /// stable and the memtable is drained (flush/bulk-load/compact) so the
+    /// checkpoint exactly matches the run data; subsequent [`Db::open`] loads it
+    /// directly instead of scanning every run.
+    pub(crate) fn checkpoint_indexes(&mut self, epoch: Epoch) {
+        // Never persist an incomplete index set (e.g. after bulk_load_columns,
+        // which bypasses per-row indexing) — reopen rebuilds from the runs.
+        if !self.indexes_complete {
+            return;
+        }
+        let snap = global_idx::IndexSnapshot {
+            hot: &self.hot,
+            bitmap: &self.bitmap,
+            ann: &self.ann,
+            fm: &self.fm,
+            sparse: &self.sparse,
+            learned_range: &self.learned_range,
+        };
+        // Best-effort: a failed checkpoint just means the next open rebuilds.
+        if global_idx::write_atomic(&self.dir, self.table_id, epoch.0, snap).is_ok() {
+            self.global_idx_epoch = epoch.0;
+            let _ = self.persist_manifest(epoch);
+        }
+    }
+
+    /// Drop any on-disk index checkpoint so the next open rebuilds from runs
+    /// (used when the live indexes are known stale, e.g. compaction to empty).
+    pub(crate) fn invalidate_index_checkpoint(&mut self) {
+        self.global_idx_epoch = 0;
+        global_idx::remove(&self.dir);
+        let _ = self.persist_manifest(self.clock.now());
+    }
+
+    /// Read the row at `row_id` visible to `snapshot`, merging the newest
+    /// version across the memtable and all sorted runs.
+    pub fn get(&self, row_id: RowId, snapshot: Snapshot) -> Option<Row> {
+        let mut best: Option<(Epoch, Row)> = self.memtable.get_version(row_id, snapshot.epoch);
+        if let Some((epoch, row)) = self.mutable_run.get_version(row_id, snapshot.epoch) {
+            if best.as_ref().map(|(be, _)| epoch > *be).unwrap_or(true) {
+                best = Some((epoch, row));
+            }
+        }
+        for rr in &self.run_refs {
+            let Ok(mut reader) = self.open_reader(rr.run_id) else {
+                continue;
+            };
+            let Ok(Some((epoch, row))) = reader.get_version(row_id, snapshot.epoch) else {
+                continue;
+            };
+            if best.as_ref().map(|(be, _)| epoch > *be).unwrap_or(true) {
+                best = Some((epoch, row));
+            }
+        }
+        match best {
+            Some((_, r)) if r.deleted => None,
+            Some((_, r)) => Some(r),
+            None => None,
+        }
+    }
+
+    /// All rows visible at `snapshot` (newest version per `RowId`, tombstones
+    /// dropped), merged across the memtable, the mutable-run tier, and all
+    /// runs. Ascending `RowId`.
+    pub fn visible_rows(&self, snapshot: Snapshot) -> Result<Vec<Row>> {
+        let mut best: HashMap<u64, (Epoch, Row)> = HashMap::new();
+        let mut fold = |row: Row| {
+            best.entry(row.row_id.0)
+                .and_modify(|e| {
+                    if row.committed_epoch > e.0 {
+                        *e = (row.committed_epoch, row.clone());
+                    }
+                })
+                .or_insert_with(|| (row.committed_epoch, row));
+        };
+        for row in self.memtable.visible_versions(snapshot.epoch) {
+            fold(row);
+        }
+        for row in self.mutable_run.visible_versions(snapshot.epoch) {
+            fold(row);
+        }
+        for rr in &self.run_refs {
+            let mut reader = self.open_reader(rr.run_id)?;
+            for row in reader.visible_versions(snapshot.epoch)? {
+                fold(row);
+            }
+        }
+        let mut out: Vec<Row> = best
+            .into_values()
+            .filter_map(|(_, r)| if r.deleted { None } else { Some(r) })
+            .collect();
+        out.sort_by_key(|r| r.row_id);
+        Ok(out)
+    }
+
+    /// Visible data as columns (column_id → values) rather than rows — the
+    /// vectorized scan path. Fast path: when the memtable is empty and there is
+    /// exactly one run (the common post-flush analytical case), it computes the
+    /// visible index set once and gathers each column, with **no per-row
+    /// `HashMap`/`Row` materialization**. Falls back to [`Self::visible_rows`]
+    /// pivoted to columns when the memtable is live or runs overlap.
+    pub fn visible_columns(&self, snapshot: Snapshot) -> Result<Vec<(u16, Vec<Value>)>> {
+        if self.memtable.is_empty() && self.mutable_run.is_empty() && self.run_refs.len() == 1 {
+            let rr = self.run_refs[0].clone();
+            let mut reader = self.open_reader(rr.run_id)?;
+            let idxs = reader.visible_indices(snapshot.epoch)?;
+            let mut cols = Vec::with_capacity(self.schema.columns.len());
+            for cdef in &self.schema.columns {
+                cols.push((cdef.id, reader.gather_column(cdef.id, &idxs)?));
+            }
+            return Ok(cols);
+        }
+        // Fallback: row merge, then pivot to columns.
+        let rows = self.visible_rows(snapshot)?;
+        let mut cols: Vec<(u16, Vec<Value>)> = self
+            .schema
+            .columns
+            .iter()
+            .map(|c| (c.id, Vec::with_capacity(rows.len())))
+            .collect();
+        for r in &rows {
+            for (cid, vec) in cols.iter_mut() {
+                vec.push(r.columns.get(cid).cloned().unwrap_or(Value::Null));
+            }
+        }
+        Ok(cols)
+    }
+
+    /// Resolve a primary-key value to a row id (latest version).
+    pub fn lookup_pk(&self, key: &[u8]) -> Option<RowId> {
+        self.hot.get(key)
+    }
+
+    /// Run a conjunctive query over the shared row-id space: each condition
+    /// yields a candidate row-id set, the sets are intersected, and the
+    /// survivors are materialized at the current snapshot. This is the AI-native
+    /// "compose primitives" surface (`semsearch ∩ fm_contains ∩ cat_in`).
+    pub fn query(&mut self, q: &crate::query::Query) -> Result<Vec<Row>> {
+        self.ensure_indexes_complete()?;
+        use std::collections::HashSet;
+        let snapshot = self.snapshot();
+        // A conjunction with no predicates matches every visible row (the
+        // documented "Empty ⇒ all rows" contract); `intersect_sets` of zero
+        // sets would otherwise wrongly yield the empty set.
+        if q.conditions.is_empty() {
+            return self.visible_rows(snapshot);
+        }
+        let mut sets: Vec<HashSet<u64>> = Vec::with_capacity(q.conditions.len());
+        for c in &q.conditions {
+            sets.push(self.resolve_condition(c, snapshot)?);
+        }
+        let candidates = intersect_sets(sets);
+        let mut rids: Vec<u64> = candidates.into_iter().collect();
+        rids.sort_unstable();
+        self.rows_for_rids(&rids, snapshot)
+    }
+
+    /// Materialize the MVCC-visible, non-deleted rows for `rids` at `snapshot`,
+    /// preserving the input order. Rows whose newest visible version is a
+    /// tombstone, or that no longer exist, are omitted. Shared by index-served
+    /// [`query`] and the Phase 8.1 FK-join path.
+    pub fn rows_for_rids(&self, rids: &[u64], snapshot: Snapshot) -> Result<Vec<Row>> {
+        use std::collections::HashMap;
+        let mut rows = Vec::with_capacity(rids.len());
+        // Overlay (memtable + mutable-run) newest visible version per rid —
+        // these shadow any stale version stored in a run. A rid may have an
+        // older version in the mutable-run tier and a newer one in the memtable
+        // (an update after a flush), so keep the **newest by epoch** across both
+        // tiers, not whichever is inserted last.
+        let mut overlay: HashMap<u64, Row> = HashMap::new();
+        let fold_newest = |row: Row, overlay: &mut HashMap<u64, Row>| {
+            overlay
+                .entry(row.row_id.0)
+                .and_modify(|e| {
+                    if row.committed_epoch > e.committed_epoch {
+                        *e = row.clone();
+                    }
+                })
+                .or_insert(row);
+        };
+        for row in self.memtable.visible_versions(snapshot.epoch) {
+            fold_newest(row, &mut overlay);
+        }
+        for row in self.mutable_run.visible_versions(snapshot.epoch) {
+            fold_newest(row, &mut overlay);
+        }
+        if self.run_refs.len() == 1 {
+            // Phase 16.3b: decode the system columns ONCE (via the clean-run-
+            // shortcut visibility pass) and binary-search each requested rid,
+            // instead of `get_version`-per-rid which re-decoded + cloned the
+            // full system columns on every call (the ~350 ms native-query tax).
+            // Phase 16.3b finish: batch the survivor positions into ONE
+            // `materialize_batch` call so user columns are decoded once each via
+            // the typed, page-cached path (not a per-rid `Vec<Value>` decode +
+            // `.cloned()`).
+            let mut reader = self.open_reader(self.run_refs[0].run_id)?;
+            let (positions, vis_rids) = reader.visible_positions_with_rids(snapshot.epoch)?;
+            // First pass: classify each input rid (overlay / run position /
+            // not-found), recording the run positions to fetch in input order.
+            enum Src {
+                Overlay,
+                Run,
+            }
+            let mut plan: Vec<Src> = Vec::with_capacity(rids.len());
+            let mut fetch: Vec<usize> = Vec::with_capacity(rids.len());
+            for rid in rids {
+                if overlay.contains_key(rid) {
+                    plan.push(Src::Overlay);
+                    continue;
+                }
+                match vis_rids.binary_search(&(*rid as i64)) {
+                    Ok(i) => {
+                        plan.push(Src::Run);
+                        fetch.push(positions[i]);
+                    }
+                    Err(_) => { /* not found — omitted from output */ }
+                }
+            }
+            let fetched = reader.materialize_batch(&fetch)?;
+            let mut fetched_iter = fetched.into_iter();
+            for (rid, src) in rids.iter().zip(plan) {
+                match src {
+                    Src::Overlay => {
+                        if let Some(r) = overlay.get(rid) {
+                            if !r.deleted {
+                                rows.push(r.clone());
+                            }
+                        }
+                    }
+                    Src::Run => {
+                        if let Some(row) = fetched_iter.next() {
+                            if !row.deleted {
+                                rows.push(row);
+                            }
+                        }
+                    }
+                }
+            }
+            return Ok(rows);
+        }
+        // Multi-run: one reader per run; newest visible version across all runs
+        // + the overlay. (Per-rid `get_version` here is unavoidable without a
+        // cross-run merge, but multi-run is the uncommon cold case.)
+        let mut readers: Vec<_> = self
+            .run_refs
+            .iter()
+            .map(|rr| self.open_reader(rr.run_id))
+            .collect::<Result<Vec<_>>>()?;
+        for rid in rids {
+            if let Some(r) = overlay.get(rid) {
+                if !r.deleted {
+                    rows.push(r.clone());
+                }
+                continue;
+            }
+            let mut best: Option<(Epoch, Row)> = None;
+            for reader in readers.iter_mut() {
+                if let Ok(Some((epoch, row))) = reader.get_version(RowId(*rid), snapshot.epoch) {
+                    if best.as_ref().map(|(be, _)| epoch > *be).unwrap_or(true) {
+                        best = Some((epoch, row));
+                    }
+                }
+            }
+            if let Some((_, r)) = best {
+                if !r.deleted {
+                    rows.push(r);
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Resolve the referencing (FK) side of a primary-key ↔ foreign-key join as
+    /// a row-id set (Phase 8.1): union the roaring-bitmap entries of
+    /// `fk_column_id` for every value in `pk_values` — the surviving
+    /// primary-key values — then intersect with `fk_conditions`, i.e. any
+    /// FK-side predicates (`ann_search ∩ fm_contains`, bitmap equality, range,
+    /// …). Returns the survivor row-ids ascending. Requires a bitmap index on
+    /// `fk_column_id`; returns an empty set when there is none.
+    /// Whether live indexes are complete (Phase 14.7 + 17.2: the broadcast
+    /// join path checks this before using the HOT index).
+    pub fn indexes_complete(&self) -> bool {
+        self.indexes_complete
+    }
+
+    /// Phase 17.2: broadcast join — return the distinct values in this table's
+    /// bitmap index for `column_id` that also exist as a key in `pk_db`'s HOT
+    /// index. Avoids loading the entire PK table when the FK column has low
+    /// cardinality. Returns `None` if no bitmap index exists for the column.
+    pub fn broadcast_join_values(&self, column_id: u16, pk_db: &Db) -> Option<Vec<Vec<u8>>> {
+        let b = self.bitmap.get(&column_id)?;
+        let result: Vec<Vec<u8>> = b
+            .keys()
+            .into_iter()
+            .filter(|k| pk_db.hot.get(k.as_slice()).is_some())
+            .cloned()
+            .collect();
+        Some(result)
+    }
+
+    pub fn fk_join_row_ids(
+        &self,
+        fk_column_id: u16,
+        pk_values: &[Vec<u8>],
+        fk_conditions: &[crate::query::Condition],
+        snapshot: Snapshot,
+    ) -> Result<Vec<u64>> {
+        use std::collections::HashSet;
+        let Some(b) = self.bitmap.get(&fk_column_id) else {
+            return Ok(Vec::new());
+        };
+        let mut join_set: HashSet<u64> = {
+            let mut acc = roaring::RoaringBitmap::new();
+            for v in pk_values {
+                acc |= b.get(v);
+            }
+            acc.iter().map(|x| x as u64).collect()
+        };
+        if !fk_conditions.is_empty() {
+            let mut sets: Vec<HashSet<u64>> = Vec::with_capacity(fk_conditions.len() + 1);
+            sets.push(std::mem::take(&mut join_set));
+            for c in fk_conditions {
+                sets.push(self.resolve_condition(c, snapshot)?);
+            }
+            join_set = intersect_sets(sets);
+        }
+        let mut out: Vec<u64> = join_set.into_iter().collect();
+        out.sort_unstable();
+        Ok(out)
+    }
+
+    /// Like [`fk_join_row_ids`] but returns only the **cardinality** of the FK
+    /// survivor set — without materializing or sorting it. For a bare
+    /// `COUNT(*)` join with no FK-side filter this is O(1) on the bitmap union
+    /// (Phase 17.4): the prior path built a `HashSet<u64>` + `Vec<u64>` +
+    /// `sort_unstable` over up to N rows only to read `.len()`.
+    pub fn fk_join_count(
+        &self,
+        fk_column_id: u16,
+        pk_values: &[Vec<u8>],
+        fk_conditions: &[crate::query::Condition],
+        snapshot: Snapshot,
+    ) -> Result<u64> {
+        use std::collections::HashSet;
+        let Some(b) = self.bitmap.get(&fk_column_id) else {
+            return Ok(0);
+        };
+        let mut acc = roaring::RoaringBitmap::new();
+        for v in pk_values {
+            acc |= b.get(v);
+        }
+        if fk_conditions.is_empty() {
+            return Ok(acc.len());
+        }
+        let mut join_set: HashSet<u64> = acc.iter().map(|x| x as u64).collect();
+        let mut sets: Vec<HashSet<u64>> = Vec::with_capacity(fk_conditions.len() + 1);
+        sets.push(std::mem::take(&mut join_set));
+        for c in fk_conditions {
+            sets.push(self.resolve_condition(c, snapshot)?);
+        }
+        Ok(intersect_sets(sets).len() as u64)
+    }
+
+    /// Resolve a single condition to its row-id set. Index-served conditions use
+    /// the in-memory indexes; `Range`/`RangeF64` prefer the learned (PGM) index
+    /// or the reader's page-index-skipping path on the single-run fast path, and
+    /// only fall back to a `visible_rows` scan off the fast path (multi-run).
+    fn resolve_condition(
+        &self,
+        c: &crate::query::Condition,
+        snapshot: Snapshot,
+    ) -> Result<std::collections::HashSet<u64>> {
+        use crate::query::Condition;
+        Ok(match c {
+            Condition::Pk(key) => {
+                let lookup = self
+                    .schema
+                    .primary_key()
+                    .map(|pk| self.index_lookup_key_bytes(pk.id, key))
+                    .unwrap_or_else(|| key.clone());
+                self.hot
+                    .get(&lookup)
+                    .map(|r| std::iter::once(r.0).collect())
+                    .unwrap_or_default()
+            }
+            Condition::BitmapEq { column_id, value } => {
+                let lookup = self.index_lookup_key_bytes(*column_id, value);
+                self.bitmap
+                    .get(column_id)
+                    .map(|b| b.get(&lookup).iter().map(|x| x as u64).collect())
+                    .unwrap_or_default()
+            }
+            Condition::BitmapIn { column_id, values } => {
+                let bm = self.bitmap.get(column_id);
+                let mut acc = roaring::RoaringBitmap::new();
+                if let Some(b) = bm {
+                    for v in values {
+                        let lookup = self.index_lookup_key_bytes(*column_id, v);
+                        acc |= b.get(&lookup);
+                    }
+                }
+                acc.iter().map(|x| x as u64).collect()
+            }
+            Condition::FmContains { column_id, pattern } => self
+                .fm
+                .get(column_id)
+                .map(|f| f.locate(pattern).into_iter().map(|r| r.0).collect())
+                .unwrap_or_default(),
+            Condition::Ann {
+                column_id,
+                query,
+                k,
+            } => self
+                .ann
+                .get(column_id)
+                .map(|a| a.search(query, *k).into_iter().map(|(r, _)| r.0).collect())
+                .unwrap_or_default(),
+            Condition::SparseMatch {
+                column_id,
+                query,
+                k,
+            } => self
+                .sparse
+                .get(column_id)
+                .map(|s| s.search(query, *k).into_iter().map(|(r, _)| r.0).collect())
+                .unwrap_or_default(),
+            Condition::Range { column_id, lo, hi } => {
+                if let Some(li) = self.learned_range.get(column_id) {
+                    li.range(*lo, *hi)
+                } else if self.run_refs.len() == 1 {
+                    // Phase 16.3: fast page-pruned single-run path — reads
+                    // SYS_ROW_ID + value per non-pruned page only, with **no
+                    // O(n) visibility HashMap**. Relaxed from the old
+                    // `memtable.is_empty() && mutable_run.is_empty()` gate so a
+                    // small overlay no longer forces a full visibility rescan:
+                    // stale run versions of overlay rids are removed and the
+                    // overlay is evaluated in-memory. Tombstoned rids that slip
+                    // through are dropped by the cursor's visible-position
+                    // intersection, so an Exact pushdown stays exact.
+                    let mut r = self.open_reader(self.run_refs[0].run_id)?;
+                    let mut set = r.range_row_ids_i64(*column_id, *lo, *hi)?;
+                    for rid in self.overlay_rid_set(snapshot) {
+                        set.remove(&rid);
+                    }
+                    self.range_scan_overlay_i64(&mut set, *column_id, *lo, *hi, snapshot);
+                    set
+                } else {
+                    self.range_scan_i64(*column_id, *lo, *hi, snapshot)?
+                }
+            }
+            Condition::RangeF64 {
+                column_id,
+                lo,
+                lo_inclusive,
+                hi,
+                hi_inclusive,
+            } => {
+                if let Some(li) = self.learned_range.get(column_id) {
+                    li.range_f64(*lo, *lo_inclusive, *hi, *hi_inclusive)
+                } else if self.run_refs.len() == 1 {
+                    // Phase 16.3: see the `Range` arm for the gate relaxation.
+                    let mut r = self.open_reader(self.run_refs[0].run_id)?;
+                    let mut set =
+                        r.range_row_ids_f64(*column_id, *lo, *lo_inclusive, *hi, *hi_inclusive)?;
+                    for rid in self.overlay_rid_set(snapshot) {
+                        set.remove(&rid);
+                    }
+                    self.range_scan_overlay_f64(
+                        &mut set,
+                        *column_id,
+                        *lo,
+                        *lo_inclusive,
+                        *hi,
+                        *hi_inclusive,
+                        snapshot,
+                    );
+                    set
+                } else {
+                    self.range_scan_f64(
+                        *column_id,
+                        *lo,
+                        *lo_inclusive,
+                        *hi,
+                        *hi_inclusive,
+                        snapshot,
+                    )?
+                }
+            }
+        })
+    }
+
+    /// Vectorized range scan for Int64 columns (Phase 13.2 / 16.3). Resolves the
+    /// survivor set via the reader's **page-pruned** path — pages whose `[min,max]`
+    /// excludes `[lo,hi]` are never decoded — restricted to MVCC-visible rows.
+    /// This is layout-independent: correct under any memtable / multi-run state,
+    /// so it is always safe to call (no "single clean run" gate). Overlay rows
+    /// (memtable / mutable-run) are excluded from the run portion and checked
+    /// directly via [`Self::range_scan_overlay_i64`].
+    fn range_scan_i64(
+        &self,
+        column_id: u16,
+        lo: i64,
+        hi: i64,
+        snapshot: Snapshot,
+    ) -> Result<HashSet<u64>> {
+        let mut s = HashSet::new();
+        let overlay_rids = self.overlay_rid_set(snapshot);
+        for rr in &self.run_refs {
+            let mut reader = self.open_reader(rr.run_id)?;
+            let matched = reader.range_row_ids_visible_i64(column_id, lo, hi, snapshot.epoch)?;
+            for rid in matched {
+                if !overlay_rids.contains(&rid) {
+                    s.insert(rid);
+                }
+            }
+        }
+        self.range_scan_overlay_i64(&mut s, column_id, lo, hi, snapshot);
+        Ok(s)
+    }
+
+    /// Float64 analogue of [`Self::range_scan_i64`] with per-bound inclusivity
+    /// (Phase 13.2 / 16.3).
+    fn range_scan_f64(
+        &self,
+        column_id: u16,
+        lo: f64,
+        lo_inclusive: bool,
+        hi: f64,
+        hi_inclusive: bool,
+        snapshot: Snapshot,
+    ) -> Result<HashSet<u64>> {
+        let mut s = HashSet::new();
+        let overlay_rids = self.overlay_rid_set(snapshot);
+        for rr in &self.run_refs {
+            let mut reader = self.open_reader(rr.run_id)?;
+            let matched = reader.range_row_ids_visible_f64(
+                column_id,
+                lo,
+                lo_inclusive,
+                hi,
+                hi_inclusive,
+                snapshot.epoch,
+            )?;
+            for rid in matched {
+                if !overlay_rids.contains(&rid) {
+                    s.insert(rid);
+                }
+            }
+        }
+        self.range_scan_overlay_f64(
+            &mut s,
+            column_id,
+            lo,
+            lo_inclusive,
+            hi,
+            hi_inclusive,
+            snapshot,
+        );
+        Ok(s)
+    }
+
+    /// Collect the set of row-ids visible in the memtable / mutable-run overlay.
+    fn overlay_rid_set(&self, snapshot: Snapshot) -> HashSet<u64> {
+        let mut s = HashSet::new();
+        for row in self.memtable.visible_versions(snapshot.epoch) {
+            s.insert(row.row_id.0);
+        }
+        for row in self.mutable_run.visible_versions(snapshot.epoch) {
+            s.insert(row.row_id.0);
+        }
+        s
+    }
+
+    fn range_scan_overlay_i64(
+        &self,
+        s: &mut HashSet<u64>,
+        column_id: u16,
+        lo: i64,
+        hi: i64,
+        snapshot: Snapshot,
+    ) {
+        for row in self
+            .memtable
+            .visible_versions(snapshot.epoch)
+            .into_iter()
+            .chain(self.mutable_run.visible_versions(snapshot.epoch))
+        {
+            if !row.deleted {
+                if let Some(Value::Int64(v)) = row.columns.get(&column_id) {
+                    if *v >= lo && *v <= hi {
+                        s.insert(row.row_id.0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn range_scan_overlay_f64(
+        &self,
+        s: &mut HashSet<u64>,
+        column_id: u16,
+        lo: f64,
+        lo_inclusive: bool,
+        hi: f64,
+        hi_inclusive: bool,
+        snapshot: Snapshot,
+    ) {
+        for row in self
+            .memtable
+            .visible_versions(snapshot.epoch)
+            .into_iter()
+            .chain(self.mutable_run.visible_versions(snapshot.epoch))
+        {
+            if !row.deleted {
+                if let Some(Value::Float64(v)) = row.columns.get(&column_id) {
+                    let ok_lo = if lo_inclusive { *v >= lo } else { *v > lo };
+                    let ok_hi = if hi_inclusive { *v <= hi } else { *v < hi };
+                    if ok_lo && ok_hi {
+                        s.insert(row.row_id.0);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn snapshot(&self) -> Snapshot {
+        self.clock.snapshot()
+    }
+
+    /// Pin the current epoch as a read snapshot; compaction will preserve the
+    /// versions it needs until [`Db::unpin_snapshot`] is called.
+    pub fn pin_snapshot(&mut self) -> Snapshot {
+        let e = self.clock.now();
+        *self.pinned.entry(e).or_insert(0) += 1;
+        Snapshot::at(e)
+    }
+
+    /// Release a pinned snapshot.
+    pub fn unpin_snapshot(&mut self, snap: Snapshot) {
+        if let Some(count) = self.pinned.get_mut(&snap.epoch) {
+            *count -= 1;
+            if *count == 0 {
+                self.pinned.remove(&snap.epoch);
+            }
+        }
+    }
+
+    /// Oldest pinned snapshot epoch, or `None` if no snapshot is active.
+    pub(crate) fn min_active_snapshot(&self) -> Option<Epoch> {
+        self.pinned.keys().next().copied()
+    }
+
+    pub fn current_epoch(&self) -> Epoch {
+        self.clock.now()
+    }
+
+    pub fn memtable_len(&self) -> usize {
+        self.memtable.len()
+    }
+
+    /// Live (non-deleted) row count, O(1) from a manifest-maintained counter —
+    /// the metadata `COUNT(*)` fast path (no scan).
+    pub fn count(&self) -> u64 {
+        self.live_count
+    }
+
+    /// Bulk-load typed columns straight to a new run — the fast ingest path.
+    /// Bypasses the WAL, the memtable, and the `Value` enum entirely; writes one
+    /// compressed run (delta for sorted Int64, dictionary for low-card Bytes)
+    /// with **LZ4** (Phase 15.3 — fast decode for scan-heavy analytical runs),
+    /// rotates the WAL, and persists the manifest in a single fsync group.
+    /// Indexes are bulk-built from the typed columns (Phase 14.2).
+    pub fn bulk_load_columns(
+        &mut self,
+        user_columns: Vec<(u16, columnar::NativeColumn)>,
+    ) -> Result<Epoch> {
+        self.bulk_load_columns_with(user_columns, 3, false, true)
+    }
+
+    /// Maximal-throughput bulk ingest (Phase 14.4): skip zstd entirely and write
+    /// raw `ALGO_PLAIN` pages. ~3–4× the encode throughput of
+    /// [`Self::bulk_load_columns`] at ~3–4× the on-disk size — the right choice
+    /// when ingest latency dominates and a background compaction will re-compress
+    /// later. Indexing, WAL rotation, and the manifest are identical to
+    /// [`Self::bulk_load_columns`].
+    pub fn bulk_load_fast(
+        &mut self,
+        user_columns: Vec<(u16, columnar::NativeColumn)>,
+    ) -> Result<Epoch> {
+        self.bulk_load_columns_with(user_columns, -1, true, false)
+    }
+
+    fn bulk_load_columns_with(
+        &mut self,
+        user_columns: Vec<(u16, columnar::NativeColumn)>,
+        zstd_level: i32,
+        force_plain: bool,
+        lz4: bool,
+    ) -> Result<Epoch> {
+        let epoch = self.commit()?;
+        let n = user_columns.first().map(|(_, c)| c.len()).unwrap_or(0);
+        if n == 0 {
+            return Ok(epoch);
+        }
+        // Spill pending mutable-run data before the Flush marker + WAL rotation.
+        self.spill_mutable_run(epoch)?;
+        let first = self.allocator.alloc_range(n as u64).0;
+        for rid in first..first + n as u64 {
+            self.reservoir.offer(rid);
+        }
+        let run_id = self.next_run_id;
+        self.next_run_id += 1;
+        let path = self.run_path(run_id);
+        let mut writer =
+            RunWriter::new(&self.schema, run_id as u128, epoch, 0).with_native_endian();
+        if force_plain {
+            writer = writer.with_plain();
+        } else if lz4 {
+            // Phase 15.3: bulk-loaded analytical runs are scan-heavy, so encode
+            // them with LZ4 (3–5× faster decode, ~10% worse ratio than zstd).
+            writer = writer.with_lz4();
+        } else {
+            writer = writer.with_zstd_level(zstd_level);
+        }
+        if let Some(kek) = &self.kek {
+            writer = writer.with_encryption(kek.as_ref(), self.indexable_column_specs());
+        }
+        let header = writer.write_native(&path, &user_columns, n, first)?;
+        self.run_refs.push(RunRef {
+            run_id: run_id as u128,
+            level: 0,
+            epoch_created: epoch.0,
+            row_count: header.row_count,
+        });
+        self.live_count = self.live_count.saturating_add(n as u64);
+        // Phase 14.7: defer index building off the ingest critical path.
+        self.indexes_complete = false;
+        self.wal.append(Op::Flush { last_seq: epoch })?;
+        self.wal.sync()?;
+        self.rotate_wal(epoch)?;
+        self.persist_manifest(epoch)?;
+        self.clear_result_cache();
+        Ok(epoch)
+    }
+
+    /// Bulk-build the live in-memory indexes (HOT/bitmap/FM/sparse) straight
+    /// from typed columns — the deferred batch-indexing path (Phase 14.2).
+    ///
+    /// Replaces the per-row `index_into` loop: no `Row`, no per-row
+    /// `HashMap<u16, Value>`, no `Value` enum. Index keys are computed directly
+    /// from the typed buffers via [`columnar::encode_key_native`], tokenized for
+    /// `ENCRYPTED_INDEXABLE` columns the same way `index_into` on a tokenized
+    /// row would. FM is appended dirty and rebuilt once on the next query; the
+    /// others are populated in a single typed pass. Entries are merged into the
+    /// existing indexes so this is correct under multi-run loads and partial
+    /// reindexes.
+    ///
+    /// `row_ids[i]` is the `RowId` of element `i` of every column. ANN
+    /// (`IndexKind::Ann`) is intentionally skipped: the native codec carries no
+    /// embeddings, so an `Embedding` column can never reach this path (a native
+    /// bulk load of an embedding schema fails at encode). LearnedRange is built
+    /// separately from the runs by [`Self::build_learned_ranges`].
+    #[allow(dead_code)]
+    fn index_columns_bulk(&mut self, columns: &[(u16, columnar::NativeColumn)], row_ids: &[u64]) {
+        let n = row_ids.len();
+        if n == 0 {
+            return;
+        }
+        let by_id: std::collections::HashMap<u16, &columnar::NativeColumn> =
+            columns.iter().map(|(id, c)| (*id, c)).collect();
+        let ty_of: std::collections::HashMap<u16, TypeId> =
+            self.schema.columns.iter().map(|c| (c.id, c.ty)).collect();
+        let pk_id = self.schema.primary_key().map(|c| c.id);
+
+        for (i, &rid) in row_ids.iter().enumerate() {
+            let row_id = RowId(rid);
+            if let Some(pid) = pk_id {
+                if let Some(col) = by_id.get(&pid) {
+                    let ty = ty_of.get(&pid).copied().unwrap_or(TypeId::Int64);
+                    if let Some(key) = bulk_index_key(&self.column_keys, pid, ty, col, i) {
+                        self.hot.insert(key, row_id);
+                    }
+                }
+            }
+            for idef in &self.schema.indexes {
+                let Some(col) = by_id.get(&idef.column_id) else {
+                    continue;
+                };
+                let ty = ty_of.get(&idef.column_id).copied().unwrap_or(TypeId::Int64);
+                match idef.kind {
+                    IndexKind::Bitmap => {
+                        if let Some(b) = self.bitmap.get_mut(&idef.column_id) {
+                            if let Some(key) =
+                                bulk_index_key(&self.column_keys, idef.column_id, ty, col, i)
+                            {
+                                b.insert(key, row_id);
+                            }
+                        }
+                    }
+                    IndexKind::FmIndex => {
+                        if let Some(f) = self.fm.get_mut(&idef.column_id) {
+                            if let Some(bytes) = columnar::native_bytes_at(col, i) {
+                                f.insert(bytes.to_vec(), row_id);
+                            }
+                        }
+                    }
+                    IndexKind::Sparse => {
+                        if let Some(s) = self.sparse.get_mut(&idef.column_id) {
+                            if let Some(bytes) = columnar::native_bytes_at(col, i) {
+                                if let Ok(terms) = bincode::deserialize::<Vec<(u32, f32)>>(bytes) {
+                                    s.insert(&terms, row_id);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// no `Value`). Fast path: empty memtable + single run decodes columns
+    /// directly and gathers visible indices; falls back to the `Value` path
+    /// pivoted to native columns otherwise. `projection` (a set of column ids)
+    /// limits decoding to the requested columns — `None` ⇒ all user columns.
+    pub fn visible_columns_native(
+        &self,
+        snapshot: Snapshot,
+        projection: Option<&[u16]>,
+    ) -> Result<Vec<(u16, columnar::NativeColumn)>> {
+        let wanted: Vec<u16> = match projection {
+            Some(p) => p.to_vec(),
+            None => self.schema.columns.iter().map(|c| c.id).collect(),
+        };
+        if self.memtable.is_empty() && self.mutable_run.is_empty() && self.run_refs.len() == 1 {
+            let rr = self.run_refs[0].clone();
+            let mut reader = self.open_reader(rr.run_id)?;
+            let idxs = reader.visible_indices_native(snapshot.epoch)?;
+            let all_visible = idxs.len() == reader.row_count();
+            // Phase 15.1: decode every requested column in parallel when the
+            // reader is mmap-backed. Each column already parallel-decodes its
+            // own pages, so a wide table saturates the pool via nested rayon
+            // without oversubscribing (work-stealing handles it). Falls back to
+            // the sequential `&mut` path when mmap is unavailable.
+            if reader.has_mmap() {
+                use rayon::prelude::*;
+                // Pre-resolve the requested ids that exist in the schema (don't
+                // capture `self` inside the rayon closure).
+                let valid: Vec<u16> = wanted
+                    .iter()
+                    .filter(|cid| self.schema.columns.iter().any(|c| c.id == **cid))
+                    .copied()
+                    .collect();
+                // Decode concurrently; `collect` preserves `valid` order.
+                let decoded: Vec<(u16, columnar::NativeColumn)> = valid
+                    .par_iter()
+                    .filter_map(|cid| {
+                        reader
+                            .column_native_shared(*cid)
+                            .ok()
+                            .map(|col| (*cid, col))
+                    })
+                    .collect();
+                let cols = decoded
+                    .into_iter()
+                    .map(|(id, col)| (id, if all_visible { col } else { col.gather(&idxs) }))
+                    .collect();
+                return Ok(cols);
+            }
+            let mut cols = Vec::with_capacity(wanted.len());
+            for cid in &wanted {
+                let cdef = match self.schema.columns.iter().find(|c| c.id == *cid) {
+                    Some(c) => c,
+                    None => continue,
+                };
+                let col = reader.column_native(cdef.id)?;
+                cols.push((cdef.id, if all_visible { col } else { col.gather(&idxs) }));
+            }
+            return Ok(cols);
+        }
+        let vcols = self.visible_columns(snapshot)?;
+        let want_set: std::collections::HashSet<u16> = wanted.iter().copied().collect();
+        let out: Vec<(u16, columnar::NativeColumn)> = vcols
+            .into_iter()
+            .filter(|(id, _)| want_set.contains(id))
+            .map(|(id, vals)| {
+                let ty = self
+                    .schema
+                    .columns
+                    .iter()
+                    .find(|c| c.id == id)
+                    .map(|c| c.ty)
+                    .unwrap_or(TypeId::Bytes);
+                (id, columnar::values_to_native(ty, &vals))
+            })
+            .collect();
+        Ok(out)
+    }
+
+    pub fn run_count(&self) -> usize {
+        self.run_refs.len()
+    }
+
+    /// Whether the memtable is empty (no unflushed puts).
+    pub fn memtable_is_empty(&self) -> bool {
+        self.memtable.is_empty()
+    }
+
+    /// The run IDs in level order (Phase 15.5: used by the Arrow IPC shadow to
+    /// key shadow files and detect stale shadows).
+    pub fn run_ids(&self) -> Vec<u128> {
+        self.run_refs.iter().map(|r| r.run_id).collect()
+    }
+
+    /// Whether the single run (if exactly one) is clean — i.e. has
+    /// `RUN_FLAG_CLEAN` set (Phase 15.5: the shadow is zero-copy only for clean
+    /// runs).
+    pub fn single_run_is_clean(&self) -> bool {
+        if self.run_refs.len() != 1 {
+            return false;
+        }
+        self.open_reader(self.run_refs[0].run_id)
+            .map(|r| r.is_clean())
+            .unwrap_or(false)
+    }
+
+    /// Best-effort resolve of the survivor RowId set for fine-grained cache
+    /// invalidation (hardening (c)). On the single-run fast path, opens a reader
+    /// and calls `resolve_survivor_rids`. On the multi-run/memtable path,
+    /// returns an empty bitmap — conservative (condition_cols still catches
+    /// column mutations, and deletes are caught by the epoch-free design falling
+    /// through to the multi-run path which re-resolves).
+    fn resolve_footprint(
+        &self,
+        conditions: &[crate::query::Condition],
+        _snapshot: Snapshot,
+    ) -> roaring::RoaringBitmap {
+        if !self.memtable.is_empty() || !self.mutable_run.is_empty() {
+            return roaring::RoaringBitmap::new();
+        }
+        if self.run_refs.is_empty() {
+            return roaring::RoaringBitmap::new();
+        }
+        // Try the single-run fast path.
+        if self.run_refs.len() == 1 {
+            if let Ok(mut reader) = self.open_reader(self.run_refs[0].run_id) {
+                if let Ok(rids) = self.resolve_survivor_rids(conditions, &mut reader) {
+                    return rids.iter().map(|r| *r as u32).collect();
+                }
+            }
+        }
+        roaring::RoaringBitmap::new()
+    }
+
+    /// Phase 19.1 + hardening (c): a cached form of
+    /// [`Db::query_columns_native`]. The cache key is epoch-independent (epoch=0);
+    /// invalidation is fine-grained — a `commit()` drops only entries whose
+    /// footprint intersects a deleted RowId or whose condition-columns intersect
+    /// a mutated column. On a miss the underlying `query_columns_native` runs and
+    /// the result is cached as typed `NativeColumn`s. Returns `None` exactly when
+    /// the non-cached path would (conditions not pushdown-served). Strictly
+    /// additive — callers wanting fresh results keep using
+    /// `query_columns_native`.
+    pub fn query_columns_native_cached(
+        &mut self,
+        conditions: &[crate::query::Condition],
+        projection: Option<&[u16]>,
+        snapshot: Snapshot,
+    ) -> Result<Option<Vec<(u16, columnar::NativeColumn)>>> {
+        if conditions.is_empty() {
+            return self.query_columns_native(conditions, projection, snapshot);
+        }
+        let key = crate::query::canonical_query_key(conditions, projection, 0);
+        if let Some(hit) = self.result_cache.lock().get_columns(key) {
+            return Ok(Some((*hit).clone()));
+        }
+        let res = self.query_columns_native(conditions, projection, snapshot)?;
+        if let Some(cols) = &res {
+            let footprint = self.resolve_footprint(conditions, snapshot);
+            let condition_cols = crate::query::condition_columns(conditions);
+            self.result_cache.lock().insert(
+                key,
+                CachedEntry {
+                    data: CachedData::Columns(Arc::new(cols.clone())),
+                    footprint,
+                    condition_cols,
+                },
+            );
+        }
+        Ok(res)
+    }
+
+    /// Phase 19.1 + hardening (c): a cached form of [`Db::query`]. The cache key
+    /// is epoch-independent; invalidation is fine-grained (see
+    /// [`Db::query_columns_native_cached`]). On a hit returns the cached rows (no
+    /// re-resolve, no re-decode).
+    pub fn query_cached(&mut self, q: &crate::query::Query) -> Result<Vec<Row>> {
+        if q.conditions.is_empty() {
+            return self.query(q);
+        }
+        let key = crate::query::canonical_query_key(&q.conditions, None, 0);
+        if let Some(hit) = self.result_cache.lock().get_rows(key) {
+            return Ok((*hit).clone());
+        }
+        let rows = self.query(q)?;
+        let footprint = rows.iter().map(|r| r.row_id.0 as u32).collect();
+        let condition_cols = crate::query::condition_columns(&q.conditions);
+        self.result_cache.lock().insert(
+            key,
+            CachedEntry {
+                data: CachedData::Rows(Arc::new(rows.clone())),
+                footprint,
+                condition_cols,
+            },
+        );
+        Ok(rows)
+    }
+
+    /// Predicate pushdown: resolve `conditions` via indexes to find the matching
+    /// row-id set, then decode only those rows' columns — not the whole table.
+    /// Returns `None` if the conditions can't be served by indexes (caller falls
+    /// back to a full scan). This is the fast path for `WHERE col = 'value'`.
+    pub fn query_columns_native(
+        &mut self,
+        conditions: &[crate::query::Condition],
+        projection: Option<&[u16]>,
+        snapshot: Snapshot,
+    ) -> Result<Option<Vec<(u16, columnar::NativeColumn)>>> {
+        use crate::query::Condition;
+        use std::collections::HashSet;
+        if conditions.is_empty() {
+            return Ok(None);
+        }
+        self.ensure_indexes_complete()?;
+
+        // Only these conditions are pushdown-served. Range/RangeF64 need a
+        // column read on the single-run fast path; off it they fall back to a
+        // visible-rows scan via `resolve_condition` (still correct for any
+        // layout, just not page-pruned).
+        let served = |c: &Condition| {
+            matches!(
+                c,
+                Condition::Pk(_)
+                    | Condition::BitmapEq { .. }
+                    | Condition::BitmapIn { .. }
+                    | Condition::FmContains { .. }
+                    | Condition::Ann { .. }
+                    | Condition::Range { .. }
+                    | Condition::RangeF64 { .. }
+                    | Condition::SparseMatch { .. }
+            )
+        };
+        if !conditions.iter().all(served) {
+            return Ok(None);
+        }
+        let fast_path =
+            self.memtable.is_empty() && self.mutable_run.is_empty() && self.run_refs.len() == 1;
+        // A Range/RangeF64 needs a column read *unless* its column has a
+        // learned (PGM) range index, in which case it's served in-memory.
+        let needs_column = conditions.iter().any(|c| match c {
+            Condition::Range { column_id, .. } => !self.learned_range.contains_key(column_id),
+            Condition::RangeF64 { column_id, .. } => !self.learned_range.contains_key(column_id),
+            _ => false,
+        });
+
+        // Open the reader once if a range needs a column read on the fast path;
+        // reuse it for the survivor gather. Off the fast path ranges are served
+        // via `resolve_condition` (no reader needed).
+        let mut reader_opt: Option<RunReader> = if fast_path && needs_column {
+            Some(self.open_reader(self.run_refs[0].run_id)?)
+        } else {
+            None
+        };
+        // Pre-read the row-id column once (reused for range filtering and, on the
+        // fast path, for survivor position lookup).
+        let row_id_data: Option<Vec<i64>> = if fast_path && needs_column {
+            let r = reader_opt.as_mut().expect("reader opened for range");
+            let col = r.column_native(crate::sorted_run::SYS_ROW_ID)?;
+            match col {
+                columnar::NativeColumn::Int64 { data, .. } => Some(data),
+                _ => return Err(MongrelError::InvalidArgument("sys row_id not int64".into())),
+            }
+        } else {
+            None
+        };
+
+        let mut sets: Vec<HashSet<u64>> = Vec::new();
+        for c in conditions {
+            let s: HashSet<u64> = match c {
+                Condition::Pk(key) => self
+                    .hot
+                    .get(key)
+                    .map(|r| std::iter::once(r.0).collect())
+                    .unwrap_or_default(),
+                Condition::BitmapEq { column_id, value } => self
+                    .bitmap
+                    .get(column_id)
+                    .map(|b| b.get(value).iter().map(|x| x as u64).collect())
+                    .unwrap_or_default(),
+                Condition::BitmapIn { column_id, values } => {
+                    let bm = self.bitmap.get(column_id);
+                    let mut acc = roaring::RoaringBitmap::new();
+                    if let Some(b) = bm {
+                        for v in values {
+                            acc |= b.get(v);
+                        }
+                    }
+                    acc.iter().map(|x| x as u64).collect()
+                }
+                Condition::FmContains { column_id, pattern } => self
+                    .fm
+                    .get(column_id)
+                    .map(|f| f.locate(pattern).into_iter().map(|r| r.0).collect())
+                    .unwrap_or_default(),
+                Condition::Ann {
+                    column_id,
+                    query,
+                    k,
+                } => self
+                    .ann
+                    .get(column_id)
+                    .map(|a| a.search(query, *k).into_iter().map(|(r, _)| r.0).collect())
+                    .unwrap_or_default(),
+                Condition::SparseMatch {
+                    column_id,
+                    query,
+                    k,
+                } => self
+                    .sparse
+                    .get(column_id)
+                    .map(|s| s.search(query, *k).into_iter().map(|(r, _)| r.0).collect())
+                    .unwrap_or_default(),
+                Condition::Range { column_id, lo, hi } => {
+                    if let Some(li) = self.learned_range.get(column_id) {
+                        li.range(*lo, *hi)
+                    } else if let Some(r) = reader_opt.as_mut() {
+                        r.range_row_ids_i64(*column_id, *lo, *hi)?
+                    } else {
+                        self.resolve_condition(c, snapshot)?
+                    }
+                }
+                Condition::RangeF64 {
+                    column_id,
+                    lo,
+                    lo_inclusive,
+                    hi,
+                    hi_inclusive,
+                } => {
+                    if let Some(li) = self.learned_range.get(column_id) {
+                        li.range_f64(*lo, *lo_inclusive, *hi, *hi_inclusive)
+                    } else if let Some(r) = reader_opt.as_mut() {
+                        r.range_row_ids_f64(*column_id, *lo, *lo_inclusive, *hi, *hi_inclusive)?
+                    } else {
+                        self.resolve_condition(c, snapshot)?
+                    }
+                }
+            };
+            sets.push(s);
+        }
+        let candidates = intersect_sets(sets);
+
+        // Build column list (projected or all user columns).
+        let col_ids: Vec<u16> = projection
+            .map(|p| p.to_vec())
+            .unwrap_or_else(|| self.schema.columns.iter().map(|c| c.id).collect());
+
+        if candidates.is_empty() {
+            // No matches → return zero-length columns of the right types.
+            let cols: Vec<(u16, columnar::NativeColumn)> = col_ids
+                .into_iter()
+                .map(|id| {
+                    let ty = self
+                        .schema
+                        .columns
+                        .iter()
+                        .find(|c| c.id == id)
+                        .map(|c| c.ty)
+                        .unwrap_or(TypeId::Bytes);
+                    (id, columnar::null_native(ty, 0))
+                })
+                .collect();
+            return Ok(Some(cols));
+        }
+
+        // Fast path: single run, empty memtable → binary-search survivor
+        // positions and gather only the projected columns.
+        if fast_path {
+            let mut reader = match reader_opt.take() {
+                Some(r) => r,
+                None => self.open_reader(self.run_refs[0].run_id)?,
+            };
+            let positions = match &row_id_data {
+                Some(ids) => {
+                    let mut p: Vec<usize> = candidates
+                        .iter()
+                        .filter_map(|rid| ids.binary_search(&(*rid as i64)).ok())
+                        .collect();
+                    p.sort_unstable();
+                    p
+                }
+                None => {
+                    let col = reader.column_native(crate::sorted_run::SYS_ROW_ID)?;
+                    match col {
+                        columnar::NativeColumn::Int64 { data, .. } => {
+                            let mut p: Vec<usize> = candidates
+                                .iter()
+                                .filter_map(|rid| data.binary_search(&(*rid as i64)).ok())
+                                .collect();
+                            p.sort_unstable();
+                            p
+                        }
+                        _ => {
+                            return Err(MongrelError::InvalidArgument(
+                                "sys row_id not int64".into(),
+                            ))
+                        }
+                    }
+                }
+            };
+            let mut cols = Vec::with_capacity(col_ids.len());
+            for cid in &col_ids {
+                let col = reader.column_native(*cid)?;
+                cols.push((*cid, col.gather(&positions)));
+            }
+            return Ok(Some(cols));
+        }
+
+        // Non-fast path (multi-run / live mutable-run tier): the survivor row-id
+        // set is already resolved above; materialize their columns via
+        // `rows_for_rids` and pivot to native columns. Correct for any layout
+        // (the fast path's single-reader gather is only an optimization). This
+        // keeps `Exact` pushdown honest when the fast path doesn't apply.
+        let mut rids: Vec<u64> = candidates.into_iter().collect();
+        rids.sort_unstable();
+        let rows = self.rows_for_rids(&rids, snapshot)?;
+        let mut cols: Vec<(u16, columnar::NativeColumn)> = Vec::with_capacity(col_ids.len());
+        for cid in &col_ids {
+            let ty = self
+                .schema
+                .columns
+                .iter()
+                .find(|c| c.id == *cid)
+                .map(|c| c.ty)
+                .unwrap_or(TypeId::Bytes);
+            let vals: Vec<Value> = rows
+                .iter()
+                .map(|r| r.columns.get(cid).cloned().unwrap_or(Value::Null))
+                .collect();
+            cols.push((*cid, columnar::values_to_native(ty, &vals)));
+        }
+        Ok(Some(cols))
+    }
+
+    /// Build a lazy, page-aware [`NativePageCursor`] for the single-run fast
+    /// path. MVCC visibility and predicate survivor resolution are settled up
+    /// front (so they see the live indexes under the DB lock); the cursor then
+    /// owns the reader and decodes only the projected columns of pages that
+    /// contain survivors, lazily. This is the fused-predicate + page-skip +
+    /// late-materialization scan.
+    ///
+    /// Phase 13.1: the memtable / mutable-run overlay is now handled. Rows with
+    /// a newer version in the overlay are excluded from the run's page plans
+    /// (their run version is stale); the overlay rows are pre-materialized and
+    /// appended as a final batch via [`NativePageCursor::new_with_overlay`].
+    ///
+    /// Returns `None` only for multiple sorted runs; the caller falls back to
+    /// the materialize-then-stream scan for that layout.
+    pub fn native_page_cursor(
+        &self,
+        snapshot: Snapshot,
+        projection: Vec<(u16, TypeId)>,
+        conditions: &[crate::query::Condition],
+    ) -> Result<Option<NativePageCursor>> {
+        use crate::cursor::build_page_plans;
+        if self.run_refs.len() != 1 {
+            return Ok(None);
+        }
+        let mut reader = self.open_reader(self.run_refs[0].run_id)?;
+        let (positions, rids) = reader.visible_positions_with_rids(snapshot.epoch)?;
+
+        // Collect overlay rows from memtable + mutable_run (visible, newest
+        // version per row). These shadow any stale version in the run.
+        let overlay_rids: HashSet<u64> = {
+            let mut s = HashSet::new();
+            for row in self.memtable.visible_versions(snapshot.epoch) {
+                s.insert(row.row_id.0);
+            }
+            for row in self.mutable_run.visible_versions(snapshot.epoch) {
+                s.insert(row.row_id.0);
+            }
+            s
+        };
+
+        // Resolve survivor rids via indexes (covers overlay rows for index-
+        // served conditions: PK, bitmap, FM, ANN, sparse — all maintained on
+        // every put).
+        let survivors = if conditions.is_empty() {
+            None
+        } else {
+            Some(self.resolve_survivor_rids(conditions, &mut reader)?)
+        };
+
+        // Exclude overlay rids from the run portion: their version in the run
+        // is stale (updated/deleted in the overlay) or they don't exist in the
+        // run (new inserts). When there are conditions, we remove overlay rids
+        // from the survivor set. When there are no conditions, we synthesize a
+        // survivor set = (all visible run rids) − (overlay rids) so the stale
+        // run rows are pruned.
+        let run_survivors: Option<HashSet<u64>> = if overlay_rids.is_empty() {
+            survivors.clone()
+        } else if let Some(s) = &survivors {
+            Some(
+                s.iter()
+                    .filter(|r| !overlay_rids.contains(r))
+                    .copied()
+                    .collect(),
+            )
+        } else {
+            Some(
+                rids.iter()
+                    .map(|&r| r as u64)
+                    .filter(|r| !overlay_rids.contains(r))
+                    .collect(),
+            )
+        };
+
+        let overlay_rows = if overlay_rids.is_empty() {
+            Vec::new()
+        } else {
+            self.overlay_visible_rows(snapshot)
+        };
+
+        // Build page plans for the run portion.
+        let plans = if positions.is_empty() {
+            Vec::new()
+        } else {
+            let page_rows = reader.page_row_counts(crate::sorted_run::SYS_ROW_ID)?;
+            build_page_plans(&positions, &rids, &page_rows, run_survivors.as_ref())
+        };
+
+        // Filter and materialize the overlay.
+        let overlay = if overlay_rows.is_empty() {
+            None
+        } else {
+            let filtered =
+                self.filter_overlay_rows(overlay_rows, conditions, survivors.as_ref(), snapshot)?;
+            if filtered.is_empty() {
+                None
+            } else {
+                Some(self.materialize_overlay(&filtered, &projection))
+            }
+        };
+
+        Ok(Some(NativePageCursor::new_with_overlay(
+            reader, projection, plans, overlay,
+        )))
+    }
+
+    /// Build a lazy streaming cursor over **multiple** sorted runs (Phase 16.1).
+    /// Generalizes [`Self::native_page_cursor`] (single-run) to arbitrary run
+    /// counts via a k-way merge by `RowId`. Cross-run MVCC resolution (newest
+    /// visible version per `RowId`) and predicate survivor resolution are settled
+    /// up front from the cheap system columns + global indexes; the cursor then
+    /// lazily decodes the projected data columns of just the pages that own
+    /// survivors, each page at most once. The memtable / mutable-run overlay is
+    /// materialized and yielded as a final batch (mirroring the single-run path).
+    ///
+    /// Returns `None` only when there are no runs at all (caller falls back).
+    #[allow(clippy::type_complexity)]
+    pub fn native_multi_run_cursor(
+        &self,
+        snapshot: Snapshot,
+        projection: Vec<(u16, TypeId)>,
+        conditions: &[crate::query::Condition],
+    ) -> Result<Option<crate::cursor::MultiRunCursor>> {
+        use crate::cursor::{MultiRunCursor, RunStream};
+        use crate::sorted_run::SYS_ROW_ID;
+        use std::collections::{BinaryHeap, HashMap, HashSet};
+        if self.run_refs.is_empty() {
+            return Ok(None);
+        }
+
+        // Open each run once; read its system columns + page layout.
+        let mut run_meta: Vec<(RunReader, Vec<i64>, Vec<i64>, Vec<u8>, Vec<usize>)> =
+            Vec::with_capacity(self.run_refs.len());
+        for rr in &self.run_refs {
+            let mut reader = self.open_reader(rr.run_id)?;
+            let (rids, eps, del) = reader.system_columns_native()?;
+            let page_rows = reader.page_row_counts(SYS_ROW_ID)?;
+            run_meta.push((reader, rids, eps, del, page_rows));
+        }
+
+        // Global cross-run newest-version resolution: rid -> (epoch, run_idx,
+        // position, deleted). Mirrors `visible_rows`, tracking which run owns
+        // the newest MVCC-visible version.
+        let mut best: HashMap<u64, (u64, usize, usize, bool)> = HashMap::new();
+        for (run_idx, (_, rids, eps, del, _)) in run_meta.iter().enumerate() {
+            for i in 0..rids.len() {
+                let rid = rids[i] as u64;
+                let e = eps[i] as u64;
+                if e > snapshot.epoch.0 {
+                    continue;
+                }
+                let is_del = del[i] != 0;
+                best.entry(rid)
+                    .and_modify(|cur| {
+                        if e > cur.0 {
+                            *cur = (e, run_idx, i, is_del);
+                        }
+                    })
+                    .or_insert((e, run_idx, i, is_del));
+            }
+        }
+
+        // Overlay rids (memtable + mutable-run) shadow every run version.
+        let overlay_rids: HashSet<u64> = {
+            let mut s = HashSet::new();
+            for row in self.memtable.visible_versions(snapshot.epoch) {
+                s.insert(row.row_id.0);
+            }
+            for row in self.mutable_run.visible_versions(snapshot.epoch) {
+                s.insert(row.row_id.0);
+            }
+            s
+        };
+
+        // Predicate survivors (global, layout-independent).
+        let survivors: Option<HashSet<u64>> = if conditions.is_empty() {
+            None
+        } else {
+            let mut sets: Vec<HashSet<u64>> = Vec::with_capacity(conditions.len());
+            for c in conditions {
+                sets.push(self.resolve_condition(c, snapshot)?);
+            }
+            Some(intersect_sets(sets))
+        };
+
+        // Per-run owned survivors: (rid, position), ascending by rid. A row is
+        // owned by the run holding its newest visible version, is not deleted,
+        // is not shadowed by the overlay, and satisfies the predicate.
+        let mut per_run: Vec<Vec<(u64, usize)>> = vec![Vec::new(); run_meta.len()];
+        for (rid, (_, run_idx, pos, deleted)) in &best {
+            if *deleted {
+                continue;
+            }
+            if overlay_rids.contains(rid) {
+                continue;
+            }
+            if let Some(s) = &survivors {
+                if !s.contains(rid) {
+                    continue;
+                }
+            }
+            per_run[*run_idx].push((*rid, *pos));
+        }
+        for v in per_run.iter_mut() {
+            v.sort_unstable_by_key(|&(rid, _)| rid);
+        }
+
+        // Build the merge streams: map each owned position to (page_seq, within).
+        let mut streams = Vec::with_capacity(run_meta.len());
+        let mut heap: BinaryHeap<std::cmp::Reverse<(u64, usize)>> = BinaryHeap::new();
+        let mut total = 0usize;
+        for (run_idx, (reader, _, _, _, page_rows)) in run_meta.into_iter().enumerate() {
+            let mut starts = Vec::with_capacity(page_rows.len());
+            let mut acc = 0usize;
+            for &r in &page_rows {
+                starts.push(acc);
+                acc += r;
+            }
+            let mut survivors_vec: Vec<(u64, usize, usize)> =
+                Vec::with_capacity(per_run[run_idx].len());
+            for &(rid, pos) in &per_run[run_idx] {
+                let page_seq = match starts.partition_point(|&s| s <= pos) {
+                    0 => continue,
+                    p => p - 1,
+                };
+                let within = pos - starts[page_seq];
+                survivors_vec.push((rid, page_seq, within));
+            }
+            total += survivors_vec.len();
+            if let Some(&(rid, _, _)) = survivors_vec.first() {
+                heap.push(std::cmp::Reverse((rid, run_idx)));
+            }
+            streams.push(RunStream::new(reader, survivors_vec, page_rows));
+        }
+
+        // Materialize the overlay (filtered + projected), yielded as the final batch.
+        let overlay_rows = if overlay_rids.is_empty() {
+            Vec::new()
+        } else {
+            self.overlay_visible_rows(snapshot)
+        };
+        let overlay = if overlay_rows.is_empty() {
+            None
+        } else {
+            let filtered =
+                self.filter_overlay_rows(overlay_rows, conditions, survivors.as_ref(), snapshot)?;
+            if filtered.is_empty() {
+                None
+            } else {
+                Some(self.materialize_overlay(&filtered, &projection))
+            }
+        };
+
+        Ok(Some(MultiRunCursor::new(
+            streams, projection, heap, total, overlay,
+        )))
+    }
+
+    /// Collect visible, non-deleted overlay rows from the memtable and mutable-
+    /// run tier at `snapshot`. These are the rows whose data lives only in the
+    /// in-memory buffers (not yet in a sorted run), or that shadow a stale
+    /// version in the run.
+    fn overlay_visible_rows(&self, snapshot: Snapshot) -> Vec<Row> {
+        let mut best: HashMap<u64, (Epoch, Row)> = HashMap::new();
+        let mut fold = |row: Row| {
+            best.entry(row.row_id.0)
+                .and_modify(|(be, br)| {
+                    if row.committed_epoch > *be {
+                        *be = row.committed_epoch;
+                        *br = row.clone();
+                    }
+                })
+                .or_insert_with(|| (row.committed_epoch, row));
+        };
+        for row in self.memtable.visible_versions(snapshot.epoch) {
+            fold(row);
+        }
+        for row in self.mutable_run.visible_versions(snapshot.epoch) {
+            fold(row);
+        }
+        let mut out: Vec<Row> = best
+            .into_values()
+            .filter_map(|(_, r)| if r.deleted { None } else { Some(r) })
+            .collect();
+        out.sort_by_key(|r| r.row_id);
+        out
+    }
+
+    /// Filter overlay rows against the conjunctive predicate. Range / RangeF64
+    /// are evaluated directly (the reader-served survivor set misses overlay
+    /// rows). All other conditions are index-served (indexes maintained on
+    /// every `put`) so the intersected `survivors` set includes overlay rows
+    /// that match — but ONLY when every condition is index-served. When there
+    /// is a mix, we compute per-condition index sets for non-range conditions
+    /// and evaluate range conditions directly, so the intersection is correct.
+    fn filter_overlay_rows(
+        &self,
+        rows: Vec<Row>,
+        conditions: &[crate::query::Condition],
+        survivors: Option<&HashSet<u64>>,
+        snapshot: Snapshot,
+    ) -> Result<Vec<Row>> {
+        if conditions.is_empty() {
+            return Ok(rows);
+        }
+        use crate::query::Condition;
+        // Determine whether every condition is index-served (survivors set is
+        // then complete for overlay rows). If so, a simple membership check
+        // suffices and is cheapest.
+        let all_index_served = !conditions
+            .iter()
+            .any(|c| matches!(c, Condition::Range { .. } | Condition::RangeF64 { .. }));
+        if all_index_served {
+            return Ok(rows
+                .into_iter()
+                .filter(|r| survivors.map_or(true, |s| s.contains(&r.row_id.0)))
+                .collect());
+        }
+        // Mixed: compute per-condition index sets for non-range conditions, and
+        // evaluate range conditions directly on column values.
+        let mut per_cond_sets: Vec<HashSet<u64>> = Vec::with_capacity(conditions.len());
+        for c in conditions {
+            let s = match c {
+                Condition::Range { .. } | Condition::RangeF64 { .. } => HashSet::new(),
+                _ => self.resolve_condition(c, snapshot)?,
+            };
+            per_cond_sets.push(s);
+        }
+        Ok(rows
+            .into_iter()
+            .filter(|row| {
+                conditions.iter().enumerate().all(|(i, c)| match c {
+                    Condition::Range { column_id, lo, hi } => {
+                        matches!(row.columns.get(column_id), Some(Value::Int64(v)) if *v >= *lo && *v <= *hi)
+                    }
+                    Condition::RangeF64 { column_id, lo, lo_inclusive, hi, hi_inclusive } => {
+                        match row.columns.get(column_id) {
+                            Some(Value::Float64(v)) => {
+                                let lo_ok = if *lo_inclusive { *v >= *lo } else { *v > *lo };
+                                let hi_ok = if *hi_inclusive { *v <= *hi } else { *v < *hi };
+                                lo_ok && hi_ok
+                            }
+                            _ => false,
+                        }
+                    }
+                    _ => per_cond_sets[i].contains(&row.row_id.0),
+                })
+            })
+            .collect())
+    }
+
+    /// Materialize overlay rows into typed `NativeColumn`s for the cursor's
+    /// final batch.
+    fn materialize_overlay(
+        &self,
+        rows: &[Row],
+        projection: &[(u16, TypeId)],
+    ) -> Vec<columnar::NativeColumn> {
+        if projection.is_empty() {
+            return vec![columnar::null_native(TypeId::Int64, rows.len())];
+        }
+        let mut cols = Vec::with_capacity(projection.len());
+        for (cid, ty) in projection {
+            let vals: Vec<Value> = rows
+                .iter()
+                .map(|r| r.columns.get(cid).cloned().unwrap_or(Value::Null))
+                .collect();
+            cols.push(columnar::values_to_native(*ty, &vals));
+        }
+        cols
+    }
+
+    /// Resolve a conjunctive predicate to its surviving `RowId` set on the
+    /// single-run fast path: each condition becomes a `RowId` set via the
+    /// in-memory indexes or the reader's page-pruned range scan, then they are
+    /// intersected. Mirrors the resolution inside [`Self::query_columns_native`].
+    fn resolve_survivor_rids(
+        &self,
+        conditions: &[crate::query::Condition],
+        reader: &mut RunReader,
+    ) -> Result<std::collections::HashSet<u64>> {
+        use crate::query::Condition;
+        let mut sets: Vec<std::collections::HashSet<u64>> = Vec::new();
+        for c in conditions {
+            let s: std::collections::HashSet<u64> = match c {
+                Condition::Pk(key) => self
+                    .hot
+                    .get(key)
+                    .map(|r| std::iter::once(r.0).collect())
+                    .unwrap_or_default(),
+                Condition::BitmapEq { column_id, value } => self
+                    .bitmap
+                    .get(column_id)
+                    .map(|b| b.get(value).iter().map(|x| x as u64).collect())
+                    .unwrap_or_default(),
+                Condition::BitmapIn { column_id, values } => {
+                    let bm = self.bitmap.get(column_id);
+                    let mut acc = roaring::RoaringBitmap::new();
+                    if let Some(b) = bm {
+                        for v in values {
+                            acc |= b.get(v);
+                        }
+                    }
+                    acc.iter().map(|x| x as u64).collect()
+                }
+                Condition::FmContains { column_id, pattern } => self
+                    .fm
+                    .get(column_id)
+                    .map(|f| f.locate(pattern).into_iter().map(|r| r.0).collect())
+                    .unwrap_or_default(),
+                Condition::Ann {
+                    column_id,
+                    query,
+                    k,
+                } => self
+                    .ann
+                    .get(column_id)
+                    .map(|a| a.search(query, *k).into_iter().map(|(r, _)| r.0).collect())
+                    .unwrap_or_default(),
+                Condition::SparseMatch {
+                    column_id,
+                    query,
+                    k,
+                } => self
+                    .sparse
+                    .get(column_id)
+                    .map(|s| s.search(query, *k).into_iter().map(|(r, _)| r.0).collect())
+                    .unwrap_or_default(),
+                Condition::Range { column_id, lo, hi } => {
+                    if let Some(li) = self.learned_range.get(column_id) {
+                        li.range(*lo, *hi)
+                    } else {
+                        reader.range_row_ids_i64(*column_id, *lo, *hi)?
+                    }
+                }
+                Condition::RangeF64 {
+                    column_id,
+                    lo,
+                    lo_inclusive,
+                    hi,
+                    hi_inclusive,
+                } => {
+                    if let Some(li) = self.learned_range.get(column_id) {
+                        li.range_f64(*lo, *lo_inclusive, *hi, *hi_inclusive)
+                    } else {
+                        reader.range_row_ids_f64(
+                            *column_id,
+                            *lo,
+                            *lo_inclusive,
+                            *hi,
+                            *hi_inclusive,
+                        )?
+                    }
+                }
+            };
+            sets.push(s);
+        }
+        Ok(intersect_sets(sets))
+    }
+
+    /// Native vectorized aggregate over a (possibly filtered) column on the
+    /// single-run fast path (Phase 7.2). Resolves survivors via the same
+    /// page-pruned cursor as the scan, then accumulates the aggregate in one
+    /// pass over the typed buffer — no `Value`, no Arrow `RecordBatch`.
+    ///
+    /// `column` is `None` for `COUNT(*)`. Returns `Ok(None)` when the fast path
+    /// does not apply (multi-run / non-empty memtable); the caller scans.
+    pub fn aggregate_native(
+        &self,
+        snapshot: Snapshot,
+        column: Option<u16>,
+        conditions: &[crate::query::Condition],
+        agg: NativeAgg,
+    ) -> Result<Option<NativeAggResult>> {
+        if self.run_refs.len() != 1 {
+            return Ok(None);
+        }
+        // COUNT(*) needs no decode — the survivor count comes from the cursor's
+        // precomputed page plans. (COUNT(col) would have to exclude nulls; defer
+        // to the caller's scan path by returning None for it.)
+        if matches!(agg, NativeAgg::Count) {
+            if column.is_some() {
+                return Ok(None);
+            }
+            let n = match self.native_page_cursor(snapshot, Vec::new(), conditions)? {
+                Some(cursor) => cursor.remaining_rows(),
+                None => return Ok(None),
+            };
+            return Ok(Some(NativeAggResult::Count(n as u64)));
+        }
+        let cid = match column {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+        let ty = self.column_type(cid);
+        let cursor = match self.native_page_cursor(snapshot, vec![(cid, ty)], conditions)? {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+        match ty {
+            TypeId::Int64 | TypeId::TimestampNanos | TypeId::Date32 => {
+                let (count, sum, mn, mx) = accumulate_int(cursor)?;
+                Ok(Some(pack_int(agg, count, sum, mn, mx)))
+            }
+            TypeId::Float64 => {
+                let (count, sum, mn, mx) = accumulate_float(cursor)?;
+                Ok(Some(pack_float(agg, count, sum, mn, mx)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Incremental aggregate over the live table (Phase 8.3). For an append-only
+    /// table, a warm cache entry (same `cache_key`) lets the result be refreshed
+    /// by aggregating **only the newly inserted rows** (row-id watermark delta)
+    /// and merging, instead of a full recompute. The caller supplies a stable
+    /// `cache_key` (e.g. a hash of the SQL + projection); distinct queries must
+    /// use distinct keys.
+    ///
+    /// Returns [`IncrementalAggResult`] with the merged state and whether the
+    /// delta path was taken. A single `delete` (ever) disables the incremental
+    /// path for the table, so correctness never relies on append-only behavior
+    /// that deletes invalidate.
+    pub fn aggregate_incremental(
+        &mut self,
+        cache_key: u64,
+        conditions: &[crate::query::Condition],
+        column: Option<u16>,
+        agg: NativeAgg,
+    ) -> Result<IncrementalAggResult> {
+        let snap = self.snapshot();
+        let cur_wm = self.allocator.current().0;
+        let cur_epoch = snap.epoch.0;
+        // The watermark equals the committed row count only when the memtable is
+        // empty (every allocated row id is durably in a run). With pending
+        // (uncommitted) writes the allocator is ahead of the visible set, so the
+        // delta range would silently skip just-committed rows — disable the
+        // incremental path entirely in that case. The mutable-run tier holding
+        // un-spilled data also disables it (those rows aren't in a run yet).
+        let incremental_ok =
+            !self.had_deletes && self.memtable.is_empty() && self.mutable_run.is_empty();
+
+        // Incremental path: append-only, no pending writes, warm cache, advanced
+        // epoch.
+        if incremental_ok {
+            if let Some(cached) = self.agg_cache.get(&cache_key).cloned() {
+                if cached.epoch == cur_epoch {
+                    return Ok(IncrementalAggResult {
+                        state: cached.state,
+                        incremental: true,
+                        delta_rows: 0,
+                    });
+                }
+                if cached.epoch < cur_epoch && cached.watermark <= cur_wm {
+                    let delta_rids: Vec<u64> = (cached.watermark..cur_wm).collect();
+                    let delta_rows = self.rows_for_rids(&delta_rids, snap)?;
+                    let index_sets = self.resolve_index_conditions(conditions, snap)?;
+                    let delta_state = agg_state_from_rows(
+                        &delta_rows,
+                        conditions,
+                        &index_sets,
+                        column,
+                        agg,
+                        &self.schema,
+                    )?;
+                    let merged = cached.state.merge(delta_state);
+                    let delta_n = delta_rids.len() as u64;
+                    self.agg_cache.insert(
+                        cache_key,
+                        CachedAgg {
+                            state: merged.clone(),
+                            watermark: cur_wm,
+                            epoch: cur_epoch,
+                        },
+                    );
+                    return Ok(IncrementalAggResult {
+                        state: merged,
+                        incremental: true,
+                        delta_rows: delta_n,
+                    });
+                }
+            }
+        }
+
+        // Cold path. For Count/Sum/Min/Max the fast vectorized cursor produces a
+        // directly-seedable state; for Avg it returns only the mean (losing the
+        // sum+count needed to merge a future delta), so Avg falls back to a
+        // visible-rows scan that captures both.
+        let cursor_ok =
+            self.memtable.is_empty() && self.mutable_run.is_empty() && self.run_refs.len() == 1;
+        let state = if cursor_ok && agg != NativeAgg::Avg {
+            match self.aggregate_native(snap, column, conditions, agg)? {
+                Some(result) => {
+                    AggState::from_native(result, agg, column.map(|c| self.column_type(c)))
+                }
+                None => self.agg_state_full_scan(conditions, column, agg, snap)?,
+            }
+        } else {
+            self.agg_state_full_scan(conditions, column, agg, snap)?
+        };
+        // Seed only when the watermark is meaningful (no pending writes).
+        if incremental_ok {
+            self.agg_cache.insert(
+                cache_key,
+                CachedAgg {
+                    state: state.clone(),
+                    watermark: cur_wm,
+                    epoch: cur_epoch,
+                },
+            );
+        }
+        Ok(IncrementalAggResult {
+            state,
+            incremental: false,
+            delta_rows: 0,
+        })
+    }
+
+    /// Full visible-rows scan → [`AggState`] (cold path; captures sum+count for
+    /// correct Avg seeding).
+    fn agg_state_full_scan(
+        &self,
+        conditions: &[crate::query::Condition],
+        column: Option<u16>,
+        agg: NativeAgg,
+        snap: Snapshot,
+    ) -> Result<AggState> {
+        let rows = self.visible_rows(snap)?;
+        let index_sets = self.resolve_index_conditions(conditions, snap)?;
+        agg_state_from_rows(&rows, conditions, &index_sets, column, agg, &self.schema)
+    }
+
+    /// Resolve only the index-defined conditions (`Ann`/`SparseMatch`) to row-id
+    /// sets for membership testing during row-wise aggregation.
+    fn resolve_index_conditions(
+        &self,
+        conditions: &[crate::query::Condition],
+        snapshot: Snapshot,
+    ) -> Result<Vec<std::collections::HashSet<u64>>> {
+        use crate::query::Condition;
+        let mut sets = Vec::new();
+        for c in conditions {
+            if matches!(c, Condition::Ann { .. } | Condition::SparseMatch { .. }) {
+                sets.push(self.resolve_condition(c, snapshot)?);
+            }
+        }
+        Ok(sets)
+    }
+
+    fn column_type(&self, cid: u16) -> TypeId {
+        self.schema
+            .columns
+            .iter()
+            .find(|c| c.id == cid)
+            .map(|c| c.ty)
+            .unwrap_or(TypeId::Bytes)
+    }
+
+    /// Approximate `COUNT`/`SUM`/`AVG` over a filtered set, computed from the
+    /// in-memory reservoir sample (Phase 8.2). Returns a point estimate plus a
+    /// normal-theory confidence interval at the supplied z-score (1.96 ≈ 95 %).
+    ///
+    /// The WHERE predicates are evaluated **exactly** on each sampled row (so
+    /// LIKE/FM and equality/range contribute no index bias); `Ann`/`SparseMatch`
+    /// are index-defined and resolved once to a row-id set that sampled rows are
+    /// tested against. `Ok(None)` when there is no usable sample.
+    pub fn approx_aggregate(
+        &self,
+        conditions: &[crate::query::Condition],
+        column: Option<u16>,
+        agg: ApproxAgg,
+        z: f64,
+    ) -> Result<Option<ApproxResult>> {
+        use crate::query::Condition;
+        use std::collections::HashSet;
+        let snapshot = self.snapshot();
+        let n_pop = self.live_count;
+        let sample_rids: Vec<u64> = self.reservoir.row_ids().to_vec();
+        if sample_rids.is_empty() {
+            return Ok(None);
+        }
+        // Materialize the live, non-deleted sampled rows.
+        let live_sample = self.rows_for_rids(&sample_rids, snapshot)?;
+        let s = live_sample.len();
+        if s == 0 {
+            return Ok(None);
+        }
+
+        // Pre-resolve Ann/Sparse conditions (index-defined predicates) to row-id
+        // sets; the per-row predicates below are evaluated exactly.
+        let mut index_sets: Vec<HashSet<u64>> = Vec::new();
+        for c in conditions {
+            if matches!(c, Condition::Ann { .. } | Condition::SparseMatch { .. }) {
+                index_sets.push(self.resolve_condition(c, snapshot)?);
+            }
+        }
+
+        // For Sum/Avg, gather the numeric column value of each passing row.
+        let cid = match (agg, column) {
+            (ApproxAgg::Count, _) => None,
+            (_, Some(c)) => Some(c),
+            _ => return Ok(None),
+        };
+        let mut passing_vals: Vec<f64> = Vec::with_capacity(s);
+        for r in &live_sample {
+            // Exact per-row predicate evaluation.
+            if !conditions
+                .iter()
+                .all(|c| condition_matches_row(c, r, &self.schema))
+            {
+                continue;
+            }
+            // Ann/Sparse membership.
+            if !index_sets.iter().all(|set| set.contains(&r.row_id.0)) {
+                continue;
+            }
+            if let Some(cid) = cid {
+                if let Some(v) = as_f64(r.columns.get(&cid)) {
+                    passing_vals.push(v);
+                } // nulls ⇒ excluded (matching SQL AVG/SUM null semantics)
+            } else {
+                passing_vals.push(0.0); // placeholder for COUNT
+            }
+        }
+        let m = passing_vals.len();
+
+        let (point, half) = match agg {
+            ApproxAgg::Count => {
+                // Proportion estimate scaled to the population.
+                let p = m as f64 / s as f64;
+                let point = n_pop as f64 * p;
+                let var = if s > 1 {
+                    n_pop as f64 * n_pop as f64 * p * (1.0 - p) / s as f64
+                        * (1.0 - s as f64 / n_pop as f64).max(0.0)
+                } else {
+                    0.0
+                };
+                (point, z * var.sqrt())
+            }
+            ApproxAgg::Sum => {
+                // Horvitz–Thompson: each sampled row represents n_pop/s rows.
+                let y: Vec<f64> = live_sample
+                    .iter()
+                    .map(|r| {
+                        let passes_row = conditions
+                            .iter()
+                            .all(|c| condition_matches_row(c, r, &self.schema))
+                            && index_sets.iter().all(|set| set.contains(&r.row_id.0));
+                        if passes_row {
+                            cid.and_then(|c| as_f64(r.columns.get(&c))).unwrap_or(0.0)
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect();
+                let mean_y = y.iter().sum::<f64>() / s as f64;
+                let point = n_pop as f64 * mean_y;
+                let var = if s > 1 {
+                    let ss: f64 = y.iter().map(|v| (v - mean_y).powi(2)).sum();
+                    let var_y = ss / (s - 1) as f64;
+                    n_pop as f64 * n_pop as f64 * var_y / s as f64
+                        * (1.0 - s as f64 / n_pop as f64).max(0.0)
+                } else {
+                    0.0
+                };
+                (point, z * var.sqrt())
+            }
+            ApproxAgg::Avg => {
+                if m == 0 {
+                    return Ok(Some(ApproxResult {
+                        point: 0.0,
+                        ci_low: 0.0,
+                        ci_high: 0.0,
+                        n_population: n_pop,
+                        n_sample_live: s,
+                        n_passing: 0,
+                    }));
+                }
+                let mean = passing_vals.iter().sum::<f64>() / m as f64;
+                let half = if m > 1 {
+                    let ss: f64 = passing_vals.iter().map(|v| (v - mean).powi(2)).sum();
+                    let sd = (ss / (m - 1) as f64).sqrt();
+                    let fpc = (1.0 - s as f64 / n_pop as f64).max(0.0);
+                    z * sd / (m as f64).sqrt() * fpc.sqrt()
+                } else {
+                    0.0
+                };
+                (mean, half)
+            }
+        };
+
+        Ok(Some(ApproxResult {
+            point,
+            ci_low: point - half,
+            ci_high: point + half,
+            n_population: n_pop,
+            n_sample_live: s,
+            n_passing: m,
+        }))
+    }
+
+    /// Exact per-column statistics for the analytical aggregate fast path
+    /// (Phase 7.1: `MIN`/`MAX`/`COUNT(col)` from page stats). Returns `None`
+    /// unless the table is effectively insert-only at `snapshot` — empty
+    /// memtable, a single sorted run, and `live_count == run.row_count()` — so
+    /// the run's page `min`/`max`/`null_count` are exact (no tombstoned or
+    /// superseded versions skew them). Under deletes/updates the caller falls
+    /// back to scanning.
+    pub fn exact_column_stats(
+        &self,
+        _snapshot: Snapshot,
+        projection: &[u16],
+    ) -> Result<Option<HashMap<u16, ColumnStat>>> {
+        if !(self.memtable.is_empty() && self.mutable_run.is_empty() && self.run_refs.len() == 1) {
+            return Ok(None);
+        }
+        let reader = self.open_reader(self.run_refs[0].run_id)?;
+        if self.live_count != reader.row_count() as u64 {
+            return Ok(None);
+        }
+        let mut out = HashMap::new();
+        for &cid in projection {
+            let cdef = match self.schema.columns.iter().find(|c| c.id == cid) {
+                Some(c) => c,
+                None => continue,
+            };
+            // Absent column (schema evolution) ⇒ all rows null.
+            let Some(stats) = reader.column_page_stats(cid) else {
+                out.insert(
+                    cid,
+                    ColumnStat {
+                        min: None,
+                        max: None,
+                        null_count: self.live_count,
+                    },
+                );
+                continue;
+            };
+            let stat = match cdef.ty {
+                TypeId::Int64 | TypeId::TimestampNanos | TypeId::Date32 => {
+                    agg_int(stats, crate::sorted_run::be_i64).map(|(mn, mx, n)| ColumnStat {
+                        min: mn.map(Value::Int64),
+                        max: mx.map(Value::Int64),
+                        null_count: n,
+                    })
+                }
+                TypeId::Float64 => {
+                    agg_float(stats, crate::sorted_run::be_f64).map(|(mn, mx, n)| ColumnStat {
+                        min: mn.map(Value::Float64),
+                        max: mx.map(Value::Float64),
+                        null_count: n,
+                    })
+                }
+                _ => None,
+            };
+            if let Some(s) = stat {
+                out.insert(cid, s);
+            }
+        }
+        Ok(Some(out))
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    pub fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    /// Add a nullable column to the schema (schema evolution). Existing runs
+    /// simply read back as null for the new column until re-written. Persists
+    /// the new schema and manifest.
+    pub fn add_column(&mut self, name: &str, ty: TypeId) -> Result<u16> {
+        if self.schema.columns.iter().any(|c| c.name == name) {
+            return Err(MongrelError::Schema(format!(
+                "column {name} already exists"
+            )));
+        }
+        let id = self.schema.columns.iter().map(|c| c.id).max().unwrap_or(0) + 1;
+        self.schema.columns.push(ColumnDef {
+            id,
+            name: name.to_string(),
+            ty,
+            flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+        });
+        self.schema.schema_id = self.schema.schema_id.saturating_add(1);
+        write_schema(&self.dir, &self.schema)?;
+        self.clear_result_cache();
+        // Phase 15.5: invalidate Arrow IPC shadows (schema changed).
+        let _ = std::fs::remove_dir_all(self.dir.join("_shadow"));
+        self.persist_manifest(self.current_epoch())?;
+        Ok(id)
+    }
+
+    /// Declare a `LearnedRange` (PGM) index on an existing numeric column and
+    /// build it immediately from the current sorted run (Phase 13.3). After
+    /// this, `Condition::Range` / `Condition::RangeF64` on that column resolve
+    /// survivors sub-linearly (O(log segments + log ε)) instead of scanning the
+    /// full column.
+    ///
+    /// Requires exactly one sorted run (call after `flush`). The index is
+    /// rebuilt automatically on subsequent flushes.
+    pub fn add_learned_range_index(&mut self, column_name: &str) -> Result<()> {
+        let cid = self
+            .schema
+            .columns
+            .iter()
+            .find(|c| c.name == column_name)
+            .map(|c| c.id)
+            .ok_or_else(|| MongrelError::Schema(format!("unknown column {column_name}")))?;
+        let ty = self
+            .schema
+            .columns
+            .iter()
+            .find(|c| c.id == cid)
+            .map(|c| c.ty)
+            .unwrap_or(TypeId::Int64);
+        if !matches!(
+            ty,
+            TypeId::Int64 | TypeId::Float64 | TypeId::TimestampNanos | TypeId::Date32
+        ) {
+            return Err(MongrelError::Schema(format!(
+                "LearnedRange requires a numeric column; {column_name} is {ty:?}"
+            )));
+        }
+        if self
+            .schema
+            .indexes
+            .iter()
+            .any(|i| i.column_id == cid && i.kind == IndexKind::LearnedRange)
+        {
+            return Ok(()); // already declared
+        }
+        self.schema.indexes.push(IndexDef {
+            name: format!("{}_learned_range", column_name),
+            column_id: cid,
+            kind: IndexKind::LearnedRange,
+        });
+        self.schema.schema_id = self.schema.schema_id.saturating_add(1);
+        write_schema(&self.dir, &self.schema)?;
+        self.build_learned_ranges()?;
+        Ok(())
+    }
+
+    /// Tuning knob for the WAL auto-sync threshold.
+    pub fn set_sync_byte_threshold(&mut self, threshold: u64) {
+        self.sync_byte_threshold = threshold;
+        self.wal.set_sync_byte_threshold(threshold);
+    }
+
+    /// Flush all live page-cache entries to the persistent `_cache/` backing
+    /// directory (best-effort). Useful before a clean shutdown so hot pages
+    /// survive restart.
+    pub fn page_cache_flush(&self) {
+        self.page_cache.lock().flush_to_disk();
+    }
+
+    /// Number of entries currently in the shared page cache (diagnostic).
+    pub fn page_cache_len(&self) -> usize {
+        self.page_cache.lock().len()
+    }
+
+    /// Number of entries currently in the shared decoded-page cache (Phase
+    /// 15.4 diagnostic).
+    pub fn decoded_cache_len(&self) -> usize {
+        self.decoded_cache.lock().len()
+    }
+
+    /// Drain the live memtable (prototype/testing helper used by the flush path
+    /// demos). Prefer [`Db::flush`] for the durable path.
+    pub fn drain_memtable_sorted(&mut self) -> Vec<Row> {
+        self.memtable.drain_sorted()
+    }
+
+    pub(crate) fn run_path(&self, run_id: u64) -> PathBuf {
+        self.dir.join(RUNS_DIR).join(format!("r-{run_id}.sr"))
+    }
+
+    pub(crate) fn open_reader(&self, run_id: u128) -> Result<RunReader> {
+        RunReader::open_with_cache(
+            self.dir.join(RUNS_DIR).join(format!("r-{run_id}.sr")),
+            self.schema.clone(),
+            self.kek.clone(),
+            Some(self.page_cache.clone()),
+            Some(self.decoded_cache.clone()),
+        )
+    }
+
+    pub(crate) fn run_refs(&self) -> &[RunRef] {
+        &self.run_refs
+    }
+
+    pub(crate) fn runs_dir(&self) -> PathBuf {
+        self.dir.join(RUNS_DIR)
+    }
+
+    pub(crate) fn wal_dir(&self) -> PathBuf {
+        self.dir.join(WAL_DIR)
+    }
+
+    pub(crate) fn set_run_refs(&mut self, refs: Vec<RunRef>) {
+        self.run_refs = refs;
+    }
+
+    pub(crate) fn next_run_id(&self) -> u64 {
+        self.next_run_id
+    }
+
+    pub(crate) fn compaction_zstd_level(&self) -> i32 {
+        self.compaction_zstd_level
+    }
+
+    pub(crate) fn bump_next_run_id(&mut self) {
+        self.next_run_id += 1;
+    }
+
+    pub(crate) fn kek(&self) -> Option<Arc<Kek>> {
+        self.kek.clone()
+    }
+
+    /// `(column_id, scheme)` for every ENCRYPTED_INDEXABLE column — passed to
+    /// the run writer so each run's descriptor records the column keys.
+    pub(crate) fn indexable_column_specs(&self) -> Vec<(u16, u8)> {
+        self.column_keys
+            .iter()
+            .map(|(&id, &(_, scheme))| (id, scheme))
+            .collect()
+    }
+
+    /// Tokenize a value for an ENCRYPTED_INDEXABLE column (HMAC-eq or OPE-range,
+    /// per the column's scheme). Returns `None` for plaintext columns. Indexes
+    /// over such columns store tokens, and queries tokenize literals the same
+    /// way — so lookups never decrypt the stored (encrypted) page payloads.
+    #[cfg(feature = "encryption")]
+    fn tokenize_value(&self, column_id: u16, v: &Value) -> Option<Value> {
+        self.tokenize_value_enc(column_id, v)
+    }
+
+    #[cfg(feature = "encryption")]
+    fn tokenize_value_enc(&self, column_id: u16, v: &Value) -> Option<Value> {
+        use crate::encryption::{hmac_token, ope_token_f64, ope_token_i64, SCHEME_HMAC_EQ};
+        let (key, scheme) = self.column_keys.get(&column_id)?;
+        let token: Vec<u8> = match (*scheme, v) {
+            (SCHEME_HMAC_EQ, _) => hmac_token(key, &v.encode_key()).to_vec(),
+            (_, Value::Int64(x)) => ope_token_i64(key, *x).to_vec(),
+            (_, Value::Float64(x)) => ope_token_f64(key, *x).to_vec(),
+            _ => hmac_token(key, &v.encode_key()).to_vec(),
+        };
+        Some(Value::Bytes(token))
+    }
+
+    /// Encoded index key for a `Value`, tokenized for HMAC-eq columns.
+    fn index_lookup_key(&self, column_id: u16, v: &Value) -> Vec<u8> {
+        self.index_lookup_key_bytes(column_id, &v.encode_key())
+    }
+
+    /// Tokenize an already-encoded lookup key (equality queries pass the
+    /// encoded search value; HMAC-eq columns wrap it under the column key).
+    fn index_lookup_key_bytes(&self, column_id: u16, encoded: &[u8]) -> Vec<u8> {
+        #[cfg(feature = "encryption")]
+        {
+            use crate::encryption::{hmac_token, SCHEME_HMAC_EQ};
+            if let Some((key, scheme)) = self.column_keys.get(&column_id) {
+                if *scheme == SCHEME_HMAC_EQ {
+                    return hmac_token(key, encoded).to_vec();
+                }
+            }
+        }
+        let _ = column_id;
+        encoded.to_vec()
+    }
+}
+
+fn intersect_sets(sets: Vec<std::collections::HashSet<u64>>) -> std::collections::HashSet<u64> {
+    let mut iter = sets.into_iter();
+    match iter.next() {
+        None => std::collections::HashSet::new(),
+        Some(first) => iter.fold(first, |acc, s| acc.intersection(&s).copied().collect()),
+    }
+}
+
+/// Exact aggregate of a column's page stats into a min/max/null_count triple
+/// (Phase 7.1). Only meaningful when the owning table is insert-only, which
+/// [`Db::exact_column_stats`] gates on.
+#[derive(Debug, Clone)]
+pub struct ColumnStat {
+    pub min: Option<Value>,
+    pub max: Option<Value>,
+    pub null_count: u64,
+}
+
+/// A supported native aggregate (Phase 7.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeAgg {
+    Count,
+    Sum,
+    Min,
+    Max,
+    Avg,
+}
+
+/// The typed result of a [`NativeAgg`] over a column.
+#[derive(Debug, Clone)]
+pub enum NativeAggResult {
+    Count(u64),
+    Int(i64),
+    Float(f64),
+    /// No non-null inputs (SUM/MIN/MAX/AVG over zero rows ⇒ SQL NULL).
+    Null,
+}
+
+/// A supported approximate aggregate over the reservoir sample (Phase 8.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApproxAgg {
+    Count,
+    Sum,
+    Avg,
+}
+
+/// Point estimate with a normal-theory confidence interval from the reservoir
+/// sample (Phase 8.2). `ci_low`/`ci_high` bracket `point` at the requested
+/// z-score; the interval has zero width when the sample equals the whole table.
+#[derive(Debug, Clone)]
+pub struct ApproxResult {
+    /// Point estimate of the aggregate.
+    pub point: f64,
+    /// Lower bound (`point − z·SE`).
+    pub ci_low: f64,
+    /// Upper bound (`point + z·SE`).
+    pub ci_high: f64,
+    /// Live population size (the table's `count()`).
+    pub n_population: u64,
+    /// Live rows in the sample (`≤` reservoir capacity).
+    pub n_sample_live: usize,
+    /// Sampled rows passing the WHERE predicate.
+    pub n_passing: usize,
+}
+
+/// A mergeable running aggregate state (Phase 8.3). Two states over disjoint
+/// row sets `merge` into the state over their union, so a cached analytical
+/// aggregate can be updated by merging in only the delta (newly inserted rows)
+/// instead of a full recompute.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AggState {
+    /// `COUNT(*)` or `COUNT(col)` over `n` matching rows.
+    Count(u64),
+    /// Int64 `SUM`: running `i128` sum + non-null count.
+    SumI {
+        sum: i128,
+        count: u64,
+    },
+    /// Float64 `SUM`: running `f64` sum + non-null count.
+    SumF {
+        sum: f64,
+        count: u64,
+    },
+    /// Int64 `AVG`: running `i128` sum + non-null count (avg = sum/count).
+    AvgI {
+        sum: i128,
+        count: u64,
+    },
+    /// Float64 `AVG`: running `f64` sum + non-null count.
+    AvgF {
+        sum: f64,
+        count: u64,
+    },
+    /// Int64 `MIN`/`MAX`.
+    MinI(i64),
+    MaxI(i64),
+    /// Float64 `MIN`/`MAX`.
+    MinF(f64),
+    MaxF(f64),
+    /// No matching rows observed yet.
+    Empty,
+}
+
+impl AggState {
+    /// Combine two states over disjoint row sets into the state over the union.
+    pub fn merge(self, other: AggState) -> AggState {
+        use AggState::*;
+        match (self, other) {
+            (Empty, x) | (x, Empty) => x,
+            (Count(a), Count(b)) => Count(a + b),
+            (SumI { sum: sa, count: ca }, SumI { sum: sb, count: cb }) => SumI {
+                sum: sa + sb,
+                count: ca + cb,
+            },
+            (SumF { sum: sa, count: ca }, SumF { sum: sb, count: cb }) => SumF {
+                sum: sa + sb,
+                count: ca + cb,
+            },
+            (AvgI { sum: sa, count: ca }, AvgI { sum: sb, count: cb }) => AvgI {
+                sum: sa + sb,
+                count: ca + cb,
+            },
+            (AvgF { sum: sa, count: ca }, AvgF { sum: sb, count: cb }) => AvgF {
+                sum: sa + sb,
+                count: ca + cb,
+            },
+            (MinI(a), MinI(b)) => MinI(a.min(b)),
+            (MaxI(a), MaxI(b)) => MaxI(a.max(b)),
+            (MinF(a), MinF(b)) => MinF(a.min(b)),
+            (MaxF(a), MaxF(b)) => MaxF(a.max(b)),
+            _ => Empty, // mismatched kinds — shouldn't happen (same query)
+        }
+    }
+
+    /// The scalar point value (`f64`), or `None` when there were no inputs.
+    pub fn point(&self) -> Option<f64> {
+        match self {
+            AggState::Count(n) => Some(*n as f64),
+            AggState::SumI { sum, .. } => Some(*sum as f64),
+            AggState::SumF { sum, .. } => Some(*sum),
+            AggState::AvgI { sum, count } if *count > 0 => Some(*sum as f64 / *count as f64),
+            AggState::AvgF { sum, count } if *count > 0 => Some(*sum / *count as f64),
+            AggState::MinI(n) => Some(*n as f64),
+            AggState::MaxI(n) => Some(*n as f64),
+            AggState::MinF(n) => Some(*n),
+            AggState::MaxF(n) => Some(*n),
+            AggState::AvgI { .. } | AggState::AvgF { .. } | AggState::Empty => None,
+        }
+    }
+
+    /// Convert a vectorized [`NativeAggResult`] (from the cursor path) into a
+    /// mergeable [`AggState`], so the incremental cache can be seeded from the
+    /// fast cold path. `ty` is the column's type (`None` for COUNT(*)).
+    pub fn from_native(result: NativeAggResult, agg: NativeAgg, ty: Option<TypeId>) -> Self {
+        let is_float = matches!(ty, Some(TypeId::Float64));
+        match (agg, result) {
+            (NativeAgg::Count, NativeAggResult::Count(n)) => AggState::Count(n),
+            (NativeAgg::Sum, NativeAggResult::Int(x)) => AggState::SumI {
+                sum: x as i128,
+                count: 1, // count unknown from NativeAggResult; use sentinel
+            },
+            (NativeAgg::Sum, NativeAggResult::Float(x)) => AggState::SumF { sum: x, count: 1 },
+            (NativeAgg::Avg, NativeAggResult::Float(x)) => AggState::AvgF { sum: x, count: 1 },
+            (NativeAgg::Min, NativeAggResult::Int(x)) => AggState::MinI(x),
+            (NativeAgg::Max, NativeAggResult::Int(x)) => AggState::MaxI(x),
+            (NativeAgg::Min, NativeAggResult::Float(x)) => AggState::MinF(x),
+            (NativeAgg::Max, NativeAggResult::Float(x)) => AggState::MaxF(x),
+            (NativeAgg::Count, _) => AggState::Empty,
+            (_, NativeAggResult::Null) => AggState::Empty,
+            _ => {
+                let _ = is_float;
+                AggState::Empty
+            }
+        }
+    }
+}
+
+/// A cached incremental aggregate (Phase 8.3): the mergeable state, the row-id
+/// watermark it covers (rows `[0, watermark)`), and the snapshot epoch.
+#[derive(Debug, Clone)]
+pub struct CachedAgg {
+    pub state: AggState,
+    pub watermark: u64,
+    pub epoch: u64,
+}
+
+/// Outcome of [`Db::aggregate_incremental`].
+#[derive(Debug, Clone)]
+pub struct IncrementalAggResult {
+    /// The aggregate state covering all rows at the current epoch.
+    pub state: AggState,
+    /// `true` when produced by merging only the delta (new rows); `false` when
+    /// a full recompute was required (cold cache, deletes, or same epoch).
+    pub incremental: bool,
+    /// Rows processed in the delta pass (`0` for a full recompute).
+    pub delta_rows: u64,
+}
+
+/// Compute a mergeable [`AggState`] over `rows` that pass every per-row
+/// `conditions` conjunct (and whose row id is in every pre-resolved
+/// `index_sets`). Shared by the cold (full) and warm (delta) incremental paths.
+fn agg_state_from_rows(
+    rows: &[Row],
+    conditions: &[crate::query::Condition],
+    index_sets: &[std::collections::HashSet<u64>],
+    column: Option<u16>,
+    agg: NativeAgg,
+    schema: &Schema,
+) -> Result<AggState> {
+    let mut count: u64 = 0;
+    let mut sum_i: i128 = 0;
+    let mut sum_f: f64 = 0.0;
+    let mut mn_i: i64 = i64::MAX;
+    let mut mx_i: i64 = i64::MIN;
+    let mut mn_f: f64 = f64::INFINITY;
+    let mut mx_f: f64 = f64::NEG_INFINITY;
+    let mut saw_int = false;
+    let mut saw_float = false;
+    for r in rows {
+        if !conditions
+            .iter()
+            .all(|c| condition_matches_row(c, r, schema))
+        {
+            continue;
+        }
+        if !index_sets.iter().all(|s| s.contains(&r.row_id.0)) {
+            continue;
+        }
+        match agg {
+            NativeAgg::Count => {
+                // COUNT(*) counts every passing row; COUNT(col) excludes NULLs.
+                match column.and_then(|cid| r.columns.get(&cid)) {
+                    None => count += 1,
+                    Some(Value::Null) => {}
+                    Some(_) => count += 1,
+                }
+            }
+            _ => match column.and_then(|cid| r.columns.get(&cid)) {
+                Some(Value::Int64(n)) => {
+                    count += 1;
+                    sum_i += *n as i128;
+                    mn_i = mn_i.min(*n);
+                    mx_i = mx_i.max(*n);
+                    saw_int = true;
+                }
+                Some(Value::Float64(f)) => {
+                    count += 1;
+                    sum_f += f;
+                    mn_f = mn_f.min(*f);
+                    mx_f = mx_f.max(*f);
+                    saw_float = true;
+                }
+                _ => {}
+            },
+        }
+    }
+    Ok(match agg {
+        NativeAgg::Count => {
+            if count == 0 {
+                AggState::Empty
+            } else {
+                AggState::Count(count)
+            }
+        }
+        NativeAgg::Sum => {
+            if count == 0 {
+                AggState::Empty
+            } else if saw_int {
+                AggState::SumI { sum: sum_i, count }
+            } else {
+                AggState::SumF { sum: sum_f, count }
+            }
+        }
+        NativeAgg::Avg => {
+            if count == 0 {
+                AggState::Empty
+            } else if saw_int {
+                AggState::AvgI { sum: sum_i, count }
+            } else {
+                AggState::AvgF { sum: sum_f, count }
+            }
+        }
+        NativeAgg::Min => {
+            if !saw_int && !saw_float {
+                AggState::Empty
+            } else if saw_int {
+                AggState::MinI(mn_i)
+            } else {
+                AggState::MinF(mn_f)
+            }
+        }
+        NativeAgg::Max => {
+            if !saw_int && !saw_float {
+                AggState::Empty
+            } else if saw_int {
+                AggState::MaxI(mx_i)
+            } else {
+                AggState::MaxF(mx_f)
+            }
+        }
+    })
+}
+
+/// Evaluate an index-served [`Condition`] exactly against a materialized row.
+/// `Ann`/`SparseMatch` (index-defined) always pass here; callers test those via a
+/// pre-resolved row-id set.
+fn condition_matches_row(c: &crate::query::Condition, row: &Row, schema: &Schema) -> bool {
+    use crate::query::Condition;
+    match c {
+        Condition::Pk(key) => match schema.primary_key() {
+            Some(pk) => row
+                .columns
+                .get(&pk.id)
+                .map(|v| v.encode_key() == *key)
+                .unwrap_or(false),
+            None => false,
+        },
+        Condition::BitmapEq { column_id, value } => row
+            .columns
+            .get(column_id)
+            .map(|v| v.encode_key() == *value)
+            .unwrap_or(false),
+        Condition::BitmapIn { column_id, values } => {
+            let key = row.columns.get(column_id).map(|v| v.encode_key());
+            match key {
+                Some(k) => values.contains(&k),
+                None => false,
+            }
+        }
+        Condition::Range { column_id, lo, hi } => match row.columns.get(column_id) {
+            Some(Value::Int64(n)) => *n >= *lo && *n <= *hi,
+            _ => false,
+        },
+        Condition::RangeF64 {
+            column_id,
+            lo,
+            lo_inclusive,
+            hi,
+            hi_inclusive,
+        } => match row.columns.get(column_id) {
+            Some(Value::Float64(n)) => {
+                let lo_ok = if *lo_inclusive { *n >= *lo } else { *n > *lo };
+                let hi_ok = if *hi_inclusive { *n <= *hi } else { *n < *hi };
+                lo_ok && hi_ok
+            }
+            _ => false,
+        },
+        Condition::FmContains { column_id, pattern } => match row.columns.get(column_id) {
+            Some(Value::Bytes(b)) => {
+                !pattern.is_empty() && b.windows(pattern.len()).any(|w| w == &pattern[..])
+            }
+            _ => false,
+        },
+        Condition::Ann { .. } | Condition::SparseMatch { .. } => true,
+    }
+}
+
+/// Coerce a cell to `f64` for Sum/Avg (Int64/Float64 only).
+fn as_f64(v: Option<&Value>) -> Option<f64> {
+    match v {
+        Some(Value::Int64(n)) => Some(*n as f64),
+        Some(Value::Float64(f)) => Some(*f),
+        _ => None,
+    }
+}
+
+/// One-pass vectorized accumulation of `(non-null count, sum, min, max)` over an
+/// Int64 column streamed through `cursor`. The inner loop over a contiguous
+/// `&[i64]` autovectorizes (SIMD) for the all-non-null prefix.
+fn accumulate_int(mut cursor: crate::cursor::NativePageCursor) -> Result<(u64, i128, i64, i64)> {
+    let mut count: u64 = 0;
+    let mut sum: i128 = 0;
+    let mut mn: i64 = i64::MAX;
+    let mut mx: i64 = i64::MIN;
+    while let Some(cols) = cursor.next_batch()? {
+        if let Some(crate::columnar::NativeColumn::Int64 { data, validity }) = cols.first() {
+            if crate::columnar::all_non_null(validity, data.len()) {
+                // All-non-null: vectorized sum/min/max with no per-element branch.
+                count += data.len() as u64;
+                sum += data.iter().map(|&v| v as i128).sum::<i128>();
+                mn = mn.min(*data.iter().min().unwrap_or(&mn));
+                mx = mx.max(*data.iter().max().unwrap_or(&mx));
+            } else {
+                for (i, &v) in data.iter().enumerate() {
+                    if crate::columnar::validity_bit(validity, i) {
+                        count += 1;
+                        sum += v as i128;
+                        mn = mn.min(v);
+                        mx = mx.max(v);
+                    }
+                }
+            }
+        }
+    }
+    Ok((count, sum, mn, mx))
+}
+
+/// f64 analogue of [`accumulate_int`].
+fn accumulate_float(mut cursor: crate::cursor::NativePageCursor) -> Result<(u64, f64, f64, f64)> {
+    let mut count: u64 = 0;
+    let mut sum: f64 = 0.0;
+    let mut mn: f64 = f64::INFINITY;
+    let mut mx: f64 = f64::NEG_INFINITY;
+    while let Some(cols) = cursor.next_batch()? {
+        if let Some(crate::columnar::NativeColumn::Float64 { data, validity }) = cols.first() {
+            if crate::columnar::all_non_null(validity, data.len()) {
+                count += data.len() as u64;
+                sum += data.iter().sum::<f64>();
+                mn = mn.min(data.iter().copied().fold(f64::INFINITY, f64::min));
+                mx = mx.max(data.iter().copied().fold(f64::NEG_INFINITY, f64::max));
+            } else {
+                for (i, &v) in data.iter().enumerate() {
+                    if crate::columnar::validity_bit(validity, i) {
+                        count += 1;
+                        sum += v;
+                        mn = mn.min(v);
+                        mx = mx.max(v);
+                    }
+                }
+            }
+        }
+    }
+    Ok((count, sum, mn, mx))
+}
+
+fn pack_int(agg: NativeAgg, count: u64, sum: i128, mn: i64, mx: i64) -> NativeAggResult {
+    if count == 0 && !matches!(agg, NativeAgg::Count) {
+        return NativeAggResult::Null;
+    }
+    match agg {
+        NativeAgg::Count => NativeAggResult::Count(count),
+        // i64 overflow on Sum ⇒ SQL NULL (DataFusion errors on overflow; null is
+        // a safe, non-misleading fallback rather than a saturated wrong value).
+        NativeAgg::Sum => match sum.try_into() {
+            Ok(v) => NativeAggResult::Int(v),
+            Err(_) => NativeAggResult::Null,
+        },
+        NativeAgg::Min => NativeAggResult::Int(mn),
+        NativeAgg::Max => NativeAggResult::Int(mx),
+        NativeAgg::Avg => NativeAggResult::Float((sum as f64) / (count as f64)),
+    }
+}
+
+fn pack_float(agg: NativeAgg, count: u64, sum: f64, mn: f64, mx: f64) -> NativeAggResult {
+    if count == 0 && !matches!(agg, NativeAgg::Count) {
+        return NativeAggResult::Null;
+    }
+    match agg {
+        NativeAgg::Count => NativeAggResult::Count(count),
+        NativeAgg::Sum => NativeAggResult::Float(sum),
+        NativeAgg::Min => NativeAggResult::Float(mn),
+        NativeAgg::Max => NativeAggResult::Float(mx),
+        NativeAgg::Avg => NativeAggResult::Float(sum / (count as f64)),
+    }
+}
+
+/// Aggregate per-page `min`/`max`/`null_count` into a column-wide i64 triple.
+/// Returns `None` if no page contributes a non-null min/max (all-null column).
+fn agg_int(
+    stats: &[crate::page::PageStat],
+    decode: fn(Option<&[u8]>) -> Option<i64>,
+) -> Option<(Option<i64>, Option<i64>, u64)> {
+    let (mut mn, mut mx, mut nulls) = (i64::MAX, i64::MIN, 0u64);
+    let mut any = false;
+    for s in stats {
+        if let Some(v) = decode(s.min.as_deref()) {
+            mn = mn.min(v);
+            any = true;
+        }
+        if let Some(v) = decode(s.max.as_deref()) {
+            mx = mx.max(v);
+            any = true;
+        }
+        nulls += s.null_count;
+    }
+    any.then_some((Some(mn), Some(mx), nulls))
+}
+
+/// f64 analogue of [`agg_int`] (compares as f64, not as bit patterns).
+fn agg_float(
+    stats: &[crate::page::PageStat],
+    decode: fn(Option<&[u8]>) -> Option<f64>,
+) -> Option<(Option<f64>, Option<f64>, u64)> {
+    let (mut mn, mut mx, mut nulls) = (f64::INFINITY, f64::NEG_INFINITY, 0u64);
+    let mut any = false;
+    for s in stats {
+        if let Some(v) = decode(s.min.as_deref()) {
+            mn = mn.min(v);
+            any = true;
+        }
+        if let Some(v) = decode(s.max.as_deref()) {
+            mx = mx.max(v);
+            any = true;
+        }
+        nulls += s.null_count;
+    }
+    any.then_some((Some(mn), Some(mx), nulls))
+}
+
+/// The four maintained secondary-index maps, keyed by column id.
+type SecondaryIndexes = (
+    HashMap<u16, BitmapIndex>,
+    HashMap<u16, AnnIndex>,
+    HashMap<u16, FmIndex>,
+    HashMap<u16, SparseIndex>,
+);
+
+fn empty_indexes(schema: &Schema) -> SecondaryIndexes {
+    let mut bitmap = HashMap::new();
+    let mut ann = HashMap::new();
+    let mut fm = HashMap::new();
+    let mut sparse = HashMap::new();
+    for idef in &schema.indexes {
+        match idef.kind {
+            IndexKind::Bitmap => {
+                bitmap.insert(idef.column_id, BitmapIndex::new());
+            }
+            IndexKind::Ann => {
+                let dim = schema
+                    .columns
+                    .iter()
+                    .find(|c| c.id == idef.column_id)
+                    .and_then(|c| match c.ty {
+                        TypeId::Embedding { dim } => Some(dim as usize),
+                        _ => None,
+                    })
+                    .unwrap_or(0);
+                ann.insert(idef.column_id, AnnIndex::new(dim));
+            }
+            IndexKind::FmIndex => {
+                fm.insert(idef.column_id, FmIndex::new());
+            }
+            IndexKind::Sparse => {
+                sparse.insert(idef.column_id, SparseIndex::new());
+            }
+            _ => {}
+        }
+    }
+    (bitmap, ann, fm, sparse)
+}
+
+fn index_into(
+    schema: &Schema,
+    row: &Row,
+    hot: &mut HotIndex,
+    bitmap: &mut HashMap<u16, BitmapIndex>,
+    ann: &mut HashMap<u16, AnnIndex>,
+    fm: &mut HashMap<u16, FmIndex>,
+    sparse: &mut HashMap<u16, SparseIndex>,
+) {
+    for idef in &schema.indexes {
+        let Some(val) = row.columns.get(&idef.column_id) else {
+            continue;
+        };
+        match idef.kind {
+            IndexKind::Bitmap => {
+                if let Some(b) = bitmap.get_mut(&idef.column_id) {
+                    b.insert(val.encode_key(), row.row_id);
+                }
+            }
+            IndexKind::Ann => {
+                if let (Some(a), Value::Embedding(v)) = (ann.get_mut(&idef.column_id), val) {
+                    a.insert(v, row.row_id);
+                }
+            }
+            IndexKind::FmIndex => {
+                if let (Some(f), Value::Bytes(b)) = (fm.get_mut(&idef.column_id), val) {
+                    f.insert(b.clone(), row.row_id);
+                }
+            }
+            IndexKind::Sparse => {
+                if let (Some(s), Value::Bytes(b)) = (sparse.get_mut(&idef.column_id), val) {
+                    // A sparse vector is stored as a bincode'd `Vec<(u32, f32)>`
+                    // in a Bytes column (SPLADE weights in, retrieval out).
+                    if let Ok(terms) = bincode::deserialize::<Vec<(u32, f32)>>(b) {
+                        s.insert(&terms, row.row_id);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(pk_col) = schema.primary_key() {
+        if let Some(pk_val) = row.columns.get(&pk_col.id) {
+            hot.insert(pk_val.encode_key(), row.row_id);
+        }
+    }
+}
+
+/// Per-element index key for the typed bulk-index path (Phase 14.2): mirrors
+/// `index_into` on a `tokenized_for_indexes(row)` — encodes the element the way
+/// [`Value::encode_key`] would, then applies the column's
+/// `ENCRYPTED_INDEXABLE` tokenization (HMAC-eq / OPE) so bitmap/HOT keys match
+/// what the incremental path stores. Returns `None` for null slots.
+#[allow(dead_code)]
+fn bulk_index_key(
+    column_keys: &HashMap<u16, ([u8; 32], u8)>,
+    column_id: u16,
+    ty: TypeId,
+    col: &columnar::NativeColumn,
+    i: usize,
+) -> Option<Vec<u8>> {
+    let encoded = columnar::encode_key_native(ty, col, i)?;
+    #[cfg(feature = "encryption")]
+    {
+        use crate::encryption::{hmac_token, ope_token_f64, ope_token_i64, SCHEME_HMAC_EQ};
+        if let Some((key, scheme)) = column_keys.get(&column_id) {
+            return Some(match (*scheme, col) {
+                (SCHEME_HMAC_EQ, _) => hmac_token(key, &encoded).to_vec(),
+                (_, columnar::NativeColumn::Int64 { data, .. }) => {
+                    ope_token_i64(key, data[i]).to_vec()
+                }
+                (_, columnar::NativeColumn::Float64 { data, .. }) => {
+                    ope_token_f64(key, data[i]).to_vec()
+                }
+                _ => hmac_token(key, &encoded).to_vec(),
+            });
+        }
+    }
+    #[cfg(not(feature = "encryption"))]
+    {
+        let _ = (column_id, column_keys, col);
+    }
+    Some(encoded)
+}
+
+fn write_schema(dir: &Path, schema: &Schema) -> Result<()> {
+    let json = serde_json::to_string_pretty(schema)
+        .map_err(|e| MongrelError::Schema(format!("encode schema: {e}")))?;
+    std::fs::write(dir.join(SCHEMA_FILENAME), json)?;
+    Ok(())
+}
+
+fn read_schema(dir: &Path) -> Result<Schema> {
+    serde_json::from_str(&std::fs::read_to_string(dir.join(SCHEMA_FILENAME))?)
+        .map_err(|e| MongrelError::Schema(format!("decode schema: {e}")))
+}
+
+fn next_wal_segment(wal_dir: &Path) -> Result<PathBuf> {
+    Ok(wal_dir.join(format!("seg-{:06}.wal", next_wal_number(wal_dir)?)))
+}
+
+fn latest_wal_segment(wal_dir: &Path) -> Result<Option<PathBuf>> {
+    let n = list_wal_numbers(wal_dir)?;
+    Ok(n.map(|max| wal_dir.join(format!("seg-{max:06}.wal"))))
+}
+
+fn next_wal_number(wal_dir: &Path) -> Result<u32> {
+    Ok(list_wal_numbers(wal_dir)?.map(|m| m + 1).unwrap_or(0))
+}
+
+fn list_wal_numbers(wal_dir: &Path) -> Result<Option<u32>> {
+    let _ = std::fs::create_dir_all(wal_dir);
+    let mut max_n = None;
+    for entry in std::fs::read_dir(wal_dir)? {
+        let entry = entry?;
+        let fname = entry.file_name();
+        let Some(s) = fname.to_str() else {
+            continue;
+        };
+        let Some(stripped) = s.strip_prefix("seg-") else {
+            continue;
+        };
+        let Some(stripped) = stripped.strip_suffix(".wal") else {
+            continue;
+        };
+        if let Ok(n) = stripped.parse::<u32>() {
+            max_n = Some(max_n.map(|m: u32| m.max(n)).unwrap_or(n));
+        }
+    }
+    Ok(max_n)
+}

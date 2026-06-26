@@ -1,0 +1,33 @@
+[package]
+name = "mongreldb-node"
+version = "0.10.5"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT OR Apache-2.0"
+description = "Native Node.js (NAPI) addon for MongrelDB — the better-sqlite3 model: in-process, no HTTP latency."
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+mongreldb-core = { path = "../mongreldb-core" }
+napi = { version = "2", default-features = false, features = ["napi8", "tokio_rt"] }
+napi-derive = "2"
+parking_lot = "0.12"
+arrow = "58"
+bytemuck = "1"
+ureq = { version = "2", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[build-dependencies]
+napi-build = "2"
+
+[features]
+default = []
+encryption = ["mongreldb-core/encryption"]
+
+# Standalone crate (built separately via `napi build`), not a workspace member —
+# keeps `cargo {test,clippy} --workspace` green without a Node toolchain.
+[workspace]

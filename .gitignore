@@ -1,0 +1,10 @@
+.worktrees/
+target/
+PLAN.md
+AGENTS.md
+CLAUDE.md
+/.claude/
+
+# Build artifacts
+*.so
+.superpowers/

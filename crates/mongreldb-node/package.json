@@ -1,0 +1,24 @@
+{
+  "name": "mongreldb",
+  "version": "0.10.1",
+  "description": "Native Node.js addon for MongrelDB — in-process, sub-ms writes, hybrid index queries.",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "napi": {
+    "name": "mongreldb",
+    "package": {
+      "name": "@mongreldb/native"
+    }
+  },
+  "scripts": {
+    "build": "napi build --release --platform",
+    "build:debug": "napi build --platform",
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18.0"
+  },
+  "engines": {
+    "node": ">= 16"
+  }
+}

@@ -1,0 +1,24 @@
+[package]
+name = "mongreldb-perf"
+version = "0.10.5"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "compare"
+path = "src/main.rs"
+
+[[bin]]
+name = "comp_bench"
+path = "src/comp_bench.rs"
+
+[dependencies]
+mongreldb-core = { path = "../mongreldb-core", features = ["encryption"] }
+mongreldb-query = { path = "../mongreldb-query" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+duckdb = { version = "1.1", features = ["bundled"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tempfile = "3"
+
+# Standalone crate (heavy C++ deps for DuckDB/SQLite) — not a workspace member.
+[workspace]

@@ -1,0 +1,16 @@
+[package]
+name = "mongreldb-client"
+version = "0.10.5"
+edition = "2021"
+publish = false
+
+[dependencies]
+mongreldb-core = { path = "../mongreldb-core" }
+mongreldb-query = { path = "../mongreldb-query" }
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+arrow = "58"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Standalone crate — not a workspace member.
+[workspace]

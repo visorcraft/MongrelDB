@@ -1,0 +1,20 @@
+[package]
+name = "mongreldb-query"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "DataFusion SQL + Arrow frontend for MongrelDB."
+
+[dependencies]
+mongreldb-core = { path = "../mongreldb-core" }
+datafusion = "54.0.0"
+arrow = "58"
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
+futures = "0.3"
+async-trait = "0.1"
+thiserror = "1"
+
+[dev-dependencies]
+tempfile = "3"
