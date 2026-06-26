@@ -101,6 +101,8 @@ mod key {
     pub const ALGO_AES_GCM: u8 = 1;
     /// HKDF-SHA256 info label for KEK domain separation.
     const KEK_INFO: &[u8] = b"mongreldb/kek/v1";
+    /// HKDF-SHA256 info label for raw-key KEK domain separation.
+    const KEK_RAW_INFO: &[u8] = b"mongreldb/kek-raw/v1";
     /// Argon2id memory cost (KiB) — OWASP-recommended minimum (≈19 MiB).
     const ARGON2_M_COST: u32 = 19_456;
     /// Argon2id time cost (iterations).
@@ -135,6 +137,35 @@ mod key {
             hk.expand(KEK_INFO, kek.as_mut())
                 .map_err(|e| MongrelError::Encryption(format!("hkdf expand: {e}")))?;
             Ok(Kek(kek))
+        }
+
+        /// Derive a 256-bit KEK from a raw key (e.g. a key file's contents)
+        /// via HKDF-SHA256 only — no Argon2id. The raw key must be >= 32
+        /// bytes and already high-entropy (machine-generated). ~0.1ms vs
+        /// ~50ms for the passphrase path.
+        pub fn from_raw_key(raw: &[u8], salt: &[u8; SALT_LEN]) -> Result<Self> {
+            if raw.len() < DEK_LEN {
+                return Err(MongrelError::InvalidArgument(format!(
+                    "raw key must be >= {DEK_LEN} bytes, got {}",
+                    raw.len()
+                )));
+            }
+            // HKDF-Extract (uses salt for domain separation), then HKDF-Expand.
+            let hk = hkdf::Hkdf::<sha2::Sha256>::new(Some(salt), raw);
+            let mut kek = Zeroizing::new([0u8; DEK_LEN]);
+            hk.expand(KEK_RAW_INFO, kek.as_mut())
+                .map_err(|e| MongrelError::Encryption(format!("hkdf expand: {e}")))?;
+            Ok(Kek(kek))
+        }
+
+        /// Derive a WAL DEK from this KEK for frame-level AEAD.
+        pub fn derive_wal_key(&self) -> Zeroizing<[u8; DEK_LEN]> {
+            self.derive_subkey(b"mongreldb/wal/v1")
+        }
+
+        /// Derive a result-cache DEK from this KEK for cache file AEAD.
+        pub fn derive_cache_key(&self) -> Zeroizing<[u8; DEK_LEN]> {
+            self.derive_subkey(b"mongreldb/rcache/v1")
         }
 
         /// Wrap a 32-byte DEK with the KEK using AES-256-GCM. `wrap_nonce` must
@@ -408,6 +439,12 @@ mod key {
         // security-critical key material.
         getrandom::getrandom(buf).expect("getrandom: OS CSPRNG unavailable");
     }
+}
+
+/// Public wrapper for `fill_random` — fills a buffer with OS CSPRNG bytes.
+#[cfg(feature = "encryption")]
+pub fn fill_random_pub(buf: &mut [u8]) {
+    getrandom::getrandom(buf).expect("getrandom: OS CSPRNG unavailable");
 }
 
 #[cfg(feature = "encryption")]

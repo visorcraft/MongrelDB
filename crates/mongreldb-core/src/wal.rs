@@ -16,7 +16,10 @@ use std::path::{Path, PathBuf};
 
 pub const WAL_MAGIC: [u8; 8] = *b"MONGRWAL";
 const WAL_VERSION: u16 = 2;
-const HEADER_LEN: u64 = 8 + 2 + 4 + 8; // magic + version + reserved + epoch_created
+const HEADER_LEN: u64 = 8 + 2 + 4 + 8; // magic + version + reserved(incl enc_flag) + epoch_created
+/// Encryption flag stored in reserved[0] of the WAL header.
+const ENC_PLAINTEXT: u8 = 0;
+const ENC_AES_GCM: u8 = 1;
 
 const CRC32C: Crc<u32> = Crc::<u32>::new(&CRC_32_ISCSI);
 
@@ -69,11 +72,27 @@ pub struct Wal {
     unflushed_bytes: u64,
     /// `sync()` automatically once this many bytes are buffered (0 = manual).
     sync_byte_threshold: u64,
+    /// Optional AEAD cipher for frame-level encryption. When present, each
+    /// frame's payload is encrypted before writing.
+    cipher: Option<Box<dyn crate::encryption::Cipher>>,
+    /// The epoch this WAL segment was created at (used for nonce derivation).
+    epoch_created: Epoch,
+    /// Per-segment frame counter for nonce uniqueness.
+    frame_seq: u32,
 }
 
 impl Wal {
     /// Create a new WAL segment, truncating any existing file at `path`.
     pub fn create(path: impl AsRef<Path>, epoch_created: Epoch) -> Result<Self> {
+        Self::create_with_cipher(path, epoch_created, None)
+    }
+
+    /// Create a new WAL segment with optional frame-level encryption.
+    pub fn create_with_cipher(
+        path: impl AsRef<Path>,
+        epoch_created: Epoch,
+        cipher: Option<Box<dyn crate::encryption::Cipher>>,
+    ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = OpenOptions::new()
             .create(true)
@@ -87,6 +106,9 @@ impl Wal {
             next_seq: epoch_created.0 + 1,
             unflushed_bytes: 0,
             sync_byte_threshold: 64 * 1024,
+            cipher,
+            epoch_created,
+            frame_seq: 0,
         };
         wal.write_header(epoch_created)?;
         Ok(wal)
@@ -106,26 +128,54 @@ impl Wal {
 
     fn append_record(&mut self, record: &Record) -> Result<()> {
         let payload = bincode::serialize(record)?;
-        let mut digest = CRC32C.digest();
-        digest.update(&record.seq.0.to_le_bytes());
-        digest.update(&payload);
-        let crc_val = digest.finalize();
 
-        let len = payload.len();
+        // Encrypt the payload if a cipher is present. The nonce is prepended
+        // to the ciphertext so the reader can extract it from a single read.
+        let frame_payload = if let Some(cipher) = &self.cipher {
+            let nonce = self.frame_nonce();
+            let ciphertext = cipher.encrypt_page(&nonce, &payload)?;
+            self.frame_seq += 1;
+            let mut combined = Vec::with_capacity(12 + ciphertext.len());
+            combined.extend_from_slice(&nonce);
+            combined.extend_from_slice(&ciphertext);
+            combined
+        } else {
+            payload
+        };
+
+        let len = frame_payload.len();
         if len > u32::MAX as usize {
             return Err(MongrelError::InvalidArgument(format!(
                 "wal payload too large: {len} bytes"
             )));
         }
+        // CRC covers seq + (encrypted) payload.
+        let mut digest = CRC32C.digest();
+        digest.update(&record.seq.0.to_le_bytes());
+        digest.update(&frame_payload);
+        let crc_val = digest.finalize();
+
         self.file.write_all(&(len as u32).to_le_bytes())?;
         self.file.write_all(&crc_val.to_le_bytes())?;
         self.file.write_all(&record.seq.0.to_le_bytes())?;
-        self.file.write_all(&payload)?;
+        self.file.write_all(&frame_payload)?;
         self.unflushed_bytes += 4 + 4 + 8 + len as u64;
         if self.sync_byte_threshold > 0 && self.unflushed_bytes >= self.sync_byte_threshold {
             self.sync()?;
         }
         Ok(())
+    }
+
+    /// Derive a unique 12-byte AEAD nonce for the current frame:
+    /// `[epoch_created: 8B LE][frame_seq: 4B LE]`. epoch_created is unique
+    /// per segment (monotonically increasing), frame_seq is unique within
+    /// a segment — together they guarantee nonce uniqueness across all
+    /// segments under the same WAL DEK.
+    fn frame_nonce(&self) -> [u8; 12] {
+        let mut n = [0u8; 12];
+        n[..8].copy_from_slice(&self.epoch_created.0.to_le_bytes());
+        n[8..].copy_from_slice(&self.frame_seq.to_le_bytes());
+        n
     }
 
     /// Flush the buffer and fsync the file. This is the durability point.
@@ -155,9 +205,14 @@ impl Wal {
     }
 
     fn write_header(&mut self, epoch_created: Epoch) -> Result<()> {
+        let enc_flag = if self.cipher.is_some() {
+            ENC_AES_GCM
+        } else {
+            ENC_PLAINTEXT
+        };
         self.file.write_all(&WAL_MAGIC)?;
         self.file.write_all(&WAL_VERSION.to_le_bytes())?;
-        self.file.write_all(&0u32.to_le_bytes())?; // reserved
+        self.file.write_all(&[enc_flag, 0, 0, 0])?; // enc_flag + 3 reserved
         self.file.write_all(&epoch_created.0.to_le_bytes())?;
         self.unflushed_bytes = 0;
         Ok(())
@@ -175,10 +230,22 @@ impl Drop for Wal {
 pub struct WalReader {
     inner: BufReader<File>,
     pos: u64,
+    /// True if frames are encrypted (enc_flag in header).
+    encrypted: bool,
+    /// Optional cipher for decryption.
+    cipher: Option<Box<dyn crate::encryption::Cipher>>,
 }
 
 impl WalReader {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_cipher(path, None)
+    }
+
+    /// Open a WAL segment for reading, optionally with a decryption cipher.
+    pub fn open_with_cipher(
+        path: impl AsRef<Path>,
+        cipher: Option<Box<dyn crate::encryption::Cipher>>,
+    ) -> Result<Self> {
         let mut file = File::open(path.as_ref())?;
         let mut magic = [0u8; 8];
         file.read_exact(&mut magic)?;
@@ -197,13 +264,18 @@ impl WalReader {
                 "unsupported wal version {version}"
             )));
         }
-        // Skip reserved(4) + epoch_created(8).
-        let mut skip = [0u8; 12];
-        file.read_exact(&mut skip)?;
+        let mut reserved = [0u8; 4];
+        file.read_exact(&mut reserved)?;
+        let encrypted = reserved[0] == ENC_AES_GCM;
+        let mut epoch_buf = [0u8; 8];
+        file.read_exact(&mut epoch_buf)?;
+        let _epoch_created = Epoch(u64::from_le_bytes(epoch_buf));
         let pos = HEADER_LEN;
         Ok(Self {
             inner: BufReader::new(file),
             pos,
+            encrypted,
+            cipher,
         })
     }
 
@@ -254,7 +326,28 @@ impl WalReader {
             });
         }
 
-        let mut record: Record = bincode::deserialize(payload)?;
+        // Decrypt if encrypted.
+        let plaintext = if self.encrypted {
+            let Some(cipher) = &self.cipher else {
+                return Err(MongrelError::Decryption(
+                    "WAL is encrypted but no cipher was provided".into(),
+                ));
+            };
+            if payload.len() < 28 {
+                // 12 (nonce) + 16 (min GCM tag) minimum
+                return Err(MongrelError::CorruptWal {
+                    offset: record_start,
+                    reason: "encrypted frame too short".into(),
+                });
+            }
+            let nonce: [u8; 12] = payload[..12].try_into().unwrap();
+            let ciphertext = &payload[12..];
+            cipher.decrypt_page(&nonce, ciphertext)?
+        } else {
+            payload.to_vec()
+        };
+
+        let mut record: Record = bincode::deserialize(&plaintext)?;
         record.seq = Epoch(seq);
         self.pos += 4 + 4 + 8 + len as u64;
         Ok(Some(record))
@@ -286,6 +379,14 @@ impl WalReader {
 /// Convenience wrapper around [`WalReader`].
 pub fn replay(path: impl AsRef<Path>) -> Result<Vec<Record>> {
     WalReader::open(path)?.replay()
+}
+
+/// Replay with an optional decryption cipher (for encrypted WAL segments).
+pub fn replay_with_cipher(
+    path: impl AsRef<Path>,
+    cipher: Option<Box<dyn crate::encryption::Cipher>>,
+) -> Result<Vec<Record>> {
+    WalReader::open_with_cipher(path, cipher)?.replay()
 }
 
 #[cfg(test)]

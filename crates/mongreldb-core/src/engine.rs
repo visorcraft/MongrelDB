@@ -10,6 +10,8 @@
 use crate::columnar;
 use crate::cursor::NativePageCursor;
 use crate::encryption::Kek;
+#[cfg(feature = "encryption")]
+use crate::encryption::DEK_LEN;
 use crate::epoch::{Epoch, EpochClock, Snapshot};
 use crate::global_idx;
 use crate::index::{AnnIndex, BitmapIndex, ColumnLearnedRange, FmIndex, HotIndex, SparseIndex};
@@ -24,6 +26,8 @@ use crate::{MongrelError, Result};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(feature = "encryption")]
+use zeroize::Zeroizing;
 
 pub const WAL_DIR: &str = "_wal";
 pub const RUNS_DIR: &str = "_runs";
@@ -118,6 +122,8 @@ pub struct Db {
     /// the committed mutations, tracked in `pending_delete_rids` and
     /// `pending_put_cols`.
     result_cache: Arc<parking_lot::Mutex<ResultCache>>,
+    /// WAL DEK (for frame-level encryption). None for plaintext tables.
+    wal_dek: Option<Zeroizing<[u8; DEK_LEN]>>,
     /// RowIds deleted since the last `commit()` — used by fine-grained cache
     /// invalidation to check footprint intersection.
     pending_delete_rids: roaring::RoaringBitmap,
@@ -174,6 +180,8 @@ struct ResultCache {
     bytes: u64,
     max_bytes: u64,
     dir: Option<std::path::PathBuf>,
+    #[allow(dead_code)]
+    cache_dek: Option<Zeroizing<[u8; DEK_LEN]>>,
 }
 
 /// Serialised form of a [`CachedEntry`] for the persistent on-disk tier (b).
@@ -239,12 +247,18 @@ impl ResultCache {
             bytes: 0,
             max_bytes,
             dir: None,
+            cache_dek: None,
         }
     }
 
     fn with_dir(mut self, dir: std::path::PathBuf) -> Self {
         let _ = std::fs::create_dir_all(&dir);
         self.dir = Some(dir);
+        self
+    }
+
+    fn with_cache_dek(mut self, dek: Option<Zeroizing<[u8; DEK_LEN]>>) -> Self {
+        self.cache_dek = dek;
         self
     }
 
@@ -263,11 +277,20 @@ impl ResultCache {
             Ok(s) => s,
             Err(_) => return,
         };
+        // Encrypt if a cache DEK is present.
+        let on_disk = if let Some(dek) = &self.cache_dek {
+            match self.encrypt_cache(&serialized, dek) {
+                Some(b) => b,
+                None => return,
+            }
+        } else {
+            serialized
+        };
         let tmp = path.with_extension("tmp");
         use std::io::Write;
         let write = || -> std::io::Result<()> {
             let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(&serialized)?;
+            f.write_all(&on_disk)?;
             f.flush()?;
             Ok(())
         };
@@ -282,7 +305,12 @@ impl ResultCache {
     fn load_from_disk(&self, key: u64) -> Option<CachedEntry> {
         let path = self.disk_path(key)?;
         let bytes = std::fs::read(&path).ok()?;
-        let serialized: SerializedEntry = bincode::deserialize(&bytes).ok()?;
+        let plaintext = if let Some(dek) = &self.cache_dek {
+            self.decrypt_cache(&bytes, dek)?
+        } else {
+            bytes
+        };
+        let serialized: SerializedEntry = bincode::deserialize(&plaintext).ok()?;
         serialized.into_entry()
     }
 
@@ -291,6 +319,43 @@ impl ResultCache {
         if let Some(path) = self.disk_path(key) {
             let _ = std::fs::remove_file(&path);
         }
+    }
+
+    /// Encrypt cache data: `[nonce: 12B][ciphertext + GCM tag]`.
+    #[cfg(feature = "encryption")]
+    fn encrypt_cache(&self, plaintext: &[u8], dek: &Zeroizing<[u8; DEK_LEN]>) -> Option<Vec<u8>> {
+        use crate::encryption::Cipher;
+        let cipher = crate::encryption::AesCipher::new(&dek[..]).ok()?;
+        let mut nonce = [0u8; 12];
+        crate::encryption::fill_random_pub(&mut nonce);
+        let ct = cipher.encrypt_page(&nonce, plaintext).ok()?;
+        let mut out = Vec::with_capacity(12 + ct.len());
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&ct);
+        Some(out)
+    }
+
+    #[cfg(not(feature = "encryption"))]
+    fn encrypt_cache(&self, _plaintext: &[u8], _dek: &Zeroizing<[u8; DEK_LEN]>) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Decrypt cache data: reads nonce from first 12 bytes.
+    #[cfg(feature = "encryption")]
+    fn decrypt_cache(&self, bytes: &[u8], dek: &Zeroizing<[u8; DEK_LEN]>) -> Option<Vec<u8>> {
+        use crate::encryption::Cipher;
+        if bytes.len() < 28 {
+            return None;
+        }
+        let cipher = crate::encryption::AesCipher::new(&dek[..]).ok()?;
+        let nonce: [u8; 12] = bytes[..12].try_into().ok()?;
+        let ct = &bytes[12..];
+        cipher.decrypt_page(&nonce, ct).ok()
+    }
+
+    #[cfg(not(feature = "encryption"))]
+    fn decrypt_cache(&self, _bytes: &[u8], _dek: &Zeroizing<[u8; DEK_LEN]>) -> Option<Vec<u8>> {
+        None
     }
 
     /// Scan the cache directory and pre-load all entries into memory. Called
@@ -325,7 +390,19 @@ impl ResultCache {
                 Ok(b) => b,
                 Err(_) => continue,
             };
-            match bincode::deserialize::<SerializedEntry>(&bytes) {
+            // Decrypt if cache DEK is present.
+            let plaintext = if let Some(dek) = &self.cache_dek {
+                match self.decrypt_cache(&bytes, dek) {
+                    Some(p) => p,
+                    None => {
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+                }
+            } else {
+                bytes
+            };
+            match bincode::deserialize::<SerializedEntry>(&plaintext) {
                 Ok(serialized) => {
                     if let Some(entry) = serialized.into_entry() {
                         self.bytes = self.bytes.saturating_add(entry.data.approx_bytes());
@@ -502,6 +579,28 @@ impl ResultCache {
 /// has a `LearnedRange` index, else `HMAC_EQ` (equality). Keys are derived
 /// deterministically from the KEK so tokens are stable across runs. Empty when
 /// the table is plaintext (no KEK).
+/// Derive WAL and cache DEKs from the KEK (None when no encryption).
+type DekaOpt = Option<Zeroizing<[u8; DEK_LEN]>>;
+
+fn derive_subkeys(kek: Option<&Kek>) -> (DekaOpt, DekaOpt) {
+    if let Some(k) = kek {
+        (Some(k.derive_wal_key()), Some(k.derive_cache_key()))
+    } else {
+        (None, None)
+    }
+}
+
+/// Create a boxed cipher from a DEK (encryption feature only).
+#[cfg(feature = "encryption")]
+fn make_cipher(dek: &Zeroizing<[u8; DEK_LEN]>) -> Box<dyn crate::encryption::Cipher> {
+    Box::new(crate::encryption::AesCipher::new(&dek[..]).expect("DEK is 32 bytes"))
+}
+
+#[cfg(not(feature = "encryption"))]
+fn make_cipher(_dek: &Zeroizing<[u8; DEK_LEN]>) -> Box<dyn crate::encryption::Cipher> {
+    Box::new(crate::encryption::PlaintextCipher)
+}
+
 fn build_column_keys(kek: Option<&Kek>, schema: &Schema) -> HashMap<u16, ([u8; 32], u8)> {
     let Some(kek) = kek else {
         return HashMap::new();
@@ -565,6 +664,49 @@ impl Db {
         Self::create_inner(dir, schema, table_id, Some(kek))
     }
 
+    /// Create a new encrypted table using a raw key (e.g. from a key file)
+    /// instead of a passphrase. Skips Argon2id — the key must already be
+    /// high-entropy (>= 32 bytes of random data). ~0.1ms vs ~50ms for the
+    /// passphrase path.
+    #[cfg(feature = "encryption")]
+    pub fn create_with_key(
+        dir: impl AsRef<Path>,
+        schema: Schema,
+        table_id: u64,
+        key: &[u8],
+    ) -> Result<Self> {
+        let dir = dir.as_ref();
+        std::fs::create_dir_all(dir.join(META_DIR))?;
+        let salt = crate::encryption::random_salt();
+        std::fs::write(dir.join(META_DIR).join(KEYS_FILENAME), salt)?;
+        let kek: Arc<Kek> = Arc::new(Kek::from_raw_key(key, &salt)?);
+        Self::create_inner(dir, schema, table_id, Some(kek))
+    }
+
+    /// Open an existing encrypted table using a raw key.
+    #[cfg(feature = "encryption")]
+    pub fn open_with_key(dir: impl AsRef<Path>, key: &[u8]) -> Result<Self> {
+        let dir = dir.as_ref();
+        let salt_path = dir.join(META_DIR).join(KEYS_FILENAME);
+        let salt_bytes = std::fs::read(&salt_path).map_err(|e| {
+            MongrelError::NotFound(format!(
+                "encryption salt file {:?}: {e} (table not encrypted, or corrupted)",
+                salt_path
+            ))
+        })?;
+        if salt_bytes.len() != crate::encryption::SALT_LEN {
+            return Err(MongrelError::InvalidArgument(format!(
+                "salt file is {} bytes, expected {}",
+                salt_bytes.len(),
+                crate::encryption::SALT_LEN
+            )));
+        }
+        let mut salt = [0u8; crate::encryption::SALT_LEN];
+        salt.copy_from_slice(&salt_bytes);
+        let kek = Arc::new(Kek::from_raw_key(key, &salt)?);
+        Self::open_with_cipher(dir, Some(kek))
+    }
+
     fn create_inner(
         dir: impl AsRef<Path>,
         schema: Schema,
@@ -575,7 +717,16 @@ impl Db {
         std::fs::create_dir_all(dir.join(WAL_DIR))?;
         std::fs::create_dir_all(dir.join(RUNS_DIR))?;
         write_schema(&dir, &schema)?;
-        let mut wal = Wal::create(dir.join(WAL_DIR).join("seg-000000.wal"), Epoch(0))?;
+        let (wal_dek, cache_dek) = derive_subkeys(kek.as_deref());
+        let mut wal = if let Some(ref dk) = wal_dek {
+            Wal::create_with_cipher(
+                dir.join(WAL_DIR).join("seg-000000.wal"),
+                Epoch(0),
+                Some(make_cipher(dk)),
+            )?
+        } else {
+            Wal::create(dir.join(WAL_DIR).join("seg-000000.wal"), Epoch(0))?
+        };
         wal.set_sync_byte_threshold(DEFAULT_SYNC_BYTE_THRESHOLD);
         let mut manifest = Manifest::new(table_id, schema.schema_id);
         manifest::write_atomic(&dir, &mut manifest)?;
@@ -619,10 +770,13 @@ impl Db {
                 crate::cache::DecodedPageCache::new(DECODED_CACHE_CAPACITY),
             )),
             result_cache: Arc::new(parking_lot::Mutex::new(
-                ResultCache::new().with_dir(rcache_dir),
+                ResultCache::new()
+                    .with_dir(rcache_dir)
+                    .with_cache_dek(cache_dek.clone()),
             )),
             pending_delete_rids: roaring::RoaringBitmap::new(),
             pending_put_cols: std::collections::HashSet::new(),
+            wal_dek,
         })
     }
 
@@ -664,14 +818,26 @@ impl Db {
         let schema: Schema = read_schema(&dir)?;
         let active = latest_wal_segment(&dir.join(WAL_DIR))?;
         let replay_epoch = Epoch(manifest.current_epoch);
+        let (wal_dek, cache_dek) = derive_subkeys(kek.as_deref());
         // Replay BEFORE truncating: `Wal::create` would erase the segment.
         let replayed = match &active {
-            Some(path) => crate::wal::replay(path)?,
+            Some(path) => {
+                let cipher = wal_dek.as_ref().map(|dk| make_cipher(dk));
+                crate::wal::replay_with_cipher(path, cipher)?
+            }
             None => Vec::new(),
         };
         let mut wal = match &active {
-            Some(path) => Wal::create(path, replay_epoch)?,
-            None => Wal::create(dir.join(WAL_DIR).join("seg-000000.wal"), replay_epoch)?,
+            Some(path) => Wal::create_with_cipher(
+                path,
+                replay_epoch,
+                wal_dek.as_ref().map(|dk| make_cipher(dk)),
+            )?,
+            None => Wal::create_with_cipher(
+                dir.join(WAL_DIR).join("seg-000000.wal"),
+                replay_epoch,
+                wal_dek.as_ref().map(|dk| make_cipher(dk)),
+            )?,
         };
         wal.set_sync_byte_threshold(DEFAULT_SYNC_BYTE_THRESHOLD);
 
@@ -750,10 +916,13 @@ impl Db {
                 crate::cache::DecodedPageCache::new(DECODED_CACHE_CAPACITY),
             )),
             result_cache: Arc::new(parking_lot::Mutex::new(
-                ResultCache::new().with_dir(rcache_dir),
+                ResultCache::new()
+                    .with_dir(rcache_dir)
+                    .with_cache_dek(cache_dek.clone()),
             )),
             pending_delete_rids: roaring::RoaringBitmap::new(),
             pending_put_cols: std::collections::HashSet::new(),
+            wal_dek,
         };
 
         // 2. Fast path: load the persisted global-index checkpoint (Phase 9.1).
@@ -1241,9 +1410,10 @@ impl Db {
 
     fn rotate_wal(&mut self, epoch: Epoch) -> Result<()> {
         let segment = next_wal_segment(&self.dir.join(WAL_DIR))?;
-        let mut wal = Wal::create(segment, epoch)?;
+        let cipher = self.wal_dek.as_ref().map(|dk| make_cipher(dk));
+        let mut wal = Wal::create_with_cipher(segment, epoch, cipher)?;
         wal.set_sync_byte_threshold(self.sync_byte_threshold);
-        wal.sync()?; // durably persist the new segment's header before swapping in
+        wal.sync()?;
         self.wal = wal;
         Ok(())
     }
