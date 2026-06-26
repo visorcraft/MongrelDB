@@ -75,8 +75,9 @@ pub struct Wal {
     /// Optional AEAD cipher for frame-level encryption. When present, each
     /// frame's payload is encrypted before writing.
     cipher: Option<Box<dyn crate::encryption::Cipher>>,
-    /// The epoch this WAL segment was created at (used for nonce derivation).
-    epoch_created: Epoch,
+    /// Random per-segment nonce seed (generated on creation). Ensures nonce
+    /// uniqueness across restarts even with the same epoch_created.
+    nonce_seed: [u8; 8],
     /// Per-segment frame counter for nonce uniqueness.
     frame_seq: u32,
 }
@@ -100,6 +101,9 @@ impl Wal {
             .write(true)
             .truncate(true)
             .open(&path)?;
+        let mut nonce_seed = [0u8; 8];
+        // fill_random is always available (non-cfg-gated)
+        getrandom::getrandom(&mut nonce_seed).expect("getrandom: OS CSPRNG unavailable");
         let mut wal = Self {
             file: BufWriter::with_capacity(1 << 20, file),
             path,
@@ -107,7 +111,7 @@ impl Wal {
             unflushed_bytes: 0,
             sync_byte_threshold: 64 * 1024,
             cipher,
-            epoch_created,
+            nonce_seed,
             frame_seq: 0,
         };
         wal.write_header(epoch_created)?;
@@ -173,7 +177,7 @@ impl Wal {
     /// segments under the same WAL DEK.
     fn frame_nonce(&self) -> [u8; 12] {
         let mut n = [0u8; 12];
-        n[..8].copy_from_slice(&self.epoch_created.0.to_le_bytes());
+        n[..8].copy_from_slice(&self.nonce_seed);
         n[8..].copy_from_slice(&self.frame_seq.to_le_bytes());
         n
     }

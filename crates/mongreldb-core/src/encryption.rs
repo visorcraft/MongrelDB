@@ -10,9 +10,15 @@
 //! (2)` — so no per-page nonce material is persisted. Decrypting a page
 //! requires unwrapping its run's DEK with the table KEK.
 
-#[cfg(feature = "encryption")]
-use crate::MongrelError;
-use crate::Result;
+use crate::error::{MongrelError, Result};
+
+/// DEK length (AES-256 = 32 bytes). Always available.
+pub const DEK_LEN: usize = 32;
+
+/// Fill a buffer with OS CSPRNG bytes. Always available.
+pub fn fill_random(buf: &mut [u8]) {
+    getrandom::getrandom(buf).expect("getrandom: OS CSPRNG unavailable");
+}
 
 /// Symmetric page cipher.
 pub trait Cipher: Send + Sync {
@@ -87,7 +93,7 @@ pub use aes::AesCipher;
 
 #[cfg(feature = "encryption")]
 mod key {
-    use super::{Cipher, MongrelError, Result};
+    use super::{fill_random, Cipher, MongrelError, Result, DEK_LEN};
     use aes_gcm::aead::{Aead, KeyInit};
     use aes_gcm::{Aes256Gcm, Nonce};
     use serde::{Deserialize, Serialize};
@@ -95,8 +101,6 @@ mod key {
 
     /// Argon2id salt length (bytes).
     pub const SALT_LEN: usize = 16;
-    /// DEK length (AES-256 = 32 bytes).
-    pub const DEK_LEN: usize = 32;
     /// Algorithm tag stored in the Encryption Descriptor: AES-256-GCM.
     pub const ALGO_AES_GCM: u8 = 1;
     /// HKDF-SHA256 info label for KEK domain separation.
@@ -433,25 +437,13 @@ mod key {
             descriptor_bytes: Vec::new(),
         })
     }
-
-    fn fill_random(buf: &mut [u8]) {
-        // The OS CSPRNG must not fail in practice; a failure is fatal for
-        // security-critical key material.
-        getrandom::getrandom(buf).expect("getrandom: OS CSPRNG unavailable");
-    }
-}
-
-/// Public wrapper for `fill_random` — fills a buffer with OS CSPRNG bytes.
-#[cfg(feature = "encryption")]
-pub fn fill_random_pub(buf: &mut [u8]) {
-    getrandom::getrandom(buf).expect("getrandom: OS CSPRNG unavailable");
 }
 
 #[cfg(feature = "encryption")]
 pub use key::{
     build_page_nonce, build_run_cipher, generate_dek, hmac_token, ope_token_f64, ope_token_i64,
     random_nonce_prefix, random_salt, setup_run_encryption, ColumnKeyDescriptor,
-    EncryptionDescriptor, Kek, ALGO_AES_GCM, DEK_LEN, SALT_LEN, SCHEME_HMAC_EQ, SCHEME_OPE_RANGE,
+    EncryptionDescriptor, Kek, ALGO_AES_GCM, SALT_LEN, SCHEME_HMAC_EQ, SCHEME_OPE_RANGE,
 };
 
 /// Per-run encryption material assembled at write/read time: the page cipher

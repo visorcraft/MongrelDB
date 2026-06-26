@@ -10,7 +10,6 @@
 use crate::columnar;
 use crate::cursor::NativePageCursor;
 use crate::encryption::Kek;
-#[cfg(feature = "encryption")]
 use crate::encryption::DEK_LEN;
 use crate::epoch::{Epoch, EpochClock, Snapshot};
 use crate::global_idx;
@@ -26,7 +25,6 @@ use crate::{MongrelError, Result};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-#[cfg(feature = "encryption")]
 use zeroize::Zeroizing;
 
 pub const WAL_DIR: &str = "_wal";
@@ -327,7 +325,7 @@ impl ResultCache {
         use crate::encryption::Cipher;
         let cipher = crate::encryption::AesCipher::new(&dek[..]).ok()?;
         let mut nonce = [0u8; 12];
-        crate::encryption::fill_random_pub(&mut nonce);
+        crate::encryption::fill_random(&mut nonce);
         let ct = cipher.encrypt_page(&nonce, plaintext).ok()?;
         let mut out = Vec::with_capacity(12 + ct.len());
         out.extend_from_slice(&nonce);
@@ -583,11 +581,14 @@ impl ResultCache {
 type DekaOpt = Option<Zeroizing<[u8; DEK_LEN]>>;
 
 fn derive_subkeys(kek: Option<&Kek>) -> (DekaOpt, DekaOpt) {
-    if let Some(k) = kek {
-        (Some(k.derive_wal_key()), Some(k.derive_cache_key()))
-    } else {
-        (None, None)
+    let _ = kek;
+    #[cfg(feature = "encryption")]
+    {
+        if let Some(k) = kek {
+            return (Some(k.derive_wal_key()), Some(k.derive_cache_key()));
+        }
     }
+    (None, None)
 }
 
 /// Create a boxed cipher from a DEK (encryption feature only).
