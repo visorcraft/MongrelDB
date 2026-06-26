@@ -66,24 +66,35 @@ with zeros when no longer needed.
 |---|---|---|
 | Sorted-run page data (`.sr`) | **Yes** | Each page encrypted independently with AES-256-GCM |
 | Sorted-run headers | No | Structural metadata needed to open the file |
-| WAL segments (`_wal/`) | **No** | Rows are plaintext in the WAL until flushed |
+| WAL segments (`_wal/`) | **Yes** (encrypted tables) | Frame-level AES-256-GCM when the table is encrypted |
 | Manifest, schema, index files | No | Non-data metadata |
-| Result cache (`_rcache/`) | No | Derived data — safe to delete |
+| Result cache (`_rcache/`) | **Yes** (encrypted tables) | AES-256-GCM encrypted cache files |
 
-### The WAL Gap
+### Key Files vs Passphrases
 
-The write-ahead log (WAL) stores rows as plaintext between when you call
-`put()` and when you call `flush()`. If you need data to be encrypted at rest
-immediately, call `flush()` after writing:
+MongrelDB supports two ways to provide the encryption key:
 
+**Passphrase** (human-memorable, slow derivation):
 ```rust
-db.put(sensitive_row)?;
-db.commit()?;
-db.flush()?;  // now the data is in an encrypted sorted run, not the plaintext WAL
+let db = Db::create_encrypted(dir, schema, 1, "my-secret-passphrase")?;
+let db = Db::open_encrypted(dir, "my-secret-passphrase")?;
 ```
+Uses Argon2id (~50ms) to stretch the passphrase into a strong key.
 
-If the process crashes before flushing, the WAL is replayed on next open —
-the data is recovered, but the WAL file itself was not encrypted on disk.
+**Raw key** (machine-generated, fast derivation):
+```rust
+let key = std::fs::read("my.key")?;  // 32+ bytes of random data
+let db = Db::create_with_key(dir, schema, 1, &key)?;
+let db = Db::open_with_key(dir, &key)?;
+```
+Skips Argon2id — uses HKDF-SHA256 only (~0.1ms). The key must already be
+high-entropy (generate one with `openssl rand 32 > my.key`).
+
+Both paths produce the same KEK; all downstream encryption (sorted runs, WAL,
+cache) is identical regardless of which method you used.
+
+**Note:** For encrypted tables, the WAL is also encrypted (frame-level
+AES-256-GCM). For plaintext tables, the WAL stores rows unencrypted.
 
 ## Encrypted Indexable Columns
 

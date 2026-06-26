@@ -162,14 +162,23 @@ cargo build --release --features encryption
 | Component | Encrypted? |
 |---|---|
 | Sorted-run page payloads (`.sr`) | **Yes** (AES-256-GCM per page) |
+| WAL segments (`_wal/`) | **Yes** (frame-level AES-256-GCM) |
+| Result cache (`_rcache/`) | **Yes** (AES-256-GCM) |
 | Run headers / metadata | No (needed for open/recovery) |
-| Live WAL segments (`_wal/`) | **No** — rows are plaintext between `put` and `flush` |
 | Manifest / schema / indexes | No |
-| Result cache (`_rcache/`) | No |
 
-**Important:** call `flush()` before treating sensitive data as fully
-at-rest-protected. The WAL holds plaintext until flushed to an encrypted
-sorted run. Full WAL encryption is a future enhancement.
+### Key files
+
+In addition to the passphrase API, you can use a raw key file:
+
+```rust
+let key = std::fs::read("my.key")?;  // 32+ bytes of random data
+let db = Db::create_with_key(dir, schema, 1, &key)?;
+let db = Db::open_with_key(dir, &key)?;
+```
+
+Generate a key with `openssl rand 32 > my.key`. The raw key path skips
+Argon2id (~0.1ms vs ~50ms for passphrases).
 
 ### Performance overhead
 

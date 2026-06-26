@@ -9,21 +9,14 @@ MongrelDB supports optional page-level encryption using AES-256-GCM
 (enabled with the `encryption` Cargo feature). When enabled:
 
 - Sorted-run page payloads (`.sr` files) are encrypted.
+- WAL segments (`_wal/`) are encrypted (frame-level AES-256-GCM).
+- Result cache files (`_rcache/`) are encrypted.
 - Encryption keys are derived from a user-supplied passphrase via
   Argon2id + HKDF-SHA256. The passphrase is the sole secret.
 - Key material in memory is wrapped in `Zeroizing` buffers and wiped
   on drop.
 
-### Known limitation: WAL plaintext gap
-
-The write-ahead log (`_wal/`) stores rows as **plaintext** between
-`put()` and `flush()`. If you require data to be encrypted at rest
-immediately, call `flush()` after writing. Full WAL encryption is a
-future enhancement.
-
 ### Unencrypted components
-
-The following are **never** encrypted, by design:
 
 - Run headers and structural metadata (needed to open files)
 - Manifest, schema files, index checkpoints
