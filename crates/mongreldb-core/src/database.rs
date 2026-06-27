@@ -79,7 +79,7 @@ impl Database {
         let meta_dek = crate::encryption::meta_dek_for(kek.as_deref());
         let cat = Catalog::empty();
         catalog::write_atomic(&root, &cat, meta_dek.as_ref())?;
-        Self::finish_open(root, cat, kek, meta_dek)
+        Self::finish_open(root, cat, kek, meta_dek, false)
     }
 
     /// Open an existing plaintext database.
@@ -108,7 +108,7 @@ impl Database {
         let meta_dek = crate::encryption::meta_dek_for(kek.as_deref());
         let cat = catalog::read(&root, meta_dek.as_ref())?
             .ok_or_else(|| MongrelError::NotFound(format!("no catalog found at {:?}", root)))?;
-        Self::finish_open(root, cat, kek, meta_dek)
+        Self::finish_open(root, cat, kek, meta_dek, true)
     }
 
     fn finish_open(
@@ -116,6 +116,7 @@ impl Database {
         cat: Catalog,
         kek: Option<Arc<crate::encryption::Kek>>,
         meta_dek: Option<[u8; META_DEK_LEN]>,
+        existing: bool,
     ) -> Result<Self> {
         let epoch = Arc::new(EpochAuthority::new(cat.db_epoch));
         let snapshots = Arc::new(SnapshotRegistry::new());
@@ -126,13 +127,15 @@ impl Database {
             crate::cache::DecodedPageCache::new(crate::engine::DECODED_CACHE_CAPACITY),
         ));
         let commit_lock = Arc::new(Mutex::new(()));
-        let shared_wal = Mutex::new(crate::wal::SharedWal::create_with_dek(
-            &root,
-            Epoch(cat.db_epoch),
-            crate::encryption::wal_dek_for(kek.as_deref()),
-        )?);
+        let wal_dek = crate::encryption::wal_dek_for(kek.as_deref());
+        let shared_wal = Mutex::new(if existing {
+            crate::wal::SharedWal::open(&root, Epoch(cat.db_epoch), wal_dek.clone())?
+        } else {
+            crate::wal::SharedWal::create_with_dek(&root, Epoch(cat.db_epoch), wal_dek.clone())?
+        });
 
         // Open every live table against the shared context. Each `open_in`
+        // replays that table's PER-TABLE WAL (Table::put-style writes) and
         // advances the shared epoch authority to its manifest epoch, so the
         // final shared watermark is the max across all tables.
         let mut tables: HashMap<u64, TableHandle> = HashMap::new();
@@ -151,6 +154,14 @@ impl Database {
             };
             let t = Table::open_in(&tdir, ctx)?;
             tables.insert(entry.table_id, Arc::new(Mutex::new(t)));
+        }
+
+        // Recover transaction writes from the shared WAL (spec §15). The per-
+        // table WALs above already replayed `Table::put` writes; this pass
+        // applies committed cross-table transactions, gated by each table's
+        // `flushed_epoch` (records already durable in a run are not re-applied).
+        if existing {
+            recover_shared_wal(&root, &tables, &epoch, wal_dek.as_ref())?;
         }
 
         Ok(Self {
@@ -423,4 +434,94 @@ impl Database {
     pub(crate) fn snapshots(&self) -> &Arc<SnapshotRegistry> {
         &self.snapshots
     }
+}
+
+/// Two-pass, `flushed_epoch`-gated recovery of the shared WAL (spec §15).
+///
+/// Pass 1 scans every `TxnCommit` marker and records `txn_id → commit_epoch`
+/// (the per-txn outcome; aborted / in-flight / torn-tail txns are absent). Pass
+/// 2 applies each committed data record (Put/Delete) to its table at the commit
+/// epoch, skipping records whose `commit_epoch <= table.flushed_epoch` (already
+/// durable in a sorted run). Finally the shared epoch authority is raised to the
+/// max committed epoch so the next commit continues monotonically.
+fn recover_shared_wal(
+    root: &Path,
+    tables: &HashMap<u64, TableHandle>,
+    epoch: &EpochAuthority,
+    wal_dek: Option<&zeroize::Zeroizing<[u8; 32]>>,
+) -> Result<()> {
+    use crate::memtable::Row;
+    use crate::rowid::RowId;
+    use crate::wal::{Op, SharedWal};
+
+    let records = SharedWal::replay_with_dek(root, wal_dek)?;
+
+    // Pass 1: committed-txn outcomes.
+    let mut committed: HashMap<u64, u64> = HashMap::new();
+    for r in &records {
+        if let Op::TxnCommit { epoch: ce, .. } = r.op {
+            committed.insert(r.txn_id, ce);
+        }
+    }
+
+    // Pass 2: stage data per table, gated by flushed_epoch.
+    type TableStage = (Vec<Row>, Vec<(RowId, Epoch)>);
+    let mut stage: HashMap<u64, TableStage> = HashMap::new();
+    let mut max_epoch = epoch.visible().0;
+    for r in records {
+        let Some(&ce) = committed.get(&r.txn_id) else {
+            continue; // aborted / in-flight — discard
+        };
+        let commit_epoch = Epoch(ce);
+        max_epoch = max_epoch.max(ce);
+        match r.op {
+            Op::Put { table_id, rows } => {
+                // Skip if this table already flushed past the commit epoch.
+                let skip = tables
+                    .get(&table_id)
+                    .map(|h| h.lock().flushed_epoch() >= ce)
+                    .unwrap_or(true);
+                if skip {
+                    continue;
+                }
+                let rows: Vec<Row> = match bincode::deserialize(&rows) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                // Re-stamp each row at the txn commit epoch (rows are pre-stamped
+                // at pending_epoch which equals the commit epoch, but be robust).
+                let rows: Vec<Row> = rows
+                    .into_iter()
+                    .map(|mut row| {
+                        row.committed_epoch = commit_epoch;
+                        row
+                    })
+                    .collect();
+                stage.entry(table_id).or_default().0.extend(rows);
+            }
+            Op::Delete { table_id, row_ids } => {
+                let skip = tables
+                    .get(&table_id)
+                    .map(|h| h.lock().flushed_epoch() >= ce)
+                    .unwrap_or(true);
+                if skip {
+                    continue;
+                }
+                let dels = row_ids.into_iter().map(|rid| (rid, commit_epoch));
+                stage.entry(table_id).or_default().1.extend(dels);
+            }
+            _ => {}
+        }
+    }
+
+    for (table_id, (rows, deletes)) in stage {
+        let Some(handle) = tables.get(&table_id) else {
+            continue;
+        };
+        let mut t = handle.lock();
+        t.recover_apply(rows, deletes)?;
+    }
+
+    epoch.advance_recovered(Epoch(max_epoch));
+    Ok(())
 }

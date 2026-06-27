@@ -1267,10 +1267,34 @@ impl Table {
         self.allocator.alloc()
     }
 
-    /// The table's id.
-    #[allow(dead_code)]
-    pub(crate) fn table_id(&self) -> u64 {
-        self.table_id
+    /// Apply already-committed puts + tombstones during shared-WAL recovery
+    /// (spec §15 pass 2). Advances the allocator, upserts/tombstones the
+    /// memtable, and indexes the rows — but does NOT touch `live_count` (the
+    /// manifest is authoritative) and does NOT append to the WAL.
+    pub(crate) fn recover_apply(
+        &mut self,
+        rows: Vec<Row>,
+        deletes: Vec<(RowId, Epoch)>,
+    ) -> Result<()> {
+        for row in &rows {
+            self.allocator.advance_to(row.row_id);
+            self.memtable.upsert(row.clone());
+        }
+        for (rid, epoch) in deletes {
+            self.memtable.tombstone(rid, epoch);
+        }
+        // Index the recovered rows on top of the run-loaded data so the newest
+        // versions overwrite the older run versions in the HOT index.
+        for row in &rows {
+            self.index_row(row);
+        }
+        let _ = self.rebuild_reservoir();
+        Ok(())
+    }
+
+    /// Highest epoch whose data is durable in a sorted run (spec §7.1).
+    pub(crate) fn flushed_epoch(&self) -> u64 {
+        self.flushed_epoch
     }
 
     /// Logically delete `row_id` (effective at the next commit).

@@ -617,6 +617,57 @@ impl SharedWal {
         })
     }
 
+    /// Open an existing shared WAL for append, preserving prior segments (which
+    /// `replay` reads for recovery). A fresh active segment numbered one past
+    /// the highest existing is created — old segments are NOT truncated (review
+    /// fix #6), so a crash mid-recovery can re-replay them safely.
+    pub fn open(
+        root: &Path,
+        epoch_created: Epoch,
+        wal_dek: Option<Zeroizing<[u8; 32]>>,
+    ) -> Result<Self> {
+        let wal_dir = root.join("_wal");
+        std::fs::create_dir_all(&wal_dir)?;
+        let next_segment_no = list_segment_numbers(&wal_dir)?
+            .into_iter()
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0);
+        let cipher = match &wal_dek {
+            #[cfg(feature = "encryption")]
+            Some(dk) => Some(Self::cipher_from_dek(dk)?),
+            #[cfg(not(feature = "encryption"))]
+            Some(_) => {
+                return Err(MongrelError::Encryption(
+                    "encryption feature disabled but a WAL DEK was supplied".into(),
+                ))
+            }
+            None => None,
+        };
+        let mut active = Wal::create_with_cipher(
+            Self::segment_path(&wal_dir, next_segment_no),
+            epoch_created,
+            cipher,
+            next_segment_no,
+        )?;
+        // Flush + fsync the fresh segment header so the recovery replay (which
+        // reads every segment) never sees a half-written file.
+        active.sync()?;
+        Ok(Self {
+            wal_dir,
+            active,
+            active_segment_no: next_segment_no,
+            durable_seq: epoch_created.0,
+            wal_dek,
+        })
+    }
+
+    /// The active segment's wal_dir (test/diagnostic).
+    #[allow(dead_code)]
+    pub fn wal_dir(&self) -> &Path {
+        &self.wal_dir
+    }
+
     /// Append a record for `(txn_id, table_id)`. Does not fsync.
     pub fn append(&mut self, txn_id: u64, _table_id: u64, op: Op) -> Result<u64> {
         Ok(self.active.append_txn(txn_id, op)?.0)
@@ -692,24 +743,7 @@ impl SharedWal {
         wal_dek: Option<&Zeroizing<[u8; 32]>>,
     ) -> Result<Vec<Record>> {
         let wal_dir = root.join("_wal");
-        let mut segments: Vec<u64> = Vec::new();
-        if let Ok(rd) = std::fs::read_dir(&wal_dir) {
-            for entry in rd.flatten() {
-                let fname = entry.file_name();
-                let Some(s) = fname.to_str() else {
-                    continue;
-                };
-                let Some(stripped) = s.strip_prefix("seg-") else {
-                    continue;
-                };
-                let Some(stripped) = stripped.strip_suffix(".wal") else {
-                    continue;
-                };
-                if let Ok(n) = stripped.parse::<u64>() {
-                    segments.push(n);
-                }
-            }
-        }
+        let mut segments = list_segment_numbers(&wal_dir)?;
         segments.sort_unstable();
         let mut out = Vec::new();
         for n in segments {
@@ -728,6 +762,29 @@ impl SharedWal {
         }
         Ok(out)
     }
+}
+
+/// List the segment numbers present under `wal_dir` (unsorted).
+fn list_segment_numbers(wal_dir: &Path) -> Result<Vec<u64>> {
+    let mut segments = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(wal_dir) {
+        for entry in rd.flatten() {
+            let fname = entry.file_name();
+            let Some(s) = fname.to_str() else {
+                continue;
+            };
+            let Some(stripped) = s.strip_prefix("seg-") else {
+                continue;
+            };
+            let Some(stripped) = stripped.strip_suffix(".wal") else {
+                continue;
+            };
+            if let Ok(n) = stripped.parse::<u64>() {
+                segments.push(n);
+            }
+        }
+    }
+    Ok(segments)
 }
 
 #[cfg(test)]
