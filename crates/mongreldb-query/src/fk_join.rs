@@ -34,8 +34,9 @@ use arrow::record_batch::RecordBatch;
 use datafusion::common::Column;
 use datafusion::logical_expr::{Expr, JoinType, LogicalPlan, Operator};
 use mongreldb_core::{schema::IndexKind, Condition, Query, Row, Schema, Table, TypeId, Value};
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// `(sort_expr, asc, nulls_first)` keys plus an optional `LIMIT n` fetch.
 type SortInfo = (Vec<(Expr, bool, bool)>, Option<usize>);
@@ -426,12 +427,8 @@ struct OutCol {
 fn lock_db<'a>(
     table: &str,
     tables: &'a HashMap<String, Arc<Mutex<Table>>>,
-) -> std::sync::MutexGuard<'a, Table> {
-    tables
-        .get(table)
-        .expect("table pre-checked present")
-        .lock()
-        .expect("db mutex poisoned")
+) -> parking_lot::MutexGuard<'a, Table> {
+    tables.get(table).expect("table pre-checked present").lock()
 }
 
 fn with_schema(table: &str, tables: &HashMap<String, Arc<Mutex<Table>>>) -> Result<Schema> {
@@ -798,7 +795,7 @@ fn is_pk_column(
 ) -> Result<bool> {
     match tables.get(table) {
         Some(arc) => {
-            let db = arc.lock().expect("db mutex poisoned");
+            let db = arc.lock();
             Ok(db
                 .schema()
                 .primary_key()
@@ -813,7 +810,7 @@ fn has_bitmap(table: &str, col: &str, tables: &HashMap<String, Arc<Mutex<Table>>
     let Some(arc) = tables.get(table) else {
         return Ok(false);
     };
-    let db = arc.lock().expect("db mutex poisoned");
+    let db = arc.lock();
     let schema = db.schema();
     let Some(cdef) = schema.column(col) else {
         return Ok(false);
@@ -1281,7 +1278,8 @@ mod tests {
         ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema as MSchema, TypeId as MTy,
     };
     use mongreldb_core::{Table, Value};
-    use std::sync::{Arc, Mutex};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
     use tempfile::tempdir;
 
     /// countries(pk `cid` Int64) ; users(pk `uid`, `country` Int64 [bitmap]).

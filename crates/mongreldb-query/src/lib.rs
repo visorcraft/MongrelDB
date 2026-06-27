@@ -38,9 +38,10 @@ use datafusion::common::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::{Expr, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
-use mongreldb_core::{Cursor, Table};
+use mongreldb_core::{Cursor, Database, Table};
+use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// A MongrelDB table exposed to DataFusion. Holds the live `Table` behind a mutex;
 /// each scan takes a fresh MVCC snapshot.
@@ -52,7 +53,7 @@ pub struct MongrelProvider {
 impl MongrelProvider {
     pub fn new(db: Arc<Mutex<Table>>) -> Result<Self> {
         let schema = {
-            let db = db.lock().expect("db mutex poisoned");
+            let db = db.lock();
             arrow_conv::arrow_schema(db.schema())?
         };
         Ok(Self { db, schema })
@@ -88,7 +89,7 @@ impl TableProvider for MongrelProvider {
         filters: &[&Expr],
     ) -> DFResult<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
         use datafusion::logical_expr::TableProviderFilterPushDown;
-        let schema_ref = self.db.lock().expect("db mutex poisoned").schema().clone();
+        let schema_ref = self.db.lock().schema().clone();
         Ok(filters
             .iter()
             .map(|f| match translate_filter(f, &schema_ref) {
@@ -116,7 +117,7 @@ impl TableProvider for MongrelProvider {
         let core_err = |e: mongreldb_core::MongrelError| {
             DataFusionError::External(Box::new(MongrelQueryError::Core(e)))
         };
-        let mut db = self.db.lock().expect("db mutex poisoned");
+        let mut db = self.db.lock();
         let snap = db.snapshot();
         let schema_ref = db.schema().clone();
 
@@ -774,20 +775,24 @@ fn longest_like_segment(pat: &str) -> Option<Vec<u8>> {
 pub struct MongrelSession {
     ctx: SessionContext,
     db: Arc<Mutex<Table>>,
+    /// P4.1: the multi-table `Database` when opened via `open()`. When `Some`,
+    /// the cache epoch is driven by `Database::visible_epoch()` instead of the
+    /// legacy `combined_epoch()` fold.
+    database: Option<Arc<Database>>,
     cache: ResultCache,
     /// Phase 16.5: logical-plan cache keyed by SQL string.
-    plan_cache: std::sync::Mutex<HashMap<String, datafusion::logical_expr::LogicalPlan>>,
+    plan_cache: parking_lot::Mutex<HashMap<String, datafusion::logical_expr::LogicalPlan>>,
     /// `table name → owning Table handle` for every registered table.
-    tables: std::sync::Mutex<HashMap<String, Arc<Mutex<Table>>>>,
+    tables: parking_lot::Mutex<HashMap<String, Arc<Mutex<Table>>>>,
     /// Phase 17.3: named materialized views — `view name → defining SQL`.
     /// On `run("SELECT * FROM <view>")`, the defining SQL is executed (or the
     /// result-cache is hit). Invalidated automatically on commit (epoch bump).
-    views: std::sync::Mutex<HashMap<String, String>>,
+    views: parking_lot::Mutex<HashMap<String, String>>,
 }
 
 /// `(sql, snapshot_epoch) → cached result batches`.
 type CacheKey = (String, u64);
-type ResultCache = std::sync::Mutex<std::collections::HashMap<CacheKey, Arc<Vec<RecordBatch>>>>;
+type ResultCache = parking_lot::Mutex<std::collections::HashMap<CacheKey, Arc<Vec<RecordBatch>>>>;
 
 impl MongrelSession {
     /// Create a session over a live `Table`. Takes ownership; wrap in `Arc` if you
@@ -805,11 +810,54 @@ impl MongrelSession {
         Self {
             ctx,
             db,
-            cache: std::sync::Mutex::new(std::collections::HashMap::new()),
-            plan_cache: std::sync::Mutex::new(HashMap::new()),
-            tables: std::sync::Mutex::new(HashMap::new()),
-            views: std::sync::Mutex::new(HashMap::new()),
+            database: None,
+            cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            plan_cache: parking_lot::Mutex::new(HashMap::new()),
+            tables: parking_lot::Mutex::new(HashMap::new()),
+            views: parking_lot::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Open a session over a multi-table [`Database`] (spec §12). Auto-registers
+    /// every live table as a `MongrelProvider`; the cache epoch is driven by
+    /// `Database::visible_epoch()` so any table's commit invalidates cached
+    /// results.
+    pub fn open(database: Arc<Database>) -> Result<Self> {
+        let ctx = SessionContext::new();
+        ctx.register_udf(datafusion::logical_expr::ScalarUDF::from(
+            udf::AnnSearchUdf::new(),
+        ));
+        ctx.register_udf(datafusion::logical_expr::ScalarUDF::from(
+            udf::SparseMatchUdf::new(),
+        ));
+
+        let mut tables: HashMap<String, Arc<Mutex<Table>>> = HashMap::new();
+        for name in database.table_names() {
+            let handle = database.table(&name)?;
+            let provider = MongrelProvider::new(handle.clone())?;
+            ctx.register_table(&name, Arc::new(provider))
+                .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
+            tables.insert(name, handle);
+        }
+
+        // Pick the first table as the "primary" for legacy `db()` accessors.
+        let primary = tables
+            .values()
+            .next()
+            .cloned()
+            .ok_or(MongrelQueryError::Core(
+                mongreldb_core::MongrelError::NotFound("database has no live tables".into()),
+            ))?;
+
+        Ok(Self {
+            ctx,
+            db: primary,
+            database: Some(database),
+            cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            plan_cache: parking_lot::Mutex::new(HashMap::new()),
+            tables: parking_lot::Mutex::new(tables),
+            views: parking_lot::Mutex::new(HashMap::new()),
+        })
     }
 
     /// The underlying Table handle (Phase 19.3: used by the daemon for direct
@@ -823,24 +871,18 @@ impl MongrelSession {
     /// executed (or served from the result cache) transparently. The view is
     /// automatically invalidated on commit (via the epoch-keyed result cache).
     pub fn create_view(&self, name: &str, sql: &str) {
-        self.views
-            .lock()
-            .unwrap()
-            .insert(name.to_string(), sql.to_string());
+        self.views.lock().insert(name.to_string(), sql.to_string());
     }
 
     /// Drop a named materialized view.
     pub fn drop_view(&self, name: &str) {
-        self.views.lock().unwrap().remove(name);
+        self.views.lock().remove(name);
     }
 
     /// Register the table under `name` so `select * from <name>` resolves.
     pub async fn register(&self, name: &str) -> Result<()> {
         let provider = MongrelProvider::new(self.db.clone())?;
-        self.tables
-            .lock()
-            .unwrap()
-            .insert(name.to_string(), self.db.clone());
+        self.tables.lock().insert(name.to_string(), self.db.clone());
         self.ctx
             .register_table(name, Arc::new(provider))
             .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
@@ -855,7 +897,7 @@ impl MongrelSession {
     pub async fn register_db(&self, name: &str, db: Table) -> Result<()> {
         let db_arc = Arc::new(Mutex::new(db));
         let provider = MongrelProvider::new(db_arc.clone())?;
-        self.tables.lock().unwrap().insert(name.to_string(), db_arc);
+        self.tables.lock().insert(name.to_string(), db_arc);
         self.ctx
             .register_table(name, Arc::new(provider))
             .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
@@ -869,17 +911,17 @@ impl MongrelSession {
         // the view's defining SQL.
         let effective_sql = self.resolve_view_sql(sql);
         let sql = effective_sql.as_str();
-        // The cache key folds in every registered table's epoch, not just the
-        // primary's, so a commit on a secondary (join) table invalidates cached
-        // multi-table results (Phase 8 review fix).
-        let epoch = self.combined_epoch();
+        // The cache key uses the Database's visible epoch (P4.1) when opened
+        // via `open()`, or the legacy `combined_epoch()` fold for multi-table
+        // sessions created via `new()` + `register_db()`.
+        let epoch = self.cache_epoch();
         let key = (sql.to_string(), epoch);
-        if let Some(hit) = self.cache.lock().unwrap().get(&key) {
+        if let Some(hit) = self.cache.lock().get(&key) {
             return Ok((**hit).clone());
         }
         // Phase 16.5: check the logical-plan cache before re-parsing.
         let df = {
-            let cached_plan = self.plan_cache.lock().unwrap().get(sql).cloned();
+            let cached_plan = self.plan_cache.lock().get(sql).cloned();
             if let Some(plan) = cached_plan {
                 datafusion::dataframe::DataFrame::new(self.ctx.state(), plan)
             } else {
@@ -890,7 +932,6 @@ impl MongrelSession {
                     .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
                 self.plan_cache
                     .lock()
-                    .unwrap()
                     .insert(sql.to_string(), df.logical_plan().clone());
                 df
             }
@@ -916,18 +957,15 @@ impl MongrelSession {
                 }
             }
         };
-        self.cache
-            .lock()
-            .unwrap()
-            .insert(key, Arc::new(batches.clone()));
+        self.cache.lock().insert(key, Arc::new(batches.clone()));
         Ok(batches)
     }
 
     /// Drop all cached results (e.g. after a manual data change you want
     /// reflected immediately).
     pub fn clear_cache(&self) {
-        self.cache.lock().unwrap().clear();
-        self.plan_cache.lock().unwrap().clear();
+        self.cache.lock().clear();
+        self.plan_cache.lock().clear();
     }
 
     /// A cache key epoch combining the primary table's epoch with every
@@ -935,7 +973,7 @@ impl MongrelSession {
     /// results (correctness for multi-table joins).
     /// Phase 17.3: rewrite `FROM <view_name>` to `FROM (<view_sql>) AS <view_name>`.
     fn resolve_view_sql(&self, sql: &str) -> String {
-        let views = self.views.lock().unwrap();
+        let views = self.views.lock();
         if views.is_empty() {
             return sql.to_string();
         }
@@ -959,18 +997,22 @@ impl MongrelSession {
         result
     }
 
+    /// Cache epoch: uses `Database::visible_epoch()` when a Database is
+    /// attached (P4.1), otherwise falls back to the legacy `combined_epoch()`.
+    fn cache_epoch(&self) -> u64 {
+        if let Some(db) = &self.database {
+            db.visible_epoch().0
+        } else {
+            self.combined_epoch()
+        }
+    }
+
     fn combined_epoch(&self) -> u64 {
-        let mut combined = self
-            .db
-            .lock()
-            .expect("db mutex poisoned")
-            .snapshot()
-            .epoch
-            .0;
-        let tables = self.tables.lock().unwrap();
+        let mut combined = self.db.lock().snapshot().epoch.0;
+        let tables = self.tables.lock();
         for arc in tables.values() {
             if !Arc::ptr_eq(arc, &self.db) {
-                let e = arc.lock().expect("db mutex poisoned").snapshot().epoch.0;
+                let e = arc.lock().snapshot().epoch.0;
                 combined = combined.wrapping_mul(31).wrapping_add(e);
             }
         }
@@ -985,7 +1027,7 @@ impl MongrelSession {
         plan: &datafusion::logical_expr::LogicalPlan,
         cache_key: u64,
     ) -> Result<Option<RecordBatch>> {
-        let mut db = self.db.lock().expect("db mutex poisoned");
+        let mut db = self.db.lock();
         let schema = db.schema().clone();
         let snap = db.snapshot();
         native_agg::try_native_aggregate(&mut db, &schema, snap, plan, cache_key)
@@ -998,7 +1040,7 @@ impl MongrelSession {
         &self,
         plan: &datafusion::logical_expr::LogicalPlan,
     ) -> Result<Option<Vec<RecordBatch>>> {
-        let tables = self.tables.lock().unwrap();
+        let tables = self.tables.lock();
         fk_join::try_fk_join(&tables, plan)
     }
 

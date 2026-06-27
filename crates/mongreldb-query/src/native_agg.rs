@@ -230,7 +230,8 @@ mod tests {
     use datafusion::prelude::SessionContext;
     use mongreldb_core::schema::{ColumnDef, ColumnFlags, Schema as MSchema, TypeId};
     use mongreldb_core::{Table, Value};
-    use std::sync::{Arc, Mutex};
+    use parking_lot::Mutex;
+use std::sync::Arc;
     use tempfile::tempdir;
 
     fn schema() -> MSchema {
@@ -275,7 +276,7 @@ mod tests {
         let (ctx, db, _dir) = ctx_and_db().await;
         let sum_plan = ctx.sql("select sum(v) as s from t").await.unwrap();
         let sel_plan = ctx.sql("select v from t").await.unwrap();
-        let mut g = db.lock().unwrap();
+        let mut g = db.lock();
         let schema = g.schema().clone();
         let snap = g.snapshot();
         let fired_sum =
