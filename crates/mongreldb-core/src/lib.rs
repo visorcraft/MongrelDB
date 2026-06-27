@@ -42,7 +42,7 @@ pub use engine::{
     AggState, ApproxAgg, ApproxResult, CachedAgg, ColumnStat, IncrementalAggResult, NativeAgg,
     NativeAggResult, Table,
 };
-pub use epoch::{Epoch, EpochClock, Snapshot};
+pub use epoch::{Epoch, EpochAuthority, EpochClock, Snapshot};
 pub use error::{MongrelError, Result};
 pub use gc::{CheckReport, DoctorReport, GcReport};
 pub use index::{

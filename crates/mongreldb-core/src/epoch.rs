@@ -84,6 +84,65 @@ impl EpochClock {
     }
 }
 
+/// Dual-counter epoch authority for a multi-table `Database`. `assigned` is the
+/// commit-order ticket (advanced the instant a txn is sequenced); `visible` is
+/// the in-order reader watermark, advanced only once a committed txn has been
+/// fully published. Readers pin `visible`; writers reserve `assigned`. The two
+/// counters decouple "what order commits happened" from "what is safe to read".
+#[derive(Debug)]
+pub struct EpochAuthority {
+    assigned: AtomicU64,
+    visible: AtomicU64,
+}
+
+impl EpochAuthority {
+    pub fn new(start: u64) -> Self {
+        Self {
+            assigned: AtomicU64::new(start),
+            visible: AtomicU64::new(start),
+        }
+    }
+
+    /// The reader watermark: the highest epoch fully published and visible.
+    #[inline]
+    pub fn visible(&self) -> Epoch {
+        Epoch(self.visible.load(Ordering::Acquire))
+    }
+
+    /// Reserve the next commit-order ticket. Returns the assigned epoch.
+    #[inline]
+    pub fn bump_assigned(&self) -> Epoch {
+        Epoch(self.assigned.fetch_add(1, Ordering::AcqRel) + 1)
+    }
+
+    /// Advance the reader watermark to `e`, monotonically. Stale (lower) values
+    /// are ignored so out-of-order publish completions never regress visibility.
+    pub fn publish_visible(&self, e: Epoch) {
+        let mut cur = self.visible.load(Ordering::Acquire);
+        while e.0 > cur {
+            match self
+                .visible
+                .compare_exchange_weak(cur, e.0, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    /// Recovery: set both counters to `e` (e.g. the max committed epoch on open).
+    pub fn set_recovered(&self, e: Epoch) {
+        self.assigned.store(e.0, Ordering::Release);
+        self.visible.store(e.0, Ordering::Release);
+    }
+
+    /// The current `assigned` counter (test/diagnostic use).
+    #[inline]
+    pub fn assigned(&self) -> Epoch {
+        Epoch(self.assigned.load(Ordering::Acquire))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,5 +157,18 @@ mod tests {
         let next = clock.bump();
         assert_eq!(next, Epoch(11));
         assert!(clock.snapshot().observes(Epoch(11)));
+    }
+
+    #[test]
+    fn epoch_authority_assigned_and_visible_advance_in_order() {
+        let a = EpochAuthority::new(0);
+        assert_eq!(a.visible(), Epoch(0));
+        let e1 = a.bump_assigned();
+        let e2 = a.bump_assigned();
+        assert_eq!((e1, e2), (Epoch(1), Epoch(2)));
+        a.publish_visible(Epoch(2));
+        assert_eq!(a.visible(), Epoch(2));
+        a.publish_visible(Epoch(1));
+        assert_eq!(a.visible(), Epoch(2));
     }
 }
