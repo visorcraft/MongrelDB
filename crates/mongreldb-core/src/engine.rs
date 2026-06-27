@@ -113,6 +113,9 @@ pub struct Table {
     /// flush in that state must NOT checkpoint; reopen rebuilds complete indexes
     /// from the runs and resets this to true.
     indexes_complete: bool,
+    /// Highest epoch whose data is durable in a sorted run (spec §7.1). Recovery
+    /// skips replaying WAL records whose commit epoch is `<= flushed_epoch`.
+    flushed_epoch: u64,
     /// Shared, MVCC content-addressed page cache (Phase 9.2). Fed by every
     /// `RunReader::read_page` so all readers share raw (decrypted) page bytes.
     page_cache: Arc<parking_lot::Mutex<crate::cache::PageCache>>,
@@ -790,7 +793,7 @@ impl Table {
         };
         wal.set_sync_byte_threshold(DEFAULT_SYNC_BYTE_THRESHOLD);
         let mut manifest = Manifest::new(table_id, schema.schema_id);
-        manifest::write_atomic(&dir, &mut manifest)?;
+        manifest::write_atomic(&dir, &mut manifest, None)?;
         let (bitmap, ann, fm, sparse) = empty_indexes(&schema);
         let column_keys = build_column_keys(ctx.kek.as_deref(), &schema);
         let rcache_dir = dir.join(RCACHE_DIR);
@@ -825,6 +828,7 @@ impl Table {
             agg_cache: HashMap::new(),
             global_idx_epoch: 0,
             indexes_complete: true,
+            flushed_epoch: 0,
             page_cache: ctx.page_cache,
             decoded_cache: ctx.decoded_cache,
             snapshots: ctx.snapshots,
@@ -878,7 +882,8 @@ impl Table {
 
     pub(crate) fn open_in(dir: impl AsRef<Path>, ctx: SharedCtx) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
-        let manifest = manifest::read(&dir)?;
+        let manifest_meta_dek = crate::encryption::meta_dek_for(ctx.kek.as_deref());
+        let manifest = manifest::read(&dir, manifest_meta_dek.as_ref())?;
         let schema: Schema = read_schema(&dir)?;
         let active = latest_wal_segment(&dir.join(WAL_DIR))?;
         let replay_epoch = Epoch(manifest.current_epoch);
@@ -995,6 +1000,7 @@ impl Table {
             agg_cache: HashMap::new(),
             global_idx_epoch: manifest.global_idx_epoch,
             indexes_complete: true,
+            flushed_epoch: manifest.flushed_epoch,
             page_cache: ctx.page_cache,
             decoded_cache: ctx.decoded_cache,
             snapshots: ctx.snapshots,
@@ -1371,6 +1377,7 @@ impl Table {
                 table_id: self.table_id,
                 flushed_epoch: epoch.0,
             })?;
+            self.flushed_epoch = epoch.0;
             self.wal.sync()?;
             self.rotate_wal(epoch)?;
             self.persist_manifest(epoch)?;
@@ -1517,6 +1524,7 @@ impl Table {
             table_id: self.table_id,
             flushed_epoch: epoch.0,
         })?;
+        self.flushed_epoch = epoch.0;
         self.wal.sync()?;
         self.rotate_wal(epoch)?;
         self.persist_manifest(epoch)?;
@@ -1549,7 +1557,9 @@ impl Table {
         m.runs = self.run_refs.clone();
         m.live_count = self.live_count;
         m.global_idx_epoch = self.global_idx_epoch;
-        manifest::write_atomic(&self.dir, &mut m)?;
+        m.flushed_epoch = self.flushed_epoch;
+        let meta_dek = self.manifest_meta_dek();
+        manifest::write_atomic(&self.dir, &mut m, meta_dek.as_ref())?;
         Ok(())
     }
 
@@ -2298,6 +2308,7 @@ impl Table {
             table_id: self.table_id,
             flushed_epoch: epoch.0,
         })?;
+        self.flushed_epoch = epoch.0;
         self.wal.sync()?;
         self.rotate_wal(epoch)?;
         self.persist_manifest(epoch)?;
@@ -3844,6 +3855,19 @@ impl Table {
 
     #[cfg(not(feature = "encryption"))]
     fn idx_dek(&self) -> Option<Zeroizing<[u8; DEK_LEN]>> {
+        None
+    }
+
+    /// Manifest (and other DB-wide metadata) meta DEK, derived from the KEK so
+    /// the on-disk manifest is encrypted + authenticated at rest for encrypted
+    /// tables. `None` for plaintext.
+    #[cfg(feature = "encryption")]
+    fn manifest_meta_dek(&self) -> Option<[u8; DEK_LEN]> {
+        self.kek.as_ref().map(|k| *k.derive_meta_key())
+    }
+
+    #[cfg(not(feature = "encryption"))]
+    fn manifest_meta_dek(&self) -> Option<[u8; DEK_LEN]> {
         None
     }
 

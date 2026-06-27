@@ -64,7 +64,7 @@ pub use sorted_run::{
     read_column_dir, read_header, write_run, write_run_with, ColumnPayload, RunHeader, RunReader,
     RunSpec, RunWriter,
 };
-pub use wal::{Op, Record, Wal, WalReader};
+pub use wal::{AddedRun, DdlOp, Op, Record, SharedWal, Wal, WalReader, SYSTEM_TXN_ID};
 
 #[cfg(feature = "encryption")]
 pub use encryption::{AesCipher, ColumnKeyDescriptor, EncryptionDescriptor, Kek};

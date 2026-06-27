@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use zeroize::Zeroizing;
 
 pub const WAL_MAGIC: [u8; 8] = *b"MONGRWAL";
 const WAL_VERSION: u16 = 3;
@@ -279,6 +280,13 @@ impl Wal {
         self.unflushed_bytes
     }
 
+    /// The next sequence number this writer will assign (i.e. last assigned + 1).
+    /// Exposed so a shared-WAL group-sync can report the durable high-water mark.
+    #[inline]
+    pub fn next_seq_val(&self) -> u64 {
+        self.next_seq
+    }
+
     /// Tune the auto-sync threshold (bytes of buffered WAL before an automatic
     /// `fsync`). `0` disables auto-sync entirely (manual [`Wal::sync`] only) —
     /// useful for latency benchmarks and for grouping many writes under one
@@ -542,6 +550,231 @@ pub fn frame_nonce_for(segment_no: u64, frame: u32) -> [u8; 12] {
     n[..8].copy_from_slice(&segment_no.to_be_bytes());
     n[8..].copy_from_slice(&frame.to_le_bytes());
     n
+}
+
+/// A WAL shared across all tables of a `Database`, multiplexing many tables'
+/// records onto one fd (spec §7.2). Owns the active `Wal` segment plus the list
+/// of rotated segments under `<root>/_wal/`. Appends are buffered; a single
+/// [`SharedWal::group_sync`] is the durability point for every concurrent
+/// writer that appended since the last sync.
+pub struct SharedWal {
+    wal_dir: PathBuf,
+    active: Wal,
+    /// Monotonic segment number of the active segment (namespaces nonces).
+    active_segment_no: u64,
+    /// Highest sequence number reported durable by the last successful
+    /// `group_sync`. P3's group-commit publishes only commits at or below this.
+    durable_seq: u64,
+    /// WAL DEK (constant across segments). None for plaintext. Kept so a
+    /// `rotate` can rebuild the per-segment cipher under the same key.
+    wal_dek: Option<Zeroizing<[u8; 32]>>,
+}
+
+impl SharedWal {
+    /// Segment filename for a given number.
+    fn segment_path(wal_dir: &Path, segment_no: u64) -> PathBuf {
+        wal_dir.join(format!("seg-{segment_no:06}.wal"))
+    }
+
+    /// Build a per-segment frame cipher from the WAL DEK (encryption feature).
+    #[cfg(feature = "encryption")]
+    fn cipher_from_dek(dek: &Zeroizing<[u8; 32]>) -> Result<Box<dyn crate::encryption::Cipher>> {
+        Ok(Box::new(crate::encryption::AesCipher::new(&dek[..])?))
+    }
+
+    /// Create a fresh shared WAL at `<root>/_wal/` starting at `epoch_created`.
+    pub fn create(root: &Path, epoch_created: Epoch) -> Result<Self> {
+        Self::create_with_dek(root, epoch_created, None)
+    }
+
+    /// Create with optional frame-level encryption (WAL DEK).
+    pub fn create_with_dek(
+        root: &Path,
+        epoch_created: Epoch,
+        wal_dek: Option<Zeroizing<[u8; 32]>>,
+    ) -> Result<Self> {
+        let wal_dir = root.join("_wal");
+        std::fs::create_dir_all(&wal_dir)?;
+        let cipher = match &wal_dek {
+            #[cfg(feature = "encryption")]
+            Some(dk) => Some(Self::cipher_from_dek(dk)?),
+            #[cfg(not(feature = "encryption"))]
+            Some(_) => {
+                return Err(MongrelError::Encryption(
+                    "encryption feature disabled but a WAL DEK was supplied".into(),
+                ))
+            }
+            None => None,
+        };
+        let active =
+            Wal::create_with_cipher(Self::segment_path(&wal_dir, 0), epoch_created, cipher, 0)?;
+        Ok(Self {
+            wal_dir,
+            active,
+            active_segment_no: 0,
+            durable_seq: epoch_created.0,
+            wal_dek,
+        })
+    }
+
+    /// Append a record for `(txn_id, table_id)`. Does not fsync.
+    pub fn append(&mut self, txn_id: u64, _table_id: u64, op: Op) -> Result<u64> {
+        Ok(self.active.append_txn(txn_id, op)?.0)
+    }
+
+    /// Append a `TxnCommit` marker sealing `txn_id` at `epoch`.
+    pub fn append_commit(&mut self, txn_id: u64, epoch: Epoch, added: &[AddedRun]) -> Result<u64> {
+        Ok(self
+            .active
+            .append_txn(
+                txn_id,
+                Op::TxnCommit {
+                    epoch: epoch.0,
+                    added_runs: added.to_vec(),
+                },
+            )?
+            .0)
+    }
+
+    /// Append a `TxnAbort` marker for `txn_id`.
+    pub fn append_abort(&mut self, txn_id: u64) -> Result<()> {
+        self.active.append_txn(txn_id, Op::TxnAbort)?;
+        Ok(())
+    }
+
+    /// Append a system record (txn_id == 0), e.g. `Flush`.
+    pub fn append_system(&mut self, op: Op) -> Result<u64> {
+        Ok(self.active.append_system(op)?.0)
+    }
+
+    /// Flush + fsync the active segment and return the highest durable sequence
+    /// number. This is the single durability point for every concurrent
+    /// appender since the last `group_sync`.
+    pub fn group_sync(&mut self) -> Result<u64> {
+        self.active.sync()?;
+        let highest = self.active.next_seq_val().saturating_sub(1);
+        if highest > self.durable_seq {
+            self.durable_seq = highest;
+        }
+        Ok(self.durable_seq)
+    }
+
+    /// Rotate to a fresh segment numbered `segment_no` (which namespaces nonces
+    /// under the constant WAL DEK). The current segment must already be synced.
+    pub fn rotate(&mut self, segment_no: u64) -> Result<()> {
+        let cipher = match &self.wal_dek {
+            #[cfg(feature = "encryption")]
+            Some(dk) => Some(Self::cipher_from_dek(dk)?),
+            _ => None,
+        };
+        let path = Self::segment_path(&self.wal_dir, segment_no);
+        let epoch = Epoch(self.durable_seq);
+        let wal = Wal::create_with_cipher(path, epoch, cipher, segment_no)?;
+        self.active = wal;
+        self.active_segment_no = segment_no;
+        Ok(())
+    }
+
+    /// The active segment number.
+    pub fn active_segment_no(&self) -> u64 {
+        self.active_segment_no
+    }
+
+    /// Replay every record across all segments in `<root>/_wal/`, in segment
+    /// order, applying the torn-tail-vs-interior-corruption rule per segment.
+    pub fn replay(root: &Path) -> Result<Vec<Record>> {
+        Self::replay_with_dek(root, None)
+    }
+
+    /// Replay with an optional WAL DEK (for encrypted segments).
+    pub fn replay_with_dek(
+        root: &Path,
+        wal_dek: Option<&Zeroizing<[u8; 32]>>,
+    ) -> Result<Vec<Record>> {
+        let wal_dir = root.join("_wal");
+        let mut segments: Vec<u64> = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&wal_dir) {
+            for entry in rd.flatten() {
+                let fname = entry.file_name();
+                let Some(s) = fname.to_str() else {
+                    continue;
+                };
+                let Some(stripped) = s.strip_prefix("seg-") else {
+                    continue;
+                };
+                let Some(stripped) = stripped.strip_suffix(".wal") else {
+                    continue;
+                };
+                if let Ok(n) = stripped.parse::<u64>() {
+                    segments.push(n);
+                }
+            }
+        }
+        segments.sort_unstable();
+        let mut out = Vec::new();
+        for n in segments {
+            let path = Self::segment_path(&wal_dir, n);
+            // Replay each segment independently: a torn tail in any segment
+            // truncates only that segment's prefix (interior corruption errors).
+            let recs = match wal_dek {
+                #[cfg(feature = "encryption")]
+                Some(dk) => {
+                    let cipher = Self::cipher_from_dek(dk)?;
+                    replay_with_cipher(&path, Some(cipher))?
+                }
+                _ => replay(&path)?,
+            };
+            out.extend(recs);
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod shared_wal_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn shared_wal_interleaves_two_tables_one_fd() {
+        let dir = tempdir().unwrap();
+        let mut w = SharedWal::create(dir.path(), Epoch(0)).unwrap();
+        w.append(
+            1,
+            10,
+            Op::Put {
+                table_id: 10,
+                rows: vec![1],
+            },
+        )
+        .unwrap();
+        w.append(
+            2,
+            20,
+            Op::Put {
+                table_id: 20,
+                rows: vec![2],
+            },
+        )
+        .unwrap();
+        w.append_commit(1, Epoch(1), &[]).unwrap();
+        w.append_commit(2, Epoch(2), &[]).unwrap();
+        let d = w.group_sync().unwrap();
+        assert!(d >= 4);
+        let recs = SharedWal::replay(dir.path()).unwrap();
+        assert_eq!(
+            recs.iter()
+                .filter(|r| matches!(r.op, Op::Put { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            recs.iter()
+                .filter(|r| matches!(r.op, Op::TxnCommit { .. }))
+                .count(),
+            2
+        );
+    }
 }
 
 #[cfg(test)]
