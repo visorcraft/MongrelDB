@@ -27,6 +27,7 @@ pub mod page;
 pub mod pma;
 pub mod query;
 pub mod reservoir;
+pub mod retention;
 pub mod rowid;
 pub mod schema;
 pub mod sorted_run;
@@ -53,6 +54,7 @@ pub use mutable_run::MutableRun;
 pub use page::{CachedPage, Encoding, PageStat};
 pub use query::{Condition, Query};
 pub use reservoir::Reservoir;
+pub use retention::{OwnedSnapshotGuard, SnapshotGuard, SnapshotRegistry};
 pub use rowid::{RowId, RowIdAllocator};
 pub use schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
 pub use sorted_run::{
