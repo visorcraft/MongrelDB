@@ -828,7 +828,6 @@ impl RemoteDatabase {
         })
     }
 
-    /// Check daemon health.
     #[napi]
     pub fn health(&self) -> napi::Result<String> {
         self.agent
@@ -839,12 +838,21 @@ impl RemoteDatabase {
             .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))
     }
 
-    /// Get the live row count (O(1) on the daemon side).
     #[napi]
-    pub fn count(&self) -> napi::Result<f64> {
+    pub fn table_names(&self) -> napi::Result<Vec<String>> {
+        self.agent
+            .get(&format!("{}/tables", self.url))
+            .call()
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?
+            .into_json()
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))
+    }
+
+    #[napi]
+    pub fn count(&self, table: String) -> napi::Result<f64> {
         let resp: serde_json::Value = self
             .agent
-            .get(&format!("{}/count", self.url))
+            .get(&format!("{}/tables/{table}/count", self.url))
             .call()
             .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?
             .into_json()
@@ -852,7 +860,6 @@ impl RemoteDatabase {
         Ok(resp["count"].as_f64().unwrap_or(0.0))
     }
 
-    /// Run a SQL query and return Arrow IPC bytes.
     #[napi]
     pub fn sql(&self, sql: String) -> napi::Result<Buffer> {
         let resp = self
@@ -866,12 +873,11 @@ impl RemoteDatabase {
         Ok(Buffer::from(bytes.into_bytes()))
     }
 
-    /// Commit pending writes.
     #[napi]
-    pub fn commit(&self) -> napi::Result<BigInt> {
+    pub fn commit(&self, table: String) -> napi::Result<BigInt> {
         let resp: serde_json::Value = self
             .agent
-            .post(&format!("{}/commit", self.url))
+            .post(&format!("{}/tables/{table}/commit", self.url))
             .call()
             .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?
             .into_json()

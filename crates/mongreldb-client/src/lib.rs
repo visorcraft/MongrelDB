@@ -1,9 +1,5 @@
-//! mongreldb-client (Phase 19.5) — a lightweight HTTP client for
-//! `mongreldb-server`. Connects to the daemon's SQL + native query endpoints
-//! and returns `RecordBatch`es (zero-copy from the Arrow IPC response body).
-//!
-//! The Condition-based composition model is preserved: `query_native` sends
-//! serialized Conditions, not just SQL.
+//! mongreldb-client — a lightweight HTTP client for `mongreldb-server`.
+//! Table-qualified routes for multi-table operations + SQL + /txn batch.
 
 use std::io::Cursor;
 
@@ -35,17 +31,86 @@ impl MongrelClient {
     }
 
     pub fn health(&self) -> Result<String, Box<dyn std::error::Error>> {
-        Ok(self.client.get(format!("{}/health", self.base_url)).send()?.text()?)
+        Ok(self
+            .client
+            .get(format!("{}/health", self.base_url))
+            .send()?
+            .text()?)
     }
 
-    pub fn count(&self) -> Result<u64, Box<dyn std::error::Error>> {
+    // ── Table management ──
+
+    pub fn list_tables(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        Ok(self
+            .client
+            .get(format!("{}/tables", self.base_url))
+            .send()?
+            .json()?)
+    }
+
+    pub fn create_table(
+        &self,
+        name: &str,
+        columns: Vec<ColumnDefJson>,
+    ) -> Result<u64, Box<dyn std::error::Error>> {
+        let resp: serde_json::Value = self
+            .client
+            .post(format!("{}/tables", self.base_url))
+            .json(&serde_json::json!({ "name": name, "columns": columns }))
+            .send()?
+            .json()?;
+        Ok(resp["table_id"].as_u64().unwrap_or(0))
+    }
+
+    pub fn drop_table(&self, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+        self.client
+            .delete(format!("{}/tables/{name}", self.base_url))
+            .send()?;
+        Ok(())
+    }
+
+    // ── Table-qualified operations ──
+
+    pub fn count(&self, table: &str) -> Result<u64, Box<dyn std::error::Error>> {
         let resp: CountResp = self
             .client
-            .get(format!("{}/count", self.base_url))
+            .get(format!("{}/tables/{table}/count", self.base_url))
             .send()?
             .json()?;
         Ok(resp.count)
     }
+
+    pub fn put(
+        &self,
+        table: &str,
+        row: Vec<(u16, mongreldb_core::Value)>,
+    ) -> Result<u64, Box<dyn std::error::Error>> {
+        let json_row: Vec<serde_json::Value> = row
+            .iter()
+            .flat_map(|(id, v)| vec![serde_json::json!(id), value_to_json(v)])
+            .collect();
+        let resp: serde_json::Value = self
+            .client
+            .post(format!("{}/tables/{table}/put", self.base_url))
+            .json(&serde_json::json!({ "row": json_row }))
+            .send()?
+            .json()?;
+        Ok(resp["row_id"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0))
+    }
+
+    pub fn commit(&self, table: &str) -> Result<u64, Box<dyn std::error::Error>> {
+        let resp: serde_json::Value = self
+            .client
+            .post(format!("{}/tables/{table}/commit", self.base_url))
+            .send()?
+            .json()?;
+        Ok(resp["epoch"].as_u64().unwrap_or(0))
+    }
+
+    // ── SQL ──
 
     pub fn sql(&self, sql: &str) -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> {
         let resp = self
@@ -59,54 +124,45 @@ impl MongrelClient {
         read_arrow_ipc(&bytes)
     }
 
-    pub fn put(
-        &self,
-        row: Vec<(u16, mongreldb_core::Value)>,
-    ) -> Result<u64, Box<dyn std::error::Error>> {
-        let json_row: Vec<(u16, serde_json::Value)> = row
-            .into_iter()
-            .map(|(id, v)| (id, value_to_json(v)))
-            .collect();
-        let resp: serde_json::Value = self
-            .client
-            .post(format!("{}/put", self.base_url))
-            .json(&serde_json::json!({ "row": json_row }))
-            .send()?
-            .json()?;
-        Ok(resp["row_id"]
-            .as_str()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0))
-    }
+    // ── Atomic txn ──
 
-    pub fn delete(&self, row_id: u64) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn txn(&self, ops: Vec<TxnOp>) -> Result<(), Box<dyn std::error::Error>> {
         self.client
-            .post(format!("{}/delete", self.base_url))
-            .json(&serde_json::json!({ "row_id": row_id }))
+            .post(format!("{}/txn", self.base_url))
+            .json(&serde_json::json!({ "ops": ops }))
             .send()?;
         Ok(())
     }
-
-    pub fn commit(&self) -> Result<u64, Box<dyn std::error::Error>> {
-        let resp: serde_json::Value = self
-            .client
-            .post(format!("{}/commit", self.base_url))
-            .send()?
-            .json()?;
-        Ok(resp["epoch"].as_u64().unwrap_or(0))
-    }
 }
 
-fn value_to_json(v: mongreldb_core::Value) -> serde_json::Value {
+#[derive(Serialize, Clone)]
+pub struct ColumnDefJson {
+    pub id: u16,
+    pub name: String,
+    pub ty: String,
+    pub primary_key: bool,
+}
+
+#[derive(Serialize, Clone)]
+pub struct TxnOp {
+    pub table: String,
+    pub op: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cells: Option<Vec<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub row_id: Option<u64>,
+}
+
+fn value_to_json(v: &mongreldb_core::Value) -> serde_json::Value {
     match v {
-        mongreldb_core::Value::Int64(n) => serde_json::Value::Number(n.into()),
-        mongreldb_core::Value::Float64(f) => serde_json::Number::from_f64(f)
+        mongreldb_core::Value::Int64(n) => serde_json::Value::Number((*n).into()),
+        mongreldb_core::Value::Float64(f) => serde_json::Number::from_f64(*f)
             .map(serde_json::Value::Number)
             .unwrap_or(serde_json::Value::Null),
         mongreldb_core::Value::Bytes(b) => {
-            serde_json::Value::String(String::from_utf8_lossy(&b).into_owned())
+            serde_json::Value::String(String::from_utf8_lossy(b).into_owned())
         }
-        mongreldb_core::Value::Bool(b) => serde_json::Value::Bool(b),
+        mongreldb_core::Value::Bool(b) => serde_json::Value::Bool(*b),
         mongreldb_core::Value::Null => serde_json::Value::Null,
         other => serde_json::Value::String(format!("{other:?}")),
     }

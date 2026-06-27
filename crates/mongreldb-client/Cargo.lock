@@ -71,6 +71,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-swap"
+version = "1.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a3a1fd6f75306b68087b831f025c712524bcb19aad54e557b1129cfa0a2b207"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2247,7 +2256,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-client"
-version = "0.10.4"
+version = "0.10.6"
 dependencies = [
  "arrow",
  "mongreldb-core",
@@ -2259,12 +2268,14 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-core"
-version = "0.10.4"
+version = "0.10.6"
 dependencies = [
+ "arc-swap",
  "bincode",
  "bytemuck",
  "bytes",
  "crc",
+ "getrandom 0.2.17",
  "lz4_flex 0.11.6",
  "memmap2",
  "parking_lot",
@@ -2274,18 +2285,20 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror 1.0.69",
+ "zeroize",
  "zstd",
 ]
 
 [[package]]
 name = "mongreldb-query"
-version = "0.10.4"
+version = "0.10.6"
 dependencies = [
  "arrow",
  "async-trait",
  "datafusion",
  "futures",
  "mongreldb-core",
+ "parking_lot",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
