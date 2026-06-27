@@ -774,7 +774,7 @@ fn longest_like_segment(pat: &str) -> Option<Vec<u8>> {
 /// when a commit advances the epoch.
 pub struct MongrelSession {
     ctx: SessionContext,
-    db: Arc<Mutex<Table>>,
+    db: Option<Arc<Mutex<Table>>>,
     /// P4.1: the multi-table `Database` when opened via `open()`. When `Some`,
     /// the cache epoch is driven by `Database::visible_epoch()` instead of the
     /// legacy `combined_epoch()` fold.
@@ -809,7 +809,7 @@ impl MongrelSession {
         ));
         Self {
             ctx,
-            db,
+            db: Some(db),
             database: None,
             cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             plan_cache: parking_lot::Mutex::new(HashMap::new()),
@@ -841,13 +841,8 @@ impl MongrelSession {
         }
 
         // Pick the first table as the "primary" for legacy `db()` accessors.
-        let primary = tables
-            .values()
-            .next()
-            .cloned()
-            .ok_or(MongrelQueryError::Core(
-                mongreldb_core::MongrelError::NotFound("database has no live tables".into()),
-            ))?;
+        // If the database is empty, `db()` will return an error.
+        let primary = tables.values().next().cloned();
 
         Ok(Self {
             ctx,
@@ -861,9 +856,10 @@ impl MongrelSession {
     }
 
     /// The underlying Table handle (Phase 19.3: used by the daemon for direct
-    /// put/delete/commit/count access).
-    pub fn db(&self) -> &Arc<Mutex<Table>> {
-        &self.db
+    /// put/delete/commit/count access). Returns `None` when the session was
+    /// opened over an empty `Database`.
+    pub fn db(&self) -> Option<&Arc<Mutex<Table>>> {
+        self.db.as_ref()
     }
 
     /// Phase 17.3: create a named materialized view backed by a SQL query.
@@ -881,8 +877,11 @@ impl MongrelSession {
 
     /// Register the table under `name` so `select * from <name>` resolves.
     pub async fn register(&self, name: &str) -> Result<()> {
-        let provider = MongrelProvider::new(self.db.clone())?;
-        self.tables.lock().insert(name.to_string(), self.db.clone());
+        let db = self.db.clone().ok_or(MongrelQueryError::Core(
+            mongreldb_core::MongrelError::NotFound("no primary table".into()),
+        ))?;
+        let provider = MongrelProvider::new(db.clone())?;
+        self.tables.lock().insert(name.to_string(), db);
         self.ctx
             .register_table(name, Arc::new(provider))
             .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
@@ -906,7 +905,40 @@ impl MongrelSession {
 
     /// Run a SQL statement and return the result batches. Repeated identical SQL
     /// against the same snapshot returns the cached batches without re-executing.
+    /// Run a SQL statement and return the result batches. DDL statements
+    /// (`CREATE TABLE`, `DROP TABLE`) are intercepted when a `Database` is
+    /// attached and mapped to the catalog. Repeated identical SQL against the
+    /// same snapshot returns the cached batches without re-executing.
     pub async fn run(&self, sql: &str) -> Result<Vec<RecordBatch>> {
+        // P4.2: intercept DDL when a Database is attached.
+        let lower = sql.trim_start().to_lowercase();
+        if lower.starts_with("create table") {
+            if let Some(db) = &self.database {
+                let (name, schema) = parse_create_table(sql)?;
+                db.create_table(&name, schema)?;
+                let handle = db.table(&name)?;
+                let provider = MongrelProvider::new(handle.clone())?;
+                self.ctx
+                    .register_table(&name, Arc::new(provider))
+                    .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
+                self.tables.lock().insert(name, handle);
+                self.clear_cache();
+                return Ok(Vec::new());
+            }
+        }
+        if lower.starts_with("drop table") {
+            if let Some(db) = &self.database {
+                let name = parse_drop_table(sql)?;
+                db.drop_table(&name)?;
+                self.ctx
+                    .deregister_table(&name)
+                    .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
+                self.tables.lock().remove(&name);
+                self.clear_cache();
+                return Ok(Vec::new());
+            }
+        }
+
         // Phase 17.3: intercept `SELECT ... FROM <view_name>` and rewrite to
         // the view's defining SQL.
         let effective_sql = self.resolve_view_sql(sql);
@@ -1008,10 +1040,11 @@ impl MongrelSession {
     }
 
     fn combined_epoch(&self) -> u64 {
-        let mut combined = self.db.lock().snapshot().epoch.0;
+        let primary = self.db.as_ref().expect("no primary table");
+        let mut combined = primary.lock().snapshot().epoch.0;
         let tables = self.tables.lock();
         for arc in tables.values() {
-            if !Arc::ptr_eq(arc, &self.db) {
+            if !Arc::ptr_eq(arc, primary) {
                 let e = arc.lock().snapshot().epoch.0;
                 combined = combined.wrapping_mul(31).wrapping_add(e);
             }
@@ -1027,7 +1060,10 @@ impl MongrelSession {
         plan: &datafusion::logical_expr::LogicalPlan,
         cache_key: u64,
     ) -> Result<Option<RecordBatch>> {
-        let mut db = self.db.lock();
+        let Some(primary) = self.db.as_ref() else {
+            return Ok(None);
+        };
+        let mut db = primary.lock();
         let schema = db.schema().clone();
         let snap = db.snapshot();
         native_agg::try_native_aggregate(&mut db, &schema, snap, plan, cache_key)
@@ -1055,4 +1091,98 @@ fn sql_cache_key(sql: &str) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     sql.hash(&mut h);
     h.finish()
+}
+
+/// Parse `CREATE TABLE <name> (<col> <type> [PRIMARY KEY], ...)` into a
+/// MongrelDB table name + schema. Supports BIGINT, DOUBLE, VARCHAR/TEXT,
+/// BOOLEAN.
+fn parse_create_table(sql: &str) -> Result<(String, mongreldb_core::schema::Schema)> {
+    use mongreldb_core::schema::*;
+
+    let open = sql
+        .find('(')
+        .ok_or(MongrelQueryError::Schema("CREATE TABLE missing '('".into()))?;
+    let close = sql
+        .rfind(')')
+        .ok_or(MongrelQueryError::Schema("CREATE TABLE missing ')'".into()))?;
+    let name = sql[..open]
+        .trim()
+        .strip_prefix("CREATE TABLE")
+        .or_else(|| sql[..open].trim().strip_prefix("create table"))
+        .unwrap_or("")
+        .trim()
+        .trim_matches('"')
+        .to_string();
+
+    let body = &sql[open + 1..close];
+    let mut columns = Vec::new();
+    let mut schema_id: u64 = 1;
+    for (i, raw) in body.split(',').enumerate() {
+        let part = raw.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let lower = part.to_lowercase();
+        let pk = lower.contains("primary key");
+        let mut tokens = part.split_whitespace();
+        let col_name = tokens
+            .next()
+            .ok_or(MongrelQueryError::Schema("missing column name".into()))?
+            .trim_matches('"');
+        let ty_str = tokens
+            .next()
+            .ok_or(MongrelQueryError::Schema("missing column type".into()))?
+            .to_lowercase();
+        let ty = match ty_str.as_str() {
+            "bigint" | "int8" | "int64" | "integer" | "int" => TypeId::Int64,
+            "double" | "float8" | "float64" | "real" | "float" => TypeId::Float64,
+            "varchar" | "text" | "string" | "bytes" => TypeId::Bytes,
+            "boolean" | "bool" => TypeId::Bool,
+            other => {
+                return Err(MongrelQueryError::Schema(format!(
+                    "unsupported column type: {other}"
+                )))
+            }
+        };
+        let mut flags = ColumnFlags::empty();
+        if pk {
+            flags = flags.with(ColumnFlags::PRIMARY_KEY);
+        }
+        columns.push(ColumnDef {
+            id: (i + 1) as u16,
+            name: col_name.to_string(),
+            ty,
+            flags,
+        });
+    }
+    schema_id = schema_id.wrapping_add(columns.len() as u64);
+
+    Ok((
+        name,
+        Schema {
+            schema_id,
+            columns,
+            indexes: vec![],
+            colocation: vec![],
+        },
+    ))
+}
+
+/// Parse `DROP TABLE <name>`.
+fn parse_drop_table(sql: &str) -> Result<String> {
+    let name = sql
+        .trim()
+        .strip_prefix("DROP TABLE")
+        .or_else(|| sql.trim().strip_prefix("drop table"))
+        .unwrap_or("")
+        .trim()
+        .trim_matches(';')
+        .trim_matches('"')
+        .to_string();
+    if name.is_empty() {
+        return Err(MongrelQueryError::Schema(
+            "DROP TABLE missing table name".into(),
+        ));
+    }
+    Ok(name)
 }

@@ -127,3 +127,35 @@ async fn database_session_cache_invalidates_on_commit() {
     let batches = session.run("SELECT * FROM t").await.unwrap();
     assert_eq!(total_rows(&batches), 2);
 }
+
+#[tokio::test]
+async fn create_and_drop_table_via_sql() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+
+    let session = MongrelSession::open(Arc::clone(&db)).unwrap();
+
+    // CREATE TABLE via SQL.
+    session
+        .run("CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)")
+        .await
+        .unwrap();
+
+    // Insert via the Database (SQL insert is not yet wired; use the native API).
+    db.transaction(|t| {
+        t.put("t", vec![(1, Value::Int64(1)), (2, Value::Int64(42))])?;
+        Ok(())
+    })
+    .unwrap();
+
+    // SELECT works.
+    let batches = session.run("SELECT * FROM t").await.unwrap();
+    assert_eq!(total_rows(&batches), 1);
+
+    // DROP TABLE via SQL.
+    session.run("DROP TABLE t").await.unwrap();
+
+    // Table is gone — querying it should fail.
+    let result = session.run("SELECT * FROM t").await;
+    assert!(result.is_err(), "expected error after DROP TABLE, got Ok");
+}

@@ -231,7 +231,7 @@ mod tests {
     use mongreldb_core::schema::{ColumnDef, ColumnFlags, Schema as MSchema, TypeId};
     use mongreldb_core::{Table, Value};
     use parking_lot::Mutex;
-use std::sync::Arc;
+    use std::sync::Arc;
     use tempfile::tempdir;
 
     fn schema() -> MSchema {
