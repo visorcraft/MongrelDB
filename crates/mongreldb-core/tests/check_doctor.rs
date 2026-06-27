@@ -131,6 +131,56 @@ fn check_detects_run_footer_checksum_corruption() {
 }
 
 #[test]
+fn check_detects_corrupt_wal_segment() {
+    let dir = tempdir().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.create_table("t", pk_schema()).unwrap();
+    seed_run(&db, "t");
+
+    // The shared WAL has at least one on-disk segment under <root>/_wal/.
+    let wal_dir = dir.path().join("_wal");
+    let seg = std::fs::read_dir(&wal_dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().and_then(|s| s.to_str()) == Some("wal"))
+        .expect("a WAL segment file exists");
+
+    // Corrupt the 8-byte header magic so the segment no longer opens.
+    let mut bytes = std::fs::read(&seg).unwrap();
+    bytes[0] ^= 0xFF;
+    std::fs::write(&seg, &bytes).unwrap();
+
+    let issues = db.check();
+    assert!(
+        issues.iter().any(|i| {
+            i.table_name == "<wal>"
+                && i.severity == "error"
+                && i.description.contains("WAL segment")
+        }),
+        "check must flag a corrupt WAL segment, got: {:?}",
+        issues
+    );
+
+    // The WAL issue must carry the reserved sentinel, not the real first
+    // table's id (0), so doctor never quarantines an innocent table for a WAL
+    // problem it cannot fix.
+    let wal_issue = issues.iter().find(|i| i.table_name == "<wal>").unwrap();
+    assert_eq!(wal_issue.table_id, u64::MAX);
+
+    // doctor must NOT touch the real first table (id 0) over a WAL issue.
+    let first_id = db.table_id("t").unwrap();
+    assert_eq!(first_id, 0);
+    let _ = db.doctor().unwrap();
+    // The table directory is still present (not quarantined).
+    let table_dir = dir.path().join("tables").join(first_id.to_string());
+    assert!(
+        table_dir.exists(),
+        "doctor must not quarantine a table for a WAL issue"
+    );
+    assert!(db.table("t").is_ok());
+}
+
+#[test]
 fn check_detects_orphan_run_file() {
     let dir = tempdir().unwrap();
     let db = Database::create(dir.path()).unwrap();

@@ -801,6 +801,37 @@ impl SharedWal {
         Ok(reaped)
     }
 
+    /// Verify the on-disk integrity of every WAL segment (spec §16): each
+    /// `seg-NNNNNN.wal` file under `<root>/_wal/` must open — its header magic
+    /// and version must parse, and for an encrypted WAL the frame cipher must
+    /// be derivable from the WAL DEK. A segment that fails to open is corrupt
+    /// or truncated and would break recovery. Returns one `(segment_no, error)`
+    /// pair per failing segment. The active (in-memory) segment is trusted by
+    /// construction and re-checked from disk like the others.
+    pub fn verify_segments(&self) -> Vec<(u64, String)> {
+        let mut bad = Vec::new();
+        let Ok(segments) = list_segment_numbers(&self.wal_dir) else {
+            return bad;
+        };
+        for n in segments {
+            let path = Self::segment_path(&self.wal_dir, n);
+            // The frame cipher is constant across segments under the WAL DEK;
+            // rebuild it per open (cheap key schedule, few segments).
+            let res = match &self.wal_dek {
+                #[cfg(feature = "encryption")]
+                Some(dk) => match Self::cipher_from_dek(dk) {
+                    Ok(cipher) => WalReader::open_with_cipher(&path, Some(cipher)),
+                    Err(e) => Err(e),
+                },
+                _ => WalReader::open_with_cipher(&path, None),
+            };
+            if let Err(e) = res {
+                bad.push((n, format!("{e}")));
+            }
+        }
+        bad
+    }
+
     /// Replay every record across all segments in `<root>/_wal/`, in segment
     /// order, applying the torn-tail-vs-interior-corruption rule per segment.
     pub fn replay(root: &Path) -> Result<Vec<Record>> {

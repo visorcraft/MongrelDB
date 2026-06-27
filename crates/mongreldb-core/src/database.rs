@@ -21,6 +21,11 @@ pub const TABLES_DIR: &str = "tables";
 pub const META_DIR: &str = "_meta";
 pub const KEYS_FILENAME: &str = "keys";
 
+/// Sentinel `table_id` for `CheckIssue`s that concern the shared WAL rather
+/// than any table. `u64::MAX` is never allocated to a real table (the catalog
+/// mints ids from 0 upward), so [`Database::doctor`] can safely skip them.
+pub const WAL_TABLE_ID: u64 = u64::MAX;
+
 /// A pending uniform-epoch run written during a large transaction (spec §8.5).
 struct SpilledRun {
     table_id: u64,
@@ -1115,6 +1120,21 @@ impl Database {
                 }
             }
         }
+
+        // WAL retention / integrity invariant (spec §16): every on-disk WAL
+        // segment must open (header magic + version, and the frame cipher must
+        // be derivable for an encrypted WAL). A segment that won't open is
+        // corrupt or truncated and would break crash recovery. `table_id` is
+        // the reserved `WAL_TABLE_ID` sentinel (u64::MAX) so [`Self::doctor`]
+        // never confuses a WAL issue with a real table.
+        for (seg, msg) in self.shared_wal.lock().verify_segments() {
+            issues.push(CheckIssue {
+                table_id: WAL_TABLE_ID,
+                table_name: "<wal>".into(),
+                severity: "error".into(),
+                description: format!("WAL segment seg-{seg:06}.wal failed integrity check: {msg}"),
+            });
+        }
         issues
     }
 
@@ -1126,9 +1146,13 @@ impl Database {
         // create_table/drop_table from racing the catalog/dir mutation.
         let _ddl = self.ddl_lock.lock();
         let issues = self.check();
+        // A corrupt WAL segment is reported as an error but is NOT a table
+        // problem — quarantining an innocent table cannot fix it (and the first
+        // real table is id 0, so the WAL sentinel WAL_TABLE_ID = u64::MAX keeps
+        // them disjoint). The admin must address WAL corruption manually.
         let bad_tables: std::collections::HashSet<u64> = issues
             .iter()
-            .filter(|i| i.severity == "error")
+            .filter(|i| i.severity == "error" && i.table_id != WAL_TABLE_ID)
             .map(|i| i.table_id)
             .collect();
         if bad_tables.is_empty() {
