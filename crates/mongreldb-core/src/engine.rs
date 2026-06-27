@@ -75,6 +75,11 @@ pub struct Table {
     run_refs: Vec<RunRef>,
     next_run_id: u64,
     sync_byte_threshold: u64,
+    /// Next transaction id to assign to a single-table auto-commit txn
+    /// (`put`/`delete` then `commit`). 0 is reserved for [`wal::SYSTEM_TXN_ID`].
+    /// The Database transaction layer (P2.5) assigns these globally; the
+    /// single-table path uses this local counter.
+    current_txn_id: u64,
     bitmap: HashMap<u16, BitmapIndex>,
     ann: HashMap<u16, AnnIndex>,
     fm: HashMap<u16, FmIndex>,
@@ -806,6 +811,7 @@ impl Table {
             run_refs: Vec::new(),
             next_run_id: 1,
             sync_byte_threshold: DEFAULT_SYNC_BYTE_THRESHOLD,
+            current_txn_id: 1,
             bitmap,
             ann,
             fm,
@@ -902,30 +908,49 @@ impl Table {
         let mut allocator = RowIdAllocator::new(manifest.next_row_id);
         let persisted_epoch = manifest.current_epoch;
 
-        // 1. Apply the replayed records to the memtable + allocator, collecting
-        //    the Put rows for index insertion. Indexing happens AFTER loading
-        //    any checkpoint / run data (below) so the newer replayed versions
+        // 1. Replay is two-phase and TxnCommit-gated: data records (Put/Delete)
+        //    are staged per `txn_id` and only applied when a durable
+        //    `TxnCommit{epoch}` for that txn is seen. Uncommitted / aborted /
+        //    torn-tail txns are discarded. Indexing happens AFTER loading any
+        //    checkpoint / run data (below) so the newer replayed versions
         //    overwrite the older run versions in the HOT index.
+        let mut staged_puts: HashMap<u64, Vec<Row>> = HashMap::new();
+        let mut staged_deletes: HashMap<u64, Vec<RowId>> = HashMap::new();
         let mut replayed_puts: Vec<Row> = Vec::new();
         let mut saw_delete = false;
         for record in replayed {
+            let txn_id = record.txn_id;
             match record.op {
                 Op::Put { rows, .. } => {
                     let rows: Vec<Row> = bincode::deserialize(&rows)?;
-                    for row in rows {
+                    for row in &rows {
                         allocator.advance_to(row.row_id);
-                        memtable.upsert(row.clone());
-                        replayed_puts.push(row);
+                    }
+                    staged_puts.entry(txn_id).or_default().extend(rows);
+                }
+                Op::Delete { row_ids, .. } => {
+                    staged_deletes.entry(txn_id).or_default().extend(row_ids);
+                }
+                Op::TxnCommit { epoch, .. } => {
+                    let commit_epoch = Epoch(epoch);
+                    if let Some(puts) = staged_puts.remove(&txn_id) {
+                        for row in &puts {
+                            memtable.upsert(row.clone());
+                        }
+                        replayed_puts.extend(puts);
+                    }
+                    if let Some(dels) = staged_deletes.remove(&txn_id) {
+                        saw_delete = true;
+                        for rid in dels {
+                            memtable.tombstone(rid, commit_epoch);
+                        }
                     }
                 }
-                Op::Delete { epoch, row_ids, .. } => {
-                    saw_delete = true;
-                    for rid in row_ids {
-                        memtable.tombstone(rid, epoch);
-                    }
+                Op::TxnAbort => {
+                    staged_puts.remove(&txn_id);
+                    staged_deletes.remove(&txn_id);
                 }
-                Op::TruncateTable { .. } => {}
-                Op::Flush { .. } => {}
+                Op::TruncateTable { .. } | Op::Flush { .. } | Op::Ddl(_) => {}
             }
         }
 
@@ -954,6 +979,7 @@ impl Table {
                 .max()
                 .unwrap_or(1),
             sync_byte_threshold: DEFAULT_SYNC_BYTE_THRESHOLD,
+            current_txn_id: 1,
             bitmap: HashMap::new(),
             ann: HashMap::new(),
             fm: HashMap::new(),
@@ -1186,10 +1212,13 @@ impl Table {
             }
         }
         let payload = bincode::serialize(&rows)?;
-        self.wal.append(Op::Put {
-            table_id: self.table_id,
-            rows: payload,
-        })?;
+        self.wal.append_txn(
+            self.current_txn_id,
+            Op::Put {
+                table_id: self.table_id,
+                rows: payload,
+            },
+        )?;
         if let Some(pk_col) = self.schema.primary_key() {
             for r in &rows {
                 if let Some(pk_val) = r.columns.get(&pk_col.id) {
@@ -1218,11 +1247,13 @@ impl Table {
     /// Logically delete `row_id` (effective at the next commit).
     pub fn delete(&mut self, row_id: RowId) -> Result<()> {
         let epoch = self.pending_epoch();
-        self.wal.append(Op::Delete {
-            table_id: self.table_id,
-            epoch,
-            row_ids: vec![row_id],
-        })?;
+        self.wal.append_txn(
+            self.current_txn_id,
+            Op::Delete {
+                table_id: self.table_id,
+                row_ids: vec![row_id],
+            },
+        )?;
         self.memtable.tombstone(row_id, epoch);
         self.live_count = self.live_count.saturating_sub(1);
         // Track for fine-grained cache invalidation (c).
@@ -1289,8 +1320,18 @@ impl Table {
         // assigned order (the dual-counter invariant). P3's bounded sequencer
         // replaces this with validate-first + group commit (overlapping fsync).
         let _g = self.commit_lock.lock();
-        self.wal.sync()?;
         let new_epoch = self.epoch.bump_assigned();
+        // Seal the staged records under a TxnCommit marker carrying the commit
+        // epoch, then a single group fsync. Recovery applies only records whose
+        // txn has a durable TxnCommit (uncommitted/torn tails are discarded).
+        self.wal.append_txn(
+            self.current_txn_id,
+            Op::TxnCommit {
+                epoch: new_epoch.0,
+                added_runs: Vec::new(),
+            },
+        )?;
+        self.wal.sync()?;
         // Hardening (c): fine-grained invalidation replaces the whole-cache
         // wipe. Only entries whose footprint intersects a deleted RowId, or
         // whose condition-columns intersect a mutated column, are dropped.
@@ -1301,6 +1342,7 @@ impl Table {
         self.pending_put_cols.clear();
         self.persist_manifest(new_epoch)?;
         self.epoch.publish_visible(new_epoch);
+        self.current_txn_id += 1;
         Ok(new_epoch)
     }
 
@@ -1322,7 +1364,10 @@ impl Table {
             self.spill_mutable_run(epoch)?;
             // The tier is now empty and its data is durably in a run → safe to
             // mark the WAL flushed and rotate to a fresh segment.
-            self.wal.append(Op::Flush { last_seq: epoch })?;
+            self.wal.append_system(Op::Flush {
+                table_id: self.table_id,
+                flushed_epoch: epoch.0,
+            })?;
             self.wal.sync()?;
             self.rotate_wal(epoch)?;
             self.persist_manifest(epoch)?;
@@ -1465,7 +1510,10 @@ impl Table {
         });
         self.live_count = self.live_count.saturating_add(n as u64);
         self.indexes_complete = false;
-        self.wal.append(Op::Flush { last_seq: epoch })?;
+        self.wal.append_system(Op::Flush {
+            table_id: self.table_id,
+            flushed_epoch: epoch.0,
+        })?;
         self.wal.sync()?;
         self.rotate_wal(epoch)?;
         self.persist_manifest(epoch)?;
@@ -2235,7 +2283,10 @@ impl Table {
         self.live_count = self.live_count.saturating_add(n as u64);
         // Phase 14.7: defer index building off the ingest critical path.
         self.indexes_complete = false;
-        self.wal.append(Op::Flush { last_seq: epoch })?;
+        self.wal.append_system(Op::Flush {
+            table_id: self.table_id,
+            flushed_epoch: epoch.0,
+        })?;
         self.wal.sync()?;
         self.rotate_wal(epoch)?;
         self.persist_manifest(epoch)?;

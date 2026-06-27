@@ -7,6 +7,7 @@
 
 use crate::epoch::Epoch;
 use crate::rowid::RowId;
+use crate::schema::Schema;
 use crate::{MongrelError, Result};
 use crc::{Crc, CRC_32_ISCSI};
 use serde::{Deserialize, Serialize};
@@ -15,20 +16,72 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 pub const WAL_MAGIC: [u8; 8] = *b"MONGRWAL";
-const WAL_VERSION: u16 = 2;
+const WAL_VERSION: u16 = 3;
 const HEADER_LEN: u64 = 8 + 2 + 4 + 8; // magic + version + reserved(incl enc_flag) + epoch_created
 /// Encryption flag stored in reserved[0] of the WAL header.
 const ENC_PLAINTEXT: u8 = 0;
 const ENC_AES_GCM: u8 = 1;
 
+/// `txn_id` reserved for system records (`Flush`) that are not part of any
+/// client transaction.
+pub const SYSTEM_TXN_ID: u64 = 0;
+
 const CRC32C: Crc<u32> = Crc::<u32>::new(&CRC_32_ISCSI);
 
 /// One mutation. `Put.rows` is a self-describing Arrow IPC stream (or, for tiny
 /// single-row writes, a compact row batch — both are opaque bytes to the WAL).
+/// `txn_id` groups records into a transaction; the group is sealed by a
+/// [`Op::TxnCommit`] carrying the same `txn_id`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Record {
     pub seq: Epoch,
+    pub txn_id: u64,
     pub op: Op,
+}
+
+/// A sorted run made durable as part of a transaction's commit (spec §7.1).
+/// Recovery links these into the table's run list at the commit epoch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddedRun {
+    pub table_id: u64,
+    pub run_id: u128,
+    pub row_count: u64,
+    pub level: u8,
+    pub min_row_id: u64,
+    pub max_row_id: u64,
+    pub content_hash: [u8; 32],
+}
+
+/// A schema change logged through the WAL (spec §7.1; full DDL wiring in P2.7).
+/// The schema/column payload is carried as JSON bytes because `Schema`'s
+/// internally-tagged `TypeId` is not representable under the WAL's bincode frame
+/// encoding.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DdlOp {
+    CreateTable {
+        table_id: u64,
+        name: String,
+        schema_json: Vec<u8>,
+    },
+    DropTable {
+        table_id: u64,
+    },
+    AlterTable {
+        table_id: u64,
+        column_json: Vec<u8>,
+    },
+}
+
+impl DdlOp {
+    /// Encode a schema for [`DdlOp::CreateTable`].
+    pub fn encode_schema(schema: &Schema) -> Result<Vec<u8>> {
+        serde_json::to_vec(schema).map_err(|e| MongrelError::Other(format!("schema json: {e}")))
+    }
+
+    /// Decode a schema carried by [`DdlOp::CreateTable`].
+    pub fn decode_schema(bytes: &[u8]) -> Result<Schema> {
+        serde_json::from_slice(bytes).map_err(|e| MongrelError::Other(format!("schema json: {e}")))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,26 +92,32 @@ pub enum Op {
     },
     Delete {
         table_id: u64,
-        /// The MVCC epoch the tombstone was stamped with at delete time. Recovery
-        /// must re-stamp the in-memory tombstone at this exact epoch (not the WAL
-        /// record's monotonic `seq`, which outpaces the commit epoch) so that a
-        /// tombstone committed before the last snapshot still hides the row.
-        epoch: Epoch,
         row_ids: Vec<RowId>,
     },
     TruncateTable {
         table_id: u64,
     },
-    /// Marker that all preceding mutations have been durably flushed to a
-    /// sorted run; recovery may stop replaying after the latest `Flush`.
+    /// System marker (txn_id == [`SYSTEM_TXN_ID`]): everything up to
+    /// `flushed_epoch` for `table_id` is durable in a sorted run, so recovery
+    /// may skip replaying older records for that table.
     Flush {
-        last_seq: Epoch,
+        table_id: u64,
+        flushed_epoch: u64,
     },
+    /// Seals a transaction: every earlier record with the same `txn_id` is
+    /// committed and becomes visible at `epoch`.
+    TxnCommit {
+        epoch: u64,
+        added_runs: Vec<AddedRun>,
+    },
+    /// Aborts a transaction; its staged records are discarded on recovery.
+    TxnAbort,
+    Ddl(DdlOp),
 }
 
 impl Record {
-    pub fn new(seq: Epoch, op: Op) -> Self {
-        Self { seq, op }
+    pub fn new(seq: Epoch, txn_id: u64, op: Op) -> Self {
+        Self { seq, txn_id, op }
     }
 }
 
@@ -129,16 +188,22 @@ impl Wal {
         Ok(wal)
     }
 
-    /// Append a record. Assigns the next monotonic sequence (the first record
-    /// after a WAL created at `E` gets `E + 1`), writes it, and returns the
-    /// assigned sequence. Does NOT fsync — call [`Wal::sync`] (or rely on the
-    /// byte threshold). The WAL sequence is independent of the row commit
-    /// epoch; the engine tracks commit epochs separately.
-    pub fn append(&mut self, op: Op) -> Result<Epoch> {
+    /// Append a record belonging to transaction `txn_id`. Assigns the next
+    /// monotonic sequence (the first record after a WAL created at `E` gets
+    /// `E + 1`), writes it, and returns the assigned sequence. Does NOT fsync —
+    /// call [`Wal::sync`] (or rely on the byte threshold). The WAL sequence is
+    /// independent of the row commit epoch; the engine tracks commit epochs
+    /// separately.
+    pub fn append_txn(&mut self, txn_id: u64, op: Op) -> Result<Epoch> {
         let seq = Epoch(self.next_seq);
         self.next_seq += 1;
-        self.append_record(&Record::new(seq, op))?;
+        self.append_record(&Record::new(seq, txn_id, op))?;
         Ok(seq)
+    }
+
+    /// Append a system record (txn_id == [`SYSTEM_TXN_ID`]), e.g. `Flush`.
+    pub fn append_system(&mut self, op: Op) -> Result<Epoch> {
+        self.append_txn(SYSTEM_TXN_ID, op)
     }
 
     fn append_record(&mut self, record: &Record) -> Result<()> {
@@ -173,17 +238,19 @@ impl Wal {
                 "wal payload too large: {len} bytes"
             )));
         }
-        // CRC covers seq + (encrypted) payload.
+        // CRC covers seq + txn_id + (encrypted) payload.
         let mut digest = CRC32C.digest();
         digest.update(&record.seq.0.to_le_bytes());
+        digest.update(&record.txn_id.to_le_bytes());
         digest.update(&frame_payload);
         let crc_val = digest.finalize();
 
         self.file.write_all(&(len as u32).to_le_bytes())?;
         self.file.write_all(&crc_val.to_le_bytes())?;
         self.file.write_all(&record.seq.0.to_le_bytes())?;
+        self.file.write_all(&record.txn_id.to_le_bytes())?;
         self.file.write_all(&frame_payload)?;
-        self.unflushed_bytes += 4 + 4 + 8 + len as u64;
+        self.unflushed_bytes += 4 + 4 + 8 + 8 + len as u64;
         if self.sync_byte_threshold > 0 && self.unflushed_bytes >= self.sync_byte_threshold {
             self.sync()?;
         }
@@ -331,7 +398,7 @@ impl WalReader {
         }
 
         let record_start = self.pos;
-        let mut rest = vec![0u8; 4 + 8 + len];
+        let mut rest = vec![0u8; 4 + 8 + 8 + len];
         match self.inner.read_exact(&mut rest) {
             Ok(()) => {}
             Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
@@ -345,10 +412,14 @@ impl WalReader {
         let seq = u64::from_le_bytes([
             rest[4], rest[5], rest[6], rest[7], rest[8], rest[9], rest[10], rest[11],
         ]);
-        let payload = &rest[12..];
+        let txn_id = u64::from_le_bytes([
+            rest[12], rest[13], rest[14], rest[15], rest[16], rest[17], rest[18], rest[19],
+        ]);
+        let payload = &rest[20..];
 
         let mut digest = CRC32C.digest();
         digest.update(&seq.to_le_bytes());
+        digest.update(&txn_id.to_le_bytes());
         digest.update(payload);
         if digest.finalize() != crc_val {
             return Err(MongrelError::CorruptWal {
@@ -389,7 +460,7 @@ impl WalReader {
         // encrypted ones. They are written equal, so this changes nothing for
         // honest data while denying a tamperer the ability to renumber a frame.
         let record: Record = bincode::deserialize(&plaintext)?;
-        self.pos += 4 + 4 + 8 + len as u64;
+        self.pos += 4 + 4 + 8 + 8 + len as u64;
         Ok(Some(record))
     }
 
@@ -440,17 +511,22 @@ mod tests {
         let path = dir.path().join("seg-000000.wal");
         let mut wal = Wal::create(&path, Epoch(100)).unwrap();
         let s1 = wal
-            .append(Op::Put {
-                table_id: 1,
-                rows: vec![1, 2, 3],
-            })
+            .append_txn(
+                7,
+                Op::Put {
+                    table_id: 1,
+                    rows: vec![1, 2, 3],
+                },
+            )
             .unwrap();
         let s2 = wal
-            .append(Op::Delete {
-                table_id: 1,
-                epoch: Epoch(101),
-                row_ids: vec![RowId(7)],
-            })
+            .append_txn(
+                7,
+                Op::Delete {
+                    table_id: 1,
+                    row_ids: vec![RowId(7)],
+                },
+            )
             .unwrap();
         assert_eq!(s1, Epoch(101));
         assert_eq!(s2, Epoch(102));
@@ -459,6 +535,7 @@ mod tests {
         let records = replay(&path).unwrap();
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].seq, Epoch(101));
+        assert_eq!(records[0].txn_id, 7);
         match &records[0].op {
             Op::Put { table_id, rows } => {
                 assert_eq!(*table_id, 1);
@@ -467,8 +544,7 @@ mod tests {
             other => panic!("unexpected op {other:?}"),
         }
         match &records[1].op {
-            Op::Delete { epoch, row_ids, .. } => {
-                assert_eq!(*epoch, Epoch(101));
+            Op::Delete { row_ids, .. } => {
                 assert_eq!(*row_ids, vec![RowId(7)]);
             }
             other => panic!("unexpected op {other:?}"),
@@ -476,14 +552,56 @@ mod tests {
     }
 
     #[test]
+    fn record_roundtrips_with_txn_id_and_commit_marker() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("seg-000000.wal");
+        let mut w = Wal::create(&path, Epoch(0)).unwrap();
+        w.append_txn(
+            7,
+            Op::Put {
+                table_id: 3,
+                rows: vec![1, 2, 3],
+            },
+        )
+        .unwrap();
+        w.append_txn(
+            7,
+            Op::TxnCommit {
+                epoch: 11,
+                added_runs: vec![],
+            },
+        )
+        .unwrap();
+        w.sync().unwrap();
+        let recs = replay(&path).unwrap();
+        assert_eq!(recs[0].txn_id, 7);
+        assert!(matches!(recs[0].op, Op::Put { table_id: 3, .. }));
+        assert!(matches!(recs[1].op, Op::TxnCommit { epoch: 11, .. }));
+        // system records carry the reserved id
+        let mut w2 = Wal::create(&path, Epoch(0)).unwrap();
+        w2.append_system(Op::Flush {
+            table_id: 3,
+            flushed_epoch: 11,
+        })
+        .unwrap();
+        w2.sync().unwrap();
+        let recs = replay(&path).unwrap();
+        assert_eq!(recs[0].txn_id, SYSTEM_TXN_ID);
+        assert!(matches!(recs[0].op, Op::Flush { .. }));
+    }
+
+    #[test]
     fn torn_write_is_detected() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("seg-000001.wal");
         let mut wal = Wal::create(&path, Epoch(0)).unwrap();
-        wal.append(Op::Put {
-            table_id: 1,
-            rows: vec![0; 10],
-        })
+        wal.append_txn(
+            1,
+            Op::Put {
+                table_id: 1,
+                rows: vec![0; 10],
+            },
+        )
         .unwrap();
         wal.sync().unwrap();
         drop(wal);
@@ -509,10 +627,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("seg-000002.wal");
         let mut wal = Wal::create(&path, Epoch(0)).unwrap();
-        wal.append(Op::Put {
-            table_id: 9,
-            rows: vec![1, 2, 3, 4],
-        })
+        wal.append_txn(
+            1,
+            Op::Put {
+                table_id: 9,
+                rows: vec![1, 2, 3, 4],
+            },
+        )
         .unwrap();
         wal.sync().unwrap();
         drop(wal);
@@ -536,10 +657,13 @@ mod tests {
         let path = dir.path().join("seg-000003.wal");
         let mut wal = Wal::create(&path, Epoch(0)).unwrap();
         wal.sync_byte_threshold = 1; // sync after every record
-        wal.append(Op::Put {
-            table_id: 1,
-            rows: vec![0; 5],
-        })
+        wal.append_txn(
+            1,
+            Op::Put {
+                table_id: 1,
+                rows: vec![0; 5],
+            },
+        )
         .unwrap();
         assert_eq!(
             wal.unflushed_bytes(),
