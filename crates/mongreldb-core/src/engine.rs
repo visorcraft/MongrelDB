@@ -3863,6 +3863,28 @@ impl Table {
         self.dir.join(RUNS_DIR).join(format!("r-{run_id}.sr"))
     }
 
+    pub(crate) fn table_dir(&self) -> &Path {
+        &self.dir
+    }
+
+    pub(crate) fn schema_ref(&self) -> &crate::schema::Schema {
+        &self.schema
+    }
+
+    pub(crate) fn alloc_run_id(&mut self) -> u64 {
+        let id = self.next_run_id;
+        self.next_run_id += 1;
+        id
+    }
+
+    pub(crate) fn link_run(&mut self, run_ref: crate::manifest::RunRef) {
+        self.run_refs.push(run_ref);
+    }
+
+    pub(crate) fn kek_ref(&self) -> Option<&Arc<Kek>> {
+        self.kek.as_ref()
+    }
+
     pub(crate) fn open_reader(&self, run_id: u128) -> Result<RunReader> {
         RunReader::open_with_cache(
             self.dir.join(RUNS_DIR).join(format!("r-{run_id}.sr")),

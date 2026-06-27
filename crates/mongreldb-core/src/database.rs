@@ -21,6 +21,17 @@ pub const TABLES_DIR: &str = "tables";
 pub const META_DIR: &str = "_meta";
 pub const KEYS_FILENAME: &str = "keys";
 
+/// A pending uniform-epoch run written during a large transaction (spec §8.5).
+struct SpilledRun {
+    table_id: u64,
+    run_id: u128,
+    pending_path: PathBuf,
+    rows: Vec<crate::memtable::Row>,
+    row_count: u64,
+    min_rid: u64,
+    max_rid: u64,
+}
+
 /// A handle to a live table inside a [`Database`]. Writes take the inner lock
 /// (P1); P3.3 replaces this with lock-free `ArcSwap` reads + a publish lock for
 /// writes.
@@ -48,6 +59,9 @@ pub struct Database {
     /// `commit_lock` shared via `SharedCtx`.
     ddl_lock: Mutex<()>,
     meta_dek: Option<[u8; META_DEK_LEN]>,
+    /// P3.4: when staged bytes per table exceed this, write a uniform-epoch
+    /// pending run to `_txn/<txn_id>/` instead of streaming Put records (§8.5).
+    spill_threshold: std::sync::atomic::AtomicU64,
     /// P3.1: write-key → commit_epoch for first-committer-wins conflict
     /// detection (spec §9.2).
     conflicts: crate::txn::ConflictIndex,
@@ -183,6 +197,9 @@ impl Database {
         // `flushed_epoch` (records already durable in a run are not re-applied).
         if existing {
             recover_shared_wal(&root, &tables, &epoch, wal_dek.as_ref())?;
+            // P3.4: sweep stale `_txn/<txn_id>/` dirs left by aborted/crashed
+            // large transactions (spec §8.5, review fix #14).
+            sweep_pending_txn_dirs(&root, &cat);
         }
 
         // Bump `open_generation` on every open and scope transaction ids by it
@@ -212,6 +229,7 @@ impl Database {
             active_txns: crate::txn::ActiveTxns::new(),
             pending_visible: Mutex::new(std::collections::BTreeSet::new()),
             poisoned: std::sync::atomic::AtomicBool::new(false),
+            spill_threshold: std::sync::atomic::AtomicU64::new(64 * 1024 * 1024),
         })
     }
 
@@ -222,7 +240,7 @@ impl Database {
 
     /// Resolve a table name → id (live tables only). pub(crate) so the
     /// transaction layer can stage by name.
-    pub(crate) fn table_id(&self, name: &str) -> Result<u64> {
+    pub fn table_id(&self, name: &str) -> Result<u64> {
         let cat = self.catalog.read();
         cat.live(name)
             .map(|e| e.table_id)
@@ -325,7 +343,91 @@ impl Database {
             self.conflicts.prune_below(Epoch(min_active));
         }
 
+        // ── 1b. Spill: if a table's staged puts exceed the threshold, write a
+        // uniform-epoch pending run (spec §8.5). Rows in the run are NOT
+        // streamed as Put records; they are linked at publish time.
+        let mut spilled: Vec<SpilledRun> = Vec::new();
+        let mut spilled_tables: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        {
+            let mut table_bytes: HashMap<u64, usize> = HashMap::new();
+            for (table_id, staged) in &staging {
+                if let Staged::Put(cells) = staged {
+                    *table_bytes.entry(*table_id).or_default() += cells.len() * 16;
+                }
+            }
+            let tables = self.tables.read();
+            for (&table_id, &bytes) in &table_bytes {
+                if bytes as u64
+                    <= self
+                        .spill_threshold
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    continue;
+                }
+                let Some(handle) = tables.get(&table_id) else {
+                    continue;
+                };
+                let mut t = handle.lock();
+                let tdir = t.table_dir().to_path_buf();
+                let txn_dir = tdir.join("_txn").join(txn_id.to_string());
+                std::fs::create_dir_all(&txn_dir)?;
+                let run_id = t.alloc_run_id() as u128;
+                let pending_path = txn_dir.join(format!("r-{run_id}.sr"));
+
+                let mut rows: Vec<Row> = Vec::new();
+                for (tid, staged) in &staging {
+                    if *tid != table_id {
+                        continue;
+                    }
+                    if let Staged::Put(cells) = staged {
+                        let row_id = t.alloc_row_id();
+                        let mut row = Row::new(row_id, Epoch(0));
+                        for (c, v) in cells {
+                            row.columns.insert(*c, v.clone());
+                        }
+                        rows.push(row);
+                    }
+                }
+                let schema = t.schema_ref().clone();
+                let kek = t.kek_ref().cloned();
+                let specs = t.indexable_column_specs();
+                drop(t);
+
+                let mut writer = crate::sorted_run::RunWriter::new(&schema, run_id, Epoch(0), 0);
+                if let Some(ref kek) = kek {
+                    writer = writer.with_encryption(kek.as_ref(), specs);
+                }
+                let header = writer.write(&pending_path, &rows)?;
+                let row_count = header.row_count;
+                let min_rid = rows.first().map(|r| r.row_id.0).unwrap_or(0);
+                let max_rid = rows.last().map(|r| r.row_id.0).unwrap_or(0);
+
+                spilled.push(SpilledRun {
+                    table_id,
+                    run_id,
+                    pending_path,
+                    rows,
+                    row_count,
+                    min_rid,
+                    max_rid,
+                });
+                spilled_tables.insert(table_id);
+            }
+        }
+
         // ── 2. Sequencer: validate-first → assign → append → sync → record ──
+        let added_runs: Vec<crate::wal::AddedRun> = spilled
+            .iter()
+            .map(|s| crate::wal::AddedRun {
+                table_id: s.table_id,
+                run_id: s.run_id,
+                row_count: s.row_count,
+                level: 0,
+                min_row_id: s.min_rid,
+                max_row_id: s.max_rid,
+                content_hash: [0u8; 32],
+            })
+            .collect();
         let (new_epoch, applies) = {
             let mut wal = self.shared_wal.lock();
 
@@ -341,6 +443,11 @@ impl Database {
             let mut applies: Vec<(u64, Vec<StagedOp>)> = Vec::new();
 
             for (table_id, staged) in &staging {
+                // Skip puts for tables that were spilled — their data is in a
+                // pending run, not in streamed Put records.
+                if spilled_tables.contains(table_id) && matches!(staged, Staged::Put(_)) {
+                    continue;
+                }
                 let handle = tables.get(table_id).ok_or_else(|| {
                     MongrelError::NotFound(format!("table {table_id} not mounted"))
                 })?;
@@ -380,7 +487,7 @@ impl Database {
                 applies.push((*table_id, ops));
             }
 
-            wal.append_commit(txn_id, new_epoch, &[])?;
+            wal.append_commit(txn_id, new_epoch, &added_runs)?;
             wal.group_sync().inspect_err(|_| {
                 self.poisoned.store(true, Ordering::Relaxed);
             })?;
@@ -389,9 +496,38 @@ impl Database {
             (new_epoch, applies)
         };
 
-        // ── 3. Publish: apply to tables, advance visible in-order ──
+        // ── 3. Publish: link spilled runs + apply non-spilled ops ──
         {
             let tables = self.tables.read();
+            // Link spilled runs first.
+            for s in &spilled {
+                if let Some(handle) = tables.get(&s.table_id) {
+                    let mut t = handle.lock();
+                    let dest = t.run_path(s.run_id as u64);
+                    std::fs::rename(&s.pending_path, &dest)?;
+                    // Clean up the now-empty `_txn/<txn_id>/` dir.
+                    if let Some(parent) = s.pending_path.parent() {
+                        let _ = std::fs::remove_dir_all(parent);
+                    }
+                    t.link_run(crate::manifest::RunRef {
+                        run_id: s.run_id,
+                        level: 0,
+                        epoch_created: new_epoch.0,
+                        row_count: s.row_count,
+                    });
+                    // Apply the run's rows to indexes + memtable + live_count.
+                    // The merge logic in `visible_rows` deduplicates by row_id,
+                    // so having rows in both a run and the memtable is safe.
+                    let mut rows = s.rows.clone();
+                    for r in rows.iter_mut() {
+                        r.committed_epoch = new_epoch;
+                    }
+                    t.apply_put_rows(rows);
+                    t.invalidate_pending_cache();
+                    t.persist_manifest(new_epoch)?;
+                }
+            }
+            // Apply non-spilled ops.
             for (table_id, ops) in applies {
                 if let Some(handle) = tables.get(&table_id) {
                     let mut t = handle.lock();
@@ -600,6 +736,14 @@ impl Database {
         id
     }
 
+    /// Set the per-table spill threshold (bytes). When a transaction's staged
+    /// bytes for a single table exceed this, the rows are written as a
+    /// uniform-epoch pending run instead of streamed Put records (spec §8.5).
+    pub fn set_spill_threshold(&self, bytes: u64) {
+        self.spill_threshold
+            .store(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// The DB-wide KEK (if encrypted).
     #[allow(dead_code)]
     pub(crate) fn kek(&self) -> Option<&Arc<crate::encryption::Kek>> {
@@ -790,4 +934,20 @@ fn recover_ddl_from_wal(
         catalog::write_atomic(root, cat, meta_dek)?;
     }
     Ok(())
+}
+
+/// Sweep stale `_txn/<txn_id>/` dirs from every table (spec §8.5, review fix
+/// #14). These dirs hold pending uniform-epoch runs from large transactions
+/// that were aborted or crashed before commit. On open, all such dirs are safe
+/// to remove — committed txns moved their runs to `_runs/` at publish time.
+fn sweep_pending_txn_dirs(root: &Path, cat: &Catalog) {
+    for entry in &cat.tables {
+        let txn_dir = root
+            .join(TABLES_DIR)
+            .join(entry.table_id.to_string())
+            .join("_txn");
+        if txn_dir.exists() {
+            let _ = std::fs::remove_dir_all(&txn_dir);
+        }
+    }
 }
