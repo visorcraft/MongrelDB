@@ -275,6 +275,13 @@ impl WalReader {
         file.read_exact(&mut epoch_buf)?;
         let _epoch_created = Epoch(u64::from_le_bytes(epoch_buf));
         let pos = HEADER_LEN;
+        if encrypted && cipher.is_none() {
+            return Err(MongrelError::Decryption(
+                "WAL is encrypted but no passphrase or key was provided. \
+                 Use Db::open_encrypted or Db::open_with_key."
+                    .into(),
+            ));
+        }
         Ok(Self {
             inner: BufReader::new(file),
             pos,
@@ -346,7 +353,11 @@ impl WalReader {
             }
             let nonce: [u8; 12] = payload[..12].try_into().unwrap();
             let ciphertext = &payload[12..];
-            cipher.decrypt_page(&nonce, ciphertext)?
+            cipher.decrypt_page(&nonce, ciphertext).map_err(|e| {
+                MongrelError::Decryption(format!(
+                    "WAL frame decryption failed — wrong passphrase or key? ({e})"
+                ))
+            })?
         } else {
             payload.to_vec()
         };
