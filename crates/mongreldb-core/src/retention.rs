@@ -102,6 +102,15 @@ impl SnapshotRegistry {
         }
     }
 
+    /// The lowest currently-pinned epoch, or `None` when no reader is active.
+    /// Unlike [`Self::min_active`] this distinguishes "no readers" from "a reader
+    /// pinned at `visible`", which compaction needs: with no readers it may drop
+    /// superseded versions/tombstones freely, but a pin (even at `visible`) must
+    /// preserve the version that reader can still see.
+    pub fn min_pinned(&self) -> Option<Epoch> {
+        self.live.lock().keys().next().copied().map(Epoch)
+    }
+
     fn release(&self, epoch: Epoch) {
         let mut live = self.live.lock();
         if let Some(count) = live.get_mut(&epoch.0) {

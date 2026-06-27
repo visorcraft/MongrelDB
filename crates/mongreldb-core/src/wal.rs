@@ -749,19 +749,29 @@ impl SharedWal {
                 continue; // never delete the segment we're appending to
             }
             let path = Self::segment_path(&self.wal_dir, n);
-            // A segment is reapable when its highest seq is below the retention
-            // floor. Replaying it (cold path) yields its record set; an empty or
-            // torn-header segment has no records and is trivially reapable.
-            let recs = match &self.wal_dek {
-                #[cfg(feature = "encryption")]
-                Some(dk) => {
-                    let cipher = Self::cipher_from_dek(dk)?;
-                    replay_with_cipher(&path, Some(cipher))?
+            // Fast path: an infinite floor means every non-active segment is
+            // reapable, so skip the (cold-but-not-free) full replay.
+            let reapable = if min_retained_seq == u64::MAX {
+                true
+            } else {
+                // A segment is reapable when its highest seq is below the
+                // retention floor. A torn/corrupt OLD segment that won't replay
+                // is treated as reapable: we are GCing it anyway and its records
+                // are by construction already durable in runs.
+                let recs = match &self.wal_dek {
+                    #[cfg(feature = "encryption")]
+                    Some(dk) => {
+                        let cipher = Self::cipher_from_dek(dk)?;
+                        replay_with_cipher(&path, Some(cipher))
+                    }
+                    _ => replay(&path),
+                };
+                match recs {
+                    Ok(recs) => recs.iter().map(|r| r.seq.0).max().unwrap_or(0) < min_retained_seq,
+                    Err(_) => true,
                 }
-                _ => replay(&path)?,
             };
-            let max_seq = recs.iter().map(|r| r.seq.0).max().unwrap_or(0);
-            if max_seq < min_retained_seq {
+            if reapable {
                 std::fs::remove_file(&path)?;
                 reaped += 1;
             }

@@ -347,6 +347,49 @@ fn gc_reaps_accumulated_wal_segments_once_durable() {
 }
 
 #[test]
+fn database_pinned_snapshot_survives_compaction() {
+    // A reader pinned via `db.snapshot()` (the Database registry, not the
+    // single-table pin set) must still see its version after a compaction on
+    // that table — compaction's version-retention must consult the Database
+    // registry, not only the table-local pins.
+    let dir = tempdir().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.create_table("t", pk_schema()).unwrap();
+    let tbl = db.table("t").unwrap();
+    tbl.lock().set_mutable_run_spill_bytes(1);
+
+    db.transaction(|t| t.put("t", vec![(1, Value::Int64(1))]).map(|_| ()))
+        .unwrap();
+    tbl.lock().flush().unwrap();
+    let rid = {
+        let g = tbl.lock();
+        let snap = g.snapshot();
+        g.visible_rows(snap).unwrap()[0].row_id
+    };
+
+    // Pin a snapshot that sees the live row, then delete + flush a tombstone.
+    let (snap_pinned, guard) = db.snapshot();
+    db.transaction(|t| t.delete("t", rid)).unwrap();
+    tbl.lock().flush().unwrap();
+
+    // Compact with the Database snapshot still pinned.
+    tbl.lock().compact().unwrap();
+
+    // The pinned snapshot must still see the row; the current view must not.
+    {
+        let g = tbl.lock();
+        assert_eq!(
+            g.visible_rows(snap_pinned).unwrap().len(),
+            1,
+            "Database-pinned snapshot must still see its version after compaction"
+        );
+        assert_eq!(g.visible_rows(g.snapshot()).unwrap().len(), 0);
+    }
+
+    drop(guard);
+}
+
+#[test]
 fn gc_sweeps_stale_txn_dirs() {
     let dir = tempdir().unwrap();
     let db = Database::create(dir.path()).unwrap();

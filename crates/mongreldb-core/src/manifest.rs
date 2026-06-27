@@ -18,7 +18,13 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub const MANIFEST_MAGIC: [u8; 8] = *b"MONGRMFT";
-pub const MANIFEST_VERSION: u16 = 1;
+/// Bumped to 2 when the `retiring` reaper queue was added. NOTE: the manifest is
+/// serialized with `bincode`, which is positional and not self-describing, so
+/// `#[serde(default)]` on new fields does NOT give cross-version read
+/// compatibility — a manifest written by an older binary cannot be decoded by a
+/// newer one (and vice-versa). The project carries no on-disk compatibility
+/// guarantee pre-1.0; this constant documents the format break.
+pub const MANIFEST_VERSION: u16 = 2;
 pub const MANIFEST_FILENAME: &str = "_mf";
 /// 32-byte meta DEK length (matches [`crate::encryption::DEK_LEN`]).
 pub const META_DEK_LEN: usize = DEK_LEN;
@@ -40,7 +46,9 @@ pub struct RunRef {
 pub struct RetiredRun {
     pub run_id: u128,
     /// The compaction epoch at which this run was superseded. Reapable once
-    /// `min_active_snapshot > retire_epoch`.
+    /// `min_active_snapshot >= retire_epoch` (a reader pinned exactly at the
+    /// compaction epoch is served by the merged run, whose `epoch_created`
+    /// equals `retire_epoch`).
     pub retire_epoch: u64,
 }
 
@@ -64,6 +72,9 @@ pub struct Manifest {
     pub flushed_epoch: u64,
     /// Runs superseded by compaction but retained for snapshot retention,
     /// pending physical deletion by `gc()` (spec §6.4). See [`RetiredRun`].
+    /// (`serde(default)` is a no-op under bincode — see [`MANIFEST_VERSION`] —
+    /// kept only so a future move to a self-describing codec would degrade
+    /// gracefully.)
     #[serde(default)]
     pub retiring: Vec<RetiredRun>,
     pub checksum: [u8; 32],

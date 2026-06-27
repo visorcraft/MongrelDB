@@ -124,7 +124,6 @@ pub struct Table {
     page_cache: Arc<parking_lot::Mutex<crate::cache::PageCache>>,
     /// Global snapshot-retention registry shared across all tables in a
     /// `Database`. Single-table direct opens get a private one.
-    #[allow(dead_code)]
     snapshots: Arc<crate::retention::SnapshotRegistry>,
     /// Cross-table commit serializer (see [`SharedCtx::commit_lock`]).
     commit_lock: Arc<parking_lot::Mutex<()>>,
@@ -2326,8 +2325,22 @@ impl Table {
     }
 
     /// Oldest pinned snapshot epoch, or `None` if no snapshot is active.
+    /// Lowest snapshot epoch that compaction must preserve a version for, or
+    /// `None` when no reader is pinned anywhere. Considers BOTH the single-table
+    /// local pin set (`self.pinned`, used by the standalone `pin_snapshot` API)
+    /// AND the shared `Database` snapshot registry (`db.snapshot()` readers) —
+    /// otherwise a multi-table reader's version could be dropped by a compaction
+    /// triggered on its table (the registry-gated reaper would then keep the
+    /// old run *files*, but readers only scan the merged run, so the version
+    /// would still be lost).
     pub(crate) fn min_active_snapshot(&self) -> Option<Epoch> {
-        self.pinned.keys().next().copied()
+        let local = self.pinned.keys().next().copied();
+        let global = self.snapshots.min_pinned();
+        match (local, global) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, b) => b,
+        }
     }
 
     pub fn current_epoch(&self) -> Epoch {
@@ -3937,9 +3950,6 @@ impl Table {
     /// `TxnCommit` still in the WAL) this is a no-op returning `false`, so the
     /// caller never double-links or double-counts. Otherwise — a crash *after*
     /// the commit fsync but *before* publish persisted the manifest — the run is
-    /// linked, its rows are added to `live_count`, and the indexes are marked
-    /// stale so the next query rebuilds them from the runs (including this one).
-    /// Returns `true` when the run was newly linked.
     /// Enqueue a compaction-superseded run for retention-gated deletion (spec
     /// §6.4). The file stays on disk until [`Self::reap_retiring`] removes it
     /// once `min_active_snapshot` has advanced past `retire_epoch`.
@@ -3959,6 +3969,11 @@ impl Table {
         }
         let mut reaped = 0;
         let mut kept: Vec<crate::manifest::RetiredRun> = Vec::new();
+        // Delete-then-persist is crash-idempotent: if we crash after unlinking
+        // some files but before persisting, the manifest still lists them in
+        // `retiring`; the next `reap_retiring` re-issues `remove_file` (the
+        // error is ignored) and `check()` excludes `retiring` ids from orphan
+        // detection, so the lingering entries are harmless until then.
         for r in std::mem::take(&mut self.retiring) {
             if min_active.0 >= r.retire_epoch {
                 let _ = std::fs::remove_file(self.run_path(r.run_id as u64));
