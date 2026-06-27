@@ -18,10 +18,9 @@
 
 use mongreldb_core::query::{Condition, Query};
 use mongreldb_core::schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
-use mongreldb_core::{Table, RowId, Value};
+use mongreldb_core::{RowId, Value};
 use napi::bindgen_prelude::{BigInt, Buffer};
 use napi_derive::napi;
-use parking_lot::Mutex;
 use std::sync::Arc;
 
 fn to_napi(e: mongreldb_core::MongrelError) -> napi::Error {
@@ -274,19 +273,30 @@ pub struct RowJs {
     pub cells: Vec<Cell>,
 }
 
-// ── database ──────────────────────────────────────────────────────────────
+// ── multi-table Database + Table (P5.1) ───────────────────────────────────
 
-/// An open MongrelDB table, held behind an `Arc<Mutex>`. Synchronous methods
-/// lock and run on the JS thread (fine for cheap/O(1) ops); the `*Async`
-/// variants return a Promise and offload blocking I/O to the NAPI tokio runtime's
-/// blocking pool, so the JS event loop is never stalled by a flush or scan.
+use mongreldb_core::Database as CoreDatabase;
+
+/// An open MongrelDB multi-table database. Each table is accessible via
+/// `table(name)`; SQL queries via `sql()`.
 #[napi]
 pub struct Database {
-    db: Arc<Mutex<Table>>,
+    inner: Arc<CoreDatabase>,
 }
 
-fn cell_pairs(db: &Table, cells: Vec<Cell>) -> napi::Result<Vec<(u16, Value)>> {
-    let schema = db.schema();
+/// A handle to one table inside a [`Database`].
+#[napi]
+pub struct TableHandle {
+    db: Arc<CoreDatabase>,
+    table_id: u64,
+    name: String,
+}
+
+fn cell_pairs_table(
+    t: &mongreldb_core::Table,
+    cells: Vec<Cell>,
+) -> napi::Result<Vec<(u16, Value)>> {
+    let schema = t.schema();
     cells
         .into_iter()
         .map(|c| {
@@ -296,15 +306,13 @@ fn cell_pairs(db: &Table, cells: Vec<Cell>) -> napi::Result<Vec<(u16, Value)>> {
                 .find(|cd| cd.id == c.column_id)
                 .map(|cd| cd.ty)
                 .unwrap_or(TypeId::Bytes);
-            let cid = c.column_id;
-            let v = c.to_value(ty);
-            Ok((cid, v))
+            Ok((c.column_id, c.to_value(ty)))
         })
         .collect()
 }
 
-fn row_to_js(db: &Table, row: &mongreldb_core::memtable::Row) -> RowJs {
-    let schema = db.schema();
+fn row_to_js_table(t: &mongreldb_core::Table, row: &mongreldb_core::memtable::Row) -> RowJs {
+    let schema = t.schema();
     let cells = schema
         .columns
         .iter()
@@ -321,91 +329,166 @@ fn row_to_js(db: &Table, row: &mongreldb_core::memtable::Row) -> RowJs {
 
 #[napi]
 impl Database {
-    /// Create a new table at `path` (constructor form: `new Database(path, schema, tableId)`).
-    #[napi(constructor)]
-    pub fn new(path: String, schema: SchemaSpec, table_id: u32) -> napi::Result<Database> {
-        let s = build_schema(schema)?;
-        let db = Table::create(&path, s, table_id as u64).map_err(to_napi)?;
+    /// Create a fresh database at `path`.
+    #[napi(factory)]
+    pub fn with_path(path: String) -> napi::Result<Database> {
+        let db = CoreDatabase::create(&path).map_err(to_napi)?;
         Ok(Database {
-            db: Arc::new(Mutex::new(db)),
+            inner: Arc::new(db),
         })
     }
 
-    /// Open an existing table from disk (`Database.open(path)`).
+    /// Open an existing database from disk.
     #[napi]
     pub fn open(path: String) -> napi::Result<Database> {
-        let db = Table::open(&path).map_err(to_napi)?;
+        let db = CoreDatabase::open(&path).map_err(to_napi)?;
         Ok(Database {
-            db: Arc::new(Mutex::new(db)),
+            inner: Arc::new(db),
         })
     }
 
-    /// Upsert one row (sync). Returns the row id; durability on next `commit`/`flush`.
+    /// Create a new table with the given schema.
     #[napi]
-    pub fn put(&mut self, cells: Vec<Cell>) -> napi::Result<BigInt> {
-        let mut g = self.db.lock();
-        let cols = cell_pairs(&g, cells)?;
+    pub fn create_table(&self, name: String, schema: SchemaSpec) -> napi::Result<BigInt> {
+        let s = build_schema(schema)?;
+        let id = self.inner.create_table(&name, s).map_err(to_napi)?;
+        Ok(BigInt::from(id))
+    }
+
+    /// Drop a table by name.
+    #[napi]
+    pub fn drop_table(&self, name: String) -> napi::Result<()> {
+        self.inner.drop_table(&name).map_err(to_napi)
+    }
+
+    /// Get a handle to a table by name for typed put/get/query operations.
+    #[napi]
+    pub fn get_table(&self, name: String) -> napi::Result<TableHandle> {
+        let table_id = self.inner.table_id(&name).map_err(to_napi)?;
+        Ok(TableHandle {
+            db: Arc::clone(&self.inner),
+            table_id,
+            name,
+        })
+    }
+
+    /// List all live table names.
+    #[napi]
+    pub fn table_names(&self) -> Vec<String> {
+        self.inner.table_names()
+    }
+
+    /// Run a cross-table SQL query. Returns Arrow IPC bytes.
+    #[napi]
+    pub async fn sql(&self, sql: String) -> napi::Result<Buffer> {
+        let db = Arc::clone(&self.inner);
+        let session = mongreldb_query::MongrelSession::open(db)
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e:?}")))?;
+        let batches = session
+            .run(&sql)
+            .await
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e:?}")))?;
+        native_cols_to_ipc_from_batches(&batches)
+    }
+
+    /// Flush + release. Optional — the `Database` also drops on GC.
+    #[napi]
+    pub fn close(&self) -> napi::Result<()> {
+        Ok(())
+    }
+}
+
+fn native_cols_to_ipc_from_batches(
+    batches: &[arrow::record_batch::RecordBatch],
+) -> napi::Result<Buffer> {
+    if batches.is_empty() {
+        return Ok(Buffer::from(Vec::new()));
+    }
+    let schema = batches[0].schema();
+    let mut buf = Vec::new();
+    let mut writer = arrow::ipc::writer::FileWriter::try_new(&mut buf, schema.as_ref())
+        .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e:?}")))?;
+    for b in batches {
+        writer
+            .write(b)
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e:?}")))?;
+    }
+    writer
+        .finish()
+        .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e:?}")))?;
+    drop(writer);
+    Ok(Buffer::from(buf))
+}
+
+#[napi]
+impl TableHandle {
+    /// Upsert one row. Returns the row id.
+    #[napi]
+    pub fn put(&self, cells: Vec<Cell>) -> napi::Result<BigInt> {
+        let handle = self.db.table(&self.name).map_err(to_napi)?;
+        let mut g = handle.lock();
+        let cols = cell_pairs_table(&g, cells)?;
         let rid = g.put(cols).map_err(to_napi)?;
         Ok(BigInt::from(rid.0))
     }
 
-    /// Group-commit: fsync once for all pending writes and bump the epoch (sync).
+    /// Group-commit this table's pending writes.
     #[napi]
-    pub fn commit(&mut self) -> napi::Result<BigInt> {
-        self.db
-            .lock()
-            .commit()
-            .map(|e| BigInt::from(e.0))
-            .map_err(to_napi)
+    pub fn commit(&self) -> napi::Result<BigInt> {
+        let handle = self.db.table(&self.name).map_err(to_napi)?;
+        let mut g = handle.lock();
+        g.commit().map(|e| BigInt::from(e.0)).map_err(to_napi)
     }
 
-    /// Flush: commit + drain the memtable to an immutable sorted run (sync).
+    /// Flush: commit + drain memtable to a sorted run.
     #[napi]
-    pub fn flush(&mut self) -> napi::Result<BigInt> {
-        self.db
-            .lock()
-            .flush()
-            .map(|e| BigInt::from(e.0))
-            .map_err(to_napi)
+    pub fn flush(&self) -> napi::Result<BigInt> {
+        let handle = self.db.table(&self.name).map_err(to_napi)?;
+        let mut g = handle.lock();
+        g.flush().map(|e| BigInt::from(e.0)).map_err(to_napi)
     }
 
-    /// Live (non-deleted) row count in O(1) — the metadata COUNT(*) fast path.
+    /// Live row count (O(1)).
     #[napi]
-    pub fn count(&self) -> BigInt {
-        BigInt::from(self.db.lock().count())
+    pub fn count(&self) -> napi::Result<BigInt> {
+        let handle = self.db.table(&self.name).map_err(to_napi)?;
+        let g = handle.lock();
+        Ok(BigInt::from(g.count()))
     }
 
-    /// Read the newest visible version of a row (sync).
+    /// Point read by row id.
     #[napi]
     pub fn get(&self, row_id: BigInt) -> napi::Result<Option<RowJs>> {
-        let g = self.db.lock();
+        let handle = self.db.table(&self.name).map_err(to_napi)?;
+        let g = handle.lock();
         let snap = g.snapshot();
         Ok(g.get(RowId(row_id.get_u64().1), snap)
-            .map(|r| row_to_js(&g, &r)))
+            .map(|r| row_to_js_table(&g, &r)))
     }
 
-    /// Hybrid query (sync): each condition resolves to a row-id set via its index
-    /// (PK/bitmap/FM/HNSW/range/sparse); sets intersect, survivors materialize.
+    /// Hybrid index query.
     #[napi]
     pub fn query(&self, conditions: Vec<ConditionSpec>) -> napi::Result<Vec<RowJs>> {
-        let mut g = self.db.lock();
+        let handle = self.db.table(&self.name).map_err(to_napi)?;
+        let mut g = handle.lock();
         let mut q = Query::new();
         for c in &conditions {
             q = q.and(build_condition(c)?);
         }
         let rows = g.query_cached(&q).map_err(to_napi)?;
-        Ok(rows.iter().map(|r| row_to_js(&g, r)).collect())
+        Ok(rows.iter().map(|r| row_to_js_table(&g, r)).collect())
     }
 
-    // ── async (Promise) variants — offload blocking work to the tokio pool ──
+    // ── async variants ──
 
-    /// Async upsert. Resolves to the row id.
     #[napi]
     pub async fn put_async(&self, cells: Vec<Cell>) -> napi::Result<BigInt> {
-        let db = self.db.clone();
+        let db = Arc::clone(&self.db);
+        let name = self.name.clone();
         napi::bindgen_prelude::spawn_blocking(move || -> napi::Result<BigInt> {
-            let mut g = db.lock();
-            let cols = cell_pairs(&g, cells)?;
+            let handle = db.table(&name).map_err(to_napi)?;
+            let mut g = handle.lock();
+            let cols = cell_pairs_table(&g, cells)?;
             let rid = g.put(cols).map_err(to_napi)?;
             Ok(BigInt::from(rid.0))
         })
@@ -413,193 +496,63 @@ impl Database {
         .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e:?}")))?
     }
 
-    /// Async commit.
     #[napi]
     pub async fn commit_async(&self) -> napi::Result<BigInt> {
-        let db = self.db.clone();
+        let db = Arc::clone(&self.db);
+        let name = self.name.clone();
         napi::bindgen_prelude::spawn_blocking(move || {
-            db.lock()
-                .commit()
-                .map(|e| BigInt::from(e.0))
-                .map_err(to_napi)
+            let handle = db.table(&name).map_err(to_napi)?;
+            let mut g = handle.lock();
+            g.commit().map(|e| BigInt::from(e.0)).map_err(to_napi)
         })
         .await
         .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e:?}")))?
     }
 
-    /// Async flush.
     #[napi]
-    pub async fn flush_async(&self) -> napi::Result<BigInt> {
-        let db = self.db.clone();
+    pub async fn count_async(&self) -> napi::Result<BigInt> {
+        let db = Arc::clone(&self.db);
+        let name = self.name.clone();
         napi::bindgen_prelude::spawn_blocking(move || {
-            db.lock()
-                .flush()
-                .map(|e| BigInt::from(e.0))
-                .map_err(to_napi)
+            let handle = db.table(&name).map_err(to_napi)?;
+            let g = handle.lock();
+            Ok(BigInt::from(g.count()))
         })
         .await
         .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e:?}")))?
     }
 
-    /// Async point read.
     #[napi]
     pub async fn get_async(&self, row_id: BigInt) -> napi::Result<Option<RowJs>> {
-        let db = self.db.clone();
+        let db = Arc::clone(&self.db);
+        let name = self.name.clone();
         napi::bindgen_prelude::spawn_blocking(move || -> napi::Result<Option<RowJs>> {
-            let g = db.lock();
+            let handle = db.table(&name).map_err(to_napi)?;
+            let g = handle.lock();
             let snap = g.snapshot();
             Ok(g.get(RowId(row_id.get_u64().1), snap)
-                .map(|r| row_to_js(&g, &r)))
+                .map(|r| row_to_js_table(&g, &r)))
         })
         .await
         .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e:?}")))?
     }
 
-    /// Async hybrid query.
     #[napi]
     pub async fn query_async(&self, conditions: Vec<ConditionSpec>) -> napi::Result<Vec<RowJs>> {
-        let db = self.db.clone();
+        let db = Arc::clone(&self.db);
+        let name = self.name.clone();
         napi::bindgen_prelude::spawn_blocking(move || -> napi::Result<Vec<RowJs>> {
-            let mut g = db.lock();
+            let handle = db.table(&name).map_err(to_napi)?;
+            let mut g = handle.lock();
             let mut q = Query::new();
             for c in &conditions {
                 q = q.and(build_condition(c)?);
             }
             let rows = g.query_cached(&q).map_err(to_napi)?;
-            Ok(rows.iter().map(|r| row_to_js(&g, r)).collect())
+            Ok(rows.iter().map(|r| row_to_js_table(&g, r)).collect())
         })
         .await
         .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e:?}")))?
-    }
-
-    /// Flush + release. Optional — the `Database` also drops on GC.
-    #[napi]
-    pub fn close(&mut self) -> napi::Result<()> {
-        self.db.lock().flush().map(|_| ()).map_err(to_napi)
-    }
-
-    // ── Phase 20: bulk paths (strictly additive; single-row API unchanged) ──
-
-    /// Batch upsert (Phase 20.1): one FFI crossing for N rows. Optionally
-    /// commits in the same call. Still durable (same WAL + fsync as `put`).
-    #[napi]
-    pub fn put_batch(
-        &mut self,
-        rows: Vec<Vec<Cell>>,
-        commit: Option<bool>,
-    ) -> napi::Result<Vec<BigInt>> {
-        let mut g = self.db.lock();
-        let batch: Vec<Vec<(u16, Value)>> = rows
-            .into_iter()
-            .map(|cells| cell_pairs(&g, cells))
-            .collect::<napi::Result<Vec<_>>>()?;
-        let rids = g.put_batch(batch).map_err(to_napi)?;
-        if commit.unwrap_or(false) {
-            g.commit().map_err(to_napi)?;
-        }
-        Ok(rids.into_iter().map(|r| BigInt::from(r.0)).collect())
-    }
-
-    /// Typed-array bulk load (Phase 20.2): constructs `NativeColumn`s directly
-    /// from typed-array pointers — no `Value` enum, no per-row JS↔Rust
-    /// conversion.
-    #[napi]
-    pub fn bulk_load_typed(&mut self, columns: Vec<TypedColumn>) -> napi::Result<BigInt> {
-        let native_cols: Vec<(u16, mongreldb_core::columnar::NativeColumn)> = columns
-            .into_iter()
-            .map(|c| c.to_native())
-            .collect::<napi::Result<Vec<_>>>()?;
-        let epoch = self
-            .db
-            .lock()
-            .bulk_load_columns(native_cols)
-            .map_err(to_napi)?;
-        Ok(BigInt::from(epoch.0))
-    }
-
-    /// Arrow zero-copy query (Phase 20.3): returns a Node `Buffer` containing
-    /// Arrow IPC bytes built from `NativeColumn` via the existing Arrow bridge.
-    #[napi]
-    pub fn query_arrow(&self, conditions: Vec<ConditionSpec>) -> napi::Result<Buffer> {
-        let mut g = self.db.lock();
-        let mut q = Query::new();
-        for c in &conditions {
-            q = q.and(build_condition(c)?);
-        }
-        let snap = g.snapshot();
-        let schema = g.schema().clone();
-        let cols = match g.query_columns_native_cached(&q.conditions, None, snap) {
-            Ok(Some(c)) => c,
-            _ => {
-                let rows = g.query(&q).map_err(to_napi)?;
-                let n = rows.len();
-                let mut by_col: std::collections::HashMap<u16, Vec<Value>> =
-                    std::collections::HashMap::new();
-                for r in &rows {
-                    for (&cid, v) in &r.columns {
-                        by_col.entry(cid).or_default().push(v.clone());
-                    }
-                }
-                schema
-                    .columns
-                    .iter()
-                    .map(|cdef| {
-                        let vals = by_col.remove(&cdef.id).unwrap_or_else(|| vec![Value::Null; n]);
-                        (cdef.id, mongreldb_core::columnar::values_to_native(cdef.ty, &vals))
-                    })
-                    .collect()
-            }
-        };
-        drop(g);
-        let fields: Vec<arrow::datatypes::Field> = cols
-            .iter()
-            .map(|(id, col)| {
-                let dt = match col {
-                    mongreldb_core::columnar::NativeColumn::Int64 { .. } => {
-                        arrow::datatypes::DataType::Int64
-                    }
-                    mongreldb_core::columnar::NativeColumn::Float64 { .. } => {
-                        arrow::datatypes::DataType::Float64
-                    }
-                    mongreldb_core::columnar::NativeColumn::Bool { .. } => {
-                        arrow::datatypes::DataType::Boolean
-                    }
-                    mongreldb_core::columnar::NativeColumn::Bytes { .. } => {
-                        arrow::datatypes::DataType::Utf8
-                    }
-                };
-                let name = schema
-                    .columns
-                    .iter()
-                    .find(|c| c.id == *id)
-                    .map(|c| c.name.as_str())
-                    .unwrap_or("col");
-                arrow::datatypes::Field::new(name, dt, true)
-            })
-            .collect();
-        let arrow_schema = std::sync::Arc::new(arrow::datatypes::Schema::new(fields));
-        let arrays: Vec<arrow::array::ArrayRef> = cols
-            .iter()
-            .map(|(_, col)| {
-                let ty = schema
-                    .columns
-                    .iter()
-                    .find(|c| c.id == 0)
-                    .map(|c| c.ty)
-                    .unwrap_or(mongreldb_core::schema::TypeId::Bytes);
-                arrow_from_native(ty, col)
-            })
-            .collect::<napi::Result<Vec<_>>>()?;
-        let batch = arrow::record_batch::RecordBatch::try_new(arrow_schema, arrays)
-            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
-        let mut buf = Vec::new();
-        {
-            let mut writer = arrow::ipc::writer::FileWriter::try_new(&mut buf, batch.schema().as_ref())
-                .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
-            let _ = writer.write(&batch);
-            let _ = writer.finish();
-        }
-        Ok(Buffer::from(buf))
     }
 }
 
@@ -617,7 +570,9 @@ pub struct TypedColumn {
 impl TypedColumn {
     fn to_native(self) -> napi::Result<(u16, mongreldb_core::columnar::NativeColumn)> {
         let n = match self.ty {
-            ColumnType::Int64 | ColumnType::Float64 | ColumnType::TimestampNanos
+            ColumnType::Int64
+            | ColumnType::Float64
+            | ColumnType::TimestampNanos
             | ColumnType::Date32 => self.data.len() / 8,
             ColumnType::Bool => self.data.len(),
             ColumnType::Bytes | ColumnType::Embedding => {
@@ -627,7 +582,10 @@ impl TypedColumn {
                 ))
             }
         };
-        let validity = self.validity.map(|b| b.to_vec()).unwrap_or_else(|| vec![0xFF; n.div_ceil(8)]);
+        let validity = self
+            .validity
+            .map(|b| b.to_vec())
+            .unwrap_or_else(|| vec![0xFF; n.div_ceil(8)]);
         let col = match self.ty {
             ColumnType::Int64 | ColumnType::TimestampNanos | ColumnType::Date32 => {
                 let data = bytemuck::cast_slice::<_, i64>(&self.data).to_vec();
@@ -637,34 +595,34 @@ impl TypedColumn {
                 let data = bytemuck::cast_slice::<_, f64>(&self.data).to_vec();
                 mongreldb_core::columnar::NativeColumn::Float64 { data, validity }
             }
-            ColumnType::Bool => {
-                mongreldb_core::columnar::NativeColumn::Bool {
-                    data: self.data.to_vec(),
-                    validity,
-                }
-            }
+            ColumnType::Bool => mongreldb_core::columnar::NativeColumn::Bool {
+                data: self.data.to_vec(),
+                validity,
+            },
             _ => unreachable!(),
         };
         Ok((self.column_id, col))
     }
 }
 
-/// Phase 20.6: explicit, opt-in write micro-batching. Writes are **not
-/// durable until flush** — the contract is the opposite of `put()`.
+/// Opt-in write micro-batching over one table. Writes are **not durable until
+/// flush** — the contract is the opposite of `put()`.
 #[napi]
 pub struct WriteBuffer {
-    db: Arc<Mutex<Table>>,
+    db: Arc<CoreDatabase>,
+    table_name: String,
     buffer: Vec<Vec<(u16, Value)>>,
     threshold: usize,
 }
 
 #[napi]
 impl WriteBuffer {
-    /// Create a new WriteBuffer. `threshold` rows trigger an auto-flush (default 1000).
+    /// Create a new WriteBuffer over a table. `threshold` rows trigger an auto-flush.
     #[napi(constructor)]
-    pub fn new(db: &Database, threshold: Option<u32>) -> Self {
+    pub fn new(table: &TableHandle, threshold: Option<u32>) -> Self {
         Self {
-            db: db.db.clone(),
+            db: Arc::clone(&table.db),
+            table_name: table.name.clone(),
             buffer: Vec::new(),
             threshold: threshold.unwrap_or(1000) as usize,
         }
@@ -675,8 +633,9 @@ impl WriteBuffer {
     #[napi]
     pub fn put(&mut self, cells: Vec<Cell>) -> napi::Result<Option<BigInt>> {
         let pair = {
-            let g = self.db.lock();
-            cell_pairs(&g, cells)?
+            let handle = self.db.table(&self.table_name).map_err(to_napi)?;
+            let g = handle.lock();
+            cell_pairs_table(&g, cells)?
         };
         self.buffer.push(pair);
         if self.buffer.len() >= self.threshold {
@@ -691,11 +650,12 @@ impl WriteBuffer {
     #[napi]
     pub fn flush(&mut self) -> napi::Result<BigInt> {
         if self.buffer.is_empty() {
-            let g = self.db.lock();
-            return Ok(BigInt::from(g.current_epoch().0));
+            let handle = self.db.table(&self.table_name).map_err(to_napi)?;
+            return Ok(BigInt::from(handle.lock().current_epoch().0));
         }
         let batch = std::mem::take(&mut self.buffer);
-        let mut g = self.db.lock();
+        let handle = self.db.table(&self.table_name).map_err(to_napi)?;
+        let mut g = handle.lock();
         g.put_batch(batch).map_err(to_napi)?;
         let epoch = g.commit().map_err(to_napi)?;
         Ok(BigInt::from(epoch.0))
@@ -709,7 +669,10 @@ fn arrow_from_native(
     use mongreldb_core::columnar::NativeColumn;
     use mongreldb_core::schema::TypeId;
     Ok(match (ty, col) {
-        (TypeId::Int64 | TypeId::TimestampNanos | TypeId::Date32, NativeColumn::Int64 { data, validity }) => {
+        (
+            TypeId::Int64 | TypeId::TimestampNanos | TypeId::Date32,
+            NativeColumn::Int64 { data, validity },
+        ) => {
             let buf: arrow::buffer::ScalarBuffer<_> = data.clone().into();
             let nulls = validity_to_nulls(validity, data.len());
             Arc::new(arrow::array::Int64Array::new(buf, nulls))
@@ -730,7 +693,14 @@ fn arrow_from_native(
             }
             Arc::new(b.finish())
         }
-        (_, NativeColumn::Bytes { offsets, values, validity }) => {
+        (
+            _,
+            NativeColumn::Bytes {
+                offsets,
+                values,
+                validity,
+            },
+        ) => {
             let n = offsets.len().saturating_sub(1);
             let mut b = arrow::array::StringBuilder::with_capacity(n, values.len());
             for i in 0..n {
@@ -835,52 +805,7 @@ impl RemoteDatabase {
     }
 }
 
-// ── Phase 20.4: Batched query results (streaming alternative) ─────────────
-
-/// Batched Arrow query (Phase 20.4): returns an array of Arrow IPC Buffers,
-/// one per page batch. Consumers process results incrementally without holding
-/// the full result in JS heap. This is the NAPI equivalent of a ReadableStream
-/// yielding one RecordBatch chunk per page.
-#[napi]
-impl Database {
-    pub fn query_arrow_batched(
-        &self,
-        conditions: Vec<ConditionSpec>,
-    ) -> napi::Result<Vec<Buffer>> {
-        let mut g = self.db.lock();
-        let mut q = Query::new();
-        for c in &conditions {
-            q = q.and(build_condition(c)?);
-        }
-        let snap = g.snapshot();
-        let schema = g.schema().clone();
-        let cols = g
-            .query_columns_native_cached(&q.conditions, None, snap)
-            .map_err(to_napi)?
-            .unwrap_or_default();
-        drop(g);
-
-        // Split into PAGE_BATCH_ROWS-sized chunks.
-        let total_rows = cols.first().map(|(_, c)| c.len()).unwrap_or(0);
-        if total_rows == 0 {
-            return Ok(Vec::new());
-        }
-        let chunk_size = 65_536usize;
-        let mut batches = Vec::new();
-        let mut start = 0;
-        while start < total_rows {
-            let end = (start + chunk_size).min(total_rows);
-            let chunk_cols: Vec<(u16, mongreldb_core::columnar::NativeColumn)> = cols
-                .iter()
-                .map(|(id, col)| (*id, col.slice_range(start, end)))
-                .collect();
-            let buf = native_cols_to_ipc(&chunk_cols, &schema)?;
-            batches.push(Buffer::from(buf));
-            start = end;
-        }
-        Ok(batches)
-    }
-}
+// ── Phase 20.4 helpers ────────────────────────────────────────────────────
 
 fn native_cols_to_ipc(
     cols: &[(u16, mongreldb_core::columnar::NativeColumn)],

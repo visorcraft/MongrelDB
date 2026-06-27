@@ -12,6 +12,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 mongreldb-core = { path = "../mongreldb-core" }
+mongreldb-query = { path = "../mongreldb-query" }
 napi = { version = "2", default-features = false, features = ["napi8", "tokio_rt"] }
 napi-derive = "2"
 parking_lot = "0.12"
