@@ -185,6 +185,12 @@ mod key {
             self.derive_subkey(b"mongreldb/run-mac/v1")
         }
 
+        /// Derive the meta DEK used to encrypt + authenticate DB-wide metadata
+        /// (catalog, manifest checkpoints). Mirrors [`Self::derive_idx_key`].
+        pub fn derive_meta_key(&self) -> Zeroizing<[u8; DEK_LEN]> {
+            self.derive_subkey(b"mongreldb/meta/v1")
+        }
+
         /// Wrap a 32-byte DEK with the KEK using AES-256-GCM. `wrap_nonce` must
         /// be unique per use under this KEK (a run's random `nonce_prefix`
         /// satisfies this).

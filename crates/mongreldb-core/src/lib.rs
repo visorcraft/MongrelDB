@@ -10,6 +10,7 @@
 
 pub mod be_tree;
 pub mod cache;
+pub mod catalog;
 pub mod columnar;
 pub mod compaction;
 pub mod cursor;
