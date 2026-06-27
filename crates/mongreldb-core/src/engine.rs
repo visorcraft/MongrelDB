@@ -990,7 +990,9 @@ impl Table {
         //    overwrite the older run versions in the HOT index.
         let mut staged_puts: HashMap<u64, Vec<Row>> = HashMap::new();
         let mut staged_deletes: HashMap<u64, Vec<RowId>> = HashMap::new();
-        let mut replayed_puts: Vec<Row> = Vec::new();
+        let mut replayed_puts: std::collections::BTreeMap<Epoch, Vec<Row>> =
+            std::collections::BTreeMap::new();
+        let mut replayed_deletes: Vec<(RowId, Epoch)> = Vec::new();
         let mut saw_delete = false;
         for record in replayed {
             let txn_id = record.txn_id;
@@ -1011,12 +1013,13 @@ impl Table {
                         for row in &puts {
                             memtable.upsert(row.clone());
                         }
-                        replayed_puts.extend(puts);
+                        replayed_puts.entry(commit_epoch).or_default().extend(puts);
                     }
                     if let Some(dels) = staged_deletes.remove(&txn_id) {
                         saw_delete = true;
                         for rid in dels {
                             memtable.tombstone(rid, commit_epoch);
+                            replayed_deletes.push((rid, commit_epoch));
                         }
                     }
                 }
@@ -1121,9 +1124,41 @@ impl Table {
             db.build_learned_ranges()?;
         }
 
-        // 3. Index the replayed (newest) WAL rows on top so updates overwrite.
-        for row in &replayed_puts {
-            db.index_row(row);
+        // 3. Index the replayed WAL rows on top so updates overwrite. Within a
+        //    single transaction epoch duplicate PKs are upserted: only the last
+        //    winner is indexed, losers are tombstoned in the already-replayed
+        //    memtable.
+        for (epoch, group) in replayed_puts {
+            let (losers, winner_pks) = db.partition_pk_winners(&group);
+            for (key, &row_id) in &winner_pks {
+                if let Some(old_rid) = db.hot.get(key) {
+                    if old_rid != row_id {
+                        db.tombstone_row(old_rid, epoch, false);
+                    }
+                }
+            }
+            for &loser_rid in &losers {
+                db.tombstone_row(loser_rid, epoch, false);
+            }
+            for (key, row_id) in winner_pks {
+                db.hot.insert(key, row_id);
+            }
+            if db.schema.primary_key().is_none() {
+                for r in &group {
+                    db.hot.insert(r.row_id.0.to_be_bytes().to_vec(), r.row_id);
+                }
+            }
+            for r in &group {
+                if !losers.contains(&r.row_id) {
+                    db.index_row(r);
+                }
+            }
+        }
+        // Apply replayed deletes after the puts: a delete targets a specific row
+        // id and only removes the HOT entry if it still points to that id, so a
+        // newer upsert for the same PK is not accidentally erased.
+        for (rid, epoch) in &replayed_deletes {
+            db.remove_hot_for_row(*rid, *epoch);
         }
 
         let _ = db.rebuild_reservoir();
@@ -1146,10 +1181,11 @@ impl Table {
     }
 
     fn rebuild_indexes_from_runs(&mut self) -> Result<()> {
+        self.hot = HotIndex::new();
         let snapshot = Epoch(u64::MAX);
         for rr in self.run_refs.clone() {
             let mut reader = self.open_reader(rr.run_id)?;
-            for row in reader.visible_versions(snapshot)? {
+            for row in reader.visible_rows(snapshot)? {
                 let tok_row = self.tokenized_for_indexes(&row);
                 index_into(
                     &self.schema,
@@ -1334,7 +1370,7 @@ impl Table {
         if self.is_shared() {
             self.pending_rows.extend(rows);
         } else {
-            self.apply_put_rows(rows);
+            self.apply_put_rows(rows)?;
         }
         Ok(())
     }
@@ -1343,7 +1379,8 @@ impl Table {
     /// live count WITHOUT appending to the per-table WAL (the WAL — shared or
     /// per-table — is the caller's responsibility). Used by the cross-table
     /// `Transaction` commit path (P2.5) after it has written the shared WAL.
-    pub(crate) fn apply_put_rows(&mut self, rows: Vec<Row>) {
+    pub(crate) fn apply_put_rows(&mut self, rows: Vec<Row>) -> Result<()> {
+        self.ensure_indexes_complete()?;
         let n = rows.len();
         // Track mutated columns for fine-grained cache invalidation (c).
         for r in &rows {
@@ -1351,28 +1388,43 @@ impl Table {
                 self.pending_put_cols.insert(cid);
             }
         }
-        if let Some(pk_col) = self.schema.primary_key() {
-            for r in &rows {
-                if let Some(pk_val) = r.columns.get(&pk_col.id) {
-                    let key = self.index_lookup_key(pk_col.id, pk_val);
-                    self.hot.insert(key, r.row_id);
+        let (losers, winner_pks) = self.partition_pk_winners(&rows);
+        let epoch = rows.first().map(|r| r.committed_epoch).unwrap_or(Epoch(0));
+        // Tombstone any pre-existing row that owns the same PK as a winner.
+        for (key, &row_id) in &winner_pks {
+            if let Some(old_rid) = self.hot.get(key) {
+                if old_rid != row_id {
+                    self.tombstone_row(old_rid, epoch, true);
                 }
             }
-        } else {
+        }
+        // Insert the winners into HOT.
+        for (key, row_id) in winner_pks {
+            self.hot.insert(key, row_id);
+        }
+        if self.schema.primary_key().is_none() {
             for r in &rows {
                 self.hot.insert(r.row_id.0.to_be_bytes().to_vec(), r.row_id);
             }
         }
+        // Index, sample, and materialize only the surviving rows.
         for r in &rows {
-            self.index_row(r);
+            if !losers.contains(&r.row_id) {
+                self.index_row(r);
+            }
         }
         for r in &rows {
-            self.reservoir.offer(r.row_id.0);
+            if !losers.contains(&r.row_id) {
+                self.reservoir.offer(r.row_id.0);
+            }
         }
         for r in rows {
-            self.memtable.upsert(r);
+            if !losers.contains(&r.row_id) {
+                self.memtable.upsert(r);
+            }
         }
-        self.live_count = self.live_count.saturating_add(n as u64);
+        self.live_count = self.live_count.saturating_add((n - losers.len()) as u64);
+        Ok(())
     }
 
     /// Allocate a fresh row id (advancing the table's allocator). Used by the
@@ -1388,33 +1440,51 @@ impl Table {
     /// scan/merge path reads at the run's commit epoch), so materializing them in
     /// the memtable too would defeat the point of spilling (peak memory stays
     /// bounded). Caller must have linked the run before reads can resolve indexes.
-    pub(crate) fn apply_run_metadata(&mut self, rows: &[Row]) {
+    pub(crate) fn apply_run_metadata(&mut self, rows: &[Row]) -> Result<()> {
+        self.ensure_indexes_complete()?;
         let n = rows.len();
         for r in rows {
             for &cid in r.columns.keys() {
                 self.pending_put_cols.insert(cid);
             }
         }
-        if let Some(pk_col) = self.schema.primary_key() {
-            for r in rows {
-                if let Some(pk_val) = r.columns.get(&pk_col.id) {
-                    let key = self.index_lookup_key(pk_col.id, pk_val);
-                    self.hot.insert(key, r.row_id);
+        let (losers, winner_pks) = self.partition_pk_winners(rows);
+        let epoch = rows.first().map(|r| r.committed_epoch).unwrap_or(Epoch(0));
+        // Tombstone pre-existing rows that conflict with winners.
+        for (key, &row_id) in &winner_pks {
+            if let Some(old_rid) = self.hot.get(key) {
+                if old_rid != row_id {
+                    self.tombstone_row(old_rid, epoch, true);
                 }
             }
-        } else {
+        }
+        // Hide duplicate-PK rows inside this uniform-epoch run by tombstoning
+        // their row ids in the memtable overlay (the overlay wins over the run).
+        for &loser_rid in &losers {
+            self.tombstone_row(loser_rid, epoch, false);
+        }
+        // Insert the winners into HOT.
+        for (key, row_id) in winner_pks {
+            self.hot.insert(key, row_id);
+        }
+        if self.schema.primary_key().is_none() {
             for r in rows {
                 self.hot.insert(r.row_id.0.to_be_bytes().to_vec(), r.row_id);
             }
         }
         for r in rows {
-            self.index_row(r);
             self.allocator.advance_to(r.row_id);
+            if !losers.contains(&r.row_id) {
+                self.index_row(r);
+            }
         }
         for r in rows {
-            self.reservoir.offer(r.row_id.0);
+            if !losers.contains(&r.row_id) {
+                self.reservoir.offer(r.row_id.0);
+            }
         }
-        self.live_count = self.live_count.saturating_add(n as u64);
+        self.live_count = self.live_count.saturating_add((n - losers.len()) as u64);
+        Ok(())
     }
 
     /// Apply already-committed puts + tombstones during shared-WAL recovery
@@ -1426,17 +1496,43 @@ impl Table {
         rows: Vec<Row>,
         deletes: Vec<(RowId, Epoch)>,
     ) -> Result<()> {
-        for row in &rows {
+        // Rows from different transactions have different epochs and can be
+        // upserted sequentially. Rows inside one transaction share an epoch, so
+        // duplicate PKs within that transaction must keep only the last winner.
+        let mut by_epoch: std::collections::BTreeMap<Epoch, Vec<Row>> =
+            std::collections::BTreeMap::new();
+        for row in rows {
             self.allocator.advance_to(row.row_id);
-            self.memtable.upsert(row.clone());
+            by_epoch.entry(row.committed_epoch).or_default().push(row);
+        }
+        for (epoch, group) in by_epoch {
+            let (losers, winner_pks) = self.partition_pk_winners(&group);
+            // Tombstone pre-existing PK owners.
+            for (key, &row_id) in &winner_pks {
+                if let Some(old_rid) = self.hot.get(key) {
+                    if old_rid != row_id {
+                        self.tombstone_row(old_rid, epoch, false);
+                    }
+                }
+            }
+            for (key, row_id) in winner_pks {
+                self.hot.insert(key, row_id);
+            }
+            if self.schema.primary_key().is_none() {
+                for r in &group {
+                    self.hot.insert(r.row_id.0.to_be_bytes().to_vec(), r.row_id);
+                }
+            }
+            for r in &group {
+                if !losers.contains(&r.row_id) {
+                    self.memtable.upsert(r.clone());
+                    self.index_row(r);
+                }
+            }
         }
         for (rid, epoch) in deletes {
             self.memtable.tombstone(rid, epoch);
-        }
-        // Index the recovered rows on top of the run-loaded data so the newest
-        // versions overwrite the older run versions in the HOT index.
-        for row in &rows {
-            self.index_row(row);
+            self.remove_hot_for_row(rid, epoch);
         }
         let _ = self.rebuild_reservoir();
         Ok(())
@@ -1465,14 +1561,120 @@ impl Table {
     /// Apply a tombstone (already-durable on the WAL) at `epoch` without
     /// appending to the per-table WAL. Used by the cross-table `Transaction`.
     pub(crate) fn apply_delete(&mut self, row_id: RowId, epoch: Epoch) {
-        self.memtable.tombstone(row_id, epoch);
-        self.live_count = self.live_count.saturating_sub(1);
+        self.remove_hot_for_row(row_id, epoch);
+        self.tombstone_row(row_id, epoch, true);
+    }
+
+    /// Tombstone `row_id` at `epoch`. When `adjust_live_count` is true the
+    /// table's `live_count` is decremented (used on the live write path); during
+    /// recovery the manifest is authoritative so the flag is false.
+    fn tombstone_row(&mut self, row_id: RowId, epoch: Epoch, adjust_live_count: bool) {
+        // Preserve the row's column values in the tombstone so HOT cleanup can
+        // recover the primary-key value even when the tombstone is replayed
+        // before index rebuilding.
+        let mut tombstone = Row {
+            row_id,
+            committed_epoch: epoch,
+            columns: std::collections::HashMap::new(),
+            deleted: true,
+        };
+        let before = Epoch(epoch.0.saturating_sub(1));
+        if let Some(live) = self.memtable.get(row_id, before) {
+            tombstone.columns = live.columns;
+        } else if let Some((_, live)) = self.mutable_run.get_version(row_id, before) {
+            if !live.deleted {
+                tombstone.columns = live.columns;
+            }
+        } else {
+            for rr in self.run_refs.clone() {
+                if let Ok(mut reader) = self.open_reader(rr.run_id) {
+                    if let Ok(Some((_, live))) = reader.get_version(row_id, before) {
+                        if !live.deleted {
+                            tombstone.columns = live.columns;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        self.memtable.upsert(tombstone);
+        if adjust_live_count {
+            self.live_count = self.live_count.saturating_sub(1);
+        }
         // Track for fine-grained cache invalidation (c).
         self.pending_delete_rids.insert(row_id.0 as u32);
         // A delete makes the incremental aggregate cache (row-id watermark
         // delta) unsafe — permanently disable it for this table.
         self.had_deletes = true;
         self.agg_cache.clear();
+    }
+
+    /// If `row_id` has a primary-key value and the HOT index currently maps
+    /// that PK to this row id, remove the entry. Keeps the PK→RowId mapping
+    /// consistent after deletes and before upserts.
+    fn remove_hot_for_row(&mut self, row_id: RowId, epoch: Epoch) {
+        let Some(pk_col) = self.schema.primary_key() else {
+            return;
+        };
+        // Use get_version (not get) so a tombstone that preserved its columns
+        // still reveals the primary-key value that HOT needs to clean up.
+        let pk_val = self
+            .memtable
+            .get_version(row_id, epoch)
+            .and_then(|(_, r)| r.columns.get(&pk_col.id).cloned())
+            .or_else(|| {
+                self.mutable_run
+                    .get_version(row_id, epoch)
+                    .filter(|(_, r)| !r.deleted)
+                    .and_then(|(_, r)| r.columns.get(&pk_col.id).cloned())
+            })
+            .or_else(|| {
+                self.run_refs.iter().find_map(|rr| {
+                    let mut reader = self.open_reader(rr.run_id).ok()?;
+                    let (_, r) = reader.get_version(row_id, epoch).ok()??;
+                    if r.deleted {
+                        return None;
+                    }
+                    r.columns.get(&pk_col.id).cloned()
+                })
+            });
+        if let Some(pk_val) = pk_val {
+            let key = self.index_lookup_key(pk_col.id, &pk_val);
+            if self.hot.get(&key) == Some(row_id) {
+                self.hot.remove(&key);
+            }
+        }
+    }
+
+    /// For a batch of rows that share the same commit epoch, decide which rows
+    /// win for each primary-key value. Returns the set of "loser" row ids that
+    /// must be skipped/overwritten, and a map from PK lookup key to the winning
+    /// row id. Rows without a PK value are always winners.
+    fn partition_pk_winners(
+        &self,
+        rows: &[Row],
+    ) -> (
+        std::collections::HashSet<RowId>,
+        std::collections::HashMap<Vec<u8>, RowId>,
+    ) {
+        let mut losers = std::collections::HashSet::new();
+        let Some(pk_col) = self.schema.primary_key() else {
+            return (losers, std::collections::HashMap::new());
+        };
+        let pk_id = pk_col.id;
+        let mut winners: std::collections::HashMap<Vec<u8>, RowId> =
+            std::collections::HashMap::new();
+        for r in rows {
+            let Some(pk_val) = r.columns.get(&pk_id) else {
+                continue;
+            };
+            let key = self.index_lookup_key(pk_id, pk_val);
+            if let Some(&old_rid) = winners.get(&key) {
+                losers.insert(old_rid);
+            }
+            winners.insert(key, r.row_id);
+        }
+        (losers, winners)
     }
 
     fn index_row(&mut self, row: &Row) {
@@ -1613,7 +1815,7 @@ impl Table {
             for r in &mut rows {
                 r.committed_epoch = new_epoch;
             }
-            self.apply_put_rows(rows);
+            self.apply_put_rows(rows)?;
         }
         let dels = std::mem::take(&mut self.pending_dels);
         for rid in dels {

@@ -229,7 +229,7 @@ fn rowid_never_reused_after_delete() -> mongreldb_core::Result<()> {
     db.commit()?;
 
     let max_old = ids.iter().map(|r| r.0).max().unwrap();
-    let new_ids: Vec<RowId> = (0..3).map(|_| db.put(row(100, 100)).unwrap()).collect();
+    let new_ids: Vec<RowId> = (0..3).map(|i| db.put(row(100 + i, 100)).unwrap()).collect();
     db.commit()?;
 
     for rid in &new_ids {
@@ -329,7 +329,7 @@ fn interleaved_batch_and_single_puts() -> mongreldb_core::Result<()> {
 }
 
 #[test]
-fn duplicate_pk_creates_multiple_visible_rows() -> mongreldb_core::Result<()> {
+fn duplicate_pk_upserts_to_single_visible_row() -> mongreldb_core::Result<()> {
     let dir = tempdir()?;
     let mut db = Table::create(&dir, test_schema(), 1)?;
 
@@ -340,11 +340,11 @@ fn duplicate_pk_creates_multiple_visible_rows() -> mongreldb_core::Result<()> {
     let rows = db.visible_rows(db.snapshot())?;
     assert_eq!(
         rows.len(),
-        2,
+        1,
         "duplicate PK produced {} visible rows",
         rows.len()
     );
-    assert_eq!(db.count(), 2);
+    assert_eq!(db.count(), 1);
 
     let latest = db
         .lookup_pk(&Value::Int64(42).encode_key())

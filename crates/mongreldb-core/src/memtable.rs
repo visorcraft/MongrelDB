@@ -118,12 +118,18 @@ impl Memtable {
         self.tree.insert_row(row);
     }
 
-    /// Append a tombstone version for `row_id` at `epoch`.
+    /// Append a tombstone version for `row_id` at `epoch`. The tombstone copies
+    /// the columns from the newest live version so that engine-level HOT cleanup
+    /// can recover the primary-key value during WAL replay.
     pub fn tombstone(&mut self, row_id: RowId, epoch: Epoch) {
+        let mut columns = HashMap::new();
+        if let Some(live) = self.get(row_id, Epoch(epoch.0.saturating_sub(1))) {
+            columns = live.columns;
+        }
         let row = Row {
             row_id,
             committed_epoch: epoch,
-            columns: HashMap::new(),
+            columns,
             deleted: true,
         };
         self.upsert(row);

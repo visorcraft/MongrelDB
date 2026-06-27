@@ -429,19 +429,22 @@ fn partial_column_puts_store_nulls() {
 }
 
 #[test]
-fn duplicate_pk_without_delete_creates_two_visible_rows() {
+fn duplicate_pk_upserts_to_single_visible_row() {
     let dir = tempdir().unwrap();
     let mut t = Table::create(dir.path(), base_schema(), 1).unwrap();
 
     let first = put2(&mut t, 42, 100);
-    let second = put2(&mut t, 42, 200); // same PK value
+    let second = put2(&mut t, 42, 200); // same PK value: should upsert
     t.commit().unwrap();
 
-    // The table tracks two live rows internally.
-    assert_eq!(t.count(), 2);
-    assert_eq!(t.visible_rows(t.snapshot()).unwrap().len(), 2);
+    // Only the latest version of a primary key is visible.
+    assert_eq!(t.count(), 1, "duplicate PK must not create two live rows");
+    assert_eq!(
+        t.visible_rows(t.snapshot()).unwrap().len(),
+        1,
+        "only the upserted row is visible"
+    );
 
-    // But the PK index only knows the latest one.
     let pk_lookup = t.lookup_pk(&42i64.to_be_bytes());
     assert_eq!(
         pk_lookup,
@@ -449,18 +452,38 @@ fn duplicate_pk_without_delete_creates_two_visible_rows() {
         "PK lookup returns the latest row id"
     );
 
-    // The older row is still visible through scan but not through PK.
     let rows = snapshot_values(&t);
-    let ids: Vec<u64> = rows.iter().map(|(rid, _)| *rid).collect();
-    assert!(ids.contains(&first.0));
-    assert!(ids.contains(&second.0));
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, second.0);
+    assert!(!rows.iter().any(|(rid, _)| *rid == first.0));
 
-    // Reopen should preserve both rows and the latest PK mapping.
+    // Reopen must preserve the upsert semantics.
     drop(t);
     let t = Table::open(dir.path()).unwrap();
-    assert_eq!(t.count(), 2);
-    assert_eq!(t.visible_rows(t.snapshot()).unwrap().len(), 2);
+    assert_eq!(t.count(), 1);
+    assert_eq!(t.visible_rows(t.snapshot()).unwrap().len(), 1);
     assert_eq!(t.lookup_pk(&42i64.to_be_bytes()), Some(second));
+}
+
+#[test]
+fn duplicate_pk_across_commits_upserts() {
+    let dir = tempdir().unwrap();
+    let mut t = Table::create(dir.path(), base_schema(), 1).unwrap();
+
+    let first = put2(&mut t, 7, 100);
+    t.commit().unwrap();
+
+    let second = put2(&mut t, 7, 200);
+    t.commit().unwrap();
+
+    assert_eq!(t.count(), 1);
+    assert_eq!(t.visible_rows(t.snapshot()).unwrap().len(), 1);
+    assert_eq!(t.lookup_pk(&7i64.to_be_bytes()), Some(second));
+
+    let rows = snapshot_values(&t);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, second.0);
+    assert!(!rows.iter().any(|(rid, _)| *rid == first.0));
 }
 
 #[test]
@@ -785,4 +808,103 @@ fn query_results_preserved_after_reopen() {
         sorted.sort_unstable();
         assert_eq!(sorted, (0..50).collect::<Vec<i64>>());
     }
+}
+
+#[test]
+fn duplicate_pk_inside_put_batch_upserts() {
+    let dir = tempdir().unwrap();
+    let mut t = Table::create(dir.path(), base_schema(), 1).unwrap();
+
+    let batch = vec![
+        vec![(1, Value::Int64(5)), (2, Value::Int64(100))],
+        vec![(1, Value::Int64(5)), (2, Value::Int64(200))],
+    ];
+    let ids = t.put_batch(batch).unwrap();
+    t.commit().unwrap();
+
+    assert_eq!(t.count(), 1, "duplicate PK inside put_batch must upsert");
+    assert_eq!(t.visible_rows(t.snapshot()).unwrap().len(), 1);
+    assert_eq!(t.lookup_pk(&5i64.to_be_bytes()), Some(ids[1]));
+
+    let rows = t.visible_rows(t.snapshot()).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].columns.get(&2), Some(&Value::Int64(200)));
+}
+
+#[test]
+fn bulk_load_then_put_same_pk_upserts() {
+    let dir = tempdir().unwrap();
+    let mut t = Table::create(dir.path(), base_schema(), 1).unwrap();
+
+    let batch: Vec<Vec<(u16, Value)>> = (0..100)
+        .map(|i| vec![(1, Value::Int64(i)), (2, Value::Int64(i * 10))])
+        .collect();
+    t.bulk_load(batch).unwrap();
+
+    let updated = put2(&mut t, 50, 999);
+    t.commit().unwrap();
+
+    assert_eq!(t.count(), 100, "bulk load + put must keep 100 visible rows");
+    assert_eq!(t.visible_rows(t.snapshot()).unwrap().len(), 100);
+    assert_eq!(t.lookup_pk(&50i64.to_be_bytes()), Some(updated));
+
+    let rows = snapshot_values(&t);
+    assert_eq!(rows.len(), 100);
+    let row50 = rows.iter().find(|(_, id)| *id == 50).copied().unwrap();
+    assert_eq!(row50.0, updated.0);
+}
+
+#[test]
+fn delete_then_flush_then_reopen_hot_consistent() {
+    let dir = tempdir().unwrap();
+    let rid = {
+        let mut t = Table::create(dir.path(), base_schema(), 1).unwrap();
+        let rid = put2(&mut t, 1, 10);
+        t.commit().unwrap();
+        t.delete(rid).unwrap();
+        t.commit().unwrap();
+        t.flush().unwrap();
+        rid
+    };
+    let t = Table::open(dir.path()).unwrap();
+    assert_eq!(t.count(), 0);
+    assert_eq!(t.visible_rows(t.snapshot()).unwrap().len(), 0);
+    assert_eq!(t.lookup_pk(&1i64.to_be_bytes()), None);
+
+    // New put for the same PK must succeed and be visible.
+    let mut t = t;
+    let rid2 = put2(&mut t, 1, 20);
+    t.commit().unwrap();
+    assert_eq!(t.count(), 1);
+    assert_eq!(t.lookup_pk(&1i64.to_be_bytes()), Some(rid2));
+    assert_ne!(rid2.0, rid.0);
+}
+
+#[test]
+fn delete_then_spill_then_reopen_with_invalid_checkpoint_hot_clean() {
+    let dir = tempdir().unwrap();
+    let rid = {
+        let mut t = Table::create(dir.path(), base_schema(), 1).unwrap();
+        t.set_mutable_run_spill_bytes(1);
+        let rid = put2(&mut t, 1, 10);
+        t.commit().unwrap();
+        t.delete(rid).unwrap();
+        t.commit().unwrap();
+        t.flush().unwrap();
+        rid
+    };
+    // Force a rebuild from runs by removing the persisted index checkpoint.
+    let _ = std::fs::remove_dir_all(dir.path().join("_idx"));
+
+    let t = Table::open(dir.path()).unwrap();
+    assert_eq!(t.count(), 0);
+    assert_eq!(t.visible_rows(t.snapshot()).unwrap().len(), 0);
+    assert_eq!(t.lookup_pk(&1i64.to_be_bytes()), None);
+
+    let mut t = t;
+    let rid2 = put2(&mut t, 1, 20);
+    t.commit().unwrap();
+    assert_eq!(t.count(), 1);
+    assert_eq!(t.lookup_pk(&1i64.to_be_bytes()), Some(rid2));
+    assert_ne!(rid2.0, rid.0);
 }

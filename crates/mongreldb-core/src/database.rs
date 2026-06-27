@@ -638,7 +638,7 @@ impl Database {
                     // materializing them in the memtable (P3.4): they are served
                     // from the linked uniform-epoch run, read at `new_epoch` via
                     // the RunRef. This keeps peak memory bounded for large txns.
-                    t.apply_run_metadata(&s.rows);
+                    t.apply_run_metadata(&s.rows)?;
                     t.invalidate_pending_cache();
                     t.persist_manifest(new_epoch)?;
                 }
@@ -649,7 +649,7 @@ impl Database {
                     let mut t = handle.lock();
                     for op in ops {
                         match op {
-                            StagedOp::Put(row) => t.apply_put_rows(vec![row]),
+                            StagedOp::Put(row) => t.apply_put_rows(vec![row])?,
                             StagedOp::Delete(rid) => t.apply_delete(rid, new_epoch),
                         }
                     }
