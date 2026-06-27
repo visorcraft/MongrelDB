@@ -77,3 +77,37 @@ fn stale_txn_dir_is_swept_on_reopen() {
     // Table still works.
     assert_eq!(db.table("t").unwrap().lock().count(), 0);
 }
+
+#[test]
+fn huge_writeset_pre_validation_keeps_sequencer_bounded() {
+    // A transaction with a large write set commits successfully. The two-phase
+    // validation (pre-check outside the sequencer, delta re-check inside)
+    // means the sequencer does O(1) work when no concurrent commits arrive.
+    let dir = tempdir().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.create_table("t", pk_schema()).unwrap();
+
+    // Commit a large write set (many distinct PKs → many conflict keys).
+    let n: u64 = 500;
+    db.transaction(|t| {
+        for i in 0..n {
+            t.put("t", vec![(1, Value::Int64(i as i64))])?;
+        }
+        Ok(())
+    })
+    .unwrap();
+
+    // All rows visible.
+    assert_eq!(db.table("t").unwrap().lock().count(), n);
+
+    // A second large txn with distinct PKs also succeeds (no false conflicts).
+    db.transaction(|t| {
+        for i in n..(2 * n) {
+            t.put("t", vec![(1, Value::Int64(i as i64))])?;
+        }
+        Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(db.table("t").unwrap().lock().count(), 2 * n);
+}

@@ -343,6 +343,16 @@ impl Database {
             self.conflicts.prune_below(Epoch(min_active));
         }
 
+        // ── 1a. Pre-validate the full write-set OUTSIDE the sequencer (spec
+        // §8.5, review fix #17). Snapshot the conflict-index version so the
+        // sequencer only re-checks if new commits arrived in the interim.
+        if self.conflicts.conflicts(&write_keys, read_epoch) {
+            return Err(MongrelError::Conflict(
+                "write-write conflict (pre-validate, first-committer-wins)".into(),
+            ));
+        }
+        let pre_validate_version = self.conflicts.version();
+
         // ── 1b. Spill: if a table's staged puts exceed the threshold, write a
         // uniform-epoch pending run (spec §8.5). Rows in the run are NOT
         // streamed as Put records; they are linked at publish time.
@@ -431,10 +441,15 @@ impl Database {
         let (new_epoch, applies) = {
             let mut wal = self.shared_wal.lock();
 
-            // Validate first — abort on conflict, no epoch consumed.
-            if self.conflicts.conflicts(&write_keys, read_epoch) {
+            // Re-check only if the conflict index advanced since pre-validation
+            // (bounded delta — spec §8.5, review fix #17). If the version is
+            // unchanged, the pre-check result is still valid and the sequencer
+            // does O(1) work regardless of write-set size.
+            if self.conflicts.version() != pre_validate_version
+                && self.conflicts.conflicts(&write_keys, read_epoch)
+            {
                 return Err(MongrelError::Conflict(
-                    "write-write conflict (first-committer-wins)".into(),
+                    "write-write conflict (sequencer delta re-check)".into(),
                 ));
             }
 

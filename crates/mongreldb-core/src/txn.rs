@@ -172,13 +172,25 @@ const CONFLICT_SHARDS: usize = 16;
 /// drops entries below `min(active read_epoch)`.
 pub struct ConflictIndex {
     shards: [parking_lot::Mutex<HashMap<WriteKey, u64>>; CONFLICT_SHARDS],
+    /// Bumped on every `record()` so pre-validation can detect whether new
+    /// commits arrived between the pre-check and the sequencer (spec §8.5,
+    /// review fix #17).
+    version: std::sync::atomic::AtomicU64,
 }
 
 impl ConflictIndex {
     pub fn new() -> Self {
         Self {
             shards: std::array::from_fn(|_| parking_lot::Mutex::new(HashMap::new())),
+            version: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Current version (incremented on every `record`). Used by the two-phase
+    /// validation: pre-validate + snapshot version → sequencer re-checks only
+    /// if the version advanced.
+    pub fn version(&self) -> u64 {
+        self.version.load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn shard(&self, key: &WriteKey) -> &parking_lot::Mutex<HashMap<WriteKey, u64>> {
@@ -204,11 +216,12 @@ impl ConflictIndex {
 
     /// Record every write-set key at `commit_epoch`.
     pub fn record(&self, keys: &[WriteKey], commit_epoch: Epoch) {
-        // Group keys by shard to minimize lock acquisitions.
         for k in keys {
             let s = self.shard(k);
             s.lock().insert(k.clone(), commit_epoch.0);
         }
+        self.version
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     /// Drop entries whose `commit_epoch < min_active` (they can never cause a
