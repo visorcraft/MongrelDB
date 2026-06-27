@@ -136,10 +136,28 @@ impl EpochAuthority {
         self.visible.store(e.0, Ordering::Release);
     }
 
+    /// Monotonically raise both counters to at least `e` (used while opening
+    /// tables that share one authority — each advances the shared clock to its
+    /// own manifest epoch; the max wins).
+    pub fn advance_recovered(&self, e: Epoch) {
+        raise_to(&self.assigned, e.0);
+        raise_to(&self.visible, e.0);
+    }
+
     /// The current `assigned` counter (test/diagnostic use).
     #[inline]
     pub fn assigned(&self) -> Epoch {
         Epoch(self.assigned.load(Ordering::Acquire))
+    }
+}
+
+fn raise_to(cell: &AtomicU64, target: u64) {
+    let mut cur = cell.load(Ordering::Acquire);
+    while target > cur {
+        match cell.compare_exchange_weak(cur, target, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => break,
+            Err(actual) => cur = actual,
+        }
     }
 }
 

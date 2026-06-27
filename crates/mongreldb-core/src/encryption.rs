@@ -608,6 +608,18 @@ pub fn build_run_cipher(_kek: &Kek, _descriptor_bytes: &[u8]) -> crate::Result<R
     unreachable!("Kek is unconstructable without the encryption feature")
 }
 
+/// Derive the DB-wide meta DEK from an optional KEK. `None` when the KEK is
+/// absent (plaintext DB) or when encryption is disabled at compile time.
+#[cfg(feature = "encryption")]
+pub fn meta_dek_for(kek: Option<&Kek>) -> Option<[u8; DEK_LEN]> {
+    kek.map(|k| *k.derive_meta_key())
+}
+
+#[cfg(not(feature = "encryption"))]
+pub fn meta_dek_for(_kek: Option<&Kek>) -> Option<[u8; DEK_LEN]> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

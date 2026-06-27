@@ -11,7 +11,7 @@ use crate::columnar;
 use crate::cursor::NativePageCursor;
 use crate::encryption::Kek;
 use crate::encryption::DEK_LEN;
-use crate::epoch::{Epoch, EpochClock, Snapshot};
+use crate::epoch::{Epoch, EpochAuthority, Snapshot};
 use crate::global_idx;
 use crate::index::{AnnIndex, BitmapIndex, ColumnLearnedRange, FmIndex, HotIndex, SparseIndex};
 use crate::manifest::{self, Manifest, RunRef};
@@ -35,8 +35,8 @@ pub const RCACHE_DIR: &str = "_rcache";
 pub const KEYS_FILENAME: &str = "keys";
 pub const SCHEMA_FILENAME: &str = "schema.json";
 const DEFAULT_SYNC_BYTE_THRESHOLD: u64 = 0; // manual commit only (pure group commit)
-const PAGE_CACHE_CAPACITY: u64 = 64 * 1024 * 1024; // 64 MiB shared page cache
-const DECODED_CACHE_CAPACITY: u64 = 64 * 1024 * 1024; // 64 MiB shared decoded-page cache (Phase 15.4)
+pub(crate) const PAGE_CACHE_CAPACITY: u64 = 64 * 1024 * 1024; // 64 MiB shared page cache
+pub(crate) const DECODED_CACHE_CAPACITY: u64 = 64 * 1024 * 1024; // 64 MiB shared decoded-page cache (Phase 15.4)
 /// Default byte watermark at which the PMA mutable-run tier spills to an
 /// immutable `.sr` sorted run (Phase 11.1). Coalesces many small flushes into
 /// one larger run so the read path merges fewer readers.
@@ -59,7 +59,10 @@ pub struct Table {
     /// higher = better ratio but slower compaction).
     compaction_zstd_level: i32,
     allocator: RowIdAllocator,
-    clock: EpochClock,
+    epoch: Arc<EpochAuthority>,
+    /// Manifest-endorsed epoch at open; used to seed the (shared) epoch
+    /// authority on a fresh open. Updated whenever the manifest is persisted.
+    persisted_epoch: u64,
     schema: Schema,
     hot: HotIndex,
     /// Table Key-Encryption Key (Argon2id+HKDF from the passphrase). Each run
@@ -108,6 +111,10 @@ pub struct Table {
     /// Shared, MVCC content-addressed page cache (Phase 9.2). Fed by every
     /// `RunReader::read_page` so all readers share raw (decrypted) page bytes.
     page_cache: Arc<parking_lot::Mutex<crate::cache::PageCache>>,
+    /// Global snapshot-retention registry shared across all tables in a
+    /// `Database`. Single-table direct opens get a private one.
+    #[allow(dead_code)]
+    snapshots: Arc<crate::retention::SnapshotRegistry>,
     /// Shared decoded-page cache (Phase 15.4): the post-decompress/decrypt typed
     /// page, so repeat scans skip decode. Keyed by `(run_id, column_id, page)`.
     decoded_cache: Arc<parking_lot::Mutex<crate::cache::DecodedPageCache>>,
@@ -635,9 +642,44 @@ fn build_column_keys(kek: Option<&Kek>, schema: &Schema) -> HashMap<u16, ([u8; 3
     }
 }
 
+/// Shared services injected into every `Table` owned by a `Database`: one epoch
+/// authority (single commit clock), one raw-page cache, one decoded-page cache,
+/// one snapshot-retention registry, and the DB-wide KEK. A directly-opened
+/// single table builds a private `SharedCtx` of its own.
+pub(crate) struct SharedCtx {
+    pub epoch: Arc<EpochAuthority>,
+    pub page_cache: Arc<parking_lot::Mutex<crate::cache::PageCache>>,
+    pub decoded_cache: Arc<parking_lot::Mutex<crate::cache::DecodedPageCache>>,
+    pub snapshots: Arc<crate::retention::SnapshotRegistry>,
+    pub kek: Option<Arc<Kek>>,
+}
+
+impl SharedCtx {
+    /// Build a fresh private context. `cache_dir = Some(_)` enables on-disk page
+    /// cache persistence (single-table direct open); `None` keeps it in-memory
+    /// (shared across tables in a `Database`).
+    pub(crate) fn new(kek: Option<Arc<Kek>>, cache_dir: Option<PathBuf>) -> Self {
+        let mut cache = crate::cache::PageCache::new(PAGE_CACHE_CAPACITY);
+        if let Some(d) = cache_dir {
+            cache = cache.with_persistence(d);
+        }
+        Self {
+            epoch: Arc::new(EpochAuthority::new(0)),
+            page_cache: Arc::new(parking_lot::Mutex::new(cache)),
+            decoded_cache: Arc::new(parking_lot::Mutex::new(
+                crate::cache::DecodedPageCache::new(DECODED_CACHE_CAPACITY),
+            )),
+            snapshots: Arc::new(crate::retention::SnapshotRegistry::new()),
+            kek,
+        }
+    }
+}
+
 impl Table {
     pub fn create(dir: impl AsRef<Path>, schema: Schema, table_id: u64) -> Result<Self> {
-        Self::create_inner(dir, schema, table_id, None)
+        let dir = dir.as_ref().to_path_buf();
+        let ctx = SharedCtx::new(None, Some(dir.join(CACHE_DIR)));
+        Self::create_in(&dir, schema, table_id, ctx)
     }
 
     /// Create a new encrypted table, deriving the table Key-Encryption Key
@@ -662,7 +704,8 @@ impl Table {
         let salt = crate::encryption::random_salt();
         std::fs::write(dir.join(META_DIR).join(KEYS_FILENAME), salt)?;
         let kek: Arc<Kek> = Arc::new(Kek::derive(passphrase, &salt)?);
-        Self::create_inner(dir, schema, table_id, Some(kek))
+        let ctx = SharedCtx::new(Some(kek), Some(dir.to_path_buf().join(CACHE_DIR)));
+        Self::create_in(dir, schema, table_id, ctx)
     }
 
     /// Create a new encrypted table using a raw key (e.g. from a key file)
@@ -681,7 +724,8 @@ impl Table {
         let salt = crate::encryption::random_salt();
         std::fs::write(dir.join(META_DIR).join(KEYS_FILENAME), salt)?;
         let kek: Arc<Kek> = Arc::new(Kek::from_raw_key(key, &salt)?);
-        Self::create_inner(dir, schema, table_id, Some(kek))
+        let ctx = SharedCtx::new(Some(kek), Some(dir.to_path_buf().join(CACHE_DIR)));
+        Self::create_in(dir, schema, table_id, ctx)
     }
 
     /// Open an existing encrypted table using a raw key.
@@ -705,20 +749,21 @@ impl Table {
         let mut salt = [0u8; crate::encryption::SALT_LEN];
         salt.copy_from_slice(&salt_bytes);
         let kek = Arc::new(Kek::from_raw_key(key, &salt)?);
-        Self::open_with_cipher(dir, Some(kek))
+        let ctx = SharedCtx::new(Some(kek), Some(dir.to_path_buf().join(CACHE_DIR)));
+        Self::open_in(dir, ctx)
     }
 
-    fn create_inner(
+    pub(crate) fn create_in(
         dir: impl AsRef<Path>,
         schema: Schema,
         table_id: u64,
-        kek: Option<Arc<Kek>>,
+        ctx: SharedCtx,
     ) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(dir.join(WAL_DIR))?;
         std::fs::create_dir_all(dir.join(RUNS_DIR))?;
         write_schema(&dir, &schema)?;
-        let (wal_dek, cache_dek) = derive_subkeys(kek.as_deref());
+        let (wal_dek, cache_dek) = derive_subkeys(ctx.kek.as_deref());
         let mut wal = if let Some(ref dk) = wal_dek {
             Wal::create_with_cipher(
                 dir.join(WAL_DIR).join("seg-000000.wal"),
@@ -732,8 +777,7 @@ impl Table {
         let mut manifest = Manifest::new(table_id, schema.schema_id);
         manifest::write_atomic(&dir, &mut manifest)?;
         let (bitmap, ann, fm, sparse) = empty_indexes(&schema);
-        let column_keys = build_column_keys(kek.as_deref(), &schema);
-        let cache_dir = dir.join(CACHE_DIR);
+        let column_keys = build_column_keys(ctx.kek.as_deref(), &schema);
         let rcache_dir = dir.join(RCACHE_DIR);
         Ok(Self {
             dir,
@@ -744,10 +788,11 @@ impl Table {
             mutable_run_spill_bytes: DEFAULT_MUTABLE_RUN_SPILL_BYTES,
             compaction_zstd_level: 3,
             allocator: RowIdAllocator::new(0),
-            clock: EpochClock::new(0),
+            epoch: ctx.epoch,
+            persisted_epoch: 0,
             schema,
             hot: HotIndex::new(),
-            kek,
+            kek: ctx.kek,
             column_keys,
             run_refs: Vec::new(),
             next_run_id: 1,
@@ -764,12 +809,9 @@ impl Table {
             agg_cache: HashMap::new(),
             global_idx_epoch: 0,
             indexes_complete: true,
-            page_cache: Arc::new(parking_lot::Mutex::new(
-                crate::cache::PageCache::new(PAGE_CACHE_CAPACITY).with_persistence(cache_dir),
-            )),
-            decoded_cache: Arc::new(parking_lot::Mutex::new(
-                crate::cache::DecodedPageCache::new(DECODED_CACHE_CAPACITY),
-            )),
+            page_cache: ctx.page_cache,
+            decoded_cache: ctx.decoded_cache,
+            snapshots: ctx.snapshots,
             result_cache: Arc::new(parking_lot::Mutex::new(
                 ResultCache::new()
                     .with_dir(rcache_dir)
@@ -785,7 +827,9 @@ impl Table {
     /// into the memtable, and rebuild the HOT + secondary indexes from the runs
     /// and replayed rows.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
-        Self::open_with_cipher(dir, None)
+        let dir = dir.as_ref();
+        let ctx = SharedCtx::new(None, Some(dir.to_path_buf().join(CACHE_DIR)));
+        Self::open_in(dir, ctx)
     }
 
     /// Open an existing encrypted table. `passphrase` must match the one used at
@@ -810,16 +854,18 @@ impl Table {
         let mut salt = [0u8; 16];
         salt.copy_from_slice(&salt_bytes);
         let kek: Arc<Kek> = Arc::new(Kek::derive(passphrase, &salt)?);
-        Self::open_with_cipher(dir, Some(kek))
+        let ctx = SharedCtx::new(Some(kek), Some(dir.to_path_buf().join(CACHE_DIR)));
+        let t = Self::open_in(dir, ctx)?;
+        Ok(t)
     }
 
-    fn open_with_cipher(dir: impl AsRef<Path>, kek: Option<Arc<Kek>>) -> Result<Self> {
+    pub(crate) fn open_in(dir: impl AsRef<Path>, ctx: SharedCtx) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         let manifest = manifest::read(&dir)?;
         let schema: Schema = read_schema(&dir)?;
         let active = latest_wal_segment(&dir.join(WAL_DIR))?;
         let replay_epoch = Epoch(manifest.current_epoch);
-        let (wal_dek, cache_dek) = derive_subkeys(kek.as_deref());
+        let (wal_dek, cache_dek) = derive_subkeys(ctx.kek.as_deref());
         // Replay BEFORE truncating: `Wal::create` would erase the segment.
         let replayed = match &active {
             Some(path) => {
@@ -844,7 +890,7 @@ impl Table {
 
         let mut memtable = Memtable::new();
         let mut allocator = RowIdAllocator::new(manifest.next_row_id);
-        let clock = EpochClock::new(manifest.current_epoch);
+        let persisted_epoch = manifest.current_epoch;
 
         // 1. Apply the replayed records to the memtable + allocator, collecting
         //    the Put rows for index insertion. Indexing happens AFTER loading
@@ -873,9 +919,8 @@ impl Table {
             }
         }
 
-        let cache_dir = dir.join(CACHE_DIR);
         let rcache_dir = dir.join(RCACHE_DIR);
-        let column_keys = build_column_keys(kek.as_deref(), &schema);
+        let column_keys = build_column_keys(ctx.kek.as_deref(), &schema);
         let mut db = Self {
             dir,
             table_id: manifest.table_id,
@@ -885,10 +930,11 @@ impl Table {
             mutable_run_spill_bytes: DEFAULT_MUTABLE_RUN_SPILL_BYTES,
             compaction_zstd_level: 3,
             allocator,
-            clock,
+            epoch: ctx.epoch,
+            persisted_epoch,
             schema,
             hot: HotIndex::new(),
-            kek,
+            kek: ctx.kek,
             column_keys,
             run_refs: manifest.runs.clone(),
             next_run_id: manifest
@@ -910,12 +956,9 @@ impl Table {
             agg_cache: HashMap::new(),
             global_idx_epoch: manifest.global_idx_epoch,
             indexes_complete: true,
-            page_cache: Arc::new(parking_lot::Mutex::new(
-                crate::cache::PageCache::new(PAGE_CACHE_CAPACITY).with_persistence(cache_dir),
-            )),
-            decoded_cache: Arc::new(parking_lot::Mutex::new(
-                crate::cache::DecodedPageCache::new(DECODED_CACHE_CAPACITY),
-            )),
+            page_cache: ctx.page_cache,
+            decoded_cache: ctx.decoded_cache,
+            snapshots: ctx.snapshots,
             result_cache: Arc::new(parking_lot::Mutex::new(
                 ResultCache::new()
                     .with_dir(rcache_dir)
@@ -925,6 +968,10 @@ impl Table {
             pending_put_cols: std::collections::HashSet::new(),
             wal_dek,
         };
+
+        // Advance the (possibly shared) epoch authority to this table's manifest
+        // epoch so rebuild/index reads below observe the recovered watermark.
+        db.epoch.advance_recovered(Epoch(db.persisted_epoch));
 
         // 2. Fast path: load the persisted global-index checkpoint (Phase 9.1).
         //    Valid only when its embedded epoch matches the manifest-endorsed
@@ -1081,7 +1128,7 @@ impl Table {
     }
 
     fn pending_epoch(&self) -> Epoch {
-        Epoch(self.clock.now().0 + 1)
+        Epoch(self.epoch.visible().0 + 1)
     }
 
     /// Upsert a row. Allocates a [`RowId`], appends a (non-fsynced) WAL record,
@@ -1227,7 +1274,7 @@ impl Table {
     /// become durable and visible, and persist the manifest.
     pub fn commit(&mut self) -> Result<Epoch> {
         self.wal.sync()?;
-        let new_epoch = self.clock.bump();
+        let new_epoch = self.epoch.bump_assigned();
         // Hardening (c): fine-grained invalidation replaces the whole-cache
         // wipe. Only entries whose footprint intersects a deleted RowId, or
         // whose condition-columns intersect a mutated column, are dropped.
@@ -1237,6 +1284,7 @@ impl Table {
         self.pending_delete_rids.clear();
         self.pending_put_cols.clear();
         self.persist_manifest(new_epoch)?;
+        self.epoch.publish_visible(new_epoch);
         Ok(new_epoch)
     }
 
@@ -1464,7 +1512,7 @@ impl Table {
     pub(crate) fn invalidate_index_checkpoint(&mut self) {
         self.global_idx_epoch = 0;
         global_idx::remove(&self.dir);
-        let _ = self.persist_manifest(self.clock.now());
+        let _ = self.persist_manifest(self.epoch.visible());
     }
 
     /// Read the row at `row_id` visible to `snapshot`, merging the newest
@@ -2060,13 +2108,13 @@ impl Table {
     }
 
     pub fn snapshot(&self) -> Snapshot {
-        self.clock.snapshot()
+        Snapshot::at(self.epoch.visible())
     }
 
     /// Pin the current epoch as a read snapshot; compaction will preserve the
     /// versions it needs until [`Table::unpin_snapshot`] is called.
     pub fn pin_snapshot(&mut self) -> Snapshot {
-        let e = self.clock.now();
+        let e = self.epoch.visible();
         *self.pinned.entry(e).or_insert(0) += 1;
         Snapshot::at(e)
     }
@@ -2087,7 +2135,14 @@ impl Table {
     }
 
     pub fn current_epoch(&self) -> Epoch {
-        self.clock.now()
+        self.epoch.visible()
+    }
+
+    /// The manifest-endorsed epoch captured at open (used to seed the shared
+    /// epoch authority when mounted in a `Database`).
+    #[allow(dead_code)]
+    pub(crate) fn persisted_epoch(&self) -> u64 {
+        self.persisted_epoch
     }
 
     pub fn memtable_len(&self) -> usize {
