@@ -322,7 +322,7 @@ async fn count_star_matches_native_count() {
     let batches = session.run("select count(*) from t").await.unwrap();
     let sql_count = i64_scalar(&batches);
 
-    let mut db = session.db().unwrap().lock();
+    let db = session.db().unwrap().lock();
     let native_count = db.count();
     drop(db);
 
@@ -658,11 +658,24 @@ async fn table_session_cache_invalidates_after_commit() {
     let first = session.run("select count(*) from t").await.unwrap();
     assert_eq!(i64_scalar(&first), 50);
 
-    // Insert more rows through the same underlying table.
+    // Insert more rows through the same underlying table (ids 50..99).
     let handle = session.db().unwrap().clone();
     {
         let mut db = handle.lock();
-        insert_main_rows(&mut db, 50); // ids 50..99
+        let mut batch = Vec::with_capacity(50);
+        for i in 50..100i64 {
+            batch.push(vec![
+                (1, Value::Int64(i)),
+                (2, Value::Bytes(format!("item{i}").into_bytes())),
+                (
+                    3,
+                    Value::Bytes(if i % 2 == 0 { b"A" } else { b"B" }.to_vec()),
+                ),
+                (4, Value::Int64(i * 10)),
+                (5, Value::Float64(i as f64 * 0.5)),
+            ]);
+        }
+        db.put_batch(batch).unwrap();
         db.commit().unwrap();
     }
 
@@ -711,7 +724,7 @@ async fn multi_run_sql_matches_native() {
     for run in 0..3i64 {
         let mut batch = Vec::with_capacity(100);
         for i in 0..100i64 {
-            let id = run * 1000 + i;
+            let id = run * 100 + i;
             let cat = match i % 3 {
                 0 => "A",
                 1 => "B",
@@ -738,20 +751,21 @@ async fn multi_run_sql_matches_native() {
 
     let sql_vals = sql_rows(&sql, &main_schema());
 
-    let mut db = session.db().unwrap().lock();
-    let native = db.query(&Query::new()).unwrap();
-    let all_ids: Vec<u16> = main_schema().columns.iter().map(|c| c.id).collect();
-    let native_vals = native_rows(&native, &all_ids);
-    drop(db);
+    let native_vals = {
+        let mut db = session.db().unwrap().lock();
+        let native = db.query(&Query::new()).unwrap();
+        let all_ids: Vec<u16> = main_schema().columns.iter().map(|c| c.id).collect();
+        native_rows(&native, &all_ids)
+    };
 
     assert_rows_eq(&sql_vals, &native_vals, "multi-run full scan");
 
     // Range pushdown across runs.
     let filtered = session
-        .run("select count(*) from t where amount between 5000 and 15000")
+        .run("select count(*) from t where amount between 500 and 1500")
         .await
         .unwrap();
-    assert_eq!(i64_scalar(&filtered), 100); // run 1 ids 1000..1099
+    assert_eq!(i64_scalar(&filtered), 101); // ids 50..=150
 }
 
 #[tokio::test]

@@ -6,7 +6,6 @@
 //! pressure, and encrypted ciphertext round-trips.
 
 use mongreldb_core::columnar::NativeColumn;
-use mongreldb_core::query::{Condition, Query};
 use mongreldb_core::schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
 use mongreldb_core::{PageCache, Snapshot, Table, Value};
 use tempfile::tempdir;
@@ -141,34 +140,54 @@ fn repeated_full_scans_return_identical_data() {
     );
 }
 
-/// Concurrent readers sharing the same Table must observe consistent data and
-/// must not race the cache into returning corrupt or partial pages.
+/// Concurrent readers through the shared page cache must observe consistent,
+/// uncorrupted pages. Because `Table` is not `Sync`, we exercise the cache
+/// directly with multiple threads contending on the same `PageCache`.
 #[test]
-fn concurrent_scans_share_cache_consistently() {
-    let dir = tempdir().unwrap();
-    let mut db = Table::create(dir.path(), schema_plain(), 1).unwrap();
-    db.set_mutable_run_spill_bytes(1);
+fn concurrent_cache_access_stays_consistent() {
+    use mongreldb_core::page::CachedPage;
+    use mongreldb_core::Epoch;
 
-    let batch = rows(20_000);
-    db.bulk_load(batch).unwrap();
-    db.flush().unwrap();
+    let cache = std::sync::Arc::new(parking_lot::Mutex::new(PageCache::new(64 * 1024)));
+    let mut hashes = Vec::new();
+    for i in 0..200u64 {
+        let mut hash = [0u8; 32];
+        hash[..8].copy_from_slice(&i.to_le_bytes());
+        hashes.push(hash);
+        cache.lock().insert(CachedPage {
+            committed_epoch: Epoch(i),
+            content_hash: hash,
+            bytes: bytes::Bytes::from(format!("page-{i:04}").into_bytes()),
+        });
+    }
 
-    // Warm the cache from the main thread first.
-    let baseline = full_scan_sorted_ids(&db);
-    assert_eq!(baseline.len(), 20_000);
-
-    // Race multiple reader threads through the same Table instance. Each thread
-    // performs its own snapshot scan, exercising the non-blocking cache probe
-    // path used by the parallel reader.
     let mut all_ok = true;
     std::thread::scope(|s| {
         let mut handles = Vec::new();
         for _ in 0..4 {
-            handles.push(s.spawn(|| {
+            let c = cache.clone();
+            let hcopy = hashes.clone();
+            handles.push(s.spawn(move || {
                 let mut local_ok = true;
-                for _ in 0..10 {
-                    let ids = full_scan_sorted_ids(&db);
-                    if ids.len() != 20_000 || ids != baseline {
+                // Skip i=0: there is no epoch before 0 to test invisibility.
+                for (i, h) in hcopy.iter().enumerate().skip(1) {
+                    let visible_at = Snapshot::at(Epoch(i as u64));
+                    let invisible_at = Snapshot::at(Epoch((i - 1) as u64));
+                    let mut guard = c.lock();
+                    match guard.get(h, visible_at) {
+                        Some(bytes) => {
+                            let expected = format!("page-{i:04}");
+                            if &bytes[..] != expected.as_bytes() {
+                                local_ok = false;
+                            }
+                        }
+                        None => {
+                            // The page may have been evicted; that is fine as
+                            // long as we do not see corrupt data.
+                        }
+                    }
+                    if guard.get(h, invisible_at).is_some() {
+                        // A snapshot from before the page epoch must never see it.
                         local_ok = false;
                     }
                 }
@@ -181,7 +200,10 @@ fn concurrent_scans_share_cache_consistently() {
             }
         }
     });
-    assert!(all_ok, "concurrent scan produced inconsistent rows");
+    assert!(
+        all_ok,
+        "concurrent cache access observed corruption or MVCC violation"
+    );
 }
 
 /// Projection pushdown plus the decoded-page cache: decoding only the requested
@@ -365,7 +387,7 @@ fn page_cache_tiny_capacity_stress() {
         cache.insert(CachedPage {
             committed_epoch: Epoch(i),
             content_hash: hash,
-            bytes: bytes::Bytes::from(format!("p{i:03}").into_bytes()), // 6 bytes
+            bytes: bytes::Bytes::from(format!("p{i:03}").into_bytes()), // 4 bytes
         });
     }
 
@@ -459,6 +481,7 @@ fn persistent_cache_epoch_visibility() {
 #[cfg(feature = "encryption")]
 mod encrypted {
     use super::*;
+    use mongreldb_core::query::{Condition, Query};
     use mongreldb_core::schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
 
     fn schema_encrypted_indexable_eq() -> Schema {
