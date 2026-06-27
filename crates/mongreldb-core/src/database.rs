@@ -238,6 +238,11 @@ impl Database {
         self.epoch.visible()
     }
 
+    /// Clone the in-memory catalog (for diagnostics / tests).
+    pub fn catalog_snapshot(&self) -> Catalog {
+        self.catalog.read().clone()
+    }
+
     /// Resolve a table name → id (live tables only). pub(crate) so the
     /// transaction layer can stage by name.
     pub fn table_id(&self, name: &str) -> Result<u64> {
@@ -743,7 +748,49 @@ impl Database {
         Ok(())
     }
 
-    /// Allocate the next generation-scoped transaction id.
+    /// Retention-gated garbage collection (spec §6.4, §7.4, §16). Deletes:
+    /// - Dropped-table subdirs whose `at_epoch < min_active_snapshot`.
+    /// - Stale `_txn/` dirs (aborted/crashed large-txn pending runs).
+    ///
+    /// Returns the number of items reclaimed.
+    pub fn gc(&self) -> Result<usize> {
+        let min_active = self.snapshots.min_active(self.epoch.visible()).0;
+        let mut reclaimed = 0;
+
+        // Reclaim dropped-table dirs where no pinned snapshot still needs them.
+        let cat = self.catalog.read();
+        for entry in &cat.tables {
+            if let TableState::Dropped { at_epoch } = entry.state {
+                if at_epoch <= min_active {
+                    let tdir = self.root.join(TABLES_DIR).join(entry.table_id.to_string());
+                    if tdir.exists() {
+                        std::fs::remove_dir_all(&tdir)?;
+                        reclaimed += 1;
+                    }
+                }
+            }
+        }
+        drop(cat);
+
+        // Sweep stale _txn/ dirs on remaining live tables.
+        let cat = self.catalog.read();
+        for entry in &cat.tables {
+            if !matches!(entry.state, TableState::Live) {
+                continue;
+            }
+            let txn_dir = self
+                .root
+                .join(TABLES_DIR)
+                .join(entry.table_id.to_string())
+                .join("_txn");
+            if txn_dir.exists() {
+                std::fs::remove_dir_all(&txn_dir)?;
+                reclaimed += 1;
+            }
+        }
+
+        Ok(reclaimed)
+    }
     fn alloc_txn_id(&self) -> u64 {
         let mut g = self.next_txn_id.lock();
         let id = *g;
