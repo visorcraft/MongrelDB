@@ -1107,15 +1107,13 @@ fn recover_ddl_from_wal(
                     std::fs::create_dir_all(tdir.join(crate::engine::WAL_DIR))?;
                     std::fs::create_dir_all(tdir.join(crate::engine::RUNS_DIR))?;
                     crate::engine::write_schema(&tdir, &schema)?;
-                    let manifest_meta_dek = crate::encryption::meta_dek_for(
-                        // We don't have the kek here, but the manifest must be
-                        // writable. Reconstruct from meta_dek is not possible;
-                        // for encrypted DBs the table dir always exists (created
-                        // by create_in before crash), so this path is plaintext-only.
-                        None,
-                    );
+                    // The DB-wide meta DEK is also the per-table manifest meta
+                    // DEK (both derive from the KEK via `derive_meta_key`), so a
+                    // reconstructed manifest must be sealed with it — otherwise
+                    // the follow-up `Table::open_in` cannot authenticate it on an
+                    // encrypted DB and the table becomes permanently unopenable.
                     let mut m = crate::manifest::Manifest::new(table_id, schema.schema_id);
-                    crate::manifest::write_atomic(&tdir, &mut m, manifest_meta_dek.as_ref())?;
+                    crate::manifest::write_atomic(&tdir, &mut m, meta_dek)?;
                 }
                 cat.tables.push(CatalogEntry {
                     table_id,

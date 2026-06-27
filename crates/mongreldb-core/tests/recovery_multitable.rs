@@ -182,6 +182,74 @@ fn ddl_recovered_from_wal_when_catalog_checkpoint_is_stale() {
     assert_eq!(db.table("recovered").unwrap().lock().count(), 1);
 }
 
+#[cfg(feature = "encryption")]
+#[test]
+fn encrypted_create_table_recovers_when_dir_missing_after_ddl_sync() {
+    // Simulate a crash on an ENCRYPTED database between the shared-WAL DDL
+    // group-sync and `Table::create_in`: the committed CreateTable is durable in
+    // the WAL, but neither the table dir nor the catalog checkpoint landed.
+    // Recovery must reconstruct the table dir with an ENCRYPTED + authenticated
+    // manifest so the follow-up `Table::open_in` (which reads with the encrypted
+    // meta DEK) can authenticate it. A plaintext manifest renders the table
+    // permanently unopenable.
+    use mongreldb_core::catalog;
+    use mongreldb_core::encryption::{meta_dek_for, Kek, SALT_LEN};
+
+    let dir = tempdir().unwrap();
+    {
+        let db = Database::create_encrypted(dir.path(), "pw").unwrap();
+        // The DDL is group-synced to the shared WAL inside create_table. The
+        // crash we model strikes between that sync and `Table::create_in`, so no
+        // data could have been committed to the table yet.
+        db.create_table("recovered", one_int_schema()).unwrap();
+    }
+
+    // Re-derive the DB-wide meta DEK to stomp the catalog back to empty
+    // (encrypted + authenticated), simulating the checkpoint that never landed.
+    let salt_bytes = std::fs::read(dir.path().join("_meta").join("keys")).unwrap();
+    let mut salt = [0u8; SALT_LEN];
+    salt.copy_from_slice(&salt_bytes);
+    let kek = Kek::derive("pw", &salt).unwrap();
+    let meta_dek = meta_dek_for(Some(&kek));
+
+    let empty = catalog::Catalog::empty();
+    catalog::write_atomic(dir.path(), &empty, meta_dek.as_ref()).unwrap();
+
+    // Remove every table dir on disk (simulating dirs that never landed before
+    // the crash).
+    let tables_dir = dir.path().join("tables");
+    for e in std::fs::read_dir(&tables_dir).unwrap() {
+        let p = e.unwrap().path();
+        if p.is_dir() {
+            std::fs::remove_dir_all(p).unwrap();
+        }
+    }
+
+    // Reopen: DDL replay must reconstruct the table dir with an ENCRYPTED +
+    // authenticated manifest. A plaintext manifest would fail to authenticate in
+    // `Table::open_in` and the open would error out.
+    let db = Database::open_encrypted(dir.path(), "pw").unwrap();
+    assert!(
+        db.table_names().iter().any(|n| n == "recovered"),
+        "table must be recovered from WAL DDL replay"
+    );
+    // The reconstructed table must be fully usable: a commit succeeds and the
+    // row is visible (proving the manifest authenticates on every subsequent
+    // operation, not just the initial open).
+    db.transaction(|t| {
+        t.put("recovered", vec![(1, Value::Int64(42))])?;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(db.table("recovered").unwrap().lock().count(), 1);
+
+    // And it survives a clean reopen (manifest persisted encrypted by the
+    // commit's persist_manifest).
+    drop(db);
+    let db = Database::open_encrypted(dir.path(), "pw").unwrap();
+    assert_eq!(db.table("recovered").unwrap().lock().count(), 1);
+}
+
 #[test]
 fn drop_table_recovered_from_wal_when_catalog_checkpoint_is_stale() {
     // Symmetric: if the DropTable DDL was committed to the WAL but the catalog
