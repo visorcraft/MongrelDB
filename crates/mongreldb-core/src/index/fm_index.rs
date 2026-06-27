@@ -156,8 +156,10 @@ pub struct FmIndex {
     docs: Vec<(Vec<u8>, RowId)>,
     /// `None` (dirty) when inserts have landed since the last build; rebuilt
     /// lazily by [`Self::ensure_built`]. The query methods take `&self`, so this
-    /// uses interior mutability — safe because the engine is single-threaded.
-    built: std::cell::RefCell<Option<Built>>,
+    /// uses a thread-safe interior-mutability cell — a `Mutex` (not `RefCell`)
+    /// so that `FmIndex` (and by extension `Table`) is `Sync` and a `&Table`
+    /// can be shared across read threads.
+    built: parking_lot::Mutex<Option<Built>>,
 }
 
 impl Default for FmIndex {
@@ -170,7 +172,7 @@ impl FmIndex {
     pub fn new() -> Self {
         Self {
             docs: Vec::new(),
-            built: std::cell::RefCell::new(None),
+            built: parking_lot::Mutex::new(None),
         }
     }
 
@@ -179,7 +181,7 @@ impl FmIndex {
     /// `O(text log text)` build instead of one per row.
     pub fn insert(&mut self, text: Vec<u8>, row_id: RowId) {
         self.docs.push((text, row_id));
-        *self.built.borrow_mut() = None;
+        *self.built.lock() = None;
     }
 
     pub fn doc_count(&self) -> usize {
@@ -204,11 +206,11 @@ impl FmIndex {
 
     /// Rebuild the derived structures now if inserts have dirtied the index.
     fn ensure_built(&self) {
-        if self.built.borrow().is_some() {
+        if self.built.lock().is_some() {
             return;
         }
         let b = self.build_inner();
-        *self.built.borrow_mut() = Some(b);
+        *self.built.lock() = Some(b);
     }
 
     /// Force a rebuild now (e.g. before serializing if a caller wants the
@@ -291,7 +293,7 @@ impl FmIndex {
     /// Backward search; returns `(lo, hi)` BWT-row range (count = `hi - lo`).
     fn backward(&self, pattern: &[u8]) -> (usize, usize) {
         self.ensure_built();
-        let b = self.built.borrow();
+        let b = self.built.lock();
         let b = b.as_ref().expect("fm built");
         let mut lo = 0usize;
         let mut hi = b.n;
@@ -309,7 +311,7 @@ impl FmIndex {
 
     fn locate_range(&self, lo: usize, hi: usize) -> Vec<RowId> {
         self.ensure_built();
-        let b = self.built.borrow();
+        let b = self.built.lock();
         let b = b.as_ref().expect("fm built");
         let mut hits: HashSet<u64> = HashSet::new();
         let mut out = Vec::new();

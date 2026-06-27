@@ -160,6 +160,17 @@ pub struct Table {
     pending_dels: Vec<RowId>,
 }
 
+// `Table` is `Sync`: every field is either plain data, an `Arc`, a `Vec`/`HashMap`
+// of `Sync` data, or a thread-safe interior-mutability cell (`parking_lot::Mutex`,
+// `crossbeam`/`epoch` Arc-shared caches). The only `RefCell`-based type was
+// `FmIndex` (lazy rebuild of the BWT), which now uses a `Mutex`, so a `&Table`
+// can be safely shared across read threads (concurrent mutation still requires
+// the caller's `Mutex<Table>`).
+const _: () = {
+    const fn assert_sync<T: ?Sized + Sync>() {}
+    assert_sync::<Table>();
+};
+
 /// A cached query result — either survivor `Row`s (the tool-call/`query` path)
 /// or typed survivor columns (the pushdown/`query_columns_native` path). One
 /// canonical key maps to exactly one variant (a `query` with no projection vs a

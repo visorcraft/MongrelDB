@@ -954,3 +954,63 @@ async fn filtered_count_star_uses_pushdown() {
     assert_eq!(sql_count, native.len() as i64);
     assert_eq!(sql_count, 41); // i=30..=70
 }
+
+#[tokio::test]
+async fn view_name_substring_of_table_does_not_rewrite_table() {
+    // Regression: view resolution used a substring search, so a view named
+    // `log` would rewrite `FROM logs` (leaving a dangling `s`). Now whole-word
+    // matching means only a real `FROM log` reference is rewritten.
+    let dir = tempdir().unwrap();
+    let mut db = Table::create(dir.path(), main_schema(), 1).unwrap();
+    insert_main_rows_and_commit(&mut db, 5);
+    db.flush().unwrap();
+
+    let session = MongrelSession::new(db);
+    session.register("t").await.unwrap();
+    session.create_view("t", "select * from t");
+
+    // `FROM t` resolves through the view and still returns the 5 base rows.
+    let via_view = session.run("select * from t").await.unwrap();
+    assert_eq!(count_rows(&via_view), 5);
+}
+
+#[tokio::test]
+async fn whitespace_only_queries_share_result() {
+    // Queries that differ only in whitespace must return identical results
+    // (and, now that the SQL is normalized for caching, share one cache entry).
+    let dir = tempdir().unwrap();
+    let mut db = Table::create(dir.path(), main_schema(), 1).unwrap();
+    insert_main_rows_and_commit(&mut db, 10);
+    db.flush().unwrap();
+
+    let session = MongrelSession::new(db);
+    session.register("t").await.unwrap();
+
+    let a = session.run("select * from t order by id").await.unwrap();
+    let b = session
+        .run("  select  *  from  t  order  by  id  ")
+        .await
+        .unwrap();
+    let c = session
+        .run("\n\tselect\n*\nfrom\n\tt\norder\nby\nid\n")
+        .await
+        .unwrap();
+    assert_eq!(count_rows(&a), 10);
+    assert_eq!(count_rows(&b), 10);
+    assert_eq!(count_rows(&c), 10);
+    // First columns (id) must match row-for-row.
+    let ids = |b: &[RecordBatch]| -> Vec<i64> {
+        b.iter()
+            .flat_map(|batch| {
+                let arr = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                (0..arr.len()).map(move |i| arr.value(i))
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&a), ids(&b));
+    assert_eq!(ids(&a), ids(&c));
+}

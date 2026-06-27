@@ -953,7 +953,11 @@ impl MongrelSession {
 
         // Phase 17.3: intercept `SELECT ... FROM <view_name>` and rewrite to
         // the view's defining SQL.
-        let effective_sql = self.resolve_view_sql(sql);
+        let resolved = self.resolve_view_sql(sql);
+        // Canonicalize whitespace outside literals/comments so queries that
+        // differ only in spacing share a cache key (and parse identically — SQL
+        // is whitespace-insensitive between tokens).
+        let effective_sql = normalize_sql(&resolved);
         let sql = effective_sql.as_str();
         // The cache key uses the Database's visible epoch (P4.1) when opened
         // via `open()`, or the legacy `combined_epoch()` fold for multi-table
@@ -1023,20 +1027,7 @@ impl MongrelSession {
         }
         let mut result = sql.to_string();
         for (name, view_sql) in views.iter() {
-            let pattern = format!("from {name}");
-            let lower_pattern = pattern.to_lowercase();
-            // Recompute the lowercase search each iteration — the result may
-            // have changed length after a prior replacement.
-            let lower = result.to_lowercase();
-            if let Some(pos) = lower.find(&lower_pattern) {
-                let replacement = format!("FROM ({view_sql}) AS {name}");
-                result = format!(
-                    "{}{}{}",
-                    &result[..pos],
-                    replacement,
-                    &result[pos + pattern.len()..]
-                );
-            }
+            result = replace_from_view(&result, name, view_sql);
         }
         result
     }
@@ -1103,6 +1094,219 @@ fn sql_cache_key(sql: &str) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     sql.hash(&mut h);
     h.finish()
+}
+
+/// Replace the first whole-word `FROM <name>` reference (case-insensitive) in
+/// `sql` with `FROM (<view_sql>) AS <name>`. Unlike a raw substring search this
+/// requires a word boundary on both sides, so a view named `log` will **not**
+/// rewrite `FROM logs` (the prior behavior matched the `from log` prefix and
+/// left a dangling `s`). Original (non-lowercased) casing is preserved outside
+/// the rewritten span.
+fn replace_from_view(sql: &str, name: &str, view_sql: &str) -> String {
+    let lower = sql.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let name_b = name.as_bytes();
+    let mut i = 0usize;
+    while let Some(rel) = lower[i..].find("from") {
+        let from_start = i + rel;
+        let after_from = from_start + 4;
+        i = after_from;
+        // Left boundary: "from" must not be a suffix of a longer identifier.
+        if from_start > 0 && is_ident_byte(bytes[from_start - 1]) {
+            continue;
+        }
+        // Must be followed by whitespace then the name.
+        let mut j = after_from;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j == after_from || !bytes[j..].starts_with(name_b) {
+            continue;
+        }
+        let after_name = j + name_b.len();
+        // Right boundary: the name must not be a prefix of a longer identifier.
+        if after_name < bytes.len() && is_ident_byte(bytes[after_name]) {
+            continue;
+        }
+        // Preserve the original `FROM ` casing/whitespace (sql[from_start..j]),
+        // then wrap the view body as a subquery aliased back to the view name.
+        let mut out = String::with_capacity(sql.len() + view_sql.len() + name.len() + 8);
+        out.push_str(&sql[..from_start]);
+        out.push_str(&sql[from_start..j]);
+        out.push('(');
+        out.push_str(view_sql);
+        out.push_str(") AS ");
+        out.push_str(name);
+        out.push_str(&sql[after_name..]);
+        return out;
+    }
+    sql.to_string()
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Canonicalize a SQL string for caching/parsing: collapse runs of ASCII
+/// whitespace outside of literals/comments to a single space and trim. String
+/// literals (`'...'`, with `''` escapes), quoted identifiers (`"..."`), escape
+/// strings (`E'...'`), line comments (`--`), block comments (`/* */`), and
+/// dollar-quoting (`$tag$...$tag$`) are passed through verbatim so their
+/// internal whitespace (which IS semantically significant) is never altered.
+/// SQL parsing is whitespace-insensitive outside literals, so the normalized
+/// form parses identically while making `SELECT  *  FROM t`, `SELECT * FROM t`,
+/// and `\n  SELECT * FROM t  \n` share one cache key.
+fn normalize_sql(sql: &str) -> String {
+    let b = sql.as_bytes();
+    let n = b.len();
+    let mut out: Vec<u8> = Vec::with_capacity(n);
+    // Whether a single separating space should precede the next emitted token
+    // (i.e. we're between tokens, not at the very start of the output).
+    let mut want_space = false;
+    let mut i = 0usize;
+    while i < n {
+        let c = b[i];
+        // Whitespace and comments both act only as token separators — they set
+        // the pending-space flag but never emit a byte themselves, so a run of
+        // "1  -- c\nFROM" collapses to a single separating space.
+        if c.is_ascii_whitespace() {
+            want_space = true;
+            i += 1;
+            continue;
+        }
+        if c == b'-' && i + 1 < n && b[i + 1] == b'-' {
+            // Line comment: skip to end of line.
+            i += 2;
+            while i < n && b[i] != b'\n' {
+                i += 1;
+            }
+            want_space = !out.is_empty();
+            continue;
+        }
+        if c == b'/' && i + 1 < n && b[i + 1] == b'*' {
+            // Block comment: skip to the matching close `*/`, honoring nesting
+            // (Postgres/DataFusion allow `/* /* */ */`).
+            i += 2;
+            let mut depth = 1usize;
+            while i + 1 < n && depth > 0 {
+                if b[i] == b'/' && b[i + 1] == b'*' {
+                    depth += 1;
+                    i += 2;
+                } else if b[i] == b'*' && b[i + 1] == b'/' {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            want_space = !out.is_empty();
+            continue;
+        }
+        // A real token byte (or a literal/quote opener) — emit the separator.
+        if want_space && !out.is_empty() {
+            out.push(b' ');
+        }
+        want_space = false;
+        match c {
+            // Escape string E'...' (backslash escapes; '' is still an escape).
+            b'E' | b'e' if i + 1 < n && b[i + 1] == b'\'' => {
+                out.push(c);
+                i += 1;
+                i = copy_quoted(&mut out, b, i, n, b'\'');
+                continue;
+            }
+            // Single-quoted string literal ('...' with '' escape).
+            b'\'' => {
+                i = copy_quoted(&mut out, b, i, n, b'\'');
+                continue;
+            }
+            // Double-quoted identifier ("..." with "" escape).
+            b'"' => {
+                i = copy_quoted(&mut out, b, i, n, b'"');
+                continue;
+            }
+            // Dollar-quoting: $tag$ ... $tag$ (tag optional/empty).
+            b'$' => {
+                let (consumed, matched) = copy_dollar_quoted(&mut out, b, i, n);
+                if matched {
+                    i = consumed;
+                    continue;
+                }
+                out.push(c);
+                i += 1;
+                continue;
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| sql.to_string())
+}
+
+/// Copy a quote-delimited span starting at `start` (the opening quote byte is
+/// `delim`), including the opening and closing delimiters and any doubled
+/// escapes, verbatim into `out`. Returns the index past the closing quote.
+fn copy_quoted(out: &mut Vec<u8>, b: &[u8], start: usize, n: usize, delim: u8) -> usize {
+    out.push(b[start]);
+    let mut i = start + 1;
+    while i < n {
+        let c = b[i];
+        out.push(c);
+        if c == delim {
+            // Doubled delimiter (e.g. '' or "") is an escape, not the end.
+            if i + 1 < n && b[i + 1] == delim {
+                out.push(b[i + 1]);
+                i += 2;
+                continue;
+            }
+            return i + 1;
+        }
+        i += 1;
+    }
+    i
+}
+
+/// Copy a dollar-quoted span starting at the opening `$`. Returns
+/// `(index_past_close, true)` if a matching close delimiter was found, or
+/// `(start + 1, false)` if this `$` does not open a dollar-quote.
+fn copy_dollar_quoted(out: &mut Vec<u8>, b: &[u8], start: usize, n: usize) -> (usize, bool) {
+    // Parse the opening delimiter: '$' [tag] '$'. An empty tag ($$..$$) is
+    // allowed; a non-empty tag must be identifier bytes starting with a
+    // letter/underscore.
+    let mut j = start + 1;
+    let tag_start = j;
+    while j < n && b[j] != b'$' && is_dollar_tag_byte(b[j]) {
+        j += 1;
+    }
+    if j >= n || b[j] != b'$' {
+        return (start + 1, false);
+    }
+    if tag_start < j && !(b[tag_start].is_ascii_alphabetic() || b[tag_start] == b'_') {
+        return (start + 1, false);
+    }
+    let close_end = j + 1; // index just past the opening '$'
+    let delim = &b[start..close_end];
+    // Copy the opening delimiter verbatim.
+    out.extend_from_slice(delim);
+    // Find the matching close delimiter.
+    let mut k = close_end;
+    while k + delim.len() <= n {
+        if &b[k..k + delim.len()] == delim {
+            out.extend_from_slice(delim);
+            return (k + delim.len(), true);
+        }
+        out.push(b[k]);
+        k += 1;
+    }
+    // Unterminated: copy the remainder verbatim (don't corrupt).
+    out.extend_from_slice(&b[close_end..n]);
+    (n, true)
+}
+
+fn is_dollar_tag_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
 }
 
 /// Strip an ASCII case-insensitive prefix from `s`, returning the remainder.
@@ -1223,4 +1427,103 @@ fn parse_drop_table(sql: &str) -> Result<(String, bool)> {
         ));
     }
     Ok((name.to_string(), if_exists))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_collapses_and_trims_whitespace() {
+        assert_eq!(normalize_sql("SELECT * FROM t"), "SELECT * FROM t");
+        assert_eq!(normalize_sql("  SELECT  *   FROM   t  "), "SELECT * FROM t");
+        assert_eq!(
+            normalize_sql("\n\tSELECT\n*\nFROM\n\tt\n"),
+            "SELECT * FROM t"
+        );
+        assert_eq!(
+            normalize_sql("SELECT   a,   b   FROM   t"),
+            normalize_sql("SELECT a, b FROM t")
+        );
+    }
+
+    #[test]
+    fn normalize_preserves_string_literal_whitespace() {
+        assert_eq!(
+            normalize_sql("SELECT 'hello   world' FROM t"),
+            "SELECT 'hello   world' FROM t"
+        );
+        assert_eq!(
+            normalize_sql("SELECT 'it''s   ok' FROM t"),
+            "SELECT 'it''s   ok' FROM t"
+        );
+        assert_eq!(
+            normalize_sql("  SELECT  'a  b'  FROM  t  "),
+            "SELECT 'a  b' FROM t"
+        );
+    }
+
+    #[test]
+    fn normalize_preserves_quoted_identifier_and_dollar_quote() {
+        assert_eq!(
+            normalize_sql("  SELECT  \"my col\"  FROM  t  "),
+            "SELECT \"my col\" FROM t"
+        );
+        assert_eq!(
+            normalize_sql("  SELECT  $$a   b$$  FROM  t  "),
+            "SELECT $$a   b$$ FROM t"
+        );
+        assert_eq!(
+            normalize_sql("SELECT $tag$body   with spaces$tag$ FROM t"),
+            "SELECT $tag$body   with spaces$tag$ FROM t"
+        );
+    }
+
+    #[test]
+    fn normalize_strips_comments() {
+        assert_eq!(
+            normalize_sql("SELECT 1 -- trailing comment\nFROM t"),
+            "SELECT 1 FROM t"
+        );
+        assert_eq!(
+            normalize_sql("SELECT /* block */ 1 FROM t"),
+            "SELECT 1 FROM t"
+        );
+        // Comment with a quote-like body must not confuse the scanner.
+        assert_eq!(
+            normalize_sql("SELECT /* 'not a string' */ 1 FROM t"),
+            "SELECT 1 FROM t"
+        );
+        // Nested block comments are honored (Postgres/DataFusion allow nesting).
+        assert_eq!(
+            normalize_sql("SELECT /* outer /* inner */ still outer */ 1 FROM t"),
+            "SELECT 1 FROM t"
+        );
+    }
+
+    #[test]
+    fn normalize_escape_string_preserved() {
+        assert_eq!(
+            normalize_sql("SELECT E'line\\nbreak' FROM t"),
+            "SELECT E'line\\nbreak' FROM t"
+        );
+    }
+
+    #[test]
+    fn replace_from_view_matches_whole_word_only() {
+        let out = replace_from_view("SELECT * FROM logs", "log", "SELECT 1");
+        assert_eq!(out, "SELECT * FROM logs");
+
+        let out = replace_from_view("SELECT * FROM log", "log", "SELECT 1");
+        assert_eq!(out, "SELECT * FROM (SELECT 1) AS log");
+
+        let out = replace_from_view("select * from log where x", "log", "SELECT 1");
+        assert_eq!(out, "select * from (SELECT 1) AS log where x");
+
+        let out = replace_from_view("SELECT * FROM log)", "log", "SELECT 1");
+        assert_eq!(out, "SELECT * FROM (SELECT 1) AS log)");
+
+        let out = replace_from_view("SELECT * xfrom log", "log", "SELECT 1");
+        assert_eq!(out, "SELECT * xfrom log");
+    }
 }
