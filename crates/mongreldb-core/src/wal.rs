@@ -568,6 +568,10 @@ pub struct SharedWal {
     /// WAL DEK (constant across segments). None for plaintext. Kept so a
     /// `rotate` can rebuild the per-segment cipher under the same key.
     wal_dek: Option<Zeroizing<[u8; 32]>>,
+    /// Count of actual fsyncs issued via [`Self::group_sync`]. With real group
+    /// commit this is far below the commit count (one leader fsync serves many
+    /// followers). Diagnostic / test-facing.
+    group_sync_count: u64,
 }
 
 impl SharedWal {
@@ -614,6 +618,7 @@ impl SharedWal {
             active_segment_no: 0,
             durable_seq: epoch_created.0,
             wal_dek,
+            group_sync_count: 0,
         })
     }
 
@@ -659,6 +664,7 @@ impl SharedWal {
             active_segment_no: next_segment_no,
             durable_seq: epoch_created.0,
             wal_dek,
+            group_sync_count: 0,
         })
     }
 
@@ -703,11 +709,22 @@ impl SharedWal {
     /// appender since the last `group_sync`.
     pub fn group_sync(&mut self) -> Result<u64> {
         self.active.sync()?;
+        self.group_sync_count += 1;
         let highest = self.active.next_seq_val().saturating_sub(1);
         if highest > self.durable_seq {
             self.durable_seq = highest;
         }
         Ok(self.durable_seq)
+    }
+
+    /// Number of fsyncs issued so far (test/diagnostic — see [`group_sync`]).
+    pub fn group_sync_count(&self) -> u64 {
+        self.group_sync_count
+    }
+
+    /// The highest sequence number reported durable by the last `group_sync`.
+    pub fn durable_seq(&self) -> u64 {
+        self.durable_seq
     }
 
     /// Rotate to a fresh segment numbered `segment_no` (which namespaces nonces

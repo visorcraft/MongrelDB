@@ -183,3 +183,51 @@ fn flush_under_concurrent_writes_loses_no_rows() {
     let actual = db.table("t").unwrap().lock().count();
     assert_eq!(actual, expected, "rows lost during concurrent flush");
 }
+
+#[test]
+fn group_commit_batches_fsyncs_under_concurrency() {
+    // P3.2: with real group commit, concurrent committers share a single leader
+    // fsync, so the WAL fsync count is strictly below the number of committed
+    // transactions. (With the old "fsync under the WAL lock" path every commit
+    // would issue its own fsync and the counts would be equal.)
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    db.create_table("t", pk_schema("v")).unwrap();
+
+    let threads = 16u64;
+    let per = 20u64;
+    let total = threads * per;
+
+    let start = db.__wal_group_sync_count();
+    let barrier = Arc::new(std::sync::Barrier::new(threads as usize));
+    let mut handles = Vec::new();
+    for ti in 0..threads {
+        let db = Arc::clone(&db);
+        let b = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            b.wait();
+            for j in 0..per {
+                let pk = (ti * per + j) as i64;
+                db.transaction(|t| {
+                    t.put("t", vec![(1, Value::Int64(pk))])?;
+                    Ok(())
+                })
+                .unwrap();
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let fsyncs = db.__wal_group_sync_count() - start;
+    assert_eq!(
+        db.table("t").unwrap().lock().count(),
+        total,
+        "all committed rows must be durable"
+    );
+    assert!(
+        fsyncs < total,
+        "group commit must batch: {fsyncs} fsyncs for {total} commits"
+    );
+}

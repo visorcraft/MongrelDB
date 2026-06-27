@@ -79,6 +79,10 @@ pub struct Database {
     active_txns: crate::txn::ActiveTxns,
     /// P3.2: set on fsync error — all subsequent writes fail fast (spec §9.3e).
     poisoned: std::sync::atomic::AtomicBool,
+    /// P3.2: group-commit coordinator. The sequencer appends under the WAL lock
+    /// but defers the fsync to one leader here, so concurrent commits share a
+    /// single fsync (spec §9.3).
+    group: crate::txn::GroupCommit,
     /// P3.6: txn ids currently spilling into `_txn/<id>/`. GC never deletes a
     /// live spill's pending dir (review fix #14, spec §6.4).
     active_spills: Arc<crate::retention::ActiveSpills>,
@@ -225,6 +229,7 @@ impl Database {
         }
         let next_txn_id = (cat.open_generation << 32) | 1;
 
+        let initial_durable = shared_wal.lock().durable_seq();
         Ok(Self {
             root,
             catalog: RwLock::new(cat),
@@ -242,6 +247,7 @@ impl Database {
             conflicts: crate::txn::ConflictIndex::new(),
             active_txns: crate::txn::ActiveTxns::new(),
             poisoned: std::sync::atomic::AtomicBool::new(false),
+            group: crate::txn::GroupCommit::new(initial_durable),
             spill_threshold: std::sync::atomic::AtomicU64::new(64 * 1024 * 1024),
             active_spills: Arc::new(crate::retention::ActiveSpills::new()),
             spill_hook: Mutex::new(None),
@@ -471,7 +477,7 @@ impl Database {
                 content_hash: [0u8; 32],
             })
             .collect();
-        let (new_epoch, applies) = {
+        let (new_epoch, applies, commit_seq) = {
             let mut wal = self.shared_wal.lock();
 
             // Re-check only if the conflict index advanced since pre-validation
@@ -544,14 +550,22 @@ impl Database {
                 applies.push((*table_id, ops));
             }
 
-            wal.append_commit(txn_id, new_epoch, &added_runs)?;
-            wal.group_sync().inspect_err(|_| {
+            let commit_seq = wal.append_commit(txn_id, new_epoch, &added_runs)?;
+
+            // Record the conflict + assign the epoch under the WAL lock so commit
+            // order == WAL append order, but DO NOT fsync here (P3.2): the fsync
+            // moves out of this critical section to the group-commit coordinator
+            // so concurrent committers share a single leader fsync.
+            self.conflicts.record(&write_keys, new_epoch);
+            (new_epoch, applies, commit_seq)
+        };
+
+        // ── 2b. Durability: one leader fsync serves this whole batch (P3.2). ──
+        self.group
+            .await_durable(&self.shared_wal, commit_seq)
+            .inspect_err(|_| {
                 self.poisoned.store(true, Ordering::Relaxed);
             })?;
-
-            self.conflicts.record(&write_keys, new_epoch);
-            (new_epoch, applies)
-        };
 
         // ── 3. Publish: link spilled runs + apply non-spilled ops ──
         {
@@ -890,6 +904,14 @@ impl Database {
     #[doc(hidden)]
     pub fn __set_spill_hook(&self, f: impl Fn() + Send + Sync + 'static) {
         *self.spill_hook.lock() = Some(Box::new(f));
+    }
+
+    /// Number of WAL fsyncs issued so far (test/diagnostic). With group commit
+    /// this stays well below the number of committed transactions when commits
+    /// are concurrent (one leader fsync covers a whole batch — spec §9.3).
+    #[doc(hidden)]
+    pub fn __wal_group_sync_count(&self) -> u64 {
+        self.shared_wal.lock().group_sync_count()
     }
 
     /// Verify multi-table integrity (spec §16). For every live table this:

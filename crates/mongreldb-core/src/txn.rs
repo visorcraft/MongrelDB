@@ -10,9 +10,11 @@
 
 use crate::database::Database;
 use crate::epoch::{Epoch, Snapshot};
-use crate::error::Result;
+use crate::error::{MongrelError, Result};
 use crate::memtable::Value;
 use crate::rowid::RowId;
+use crate::wal::SharedWal;
+use parking_lot::{Condvar, Mutex as PlMutex};
 
 /// One staged mutation against a named table.
 pub(crate) enum Staged {
@@ -236,6 +238,85 @@ impl ConflictIndex {
 impl Default for ConflictIndex {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ── P3.2: real group commit (spec §9.3) ─────────────────────────────────
+
+/// Group-commit coordinator (spec §9.3). The commit sequencer appends a txn's
+/// records under the WAL mutex but does **not** fsync there; instead each
+/// committer calls [`Self::await_durable`] with its commit record's WAL seq.
+/// Exactly one waiter becomes the *leader* and issues a single `group_sync`
+/// (fsync), which makes durable every record appended up to that point; the
+/// others are *followers* that simply wait until `durable_seq` reaches their
+/// commit seq. One fsync therefore covers a whole batch of concurrent commits.
+pub struct GroupCommit {
+    inner: PlMutex<GroupState>,
+    cv: Condvar,
+}
+
+struct GroupState {
+    durable_seq: u64,
+    syncing: bool,
+    poisoned: bool,
+}
+
+impl GroupCommit {
+    pub fn new(durable_seq: u64) -> Self {
+        Self {
+            inner: PlMutex::new(GroupState {
+                durable_seq,
+                syncing: false,
+                poisoned: false,
+            }),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// Block until `commit_seq` is durable. The first eligible caller fsyncs on
+    /// behalf of the batch; the rest wait on the condvar. On fsync error the
+    /// coordinator is poisoned and every waiter (current and future) returns
+    /// `Err` (spec §9.3e). `wal` is the same `SharedWal` the sequencer appended
+    /// to — locked here only for the brief fsync, never across the wait.
+    pub fn await_durable(&self, wal: &PlMutex<SharedWal>, commit_seq: u64) -> Result<()> {
+        let mut st = self.inner.lock();
+        loop {
+            if st.poisoned {
+                return Err(MongrelError::Other(
+                    "database poisoned by fsync error".into(),
+                ));
+            }
+            if st.durable_seq >= commit_seq {
+                return Ok(());
+            }
+            if st.syncing {
+                // Another thread is the leader; wait for it to advance durability.
+                self.cv.wait(&mut st);
+                continue;
+            }
+            // Become the leader: fsync outside the coordinator lock (but under
+            // the WAL lock) so followers can queue up behind us.
+            st.syncing = true;
+            drop(st);
+            let res = wal.lock().group_sync();
+            st = self.inner.lock();
+            st.syncing = false;
+            match res {
+                Ok(durable) => {
+                    if durable > st.durable_seq {
+                        st.durable_seq = durable;
+                    }
+                    self.cv.notify_all();
+                    // Loop re-checks: our commit_seq <= durable (group_sync makes
+                    // everything appended-so-far durable), so we return Ok next.
+                }
+                Err(e) => {
+                    st.poisoned = true;
+                    self.cv.notify_all();
+                    return Err(e);
+                }
+            }
+        }
     }
 }
 
