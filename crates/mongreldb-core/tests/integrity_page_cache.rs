@@ -478,7 +478,10 @@ fn persistent_cache_epoch_visibility() {
     assert_eq!(&got.unwrap()[..], b"data");
     // An older snapshot must NOT see it (MVCC visibility preserved).
     let missed = reloaded.get(&hash, Snapshot::at(mongreldb_core::Epoch(2)));
-    assert!(missed.is_none(), "page committed at epoch 3 must not be visible at epoch 2");
+    assert!(
+        missed.is_none(),
+        "page committed at epoch 3 must not be visible at epoch 2"
+    );
 }
 
 #[cfg(feature = "encryption")]
