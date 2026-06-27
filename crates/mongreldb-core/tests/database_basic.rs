@@ -96,7 +96,8 @@ fn database_snapshot_is_retained() {
         .unwrap();
     db.table("orders").unwrap().lock().commit().unwrap();
     let (snap, _guard) = db.snapshot();
-    assert_eq!(snap.epoch, Epoch(1));
+    // create_table (DDL) advances the epoch to 1, then the put+commit to 2.
+    assert_eq!(snap.epoch, Epoch(2));
 }
 
 #[test]
@@ -130,5 +131,6 @@ fn concurrent_cross_table_commits_publish_in_order() {
     for h in handles {
         h.join().unwrap();
     }
-    assert_eq!(db.visible_epoch(), Epoch((2 * n) as u64));
+    // 2 create_table DDL commits + 2*n data commits advance the shared clock.
+    assert_eq!(db.visible_epoch(), Epoch(2 + (2 * n) as u64));
 }

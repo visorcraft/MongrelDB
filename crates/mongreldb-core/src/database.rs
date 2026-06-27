@@ -164,6 +164,16 @@ impl Database {
             recover_shared_wal(&root, &tables, &epoch, wal_dek.as_ref())?;
         }
 
+        // Bump `open_generation` on every open and scope transaction ids by it
+        // (`txn_id = (generation << 32) | counter`), so ids never alias across
+        // reopens (review fix #11). Persist the bumped generation to the catalog.
+        let mut cat = cat;
+        if existing {
+            cat.open_generation = cat.open_generation.wrapping_add(1);
+            catalog::write_atomic(&root, &cat, meta_dek.as_ref())?;
+        }
+        let next_txn_id = (cat.open_generation << 32) | 1;
+
         Ok(Self {
             root,
             catalog: RwLock::new(cat),
@@ -173,7 +183,7 @@ impl Database {
             decoded_cache,
             commit_lock,
             shared_wal,
-            next_txn_id: Mutex::new(1),
+            next_txn_id: Mutex::new(next_txn_id),
             tables: RwLock::new(tables),
             kek,
             ddl_lock: Mutex::new(()),
@@ -197,12 +207,7 @@ impl Database {
 
     /// Begin a new transaction reading at the current visible epoch.
     pub fn begin(&self) -> crate::txn::Transaction<'_> {
-        let txn_id = {
-            let mut g = self.next_txn_id.lock();
-            let id = *g;
-            *g += 1;
-            id
-        };
+        let txn_id = self.alloc_txn_id();
         let read = Snapshot::at(self.epoch.visible());
         crate::txn::Transaction::new(self, txn_id, read)
     }
@@ -356,9 +361,14 @@ impl Database {
             .ok_or_else(|| MongrelError::NotFound(format!("table {name:?} not mounted")))
     }
 
-    /// Create a new table. Allocates an id, writes the schema + empty manifest,
-    /// appends a catalog entry, and mounts the table.
+    /// Create a new table. The DDL is first logged to the shared WAL
+    /// (`Op::Ddl(CreateTable)` + `TxnCommit`) and group-synced so it is durable
+    /// BEFORE the in-memory catalog and table map are mutated; the catalog
+    /// checkpoint is rewritten afterwards (spec §15, review fix #16). A reopen
+    /// that sees a stale catalog still recovers the table by replaying the Ddl.
     pub fn create_table(&self, name: &str, schema: Schema) -> Result<u64> {
+        use crate::wal::DdlOp;
+
         let _g = self.ddl_lock.lock();
         {
             let cat = self.catalog.read();
@@ -368,10 +378,38 @@ impl Database {
                 )));
             }
         }
-        let mut cat = self.catalog.write();
-        let table_id = cat.next_table_id;
-        cat.next_table_id += 1;
-        let created_epoch = self.epoch.visible().0;
+
+        // Allocate id + epoch + txn id under the commit lock so the DDL commit
+        // is serialized with data commits (in-order publish).
+        let commit_lock = Arc::clone(&self.commit_lock);
+        let _c = commit_lock.lock();
+        let table_id = {
+            let mut cat = self.catalog.write();
+            let id = cat.next_table_id;
+            cat.next_table_id += 1;
+            id
+        };
+        let epoch = self.epoch.bump_assigned();
+        let txn_id = self.alloc_txn_id();
+
+        // 1. Log the DDL + commit marker to the shared WAL and fsync (durable).
+        let schema_json = DdlOp::encode_schema(&schema)?;
+        {
+            let mut wal = self.shared_wal.lock();
+            wal.append(
+                txn_id,
+                table_id,
+                crate::wal::Op::Ddl(DdlOp::CreateTable {
+                    table_id,
+                    name: name.to_string(),
+                    schema_json,
+                }),
+            )?;
+            wal.append_commit(txn_id, epoch, &[])?;
+            wal.group_sync()?;
+        }
+
+        // 2. Create the on-disk table dir + manifest.
         let tdir = self.root.join(TABLES_DIR).join(table_id.to_string());
         std::fs::create_dir_all(&tdir)?;
         let ctx = SharedCtx {
@@ -383,38 +421,77 @@ impl Database {
             commit_lock: Arc::clone(&self.commit_lock),
         };
         let table = Table::create_in(&tdir, schema.clone(), table_id, ctx)?;
-        cat.tables.push(CatalogEntry {
-            table_id,
-            name: name.to_string(),
-            schema,
-            state: TableState::Live,
-            created_epoch,
-        });
-        catalog::write_atomic(&self.root, &cat, self.meta_dek.as_ref())?;
+
+        // 3. Mutate the in-memory catalog + mount the table, then rewrite the
+        //    catalog checkpoint (lazy: outside the WAL critical section).
+        {
+            let mut cat = self.catalog.write();
+            cat.tables.push(CatalogEntry {
+                table_id,
+                name: name.to_string(),
+                schema,
+                state: TableState::Live,
+                created_epoch: epoch.0,
+            });
+        }
+        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
         self.tables
             .write()
             .insert(table_id, Arc::new(Mutex::new(table)));
+
+        self.epoch.publish_visible(epoch);
         Ok(table_id)
     }
 
-    /// Logically drop a table. Its rows become unqueryable immediately; the
-    /// physical subdir is reaped later by the retention-gated GC (P3.6).
+    /// Logically drop a table, logging the DDL through the shared WAL first.
     pub fn drop_table(&self, name: &str) -> Result<()> {
+        use crate::wal::DdlOp;
+
         let _g = self.ddl_lock.lock();
-        let mut cat = self.catalog.write();
-        let entry = cat
-            .tables
-            .iter_mut()
-            .find(|t| t.name == name && matches!(t.state, TableState::Live))
-            .ok_or_else(|| MongrelError::NotFound(format!("table {name:?} not found")))?;
-        let id = entry.table_id;
-        entry.state = TableState::Dropped {
-            at_epoch: self.epoch.visible().0,
+        let table_id = {
+            let cat = self.catalog.read();
+            cat.live(name)
+                .ok_or_else(|| MongrelError::NotFound(format!("table {name:?} not found")))?
+                .table_id
         };
-        catalog::write_atomic(&self.root, &cat, self.meta_dek.as_ref())?;
-        drop(cat);
-        self.tables.write().remove(&id);
+
+        let commit_lock = Arc::clone(&self.commit_lock);
+        let _c = commit_lock.lock();
+        let epoch = self.epoch.bump_assigned();
+        let txn_id = self.alloc_txn_id();
+        {
+            let mut wal = self.shared_wal.lock();
+            wal.append(
+                txn_id,
+                table_id,
+                crate::wal::Op::Ddl(DdlOp::DropTable { table_id }),
+            )?;
+            wal.append_commit(txn_id, epoch, &[])?;
+            wal.group_sync()?;
+        }
+
+        {
+            let mut cat = self.catalog.write();
+            let entry = cat
+                .tables
+                .iter_mut()
+                .find(|t| t.table_id == table_id)
+                .ok_or_else(|| MongrelError::NotFound(format!("table {name:?} not found")))?;
+            entry.state = TableState::Dropped { at_epoch: epoch.0 };
+        }
+        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+        self.tables.write().remove(&table_id);
+
+        self.epoch.publish_visible(epoch);
         Ok(())
+    }
+
+    /// Allocate the next generation-scoped transaction id.
+    fn alloc_txn_id(&self) -> u64 {
+        let mut g = self.next_txn_id.lock();
+        let id = *g;
+        *g = g.wrapping_add(1);
+        id
     }
 
     /// The DB-wide KEK (if encrypted).

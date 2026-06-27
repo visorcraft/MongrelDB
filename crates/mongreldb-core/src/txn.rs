@@ -43,6 +43,12 @@ impl<'db> Transaction<'db> {
         self.read
     }
 
+    /// The transaction's id (generation-scoped: high 32 bits = open generation,
+    /// low 32 = per-open counter). Mainly diagnostic / test-facing.
+    pub fn txn_id(&self) -> u64 {
+        self.txn_id
+    }
+
     /// Stage a put on `table`. The row id is allocated at commit so an aborted
     /// transaction never consumes ids.
     pub fn put(&mut self, table: &str, cells: Vec<(u16, Value)>) -> Result<()> {

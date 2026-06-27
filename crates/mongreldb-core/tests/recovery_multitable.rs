@@ -88,3 +88,64 @@ fn recovery_ignores_uncommitted_txn() {
     let db = Database::open(dir.path()).unwrap();
     assert_eq!(db.table("a").unwrap().lock().count(), 0);
 }
+
+#[test]
+fn txn_ids_do_not_alias_across_reopen() {
+    // open gen=0 writes txn_ids in generation 0; reopen bumps the generation so
+    // new txn_ids cannot collide with any pre-reopen id.
+    let dir = tempdir().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.create_table("a", one_int_schema()).unwrap();
+    let t1 = db.begin();
+    let t2 = db.begin();
+    // Same generation: distinct low-counter ids, same high generation bits.
+    assert_ne!(t1.txn_id(), t2.txn_id());
+    let gen1 = t1.txn_id() >> 32;
+    let id1 = t1.txn_id();
+    let id2 = t2.txn_id();
+    assert_eq!(gen1, id2 >> 32);
+    drop(t1);
+    drop(t2);
+    drop(db);
+
+    let db = Database::open(dir.path()).unwrap();
+    let t3 = db.begin();
+    let gen2 = t3.txn_id() >> 32;
+    // Different generation (high 32 bits advanced) — cannot equal any prior id.
+    assert_ne!(gen2, gen1, "open must bump the generation");
+    assert_ne!(t3.txn_id(), id1);
+    assert_ne!(t3.txn_id(), id2);
+}
+
+#[test]
+fn ddl_is_durable_via_wal_before_catalog_checkpoint() {
+    use mongreldb_core::{DdlOp, Op, SharedWal};
+
+    let dir = tempdir().unwrap();
+    {
+        let db = Database::create(dir.path()).unwrap();
+        db.create_table("orders", one_int_schema()).unwrap();
+        // A data commit on the new table.
+        db.transaction(|t| {
+            t.put("orders", vec![(1, Value::Int64(7))])?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    // The shared WAL carries the CreateTable Ddl record (durability does not
+    // rest solely on the catalog checkpoint).
+    let recs = SharedWal::replay(dir.path()).unwrap();
+    assert!(
+        recs.iter().any(|r| matches!(
+            r.op,
+            Op::Ddl(DdlOp::CreateTable { ref name, .. }) if name == "orders"
+        )),
+        "CreateTable must be logged to the shared WAL"
+    );
+
+    // Reopen sees the table and its data.
+    let db = Database::open(dir.path()).unwrap();
+    assert!(db.table_names().iter().any(|n| n == "orders"));
+    assert_eq!(db.table("orders").unwrap().lock().count(), 1);
+}
