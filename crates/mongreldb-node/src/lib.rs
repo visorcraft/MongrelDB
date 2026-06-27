@@ -556,6 +556,81 @@ impl TableHandle {
     }
 }
 
+/// A cross-table transaction (P5.2). Stage puts/deletes across tables; commit
+/// atomically. On conflict, `commit` throws a `ConflictError`.
+#[napi]
+pub struct Transaction {
+    db: Arc<CoreDatabase>,
+    staging: Vec<(String, TxnOp)>,
+}
+
+enum TxnOp {
+    Put(Vec<(u16, Value)>),
+    Delete(RowId),
+}
+
+#[napi]
+impl Transaction {
+    #[napi(constructor)]
+    pub fn new(db: &Database) -> Self {
+        Self {
+            db: Arc::clone(&db.inner),
+            staging: Vec::new(),
+        }
+    }
+
+    /// Stage a put on `table`.
+    #[napi]
+    pub fn put(&mut self, table: String, cells: Vec<Cell>) -> napi::Result<()> {
+        let handle = self.db.table(&table).map_err(to_napi)?;
+        let g = handle.lock();
+        let cols = cell_pairs_table(&g, cells)?;
+        drop(g);
+        self.staging.push((table, TxnOp::Put(cols)));
+        Ok(())
+    }
+
+    /// Stage a delete of `row_id` on `table`.
+    #[napi]
+    pub fn delete(&mut self, table: String, row_id: BigInt) -> napi::Result<()> {
+        self.staging
+            .push((table, TxnOp::Delete(RowId(row_id.get_u64().1))));
+        Ok(())
+    }
+
+    /// Commit all staged ops atomically. Returns the commit epoch.
+    /// Throws `ConflictError` on write-write conflict (retryable).
+    #[napi]
+    pub fn commit(&mut self) -> napi::Result<BigInt> {
+        let db_ref: &CoreDatabase = &*self.db;
+        let mut tx = db_ref.begin();
+        for (table, op) in &self.staging {
+            match op {
+                TxnOp::Put(cells) => {
+                    tx.put(table, cells.clone()).map_err(to_napi)?;
+                }
+                TxnOp::Delete(rid) => {
+                    tx.delete(table, *rid).map_err(to_napi)?;
+                }
+            }
+        }
+        let epoch = tx.commit().map_err(|e| match e {
+            mongreldb_core::MongrelError::Conflict(_) => napi::Error::new(
+                napi::Status::GenericFailure,
+                "ConflictError: write-write conflict".to_string(),
+            ),
+            other => to_napi(other),
+        })?;
+        Ok(BigInt::from(epoch.0))
+    }
+
+    /// Discard all staged ops.
+    #[napi]
+    pub fn rollback(&mut self) {
+        self.staging.clear();
+    }
+}
+
 /// Phase 20.2: a typed column for bulk loading, wrapping JS typed-array data.
 #[napi(object)]
 pub struct TypedColumn {

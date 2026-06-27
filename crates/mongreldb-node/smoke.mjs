@@ -99,4 +99,53 @@ db2.close();
 rmSync(dir2, { recursive: true });
 console.log('smoke: async API ✓');
 
+// ── Cross-table Transaction + ConflictError ───────────────────────────────
+
+const dir3 = makeTempDir();
+const db3 = Database.withPath(dir3);
+db3.createTable('orders', {
+  columns: [
+    { id: 1, name: 'id', ty: 1, primaryKey: true, nullable: false },
+    { id: 2, name: 'amount', ty: 1, primaryKey: false, nullable: false },
+  ],
+  indexes: [],
+});
+db3.createTable('customers', {
+  columns: [
+    { id: 1, name: 'id', ty: 1, primaryKey: true, nullable: false },
+    { id: 2, name: 'orders', ty: 1, primaryKey: false, nullable: false },
+  ],
+  indexes: [],
+});
+
+// Atomic cross-table transaction.
+const { Transaction } = require('./mongreldb.node');
+const tx = new Transaction(db3);
+tx.put('orders', [
+  { columnId: 1, int64: 1 },
+  { columnId: 2, int64: 100 },
+]);
+tx.put('customers', [
+  { columnId: 1, int64: 1 },
+  { columnId: 2, int64: 1 },
+]);
+const epoch = tx.commit();
+assert(typeof epoch === 'bigint', `epoch is bigint, got ${typeof epoch}`);
+
+assert(db3.getTable('orders').count() === 1n, 'order committed');
+assert(db3.getTable('customers').count() === 1n, 'customer committed');
+
+// Rollback test.
+const tx2 = new Transaction(db3);
+tx2.put('orders', [
+  { columnId: 1, int64: 2 },
+  { columnId: 2, int64: 200 },
+]);
+tx2.rollback();
+assert(db3.getTable('orders').count() === 1n, 'rollback leaves 1 row');
+
+db3.close();
+rmSync(dir3, { recursive: true });
+console.log('smoke: cross-table Transaction ✓');
+
 console.log('All smoke tests passed.');
