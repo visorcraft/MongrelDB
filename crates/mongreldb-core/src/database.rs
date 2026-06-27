@@ -1110,12 +1110,19 @@ fn recover_shared_wal(
                     }
                 }
             }
-            t.link_run(crate::manifest::RunRef {
-                run_id: ar.run_id,
-                level: ar.level,
-                epoch_created: *ce,
-                row_count: ar.row_count,
-            });
+            // Only link a run whose file is actually present, and never re-link
+            // one the publish phase already persisted into the manifest (which is
+            // the common clean-reopen case, since the `TxnCommit` lives in the WAL
+            // until segment GC). `recover_spilled_run` is idempotent + reconciles
+            // `live_count`/indexes only when the run is genuinely new.
+            if t.run_path(ar.run_id as u64).exists() {
+                t.recover_spilled_run(crate::manifest::RunRef {
+                    run_id: ar.run_id,
+                    level: ar.level,
+                    epoch_created: *ce,
+                    row_count: ar.row_count,
+                });
+            }
         }
     }
 

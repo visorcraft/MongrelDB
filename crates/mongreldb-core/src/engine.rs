@@ -3925,6 +3925,25 @@ impl Table {
         self.run_refs.push(run_ref);
     }
 
+    /// Link a spilled run found during shared-WAL recovery (spec §8.5).
+    /// **Idempotent**: if the run is already in the manifest (the publish phase
+    /// persisted it before the crash, or this is a clean reopen with the
+    /// `TxnCommit` still in the WAL) this is a no-op returning `false`, so the
+    /// caller never double-links or double-counts. Otherwise — a crash *after*
+    /// the commit fsync but *before* publish persisted the manifest — the run is
+    /// linked, its rows are added to `live_count`, and the indexes are marked
+    /// stale so the next query rebuilds them from the runs (including this one).
+    /// Returns `true` when the run was newly linked.
+    pub(crate) fn recover_spilled_run(&mut self, run_ref: crate::manifest::RunRef) -> bool {
+        if self.run_refs.iter().any(|r| r.run_id == run_ref.run_id) {
+            return false;
+        }
+        self.live_count = self.live_count.saturating_add(run_ref.row_count);
+        self.run_refs.push(run_ref);
+        self.indexes_complete = false;
+        true
+    }
+
     pub(crate) fn kek_ref(&self) -> Option<&Arc<Kek>> {
         self.kek.as_ref()
     }

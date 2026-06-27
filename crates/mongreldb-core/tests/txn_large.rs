@@ -181,6 +181,46 @@ fn spilled_run_respects_snapshot_isolation() {
 }
 
 #[test]
+fn spilled_run_relink_is_idempotent_across_reopens() {
+    // The shared-WAL recovery pass re-links spilled runs from the still-present
+    // TxnCommit record. Re-opening repeatedly must NOT double-count or duplicate
+    // the run: count stays stable and indexed lookups keep working.
+    let dir = tempdir().unwrap();
+    {
+        let db = Database::create(dir.path()).unwrap();
+        db.create_table("t", pk_schema()).unwrap();
+        db.set_spill_threshold(1);
+        db.transaction(|t| {
+            for i in 0..40i64 {
+                t.put("t", vec![(1, Value::Int64(i))])?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(db.table("t").unwrap().lock().count(), 40);
+    }
+
+    for _ in 0..3 {
+        let db = Database::open(dir.path()).unwrap();
+        let tbl = db.table("t").unwrap();
+        let mut g = tbl.lock();
+        assert_eq!(g.count(), 40, "count must stay stable across reopens");
+        let q = Query::new().and(Condition::Range {
+            column_id: 1,
+            lo: 0,
+            hi: 39,
+        });
+        assert_eq!(g.query(&q).unwrap().len(), 40);
+        drop(g);
+        assert!(
+            db.check().is_empty(),
+            "check reports no integrity issues: {:?}",
+            db.check()
+        );
+    }
+}
+
+#[test]
 fn spilled_txn_recovers_run_from_wal_after_crash() {
     // A spilled transaction's data must survive a reopen even though the run
     // was linked in memory only (the manifest may not have persisted in time).

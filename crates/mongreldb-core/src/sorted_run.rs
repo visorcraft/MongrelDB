@@ -1132,12 +1132,22 @@ impl<'a> RunWriter<'a> {
             .collect::<Result<Vec<_>>>()?;
         columns.extend(user_cols);
 
+        // A uniform-epoch run's `_epoch` column is a placeholder (the real commit
+        // epoch is overlaid from the RunRef at read time), so it must NOT be
+        // marked clean — the clean fast path skips snapshot gating — and must
+        // carry the overlay flag. write_native is not the spill path today, but
+        // keep it sound if it ever is.
+        let flags = if self.uniform_epoch {
+            RUN_FLAG_UNIFORM_EPOCH
+        } else {
+            RUN_FLAG_CLEAN
+        };
         let spec = RunSpec {
             run_id: self.run_id,
             schema_id: self.schema.schema_id,
             epoch_created: self.epoch_created.0,
             level: self.level,
-            flags: RUN_FLAG_CLEAN,
+            flags,
             sort_key_column_id: SYS_ROW_ID,
             row_count: n as u64,
             min_row_id: first_row_id,
