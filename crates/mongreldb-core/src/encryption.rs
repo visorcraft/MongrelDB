@@ -10,7 +10,10 @@
 //! (2)` — so no per-page nonce material is persisted. Decrypting a page
 //! requires unwrapping its run's DEK with the table KEK.
 
-use crate::error::{MongrelError, Result};
+use crate::error::Result;
+// `MongrelError` is only constructed by the feature-gated AES / key submodules.
+#[cfg(feature = "encryption")]
+use crate::error::MongrelError;
 
 /// DEK length (AES-256 = 32 bytes). Always available.
 pub const DEK_LEN: usize = 32;
@@ -172,6 +175,16 @@ mod key {
             self.derive_subkey(b"mongreldb/rcache/v1")
         }
 
+        /// Derive the index-checkpoint DEK from this KEK (`_idx/global.idx`).
+        pub fn derive_idx_key(&self) -> Zeroizing<[u8; DEK_LEN]> {
+            self.derive_subkey(b"mongreldb/idx/v1")
+        }
+
+        /// Derive the run-metadata MAC key from this KEK (see [`run_metadata_mac`]).
+        pub fn derive_run_mac_key(&self) -> Zeroizing<[u8; DEK_LEN]> {
+            self.derive_subkey(b"mongreldb/run-mac/v1")
+        }
+
         /// Wrap a 32-byte DEK with the KEK using AES-256-GCM. `wrap_nonce` must
         /// be unique per use under this KEK (a run's random `nonce_prefix`
         /// satisfies this).
@@ -261,19 +274,28 @@ mod key {
         mac.finalize().into_bytes().into()
     }
 
-    /// Order-preserving token for an `i64`: a key-derived affine map on the
-    /// sign-flipped u64 representation, computed in u128 so it never wraps. The
-    /// result is a 16-byte big-endian token whose byte order equals the value's
-    /// numeric order, so a range index over the token serves range queries
-    /// without decrypting. OPE inherently leaks order; the slope/intercept are
-    /// secret (key-derived), so absolute values stay hidden.
+    /// Order-preserving token for an `i64`: the sign-flipped u64 representation
+    /// run through [`monotone_ope`]. The result is a 16-byte big-endian token
+    /// whose byte order equals the value's numeric order, so a range index over
+    /// the token serves range queries without decrypting.
+    ///
+    /// **Still an OPE — leaks order; not ideal ORE.** Unlike the previous affine
+    /// map, this is *non-linear*: each byte-block's contribution is an
+    /// independent, key-derived random monotone function of that block, keyed by
+    /// all higher-order bytes (the prefix). There is no global `a·m + b`
+    /// structure, so the two-known-plaintext inversion and the GCD-of-gaps
+    /// spacing recovery that broke the affine scheme no longer apply. What it
+    /// still reveals: order (inherent to any OPE) and, to a known/chosen-
+    /// plaintext attacker, the monotone mapping of a block *within a shared
+    /// prefix*. For values that must stay fully hidden, prefer equality tokens
+    /// ([`hmac_token`]) or no index.
     pub fn ope_token_i64(col_key: &[u8; DEK_LEN], x: i64) -> [u8; 16] {
         let m = (x as u64) ^ (1u64 << 63); // order-preserving i64 -> u64
-        affine_ope(col_key, m)
+        monotone_ope(col_key, m)
     }
 
     /// Order-preserving token for an `f64`, via the IEEE-754 total-order → u64
-    /// bijection, then the same affine OPE as [`ope_token_i64`].
+    /// bijection, then the same [`monotone_ope`] as [`ope_token_i64`].
     pub fn ope_token_f64(col_key: &[u8; DEK_LEN], x: f64) -> [u8; 16] {
         let bits = x.to_bits();
         let m = if bits & (1u64 << 63) != 0 {
@@ -281,18 +303,106 @@ mod key {
         } else {
             bits ^ (1u64 << 63)
         };
-        affine_ope(col_key, m)
+        monotone_ope(col_key, m)
     }
 
-    /// key-derived affine OPE on a u64 domain: `token = a*m + b` in u128, where
-    /// `a` is a positive odd 32-bit value and `b` a 64-bit value, both derived
-    /// from the column key. `a < 2^32` and `m < 2^64` ⇒ `a*m + b < 2^96`, so it
-    /// never wraps and is strictly increasing in `m` (injective).
-    fn affine_ope(col_key: &[u8; DEK_LEN], m: u64) -> [u8; 16] {
-        let a = (u64::from_be_bytes(col_key[0..8].try_into().unwrap()) & 0xFFFF_FFFF) | 1;
-        let b = u64::from_be_bytes(col_key[8..16].try_into().unwrap());
-        let token = (m as u128) * (a as u128) + (b as u128);
-        token.to_be_bytes()
+    /// HKDF-Expand info label for the per-block OPE gap streams.
+    const OPE_INFO: &[u8] = b"mongreldb/ope-blk/v2";
+
+    /// Non-linear, prefix-keyed order-preserving encoding of a u64 onto a
+    /// 16-byte big-endian token.
+    ///
+    /// `m`'s 8 big-endian bytes are mapped block-by-block (MSB first). Block `i`
+    /// (value `v ∈ [0,256)`) becomes a 2-byte chunk
+    /// `o(v) = v + Σ_{t<v} gap[t]`, a strictly-increasing step function whose
+    /// gaps come from `HKDF(col_key, info ‖ i ‖ m[..i])` — i.e. keyed by the
+    /// block index AND every higher-order byte. With each `gap[t] ∈ [0,256)` the
+    /// chunk stays ≤ 65 280 < 2^16, so it fits two bytes and never overflows.
+    ///
+    /// Order preservation: for `m < m'` let `j` be the first differing byte
+    /// (`m[j] < m'[j]`, equal above). Equal prefixes ⇒ identical gap streams and
+    /// identical chunks for blocks `< j`; at `j` the step function is strictly
+    /// increasing so `o(m[j]) < o(m'[j])`; that smaller fixed-width chunk wins
+    /// the lexicographic comparison regardless of the lower bytes. Hence the
+    /// token byte-order equals numeric order, and the map is deterministic and
+    /// column-stable (same key ⇒ same token across runs), as the range index
+    /// requires.
+    fn monotone_ope(col_key: &[u8; DEK_LEN], m: u64) -> [u8; 16] {
+        let mb = m.to_be_bytes();
+        let mut out = [0u8; 16];
+        for i in 0..8 {
+            let v = mb[i] as usize;
+            let mut o: u32 = v as u32;
+            if v > 0 {
+                // Derive gap[0..v] (HKDF-Expand is a prefix-stable stream, so
+                // expanding `v` bytes matches the first `v` bytes for any v).
+                let mut info = Vec::with_capacity(OPE_INFO.len() + 1 + i);
+                info.extend_from_slice(OPE_INFO);
+                info.push(i as u8);
+                info.extend_from_slice(&mb[..i]);
+                let hk = hkdf::Hkdf::<sha2::Sha256>::from_prk(&col_key[..])
+                    .expect("col_key is 32 bytes >= HashLen");
+                let mut gaps = [0u8; 255];
+                hk.expand(&info, &mut gaps[..v])
+                    .expect("v <= 255 <= 255*HashLen");
+                for &g in &gaps[..v] {
+                    o += g as u32;
+                }
+            }
+            let chunk = o as u16; // <= 65_280, no truncation
+            out[2 * i..2 * i + 2].copy_from_slice(&chunk.to_be_bytes());
+        }
+        out
+    }
+
+    /// Encrypt an arbitrary blob with a DEK: `[nonce: 12B][AES-256-GCM ct+tag]`,
+    /// fresh random 96-bit nonce. Used for the at-rest index checkpoint and any
+    /// other low-write-volume blob (a random nonce is safe well past the handful
+    /// of writes such files see per key).
+    pub fn encrypt_blob(dek: &[u8; DEK_LEN], plaintext: &[u8]) -> Result<Vec<u8>> {
+        let cipher = crate::encryption::AesCipher::new(&dek[..])?;
+        let mut nonce = [0u8; 12];
+        fill_random(&mut nonce);
+        let ct = cipher.encrypt_page(&nonce, plaintext)?;
+        let mut out = Vec::with_capacity(12 + ct.len());
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&ct);
+        Ok(out)
+    }
+
+    /// Inverse of [`encrypt_blob`]. The GCM tag authenticates; a wrong key or
+    /// tampered blob fails here.
+    pub fn decrypt_blob(dek: &[u8; DEK_LEN], bytes: &[u8]) -> Result<Vec<u8>> {
+        if bytes.len() < 12 + 16 {
+            return Err(MongrelError::Decryption("blob too short".into()));
+        }
+        let cipher = crate::encryption::AesCipher::new(&dek[..])?;
+        let nonce: [u8; 12] = bytes[..12].try_into().unwrap();
+        cipher.decrypt_page(&nonce, &bytes[12..])
+    }
+
+    /// HMAC-SHA256 over a run's metadata (`header ‖ dir ‖ descriptor`, each
+    /// length-prefixed) under a KEK-derived key. Binds the *cleartext* run
+    /// header, column directory, and encryption descriptor to the key, so an
+    /// attacker with write access cannot tamper offsets / page stats / structure
+    /// (which would otherwise silently corrupt query results) without detection.
+    /// Page payloads are already AEAD-authenticated per page, so they are not
+    /// re-covered here (avoids a full-file read on open).
+    pub fn run_metadata_mac(
+        mac_key: &[u8; DEK_LEN],
+        header: &[u8],
+        dir: &[u8],
+        descriptor: &[u8],
+    ) -> [u8; 32] {
+        use hmac::Mac;
+        let mut mac = <hmac::Hmac<sha2::Sha256> as Mac>::new_from_slice(mac_key)
+            .expect("HMAC accepts any key size");
+        mac.update(b"mongreldb/run-meta-mac/v1");
+        for part in [header, dir, descriptor] {
+            mac.update(&(part.len() as u64).to_le_bytes());
+            mac.update(part);
+        }
+        mac.finalize().into_bytes().into()
     }
 
     /// Build a distinct AEAD nonce for a KEK wrap (DEK or a column key) from the
@@ -413,6 +523,7 @@ mod key {
             cipher,
             nonce_prefix,
             descriptor_bytes,
+            mac_key: Some(*kek.derive_run_mac_key()),
         })
     }
 
@@ -437,15 +548,17 @@ mod key {
             cipher,
             nonce_prefix: desc.nonce_prefix,
             descriptor_bytes: Vec::new(),
+            mac_key: None,
         })
     }
 }
 
 #[cfg(feature = "encryption")]
 pub use key::{
-    build_page_nonce, build_run_cipher, generate_dek, hmac_token, ope_token_f64, ope_token_i64,
-    random_nonce_prefix, random_salt, setup_run_encryption, ColumnKeyDescriptor,
-    EncryptionDescriptor, Kek, ALGO_AES_GCM, SALT_LEN, SCHEME_HMAC_EQ, SCHEME_OPE_RANGE,
+    build_page_nonce, build_run_cipher, decrypt_blob, encrypt_blob, generate_dek, hmac_token,
+    ope_token_f64, ope_token_i64, random_nonce_prefix, random_salt, run_metadata_mac,
+    setup_run_encryption, ColumnKeyDescriptor, EncryptionDescriptor, Kek, ALGO_AES_GCM, SALT_LEN,
+    SCHEME_HMAC_EQ, SCHEME_OPE_RANGE,
 };
 
 /// Per-run encryption material assembled at write/read time: the page cipher
@@ -457,6 +570,9 @@ pub struct RunEncryption {
     pub cipher: Box<dyn Cipher>,
     pub nonce_prefix: [u8; 12],
     pub descriptor_bytes: Vec<u8>,
+    /// Run-metadata MAC key (write path only; `None` on the read path, where the
+    /// reader re-derives it from the KEK). See [`run_metadata_mac`].
+    pub mac_key: Option<[u8; 32]>,
 }
 
 /// Placeholder KEK when the `encryption` feature is disabled. It has no public
@@ -629,6 +745,30 @@ mod tests {
         }
         // Equal values map to equal tokens (deterministic).
         assert_eq!(ope_token_i64(&ck, 0), ope_token_i64(&ck, 0));
+    }
+
+    /// Regression (peer review): the OPE must be NON-linear. The old affine map
+    /// (`a*m + b`) gave equally-spaced tokens for equally-spaced inputs, which a
+    /// two-known-plaintext / GCD attacker inverts trivially. The prefix-keyed
+    /// construction must not have constant token gaps.
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn ope_token_is_non_linear() {
+        let salt = random_salt();
+        let k = Kek::derive("pass", &salt).unwrap();
+        let ck = k.derive_column_key(9);
+        let t = |x: i64| u128::from_be_bytes(ope_token_i64(&ck, x));
+        // Equally-spaced inputs → gaps must differ (an affine map would tie them).
+        let g1 = t(101).wrapping_sub(t(100));
+        let g2 = t(102).wrapping_sub(t(101));
+        let g3 = t(103).wrapping_sub(t(102));
+        assert!(
+            !(g1 == g2 && g2 == g3),
+            "constant token gaps => OPE is still affine/linear"
+        );
+        // …while remaining strictly order-preserving and deterministic.
+        assert!(t(100) < t(101) && t(101) < t(102) && t(102) < t(103));
+        assert_eq!(ope_token_i64(&ck, 100), ope_token_i64(&ck, 100));
     }
 
     #[cfg(feature = "encryption")]

@@ -9,7 +9,7 @@
 
 use mongreldb_core::{
     schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId},
-    sorted_run::read_header,
+    sorted_run::{read_column_dir, read_header},
     Condition, Db, EncryptionDescriptor, Query, Value,
 };
 use std::io::{Read, Seek, SeekFrom};
@@ -309,4 +309,163 @@ fn indexable_descriptor_records_column_key() {
         cd.wrapped_column_key.len(),
         mongreldb_core::encryption::DEK_LEN + 16
     );
+}
+
+/// Regression (peer review): the column directory is serialized in cleartext, so
+/// per-page `min`/`max` must NOT carry plaintext values for encrypted columns —
+/// otherwise an at-rest attacker reads literal values straight out of the `.sr`
+/// file without the key. Asserts a distinctive plaintext canary never appears in
+/// the raw run bytes (it would, as the min==max of its page, before the fix).
+#[test]
+fn encrypted_run_directory_does_not_leak_plaintext_minmax() {
+    const CANARY: &[u8] = b"CANARY-SECRET-must-not-hit-disk-in-cleartext";
+    let dir = tempdir().unwrap();
+    let id = {
+        let mut db = Db::create_encrypted(dir.path(), schema(), 1, "pw").unwrap();
+        db.set_mutable_run_spill_bytes(1);
+        let id = db
+            .put(vec![
+                (1, Value::Int64(7)),
+                (2, Value::Bytes(CANARY.to_vec())),
+            ])
+            .unwrap();
+        db.flush().unwrap();
+        id
+    };
+    let runs = run_files(dir.path());
+    assert_eq!(runs.len(), 1);
+    let raw = std::fs::read(&runs[0]).unwrap();
+    assert!(
+        raw.windows(CANARY.len()).all(|w| w != CANARY),
+        "plaintext canary leaked into the encrypted run file (min/max in the \
+         cleartext directory?)"
+    );
+    // And the value still round-trips with the key (decrypt path intact).
+    let db = Db::open_encrypted(dir.path(), "pw").unwrap();
+    let row = db.get(id, db.snapshot()).unwrap();
+    assert!(matches!(row.columns.get(&2), Some(Value::Bytes(b)) if b == CANARY));
+}
+
+/// Regression (peer review): with min/max suppressed for encrypted columns, the
+/// range resolvers must fall back to a full decrypt-and-scan instead of treating
+/// a missing stat as "all-null" and skipping the page (which would silently drop
+/// every matching row). A range query over an encrypted Int64 column must still
+/// return exactly the matching rows.
+#[test]
+fn encrypted_int64_range_query_returns_correct_rows() {
+    let dir = tempdir().unwrap();
+    let mut db = Db::create_encrypted(dir.path(), schema(), 1, "pw").unwrap();
+    db.set_mutable_run_spill_bytes(1);
+    for i in 1..=100i64 {
+        db.put(vec![
+            (1, Value::Int64(i)),
+            (2, Value::Bytes(format!("v{i}").into_bytes())),
+        ])
+        .unwrap();
+    }
+    db.flush().unwrap();
+    let got = db
+        .query(&Query::new().and(Condition::Range {
+            column_id: 1,
+            lo: 10,
+            hi: 20,
+        }))
+        .unwrap()
+        .len();
+    assert_eq!(got, 11, "encrypted range scan must not skip matching pages");
+}
+
+/// Regression (peer review, run-metadata MAC): the cleartext run directory/header
+/// drive page decoding but were guarded only by an UNKEYED SHA-256 an attacker can
+/// recompute. Each encrypted run now carries a KEK-derived HMAC over
+/// header+dir+descriptor, appended after the footer. Corrupting that tag (the only
+/// bytes nothing else reads) must reject reads — a non-vacuous proof the MAC is
+/// both written and enforced. The same verification covers any tamper of the
+/// header/dir/descriptor it authenticates.
+#[test]
+fn run_metadata_mac_is_written_and_enforced() {
+    let dir = tempdir().unwrap();
+    {
+        let mut db = Db::create_encrypted(dir.path(), schema(), 1, "pw").unwrap();
+        db.set_mutable_run_spill_bytes(1);
+        for i in 1..=20i64 {
+            db.put(vec![
+                (1, Value::Int64(i)),
+                (2, Value::Bytes(format!("v{i}").into_bytes())),
+            ])
+            .unwrap();
+        }
+        db.flush().unwrap();
+    }
+    let runs = run_files(dir.path());
+    let path = &runs[0];
+    let header = read_header(path).unwrap();
+    let mut bytes = std::fs::read(path).unwrap();
+
+    // The 32-byte MAC tag sits right after the 48-byte footer; the writer must
+    // have appended it.
+    let tag_off = header.footer_offset as usize + 48;
+    assert!(
+        bytes.len() >= tag_off + 32,
+        "encrypted run must carry a 32-byte metadata MAC tag"
+    );
+    // Corrupt the tag. It is past the SHA-256-checksummed region, so the unkeyed
+    // checks still pass — only the keyed MAC can reject.
+    bytes[tag_off] ^= 0xFF;
+    std::fs::write(path, &bytes).unwrap();
+    assert!(read_header(path).is_ok(), "tag is past the checksummed region");
+    assert!(read_column_dir(path, &header).is_ok(), "directory still parses");
+
+    // Open may load the still-valid checkpoint without touching the run; the query
+    // forces a run read, which must be rejected by the MAC.
+    let opened = Db::open_encrypted(dir.path(), "pw");
+    let rejected = match opened {
+        Err(_) => true,
+        Ok(mut db) => db
+            .query(&Query::new().and(Condition::Range {
+                column_id: 1,
+                lo: 1,
+                hi: 20,
+            }))
+            .is_err(),
+    };
+    assert!(rejected, "a corrupted run-metadata MAC must reject run reads");
+}
+
+/// Regression (peer review, checkpoint encryption): the persisted index
+/// checkpoint embeds index keys / PGM segments derived from user data. For an
+/// encrypted table it must be encrypted at rest — not begin with the cleartext
+/// `MONGRIDX` magic — and still round-trip on reopen with the key.
+#[test]
+fn index_checkpoint_is_encrypted_at_rest() {
+    let dir = tempdir().unwrap();
+    {
+        let mut db = Db::create_encrypted(dir.path(), schema_indexable_eq(), 1, "pw").unwrap();
+        db.set_mutable_run_spill_bytes(1);
+        for i in 1..=20i64 {
+            db.put(vec![
+                (1, Value::Int64(i)),
+                (2, Value::Bytes(format!("label{i}").into_bytes())),
+            ])
+            .unwrap();
+        }
+        db.flush().unwrap();
+    }
+    let idx = dir.path().join("_idx").join("global.idx");
+    assert!(idx.exists(), "checkpoint should exist after flush");
+    let bytes = std::fs::read(&idx).unwrap();
+    assert!(
+        bytes.len() < 8 || &bytes[..8] != b"MONGRIDX",
+        "encrypted table's index checkpoint leaked the cleartext magic"
+    );
+    // Reopen loads the (encrypted) checkpoint and an indexed lookup still works.
+    let mut db = Db::open_encrypted(dir.path(), "pw").unwrap();
+    let n = db
+        .query(&Query::new().and(Condition::BitmapEq {
+            column_id: 2,
+            value: b"label7".to_vec(),
+        }))
+        .unwrap()
+        .len();
+    assert_eq!(n, 1, "indexed equality lookup must work after encrypted reopen");
 }

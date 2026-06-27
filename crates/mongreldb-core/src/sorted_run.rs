@@ -129,6 +129,38 @@ impl ColumnPageHeader {
     const PAGE_ENCRYPTED: u8 = 1 << 0;
 }
 
+/// Length of the run-metadata HMAC tag appended after the footer of an encrypted
+/// run (HMAC-SHA256, see [`crate::encryption::run_metadata_mac`]).
+const RUN_MAC_LEN: usize = 32;
+
+/// Compute the run-metadata MAC tag for an encrypted run, or `None` for a
+/// plaintext run (or when the `encryption` feature is off, where `enc` is always
+/// `None`). MACs `header ‖ dir ‖ descriptor` under the run's KEK-derived key.
+fn compute_run_mac(
+    enc: Option<&RunEncryption>,
+    header_bytes: &[u8],
+    dir_bytes: &[u8],
+) -> Option<[u8; RUN_MAC_LEN]> {
+    #[cfg(feature = "encryption")]
+    {
+        if let Some(e) = enc {
+            if let Some(mac_key) = &e.mac_key {
+                return Some(crate::encryption::run_metadata_mac(
+                    mac_key,
+                    header_bytes,
+                    dir_bytes,
+                    &e.descriptor_bytes,
+                ));
+            }
+        }
+    }
+    #[cfg(not(feature = "encryption"))]
+    {
+        let _ = (enc, header_bytes, dir_bytes);
+    }
+    None
+}
+
 /// A column's pages handed to the low-level writer.
 pub struct ColumnPayload {
     pub column_id: u16,
@@ -303,6 +335,16 @@ fn plan_run(
             stat.offset = cursor;
             stat.compressed_len = odl as u32;
             stat.uncompressed_len = page.len() as u32;
+            // The column directory is serialized in cleartext, so per-page
+            // min/max would leak raw plaintext values (literal bytes for `Bytes`
+            // columns) of every encrypted page to anyone reading the file
+            // without the key. Drop them for encrypted runs — pruning falls back
+            // to a full decrypt-and-scan for these columns (see the range
+            // resolvers' `col_encrypted` guard).
+            if encrypted {
+                stat.min = None;
+                stat.max = None;
+            }
             stats.push(stat);
             cursor += odl as u64;
             region_len += odl as u64;
@@ -343,7 +385,9 @@ fn plan_run(
         None => 0,
     };
     let footer_offset = cursor;
-    let total = footer_offset as usize + 8 + 8 + 32;
+    // footer = MAGIC(8) + footer_offset(8) + checksum(32); encrypted runs append
+    // a 32-byte HMAC tag (RUN_MAC_LEN) authenticating header+dir+descriptor.
+    let total = footer_offset as usize + 8 + 8 + 32 + if encrypted { RUN_MAC_LEN } else { 0 };
     Ok(RunPlan {
         jobs,
         dir_bytes,
@@ -486,6 +530,10 @@ fn place_run(
     buf[foot..foot + 8].copy_from_slice(&RUN_MAGIC);
     buf[foot + 8..foot + 16].copy_from_slice(&plan.footer_offset.to_le_bytes());
     buf[foot + 16..foot + 48].copy_from_slice(&checksum);
+    // Encrypted runs: append the keyed metadata MAC over header‖dir‖descriptor.
+    if let Some(tag) = compute_run_mac(enc, &header_bytes, &plan.dir_bytes) {
+        buf[foot + 48..foot + 48 + RUN_MAC_LEN].copy_from_slice(&tag);
+    }
     Ok(header)
 }
 
@@ -541,6 +589,13 @@ fn write_run_vec(
             stat.offset = offset;
             stat.compressed_len = on_disk.len() as u32;
             stat.uncompressed_len = page.len() as u32;
+            // See plan_run: the cleartext directory must not carry plaintext
+            // min/max for encrypted columns. Keep this byte-identical to
+            // plan_run so both writers emit the same run.
+            if enc.is_some() {
+                stat.min = None;
+                stat.max = None;
+            }
             stats.push(stat);
         }
         let page_flags = if enc.is_some() {
@@ -621,6 +676,11 @@ fn write_run_vec(
     buf.write_all(&RUN_MAGIC)?;
     buf.write_all(&footer_offset.to_le_bytes())?;
     buf.write_all(&checksum)?;
+    // Encrypted runs: append the keyed metadata MAC (byte-identical to the mmap
+    // writer). `dir_bytes`/`header_bytes` here are the exact serialized forms.
+    if let Some(tag) = compute_run_mac(enc.as_ref(), &header_bytes, &dir_bytes) {
+        buf.write_all(&tag)?;
+    }
 
     let mut file = OpenOptions::new()
         .create(true)
@@ -767,6 +827,59 @@ pub(crate) fn read_encryption_descriptor_bytes(
     let mut buf = vec![0u8; len];
     file.read_exact(&mut buf)?;
     Ok(buf)
+}
+
+/// Authenticate an encrypted run's cleartext metadata (`header ‖ dir ‖
+/// descriptor`) against the keyed MAC tag stored after the footer. Run BEFORE
+/// any offset/stat from the directory is trusted to drive a read. Errors if the
+/// tag is missing (a run written before run-metadata MACs existed) or does not
+/// match (tampering, or the wrong key). The on-disk page payloads are AEAD-
+/// authenticated separately, so they are not covered here.
+#[cfg(feature = "encryption")]
+fn verify_run_mac(
+    path: &Path,
+    header: &RunHeader,
+    dir: &[ColumnPageHeader],
+    kek: &Kek,
+    desc_bytes: &[u8],
+) -> Result<()> {
+    let header_bytes = bincode::serialize(header)?;
+    let dir_bytes = bincode::serialize(dir)?;
+    let mac_key = kek.derive_run_mac_key();
+    let expected =
+        crate::encryption::run_metadata_mac(&mac_key, &header_bytes, &dir_bytes, desc_bytes);
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(header.footer_offset + 8 + 8 + 32))?;
+    let mut tag = [0u8; RUN_MAC_LEN];
+    file.read_exact(&mut tag).map_err(|_| {
+        MongrelError::Decryption(
+            "encrypted run is missing or truncated its metadata MAC; cannot \
+             authenticate metadata"
+                .into(),
+        )
+    })?;
+    // Constant-time comparison (no early-exit timing oracle on the tag).
+    let mut diff = 0u8;
+    for (x, y) in tag.iter().zip(expected.iter()) {
+        diff |= x ^ y;
+    }
+    if diff != 0 {
+        return Err(MongrelError::Decryption(
+            "run metadata authentication failed — tampered run or wrong key".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "encryption"))]
+fn verify_run_mac(
+    _path: &Path,
+    _header: &RunHeader,
+    _dir: &[ColumnPageHeader],
+    _kek: &Kek,
+    _desc_bytes: &[u8],
+) -> Result<()> {
+    Ok(())
 }
 
 // ============================ high-level writer ============================
@@ -1313,6 +1426,12 @@ impl RunReader {
                 ));
             }
             let desc_bytes = read_encryption_descriptor_bytes(&path, &header)?;
+            // Authenticate the cleartext metadata (header‖dir‖descriptor) under
+            // the KEK-derived MAC key BEFORE trusting any offset/stat to drive a
+            // read. Required for every encrypted run (no downgrade path: an
+            // attacker can neither strip the encryption — pages stay ciphertext —
+            // nor forge the tag without the key).
+            verify_run_mac(&path, &header, &dir, kek, &desc_bytes)?;
             let enc = crate::encryption::build_run_cipher(kek, &desc_bytes)?;
             (Some(enc.cipher), enc.nonce_prefix)
         } else {
@@ -1377,6 +1496,19 @@ impl RunReader {
             .iter()
             .find(|h| h.column_id == column_id)
             .ok_or_else(|| MongrelError::ColumnNotFound(format!("column {column_id}")))
+    }
+
+    /// Whether `column_id`'s pages are encrypted. Encrypted runs carry no
+    /// cleartext per-page min/max (they would leak plaintext values), so the
+    /// range resolvers must NOT prune by stats for such columns — a missing
+    /// stat there means "hidden", not "all-null". They fall back to decrypting
+    /// and scanning every page.
+    fn col_encrypted(&self, column_id: u16) -> bool {
+        self.dir
+            .iter()
+            .find(|h| h.column_id == column_id)
+            .map(|h| h.flags & ColumnPageHeader::PAGE_ENCRYPTED != 0)
+            .unwrap_or(false)
     }
 
     pub(crate) fn read_page(&mut self, column_id: u16, page_seq: usize) -> Result<Vec<u8>> {
@@ -1772,13 +1904,16 @@ impl RunReader {
                     .collect(),
                 None => return Ok(std::collections::HashSet::new()),
             };
+        // Encrypted columns have no cleartext stats — never prune, always scan.
+        let col_encrypted = self.col_encrypted(column_id);
         let mut out = std::collections::HashSet::new();
         for (seq, (mn, mx, nrows)) in info.into_iter().enumerate() {
             // Skip pages that cannot contain a match (or are all-null).
-            let skip = match (mn, mx) {
-                (Some(mn), Some(mx)) => mx < lo || mn > hi,
-                _ => true,
-            };
+            let skip = !col_encrypted
+                && match (mn, mx) {
+                    (Some(mn), Some(mx)) => mx < lo || mn > hi,
+                    _ => true,
+                };
             if skip {
                 continue;
             }
@@ -1827,18 +1962,21 @@ impl RunReader {
                     .collect(),
                 None => return Ok(std::collections::HashSet::new()),
             };
+        // Encrypted columns have no cleartext stats — never prune, always scan.
+        let col_encrypted = self.col_encrypted(column_id);
         let mut out = std::collections::HashSet::new();
         for (seq, (mn, mx, nrows)) in info.into_iter().enumerate() {
             // A page can be dropped iff every value fails the predicate, i.e. the
             // largest fails the lo-test or the smallest fails the hi-test.
-            let skip = match (mn, mx) {
-                (Some(mn), Some(mx)) => {
-                    let skip_lo = mx < lo || (!lo_inclusive && mx == lo);
-                    let skip_hi = mn > hi || (!hi_inclusive && mn == hi);
-                    skip_lo || skip_hi
-                }
-                _ => true,
-            };
+            let skip = !col_encrypted
+                && match (mn, mx) {
+                    (Some(mn), Some(mx)) => {
+                        let skip_lo = mx < lo || (!lo_inclusive && mx == lo);
+                        let skip_hi = mn > hi || (!hi_inclusive && mn == hi);
+                        skip_lo || skip_hi
+                    }
+                    _ => true,
+                };
             if skip {
                 continue;
             }
@@ -1924,6 +2062,8 @@ impl RunReader {
                 .collect(),
             None => return Ok(Vec::new()),
         };
+        // Encrypted columns have no cleartext stats — never prune, always scan.
+        let col_encrypted = self.col_encrypted(column_id);
         let (positions, rids) = self.visible_positions_with_rids(snapshot)?;
         let mut out: Vec<u64> = Vec::new();
         let mut vis = 0usize;
@@ -1931,10 +2071,11 @@ impl RunReader {
         for (seq, &(mn, mx, nrows)) in stats.iter().enumerate() {
             let page_end = page_start + nrows;
             // A page can be dropped iff every value fails the predicate.
-            let skip = match (mn, mx) {
-                (Some(mn), Some(mx)) => mx < lo || mn > hi,
-                _ => true, // all-null / no stats → nulls never match
-            };
+            let skip = !col_encrypted
+                && match (mn, mx) {
+                    (Some(mn), Some(mx)) => mx < lo || mn > hi,
+                    _ => true, // all-null / no stats → nulls never match
+                };
             if !skip {
                 let val_page = self.read_page(column_id, seq)?;
                 let vals = columnar::decode_page_native(TypeId::Int64, &val_page, nrows)?;
@@ -1985,20 +2126,23 @@ impl RunReader {
                 .collect(),
             None => return Ok(Vec::new()),
         };
+        // Encrypted columns have no cleartext stats — never prune, always scan.
+        let col_encrypted = self.col_encrypted(column_id);
         let (positions, rids) = self.visible_positions_with_rids(snapshot)?;
         let mut out: Vec<u64> = Vec::new();
         let mut vis = 0usize;
         let mut page_start = 0usize;
         for (seq, &(mn, mx, nrows)) in stats.iter().enumerate() {
             let page_end = page_start + nrows;
-            let skip = match (mn, mx) {
-                (Some(mn), Some(mx)) => {
-                    let skip_lo = mx < lo || (!lo_inclusive && mx == lo);
-                    let skip_hi = mn > hi || (!hi_inclusive && mn == hi);
-                    skip_lo || skip_hi
-                }
-                _ => true,
-            };
+            let skip = !col_encrypted
+                && match (mn, mx) {
+                    (Some(mn), Some(mx)) => {
+                        let skip_lo = mx < lo || (!lo_inclusive && mx == lo);
+                        let skip_hi = mn > hi || (!hi_inclusive && mn == hi);
+                        skip_lo || skip_hi
+                    }
+                    _ => true,
+                };
             if !skip {
                 let val_page = self.read_page(column_id, seq)?;
                 let vals = columnar::decode_page_native(TypeId::Float64, &val_page, nrows)?;

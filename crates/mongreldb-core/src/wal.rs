@@ -75,12 +75,21 @@ pub struct Wal {
     /// Optional AEAD cipher for frame-level encryption. When present, each
     /// frame's payload is encrypted before writing.
     cipher: Option<Box<dyn crate::encryption::Cipher>>,
-    /// Random per-segment nonce seed (4 bytes, generated on creation).
-    /// Combined with the 8-byte frame counter gives a unique 12-byte nonce
-    /// per frame. 4 bytes of randomness = 2^32 possible seeds → birthday
-    /// collision at ~2^16 segments, well within practical limits.
-    nonce_seed: [u8; 4],
-    /// Per-segment frame counter (u64 — never overflows in practice).
+    /// Random per-segment nonce seed (8 bytes, drawn fresh on every segment
+    /// create / rotate / reopen). Forms the high 8 bytes of the 12-byte
+    /// AES-GCM nonce; the low 4 are the frame counter. The WAL DEK is constant
+    /// across all segments, so cross-segment nonce uniqueness rests entirely on
+    /// this seed: 8 bytes = 2^64 seeds → birthday collision only near ~2^32
+    /// segments (vs ~2^16 for the old 4-byte seed). Drawing a fresh seed on
+    /// every create — including reopen, which truncates and rewrites the active
+    /// segment — is also what stops a reopened segment from replaying the
+    /// pre-crash segment's nonces under the same DEK.
+    nonce_seed: [u8; 8],
+    /// Per-segment frame counter. Occupies the low 4 bytes of the nonce, so
+    /// `append_record` refuses to write past `u32::MAX` frames in one segment
+    /// (that would truncate the counter and reuse a nonce under the DEK).
+    /// Segments rotate at flush long before this, so it is unreachable in
+    /// practice — but enforced rather than assumed.
     frame_seq: u64,
 }
 
@@ -103,7 +112,7 @@ impl Wal {
             .write(true)
             .truncate(true)
             .open(&path)?;
-        let mut nonce_seed = [0u8; 4];
+        let mut nonce_seed = [0u8; 8];
         // fill_random is always available (non-cfg-gated)
         getrandom::getrandom(&mut nonce_seed).expect("getrandom: OS CSPRNG unavailable");
         let mut wal = Self {
@@ -138,6 +147,15 @@ impl Wal {
         // Encrypt the payload if a cipher is present. The nonce is prepended
         // to the ciphertext so the reader can extract it from a single read.
         let frame_payload = if let Some(cipher) = &self.cipher {
+            // The frame counter occupies the low 4 bytes of the nonce. Refuse to
+            // wrap it — a wrapped counter would reuse a nonce under the constant
+            // WAL DEK (catastrophic for AES-GCM). Unreachable in practice
+            // (segments rotate at flush), but enforced.
+            if self.frame_seq > u32::MAX as u64 {
+                return Err(MongrelError::Full(
+                    "wal segment frame counter exhausted (2^32); rotate the segment".into(),
+                ));
+            }
             let nonce = self.frame_nonce();
             let ciphertext = cipher.encrypt_page(&nonce, &payload)?;
             self.frame_seq += 1;
@@ -172,20 +190,15 @@ impl Wal {
         Ok(())
     }
 
-    /// Derive a unique 12-byte AEAD nonce for the current frame:
-    /// `[epoch_created: 8B LE][frame_seq: 4B LE]`. epoch_created is unique
-    /// per segment (monotonically increasing), frame_seq is unique within
-    /// a segment — together they guarantee nonce uniqueness across all
-    /// segments under the same WAL DEK.
-    /// Derive a unique 12-byte AEAD nonce for the current frame:
-    /// `[nonce_seed: 4B][frame_seq: 8B LE]`. The seed is random per segment
-    /// (regenerated on every Wal::create_with_cipher call), frame_seq is a
-    /// monotonically increasing u64 — together they guarantee nonce uniqueness
-    /// across segments and frames under the same WAL DEK.
+    /// Build the 12-byte AES-GCM nonce for the current frame:
+    /// `[nonce_seed: 8B][frame_seq: 4B LE]`. The seed is random per segment
+    /// (drawn on every `create_with_cipher`) and the counter is unique within a
+    /// segment, so nonces never repeat under the constant WAL DEK — provided
+    /// `frame_seq <= u32::MAX`, which `append_record` enforces before calling.
     fn frame_nonce(&self) -> [u8; 12] {
         let mut n = [0u8; 12];
-        n[..4].copy_from_slice(&self.nonce_seed);
-        n[4..].copy_from_slice(&self.frame_seq.to_le_bytes());
+        n[..8].copy_from_slice(&self.nonce_seed);
+        n[8..].copy_from_slice(&(self.frame_seq as u32).to_le_bytes());
         n
     }
 
@@ -369,8 +382,13 @@ impl WalReader {
             payload.to_vec()
         };
 
-        let mut record: Record = bincode::deserialize(&plaintext)?;
-        record.seq = Epoch(seq);
+        // Trust the deserialized `seq`, not the outer frame `seq`: the outer one
+        // is covered only by an unkeyed CRC32C (recomputable by anyone with
+        // write access), whereas the inner `seq` rides inside the record — under
+        // the CRC for plaintext frames and under AES-GCM authentication for
+        // encrypted ones. They are written equal, so this changes nothing for
+        // honest data while denying a tamperer the ability to renumber a frame.
+        let record: Record = bincode::deserialize(&plaintext)?;
         self.pos += 4 + 4 + 8 + len as u64;
         Ok(Some(record))
     }

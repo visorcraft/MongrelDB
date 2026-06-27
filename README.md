@@ -93,7 +93,8 @@ Join `COUNT(*)` **3× faster than DuckDB, 15× faster than SQLite**.
 - **Projection pushdown:** only the columns the query asks for are decoded.
 - **Page index:** columns are split into 65 536-row pages with populated
   `PageStat` min/max; the reader skips pages whose `[min,max]` excludes the
-  predicate during filtered scans (Parquet-style pruning).
+  predicate during filtered scans (Parquet-style pruning). Encrypted columns
+  omit plaintext min/max (it would leak values) and fall back to a full scan.
 - **Multi-table:** distinct tables register on one DataFusion context for joins.
 - **Arrow bridge:** Constructs `Int64Array`/`Float64Array` directly from typed
   buffers (one memcpy, no per-element builder) for the all-non-null case.
@@ -119,25 +120,25 @@ Join `COUNT(*)` **3× faster than DuckDB, 15× faster than SQLite**.
 ## Encryption
 
 MongrelDB supports optional page-level encryption via AES-256-GCM (enabled
-with the `encryption` feature). The **passphrase is the sole secret** — there
-is no key file, KMS integration, or environment variable mechanism.
+with the `encryption` feature). The **secret is a passphrase or a raw key
+file** — there is no KMS integration or environment-variable mechanism.
 
 ### Key hierarchy
 
 ```
-passphrase + salt (16-byte random, stored in _meta/keys)
-  │
-  ▼  Argon2id (19 MiB, 2 iterations) + HKDF-SHA256
-  │
-  KEK (256-bit, table-level, never persisted)
-  │
-  ├──► AES-256-GCM wraps a fresh random DEK per sorted run
-  │    (stored wrapped in the run header; unwrapped in memory on open)
-  │
-  └──► HKDF-Expand per column ("mongreldb/colkey/" + column_id)
-       │
-       ├──► HMAC-SHA256 key → deterministic equality tokens (ENCRYPTED_INDEXABLE)
-       └──► OPE key → order-preserving encryption for range queries
+passphrase + salt (16-byte random, in _meta/keys)   |   raw key file (≥32 bytes)
+  │                                                      │
+  ▼  Argon2id (19 MiB, t=2) + HKDF-SHA256               ▼  HKDF-SHA256 only
+  └─────────────► KEK (256-bit, table-level, never persisted) ◄───────────┘
+        │
+        ├──► per-run DEK (random; AES-256-GCM-wrapped in the run descriptor) → page payloads
+        ├──► WAL key              → WAL frame AEAD (_wal/)
+        ├──► result-cache key     → _rcache/ AEAD
+        ├──► index-checkpoint key → _idx/global.idx AEAD
+        ├──► run-metadata MAC key → HMAC over each run's header + dir + descriptor
+        └──► per-column key (HKDF "mongreldb/colkey/" + column_id)   [ENCRYPTED_INDEXABLE]
+               ├──► HMAC-SHA256          → deterministic equality tokens
+               └──► order-preserving enc → non-linear range tokens
 ```
 
 All key material in memory is wrapped in `Zeroizing` and wiped on drop.
@@ -164,8 +165,14 @@ cargo build --release --features encryption
 | Sorted-run page payloads (`.sr`) | **Yes** (AES-256-GCM per page) |
 | WAL segments (`_wal/`) | **Yes** (frame-level AES-256-GCM) |
 | Result cache (`_rcache/`) | **Yes** (AES-256-GCM) |
-| Run headers / metadata | No (needed for open/recovery) |
-| Manifest / schema / indexes | No |
+| Index checkpoint (`_idx/global.idx`) | **Yes** (AES-256-GCM) |
+| Per-page min/max zone maps | Omitted for encrypted columns (would leak values) |
+| Run header / directory | No — but **authenticated** by a required keyed HMAC (tamper-evident) |
+| Manifest / schema | No |
+
+Tampering an encrypted run's cleartext metadata (offsets, page stats, structure)
+is caught on open by the run-metadata MAC; page payloads are authenticated per
+page by AES-256-GCM.
 
 ### Key files
 

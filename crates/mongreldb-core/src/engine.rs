@@ -930,7 +930,7 @@ impl Db {
         //    Valid only when its embedded epoch matches the manifest-endorsed
         //    `global_idx_epoch` and every run was created at or before it, so the
         //    checkpoint covers all run data. Otherwise rebuild from the runs.
-        let checkpoint = global_idx::read(&db.dir)?;
+        let checkpoint = global_idx::read(&db.dir, db.idx_dek().as_deref())?;
         let checkpoint_valid = checkpoint.as_ref().is_some_and(|c| {
             c.epoch_built == manifest.global_idx_epoch
                 && manifest.global_idx_epoch > 0
@@ -1450,7 +1450,10 @@ impl Db {
             learned_range: &self.learned_range,
         };
         // Best-effort: a failed checkpoint just means the next open rebuilds.
-        if global_idx::write_atomic(&self.dir, self.table_id, epoch.0, snap).is_ok() {
+        let idx_dek = self.idx_dek();
+        if global_idx::write_atomic(&self.dir, self.table_id, epoch.0, snap, idx_dek.as_deref())
+            .is_ok()
+        {
             self.global_idx_epoch = epoch.0;
             let _ = self.persist_manifest(epoch);
         }
@@ -3702,6 +3705,19 @@ impl Db {
 
     pub(crate) fn kek(&self) -> Option<Arc<Kek>> {
         self.kek.clone()
+    }
+
+    /// The index-checkpoint DEK (KEK-derived) for encrypted tables; `None` for
+    /// plaintext tables. The checkpoint embeds index keys / PGM segment values
+    /// derived from user data, so an encrypted table must encrypt it at rest.
+    #[cfg(feature = "encryption")]
+    fn idx_dek(&self) -> Option<Zeroizing<[u8; DEK_LEN]>> {
+        self.kek.as_ref().map(|k| k.derive_idx_key())
+    }
+
+    #[cfg(not(feature = "encryption"))]
+    fn idx_dek(&self) -> Option<Zeroizing<[u8; DEK_LEN]>> {
+        None
     }
 
     /// `(column_id, scheme)` for every ENCRYPTED_INDEXABLE column — passed to

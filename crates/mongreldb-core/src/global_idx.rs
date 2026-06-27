@@ -82,11 +82,47 @@ pub fn path(dir: &Path) -> PathBuf {
 /// Atomically write the checkpoint: serialize all indexes, write
 /// `_idx/global.idx.tmp`, fsync, rename, fsync the dir. The caller is
 /// responsible for bumping `manifest.global_idx_epoch` afterwards.
+/// Wrap the plaintext checkpoint blob for disk: encrypted (`[nonce][GCM]`) when
+/// a DEK is present (the table is encrypted), else returned unchanged. The
+/// plaintext checkpoint embeds index keys / PGM segment values derived from
+/// user data, so for an encrypted table it must not hit disk in the clear.
+fn encode_file(plain: Vec<u8>, dek: Option<&[u8; 32]>) -> Result<Vec<u8>> {
+    #[cfg(feature = "encryption")]
+    {
+        if let Some(k) = dek {
+            return crate::encryption::encrypt_blob(k, &plain);
+        }
+    }
+    #[cfg(not(feature = "encryption"))]
+    {
+        let _ = dek;
+    }
+    Ok(plain)
+}
+
+/// Inverse of [`encode_file`]. Returns `None` when an encrypted checkpoint fails
+/// to decrypt (wrong key, tamper, or corruption) so the caller simply rebuilds
+/// from the runs.
+fn decode_file(raw: Vec<u8>, dek: Option<&[u8; 32]>) -> Option<Vec<u8>> {
+    #[cfg(feature = "encryption")]
+    {
+        if let Some(k) = dek {
+            return crate::encryption::decrypt_blob(k, &raw).ok();
+        }
+    }
+    #[cfg(not(feature = "encryption"))]
+    {
+        let _ = dek;
+    }
+    Some(raw)
+}
+
 pub fn write_atomic(
     dir: &Path,
     table_id: u64,
     epoch_built: u64,
     snap: IndexSnapshot<'_>,
+    dek: Option<&[u8; 32]>,
 ) -> Result<()> {
     let mut records = Vec::new();
 
@@ -169,6 +205,11 @@ pub fn write_atomic(
     let hash: [u8; 32] = Sha256::digest(&out).into();
     out.extend_from_slice(&hash);
 
+    // Encrypt the whole blob at rest for encrypted tables (GCM also authenticates,
+    // so the inner SHA-256 becomes a redundant corruption check — kept for format
+    // uniformity with the plaintext path).
+    let out = encode_file(out, dek)?;
+
     {
         let mut file = std::fs::File::create(&tmp_path)?;
         use std::io::Write;
@@ -181,11 +222,17 @@ pub fn write_atomic(
 
 /// Read and validate the checkpoint. Verifies both MAGIC sentinels and the
 /// trailing SHA-256 before deserializing records.
-pub fn read(dir: &Path) -> Result<Option<LoadedIndexes>> {
+pub fn read(dir: &Path, dek: Option<&[u8; 32]>) -> Result<Option<LoadedIndexes>> {
     let path = path(dir);
-    let bytes = match std::fs::read(&path) {
+    let raw = match std::fs::read(&path) {
         Ok(b) => b,
         Err(_) => return Ok(None),
+    };
+    // Decrypt first for encrypted tables; a decryption failure (wrong key, tamper,
+    // or a pre-encryption checkpoint) → rebuild from runs.
+    let bytes = match decode_file(raw, dek) {
+        Some(b) => b,
+        None => return Ok(None),
     };
     if bytes.len() < 8 + 8 + 32 {
         return Ok(None); // too short to be valid; rebuild instead
@@ -333,9 +380,9 @@ mod tests {
             sparse: &sparse_map,
             learned_range: &lr_map,
         };
-        write_atomic(dir.path(), 42, 7, snap).unwrap();
+        write_atomic(dir.path(), 42, 7, snap, None).unwrap();
 
-        let loaded = read(dir.path()).unwrap().expect("checkpoint present");
+        let loaded = read(dir.path(), None).unwrap().expect("checkpoint present");
         assert_eq!(loaded.epoch_built, 7);
         assert_eq!(loaded.hot.get(b"alice"), Some(RowId(1)));
         assert_eq!(loaded.hot.get(b"bob"), Some(RowId(2)));
@@ -352,7 +399,7 @@ mod tests {
     #[test]
     fn read_returns_none_when_absent() {
         let dir = tempdir().unwrap();
-        assert!(read(dir.path()).unwrap().is_none());
+        assert!(read(dir.path(), None).unwrap().is_none());
     }
 
     #[test]
@@ -376,6 +423,7 @@ mod tests {
                 sparse: &sparse,
                 learned_range: &lr,
             },
+            None,
         )
         .unwrap();
         // Flip a body byte (between the two MAGICs).
@@ -383,7 +431,7 @@ mod tests {
         let mut bytes = std::fs::read(&p).unwrap();
         bytes[12] ^= 0xFF;
         std::fs::write(&p, bytes).unwrap();
-        let res = read(dir.path());
+        let res = read(dir.path(), None);
         assert!(
             matches!(res, Err(MongrelError::ChecksumMismatch { .. })),
             "expected checksum mismatch"
