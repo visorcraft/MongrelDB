@@ -55,6 +55,14 @@ pub const RUN_FLAG_TOMBSTONE_ONLY: u8 = 1 << 1;
 /// survivor↔position mapping). Old runs lack this bit and default to not-clean
 /// (safe fallback to the full pass).
 pub const RUN_FLAG_CLEAN: u8 = 1 << 2;
+/// Run is "uniform-epoch": every row's commit epoch is the run's commit epoch,
+/// which is **not** baked into the file (it is assigned at commit/link time and
+/// recorded in the manifest `RunRef.epoch_created`). Spill runs from large
+/// transactions are written before the commit epoch is known, so their stored
+/// `_epoch` column is a placeholder; the reader must overlay the real epoch from
+/// the `RunRef`. The engine calls [`RunReader::set_uniform_epoch`] with that
+/// value after opening such a run.
+pub const RUN_FLAG_UNIFORM_EPOCH: u8 = 1 << 3;
 pub const SORT_KEY_ROW_ID: u16 = 0xFFFF;
 
 /// Reserved column ids for the MVCC system columns, stored in every run.
@@ -110,6 +118,9 @@ impl RunHeader {
     }
     pub fn is_clean(&self) -> bool {
         self.flags & RUN_FLAG_CLEAN != 0
+    }
+    pub fn is_uniform_epoch(&self) -> bool {
+        self.flags & RUN_FLAG_UNIFORM_EPOCH != 0
     }
 }
 
@@ -916,6 +927,11 @@ pub struct RunWriter<'a> {
     /// the MVCC visibility pass. Set true only by paths that construct clean
     /// system columns by construction (typed bulk load, compaction output).
     clean: bool,
+    /// Whether this run's stored `_epoch` column is a placeholder and its real
+    /// commit epoch lives in the manifest `RunRef.epoch_created` (set only by the
+    /// large-transaction spill path, which writes before the epoch is assigned).
+    /// Stamps [`RUN_FLAG_UNIFORM_EPOCH`] so the reader overlays the real epoch.
+    uniform_epoch: bool,
     /// Write fixed-width page payloads in little-endian (Phase 15.7) so the
     /// decode path is a memcpy on real (x86/ARM) hardware instead of a
     /// per-element `swap_bytes`. Default **true** for the typed write paths
@@ -936,8 +952,19 @@ impl<'a> RunWriter<'a> {
             indexable_columns: Vec::new(),
             compress: columnar::Compress::Zstd(3),
             clean: false,
+            uniform_epoch: false,
             le: false,
         }
+    }
+
+    /// Mark this run as uniform-epoch: its stored `_epoch` column is a
+    /// placeholder and the real commit epoch is supplied at read time from the
+    /// manifest `RunRef.epoch_created` (see [`RUN_FLAG_UNIFORM_EPOCH`]). Used by
+    /// the large-transaction spill path, which writes the run before the commit
+    /// epoch is assigned.
+    pub fn uniform_epoch(mut self, uniform: bool) -> Self {
+        self.uniform_epoch = uniform;
+        self
     }
 
     /// Encrypt this run's pages with a fresh per-file DEK wrapped by `kek`.
@@ -1188,7 +1215,13 @@ impl<'a> RunWriter<'a> {
             schema_id: self.schema.schema_id,
             epoch_created: self.epoch_created.0,
             level: self.level,
-            flags: if self.clean { RUN_FLAG_CLEAN } else { 0 },
+            flags: {
+                let mut f = if self.clean { RUN_FLAG_CLEAN } else { 0 };
+                if self.uniform_epoch {
+                    f |= RUN_FLAG_UNIFORM_EPOCH;
+                }
+                f
+            },
             sort_key_column_id: SYS_ROW_ID,
             row_count: n as u64,
             min_row_id: min_rid,
@@ -1404,6 +1437,10 @@ pub struct RunReader {
     /// page, so a repeat scan skips decode. Keyed by `(run_id, column_id,
     /// page_seq)` identity; `None` in standalone tests.
     decoded_cache: Option<Arc<parking_lot::Mutex<crate::cache::DecodedPageCache>>>,
+    /// Uniform-epoch overlay (see [`RUN_FLAG_UNIFORM_EPOCH`]). When `Some`, every
+    /// row's commit epoch is taken to be this value instead of the placeholder
+    /// stored in the `_epoch` column. Set by [`Self::set_uniform_epoch`].
+    epoch_override: Option<Epoch>,
 }
 
 impl RunReader {
@@ -1470,6 +1507,7 @@ impl RunReader {
             nonce_prefix,
             col_cache: HashMap::new(),
             learned,
+            epoch_override: None,
             page_cache,
             decoded_cache,
         })
@@ -1477,6 +1515,17 @@ impl RunReader {
 
     pub fn header(&self) -> &RunHeader {
         &self.header
+    }
+
+    /// Overlay the real commit epoch for a uniform-epoch run (see
+    /// [`RUN_FLAG_UNIFORM_EPOCH`]). No-op unless the run carries that flag, so it
+    /// is always safe for the engine to call with the `RunRef.epoch_created`.
+    pub(crate) fn set_uniform_epoch(&mut self, epoch: Epoch) {
+        if self.header.is_uniform_epoch() {
+            self.epoch_override = Some(epoch);
+            // Drop any cached placeholder epoch column so the overlay takes hold.
+            self.col_cache.remove(&SYS_EPOCH);
+        }
     }
 
     /// Whether this run is "clean" (one version per RowId, no tombstones,
@@ -1644,6 +1693,18 @@ impl RunReader {
 
     /// Decode (and cache) a full column, concatenating all pages.
     fn column(&mut self, column_id: u16) -> Result<&[Value]> {
+        // Uniform-epoch overlay: serve the `_epoch` column as a constant of the
+        // real commit epoch instead of the placeholder stored on disk.
+        if column_id == SYS_EPOCH {
+            if let Some(ov) = self.epoch_override {
+                if !self.col_cache.contains_key(&column_id) {
+                    let n = self.row_count();
+                    self.col_cache
+                        .insert(column_id, vec![Value::Int64(ov.0 as i64); n]);
+                }
+                return Ok(self.col_cache.get(&column_id).unwrap().as_slice());
+            }
+        }
         if !self.col_cache.contains_key(&column_id) {
             let ty = self.resolve_type(column_id);
             let page_rows: Vec<usize> = {
@@ -1772,6 +1833,14 @@ impl RunReader {
     /// run is mmap-backed and has more than one page; otherwise sequentially.
     pub fn column_native(&mut self, column_id: u16) -> Result<columnar::NativeColumn> {
         use rayon::prelude::*;
+        if column_id == SYS_EPOCH {
+            if let Some(ov) = self.epoch_override {
+                return Ok(columnar::NativeColumn::int64_constant(
+                    ov.0 as i64,
+                    self.row_count(),
+                ));
+            }
+        }
         let ty = self.resolve_type(column_id);
         let n = self.row_count();
         let Some(ch) = self.dir.iter().find(|h| h.column_id == column_id) else {
@@ -1820,6 +1889,14 @@ impl RunReader {
     /// column's byte range (Phase 15.2) before the decode workers touch it.
     pub fn column_native_shared(&self, column_id: u16) -> Result<columnar::NativeColumn> {
         use rayon::prelude::*;
+        if column_id == SYS_EPOCH {
+            if let Some(ov) = self.epoch_override {
+                return Ok(columnar::NativeColumn::int64_constant(
+                    ov.0 as i64,
+                    self.row_count(),
+                ));
+            }
+        }
         let ty = self.resolve_type(column_id);
         let n = self.row_count();
         let Some(ch) = self.dir.iter().find(|h| h.column_id == column_id) else {
@@ -2199,7 +2276,10 @@ impl RunReader {
         // only) visible version. Skip decoding epoch/deleted and the group-
         // collapse loop; just decode row_ids (needed for survivor↔position
         // mapping) and return identity positions [0..n).
-        if self.is_clean() {
+        // A uniform-epoch overlay must still gate by snapshot, so skip the clean
+        // fast path when an override is active (defensive: spill runs are never
+        // written clean).
+        if self.is_clean() && self.epoch_override.is_none() {
             let row_ids = match self.column_native_shared(SYS_ROW_ID)? {
                 columnar::NativeColumn::Int64 { data, .. } => data,
                 _ => return Err(MongrelError::InvalidArgument("sys row_id not int64".into())),

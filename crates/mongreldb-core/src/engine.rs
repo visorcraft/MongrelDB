@@ -1275,6 +1275,42 @@ impl Table {
         self.allocator.alloc()
     }
 
+    /// Apply the metadata for rows that were spilled to a linked uniform-epoch
+    /// run (P3.4): update the HOT + secondary indexes, the reservoir, the
+    /// allocator high-water mark, and `live_count` — but **do NOT** insert the
+    /// rows into the memtable. The rows are served from the linked run (which the
+    /// scan/merge path reads at the run's commit epoch), so materializing them in
+    /// the memtable too would defeat the point of spilling (peak memory stays
+    /// bounded). Caller must have linked the run before reads can resolve indexes.
+    pub(crate) fn apply_run_metadata(&mut self, rows: &[Row]) {
+        let n = rows.len();
+        for r in rows {
+            for &cid in r.columns.keys() {
+                self.pending_put_cols.insert(cid);
+            }
+        }
+        if let Some(pk_col) = self.schema.primary_key() {
+            for r in rows {
+                if let Some(pk_val) = r.columns.get(&pk_col.id) {
+                    let key = self.index_lookup_key(pk_col.id, pk_val);
+                    self.hot.insert(key, r.row_id);
+                }
+            }
+        } else {
+            for r in rows {
+                self.hot.insert(r.row_id.0.to_be_bytes().to_vec(), r.row_id);
+            }
+        }
+        for r in rows {
+            self.index_row(r);
+            self.allocator.advance_to(r.row_id);
+        }
+        for r in rows {
+            self.reservoir.offer(r.row_id.0);
+        }
+        self.live_count = self.live_count.saturating_add(n as u64);
+    }
+
     /// Apply already-committed puts + tombstones during shared-WAL recovery
     /// (spec §15 pass 2). Advances the allocator, upserts/tombstones the
     /// memtable, and indexes the rows — but does NOT touch `live_count` (the
@@ -3894,14 +3930,21 @@ impl Table {
     }
 
     pub(crate) fn open_reader(&self, run_id: u128) -> Result<RunReader> {
-        RunReader::open_with_cache(
+        let mut reader = RunReader::open_with_cache(
             self.dir.join(RUNS_DIR).join(format!("r-{run_id}.sr")),
             self.schema.clone(),
             self.kek.clone(),
             Some(self.page_cache.clone()),
             Some(self.decoded_cache.clone()),
             self.table_id,
-        )
+        )?;
+        // Overlay the real commit epoch for uniform-epoch (large-txn spill) runs:
+        // their stored `_epoch` is a placeholder; the manifest RunRef carries the
+        // assigned epoch. A no-op for ordinary runs.
+        if let Some(rr) = self.run_refs.iter().find(|r| r.run_id == run_id) {
+            reader.set_uniform_epoch(Epoch(rr.epoch_created));
+        }
+        Ok(reader)
     }
 
     pub(crate) fn run_refs(&self) -> &[RunRef] {

@@ -1,5 +1,6 @@
 //! P3.4 — unbounded transactions via quarantined uniform-epoch spill runs.
 
+use mongreldb_core::query::{Condition, Query};
 use mongreldb_core::{schema::*, Database, Value};
 use tempfile::tempdir;
 
@@ -110,6 +111,73 @@ fn huge_writeset_pre_validation_keeps_sequencer_bounded() {
     .unwrap();
 
     assert_eq!(db.table("t").unwrap().lock().count(), 2 * n);
+}
+
+#[test]
+fn spilled_txn_does_not_materialize_rows_in_memtable() {
+    // P3.4: a spilled large txn must keep peak memory bounded — the rows go to a
+    // linked uniform-epoch run, NOT into the in-memory memtable. Reads still see
+    // them (via the run + indexes), but the memtable stays empty.
+    let dir = tempdir().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.create_table("t", pk_schema()).unwrap();
+    db.set_spill_threshold(1);
+
+    let n: u64 = 200;
+    db.transaction(|t| {
+        for i in 0..n {
+            t.put("t", vec![(1, Value::Int64(i as i64))])?;
+        }
+        Ok(())
+    })
+    .unwrap();
+
+    let tbl = db.table("t").unwrap();
+    let mut g = tbl.lock();
+    assert_eq!(g.count(), n, "all spilled rows must be visible");
+    assert_eq!(
+        g.memtable_len(),
+        0,
+        "spilled rows must not be materialized in the memtable"
+    );
+    // Index-served range query resolves entirely from the linked run.
+    let q = Query::new().and(Condition::Range {
+        column_id: 1,
+        lo: 0,
+        hi: (n as i64) - 1,
+    });
+    assert_eq!(g.query(&q).unwrap().len(), n as usize);
+}
+
+#[test]
+fn spilled_run_respects_snapshot_isolation() {
+    // A snapshot pinned before a spilled txn commits must NOT see its rows; a
+    // current reader after commit must. Guards the uniform-epoch overlay (the run
+    // is gated by RunRef.epoch_created, not its placeholder _epoch=0 column).
+    let dir = tempdir().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.create_table("t", pk_schema()).unwrap();
+    db.set_spill_threshold(1);
+
+    let tbl = db.table("t").unwrap();
+    let snap_before = tbl.lock().snapshot();
+
+    db.transaction(|t| {
+        for i in 0..50u64 {
+            t.put("t", vec![(1, Value::Int64(i as i64))])?;
+        }
+        Ok(())
+    })
+    .unwrap();
+
+    let g = tbl.lock();
+    let before = g.visible_rows(snap_before).unwrap();
+    assert_eq!(
+        before.len(),
+        0,
+        "snapshot pinned before commit must not see spilled rows"
+    );
+    assert_eq!(g.count(), 50, "current readers see all committed rows");
 }
 
 #[test]

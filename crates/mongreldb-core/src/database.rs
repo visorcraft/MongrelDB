@@ -413,7 +413,8 @@ impl Database {
                 let specs = t.indexable_column_specs();
                 drop(t);
 
-                let mut writer = crate::sorted_run::RunWriter::new(&schema, run_id, Epoch(0), 0);
+                let mut writer = crate::sorted_run::RunWriter::new(&schema, run_id, Epoch(0), 0)
+                    .uniform_epoch(true);
                 if let Some(ref kek) = kek {
                     writer = writer.with_encryption(kek.as_ref(), specs);
                 }
@@ -549,14 +550,11 @@ impl Database {
                         epoch_created: new_epoch.0,
                         row_count: s.row_count,
                     });
-                    // Apply the run's rows to indexes + memtable + live_count.
-                    // The merge logic in `visible_rows` deduplicates by row_id,
-                    // so having rows in both a run and the memtable is safe.
-                    let mut rows = s.rows.clone();
-                    for r in rows.iter_mut() {
-                        r.committed_epoch = new_epoch;
-                    }
-                    t.apply_put_rows(rows);
+                    // Update indexes + live_count from the spilled rows WITHOUT
+                    // materializing them in the memtable (P3.4): they are served
+                    // from the linked uniform-epoch run, read at `new_epoch` via
+                    // the RunRef. This keeps peak memory bounded for large txns.
+                    t.apply_run_metadata(&s.rows);
                     t.invalidate_pending_cache();
                     t.persist_manifest(new_epoch)?;
                 }
