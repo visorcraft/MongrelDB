@@ -32,6 +32,15 @@ struct SpilledRun {
     max_rid: u64,
 }
 
+/// An integrity issue found by [`Database::check`] (spec §16).
+#[derive(Debug, Clone)]
+pub struct CheckIssue {
+    pub table_id: u64,
+    pub table_name: String,
+    pub severity: String,
+    pub description: String,
+}
+
 /// A handle to a live table inside a [`Database`]. Writes take the inner lock
 /// (P1); P3.3 replaces this with lock-free `ArcSwap` reads + a publish lock for
 /// writes.
@@ -804,6 +813,84 @@ impl Database {
     pub fn set_spill_threshold(&self, bytes: u64) {
         self.spill_threshold
             .store(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Verify multi-table integrity (spec §16). Checks that every live table's
+    /// manifest is readable and every `RunRef`'s file exists. Returns a list of
+    /// issues found (empty = healthy).
+    pub fn check(&self) -> Vec<CheckIssue> {
+        let mut issues = Vec::new();
+        let cat = self.catalog.read();
+        for entry in &cat.tables {
+            if !matches!(entry.state, TableState::Live) {
+                continue;
+            }
+            let tdir = self.root.join(TABLES_DIR).join(entry.table_id.to_string());
+            let manifest_meta_dek = crate::encryption::meta_dek_for(self.kek.as_deref());
+            match crate::manifest::read(&tdir, manifest_meta_dek.as_ref()) {
+                Ok(m) => {
+                    for rr in &m.runs {
+                        let run_path = tdir
+                            .join(crate::engine::RUNS_DIR)
+                            .join(format!("r-{}.sr", rr.run_id));
+                        if !run_path.exists() {
+                            issues.push(CheckIssue {
+                                table_id: entry.table_id,
+                                table_name: entry.name.clone(),
+                                severity: "error".into(),
+                                description: format!("missing run file r-{}.sr", rr.run_id),
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    issues.push(CheckIssue {
+                        table_id: entry.table_id,
+                        table_name: entry.name.clone(),
+                        severity: "error".into(),
+                        description: format!("manifest read failed: {e}"),
+                    });
+                }
+            }
+        }
+        issues
+    }
+
+    /// Quarantine unreadable tables (spec §16). Moves corrupt table dirs to
+    /// `_quarantine/<table_id>/` and marks them dropped in the catalog so the
+    /// DB still opens.
+    pub fn doctor(&self) -> Result<Vec<u64>> {
+        let issues = self.check();
+        let bad_tables: std::collections::HashSet<u64> = issues
+            .iter()
+            .filter(|i| i.severity == "error")
+            .map(|i| i.table_id)
+            .collect();
+        if bad_tables.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let qdir = self.root.join("_quarantine");
+        std::fs::create_dir_all(&qdir)?;
+        let mut quarantined = Vec::new();
+        for &table_id in &bad_tables {
+            let tdir = self.root.join(TABLES_DIR).join(table_id.to_string());
+            if tdir.exists() {
+                let dest = qdir.join(table_id.to_string());
+                std::fs::rename(&tdir, &dest)?;
+            }
+            {
+                let mut cat = self.catalog.write();
+                if let Some(entry) = cat.tables.iter_mut().find(|t| t.table_id == table_id) {
+                    entry.state = TableState::Dropped {
+                        at_epoch: self.epoch.visible().0,
+                    };
+                }
+            }
+            quarantined.push(table_id);
+        }
+        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+        Ok(quarantined)
     }
 
     /// The DB-wide KEK (if encrypted).

@@ -41,7 +41,7 @@ pub use be_tree::BeTree;
 pub use cache::PageCache;
 pub use columnar::{decode_column, encode_column};
 pub use cursor::{Cursor, MultiRunCursor, NativePageCursor};
-pub use database::Database;
+pub use database::{CheckIssue, Database};
 pub use encryption::{Cipher, PlaintextCipher};
 pub use engine::{
     AggState, ApproxAgg, ApproxResult, CachedAgg, ColumnStat, IncrementalAggResult, NativeAgg,
