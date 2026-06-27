@@ -845,11 +845,23 @@ fn recover_shared_wal(
 
     let records = SharedWal::replay_with_dek(root, wal_dek)?;
 
-    // Pass 1: committed-txn outcomes.
+    // Pass 1: committed-txn outcomes + collect spilled-run info.
     let mut committed: HashMap<u64, u64> = HashMap::new();
+    let mut spilled_to_link: Vec<(
+        u64, /*txn_id*/
+        u64, /*epoch*/
+        Vec<crate::wal::AddedRun>,
+    )> = Vec::new();
     for r in &records {
-        if let Op::TxnCommit { epoch: ce, .. } = r.op {
+        if let Op::TxnCommit {
+            epoch: ce,
+            ref added_runs,
+        } = r.op
+        {
             committed.insert(r.txn_id, ce);
+            if !added_runs.is_empty() {
+                spilled_to_link.push((r.txn_id, ce, added_runs.clone()));
+            }
         }
     }
 
@@ -909,6 +921,39 @@ fn recover_shared_wal(
         };
         let mut t = handle.lock();
         t.recover_apply(rows, deletes)?;
+    }
+
+    // Pass 3: link spilled runs from committed txns (spec §8.5). A crash
+    // between TxnCommit sync and the publish phase leaves the run in
+    // `_txn/<txn_id>/`. Move it to `_runs/` and add the RunRef.
+    for (txn_id, ce, added_runs) in &spilled_to_link {
+        for ar in added_runs {
+            let Some(handle) = tables.get(&ar.table_id) else {
+                continue;
+            };
+            let mut t = handle.lock();
+            let dest = t.run_path(ar.run_id as u64);
+            if !dest.exists() {
+                let pending = root
+                    .join(TABLES_DIR)
+                    .join(ar.table_id.to_string())
+                    .join("_txn")
+                    .join(txn_id.to_string())
+                    .join(format!("r-{}.sr", ar.run_id));
+                if pending.exists() {
+                    if let Some(parent) = pending.parent() {
+                        std::fs::rename(&pending, &dest)?;
+                        let _ = std::fs::remove_dir_all(parent);
+                    }
+                }
+            }
+            t.link_run(crate::manifest::RunRef {
+                run_id: ar.run_id,
+                level: ar.level,
+                epoch_created: *ce,
+                row_count: ar.row_count,
+            });
+        }
     }
 
     epoch.advance_recovered(Epoch(max_epoch));

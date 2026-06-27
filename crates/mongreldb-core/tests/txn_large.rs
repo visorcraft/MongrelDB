@@ -111,3 +111,32 @@ fn huge_writeset_pre_validation_keeps_sequencer_bounded() {
 
     assert_eq!(db.table("t").unwrap().lock().count(), 2 * n);
 }
+
+#[test]
+fn spilled_txn_recovers_run_from_wal_after_crash() {
+    // A spilled transaction's data must survive a reopen even though the run
+    // was linked in memory only (the manifest may not have persisted in time).
+    // Recovery moves the run from _txn/ to _runs/ and links it.
+    let dir = tempdir().unwrap();
+    {
+        let db = Database::create(dir.path()).unwrap();
+        db.create_table("t", pk_schema()).unwrap();
+        db.set_spill_threshold(1);
+        db.transaction(|t| {
+            for i in 0..50i64 {
+                t.put("t", vec![(1, Value::Int64(i))])?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(db.table("t").unwrap().lock().count(), 50);
+    }
+
+    // Reopen — the spilled run must be recovered.
+    let db = Database::open(dir.path()).unwrap();
+    assert_eq!(
+        db.table("t").unwrap().lock().count(),
+        50,
+        "spilled run data must survive reopen"
+    );
+}
