@@ -74,6 +74,113 @@ fn check_reports_missing_run_file() {
     );
 }
 
+fn first_run_path(dir: &std::path::Path, table_id: u64) -> std::path::PathBuf {
+    let runs_dir = dir.join("tables").join(table_id.to_string()).join("_runs");
+    std::fs::read_dir(&runs_dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().and_then(|s| s.to_str()) == Some("sr"))
+        .expect("a run file")
+}
+
+/// Seed `table` with rows and flush them to at least one on-disk run file
+/// (spill threshold of 1 byte forces the mutable run out to a real `.sr`).
+fn seed_run(db: &Database, table: &str) {
+    db.table(table)
+        .unwrap()
+        .lock()
+        .set_mutable_run_spill_bytes(1);
+    for i in 0..50i64 {
+        db.transaction(|t| {
+            t.put(table, vec![(1, Value::Int64(i))])?;
+            Ok(())
+        })
+        .unwrap();
+    }
+    db.table(table).unwrap().lock().flush().unwrap();
+}
+
+#[test]
+fn check_detects_run_footer_checksum_corruption() {
+    let dir = tempdir().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.create_table("t", pk_schema()).unwrap();
+    seed_run(&db, "t");
+
+    let table_id = db.table_id("t").unwrap();
+    let run_path = first_run_path(dir.path(), table_id);
+
+    // Flip a byte in the body (payload), not the header or footer magic, so the
+    // old window-scan heuristic (which only looks for RUN_MAGIC in the tail)
+    // cannot catch it — only a real footer checksum does.
+    let mut bytes = std::fs::read(&run_path).unwrap();
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 0xFF;
+    std::fs::write(&run_path, &bytes).unwrap();
+
+    let issues = db.check();
+    assert!(
+        issues
+            .iter()
+            .any(|i| i.table_id == table_id && i.severity == "error"),
+        "check must flag payload/footer checksum corruption, got: {:?}",
+        issues
+    );
+}
+
+#[test]
+fn check_detects_orphan_run_file() {
+    let dir = tempdir().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.create_table("t", pk_schema()).unwrap();
+    seed_run(&db, "t");
+
+    let table_id = db.table_id("t").unwrap();
+    let runs_dir = dir
+        .path()
+        .join("tables")
+        .join(table_id.to_string())
+        .join("_runs");
+    // A .sr file on disk that no RunRef in the manifest references.
+    std::fs::write(runs_dir.join("r-999999.sr"), b"orphan run file").unwrap();
+
+    let issues = db.check();
+    assert!(
+        issues.iter().any(|i| i.description.contains("orphan")),
+        "check must report the orphan run file, got: {:?}",
+        issues
+    );
+}
+
+#[cfg(feature = "encryption")]
+#[test]
+fn check_detects_run_mac_tamper_on_encrypted_db() {
+    let dir = tempdir().unwrap();
+    let db = Database::create_encrypted(dir.path(), "pw").unwrap();
+    db.create_table("t", pk_schema()).unwrap();
+    seed_run(&db, "t");
+
+    let table_id = db.table_id("t").unwrap();
+    let run_path = first_run_path(dir.path(), table_id);
+
+    // Tamper the trailing keyed run-metadata MAC tag (the last 32 bytes), which
+    // the unkeyed footer checksum does not cover — only the keyed MAC catches it.
+    let mut bytes = std::fs::read(&run_path).unwrap();
+    let n = bytes.len();
+    bytes[n - 1] ^= 0xFF;
+    std::fs::write(&run_path, &bytes).unwrap();
+
+    let issues = db.check();
+    assert!(
+        issues
+            .iter()
+            .any(|i| i.table_id == table_id && i.severity == "error"),
+        "check must flag run metadata MAC tamper, got: {:?}",
+        issues
+    );
+}
+
 #[test]
 fn check_passes_on_healthy_db() {
     let dir = tempdir().unwrap();

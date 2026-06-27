@@ -821,45 +821,105 @@ impl Database {
             .store(bytes, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Verify multi-table integrity (spec §16). Checks that every live table's
-    /// manifest is readable and every `RunRef`'s file exists, has the correct
-    /// magic header, and has a well-formed footer (not truncated). Returns a
-    /// list of issues found (empty = healthy).
+    /// Verify multi-table integrity (spec §16). For every live table this:
+    /// authenticates the manifest; opens each `RunRef`'s file through
+    /// [`RunReader`](crate::sorted_run::RunReader), which verifies the run footer
+    /// checksum and — for encrypted DBs — the keyed run-metadata MAC; checks each
+    /// run's physical row count against its `RunRef`; flags `RunRef`s whose file
+    /// is missing (dangling) and `.sr` files on disk that no `RunRef` references
+    /// (orphan); and verifies `flushed_epoch <= current_epoch`. Returns the list
+    /// of issues found (empty = healthy). Orphans are `warning`-severity; all
+    /// other findings are `error`-severity (so [`Self::doctor`] quarantines them).
     pub fn check(&self) -> Vec<CheckIssue> {
         let mut issues = Vec::new();
         let cat = self.catalog.read();
+        let manifest_meta_dek = crate::encryption::meta_dek_for(self.kek.as_deref());
         for entry in &cat.tables {
             if !matches!(entry.state, TableState::Live) {
                 continue;
             }
             let tdir = self.root.join(TABLES_DIR).join(entry.table_id.to_string());
-            let manifest_meta_dek = crate::encryption::meta_dek_for(self.kek.as_deref());
-            match crate::manifest::read(&tdir, manifest_meta_dek.as_ref()) {
-                Ok(m) => {
-                    for rr in &m.runs {
-                        let run_path = tdir
-                            .join(crate::engine::RUNS_DIR)
-                            .join(format!("r-{}.sr", rr.run_id));
-                        match verify_run_file(&run_path) {
-                            Ok(()) => {}
-                            Err(reason) => {
-                                issues.push(CheckIssue {
-                                    table_id: entry.table_id,
-                                    table_name: entry.name.clone(),
-                                    severity: "error".into(),
-                                    description: reason,
-                                });
-                            }
+            let mut err = |sev: &str, desc: String| {
+                issues.push(CheckIssue {
+                    table_id: entry.table_id,
+                    table_name: entry.name.clone(),
+                    severity: sev.into(),
+                    description: desc,
+                });
+            };
+            let m = match crate::manifest::read(&tdir, manifest_meta_dek.as_ref()) {
+                Ok(m) => m,
+                Err(e) => {
+                    err("error", format!("manifest read failed: {e}"));
+                    continue;
+                }
+            };
+            if m.flushed_epoch > m.current_epoch {
+                err(
+                    "error",
+                    format!(
+                        "flushed_epoch {} exceeds current_epoch {} (impossible)",
+                        m.flushed_epoch, m.current_epoch
+                    ),
+                );
+            }
+
+            let runs_dir = tdir.join(crate::engine::RUNS_DIR);
+            let mut referenced: std::collections::HashSet<u128> = std::collections::HashSet::new();
+            for rr in &m.runs {
+                referenced.insert(rr.run_id);
+                let run_path = runs_dir.join(format!("r-{}.sr", rr.run_id));
+                if !run_path.exists() {
+                    err("error", format!("missing run file: r-{}.sr", rr.run_id));
+                    continue;
+                }
+                match crate::sorted_run::RunReader::open(
+                    &run_path,
+                    entry.schema.clone(),
+                    self.kek.clone(),
+                ) {
+                    Ok(reader) => {
+                        if reader.row_count() as u64 != rr.row_count {
+                            err(
+                                "error",
+                                format!(
+                                    "run r-{} row count mismatch: manifest {} vs run {}",
+                                    rr.run_id,
+                                    rr.row_count,
+                                    reader.row_count()
+                                ),
+                            );
                         }
                     }
+                    Err(e) => {
+                        err(
+                            "error",
+                            format!("run r-{} integrity check failed: {e}", rr.run_id),
+                        );
+                    }
                 }
-                Err(e) => {
-                    issues.push(CheckIssue {
-                        table_id: entry.table_id,
-                        table_name: entry.name.clone(),
-                        severity: "error".into(),
-                        description: format!("manifest read failed: {e}"),
-                    });
+            }
+
+            // Orphan `.sr` files present on disk but absent from the manifest.
+            if let Ok(rd) = std::fs::read_dir(&runs_dir) {
+                for ent in rd.flatten() {
+                    let p = ent.path();
+                    if p.extension().and_then(|s| s.to_str()) != Some("sr") {
+                        continue;
+                    }
+                    let run_id = p
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .and_then(|s| s.strip_prefix("r-"))
+                        .and_then(|s| s.parse::<u128>().ok());
+                    if let Some(id) = run_id {
+                        if !referenced.contains(&id) {
+                            err(
+                                "warning",
+                                format!("orphan run file r-{id}.sr not referenced by the manifest"),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1157,53 +1217,4 @@ fn sweep_pending_txn_dirs(root: &Path, cat: &Catalog) {
             let _ = std::fs::remove_dir_all(&txn_dir);
         }
     }
-}
-
-/// Verify a `.sr` run file is non-truncated and has valid magic + footer.
-/// Returns `Ok(())` on success, `Err(reason_string)` on any integrity issue.
-fn verify_run_file(path: &Path) -> std::result::Result<(), String> {
-    use std::io::{Read, Seek, SeekFrom};
-
-    let metadata = if path.exists() {
-        std::fs::metadata(path).map_err(|e| format!("run file stat failed: {e}"))?
-    } else {
-        return Err(format!(
-            "missing run file: {}",
-            path.file_name().unwrap_or_default().to_string_lossy()
-        ));
-    };
-    let size = metadata.len() as usize;
-    const MIN_RUN_SIZE: usize = 8 + 48;
-    if size < MIN_RUN_SIZE {
-        return Err(format!(
-            "run file too small ({} bytes, expected ≥ {})",
-            size, MIN_RUN_SIZE
-        ));
-    }
-
-    let mut file = std::fs::File::open(path).map_err(|e| format!("run file open failed: {e}"))?;
-
-    let mut magic = [0u8; 8];
-    file.read_exact(&mut magic)
-        .map_err(|e| format!("run header read failed: {e}"))?;
-    if magic != crate::sorted_run::RUN_MAGIC {
-        return Err(format!(
-            "run header magic mismatch: expected {:?}, got {:?}",
-            crate::sorted_run::RUN_MAGIC,
-            magic
-        ));
-    }
-
-    let tail_len = size.min(80);
-    let mut tail = vec![0u8; tail_len];
-    file.seek(SeekFrom::End(-(tail_len as i64)))
-        .map_err(|e| format!("run seek failed: {e}"))?;
-    file.read_exact(&mut tail)
-        .map_err(|e| format!("run footer read failed: {e}"))?;
-    let magic_found = tail.windows(8).any(|w| w == crate::sorted_run::RUN_MAGIC);
-    if !magic_found {
-        return Err("run footer magic not found (truncated or corrupt)".into());
-    }
-
-    Ok(())
 }
