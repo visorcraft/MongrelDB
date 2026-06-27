@@ -1,6 +1,6 @@
 [package]
 name = "mongreldb-server"
-version = "0.10.6"
+version = "0.11.0"
 edition = "2021"
 publish = false
 
