@@ -3727,6 +3727,7 @@ impl Table {
             self.kek.clone(),
             Some(self.page_cache.clone()),
             Some(self.decoded_cache.clone()),
+            self.table_id,
         )
     }
 

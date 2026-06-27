@@ -700,11 +700,19 @@ fn page_nonce(nonce_prefix: [u8; 12], column_id: u16, page_seq: u32) -> [u8; 12]
 }
 
 /// Stable content-address of an immutable run page (the cache key): SHA-256 of
-/// `(run_id, column_id, page_seq)`. Runs are immutable, so this identity is
-/// also the page's content address — a rewritten page lives in a different run
-/// (different id) and so gets a different key without any invalidation sweep.
-pub(crate) fn page_cache_key(run_id: u128, column_id: u16, page_seq: usize) -> [u8; 32] {
+/// `(table_id, run_id, column_id, page_seq)`. Runs are immutable, so this
+/// identity is also the page's content address — a rewritten page lives in a
+/// different run (different id) and so gets a different key without any
+/// invalidation sweep. `table_id` namespaces the shared cache across tables in
+/// a `Database` so two tables' identically-numbered runs never collide.
+pub(crate) fn page_cache_key(
+    table_id: u64,
+    run_id: u128,
+    column_id: u16,
+    page_seq: usize,
+) -> [u8; 32] {
     let mut h = Sha256::new();
+    h.update(table_id.to_be_bytes());
     h.update(run_id.to_be_bytes());
     h.update(column_id.to_be_bytes());
     h.update((page_seq as u64).to_be_bytes());
@@ -1380,6 +1388,8 @@ pub struct RunReader {
     header: RunHeader,
     dir: Vec<ColumnPageHeader>,
     schema: Schema,
+    /// Owning table id — namespaces the shared page cache across tables.
+    table_id: u64,
     /// Per-run page cipher, built from the unwrapped DEK (None when plaintext).
     cipher: Option<Box<dyn Cipher>>,
     /// Per-run nonce prefix (overlaid per page with column_id + page_seq).
@@ -1398,7 +1408,7 @@ pub struct RunReader {
 
 impl RunReader {
     pub fn open(path: impl AsRef<Path>, schema: Schema, kek: Option<Arc<Kek>>) -> Result<Self> {
-        Self::open_with_cache(path, schema, kek, None, None)
+        Self::open_with_cache(path, schema, kek, None, None, 0)
     }
 
     pub(crate) fn open_with_cache(
@@ -1407,6 +1417,7 @@ impl RunReader {
         kek: Option<Arc<Kek>>,
         page_cache: Option<Arc<parking_lot::Mutex<crate::cache::PageCache>>>,
         decoded_cache: Option<Arc<parking_lot::Mutex<crate::cache::DecodedPageCache>>>,
+        table_id: u64,
     ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let header = read_header(&path)?;
@@ -1454,6 +1465,7 @@ impl RunReader {
             header,
             dir,
             schema,
+            table_id,
             cipher,
             nonce_prefix,
             col_cache: HashMap::new(),
@@ -1526,7 +1538,7 @@ impl RunReader {
         };
         // Shared cache: serve the raw (on-disk / ciphertext) page bytes if
         // present, so concurrent readers never re-read or re-decrypt a page.
-        let key = page_cache_key(self.header.run_id, column_id, page_seq);
+        let key = page_cache_key(self.table_id, self.header.run_id, column_id, page_seq);
         if let Some(cache) = &self.page_cache {
             if let Some(bytes) = cache.lock().get(
                 &key,
@@ -1584,7 +1596,7 @@ impl RunReader {
         let encrypted = ch.flags & ColumnPageHeader::PAGE_ENCRYPTED != 0;
         // Non-blocking probe of the shared cache: never block the rayon pool on
         // a contended lock. On a hit, avoid the mmap slice + decrypt entirely.
-        let key = page_cache_key(self.header.run_id, column_id, page_seq);
+        let key = page_cache_key(self.table_id, self.header.run_id, column_id, page_seq);
         if let Some(cache) = &self.page_cache {
             if let Some(guard) = cache.try_lock() {
                 if let Some(bytes) = guard.try_get(
@@ -1866,7 +1878,7 @@ impl RunReader {
         nrows: usize,
         run_id: u128,
     ) -> Result<(columnar::NativeColumn, Option<[u8; 32]>)> {
-        let key = page_cache_key(run_id, column_id, seq);
+        let key = page_cache_key(self.table_id, run_id, column_id, seq);
         if let Some(cache) = &self.decoded_cache {
             if let Some(g) = cache.try_lock() {
                 if let Some(hit) = g.try_get(&key) {
@@ -2716,7 +2728,7 @@ mod tests {
             .unwrap();
 
         let mut reader =
-            RunReader::open_with_cache(&path, schema(), None, None, None).expect("open reader");
+            RunReader::open_with_cache(&path, schema(), None, None, None, 0).expect("open reader");
         assert!(reader.has_mmap(), "test env must support read-only mmap");
         assert_eq!(reader.row_count(), header.row_count as usize);
 
@@ -2760,5 +2772,15 @@ mod tests {
                 _ => panic!("type mismatch col {cid}: {a:?} vs {b:?}"),
             }
         }
+    }
+
+    #[test]
+    fn page_cache_key_distinguishes_tables() {
+        let a = page_cache_key(1, 5, 2, 3);
+        let b = page_cache_key(2, 5, 2, 3);
+        assert_ne!(a, b, "same run/col/page, different table must differ");
+        // same table different run/col/page also differ (sanity)
+        assert_ne!(page_cache_key(1, 5, 2, 3), page_cache_key(1, 6, 2, 3));
+        assert_ne!(page_cache_key(1, 5, 2, 3), page_cache_key(1, 5, 2, 4));
     }
 }
