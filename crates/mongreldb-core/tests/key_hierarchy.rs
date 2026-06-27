@@ -96,6 +96,21 @@ fn run_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 }
 
 #[test]
+fn empty_encrypted_table_reopens_without_any_write() {
+    // An encrypted table created with NO writes/flush must reopen: the manifest
+    // written at create time has to be encrypted + authenticated so the reopen's
+    // manifest read can authenticate it. A plaintext create-time manifest would
+    // make the table permanently unopenable.
+    let dir = tempdir().unwrap();
+    {
+        let _db = Table::create_encrypted(dir.path(), schema(), 1, "pw").unwrap();
+        // no put, no flush, no commit
+    }
+    let db = Table::open_encrypted(dir.path(), "pw").unwrap();
+    assert_eq!(db.count(), 0);
+}
+
+#[test]
 fn salt_file_persisted_at_create() {
     let dir = tempdir().unwrap();
     let _ = Table::create_encrypted(dir.path(), schema(), 1, "passphrase").unwrap();

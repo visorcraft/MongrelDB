@@ -796,7 +796,12 @@ impl Table {
         };
         wal.set_sync_byte_threshold(DEFAULT_SYNC_BYTE_THRESHOLD);
         let mut manifest = Manifest::new(table_id, schema.schema_id);
-        manifest::write_atomic(&dir, &mut manifest, None)?;
+        // Seal the create-time manifest with the meta DEK so an encrypted table
+        // reopens even if no write/flush ever re-persists it (otherwise the
+        // reopen's encrypted manifest read fails to authenticate a plaintext
+        // blob — see `manifest_meta_dek`).
+        let manifest_meta_dek = crate::encryption::meta_dek_for(ctx.kek.as_deref());
+        manifest::write_atomic(&dir, &mut manifest, manifest_meta_dek.as_ref())?;
         let (bitmap, ann, fm, sparse) = empty_indexes(&schema);
         let column_keys = build_column_keys(ctx.kek.as_deref(), &schema);
         let rcache_dir = dir.join(RCACHE_DIR);
