@@ -132,3 +132,47 @@ fn doctor_quarantines_and_db_still_opens() {
     assert!(!db.table_names().iter().any(|n| n == "bad"));
     assert_eq!(db.table("good").unwrap().lock().count(), 1);
 }
+
+#[test]
+fn import_single_table_into_database() {
+    use mongreldb_core::Table;
+
+    // Create an "old" single-table directory with data.
+    let old_dir = tempdir().unwrap();
+    {
+        let mut old = Table::create(old_dir.path(), pk_schema(), 1).unwrap();
+        for i in 0..50i64 {
+            old.put(vec![(1, Value::Int64(i))]).unwrap();
+        }
+        old.commit().unwrap();
+        old.flush().unwrap();
+    }
+
+    // Import into a new Database.
+    let new_dir = tempdir().unwrap();
+    let db = Database::create(new_dir.path()).unwrap();
+    db.create_table("imported", pk_schema()).unwrap();
+
+    // Read all rows from the old table and insert them.
+    {
+        let old = Table::open(old_dir.path()).unwrap();
+        let snap = old.snapshot();
+        let rows = old.visible_rows(snap).unwrap();
+        drop(old);
+
+        for row in rows {
+            let cells: Vec<(u16, Value)> = row
+                .columns
+                .iter()
+                .map(|(&cid, v)| (cid, v.clone()))
+                .collect();
+            db.transaction(|t| {
+                t.put("imported", cells)?;
+                Ok(())
+            })
+            .unwrap();
+        }
+    }
+
+    assert_eq!(db.table("imported").unwrap().lock().count(), 50);
+}
