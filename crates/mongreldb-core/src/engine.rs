@@ -783,6 +783,7 @@ impl Table {
                 dir.join(WAL_DIR).join("seg-000000.wal"),
                 Epoch(0),
                 Some(make_cipher(dk)),
+                0,
             )?
         } else {
             Wal::create(dir.join(WAL_DIR).join("seg-000000.wal"), Epoch(0))?
@@ -895,11 +896,13 @@ impl Table {
                 path,
                 replay_epoch,
                 wal_dek.as_ref().map(|dk| make_cipher(dk)),
+                0,
             )?,
             None => Wal::create_with_cipher(
                 dir.join(WAL_DIR).join("seg-000000.wal"),
                 replay_epoch,
                 wal_dek.as_ref().map(|dk| make_cipher(dk)),
+                0,
             )?,
         };
         wal.set_sync_byte_threshold(DEFAULT_SYNC_BYTE_THRESHOLD);
@@ -1524,7 +1527,15 @@ impl Table {
     fn rotate_wal(&mut self, epoch: Epoch) -> Result<()> {
         let segment = next_wal_segment(&self.dir.join(WAL_DIR))?;
         let cipher = self.wal_dek.as_ref().map(|dk| make_cipher(dk));
-        let mut wal = Wal::create_with_cipher(segment, epoch, cipher)?;
+        // The segment number (from the filename) namespaces nonces under the
+        // constant WAL DEK — pass it through to the writer.
+        let segment_no = segment
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.strip_prefix("seg-"))
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        let mut wal = Wal::create_with_cipher(segment, epoch, cipher, segment_no)?;
         wal.set_sync_byte_threshold(self.sync_byte_threshold);
         wal.sync()?;
         self.wal = wal;

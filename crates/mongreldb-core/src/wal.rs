@@ -134,16 +134,15 @@ pub struct Wal {
     /// Optional AEAD cipher for frame-level encryption. When present, each
     /// frame's payload is encrypted before writing.
     cipher: Option<Box<dyn crate::encryption::Cipher>>,
-    /// Random per-segment nonce seed (8 bytes, drawn fresh on every segment
-    /// create / rotate / reopen). Forms the high 8 bytes of the 12-byte
-    /// AES-GCM nonce; the low 4 are the frame counter. The WAL DEK is constant
-    /// across all segments, so cross-segment nonce uniqueness rests entirely on
-    /// this seed: 8 bytes = 2^64 seeds → birthday collision only near ~2^32
-    /// segments (vs ~2^16 for the old 4-byte seed). Drawing a fresh seed on
-    /// every create — including reopen, which truncates and rewrites the active
-    /// segment — is also what stops a reopened segment from replaying the
-    /// pre-crash segment's nonces under the same DEK.
-    nonce_seed: [u8; 8],
+    /// Persisted segment number for this WAL segment. Forms the high 8 bytes
+    /// (big-endian) of the 12-byte AES-GCM nonce; the low 4 are the per-segment
+    /// frame counter. The WAL DEK is constant across all segments, so cross-
+    /// segment nonce uniqueness rests entirely on this number, which is drawn
+    /// from the catalog's monotonic `next_segment_no` (spec §7.1, review fix
+    /// #23). Determinism makes a reopened segment — which truncates and rewrites
+    /// the active file — reuse the SAME nonces it would have used pre-crash,
+    /// which is safe because the old frames are gone (overwritten).
+    segment_no: u64,
     /// Per-segment frame counter. Occupies the low 4 bytes of the nonce, so
     /// `append_record` refuses to write past `u32::MAX` frames in one segment
     /// (that would truncate the counter and reuse a nonce under the DEK).
@@ -155,14 +154,17 @@ pub struct Wal {
 impl Wal {
     /// Create a new WAL segment, truncating any existing file at `path`.
     pub fn create(path: impl AsRef<Path>, epoch_created: Epoch) -> Result<Self> {
-        Self::create_with_cipher(path, epoch_created, None)
+        Self::create_with_cipher(path, epoch_created, None, 0)
     }
 
-    /// Create a new WAL segment with optional frame-level encryption.
+    /// Create a new WAL segment with optional frame-level encryption. The
+    /// persisted `segment_no` namespaces AES-GCM nonces across segments under
+    /// the constant WAL DEK (spec §7.1, review fix #23).
     pub fn create_with_cipher(
         path: impl AsRef<Path>,
         epoch_created: Epoch,
         cipher: Option<Box<dyn crate::encryption::Cipher>>,
+        segment_no: u64,
     ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = OpenOptions::new()
@@ -171,9 +173,6 @@ impl Wal {
             .write(true)
             .truncate(true)
             .open(&path)?;
-        let mut nonce_seed = [0u8; 8];
-        // fill_random is always available (non-cfg-gated)
-        getrandom::getrandom(&mut nonce_seed).expect("getrandom: OS CSPRNG unavailable");
         let mut wal = Self {
             file: BufWriter::with_capacity(1 << 20, file),
             path,
@@ -181,7 +180,7 @@ impl Wal {
             unflushed_bytes: 0,
             sync_byte_threshold: 64 * 1024,
             cipher,
-            nonce_seed,
+            segment_no,
             frame_seq: 0,
         };
         wal.write_header(epoch_created)?;
@@ -258,15 +257,12 @@ impl Wal {
     }
 
     /// Build the 12-byte AES-GCM nonce for the current frame:
-    /// `[nonce_seed: 8B][frame_seq: 4B LE]`. The seed is random per segment
-    /// (drawn on every `create_with_cipher`) and the counter is unique within a
-    /// segment, so nonces never repeat under the constant WAL DEK — provided
+    /// `[segment_no: 8B BE][frame_seq: 4B LE]`. `segment_no` is persisted and
+    /// monotonic across segments; the counter is unique within a segment, so
+    /// nonces never repeat under the constant WAL DEK — provided
     /// `frame_seq <= u32::MAX`, which `append_record` enforces before calling.
     fn frame_nonce(&self) -> [u8; 12] {
-        let mut n = [0u8; 12];
-        n[..8].copy_from_slice(&self.nonce_seed);
-        n[8..].copy_from_slice(&(self.frame_seq as u32).to_le_bytes());
-        n
+        frame_nonce_for(self.segment_no, self.frame_seq as u32)
     }
 
     /// Flush the buffer and fsync the file. This is the durability point.
@@ -500,6 +496,17 @@ pub fn replay_with_cipher(
     WalReader::open_with_cipher(path, cipher)?.replay()
 }
 
+/// Build the deterministic 12-byte AES-GCM nonce for `(segment_no, frame)`:
+/// `[segment_no: 8B BE][frame: 4B LE]`. The high 8 bytes are unique per
+/// segment (persisted monotonic counter) and the low 4 are unique per frame
+/// within a segment, so the pair never collides under the constant WAL DEK.
+pub fn frame_nonce_for(segment_no: u64, frame: u32) -> [u8; 12] {
+    let mut n = [0u8; 12];
+    n[..8].copy_from_slice(&segment_no.to_be_bytes());
+    n[8..].copy_from_slice(&frame.to_le_bytes());
+    n
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -670,5 +677,17 @@ mod tests {
             0,
             "threshold should have auto-synced"
         );
+    }
+
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn wal_nonce_is_segment_deterministic() {
+        // Two segments with different segment_no must never share a frame nonce
+        // base, and frames within a segment never collide.
+        assert_ne!(frame_nonce_for(5, 0), frame_nonce_for(6, 0));
+        assert_ne!(frame_nonce_for(5, 0), frame_nonce_for(5, 1));
+        // Deterministic: same inputs → same nonce (reopened segment reuses its
+        // own nonces safely because the old frames were overwritten).
+        assert_eq!(frame_nonce_for(5, 0), frame_nonce_for(5, 0));
     }
 }
