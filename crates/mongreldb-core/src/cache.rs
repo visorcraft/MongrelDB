@@ -139,15 +139,20 @@ impl PageCache {
         }
     }
 
-    fn spill(&self, key: &[u8; 32], _epoch: Epoch, bytes: &[u8]) {
+    fn spill(&self, key: &[u8; 32], epoch: Epoch, bytes: &[u8]) {
         if !self.persistent {
             return;
         }
         let Some(dir) = &self.dir else { return };
         let _ = std::fs::create_dir_all(dir);
-        let path = dir.join(hex_key(key));
-        // Write-then-rename for atomicity.
-        let tmp = dir.join(format!("{}.tmp", hex_key(key)));
+        let hex = hex_key(key);
+        // Embed the committed epoch in the filename (`<hex>.<epoch>`) so it can
+        // be restored on reload instead of defaulting to a maximal epoch —
+        // otherwise reloaded pages are invisible to ordinary snapshots and the
+        // persistent tier is effectively dead after reopen. The page bytes stay
+        // raw (ciphertext when the table is encrypted).
+        let path = dir.join(format!("{hex}.{}", epoch.0));
+        let tmp = dir.join(format!("{hex}.{}.tmp", epoch.0));
         if std::fs::write(&tmp, bytes).is_ok() {
             let _ = std::fs::rename(&tmp, &path);
         }
@@ -161,13 +166,32 @@ impl PageCache {
         };
         for entry in entries.flatten() {
             let name = entry.file_name();
-            let Some(hex) = name.to_str() else { continue };
+            let Some(s) = name.to_str() else { continue };
             // Skip in-progress temp files.
-            if hex.ends_with(".tmp") {
+            if s.ends_with(".tmp") {
                 continue;
             }
-            let Some(key) = decode_hex_key(hex) else {
-                continue;
+            // New format: "<64hex>.<epoch>". Legacy raw files ("<64hex>" with
+            // no dot) stay visible to every snapshot.
+            let (key, epoch) = match s.rsplit_once('.') {
+                Some((hex, suffix)) => {
+                    let key = match decode_hex_key(hex) {
+                        Some(k) => k,
+                        None => continue,
+                    };
+                    let epoch = match suffix.parse::<u64>() {
+                        Ok(e) => Epoch(e),
+                        Err(_) => continue,
+                    };
+                    (key, epoch)
+                }
+                None => {
+                    let key = match decode_hex_key(s) {
+                        Some(k) => k,
+                        None => continue,
+                    };
+                    (key, Epoch(u64::MAX))
+                }
             };
             if self.map.contains_key(&key) {
                 continue;
@@ -183,9 +207,7 @@ impl PageCache {
                 key,
                 Entry {
                     bytes: bytes::Bytes::from(bytes),
-                    // Persisted pages are immutable run pages; a maximal snapshot
-                    // always sees them.
-                    epoch: Epoch(u64::MAX),
+                    epoch,
                     freq: 0,
                 },
             );

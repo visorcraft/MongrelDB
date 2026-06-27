@@ -440,10 +440,9 @@ fn persistent_cache_plaintext_round_trip() {
     cache.flush_to_disk();
     drop(cache);
 
-    // NOTE: the persistent cache reloads pages with epoch u64::MAX, so only a
-    // maximal snapshot currently sees them. A normal snapshot would miss and
-    // fall back to disk. The `persistent_cache_epoch_visibility` test below
-    // documents this behavior.
+    // The persistent cache reloads pages with their original committed epoch, so
+    // a normal snapshot at that epoch (or newer) sees them; a maximal snapshot
+    // also sees them.
     let mut reloaded = PageCache::new(1 << 20).with_persistence(dir.path().to_path_buf());
     let got = reloaded
         .get(&hash, Snapshot::at(mongreldb_core::Epoch(u64::MAX)))
@@ -451,12 +450,11 @@ fn persistent_cache_plaintext_round_trip() {
     assert_eq!(&got[..], data);
 }
 
-/// Regression note: pages spilled to the persistent cache are reloaded with
-/// epoch `u64::MAX`, making them invisible to ordinary snapshots. This is a
-/// correctness/performance issue: the cache is effectively bypassed after
-/// reopen for any snapshot with a normal epoch.
+/// Regression: pages spilled to the persistent cache must reload with their
+/// original committed epoch so they remain visible to ordinary (non-maximal)
+/// snapshots after reopen. Previously they reloaded with `Epoch(u64::MAX)`,
+/// making the persistent tier effectively dead for normal snapshots.
 #[test]
-#[should_panic(expected = "persistent cache page invisible to ordinary snapshot")]
 fn persistent_cache_epoch_visibility() {
     let dir = tempdir().unwrap();
     let mut cache = PageCache::new(1 << 20).with_persistence(dir.path().to_path_buf());
@@ -471,11 +469,16 @@ fn persistent_cache_epoch_visibility() {
     drop(cache);
 
     let mut reloaded = PageCache::new(1 << 20).with_persistence(dir.path().to_path_buf());
+    // Visible at the exact committed epoch and at any newer epoch.
     let got = reloaded.get(&hash, Snapshot::at(mongreldb_core::Epoch(3)));
     assert!(
         got.is_some(),
-        "persistent cache page invisible to ordinary snapshot"
+        "persistent cache page must be visible at its committed epoch after reopen"
     );
+    assert_eq!(&got.unwrap()[..], b"data");
+    // An older snapshot must NOT see it (MVCC visibility preserved).
+    let missed = reloaded.get(&hash, Snapshot::at(mongreldb_core::Epoch(2)));
+    assert!(missed.is_none(), "page committed at epoch 3 must not be visible at epoch 2");
 }
 
 #[cfg(feature = "encryption")]
