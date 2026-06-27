@@ -673,6 +673,13 @@ impl Database {
     /// that sees a stale catalog still recovers the table by replaying the Ddl.
     pub fn create_table(&self, name: &str, schema: Schema) -> Result<u64> {
         use crate::wal::DdlOp;
+        use std::sync::atomic::Ordering;
+
+        if self.poisoned.load(Ordering::Relaxed) {
+            return Err(MongrelError::Other(
+                "database poisoned by fsync error".into(),
+            ));
+        }
 
         let _g = self.ddl_lock.lock();
         {
@@ -703,9 +710,10 @@ impl Database {
         let mut schema = schema;
         schema.schema_id = table_id;
 
-        // 1. Log the DDL + commit marker to the shared WAL and fsync (durable).
+        // 1. Log the DDL + commit marker to the shared WAL, then make it durable
+        //    via the group-commit coordinator (no fsync under the WAL lock — P3.2).
         let schema_json = DdlOp::encode_schema(&schema)?;
-        {
+        let commit_seq = {
             let mut wal = self.shared_wal.lock();
             wal.append(
                 txn_id,
@@ -716,9 +724,13 @@ impl Database {
                     schema_json,
                 }),
             )?;
-            wal.append_commit(txn_id, epoch, &[])?;
-            wal.group_sync()?;
-        }
+            wal.append_commit(txn_id, epoch, &[])?
+        };
+        self.group
+            .await_durable(&self.shared_wal, commit_seq)
+            .inspect_err(|_| {
+                self.poisoned.store(true, Ordering::Relaxed);
+            })?;
 
         // 2. Create the on-disk table dir + manifest.
         let tdir = self.root.join(TABLES_DIR).join(table_id.to_string());
@@ -757,6 +769,13 @@ impl Database {
     /// Logically drop a table, logging the DDL through the shared WAL first.
     pub fn drop_table(&self, name: &str) -> Result<()> {
         use crate::wal::DdlOp;
+        use std::sync::atomic::Ordering;
+
+        if self.poisoned.load(Ordering::Relaxed) {
+            return Err(MongrelError::Other(
+                "database poisoned by fsync error".into(),
+            ));
+        }
 
         let _g = self.ddl_lock.lock();
         let table_id = {
@@ -770,16 +789,20 @@ impl Database {
         let _c = commit_lock.lock();
         let epoch = self.epoch.bump_assigned();
         let txn_id = self.alloc_txn_id();
-        {
+        let commit_seq = {
             let mut wal = self.shared_wal.lock();
             wal.append(
                 txn_id,
                 table_id,
                 crate::wal::Op::Ddl(DdlOp::DropTable { table_id }),
             )?;
-            wal.append_commit(txn_id, epoch, &[])?;
-            wal.group_sync()?;
-        }
+            wal.append_commit(txn_id, epoch, &[])?
+        };
+        self.group
+            .await_durable(&self.shared_wal, commit_seq)
+            .inspect_err(|_| {
+                self.poisoned.store(true, Ordering::Relaxed);
+            })?;
 
         {
             let mut cat = self.catalog.write();
@@ -912,6 +935,14 @@ impl Database {
     #[doc(hidden)]
     pub fn __wal_group_sync_count(&self) -> u64 {
         self.shared_wal.lock().group_sync_count()
+    }
+
+    /// Force the poisoned state (test-only) to verify the §9.3e fail-fast
+    /// contract that an fsync error would trigger in production.
+    #[doc(hidden)]
+    pub fn __poison(&self) {
+        self.poisoned
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Verify multi-table integrity (spec §16). For every live table this:

@@ -58,17 +58,25 @@ fn same_pk_concurrent_insert_conflicts_exactly_one_wins() {
     let db = Arc::new(Database::create(dir.path()).unwrap());
     db.create_table("t", pk_schema("v")).unwrap();
 
-    let barrier = Arc::new(std::sync::Barrier::new(2));
+    // Both writers must take their read snapshot BEFORE either commits, so they
+    // genuinely race on the same pre-commit state. The first barrier gates that;
+    // the second releases both commits together. (Without the pre-commit-snapshot
+    // gate one thread could commit + publish before the other even begins, and
+    // the late reader would correctly see the row and not conflict — a real SI
+    // outcome, but not the write-write race this test means to exercise.)
+    let begun = Arc::new(std::sync::Barrier::new(2));
+    let commit = Arc::new(std::sync::Barrier::new(2));
     let mut handles = Vec::new();
     for _ in 0..2 {
         let db = Arc::clone(&db);
-        let b = Arc::clone(&barrier);
+        let begun = Arc::clone(&begun);
+        let commit = Arc::clone(&commit);
         handles.push(thread::spawn(move || {
-            b.wait();
-            db.transaction(|t| {
-                t.put("t", vec![(1, Value::Int64(42))])?;
-                Ok(())
-            })
+            let mut tx = db.begin();
+            tx.put("t", vec![(1, Value::Int64(42))]).unwrap();
+            begun.wait(); // both have a read snapshot + staged write
+            commit.wait(); // race the commits
+            tx.commit()
         }));
     }
 
@@ -229,5 +237,39 @@ fn group_commit_batches_fsyncs_under_concurrency() {
     assert!(
         fsyncs < total,
         "group commit must batch: {fsyncs} fsyncs for {total} commits"
+    );
+}
+
+#[test]
+fn poisoned_db_fails_data_and_ddl_writes_fast() {
+    // P3.2 §9.3e: once an fsync error poisons the DB, every subsequent write —
+    // including DDL — must fail fast so no later fsync can retroactively make an
+    // indeterminate transaction's appended records durable.
+    let dir = tempdir().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.create_table("t", pk_schema("v")).unwrap();
+
+    let before = db.__wal_group_sync_count();
+    db.__poison();
+
+    let data = db.transaction(|t| {
+        t.put("t", vec![(1, Value::Int64(1))])?;
+        Ok(())
+    });
+    assert!(matches!(data, Err(MongrelError::Other(_))), "data commit");
+
+    let create = db.create_table("t2", pk_schema("v"));
+    assert!(
+        matches!(create, Err(MongrelError::Other(_))),
+        "create_table"
+    );
+
+    let drop = db.drop_table("t");
+    assert!(matches!(drop, Err(MongrelError::Other(_))), "drop_table");
+
+    assert_eq!(
+        db.__wal_group_sync_count(),
+        before,
+        "a poisoned DB must issue no further fsyncs"
     );
 }
