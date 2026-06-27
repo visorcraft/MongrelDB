@@ -191,9 +191,11 @@ mod key {
         ) -> Result<Zeroizing<[u8; DEK_LEN]>> {
             let cipher = Aes256Gcm::new_from_slice(&self.0[..])
                 .map_err(|e| MongrelError::Encryption(format!("kek aes init: {e}")))?;
-            let pt = cipher
-                .decrypt(Nonce::from_slice(wrap_nonce), wrapped)
-                .map_err(|e| MongrelError::Decryption(format!("dek unwrap: {e}")))?;
+            let pt = Zeroizing::new(
+                cipher
+                    .decrypt(Nonce::from_slice(wrap_nonce), wrapped)
+                    .map_err(|e| MongrelError::Decryption(format!("dek unwrap: {e}")))?,
+            );
             if pt.len() != DEK_LEN {
                 return Err(MongrelError::Decryption(format!(
                     "unwrapped dek is {} bytes, expected {DEK_LEN}",
@@ -201,7 +203,7 @@ mod key {
                 )));
             }
             let mut dek = Zeroizing::new([0u8; DEK_LEN]);
-            dek.copy_from_slice(&pt);
+            dek.copy_from_slice(&pt[..]);
             Ok(dek)
         }
     }

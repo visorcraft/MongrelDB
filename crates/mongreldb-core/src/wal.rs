@@ -75,11 +75,13 @@ pub struct Wal {
     /// Optional AEAD cipher for frame-level encryption. When present, each
     /// frame's payload is encrypted before writing.
     cipher: Option<Box<dyn crate::encryption::Cipher>>,
-    /// Random per-segment nonce seed (generated on creation). Ensures nonce
-    /// uniqueness across restarts even with the same epoch_created.
-    nonce_seed: [u8; 8],
-    /// Per-segment frame counter for nonce uniqueness.
-    frame_seq: u32,
+    /// Random per-segment nonce seed (4 bytes, generated on creation).
+    /// Combined with the 8-byte frame counter gives a unique 12-byte nonce
+    /// per frame. 4 bytes of randomness = 2^32 possible seeds → birthday
+    /// collision at ~2^16 segments, well within practical limits.
+    nonce_seed: [u8; 4],
+    /// Per-segment frame counter (u64 — never overflows in practice).
+    frame_seq: u64,
 }
 
 impl Wal {
@@ -101,7 +103,7 @@ impl Wal {
             .write(true)
             .truncate(true)
             .open(&path)?;
-        let mut nonce_seed = [0u8; 8];
+        let mut nonce_seed = [0u8; 4];
         // fill_random is always available (non-cfg-gated)
         getrandom::getrandom(&mut nonce_seed).expect("getrandom: OS CSPRNG unavailable");
         let mut wal = Self {
@@ -175,10 +177,15 @@ impl Wal {
     /// per segment (monotonically increasing), frame_seq is unique within
     /// a segment — together they guarantee nonce uniqueness across all
     /// segments under the same WAL DEK.
+    /// Derive a unique 12-byte AEAD nonce for the current frame:
+    /// `[nonce_seed: 4B][frame_seq: 8B LE]`. The seed is random per segment
+    /// (regenerated on every Wal::create_with_cipher call), frame_seq is a
+    /// monotonically increasing u64 — together they guarantee nonce uniqueness
+    /// across segments and frames under the same WAL DEK.
     fn frame_nonce(&self) -> [u8; 12] {
         let mut n = [0u8; 12];
-        n[..8].copy_from_slice(&self.nonce_seed);
-        n[8..].copy_from_slice(&self.frame_seq.to_le_bytes());
+        n[..4].copy_from_slice(&self.nonce_seed);
+        n[4..].copy_from_slice(&self.frame_seq.to_le_bytes());
         n
     }
 
