@@ -8,3 +8,4 @@ CLAUDE.md
 # Build artifacts
 *.so
 .superpowers/
+/docs/superpowers/
