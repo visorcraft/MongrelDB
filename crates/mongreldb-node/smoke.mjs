@@ -192,4 +192,99 @@ db4.close();
 rmSync(dir4, { recursive: true });
 console.log('smoke: WriteBuffer + atomic visibility ✓');
 
+// ── New surface: putBatch / bulkLoadTyped / queryArrow / begin / async ──────
+
+const { ColumnType } = require('./mongreldb.node');
+const dir5 = makeTempDir();
+const db5 = Database.withPath(dir5);
+db5.createTable('nums', {
+  columns: [
+    { id: 1, name: 'id', ty: 1, primaryKey: true, nullable: false },
+    { id: 2, name: 'v', ty: 1, primaryKey: false, nullable: false },
+  ],
+  indexes: [{ name: 'v_idx', columnId: 2, kind: 0 }],
+});
+
+const nums = db5.table('nums'); // table() alias for getTable()
+const epoch0 = db5.snapshotEpoch();
+assert(typeof epoch0 === 'bigint', 'snapshotEpoch is bigint');
+
+// putBatch: three rows in one call → three row ids.
+const batchIds = nums.putBatch([
+  [{ columnId: 1, int64: 1 }, { columnId: 2, int64: 7 }],
+  [{ columnId: 1, int64: 2 }, { columnId: 2, int64: 7 }],
+  [{ columnId: 1, int64: 3 }, { columnId: 2, int64: 9 }],
+]);
+assert(batchIds.length === 3, `putBatch returns 3 ids, got ${batchIds.length}`);
+await nums.flushAsync(); // flush to a sorted run (also exercises flushAsync)
+assert(nums.count() === 3n, `putBatch count ${nums.count()}`);
+
+// queryArrow: matching rows as Arrow IPC bytes — verify the IPC file magic.
+const arrow = nums.queryArrow([
+  { kind: ConditionKind.RangeInt, columnId: 2, int64Lo: 7, int64Hi: 7 },
+]);
+assert(arrow.length > 0, 'queryArrow returns bytes');
+assert(arrow.subarray(0, 6).toString('ascii') === 'ARROW1', 'queryArrow emits Arrow IPC');
+
+// bulkLoadTyped: typed Int64 columns straight from JS BigInt64Array buffers.
+db5.createTable('bulk', {
+  columns: [
+    { id: 1, name: 'id', ty: 1, primaryKey: true, nullable: false },
+    { id: 2, name: 'v', ty: 1, primaryKey: false, nullable: false },
+  ],
+  indexes: [],
+});
+const bulk = db5.table('bulk');
+const toBuf = (a) => Buffer.from(a.buffer, a.byteOffset, a.byteLength);
+const bulkEpoch = bulk.bulkLoadTyped([
+  { columnId: 1, ty: ColumnType.Int64, data: toBuf(new BigInt64Array([10n, 11n, 12n])) },
+  { columnId: 2, ty: ColumnType.Int64, data: toBuf(new BigInt64Array([100n, 110n, 120n])) },
+]);
+assert(typeof bulkEpoch === 'bigint', 'bulkLoadTyped returns an epoch');
+assert(bulk.count() === 3n, `bulkLoadTyped count ${bulk.count()}`);
+
+// db.begin() factory + commitAsync().
+const tx5 = db5.begin();
+tx5.put('nums', [{ columnId: 1, int64: 99 }, { columnId: 2, int64: 5 }]);
+const txEpoch = await tx5.commitAsync();
+assert(typeof txEpoch === 'bigint', 'commitAsync returns an epoch');
+assert(nums.count() === 4n, `after txn count ${nums.count()}`);
+assert(db5.snapshotEpoch() >= epoch0, 'snapshotEpoch advances');
+
+db5.close();
+rmSync(dir5, { recursive: true });
+console.log('smoke: putBatch / bulkLoadTyped / queryArrow / begin / async ✓');
+
+// ── Encrypted database round-trip (encryption ships on by default) ──────────
+
+const dir6 = makeTempDir();
+const PASS = 'qa-verify-passphrase';
+const secretSchema = {
+  columns: [
+    { id: 1, name: 'id', ty: 1, primaryKey: true, nullable: false },
+    { id: 2, name: 'v', ty: 1, primaryKey: false, nullable: false },
+  ],
+  indexes: [],
+};
+{
+  const edb = Database.createEncrypted(dir6, PASS);
+  edb.createTable('secret', secretSchema);
+  const st = edb.getTable('secret');
+  st.put([{ columnId: 1, int64: 7 }, { columnId: 2, int64: 42 }]);
+  st.flush();
+  edb.close();
+}
+// Reopen with the correct passphrase → data is readable.
+{
+  const edb = Database.openEncrypted(dir6, PASS);
+  assert(edb.getTable('secret').count() === 1n, 'encrypted reopen sees the row');
+  const r = edb.getTable('secret').get(0n);
+  assert(r !== undefined && r.cells[1].int64 === 42, 'encrypted value round-trips');
+  edb.close();
+}
+// Wrong passphrase is rejected.
+assert.throws(() => Database.openEncrypted(dir6, 'wrong-passphrase'), 'wrong passphrase rejected');
+rmSync(dir6, { recursive: true });
+console.log('smoke: encrypted round-trip ✓');
+
 console.log('All smoke tests passed.');

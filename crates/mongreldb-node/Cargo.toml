@@ -1,6 +1,6 @@
 [package]
 name = "mongreldb-node"
-version = "0.10.6"
+version = "0.12.0"
 edition = "2021"
 rust-version = "1.80"
 license = "MIT OR Apache-2.0"
@@ -26,7 +26,9 @@ serde_json = "1"
 napi-build = "2"
 
 [features]
-default = []
+# Encryption is a core MongrelDB selling point — on by default. Build with
+# `napi build --no-default-features` to ship an addon without it.
+default = ["encryption"]
 encryption = ["mongreldb-core/encryption"]
 
 # Standalone crate (built separately via `napi build`), not a workspace member —

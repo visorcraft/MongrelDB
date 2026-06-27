@@ -10,9 +10,9 @@
 //!   cd crates/mongreldb-node && napi build --release --platform
 //! Produces `mongreldb.<platform>.node` + `index.d.ts`.
 //!
-//! NOTE: row ids / counts / epochs cross the FFI as `u32`/`i32` (JS Number).
-//! Swap to `BigInt` (napi `i64`/`u64`) for tables beyond 2³² rows or full i64
-//! ranges — a localized change to the types in this file.
+//! Row ids / counts / epochs cross the FFI as `BigInt` (lossless u64). Cross-
+//! table SQL is also available via `Database.sql` (Arrow IPC results); the
+//! typed object API stays the zero-SQL fast path for single-table ops.
 
 #![deny(clippy::all)]
 
@@ -25,6 +25,21 @@ use std::sync::Arc;
 
 fn to_napi(e: mongreldb_core::MongrelError) -> napi::Error {
     napi::Error::new(napi::Status::GenericFailure, format!("{e:?}"))
+}
+
+/// Map a transaction-commit result to JS, preserving the `__CONFLICT__:` prefix
+/// the `index.js` wrapper re-throws as a retryable `ConflictError`.
+fn commit_result_to_napi(
+    result: mongreldb_core::Result<mongreldb_core::Epoch>,
+) -> napi::Result<BigInt> {
+    match result {
+        Ok(epoch) => Ok(BigInt::from(epoch.0)),
+        Err(mongreldb_core::MongrelError::Conflict(msg)) => Err(napi::Error::new(
+            napi::Status::GenericFailure,
+            format!("__CONFLICT__:{msg}"),
+        )),
+        Err(other) => Err(to_napi(other)),
+    }
 }
 
 // ── schema ────────────────────────────────────────────────────────────────
@@ -288,7 +303,6 @@ pub struct Database {
 #[napi]
 pub struct TableHandle {
     db: Arc<CoreDatabase>,
-    table_id: u64,
     name: String,
 }
 
@@ -364,12 +378,33 @@ impl Database {
     /// Get a handle to a table by name for typed put/get/query operations.
     #[napi]
     pub fn get_table(&self, name: String) -> napi::Result<TableHandle> {
-        let table_id = self.inner.table_id(&name).map_err(to_napi)?;
+        // Validate the table exists now; per-op calls re-resolve it by name.
+        self.inner.table_id(&name).map_err(to_napi)?;
         Ok(TableHandle {
             db: Arc::clone(&self.inner),
-            table_id,
             name,
         })
+    }
+
+    /// Alias for [`Database::get_table`] matching the spec's `database.table(name)`.
+    #[napi]
+    pub fn table(&self, name: String) -> napi::Result<TableHandle> {
+        self.get_table(name)
+    }
+
+    /// Begin a cross-table transaction (stage puts/deletes, then `commit`).
+    #[napi]
+    pub fn begin(&self) -> Transaction {
+        Transaction {
+            db: Arc::clone(&self.inner),
+            staging: parking_lot::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The current reader-visible epoch — the database-wide snapshot point.
+    #[napi]
+    pub fn snapshot_epoch(&self) -> BigInt {
+        BigInt::from(self.inner.visible_epoch().0)
     }
 
     /// List all live table names.
@@ -395,6 +430,33 @@ impl Database {
     #[napi]
     pub fn close(&self) -> napi::Result<()> {
         Ok(())
+    }
+}
+
+/// Encrypted constructors. The `encryption` feature is **on by default**; build
+/// with `--no-default-features` to omit it. Kept as a whole separate impl block
+/// because a per-method `#[cfg]` inside a `#[napi] impl` would leave a dangling
+/// `#[napi]` registration symbol when the feature is disabled.
+#[cfg(feature = "encryption")]
+#[napi]
+impl Database {
+    /// Create a fresh encrypted database (page-level AES-256-GCM; the database
+    /// KEK is derived from `passphrase` via Argon2id + HKDF).
+    #[napi(factory)]
+    pub fn create_encrypted(path: String, passphrase: String) -> napi::Result<Database> {
+        let db = CoreDatabase::create_encrypted(&path, &passphrase).map_err(to_napi)?;
+        Ok(Database {
+            inner: Arc::new(db),
+        })
+    }
+
+    /// Open an existing encrypted database with its passphrase.
+    #[napi]
+    pub fn open_encrypted(path: String, passphrase: String) -> napi::Result<Database> {
+        let db = CoreDatabase::open_encrypted(&path, &passphrase).map_err(to_napi)?;
+        Ok(Database {
+            inner: Arc::new(db),
+        })
     }
 }
 
@@ -479,6 +541,45 @@ impl TableHandle {
         Ok(rows.iter().map(|r| row_to_js_table(&g, r)).collect())
     }
 
+    /// Insert a batch of rows in one call. Returns the new row ids in order.
+    #[napi]
+    pub fn put_batch(&self, rows: Vec<Vec<Cell>>) -> napi::Result<Vec<BigInt>> {
+        let handle = self.db.table(&self.name).map_err(to_napi)?;
+        let mut g = handle.lock();
+        let mut batch = Vec::with_capacity(rows.len());
+        for cells in rows {
+            batch.push(cell_pairs_table(&g, cells)?);
+        }
+        let rids = g.put_batch(batch).map_err(to_napi)?;
+        Ok(rids.into_iter().map(|r| BigInt::from(r.0)).collect())
+    }
+
+    /// Fastest ingest path: bulk-load typed columns (Int64/Float64/Bool) in one
+    /// shot, bypassing the per-cell `Value` enum. Returns the commit epoch.
+    /// Bytes/Embedding columns are not supported here — use `putBatch`.
+    #[napi]
+    pub fn bulk_load_typed(&self, columns: Vec<TypedColumn>) -> napi::Result<BigInt> {
+        let native = columns
+            .into_iter()
+            .map(|c| c.into_native())
+            .collect::<napi::Result<Vec<_>>>()?;
+        let handle = self.db.table(&self.name).map_err(to_napi)?;
+        let mut g = handle.lock();
+        g.bulk_load_columns(native)
+            .map(|e| BigInt::from(e.0))
+            .map_err(to_napi)
+    }
+
+    /// Hybrid index query returning the matching rows as Arrow IPC bytes
+    /// (columnar, zero-copy on the JS side). Requires at least one condition —
+    /// use `Database.sql` for full scans.
+    #[napi]
+    pub fn query_arrow(&self, conditions: Vec<ConditionSpec>) -> napi::Result<Buffer> {
+        let handle = self.db.table(&self.name).map_err(to_napi)?;
+        let mut g = handle.lock();
+        query_arrow_inner(&mut g, &conditions)
+    }
+
     // ── async variants ──
 
     #[napi]
@@ -554,6 +655,59 @@ impl TableHandle {
         .await
         .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e:?}")))?
     }
+
+    #[napi]
+    pub async fn flush_async(&self) -> napi::Result<BigInt> {
+        let db = Arc::clone(&self.db);
+        let name = self.name.clone();
+        napi::bindgen_prelude::spawn_blocking(move || {
+            let handle = db.table(&name).map_err(to_napi)?;
+            let mut g = handle.lock();
+            g.flush().map(|e| BigInt::from(e.0)).map_err(to_napi)
+        })
+        .await
+        .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e:?}")))?
+    }
+
+    #[napi]
+    pub async fn query_arrow_async(&self, conditions: Vec<ConditionSpec>) -> napi::Result<Buffer> {
+        let db = Arc::clone(&self.db);
+        let name = self.name.clone();
+        napi::bindgen_prelude::spawn_blocking(move || -> napi::Result<Buffer> {
+            let handle = db.table(&name).map_err(to_napi)?;
+            let mut g = handle.lock();
+            query_arrow_inner(&mut g, &conditions)
+        })
+        .await
+        .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e:?}")))?
+    }
+}
+
+/// Shared body for `query_arrow` / `query_arrow_async`: resolve the conditions
+/// to native columns under a fresh snapshot and serialize them to Arrow IPC.
+fn query_arrow_inner(
+    g: &mut mongreldb_core::Table,
+    conditions: &[ConditionSpec],
+) -> napi::Result<Buffer> {
+    if conditions.is_empty() {
+        return Err(napi::Error::new(
+            napi::Status::InvalidArg,
+            "queryArrow requires at least one condition; use Database.sql for full scans",
+        ));
+    }
+    let mut conds = Vec::with_capacity(conditions.len());
+    for c in conditions {
+        conds.push(build_condition(c)?);
+    }
+    let snap = g.snapshot();
+    let proj: Vec<u16> = g.schema().columns.iter().map(|c| c.id).collect();
+    let cols = g
+        .query_columns_native(&conds, Some(&proj), snap)
+        .map_err(to_napi)?;
+    match cols {
+        Some(cols) => Ok(Buffer::from(native_cols_to_ipc(&cols, g.schema())?)),
+        None => Ok(Buffer::from(Vec::new())),
+    }
 }
 
 /// A cross-table transaction (P5.2). Stage puts/deletes across tables; commit
@@ -561,7 +715,9 @@ impl TableHandle {
 #[napi]
 pub struct Transaction {
     db: Arc<CoreDatabase>,
-    staging: Vec<(String, TxnOp)>,
+    // Interior mutability so every method takes `&self`: NAPI requires async
+    // methods to avoid `&mut self`, and a transaction handle is `Arc`-shared.
+    staging: parking_lot::Mutex<Vec<(String, TxnOp)>>,
 }
 
 enum TxnOp {
@@ -575,25 +731,26 @@ impl Transaction {
     pub fn new(db: &Database) -> Self {
         Self {
             db: Arc::clone(&db.inner),
-            staging: Vec::new(),
+            staging: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
     /// Stage a put on `table`.
     #[napi]
-    pub fn put(&mut self, table: String, cells: Vec<Cell>) -> napi::Result<()> {
+    pub fn put(&self, table: String, cells: Vec<Cell>) -> napi::Result<()> {
         let handle = self.db.table(&table).map_err(to_napi)?;
         let g = handle.lock();
         let cols = cell_pairs_table(&g, cells)?;
         drop(g);
-        self.staging.push((table, TxnOp::Put(cols)));
+        self.staging.lock().push((table, TxnOp::Put(cols)));
         Ok(())
     }
 
     /// Stage a delete of `row_id` on `table`.
     #[napi]
-    pub fn delete(&mut self, table: String, row_id: BigInt) -> napi::Result<()> {
+    pub fn delete(&self, table: String, row_id: BigInt) -> napi::Result<()> {
         self.staging
+            .lock()
             .push((table, TxnOp::Delete(RowId(row_id.get_u64().1))));
         Ok(())
     }
@@ -601,38 +758,42 @@ impl Transaction {
     /// Commit all staged ops atomically. Returns the commit epoch.
     /// Throws `ConflictError` on write-write conflict (retryable).
     #[napi]
-    pub fn commit(&mut self) -> napi::Result<BigInt> {
-        let db_ref: &CoreDatabase = &*self.db;
-        let mut tx = db_ref.begin();
-        let stage = std::mem::take(&mut self.staging);
-        let result = (|| {
-            for (table, op) in &stage {
-                match op {
-                    TxnOp::Put(cells) => {
-                        tx.put(table, cells.clone())?;
-                    }
-                    TxnOp::Delete(rid) => {
-                        tx.delete(table, *rid)?;
-                    }
-                }
-            }
-            tx.commit()
-        })();
-        match result {
-            Ok(epoch) => Ok(BigInt::from(epoch.0)),
-            Err(mongreldb_core::MongrelError::Conflict(msg)) => Err(napi::Error::new(
-                napi::Status::GenericFailure,
-                format!("__CONFLICT__:{msg}"),
-            )),
-            Err(other) => Err(to_napi(other)),
-        }
+    pub fn commit(&self) -> napi::Result<BigInt> {
+        let stage = std::mem::take(&mut *self.staging.lock());
+        commit_result_to_napi(apply_txn(&self.db, &stage))
+    }
+
+    /// Commit off the JS event loop (the durability fsync runs on the NAPI
+    /// blocking pool). Throws `ConflictError` on write-write conflict.
+    #[napi]
+    pub async fn commit_async(&self) -> napi::Result<BigInt> {
+        let db = Arc::clone(&self.db);
+        let stage = std::mem::take(&mut *self.staging.lock());
+        napi::bindgen_prelude::spawn_blocking(move || commit_result_to_napi(apply_txn(&db, &stage)))
+            .await
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e:?}")))?
     }
 
     /// Discard all staged ops.
     #[napi]
-    pub fn rollback(&mut self) {
-        self.staging.clear();
+    pub fn rollback(&self) {
+        self.staging.lock().clear();
     }
+}
+
+/// Replay staged ops into a fresh core transaction and commit atomically.
+fn apply_txn(
+    db: &CoreDatabase,
+    stage: &[(String, TxnOp)],
+) -> mongreldb_core::Result<mongreldb_core::Epoch> {
+    let mut tx = db.begin();
+    for (table, op) in stage {
+        match op {
+            TxnOp::Put(cells) => tx.put(table, cells.clone())?,
+            TxnOp::Delete(rid) => tx.delete(table, *rid)?,
+        }
+    }
+    tx.commit()
 }
 
 /// Phase 20.2: a typed column for bulk loading, wrapping JS typed-array data.
@@ -647,7 +808,7 @@ pub struct TypedColumn {
 }
 
 impl TypedColumn {
-    fn to_native(self) -> napi::Result<(u16, mongreldb_core::columnar::NativeColumn)> {
+    fn into_native(self) -> napi::Result<(u16, mongreldb_core::columnar::NativeColumn)> {
         let n = match self.ty {
             ColumnType::Int64
             | ColumnType::Float64
