@@ -24,7 +24,7 @@ fn schema() -> Schema {
                 id: 3,
                 name: "value".into(),
                 ty: TypeId::Int64,
-                flags: ColumnFlags::empty(),
+                flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
             },
         ],
         indexes: vec![IndexDef {

@@ -28,7 +28,7 @@ fn schema() -> Schema {
                 id: 3,
                 name: "emb".into(),
                 ty: TypeId::Embedding { dim: 8 },
-                flags: ColumnFlags::empty(),
+                flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
             },
         ],
         indexes: vec![
@@ -115,7 +115,12 @@ fn mvcc_snapshot_isolation_after_update() {
         (2, Value::Bytes(b"v2".to_vec())),
     ])
     .unwrap();
-    let _ = db.put(vec![]).unwrap(); // bump allocator/seq noise; harmless
+    let _ = db
+        .put(vec![
+            (1, Value::Int64(99)),
+            (2, Value::Bytes(b"noise".to_vec())),
+        ])
+        .unwrap(); // bump allocator/seq noise
     let e2 = db.commit().unwrap();
 
     // Old snapshot sees v1; new snapshot sees v2 (latest row id).

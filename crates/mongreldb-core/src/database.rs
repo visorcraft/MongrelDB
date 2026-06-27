@@ -445,6 +445,7 @@ impl Database {
                         continue;
                     }
                     if let Staged::Put(cells) = staged {
+                        t.validate_cells_not_null(cells)?;
                         let row_id = t.alloc_row_id();
                         let mut row = Row::new(row_id, Epoch(0));
                         for (c, v) in cells {
@@ -507,7 +508,10 @@ impl Database {
                         let handle = tables.get(table_id).ok_or_else(|| {
                             MongrelError::NotFound(format!("table {table_id} not mounted"))
                         })?;
-                        let row_id = handle.lock().alloc_row_id();
+                        let mut t = handle.lock();
+                        t.validate_cells_not_null(cells)?;
+                        let row_id = t.alloc_row_id();
+                        drop(t);
                         let mut row = Row::new(row_id, Epoch(0));
                         for (c, v) in cells {
                             row.columns.insert(*c, v.clone());

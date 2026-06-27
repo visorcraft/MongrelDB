@@ -1,4 +1,8 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+use crate::error::{MongrelError, Result};
+use crate::memtable::Value;
 
 /// Logical column types. The on-disk Arrow encoding is chosen at flush based on
 /// [`TypeId`] and run-time stats (e.g. low-cardinality strings → dictionary).
@@ -134,6 +138,32 @@ impl Schema {
         self.columns
             .iter()
             .find(|c| c.flags.contains(ColumnFlags::PRIMARY_KEY))
+    }
+
+    /// Return an error if any column that is not marked NULLABLE is either
+    /// missing from `columns` or present as `Value::Null`.
+    pub fn validate_not_null(&self, columns: &HashMap<u16, Value>) -> Result<()> {
+        for col in &self.columns {
+            if col.flags.contains(ColumnFlags::NULLABLE) {
+                continue;
+            }
+            match columns.get(&col.id) {
+                None => {
+                    return Err(MongrelError::InvalidArgument(format!(
+                        "column '{}' ({}) is NOT NULL but was omitted",
+                        col.name, col.id
+                    )));
+                }
+                Some(Value::Null) => {
+                    return Err(MongrelError::InvalidArgument(format!(
+                        "column '{}' ({}) is NOT NULL but got NULL",
+                        col.name, col.id
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(())
     }
 }
 

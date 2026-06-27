@@ -32,7 +32,7 @@ fn schema() -> Schema {
                 id: 3,
                 name: "text".into(),
                 ty: TypeId::Bytes,
-                flags: ColumnFlags::empty(),
+                flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
             },
             ColumnDef {
                 id: 4,

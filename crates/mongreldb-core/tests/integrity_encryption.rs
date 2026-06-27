@@ -34,7 +34,9 @@ fn schema_with_indexable_bitmap() -> Schema {
                 id: 3,
                 name: "score".into(),
                 ty: TypeId::Int64,
-                flags: ColumnFlags::empty().with(ColumnFlags::ENCRYPTED),
+                flags: ColumnFlags::empty()
+                    .with(ColumnFlags::ENCRYPTED)
+                    .with(ColumnFlags::NULLABLE),
             },
         ],
         indexes: vec![IndexDef {

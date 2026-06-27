@@ -1327,6 +1327,11 @@ impl Table {
     /// and updates the memtable + indexes. Returns the new row id. Durability
     /// arrives at the next [`Table::commit`] (or [`Table::flush`]).
     pub fn put(&mut self, columns: Vec<(u16, Value)>) -> Result<RowId> {
+        let mut col_map = std::collections::HashMap::with_capacity(columns.len());
+        for (c, v) in &columns {
+            col_map.insert(*c, v.clone());
+        }
+        self.schema.validate_not_null(&col_map)?;
         let row_id = self.allocator.alloc();
         let epoch = self.pending_epoch();
         let mut row = Row::new(row_id, epoch);
@@ -1340,6 +1345,13 @@ impl Table {
     /// Bulk upsert: many rows under a single WAL record + one index pass. Far
     /// cheaper than `put` in a loop for batch ingest.
     pub fn put_batch(&mut self, batch: Vec<Vec<(u16, Value)>>) -> Result<Vec<RowId>> {
+        for cols in &batch {
+            let mut col_map = std::collections::HashMap::with_capacity(cols.len());
+            for (c, v) in cols {
+                col_map.insert(*c, v.clone());
+            }
+            self.schema.validate_not_null(&col_map)?;
+        }
         let epoch = self.pending_epoch();
         let mut rows = Vec::with_capacity(batch.len());
         let mut ids = Vec::with_capacity(batch.len());
@@ -1541,6 +1553,15 @@ impl Table {
     /// Highest epoch whose data is durable in a sorted run (spec §7.1).
     pub(crate) fn flushed_epoch(&self) -> u64 {
         self.flushed_epoch
+    }
+
+    /// Validate that `cells` satisfy the schema's NOT NULL constraints.
+    pub(crate) fn validate_cells_not_null(&self, cells: &[(u16, Value)]) -> Result<()> {
+        let mut col_map = std::collections::HashMap::with_capacity(cells.len());
+        for (c, v) in cells {
+            col_map.insert(*c, v.clone());
+        }
+        self.schema.validate_not_null(&col_map)
     }
 
     /// Logically delete `row_id` (effective at the next commit).

@@ -44,13 +44,13 @@ fn schema_with_bitmap() -> Schema {
                 id: 2,
                 name: "tag".into(),
                 ty: TypeId::Bytes,
-                flags: ColumnFlags::empty(),
+                flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
             },
             ColumnDef {
                 id: 3,
                 name: "score".into(),
                 ty: TypeId::Int64,
-                flags: ColumnFlags::empty(),
+                flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
             },
         ],
         indexes: vec![IndexDef {
@@ -426,6 +426,75 @@ fn partial_column_puts_store_nulls() {
         ]
     );
     assert_eq!(col3, vec![Value::Int64(10), Value::Null, Value::Int64(30)]);
+}
+
+fn schema_with_not_null() -> Schema {
+    Schema {
+        schema_id: 1,
+        columns: vec![
+            ColumnDef {
+                id: 1,
+                name: "id".into(),
+                ty: TypeId::Int64,
+                flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+            },
+            ColumnDef {
+                id: 2,
+                name: "req".into(),
+                ty: TypeId::Int64,
+                flags: ColumnFlags::empty(),
+            },
+            ColumnDef {
+                id: 3,
+                name: "opt".into(),
+                ty: TypeId::Int64,
+                flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+            },
+        ],
+        indexes: vec![],
+        colocation: vec![],
+    }
+}
+
+#[test]
+fn not_null_column_rejects_omit_and_explicit_null() {
+    let dir = tempdir().unwrap();
+    let mut t = Table::create(dir.path(), schema_with_not_null(), 1).unwrap();
+
+    // Omitting a NOT NULL column must fail.
+    assert!(t.put(vec![(1, Value::Int64(1))]).is_err());
+
+    // Explicit NULL for a NOT NULL column must fail.
+    assert!(t.put(vec![(1, Value::Int64(2)), (2, Value::Null)]).is_err());
+
+    // A valid row and a row with a null optional column must succeed.
+    t.put(vec![(1, Value::Int64(3)), (2, Value::Int64(30))])
+        .unwrap();
+    t.put(vec![
+        (1, Value::Int64(4)),
+        (2, Value::Int64(40)),
+        (3, Value::Null),
+    ])
+    .unwrap();
+    t.commit().unwrap();
+
+    assert_eq!(t.count(), 2);
+}
+
+#[test]
+fn not_null_enforced_in_put_batch() {
+    let dir = tempdir().unwrap();
+    let mut t = Table::create(dir.path(), schema_with_not_null(), 1).unwrap();
+
+    let batch = vec![
+        vec![(1, Value::Int64(1)), (2, Value::Int64(10))],
+        vec![(1, Value::Int64(2))], // missing required column
+    ];
+    assert!(t.put_batch(batch).is_err());
+
+    // No rows from the invalid batch are committed.
+    t.commit().unwrap();
+    assert_eq!(t.count(), 0);
 }
 
 #[test]
