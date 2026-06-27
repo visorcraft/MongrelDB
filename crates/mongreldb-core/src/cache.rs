@@ -451,8 +451,8 @@ mod tests {
             cache.insert(page(hash, 5, data));
             cache.flush_to_disk();
         }
-        // The backing file exists.
-        let backing = dir.path().join(hex_key(&hash));
+        // The backing file exists (named `<hex>.<epoch>`).
+        let backing = dir.path().join(format!("{}.{}", hex_key(&hash), 5));
         assert!(backing.exists(), "cache file should be spilled");
 
         // Second cache (simulating reopen): loads the spilled page.

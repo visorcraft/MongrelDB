@@ -27,7 +27,7 @@ fn schema() -> Schema {
                 id: 3,
                 name: "cost".into(),
                 ty: TypeId::Float64,
-                flags: ColumnFlags::empty(),
+                flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
             },
         ],
         indexes: vec![IndexDef {
@@ -87,7 +87,7 @@ fn query_columns_native_cached_hits() {
             1,
             NativeColumn::Int64 {
                 data: (0..500).collect(),
-                validity: vec![0xFF; 500 / 8],
+                validity: vec![0xFF; 500usize.div_ceil(8)],
             },
         ),
         (
@@ -95,14 +95,14 @@ fn query_columns_native_cached_hits() {
             NativeColumn::Bytes {
                 offsets: (0..=500).map(|i| (i * 3) as u32).collect(),
                 values: b"abc".repeat(500),
-                validity: vec![0xFF; 500 / 8],
+                validity: vec![0xFF; 500usize.div_ceil(8)],
             },
         ),
         (
             3,
             NativeColumn::Float64 {
                 data: (0..500).map(|i| i as f64).collect(),
-                validity: vec![0xFF; 500 / 8],
+                validity: vec![0xFF; 500usize.div_ceil(8)],
             },
         ),
     ];

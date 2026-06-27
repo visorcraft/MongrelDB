@@ -161,7 +161,7 @@ fn per_file_dek_differs_between_runs() {
         // Run 2 (distinct memtable → distinct run).
         let _ = db
             .put(vec![
-                (2, Value::Int64(2)),
+                (1, Value::Int64(2)),
                 (2, Value::Bytes(b"same".to_vec())),
             ])
             .unwrap();
@@ -231,7 +231,9 @@ fn plaintext_table_has_no_salt_or_descriptor() {
     {
         let mut db = Table::create(dir.path(), schema(), 1).unwrap();
         db.set_mutable_run_spill_bytes(1); // spill so a plaintext run exists to inspect
-        let _ = db.put(vec![(1, Value::Int64(1))]).unwrap();
+        let _ = db
+            .put(vec![(1, Value::Int64(1)), (2, Value::Bytes(b"s".to_vec()))])
+            .unwrap();
         db.flush().unwrap();
     }
     assert!(

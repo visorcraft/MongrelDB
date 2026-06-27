@@ -657,7 +657,7 @@ async fn zero_copy_preserves_nulls() {
                 id: 2,
                 name: "v".into(),
                 ty: TypeId::Int64,
-                flags: ColumnFlags::empty(),
+                flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
             },
         ],
         indexes: vec![],
