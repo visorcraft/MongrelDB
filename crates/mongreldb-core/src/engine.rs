@@ -1,11 +1,11 @@
 //! The engine tying the write and read paths together.
 //!
-//! Sub-ms writes: [`Db::put`] appends to the WAL **without fsyncing**, upserts
+//! Sub-ms writes: [`Table::put`] appends to the WAL **without fsyncing**, upserts
 //! the skip-list memtable, and updates the in-memory HOT index + secondary
-//! indexes. A batch-driven [`Db::commit`] does the group `fsync` and bumps the
-//! epoch. [`Db::flush`] commits, drains the memtable into an immutable sorted
+//! indexes. A batch-driven [`Table::commit`] does the group `fsync` and bumps the
+//! epoch. [`Table::flush`] commits, drains the memtable into an immutable sorted
 //! run, and rotates the WAL. Reads merge versions across the live memtable and
-//! all sorted runs ([`Db::get`], [`Db::visible_rows`]).
+//! all sorted runs ([`Table::get`], [`Table::visible_rows`]).
 
 use crate::columnar;
 use crate::cursor::NativePageCursor;
@@ -43,7 +43,7 @@ const DECODED_CACHE_CAPACITY: u64 = 64 * 1024 * 1024; // 64 MiB shared decoded-p
 const DEFAULT_MUTABLE_RUN_SPILL_BYTES: u64 = 8 * 1024 * 1024;
 
 /// An open MongrelDB table.
-pub struct Db {
+pub struct Table {
     dir: PathBuf,
     table_id: u64,
     wal: Wal,
@@ -83,7 +83,7 @@ pub struct Db {
     /// versions an active snapshot still needs.
     pinned: BTreeMap<Epoch, usize>,
     /// Live (non-deleted) row count — maintained incrementally for O(1)
-    /// `Db::count()` without a scan.
+    /// `Table::count()` without a scan.
     pub(crate) live_count: u64,
     /// Uniform reservoir sample of row ids for approximate analytics
     /// (Phase 8.2). Maintained incrementally on insert; repopulated on open.
@@ -97,11 +97,11 @@ pub struct Db {
     /// epoch. A re-query after more inserts processes only the delta and merges.
     agg_cache: HashMap<u64, CachedAgg>,
     /// The manifest epoch the on-disk `_idx/global.idx` checkpoint covers (0 if
-    /// there is no checkpoint). Updated by [`Db::checkpoint_indexes`]; persisted
+    /// there is no checkpoint). Updated by [`Table::checkpoint_indexes`]; persisted
     /// in the manifest so reopen loads the checkpoint instead of rebuilding.
     global_idx_epoch: u64,
     /// False when the live in-memory indexes are known to be incomplete (e.g.
-    /// after [`Db::bulk_load_columns`], which bypasses per-row indexing). A
+    /// after [`Table::bulk_load_columns`], which bypasses per-row indexing). A
     /// flush in that state must NOT checkpoint; reopen rebuilds complete indexes
     /// from the runs and resets this to true.
     indexes_complete: bool,
@@ -111,7 +111,7 @@ pub struct Db {
     /// Shared decoded-page cache (Phase 15.4): the post-decompress/decrypt typed
     /// page, so repeat scans skip decode. Keyed by `(run_id, column_id, page)`.
     decoded_cache: Arc<parking_lot::Mutex<crate::cache::DecodedPageCache>>,
-    /// Db-level result cache (Phase 19.1): `canonical_query_key(conditions,
+    /// Table-level result cache (Phase 19.1): `canonical_query_key(conditions,
     /// projection, epoch)` → the survivor columns as typed `NativeColumn`s. Shared
     /// by the native `Condition` API and (via `query_cached`) the tool-call path,
     /// which previously had no caching (only the SQL `MongrelSession` cache did).
@@ -170,7 +170,7 @@ struct CachedEntry {
 /// memory miss, the cache tries disk before falling through to re-resolution.
 /// On `insert`, the entry is also written to disk atomically (write + fsync +
 /// rename). On `invalidate`/`clear`, the matching disk files are deleted. On
-/// `Db::open`, existing disk entries are pre-loaded so fine-grained invalidation
+/// `Table::open`, existing disk entries are pre-loaded so fine-grained invalidation
 /// resumes across restart.
 struct ResultCache {
     entries: std::collections::HashMap<u64, CachedEntry>,
@@ -357,7 +357,7 @@ impl ResultCache {
     }
 
     /// Scan the cache directory and pre-load all entries into memory. Called
-    /// once on `Db::open`. Best-effort: corrupt/unreadable files are deleted.
+    /// once on `Table::open`. Best-effort: corrupt/unreadable files are deleted.
     fn load_persistent(&mut self) {
         let Some(dir) = self.dir.as_ref().cloned() else {
             return;
@@ -635,7 +635,7 @@ fn build_column_keys(kek: Option<&Kek>, schema: &Schema) -> HashMap<u16, ([u8; 3
     }
 }
 
-impl Db {
+impl Table {
     pub fn create(dir: impl AsRef<Path>, schema: Schema, table_id: u64) -> Result<Self> {
         Self::create_inner(dir, schema, table_id, None)
     }
@@ -1086,7 +1086,7 @@ impl Db {
 
     /// Upsert a row. Allocates a [`RowId`], appends a (non-fsynced) WAL record,
     /// and updates the memtable + indexes. Returns the new row id. Durability
-    /// arrives at the next [`Db::commit`] (or [`Db::flush`]).
+    /// arrives at the next [`Table::commit`] (or [`Table::flush`]).
     pub fn put(&mut self, columns: Vec<(u16, Value)>) -> Result<RowId> {
         let row_id = self.allocator.alloc();
         let epoch = self.pending_epoch();
@@ -1433,7 +1433,7 @@ impl Db {
     /// Checkpoint the in-memory secondary indexes to `_idx/global.idx` and stamp
     /// the manifest's `global_idx_epoch` (Phase 9.1). Call after the runs are
     /// stable and the memtable is drained (flush/bulk-load/compact) so the
-    /// checkpoint exactly matches the run data; subsequent [`Db::open`] loads it
+    /// checkpoint exactly matches the run data; subsequent [`Table::open`] loads it
     /// directly instead of scanning every run.
     pub(crate) fn checkpoint_indexes(&mut self, epoch: Epoch) {
         // Never persist an incomplete index set (e.g. after bulk_load_columns,
@@ -1722,7 +1722,7 @@ impl Db {
     /// bitmap index for `column_id` that also exist as a key in `pk_db`'s HOT
     /// index. Avoids loading the entire PK table when the FK column has low
     /// cardinality. Returns `None` if no bitmap index exists for the column.
-    pub fn broadcast_join_values(&self, column_id: u16, pk_db: &Db) -> Option<Vec<Vec<u8>>> {
+    pub fn broadcast_join_values(&self, column_id: u16, pk_db: &Table) -> Option<Vec<Vec<u8>>> {
         let b = self.bitmap.get(&column_id)?;
         let result: Vec<Vec<u8>> = b
             .keys()
@@ -2064,7 +2064,7 @@ impl Db {
     }
 
     /// Pin the current epoch as a read snapshot; compaction will preserve the
-    /// versions it needs until [`Db::unpin_snapshot`] is called.
+    /// versions it needs until [`Table::unpin_snapshot`] is called.
     pub fn pin_snapshot(&mut self) -> Snapshot {
         let e = self.clock.now();
         *self.pinned.entry(e).or_insert(0) += 1;
@@ -2389,7 +2389,7 @@ impl Db {
     }
 
     /// Phase 19.1 + hardening (c): a cached form of
-    /// [`Db::query_columns_native`]. The cache key is epoch-independent (epoch=0);
+    /// [`Table::query_columns_native`]. The cache key is epoch-independent (epoch=0);
     /// invalidation is fine-grained — a `commit()` drops only entries whose
     /// footprint intersects a deleted RowId or whose condition-columns intersect
     /// a mutated column. On a miss the underlying `query_columns_native` runs and
@@ -2426,9 +2426,9 @@ impl Db {
         Ok(res)
     }
 
-    /// Phase 19.1 + hardening (c): a cached form of [`Db::query`]. The cache key
+    /// Phase 19.1 + hardening (c): a cached form of [`Table::query`]. The cache key
     /// is epoch-independent; invalidation is fine-grained (see
-    /// [`Db::query_columns_native_cached`]). On a hit returns the cached rows (no
+    /// [`Table::query_columns_native_cached`]). On a hit returns the cached rows (no
     /// re-resolve, no re-decode).
     pub fn query_cached(&mut self, q: &crate::query::Query) -> Result<Vec<Row>> {
         if q.conditions.is_empty() {
@@ -3656,7 +3656,7 @@ impl Db {
     }
 
     /// Drain the live memtable (prototype/testing helper used by the flush path
-    /// demos). Prefer [`Db::flush`] for the durable path.
+    /// demos). Prefer [`Table::flush`] for the durable path.
     pub fn drain_memtable_sorted(&mut self) -> Vec<Row> {
         self.memtable.drain_sorted()
     }
@@ -3783,7 +3783,7 @@ fn intersect_sets(sets: Vec<std::collections::HashSet<u64>>) -> std::collections
 
 /// Exact aggregate of a column's page stats into a min/max/null_count triple
 /// (Phase 7.1). Only meaningful when the owning table is insert-only, which
-/// [`Db::exact_column_stats`] gates on.
+/// [`Table::exact_column_stats`] gates on.
 #[derive(Debug, Clone)]
 pub struct ColumnStat {
     pub min: Option<Value>,
@@ -3959,7 +3959,7 @@ pub struct CachedAgg {
     pub epoch: u64,
 }
 
-/// Outcome of [`Db::aggregate_incremental`].
+/// Outcome of [`Table::aggregate_incremental`].
 #[derive(Debug, Clone)]
 pub struct IncrementalAggResult {
     /// The aggregate state covering all rows at the current epoch.

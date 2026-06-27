@@ -2,7 +2,7 @@
 //! the flush (`write`) and bulk-load (`write_native`) paths.
 
 use mongreldb_core::schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
-use mongreldb_core::{read_column_dir, read_header, Db, Value};
+use mongreldb_core::{read_column_dir, read_header, Table, Value};
 use std::path::PathBuf;
 use tempfile::tempdir;
 
@@ -45,7 +45,7 @@ fn be_u64(b: &Vec<u8>) -> u64 {
     u64::from_be_bytes(b.as_slice().try_into().unwrap())
 }
 
-fn run_file(db: &Db) -> PathBuf {
+fn run_file(db: &Table) -> PathBuf {
     let dir = db.dir();
     let mut p = dir.join("_runs").join("r-1.sr");
     if !p.exists() {
@@ -68,7 +68,7 @@ fn run_file(db: &Db) -> PathBuf {
 #[test]
 fn page_stats_populated_on_flush() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     db.set_mutable_run_spill_bytes(1); // spill so a run's page stats can be inspected
     for i in 0..50i64 {
         db.put(vec![
@@ -109,7 +109,7 @@ fn page_stats_populated_on_flush() {
 #[test]
 fn page_stats_populated_on_bulk_load() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     db.bulk_load(
         (0..1000i64)
             .map(|i| {
@@ -141,7 +141,7 @@ fn page_stats_populated_on_bulk_load() {
 fn multi_page_range_skipping() {
     use mongreldb_core::query::{Condition, Query};
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     db.bulk_load(
         (0..200_000i64)
             .map(|i| {

@@ -18,7 +18,7 @@
 
 use mongreldb_core::query::{Condition, Query};
 use mongreldb_core::schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
-use mongreldb_core::{Db, RowId, Value};
+use mongreldb_core::{Table, RowId, Value};
 use napi::bindgen_prelude::{BigInt, Buffer};
 use napi_derive::napi;
 use parking_lot::Mutex;
@@ -282,10 +282,10 @@ pub struct RowJs {
 /// blocking pool, so the JS event loop is never stalled by a flush or scan.
 #[napi]
 pub struct Database {
-    db: Arc<Mutex<Db>>,
+    db: Arc<Mutex<Table>>,
 }
 
-fn cell_pairs(db: &Db, cells: Vec<Cell>) -> napi::Result<Vec<(u16, Value)>> {
+fn cell_pairs(db: &Table, cells: Vec<Cell>) -> napi::Result<Vec<(u16, Value)>> {
     let schema = db.schema();
     cells
         .into_iter()
@@ -303,7 +303,7 @@ fn cell_pairs(db: &Db, cells: Vec<Cell>) -> napi::Result<Vec<(u16, Value)>> {
         .collect()
 }
 
-fn row_to_js(db: &Db, row: &mongreldb_core::memtable::Row) -> RowJs {
+fn row_to_js(db: &Table, row: &mongreldb_core::memtable::Row) -> RowJs {
     let schema = db.schema();
     let cells = schema
         .columns
@@ -325,7 +325,7 @@ impl Database {
     #[napi(constructor)]
     pub fn new(path: String, schema: SchemaSpec, table_id: u32) -> napi::Result<Database> {
         let s = build_schema(schema)?;
-        let db = Db::create(&path, s, table_id as u64).map_err(to_napi)?;
+        let db = Table::create(&path, s, table_id as u64).map_err(to_napi)?;
         Ok(Database {
             db: Arc::new(Mutex::new(db)),
         })
@@ -334,7 +334,7 @@ impl Database {
     /// Open an existing table from disk (`Database.open(path)`).
     #[napi]
     pub fn open(path: String) -> napi::Result<Database> {
-        let db = Db::open(&path).map_err(to_napi)?;
+        let db = Table::open(&path).map_err(to_napi)?;
         Ok(Database {
             db: Arc::new(Mutex::new(db)),
         })
@@ -653,7 +653,7 @@ impl TypedColumn {
 /// durable until flush** — the contract is the opposite of `put()`.
 #[napi]
 pub struct WriteBuffer {
-    db: Arc<Mutex<Db>>,
+    db: Arc<Mutex<Table>>,
     buffer: Vec<Vec<(u16, Value)>>,
     threshold: usize,
 }

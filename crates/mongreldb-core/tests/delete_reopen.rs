@@ -1,11 +1,11 @@
 //! Regression: a tombstone committed before reopen must still hide its row after
 //! recovery. Previously the WAL replay stamped the in-memory tombstone with the
 //! WAL record's monotonic `seq` (which outpaces the commit epoch), landing it in
-//! the MVCC future and making deleted rows reappear after `Db::open`.
+//! the MVCC future and making deleted rows reappear after `Table::open`.
 
 use mongreldb_core::{
     schema::{ColumnDef, ColumnFlags, Schema, TypeId},
-    Db, RowId, Value,
+    RowId, Table, Value,
 };
 use tempfile::tempdir;
 
@@ -31,7 +31,7 @@ fn schema() -> Schema {
     }
 }
 
-fn put(db: &mut Db, id: i64, v: i64) -> RowId {
+fn put(db: &mut Table, id: i64, v: i64) -> RowId {
     db.put(vec![(1, Value::Int64(id)), (2, Value::Int64(v))])
         .unwrap()
 }
@@ -40,7 +40,7 @@ fn put(db: &mut Db, id: i64, v: i64) -> RowId {
 #[test]
 fn delete_survives_reopen_after_commit() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     let a = put(&mut db, 1, 10);
     put(&mut db, 2, 20);
     db.commit().unwrap();
@@ -50,7 +50,7 @@ fn delete_survives_reopen_after_commit() {
     assert_eq!(db.visible_rows(db.snapshot()).unwrap().len(), 1);
 
     drop(db);
-    let db = Db::open(dir.path()).unwrap();
+    let db = Table::open(dir.path()).unwrap();
     assert_eq!(db.count(), 1);
     let visible = db.visible_rows(db.snapshot()).unwrap();
     assert_eq!(visible.len(), 1, "deleted row reappeared after reopen");
@@ -62,7 +62,7 @@ fn delete_survives_reopen_after_commit() {
 #[test]
 fn delete_survives_reopen_after_flush() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     let a = put(&mut db, 1, 10);
     put(&mut db, 2, 20);
     db.commit().unwrap();
@@ -70,7 +70,7 @@ fn delete_survives_reopen_after_flush() {
     db.flush().unwrap();
 
     drop(db);
-    let db = Db::open(dir.path()).unwrap();
+    let db = Table::open(dir.path()).unwrap();
     assert_eq!(db.count(), 1);
     let visible = db.visible_rows(db.snapshot()).unwrap();
     assert_eq!(
@@ -85,7 +85,7 @@ fn delete_survives_reopen_after_flush() {
 #[test]
 fn upsert_by_replace_survives_reopen() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     put(&mut db, 1, 10);
     db.commit().unwrap();
 
@@ -100,7 +100,7 @@ fn upsert_by_replace_survives_reopen() {
     assert_eq!(db.visible_rows(db.snapshot()).unwrap().len(), 1);
 
     drop(db);
-    let db = Db::open(dir.path()).unwrap();
+    let db = Table::open(dir.path()).unwrap();
     assert_eq!(db.count(), 1, "ghost duplicate after reopen");
     let visible = db.visible_rows(db.snapshot()).unwrap();
     assert_eq!(visible.len(), 1, "more than one live row for the same PK");

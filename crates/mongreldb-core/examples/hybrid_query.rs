@@ -3,7 +3,7 @@
 //!
 //!     ann_search(vec) ∩ fm_contains(text) ∩ bitmap_eq(category)
 //!
-//! Loads a small trip dataset, then issues ONE `Db::query` that intersects
+//! Loads a small trip dataset, then issues ONE `Table::query` that intersects
 //! HNSW semantic search, FM-index substring, and a roaring bitmap — all over the
 //! shared row-id space, in-process, with no network hop.
 //!
@@ -11,7 +11,7 @@
 
 use mongreldb_core::query::{Condition, Query};
 use mongreldb_core::schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
-use mongreldb_core::{Db, Value};
+use mongreldb_core::{Table, Value};
 use tempfile::tempdir;
 
 const DIM: usize = 16;
@@ -83,7 +83,7 @@ fn emb(label: &str) -> Vec<f32> {
 
 fn main() -> mongreldb_core::Result<()> {
     let dir = tempdir()?;
-    let mut db = Db::create(dir.path(), schema(), 1)?;
+    let mut db = Table::create(dir.path(), schema(), 1)?;
 
     let cities = [
         ("Rome", "city", "ancient ruins and pasta in rome"),

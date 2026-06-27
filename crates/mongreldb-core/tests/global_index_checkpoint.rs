@@ -1,5 +1,5 @@
 //! Phase 9.1 — `_idx/global.idx`: the persisted index checkpoint lets
-//! [`Db::open`] load HOT/bitmap/FM/ANN/sparse/learned-range indexes directly
+//! [`Table::open`] load HOT/bitmap/FM/ANN/sparse/learned-range indexes directly
 //! instead of scanning every sorted run. These tests exercise the fast path
 //! (checkpoint loaded), the WAL-replay-on-top path, the fallback when no
 //! checkpoint exists, and the compaction refresh.
@@ -7,7 +7,7 @@
 use mongreldb_core::columnar::NativeColumn;
 use mongreldb_core::query::{Condition, Query};
 use mongreldb_core::schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
-use mongreldb_core::{Db, Value};
+use mongreldb_core::{Table, Value};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use tempfile::tempdir;
@@ -70,7 +70,7 @@ fn enc_i64(v: i64) -> Vec<u8> {
 fn checkpoint_loaded_on_reopen_all_indexes() {
     let dir = tempdir().unwrap();
     {
-        let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+        let mut db = Table::create(dir.path(), schema(), 1).unwrap();
         db.set_mutable_run_spill_bytes(1); // spill so a checkpoint is written
         db.put(vec![
             (1, Value::Int64(10)),
@@ -92,7 +92,7 @@ fn checkpoint_loaded_on_reopen_all_indexes() {
             "global.idx checkpoint should exist after flush"
         );
     }
-    let mut db = Db::open(dir.path()).unwrap();
+    let mut db = Table::open(dir.path()).unwrap();
 
     let q = Query::pk(enc_i64(20));
     assert_eq!(db.query(&q).unwrap().len(), 1, "PK (HOT) lookup");
@@ -129,7 +129,7 @@ fn checkpoint_loaded_on_reopen_all_indexes() {
 fn wal_replay_indexes_on_top_of_checkpoint() {
     let dir = tempdir().unwrap();
     {
-        let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+        let mut db = Table::create(dir.path(), schema(), 1).unwrap();
         db.put(vec![
             (1, Value::Int64(1)),
             (2, Value::Bytes(b"red".to_vec())),
@@ -145,7 +145,7 @@ fn wal_replay_indexes_on_top_of_checkpoint() {
         .unwrap();
         db.commit().unwrap();
     }
-    let mut db = Db::open(dir.path()).unwrap();
+    let mut db = Table::open(dir.path()).unwrap();
     let q = Query::pk(enc_i64(2));
     assert_eq!(
         db.query(&q).unwrap().len(),
@@ -173,7 +173,7 @@ fn wal_replay_indexes_on_top_of_checkpoint() {
 fn fallback_rebuilds_when_checkpoint_absent() {
     let dir = tempdir().unwrap();
     {
-        let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+        let mut db = Table::create(dir.path(), schema(), 1).unwrap();
         db.set_mutable_run_spill_bytes(1); // spill so a checkpoint is written
         db.put(vec![
             (1, Value::Int64(5)),
@@ -184,7 +184,7 @@ fn fallback_rebuilds_when_checkpoint_absent() {
         db.flush().unwrap();
         std::fs::remove_file(dir.path().join("_idx/global.idx")).unwrap();
     }
-    let mut db = Db::open(dir.path()).unwrap();
+    let mut db = Table::open(dir.path()).unwrap();
     let q = Query::pk(enc_i64(5));
     assert_eq!(
         db.query(&q).unwrap().len(),
@@ -202,7 +202,7 @@ fn fallback_rebuilds_when_checkpoint_absent() {
 fn compaction_refreshes_checkpoint() {
     let dir = tempdir().unwrap();
     {
-        let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+        let mut db = Table::create(dir.path(), schema(), 1).unwrap();
         db.set_mutable_run_spill_bytes(1); // spill per flush so compaction + checkpoint fire
         db.put(vec![
             (1, Value::Int64(1)),
@@ -224,7 +224,7 @@ fn compaction_refreshes_checkpoint() {
             "checkpoint refreshed after compaction"
         );
     }
-    let mut db = Db::open(dir.path()).unwrap();
+    let mut db = Table::open(dir.path()).unwrap();
     let q = Query::new().and(Condition::BitmapEq {
         column_id: 2,
         value: b"red".to_vec(),
@@ -295,7 +295,7 @@ fn ann_and_sparse_roundtrip_through_checkpoint() {
     };
     let dir = tempdir().unwrap();
     {
-        let mut db = Db::create(dir.path(), s, 2).unwrap();
+        let mut db = Table::create(dir.path(), s, 2).unwrap();
         db.put(vec![
             (1, Value::Int64(0)),
             (
@@ -316,7 +316,7 @@ fn ann_and_sparse_roundtrip_through_checkpoint() {
         .unwrap();
         db.flush().unwrap();
     }
-    let mut db = Db::open(dir.path()).unwrap();
+    let mut db = Table::open(dir.path()).unwrap();
 
     let q = Query::new().and(Condition::Ann {
         column_id: 2,
@@ -368,7 +368,7 @@ fn bulk_load_columns_builds_indexes_and_checkpoints() {
     };
     let dir = tempdir().unwrap();
     {
-        let mut db = Db::create(dir.path(), s, 3).unwrap();
+        let mut db = Table::create(dir.path(), s, 3).unwrap();
         let ids = NativeColumn::int64_sequence(1, 3);
         let scores = NativeColumn::Int64 {
             data: vec![10, 20, 30],
@@ -389,7 +389,7 @@ fn bulk_load_columns_builds_indexes_and_checkpoints() {
             "bulk_load_columns must checkpoint its bulk-built indexes"
         );
     }
-    let mut db = Db::open(dir.path()).unwrap();
+    let mut db = Table::open(dir.path()).unwrap();
     assert_eq!(db.count(), 3, "rows survive reopen");
     let q = Query::pk(enc_i64(2));
     assert_eq!(db.query(&q).unwrap().len(), 1);

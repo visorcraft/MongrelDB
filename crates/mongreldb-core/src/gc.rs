@@ -4,12 +4,12 @@
 //! flushes / old compaction inputs) and stale WAL segments (all but the active
 //! one). `check` re-verifies every referenced run's footer checksum.
 
-use crate::engine::Db;
+use crate::engine::Table;
 use crate::sorted_run::read_header;
 use crate::Result;
 use std::collections::HashSet;
 
-/// Outcome of a [`Db::gc`] pass.
+/// Outcome of a [`Table::gc`] pass.
 #[derive(Debug, Default, Clone)]
 pub struct GcReport {
     pub runs_removed: usize,
@@ -17,7 +17,7 @@ pub struct GcReport {
     pub bytes_freed: u64,
 }
 
-/// Outcome of a [`Db::check`] pass.
+/// Outcome of a [`Table::check`] pass.
 #[derive(Debug, Default, Clone)]
 pub struct CheckReport {
     pub runs_checked: usize,
@@ -25,7 +25,7 @@ pub struct CheckReport {
     pub issues: Vec<String>,
 }
 
-/// Outcome of a [`Db::doctor`] pass (best-effort repair): corrupt runs are
+/// Outcome of a [`Table::doctor`] pass (best-effort repair): corrupt runs are
 /// dropped from the manifest so the table is usable again, at the cost of the
 /// data they held.
 #[derive(Debug, Default, Clone)]
@@ -33,7 +33,7 @@ pub struct DoctorReport {
     pub runs_dropped: Vec<u128>,
 }
 
-impl Db {
+impl Table {
     /// Remove orphan run files (not in the manifest) and all but the active WAL
     /// segment. Safe to run any time; readers pin snapshots, not files.
     pub fn gc(&self) -> Result<GcReport> {
@@ -160,7 +160,7 @@ mod tests {
     #[test]
     fn gc_removes_orphan_runs_and_old_wal_segments() {
         let dir = tempdir().unwrap();
-        let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+        let mut db = Table::create(dir.path(), schema(), 1).unwrap();
         db.set_mutable_run_spill_bytes(1); // spill every flush to a run
         db.put(vec![(1, Value::Int64(1))]).unwrap();
         db.flush().unwrap(); // run 1 + rotated WAL
@@ -180,7 +180,7 @@ mod tests {
     #[test]
     fn check_flags_a_corrupt_run() {
         let dir = tempdir().unwrap();
-        let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+        let mut db = Table::create(dir.path(), schema(), 1).unwrap();
         db.set_mutable_run_spill_bytes(1); // spill every flush to a run
         db.put(vec![(1, Value::Int64(1))]).unwrap();
         db.flush().unwrap();

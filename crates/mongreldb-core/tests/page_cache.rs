@@ -5,7 +5,7 @@
 //! non-blockingly, and an optional `_cache/` backing dir survives restart.
 
 use mongreldb_core::schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
-use mongreldb_core::{Db, Value};
+use mongreldb_core::{Table, Value};
 use tempfile::tempdir;
 
 fn schema() -> Schema {
@@ -37,7 +37,7 @@ fn schema() -> Schema {
 #[test]
 fn shared_cache_serves_reads_across_readers() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     // Enough rows to span multiple pages so the cache has real work to do.
     for i in 0..200_000i64 {
         db.put(vec![(1, Value::Int64(i)), (2, Value::Int64(i * 2))])
@@ -71,7 +71,7 @@ fn shared_cache_serves_reads_across_readers() {
 fn persistent_cache_survives_reopen() {
     let dir = tempdir().unwrap();
     {
-        let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+        let mut db = Table::create(dir.path(), schema(), 1).unwrap();
         db.set_mutable_run_spill_bytes(1); // spill so run pages warm the page cache
         for i in 0..100_000i64 {
             db.put(vec![(1, Value::Int64(i)), (2, Value::Int64(i / 7))])
@@ -90,7 +90,7 @@ fn persistent_cache_survives_reopen() {
     assert!(spilled > 0, "expected spilled page files, got {spilled}");
 
     // Reopen: the persistent cache is reloaded; reads are still correct.
-    let db = Db::open(dir.path()).unwrap();
+    let db = Table::open(dir.path()).unwrap();
     assert_eq!(db.count(), 100_000);
     let snap = db.snapshot();
     let out = db.visible_columns_native(snap, None).unwrap();
@@ -108,7 +108,7 @@ fn cache_does_not_break_encrypted_reads() {
     // encrypted table must round-trip correctly through the shared cache.
     let dir = tempdir().unwrap();
     {
-        let mut db = Db::create_encrypted(dir.path(), schema(), 1, "passphrase").unwrap();
+        let mut db = Table::create_encrypted(dir.path(), schema(), 1, "passphrase").unwrap();
         for i in 0..5_000i64 {
             db.put(vec![(1, Value::Int64(i)), (2, Value::Int64(i + 1))])
                 .unwrap();
@@ -133,6 +133,6 @@ fn cache_does_not_break_encrypted_reads() {
         assert_eq!(n1, 5_000);
         assert_eq!(n2, 5_000);
     }
-    let db = Db::open_encrypted(dir.path(), "passphrase").unwrap();
+    let db = Table::open_encrypted(dir.path(), "passphrase").unwrap();
     assert_eq!(db.count(), 5_000);
 }

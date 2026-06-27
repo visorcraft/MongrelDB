@@ -3,7 +3,7 @@
 
 use mongreldb_core::query::{Condition, Query};
 use mongreldb_core::schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
-use mongreldb_core::{Db, Value};
+use mongreldb_core::{Table, Value};
 use tempfile::tempdir;
 
 fn schema() -> Schema {
@@ -35,7 +35,7 @@ fn schema() -> Schema {
 #[test]
 fn learned_range_serves_exact_results() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     // Values intentionally out of row-id order, spanning negatives.
     let vals = [100i64, -50, 0, -50, 1000, 7, -50, 250, 7, -1];
     db.bulk_load(
@@ -76,7 +76,7 @@ fn learned_range_serves_exact_results() {
 #[test]
 fn learned_range_matches_full_scan_answer() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     db.bulk_load(
         (0..5000i64)
             .map(|i| {

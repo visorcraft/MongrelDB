@@ -7,7 +7,7 @@
 //! `commit` (one fsync) — the durable-update cost.
 
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion, Throughput};
-use mongreldb_core::{schema::*, Db, Value};
+use mongreldb_core::{schema::*, Table, Value};
 use std::time::Duration;
 use tempfile::tempdir;
 
@@ -53,7 +53,7 @@ fn schema() -> Schema {
 
 const N: u64 = 100;
 
-fn insert_rows(db: &mut Db) {
+fn insert_rows(db: &mut Table) {
     for i in 0..N {
         db.put(vec![
             (1, Value::Int64(i as i64)),
@@ -67,18 +67,18 @@ fn insert_rows(db: &mut Db) {
 }
 
 /// A table with 100 rows still in the memtable (inserted + committed, not flushed).
-fn memtable_db() -> (tempfile::TempDir, Db) {
+fn memtable_db() -> (tempfile::TempDir, Table) {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     insert_rows(&mut db);
     db.commit().unwrap();
     (dir, db)
 }
 
 /// A table with 100 rows flushed to a sorted run on disk (memtable empty).
-fn flushed_db() -> (tempfile::TempDir, Db) {
+fn flushed_db() -> (tempfile::TempDir, Table) {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     insert_rows(&mut db);
     db.flush().unwrap();
     (dir, db)

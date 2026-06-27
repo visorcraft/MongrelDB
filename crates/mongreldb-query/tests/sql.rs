@@ -2,7 +2,7 @@
 
 use arrow::array::Array;
 use mongreldb_core::schema::{ColumnDef, ColumnFlags, Schema, TypeId};
-use mongreldb_core::{Db, Value};
+use mongreldb_core::{Table, Value};
 use mongreldb_query::MongrelSession;
 use tempfile::tempdir;
 
@@ -63,7 +63,7 @@ fn total_rows(batches: &[arrow::record_batch::RecordBatch]) -> usize {
 
 async fn setup() -> (tempfile::TempDir, MongrelSession) {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     for i in 0..100i64 {
         db.put(vec![
             (1, Value::Int64(i)),
@@ -295,7 +295,7 @@ fn vec_schema() -> Schema {
 #[tokio::test]
 async fn ann_search_pushdown() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), vec_schema(), 2).unwrap();
+    let mut db = Table::create(dir.path(), vec_schema(), 2).unwrap();
     let proto = [1.0f32, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0, -1.0];
     for i in 0..12i64 {
         // Row 0 is the prototype itself; every other row flips a distinct bit.
@@ -358,7 +358,7 @@ fn cities_schema() -> Schema {
     }
 }
 
-/// Two distinct tables (separate `Db`s) on one session → DataFusion hash join.
+/// Two distinct tables (separate `Table`s) on one session → DataFusion hash join.
 /// `travel_trips.destination ∈ City0..City99`; `cities` lists City0..City9 with
 /// `country ∈ {North, South}`. A filtered join on `country = 'North'` yields the
 /// 5 matching trips.
@@ -367,7 +367,7 @@ async fn multi_table_join() {
     let (dir, session) = setup().await; // registers travel_trips
 
     let cities_dir = tempdir().unwrap();
-    let mut cities = Db::create(cities_dir.path(), cities_schema(), 3).unwrap();
+    let mut cities = Table::create(cities_dir.path(), cities_schema(), 3).unwrap();
     for i in 0..10i64 {
         let country = if i % 2 == 0 { "North" } else { "South" };
         cities
@@ -400,7 +400,7 @@ async fn fk_join_composes_pk_and_fk_predicates() {
     let (dir, session) = setup().await;
 
     let cities_dir = tempdir().unwrap();
-    let mut cities = Db::create(cities_dir.path(), cities_schema(), 3).unwrap();
+    let mut cities = Table::create(cities_dir.path(), cities_schema(), 3).unwrap();
     for i in 0..10i64 {
         let country = if i % 2 == 0 { "North" } else { "South" };
         cities
@@ -459,7 +459,7 @@ async fn streaming_scan_emits_multiple_batches() {
         indexes: vec![],
         colocation: vec![],
     };
-    let mut db = Db::create(dir.path(), minimal, 1).unwrap();
+    let mut db = Table::create(dir.path(), minimal, 1).unwrap();
     // 65 536 + 1000 ⇒ exactly two streamed batches (full + partial).
     let n: i64 = 65_536 + 1000;
     for i in 0..n {
@@ -537,7 +537,7 @@ async fn multi_run_streams_and_limit_short_circuits() {
         }],
         colocation: vec![],
     };
-    let mut db = Db::create(dir.path(), multi_schema, 1).unwrap();
+    let mut db = Table::create(dir.path(), multi_schema, 1).unwrap();
     db.set_mutable_run_spill_bytes(1); // each flush spills a fresh run
     for run in 0..3i64 {
         for i in 0..1000i64 {
@@ -594,7 +594,7 @@ async fn cursor_page_pruning_is_exact() {
         indexes: vec![],
         colocation: vec![],
     };
-    let mut db = Db::create(dir.path(), minimal, 1).unwrap();
+    let mut db = Table::create(dir.path(), minimal, 1).unwrap();
     // ~3 pages (2 full 65 536-row pages + a partial third).
     let n: i64 = 65_536 * 2 + 5000;
     for i in 0..n {
@@ -663,7 +663,7 @@ async fn zero_copy_preserves_nulls() {
         indexes: vec![],
         colocation: vec![],
     };
-    let mut db = Db::create(dir.path(), nullable, 1).unwrap();
+    let mut db = Table::create(dir.path(), nullable, 1).unwrap();
     for i in 0..10i64 {
         // Even rows carry a value; odd rows leave `v` null (no entry).
         if i % 2 == 0 {
@@ -709,7 +709,7 @@ async fn zero_copy_preserves_nulls() {
 #[tokio::test]
 async fn cursor_handles_schema_evolution() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     for i in 0..100i64 {
         db.put(vec![
             (1, Value::Int64(i)),

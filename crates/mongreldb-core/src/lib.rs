@@ -38,10 +38,9 @@ pub use cache::PageCache;
 pub use columnar::{decode_column, encode_column};
 pub use cursor::{Cursor, MultiRunCursor, NativePageCursor};
 pub use encryption::{Cipher, PlaintextCipher};
-pub use engine::Db;
 pub use engine::{
     AggState, ApproxAgg, ApproxResult, CachedAgg, ColumnStat, IncrementalAggResult, NativeAgg,
-    NativeAggResult,
+    NativeAggResult, Table,
 };
 pub use epoch::{Epoch, EpochClock, Snapshot};
 pub use error::{MongrelError, Result};

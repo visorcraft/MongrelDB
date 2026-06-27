@@ -4,7 +4,7 @@
 use mongreldb_core::columnar::NativeColumn;
 use mongreldb_core::epoch::Epoch;
 use mongreldb_core::schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
-use mongreldb_core::{tsv, Db, NativeAgg, NativeAggResult, Snapshot, Value};
+use mongreldb_core::{tsv, NativeAgg, NativeAggResult, Snapshot, Table, Value};
 use tempfile::tempdir;
 
 fn schema() -> Schema {
@@ -24,7 +24,7 @@ fn schema() -> Schema {
 #[test]
 fn bulk_load_then_vectorized_scan() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     let batch: Vec<Vec<(u16, Value)>> = (0..1000).map(|i| vec![(1, Value::Int64(i))]).collect();
     db.bulk_load(batch).unwrap();
     assert_eq!(db.run_count(), 1);
@@ -42,7 +42,7 @@ fn bulk_load_then_vectorized_scan() {
 #[test]
 fn schema_evolution_reads_old_rows_as_null() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     db.put(vec![(1, Value::Int64(1))]).unwrap();
     db.flush().unwrap();
 
@@ -72,7 +72,7 @@ fn schema_evolution_reads_old_rows_as_null() {
 #[test]
 fn doctor_drops_a_corrupt_run() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     db.set_mutable_run_spill_bytes(1); // force a spill per flush (exercises doctor)
     db.put(vec![(1, Value::Int64(1))]).unwrap();
     db.flush().unwrap();
@@ -102,7 +102,7 @@ fn doctor_drops_a_corrupt_run() {
 #[test]
 fn native_bulk_load_and_metadata_count() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     let n = 50_000usize;
     let id_col = NativeColumn::int64_sequence(0, n);
     let cols = vec![(1u16, id_col)];
@@ -126,7 +126,7 @@ fn native_bulk_load_and_metadata_count() {
 #[test]
 fn parallel_page_decode_round_trips_multipage_column() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     // 3 full 65 536-row pages + a partial fourth → exercises the parallel branch.
     let n = 65_536 * 3 + 12_345;
     let id_col = NativeColumn::int64_sequence(0, n);
@@ -179,7 +179,7 @@ fn native_aggregate_matches_expected() {
         }],
         colocation: vec![],
     };
-    let mut db = Db::create(dir.path(), schema, 1).unwrap();
+    let mut db = Table::create(dir.path(), schema, 1).unwrap();
     let n = 50_000i64;
     db.bulk_load(
         (0..n)
@@ -259,7 +259,7 @@ fn native_aggregate_matches_expected() {
 #[test]
 fn tsv_round_trips_through_the_engine() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     let original = vec![
         vec![(1, Value::Int64(1))],
         vec![(1, Value::Int64(2))],
@@ -275,7 +275,7 @@ fn tsv_round_trips_through_the_engine() {
 
     // Re-ingest the imported rows into a fresh db and verify.
     let dir2 = tempdir().unwrap();
-    let mut db2 = Db::create(dir2.path(), schema(), 1).unwrap();
+    let mut db2 = Table::create(dir2.path(), schema(), 1).unwrap();
     db2.put_batch(imported).unwrap();
     db2.commit().unwrap();
     let snap = Snapshot::at(Epoch(1));

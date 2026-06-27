@@ -4,7 +4,7 @@
 //! — but preserving the version each pinned read snapshot still needs. Identical
 //! re-encoded pages reuse their content hash, so the page cache keeps hitting.
 
-use crate::engine::Db;
+use crate::engine::Table;
 use crate::epoch::Epoch;
 use crate::manifest::RunRef;
 use crate::memtable::Row;
@@ -12,7 +12,7 @@ use crate::sorted_run::RunWriter;
 use crate::Result;
 use std::collections::HashMap;
 
-impl Db {
+impl Table {
     /// Merge all runs into a single level-1 run, dropping superseded versions
     /// and tombstones — **but preserving** the version each pinned snapshot
     /// still needs. No-op if there are fewer than two runs.
@@ -151,7 +151,7 @@ mod tests {
     #[test]
     fn compaction_merges_runs_and_gcs_tombstoned_row() {
         let dir = tempdir().unwrap();
-        let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+        let mut db = Table::create(dir.path(), schema(), 1).unwrap();
         // Spill every flush to a run (this test exercises run-level merging).
         db.set_mutable_run_spill_bytes(1);
         let mut ids = Vec::new();
@@ -176,7 +176,7 @@ mod tests {
     #[test]
     fn pinned_snapshot_survives_compaction() {
         let dir = tempdir().unwrap();
-        let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+        let mut db = Table::create(dir.path(), schema(), 1).unwrap();
         let r = db.put(vec![(1, Value::Int64(1))]).unwrap();
         db.flush().unwrap(); // run 1: live version of r
 

@@ -3,7 +3,7 @@
 
 use mongreldb_core::columnar::NativeColumn;
 use mongreldb_core::schema::*;
-use mongreldb_core::Db;
+use mongreldb_core::Table;
 use mongreldb_query::MongrelSession;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
@@ -77,7 +77,7 @@ fn main() {
     let regions: Vec<Vec<u8>> = (0..n).map(|i| match i % 5 { 0 => b"north".to_vec(), 1 => b"south".to_vec(), 2 => b"east".to_vec(), 3 => b"west".to_vec(), _ => b"central".to_vec() }).collect();
 
     let v = n / 8;
-    let mut db = Db::create(dir.path().join("t"), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path().join("t"), schema(), 1).unwrap();
     db.bulk_load_columns(vec![
         (1, NativeColumn::Int64 { data: ids, validity: vec![0xFF; v] }),
         (2, mk_bytes_col(&cats)),
@@ -90,7 +90,7 @@ fn main() {
     db.flush().unwrap();
 
     let udir = tempdir().unwrap();
-    let mut users = Db::create(udir.path().join("u"), users_schema(), 2).unwrap();
+    let mut users = Table::create(udir.path().join("u"), users_schema(), 2).unwrap();
     let u_ids: Vec<i64> = (0..100_000).map(|i| i as i64).collect();
     let u_regions: Vec<Vec<u8>> = (0..100_000).map(|i| match i % 5 { 0 => b"north".to_vec(), 1 => b"south".to_vec(), 2 => b"east".to_vec(), 3 => b"west".to_vec(), _ => b"central".to_vec() }).collect();
     users.bulk_load_columns(vec![

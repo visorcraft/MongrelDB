@@ -1,7 +1,7 @@
 //! Global index file — `_idx/global.idx` (DBPLAN §6.3).
 //!
 //! On flush/bulk-load the in-memory secondary indexes (HOT, bitmap, FM, ANN,
-//! sparse, learned-range) are checkpointed here so [`crate::engine::Db::open`]
+//! sparse, learned-range) are checkpointed here so [`crate::engine::Table::open`]
 //! can load them directly instead of scanning every sorted run. The file is
 //! self-describing and integrity-checked:
 //!

@@ -8,7 +8,7 @@
 
 use mongreldb_core::{
     schema::{ColumnDef, ColumnFlags, Schema, TypeId},
-    Db, RowId, Snapshot, Value,
+    RowId, Snapshot, Table, Value,
 };
 use tempfile::tempdir;
 
@@ -34,7 +34,7 @@ fn schema() -> Schema {
     }
 }
 
-fn put(db: &mut Db, id: i64, v: i64) -> RowId {
+fn put(db: &mut Table, id: i64, v: i64) -> RowId {
     db.put(vec![(1, Value::Int64(id)), (2, Value::Int64(v))])
         .unwrap()
 }
@@ -42,7 +42,7 @@ fn put(db: &mut Db, id: i64, v: i64) -> RowId {
 #[test]
 fn flush_coalesces_into_mutable_run_without_writing_a_run() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     // Default 8 MiB spill threshold: a handful of small rows stays in memory.
     let r0 = put(&mut db, 0, 100);
     let r1 = put(&mut db, 1, 101);
@@ -74,7 +74,7 @@ fn flush_coalesces_into_mutable_run_without_writing_a_run() {
 #[test]
 fn multiple_flushes_coalesce_into_one_run_on_spill() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     // Tiny threshold: each flush spills. Used here to confirm that the spill
     // path still produces a correct, queryable run.
     db.set_mutable_run_spill_bytes(1);
@@ -110,7 +110,7 @@ fn multiple_flushes_coalesce_into_one_run_on_spill() {
 #[test]
 fn mvcc_merge_across_memtable_tier_and_run() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     // Row lives in a run.
     db.set_mutable_run_spill_bytes(1);
     let r = put(&mut db, 1, 10);
@@ -141,7 +141,7 @@ fn reopen_rebuilds_unflushed_tier_from_wal_replay() {
     let dir = tempdir().unwrap();
     let path = dir.path().to_path_buf();
     {
-        let mut db = Db::create(&path, schema(), 1).unwrap();
+        let mut db = Table::create(&path, schema(), 1).unwrap();
         // Default threshold: flush coalesces into the tier, WAL is NOT rotated.
         put(&mut db, 0, 5);
         put(&mut db, 1, 6);
@@ -150,7 +150,7 @@ fn reopen_rebuilds_unflushed_tier_from_wal_replay() {
     }
     // Reopen: the in-memory tier is empty, but recovery replays the unrotated
     // WAL into the memtable, so the rows are still present.
-    let db = Db::open(&path).unwrap();
+    let db = Table::open(&path).unwrap();
     assert_eq!(db.run_count(), 0);
     assert_eq!(db.count(), 2);
     let snap = db.snapshot();
@@ -169,7 +169,7 @@ fn reopen_rebuilds_unflushed_tier_from_wal_replay() {
 #[test]
 fn rows_for_rids_overlay_shadows_run_and_drops_tombstones() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     // One bulk-loaded run with a known PK (rid 0).
     db.bulk_load(vec![vec![(1, Value::Int64(7)), (2, Value::Int64(70))]])
         .unwrap();

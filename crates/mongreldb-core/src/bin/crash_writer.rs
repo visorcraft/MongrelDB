@@ -14,7 +14,7 @@
 //! located at `$CARGO_BIN_EXE_crash_writer`.
 
 use mongreldb_core::schema::{ColumnDef, ColumnFlags, Schema, TypeId};
-use mongreldb_core::{Db, Value};
+use mongreldb_core::{Table, Value};
 use std::io::Write;
 use std::process::exit;
 use std::time::{Duration, Instant};
@@ -48,7 +48,7 @@ fn main() {
         // manifest epoch advance) completes before we signal, so the row must
         // survive a `kill -9` that lands any time after COMMITTED_READY.
         "committed" => {
-            let mut db = Db::create(&dir, schema(), 1).expect("create");
+            let mut db = Table::create(&dir, schema(), 1).expect("create");
             db.put(vec![(1, Value::Int64(4242))]).expect("put");
             db.commit().expect("commit");
             signal("COMMITTED_READY");
@@ -57,7 +57,7 @@ fn main() {
         // Several independent committed transactions (distinct PKs) — all must
         // survive a `kill -9` after the final commit.
         "committed-burst" => {
-            let mut db = Db::create(&dir, schema(), 1).expect("create");
+            let mut db = Table::create(&dir, schema(), 1).expect("create");
             for v in [10i64, 20, 30] {
                 db.put(vec![(1, Value::Int64(v))]).expect("put");
                 db.commit().expect("commit");
@@ -72,7 +72,7 @@ fn main() {
         // memtable yet keep it invisible (committed_epoch > manifest epoch), and
         // must not panic or corrupt.
         "uncommitted" => {
-            let mut db = Db::create(&dir, schema(), 1).expect("create");
+            let mut db = Table::create(&dir, schema(), 1).expect("create");
             db.set_sync_byte_threshold(1);
             db.put(vec![(1, Value::Int64(9999))]).expect("put");
             signal("UNCOMMITTED_READY");
@@ -83,7 +83,7 @@ fn main() {
         // crash lands after the run is on disk and the WAL is rotated, so
         // recovery must read the row from the run.
         "flush-spill" => {
-            let mut db = Db::create(&dir, schema(), 1).expect("create");
+            let mut db = Table::create(&dir, schema(), 1).expect("create");
             db.set_mutable_run_spill_bytes(1);
             db.put(vec![(1, Value::Int64(7777))]).expect("put");
             db.flush().expect("flush");

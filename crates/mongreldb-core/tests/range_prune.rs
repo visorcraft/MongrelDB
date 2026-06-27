@@ -2,11 +2,11 @@
 //! correct (and equal the brute-force visible set) under any layout — including
 //! a non-empty memtable and multiple runs, the state that previously forced a
 //! full-column decode. These columns have NO `LearnedRange` index, so resolution
-//! goes through `Db::resolve_condition` → `range_scan_*` (now page-pruned).
+//! goes through `Table::resolve_condition` → `range_scan_*` (now page-pruned).
 
 use mongreldb_core::query::{Condition, Query};
 use mongreldb_core::schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
-use mongreldb_core::{Db, Value};
+use mongreldb_core::{Table, Value};
 use tempfile::tempdir;
 
 /// No LearnedRange index on `v`/`f` → resolution uses the (page-pruned) scan
@@ -59,7 +59,7 @@ fn row(i: i64) -> Vec<(u16, Value)> {
     ]
 }
 
-fn brute_count_i64(db: &Db, lo: i64, hi: i64) -> usize {
+fn brute_count_i64(db: &Table, lo: i64, hi: i64) -> usize {
     db.visible_rows(db.snapshot())
         .unwrap()
         .iter()
@@ -67,7 +67,7 @@ fn brute_count_i64(db: &Db, lo: i64, hi: i64) -> usize {
         .count()
 }
 
-fn brute_count_f64(db: &Db, lo: f64, lo_inc: bool, hi: f64, hi_inc: bool) -> usize {
+fn brute_count_f64(db: &Table, lo: f64, lo_inc: bool, hi: f64, hi_inc: bool) -> usize {
     db.visible_rows(db.snapshot())
         .unwrap()
         .iter()
@@ -85,7 +85,7 @@ fn brute_count_f64(db: &Db, lo: f64, lo_inc: bool, hi: f64, hi_inc: bool) -> usi
 #[test]
 fn range_scan_prunes_correctly_with_nonempty_memtable() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     // >1 PAX page (pages are 65 536 rows): 200_000 rows ⇒ 4 pages.
     let n = 200_000i64;
     db.bulk_load((0..n).map(row).collect::<Vec<_>>()).unwrap();
@@ -145,7 +145,7 @@ fn range_scan_prunes_correctly_with_nonempty_memtable() {
 #[test]
 fn range_scan_f64_prunes_correctly_with_nonempty_memtable() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     let n = 200_000i64;
     db.bulk_load((0..n).map(row).collect::<Vec<_>>()).unwrap();
     for i in 0..5 {
@@ -191,7 +191,7 @@ fn range_scan_f64_prunes_correctly_with_nonempty_memtable() {
 fn range_scan_correct_after_flush_creates_second_run() {
     // Two runs (bulk_load + flush after extra puts) — the multi-run case.
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     db.bulk_load((0..70_000i64).map(row).collect::<Vec<_>>())
         .unwrap();
     db.put(row(70_000)).unwrap();
@@ -212,7 +212,7 @@ fn range_scan_correct_after_flush_creates_second_run() {
 #[test]
 fn range_scan_respects_deletes() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     db.bulk_load((0..70_000i64).map(row).collect::<Vec<_>>())
         .unwrap();
     // Delete rows 10..21 (the exact [10,20] survivors), commit (memtable dirty).

@@ -33,7 +33,7 @@ use arrow::datatypes::Field;
 use arrow::record_batch::RecordBatch;
 use datafusion::common::Column;
 use datafusion::logical_expr::{Expr, JoinType, LogicalPlan, Operator};
-use mongreldb_core::{schema::IndexKind, Condition, Db, Query, Row, Schema, TypeId, Value};
+use mongreldb_core::{schema::IndexKind, Condition, Query, Row, Schema, Table, TypeId, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -44,7 +44,7 @@ type SortInfo = (Vec<(Expr, bool, bool)>, Option<usize>);
 /// bitmap intersection and return the result batches; otherwise `None` (fall
 /// through to DataFusion).
 pub(crate) fn try_fk_join(
-    tables: &HashMap<String, Arc<Mutex<Db>>>,
+    tables: &HashMap<String, Arc<Mutex<Table>>>,
     plan: &LogicalPlan,
 ) -> Result<Option<Vec<RecordBatch>>> {
     // 1. Peel outer Sort / Limit (captured), Projection (captured), optional
@@ -425,8 +425,8 @@ struct OutCol {
 
 fn lock_db<'a>(
     table: &str,
-    tables: &'a HashMap<String, Arc<Mutex<Db>>>,
-) -> std::sync::MutexGuard<'a, Db> {
+    tables: &'a HashMap<String, Arc<Mutex<Table>>>,
+) -> std::sync::MutexGuard<'a, Table> {
     tables
         .get(table)
         .expect("table pre-checked present")
@@ -434,7 +434,7 @@ fn lock_db<'a>(
         .expect("db mutex poisoned")
 }
 
-fn with_schema(table: &str, tables: &HashMap<String, Arc<Mutex<Db>>>) -> Result<Schema> {
+fn with_schema(table: &str, tables: &HashMap<String, Arc<Mutex<Table>>>) -> Result<Schema> {
     let db = lock_db(table, tables);
     Ok(db.schema().clone())
 }
@@ -529,7 +529,7 @@ fn route_conjunct(
     conj: &Expr,
     left: &Side,
     right: &Side,
-    tables: &HashMap<String, Arc<Mutex<Db>>>,
+    tables: &HashMap<String, Arc<Mutex<Table>>>,
 ) -> Result<Option<bool>> {
     let cols = referenced_columns(conj);
     if cols.is_empty() {
@@ -658,7 +658,7 @@ fn classify(
     join: &datafusion::logical_expr::Join,
     left: &Side,
     right: &Side,
-    tables: &HashMap<String, Arc<Mutex<Db>>>,
+    tables: &HashMap<String, Arc<Mutex<Table>>>,
 ) -> Result<Option<JoinClass>> {
     // Extract the single equi-condition as (left-ish col, right-ish col) with
     // the side each belongs to.
@@ -791,7 +791,11 @@ fn col_name(expr: &Expr) -> Option<String> {
     }
 }
 
-fn is_pk_column(table: &str, col: &str, tables: &HashMap<String, Arc<Mutex<Db>>>) -> Result<bool> {
+fn is_pk_column(
+    table: &str,
+    col: &str,
+    tables: &HashMap<String, Arc<Mutex<Table>>>,
+) -> Result<bool> {
     match tables.get(table) {
         Some(arc) => {
             let db = arc.lock().expect("db mutex poisoned");
@@ -805,7 +809,7 @@ fn is_pk_column(table: &str, col: &str, tables: &HashMap<String, Arc<Mutex<Db>>>
     }
 }
 
-fn has_bitmap(table: &str, col: &str, tables: &HashMap<String, Arc<Mutex<Db>>>) -> Result<bool> {
+fn has_bitmap(table: &str, col: &str, tables: &HashMap<String, Arc<Mutex<Table>>>) -> Result<bool> {
     let Some(arc) = tables.get(table) else {
         return Ok(false);
     };
@@ -825,7 +829,7 @@ fn has_bitmap(table: &str, col: &str, tables: &HashMap<String, Arc<Mutex<Db>>>) 
 /// would be inexact ⇒ bail to DataFusion).
 fn translate_side(
     table: &str,
-    tables: &HashMap<String, Arc<Mutex<Db>>>,
+    tables: &HashMap<String, Arc<Mutex<Table>>>,
     conj: &[Expr],
 ) -> Result<Option<Vec<Condition>>> {
     let schema = with_schema(table, tables)?;
@@ -846,7 +850,7 @@ fn output_columns(
     jc: &JoinClass,
     left: &Side,
     right: &Side,
-    tables: &HashMap<String, Arc<Mutex<Db>>>,
+    tables: &HashMap<String, Arc<Mutex<Table>>>,
 ) -> Result<Vec<OutCol>> {
     let fk_side = if jc.pk_is_left { right } else { left };
     let pk_side = if jc.pk_is_left { left } else { right };
@@ -942,7 +946,7 @@ fn output_schema(
     jc: &JoinClass,
     left: &Side,
     right: &Side,
-    tables: &HashMap<String, Arc<Mutex<Db>>>,
+    tables: &HashMap<String, Arc<Mutex<Table>>>,
 ) -> Result<Option<arrow::datatypes::Schema>> {
     let cols = output_columns(projection, jc, left, right, tables)?;
     if projection.is_some() && cols.is_empty() {
@@ -1061,7 +1065,7 @@ fn compute_join_aggregate(
     jc: &JoinClass,
     left: &Side,
     right: &Side,
-    tables: &HashMap<String, Arc<Mutex<Db>>>,
+    tables: &HashMap<String, Arc<Mutex<Table>>>,
     fk_rids: &[u64],
 ) -> Result<Option<Vec<RecordBatch>>> {
     use datafusion::common::ScalarValue;
@@ -1276,13 +1280,13 @@ mod tests {
     use mongreldb_core::schema::{
         ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema as MSchema, TypeId as MTy,
     };
-    use mongreldb_core::{Db, Value};
+    use mongreldb_core::{Table, Value};
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
 
     /// countries(pk `cid` Int64) ; users(pk `uid`, `country` Int64 [bitmap]).
     /// users reference countries by `country`. Join users.country = countries.cid.
-    fn build() -> (tempfile::TempDir, HashMap<String, Arc<Mutex<Db>>>) {
+    fn build() -> (tempfile::TempDir, HashMap<String, Arc<Mutex<Table>>>) {
         let dir = tempdir().unwrap();
 
         let countries_schema = MSchema {
@@ -1297,7 +1301,7 @@ mod tests {
             colocation: vec![],
         };
         let mut countries =
-            Db::create(dir.path().join("countries").as_path(), countries_schema, 1).unwrap();
+            Table::create(dir.path().join("countries").as_path(), countries_schema, 1).unwrap();
         for i in 0..5i64 {
             countries.put(vec![(1, Value::Int64(i))]).unwrap();
         }
@@ -1326,7 +1330,7 @@ mod tests {
             }],
             colocation: vec![],
         };
-        let mut users = Db::create(dir.path().join("users").as_path(), users_schema, 1).unwrap();
+        let mut users = Table::create(dir.path().join("users").as_path(), users_schema, 1).unwrap();
         for u in 0..10i64 {
             users
                 .put(vec![(1, Value::Int64(u)), (2, Value::Int64(u % 5))])
@@ -1334,14 +1338,14 @@ mod tests {
         }
         users.flush().unwrap();
 
-        let mut tables: HashMap<String, Arc<Mutex<Db>>> = HashMap::new();
+        let mut tables: HashMap<String, Arc<Mutex<Table>>> = HashMap::new();
         tables.insert("countries".into(), Arc::new(Mutex::new(countries)));
         tables.insert("users".into(), Arc::new(Mutex::new(users)));
         (dir, tables)
     }
 
     async fn ctx_with(
-        tables: &HashMap<String, Arc<Mutex<Db>>>,
+        tables: &HashMap<String, Arc<Mutex<Table>>>,
     ) -> datafusion::prelude::SessionContext {
         let pu = MongrelProvider::new(Arc::clone(&tables["users"])).unwrap();
         let pc = MongrelProvider::new(Arc::clone(&tables["countries"])).unwrap();

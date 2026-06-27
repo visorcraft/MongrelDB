@@ -7,7 +7,7 @@
 use mongreldb_core::columnar::NativeColumn;
 use mongreldb_core::query::{Condition, Query};
 use mongreldb_core::schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
-use mongreldb_core::{Db, Value};
+use mongreldb_core::{Table, Value};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use tempfile::tempdir;
@@ -98,7 +98,7 @@ fn schema() -> Schema {
 #[test]
 fn typed_bulk_load_builds_all_indexes() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
 
     let docs = [
         (0i64, "red", "the quick brown fox", "quick fox"),
@@ -194,7 +194,7 @@ fn typed_bulk_load_builds_all_indexes() {
 fn typed_bulk_load_indexes_survive_reopen() {
     let dir = tempdir().unwrap();
     {
-        let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+        let mut db = Table::create(dir.path(), schema(), 1).unwrap();
         let id_col = NativeColumn::int64_sequence(0, 3);
         let cat_col = bytes_column(&[b"red".to_vec(), b"blue".to_vec(), b"red".to_vec()]);
         let text_col = bytes_column(&[
@@ -216,7 +216,7 @@ fn typed_bulk_load_indexes_survive_reopen() {
         ])
         .unwrap();
     }
-    let mut db = Db::open(dir.path()).unwrap();
+    let mut db = Table::open(dir.path()).unwrap();
     assert_eq!(db.count(), 3);
     // PK served from the reloaded HOT checkpoint.
     assert_eq!(
@@ -275,7 +275,7 @@ fn parallel_column_encoding_round_trips() {
         indexes: Vec::new(),
         colocation: vec![],
     };
-    let mut db = Db::create(dir.path(), sc, 1).unwrap();
+    let mut db = Table::create(dir.path(), sc, 1).unwrap();
     // >1 page per column (PAGE_ROWS = 65 536) so native_column_pages takes the
     // rayon branch, and 4 user columns so write_native takes it too.
     let n = 65_536 * 2 + 7;
@@ -343,7 +343,7 @@ fn parallel_column_encoding_round_trips() {
 #[test]
 fn bulk_load_fast_round_trips_plain_pages() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     let docs = [
         (0i64, "red", "the quick brown fox", "quick fox"),
         (1, "blue", "the lazy dog", "lazy dog"),
@@ -401,7 +401,7 @@ fn bulk_load_fast_round_trips_plain_pages() {
 
     // Reopen reads the plain run + checkpoint.
     drop(db);
-    let mut db = Db::open(dir.path()).unwrap();
+    let mut db = Table::open(dir.path()).unwrap();
     assert_eq!(db.count(), 3);
     assert_eq!(
         db.query(&Query::pk(2i64.to_be_bytes().to_vec()))
@@ -416,7 +416,7 @@ fn bulk_load_fast_round_trips_plain_pages() {
 #[test]
 fn decoded_page_cache_populates_on_scan() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     let id_col = NativeColumn::int64_sequence(0, 3);
     let cat_col = bytes_column(&[b"red".to_vec(), b"blue".to_vec(), b"red".to_vec()]);
     let text_col = bytes_column(&[
@@ -475,7 +475,7 @@ fn bulk_load_fast_run_is_larger_than_zstd() {
         colocation: vec![],
     };
     let mk = |dir| {
-        let mut db = Db::create(dir, sc.clone(), 1).unwrap();
+        let mut db = Table::create(dir, sc.clone(), 1).unwrap();
         let n = 50_000usize;
         // Highly compressible: a sequential run encodes tiny under delta+zstd.
         let col = NativeColumn::int64_sequence(0, n);
@@ -483,7 +483,7 @@ fn bulk_load_fast_run_is_larger_than_zstd() {
         db
     };
     let mk_fast = |dir| {
-        let mut db = Db::create(dir, sc.clone(), 1).unwrap();
+        let mut db = Table::create(dir, sc.clone(), 1).unwrap();
         let n = 50_000usize;
         let col = NativeColumn::int64_sequence(0, n);
         db.bulk_load_fast(vec![(1, col)]).unwrap();
@@ -509,7 +509,7 @@ fn bulk_load_fast_run_is_larger_than_zstd() {
 #[test]
 fn double_bulk_load_no_duplicate_indexes() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     let mk = |offset: i64| {
         vec![
             (

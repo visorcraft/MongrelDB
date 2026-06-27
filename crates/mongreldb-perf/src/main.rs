@@ -6,7 +6,7 @@
 
 use mongreldb_core::query::{Condition, Query};
 use mongreldb_core::schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
-use mongreldb_core::{Db, RowId, Value};
+use mongreldb_core::{Table, RowId, Value};
 use mongreldb_query::MongrelSession;
 use std::time::{Duration, Instant};
 
@@ -82,9 +82,9 @@ fn mongrel(n: i64, encrypted: bool) -> Times {
     {
         let d = tempfile::tempdir().unwrap();
         let mut db = if encrypted {
-            Db::create_encrypted(d.path().join("t"), trips_schema(), 1, "passphrase").unwrap()
+            Table::create_encrypted(d.path().join("t"), trips_schema(), 1, "passphrase").unwrap()
         } else {
-            Db::create(d.path().join("t"), trips_schema(), 1).unwrap()
+            Table::create(d.path().join("t"), trips_schema(), 1).unwrap()
         };
         let rows = trips_rows(n);
         let now = Instant::now();
@@ -95,9 +95,9 @@ fn mongrel(n: i64, encrypted: bool) -> Times {
     // load again for the read/update/delete ops
     let d = tempfile::tempdir().unwrap();
     let mut db = if encrypted {
-        Db::create_encrypted(d.path().join("t"), trips_schema(), 1, "passphrase").unwrap()
+        Table::create_encrypted(d.path().join("t"), trips_schema(), 1, "passphrase").unwrap()
     } else {
-        Db::create(d.path().join("t"), trips_schema(), 1).unwrap()
+        Table::create(d.path().join("t"), trips_schema(), 1).unwrap()
     };
     db.bulk_load(trips_rows(n)).unwrap();
 
@@ -149,7 +149,7 @@ fn mongrel(n: i64, encrypted: bool) -> Times {
     // SQL filter / count / join via the DataFusion frontend
     let rt = tokio::runtime::Runtime::new().unwrap();
     let cdir = tempfile::tempdir().unwrap();
-    let mut cities = Db::create(cdir.path().join("c"), cities_schema(), 2).unwrap();
+    let mut cities = Table::create(cdir.path().join("c"), cities_schema(), 2).unwrap();
     cities.bulk_load(
         (0..50i64).map(|i| vec![
             (1, Value::Bytes(format!("City{i}").into_bytes())),
@@ -449,7 +449,7 @@ fn main() {
     }
 
     println!("### MongrelDB native query paths (not the SQL scan path)\n");
-    println!("| N | count() O(1) metadata | filter via Db::query (index/tool-call) |");
+    println!("| N | count() O(1) metadata | filter via Table::query (index/tool-call) |");
     println!("|---:|---:|---:|");
     for &n in &[100i64, 1_000_000] {
         let m = mongrel(n, false);
@@ -461,7 +461,7 @@ fn main() {
 fn storage_efficiency() {
     use std::fs;
     let dir = tempfile::tempdir().unwrap();
-    let mut db = Db::create(dir.path().join("t"), trips_schema(), 1).unwrap();
+    let mut db = Table::create(dir.path().join("t"), trips_schema(), 1).unwrap();
     let rows = trips_rows(1_000_000);
     db.bulk_load(rows).unwrap();
     db.flush().unwrap();

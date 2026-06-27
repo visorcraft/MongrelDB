@@ -5,7 +5,7 @@
 //! overlay are served as a final batch; stale versions in the run are excluded.
 
 use mongreldb_core::schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
-use mongreldb_core::{Condition, Db, NativeAgg, Value};
+use mongreldb_core::{Condition, NativeAgg, Table, Value};
 use tempfile::tempdir;
 
 fn schema() -> Schema {
@@ -37,7 +37,7 @@ fn schema() -> Schema {
 #[test]
 fn page_cursor_serves_overlay_rows() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     db.set_mutable_run_spill_bytes(1); // force spill so run_refs.len() == 1
     for i in 0..1000i64 {
         db.put(vec![(1, Value::Int64(i)), (2, Value::Int64(i * 10))])
@@ -82,7 +82,7 @@ fn page_cursor_serves_overlay_rows() {
 #[test]
 fn page_cursor_overlay_shadows_run_version() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     db.set_mutable_run_spill_bytes(1);
     let run_rid = db
         .put(vec![(1, Value::Int64(1)), (2, Value::Int64(100))])
@@ -118,7 +118,7 @@ fn page_cursor_overlay_shadows_run_version() {
 #[test]
 fn page_cursor_range_filter_with_overlay() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     db.set_mutable_run_spill_bytes(1);
     for i in 0..100i64 {
         db.put(vec![(1, Value::Int64(i)), (2, Value::Int64(i))])
@@ -167,7 +167,7 @@ fn page_cursor_range_filter_with_overlay() {
 #[test]
 fn aggregate_count_with_overlay() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     db.set_mutable_run_spill_bytes(1);
     for i in 0..100i64 {
         db.put(vec![(1, Value::Int64(i)), (2, Value::Int64(i))])

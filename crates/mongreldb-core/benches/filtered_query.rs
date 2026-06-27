@@ -10,7 +10,7 @@
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use mongreldb_core::query::{Condition, Query};
-use mongreldb_core::{schema::*, Db, Value};
+use mongreldb_core::{schema::*, Table, Value};
 use std::time::Duration;
 use tempfile::tempdir;
 
@@ -76,7 +76,7 @@ fn bench_filtered_query(c: &mut Criterion) {
 
     // Setup once: bulk-load 1M rows (indexes maintained by `index_into`).
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     db.bulk_load(rows(N)).unwrap();
     let snap = db.snapshot();
     let proj: [u16; 2] = [1, 3]; // id + cost

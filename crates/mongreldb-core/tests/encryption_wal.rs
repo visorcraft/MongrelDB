@@ -2,7 +2,7 @@
 #![cfg(feature = "encryption")]
 
 use mongreldb_core::schema::*;
-use mongreldb_core::{Db, Value};
+use mongreldb_core::{Table, Value};
 use tempfile::tempdir;
 
 fn schema() -> Schema {
@@ -42,7 +42,8 @@ fn rows(n: i64) -> Vec<Vec<(u16, Value)>> {
 fn encrypted_wal_round_trip() {
     let dir = tempdir().unwrap();
     {
-        let mut db = Db::create_encrypted(dir.path().join("t"), schema(), 1, "passphrase").unwrap();
+        let mut db =
+            Table::create_encrypted(dir.path().join("t"), schema(), 1, "passphrase").unwrap();
         db.bulk_load(rows(100)).unwrap();
         db.put(vec![
             (1, Value::Int64(999)),
@@ -52,7 +53,7 @@ fn encrypted_wal_round_trip() {
         db.commit().unwrap();
     }
     {
-        let db = Db::open_encrypted(dir.path().join("t"), "passphrase").unwrap();
+        let db = Table::open_encrypted(dir.path().join("t"), "passphrase").unwrap();
         assert_eq!(db.count(), 101);
     }
 }
@@ -61,12 +62,12 @@ fn encrypted_wal_round_trip() {
 fn encrypted_wal_wrong_key_fails() {
     let dir = tempdir().unwrap();
     {
-        let mut db = Db::create_encrypted(dir.path().join("t"), schema(), 1, "correct").unwrap();
+        let mut db = Table::create_encrypted(dir.path().join("t"), schema(), 1, "correct").unwrap();
         db.put(vec![(1, Value::Int64(1)), (2, Value::Bytes(b"a".to_vec()))])
             .unwrap();
         db.commit().unwrap();
     }
-    let result = Db::open_encrypted(dir.path().join("t"), "wrong");
+    let result = Table::open_encrypted(dir.path().join("t"), "wrong");
     assert!(result.is_err(), "wrong passphrase must fail");
 }
 
@@ -74,7 +75,7 @@ fn encrypted_wal_wrong_key_fails() {
 fn plaintext_wal_still_works() {
     let dir = tempdir().unwrap();
     {
-        let mut db = Db::create(dir.path().join("t"), schema(), 1).unwrap();
+        let mut db = Table::create(dir.path().join("t"), schema(), 1).unwrap();
         db.put(vec![
             (1, Value::Int64(1)),
             (2, Value::Bytes(b"hello".to_vec())),
@@ -83,7 +84,7 @@ fn plaintext_wal_still_works() {
         db.commit().unwrap();
     }
     {
-        let db = Db::open(dir.path().join("t")).unwrap();
+        let db = Table::open(dir.path().join("t")).unwrap();
         assert_eq!(db.count(), 1);
     }
 }
@@ -93,7 +94,7 @@ fn raw_key_create_and_open() {
     let dir = tempdir().unwrap();
     let key = (0..32u8).collect::<Vec<u8>>();
     {
-        let mut db = Db::create_with_key(dir.path().join("t"), schema(), 1, &key).unwrap();
+        let mut db = Table::create_with_key(dir.path().join("t"), schema(), 1, &key).unwrap();
         db.put(vec![
             (1, Value::Int64(42)),
             (2, Value::Bytes(b"keytest".to_vec())),
@@ -102,7 +103,7 @@ fn raw_key_create_and_open() {
         db.commit().unwrap();
     }
     {
-        let db = Db::open_with_key(dir.path().join("t"), &key).unwrap();
+        let db = Table::open_with_key(dir.path().join("t"), &key).unwrap();
         assert_eq!(db.count(), 1);
     }
 }
@@ -113,7 +114,7 @@ fn raw_key_wrong_fails() {
     let key = (0..32u8).collect::<Vec<u8>>();
     let wrong = (1..33u8).collect::<Vec<u8>>();
     {
-        let mut db = Db::create_with_key(dir.path().join("t"), schema(), 1, &key).unwrap();
+        let mut db = Table::create_with_key(dir.path().join("t"), schema(), 1, &key).unwrap();
         db.put(vec![
             (1, Value::Int64(1)),
             (2, Value::Bytes(b"data".to_vec())),
@@ -122,7 +123,7 @@ fn raw_key_wrong_fails() {
         db.commit().unwrap();
     }
     // Opening with the wrong key fails when trying to decrypt WAL frames.
-    let result = Db::open_with_key(dir.path().join("t"), &wrong);
+    let result = Table::open_with_key(dir.path().join("t"), &wrong);
     assert!(
         result.is_err(),
         "wrong key must fail on encrypted WAL replay"
@@ -134,7 +135,7 @@ fn encrypted_cache_survives_restart() {
     use mongreldb_core::query::{Condition, Query};
     let dir = tempdir().unwrap();
     {
-        let mut db = Db::create_encrypted(dir.path().join("t"), schema(), 1, "pass").unwrap();
+        let mut db = Table::create_encrypted(dir.path().join("t"), schema(), 1, "pass").unwrap();
         db.bulk_load(rows(100)).unwrap();
         db.flush().unwrap();
         let q = Query::new().and(Condition::Range {
@@ -146,7 +147,7 @@ fn encrypted_cache_survives_restart() {
         assert_eq!(r.len(), 11, "initial query returns 11 rows");
     }
     {
-        let mut db = Db::open_encrypted(dir.path().join("t"), "pass").unwrap();
+        let mut db = Table::open_encrypted(dir.path().join("t"), "pass").unwrap();
         let q = Query::new().and(Condition::Range {
             column_id: 1,
             lo: 10,

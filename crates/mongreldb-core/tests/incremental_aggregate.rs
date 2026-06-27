@@ -1,7 +1,7 @@
 //! Phase 8.3: incremental aggregate-cache maintenance.
 
 use mongreldb_core::schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
-use mongreldb_core::{AggState, Condition, Db, NativeAgg, Value};
+use mongreldb_core::{AggState, Condition, NativeAgg, Table, Value};
 use tempfile::tempdir;
 
 fn schema() -> Schema {
@@ -36,7 +36,7 @@ fn schema() -> Schema {
     }
 }
 
-fn put_range(db: &mut Db, lo: i64, hi: i64) {
+fn put_range(db: &mut Table, lo: i64, hi: i64) {
     for i in lo..hi {
         db.put(vec![
             (1, Value::Int64(i)),
@@ -50,7 +50,7 @@ fn put_range(db: &mut Db, lo: i64, hi: i64) {
 #[test]
 fn cold_then_warm_matches_exact() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     db.set_mutable_run_spill_bytes(1); // spill per flush so the incremental watermark holds
     put_range(&mut db, 0, 1000);
     db.flush().unwrap();
@@ -90,7 +90,7 @@ fn cold_then_warm_matches_exact() {
 #[test]
 fn incremental_count_and_avg_with_filter() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     db.set_mutable_run_spill_bytes(1); // spill per flush so the incremental watermark holds
     put_range(&mut db, 0, 1000);
     db.flush().unwrap();
@@ -133,7 +133,7 @@ fn incremental_count_and_avg_with_filter() {
 #[test]
 fn delete_disables_incremental() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     db.set_mutable_run_spill_bytes(1); // spill per flush so the incremental watermark holds
     put_range(&mut db, 0, 1000);
     db.flush().unwrap();
@@ -157,7 +157,7 @@ fn delete_disables_incremental() {
 #[test]
 fn distinct_keys_are_independent() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     db.set_mutable_run_spill_bytes(1); // spill per flush so the incremental watermark holds
     put_range(&mut db, 0, 1000);
     db.flush().unwrap();
@@ -187,7 +187,7 @@ fn count_column_excludes_nulls() {
     // Regression (Phase 8 review): COUNT(col) must skip NULL cells, unlike
     // COUNT(*).
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     db.set_mutable_run_spill_bytes(1); // spill per flush so the incremental watermark holds
     for i in 0..10i64 {
         let mut cols = vec![(1, Value::Int64(i)), (2, Value::Int64(i % 10))];
@@ -214,7 +214,7 @@ fn uncommitted_writes_do_not_poison_cache() {
     // watermark that later skips just-committed rows. `put` without `flush`
     // leaves the memtable non-empty ⇒ no incremental seeding.
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     db.set_mutable_run_spill_bytes(1); // spill per flush so the incremental watermark holds
     put_range(&mut db, 0, 100);
     db.flush().unwrap(); // warm the cache at epoch E1

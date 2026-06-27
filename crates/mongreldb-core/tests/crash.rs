@@ -6,7 +6,7 @@ use mongreldb_core::epoch::Epoch;
 use mongreldb_core::memtable::Row;
 use mongreldb_core::schema::{ColumnDef, ColumnFlags, Schema, TypeId};
 use mongreldb_core::sorted_run::RunWriter;
-use mongreldb_core::{Db, RowId, Value};
+use mongreldb_core::{RowId, Table, Value};
 use std::fs::OpenOptions;
 use std::io::Write;
 use tempfile::tempdir;
@@ -33,7 +33,7 @@ fn row(id: i64) -> Row {
 fn orphan_run_from_crash_mid_flush_is_ignored() {
     let dir = tempdir().unwrap();
     // Durable, manifest-referenced run with rows 1 and 2.
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     db.put(vec![(1, Value::Int64(1))]).unwrap();
     db.put(vec![(1, Value::Int64(2))]).unwrap();
     db.flush().unwrap();
@@ -47,7 +47,7 @@ fn orphan_run_from_crash_mid_flush_is_ignored() {
     assert!(orphan.exists(), "orphan run written");
 
     // Recovery must ignore the orphan run.
-    let db = Db::open(dir.path()).unwrap();
+    let db = Table::open(dir.path()).unwrap();
     let rows = db.visible_rows(db.snapshot()).unwrap();
     let vals: Vec<i64> = rows
         .iter()
@@ -64,7 +64,7 @@ fn torn_wal_tail_is_truncated_on_recovery() {
     let dir = tempdir().unwrap();
     let path = dir.path().to_path_buf();
     {
-        let mut db = Db::create(&path, schema(), 1).unwrap();
+        let mut db = Table::create(&path, schema(), 1).unwrap();
         db.put(vec![(1, Value::Int64(7))]).unwrap();
         db.commit().unwrap(); // Put record fsynced into seg-000000.wal
     }
@@ -79,7 +79,7 @@ fn torn_wal_tail_is_truncated_on_recovery() {
     }
 
     // Recovery replays the valid prefix and stops at the torn tail (no panic).
-    let db = Db::open(&path).unwrap();
+    let db = Table::open(&path).unwrap();
     let rows = db.visible_rows(db.snapshot()).unwrap();
     let vals: Vec<i64> = rows
         .iter()

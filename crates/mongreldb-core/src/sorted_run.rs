@@ -1881,7 +1881,7 @@ impl RunReader {
 
     /// Row ids whose Int64 value is in `[lo, hi]`, **skipping pages whose
     /// `[min,max]` stat excludes the range** (Parquet-style page-index pruning).
-    /// Nulls are excluded. Used by `Db::query_columns_native` to serve
+    /// Nulls are excluded. Used by `Table::query_columns_native` to serve
     /// `Condition::Range` without decoding every page.
     pub fn range_row_ids_i64(
         &mut self,

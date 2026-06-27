@@ -5,7 +5,7 @@
 
 use mongreldb_core::query::{Condition, Query};
 use mongreldb_core::schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
-use mongreldb_core::{Db, Value};
+use mongreldb_core::{Table, Value};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use tempfile::tempdir;
@@ -58,7 +58,7 @@ fn schema() -> Schema {
 #[test]
 fn sparse_match_ranks_by_term_overlap() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     let docs = [
         (0i64, "the quick brown fox"),
         (1, "the lazy dog sleeps"),
@@ -79,7 +79,7 @@ fn sparse_match_ranks_by_term_overlap() {
     });
     let rows = db.query(&q).unwrap();
     // rows are sorted by row_id, so sort by relevance via a re-query of scores:
-    // Db::query returns the candidate set; verify membership + that doc1 absent.
+    // Table::query returns the candidate set; verify membership + that doc1 absent.
     let ids: Vec<i64> = rows
         .iter()
         .filter_map(|r| match r.columns.get(&1) {
@@ -131,7 +131,7 @@ fn sparse_match_intersects_bitmap() {
         ],
         colocation: vec![],
     };
-    let mut db = Db::create(dir.path(), sc, 1).unwrap();
+    let mut db = Table::create(dir.path(), sc, 1).unwrap();
     // cat "a": docs 0,1 contain "quick"; cat "b": doc 2 also contains "quick".
     db.bulk_load(
         [

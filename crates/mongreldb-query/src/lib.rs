@@ -11,10 +11,10 @@
 //!
 //! Example (skipped from doctests; see `tests/sql.rs` for runnable ones):
 //! ```ignore
-//! # use mongreldb_core::Db;
+//! # use mongreldb_core::Table;
 //! # use mongreldb_query::MongrelSession;
 //! # async fn run() -> anyhow::Result<()> {
-//! let db = Db::create("travel.mongreldb", /* schema */ unimplemented!(), 1)?;
+//! let db = Table::create("travel.mongreldb", /* schema */ unimplemented!(), 1)?;
 //! let session = MongrelSession::new(db);
 //! session.register("travel_trips").await?;
 //! let batches = session.run("select * from travel_trips where cost < 300").await?;
@@ -38,19 +38,19 @@ use datafusion::common::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::{Expr, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
-use mongreldb_core::{Cursor, Db};
+use mongreldb_core::{Cursor, Table};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-/// A MongrelDB table exposed to DataFusion. Holds the live `Db` behind a mutex;
+/// A MongrelDB table exposed to DataFusion. Holds the live `Table` behind a mutex;
 /// each scan takes a fresh MVCC snapshot.
 pub struct MongrelProvider {
-    db: Arc<Mutex<Db>>,
+    db: Arc<Mutex<Table>>,
     schema: SchemaRef,
 }
 
 impl MongrelProvider {
-    pub fn new(db: Arc<Mutex<Db>>) -> Result<Self> {
+    pub fn new(db: Arc<Mutex<Table>>) -> Result<Self> {
         let schema = {
             let db = db.lock().expect("db mutex poisoned");
             arrow_conv::arrow_schema(db.schema())?
@@ -334,7 +334,7 @@ impl TableProvider for MongrelProvider {
         drop(db);
 
         // Phase 15.5: write the Arrow IPC shadow for future scans (best-effort,
-        // outside the Db lock).
+        // outside the Table lock).
         if let Some((dir, run_id, arrays, schema)) = shadow_write {
             if let Ok(batch) = RecordBatch::try_new(schema, arrays) {
                 shadow::ArrowShadow::new(&dir).write(run_id, &batch);
@@ -380,7 +380,7 @@ fn project_batch(
 
 /// Translate a DataFusion WHERE filter expression into a MongrelDB
 /// index-backed [`Condition`]. Supported translations (all index/scan-served by
-/// `Db::query_columns_native`):
+/// `Table::query_columns_native`):
 ///
 /// * `col = literal` → [`Condition::BitmapEq`] (bitmap index) or
 ///   [`Condition::Pk`] (primary key).
@@ -773,12 +773,12 @@ fn longest_like_segment(pat: &str) -> Option<Vec<u8>> {
 /// when a commit advances the epoch.
 pub struct MongrelSession {
     ctx: SessionContext,
-    db: Arc<Mutex<Db>>,
+    db: Arc<Mutex<Table>>,
     cache: ResultCache,
     /// Phase 16.5: logical-plan cache keyed by SQL string.
     plan_cache: std::sync::Mutex<HashMap<String, datafusion::logical_expr::LogicalPlan>>,
-    /// `table name → owning Db handle` for every registered table.
-    tables: std::sync::Mutex<HashMap<String, Arc<Mutex<Db>>>>,
+    /// `table name → owning Table handle` for every registered table.
+    tables: std::sync::Mutex<HashMap<String, Arc<Mutex<Table>>>>,
     /// Phase 17.3: named materialized views — `view name → defining SQL`.
     /// On `run("SELECT * FROM <view>")`, the defining SQL is executed (or the
     /// result-cache is hit). Invalidated automatically on commit (epoch bump).
@@ -790,10 +790,10 @@ type CacheKey = (String, u64);
 type ResultCache = std::sync::Mutex<std::collections::HashMap<CacheKey, Arc<Vec<RecordBatch>>>>;
 
 impl MongrelSession {
-    /// Create a session over a live `Db`. Takes ownership; wrap in `Arc` if you
+    /// Create a session over a live `Table`. Takes ownership; wrap in `Arc` if you
     /// need to keep a handle for writes after registering the provider. Registers
     /// the `ann_search` UDF so SQL semantic-search predicates parse.
-    pub fn new(db: Db) -> Self {
+    pub fn new(db: Table) -> Self {
         let db = Arc::new(Mutex::new(db));
         let ctx = SessionContext::new();
         ctx.register_udf(datafusion::logical_expr::ScalarUDF::from(
@@ -812,9 +812,9 @@ impl MongrelSession {
         }
     }
 
-    /// The underlying Db handle (Phase 19.3: used by the daemon for direct
+    /// The underlying Table handle (Phase 19.3: used by the daemon for direct
     /// put/delete/commit/count access).
-    pub fn db(&self) -> &Arc<Mutex<Db>> {
+    pub fn db(&self) -> &Arc<Mutex<Table>> {
         &self.db
     }
 
@@ -847,12 +847,12 @@ impl MongrelSession {
         Ok(())
     }
 
-    /// Register a second (or further) live `Db` as another table on the same
-    /// session, enabling cross-table SQL joins. The first `Db` (passed to
+    /// Register a second (or further) live `Table` as another table on the same
+    /// session, enabling cross-table SQL joins. The first `Table` (passed to
     /// [`Self::new`]) still owns the result-cache epoch: cached results are
     /// invalidated on its commits, so mutate the primary table last or call
     /// [`Self::clear_cache`] after writing a secondary table.
-    pub async fn register_db(&self, name: &str, db: Db) -> Result<()> {
+    pub async fn register_db(&self, name: &str, db: Table) -> Result<()> {
         let db_arc = Arc::new(Mutex::new(db));
         let provider = MongrelProvider::new(db_arc.clone())?;
         self.tables.lock().unwrap().insert(name.to_string(), db_arc);

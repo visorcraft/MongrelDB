@@ -4,12 +4,12 @@
 //! runs, resolving cross-run MVCC (newest visible version per `RowId`,
 //! including tombstones) and the predicate up front, then lazily decoding only
 //! the projected columns of surviving pages. These tests pin it against the
-//! authoritative `Db::visible_rows` for multi-run layouts with overlapping
+//! authoritative `Table::visible_rows` for multi-run layouts with overlapping
 //! versions, deletes, and a live memtable overlay.
 
 use mongreldb_core::columnar::NativeColumn;
 use mongreldb_core::schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
-use mongreldb_core::{Condition, Cursor, Db, Value};
+use mongreldb_core::{Condition, Cursor, Table, Value};
 use tempfile::tempdir;
 
 fn schema() -> Schema {
@@ -47,7 +47,7 @@ fn i64s(col: &NativeColumn) -> Vec<i64> {
 
 /// Drain a cursor projected as `(id, cost)` into a flat `(id, cost)` list.
 fn drain_id_cost(
-    db: &Db,
+    db: &Table,
     snap: mongreldb_core::Snapshot,
     conditions: &[Condition],
 ) -> Vec<(i64, i64)> {
@@ -73,7 +73,7 @@ fn drain_id_cost(
 #[test]
 fn multi_run_cursor_equals_visible_rows() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     db.set_mutable_run_spill_bytes(1); // each flush spills a fresh run
 
     // Run 1: id 0..200.
@@ -159,7 +159,7 @@ fn multi_run_cursor_equals_visible_rows() {
 #[test]
 fn multi_run_cursor_applies_predicate() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     db.set_mutable_run_spill_bytes(1);
 
     for run in 0..3i64 {
@@ -198,7 +198,7 @@ fn multi_run_cursor_limits_short_circuits() {
     // small pull. We can't assert decode counts directly, but we can confirm
     // correctness when only the first batch is consumed and the rest dropped.
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     db.set_mutable_run_spill_bytes(1);
     for run in 0..4i64 {
         for i in 0..1000i64 {

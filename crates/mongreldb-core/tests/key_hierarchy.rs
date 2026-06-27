@@ -2,7 +2,7 @@
 //!
 //! Verifies the per-table Argon2id+HKDF KEK, the persisted salt, the per-file
 //! wrapped DEK stored in each run's Encryption Descriptor, and deterministic
-//! per-page nonces — entirely through the public `Db` API plus the public
+//! per-page nonces — entirely through the public `Table` API plus the public
 //! `read_header`.
 
 #![cfg(feature = "encryption")]
@@ -10,7 +10,7 @@
 use mongreldb_core::{
     schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId},
     sorted_run::{read_column_dir, read_header},
-    Condition, Db, EncryptionDescriptor, Query, Value,
+    Condition, EncryptionDescriptor, Query, Table, Value,
 };
 use std::io::{Read, Seek, SeekFrom};
 use tempfile::tempdir;
@@ -98,7 +98,7 @@ fn run_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 #[test]
 fn salt_file_persisted_at_create() {
     let dir = tempdir().unwrap();
-    let _ = Db::create_encrypted(dir.path(), schema(), 1, "passphrase").unwrap();
+    let _ = Table::create_encrypted(dir.path(), schema(), 1, "passphrase").unwrap();
     let salt = std::fs::read(dir.path().join("_meta").join("keys")).unwrap();
     assert_eq!(salt.len(), mongreldb_core::encryption::SALT_LEN);
 }
@@ -107,7 +107,7 @@ fn salt_file_persisted_at_create() {
 fn each_run_carries_a_wrapped_dek() {
     let dir = tempdir().unwrap();
     {
-        let mut db = Db::create_encrypted(dir.path(), schema(), 1, "passphrase").unwrap();
+        let mut db = Table::create_encrypted(dir.path(), schema(), 1, "passphrase").unwrap();
         db.set_mutable_run_spill_bytes(1); // spill so the run file carries a descriptor
         let _ = db
             .put(vec![(1, Value::Int64(1)), (2, Value::Bytes(b"a".to_vec()))])
@@ -133,7 +133,7 @@ fn each_run_carries_a_wrapped_dek() {
 fn per_file_dek_differs_between_runs() {
     let dir = tempdir().unwrap();
     {
-        let mut db = Db::create_encrypted(dir.path(), schema(), 1, "passphrase").unwrap();
+        let mut db = Table::create_encrypted(dir.path(), schema(), 1, "passphrase").unwrap();
         db.set_mutable_run_spill_bytes(1); // spill so the run file carries a descriptor
                                            // Run 1.
         let _ = db
@@ -170,7 +170,7 @@ fn per_file_dek_differs_between_runs() {
 fn correct_passphrase_round_trips_across_reopen() {
     let dir = tempdir().unwrap();
     let id = {
-        let mut db = Db::create_encrypted(dir.path(), schema(), 1, "the right one").unwrap();
+        let mut db = Table::create_encrypted(dir.path(), schema(), 1, "the right one").unwrap();
         db.set_mutable_run_spill_bytes(1); // spill so decryption runs against a real run
         let id = db
             .put(vec![
@@ -181,7 +181,7 @@ fn correct_passphrase_round_trips_across_reopen() {
         db.flush().unwrap();
         id
     };
-    let db = Db::open_encrypted(dir.path(), "the right one").unwrap();
+    let db = Table::open_encrypted(dir.path(), "the right one").unwrap();
     let row = db.get(id, db.snapshot()).unwrap();
     assert!(matches!(row.columns.get(&2), Some(Value::Bytes(b)) if b == b"topsecret"));
 }
@@ -190,7 +190,7 @@ fn correct_passphrase_round_trips_across_reopen() {
 fn wrong_passphrase_fails_to_decrypt() {
     let dir = tempdir().unwrap();
     {
-        let mut db = Db::create_encrypted(dir.path(), schema(), 1, "right").unwrap();
+        let mut db = Table::create_encrypted(dir.path(), schema(), 1, "right").unwrap();
         db.set_mutable_run_spill_bytes(1); // spill so a wrong passphrase must unwrap a DEK
         let _ = db
             .put(vec![(1, Value::Int64(1)), (2, Value::Bytes(b"x".to_vec()))])
@@ -199,7 +199,7 @@ fn wrong_passphrase_fails_to_decrypt() {
     }
     // Deriving the (wrong) KEK succeeds; the failure surfaces when a run's DEK
     // must be unwrapped — either at open (index rebuild) or on first read.
-    let opened = Db::open_encrypted(dir.path(), "wrong");
+    let opened = Table::open_encrypted(dir.path(), "wrong");
     let read_fails = match opened {
         Ok(db) => db.visible_rows(db.snapshot()).is_err(),
         Err(_) => true,
@@ -214,7 +214,7 @@ fn wrong_passphrase_fails_to_decrypt() {
 fn plaintext_table_has_no_salt_or_descriptor() {
     let dir = tempdir().unwrap();
     {
-        let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+        let mut db = Table::create(dir.path(), schema(), 1).unwrap();
         db.set_mutable_run_spill_bytes(1); // spill so a plaintext run exists to inspect
         let _ = db.put(vec![(1, Value::Int64(1))]).unwrap();
         db.flush().unwrap();
@@ -235,7 +235,7 @@ fn plaintext_table_has_no_salt_or_descriptor() {
 fn indexable_equality_query_served_via_tokenized_bitmap() {
     let dir = tempdir().unwrap();
     {
-        let mut db = Db::create_encrypted(dir.path(), schema_indexable_eq(), 1, "pass").unwrap();
+        let mut db = Table::create_encrypted(dir.path(), schema_indexable_eq(), 1, "pass").unwrap();
         db.set_mutable_run_spill_bytes(1); // spill so the run carries a column-key descriptor
         for i in 0..40u64 {
             let label = if i % 2 == 0 {
@@ -252,7 +252,7 @@ fn indexable_equality_query_served_via_tokenized_bitmap() {
     // global checkpoint, or rebuilt from runs) holds HMAC tokens, and the
     // BitmapEq literal is tokenized the same way — so the lookup is served
     // without decrypting the stored page payloads.
-    let mut db = Db::open_encrypted(dir.path(), "pass").unwrap();
+    let mut db = Table::open_encrypted(dir.path(), "pass").unwrap();
     let q = Query::new().and(Condition::BitmapEq {
         column_id: 2,
         value: b"red".to_vec(),
@@ -284,7 +284,7 @@ fn indexable_equality_query_served_via_tokenized_bitmap() {
 fn indexable_descriptor_records_column_key() {
     let dir = tempdir().unwrap();
     {
-        let mut db = Db::create_encrypted(dir.path(), schema_indexable_eq(), 1, "pass").unwrap();
+        let mut db = Table::create_encrypted(dir.path(), schema_indexable_eq(), 1, "pass").unwrap();
         db.set_mutable_run_spill_bytes(1); // spill so the run carries a column-key descriptor
         let _ = db
             .put(vec![
@@ -321,7 +321,7 @@ fn encrypted_run_directory_does_not_leak_plaintext_minmax() {
     const CANARY: &[u8] = b"CANARY-SECRET-must-not-hit-disk-in-cleartext";
     let dir = tempdir().unwrap();
     let id = {
-        let mut db = Db::create_encrypted(dir.path(), schema(), 1, "pw").unwrap();
+        let mut db = Table::create_encrypted(dir.path(), schema(), 1, "pw").unwrap();
         db.set_mutable_run_spill_bytes(1);
         let id = db
             .put(vec![
@@ -341,7 +341,7 @@ fn encrypted_run_directory_does_not_leak_plaintext_minmax() {
          cleartext directory?)"
     );
     // And the value still round-trips with the key (decrypt path intact).
-    let db = Db::open_encrypted(dir.path(), "pw").unwrap();
+    let db = Table::open_encrypted(dir.path(), "pw").unwrap();
     let row = db.get(id, db.snapshot()).unwrap();
     assert!(matches!(row.columns.get(&2), Some(Value::Bytes(b)) if b == CANARY));
 }
@@ -354,7 +354,7 @@ fn encrypted_run_directory_does_not_leak_plaintext_minmax() {
 #[test]
 fn encrypted_int64_range_query_returns_correct_rows() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create_encrypted(dir.path(), schema(), 1, "pw").unwrap();
+    let mut db = Table::create_encrypted(dir.path(), schema(), 1, "pw").unwrap();
     db.set_mutable_run_spill_bytes(1);
     for i in 1..=100i64 {
         db.put(vec![
@@ -386,7 +386,7 @@ fn encrypted_int64_range_query_returns_correct_rows() {
 fn run_metadata_mac_is_written_and_enforced() {
     let dir = tempdir().unwrap();
     {
-        let mut db = Db::create_encrypted(dir.path(), schema(), 1, "pw").unwrap();
+        let mut db = Table::create_encrypted(dir.path(), schema(), 1, "pw").unwrap();
         db.set_mutable_run_spill_bytes(1);
         for i in 1..=20i64 {
             db.put(vec![
@@ -413,12 +413,18 @@ fn run_metadata_mac_is_written_and_enforced() {
     // checks still pass — only the keyed MAC can reject.
     bytes[tag_off] ^= 0xFF;
     std::fs::write(path, &bytes).unwrap();
-    assert!(read_header(path).is_ok(), "tag is past the checksummed region");
-    assert!(read_column_dir(path, &header).is_ok(), "directory still parses");
+    assert!(
+        read_header(path).is_ok(),
+        "tag is past the checksummed region"
+    );
+    assert!(
+        read_column_dir(path, &header).is_ok(),
+        "directory still parses"
+    );
 
     // Open may load the still-valid checkpoint without touching the run; the query
     // forces a run read, which must be rejected by the MAC.
-    let opened = Db::open_encrypted(dir.path(), "pw");
+    let opened = Table::open_encrypted(dir.path(), "pw");
     let rejected = match opened {
         Err(_) => true,
         Ok(mut db) => db
@@ -429,7 +435,10 @@ fn run_metadata_mac_is_written_and_enforced() {
             }))
             .is_err(),
     };
-    assert!(rejected, "a corrupted run-metadata MAC must reject run reads");
+    assert!(
+        rejected,
+        "a corrupted run-metadata MAC must reject run reads"
+    );
 }
 
 /// Regression (peer review, checkpoint encryption): the persisted index
@@ -440,7 +449,7 @@ fn run_metadata_mac_is_written_and_enforced() {
 fn index_checkpoint_is_encrypted_at_rest() {
     let dir = tempdir().unwrap();
     {
-        let mut db = Db::create_encrypted(dir.path(), schema_indexable_eq(), 1, "pw").unwrap();
+        let mut db = Table::create_encrypted(dir.path(), schema_indexable_eq(), 1, "pw").unwrap();
         db.set_mutable_run_spill_bytes(1);
         for i in 1..=20i64 {
             db.put(vec![
@@ -459,7 +468,7 @@ fn index_checkpoint_is_encrypted_at_rest() {
         "encrypted table's index checkpoint leaked the cleartext magic"
     );
     // Reopen loads the (encrypted) checkpoint and an indexed lookup still works.
-    let mut db = Db::open_encrypted(dir.path(), "pw").unwrap();
+    let mut db = Table::open_encrypted(dir.path(), "pw").unwrap();
     let n = db
         .query(&Query::new().and(Condition::BitmapEq {
             column_id: 2,
@@ -467,5 +476,8 @@ fn index_checkpoint_is_encrypted_at_rest() {
         }))
         .unwrap()
         .len();
-    assert_eq!(n, 1, "indexed equality lookup must work after encrypted reopen");
+    assert_eq!(
+        n, 1,
+        "indexed equality lookup must work after encrypted reopen"
+    );
 }

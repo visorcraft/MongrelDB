@@ -1,10 +1,10 @@
-//! Phase 19.1 — Db-level in-process result cache (`query_cached` /
+//! Phase 19.1 — Table-level in-process result cache (`query_cached` /
 //! `query_columns_native_cached`): repeat queries hit; a `commit()` invalidates.
 
 use mongreldb_core::columnar::NativeColumn;
 use mongreldb_core::query::{Condition, Query};
 use mongreldb_core::schema::*;
-use mongreldb_core::{Db, Value};
+use mongreldb_core::{Table, Value};
 use tempfile::tempdir;
 
 fn schema() -> Schema {
@@ -42,7 +42,7 @@ fn schema() -> Schema {
 #[test]
 fn query_cached_hits_then_invalidates_on_commit() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     let rows: Vec<Vec<(u16, Value)>> = (0..1000)
         .map(|i| {
             vec![
@@ -81,7 +81,7 @@ fn query_cached_hits_then_invalidates_on_commit() {
 #[test]
 fn query_columns_native_cached_hits() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     let cols = vec![
         (
             1,
@@ -144,7 +144,7 @@ fn query_columns_native_cached_hits() {
 #[test]
 fn lru_promote_on_hit_and_configurable_budget() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     let rows: Vec<Vec<(u16, Value)>> = (0..300)
         .map(|i| {
             vec![
@@ -200,7 +200,7 @@ fn lru_promote_on_hit_and_configurable_budget() {
 #[test]
 fn fine_grained_invalidation_delete_survivor() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     let rows: Vec<Vec<(u16, Value)>> = (0..300)
         .map(|i| {
             vec![
@@ -233,7 +233,7 @@ fn fine_grained_invalidation_delete_survivor() {
 #[test]
 fn fine_grained_invalidation_column_aware_insert() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     // Two columns: city (2) and cost (3). Bitmap index on city only.
     let rows: Vec<Vec<(u16, Value)>> = (0..300)
         .map(|i| {
@@ -285,7 +285,7 @@ fn fine_grained_invalidation_column_aware_insert() {
 #[test]
 fn fine_grained_invalidation_multi_run_delete() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     let rows: Vec<Vec<(u16, Value)>> = (0..100)
         .map(|i| {
             vec![
@@ -351,7 +351,7 @@ fn persistent_tier_survives_restart() {
     let rcache_path = dir.path().join("_rcache");
 
     {
-        let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+        let mut db = Table::create(dir.path(), schema(), 1).unwrap();
         let rows: Vec<Vec<(u16, Value)>> = (0..200)
             .map(|i| {
                 vec![
@@ -382,7 +382,7 @@ fn persistent_tier_survives_restart() {
     }
 
     {
-        let mut db = Db::open(dir.path()).unwrap();
+        let mut db = Table::open(dir.path()).unwrap();
         let q = Query::new().and(Condition::BitmapEq {
             column_id: 2,
             value: b"alpha".to_vec(),

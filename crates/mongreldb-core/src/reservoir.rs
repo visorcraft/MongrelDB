@@ -2,13 +2,13 @@
 //!
 //! A fixed-capacity uniform sample of row ids is maintained incrementally as
 //! rows are inserted (Vitter's Algorithm R). It lets
-//! [`crate::Db::approx_aggregate`] answer `COUNT / SUM / AVG … WHERE` over a
+//! [`crate::Table::approx_aggregate`] answer `COUNT / SUM / AVG … WHERE` over a
 //! ~1 % sample in O(k) instead of a full scan, with normal-theory confidence
 //! intervals. When the table has `≤ k` live rows the sample is the whole table
 //! and the estimate is exact (zero-width interval).
 //!
 //! The sample lives in memory; it is repopulated from the visible rows during
-//! [`crate::Db::open`] (which already scans for index rebuild), so a reopened
+//! [`crate::Table::open`] (which already scans for index rebuild), so a reopened
 //! table has a sample immediately. Persistence is deferred to Phase 9.
 
 /// A reservoir sample of row ids over a live table, plus the count of rows ever

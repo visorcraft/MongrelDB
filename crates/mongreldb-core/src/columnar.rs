@@ -302,7 +302,7 @@ fn algo_with_le(algo: u8, le: bool) -> u8 {
 /// self-describing, so a run may freely mix pages written under any variant.
 #[derive(Debug, Clone, Copy)]
 pub enum Compress {
-    /// No compression (raw `ALGO_PLAIN`) — [`crate::Db::bulk_load_fast`].
+    /// No compression (raw `ALGO_PLAIN`) — [`crate::Table::bulk_load_fast`].
     Plain,
     /// zstd at `level` (3 for compaction, 1 for the level-1 bulk path).
     Zstd(i32),
@@ -318,7 +318,7 @@ fn zstd_compress(data: &[u8]) -> Result<Vec<u8>> {
 /// zstd at an explicit level (Phase 14.4): the bulk path uses level 1 (3–4×
 /// faster, ~10% worse ratio) and background compaction upgrades cold runs back
 /// to level 3. `level < 0` is the sentinel for "no compression" (raw `Plain`
-/// pages) used by [`Db::bulk_load_fast`].
+/// pages) used by [`Table::bulk_load_fast`].
 fn zstd_compress_level(data: &[u8], level: i32) -> Result<Vec<u8>> {
     zstd::encode_all(data, level)
         .map_err(|e| MongrelError::InvalidArgument(format!("zstd compress: {e}")))
@@ -1304,7 +1304,7 @@ fn validity_bitmap_from(non_null: impl IntoIterator<Item = bool>) -> Vec<u8> {
 /// Encode a typed column straight to an algo-prefixed page (no `Value`).
 ///
 /// `compress` selects the on-disk algorithm (Phase 14.4 / 15.3): `Plain` emits
-/// raw `ALGO_PLAIN` (no compression — [`crate::Db::bulk_load_fast`]); `Zstd(lvl)`
+/// raw `ALGO_PLAIN` (no compression — [`crate::Table::bulk_load_fast`]); `Zstd(lvl)`
 /// writes the zstd variants at `lvl`; `Lz4` writes the LZ4 variants (hot runs,
 /// faster decode). `Encoding::Plain` forces raw plain regardless of `compress`.
 pub fn encode_page_native(

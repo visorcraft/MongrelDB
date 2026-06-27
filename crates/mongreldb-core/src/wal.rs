@@ -298,7 +298,7 @@ impl WalReader {
         if encrypted && cipher.is_none() {
             return Err(MongrelError::Decryption(
                 "WAL is encrypted but no passphrase or key was provided. \
-                 Use Db::open_encrypted or Db::open_with_key."
+                 Use Table::open_encrypted or Table::open_with_key."
                     .into(),
             ));
         }

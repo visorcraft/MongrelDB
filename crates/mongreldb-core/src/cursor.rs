@@ -44,7 +44,7 @@ pub(crate) struct PagePlan {
 }
 
 /// A forward cursor over a single sorted run that yields the projected columns
-/// of surviving rows, page by page. Built by [`crate::engine::Db`].
+/// of surviving rows, page by page. Built by [`crate::engine::Table`].
 ///
 /// All MVCC visibility and predicate resolution is settled at construction
 /// (the `PagePlan`s); [`Self::next_batch`] is pure lazy column decode + gather.

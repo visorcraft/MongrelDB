@@ -7,7 +7,7 @@
 //!
 //! On Unix, `Child::kill` is documented to send `SIGKILL`, i.e. `kill -9`.
 
-use mongreldb_core::{Db, Value};
+use mongreldb_core::{Table, Value};
 use std::io::BufRead;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -83,7 +83,7 @@ fn spawn_and_kill(mode: &str, ready: &str, db_dir: &std::path::Path) {
     );
 }
 
-fn values(db: &Db) -> Vec<i64> {
+fn values(db: &Table) -> Vec<i64> {
     let rows = db.visible_rows(db.snapshot()).expect("visible_rows");
     let mut vals: Vec<i64> = rows
         .iter()
@@ -101,7 +101,7 @@ fn committed_row_survives_real_kill9() {
     let dir = TempDir::new().unwrap();
     spawn_and_kill("committed", "COMMITTED_READY", dir.path());
 
-    let db = Db::open(dir.path()).expect("reopen after kill -9");
+    let db = Table::open(dir.path()).expect("reopen after kill -9");
     assert_eq!(
         values(&db),
         vec![4242],
@@ -115,7 +115,7 @@ fn committed_burst_survives_real_kill9() {
     let dir = TempDir::new().unwrap();
     spawn_and_kill("committed-burst", "BURST_READY", dir.path());
 
-    let db = Db::open(dir.path()).expect("reopen after kill -9");
+    let db = Table::open(dir.path()).expect("reopen after kill -9");
     assert_eq!(
         values(&db),
         vec![10, 20, 30],
@@ -132,7 +132,7 @@ fn uncommitted_row_stays_invisible_after_real_kill9() {
     // Recovery must not panic or corrupt, even though the WAL `Put` record was
     // fsynced to disk; the uncommitted row is replayed into the memtable but
     // hidden by MVCC (committed_epoch > manifest epoch).
-    let db = Db::open(dir.path()).expect("reopen after kill -9");
+    let db = Table::open(dir.path()).expect("reopen after kill -9");
     assert!(
         values(&db).is_empty(),
         "uncommitted row must not be visible after kill -9"
@@ -145,7 +145,7 @@ fn flushed_run_survives_real_kill9() {
     let dir = TempDir::new().unwrap();
     spawn_and_kill("flush-spill", "FLUSH_READY", dir.path());
 
-    let db = Db::open(dir.path()).expect("reopen after kill -9");
+    let db = Table::open(dir.path()).expect("reopen after kill -9");
     assert_eq!(
         values(&db),
         vec![7777],

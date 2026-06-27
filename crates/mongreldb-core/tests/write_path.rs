@@ -39,9 +39,9 @@ fn schema() -> Schema {
 #[test]
 fn write_path_prototype() {
     // --- 1. Group-commit write path (the sub-ms path) ----------------------
-    use mongreldb_core::Db;
+    use mongreldb_core::Table;
     let dir = tempfile::tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
 
     let mut row_ids = Vec::new();
     for (i, label) in ["red", "blue", "red", "green"].iter().enumerate() {

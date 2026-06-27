@@ -11,7 +11,7 @@
 //! Run: `cargo bench -p mongreldb-core`
 
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion, Throughput};
-use mongreldb_core::{schema::*, Db, Value};
+use mongreldb_core::{schema::*, Table, Value};
 use std::time::Duration;
 use tempfile::tempdir;
 
@@ -39,9 +39,9 @@ fn schema() -> Schema {
 
 const PAYLOAD: &[u8] = b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"; // 32 bytes
 
-fn fresh_db() -> (tempfile::TempDir, Db) {
+fn fresh_db() -> (tempfile::TempDir, Table) {
     let dir = tempdir().expect("tempdir");
-    let mut db = Db::create(dir.path(), schema(), 1).expect("create");
+    let mut db = Table::create(dir.path(), schema(), 1).expect("create");
     db.set_sync_byte_threshold(0); // manual commit only; isolate put latency
     (dir, db)
 }

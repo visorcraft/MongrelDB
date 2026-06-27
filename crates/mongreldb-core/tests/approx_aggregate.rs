@@ -1,7 +1,7 @@
 //! Phase 8.2: reservoir-sample approximate aggregate correctness.
 
 use mongreldb_core::schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
-use mongreldb_core::{ApproxAgg, Condition, Db, Value};
+use mongreldb_core::{ApproxAgg, Condition, Table, Value};
 use tempfile::tempdir;
 
 fn schema() -> Schema {
@@ -36,8 +36,8 @@ fn schema() -> Schema {
     }
 }
 
-fn fill(dir: &std::path::Path, n: i64) -> Db {
-    let mut db = Db::create(dir, schema(), 1).unwrap();
+fn fill(dir: &std::path::Path, n: i64) -> Table {
+    let mut db = Table::create(dir, schema(), 1).unwrap();
     for i in 0..n {
         db.put(vec![
             (1, Value::Int64(i)),
@@ -167,7 +167,7 @@ fn approx_rebuilt_on_reopen() {
     {
         let _ = fill(&path, 300);
     }
-    let db = Db::open(&path).unwrap();
+    let db = Table::open(&path).unwrap();
     let r = db
         .approx_aggregate(&[], None, ApproxAgg::Count, 1.96)
         .unwrap()

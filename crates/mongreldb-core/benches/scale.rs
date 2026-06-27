@@ -5,7 +5,7 @@
 //! Run: `cargo bench -p mongreldb-core --bench scale`
 
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion, Throughput};
-use mongreldb_core::{columnar::NativeColumn, schema::*, Db, Value};
+use mongreldb_core::{columnar::NativeColumn, schema::*, Table, Value};
 use std::time::Duration;
 use tempfile::tempdir;
 
@@ -90,7 +90,7 @@ fn bench_scale(c: &mut Criterion) {
                 b.iter_batched(
                     || (tempdir().unwrap(), batch(n)),
                     |(dir, rows)| {
-                        let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+                        let mut db = Table::create(dir.path(), schema(), 1).unwrap();
                         let ids = db.put_batch(rows).unwrap();
                         db.commit().unwrap();
                         black_box(ids);
@@ -108,7 +108,7 @@ fn bench_scale(c: &mut Criterion) {
                 b.iter_batched(
                     || (tempdir().unwrap(), batch(n)),
                     |(dir, rows)| {
-                        let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+                        let mut db = Table::create(dir.path(), schema(), 1).unwrap();
                         db.put_batch(rows).unwrap();
                         db.flush().unwrap();
                     },
@@ -122,7 +122,7 @@ fn bench_scale(c: &mut Criterion) {
             b.iter_batched(
                 || (tempdir().unwrap(), batch(n)),
                 |(dir, rows)| {
-                    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+                    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
                     db.bulk_load(rows).unwrap();
                 },
                 BatchSize::SmallInput,
@@ -138,7 +138,7 @@ fn bench_scale(c: &mut Criterion) {
                 b.iter_batched(
                     || (tempdir().unwrap(), native_columns(n)),
                     |(dir, cols)| {
-                        let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+                        let mut db = Table::create(dir.path(), schema(), 1).unwrap();
                         db.bulk_load_columns(cols).unwrap();
                     },
                     BatchSize::SmallInput,
@@ -154,7 +154,7 @@ fn bench_scale(c: &mut Criterion) {
                 b.iter_batched(
                     || (tempdir().unwrap(), native_columns(n)),
                     |(dir, cols)| {
-                        let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+                        let mut db = Table::create(dir.path(), schema(), 1).unwrap();
                         db.bulk_load_fast(cols).unwrap();
                     },
                     BatchSize::SmallInput,
@@ -170,7 +170,7 @@ fn bench_scale(c: &mut Criterion) {
                 b.iter_batched_ref(
                     || {
                         let dir = tempdir().unwrap();
-                        let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+                        let mut db = Table::create(dir.path(), schema(), 1).unwrap();
                         db.put_batch(batch(n)).unwrap();
                         db.flush().unwrap();
                         (dir, db)
@@ -197,7 +197,7 @@ fn bench_scale(c: &mut Criterion) {
                 b.iter_batched_ref(
                     || {
                         let dir = tempdir().unwrap();
-                        let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+                        let mut db = Table::create(dir.path(), schema(), 1).unwrap();
                         db.bulk_load_columns(native_columns(n)).unwrap();
                         (dir, db)
                     },

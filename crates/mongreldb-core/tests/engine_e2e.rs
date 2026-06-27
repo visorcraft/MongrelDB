@@ -4,7 +4,7 @@
 
 use mongreldb_core::{
     schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId},
-    Condition, Db, Query, RowId, Snapshot, Value,
+    Condition, Query, RowId, Snapshot, Table, Value,
 };
 use tempfile::tempdir;
 
@@ -59,7 +59,7 @@ fn blue_emb() -> Vec<f32> {
     vec![-1.0, -1.0, -1.0, -1.0, 1.0, 1.0, 1.0, 1.0]
 }
 
-fn seed(db: &mut Db) -> Vec<RowId> {
+fn seed(db: &mut Table) -> Vec<RowId> {
     let specs: [(i64, &[u8], Vec<f32>); 4] = [
         (10, b"red", red_emb()),
         (20, b"blue", blue_emb()),
@@ -83,7 +83,7 @@ fn seed(db: &mut Db) -> Vec<RowId> {
 #[test]
 fn flush_then_read_across_run() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     let ids = seed(&mut db);
     db.set_mutable_run_spill_bytes(1); // force a spill so reads cross into the run
     db.flush().unwrap(); // memtable → sorted run; memtable now empty
@@ -102,7 +102,7 @@ fn flush_then_read_across_run() {
 #[test]
 fn mvcc_snapshot_isolation_after_update() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     let id = db
         .put(vec![
             (1, Value::Int64(1)),
@@ -131,7 +131,7 @@ fn mvcc_snapshot_isolation_after_update() {
 #[test]
 fn conjunctive_query_intersects_row_id_space() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     let _ = seed(&mut db);
     db.commit().unwrap();
 
@@ -169,7 +169,7 @@ fn reopen_recovers_state_from_wal_and_runs() {
     let dir = tempdir().unwrap();
     let path = dir.path().to_path_buf();
     let committed_id = {
-        let mut db = Db::create(&path, schema(), 1).unwrap();
+        let mut db = Table::create(&path, schema(), 1).unwrap();
         let ids = seed(&mut db);
         db.flush().unwrap(); // durable in a run
                              // A few more writes that live only in the WAL (not flushed).
@@ -183,7 +183,7 @@ fn reopen_recovers_state_from_wal_and_runs() {
         ids[0]
     };
     // Reopen: runs + WAL replay rebuild the live state.
-    let mut db = Db::open(&path).unwrap();
+    let mut db = Table::open(&path).unwrap();
     let snap = db.snapshot();
     assert!(db.get(committed_id, snap).is_some(), "flushed row survives");
     let all = db.visible_rows(snap).unwrap();
@@ -201,7 +201,7 @@ fn reopen_recovers_state_from_wal_and_runs() {
 #[test]
 fn compaction_preserves_visible_state() {
     let dir = tempdir().unwrap();
-    let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
     let _ = seed(&mut db);
     db.set_mutable_run_spill_bytes(1); // force a spill per flush (exercises compaction)
     db.flush().unwrap();
@@ -228,7 +228,7 @@ fn encrypted_flush_and_read_round_trips() {
     let path = dir.path().to_path_buf();
     {
         let mut db =
-            Db::create_encrypted(&path, schema(), 1, "correct horse battery staple").unwrap();
+            Table::create_encrypted(&path, schema(), 1, "correct horse battery staple").unwrap();
         db.set_mutable_run_spill_bytes(1); // force a spill so the run file is encrypted on disk
         let id = db
             .put(vec![
@@ -242,7 +242,7 @@ fn encrypted_flush_and_read_round_trips() {
         assert!(matches!(row.columns.get(&2), Some(Value::Bytes(b)) if b == b"secret"));
     }
     // Reopen with the right passphrase; pages decrypt on read.
-    let db = Db::open_encrypted(&path, "correct horse battery staple").unwrap();
+    let db = Table::open_encrypted(&path, "correct horse battery staple").unwrap();
     let all = db.visible_rows(db.snapshot()).unwrap();
     assert_eq!(all.len(), 1);
     // The on-disk page bytes must not contain the plaintext.

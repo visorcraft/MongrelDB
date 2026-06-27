@@ -3,7 +3,7 @@
 //! For the common analytical shape `SELECT <agg>(col) FROM <primary> [WHERE ...]`
 //! (single aggregate, no `GROUP BY`, agg = COUNT/`COUNT(*)`/SUM/MIN/MAX/AVG over
 //! a bare Int64/Float64 column), compute the result directly over the page-pruned
-//! native cursor in [`mongreldb_core::Db::aggregate_native`] — one vectorized
+//! native cursor in [`mongreldb_core::Table::aggregate_native`] — one vectorized
 //! pass, no `Value`, no Arrow `RecordBatch` materialized for the input. Anything
 //! more involved (joins, `GROUP BY`, expressions, secondary tables, unsupported
 //! predicates) falls through to normal DataFusion execution.
@@ -19,7 +19,7 @@ use arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
 use datafusion::logical_expr::expr::AggregateFunction;
 use datafusion::logical_expr::{Expr, LogicalPlan, Operator};
-use mongreldb_core::{Condition, Db, NativeAgg, Schema, Snapshot, TypeId};
+use mongreldb_core::{Condition, NativeAgg, Schema, Snapshot, Table, TypeId};
 use std::sync::Arc;
 
 use crate::error::{MongrelQueryError, Result};
@@ -28,7 +28,7 @@ use crate::error::{MongrelQueryError, Result};
 /// natively and return the one-row result batch; otherwise `None` (fall through
 /// to DataFusion).
 pub(crate) fn try_native_aggregate(
-    db: &mut Db,
+    db: &mut Table,
     schema: &Schema,
     _snapshot: Snapshot,
     plan: &LogicalPlan,
@@ -229,7 +229,7 @@ mod tests {
     use arrow::array::Int64Array;
     use datafusion::prelude::SessionContext;
     use mongreldb_core::schema::{ColumnDef, ColumnFlags, Schema as MSchema, TypeId};
-    use mongreldb_core::{Db, Value};
+    use mongreldb_core::{Table, Value};
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
 
@@ -255,9 +255,9 @@ mod tests {
         }
     }
 
-    async fn ctx_and_db() -> (SessionContext, Arc<Mutex<Db>>, tempfile::TempDir) {
+    async fn ctx_and_db() -> (SessionContext, Arc<Mutex<Table>>, tempfile::TempDir) {
         let dir = tempdir().unwrap();
-        let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+        let mut db = Table::create(dir.path(), schema(), 1).unwrap();
         for i in 0..1000i64 {
             db.put(vec![(1, Value::Int64(i)), (2, Value::Int64(i * 2))])
                 .unwrap();

@@ -2,7 +2,7 @@
 //!
 //! A [`Query`] is a conjunction of [`Condition`]s. Each condition resolves to a
 //! set of row ids in the shared [`crate::rowid::RowId`] space (PK exact, bitmap
-//! equality, ANN semantic, FM substring, or a column range). [`crate::Db`]
+//! equality, ANN semantic, FM substring, or a column range). [`crate::Table`]
 //! intersects the sets and materializes the survivors — letting an agent express
 //! `semsearch ∩ fm_contains ∩ cat_in`, which no SQL FTS pipeline can.
 

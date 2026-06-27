@@ -2,7 +2,7 @@
 //! (id int64, value float64, name utf8). Runs each measurement multiple times
 //! and reports the best (min) to filter sandbox contention.
 
-use mongreldb_core::{columnar::NativeColumn, schema::*, Db};
+use mongreldb_core::{columnar::NativeColumn, schema::*, Table};
 use std::time::Instant;
 use tempfile::tempdir;
 
@@ -72,7 +72,7 @@ fn main() {
         let mut bpr = 0.0_f64;
         for _ in 0..3 {
             let dir = tempdir().unwrap();
-            let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+            let mut db = Table::create(dir.path(), schema(), 1).unwrap();
             let cols = build_cols(n);
             let t = Instant::now();
             db.bulk_load_columns(cols).unwrap();
@@ -91,7 +91,7 @@ fn main() {
 
         // --- Load once for scan + update ---
         let dir = tempdir().unwrap();
-        let mut db = Db::create(dir.path(), schema(), 1).unwrap();
+        let mut db = Table::create(dir.path(), schema(), 1).unwrap();
         db.bulk_load_columns(build_cols(n)).unwrap();
         let snap = db.snapshot();
 

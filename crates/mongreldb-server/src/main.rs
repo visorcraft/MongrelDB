@@ -1,4 +1,4 @@
-//! mongreldb-server (Phase 19.3) — a long-lived process holding a `Db` open
+//! mongreldb-server (Phase 19.3) — a long-lived process holding a `Table` open
 //! with all indexes warm, serving SQL + native APIs over HTTP.
 //!
 //! Endpoints:
@@ -24,7 +24,7 @@ use axum::Json;
 use mongreldb_core::columnar::NativeColumn;
 use mongreldb_core::query::{Condition, Query};
 use mongreldb_core::schema::TypeId;
-use mongreldb_core::{Db, Value};
+use mongreldb_core::{Table, Value};
 use mongreldb_query::MongrelSession;
 use serde::{Deserialize, Serialize};
 
@@ -42,7 +42,7 @@ async fn main() {
     let table_dir = &args[1];
     let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(8453);
 
-    let db = Db::open(table_dir).unwrap_or_else(|e| {
+    let db = Table::open(table_dir).unwrap_or_else(|e| {
         eprintln!("failed to open {table_dir}: {e}");
         std::process::exit(1);
     });
