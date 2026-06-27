@@ -604,24 +604,28 @@ impl Transaction {
     pub fn commit(&mut self) -> napi::Result<BigInt> {
         let db_ref: &CoreDatabase = &*self.db;
         let mut tx = db_ref.begin();
-        for (table, op) in &self.staging {
-            match op {
-                TxnOp::Put(cells) => {
-                    tx.put(table, cells.clone()).map_err(to_napi)?;
-                }
-                TxnOp::Delete(rid) => {
-                    tx.delete(table, *rid).map_err(to_napi)?;
+        let stage = std::mem::take(&mut self.staging);
+        let result = (|| {
+            for (table, op) in &stage {
+                match op {
+                    TxnOp::Put(cells) => {
+                        tx.put(table, cells.clone())?;
+                    }
+                    TxnOp::Delete(rid) => {
+                        tx.delete(table, *rid)?;
+                    }
                 }
             }
-        }
-        let epoch = tx.commit().map_err(|e| match e {
-            mongreldb_core::MongrelError::Conflict(_) => napi::Error::new(
+            tx.commit()
+        })();
+        match result {
+            Ok(epoch) => Ok(BigInt::from(epoch.0)),
+            Err(mongreldb_core::MongrelError::Conflict(msg)) => Err(napi::Error::new(
                 napi::Status::GenericFailure,
-                "ConflictError: write-write conflict".to_string(),
-            ),
-            other => to_napi(other),
-        })?;
-        Ok(BigInt::from(epoch.0))
+                format!("__CONFLICT__:{msg}"),
+            )),
+            Err(other) => Err(to_napi(other)),
+        }
     }
 
     /// Discard all staged ops.

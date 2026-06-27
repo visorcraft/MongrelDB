@@ -115,11 +115,14 @@ async fn create_table(
         });
     }
     let schema = Schema {
-        schema_id: 1,
+        schema_id: 0,
         columns,
         indexes: vec![],
         colocation: vec![],
     };
+    if let Err(msg) = validate_table_name(&req.name) {
+        return (StatusCode::BAD_REQUEST, msg).into_response();
+    }
     match state.db.create_table(&req.name, schema) {
         Ok(id) => Json(json!({ "table_id": id })).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -145,9 +148,21 @@ struct PutRequest {
     row: Vec<serde_json::Value>,
 }
 
-fn json_to_value(v: &serde_json::Value) -> Value {
-    match v {
-        serde_json::Value::Number(n) => {
+fn json_to_value(v: &serde_json::Value, expected: TypeId) -> Value {
+    match (v, expected) {
+        (serde_json::Value::Number(n), TypeId::Float64) => {
+            n.as_f64().map(Value::Float64).unwrap_or(Value::Null)
+        }
+        (serde_json::Value::Number(n), TypeId::Int64) => {
+            n.as_i64().map(Value::Int64).unwrap_or(Value::Null)
+        }
+        (serde_json::Value::String(s), TypeId::Bytes) => {
+            Value::Bytes(s.as_bytes().to_vec())
+        }
+        (serde_json::Value::Bool(b), TypeId::Bool) => Value::Bool(*b),
+        (serde_json::Value::Null, _) => Value::Null,
+        // Lenient fallbacks for unknown/loosely-typed JSON.
+        (serde_json::Value::Number(n), _) => {
             if let Some(i) = n.as_i64() {
                 Value::Int64(i)
             } else if let Some(f) = n.as_f64() {
@@ -156,11 +171,48 @@ fn json_to_value(v: &serde_json::Value) -> Value {
                 Value::Null
             }
         }
-        serde_json::Value::String(s) => Value::Bytes(s.as_bytes().to_vec()),
-        serde_json::Value::Bool(b) => Value::Bool(*b),
-        serde_json::Value::Null => Value::Null,
+        (serde_json::Value::String(s), _) => Value::Bytes(s.as_bytes().to_vec()),
+        (serde_json::Value::Bool(b), _) => Value::Bool(*b),
         _ => Value::Null,
     }
+}
+
+/// Parse a flat JSON array `[col_id, val, col_id, val, ...]` into typed cell
+/// pairs, validating the schema. Returns `Err(message)` on any malformed pair.
+fn parse_cells(
+    row: &[serde_json::Value],
+    schema: &mongreldb_core::schema::Schema,
+) -> Result<Vec<(u16, Value)>, String> {
+    if row.len() % 2 != 0 {
+        return Err("row must be an even-length array of [col_id, value] pairs".into());
+    }
+    let mut out = Vec::with_capacity(row.len() / 2);
+    for chunk in row.chunks(2) {
+        let col_id = chunk[0]
+            .as_u64()
+            .ok_or("column id must be a non-negative integer")?
+            as u16;
+        let expected = schema
+            .columns
+            .iter()
+            .find(|c| c.id == col_id)
+            .map(|c| c.ty)
+            .ok_or_else(|| format!("unknown column id {col_id}"))?;
+        let val = json_to_value(&chunk[1], expected);
+        out.push((col_id, val));
+    }
+    Ok(out)
+}
+
+/// Basic validation for a table name: non-empty and no path separators.
+fn validate_table_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("table name must not be empty".into());
+    }
+    if name.contains('/') || name.contains('\\') || name.contains('\0') {
+        return Err("table name contains invalid characters".into());
+    }
+    Ok(())
 }
 
 async fn put_row(
@@ -173,15 +225,11 @@ async fn put_row(
         Err(e) => return (StatusCode::NOT_FOUND, e.to_string()).into_response(),
     };
     let mut g = handle.lock();
-    let row: Vec<(u16, Value)> = req
-        .row
-        .chunks(2)
-        .filter_map(|chunk| {
-            let col_id = chunk.first()?.as_u64()? as u16;
-            let val = json_to_value(chunk.get(1)?);
-            Some((col_id, val))
-        })
-        .collect();
+    let schema = g.schema().clone();
+    let row = match parse_cells(&req.row, &schema) {
+        Ok(r) => r,
+        Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+    };
     match g.put(row) {
         Ok(rid) => Json(json!({ "row_id": rid.0.to_string() })).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -268,29 +316,64 @@ async fn txn(
     State(state): State<Arc<AppState>>,
     Json(req): Json<TxnRequest>,
 ) -> Response {
-    let result = state.db.transaction(|t| {
-        for op in &req.ops {
-            match op.op.as_str() {
-                "put" => {
-                    let cells: Vec<(u16, Value)> = op
-                        .cells
-                        .as_ref()
-                        .unwrap()
-                        .chunks(2)
-                        .filter_map(|chunk| {
-                            let col_id = chunk.first()?.as_u64()? as u16;
-                            let val = json_to_value(chunk.get(1)?);
-                            Some((col_id, val))
-                        })
-                        .collect();
-                    t.put(&op.table, cells)?;
-                }
-                "delete" => {
-                    if let Some(rid) = op.row_id {
-                        t.delete(&op.table, mongreldb_core::RowId(rid))?;
+    // Pre-validate every op against the live schemas before entering the
+    // transaction, so malformed input returns 400 without consuming an epoch
+    // or poisoning a txn.
+    let mut parsed: Vec<(String, TxnAction)> = Vec::with_capacity(req.ops.len());
+    for op in &req.ops {
+        match op.op.as_str() {
+            "put" => {
+                let cells_json = match op.cells.as_ref() {
+                    Some(c) if !c.is_empty() => c,
+                    _ => {
+                        return (StatusCode::BAD_REQUEST, "put op requires non-empty cells")
+                            .into_response()
                     }
+                };
+                let handle = match state.db.table(&op.table) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        return (StatusCode::NOT_FOUND, e.to_string()).into_response()
+                    }
+                };
+                let schema = handle.lock().schema().clone();
+                let cells = match parse_cells(cells_json, &schema) {
+                    Ok(c) => c,
+                    Err(msg) => {
+                        return (StatusCode::BAD_REQUEST, msg).into_response()
+                    }
+                };
+                parsed.push((op.table.clone(), TxnAction::Put(cells)));
+            }
+            "delete" => {
+                let rid = match op.row_id {
+                    Some(r) => r,
+                    None => {
+                        return (StatusCode::BAD_REQUEST, "delete op requires row_id")
+                            .into_response()
+                    }
+                };
+                parsed.push((op.table.clone(), TxnAction::Delete(rid)));
+            }
+            other => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("unknown op: {other}"),
+                )
+                    .into_response()
+            }
+        }
+    }
+
+    let result = state.db.transaction(|t| {
+        for (table, action) in &parsed {
+            match action {
+                TxnAction::Put(cells) => {
+                    t.put(table, cells.clone())?;
                 }
-                _ => {}
+                TxnAction::Delete(rid) => {
+                    t.delete(table, mongreldb_core::RowId(*rid))?;
+                }
             }
         }
         Ok(())
@@ -299,4 +382,9 @@ async fn txn(
         Ok(_) => Json(json!({ "status": "committed" })).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
+}
+
+enum TxnAction {
+    Put(Vec<(u16, Value)>),
+    Delete(u64),
 }

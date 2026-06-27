@@ -840,9 +840,13 @@ impl MongrelSession {
             tables.insert(name, handle);
         }
 
-        // Pick the first table as the "primary" for legacy `db()` accessors.
-        // If the database is empty, `db()` will return an error.
-        let primary = tables.values().next().cloned();
+        // Pick a stable "primary" (lexicographically smallest name) for legacy
+        // `db()` accessors. If the database is empty, `db()` returns `None`.
+        let primary = {
+            let mut names: Vec<&String> = tables.keys().collect();
+            names.sort();
+            names.first().and_then(|n| tables.get(*n).cloned())
+        };
 
         Ok(Self {
             ctx,
@@ -928,12 +932,20 @@ impl MongrelSession {
         }
         if lower.starts_with("drop table") {
             if let Some(db) = &self.database {
-                let name = parse_drop_table(sql)?;
-                db.drop_table(&name)?;
-                self.ctx
-                    .deregister_table(&name)
-                    .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
-                self.tables.lock().remove(&name);
+                let (name, if_exists) = parse_drop_table(sql)?;
+                let drop_result = db.drop_table(&name);
+                if let Err(e) = drop_result {
+                    // IF EXISTS tolerates NotFound.
+                    let is_not_found = matches!(e, mongreldb_core::MongrelError::NotFound(_));
+                    if !(if_exists && is_not_found) {
+                        return Err(e.into());
+                    }
+                } else {
+                    self.ctx
+                        .deregister_table(&name)
+                        .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
+                    self.tables.lock().remove(&name);
+                }
                 self.clear_cache();
                 return Ok(Vec::new());
             }
@@ -1093,9 +1105,20 @@ fn sql_cache_key(sql: &str) -> u64 {
     h.finish()
 }
 
-/// Parse `CREATE TABLE <name> (<col> <type> [PRIMARY KEY], ...)` into a
-/// MongrelDB table name + schema. Supports BIGINT, DOUBLE, VARCHAR/TEXT,
-/// BOOLEAN.
+/// Strip an ASCII case-insensitive prefix from `s`, returning the remainder.
+fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    let bytes = s.as_bytes();
+    let pb = prefix.as_bytes();
+    if bytes.len() >= pb.len() && bytes[..pb.len()].eq_ignore_ascii_case(pb) {
+        Some(&s[pb.len()..])
+    } else {
+        None
+    }
+}
+
+/// Parse `CREATE TABLE [IF NOT EXISTS] <name> (<col> <type> [PRIMARY KEY], ...)`
+/// into a MongrelDB table name + schema. Supports BIGINT, DOUBLE,
+/// VARCHAR/TEXT, BOOLEAN. Table name may be double-quoted.
 fn parse_create_table(sql: &str) -> Result<(String, mongreldb_core::schema::Schema)> {
     use mongreldb_core::schema::*;
 
@@ -1105,18 +1128,27 @@ fn parse_create_table(sql: &str) -> Result<(String, mongreldb_core::schema::Sche
     let close = sql
         .rfind(')')
         .ok_or(MongrelQueryError::Schema("CREATE TABLE missing ')'".into()))?;
-    let name = sql[..open]
-        .trim()
-        .strip_prefix("CREATE TABLE")
-        .or_else(|| sql[..open].trim().strip_prefix("create table"))
+    let head = sql[..open].trim();
+    let after_kw = strip_prefix_ci(head, "CREATE TABLE")
+        .or_else(|| strip_prefix_ci(head, "create table"))
         .unwrap_or("")
-        .trim()
-        .trim_matches('"')
-        .to_string();
+        .trim();
+    // Skip optional `IF NOT EXISTS`.
+    let after_kw = after_kw
+        .strip_prefix("IF NOT EXISTS")
+        .or_else(|| after_kw.strip_prefix("if not exists"))
+        .map(str::trim)
+        .unwrap_or(after_kw);
+    let name = after_kw.trim_matches('"').to_string();
+    if name.is_empty() {
+        return Err(MongrelQueryError::Schema(
+            "CREATE TABLE missing table name".into(),
+        ));
+    }
 
     let body = &sql[open + 1..close];
     let mut columns = Vec::new();
-    let mut schema_id: u64 = 1;
+    let schema_id: u64 = 0; // Database::create_table overrides with the table_id.
     for (i, raw) in body.split(',').enumerate() {
         let part = raw.trim();
         if part.is_empty() {
@@ -1155,7 +1187,6 @@ fn parse_create_table(sql: &str) -> Result<(String, mongreldb_core::schema::Sche
             flags,
         });
     }
-    schema_id = schema_id.wrapping_add(columns.len() as u64);
 
     Ok((
         name,
@@ -1168,21 +1199,28 @@ fn parse_create_table(sql: &str) -> Result<(String, mongreldb_core::schema::Sche
     ))
 }
 
-/// Parse `DROP TABLE <name>`.
-fn parse_drop_table(sql: &str) -> Result<String> {
-    let name = sql
-        .trim()
-        .strip_prefix("DROP TABLE")
-        .or_else(|| sql.trim().strip_prefix("drop table"))
+/// Parse `DROP TABLE [IF EXISTS] <name>`. Returns `(name, if_exists)`.
+fn parse_drop_table(sql: &str) -> Result<(String, bool)> {
+    let head = sql.trim();
+    let after_kw = strip_prefix_ci(head, "DROP TABLE")
+        .or_else(|| strip_prefix_ci(head, "drop table"))
         .unwrap_or("")
-        .trim()
-        .trim_matches(';')
-        .trim_matches('"')
-        .to_string();
+        .trim();
+    // Detect optional `IF EXISTS`.
+    let (rest, if_exists) = if let Some(r) = after_kw
+        .strip_prefix("IF EXISTS")
+        .or_else(|| after_kw.strip_prefix("if exists"))
+        .map(str::trim)
+    {
+        (r, true)
+    } else {
+        (after_kw, false)
+    };
+    let name = rest.trim_matches(';').trim_matches('"').trim();
     if name.is_empty() {
         return Err(MongrelQueryError::Schema(
             "DROP TABLE missing table name".into(),
         ));
     }
-    Ok(name)
+    Ok((name.to_string(), if_exists))
 }

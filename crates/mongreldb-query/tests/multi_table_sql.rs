@@ -159,3 +159,57 @@ async fn create_and_drop_table_via_sql() {
     let result = session.run("SELECT * FROM t").await;
     assert!(result.is_err(), "expected error after DROP TABLE, got Ok");
 }
+
+#[tokio::test]
+async fn ddl_is_case_insensitive() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    let session = MongrelSession::open(Arc::clone(&db)).unwrap();
+
+    // Mixed-case keywords.
+    session
+        .run("Create Table t (id BIGINT Primary Key, v BIGINT)")
+        .await
+        .unwrap();
+    assert_eq!(db.table_names(), vec!["t".to_string()]);
+
+    session.run("Drop Table t").await.unwrap();
+    assert!(db.table_names().is_empty());
+}
+
+#[tokio::test]
+async fn ddl_with_if_not_exists_and_if_exists() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    let session = MongrelSession::open(Arc::clone(&db)).unwrap();
+
+    // CREATE TABLE IF NOT EXISTS
+    session
+        .run("CREATE TABLE IF NOT EXISTS t (id BIGINT PRIMARY KEY, v BIGINT)")
+        .await
+        .unwrap();
+    assert_eq!(db.table_names(), vec!["t".to_string()]);
+
+    // DROP TABLE IF EXISTS on a live table succeeds.
+    session.run("DROP TABLE IF EXISTS t").await.unwrap();
+    assert!(db.table_names().is_empty());
+
+    // DROP TABLE IF EXISTS on a non-existent table succeeds (no error).
+    session.run("DROP TABLE IF EXISTS nonexist").await.unwrap();
+}
+
+#[tokio::test]
+async fn schema_id_is_unique_per_table() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+
+    let _ = db.create_table("a", orders_schema()).unwrap();
+    let _ = db.create_table("b", customers_schema()).unwrap();
+
+    let schema_a = db.table("a").unwrap().lock().schema().clone();
+    let schema_b = db.table("b").unwrap().lock().schema().clone();
+    assert_ne!(
+        schema_a.schema_id, schema_b.schema_id,
+        "schema_ids must be unique across tables"
+    );
+}

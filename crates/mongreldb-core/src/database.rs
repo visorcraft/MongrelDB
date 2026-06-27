@@ -663,6 +663,12 @@ impl Database {
         let epoch = self.epoch.bump_assigned();
         let txn_id = self.alloc_txn_id();
 
+        // Stamp the schema_id with the unique table_id so every table in the
+        // database has a distinct schema_id (caller-provided values are
+        // ignored to prevent collisions).
+        let mut schema = schema;
+        schema.schema_id = table_id;
+
         // 1. Log the DDL + commit marker to the shared WAL and fsync (durable).
         let schema_json = DdlOp::encode_schema(&schema)?;
         {
@@ -816,8 +822,9 @@ impl Database {
     }
 
     /// Verify multi-table integrity (spec §16). Checks that every live table's
-    /// manifest is readable and every `RunRef`'s file exists. Returns a list of
-    /// issues found (empty = healthy).
+    /// manifest is readable and every `RunRef`'s file exists, has the correct
+    /// magic header, and has a well-formed footer (not truncated). Returns a
+    /// list of issues found (empty = healthy).
     pub fn check(&self) -> Vec<CheckIssue> {
         let mut issues = Vec::new();
         let cat = self.catalog.read();
@@ -833,13 +840,16 @@ impl Database {
                         let run_path = tdir
                             .join(crate::engine::RUNS_DIR)
                             .join(format!("r-{}.sr", rr.run_id));
-                        if !run_path.exists() {
-                            issues.push(CheckIssue {
-                                table_id: entry.table_id,
-                                table_name: entry.name.clone(),
-                                severity: "error".into(),
-                                description: format!("missing run file r-{}.sr", rr.run_id),
-                            });
+                        match verify_run_file(&run_path) {
+                            Ok(()) => {}
+                            Err(reason) => {
+                                issues.push(CheckIssue {
+                                    table_id: entry.table_id,
+                                    table_name: entry.name.clone(),
+                                    severity: "error".into(),
+                                    description: reason,
+                                });
+                            }
                         }
                     }
                 }
@@ -857,9 +867,12 @@ impl Database {
     }
 
     /// Quarantine unreadable tables (spec §16). Moves corrupt table dirs to
-    /// `_quarantine/<table_id>/` and marks them dropped in the catalog so the
-    /// DB still opens.
+    /// `_quarantine/<table_id>/`, marks them dropped in the catalog, and
+    /// unmounts them from the live table map so the DB still opens.
     pub fn doctor(&self) -> Result<Vec<u64>> {
+        // Hold the DDL lock for the whole operation to prevent concurrent
+        // create_table/drop_table from racing the catalog/dir mutation.
+        let _ddl = self.ddl_lock.lock();
         let issues = self.check();
         let bad_tables: std::collections::HashSet<u64> = issues
             .iter()
@@ -887,6 +900,8 @@ impl Database {
                     };
                 }
             }
+            // Unmount the live handle so no further access reaches the moved dir.
+            self.tables.write().remove(&table_id);
             quarantined.push(table_id);
         }
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
@@ -1144,4 +1159,53 @@ fn sweep_pending_txn_dirs(root: &Path, cat: &Catalog) {
             let _ = std::fs::remove_dir_all(&txn_dir);
         }
     }
+}
+
+/// Verify a `.sr` run file is non-truncated and has valid magic + footer.
+/// Returns `Ok(())` on success, `Err(reason_string)` on any integrity issue.
+fn verify_run_file(path: &Path) -> std::result::Result<(), String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let metadata = if path.exists() {
+        std::fs::metadata(path).map_err(|e| format!("run file stat failed: {e}"))?
+    } else {
+        return Err(format!(
+            "missing run file: {}",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+    };
+    let size = metadata.len() as usize;
+    const MIN_RUN_SIZE: usize = 8 + 48;
+    if size < MIN_RUN_SIZE {
+        return Err(format!(
+            "run file too small ({} bytes, expected ≥ {})",
+            size, MIN_RUN_SIZE
+        ));
+    }
+
+    let mut file = std::fs::File::open(path).map_err(|e| format!("run file open failed: {e}"))?;
+
+    let mut magic = [0u8; 8];
+    file.read_exact(&mut magic)
+        .map_err(|e| format!("run header read failed: {e}"))?;
+    if magic != crate::sorted_run::RUN_MAGIC {
+        return Err(format!(
+            "run header magic mismatch: expected {:?}, got {:?}",
+            crate::sorted_run::RUN_MAGIC,
+            magic
+        ));
+    }
+
+    let tail_len = size.min(80);
+    let mut tail = vec![0u8; tail_len];
+    file.seek(SeekFrom::End(-(tail_len as i64)))
+        .map_err(|e| format!("run seek failed: {e}"))?;
+    file.read_exact(&mut tail)
+        .map_err(|e| format!("run footer read failed: {e}"))?;
+    let magic_found = tail.windows(8).any(|w| w == crate::sorted_run::RUN_MAGIC);
+    if !magic_found {
+        return Err("run footer magic not found (truncated or corrupt)".into());
+    }
+
+    Ok(())
 }
