@@ -460,19 +460,56 @@ impl WalReader {
         Ok(Some(record))
     }
 
-    /// Replay all cleanly-committed records. A torn tail (crash mid-append) is
-    /// treated as end-of-log and truncated — the valid prefix is returned.
+    /// Replay all cleanly-committed records. A torn tail (crash mid-append or a
+    /// partially-flushed last frame) is treated as end-of-log and truncated —
+    /// the valid prefix is returned. A CRC failure or short read that is
+    /// followed by a well-formed frame is treated as **interior corruption**
+    /// and surfaces as [`MongrelError::CorruptWal`] (spec §8.4, review fix #22).
     pub fn replay(&mut self) -> Result<Vec<Record>> {
         let mut out = Vec::new();
         loop {
             match self.next_record() {
                 Ok(Some(rec)) => out.push(rec),
                 Ok(None) => break,
-                Err(MongrelError::TornWrite { .. }) => break,
+                Err(MongrelError::TornWrite { offset }) => {
+                    // Partial trailing frame: clean EOF unless a valid frame
+                    // follows it (which would mean the torn frame is interior).
+                    if self.valid_frame_follows()? {
+                        return Err(MongrelError::CorruptWal {
+                            offset,
+                            reason: "interior torn frame followed by a valid frame".into(),
+                        });
+                    }
+                    break;
+                }
+                Err(MongrelError::CorruptWal { offset, .. }) => {
+                    // CRC mismatch: torn tail if nothing valid follows, else
+                    // interior corruption.
+                    if self.valid_frame_follows()? {
+                        return Err(MongrelError::CorruptWal {
+                            offset,
+                            reason: "interior corruption: valid frame follows a CRC mismatch"
+                                .into(),
+                        });
+                    }
+                    break;
+                }
                 Err(e) => return Err(e),
             }
         }
         Ok(out)
+    }
+
+    /// Probe whether a well-formed frame remains at the current read position.
+    /// Used by [`Self::replay`] to disambiguate a trailing torn frame from
+    /// interior corruption. The reader state is left positioned after the
+    /// probed frame; `replay` stops after calling this regardless.
+    fn valid_frame_follows(&mut self) -> Result<bool> {
+        match self.next_record() {
+            Ok(Some(_)) => Ok(true),
+            Ok(None) => Ok(false),
+            Err(_) => Ok(false),
+        }
     }
 
     /// Position the write cursor at end of file (for a reopen-and-append path,
@@ -655,6 +692,101 @@ mod tests {
         assert!(
             matches!(err, MongrelError::CorruptWal { .. }),
             "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn trailing_torn_is_eof_but_interior_corruption_errors() {
+        let dir = tempdir().unwrap();
+
+        // (a) good records then a half-written trailing frame -> replay returns
+        //     the good prefix (torn tail = clean EOF).
+        let path_a = dir.path().join("seg-torn.wal");
+        let mut wal = Wal::create(&path_a, Epoch(0)).unwrap();
+        wal.append_txn(
+            1,
+            Op::Put {
+                table_id: 1,
+                rows: vec![1],
+            },
+        )
+        .unwrap();
+        wal.append_txn(
+            1,
+            Op::Put {
+                table_id: 1,
+                rows: vec![2],
+            },
+        )
+        .unwrap();
+        wal.sync().unwrap();
+        drop(wal);
+        // Append a partial trailing frame (claims 64 bytes, only 7 written).
+        let mut f = OpenOptions::new().append(true).open(&path_a).unwrap();
+        f.write_all(&64u32.to_le_bytes()).unwrap();
+        f.write_all(&[0u8; 7]).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+        let recs = replay(&path_a).unwrap();
+        assert_eq!(recs.len(), 2, "torn trailing frame must truncate cleanly");
+
+        // (b) corrupt an INTERIOR frame's CRC and append a valid frame after ->
+        //     replay errors (interior corruption, not a torn tail).
+        let path_b = dir.path().join("seg-interior.wal");
+        let mut wal = Wal::create(&path_b, Epoch(0)).unwrap();
+        wal.append_txn(
+            1,
+            Op::Put {
+                table_id: 1,
+                rows: vec![10, 20, 30],
+            },
+        )
+        .unwrap();
+        wal.append_txn(
+            1,
+            Op::Put {
+                table_id: 1,
+                rows: vec![40],
+            },
+        )
+        .unwrap();
+        wal.sync().unwrap();
+        drop(wal);
+        // Flip a payload byte of the FIRST frame (interior), leaving the second
+        // frame intact so a valid frame follows the corrupt one.
+        let mut bytes = std::fs::read(&path_b).unwrap();
+        let first_payload_byte = HEADER_LEN as usize + 4 + 4 + 8 + 8; // past len+crc+seq+txn_id
+        bytes[first_payload_byte] ^= 0xFF;
+        std::fs::write(&path_b, bytes).unwrap();
+        let err = replay(&path_b).unwrap_err();
+        assert!(
+            matches!(err, MongrelError::CorruptWal { .. }),
+            "interior corruption must error, got {err:?}"
+        );
+
+        // (c) a trailing frame whose CRC is bad (last frame, nothing valid
+        //     after) is a torn tail -> clean truncation, no error.
+        let path_c = dir.path().join("seg-badtail.wal");
+        let mut wal = Wal::create(&path_c, Epoch(0)).unwrap();
+        wal.append_txn(
+            1,
+            Op::Put {
+                table_id: 1,
+                rows: vec![5],
+            },
+        )
+        .unwrap();
+        wal.sync().unwrap();
+        drop(wal);
+        let mut bytes = std::fs::read(&path_c).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        std::fs::write(&path_c, bytes).unwrap();
+        let recs = replay(&path_c).unwrap();
+        assert_eq!(
+            recs.len(),
+            0,
+            "trailing corrupt frame with no valid follower is a torn tail"
         );
     }
 
