@@ -2610,28 +2610,27 @@ impl Table {
                 .map(|s| s.search(query, *k).into_iter().map(|(r, _)| r.0).collect())
                 .unwrap_or_default(),
             Condition::Range { column_id, lo, hi } => {
-                if let Some(li) = self.learned_range.get(column_id) {
+                // Build the candidate set from the durable tier — the learned
+                // index (built from sorted runs) or a single page-pruned run —
+                // then merge the memtable/mutable-run overlay. An overlay row
+                // supersedes its run version (it may have been updated out of
+                // range or deleted), so overlay rids are dropped from the run
+                // set and re-evaluated from the overlay directly. Without this
+                // merge, rows still in the memtable are invisible to a ranged
+                // read whenever a LearnedRange index is present.
+                let mut set = if let Some(li) = self.learned_range.get(column_id) {
                     li.range(*lo, *hi)
                 } else if self.run_refs.len() == 1 {
-                    // Phase 16.3: fast page-pruned single-run path — reads
-                    // SYS_ROW_ID + value per non-pruned page only, with **no
-                    // O(n) visibility HashMap**. Relaxed from the old
-                    // `memtable.is_empty() && mutable_run.is_empty()` gate so a
-                    // small overlay no longer forces a full visibility rescan:
-                    // stale run versions of overlay rids are removed and the
-                    // overlay is evaluated in-memory. Tombstoned rids that slip
-                    // through are dropped by the cursor's visible-position
-                    // intersection, so an Exact pushdown stays exact.
                     let mut r = self.open_reader(self.run_refs[0].run_id)?;
-                    let mut set = r.range_row_ids_i64(*column_id, *lo, *hi)?;
-                    for rid in self.overlay_rid_set(snapshot) {
-                        set.remove(&rid);
-                    }
-                    self.range_scan_overlay_i64(&mut set, *column_id, *lo, *hi, snapshot);
-                    set
+                    r.range_row_ids_i64(*column_id, *lo, *hi)?
                 } else {
-                    self.range_scan_i64(*column_id, *lo, *hi, snapshot)?
+                    return self.range_scan_i64(*column_id, *lo, *hi, snapshot);
+                };
+                for rid in self.overlay_rid_set(snapshot) {
+                    set.remove(&rid);
                 }
+                self.range_scan_overlay_i64(&mut set, *column_id, *lo, *hi, snapshot);
+                set
             }
             Condition::RangeF64 {
                 column_id,
@@ -2640,18 +2639,15 @@ impl Table {
                 hi,
                 hi_inclusive,
             } => {
-                if let Some(li) = self.learned_range.get(column_id) {
+                // See the `Range` arm: merge the overlay over the durable
+                // candidate set so memtable/mutable-run rows are visible.
+                let mut set = if let Some(li) = self.learned_range.get(column_id) {
                     li.range_f64(*lo, *lo_inclusive, *hi, *hi_inclusive)
                 } else if self.run_refs.len() == 1 {
-                    // Phase 16.3: see the `Range` arm for the gate relaxation.
                     let mut r = self.open_reader(self.run_refs[0].run_id)?;
-                    let mut set =
-                        r.range_row_ids_f64(*column_id, *lo, *lo_inclusive, *hi, *hi_inclusive)?;
-                    for rid in self.overlay_rid_set(snapshot) {
-                        set.remove(&rid);
-                    }
-                    self.range_scan_overlay_f64(
-                        &mut set,
+                    r.range_row_ids_f64(*column_id, *lo, *lo_inclusive, *hi, *hi_inclusive)?
+                } else {
+                    return self.range_scan_f64(
                         *column_id,
                         *lo,
                         *lo_inclusive,
@@ -2659,17 +2655,20 @@ impl Table {
                         *hi_inclusive,
                         snapshot,
                     );
-                    set
-                } else {
-                    self.range_scan_f64(
-                        *column_id,
-                        *lo,
-                        *lo_inclusive,
-                        *hi,
-                        *hi_inclusive,
-                        snapshot,
-                    )?
+                };
+                for rid in self.overlay_rid_set(snapshot) {
+                    set.remove(&rid);
                 }
+                self.range_scan_overlay_f64(
+                    &mut set,
+                    *column_id,
+                    *lo,
+                    *lo_inclusive,
+                    *hi,
+                    *hi_inclusive,
+                    snapshot,
+                );
+                set
             }
         })
     }
