@@ -597,13 +597,13 @@ impl ResultCache {
 /// Derive WAL and cache DEKs from the KEK (None when no encryption).
 type DekaOpt = Option<Zeroizing<[u8; DEK_LEN]>>;
 
-fn derive_subkeys(kek: Option<&Kek>, table_id: u64) -> (DekaOpt, DekaOpt) {
+fn derive_subkeys(kek: Option<&Kek>, _table_id: u64) -> (DekaOpt, DekaOpt) {
     let _ = kek;
     #[cfg(feature = "encryption")]
     {
         if let Some(k) = kek {
             return (
-                Some(k.derive_table_wal_key(table_id)),
+                Some(k.derive_table_wal_key(_table_id)),
                 Some(k.derive_cache_key()),
             );
         }

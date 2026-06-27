@@ -41,6 +41,8 @@ pub enum MongrelError {
     InvalidArgument(String),
     #[error("table is full: {0}")]
     Full(String),
+    #[error("transaction conflict: {0}")]
+    Conflict(String),
     #[error("{0}")]
     Other(String),
 }

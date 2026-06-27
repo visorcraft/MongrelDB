@@ -9,7 +9,7 @@
 //! dropped transaction) discards the staging and appends nothing durable.
 
 use crate::database::Database;
-use crate::epoch::Snapshot;
+use crate::epoch::{Epoch, Snapshot};
 use crate::error::Result;
 use crate::memtable::Value;
 use crate::rowid::RowId;
@@ -27,15 +27,18 @@ pub struct Transaction<'db> {
     txn_id: u64,
     read: Snapshot,
     staging: Vec<(u64 /*table_id*/, Staged)>,
+    _active: Option<ActiveTxnGuard<'db>>,
 }
 
 impl<'db> Transaction<'db> {
     pub(crate) fn new(db: &'db Database, txn_id: u64, read: Snapshot) -> Self {
+        let guard = db.register_active(read.epoch);
         Self {
             db,
             txn_id,
             read,
             staging: Vec::new(),
+            _active: Some(guard),
         }
     }
 
@@ -65,8 +68,9 @@ impl<'db> Transaction<'db> {
     }
 
     /// Commit: durably seal the staging under one epoch and publish it.
-    pub fn commit(self) -> Result<crate::epoch::Epoch> {
-        self.db.commit_transaction(self.txn_id, self.staging)
+    pub fn commit(self) -> Result<Epoch> {
+        self.db
+            .commit_transaction(self.txn_id, self.read.epoch, self.staging)
     }
 
     /// Rollback: discard staging. Nothing is appended to the WAL.
@@ -83,7 +87,6 @@ pub(crate) enum StagedOp {
 
 // ── P3.1: conflict index + active-txn registry (spec §8.3, §9.2) ─────────
 
-use crate::epoch::Epoch;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 

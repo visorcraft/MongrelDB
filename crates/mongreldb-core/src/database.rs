@@ -48,6 +48,17 @@ pub struct Database {
     /// `commit_lock` shared via `SharedCtx`.
     ddl_lock: Mutex<()>,
     meta_dek: Option<[u8; META_DEK_LEN]>,
+    /// P3.1: write-key → commit_epoch for first-committer-wins conflict
+    /// detection (spec §9.2).
+    conflicts: crate::txn::ConflictIndex,
+    /// P3.1: min read_epoch of all in-flight txns, drives conflict-index
+    /// pruning (spec §9.2, review fix #12).
+    active_txns: crate::txn::ActiveTxns,
+    /// P3.2: epochs that have published but not yet been absorbed into the
+    /// in-order `visible` watermark.
+    pending_visible: Mutex<std::collections::BTreeSet<u64>>,
+    /// P3.2: set on fsync error — all subsequent writes fail fast (spec §9.3e).
+    poisoned: std::sync::atomic::AtomicBool,
 }
 
 impl Database {
@@ -197,6 +208,10 @@ impl Database {
             kek,
             ddl_lock: Mutex::new(()),
             meta_dek,
+            conflicts: crate::txn::ConflictIndex::new(),
+            active_txns: crate::txn::ActiveTxns::new(),
+            pending_visible: Mutex::new(std::collections::BTreeSet::new()),
+            poisoned: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -239,93 +254,175 @@ impl Database {
         }
     }
 
-    /// Seal a transaction: serial commit under `commit_lock`, append to the
-    /// shared WAL, group-sync, apply to tables, persist manifests, publish.
-    /// Single-applier subset (P3 splits this into validate-first + group commit).
+    /// Register a txn in `ActiveTxns` (spec §9.2, review fix #12). Called from
+    /// `Transaction::new` so registration happens **before** any read.
+    pub(crate) fn register_active(&self, epoch: Epoch) -> crate::txn::ActiveTxnGuard<'_> {
+        self.active_txns.register(epoch)
+    }
+
+    /// Seal a transaction (spec §9.3):
+    /// 1. Prepare — derive write keys, allocate row ids (brief table locks).
+    /// 2. Sequencer — validate-first under the WAL mutex; abort on conflict
+    ///    with no epoch consumed; assign epoch, append data records + TxnCommit,
+    ///    group-sync, record conflict keys.
+    /// 3. Publish — apply to tables, advance visible in-order.
     pub(crate) fn commit_transaction(
         &self,
         txn_id: u64,
+        read_epoch: Epoch,
         staging: Vec<(u64, crate::txn::Staged)>,
     ) -> Result<Epoch> {
         use crate::memtable::Row;
-        use crate::txn::StagedOp;
+        use crate::txn::{Staged, StagedOp, WriteKey};
         use crate::wal::Op;
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        use std::sync::atomic::Ordering;
 
-        // Serial applier: the whole assign→fsync→publish is one critical
-        // section so the dual-counter publishes strictly in order.
-        let _g = self.commit_lock.lock();
-        let new_epoch = self.epoch.bump_assigned();
+        if self.poisoned.load(Ordering::Relaxed) {
+            return Err(MongrelError::Other(
+                "database poisoned by fsync error".into(),
+            ));
+        }
 
-        // Build rows (allocating ids) and append data records to the shared WAL
-        // BEFORE making anything visible.
-        let mut wal = self.shared_wal.lock();
-        let tables = self.tables.read();
-        let mut applies: Vec<(u64, Vec<StagedOp>)> = Vec::new();
-
-        for (table_id, staged) in staging {
-            let handle = tables
-                .get(&table_id)
-                .ok_or_else(|| MongrelError::NotFound(format!("table {table_id} not mounted")))?;
-            let mut t = handle.lock();
-            let mut ops = Vec::new();
-            match staged {
-                crate::txn::Staged::Put(cells) => {
-                    let row_id = t.alloc_row_id();
-                    let mut row = Row::new(row_id, new_epoch);
-                    for (c, v) in cells {
-                        row.columns.insert(c, v);
+        // ── 1. Prepare: derive write keys + allocate row ids ──
+        let write_keys = {
+            let cat = self.catalog.read();
+            let mut keys: Vec<WriteKey> = Vec::new();
+            for (table_id, staged) in &staging {
+                match staged {
+                    Staged::Put(cells) => {
+                        if let Some(entry) = cat.tables.iter().find(|t| t.table_id == *table_id) {
+                            for col in &entry.schema.columns {
+                                if col.flags.contains(crate::schema::ColumnFlags::PRIMARY_KEY) {
+                                    if let Some((_, val)) =
+                                        cells.iter().find(|(id, _)| *id == col.id)
+                                    {
+                                        let mut h = DefaultHasher::new();
+                                        val.encode_key().hash(&mut h);
+                                        keys.push(WriteKey::Unique {
+                                            table_id: *table_id,
+                                            index_id: 0,
+                                            key_hash: h.finish(),
+                                        });
+                                    }
+                                }
+                            }
+                        }
                     }
-                    let payload = bincode::serialize(&vec![row.clone()])
-                        .map_err(|e| MongrelError::Other(format!("row serialize: {e}")))?;
-                    wal.append(
-                        txn_id,
-                        table_id,
-                        Op::Put {
-                            table_id,
-                            rows: payload,
-                        },
-                    )?;
-                    ops.push(StagedOp::Put(row));
-                }
-                crate::txn::Staged::Delete(rid) => {
-                    wal.append(
-                        txn_id,
-                        table_id,
-                        Op::Delete {
-                            table_id,
-                            row_ids: vec![rid],
-                        },
-                    )?;
-                    ops.push(StagedOp::Delete(rid));
+                    Staged::Delete(rid) => keys.push(WriteKey::Row {
+                        table_id: *table_id,
+                        row_id: rid.0,
+                    }),
                 }
             }
-            applies.push((table_id, ops));
+            keys
+        };
+
+        // Opportunistic pruning.
+        let min_active = self.active_txns.min_read_epoch();
+        if min_active < u64::MAX {
+            self.conflicts.prune_below(Epoch(min_active));
         }
 
-        // Seal + group-fsync.
-        wal.append_commit(txn_id, new_epoch, &[])?;
-        let _durable_seq = wal.group_sync()?;
-        drop(wal);
+        // ── 2. Sequencer: validate-first → assign → append → sync → record ──
+        let (new_epoch, applies) = {
+            let mut wal = self.shared_wal.lock();
 
-        // Apply the now-durable staging to each table's memtable + indexes at
-        // the commit epoch, then persist the manifest so reopen sees it.
-        for (table_id, ops) in applies {
-            let Some(handle) = tables.get(&table_id) else {
-                continue;
-            };
-            let mut t = handle.lock();
-            for op in ops {
-                match op {
-                    StagedOp::Put(row) => t.apply_put_rows(vec![row]),
-                    StagedOp::Delete(rid) => t.apply_delete(rid, new_epoch),
+            // Validate first — abort on conflict, no epoch consumed.
+            if self.conflicts.conflicts(&write_keys, read_epoch) {
+                return Err(MongrelError::Conflict(
+                    "write-write conflict (first-committer-wins)".into(),
+                ));
+            }
+
+            let new_epoch = self.epoch.bump_assigned();
+            let tables = self.tables.read();
+            let mut applies: Vec<(u64, Vec<StagedOp>)> = Vec::new();
+
+            for (table_id, staged) in &staging {
+                let handle = tables.get(table_id).ok_or_else(|| {
+                    MongrelError::NotFound(format!("table {table_id} not mounted"))
+                })?;
+                let mut t = handle.lock();
+                let mut ops = Vec::new();
+                match staged {
+                    Staged::Put(cells) => {
+                        let row_id = t.alloc_row_id();
+                        let mut row = Row::new(row_id, new_epoch);
+                        for (c, v) in cells {
+                            row.columns.insert(*c, v.clone());
+                        }
+                        let payload = bincode::serialize(&vec![row.clone()])
+                            .map_err(|e| MongrelError::Other(format!("row serialize: {e}")))?;
+                        wal.append(
+                            txn_id,
+                            *table_id,
+                            Op::Put {
+                                table_id: *table_id,
+                                rows: payload,
+                            },
+                        )?;
+                        ops.push(StagedOp::Put(row));
+                    }
+                    Staged::Delete(rid) => {
+                        wal.append(
+                            txn_id,
+                            *table_id,
+                            Op::Delete {
+                                table_id: *table_id,
+                                row_ids: vec![*rid],
+                            },
+                        )?;
+                        ops.push(StagedOp::Delete(*rid));
+                    }
+                }
+                applies.push((*table_id, ops));
+            }
+
+            wal.append_commit(txn_id, new_epoch, &[])?;
+            wal.group_sync().inspect_err(|_| {
+                self.poisoned.store(true, Ordering::Relaxed);
+            })?;
+
+            self.conflicts.record(&write_keys, new_epoch);
+            (new_epoch, applies)
+        };
+
+        // ── 3. Publish: apply to tables, advance visible in-order ──
+        {
+            let tables = self.tables.read();
+            for (table_id, ops) in applies {
+                if let Some(handle) = tables.get(&table_id) {
+                    let mut t = handle.lock();
+                    for op in ops {
+                        match op {
+                            StagedOp::Put(row) => t.apply_put_rows(vec![row]),
+                            StagedOp::Delete(rid) => t.apply_delete(rid, new_epoch),
+                        }
+                    }
+                    t.invalidate_pending_cache();
+                    t.persist_manifest(new_epoch)?;
                 }
             }
-            t.invalidate_pending_cache();
-            t.persist_manifest(new_epoch)?;
         }
 
-        self.epoch.publish_visible(new_epoch);
+        self.advance_visible(new_epoch);
         Ok(new_epoch)
+    }
+
+    /// Advance `visible` in-order: epoch E becomes visible only once E and all
+    /// prior unpublished epochs have finished publishing (spec §9.3e).
+    fn advance_visible(&self, published: Epoch) {
+        let mut pending = self.pending_visible.lock();
+        pending.insert(published.0);
+        let mut vis = self.epoch.visible().0;
+        while pending.remove(&(vis + 1)) {
+            vis += 1;
+        }
+        if vis > self.epoch.visible().0 {
+            self.epoch.publish_visible(Epoch(vis));
+        }
     }
 
     /// Register a read snapshot at the current visible epoch and return it with
