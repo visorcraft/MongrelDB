@@ -3185,7 +3185,10 @@ impl Table {
         if conditions.is_empty() {
             return self.query_columns_native(conditions, projection, snapshot);
         }
-        let key = crate::query::canonical_query_key(conditions, projection, 0);
+        // The snapshot epoch is part of the key so two queries with identical
+        // conditions/projection but pinned at different snapshots never share a
+        // cached result (MVCC isolation for the explicit-snapshot API).
+        let key = crate::query::canonical_query_key(conditions, projection, snapshot.epoch.0);
         if let Some(hit) = self.result_cache.lock().get_columns(key) {
             return Ok(Some((*hit).clone()));
         }
