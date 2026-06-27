@@ -1,6 +1,7 @@
-//! P3.2 — concurrent writers, first-committer-wins conflict detection.
+//! P3.2/P3.3 — concurrent writers, conflict detection, generation-sealed flush.
 
 use mongreldb_core::{schema::*, Database, MongrelError, Value};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use tempfile::tempdir;
@@ -141,4 +142,44 @@ fn aborted_txn_consumes_no_epoch_and_visible_does_not_stall() {
     .unwrap();
     let vis2 = db.visible_epoch().0;
     assert!(vis2 > vis);
+}
+
+#[test]
+fn flush_under_concurrent_writes_loses_no_rows() {
+    use std::time::Duration;
+
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    db.create_table("t", pk_schema("v")).unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let total = Arc::new(AtomicU64::new(0));
+
+    let db_w = Arc::clone(&db);
+    let stop_w = Arc::clone(&stop);
+    let total_w = Arc::clone(&total);
+    let writer = thread::spawn(move || {
+        let mut i: i64 = 0;
+        while !stop_w.load(Ordering::Relaxed) {
+            db_w.transaction(|t| {
+                t.put("t", vec![(1, Value::Int64(i))])?;
+                Ok(())
+            })
+            .unwrap();
+            i += 1;
+            total_w.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+
+    for _ in 0..3 {
+        thread::sleep(Duration::from_millis(20));
+        let _ = db.table("t").unwrap().lock().flush();
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    writer.join().unwrap();
+
+    let expected = total.load(Ordering::Relaxed);
+    let actual = db.table("t").unwrap().lock().count();
+    assert_eq!(actual, expected, "rows lost during concurrent flush");
 }
