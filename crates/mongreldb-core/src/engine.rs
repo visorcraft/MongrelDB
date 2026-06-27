@@ -597,12 +597,15 @@ impl ResultCache {
 /// Derive WAL and cache DEKs from the KEK (None when no encryption).
 type DekaOpt = Option<Zeroizing<[u8; DEK_LEN]>>;
 
-fn derive_subkeys(kek: Option<&Kek>) -> (DekaOpt, DekaOpt) {
+fn derive_subkeys(kek: Option<&Kek>, table_id: u64) -> (DekaOpt, DekaOpt) {
     let _ = kek;
     #[cfg(feature = "encryption")]
     {
         if let Some(k) = kek {
-            return (Some(k.derive_wal_key()), Some(k.derive_cache_key()));
+            return (
+                Some(k.derive_table_wal_key(table_id)),
+                Some(k.derive_cache_key()),
+            );
         }
     }
     (None, None)
@@ -780,7 +783,7 @@ impl Table {
         std::fs::create_dir_all(dir.join(WAL_DIR))?;
         std::fs::create_dir_all(dir.join(RUNS_DIR))?;
         write_schema(&dir, &schema)?;
-        let (wal_dek, cache_dek) = derive_subkeys(ctx.kek.as_deref());
+        let (wal_dek, cache_dek) = derive_subkeys(ctx.kek.as_deref(), table_id);
         let mut wal = if let Some(ref dk) = wal_dek {
             Wal::create_with_cipher(
                 dir.join(WAL_DIR).join("seg-000000.wal"),
@@ -887,7 +890,7 @@ impl Table {
         let schema: Schema = read_schema(&dir)?;
         let active = latest_wal_segment(&dir.join(WAL_DIR))?;
         let replay_epoch = Epoch(manifest.current_epoch);
-        let (wal_dek, cache_dek) = derive_subkeys(ctx.kek.as_deref());
+        let (wal_dek, cache_dek) = derive_subkeys(ctx.kek.as_deref(), manifest.table_id);
         // Replay BEFORE truncating: `Wal::create` would erase the segment.
         let replayed = match &active {
             Some(path) => {
@@ -4608,7 +4611,7 @@ fn bulk_index_key(
     Some(encoded)
 }
 
-fn write_schema(dir: &Path, schema: &Schema) -> Result<()> {
+pub(crate) fn write_schema(dir: &Path, schema: &Schema) -> Result<()> {
     let json = serde_json::to_string_pretty(schema)
         .map_err(|e| MongrelError::Schema(format!("encode schema: {e}")))?;
     std::fs::write(dir.join(SCHEMA_FILENAME), json)?;

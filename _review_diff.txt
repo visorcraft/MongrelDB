@@ -1,0 +1,521 @@
+crates/mongreldb-core/src/database.rs              | 383 ++++++++++-
+ crates/mongreldb-core/src/encryption.rs            |  14 +
+ crates/mongreldb-core/src/engine.rs                | 224 +++++--
+ crates/mongreldb-core/src/lib.rs                   |   3 +-
+ crates/mongreldb-core/src/manifest.rs              |  93 ++-
+ crates/mongreldb-core/src/txn.rs                   |  82 +++
+ crates/mongreldb-core/src/wal.rs                   | 709 ++++++++++++++++++---
+ crates/mongreldb-core/tests/database_basic.rs      |   6 +-
+ crates/mongreldb-core/tests/recovery_multitable.rs | 151 +++++
+ crates/mongreldb-core/tests/txn_atomic.rs          |  64 ++
+ crates/mongreldb-core/tests/wal_shared.rs          |  95 +++
+ 11 files changed, 1667 insertions(+), 157 deletions(-)
+
+--- Changes ---
+
+crates/mongreldb-core/src/database.rs
+  @@ -26,8 +26,8 @@ pub const KEYS_FILENAME: &str = "keys";
+  -/// A multi-table database: one catalog, one epoch clock, shared caches, and a
+  -/// live map of name → `Arc<Table>`.
+  +/// A multi-table database: one catalog, one epoch clock, shared caches, a
+  +/// shared WAL, and a live map of name → `Arc<Table>`.
+   pub struct Database {
+       root: PathBuf,
+       catalog: RwLock<Catalog>,
+  @@ -36,6 +36,12 @@ pub struct Database {
+  +    /// One shared WAL multiplexing every table's records (spec §7.2). Owned
+  +    /// behind a `Mutex` so the transaction layer can append + group-sync.
+  +    shared_wal: Mutex<crate::wal::SharedWal>,
+  +    /// Monotonic per-open transaction-id counter. Scoped by `open_generation`
+  +    /// in P2.7; here it just needs to be unique within an open.
+  +    next_txn_id: Mutex<u64>,
+       tables: RwLock<HashMap<u64, TableHandle>>,
+       kek: Option<Arc<crate::encryption::Kek>>,
+       /// Serializes DDL (create/drop table); data commits serialize through
+  @@ -73,7 +79,7 @@ impl Database {
+  -        Self::finish_open(root, cat, kek, meta_dek)
+  +        Self::finish_open(root, cat, kek, meta_dek, false)
+       }
+   
+       /// Open an existing plaintext database.
+  @@ -102,7 +108,7 @@ impl Database {
+  -        Self::finish_open(root, cat, kek, meta_dek)
+  +        Self::finish_open(root, cat, kek, meta_dek, true)
+       }
+   
+       fn finish_open(
+  @@ -110,6 +116,7 @@ impl Database {
+  +        existing: bool,
+       ) -> Result<Self> {
+           let epoch = Arc::new(EpochAuthority::new(cat.db_epoch));
+           let snapshots = Arc::new(SnapshotRegistry::new());
+  @@ -120,8 +127,15 @@ impl Database {
+  +        let wal_dek = crate::encryption::wal_dek_for(kek.as_deref());
+  +        let shared_wal = Mutex::new(if existing {
+  +            crate::wal::SharedWal::open(&root, Epoch(cat.db_epoch), wal_dek.clone())?
+  +        } else {
+  +            crate::wal::SharedWal::create_with_dek(&root, Epoch(cat.db_epoch), wal_dek.clone())?
+  +        });
+   
+           // Open every live table against the shared context. Each `open_in`
+  +        // replays that table's PER-TABLE WAL (Table::put-style writes) and
+           // advances the shared epoch authority to its manifest epoch, so the
+           // final shared watermark is the max across all tables.
+           let mut tables: HashMap<u64, TableHandle> = HashMap::new();
+  @@ -142,6 +156,24 @@ impl Database {
+  +        // Recover transaction writes from the shared WAL (spec §15). The per-
+  +        // table WALs above already replayed `Table::put` writes; this pass
+  +        // applies committed cross-table transactions, gated by each table's
+  +        // `flushed_epoch` (records already durable in a run are not re-applied).
+  +        if existing {
+  +            recover_shared_wal(&root, &tables, &epoch, wal_dek.as_ref())?;
+  +        }
+  +
+  +        // Bump `open_generation` on every open and scope transaction ids by it
+  +        // (`txn_id = (generation << 32) | counter`), so ids never alias across
+  +        // reopens (review fix #11). Persist the bumped generation to the catalog.
+  +        let mut cat = cat;
+  +        if existing {
+  +            cat.open_generation = cat.open_generation.wrapping_add(1);
+  +            catalog::write_atomic(&root, &cat, meta_dek.as_ref())?;
+  +        }
+  +        let next_txn_id = (cat.open_generation << 32) | 1;
+  +
+           Ok(Self {
+               root,
+               catalog: RwLock::new(cat),
+  @@ -150,6 +182,8 @@ impl Database {
+  +            shared_wal,
+  +            next_txn_id: Mutex::new(next_txn_id),
+               tables: RwLock::new(tables),
+               kek,
+               ddl_lock: Mutex::new(()),
+  @@ -162,6 +196,129 @@ impl Database {
+  +    /// Resolve a table name → id (live tables only). pub(crate) so the
+  +    /// transaction layer can stage by name.
+  +    pub(crate) fn table_id(&self, name: &str) -> Result<u64> {
+  +        let cat = self.catalog.read();
+  +        cat.live(name)
+  +            .map(|e| e.table_id)
+  +            .ok_or_else(|| MongrelError::NotFound(format!("table {name:?} not found")))
+  +    }
+  +
+  +    /// Begin a new transaction reading at the current visible epoch.
+  +    pub fn begin(&self) -> crate::txn::Transaction<'_> {
+  +        let txn_id = self.alloc_txn_id();
+  +        let read = Snapshot::at(self.epoch.visible());
+  +        crate::txn::Transaction::new(self, txn_id, read)
+  +    }
+  +
+  +    /// Run `f` in a transaction; commit on `Ok`, rollback on `Err`.
+  +    pub fn transaction<T>(
+  +        &self,
+  +        f: impl FnOnce(&mut crate::txn::Transaction) -> Result<T>,
+  +    ) -> Result<T> {
+  +        let mut tx = self.begin();
+  +        match f(&mut tx) {
+  +            Ok(out) => {
+  +                tx.commit()?;
+  +                Ok(out)
+  +            }
+  +            Err(e) => {
+  +                tx.rollback();
+  +                Err(e)
+  +            }
+  +        }
+  +    }
+  +
+  +    /// Seal a transaction: serial commit under `commit_lock`, append to the
+  +    /// shared WAL, group-sync, apply to tables, persist manifests, publish.
+  +    /// Single-applier subset (P3 splits this into validate-first + group commit).
+  +    pub(crate) fn commit_transaction(
+  +        &self,
+  +        txn_id: u64,
+  +        staging: Vec<(u64, crate::txn::Staged)>,
+  +    ) -> Result<Epoch> {
+  +        use crate::memtable::Row;
+  +        use crate::txn::StagedOp;
+  +        use crate::wal::Op;
+  +
+  +        // Serial applier: the whole assign→fsync→publish is one critical
+  +        // section so the dual-counter publishes strictly in order.
+  +        let _g = self.commit_lock.lock();
+  +        let new_epoch = self.epoch.bump_assigned();
+  +
+  +        // Build rows (allocating ids) and append data records to the shared WAL
+  +        // BEFORE making anything visible.
+  +        let mut wal = self.shared_wal.lock();
+  +        let tables = self.tables.read();
+  +        let mut applies: Vec<(u64, Vec<StagedOp>)> = Vec::new();
+  +
+  +        for (table_id, staged) in staging {
+  +            let handle = tables
+  +                .get(&table_id)
+  +                .ok_or_else(|| MongrelError::NotFound(format!("table {table_id} not mounted")))?;
+  +            let mut t = handle.lock();
+  +            let mut ops = Vec::new();
+  +            match staged {
+  +                crate::txn::Staged::Put(cells) => {
+  +                    let row_id = t.alloc_row_id();
+  +                    let mut row = Row::new(row_id, new_epoch);
+  +                    for (c, v) in cells {
+  +                        row.columns.insert(c, v);
+  +                    }
+  +                    let payload = bincode::serialize(&vec![row.clone()])
+  +                        .map_err(|e| MongrelError::Other(format!("row serialize: {e}")))?;
+  +                    wal.append(
+  +                        txn_id,
+  +                        table_id,
+  +                        Op::Put {
+  +                            table_id,
+  +                            rows: payload,
+  +                        },
+  +                    )?;
+  +                    ops.push(StagedOp::Put(row));
+  +                }
+  +                crate::txn::Staged::Delete(rid) => {
+  +                    wal.append(
+  +                        txn_id,
+  +                        table_id,
+  +                        Op::Delete {
+  +                            table_id,
+  +                            row_ids: vec![rid],
+  +                        },
+  +                    )?;
+  +                    ops.push(StagedOp::Delete(rid));
+  +                }
+  +            }
+  +            applies.push((table_id, ops));
+  +        }
+  +
+  +        // Seal + group-fsync.
+  +        wal.append_commit(txn_id, new_epoch, &[])?;
+  +        let _durable_seq = wal.group_sync()?;
+  ... (23 lines truncated)
+  @@ -204,9 +361,14 @@ impl Database {
+  -    /// Create a new table. Allocates an id, writes the schema + empty manifest,
+  -    /// appends a catalog entry, and mounts the table.
+  +    /// Create a new table. The DDL is first logged to the shared WAL
+  +    /// (`Op::Ddl(CreateTable)` + `TxnCommit`) and group-synced so it is durable
+  +    /// BEFORE the in-memory catalog and table map are mutated; the catalog
+  +    /// checkpoint is rewritten afterwards (spec §15, review fix #16). A reopen
+  +    /// that sees a stale catalog still recovers the table by replaying the Ddl.
+       pub fn create_table(&self, name: &str, schema: Schema) -> Result<u64> {
+  +        use crate::wal::DdlOp;
+  +
+           let _g = self.ddl_lock.lock();
+           {
+               let cat = self.catalog.read();
+  @@ -216,10 +378,38 @@ impl Database {
+  -        let mut cat = self.catalog.write();
+  -        let table_id = cat.next_table_id;
+  -        cat.next_table_id += 1;
+  -        let created_epoch = self.epoch.visible().0;
+  +
+  +        // Allocate id + epoch + txn id under the commit lock so the DDL commit
+  +        // is serialized with data commits (in-order publish).
+  +        let commit_lock = Arc::clone(&self.commit_lock);
+  +        let _c = commit_lock.lock();
+  +        let table_id = {
+  +            let mut cat = self.catalog.write();
+  +            let id = cat.next_table_id;
+  +            cat.next_table_id += 1;
+  +            id
+  +        };
+  +        let epoch = self.epoch.bump_assigned();
+  +        let txn_id = self.alloc_txn_id();
+  +
+  +        // 1. Log the DDL + commit marker to the shared WAL and fsync (durable).
+  +        let schema_json = DdlOp::encode_schema(&schema)?;
+  +        {
+  +            let mut wal = self.shared_wal.lock();
+  +            wal.append(
+  +                txn_id,
+  +                table_id,
+  +                crate::wal::Op::Ddl(DdlOp::CreateTable {
+  +                    table_id,
+  +                    name: name.to_string(),
+  +                    schema_json,
+  +                }),
+  +            )?;
+  +            wal.append_commit(txn_id, epoch, &[])?;
+  +            wal.group_sync()?;
+  +        }
+  +
+  +        // 2. Create the on-disk table dir + manifest.
+           let tdir = self.root.join(TABLES_DIR).join(table_id.to_string());
+           std::fs::create_dir_all(&tdir)?;
+           let ctx = SharedCtx {
+  @@ -231,40 +421,79 @@ impl Database {
+  -        cat.tables.push(CatalogEntry {
+  -            table_id,
+  -            name: name.to_string(),
+  -            schema,
+  -            state: TableState::Live,
+  -            created_epoch,
+  -        });
+  -        catalog::write_atomic(&self.root, &cat, self.meta_dek.as_ref())?;
+  +
+  +        // 3. Mutate the in-memory catalog + mount the table, then rewrite the
+  +        //    catalog checkpoint (lazy: outside the WAL critical section).
+  +        {
+  +            let mut cat = self.catalog.write();
+  +            cat.tables.push(CatalogEntry {
+  +                table_id,
+  +                name: name.to_string(),
+  +                schema,
+  +                state: TableState::Live,
+  +                created_epoch: epoch.0,
+  +            });
+  +        }
+  +        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+           self.tables
+               .write()
+               .insert(table_id, Arc::new(Mutex::new(table)));
+  +
+  +        self.epoch.publish_visible(epoch);
+           Ok(table_id)
+       }
+   
+  -    /// Logically drop a table. Its rows become unqueryable immediately; the
+  -    /// physical subdir is reaped later by the retention-gated GC (P3.6).
+  +    /// Logically drop a table, logging the DDL through the shared WAL first.
+       pub fn drop_table(&self, name: &str) -> Result<()> {
+  +        use crate::wal::DdlOp;
+  +
+           let _g = self.ddl_lock.lock();
+  -        let mut cat = self.catalog.write();
+  -        let entry = cat
+  -            .tables
+  -            .iter_mut()
+  -            .find(|t| t.name == name && matches!(t.state, TableState::Live))
+  -            .ok_or_else(|| MongrelError::NotFound(format!("table {name:?} not found")))?;
+  -        let id = entry.table_id;
+  -        entry.state = TableState::Dropped {
+  -            at_epoch: self.epoch.visible().0,
+  +        let table_id = {
+  +            let cat = self.catalog.read();
+  +            cat.live(name)
+  +                .ok_or_else(|| MongrelError::NotFound(format!("table {name:?} not found")))?
+  +                .table_id
+           };
+  -        catalog::write_atomic(&self.root, &cat, self.meta_dek.as_ref())?;
+  -        drop(cat);
+  -        self.tables.write().remove(&id);
+  +
+  +        let commit_lock = Arc::clone(&self.commit_lock);
+  +        let _c = commit_lock.lock();
+  +        let epoch = self.epoch.bump_assigned();
+  +        let txn_id = self.alloc_txn_id();
+  +        {
+  +            let mut wal = self.shared_wal.lock();
+  +            wal.append(
+  +                txn_id,
+  +                table_id,
+  +                crate::wal::Op::Ddl(DdlOp::DropTable { table_id }),
+  +            )?;
+  +            wal.append_commit(txn_id, epoch, &[])?;
+  +            wal.group_sync()?;
+  +        }
+  +
+  +        {
+  +            let mut cat = self.catalog.write();
+  +            let entry = cat
+  +                .tables
+  +                .iter_mut()
+  +                .find(|t| t.table_id == table_id)
+  +                .ok_or_else(|| MongrelError::NotFound(format!("table {name:?} not found")))?;
+  +            entry.state = TableState::Dropped { at_epoch: epoch.0 };
+  +        }
+  +        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+  +        self.tables.write().remove(&table_id);
+  +
+  +        self.epoch.publish_visible(epoch);
+           Ok(())
+       }
+   
+  +    /// Allocate the next generation-scoped transaction id.
+  +    fn alloc_txn_id(&self) -> u64 {
+  +        let mut g = self.next_txn_id.lock();
+  +        let id = *g;
+  +        *g = g.wrapping_add(1);
+  +        id
+  +    }
+  +
+       /// The DB-wide KEK (if encrypted).
+       #[allow(dead_code)]
+       pub(crate) fn kek(&self) -> Option<&Arc<crate::encryption::Kek>> {
+  @@ -283,3 +512,93 @@ impl Database {
+  +
+  +/// Two-pass, `flushed_epoch`-gated recovery of the shared WAL (spec §15).
+  +///
+  +/// Pass 1 scans every `TxnCommit` marker and records `txn_id → commit_epoch`
+  +/// (the per-txn outcome; aborted / in-flight / torn-tail txns are absent). Pass
+  +/// 2 applies each committed data record (Put/Delete) to its table at the commit
+  +/// epoch, skipping records whose `commit_epoch <= table.flushed_epoch` (already
+  +/// durable in a sorted run). Finally the shared epoch authority is raised to the
+  +/// max committed epoch so the next commit continues monotonically.
+  +fn recover_shared_wal(
+  +    root: &Path,
+  +    tables: &HashMap<u64, TableHandle>,
+  +    epoch: &EpochAuthority,
+  +    wal_dek: Option<&zeroize::Zeroizing<[u8; 32]>>,
+  +) -> Result<()> {
+  +    use crate::memtable::Row;
+  +    use crate::rowid::RowId;
+  +    use crate::wal::{Op, SharedWal};
+  +
+  +    let records = SharedWal::replay_with_dek(root, wal_dek)?;
+  +
+  +    // Pass 1: committed-txn outcomes.
+  +    let mut committed: HashMap<u64, u64> = HashMap::new();
+  +    for r in &records {
+  +        if let Op::TxnCommit { epoch: ce, .. } = r.op {
+  +            committed.insert(r.txn_id, ce);
+  +        }
+  +    }
+  +
+  +    // Pass 2: stage data per table, gated by flushed_epoch.
+  +    type TableStage = (Vec<Row>, Vec<(RowId, Epoch)>);
+  +    let mut stage: HashMap<u64, TableStage> = HashMap::new();
+  +    let mut max_epoch = epoch.visible().0;
+  +    for r in records {
+  +        let Some(&ce) = committed.get(&r.txn_id) else {
+  +            continue; // aborted / in-flight — discard
+  +        };
+  +        let commit_epoch = Epoch(ce);
+  +        max_epoch = max_epoch.max(ce);
+  +        match r.op {
+  +            Op::Put { table_id, rows } => {
+  +                // Skip if this table already flushed past the commit epoch.
+  +                let skip = tables
+  +                    .get(&table_id)
+  +                    .map(|h| h.lock().flushed_epoch() >= ce)
+  +                    .unwrap_or(true);
+  +                if skip {
+  +                    continue;
+  +                }
+  +                let rows: Vec<Row> = match bincode::deserialize(&rows) {
+  +                    Ok(v) => v,
+  +                    Err(_) => continue,
+  +                };
+  +                // Re-stamp each row at the txn commit epoch (rows are pre-stamped
+  +                // at pending_epoch which equals the commit epoch, but be robust).
+  +                let rows: Vec<Row> = rows
+  +                    .into_iter()
+  +                    .map(|mut row| {
+  +                        row.committed_epoch = commit_epoch;
+  +                        row
+  +                    })
+  +                    .collect();
+  +                stage.entry(table_id).or_default().0.extend(rows);
+  +            }
+  +            Op::Delete { table_id, row_ids } => {
+  +                let skip = tables
+  +                    .get(&table_id)
+  +                    .map(|h| h.lock().flushed_epoch() >= ce)
+  +                    .unwrap_or(true);
+  +                if skip {
+  +                    continue;
+  +                }
+  +                let dels = row_ids.into_iter().map(|rid| (rid, commit_epoch));
+  +                stage.entry(table_id).or_default().1.extend(dels);
+  +            }
+  +            _ => {}
+  +        }
+  +    }
+  +
+  +    for (table_id, (rows, deletes)) in stage {
+  +        let Some(handle) = tables.get(&table_id) else {
+  +            continue;
+  +        };
+  +        let mut t = handle.lock();
+  +        t.recover_apply(rows, deletes)?;
+  +    }
+  +
+  +    epoch.advance_recovered(Epoch(max_epoch));
+  +    Ok(())
+  +}
+  +351 -32
+
+crates/mongreldb-core/src/encryption.rs
+  @@ -14,6 +14,8 @@ use crate::error::Result;
+  +#[cfg(feature = "encryption")]
+  +use zeroize::Zeroizing;
+   
+   /// DEK length (AES-256 = 32 bytes). Always available.
+   pub const DEK_LEN: usize = 32;
+  @@ -620,6 +622,18 @@ pub fn meta_dek_for(_kek: Option<&Kek>) -> Option<[u8; DEK_LEN]> {
+  +/// Derive the shared-WAL frame DEK from an optional KEK. `None` when the KEK is
+  +/// absent or encryption is disabled.
+  +#[cfg(feature = "encryption")]
+  +pub fn wal_dek_for(kek: Option<&Kek>) -> Option<Zeroizing<[u8; DEK_LEN]>> {
+  +    kek.map(|k| k.derive_wal_key())
+  +}
+  +
+  +#[cfg(not(feature = "encryption"))]
+  +pub fn wal_dek_for(_kek: Option<&Kek>) -> Option<zeroize::Zeroizing<[u8; DEK_LEN]>> {
+  +    None
+  +}
+  +
+   #[cfg(test)]
+   mod tests {
+       use super::*;
+  +14 -0
+
+crates/mongreldb-core/src/engine.rs
+  @@ -75,6 +75,11 @@ pub struct Table {
+  +    /// Next transaction id to assign to a single-table auto-commit txn
+  +    /// (`put`/`delete` then `commit`). 0 is reserved for [`wal::SYSTEM_TXN_ID`].
+  +    /// The Database transaction layer (P2.5) assigns these globally; the
+  +    /// single-table path uses this local counter.
+  +    current_txn_id: u64,
+       bitmap: HashMap<u16, BitmapIndex>,
+       ann: HashMap<u16, AnnIndex>,
+       fm: HashMap<u16, FmIndex>,
+  @@ -108,6 +113,9 @@ pub struct Table {
+  +    /// Highest epoch whose data is durable in a sorted run (spec §7.1). Recovery
+  +    /// skips replaying WAL records whose commit epoch is `<= flushed_epoch`.
+  +    flushed_epoch: u64,
+       /// Shared, MVCC content-addressed page cache (Phase 9.2). Fed by every
+       /// `RunReader::read_page` so all readers share raw (decrypted) page bytes.
+       page_cache: Arc<parking_lot::Mutex<crate::cache::PageCache>>,
+  @@ -778,13 +786,14 @@ impl Table {
+  +                0,
+               )?
+           } else {
+               Wal::create(dir.join(WAL_DIR).join("seg-000000.wal"), Epoch(0))?
+           };
+           wal.set_sync_byte_threshold(DEFAULT_SYNC_BYTE_THRESHOLD);
+           let mut manifest = Manifest::new(table_id, schema.schema_id);
+  -        manifest::write_atomic(&dir, &mut manifest)?;
+  +        manifest::write_atomic(&dir, &mut manifest, None)?;
+           let (bitmap, ann, fm, sparse) = empty_indexes(&schema);
+           let column_keys = build_column_keys(ctx.kek.as_deref(), &schema);
+           let rcache_dir = dir.join(RCACHE_DIR);
+  @@ -806,6 +815,7 @@ impl Table {
+  +            current_txn_id: 1,
+               bitmap,
+               ann,
+               fm,
+  @@ -818,6 +828,7 @@ impl Table {
+  +            flushed_epoch: 0,
+               page_cache: ctx.page_cache,
+               decoded_cache: ctx.decoded_cache,
+               snapshots: ctx.snapshots,
+  @@ -871,7 +882,8 @@ impl Table {
+  -        let manifest = manifest::read(&dir)?;
+  +        let manifest_meta_dek = crate::encryption::meta_dek_for(ctx.kek.as_deref());
+  +        let manifest = manifest::read(&dir, manifest_meta_dek.as_ref())?;
+           let schema: Schema = read_schema(&dir)?;
+           let active = latest_wal_segment(&dir.join(WAL_DIR))?;
+           let replay_epoch = Epoch(manifest.current_epoch);
+  @@ -889,11 +901,13 @@ impl Table {
+  +                0,
+               )?,
+               None => Wal::create_with_cipher(
+                   dir.join(WAL_DIR).join("seg-000000.wal"),
+
+... (more changes truncated)
+  +15 -2
+[full diff: rtk git diff --no-compact]

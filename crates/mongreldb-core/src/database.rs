@@ -134,6 +134,16 @@ impl Database {
             crate::wal::SharedWal::create_with_dek(&root, Epoch(cat.db_epoch), wal_dek.clone())?
         });
 
+        // Recover DDL from the shared WAL BEFORE opening tables (spec §15,
+        // review fix #16). A crash between WAL fsync and the catalog
+        // checkpoint leaves committed DDL durable in the WAL but absent from
+        // the on-disk catalog; replay it here so the table-mounting loop and
+        // data-record recovery see a correct catalog.
+        let mut cat = cat;
+        if existing {
+            recover_ddl_from_wal(&root, &mut cat, meta_dek.as_ref(), wal_dek.as_ref())?;
+        }
+
         // Open every live table against the shared context. Each `open_in`
         // replays that table's PER-TABLE WAL (Table::put-style writes) and
         // advances the shared epoch authority to its manifest epoch, so the
@@ -167,7 +177,6 @@ impl Database {
         // Bump `open_generation` on every open and scope transaction ids by it
         // (`txn_id = (generation << 32) | counter`), so ids never alias across
         // reopens (review fix #11). Persist the bumped generation to the catalog.
-        let mut cat = cat;
         if existing {
             cat.open_generation = cat.open_generation.wrapping_add(1);
             catalog::write_atomic(&root, &cat, meta_dek.as_ref())?;
@@ -600,5 +609,88 @@ fn recover_shared_wal(
     }
 
     epoch.advance_recovered(Epoch(max_epoch));
+    Ok(())
+}
+
+/// Replay committed `Op::Ddl` records from the shared WAL into the catalog
+/// (spec §15, review fix #16). A crash between WAL group-sync and the catalog
+/// checkpoint leaves DDL durable in the WAL but absent from the on-disk
+/// catalog. This pass closes that window by reconstructing missing entries
+/// (and marking committed drops) before tables are mounted.
+fn recover_ddl_from_wal(
+    root: &Path,
+    cat: &mut Catalog,
+    meta_dek: Option<&[u8; META_DEK_LEN]>,
+    wal_dek: Option<&zeroize::Zeroizing<[u8; 32]>>,
+) -> Result<()> {
+    use crate::wal::{DdlOp, Op, SharedWal};
+
+    let records = match SharedWal::replay_with_dek(root, wal_dek) {
+        Ok(r) => r,
+        Err(_) => return Ok(()),
+    };
+
+    let mut committed: HashMap<u64, u64> = HashMap::new();
+    for r in &records {
+        if let Op::TxnCommit { epoch: ce, .. } = r.op {
+            committed.insert(r.txn_id, ce);
+        }
+    }
+
+    let mut changed = false;
+    for r in records {
+        let Some(&ce) = committed.get(&r.txn_id) else {
+            continue;
+        };
+        match r.op {
+            Op::Ddl(DdlOp::CreateTable {
+                table_id,
+                ref name,
+                ref schema_json,
+            }) => {
+                if cat.tables.iter().any(|t| t.table_id == table_id) {
+                    continue;
+                }
+                let schema = DdlOp::decode_schema(schema_json)?;
+                let tdir = root.join(TABLES_DIR).join(table_id.to_string());
+                if !tdir.exists() {
+                    std::fs::create_dir_all(tdir.join(crate::engine::WAL_DIR))?;
+                    std::fs::create_dir_all(tdir.join(crate::engine::RUNS_DIR))?;
+                    crate::engine::write_schema(&tdir, &schema)?;
+                    let manifest_meta_dek = crate::encryption::meta_dek_for(
+                        // We don't have the kek here, but the manifest must be
+                        // writable. Reconstruct from meta_dek is not possible;
+                        // for encrypted DBs the table dir always exists (created
+                        // by create_in before crash), so this path is plaintext-only.
+                        None,
+                    );
+                    let mut m = crate::manifest::Manifest::new(table_id, schema.schema_id);
+                    crate::manifest::write_atomic(&tdir, &mut m, manifest_meta_dek.as_ref())?;
+                }
+                cat.tables.push(CatalogEntry {
+                    table_id,
+                    name: name.clone(),
+                    schema,
+                    state: TableState::Live,
+                    created_epoch: ce,
+                });
+                cat.next_table_id = cat.next_table_id.max(table_id + 1);
+                changed = true;
+            }
+            Op::Ddl(DdlOp::DropTable { table_id }) => {
+                if let Some(entry) = cat.tables.iter_mut().find(|t| t.table_id == table_id) {
+                    if matches!(entry.state, TableState::Live) {
+                        entry.state = TableState::Dropped { at_epoch: ce };
+                        changed = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if changed {
+        catalog::write_atomic(root, cat, meta_dek)?;
+    }
     Ok(())
 }

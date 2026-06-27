@@ -149,3 +149,69 @@ fn ddl_is_durable_via_wal_before_catalog_checkpoint() {
     assert!(db.table_names().iter().any(|n| n == "orders"));
     assert_eq!(db.table("orders").unwrap().lock().count(), 1);
 }
+
+#[test]
+fn ddl_recovered_from_wal_when_catalog_checkpoint_is_stale() {
+    // Simulate a crash between WAL group-sync and the catalog checkpoint by
+    // overwriting the catalog with the pre-DDL (empty) state. The table dir
+    // exists on disk, but the catalog doesn't know about it. Reopen MUST
+    // recover the table by replaying the committed Op::Ddl(CreateTable).
+    use mongreldb_core::catalog;
+
+    let dir = tempdir().unwrap();
+    {
+        let db = Database::create(dir.path()).unwrap();
+        db.create_table("recovered", one_int_schema()).unwrap();
+        db.transaction(|t| {
+            t.put("recovered", vec![(1, Value::Int64(42))])?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    // Stomp the catalog back to empty (simulating a checkpoint that never landed).
+    let empty = catalog::Catalog::empty();
+    catalog::write_atomic(dir.path(), &empty, None).unwrap();
+
+    // Reopen: DDL replay should recover the table.
+    let db = Database::open(dir.path()).unwrap();
+    assert!(
+        db.table_names().iter().any(|n| n == "recovered"),
+        "table must be recovered from WAL DDL replay"
+    );
+    assert_eq!(db.table("recovered").unwrap().lock().count(), 1);
+}
+
+#[test]
+fn drop_table_recovered_from_wal_when_catalog_checkpoint_is_stale() {
+    // Symmetric: if the DropTable DDL was committed to the WAL but the catalog
+    // checkpoint didn't land, reopen must NOT show the table as live.
+    use mongreldb_core::catalog;
+
+    let dir = tempdir().unwrap();
+    let pre_drop_catalog = {
+        let db = Database::create(dir.path()).unwrap();
+        db.create_table("doomed", one_int_schema()).unwrap();
+        db.transaction(|t| {
+            t.put("doomed", vec![(1, Value::Int64(1))])?;
+            Ok(())
+        })
+        .unwrap();
+
+        // Snapshot the pre-drop catalog so we can restore it (simulating the
+        // checkpoint landing BEFORE the drop checkpoint).
+        let cat = catalog::read(dir.path(), None).unwrap().unwrap();
+        db.drop_table("doomed").unwrap();
+        cat
+    };
+
+    // Restore the pre-drop catalog (stale: table still Live in catalog, but
+    // DropTable is durable in the WAL).
+    catalog::write_atomic(dir.path(), &pre_drop_catalog, None).unwrap();
+
+    let db = Database::open(dir.path()).unwrap();
+    assert!(
+        !db.table_names().iter().any(|n| n == "doomed"),
+        "DropTable must be recovered from WAL DDL replay"
+    );
+}

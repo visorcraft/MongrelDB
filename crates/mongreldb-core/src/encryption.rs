@@ -172,6 +172,22 @@ mod key {
             self.derive_subkey(b"mongreldb/wal/v1")
         }
 
+        /// Derive the shared (multi-table) WAL DEK — domain-separated from the
+        /// per-table WAL so the two logs never share key+nonce space under the
+        /// same KEK (review fix from P2 peer review).
+        pub fn derive_shared_wal_key(&self) -> Zeroizing<[u8; DEK_LEN]> {
+            self.derive_subkey(b"mongreldb/swal/v1")
+        }
+
+        /// Derive a per-table WAL DEK unique to `table_id`, so no two tables
+        /// share the same DEK even under the same KEK.
+        pub fn derive_table_wal_key(&self, table_id: u64) -> Zeroizing<[u8; DEK_LEN]> {
+            let mut info = b"mongreldb/twal/".to_vec();
+            info.extend_from_slice(&table_id.to_be_bytes());
+            info.extend_from_slice(b"/v1");
+            self.derive_subkey(&info)
+        }
+
         /// Derive a result-cache DEK from this KEK for cache file AEAD.
         pub fn derive_cache_key(&self) -> Zeroizing<[u8; DEK_LEN]> {
             self.derive_subkey(b"mongreldb/rcache/v1")
@@ -626,7 +642,7 @@ pub fn meta_dek_for(_kek: Option<&Kek>) -> Option<[u8; DEK_LEN]> {
 /// absent or encryption is disabled.
 #[cfg(feature = "encryption")]
 pub fn wal_dek_for(kek: Option<&Kek>) -> Option<Zeroizing<[u8; DEK_LEN]>> {
-    kek.map(|k| k.derive_wal_key())
+    kek.map(|k| k.derive_shared_wal_key())
 }
 
 #[cfg(not(feature = "encryption"))]
@@ -859,5 +875,25 @@ mod tests {
             setup_run_encryption(&kek, &[(1, SCHEME_HMAC_EQ), (2, SCHEME_OPE_RANGE)]).unwrap();
         let built = build_run_cipher(&kek, &enc.descriptor_bytes).unwrap();
         assert_eq!(built.nonce_prefix, enc.nonce_prefix);
+    }
+
+    /// The shared WAL, per-table WAL, and per-table-2 WAL must all derive
+    /// DISTINCT DEKs under the same KEK — otherwise two WAL files sharing the
+    /// same key + the same `segment_no=0` nonce space is catastrophic AES-GCM
+    /// nonce reuse (review fix from P2 peer review).
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn wal_deks_are_domain_separated() {
+        let salt = random_salt();
+        let k = Kek::derive("pass", &salt).unwrap();
+        let shared = k.derive_shared_wal_key();
+        let tbl1 = k.derive_table_wal_key(1);
+        let tbl2 = k.derive_table_wal_key(2);
+        let legacy = k.derive_wal_key();
+        assert_ne!(shared.as_ref(), tbl1.as_ref(), "shared != table1");
+        assert_ne!(shared.as_ref(), tbl2.as_ref(), "shared != table2");
+        assert_ne!(shared.as_ref(), legacy.as_ref(), "shared != legacy");
+        assert_ne!(tbl1.as_ref(), tbl2.as_ref(), "table1 != table2");
+        assert_ne!(tbl1.as_ref(), legacy.as_ref(), "table1 != legacy");
     }
 }
