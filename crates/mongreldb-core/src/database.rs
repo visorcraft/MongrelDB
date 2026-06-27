@@ -57,11 +57,14 @@ pub struct Database {
     decoded_cache: Arc<parking_lot::Mutex<crate::cache::DecodedPageCache>>,
     commit_lock: Arc<Mutex<()>>,
     /// One shared WAL multiplexing every table's records (spec §7.2). Owned
-    /// behind a `Mutex` so the transaction layer can append + group-sync.
-    shared_wal: Mutex<crate::wal::SharedWal>,
+    /// behind a `Mutex` so the transaction layer can append + group-sync. Shared
+    /// (via `Arc`) with every mounted `Table` so single-table `put`/`commit`
+    /// writes also land in this one WAL (B1 — one WAL per database).
+    shared_wal: Arc<Mutex<crate::wal::SharedWal>>,
     /// Monotonic per-open transaction-id counter. Scoped by `open_generation`
-    /// in P2.7; here it just needs to be unique within an open.
-    next_txn_id: Mutex<u64>,
+    /// in P2.7; here it just needs to be unique within an open. Shared with
+    /// mounted tables so their auto-commit txn ids never alias cross-table ones.
+    next_txn_id: Arc<Mutex<u64>>,
     tables: RwLock<HashMap<u64, TableHandle>>,
     kek: Option<Arc<crate::encryption::Kek>>,
     /// Serializes DDL (create/drop table); data commits serialize through
@@ -78,11 +81,12 @@ pub struct Database {
     /// pruning (spec §9.2, review fix #12).
     active_txns: crate::txn::ActiveTxns,
     /// P3.2: set on fsync error — all subsequent writes fail fast (spec §9.3e).
-    poisoned: std::sync::atomic::AtomicBool,
+    /// Shared with mounted tables so a single-table commit also honors poison.
+    poisoned: Arc<std::sync::atomic::AtomicBool>,
     /// P3.2: group-commit coordinator. The sequencer appends under the WAL lock
     /// but defers the fsync to one leader here, so concurrent commits share a
-    /// single fsync (spec §9.3).
-    group: crate::txn::GroupCommit,
+    /// single fsync (spec §9.3). Shared with mounted tables.
+    group: Arc<crate::txn::GroupCommit>,
     /// P3.6: txn ids currently spilling into `_txn/<id>/`. GC never deletes a
     /// live spill's pending dir (review fix #14, spec §6.4).
     active_spills: Arc<crate::retention::ActiveSpills>,
@@ -171,11 +175,22 @@ impl Database {
         ));
         let commit_lock = Arc::new(Mutex::new(()));
         let wal_dek = crate::encryption::wal_dek_for(kek.as_deref());
-        let shared_wal = Mutex::new(if existing {
+        let shared_wal = Arc::new(Mutex::new(if existing {
             crate::wal::SharedWal::open(&root, Epoch(cat.db_epoch), wal_dek.clone())?
         } else {
             crate::wal::SharedWal::create_with_dek(&root, Epoch(cat.db_epoch), wal_dek.clone())?
-        });
+        }));
+        // Shared write-path state handed to every mounted table so single-table
+        // `put`/`commit` writes route through the one shared WAL, the one group-
+        // commit coordinator, and the one poison flag (B1).
+        let poisoned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let group = Arc::new(crate::txn::GroupCommit::new(
+            shared_wal.lock().durable_seq(),
+        ));
+        // Final base value is set after the open-generation bump below; tables
+        // only draw ids once the user issues a write (post-open), so the
+        // placeholder is never observed.
+        let txn_ids = Arc::new(Mutex::new(1u64));
 
         // Recover DDL from the shared WAL BEFORE opening tables (spec §15,
         // review fix #16). A crash between WAL fsync and the catalog
@@ -187,10 +202,11 @@ impl Database {
             recover_ddl_from_wal(&root, &mut cat, meta_dek.as_ref(), wal_dek.as_ref())?;
         }
 
-        // Open every live table against the shared context. Each `open_in`
-        // replays that table's PER-TABLE WAL (Table::put-style writes) and
+        // Open every live table against the shared context. Mounted tables have
+        // no private WAL (B1) — `open_in` just loads the manifest/runs and
         // advances the shared epoch authority to its manifest epoch, so the
-        // final shared watermark is the max across all tables.
+        // final shared watermark is the max across all tables. All of a mounted
+        // table's committed records are replayed below from the shared WAL.
         let mut tables: HashMap<u64, TableHandle> = HashMap::new();
         for entry in &cat.tables {
             if !matches!(entry.state, TableState::Live) {
@@ -204,15 +220,22 @@ impl Database {
                 snapshots: Arc::clone(&snapshots),
                 kek: kek.clone(),
                 commit_lock: Arc::clone(&commit_lock),
+                shared: Some(crate::engine::SharedWalCtx {
+                    wal: Arc::clone(&shared_wal),
+                    group: Arc::clone(&group),
+                    poisoned: Arc::clone(&poisoned),
+                    txn_ids: Arc::clone(&txn_ids),
+                }),
             };
             let t = Table::open_in(&tdir, ctx)?;
             tables.insert(entry.table_id, Arc::new(Mutex::new(t)));
         }
 
-        // Recover transaction writes from the shared WAL (spec §15). The per-
-        // table WALs above already replayed `Table::put` writes; this pass
-        // applies committed cross-table transactions, gated by each table's
-        // `flushed_epoch` (records already durable in a run are not re-applied).
+        // Recover transaction writes from the shared WAL (spec §15). This is the
+        // single durability source for mounted tables: it applies every committed
+        // record — both single-table `Table::commit` writes and cross-table
+        // transactions — gated by each table's `flushed_epoch` (records already
+        // durable in a run are not re-applied).
         if existing {
             recover_shared_wal(&root, &tables, &epoch, wal_dek.as_ref())?;
             // P3.4: sweep stale `_txn/<txn_id>/` dirs left by aborted/crashed
@@ -228,8 +251,9 @@ impl Database {
             catalog::write_atomic(&root, &cat, meta_dek.as_ref())?;
         }
         let next_txn_id = (cat.open_generation << 32) | 1;
+        // Seed the shared txn-id allocator now that the generation is final.
+        *txn_ids.lock() = next_txn_id;
 
-        let initial_durable = shared_wal.lock().durable_seq();
         Ok(Self {
             root,
             catalog: RwLock::new(cat),
@@ -239,15 +263,15 @@ impl Database {
             decoded_cache,
             commit_lock,
             shared_wal,
-            next_txn_id: Mutex::new(next_txn_id),
+            next_txn_id: txn_ids,
             tables: RwLock::new(tables),
             kek,
             ddl_lock: Mutex::new(()),
             meta_dek,
             conflicts: crate::txn::ConflictIndex::new(),
             active_txns: crate::txn::ActiveTxns::new(),
-            poisoned: std::sync::atomic::AtomicBool::new(false),
-            group: crate::txn::GroupCommit::new(initial_durable),
+            poisoned,
+            group,
             spill_threshold: std::sync::atomic::AtomicU64::new(64 * 1024 * 1024),
             active_spills: Arc::new(crate::retention::ActiveSpills::new()),
             spill_hook: Mutex::new(None),
@@ -464,6 +488,37 @@ impl Database {
             }
         }
 
+        // ── 1c. Pre-build non-spilled put rows OUTSIDE the WAL critical section.
+        // Allocating row ids + building the rows here (lock order: table handle →
+        // nothing) means the sequencer never locks a table handle while holding
+        // the shared-WAL mutex. That matters because `Table::commit`/`flush` lock
+        // the table handle THEN the shared WAL; if the sequencer did the reverse
+        // (WAL then handle) the two paths would deadlock (review fix: B1).
+        // Aligned 1:1 with `staging`; `None` for deletes and spilled puts.
+        // Row ids are allocated here, before the sequencer's delta conflict
+        // re-check, so a losing txn leaks the ids it reserved — harmless, the
+        // u64 row-id space is monotonic and gaps are expected (spills do the same).
+        let mut prebuilt: Vec<Option<Row>> = Vec::with_capacity(staging.len());
+        {
+            let tables = self.tables.read();
+            for (table_id, staged) in &staging {
+                match staged {
+                    Staged::Put(cells) if !spilled_tables.contains(table_id) => {
+                        let handle = tables.get(table_id).ok_or_else(|| {
+                            MongrelError::NotFound(format!("table {table_id} not mounted"))
+                        })?;
+                        let row_id = handle.lock().alloc_row_id();
+                        let mut row = Row::new(row_id, Epoch(0));
+                        for (c, v) in cells {
+                            row.columns.insert(*c, v.clone());
+                        }
+                        prebuilt.push(Some(row));
+                    }
+                    _ => prebuilt.push(None),
+                }
+            }
+        }
+
         // ── 2. Sequencer: validate-first → assign → append → sync → record ──
         let added_runs: Vec<crate::wal::AddedRun> = spilled
             .iter()
@@ -502,27 +557,20 @@ impl Database {
             }
 
             let new_epoch = self.epoch.bump_assigned();
-            let tables = self.tables.read();
             let mut applies: Vec<(u64, Vec<StagedOp>)> = Vec::new();
 
-            for (table_id, staged) in &staging {
+            for (idx, (table_id, staged)) in staging.iter().enumerate() {
                 // Skip puts for tables that were spilled — their data is in a
                 // pending run, not in streamed Put records.
                 if spilled_tables.contains(table_id) && matches!(staged, Staged::Put(_)) {
                     continue;
                 }
-                let handle = tables.get(table_id).ok_or_else(|| {
-                    MongrelError::NotFound(format!("table {table_id} not mounted"))
-                })?;
-                let mut t = handle.lock();
                 let mut ops = Vec::new();
                 match staged {
-                    Staged::Put(cells) => {
-                        let row_id = t.alloc_row_id();
-                        let mut row = Row::new(row_id, new_epoch);
-                        for (c, v) in cells {
-                            row.columns.insert(*c, v.clone());
-                        }
+                    Staged::Put(_) => {
+                        // Stamp the pre-built row at the real assigned epoch.
+                        let mut row = prebuilt[idx].take().expect("prebuilt put row");
+                        row.committed_epoch = new_epoch;
                         let payload = bincode::serialize(&vec![row.clone()])
                             .map_err(|e| MongrelError::Other(format!("row serialize: {e}")))?;
                         wal.append(
@@ -742,6 +790,12 @@ impl Database {
             snapshots: Arc::clone(&self.snapshots),
             kek: self.kek.clone(),
             commit_lock: Arc::clone(&self.commit_lock),
+            shared: Some(crate::engine::SharedWalCtx {
+                wal: Arc::clone(&self.shared_wal),
+                group: Arc::clone(&self.group),
+                poisoned: Arc::clone(&self.poisoned),
+                txn_ids: Arc::clone(&self.next_txn_id),
+            }),
         };
         let table = Table::create_in(&tdir, schema.clone(), table_id, ctx)?;
 

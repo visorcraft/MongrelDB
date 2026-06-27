@@ -241,6 +241,45 @@ fn group_commit_batches_fsyncs_under_concurrency() {
 }
 
 #[test]
+fn single_table_commit_is_not_visible_before_its_commit_epoch() {
+    // B2 (subsumed by B1): a mounted table's `put` must not stamp rows at a
+    // speculative `visible+1` epoch. Here table A stages a put, then table B's
+    // commits advance the shared clock; A's uncommitted row must remain invisible
+    // (not counted) until A actually commits — no reader can observe it early.
+    let dir = tempdir().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.create_table("a", pk_schema("v")).unwrap();
+    db.create_table("b", pk_schema("v")).unwrap();
+
+    // Stage a put on A but DO NOT commit it.
+    {
+        let h = db.table("a").unwrap();
+        let mut g = h.lock();
+        g.put(vec![(1, Value::Int64(100))]).unwrap();
+    }
+
+    // Advance the shared clock well past A's would-be speculative epoch.
+    for i in 0..5 {
+        let h = db.table("b").unwrap();
+        let mut g = h.lock();
+        g.put(vec![(1, Value::Int64(i))]).unwrap();
+        g.commit().unwrap();
+    }
+
+    // A's row is still uncommitted → invisible (the old speculative-epoch bug
+    // would have made it visible once the shared clock passed visible+1).
+    assert_eq!(
+        db.table("a").unwrap().lock().count(),
+        0,
+        "uncommitted row must not be visible before its commit epoch"
+    );
+
+    // Commit A; now (and only now) the row is visible.
+    db.table("a").unwrap().lock().commit().unwrap();
+    assert_eq!(db.table("a").unwrap().lock().count(), 1);
+}
+
+#[test]
 fn poisoned_db_fails_data_and_ddl_writes_fast() {
     // P3.2 §9.3e: once an fsync error poisons the DB, every subsequent write —
     // including DDL — must fail fast so no later fsync can retroactively make an

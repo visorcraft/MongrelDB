@@ -20,10 +20,12 @@ use crate::mutable_run::MutableRun;
 use crate::rowid::{RowId, RowIdAllocator};
 use crate::schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
 use crate::sorted_run::{RunReader, RunWriter};
-use crate::wal::{Op, Wal};
+use crate::txn::GroupCommit;
+use crate::wal::{Op, SharedWal, Wal};
 use crate::{MongrelError, Result};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use zeroize::Zeroizing;
 
@@ -46,7 +48,7 @@ const DEFAULT_MUTABLE_RUN_SPILL_BYTES: u64 = 8 * 1024 * 1024;
 pub struct Table {
     dir: PathBuf,
     table_id: u64,
-    wal: Wal,
+    wal: WalSink,
     memtable: Memtable,
     /// PMA-backed mutable-run LSM tier (Phase 11.1). A flush drains the
     /// memtable into this in-memory sorted tier instead of immediately writing
@@ -147,6 +149,15 @@ pub struct Table {
     /// Column IDs touched by `put`/`put_batch` since the last `commit()` — used
     /// by conservative insert-newly-matches invalidation.
     pending_put_cols: std::collections::HashSet<u16>,
+    /// B1/B2: rows staged by `put`/`put_batch` on a mounted (shared-WAL) table
+    /// but not yet applied to the memtable. They are re-stamped to the real
+    /// assigned epoch in `commit` (never a speculative `visible+1`), so a
+    /// concurrent reader can never observe them before their commit epoch.
+    /// Always empty on a standalone (private-WAL) table, which applies inline.
+    pending_rows: Vec<Row>,
+    /// B1/B2: tombstones staged on a mounted table, applied at the assigned
+    /// epoch in `commit` (mirror of `pending_rows`).
+    pending_dels: Vec<RowId>,
 }
 
 /// A cached query result — either survivor `Row`s (the tool-call/`query` path)
@@ -673,12 +684,36 @@ pub(crate) struct SharedCtx {
     /// and `visible` published as one atomic unit. P3 replaces this with the
     /// bounded validate-first sequencer + group commit (overlapping fsync).
     pub commit_lock: Arc<parking_lot::Mutex<()>>,
+    /// B1: when `Some`, the table is mounted in a `Database` and routes every
+    /// write through the one shared WAL (no private `_wal/` dir is created).
+    /// `None` for a directly-opened standalone table, which keeps a private WAL.
+    pub shared: Option<SharedWalCtx>,
+}
+
+/// Handles a mounted table needs to write to the database's single shared WAL
+/// (B1): the WAL itself, the group-commit coordinator + poison flag (so a
+/// single-table commit honors the same durability/§9.3e semantics as a cross-
+/// table txn), and the shared txn-id allocator (so auto-commit ids never alias
+/// cross-table ones in the merged log).
+#[derive(Clone)]
+pub(crate) struct SharedWalCtx {
+    pub wal: Arc<parking_lot::Mutex<SharedWal>>,
+    pub group: Arc<GroupCommit>,
+    pub poisoned: Arc<AtomicBool>,
+    pub txn_ids: Arc<parking_lot::Mutex<u64>>,
+}
+
+/// Where a table's WAL records go. A standalone table owns a `Private` WAL; a
+/// `Database`-mounted table writes to the one `Shared` WAL (B1).
+enum WalSink {
+    Private(Wal),
+    Shared(SharedWalCtx),
 }
 
 impl SharedCtx {
-    /// Build a fresh private context. `cache_dir = Some(_)` enables on-disk page
-    /// cache persistence (single-table direct open); `None` keeps it in-memory
-    /// (shared across tables in a `Database`).
+    /// Build a fresh private (standalone) context. `cache_dir = Some(_)` enables
+    /// on-disk page cache persistence (single-table direct open); `None` keeps
+    /// it in-memory (shared across tables in a `Database`).
     pub(crate) fn new(kek: Option<Arc<Kek>>, cache_dir: Option<PathBuf>) -> Self {
         let mut cache = crate::cache::PageCache::new(PAGE_CACHE_CAPACITY);
         if let Some(d) = cache_dir {
@@ -693,6 +728,7 @@ impl SharedCtx {
             snapshots: Arc::new(crate::retention::SnapshotRegistry::new()),
             kek,
             commit_lock: Arc::new(parking_lot::Mutex::new(())),
+            shared: None,
         }
     }
 }
@@ -782,21 +818,29 @@ impl Table {
         ctx: SharedCtx,
     ) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
-        std::fs::create_dir_all(dir.join(WAL_DIR))?;
         std::fs::create_dir_all(dir.join(RUNS_DIR))?;
         write_schema(&dir, &schema)?;
         let (wal_dek, cache_dek) = derive_subkeys(ctx.kek.as_deref(), table_id);
-        let mut wal = if let Some(ref dk) = wal_dek {
-            Wal::create_with_cipher(
-                dir.join(WAL_DIR).join("seg-000000.wal"),
-                Epoch(0),
-                Some(make_cipher(dk)),
-                0,
-            )?
-        } else {
-            Wal::create(dir.join(WAL_DIR).join("seg-000000.wal"), Epoch(0))?
+        // B1: a mounted table routes writes through the shared WAL and never
+        // creates its own `_wal/` dir. A standalone table owns a private WAL.
+        let (wal, current_txn_id) = match ctx.shared.clone() {
+            Some(s) => (WalSink::Shared(s), 0),
+            None => {
+                std::fs::create_dir_all(dir.join(WAL_DIR))?;
+                let mut w = if let Some(ref dk) = wal_dek {
+                    Wal::create_with_cipher(
+                        dir.join(WAL_DIR).join("seg-000000.wal"),
+                        Epoch(0),
+                        Some(make_cipher(dk)),
+                        0,
+                    )?
+                } else {
+                    Wal::create(dir.join(WAL_DIR).join("seg-000000.wal"), Epoch(0))?
+                };
+                w.set_sync_byte_threshold(DEFAULT_SYNC_BYTE_THRESHOLD);
+                (WalSink::Private(w), 1)
+            }
         };
-        wal.set_sync_byte_threshold(DEFAULT_SYNC_BYTE_THRESHOLD);
         let mut manifest = Manifest::new(table_id, schema.schema_id);
         // Seal the create-time manifest with the meta DEK so an encrypted table
         // reopens even if no write/flush ever re-persists it (otherwise the
@@ -826,7 +870,7 @@ impl Table {
             retiring: Vec::new(),
             next_run_id: 1,
             sync_byte_threshold: DEFAULT_SYNC_BYTE_THRESHOLD,
-            current_txn_id: 1,
+            current_txn_id,
             bitmap,
             ann,
             fm,
@@ -851,6 +895,8 @@ impl Table {
             )),
             pending_delete_rids: roaring::RoaringBitmap::new(),
             pending_put_cols: std::collections::HashSet::new(),
+            pending_rows: Vec::new(),
+            pending_dels: Vec::new(),
             wal_dek,
         })
     }
@@ -896,32 +942,41 @@ impl Table {
         let manifest_meta_dek = crate::encryption::meta_dek_for(ctx.kek.as_deref());
         let manifest = manifest::read(&dir, manifest_meta_dek.as_ref())?;
         let schema: Schema = read_schema(&dir)?;
-        let active = latest_wal_segment(&dir.join(WAL_DIR))?;
         let replay_epoch = Epoch(manifest.current_epoch);
         let (wal_dek, cache_dek) = derive_subkeys(ctx.kek.as_deref(), manifest.table_id);
-        // Replay BEFORE truncating: `Wal::create` would erase the segment.
-        let replayed = match &active {
-            Some(path) => {
-                let cipher = wal_dek.as_ref().map(|dk| make_cipher(dk));
-                crate::wal::replay_with_cipher(path, cipher)?
+        // B1: a mounted table has no private WAL — its committed records live in
+        // the shared WAL and are replayed by `Database::recover_shared_wal`. A
+        // standalone table replays + reopens its own `_wal/` segment here.
+        let (wal, replayed, current_txn_id) = match ctx.shared.clone() {
+            Some(s) => (WalSink::Shared(s), Vec::new(), 0),
+            None => {
+                let active = latest_wal_segment(&dir.join(WAL_DIR))?;
+                // Replay BEFORE truncating: `Wal::create` would erase the segment.
+                let replayed = match &active {
+                    Some(path) => {
+                        let cipher = wal_dek.as_ref().map(|dk| make_cipher(dk));
+                        crate::wal::replay_with_cipher(path, cipher)?
+                    }
+                    None => Vec::new(),
+                };
+                let mut w = match &active {
+                    Some(path) => Wal::create_with_cipher(
+                        path,
+                        replay_epoch,
+                        wal_dek.as_ref().map(|dk| make_cipher(dk)),
+                        0,
+                    )?,
+                    None => Wal::create_with_cipher(
+                        dir.join(WAL_DIR).join("seg-000000.wal"),
+                        replay_epoch,
+                        wal_dek.as_ref().map(|dk| make_cipher(dk)),
+                        0,
+                    )?,
+                };
+                w.set_sync_byte_threshold(DEFAULT_SYNC_BYTE_THRESHOLD);
+                (WalSink::Private(w), replayed, 1)
             }
-            None => Vec::new(),
         };
-        let mut wal = match &active {
-            Some(path) => Wal::create_with_cipher(
-                path,
-                replay_epoch,
-                wal_dek.as_ref().map(|dk| make_cipher(dk)),
-                0,
-            )?,
-            None => Wal::create_with_cipher(
-                dir.join(WAL_DIR).join("seg-000000.wal"),
-                replay_epoch,
-                wal_dek.as_ref().map(|dk| make_cipher(dk)),
-                0,
-            )?,
-        };
-        wal.set_sync_byte_threshold(DEFAULT_SYNC_BYTE_THRESHOLD);
 
         let mut memtable = Memtable::new();
         let mut allocator = RowIdAllocator::new(manifest.next_row_id);
@@ -999,7 +1054,7 @@ impl Table {
                 .max()
                 .unwrap_or(1),
             sync_byte_threshold: DEFAULT_SYNC_BYTE_THRESHOLD,
-            current_txn_id: 1,
+            current_txn_id,
             bitmap: HashMap::new(),
             ann: HashMap::new(),
             fm: HashMap::new(),
@@ -1024,6 +1079,8 @@ impl Table {
             )),
             pending_delete_rids: roaring::RoaringBitmap::new(),
             pending_put_cols: std::collections::HashSet::new(),
+            pending_rows: Vec::new(),
+            pending_dels: Vec::new(),
             wal_dek,
         };
 
@@ -1189,6 +1246,47 @@ impl Table {
         Epoch(self.epoch.visible().0 + 1)
     }
 
+    /// True when this table is mounted in a `Database` (writes route through the
+    /// shared WAL).
+    fn is_shared(&self) -> bool {
+        matches!(self.wal, WalSink::Shared(_))
+    }
+
+    /// Return the current auto-commit txn id, allocating a fresh one from the
+    /// shared allocator on a mounted table when a new span starts (sentinel 0).
+    /// A standalone table uses its private monotonic counter (never 0).
+    fn ensure_txn_id(&mut self) -> u64 {
+        if self.current_txn_id == 0 {
+            let id = match &self.wal {
+                WalSink::Shared(s) => {
+                    let mut g = s.txn_ids.lock();
+                    let v = *g;
+                    *g = g.wrapping_add(1);
+                    v
+                }
+                WalSink::Private(_) => 1,
+            };
+            self.current_txn_id = id;
+        }
+        self.current_txn_id
+    }
+
+    /// Append a data record (`Put`/`Delete`) for the current auto-commit txn to
+    /// whichever WAL backs this table.
+    fn wal_append_data(&mut self, op: Op) -> Result<()> {
+        let txn_id = self.ensure_txn_id();
+        let table_id = self.table_id;
+        match &mut self.wal {
+            WalSink::Private(w) => {
+                w.append_txn(txn_id, op)?;
+            }
+            WalSink::Shared(s) => {
+                s.wal.lock().append(txn_id, table_id, op)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Upsert a row. Allocates a [`RowId`], appends a (non-fsynced) WAL record,
     /// and updates the memtable + indexes. Returns the new row id. Durability
     /// arrives at the next [`Table::commit`] (or [`Table::flush`]).
@@ -1222,18 +1320,22 @@ impl Table {
         Ok(ids)
     }
 
-    /// Append `rows` (all sharing the pending epoch) under one WAL record, index
-    /// them, and fold them into the memtable.
+    /// Append `rows` under one WAL record. On a standalone table they are folded
+    /// into the memtable + indexes immediately (single clock — no speculative-
+    /// epoch hazard). On a mounted table (B1/B2) they are staged in
+    /// `pending_rows` and applied at the real assigned epoch in `commit`, so a
+    /// concurrent reader can never see them before their commit epoch.
     fn commit_rows(&mut self, rows: Vec<Row>) -> Result<()> {
         let payload = bincode::serialize(&rows)?;
-        self.wal.append_txn(
-            self.current_txn_id,
-            Op::Put {
-                table_id: self.table_id,
-                rows: payload,
-            },
-        )?;
-        self.apply_put_rows(rows);
+        self.wal_append_data(Op::Put {
+            table_id: self.table_id,
+            rows: payload,
+        })?;
+        if self.is_shared() {
+            self.pending_rows.extend(rows);
+        } else {
+            self.apply_put_rows(rows);
+        }
         Ok(())
     }
 
@@ -1348,14 +1450,15 @@ impl Table {
     /// Logically delete `row_id` (effective at the next commit).
     pub fn delete(&mut self, row_id: RowId) -> Result<()> {
         let epoch = self.pending_epoch();
-        self.wal.append_txn(
-            self.current_txn_id,
-            Op::Delete {
-                table_id: self.table_id,
-                row_ids: vec![row_id],
-            },
-        )?;
-        self.apply_delete(row_id, epoch);
+        self.wal_append_data(Op::Delete {
+            table_id: self.table_id,
+            row_ids: vec![row_id],
+        })?;
+        if self.is_shared() {
+            self.pending_dels.push(row_id);
+        } else {
+            self.apply_delete(row_id, epoch);
+        }
         Ok(())
     }
 
@@ -1419,29 +1522,43 @@ impl Table {
         }
     }
 
-    /// Group-commit: fsync the WAL, advance the epoch so all pending writes
-    /// become durable and visible, and persist the manifest.
+    /// Group-commit: make all pending writes durable, advance the epoch so they
+    /// become visible, and persist the manifest. Dispatches on the WAL sink: a
+    /// standalone table fsyncs its private WAL; a mounted table seals into the
+    /// shared WAL and defers the fsync to the group-commit coordinator (B1).
     pub fn commit(&mut self) -> Result<Epoch> {
+        if self.is_shared() {
+            self.commit_shared()
+        } else {
+            self.commit_private()
+        }
+    }
+
+    /// Standalone commit: fsync the private WAL under the commit lock.
+    fn commit_private(&mut self) -> Result<Epoch> {
         // Serialize the assign→fsync→publish critical section across all tables
         // sharing the epoch authority so `visible` is published strictly in
-        // assigned order (the dual-counter invariant). P3's bounded sequencer
-        // replaces this with validate-first + group commit (overlapping fsync).
-        // Clone the Arc first so the guard does not borrow `self` (we take
-        // `&mut self` methods below).
+        // assigned order (the dual-counter invariant).
         let commit_lock = Arc::clone(&self.commit_lock);
         let _g = commit_lock.lock();
         let new_epoch = self.epoch.bump_assigned();
+        let txn_id = self.current_txn_id;
         // Seal the staged records under a TxnCommit marker carrying the commit
         // epoch, then a single group fsync. Recovery applies only records whose
         // txn has a durable TxnCommit (uncommitted/torn tails are discarded).
-        self.wal.append_txn(
-            self.current_txn_id,
-            Op::TxnCommit {
-                epoch: new_epoch.0,
-                added_runs: Vec::new(),
-            },
-        )?;
-        self.wal.sync()?;
+        match &mut self.wal {
+            WalSink::Private(w) => {
+                w.append_txn(
+                    txn_id,
+                    Op::TxnCommit {
+                        epoch: new_epoch.0,
+                        added_runs: Vec::new(),
+                    },
+                )?;
+                w.sync()?;
+            }
+            WalSink::Shared(_) => unreachable!("commit_private on a shared sink"),
+        }
         self.invalidate_pending_cache();
         self.persist_manifest(new_epoch)?;
         // Publish through the shared in-order gate so a `Table::commit` can never
@@ -1449,6 +1566,65 @@ impl Table {
         // lower assigned epoch whose writes are not yet applied (spec §9.3e).
         self.epoch.publish_in_order(new_epoch);
         self.current_txn_id += 1;
+        Ok(new_epoch)
+    }
+
+    /// Mounted commit (B1/B2): mirror the cross-table sequencer. Seal a
+    /// `TxnCommit` into the shared WAL under the WAL lock (assigning the epoch in
+    /// WAL-append order), make it durable via the group-commit coordinator (one
+    /// leader fsync for the whole batch), then apply the staged rows at the
+    /// assigned epoch and publish in order. Honors the shared poison flag.
+    fn commit_shared(&mut self) -> Result<Epoch> {
+        use std::sync::atomic::Ordering;
+        let s = match &self.wal {
+            WalSink::Shared(s) => s.clone(),
+            WalSink::Private(_) => unreachable!("commit_shared on a private sink"),
+        };
+        if s.poisoned.load(Ordering::Relaxed) {
+            return Err(MongrelError::Other(
+                "database poisoned by fsync error".into(),
+            ));
+        }
+        // Serialize the whole single-table commit critical section (assign →
+        // durable → publish) under the shared commit lock so concurrent
+        // `Table::commit`s publish strictly in assigned order and each returns
+        // only once its epoch is visible (read-your-writes after commit). The
+        // fsync still defers to the group-commit coordinator, which can batch a
+        // held commit with concurrent cross-table `transaction()` committers.
+        let commit_lock = Arc::clone(&self.commit_lock);
+        let _g = commit_lock.lock();
+        // Always seal a txn (allocating an id if this span had no writes) so the
+        // epoch advances monotonically like the standalone path.
+        let txn_id = self.ensure_txn_id();
+        let (new_epoch, commit_seq) = {
+            let mut wal = s.wal.lock();
+            let new_epoch = self.epoch.bump_assigned();
+            let seq = wal.append_commit(txn_id, new_epoch, &[])?;
+            (new_epoch, seq)
+        };
+        s.group
+            .await_durable(&s.wal, commit_seq)
+            .inspect_err(|_| s.poisoned.store(true, Ordering::Relaxed))?;
+
+        // Apply staged rows/tombstones at the real assigned epoch (B2): nothing
+        // was stamped speculatively, and nothing is visible until publish below.
+        let mut rows = std::mem::take(&mut self.pending_rows);
+        if !rows.is_empty() {
+            for r in &mut rows {
+                r.committed_epoch = new_epoch;
+            }
+            self.apply_put_rows(rows);
+        }
+        let dels = std::mem::take(&mut self.pending_dels);
+        for rid in dels {
+            self.apply_delete(rid, new_epoch);
+        }
+
+        self.invalidate_pending_cache();
+        self.persist_manifest(new_epoch)?;
+        self.epoch.publish_in_order(new_epoch);
+        // Next auto-commit span allocates a fresh shared txn id.
+        self.current_txn_id = 0;
         Ok(new_epoch)
     }
 
@@ -1469,14 +1645,9 @@ impl Table {
         if self.mutable_run.approx_bytes() >= self.mutable_run_spill_bytes {
             self.spill_mutable_run(epoch)?;
             // The tier is now empty and its data is durably in a run → safe to
-            // mark the WAL flushed and rotate to a fresh segment.
-            self.wal.append_system(Op::Flush {
-                table_id: self.table_id,
-                flushed_epoch: epoch.0,
-            })?;
-            self.flushed_epoch = epoch.0;
-            self.wal.sync()?;
-            self.rotate_wal(epoch)?;
+            // mark the WAL flushed (and, for a private WAL, rotate to a fresh
+            // segment so the flushed records aren't replayed).
+            self.mark_flushed(epoch)?;
             self.persist_manifest(epoch)?;
             self.build_learned_ranges()?;
             // Memtable is drained and runs are stable → checkpoint the indexes so
@@ -1486,6 +1657,37 @@ impl Table {
         // else: data coalesced in the in-memory tier; the WAL still covers it
         // and the manifest epoch was already persisted by `commit`.
         Ok(epoch)
+    }
+
+    /// Mark `epoch` as flushed: append a `Flush` marker to the WAL, advance
+    /// `flushed_epoch`, and — for a private WAL only — rotate to a fresh segment
+    /// so the now-durable-in-a-run records are not replayed. A mounted table's
+    /// shared WAL is never rotated per-table; recovery skips its already-flushed
+    /// records via the manifest `flushed_epoch` gate, and segment GC (B3c) reaps
+    /// them once every table has flushed past them.
+    fn mark_flushed(&mut self, epoch: Epoch) -> Result<()> {
+        let op = Op::Flush {
+            table_id: self.table_id,
+            flushed_epoch: epoch.0,
+        };
+        match &mut self.wal {
+            WalSink::Private(w) => {
+                w.append_system(op)?;
+                w.sync()?;
+            }
+            WalSink::Shared(s) => {
+                // Informational in the shared log (recovery gates on the manifest
+                // `flushed_epoch`); not separately fsynced — the run + manifest
+                // are the durability point and the underlying rows were already
+                // fsynced at their commit.
+                s.wal.lock().append_system(op)?;
+            }
+        }
+        self.flushed_epoch = epoch.0;
+        if matches!(self.wal, WalSink::Private(_)) {
+            self.rotate_wal(epoch)?;
+        }
+        Ok(())
     }
 
     /// Spill the mutable-run tier to a new immutable level-0 sorted run. The
@@ -1617,18 +1819,14 @@ impl Table {
         });
         self.live_count = self.live_count.saturating_add(n as u64);
         self.indexes_complete = false;
-        self.wal.append_system(Op::Flush {
-            table_id: self.table_id,
-            flushed_epoch: epoch.0,
-        })?;
-        self.flushed_epoch = epoch.0;
-        self.wal.sync()?;
-        self.rotate_wal(epoch)?;
+        self.mark_flushed(epoch)?;
         self.persist_manifest(epoch)?;
         self.clear_result_cache();
         Ok(epoch)
     }
 
+    /// Rotate the private WAL to a fresh segment. Only valid for a standalone
+    /// table — a mounted table never rotates the shared WAL per-table.
     fn rotate_wal(&mut self, epoch: Epoch) -> Result<()> {
         let segment = next_wal_segment(&self.dir.join(WAL_DIR))?;
         let cipher = self.wal_dek.as_ref().map(|dk| make_cipher(dk));
@@ -1643,7 +1841,7 @@ impl Table {
         let mut wal = Wal::create_with_cipher(segment, epoch, cipher, segment_no)?;
         wal.set_sync_byte_threshold(self.sync_byte_threshold);
         wal.sync()?;
-        self.wal = wal;
+        self.wal = WalSink::Private(wal);
         Ok(())
     }
 
@@ -2428,13 +2626,7 @@ impl Table {
         self.live_count = self.live_count.saturating_add(n as u64);
         // Phase 14.7: defer index building off the ingest critical path.
         self.indexes_complete = false;
-        self.wal.append_system(Op::Flush {
-            table_id: self.table_id,
-            flushed_epoch: epoch.0,
-        })?;
-        self.flushed_epoch = epoch.0;
-        self.wal.sync()?;
-        self.rotate_wal(epoch)?;
+        self.mark_flushed(epoch)?;
         self.persist_manifest(epoch)?;
         self.clear_result_cache();
         Ok(epoch)
@@ -3892,10 +4084,13 @@ impl Table {
         Ok(())
     }
 
-    /// Tuning knob for the WAL auto-sync threshold.
+    /// Tuning knob for the WAL auto-sync threshold. A no-op on a mounted table
+    /// (the shared WAL's durability is governed by the group-commit coordinator).
     pub fn set_sync_byte_threshold(&mut self, threshold: u64) {
         self.sync_byte_threshold = threshold;
-        self.wal.set_sync_byte_threshold(threshold);
+        if let WalSink::Private(w) = &mut self.wal {
+            w.set_sync_byte_threshold(threshold);
+        }
     }
 
     /// Flush all live page-cache entries to the persistent `_cache/` backing

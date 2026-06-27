@@ -1,7 +1,60 @@
 //! P2.4 — `SharedWal` multiplexes many tables' records onto one fd.
+//! B1 — mounted tables route every write through that one shared WAL.
 
-use mongreldb_core::{Epoch, Op, SharedWal};
+use mongreldb_core::schema::{ColumnDef, ColumnFlags, Schema, TypeId};
+use mongreldb_core::{Database, Epoch, Op, SharedWal, Value};
 use tempfile::tempdir;
+
+fn one_int_schema() -> Schema {
+    Schema {
+        schema_id: 1,
+        columns: vec![ColumnDef {
+            id: 1,
+            name: "v".into(),
+            ty: TypeId::Int64,
+            flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+        }],
+        indexes: vec![],
+        colocation: vec![],
+    }
+}
+
+#[test]
+fn database_uses_one_wal_for_n_tables() {
+    let dir = tempdir().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.create_table("a", one_int_schema()).unwrap();
+    db.create_table("b", one_int_schema()).unwrap();
+    // Mounted tables must NOT create their own `_wal/` dir (B1).
+    for name in ["a", "b"] {
+        let id = db.table_id(name).unwrap();
+        let per_table_wal = dir.path().join("tables").join(id.to_string()).join("_wal");
+        assert!(
+            !per_table_wal.exists(),
+            "mounted table {name} must not own a WAL"
+        );
+    }
+    assert!(dir.path().join("_wal").exists(), "shared WAL exists");
+}
+
+#[test]
+fn single_table_put_commit_recovers_from_shared_wal() {
+    let dir = tempdir().unwrap();
+    {
+        let db = Database::create(dir.path()).unwrap();
+        db.create_table("t", one_int_schema()).unwrap();
+        let t = db.table("t").unwrap();
+        {
+            let mut g = t.lock();
+            g.put(vec![(1, Value::Int64(7))]).unwrap();
+            g.commit().unwrap();
+        }
+        // Drop without an explicit clean-shutdown step: the row's durability
+        // must come from the shared WAL alone.
+    }
+    let db = Database::open(dir.path()).unwrap();
+    assert_eq!(db.table("t").unwrap().lock().count(), 1);
+}
 
 #[test]
 fn shared_wal_interleaves_two_tables_one_fd() {
