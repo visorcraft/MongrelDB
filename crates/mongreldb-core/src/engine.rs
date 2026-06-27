@@ -2763,12 +2763,20 @@ impl Table {
         hi: i64,
         snapshot: Snapshot,
     ) {
-        for row in self
-            .memtable
-            .visible_versions(snapshot.epoch)
-            .into_iter()
-            .chain(self.mutable_run.visible_versions(snapshot.epoch))
-        {
+        // Collapse both overlay tiers to the newest visible version per row id
+        // (the memtable supersedes the mutable run) before range-checking, so a
+        // stale in-range mutable-run version cannot shadow a newer out-of-range
+        // memtable version of the same row.
+        let mut newest: HashMap<u64, &Row> = HashMap::new();
+        let mutable = self.mutable_run.visible_versions(snapshot.epoch);
+        let memtable = self.memtable.visible_versions(snapshot.epoch);
+        for r in &mutable {
+            newest.entry(r.row_id.0).or_insert(r);
+        }
+        for r in &memtable {
+            newest.insert(r.row_id.0, r);
+        }
+        for row in newest.values() {
             if !row.deleted {
                 if let Some(Value::Int64(v)) = row.columns.get(&column_id) {
                     if *v >= lo && *v <= hi {
@@ -2790,12 +2798,18 @@ impl Table {
         hi_inclusive: bool,
         snapshot: Snapshot,
     ) {
-        for row in self
-            .memtable
-            .visible_versions(snapshot.epoch)
-            .into_iter()
-            .chain(self.mutable_run.visible_versions(snapshot.epoch))
-        {
+        // See `range_scan_overlay_i64`: dedup to the newest version per row id
+        // across the memtable + mutable run before range-checking.
+        let mut newest: HashMap<u64, &Row> = HashMap::new();
+        let mutable = self.mutable_run.visible_versions(snapshot.epoch);
+        let memtable = self.memtable.visible_versions(snapshot.epoch);
+        for r in &mutable {
+            newest.entry(r.row_id.0).or_insert(r);
+        }
+        for r in &memtable {
+            newest.insert(r.row_id.0, r);
+        }
+        for row in newest.values() {
             if !row.deleted {
                 if let Some(Value::Float64(v)) = row.columns.get(&column_id) {
                     let ok_lo = if lo_inclusive { *v >= lo } else { *v > lo };
@@ -3167,7 +3181,8 @@ impl Table {
     }
 
     /// Phase 19.1 + hardening (c): a cached form of
-    /// [`Table::query_columns_native`]. The cache key is epoch-independent (epoch=0);
+    /// [`Table::query_columns_native`]. The cache key embeds the snapshot epoch
+    /// so two queries at different pinned snapshots never share an entry;
     /// invalidation is fine-grained — a `commit()` drops only entries whose
     /// footprint intersects a deleted RowId or whose condition-columns intersect
     /// a mutated column. On a miss the underlying `query_columns_native` runs and
@@ -3347,29 +3362,13 @@ impl Table {
                     .get(column_id)
                     .map(|s| s.search(query, *k).into_iter().map(|(r, _)| r.0).collect())
                     .unwrap_or_default(),
-                Condition::Range { column_id, lo, hi } => {
-                    if let Some(li) = self.learned_range.get(column_id) {
-                        li.range(*lo, *hi)
-                    } else if let Some(r) = reader_opt.as_mut() {
-                        r.range_row_ids_i64(*column_id, *lo, *hi)?
-                    } else {
-                        self.resolve_condition(c, snapshot)?
-                    }
-                }
-                Condition::RangeF64 {
-                    column_id,
-                    lo,
-                    lo_inclusive,
-                    hi,
-                    hi_inclusive,
-                } => {
-                    if let Some(li) = self.learned_range.get(column_id) {
-                        li.range_f64(*lo, *lo_inclusive, *hi, *hi_inclusive)
-                    } else if let Some(r) = reader_opt.as_mut() {
-                        r.range_row_ids_f64(*column_id, *lo, *lo_inclusive, *hi, *hi_inclusive)?
-                    } else {
-                        self.resolve_condition(c, snapshot)?
-                    }
+                Condition::Range { .. } | Condition::RangeF64 { .. } => {
+                    // Delegate to `resolve_condition`, which merges the
+                    // memtable/mutable-run overlay over the learned-index /
+                    // single-run candidate set in every sub-case. Duplicating
+                    // the merge here would silently drift again (this path is
+                    // marked Exact pushdown, so DataFusion does not re-filter).
+                    self.resolve_condition(c, snapshot)?
                 }
             };
             sets.push(s);

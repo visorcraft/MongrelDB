@@ -325,6 +325,29 @@ fn range_query_with_learned_index_misses_memtable_rows() {
         51,
         "cached range query must see memtable row matching learned index range"
     );
+
+    // The native-column (SQL pushdown) path must also merge the overlay over
+    // the learned index — it is marked Exact, so DataFusion does not re-filter.
+    let snap = db.snapshot();
+    let cols = db
+        .query_columns_native_cached(
+            &[Condition::RangeF64 {
+                column_id: 3,
+                lo: 0.0,
+                lo_inclusive: true,
+                hi: 49.0,
+                hi_inclusive: true,
+            }],
+            None,
+            snap,
+        )
+        .unwrap()
+        .expect("served");
+    let n = count_from_native_cols(&cols);
+    assert_eq!(
+        n, 51,
+        "native-column range query must see memtable row matching learned index range"
+    );
 }
 
 #[test]
