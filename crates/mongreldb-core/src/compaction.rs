@@ -56,15 +56,18 @@ impl Table {
         // Recompute the live-row counter from the merged survivors.
         self.live_count = rows.iter().filter(|r| !r.deleted).count() as u64;
 
+        let retire_epoch = self.current_epoch().0;
         if rows.is_empty() {
-            // Persist the empty manifest BEFORE unlinking the superseded files so
-            // a concurrent `check`/`doctor` never observes a RunRef whose file is
-            // already gone (which would mis-quarantine a healthy table).
+            // Point the manifest at the empty run set and enqueue the superseded
+            // runs for retention-gated deletion (spec §6.4) — `gc()` deletes them
+            // once no pinned snapshot can still need them. Persisting before any
+            // unlink also keeps a concurrent `check`/`doctor` from ever seeing a
+            // RunRef whose file is already gone.
             self.set_run_refs(Vec::new());
-            self.persist_manifest(self.current_epoch())?;
             for rr in &old_refs {
-                let _ = std::fs::remove_file(self.run_path(rr.run_id as u64));
+                self.retire_run(rr.run_id, retire_epoch);
             }
+            self.persist_manifest(self.current_epoch())?;
             // No live rows remain; the in-memory indexes are stale → drop the
             // checkpoint so reopen rebuilds (empty) instead of loading it.
             self.invalidate_index_checkpoint();
@@ -83,21 +86,23 @@ impl Table {
         }
         let header = writer.write(&path, &rows)?;
 
-        // Point the manifest at the new run and persist it BEFORE unlinking the
-        // superseded files, so a concurrent `check`/`doctor` never sees a RunRef
-        // whose file is already gone (which would mis-quarantine a healthy
-        // table). The old files are briefly unreferenced-on-disk — a harmless
-        // `warning`-level orphan, never an `error`.
+        // Point the manifest at the new run and enqueue the superseded runs for
+        // retention-gated deletion (spec §6.4): `gc()` deletes their files once
+        // `min_active_snapshot` passes this compaction epoch, so a reader pinned
+        // below it keeps a consistent on-disk view. Persisting the manifest
+        // (with both the new RunRef and the `retiring` queue) BEFORE any unlink
+        // also means a concurrent `check`/`doctor` never sees a RunRef whose file
+        // is gone, and the retired files are tracked (not orphans) across reopen.
         self.set_run_refs(vec![RunRef {
             run_id: run_id as u128,
             level: 1,
             epoch_created: header.epoch_created,
             row_count: header.row_count,
         }]);
-        self.persist_manifest(self.current_epoch())?;
         for rr in &old_refs {
-            let _ = std::fs::remove_file(self.run_path(rr.run_id as u64));
+            self.retire_run(rr.run_id, retire_epoch);
         }
+        self.persist_manifest(self.current_epoch())?;
         // Compaction yields exactly one run → (re)build the learned-range PGMs
         // so the checkpoint captures them (otherwise reopen would load a
         // checkpoint with empty learned_range and fall back to page-pruned scans).

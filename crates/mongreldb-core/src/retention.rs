@@ -9,7 +9,62 @@
 use crate::epoch::Epoch;
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::sync::Arc;
+
+/// Set of transaction ids that are currently spilling into `_txn/<txn_id>/`
+/// (spec §8.5, review fix #14). A large transaction registers its id before
+/// writing its pending run and holds the [`SpillGuard`] through publish; GC
+/// consults [`ActiveSpills::is_active`] and never deletes a live txn's pending
+/// dir (deleting it would lose the spill run / fail the commit).
+#[derive(Default)]
+pub struct ActiveSpills {
+    inner: Mutex<HashSet<u64>>,
+}
+
+impl ActiveSpills {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// Register `txn_id` as actively spilling. The id stays protected from GC
+    /// until the returned guard is dropped.
+    pub fn register(self: &Arc<Self>, txn_id: u64) -> SpillGuard {
+        self.inner.lock().insert(txn_id);
+        SpillGuard {
+            registry: Arc::clone(self),
+            txn_id,
+        }
+    }
+
+    /// Whether `txn_id`'s pending `_txn/` dir is currently in use.
+    pub fn is_active(&self, txn_id: u64) -> bool {
+        self.inner.lock().contains(&txn_id)
+    }
+
+    /// Whether no transaction is currently spilling. Used to gate WAL-segment GC.
+    pub fn is_idle(&self) -> bool {
+        self.inner.lock().is_empty()
+    }
+
+    fn release(&self, txn_id: u64) {
+        self.inner.lock().remove(&txn_id);
+    }
+}
+
+/// RAII handle that deregisters its txn id from [`ActiveSpills`] on drop.
+pub struct SpillGuard {
+    registry: Arc<ActiveSpills>,
+    txn_id: u64,
+}
+
+impl Drop for SpillGuard {
+    fn drop(&mut self) {
+        self.registry.release(self.txn_id);
+    }
+}
 
 /// Refcounted multiset of pinned reader epochs. Tracks the lowest live snapshot
 /// so the reaper can decide what is safe to reclaim.

@@ -731,6 +731,49 @@ impl SharedWal {
         self.active_segment_no
     }
 
+    /// Delete rotated (non-active) WAL segments whose records are all below
+    /// `min_retained_seq` — i.e. every record in them is already durable in a
+    /// run and not needed by any in-flight or committed-not-flushed txn (spec
+    /// §6.4/§16). The active segment is **never** deleted. Returns the count of
+    /// segment files reaped.
+    ///
+    /// `open()` mints a fresh active segment on every reopen without truncating
+    /// the prior ones (so a crash mid-recovery can re-replay), which means old
+    /// segments accumulate; this is what reaps them once their data is durable.
+    pub fn gc_segments(&mut self, min_retained_seq: u64) -> Result<usize> {
+        let mut segments = list_segment_numbers(&self.wal_dir)?;
+        segments.sort_unstable();
+        let mut reaped = 0;
+        for n in segments {
+            if n == self.active_segment_no {
+                continue; // never delete the segment we're appending to
+            }
+            let path = Self::segment_path(&self.wal_dir, n);
+            // A segment is reapable when its highest seq is below the retention
+            // floor. Replaying it (cold path) yields its record set; an empty or
+            // torn-header segment has no records and is trivially reapable.
+            let recs = match &self.wal_dek {
+                #[cfg(feature = "encryption")]
+                Some(dk) => {
+                    let cipher = Self::cipher_from_dek(dk)?;
+                    replay_with_cipher(&path, Some(cipher))?
+                }
+                _ => replay(&path)?,
+            };
+            let max_seq = recs.iter().map(|r| r.seq.0).max().unwrap_or(0);
+            if max_seq < min_retained_seq {
+                std::fs::remove_file(&path)?;
+                reaped += 1;
+            }
+        }
+        if reaped > 0 {
+            if let Ok(d) = std::fs::File::open(&self.wal_dir) {
+                let _ = d.sync_all();
+            }
+        }
+        Ok(reaped)
+    }
+
     /// Replay every record across all segments in `<root>/_wal/`, in segment
     /// order, applying the torn-tail-vs-interior-corruption rule per segment.
     pub fn replay(root: &Path) -> Result<Vec<Record>> {

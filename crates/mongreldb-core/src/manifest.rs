@@ -31,6 +31,19 @@ pub struct RunRef {
     pub row_count: u64,
 }
 
+/// A run that compaction superseded but kept on disk for snapshot retention
+/// (spec §6.4/§7.4). Its file is physically deleted by `gc()` only once
+/// `min_active_snapshot` has advanced past `retire_epoch` — i.e. no pinned
+/// reader can still need it. Persisted in the manifest so the reaper survives
+/// a reopen (otherwise the file would linger as an orphan).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetiredRun {
+    pub run_id: u128,
+    /// The compaction epoch at which this run was superseded. Reapable once
+    /// `min_active_snapshot > retire_epoch`.
+    pub retire_epoch: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
     pub magic: [u8; 8],
@@ -49,6 +62,10 @@ pub struct Manifest {
     /// `<= flushed_epoch` (they are already represented by runs).
     #[serde(default)]
     pub flushed_epoch: u64,
+    /// Runs superseded by compaction but retained for snapshot retention,
+    /// pending physical deletion by `gc()` (spec §6.4). See [`RetiredRun`].
+    #[serde(default)]
+    pub retiring: Vec<RetiredRun>,
     pub checksum: [u8; 32],
 }
 
@@ -65,6 +82,7 @@ impl Manifest {
             global_idx_epoch: 0,
             live_count: 0,
             flushed_epoch: 0,
+            retiring: Vec::new(),
             checksum: [0u8; 32],
         }
     }

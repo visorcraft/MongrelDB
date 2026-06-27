@@ -73,6 +73,9 @@ pub struct Table {
     /// tokens are identical across runs. Empty when the table is plaintext.
     column_keys: HashMap<u16, ([u8; 32], u8)>,
     run_refs: Vec<RunRef>,
+    /// Runs superseded by compaction, kept on disk for snapshot retention until
+    /// `gc()` reaps them (spec §6.4). Persisted in the manifest (`retiring`).
+    retiring: Vec<crate::manifest::RetiredRun>,
     next_run_id: u64,
     sync_byte_threshold: u64,
     /// Next transaction id to assign to a single-table auto-commit txn
@@ -821,6 +824,7 @@ impl Table {
             kek: ctx.kek,
             column_keys,
             run_refs: Vec::new(),
+            retiring: Vec::new(),
             next_run_id: 1,
             sync_byte_threshold: DEFAULT_SYNC_BYTE_THRESHOLD,
             current_txn_id: 1,
@@ -988,6 +992,7 @@ impl Table {
             kek: ctx.kek,
             column_keys,
             run_refs: manifest.runs.clone(),
+            retiring: manifest.retiring.clone(),
             next_run_id: manifest
                 .runs
                 .iter()
@@ -1663,6 +1668,7 @@ impl Table {
         m.live_count = self.live_count;
         m.global_idx_epoch = self.global_idx_epoch;
         m.flushed_epoch = self.flushed_epoch;
+        m.retiring = self.retiring.clone();
         let meta_dek = self.manifest_meta_dek();
         manifest::write_atomic(&self.dir, &mut m, meta_dek.as_ref())?;
         Ok(())
@@ -3934,6 +3940,40 @@ impl Table {
     /// linked, its rows are added to `live_count`, and the indexes are marked
     /// stale so the next query rebuilds them from the runs (including this one).
     /// Returns `true` when the run was newly linked.
+    /// Enqueue a compaction-superseded run for retention-gated deletion (spec
+    /// §6.4). The file stays on disk until [`Self::reap_retiring`] removes it
+    /// once `min_active_snapshot` has advanced past `retire_epoch`.
+    pub(crate) fn retire_run(&mut self, run_id: u128, retire_epoch: u64) {
+        self.retiring.push(crate::manifest::RetiredRun {
+            run_id,
+            retire_epoch,
+        });
+    }
+
+    /// Physically delete retired run files whose `retire_epoch` no pinned reader
+    /// can still need (`min_active >= retire_epoch`), drop them from the queue,
+    /// and persist the manifest if anything changed. Returns the count reaped.
+    pub(crate) fn reap_retiring(&mut self, min_active: Epoch) -> Result<usize> {
+        if self.retiring.is_empty() {
+            return Ok(0);
+        }
+        let mut reaped = 0;
+        let mut kept: Vec<crate::manifest::RetiredRun> = Vec::new();
+        for r in std::mem::take(&mut self.retiring) {
+            if min_active.0 >= r.retire_epoch {
+                let _ = std::fs::remove_file(self.run_path(r.run_id as u64));
+                reaped += 1;
+            } else {
+                kept.push(r);
+            }
+        }
+        self.retiring = kept;
+        if reaped > 0 {
+            self.persist_manifest(self.current_epoch())?;
+        }
+        Ok(reaped)
+    }
+
     pub(crate) fn recover_spilled_run(&mut self, run_ref: crate::manifest::RunRef) -> bool {
         if self.run_refs.iter().any(|r| r.run_id == run_ref.run_id) {
             return false;

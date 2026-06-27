@@ -1,6 +1,7 @@
 //! P3.6 — retention-gated GC for dropped tables and pending runs.
 
 use mongreldb_core::{schema::*, Database, Value};
+use std::sync::{Arc, Barrier};
 use tempfile::tempdir;
 
 fn pk_schema() -> Schema {
@@ -86,6 +87,263 @@ fn pinned_snapshot_blocks_drop_reclaim() {
     drop(guard);
     db.gc().unwrap();
     assert!(!tdir.exists(), "dir should be reclaimed after unpin");
+}
+
+#[test]
+fn gc_does_not_delete_in_flight_txn_dir() {
+    // A large txn spills into `_txn/<id>/`. While it is paused mid-commit (after
+    // the spill write, before publish) a concurrent `gc()` must NOT delete its
+    // pending dir — otherwise the commit loses data. After release the txn
+    // commits and all rows are present.
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    db.create_table("t", pk_schema()).unwrap();
+    db.set_spill_threshold(1);
+
+    let reached = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    {
+        let reached = reached.clone();
+        let release = release.clone();
+        db.__set_spill_hook(move || {
+            reached.wait();
+            release.wait();
+        });
+    }
+
+    let writer = {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            db.transaction(|t| {
+                for i in 0..80i64 {
+                    t.put("t", vec![(1, Value::Int64(i))])?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        })
+    };
+
+    // Wait until the txn has written its spill run and is paused.
+    reached.wait();
+
+    // GC must not touch the in-flight txn's dir.
+    db.gc().unwrap();
+    let table_id = db.table_id("t").unwrap();
+    let txn_dir = dir
+        .path()
+        .join("tables")
+        .join(table_id.to_string())
+        .join("_txn");
+    let has_pending = txn_dir.exists()
+        && std::fs::read_dir(&txn_dir)
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false);
+    assert!(
+        has_pending,
+        "in-flight spill dir must survive a concurrent gc()"
+    );
+
+    // Release the txn; it commits successfully.
+    release.wait();
+    writer.join().unwrap();
+
+    assert_eq!(db.table("t").unwrap().lock().count(), 80);
+}
+
+fn count_sr_files(runs_dir: &std::path::Path) -> usize {
+    std::fs::read_dir(runs_dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("sr"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+#[test]
+fn superseded_runs_reaped_only_after_min_active_passes() {
+    // Compaction supersedes its input runs but keeps the files on disk (the
+    // `retiring` queue). `gc()` deletes them only once `min_active_snapshot`
+    // passes the compaction epoch: a snapshot pinned below it keeps the files;
+    // releasing it lets the next gc() reap them. The merged run always survives.
+    let dir = tempdir().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.create_table("t", pk_schema()).unwrap();
+
+    let tbl = db.table("t").unwrap();
+    let table_id = db.table_id("t").unwrap();
+    let runs_dir = dir
+        .path()
+        .join("tables")
+        .join(table_id.to_string())
+        .join("_runs");
+
+    // Force each flush to spill to a sorted run (vs the mutable-run tier).
+    tbl.lock().set_mutable_run_spill_bytes(1);
+
+    // Two flushed runs.
+    db.transaction(|t| t.put("t", vec![(1, Value::Int64(1))]).map(|_| ()))
+        .unwrap();
+    tbl.lock().flush().unwrap();
+    db.transaction(|t| t.put("t", vec![(1, Value::Int64(2))]).map(|_| ()))
+        .unwrap();
+    tbl.lock().flush().unwrap();
+    assert_eq!(tbl.lock().run_count(), 2);
+    assert_eq!(count_sr_files(&runs_dir), 2);
+
+    // Pin a snapshot, then advance the epoch past it with another flushed run so
+    // the compaction epoch is strictly above the pinned epoch.
+    let (_snap, guard) = db.snapshot();
+    db.transaction(|t| t.put("t", vec![(1, Value::Int64(3))]).map(|_| ()))
+        .unwrap();
+    tbl.lock().flush().unwrap();
+    assert_eq!(count_sr_files(&runs_dir), 3);
+
+    // Compact: one merged run + three superseded runs kept on disk.
+    tbl.lock().compact().unwrap();
+    assert_eq!(tbl.lock().run_count(), 1);
+    assert_eq!(
+        count_sr_files(&runs_dir),
+        4,
+        "superseded run files retained after compaction"
+    );
+
+    // gc() while the snapshot is pinned below the compaction epoch keeps them.
+    db.gc().unwrap();
+    assert_eq!(
+        count_sr_files(&runs_dir),
+        4,
+        "pinned snapshot must block reaping of superseded runs"
+    );
+    // check() must not flag the retained files as orphans.
+    assert!(db.check().is_empty(), "check clean: {:?}", db.check());
+
+    // Release the pin; now gc() reaps the superseded runs, merged run remains.
+    drop(guard);
+    db.gc().unwrap();
+    assert_eq!(
+        count_sr_files(&runs_dir),
+        1,
+        "superseded runs reaped after the pin is released"
+    );
+    assert_eq!(tbl.lock().count(), 3, "live count intact after reaping");
+    assert!(
+        db.check().is_empty(),
+        "check clean after reap: {:?}",
+        db.check()
+    );
+}
+
+fn count_wal_segments(wal_dir: &std::path::Path) -> usize {
+    std::fs::read_dir(wal_dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .map(|s| s.starts_with("seg-") && s.ends_with(".wal"))
+                        .unwrap_or(false)
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+#[test]
+fn wal_segment_not_gcd_while_in_flight_txn_holds_it() {
+    // While a large txn is mid-commit (paused after its spill write, before the
+    // sequencer appends its TxnCommit) a concurrent gc() must NOT delete the WAL
+    // segment it will write into; the txn then commits and recovers on reopen.
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    db.create_table("t", pk_schema()).unwrap();
+    db.set_spill_threshold(1);
+    let wal_dir = dir.path().join("_wal");
+
+    let reached = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    {
+        let reached = reached.clone();
+        let release = release.clone();
+        db.__set_spill_hook(move || {
+            reached.wait();
+            release.wait();
+        });
+    }
+    let writer = {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            db.transaction(|t| {
+                for i in 0..60i64 {
+                    t.put("t", vec![(1, Value::Int64(i))])?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        })
+    };
+
+    reached.wait();
+    let before = count_wal_segments(&wal_dir);
+    db.gc().unwrap();
+    assert_eq!(
+        count_wal_segments(&wal_dir),
+        before,
+        "active WAL segment must survive gc() during an in-flight txn"
+    );
+    release.wait();
+    writer.join().unwrap();
+
+    assert_eq!(db.table("t").unwrap().lock().count(), 60);
+    // Reopen — the committed txn is durable.
+    drop(db);
+    let db = Database::open(dir.path()).unwrap();
+    assert_eq!(db.table("t").unwrap().lock().count(), 60);
+}
+
+#[test]
+fn gc_reaps_accumulated_wal_segments_once_durable() {
+    // `SharedWal::open` mints a fresh segment per reopen without truncating the
+    // old ones. After the data is durable in runs, gc() reaps the rotated
+    // (non-active) segments while keeping the active one — and the DB still
+    // opens and reads correctly afterward.
+    let dir = tempdir().unwrap();
+    let wal_dir = dir.path().join("_wal");
+    {
+        let db = Database::create(dir.path()).unwrap();
+        db.create_table("t", pk_schema()).unwrap();
+        let tbl = db.table("t").unwrap();
+        tbl.lock().set_mutable_run_spill_bytes(1);
+        db.transaction(|t| t.put("t", vec![(1, Value::Int64(1))]).map(|_| ()))
+            .unwrap();
+        tbl.lock().flush().unwrap();
+    }
+    // A few reopens accumulate segments.
+    for _ in 0..3 {
+        let db = Database::open(dir.path()).unwrap();
+        db.table("t").unwrap().lock().flush().unwrap();
+        drop(db);
+    }
+    assert!(
+        count_wal_segments(&wal_dir) > 1,
+        "reopens should accumulate WAL segments"
+    );
+
+    let db = Database::open(dir.path()).unwrap();
+    // Data is durable (flushed); gc reaps the rotated segments.
+    db.gc().unwrap();
+    assert_eq!(
+        count_wal_segments(&wal_dir),
+        1,
+        "only the active segment remains after gc"
+    );
+    assert_eq!(db.table("t").unwrap().lock().count(), 1);
+
+    // Still recoverable after reopening post-GC.
+    drop(db);
+    let db = Database::open(dir.path()).unwrap();
+    assert_eq!(db.table("t").unwrap().lock().count(), 1);
 }
 
 #[test]

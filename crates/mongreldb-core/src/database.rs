@@ -79,6 +79,14 @@ pub struct Database {
     active_txns: crate::txn::ActiveTxns,
     /// P3.2: set on fsync error — all subsequent writes fail fast (spec §9.3e).
     poisoned: std::sync::atomic::AtomicBool,
+    /// P3.6: txn ids currently spilling into `_txn/<id>/`. GC never deletes a
+    /// live spill's pending dir (review fix #14, spec §6.4).
+    active_spills: Arc<crate::retention::ActiveSpills>,
+    /// Test-only barrier invoked after a transaction writes its spill runs but
+    /// before the sequencer/publish, so tests can race `gc()` against an
+    /// in-flight spill. `None` in production.
+    #[doc(hidden)]
+    spill_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 impl Database {
@@ -235,6 +243,8 @@ impl Database {
             active_txns: crate::txn::ActiveTxns::new(),
             poisoned: std::sync::atomic::AtomicBool::new(false),
             spill_threshold: std::sync::atomic::AtomicU64::new(64 * 1024 * 1024),
+            active_spills: Arc::new(crate::retention::ActiveSpills::new()),
+            spill_hook: Mutex::new(None),
         })
     }
 
@@ -368,6 +378,10 @@ impl Database {
         // streamed as Put records; they are linked at publish time.
         let mut spilled: Vec<SpilledRun> = Vec::new();
         let mut spilled_tables: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        // Protect this txn's `_txn/<id>/` dir from a concurrent `gc()` for as long
+        // as the spill runs are live (registered on first spill, dropped at the
+        // end of this function on commit/abort/error).
+        let mut spill_guard: Option<crate::retention::SpillGuard> = None;
         {
             let mut table_bytes: HashMap<u64, usize> = HashMap::new();
             for (table_id, staged) in &staging {
@@ -387,6 +401,7 @@ impl Database {
                 let Some(handle) = tables.get(&table_id) else {
                     continue;
                 };
+                spill_guard.get_or_insert_with(|| self.active_spills.register(txn_id));
                 let mut t = handle.lock();
                 let tdir = t.table_dir().to_path_buf();
                 let txn_dir = tdir.join("_txn").join(txn_id.to_string());
@@ -433,6 +448,13 @@ impl Database {
                     max_rid,
                 });
                 spilled_tables.insert(table_id);
+            }
+        }
+
+        // Test seam: let a test race `gc()` against this in-flight spill.
+        if spill_guard.is_some() {
+            if let Some(hook) = self.spill_hook.lock().as_ref() {
+                hook();
             }
         }
 
@@ -785,7 +807,10 @@ impl Database {
         }
         drop(cat);
 
-        // Sweep stale _txn/ dirs on remaining live tables.
+        // Sweep stale _txn/<id>/ dirs on remaining live tables — but NEVER an
+        // in-flight spill's dir (deleting it would lose the pending run and fail
+        // the commit, review fix #14). Each `_txn/` subdir is named by its txn id;
+        // skip any id still registered in `active_spills`.
         let cat = self.catalog.read();
         for entry in &cat.tables {
             if !matches!(entry.state, TableState::Live) {
@@ -796,10 +821,50 @@ impl Database {
                 .join(TABLES_DIR)
                 .join(entry.table_id.to_string())
                 .join("_txn");
-            if txn_dir.exists() {
-                std::fs::remove_dir_all(&txn_dir)?;
+            if !txn_dir.exists() {
+                continue;
+            }
+            for sub in std::fs::read_dir(&txn_dir)? {
+                let sub = sub?;
+                let name = sub.file_name();
+                let Some(name) = name.to_str() else { continue };
+                // A non-numeric entry can't belong to a live txn — sweep it.
+                let is_active = name
+                    .parse::<u64>()
+                    .map(|id| self.active_spills.is_active(id))
+                    .unwrap_or(false);
+                if is_active {
+                    continue;
+                }
+                std::fs::remove_dir_all(sub.path())?;
                 reclaimed += 1;
             }
+        }
+        drop(cat);
+
+        // Reap compaction-superseded runs whose retire epoch no pinned snapshot
+        // can still need (spec §6.4). Each table deletes its own retired files
+        // gated on `min_active` and persists its manifest.
+        let tables = self.tables.read();
+        for handle in tables.values() {
+            reclaimed += handle.lock().reap_retiring(Epoch(min_active))?;
+        }
+
+        // WAL-segment GC (spec §6.4/§16). `SharedWal::open` mints a fresh active
+        // segment on every reopen without truncating the prior ones, so rotated
+        // segments accumulate. Once every live table's committed data is durable
+        // in runs (no in-memory rows) and no in-flight spill is open, all rotated
+        // (non-active) segments are redundant for recovery and safe to delete —
+        // an in-flight txn only ever appends to the active segment, which is
+        // never deleted.
+        let all_durable = self.active_spills.is_idle()
+            && tables.values().all(|h| {
+                let g = h.lock();
+                g.memtable_len() == 0 && g.mutable_run_len() == 0
+            });
+        drop(tables);
+        if all_durable {
+            reclaimed += self.shared_wal.lock().gc_segments(u64::MAX)?;
         }
 
         Ok(reclaimed)
@@ -817,6 +882,14 @@ impl Database {
     pub fn set_spill_threshold(&self, bytes: u64) {
         self.spill_threshold
             .store(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Test-only: install a hook invoked after a transaction writes its spill
+    /// runs but before the sequencer, so a test can race `gc()` against an
+    /// in-flight spill. Not part of the stable API.
+    #[doc(hidden)]
+    pub fn __set_spill_hook(&self, f: impl Fn() + Send + Sync + 'static) {
+        *self.spill_hook.lock() = Some(Box::new(f));
     }
 
     /// Verify multi-table integrity (spec §16). For every live table this:
@@ -899,6 +972,13 @@ impl Database {
                         );
                     }
                 }
+            }
+
+            // Compaction-superseded runs awaiting retention-gated deletion are
+            // tracked in `retiring`; their files are expected on disk, so they
+            // are not orphans.
+            for r in &m.retiring {
+                referenced.insert(r.run_id);
             }
 
             // Orphan `.sr` files present on disk but absent from the manifest.
