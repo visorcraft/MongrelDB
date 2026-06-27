@@ -34,6 +34,7 @@ pub mod rowid;
 pub mod schema;
 pub mod sorted_run;
 pub mod tsv;
+pub mod txn;
 pub mod wal;
 
 pub use be_tree::BeTree;

@@ -26,8 +26,8 @@ pub const KEYS_FILENAME: &str = "keys";
 /// writes.
 pub type TableHandle = Arc<Mutex<Table>>;
 
-/// A multi-table database: one catalog, one epoch clock, shared caches, and a
-/// live map of name → `Arc<Table>`.
+/// A multi-table database: one catalog, one epoch clock, shared caches, a
+/// shared WAL, and a live map of name → `Arc<Table>`.
 pub struct Database {
     root: PathBuf,
     catalog: RwLock<Catalog>,
@@ -36,6 +36,12 @@ pub struct Database {
     page_cache: Arc<parking_lot::Mutex<crate::cache::PageCache>>,
     decoded_cache: Arc<parking_lot::Mutex<crate::cache::DecodedPageCache>>,
     commit_lock: Arc<Mutex<()>>,
+    /// One shared WAL multiplexing every table's records (spec §7.2). Owned
+    /// behind a `Mutex` so the transaction layer can append + group-sync.
+    shared_wal: Mutex<crate::wal::SharedWal>,
+    /// Monotonic per-open transaction-id counter. Scoped by `open_generation`
+    /// in P2.7; here it just needs to be unique within an open.
+    next_txn_id: Mutex<u64>,
     tables: RwLock<HashMap<u64, TableHandle>>,
     kek: Option<Arc<crate::encryption::Kek>>,
     /// Serializes DDL (create/drop table); data commits serialize through
@@ -120,6 +126,11 @@ impl Database {
             crate::cache::DecodedPageCache::new(crate::engine::DECODED_CACHE_CAPACITY),
         ));
         let commit_lock = Arc::new(Mutex::new(()));
+        let shared_wal = Mutex::new(crate::wal::SharedWal::create_with_dek(
+            &root,
+            Epoch(cat.db_epoch),
+            crate::encryption::wal_dek_for(kek.as_deref()),
+        )?);
 
         // Open every live table against the shared context. Each `open_in`
         // advances the shared epoch authority to its manifest epoch, so the
@@ -150,6 +161,8 @@ impl Database {
             page_cache,
             decoded_cache,
             commit_lock,
+            shared_wal,
+            next_txn_id: Mutex::new(1),
             tables: RwLock::new(tables),
             kek,
             ddl_lock: Mutex::new(()),
@@ -160,6 +173,134 @@ impl Database {
     /// The current reader-visible epoch.
     pub fn visible_epoch(&self) -> Epoch {
         self.epoch.visible()
+    }
+
+    /// Resolve a table name → id (live tables only). pub(crate) so the
+    /// transaction layer can stage by name.
+    pub(crate) fn table_id(&self, name: &str) -> Result<u64> {
+        let cat = self.catalog.read();
+        cat.live(name)
+            .map(|e| e.table_id)
+            .ok_or_else(|| MongrelError::NotFound(format!("table {name:?} not found")))
+    }
+
+    /// Begin a new transaction reading at the current visible epoch.
+    pub fn begin(&self) -> crate::txn::Transaction<'_> {
+        let txn_id = {
+            let mut g = self.next_txn_id.lock();
+            let id = *g;
+            *g += 1;
+            id
+        };
+        let read = Snapshot::at(self.epoch.visible());
+        crate::txn::Transaction::new(self, txn_id, read)
+    }
+
+    /// Run `f` in a transaction; commit on `Ok`, rollback on `Err`.
+    pub fn transaction<T>(
+        &self,
+        f: impl FnOnce(&mut crate::txn::Transaction) -> Result<T>,
+    ) -> Result<T> {
+        let mut tx = self.begin();
+        match f(&mut tx) {
+            Ok(out) => {
+                tx.commit()?;
+                Ok(out)
+            }
+            Err(e) => {
+                tx.rollback();
+                Err(e)
+            }
+        }
+    }
+
+    /// Seal a transaction: serial commit under `commit_lock`, append to the
+    /// shared WAL, group-sync, apply to tables, persist manifests, publish.
+    /// Single-applier subset (P3 splits this into validate-first + group commit).
+    pub(crate) fn commit_transaction(
+        &self,
+        txn_id: u64,
+        staging: Vec<(u64, crate::txn::Staged)>,
+    ) -> Result<Epoch> {
+        use crate::memtable::Row;
+        use crate::txn::StagedOp;
+        use crate::wal::Op;
+
+        // Serial applier: the whole assign→fsync→publish is one critical
+        // section so the dual-counter publishes strictly in order.
+        let _g = self.commit_lock.lock();
+        let new_epoch = self.epoch.bump_assigned();
+
+        // Build rows (allocating ids) and append data records to the shared WAL
+        // BEFORE making anything visible.
+        let mut wal = self.shared_wal.lock();
+        let tables = self.tables.read();
+        let mut applies: Vec<(u64, Vec<StagedOp>)> = Vec::new();
+
+        for (table_id, staged) in staging {
+            let handle = tables
+                .get(&table_id)
+                .ok_or_else(|| MongrelError::NotFound(format!("table {table_id} not mounted")))?;
+            let mut t = handle.lock();
+            let mut ops = Vec::new();
+            match staged {
+                crate::txn::Staged::Put(cells) => {
+                    let row_id = t.alloc_row_id();
+                    let mut row = Row::new(row_id, new_epoch);
+                    for (c, v) in cells {
+                        row.columns.insert(c, v);
+                    }
+                    let payload = bincode::serialize(&vec![row.clone()])
+                        .map_err(|e| MongrelError::Other(format!("row serialize: {e}")))?;
+                    wal.append(
+                        txn_id,
+                        table_id,
+                        Op::Put {
+                            table_id,
+                            rows: payload,
+                        },
+                    )?;
+                    ops.push(StagedOp::Put(row));
+                }
+                crate::txn::Staged::Delete(rid) => {
+                    wal.append(
+                        txn_id,
+                        table_id,
+                        Op::Delete {
+                            table_id,
+                            row_ids: vec![rid],
+                        },
+                    )?;
+                    ops.push(StagedOp::Delete(rid));
+                }
+            }
+            applies.push((table_id, ops));
+        }
+
+        // Seal + group-fsync.
+        wal.append_commit(txn_id, new_epoch, &[])?;
+        let _durable_seq = wal.group_sync()?;
+        drop(wal);
+
+        // Apply the now-durable staging to each table's memtable + indexes at
+        // the commit epoch, then persist the manifest so reopen sees it.
+        for (table_id, ops) in applies {
+            let Some(handle) = tables.get(&table_id) else {
+                continue;
+            };
+            let mut t = handle.lock();
+            for op in ops {
+                match op {
+                    StagedOp::Put(row) => t.apply_put_rows(vec![row]),
+                    StagedOp::Delete(rid) => t.apply_delete(rid, new_epoch),
+                }
+            }
+            t.invalidate_pending_cache();
+            t.persist_manifest(new_epoch)?;
+        }
+
+        self.epoch.publish_visible(new_epoch);
+        Ok(new_epoch)
     }
 
     /// Register a read snapshot at the current visible epoch and return it with

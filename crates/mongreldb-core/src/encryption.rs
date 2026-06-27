@@ -14,6 +14,8 @@ use crate::error::Result;
 // `MongrelError` is only constructed by the feature-gated AES / key submodules.
 #[cfg(feature = "encryption")]
 use crate::error::MongrelError;
+#[cfg(feature = "encryption")]
+use zeroize::Zeroizing;
 
 /// DEK length (AES-256 = 32 bytes). Always available.
 pub const DEK_LEN: usize = 32;
@@ -617,6 +619,18 @@ pub fn meta_dek_for(kek: Option<&Kek>) -> Option<[u8; DEK_LEN]> {
 
 #[cfg(not(feature = "encryption"))]
 pub fn meta_dek_for(_kek: Option<&Kek>) -> Option<[u8; DEK_LEN]> {
+    None
+}
+
+/// Derive the shared-WAL frame DEK from an optional KEK. `None` when the KEK is
+/// absent or encryption is disabled.
+#[cfg(feature = "encryption")]
+pub fn wal_dek_for(kek: Option<&Kek>) -> Option<Zeroizing<[u8; DEK_LEN]>> {
+    kek.map(|k| k.derive_wal_key())
+}
+
+#[cfg(not(feature = "encryption"))]
+pub fn wal_dek_for(_kek: Option<&Kek>) -> Option<zeroize::Zeroizing<[u8; DEK_LEN]>> {
     None
 }
 

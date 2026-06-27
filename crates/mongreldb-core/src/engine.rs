@@ -1213,13 +1213,6 @@ impl Table {
     /// Append `rows` (all sharing the pending epoch) under one WAL record, index
     /// them, and fold them into the memtable.
     fn commit_rows(&mut self, rows: Vec<Row>) -> Result<()> {
-        let n = rows.len();
-        // Track mutated columns for fine-grained cache invalidation (c).
-        for r in &rows {
-            for &cid in r.columns.keys() {
-                self.pending_put_cols.insert(cid);
-            }
-        }
         let payload = bincode::serialize(&rows)?;
         self.wal.append_txn(
             self.current_txn_id,
@@ -1228,6 +1221,22 @@ impl Table {
                 rows: payload,
             },
         )?;
+        self.apply_put_rows(rows);
+        Ok(())
+    }
+
+    /// Apply already-durable put rows to the memtable + indexes + allocator +
+    /// live count WITHOUT appending to the per-table WAL (the WAL — shared or
+    /// per-table — is the caller's responsibility). Used by the cross-table
+    /// `Transaction` commit path (P2.5) after it has written the shared WAL.
+    pub(crate) fn apply_put_rows(&mut self, rows: Vec<Row>) {
+        let n = rows.len();
+        // Track mutated columns for fine-grained cache invalidation (c).
+        for r in &rows {
+            for &cid in r.columns.keys() {
+                self.pending_put_cols.insert(cid);
+            }
+        }
         if let Some(pk_col) = self.schema.primary_key() {
             for r in &rows {
                 if let Some(pk_val) = r.columns.get(&pk_col.id) {
@@ -1250,7 +1259,18 @@ impl Table {
             self.memtable.upsert(r);
         }
         self.live_count = self.live_count.saturating_add(n as u64);
-        Ok(())
+    }
+
+    /// Allocate a fresh row id (advancing the table's allocator). Used by the
+    /// cross-table `Transaction` to assign ids before sealing a row.
+    pub(crate) fn alloc_row_id(&mut self) -> RowId {
+        self.allocator.alloc()
+    }
+
+    /// The table's id.
+    #[allow(dead_code)]
+    pub(crate) fn table_id(&self) -> u64 {
+        self.table_id
     }
 
     /// Logically delete `row_id` (effective at the next commit).
@@ -1263,6 +1283,13 @@ impl Table {
                 row_ids: vec![row_id],
             },
         )?;
+        self.apply_delete(row_id, epoch);
+        Ok(())
+    }
+
+    /// Apply a tombstone (already-durable on the WAL) at `epoch` without
+    /// appending to the per-table WAL. Used by the cross-table `Transaction`.
+    pub(crate) fn apply_delete(&mut self, row_id: RowId, epoch: Epoch) {
         self.memtable.tombstone(row_id, epoch);
         self.live_count = self.live_count.saturating_sub(1);
         // Track for fine-grained cache invalidation (c).
@@ -1271,7 +1298,6 @@ impl Table {
         // delta) unsafe — permanently disable it for this table.
         self.had_deletes = true;
         self.agg_cache.clear();
-        Ok(())
     }
 
     fn index_row(&mut self, row: &Row) {
@@ -1328,7 +1354,10 @@ impl Table {
         // sharing the epoch authority so `visible` is published strictly in
         // assigned order (the dual-counter invariant). P3's bounded sequencer
         // replaces this with validate-first + group commit (overlapping fsync).
-        let _g = self.commit_lock.lock();
+        // Clone the Arc first so the guard does not borrow `self` (we take
+        // `&mut self` methods below).
+        let commit_lock = Arc::clone(&self.commit_lock);
+        let _g = commit_lock.lock();
         let new_epoch = self.epoch.bump_assigned();
         // Seal the staged records under a TxnCommit marker carrying the commit
         // epoch, then a single group fsync. Recovery applies only records whose
@@ -1341,14 +1370,7 @@ impl Table {
             },
         )?;
         self.wal.sync()?;
-        // Hardening (c): fine-grained invalidation replaces the whole-cache
-        // wipe. Only entries whose footprint intersects a deleted RowId, or
-        // whose condition-columns intersect a mutated column, are dropped.
-        self.result_cache
-            .lock()
-            .invalidate(&self.pending_delete_rids, &self.pending_put_cols);
-        self.pending_delete_rids.clear();
-        self.pending_put_cols.clear();
+        self.invalidate_pending_cache();
         self.persist_manifest(new_epoch)?;
         self.epoch.publish_visible(new_epoch);
         self.current_txn_id += 1;
@@ -1548,6 +1570,18 @@ impl Table {
         wal.sync()?;
         self.wal = wal;
         Ok(())
+    }
+
+    /// Fine-grained result-cache invalidation (hardening (c)): drop only
+    /// entries whose footprint intersects a deleted RowId or whose
+    /// condition-columns intersect a mutated column, then clear the pending
+    /// sets. Called by `commit` and the cross-table transaction path.
+    pub(crate) fn invalidate_pending_cache(&mut self) {
+        self.result_cache
+            .lock()
+            .invalidate(&self.pending_delete_rids, &self.pending_put_cols);
+        self.pending_delete_rids.clear();
+        self.pending_put_cols.clear();
     }
 
     pub(crate) fn persist_manifest(&self, epoch: Epoch) -> Result<()> {
