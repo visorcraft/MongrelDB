@@ -111,9 +111,10 @@ fn check_detects_run_footer_checksum_corruption() {
     let table_id = db.table_id("t").unwrap();
     let run_path = first_run_path(dir.path(), table_id);
 
-    // Flip a byte in the body (payload), not the header or footer magic, so the
-    // old window-scan heuristic (which only looks for RUN_MAGIC in the tail)
-    // cannot catch it — only a real footer checksum does.
+    // Flip a byte in the middle of the file — past the header magic and away
+    // from the footer-magic tail — so the old window-scan heuristic (which only
+    // looks for RUN_MAGIC in the first 8 bytes and the last 80) cannot catch it.
+    // Only a real footer checksum over the body detects this.
     let mut bytes = std::fs::read(&run_path).unwrap();
     let mid = bytes.len() / 2;
     bytes[mid] ^= 0xFF;

@@ -57,11 +57,14 @@ impl Table {
         self.live_count = rows.iter().filter(|r| !r.deleted).count() as u64;
 
         if rows.is_empty() {
+            // Persist the empty manifest BEFORE unlinking the superseded files so
+            // a concurrent `check`/`doctor` never observes a RunRef whose file is
+            // already gone (which would mis-quarantine a healthy table).
+            self.set_run_refs(Vec::new());
+            self.persist_manifest(self.current_epoch())?;
             for rr in &old_refs {
                 let _ = std::fs::remove_file(self.run_path(rr.run_id as u64));
             }
-            self.set_run_refs(Vec::new());
-            self.persist_manifest(self.current_epoch())?;
             // No live rows remain; the in-memory indexes are stale → drop the
             // checkpoint so reopen rebuilds (empty) instead of loading it.
             self.invalidate_index_checkpoint();
@@ -80,9 +83,11 @@ impl Table {
         }
         let header = writer.write(&path, &rows)?;
 
-        for rr in &old_refs {
-            let _ = std::fs::remove_file(self.run_path(rr.run_id as u64));
-        }
+        // Point the manifest at the new run and persist it BEFORE unlinking the
+        // superseded files, so a concurrent `check`/`doctor` never sees a RunRef
+        // whose file is already gone (which would mis-quarantine a healthy
+        // table). The old files are briefly unreferenced-on-disk — a harmless
+        // `warning`-level orphan, never an `error`.
         self.set_run_refs(vec![RunRef {
             run_id: run_id as u128,
             level: 1,
@@ -90,6 +95,9 @@ impl Table {
             row_count: header.row_count,
         }]);
         self.persist_manifest(self.current_epoch())?;
+        for rr in &old_refs {
+            let _ = std::fs::remove_file(self.run_path(rr.run_id as u64));
+        }
         // Compaction yields exactly one run → (re)build the learned-range PGMs
         // so the checkpoint captures them (otherwise reopen would load a
         // checkpoint with empty learned_range and fall back to page-pruned scans).

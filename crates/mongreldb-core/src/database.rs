@@ -830,6 +830,9 @@ impl Database {
     /// (orphan); and verifies `flushed_epoch <= current_epoch`. Returns the list
     /// of issues found (empty = healthy). Orphans are `warning`-severity; all
     /// other findings are `error`-severity (so [`Self::doctor`] quarantines them).
+    ///
+    /// Cost: O(total run bytes) — the footer checksum is verified over each run's
+    /// full body, so this is an integrity tool, not a hot path.
     pub fn check(&self) -> Vec<CheckIssue> {
         let mut issues = Vec::new();
         let cat = self.catalog.read();
