@@ -115,6 +115,8 @@ pub struct Table {
     /// `Database`. Single-table direct opens get a private one.
     #[allow(dead_code)]
     snapshots: Arc<crate::retention::SnapshotRegistry>,
+    /// Cross-table commit serializer (see [`SharedCtx::commit_lock`]).
+    commit_lock: Arc<parking_lot::Mutex<()>>,
     /// Shared decoded-page cache (Phase 15.4): the post-decompress/decrypt typed
     /// page, so repeat scans skip decode. Keyed by `(run_id, column_id, page)`.
     decoded_cache: Arc<parking_lot::Mutex<crate::cache::DecodedPageCache>>,
@@ -652,6 +654,12 @@ pub(crate) struct SharedCtx {
     pub decoded_cache: Arc<parking_lot::Mutex<crate::cache::DecodedPageCache>>,
     pub snapshots: Arc<crate::retention::SnapshotRegistry>,
     pub kek: Option<Arc<Kek>>,
+    /// Serializes the commit critical section across all tables sharing this
+    /// context so the dual-counter's in-order-publish invariant holds: the
+    /// assigned ticket is reserved, the WAL fsynced, the manifest persisted,
+    /// and `visible` published as one atomic unit. P3 replaces this with the
+    /// bounded validate-first sequencer + group commit (overlapping fsync).
+    pub commit_lock: Arc<parking_lot::Mutex<()>>,
 }
 
 impl SharedCtx {
@@ -671,6 +679,7 @@ impl SharedCtx {
             )),
             snapshots: Arc::new(crate::retention::SnapshotRegistry::new()),
             kek,
+            commit_lock: Arc::new(parking_lot::Mutex::new(())),
         }
     }
 }
@@ -812,6 +821,7 @@ impl Table {
             page_cache: ctx.page_cache,
             decoded_cache: ctx.decoded_cache,
             snapshots: ctx.snapshots,
+            commit_lock: ctx.commit_lock,
             result_cache: Arc::new(parking_lot::Mutex::new(
                 ResultCache::new()
                     .with_dir(rcache_dir)
@@ -959,6 +969,7 @@ impl Table {
             page_cache: ctx.page_cache,
             decoded_cache: ctx.decoded_cache,
             snapshots: ctx.snapshots,
+            commit_lock: ctx.commit_lock,
             result_cache: Arc::new(parking_lot::Mutex::new(
                 ResultCache::new()
                     .with_dir(rcache_dir)
@@ -1273,6 +1284,11 @@ impl Table {
     /// Group-commit: fsync the WAL, advance the epoch so all pending writes
     /// become durable and visible, and persist the manifest.
     pub fn commit(&mut self) -> Result<Epoch> {
+        // Serialize the assign→fsync→publish critical section across all tables
+        // sharing the epoch authority so `visible` is published strictly in
+        // assigned order (the dual-counter invariant). P3's bounded sequencer
+        // replaces this with validate-first + group commit (overlapping fsync).
+        let _g = self.commit_lock.lock();
         self.wal.sync()?;
         let new_epoch = self.epoch.bump_assigned();
         // Hardening (c): fine-grained invalidation replaces the whole-cache
@@ -2136,13 +2152,6 @@ impl Table {
 
     pub fn current_epoch(&self) -> Epoch {
         self.epoch.visible()
-    }
-
-    /// The manifest-endorsed epoch captured at open (used to seed the shared
-    /// epoch authority when mounted in a `Database`).
-    #[allow(dead_code)]
-    pub(crate) fn persisted_epoch(&self) -> u64 {
-        self.persisted_epoch
     }
 
     pub fn memtable_len(&self) -> usize {

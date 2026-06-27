@@ -1,0 +1,521 @@
+crates/mongreldb-core/src/catalog.rs          | 182 +++++++++++++++++
+ crates/mongreldb-core/src/database.rs         | 280 ++++++++++++++++++++++++++
+ crates/mongreldb-core/src/encryption.rs       |  18 ++
+ crates/mongreldb-core/src/engine.rs           | 140 +++++++++----
+ crates/mongreldb-core/src/epoch.rs            |  18 ++
+ crates/mongreldb-core/src/lib.rs              |   5 +
+ crates/mongreldb-core/src/retention.rs        | 136 +++++++++++++
+ crates/mongreldb-core/src/sorted_run.rs       |  40 +++-
+ crates/mongreldb-core/tests/catalog.rs        | 102 ++++++++++
+ crates/mongreldb-core/tests/database_basic.rs |  98 +++++++++
+ 10 files changed, 968 insertions(+), 51 deletions(-)
+
+--- Changes ---
+
+crates/mongreldb-core/src/catalog.rs
+  @@ -0,0 +1,182 @@
+  +//! DB-wide catalog checkpoint (spec §5.1).
+  +//!
+  +//! The catalog records every table's id, name, schema, and live/dropped state
+  +//! plus the DB-wide monotonic counters (`db_epoch`, `next_table_id`,
+  +//! `open_generation`, `next_segment_no`). It is rewritten atomically on every
+  +//! DDL and persisted to `<root>/CATALOG` with:
+  +//!
+  +//! - a fixed magic + SHA-256 integrity tag for plaintext, or
+  +//! - AES-256-GCM (`meta_dek`-derived via [`Kek::derive_meta_key`]) which both
+  +//!   encrypts and authenticates, plus
+  +//! - a directory `sync_all` after the atomic rename (review fix #19), so a crash
+  +//!   never leaves a half-linked catalog entry.
+  +
+  +use crate::error::{MongrelError, Result};
+  +use crate::schema::Schema;
+  +use serde::{Deserialize, Serialize};
+  +use sha2::{Digest, Sha256};
+  +use std::io::Write;
+  +use std::path::Path;
+  +
+  +pub const CATALOG_FILENAME: &str = "CATALOG";
+  +const MAGIC: &[u8; 8] = b"MONGRCAT";
+  +/// 32-byte meta DEK length (matches [`crate::encryption::DEK_LEN`]).
+  +pub const META_DEK_LEN: usize = 32;
+  +
+  +/// Lifecycle state of a catalog table entry.
+  +#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+  +pub enum TableState {
+  +    /// Live and queryable.
+  +    Live,
+  +    /// Logically dropped at `at_epoch`; the physical subdir is reaped once no
+  +    /// reader pins a snapshot older than `at_epoch`.
+  +    Dropped { at_epoch: u64 },
+  +}
+  +
+  +/// One row of the catalog.
+  +#[derive(Debug, Clone, Serialize, Deserialize)]
+  +pub struct CatalogEntry {
+  +    pub table_id: u64,
+  +    pub name: String,
+  +    pub schema: Schema,
+  +    pub state: TableState,
+  +    pub created_epoch: u64,
+  +}
+  +
+  +/// The full in-memory catalog, mirrored on disk by [`write_atomic`].
+  +#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+  +pub struct Catalog {
+  +    /// Highest epoch ever assigned by this DB's commit sequencer.
+  +    pub db_epoch: u64,
+  +    /// Next table id to allocate.
+  +    pub next_table_id: u64,
+  +    /// Bumped (and fsynced) on every open to scope `txn_id` across reopens.
+  +    pub open_generation: u64,
+  +    /// Next shared-WAL segment number to allocate.
+  +    pub next_segment_no: u64,
+  +    pub tables: Vec<CatalogEntry>,
+  +}
+  +
+  +impl Catalog {
+  +    /// An empty catalog for a freshly created DB.
+  +    pub fn empty() -> Self {
+  +        Catalog::default()
+  +    }
+  +
+  +    /// Look up an entry by name (live only).
+  +    pub fn live(&self, name: &str) -> Option<&CatalogEntry> {
+  +        self.tables
+  +            .iter()
+  +            .find(|t| t.name == name && matches!(t.state, TableState::Live))
+  +    }
+  +}
+  +
+  +#[cfg(feature = "encryption")]
+  +fn seal(body: &[u8], meta_dek: Option<&[u8; META_DEK_LEN]>) -> Result<Vec<u8>> {
+  +    match meta_dek {
+  +        Some(dek) => crate::encryption::encrypt_blob(dek, body),
+  +        None => Ok(plaintext_frame(body)),
+  +    }
+  +}
+  +
+  +#[cfg(not(feature = "encryption"))]
+  +fn seal(body: &[u8], _meta_dek: Option<&[u8; META_DEK_LEN]>) -> Result<Vec<u8>> {
+  +    Ok(plaintext_frame(body))
+  +}
+  +
+  +fn plaintext_frame(body: &[u8]) -> Vec<u8> {
+  +    let hash = Sha256::digest(body);
+  +    let mut out = Vec::with_capacity(body.len() + 8 + 32);
+  +    out.extend_from_slice(MAGIC);
+  +    out.extend_from_slice(&hash);
+  +    out.extend_from_slice(body);
+  +    out
+  +}
+  +
+  +/// Atomically write the catalog to `<dir>/CATALOG` (review fix #19: dir-fsync).
+  +///
+  +/// If `meta_dek` is `Some`, the body is AES-256-GCM sealed (confidential +
+  +/// authenticated); otherwise the body carries a SHA-256 tag (integrity only).
+  +pub fn write_atomic(
+  ... (82 lines truncated)
+  +182 -0
+
+crates/mongreldb-core/src/database.rs
+  @@ -0,0 +1,280 @@
+  +//! Multi-table `Database` container (spec §5, §6, §10).
+  +//!
+  +//! Owns the shared services — catalog, dual-counter epoch authority, shared
+  +//! raw/decoded page caches, snapshot-retention registry, and the DB-wide KEK —
+  +//! and mounts per-table [`Table`] engines under `tables/<id>/` that borrow them.
+  +//! P1 scope: per-table WALs remain (collapsed into one shared WAL in P2); the
+  +//! win here is one consistent commit clock across tables and one reopen path.
+  +
+  +use crate::catalog::{self, Catalog, CatalogEntry, TableState, META_DEK_LEN};
+  +use crate::engine::{SharedCtx, Table};
+  +use crate::epoch::{Epoch, EpochAuthority, Snapshot};
+  +use crate::error::{MongrelError, Result};
+  +use crate::retention::{OwnedSnapshotGuard, SnapshotGuard, SnapshotRegistry};
+  +use crate::schema::Schema;
+  +use parking_lot::{Mutex, RwLock};
+  +use std::collections::HashMap;
+  +use std::path::{Path, PathBuf};
+  +use std::sync::Arc;
+  +
+  +pub const TABLES_DIR: &str = "tables";
+  +pub const META_DIR: &str = "_meta";
+  +pub const KEYS_FILENAME: &str = "keys";
+  +
+  +/// A handle to a live table inside a [`Database`]. Writes take the inner lock
+  +/// (P1); P3.3 replaces this with lock-free `ArcSwap` reads + a publish lock for
+  +/// writes.
+  +pub type TableHandle = Arc<Mutex<Table>>;
+  +
+  +/// A multi-table database: one catalog, one epoch clock, shared caches, and a
+  +/// live map of name → `Arc<Table>`.
+  +pub struct Database {
+  +    root: PathBuf,
+  +    catalog: RwLock<Catalog>,
+  +    epoch: Arc<EpochAuthority>,
+  +    snapshots: Arc<SnapshotRegistry>,
+  +    page_cache: Arc<parking_lot::Mutex<crate::cache::PageCache>>,
+  +    decoded_cache: Arc<parking_lot::Mutex<crate::cache::DecodedPageCache>>,
+  +    tables: RwLock<HashMap<u64, TableHandle>>,
+  +    kek: Option<Arc<crate::encryption::Kek>>,
+  +    /// Serializes cross-table mutations (P1); replaced by the bounded commit
+  +    /// sequencer in P3.
+  +    commit_lock: Mutex<()>,
+  +    meta_dek: Option<[u8; META_DEK_LEN]>,
+  +}
+  +
+  +impl Database {
+  +    /// Create a fresh plaintext database at `root`.
+  +    pub fn create(root: impl AsRef<Path>) -> Result<Self> {
+  +        Self::create_inner(root, None)
+  +    }
+  +
+  +    /// Create a fresh encrypted database, deriving the DB-wide KEK from a
+  +    /// passphrase (Argon2id + HKDF). The salt is persisted at `_meta/keys`.
+  +    #[cfg(feature = "encryption")]
+  +    pub fn create_encrypted(root: impl AsRef<Path>, passphrase: &str) -> Result<Self> {
+  +        let root = root.as_ref();
+  +        std::fs::create_dir_all(root)?;
+  +        std::fs::create_dir_all(root.join(META_DIR))?;
+  +        let salt = crate::encryption::random_salt();
+  +        std::fs::write(root.join(META_DIR).join(KEYS_FILENAME), salt)?;
+  +        let kek = Arc::new(crate::encryption::Kek::derive(passphrase, &salt)?);
+  +        Self::create_inner(root, Some(kek))
+  +    }
+  +
+  +    fn create_inner(
+  +        root: impl AsRef<Path>,
+  +        kek: Option<Arc<crate::encryption::Kek>>,
+  +    ) -> Result<Self> {
+  +        let root = root.as_ref().to_path_buf();
+  +        std::fs::create_dir_all(&root)?;
+  +        std::fs::create_dir_all(root.join(TABLES_DIR))?;
+  +        let meta_dek = crate::encryption::meta_dek_for(kek.as_deref());
+  +        let cat = Catalog::empty();
+  +        catalog::write_atomic(&root, &cat, meta_dek.as_ref())?;
+  +        Self::finish_open(root, cat, kek, meta_dek)
+  +    }
+  +
+  +    /// Open an existing plaintext database.
+  +    pub fn open(root: impl AsRef<Path>) -> Result<Self> {
+  +        Self::open_inner(root, None, None)
+  +    }
+  +
+  +    /// Open an existing encrypted database with a passphrase.
+  +    #[cfg(feature = "encryption")]
+  +    pub fn open_encrypted(root: impl AsRef<Path>, passphrase: &str) -> Result<Self> {
+  +        let root = root.as_ref();
+  +        let salt_bytes = std::fs::read(root.join(META_DIR).join(KEYS_FILENAME))
+  +            .map_err(|e| MongrelError::NotFound(format!("encryption salt file: {e}")))?;
+  +        let mut salt = [0u8; crate::encryption::SALT_LEN];
+  +        salt.copy_from_slice(&salt_bytes);
+  +        let kek = Arc::new(crate::encryption::Kek::derive(passphrase, &salt)?);
+  +        Self::open_inner(root, Some(kek), None)
+  +    }
+  +
+  +    fn open_inner(
+  +        root: impl AsRef<Path>,
+  +        kek: Option<Arc<crate::encryption::Kek>>,
+  +        _meta_dek_override: Option<[u8; META_DEK_LEN]>,
+  +    ) -> Result<Self> {
+  +        let root = root.as_ref().to_path_buf();
+  ... (180 lines truncated)
+  +280 -0
+
+crates/mongreldb-core/src/encryption.rs
+  @@ -185,6 +185,12 @@ mod key {
+  +        /// Derive the meta DEK used to encrypt + authenticate DB-wide metadata
+  +        /// (catalog, manifest checkpoints). Mirrors [`Self::derive_idx_key`].
+  +        pub fn derive_meta_key(&self) -> Zeroizing<[u8; DEK_LEN]> {
+  +            self.derive_subkey(b"mongreldb/meta/v1")
+  +        }
+  +
+           /// Wrap a 32-byte DEK with the KEK using AES-256-GCM. `wrap_nonce` must
+           /// be unique per use under this KEK (a run's random `nonce_prefix`
+           /// satisfies this).
+  @@ -602,6 +608,18 @@ pub fn build_run_cipher(_kek: &Kek, _descriptor_bytes: &[u8]) -> crate::Result<R
+  +/// Derive the DB-wide meta DEK from an optional KEK. `None` when the KEK is
+  +/// absent (plaintext DB) or when encryption is disabled at compile time.
+  +#[cfg(feature = "encryption")]
+  +pub fn meta_dek_for(kek: Option<&Kek>) -> Option<[u8; DEK_LEN]> {
+  +    kek.map(|k| *k.derive_meta_key())
+  +}
+  +
+  +#[cfg(not(feature = "encryption"))]
+  +pub fn meta_dek_for(_kek: Option<&Kek>) -> Option<[u8; DEK_LEN]> {
+  +    None
+  +}
+  +
+   #[cfg(test)]
+   mod tests {
+       use super::*;
+  +18 -0
+
+crates/mongreldb-core/src/engine.rs
+  @@ -11,7 +11,7 @@ use crate::columnar;
+  -use crate::epoch::{Epoch, EpochClock, Snapshot};
+  +use crate::epoch::{Epoch, EpochAuthority, Snapshot};
+   use crate::global_idx;
+   use crate::index::{AnnIndex, BitmapIndex, ColumnLearnedRange, FmIndex, HotIndex, SparseIndex};
+   use crate::manifest::{self, Manifest, RunRef};
+  @@ -35,8 +35,8 @@ pub const RCACHE_DIR: &str = "_rcache";
+  -const PAGE_CACHE_CAPACITY: u64 = 64 * 1024 * 1024; // 64 MiB shared page cache
+  -const DECODED_CACHE_CAPACITY: u64 = 64 * 1024 * 1024; // 64 MiB shared decoded-page cache (Phase 15.4)
+  +pub(crate) const PAGE_CACHE_CAPACITY: u64 = 64 * 1024 * 1024; // 64 MiB shared page cache
+  +pub(crate) const DECODED_CACHE_CAPACITY: u64 = 64 * 1024 * 1024; // 64 MiB shared decoded-page cache (Phase 15.4)
+   /// Default byte watermark at which the PMA mutable-run tier spills to an
+   /// immutable `.sr` sorted run (Phase 11.1). Coalesces many small flushes into
+   /// one larger run so the read path merges fewer readers.
+  @@ -59,7 +59,10 @@ pub struct Table {
+  -    clock: EpochClock,
+  +    epoch: Arc<EpochAuthority>,
+  +    /// Manifest-endorsed epoch at open; used to seed the (shared) epoch
+  +    /// authority on a fresh open. Updated whenever the manifest is persisted.
+  +    persisted_epoch: u64,
+       schema: Schema,
+       hot: HotIndex,
+       /// Table Key-Encryption Key (Argon2id+HKDF from the passphrase). Each run
+  @@ -108,6 +111,10 @@ pub struct Table {
+  +    /// Global snapshot-retention registry shared across all tables in a
+  +    /// `Database`. Single-table direct opens get a private one.
+  +    #[allow(dead_code)]
+  +    snapshots: Arc<crate::retention::SnapshotRegistry>,
+       /// Shared decoded-page cache (Phase 15.4): the post-decompress/decrypt typed
+       /// page, so repeat scans skip decode. Keyed by `(run_id, column_id, page)`.
+       decoded_cache: Arc<parking_lot::Mutex<crate::cache::DecodedPageCache>>,
+  @@ -635,9 +642,44 @@ fn build_column_keys(kek: Option<&Kek>, schema: &Schema) -> HashMap<u16, ([u8; 3
+  +/// Shared services injected into every `Table` owned by a `Database`: one epoch
+  +/// authority (single commit clock), one raw-page cache, one decoded-page cache,
+  +/// one snapshot-retention registry, and the DB-wide KEK. A directly-opened
+  +/// single table builds a private `SharedCtx` of its own.
+  +pub(crate) struct SharedCtx {
+  +    pub epoch: Arc<EpochAuthority>,
+  +    pub page_cache: Arc<parking_lot::Mutex<crate::cache::PageCache>>,
+  +    pub decoded_cache: Arc<parking_lot::Mutex<crate::cache::DecodedPageCache>>,
+  +    pub snapshots: Arc<crate::retention::SnapshotRegistry>,
+  +    pub kek: Option<Arc<Kek>>,
+  +}
+  +
+  +impl SharedCtx {
+  +    /// Build a fresh private context. `cache_dir = Some(_)` enables on-disk page
+  +    /// cache persistence (single-table direct open); `None` keeps it in-memory
+  +    /// (shared across tables in a `Database`).
+  +    pub(crate) fn new(kek: Option<Arc<Kek>>, cache_dir: Option<PathBuf>) -> Self {
+  +        let mut cache = crate::cache::PageCache::new(PAGE_CACHE_CAPACITY);
+  +        if let Some(d) = cache_dir {
+  +            cache = cache.with_persistence(d);
+  +        }
+  +        Self {
+  +            epoch: Arc::new(EpochAuthority::new(0)),
+  +            page_cache: Arc::new(parking_lot::Mutex::new(cache)),
+  +            decoded_cache: Arc::new(parking_lot::Mutex::new(
+  +                crate::cache::DecodedPageCache::new(DECODED_CACHE_CAPACITY),
+  +            )),
+  +            snapshots: Arc::new(crate::retention::SnapshotRegistry::new()),
+  +            kek,
+  +        }
+  +    }
+  +}
+  +
+   impl Table {
+       pub fn create(dir: impl AsRef<Path>, schema: Schema, table_id: u64) -> Result<Self> {
+  -        Self::create_inner(dir, schema, table_id, None)
+  +        let dir = dir.as_ref().to_path_buf();
+  +        let ctx = SharedCtx::new(None, Some(dir.join(CACHE_DIR)));
+  +        Self::create_in(&dir, schema, table_id, ctx)
+       }
+   
+       /// Create a new encrypted table, deriving the table Key-Encryption Key
+  @@ -662,7 +704,8 @@ impl Table {
+  -        Self::create_inner(dir, schema, table_id, Some(kek))
+  +        let ctx = SharedCtx::new(Some(kek), Some(dir.to_path_buf().join(CACHE_DIR)));
+  +        Self::create_in(dir, schema, table_id, ctx)
+       }
+   
+       /// Create a new encrypted table using a raw key (e.g. from a key file)
+  @@ -681,7 +724,8 @@ impl Table {
+  -        Self::create_inner(dir, schema, table_id, Some(kek))
+  +        let ctx = SharedCtx::new(Some(kek), Some(dir.to_path_buf().join(CACHE_DIR)));
+  +        Self::create_in(dir, schema, table_id, ctx)
+       }
+   
+       /// Open an existing encrypted table using a raw key.
+  @@ -705,20 +749,21 @@ impl Table {
+  -        Self::open_with_cipher(dir, Some(kek))
+  +        let ctx = SharedCtx::new(Some(kek), Some(dir.to_path_buf().join(CACHE_DIR)));
+  +        Self::open_in(dir, ctx)
+       }
+   
+  -    fn create_inner(
+  +    pub(crate) fn create_in(
+           dir: impl AsRef<Path>,
+           schema: Schema,
+           table_id: u64,
+  -        kek: Option<Arc<Kek>>,
+  +        ctx: SharedCtx,
+       ) -> Result<Self> {
+           let dir = dir.as_ref().to_path_buf();
+           std::fs::create_dir_all(dir.join(WAL_DIR))?;
+           std::fs::create_dir_all(dir.join(RUNS_DIR))?;
+           write_schema(&dir, &schema)?;
+  -        let (wal_dek, cache_dek) = derive_subkeys(kek.as_deref());
+  +        let (wal_dek, cache_dek) = derive_subkeys(ctx.kek.as_deref());
+           let mut wal = if let Some(ref dk) = wal_dek {
+               Wal::create_with_cipher(
+                   dir.join(WAL_DIR).join("seg-000000.wal"),
+  @@ -732,8 +777,7 @@ impl Table {
+  -        let column_keys = build_column_keys(kek.as_deref(), &schema);
+  -        let cache_dir = dir.join(CACHE_DIR);
+  +        let column_keys = build_column_keys(ctx.kek.as_deref(), &schema);
+           let rcache_dir = dir.join(RCACHE_DIR);
+           Ok(Self {
+               dir,
+  @@ -744,10 +788,11 @@ impl Table {
+  -            clock: EpochClock::new(0),
+  +            epoch: ctx.epoch,
+  +            persisted_epoch: 0,
+               schema,
+               hot: HotIndex::new(),
+  -            kek,
+  +            kek: ctx.kek,
+               column_keys,
+               run_refs: Vec::new(),
+               next_run_id: 1,
+  @@ -764,12 +809,9 @@ impl Table {
+  -            page_cache: Arc::new(parking_lot::Mutex::new(
+  -                crate::cache::PageCache::new(PAGE_CACHE_CAPACITY).with_persistence(cache_dir),
+  -            )),
+  -            decoded_cache: Arc::new(parking_lot::Mutex::new(
+  -                crate::cache::DecodedPageCache::new(DECODED_CACHE_CAPACITY),
+  -            )),
+  +            page_cache: ctx.page_cache,
+  +            decoded_cache: ctx.decoded_cache,
+  +            snapshots: ctx.snapshots,
+               result_cache: Arc::new(parking_lot::Mutex::new(
+                   ResultCache::new()
+                       .with_dir(rcache_dir)
+  @@ -785,7 +827,9 @@ impl Table {
+  -        Self::open_with_cipher(dir, None)
+  +        let dir = dir.as_ref();
+  +        let ctx = SharedCtx::new(None, Some(dir.to_path_buf().join(CACHE_DIR)));
+  +        Self::open_in(dir, ctx)
+       }
+   
+       /// Open an existing encrypted table. `passphrase` must match the one used at
+  @@ -810,16 +854,18 @@ impl Table {
+  -        Self::open_with_cipher(dir, Some(kek))
+  +        let ctx = SharedCtx::new(Some(kek), Some(dir.to_path_buf().join(CACHE_DIR)));
+  +        let t = Self::open_in(dir, ctx)?;
+  +        Ok(t)
+       }
+   
+  -    fn open_with_cipher(dir: impl AsRef<Path>, kek: Option<Arc<Kek>>) -> Result<Self> {
+  +    pub(crate) fn open_in(dir: impl AsRef<Path>, ctx: SharedCtx) -> Result<Self> {
+           let dir = dir.as_ref().to_path_buf();
+           let manifest = manifest::read(&dir)?;
+           let schema: Schema = read_schema(&dir)?;
+           let active = latest_wal_segment(&dir.join(WAL_DIR))?;
+           let replay_epoch = Epoch(manifest.current_epoch);
+  -        let (wal_dek, cache_dek) = derive_subkeys(kek.as_deref());
+  +        let (wal_dek, cache_dek) = derive_subkeys(ctx.kek.as_deref());
+           // Replay BEFORE truncating: `Wal::create` would erase the segment.
+           let replayed = match &active {
+               Some(path) => {
+  @@ -844,7 +890,7 @@ impl Table {
+  -        let clock = EpochClock::new(manifest.current_epoch);
+  +        let persisted_epoch = manifest.current_epoch;
+   
+           // 1. Apply the replayed records to the memtable + allocator, collecting
+           //    the Put rows for index insertion. Indexing happens AFTER loading
+  @@ -873,9 +919,8 @@ impl Table {
+  -        let cache_dir = dir.join(CACHE_DIR);
+           let rcache_dir = dir.join(RCACHE_DIR);
+  -        let column_keys = build_column_keys(kek.as_deref(), &schema);
+  +        let column_keys = build_column_keys(ctx.kek.as_deref(), &schema);
+           let mut db = Self {
+               dir,
+               table_id: manifest.table_id,
+  @@ -885,10 +930,11 @@ impl Table {
+  -            clock,
+  +            epoch: ctx.epoch,
+  +            persisted_epoch,
+               schema,
+               hot: HotIndex::new(),
+  -            kek,
+  +            kek: ctx.kek,
+               column_keys,
+               run_refs: manifest.runs.clone(),
+               next_run_id: manifest
+  @@ -910,12 +956,9 @@ impl Table {
+  -            page_cache: Arc::new(parking_lot::Mutex::new(
+  -                crate::cache::PageCache::new(PAGE_CACHE_CAPACITY).with_persistence(cache_dir),
+  -            )),
+  -            decoded_cache: Arc::new(parking_lot::Mutex::new(
+  -                crate::cache::DecodedPageCache::new(DECODED_CACHE_CAPACITY),
+  -            )),
+  +            page_cache: ctx.page_cache,
+  +            decoded_cache: ctx.decoded_cache,
+  +            snapshots: ctx.snapshots,
+               result_cache: Arc::new(parking_lot::Mutex::new(
+                   ResultCache::new()
+                       .with_dir(rcache_dir)
+  @@ -926,6 +969,10 @@ impl Table {
+  +        // Advance the (possibly shared) epoch authority to this table's manifest
+  +        // epoch so rebuild/index reads below observe the recovered watermark.
+  +        db.epoch.advance_recovered(Epoch(db.persisted_epoch));
+  +
+           // 2. Fast path: load the persisted global-index checkpoint (Phase 9.1).
+           //    Valid only when its embedded epoch matches the manifest-endorsed
+           //    `global_idx_epoch` and every run was created at or before it, so the
+  @@ -1081,7 +1128,7 @@ impl Table {
+  -        Epoch(self.clock.now().0 + 1)
+  +        Epoch(self.epoch.visible().0 + 1)
+       }
+   
+       /// Upsert a row. Allocates a [`RowId`], appends a (non-fsynced) WAL record,
+  @@ -1227,7 +1274,7 @@ impl Table {
+  -        let new_epoch = self.clock.bump();
+  +        let new_epoch = self.epoch.bump_assigned();
+           // Hardening (c): fine-grained invalidation replaces the whole-cache
+           // wipe. Only entries whose footprint intersects a deleted RowId, or
+           // whose condition-columns intersect a mutated column, are dropped.
+  @@ -1237,6 +1284,7 @@ impl Table {
+  +        self.epoch.publish_visible(new_epoch);
+           Ok(new_epoch)
+       }
+   
+  @@ -1464,7 +1512,7 @@ impl Table {
+  -        let _ = self.persist_manifest(self.clock.now());
+  +        let _ = self.persist_manifest(self.epoch.visible());
+       }
+   
+       /// Read the row at `row_id` visible to `snapshot`, merging the newest
+  @@ -2060,13 +2108,13 @@ impl Table {
+  -        self.clock.snapshot()
+  +        Snapshot::at(self.epoch.visible())
+       }
+   
+       /// Pin the current epoch as a read snapshot; compaction will preserve the
+       /// versions it needs until [`Table::unpin_snapshot`] is called.
+       pub fn pin_snapshot(&mut self) -> Snapshot {
+  -        let e = self.clock.now();
+  +        let e = self.epoch.visible();
+           *self.pinned.entry(e).or_insert(0) += 1;
+           Snapshot::at(e)
+       }
+  @@ -2087,7 +2135,14 @@ impl Table {
+  -        self.clock.now()
+  +        self.epoch.visible()
+  +    }
+  +
+  +    /// The manifest-endorsed epoch captured at open (used to seed the shared
+  +    /// epoch authority when mounted in a `Database`).
+  +    #[allow(dead_code)]
+  +    pub(crate) fn persisted_epoch(&self) -> u64 {
+  +        self.persisted_epoch
+       }
+   
+
+... (more changes truncated)
+  +97 -42
+[full diff: rtk git diff --no-compact]

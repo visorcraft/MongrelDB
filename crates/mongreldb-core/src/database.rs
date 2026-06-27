@@ -35,11 +35,12 @@ pub struct Database {
     snapshots: Arc<SnapshotRegistry>,
     page_cache: Arc<parking_lot::Mutex<crate::cache::PageCache>>,
     decoded_cache: Arc<parking_lot::Mutex<crate::cache::DecodedPageCache>>,
+    commit_lock: Arc<Mutex<()>>,
     tables: RwLock<HashMap<u64, TableHandle>>,
     kek: Option<Arc<crate::encryption::Kek>>,
-    /// Serializes cross-table mutations (P1); replaced by the bounded commit
-    /// sequencer in P3.
-    commit_lock: Mutex<()>,
+    /// Serializes DDL (create/drop table); data commits serialize through
+    /// `commit_lock` shared via `SharedCtx`.
+    ddl_lock: Mutex<()>,
     meta_dek: Option<[u8; META_DEK_LEN]>,
 }
 
@@ -118,6 +119,7 @@ impl Database {
         let decoded_cache = Arc::new(parking_lot::Mutex::new(
             crate::cache::DecodedPageCache::new(crate::engine::DECODED_CACHE_CAPACITY),
         ));
+        let commit_lock = Arc::new(Mutex::new(()));
 
         // Open every live table against the shared context. Each `open_in`
         // advances the shared epoch authority to its manifest epoch, so the
@@ -134,6 +136,7 @@ impl Database {
                 decoded_cache: Arc::clone(&decoded_cache),
                 snapshots: Arc::clone(&snapshots),
                 kek: kek.clone(),
+                commit_lock: Arc::clone(&commit_lock),
             };
             let t = Table::open_in(&tdir, ctx)?;
             tables.insert(entry.table_id, Arc::new(Mutex::new(t)));
@@ -146,9 +149,10 @@ impl Database {
             snapshots,
             page_cache,
             decoded_cache,
+            commit_lock,
             tables: RwLock::new(tables),
             kek,
-            commit_lock: Mutex::new(()),
+            ddl_lock: Mutex::new(()),
             meta_dek,
         })
     }
@@ -203,7 +207,7 @@ impl Database {
     /// Create a new table. Allocates an id, writes the schema + empty manifest,
     /// appends a catalog entry, and mounts the table.
     pub fn create_table(&self, name: &str, schema: Schema) -> Result<u64> {
-        let _g = self.commit_lock.lock();
+        let _g = self.ddl_lock.lock();
         {
             let cat = self.catalog.read();
             if cat.live(name).is_some() {
@@ -224,6 +228,7 @@ impl Database {
             decoded_cache: Arc::clone(&self.decoded_cache),
             snapshots: Arc::clone(&self.snapshots),
             kek: self.kek.clone(),
+            commit_lock: Arc::clone(&self.commit_lock),
         };
         let table = Table::create_in(&tdir, schema.clone(), table_id, ctx)?;
         cat.tables.push(CatalogEntry {
@@ -243,7 +248,7 @@ impl Database {
     /// Logically drop a table. Its rows become unqueryable immediately; the
     /// physical subdir is reaped later by the retention-gated GC (P3.6).
     pub fn drop_table(&self, name: &str) -> Result<()> {
-        let _g = self.commit_lock.lock();
+        let _g = self.ddl_lock.lock();
         let mut cat = self.catalog.write();
         let entry = cat
             .tables
