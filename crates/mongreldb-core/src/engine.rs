@@ -1564,6 +1564,73 @@ impl Table {
         self.schema.validate_not_null(&col_map)
     }
 
+    /// Column-major NOT NULL validation for the bulk-load paths. Every schema
+    /// column that is not marked NULLABLE must be present in `columns` and have
+    /// no null validity bits over its first `n` rows.
+    fn validate_columns_not_null(
+        &self,
+        columns: &[(u16, columnar::NativeColumn)],
+        n: usize,
+    ) -> Result<()> {
+        let by_id: HashMap<u16, &columnar::NativeColumn> =
+            columns.iter().map(|(id, c)| (*id, c)).collect();
+        for col in &self.schema.columns {
+            if col.flags.contains(ColumnFlags::NULLABLE) {
+                continue;
+            }
+            match by_id.get(&col.id) {
+                None => {
+                    return Err(MongrelError::InvalidArgument(format!(
+                        "column '{}' ({}) is NOT NULL but was omitted from the bulk load",
+                        col.name, col.id
+                    )));
+                }
+                Some(c) => {
+                    if c.null_count(n) != 0 {
+                        return Err(MongrelError::InvalidArgument(format!(
+                            "column '{}' ({}) is NOT NULL but the bulk load contains nulls",
+                            col.name, col.id
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// For a bulk-loaded batch, compute the row indices that survive primary-
+    /// key upsert: for each PK value the last occurrence wins, earlier
+    /// duplicates are dropped. Rows with a null PK value are always kept.
+    /// Returns `None` when the schema has no primary key.
+    fn bulk_pk_winner_indices(
+        &self,
+        columns: &[(u16, columnar::NativeColumn)],
+        n: usize,
+    ) -> Option<Vec<usize>> {
+        let pk_col = self.schema.primary_key()?;
+        let pk_id = pk_col.id;
+        let pk_ty = pk_col.ty;
+        let by_id: HashMap<u16, &columnar::NativeColumn> =
+            columns.iter().map(|(id, c)| (*id, c)).collect();
+        let pk_native = by_id.get(&pk_id)?;
+        // key -> index of the last row that carried that PK value.
+        let mut last: HashMap<Vec<u8>, usize> = HashMap::new();
+        let mut null_pk_rows: Vec<usize> = Vec::new();
+        for i in 0..n {
+            match bulk_index_key(&self.column_keys, pk_id, pk_ty, pk_native, i) {
+                Some(key) => {
+                    last.insert(key, i);
+                }
+                None => null_pk_rows.push(i),
+            }
+        }
+        let mut winners: HashSet<usize> = last.values().copied().collect();
+        for i in null_pk_rows {
+            winners.insert(i);
+        }
+        Some((0..n).filter(|i| winners.contains(i)).collect())
+    }
+
     /// Logically delete `row_id` (effective at the next commit).
     pub fn delete(&mut self, row_id: RowId) -> Result<()> {
         let epoch = self.pending_epoch();
@@ -1996,11 +2063,7 @@ impl Table {
         // row-major sparse batch → column-major typed columns (in parallel),
         // then `write_native` + `index_columns_bulk`, instead of per-row
         // `Row { HashMap }` + `index_into` + the sequential `Value` writer.
-        let first = self.allocator.alloc_range(n as u64).0;
-        for rid in first..first + n as u64 {
-            self.reservoir.offer(rid);
-        }
-        let user_columns: Vec<(u16, columnar::NativeColumn)> = {
+        let mut user_columns: Vec<(u16, columnar::NativeColumn)> = {
             use rayon::prelude::*;
             use std::collections::HashMap;
             let mut by_col: HashMap<u16, Vec<Value>> = HashMap::new();
@@ -2023,6 +2086,29 @@ impl Table {
                 })
                 .collect::<Vec<_>>()
         };
+        // Enforce NOT NULL constraints and primary-key upsert semantics before
+        // any row id is allocated or bytes hit the run file. Losers of a
+        // duplicate primary key are dropped from the encoded run entirely so
+        // the dedup survives reopen (no ephemeral memtable tombstone).
+        self.validate_columns_not_null(&user_columns, n)?;
+        let winner_idx = self
+            .bulk_pk_winner_indices(&user_columns, n)
+            .and_then(|idx| if idx.len() == n { None } else { Some(idx) });
+        let (write_columns, write_n): (Vec<(u16, columnar::NativeColumn)>, usize) =
+            match winner_idx.as_deref() {
+                Some(idx) => {
+                    let compacted = user_columns
+                        .iter()
+                        .map(|(id, c)| (*id, c.gather(idx)))
+                        .collect();
+                    (compacted, idx.len())
+                }
+                None => (std::mem::take(&mut user_columns), n),
+            };
+        let first = self.allocator.alloc_range(write_n as u64).0;
+        for rid in first..first + write_n as u64 {
+            self.reservoir.offer(rid);
+        }
         let run_id = self.next_run_id;
         self.next_run_id += 1;
         let path = self.run_path(run_id);
@@ -2033,14 +2119,14 @@ impl Table {
         if let Some(kek) = &self.kek {
             writer = writer.with_encryption(kek.as_ref(), self.indexable_column_specs());
         }
-        let header = writer.write_native(&path, &user_columns, n, first)?;
+        let header = writer.write_native(&path, &write_columns, write_n, first)?;
         self.run_refs.push(RunRef {
             run_id: run_id as u128,
             level: 0,
             epoch_created: epoch.0,
             row_count: header.row_count,
         });
-        self.live_count = self.live_count.saturating_add(n as u64);
+        self.live_count = self.live_count.saturating_add(write_n as u64);
         self.indexes_complete = false;
         self.mark_flushed(epoch)?;
         self.persist_manifest(epoch)?;
@@ -2818,8 +2904,25 @@ impl Table {
         }
         // Spill pending mutable-run data before the Flush marker + WAL rotation.
         self.spill_mutable_run(epoch)?;
-        let first = self.allocator.alloc_range(n as u64).0;
-        for rid in first..first + n as u64 {
+        // Enforce NOT NULL constraints and primary-key upsert semantics before
+        // any row id is allocated or bytes hit the run file.
+        self.validate_columns_not_null(&user_columns, n)?;
+        let winner_idx = self
+            .bulk_pk_winner_indices(&user_columns, n)
+            .and_then(|idx| if idx.len() == n { None } else { Some(idx) });
+        let (write_columns, write_n): (Vec<(u16, columnar::NativeColumn)>, usize) =
+            match winner_idx.as_deref() {
+                Some(idx) => {
+                    let compacted = user_columns
+                        .iter()
+                        .map(|(id, c)| (*id, c.gather(idx)))
+                        .collect();
+                    (compacted, idx.len())
+                }
+                None => (user_columns, n),
+            };
+        let first = self.allocator.alloc_range(write_n as u64).0;
+        for rid in first..first + write_n as u64 {
             self.reservoir.offer(rid);
         }
         let run_id = self.next_run_id;
@@ -2839,14 +2942,14 @@ impl Table {
         if let Some(kek) = &self.kek {
             writer = writer.with_encryption(kek.as_ref(), self.indexable_column_specs());
         }
-        let header = writer.write_native(&path, &user_columns, n, first)?;
+        let header = writer.write_native(&path, &write_columns, write_n, first)?;
         self.run_refs.push(RunRef {
             run_id: run_id as u128,
             level: 0,
             epoch_created: epoch.0,
             row_count: header.row_count,
         });
-        self.live_count = self.live_count.saturating_add(n as u64);
+        self.live_count = self.live_count.saturating_add(write_n as u64);
         // Phase 14.7: defer index building off the ingest critical path.
         self.indexes_complete = false;
         self.mark_flushed(epoch)?;

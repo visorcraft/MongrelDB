@@ -749,6 +749,24 @@ impl NativeColumn {
         }
     }
 
+    /// Count null rows in the first `n` slots. An empty validity bitmap means
+    /// every slot is non-null.
+    pub fn null_count(&self, n: usize) -> usize {
+        if n == 0 {
+            return 0;
+        }
+        let validity = match self {
+            NativeColumn::Int64 { validity, .. }
+            | NativeColumn::Float64 { validity, .. }
+            | NativeColumn::Bool { validity, .. }
+            | NativeColumn::Bytes { validity, .. } => validity,
+        };
+        if validity.is_empty() {
+            return 0;
+        }
+        (0..n).filter(|&i| !validity_bit(validity, i)).count()
+    }
+
     /// Approximate heap size (used to bound the decoded-page cache, Phase 15.4).
     pub fn approx_bytes(&self) -> u64 {
         match self {

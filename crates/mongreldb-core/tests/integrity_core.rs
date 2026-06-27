@@ -977,3 +977,124 @@ fn delete_then_spill_then_reopen_with_invalid_checkpoint_hot_clean() {
     assert_eq!(t.lookup_pk(&1i64.to_be_bytes()), Some(rid2));
     assert_ne!(rid2.0, rid.0);
 }
+
+#[test]
+fn bulk_load_duplicate_pk_upserts_within_batch() {
+    let dir = tempdir().unwrap();
+    let mut t = Table::create(dir.path(), base_schema(), 1).unwrap();
+
+    let batch: Vec<Vec<(u16, Value)>> = vec![
+        vec![(1, Value::Int64(7)), (2, Value::Int64(100))],
+        vec![(1, Value::Int64(8)), (2, Value::Int64(200))],
+        vec![(1, Value::Int64(7)), (2, Value::Int64(999))], // dup PK 7, last wins
+    ];
+    t.bulk_load(batch).unwrap();
+
+    assert_eq!(t.count(), 2, "duplicate PKs in a bulk load must upsert");
+    let rows = t.visible_rows(t.snapshot()).unwrap();
+    assert_eq!(rows.len(), 2, "scan must also see only the winners");
+    let row7 = rows
+        .iter()
+        .find(|r| r.columns.get(&1) == Some(&Value::Int64(7)))
+        .unwrap();
+    assert_eq!(
+        row7.columns.get(&2),
+        Some(&Value::Int64(999)),
+        "last duplicate PK value must win"
+    );
+}
+
+#[test]
+fn bulk_load_duplicate_pk_survives_reopen() {
+    let dir = tempdir().unwrap();
+    {
+        let mut t = Table::create(dir.path(), base_schema(), 1).unwrap();
+        let batch: Vec<Vec<(u16, Value)>> = vec![
+            vec![(1, Value::Int64(7)), (2, Value::Int64(100))],
+            vec![(1, Value::Int64(7)), (2, Value::Int64(200))],
+        ];
+        t.bulk_load(batch).unwrap();
+        assert_eq!(t.count(), 1);
+    }
+    let t = Table::open(dir.path()).unwrap();
+    assert_eq!(
+        t.count(),
+        1,
+        "bulk-load PK dedup must persist across reopen"
+    );
+    let rows = t.visible_rows(t.snapshot()).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].columns.get(&2), Some(&Value::Int64(200)));
+    assert_eq!(
+        t.lookup_pk(&7i64.to_be_bytes()),
+        Some(rows[0].row_id),
+        "reopened HOT index must point at the surviving winner"
+    );
+}
+
+#[test]
+fn bulk_load_rejects_missing_not_null_column() {
+    let dir = tempdir().unwrap();
+    let mut t = Table::create(dir.path(), base_schema(), 1).unwrap();
+    // Column 2 ("v") is NOT NULL but omitted from every row.
+    let batch: Vec<Vec<(u16, Value)>> = vec![vec![(1, Value::Int64(7))]];
+    let res = t.bulk_load(batch);
+    assert!(
+        res.is_err(),
+        "bulk_load must reject a batch missing a NOT NULL column"
+    );
+    assert_eq!(t.count(), 0, "rejected bulk load must not change count");
+}
+
+#[test]
+fn bulk_load_rejects_explicit_null_in_not_null_column() {
+    let dir = tempdir().unwrap();
+    let mut t = Table::create(dir.path(), base_schema(), 1).unwrap();
+    let batch: Vec<Vec<(u16, Value)>> = vec![vec![(1, Value::Int64(7)), (2, Value::Null)]];
+    assert!(t.bulk_load(batch).is_err());
+    assert_eq!(t.count(), 0);
+}
+
+#[test]
+fn bulk_load_columns_duplicate_pk_upserts() {
+    use mongreldb_core::columnar::NativeColumn;
+    let dir = tempdir().unwrap();
+    let mut t = Table::create(dir.path(), base_schema(), 1).unwrap();
+    // PK column 1: values [7, 8, 7] -> last 7 wins; first 7 dropped.
+    let pk = NativeColumn::Int64 {
+        data: vec![7, 8, 7],
+        validity: vec![0b111],
+    };
+    let v = NativeColumn::Int64 {
+        data: vec![100, 200, 999],
+        validity: vec![0b111],
+    };
+    t.bulk_load_columns(vec![(1, pk), (2, v)]).unwrap();
+    assert_eq!(t.count(), 2);
+    let rows = t.visible_rows(t.snapshot()).unwrap();
+    assert_eq!(rows.len(), 2);
+    let row7 = rows
+        .iter()
+        .find(|r| r.columns.get(&1) == Some(&Value::Int64(7)))
+        .unwrap();
+    assert_eq!(row7.columns.get(&2), Some(&Value::Int64(999)));
+}
+
+#[test]
+fn bulk_load_fast_rejects_not_null_violation() {
+    use mongreldb_core::columnar::NativeColumn;
+    let dir = tempdir().unwrap();
+    let mut t = Table::create(dir.path(), base_schema(), 1).unwrap();
+    // PK present, NOT NULL column 2 entirely null.
+    let pk = NativeColumn::Int64 {
+        data: vec![7],
+        validity: vec![0b1],
+    };
+    let v = NativeColumn::Int64 {
+        data: vec![0],
+        validity: vec![0b0], // null
+    };
+    let res = t.bulk_load_fast(vec![(1, pk), (2, v)]);
+    assert!(res.is_err(), "bulk_load_fast must enforce NOT NULL");
+    assert_eq!(t.count(), 0);
+}
