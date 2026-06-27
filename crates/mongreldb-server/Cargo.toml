@@ -8,6 +8,10 @@ publish = false
 name = "mongreldb-server"
 path = "src/main.rs"
 
+[lib]
+name = "mongreldb_server"
+path = "src/lib.rs"
+
 [dependencies]
 mongreldb-core = { path = "../mongreldb-core", features = ["encryption"] }
 mongreldb-query = { path = "../mongreldb-query" }
@@ -16,6 +20,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 arrow = "58"
+
+[dev-dependencies]
+tower = "0.5"
+reqwest = { version = "0.12", features = ["json"] }
+tempfile = "3"
 
 # Standalone crate — not a workspace member.
 [workspace]
