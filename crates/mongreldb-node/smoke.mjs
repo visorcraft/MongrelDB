@@ -148,4 +148,48 @@ db3.close();
 rmSync(dir3, { recursive: true });
 console.log('smoke: cross-table Transaction ✓');
 
+// ── WriteBuffer from Table + atomic visibility ─────────────────────────────
+
+const dir4 = makeTempDir();
+const db4 = Database.withPath(dir4);
+db4.createTable('w', {
+  columns: [
+    { id: 1, name: 'id', ty: 1, primaryKey: true, nullable: false },
+    { id: 2, name: 'v', ty: 1, primaryKey: false, nullable: false },
+  ],
+  indexes: [],
+});
+
+const wTable = db4.getTable('w');
+const { WriteBuffer } = require('./mongreldb.node');
+const wb = new WriteBuffer(wTable, 10);
+for (let i = 0; i < 25; i++) {
+  wb.put([
+    { columnId: 1, int64: i },
+    { columnId: 2, int64: i * 2 },
+  ]);
+}
+wb.flush();
+assert(wTable.count() === 25n, `writebuffer count ${wTable.count()}`);
+
+// Atomic cross-table visibility: a transaction's writes are not visible until commit.
+db4.createTable('vis', {
+  columns: [
+    { id: 1, name: 'id', ty: 1, primaryKey: true, nullable: false },
+    { id: 2, name: 'v', ty: 1, primaryKey: false, nullable: false },
+  ],
+  indexes: [],
+});
+const tx3 = new Transaction(db4);
+tx3.put('vis', [{ columnId: 1, int64: 1 }, { columnId: 2, int64: 42 }]);
+// Before commit: vis table has 0 rows.
+assert(db4.getTable('vis').count() === 0n, 'pre-commit: 0 rows');
+tx3.commit();
+// After commit: vis table has 1 row.
+assert(db4.getTable('vis').count() === 1n, 'post-commit: 1 row');
+
+db4.close();
+rmSync(dir4, { recursive: true });
+console.log('smoke: WriteBuffer + atomic visibility ✓');
+
 console.log('All smoke tests passed.');
