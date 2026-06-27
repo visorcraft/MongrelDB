@@ -77,9 +77,6 @@ pub struct Database {
     /// P3.1: min read_epoch of all in-flight txns, drives conflict-index
     /// pruning (spec §9.2, review fix #12).
     active_txns: crate::txn::ActiveTxns,
-    /// P3.2: epochs that have published but not yet been absorbed into the
-    /// in-order `visible` watermark.
-    pending_visible: Mutex<std::collections::BTreeSet<u64>>,
     /// P3.2: set on fsync error — all subsequent writes fail fast (spec §9.3e).
     poisoned: std::sync::atomic::AtomicBool,
 }
@@ -236,7 +233,6 @@ impl Database {
             meta_dek,
             conflicts: crate::txn::ConflictIndex::new(),
             active_txns: crate::txn::ActiveTxns::new(),
-            pending_visible: Mutex::new(std::collections::BTreeSet::new()),
             poisoned: std::sync::atomic::AtomicBool::new(false),
             spill_threshold: std::sync::atomic::AtomicU64::new(64 * 1024 * 1024),
         })
@@ -462,6 +458,15 @@ impl Database {
             if self.conflicts.version() != pre_validate_version
                 && self.conflicts.conflicts(&write_keys, read_epoch)
             {
+                // Abort: this txn assigned no epoch yet, so drop the quarantined
+                // spill runs we wrote during prepare instead of leaking them in
+                // `_txn/` until the next GC/reopen sweep.
+                drop(wal);
+                for s in &spilled {
+                    if let Some(parent) = s.pending_path.parent() {
+                        let _ = std::fs::remove_dir_all(parent);
+                    }
+                }
                 return Err(MongrelError::Conflict(
                     "write-write conflict (sequencer delta re-check)".into(),
                 ));
@@ -577,17 +582,12 @@ impl Database {
     }
 
     /// Advance `visible` in-order: epoch E becomes visible only once E and all
-    /// prior unpublished epochs have finished publishing (spec §9.3e).
+    /// prior unpublished epochs have finished publishing (spec §9.3e). The
+    /// in-order gate lives on the shared [`EpochAuthority`] so this path, the
+    /// single-table `Table::commit` path, and DDL all share one watermark and
+    /// can never publish out of assigned order under concurrency.
     fn advance_visible(&self, published: Epoch) {
-        let mut pending = self.pending_visible.lock();
-        pending.insert(published.0);
-        let mut vis = self.epoch.visible().0;
-        while pending.remove(&(vis + 1)) {
-            vis += 1;
-        }
-        if vis > self.epoch.visible().0 {
-            self.epoch.publish_visible(Epoch(vis));
-        }
+        self.epoch.publish_in_order(published);
     }
 
     /// Register a read snapshot at the current visible epoch and return it with
@@ -716,7 +716,7 @@ impl Database {
             .write()
             .insert(table_id, Arc::new(Mutex::new(table)));
 
-        self.epoch.publish_visible(epoch);
+        self.advance_visible(epoch);
         Ok(table_id)
     }
 
@@ -759,7 +759,7 @@ impl Database {
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
         self.tables.write().remove(&table_id);
 
-        self.epoch.publish_visible(epoch);
+        self.advance_visible(epoch);
         Ok(())
     }
 

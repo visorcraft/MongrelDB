@@ -1,4 +1,6 @@
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A monotonically increasing commit number. Every successful commit bumps the
@@ -93,6 +95,12 @@ impl EpochClock {
 pub struct EpochAuthority {
     assigned: AtomicU64,
     visible: AtomicU64,
+    /// Epochs that have finished publishing but cannot yet be absorbed into the
+    /// `visible` watermark because an earlier assigned epoch is still in flight.
+    /// Shared across every commit path (cross-table transactions, single-table
+    /// `Table::commit`, and DDL) so the watermark only ever advances in assigned
+    /// order regardless of which path or thread completes first.
+    pending: Mutex<BTreeSet<u64>>,
 }
 
 impl EpochAuthority {
@@ -100,6 +108,7 @@ impl EpochAuthority {
         Self {
             assigned: AtomicU64::new(start),
             visible: AtomicU64::new(start),
+            pending: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -128,6 +137,24 @@ impl EpochAuthority {
                 Err(actual) => cur = actual,
             }
         }
+    }
+
+    /// Publish a fully-committed `e` and advance `visible` in assigned order:
+    /// `e` becomes visible only once it and every prior assigned epoch have
+    /// also been published (spec §9.3e). Because the pending set lives on the
+    /// shared authority, interleaved commits from different paths/threads can
+    /// never make the watermark jump past an epoch whose writes are not yet
+    /// applied. Each assigned epoch must call this exactly once.
+    pub fn publish_in_order(&self, e: Epoch) {
+        let mut pending = self.pending.lock();
+        pending.insert(e.0);
+        let mut vis = self.visible.load(Ordering::Acquire);
+        while pending.remove(&(vis + 1)) {
+            vis += 1;
+        }
+        // `vis` only ever moves forward here; `publish_visible` is monotonic.
+        drop(pending);
+        self.publish_visible(Epoch(vis));
     }
 
     /// Recovery: set both counters to `e` (e.g. the max committed epoch on open).
@@ -188,5 +215,25 @@ mod tests {
         assert_eq!(a.visible(), Epoch(2));
         a.publish_visible(Epoch(1));
         assert_eq!(a.visible(), Epoch(2));
+    }
+
+    #[test]
+    fn publish_in_order_gates_until_gap_filled() {
+        let a = EpochAuthority::new(0);
+        let e1 = a.bump_assigned();
+        let e2 = a.bump_assigned();
+        let e3 = a.bump_assigned();
+        assert_eq!((e1, e2, e3), (Epoch(1), Epoch(2), Epoch(3)));
+
+        // A later epoch finishing first must NOT advance the watermark past the
+        // still-in-flight earlier epochs.
+        a.publish_in_order(e3);
+        assert_eq!(a.visible(), Epoch(0), "e3 cannot be visible before e1/e2");
+        a.publish_in_order(e2);
+        assert_eq!(a.visible(), Epoch(0), "e2 still gated on e1");
+
+        // Filling the gap drains everything consecutively in one shot.
+        a.publish_in_order(e1);
+        assert_eq!(a.visible(), Epoch(3));
     }
 }

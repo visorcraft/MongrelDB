@@ -1399,7 +1399,10 @@ impl Table {
         self.wal.sync()?;
         self.invalidate_pending_cache();
         self.persist_manifest(new_epoch)?;
-        self.epoch.publish_visible(new_epoch);
+        // Publish through the shared in-order gate so a `Table::commit` can never
+        // advance the watermark past an in-flight cross-table transaction's
+        // lower assigned epoch whose writes are not yet applied (spec §9.3e).
+        self.epoch.publish_in_order(new_epoch);
         self.current_txn_id += 1;
         Ok(new_epoch)
     }
