@@ -1,6 +1,6 @@
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
-const { Database, ConditionKind } = require('./mongreldb.node');
+const { Database, ConditionKind } = require('./index.js');
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -41,14 +41,14 @@ const tableB = db.getTable('b');
 
 for (let i = 0; i < 100; i++) {
   tableA.put([
-    { columnId: 1, int64: i },
-    { columnId: 2, int64: i * 10 },
+    { columnId: 1, int64: BigInt(i) },
+    { columnId: 2, int64: BigInt(i * 10) },
   ]);
 }
 for (let i = 0; i < 50; i++) {
   const tag = i % 2 === 0 ? 'even' : 'odd';
   tableB.put([
-    { columnId: 1, int64: i },
+    { columnId: 1, int64: BigInt(i) },
     { columnId: 2, bytes: Buffer.from(tag) },
   ]);
 }
@@ -62,7 +62,7 @@ assert(tableB.count() === 50n, `tableB count ${tableB.count()}`);
 // Point read.
 const row = tableA.get(5n);
 assert(row !== undefined, 'get returns a row');
-assert(row.cells[0].int64 === 5, `row id is 5, got ${row.cells[0].int64}`);
+assert(row.cells[0].int64 === 5n, `row id is 5, got ${row.cells[0].int64}`);
 
 // Hybrid query on tableB.
 const results = tableB.query([
@@ -87,8 +87,8 @@ const t = db2.getTable('t');
 
 for (let i = 0; i < 50; i++) {
   await t.putAsync([
-    { columnId: 1, int64: i },
-    { columnId: 2, int64: i },
+    { columnId: 1, int64: BigInt(i) },
+    { columnId: 2, int64: BigInt(i) },
   ]);
 }
 await t.commitAsync();
@@ -119,15 +119,15 @@ db3.createTable('customers', {
 });
 
 // Atomic cross-table transaction.
-const { Transaction } = require('./mongreldb.node');
+const { Transaction } = require('./index.js');
 const tx = new Transaction(db3);
 tx.put('orders', [
-  { columnId: 1, int64: 1 },
-  { columnId: 2, int64: 100 },
+  { columnId: 1, int64: 1n },
+  { columnId: 2, int64: 100n },
 ]);
 tx.put('customers', [
-  { columnId: 1, int64: 1 },
-  { columnId: 2, int64: 1 },
+  { columnId: 1, int64: 1n },
+  { columnId: 2, int64: 1n },
 ]);
 const epoch = tx.commit();
 assert(typeof epoch === 'bigint', `epoch is bigint, got ${typeof epoch}`);
@@ -138,8 +138,8 @@ assert(db3.getTable('customers').count() === 1n, 'customer committed');
 // Rollback test.
 const tx2 = new Transaction(db3);
 tx2.put('orders', [
-  { columnId: 1, int64: 2 },
-  { columnId: 2, int64: 200 },
+  { columnId: 1, int64: 2n },
+  { columnId: 2, int64: 200n },
 ]);
 tx2.rollback();
 assert(db3.getTable('orders').count() === 1n, 'rollback leaves 1 row');
@@ -161,12 +161,12 @@ db4.createTable('w', {
 });
 
 const wTable = db4.getTable('w');
-const { WriteBuffer } = require('./mongreldb.node');
+const { WriteBuffer } = require('./index.js');
 const wb = new WriteBuffer(wTable, 10);
 for (let i = 0; i < 25; i++) {
   wb.put([
-    { columnId: 1, int64: i },
-    { columnId: 2, int64: i * 2 },
+    { columnId: 1, int64: BigInt(i) },
+    { columnId: 2, int64: BigInt(i * 2) },
   ]);
 }
 wb.flush();
@@ -181,7 +181,7 @@ db4.createTable('vis', {
   indexes: [],
 });
 const tx3 = new Transaction(db4);
-tx3.put('vis', [{ columnId: 1, int64: 1 }, { columnId: 2, int64: 42 }]);
+tx3.put('vis', [{ columnId: 1, int64: 1n }, { columnId: 2, int64: 42n }]);
 // Before commit: vis table has 0 rows.
 assert(db4.getTable('vis').count() === 0n, 'pre-commit: 0 rows');
 tx3.commit();
@@ -194,7 +194,7 @@ console.log('smoke: WriteBuffer + atomic visibility ✓');
 
 // ── New surface: putBatch / bulkLoadTyped / queryArrow / begin / async ──────
 
-const { ColumnType } = require('./mongreldb.node');
+const { ColumnType } = require('./index.js');
 const dir5 = makeTempDir();
 const db5 = Database.withPath(dir5);
 db5.createTable('nums', {
@@ -211,9 +211,9 @@ assert(typeof epoch0 === 'bigint', 'snapshotEpoch is bigint');
 
 // putBatch: three rows in one call → three row ids.
 const batchIds = nums.putBatch([
-  [{ columnId: 1, int64: 1 }, { columnId: 2, int64: 7 }],
-  [{ columnId: 1, int64: 2 }, { columnId: 2, int64: 7 }],
-  [{ columnId: 1, int64: 3 }, { columnId: 2, int64: 9 }],
+  [{ columnId: 1, int64: 1n }, { columnId: 2, int64: 7n }],
+  [{ columnId: 1, int64: 2n }, { columnId: 2, int64: 7n }],
+  [{ columnId: 1, int64: 3n }, { columnId: 2, int64: 9n }],
 ]);
 assert(batchIds.length === 3, `putBatch returns 3 ids, got ${batchIds.length}`);
 await nums.flushAsync(); // flush to a sorted run (also exercises flushAsync)
@@ -221,7 +221,7 @@ assert(nums.count() === 3n, `putBatch count ${nums.count()}`);
 
 // queryArrow: matching rows as Arrow IPC bytes — verify the IPC file magic.
 const arrow = nums.queryArrow([
-  { kind: ConditionKind.RangeInt, columnId: 2, int64Lo: 7, int64Hi: 7 },
+  { kind: ConditionKind.RangeInt, columnId: 2, int64Lo: 7n, int64Hi: 7n },
 ]);
 assert(arrow.length > 0, 'queryArrow returns bytes');
 assert(arrow.subarray(0, 6).toString('ascii') === 'ARROW1', 'queryArrow emits Arrow IPC');
@@ -245,7 +245,7 @@ assert(bulk.count() === 3n, `bulkLoadTyped count ${bulk.count()}`);
 
 // db.begin() factory + commitAsync().
 const tx5 = db5.begin();
-tx5.put('nums', [{ columnId: 1, int64: 99 }, { columnId: 2, int64: 5 }]);
+tx5.put('nums', [{ columnId: 1, int64: 99n }, { columnId: 2, int64: 5n }]);
 const txEpoch = await tx5.commitAsync();
 assert(typeof txEpoch === 'bigint', 'commitAsync returns an epoch');
 assert(nums.count() === 4n, `after txn count ${nums.count()}`);
@@ -270,7 +270,7 @@ const secretSchema = {
   const edb = Database.createEncrypted(dir6, PASS);
   edb.createTable('secret', secretSchema);
   const st = edb.getTable('secret');
-  st.put([{ columnId: 1, int64: 7 }, { columnId: 2, int64: 42 }]);
+  st.put([{ columnId: 1, int64: 7n }, { columnId: 2, int64: 42n }]);
   st.flush();
   edb.close();
 }
@@ -279,7 +279,7 @@ const secretSchema = {
   const edb = Database.openEncrypted(dir6, PASS);
   assert(edb.getTable('secret').count() === 1n, 'encrypted reopen sees the row');
   const r = edb.getTable('secret').get(0n);
-  assert(r !== undefined && r.cells[1].int64 === 42, 'encrypted value round-trips');
+  assert(r !== undefined && r.cells[1].int64 === 42n, 'encrypted value round-trips');
   edb.close();
 }
 // Wrong passphrase is rejected.
@@ -304,12 +304,12 @@ console.log('smoke: encrypted round-trip ✓');
   // Scope ops to a table once; put/putBatch stage into ONE transaction.
   const tx = db7.begin();
   const ta = tx.table('a');
-  ta.put([{ columnId: 1, int64: 1 }, { columnId: 2, int64: 10 }]);
+  ta.put([{ columnId: 1, int64: 1n }, { columnId: 2, int64: 10n }]);
   ta.putBatch([
-    [{ columnId: 1, int64: 2 }, { columnId: 2, int64: 20 }],
-    [{ columnId: 1, int64: 3 }, { columnId: 2, int64: 30 }],
+    [{ columnId: 1, int64: 2n }, { columnId: 2, int64: 20n }],
+    [{ columnId: 1, int64: 3n }, { columnId: 2, int64: 30n }],
   ]);
-  tx.table('b').put([{ columnId: 1, int64: 1 }, { columnId: 2, int64: 99 }]);
+  tx.table('b').put([{ columnId: 1, int64: 1n }, { columnId: 2, int64: 99n }]);
   // Atomic: nothing visible until the parent transaction commits.
   assert(db7.getTable('a').count() === 0n, 'pre-commit a: 0');
   tx.commit();
@@ -318,14 +318,14 @@ console.log('smoke: encrypted round-trip ✓');
 
   // Flat API still works alongside the sub-API (backwards compatible).
   const tx2 = db7.begin();
-  tx2.put('a', [{ columnId: 1, int64: 4 }, { columnId: 2, int64: 40 }]); // flat
-  tx2.table('b').put([{ columnId: 1, int64: 2 }, { columnId: 2, int64: 88 }]); // sub-API
+  tx2.put('a', [{ columnId: 1, int64: 4n }, { columnId: 2, int64: 40n }]); // flat
+  tx2.table('b').put([{ columnId: 1, int64: 2n }, { columnId: 2, int64: 88n }]); // sub-API
   tx2.commit();
   assert(db7.getTable('a').count() === 4n, `flat add: ${db7.getTable('a').count()}`);
   assert(db7.getTable('b').count() === 2n, `sub add: ${db7.getTable('b').count()}`);
 
   // Sub-API delete: capture a real row id via a direct put, then delete it.
-  const rid = db7.getTable('a').put([{ columnId: 1, int64: 100 }, { columnId: 2, int64: 1 }]);
+  const rid = db7.getTable('a').put([{ columnId: 1, int64: 100n }, { columnId: 2, int64: 1n }]);
   db7.getTable('a').commit();
   const before = db7.getTable('a').count();
   const txDel = db7.begin();
@@ -337,5 +337,55 @@ console.log('smoke: encrypted round-trip ✓');
   rmSync(dir7, { recursive: true });
 }
 console.log('smoke: TxnTable sub-API ✓');
+
+// ── Full-range Int64 / BigInt round-trip ───────────────────────────────────
+{
+  const dir8 = makeTempDir();
+  const db8 = Database.withPath(dir8);
+  const i64Schema = {
+    columns: [
+      { id: 1, name: 'id', ty: 1, primaryKey: true, nullable: false },
+      { id: 2, name: 'value', ty: 1, primaryKey: false, nullable: false },
+    ],
+    indexes: [{ name: 'value_idx', columnId: 2, kind: 0 }],
+  };
+  db8.createTable('i64', i64Schema);
+  const i64 = db8.getTable('i64');
+
+  const max = 9_223_372_036_854_775_807n;
+  const min = -9_223_372_036_854_775_808n;
+  const ridMax = i64.put([
+    { columnId: 1, int64: 1n },
+    { columnId: 2, int64: max },
+  ]);
+  const ridMin = i64.put([
+    { columnId: 1, int64: 2n },
+    { columnId: 2, int64: min },
+  ]);
+  i64.commit();
+
+  const rMax = i64.get(ridMax);
+  const rMin = i64.get(ridMin);
+  assert(rMax !== undefined, 'max row read');
+  assert(rMin !== undefined, 'min row read');
+  assert(rMax.cells[1].int64 === max, `max round-trip: ${rMax.cells[1].int64}`);
+  assert(rMin.cells[1].int64 === min, `min round-trip: ${rMin.cells[1].int64}`);
+
+  // RangeInt query with BigInt bounds.
+  const range = i64.query([
+    { kind: ConditionKind.RangeInt, columnId: 2, int64Lo: min, int64Hi: 0n },
+  ]);
+  assert(range.length === 1, `one row in negative range, got ${range.length}`);
+  assert(range[0].cells[1].int64 === min, 'RangeInt returns the negative min');
+
+  const all = i64.query([
+    { kind: ConditionKind.RangeInt, columnId: 2, int64Lo: min, int64Hi: max },
+  ]);
+  assert(all.length === 2, `both rows in full int64 range, got ${all.length}`);
+
+  db8.close();
+  rmSync(dir8, { recursive: true });
+}
+console.log('smoke: full-range Int64 / BigInt ✓');
 
 console.log('All smoke tests passed.');

@@ -154,7 +154,7 @@ fn build_schema(spec: SchemaSpec) -> napi::Result<Schema> {
 #[napi(object)]
 pub struct Cell {
     pub column_id: u16,
-    pub int64: Option<i32>,
+    pub int64: Option<BigInt>,
     pub float64: Option<f64>,
     pub boolean: Option<bool>,
     pub text: Option<String>,
@@ -179,7 +179,12 @@ impl Cell {
         match ty {
             TypeId::Bool => Value::Bool(self.boolean.unwrap_or(false)),
             TypeId::Int64 | TypeId::TimestampNanos | TypeId::Date32 => {
-                Value::Int64(self.int64.unwrap_or(0) as i64)
+                Value::Int64(
+                    self.int64
+                        .as_ref()
+                        .map(|b| b.get_i64().0)
+                        .unwrap_or(0),
+                )
             }
             TypeId::Float64 => Value::Float64(self.float64.unwrap_or(0.0)),
             TypeId::Bytes => match &self.text {
@@ -199,7 +204,7 @@ fn from_value(v: &Value, column_id: u16) -> Cell {
     match v {
         Value::Null => {}
         Value::Bool(b) => cell.boolean = Some(*b),
-        Value::Int64(n) => cell.int64 = Some(*n as i32),
+        Value::Int64(n) => cell.int64 = Some(BigInt::from(*n)),
         Value::Float64(f) => cell.float64 = Some(*f),
         Value::Bytes(b) => match std::str::from_utf8(b) {
             Ok(s) => cell.text = Some(s.to_string()),
@@ -229,8 +234,8 @@ pub enum ConditionKind {
 pub struct ConditionSpec {
     pub kind: ConditionKind,
     pub column_id: u16,
-    pub int64_lo: Option<i32>,
-    pub int64_hi: Option<i32>,
+    pub int64_lo: Option<BigInt>,
+    pub int64_hi: Option<BigInt>,
     pub float64_lo: Option<f64>,
     pub float64_hi: Option<f64>,
     pub text: Option<String>,
@@ -247,8 +252,16 @@ fn build_condition(spec: &ConditionSpec) -> napi::Result<Condition> {
         },
         ConditionKind::RangeInt => Condition::Range {
             column_id: spec.column_id,
-            lo: spec.int64_lo.unwrap_or(i32::MIN) as i64,
-            hi: spec.int64_hi.unwrap_or(i32::MAX) as i64,
+            lo: spec
+                .int64_lo
+                .as_ref()
+                .map(|b| b.get_i64().0)
+                .unwrap_or(i64::MIN),
+            hi: spec
+                .int64_hi
+                .as_ref()
+                .map(|b| b.get_i64().0)
+                .unwrap_or(i64::MAX),
         },
         ConditionKind::RangeF64 => Condition::RangeF64 {
             column_id: spec.column_id,
