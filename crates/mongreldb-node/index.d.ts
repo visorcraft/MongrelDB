@@ -51,12 +51,12 @@ export interface Cell {
 }
 export const enum ConditionKind {
   Pk = 0,
-  PkInt64 = 1,
-  BitmapEq = 2,
-  RangeInt = 3,
-  RangeF64 = 4,
-  FmContains = 5,
-  Ann = 6
+  BitmapEq = 1,
+  RangeInt = 2,
+  RangeF64 = 3,
+  FmContains = 4,
+  Ann = 5,
+  PkInt64 = 6
 }
 /**
  * One predicate over the shared row-id space. Set the fields appropriate to

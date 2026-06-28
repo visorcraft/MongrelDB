@@ -220,12 +220,12 @@ fn from_value(v: &Value, column_id: u16) -> Cell {
 #[napi]
 pub enum ConditionKind {
     Pk,
-    PkInt64,
     BitmapEq,
     RangeInt,
     RangeF64,
     FmContains,
     Ann,
+    PkInt64,
 }
 
 /// One predicate over the shared row-id space. Set the fields appropriate to
@@ -247,12 +247,6 @@ pub struct ConditionSpec {
 fn build_condition(spec: &ConditionSpec) -> napi::Result<Condition> {
     Ok(match spec.kind {
         ConditionKind::Pk => Condition::Pk(text_bytes(spec)?),
-        ConditionKind::PkInt64 => Condition::Pk(
-            spec.int64_lo
-                .as_ref()
-                .map(|b| b.get_i64().0.to_be_bytes().to_vec())
-                .ok_or_else(|| napi::Error::new(napi::Status::InvalidArg, "PkInt64 needs int64_lo"))?,
-        ),
         ConditionKind::BitmapEq => Condition::BitmapEq {
             column_id: spec.column_id,
             value: text_bytes(spec)?,
@@ -292,6 +286,12 @@ fn build_condition(spec: &ConditionSpec) -> napi::Result<Condition> {
                 .collect(),
             k: spec.k.unwrap_or(10) as usize,
         },
+        ConditionKind::PkInt64 => Condition::Pk(
+            spec.int64_lo
+                .as_ref()
+                .map(|b| b.get_i64().0.to_be_bytes().to_vec())
+                .ok_or_else(|| napi::Error::new(napi::Status::InvalidArg, "PkInt64 needs int64_lo"))?,
+        ),
     })
 }
 
