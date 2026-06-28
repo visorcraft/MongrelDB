@@ -287,4 +287,55 @@ assert.throws(() => Database.openEncrypted(dir6, 'wrong-passphrase'), 'wrong pas
 rmSync(dir6, { recursive: true });
 console.log('smoke: encrypted round-trip ✓');
 
+// ── TxnTable sub-API: tx.table(name).put/delete — additive, backwards compatible ──
+{
+  const dir7 = makeTempDir();
+  const db7 = Database.withPath(dir7);
+  const sch = {
+    columns: [
+      { id: 1, name: 'id', ty: 1, primaryKey: true, nullable: false },
+      { id: 2, name: 'v', ty: 1, primaryKey: false, nullable: false },
+    ],
+    indexes: [],
+  };
+  db7.createTable('a', sch);
+  db7.createTable('b', sch);
+
+  // Scope ops to a table once; put/putBatch stage into ONE transaction.
+  const tx = db7.begin();
+  const ta = tx.table('a');
+  ta.put([{ columnId: 1, int64: 1 }, { columnId: 2, int64: 10 }]);
+  ta.putBatch([
+    [{ columnId: 1, int64: 2 }, { columnId: 2, int64: 20 }],
+    [{ columnId: 1, int64: 3 }, { columnId: 2, int64: 30 }],
+  ]);
+  tx.table('b').put([{ columnId: 1, int64: 1 }, { columnId: 2, int64: 99 }]);
+  // Atomic: nothing visible until the parent transaction commits.
+  assert(db7.getTable('a').count() === 0n, 'pre-commit a: 0');
+  tx.commit();
+  assert(db7.getTable('a').count() === 3n, `a after commit: ${db7.getTable('a').count()}`);
+  assert(db7.getTable('b').count() === 1n, `b after commit: ${db7.getTable('b').count()}`);
+
+  // Flat API still works alongside the sub-API (backwards compatible).
+  const tx2 = db7.begin();
+  tx2.put('a', [{ columnId: 1, int64: 4 }, { columnId: 2, int64: 40 }]); // flat
+  tx2.table('b').put([{ columnId: 1, int64: 2 }, { columnId: 2, int64: 88 }]); // sub-API
+  tx2.commit();
+  assert(db7.getTable('a').count() === 4n, `flat add: ${db7.getTable('a').count()}`);
+  assert(db7.getTable('b').count() === 2n, `sub add: ${db7.getTable('b').count()}`);
+
+  // Sub-API delete: capture a real row id via a direct put, then delete it.
+  const rid = db7.getTable('a').put([{ columnId: 1, int64: 100 }, { columnId: 2, int64: 1 }]);
+  db7.getTable('a').commit();
+  const before = db7.getTable('a').count();
+  const txDel = db7.begin();
+  txDel.table('a').delete(rid);
+  txDel.commit();
+  assert(db7.getTable('a').count() === before - 1n, 'sub-API delete removed the row');
+
+  db7.close();
+  rmSync(dir7, { recursive: true });
+}
+console.log('smoke: TxnTable sub-API ✓');
+
 console.log('All smoke tests passed.');

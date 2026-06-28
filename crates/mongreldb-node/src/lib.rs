@@ -397,7 +397,7 @@ impl Database {
     pub fn begin(&self) -> Transaction {
         Transaction {
             db: Arc::clone(&self.inner),
-            staging: parking_lot::Mutex::new(Vec::new()),
+            staging: Arc::new(parking_lot::Mutex::new(Vec::new())),
         }
     }
 
@@ -715,9 +715,10 @@ fn query_arrow_inner(
 #[napi]
 pub struct Transaction {
     db: Arc<CoreDatabase>,
-    // Interior mutability so every method takes `&self`: NAPI requires async
-    // methods to avoid `&mut self`, and a transaction handle is `Arc`-shared.
-    staging: parking_lot::Mutex<Vec<(String, TxnOp)>>,
+    // Interior mutability so every method takes `&self` (NAPI async can't take
+    // `&mut self`); `Arc` so a `TxnTable` sub-handle can stage into the same
+    // buffer, and the handle itself is cheap to share.
+    staging: Arc<parking_lot::Mutex<Vec<(String, TxnOp)>>>,
 }
 
 enum TxnOp {
@@ -731,7 +732,7 @@ impl Transaction {
     pub fn new(db: &Database) -> Self {
         Self {
             db: Arc::clone(&db.inner),
-            staging: parking_lot::Mutex::new(Vec::new()),
+            staging: Arc::new(parking_lot::Mutex::new(Vec::new())),
         }
     }
 
@@ -778,6 +779,75 @@ impl Transaction {
     #[napi]
     pub fn rollback(&self) {
         self.staging.lock().clear();
+    }
+
+    /// Scope subsequent ops to `table` via a `TxnTable`, so the table name
+    /// isn't repeated on every `put`/`delete`. Pure sugar over the flat
+    /// `put(table, …)` / `delete(table, …)` API — the sub-handle stages into
+    /// THIS transaction, and this transaction's `commit`/`rollback` still drive
+    /// durability.
+    #[napi]
+    pub fn table(&self, name: String) -> napi::Result<TxnTable> {
+        // Validate the table exists up front (matches Database::get_table).
+        self.db.table(&name).map_err(to_napi)?;
+        Ok(TxnTable {
+            db: Arc::clone(&self.db),
+            staging: Arc::clone(&self.staging),
+            table: name,
+        })
+    }
+}
+
+/// A table-scoped view of a [`Transaction`] (returned by `transaction.table()`).
+/// Stages `put`/`delete` for its bound table into the parent transaction; the
+/// parent's `commit`/`rollback` still apply.
+#[napi]
+pub struct TxnTable {
+    db: Arc<CoreDatabase>,
+    staging: Arc<parking_lot::Mutex<Vec<(String, TxnOp)>>>,
+    table: String,
+}
+
+#[napi]
+impl TxnTable {
+    /// Stage a put on this table.
+    #[napi]
+    pub fn put(&self, cells: Vec<Cell>) -> napi::Result<()> {
+        let cols = {
+            let handle = self.db.table(&self.table).map_err(to_napi)?;
+            let g = handle.lock();
+            cell_pairs_table(&g, cells)?
+        };
+        self.staging
+            .lock()
+            .push((self.table.clone(), TxnOp::Put(cols)));
+        Ok(())
+    }
+
+    /// Stage a batch of puts on this table.
+    #[napi]
+    pub fn put_batch(&self, rows: Vec<Vec<Cell>>) -> napi::Result<()> {
+        let staged = {
+            let handle = self.db.table(&self.table).map_err(to_napi)?;
+            let g = handle.lock();
+            rows.into_iter()
+                .map(|cells| cell_pairs_table(&g, cells))
+                .collect::<napi::Result<Vec<_>>>()?
+        };
+        let mut buf = self.staging.lock();
+        for cols in staged {
+            buf.push((self.table.clone(), TxnOp::Put(cols)));
+        }
+        Ok(())
+    }
+
+    /// Stage a delete of `row_id` on this table.
+    #[napi]
+    pub fn delete(&self, row_id: BigInt) -> napi::Result<()> {
+        self.staging
+            .lock()
+            .push((self.table.clone(), TxnOp::Delete(RowId(row_id.get_u64().1))));
+        Ok(())
     }
 }
 
