@@ -51,11 +51,12 @@ export interface Cell {
 }
 export const enum ConditionKind {
   Pk = 0,
-  BitmapEq = 1,
-  RangeInt = 2,
-  RangeF64 = 3,
-  FmContains = 4,
-  Ann = 5
+  PkInt64 = 1,
+  BitmapEq = 2,
+  RangeInt = 3,
+  RangeF64 = 4,
+  FmContains = 5,
+  Ann = 6
 }
 /**
  * One predicate over the shared row-id space. Set the fields appropriate to
@@ -133,6 +134,16 @@ export declare class TableHandle {
   count(): bigint
   /** Point read by row id. */
   get(rowId: bigint): RowJs | null
+  /** Point read by a text primary key. */
+  getByPkText(text: string): RowJs | null
+  /** Point read by an Int64 primary key. */
+  getByPkInt64(value: bigint): RowJs | null
+  /** Delete a row by storage row id. */
+  delete(rowId: bigint): void
+  /** Delete the first row matching a text primary key. */
+  deleteByPkText(text: string): void
+  /** Delete the first row matching an Int64 primary key. */
+  deleteByPkInt64(value: bigint): void
   /** Hybrid index query. */
   query(conditions: Array<ConditionSpec>): Array<RowJs>
   /** Insert a batch of rows in one call. Returns the new row ids in order. */

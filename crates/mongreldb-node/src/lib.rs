@@ -220,6 +220,7 @@ fn from_value(v: &Value, column_id: u16) -> Cell {
 #[napi]
 pub enum ConditionKind {
     Pk,
+    PkInt64,
     BitmapEq,
     RangeInt,
     RangeF64,
@@ -246,6 +247,12 @@ pub struct ConditionSpec {
 fn build_condition(spec: &ConditionSpec) -> napi::Result<Condition> {
     Ok(match spec.kind {
         ConditionKind::Pk => Condition::Pk(text_bytes(spec)?),
+        ConditionKind::PkInt64 => Condition::Pk(
+            spec.int64_lo
+                .as_ref()
+                .map(|b| b.get_i64().0.to_be_bytes().to_vec())
+                .ok_or_else(|| napi::Error::new(napi::Status::InvalidArg, "PkInt64 needs int64_lo"))?,
+        ),
         ConditionKind::BitmapEq => Condition::BitmapEq {
             column_id: spec.column_id,
             value: text_bytes(spec)?,
@@ -539,6 +546,60 @@ impl TableHandle {
         let snap = g.snapshot();
         Ok(g.get(RowId(row_id.get_u64().1), snap)
             .map(|r| row_to_js_table(&g, &r)))
+    }
+
+    /// Point read by a text primary key.
+    #[napi]
+    pub fn get_by_pk_text(&self, text: String) -> napi::Result<Option<RowJs>> {
+        let handle = self.db.table(&self.name).map_err(to_napi)?;
+        let mut g = handle.lock();
+        let q = Query::pk(text.into_bytes());
+        let rows = g.query_cached(&q).map_err(to_napi)?;
+        Ok(rows.first().map(|r| row_to_js_table(&g, r)))
+    }
+
+    /// Point read by an Int64 primary key.
+    #[napi]
+    pub fn get_by_pk_int64(&self, value: BigInt) -> napi::Result<Option<RowJs>> {
+        let handle = self.db.table(&self.name).map_err(to_napi)?;
+        let mut g = handle.lock();
+        let q = Query::pk(value.get_i64().0.to_be_bytes().to_vec());
+        let rows = g.query_cached(&q).map_err(to_napi)?;
+        Ok(rows.first().map(|r| row_to_js_table(&g, r)))
+    }
+
+    /// Delete a row by storage row id.
+    #[napi]
+    pub fn delete(&self, row_id: BigInt) -> napi::Result<()> {
+        let handle = self.db.table(&self.name).map_err(to_napi)?;
+        let mut g = handle.lock();
+        g.delete(RowId(row_id.get_u64().1)).map_err(to_napi)
+    }
+
+    /// Delete the first row matching a text primary key.
+    #[napi]
+    pub fn delete_by_pk_text(&self, text: String) -> napi::Result<()> {
+        let handle = self.db.table(&self.name).map_err(to_napi)?;
+        let mut g = handle.lock();
+        let q = Query::pk(text.into_bytes());
+        let rows = g.query_cached(&q).map_err(to_napi)?;
+        if let Some(r) = rows.first() {
+            g.delete(r.row_id).map_err(to_napi)?;
+        }
+        Ok(())
+    }
+
+    /// Delete the first row matching an Int64 primary key.
+    #[napi]
+    pub fn delete_by_pk_int64(&self, value: BigInt) -> napi::Result<()> {
+        let handle = self.db.table(&self.name).map_err(to_napi)?;
+        let mut g = handle.lock();
+        let q = Query::pk(value.get_i64().0.to_be_bytes().to_vec());
+        let rows = g.query_cached(&q).map_err(to_napi)?;
+        if let Some(r) = rows.first() {
+            g.delete(r.row_id).map_err(to_napi)?;
+        }
+        Ok(())
     }
 
     /// Hybrid index query.

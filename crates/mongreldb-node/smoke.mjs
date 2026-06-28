@@ -388,4 +388,84 @@ console.log('smoke: TxnTable sub-API ✓');
 }
 console.log('smoke: full-range Int64 / BigInt ✓');
 
+// ── Typed primary-key get/delete ───────────────────────────────────────────
+{
+  const dir9 = makeTempDir();
+  const db9 = Database.withPath(dir9);
+
+  // Text primary-key table.
+  db9.createTable('text_pk', {
+    columns: [
+      { id: 1, name: 'id', ty: 5, primaryKey: true, nullable: false },
+      { id: 2, name: 'v', ty: 1, primaryKey: false, nullable: false },
+    ],
+    indexes: [],
+  });
+  const textPk = db9.getTable('text_pk');
+  textPk.put([
+    { columnId: 1, text: 'alpha' },
+    { columnId: 2, int64: 100n },
+  ]);
+  textPk.put([
+    { columnId: 1, text: 'beta' },
+    { columnId: 2, int64: 200n },
+  ]);
+  textPk.commit();
+
+  const gotAlpha = textPk.getByPkText('alpha');
+  assert(gotAlpha !== null, 'getByPkText finds alpha');
+  assert(gotAlpha.cells[1].int64 === 100n, 'alpha value round-trips');
+
+  textPk.deleteByPkText('alpha');
+  textPk.commit();
+  assert(textPk.getByPkText('alpha') === null, 'alpha deleted');
+  assert(textPk.getByPkText('beta') !== null, 'beta remains');
+
+  // Int64 primary-key table.
+  db9.createTable('int64_pk', {
+    columns: [
+      { id: 1, name: 'id', ty: 1, primaryKey: true, nullable: false },
+      { id: 2, name: 'v', ty: 5, primaryKey: false, nullable: false },
+    ],
+    indexes: [],
+  });
+  const int64Pk = db9.getTable('int64_pk');
+  int64Pk.put([
+    { columnId: 1, int64: 42n },
+    { columnId: 2, text: 'forty-two' },
+  ]);
+  int64Pk.put([
+    { columnId: 1, int64: -7n },
+    { columnId: 2, text: 'negative-seven' },
+  ]);
+  int64Pk.commit();
+
+  const got42 = int64Pk.getByPkInt64(42n);
+  assert(got42 !== null, 'getByPkInt64 finds 42');
+  assert(got42.cells[1].text === 'forty-two', '42 value round-trips');
+
+  const gotNeg = int64Pk.getByPkInt64(-7n);
+  assert(gotNeg !== null, 'getByPkInt64 finds -7');
+
+  int64Pk.deleteByPkInt64(42n);
+  int64Pk.commit();
+  assert(int64Pk.getByPkInt64(42n) === null, '42 deleted');
+  assert(int64Pk.getByPkInt64(-7n) !== null, '-7 remains');
+
+  // Direct row-id delete via TableHandle.delete.
+  const rid = textPk.put([
+    { columnId: 1, text: 'gamma' },
+    { columnId: 2, int64: 300n },
+  ]);
+  textPk.commit();
+  assert(textPk.get(rid) !== null, 'gamma inserted');
+  textPk.delete(rid);
+  textPk.commit();
+  assert(textPk.get(rid) === null, 'gamma deleted by row id');
+
+  db9.close();
+  rmSync(dir9, { recursive: true });
+}
+console.log('smoke: typed primary-key get/delete ✓');
+
 console.log('All smoke tests passed.');
