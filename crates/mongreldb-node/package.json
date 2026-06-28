@@ -11,10 +11,18 @@
     }
   },
   "scripts": {
-    "build": "napi build --release --platform",
-    "build:debug": "napi build --platform",
+    "build": "napi build --release --platform --js native.js --dts native.d.ts",
+    "build:debug": "napi build --platform --js native.js --dts native.d.ts",
     "test": "node --test"
   },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "native.js",
+    "native.d.ts",
+    "smoke.mjs",
+    "mongreldb.*.node"
+  ],
   "devDependencies": {
     "@napi-rs/cli": "^2.18.0"
   },

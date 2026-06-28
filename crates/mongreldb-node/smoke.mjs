@@ -1,6 +1,6 @@
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
-const { Database, ConditionKind } = require('./index.js');
+const { Database, ConditionKind, ColumnType, ConflictError } = require('./index.js');
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -194,7 +194,6 @@ console.log('smoke: WriteBuffer + atomic visibility ✓');
 
 // ── New surface: putBatch / bulkLoadTyped / queryArrow / begin / async ──────
 
-const { ColumnType } = require('./index.js');
 const dir5 = makeTempDir();
 const db5 = Database.withPath(dir5);
 db5.createTable('nums', {
@@ -467,5 +466,205 @@ console.log('smoke: full-range Int64 / BigInt ✓');
   rmSync(dir9, { recursive: true });
 }
 console.log('smoke: typed primary-key get/delete ✓');
+
+// ── A3: catalog-aware addColumn ────────────────────────────────────────────
+{
+  const dirA3 = makeTempDir();
+  const dbA3 = Database.withPath(dirA3);
+  dbA3.createTable('evolve', {
+    columns: [
+      { id: 1, name: 'id', ty: ColumnType.Int64, primaryKey: true, nullable: false },
+      { id: 2, name: 'v', ty: ColumnType.Int64, primaryKey: false, nullable: false },
+    ],
+    indexes: [],
+  });
+  const evolve = dbA3.getTable('evolve');
+  evolve.put([
+    { columnId: 1, int64: 1n },
+    { columnId: 2, int64: 100n },
+  ]);
+  evolve.commit();
+
+  // Adding a non-null column without a default must be rejected.
+  assert.throws(
+    () =>
+      dbA3.addColumn('evolve', {
+        id: 3,
+        name: 'missing_default',
+        ty: ColumnType.Int64,
+        primaryKey: false,
+        nullable: false,
+      }),
+    /non-null column added without default/
+  );
+
+  // Add a nullable Int64 column.
+  const newColId = dbA3.addColumn('evolve', {
+    id: 3,
+    name: 'extra',
+    ty: ColumnType.Int64,
+    primaryKey: false,
+    nullable: true,
+  });
+  assert(typeof newColId === 'bigint', 'addColumn returns a column id');
+
+  // Existing row reads back with null in the new column.
+  const oldRow = evolve.get(0n);
+  assert(oldRow !== null, 'old row still readable');
+  const extraCell = oldRow.cells.find((c) => c.columnId === 3);
+  assert(extraCell !== undefined, 'new column present in row');
+  assert(extraCell.int64 === undefined || extraCell.int64 === null, 'new column is null');
+
+  dbA3.close();
+  rmSync(dirA3, { recursive: true });
+}
+console.log('smoke: A3 catalog-aware addColumn ✓');
+
+// ── A4: backup and integrity primitives ────────────────────────────────────
+{
+  const dirA4 = makeTempDir();
+  const dbA4 = Database.withPath(dirA4);
+  dbA4.createTable('check_t', {
+    columns: [
+      { id: 1, name: 'id', ty: ColumnType.Int64, primaryKey: true, nullable: false },
+    ],
+    indexes: [],
+  });
+  dbA4.getTable('check_t').put([{ columnId: 1, int64: 1n }]);
+  dbA4.getTable('check_t').commit();
+
+  const checkJson = dbA4.check();
+  const checkReport = JSON.parse(checkJson);
+  assert(checkReport.ok === true, 'check reports ok on fresh db');
+  assert(Array.isArray(checkReport.tables), 'check report has tables array');
+
+  const doctorJson = dbA4.doctor();
+  const doctorReport = JSON.parse(doctorJson);
+  assert(doctorReport.ok === true, 'doctor reports ok on fresh db');
+  assert(Array.isArray(doctorReport.quarantined), 'doctor report has quarantined array');
+
+  assert(dbA4.directory() === dirA4, 'directory returns the creation path');
+
+  dbA4.close();
+  rmSync(dirA4, { recursive: true });
+}
+console.log('smoke: A4 check / doctor / directory ✓');
+
+// ── A5: ConflictError + transaction(fn) retry wrapper ──────────────────────
+{
+  const dirA5 = makeTempDir();
+  const dbA5 = Database.withPath(dirA5);
+  dbA5.createTable('retry', {
+    columns: [
+      { id: 1, name: 'id', ty: ColumnType.Int64, primaryKey: true, nullable: false },
+      { id: 2, name: 'v', ty: ColumnType.Int64, primaryKey: false, nullable: false },
+    ],
+    indexes: [],
+  });
+
+  // Successful transaction helper run commits the staged write.
+  const epoch = await dbA5.transaction((txn) => {
+    txn.put('retry', [
+      { columnId: 1, int64: 1n },
+      { columnId: 2, int64: 42n },
+    ]);
+  });
+  assert(typeof epoch === 'bigint', 'transaction helper returns epoch');
+  assert(dbA5.getTable('retry').count() === 1n, 'transaction helper committed the write');
+
+  // Non-conflict errors are re-thrown immediately.
+  let threw = false;
+  try {
+    await dbA5.transaction(() => {
+      throw new Error('boom');
+    });
+  } catch (e) {
+    threw = true;
+    assert(e.message === 'boom', 'non-conflict error is re-thrown');
+  }
+  assert(threw, 'non-conflict error propagated');
+
+  // ConflictError class is exported.
+  assert(new ConflictError('x') instanceof Error, 'ConflictError extends Error');
+
+  dbA5.close();
+  rmSync(dirA5, { recursive: true });
+}
+console.log('smoke: A5 ConflictError + transaction wrapper ✓');
+
+// ── BigInt range validation ────────────────────────────────────────────────
+{
+  const dirRange = makeTempDir();
+  const dbRange = Database.withPath(dirRange);
+  dbRange.createTable('range', {
+    columns: [
+      { id: 1, name: 'id', ty: ColumnType.Int64, primaryKey: true, nullable: false },
+      { id: 2, name: 'v', ty: ColumnType.Int64, primaryKey: false, nullable: false },
+    ],
+    indexes: [{ name: 'v_idx', columnId: 2, kind: 0 }],
+  });
+  const range = dbRange.getTable('range');
+  range.put([
+    { columnId: 1, int64: 1n },
+    { columnId: 2, int64: 1n },
+  ]);
+  range.commit();
+  const rid = range.get(0n).rowId;
+
+  const i64Max = 9_223_372_036_854_775_807n;
+  const i64Over = i64Max + 1n;
+  const u64Max = 18_446_744_073_709_551_615n;
+
+  // Cell value out of i64 range.
+  assert.throws(
+    () => range.put([{ columnId: 1, int64: i64Over }]),
+    /BigInt out of i64 range/,
+    'put rejects out-of-range i64 cell'
+  );
+
+  // RangeInt bounds out of i64 range.
+  assert.throws(
+    () =>
+      range.query([
+        { kind: ConditionKind.RangeInt, columnId: 2, int64Lo: i64Over, int64Hi: i64Over },
+      ]),
+    /BigInt out of i64 range/,
+    'RangeInt rejects out-of-range bound'
+  );
+
+  // Int64 primary-key lookup out of i64 range.
+  assert.throws(
+    () => range.getByPkInt64(i64Over),
+    /BigInt out of i64 range/,
+    'getByPkInt64 rejects out-of-range pk'
+  );
+  assert.throws(
+    () => range.deleteByPkInt64(i64Over),
+    /BigInt out of i64 range/,
+    'deleteByPkInt64 rejects out-of-range pk'
+  );
+
+  // Row ids are u64; negative or too-large values are rejected.
+  assert.throws(() => range.get(-1n), /BigInt out of u64 range/, 'get rejects negative row id');
+  assert.throws(() => range.delete(-1n), /BigInt out of u64 range/, 'delete rejects negative row id');
+  assert.throws(
+    () => range.get(u64Max + 1n),
+    /BigInt out of u64 range/,
+    'get rejects too-large row id'
+  );
+
+  // Transaction delete also validates the row id.
+  const txRange = dbRange.begin();
+  assert.throws(
+    () => txRange.delete('range', -1n),
+    /BigInt out of u64 range/,
+    'transaction delete rejects negative row id'
+  );
+  txRange.rollback();
+
+  dbRange.close();
+  rmSync(dirRange, { recursive: true });
+}
+console.log('smoke: BigInt range validation ✓');
 
 console.log('All smoke tests passed.');

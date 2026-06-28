@@ -23,23 +23,49 @@ use napi::bindgen_prelude::{BigInt, Buffer};
 use napi_derive::napi;
 use std::sync::Arc;
 
+/// Map core errors to NAPI with stable category prefixes so the JS wrapper can
+/// recognize retryable conflicts (`__CONFLICT__:`) and missing entities
+/// (`__NOT_FOUND__:`).
 fn to_napi(e: mongreldb_core::MongrelError) -> napi::Error {
-    napi::Error::new(napi::Status::GenericFailure, format!("{e:?}"))
+    let msg = match &e {
+        mongreldb_core::MongrelError::Conflict(msg) => format!("__CONFLICT__:{msg}"),
+        mongreldb_core::MongrelError::NotFound(msg) => format!("__NOT_FOUND__:{msg}"),
+        _ => format!("{e:?}"),
+    };
+    napi::Error::new(napi::Status::GenericFailure, msg)
 }
 
-/// Map a transaction-commit result to JS, preserving the `__CONFLICT__:` prefix
-/// the `index.js` wrapper re-throws as a retryable `ConflictError`.
+/// Map a transaction-commit result to JS, preserving conflict categories.
 fn commit_result_to_napi(
     result: mongreldb_core::Result<mongreldb_core::Epoch>,
 ) -> napi::Result<BigInt> {
-    match result {
-        Ok(epoch) => Ok(BigInt::from(epoch.0)),
-        Err(mongreldb_core::MongrelError::Conflict(msg)) => Err(napi::Error::new(
-            napi::Status::GenericFailure,
-            format!("__CONFLICT__:{msg}"),
-        )),
-        Err(other) => Err(to_napi(other)),
+    result.map(|epoch| BigInt::from(epoch.0)).map_err(to_napi)
+}
+
+/// Convert a JS `BigInt` to `i64`, rejecting out-of-range values instead of
+/// silently truncating.
+fn bigint_to_i64(b: &BigInt) -> napi::Result<i64> {
+    let (val, lossless) = b.get_i64();
+    if !lossless {
+        return Err(napi::Error::new(
+            napi::Status::InvalidArg,
+            "BigInt out of i64 range",
+        ));
     }
+    Ok(val)
+}
+
+/// Convert a JS `BigInt` to `u64`, rejecting out-of-range values (e.g. negative
+/// or too-large row ids) instead of silently wrapping.
+fn bigint_to_u64(b: &BigInt) -> napi::Result<u64> {
+    let (negative, val, lossless) = b.get_u64();
+    if negative || !lossless {
+        return Err(napi::Error::new(
+            napi::Status::InvalidArg,
+            "BigInt out of u64 range",
+        ));
+    }
+    Ok(val)
 }
 
 // ── schema ────────────────────────────────────────────────────────────────
@@ -71,6 +97,9 @@ pub struct ColumnSpec {
     pub nullable: bool,
     /// Required when `ty == Embedding`.
     pub embedding_dim: Option<u32>,
+    /// Optional default value for schema-evolution back-fill. Currently only
+    /// validated; applying defaults to existing rows is not yet implemented.
+    pub default_value: Option<Cell>,
 }
 
 #[napi(object)]
@@ -175,14 +204,15 @@ impl Cell {
         }
     }
 
-    fn to_value(&self, ty: TypeId) -> Value {
-        match ty {
+    fn to_value(&self, ty: TypeId) -> napi::Result<Value> {
+        Ok(match ty {
             TypeId::Bool => Value::Bool(self.boolean.unwrap_or(false)),
             TypeId::Int64 | TypeId::TimestampNanos | TypeId::Date32 => {
                 Value::Int64(
                     self.int64
                         .as_ref()
-                        .map(|b| b.get_i64().0)
+                        .map(bigint_to_i64)
+                        .transpose()?
                         .unwrap_or(0),
                 )
             }
@@ -195,7 +225,7 @@ impl Cell {
                 Value::Embedding(self.embedding.iter().flatten().map(|x| *x as f32).collect())
             }
             _ => Value::Null,
-        }
+        })
     }
 }
 
@@ -256,12 +286,14 @@ fn build_condition(spec: &ConditionSpec) -> napi::Result<Condition> {
             lo: spec
                 .int64_lo
                 .as_ref()
-                .map(|b| b.get_i64().0)
+                .map(bigint_to_i64)
+                .transpose()?
                 .unwrap_or(i64::MIN),
             hi: spec
                 .int64_hi
                 .as_ref()
-                .map(|b| b.get_i64().0)
+                .map(bigint_to_i64)
+                .transpose()?
                 .unwrap_or(i64::MAX),
         },
         ConditionKind::RangeF64 => Condition::RangeF64 {
@@ -287,10 +319,13 @@ fn build_condition(spec: &ConditionSpec) -> napi::Result<Condition> {
             k: spec.k.unwrap_or(10) as usize,
         },
         ConditionKind::PkInt64 => Condition::Pk(
-            spec.int64_lo
-                .as_ref()
-                .map(|b| b.get_i64().0.to_be_bytes().to_vec())
-                .ok_or_else(|| napi::Error::new(napi::Status::InvalidArg, "PkInt64 needs int64_lo"))?,
+            bigint_to_i64(
+                spec.int64_lo
+                    .as_ref()
+                    .ok_or_else(|| napi::Error::new(napi::Status::InvalidArg, "PkInt64 needs int64_lo"))?,
+            )?
+            .to_be_bytes()
+            .to_vec(),
         ),
     })
 }
@@ -317,6 +352,7 @@ use mongreldb_core::Database as CoreDatabase;
 #[napi]
 pub struct Database {
     inner: Arc<CoreDatabase>,
+    path: String,
 }
 
 /// A handle to one table inside a [`Database`].
@@ -340,7 +376,7 @@ fn cell_pairs_table(
                 .find(|cd| cd.id == c.column_id)
                 .map(|cd| cd.ty)
                 .unwrap_or(TypeId::Bytes);
-            Ok((c.column_id, c.to_value(ty)))
+            Ok((c.column_id, c.to_value(ty)?))
         })
         .collect()
 }
@@ -369,6 +405,7 @@ impl Database {
         let db = CoreDatabase::create(&path).map_err(to_napi)?;
         Ok(Database {
             inner: Arc::new(db),
+            path,
         })
     }
 
@@ -378,6 +415,7 @@ impl Database {
         let db = CoreDatabase::open(&path).map_err(to_napi)?;
         Ok(Database {
             inner: Arc::new(db),
+            path,
         })
     }
 
@@ -433,6 +471,75 @@ impl Database {
         self.inner.table_names()
     }
 
+    /// Add a column to an existing table. The column must be nullable or supply
+    /// a default value so existing rows can be evolved safely.
+    #[napi]
+    pub fn add_column(&self, table: String, column: ColumnSpec) -> napi::Result<BigInt> {
+        if !column.nullable && column.default_value.is_none() {
+            return Err(napi::Error::new(
+                napi::Status::InvalidArg,
+                "non-null column added without default",
+            ));
+        }
+        let handle = self.inner.table(&table).map_err(to_napi)?;
+        let mut g = handle.lock();
+        let ty = to_type_id(&column.ty, column.embedding_dim)?;
+        // Core `add_column` always adds the column as nullable; enforcing a
+        // non-null constraint with a default would require a full table rewrite,
+        // which is not yet implemented. The validation above still rejects the
+        // unsupported "non-null without default" case.
+        let id = g.add_column(&column.name, ty).map_err(to_napi)?;
+        Ok(BigInt::from(id as u64))
+    }
+
+    /// Verify database integrity. Returns a JSON-string summary.
+    #[napi]
+    pub fn check(&self) -> napi::Result<String> {
+        let issues = self.inner.check();
+        let mut tables: std::collections::HashMap<u64, serde_json::Value> =
+            std::collections::HashMap::new();
+        for issue in &issues {
+            let entry = tables.entry(issue.table_id).or_insert_with(|| {
+                serde_json::json!({
+                    "table_id": issue.table_id,
+                    "table_name": &issue.table_name,
+                    "issue_count": 0,
+                    "issues": [],
+                })
+            });
+            entry["issue_count"] = serde_json::json!(entry["issue_count"].as_u64().unwrap_or(0) + 1);
+            entry["issues"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({
+                    "severity": &issue.severity,
+                    "description": &issue.description,
+                }));
+        }
+        let summary = serde_json::json!({
+            "ok": issues.is_empty(),
+            "tables": tables.values().collect::<Vec<_>>(),
+        });
+        Ok(summary.to_string())
+    }
+
+    /// Repair/quarantine corrupt tables. Returns a JSON-string summary.
+    #[napi]
+    pub fn doctor(&self) -> napi::Result<String> {
+        let quarantined = self.inner.doctor().map_err(to_napi)?;
+        let summary = serde_json::json!({
+            "ok": quarantined.is_empty(),
+            "quarantined": quarantined,
+        });
+        Ok(summary.to_string())
+    }
+
+    /// Return the path passed to `withPath` / `open`.
+    #[napi]
+    pub fn directory(&self) -> String {
+        self.path.clone()
+    }
+
     /// Run a cross-table SQL query. Returns Arrow IPC bytes.
     #[napi]
     pub async fn sql(&self, sql: String) -> napi::Result<Buffer> {
@@ -467,6 +574,7 @@ impl Database {
         let db = CoreDatabase::create_encrypted(&path, &passphrase).map_err(to_napi)?;
         Ok(Database {
             inner: Arc::new(db),
+            path,
         })
     }
 
@@ -476,6 +584,7 @@ impl Database {
         let db = CoreDatabase::open_encrypted(&path, &passphrase).map_err(to_napi)?;
         Ok(Database {
             inner: Arc::new(db),
+            path,
         })
     }
 }
@@ -544,7 +653,7 @@ impl TableHandle {
         let handle = self.db.table(&self.name).map_err(to_napi)?;
         let g = handle.lock();
         let snap = g.snapshot();
-        Ok(g.get(RowId(row_id.get_u64().1), snap)
+        Ok(g.get(RowId(bigint_to_u64(&row_id)?), snap)
             .map(|r| row_to_js_table(&g, &r)))
     }
 
@@ -563,7 +672,7 @@ impl TableHandle {
     pub fn get_by_pk_int64(&self, value: BigInt) -> napi::Result<Option<RowJs>> {
         let handle = self.db.table(&self.name).map_err(to_napi)?;
         let mut g = handle.lock();
-        let q = Query::pk(value.get_i64().0.to_be_bytes().to_vec());
+        let q = Query::pk(bigint_to_i64(&value)?.to_be_bytes().to_vec());
         let rows = g.query_cached(&q).map_err(to_napi)?;
         Ok(rows.first().map(|r| row_to_js_table(&g, r)))
     }
@@ -573,7 +682,7 @@ impl TableHandle {
     pub fn delete(&self, row_id: BigInt) -> napi::Result<()> {
         let handle = self.db.table(&self.name).map_err(to_napi)?;
         let mut g = handle.lock();
-        g.delete(RowId(row_id.get_u64().1)).map_err(to_napi)
+        g.delete(RowId(bigint_to_u64(&row_id)?)).map_err(to_napi)
     }
 
     /// Delete the first row matching a text primary key.
@@ -594,7 +703,7 @@ impl TableHandle {
     pub fn delete_by_pk_int64(&self, value: BigInt) -> napi::Result<()> {
         let handle = self.db.table(&self.name).map_err(to_napi)?;
         let mut g = handle.lock();
-        let q = Query::pk(value.get_i64().0.to_be_bytes().to_vec());
+        let q = Query::pk(bigint_to_i64(&value)?.to_be_bytes().to_vec());
         let rows = g.query_cached(&q).map_err(to_napi)?;
         if let Some(r) = rows.first() {
             g.delete(r.row_id).map_err(to_napi)?;
@@ -701,11 +810,12 @@ impl TableHandle {
     pub async fn get_async(&self, row_id: BigInt) -> napi::Result<Option<RowJs>> {
         let db = Arc::clone(&self.db);
         let name = self.name.clone();
+        let row_id_u64 = bigint_to_u64(&row_id)?;
         napi::bindgen_prelude::spawn_blocking(move || -> napi::Result<Option<RowJs>> {
             let handle = db.table(&name).map_err(to_napi)?;
             let g = handle.lock();
             let snap = g.snapshot();
-            Ok(g.get(RowId(row_id.get_u64().1), snap)
+            Ok(g.get(RowId(row_id_u64), snap)
                 .map(|r| row_to_js_table(&g, &r)))
         })
         .await
@@ -826,7 +936,7 @@ impl Transaction {
     pub fn delete(&self, table: String, row_id: BigInt) -> napi::Result<()> {
         self.staging
             .lock()
-            .push((table, TxnOp::Delete(RowId(row_id.get_u64().1))));
+            .push((table, TxnOp::Delete(RowId(bigint_to_u64(&row_id)?))));
         Ok(())
     }
 
@@ -920,7 +1030,7 @@ impl TxnTable {
     pub fn delete(&self, row_id: BigInt) -> napi::Result<()> {
         self.staging
             .lock()
-            .push((self.table.clone(), TxnOp::Delete(RowId(row_id.get_u64().1))));
+            .push((self.table.clone(), TxnOp::Delete(RowId(bigint_to_u64(&row_id)?))));
         Ok(())
     }
 }
