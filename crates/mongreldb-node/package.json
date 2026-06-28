@@ -13,6 +13,7 @@
   "scripts": {
     "build": "napi build --release --platform --js native.js --dts native.d.ts",
     "build:debug": "napi build --platform --js native.js --dts native.d.ts",
+    "prepare": "npm run build",
     "test": "node --test"
   },
   "files": [
