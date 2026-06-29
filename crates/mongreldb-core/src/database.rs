@@ -803,6 +803,13 @@ impl Database {
         // ignored to prevent collisions).
         let mut schema = schema;
         schema.schema_id = table_id;
+        // Defense in depth: reject an invalid schema BEFORE any durable
+        // side-effect. `Table::create_in` re-validates, but by then the DDL has
+        // already been appended to the shared WAL; a failing create_in would
+        // leave a dangling entry that `recover_ddl_from_wal` replays without
+        // re-validating, corrupting the catalog on reopen. Validating here
+        // keeps the WAL free of schemas that can never be opened.
+        schema.validate_auto_increment()?;
 
         // 1. Log the DDL + commit marker to the shared WAL, then make it durable
         //    via the group-commit coordinator (no fsync under the WAL lock — P3.2).

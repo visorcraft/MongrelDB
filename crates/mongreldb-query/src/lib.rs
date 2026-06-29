@@ -38,7 +38,7 @@ use datafusion::common::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::{Expr, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
-use mongreldb_core::{Cursor, Database, Table};
+use mongreldb_core::{ColumnFlags, Cursor, Database, Table};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -1320,9 +1320,51 @@ fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     }
 }
 
-/// Parse `CREATE TABLE [IF NOT EXISTS] <name> (<col> <type> [PRIMARY KEY], ...)`
-/// into a MongrelDB table name + schema. Supports BIGINT, DOUBLE,
-/// VARCHAR/TEXT, BOOLEAN. Table name may be double-quoted.
+/// Recognized column constraints in `CREATE TABLE` column definitions. Each
+/// entry maps a SQL phrase (matched case-insensitively as a substring of the
+/// whitespace-normalized constraint clause) to the [`ColumnFlags`] bit it sets.
+///
+/// Multi-word phrases such as `"primary key"` match regardless of internal
+/// spacing because the clause is normalized to single spaces before matching.
+///
+/// **Adding a new column constraint is a one-line change:** append `(phrase,
+/// flag)` here. This keeps the DDL shim's grammar in one place rather than
+/// scattering `contains(...)` checks across the parser. (A full SQL grammar is
+/// deliberately out of scope — only `CREATE TABLE` / `DROP TABLE` are
+/// intercepted here; all query parsing is delegated to DataFusion.)
+const COLUMN_CONSTRAINTS: &[(&str, u32)] = &[
+    ("primary key", ColumnFlags::PRIMARY_KEY),
+    // Both spellings are accepted: `AUTOINCREMENT` (SQLite) and `AUTO_INCREMENT`
+    // (MySQL). The engine enforces that the flag is valid only on a single
+    // non-nullable `Int64` primary key (see `Schema::validate_auto_increment`),
+    // so recognizing the keyword on any column here is safe — invalid
+    // placements are rejected at table-creation time, before the schema is
+    // durably logged.
+    ("autoincrement", ColumnFlags::AUTO_INCREMENT),
+    ("auto_increment", ColumnFlags::AUTO_INCREMENT),
+];
+
+/// Translate a column's constraint clause (the text following `<name> <type>`
+/// in a `CREATE TABLE` column definition) into [`ColumnFlags`]. The clause is
+/// lowercased and its internal whitespace collapsed to single spaces so
+/// multi-word phrases match regardless of formatting. See
+/// [`COLUMN_CONSTRAINTS`] for the recognized phrases; add new ones there.
+fn parse_column_constraints(constraint_text: &str) -> ColumnFlags {
+    let normalized = constraint_text.to_lowercase();
+    let mut flags = ColumnFlags::empty();
+    for (phrase, bit) in COLUMN_CONSTRAINTS {
+        if normalized.contains(phrase) {
+            flags = flags.with(*bit);
+        }
+    }
+    flags
+}
+
+/// Parse `CREATE TABLE [IF NOT EXISTS] <name> (<col> <type> <constraints>, ...)`
+/// into a MongrelDB table name + schema. Supports BIGINT/INTEGER/INT, DOUBLE,
+/// VARCHAR/TEXT, BOOLEAN. Recognized column constraints (`PRIMARY KEY`,
+/// `AUTOINCREMENT` / `AUTO_INCREMENT`) are listed in [`COLUMN_CONSTRAINTS`].
+/// Table name may be double-quoted.
 fn parse_create_table(sql: &str) -> Result<(String, mongreldb_core::schema::Schema)> {
     use mongreldb_core::schema::*;
 
@@ -1358,8 +1400,6 @@ fn parse_create_table(sql: &str) -> Result<(String, mongreldb_core::schema::Sche
         if part.is_empty() {
             continue;
         }
-        let lower = part.to_lowercase();
-        let pk = lower.contains("primary key");
         let mut tokens = part.split_whitespace();
         let col_name = tokens
             .next()
@@ -1380,10 +1420,11 @@ fn parse_create_table(sql: &str) -> Result<(String, mongreldb_core::schema::Sche
                 )))
             }
         };
-        let mut flags = ColumnFlags::empty();
-        if pk {
-            flags = flags.with(ColumnFlags::PRIMARY_KEY);
-        }
+        // Everything after `<name> <type>` is the column's constraint clause
+        // (e.g. `PRIMARY KEY`, `PRIMARY KEY AUTOINCREMENT`). The remaining
+        // tokens are matched against `COLUMN_CONSTRAINTS`.
+        let constraint_clause: String = tokens.collect::<Vec<_>>().join(" ");
+        let flags = parse_column_constraints(&constraint_clause);
         columns.push(ColumnDef {
             id: (i + 1) as u16,
             name: col_name.to_string(),
