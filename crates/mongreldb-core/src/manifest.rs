@@ -1,7 +1,7 @@
 //! Manifest — the atomic pointer to the current set of sorted runs.
 //!
-//! On-disk layout matches `DBPLAN.md` §6.4. A commit writes `_mf.tmp` then
-//! `rename(_mf.tmp, _mf)`, which is atomic on POSIX, giving crash-safe commit.
+//! A commit writes `_mf.tmp` then `rename(_mf.tmp, _mf)`, which is atomic on
+//! POSIX, giving crash-safe commit.
 //! For encrypted DBs the whole blob is AES-256-GCM sealed under the DB-wide
 //! meta DEK (confidential + authenticated); for plaintext DBs it carries a
 //! SHA-256 integrity tag. Either way the parent directory is fsynced after the

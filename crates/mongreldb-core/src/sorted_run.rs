@@ -1,8 +1,8 @@
 //! Sorted Run — the immutable columnar unit (`.sr`).
 //!
-//! On-disk layout matches `DBPLAN.md` §6.2: a 256-byte header, a columnar page
-//! region (PAX), a column directory, an index trailer, and a checksummed
-//! footer. [`RunWriter`] flushes drained memtable rows into encoded columns
+//! On-disk layout: a 256-byte header, a columnar page region (PAX), a column
+//! directory, an index trailer, and a checksummed footer. [`RunWriter`] flushes
+//! drained memtable rows into encoded columns
 //! (system columns `_row_id` / `_epoch` / `_deleted` plus user columns), and
 //! [`RunReader`] decodes them back, answering MVCC point lookups and scans.
 

@@ -2,9 +2,8 @@
 //! indexes over a shared row-id space, page-level native encryption, an
 //! MVCC-tagged content-addressed cache, and an AI-native access layer.
 //!
-//! See `DBPLAN.md` at the repository root for the full design and on-disk
-//! layouts. Phase 0 (this crate) delivers the WAL + memtable + Bε-tree write
-//! path plus the container formats and index scaffolds.
+//! The crate owns the WAL + memtable + Bε-tree write path, sorted-run container
+//! formats, MVCC snapshots, page cache, encryption, compaction, and indexes.
 
 #![allow(clippy::module_inception)]
 

@@ -3,7 +3,7 @@
 //! Sub-ms writes come from the fact that [`Wal::append`] only copies bytes into
 //! the OS file buffer (and an in-process [`BufWriter`]); it does **not** fsync.
 //! A timer- or threshold-driven [`Wal::sync`] does the `flush() + sync_all()`
-//! and bumps the epoch. See `DBPLAN.md` §6.1 for the on-disk layout.
+//! and bumps the epoch.
 
 use crate::epoch::Epoch;
 use crate::rowid::RowId;

@@ -1,8 +1,8 @@
 //! MVCC-tagged, content-addressed page cache.
 //!
-//! Correctness by construction (see `DBPLAN.md` §8): every entry carries the
-//! [`Epoch`] at which its page was committed, and the key is the page's
-//! content/identity hash. A query at [`Snapshot`] only reads entries with
+//! Correctness by construction: every entry carries the [`Epoch`] at which its
+//! page was committed, and the key is the page's content/identity hash. A query
+//! at [`Snapshot`] only reads entries with
 //! `committed_epoch <= snapshot.epoch`; a rewritten page gets a new hash and the
 //! old entry ages out by capacity — so **no invalidation sweep ever runs**.
 //!

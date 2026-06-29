@@ -1,4 +1,4 @@
-//! Global index file — `_idx/global.idx` (DBPLAN §6.3).
+//! Global index file — `_idx/global.idx`.
 //!
 //! On flush/bulk-load the in-memory secondary indexes (HOT, bitmap, FM, ANN,
 //! sparse, learned-range) are checkpointed here so [`crate::engine::Table::open`]
@@ -30,7 +30,7 @@ pub const IDX_VERSION: u16 = 1;
 pub const IDX_DIR: &str = "_idx";
 pub const IDX_FILENAME: &str = "global.idx";
 
-// Record kind bytes (DBPLAN §6.3 kind table; SPARSE/LEARNED extend it).
+// Record kind bytes for framed index payloads.
 const K_HOT: u8 = 1;
 const K_BITMAP: u8 = 3;
 const K_FM: u8 = 4;
