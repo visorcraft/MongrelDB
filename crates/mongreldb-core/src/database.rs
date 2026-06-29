@@ -121,6 +121,19 @@ impl Database {
         Self::create_inner(root, Some(kek))
     }
 
+    /// Create a fresh encrypted database, deriving the DB-wide KEK from a raw
+    /// high-entropy key via HKDF. The salt is persisted at `_meta/keys`.
+    #[cfg(feature = "encryption")]
+    pub fn create_with_key(root: impl AsRef<Path>, key: &[u8]) -> Result<Self> {
+        let root = root.as_ref();
+        std::fs::create_dir_all(root)?;
+        std::fs::create_dir_all(root.join(META_DIR))?;
+        let salt = crate::encryption::random_salt();
+        std::fs::write(root.join(META_DIR).join(KEYS_FILENAME), salt)?;
+        let kek = Arc::new(crate::encryption::Kek::from_raw_key(key, &salt)?);
+        Self::create_inner(root, Some(kek))
+    }
+
     fn create_inner(
         root: impl AsRef<Path>,
         kek: Option<Arc<crate::encryption::Kek>>,
@@ -148,6 +161,30 @@ impl Database {
         let mut salt = [0u8; crate::encryption::SALT_LEN];
         salt.copy_from_slice(&salt_bytes);
         let kek = Arc::new(crate::encryption::Kek::derive(passphrase, &salt)?);
+        Self::open_inner(root, Some(kek), None)
+    }
+
+    /// Open an existing encrypted database using a raw high-entropy key.
+    #[cfg(feature = "encryption")]
+    pub fn open_with_key(root: impl AsRef<Path>, key: &[u8]) -> Result<Self> {
+        let root = root.as_ref();
+        let salt_path = root.join(META_DIR).join(KEYS_FILENAME);
+        let salt_bytes = std::fs::read(&salt_path).map_err(|e| {
+            MongrelError::NotFound(format!(
+                "encryption salt file {:?}: {e} (database not encrypted, or corrupted)",
+                salt_path
+            ))
+        })?;
+        if salt_bytes.len() != crate::encryption::SALT_LEN {
+            return Err(MongrelError::InvalidArgument(format!(
+                "salt file is {} bytes, expected {}",
+                salt_bytes.len(),
+                crate::encryption::SALT_LEN
+            )));
+        }
+        let mut salt = [0u8; crate::encryption::SALT_LEN];
+        salt.copy_from_slice(&salt_bytes);
+        let kek = Arc::new(crate::encryption::Kek::from_raw_key(key, &salt)?);
         Self::open_inner(root, Some(kek), None)
     }
 
