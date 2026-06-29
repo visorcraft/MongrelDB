@@ -591,6 +591,15 @@ impl Database {
         self.inner.drop_table(&name).map_err(to_napi)
     }
 
+    /// Rename a live table. Fails if `name` does not exist, if `new_name` is
+    /// empty, or if `new_name` is already in use. A no-op when `name == new_name`.
+    #[napi]
+    pub fn rename_table(&self, name: String, new_name: String) -> napi::Result<()> {
+        self.inner
+            .rename_table(&name, &new_name)
+            .map_err(to_napi)
+    }
+
     /// Get a handle to a table by name for typed put/get/query operations.
     #[napi]
     pub fn get_table(&self, name: String) -> napi::Result<TableHandle> {

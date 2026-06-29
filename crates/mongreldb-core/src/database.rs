@@ -927,6 +927,90 @@ impl Database {
         Ok(())
     }
 
+    /// Rename a live table. `name` must exist and `new_name` must not collide
+    /// with any live table; both checks run under `ddl_lock` so they are atomic
+    /// with the rename and with concurrent `create_table` existence checks (no
+    /// TOCTOU window). A no-op rename (`name == new_name`) succeeds without
+    /// side-effects. The rename is logged to the shared WAL as
+    /// `DdlOp::RenameTable` and recovered on reopen; the `table_id`, schema,
+    /// and on-disk layout are unchanged (the table is keyed by `table_id`, so
+    /// the in-memory object does not move — only the catalog name changes).
+    pub fn rename_table(&self, name: &str, new_name: &str) -> Result<()> {
+        use crate::wal::DdlOp;
+        use std::sync::atomic::Ordering;
+
+        if self.poisoned.load(Ordering::Relaxed) {
+            return Err(MongrelError::Other(
+                "database poisoned by fsync error".into(),
+            ));
+        }
+
+        // A no-op rename short-circuits before any locking, so it can never
+        // trip the "target already exists" check (the source *is* that name).
+        if name == new_name {
+            return Ok(());
+        }
+        if new_name.is_empty() {
+            return Err(MongrelError::InvalidArgument(
+                "rename_table: new name must not be empty".into(),
+            ));
+        }
+
+        let _g = self.ddl_lock.lock();
+        let table_id = {
+            let cat = self.catalog.read();
+            let src = cat
+                .live(name)
+                .ok_or_else(|| MongrelError::NotFound(format!("table {name:?} not found")))?;
+            // Target must be free. Checked under ddl_lock, which every other
+            // DDL (create/rename/drop) also holds, so a concurrent operation
+            // cannot claim `new_name` between this check and the catalog write.
+            if cat.live(new_name).is_some() {
+                return Err(MongrelError::InvalidArgument(format!(
+                    "rename_table: a table named {new_name:?} already exists"
+                )));
+            }
+            src.table_id
+        };
+
+        let commit_lock = Arc::clone(&self.commit_lock);
+        let _c = commit_lock.lock();
+        let epoch = self.epoch.bump_assigned();
+        let txn_id = self.alloc_txn_id();
+        let commit_seq = {
+            let mut wal = self.shared_wal.lock();
+            wal.append(
+                txn_id,
+                table_id,
+                crate::wal::Op::Ddl(DdlOp::RenameTable {
+                    table_id,
+                    new_name: new_name.to_string(),
+                }),
+            )?;
+            wal.append_commit(txn_id, epoch, &[])?
+        };
+        self.group
+            .await_durable(&self.shared_wal, commit_seq)
+            .inspect_err(|_| {
+                self.poisoned.store(true, Ordering::Relaxed);
+            })?;
+
+        {
+            let mut cat = self.catalog.write();
+            let entry = cat
+                .tables
+                .iter_mut()
+                .find(|t| t.table_id == table_id)
+                .ok_or_else(|| MongrelError::NotFound(format!("table {name:?} not found")))?;
+            entry.name = new_name.to_string();
+        }
+        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+        // The in-memory table object is keyed by table_id, not name, so it does
+        // not move and live TableHandles remain valid.
+        self.advance_visible(epoch);
+        Ok(())
+    }
+
     /// Retention-gated garbage collection (spec §6.4, §7.4, §16). Deletes:
     /// - Dropped-table subdirs whose `at_epoch < min_active_snapshot`.
     /// - Stale `_txn/` dirs (aborted/crashed large-txn pending runs).
@@ -1459,6 +1543,20 @@ fn recover_ddl_from_wal(
                         changed = true;
                     }
                 }
+            }
+            Op::Ddl(DdlOp::RenameTable {
+                table_id,
+                ref new_name,
+            }) => {
+                if let Some(entry) = cat.tables.iter_mut().find(|t| t.table_id == table_id) {
+                    if entry.name != *new_name {
+                        entry.name = new_name.clone();
+                        changed = true;
+                    }
+                }
+                // If the entry is absent, its CreateTable was already
+                // checkpointed carrying the post-rename name, so there is
+                // nothing to apply — a no-op, not an error.
             }
             _ => {}
         }

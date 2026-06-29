@@ -755,4 +755,63 @@ console.log('smoke: BigInt range validation ✓');
 }
 console.log('smoke: AUTO_INCREMENT ✓');
 
+// ── rename_table ──────────────────────────────────────────────────────────
+{
+  const dir = mkdtempSync(join(tmpdir(), 'mc-rename-'));
+  const db = Database.withPath(dir);
+  db.createTable('a', schemaA);
+  db.createTable('b', schemaA);
+
+  // Basic rename: 'a' → 'c'.
+  db.renameTable('a', 'c');
+  const names = db.tableNames().sort();
+  assert(
+    JSON.stringify(names) === JSON.stringify(['b', 'c']),
+    `rename a→c: names=${JSON.stringify(names)}`
+  );
+
+  // Old name no longer resolves; new name does.
+  let oldGone = false;
+  try {
+    db.getTable('a');
+  } catch {
+    oldGone = true;
+  }
+  assert(oldGone, 'old name should not resolve after rename');
+  db.getTable('c'); // resolves without throwing
+
+  // Conflict: renaming onto an existing name must throw.
+  let conflict = false;
+  try {
+    db.renameTable('c', 'b');
+  } catch {
+    conflict = true;
+  }
+  assert(conflict, 'rename onto an existing name must fail');
+
+  // No-op rename (same name) succeeds.
+  db.renameTable('b', 'b');
+
+  // Empty new name is rejected.
+  let empty = false;
+  try {
+    db.renameTable('b', '');
+  } catch {
+    empty = true;
+  }
+  assert(empty, 'empty new name must be rejected');
+
+  // Durability: reopen keeps the new name.
+  db.close();
+  const db2 = Database.open(dir);
+  const reopened = db2.tableNames().sort();
+  assert(
+    JSON.stringify(reopened) === JSON.stringify(['b', 'c']),
+    `reopen after rename: ${JSON.stringify(reopened)}`
+  );
+  db2.close();
+  rmSync(dir, { recursive: true, force: true });
+}
+console.log('smoke: rename_table ✓');
+
 console.log('All smoke tests passed.');

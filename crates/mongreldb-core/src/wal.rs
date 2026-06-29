@@ -71,6 +71,15 @@ pub enum DdlOp {
         table_id: u64,
         column_json: Vec<u8>,
     },
+    /// Rename a live table. The catalog entry's name changes; the `table_id`,
+    /// schema, on-disk layout, and in-memory table object are all untouched
+    /// (the table is keyed by `table_id`, not name). Recovery applies this by
+    /// rewriting the catalog entry's name; it is idempotent when the
+    /// checkpoint already carries `new_name`.
+    RenameTable {
+        table_id: u64,
+        new_name: String,
+    },
 }
 
 impl DdlOp {

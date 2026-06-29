@@ -127,6 +127,11 @@ export declare class Database {
   createTable(name: string, schema: SchemaSpec): bigint
   /** Drop a table by name. */
   dropTable(name: string): void
+  /**
+   * Rename a live table. Fails if `name` does not exist, if `new_name` is
+   * empty, or if `new_name` is already in use. A no-op when `name == new_name`.
+   */
+  renameTable(name: string, newName: string): void
   /** Get a handle to a table by name for typed put/get/query operations. */
   getTable(name: string): TableHandle
   /** Alias for [`Database::get_table`] matching the spec's `database.table(name)`. */

@@ -335,3 +335,80 @@ async fn autoincrement_on_non_primary_key_is_rejected_with_no_dangling_wal_entry
         "a rejected CREATE TABLE must not leave a table in the catalog after reopen"
     );
 }
+
+// --- ALTER TABLE ... RENAME TO ... -------------------------------------------
+
+#[tokio::test]
+async fn alter_table_rename_via_sql() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    let session = MongrelSession::open(Arc::clone(&db)).unwrap();
+
+    session
+        .run("CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)")
+        .await
+        .unwrap();
+    // Insert via the Database so the row is committed and visible to the
+    // session's epoch before the rename.
+    db.transaction(|t| {
+        t.put("t", vec![(1, Value::Int64(1)), (2, Value::Int64(10))])?;
+        t.put("t", vec![(1, Value::Int64(2)), (2, Value::Int64(20))])
+    })
+    .unwrap();
+
+    session
+        .run("ALTER TABLE t RENAME TO u")
+        .await
+        .unwrap();
+
+    // The old name is gone from the catalog and from DataFusion.
+    assert!(!db.table_names().contains(&"t".to_string()));
+    assert!(session.run("SELECT * FROM t").await.is_err());
+
+    // The new name resolves and carries the data over.
+    assert!(db.table_names().contains(&"u".to_string()));
+    let batches = session.run("SELECT * FROM u").await.unwrap();
+    assert_eq!(total_rows(&batches), 2);
+}
+
+#[tokio::test]
+async fn alter_table_rename_rejects_conflict_via_sql() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    let session = MongrelSession::open(Arc::clone(&db)).unwrap();
+    session
+        .run("CREATE TABLE a (id BIGINT PRIMARY KEY)")
+        .await
+        .unwrap();
+    session
+        .run("CREATE TABLE b (id BIGINT PRIMARY KEY)")
+        .await
+        .unwrap();
+
+    let result = session.run("ALTER TABLE a RENAME TO b").await;
+    assert!(
+        result.is_err(),
+        "renaming onto an existing table name must fail"
+    );
+    // Both original tables remain intact.
+    let mut names = db.table_names();
+    names.sort();
+    assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
+}
+
+#[tokio::test]
+async fn alter_table_rename_is_case_insensitive() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    let session = MongrelSession::open(Arc::clone(&db)).unwrap();
+    session
+        .run("CREATE TABLE t (id BIGINT PRIMARY KEY)")
+        .await
+        .unwrap();
+
+    session
+        .run("Alter Table t Rename To u")
+        .await
+        .unwrap();
+    assert_eq!(db.table_names(), vec!["u".to_string()]);
+}

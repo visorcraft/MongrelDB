@@ -950,6 +950,27 @@ impl MongrelSession {
                 return Ok(Vec::new());
             }
         }
+        if lower.starts_with("alter table") {
+            if let Some(db) = &self.database {
+                let (old_name, new_name) = parse_alter_table_rename(sql)?;
+                db.rename_table(&old_name, &new_name)?;
+                // Re-key DataFusion + the session's handle cache under the new
+                // name. The table_id and underlying table object are unchanged
+                // by a rename, so a fresh handle resolves to the same table.
+                self.ctx
+                    .deregister_table(&old_name)
+                    .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
+                self.tables.lock().remove(&old_name);
+                let handle = db.table(&new_name)?;
+                let provider = MongrelProvider::new(handle.clone())?;
+                self.ctx
+                    .register_table(&new_name, Arc::new(provider))
+                    .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
+                self.tables.lock().insert(new_name, handle);
+                self.clear_cache();
+                return Ok(Vec::new());
+            }
+        }
 
         // Phase 17.3: intercept `SELECT ... FROM <view_name>` and rewrite to
         // the view's defining SQL.
@@ -1468,6 +1489,43 @@ fn parse_drop_table(sql: &str) -> Result<(String, bool)> {
         ));
     }
     Ok((name.to_string(), if_exists))
+}
+
+/// Parse `ALTER TABLE <name> RENAME TO <new_name>` into `(old_name, new_name)`.
+/// Keywords are case-insensitive; table names may be double-quoted. Only the
+/// RENAME form of ALTER TABLE is supported here — column alterations go through
+/// the native `add_column` API — so any other ALTER shape yields a schema error.
+///
+/// The `RENAME TO` separator is matched as a space-bordered, case-insensitive
+/// phrase. `to_ascii_lowercase` is used (not `to_lowercase`) so byte indices in
+/// the lowercased copy map 1:1 back to the original, even for non-ASCII names.
+fn parse_alter_table_rename(sql: &str) -> Result<(String, String)> {
+    let trimmed = sql.trim();
+    let after_kw = strip_prefix_ci(trimmed, "ALTER TABLE")
+        .ok_or_else(|| MongrelQueryError::Schema("not an ALTER TABLE statement".into()))?
+        .trim();
+    let lower = after_kw.to_ascii_lowercase();
+    let sep = " rename to ";
+    let sep_idx = lower.find(sep).ok_or_else(|| {
+        MongrelQueryError::Schema("ALTER TABLE must contain 'RENAME TO <new_name>'".into())
+    })?;
+    let old_name = after_kw[..sep_idx].trim().trim_matches('"').to_string();
+    let new_name = after_kw[sep_idx + sep.len()..]
+        .trim()
+        .trim_end_matches(';')
+        .trim_matches('"')
+        .to_string();
+    if old_name.is_empty() {
+        return Err(MongrelQueryError::Schema(
+            "ALTER TABLE missing source table name".into(),
+        ));
+    }
+    if new_name.is_empty() {
+        return Err(MongrelQueryError::Schema(
+            "ALTER TABLE missing new table name".into(),
+        ));
+    }
+    Ok((old_name, new_name))
 }
 
 #[cfg(test)]
