@@ -205,21 +205,25 @@ impl Cell {
     }
 
     fn to_value(&self, ty: TypeId) -> napi::Result<Value> {
+        // A cell whose value field for its column type is absent represents SQL
+        // NULL. Callers that mean zero/empty must set the field explicitly.
         Ok(match ty {
-            TypeId::Bool => Value::Bool(self.boolean.unwrap_or(false)),
-            TypeId::Int64 | TypeId::TimestampNanos | TypeId::Date32 => {
-                Value::Int64(
-                    self.int64
-                        .as_ref()
-                        .map(bigint_to_i64)
-                        .transpose()?
-                        .unwrap_or(0),
-                )
-            }
-            TypeId::Float64 => Value::Float64(self.float64.unwrap_or(0.0)),
-            TypeId::Bytes => match &self.text {
-                Some(s) => Value::Bytes(s.as_bytes().to_vec()),
-                None => Value::Bytes(self.bytes.as_ref().map(|b| b.to_vec()).unwrap_or_default()),
+            TypeId::Bool => match self.boolean {
+                Some(b) => Value::Bool(b),
+                None => Value::Null,
+            },
+            TypeId::Int64 | TypeId::TimestampNanos | TypeId::Date32 => match self.int64.as_ref() {
+                Some(n) => Value::Int64(bigint_to_i64(n)?),
+                None => Value::Null,
+            },
+            TypeId::Float64 => match self.float64 {
+                Some(f) => Value::Float64(f),
+                None => Value::Null,
+            },
+            TypeId::Bytes => match (&self.text, &self.bytes) {
+                (Some(s), _) => Value::Bytes(s.as_bytes().to_vec()),
+                (None, Some(b)) => Value::Bytes(b.to_vec()),
+                (None, None) => Value::Null,
             },
             TypeId::Embedding { .. } => {
                 Value::Embedding(self.embedding.iter().flatten().map(|x| *x as f32).collect())
