@@ -1405,7 +1405,10 @@ impl Table {
     /// value (`Some` only when the column was omitted/null and the engine filled
     /// it; `None` when the table has no auto-increment column or the caller
     /// supplied an explicit value).
-    pub fn put_returning(&mut self, mut columns: Vec<(u16, Value)>) -> Result<(RowId, Option<i64>)> {
+    pub fn put_returning(
+        &mut self,
+        mut columns: Vec<(u16, Value)>,
+    ) -> Result<(RowId, Option<i64>)> {
         let assigned = self.fill_auto_inc(&mut columns)?;
         let mut col_map = std::collections::HashMap::with_capacity(columns.len());
         for (c, v) in &columns {
@@ -1425,7 +1428,11 @@ impl Table {
     /// Bulk upsert: many rows under a single WAL record + one index pass. Far
     /// cheaper than `put` in a loop for batch ingest.
     pub fn put_batch(&mut self, batch: Vec<Vec<(u16, Value)>>) -> Result<Vec<RowId>> {
-        Ok(self.put_batch_returning(batch)?.into_iter().map(|(r, _)| r).collect())
+        Ok(self
+            .put_batch_returning(batch)?
+            .into_iter()
+            .map(|(r, _)| r)
+            .collect())
     }
 
     /// Like [`Table::put_batch`] but each entry is paired with the engine-
@@ -1434,8 +1441,7 @@ impl Table {
         &mut self,
         batch: Vec<Vec<(u16, Value)>>,
     ) -> Result<Vec<(RowId, Option<i64>)>> {
-        let mut filled: Vec<(Vec<(u16, Value)>, Option<i64>)> =
-            Vec::with_capacity(batch.len());
+        let mut filled: Vec<(Vec<(u16, Value)>, Option<i64>)> = Vec::with_capacity(batch.len());
         for mut cols in batch {
             let assigned = self.fill_auto_inc(&mut cols)?;
             filled.push((cols, assigned));
@@ -1534,7 +1540,11 @@ impl Table {
         if !needs_seed {
             return Ok(());
         }
-        let cid = self.auto_inc.as_ref().expect("auto-inc column present").column_id;
+        let cid = self
+            .auto_inc
+            .as_ref()
+            .expect("auto-inc column present")
+            .column_id;
         let max = self.scan_max_int64(cid)?;
         let ai = self.auto_inc.as_mut().expect("auto-inc column present");
         let floor = max.saturating_add(1).max(1);

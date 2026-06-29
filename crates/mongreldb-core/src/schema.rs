@@ -264,7 +264,12 @@ mod tests {
     fn auto_increment_validation_accepts_int64_pk() {
         let s = Schema {
             schema_id: 1,
-            columns: vec![col(0, "id", TypeId::Int64, ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY | ColumnFlags::AUTO_INCREMENT))],
+            columns: vec![col(
+                0,
+                "id",
+                TypeId::Int64,
+                ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY | ColumnFlags::AUTO_INCREMENT),
+            )],
             indexes: vec![],
             colocation: vec![],
         };
@@ -277,8 +282,18 @@ mod tests {
         let s = Schema {
             schema_id: 1,
             columns: vec![
-                col(0, "id", TypeId::Int64, ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY)),
-                col(1, "seq", TypeId::Int64, ColumnFlags::empty().with(ColumnFlags::AUTO_INCREMENT)),
+                col(
+                    0,
+                    "id",
+                    TypeId::Int64,
+                    ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                ),
+                col(
+                    1,
+                    "seq",
+                    TypeId::Int64,
+                    ColumnFlags::empty().with(ColumnFlags::AUTO_INCREMENT),
+                ),
             ],
             indexes: vec![],
             colocation: vec![],
@@ -290,7 +305,12 @@ mod tests {
     fn auto_increment_validation_rejects_non_int64() {
         let s = Schema {
             schema_id: 1,
-            columns: vec![col(0, "id", TypeId::Bytes, ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY | ColumnFlags::AUTO_INCREMENT))],
+            columns: vec![col(
+                0,
+                "id",
+                TypeId::Bytes,
+                ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY | ColumnFlags::AUTO_INCREMENT),
+            )],
             indexes: vec![],
             colocation: vec![],
         };
@@ -302,8 +322,19 @@ mod tests {
         let s = Schema {
             schema_id: 1,
             columns: vec![
-                col(0, "id", TypeId::Int64, ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY | ColumnFlags::AUTO_INCREMENT)),
-                col(1, "id2", TypeId::Int64, ColumnFlags::empty().with(ColumnFlags::AUTO_INCREMENT)),
+                col(
+                    0,
+                    "id",
+                    TypeId::Int64,
+                    ColumnFlags::empty()
+                        .with(ColumnFlags::PRIMARY_KEY | ColumnFlags::AUTO_INCREMENT),
+                ),
+                col(
+                    1,
+                    "id2",
+                    TypeId::Int64,
+                    ColumnFlags::empty().with(ColumnFlags::AUTO_INCREMENT),
+                ),
             ],
             indexes: vec![],
             colocation: vec![],
@@ -316,7 +347,13 @@ mod tests {
         let s = Schema {
             schema_id: 1,
             columns: vec![
-                col(0, "id", TypeId::Int64, ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY | ColumnFlags::AUTO_INCREMENT)),
+                col(
+                    0,
+                    "id",
+                    TypeId::Int64,
+                    ColumnFlags::empty()
+                        .with(ColumnFlags::PRIMARY_KEY | ColumnFlags::AUTO_INCREMENT),
+                ),
                 col(1, "name", TypeId::Bytes, ColumnFlags::empty()),
             ],
             indexes: vec![],
