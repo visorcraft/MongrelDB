@@ -59,6 +59,13 @@ impl ColumnFlags {
     pub const ENCRYPTED_INDEXABLE: u32 = 1 << 3;
     /// Store 1 bit per dimension; similarity via popcount(XOR).
     pub const EMBEDDING_BINARY_QUANTIZED: u32 = 1 << 4;
+    /// Engine-managed monotonic identity allocator. Valid only on a single
+    /// `Int64` primary-key column per table (see [`Schema::validate_auto_increment`]).
+    /// On insert, when the column is omitted or `Null`, the engine assigns the
+    /// next counter value; an explicit `Int64` value is honored and advances the
+    /// counter past it. Counters are 1-based, never reused, and independent of
+    /// the physical [`crate::rowid::RowId`].
+    pub const AUTO_INCREMENT: u32 = 1 << 5;
 
     #[inline]
     pub const fn empty() -> Self {
@@ -141,11 +148,21 @@ impl Schema {
     }
 
     /// Return an error if any column that is not marked NULLABLE is either
-    /// missing from `columns` or present as `Value::Null`.
+    /// missing from `columns` or present as `Value::Null`. A column carrying
+    /// [`ColumnFlags::AUTO_INCREMENT`] is exempt when omitted/`Null` because the
+    /// engine fills it in before this check runs.
     pub fn validate_not_null(&self, columns: &HashMap<u16, Value>) -> Result<()> {
         for col in &self.columns {
             if col.flags.contains(ColumnFlags::NULLABLE) {
                 continue;
+            }
+            // The engine supplies the AUTO_INCREMENT value, so its absence is
+            // legal at this layer (filled in upstream of validation).
+            if col.flags.contains(ColumnFlags::AUTO_INCREMENT) {
+                match columns.get(&col.id) {
+                    None | Some(Value::Null) => continue,
+                    Some(_) => {}
+                }
             }
             match columns.get(&col.id) {
                 None => {
@@ -164,6 +181,52 @@ impl Schema {
             }
         }
         Ok(())
+    }
+
+    /// Enforce the `AUTO_INCREMENT` column contract: at most one such column,
+    /// and it must be a non-nullable `Int64` primary key. Called at table
+    /// creation time so an invalid schema never reaches the insert path.
+    pub fn validate_auto_increment(&self) -> Result<()> {
+        let mut seen: Option<&ColumnDef> = None;
+        for col in &self.columns {
+            if !col.flags.contains(ColumnFlags::AUTO_INCREMENT) {
+                continue;
+            }
+            if seen.is_some() {
+                return Err(MongrelError::Schema(format!(
+                    "AUTO_INCREMENT may be set on at most one column; '{}' and '{}' both carry it",
+                    seen.unwrap().name,
+                    col.name
+                )));
+            }
+            if col.ty != TypeId::Int64 {
+                return Err(MongrelError::Schema(format!(
+                    "AUTO_INCREMENT column '{}' must be Int64, is {:?}",
+                    col.name, col.ty
+                )));
+            }
+            if !col.flags.contains(ColumnFlags::PRIMARY_KEY) {
+                return Err(MongrelError::Schema(format!(
+                    "AUTO_INCREMENT column '{}' must also be the primary key",
+                    col.name
+                )));
+            }
+            if col.flags.contains(ColumnFlags::NULLABLE) {
+                return Err(MongrelError::Schema(format!(
+                    "AUTO_INCREMENT column '{}' must not be nullable",
+                    col.name
+                )));
+            }
+            seen = Some(col);
+        }
+        Ok(())
+    }
+
+    /// The single `AUTO_INCREMENT` column, if any.
+    pub fn auto_increment_column(&self) -> Option<&ColumnDef> {
+        self.columns
+            .iter()
+            .find(|c| c.flags.contains(ColumnFlags::AUTO_INCREMENT))
     }
 }
 
@@ -186,5 +249,82 @@ mod tests {
         assert_eq!(TypeId::Int64.fixed_size(), Some(8));
         assert_eq!(TypeId::Bytes.fixed_size(), None);
         assert_eq!(TypeId::Embedding { dim: 768 }.fixed_size(), None);
+    }
+
+    fn col(id: u16, name: &str, ty: TypeId, flags: ColumnFlags) -> ColumnDef {
+        ColumnDef {
+            id,
+            name: name.into(),
+            ty,
+            flags,
+        }
+    }
+
+    #[test]
+    fn auto_increment_validation_accepts_int64_pk() {
+        let s = Schema {
+            schema_id: 1,
+            columns: vec![col(0, "id", TypeId::Int64, ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY | ColumnFlags::AUTO_INCREMENT))],
+            indexes: vec![],
+            colocation: vec![],
+        };
+        assert!(s.validate_auto_increment().is_ok());
+        assert_eq!(s.auto_increment_column().unwrap().id, 0);
+    }
+
+    #[test]
+    fn auto_increment_validation_rejects_non_pk() {
+        let s = Schema {
+            schema_id: 1,
+            columns: vec![
+                col(0, "id", TypeId::Int64, ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY)),
+                col(1, "seq", TypeId::Int64, ColumnFlags::empty().with(ColumnFlags::AUTO_INCREMENT)),
+            ],
+            indexes: vec![],
+            colocation: vec![],
+        };
+        assert!(s.validate_auto_increment().is_err());
+    }
+
+    #[test]
+    fn auto_increment_validation_rejects_non_int64() {
+        let s = Schema {
+            schema_id: 1,
+            columns: vec![col(0, "id", TypeId::Bytes, ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY | ColumnFlags::AUTO_INCREMENT))],
+            indexes: vec![],
+            colocation: vec![],
+        };
+        assert!(s.validate_auto_increment().is_err());
+    }
+
+    #[test]
+    fn auto_increment_validation_rejects_two() {
+        let s = Schema {
+            schema_id: 1,
+            columns: vec![
+                col(0, "id", TypeId::Int64, ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY | ColumnFlags::AUTO_INCREMENT)),
+                col(1, "id2", TypeId::Int64, ColumnFlags::empty().with(ColumnFlags::AUTO_INCREMENT)),
+            ],
+            indexes: vec![],
+            colocation: vec![],
+        };
+        assert!(s.validate_auto_increment().is_err());
+    }
+
+    #[test]
+    fn auto_increment_exempt_from_not_null_when_omitted() {
+        let s = Schema {
+            schema_id: 1,
+            columns: vec![
+                col(0, "id", TypeId::Int64, ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY | ColumnFlags::AUTO_INCREMENT)),
+                col(1, "name", TypeId::Bytes, ColumnFlags::empty()),
+            ],
+            indexes: vec![],
+            colocation: vec![],
+        };
+        // Omitting the auto-inc column must not trip NOT NULL.
+        let mut cols = HashMap::new();
+        cols.insert(1u16, Value::Bytes(b"x".to_vec()));
+        assert!(s.validate_not_null(&cols).is_ok());
     }
 }

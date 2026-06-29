@@ -324,7 +324,7 @@ console.log('smoke: encrypted round-trip ✓');
   assert(db7.getTable('b').count() === 2n, `sub add: ${db7.getTable('b').count()}`);
 
   // Sub-API delete: capture a real row id via a direct put, then delete it.
-  const rid = db7.getTable('a').put([{ columnId: 1, int64: 100n }, { columnId: 2, int64: 1n }]);
+  const rid = db7.getTable('a').put([{ columnId: 1, int64: 100n }, { columnId: 2, int64: 1n }]).rowId;
   db7.getTable('a').commit();
   const before = db7.getTable('a').count();
   const txDel = db7.begin();
@@ -356,11 +356,11 @@ console.log('smoke: TxnTable sub-API ✓');
   const ridMax = i64.put([
     { columnId: 1, int64: 1n },
     { columnId: 2, int64: max },
-  ]);
+  ]).rowId;
   const ridMin = i64.put([
     { columnId: 1, int64: 2n },
     { columnId: 2, int64: min },
-  ]);
+  ]).rowId;
   i64.commit();
 
   const rMax = i64.get(ridMax);
@@ -455,7 +455,7 @@ console.log('smoke: full-range Int64 / BigInt ✓');
   const rid = textPk.put([
     { columnId: 1, text: 'gamma' },
     { columnId: 2, int64: 300n },
-  ]);
+  ]).rowId;
   textPk.commit();
   assert(textPk.get(rid) !== null, 'gamma inserted');
   textPk.delete(rid);
@@ -666,5 +666,93 @@ console.log('smoke: A5 ConflictError + transaction wrapper ✓');
   rmSync(dirRange, { recursive: true });
 }
 console.log('smoke: BigInt range validation ✓');
+
+// ── Engine-native AUTO_INCREMENT ──────────────────────────────────────────
+{
+  const dirAi = makeTempDir();
+  const ai = Database.withPath(dirAi);
+  ai.createTable('things', {
+    columns: [
+      { id: 1, name: 'id', ty: 1, primaryKey: true, nullable: false, autoIncrement: true },
+      { id: 2, name: 'label', ty: 5, primaryKey: false, nullable: false },
+    ],
+    indexes: [],
+  });
+  const t = ai.getTable('things');
+
+  // Omit the PK cell → engine assigns 1, 2, 3.
+  const r1 = t.put([{ columnId: 2, bytes: Buffer.from('a') }]);
+  const r2 = t.put([{ columnId: 2, bytes: Buffer.from('b') }]);
+  const r3 = t.put([{ columnId: 2, bytes: Buffer.from('c') }]);
+  assert(typeof r1.rowId === 'bigint', 'put returns rowId bigint');
+  assert(r1.autoInc === 1n, `omit pk → engine assigns 1 (got ${r1.autoInc})`);
+  assert(r2.autoInc === 2n, `omit pk → engine assigns 2`);
+  assert(r3.autoInc === 3n, `omit pk → engine assigns 3`);
+  assert(r1.rowId !== r2.rowId && r2.rowId !== r3.rowId, 'distinct row ids');
+
+  // Explicit id advances the counter past it.
+  const r4 = t.put([
+    { columnId: 1, int64: 50n },
+    { columnId: 2, bytes: Buffer.from('big') },
+  ]);
+  assert(r4.autoInc == null, 'explicit id → autoInc null/undefined');
+  const r5 = t.put([{ columnId: 2, bytes: Buffer.from('n') }]);
+  assert(r5.autoInc === 51n, `omit after explicit 50 → 51 (got ${r5.autoInc})`);
+  t.commit();
+
+  // The assigned value is materialized in the row: each PK is retrievable.
+  for (const id of [1n, 2n, 3n, 50n, 51n]) {
+    const got = t.getByPkInt64(id);
+    assert(got !== null, `materialized pk ${id} retrievable`);
+  }
+  assert(t.getByPkInt64(4n) === null, 'id 4 was never assigned');
+
+  // Batch assigns per-row and returns each.
+  const batch = t.putBatch([
+    [{ columnId: 2, bytes: Buffer.from('x') }],
+    [{ columnId: 2, bytes: Buffer.from('y') }],
+  ]);
+  assert.deepEqual(batch.map((b) => b.autoInc), [52n, 53n], 'batch per-row ids');
+  t.commit();
+  ai.close();
+
+  // Reopen: the manifest-checkpointed counter continues.
+  const ai2 = Database.open(dirAi);
+  const t2 = ai2.getTable('things');
+  const r6 = t2.put([{ columnId: 2, bytes: Buffer.from('d') }]);
+  assert(r6.autoInc === 54n, `reopen continues counter (got ${r6.autoInc})`);
+  ai2.close();
+
+  // Seed-from-max: bulk-load explicit ids, reopen, first omitted allocation
+  // seeds to max(existing)+1 (no collision at 1).
+  const dirSeed = makeTempDir();
+  const seed = Database.withPath(dirSeed);
+  seed.createTable('legacy', {
+    columns: [
+      { id: 1, name: 'id', ty: 1, primaryKey: true, nullable: false, autoIncrement: true },
+      { id: 2, name: 'v', ty: 1, primaryKey: false, nullable: false },
+    ],
+    indexes: [],
+  });
+  const sl = seed.getTable('legacy');
+  for (let i = 1; i <= 40; i++) {
+    sl.put([
+      { columnId: 1, int64: BigInt(i) },
+      { columnId: 2, int64: BigInt(i) },
+    ]);
+  }
+  sl.commit();
+  sl.flush();
+  seed.close();
+
+  const seed2 = Database.open(dirSeed);
+  const sl2 = seed2.getTable('legacy');
+  const rs = sl2.put([{ columnId: 2, int64: 999n }]);
+  assert(rs.autoInc === 41n, `seed-from-max → 41 (got ${rs.autoInc})`);
+  seed2.close();
+  rmSync(dirAi, { recursive: true });
+  rmSync(dirSeed, { recursive: true });
+}
+console.log('smoke: AUTO_INCREMENT ✓');
 
 console.log('All smoke tests passed.');

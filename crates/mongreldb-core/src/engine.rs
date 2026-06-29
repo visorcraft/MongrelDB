@@ -44,6 +44,37 @@ pub(crate) const DECODED_CACHE_CAPACITY: u64 = 64 * 1024 * 1024; // 64 MiB share
 /// one larger run so the read path merges fewer readers.
 const DEFAULT_MUTABLE_RUN_SPILL_BYTES: u64 = 8 * 1024 * 1024;
 
+/// Engine-managed `AUTO_INCREMENT` counter state for a table (present iff the
+/// schema declares an `AUTO_INCREMENT` primary key).
+///
+/// `next` is the next value to hand out (1-based, monotonic, never reused). It
+/// is `0` while *unseeded* — the counter has never been advanced (fresh table or
+/// a legacy manifest predating `auto_inc_next`). When `seeded` is `false` the
+/// first allocation scans `max(PK)` over all visible rows so the counter never
+/// collides with pre-existing rows; a value of `0` after seeding never happens
+/// (ids are never 0). The manifest persists `next` only when `seeded`, so a
+/// reopen that reads `auto_inc_next > 0` is authoritative.
+///
+/// `seeded == false` but `next > 0` is a transient recovery-only state: WAL
+/// replay may bump `next` past replayed ids without marking it seeded, so the
+/// scan still runs to cover rows that were already flushed to sorted runs.
+#[derive(Clone, Copy, Debug)]
+struct AutoIncState {
+    column_id: u16,
+    next: i64,
+    seeded: bool,
+}
+
+/// Resolve the auto-increment column (if any) from a schema into initial
+/// counter state. Always called after [`crate::schema::Schema::validate_auto_increment`].
+fn resolve_auto_inc(schema: &Schema) -> Option<AutoIncState> {
+    schema.auto_increment_column().map(|c| AutoIncState {
+        column_id: c.id,
+        next: 0,
+        seeded: false,
+    })
+}
+
 /// An open MongrelDB table.
 pub struct Table {
     dir: PathBuf,
@@ -158,6 +189,9 @@ pub struct Table {
     /// B1/B2: tombstones staged on a mounted table, applied at the assigned
     /// epoch in `commit` (mirror of `pending_rows`).
     pending_dels: Vec<RowId>,
+    /// Engine-managed `AUTO_INCREMENT` counter (`None` for tables without an
+    /// auto-increment primary key). See [`AutoIncState`].
+    auto_inc: Option<AutoIncState>,
 }
 
 // `Table` is `Sync`: every field is either plain data, an `Arc`, a `Vec`/`HashMap`
@@ -828,6 +862,7 @@ impl Table {
         table_id: u64,
         ctx: SharedCtx,
     ) -> Result<Self> {
+        schema.validate_auto_increment()?;
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(dir.join(RUNS_DIR))?;
         write_schema(&dir, &schema)?;
@@ -861,6 +896,7 @@ impl Table {
         manifest::write_atomic(&dir, &mut manifest, manifest_meta_dek.as_ref())?;
         let (bitmap, ann, fm, sparse) = empty_indexes(&schema);
         let column_keys = build_column_keys(ctx.kek.as_deref(), &schema);
+        let auto_inc = resolve_auto_inc(&schema);
         let rcache_dir = dir.join(RCACHE_DIR);
         Ok(Self {
             dir,
@@ -909,6 +945,7 @@ impl Table {
             pending_rows: Vec::new(),
             pending_dels: Vec::new(),
             wal_dek,
+            auto_inc,
         })
     }
 
@@ -992,6 +1029,17 @@ impl Table {
         let mut memtable = Memtable::new();
         let mut allocator = RowIdAllocator::new(manifest.next_row_id);
         let persisted_epoch = manifest.current_epoch;
+        // Seed the auto-increment counter from the manifest. `auto_inc_next == 0`
+        // means unseeded (fresh table, or a legacy manifest migrated forward) —
+        // the first allocation scans `max(PK)` to avoid colliding with existing
+        // rows. WAL replay (below) and `recover_apply` additionally bump `next`
+        // past replayed ids without marking it seeded, so the scan still covers
+        // any rows that were already flushed to sorted runs.
+        let mut auto_inc = resolve_auto_inc(&schema).map(|mut s| {
+            s.next = manifest.auto_inc_next;
+            s.seeded = manifest.auto_inc_next > 0;
+            s
+        });
 
         // 1. Replay is two-phase and TxnCommit-gated: data records (Put/Delete)
         //    are staged per `txn_id` and only applied when a durable
@@ -1012,6 +1060,13 @@ impl Table {
                     let rows: Vec<Row> = bincode::deserialize(&rows)?;
                     for row in &rows {
                         allocator.advance_to(row.row_id);
+                        if let Some(ai) = auto_inc.as_mut() {
+                            if let Some(Value::Int64(n)) = row.columns.get(&ai.column_id) {
+                                if *n + 1 > ai.next {
+                                    ai.next = *n + 1;
+                                }
+                            }
+                        }
                     }
                     staged_puts.entry(txn_id).or_default().extend(rows);
                 }
@@ -1096,6 +1151,7 @@ impl Table {
             pending_rows: Vec::new(),
             pending_dels: Vec::new(),
             wal_dek,
+            auto_inc,
         };
 
         // Advance the (possibly shared) epoch authority to this table's manifest
@@ -1337,7 +1393,20 @@ impl Table {
     /// Upsert a row. Allocates a [`RowId`], appends a (non-fsynced) WAL record,
     /// and updates the memtable + indexes. Returns the new row id. Durability
     /// arrives at the next [`Table::commit`] (or [`Table::flush`]).
+    ///
+    /// For an `AUTO_INCREMENT` primary key, omit the column (or pass
+    /// [`Value::Null`]) and the engine assigns the next counter value; use
+    /// [`Table::put_returning`] to learn that assigned value.
     pub fn put(&mut self, columns: Vec<(u16, Value)>) -> Result<RowId> {
+        Ok(self.put_returning(columns)?.0)
+    }
+
+    /// Like [`Table::put`] but also returns the engine-assigned `AUTO_INCREMENT`
+    /// value (`Some` only when the column was omitted/null and the engine filled
+    /// it; `None` when the table has no auto-increment column or the caller
+    /// supplied an explicit value).
+    pub fn put_returning(&mut self, mut columns: Vec<(u16, Value)>) -> Result<(RowId, Option<i64>)> {
+        let assigned = self.fill_auto_inc(&mut columns)?;
         let mut col_map = std::collections::HashMap::with_capacity(columns.len());
         for (c, v) in &columns {
             col_map.insert(*c, v.clone());
@@ -1350,13 +1419,28 @@ impl Table {
             row.columns.insert(col_id, val);
         }
         self.commit_rows(vec![row])?;
-        Ok(row_id)
+        Ok((row_id, assigned))
     }
 
     /// Bulk upsert: many rows under a single WAL record + one index pass. Far
     /// cheaper than `put` in a loop for batch ingest.
     pub fn put_batch(&mut self, batch: Vec<Vec<(u16, Value)>>) -> Result<Vec<RowId>> {
-        for cols in &batch {
+        Ok(self.put_batch_returning(batch)?.into_iter().map(|(r, _)| r).collect())
+    }
+
+    /// Like [`Table::put_batch`] but each entry is paired with the engine-
+    /// assigned `AUTO_INCREMENT` value (`Some` only when filled by the engine).
+    pub fn put_batch_returning(
+        &mut self,
+        batch: Vec<Vec<(u16, Value)>>,
+    ) -> Result<Vec<(RowId, Option<i64>)>> {
+        let mut filled: Vec<(Vec<(u16, Value)>, Option<i64>)> =
+            Vec::with_capacity(batch.len());
+        for mut cols in batch {
+            let assigned = self.fill_auto_inc(&mut cols)?;
+            filled.push((cols, assigned));
+        }
+        for (cols, _) in &filled {
             let mut col_map = std::collections::HashMap::with_capacity(cols.len());
             for (c, v) in cols {
                 col_map.insert(*c, v.clone());
@@ -1364,19 +1448,137 @@ impl Table {
             self.schema.validate_not_null(&col_map)?;
         }
         let epoch = self.pending_epoch();
-        let mut rows = Vec::with_capacity(batch.len());
-        let mut ids = Vec::with_capacity(batch.len());
-        for cols in batch {
+        let mut rows = Vec::with_capacity(filled.len());
+        let mut ids = Vec::with_capacity(filled.len());
+        for (cols, assigned) in filled {
             let row_id = self.allocator.alloc();
             let mut row = Row::new(row_id, epoch);
             for (c, v) in cols {
                 row.columns.insert(c, v);
             }
-            ids.push(row_id);
+            ids.push((row_id, assigned));
             rows.push(row);
         }
         self.commit_rows(rows)?;
         Ok(ids)
+    }
+
+    /// Fill the `AUTO_INCREMENT` column for an upcoming row. When the column is
+    /// omitted or [`Value::Null`] the next counter value is allocated and the
+    /// cell is appended/replaced in `columns`; an explicit `Int64` is honored
+    /// and advances the counter past it. Returns `Some(value)` when the engine
+    /// allocated (so the caller can surface it), `None` otherwise.
+    fn fill_auto_inc(&mut self, columns: &mut Vec<(u16, Value)>) -> Result<Option<i64>> {
+        let Some(cid) = self.auto_inc.as_ref().map(|a| a.column_id) else {
+            return Ok(None);
+        };
+        let pos = columns.iter().position(|(c, _)| *c == cid);
+        let assigned = match pos {
+            Some(i) => match &columns[i].1 {
+                Value::Null => {
+                    let next = self.alloc_auto_inc_value()?;
+                    columns[i].1 = Value::Int64(next);
+                    Some(next)
+                }
+                Value::Int64(n) => {
+                    self.advance_auto_inc_past(*n)?;
+                    None
+                }
+                other => {
+                    return Err(MongrelError::InvalidArgument(format!(
+                        "AUTO_INCREMENT column {cid} must be Int64 or NULL, got {:?}",
+                        other
+                    )))
+                }
+            },
+            None => {
+                let next = self.alloc_auto_inc_value()?;
+                columns.push((cid, Value::Int64(next)));
+                Some(next)
+            }
+        };
+        Ok(assigned)
+    }
+
+    /// Allocate the next identity value, seeding the counter first if needed.
+    fn alloc_auto_inc_value(&mut self) -> Result<i64> {
+        self.ensure_auto_inc_seeded()?;
+        // Borrow checker: re-read after the mutable `ensure` call returns.
+        let ai = self.auto_inc.as_mut().expect("auto-inc column present");
+        let v = ai.next;
+        ai.next = ai.next.saturating_add(1);
+        Ok(v)
+    }
+
+    /// Advance the counter past an explicit id, seeding first if needed so a
+    /// pre-existing higher id elsewhere is never ignored.
+    fn advance_auto_inc_past(&mut self, used: i64) -> Result<()> {
+        self.ensure_auto_inc_seeded()?;
+        let ai = self.auto_inc.as_mut().expect("auto-inc column present");
+        let floor = used.saturating_add(1).max(1);
+        if ai.next < floor {
+            ai.next = floor;
+        }
+        Ok(())
+    }
+
+    /// Seed the counter on first use by scanning `max(PK)` over all visible
+    /// rows, so an upgraded table (legacy client-assigned ids, or a manifest
+    /// migrated from `auto_inc_next == 0`) never hands out a colliding id.
+    /// Idempotent: a no-op once seeded.
+    fn ensure_auto_inc_seeded(&mut self) -> Result<()> {
+        let needs_seed = match self.auto_inc {
+            Some(ai) => !ai.seeded,
+            None => return Ok(()),
+        };
+        if !needs_seed {
+            return Ok(());
+        }
+        let cid = self.auto_inc.as_ref().expect("auto-inc column present").column_id;
+        let max = self.scan_max_int64(cid)?;
+        let ai = self.auto_inc.as_mut().expect("auto-inc column present");
+        let floor = max.saturating_add(1).max(1);
+        if ai.next < floor {
+            ai.next = floor;
+        }
+        ai.seeded = true;
+        Ok(())
+    }
+
+    /// One-time `max(Int64 column)` over all MVCC-visible rows. Used to seed the
+    /// auto-increment counter. Runs at most once per table (the manifest then
+    /// checkpoints the seeded counter).
+    fn scan_max_int64(&mut self, column_id: u16) -> Result<i64> {
+        let rows = self.query(&crate::query::Query::default())?;
+        let mut max: i64 = 0;
+        for r in &rows {
+            if let Some(Value::Int64(n)) = r.columns.get(&column_id) {
+                if *n > max {
+                    max = *n;
+                }
+            }
+        }
+        Ok(max)
+    }
+
+    /// Reserve (but do not insert) the next `AUTO_INCREMENT` value, advancing
+    /// the in-memory counter. Returns `None` when the table has no
+    /// auto-increment column.
+    ///
+    /// This is the escape hatch for callers that stage the row with an explicit
+    /// id inside a cross-table [`crate::Transaction`] — where the engine cannot
+    /// fill the column on the `put` path (the row id + cells are only assembled
+    /// at commit). Unlike the old Kit `__kit_sequences` sequence row, the
+    /// reservation is a pure in-memory counter bump: no hot row, no second
+    /// commit. It becomes durable when a row carrying the reserved id commits
+    /// (the counter is checkpointed to the manifest in the same commit); an
+    /// aborted reservation simply leaves a gap, which the never-reuse rule
+    /// permits.
+    pub fn reserve_auto_inc(&mut self) -> Result<Option<i64>> {
+        if self.auto_inc.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(self.alloc_auto_inc_value()?))
     }
 
     /// Append `rows` under one WAL record. On a standalone table they are folded
@@ -1526,6 +1728,17 @@ impl Table {
             std::collections::BTreeMap::new();
         for row in rows {
             self.allocator.advance_to(row.row_id);
+            // Mirror the row-id advance for the AUTO_INCREMENT counter: WAL
+            // replay must not hand out an id a recovered row already claimed.
+            // `seeded` is intentionally left untouched so a still-unseeded
+            // counter still scans `max(PK)` to cover already-flushed rows.
+            if let Some(ai) = self.auto_inc.as_mut() {
+                if let Some(Value::Int64(n)) = row.columns.get(&ai.column_id) {
+                    if *n + 1 > ai.next {
+                        ai.next = *n + 1;
+                    }
+                }
+            }
             by_epoch.entry(row.committed_epoch).or_default().push(row);
         }
         for (epoch, group) in by_epoch {
@@ -2186,6 +2399,13 @@ impl Table {
         m.global_idx_epoch = self.global_idx_epoch;
         m.flushed_epoch = self.flushed_epoch;
         m.retiring = self.retiring.clone();
+        // Persist the authoritative counter only when seeded; otherwise write 0
+        // so the next open still scans `max(PK)` on first use (an unseeded
+        // lower bound from WAL replay is not safe to trust across a flush).
+        m.auto_inc_next = match self.auto_inc {
+            Some(ai) if ai.seeded => ai.next,
+            _ => 0,
+        };
         let meta_dek = self.manifest_meta_dek();
         manifest::write_atomic(&self.dir, &mut m, meta_dek.as_ref())?;
         Ok(())

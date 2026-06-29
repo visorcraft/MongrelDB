@@ -100,6 +100,12 @@ pub struct ColumnSpec {
     /// Optional default value for schema-evolution back-fill. Currently only
     /// validated; applying defaults to existing rows is not yet implemented.
     pub default_value: Option<Cell>,
+    /// Engine-managed monotonic identity allocator for an `Int64` primary key.
+    /// When `true`, the engine assigns the next counter value on insert if the
+    /// column is omitted/null, and explicit ids advance the counter past them.
+    /// Mutually exclusive with `nullable`; requires `primary_key` and `Int64`.
+    /// Defaults to `false` (omitted/null).
+    pub auto_increment: Option<bool>,
 }
 
 #[napi(object)]
@@ -145,6 +151,9 @@ fn build_schema(spec: SchemaSpec) -> napi::Result<Schema> {
             }
             if c.nullable {
                 f = f.with(ColumnFlags::NULLABLE);
+            }
+            if c.auto_increment.unwrap_or(false) {
+                f = f.with(ColumnFlags::AUTO_INCREMENT);
             }
             Ok::<ColumnDef, napi::Error>(ColumnDef {
                 id: c.id,
@@ -364,6 +373,151 @@ pub struct Database {
 pub struct TableHandle {
     db: Arc<CoreDatabase>,
     name: String,
+}
+
+/// Cursor over a packed bulk-write buffer (see `Transaction::put_packed`).
+struct PackedReader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> PackedReader<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    fn take(&mut self, n: usize) -> napi::Result<&'a [u8]> {
+        let end = self.pos.checked_add(n).filter(|e| *e <= self.buf.len());
+        match end {
+            Some(end) => {
+                let s = &self.buf[self.pos..end];
+                self.pos = end;
+                Ok(s)
+            }
+            None => Err(napi::Error::new(
+                napi::Status::InvalidArg,
+                "packed buffer truncated",
+            )),
+        }
+    }
+
+    fn u8(&mut self) -> napi::Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+    fn u16(&mut self) -> napi::Result<u16> {
+        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
+    }
+    fn u32(&mut self) -> napi::Result<usize> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()) as usize)
+    }
+    fn i64(&mut self) -> napi::Result<i64> {
+        Ok(i64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+    fn u64(&mut self) -> napi::Result<u64> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+    fn f64(&mut self) -> napi::Result<f64> {
+        Ok(f64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+}
+
+fn decode_packed_puts(payload: &[u8]) -> napi::Result<Vec<Vec<(u16, Value)>>> {
+    let mut r = PackedReader::new(payload);
+    let row_count = r.u32()?;
+    let mut rows = Vec::with_capacity(row_count);
+    for _ in 0..row_count {
+        let cell_count = r.u16()? as usize;
+        let mut cols = Vec::with_capacity(cell_count);
+        for _ in 0..cell_count {
+            let column_id = r.u16()?;
+            let tag = r.u8()?;
+            let value = match tag {
+                0 => Value::Null,
+                1 => Value::Int64(r.i64()?),
+                2 => Value::Float64(r.f64()?),
+                3 => Value::Bool(r.u8()? != 0),
+                4 => {
+                    let len = r.u32()?;
+                    Value::Bytes(r.take(len)?.to_vec())
+                }
+                other => {
+                    return Err(napi::Error::new(
+                        napi::Status::InvalidArg,
+                        format!("packed buffer: unknown cell tag {other}"),
+                    ))
+                }
+            };
+            cols.push((column_id, value));
+        }
+        rows.push(cols);
+    }
+    Ok(rows)
+}
+
+fn decode_packed_row_ids(payload: &[u8]) -> napi::Result<Vec<u64>> {
+    let mut r = PackedReader::new(payload);
+    let count = r.u32()?;
+    let mut ids = Vec::with_capacity(count);
+    for _ in 0..count {
+        ids.push(r.u64()?);
+    }
+    Ok(ids)
+}
+
+#[cfg(test)]
+mod packed_tests {
+    use super::*;
+
+    #[test]
+    fn decodes_mixed_rows() {
+        // 1 row, 3 cells: (col 1, int64 7), (col 2, bytes "hi"), (col 3, null).
+        let mut b = Vec::new();
+        b.extend_from_slice(&1u32.to_le_bytes()); // rowCount
+        b.extend_from_slice(&3u16.to_le_bytes()); // cellCount
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.push(1);
+        b.extend_from_slice(&7i64.to_le_bytes());
+        b.extend_from_slice(&2u16.to_le_bytes());
+        b.push(4);
+        b.extend_from_slice(&2u32.to_le_bytes());
+        b.extend_from_slice(b"hi");
+        b.extend_from_slice(&3u16.to_le_bytes());
+        b.push(0);
+
+        let rows = decode_packed_puts(&b).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0],
+            vec![
+                (1u16, Value::Int64(7)),
+                (2u16, Value::Bytes(b"hi".to_vec())),
+                (3u16, Value::Null),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_truncated_and_unknown_tag() {
+        // claims 1 row but no body
+        assert!(decode_packed_puts(&1u32.to_le_bytes()).is_err());
+        // 1 row, 1 cell, col 1, tag 99 (unknown)
+        let mut b = Vec::new();
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.push(99);
+        assert!(decode_packed_puts(&b).is_err());
+    }
+
+    #[test]
+    fn decodes_row_ids() {
+        let mut b = Vec::new();
+        b.extend_from_slice(&2u32.to_le_bytes());
+        b.extend_from_slice(&5u64.to_le_bytes());
+        b.extend_from_slice(&9u64.to_le_bytes());
+        assert_eq!(decode_packed_row_ids(&b).unwrap(), vec![5, 9]);
+        assert!(decode_packed_row_ids(&3u32.to_le_bytes()).is_err());
+    }
 }
 
 fn cell_pairs_table(
@@ -615,16 +769,32 @@ fn native_cols_to_ipc_from_batches(
     Ok(Buffer::from(buf))
 }
 
+/// Result of an insert: the physical row id plus, when the engine allocated
+/// it, the `AUTO_INCREMENT` value written into the row.
+#[napi(object)]
+pub struct PutResult {
+    /// The storage row id (stable physical identity).
+    pub row_id: BigInt,
+    /// The engine-assigned `AUTO_INCREMENT` value, when the column was omitted
+    /// or null and the engine filled it. `null` for tables without an
+    /// auto-increment column, or when the caller supplied an explicit value.
+    pub auto_inc: Option<BigInt>,
+}
+
 #[napi]
 impl TableHandle {
-    /// Upsert one row. Returns the row id.
+    /// Upsert one row. Returns the row id and, when the engine allocated it,
+    /// the `AUTO_INCREMENT` value.
     #[napi]
-    pub fn put(&self, cells: Vec<Cell>) -> napi::Result<BigInt> {
+    pub fn put(&self, cells: Vec<Cell>) -> napi::Result<PutResult> {
         let handle = self.db.table(&self.name).map_err(to_napi)?;
         let mut g = handle.lock();
         let cols = cell_pairs_table(&g, cells)?;
-        let rid = g.put(cols).map_err(to_napi)?;
-        Ok(BigInt::from(rid.0))
+        let (rid, auto) = g.put_returning(cols).map_err(to_napi)?;
+        Ok(PutResult {
+            row_id: BigInt::from(rid.0),
+            auto_inc: auto.map(BigInt::from),
+        })
     }
 
     /// Group-commit this table's pending writes.
@@ -669,6 +839,21 @@ impl TableHandle {
         let q = Query::pk(text.into_bytes());
         let rows = g.query_cached(&q).map_err(to_napi)?;
         Ok(rows.first().map(|r| row_to_js_table(&g, r)))
+    }
+
+    /// Reserve (without inserting) the next `AUTO_INCREMENT` value for this
+    /// table, advancing the engine's in-memory counter. Returns `null` if the
+    /// table has no auto-increment column. Used by callers that stage a row with
+    /// an explicit id inside a transaction; the reservation becomes durable when
+    /// a row carrying the id commits, and a never-used reservation just leaves a
+    /// gap. Far cheaper than a Kit-style sequence row — no hot row, no extra
+    /// commit.
+    #[napi]
+    pub fn reserve_auto_inc(&self) -> napi::Result<Option<BigInt>> {
+        let handle = self.db.table(&self.name).map_err(to_napi)?;
+        let mut g = handle.lock();
+        let v = g.reserve_auto_inc().map_err(to_napi)?;
+        Ok(v.map(BigInt::from))
     }
 
     /// Point read by an Int64 primary key.
@@ -728,17 +913,24 @@ impl TableHandle {
         Ok(rows.iter().map(|r| row_to_js_table(&g, r)).collect())
     }
 
-    /// Insert a batch of rows in one call. Returns the new row ids in order.
+    /// Insert a batch of rows in one call. Returns each row's id and, when the
+    /// engine allocated it, its `AUTO_INCREMENT` value, in order.
     #[napi]
-    pub fn put_batch(&self, rows: Vec<Vec<Cell>>) -> napi::Result<Vec<BigInt>> {
+    pub fn put_batch(&self, rows: Vec<Vec<Cell>>) -> napi::Result<Vec<PutResult>> {
         let handle = self.db.table(&self.name).map_err(to_napi)?;
         let mut g = handle.lock();
         let mut batch = Vec::with_capacity(rows.len());
         for cells in rows {
             batch.push(cell_pairs_table(&g, cells)?);
         }
-        let rids = g.put_batch(batch).map_err(to_napi)?;
-        Ok(rids.into_iter().map(|r| BigInt::from(r.0)).collect())
+        let rids = g.put_batch_returning(batch).map_err(to_napi)?;
+        Ok(rids
+            .into_iter()
+            .map(|(r, a)| PutResult {
+                row_id: BigInt::from(r.0),
+                auto_inc: a.map(BigInt::from),
+            })
+            .collect())
     }
 
     /// Fastest ingest path: bulk-load typed columns (Int64/Float64/Bool) in one
@@ -770,18 +962,24 @@ impl TableHandle {
     // ── async variants ──
 
     #[napi]
-    pub async fn put_async(&self, cells: Vec<Cell>) -> napi::Result<BigInt> {
+    pub async fn put_async(&self, cells: Vec<Cell>) -> napi::Result<PutResult> {
         let db = Arc::clone(&self.db);
         let name = self.name.clone();
-        napi::bindgen_prelude::spawn_blocking(move || -> napi::Result<BigInt> {
-            let handle = db.table(&name).map_err(to_napi)?;
-            let mut g = handle.lock();
-            let cols = cell_pairs_table(&g, cells)?;
-            let rid = g.put(cols).map_err(to_napi)?;
-            Ok(BigInt::from(rid.0))
-        })
+        let (rid, auto) = napi::bindgen_prelude::spawn_blocking(
+            move || -> napi::Result<(u64, Option<i64>)> {
+                let handle = db.table(&name).map_err(to_napi)?;
+                let mut g = handle.lock();
+                let cols = cell_pairs_table(&g, cells)?;
+                let (rid, auto) = g.put_returning(cols).map_err(to_napi)?;
+                Ok((rid.0, auto))
+            },
+        )
         .await
-        .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e:?}")))?
+        .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e:?}")))??;
+        Ok(PutResult {
+            row_id: BigInt::from(rid),
+            auto_inc: auto.map(BigInt::from),
+        })
     }
 
     #[napi]
@@ -941,6 +1139,37 @@ impl Transaction {
         self.staging
             .lock()
             .push((table, TxnOp::Delete(RowId(bigint_to_u64(&row_id)?))));
+        Ok(())
+    }
+
+    /// Stage many puts on `table` from a compact little-endian buffer, skipping
+    /// the per-cell NAPI `Cell` object marshalling that dominates a bulk load.
+    /// Layout: `u32 rowCount`, then per row `u16 cellCount`, then per cell
+    /// `u16 columnId`, `u8 tag`, payload — tag 0=null, 1=int64 (i64 LE),
+    /// 2=float64 (f64 LE), 3=bool (u8), 4=bytes (u32 len + bytes; text is UTF-8).
+    /// The decoded `(column_id, Value)` pairs are identical to what `put` builds.
+    #[napi]
+    pub fn put_packed(&self, table: String, payload: Buffer) -> napi::Result<()> {
+        let rows = decode_packed_puts(&payload)?;
+        let mut buf = self.staging.lock();
+        buf.reserve(rows.len());
+        for cols in rows {
+            buf.push((table.clone(), TxnOp::Put(cols)));
+        }
+        Ok(())
+    }
+
+    /// Stage many deletes on `table` from a compact buffer of row ids:
+    /// `u32 count`, then `count` × `u64 LE` row id. One NAPI crossing instead
+    /// of one per row.
+    #[napi]
+    pub fn delete_packed(&self, table: String, payload: Buffer) -> napi::Result<()> {
+        let ids = decode_packed_row_ids(&payload)?;
+        let mut buf = self.staging.lock();
+        buf.reserve(ids.len());
+        for rid in ids {
+            buf.push((table.clone(), TxnOp::Delete(RowId(rid))));
+        }
         Ok(())
     }
 

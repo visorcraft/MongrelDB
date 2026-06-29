@@ -30,6 +30,14 @@ export interface ColumnSpec {
    * validated; applying defaults to existing rows is not yet implemented.
    */
   defaultValue?: Cell
+  /**
+   * Engine-managed monotonic identity allocator for an `Int64` primary key.
+   * When `true`, the engine assigns the next counter value on insert if the
+   * column is omitted/null, and explicit ids advance the counter past them.
+   * Mutually exclusive with `nullable`; requires `primary_key` and `Int64`.
+   * Defaults to `false` (omitted/null).
+   */
+  autoIncrement?: boolean
 }
 export interface IndexSpec {
   name: string
@@ -82,6 +90,20 @@ export interface ConditionSpec {
 export interface RowJs {
   rowId: bigint
   cells: Array<Cell>
+}
+/**
+ * Result of an insert: the physical row id plus, when the engine allocated
+ * it, the `AUTO_INCREMENT` value written into the row.
+ */
+export interface PutResult {
+  /** The storage row id (stable physical identity). */
+  rowId: bigint
+  /**
+   * The engine-assigned `AUTO_INCREMENT` value, when the column was omitted
+   * or null and the engine filled it. `null` for tables without an
+   * auto-increment column, or when the caller supplied an explicit value.
+   */
+  autoInc?: bigint
 }
 /** Phase 20.2: a typed column for bulk loading, wrapping JS typed-array data. */
 export interface TypedColumn {
@@ -140,8 +162,11 @@ export declare class Database {
 }
 /** A handle to one table inside a [`Database`]. */
 export declare class TableHandle {
-  /** Upsert one row. Returns the row id. */
-  put(cells: Array<Cell>): bigint
+  /**
+   * Upsert one row. Returns the row id and, when the engine allocated it,
+   * the `AUTO_INCREMENT` value.
+   */
+  put(cells: Array<Cell>): PutResult
   /** Group-commit this table's pending writes. */
   commit(): bigint
   /** Flush: commit + drain memtable to a sorted run. */
@@ -152,6 +177,16 @@ export declare class TableHandle {
   get(rowId: bigint): RowJs | null
   /** Point read by a text primary key. */
   getByPkText(text: string): RowJs | null
+  /**
+   * Reserve (without inserting) the next `AUTO_INCREMENT` value for this
+   * table, advancing the engine's in-memory counter. Returns `null` if the
+   * table has no auto-increment column. Used by callers that stage a row with
+   * an explicit id inside a transaction; the reservation becomes durable when
+   * a row carrying the id commits, and a never-used reservation just leaves a
+   * gap. Far cheaper than a Kit-style sequence row — no hot row, no extra
+   * commit.
+   */
+  reserveAutoInc(): bigint | null
   /** Point read by an Int64 primary key. */
   getByPkInt64(value: bigint): RowJs | null
   /** Delete a row by storage row id. */
@@ -162,8 +197,11 @@ export declare class TableHandle {
   deleteByPkInt64(value: bigint): void
   /** Hybrid index query. */
   query(conditions: Array<ConditionSpec>): Array<RowJs>
-  /** Insert a batch of rows in one call. Returns the new row ids in order. */
-  putBatch(rows: Array<Array<Cell>>): Array<bigint>
+  /**
+   * Insert a batch of rows in one call. Returns each row's id and, when the
+   * engine allocated it, its `AUTO_INCREMENT` value, in order.
+   */
+  putBatch(rows: Array<Array<Cell>>): Array<PutResult>
   /**
    * Fastest ingest path: bulk-load typed columns (Int64/Float64/Bool) in one
    * shot, bypassing the per-cell `Value` enum. Returns the commit epoch.
@@ -176,7 +214,7 @@ export declare class TableHandle {
    * use `Database.sql` for full scans.
    */
   queryArrow(conditions: Array<ConditionSpec>): Buffer
-  putAsync(cells: Array<Cell>): Promise<bigint>
+  putAsync(cells: Array<Cell>): Promise<PutResult>
   commitAsync(): Promise<bigint>
   countAsync(): Promise<bigint>
   getAsync(rowId: bigint): Promise<RowJs | null>
@@ -194,6 +232,21 @@ export declare class Transaction {
   put(table: string, cells: Array<Cell>): void
   /** Stage a delete of `row_id` on `table`. */
   delete(table: string, rowId: bigint): void
+  /**
+   * Stage many puts on `table` from a compact little-endian buffer, skipping
+   * the per-cell NAPI `Cell` object marshalling that dominates a bulk load.
+   * Layout: `u32 rowCount`, then per row `u16 cellCount`, then per cell
+   * `u16 columnId`, `u8 tag`, payload — tag 0=null, 1=int64 (i64 LE),
+   * 2=float64 (f64 LE), 3=bool (u8), 4=bytes (u32 len + bytes; text is UTF-8).
+   * The decoded `(column_id, Value)` pairs are identical to what `put` builds.
+   */
+  putPacked(table: string, payload: Buffer): void
+  /**
+   * Stage many deletes on `table` from a compact buffer of row ids:
+   * `u32 count`, then `count` × `u64 LE` row id. One NAPI crossing instead
+   * of one per row.
+   */
+  deletePacked(table: string, payload: Buffer): void
   /**
    * Commit all staged ops atomically. Returns the commit epoch.
    * Throws `ConflictError` on write-write conflict (retryable).
