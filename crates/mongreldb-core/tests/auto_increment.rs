@@ -1,8 +1,10 @@
 //! Engine-native AUTO_INCREMENT: counter allocation, explicit-id advancement,
 //! gap behavior, crash/reopen durability, and seed-from-max on legacy data.
 
+use mongreldb_core::columnar::NativeColumn;
+use mongreldb_core::manifest;
 use mongreldb_core::schema::*;
-use mongreldb_core::{Database, Table, Value};
+use mongreldb_core::{Database, Query, RowId, Table, Value};
 use tempfile::tempdir;
 
 fn ai_schema() -> Schema {
@@ -26,6 +28,38 @@ fn ai_schema() -> Schema {
         ],
         indexes: vec![],
         colocation: vec![],
+    }
+}
+
+fn ai_int_schema() -> Schema {
+    Schema {
+        schema_id: 1,
+        columns: vec![
+            ColumnDef {
+                id: 1,
+                name: "id".into(),
+                ty: TypeId::Int64,
+                flags: ColumnFlags::empty()
+                    .with(ColumnFlags::PRIMARY_KEY)
+                    .with(ColumnFlags::AUTO_INCREMENT),
+            },
+            ColumnDef {
+                id: 2,
+                name: "value".into(),
+                ty: TypeId::Int64,
+                flags: ColumnFlags::empty(),
+            },
+        ],
+        indexes: vec![],
+        colocation: vec![],
+    }
+}
+
+fn int_col(data: Vec<i64>) -> NativeColumn {
+    let n = data.len();
+    NativeColumn::Int64 {
+        data,
+        validity: vec![0xFF; n.div_ceil(8)],
     }
 }
 
@@ -227,6 +261,66 @@ fn seeds_from_max_on_legacy_data() {
             "must seed to max(existing)+1, not collide at 1"
         );
     }
+}
+
+#[test]
+fn bulk_load_seeds_counter_when_table_was_empty() {
+    let dir = tempdir().unwrap();
+    let mut t = Table::create(dir.path(), ai_int_schema(), 1).unwrap();
+    t.bulk_load_columns(vec![
+        (1, int_col(vec![10, 11, 12])),
+        (2, int_col(vec![100, 101, 102])),
+    ])
+    .unwrap();
+
+    let m = manifest::read(dir.path(), None).unwrap();
+    assert_eq!(
+        m.auto_inc_next, 13,
+        "fresh bulk load should persist the next AUTO_INCREMENT value"
+    );
+
+    let (_, assigned) = t.put_returning(vec![(2, Value::Int64(103))]).unwrap();
+    assert_eq!(assigned, Some(13));
+}
+
+#[test]
+fn row_major_bulk_load_seeds_counter_when_table_was_empty() {
+    let dir = tempdir().unwrap();
+    let mut t = Table::create(dir.path(), ai_int_schema(), 1).unwrap();
+    t.bulk_load(vec![
+        vec![(1, Value::Int64(20)), (2, Value::Int64(200))],
+        vec![(1, Value::Int64(21)), (2, Value::Int64(201))],
+    ])
+    .unwrap();
+
+    let m = manifest::read(dir.path(), None).unwrap();
+    assert_eq!(m.auto_inc_next, 22);
+
+    let (_, assigned) = t.put_returning(vec![(2, Value::Int64(202))]).unwrap();
+    assert_eq!(assigned, Some(22));
+}
+
+#[test]
+fn delete_after_lazy_bulk_indexing_hides_auto_inc_pk() {
+    let dir = tempdir().unwrap();
+    let mut t = Table::create(dir.path(), ai_int_schema(), 1).unwrap();
+    t.bulk_load_columns(vec![
+        (1, int_col(vec![1, 2, 3])),
+        (2, int_col(vec![10, 20, 30])),
+    ])
+    .unwrap();
+
+    t.delete(RowId(0)).unwrap();
+    t.commit().unwrap();
+
+    let deleted = t.query(&Query::pk(Value::Int64(1).encode_key())).unwrap();
+    assert!(
+        deleted.is_empty(),
+        "deleted AUTO_INCREMENT PK must be hidden"
+    );
+    let live = t.query(&Query::pk(Value::Int64(2).encode_key())).unwrap();
+    assert_eq!(live.len(), 1);
+    assert_eq!(t.count(), 2);
 }
 
 #[test]

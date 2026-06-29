@@ -65,6 +65,8 @@ struct AutoIncState {
     seeded: bool,
 }
 
+type FilledAutoIncRow = (Vec<(u16, Value)>, Option<i64>);
+
 /// Resolve the auto-increment column (if any) from a schema into initial
 /// counter state. Always called after [`crate::schema::Schema::validate_auto_increment`].
 fn resolve_auto_inc(schema: &Schema) -> Option<AutoIncState> {
@@ -123,6 +125,8 @@ pub struct Table {
     /// Per-column learned (PGM) range indexes for `IndexKind::LearnedRange`
     /// columns, built from the single sorted run.
     learned_range: HashMap<u16, ColumnLearnedRange>,
+    /// Reverse primary-key map for HOT cleanup on row-id deletes.
+    pk_by_row: HashMap<RowId, Vec<u8>>,
     /// Refcounted pinned read snapshots (epoch → count); compaction must not GC
     /// versions an active snapshot still needs.
     pinned: BTreeMap<Epoch, usize>,
@@ -923,6 +927,7 @@ impl Table {
             fm,
             sparse,
             learned_range: HashMap::new(),
+            pk_by_row: HashMap::new(),
             pinned: BTreeMap::new(),
             live_count: 0,
             reservoir: crate::reservoir::Reservoir::default(),
@@ -1129,6 +1134,7 @@ impl Table {
             fm: HashMap::new(),
             sparse: HashMap::new(),
             learned_range: HashMap::new(),
+            pk_by_row: HashMap::new(),
             pinned: BTreeMap::new(),
             live_count: manifest.live_count,
             reservoir: crate::reservoir::Reservoir::default(),
@@ -1179,6 +1185,7 @@ impl Table {
                 db.fm = loaded.fm;
                 db.sparse = loaded.sparse;
                 db.learned_range = loaded.learned_range;
+                db.refresh_pk_by_row_from_hot();
             }
         }
         if !checkpoint_valid {
@@ -1208,7 +1215,7 @@ impl Table {
                 db.tombstone_row(loser_rid, epoch, false);
             }
             for (key, row_id) in winner_pks {
-                db.hot.insert(key, row_id);
+                db.insert_hot_pk(key, row_id);
             }
             if db.schema.primary_key().is_none() {
                 for r in &group {
@@ -1249,6 +1256,7 @@ impl Table {
 
     fn rebuild_indexes_from_runs(&mut self) -> Result<()> {
         self.hot = HotIndex::new();
+        self.pk_by_row.clear();
         let snapshot = Epoch(u64::MAX);
         for rr in self.run_refs.clone() {
             let mut reader = self.open_reader(rr.run_id)?;
@@ -1265,7 +1273,25 @@ impl Table {
                 );
             }
         }
+        self.refresh_pk_by_row_from_hot();
         Ok(())
+    }
+
+    fn refresh_pk_by_row_from_hot(&mut self) {
+        self.pk_by_row.clear();
+        if self.schema.primary_key().is_none() {
+            return;
+        }
+        for (key, row_id) in self.hot.entries() {
+            self.pk_by_row.insert(row_id, key);
+        }
+    }
+
+    fn insert_hot_pk(&mut self, key: Vec<u8>, row_id: RowId) {
+        if self.schema.primary_key().is_some() {
+            self.pk_by_row.insert(row_id, key.clone());
+        }
+        self.hot.insert(key, row_id);
     }
 
     /// (Re)build per-column learned (PGM) range indexes for `LearnedRange`
@@ -1441,7 +1467,7 @@ impl Table {
         &mut self,
         batch: Vec<Vec<(u16, Value)>>,
     ) -> Result<Vec<(RowId, Option<i64>)>> {
-        let mut filled: Vec<(Vec<(u16, Value)>, Option<i64>)> = Vec::with_capacity(batch.len());
+        let mut filled: Vec<FilledAutoIncRow> = Vec::with_capacity(batch.len());
         for mut cols in batch {
             let assigned = self.fill_auto_inc(&mut cols)?;
             filled.push((cols, assigned));
@@ -1571,6 +1597,48 @@ impl Table {
         Ok(max)
     }
 
+    fn advance_auto_inc_from_native_columns(
+        &mut self,
+        columns: &[(u16, columnar::NativeColumn)],
+        n: usize,
+        live_before: u64,
+    ) -> Result<()> {
+        let Some(ai) = self.auto_inc.as_mut() else {
+            return Ok(());
+        };
+        let Some((_, col)) = columns.iter().find(|(cid, _)| *cid == ai.column_id) else {
+            return Ok(());
+        };
+        let columnar::NativeColumn::Int64 { data, validity } = col else {
+            return Err(MongrelError::InvalidArgument(format!(
+                "AUTO_INCREMENT column {} must be Int64",
+                ai.column_id
+            )));
+        };
+        let max = data
+            .iter()
+            .take(n)
+            .enumerate()
+            .filter_map(|(i, v)| {
+                if validity.is_empty() || columnar::validity_bit(validity, i) {
+                    Some(*v)
+                } else {
+                    None
+                }
+            })
+            .max();
+        if let Some(max) = max {
+            let floor = max.saturating_add(1).max(1);
+            if ai.next < floor {
+                ai.next = floor;
+            }
+            if ai.seeded || live_before == 0 {
+                ai.seeded = true;
+            }
+        }
+        Ok(())
+    }
+
     /// Reserve (but do not insert) the next `AUTO_INCREMENT` value, advancing
     /// the in-memory counter. Returns `None` when the table has no
     /// auto-increment column.
@@ -1635,7 +1703,7 @@ impl Table {
         }
         // Insert the winners into HOT.
         for (key, row_id) in winner_pks {
-            self.hot.insert(key, row_id);
+            self.insert_hot_pk(key, row_id);
         }
         if self.schema.primary_key().is_none() {
             for r in &rows {
@@ -1700,7 +1768,7 @@ impl Table {
         }
         // Insert the winners into HOT.
         for (key, row_id) in winner_pks {
-            self.hot.insert(key, row_id);
+            self.insert_hot_pk(key, row_id);
         }
         if self.schema.primary_key().is_none() {
             for r in rows {
@@ -1762,7 +1830,7 @@ impl Table {
                 }
             }
             for (key, row_id) in winner_pks {
-                self.hot.insert(key, row_id);
+                self.insert_hot_pk(key, row_id);
             }
             if self.schema.primary_key().is_none() {
                 for r in &group {
@@ -1891,35 +1959,14 @@ impl Table {
     /// table's `live_count` is decremented (used on the live write path); during
     /// recovery the manifest is authoritative so the flag is false.
     fn tombstone_row(&mut self, row_id: RowId, epoch: Epoch, adjust_live_count: bool) {
-        // Preserve the row's column values in the tombstone so HOT cleanup can
-        // recover the primary-key value even when the tombstone is replayed
-        // before index rebuilding.
-        let mut tombstone = Row {
+        let tombstone = Row {
             row_id,
             committed_epoch: epoch,
             columns: std::collections::HashMap::new(),
             deleted: true,
         };
-        let before = Epoch(epoch.0.saturating_sub(1));
-        if let Some(live) = self.memtable.get(row_id, before) {
-            tombstone.columns = live.columns;
-        } else if let Some((_, live)) = self.mutable_run.get_version(row_id, before) {
-            if !live.deleted {
-                tombstone.columns = live.columns;
-            }
-        } else {
-            for rr in self.run_refs.clone() {
-                if let Ok(mut reader) = self.open_reader(rr.run_id) {
-                    if let Ok(Some((_, live))) = reader.get_version(row_id, before) {
-                        if !live.deleted {
-                            tombstone.columns = live.columns;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
         self.memtable.upsert(tombstone);
+        self.pk_by_row.remove(&row_id);
         if adjust_live_count {
             self.live_count = self.live_count.saturating_sub(1);
         }
@@ -1938,8 +1985,17 @@ impl Table {
         let Some(pk_col) = self.schema.primary_key() else {
             return;
         };
-        // Use get_version (not get) so a tombstone that preserved its columns
-        // still reveals the primary-key value that HOT needs to clean up.
+        if let Some(key) = self.pk_by_row.remove(&row_id) {
+            if self.hot.get(&key) == Some(row_id) {
+                self.hot.remove(&key);
+            }
+            return;
+        }
+        if !self.indexes_complete {
+            return;
+        }
+        // Use get_version (not get) so older visible versions can still reveal
+        // the primary-key value that HOT needs to clean up.
         let pk_val = self
             .memtable
             .get_version(row_id, epoch)
@@ -2288,6 +2344,7 @@ impl Table {
         if n == 0 {
             return Ok(epoch);
         }
+        let live_before = self.live_count;
         // Spill any pending mutable-run data first: bulk_load writes a Flush
         // marker + rotates the WAL below, which is only safe once all in-flight
         // data is durably in a run.
@@ -2339,6 +2396,7 @@ impl Table {
                 }
                 None => (std::mem::take(&mut user_columns), n),
             };
+        self.advance_auto_inc_from_native_columns(&write_columns, write_n, live_before)?;
         let first = self.allocator.alloc_range(write_n as u64).0;
         for rid in first..first + write_n as u64 {
             self.reservoir.offer(rid);
@@ -3156,6 +3214,7 @@ impl Table {
         if n == 0 {
             return Ok(epoch);
         }
+        let live_before = self.live_count;
         // Spill pending mutable-run data before the Flush marker + WAL rotation.
         self.spill_mutable_run(epoch)?;
         // Enforce NOT NULL constraints and primary-key upsert semantics before
@@ -3175,6 +3234,7 @@ impl Table {
                 }
                 None => (user_columns, n),
             };
+        self.advance_auto_inc_from_native_columns(&write_columns, write_n, live_before)?;
         let first = self.allocator.alloc_range(write_n as u64).0;
         for rid in first..first + write_n as u64 {
             self.reservoir.offer(rid);
@@ -3247,7 +3307,7 @@ impl Table {
                 if let Some(col) = by_id.get(&pid) {
                     let ty = ty_of.get(&pid).copied().unwrap_or(TypeId::Int64);
                     if let Some(key) = bulk_index_key(&self.column_keys, pid, ty, col, i) {
-                        self.hot.insert(key, row_id);
+                        self.insert_hot_pk(key, row_id);
                     }
                 }
             }

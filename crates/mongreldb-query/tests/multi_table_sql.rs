@@ -356,10 +356,7 @@ async fn alter_table_rename_via_sql() {
     })
     .unwrap();
 
-    session
-        .run("ALTER TABLE t RENAME TO u")
-        .await
-        .unwrap();
+    session.run("ALTER TABLE t RENAME TO u").await.unwrap();
 
     // The old name is gone from the catalog and from DataFusion.
     assert!(!db.table_names().contains(&"t".to_string()));
@@ -406,9 +403,6 @@ async fn alter_table_rename_is_case_insensitive() {
         .await
         .unwrap();
 
-    session
-        .run("Alter Table t Rename To u")
-        .await
-        .unwrap();
+    session.run("Alter Table t Rename To u").await.unwrap();
     assert_eq!(db.table_names(), vec!["u".to_string()]);
 }

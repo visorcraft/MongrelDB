@@ -192,11 +192,10 @@ impl Schema {
             if !col.flags.contains(ColumnFlags::AUTO_INCREMENT) {
                 continue;
             }
-            if seen.is_some() {
+            if let Some(prev) = seen {
                 return Err(MongrelError::Schema(format!(
                     "AUTO_INCREMENT may be set on at most one column; '{}' and '{}' both carry it",
-                    seen.unwrap().name,
-                    col.name
+                    prev.name, col.name
                 )));
             }
             if col.ty != TypeId::Int64 {

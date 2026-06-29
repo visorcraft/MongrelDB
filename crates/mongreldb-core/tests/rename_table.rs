@@ -101,7 +101,10 @@ fn rename_rejects_empty_new_name() {
     let db = Database::create(dir.path()).unwrap();
     db.create_table("a", schema()).unwrap();
     let err = db.rename_table("a", "").unwrap_err();
-    assert!(matches!(err, MongrelError::InvalidArgument(_)), "got {err:?}");
+    assert!(
+        matches!(err, MongrelError::InvalidArgument(_)),
+        "got {err:?}"
+    );
 }
 
 #[test]
