@@ -155,6 +155,12 @@ export declare class Database {
    * a default value so existing rows can be evolved safely.
    */
   addColumn(table: string, column: ColumnSpec): bigint
+  /**
+   * Alter an existing column's native schema metadata. The source column is
+   * selected by `column_name`; the supplied column spec provides the target
+   * name, storage type, and flags while the stable engine column id is kept.
+   */
+  alterColumn(table: string, columnName: string, column: ColumnSpec): bigint
   /** Verify database integrity. Returns a JSON-string summary. */
   check(): string
   /** Repair/quarantine corrupt tables. Returns a JSON-string summary. */
