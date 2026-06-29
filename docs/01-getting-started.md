@@ -65,7 +65,7 @@ mongreldb-core = { path = "...", features = ["encryption"] }
 ```sh
 cd crates/mongreldb-node
 npm install
-npx napi build --release --platform
+npm run build
 ```
 
 This produces `mongreldb.<platform>.node` — a native addon you can `require()`

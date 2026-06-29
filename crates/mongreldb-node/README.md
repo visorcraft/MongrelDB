@@ -1,7 +1,7 @@
 # mongreldb-node
 
 Native Node.js addon for MongrelDB via [NAPI](https://napi.rs) — the
-**better-sqlite3 model**: in-process, no HTTP latency, so the ~8 µs single-row
+**better-sqlite3 model**: in-process, no HTTP latency, so the ~6 µs single-row
 write isn't dwarfed by a network round-trip. Exposes a **typed object/method
 interface** (not SQL); TypeScript types are generated at build time.
 
@@ -11,7 +11,7 @@ ABI and needs Node.js tooling). It is excluded from `cargo {test,clippy}
 
 ## Build
 
-Requires Node.js 16+ and `@napi-rs/cli`:
+Requires Node.js ≥ 16 and `@napi-rs/cli`:
 
 ```bash
 cd crates/mongreldb-node
@@ -23,15 +23,26 @@ npm run build          # → mongreldb.<platform>.node + index.d.ts
 
 ```ts
 class Database {
-  constructor(path: string, schema: SchemaSpec, tableId: number)
+  static withPath(path: string): Database
   static open(path: string): Database
-  put(cells: Cell[]): number            // returns rowId
-  commit(): number                       // epoch
-  flush(): number
-  count(): number                        // O(1)
-  get(rowId: number): Row | null
-  query(conditions: ConditionSpec[]): Row[]   // hybrid: bitmap ∩ range ∩ FM ∩ HNSW
+  createTable(name: string, schema: SchemaSpec): bigint
+  table(name: string): TableHandle
+  begin(): Transaction
+  sql(sql: string): Promise<Buffer>
   close(): void
+}
+
+class TableHandle {
+  put(cells: Cell[]): PutResult
+  putBatch(rows: Cell[][]): PutResult[]
+  bulkLoadTyped(columns: TypedColumn[]): bigint
+  commit(): bigint
+  flush(): bigint
+  count(): bigint                        // O(1)
+  countWhere(conditions: ConditionSpec[]): bigint
+  get(rowId: bigint): RowJs | null
+  query(conditions: ConditionSpec[]): RowJs[]   // hybrid: bitmap ∩ range ∩ FM ∩ HNSW
+  queryArrow(conditions: ConditionSpec[]): Buffer
 }
 ```
 
@@ -43,9 +54,9 @@ in one hop:
 
 ```ts
 db.query([
-  { kind: ConditionKind.Ann, column_id: 5, embedding: queryVec, k: 50 },
-  { kind: ConditionKind.FmContains, column_id: 2, text: "rome" },
-  { kind: ConditionKind.BitmapEq, column_id: 3, text: "eu" },
+  { kind: ConditionKind.Ann, columnId: 5, embedding: queryVec, k: 50 },
+  { kind: ConditionKind.FmContains, columnId: 2, text: "rome" },
+  { kind: ConditionKind.BitmapIn, columnId: 3, values: ["eu", "na"] },
 ])
 ```
 
@@ -53,6 +64,5 @@ db.query([
 
 - Row ids / counts / epochs cross the FFI as JS `BigInt` (`u64`), so the full
   64-bit id space is lossless.
-- Methods are synchronous and block the JS thread (the MongrelDB core is a
-  synchronous `std::fs` store). Offloading hot loops to a worker thread is the
-  remaining production polish.
+- Most blocking table methods also expose `*Async` Promise variants that run on
+  the NAPI blocking pool.

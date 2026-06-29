@@ -28,8 +28,8 @@ custom columnar format, with a rich index set designed for AI-native access
 patterns. **New to MongrelDB? Start with the [docs](docs/).**
 
 The write path is an LSM/Bε-tree: an append-only WAL with group commit feeds a
-Bε-tree memtable (composite-key MVCC skip-list), which flushes to immutable
-sorted runs (`.sr` PAX columnar pages). Single-row durable update: **~6 µs**.
+Bε-tree memtable keyed by `(RowId, Epoch)`, which flushes to immutable sorted
+runs (`.sr` PAX columnar pages). Single-row durable update: **~6 µs**.
 
 The read path merges memtable + sorted runs under MVCC snapshot isolation. Seven
 index types — all resolving through a shared `RowId` space — enable hybrid
@@ -198,20 +198,20 @@ In practice, encryption adds negligible latency to bulk ingest and queries
 MongrelDB also ships as a native NAPI addon (`crates/mongreldb-node`) — the
 **better-sqlite3 model**: in-process, no HTTP hop, so the sub-ms write latency
 isn't lost to a round-trip. It exposes a **typed object/method API** (not SQL)
-with a hybrid `query` that composes `ann_search ∩ fm_contains ∩ bitmap_eq` in a
-single call. TypeScript types are generated at build time, and row ids / counts
-cross the FFI as lossless `BigInt`:
+with a hybrid `query` that composes ANN, FM, bitmap equality/IN, and range
+conditions in a single row-id-space intersection. TypeScript types are generated
+at build time, and row ids / counts / epochs cross the FFI as lossless `BigInt`:
 
 ```sh
-cd crates/mongreldb-node && npm install && npx napi build --release --platform   # → index.{js,d.ts}
+cd crates/mongreldb-node && npm install && npm run build   # release NAPI addon + typings
 ```
 
 A `smoke.mjs` exercises put/get/count and a hybrid query against the live addon.
-Every blocking method also has a `*Async` Promise variant that offloads to the
-tokio blocking pool, so the JS event loop is never stalled. Bulk paths
-(`putBatch`, `bulkLoadTyped`, `queryArrow`, `queryArrowBatched`, `WriteBuffer`)
-cross FFI once per batch, not per row. `RemoteDatabase.connect(url)` routes to
-a `mongreldb-server` daemon for multi-process cache sharing.
+Create/open a `Database`, create tables with `createTable`, then operate through
+`db.table(name)`. The table handle exposes `put`, `putBatch`, `bulkLoadTyped`,
+`query`, `queryArrow`, `count`, and `countWhere`; Promise variants are available
+for blocking read/write methods. `RemoteDatabase` routes to a
+`mongreldb-server` daemon for multi-process cache sharing.
 
 ## Benchmarks
 
@@ -225,7 +225,7 @@ result-cache hits are sub-µs across all queries.
 
 ## Setup
 
-**Prerequisites:** Rust ≥ 1.80 (Node.js 16+ for the addon).
+**Prerequisites:** Rust ≥ 1.80 (Node.js ≥ 16 for the addon).
 
 ```sh
 git clone https://github.com/visorcraft/MongrelDB.git
@@ -260,7 +260,8 @@ crates/mongreldb-node/    NAPI addon (typed object API; built via `napi`)
 crates/mongreldb-server/  HTTP daemon (axum/tokio; SQL + native query over HTTP)
 crates/mongreldb-client/  lightweight HTTP client for the daemon
 crates/mongreldb-perf/    cross-engine benchmark vs SQLite/DuckDB (standalone)
-examples/hybrid_query.rs  runnable ann ∩ fm ∩ bitmap hybrid-query demo
+crates/mongreldb-core/examples/hybrid_query.rs
+                          runnable ann ∩ fm ∩ bitmap hybrid-query demo
 BENCHMARKS.md             measured cross-engine performance matrix
 ```
 

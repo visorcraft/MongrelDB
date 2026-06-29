@@ -1,229 +1,220 @@
 # Node.js Quick Start
 
-MongrelDB ships as a native Node.js addon (NAPI). It runs in-process — no
-database server, no HTTP, no network. This means write latency stays at
-single-digit microseconds.
-
-## Installation
+MongrelDB ships as a native NAPI addon. It runs in-process, so write and query
+latency are not hidden behind an HTTP hop. Build the addon in release mode:
 
 ```sh
 cd crates/mongreldb-node
 npm install
-npx napi build --release --platform
+npm run build
 ```
 
-This generates:
-- `mongreldb.<platform>.node` — the native binary
-- `index.js` — JavaScript entry point
-- `index.d.ts` — TypeScript type definitions
+This generates `mongreldb.<platform>.node`, `native.js`, and `native.d.ts`.
+The hand-written `index.js` wrapper re-exports the native API and adds a
+retrying transaction helper.
 
-Copy these into your project, or add the crate directory to your `package.json`.
-
-## Creating a Database
+## Create A Database
 
 ```javascript
 const { Database, ColumnType, IndexKindSpec } = require('./index.js');
 
-const db = new Database('./my_data', {
-    columns: [
-        { id: 1, name: 'id', ty: ColumnType.Int64, primaryKey: true, nullable: false },
-        { id: 2, name: 'email', ty: ColumnType.Bytes, primaryKey: false, nullable: false },
-        { id: 3, name: 'score', ty: ColumnType.Float64, primaryKey: false, nullable: false },
-    ],
-    indexes: [
-        { name: 'email_bm', columnId: 2, kind: IndexKindSpec.Bitmap },
-    ],
-}, 1);
+const db = Database.withPath('./my_data');
+
+db.createTable('users', {
+  columns: [
+    { id: 1, name: 'id', ty: ColumnType.Int64, primaryKey: true, nullable: false },
+    { id: 2, name: 'email', ty: ColumnType.Bytes, primaryKey: false, nullable: false },
+    { id: 3, name: 'tier', ty: ColumnType.Bytes, primaryKey: false, nullable: false },
+    { id: 4, name: 'score', ty: ColumnType.Float64, primaryKey: false, nullable: false },
+  ],
+  indexes: [
+    { name: 'email_bm', columnId: 2, kind: IndexKindSpec.Bitmap },
+    { name: 'tier_bm', columnId: 3, kind: IndexKindSpec.Bitmap },
+  ],
+});
+
+const users = db.table('users');
 ```
 
-To reopen an existing database:
+Reopen an existing database with:
 
 ```javascript
 const db = Database.open('./my_data');
+const users = db.table('users');
 ```
 
-## Writing Data
-
-### Single Row (Sync)
+## Write Rows
 
 ```javascript
-const rowId = db.put([
-    { columnId: 1, int64: 42n },
-    { columnId: 2, text: 'alice@example.com' },
-    { columnId: 3, float64: 98.5 },
-]);
-console.log('Row ID:', rowId);  // BigInt
-
-db.commit();  // make it durable
-```
-
-### Single Row (Async)
-
-```javascript
-const rowId = await db.putAsync([
-    { columnId: 1, int64: 43n },
-    { columnId: 2, text: 'bob@example.com' },
-    { columnId: 3, float64: 87.0 },
-]);
-await db.commitAsync();
-```
-
-### Batch Insert
-
-For many rows at once — one FFI call instead of N:
-
-```javascript
-const rows = [];
-for (let i = 0n; i < 10000n; i++) {
-    rows.push([
-        { columnId: 1, int64: i },
-        { columnId: 2, text: `user${i}@test.com` },
-        { columnId: 3, float64: Number(i) * 1.5 },
-    ]);
-}
-
-const rowIds = db.putBatch(rows, true);  // true = commit immediately
-console.log(`Inserted ${rowIds.length} rows`);
-```
-
-### Bulk Load (Fastest)
-
-For millions of rows, use typed arrays — data crosses the FFI boundary as raw
-bytes with zero per-row conversion:
-
-```javascript
-const n = 1_000_000;
-
-db.bulkLoadTyped([
-    {
-        columnId: 1,
-        ty: ColumnType.Int64,
-        data: Buffer.from(new BigInt64Array(n).map((_, i) => BigInt(i)).buffer),
-        validity: Buffer.alloc(n / 8, 0xFF),
-    },
-    // ... other columns
-]);
-```
-
-## Reading Data
-
-### Get a Single Row
-
-```javascript
-const row = db.get(42n);  // BigInt row ID
-console.log(row.cells);   // array of cell values
-console.log(row.rowId);   // BigInt
-```
-
-### Get Row Count
-
-```javascript
-console.log('Rows:', db.count());  // O(1), instant
-```
-
-### Query with Conditions
-
-```javascript
-const results = db.query([
-    { kind: 'bitmapEq', columnId: 2, value: Buffer.from('alice@example.com') },
+const inserted = users.put([
+  { columnId: 1, int64: 42n },
+  { columnId: 2, text: 'alice@example.com' },
+  { columnId: 3, text: 'gold' },
+  { columnId: 4, float64: 98.5 },
 ]);
 
-console.log(`Found ${results.length} rows`);
-for (const row of results) {
-    console.log(row);
-}
+console.log(inserted.rowId); // BigInt
+users.commit();              // durable group commit
 ```
 
-### Query Returning Arrow (Zero-Copy)
-
-Instead of JavaScript objects, get Arrow IPC bytes — consumable by the
-`apache-arrow` npm package with no per-row allocation:
+Async variants offload blocking I/O to the NAPI blocking pool:
 
 ```javascript
-const arrowBuffer = db.queryArrow([
-    { kind: 'rangeF64', columnId: 3, lo: 90.0, hi: 100.0 },
+await users.putAsync([
+  { columnId: 1, int64: 43n },
+  { columnId: 2, text: 'bob@example.com' },
+  { columnId: 3, text: 'silver' },
+  { columnId: 4, float64: 87.0 },
+]);
+await users.commitAsync();
+```
+
+Batch inserts cross the FFI boundary once and still need a commit:
+
+```javascript
+const results = users.putBatch([
+  [
+    { columnId: 1, int64: 100n },
+    { columnId: 2, text: 'user100@example.com' },
+    { columnId: 3, text: 'gold' },
+    { columnId: 4, float64: 91.0 },
+  ],
+  [
+    { columnId: 1, int64: 101n },
+    { columnId: 2, text: 'user101@example.com' },
+    { columnId: 3, text: 'bronze' },
+    { columnId: 4, float64: 72.0 },
+  ],
+]);
+users.commit();
+console.log(results.map((r) => r.rowId));
+```
+
+For typed bulk ingest, use a fixed-width table and pass raw little-endian
+buffers. `bulkLoadTyped` supports Int64, Float64, and Bool columns; use
+`putBatch` for rows that include Bytes or Embedding columns.
+
+```javascript
+db.createTable('metrics', {
+  columns: [
+    { id: 1, name: 'id', ty: ColumnType.Int64, primaryKey: true, nullable: false },
+    { id: 2, name: 'score', ty: ColumnType.Float64, primaryKey: false, nullable: false },
+  ],
+  indexes: [],
+});
+
+const metrics = db.table('metrics');
+const ids = new BigInt64Array([200n, 201n, 202n]);
+const scores = new Float64Array([88.0, 93.5, 77.25]);
+
+const epoch = metrics.bulkLoadTyped([
+  { columnId: 1, ty: ColumnType.Int64, data: Buffer.from(ids.buffer) },
+  { columnId: 2, ty: ColumnType.Float64, data: Buffer.from(scores.buffer) },
+]);
+console.log(epoch);
+```
+
+## Read Rows
+
+```javascript
+const row = users.get(0n); // physical row id
+console.log(row?.rowId, row?.cells);
+
+console.log(users.count()); // O(1), BigInt
+```
+
+Primary-key helpers are available for single-column text and Int64 primary
+keys:
+
+```javascript
+const byId = users.getByPkInt64(42n);
+```
+
+## Query With Conditions
+
+Conditions are ANDed together inside the engine. Use `ConditionKind` constants
+from the generated bindings:
+
+```javascript
+const { ConditionKind } = require('./index.js');
+
+const matches = users.query([
+  { kind: ConditionKind.BitmapIn, columnId: 3, values: ['gold', 'silver'] },
+  { kind: ConditionKind.RangeF64, columnId: 4, float64Lo: 80.0, float64Hi: 100.0 },
 ]);
 
-// Parse with apache-arrow:
-// const { Table } = require('apache-arrow');
-// const table = Table.from(arrowBuffer);
+console.log(matches.length);
 ```
 
-### Batched Query Results
-
-For large result sets, get one Arrow buffer per ~65K-row page chunk:
+When you only need cardinality, `countWhere` resolves the same native condition
+set without materializing rows when possible:
 
 ```javascript
-const chunks = db.queryArrowBatched([
-    { kind: 'bitmapEq', columnId: 2, value: Buffer.from('premium') },
+const n = users.countWhere([
+  { kind: ConditionKind.BitmapIn, columnId: 3, values: ['gold', 'silver'] },
 ]);
-
-for (const chunk of chunks) {
-    // process each chunk independently
-    // reduces peak memory vs. holding the full result
-}
+console.log(n);
 ```
 
-## Deleting and Updating
+For columnar consumers, `queryArrow` returns Arrow IPC bytes:
 
 ```javascript
-db.delete(42n);   // mark row 42 as deleted
-db.commit();
+const arrowBytes = users.queryArrow([
+  { kind: ConditionKind.RangeF64, columnId: 4, float64Lo: 90.0, float64Hi: 100.0 },
+]);
 ```
 
-To update a row, just `put` with the same data — MongrelDB handles versioning
-internally.
+## Transactions
 
-## Write Buffer (Optional Micro-Batching)
+Use `begin()` for atomic multi-table staging:
 
-For high-throughput local writes where you don't need immediate durability:
+```javascript
+const txn = db.begin();
+txn.put('users', [
+  { columnId: 1, int64: 500n },
+  { columnId: 2, text: 'txn@example.com' },
+  { columnId: 3, text: 'gold' },
+  { columnId: 4, float64: 99.0 },
+]);
+txn.commit();
+```
+
+The wrapper also exposes `db.transaction(fn, opts)` for conflict retries.
+
+## Write Buffer
+
+`WriteBuffer` batches non-durable writes until `flush()`:
 
 ```javascript
 const { WriteBuffer } = require('./index.js');
 
-const buf = new WriteBuffer(db, 5000);  // auto-flush every 5000 rows
-
-for (let i = 0n; i < 100_000n; i++) {
-    buf.put([
-        { columnId: 1, int64: i },
-        { columnId: 2, text: `user${i}` },
-        { columnId: 3, float64: 0.0 },
-    ]);
-}
-
-buf.flush();  // writes become durable only after this call
+const buf = new WriteBuffer(users, 5000);
+buf.put([
+  { columnId: 1, int64: 900n },
+  { columnId: 2, text: 'buffered@example.com' },
+  { columnId: 3, text: 'bronze' },
+  { columnId: 4, float64: 50.0 },
+]);
+buf.flush();
 ```
 
-**Important:** `WriteBuffer` is the opposite of `put()` — writes are *not*
-durable until you call `flush()`. Use it only when you can tolerate losing
-buffered data on a crash.
+Use it only when losing buffered writes on crash is acceptable.
 
-## Connecting to a Daemon
+## Daemon Client
 
-If you're running `mongreldb-server` (see [Daemon Guide](08-daemon.md)), multiple
-Node processes can share one warm database:
+`RemoteDatabase` talks to `mongreldb-server` over HTTP for multi-process cache
+sharing:
 
 ```javascript
 const { RemoteDatabase } = require('./index.js');
 
-const db = new RemoteDatabase('http://127.0.0.1:8453');
-
-const count = db.count();          // queries the daemon
-const arrowBytes = db.sql('SELECT * FROM events WHERE score > 90');
-db.commit();
+const remote = new RemoteDatabase('http://127.0.0.1:8453');
+console.log(remote.count('users'));
+const arrow = remote.sql('SELECT * FROM users WHERE score > 90');
 ```
-
-## TypeScript
-
-Type definitions are generated at build time (`index.d.ts`). All row IDs,
-counts, and epochs use `BigInt` (not JS Number) to preserve full 64-bit
-precision.
 
 ## Closing
 
 ```javascript
-db.close();   // flush + release resources
+db.close();
 ```
-
-The database is also cleaned up automatically when garbage-collected, but
-calling `close()` ensures data is flushed before exit.
