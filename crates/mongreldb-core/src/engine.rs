@@ -1695,18 +1695,21 @@ impl Table {
                 ai.column_id
             )));
         };
-        let max = data
-            .iter()
-            .take(n)
-            .enumerate()
-            .filter_map(|(i, v)| {
-                if validity.is_empty() || columnar::validity_bit(validity, i) {
-                    Some(*v)
-                } else {
-                    None
-                }
-            })
-            .max();
+        let max = if native_int64_strictly_increasing(col, n) {
+            data.get(n.saturating_sub(1)).copied()
+        } else {
+            data.iter()
+                .take(n)
+                .enumerate()
+                .filter_map(|(i, v)| {
+                    if validity.is_empty() || columnar::validity_bit(validity, i) {
+                        Some(*v)
+                    } else {
+                        None
+                    }
+                })
+                .max()
+        };
         if let Some(max) = max {
             let floor = max.saturating_add(1).max(1);
             if ai.next < floor {
@@ -2049,8 +2052,8 @@ impl Table {
 
     /// For a bulk-loaded batch, compute the row indices that survive primary-
     /// key upsert: for each PK value the last occurrence wins, earlier
-    /// duplicates are dropped. Rows with a null PK value are always kept.
-    /// Returns `None` when the schema has no primary key.
+    /// duplicates are dropped. Rows with a null PK value are always kept. Returns
+    /// `None` when there is no primary key or no compaction is needed.
     fn bulk_pk_winner_indices(
         &self,
         columns: &[(u16, columnar::NativeColumn)],
@@ -2062,6 +2065,9 @@ impl Table {
         let by_id: HashMap<u16, &columnar::NativeColumn> =
             columns.iter().map(|(id, c)| (*id, c)).collect();
         let pk_native = by_id.get(&pk_id)?;
+        if native_int64_strictly_increasing(pk_native, n) {
+            return None;
+        }
         // key -> index of the last row that carried that PK value.
         let mut last: HashMap<Vec<u8>, usize> = HashMap::new();
         let mut null_pk_rows: Vec<usize> = Vec::new();
@@ -5115,6 +5121,19 @@ fn intersect_sets(sets: Vec<std::collections::HashSet<u64>>) -> std::collections
         None => std::collections::HashSet::new(),
         Some(first) => iter.fold(first, |acc, s| acc.intersection(&s).copied().collect()),
     }
+}
+
+fn native_int64_strictly_increasing(col: &columnar::NativeColumn, n: usize) -> bool {
+    let columnar::NativeColumn::Int64 { data, validity } = col else {
+        return false;
+    };
+    if data.len() < n || !columnar::all_non_null(validity, n) {
+        return false;
+    }
+    data.iter()
+        .take(n)
+        .zip(data.iter().skip(1))
+        .all(|(a, b)| a < b)
 }
 
 /// Exact aggregate of a column's page stats into a min/max/null_count triple
