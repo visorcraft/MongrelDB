@@ -19,7 +19,7 @@ use crate::memtable::{Memtable, Row, Value};
 use crate::mutable_run::MutableRun;
 use crate::row_id_set::RowIdSet;
 use crate::rowid::{RowId, RowIdAllocator};
-use crate::schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
+use crate::schema::{AlterColumn, ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
 use crate::sorted_run::{RunReader, RunWriter};
 use crate::txn::GroupCommit;
 use crate::wal::{Op, SharedWal, Wal};
@@ -5077,6 +5077,108 @@ impl Table {
         &self.schema
     }
 
+    pub(crate) fn prepare_alter_column(
+        &mut self,
+        column_name: &str,
+        change: &AlterColumn,
+    ) -> Result<ColumnDef> {
+        if !self.pending_rows.is_empty() || !self.pending_dels.is_empty() {
+            return Err(MongrelError::InvalidArgument(
+                "ALTER COLUMN requires committing staged writes first".into(),
+            ));
+        }
+        let old = self
+            .schema
+            .columns
+            .iter()
+            .find(|c| c.name == column_name)
+            .cloned()
+            .ok_or_else(|| MongrelError::Schema(format!("unknown column {column_name}")))?;
+        let mut next = old.clone();
+
+        if let Some(name) = &change.name {
+            let trimmed = name.trim();
+            if trimmed.is_empty() {
+                return Err(MongrelError::InvalidArgument(
+                    "ALTER COLUMN name must not be empty".into(),
+                ));
+            }
+            if trimmed != old.name && self.schema.columns.iter().any(|c| c.name == trimmed) {
+                return Err(MongrelError::Schema(format!(
+                    "column {trimmed} already exists"
+                )));
+            }
+            next.name = trimmed.to_string();
+        }
+
+        if let Some(ty) = change.ty {
+            next.ty = ty;
+        }
+        if let Some(flags) = change.flags {
+            validate_alter_column_flags(old.flags, flags)?;
+            next.flags = flags;
+        }
+
+        validate_alter_column_type(&self.schema, &old, &next, self.has_stored_versions())?;
+        if old.flags.contains(ColumnFlags::NULLABLE)
+            && !next.flags.contains(ColumnFlags::NULLABLE)
+            && self.column_has_nulls(old.id)?
+        {
+            return Err(MongrelError::InvalidArgument(format!(
+                "column '{}' contains NULL values",
+                old.name
+            )));
+        }
+        Ok(next)
+    }
+
+    pub(crate) fn apply_altered_column(&mut self, column: ColumnDef) -> Result<()> {
+        let idx = self
+            .schema
+            .columns
+            .iter()
+            .position(|c| c.id == column.id)
+            .ok_or_else(|| MongrelError::Schema(format!("unknown column {}", column.id)))?;
+        if self.schema.columns[idx] == column {
+            return Ok(());
+        }
+        self.schema.columns[idx] = column;
+        self.schema.schema_id = self.schema.schema_id.saturating_add(1);
+        self.schema.validate_auto_increment()?;
+        self.auto_inc = resolve_auto_inc(&self.schema);
+        self.column_keys = build_column_keys(self.kek.as_deref(), &self.schema);
+        write_schema(&self.dir, &self.schema)?;
+        self.clear_result_cache();
+        let _ = std::fs::remove_dir_all(self.dir.join("_shadow"));
+        self.persist_manifest(self.current_epoch())?;
+        Ok(())
+    }
+
+    pub fn alter_column(&mut self, column_name: &str, change: AlterColumn) -> Result<ColumnDef> {
+        let column = self.prepare_alter_column(column_name, &change)?;
+        self.apply_altered_column(column.clone())?;
+        Ok(column)
+    }
+
+    fn column_has_nulls(&mut self, column_id: u16) -> Result<bool> {
+        if self.live_count == 0 {
+            return Ok(false);
+        }
+        let snap = self.snapshot();
+        let columns = self.visible_columns_native(snap, Some(&[column_id]))?;
+        Ok(columns
+            .first()
+            .map(|(_, col)| col.null_count(col.len()) != 0)
+            .unwrap_or(true))
+    }
+
+    fn has_stored_versions(&self) -> bool {
+        !self.memtable.is_empty()
+            || !self.mutable_run.is_empty()
+            || self.run_refs.iter().any(|r| r.row_count > 0)
+            || !self.retiring.is_empty()
+    }
+
     /// Add a column to the schema (schema evolution). Existing runs simply read
     /// back as null for the new column until re-written. Persists the new schema
     /// and manifest. The caller supplies the full [`ColumnFlags`] so migrations
@@ -5944,6 +6046,52 @@ fn empty_indexes(schema: &Schema) -> SecondaryIndexes {
         }
     }
     (bitmap, ann, fm, sparse)
+}
+
+const ALTER_COLUMN_PROTECTED_FLAGS: u32 = ColumnFlags::PRIMARY_KEY
+    | ColumnFlags::AUTO_INCREMENT
+    | ColumnFlags::ENCRYPTED
+    | ColumnFlags::ENCRYPTED_INDEXABLE
+    | ColumnFlags::EMBEDDING_BINARY_QUANTIZED;
+
+fn validate_alter_column_flags(old: ColumnFlags, new: ColumnFlags) -> Result<()> {
+    if (old.bits() ^ new.bits()) & ALTER_COLUMN_PROTECTED_FLAGS != 0 {
+        return Err(MongrelError::Schema(
+            "ALTER COLUMN may only change NULLABLE; primary key, auto-increment, encryption, and embedding flags are immutable".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_alter_column_type(
+    schema: &Schema,
+    old: &ColumnDef,
+    next: &ColumnDef,
+    has_stored_versions: bool,
+) -> Result<()> {
+    if old.ty == next.ty {
+        return Ok(());
+    }
+    if schema.indexes.iter().any(|i| i.column_id == old.id) {
+        return Err(MongrelError::Schema(format!(
+            "ALTER COLUMN TYPE is not supported for indexed column '{}'",
+            old.name
+        )));
+    }
+    if !has_stored_versions || storage_compatible_type_change(old.ty, next.ty) {
+        return Ok(());
+    }
+    Err(MongrelError::Schema(format!(
+        "ALTER COLUMN TYPE from {:?} to {:?} requires an empty column or a representation-compatible type",
+        old.ty, next.ty
+    )))
+}
+
+fn storage_compatible_type_change(old: TypeId, new: TypeId) -> bool {
+    matches!(
+        (old, new),
+        (TypeId::Int64, TypeId::TimestampNanos) | (TypeId::TimestampNanos, TypeId::Int64)
+    )
 }
 
 fn index_into(

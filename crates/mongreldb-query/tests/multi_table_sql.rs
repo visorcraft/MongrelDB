@@ -406,3 +406,100 @@ async fn alter_table_rename_is_case_insensitive() {
     session.run("Alter Table t Rename To u").await.unwrap();
     assert_eq!(db.table_names(), vec!["u".to_string()]);
 }
+
+#[tokio::test]
+async fn alter_table_rename_column_via_sql_refreshes_schema() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    let session = MongrelSession::open(Arc::clone(&db)).unwrap();
+    session
+        .run("CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)")
+        .await
+        .unwrap();
+    db.transaction(|t| {
+        t.put("t", vec![(1, Value::Int64(1)), (2, Value::Int64(10))])?;
+        t.put("t", vec![(1, Value::Int64(2)), (2, Value::Int64(20))])
+    })
+    .unwrap();
+
+    session
+        .run("ALTER TABLE t RENAME COLUMN v TO amount")
+        .await
+        .unwrap();
+
+    assert!(db
+        .table("t")
+        .unwrap()
+        .lock()
+        .schema()
+        .column("amount")
+        .is_some());
+    assert!(session.run("SELECT v FROM t").await.is_err());
+    let batches = session.run("SELECT amount FROM t").await.unwrap();
+    assert_eq!(total_rows(&batches), 2);
+    assert_eq!(batches[0].schema().field(0).name(), "amount");
+}
+
+#[tokio::test]
+async fn alter_column_nullability_via_sql() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    let session = MongrelSession::open(Arc::clone(&db)).unwrap();
+    session
+        .run("CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)")
+        .await
+        .unwrap();
+
+    session
+        .run("ALTER TABLE t ALTER COLUMN v DROP NOT NULL")
+        .await
+        .unwrap();
+    assert!(db
+        .table("t")
+        .unwrap()
+        .lock()
+        .schema()
+        .column("v")
+        .unwrap()
+        .flags
+        .contains(ColumnFlags::NULLABLE));
+
+    db.transaction(|t| t.put("t", vec![(1, Value::Int64(1))]))
+        .unwrap();
+    let result = session
+        .run("ALTER TABLE t ALTER COLUMN v SET NOT NULL")
+        .await;
+    assert!(
+        result.is_err(),
+        "SET NOT NULL must reject existing NULL values"
+    );
+}
+
+#[tokio::test]
+async fn alter_column_type_via_sql_on_empty_table() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    let session = MongrelSession::open(Arc::clone(&db)).unwrap();
+    session
+        .run("CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)")
+        .await
+        .unwrap();
+
+    session
+        .run("ALTER TABLE t ALTER COLUMN v TYPE TEXT")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        db.table("t")
+            .unwrap()
+            .lock()
+            .schema()
+            .column("v")
+            .unwrap()
+            .ty,
+        TypeId::Bytes
+    );
+    let batches = session.run("SELECT v FROM t").await.unwrap();
+    assert_eq!(total_rows(&batches), 0);
+}

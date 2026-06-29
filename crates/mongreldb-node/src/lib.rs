@@ -17,7 +17,9 @@
 #![deny(clippy::all)]
 
 use mongreldb_core::query::{Condition, Query};
-use mongreldb_core::schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
+use mongreldb_core::schema::{
+    AlterColumn, ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId,
+};
 use mongreldb_core::{RowId, Value};
 use napi::bindgen_prelude::{BigInt, Buffer};
 use napi_derive::napi;
@@ -140,26 +142,31 @@ fn to_type_id(ty: &ColumnType, embedding_dim: Option<u32>) -> napi::Result<TypeI
     })
 }
 
+fn to_column_flags(column: &ColumnSpec) -> ColumnFlags {
+    let mut flags = ColumnFlags::empty();
+    if column.primary_key {
+        flags = flags.with(ColumnFlags::PRIMARY_KEY);
+    }
+    if column.nullable {
+        flags = flags.with(ColumnFlags::NULLABLE);
+    }
+    if column.auto_increment.unwrap_or(false) {
+        flags = flags.with(ColumnFlags::AUTO_INCREMENT);
+    }
+    flags
+}
+
 fn build_schema(spec: SchemaSpec) -> napi::Result<Schema> {
     let columns = spec
         .columns
         .into_iter()
         .map(|c| {
-            let mut f = ColumnFlags::empty();
-            if c.primary_key {
-                f = f.with(ColumnFlags::PRIMARY_KEY);
-            }
-            if c.nullable {
-                f = f.with(ColumnFlags::NULLABLE);
-            }
-            if c.auto_increment.unwrap_or(false) {
-                f = f.with(ColumnFlags::AUTO_INCREMENT);
-            }
+            let flags = to_column_flags(&c);
             Ok::<ColumnDef, napi::Error>(ColumnDef {
                 id: c.id,
                 name: c.name,
                 ty: to_type_id(&c.ty, c.embedding_dim)?,
-                flags: f,
+                flags,
             })
         })
         .collect::<napi::Result<Vec<_>>>()?;
@@ -682,18 +689,36 @@ impl Database {
         let handle = self.inner.table(&table).map_err(to_napi)?;
         let mut g = handle.lock();
         let ty = to_type_id(&column.ty, column.embedding_dim)?;
-        let mut flags = mongreldb_core::schema::ColumnFlags::empty();
-        if column.primary_key {
-            flags = flags.with(mongreldb_core::schema::ColumnFlags::PRIMARY_KEY);
-        }
-        if column.nullable {
-            flags = flags.with(mongreldb_core::schema::ColumnFlags::NULLABLE);
-        }
-        if column.auto_increment.unwrap_or(false) {
-            flags = flags.with(mongreldb_core::schema::ColumnFlags::AUTO_INCREMENT);
-        }
+        let flags = to_column_flags(&column);
         let id = g.add_column(&column.name, ty, flags).map_err(to_napi)?;
         Ok(BigInt::from(id as u64))
+    }
+
+    /// Alter an existing column's native schema metadata. The source column is
+    /// selected by `column_name`; the supplied column spec provides the target
+    /// name, storage type, and flags while the stable engine column id is kept.
+    #[napi]
+    pub fn alter_column(
+        &self,
+        table: String,
+        column_name: String,
+        column: ColumnSpec,
+    ) -> napi::Result<BigInt> {
+        let ty = to_type_id(&column.ty, column.embedding_dim)?;
+        let flags = to_column_flags(&column);
+        let altered = self
+            .inner
+            .alter_column(
+                &table,
+                &column_name,
+                AlterColumn {
+                    name: Some(column.name),
+                    ty: Some(ty),
+                    flags: Some(flags),
+                },
+            )
+            .map_err(to_napi)?;
+        Ok(BigInt::from(altered.id as u64))
     }
 
     /// Verify database integrity. Returns a JSON-string summary.

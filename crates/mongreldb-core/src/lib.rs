@@ -61,7 +61,7 @@ pub use query::{Condition, Query};
 pub use reservoir::Reservoir;
 pub use retention::{OwnedSnapshotGuard, SnapshotGuard, SnapshotRegistry};
 pub use rowid::{RowId, RowIdAllocator};
-pub use schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
+pub use schema::{AlterColumn, ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
 pub use sorted_run::{
     read_column_dir, read_header, write_run, write_run_with, ColumnPayload, RunHeader, RunReader,
     RunSpec, RunWriter,

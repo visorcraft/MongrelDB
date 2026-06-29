@@ -7,7 +7,7 @@
 
 use crate::epoch::Epoch;
 use crate::rowid::RowId;
-use crate::schema::Schema;
+use crate::schema::{ColumnDef, Schema};
 use crate::{MongrelError, Result};
 use crc::{Crc, CRC_32_ISCSI};
 use serde::{Deserialize, Serialize};
@@ -67,6 +67,8 @@ pub enum DdlOp {
     DropTable {
         table_id: u64,
     },
+    /// Replace one existing column definition with the JSON-encoded
+    /// [`ColumnDef`] produced by native ALTER COLUMN validation.
     AlterTable {
         table_id: u64,
         column_json: Vec<u8>,
@@ -91,6 +93,14 @@ impl DdlOp {
     /// Decode a schema carried by [`DdlOp::CreateTable`].
     pub fn decode_schema(bytes: &[u8]) -> Result<Schema> {
         serde_json::from_slice(bytes).map_err(|e| MongrelError::Other(format!("schema json: {e}")))
+    }
+
+    pub fn encode_column(column: &ColumnDef) -> Result<Vec<u8>> {
+        serde_json::to_vec(column).map_err(|e| MongrelError::Other(format!("column json: {e}")))
+    }
+
+    pub fn decode_column(bytes: &[u8]) -> Result<ColumnDef> {
+        serde_json::from_slice(bytes).map_err(|e| MongrelError::Other(format!("column json: {e}")))
     }
 }
 

@@ -11,7 +11,7 @@ use crate::engine::{SharedCtx, Table};
 use crate::epoch::{Epoch, EpochAuthority, Snapshot};
 use crate::error::{MongrelError, Result};
 use crate::retention::{OwnedSnapshotGuard, SnapshotGuard, SnapshotRegistry};
-use crate::schema::Schema;
+use crate::schema::{AlterColumn, ColumnDef, Schema};
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -1027,6 +1027,86 @@ impl Database {
         Ok(())
     }
 
+    pub fn alter_column(
+        &self,
+        table_name: &str,
+        column_name: &str,
+        change: AlterColumn,
+    ) -> Result<ColumnDef> {
+        use crate::wal::DdlOp;
+        use std::sync::atomic::Ordering;
+
+        if self.poisoned.load(Ordering::Relaxed) {
+            return Err(MongrelError::Other(
+                "database poisoned by fsync error".into(),
+            ));
+        }
+
+        let _g = self.ddl_lock.lock();
+        let table_id = {
+            let cat = self.catalog.read();
+            cat.live(table_name)
+                .ok_or_else(|| MongrelError::NotFound(format!("table {table_name:?} not found")))?
+                .table_id
+        };
+        let handle =
+            self.tables.read().get(&table_id).cloned().ok_or_else(|| {
+                MongrelError::NotFound(format!("table {table_name:?} not mounted"))
+            })?;
+        let mut table = handle.lock();
+        let column = table.prepare_alter_column(column_name, &change)?;
+        if table
+            .schema()
+            .columns
+            .iter()
+            .find(|c| c.id == column.id)
+            .is_some_and(|c| c == &column)
+        {
+            return Ok(column);
+        }
+
+        let commit_lock = Arc::clone(&self.commit_lock);
+        let _c = commit_lock.lock();
+        let epoch = self.epoch.bump_assigned();
+        let txn_id = self.alloc_txn_id();
+        let column_json = DdlOp::encode_column(&column)?;
+        let commit_seq = {
+            let mut wal = self.shared_wal.lock();
+            wal.append(
+                txn_id,
+                table_id,
+                crate::wal::Op::Ddl(DdlOp::AlterTable {
+                    table_id,
+                    column_json,
+                }),
+            )?;
+            wal.append_commit(txn_id, epoch, &[])?
+        };
+        self.group
+            .await_durable(&self.shared_wal, commit_seq)
+            .inspect_err(|_| {
+                self.poisoned.store(true, Ordering::Relaxed);
+            })?;
+
+        table.apply_altered_column(column.clone())?;
+        let schema = table.schema().clone();
+        drop(table);
+
+        {
+            let mut cat = self.catalog.write();
+            let entry = cat
+                .tables
+                .iter_mut()
+                .find(|t| t.table_id == table_id)
+                .ok_or_else(|| MongrelError::NotFound(format!("table {table_name:?} not found")))?;
+            entry.schema = schema;
+        }
+        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+
+        self.advance_visible(epoch);
+        Ok(column)
+    }
+
     /// Retention-gated garbage collection (spec §6.4, §7.4, §16). Deletes:
     /// - Dropped-table subdirs whose `at_epoch < min_active_snapshot`.
     /// - Stale `_txn/` dirs (aborted/crashed large-txn pending runs).
@@ -1574,6 +1654,21 @@ fn recover_ddl_from_wal(
                 // checkpointed carrying the post-rename name, so there is
                 // nothing to apply — a no-op, not an error.
             }
+            Op::Ddl(DdlOp::AlterTable {
+                table_id,
+                ref column_json,
+            }) => {
+                let column = DdlOp::decode_column(column_json)?;
+                if let Some(entry) = cat.tables.iter_mut().find(|t| t.table_id == table_id) {
+                    if apply_recovered_column_def(&mut entry.schema, column) {
+                        let tdir = root.join(TABLES_DIR).join(table_id.to_string());
+                        if tdir.exists() {
+                            crate::engine::write_schema(&tdir, &entry.schema)?;
+                        }
+                        changed = true;
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -1582,6 +1677,22 @@ fn recover_ddl_from_wal(
         catalog::write_atomic(root, cat, meta_dek)?;
     }
     Ok(())
+}
+
+fn apply_recovered_column_def(schema: &mut Schema, column: ColumnDef) -> bool {
+    match schema.columns.iter_mut().find(|c| c.id == column.id) {
+        Some(existing) if *existing == column => false,
+        Some(existing) => {
+            *existing = column;
+            schema.schema_id = schema.schema_id.saturating_add(1);
+            true
+        }
+        None => {
+            schema.columns.push(column);
+            schema.schema_id = schema.schema_id.saturating_add(1);
+            true
+        }
+    }
 }
 
 /// Sweep stale `_txn/<txn_id>/` dirs from every table (spec §8.5, review fix

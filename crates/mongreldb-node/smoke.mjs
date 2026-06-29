@@ -515,10 +515,23 @@ console.log('smoke: typed primary-key get/delete ✓');
   assert(extraCell !== undefined, 'new column present in row');
   assert(extraCell.int64 === undefined || extraCell.int64 === null, 'new column is null');
 
+  // Rename the column through native ALTER COLUMN while preserving the stable id.
+  const alteredColId = dbA3.alterColumn('evolve', 'extra', {
+    id: 3,
+    name: 'renamed_extra',
+    ty: ColumnType.Int64,
+    primaryKey: false,
+    nullable: true,
+  });
+  assert(alteredColId === newColId, 'alterColumn returns the stable column id');
+  const evolvedColumns = dbA3.tableColumns('evolve');
+  assert(evolvedColumns.includes('renamed_extra'), 'alterColumn renamed the column');
+  assert(!evolvedColumns.includes('extra'), 'old column name removed after alterColumn');
+
   dbA3.close();
   rmSync(dirA3, { recursive: true });
 }
-console.log('smoke: A3 catalog-aware addColumn ✓');
+console.log('smoke: A3 catalog-aware addColumn/alterColumn ✓');
 
 // ── A4: backup and integrity primitives ────────────────────────────────────
 {

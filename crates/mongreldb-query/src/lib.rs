@@ -38,7 +38,7 @@ use datafusion::common::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::{Expr, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
-use mongreldb_core::{ColumnFlags, Cursor, Database, Table};
+use mongreldb_core::{AlterColumn, ColumnFlags, Cursor, Database, Table};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -922,12 +922,25 @@ impl MongrelSession {
         Ok(())
     }
 
+    fn refresh_registered_table(&self, db: &Arc<Database>, name: &str) -> Result<()> {
+        self.ctx
+            .deregister_table(name)
+            .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
+        let handle = db.table(name)?;
+        let provider = MongrelProvider::new(handle.clone())?;
+        self.ctx
+            .register_table(name, Arc::new(provider))
+            .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
+        self.tables.lock().insert(name.to_string(), handle);
+        Ok(())
+    }
+
     /// Run a SQL statement and return the result batches. Repeated identical SQL
     /// against the same snapshot returns the cached batches without re-executing.
     /// Run a SQL statement and return the result batches. DDL statements
-    /// (`CREATE TABLE`, `DROP TABLE`) are intercepted when a `Database` is
-    /// attached and mapped to the catalog. Repeated identical SQL against the
-    /// same snapshot returns the cached batches without re-executing.
+    /// (`CREATE TABLE`, `DROP TABLE`, `ALTER TABLE`) are intercepted when a
+    /// `Database` is attached and mapped to the catalog. Repeated identical SQL
+    /// against the same snapshot returns the cached batches without re-executing.
     pub async fn run(&self, sql: &str) -> Result<Vec<RecordBatch>> {
         // P4.2: intercept DDL when a Database is attached.
         let lower = sql.trim_start().to_lowercase();
@@ -967,21 +980,58 @@ impl MongrelSession {
         }
         if lower.starts_with("alter table") {
             if let Some(db) = &self.database {
-                let (old_name, new_name) = parse_alter_table_rename(sql)?;
-                db.rename_table(&old_name, &new_name)?;
-                // Re-key DataFusion + the session's handle cache under the new
-                // name. The table_id and underlying table object are unchanged
-                // by a rename, so a fresh handle resolves to the same table.
-                self.ctx
-                    .deregister_table(&old_name)
-                    .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
-                self.tables.lock().remove(&old_name);
-                let handle = db.table(&new_name)?;
-                let provider = MongrelProvider::new(handle.clone())?;
-                self.ctx
-                    .register_table(&new_name, Arc::new(provider))
-                    .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
-                self.tables.lock().insert(new_name, handle);
+                match parse_alter_table(sql)? {
+                    ParsedAlterTable::RenameTable { old_name, new_name } => {
+                        db.rename_table(&old_name, &new_name)?;
+                        // Re-key DataFusion + the session's handle cache under the new
+                        // name. The table_id and underlying table object are unchanged
+                        // by a rename, so a fresh handle resolves to the same table.
+                        self.ctx
+                            .deregister_table(&old_name)
+                            .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
+                        self.tables.lock().remove(&old_name);
+                        let handle = db.table(&new_name)?;
+                        let provider = MongrelProvider::new(handle.clone())?;
+                        self.ctx
+                            .register_table(&new_name, Arc::new(provider))
+                            .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
+                        self.tables.lock().insert(new_name, handle);
+                    }
+                    ParsedAlterTable::RenameColumn {
+                        table_name,
+                        column_name,
+                        new_name,
+                    } => {
+                        db.alter_column(&table_name, &column_name, AlterColumn::rename(new_name))?;
+                        self.refresh_registered_table(db, &table_name)?;
+                    }
+                    ParsedAlterTable::AlterColumnType {
+                        table_name,
+                        column_name,
+                        ty,
+                    } => {
+                        db.alter_column(&table_name, &column_name, AlterColumn::set_type(ty))?;
+                        self.refresh_registered_table(db, &table_name)?;
+                    }
+                    ParsedAlterTable::SetNotNull {
+                        table_name,
+                        column_name,
+                    } => {
+                        let flags = current_column_flags(db, &table_name, &column_name)?
+                            .without(ColumnFlags::NULLABLE);
+                        db.alter_column(&table_name, &column_name, AlterColumn::set_flags(flags))?;
+                        self.refresh_registered_table(db, &table_name)?;
+                    }
+                    ParsedAlterTable::DropNotNull {
+                        table_name,
+                        column_name,
+                    } => {
+                        let flags = current_column_flags(db, &table_name, &column_name)?
+                            .with(ColumnFlags::NULLABLE);
+                        db.alter_column(&table_name, &column_name, AlterColumn::set_flags(flags))?;
+                        self.refresh_registered_table(db, &table_name)?;
+                    }
+                }
                 self.clear_cache();
                 return Ok(Vec::new());
             }
@@ -1387,7 +1437,7 @@ fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
 /// **Adding a new column constraint is a one-line change:** append `(phrase,
 /// flag)` here. This keeps the DDL shim's grammar in one place rather than
 /// scattering `contains(...)` checks across the parser. (A full SQL grammar is
-/// deliberately out of scope — only `CREATE TABLE` / `DROP TABLE` are
+/// deliberately out of scope — only the DDL shapes handled below are
 /// intercepted here; all query parsing is delegated to DataFusion.)
 const COLUMN_CONSTRAINTS: &[(&str, u32)] = &[
     ("primary key", ColumnFlags::PRIMARY_KEY),
@@ -1415,6 +1465,20 @@ fn parse_column_constraints(constraint_text: &str) -> ColumnFlags {
         }
     }
     flags
+}
+
+fn parse_sql_type(ty_str: &str) -> Result<mongreldb_core::schema::TypeId> {
+    use mongreldb_core::schema::TypeId;
+
+    match ty_str.trim().trim_end_matches(';').to_lowercase().as_str() {
+        "bigint" | "int8" | "int64" | "integer" | "int" => Ok(TypeId::Int64),
+        "double" | "float8" | "float64" | "real" | "float" => Ok(TypeId::Float64),
+        "varchar" | "text" | "string" | "bytes" => Ok(TypeId::Bytes),
+        "boolean" | "bool" => Ok(TypeId::Bool),
+        other => Err(MongrelQueryError::Schema(format!(
+            "unsupported column type: {other}"
+        ))),
+    }
 }
 
 /// Parse `CREATE TABLE [IF NOT EXISTS] <name> (<col> <type> <constraints>, ...)`
@@ -1466,17 +1530,7 @@ fn parse_create_table(sql: &str) -> Result<(String, mongreldb_core::schema::Sche
             .next()
             .ok_or(MongrelQueryError::Schema("missing column type".into()))?
             .to_lowercase();
-        let ty = match ty_str.as_str() {
-            "bigint" | "int8" | "int64" | "integer" | "int" => TypeId::Int64,
-            "double" | "float8" | "float64" | "real" | "float" => TypeId::Float64,
-            "varchar" | "text" | "string" | "bytes" => TypeId::Bytes,
-            "boolean" | "bool" => TypeId::Bool,
-            other => {
-                return Err(MongrelQueryError::Schema(format!(
-                    "unsupported column type: {other}"
-                )))
-            }
-        };
+        let ty = parse_sql_type(&ty_str)?;
         // Everything after `<name> <type>` is the column's constraint clause
         // (e.g. `PRIMARY KEY`, `PRIMARY KEY AUTOINCREMENT`). The remaining
         // tokens are matched against `COLUMN_CONSTRAINTS`.
@@ -1527,41 +1581,159 @@ fn parse_drop_table(sql: &str) -> Result<(String, bool)> {
     Ok((name.to_string(), if_exists))
 }
 
-/// Parse `ALTER TABLE <name> RENAME TO <new_name>` into `(old_name, new_name)`.
-/// Keywords are case-insensitive; table names may be double-quoted. Only the
-/// RENAME form of ALTER TABLE is supported here — column alterations go through
-/// the native `add_column` API — so any other ALTER shape yields a schema error.
-///
-/// The `RENAME TO` separator is matched as a space-bordered, case-insensitive
-/// phrase. `to_ascii_lowercase` is used (not `to_lowercase`) so byte indices in
-/// the lowercased copy map 1:1 back to the original, even for non-ASCII names.
-fn parse_alter_table_rename(sql: &str) -> Result<(String, String)> {
-    let trimmed = sql.trim();
+enum ParsedAlterTable {
+    RenameTable {
+        old_name: String,
+        new_name: String,
+    },
+    RenameColumn {
+        table_name: String,
+        column_name: String,
+        new_name: String,
+    },
+    AlterColumnType {
+        table_name: String,
+        column_name: String,
+        ty: mongreldb_core::schema::TypeId,
+    },
+    SetNotNull {
+        table_name: String,
+        column_name: String,
+    },
+    DropNotNull {
+        table_name: String,
+        column_name: String,
+    },
+}
+
+fn current_column_flags(db: &Arc<Database>, table: &str, column: &str) -> Result<ColumnFlags> {
+    let handle = db.table(table)?;
+    let table = handle.lock();
+    table
+        .schema()
+        .column(column)
+        .map(|c| c.flags)
+        .ok_or_else(|| MongrelQueryError::Schema(format!("unknown column {column}")))
+}
+
+fn parse_alter_table(sql: &str) -> Result<ParsedAlterTable> {
+    let trimmed = strip_statement_semicolon(sql.trim());
     let after_kw = strip_prefix_ci(trimmed, "ALTER TABLE")
         .ok_or_else(|| MongrelQueryError::Schema("not an ALTER TABLE statement".into()))?
         .trim();
-    let lower = after_kw.to_ascii_lowercase();
-    let sep = " rename to ";
-    let sep_idx = lower.find(sep).ok_or_else(|| {
-        MongrelQueryError::Schema("ALTER TABLE must contain 'RENAME TO <new_name>'".into())
-    })?;
-    let old_name = after_kw[..sep_idx].trim().trim_matches('"').to_string();
-    let new_name = after_kw[sep_idx + sep.len()..]
-        .trim()
-        .trim_end_matches(';')
-        .trim_matches('"')
-        .to_string();
-    if old_name.is_empty() {
+    let (table_name, rest) = take_sql_ident(after_kw, "ALTER TABLE missing table name")?;
+    let rest = rest.trim();
+
+    if let Some(after) = strip_prefix_ci(rest, "RENAME TO") {
+        let new_name = parse_trailing_identifier(after, "ALTER TABLE missing new table name")?;
+        return Ok(ParsedAlterTable::RenameTable {
+            old_name: table_name,
+            new_name,
+        });
+    }
+
+    if let Some(after) = strip_prefix_ci(rest, "RENAME COLUMN") {
+        let (column_name, after_col) =
+            take_sql_ident(after, "ALTER TABLE RENAME COLUMN missing column name")?;
+        let after_to = strip_prefix_ci(after_col.trim(), "TO").ok_or_else(|| {
+            MongrelQueryError::Schema("ALTER TABLE RENAME COLUMN missing TO".into())
+        })?;
+        let new_name = parse_trailing_identifier(
+            after_to,
+            "ALTER TABLE RENAME COLUMN missing new column name",
+        )?;
+        return Ok(ParsedAlterTable::RenameColumn {
+            table_name,
+            column_name,
+            new_name,
+        });
+    }
+
+    let after_alter = strip_prefix_ci(rest, "ALTER COLUMN")
+        .or_else(|| strip_prefix_ci(rest, "ALTER"))
+        .ok_or_else(|| {
+            MongrelQueryError::Schema(
+                "ALTER TABLE must be RENAME TO, RENAME COLUMN, or ALTER COLUMN".into(),
+            )
+        })?;
+    let (column_name, action) =
+        take_sql_ident(after_alter, "ALTER TABLE ALTER COLUMN missing column name")?;
+    let action = action.trim();
+
+    if let Some(after_type) =
+        strip_prefix_ci(action, "TYPE").or_else(|| strip_prefix_ci(action, "SET DATA TYPE"))
+    {
+        let ty = parse_type_tail(after_type)?;
+        return Ok(ParsedAlterTable::AlterColumnType {
+            table_name,
+            column_name,
+            ty,
+        });
+    }
+    if strip_prefix_ci(action, "SET NOT NULL").is_some() {
+        return Ok(ParsedAlterTable::SetNotNull {
+            table_name,
+            column_name,
+        });
+    }
+    if strip_prefix_ci(action, "DROP NOT NULL").is_some() {
+        return Ok(ParsedAlterTable::DropNotNull {
+            table_name,
+            column_name,
+        });
+    }
+
+    Err(MongrelQueryError::Schema(
+        "unsupported ALTER COLUMN action".into(),
+    ))
+}
+
+fn strip_statement_semicolon(s: &str) -> &str {
+    s.trim().trim_end_matches(';').trim()
+}
+
+fn take_sql_ident<'a>(s: &'a str, missing: &str) -> Result<(String, &'a str)> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err(MongrelQueryError::Schema(missing.into()));
+    }
+    if let Some(rest) = s.strip_prefix('"') {
+        let Some(end) = rest.find('"') else {
+            return Err(MongrelQueryError::Schema(
+                "unterminated quoted identifier".into(),
+            ));
+        };
+        let ident = rest[..end].to_string();
+        if ident.is_empty() {
+            return Err(MongrelQueryError::Schema(missing.into()));
+        }
+        return Ok((ident, &rest[end + 1..]));
+    }
+    let end = s.find(|c: char| c.is_ascii_whitespace()).unwrap_or(s.len());
+    let ident = s[..end].trim_matches('"').to_string();
+    if ident.is_empty() {
+        return Err(MongrelQueryError::Schema(missing.into()));
+    }
+    Ok((ident, &s[end..]))
+}
+
+fn parse_trailing_identifier(s: &str, missing: &str) -> Result<String> {
+    let (ident, rest) = take_sql_ident(s, missing)?;
+    if !strip_statement_semicolon(rest).is_empty() {
         return Err(MongrelQueryError::Schema(
-            "ALTER TABLE missing source table name".into(),
+            "unexpected tokens after identifier".into(),
         ));
     }
-    if new_name.is_empty() {
-        return Err(MongrelQueryError::Schema(
-            "ALTER TABLE missing new table name".into(),
-        ));
-    }
-    Ok((old_name, new_name))
+    Ok(ident)
+}
+
+fn parse_type_tail(s: &str) -> Result<mongreldb_core::schema::TypeId> {
+    let tail = strip_statement_semicolon(s);
+    let ty = tail
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| MongrelQueryError::Schema("ALTER COLUMN TYPE missing type".into()))?;
+    parse_sql_type(ty)
 }
 
 #[cfg(test)]

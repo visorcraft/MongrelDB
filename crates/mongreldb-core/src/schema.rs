@@ -79,6 +79,12 @@ impl ColumnFlags {
     }
 
     #[inline]
+    pub const fn without(mut self, flag: u32) -> Self {
+        self.bits &= !flag;
+        self
+    }
+
+    #[inline]
     pub const fn contains(&self, flag: u32) -> bool {
         self.bits & flag != 0
     }
@@ -90,12 +96,46 @@ impl ColumnFlags {
 }
 
 /// A column definition. `id` is stable, monotonic, and never reused.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ColumnDef {
     pub id: u16,
     pub name: String,
     pub ty: TypeId,
     pub flags: ColumnFlags,
+}
+
+/// Metadata updates supported by native ALTER COLUMN.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AlterColumn {
+    pub name: Option<String>,
+    pub ty: Option<TypeId>,
+    pub flags: Option<ColumnFlags>,
+}
+
+impl AlterColumn {
+    pub fn rename(name: impl Into<String>) -> Self {
+        Self {
+            name: Some(name.into()),
+            ty: None,
+            flags: None,
+        }
+    }
+
+    pub fn set_type(ty: TypeId) -> Self {
+        Self {
+            name: None,
+            ty: Some(ty),
+            flags: None,
+        }
+    }
+
+    pub fn set_flags(flags: ColumnFlags) -> Self {
+        Self {
+            name: None,
+            ty: None,
+            flags: Some(flags),
+        }
+    }
 }
 
 /// The kind of secondary index to maintain for a column. The primary-key index
