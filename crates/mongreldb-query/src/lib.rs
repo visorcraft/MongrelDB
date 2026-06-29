@@ -138,6 +138,8 @@ impl TableProvider for MongrelProvider {
         if empty_proj {
             let total: usize = if translated.is_empty() {
                 db.count() as usize
+            } else if let Some(count) = db.count_conditions(&translated, snap).map_err(core_err)? {
+                count as usize
             } else {
                 match schema_ref.columns.first() {
                     Some(cdef) => {

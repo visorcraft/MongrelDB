@@ -13,6 +13,7 @@ use crate::error::{MongrelError, Result};
 use crate::index::pgm::{LearnedIndex, PgmIndex};
 use crate::memtable::{Row, Value};
 use crate::page::{Encoding, PageStat};
+use crate::row_id_set::RowIdSet;
 use crate::rowid::RowId;
 use crate::schema::{Schema, TypeId};
 use serde::{Deserialize, Serialize};
@@ -1548,6 +1549,44 @@ impl RunReader {
         self.header.row_count as usize
     }
 
+    pub(crate) fn clean_contiguous_row_ids(&self) -> bool {
+        let n = self.row_count();
+        n > 0
+            && self.is_clean()
+            && self.epoch_override.is_none()
+            && self.header.max_row_id >= self.header.min_row_id
+            && self
+                .header
+                .max_row_id
+                .checked_sub(self.header.min_row_id)
+                .and_then(|span| span.checked_add(1))
+                == Some(n as u64)
+    }
+
+    pub(crate) fn position_for_row_id_fast(&self, row_id: u64) -> Option<usize> {
+        if !self.clean_contiguous_row_ids()
+            || row_id < self.header.min_row_id
+            || row_id > self.header.max_row_id
+        {
+            return None;
+        }
+        Some((row_id - self.header.min_row_id) as usize)
+    }
+
+    pub(crate) fn positions_for_row_ids_fast(&self, row_ids: &[u64]) -> Option<Vec<usize>> {
+        if !self.clean_contiguous_row_ids() {
+            return None;
+        }
+        let mut positions = Vec::with_capacity(row_ids.len());
+        for &row_id in row_ids {
+            if let Some(pos) = self.position_for_row_id_fast(row_id) {
+                positions.push(pos);
+            }
+        }
+        positions.sort_unstable();
+        Some(positions)
+    }
+
     fn resolve_type(&self, column_id: u16) -> TypeId {
         match column_id {
             SYS_ROW_ID | SYS_EPOCH => TypeId::Int64,
@@ -1988,6 +2027,19 @@ impl RunReader {
         lo: i64,
         hi: i64,
     ) -> Result<std::collections::HashSet<u64>> {
+        Ok(self
+            .range_row_id_set_i64(column_id, lo, hi)?
+            .into_sorted_vec()
+            .into_iter()
+            .collect())
+    }
+
+    pub(crate) fn range_row_id_set_i64(
+        &mut self,
+        column_id: u16,
+        lo: i64,
+        hi: i64,
+    ) -> Result<RowIdSet> {
         let info: Vec<(Option<i64>, Option<i64>, usize)> =
             match self.dir.iter().find(|h| h.column_id == column_id) {
                 Some(ch) => ch
@@ -2001,12 +2053,16 @@ impl RunReader {
                         )
                     })
                     .collect(),
-                None => return Ok(std::collections::HashSet::new()),
+                None => return Ok(RowIdSet::empty()),
             };
         // Encrypted columns have no cleartext stats — never prune, always scan.
         let col_encrypted = self.col_encrypted(column_id);
-        let mut out = std::collections::HashSet::new();
+        let clean_contiguous = self.clean_contiguous_row_ids();
+        let mut out = Vec::new();
+        let mut page_start = 0usize;
         for (seq, (mn, mx, nrows)) in info.into_iter().enumerate() {
+            let current_page_start = page_start;
+            page_start += nrows;
             // Skip pages that cannot contain a match (or are all-null).
             let skip = !col_encrypted
                 && match (mn, mx) {
@@ -2016,24 +2072,30 @@ impl RunReader {
             if skip {
                 continue;
             }
-            let rid_page = self.read_page(SYS_ROW_ID, seq)?;
             let val_page = self.read_page(column_id, seq)?;
-            let rids = columnar::decode_page_native(TypeId::Int64, &rid_page, nrows)?;
             let vals =
                 columnar::decode_page_native(self.resolve_type(column_id), &val_page, nrows)?;
-            if let (
-                columnar::NativeColumn::Int64 { data: r, .. },
-                columnar::NativeColumn::Int64 { data: v, validity },
-            ) = (rids, vals)
-            {
-                for (i, val) in v.iter().enumerate() {
-                    if columnar::validity_bit(&validity, i) && *val >= lo && *val <= hi {
-                        out.insert(r[i] as u64);
+            if let columnar::NativeColumn::Int64 { data: v, validity } = vals {
+                if clean_contiguous {
+                    for (i, val) in v.iter().enumerate() {
+                        if columnar::validity_bit(&validity, i) && *val >= lo && *val <= hi {
+                            out.push(self.header.min_row_id + current_page_start as u64 + i as u64);
+                        }
+                    }
+                } else {
+                    let rid_page = self.read_page(SYS_ROW_ID, seq)?;
+                    let rids = columnar::decode_page_native(TypeId::Int64, &rid_page, nrows)?;
+                    if let columnar::NativeColumn::Int64 { data: r, .. } = rids {
+                        for (i, val) in v.iter().enumerate() {
+                            if columnar::validity_bit(&validity, i) && *val >= lo && *val <= hi {
+                                out.push(r[i] as u64);
+                            }
+                        }
                     }
                 }
             }
         }
-        Ok(out)
+        Ok(RowIdSet::from_unsorted(out))
     }
 
     /// Float64 analogue of [`Self::range_row_ids_i64`] with per-bound
@@ -2046,6 +2108,21 @@ impl RunReader {
         hi: f64,
         hi_inclusive: bool,
     ) -> Result<std::collections::HashSet<u64>> {
+        Ok(self
+            .range_row_id_set_f64(column_id, lo, lo_inclusive, hi, hi_inclusive)?
+            .into_sorted_vec()
+            .into_iter()
+            .collect())
+    }
+
+    pub(crate) fn range_row_id_set_f64(
+        &mut self,
+        column_id: u16,
+        lo: f64,
+        lo_inclusive: bool,
+        hi: f64,
+        hi_inclusive: bool,
+    ) -> Result<RowIdSet> {
         let info: Vec<(Option<f64>, Option<f64>, usize)> =
             match self.dir.iter().find(|h| h.column_id == column_id) {
                 Some(ch) => ch
@@ -2059,12 +2136,16 @@ impl RunReader {
                         )
                     })
                     .collect(),
-                None => return Ok(std::collections::HashSet::new()),
+                None => return Ok(RowIdSet::empty()),
             };
         // Encrypted columns have no cleartext stats — never prune, always scan.
         let col_encrypted = self.col_encrypted(column_id);
-        let mut out = std::collections::HashSet::new();
+        let clean_contiguous = self.clean_contiguous_row_ids();
+        let mut out = Vec::new();
+        let mut page_start = 0usize;
         for (seq, (mn, mx, nrows)) in info.into_iter().enumerate() {
+            let current_page_start = page_start;
+            page_start += nrows;
             // A page can be dropped iff every value fails the predicate, i.e. the
             // largest fails the lo-test or the smallest fails the hi-test.
             let skip = !col_encrypted
@@ -2079,28 +2160,39 @@ impl RunReader {
             if skip {
                 continue;
             }
-            let rid_page = self.read_page(SYS_ROW_ID, seq)?;
             let val_page = self.read_page(column_id, seq)?;
-            let rids = columnar::decode_page_native(TypeId::Int64, &rid_page, nrows)?;
             let vals = columnar::decode_page_native(TypeId::Float64, &val_page, nrows)?;
-            if let (
-                columnar::NativeColumn::Int64 { data: r, .. },
-                columnar::NativeColumn::Float64 { data: v, validity },
-            ) = (rids, vals)
-            {
-                for (i, val) in v.iter().enumerate() {
-                    if !columnar::validity_bit(&validity, i) || val.is_nan() {
-                        continue;
+            if let columnar::NativeColumn::Float64 { data: v, validity } = vals {
+                if clean_contiguous {
+                    for (i, val) in v.iter().enumerate() {
+                        if !columnar::validity_bit(&validity, i) || val.is_nan() {
+                            continue;
+                        }
+                        let ok_lo = if lo_inclusive { *val >= lo } else { *val > lo };
+                        let ok_hi = if hi_inclusive { *val <= hi } else { *val < hi };
+                        if ok_lo && ok_hi {
+                            out.push(self.header.min_row_id + current_page_start as u64 + i as u64);
+                        }
                     }
-                    let ok_lo = if lo_inclusive { *val >= lo } else { *val > lo };
-                    let ok_hi = if hi_inclusive { *val <= hi } else { *val < hi };
-                    if ok_lo && ok_hi {
-                        out.insert(r[i] as u64);
+                } else {
+                    let rid_page = self.read_page(SYS_ROW_ID, seq)?;
+                    let rids = columnar::decode_page_native(TypeId::Int64, &rid_page, nrows)?;
+                    if let columnar::NativeColumn::Int64 { data: r, .. } = rids {
+                        for (i, val) in v.iter().enumerate() {
+                            if !columnar::validity_bit(&validity, i) || val.is_nan() {
+                                continue;
+                            }
+                            let ok_lo = if lo_inclusive { *val >= lo } else { *val > lo };
+                            let ok_hi = if hi_inclusive { *val <= hi } else { *val < hi };
+                            if ok_lo && ok_hi {
+                                out.push(r[i] as u64);
+                            }
+                        }
                     }
                 }
             }
         }
-        Ok(out)
+        Ok(RowIdSet::from_unsorted(out))
     }
 
     /// Visible array indices computed from typed system columns (no `Value`).

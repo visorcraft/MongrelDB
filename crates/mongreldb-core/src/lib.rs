@@ -29,6 +29,7 @@ pub mod pma;
 pub mod query;
 pub mod reservoir;
 pub mod retention;
+pub(crate) mod row_id_set;
 pub mod rowid;
 pub mod schema;
 pub mod sorted_run;

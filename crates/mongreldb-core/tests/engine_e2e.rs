@@ -100,6 +100,24 @@ fn flush_then_read_across_run() {
 }
 
 #[test]
+fn count_conditions_returns_survivor_cardinality() {
+    let dir = tempdir().unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
+    seed(&mut db);
+    db.flush().unwrap();
+
+    let snap = db.snapshot();
+    let red = [Condition::BitmapEq {
+        column_id: 2,
+        value: b"red".to_vec(),
+    }];
+    assert_eq!(db.count_conditions(&red, snap).unwrap(), Some(2));
+
+    let pk = [Condition::Pk(Value::Int64(20).encode_key())];
+    assert_eq!(db.count_conditions(&pk, snap).unwrap(), Some(1));
+}
+
+#[test]
 fn mvcc_snapshot_isolation_after_update() {
     let dir = tempdir().unwrap();
     let mut db = Table::create(dir.path(), schema(), 1).unwrap();

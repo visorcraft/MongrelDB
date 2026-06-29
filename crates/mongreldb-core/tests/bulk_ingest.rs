@@ -137,12 +137,13 @@ fn typed_bulk_load_builds_all_indexes() {
     ])
     .unwrap();
     assert_eq!(db.count(), 3);
-    // Phase 14.7: indexes are built lazily on the first query/flush — trigger
-    // it now so the checkpoint exists and the index assertions below pass.
-    db.flush().unwrap();
+    assert!(
+        db.indexes_complete(),
+        "fresh typed bulk load should eagerly build live indexes"
+    );
     assert!(
         dir.path().join("_idx/global.idx").exists(),
-        "typed bulk load must write the index checkpoint after flush"
+        "fresh typed bulk load must write the index checkpoint"
     );
 
     // PK (HOT) built from the typed PK column.

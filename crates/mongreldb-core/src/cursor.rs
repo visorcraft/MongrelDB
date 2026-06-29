@@ -12,10 +12,9 @@
 //! cursor never uses page `min/max` for MVCC visibility; visibility comes from
 //! the system columns (`RowId`/`Epoch`/deleted) resolved at build time.
 
-use std::collections::HashSet;
-
 use crate::columnar::{decode_page_native, NativeColumn};
 use crate::error::Result;
+use crate::row_id_set::RowIdSet;
 use crate::schema::TypeId;
 use crate::sorted_run::{RunReader, SYS_ROW_ID};
 
@@ -360,7 +359,7 @@ pub(crate) fn build_page_plans(
     visible_positions: &[usize],
     rids: &[i64],
     page_row_counts: &[usize],
-    survivors: Option<&HashSet<u64>>,
+    survivors: Option<&RowIdSet>,
 ) -> Vec<PagePlan> {
     debug_assert_eq!(visible_positions.len(), rids.len());
     // Cumulative page start offsets.
@@ -387,7 +386,7 @@ pub(crate) fn build_page_plans(
     };
     if selective {
         let set = survivors.unwrap();
-        for &s in set {
+        for s in set.to_sorted_vec() {
             let Ok(i) = rids.binary_search(&(s as i64)) else {
                 continue; // survivor lives in the overlay, not this run
             };
@@ -404,7 +403,7 @@ pub(crate) fn build_page_plans(
     } else {
         for (i, &global) in visible_positions.iter().enumerate() {
             if let Some(set) = survivors {
-                if !set.contains(&(rids[i] as u64)) {
+                if !set.contains(rids[i] as u64) {
                     continue;
                 }
             }

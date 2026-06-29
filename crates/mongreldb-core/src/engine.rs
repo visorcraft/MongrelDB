@@ -17,6 +17,7 @@ use crate::index::{AnnIndex, BitmapIndex, ColumnLearnedRange, FmIndex, HotIndex,
 use crate::manifest::{self, Manifest, RunRef};
 use crate::memtable::{Memtable, Row, Value};
 use crate::mutable_run::MutableRun;
+use crate::row_id_set::RowIdSet;
 use crate::rowid::{RowId, RowIdAllocator};
 use crate::schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
 use crate::sorted_run::{RunReader, RunWriter};
@@ -2507,6 +2508,10 @@ impl Table {
         // marker + rotates the WAL below, which is only safe once all in-flight
         // data is durably in a run.
         self.spill_mutable_run(epoch)?;
+        let eager_index_build = self.indexes_complete
+            && self.run_refs.is_empty()
+            && self.memtable.is_empty()
+            && self.mutable_run.is_empty();
         // Phase 14.7: route the legacy Value API through the same parallel
         // encode + typed batch-index path as `bulk_load_columns`. Transpose the
         // row-major sparse batch → column-major typed columns (in parallel),
@@ -2578,9 +2583,19 @@ impl Table {
             row_count: header.row_count,
         });
         self.live_count = self.live_count.saturating_add(write_n as u64);
-        self.indexes_complete = false;
+        if eager_index_build {
+            let row_ids: Vec<u64> = (first..first + write_n as u64).collect();
+            self.index_columns_bulk(&write_columns, &row_ids);
+            self.indexes_complete = true;
+            self.build_learned_ranges()?;
+        } else {
+            self.indexes_complete = false;
+        }
         self.mark_flushed(epoch)?;
         self.persist_manifest(epoch)?;
+        if eager_index_build {
+            self.checkpoint_indexes(epoch);
+        }
         self.clear_result_cache();
         Ok(epoch)
     }
@@ -2780,7 +2795,6 @@ impl Table {
     /// "compose primitives" surface (`semsearch ∩ fm_contains ∩ cat_in`).
     pub fn query(&mut self, q: &crate::query::Query) -> Result<Vec<Row>> {
         self.ensure_indexes_complete()?;
-        use std::collections::HashSet;
         let snapshot = self.snapshot();
         // A conjunction with no predicates matches every visible row (the
         // documented "Empty ⇒ all rows" contract); `intersect_sets` of zero
@@ -2788,13 +2802,11 @@ impl Table {
         if q.conditions.is_empty() {
             return self.visible_rows(snapshot);
         }
-        let mut sets: Vec<HashSet<u64>> = Vec::with_capacity(q.conditions.len());
+        let mut sets: Vec<RowIdSet> = Vec::with_capacity(q.conditions.len());
         for c in &q.conditions {
             sets.push(self.resolve_condition(c, snapshot)?);
         }
-        let candidates = intersect_sets(sets);
-        let mut rids: Vec<u64> = candidates.into_iter().collect();
-        rids.sort_unstable();
+        let rids = RowIdSet::intersect_many(sets).into_sorted_vec();
         self.rows_for_rids(&rids, snapshot)
     }
 
@@ -2948,28 +2960,25 @@ impl Table {
         fk_conditions: &[crate::query::Condition],
         snapshot: Snapshot,
     ) -> Result<Vec<u64>> {
-        use std::collections::HashSet;
         let Some(b) = self.bitmap.get(&fk_column_id) else {
             return Ok(Vec::new());
         };
-        let mut join_set: HashSet<u64> = {
+        let mut join_set = {
             let mut acc = roaring::RoaringBitmap::new();
             for v in pk_values {
                 acc |= b.get(v);
             }
-            acc.iter().map(|x| x as u64).collect()
+            RowIdSet::from_roaring(acc)
         };
         if !fk_conditions.is_empty() {
-            let mut sets: Vec<HashSet<u64>> = Vec::with_capacity(fk_conditions.len() + 1);
-            sets.push(std::mem::take(&mut join_set));
+            let mut sets: Vec<RowIdSet> = Vec::with_capacity(fk_conditions.len() + 1);
+            sets.push(join_set);
             for c in fk_conditions {
                 sets.push(self.resolve_condition(c, snapshot)?);
             }
-            join_set = intersect_sets(sets);
+            join_set = RowIdSet::intersect_many(sets);
         }
-        let mut out: Vec<u64> = join_set.into_iter().collect();
-        out.sort_unstable();
-        Ok(out)
+        Ok(join_set.into_sorted_vec())
     }
 
     /// Like [`fk_join_row_ids`] but returns only the **cardinality** of the FK
@@ -2984,7 +2993,6 @@ impl Table {
         fk_conditions: &[crate::query::Condition],
         snapshot: Snapshot,
     ) -> Result<u64> {
-        use std::collections::HashSet;
         let Some(b) = self.bitmap.get(&fk_column_id) else {
             return Ok(0);
         };
@@ -2995,13 +3003,12 @@ impl Table {
         if fk_conditions.is_empty() {
             return Ok(acc.len());
         }
-        let mut join_set: HashSet<u64> = acc.iter().map(|x| x as u64).collect();
-        let mut sets: Vec<HashSet<u64>> = Vec::with_capacity(fk_conditions.len() + 1);
-        sets.push(std::mem::take(&mut join_set));
+        let mut sets: Vec<RowIdSet> = Vec::with_capacity(fk_conditions.len() + 1);
+        sets.push(RowIdSet::from_roaring(acc));
         for c in fk_conditions {
             sets.push(self.resolve_condition(c, snapshot)?);
         }
-        Ok(intersect_sets(sets).len() as u64)
+        Ok(RowIdSet::intersect_many(sets).len() as u64)
     }
 
     /// Resolve a single condition to its row-id set. Index-served conditions use
@@ -3012,7 +3019,7 @@ impl Table {
         &self,
         c: &crate::query::Condition,
         snapshot: Snapshot,
-    ) -> Result<std::collections::HashSet<u64>> {
+    ) -> Result<RowIdSet> {
         use crate::query::Condition;
         Ok(match c {
             Condition::Pk(key) => {
@@ -3023,15 +3030,15 @@ impl Table {
                     .unwrap_or_else(|| key.clone());
                 self.hot
                     .get(&lookup)
-                    .map(|r| std::iter::once(r.0).collect())
-                    .unwrap_or_default()
+                    .map(|r| RowIdSet::one(r.0))
+                    .unwrap_or_else(RowIdSet::empty)
             }
             Condition::BitmapEq { column_id, value } => {
                 let lookup = self.index_lookup_key_bytes(*column_id, value);
                 self.bitmap
                     .get(column_id)
-                    .map(|b| b.get(&lookup).iter().map(|x| x as u64).collect())
-                    .unwrap_or_default()
+                    .map(|b| RowIdSet::from_roaring(b.get(&lookup)))
+                    .unwrap_or_else(RowIdSet::empty)
             }
             Condition::BitmapIn { column_id, values } => {
                 let bm = self.bitmap.get(column_id);
@@ -3042,13 +3049,15 @@ impl Table {
                         acc |= b.get(&lookup);
                     }
                 }
-                acc.iter().map(|x| x as u64).collect()
+                RowIdSet::from_roaring(acc)
             }
             Condition::FmContains { column_id, pattern } => self
                 .fm
                 .get(column_id)
-                .map(|f| f.locate(pattern).into_iter().map(|r| r.0).collect())
-                .unwrap_or_default(),
+                .map(|f| {
+                    RowIdSet::from_unsorted(f.locate(pattern).into_iter().map(|r| r.0).collect())
+                })
+                .unwrap_or_else(RowIdSet::empty),
             Condition::Ann {
                 column_id,
                 query,
@@ -3056,8 +3065,12 @@ impl Table {
             } => self
                 .ann
                 .get(column_id)
-                .map(|a| a.search(query, *k).into_iter().map(|(r, _)| r.0).collect())
-                .unwrap_or_default(),
+                .map(|a| {
+                    RowIdSet::from_unsorted(
+                        a.search(query, *k).into_iter().map(|(r, _)| r.0).collect(),
+                    )
+                })
+                .unwrap_or_else(RowIdSet::empty),
             Condition::SparseMatch {
                 column_id,
                 query,
@@ -3065,8 +3078,12 @@ impl Table {
             } => self
                 .sparse
                 .get(column_id)
-                .map(|s| s.search(query, *k).into_iter().map(|(r, _)| r.0).collect())
-                .unwrap_or_default(),
+                .map(|s| {
+                    RowIdSet::from_unsorted(
+                        s.search(query, *k).into_iter().map(|(r, _)| r.0).collect(),
+                    )
+                })
+                .unwrap_or_else(RowIdSet::empty),
             Condition::Range { column_id, lo, hi } => {
                 // Build the candidate set from the durable tier — the learned
                 // index (built from sorted runs) or a single page-pruned run —
@@ -3077,16 +3094,14 @@ impl Table {
                 // merge, rows still in the memtable are invisible to a ranged
                 // read whenever a LearnedRange index is present.
                 let mut set = if let Some(li) = self.learned_range.get(column_id) {
-                    li.range(*lo, *hi)
+                    RowIdSet::from_unsorted(li.range(*lo, *hi).into_iter().collect())
                 } else if self.run_refs.len() == 1 {
                     let mut r = self.open_reader(self.run_refs[0].run_id)?;
-                    r.range_row_ids_i64(*column_id, *lo, *hi)?
+                    r.range_row_id_set_i64(*column_id, *lo, *hi)?
                 } else {
                     return self.range_scan_i64(*column_id, *lo, *hi, snapshot);
                 };
-                for rid in self.overlay_rid_set(snapshot) {
-                    set.remove(&rid);
-                }
+                set.remove_many(self.overlay_rid_set(snapshot));
                 self.range_scan_overlay_i64(&mut set, *column_id, *lo, *hi, snapshot);
                 set
             }
@@ -3100,10 +3115,14 @@ impl Table {
                 // See the `Range` arm: merge the overlay over the durable
                 // candidate set so memtable/mutable-run rows are visible.
                 let mut set = if let Some(li) = self.learned_range.get(column_id) {
-                    li.range_f64(*lo, *lo_inclusive, *hi, *hi_inclusive)
+                    RowIdSet::from_unsorted(
+                        li.range_f64(*lo, *lo_inclusive, *hi, *hi_inclusive)
+                            .into_iter()
+                            .collect(),
+                    )
                 } else if self.run_refs.len() == 1 {
                     let mut r = self.open_reader(self.run_refs[0].run_id)?;
-                    r.range_row_ids_f64(*column_id, *lo, *lo_inclusive, *hi, *hi_inclusive)?
+                    r.range_row_id_set_f64(*column_id, *lo, *lo_inclusive, *hi, *hi_inclusive)?
                 } else {
                     return self.range_scan_f64(
                         *column_id,
@@ -3114,9 +3133,7 @@ impl Table {
                         snapshot,
                     );
                 };
-                for rid in self.overlay_rid_set(snapshot) {
-                    set.remove(&rid);
-                }
+                set.remove_many(self.overlay_rid_set(snapshot));
                 self.range_scan_overlay_f64(
                     &mut set,
                     *column_id,
@@ -3144,18 +3161,19 @@ impl Table {
         lo: i64,
         hi: i64,
         snapshot: Snapshot,
-    ) -> Result<HashSet<u64>> {
-        let mut s = HashSet::new();
+    ) -> Result<RowIdSet> {
+        let mut row_ids = Vec::new();
         let overlay_rids = self.overlay_rid_set(snapshot);
         for rr in &self.run_refs {
             let mut reader = self.open_reader(rr.run_id)?;
             let matched = reader.range_row_ids_visible_i64(column_id, lo, hi, snapshot.epoch)?;
             for rid in matched {
                 if !overlay_rids.contains(&rid) {
-                    s.insert(rid);
+                    row_ids.push(rid);
                 }
             }
         }
+        let mut s = RowIdSet::from_unsorted(row_ids);
         self.range_scan_overlay_i64(&mut s, column_id, lo, hi, snapshot);
         Ok(s)
     }
@@ -3170,8 +3188,8 @@ impl Table {
         hi: f64,
         hi_inclusive: bool,
         snapshot: Snapshot,
-    ) -> Result<HashSet<u64>> {
-        let mut s = HashSet::new();
+    ) -> Result<RowIdSet> {
+        let mut row_ids = Vec::new();
         let overlay_rids = self.overlay_rid_set(snapshot);
         for rr in &self.run_refs {
             let mut reader = self.open_reader(rr.run_id)?;
@@ -3185,10 +3203,11 @@ impl Table {
             )?;
             for rid in matched {
                 if !overlay_rids.contains(&rid) {
-                    s.insert(rid);
+                    row_ids.push(rid);
                 }
             }
         }
+        let mut s = RowIdSet::from_unsorted(row_ids);
         self.range_scan_overlay_f64(
             &mut s,
             column_id,
@@ -3215,7 +3234,7 @@ impl Table {
 
     fn range_scan_overlay_i64(
         &self,
-        s: &mut HashSet<u64>,
+        s: &mut RowIdSet,
         column_id: u16,
         lo: i64,
         hi: i64,
@@ -3248,7 +3267,7 @@ impl Table {
     #[allow(clippy::too_many_arguments)]
     fn range_scan_overlay_f64(
         &self,
-        s: &mut HashSet<u64>,
+        s: &mut RowIdSet,
         column_id: u16,
         lo: f64,
         lo_inclusive: bool,
@@ -3335,6 +3354,42 @@ impl Table {
         self.live_count
     }
 
+    /// Count rows matching an index-backed conjunctive predicate without
+    /// materializing projected columns. Returns `None` when a condition cannot
+    /// be served by the native predicate resolver.
+    pub fn count_conditions(
+        &mut self,
+        conditions: &[crate::query::Condition],
+        snapshot: Snapshot,
+    ) -> Result<Option<u64>> {
+        use crate::query::Condition;
+        if conditions.is_empty() {
+            return Ok(Some(self.live_count));
+        }
+        let served = |c: &Condition| {
+            matches!(
+                c,
+                Condition::Pk(_)
+                    | Condition::BitmapEq { .. }
+                    | Condition::BitmapIn { .. }
+                    | Condition::FmContains { .. }
+                    | Condition::Ann { .. }
+                    | Condition::Range { .. }
+                    | Condition::RangeF64 { .. }
+                    | Condition::SparseMatch { .. }
+            )
+        };
+        if !conditions.iter().all(served) {
+            return Ok(None);
+        }
+        self.ensure_indexes_complete()?;
+        let mut sets = Vec::with_capacity(conditions.len());
+        for condition in conditions {
+            sets.push(self.resolve_condition(condition, snapshot)?);
+        }
+        Ok(Some(RowIdSet::intersect_many(sets).len() as u64))
+    }
+
     /// Bulk-load typed columns straight to a new run — the fast ingest path.
     /// Bypasses the WAL, the memtable, and the `Value` enum entirely; writes one
     /// compressed run (delta for sorted Int64, dictionary for low-card Bytes)
@@ -3376,6 +3431,10 @@ impl Table {
         let live_before = self.live_count;
         // Spill pending mutable-run data before the Flush marker + WAL rotation.
         self.spill_mutable_run(epoch)?;
+        let eager_index_build = self.indexes_complete
+            && self.run_refs.is_empty()
+            && self.memtable.is_empty()
+            && self.mutable_run.is_empty();
         // Enforce NOT NULL constraints and primary-key upsert semantics before
         // any row id is allocated or bytes hit the run file.
         self.fill_auto_inc_native_columns(&mut user_columns, n)?;
@@ -3424,10 +3483,22 @@ impl Table {
             row_count: header.row_count,
         });
         self.live_count = self.live_count.saturating_add(write_n as u64);
-        // Phase 14.7: defer index building off the ingest critical path.
-        self.indexes_complete = false;
+        if eager_index_build {
+            let row_ids: Vec<u64> = (first..first + write_n as u64).collect();
+            self.index_columns_bulk(&write_columns, &row_ids);
+            self.indexes_complete = true;
+            self.build_learned_ranges()?;
+        } else {
+            // Phase 14.7: defer index building off the ingest critical path for
+            // non-empty tables where cross-run PK/update semantics must be
+            // reconstructed from durable state.
+            self.indexes_complete = false;
+        }
         self.mark_flushed(epoch)?;
         self.persist_manifest(epoch)?;
+        if eager_index_build {
+            self.checkpoint_indexes(epoch);
+        }
         self.clear_result_cache();
         Ok(epoch)
     }
@@ -3449,7 +3520,6 @@ impl Table {
     /// embeddings, so an `Embedding` column can never reach this path (a native
     /// bulk load of an embedding schema fails at encode). LearnedRange is built
     /// separately from the runs by [`Self::build_learned_ranges`].
-    #[allow(dead_code)]
     fn index_columns_bulk(&mut self, columns: &[(u16, columnar::NativeColumn)], row_ids: &[u64]) {
         let n = row_ids.len();
         if n == 0 {
@@ -3634,7 +3704,7 @@ impl Table {
         if self.run_refs.len() == 1 {
             if let Ok(mut reader) = self.open_reader(self.run_refs[0].run_id) {
                 if let Ok(rids) = self.resolve_survivor_rids(conditions, &mut reader) {
-                    return rids.iter().map(|r| *r as u32).collect();
+                    return rids.to_roaring_lossy();
                 }
             }
         }
@@ -3720,7 +3790,6 @@ impl Table {
         snapshot: Snapshot,
     ) -> Result<Option<Vec<(u16, columnar::NativeColumn)>>> {
         use crate::query::Condition;
-        use std::collections::HashSet;
         if conditions.is_empty() {
             return Ok(None);
         }
@@ -3764,77 +3833,41 @@ impl Table {
         } else {
             None
         };
-        // Pre-read the row-id column once (reused for range filtering and, on the
-        // fast path, for survivor position lookup).
-        let row_id_data: Option<Vec<i64>> = if fast_path && needs_column {
-            let r = reader_opt.as_mut().expect("reader opened for range");
-            let col = r.column_native(crate::sorted_run::SYS_ROW_ID)?;
-            match col {
-                columnar::NativeColumn::Int64 { data, .. } => Some(data),
-                _ => return Err(MongrelError::InvalidArgument("sys row_id not int64".into())),
-            }
-        } else {
-            None
-        };
 
-        let mut sets: Vec<HashSet<u64>> = Vec::new();
+        let mut sets: Vec<RowIdSet> = Vec::new();
         for c in conditions {
-            let s: HashSet<u64> = match c {
-                Condition::Pk(key) => self
-                    .hot
-                    .get(key)
-                    .map(|r| std::iter::once(r.0).collect())
-                    .unwrap_or_default(),
-                Condition::BitmapEq { column_id, value } => self
-                    .bitmap
-                    .get(column_id)
-                    .map(|b| b.get(value).iter().map(|x| x as u64).collect())
-                    .unwrap_or_default(),
-                Condition::BitmapIn { column_id, values } => {
-                    let bm = self.bitmap.get(column_id);
-                    let mut acc = roaring::RoaringBitmap::new();
-                    if let Some(b) = bm {
-                        for v in values {
-                            acc |= b.get(v);
-                        }
+            let s = match c {
+                Condition::Range { column_id, lo, hi }
+                    if fast_path && !self.learned_range.contains_key(column_id) =>
+                {
+                    if reader_opt.is_none() {
+                        reader_opt = Some(self.open_reader(self.run_refs[0].run_id)?);
                     }
-                    acc.iter().map(|x| x as u64).collect()
+                    reader_opt
+                        .as_mut()
+                        .expect("reader opened for range")
+                        .range_row_id_set_i64(*column_id, *lo, *hi)?
                 }
-                Condition::FmContains { column_id, pattern } => self
-                    .fm
-                    .get(column_id)
-                    .map(|f| f.locate(pattern).into_iter().map(|r| r.0).collect())
-                    .unwrap_or_default(),
-                Condition::Ann {
+                Condition::RangeF64 {
                     column_id,
-                    query,
-                    k,
-                } => self
-                    .ann
-                    .get(column_id)
-                    .map(|a| a.search(query, *k).into_iter().map(|(r, _)| r.0).collect())
-                    .unwrap_or_default(),
-                Condition::SparseMatch {
-                    column_id,
-                    query,
-                    k,
-                } => self
-                    .sparse
-                    .get(column_id)
-                    .map(|s| s.search(query, *k).into_iter().map(|(r, _)| r.0).collect())
-                    .unwrap_or_default(),
-                Condition::Range { .. } | Condition::RangeF64 { .. } => {
-                    // Delegate to `resolve_condition`, which merges the
-                    // memtable/mutable-run overlay over the learned-index /
-                    // single-run candidate set in every sub-case. Duplicating
-                    // the merge here would silently drift again (this path is
-                    // marked Exact pushdown, so DataFusion does not re-filter).
-                    self.resolve_condition(c, snapshot)?
+                    lo,
+                    lo_inclusive,
+                    hi,
+                    hi_inclusive,
+                } if fast_path && !self.learned_range.contains_key(column_id) => {
+                    if reader_opt.is_none() {
+                        reader_opt = Some(self.open_reader(self.run_refs[0].run_id)?);
+                    }
+                    reader_opt
+                        .as_mut()
+                        .expect("reader opened for range")
+                        .range_row_id_set_f64(*column_id, *lo, *lo_inclusive, *hi, *hi_inclusive)?
                 }
+                _ => self.resolve_condition(c, snapshot)?,
             };
             sets.push(s);
         }
-        let candidates = intersect_sets(sets);
+        let candidates = RowIdSet::intersect_many(sets);
 
         // Build column list (projected or all user columns).
         let col_ids: Vec<u16> = projection
@@ -3866,32 +3899,23 @@ impl Table {
                 Some(r) => r,
                 None => self.open_reader(self.run_refs[0].run_id)?,
             };
-            let positions = match &row_id_data {
-                Some(ids) => {
-                    let mut p: Vec<usize> = candidates
-                        .iter()
-                        .filter_map(|rid| ids.binary_search(&(*rid as i64)).ok())
-                        .collect();
-                    p.sort_unstable();
-                    p
-                }
-                None => {
-                    let col = reader.column_native(crate::sorted_run::SYS_ROW_ID)?;
-                    match col {
-                        columnar::NativeColumn::Int64 { data, .. } => {
-                            let mut p: Vec<usize> = candidates
-                                .iter()
-                                .filter_map(|rid| data.binary_search(&(*rid as i64)).ok())
-                                .collect();
-                            p.sort_unstable();
-                            p
-                        }
-                        _ => {
-                            return Err(MongrelError::InvalidArgument(
-                                "sys row_id not int64".into(),
-                            ))
-                        }
+            let candidate_ids = candidates.into_sorted_vec();
+            let positions = if let Some(positions) =
+                reader.positions_for_row_ids_fast(&candidate_ids)
+            {
+                positions
+            } else {
+                let col = reader.column_native(crate::sorted_run::SYS_ROW_ID)?;
+                match col {
+                    columnar::NativeColumn::Int64 { data, .. } => {
+                        let mut p: Vec<usize> = candidate_ids
+                            .iter()
+                            .filter_map(|rid| data.binary_search(&(*rid as i64)).ok())
+                            .collect();
+                        p.sort_unstable();
+                        p
                     }
+                    _ => return Err(MongrelError::InvalidArgument("sys row_id not int64".into())),
                 }
             };
             let mut cols = Vec::with_capacity(col_ids.len());
@@ -3907,8 +3931,7 @@ impl Table {
         // `rows_for_rids` and pivot to native columns. Correct for any layout
         // (the fast path's single-reader gather is only an optimization). This
         // keeps `Exact` pushdown honest when the fast path doesn't apply.
-        let mut rids: Vec<u64> = candidates.into_iter().collect();
-        rids.sort_unstable();
+        let rids = candidates.into_sorted_vec();
         let rows = self.rows_for_rids(&rids, snapshot)?;
         let mut cols: Vec<(u16, columnar::NativeColumn)> = Vec::with_capacity(col_ids.len());
         for cid in &col_ids {
@@ -3983,22 +4006,19 @@ impl Table {
         // from the survivor set. When there are no conditions, we synthesize a
         // survivor set = (all visible run rids) − (overlay rids) so the stale
         // run rows are pruned.
-        let run_survivors: Option<HashSet<u64>> = if overlay_rids.is_empty() {
+        let run_survivors: Option<RowIdSet> = if overlay_rids.is_empty() {
             survivors.clone()
         } else if let Some(s) = &survivors {
-            Some(
-                s.iter()
-                    .filter(|r| !overlay_rids.contains(r))
-                    .copied()
-                    .collect(),
-            )
+            let mut run_set = s.clone();
+            run_set.remove_many(overlay_rids.iter().copied());
+            Some(run_set)
         } else {
-            Some(
+            Some(RowIdSet::from_unsorted(
                 rids.iter()
                     .map(|&r| r as u64)
                     .filter(|r| !overlay_rids.contains(r))
                     .collect(),
-            )
+            ))
         };
 
         let overlay_rows = if overlay_rids.is_empty() {
@@ -4102,14 +4122,14 @@ impl Table {
         };
 
         // Predicate survivors (global, layout-independent).
-        let survivors: Option<HashSet<u64>> = if conditions.is_empty() {
+        let survivors: Option<RowIdSet> = if conditions.is_empty() {
             None
         } else {
-            let mut sets: Vec<HashSet<u64>> = Vec::with_capacity(conditions.len());
+            let mut sets: Vec<RowIdSet> = Vec::with_capacity(conditions.len());
             for c in conditions {
                 sets.push(self.resolve_condition(c, snapshot)?);
             }
-            Some(intersect_sets(sets))
+            Some(RowIdSet::intersect_many(sets))
         };
 
         // Per-run owned survivors: (rid, position), ascending by rid. A row is
@@ -4124,7 +4144,7 @@ impl Table {
                 continue;
             }
             if let Some(s) = &survivors {
-                if !s.contains(rid) {
+                if !s.contains(*rid) {
                     continue;
                 }
             }
@@ -4226,7 +4246,7 @@ impl Table {
         &self,
         rows: Vec<Row>,
         conditions: &[crate::query::Condition],
-        survivors: Option<&HashSet<u64>>,
+        survivors: Option<&RowIdSet>,
         snapshot: Snapshot,
     ) -> Result<Vec<Row>> {
         if conditions.is_empty() {
@@ -4242,15 +4262,15 @@ impl Table {
         if all_index_served {
             return Ok(rows
                 .into_iter()
-                .filter(|r| survivors.map_or(true, |s| s.contains(&r.row_id.0)))
+                .filter(|r| survivors.map_or(true, |s| s.contains(r.row_id.0)))
                 .collect());
         }
         // Mixed: compute per-condition index sets for non-range conditions, and
         // evaluate range conditions directly on column values.
-        let mut per_cond_sets: Vec<HashSet<u64>> = Vec::with_capacity(conditions.len());
+        let mut per_cond_sets: Vec<RowIdSet> = Vec::with_capacity(conditions.len());
         for c in conditions {
             let s = match c {
-                Condition::Range { .. } | Condition::RangeF64 { .. } => HashSet::new(),
+                Condition::Range { .. } | Condition::RangeF64 { .. } => RowIdSet::empty(),
                 _ => self.resolve_condition(c, snapshot)?,
             };
             per_cond_sets.push(s);
@@ -4272,7 +4292,7 @@ impl Table {
                             _ => false,
                         }
                     }
-                    _ => per_cond_sets[i].contains(&row.row_id.0),
+                    _ => per_cond_sets[i].contains(row.row_id.0),
                 })
             })
             .collect())
@@ -4307,36 +4327,49 @@ impl Table {
         &self,
         conditions: &[crate::query::Condition],
         reader: &mut RunReader,
-    ) -> Result<std::collections::HashSet<u64>> {
+    ) -> Result<RowIdSet> {
         use crate::query::Condition;
-        let mut sets: Vec<std::collections::HashSet<u64>> = Vec::new();
+        let mut sets: Vec<RowIdSet> = Vec::new();
         for c in conditions {
-            let s: std::collections::HashSet<u64> = match c {
-                Condition::Pk(key) => self
-                    .hot
-                    .get(key)
-                    .map(|r| std::iter::once(r.0).collect())
-                    .unwrap_or_default(),
-                Condition::BitmapEq { column_id, value } => self
-                    .bitmap
-                    .get(column_id)
-                    .map(|b| b.get(value).iter().map(|x| x as u64).collect())
-                    .unwrap_or_default(),
+            let s: RowIdSet = match c {
+                Condition::Pk(key) => {
+                    let lookup = self
+                        .schema
+                        .primary_key()
+                        .map(|pk| self.index_lookup_key_bytes(pk.id, key))
+                        .unwrap_or_else(|| key.clone());
+                    self.hot
+                        .get(&lookup)
+                        .map(|r| RowIdSet::one(r.0))
+                        .unwrap_or_else(RowIdSet::empty)
+                }
+                Condition::BitmapEq { column_id, value } => {
+                    let lookup = self.index_lookup_key_bytes(*column_id, value);
+                    self.bitmap
+                        .get(column_id)
+                        .map(|b| RowIdSet::from_roaring(b.get(&lookup)))
+                        .unwrap_or_else(RowIdSet::empty)
+                }
                 Condition::BitmapIn { column_id, values } => {
                     let bm = self.bitmap.get(column_id);
                     let mut acc = roaring::RoaringBitmap::new();
                     if let Some(b) = bm {
                         for v in values {
-                            acc |= b.get(v);
+                            let lookup = self.index_lookup_key_bytes(*column_id, v);
+                            acc |= b.get(&lookup);
                         }
                     }
-                    acc.iter().map(|x| x as u64).collect()
+                    RowIdSet::from_roaring(acc)
                 }
                 Condition::FmContains { column_id, pattern } => self
                     .fm
                     .get(column_id)
-                    .map(|f| f.locate(pattern).into_iter().map(|r| r.0).collect())
-                    .unwrap_or_default(),
+                    .map(|f| {
+                        RowIdSet::from_unsorted(
+                            f.locate(pattern).into_iter().map(|r| r.0).collect(),
+                        )
+                    })
+                    .unwrap_or_else(RowIdSet::empty),
                 Condition::Ann {
                     column_id,
                     query,
@@ -4344,8 +4377,12 @@ impl Table {
                 } => self
                     .ann
                     .get(column_id)
-                    .map(|a| a.search(query, *k).into_iter().map(|(r, _)| r.0).collect())
-                    .unwrap_or_default(),
+                    .map(|a| {
+                        RowIdSet::from_unsorted(
+                            a.search(query, *k).into_iter().map(|(r, _)| r.0).collect(),
+                        )
+                    })
+                    .unwrap_or_else(RowIdSet::empty),
                 Condition::SparseMatch {
                     column_id,
                     query,
@@ -4353,13 +4390,17 @@ impl Table {
                 } => self
                     .sparse
                     .get(column_id)
-                    .map(|s| s.search(query, *k).into_iter().map(|(r, _)| r.0).collect())
-                    .unwrap_or_default(),
+                    .map(|s| {
+                        RowIdSet::from_unsorted(
+                            s.search(query, *k).into_iter().map(|(r, _)| r.0).collect(),
+                        )
+                    })
+                    .unwrap_or_else(RowIdSet::empty),
                 Condition::Range { column_id, lo, hi } => {
                     if let Some(li) = self.learned_range.get(column_id) {
-                        li.range(*lo, *hi)
+                        RowIdSet::from_unsorted(li.range(*lo, *hi).into_iter().collect())
                     } else {
-                        reader.range_row_ids_i64(*column_id, *lo, *hi)?
+                        reader.range_row_id_set_i64(*column_id, *lo, *hi)?
                     }
                 }
                 Condition::RangeF64 {
@@ -4370,9 +4411,13 @@ impl Table {
                     hi_inclusive,
                 } => {
                     if let Some(li) = self.learned_range.get(column_id) {
-                        li.range_f64(*lo, *lo_inclusive, *hi, *hi_inclusive)
+                        RowIdSet::from_unsorted(
+                            li.range_f64(*lo, *lo_inclusive, *hi, *hi_inclusive)
+                                .into_iter()
+                                .collect(),
+                        )
                     } else {
-                        reader.range_row_ids_f64(
+                        reader.range_row_id_set_f64(
                             *column_id,
                             *lo,
                             *lo_inclusive,
@@ -4384,7 +4429,7 @@ impl Table {
             };
             sets.push(s);
         }
-        Ok(intersect_sets(sets))
+        Ok(RowIdSet::intersect_many(sets))
     }
 
     /// Native vectorized aggregate over a (possibly filtered) column on the
@@ -4565,7 +4610,7 @@ impl Table {
         &self,
         conditions: &[crate::query::Condition],
         snapshot: Snapshot,
-    ) -> Result<Vec<std::collections::HashSet<u64>>> {
+    ) -> Result<Vec<RowIdSet>> {
         use crate::query::Condition;
         let mut sets = Vec::new();
         for c in conditions {
@@ -4601,7 +4646,6 @@ impl Table {
         z: f64,
     ) -> Result<Option<ApproxResult>> {
         use crate::query::Condition;
-        use std::collections::HashSet;
         let snapshot = self.snapshot();
         let n_pop = self.live_count;
         let sample_rids: Vec<u64> = self.reservoir.row_ids().to_vec();
@@ -4617,7 +4661,7 @@ impl Table {
 
         // Pre-resolve Ann/Sparse conditions (index-defined predicates) to row-id
         // sets; the per-row predicates below are evaluated exactly.
-        let mut index_sets: Vec<HashSet<u64>> = Vec::new();
+        let mut index_sets: Vec<RowIdSet> = Vec::new();
         for c in conditions {
             if matches!(c, Condition::Ann { .. } | Condition::SparseMatch { .. }) {
                 index_sets.push(self.resolve_condition(c, snapshot)?);
@@ -4640,7 +4684,7 @@ impl Table {
                 continue;
             }
             // Ann/Sparse membership.
-            if !index_sets.iter().all(|set| set.contains(&r.row_id.0)) {
+            if !index_sets.iter().all(|set| set.contains(r.row_id.0)) {
                 continue;
             }
             if let Some(cid) = cid {
@@ -4674,7 +4718,7 @@ impl Table {
                         let passes_row = conditions
                             .iter()
                             .all(|c| condition_matches_row(c, r, &self.schema))
-                            && index_sets.iter().all(|set| set.contains(&r.row_id.0));
+                            && index_sets.iter().all(|set| set.contains(r.row_id.0));
                         if passes_row {
                             cid.and_then(|c| as_f64(r.columns.get(&c))).unwrap_or(0.0)
                         } else {
@@ -5115,14 +5159,6 @@ impl Table {
     }
 }
 
-fn intersect_sets(sets: Vec<std::collections::HashSet<u64>>) -> std::collections::HashSet<u64> {
-    let mut iter = sets.into_iter();
-    match iter.next() {
-        None => std::collections::HashSet::new(),
-        Some(first) => iter.fold(first, |acc, s| acc.intersection(&s).copied().collect()),
-    }
-}
-
 fn native_int64_strictly_increasing(col: &columnar::NativeColumn, n: usize) -> bool {
     let columnar::NativeColumn::Int64 { data, validity } = col else {
         return false;
@@ -5332,7 +5368,7 @@ pub struct IncrementalAggResult {
 fn agg_state_from_rows(
     rows: &[Row],
     conditions: &[crate::query::Condition],
-    index_sets: &[std::collections::HashSet<u64>],
+    index_sets: &[RowIdSet],
     column: Option<u16>,
     agg: NativeAgg,
     schema: &Schema,
@@ -5353,7 +5389,7 @@ fn agg_state_from_rows(
         {
             continue;
         }
-        if !index_sets.iter().all(|s| s.contains(&r.row_id.0)) {
+        if !index_sets.iter().all(|s| s.contains(r.row_id.0)) {
             continue;
         }
         match agg {
