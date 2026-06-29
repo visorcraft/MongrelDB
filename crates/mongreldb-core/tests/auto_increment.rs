@@ -301,6 +301,73 @@ fn row_major_bulk_load_seeds_counter_when_table_was_empty() {
 }
 
 #[test]
+fn bulk_load_columns_fills_omitted_auto_inc_pk() {
+    let dir = tempdir().unwrap();
+    let mut t = Table::create(dir.path(), ai_int_schema(), 1).unwrap();
+    t.bulk_load_columns(vec![(2, int_col(vec![100, 101, 102]))])
+        .unwrap();
+
+    let rows = t.query(&Query::default()).unwrap();
+    let ids: Vec<i64> = rows
+        .iter()
+        .map(|r| match r.columns.get(&1) {
+            Some(Value::Int64(n)) => *n,
+            _ => panic!("expected generated id"),
+        })
+        .collect();
+    assert_eq!(ids, vec![1, 2, 3]);
+
+    let m = manifest::read(dir.path(), None).unwrap();
+    assert_eq!(m.auto_inc_next, 4);
+}
+
+#[test]
+fn row_major_bulk_load_fills_omitted_auto_inc_pk() {
+    let dir = tempdir().unwrap();
+    let mut t = Table::create(dir.path(), ai_int_schema(), 1).unwrap();
+    t.bulk_load(vec![
+        vec![(2, Value::Int64(100))],
+        vec![(2, Value::Int64(101))],
+        vec![(2, Value::Int64(102))],
+    ])
+    .unwrap();
+
+    let rows = t.query(&Query::default()).unwrap();
+    let ids: Vec<i64> = rows
+        .iter()
+        .map(|r| match r.columns.get(&1) {
+            Some(Value::Int64(n)) => *n,
+            _ => panic!("expected generated id"),
+        })
+        .collect();
+    assert_eq!(ids, vec![1, 2, 3]);
+
+    let m = manifest::read(dir.path(), None).unwrap();
+    assert_eq!(m.auto_inc_next, 4);
+}
+
+#[test]
+fn generated_put_after_lazy_bulk_indexing_remains_queryable() {
+    let dir = tempdir().unwrap();
+    let mut t = Table::create(dir.path(), ai_int_schema(), 1).unwrap();
+    t.bulk_load_columns(vec![
+        (1, int_col(vec![1, 2, 3])),
+        (2, int_col(vec![10, 20, 30])),
+    ])
+    .unwrap();
+
+    let (_, assigned) = t.put_returning(vec![(2, Value::Int64(40))]).unwrap();
+    assert_eq!(assigned, Some(4));
+    t.commit().unwrap();
+
+    let old = t.query(&Query::pk(Value::Int64(1).encode_key())).unwrap();
+    assert_eq!(old.len(), 1);
+    let new = t.query(&Query::pk(Value::Int64(4).encode_key())).unwrap();
+    assert_eq!(new.len(), 1);
+    assert_eq!(t.count(), 4);
+}
+
+#[test]
 fn delete_after_lazy_bulk_indexing_hides_auto_inc_pk() {
     let dir = tempdir().unwrap();
     let mut t = Table::create(dir.path(), ai_int_schema(), 1).unwrap();

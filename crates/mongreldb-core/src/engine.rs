@@ -190,6 +190,7 @@ pub struct Table {
     /// concurrent reader can never observe them before their commit epoch.
     /// Always empty on a standalone (private-WAL) table, which applies inline.
     pending_rows: Vec<Row>,
+    pending_rows_auto_inc: Vec<bool>,
     /// B1/B2: tombstones staged on a mounted table, applied at the assigned
     /// epoch in `commit` (mirror of `pending_rows`).
     pending_dels: Vec<RowId>,
@@ -948,6 +949,7 @@ impl Table {
             pending_delete_rids: roaring::RoaringBitmap::new(),
             pending_put_cols: std::collections::HashSet::new(),
             pending_rows: Vec::new(),
+            pending_rows_auto_inc: Vec::new(),
             pending_dels: Vec::new(),
             wal_dek,
             auto_inc,
@@ -1155,6 +1157,7 @@ impl Table {
             pending_delete_rids: roaring::RoaringBitmap::new(),
             pending_put_cols: std::collections::HashSet::new(),
             pending_rows: Vec::new(),
+            pending_rows_auto_inc: Vec::new(),
             pending_dels: Vec::new(),
             wal_dek,
             auto_inc,
@@ -1257,6 +1260,11 @@ impl Table {
     fn rebuild_indexes_from_runs(&mut self) -> Result<()> {
         self.hot = HotIndex::new();
         self.pk_by_row.clear();
+        let (bitmap, ann, fm, sparse) = empty_indexes(&self.schema);
+        self.bitmap = bitmap;
+        self.ann = ann;
+        self.fm = fm;
+        self.sparse = sparse;
         let snapshot = Epoch(u64::MAX);
         for rr in self.run_refs.clone() {
             let mut reader = self.open_reader(rr.run_id)?;
@@ -1271,6 +1279,20 @@ impl Table {
                     &mut self.fm,
                     &mut self.sparse,
                 );
+            }
+        }
+        for row in self.mutable_run.visible_versions(snapshot) {
+            if row.deleted {
+                self.remove_hot_for_row(row.row_id, snapshot);
+            } else {
+                self.index_row(&row);
+            }
+        }
+        for row in self.memtable.visible_versions(snapshot) {
+            if row.deleted {
+                self.remove_hot_for_row(row.row_id, snapshot);
+            } else {
+                self.index_row(&row);
             }
         }
         self.refresh_pk_by_row_from_hot();
@@ -1447,7 +1469,7 @@ impl Table {
         for (col_id, val) in columns {
             row.columns.insert(col_id, val);
         }
-        self.commit_rows(vec![row])?;
+        self.commit_rows(vec![row], assigned.is_some())?;
         Ok((row_id, assigned))
     }
 
@@ -1491,7 +1513,8 @@ impl Table {
             ids.push((row_id, assigned));
             rows.push(row);
         }
-        self.commit_rows(rows)?;
+        let all_auto_generated = ids.iter().all(|(_, assigned)| assigned.is_some());
+        self.commit_rows(rows, all_auto_generated)?;
         Ok(ids)
     }
 
@@ -1566,6 +1589,9 @@ impl Table {
         if !needs_seed {
             return Ok(());
         }
+        if self.seed_empty_auto_inc() {
+            return Ok(());
+        }
         let cid = self
             .auto_inc
             .as_ref()
@@ -1581,20 +1607,74 @@ impl Table {
         Ok(())
     }
 
+    fn alloc_auto_inc_range(&mut self, n: usize) -> Result<Option<i64>> {
+        if n == 0 || self.auto_inc.is_none() {
+            return Ok(None);
+        }
+        self.ensure_auto_inc_seeded()?;
+        let ai = self.auto_inc.as_mut().expect("auto-inc column present");
+        let start = ai.next;
+        ai.next = ai.next.saturating_add(n as i64);
+        Ok(Some(start))
+    }
+
     /// One-time `max(Int64 column)` over all MVCC-visible rows. Used to seed the
     /// auto-increment counter. Runs at most once per table (the manifest then
     /// checkpoints the seeded counter).
     fn scan_max_int64(&mut self, column_id: u16) -> Result<i64> {
-        let rows = self.query(&crate::query::Query::default())?;
         let mut max: i64 = 0;
-        for r in &rows {
+        for r in self.memtable.visible_versions(Epoch(u64::MAX)) {
             if let Some(Value::Int64(n)) = r.columns.get(&column_id) {
                 if *n > max {
                     max = *n;
                 }
             }
         }
+        for r in self.mutable_run.visible_versions(Epoch(u64::MAX)) {
+            if let Some(Value::Int64(n)) = r.columns.get(&column_id) {
+                if *n > max {
+                    max = *n;
+                }
+            }
+        }
+        for rr in self.run_refs.clone() {
+            let reader = self.open_reader(rr.run_id)?;
+            if let Some(stats) = reader.column_page_stats(column_id) {
+                for s in stats {
+                    if let Some(n) = crate::sorted_run::be_i64(s.max.as_deref()) {
+                        if n > max {
+                            max = n;
+                        }
+                    }
+                }
+            } else if reader.has_column(column_id) {
+                if let columnar::NativeColumn::Int64 { data, validity } =
+                    reader.column_native_shared(column_id)?
+                {
+                    for (i, n) in data.iter().enumerate() {
+                        if (validity.is_empty() || columnar::validity_bit(&validity, i)) && *n > max
+                        {
+                            max = *n;
+                        }
+                    }
+                }
+            }
+        }
         Ok(max)
+    }
+
+    fn seed_empty_auto_inc(&mut self) -> bool {
+        let Some(ai) = self.auto_inc.as_mut() else {
+            return false;
+        };
+        if ai.seeded || self.live_count != 0 {
+            return false;
+        }
+        if ai.next < 1 {
+            ai.next = 1;
+        }
+        ai.seeded = true;
+        true
     }
 
     fn advance_auto_inc_from_native_columns(
@@ -1639,6 +1719,63 @@ impl Table {
         Ok(())
     }
 
+    fn fill_auto_inc_native_columns(
+        &mut self,
+        columns: &mut Vec<(u16, columnar::NativeColumn)>,
+        n: usize,
+    ) -> Result<()> {
+        let Some(cid) = self.auto_inc.as_ref().map(|a| a.column_id) else {
+            return Ok(());
+        };
+        let Some(pos) = columns.iter().position(|(id, _)| *id == cid) else {
+            if let Some(start) = self.alloc_auto_inc_range(n)? {
+                columns.push((
+                    cid,
+                    columnar::NativeColumn::Int64 {
+                        data: (start..start.saturating_add(n as i64)).collect(),
+                        validity: vec![0xFF; n.div_ceil(8)],
+                    },
+                ));
+            }
+            return Ok(());
+        };
+
+        let columnar::NativeColumn::Int64 { data, validity } = &mut columns[pos].1 else {
+            return Err(MongrelError::InvalidArgument(format!(
+                "AUTO_INCREMENT column {cid} must be Int64"
+            )));
+        };
+        if data.len() < n {
+            return Err(MongrelError::InvalidArgument(format!(
+                "AUTO_INCREMENT column {cid} has {} rows, expected {n}",
+                data.len()
+            )));
+        }
+        if columnar::all_non_null(validity, n) {
+            return Ok(());
+        }
+        if validity.iter().all(|b| *b == 0) {
+            if let Some(start) = self.alloc_auto_inc_range(n)? {
+                for (i, slot) in data.iter_mut().take(n).enumerate() {
+                    *slot = start.saturating_add(i as i64);
+                }
+                *validity = vec![0xFF; n.div_ceil(8)];
+            }
+            return Ok(());
+        }
+
+        let new_validity = vec![0xFF; data.len().div_ceil(8)];
+        for (i, slot) in data.iter_mut().enumerate().take(n) {
+            if columnar::validity_bit(validity, i) {
+                self.advance_auto_inc_past(*slot)?;
+            } else {
+                *slot = self.alloc_auto_inc_value()?;
+            }
+        }
+        *validity = new_validity;
+        Ok(())
+    }
+
     /// Reserve (but do not insert) the next `AUTO_INCREMENT` value, advancing
     /// the in-memory counter. Returns `None` when the table has no
     /// auto-increment column.
@@ -1664,16 +1801,18 @@ impl Table {
     /// epoch hazard). On a mounted table (B1/B2) they are staged in
     /// `pending_rows` and applied at the real assigned epoch in `commit`, so a
     /// concurrent reader can never see them before their commit epoch.
-    fn commit_rows(&mut self, rows: Vec<Row>) -> Result<()> {
+    fn commit_rows(&mut self, rows: Vec<Row>, auto_inc_generated: bool) -> Result<()> {
         let payload = bincode::serialize(&rows)?;
         self.wal_append_data(Op::Put {
             table_id: self.table_id,
             rows: payload,
         })?;
         if self.is_shared() {
+            self.pending_rows_auto_inc
+                .extend(std::iter::repeat(auto_inc_generated).take(rows.len()));
             self.pending_rows.extend(rows);
         } else {
-            self.apply_put_rows(rows)?;
+            self.apply_put_rows_inner(rows, !auto_inc_generated)?;
         }
         Ok(())
     }
@@ -1683,7 +1822,13 @@ impl Table {
     /// per-table — is the caller's responsibility). Used by the cross-table
     /// `Transaction` commit path (P2.5) after it has written the shared WAL.
     pub(crate) fn apply_put_rows(&mut self, rows: Vec<Row>) -> Result<()> {
-        self.ensure_indexes_complete()?;
+        self.apply_put_rows_inner(rows, true)
+    }
+
+    fn apply_put_rows_inner(&mut self, rows: Vec<Row>, check_existing_pk: bool) -> Result<()> {
+        if check_existing_pk {
+            self.ensure_indexes_complete()?;
+        }
         let n = rows.len();
         // Track mutated columns for fine-grained cache invalidation (c).
         for r in &rows {
@@ -1694,10 +1839,12 @@ impl Table {
         let (losers, winner_pks) = self.partition_pk_winners(&rows);
         let epoch = rows.first().map(|r| r.committed_epoch).unwrap_or(Epoch(0));
         // Tombstone any pre-existing row that owns the same PK as a winner.
-        for (key, &row_id) in &winner_pks {
-            if let Some(old_rid) = self.hot.get(key) {
-                if old_rid != row_id {
-                    self.tombstone_row(old_rid, epoch, true);
+        if check_existing_pk {
+            for (key, &row_id) in &winner_pks {
+                if let Some(old_rid) = self.hot.get(key) {
+                    if old_rid != row_id {
+                        self.tombstone_row(old_rid, epoch, true);
+                    }
                 }
             }
         }
@@ -2193,7 +2340,12 @@ impl Table {
             for r in &mut rows {
                 r.committed_epoch = new_epoch;
             }
-            self.apply_put_rows(rows)?;
+            let auto_inc_flags = std::mem::take(&mut self.pending_rows_auto_inc);
+            let all_auto_generated =
+                auto_inc_flags.len() == rows.len() && auto_inc_flags.iter().all(|b| *b);
+            self.apply_put_rows_inner(rows, !all_auto_generated)?;
+        } else {
+            self.pending_rows_auto_inc.clear();
         }
         let dels = std::mem::take(&mut self.pending_dels);
         for rid in dels {
@@ -2381,6 +2533,7 @@ impl Table {
         // any row id is allocated or bytes hit the run file. Losers of a
         // duplicate primary key are dropped from the encoded run entirely so
         // the dedup survives reopen (no ephemeral memtable tombstone).
+        self.fill_auto_inc_native_columns(&mut user_columns, n)?;
         self.validate_columns_not_null(&user_columns, n)?;
         let winner_idx = self
             .bulk_pk_winner_indices(&user_columns, n)
@@ -3204,7 +3357,7 @@ impl Table {
 
     fn bulk_load_columns_with(
         &mut self,
-        user_columns: Vec<(u16, columnar::NativeColumn)>,
+        mut user_columns: Vec<(u16, columnar::NativeColumn)>,
         zstd_level: i32,
         force_plain: bool,
         lz4: bool,
@@ -3219,6 +3372,7 @@ impl Table {
         self.spill_mutable_run(epoch)?;
         // Enforce NOT NULL constraints and primary-key upsert semantics before
         // any row id is allocated or bytes hit the run file.
+        self.fill_auto_inc_native_columns(&mut user_columns, n)?;
         self.validate_columns_not_null(&user_columns, n)?;
         let winner_idx = self
             .bulk_pk_winner_indices(&user_columns, n)
