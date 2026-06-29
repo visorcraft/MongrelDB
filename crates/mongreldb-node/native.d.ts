@@ -143,6 +143,12 @@ export declare class Database {
   /** List all live table names. */
   tableNames(): Array<string>
   /**
+   * Return the column names of a table as it exists in the **database**
+   * (not the code-defined schema). Lets migrations check whether a column
+   * is already present before calling `add_column`.
+   */
+  tableColumns(name: string): Array<string>
+  /**
    * Add a column to an existing table. The column must be nullable or supply
    * a default value so existing rows can be evolved safely.
    */

@@ -638,6 +638,16 @@ impl Database {
         self.inner.table_names()
     }
 
+    /// Return the column names of a table as it exists in the **database**
+    /// (not the code-defined schema). Lets migrations check whether a column
+    /// is already present before calling `add_column`.
+    #[napi]
+    pub fn table_columns(&self, name: String) -> napi::Result<Vec<String>> {
+        let handle = self.inner.table(&name).map_err(to_napi)?;
+        let g = handle.lock();
+        Ok(g.schema().columns.iter().map(|c| c.name.clone()).collect())
+    }
+
     /// Add a column to an existing table. The column must be nullable or supply
     /// a default value so existing rows can be evolved safely.
     #[napi]
