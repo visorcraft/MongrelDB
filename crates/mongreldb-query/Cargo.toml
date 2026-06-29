@@ -11,6 +11,7 @@ mongreldb-core = { path = "../mongreldb-core" }
 datafusion = "54.0.0"
 arrow = "58"
 serde_json = "1"
+sqlparser = "0.62.0"
 parking_lot = "0.12"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
 futures = "0.3"

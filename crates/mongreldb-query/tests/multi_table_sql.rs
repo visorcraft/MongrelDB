@@ -1,5 +1,7 @@
 //! P4.1 — multi-table SQL over a Database.
 
+use datafusion::arrow::array::{Array, BooleanArray, Int64Array, StringArray};
+use datafusion::arrow::record_batch::RecordBatch;
 use mongreldb_core::{schema::*, Database, Value};
 use mongreldb_query::MongrelSession;
 use std::sync::Arc;
@@ -49,8 +51,56 @@ fn customers_schema() -> Schema {
     }
 }
 
-fn total_rows(batches: &[datafusion::arrow::record_batch::RecordBatch]) -> usize {
+fn total_rows(batches: &[RecordBatch]) -> usize {
     batches.iter().map(|b| b.num_rows()).sum()
+}
+
+fn i64_values(batches: &[RecordBatch], column: usize) -> Vec<i64> {
+    batches
+        .iter()
+        .flat_map(|batch| {
+            let array = batch
+                .column(column)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            (0..array.len())
+                .map(|row| array.value(row))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn string_values(batches: &[RecordBatch], column: usize) -> Vec<String> {
+    batches
+        .iter()
+        .flat_map(|batch| {
+            let array = batch
+                .column(column)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            (0..array.len())
+                .map(|row| array.value(row).to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn bool_values(batches: &[RecordBatch], column: usize) -> Vec<bool> {
+    batches
+        .iter()
+        .flat_map(|batch| {
+            let array = batch
+                .column(column)
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap();
+            (0..array.len())
+                .map(|row| array.value(row))
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 #[tokio::test]
@@ -502,4 +552,301 @@ async fn alter_column_type_via_sql_on_empty_table() {
     );
     let batches = session.run("SELECT v FROM t").await.unwrap();
     assert_eq!(total_rows(&batches), 0);
+}
+
+#[tokio::test]
+async fn insert_update_delete_and_truncate_via_sql() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    let session = MongrelSession::open(Arc::clone(&db)).unwrap();
+
+    session
+        .run("CREATE TABLE items (id BIGINT PRIMARY KEY, name TEXT, qty BIGINT)")
+        .await
+        .unwrap();
+    session
+        .run(
+            "INSERT INTO items (id, name, qty) VALUES \
+             (1, 'pencil', 5), (2, 'pen', 8), (3, 'eraser', 2)",
+        )
+        .await
+        .unwrap();
+
+    let batches = session
+        .run("SELECT id, name, qty FROM items ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(i64_values(&batches, 0), vec![1, 2, 3]);
+    assert_eq!(
+        string_values(&batches, 1),
+        vec![
+            "pencil".to_string(),
+            "pen".to_string(),
+            "eraser".to_string()
+        ]
+    );
+    assert_eq!(i64_values(&batches, 2), vec![5, 8, 2]);
+
+    session
+        .run("UPDATE items SET qty = 18 WHERE name = 'pen' OR id = 3")
+        .await
+        .unwrap();
+    let batches = session
+        .run("SELECT qty FROM items ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(i64_values(&batches, 0), vec![5, 18, 18]);
+
+    session
+        .run("DELETE FROM items WHERE qty >= 18 AND name IN ('pen', 'eraser')")
+        .await
+        .unwrap();
+    let batches = session
+        .run("SELECT id FROM items ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(i64_values(&batches, 0), vec![1]);
+
+    session.run("TRUNCATE TABLE items").await.unwrap();
+    let batches = session.run("SELECT id FROM items").await.unwrap();
+    assert_eq!(total_rows(&batches), 0);
+}
+
+#[tokio::test]
+async fn insert_on_conflict_variants_via_sql() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    let session = MongrelSession::open(Arc::clone(&db)).unwrap();
+
+    session
+        .run("CREATE TABLE items (id BIGINT PRIMARY KEY, name TEXT, qty BIGINT)")
+        .await
+        .unwrap();
+    session
+        .run("INSERT INTO items (id, name, qty) VALUES (1, 'old', 10)")
+        .await
+        .unwrap();
+    session
+        .run(
+            "INSERT INTO items (id, name, qty) VALUES (1, 'ignored', 99) \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .await
+        .unwrap();
+
+    let batches = session
+        .run("SELECT name, qty FROM items WHERE id = 1")
+        .await
+        .unwrap();
+    assert_eq!(string_values(&batches, 0), vec!["old".to_string()]);
+    assert_eq!(i64_values(&batches, 1), vec![10]);
+
+    session
+        .run(
+            "INSERT INTO items (id, name, qty) VALUES (1, 'new', 15) \
+             ON CONFLICT (id) DO UPDATE SET name = excluded.name, qty = excluded.qty",
+        )
+        .await
+        .unwrap();
+    let batches = session
+        .run("SELECT name, qty FROM items WHERE id = 1")
+        .await
+        .unwrap();
+    assert_eq!(string_values(&batches, 0), vec!["new".to_string()]);
+    assert_eq!(i64_values(&batches, 1), vec![15]);
+}
+
+#[tokio::test]
+async fn create_and_drop_index_via_sql_preserves_rows() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    let session = MongrelSession::open(Arc::clone(&db)).unwrap();
+
+    session
+        .run("CREATE TABLE metrics (id BIGINT PRIMARY KEY, category TEXT, amount BIGINT)")
+        .await
+        .unwrap();
+    session
+        .run(
+            "INSERT INTO metrics (id, category, amount) VALUES \
+             (1, 'a', 10), (2, 'b', 20), (3, 'a', 30)",
+        )
+        .await
+        .unwrap();
+
+    session
+        .run("CREATE INDEX idx_metrics_category ON metrics (category)")
+        .await
+        .unwrap();
+    {
+        let schema = db.table("metrics").unwrap().lock().schema().clone();
+        assert_eq!(schema.indexes.len(), 1);
+        assert_eq!(schema.indexes[0].name, "idx_metrics_category");
+    }
+
+    let batches = session
+        .run("SELECT id FROM metrics WHERE category = 'a' ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(i64_values(&batches, 0), vec![1, 3]);
+
+    session
+        .run("DROP INDEX idx_metrics_category ON metrics")
+        .await
+        .unwrap();
+    let schema = db.table("metrics").unwrap().lock().schema().clone();
+    assert!(schema.indexes.is_empty());
+    let batches = session
+        .run("SELECT id FROM metrics ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(i64_values(&batches, 0), vec![1, 2, 3]);
+}
+
+#[tokio::test]
+async fn create_and_drop_view_via_sql() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    let session = MongrelSession::open(Arc::clone(&db)).unwrap();
+
+    session
+        .run("CREATE TABLE items (id BIGINT PRIMARY KEY, name TEXT, qty BIGINT)")
+        .await
+        .unwrap();
+    session
+        .run("INSERT INTO items (id, name, qty) VALUES (1, 'small', 1), (2, 'large', 20)")
+        .await
+        .unwrap();
+    session
+        .run("CREATE VIEW large_items AS SELECT name FROM items WHERE qty >= 10")
+        .await
+        .unwrap();
+
+    let batches = session.run("SELECT name FROM large_items").await.unwrap();
+    assert_eq!(string_values(&batches, 0), vec!["large".to_string()]);
+
+    session.run("DROP VIEW large_items").await.unwrap();
+    assert!(session.run("SELECT name FROM large_items").await.is_err());
+}
+
+#[tokio::test]
+async fn introspection_and_admin_commands_via_sql() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    let session = MongrelSession::open(Arc::clone(&db)).unwrap();
+
+    session
+        .run("CREATE TABLE alpha (id BIGINT PRIMARY KEY, note TEXT)")
+        .await
+        .unwrap();
+    session
+        .run("CREATE TABLE beta (id BIGINT PRIMARY KEY)")
+        .await
+        .unwrap();
+
+    let batches = session.run("SHOW TABLES").await.unwrap();
+    assert_eq!(
+        string_values(&batches, 0),
+        vec!["alpha".to_string(), "beta".to_string()]
+    );
+
+    let batches = session.run("DESCRIBE alpha").await.unwrap();
+    assert_eq!(
+        string_values(&batches, 0),
+        vec!["id".to_string(), "note".to_string()]
+    );
+    assert_eq!(bool_values(&batches, 3), vec![true, false]);
+
+    let batches = session.run("PRAGMA table_info(alpha)").await.unwrap();
+    assert_eq!(
+        string_values(&batches, 1),
+        vec!["id".to_string(), "note".to_string()]
+    );
+    assert_eq!(bool_values(&batches, 4), vec![true, false]);
+
+    let batches = session.run("CHECK").await.unwrap();
+    assert_eq!(batches[0].schema().field(0).name(), "severity");
+    session.run("VACUUM").await.unwrap();
+}
+
+#[tokio::test]
+async fn explicit_transactions_stage_sql_dml() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    let session = MongrelSession::open(Arc::clone(&db)).unwrap();
+
+    session
+        .run("CREATE TABLE tx_items (id BIGINT PRIMARY KEY, name TEXT)")
+        .await
+        .unwrap();
+
+    session.run("BEGIN").await.unwrap();
+    session
+        .run("INSERT INTO tx_items (id, name) VALUES (1, 'one')")
+        .await
+        .unwrap();
+    session
+        .run("INSERT INTO tx_items (id, name) VALUES (2, 'two')")
+        .await
+        .unwrap();
+    session.run("COMMIT").await.unwrap();
+
+    let batches = session
+        .run("SELECT id FROM tx_items ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(i64_values(&batches, 0), vec![1, 2]);
+
+    session.run("BEGIN").await.unwrap();
+    session
+        .run("DELETE FROM tx_items WHERE id = 1")
+        .await
+        .unwrap();
+    session.run("ROLLBACK").await.unwrap();
+    let batches = session
+        .run("SELECT id FROM tx_items ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(i64_values(&batches, 0), vec![1, 2]);
+}
+
+#[tokio::test]
+async fn alter_table_add_and_drop_column_via_sql_preserves_rows() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    let session = MongrelSession::open(Arc::clone(&db)).unwrap();
+
+    session
+        .run("CREATE TABLE t (id BIGINT PRIMARY KEY)")
+        .await
+        .unwrap();
+    session.run("INSERT INTO t (id) VALUES (1)").await.unwrap();
+
+    session
+        .run("ALTER TABLE t ADD COLUMN note TEXT")
+        .await
+        .unwrap();
+    assert!(db
+        .table("t")
+        .unwrap()
+        .lock()
+        .schema()
+        .column("note")
+        .is_some());
+    session
+        .run("INSERT INTO t (id, note) VALUES (2, 'kept')")
+        .await
+        .unwrap();
+
+    session.run("ALTER TABLE t DROP COLUMN note").await.unwrap();
+    assert!(db
+        .table("t")
+        .unwrap()
+        .lock()
+        .schema()
+        .column("note")
+        .is_none());
+    assert!(session.run("SELECT note FROM t").await.is_err());
+    let batches = session.run("SELECT id FROM t ORDER BY id").await.unwrap();
+    assert_eq!(i64_values(&batches, 0), vec![1, 2]);
 }

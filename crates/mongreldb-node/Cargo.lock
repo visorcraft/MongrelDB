@@ -2191,7 +2191,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-core"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "aes-gcm",
  "arc-swap",
@@ -2218,7 +2218,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-node"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "arrow",
  "bytemuck",
@@ -2235,7 +2235,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-query"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -2244,6 +2244,7 @@ dependencies = [
  "mongreldb-core",
  "parking_lot",
  "serde_json",
+ "sqlparser",
  "thiserror 1.0.69",
  "tokio",
 ]

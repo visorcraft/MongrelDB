@@ -22,6 +22,7 @@
 //! ```
 
 pub mod arrow_conv;
+mod commands;
 mod error;
 mod fk_join;
 mod native_agg;
@@ -803,6 +804,10 @@ pub struct MongrelSession {
     /// On `run("SELECT * FROM <view>")`, the defining SQL is executed (or the
     /// result-cache is hit). Invalidated automatically on commit (epoch bump).
     views: parking_lot::Mutex<HashMap<String, String>>,
+    /// SQL `BEGIN`/`COMMIT` staging for DML statements. Reads remain
+    /// snapshot-at-scan; this batches SQL writes atomically when a client sends
+    /// an explicit transaction block.
+    sql_txn: parking_lot::Mutex<Option<Vec<commands::PendingSqlOp>>>,
 }
 
 /// `(sql, snapshot_epoch) → cached result batches`.
@@ -830,6 +835,7 @@ impl MongrelSession {
             plan_cache: parking_lot::Mutex::new(HashMap::new()),
             tables: parking_lot::Mutex::new(HashMap::new()),
             views: parking_lot::Mutex::new(HashMap::new()),
+            sql_txn: parking_lot::Mutex::new(None),
         }
     }
 
@@ -871,6 +877,7 @@ impl MongrelSession {
             plan_cache: parking_lot::Mutex::new(HashMap::new()),
             tables: parking_lot::Mutex::new(tables),
             views: parking_lot::Mutex::new(HashMap::new()),
+            sql_txn: parking_lot::Mutex::new(None),
         })
     }
 
@@ -942,6 +949,10 @@ impl MongrelSession {
     /// `Database` is attached and mapped to the catalog. Repeated identical SQL
     /// against the same snapshot returns the cached batches without re-executing.
     pub async fn run(&self, sql: &str) -> Result<Vec<RecordBatch>> {
+        if let Some(batches) = commands::try_run_command(self, sql)? {
+            return Ok(batches);
+        }
+
         // P4.2: intercept DDL when a Database is attached.
         let lower = sql.trim_start().to_lowercase();
         if lower.starts_with("create table") {
