@@ -69,7 +69,8 @@ export const enum ConditionKind {
   RangeF64 = 3,
   FmContains = 4,
   Ann = 5,
-  PkInt64 = 6
+  PkInt64 = 6,
+  BitmapIn = 7
 }
 /**
  * One predicate over the shared row-id space. Set the fields appropriate to
@@ -84,6 +85,7 @@ export interface ConditionSpec {
   float64Lo?: number
   float64Hi?: number
   text?: string
+  values?: Array<string>
   embedding?: Array<number>
   k?: number
 }
@@ -184,6 +186,8 @@ export declare class TableHandle {
   flush(): bigint
   /** Live row count (O(1)). */
   count(): bigint
+  /** Count rows matching a native conjunctive predicate without materializing rows when possible. */
+  countWhere(conditions: Array<ConditionSpec>): bigint
   /** Point read by row id. */
   get(rowId: bigint): RowJs | null
   /** Point read by a text primary key. */
@@ -228,6 +232,7 @@ export declare class TableHandle {
   putAsync(cells: Array<Cell>): Promise<PutResult>
   commitAsync(): Promise<bigint>
   countAsync(): Promise<bigint>
+  countWhereAsync(conditions: Array<ConditionSpec>): Promise<bigint>
   getAsync(rowId: bigint): Promise<RowJs | null>
   queryAsync(conditions: Array<ConditionSpec>): Promise<Array<RowJs>>
   flushAsync(): Promise<bigint>

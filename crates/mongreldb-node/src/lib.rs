@@ -269,6 +269,7 @@ pub enum ConditionKind {
     FmContains,
     Ann,
     PkInt64,
+    BitmapIn,
 }
 
 /// One predicate over the shared row-id space. Set the fields appropriate to
@@ -283,6 +284,7 @@ pub struct ConditionSpec {
     pub float64_lo: Option<f64>,
     pub float64_hi: Option<f64>,
     pub text: Option<String>,
+    pub values: Option<Vec<String>>,
     pub embedding: Option<Vec<f64>>,
     pub k: Option<u32>,
 }
@@ -332,14 +334,16 @@ fn build_condition(spec: &ConditionSpec) -> napi::Result<Condition> {
             k: spec.k.unwrap_or(10) as usize,
         },
         ConditionKind::PkInt64 => Condition::Pk(
-            bigint_to_i64(
-                spec.int64_lo
-                    .as_ref()
-                    .ok_or_else(|| napi::Error::new(napi::Status::InvalidArg, "PkInt64 needs int64_lo"))?,
-            )?
+            bigint_to_i64(spec.int64_lo.as_ref().ok_or_else(|| {
+                napi::Error::new(napi::Status::InvalidArg, "PkInt64 needs int64_lo")
+            })?)?
             .to_be_bytes()
             .to_vec(),
         ),
+        ConditionKind::BitmapIn => Condition::BitmapIn {
+            column_id: spec.column_id,
+            values: text_values(spec)?,
+        },
     })
 }
 
@@ -348,6 +352,25 @@ fn text_bytes(spec: &ConditionSpec) -> napi::Result<Vec<u8>> {
         .as_ref()
         .map(|s| s.as_bytes().to_vec())
         .ok_or_else(|| napi::Error::new(napi::Status::InvalidArg, "expected `text`"))
+}
+
+fn text_values(spec: &ConditionSpec) -> napi::Result<Vec<Vec<u8>>> {
+    spec.values
+        .as_ref()
+        .map(|values| values.iter().map(|s| s.as_bytes().to_vec()).collect())
+        .ok_or_else(|| napi::Error::new(napi::Status::InvalidArg, "expected `values`"))
+}
+
+fn build_conditions(specs: &[ConditionSpec]) -> napi::Result<Vec<Condition>> {
+    specs.iter().map(build_condition).collect()
+}
+
+fn build_query_from_conditions(conditions: Vec<Condition>) -> Query {
+    let mut q = Query::new();
+    for c in conditions {
+        q = q.and(c);
+    }
+    q
 }
 
 #[napi(object)]
@@ -595,9 +618,7 @@ impl Database {
     /// empty, or if `new_name` is already in use. A no-op when `name == new_name`.
     #[napi]
     pub fn rename_table(&self, name: String, new_name: String) -> napi::Result<()> {
-        self.inner
-            .rename_table(&name, &new_name)
-            .map_err(to_napi)
+        self.inner.rename_table(&name, &new_name).map_err(to_napi)
     }
 
     /// Get a handle to a table by name for typed put/get/query operations.
@@ -684,7 +705,8 @@ impl Database {
                     "issues": [],
                 })
             });
-            entry["issue_count"] = serde_json::json!(entry["issue_count"].as_u64().unwrap_or(0) + 1);
+            entry["issue_count"] =
+                serde_json::json!(entry["issue_count"].as_u64().unwrap_or(0) + 1);
             entry["issues"]
                 .as_array_mut()
                 .unwrap()
@@ -840,6 +862,27 @@ impl TableHandle {
         Ok(BigInt::from(g.count()))
     }
 
+    /// Count rows matching a native conjunctive predicate without materializing rows when possible.
+    #[napi]
+    pub fn count_where(&self, conditions: Vec<ConditionSpec>) -> napi::Result<BigInt> {
+        let handle = self.db.table(&self.name).map_err(to_napi)?;
+        let mut g = handle.lock();
+        if conditions.is_empty() {
+            return Ok(BigInt::from(g.count()));
+        }
+        let core_conditions = build_conditions(&conditions)?;
+        let snap = g.snapshot();
+        if let Some(count) = g
+            .count_conditions(&core_conditions, snap)
+            .map_err(to_napi)?
+        {
+            return Ok(BigInt::from(count));
+        }
+        let q = build_query_from_conditions(core_conditions);
+        let rows = g.query_cached(&q).map_err(to_napi)?;
+        Ok(BigInt::from(rows.len() as u64))
+    }
+
     /// Point read by row id.
     #[napi]
     pub fn get(&self, row_id: BigInt) -> napi::Result<Option<RowJs>> {
@@ -924,10 +967,7 @@ impl TableHandle {
     pub fn query(&self, conditions: Vec<ConditionSpec>) -> napi::Result<Vec<RowJs>> {
         let handle = self.db.table(&self.name).map_err(to_napi)?;
         let mut g = handle.lock();
-        let mut q = Query::new();
-        for c in &conditions {
-            q = q.and(build_condition(c)?);
-        }
+        let q = build_query_from_conditions(build_conditions(&conditions)?);
         let rows = g.query_cached(&q).map_err(to_napi)?;
         Ok(rows.iter().map(|r| row_to_js_table(&g, r)).collect())
     }
@@ -984,17 +1024,16 @@ impl TableHandle {
     pub async fn put_async(&self, cells: Vec<Cell>) -> napi::Result<PutResult> {
         let db = Arc::clone(&self.db);
         let name = self.name.clone();
-        let (rid, auto) = napi::bindgen_prelude::spawn_blocking(
-            move || -> napi::Result<(u64, Option<i64>)> {
+        let (rid, auto) =
+            napi::bindgen_prelude::spawn_blocking(move || -> napi::Result<(u64, Option<i64>)> {
                 let handle = db.table(&name).map_err(to_napi)?;
                 let mut g = handle.lock();
                 let cols = cell_pairs_table(&g, cells)?;
                 let (rid, auto) = g.put_returning(cols).map_err(to_napi)?;
                 Ok((rid.0, auto))
-            },
-        )
-        .await
-        .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e:?}")))??;
+            })
+            .await
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e:?}")))??;
         Ok(PutResult {
             row_id: BigInt::from(rid),
             auto_inc: auto.map(BigInt::from),
@@ -1028,6 +1067,32 @@ impl TableHandle {
     }
 
     #[napi]
+    pub async fn count_where_async(&self, conditions: Vec<ConditionSpec>) -> napi::Result<BigInt> {
+        let db = Arc::clone(&self.db);
+        let name = self.name.clone();
+        napi::bindgen_prelude::spawn_blocking(move || {
+            let handle = db.table(&name).map_err(to_napi)?;
+            let mut g = handle.lock();
+            if conditions.is_empty() {
+                return Ok(BigInt::from(g.count()));
+            }
+            let core_conditions = build_conditions(&conditions)?;
+            let snap = g.snapshot();
+            if let Some(count) = g
+                .count_conditions(&core_conditions, snap)
+                .map_err(to_napi)?
+            {
+                return Ok(BigInt::from(count));
+            }
+            let q = build_query_from_conditions(core_conditions);
+            let rows = g.query_cached(&q).map_err(to_napi)?;
+            Ok(BigInt::from(rows.len() as u64))
+        })
+        .await
+        .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e:?}")))?
+    }
+
+    #[napi]
     pub async fn get_async(&self, row_id: BigInt) -> napi::Result<Option<RowJs>> {
         let db = Arc::clone(&self.db);
         let name = self.name.clone();
@@ -1050,10 +1115,7 @@ impl TableHandle {
         napi::bindgen_prelude::spawn_blocking(move || -> napi::Result<Vec<RowJs>> {
             let handle = db.table(&name).map_err(to_napi)?;
             let mut g = handle.lock();
-            let mut q = Query::new();
-            for c in &conditions {
-                q = q.and(build_condition(c)?);
-            }
+            let q = build_query_from_conditions(build_conditions(&conditions)?);
             let rows = g.query_cached(&q).map_err(to_napi)?;
             Ok(rows.iter().map(|r| row_to_js_table(&g, r)).collect())
         })
@@ -1280,9 +1342,10 @@ impl TxnTable {
     /// Stage a delete of `row_id` on this table.
     #[napi]
     pub fn delete(&self, row_id: BigInt) -> napi::Result<()> {
-        self.staging
-            .lock()
-            .push((self.table.clone(), TxnOp::Delete(RowId(bigint_to_u64(&row_id)?))));
+        self.staging.lock().push((
+            self.table.clone(),
+            TxnOp::Delete(RowId(bigint_to_u64(&row_id)?)),
+        ));
         Ok(())
     }
 }
