@@ -137,6 +137,9 @@ impl TableProvider for MongrelProvider {
         let empty_proj = projection.map(|p| p.is_empty()).unwrap_or(false);
         if empty_proj {
             let total: usize = if translated.is_empty() {
+                mongreldb_core::trace::QueryTrace::record(|t| {
+                    t.scan_mode = mongreldb_core::trace::ScanMode::CountMetadata;
+                });
                 db.count() as usize
             } else if let Some(count) = db.count_conditions(&translated, snap).map_err(core_err)? {
                 count as usize
@@ -153,6 +156,9 @@ impl TableProvider for MongrelProvider {
                                 .visible_columns_native(snap, Some(&one))
                                 .map_err(core_err)?,
                         };
+                        mongreldb_core::trace::QueryTrace::record(|t| {
+                            t.scan_mode = mongreldb_core::trace::ScanMode::Materialized;
+                        });
                         cols.first().map(|(_, c)| c.len()).unwrap_or(0)
                     }
                     None => 0,
@@ -229,6 +235,9 @@ impl TableProvider for MongrelProvider {
                     if let Some(projected) =
                         project_batch(&batch, &col_ids, &schema_ref, &scan_schema)
                     {
+                        mongreldb_core::trace::QueryTrace::record(|t| {
+                            t.scan_mode = mongreldb_core::trace::ScanMode::ArrowShadow;
+                        });
                         return Ok(Arc::new(scan::MongrelScanExec::new_batch(
                             scan_schema,
                             projected,
@@ -344,6 +353,10 @@ impl TableProvider for MongrelProvider {
             }
         }
 
+        mongreldb_core::trace::QueryTrace::record(|t| {
+            t.scan_mode = mongreldb_core::trace::ScanMode::Materialized;
+            t.row_materialized = true;
+        });
         Ok(Arc::new(scan::MongrelScanExec::new(
             scan_schema,
             ordered,
@@ -1030,6 +1043,27 @@ impl MongrelSession {
         };
         self.cache.lock().insert(key, Arc::new(batches.clone()));
         Ok(batches)
+    }
+
+    /// [`Self::run`] with a captured [`mongreldb_core::trace::QueryTrace`].
+    ///
+    /// Runs the SQL query inside a trace-capture scope so that path-decision
+    /// recordings from both the SQL scan layer (`MongrelProvider::scan`) and
+    /// the core engine (`Table::native_page_cursor`, `query_columns_native`,
+    /// `count_conditions`, etc.) are collected into a single returned trace.
+    ///
+    /// The session-level result cache returns before `scan()` runs on a hit, so
+    /// a session-cache hit yields `scan_mode = Unknown`. For scan-level
+    /// result-cache tracing, use
+    /// [`mongreldb_core::Table::query_columns_native_cached_traced`].
+    pub async fn run_sql_traced(
+        &self,
+        sql: &str,
+    ) -> Result<(Vec<RecordBatch>, mongreldb_core::trace::QueryTrace)> {
+        mongreldb_core::trace::QueryTrace::push_scope();
+        let result = self.run(sql).await;
+        let trace = mongreldb_core::trace::QueryTrace::pop_scope();
+        Ok((result?, trace))
     }
 
     /// Drop all cached results (e.g. after a manual data change you want

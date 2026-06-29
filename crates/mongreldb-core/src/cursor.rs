@@ -33,6 +33,42 @@ pub trait Cursor: Send {
     fn projection_types(&self) -> Vec<TypeId>;
 }
 
+/// Drain every batch from `cursor` and concatenate per-column into a single
+/// `Vec<(column_id, NativeColumn)>` in `projection` order. Each batch's columns
+/// are appended via [`NativeColumn::concat`], so the result is one typed buffer
+/// per projected column spanning all surviving rows.
+///
+/// This is the columnar alternative to `rows_for_rids` for layouts where the
+/// single-run fast gather does not apply (multi-run, non-empty overlay): it
+/// lets [`crate::engine::Table::query_columns_native`] stay columnar end-to-end
+/// instead of materializing `Row { HashMap }` objects and pivoting back.
+pub fn drain_cursor_to_columns(
+    cursor: &mut dyn Cursor,
+    projection: &[(u16, TypeId)],
+) -> Result<Vec<(u16, NativeColumn)>> {
+    let ncols = projection.len();
+    let mut acc: Vec<Vec<NativeColumn>> = (0..ncols).map(|_| Vec::new()).collect();
+    while let Some(batch) = cursor.next_batch()? {
+        for (j, col) in batch.into_iter().enumerate() {
+            if j < ncols {
+                acc[j].push(col);
+            }
+        }
+    }
+    Ok(acc
+        .into_iter()
+        .enumerate()
+        .map(|(j, pieces)| {
+            let col = if pieces.is_empty() {
+                crate::columnar::null_native(projection[j].1, 0)
+            } else {
+                NativeColumn::concat(&pieces)
+            };
+            (projection[j].0, col)
+        })
+        .collect())
+}
+
 /// One page's worth of within-page survivor positions to decode.
 #[derive(Clone)]
 pub(crate) struct PagePlan {

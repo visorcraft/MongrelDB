@@ -33,6 +33,7 @@ pub(crate) mod row_id_set;
 pub mod rowid;
 pub mod schema;
 pub mod sorted_run;
+pub mod trace;
 pub mod tsv;
 pub mod txn;
 pub mod wal;
@@ -40,7 +41,7 @@ pub mod wal;
 pub use be_tree::BeTree;
 pub use cache::PageCache;
 pub use columnar::{decode_column, encode_column};
-pub use cursor::{Cursor, MultiRunCursor, NativePageCursor};
+pub use cursor::{drain_cursor_to_columns, Cursor, MultiRunCursor, NativePageCursor};
 pub use database::{CheckIssue, Database};
 pub use encryption::{Cipher, PlaintextCipher};
 pub use engine::{
@@ -65,6 +66,7 @@ pub use sorted_run::{
     read_column_dir, read_header, write_run, write_run_with, ColumnPayload, RunHeader, RunReader,
     RunSpec, RunWriter,
 };
+pub use trace::{IndexRebuild, QueryTrace, ScanMode};
 pub use wal::{AddedRun, DdlOp, Op, Record, SharedWal, Wal, WalReader, SYSTEM_TXN_ID};
 
 #[cfg(feature = "encryption")]

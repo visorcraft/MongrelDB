@@ -1384,8 +1384,14 @@ impl Table {
     /// Called lazily by `query` / `query_columns_native` / `flush`.
     fn ensure_indexes_complete(&mut self) -> Result<()> {
         if self.indexes_complete {
+            crate::trace::QueryTrace::record(|t| {
+                t.index_rebuild = crate::trace::IndexRebuild::AlreadyComplete;
+            });
             return Ok(());
         }
+        crate::trace::QueryTrace::record(|t| {
+            t.index_rebuild = crate::trace::IndexRebuild::Rebuilt;
+        });
         self.rebuild_indexes_from_runs()?;
         self.build_learned_ranges()?;
         self.indexes_complete = true;
@@ -2796,12 +2802,26 @@ impl Table {
     pub fn query(&mut self, q: &crate::query::Query) -> Result<Vec<Row>> {
         self.ensure_indexes_complete()?;
         let snapshot = self.snapshot();
+        crate::trace::QueryTrace::record(|t| {
+            t.run_count = self.run_refs.len();
+            t.memtable_rows = self.memtable.len();
+            t.mutable_run_rows = self.mutable_run.len();
+        });
         // A conjunction with no predicates matches every visible row (the
         // documented "Empty ⇒ all rows" contract); `intersect_sets` of zero
         // sets would otherwise wrongly yield the empty set.
         if q.conditions.is_empty() {
+            crate::trace::QueryTrace::record(|t| {
+                t.scan_mode = crate::trace::ScanMode::Materialized;
+                t.row_materialized = true;
+            });
             return self.visible_rows(snapshot);
         }
+        crate::trace::QueryTrace::record(|t| {
+            t.conditions_pushed = q.conditions.len();
+            t.scan_mode = crate::trace::ScanMode::Materialized;
+            t.row_materialized = true;
+        });
         let mut sets: Vec<RowIdSet> = Vec::with_capacity(q.conditions.len());
         for c in &q.conditions {
             sets.push(self.resolve_condition(c, snapshot)?);
@@ -3387,7 +3407,13 @@ impl Table {
         for condition in conditions {
             sets.push(self.resolve_condition(condition, snapshot)?);
         }
-        Ok(Some(RowIdSet::intersect_many(sets).len() as u64))
+        let count = RowIdSet::intersect_many(sets).len() as u64;
+        crate::trace::QueryTrace::record(|t| {
+            t.scan_mode = crate::trace::ScanMode::CountSurvivors;
+            t.survivor_count = Some(count as usize);
+            t.conditions_pushed = conditions.len();
+        });
+        Ok(Some(count))
     }
 
     /// Bulk-load typed columns straight to a new run — the fast ingest path.
@@ -3735,6 +3761,10 @@ impl Table {
         // cached result (MVCC isolation for the explicit-snapshot API).
         let key = crate::query::canonical_query_key(conditions, projection, snapshot.epoch.0);
         if let Some(hit) = self.result_cache.lock().get_columns(key) {
+            crate::trace::QueryTrace::record(|t| {
+                t.result_cache_hit = true;
+                t.scan_mode = crate::trace::ScanMode::NativePushdown;
+            });
             return Ok(Some((*hit).clone()));
         }
         let res = self.query_columns_native(conditions, projection, snapshot)?;
@@ -3763,6 +3793,10 @@ impl Table {
         }
         let key = crate::query::canonical_query_key(&q.conditions, None, 0);
         if let Some(hit) = self.result_cache.lock().get_rows(key) {
+            crate::trace::QueryTrace::record(|t| {
+                t.result_cache_hit = true;
+                t.scan_mode = crate::trace::ScanMode::Materialized;
+            });
             return Ok((*hit).clone());
         }
         let rows = self.query(q)?;
@@ -3777,6 +3811,103 @@ impl Table {
             },
         );
         Ok(rows)
+    }
+
+    // -----------------------------------------------------------------------
+    // Traced query wrappers (OPTIMIZATIONS.md Priority 0 / 16).
+    //
+    // Each `_traced` method runs its underlying query inside a
+    // [`crate::trace::QueryTrace::capture`] scope and returns the result
+    // alongside the captured path trace. The trace records which physical path
+    // served the query (cursor / pushdown / materialized / count-shortcut),
+    // whether indexes were rebuilt, whether the result cache hit, overlay size,
+    // survivor count, and the fast row-id map usage. Recording is zero-cost
+    // when no `_traced` method is on the call stack (the plain methods are
+    // unchanged).
+    // -----------------------------------------------------------------------
+
+    /// [`Self::query_columns_native`] with a captured [`crate::trace::QueryTrace`].
+    #[allow(clippy::type_complexity)]
+    pub fn query_columns_native_traced(
+        &mut self,
+        conditions: &[crate::query::Condition],
+        projection: Option<&[u16]>,
+        snapshot: Snapshot,
+    ) -> Result<(
+        Option<Vec<(u16, columnar::NativeColumn)>>,
+        crate::trace::QueryTrace,
+    )> {
+        let (result, trace) = crate::trace::QueryTrace::capture(|| {
+            self.query_columns_native(conditions, projection, snapshot)
+        });
+        Ok((result?, trace))
+    }
+
+    /// [`Self::query_columns_native_cached`] with a captured
+    /// [`crate::trace::QueryTrace`] (records result-cache hits too).
+    #[allow(clippy::type_complexity)]
+    pub fn query_columns_native_cached_traced(
+        &mut self,
+        conditions: &[crate::query::Condition],
+        projection: Option<&[u16]>,
+        snapshot: Snapshot,
+    ) -> Result<(
+        Option<Vec<(u16, columnar::NativeColumn)>>,
+        crate::trace::QueryTrace,
+    )> {
+        let (result, trace) = crate::trace::QueryTrace::capture(|| {
+            self.query_columns_native_cached(conditions, projection, snapshot)
+        });
+        Ok((result?, trace))
+    }
+
+    /// [`Self::native_page_cursor`] with a captured [`crate::trace::QueryTrace`].
+    pub fn native_page_cursor_traced(
+        &self,
+        snapshot: Snapshot,
+        projection: Vec<(u16, TypeId)>,
+        conditions: &[crate::query::Condition],
+    ) -> Result<(Option<NativePageCursor>, crate::trace::QueryTrace)> {
+        let (result, trace) = crate::trace::QueryTrace::capture(|| {
+            self.native_page_cursor(snapshot, projection, conditions)
+        });
+        Ok((result?, trace))
+    }
+
+    /// [`Self::native_multi_run_cursor`] with a captured [`crate::trace::QueryTrace`].
+    pub fn native_multi_run_cursor_traced(
+        &self,
+        snapshot: Snapshot,
+        projection: Vec<(u16, TypeId)>,
+        conditions: &[crate::query::Condition],
+    ) -> Result<(
+        Option<crate::cursor::MultiRunCursor>,
+        crate::trace::QueryTrace,
+    )> {
+        let (result, trace) = crate::trace::QueryTrace::capture(|| {
+            self.native_multi_run_cursor(snapshot, projection, conditions)
+        });
+        Ok((result?, trace))
+    }
+
+    /// [`Self::count_conditions`] with a captured [`crate::trace::QueryTrace`].
+    pub fn count_conditions_traced(
+        &mut self,
+        conditions: &[crate::query::Condition],
+        snapshot: Snapshot,
+    ) -> Result<(Option<u64>, crate::trace::QueryTrace)> {
+        let (result, trace) =
+            crate::trace::QueryTrace::capture(|| self.count_conditions(conditions, snapshot));
+        Ok((result?, trace))
+    }
+
+    /// [`Self::query`] with a captured [`crate::trace::QueryTrace`].
+    pub fn query_traced(
+        &mut self,
+        q: &crate::query::Query,
+    ) -> Result<(Vec<Row>, crate::trace::QueryTrace)> {
+        let (result, trace) = crate::trace::QueryTrace::capture(|| self.query(q));
+        Ok((result?, trace))
     }
 
     /// Predicate pushdown: resolve `conditions` via indexes to find the matching
@@ -3817,93 +3948,127 @@ impl Table {
         }
         let fast_path =
             self.memtable.is_empty() && self.mutable_run.is_empty() && self.run_refs.len() == 1;
-        // A Range/RangeF64 needs a column read *unless* its column has a
-        // learned (PGM) range index, in which case it's served in-memory.
-        let needs_column = conditions.iter().any(|c| match c {
-            Condition::Range { column_id, .. } => !self.learned_range.contains_key(column_id),
-            Condition::RangeF64 { column_id, .. } => !self.learned_range.contains_key(column_id),
-            _ => false,
+        crate::trace::QueryTrace::record(|t| {
+            t.run_count = self.run_refs.len();
+            t.memtable_rows = self.memtable.len();
+            t.mutable_run_rows = self.mutable_run.len();
+            t.conditions_pushed = conditions.len();
+            t.learned_range_used = conditions.iter().any(|c| match c {
+                Condition::Range { column_id, .. } | Condition::RangeF64 { column_id, .. } => {
+                    self.learned_range.contains_key(column_id)
+                }
+                _ => false,
+            });
         });
-
-        // Open the reader once if a range needs a column read on the fast path;
-        // reuse it for the survivor gather. Off the fast path ranges are served
-        // via `resolve_condition` (no reader needed).
-        let mut reader_opt: Option<RunReader> = if fast_path && needs_column {
-            Some(self.open_reader(self.run_refs[0].run_id)?)
-        } else {
-            None
-        };
-
-        let mut sets: Vec<RowIdSet> = Vec::new();
-        for c in conditions {
-            let s = match c {
-                Condition::Range { column_id, lo, hi }
-                    if fast_path && !self.learned_range.contains_key(column_id) =>
-                {
-                    if reader_opt.is_none() {
-                        reader_opt = Some(self.open_reader(self.run_refs[0].run_id)?);
-                    }
-                    reader_opt
-                        .as_mut()
-                        .expect("reader opened for range")
-                        .range_row_id_set_i64(*column_id, *lo, *hi)?
-                }
-                Condition::RangeF64 {
-                    column_id,
-                    lo,
-                    lo_inclusive,
-                    hi,
-                    hi_inclusive,
-                } if fast_path && !self.learned_range.contains_key(column_id) => {
-                    if reader_opt.is_none() {
-                        reader_opt = Some(self.open_reader(self.run_refs[0].run_id)?);
-                    }
-                    reader_opt
-                        .as_mut()
-                        .expect("reader opened for range")
-                        .range_row_id_set_f64(*column_id, *lo, *lo_inclusive, *hi, *hi_inclusive)?
-                }
-                _ => self.resolve_condition(c, snapshot)?,
-            };
-            sets.push(s);
-        }
-        let candidates = RowIdSet::intersect_many(sets);
-
-        // Build column list (projected or all user columns).
+        // Build column list (projected or all user columns) + projection pairs.
         let col_ids: Vec<u16> = projection
             .map(|p| p.to_vec())
             .unwrap_or_else(|| self.schema.columns.iter().map(|c| c.id).collect());
+        let proj_pairs: Vec<(u16, TypeId)> = col_ids
+            .iter()
+            .map(|&cid| {
+                let ty = self
+                    .schema
+                    .columns
+                    .iter()
+                    .find(|c| c.id == cid)
+                    .map(|c| c.ty)
+                    .unwrap_or(TypeId::Bytes);
+                (cid, ty)
+            })
+            .collect();
 
-        if candidates.is_empty() {
-            // No matches → return zero-length columns of the right types.
-            let cols: Vec<(u16, columnar::NativeColumn)> = col_ids
-                .into_iter()
-                .map(|id| {
-                    let ty = self
-                        .schema
-                        .columns
-                        .iter()
-                        .find(|c| c.id == id)
-                        .map(|c| c.ty)
-                        .unwrap_or(TypeId::Bytes);
-                    (id, columnar::null_native(ty, 0))
-                })
-                .collect();
-            return Ok(Some(cols));
-        }
-
-        // Fast path: single run, empty memtable → binary-search survivor
-        // positions and gather only the projected columns.
+        // -----------------------------------------------------------------------
+        // Fast path: single run, empty memtable/mutable-run → resolve survivors,
+        // binary-search positions, gather only the projected columns from one
+        // reader. This is the fastest pushdown path (no cursor overhead).
+        // -----------------------------------------------------------------------
         if fast_path {
+            // A Range/RangeF64 needs a column read *unless* its column has a
+            // learned (PGM) range index, in which case it's served in-memory.
+            let needs_column = conditions.iter().any(|c| match c {
+                Condition::Range { column_id, .. } => !self.learned_range.contains_key(column_id),
+                Condition::RangeF64 { column_id, .. } => {
+                    !self.learned_range.contains_key(column_id)
+                }
+                _ => false,
+            });
+            let mut reader_opt: Option<RunReader> = if needs_column {
+                Some(self.open_reader(self.run_refs[0].run_id)?)
+            } else {
+                None
+            };
+            let mut sets: Vec<RowIdSet> = Vec::new();
+            for c in conditions {
+                let s = match c {
+                    Condition::Range { column_id, lo, hi }
+                        if !self.learned_range.contains_key(column_id) =>
+                    {
+                        if reader_opt.is_none() {
+                            reader_opt = Some(self.open_reader(self.run_refs[0].run_id)?);
+                        }
+                        reader_opt
+                            .as_mut()
+                            .expect("reader opened for range")
+                            .range_row_id_set_i64(*column_id, *lo, *hi)?
+                    }
+                    Condition::RangeF64 {
+                        column_id,
+                        lo,
+                        lo_inclusive,
+                        hi,
+                        hi_inclusive,
+                    } if !self.learned_range.contains_key(column_id) => {
+                        if reader_opt.is_none() {
+                            reader_opt = Some(self.open_reader(self.run_refs[0].run_id)?);
+                        }
+                        reader_opt
+                            .as_mut()
+                            .expect("reader opened for range")
+                            .range_row_id_set_f64(
+                                *column_id,
+                                *lo,
+                                *lo_inclusive,
+                                *hi,
+                                *hi_inclusive,
+                            )?
+                    }
+                    _ => self.resolve_condition(c, snapshot)?,
+                };
+                sets.push(s);
+            }
+            let candidates = RowIdSet::intersect_many(sets);
+            crate::trace::QueryTrace::record(|t| {
+                t.survivor_count = Some(candidates.len());
+            });
+            if candidates.is_empty() {
+                let cols: Vec<(u16, columnar::NativeColumn)> = col_ids
+                    .iter()
+                    .map(|&id| {
+                        (
+                            id,
+                            columnar::null_native(
+                                proj_pairs
+                                    .iter()
+                                    .find(|(c, _)| c == &id)
+                                    .map(|(_, t)| *t)
+                                    .unwrap_or(TypeId::Bytes),
+                                0,
+                            ),
+                        )
+                    })
+                    .collect();
+                return Ok(Some(cols));
+            }
             let mut reader = match reader_opt.take() {
                 Some(r) => r,
                 None => self.open_reader(self.run_refs[0].run_id)?,
             };
             let candidate_ids = candidates.into_sorted_vec();
-            let positions = if let Some(positions) =
+            let (positions, fast_rid) = if let Some(positions) =
                 reader.positions_for_row_ids_fast(&candidate_ids)
             {
-                positions
+                (positions, true)
             } else {
                 let col = reader.column_native(crate::sorted_run::SYS_ROW_ID)?;
                 match col {
@@ -3913,11 +4078,15 @@ impl Table {
                             .filter_map(|rid| data.binary_search(&(*rid as i64)).ok())
                             .collect();
                         p.sort_unstable();
-                        p
+                        (p, false)
                     }
                     _ => return Err(MongrelError::InvalidArgument("sys row_id not int64".into())),
                 }
             };
+            crate::trace::QueryTrace::record(|t| {
+                t.scan_mode = crate::trace::ScanMode::NativePushdown;
+                t.fast_row_id_map = fast_rid;
+            });
             let mut cols = Vec::with_capacity(col_ids.len());
             for cid in &col_ids {
                 let col = reader.column_native(*cid)?;
@@ -3926,27 +4095,64 @@ impl Table {
             return Ok(Some(cols));
         }
 
-        // Non-fast path (multi-run / live mutable-run tier): the survivor row-id
-        // set is already resolved above; materialize their columns via
-        // `rows_for_rids` and pivot to native columns. Correct for any layout
-        // (the fast path's single-reader gather is only an optimization). This
-        // keeps `Exact` pushdown honest when the fast path doesn't apply.
-        let rids = candidates.into_sorted_vec();
+        // -----------------------------------------------------------------------
+        // Non-fast path (multi-run / non-empty overlay). Route through the
+        // columnar cursor (OPTIMIZATIONS.md Priority 1 + 4): the cursor builder
+        // resolves MVCC, predicates, and overlay internally in batch, then
+        // streams projected columns page-by-page. This avoids the per-rid
+        // `rows_for_rids` `get_version`-across-all-runs cost that made multi-run
+        // pushdown ~1000× slower than the single-run fast path.
+        //
+        // The cursor handles both single-run-with-overlay (`native_page_cursor`)
+        // and multi-run (`native_multi_run_cursor`) layouts. The empty-table
+        // (no runs, memtable-only) edge case falls through to `rows_for_rids`.
+        // -----------------------------------------------------------------------
+        if !self.run_refs.is_empty() {
+            use crate::cursor::{drain_cursor_to_columns, Cursor};
+            let remaining: usize;
+            let mut cursor: Box<dyn crate::cursor::Cursor> = if self.run_refs.len() == 1 {
+                let c = self
+                    .native_page_cursor(snapshot, proj_pairs.clone(), conditions)?
+                    .expect("single-run cursor should build when run_refs.len() == 1");
+                remaining = c.remaining_rows();
+                Box::new(c)
+            } else {
+                let c = self
+                    .native_multi_run_cursor(snapshot, proj_pairs.clone(), conditions)?
+                    .expect("multi-run cursor should build when run_refs.len() >= 1");
+                remaining = c.remaining_rows();
+                Box::new(c)
+            };
+            crate::trace::QueryTrace::record(|t| {
+                if t.survivor_count.is_none() {
+                    t.survivor_count = Some(remaining);
+                }
+            });
+            let cols = drain_cursor_to_columns(cursor.as_mut(), &proj_pairs)?;
+            return Ok(Some(cols));
+        }
+
+        // Empty-table fallback (no sorted runs, memtable/mutable-run only): the
+        // cursor builders return `None` for `run_refs.is_empty()`, so resolve
+        // from overlay indexes and materialize via `rows_for_rids`. This is the
+        // rare edge case (fresh table with only `put`s, no `flush`/`bulk_load`).
+        crate::trace::QueryTrace::record(|t| {
+            t.scan_mode = crate::trace::ScanMode::Materialized;
+            t.row_materialized = true;
+        });
+        let mut sets: Vec<RowIdSet> = Vec::with_capacity(conditions.len());
+        for c in conditions {
+            sets.push(self.resolve_condition(c, snapshot)?);
+        }
+        let rids = RowIdSet::intersect_many(sets).into_sorted_vec();
         let rows = self.rows_for_rids(&rids, snapshot)?;
         let mut cols: Vec<(u16, columnar::NativeColumn)> = Vec::with_capacity(col_ids.len());
-        for cid in &col_ids {
-            let ty = self
-                .schema
-                .columns
-                .iter()
-                .find(|c| c.id == *cid)
-                .map(|c| c.ty)
-                .unwrap_or(TypeId::Bytes);
+        for (cid, ty) in &proj_pairs {
             let vals: Vec<Value> = rows
                 .iter()
                 .map(|r| r.columns.get(cid).cloned().unwrap_or(Value::Null))
                 .collect();
-            cols.push((*cid, columnar::values_to_native(ty, &vals)));
+            cols.push((*cid, columnar::values_to_native(*ty, &vals)));
         }
         Ok(Some(cols))
     }
@@ -4048,12 +4254,28 @@ impl Table {
             }
         };
 
+        let overlay_row_count = overlay
+            .as_ref()
+            .map(|c| c.first().map(|c| c.len()).unwrap_or(0))
+            .unwrap_or(0);
+        crate::trace::QueryTrace::record(|t| {
+            t.scan_mode = crate::trace::ScanMode::NativePageCursor;
+            t.run_count = self.run_refs.len();
+            t.memtable_rows = self.memtable.len();
+            t.mutable_run_rows = self.mutable_run.len();
+            t.overlay_rows = overlay_row_count;
+            t.conditions_pushed = conditions.len();
+            t.pages_decoded = plans
+                .iter()
+                .map(|p| p.positions.len())
+                .sum::<usize>()
+                .min(1);
+        });
+
         Ok(Some(NativePageCursor::new_with_overlay(
             reader, projection, plans, overlay,
         )))
     }
-
-    /// Build a lazy streaming cursor over **multiple** sorted runs (Phase 16.1).
     /// Generalizes [`Self::native_page_cursor`] (single-run) to arbitrary run
     /// counts via a k-way merge by `RowId`. Cross-run MVCC resolution (newest
     /// visible version per `RowId`) and predicate survivor resolution are settled
@@ -4199,6 +4421,20 @@ impl Table {
                 Some(self.materialize_overlay(&filtered, &projection))
             }
         };
+
+        let overlay_row_count = overlay
+            .as_ref()
+            .map(|c| c.first().map(|c| c.len()).unwrap_or(0))
+            .unwrap_or(0);
+        crate::trace::QueryTrace::record(|t| {
+            t.scan_mode = crate::trace::ScanMode::MultiRunCursor;
+            t.run_count = self.run_refs.len();
+            t.memtable_rows = self.memtable.len();
+            t.mutable_run_rows = self.mutable_run.len();
+            t.overlay_rows = overlay_row_count;
+            t.conditions_pushed = conditions.len();
+            t.survivor_count = Some(total);
+        });
 
         Ok(Some(MultiRunCursor::new(
             streams, projection, heap, total, overlay,

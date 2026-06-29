@@ -59,6 +59,10 @@ name = "filtered_query"
 harness = false
 
 [[bench]]
+name = "path_matrix"
+harness = false
+
+[[bench]]
 name = "page_encryption"
 harness = false
 required-features = ["encryption"]
