@@ -723,7 +723,12 @@ async fn cursor_handles_schema_evolution() {
     db.flush().unwrap();
     // Add a nullable column AFTER the run was written — the old run has no
     // pages for it, so every existing row must read NULL.
-    db.add_column("note", TypeId::Bytes).unwrap();
+    db.add_column(
+        "note",
+        TypeId::Bytes,
+        ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+    )
+    .unwrap();
 
     // Acquire the db back out of a freshly-built session for writes/queries.
     let session = MongrelSession::new(db);

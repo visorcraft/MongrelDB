@@ -414,6 +414,79 @@ fn counter_survives_flush_then_reopen() {
     }
 }
 
+fn no_pk_schema() -> Schema {
+    Schema {
+        schema_id: 1,
+        columns: vec![ColumnDef {
+            id: 2,
+            name: "label".into(),
+            ty: TypeId::Bytes,
+            flags: ColumnFlags::empty(),
+        }],
+        indexes: vec![],
+        colocation: vec![],
+    }
+}
+
+#[test]
+fn cross_table_transaction_fills_auto_increment_and_returns_it() {
+    let dir = tempdir().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.create_table("things", ai_schema()).unwrap();
+
+    let a1 = {
+        let mut tx = db.begin();
+        let assigned = tx
+            .put("things", vec![(2, Value::Bytes(b"a".to_vec()))])
+            .unwrap();
+        assert_eq!(assigned, Some(1));
+        tx.commit().unwrap();
+        assigned
+    };
+
+    let a2 = {
+        let mut tx = db.begin();
+        let assigned = tx
+            .put("things", vec![(2, Value::Bytes(b"b".to_vec()))])
+            .unwrap();
+        assert_eq!(assigned, Some(2));
+        tx.commit().unwrap();
+        assigned
+    };
+
+    assert_eq!((a1, a2), (Some(1), Some(2)));
+
+    // Verify the values are materialized.
+    let handle = db.table("things").unwrap();
+    let g = handle.lock();
+    let rows = g.visible_rows(g.snapshot()).unwrap();
+    let mut ids: Vec<i64> = rows
+        .iter()
+        .map(|r| match r.columns.get(&1) {
+            Some(Value::Int64(n)) => *n,
+            _ => panic!("expected Int64 id"),
+        })
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec![1, 2]);
+}
+
+#[test]
+fn add_column_can_create_auto_increment_primary_key() {
+    let dir = tempdir().unwrap();
+    let mut t = Table::create(dir.path(), no_pk_schema(), 1).unwrap();
+    let flags = ColumnFlags::empty()
+        .with(ColumnFlags::PRIMARY_KEY)
+        .with(ColumnFlags::AUTO_INCREMENT);
+    let id = t.add_column("id", TypeId::Int64, flags).unwrap();
+    assert_eq!(id, 3, "new column id follows the existing max column id");
+
+    let (_, assigned) = t
+        .put_returning(vec![(2, Value::Bytes(b"x".to_vec()))])
+        .unwrap();
+    assert_eq!(assigned, Some(1));
+}
+
 #[test]
 fn database_shared_wal_counter_survives_reopen() {
     // The Kit's tables live in a Database (mounted/shared-WAL). Verifies the

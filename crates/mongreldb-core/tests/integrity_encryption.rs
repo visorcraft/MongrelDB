@@ -410,7 +410,13 @@ fn encrypted_schema_evolution() {
             Table::create_encrypted(&path, schema_with_indexable_bitmap(), 1, "pass").unwrap();
         db.put(row(1, b"old", 1)).unwrap();
         db.flush().unwrap();
-        let _new_cid = db.add_column("new_col", TypeId::Int64).unwrap();
+        let _new_cid = db
+            .add_column(
+                "new_col",
+                TypeId::Int64,
+                ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+            )
+            .unwrap();
         db.put(vec![
             (1, Value::Int64(2)),
             (2, Value::Bytes(b"new".to_vec())),

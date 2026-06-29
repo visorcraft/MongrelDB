@@ -833,7 +833,12 @@ async fn schema_evolution_reads_null_for_old_rows() {
     db.commit().unwrap();
     db.flush().unwrap();
 
-    db.add_column("note", TypeId::Bytes).unwrap();
+    db.add_column(
+        "note",
+        TypeId::Bytes,
+        ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+    )
+    .unwrap();
     for i in 10..20i64 {
         db.put(vec![
             (1, Value::Int64(i)),

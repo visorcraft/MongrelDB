@@ -312,7 +312,13 @@ fn schema_evolution_add_column_reads_null_for_old_rows() {
         t.commit().unwrap();
         t.flush().unwrap();
 
-        let new_cid = t.add_column("extra", TypeId::Int64).unwrap();
+        let new_cid = t
+            .add_column(
+                "extra",
+                TypeId::Int64,
+                ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+            )
+            .unwrap();
         assert_eq!(new_cid, 3);
 
         // New rows can write the new column.
@@ -362,7 +368,13 @@ fn schema_evolution_query_on_new_column_does_not_crash() {
     t.commit().unwrap();
     t.flush().unwrap();
 
-    let _ = t.add_column("extra", TypeId::Int64).unwrap();
+    let _ = t
+        .add_column(
+            "extra",
+            TypeId::Int64,
+            ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+        )
+        .unwrap();
 
     // Range query on the new column should not include old rows (they are null).
     let q = Query::new().and(Condition::Range {
@@ -654,7 +666,13 @@ fn reopen_after_add_column_without_flush() {
         let mut t = Table::create(dir.path(), base_schema(), 1).unwrap();
         put2(&mut t, 1, 10);
         t.commit().unwrap();
-        let _ = t.add_column("extra", TypeId::Bytes).unwrap();
+        let _ = t
+            .add_column(
+                "extra",
+                TypeId::Bytes,
+                ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+            )
+            .unwrap();
         put2(&mut t, 2, 20);
         t.commit().unwrap();
     }
@@ -765,7 +783,13 @@ fn add_column_does_not_change_count() {
     t.commit().unwrap();
     assert_eq!(t.count(), 2);
 
-    let _ = t.add_column("extra", TypeId::Int64).unwrap();
+    let _ = t
+        .add_column(
+            "extra",
+            TypeId::Int64,
+            ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+        )
+        .unwrap();
     assert_eq!(t.count(), 2, "add_column must not change live row count");
     assert_eq!(t.visible_rows(t.snapshot()).unwrap().len(), 2);
 

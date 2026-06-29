@@ -244,8 +244,13 @@ export declare class TableHandle {
  */
 export declare class Transaction {
   constructor(db: Database)
-  /** Stage a put on `table`. */
-  put(table: string, cells: Array<Cell>): void
+  /**
+   * Stage a put on `table`. Returns the engine-assigned `AUTO_INCREMENT`
+   * value when the table has an auto-increment primary key and the column was
+   * omitted or null; returns `null` otherwise (explicit id, or no auto-inc
+   * column). The returned value is the id that will be written on commit.
+   */
+  put(table: string, cells: Array<Cell>): bigint | null
   /** Stage a delete of `row_id` on `table`. */
   delete(table: string, rowId: bigint): void
   /**
@@ -290,8 +295,11 @@ export declare class Transaction {
  * parent's `commit`/`rollback` still apply.
  */
 export declare class TxnTable {
-  /** Stage a put on this table. */
-  put(cells: Array<Cell>): void
+  /**
+   * Stage a put on this table. Returns the engine-assigned `AUTO_INCREMENT`
+   * value when applicable, or `null` otherwise.
+   */
+  put(cells: Array<Cell>): bigint | null
   /** Stage a batch of puts on this table. */
   putBatch(rows: Array<Array<Cell>>): void
   /** Stage a delete of `row_id` on this table. */

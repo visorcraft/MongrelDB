@@ -55,11 +55,19 @@ impl<'db> Transaction<'db> {
     }
 
     /// Stage a put on `table`. The row id is allocated at commit so an aborted
-    /// transaction never consumes ids.
-    pub fn put(&mut self, table: &str, cells: Vec<(u16, Value)>) -> Result<()> {
+    /// transaction never consumes ids. If the table has an `AUTO_INCREMENT`
+    /// primary key and the column is omitted or null, the engine fills it now
+    /// and returns the assigned value; explicit ids are honored and advance the
+    /// counter. The value is staged in `cells`, so the commit path writes the
+    /// same id into the row.
+    pub fn put(&mut self, table: &str, mut cells: Vec<(u16, Value)>) -> Result<Option<i64>> {
+        let handle = self.db.table(table)?;
+        let mut t = handle.lock();
+        let assigned = t.fill_auto_inc(&mut cells)?;
+        drop(t);
         let id = self.db.table_id(table)?;
         self.staging.push((id, Staged::Put(cells)));
-        Ok(())
+        Ok(assigned)
     }
 
     /// Stage a delete of `row_id` on `table`.

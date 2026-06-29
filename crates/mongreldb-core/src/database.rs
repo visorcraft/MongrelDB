@@ -380,7 +380,7 @@ impl Database {
         &self,
         txn_id: u64,
         read_epoch: Epoch,
-        staging: Vec<(u64, crate::txn::Staged)>,
+        mut staging: Vec<(u64, crate::txn::Staged)>,
     ) -> Result<Epoch> {
         use crate::memtable::Row;
         use crate::txn::{Staged, StagedOp, WriteKey};
@@ -444,6 +444,22 @@ impl Database {
             ));
         }
         let pre_validate_version = self.conflicts.version();
+
+        // ── 1a½. Fill `AUTO_INCREMENT` columns for every staged put. This must
+        // happen before row ids are allocated and before rows are serialized
+        // (either as streamed Put records or spilled runs), so raw transaction
+        // users get engine-assigned ids just like single-table `put_returning`.
+        {
+            let tables = self.tables.read();
+            for (table_id, staged) in &mut staging {
+                if let Staged::Put(cells) = staged {
+                    if let Some(handle) = tables.get(table_id) {
+                        let mut t = handle.lock();
+                        t.fill_auto_inc(cells)?;
+                    }
+                }
+            }
+        }
 
         // ── 1b. Spill: if a table's staged puts exceed the threshold, write a
         // uniform-epoch pending run (spec §8.5). Rows in the run are NOT

@@ -46,7 +46,13 @@ fn schema_evolution_reads_old_rows_as_null() {
     db.put(vec![(1, Value::Int64(1))]).unwrap();
     db.flush().unwrap();
 
-    let new_id = db.add_column("note", TypeId::Bytes).unwrap();
+    let new_id = db
+        .add_column(
+            "note",
+            TypeId::Bytes,
+            ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+        )
+        .unwrap();
     assert!(new_id > 1);
 
     // Old run reads the new column as null.

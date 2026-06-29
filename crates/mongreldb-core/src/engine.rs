@@ -1530,7 +1530,7 @@ impl Table {
     /// cell is appended/replaced in `columns`; an explicit `Int64` is honored
     /// and advances the counter past it. Returns `Some(value)` when the engine
     /// allocated (so the caller can surface it), `None` otherwise.
-    fn fill_auto_inc(&mut self, columns: &mut Vec<(u16, Value)>) -> Result<Option<i64>> {
+    pub fn fill_auto_inc(&mut self, columns: &mut Vec<(u16, Value)>) -> Result<Option<i64>> {
         let Some(cid) = self.auto_inc.as_ref().map(|a| a.column_id) else {
             return Ok(None);
         };
@@ -5077,10 +5077,11 @@ impl Table {
         &self.schema
     }
 
-    /// Add a nullable column to the schema (schema evolution). Existing runs
-    /// simply read back as null for the new column until re-written. Persists
-    /// the new schema and manifest.
-    pub fn add_column(&mut self, name: &str, ty: TypeId) -> Result<u16> {
+    /// Add a column to the schema (schema evolution). Existing runs simply read
+    /// back as null for the new column until re-written. Persists the new schema
+    /// and manifest. The caller supplies the full [`ColumnFlags`] so migrations
+    /// can add `PRIMARY KEY` / `AUTO_INCREMENT` columns correctly.
+    pub fn add_column(&mut self, name: &str, ty: TypeId, flags: ColumnFlags) -> Result<u16> {
         if self.schema.columns.iter().any(|c| c.name == name) {
             return Err(MongrelError::Schema(format!(
                 "column {name} already exists"
@@ -5091,9 +5092,13 @@ impl Table {
             id,
             name: name.to_string(),
             ty,
-            flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+            flags,
         });
         self.schema.schema_id = self.schema.schema_id.saturating_add(1);
+        self.schema.validate_auto_increment()?;
+        if flags.contains(ColumnFlags::AUTO_INCREMENT) {
+            self.auto_inc = resolve_auto_inc(&self.schema);
+        }
         write_schema(&self.dir, &self.schema)?;
         self.clear_result_cache();
         // Phase 15.5: invalidate Arrow IPC shadows (schema changed).

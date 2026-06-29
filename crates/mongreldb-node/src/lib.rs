@@ -682,11 +682,17 @@ impl Database {
         let handle = self.inner.table(&table).map_err(to_napi)?;
         let mut g = handle.lock();
         let ty = to_type_id(&column.ty, column.embedding_dim)?;
-        // Core `add_column` always adds the column as nullable; enforcing a
-        // non-null constraint with a default would require a full table rewrite,
-        // which is not yet implemented. The validation above still rejects the
-        // unsupported "non-null without default" case.
-        let id = g.add_column(&column.name, ty).map_err(to_napi)?;
+        let mut flags = mongreldb_core::schema::ColumnFlags::empty();
+        if column.primary_key {
+            flags = flags.with(mongreldb_core::schema::ColumnFlags::PRIMARY_KEY);
+        }
+        if column.nullable {
+            flags = flags.with(mongreldb_core::schema::ColumnFlags::NULLABLE);
+        }
+        if column.auto_increment.unwrap_or(false) {
+            flags = flags.with(mongreldb_core::schema::ColumnFlags::AUTO_INCREMENT);
+        }
+        let id = g.add_column(&column.name, ty, flags).map_err(to_napi)?;
         Ok(BigInt::from(id as u64))
     }
 
@@ -1203,15 +1209,19 @@ impl Transaction {
         }
     }
 
-    /// Stage a put on `table`.
+    /// Stage a put on `table`. Returns the engine-assigned `AUTO_INCREMENT`
+    /// value when the table has an auto-increment primary key and the column was
+    /// omitted or null; returns `null` otherwise (explicit id, or no auto-inc
+    /// column). The returned value is the id that will be written on commit.
     #[napi]
-    pub fn put(&self, table: String, cells: Vec<Cell>) -> napi::Result<()> {
+    pub fn put(&self, table: String, cells: Vec<Cell>) -> napi::Result<Option<BigInt>> {
         let handle = self.db.table(&table).map_err(to_napi)?;
-        let g = handle.lock();
-        let cols = cell_pairs_table(&g, cells)?;
+        let mut g = handle.lock();
+        let mut cols = cell_pairs_table(&g, cells)?;
+        let assigned = g.fill_auto_inc(&mut cols).map_err(to_napi)?;
         drop(g);
         self.staging.lock().push((table, TxnOp::Put(cols)));
-        Ok(())
+        Ok(assigned.map(BigInt::from))
     }
 
     /// Stage a delete of `row_id` on `table`.
@@ -1308,18 +1318,21 @@ pub struct TxnTable {
 
 #[napi]
 impl TxnTable {
-    /// Stage a put on this table.
+    /// Stage a put on this table. Returns the engine-assigned `AUTO_INCREMENT`
+    /// value when applicable, or `null` otherwise.
     #[napi]
-    pub fn put(&self, cells: Vec<Cell>) -> napi::Result<()> {
-        let cols = {
+    pub fn put(&self, cells: Vec<Cell>) -> napi::Result<Option<BigInt>> {
+        let (cols, assigned) = {
             let handle = self.db.table(&self.table).map_err(to_napi)?;
-            let g = handle.lock();
-            cell_pairs_table(&g, cells)?
+            let mut g = handle.lock();
+            let mut cols = cell_pairs_table(&g, cells)?;
+            let assigned = g.fill_auto_inc(&mut cols).map_err(to_napi)?;
+            (cols, assigned)
         };
         self.staging
             .lock()
             .push((self.table.clone(), TxnOp::Put(cols)));
-        Ok(())
+        Ok(assigned.map(BigInt::from))
     }
 
     /// Stage a batch of puts on this table.
@@ -1358,7 +1371,9 @@ fn apply_txn(
     let mut tx = db.begin();
     for (table, op) in stage {
         match op {
-            TxnOp::Put(cells) => tx.put(table, cells.clone())?,
+            TxnOp::Put(cells) => {
+                let _ = tx.put(table, cells.clone())?;
+            }
             TxnOp::Delete(rid) => tx.delete(table, *rid)?,
         }
     }
