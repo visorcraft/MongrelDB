@@ -4915,6 +4915,49 @@ impl Table {
     ///
     /// `column` is `None` for `COUNT(*)`. Returns `Ok(None)` when the fast path
     /// does not apply (multi-run / non-empty memtable); the caller scans.
+    /// Open the streaming [`Cursor`](crate::cursor::Cursor) matching the current
+    /// run layout: the single-run page cursor when there is exactly one sorted
+    /// run, otherwise the multi-run k-way merge cursor. Both fuse the predicate,
+    /// skip non-surviving pages, and fold the memtable / mutable-run overlay, so
+    /// callers stay columnar end-to-end and never materialize `Row`s. Returns
+    /// `None` when no cursor applies (e.g. an overlay-only table with no sorted
+    /// run), leaving the caller to fall back.
+    ///
+    /// This is the single source of truth for layout-aware cursor selection,
+    /// shared by the column scan ([`Self::query_columns_native`] / the SQL
+    /// provider) and the aggregate path ([`Self::aggregate_native`]). New
+    /// streaming consumers should build on this rather than re-deciding the
+    /// cursor by run count.
+    pub fn scan_cursor(
+        &self,
+        snapshot: Snapshot,
+        projection: Vec<(u16, TypeId)>,
+        conditions: &[crate::query::Condition],
+    ) -> Result<Option<Box<dyn crate::cursor::Cursor>>> {
+        if self.run_refs.len() == 1 {
+            Ok(self
+                .native_page_cursor(snapshot, projection, conditions)?
+                .map(|c| Box::new(c) as Box<dyn crate::cursor::Cursor>))
+        } else {
+            Ok(self
+                .native_multi_run_cursor(snapshot, projection, conditions)?
+                .map(|c| Box::new(c) as Box<dyn crate::cursor::Cursor>))
+        }
+    }
+
+    /// Native vectorized aggregate over a (possibly filtered) column, in one
+    /// pass over the typed buffers — no `Value`, no Arrow batch. Layout-agnostic:
+    /// survivors stream through [`Self::scan_cursor`] (single- or multi-run,
+    /// overlay-folded), so the same path serves every sorted-run layout.
+    ///
+    /// `column` is `None` for `COUNT(*)`. Order of attempts:
+    /// 1. Single clean run + no `WHERE` ⇒ `MIN`/`MAX`/`COUNT(col)` straight from
+    ///    page `min`/`max`/`null_count` (no decode).
+    /// 2. `COUNT(*)` ⇒ survivor cardinality from the cursor's page plans.
+    /// 3. Otherwise accumulate the projected column over the cursor.
+    ///
+    /// Returns `Ok(None)` (caller scans) when no native path applies: an
+    /// overlay-only table with no sorted run, or a non-numeric column.
     pub fn aggregate_native(
         &self,
         snapshot: Snapshot,
@@ -4922,45 +4965,35 @@ impl Table {
         conditions: &[crate::query::Condition],
         agg: NativeAgg,
     ) -> Result<Option<NativeAggResult>> {
-        if self.run_refs.len() != 1 {
-            return Ok(None);
-        }
-        // Phase 7.1: with no WHERE, MIN/MAX/COUNT(col) come straight from page
-        // min/max/null_count — no column decode at all.
-        if conditions.is_empty() {
+        // 1. Single clean run + no WHERE ⇒ MIN/MAX/COUNT(col) from page stats.
+        if self.run_refs.len() == 1 && conditions.is_empty() {
             if let Some(res) = self.aggregate_from_stats(snapshot, column, agg)? {
                 return Ok(Some(res));
             }
         }
-        // COUNT(*) needs no decode — the survivor count comes from the cursor's
-        // precomputed page plans. (COUNT(col) would have to exclude nulls; defer
-        // to the caller's scan path by returning None for it.)
-        if matches!(agg, NativeAgg::Count) {
-            if column.is_some() {
-                return Ok(None);
-            }
-            let n = match self.native_page_cursor(snapshot, Vec::new(), conditions)? {
-                Some(cursor) => cursor.remaining_rows(),
-                None => return Ok(None),
-            };
-            return Ok(Some(NativeAggResult::Count(n as u64)));
+        // 2. COUNT(*) ⇒ survivor count from the cursor's page plans, no decode.
+        if matches!(agg, NativeAgg::Count) && column.is_none() {
+            return Ok(self
+                .scan_cursor(snapshot, Vec::new(), conditions)?
+                .map(|c| NativeAggResult::Count(c.remaining_rows() as u64)));
         }
+        // 3. Accumulate the projected column. COUNT(col) excludes nulls — the
+        //    accumulator's count is the non-null count, which `pack_*` returns.
         let cid = match column {
             Some(c) => c,
             None => return Ok(None),
         };
         let ty = self.column_type(cid);
-        let cursor = match self.native_page_cursor(snapshot, vec![(cid, ty)], conditions)? {
-            Some(c) => c,
-            None => return Ok(None),
+        let Some(mut cursor) = self.scan_cursor(snapshot, vec![(cid, ty)], conditions)? else {
+            return Ok(None);
         };
         match ty {
             TypeId::Int64 | TypeId::TimestampNanos | TypeId::Date32 => {
-                let (count, sum, mn, mx) = accumulate_int(cursor)?;
+                let (count, sum, mn, mx) = accumulate_int(cursor.as_mut())?;
                 Ok(Some(pack_int(agg, count, sum, mn, mx)))
             }
             TypeId::Float64 => {
-                let (count, sum, mn, mx) = accumulate_float(cursor)?;
+                let (count, sum, mn, mx) = accumulate_float(cursor.as_mut())?;
                 Ok(Some(pack_float(agg, count, sum, mn, mx)))
             }
             _ => Ok(None),
@@ -5860,7 +5893,7 @@ pub enum NativeAgg {
 }
 
 /// The typed result of a [`NativeAgg`] over a column.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum NativeAggResult {
     Count(u64),
     Int(i64),
@@ -6217,7 +6250,7 @@ fn as_f64(v: Option<&Value>) -> Option<f64> {
 /// One-pass vectorized accumulation of `(non-null count, sum, min, max)` over an
 /// Int64 column streamed through `cursor`. The inner loop over a contiguous
 /// `&[i64]` autovectorizes (SIMD) for the all-non-null prefix.
-fn accumulate_int(mut cursor: crate::cursor::NativePageCursor) -> Result<(u64, i128, i64, i64)> {
+fn accumulate_int(cursor: &mut dyn crate::cursor::Cursor) -> Result<(u64, i128, i64, i64)> {
     let mut count: u64 = 0;
     let mut sum: i128 = 0;
     let mut mn: i64 = i64::MAX;
@@ -6246,7 +6279,7 @@ fn accumulate_int(mut cursor: crate::cursor::NativePageCursor) -> Result<(u64, i
 }
 
 /// f64 analogue of [`accumulate_int`].
-fn accumulate_float(mut cursor: crate::cursor::NativePageCursor) -> Result<(u64, f64, f64, f64)> {
+fn accumulate_float(cursor: &mut dyn crate::cursor::Cursor) -> Result<(u64, f64, f64, f64)> {
     let mut count: u64 = 0;
     let mut sum: f64 = 0.0;
     let mut mn: f64 = f64::INFINITY;

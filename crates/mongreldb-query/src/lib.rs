@@ -252,19 +252,13 @@ impl TableProvider for MongrelProvider {
 
         // Phase 6.2 / 16.1: drive a lazy streaming cursor that fuses the
         // predicate, skips pages with no survivors, and decodes only the
-        // projected columns of surviving pages. Single-run uses the page-plan
-        // fast path; multi-run uses the k-way-merge cursor (Phase 16.1) — both
-        // avoid fully materializing every row. Anything else (e.g. an empty
+        // projected columns of surviving pages. `scan_cursor` picks the page-plan
+        // fast path for a single run or the k-way-merge cursor for multi-run —
+        // both avoid fully materializing every row. Anything else (e.g. an empty
         // table with only memtable rows) falls through to materialize-then-chunk.
-        let cursor: Option<Box<dyn Cursor>> = if db.run_count() == 1 {
-            db.native_page_cursor(snap, proj_pairs, &translated)
-                .map_err(core_err)?
-                .map(|c| Box::new(c) as Box<dyn Cursor>)
-        } else {
-            db.native_multi_run_cursor(snap, proj_pairs, &translated)
-                .map_err(core_err)?
-                .map(|c| Box::new(c) as Box<dyn Cursor>)
-        };
+        let cursor: Option<Box<dyn Cursor>> = db
+            .scan_cursor(snap, proj_pairs, &translated)
+            .map_err(core_err)?;
         if let Some(cursor) = cursor {
             let num_rows = cursor.remaining_rows();
             // Phase 16.3a: extract the LIKE pattern for residual pre-filtering.
