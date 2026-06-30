@@ -936,6 +936,45 @@ async fn metadata_aggregates_count_col_and_null_column() {
     );
 }
 
+/// Phase 7.1c (P7c): COUNT(DISTINCT col) over a bitmap-indexed column is served
+/// from the bitmap's distinct-key count. A column without a bitmap index falls
+/// back to DataFusion (still correct).
+#[tokio::test]
+async fn count_distinct_from_bitmap_partition() {
+    let dir = tempdir().unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
+    // destination cycles through 5 cities ⇒ 5 distinct; bitmap-indexed.
+    let rows: Vec<Vec<(u16, Value)>> = (0..100i64)
+        .map(|i| {
+            vec![
+                (1, Value::Int64(i)),
+                (2, Value::Bytes(format!("City{}", i % 5).into_bytes())),
+                (3, Value::Int64(1_700_000_000 + i)),
+                (4, Value::Float64(1.0 + i as f64)),
+                (5, Value::Float64(2.0)),
+            ]
+        })
+        .collect();
+    db.bulk_load(rows).unwrap();
+    let session = MongrelSession::new(db);
+    session.register("travel_trips").await.unwrap();
+
+    // Bitmap-indexed column ⇒ served from bitmap cardinality.
+    assert_eq!(
+        i64_val(
+            &session,
+            "select count(distinct destination) as c from travel_trips"
+        )
+        .await,
+        5
+    );
+    // PK column (no bitmap) ⇒ DataFusion fallback, still exact: 100 distinct ids.
+    assert_eq!(
+        i64_val(&session, "select count(distinct id) as c from travel_trips").await,
+        100
+    );
+}
+
 /// Regression: COUNT(col) on the visible-rows scan path (data in the mutable-run
 /// overlay, not a sorted run) must exclude rows where the column is absent via
 /// schema evolution — those read NULL and `COUNT(col)` excludes NULLs.

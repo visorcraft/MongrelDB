@@ -42,6 +42,25 @@ pub(crate) fn try_native_aggregate(
     }
     let core_err = |e: mongreldb_core::MongrelError| MongrelQueryError::Core(e);
 
+    // Phase 7.1c: COUNT(DISTINCT col) over a bitmap-indexed column with no WHERE
+    // is the bitmap's distinct-key count — no scan. Falls through to DataFusion
+    // when there is a filter, no bitmap index, or the table isn't insert-only.
+    if let Some(col_name) = parse_count_distinct(&agg.aggr_expr[0]) {
+        let unfiltered = extract_filter_conjuncts(&agg.input).is_some_and(|c| c.is_empty());
+        if unfiltered {
+            if let Some(cdef) = schema.columns.iter().find(|c| c.name == col_name) {
+                if let Some(n) = db.count_distinct_from_bitmap(cdef.id).map_err(core_err)? {
+                    let out_schema: SchemaRef = Arc::new(arrow_schema_from_df(&agg.schema));
+                    let array = scalar_to_array(&ScalarValue::Int64(Some(n as i64)));
+                    let batch = RecordBatch::try_new(out_schema, vec![array])
+                        .map_err(|e| MongrelQueryError::Arrow(e.to_string()))?;
+                    return Ok(Some(batch));
+                }
+            }
+        }
+        return Ok(None); // a DISTINCT shape we can't serve ⇒ let DataFusion run it
+    }
+
     let Some((agg_kind, col_name)) = parse_agg_expr(&agg.aggr_expr[0]) else {
         return Ok(None);
     };
@@ -135,6 +154,29 @@ fn parse_agg_expr(expr: &Expr) -> Option<(NativeAgg, Option<String>)> {
         _ => return None,
     };
     Some((agg, col))
+}
+
+/// If `expr` is `COUNT(DISTINCT <column>)` (peeling an `Alias`), return the
+/// column name. `None` for any other shape (incl. `COUNT(DISTINCT expr)` or a
+/// `FILTER`/`ORDER BY` clause).
+fn parse_count_distinct(expr: &Expr) -> Option<String> {
+    let Expr::AggregateFunction(AggregateFunction { func, params }) = expr else {
+        if let Expr::Alias(alias) = expr {
+            return parse_count_distinct(&alias.expr);
+        }
+        return None;
+    };
+    if func.name() != "count"
+        || !params.distinct
+        || params.filter.is_some()
+        || !params.order_by.is_empty()
+    {
+        return None;
+    }
+    match params.args.as_slice() {
+        [Expr::Column(c)] => Some(c.name.clone()),
+        _ => None,
+    }
 }
 
 /// From `Aggregate.input = (Filter)? → TableScan`, return the WHERE conjuncts

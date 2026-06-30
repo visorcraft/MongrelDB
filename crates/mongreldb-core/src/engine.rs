@@ -5016,6 +5016,34 @@ impl Table {
         }
     }
 
+    /// Phase 7.1c: exact `COUNT(DISTINCT col)` from the bitmap index's partition
+    /// cardinality — the number of distinct indexed values — with no scan. Each
+    /// distinct value is one bitmap key; under the insert-only invariant (empty
+    /// overlay, single run, `live_count == row_count`) every key has at least one
+    /// live row, so the key count is exact. `NULL` is excluded from
+    /// `COUNT(DISTINCT)`, so a null key (from an explicit `Value::Null` put) is
+    /// discounted. Returns `None` (caller scans) without a bitmap index on the
+    /// column or when the invariant does not hold.
+    pub fn count_distinct_from_bitmap(&self, column_id: u16) -> Result<Option<u64>> {
+        if !(self.memtable.is_empty() && self.mutable_run.is_empty() && self.run_refs.len() == 1) {
+            return Ok(None);
+        }
+        let reader = self.open_reader(self.run_refs[0].run_id)?;
+        if self.live_count != reader.row_count() as u64 {
+            return Ok(None);
+        }
+        let Some(bm) = self.bitmap.get(&column_id) else {
+            return Ok(None); // no bitmap index ⇒ let the caller scan
+        };
+        let mut distinct = bm.value_count() as u64;
+        // A null key (explicit `Value::Null`) is indexed but excluded from
+        // COUNT(DISTINCT). (Schema-evolution-absent columns are never indexed.)
+        if !bm.get(&Value::Null.encode_key()).is_empty() {
+            distinct = distinct.saturating_sub(1);
+        }
+        Ok(Some(distinct))
+    }
+
     /// Incremental aggregate over the live table (Phase 8.3). For an append-only
     /// table, a warm cache entry (same `cache_key`) lets the result be refreshed
     /// by aggregating **only the newly inserted rows** (row-id watermark delta)
