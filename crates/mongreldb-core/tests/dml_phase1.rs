@@ -154,6 +154,40 @@ fn upsert_do_nothing_and_update_survive_reopen() {
 }
 
 #[test]
+fn upsert_do_update_identical_patch_is_unchanged() {
+    let dir = tempdir().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.create_table("users", users_schema()).unwrap();
+    db.transaction(|tx| {
+        tx.put("users", row(1, b"alice"))?;
+        Ok(())
+    })
+    .unwrap();
+
+    let mut tx = db.begin();
+    let unchanged = tx
+        .upsert(
+            "users",
+            row(1, b"alice"),
+            UpsertAction::DoUpdate(vec![(2, Value::Bytes(b"alice".to_vec()))]),
+        )
+        .unwrap();
+    assert_eq!(unchanged.action, UpsertActionKind::Unchanged);
+    assert_eq!(cell(&unchanged.row, 2), Value::Bytes(b"alice".to_vec()));
+    tx.commit().unwrap();
+
+    let table = db.table("users").unwrap();
+    let guard = table.lock();
+    let r = guard
+        .get(
+            guard.lookup_pk(&Value::Int64(1).encode_key()).unwrap(),
+            guard.snapshot(),
+        )
+        .unwrap();
+    assert_eq!(r.columns.get(&2), Some(&Value::Bytes(b"alice".to_vec())));
+}
+
+#[test]
 fn update_many_and_delete_many_return_images_and_survive_reopen() {
     let dir = tempdir().unwrap();
     {
@@ -308,4 +342,61 @@ fn transaction_truncate_rejects_same_table_writes() {
     let mut tx = db.begin();
     tx.truncate("users").unwrap();
     assert!(tx.delete("users", RowId(1)).is_err());
+}
+
+#[test]
+fn upsert_update_conflicts_with_concurrent_delete() {
+    let dir = tempdir().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.create_table("users", users_schema()).unwrap();
+
+    // Seed a row.
+    {
+        let t = db.table("users").unwrap();
+        let mut g = t.lock();
+        g.put(row(1, b"alice")).unwrap();
+        g.commit().unwrap();
+    }
+
+    // Upsert commits first, delete loses.
+    {
+        let mut upsert = db.begin();
+        let mut delete = db.begin();
+        upsert
+            .upsert(
+                "users",
+                row(1, b"alice"),
+                UpsertAction::DoUpdate(vec![(2, Value::Bytes(b"updated".to_vec()))]),
+            )
+            .unwrap();
+        delete
+            .delete_many("users", vec![row_id_for(&db, "users", 1)])
+            .unwrap();
+        upsert.commit().unwrap();
+        assert_conflict(delete.commit().unwrap_err());
+    }
+
+    // Re-seed, then delete commits first, upsert loses.
+    {
+        let t = db.table("users").unwrap();
+        let mut g = t.lock();
+        g.put(row(1, b"alice")).unwrap();
+        g.commit().unwrap();
+    }
+    {
+        let mut upsert = db.begin();
+        let mut delete = db.begin();
+        delete
+            .delete_many("users", vec![row_id_for(&db, "users", 1)])
+            .unwrap();
+        upsert
+            .upsert(
+                "users",
+                row(1, b"alice"),
+                UpsertAction::DoUpdate(vec![(2, Value::Bytes(b"updated2".to_vec()))]),
+            )
+            .unwrap();
+        delete.commit().unwrap();
+        assert_conflict(upsert.commit().unwrap_err());
+    }
 }

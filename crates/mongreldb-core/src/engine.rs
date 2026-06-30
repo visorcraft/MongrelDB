@@ -196,8 +196,9 @@ pub struct Table {
     /// epoch in `commit` (mirror of `pending_rows`).
     pending_dels: Vec<RowId>,
     /// B1/B2: truncate staged on a mounted table, applied at the assigned epoch
-    /// in `commit`; standalone tables apply the clear immediately.
-    pending_truncate: bool,
+    /// in `commit`; standalone tables also defer the physical clear until after
+    /// the private WAL is fsynced.
+    pending_truncate: Option<Epoch>,
     /// Engine-managed `AUTO_INCREMENT` counter (`None` for tables without an
     /// auto-increment primary key). See [`AutoIncState`].
     auto_inc: Option<AutoIncState>,
@@ -955,7 +956,7 @@ impl Table {
             pending_rows: Vec::new(),
             pending_rows_auto_inc: Vec::new(),
             pending_dels: Vec::new(),
-            pending_truncate: false,
+            pending_truncate: None,
             wal_dek,
             auto_inc,
         })
@@ -1164,7 +1165,7 @@ impl Table {
             pending_rows: Vec::new(),
             pending_rows_auto_inc: Vec::new(),
             pending_dels: Vec::new(),
-            pending_truncate: false,
+            pending_truncate: None,
             wal_dek,
             auto_inc,
         };
@@ -2127,14 +2128,10 @@ impl Table {
         self.wal_append_data(Op::TruncateTable {
             table_id: self.table_id,
         })?;
-        if self.is_shared() {
-            self.pending_rows.clear();
-            self.pending_rows_auto_inc.clear();
-            self.pending_dels.clear();
-            self.pending_truncate = true;
-        } else {
-            self.apply_truncate(epoch)?;
-        }
+        self.pending_rows.clear();
+        self.pending_rows_auto_inc.clear();
+        self.pending_dels.clear();
+        self.pending_truncate = Some(epoch);
         Ok(())
     }
 
@@ -2363,6 +2360,10 @@ impl Table {
             }
             WalSink::Shared(_) => unreachable!("commit_private on a shared sink"),
         }
+        // The truncate record is now durable; apply the physical clear.
+        if let Some(epoch) = self.pending_truncate.take() {
+            self.apply_truncate(epoch)?;
+        }
         self.invalidate_pending_cache();
         self.persist_manifest(new_epoch)?;
         // Publish through the shared in-order gate so a `Table::commit` can never
@@ -2412,7 +2413,7 @@ impl Table {
 
         // Apply staged truncate/rows/tombstones at the real assigned epoch (B2): nothing
         // was stamped speculatively, and nothing is visible until publish below.
-        if std::mem::take(&mut self.pending_truncate) {
+        if self.pending_truncate.take().is_some() {
             self.apply_truncate(new_epoch)?;
         }
         let mut rows = std::mem::take(&mut self.pending_rows);

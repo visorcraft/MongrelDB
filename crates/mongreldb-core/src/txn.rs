@@ -202,7 +202,14 @@ impl<'db> Transaction<'db> {
                 auto_inc: None,
             }),
             (Some((old_id, old_row)), UpsertAction::DoUpdate(update_cells)) => {
-                let merged = merge_cells(old_row.columns, update_cells);
+                let merged = merge_cells(old_row.columns.clone(), update_cells);
+                if columns_equal(&old_row.columns, &merged) {
+                    return Ok(UpsertResult {
+                        action: UpsertActionKind::Unchanged,
+                        row: old_row,
+                        auto_inc: None,
+                    });
+                }
                 let row = owned_row_from_cells(&merged);
                 self.staging.push((id, Staged::Delete(old_id)));
                 self.staging.push((id, Staged::Put(merged)));
@@ -295,6 +302,19 @@ fn merge_cells(mut base: Vec<(u16, Value)>, updates: Vec<(u16, Value)>) -> Vec<(
     }
     base.sort_by_key(|(id, _)| *id);
     base
+}
+
+fn columns_equal(a: &[(u16, Value)], b: &[(u16, Value)]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut a: Vec<_> = a.iter().collect();
+    let mut b: Vec<_> = b.iter().collect();
+    a.sort_by_key(|(id, _)| *id);
+    b.sort_by_key(|(id, _)| *id);
+    a.iter()
+        .zip(b.iter())
+        .all(|((id_a, v_a), (id_b, v_b))| id_a == id_b && v_a == v_b)
 }
 
 /// Staged operation produced after row-id allocation (internal to commit).
