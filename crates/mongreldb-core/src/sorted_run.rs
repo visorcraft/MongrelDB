@@ -2236,10 +2236,10 @@ impl RunReader {
                 let rid_page = self.read_page(SYS_ROW_ID, seq)?;
                 let rids = columnar::decode_page_native(TypeId::Int64, &rid_page, nrows)?;
                 if let columnar::NativeColumn::Int64 { data: r, .. } = rids {
-                    for i in 0..nrows {
+                    for (i, &rid) in r.iter().enumerate().take(nrows) {
                         let is_null = !columnar::validity_bit(validity, i);
                         if is_null == want_nulls {
-                            out.push(r[i] as u64);
+                            out.push(rid as u64);
                         }
                     }
                 }

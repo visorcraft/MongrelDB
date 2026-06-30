@@ -6196,14 +6196,12 @@ fn condition_matches_row(c: &crate::query::Condition, row: &Row, schema: &Schema
             _ => false,
         },
         Condition::Ann { .. } | Condition::SparseMatch { .. } => true,
-        Condition::IsNull { column_id } => match row.columns.get(column_id) {
-            Some(Value::Null) | None => true,
-            _ => false,
-        },
-        Condition::IsNotNull { column_id } => match row.columns.get(column_id) {
-            Some(Value::Null) | None => false,
-            _ => true,
-        },
+        Condition::IsNull { column_id } => {
+            matches!(row.columns.get(column_id), Some(Value::Null) | None)
+        }
+        Condition::IsNotNull { column_id } => {
+            !matches!(row.columns.get(column_id), Some(Value::Null) | None)
+        }
     }
 }
 
