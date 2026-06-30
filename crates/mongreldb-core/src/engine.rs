@@ -4873,6 +4873,13 @@ impl Table {
         if self.run_refs.len() != 1 {
             return Ok(None);
         }
+        // Phase 7.1: with no WHERE, MIN/MAX/COUNT(col) come straight from page
+        // min/max/null_count — no column decode at all.
+        if conditions.is_empty() {
+            if let Some(res) = self.aggregate_from_stats(snapshot, column, agg)? {
+                return Ok(Some(res));
+            }
+        }
         // COUNT(*) needs no decode — the survivor count comes from the cursor's
         // precomputed page plans. (COUNT(col) would have to exclude nulls; defer
         // to the caller's scan path by returning None for it.)
@@ -4903,6 +4910,55 @@ impl Table {
             TypeId::Float64 => {
                 let (count, sum, mn, mx) = accumulate_float(cursor)?;
                 Ok(Some(pack_float(agg, count, sum, mn, mx)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Phase 7.1 metadata fast path: answer an unfiltered `MIN`/`MAX`/`COUNT(col)`
+    /// straight from page `min`/`max`/`null_count` — no column decode. Returns
+    /// `None` (caller decodes) for `COUNT(*)`/`SUM`/`AVG`, when exact stats are
+    /// unavailable (multi-version run; [`Table::exact_column_stats`] gates this),
+    /// or for a column whose stats omit `min`/`max` while it still holds values
+    /// (e.g. an encrypted column) — returning `NULL` there would be a wrong
+    /// answer, so we fall back to decoding.
+    fn aggregate_from_stats(
+        &self,
+        snapshot: Snapshot,
+        column: Option<u16>,
+        agg: NativeAgg,
+    ) -> Result<Option<NativeAggResult>> {
+        let cid = match (agg, column) {
+            (NativeAgg::Count | NativeAgg::Min | NativeAgg::Max, Some(c)) => c,
+            _ => return Ok(None), // COUNT(*), SUM, AVG: not served from page stats
+        };
+        let Some(stats) = self.exact_column_stats(snapshot, &[cid])? else {
+            return Ok(None);
+        };
+        let Some(cs) = stats.get(&cid) else {
+            return Ok(None);
+        };
+        match agg {
+            // COUNT(col) excludes NULLs: live rows minus the column's null count.
+            NativeAgg::Count => Ok(Some(NativeAggResult::Count(
+                self.live_count.saturating_sub(cs.null_count),
+            ))),
+            NativeAgg::Min | NativeAgg::Max => {
+                let bound = if agg == NativeAgg::Min {
+                    &cs.min
+                } else {
+                    &cs.max
+                };
+                match bound {
+                    Some(Value::Int64(x)) => Ok(Some(NativeAggResult::Int(*x))),
+                    Some(Value::Float64(x)) => Ok(Some(NativeAggResult::Float(*x))),
+                    Some(_) => Ok(None), // unexpected stat type ⇒ decode
+                    // No bound: a genuine SQL NULL only when the column is wholly
+                    // null. Otherwise the stats are simply unavailable (encrypted),
+                    // so decode for a correct answer.
+                    None if cs.null_count >= self.live_count => Ok(Some(NativeAggResult::Null)),
+                    None => Ok(None),
+                }
             }
             _ => Ok(None),
         }
@@ -5924,14 +5980,16 @@ fn agg_state_from_rows(
             continue;
         }
         match agg {
-            NativeAgg::Count => {
-                // COUNT(*) counts every passing row; COUNT(col) excludes NULLs.
-                match column.and_then(|cid| r.columns.get(&cid)) {
-                    None => count += 1,
-                    Some(Value::Null) => {}
+            NativeAgg::Count => match column {
+                // COUNT(*) counts every passing row.
+                None => count += 1,
+                // COUNT(col) excludes NULLs — explicit `Value::Null` and a column
+                // absent from the row (schema evolution) are both NULL.
+                Some(cid) => match r.columns.get(&cid) {
+                    None | Some(Value::Null) => {}
                     Some(_) => count += 1,
-                }
-            }
+                },
+            },
             _ => match column.and_then(|cid| r.columns.get(&cid)) {
                 Some(Value::Int64(n)) => {
                     count += 1;

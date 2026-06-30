@@ -262,6 +262,86 @@ async fn bitmap_intersect_range() {
     assert_eq!(total_rows(&batches), 1);
 }
 
+// ── Priority 6: OR-of-equalities on one column → BitmapIn pushdown ────────────
+
+/// `col = a OR col = b OR …` on a bitmap-indexed column unions to the bitmap of
+/// each value. Exercises `try_or_as_bitmap_in` and the `BitmapIn` condition.
+#[tokio::test]
+async fn or_of_equalities_same_column_unions() {
+    let (_dir, session) = setup().await;
+    let two = session
+        .run("select id from travel_trips where destination = 'City5' or destination = 'City7'")
+        .await
+        .unwrap();
+    assert_eq!(total_rows(&two), 2);
+
+    let three = session
+        .run(
+            "select id from travel_trips \
+             where destination = 'City1' or destination = 'City2' or destination = 'City3'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(total_rows(&three), 3);
+}
+
+// ── Priority 6: IS NULL / IS NOT NULL pushdown ───────────────────────────────
+
+/// 60 rows predate an `add_column("note")` (so they read NULL); 40 rows set it.
+/// `IS NULL` must return exactly the 60, `IS NOT NULL` the 40.
+#[tokio::test]
+async fn is_null_and_is_not_null_partition_rows() {
+    let dir = tempdir().unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
+    for i in 0..60i64 {
+        db.put(vec![
+            (1, Value::Int64(i)),
+            (2, Value::Bytes(format!("City{i}").into_bytes())),
+            (3, Value::Int64(1_700_000_000 + i)),
+            (4, Value::Float64(1.0 + i as f64)),
+            (5, Value::Float64(2.0)),
+        ])
+        .unwrap();
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+
+    db.add_column(
+        "note",
+        TypeId::Bytes,
+        ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+    )
+    .unwrap();
+    for i in 60..100i64 {
+        db.put(vec![
+            (1, Value::Int64(i)),
+            (2, Value::Bytes(format!("City{i}").into_bytes())),
+            (3, Value::Int64(1_700_000_000 + i)),
+            (4, Value::Float64(1.0 + i as f64)),
+            (5, Value::Float64(2.0)),
+            (6, Value::Bytes(format!("note{i}").into_bytes())),
+        ])
+        .unwrap();
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+
+    let session = MongrelSession::new(db);
+    session.register("travel_trips").await.unwrap();
+
+    let nulls = session
+        .run("select id from travel_trips where note is null")
+        .await
+        .unwrap();
+    assert_eq!(total_rows(&nulls), 60);
+
+    let not_nulls = session
+        .run("select id from travel_trips where note is not null")
+        .await
+        .unwrap();
+    assert_eq!(total_rows(&not_nulls), 40);
+}
+
 // ── Item 1: HNSW semantic pushdown via the `ann_search` SQL UDF ──────────────
 
 fn vec_schema() -> Schema {
@@ -786,6 +866,114 @@ async fn metadata_aggregates_count_min_max() {
         .value(0);
     assert_eq!(mn, 0);
     assert_eq!(mx, 99);
+}
+
+/// Phase 7.1 (P7a/P7b): COUNT(col) and MIN/MAX served from page
+/// min/max/null_count with no column decode. `bulk_load` lands the rows in a
+/// single sorted run (empty overlay, `live_count == row_count`), so aggregates
+/// route through `aggregate_from_stats`. `empty_i` is added afterward, so every
+/// row reads NULL for it — exercising COUNT-excludes-NULL and all-NULL MIN/MAX
+/// (⇒ SQL NULL).
+#[tokio::test]
+async fn metadata_aggregates_count_col_and_null_column() {
+    let dir = tempdir().unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
+    let rows: Vec<Vec<(u16, Value)>> = (0..100i64)
+        .map(|i| {
+            vec![
+                (1, Value::Int64(i)),
+                (2, Value::Bytes(format!("City{i}").into_bytes())),
+                (3, Value::Int64(1_700_000_000 + i)),
+                (4, Value::Float64(10.0 + i as f64)),
+                (5, Value::Float64(2.0)),
+            ]
+        })
+        .collect();
+    db.bulk_load(rows).unwrap(); // single sorted run, 100 rows
+    db.add_column(
+        "empty_i",
+        TypeId::Int64,
+        ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+    )
+    .unwrap(); // absent from the run ⇒ every row reads NULL, still one run
+    let session = MongrelSession::new(db);
+    session.register("travel_trips").await.unwrap();
+
+    // COUNT(col) excludes NULLs: id (PK) has none; empty_i is wholly NULL.
+    assert_eq!(
+        i64_val(&session, "select count(id) as c from travel_trips").await,
+        100
+    );
+    assert_eq!(
+        i64_val(&session, "select count(empty_i) as c from travel_trips").await,
+        0
+    );
+
+    // MIN/MAX from page bounds — Int64 and Float64.
+    assert_eq!(
+        i64_val(&session, "select min(departure) as m from travel_trips").await,
+        1_700_000_000
+    );
+    assert_eq!(
+        i64_val(&session, "select max(departure) as m from travel_trips").await,
+        1_700_000_099
+    );
+    assert!(
+        (f64_val(&session, "select min(cost) as m from travel_trips").await - 10.0).abs() < 1e-9
+    );
+    assert!(
+        (f64_val(&session, "select max(cost) as m from travel_trips").await - 109.0).abs() < 1e-9
+    );
+
+    // MIN/MAX over a wholly-NULL column ⇒ SQL NULL.
+    let nb = session
+        .run("select min(empty_i) as m from travel_trips")
+        .await
+        .unwrap();
+    assert!(
+        nb[0].column(0).is_null(0),
+        "MIN over an all-NULL column must be SQL NULL"
+    );
+}
+
+/// Regression: COUNT(col) on the visible-rows scan path (data in the mutable-run
+/// overlay, not a sorted run) must exclude rows where the column is absent via
+/// schema evolution — those read NULL and `COUNT(col)` excludes NULLs.
+#[tokio::test]
+async fn count_col_excludes_schema_evolution_nulls_on_scan() {
+    let dir = tempdir().unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
+    for i in 0..40i64 {
+        db.put(vec![
+            (1, Value::Int64(i)),
+            (2, Value::Bytes(format!("City{i}").into_bytes())),
+            (3, Value::Int64(1_700_000_000 + i)),
+            (4, Value::Float64(10.0 + i as f64)),
+            (5, Value::Float64(2.0)),
+        ])
+        .unwrap();
+    }
+    db.commit().unwrap();
+    db.flush().unwrap(); // rows live in the mutable-run overlay (not a sorted run)
+    db.add_column(
+        "empty_i",
+        TypeId::Int64,
+        ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+    )
+    .unwrap();
+    let session = MongrelSession::new(db);
+    session.register("travel_trips").await.unwrap();
+
+    // All 40 rows predate empty_i ⇒ NULL ⇒ excluded by COUNT(col).
+    assert_eq!(
+        i64_val(&session, "select count(empty_i) as c from travel_trips").await,
+        0
+    );
+    // COUNT(*) still counts every row.
+    assert_eq!(
+        i64_val(&session, "select count(*) as c from travel_trips").await,
+        40
+    );
 }
 
 /// Phase 7.1: verify DataFusion's `AggregateStatistics` rewrite actually fires —
