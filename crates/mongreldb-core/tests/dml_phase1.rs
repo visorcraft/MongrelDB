@@ -400,3 +400,47 @@ fn upsert_update_conflicts_with_concurrent_delete() {
         assert_conflict(upsert.commit().unwrap_err());
     }
 }
+
+#[test]
+fn table_truncate_private_wal_deferred_until_commit() {
+    use mongreldb_core::manifest;
+
+    let dir = tempdir().unwrap();
+    let table_dir = dir.path().join("table");
+    {
+        let mut table = Table::create(&table_dir, users_schema(), 1).unwrap();
+        // Force every row to spill to an immutable sorted run so the manifest
+        // holds a reference to a run file. An uncommitted truncate must not
+        // delete that run or clear the manifest.
+        table.set_mutable_run_spill_bytes(1);
+        table.put(row(1, b"alice")).unwrap();
+        table.commit().unwrap();
+        table.flush().unwrap();
+        assert_eq!(table.count(), 1);
+
+        // Stage a truncate but do not commit. Dropping the table should roll
+        // back the uncommitted truncate.
+        table.truncate().unwrap();
+    }
+
+    let table = Table::open(&table_dir).unwrap();
+    assert_eq!(table.count(), 1);
+    assert!(
+        table.lookup_pk(&Value::Int64(1).encode_key()).is_some(),
+        "row with pk=1 should survive an uncommitted truncate"
+    );
+
+    let manifest = manifest::read(&table_dir, None).unwrap();
+    assert!(
+        !manifest.runs.is_empty(),
+        "manifest should still reference the flushed run"
+    );
+    for run in &manifest.runs {
+        let path = table_dir.join("_runs").join(format!("r-{}.sr", run.run_id));
+        assert!(
+            path.exists(),
+            "run file referenced by manifest should still exist: {:?}",
+            path
+        );
+    }
+}

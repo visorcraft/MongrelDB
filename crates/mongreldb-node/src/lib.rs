@@ -1473,6 +1473,20 @@ impl Transaction {
         .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e:?}")))?
     }
 
+    /// Async commit that returns both the committed epoch and the affected row
+    /// identities, off the JS event loop. Throws `ConflictError` on write-write
+    /// conflict.
+    #[napi]
+    pub async fn commit_async_returning(&self) -> napi::Result<CommitResultJs> {
+        let db = Arc::clone(&self.db);
+        let stage = std::mem::take(&mut *self.staging.lock());
+        napi::bindgen_prelude::spawn_blocking(move || {
+            commit_returning_to_napi(&db, apply_txn(&db, &stage))
+        })
+        .await
+        .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e:?}")))?
+    }
+
     /// Discard all staged ops.
     #[napi]
     pub fn rollback(&self) {

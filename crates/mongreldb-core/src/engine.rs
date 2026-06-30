@@ -2117,8 +2117,10 @@ impl Table {
     pub fn delete_returning(&mut self, row_id: RowId) -> Result<Option<OwnedRow>> {
         let pre = self.get(row_id, self.snapshot());
         self.delete(row_id)?;
-        Ok(pre.map(|row| OwnedRow {
-            columns: row.columns.into_iter().collect(),
+        Ok(pre.map(|row| {
+            let mut columns: Vec<_> = row.columns.into_iter().collect();
+            columns.sort_by_key(|(id, _)| *id);
+            OwnedRow { columns }
         }))
     }
 

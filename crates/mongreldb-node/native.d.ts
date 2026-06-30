@@ -314,6 +314,12 @@ export declare class Transaction {
    * blocking pool). Throws `ConflictError` on write-write conflict.
    */
   commitAsync(): Promise<bigint>
+  /**
+   * Async commit that returns both the committed epoch and the affected row
+   * identities, off the JS event loop. Throws `ConflictError` on write-write
+   * conflict.
+   */
+  commitAsyncReturning(): Promise<CommitResultJs>
   /** Discard all staged ops. */
   rollback(): void
   /**
