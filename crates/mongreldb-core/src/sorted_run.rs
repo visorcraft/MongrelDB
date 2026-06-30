@@ -2195,7 +2195,59 @@ impl RunReader {
         Ok(RowIdSet::from_unsorted(out))
     }
 
-    /// Visible array indices computed from typed system columns (no `Value`).
+    /// Page-pruned row-id set for `IS NULL` / `IS NOT NULL` on `column_id`.
+    /// Skips pages whose `null_count` makes a match impossible (no nulls for
+    /// `IS NULL`, all-nulls for `IS NOT NULL`), then decodes the validity bitmap
+    /// of surviving pages to pinpoint matching rows.
+    pub(crate) fn null_row_id_set(&mut self, column_id: u16, want_nulls: bool) -> Result<RowIdSet> {
+        let stats: Vec<(usize, usize)> = match self.dir.iter().find(|h| h.column_id == column_id) {
+            Some(ch) => ch
+                .page_stats
+                .iter()
+                .map(|s| (s.null_count as usize, s.row_count as usize))
+                .collect(),
+            None => return Ok(RowIdSet::empty()),
+        };
+        let ty = self.resolve_type(column_id);
+        let clean_contiguous = self.clean_contiguous_row_ids();
+        let mut out = Vec::new();
+        let mut page_start = 0usize;
+        for (seq, (null_count, nrows)) in stats.into_iter().enumerate() {
+            let current_page_start = page_start;
+            page_start += nrows;
+            // Skip pages that cannot match.
+            if want_nulls && null_count == 0 {
+                continue;
+            }
+            if !want_nulls && null_count == nrows {
+                continue;
+            }
+            let val_page = self.read_page(column_id, seq)?;
+            let col = columnar::decode_page_native(ty, &val_page, nrows)?;
+            let validity = col.validity();
+            if clean_contiguous {
+                for i in 0..nrows {
+                    let is_null = !columnar::validity_bit(validity, i);
+                    if is_null == want_nulls {
+                        out.push(self.header.min_row_id + current_page_start as u64 + i as u64);
+                    }
+                }
+            } else {
+                let rid_page = self.read_page(SYS_ROW_ID, seq)?;
+                let rids = columnar::decode_page_native(TypeId::Int64, &rid_page, nrows)?;
+                if let columnar::NativeColumn::Int64 { data: r, .. } = rids {
+                    for i in 0..nrows {
+                        let is_null = !columnar::validity_bit(validity, i);
+                        if is_null == want_nulls {
+                            out.push(r[i] as u64);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(RowIdSet::from_unsorted(out))
+    }
+
     pub fn visible_indices_native(&mut self, snapshot: Epoch) -> Result<Vec<usize>> {
         let n = self.row_count();
         if n == 0 {
@@ -2361,7 +2413,54 @@ impl RunReader {
         Ok(out)
     }
 
-    /// Visible row positions (latest version per `RowId` at `snapshot`,
+    /// MVCC-visible `IS NULL` / `IS NOT NULL` resolution. Follows the same
+    /// page-stat-pruned + visible-positions pattern as
+    /// [`Self::range_row_ids_visible_i64`], but checks the validity bitmap
+    /// instead of a value range. Pages with no nulls (for IS NULL) or all-nulls
+    /// (for IS NOT NULL) are skipped.
+    pub fn null_row_ids_visible(
+        &mut self,
+        column_id: u16,
+        want_nulls: bool,
+        snapshot: Epoch,
+    ) -> Result<Vec<u64>> {
+        let stats: Vec<(usize, usize)> = match self.column_page_stats(column_id) {
+            Some(s) => s
+                .iter()
+                .map(|st| (st.null_count as usize, st.row_count as usize))
+                .collect(),
+            None => return Ok(Vec::new()),
+        };
+        let ty = self.resolve_type(column_id);
+        let (positions, rids) = self.visible_positions_with_rids(snapshot)?;
+        let mut out: Vec<u64> = Vec::new();
+        let mut vis = 0usize;
+        let mut page_start = 0usize;
+        for (seq, &(null_count, nrows)) in stats.iter().enumerate() {
+            let page_end = page_start + nrows;
+            let skip = (want_nulls && null_count == 0) || (!want_nulls && null_count == nrows);
+            if !skip {
+                let val_page = self.read_page(column_id, seq)?;
+                let col = columnar::decode_page_native(ty, &val_page, nrows)?;
+                let validity = col.validity();
+                while vis < positions.len() && positions[vis] < page_end {
+                    let local = positions[vis] - page_start;
+                    let is_null = !columnar::validity_bit(validity, local);
+                    if is_null == want_nulls {
+                        out.push(rids[vis] as u64);
+                    }
+                    vis += 1;
+                }
+            } else {
+                while vis < positions.len() && positions[vis] < page_end {
+                    vis += 1;
+                }
+            }
+            page_start = page_end;
+        }
+        Ok(out)
+    }
+
     /// tombstones excluded) paired with each position's `RowId`, in one pass.
     /// Used by [`crate::cursor::NativePageCursor`] to map survivors to pages
     /// without re-decoding the system columns.

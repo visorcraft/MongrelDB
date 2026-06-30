@@ -720,6 +720,17 @@ impl NativeColumn {
         self.len() == 0
     }
 
+    /// The null-validity bitmask (bit `i` set ⇒ row `i` non-null). All variants
+    /// carry one; use [`validity_bit`] to test individual positions.
+    pub fn validity(&self) -> &[u8] {
+        match self {
+            NativeColumn::Int64 { validity, .. }
+            | NativeColumn::Float64 { validity, .. }
+            | NativeColumn::Bool { validity, .. }
+            | NativeColumn::Bytes { validity, .. } => validity,
+        }
+    }
+
     /// Verify internal invariants after deserialization (hardening (b)).
     /// Returns `false` if the column is structurally invalid (e.g. offsets
     /// length mismatch, last offset out of bounds).

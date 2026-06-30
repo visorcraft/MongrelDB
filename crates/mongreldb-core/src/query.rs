@@ -29,6 +29,14 @@ pub enum Condition {
     },
     /// Arbitrary substring via the FM index (no tokenization).
     FmContains { column_id: u16, pattern: Vec<u8> },
+    /// Multi-segment FM intersection for `LIKE '%seg1%seg2%...'` (Priority 12).
+    /// Resolves to the **intersection** of FM lookups for each segment — a much
+    /// tighter superset than the single longest segment. DataFusion still
+    /// re-applies the real wildcard semantics (`Inexact` pushdown).
+    FmContainsAll {
+        column_id: u16,
+        patterns: Vec<Vec<u8>>,
+    },
     /// Inclusive integer range (served by scanning the int column, later by the
     /// learned PGM index / page-index pruning). Exclusive bounds (`>`,`<`) are
     /// expressed exactly via ±1 in the translator.
@@ -49,6 +57,13 @@ pub enum Condition {
         query: Vec<(u32, f32)>,
         k: usize,
     },
+    /// Rows where `column_id` is NULL. Resolved by decoding the column and
+    /// collecting null positions — a column scan, but no row materialization.
+    /// Page-stat aware: pages with `null_count == 0` are skipped.
+    IsNull { column_id: u16 },
+    /// Rows where `column_id` is NOT NULL. The complement of [`Self::IsNull`].
+    /// Page-stat aware: pages with `null_count == row_count` are skipped.
+    IsNotNull { column_id: u16 },
 }
 
 /// A conjunctive query. Empty ⇒ all rows.
@@ -157,6 +172,19 @@ fn hash_condition(c: &Condition) -> u64 {
             column_id.hash(&mut h);
             pattern.hash(&mut h);
         }
+        Condition::FmContainsAll {
+            column_id,
+            patterns,
+        } => {
+            10u8.hash(&mut h);
+            column_id.hash(&mut h);
+            let mut sorted: Vec<&[u8]> = patterns.iter().map(|p| p.as_slice()).collect();
+            sorted.sort();
+            sorted.len().hash(&mut h);
+            for p in sorted {
+                p.hash(&mut h);
+            }
+        }
         Condition::Range { column_id, lo, hi } => {
             5u8.hash(&mut h);
             column_id.hash(&mut h);
@@ -192,6 +220,14 @@ fn hash_condition(c: &Condition) -> u64 {
                 wb.hash(&mut h);
             }
         }
+        Condition::IsNull { column_id } => {
+            8u8.hash(&mut h);
+            column_id.hash(&mut h);
+        }
+        Condition::IsNotNull { column_id } => {
+            9u8.hash(&mut h);
+            column_id.hash(&mut h);
+        }
     }
     h.finish()
 }
@@ -209,9 +245,12 @@ pub fn condition_columns(conditions: &[Condition]) -> Vec<u16> {
             | Condition::BitmapIn { column_id, .. }
             | Condition::Ann { column_id, .. }
             | Condition::FmContains { column_id, .. }
+            | Condition::FmContainsAll { column_id, .. }
             | Condition::Range { column_id, .. }
             | Condition::RangeF64 { column_id, .. }
-            | Condition::SparseMatch { column_id, .. } => Some(*column_id),
+            | Condition::SparseMatch { column_id, .. }
+            | Condition::IsNull { column_id }
+            | Condition::IsNotNull { column_id } => Some(*column_id),
         })
         .collect();
     cols.sort_unstable();

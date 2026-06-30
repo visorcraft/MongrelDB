@@ -3145,6 +3145,26 @@ impl Table {
                     RowIdSet::from_unsorted(f.locate(pattern).into_iter().map(|r| r.0).collect())
                 })
                 .unwrap_or_else(RowIdSet::empty),
+            Condition::FmContainsAll {
+                column_id,
+                patterns,
+            } => {
+                // Multi-segment intersection (Priority 12): resolve each segment
+                // via FM and intersect — much tighter than the single longest.
+                if let Some(f) = self.fm.get(column_id) {
+                    let sets: Vec<RowIdSet> = patterns
+                        .iter()
+                        .map(|pat| {
+                            RowIdSet::from_unsorted(
+                                f.locate(pat).into_iter().map(|r| r.0).collect(),
+                            )
+                        })
+                        .collect();
+                    RowIdSet::intersect_many(sets)
+                } else {
+                    RowIdSet::empty()
+                }
+            }
             Condition::Ann {
                 column_id,
                 query,
@@ -3230,6 +3250,28 @@ impl Table {
                     *hi_inclusive,
                     snapshot,
                 );
+                set
+            }
+            Condition::IsNull { column_id } => {
+                let mut set = if self.run_refs.len() == 1 {
+                    let mut r = self.open_reader(self.run_refs[0].run_id)?;
+                    r.null_row_id_set(*column_id, true)?
+                } else {
+                    return self.null_scan(*column_id, true, snapshot);
+                };
+                set.remove_many(self.overlay_rid_set(snapshot));
+                self.null_scan_overlay(&mut set, *column_id, true, snapshot);
+                set
+            }
+            Condition::IsNotNull { column_id } => {
+                let mut set = if self.run_refs.len() == 1 {
+                    let mut r = self.open_reader(self.run_refs[0].run_id)?;
+                    r.null_row_id_set(*column_id, false)?
+                } else {
+                    return self.null_scan(*column_id, false, snapshot);
+                };
+                set.remove_many(self.overlay_rid_set(snapshot));
+                self.null_scan_overlay(&mut set, *column_id, false, snapshot);
                 set
             }
         })
@@ -3386,6 +3428,56 @@ impl Table {
         }
     }
 
+    /// Multi-run fallback for `IS NULL` / `IS NOT NULL`. Calls each run's
+    /// MVCC-aware null scan and merges with the overlay.
+    fn null_scan(&self, column_id: u16, want_nulls: bool, snapshot: Snapshot) -> Result<RowIdSet> {
+        let mut row_ids = Vec::new();
+        let overlay_rids = self.overlay_rid_set(snapshot);
+        for rr in &self.run_refs {
+            let mut reader = self.open_reader(rr.run_id)?;
+            let matched = reader.null_row_ids_visible(column_id, want_nulls, snapshot.epoch)?;
+            for rid in matched {
+                if !overlay_rids.contains(&rid) {
+                    row_ids.push(rid);
+                }
+            }
+        }
+        let mut s = RowIdSet::from_unsorted(row_ids);
+        self.null_scan_overlay(&mut s, column_id, want_nulls, snapshot);
+        Ok(s)
+    }
+
+    /// Merge overlay rows for `IS NULL` / `IS NOT NULL`. An overlay row
+    /// supersedes its run version, so overlay rids are removed from the run
+    /// set and re-evaluated from the overlay values directly.
+    fn null_scan_overlay(
+        &self,
+        s: &mut RowIdSet,
+        column_id: u16,
+        want_nulls: bool,
+        snapshot: Snapshot,
+    ) {
+        let mut newest: HashMap<u64, &Row> = HashMap::new();
+        let mutable = self.mutable_run.visible_versions(snapshot.epoch);
+        let memtable = self.memtable.visible_versions(snapshot.epoch);
+        for r in &mutable {
+            newest.entry(r.row_id.0).or_insert(r);
+        }
+        for r in &memtable {
+            newest.insert(r.row_id.0, r);
+        }
+        for row in newest.values() {
+            if row.deleted {
+                continue;
+            }
+            let is_null = !row.columns.contains_key(&column_id)
+                || matches!(row.columns.get(&column_id), Some(Value::Null) | None);
+            if is_null == want_nulls {
+                s.insert(row.row_id.0);
+            }
+        }
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         Snapshot::at(self.epoch.visible())
     }
@@ -3460,10 +3552,13 @@ impl Table {
                     | Condition::BitmapEq { .. }
                     | Condition::BitmapIn { .. }
                     | Condition::FmContains { .. }
+                    | Condition::FmContainsAll { .. }
                     | Condition::Ann { .. }
                     | Condition::Range { .. }
                     | Condition::RangeF64 { .. }
                     | Condition::SparseMatch { .. }
+                    | Condition::IsNull { .. }
+                    | Condition::IsNotNull { .. }
             )
         };
         if !conditions.iter().all(served) {
@@ -4004,10 +4099,13 @@ impl Table {
                     | Condition::BitmapEq { .. }
                     | Condition::BitmapIn { .. }
                     | Condition::FmContains { .. }
+                    | Condition::FmContainsAll { .. }
                     | Condition::Ann { .. }
                     | Condition::Range { .. }
                     | Condition::RangeF64 { .. }
                     | Condition::SparseMatch { .. }
+                    | Condition::IsNull { .. }
+                    | Condition::IsNotNull { .. }
             )
         };
         if !conditions.iter().all(served) {
@@ -4673,6 +4771,24 @@ impl Table {
                         )
                     })
                     .unwrap_or_else(RowIdSet::empty),
+                Condition::FmContainsAll {
+                    column_id,
+                    patterns,
+                } => {
+                    if let Some(f) = self.fm.get(column_id) {
+                        let sets: Vec<RowIdSet> = patterns
+                            .iter()
+                            .map(|pat| {
+                                RowIdSet::from_unsorted(
+                                    f.locate(pat).into_iter().map(|r| r.0).collect(),
+                                )
+                            })
+                            .collect();
+                        RowIdSet::intersect_many(sets)
+                    } else {
+                        RowIdSet::empty()
+                    }
+                }
                 Condition::Ann {
                     column_id,
                     query,
@@ -4729,6 +4845,8 @@ impl Table {
                         )?
                     }
                 }
+                Condition::IsNull { column_id } => reader.null_row_id_set(*column_id, true)?,
+                Condition::IsNotNull { column_id } => reader.null_row_id_set(*column_id, false)?,
             };
             sets.push(s);
         }
@@ -5927,7 +6045,24 @@ fn condition_matches_row(c: &crate::query::Condition, row: &Row, schema: &Schema
             }
             _ => false,
         },
+        Condition::FmContainsAll {
+            column_id,
+            patterns,
+        } => match row.columns.get(column_id) {
+            Some(Value::Bytes(b)) => patterns
+                .iter()
+                .all(|pat| !pat.is_empty() && b.windows(pat.len()).any(|w| w == &pat[..])),
+            _ => false,
+        },
         Condition::Ann { .. } | Condition::SparseMatch { .. } => true,
+        Condition::IsNull { column_id } => match row.columns.get(column_id) {
+            Some(Value::Null) | None => true,
+            _ => false,
+        },
+        Condition::IsNotNull { column_id } => match row.columns.get(column_id) {
+            Some(Value::Null) | None => false,
+            _ => true,
+        },
     }
 }
 

@@ -94,9 +94,10 @@ impl TableProvider for MongrelProvider {
         Ok(filters
             .iter()
             .map(|f| match translate_filter(f, &schema_ref) {
-                Some(mongreldb_core::Condition::FmContains { .. }) => {
-                    TableProviderFilterPushDown::Inexact
-                }
+                Some(
+                    mongreldb_core::Condition::FmContains { .. }
+                    | mongreldb_core::Condition::FmContainsAll { .. },
+                ) => TableProviderFilterPushDown::Inexact,
                 Some(_) => TableProviderFilterPushDown::Exact,
                 None => match translate_ann_search(f, &schema_ref)
                     .or_else(|| translate_sparse_match(f, &schema_ref))
@@ -420,8 +421,16 @@ pub(crate) fn translate_filter(
     use datafusion::logical_expr::{Between, BinaryExpr, Like, Operator};
     use mongreldb_core::{ColumnFlags, Condition, IndexKind, TypeId, Value};
 
+    // Extended int extraction: handles Date32 and all Timestamp* precision
+    // variants that DataFusion emits for typed column comparisons. These are
+    // stored as Int64 internally, so the numeric value is the raw i64.
     let int_val = |s: &ScalarValue| match s {
         ScalarValue::Int64(Some(v)) => Some(*v),
+        ScalarValue::Date32(Some(v)) => Some(*v as i64),
+        ScalarValue::TimestampSecond(Some(v), _) => Some(*v),
+        ScalarValue::TimestampMillisecond(Some(v), _) => Some(*v),
+        ScalarValue::TimestampMicrosecond(Some(v), _) => Some(*v),
+        ScalarValue::TimestampNanosecond(Some(v), _) => Some(*v),
         _ => None,
     };
     let float_val = |s: &ScalarValue| match s {
@@ -460,7 +469,15 @@ pub(crate) fn translate_filter(
 
     match expr {
         // `col OP literal` (and the mirrored `literal OP col`).
+        // Also handles `col = v1 OR col = v2 OR ...` → BitmapIn.
         Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
+            // OR-of-equalities on the same column → BitmapIn (Priority 6).
+            if *op == Operator::Or {
+                return try_or_as_bitmap_in(expr, schema);
+            }
+            // Unwrap single-layer Cast wrappers (canonicalization).
+            let left = peel_cast(left);
+            let right = peel_cast(right);
             let (col_name, scalar, flipped) = match (left.as_ref(), right.as_ref()) {
                 (Expr::Column(c), Expr::Literal(s, _)) => (&c.name, s, false),
                 (Expr::Literal(s, _), Expr::Column(c)) => (&c.name, s, true),
@@ -575,10 +592,28 @@ pub(crate) fn translate_filter(
             if !has_fm(cdef.id) {
                 return None;
             }
-            longest_like_segment(pat).map(|seg| Condition::FmContains {
-                column_id: cdef.id,
-                pattern: seg,
-            })
+            // Priority 12: extract ALL literal segments (≥3 chars) and intersect
+            // their FM results for a much tighter superset than the single
+            // longest segment. Falls back to the longest when only one qualifies.
+            let segments: Vec<Vec<u8>> = pat
+                .split(['%', '_'])
+                .filter(|s| s.len() >= 3)
+                .map(|s| s.as_bytes().to_vec())
+                .collect();
+            match segments.len() {
+                0 => longest_like_segment(pat).map(|seg| Condition::FmContains {
+                    column_id: cdef.id,
+                    pattern: seg,
+                }),
+                1 => Some(Condition::FmContains {
+                    column_id: cdef.id,
+                    pattern: segments.into_iter().next().unwrap(),
+                }),
+                _ => Some(Condition::FmContainsAll {
+                    column_id: cdef.id,
+                    patterns: segments,
+                }),
+            }
         }
 
         // `col IN (lit1, lit2, …)` → BitmapIn (bitmap union). Phase 13.5:
@@ -607,6 +642,26 @@ pub(crate) fn translate_filter(
                 column_id: cdef.id,
                 values,
             })
+        }
+
+        // `col IS NULL` → page-stat-pruned column scan for null validity.
+        Expr::IsNull(inner) => {
+            let col_name = match inner.as_ref() {
+                Expr::Column(c) => &c.name,
+                _ => return None,
+            };
+            let cdef = col_def(col_name)?;
+            Some(Condition::IsNull { column_id: cdef.id })
+        }
+
+        // `col IS NOT NULL` → complement of IS NULL.
+        Expr::IsNotNull(inner) => {
+            let col_name = match inner.as_ref() {
+                Expr::Column(c) => &c.name,
+                _ => return None,
+            };
+            let cdef = col_def(col_name)?;
+            Some(Condition::IsNotNull { column_id: cdef.id })
         }
 
         _ => None,
@@ -783,6 +838,91 @@ fn longest_like_segment(pat: &str) -> Option<Vec<u8>> {
         .max_by_key(|s| s.len())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_vec())
+}
+
+/// Unwrap a single-layer `Expr::Cast` wrapper to enable pushdown for queries
+/// like `WHERE CAST(col AS BIGINT) = 5` (canonicalization). Returns the
+/// original `Box` unchanged for non-cast expressions.
+fn peel_cast(expr: &Expr) -> std::borrow::Cow<'_, Expr> {
+    match expr {
+        Expr::Cast(datafusion::logical_expr::Cast { expr, .. }) => std::borrow::Cow::Borrowed(expr),
+        _ => std::borrow::Cow::Borrowed(expr),
+    }
+}
+
+/// Flatten an OR tree of same-column equality comparisons into a `BitmapIn`.
+/// Handles `col = v1 OR col = v2 OR ...` (and nested OR) that DataFusion's
+/// optimizer may not have rewritten into `IN`. Returns `None` if the OR spans
+/// different columns, non-equality comparisons, or a non-bitmap-indexed column.
+fn try_or_as_bitmap_in(
+    expr: &Expr,
+    schema: &mongreldb_core::Schema,
+) -> Option<mongreldb_core::Condition> {
+    use datafusion::logical_expr::{BinaryExpr, Operator};
+    let mut values: Vec<Vec<u8>> = Vec::new();
+    let mut target_col: Option<u16> = None;
+    let mut stack = vec![expr];
+    while let Some(e) = stack.pop() {
+        match e {
+            Expr::BinaryExpr(BinaryExpr {
+                left,
+                op: Operator::Or,
+                right,
+            }) => {
+                stack.push(left);
+                stack.push(right);
+            }
+            Expr::BinaryExpr(BinaryExpr {
+                left,
+                op: Operator::Eq,
+                right,
+            }) => {
+                let (col_name, scalar) = match (left.as_ref(), right.as_ref()) {
+                    (Expr::Column(c), Expr::Literal(s, _)) => (&c.name, s),
+                    (Expr::Literal(s, _), Expr::Column(c)) => (&c.name, s),
+                    _ => return None,
+                };
+                let cdef = schema.columns.iter().find(|c| &c.name == col_name)?;
+                if !schema
+                    .indexes
+                    .iter()
+                    .any(|i| i.column_id == cdef.id && i.kind == mongreldb_core::IndexKind::Bitmap)
+                {
+                    return None;
+                }
+                match target_col {
+                    None => target_col = Some(cdef.id),
+                    Some(id) if id != cdef.id => return None,
+                    _ => {}
+                }
+                let v = match scalar {
+                    datafusion::common::ScalarValue::Int64(Some(v)) => {
+                        mongreldb_core::Value::Int64(*v)
+                    }
+                    datafusion::common::ScalarValue::Utf8(Some(s)) => {
+                        mongreldb_core::Value::Bytes(s.as_bytes().to_vec())
+                    }
+                    datafusion::common::ScalarValue::Float64(Some(f)) => {
+                        mongreldb_core::Value::Float64(*f)
+                    }
+                    datafusion::common::ScalarValue::Boolean(Some(b)) => {
+                        mongreldb_core::Value::Bool(*b)
+                    }
+                    _ => return None,
+                };
+                values.push(v.encode_key());
+            }
+            _ => return None,
+        }
+    }
+    let col_id = target_col?;
+    if values.is_empty() {
+        return None;
+    }
+    Some(mongreldb_core::Condition::BitmapIn {
+        column_id: col_id,
+        values,
+    })
 }
 
 /// Convenience wrapper: a DataFusion `SessionContext` bound to a live MongrelDB,
