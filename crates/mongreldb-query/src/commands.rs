@@ -1383,7 +1383,9 @@ fn add_index_defs(
         let col = schema
             .column(&col_name)
             .ok_or_else(|| MongrelQueryError::Schema(format!("unknown index column {col_name}")))?;
-        let idx_name = if i == 0 {
+        let idx_name = if columns.len() == 1 {
+            name.to_string()
+        } else if i == 0 {
             name.to_string()
         } else {
             format!("{name}_{col_name}")
