@@ -4410,7 +4410,8 @@ impl Table {
         let overlay_rows = if overlay_rids.is_empty() {
             Vec::new()
         } else {
-            self.overlay_visible_rows(snapshot)
+            let bound = Self::overlay_materialization_bound(conditions, &survivors);
+            self.overlay_visible_rows(snapshot, bound)
         };
 
         // Build page plans for the run portion.
@@ -4588,7 +4589,8 @@ impl Table {
         let overlay_rows = if overlay_rids.is_empty() {
             Vec::new()
         } else {
-            self.overlay_visible_rows(snapshot)
+            let bound = Self::overlay_materialization_bound(conditions, &survivors);
+            self.overlay_visible_rows(snapshot, bound)
         };
         let overlay = if overlay_rows.is_empty() {
             None
@@ -4625,9 +4627,47 @@ impl Table {
     /// run tier at `snapshot`. These are the rows whose data lives only in the
     /// in-memory buffers (not yet in a sorted run), or that shadow a stale
     /// version in the run.
-    fn overlay_visible_rows(&self, snapshot: Snapshot) -> Vec<Row> {
+    /// The survivor set that bounds overlay materialization (Priority 2), or
+    /// `None` when overlay rows must be fully materialized — i.e. there is a
+    /// `Range`/`RangeF64` residual, for which the index-served survivor set does
+    /// not cover matching overlay rows (those are evaluated downstream). This
+    /// mirrors the `all_index_served` branch of
+    /// [`filter_overlay_rows`](Self::filter_overlay_rows), so bounding here is
+    /// result-preserving.
+    fn overlay_materialization_bound<'a>(
+        conditions: &[crate::query::Condition],
+        survivors: &'a Option<RowIdSet>,
+    ) -> Option<&'a RowIdSet> {
+        use crate::query::Condition;
+        let has_range = conditions
+            .iter()
+            .any(|c| matches!(c, Condition::Range { .. } | Condition::RangeF64 { .. }));
+        if has_range {
+            None
+        } else {
+            survivors.as_ref()
+        }
+    }
+
+    /// Materialize the visible overlay rows (memtable + mutable-run, newest
+    /// version per row, non-deleted).
+    ///
+    /// Priority 2 (selective overlay probing): when `bound` is `Some`, only rows
+    /// whose id is in it are materialized. The caller passes the index-resolved
+    /// survivor set as `bound` exactly when every condition is index-served — in
+    /// which case [`filter_overlay_rows`](Self::filter_overlay_rows) would discard
+    /// any non-survivor overlay row anyway, so this prunes the materialization
+    /// without changing the result. With a Range/RangeF64 residual the survivor
+    /// set is incomplete for overlay rows, so the caller passes `None` (full
+    /// materialization) and the range is re-evaluated downstream.
+    fn overlay_visible_rows(&self, snapshot: Snapshot, bound: Option<&RowIdSet>) -> Vec<Row> {
         let mut best: HashMap<u64, (Epoch, Row)> = HashMap::new();
         let mut fold = |row: Row| {
+            if let Some(b) = bound {
+                if !b.contains(row.row_id.0) {
+                    return;
+                }
+            }
             best.entry(row.row_id.0)
                 .and_modify(|(be, br)| {
                     if row.committed_epoch > *be {
