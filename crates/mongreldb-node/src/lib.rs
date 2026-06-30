@@ -386,6 +386,39 @@ pub struct RowJs {
     pub cells: Vec<Cell>,
 }
 
+#[napi(object)]
+pub struct OwnedRowJs {
+    pub cells: Vec<Cell>,
+}
+
+#[napi(object)]
+pub struct UpsertResultJs {
+    pub action: String,
+    pub row: OwnedRowJs,
+    pub auto_inc: Option<BigInt>,
+}
+
+#[napi(object)]
+pub struct RowUpdateJs {
+    pub row_id: BigInt,
+    pub cells: Vec<Cell>,
+}
+
+#[napi(object)]
+pub struct TxnOpResultJs {
+    pub kind: String,
+    pub auto_inc: Option<BigInt>,
+    pub row: Option<OwnedRowJs>,
+    pub rows: Option<Vec<OwnedRowJs>>,
+    pub upsert: Option<UpsertResultJs>,
+}
+
+#[napi(object)]
+pub struct CommitResultJs {
+    pub epoch: BigInt,
+    pub results: Vec<TxnOpResultJs>,
+}
+
 // ── multi-table Database + Table (P5.1) ───────────────────────────────────
 
 use mongreldb_core::Database as CoreDatabase;
@@ -583,6 +616,33 @@ fn row_to_js_table(t: &mongreldb_core::Table, row: &mongreldb_core::memtable::Ro
         row_id: BigInt::from(row.row_id.0),
         cells,
     }
+}
+
+fn owned_row_to_js_table(t: &mongreldb_core::Table, row: &mongreldb_core::OwnedRow) -> OwnedRowJs {
+    let schema = t.schema();
+    let cells = schema
+        .columns
+        .iter()
+        .map(|cd| {
+            let v = row
+                .columns
+                .iter()
+                .find(|(id, _)| *id == cd.id)
+                .map(|(_, value)| value.clone())
+                .unwrap_or(Value::Null);
+            from_value(&v, cd.id)
+        })
+        .collect();
+    OwnedRowJs { cells }
+}
+
+fn upsert_action_to_js(action: mongreldb_core::UpsertActionKind) -> String {
+    match action {
+        mongreldb_core::UpsertActionKind::Inserted => "inserted",
+        mongreldb_core::UpsertActionKind::Updated => "updated",
+        mongreldb_core::UpsertActionKind::Unchanged => "unchanged",
+    }
+    .to_string()
 }
 
 #[napi]
@@ -967,6 +1027,14 @@ impl TableHandle {
         g.delete(RowId(bigint_to_u64(&row_id)?)).map_err(to_napi)
     }
 
+    /// Truncate all rows in this table. Call `commit()` to make it durable.
+    #[napi]
+    pub fn truncate(&self) -> napi::Result<()> {
+        let handle = self.db.table(&self.name).map_err(to_napi)?;
+        let mut g = handle.lock();
+        g.truncate().map_err(to_napi)
+    }
+
     /// Delete the first row matching a text primary key.
     #[napi]
     pub fn delete_by_pk_text(&self, text: String) -> napi::Result<()> {
@@ -1220,8 +1288,22 @@ pub struct Transaction {
 }
 
 enum TxnOp {
-    Put(Vec<(u16, Value)>),
+    Put {
+        cells: Vec<(u16, Value)>,
+        auto_inc: Option<i64>,
+    },
     Delete(RowId),
+    Truncate,
+    Upsert {
+        insert_cells: Vec<(u16, Value)>,
+        action: mongreldb_core::UpsertAction,
+    },
+    UpdateMany {
+        updates: Vec<(RowId, Vec<(u16, Value)>)>,
+    },
+    DeleteMany {
+        row_ids: Vec<RowId>,
+    },
 }
 
 #[napi]
@@ -1245,7 +1327,13 @@ impl Transaction {
         let mut cols = cell_pairs_table(&g, cells)?;
         let assigned = g.fill_auto_inc(&mut cols).map_err(to_napi)?;
         drop(g);
-        self.staging.lock().push((table, TxnOp::Put(cols)));
+        self.staging.lock().push((
+            table,
+            TxnOp::Put {
+                cells: cols,
+                auto_inc: assigned,
+            },
+        ));
         Ok(assigned.map(BigInt::from))
     }
 
@@ -1255,6 +1343,69 @@ impl Transaction {
         self.staging
             .lock()
             .push((table, TxnOp::Delete(RowId(bigint_to_u64(&row_id)?))));
+        Ok(())
+    }
+
+    #[napi]
+    pub fn truncate(&self, table: String) -> napi::Result<()> {
+        self.staging.lock().push((table, TxnOp::Truncate));
+        Ok(())
+    }
+
+    #[napi]
+    pub fn upsert(
+        &self,
+        table: String,
+        insert_cells: Vec<Cell>,
+        update_cells: Option<Vec<Cell>>,
+    ) -> napi::Result<()> {
+        let handle = self.db.table(&table).map_err(to_napi)?;
+        let g = handle.lock();
+        let insert_cells = cell_pairs_table(&g, insert_cells)?;
+        let action = match update_cells {
+            Some(cells) => mongreldb_core::UpsertAction::DoUpdate(cell_pairs_table(&g, cells)?),
+            None => mongreldb_core::UpsertAction::DoNothing,
+        };
+        drop(g);
+        self.staging.lock().push((
+            table,
+            TxnOp::Upsert {
+                insert_cells,
+                action,
+            },
+        ));
+        Ok(())
+    }
+
+    #[napi]
+    pub fn update_many(&self, table: String, updates: Vec<RowUpdateJs>) -> napi::Result<()> {
+        let handle = self.db.table(&table).map_err(to_napi)?;
+        let g = handle.lock();
+        let updates = updates
+            .into_iter()
+            .map(|update| {
+                Ok((
+                    RowId(bigint_to_u64(&update.row_id)?),
+                    cell_pairs_table(&g, update.cells)?,
+                ))
+            })
+            .collect::<napi::Result<Vec<_>>>()?;
+        drop(g);
+        self.staging
+            .lock()
+            .push((table, TxnOp::UpdateMany { updates }));
+        Ok(())
+    }
+
+    #[napi]
+    pub fn delete_many(&self, table: String, row_ids: Vec<BigInt>) -> napi::Result<()> {
+        let row_ids = row_ids
+            .iter()
+            .map(|row_id| bigint_to_u64(row_id).map(RowId))
+            .collect::<napi::Result<Vec<_>>>()?;
+        self.staging
+            .lock()
+            .push((table, TxnOp::DeleteMany { row_ids }));
         Ok(())
     }
 
@@ -1270,7 +1421,13 @@ impl Transaction {
         let mut buf = self.staging.lock();
         buf.reserve(rows.len());
         for cols in rows {
-            buf.push((table.clone(), TxnOp::Put(cols)));
+            buf.push((
+                table.clone(),
+                TxnOp::Put {
+                    cells: cols,
+                    auto_inc: None,
+                },
+            ));
         }
         Ok(())
     }
@@ -1294,7 +1451,13 @@ impl Transaction {
     #[napi]
     pub fn commit(&self) -> napi::Result<BigInt> {
         let stage = std::mem::take(&mut *self.staging.lock());
-        commit_result_to_napi(apply_txn(&self.db, &stage))
+        commit_result_to_napi(apply_txn(&self.db, &stage).map(|(epoch, _)| epoch))
+    }
+
+    #[napi]
+    pub fn commit_returning(&self) -> napi::Result<CommitResultJs> {
+        let stage = std::mem::take(&mut *self.staging.lock());
+        commit_returning_to_napi(&self.db, apply_txn(&self.db, &stage))
     }
 
     /// Commit off the JS event loop (the durability fsync runs on the NAPI
@@ -1303,9 +1466,11 @@ impl Transaction {
     pub async fn commit_async(&self) -> napi::Result<BigInt> {
         let db = Arc::clone(&self.db);
         let stage = std::mem::take(&mut *self.staging.lock());
-        napi::bindgen_prelude::spawn_blocking(move || commit_result_to_napi(apply_txn(&db, &stage)))
-            .await
-            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e:?}")))?
+        napi::bindgen_prelude::spawn_blocking(move || {
+            commit_result_to_napi(apply_txn(&db, &stage).map(|(epoch, _)| epoch))
+        })
+        .await
+        .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e:?}")))?
     }
 
     /// Discard all staged ops.
@@ -1356,7 +1521,13 @@ impl TxnTable {
         };
         self.staging
             .lock()
-            .push((self.table.clone(), TxnOp::Put(cols)));
+            .push((
+                self.table.clone(),
+                TxnOp::Put {
+                    cells: cols,
+                    auto_inc: assigned,
+                },
+            ));
         Ok(assigned.map(BigInt::from))
     }
 
@@ -1372,7 +1543,13 @@ impl TxnTable {
         };
         let mut buf = self.staging.lock();
         for cols in staged {
-            buf.push((self.table.clone(), TxnOp::Put(cols)));
+            buf.push((
+                self.table.clone(),
+                TxnOp::Put {
+                    cells: cols,
+                    auto_inc: None,
+                },
+            ));
         }
         Ok(())
     }
@@ -1386,23 +1563,211 @@ impl TxnTable {
         ));
         Ok(())
     }
+
+    #[napi]
+    pub fn truncate(&self) -> napi::Result<()> {
+        self.staging
+            .lock()
+            .push((self.table.clone(), TxnOp::Truncate));
+        Ok(())
+    }
+
+    #[napi]
+    pub fn upsert(
+        &self,
+        insert_cells: Vec<Cell>,
+        update_cells: Option<Vec<Cell>>,
+    ) -> napi::Result<()> {
+        let handle = self.db.table(&self.table).map_err(to_napi)?;
+        let g = handle.lock();
+        let insert_cells = cell_pairs_table(&g, insert_cells)?;
+        let action = match update_cells {
+            Some(cells) => mongreldb_core::UpsertAction::DoUpdate(cell_pairs_table(&g, cells)?),
+            None => mongreldb_core::UpsertAction::DoNothing,
+        };
+        drop(g);
+        self.staging.lock().push((
+            self.table.clone(),
+            TxnOp::Upsert {
+                insert_cells,
+                action,
+            },
+        ));
+        Ok(())
+    }
+
+    #[napi]
+    pub fn update_many(&self, updates: Vec<RowUpdateJs>) -> napi::Result<()> {
+        let handle = self.db.table(&self.table).map_err(to_napi)?;
+        let g = handle.lock();
+        let updates = updates
+            .into_iter()
+            .map(|update| {
+                Ok((
+                    RowId(bigint_to_u64(&update.row_id)?),
+                    cell_pairs_table(&g, update.cells)?,
+                ))
+            })
+            .collect::<napi::Result<Vec<_>>>()?;
+        drop(g);
+        self.staging
+            .lock()
+            .push((self.table.clone(), TxnOp::UpdateMany { updates }));
+        Ok(())
+    }
+
+    #[napi]
+    pub fn delete_many(&self, row_ids: Vec<BigInt>) -> napi::Result<()> {
+        let row_ids = row_ids
+            .iter()
+            .map(|row_id| bigint_to_u64(row_id).map(RowId))
+            .collect::<napi::Result<Vec<_>>>()?;
+        self.staging
+            .lock()
+            .push((self.table.clone(), TxnOp::DeleteMany { row_ids }));
+        Ok(())
+    }
+}
+
+enum OpResult {
+    None,
+    Put {
+        table: String,
+        result: mongreldb_core::PutResult,
+    },
+    Upsert {
+        table: String,
+        result: mongreldb_core::UpsertResult,
+    },
+    Rows {
+        table: String,
+        rows: Vec<mongreldb_core::OwnedRow>,
+    },
+}
+
+fn commit_returning_to_napi(
+    db: &CoreDatabase,
+    result: mongreldb_core::Result<(mongreldb_core::Epoch, Vec<OpResult>)>,
+) -> napi::Result<CommitResultJs> {
+    let (epoch, results) = result.map_err(to_napi)?;
+    let results = results
+        .into_iter()
+        .map(|result| op_result_to_js(db, result))
+        .collect::<napi::Result<Vec<_>>>()?;
+    Ok(CommitResultJs {
+        epoch: BigInt::from(epoch.0),
+        results,
+    })
+}
+
+fn op_result_to_js(db: &CoreDatabase, result: OpResult) -> napi::Result<TxnOpResultJs> {
+    match result {
+        OpResult::None => Ok(TxnOpResultJs {
+            kind: "none".to_string(),
+            auto_inc: None,
+            row: None,
+            rows: None,
+            upsert: None,
+        }),
+        OpResult::Put { table, result } => {
+            let handle = db.table(&table).map_err(to_napi)?;
+            let g = handle.lock();
+            Ok(TxnOpResultJs {
+                kind: "put".to_string(),
+                auto_inc: result.auto_inc.map(BigInt::from),
+                row: Some(owned_row_to_js_table(&g, &result.row)),
+                rows: None,
+                upsert: None,
+            })
+        }
+        OpResult::Upsert { table, result } => {
+            let handle = db.table(&table).map_err(to_napi)?;
+            let g = handle.lock();
+            Ok(TxnOpResultJs {
+                kind: "upsert".to_string(),
+                auto_inc: result.auto_inc.map(BigInt::from),
+                row: None,
+                rows: None,
+                upsert: Some(UpsertResultJs {
+                    action: upsert_action_to_js(result.action),
+                    row: owned_row_to_js_table(&g, &result.row),
+                    auto_inc: result.auto_inc.map(BigInt::from),
+                }),
+            })
+        }
+        OpResult::Rows { table, rows } => {
+            let handle = db.table(&table).map_err(to_napi)?;
+            let g = handle.lock();
+            Ok(TxnOpResultJs {
+                kind: "rows".to_string(),
+                auto_inc: None,
+                row: None,
+                rows: Some(
+                    rows.iter()
+                        .map(|row| owned_row_to_js_table(&g, row))
+                        .collect(),
+                ),
+                upsert: None,
+            })
+        }
+    }
 }
 
 /// Replay staged ops into a fresh core transaction and commit atomically.
 fn apply_txn(
     db: &CoreDatabase,
     stage: &[(String, TxnOp)],
-) -> mongreldb_core::Result<mongreldb_core::Epoch> {
+) -> mongreldb_core::Result<(mongreldb_core::Epoch, Vec<OpResult>)> {
     let mut tx = db.begin();
+    let mut out = Vec::with_capacity(stage.len());
     for (table, op) in stage {
         match op {
-            TxnOp::Put(cells) => {
-                let _ = tx.put(table, cells.clone())?;
+            TxnOp::Put { cells, auto_inc } => {
+                let mut result = tx.put_returning(table, cells.clone())?;
+                if result.auto_inc.is_none() {
+                    result.auto_inc = *auto_inc;
+                }
+                out.push(OpResult::Put {
+                    table: table.clone(),
+                    result,
+                });
             }
-            TxnOp::Delete(rid) => tx.delete(table, *rid)?,
+            TxnOp::Delete(rid) => {
+                tx.delete(table, *rid)?;
+                out.push(OpResult::None);
+            }
+            TxnOp::Truncate => {
+                tx.truncate(table)?;
+                out.push(OpResult::None);
+            }
+            TxnOp::Upsert {
+                insert_cells,
+                action,
+            } => {
+                let result = tx.upsert(table, insert_cells.clone(), action.clone())?;
+                out.push(OpResult::Upsert {
+                    table: table.clone(),
+                    result,
+                });
+            }
+            TxnOp::UpdateMany { updates } => {
+                let rows = tx.update_many(table, updates.clone())?;
+                out.push(OpResult::Rows {
+                    table: table.clone(),
+                    rows,
+                });
+            }
+            TxnOp::DeleteMany { row_ids } => {
+                let rows = tx.delete_many(table, row_ids.clone())?;
+                out.push(OpResult::Rows {
+                    table: table.clone(),
+                    rows,
+                });
+            }
         }
     }
-    tx.commit()
+    let epoch = tx.commit()?;
+    Ok((epoch, out))
 }
 
 /// Phase 20.2: a typed column for bulk loading, wrapping JS typed-array data.

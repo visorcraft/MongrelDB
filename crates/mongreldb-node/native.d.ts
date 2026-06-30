@@ -93,6 +93,29 @@ export interface RowJs {
   rowId: bigint
   cells: Array<Cell>
 }
+export interface OwnedRowJs {
+  cells: Array<Cell>
+}
+export interface UpsertResultJs {
+  action: string
+  row: OwnedRowJs
+  autoInc?: bigint
+}
+export interface RowUpdateJs {
+  rowId: bigint
+  cells: Array<Cell>
+}
+export interface TxnOpResultJs {
+  kind: string
+  autoInc?: bigint
+  row?: OwnedRowJs
+  rows?: Array<OwnedRowJs>
+  upsert?: UpsertResultJs
+}
+export interface CommitResultJs {
+  epoch: bigint
+  results: Array<TxnOpResultJs>
+}
 /**
  * Result of an insert: the physical row id plus, when the engine allocated
  * it, the `AUTO_INCREMENT` value written into the row.
@@ -212,6 +235,8 @@ export declare class TableHandle {
   getByPkInt64(value: bigint): RowJs | null
   /** Delete a row by storage row id. */
   delete(rowId: bigint): void
+  /** Truncate all rows in this table. Call `commit()` to make it durable. */
+  truncate(): void
   /** Delete the first row matching a text primary key. */
   deleteByPkText(text: string): void
   /** Delete the first row matching an Int64 primary key. */
@@ -259,6 +284,10 @@ export declare class Transaction {
   put(table: string, cells: Array<Cell>): bigint | null
   /** Stage a delete of `row_id` on `table`. */
   delete(table: string, rowId: bigint): void
+  truncate(table: string): void
+  upsert(table: string, insertCells: Array<Cell>, updateCells?: Array<Cell> | undefined | null): void
+  updateMany(table: string, updates: Array<RowUpdateJs>): void
+  deleteMany(table: string, rowIds: Array<bigint>): void
   /**
    * Stage many puts on `table` from a compact little-endian buffer, skipping
    * the per-cell NAPI `Cell` object marshalling that dominates a bulk load.
@@ -279,6 +308,7 @@ export declare class Transaction {
    * Throws `ConflictError` on write-write conflict (retryable).
    */
   commit(): bigint
+  commitReturning(): CommitResultJs
   /**
    * Commit off the JS event loop (the durability fsync runs on the NAPI
    * blocking pool). Throws `ConflictError` on write-write conflict.
@@ -310,6 +340,10 @@ export declare class TxnTable {
   putBatch(rows: Array<Array<Cell>>): void
   /** Stage a delete of `row_id` on this table. */
   delete(rowId: bigint): void
+  truncate(): void
+  upsert(insertCells: Array<Cell>, updateCells?: Array<Cell> | undefined | null): void
+  updateMany(updates: Array<RowUpdateJs>): void
+  deleteMany(rowIds: Array<bigint>): void
 }
 /**
  * Opt-in write micro-batching over one table. Writes are **not durable until
