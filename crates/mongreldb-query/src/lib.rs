@@ -1205,6 +1205,7 @@ impl MongrelSession {
             return Ok((**hit).clone());
         }
         // Phase 16.5: check the logical-plan cache before re-parsing.
+        let plan_start = std::time::Instant::now();
         let df = {
             let cached_plan = self.plan_cache.lock().get(sql).cloned();
             if let Some(plan) = cached_plan {
@@ -1221,6 +1222,10 @@ impl MongrelSession {
                 df
             }
         };
+        // Priority 8: record logical-planning time (parse + plan; ~0 on a
+        // plan-cache hit), separate from execution.
+        let planning_nanos = plan_start.elapsed().as_nanos() as u64;
+        mongreldb_core::trace::QueryTrace::record(|t| t.planning_nanos = planning_nanos);
 
         // Phase 7.2/8.3 fast path: serve a simple single aggregate (SUM/MIN/MAX/
         // AVG/COUNT) over the primary table from the incremental aggregate
@@ -1234,7 +1239,13 @@ impl MongrelSession {
                 // registered tables via roaring-bitmap intersection, with no
                 // hash-join materialization. Falls through otherwise.
                 match self.try_fk_join(df.logical_plan()) {
-                    Ok(Some(b)) => b,
+                    Ok(Some(b)) => {
+                        // Priority 13: the native FK-bitmap path served the join.
+                        mongreldb_core::trace::QueryTrace::record(|t| {
+                            t.join_mode = mongreldb_core::trace::JoinMode::FkBitmap;
+                        });
+                        b
+                    }
                     _ => df
                         .collect()
                         .await

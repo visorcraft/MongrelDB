@@ -148,6 +148,79 @@ async fn cross_table_join_over_database() {
     assert_eq!(total_rows(&batches), 1);
 }
 
+/// Priority 13 + 8: the query trace reports which join path ran and how long
+/// logical planning took.
+#[tokio::test]
+async fn join_and_planning_diagnostics() {
+    use mongreldb_core::trace::JoinMode;
+    // orders carries a bitmap index on the FK join column, which enables the
+    // native broadcast FK-bitmap join even without a WHERE on the PK side.
+    let orders = Schema {
+        schema_id: 1,
+        columns: vec![
+            ColumnDef {
+                id: 1,
+                name: "id".into(),
+                ty: TypeId::Int64,
+                flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+            },
+            ColumnDef {
+                id: 2,
+                name: "customer_id".into(),
+                ty: TypeId::Int64,
+                flags: ColumnFlags::empty(),
+            },
+        ],
+        indexes: vec![IndexDef {
+            name: "orders_cust_bm".into(),
+            column_id: 2,
+            kind: IndexKind::Bitmap,
+        }],
+        colocation: vec![],
+    };
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    db.create_table("orders", orders).unwrap();
+    db.create_table("customers", customers_schema()).unwrap();
+    db.transaction(|t| {
+        t.put(
+            "customers",
+            vec![(1, Value::Int64(1)), (2, Value::Bytes(b"Alice".to_vec()))],
+        )?;
+        t.put(
+            "customers",
+            vec![(1, Value::Int64(2)), (2, Value::Bytes(b"Bob".to_vec()))],
+        )?;
+        t.put("orders", vec![(1, Value::Int64(100)), (2, Value::Int64(1))])?;
+        t.put("orders", vec![(1, Value::Int64(101)), (2, Value::Int64(2))])?;
+        t.put("orders", vec![(1, Value::Int64(102)), (2, Value::Int64(1))])?;
+        Ok(())
+    })
+    .unwrap();
+    let session = MongrelSession::open(Arc::clone(&db)).unwrap();
+
+    // Non-join query ⇒ JoinMode::None; a cold query records planning time.
+    let (_b, t) = session
+        .run_sql_traced("SELECT * FROM orders")
+        .await
+        .unwrap();
+    assert_eq!(t.join_mode, JoinMode::None);
+    assert!(
+        t.planning_nanos > 0,
+        "cold query should record planning time"
+    );
+
+    // PK↔FK equi-join over the bitmap-indexed FK ⇒ native FK-bitmap path.
+    let (b, t) = session
+        .run_sql_traced(
+            "SELECT o.id, c.name FROM orders o JOIN customers c ON o.customer_id = c.id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(total_rows(&b), 3);
+    assert_eq!(t.join_mode, JoinMode::FkBitmap);
+}
+
 #[tokio::test]
 async fn database_session_cache_invalidates_on_commit() {
     let dir = tempdir().unwrap();

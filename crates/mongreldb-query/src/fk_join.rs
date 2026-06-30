@@ -59,6 +59,13 @@ pub(crate) fn try_fk_join(
     let LogicalPlan::Join(join) = join_plan else {
         return Ok(None);
     };
+    // This is a join-shaped query: assume the DataFusion hash-join fallback
+    // (Priority 13 diagnostics). The caller overwrites this with `FkBitmap` when
+    // the native path actually serves the result. Non-join queries returned
+    // above and stay `JoinMode::None`.
+    mongreldb_core::trace::QueryTrace::record(|t| {
+        t.join_mode = mongreldb_core::trace::JoinMode::DataFusionHash;
+    });
     // Phase 13.6: Inner, Left, LeftSemi, LeftAnti, RightSemi, RightAnti.
     if !matches!(
         join.join_type,

@@ -96,6 +96,30 @@ impl fmt::Display for ScanMode {
     }
 }
 
+/// Which join execution path served a query (Priority 13: join diagnostics).
+/// `None` for non-join queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum JoinMode {
+    /// No join in the query (or the join path was never reached).
+    #[default]
+    None,
+    /// Native FK↔PK roaring-bitmap intersection — no hash-join materialization
+    /// ([`crate::engine::Table`] index resolve only).
+    FkBitmap,
+    /// Fell back to DataFusion's hash join (shape the native path can't serve).
+    DataFusionHash,
+}
+
+impl fmt::Display for JoinMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            JoinMode::None => "none",
+            JoinMode::FkBitmap => "fk-bitmap",
+            JoinMode::DataFusionHash => "datafusion-hash",
+        })
+    }
+}
+
 /// Whether `ensure_indexes_complete` rebuilt indexes during this query. A
 /// rebuild is the user-facing stall case (Priority 10); this field exposes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -153,6 +177,12 @@ pub struct QueryTrace {
     pub pages_decoded: usize,
     /// Number of pages skipped by page-stat pruning or empty page plans.
     pub pages_skipped: usize,
+    /// Which join path served the query (Priority 13). `None` for non-joins.
+    pub join_mode: JoinMode,
+    /// Logical-planning time in nanoseconds (Priority 8: parse + plan, separate
+    /// from execution). `0` on a result-cache hit (planning was skipped) or when
+    /// the plan came from the logical-plan cache.
+    pub planning_nanos: u64,
 }
 
 impl QueryTrace {
