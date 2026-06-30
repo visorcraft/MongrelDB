@@ -1,6 +1,6 @@
 {
   "name": "mongreldb",
-  "version": "0.14.0",
+  "version": "0.15.0",
   "description": "Native Node.js addon for MongrelDB — in-process, sub-ms writes, hybrid index queries.",
   "main": "index.js",
   "types": "index.d.ts",
