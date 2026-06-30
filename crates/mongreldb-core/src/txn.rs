@@ -20,6 +20,7 @@ use parking_lot::{Condvar, Mutex as PlMutex};
 pub(crate) enum Staged {
     Put(Vec<(u16, Value)>),
     Delete(RowId),
+    Truncate,
 }
 
 /// An in-flight cross-table transaction. Holds a read snapshot taken at `begin`
@@ -61,11 +62,12 @@ impl<'db> Transaction<'db> {
     /// counter. The value is staged in `cells`, so the commit path writes the
     /// same id into the row.
     pub fn put(&mut self, table: &str, mut cells: Vec<(u16, Value)>) -> Result<Option<i64>> {
+        let id = self.db.table_id(table)?;
+        self.reject_after_truncate(id)?;
         let handle = self.db.table(table)?;
         let mut t = handle.lock();
         let assigned = t.fill_auto_inc(&mut cells)?;
         drop(t);
-        let id = self.db.table_id(table)?;
         self.staging.push((id, Staged::Put(cells)));
         Ok(assigned)
     }
@@ -73,7 +75,34 @@ impl<'db> Transaction<'db> {
     /// Stage a delete of `row_id` on `table`.
     pub fn delete(&mut self, table: &str, row_id: RowId) -> Result<()> {
         let id = self.db.table_id(table)?;
+        self.reject_after_truncate(id)?;
         self.staging.push((id, Staged::Delete(row_id)));
+        Ok(())
+    }
+
+    pub fn truncate(&mut self, table: &str) -> Result<()> {
+        let id = self.db.table_id(table)?;
+        for (table_id, op) in &self.staging {
+            if *table_id == id && !matches!(op, Staged::Truncate) {
+                return Err(MongrelError::InvalidArgument(
+                    "truncate cannot be combined with other writes on the same table".into(),
+                ));
+            }
+        }
+        self.staging.push((id, Staged::Truncate));
+        Ok(())
+    }
+
+    fn reject_after_truncate(&self, table_id: u64) -> Result<()> {
+        if self
+            .staging
+            .iter()
+            .any(|(tid, op)| *tid == table_id && matches!(op, Staged::Truncate))
+        {
+            return Err(MongrelError::InvalidArgument(
+                "truncate cannot be combined with other writes on the same table".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -93,6 +122,7 @@ impl<'db> Transaction<'db> {
 pub(crate) enum StagedOp {
     Put(crate::memtable::Row),
     Delete(RowId),
+    Truncate,
 }
 
 // ── P3.1: conflict index + active-txn registry (spec §8.3, §9.2) ─────────
@@ -182,6 +212,8 @@ const CONFLICT_SHARDS: usize = 16;
 /// drops entries below `min(active read_epoch)`.
 pub struct ConflictIndex {
     shards: [parking_lot::Mutex<HashMap<WriteKey, u64>>; CONFLICT_SHARDS],
+    table_truncate_epochs: parking_lot::Mutex<HashMap<u64, u64>>,
+    table_write_epochs: parking_lot::Mutex<HashMap<u64, u64>>,
     /// Bumped on every `record()` so pre-validation can detect whether new
     /// commits arrived between the pre-check and the sequencer (spec §8.5,
     /// review fix #17).
@@ -192,6 +224,8 @@ impl ConflictIndex {
     pub fn new() -> Self {
         Self {
             shards: std::array::from_fn(|_| parking_lot::Mutex::new(HashMap::new())),
+            table_truncate_epochs: parking_lot::Mutex::new(HashMap::new()),
+            table_write_epochs: parking_lot::Mutex::new(HashMap::new()),
             version: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -221,6 +255,22 @@ impl ConflictIndex {
                 }
             }
         }
+        let truncates = self.table_truncate_epochs.lock();
+        let writes = self.table_write_epochs.lock();
+        for k in keys {
+            match k {
+                WriteKey::Row { table_id, .. } | WriteKey::Unique { table_id, .. } => {
+                    if truncates.get(table_id).is_some_and(|&ce| ce > read_epoch.0) {
+                        return true;
+                    }
+                }
+                WriteKey::Table { table_id } => {
+                    if writes.get(table_id).is_some_and(|&ce| ce > read_epoch.0) {
+                        return true;
+                    }
+                }
+            }
+        }
         false
     }
 
@@ -229,6 +279,24 @@ impl ConflictIndex {
         for k in keys {
             let s = self.shard(k);
             s.lock().insert(k.clone(), commit_epoch.0);
+        }
+        let mut truncates = self.table_truncate_epochs.lock();
+        let mut writes = self.table_write_epochs.lock();
+        for k in keys {
+            match k {
+                WriteKey::Table { table_id } => {
+                    truncates
+                        .entry(*table_id)
+                        .and_modify(|ce| *ce = (*ce).max(commit_epoch.0))
+                        .or_insert(commit_epoch.0);
+                }
+                WriteKey::Row { table_id, .. } | WriteKey::Unique { table_id, .. } => {
+                    writes
+                        .entry(*table_id)
+                        .and_modify(|ce| *ce = (*ce).max(commit_epoch.0))
+                        .or_insert(commit_epoch.0);
+                }
+            }
         }
         self.version
             .fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -240,6 +308,12 @@ impl ConflictIndex {
         for s in &self.shards {
             s.lock().retain(|_, ce| *ce >= min_active.0);
         }
+        self.table_truncate_epochs
+            .lock()
+            .retain(|_, ce| *ce >= min_active.0);
+        self.table_write_epochs
+            .lock()
+            .retain(|_, ce| *ce >= min_active.0);
     }
 }
 
@@ -400,6 +474,45 @@ mod tests {
         assert!(!ci.conflicts(&k, Epoch(6)));
         ci.prune_below(Epoch(7));
         assert!(!ci.conflicts(&k, Epoch(5)));
+    }
+
+    #[test]
+    fn conflict_index_table_scope_conflicts_both_directions() {
+        let ci = ConflictIndex::new();
+        ci.record(&[WriteKey::Table { table_id: 1 }], Epoch(6));
+        assert!(ci.conflicts(
+            &[WriteKey::Row {
+                table_id: 1,
+                row_id: 7,
+            }],
+            Epoch(5)
+        ));
+        assert!(ci.conflicts(
+            &[WriteKey::Unique {
+                table_id: 1,
+                index_id: 0,
+                key_hash: 42,
+            }],
+            Epoch(5)
+        ));
+        assert!(!ci.conflicts(
+            &[WriteKey::Row {
+                table_id: 2,
+                row_id: 7,
+            }],
+            Epoch(5)
+        ));
+
+        let ci = ConflictIndex::new();
+        ci.record(
+            &[WriteKey::Row {
+                table_id: 1,
+                row_id: 7,
+            }],
+            Epoch(6),
+        );
+        assert!(ci.conflicts(&[WriteKey::Table { table_id: 1 }], Epoch(5)));
+        assert!(!ci.conflicts(&[WriteKey::Table { table_id: 2 }], Epoch(5)));
     }
 
     #[test]

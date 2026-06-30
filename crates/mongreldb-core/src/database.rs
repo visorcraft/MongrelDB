@@ -424,6 +424,9 @@ impl Database {
                         table_id: *table_id,
                         row_id: rid.0,
                     }),
+                    Staged::Truncate => keys.push(WriteKey::Table {
+                        table_id: *table_id,
+                    }),
                 }
             }
             keys
@@ -576,7 +579,7 @@ impl Database {
                         }
                         prebuilt.push(Some(row));
                     }
-                    _ => prebuilt.push(None),
+                    Staged::Put(_) | Staged::Delete(_) | Staged::Truncate => prebuilt.push(None),
                 }
             }
         }
@@ -656,6 +659,16 @@ impl Database {
                         )?;
                         ops.push(StagedOp::Delete(*rid));
                     }
+                    Staged::Truncate => {
+                        wal.append(
+                            txn_id,
+                            *table_id,
+                            Op::TruncateTable {
+                                table_id: *table_id,
+                            },
+                        )?;
+                        ops.push(StagedOp::Truncate);
+                    }
                 }
                 applies.push((*table_id, ops));
             }
@@ -713,6 +726,7 @@ impl Database {
                         match op {
                             StagedOp::Put(row) => t.apply_put_rows(vec![row])?,
                             StagedOp::Delete(rid) => t.apply_delete(rid, new_epoch),
+                            StagedOp::Truncate => t.apply_truncate(new_epoch)?,
                         }
                     }
                     t.invalidate_pending_cache();
@@ -1468,7 +1482,7 @@ fn recover_shared_wal(
     }
 
     // Pass 2: stage data per table, gated by flushed_epoch.
-    type TableStage = (Vec<Row>, Vec<(RowId, Epoch)>);
+    type TableStage = (Vec<Row>, Vec<(RowId, Epoch)>, Option<Epoch>, Epoch);
     let mut stage: HashMap<u64, TableStage> = HashMap::new();
     let mut max_epoch = epoch.visible().0;
     for r in records {
@@ -1500,7 +1514,11 @@ fn recover_shared_wal(
                         row
                     })
                     .collect();
-                stage.entry(table_id).or_default().0.extend(rows);
+                let entry = stage
+                    .entry(table_id)
+                    .or_insert_with(|| (Vec::new(), Vec::new(), None, commit_epoch));
+                entry.0.extend(rows);
+                entry.3 = commit_epoch;
             }
             Op::Delete { table_id, row_ids } => {
                 let skip = tables
@@ -1511,18 +1529,43 @@ fn recover_shared_wal(
                     continue;
                 }
                 let dels = row_ids.into_iter().map(|rid| (rid, commit_epoch));
-                stage.entry(table_id).or_default().1.extend(dels);
+                let entry = stage
+                    .entry(table_id)
+                    .or_insert_with(|| (Vec::new(), Vec::new(), None, commit_epoch));
+                entry.1.extend(dels);
+                entry.3 = commit_epoch;
+            }
+            Op::TruncateTable { table_id } => {
+                let skip = tables
+                    .get(&table_id)
+                    .map(|h| h.lock().flushed_epoch() >= ce)
+                    .unwrap_or(true);
+                if skip {
+                    continue;
+                }
+                stage.insert(
+                    table_id,
+                    (Vec::new(), Vec::new(), Some(commit_epoch), commit_epoch),
+                );
             }
             _ => {}
         }
     }
 
-    for (table_id, (rows, deletes)) in stage {
+    for (table_id, (rows, deletes, truncate_epoch, table_epoch)) in stage {
         let Some(handle) = tables.get(&table_id) else {
             continue;
         };
         let mut t = handle.lock();
+        if let Some(epoch) = truncate_epoch {
+            t.apply_truncate(epoch)?;
+        }
         t.recover_apply(rows, deletes)?;
+        if truncate_epoch.is_some() {
+            let rows = t.visible_rows(Snapshot::at(Epoch(u64::MAX)))?;
+            t.live_count = rows.len() as u64;
+            t.persist_manifest(table_epoch)?;
+        }
     }
 
     // Pass 3: link spilled runs from committed txns (spec §8.5). A crash

@@ -195,6 +195,9 @@ pub struct Table {
     /// B1/B2: tombstones staged on a mounted table, applied at the assigned
     /// epoch in `commit` (mirror of `pending_rows`).
     pending_dels: Vec<RowId>,
+    /// B1/B2: truncate staged on a mounted table, applied at the assigned epoch
+    /// in `commit`; standalone tables apply the clear immediately.
+    pending_truncate: bool,
     /// Engine-managed `AUTO_INCREMENT` counter (`None` for tables without an
     /// auto-increment primary key). See [`AutoIncState`].
     auto_inc: Option<AutoIncState>,
@@ -952,6 +955,7 @@ impl Table {
             pending_rows: Vec::new(),
             pending_rows_auto_inc: Vec::new(),
             pending_dels: Vec::new(),
+            pending_truncate: false,
             wal_dek,
             auto_inc,
         })
@@ -1160,6 +1164,7 @@ impl Table {
             pending_rows: Vec::new(),
             pending_rows_auto_inc: Vec::new(),
             pending_dels: Vec::new(),
+            pending_truncate: false,
             wal_dek,
             auto_inc,
         };
@@ -2108,6 +2113,57 @@ impl Table {
         Ok(())
     }
 
+    /// Durably remove every row in the table once the current write span commits.
+    pub fn truncate(&mut self) -> Result<()> {
+        let epoch = self.pending_epoch();
+        self.wal_append_data(Op::TruncateTable {
+            table_id: self.table_id,
+        })?;
+        if self.is_shared() {
+            self.pending_rows.clear();
+            self.pending_rows_auto_inc.clear();
+            self.pending_dels.clear();
+            self.pending_truncate = true;
+        } else {
+            self.apply_truncate(epoch)?;
+        }
+        Ok(())
+    }
+
+    /// Apply an already-durable truncate without appending to the WAL.
+    pub(crate) fn apply_truncate(&mut self, _epoch: Epoch) -> Result<()> {
+        for rr in std::mem::take(&mut self.run_refs) {
+            let _ = std::fs::remove_file(self.run_path(rr.run_id as u64));
+        }
+        for r in std::mem::take(&mut self.retiring) {
+            let _ = std::fs::remove_file(self.run_path(r.run_id as u64));
+        }
+        self.memtable = Memtable::new();
+        self.mutable_run = MutableRun::new();
+        self.hot = HotIndex::new();
+        let (bitmap, ann, fm, sparse) = empty_indexes(&self.schema);
+        self.bitmap = bitmap;
+        self.ann = ann;
+        self.fm = fm;
+        self.sparse = sparse;
+        self.learned_range.clear();
+        self.pk_by_row.clear();
+        self.live_count = 0;
+        self.reservoir = crate::reservoir::Reservoir::default();
+        self.had_deletes = true;
+        self.agg_cache.clear();
+        self.global_idx_epoch = 0;
+        self.indexes_complete = true;
+        self.pending_delete_rids.clear();
+        self.pending_put_cols.clear();
+        self.pending_rows.clear();
+        self.pending_rows_auto_inc.clear();
+        self.pending_dels.clear();
+        self.clear_result_cache();
+        self.invalidate_index_checkpoint();
+        Ok(())
+    }
+
     /// Apply a tombstone (already-durable on the WAL) at `epoch` without
     /// appending to the per-table WAL. Used by the cross-table `Transaction`.
     pub(crate) fn apply_delete(&mut self, row_id: RowId, epoch: Epoch) {
@@ -2346,8 +2402,11 @@ impl Table {
             .await_durable(&s.wal, commit_seq)
             .inspect_err(|_| s.poisoned.store(true, Ordering::Relaxed))?;
 
-        // Apply staged rows/tombstones at the real assigned epoch (B2): nothing
+        // Apply staged truncate/rows/tombstones at the real assigned epoch (B2): nothing
         // was stamped speculatively, and nothing is visible until publish below.
+        if std::mem::take(&mut self.pending_truncate) {
+            self.apply_truncate(new_epoch)?;
+        }
         let mut rows = std::mem::take(&mut self.pending_rows);
         if !rows.is_empty() {
             for r in &mut rows {
