@@ -3856,6 +3856,18 @@ impl Table {
         self.memtable.is_empty()
     }
 
+    /// Cumulative raw-page-cache hit/miss counts (Priority 14: hit visibility).
+    /// Useful for confirming a repeat scan is served from cache or measuring a
+    /// query's locality after [`reset_page_cache_stats`](Self::reset_page_cache_stats).
+    pub fn page_cache_stats(&self) -> crate::cache::CacheStats {
+        self.page_cache.lock().stats()
+    }
+
+    /// Zero the raw-page-cache hit/miss counters.
+    pub fn reset_page_cache_stats(&self) {
+        self.page_cache.lock().reset_stats();
+    }
+
     /// The run IDs in level order (Phase 15.5: used by the Arrow IPC shadow to
     /// key shadow files and detect stale shadows).
     pub fn run_ids(&self) -> Vec<u128> {

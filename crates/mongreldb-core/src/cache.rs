@@ -19,6 +19,29 @@ use crate::epoch::{Epoch, Snapshot};
 use crate::page::CachedPage;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Cumulative page-cache access counters (Priority 14: hit visibility). A *hit*
+/// is a lookup that returned a page visible to the snapshot; a *miss* is a
+/// lookup that found nothing or an entry too new for the snapshot (the caller
+/// then reads from disk).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheStats {
+    pub hits: u64,
+    pub misses: u64,
+}
+
+impl CacheStats {
+    /// Fraction of lookups served from cache in `[0, 1]` (`0` when never used).
+    pub fn hit_rate(&self) -> f64 {
+        let total = self.hits + self.misses;
+        if total == 0 {
+            0.0
+        } else {
+            self.hits as f64 / total as f64
+        }
+    }
+}
 
 /// Bounded, MVCC-safe page cache with frequency-aware CLOCK eviction and an
 /// optional persistent backing directory.
@@ -33,6 +56,10 @@ pub struct PageCache {
     /// spilled/loaded as `<hex(key)>` files (raw on-disk bytes).
     dir: Option<PathBuf>,
     persistent: bool,
+    /// Lookups served from cache (visible to the snapshot).
+    hits: AtomicU64,
+    /// Lookups that found nothing visible (caller falls through to disk).
+    misses: AtomicU64,
 }
 
 struct Entry {
@@ -53,7 +80,24 @@ impl PageCache {
             used_bytes: 0,
             dir: None,
             persistent: false,
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
         }
+    }
+
+    /// Cumulative hit/miss counts since construction (or the last
+    /// [`reset_stats`](Self::reset_stats)). Cheap (`Relaxed` atomic loads).
+    pub fn stats(&self) -> CacheStats {
+        CacheStats {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Zero the hit/miss counters (e.g. to measure a single query's locality).
+    pub fn reset_stats(&self) {
+        self.hits.store(0, Ordering::Relaxed);
+        self.misses.store(0, Ordering::Relaxed);
     }
 
     /// Enable persistence: load any cached pages from `<dir>` and spill future
@@ -92,15 +136,23 @@ impl PageCache {
     /// Fetch the page visible to `snapshot` (the entry's committed epoch must be
     /// `<= snapshot.epoch`), promoting its frequency. O(1).
     pub fn get(&mut self, content_hash: &[u8; 32], snapshot: Snapshot) -> Option<bytes::Bytes> {
-        let entry = self.map.get_mut(content_hash)?;
-        if entry.epoch <= snapshot.epoch {
-            if entry.freq < FREQ_MAX {
-                entry.freq += 1;
-            }
-            Some(entry.bytes.clone())
+        let hit = self
+            .map
+            .get_mut(content_hash)
+            .filter(|e| e.epoch <= snapshot.epoch)
+            .map(|entry| {
+                if entry.freq < FREQ_MAX {
+                    entry.freq += 1;
+                }
+                entry.bytes.clone()
+            });
+        let counter = if hit.is_some() {
+            &self.hits
         } else {
-            None
-        }
+            &self.misses
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        hit
     }
 
     /// Non-blocking probe used by the parallel (rayon) read path: returns a hit
@@ -108,13 +160,20 @@ impl PageCache {
     /// `None` on miss (or if the value is not visible to `snapshot`). The
     /// caller treats any `None` as "fall through to disk".
     pub fn try_get(&self, content_hash: &[u8; 32], snapshot: Snapshot) -> Option<bytes::Bytes> {
-        self.map.get(content_hash).and_then(|e| {
+        let hit = self.map.get(content_hash).and_then(|e| {
             if e.epoch <= snapshot.epoch {
                 Some(e.bytes.clone())
             } else {
                 None
             }
-        })
+        });
+        let counter = if hit.is_some() {
+            &self.hits
+        } else {
+            &self.misses
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        hit
     }
 
     pub fn used_bytes(&self) -> u64 {
@@ -395,6 +454,29 @@ mod tests {
             cache.get(&hash, Snapshot::at(Epoch(3))),
             Some(bytes::Bytes::copy_from_slice(b"v3"))
         );
+    }
+
+    #[test]
+    fn hit_miss_counters_track_lookups() {
+        let mut cache = PageCache::new(1 << 20);
+        let hash = [7u8; 32];
+        cache.insert(page(hash, 1, b"v"));
+        assert_eq!(cache.stats(), CacheStats { hits: 0, misses: 0 });
+
+        // Visible hit (get + try_get).
+        assert!(cache.get(&hash, Snapshot::at(Epoch(1))).is_some());
+        assert!(cache.try_get(&hash, Snapshot::at(Epoch(1))).is_some());
+        // Absent key ⇒ miss; present-but-too-new entry ⇒ miss.
+        assert!(cache.get(&[9u8; 32], Snapshot::at(Epoch(1))).is_none());
+        assert!(cache.get(&hash, Snapshot::at(Epoch(0))).is_none());
+
+        let s = cache.stats();
+        assert_eq!(s, CacheStats { hits: 2, misses: 2 });
+        assert!((s.hit_rate() - 0.5).abs() < 1e-9);
+
+        cache.reset_stats();
+        assert_eq!(cache.stats(), CacheStats { hits: 0, misses: 0 });
+        assert_eq!(cache.stats().hit_rate(), 0.0);
     }
 
     #[test]
