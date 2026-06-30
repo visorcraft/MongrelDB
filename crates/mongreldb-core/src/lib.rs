@@ -67,6 +67,7 @@ pub use sorted_run::{
     RunSpec, RunWriter,
 };
 pub use trace::{IndexRebuild, QueryTrace, ScanMode};
+pub use txn::{OwnedRow, PutResult, UpsertAction, UpsertActionKind, UpsertResult};
 pub use wal::{AddedRun, DdlOp, Op, Record, SharedWal, Wal, WalReader, SYSTEM_TXN_ID};
 
 #[cfg(feature = "encryption")]

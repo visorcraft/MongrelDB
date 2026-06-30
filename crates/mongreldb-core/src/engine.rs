@@ -21,7 +21,7 @@ use crate::row_id_set::RowIdSet;
 use crate::rowid::{RowId, RowIdAllocator};
 use crate::schema::{AlterColumn, ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
 use crate::sorted_run::{RunReader, RunWriter};
-use crate::txn::GroupCommit;
+use crate::txn::{GroupCommit, OwnedRow};
 use crate::wal::{Op, SharedWal, Wal};
 use crate::{MongrelError, Result};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -2111,6 +2111,14 @@ impl Table {
             self.apply_delete(row_id, epoch);
         }
         Ok(())
+    }
+
+    pub fn delete_returning(&mut self, row_id: RowId) -> Result<Option<OwnedRow>> {
+        let pre = self.get(row_id, self.snapshot());
+        self.delete(row_id)?;
+        Ok(pre.map(|row| OwnedRow {
+            columns: row.columns.into_iter().collect(),
+        }))
     }
 
     /// Durably remove every row in the table once the current write span commits.

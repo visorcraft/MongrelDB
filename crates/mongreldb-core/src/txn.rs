@@ -23,6 +23,37 @@ pub(crate) enum Staged {
     Truncate,
 }
 
+#[derive(Debug, Clone)]
+pub struct OwnedRow {
+    pub columns: Vec<(u16, Value)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PutResult {
+    pub auto_inc: Option<i64>,
+    pub row: OwnedRow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpsertActionKind {
+    Inserted,
+    Updated,
+    Unchanged,
+}
+
+#[derive(Debug, Clone)]
+pub enum UpsertAction {
+    DoNothing,
+    DoUpdate(Vec<(u16, Value)>),
+}
+
+#[derive(Debug, Clone)]
+pub struct UpsertResult {
+    pub action: UpsertActionKind,
+    pub row: OwnedRow,
+    pub auto_inc: Option<i64>,
+}
+
 /// An in-flight cross-table transaction. Holds a read snapshot taken at `begin`
 /// and stages writes; nothing is durable or visible until [`Self::commit`].
 pub struct Transaction<'db> {
@@ -72,12 +103,116 @@ impl<'db> Transaction<'db> {
         Ok(assigned)
     }
 
+    pub fn put_returning(
+        &mut self,
+        table: &str,
+        mut cells: Vec<(u16, Value)>,
+    ) -> Result<PutResult> {
+        let id = self.db.table_id(table)?;
+        self.reject_after_truncate(id)?;
+        let handle = self.db.table(table)?;
+        let assigned = handle.lock().fill_auto_inc(&mut cells)?;
+        let row = owned_row_from_cells(&cells);
+        self.staging.push((id, Staged::Put(cells)));
+        Ok(PutResult {
+            auto_inc: assigned,
+            row,
+        })
+    }
+
     /// Stage a delete of `row_id` on `table`.
     pub fn delete(&mut self, table: &str, row_id: RowId) -> Result<()> {
         let id = self.db.table_id(table)?;
         self.reject_after_truncate(id)?;
         self.staging.push((id, Staged::Delete(row_id)));
         Ok(())
+    }
+
+    pub fn delete_many(&mut self, table: &str, row_ids: Vec<RowId>) -> Result<Vec<OwnedRow>> {
+        let id = self.db.table_id(table)?;
+        self.reject_after_truncate(id)?;
+        let snap = self.read;
+        let handle = self.db.table(table)?;
+        let t = handle.lock();
+        let mut pre_images = Vec::with_capacity(row_ids.len());
+        for row_id in &row_ids {
+            if let Some(row) = t.get(*row_id, snap) {
+                pre_images.push(owned_row_from_map(row.columns));
+            }
+        }
+        drop(t);
+        for row_id in row_ids {
+            self.staging.push((id, Staged::Delete(row_id)));
+        }
+        Ok(pre_images)
+    }
+
+    pub fn update_many(
+        &mut self,
+        table: &str,
+        updates: Vec<(RowId, Vec<(u16, Value)>)>,
+    ) -> Result<Vec<OwnedRow>> {
+        let id = self.db.table_id(table)?;
+        self.reject_after_truncate(id)?;
+        let snap = self.read;
+        let handle = self.db.table(table)?;
+        let t = handle.lock();
+        let mut post_images = Vec::with_capacity(updates.len());
+        let mut staged = Vec::with_capacity(updates.len() * 2);
+        for (old_id, new_cells) in updates {
+            let old_row = t
+                .get(old_id, snap)
+                .ok_or_else(|| MongrelError::NotFound(format!("row {old_id:?} not found")))?;
+            let merged = merge_cells(old_row.columns.into_iter().collect(), new_cells);
+            post_images.push(owned_row_from_cells(&merged));
+            staged.push((id, Staged::Delete(old_id)));
+            staged.push((id, Staged::Put(merged)));
+        }
+        drop(t);
+        self.staging.extend(staged);
+        Ok(post_images)
+    }
+
+    pub fn upsert(
+        &mut self,
+        table: &str,
+        mut insert_cells: Vec<(u16, Value)>,
+        action: UpsertAction,
+    ) -> Result<UpsertResult> {
+        let id = self.db.table_id(table)?;
+        self.reject_after_truncate(id)?;
+        match (self.existing_pk_row(table, &insert_cells)?, action) {
+            (None, _) => {
+                let assigned = self
+                    .db
+                    .table(table)?
+                    .lock()
+                    .fill_auto_inc(&mut insert_cells)?;
+                let row = owned_row_from_cells(&insert_cells);
+                self.staging.push((id, Staged::Put(insert_cells)));
+                Ok(UpsertResult {
+                    action: UpsertActionKind::Inserted,
+                    row,
+                    auto_inc: assigned,
+                })
+            }
+            (Some((_old_id, old_row)), UpsertAction::DoNothing) => Ok(UpsertResult {
+                action: UpsertActionKind::Unchanged,
+                row: old_row,
+                auto_inc: None,
+            }),
+            (Some((old_id, old_row)), UpsertAction::DoUpdate(update_cells)) => {
+                let merged = merge_cells(old_row.columns, update_cells);
+                let row = owned_row_from_cells(&merged);
+                self.staging.push((id, Staged::Delete(old_id)));
+                self.staging.push((id, Staged::Put(merged)));
+                Ok(UpsertResult {
+                    action: UpsertActionKind::Updated,
+                    row,
+                    auto_inc: None,
+                })
+            }
+        }
     }
 
     pub fn truncate(&mut self, table: &str) -> Result<()> {
@@ -106,6 +241,29 @@ impl<'db> Transaction<'db> {
         Ok(())
     }
 
+    fn existing_pk_row(
+        &self,
+        table: &str,
+        cells: &[(u16, Value)],
+    ) -> Result<Option<(RowId, OwnedRow)>> {
+        let handle = self.db.table(table)?;
+        let t = handle.lock();
+        let Some(pk_col) = t.schema().primary_key() else {
+            return Ok(None);
+        };
+        let Some((_, pk_value)) = cells.iter().find(|(id, _)| *id == pk_col.id) else {
+            return Ok(None);
+        };
+        if matches!(pk_value, Value::Null) {
+            return Ok(None);
+        }
+        let Some(row_id) = t.lookup_pk(&pk_value.encode_key()) else {
+            return Ok(None);
+        };
+        Ok(t.get(row_id, self.read)
+            .map(|row| (row_id, owned_row_from_map(row.columns))))
+    }
+
     /// Commit: durably seal the staging under one epoch and publish it.
     pub fn commit(self) -> Result<Epoch> {
         self.db
@@ -116,6 +274,27 @@ impl<'db> Transaction<'db> {
     pub fn rollback(self) {
         // Dropping `self` is enough — staging lives only in memory.
     }
+}
+
+fn owned_row_from_cells(cells: &[(u16, Value)]) -> OwnedRow {
+    let mut columns = cells.to_vec();
+    columns.sort_by_key(|(id, _)| *id);
+    OwnedRow { columns }
+}
+
+fn owned_row_from_map(columns: HashMap<u16, Value>) -> OwnedRow {
+    let mut columns: Vec<(u16, Value)> = columns.into_iter().collect();
+    columns.sort_by_key(|(id, _)| *id);
+    OwnedRow { columns }
+}
+
+fn merge_cells(mut base: Vec<(u16, Value)>, updates: Vec<(u16, Value)>) -> Vec<(u16, Value)> {
+    for (id, value) in updates {
+        base.retain(|(existing, _)| *existing != id);
+        base.push((id, value));
+    }
+    base.sort_by_key(|(id, _)| *id);
+    base
 }
 
 /// Staged operation produced after row-id allocation (internal to commit).
