@@ -1,10 +1,10 @@
 [package]
 name = "mongreldb-node"
-version = "0.18.0"
+version = "0.18.1"
 edition = "2021"
 rust-version = "1.80"
 license = "MIT OR Apache-2.0"
-description = "Native Node.js (NAPI) addon for MongrelDB — the better-sqlite3 model: in-process, no HTTP latency."
+description = "High-performance Node.js bindings for MongrelDB with native in-process storage and hybrid indexing."
 publish = false
 
 [lib]

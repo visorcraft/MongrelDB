@@ -1,0 +1,59 @@
+# Builds the native addon and publishes @visorcraft/mongreldb to npm on a tag.
+#
+# Single-platform: bundles a linux-x64-gnu .node (matches what ships today), so
+# the package only installs on linux-x64 — fine for the Roamarr container and a
+# Linux dev box. To go multi-platform later, split this into a build matrix and
+# napi platform packages (@visorcraft/mongreldb-native-<triple>).
+#
+# Publish this BEFORE @visorcraft/mongreldb-kit — the kit's release installs
+# this package from npm to satisfy its peer dependency.
+#
+# Release flow: bump "version" in crates/mongreldb-node/package.json, commit,
+# then tag and push:  git tag v0.18.1 && git push origin v0.18.1
+# npm refuses to republish an existing version, so the tag must be a new version
+# (0.18.0 is already published).
+#
+# Requires repo secret NPM_TOKEN: a granular npm token with read+write on the
+# @visorcraft scope.
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  id-token: write # npm provenance
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/mongreldb-node
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/mongreldb-node
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          scope: '@visorcraft'
+
+      - run: npm install
+
+      - run: npm run build
+
+      # Sanity gate: the freshly built addon must load before we publish.
+      - run: node -e "require('./index.js'); console.log('addon loads OK')"
+
+      - run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

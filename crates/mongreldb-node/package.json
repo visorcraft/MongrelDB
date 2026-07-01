@@ -1,7 +1,7 @@
 {
   "name": "@visorcraft/mongreldb",
-  "version": "0.18.0",
-  "description": "Native Node.js addon for MongrelDB — in-process, sub-ms writes, hybrid index queries.",
+  "version": "0.18.1",
+  "description": "High-performance Node.js bindings for MongrelDB with native in-process storage, sub-ms writes, and hybrid indexing.",
   "main": "index.js",
   "types": "index.d.ts",
   "napi": {

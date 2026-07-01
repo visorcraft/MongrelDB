@@ -1,8 +1,9 @@
 # mongreldb-node
 
-Native Node.js addon for MongrelDB via [NAPI](https://napi.rs) — the
-**better-sqlite3 model**: in-process, no HTTP latency, so the ~6 µs single-row
-write isn't dwarfed by a network round-trip. Exposes a **typed object/method
+High-performance Node.js bindings for MongrelDB via [NAPI](https://napi.rs),
+with native in-process storage, sub-ms writes, and hybrid indexing. It follows
+the **better-sqlite3 model**: no HTTP latency, so the ~6 µs single-row write
+isn't dwarfed by a network round-trip. Exposes a **typed object/method
 interface** (not SQL); TypeScript types are generated at build time.
 
 This crate is built **separately** from the Rust workspace (it targets the NAPI

@@ -1,5 +1,5 @@
-//! Native Node.js addon for MongrelDB via NAPI — the better-sqlite3 model:
-//! in-process, zero-HTTP-latency, sub-millisecond single-row writes.
+//! High-performance Node.js bindings for MongrelDB via NAPI, with native
+//! in-process storage, sub-millisecond writes, and hybrid indexing.
 //!
 //! This crate exposes a **typed object/method interface** (not SQL): `Database`,
 //! `put`, `get`, `commit`, `flush`, `count`, and a hybrid `query` that composes
