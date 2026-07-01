@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
 description = "MongrelDB core: log-structured columnar store with sub-ms writes, learned indexes, and an AI-native access layer."
 
 [dependencies]

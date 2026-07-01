@@ -4,10 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
 description = "DataFusion SQL + Arrow frontend for MongrelDB."
 
 [dependencies]
-mongreldb-core = { path = "../mongreldb-core" }
+mongreldb-core = { path = "../mongreldb-core", version = "0.18.2" }
 datafusion = "54.0.0"
 arrow = "58"
 serde_json = "1"
