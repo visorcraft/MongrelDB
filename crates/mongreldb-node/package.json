@@ -4,6 +4,11 @@
   "description": "High-performance Node.js bindings for MongrelDB with native in-process storage, sub-ms writes, and hybrid indexing.",
   "main": "index.js",
   "types": "index.d.ts",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/visorcraft/MongrelDB.git",
+    "directory": "crates/mongreldb-node"
+  },
   "napi": {
     "name": "mongreldb",
     "package": {
