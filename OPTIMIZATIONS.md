@@ -28,6 +28,46 @@ cargo bench -p mongreldb-core --bench filtered_query
 cargo bench -p mongreldb-core --bench path_matrix
 ```
 
+## Status Update - 2026-07-02
+
+A focused pass closed the remaining tractable items; the larger research-grade
+routes are annotated below as deferred.
+
+- **Narrow-int / float32 / wider-timestamp range + equality pushdown**
+  (Priority 6) — `crates/mongreldb-query/src/lib.rs`: the literal extractors
+  (`int_val`/`float_val`/`val`) and the range/BETWEEN type dispatch now cover
+  `Int8/16/32`, `UInt8/16/32/64`, `Float32`, plus every Timestamp precision.
+  Equality on narrow-int/float32 bitmap + primary-key columns now pushes down
+  too. (OR→BitmapIn, boolean equality, and cast canonicalization were already
+  in place.)
+- **Anchored `LIKE 'abc%'` / `'%abc'`** (Priority 12) — already pushed to
+  `FmContains("<segment>")` as a correct superset (DataFusion re-applies the
+  real wildcard). A *tighter* prefix scan would need a new bytes-range
+  condition / prefix index — that larger item remains open.
+- **Decoded-page cache hit/miss counters** (Priority 14) —
+  `DecodedPageCache` now reports `stats()`/`reset_stats()` mirroring
+  `PageCache`, so the decode-skip rate of a repeat scan is observable. (The
+  raw-page cache already had counters.)
+- **TypeScript migrate row conversion** (Kit Priority 3) — `migrate.ts`'s
+  per-column `cells.find()` `rowFromRowJs` duplicate is removed; it now reuses
+  the alignment-fast-path + `Map`-fallback version from `rows.ts`.
+- **Python analytics without JSON strings** (Kit Priority 4) —
+  `approx_aggregate`/`incremental_aggregate`/`explain` now build native
+  `PyDict`s (via the existing `value_to_py`/`PyDict` path) instead of
+  `serde_json::to_string` → `json.loads`. (`set_similarity` already returned
+  native dicts; row reads were already direct.)
+
+The genuinely open items (each multi-day, research-grade): overlay indexes for
+the still-broad overlay cases (Priority 5); physical-plan cache + direct SQL
+dispatch (Priority 8); Arrow zero-copy buffers + background shadow refresh
+(Priority 9); page-plan range/bitmap fuse and bitmap page-stat pruning
+(Priority 11); true prefix/trigram indexes for anchored LIKE (Priority 12);
+projected/both-side-filtered/semi-anti joins (Priority 13); cache sharding +
+per-query local decoded cache (Priority 14); compaction-as-query-optimization
+(Priority 15). Kit-side: cross-language benchmark suite (Kit P0), TS predicate
+collapsing (Kit P2), join/grouping pushdown (Kit P5), bulk-write guard
+batching (Kit P6).
+
 ## Status Update - 2026-07-01
 
 Several backlog items have since landed and are now reflected below (moved into

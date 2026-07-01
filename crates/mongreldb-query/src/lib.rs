@@ -415,11 +415,18 @@ pub(crate) fn translate_filter(
     use datafusion::logical_expr::{Between, BinaryExpr, Like, Operator};
     use mongreldb_core::{ColumnFlags, Condition, IndexKind, TypeId, Value};
 
-    // Extended int extraction: handles Date32 and all Timestamp* precision
-    // variants that DataFusion emits for typed column comparisons. These are
-    // stored as Int64 internally, so the numeric value is the raw i64.
+    // Extended int extraction: handles every integer width (narrow ints are
+    // stored widened to Int64 internally), Date32, and all Timestamp* precision
+    // variants DataFusion emits. The numeric value is the raw i64.
     let int_val = |s: &ScalarValue| match s {
+        ScalarValue::Int8(Some(v)) => Some(*v as i64),
+        ScalarValue::Int16(Some(v)) => Some(*v as i64),
+        ScalarValue::Int32(Some(v)) => Some(*v as i64),
         ScalarValue::Int64(Some(v)) => Some(*v),
+        ScalarValue::UInt8(Some(v)) => Some(*v as i64),
+        ScalarValue::UInt16(Some(v)) => Some(*v as i64),
+        ScalarValue::UInt32(Some(v)) => Some(*v as i64),
+        ScalarValue::UInt64(Some(v)) => Some(*v as i64),
         ScalarValue::Date32(Some(v)) => Some(*v as i64),
         ScalarValue::TimestampSecond(Some(v), _) => Some(*v),
         ScalarValue::TimestampMillisecond(Some(v), _) => Some(*v),
@@ -428,6 +435,7 @@ pub(crate) fn translate_filter(
         _ => None,
     };
     let float_val = |s: &ScalarValue| match s {
+        ScalarValue::Float32(Some(f)) => Some(*f as f64),
         ScalarValue::Float64(Some(f)) => Some(*f),
         _ => None,
     };
@@ -438,9 +446,15 @@ pub(crate) fn translate_filter(
     let _ = bytes_val; // retained for clarity; equality uses the generic `val` below.
 
     let val = |s: &ScalarValue| -> Option<Value> {
+        // Integer literals of any width coerce to Int64 (the storage width);
+        // Float32 widens to Float64. This keeps equality pushdown working on
+        // narrow-int / float32 bitmap and primary-key columns.
+        if let Some(i) = int_val(s) {
+            return Some(Value::Int64(i));
+        }
         match s {
-            ScalarValue::Int64(Some(v)) => Some(Value::Int64(*v)),
             ScalarValue::Utf8(Some(s)) => Some(Value::Bytes(s.as_bytes().to_vec())),
+            ScalarValue::Float32(Some(f)) => Some(Value::Float64(*f as f64)),
             ScalarValue::Float64(Some(f)) => Some(Value::Float64(*f)),
             ScalarValue::Boolean(Some(b)) => Some(Value::Bool(*b)),
             _ => None,
@@ -495,9 +509,19 @@ pub(crate) fn translate_filter(
                 return None;
             }
 
-            // Range on a typed numeric column.
+            // Range on a typed numeric column. Every integer width is stored
+            // widened to Int64, so they all share the integer Range path.
             match cdef.ty {
-                TypeId::Int64 | TypeId::TimestampNanos | TypeId::Date32 => {
+                TypeId::Int8
+                | TypeId::Int16
+                | TypeId::Int32
+                | TypeId::Int64
+                | TypeId::UInt8
+                | TypeId::UInt16
+                | TypeId::UInt32
+                | TypeId::UInt64
+                | TypeId::TimestampNanos
+                | TypeId::Date32 => {
                     let v = int_val(scalar)?;
                     let (lo, hi) = int_bounds(op, v)?;
                     Some(Condition::Range {
@@ -506,7 +530,7 @@ pub(crate) fn translate_filter(
                         hi,
                     })
                 }
-                TypeId::Float64 => {
+                TypeId::Float32 | TypeId::Float64 => {
                     let v = float_val(scalar)?;
                     let (lo, lo_inc, hi, hi_inc) = float_bounds(op, v)?;
                     Some(Condition::RangeF64 {
@@ -540,7 +564,16 @@ pub(crate) fn translate_filter(
                 _ => return None,
             };
             match cdef.ty {
-                TypeId::Int64 | TypeId::TimestampNanos | TypeId::Date32 => {
+                TypeId::Int8
+                | TypeId::Int16
+                | TypeId::Int32
+                | TypeId::Int64
+                | TypeId::UInt8
+                | TypeId::UInt16
+                | TypeId::UInt32
+                | TypeId::UInt64
+                | TypeId::TimestampNanos
+                | TypeId::Date32 => {
                     let (Some(lo), Some(hi)) = (int_val(lo_s), int_val(hi_s)) else {
                         return None;
                     };
@@ -550,7 +583,7 @@ pub(crate) fn translate_filter(
                         hi,
                     })
                 }
-                TypeId::Float64 => {
+                TypeId::Float32 | TypeId::Float64 => {
                     let (Some(lo), Some(hi)) = (float_val(lo_s), float_val(hi_s)) else {
                         return None;
                     };

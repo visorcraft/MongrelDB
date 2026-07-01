@@ -364,6 +364,10 @@ pub struct DecodedPageCache {
     hand: usize,
     capacity_bytes: u64,
     used_bytes: u64,
+    /// Lookups served from the decoded cache (skipped decode).
+    hits: AtomicU64,
+    /// Lookups that missed (caller decoded the page).
+    misses: AtomicU64,
 }
 
 impl DecodedPageCache {
@@ -374,13 +378,39 @@ impl DecodedPageCache {
             hand: 0,
             capacity_bytes,
             used_bytes: 0,
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
         }
+    }
+
+    /// Cumulative hit/miss counts since construction (or the last
+    /// [`reset_stats`](Self::reset_stats)).
+    pub fn stats(&self) -> CacheStats {
+        CacheStats {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Zero the hit/miss counters.
+    pub fn reset_stats(&self) {
+        self.hits.store(0, Ordering::Relaxed);
+        self.misses.store(0, Ordering::Relaxed);
     }
 
     /// Non-blocking probe used by the parallel scan path (`&self`, no write
     /// lock) — returns the cached decoded page on hit, `None` on miss.
     pub fn try_get(&self, key: &[u8; 32]) -> Option<std::sync::Arc<crate::columnar::NativeColumn>> {
-        self.map.get(key).cloned()
+        match self.map.get(key).cloned() {
+            Some(v) => {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                Some(v)
+            }
+            None => {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
     }
 
     /// Insert a decoded page (replaces any entry with the same key). Evicts
@@ -595,5 +625,31 @@ mod tests {
             cache.map.len(),
             "ring/map size mismatch (orphaned entries or slots)"
         );
+    }
+
+    #[test]
+    fn decoded_cache_hit_miss_counters() {
+        // Priority 14: the decoded-page cache reports hit/miss counts so a
+        // repeat scan's decode-skip rate is observable.
+        use crate::columnar::NativeColumn;
+        let mut cache = DecodedPageCache::new(1 << 20);
+        let key = [9u8; 32];
+        cache.insert(
+            key,
+            std::sync::Arc::new(NativeColumn::Int64 {
+                data: vec![1, 2, 3],
+                validity: vec![],
+            }),
+        );
+        // Two hits, one miss.
+        assert!(cache.try_get(&key).is_some());
+        assert!(cache.try_get(&key).is_some());
+        assert!(cache.try_get(&[0u8; 32]).is_none());
+        let s = cache.stats();
+        assert_eq!(s.hits, 2);
+        assert_eq!(s.misses, 1);
+        assert!(s.hit_rate() > 0.66 && s.hit_rate() < 0.67);
+        cache.reset_stats();
+        assert_eq!(cache.stats(), CacheStats::default());
     }
 }
