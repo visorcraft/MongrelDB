@@ -38,8 +38,8 @@ struct AppState {
 
 pub fn build_app(db: Arc<Database>) -> axum::Router {
     let state = Arc::new(AppState {
+        idem: kit::IdempotencyStore::new(db.root()),
         db,
-        idem: kit::IdempotencyStore::new(),
     });
     axum::Router::new()
         .route("/health", get(health))
@@ -54,6 +54,7 @@ pub fn build_app(db: Arc<Database>) -> axum::Router {
         .route("/kit/schema", get(kit::schema_all))
         .route("/kit/schema/{table}", get(kit::schema_one))
         .route("/kit/txn", post(kit::kit_txn))
+        .route("/kit/query", post(kit::kit_query))
         .with_state(state)
 }
 

@@ -248,6 +248,36 @@ pub struct KitTxnResponse {
     pub results: Vec<KitOpResult>,
 }
 
+// ── /kit/query typed models ─────────────────────────────────────────────────
+
+/// A native typed query (`POST /kit/query`). `conditions` are raw JSON objects
+/// mirroring the daemon's condition variants, e.g. `{"pk": {"value": 2}}`,
+/// `{"range": {"column_id": 2, "lo": 0, "hi": 100}}`,
+/// `{"ann": {"column_id": 5, "query": [...], "k": 10}}`.
+#[derive(Debug, Clone, Serialize)]
+pub struct KitQueryRequest {
+    pub table: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub conditions: Vec<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub projection: Option<Vec<u16>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct KitQueryResponse {
+    pub rows: Vec<KitQueryRow>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct KitQueryRow {
+    pub row_id: String,
+    /// Flat `[col_id, val, col_id, val, …]` cells.
+    pub cells: Vec<serde_json::Value>,
+}
+
 // Internal mirror of the server's error envelope.
 #[derive(Debug, Deserialize)]
 struct KitErrorEnvelope {
@@ -427,6 +457,19 @@ impl MongrelClient {
         let resp = self
             .client
             .post(self.url("/kit/txn"))
+            .json(req)
+            .send()?;
+        let resp = self.check(resp)?;
+        Ok(resp.json()?)
+    }
+
+    /// Run a native typed query (`POST /kit/query`) returning physical row ids
+    /// and typed cells. Conditions intersect in the row-id space; this is the
+    /// native counterpart to SQL reads (which hide row ids).
+    pub fn kit_query(&self, req: &KitQueryRequest) -> ClientResult<KitQueryResponse> {
+        let resp = self
+            .client
+            .post(self.url("/kit/query"))
             .json(req)
             .send()?;
         let resp = self.check(resp)?;

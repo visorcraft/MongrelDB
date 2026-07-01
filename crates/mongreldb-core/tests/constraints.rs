@@ -103,6 +103,12 @@ fn orders_schema_with_fk() -> Schema {
     }
 }
 
+fn orders_schema_with_action(action: FkAction) -> Schema {
+    let mut s = orders_schema_with_fk();
+    s.constraints.foreign_keys[0].on_delete = action;
+    s
+}
+
 fn row(pairs: &[(u16, Value)]) -> Vec<(u16, Value)> {
     pairs.to_vec()
 }
@@ -373,4 +379,227 @@ fn no_constraints_means_no_overhead_path() {
 #[allow(dead_code)]
 fn _rid() -> RowId {
     RowId(0)
+}
+
+fn visible_count(db: &Database, table: &str) -> usize {
+    let snap = db.snapshot().0;
+    db.table(table)
+        .unwrap()
+        .lock()
+        .visible_rows(snap)
+        .unwrap()
+        .len()
+}
+
+fn visible_rows_with_uid(db: &Database, table: &str, uid_col: u16) -> Vec<Value> {
+    let snap = db.snapshot().0;
+    db.table(table)
+        .unwrap()
+        .lock()
+        .visible_rows(snap)
+        .unwrap()
+        .iter()
+        .map(|r| r.columns.get(&uid_col).cloned().unwrap_or(Value::Null))
+        .collect()
+}
+
+fn row_id_of(db: &Database, table: &str, col: u16, val: &Value) -> RowId {
+    let snap = db.snapshot().0;
+    db.table(table)
+        .unwrap()
+        .lock()
+        .visible_rows(snap)
+        .unwrap()
+        .iter()
+        .find(|r| r.columns.get(&col) == Some(val))
+        .map(|r| r.row_id)
+        .unwrap()
+}
+
+#[test]
+fn fk_cascade_deletes_children() {
+    let dir = tempdir().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.create_table("users", users_schema(false, false))
+        .unwrap();
+    db.create_table("orders", orders_schema_with_action(FkAction::Cascade))
+        .unwrap();
+
+    db.transaction(|t| t.put("users", row(&[(0, Value::Int64(1))])))
+        .unwrap();
+    db.transaction(|t| {
+        t.put(
+            "orders",
+            row(&[(10, Value::Int64(100)), (11, Value::Int64(1))]),
+        )?;
+        t.put(
+            "orders",
+            row(&[(10, Value::Int64(101)), (11, Value::Int64(1))]),
+        )
+    })
+    .unwrap();
+    db.transaction(|t| t.put("users", row(&[(0, Value::Int64(2))])))
+        .unwrap();
+    db.transaction(|t| {
+        t.put(
+            "orders",
+            row(&[(10, Value::Int64(102)), (11, Value::Int64(2))]),
+        )
+    })
+    .unwrap();
+
+    assert_eq!(visible_count(&db, "orders"), 3);
+    // Delete user 1 → both referencing orders cascade-deleted.
+    let uid1 = row_id_of(&db, "users", 0, &Value::Int64(1));
+    db.transaction(|t| t.delete("users", uid1)).unwrap();
+    assert_eq!(visible_count(&db, "users"), 1);
+    // Orders 100/101 gone; order 102 (user 2) remains.
+    assert_eq!(visible_count(&db, "orders"), 1);
+    let snap = db.snapshot().0;
+    let remaining = db
+        .table("orders")
+        .unwrap()
+        .lock()
+        .visible_rows(snap)
+        .unwrap();
+    assert_eq!(remaining[0].columns.get(&10), Some(&Value::Int64(102)));
+}
+
+#[test]
+fn fk_set_null_nulls_child_fk() {
+    let dir = tempdir().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.create_table("users", users_schema(false, false))
+        .unwrap();
+    db.create_table("orders", orders_schema_with_action(FkAction::SetNull))
+        .unwrap();
+
+    db.transaction(|t| t.put("users", row(&[(0, Value::Int64(1))])))
+        .unwrap();
+    db.transaction(|t| {
+        t.put(
+            "orders",
+            row(&[(10, Value::Int64(100)), (11, Value::Int64(1))]),
+        )
+    })
+    .unwrap();
+
+    // Delete the parent → the child's FK column becomes NULL (child survives).
+    let uid1 = row_id_of(&db, "users", 0, &Value::Int64(1));
+    db.transaction(|t| t.delete("users", uid1)).unwrap();
+    assert_eq!(visible_count(&db, "users"), 0);
+    assert_eq!(
+        visible_count(&db, "orders"),
+        1,
+        "child row survives set-null"
+    );
+    assert_eq!(
+        visible_rows_with_uid(&db, "orders", 11),
+        vec![Value::Null],
+        "FK column was nulled"
+    );
+}
+
+#[test]
+fn fk_cascade_transitive() {
+    // users <- orders (cascade) <- items (cascade): deleting the user cascades
+    // through orders to items.
+    let dir = tempdir().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.create_table("users", users_schema(false, false))
+        .unwrap();
+    db.create_table("orders", orders_schema_with_action(FkAction::Cascade))
+        .unwrap();
+    // items references orders.oid (col 10).
+    let mut items_cons = TableConstraints::default();
+    items_cons.foreign_keys.push(ForeignKey {
+        id: 4,
+        name: "items_order_fk".into(),
+        columns: vec![21],
+        ref_table: "orders".into(),
+        ref_columns: vec![10],
+        on_delete: FkAction::Cascade,
+    });
+    db.create_table(
+        "items",
+        Schema {
+            schema_id: 0,
+            columns: vec![
+                col(
+                    20,
+                    "iid",
+                    TypeId::Int64,
+                    ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                ),
+                col(
+                    21,
+                    "oid",
+                    TypeId::Int64,
+                    ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+                ),
+            ],
+            indexes: vec![],
+            colocation: vec![],
+            constraints: items_cons,
+        },
+    )
+    .unwrap();
+
+    db.transaction(|t| t.put("users", row(&[(0, Value::Int64(1))])))
+        .unwrap();
+    db.transaction(|t| {
+        t.put(
+            "orders",
+            row(&[(10, Value::Int64(50)), (11, Value::Int64(1))]),
+        )
+    })
+    .unwrap();
+    db.transaction(|t| {
+        t.put(
+            "items",
+            row(&[(20, Value::Int64(9)), (21, Value::Int64(50))]),
+        )
+    })
+    .unwrap();
+
+    assert_eq!(visible_count(&db, "items"), 1);
+    let uid1 = row_id_of(&db, "users", 0, &Value::Int64(1));
+    db.transaction(|t| t.delete("users", uid1)).unwrap();
+    assert_eq!(visible_count(&db, "orders"), 0);
+    assert_eq!(
+        visible_count(&db, "items"),
+        0,
+        "transitive cascade reached items"
+    );
+}
+
+#[test]
+fn fk_restrict_still_blocks_when_mixed() {
+    // A RESTRICT child still blocks even when a CASCADE child would be cleaned.
+    let dir = tempdir().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.create_table("users", users_schema(false, false))
+        .unwrap();
+    db.create_table("orders", orders_schema_with_action(FkAction::Cascade))
+        .unwrap();
+    db.create_table("logs", orders_schema_with_action(FkAction::Restrict))
+        .unwrap();
+
+    db.transaction(|t| t.put("users", row(&[(0, Value::Int64(1))])))
+        .unwrap();
+    db.transaction(|t| {
+        t.put(
+            "orders",
+            row(&[(10, Value::Int64(1)), (11, Value::Int64(1))]),
+        )
+    })
+    .unwrap();
+    db.transaction(|t| t.put("logs", row(&[(10, Value::Int64(2)), (11, Value::Int64(1))])))
+        .unwrap();
+
+    let uid1 = row_id_of(&db, "users", 0, &Value::Int64(1));
+    let r = db.transaction(|t| t.delete("users", uid1));
+    let err = r.unwrap_err();
+    assert!(matches!(err, MongrelError::Conflict(_)));
+    assert!(format!("{err}").contains("restricts delete"));
 }

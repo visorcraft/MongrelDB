@@ -330,6 +330,11 @@ impl Database {
         self.catalog.read().clone()
     }
 
+    /// The filesystem root this database was opened/created at.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// Resolve a table name → id (live tables only). pub(crate) so the
     /// transaction layer can stage by name.
     pub fn table_id(&self, name: &str) -> Result<u64> {
@@ -371,7 +376,8 @@ impl Database {
     }
 
     /// Authoritatively validate every declared constraint on the staged write
-    /// set under the transaction's read snapshot. Called from
+    /// set under the transaction's read snapshot, AND expand ON DELETE CASCADE /
+    /// SET NULL actions into explicit child ops. Called from
     /// [`Self::commit_transaction`] outside the WAL mutex. Returns the first
     /// violation as an `Err`, aborting the commit atomically. This is the
     /// server-side authority point: concurrent remote writers that each pass
@@ -380,14 +386,15 @@ impl Database {
     /// Scope: CHECK (full, three-valued), UNIQUE beyond the PK (existence scan +
     /// intra-transaction dedup; concurrent-txn races are additionally caught by
     /// `WriteKey::Unique`), and FK insert-side parent existence + ON DELETE
-    /// RESTRICT. ON DELETE CASCADE / SET NULL and FK updates are deferred
-    /// (logged here as restrict violations so a delete never orphans rows).
+    /// {RESTRICT, CASCADE, SET NULL}. CASCADE appends child deletes (transitive
+    /// fixpoint); SET NULL appends child updates (FK columns nulled). Truncate is
+    /// RESTRICT-only (cascade-truncate is unsupported).
     fn validate_constraints(
         &self,
-        staging: &[(u64, crate::txn::Staged)],
+        staging: &mut Vec<(u64, crate::txn::Staged)>,
         read_epoch: Epoch,
     ) -> Result<()> {
-        use crate::constraint::{encode_composite_key, validate_checks};
+        use crate::constraint::{encode_composite_key, validate_checks, FkAction};
         use crate::memtable::Row;
         use crate::txn::Staged;
         use std::collections::HashSet;
@@ -409,18 +416,6 @@ impl Database {
             return Ok(());
         }
 
-        // Rows staged for deletion in THIS transaction. When checking unique
-        // existence we must exclude these: an upsert/update stages
-        // Delete(old_id) + Put(merged), so the old version is still visible at
-        // the read snapshot but is logically gone — its keys are being freed.
-        let staged_deletes: HashSet<(u64, u64)> = staging
-            .iter()
-            .filter_map(|(t, op)| match op {
-                Staged::Delete(rid) => Some((*t, rid.0)),
-                _ => None,
-            })
-            .collect();
-
         // Lazily-loaded visible rows per table, shared across checks.
         let mut rows_cache: HashMap<u64, Vec<Row>> = HashMap::new();
         let mut load_rows = |table_id: u64| -> Result<Vec<Row>> {
@@ -433,10 +428,107 @@ impl Database {
             Ok(rows)
         };
 
+        // ── Phase A: expand ON DELETE CASCADE / SET NULL into explicit child
+        // ops (transitive fixpoint). RESTRICT is not expanded here — it is
+        // enforced as a violation in Phase B. `cascaded` records every delete
+        // we have already expanded so a self-referential CASCADE FK cannot loop.
+        let mut cascaded: HashSet<(u64, u64)> = HashSet::new();
+        loop {
+            let mut new_ops: Vec<(u64, Staged)> = Vec::new();
+            let deletes: Vec<(u64, crate::rowid::RowId)> = staging
+                .iter()
+                .filter_map(|(t, op)| match op {
+                    Staged::Delete(rid) => Some((*t, *rid)),
+                    _ => None,
+                })
+                .collect();
+            for (table_id, rid) in deletes {
+                if !cascaded.insert((table_id, rid.0)) {
+                    continue;
+                }
+                let Some(tname) = live
+                    .iter()
+                    .find(|(t, _, _)| *t == table_id)
+                    .map(|(_, n, _)| *n)
+                else {
+                    continue;
+                };
+                let parent_handle = self.table_by_id(table_id)?;
+                let Some(parent_row) = parent_handle.lock().get(rid, snapshot) else {
+                    continue;
+                };
+                for (child_id, _child_name, child_schema) in &live {
+                    for fk in &child_schema.constraints.foreign_keys {
+                        if fk.ref_table != tname {
+                            continue;
+                        }
+                        let Some(parent_key) =
+                            encode_composite_key(&fk.ref_columns, &parent_row.columns)
+                        else {
+                            continue;
+                        };
+                        match fk.on_delete {
+                            FkAction::Restrict => continue,
+                            FkAction::Cascade => {
+                                let child_rows = load_rows(*child_id)?;
+                                for cr in &child_rows {
+                                    if !cascaded.contains(&(*child_id, cr.row_id.0))
+                                        && encode_composite_key(&fk.columns, &cr.columns).as_deref()
+                                            == Some(parent_key.as_slice())
+                                    {
+                                        new_ops.push((*child_id, Staged::Delete(cr.row_id)));
+                                    }
+                                }
+                            }
+                            FkAction::SetNull => {
+                                let child_rows = load_rows(*child_id)?;
+                                for cr in &child_rows {
+                                    if !cascaded.contains(&(*child_id, cr.row_id.0))
+                                        && encode_composite_key(&fk.columns, &cr.columns).as_deref()
+                                            == Some(parent_key.as_slice())
+                                    {
+                                        // Re-emit the child row with the FK
+                                        // columns set to NULL (delete + put).
+                                        let mut cells: Vec<(u16, crate::memtable::Value)> = cr
+                                            .columns
+                                            .iter()
+                                            .map(|(k, v)| (*k, v.clone()))
+                                            .collect();
+                                        for cid in &fk.columns {
+                                            cells.retain(|(k, _)| k != cid);
+                                            cells.push((*cid, crate::memtable::Value::Null));
+                                        }
+                                        new_ops.push((*child_id, Staged::Delete(cr.row_id)));
+                                        new_ops.push((*child_id, Staged::Put(cells)));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if new_ops.is_empty() {
+                break;
+            }
+            staging.extend(new_ops);
+        }
+
+        // Rows staged for deletion in THIS transaction (now including cascaded
+        // deletes). Used to exclude the old version of an updated row from
+        // unique-existence scans.
+        let staged_deletes: HashSet<(u64, u64)> = staging
+            .iter()
+            .filter_map(|(t, op)| match op {
+                Staged::Delete(rid) => Some((*t, rid.0)),
+                _ => None,
+            })
+            .collect();
+
         // Intra-transaction unique-key dedup: (table_id, uc_id, key).
         let mut seen_unique: HashSet<(u64, u16, Vec<u8>)> = HashSet::new();
 
-        for (table_id, op) in staging {
+        // ── Phase B: validate the fully-expanded staging set.
+        for (table_id, op) in staging.iter() {
             let Some((_, tname, schema)) = live.iter().find(|(t, _, _)| t == table_id).copied()
             else {
                 continue;
@@ -466,7 +558,7 @@ impl Database {
                         let rows = load_rows(*table_id)?;
                         for r in &rows {
                             // Skip rows this same transaction is deleting (the
-                            // old version of an updated row — its key is freed).
+                            // old version of an updated/cascade-deleted row).
                             if staged_deletes.contains(&(*table_id, r.row_id.0)) {
                                 continue;
                             }
@@ -500,6 +592,9 @@ impl Database {
                         let parent_rows = load_rows(parent_id)?;
                         let mut found = false;
                         for r in &parent_rows {
+                            if staged_deletes.contains(&(parent_id, r.row_id.0)) {
+                                continue;
+                            }
                             if let Some(pkey) = encode_composite_key(&fk.ref_columns, &r.columns) {
                                 if pkey == child_key {
                                     found = true;
@@ -516,17 +611,16 @@ impl Database {
                     }
                 }
                 Staged::Delete(rid) => {
-                    // FK ON DELETE: a child row referencing this parent blocks
-                    // the delete. (RESTRICT; CASCADE/SET NULL deferred → also
-                    // rejected so a delete never orphans rows.)
+                    // FK ON DELETE RESTRICT: a child row (whose FK action is
+                    // RESTRICT) referencing this parent blocks the delete.
+                    // CASCADE/SET NULL children were expanded in Phase A.
                     let parent_handle = self.table_by_id(*table_id)?;
                     let Some(parent_row) = parent_handle.lock().get(*rid, snapshot) else {
                         continue;
                     };
-                    // Find child tables whose FK references this parent.
                     for (child_id, child_name, child_schema) in &live {
                         for fk in &child_schema.constraints.foreign_keys {
-                            if fk.ref_table != tname {
+                            if fk.ref_table != tname || fk.on_delete != FkAction::Restrict {
                                 continue;
                             }
                             let Some(parent_key) =
@@ -536,6 +630,11 @@ impl Database {
                             };
                             let child_rows = load_rows(*child_id)?;
                             for r in &child_rows {
+                                // A child already being deleted by this txn
+                                // (cascade/inline) is not a restrict violation.
+                                if staged_deletes.contains(&(*child_id, r.row_id.0)) {
+                                    continue;
+                                }
                                 if let Some(ck) = encode_composite_key(&fk.columns, &r.columns) {
                                     if ck == parent_key {
                                         return Err(MongrelError::Conflict(format!(
@@ -549,8 +648,9 @@ impl Database {
                     }
                 }
                 Staged::Truncate => {
-                    // A truncate removes every parent row; reject if any child
-                    // references this table at all (RESTRICT semantics).
+                    // Truncate is RESTRICT-only: reject if any child references
+                    // this table (any FK action), since cascade-truncate is
+                    // unsupported.
                     for (child_id, child_name, child_schema) in &live {
                         for fk in &child_schema.constraints.foreign_keys {
                             if fk.ref_table != tname {
@@ -694,7 +794,7 @@ impl Database {
         // satisfies every declared constraint or is rejected atomically — no
         // partial commit. Concurrent-txn uniqueness is additionally guarded by
         // the `WriteKey::Unique` keys derived above.
-        self.validate_constraints(&staging, read_epoch)?;
+        self.validate_constraints(&mut staging, read_epoch)?;
 
         // ── 1b. Spill: if a table's staged puts exceed the threshold, write a
         // uniform-epoch pending run (spec §8.5). Rows in the run are NOT

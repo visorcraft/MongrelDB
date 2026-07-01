@@ -20,6 +20,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use mongreldb_core::query::{Condition, Query};
 use mongreldb_core::schema::{ColumnFlags, Schema};
 use mongreldb_core::txn::{UpsertAction, UpsertActionKind};
 use mongreldb_core::{MongrelError, RowId, Value};
@@ -29,18 +30,26 @@ use serde_json::{json, Value as Jval};
 use crate::json_to_value;
 use crate::AppState;
 
-/// Per-server idempotency store: idempotency key → committed response. A
-/// best-effort in-memory cache (single-process daemon); a persistent store is
-/// the "full version" item. Per-key locks serialize truly-concurrent identical
-/// retries so a key is applied exactly once.
+/// Per-server idempotency store: idempotency key → committed response, backed
+/// by an on-disk `<root>/_idem/` directory so retry-after-restart (not just
+/// retry-after-timeout) still returns the original committed response exactly
+/// once. The in-memory map is a hot cache; a miss falls through to disk. Per-key
+/// locks serialize truly-concurrent identical retries.
 pub struct IdempotencyStore {
+    dir: std::path::PathBuf,
     committed: Mutex<HashMap<String, KitTxnResponse>>,
     in_flight: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 impl IdempotencyStore {
-    pub fn new() -> Self {
+    /// Open (or create) the store rooted at `<root>/_idem/`. Best-effort: a
+    /// failure to create the directory is not fatal — the store simply behaves
+    /// as in-memory-only (disk reads/writes become no-ops on error).
+    pub fn new(root: &std::path::Path) -> Self {
+        let dir = root.join("_idem");
+        let _ = std::fs::create_dir_all(&dir);
         Self {
+            dir,
             committed: Mutex::new(HashMap::new()),
             in_flight: Mutex::new(HashMap::new()),
         }
@@ -55,18 +64,46 @@ impl IdempotencyStore {
             .clone()
     }
 
+    fn path_for(&self, key: &str) -> std::path::PathBuf {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        key.hash(&mut h);
+        self.dir.join(format!("{:016x}.json", h.finish()))
+    }
+
     fn get(&self, key: &str) -> Option<KitTxnResponse> {
-        self.committed.lock().unwrap().get(key).cloned()
+        if let Some(v) = self.committed.lock().unwrap().get(key).cloned() {
+            return Some(v);
+        }
+        // Disk fallback (persisted across daemon restarts).
+        let path = self.path_for(key);
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(_) => return None,
+        };
+        match serde_json::from_slice::<KitTxnResponse>(&bytes) {
+            Ok(v) => {
+                self.committed
+                    .lock()
+                    .unwrap()
+                    .insert(key.to_string(), v.clone());
+                Some(v)
+            }
+            Err(_) => None,
+        }
     }
 
     fn store(&self, key: String, resp: KitTxnResponse) {
+        // Atomic write: tmp file in the same dir, then rename.
+        let path = self.path_for(&key);
+        if let Ok(bytes) = serde_json::to_vec(&resp) {
+            let tmp = path.with_extension("json.tmp");
+            if std::fs::write(&tmp, &bytes).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
+        }
         self.committed.lock().unwrap().insert(key, resp);
-    }
-}
-
-impl Default for IdempotencyStore {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -110,14 +147,14 @@ pub enum KitOp {
 
 // ── Response models ─────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KitTxnResponse {
     pub status: String,
     pub epoch: u64,
     pub results: Vec<KitOpResult>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum KitOpResult {
     Put {
@@ -322,6 +359,221 @@ fn txn_response(r: Result<KitTxnResponse, Response>) -> Response {
     }
 }
 
+// ── Native typed query endpoint (/kit/query) ────────────────────────────────
+//
+// A row-ID- and typed-cell-returning native query over the engine's `Condition`
+// primitives (PK / bitmap equality / range / ANN / sparse / FM / MinHash / null
+// tests). This is the native counterpart to SQL reads: it returns physical row
+// ids (SQL hides them) and exposes ANN/sparse/MinHash conditions with typed
+// results. Conditions intersect in the row-id space; only survivors decode.
+
+#[derive(Debug, Deserialize)]
+pub struct KitQueryRequest {
+    pub table: String,
+    #[serde(default)]
+    pub conditions: Vec<JsonCondition>,
+    /// Projected column ids. Omit / empty ⇒ all columns.
+    #[serde(default)]
+    pub projection: Option<Vec<u16>>,
+    /// Cap on the number of returned rows (after intersection).
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// A condition over the row-id space, mirroring `mongreldb_core::query::Condition`
+/// in a JSON-friendly, externally-tagged shape.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JsonCondition {
+    Pk { value: Jval },
+    BitmapEq { column_id: u16, value: Jval },
+    BitmapIn { column_id: u16, values: Vec<Jval> },
+    Range { column_id: u16, lo: i64, hi: i64 },
+    RangeF64 {
+        column_id: u16,
+        lo: f64,
+        lo_inclusive: bool,
+        hi: f64,
+        hi_inclusive: bool,
+    },
+    IsNull { column_id: u16 },
+    IsNotNull { column_id: u16 },
+    FmContains { column_id: u16, pattern: String },
+    FmContainsAll { column_id: u16, patterns: Vec<String> },
+    Ann { column_id: u16, query: Vec<f32>, k: usize },
+    SparseMatch { column_id: u16, query: Vec<(u32, f32)>, k: usize },
+    MinHashSimilar { column_id: u16, query: Vec<u64>, k: usize },
+}
+
+#[derive(Debug, Serialize)]
+pub struct KitQueryResponse {
+    pub rows: Vec<KitRow>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct KitRow {
+    pub row_id: String,
+    pub cells: Vec<Jval>,
+}
+
+pub async fn kit_query(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<KitQueryRequest>,
+) -> Response {
+    let handle = match state.db.table(&req.table) {
+        Ok(h) => h,
+        Err(e) => return (StatusCode::NOT_FOUND, e.to_string()).into_response(),
+    };
+    let schema = handle.lock().schema().clone();
+
+    // Translate JSON conditions → engine Conditions.
+    let mut q = Query::new();
+    for c in &req.conditions {
+        match parse_condition(c, &schema) {
+            Ok(cond) => q = q.and(cond),
+            Err(msg) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(KitErrorEnvelope {
+                        status: "aborted".into(),
+                        error: KitError::new("BAD_REQUEST", msg),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    let projection: Option<std::collections::HashSet<u16>> =
+        req.projection.as_ref().map(|p| p.iter().copied().collect());
+
+    let limit = req.limit.unwrap_or(usize::MAX);
+    let rows = match handle.lock().query(&q) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                e.to_string(),
+            )
+                .into_response();
+        }
+    };
+    let mut out: Vec<KitRow> = Vec::new();
+    let mut truncated = false;
+    for r in rows {
+        if out.len() >= limit {
+            truncated = true;
+            break;
+        }
+        let cells: Vec<Jval> = match &projection {
+            Some(proj) => schema
+                .columns
+                .iter()
+                .filter(|c| proj.contains(&c.id))
+                .filter_map(|c| {
+                    r.columns.get(&c.id).map(|v| {
+                        vec![json!(c.id), value_to_json(v)]
+                    })
+                })
+                .flatten()
+                .collect(),
+            None => schema
+                .columns
+                .iter()
+                .filter_map(|c| {
+                    r.columns.get(&c.id).map(|v| vec![json!(c.id), value_to_json(v)])
+                })
+                .flatten()
+                .collect(),
+        };
+        out.push(KitRow {
+            row_id: r.row_id.0.to_string(),
+            cells,
+        });
+    }
+    Json(KitQueryResponse { rows: out, truncated }).into_response()
+}
+
+fn parse_condition(c: &JsonCondition, schema: &Schema) -> std::result::Result<Condition, String> {
+    Ok(match c {
+        JsonCondition::Pk { value } => {
+            let pk = schema.primary_key().ok_or("table has no primary key")?;
+            Condition::Pk(json_to_value(value, pk.ty).encode_key())
+        }
+        JsonCondition::BitmapEq { column_id, value } => {
+            let ty = col_type(schema, *column_id)?;
+            Condition::BitmapEq {
+                column_id: *column_id,
+                value: json_to_value(value, ty).encode_key(),
+            }
+        }
+        JsonCondition::BitmapIn { column_id, values } => {
+            let ty = col_type(schema, *column_id)?;
+            Condition::BitmapIn {
+                column_id: *column_id,
+                values: values
+                    .iter()
+                    .map(|v| json_to_value(v, ty).encode_key())
+                    .collect(),
+            }
+        }
+        JsonCondition::Range { column_id, lo, hi } => Condition::Range {
+            column_id: *column_id,
+            lo: *lo,
+            hi: *hi,
+        },
+        JsonCondition::RangeF64 {
+            column_id,
+            lo,
+            lo_inclusive,
+            hi,
+            hi_inclusive,
+        } => Condition::RangeF64 {
+            column_id: *column_id,
+            lo: *lo,
+            lo_inclusive: *lo_inclusive,
+            hi: *hi,
+            hi_inclusive: *hi_inclusive,
+        },
+        JsonCondition::IsNull { column_id } => Condition::IsNull { column_id: *column_id },
+        JsonCondition::IsNotNull { column_id } => Condition::IsNotNull { column_id: *column_id },
+        JsonCondition::FmContains { column_id, pattern } => Condition::FmContains {
+            column_id: *column_id,
+            pattern: pattern.as_bytes().to_vec(),
+        },
+        JsonCondition::FmContainsAll { column_id, patterns } => Condition::FmContainsAll {
+            column_id: *column_id,
+            patterns: patterns.iter().map(|s| s.as_bytes().to_vec()).collect(),
+        },
+        JsonCondition::Ann { column_id, query, k } => Condition::Ann {
+            column_id: *column_id,
+            query: query.clone(),
+            k: *k,
+        },
+        JsonCondition::SparseMatch { column_id, query, k } => Condition::SparseMatch {
+            column_id: *column_id,
+            query: query.clone(),
+            k: *k,
+        },
+        JsonCondition::MinHashSimilar { column_id, query, k } => Condition::MinHashSimilar {
+            column_id: *column_id,
+            query: query.clone(),
+            k: *k,
+        },
+    })
+}
+
+fn col_type(schema: &Schema, column_id: u16) -> std::result::Result<mongreldb_core::schema::TypeId, String> {
+    schema
+        .columns
+        .iter()
+        .find(|c| c.id == column_id)
+        .map(|c| c.ty)
+        .ok_or_else(|| format!("unknown column id {column_id}"))
+}
+
+#[allow(clippy::result_large_err)]
 fn execute_kit_txn(state: &AppState, req: &KitTxnRequest) -> Result<KitTxnResponse, Response> {
     // 1. Structural pre-validation: resolve each op against the live schemas and
     //    parse cells into typed Values. This gives per-op error attribution
@@ -530,6 +782,7 @@ fn lookup_schema(state: &AppState, table: &str) -> std::result::Result<Schema, M
 
 /// Parse a flat `[col_id, val, …]` cell array against a schema.
 fn parse_cells(row: &[Jval], schema: &Schema) -> std::result::Result<Vec<(u16, Value)>, String> {
+    #[allow(clippy::manual_is_multiple_of)]
     if row.len() % 2 != 0 {
         return Err("cells must be an even-length [col_id, value, …] array".into());
     }

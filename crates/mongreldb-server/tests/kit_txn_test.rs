@@ -109,6 +109,44 @@ async fn get(app: axum::Router, uri: &str) -> (u16, serde_json::Value) {
     (status, v)
 }
 
+async fn setup_shared() -> (tempfile::TempDir, Arc<Database>, axum::Router) {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    db.create_table("users", users_schema()).unwrap();
+    db.create_table("orders", orders_schema()).unwrap();
+    let app = build_app(Arc::clone(&db));
+    (dir, db, app)
+}
+
+#[tokio::test]
+async fn idempotency_persists_across_server_restart() {
+    // Commit a batch with key K on app1, then rebuild a fresh app2 on the SAME
+    // database dir (simulating a daemon restart). The replayed K must return
+    // the original committed response from the on-disk `_idem/` store.
+    let (_dir, db, app1) = setup_shared().await;
+    let body = serde_json::json!({
+        "idempotency_key": "persist-k",
+        "ops": [{"put": {"table": "users", "cells": [0, 7, 1, "p@x", 2, 1]}}]
+    });
+    let (s1, v1) = post(app1, "/kit/txn", body.clone()).await;
+    assert_eq!(s1, 200);
+    let epoch1 = v1["epoch"].as_u64().unwrap();
+
+    // Fresh server instance on the same db (new IdempotencyStore, empty memory).
+    let app2 = build_app(Arc::clone(&db));
+    let (s2, v2) = post(app2, "/kit/txn", body).await;
+    assert_eq!(s2, 200);
+    assert_eq!(
+        v2["epoch"].as_u64().unwrap(),
+        epoch1,
+        "idempotent replay after restart returns cached epoch from disk"
+    );
+    // And the row was not double-inserted.
+    let snap = db.snapshot().0;
+    let n = db.table("users").unwrap().lock().visible_rows(snap).unwrap().len();
+    assert_eq!(n, 1);
+}
+
 #[tokio::test]
 async fn schema_endpoint_returns_constraints() {
     let (_d, app) = setup().await;
@@ -228,4 +266,54 @@ async fn kit_txn_structural_error_has_op_index() {
     assert_eq!(s, 400);
     assert_eq!(v["error"]["code"], "BAD_REQUEST");
     assert_eq!(v["error"]["op_index"], 0);
+}
+
+#[tokio::test]
+async fn kit_query_pk_range_and_projection() {
+    let (_d, app) = setup().await;
+    // Seed: users with explicit ids 1..=3 (ages 30/40/50), emails a/b/c.
+    let b = serde_json::json!({"ops": [
+        {"put": {"table": "users", "cells": [0, 1, 1, "a@x", 2, 30]}},
+        {"put": {"table": "users", "cells": [0, 2, 1, "b@x", 2, 40]}},
+        {"put": {"table": "users", "cells": [0, 3, 1, "c@x", 2, 50]}},
+    ]});
+    let (s, _) = post(app.clone(), "/kit/txn", b).await;
+    assert_eq!(s, 200);
+
+    // PK exact lookup → one row, with its physical row_id.
+    let q = serde_json::json!({"table": "users", "conditions": [{"pk": {"value": 2}}]});
+    let (s, v) = post(app.clone(), "/kit/query", q).await;
+    assert_eq!(s, 200, "body: {v}");
+    assert_eq!(v["rows"].as_array().unwrap().len(), 1);
+    assert!(v["rows"][0]["row_id"].is_string(), "row_id returned");
+    // cells carry id 0 → 2 (the PK we asked for).
+    let cells = v["rows"][0]["cells"].as_array().unwrap();
+    assert!(cells.contains(&serde_json::json!(2)));
+
+    // Range 35..=55 on age (col 2) → users 2 and 3.
+    let q = serde_json::json!({"table": "users",
+        "conditions": [{"range": {"column_id": 2, "lo": 35, "hi": 55}}],
+        "projection": [0, 2]});
+    let (s, v) = post(app.clone(), "/kit/query", q).await;
+    assert_eq!(s, 200, "body: {v}");
+    assert_eq!(v["rows"].as_array().unwrap().len(), 2);
+    // Projection: only cols 0 and 2 appear (no email col 1).
+    for r in v["rows"].as_array().unwrap() {
+        let ids: Vec<&serde_json::Value> = r["cells"].as_array().unwrap().iter().step_by(2).collect();
+        assert!(ids.contains(&&serde_json::json!(0)) || ids.contains(&&serde_json::json!(2)));
+        assert!(!ids.iter().any(|x| **x == serde_json::json!(1u64)), "email not projected");
+    }
+
+    // Limit truncates.
+    let q = serde_json::json!({"table": "users", "limit": 1});
+    let (s, v) = post(app.clone(), "/kit/query", q).await;
+    assert_eq!(s, 200);
+    assert_eq!(v["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(v["truncated"], true);
+
+    // Empty conditions ⇒ all rows.
+    let q = serde_json::json!({"table": "users"});
+    let (s, v) = post(app, "/kit/query", q).await;
+    assert_eq!(s, 200);
+    assert_eq!(v["rows"].as_array().unwrap().len(), 3);
 }
