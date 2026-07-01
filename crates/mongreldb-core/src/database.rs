@@ -411,6 +411,18 @@ impl Database {
             return Ok(());
         }
 
+        // Rows staged for deletion in THIS transaction. When checking unique
+        // existence we must exclude these: an upsert/update stages
+        // Delete(old_id) + Put(merged), so the old version is still visible at
+        // the read snapshot but is logically gone — its keys are being freed.
+        let staged_deletes: HashSet<(u64, u64)> = staging
+            .iter()
+            .filter_map(|(t, op)| match op {
+                Staged::Delete(rid) => Some((*t, rid.0)),
+                _ => None,
+            })
+            .collect();
+
         // Lazily-loaded visible rows per table, shared across checks.
         let mut rows_cache: HashMap<u64, Vec<Row>> = HashMap::new();
         let mut load_rows = |table_id: u64| -> Result<Vec<Row>> {
@@ -455,6 +467,11 @@ impl Database {
                         }
                         let rows = load_rows(*table_id)?;
                         for r in &rows {
+                            // Skip rows this same transaction is deleting (the
+                            // old version of an updated row — its key is freed).
+                            if staged_deletes.contains(&(*table_id, r.row_id.0)) {
+                                continue;
+                            }
                             if let Some(theirs) = encode_composite_key(&uc.columns, &r.columns) {
                                 if theirs == key {
                                     return Err(MongrelError::Conflict(format!(

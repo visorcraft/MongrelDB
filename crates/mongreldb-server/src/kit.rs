@@ -1,7 +1,7 @@
 //! Typed Kit-aware server endpoints that sit on top of the engine's
 //! transactional commit path. These give remote clients an authoritative
-//! surface (validation + constraints + sequence allocation executed server-side
-//! inside one core transaction) rather than SQL passthrough.
+//! surface (validation + constraints executed server-side inside one core
+//! transaction) rather than SQL passthrough.
 //!
 //! Routes:
 //!   GET  /kit/schema            → all tables' schema/constraint metadata
@@ -22,7 +22,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use mongreldb_core::schema::{ColumnFlags, Schema};
 use mongreldb_core::txn::{UpsertAction, UpsertActionKind};
-use mongreldb_core::{Database, MongrelError, RowId, Value};
+use mongreldb_core::{MongrelError, RowId, Value};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Jval};
 
@@ -46,9 +46,6 @@ impl IdempotencyStore {
         }
     }
 
-    /// Acquire the per-key lock handle (creating it if necessary). Callers hold
-    /// this lock across execution so two concurrent identical-key requests run
-    /// strictly one-after-the-other.
     fn key_lock(&self, key: &str) -> Arc<Mutex<()>> {
         self.in_flight
             .lock()
@@ -77,8 +74,6 @@ impl Default for IdempotencyStore {
 
 #[derive(Debug, Deserialize)]
 pub struct KitTxnRequest {
-    /// Optional idempotency key. A retried request with the same key returns the
-    /// original committed response exactly once.
     #[serde(default)]
     pub idempotency_key: Option<String>,
     pub ops: Vec<KitOp>,
@@ -91,16 +86,15 @@ pub enum KitOp {
     Put {
         table: String,
         /// Flat `[col_id, val, col_id, val, …]` cells.
-        cells: Vec<Json>,
-        /// When true, the per-op result carries the full committed row.
+        cells: Vec<Jval>,
         #[serde(default)]
         returning: bool,
     },
     Upsert {
         table: String,
-        cells: Vec<Json>,
+        cells: Vec<Jval>,
         /// Cells applied on conflict (absent ⇒ DO NOTHING).
-        update_cells: Option<Vec<Json>>,
+        update_cells: Option<Vec<Jval>>,
         #[serde(default)]
         returning: bool,
     },
@@ -110,7 +104,7 @@ pub enum KitOp {
     },
     DeleteByPk {
         table: String,
-        pk: Json,
+        pk: Jval,
     },
 }
 
@@ -127,16 +121,19 @@ pub struct KitTxnResponse {
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum KitOpResult {
     Put {
+        /// The engine allocates physical row ids at commit, so this is `None`
+        /// for batch puts. The returned `row` carries the PK (and any auto_inc),
+        /// which is how typed clients identify a logical row.
         row_id: Option<String>,
         auto_inc: Option<i64>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        row: Option<Vec<Json>>,
+        row: Option<Vec<Jval>>,
     },
     Upsert {
         action: String,
         auto_inc: Option<i64>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        row: Option<Vec<Json>>,
+        row: Option<Vec<Jval>>,
     },
     Deleted,
     NotFound,
@@ -197,7 +194,7 @@ pub fn error_code(e: &MongrelError) -> &'static str {
     }
 }
 
-// ── Handlers ────────────────────────────────────────────────────────────────
+// ── Metadata handlers ───────────────────────────────────────────────────────
 
 pub async fn schema_all(State(state): State<Arc<AppState>>) -> Response {
     let names = state.db.table_names();
@@ -220,8 +217,8 @@ pub async fn schema_one(
     }
 }
 
-fn schema_descriptor(schema: &Schema) -> Json {
-    let columns: Vec<Json> = schema
+fn schema_descriptor(schema: &Schema) -> Jval {
+    let columns: Vec<Jval> = schema
         .columns
         .iter()
         .map(|c| {
@@ -235,13 +232,13 @@ fn schema_descriptor(schema: &Schema) -> Json {
             })
         })
         .collect();
-    let uniques: Vec<Json> = schema
+    let uniques: Vec<Jval> = schema
         .constraints
         .uniques
         .iter()
         .map(|u| json!({ "id": u.id, "name": u.name, "columns": u.columns }))
         .collect();
-    let fks: Vec<Json> = schema
+    let fks: Vec<Jval> = schema
         .constraints
         .foreign_keys
         .iter()
@@ -256,7 +253,7 @@ fn schema_descriptor(schema: &Schema) -> Json {
             })
         })
         .collect();
-    let checks: Vec<Json> = schema
+    let checks: Vec<Jval> = schema
         .constraints
         .checks
         .iter()
@@ -290,34 +287,39 @@ fn type_name(ty: mongreldb_core::schema::TypeId) -> &'static str {
     }
 }
 
+// ── Typed transaction handler ───────────────────────────────────────────────
+
 pub async fn kit_txn(
     State(state): State<Arc<AppState>>,
     Json(req): Json<KitTxnRequest>,
 ) -> Response {
-    run_kit_txn(&state, req).await
-}
-
-async fn run_kit_txn(state: &AppState, req: KitTxnRequest) -> Response {
     // Idempotency: if a key is present, serialize same-key requests and return
     // any previously-committed response verbatim.
-    if let Some(key) = req.idempotency_key.as_deref() {
-        if let Some(cached) = state.idem.get(key) {
+    if let Some(key) = req.idempotency_key.clone() {
+        if let Some(cached) = state.idem.get(&key) {
             return Json(cached).into_response();
         }
-        let lock = state.idem.key_lock(key);
-        // Hold the per-key lock across execution.
+        let lock = state.idem.key_lock(&key);
         let _g = lock.lock().unwrap();
-        // Re-check after acquiring — a concurrent peer may have committed.
-        if let Some(cached) = state.idem.get(key) {
+        if let Some(cached) = state.idem.get(&key) {
             return Json(cached).into_response();
         }
-        let resp = execute_kit_txn(state, &req);
+        let resp = execute_kit_txn(&state, &req);
         if let Ok(out) = &resp {
-            state.idem.store(key.to_string(), out.clone());
+            state.idem.store(key.clone(), out.clone());
         }
-        return resp.into_response();
+        return txn_response(resp);
     }
-    execute_kit_txn(state, &req).into_response()
+    txn_response(execute_kit_txn(&state, &req))
+}
+
+/// Convert a `Result<KitTxnResponse, Response>` (Ok = committed batch, Err =
+/// pre-built error Response) into a single axum `Response`.
+fn txn_response(r: Result<KitTxnResponse, Response>) -> Response {
+    match r {
+        Ok(resp) => Json(resp).into_response(),
+        Err(resp) => resp,
+    }
 }
 
 fn execute_kit_txn(state: &AppState, req: &KitTxnRequest) -> Result<KitTxnResponse, Response> {
@@ -418,10 +420,6 @@ fn execute_kit_txn(state: &AppState, req: &KitTxnRequest) -> Result<KitTxnRespon
                 Action::Put { table, cells } => {
                     let pr = t.put_returning(table, cells.clone())?;
                     results.push(KitOpResult::Put {
-                        // The engine allocates physical row ids at commit, so the
-                        // id is not surfaced for batch puts. The returned row
-                        // carries the PK (and any auto_inc value), which is how
-                        // typed clients identify a logical row.
                         row_id: None,
                         auto_inc: pr.auto_inc,
                         row: if p.returning {
@@ -526,12 +524,12 @@ fn op_error_msg(i: usize, code: &str, msg: String) -> Response {
 
 fn lookup_schema(state: &AppState, table: &str) -> std::result::Result<Schema, MongrelError> {
     let h = state.db.table(table)?;
-    Ok(h.lock().schema().clone())
+    let g = h.lock();
+    Ok(g.schema().clone())
 }
 
-/// Parse a flat `[col_id, val, …]` cell array against a schema. Reuses the
-/// engine Value coercion from the crate root.
-fn parse_cells(row: &[Json], schema: &Schema) -> std::result::Result<Vec<(u16, Value)>, String> {
+/// Parse a flat `[col_id, val, …]` cell array against a schema.
+fn parse_cells(row: &[Jval], schema: &Schema) -> std::result::Result<Vec<(u16, Value)>, String> {
     if row.len() % 2 != 0 {
         return Err("cells must be an even-length [col_id, value, …] array".into());
     }
@@ -552,13 +550,13 @@ fn parse_cells(row: &[Json], schema: &Schema) -> std::result::Result<Vec<(u16, V
 }
 
 /// Coerce a PK JSON value against the table's declared primary-key column.
-fn pk_value(pk: &Json, schema: &Schema) -> std::result::Result<Value, String> {
+fn pk_value(pk: &Jval, schema: &Schema) -> std::result::Result<Value, String> {
     let pk_col = schema.primary_key().ok_or("table has no primary_key column")?;
     Ok(json_to_value(pk, pk_col.ty))
 }
 
-fn row_to_json(row: &mongreldb_core::txn::OwnedRow) -> Vec<Json> {
-    let mut out: Vec<Json> = Vec::with_capacity(row.columns.len() * 2);
+fn row_to_json(row: &mongreldb_core::txn::OwnedRow) -> Vec<Jval> {
+    let mut out: Vec<Jval> = Vec::with_capacity(row.columns.len() * 2);
     for (id, v) in &row.columns {
         out.push(json!(id));
         out.push(value_to_json(v));
@@ -566,25 +564,25 @@ fn row_to_json(row: &mongreldb_core::txn::OwnedRow) -> Vec<Json> {
     out
 }
 
-pub(crate) fn value_to_json(v: &Value) -> Json {
+pub(crate) fn value_to_json(v: &Value) -> Jval {
     match v {
         Value::Int64(n) => json!(n),
         Value::Float64(f) => serde_json::Number::from_f64(*f)
-            .map(Json::Number)
-            .unwrap_or(Json::Null),
-        Value::Bytes(b) => Json::String(String::from_utf8_lossy(b).into_owned()),
-        Value::Bool(b) => Json::Bool(*b),
-        Value::Null => Json::Null,
+            .map(Jval::Number)
+            .unwrap_or(Jval::Null),
+        Value::Bytes(b) => Jval::String(String::from_utf8_lossy(b).into_owned()),
+        Value::Bool(b) => Jval::Bool(*b),
+        Value::Null => Jval::Null,
         Value::Embedding(v) => {
-            let arr: Vec<Json> = v
+            let arr: Vec<Jval> = v
                 .iter()
                 .map(|x| {
-                    serde_json::Number::from_f64(*x)
-                        .map(Json::Number)
-                        .unwrap_or(Json::Null)
+                    serde_json::Number::from_f64(*x as f64)
+                        .map(Jval::Number)
+                        .unwrap_or(Jval::Null)
                 })
                 .collect();
-            Json::Array(arr)
+            Jval::Array(arr)
         }
     }
 }
