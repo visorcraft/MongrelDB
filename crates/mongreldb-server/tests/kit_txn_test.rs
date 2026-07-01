@@ -317,3 +317,67 @@ async fn kit_query_pk_range_and_projection() {
     assert_eq!(s, 200);
     assert_eq!(v["rows"].as_array().unwrap().len(), 3);
 }
+
+#[tokio::test]
+async fn kit_create_table_self_services_constraints_over_http() {
+    // A remote client provisions a constraint-bearing table entirely over HTTP
+    // (no out-of-band create): unique + check + auto_increment, then exercises
+    // the constraints through /kit/txn.
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    let app = build_app(Arc::clone(&db));
+
+    let body = serde_json::json!({
+        "name": "accounts",
+        "columns": [
+            {"id": 0, "name": "id", "ty": "int64", "primary_key": true, "auto_increment": true},
+            {"id": 1, "name": "email", "ty": "bytes", "nullable": true},
+            {"id": 2, "name": "level", "ty": "int64", "nullable": true},
+        ],
+        "constraints": {
+            "uniques": [{"id": 1, "name": "email_unique", "columns": [1]}],
+            "checks": [{"id": 2, "name": "level_nonneg", "expr":
+                {"Or": [{"IsNull": 2}, {"Ge": [{"Col": 2}, {"Lit": {"Int64": 0}}]}]}}]
+        }
+    });
+    let (s, v) = post(app.clone(), "/kit/create_table", body).await;
+    assert_eq!(s, 200, "create_table body: {v}");
+    assert!(v["table_id"].as_u64().is_some());
+
+    // Schema metadata round-trips the constraints + auto_increment flag.
+    let (s, v) = get(app.clone(), "/kit/schema/accounts").await;
+    assert_eq!(s, 200);
+    assert_eq!(v["columns"][0]["auto_increment"], true);
+    assert_eq!(v["constraints"]["uniques"][0]["name"], "email_unique");
+    assert_eq!(v["constraints"]["checks"][0]["name"], "level_nonneg");
+
+    // A valid insert commits (auto-inc assigned).
+    let (s, v) = post(
+        app.clone(),
+        "/kit/txn",
+        serde_json::json!({"ops":[{"put":{"table":"accounts","cells":[1,"a@x",2,5],"returning":true}}]}),
+    )
+    .await;
+    assert_eq!(s, 200, "body: {v}");
+    assert!(v["results"][0]["auto_inc"].as_i64().unwrap() >= 1);
+
+    // Duplicate email → UNIQUE_VIOLATION (constraint enforced end-to-end).
+    let (s, v) = post(
+        app.clone(),
+        "/kit/txn",
+        serde_json::json!({"ops":[{"put":{"table":"accounts","cells":[0,9,1,"a@x"]}}]}),
+    )
+    .await;
+    assert_eq!(s, 409);
+    assert_eq!(v["error"]["code"], "UNIQUE_VIOLATION");
+
+    // CHECK violation → CHECK_VIOLATION.
+    let (s, v) = post(
+        app,
+        "/kit/txn",
+        serde_json::json!({"ops":[{"put":{"table":"accounts","cells":[1,"b@x",2,-1]}}]}),
+    )
+    .await;
+    assert_eq!(s, 409);
+    assert_eq!(v["error"]["code"], "CHECK_VIOLATION");
+}

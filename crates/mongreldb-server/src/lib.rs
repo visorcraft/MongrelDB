@@ -55,6 +55,7 @@ pub fn build_app(db: Arc<Database>) -> axum::Router {
         .route("/kit/schema/{table}", get(kit::schema_one))
         .route("/kit/txn", post(kit::kit_txn))
         .route("/kit/query", post(kit::kit_query))
+        .route("/kit/create_table", post(kit::kit_create_table))
         .with_state(state)
 }
 
@@ -216,7 +217,7 @@ fn parse_cells(
 }
 
 /// Basic validation for a table name: non-empty and no path separators.
-fn validate_table_name(name: &str) -> Result<(), String> {
+pub(crate) fn validate_table_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("table name must not be empty".into());
     }

@@ -475,6 +475,21 @@ impl MongrelClient {
         let resp = self.check(resp)?;
         Ok(resp.json()?)
     }
+
+    /// Create a constraint-bearing table over HTTP (`POST /kit/create_table`).
+    /// `body` is the full request JSON — `{name, columns:[{id,name,ty,
+    /// primary_key,nullable,auto_increment,…}], constraints:{uniques,…,
+    /// foreign_keys,…, checks:[{id,name,expr}]}}`. Returns the assigned table id.
+    pub fn kit_create_table(&self, body: &serde_json::Value) -> ClientResult<u64> {
+        let resp = self
+            .client
+            .post(self.url("/kit/create_table"))
+            .json(body)
+            .send()?;
+        let resp = self.check(resp)?;
+        let v: serde_json::Value = resp.json()?;
+        Ok(v["table_id"].as_u64().unwrap_or(0))
+    }
 }
 
 #[derive(Serialize, Clone)]

@@ -20,15 +20,16 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use mongreldb_core::constraint::TableConstraints;
 use mongreldb_core::query::{Condition, Query};
-use mongreldb_core::schema::{ColumnFlags, Schema};
+use mongreldb_core::schema::{ColumnDef, ColumnFlags, Schema, TypeId};
 use mongreldb_core::txn::{UpsertAction, UpsertActionKind};
 use mongreldb_core::{MongrelError, RowId, Value};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Jval};
 
 use crate::json_to_value;
-use crate::AppState;
+use crate::{validate_table_name, AppState};
 
 /// Per-server idempotency store: idempotency key → committed response, backed
 /// by an on-disk `<root>/_idem/` directory so retry-after-restart (not just
@@ -321,6 +322,133 @@ fn type_name(ty: mongreldb_core::schema::TypeId) -> &'static str {
         Date32 => "date32",
         Bytes => "bytes",
         Embedding { .. } => "embedding",
+    }
+}
+
+fn parse_type_name(s: &str) -> std::result::Result<TypeId, String> {
+    use mongreldb_core::schema::TypeId::*;
+    Ok(match s {
+        "bool" => Bool,
+        "int8" | "i8" => Int8,
+        "int16" | "i16" => Int16,
+        "int32" | "i32" => Int32,
+        "int64" | "i64" | "bigint" => Int64,
+        "uint8" | "u8" => UInt8,
+        "uint16" | "u16" => UInt16,
+        "uint32" | "u32" => UInt32,
+        "uint64" | "u64" => UInt64,
+        "float32" | "f32" => Float32,
+        "float64" | "f64" | "double" => Float64,
+        "timestamp_nanos" | "timestamp" => TimestampNanos,
+        "date32" | "date" => Date32,
+        "bytes" | "varchar" | "text" | "string" => Bytes,
+        other if other.starts_with("embedding") => Embedding { dim: 0 },
+        other => return Err(format!("unknown type: {other}")),
+    })
+}
+
+// ── Typed DDL: POST /kit/create_table ───────────────────────────────────────
+//
+// A constraint-aware table creator: the full ColumnFlags surface (nullable /
+// primary_key / auto_increment / encrypted / encrypted_indexable) plus the
+// engine's declarative TableConstraints (unique / FK / check). This lets a
+// remote client self-provision a constraint-bearing table entirely over HTTP —
+// the legacy `/tables` route only maps `primary_key`.
+
+#[derive(Debug, Deserialize)]
+pub struct KitCreateTableRequest {
+    pub name: String,
+    pub columns: Vec<KitColumnDef>,
+    #[serde(default)]
+    pub constraints: TableConstraints,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct KitColumnDef {
+    pub id: u16,
+    pub name: String,
+    pub ty: String,
+    #[serde(default)]
+    pub primary_key: bool,
+    #[serde(default)]
+    pub nullable: bool,
+    #[serde(default)]
+    pub auto_increment: bool,
+    #[serde(default)]
+    pub encrypted: bool,
+    #[serde(default)]
+    pub encrypted_indexable: bool,
+}
+
+pub async fn kit_create_table(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<KitCreateTableRequest>,
+) -> Response {
+    if let Err(msg) = validate_table_name(&req.name) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(KitErrorEnvelope {
+                status: "aborted".into(),
+                error: KitError::new("BAD_REQUEST", msg),
+            }),
+        )
+            .into_response();
+    }
+    let mut columns = Vec::with_capacity(req.columns.len());
+    for c in &req.columns {
+        let ty = match parse_type_name(&c.ty) {
+            Ok(t) => t,
+            Err(msg) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(KitErrorEnvelope {
+                        status: "aborted".into(),
+                        error: KitError::new("BAD_REQUEST", msg),
+                    }),
+                )
+                    .into_response();
+            }
+        };
+        let mut flags = ColumnFlags::empty();
+        if c.primary_key {
+            flags = flags.with(ColumnFlags::PRIMARY_KEY);
+        }
+        if c.nullable {
+            flags = flags.with(ColumnFlags::NULLABLE);
+        }
+        if c.auto_increment {
+            flags = flags.with(ColumnFlags::AUTO_INCREMENT);
+        }
+        if c.encrypted {
+            flags = flags.with(ColumnFlags::ENCRYPTED);
+        }
+        if c.encrypted_indexable {
+            flags = flags.with(ColumnFlags::ENCRYPTED_INDEXABLE);
+        }
+        columns.push(ColumnDef {
+            id: c.id,
+            name: c.name.clone(),
+            ty,
+            flags,
+        });
+    }
+    let schema = Schema {
+        schema_id: 0,
+        columns,
+        indexes: vec![],
+        colocation: vec![],
+        constraints: req.constraints,
+    };
+    match state.db.create_table(&req.name, schema) {
+        Ok(id) => Json(json!({ "table_id": id })).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(KitErrorEnvelope {
+                status: "aborted".into(),
+                error: KitError::new("BAD_REQUEST", format!("{e}")),
+            }),
+        )
+            .into_response(),
     }
 }
 
