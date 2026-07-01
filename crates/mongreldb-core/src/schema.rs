@@ -317,7 +317,8 @@ mod tests {
                 ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY | ColumnFlags::AUTO_INCREMENT),
             )],
             indexes: vec![],
-            colocation: vec![], constraints: Default::default(),
+            colocation: vec![],
+            constraints: Default::default(),
         };
         assert!(s.validate_auto_increment().is_ok());
         assert_eq!(s.auto_increment_column().unwrap().id, 0);
@@ -342,7 +343,8 @@ mod tests {
                 ),
             ],
             indexes: vec![],
-            colocation: vec![], constraints: Default::default(),
+            colocation: vec![],
+            constraints: Default::default(),
         };
         assert!(s.validate_auto_increment().is_err());
     }
@@ -358,7 +360,8 @@ mod tests {
                 ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY | ColumnFlags::AUTO_INCREMENT),
             )],
             indexes: vec![],
-            colocation: vec![], constraints: Default::default(),
+            colocation: vec![],
+            constraints: Default::default(),
         };
         assert!(s.validate_auto_increment().is_err());
     }
@@ -383,7 +386,8 @@ mod tests {
                 ),
             ],
             indexes: vec![],
-            colocation: vec![], constraints: Default::default(),
+            colocation: vec![],
+            constraints: Default::default(),
         };
         assert!(s.validate_auto_increment().is_err());
     }
@@ -403,7 +407,8 @@ mod tests {
                 col(1, "name", TypeId::Bytes, ColumnFlags::empty()),
             ],
             indexes: vec![],
-            colocation: vec![], constraints: Default::default(),
+            colocation: vec![],
+            constraints: Default::default(),
         };
         // Omitting the auto-inc column must not trip NOT NULL.
         let mut cols = HashMap::new();

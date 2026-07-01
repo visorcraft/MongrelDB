@@ -27,7 +27,8 @@ fn test_schema() -> Schema {
             column_id: 1,
             kind: IndexKind::Bitmap,
         }],
-        colocation: vec![], constraints: Default::default(),
+        colocation: vec![],
+        constraints: Default::default(),
     }
 }
 

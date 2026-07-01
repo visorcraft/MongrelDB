@@ -33,7 +33,8 @@ fn schema() -> Schema {
             },
         ],
         indexes: Vec::new(),
-        colocation: vec![], constraints: Default::default(),
+        colocation: vec![],
+        constraints: Default::default(),
     }
 }
 

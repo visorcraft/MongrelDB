@@ -1303,7 +1303,8 @@ mod tests {
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
             }],
             indexes: vec![],
-            colocation: vec![], constraints: Default::default(),
+            colocation: vec![],
+            constraints: Default::default(),
         };
         let mut countries =
             Table::create(dir.path().join("countries").as_path(), countries_schema, 1).unwrap();
@@ -1333,7 +1334,8 @@ mod tests {
                 column_id: 2,
                 kind: IndexKind::Bitmap,
             }],
-            colocation: vec![], constraints: Default::default(),
+            colocation: vec![],
+            constraints: Default::default(),
         };
         let mut users = Table::create(dir.path().join("users").as_path(), users_schema, 1).unwrap();
         for u in 0..10i64 {

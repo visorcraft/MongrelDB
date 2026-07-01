@@ -17,7 +17,8 @@ fn schema() -> Schema {
             flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
         }],
         indexes: Vec::new(),
-        colocation: vec![], constraints: Default::default(),
+        colocation: vec![],
+        constraints: Default::default(),
     }
 }
 
@@ -183,7 +184,8 @@ fn native_aggregate_matches_expected() {
             column_id: 2,
             kind: IndexKind::Bitmap,
         }],
-        colocation: vec![], constraints: Default::default(),
+        colocation: vec![],
+        constraints: Default::default(),
     };
     let mut db = Table::create(dir.path(), schema, 1).unwrap();
     let n = 50_000i64;

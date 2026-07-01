@@ -46,20 +46,15 @@ pub struct UniqueConstraint {
 }
 
 /// ON DELETE action for a [`ForeignKey`].
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum FkAction {
     /// Reject the parent delete if any child row references it (default).
+    #[default]
     Restrict,
     /// Cascade the delete to child rows.
     Cascade,
     /// Set the referencing columns to `NULL` in child rows.
     SetNull,
-}
-
-impl Default for FkAction {
-    fn default() -> Self {
-        FkAction::Restrict
-    }
 }
 
 /// A foreign key: the listed `columns` must reference an existing row in
@@ -294,7 +289,10 @@ pub(crate) fn value_cmp(a: &Value, b: &Value) -> Option<Ordering> {
 /// uniqueness / FK matching. Returns `None` if any referenced column is missing
 /// or `Null` — SQL semantics: a UNIQUE constraint ignores rows where any
 /// constrained column is NULL, and an FK with a NULL component is not checked.
-pub(crate) fn encode_composite_key(columns: &[u16], cells: &HashMap<u16, Value>) -> Option<Vec<u8>> {
+pub(crate) fn encode_composite_key(
+    columns: &[u16],
+    cells: &HashMap<u16, Value>,
+) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     for cid in columns {
         let v = cells.get(cid)?;
@@ -336,7 +334,10 @@ mod tests {
     #[test]
     fn check_eq_literal() {
         // col 1 == 5
-        let e = CheckExpr::Eq(Box::new(CheckExpr::Col(1)), Box::new(CheckExpr::Lit(Value::Int64(5))));
+        let e = CheckExpr::Eq(
+            Box::new(CheckExpr::Col(1)),
+            Box::new(CheckExpr::Lit(Value::Int64(5))),
+        );
         assert!(e.satisfied(&m(&[(1, Value::Int64(5))])));
         assert!(!e.satisfied(&m(&[(1, Value::Int64(6))])));
         // null comparison → unknown → satisfied (CHECK passes on unknown)

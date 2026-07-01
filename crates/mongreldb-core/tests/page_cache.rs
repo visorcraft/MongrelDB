@@ -30,7 +30,8 @@ fn schema() -> Schema {
             column_id: 2,
             kind: IndexKind::LearnedRange,
         }],
-        colocation: vec![], constraints: Default::default(),
+        colocation: vec![],
+        constraints: Default::default(),
     }
 }
 

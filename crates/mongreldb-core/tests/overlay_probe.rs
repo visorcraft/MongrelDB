@@ -36,7 +36,8 @@ fn schema() -> Schema {
             column_id: 2,
             kind: IndexKind::Bitmap,
         }],
-        colocation: vec![], constraints: Default::default(),
+        colocation: vec![],
+        constraints: Default::default(),
     }
 }
 

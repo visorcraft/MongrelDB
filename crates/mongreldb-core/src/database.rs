@@ -404,9 +404,7 @@ impl Database {
             .collect();
 
         // Fast path: bail if no live table declares any constraints at all.
-        let any_constraints = live
-            .iter()
-            .any(|(_, _, s)| !s.constraints.is_empty());
+        let any_constraints = live.iter().any(|(_, _, s)| !s.constraints.is_empty());
         if !any_constraints {
             return Ok(());
         }
@@ -485,12 +483,14 @@ impl Database {
 
                     // FK insert-side: parent must exist.
                     for fk in &schema.constraints.foreign_keys {
-                        let Some(child_key) = encode_composite_key(&fk.columns, &cells_map)
-                        else {
+                        let Some(child_key) = encode_composite_key(&fk.columns, &cells_map) else {
                             continue; // NULL FK component → not checked (SQL).
                         };
-                        let Some(parent_id) =
-                            cat.tables.iter().find(|t| t.name == fk.ref_table).map(|t| t.table_id)
+                        let Some(parent_id) = cat
+                            .tables
+                            .iter()
+                            .find(|t| t.name == fk.ref_table)
+                            .map(|t| t.table_id)
                         else {
                             return Err(MongrelError::InvalidArgument(format!(
                                 "FOREIGN KEY '{}' references unknown table '{}'",
@@ -557,9 +557,10 @@ impl Database {
                                 continue;
                             }
                             let child_rows = load_rows(*child_id)?;
-                            if child_rows.iter().any(|r| {
-                                encode_composite_key(&fk.columns, &r.columns).is_some()
-                            }) {
+                            if child_rows
+                                .iter()
+                                .any(|r| encode_composite_key(&fk.columns, &r.columns).is_some())
+                            {
                                 return Err(MongrelError::Conflict(format!(
                                     "FOREIGN KEY '{}' on table '{child_name}' restricts truncate of '{tname}'",
                                     fk.name

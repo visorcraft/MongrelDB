@@ -25,7 +25,8 @@ fn orders_schema() -> Schema {
             },
         ],
         indexes: vec![],
-        colocation: vec![], constraints: Default::default(),
+        colocation: vec![],
+        constraints: Default::default(),
     }
 }
 
@@ -47,7 +48,8 @@ fn customers_schema() -> Schema {
             },
         ],
         indexes: vec![],
-        colocation: vec![], constraints: Default::default(),
+        colocation: vec![],
+        constraints: Default::default(),
     }
 }
 
@@ -176,7 +178,8 @@ async fn join_and_planning_diagnostics() {
             column_id: 2,
             kind: IndexKind::Bitmap,
         }],
-        colocation: vec![], constraints: Default::default(),
+        colocation: vec![],
+        constraints: Default::default(),
     };
     let dir = tempdir().unwrap();
     let db = Arc::new(Database::create(dir.path()).unwrap());

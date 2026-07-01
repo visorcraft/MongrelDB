@@ -25,6 +25,7 @@ arrow = "58"
 tower = "0.5"
 reqwest = { version = "0.12", features = ["json"] }
 tempfile = "3"
+mongreldb-client = { path = "../mongreldb-client" }
 
 # Standalone crate — not a workspace member.
 [workspace]

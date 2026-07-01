@@ -50,7 +50,26 @@ pub enum KitErrorCode {
     Other,
 }
 
+impl std::fmt::Display for KitErrorCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl KitErrorCode {
+    fn as_str(&self) -> &'static str {
+        match self {
+            KitErrorCode::UniqueViolation => "UNIQUE_VIOLATION",
+            KitErrorCode::FkViolation => "FK_VIOLATION",
+            KitErrorCode::CheckViolation => "CHECK_VIOLATION",
+            KitErrorCode::Conflict => "CONFLICT",
+            KitErrorCode::BadRequest => "BAD_REQUEST",
+            KitErrorCode::NotFound => "NOT_FOUND",
+            KitErrorCode::Internal => "INTERNAL",
+            KitErrorCode::Other => "OTHER",
+        }
+    }
+
     fn from_str(s: &str) -> Self {
         match s {
             "UNIQUE_VIOLATION" => KitErrorCode::UniqueViolation,

@@ -2430,6 +2430,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "mongreldb-client"
+version = "0.18.0"
+dependencies = [
+ "arrow",
+ "mongreldb-core",
+ "mongreldb-query",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "mongreldb-core"
 version = "0.18.0"
 dependencies = [
@@ -2478,6 +2491,7 @@ version = "0.18.0"
 dependencies = [
  "arrow",
  "axum",
+ "mongreldb-client",
  "mongreldb-core",
  "mongreldb-query",
  "reqwest",
@@ -2981,7 +2995,9 @@ dependencies = [
  "base64",
  "bytes",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
+ "futures-util",
  "h2",
  "http",
  "http-body",

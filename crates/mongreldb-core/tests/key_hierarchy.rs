@@ -33,7 +33,8 @@ fn schema() -> Schema {
             },
         ],
         indexes: vec![],
-        colocation: vec![], constraints: Default::default(),
+        colocation: vec![],
+        constraints: Default::default(),
     }
 }
 
@@ -61,7 +62,8 @@ fn schema_indexable_eq() -> Schema {
             column_id: 2,
             kind: IndexKind::Bitmap,
         }],
-        colocation: vec![], constraints: Default::default(),
+        colocation: vec![],
+        constraints: Default::default(),
     }
 }
 

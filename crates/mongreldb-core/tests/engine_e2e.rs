@@ -48,7 +48,8 @@ fn schema() -> Schema {
                 kind: IndexKind::Ann,
             },
         ],
-        colocation: vec![], constraints: Default::default(),
+        colocation: vec![],
+        constraints: Default::default(),
     }
 }
 

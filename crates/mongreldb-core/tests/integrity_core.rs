@@ -26,7 +26,8 @@ fn base_schema() -> Schema {
             },
         ],
         indexes: vec![],
-        colocation: vec![], constraints: Default::default(),
+        colocation: vec![],
+        constraints: Default::default(),
     }
 }
 
@@ -58,7 +59,8 @@ fn schema_with_bitmap() -> Schema {
             column_id: 2,
             kind: IndexKind::Bitmap,
         }],
-        colocation: vec![], constraints: Default::default(),
+        colocation: vec![],
+        constraints: Default::default(),
     }
 }
 
@@ -464,7 +466,8 @@ fn schema_with_not_null() -> Schema {
             },
         ],
         indexes: vec![],
-        colocation: vec![], constraints: Default::default(),
+        colocation: vec![],
+        constraints: Default::default(),
     }
 }
 

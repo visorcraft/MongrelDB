@@ -51,7 +51,8 @@ fn schema() -> Schema {
             column_id: 2,
             kind: IndexKind::Sparse,
         }],
-        colocation: vec![], constraints: Default::default(),
+        colocation: vec![],
+        constraints: Default::default(),
     }
 }
 
@@ -129,7 +130,8 @@ fn sparse_match_intersects_bitmap() {
                 kind: IndexKind::Sparse,
             },
         ],
-        colocation: vec![], constraints: Default::default(),
+        colocation: vec![],
+        constraints: Default::default(),
     };
     let mut db = Table::create(dir.path(), sc, 1).unwrap();
     // cat "a": docs 0,1 contain "quick"; cat "b": doc 2 also contains "quick".
