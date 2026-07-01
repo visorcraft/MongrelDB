@@ -9,7 +9,8 @@
 # this package from npm to satisfy its peer dependency.
 #
 # Release flow: bump "version" in crates/mongreldb-node/package.json, commit,
-# then tag and push:  git tag v0.18.1 && git push origin v0.18.1
+# then tag and push the matching version, for example:
+#   git tag v0.18.2 && git push origin master v0.18.2
 # npm refuses to republish an existing version, so the tag must be a new version
 # (0.18.0 is already published).
 #
@@ -47,7 +48,7 @@ jobs:
           registry-url: https://registry.npmjs.org
           scope: '@visorcraft'
 
-      - run: npm install
+      - run: npm ci
 
       - run: npm run build
 
