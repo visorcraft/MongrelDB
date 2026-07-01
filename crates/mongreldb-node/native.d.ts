@@ -88,7 +88,8 @@ export const enum ConditionKind {
   IsNull = 8,
   IsNotNull = 9,
   FmContainsAll = 10,
-  SparseMatch = 11
+  SparseMatch = 11,
+  MinHashSimilar = 12
 }
 /**
  * One predicate over the shared row-id space. Set the fields appropriate to

@@ -317,6 +317,7 @@ pub enum ConditionKind {
     IsNotNull,
     FmContainsAll,
     SparseMatch,
+    MinHashSimilar,
 }
 
 /// One predicate over the shared row-id space. Set the fields appropriate to
@@ -416,6 +417,19 @@ fn build_condition(spec: &ConditionSpec) -> napi::Result<Condition> {
                     .into_iter()
                     .zip(weights.into_iter().chain(std::iter::repeat(1.0)))
                     .map(|(t, w)| (t, w as f32))
+                    .collect(),
+                k: spec.k.unwrap_or(10) as usize,
+            }
+        }
+        ConditionKind::MinHashSimilar => {
+            // The query set arrives as `values` (token strings); hash them with
+            // the same core function that hashed the indexed documents' tokens.
+            let members = spec.values.clone().unwrap_or_default();
+            Condition::MinHashSimilar {
+                column_id: spec.column_id,
+                query: members
+                    .iter()
+                    .map(|s| mongreldb_core::index::minhash_token_hash(s))
                     .collect(),
                 k: spec.k.unwrap_or(10) as usize,
             }
