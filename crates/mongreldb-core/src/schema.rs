@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::constraint::TableConstraints;
 use crate::error::{MongrelError, Result};
 use crate::memtable::Value;
 
@@ -174,6 +175,12 @@ pub struct Schema {
     /// I/O and cache locality. Empty = no co-location (default).
     #[serde(default)]
     pub colocation: Vec<Vec<u16>>,
+    /// Engine-side declarative constraints (unique / FK / check). Empty by
+    /// default — legacy and Kit-managed tables carry no engine constraints and
+    /// behave exactly as before. When non-empty, the transaction layer enforces
+    /// them authoritatively at commit (see [`crate::database`]).
+    #[serde(default)]
+    pub constraints: TableConstraints,
 }
 
 impl Schema {
@@ -310,7 +317,7 @@ mod tests {
                 ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY | ColumnFlags::AUTO_INCREMENT),
             )],
             indexes: vec![],
-            colocation: vec![],
+            colocation: vec![], constraints: Default::default(),
         };
         assert!(s.validate_auto_increment().is_ok());
         assert_eq!(s.auto_increment_column().unwrap().id, 0);
@@ -335,7 +342,7 @@ mod tests {
                 ),
             ],
             indexes: vec![],
-            colocation: vec![],
+            colocation: vec![], constraints: Default::default(),
         };
         assert!(s.validate_auto_increment().is_err());
     }
@@ -351,7 +358,7 @@ mod tests {
                 ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY | ColumnFlags::AUTO_INCREMENT),
             )],
             indexes: vec![],
-            colocation: vec![],
+            colocation: vec![], constraints: Default::default(),
         };
         assert!(s.validate_auto_increment().is_err());
     }
@@ -376,7 +383,7 @@ mod tests {
                 ),
             ],
             indexes: vec![],
-            colocation: vec![],
+            colocation: vec![], constraints: Default::default(),
         };
         assert!(s.validate_auto_increment().is_err());
     }
@@ -396,7 +403,7 @@ mod tests {
                 col(1, "name", TypeId::Bytes, ColumnFlags::empty()),
             ],
             indexes: vec![],
-            colocation: vec![],
+            colocation: vec![], constraints: Default::default(),
         };
         // Omitting the auto-inc column must not trip NOT NULL.
         let mut cols = HashMap::new();

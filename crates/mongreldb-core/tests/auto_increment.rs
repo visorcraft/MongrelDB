@@ -27,7 +27,7 @@ fn ai_schema() -> Schema {
             },
         ],
         indexes: vec![],
-        colocation: vec![],
+        colocation: vec![], constraints: Default::default(),
     }
 }
 
@@ -51,7 +51,7 @@ fn ai_int_schema() -> Schema {
             },
         ],
         indexes: vec![],
-        colocation: vec![],
+        colocation: vec![], constraints: Default::default(),
     }
 }
 
@@ -202,7 +202,7 @@ fn rejects_invalid_auto_inc_schema() {
                 .with(ColumnFlags::AUTO_INCREMENT),
         }],
         indexes: vec![],
-        colocation: vec![],
+        colocation: vec![], constraints: Default::default(),
     };
     assert!(Table::create(dir.path(), bad, 1).is_err());
 }
@@ -424,7 +424,7 @@ fn no_pk_schema() -> Schema {
             flags: ColumnFlags::empty(),
         }],
         indexes: vec![],
-        colocation: vec![],
+        colocation: vec![], constraints: Default::default(),
     }
 }
 

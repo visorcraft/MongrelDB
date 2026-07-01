@@ -29,7 +29,7 @@ fn schema() -> Schema {
             flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
         }],
         indexes: Vec::new(),
-        colocation: Vec::new(),
+        colocation: Vec::new(), constraints: Default::default(),
     }
 }
 

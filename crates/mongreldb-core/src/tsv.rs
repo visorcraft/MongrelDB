@@ -169,7 +169,7 @@ mod tests {
                 },
             ],
             indexes: Vec::new(),
-            colocation: vec![],
+            colocation: vec![], constraints: Default::default(),
         }
     }
 

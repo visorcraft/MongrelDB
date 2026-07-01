@@ -22,7 +22,7 @@ fn users_schema() -> Schema {
             },
         ],
         indexes: vec![],
-        colocation: vec![],
+        colocation: vec![], constraints: Default::default(),
     }
 }
 
@@ -46,7 +46,7 @@ fn identity_schema() -> Schema {
             },
         ],
         indexes: vec![],
-        colocation: vec![],
+        colocation: vec![], constraints: Default::default(),
     }
 }
 

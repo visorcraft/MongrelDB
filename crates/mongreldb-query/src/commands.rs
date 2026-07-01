@@ -827,7 +827,7 @@ fn schema_from_create_table(create: &CreateTable) -> Result<CoreSchema> {
         schema_id: 0,
         columns,
         indexes: Vec::new(),
-        colocation: Vec::new(),
+        colocation: Vec::new(), constraints: Default::default(),
     };
     for constraint in &create.constraints {
         match constraint {

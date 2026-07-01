@@ -157,7 +157,7 @@ mod tests {
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
             }],
             indexes: Vec::new(),
-            colocation: vec![],
+            colocation: vec![], constraints: Default::default(),
         }
     }
 

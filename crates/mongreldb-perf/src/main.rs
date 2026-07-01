@@ -35,7 +35,7 @@ fn trips_schema() -> Schema {
             ColumnDef { id: 4, name: "ts".into(), ty: TypeId::Int64, flags: ColumnFlags::empty() },
         ],
         indexes: vec![IndexDef { name: "dest_bm".into(), column_id: 2, kind: IndexKind::Bitmap }],
-            colocation: vec![],
+            colocation: vec![], constraints: Default::default(),
     }
 }
 
@@ -47,7 +47,7 @@ fn cities_schema() -> Schema {
             ColumnDef { id: 2, name: "country".into(), ty: TypeId::Bytes, flags: ColumnFlags::empty() },
         ],
         indexes: vec![],
-            colocation: vec![],
+            colocation: vec![], constraints: Default::default(),
     }
 }
 

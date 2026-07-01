@@ -25,7 +25,7 @@ fn schema() -> Schema {
             IndexDef { name: "status_bm".into(), column_id: 3, kind: IndexKind::Bitmap },
             IndexDef { name: "region_bm".into(), column_id: 7, kind: IndexKind::Bitmap },
         ],
-        colocation: vec![],
+        colocation: vec![], constraints: Default::default(),
     }
 }
 
@@ -37,7 +37,7 @@ fn users_schema() -> Schema {
             ColumnDef { id: 2, name: "region".into(), ty: TypeId::Bytes, flags: ColumnFlags::empty() },
         ],
         indexes: vec![],
-        colocation: vec![],
+        colocation: vec![], constraints: Default::default(),
     }
 }
 

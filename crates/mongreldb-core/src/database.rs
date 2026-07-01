@@ -370,6 +370,192 @@ impl Database {
         self.active_txns.register(epoch)
     }
 
+    /// Authoritatively validate every declared constraint on the staged write
+    /// set under the transaction's read snapshot. Called from
+    /// [`Self::commit_transaction`] outside the WAL mutex. Returns the first
+    /// violation as an `Err`, aborting the commit atomically. This is the
+    /// server-side authority point: concurrent remote writers that each pass
+    /// their own client-side checks still cannot both commit a violating batch.
+    ///
+    /// Scope: CHECK (full, three-valued), UNIQUE beyond the PK (existence scan +
+    /// intra-transaction dedup; concurrent-txn races are additionally caught by
+    /// `WriteKey::Unique`), and FK insert-side parent existence + ON DELETE
+    /// RESTRICT. ON DELETE CASCADE / SET NULL and FK updates are deferred
+    /// (logged here as restrict violations so a delete never orphans rows).
+    fn validate_constraints(
+        &self,
+        staging: &[(u64, crate::txn::Staged)],
+        read_epoch: Epoch,
+    ) -> Result<()> {
+        use crate::constraint::{encode_composite_key, validate_checks};
+        use crate::memtable::Row;
+        use crate::txn::Staged;
+        use std::collections::HashSet;
+
+        let snapshot = Snapshot::at(read_epoch);
+        let cat = self.catalog.read();
+
+        // Collect live (id, name, constraints-bearing?) for staged tables.
+        let live: Vec<(u64, &str, &crate::schema::Schema)> = cat
+            .tables
+            .iter()
+            .filter(|e| matches!(e.state, TableState::Live))
+            .map(|e| (e.table_id, e.name.as_str(), &e.schema))
+            .collect();
+
+        // Fast path: bail if no live table declares any constraints at all.
+        let any_constraints = live
+            .iter()
+            .any(|(_, _, s)| !s.constraints.is_empty());
+        if !any_constraints {
+            return Ok(());
+        }
+
+        // Lazily-loaded visible rows per table, shared across checks.
+        let mut rows_cache: HashMap<u64, Vec<Row>> = HashMap::new();
+        let mut load_rows = |table_id: u64| -> Result<Vec<Row>> {
+            if let Some(r) = rows_cache.get(&table_id) {
+                return Ok(r.clone());
+            }
+            let handle = self.table_by_id(table_id)?;
+            let rows = handle.lock().visible_rows(snapshot)?;
+            rows_cache.insert(table_id, rows.clone());
+            Ok(rows)
+        };
+
+        // Intra-transaction unique-key dedup: (table_id, uc_id, key).
+        let mut seen_unique: HashSet<(u64, u16, Vec<u8>)> = HashSet::new();
+
+        for (table_id, op) in staging {
+            let Some((_, tname, schema)) = live.iter().find(|(t, _, _)| t == table_id).copied()
+            else {
+                continue;
+            };
+            let cells_map: HashMap<u16, crate::memtable::Value>;
+            match op {
+                Staged::Put(cells) => {
+                    cells_map = cells.iter().cloned().collect();
+
+                    // CHECK constraints.
+                    if !schema.constraints.checks.is_empty() {
+                        validate_checks(&schema.constraints.checks, &cells_map)?;
+                    }
+
+                    // UNIQUE (non-PK) constraints.
+                    for uc in &schema.constraints.uniques {
+                        let Some(key) = encode_composite_key(&uc.columns, &cells_map) else {
+                            continue; // NULL in a constrained column → skip (SQL).
+                        };
+                        let marker = (*table_id, uc.id, key.clone());
+                        if !seen_unique.insert(marker) {
+                            return Err(MongrelError::Conflict(format!(
+                                "UNIQUE constraint '{}' on table '{tname}' violated within batch",
+                                uc.name
+                            )));
+                        }
+                        let rows = load_rows(*table_id)?;
+                        for r in &rows {
+                            if let Some(theirs) = encode_composite_key(&uc.columns, &r.columns) {
+                                if theirs == key {
+                                    return Err(MongrelError::Conflict(format!(
+                                        "UNIQUE constraint '{}' on table '{tname}' violated",
+                                        uc.name
+                                    )));
+                                }
+                            }
+                        }
+                    }
+
+                    // FK insert-side: parent must exist.
+                    for fk in &schema.constraints.foreign_keys {
+                        let Some(child_key) = encode_composite_key(&fk.columns, &cells_map)
+                        else {
+                            continue; // NULL FK component → not checked (SQL).
+                        };
+                        let Some(parent_id) =
+                            cat.tables.iter().find(|t| t.name == fk.ref_table).map(|t| t.table_id)
+                        else {
+                            return Err(MongrelError::InvalidArgument(format!(
+                                "FOREIGN KEY '{}' references unknown table '{}'",
+                                fk.name, fk.ref_table
+                            )));
+                        };
+                        let parent_rows = load_rows(parent_id)?;
+                        let mut found = false;
+                        for r in &parent_rows {
+                            if let Some(pkey) = encode_composite_key(&fk.ref_columns, &r.columns) {
+                                if pkey == child_key {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if !found {
+                            return Err(MongrelError::Conflict(format!(
+                                "FOREIGN KEY '{}' on table '{tname}' has no matching parent in '{}'",
+                                fk.name, fk.ref_table
+                            )));
+                        }
+                    }
+                }
+                Staged::Delete(rid) => {
+                    // FK ON DELETE: a child row referencing this parent blocks
+                    // the delete. (RESTRICT; CASCADE/SET NULL deferred → also
+                    // rejected so a delete never orphans rows.)
+                    let parent_handle = self.table_by_id(*table_id)?;
+                    let Some(parent_row) = parent_handle.lock().get(*rid, snapshot) else {
+                        continue;
+                    };
+                    // Find child tables whose FK references this parent.
+                    for (child_id, child_name, child_schema) in &live {
+                        for fk in &child_schema.constraints.foreign_keys {
+                            if fk.ref_table != tname {
+                                continue;
+                            }
+                            let Some(parent_key) =
+                                encode_composite_key(&fk.ref_columns, &parent_row.columns)
+                            else {
+                                continue;
+                            };
+                            let child_rows = load_rows(*child_id)?;
+                            for r in &child_rows {
+                                if let Some(ck) = encode_composite_key(&fk.columns, &r.columns) {
+                                    if ck == parent_key {
+                                        return Err(MongrelError::Conflict(format!(
+                                            "FOREIGN KEY '{}' on table '{child_name}' restricts delete (parent referenced)",
+                                            fk.name
+                                        )));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Staged::Truncate => {
+                    // A truncate removes every parent row; reject if any child
+                    // references this table at all (RESTRICT semantics).
+                    for (child_id, child_name, child_schema) in &live {
+                        for fk in &child_schema.constraints.foreign_keys {
+                            if fk.ref_table != tname {
+                                continue;
+                            }
+                            let child_rows = load_rows(*child_id)?;
+                            if child_rows.iter().any(|r| {
+                                encode_composite_key(&fk.columns, &r.columns).is_some()
+                            }) {
+                                return Err(MongrelError::Conflict(format!(
+                                    "FOREIGN KEY '{}' on table '{child_name}' restricts truncate of '{tname}'",
+                                    fk.name
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Seal a transaction (spec §9.3):
     /// 1. Prepare — derive write keys, allocate row ids (brief table locks).
     /// 2. Sequencer — validate-first under the WAL mutex; abort on conflict
@@ -418,6 +604,26 @@ impl Database {
                                     }
                                 }
                             }
+                            // Declared non-PK unique constraints register a
+                            // `WriteKey::Unique` (namespace-separated from the
+                            // PK's index_id==0 by setting the high bit) so two
+                            // concurrent transactions inserting the same key
+                            // cannot both commit. Rows with any NULL constrained
+                            // column are skipped (SQL semantics).
+                            for uc in &entry.schema.constraints.uniques {
+                                if let Some(key_bytes) = crate::constraint::encode_composite_key(
+                                    &uc.columns,
+                                    &cells.iter().cloned().collect(),
+                                ) {
+                                    let mut h = DefaultHasher::new();
+                                    key_bytes.hash(&mut h);
+                                    keys.push(WriteKey::Unique {
+                                        table_id: *table_id,
+                                        index_id: uc.id | 0x8000,
+                                        key_hash: h.finish(),
+                                    });
+                                }
+                            }
                         }
                     }
                     Staged::Delete(rid) => keys.push(WriteKey::Row {
@@ -463,6 +669,14 @@ impl Database {
                 }
             }
         }
+
+        // ── 1a¾. Validate declarative constraints (unique / FK / check) under
+        // the read snapshot, outside the WAL mutex. This is the authoritative
+        // server-side enforcement point: a batch that reaches commit either
+        // satisfies every declared constraint or is rejected atomically — no
+        // partial commit. Concurrent-txn uniqueness is additionally guarded by
+        // the `WriteKey::Unique` keys derived above.
+        self.validate_constraints(&staging, read_epoch)?;
 
         // ── 1b. Spill: if a table's staged puts exceed the threshold, write a
         // uniform-epoch pending run (spec §8.5). Rows in the run are NOT
@@ -788,6 +1002,16 @@ impl Database {
             .get(&id)
             .cloned()
             .ok_or_else(|| MongrelError::NotFound(format!("table {name:?} not mounted")))
+    }
+
+    /// Resolve a live table id → mounted handle (used by the constraint
+    /// validation pass and other id-qualified internal paths).
+    fn table_by_id(&self, id: u64) -> Result<TableHandle> {
+        self.tables
+            .read()
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| MongrelError::NotFound(format!("table id {id} not mounted")))
     }
 
     /// Create a new table. The DDL is first logged to the shared WAL

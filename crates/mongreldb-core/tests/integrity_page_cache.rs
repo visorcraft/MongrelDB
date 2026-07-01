@@ -38,7 +38,7 @@ fn schema_plain() -> Schema {
             column_id: 3,
             kind: IndexKind::Bitmap,
         }],
-        colocation: vec![],
+        colocation: vec![], constraints: Default::default(),
     }
 }
 
@@ -512,7 +512,7 @@ mod encrypted {
                 column_id: 2,
                 kind: IndexKind::Bitmap,
             }],
-            colocation: vec![],
+            colocation: vec![], constraints: Default::default(),
         }
     }
 
@@ -538,7 +538,7 @@ mod encrypted {
                 column_id: 2,
                 kind: IndexKind::LearnedRange,
             }],
-            colocation: vec![],
+            colocation: vec![], constraints: Default::default(),
         }
     }
 

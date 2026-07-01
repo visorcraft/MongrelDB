@@ -58,7 +58,7 @@ fn schema() -> Schema {
                 kind: IndexKind::LearnedRange,
             },
         ],
-        colocation: vec![],
+        colocation: vec![], constraints: Default::default(),
     }
 }
 
@@ -291,7 +291,7 @@ fn ann_and_sparse_roundtrip_through_checkpoint() {
                 kind: IndexKind::Sparse,
             },
         ],
-        colocation: vec![],
+        colocation: vec![], constraints: Default::default(),
     };
     let dir = tempdir().unwrap();
     {
@@ -364,7 +364,7 @@ fn bulk_load_columns_builds_indexes_and_checkpoints() {
             column_id: 2,
             kind: IndexKind::LearnedRange,
         }],
-        colocation: vec![],
+        colocation: vec![], constraints: Default::default(),
     };
     let dir = tempdir().unwrap();
     {

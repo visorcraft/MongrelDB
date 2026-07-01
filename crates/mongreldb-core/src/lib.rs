@@ -12,6 +12,7 @@ pub mod cache;
 pub mod catalog;
 pub mod columnar;
 pub mod compaction;
+pub mod constraint;
 pub mod cursor;
 pub mod database;
 pub mod encryption;

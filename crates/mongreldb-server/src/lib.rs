@@ -29,12 +29,18 @@ use mongreldb_query::MongrelSession;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+mod kit;
+
 struct AppState {
     db: Arc<Database>,
+    idem: kit::IdempotencyStore,
 }
 
 pub fn build_app(db: Arc<Database>) -> axum::Router {
-    let state = Arc::new(AppState { db });
+    let state = Arc::new(AppState {
+        db,
+        idem: kit::IdempotencyStore::new(),
+    });
     axum::Router::new()
         .route("/health", get(health))
         .route("/tables", get(list_tables).post(create_table))
@@ -44,6 +50,10 @@ pub fn build_app(db: Arc<Database>) -> axum::Router {
         .route("/tables/{name}/commit", post(commit))
         .route("/sql", post(sql))
         .route("/txn", post(txn))
+        // Typed Kit-aware surface (authoritative validation + constraints).
+        .route("/kit/schema", get(kit::schema_all))
+        .route("/kit/schema/{table}", get(kit::schema_one))
+        .route("/kit/txn", post(kit::kit_txn))
         .with_state(state)
 }
 
@@ -118,7 +128,7 @@ async fn create_table(
         schema_id: 0,
         columns,
         indexes: vec![],
-        colocation: vec![],
+        colocation: vec![], constraints: Default::default(),
     };
     if let Err(msg) = validate_table_name(&req.name) {
         return (StatusCode::BAD_REQUEST, msg).into_response();
@@ -148,7 +158,7 @@ struct PutRequest {
     row: Vec<serde_json::Value>,
 }
 
-fn json_to_value(v: &serde_json::Value, expected: TypeId) -> Value {
+pub(crate) fn json_to_value(v: &serde_json::Value, expected: TypeId) -> Value {
     match (v, expected) {
         (serde_json::Value::Number(n), TypeId::Float64) => {
             n.as_f64().map(Value::Float64).unwrap_or(Value::Null)

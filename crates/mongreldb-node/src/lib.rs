@@ -202,7 +202,7 @@ fn build_schema(spec: SchemaSpec) -> napi::Result<Schema> {
         schema_id: 1,
         columns,
         indexes,
-        colocation: Vec::new(),
+        colocation: Vec::new(), constraints: Default::default(),
     })
 }
 

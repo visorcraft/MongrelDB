@@ -44,7 +44,7 @@ fn schema_with_indexable_bitmap() -> Schema {
             column_id: 2,
             kind: IndexKind::Bitmap,
         }],
-        colocation: vec![],
+        colocation: vec![], constraints: Default::default(),
     }
 }
 
@@ -72,7 +72,7 @@ fn schema_with_indexable_range() -> Schema {
             column_id: 2,
             kind: IndexKind::LearnedRange,
         }],
-        colocation: vec![],
+        colocation: vec![], constraints: Default::default(),
     }
 }
 
@@ -104,7 +104,7 @@ fn schema_plain_encrypted_mix() -> Schema {
             column_id: 2,
             kind: IndexKind::Bitmap,
         }],
-        colocation: vec![],
+        colocation: vec![], constraints: Default::default(),
     }
 }
 

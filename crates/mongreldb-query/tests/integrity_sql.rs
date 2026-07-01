@@ -73,7 +73,7 @@ fn main_schema() -> Schema {
                 kind: IndexKind::LearnedRange,
             },
         ],
-        colocation: vec![],
+        colocation: vec![], constraints: Default::default(),
     }
 }
 
@@ -99,7 +99,7 @@ fn ann_schema() -> Schema {
             column_id: 2,
             kind: IndexKind::Ann,
         }],
-        colocation: vec![],
+        colocation: vec![], constraints: Default::default(),
     }
 }
 
@@ -121,7 +121,7 @@ fn orders_schema() -> Schema {
             },
         ],
         indexes: vec![],
-        colocation: vec![],
+        colocation: vec![], constraints: Default::default(),
     }
 }
 
@@ -143,7 +143,7 @@ fn customers_schema() -> Schema {
             },
         ],
         indexes: vec![],
-        colocation: vec![],
+        colocation: vec![], constraints: Default::default(),
     }
 }
 
@@ -821,7 +821,7 @@ async fn schema_evolution_reads_null_for_old_rows() {
             },
         ],
         indexes: vec![],
-        colocation: vec![],
+        colocation: vec![], constraints: Default::default(),
     };
 
     let dir = tempdir().unwrap();

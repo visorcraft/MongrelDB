@@ -46,7 +46,7 @@ fn test_schema() -> Schema {
                 kind: IndexKind::LearnedRange,
             },
         ],
-        colocation: vec![],
+        colocation: vec![], constraints: Default::default(),
     }
 }
 

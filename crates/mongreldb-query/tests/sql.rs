@@ -53,7 +53,7 @@ fn schema() -> Schema {
                 kind: mongreldb_core::schema::IndexKind::FmIndex,
             },
         ],
-        colocation: vec![],
+        colocation: vec![], constraints: Default::default(),
     }
 }
 
@@ -366,7 +366,7 @@ fn vec_schema() -> Schema {
             column_id: 2,
             kind: mongreldb_core::schema::IndexKind::Ann,
         }],
-        colocation: vec![],
+        colocation: vec![], constraints: Default::default(),
     }
 }
 
@@ -434,7 +434,7 @@ fn cities_schema() -> Schema {
             column_id: 2,
             kind: mongreldb_core::schema::IndexKind::Bitmap,
         }],
-        colocation: vec![],
+        colocation: vec![], constraints: Default::default(),
     }
 }
 
@@ -537,7 +537,7 @@ async fn streaming_scan_emits_multiple_batches() {
             },
         ],
         indexes: vec![],
-        colocation: vec![],
+        colocation: vec![], constraints: Default::default(),
     };
     let mut db = Table::create(dir.path(), minimal, 1).unwrap();
     // 65 536 + 1000 ⇒ exactly two streamed batches (full + partial).
@@ -615,7 +615,7 @@ async fn multi_run_streams_and_limit_short_circuits() {
             column_id: 2,
             kind: IndexKind::Bitmap,
         }],
-        colocation: vec![],
+        colocation: vec![], constraints: Default::default(),
     };
     let mut db = Table::create(dir.path(), multi_schema, 1).unwrap();
     db.set_mutable_run_spill_bytes(1); // each flush spills a fresh run
@@ -672,7 +672,7 @@ async fn cursor_page_pruning_is_exact() {
             },
         ],
         indexes: vec![],
-        colocation: vec![],
+        colocation: vec![], constraints: Default::default(),
     };
     let mut db = Table::create(dir.path(), minimal, 1).unwrap();
     // ~3 pages (2 full 65 536-row pages + a partial third).
@@ -741,7 +741,7 @@ async fn zero_copy_preserves_nulls() {
             },
         ],
         indexes: vec![],
-        colocation: vec![],
+        colocation: vec![], constraints: Default::default(),
     };
     let mut db = Table::create(dir.path(), nullable, 1).unwrap();
     for i in 0..10i64 {

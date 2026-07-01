@@ -40,7 +40,7 @@ fn schema() -> Schema {
             column_id: 2,
             kind: IndexKind::MinHash,
         }],
-        colocation: vec![],
+        colocation: vec![], constraints: Default::default(),
     }
 }
 
@@ -122,7 +122,7 @@ fn minhash_intersects_with_another_condition() {
                 kind: IndexKind::MinHash,
             },
         ],
-        colocation: vec![],
+        colocation: vec![], constraints: Default::default(),
     };
     let mut db = Table::create(dir.path(), sc, 1).unwrap();
     db.bulk_load(vec![

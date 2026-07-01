@@ -13,7 +13,7 @@ fn pk_schema() -> Schema {
             flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
         }],
         indexes: vec![],
-        colocation: vec![],
+        colocation: vec![], constraints: Default::default(),
     }
 }
 

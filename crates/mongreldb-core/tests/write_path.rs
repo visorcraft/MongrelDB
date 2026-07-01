@@ -32,7 +32,7 @@ fn schema() -> Schema {
             column_id: 2,
             kind: IndexKind::Bitmap,
         }],
-        colocation: vec![],
+        colocation: vec![], constraints: Default::default(),
     }
 }
 
