@@ -88,6 +88,7 @@ pub enum IndexKindSpec {
     Bitmap,
     FmIndex,
     Ann,
+    Sparse,
 }
 
 #[napi(object)]
@@ -180,6 +181,7 @@ fn build_schema(spec: SchemaSpec) -> napi::Result<Schema> {
                 IndexKindSpec::Bitmap => IndexKind::Bitmap,
                 IndexKindSpec::FmIndex => IndexKind::FmIndex,
                 IndexKindSpec::Ann => IndexKind::Ann,
+                IndexKindSpec::Sparse => IndexKind::Sparse,
             },
         })
         .collect();
@@ -277,6 +279,10 @@ pub enum ConditionKind {
     Ann,
     PkInt64,
     BitmapIn,
+    IsNull,
+    IsNotNull,
+    FmContainsAll,
+    SparseMatch,
 }
 
 /// One predicate over the shared row-id space. Set the fields appropriate to
@@ -294,6 +300,10 @@ pub struct ConditionSpec {
     pub values: Option<Vec<String>>,
     pub embedding: Option<Vec<f64>>,
     pub k: Option<u32>,
+    /// SparseMatch query token ids (paired with `sparse_weights`).
+    pub sparse_tokens: Option<Vec<u32>>,
+    /// SparseMatch query token weights (paired with `sparse_tokens`).
+    pub sparse_weights: Option<Vec<f64>>,
 }
 
 fn build_condition(spec: &ConditionSpec) -> napi::Result<Condition> {
@@ -351,6 +361,31 @@ fn build_condition(spec: &ConditionSpec) -> napi::Result<Condition> {
             column_id: spec.column_id,
             values: text_values(spec)?,
         },
+        ConditionKind::IsNull => Condition::IsNull {
+            column_id: spec.column_id,
+        },
+        ConditionKind::IsNotNull => Condition::IsNotNull {
+            column_id: spec.column_id,
+        },
+        ConditionKind::FmContainsAll => Condition::FmContainsAll {
+            column_id: spec.column_id,
+            patterns: text_values(spec)?,
+        },
+        ConditionKind::SparseMatch => {
+            let tokens = spec.sparse_tokens.clone().ok_or_else(|| {
+                napi::Error::new(napi::Status::InvalidArg, "SparseMatch needs sparse_tokens")
+            })?;
+            let weights = spec.sparse_weights.clone().unwrap_or_default();
+            Condition::SparseMatch {
+                column_id: spec.column_id,
+                query: tokens
+                    .into_iter()
+                    .zip(weights.into_iter().chain(std::iter::repeat(1.0)))
+                    .map(|(t, w)| (t, w as f32))
+                    .collect(),
+                k: spec.k.unwrap_or(10) as usize,
+            }
+        }
     })
 }
 

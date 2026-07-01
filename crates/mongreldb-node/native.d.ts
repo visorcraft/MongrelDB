@@ -15,7 +15,8 @@ export const enum ColumnType {
 export const enum IndexKindSpec {
   Bitmap = 0,
   FmIndex = 1,
-  Ann = 2
+  Ann = 2,
+  Sparse = 3
 }
 export interface ColumnSpec {
   id: number
@@ -70,7 +71,11 @@ export const enum ConditionKind {
   FmContains = 4,
   Ann = 5,
   PkInt64 = 6,
-  BitmapIn = 7
+  BitmapIn = 7,
+  IsNull = 8,
+  IsNotNull = 9,
+  FmContainsAll = 10,
+  SparseMatch = 11
 }
 /**
  * One predicate over the shared row-id space. Set the fields appropriate to
@@ -88,6 +93,10 @@ export interface ConditionSpec {
   values?: Array<string>
   embedding?: Array<number>
   k?: number
+  /** SparseMatch query token ids (paired with `sparse_weights`). */
+  sparseTokens?: Array<number>
+  /** SparseMatch query token weights (paired with `sparse_tokens`). */
+  sparseWeights?: Array<number>
 }
 export interface RowJs {
   rowId: bigint
