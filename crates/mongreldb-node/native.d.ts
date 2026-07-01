@@ -266,6 +266,18 @@ export declare class TableHandle {
   /** Hybrid index query. */
   query(conditions: Array<ConditionSpec>): Array<RowJs>
   /**
+   * Read every row of this table visible at commit `epoch` — a point-in-time
+   * (MVCC time-travel) read. `epoch` must not exceed the current visible
+   * epoch.
+   */
+  rowsAtEpoch(epoch: bigint): Array<RowJs>
+  /**
+   * Reservoir-sampled approximate aggregate (`count`/`sum`/`avg`) with a
+   * `z`-score confidence interval. Returns a JSON object, or `null` when the
+   * reservoir is empty. `columnId` is required for `sum`/`avg`.
+   */
+  approxAggregate(agg: string, columnId: number | undefined | null, z: number): string | null
+  /**
    * Insert a batch of rows in one call. Returns each row's id and, when the
    * engine allocated it, its `AUTO_INCREMENT` value, in order.
    */

@@ -1140,6 +1140,62 @@ impl TableHandle {
         Ok(rows.iter().map(|r| row_to_js_table(&g, r)).collect())
     }
 
+    /// Read every row of this table visible at commit `epoch` — a point-in-time
+    /// (MVCC time-travel) read. `epoch` must not exceed the current visible
+    /// epoch.
+    #[napi]
+    pub fn rows_at_epoch(&self, epoch: BigInt) -> napi::Result<Vec<RowJs>> {
+        let epoch = epoch.get_u64().1;
+        let current = self.db.visible_epoch().0;
+        if epoch > current {
+            return Err(napi::Error::from_reason(format!(
+                "epoch {epoch} is in the future (current committed epoch is {current})"
+            )));
+        }
+        let handle = self.db.table(&self.name).map_err(to_napi)?;
+        let g = handle.lock();
+        let snap = mongreldb_core::epoch::Snapshot::at(mongreldb_core::Epoch(epoch));
+        let rows = g.visible_rows(snap).map_err(to_napi)?;
+        Ok(rows.iter().map(|r| row_to_js_table(&g, r)).collect())
+    }
+
+    /// Reservoir-sampled approximate aggregate (`count`/`sum`/`avg`) with a
+    /// `z`-score confidence interval. Returns a JSON object, or `null` when the
+    /// reservoir is empty. `columnId` is required for `sum`/`avg`.
+    #[napi]
+    pub fn approx_aggregate(
+        &self,
+        agg: String,
+        column_id: Option<u32>,
+        z: f64,
+    ) -> napi::Result<Option<String>> {
+        let kind = match agg.as_str() {
+            "count" => mongreldb_core::ApproxAgg::Count,
+            "sum" => mongreldb_core::ApproxAgg::Sum,
+            "avg" => mongreldb_core::ApproxAgg::Avg,
+            other => {
+                return Err(napi::Error::from_reason(format!(
+                    "unknown approx aggregate '{other}'"
+                )))
+            }
+        };
+        let cid = column_id.map(|c| c as u16);
+        let handle = self.db.table(&self.name).map_err(to_napi)?;
+        let g = handle.lock();
+        let res = g.approx_aggregate(&[], cid, kind, z).map_err(to_napi)?;
+        Ok(res.map(|r| {
+            serde_json::json!({
+                "point": r.point,
+                "ci_low": r.ci_low,
+                "ci_high": r.ci_high,
+                "n_population": r.n_population,
+                "n_sample_live": r.n_sample_live,
+                "n_passing": r.n_passing,
+            })
+            .to_string()
+        }))
+    }
+
     /// Insert a batch of rows in one call. Returns each row's id and, when the
     /// engine allocated it, its `AUTO_INCREMENT` value, in order.
     #[napi]
