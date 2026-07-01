@@ -37,6 +37,7 @@ const K_FM: u8 = 4;
 const K_ANN: u8 = 5;
 const K_SPARSE: u8 = 9;
 const K_LEARNED: u8 = 10;
+const K_MINHASH: u8 = 11;
 
 /// All in-memory secondary indexes bundled for a single checkpoint write.
 pub struct IndexSnapshot<'a> {
@@ -45,6 +46,7 @@ pub struct IndexSnapshot<'a> {
     pub ann: &'a HashMap<u16, crate::index::AnnIndex>,
     pub fm: &'a HashMap<u16, crate::index::FmIndex>,
     pub sparse: &'a HashMap<u16, crate::index::SparseIndex>,
+    pub minhash: &'a HashMap<u16, crate::index::MinHashIndex>,
     pub learned_range: &'a HashMap<u16, ColumnLearnedRange>,
 }
 
@@ -56,6 +58,7 @@ pub struct LoadedIndexes {
     pub ann: HashMap<u16, crate::index::AnnIndex>,
     pub fm: HashMap<u16, crate::index::FmIndex>,
     pub sparse: HashMap<u16, crate::index::SparseIndex>,
+    pub minhash: HashMap<u16, crate::index::MinHashIndex>,
     pub learned_range: HashMap<u16, ColumnLearnedRange>,
 }
 
@@ -175,6 +178,16 @@ pub fn write_atomic(
             });
         }
     }
+    for (&cid, mh) in snap.minhash {
+        if !mh.is_empty() {
+            let entries = mh.entries();
+            records.push(Record {
+                kind: K_MINHASH,
+                column_id: cid,
+                payload: bincode::serialize(&entries)?,
+            });
+        }
+    }
     for (&cid, lr) in snap.learned_range {
         let s = lr.snapshot();
         records.push(Record {
@@ -275,6 +288,7 @@ pub fn read(dir: &Path, dek: Option<&[u8; 32]>) -> Result<Option<LoadedIndexes>>
     let mut ann = HashMap::new();
     let mut fm = HashMap::new();
     let mut sparse = HashMap::new();
+    let mut minhash = HashMap::new();
     let mut learned_range = HashMap::new();
 
     for rec in body.records {
@@ -306,6 +320,14 @@ pub fn read(dir: &Path, dek: Option<&[u8; 32]>) -> Result<Option<LoadedIndexes>>
                     crate::index::SparseIndex::from_entries(entries),
                 );
             }
+            K_MINHASH => {
+                let entries: crate::index::minhash::MinHashEntries =
+                    bincode::deserialize(&rec.payload)?;
+                minhash.insert(
+                    rec.column_id,
+                    crate::index::MinHashIndex::from_entries(entries),
+                );
+            }
             K_LEARNED => {
                 let snap: ColumnLearnedRangeSnapshot = bincode::deserialize(&rec.payload)?;
                 learned_range.insert(rec.column_id, ColumnLearnedRange::from_snapshot(snap));
@@ -321,6 +343,7 @@ pub fn read(dir: &Path, dek: Option<&[u8; 32]>) -> Result<Option<LoadedIndexes>>
         ann,
         fm,
         sparse,
+        minhash,
         learned_range,
     }))
 }
@@ -370,6 +393,17 @@ mod tests {
         sp.insert(&[(1, 1.0)], RowId(1));
         sparse_map.insert(13u16, sp);
 
+        let mut minhash_map = HashMap::new();
+        let mut mh = crate::index::MinHashIndex::new();
+        let toks = |ts: &[&str]| -> Vec<u64> {
+            ts.iter()
+                .map(|t| crate::index::minhash_token_hash(t))
+                .collect()
+        };
+        mh.insert(&toks(&["a", "b", "c", "d"]), RowId(0));
+        mh.insert(&toks(&["x", "y", "z", "w"]), RowId(1));
+        minhash_map.insert(15u16, mh);
+
         let lr_map = HashMap::<u16, ColumnLearnedRange>::new();
 
         let snap = IndexSnapshot {
@@ -378,6 +412,7 @@ mod tests {
             ann: &ann_map,
             fm: &fm_map,
             sparse: &sparse_map,
+            minhash: &minhash_map,
             learned_range: &lr_map,
         };
         write_atomic(dir.path(), 42, 7, snap, None).unwrap();
@@ -394,6 +429,10 @@ mod tests {
         assert_eq!(top[0].0, RowId(0));
         let sp_top = loaded.sparse[&13].search(&[(1, 1.0), (2, 1.0)], 2);
         assert_eq!(sp_top[0].0, RowId(0));
+        // MinHash survives the checkpoint round-trip: the identical set is found.
+        let mh_top = loaded.minhash[&15].search(&toks(&["a", "b", "c", "d"]), 5);
+        assert_eq!(mh_top[0].0, RowId(0));
+        assert!(mh_top[0].1 > 0.95);
     }
 
     #[test]
@@ -410,6 +449,7 @@ mod tests {
         let ann = HashMap::new();
         let fm = HashMap::new();
         let sparse = HashMap::new();
+        let minhash = HashMap::new();
         let lr = HashMap::new();
         write_atomic(
             dir.path(),
@@ -421,6 +461,7 @@ mod tests {
                 ann: &ann,
                 fm: &fm,
                 sparse: &sparse,
+                minhash: &minhash,
                 learned_range: &lr,
             },
             None,

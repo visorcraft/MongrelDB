@@ -13,7 +13,9 @@ use crate::encryption::Kek;
 use crate::encryption::DEK_LEN;
 use crate::epoch::{Epoch, EpochAuthority, Snapshot};
 use crate::global_idx;
-use crate::index::{AnnIndex, BitmapIndex, ColumnLearnedRange, FmIndex, HotIndex, SparseIndex};
+use crate::index::{
+    AnnIndex, BitmapIndex, ColumnLearnedRange, FmIndex, HotIndex, MinHashIndex, SparseIndex,
+};
 use crate::manifest::{self, Manifest, RunRef};
 use crate::memtable::{Memtable, Row, Value};
 use crate::mutable_run::MutableRun;
@@ -123,6 +125,7 @@ pub struct Table {
     ann: HashMap<u16, AnnIndex>,
     fm: HashMap<u16, FmIndex>,
     sparse: HashMap<u16, SparseIndex>,
+    minhash: HashMap<u16, MinHashIndex>,
     /// Per-column learned (PGM) range indexes for `IndexKind::LearnedRange`
     /// columns, built from the single sorted run.
     learned_range: HashMap<u16, ColumnLearnedRange>,
@@ -904,7 +907,7 @@ impl Table {
         // blob — see `manifest_meta_dek`).
         let manifest_meta_dek = crate::encryption::meta_dek_for(ctx.kek.as_deref());
         manifest::write_atomic(&dir, &mut manifest, manifest_meta_dek.as_ref())?;
-        let (bitmap, ann, fm, sparse) = empty_indexes(&schema);
+        let (bitmap, ann, fm, sparse, minhash) = empty_indexes(&schema);
         let column_keys = build_column_keys(ctx.kek.as_deref(), &schema);
         let auto_inc = resolve_auto_inc(&schema);
         let rcache_dir = dir.join(RCACHE_DIR);
@@ -932,6 +935,7 @@ impl Table {
             ann,
             fm,
             sparse,
+            minhash,
             learned_range: HashMap::new(),
             pk_by_row: HashMap::new(),
             pinned: BTreeMap::new(),
@@ -1141,6 +1145,7 @@ impl Table {
             ann: HashMap::new(),
             fm: HashMap::new(),
             sparse: HashMap::new(),
+            minhash: HashMap::new(),
             learned_range: HashMap::new(),
             pk_by_row: HashMap::new(),
             pinned: BTreeMap::new(),
@@ -1194,16 +1199,18 @@ impl Table {
                 db.ann = loaded.ann;
                 db.fm = loaded.fm;
                 db.sparse = loaded.sparse;
+                db.minhash = loaded.minhash;
                 db.learned_range = loaded.learned_range;
                 db.refresh_pk_by_row_from_hot();
             }
         }
         if !checkpoint_valid {
-            let (bitmap, ann, fm, sparse) = empty_indexes(&db.schema);
+            let (bitmap, ann, fm, sparse, minhash) = empty_indexes(&db.schema);
             db.bitmap = bitmap;
             db.ann = ann;
             db.fm = fm;
             db.sparse = sparse;
+            db.minhash = minhash;
             db.rebuild_indexes_from_runs()?;
             db.build_learned_ranges()?;
         }
@@ -1267,11 +1274,12 @@ impl Table {
     fn rebuild_indexes_from_runs(&mut self) -> Result<()> {
         self.hot = HotIndex::new();
         self.pk_by_row.clear();
-        let (bitmap, ann, fm, sparse) = empty_indexes(&self.schema);
+        let (bitmap, ann, fm, sparse, minhash) = empty_indexes(&self.schema);
         self.bitmap = bitmap;
         self.ann = ann;
         self.fm = fm;
         self.sparse = sparse;
+        self.minhash = minhash;
         let snapshot = Epoch(u64::MAX);
         for rr in self.run_refs.clone() {
             let mut reader = self.open_reader(rr.run_id)?;
@@ -1285,6 +1293,7 @@ impl Table {
                     &mut self.ann,
                     &mut self.fm,
                     &mut self.sparse,
+                    &mut self.minhash,
                 );
             }
         }
@@ -2148,11 +2157,12 @@ impl Table {
         self.memtable = Memtable::new();
         self.mutable_run = MutableRun::new();
         self.hot = HotIndex::new();
-        let (bitmap, ann, fm, sparse) = empty_indexes(&self.schema);
+        let (bitmap, ann, fm, sparse, minhash) = empty_indexes(&self.schema);
         self.bitmap = bitmap;
         self.ann = ann;
         self.fm = fm;
         self.sparse = sparse;
+        self.minhash = minhash;
         self.learned_range.clear();
         self.pk_by_row.clear();
         self.live_count = 0;
@@ -2291,6 +2301,7 @@ impl Table {
             &mut self.ann,
             &mut self.fm,
             &mut self.sparse,
+            &mut self.minhash,
         );
     }
 
@@ -2746,6 +2757,7 @@ impl Table {
             ann: &self.ann,
             fm: &self.fm,
             sparse: &self.sparse,
+            minhash: &self.minhash,
             learned_range: &self.learned_range,
         };
         // Best-effort: a failed checkpoint just means the next open rebuilds.
@@ -3194,6 +3206,19 @@ impl Table {
                     )
                 })
                 .unwrap_or_else(RowIdSet::empty),
+            Condition::MinHashSimilar {
+                column_id,
+                query,
+                k,
+            } => self
+                .minhash
+                .get(column_id)
+                .map(|mh| {
+                    RowIdSet::from_unsorted(
+                        mh.search(query, *k).into_iter().map(|(r, _)| r.0).collect(),
+                    )
+                })
+                .unwrap_or_else(RowIdSet::empty),
             Condition::Range { column_id, lo, hi } => {
                 // Build the candidate set from the durable tier — the learned
                 // index (built from sorted runs) or a single page-pruned run —
@@ -3560,6 +3585,7 @@ impl Table {
                     | Condition::Range { .. }
                     | Condition::RangeF64 { .. }
                     | Condition::SparseMatch { .. }
+                    | Condition::MinHashSimilar { .. }
                     | Condition::IsNull { .. }
                     | Condition::IsNotNull { .. }
             )
@@ -3760,6 +3786,14 @@ impl Table {
                                 if let Ok(terms) = bincode::deserialize::<Vec<(u32, f32)>>(bytes) {
                                     s.insert(&terms, row_id);
                                 }
+                            }
+                        }
+                    }
+                    IndexKind::MinHash => {
+                        if let Some(mh) = self.minhash.get_mut(&idef.column_id) {
+                            if let Some(bytes) = columnar::native_bytes_at(col, i) {
+                                let tokens = crate::index::token_hashes_from_bytes(bytes);
+                                mh.insert(&tokens, row_id);
                             }
                         }
                     }
@@ -4119,6 +4153,7 @@ impl Table {
                     | Condition::Range { .. }
                     | Condition::RangeF64 { .. }
                     | Condition::SparseMatch { .. }
+                    | Condition::MinHashSimilar { .. }
                     | Condition::IsNull { .. }
                     | Condition::IsNotNull { .. }
             )
@@ -4870,6 +4905,19 @@ impl Table {
                         )
                     })
                     .unwrap_or_else(RowIdSet::empty),
+                Condition::MinHashSimilar {
+                    column_id,
+                    query,
+                    k,
+                } => self
+                    .minhash
+                    .get(column_id)
+                    .map(|mh| {
+                        RowIdSet::from_unsorted(
+                            mh.search(query, *k).into_iter().map(|(r, _)| r.0).collect(),
+                        )
+                    })
+                    .unwrap_or_else(RowIdSet::empty),
                 Condition::Range { column_id, lo, hi } => {
                     if let Some(li) = self.learned_range.get(column_id) {
                         RowIdSet::from_unsorted(li.range(*lo, *hi).into_iter().collect())
@@ -5207,7 +5255,12 @@ impl Table {
         use crate::query::Condition;
         let mut sets = Vec::new();
         for c in conditions {
-            if matches!(c, Condition::Ann { .. } | Condition::SparseMatch { .. }) {
+            if matches!(
+                c,
+                Condition::Ann { .. }
+                    | Condition::SparseMatch { .. }
+                    | Condition::MinHashSimilar { .. }
+            ) {
                 sets.push(self.resolve_condition(c, snapshot)?);
             }
         }
@@ -5256,7 +5309,12 @@ impl Table {
         // sets; the per-row predicates below are evaluated exactly.
         let mut index_sets: Vec<RowIdSet> = Vec::new();
         for c in conditions {
-            if matches!(c, Condition::Ann { .. } | Condition::SparseMatch { .. }) {
+            if matches!(
+                c,
+                Condition::Ann { .. }
+                    | Condition::SparseMatch { .. }
+                    | Condition::MinHashSimilar { .. }
+            ) {
                 index_sets.push(self.resolve_condition(c, snapshot)?);
             }
         }
@@ -6228,7 +6286,9 @@ fn condition_matches_row(c: &crate::query::Condition, row: &Row, schema: &Schema
                 .all(|pat| !pat.is_empty() && b.windows(pat.len()).any(|w| w == &pat[..])),
             _ => false,
         },
-        Condition::Ann { .. } | Condition::SparseMatch { .. } => true,
+        Condition::Ann { .. }
+        | Condition::SparseMatch { .. }
+        | Condition::MinHashSimilar { .. } => true,
         Condition::IsNull { column_id } => {
             matches!(row.columns.get(column_id), Some(Value::Null) | None)
         }
@@ -6386,6 +6446,7 @@ type SecondaryIndexes = (
     HashMap<u16, AnnIndex>,
     HashMap<u16, FmIndex>,
     HashMap<u16, SparseIndex>,
+    HashMap<u16, MinHashIndex>,
 );
 
 fn empty_indexes(schema: &Schema) -> SecondaryIndexes {
@@ -6393,6 +6454,7 @@ fn empty_indexes(schema: &Schema) -> SecondaryIndexes {
     let mut ann = HashMap::new();
     let mut fm = HashMap::new();
     let mut sparse = HashMap::new();
+    let mut minhash = HashMap::new();
     for idef in &schema.indexes {
         match idef.kind {
             IndexKind::Bitmap => {
@@ -6416,10 +6478,13 @@ fn empty_indexes(schema: &Schema) -> SecondaryIndexes {
             IndexKind::Sparse => {
                 sparse.insert(idef.column_id, SparseIndex::new());
             }
+            IndexKind::MinHash => {
+                minhash.insert(idef.column_id, MinHashIndex::new());
+            }
             _ => {}
         }
     }
-    (bitmap, ann, fm, sparse)
+    (bitmap, ann, fm, sparse, minhash)
 }
 
 const ALTER_COLUMN_PROTECTED_FLAGS: u32 = ColumnFlags::PRIMARY_KEY
@@ -6468,6 +6533,7 @@ fn storage_compatible_type_change(old: TypeId, new: TypeId) -> bool {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn index_into(
     schema: &Schema,
     row: &Row,
@@ -6476,6 +6542,7 @@ fn index_into(
     ann: &mut HashMap<u16, AnnIndex>,
     fm: &mut HashMap<u16, FmIndex>,
     sparse: &mut HashMap<u16, SparseIndex>,
+    minhash: &mut HashMap<u16, MinHashIndex>,
 ) {
     for idef in &schema.indexes {
         let Some(val) = row.columns.get(&idef.column_id) else {
@@ -6504,6 +6571,14 @@ fn index_into(
                     if let Ok(terms) = bincode::deserialize::<Vec<(u32, f32)>>(b) {
                         s.insert(&terms, row.row_id);
                     }
+                }
+            }
+            IndexKind::MinHash => {
+                if let (Some(mh), Value::Bytes(b)) = (minhash.get_mut(&idef.column_id), val) {
+                    // The set is a JSON array (the Kit's `set_similarity` shape);
+                    // tokenize + hash its members into the MinHash signature.
+                    let tokens = crate::index::token_hashes_from_bytes(b);
+                    mh.insert(&tokens, row.row_id);
                 }
             }
             _ => {}

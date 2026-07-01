@@ -57,6 +57,14 @@ pub enum Condition {
         query: Vec<(u32, f32)>,
         k: usize,
     },
+    /// MinHash/LSH set-similarity: candidate row ids whose set is similar to
+    /// `query` (a set of 64-bit token hashes), ranked by estimated Jaccard,
+    /// truncated to `k`. Approximate (LSH recall) — the caller re-verifies.
+    MinHashSimilar {
+        column_id: u16,
+        query: Vec<u64>,
+        k: usize,
+    },
     /// Rows where `column_id` is NULL. Resolved by decoding the column and
     /// collecting null positions — a column scan, but no row materialization.
     /// Page-stat aware: pages with `null_count == 0` are skipped.
@@ -220,6 +228,20 @@ fn hash_condition(c: &Condition) -> u64 {
                 wb.hash(&mut h);
             }
         }
+        Condition::MinHashSimilar {
+            column_id,
+            query,
+            k,
+        } => {
+            10u8.hash(&mut h);
+            column_id.hash(&mut h);
+            k.hash(&mut h);
+            let mut q = query.clone();
+            q.sort_unstable();
+            for t in q {
+                t.hash(&mut h);
+            }
+        }
         Condition::IsNull { column_id } => {
             8u8.hash(&mut h);
             column_id.hash(&mut h);
@@ -249,6 +271,7 @@ pub fn condition_columns(conditions: &[Condition]) -> Vec<u16> {
             | Condition::Range { column_id, .. }
             | Condition::RangeF64 { column_id, .. }
             | Condition::SparseMatch { column_id, .. }
+            | Condition::MinHashSimilar { column_id, .. }
             | Condition::IsNull { column_id }
             | Condition::IsNotNull { column_id } => Some(*column_id),
         })

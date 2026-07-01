@@ -11,6 +11,7 @@ pub mod fm_index;
 pub mod hnsw;
 pub mod hot;
 pub mod learned_range;
+pub mod minhash;
 pub mod pgm;
 pub mod sparse;
 
@@ -19,5 +20,6 @@ pub use bitmap::BitmapIndex;
 pub use fm_index::FmIndex;
 pub use hot::HotIndex;
 pub use learned_range::{ColumnLearnedRange, ColumnLearnedRangeSnapshot};
+pub use minhash::{minhash_token_hash, token_hashes_from_bytes, MinHashIndex};
 pub use pgm::LearnedIndex;
 pub use sparse::SparseIndex;
