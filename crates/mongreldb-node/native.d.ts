@@ -39,6 +39,13 @@ export interface ColumnSpec {
    * Defaults to `false` (omitted/null).
    */
   autoIncrement?: boolean
+  /** Encrypt this column's page payload at rest (requires an encrypted db). */
+  encrypted?: boolean
+  /**
+   * Encrypt the column but keep it queryable via deterministic equality
+   * tokens / order-preserving encoding (requires an encrypted db).
+   */
+  encryptedIndexable?: boolean
 }
 export interface IndexSpec {
   name: string

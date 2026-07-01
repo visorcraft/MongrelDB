@@ -109,6 +109,11 @@ pub struct ColumnSpec {
     /// Mutually exclusive with `nullable`; requires `primary_key` and `Int64`.
     /// Defaults to `false` (omitted/null).
     pub auto_increment: Option<bool>,
+    /// Encrypt this column's page payload at rest (requires an encrypted db).
+    pub encrypted: Option<bool>,
+    /// Encrypt the column but keep it queryable via deterministic equality
+    /// tokens / order-preserving encoding (requires an encrypted db).
+    pub encrypted_indexable: Option<bool>,
 }
 
 #[napi(object)]
@@ -150,6 +155,12 @@ fn to_column_flags(column: &ColumnSpec) -> ColumnFlags {
     }
     if column.nullable {
         flags = flags.with(ColumnFlags::NULLABLE);
+    }
+    if column.encrypted.unwrap_or(false) {
+        flags = flags.with(ColumnFlags::ENCRYPTED);
+    }
+    if column.encrypted_indexable.unwrap_or(false) {
+        flags = flags.with(ColumnFlags::ENCRYPTED_INDEXABLE);
     }
     if column.auto_increment.unwrap_or(false) {
         flags = flags.with(ColumnFlags::AUTO_INCREMENT);
