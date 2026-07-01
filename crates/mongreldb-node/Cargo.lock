@@ -2221,6 +2221,7 @@ name = "mongreldb-node"
 version = "0.16.0"
 dependencies = [
  "arrow",
+ "bincode",
  "bytemuck",
  "mongreldb-core",
  "mongreldb-query",
