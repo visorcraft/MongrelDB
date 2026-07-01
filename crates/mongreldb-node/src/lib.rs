@@ -441,6 +441,30 @@ fn build_conditions(specs: &[ConditionSpec]) -> napi::Result<Vec<Condition>> {
     specs.iter().map(build_condition).collect()
 }
 
+/// Finalize a mergeable `AggState` to a JSON scalar, keeping integer-ness for
+/// `COUNT`/`MIN`/`MAX`/int `SUM` and a float for averages / float columns.
+fn agg_state_to_json(s: &mongreldb_core::AggState) -> serde_json::Value {
+    use mongreldb_core::AggState::*;
+    let num = |x: f64| {
+        serde_json::Number::from_f64(x)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null)
+    };
+    match s {
+        Count(n) => serde_json::Value::from(*n),
+        SumI { sum, .. } => i64::try_from(*sum)
+            .map(serde_json::Value::from)
+            .unwrap_or_else(|_| num(*sum as f64)),
+        SumF { sum, .. } => num(*sum),
+        AvgI { sum, count } if *count > 0 => num(*sum as f64 / *count as f64),
+        AvgF { sum, count } if *count > 0 => num(*sum / *count as f64),
+        AvgI { .. } | AvgF { .. } => serde_json::Value::Null,
+        MinI(n) | MaxI(n) => serde_json::Value::from(*n),
+        MinF(f) | MaxF(f) => num(*f),
+        Empty => serde_json::Value::Null,
+    }
+}
+
 fn build_query_from_conditions(conditions: Vec<Condition>) -> Query {
     let mut q = Query::new();
     for c in conditions {
@@ -1196,6 +1220,52 @@ impl TableHandle {
         }))
     }
 
+    /// Incrementally-maintained aggregate (`count`/`sum`/`min`/`max`/`avg`),
+    /// optionally filtered by pushed-down `conditions`. Returns a JSON object
+    /// `{value, incremental, delta_rows}`; the value is always exact. The engine
+    /// caches per `(table, column, agg, conditions)` and folds in only the delta
+    /// of newly-committed rows once data has spilled to runs.
+    #[napi]
+    pub fn incremental_aggregate(
+        &self,
+        agg: String,
+        column_id: Option<u32>,
+        conditions: Vec<ConditionSpec>,
+    ) -> napi::Result<String> {
+        let kind = match agg.as_str() {
+            "count" => mongreldb_core::NativeAgg::Count,
+            "sum" => mongreldb_core::NativeAgg::Sum,
+            "min" => mongreldb_core::NativeAgg::Min,
+            "max" => mongreldb_core::NativeAgg::Max,
+            "avg" => mongreldb_core::NativeAgg::Avg,
+            other => {
+                return Err(napi::Error::from_reason(format!(
+                    "unknown aggregate '{other}'"
+                )))
+            }
+        };
+        let cid = column_id.map(|c| c as u16);
+        let conds = build_conditions(&conditions)?;
+        // Stable per-(table,column,agg,conditions) cache key.
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&self.name, &mut hasher);
+        std::hash::Hash::hash(&cid, &mut hasher);
+        std::hash::Hash::hash(&agg, &mut hasher);
+        std::hash::Hash::hash(&format!("{conds:?}"), &mut hasher);
+        let cache_key = std::hash::Hasher::finish(&hasher);
+        let handle = self.db.table(&self.name).map_err(to_napi)?;
+        let mut g = handle.lock();
+        let res = g
+            .aggregate_incremental(cache_key, &conds, cid, kind)
+            .map_err(to_napi)?;
+        Ok(serde_json::json!({
+            "value": agg_state_to_json(&res.state),
+            "incremental": res.incremental,
+            "delta_rows": res.delta_rows,
+        })
+        .to_string())
+    }
+
     /// Insert a batch of rows in one call. Returns each row's id and, when the
     /// engine allocated it, its `AUTO_INCREMENT` value, in order.
     #[napi]
@@ -1658,15 +1728,13 @@ impl TxnTable {
             let assigned = g.fill_auto_inc(&mut cols).map_err(to_napi)?;
             (cols, assigned)
         };
-        self.staging
-            .lock()
-            .push((
-                self.table.clone(),
-                TxnOp::Put {
-                    cells: cols,
-                    auto_inc: assigned,
-                },
-            ));
+        self.staging.lock().push((
+            self.table.clone(),
+            TxnOp::Put {
+                cells: cols,
+                auto_inc: assigned,
+            },
+        ));
         Ok(assigned.map(BigInt::from))
     }
 

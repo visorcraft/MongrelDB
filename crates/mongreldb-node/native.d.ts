@@ -278,6 +278,14 @@ export declare class TableHandle {
    */
   approxAggregate(agg: string, columnId: number | undefined | null, z: number): string | null
   /**
+   * Incrementally-maintained aggregate (`count`/`sum`/`min`/`max`/`avg`),
+   * optionally filtered by pushed-down `conditions`. Returns a JSON object
+   * `{value, incremental, delta_rows}`; the value is always exact. The engine
+   * caches per `(table, column, agg, conditions)` and folds in only the delta
+   * of newly-committed rows once data has spilled to runs.
+   */
+  incrementalAggregate(agg: string, columnId: number | undefined | null, conditions: Array<ConditionSpec>): string
+  /**
    * Insert a batch of rows in one call. Returns each row's id and, when the
    * engine allocated it, its `AUTO_INCREMENT` value, in order.
    */
