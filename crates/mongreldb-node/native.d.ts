@@ -62,6 +62,12 @@ export interface Cell {
   text?: string
   bytes?: Buffer
   embedding?: Array<number>
+  /**
+   * Sparse (SPLADE) token ids, paired with `sparse_weights`; bincoded into a
+   * Bytes value for a `Sparse` column on insert.
+   */
+  sparseTokens?: Array<number>
+  sparseWeights?: Array<number>
 }
 export const enum ConditionKind {
   Pk = 0,

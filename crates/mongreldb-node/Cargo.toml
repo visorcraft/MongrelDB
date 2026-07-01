@@ -11,6 +11,7 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
+bincode = "1"
 mongreldb-core = { path = "../mongreldb-core" }
 mongreldb-query = { path = "../mongreldb-query" }
 napi = { version = "2", default-features = false, features = ["napi8", "tokio_rt"] }

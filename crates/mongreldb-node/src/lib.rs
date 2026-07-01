@@ -207,6 +207,10 @@ pub struct Cell {
     pub text: Option<String>,
     pub bytes: Option<Buffer>,
     pub embedding: Option<Vec<f64>>,
+    /// Sparse (SPLADE) token ids, paired with `sparse_weights`; bincoded into a
+    /// Bytes value for a `Sparse` column on insert.
+    pub sparse_tokens: Option<Vec<u32>>,
+    pub sparse_weights: Option<Vec<f64>>,
 }
 
 impl Cell {
@@ -219,6 +223,8 @@ impl Cell {
             text: None,
             bytes: None,
             embedding: None,
+            sparse_tokens: None,
+            sparse_weights: None,
         }
     }
 
@@ -238,11 +244,28 @@ impl Cell {
                 Some(f) => Value::Float64(f),
                 None => Value::Null,
             },
-            TypeId::Bytes => match (&self.text, &self.bytes) {
-                (Some(s), _) => Value::Bytes(s.as_bytes().to_vec()),
-                (None, Some(b)) => Value::Bytes(b.to_vec()),
-                (None, None) => Value::Null,
-            },
+            TypeId::Bytes => {
+                if let Some(tokens) = &self.sparse_tokens {
+                    // A `Sparse` column maps to Bytes; bincode `Vec<(u32, f32)>`
+                    // so the engine's sparse index reads the tokens.
+                    let weights = self.sparse_weights.clone().unwrap_or_default();
+                    let terms: Vec<(u32, f32)> = tokens
+                        .iter()
+                        .zip(weights.into_iter().chain(std::iter::repeat(1.0)))
+                        .map(|(t, w)| (*t, w as f32))
+                        .collect();
+                    Value::Bytes(
+                        bincode::serialize(&terms)
+                            .map_err(|e| napi::Error::from_reason(e.to_string()))?,
+                    )
+                } else {
+                    match (&self.text, &self.bytes) {
+                        (Some(s), _) => Value::Bytes(s.as_bytes().to_vec()),
+                        (None, Some(b)) => Value::Bytes(b.to_vec()),
+                        (None, None) => Value::Null,
+                    }
+                }
+            }
             TypeId::Embedding { .. } => {
                 Value::Embedding(self.embedding.iter().flatten().map(|x| *x as f32).collect())
             }
