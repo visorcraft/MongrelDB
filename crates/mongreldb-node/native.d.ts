@@ -16,7 +16,8 @@ export const enum IndexKindSpec {
   Bitmap = 0,
   FmIndex = 1,
   Ann = 2,
-  Sparse = 3
+  Sparse = 3,
+  MinHash = 4
 }
 export interface ColumnSpec {
   id: number

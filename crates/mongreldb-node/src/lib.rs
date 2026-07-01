@@ -89,6 +89,7 @@ pub enum IndexKindSpec {
     FmIndex,
     Ann,
     Sparse,
+    MinHash,
 }
 
 #[napi(object)]
@@ -193,6 +194,7 @@ fn build_schema(spec: SchemaSpec) -> napi::Result<Schema> {
                 IndexKindSpec::FmIndex => IndexKind::FmIndex,
                 IndexKindSpec::Ann => IndexKind::Ann,
                 IndexKindSpec::Sparse => IndexKind::Sparse,
+                IndexKindSpec::MinHash => IndexKind::MinHash,
             },
         })
         .collect();
