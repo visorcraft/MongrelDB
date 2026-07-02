@@ -866,7 +866,7 @@ fn condition_cost_rank(c: &crate::query::Condition) -> u8 {
         Condition::Pk(_)
         | Condition::BitmapEq { .. }
         | Condition::BitmapIn { .. }
-                    | Condition::BytesPrefix { .. }
+        | Condition::BytesPrefix { .. }
         | Condition::IsNull { .. }
         | Condition::IsNotNull { .. } => 0,
         // Page-pruned scan or LSH candidate lookup.

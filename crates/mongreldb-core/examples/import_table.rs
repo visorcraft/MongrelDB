@@ -45,8 +45,11 @@ fn run(old_dir: &str, new_dir: &str, table_name: &str) -> mongreldb_core::Result
     db.create_table(table_name, schema)?;
 
     for row in rows {
-        let cells: Vec<(u16, mongreldb_core::Value)> =
-            row.columns.iter().map(|(&cid, v)| (cid, v.clone())).collect();
+        let cells: Vec<(u16, mongreldb_core::Value)> = row
+            .columns
+            .iter()
+            .map(|(&cid, v)| (cid, v.clone()))
+            .collect();
         db.transaction(|t| {
             t.put(table_name, cells)?;
             Ok(())

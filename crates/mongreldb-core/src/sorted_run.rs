@@ -2406,7 +2406,9 @@ impl RunReader {
         let raw = self.read_page(column_id, seq)?;
         let col = columnar::decode_page_native(ty, &raw, nrows)?;
         if let Some(cache) = &self.decoded_cache {
-            cache.lock(&key).insert(key, std::sync::Arc::new(col.clone()));
+            cache
+                .lock(&key)
+                .insert(key, std::sync::Arc::new(col.clone()));
         }
         Ok(col)
     }

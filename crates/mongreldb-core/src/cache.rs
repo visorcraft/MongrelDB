@@ -481,7 +481,9 @@ pub const CACHE_SHARDS: usize = 16;
 impl<T> Sharded<T> {
     pub fn new(n_shards: usize, make: impl FnMut() -> T) -> Self {
         let mut make = make;
-        let shards = (0..n_shards).map(|_| parking_lot::Mutex::new(make())).collect();
+        let shards = (0..n_shards)
+            .map(|_| parking_lot::Mutex::new(make()))
+            .collect();
         Self {
             shards,
             try_lock_misses: AtomicU64::new(0),
@@ -603,7 +605,14 @@ mod tests {
         let mut cache = PageCache::new(1 << 20);
         let hash = [7u8; 32];
         cache.insert(page(hash, 1, b"v"));
-        assert_eq!(cache.stats(), CacheStats { hits: 0, misses: 0, try_lock_misses: 0 });
+        assert_eq!(
+            cache.stats(),
+            CacheStats {
+                hits: 0,
+                misses: 0,
+                try_lock_misses: 0
+            }
+        );
 
         // Visible hit (get + try_get).
         assert!(cache.get(&hash, Snapshot::at(Epoch(1))).is_some());
@@ -613,11 +622,25 @@ mod tests {
         assert!(cache.get(&hash, Snapshot::at(Epoch(0))).is_none());
 
         let s = cache.stats();
-        assert_eq!(s, CacheStats { hits: 2, misses: 2, try_lock_misses: 0 });
+        assert_eq!(
+            s,
+            CacheStats {
+                hits: 2,
+                misses: 2,
+                try_lock_misses: 0
+            }
+        );
         assert!((s.hit_rate() - 0.5).abs() < 1e-9);
 
         cache.reset_stats();
-        assert_eq!(cache.stats(), CacheStats { hits: 0, misses: 0, try_lock_misses: 0 });
+        assert_eq!(
+            cache.stats(),
+            CacheStats {
+                hits: 0,
+                misses: 0,
+                try_lock_misses: 0
+            }
+        );
         assert_eq!(cache.stats().hit_rate(), 0.0);
     }
 

@@ -75,7 +75,10 @@ fn bitmap_eq_includes_unflushed_overlay_rows() {
         .unwrap()
         .expect("bitmap condition is served");
     // 50 flushed + 30 unflushed = 80; the cat=9 row is excluded.
-    assert_eq!(count, 80, "bitmap query must include unflushed overlay rows");
+    assert_eq!(
+        count, 80,
+        "bitmap query must include unflushed overlay rows"
+    );
 
     // And the materialized query must return exactly those 80 ids (0..80).
     let mut rows = db.query(&Query::new().and(cond)).unwrap();
@@ -108,9 +111,7 @@ fn pk_lookup_finds_unflushed_overlay_row() {
         .unwrap();
     db.commit().unwrap();
 
-    let row = db
-        .query(&Query::pk(Value::Int64(42).encode_key()))
-        .unwrap();
+    let row = db.query(&Query::pk(Value::Int64(42).encode_key())).unwrap();
     assert_eq!(row.len(), 1, "HOT must resolve an unflushed PK");
 }
 
