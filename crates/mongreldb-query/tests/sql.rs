@@ -1130,3 +1130,134 @@ async fn native_aggregate_rejects_like_filter() {
         .value(0);
     assert_eq!(c, 9, "LIKE wildcard semantics must be applied exactly");
 }
+
+// ── §5.3 direct SQL dispatch ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn direct_dispatch_equality_and_range_match_datafusion() {
+    let (_dir, session) = setup().await;
+    // Equality on the PK → dispatched natively, exact rows.
+    let (b, trace) = session
+        .run_sql_traced("SELECT id FROM travel_trips WHERE id = 7")
+        .await
+        .unwrap();
+    assert_eq!(total_rows(&b), 1);
+    assert_eq!(
+        trace.scan_mode,
+        mongreldb_core::trace::ScanMode::DirectDispatch,
+        "simple single-table eq SELECT should direct-dispatch"
+    );
+    // Range → dispatched, correct count.
+    let (b, trace) = session
+        .run_sql_traced("SELECT id FROM travel_trips WHERE id >= 90")
+        .await
+        .unwrap();
+    assert_eq!(total_rows(&b), 10);
+    assert_eq!(
+        trace.scan_mode,
+        mongreldb_core::trace::ScanMode::DirectDispatch
+    );
+
+    // Projection: only the requested column is returned.
+    assert_eq!(b[0].schema().fields().len(), 1);
+    assert_eq!(b[0].schema().field(0).name(), "id");
+
+    // SELECT * dispatched too.
+    let (b, trace) = session
+        .run_sql_traced("SELECT * FROM travel_trips WHERE id < 3")
+        .await
+        .unwrap();
+    assert_eq!(total_rows(&b), 3);
+    assert_eq!(
+        trace.scan_mode,
+        mongreldb_core::trace::ScanMode::DirectDispatch
+    );
+    assert_eq!(
+        b[0].schema().fields().len(),
+        5,
+        "SELECT * projects all columns"
+    );
+}
+
+#[tokio::test]
+async fn direct_dispatch_bitmap_equality_on_indexed_column() {
+    let (_dir, session) = setup().await;
+    // destination (col 2) has a bitmap index → BitmapEq via direct dispatch.
+    let (b, trace) = session
+        .run_sql_traced("SELECT id FROM travel_trips WHERE destination = 'City5'")
+        .await
+        .unwrap();
+    assert_eq!(total_rows(&b), 1);
+    assert_eq!(
+        trace.scan_mode,
+        mongreldb_core::trace::ScanMode::DirectDispatch
+    );
+}
+
+#[tokio::test]
+async fn direct_dispatch_in_list_and_null_fall_through_correctly() {
+    let (_dir, session) = setup().await;
+    // IN-list on the bitmap-indexed destination column.
+    let (b, _t) = session
+        .run_sql_traced("SELECT id FROM travel_trips WHERE destination IN ('City1','City2')")
+        .await
+        .unwrap();
+    assert_eq!(total_rows(&b), 2);
+    // IS NOT NULL is an exact condition; dispatched (no rows are null here, so 100).
+    let (b, _t) = session
+        .run_sql_traced("SELECT id FROM travel_trips WHERE destination IS NOT NULL")
+        .await
+        .unwrap();
+    assert_eq!(total_rows(&b), 100);
+}
+
+#[tokio::test]
+async fn like_and_limit_fall_through_to_datafusion() {
+    let (_dir, session) = setup().await;
+    // LIKE is a superset predicate → must NOT direct-dispatch (DataFusion
+    // re-applies the wildcard). Results are still correct.
+    let (b, trace) = session
+        .run_sql_traced("SELECT id FROM travel_trips WHERE destination LIKE 'City1%'")
+        .await
+        .unwrap();
+    // 'City1', 'City10'..'City19' → 11 rows.
+    assert_eq!(total_rows(&b), 11);
+    assert_ne!(
+        trace.scan_mode,
+        mongreldb_core::trace::ScanMode::DirectDispatch,
+        "LIKE must fall through (inexact)"
+    );
+    // LIMIT present → v1 falls through.
+    let (b, trace) = session
+        .run_sql_traced("SELECT id FROM travel_trips WHERE id = 5 LIMIT 1")
+        .await
+        .unwrap();
+    assert_eq!(total_rows(&b), 1);
+    assert_ne!(
+        trace.scan_mode,
+        mongreldb_core::trace::ScanMode::DirectDispatch
+    );
+}
+
+#[tokio::test]
+async fn direct_dispatch_is_memoized_by_result_cache() {
+    let (_dir, session) = setup().await;
+    // First call dispatches + memoizes.
+    let (b1, t1) = session
+        .run_sql_traced("SELECT id FROM travel_trips WHERE id = 4")
+        .await
+        .unwrap();
+    assert_eq!(total_rows(&b1), 1);
+    assert_eq!(
+        t1.scan_mode,
+        mongreldb_core::trace::ScanMode::DirectDispatch
+    );
+    // Second identical call hits the result cache (~0.1µs); scan_mode is
+    // Unknown because the scan layer never ran.
+    let (b2, t2) = session
+        .run_sql_traced("SELECT id FROM travel_trips WHERE id = 4")
+        .await
+        .unwrap();
+    assert_eq!(total_rows(&b2), 1);
+    assert_eq!(t2.scan_mode, mongreldb_core::trace::ScanMode::Unknown);
+}

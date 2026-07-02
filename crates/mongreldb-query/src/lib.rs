@@ -958,6 +958,308 @@ fn try_or_as_bitmap_in(
     })
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// §5.3 direct SQL dispatch: translate a sqlparser AST WHERE clause into the
+// engine's exact Condition set (no DataFusion involvement). Only predicates
+// whose Condition is EXACT are accepted; everything else returns None so the
+// caller falls through to the DataFusion path (which re-applies residuals).
+
+fn sp_ident_name(expr: &sqlparser::ast::Expr) -> Option<&str> {
+    use sqlparser::ast::Expr;
+    match expr {
+        Expr::Identifier(ident) => Some(ident.value.as_str()),
+        Expr::CompoundIdentifier(idents) => idents.last().map(|i| i.value.as_str()),
+        _ => None,
+    }
+}
+
+/// A sqlparser literal → core Value. Numbers widen to Int64 (or Float64 if they
+/// don't fit i64); single-quoted strings → Bytes; booleans → Bool.
+fn sp_literal(expr: &sqlparser::ast::Expr) -> Option<mongreldb_core::Value> {
+    use sqlparser::ast::Expr;
+    let v = match expr {
+        Expr::Value(v) => v,
+        _ => return None,
+    };
+    use sqlparser::ast::Value as SpValue;
+    match &v.value {
+        SpValue::Number(s, _) => s
+            .parse::<i64>()
+            .map(mongreldb_core::Value::Int64)
+            .or_else(|_| s.parse::<f64>().map(mongreldb_core::Value::Float64))
+            .ok(),
+        SpValue::SingleQuotedString(s) => Some(mongreldb_core::Value::Bytes(s.as_bytes().to_vec())),
+        SpValue::Boolean(b) => Some(mongreldb_core::Value::Bool(*b)),
+        _ => None,
+    }
+}
+
+fn is_int_ty(ty: mongreldb_core::schema::TypeId) -> bool {
+    use mongreldb_core::schema::TypeId::*;
+    matches!(
+        ty,
+        Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64 | TimestampNanos | Date32
+    )
+}
+
+fn is_float_ty(ty: mongreldb_core::schema::TypeId) -> bool {
+    matches!(
+        ty,
+        mongreldb_core::schema::TypeId::Float32 | mongreldb_core::schema::TypeId::Float64
+    )
+}
+
+/// Translate ONE sqlparser predicate `Expr` into one exact `Condition`.
+/// Returns `None` for anything inexact or unsupported (→ caller falls through).
+fn translate_sqlparser_predicate(
+    expr: &sqlparser::ast::Expr,
+    schema: &mongreldb_core::Schema,
+) -> Option<mongreldb_core::Condition> {
+    use mongreldb_core::{schema::ColumnFlags, Condition, IndexKind, Value};
+    use sqlparser::ast::{BinaryOperator, Expr};
+
+    let col_def = |name: &str| schema.columns.iter().find(|c| c.name == name);
+    let has_bitmap = |cid: u16| {
+        schema
+            .indexes
+            .iter()
+            .any(|i| i.column_id == cid && i.kind == IndexKind::Bitmap)
+    };
+
+    match expr {
+        // `a = b OR a = c …` (one column, all literals) → BitmapIn.
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Or,
+            right,
+        } => {
+            let mut values: Vec<Vec<u8>> = Vec::new();
+            let mut target: Option<u16> = None;
+            let mut stack: Vec<&Expr> = vec![left.as_ref(), right.as_ref()];
+            while let Some(e) = stack.pop() {
+                match e {
+                    Expr::BinaryOp {
+                        left,
+                        op: BinaryOperator::Or,
+                        right,
+                    } => {
+                        stack.push(left.as_ref());
+                        stack.push(right.as_ref());
+                    }
+                    Expr::BinaryOp {
+                        left,
+                        op: BinaryOperator::Eq,
+                        right,
+                    } => {
+                        let (name, lit) = match (left.as_ref(), right.as_ref()) {
+                            (l, r) if sp_ident_name(l).is_some() && sp_literal(r).is_some() => {
+                                (l, r)
+                            }
+                            (l, r) if sp_ident_name(r).is_some() && sp_literal(l).is_some() => {
+                                (r, l)
+                            }
+                            _ => return None,
+                        };
+                        let cdef = col_def(sp_ident_name(name)?)?;
+                        if !has_bitmap(cdef.id) {
+                            return None;
+                        }
+                        match target {
+                            None => target = Some(cdef.id),
+                            Some(id) if id != cdef.id => return None,
+                            _ => {}
+                        }
+                        values.push(sp_literal(lit)?.encode_key());
+                    }
+                    _ => return None,
+                }
+            }
+            let cid = target?;
+            (!values.is_empty()).then_some(Condition::BitmapIn {
+                column_id: cid,
+                values,
+            })
+        }
+        // Comparison `col OP literal` (or mirrored).
+        Expr::BinaryOp { left, op, right } => {
+            let flipped;
+            let (col_expr, lit_expr) = match (
+                sp_ident_name(left),
+                sp_literal(right),
+                sp_ident_name(right),
+                sp_literal(left),
+            ) {
+                (Some(_), Some(_), _, _) => {
+                    flipped = false;
+                    (left.as_ref(), right.as_ref())
+                }
+                (_, _, Some(_), Some(_)) => {
+                    flipped = true;
+                    (right.as_ref(), left.as_ref())
+                }
+                _ => return None,
+            };
+            let name = sp_ident_name(col_expr)?;
+            let cdef = col_def(name)?;
+            let v = sp_literal(lit_expr)?;
+            use sqlparser::ast::BinaryOperator::*;
+            // Inline the comparison→Range/RangeF64 bounds, fusing the flip
+            // (BinaryOperator is not Copy, so we match the &op directly).
+            match op {
+                Eq => {
+                    if has_bitmap(cdef.id) {
+                        Some(Condition::BitmapEq {
+                            column_id: cdef.id,
+                            value: v.encode_key(),
+                        })
+                    } else if cdef.flags.contains(ColumnFlags::PRIMARY_KEY) {
+                        Some(Condition::Pk(v.encode_key()))
+                    } else {
+                        None
+                    }
+                }
+                Lt | LtEq | Gt | GtEq if is_int_ty(cdef.ty) => {
+                    let n = match v {
+                        Value::Int64(n) => n,
+                        _ => return None,
+                    };
+                    // `col OP v`, or the mirrored `v OP col` with the flipped op.
+                    let (lo, hi) = match (flipped, op) {
+                        (false, Lt) | (true, Gt) => (i64::MIN, n.saturating_sub(1)),
+                        (false, Gt) | (true, Lt) => (n.saturating_add(1), i64::MAX),
+                        (false, LtEq) | (true, GtEq) => (i64::MIN, n),
+                        (false, GtEq) | (true, LtEq) => (n, i64::MAX),
+                        _ => (i64::MIN, i64::MAX),
+                    };
+                    Some(Condition::Range {
+                        column_id: cdef.id,
+                        lo,
+                        hi,
+                    })
+                }
+                Lt | LtEq | Gt | GtEq if is_float_ty(cdef.ty) => {
+                    let f = match v {
+                        Value::Float64(f) => f,
+                        _ => return None,
+                    };
+                    let (lo, li, hi, hi_i) = match (flipped, op) {
+                        (false, Lt) | (true, Gt) => (f64::NEG_INFINITY, true, f, false),
+                        (false, Gt) | (true, Lt) => (f, false, f64::INFINITY, true),
+                        (false, LtEq) | (true, GtEq) => (f64::NEG_INFINITY, true, f, true),
+                        (false, GtEq) | (true, LtEq) => (f, true, f64::INFINITY, true),
+                        _ => (f64::NEG_INFINITY, true, f64::INFINITY, true),
+                    };
+                    Some(Condition::RangeF64 {
+                        column_id: cdef.id,
+                        lo,
+                        lo_inclusive: li,
+                        hi,
+                        hi_inclusive: hi_i,
+                    })
+                }
+                _ => None,
+            }
+        }
+        Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } if !negated => {
+            let name = sp_ident_name(expr)?;
+            let cdef = col_def(name)?;
+            if is_int_ty(cdef.ty) {
+                let lo = match sp_literal(low)? {
+                    Value::Int64(n) => n,
+                    _ => return None,
+                };
+                let hi = match sp_literal(high)? {
+                    Value::Int64(n) => n,
+                    _ => return None,
+                };
+                Some(Condition::Range {
+                    column_id: cdef.id,
+                    lo,
+                    hi,
+                })
+            } else if is_float_ty(cdef.ty) {
+                let lo = match sp_literal(low)? {
+                    Value::Float64(f) => f,
+                    _ => return None,
+                };
+                let hi = match sp_literal(high)? {
+                    Value::Float64(f) => f,
+                    _ => return None,
+                };
+                Some(Condition::RangeF64 {
+                    column_id: cdef.id,
+                    lo,
+                    lo_inclusive: true,
+                    hi,
+                    hi_inclusive: true,
+                })
+            } else {
+                None
+            }
+        }
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } if !negated => {
+            let name = sp_ident_name(expr)?;
+            let cdef = col_def(name)?;
+            if !has_bitmap(cdef.id) {
+                return None;
+            }
+            let values: Vec<Vec<u8>> = list
+                .iter()
+                .map(|e| sp_literal(e).map(|v| v.encode_key()))
+                .collect::<Option<_>>()?;
+            (!values.is_empty()).then_some(Condition::BitmapIn {
+                column_id: cdef.id,
+                values,
+            })
+        }
+        // `col IS NULL` / `col IS NOT NULL`. sqlparser 0.62 represents these as
+        // `IsNull(expr)` / `IsNotNull(expr)` (and, defensively, `IsBoolean`).
+        Expr::IsNull(inner) => {
+            let cid = col_def(sp_ident_name(inner)?)?.id;
+            Some(Condition::IsNull { column_id: cid })
+        }
+        Expr::IsNotNull(inner) => {
+            let cid = col_def(sp_ident_name(inner)?)?.id;
+            Some(Condition::IsNotNull { column_id: cid })
+        }
+        _ => None,
+    }
+}
+
+/// Split a top-level AND tree into conjuncts, translating each to an exact
+/// Condition. Returns `None` if any conjunct is inexact/unsupported.
+fn translate_sqlparser_filter(
+    expr: &sqlparser::ast::Expr,
+    schema: &mongreldb_core::Schema,
+) -> Option<Vec<mongreldb_core::Condition>> {
+    use sqlparser::ast::{BinaryOperator, Expr};
+    let mut out = Vec::new();
+    let mut stack = vec![expr];
+    while let Some(e) = stack.pop() {
+        match e {
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::And,
+                right,
+            } => {
+                stack.push(left.as_ref());
+                stack.push(right.as_ref());
+            }
+            other => out.push(translate_sqlparser_predicate(other, schema)?),
+        }
+    }
+    Some(out)
+}
+
 /// Convenience wrapper: a DataFusion `SessionContext` bound to a live MongrelDB,
 /// with a result cache keyed by `(sql, snapshot_epoch)` that auto-invalidates
 /// when a commit advances the epoch.
@@ -1121,11 +1423,193 @@ impl MongrelSession {
     /// (`CREATE TABLE`, `DROP TABLE`, `ALTER TABLE`) are intercepted when a
     /// `Database` is attached and mapped to the catalog. Repeated identical SQL
     /// against the same snapshot returns the cached batches without re-executing.
+    /// §5.3 direct SQL dispatch: recognize a simple single-table `SELECT` from
+    /// the raw SQL via the vendored `sqlparser` AST and serve it straight from
+    /// the native column cursor, **bypassing DataFusion parse+plan+optimize**.
+    /// Returns `Ok(None)` (→ fall through to `ctx.sql()`) for any shape it
+    /// cannot serve *exactly*, or on any parse error. See the design doc at
+    /// `docs/superpowers/plans/2026-07-02-direct-sql-dispatch.md`.
+    fn try_direct_dispatch(&self, sql: &str) -> Result<Option<Vec<RecordBatch>>> {
+        use arrow::array::ArrayRef;
+        use mongreldb_core::Condition;
+        use sqlparser::ast::{Expr, Query, SelectItem, SetExpr, Statement, TableFactor};
+        use sqlparser::dialect::PostgreSqlDialect;
+        use sqlparser::parser::Parser;
+
+        // Any parse error, or more than one statement → fall through.
+        let Ok(stmts) = Parser::parse_sql(&PostgreSqlDialect {}, sql) else {
+            return Ok(None);
+        };
+        if stmts.len() != 1 {
+            return Ok(None);
+        }
+        let Statement::Query(query) = stmts.into_iter().next().unwrap() else {
+            return Ok(None);
+        };
+        let Query { body, .. } = *query;
+        let select = match *body {
+            SetExpr::Select(s) => *s,
+            _ => return Ok(None),
+        };
+        // v1: fall through if LIMIT/OFFSET is present (can't read the fields
+        // portably; a conservative token check keeps correctness safe).
+        let lower_sql = sql.to_lowercase();
+        if lower_sql.contains(" limit ") || lower_sql.contains(" offset ") {
+            return Ok(None);
+        }
+        // Reject shapes we don't handle: DISTINCT / GROUP BY / HAVING / multi-FROM / joins.
+        use sqlparser::ast::GroupByExpr;
+        if select.distinct.is_some()
+            || !matches!(&select.group_by, GroupByExpr::Expressions(e, _) if e.is_empty())
+            || select.having.is_some()
+            || select.from.len() != 1
+            || !select.from[0].joins.is_empty()
+        {
+            return Ok(None);
+        }
+        let table_name = match &select.from[0].relation {
+            TableFactor::Table { name, .. } => Some(name.to_string()),
+            _ => return Ok(None),
+        };
+        let Some(table_name) = table_name else {
+            return Ok(None);
+        };
+
+        // v1 only dispatches FILTERED single-table SELECTs. An unfiltered `SELECT
+        // *`/`SELECT cols` already streams efficiently through the scan path
+        // (with ≤65 536-row batch chunking + Arrow shadow writes), which the
+        // direct path's single-shot column decode can't preserve — so leave it
+        // to DataFusion. The win here is the cold filtered-SELECT planning cost.
+        if select.selection.is_none() {
+            return Ok(None);
+        }
+
+        // Projection: only `*` or a list of bare column identifiers.
+        let mut proj_names: Option<Vec<String>> = None;
+        for item in &select.projection {
+            match item {
+                SelectItem::Wildcard(_) => {}
+                SelectItem::UnnamedExpr(Expr::Identifier(ident)) => {
+                    proj_names
+                        .get_or_insert_with(Vec::new)
+                        .push(ident.value.clone());
+                }
+                SelectItem::UnnamedExpr(Expr::CompoundIdentifier(idents)) => {
+                    if let Some(last) = idents.last() {
+                        proj_names
+                            .get_or_insert_with(Vec::new)
+                            .push(last.value.clone());
+                    }
+                }
+                _ => return Ok(None),
+            }
+        }
+
+        // Resolve the table handle.
+        let handle = match self.tables.lock().get(&table_name).cloned() {
+            Some(h) => h,
+            None => return Ok(None),
+        };
+
+        let mut db = handle.lock();
+        let schema = db.schema().clone();
+        // Translate WHERE against the live schema; an inexact/unsupported
+        // predicate → fall through to DataFusion (which re-applies residuals).
+        let conditions: Vec<Condition> = match &select.selection {
+            Some(expr) => match translate_sqlparser_filter(expr, &schema) {
+                Some(c) => c,
+                None => return Ok(None),
+            },
+            None => Vec::new(),
+        };
+        if !conditions.is_empty() && db.ensure_indexes_complete().is_err() {
+            return Ok(None);
+        }
+        let snap = db.snapshot();
+
+        // Resolve projected column ids + Arrow field list (in projection order).
+        let mut col_ids: Vec<u16> = Vec::new();
+        let mut fields: Vec<arrow::datatypes::Field> = Vec::new();
+        let resolve_col = |name: &str| -> Option<&mongreldb_core::schema::ColumnDef> {
+            schema.columns.iter().find(|c| c.name == name)
+        };
+        match &proj_names {
+            None => {
+                for c in &schema.columns {
+                    col_ids.push(c.id);
+                    fields.push(arrow::datatypes::Field::new(
+                        &c.name,
+                        arrow_conv::arrow_data_type(&c.ty)?,
+                        c.flags.contains(mongreldb_core::ColumnFlags::NULLABLE),
+                    ));
+                }
+            }
+            Some(names) => {
+                for n in names {
+                    let cdef = match resolve_col(n) {
+                        Some(c) => c,
+                        None => return Ok(None), // unknown column → let DataFusion error
+                    };
+                    col_ids.push(cdef.id);
+                    fields.push(arrow::datatypes::Field::new(
+                        &cdef.name,
+                        arrow_conv::arrow_data_type(&cdef.ty)?,
+                        cdef.flags.contains(mongreldb_core::ColumnFlags::NULLABLE),
+                    ));
+                }
+            }
+        }
+
+        // Execute via the same native column path MongrelProvider::scan uses.
+        let cols = if !conditions.is_empty() {
+            match db.query_columns_native_cached(&conditions, Some(&col_ids), snap) {
+                Ok(Some(c)) => c,
+                Ok(None) => db
+                    .visible_columns_native(snap, Some(&col_ids))
+                    .map_err(MongrelQueryError::Core)?,
+                Err(_) => return Ok(None),
+            }
+        } else {
+            db.visible_columns_native(snap, Some(&col_ids))
+                .map_err(MongrelQueryError::Core)?
+        };
+        drop(db);
+
+        // Order decoded columns into projection order, then build one batch.
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(col_ids.len());
+        for cid in &col_ids {
+            let col = cols
+                .iter()
+                .find(|(id, _)| id == cid)
+                .map(|(_, c)| c.clone());
+            let Some(col) = col else { return Ok(None) };
+            let ty = schema
+                .columns
+                .iter()
+                .find(|c| c.id == *cid)
+                .map(|c| c.ty)
+                .unwrap_or(mongreldb_core::schema::TypeId::Int64);
+            arrays.push(arrow_conv::native_to_array(ty, &col)?);
+        }
+        let batch_schema = Arc::new(arrow::datatypes::Schema::new(fields));
+        let batch = RecordBatch::try_new(batch_schema, arrays)
+            .map_err(|e| MongrelQueryError::Arrow(format!("direct dispatch batch build: {e}")))?;
+
+        mongreldb_core::trace::QueryTrace::record(|t| {
+            t.scan_mode = mongreldb_core::trace::ScanMode::DirectDispatch;
+            t.planning_nanos = 0; // we bypassed DataFusion planning
+        });
+        Ok(Some(vec![batch]))
+    }
+
+    /// Run a SQL statement: DDL/commands are intercepted; otherwise a result
+    /// cache keyed by `(normalized SQL, snapshot epoch)` memoizes batches.
+    /// §5.3: simple single-table SELECTs are served by [`try_direct_dispatch`]
+    /// (no DataFusion planning) before falling back to the full DataFusion path.
     pub async fn run(&self, sql: &str) -> Result<Vec<RecordBatch>> {
         if let Some(batches) = commands::try_run_command(self, sql)? {
             return Ok(batches);
         }
-
         // P4.2: intercept DDL when a Database is attached.
         let lower = sql.trim_start().to_lowercase();
         if lower.starts_with("create table") {
@@ -1236,6 +1720,14 @@ impl MongrelSession {
         let key = (sql.to_string(), epoch);
         if let Some(hit) = self.cache.lock().get(&key) {
             return Ok((**hit).clone());
+        }
+        // §5.3: direct SQL dispatch for simple single-table SELECTs — bypasses
+        // DataFusion parse+plan+optimize. Served batches are memoized into the
+        // result cache like the normal path. Returns None (→ fall through) for
+        // any shape it cannot serve exactly.
+        if let Some(batches) = self.try_direct_dispatch(sql)? {
+            self.cache.lock().insert(key, Arc::new(batches.clone()));
+            return Ok(batches);
         }
         // Phase 16.5: check the logical-plan cache before re-parsing.
         let plan_start = std::time::Instant::now();

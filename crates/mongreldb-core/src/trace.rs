@@ -78,6 +78,10 @@ pub enum ScanMode {
     /// `rows_for_rids` — rows go through the `Row { HashMap }` shape. This is
     /// the path optimizations try to avoid.
     Materialized,
+    /// §5.3 direct SQL dispatch: a simple single-table `SELECT` recognized from
+    /// the raw SQL (sqlparser AST) and served straight from the native column
+    /// cursor, bypassing DataFusion parse+plan+optimize entirely.
+    DirectDispatch,
 }
 
 impl fmt::Display for ScanMode {
@@ -91,6 +95,7 @@ impl fmt::Display for ScanMode {
             ScanMode::MultiRunCursor => "multi-run-cursor",
             ScanMode::NativePushdown => "native-pushdown",
             ScanMode::Materialized => "materialized",
+            ScanMode::DirectDispatch => "direct-dispatch",
         };
         f.write_str(s)
     }
