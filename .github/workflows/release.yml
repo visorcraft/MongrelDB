@@ -1,4 +1,5 @@
-# Builds the native addon and publishes @visorcraft/mongreldb to npm on a tag.
+# Builds the native addon and publishes @visorcraft/mongreldb to npm, and
+# publishes the mongreldb-core Rust crate to crates.io, on a tag.
 #
 # Single-platform: bundles a linux-x64-gnu .node (matches what ships today), so
 # the package only installs on linux-x64 — fine for the Roamarr container and a
@@ -8,14 +9,20 @@
 # Publish this BEFORE @visorcraft/mongreldb-kit — the kit's release installs
 # this package from npm to satisfy its peer dependency.
 #
-# Release flow: bump "version" in crates/mongreldb-node/package.json, commit,
-# then tag and push the matching version, for example:
+# Release flow: bump "version" in crates/mongreldb-node/package.json and
+# workspace.package.version in Cargo.toml, commit, then tag and push the
+# matching version, for example:
 #   git tag v0.18.2 && git push origin master v0.18.2
-# npm refuses to republish an existing version, so the tag must be a new version
-# (0.18.0 is already published).
+# npm/crates.io both refuse to republish an existing version, so the tag must
+# be a new version.
 #
-# Requires repo secret NPM_TOKEN: a granular npm token with read+write on the
-# @visorcraft scope.
+# mongreldb-query is not published (never has been; nothing outside this repo
+# depends on it — only mongreldb-core is a public crates.io dependency, e.g.
+# for MongrelDB Kit).
+#
+# Requires repo secrets:
+#   NPM_TOKEN            — granular npm token, read+write on @visorcraft
+#   CARGO_REGISTRY_TOKEN — crates.io API token, publish scope
 name: Release
 
 on:
@@ -58,3 +65,16 @@ jobs:
       - run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  publish-crate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo publish -p mongreldb-core
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
