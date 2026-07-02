@@ -21,6 +21,11 @@ pub enum Condition {
         column_id: u16,
         values: Vec<Vec<u8>>,
     },
+    /// Prefix match on a Bytes column with a bitmap index: all row-ids whose
+    /// indexed value starts with `prefix`. Exact (no residual needed) — the
+    /// bitmap's distinct keys are enumerated and filtered by prefix. Tighter
+    /// than `FmContains` for anchored `LIKE 'prefix%'`. (§5.6)
+    BytesPrefix { column_id: u16, prefix: Vec<u8> },
     /// Semantic search via the binary-quantized ANN index.
     Ann {
         column_id: u16,
@@ -250,6 +255,11 @@ fn hash_condition(c: &Condition) -> u64 {
             9u8.hash(&mut h);
             column_id.hash(&mut h);
         }
+        Condition::BytesPrefix { column_id, prefix } => {
+            11u8.hash(&mut h);
+            column_id.hash(&mut h);
+            prefix.hash(&mut h);
+        }
     }
     h.finish()
 }
@@ -265,6 +275,7 @@ pub fn condition_columns(conditions: &[Condition]) -> Vec<u16> {
             Condition::Pk(_) => None,
             Condition::BitmapEq { column_id, .. }
             | Condition::BitmapIn { column_id, .. }
+            | Condition::BytesPrefix { column_id, .. }
             | Condition::Ann { column_id, .. }
             | Condition::FmContains { column_id, .. }
             | Condition::FmContainsAll { column_id, .. }

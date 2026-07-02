@@ -866,6 +866,7 @@ fn condition_cost_rank(c: &crate::query::Condition) -> u8 {
         Condition::Pk(_)
         | Condition::BitmapEq { .. }
         | Condition::BitmapIn { .. }
+                    | Condition::BytesPrefix { .. }
         | Condition::IsNull { .. }
         | Condition::IsNotNull { .. } => 0,
         // Page-pruned scan or LSH candidate lookup.
@@ -3451,6 +3452,24 @@ impl Table {
                 }
                 RowIdSet::from_roaring(acc)
             }
+            Condition::BytesPrefix { column_id, prefix } => {
+                // §5.6: enumerate bitmap keys sharing the prefix for an exact
+                // prefix match (anchored `LIKE 'prefix%'`), tighter than the
+                // FM substring superset. The caller only emits this when the
+                // column has a bitmap index.
+                if let Some(b) = self.bitmap.get(column_id) {
+                    let lookup_prefix = self.index_lookup_key_bytes(*column_id, prefix);
+                    let mut acc = roaring::RoaringBitmap::new();
+                    for key in b.keys() {
+                        if key.starts_with(&lookup_prefix) {
+                            acc |= b.get(key);
+                        }
+                    }
+                    RowIdSet::from_roaring(acc)
+                } else {
+                    RowIdSet::empty()
+                }
+            }
             Condition::FmContains { column_id, pattern } => self
                 .fm
                 .get(column_id)
@@ -3877,6 +3896,7 @@ impl Table {
                 Condition::Pk(_)
                     | Condition::BitmapEq { .. }
                     | Condition::BitmapIn { .. }
+                    | Condition::BytesPrefix { .. }
                     | Condition::FmContains { .. }
                     | Condition::FmContainsAll { .. }
                     | Condition::Ann { .. }
@@ -4480,6 +4500,7 @@ impl Table {
                 Condition::Pk(_)
                     | Condition::BitmapEq { .. }
                     | Condition::BitmapIn { .. }
+                    | Condition::BytesPrefix { .. }
                     | Condition::FmContains { .. }
                     | Condition::FmContainsAll { .. }
                     | Condition::Ann { .. }
@@ -5194,6 +5215,20 @@ impl Table {
                         }
                     }
                     RowIdSet::from_roaring(acc)
+                }
+                Condition::BytesPrefix { column_id, prefix } => {
+                    if let Some(b) = self.bitmap.get(column_id) {
+                        let lookup_prefix = self.index_lookup_key_bytes(*column_id, prefix);
+                        let mut acc = roaring::RoaringBitmap::new();
+                        for key in b.keys() {
+                            if key.starts_with(&lookup_prefix) {
+                                acc |= b.get(key);
+                            }
+                        }
+                        RowIdSet::from_roaring(acc)
+                    } else {
+                        RowIdSet::empty()
+                    }
                 }
                 Condition::FmContains { column_id, pattern } => self
                     .fm
@@ -6609,6 +6644,11 @@ fn condition_matches_row(c: &crate::query::Condition, row: &Row, schema: &Schema
                 None => false,
             }
         }
+        Condition::BytesPrefix { column_id, prefix } => row
+            .columns
+            .get(column_id)
+            .map(|v| v.encode_key().starts_with(prefix))
+            .unwrap_or(false),
         Condition::Range { column_id, lo, hi } => match row.columns.get(column_id) {
             Some(Value::Int64(n)) => *n >= *lo && *n <= *hi,
             _ => false,

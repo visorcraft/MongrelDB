@@ -622,6 +622,18 @@ pub(crate) fn translate_filter(
                 return None;
             };
             let cdef = col_def(&c.name)?;
+            // §5.6: anchored prefix `LIKE 'literal%'` (no embedded wildcards)
+            // on a bitmap-indexed column → exact BytesPrefix, tighter than the
+            // FM substring superset. Checked before the FM path.
+            if has_bitmap(cdef.id) {
+                if let Some(prefix) = anchored_like_prefix(pat) {
+                    return Some(Condition::BytesPrefix {
+                        column_id: cdef.id,
+                        prefix: mongreldb_core::Value::Bytes(prefix.as_bytes().to_vec())
+                            .encode_key(),
+                    });
+                }
+            }
             if !has_fm(cdef.id) {
                 return None;
             }
@@ -871,6 +883,18 @@ fn longest_like_segment(pat: &str) -> Option<Vec<u8>> {
         .max_by_key(|s| s.len())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_vec())
+}
+
+/// Detect an anchored-prefix LIKE pattern: `literal%` with no `%` or `_` in
+/// the literal part and a single trailing `%`. Returns the prefix (without the
+/// `%`). Used to emit an exact `BytesPrefix` condition on bitmap-indexed
+/// columns — tighter than the FM substring superset. (§5.6)
+fn anchored_like_prefix(pat: &str) -> Option<&str> {
+    let rest = pat.strip_suffix('%')?;
+    if rest.is_empty() || rest.contains(['%', '_']) {
+        return None;
+    }
+    Some(rest)
 }
 
 /// Unwrap a single-layer `Expr::Cast` wrapper to enable pushdown for queries
