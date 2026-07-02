@@ -839,6 +839,30 @@ impl SharedCtx {
     }
 }
 
+/// §5.5: estimated per-condition resolution cost for cheap-first conjunction
+/// ordering. Lower is resolved first so a selective O(1) index lookup can
+/// short-circuit an expensive range/FM/vector scan.
+fn condition_cost_rank(c: &crate::query::Condition) -> u8 {
+    use crate::query::Condition;
+    match c {
+        // O(1) index lookups — resolve first.
+        Condition::Pk(_)
+        | Condition::BitmapEq { .. }
+        | Condition::BitmapIn { .. }
+        | Condition::IsNull { .. }
+        | Condition::IsNotNull { .. } => 0,
+        // Page-pruned scan or LSH candidate lookup.
+        Condition::Range { .. } | Condition::RangeF64 { .. } | Condition::MinHashSimilar { .. } => {
+            1
+        }
+        // FM locate / vector scans — most expensive, resolve last.
+        Condition::FmContains { .. }
+        | Condition::FmContainsAll { .. }
+        | Condition::Ann { .. }
+        | Condition::SparseMatch { .. } => 2,
+    }
+}
+
 impl Table {
     pub fn create(dir: impl AsRef<Path>, schema: Schema, table_id: u64) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
@@ -3079,9 +3103,22 @@ impl Table {
             t.scan_mode = crate::trace::ScanMode::Materialized;
             t.row_materialized = true;
         });
-        let mut sets: Vec<RowIdSet> = Vec::with_capacity(q.conditions.len());
-        for c in &q.conditions {
-            sets.push(self.resolve_condition(c, snapshot)?);
+        // §5.5: resolve conditions CHEAP-FIRST and early-exit the moment a
+        // condition yields an empty survivor set. Previously every condition
+        // (including an expensive range/FM page scan) was resolved before
+        // `intersect_many` noticed an empty set; now a selective bitmap/PK that
+        // eliminates all rows short-circuits the rest. Correctness is unchanged
+        // (intersection with an empty set is empty either way).
+        let mut ordered: Vec<&crate::query::Condition> = q.conditions.iter().collect();
+        ordered.sort_by_key(|c| condition_cost_rank(c));
+        let mut sets: Vec<RowIdSet> = Vec::with_capacity(ordered.len());
+        for c in &ordered {
+            let s = self.resolve_condition(c, snapshot)?;
+            let empty = s.is_empty();
+            sets.push(s);
+            if empty {
+                break;
+            }
         }
         let rids = RowIdSet::intersect_many(sets).into_sorted_vec();
         self.rows_for_rids(&rids, snapshot)
