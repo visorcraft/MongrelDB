@@ -46,8 +46,8 @@ pub use cursor::{drain_cursor_to_columns, Cursor, MultiRunCursor, NativePageCurs
 pub use database::{CheckIssue, Database};
 pub use encryption::{Cipher, PlaintextCipher};
 pub use engine::{
-    AggState, ApproxAgg, ApproxResult, CachedAgg, ColumnStat, IncrementalAggResult, NativeAgg,
-    NativeAggResult, Table,
+    AggState, ApproxAgg, ApproxResult, CachedAgg, ColumnStat, IncrementalAggResult,
+    IndexBuildPolicy, NativeAgg, NativeAggResult, Table,
 };
 pub use epoch::{Epoch, EpochAuthority, EpochClock, Snapshot};
 pub use error::{MongrelError, Result};

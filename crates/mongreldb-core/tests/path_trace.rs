@@ -9,7 +9,7 @@
 
 use mongreldb_core::schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
 use mongreldb_core::trace::{IndexRebuild, ScanMode};
-use mongreldb_core::{Condition, Query, Table, Value};
+use mongreldb_core::{Condition, IndexBuildPolicy, Query, Table, Value};
 use tempfile::{tempdir, TempDir};
 
 fn schema() -> Schema {
@@ -57,9 +57,13 @@ fn rows(n: u64) -> Vec<Vec<(u16, Value)>> {
         .collect()
 }
 
+/// Steady-state fixture: these tests assert *which query path* runs once the
+/// indexes are live, so build them eagerly (the deferred default is covered by
+/// `trace_index_rebuild_after_bulk_load`).
 fn build_db(n: u64) -> (TempDir, Table) {
     let dir = tempdir().unwrap();
     let mut db = Table::create(dir.path(), schema(), 1).unwrap();
+    db.set_index_build_policy(IndexBuildPolicy::Eager);
     db.bulk_load(rows(n)).unwrap();
     (dir, db)
 }
@@ -201,15 +205,22 @@ fn trace_index_rebuild_after_bulk_load() {
     let (_, trace) = db
         .query_columns_native_traced(&q.conditions, Some(&[1u16]), snap)
         .unwrap();
-    // The bulk load eagerly builds indexes for empty tables (recent fix), so
-    // the first query should see indexes already complete. Verify the field is
-    // populated (not the default Unknown/None).
-    assert_ne!(
+    // Default `IndexBuildPolicy::Deferred`: the bulk load leaves indexes
+    // incomplete, so the first query pays the one-time lazy rebuild…
+    assert_eq!(
         trace.index_rebuild,
-        IndexRebuild::None,
-        "index_rebuild should be recorded: {trace}"
+        IndexRebuild::Rebuilt,
+        "first query after a deferred bulk load must rebuild indexes: {trace}"
     );
-    trace.assert_no_index_rebuild(); // Eager build → no stall on query.
+    // …and the second query is served from the now-complete indexes.
+    let (_, trace) = db
+        .query_columns_native_traced(&q.conditions, Some(&[1u16]), snap)
+        .unwrap();
+    assert_eq!(
+        trace.index_rebuild,
+        IndexRebuild::AlreadyComplete,
+        "second query must not rebuild again: {trace}"
+    );
 }
 
 #[test]

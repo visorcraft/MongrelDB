@@ -133,6 +133,12 @@ impl TableProvider for MongrelProvider {
             })
             .collect();
 
+        // Index-served conditions require complete live indexes; a deferred
+        // bulk load pays its one-time build here (Phase 14.7 lazy contract).
+        if !translated.is_empty() {
+            db.ensure_indexes_complete().map_err(core_err)?;
+        }
+
         // `COUNT(*)`-style queries (empty projection) need only a row count.
         // Unfiltered ⇒ O(1) via the maintained `live_count` metadata; a pushed
         // WHERE ⇒ decode one column through the pushdown path to count survivors.

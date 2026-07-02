@@ -12,20 +12,68 @@ fn schema() -> Schema {
     Schema {
         schema_id: 1,
         columns: vec![
-            ColumnDef { id: 1, name: "id".into(), ty: TypeId::Int64, flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY) },
-            ColumnDef { id: 2, name: "category".into(), ty: TypeId::Bytes, flags: ColumnFlags::empty() },
-            ColumnDef { id: 3, name: "status".into(), ty: TypeId::Bytes, flags: ColumnFlags::empty() },
-            ColumnDef { id: 4, name: "amount".into(), ty: TypeId::Float64, flags: ColumnFlags::empty() },
-            ColumnDef { id: 5, name: "ts".into(), ty: TypeId::Int64, flags: ColumnFlags::empty() },
-            ColumnDef { id: 6, name: "user_id".into(), ty: TypeId::Int64, flags: ColumnFlags::empty() },
-            ColumnDef { id: 7, name: "region".into(), ty: TypeId::Bytes, flags: ColumnFlags::empty() },
+            ColumnDef {
+                id: 1,
+                name: "id".into(),
+                ty: TypeId::Int64,
+                flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+            },
+            ColumnDef {
+                id: 2,
+                name: "category".into(),
+                ty: TypeId::Bytes,
+                flags: ColumnFlags::empty(),
+            },
+            ColumnDef {
+                id: 3,
+                name: "status".into(),
+                ty: TypeId::Bytes,
+                flags: ColumnFlags::empty(),
+            },
+            ColumnDef {
+                id: 4,
+                name: "amount".into(),
+                ty: TypeId::Float64,
+                flags: ColumnFlags::empty(),
+            },
+            ColumnDef {
+                id: 5,
+                name: "ts".into(),
+                ty: TypeId::Int64,
+                flags: ColumnFlags::empty(),
+            },
+            ColumnDef {
+                id: 6,
+                name: "user_id".into(),
+                ty: TypeId::Int64,
+                flags: ColumnFlags::empty(),
+            },
+            ColumnDef {
+                id: 7,
+                name: "region".into(),
+                ty: TypeId::Bytes,
+                flags: ColumnFlags::empty(),
+            },
         ],
         indexes: vec![
-            IndexDef { name: "cat_bm".into(), column_id: 2, kind: IndexKind::Bitmap },
-            IndexDef { name: "status_bm".into(), column_id: 3, kind: IndexKind::Bitmap },
-            IndexDef { name: "region_bm".into(), column_id: 7, kind: IndexKind::Bitmap },
+            IndexDef {
+                name: "cat_bm".into(),
+                column_id: 2,
+                kind: IndexKind::Bitmap,
+            },
+            IndexDef {
+                name: "status_bm".into(),
+                column_id: 3,
+                kind: IndexKind::Bitmap,
+            },
+            IndexDef {
+                name: "region_bm".into(),
+                column_id: 7,
+                kind: IndexKind::Bitmap,
+            },
         ],
-        colocation: vec![], constraints: Default::default(),
+        colocation: vec![],
+        constraints: Default::default(),
     }
 }
 
@@ -33,25 +81,49 @@ fn users_schema() -> Schema {
     Schema {
         schema_id: 2,
         columns: vec![
-            ColumnDef { id: 1, name: "uid".into(), ty: TypeId::Int64, flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY) },
-            ColumnDef { id: 2, name: "region".into(), ty: TypeId::Bytes, flags: ColumnFlags::empty() },
+            ColumnDef {
+                id: 1,
+                name: "uid".into(),
+                ty: TypeId::Int64,
+                flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+            },
+            ColumnDef {
+                id: 2,
+                name: "region".into(),
+                ty: TypeId::Bytes,
+                flags: ColumnFlags::empty(),
+            },
         ],
         indexes: vec![],
-        colocation: vec![], constraints: Default::default(),
+        colocation: vec![],
+        constraints: Default::default(),
     }
 }
 
 fn mk_bytes_col(vals: &[Vec<u8>]) -> NativeColumn {
     let offsets: Vec<u32> = std::iter::once(0u32)
-        .chain(vals.iter().scan(0u32, |acc, v| { *acc += v.len() as u32; Some(*acc) }))
+        .chain(vals.iter().scan(0u32, |acc, v| {
+            *acc += v.len() as u32;
+            Some(*acc)
+        }))
         .collect();
     let values: Vec<u8> = vals.iter().flat_map(|v| v.iter().copied()).collect();
-    NativeColumn::Bytes { offsets, values, validity: vec![0xFF; vals.len().div_ceil(8)] }
+    NativeColumn::Bytes {
+        offsets,
+        values,
+        validity: vec![0xFF; vals.len().div_ceil(8)],
+    }
 }
 
-fn ms(d: Duration) -> f64 { d.as_secs_f64() * 1e6 }
+fn ms(d: Duration) -> f64 {
+    d.as_secs_f64() * 1e6
+}
 
-struct Stats { p50: f64, p95: f64, min: f64 }
+struct Stats {
+    p50: f64,
+    p95: f64,
+    min: f64,
+}
 
 fn measure(runs: Vec<Duration>) -> Stats {
     let mut sorted: Vec<f64> = runs.into_iter().map(|d| ms(d)).collect();
@@ -69,34 +141,98 @@ fn main() {
     let n: usize = 1_000_000;
 
     let ids: Vec<i64> = (0..n as i64).collect();
-    let cats: Vec<Vec<u8>> = (0..n).map(|i| match i % 4 { 0 => b"alpha".to_vec(), 1 => b"beta".to_vec(), 2 => b"gamma".to_vec(), _ => b"delta".to_vec() }).collect();
-    let statuses: Vec<Vec<u8>> = (0..n).map(|i| if i % 3 == 0 { b"active".to_vec() } else { b"inactive".to_vec() }).collect();
+    let cats: Vec<Vec<u8>> = (0..n)
+        .map(|i| match i % 4 {
+            0 => b"alpha".to_vec(),
+            1 => b"beta".to_vec(),
+            2 => b"gamma".to_vec(),
+            _ => b"delta".to_vec(),
+        })
+        .collect();
+    let statuses: Vec<Vec<u8>> = (0..n)
+        .map(|i| {
+            if i % 3 == 0 {
+                b"active".to_vec()
+            } else {
+                b"inactive".to_vec()
+            }
+        })
+        .collect();
     let amounts: Vec<f64> = (0..n).map(|i| 100.0 + (i as f64) * 0.1).collect();
     let timestamps: Vec<i64> = (0..n).map(|i| 1_700_000_000 + i as i64).collect();
     let user_ids: Vec<i64> = (0..n).map(|i| (i / 10) as i64).collect();
-    let regions: Vec<Vec<u8>> = (0..n).map(|i| match i % 5 { 0 => b"north".to_vec(), 1 => b"south".to_vec(), 2 => b"east".to_vec(), 3 => b"west".to_vec(), _ => b"central".to_vec() }).collect();
+    let regions: Vec<Vec<u8>> = (0..n)
+        .map(|i| match i % 5 {
+            0 => b"north".to_vec(),
+            1 => b"south".to_vec(),
+            2 => b"east".to_vec(),
+            3 => b"west".to_vec(),
+            _ => b"central".to_vec(),
+        })
+        .collect();
 
     let v = n / 8;
     let mut db = Table::create(dir.path().join("t"), schema(), 1).unwrap();
     db.bulk_load_columns(vec![
-        (1, NativeColumn::Int64 { data: ids, validity: vec![0xFF; v] }),
+        (
+            1,
+            NativeColumn::Int64 {
+                data: ids,
+                validity: vec![0xFF; v],
+            },
+        ),
         (2, mk_bytes_col(&cats)),
         (3, mk_bytes_col(&statuses)),
-        (4, NativeColumn::Float64 { data: amounts, validity: vec![0xFF; v] }),
-        (5, NativeColumn::Int64 { data: timestamps, validity: vec![0xFF; v] }),
-        (6, NativeColumn::Int64 { data: user_ids, validity: vec![0xFF; v] }),
+        (
+            4,
+            NativeColumn::Float64 {
+                data: amounts,
+                validity: vec![0xFF; v],
+            },
+        ),
+        (
+            5,
+            NativeColumn::Int64 {
+                data: timestamps,
+                validity: vec![0xFF; v],
+            },
+        ),
+        (
+            6,
+            NativeColumn::Int64 {
+                data: user_ids,
+                validity: vec![0xFF; v],
+            },
+        ),
         (7, mk_bytes_col(&regions)),
-    ]).unwrap();
+    ])
+    .unwrap();
     db.flush().unwrap();
 
     let udir = tempdir().unwrap();
     let mut users = Table::create(udir.path().join("u"), users_schema(), 2).unwrap();
     let u_ids: Vec<i64> = (0..100_000).map(|i| i as i64).collect();
-    let u_regions: Vec<Vec<u8>> = (0..100_000).map(|i| match i % 5 { 0 => b"north".to_vec(), 1 => b"south".to_vec(), 2 => b"east".to_vec(), 3 => b"west".to_vec(), _ => b"central".to_vec() }).collect();
-    users.bulk_load_columns(vec![
-        (1, NativeColumn::Int64 { data: u_ids, validity: vec![0xFF; 100_000 / 8] }),
-        (2, mk_bytes_col(&u_regions)),
-    ]).unwrap();
+    let u_regions: Vec<Vec<u8>> = (0..100_000)
+        .map(|i| match i % 5 {
+            0 => b"north".to_vec(),
+            1 => b"south".to_vec(),
+            2 => b"east".to_vec(),
+            3 => b"west".to_vec(),
+            _ => b"central".to_vec(),
+        })
+        .collect();
+    users
+        .bulk_load_columns(vec![
+            (
+                1,
+                NativeColumn::Int64 {
+                    data: u_ids,
+                    validity: vec![0xFF; 100_000 / 8],
+                },
+            ),
+            (2, mk_bytes_col(&u_regions)),
+        ])
+        .unwrap();
     users.flush().unwrap();
 
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -107,7 +243,9 @@ fn main() {
     });
 
     // Warmup
-    rt.block_on(async { let _ = session.run("SELECT count(*) FROM events").await; });
+    rt.block_on(async {
+        let _ = session.run("SELECT count(*) FROM events").await;
+    });
 
     let queries: Vec<(&str, &str)> = vec![
         ("warm_full_count",       "SELECT count(*) FROM events"),
@@ -149,9 +287,13 @@ fn main() {
         });
         let cs = measure(cold);
 
-        println!("│ {:<21} │ {:>13.1} │ {:>6.1} │ {:>6.1} │ {:>13.3} │ {:>6.1} │ {:>6.1} │",
-            name, ws.p50, ws.p95, ws.min, cs.p50, cs.p95, cs.min);
+        println!(
+            "│ {:<21} │ {:>13.1} │ {:>6.1} │ {:>6.1} │ {:>13.3} │ {:>6.1} │ {:>6.1} │",
+            name, ws.p50, ws.p95, ws.min, cs.p50, cs.p95, cs.min
+        );
     }
-    println!("└───────────────────────┴───────────────┴──────┴───────┴───────────────┴──────┴───────┘");
+    println!(
+        "└───────────────────────┴───────────────┴──────┴───────┴───────────────┴──────┴───────┘"
+    );
     println!("\n(all times in µs, 1M events + 100K users, warm = result-cache hit, cold = cache cleared)");
 }

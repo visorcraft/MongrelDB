@@ -195,6 +195,9 @@ fn native_aggregate_matches_expected() {
             .collect::<Vec<_>>(),
     )
     .unwrap();
+    // `aggregate_native` is a `&self` fast path: it declines (Ok(None)) while
+    // deferred indexes are incomplete, so build them before driving it.
+    db.ensure_indexes_complete().unwrap();
     let snap = db.snapshot();
 
     // Unfiltered: v = 0,2,4,...; sum = 2*(0+1+..+n-1) = (n-1)*n.

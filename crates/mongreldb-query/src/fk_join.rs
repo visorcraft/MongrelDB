@@ -138,6 +138,17 @@ pub(crate) fn try_fk_join(
         return Ok(None);
     }
 
+    // Every path below reads live indexes (`fk_join_count`/`fk_join_row_ids`
+    // intersect the FK bitmap; the broadcast path probes PK HOT). A deferred
+    // bulk load pays its one-time index build here before those `&Table`
+    // reads (Phase 14.7 lazy contract).
+    lock_db(&jc.pk_table, tables)
+        .ensure_indexes_complete()
+        .map_err(MongrelQueryError::Core)?;
+    lock_db(&jc.fk_table, tables)
+        .ensure_indexes_complete()
+        .map_err(MongrelQueryError::Core)?;
+
     // 5. Resolve the PK side survivor rows; collect their join-column values.
     //    Phase 17.2: broadcast join — when the PK side has no WHERE filter
     //    (would load the entire table) and the FK table has a bitmap index on

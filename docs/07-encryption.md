@@ -126,12 +126,14 @@ In practice, encryption adds less than 5% overhead to bulk operations:
 
 | Operation | Plain | Encrypted | Overhead |
 |---|---|---|---|
-| Bulk ingest (1M rows) | 194 ms | 149 ms | negligible |
-| Cold SQL filter | 7.2 ms | 7.7 ms | ~7% |
-| SQL join | 1.55 ms | 1.45 ms | negligible |
+| Bulk ingest (1M rows) | 76.6 ms | 78.1 ms | ~2% |
+| Cold SQL filter | 7.5 ms | 7.3 ms | negligible |
+| SQL join | 1.68 ms | 1.49 ms | negligible |
 
 (The encrypted path is sometimes faster due to differences in run layout —
-this is within measurement noise.)
+this is within measurement noise. Encrypted columns prune pages via a
+decrypted-at-open stats envelope, so filtered reads scan the same page count
+as plaintext.)
 
 ## Losing the Passphrase
 

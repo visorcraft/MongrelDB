@@ -1,13 +1,15 @@
 //! Phase 14.1/14.2 — typed bulk ingest (`bulk_load_columns`) must build the
 //! live secondary indexes straight from `NativeColumn`s (no per-row `Value`/
-//! `Row`/`HashMap`) and keep `indexes_complete` so the checkpoint is written and
-//! queries are served without a reopen-rebuild. Exercises PK/HOT, bitmap, FM,
-//! and sparse indexes through the typed path and a reopen round-trip.
+//! `Row`/`HashMap`). Under `IndexBuildPolicy::Eager` the indexes and checkpoint
+//! are built inside the load; under the default `Deferred` policy they complete
+//! lazily on the first query/flush (Phase 14.7). Exercises PK/HOT, bitmap, FM,
+//! and sparse indexes through the typed path, a reopen round-trip, and both
+//! policies.
 
 use mongreldb_core::columnar::NativeColumn;
 use mongreldb_core::query::{Condition, Query};
 use mongreldb_core::schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
-use mongreldb_core::{Table, Value};
+use mongreldb_core::{IndexBuildPolicy, Table, Value};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use tempfile::tempdir;
@@ -100,6 +102,7 @@ fn schema() -> Schema {
 fn typed_bulk_load_builds_all_indexes() {
     let dir = tempdir().unwrap();
     let mut db = Table::create(dir.path(), schema(), 1).unwrap();
+    db.set_index_build_policy(IndexBuildPolicy::Eager);
 
     let docs = [
         (0i64, "red", "the quick brown fox", "quick fox"),
@@ -190,13 +193,72 @@ fn typed_bulk_load_builds_all_indexes() {
     assert!(ids.contains(&0) && ids.contains(&2) && !ids.contains(&1));
 }
 
-/// The checkpoint written by `bulk_load_columns` reloads on reopen, so all
-/// indexes survive without a run scan.
+/// Default policy (`Deferred`): a fresh typed bulk load keeps the ingest
+/// critical path free of index building — indexes are incomplete right after
+/// the load, then complete lazily on the first query, which still answers
+/// correctly through every index kind.
+#[test]
+fn typed_bulk_load_defers_indexes_by_default() {
+    let dir = tempdir().unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
+    assert_eq!(db.index_build_policy(), IndexBuildPolicy::Deferred);
+
+    let id_col = NativeColumn::int64_sequence(0, 3);
+    let cat_col = bytes_column(&[b"red".to_vec(), b"blue".to_vec(), b"red".to_vec()]);
+    let text_col = bytes_column(&[
+        b"the quick brown fox".to_vec(),
+        b"the lazy dog".to_vec(),
+        b"quick fox".to_vec(),
+    ]);
+    let sparse_col = bytes_column(
+        &["quick fox", "lazy dog", "quick fox"]
+            .iter()
+            .map(|s| bincode::serialize(&tokenize(s)).unwrap())
+            .collect::<Vec<_>>(),
+    );
+    db.bulk_load_columns(vec![
+        (1, id_col),
+        (2, cat_col),
+        (3, text_col),
+        (4, sparse_col),
+    ])
+    .unwrap();
+
+    assert!(
+        !db.indexes_complete(),
+        "default bulk load must defer index building off the ingest path"
+    );
+    assert!(
+        !dir.path().join("_idx/global.idx").exists(),
+        "no index checkpoint may be written while indexes are incomplete"
+    );
+
+    // First query triggers the lazy rebuild (Phase 14.7) and serves correctly.
+    let q = Query::new().and(Condition::BitmapEq {
+        column_id: 2,
+        value: b"red".to_vec(),
+    });
+    assert_eq!(db.query(&q).unwrap().len(), 2);
+    assert!(
+        db.indexes_complete(),
+        "first query must complete the deferred indexes"
+    );
+    assert_eq!(
+        db.query(&Query::pk(0i64.to_be_bytes().to_vec()))
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+/// The checkpoint written by an `Eager` `bulk_load_columns` reloads on reopen,
+/// so all indexes survive without a run scan.
 #[test]
 fn typed_bulk_load_indexes_survive_reopen() {
     let dir = tempdir().unwrap();
     {
         let mut db = Table::create(dir.path(), schema(), 1).unwrap();
+        db.set_index_build_policy(IndexBuildPolicy::Eager);
         let id_col = NativeColumn::int64_sequence(0, 3);
         let cat_col = bytes_column(&[b"red".to_vec(), b"blue".to_vec(), b"red".to_vec()]);
         let text_col = bytes_column(&[

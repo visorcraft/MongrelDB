@@ -42,6 +42,7 @@ encryption = ["dep:aes-gcm", "dep:argon2", "dep:hkdf", "dep:hmac"]
 tempfile = "3"
 criterion = "0.5"
 bincode = "1"
+sha2 = "0.10"
 
 [[bench]]
 name = "write_path"

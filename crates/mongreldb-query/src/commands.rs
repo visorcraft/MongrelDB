@@ -1473,7 +1473,10 @@ fn pk_conflict_row(
         return Ok(None);
     }
     let handle = db.table(table)?;
-    let guard = handle.lock();
+    let mut guard = handle.lock();
+    // A deferred bulk load leaves HOT unbuilt; complete it before the point
+    // lookup (Phase 14.7 lazy contract).
+    guard.ensure_indexes_complete()?;
     let Some(row_id) = guard.lookup_pk(&value.encode_key()) else {
         return Ok(None);
     };

@@ -26,8 +26,31 @@ use std::sync::Arc;
 
 pub const RUN_MAGIC: [u8; 8] = *b"MONGRRUN";
 pub const RUN_FORMAT_VERSION: u16 = 1;
-pub const RUN_HEADER_VERSION: u16 = 1;
+/// v2 appends `encrypted_stats_offset`/`encrypted_stats_len` to [`RunHeader`].
+/// The fields are trailing and the header region is zero-padded, so a run
+/// written before v2 deserializes with both fields = 0 ("no encrypted stats
+/// section"). Pre-v2 *encrypted* runs are not readable (their MAC covers the
+/// shorter v1 header serialization) — recreate them; no released data exists.
+pub const RUN_HEADER_VERSION: u16 = 2;
 pub const RUN_HEADER_PAD: usize = 256;
+
+/// Reserved `(column_id, page_seq)` nonce coordinates for the encrypted
+/// page-stats envelope (see [`RunHeader::encrypted_stats_offset`]). Pages per
+/// column are capped strictly below `u16::MAX` at encode, so no page nonce can
+/// ever collide with this pair under the run's DEK.
+const ENC_STATS_NONCE_COLUMN: u16 = u16::MAX;
+const ENC_STATS_NONCE_SEQ: u32 = u16::MAX as u32;
+
+/// One page's `(min, max)` bounds as stored in the encrypted stats envelope.
+type PageMinMax = (Option<Vec<u8>>, Option<Vec<u8>>);
+
+/// Per-page `(min, max)` bounds of one encrypted column, keyed by column id —
+/// the plaintext shape of the encrypted stats envelope. The cleartext column
+/// directory must not carry these (they would leak values to anyone holding
+/// the file without the key), so they travel AES-256-GCM-encrypted under the
+/// run DEK and are overlaid onto the in-memory [`PageStat`]s at open, which
+/// restores zone-map page pruning for encrypted columns.
+type EncryptedColumnStats = Vec<(u16, Vec<PageMinMax>)>;
 
 /// AES-256-GCM authentication-tag length appended to every ciphertext. Used to
 /// precompute on-disk page sizes so the direct-to-mmap writer can lay the whole
@@ -111,6 +134,11 @@ pub struct RunHeader {
     pub index_trailer_offset: u64,
     pub encryption_descriptor_offset: u64,
     pub footer_offset: u64,
+    /// Offset/length of the AES-256-GCM-encrypted per-page min/max envelope
+    /// for encrypted columns (0/0 = absent; always 0 for plaintext runs and
+    /// pre-v2 files, whose zero header padding deserializes to 0 here).
+    pub encrypted_stats_offset: u64,
+    pub encrypted_stats_len: u64,
 }
 
 impl RunHeader {
@@ -302,6 +330,12 @@ struct RunPlan {
     encryption_descriptor_offset: u64,
     footer_offset: u64,
     total: usize,
+    /// Serialized (plaintext) [`EncryptedColumnStats`]; encrypted into the
+    /// stats section by the writer. `None` when the run is plaintext or no
+    /// encrypted column carries min/max.
+    encrypted_stats_plain: Option<Vec<u8>>,
+    encrypted_stats_offset: u64,
+    encrypted_stats_len: u64,
 }
 
 /// Compute the run layout: per-page offset + on-disk length, the filled column
@@ -316,18 +350,21 @@ fn plan_run(
     let columns = spec.columns;
     let mut jobs: Vec<(usize, usize, u64, usize)> = Vec::new();
     let mut dir: Vec<ColumnPageHeader> = Vec::with_capacity(columns.len());
+    let mut enc_stats: EncryptedColumnStats = Vec::new();
     let mut cursor: u64 = RUN_HEADER_PAD as u64;
     for (ci, col) in columns.iter().enumerate() {
         let region_offset = cursor;
         let mut region_len = 0u64;
         let mut stats = Vec::with_capacity(col.pages.len());
+        let mut col_minmax: Vec<PageMinMax> = Vec::new();
         for (ps, page) in col.pages.iter().enumerate() {
             // The per-page GCM nonce encodes page_seq in 2 bytes; refuse to
-            // silently truncate past 65 535 pages/column (4.29e9 rows), which
-            // would otherwise reuse a nonce under the run's DEK.
-            if encrypted && ps > u16::MAX as usize {
+            // silently truncate at 65 535 pages/column (4.29e9 rows), which
+            // would otherwise reuse a nonce under the run's DEK. Sequence
+            // 0xFFFF itself is reserved for the encrypted-stats envelope.
+            if encrypted && ps >= u16::MAX as usize {
                 return Err(MongrelError::Full(format!(
-                    "column {:#x} exceeds 65535 pages; encrypted-run page-seq nonce space exhausted",
+                    "column {:#x} exceeds 65534 pages; encrypted-run page-seq nonce space exhausted",
                     col.column_id
                 )));
             }
@@ -350,16 +387,21 @@ fn plan_run(
             // The column directory is serialized in cleartext, so per-page
             // min/max would leak raw plaintext values (literal bytes for `Bytes`
             // columns) of every encrypted page to anyone reading the file
-            // without the key. Drop them for encrypted runs — pruning falls back
-            // to a full decrypt-and-scan for these columns (see the range
-            // resolvers' `col_encrypted` guard).
+            // without the key. Move them out of the directory and into the
+            // DEK-encrypted stats envelope, which the reader overlays back at
+            // open — zone-map page pruning works identically to plaintext runs.
             if encrypted {
-                stat.min = None;
-                stat.max = None;
+                col_minmax.push((stat.min.take(), stat.max.take()));
             }
             stats.push(stat);
             cursor += odl as u64;
             region_len += odl as u64;
+        }
+        if col_minmax
+            .iter()
+            .any(|(mn, mx)| mn.is_some() || mx.is_some())
+        {
+            enc_stats.push((col.column_id, col_minmax));
         }
         let page_flags = if encrypted {
             ColumnPageHeader::PAGE_ENCRYPTED
@@ -396,6 +438,16 @@ fn plan_run(
         }
         None => 0,
     };
+    let (encrypted_stats_plain, encrypted_stats_offset, encrypted_stats_len) =
+        if encrypted && !enc_stats.is_empty() {
+            let plain = bincode::serialize(&enc_stats)?;
+            let ct_len = on_disk_len(plain.len(), true) as u64;
+            let off = cursor;
+            cursor += ct_len;
+            (Some(plain), off, ct_len)
+        } else {
+            (None, 0, 0)
+        };
     let footer_offset = cursor;
     // footer = MAGIC(8) + footer_offset(8) + checksum(32); encrypted runs append
     // a 32-byte HMAC tag (RUN_MAC_LEN) authenticating header+dir+descriptor.
@@ -409,6 +461,9 @@ fn plan_run(
         encryption_descriptor_offset,
         footer_offset,
         total,
+        encrypted_stats_plain,
+        encrypted_stats_offset,
+        encrypted_stats_len,
     })
 }
 
@@ -501,6 +556,13 @@ fn place_run(
         buf[off..off + 4].copy_from_slice(&(e.descriptor_bytes.len() as u32).to_le_bytes());
         buf[off + 4..off + 4 + e.descriptor_bytes.len()].copy_from_slice(&e.descriptor_bytes);
     }
+    if let (Some(e), Some(plain)) = (enc, plan.encrypted_stats_plain.as_ref()) {
+        let nonce = page_nonce(e.nonce_prefix, ENC_STATS_NONCE_COLUMN, ENC_STATS_NONCE_SEQ);
+        let ct = e.cipher.encrypt_page(&nonce, plain)?;
+        debug_assert_eq!(ct.len() as u64, plan.encrypted_stats_len);
+        let off = plan.encrypted_stats_offset as usize;
+        buf[off..off + ct.len()].copy_from_slice(&ct);
+    }
 
     // ---- header + footer ----
     let header_flags = if plan.encrypted {
@@ -527,6 +589,8 @@ fn place_run(
         index_trailer_offset: plan.index_trailer_offset,
         encryption_descriptor_offset: plan.encryption_descriptor_offset,
         footer_offset: plan.footer_offset,
+        encrypted_stats_offset: plan.encrypted_stats_offset,
+        encrypted_stats_len: plan.encrypted_stats_len,
     };
     let header_bytes = bincode::serialize(&header)?;
     if header_bytes.len() > RUN_HEADER_PAD {
@@ -560,15 +624,17 @@ fn write_run_vec(
     let mut buf: Vec<u8> = vec![0; RUN_HEADER_PAD]; // reserve header region
     let mut content_hasher = Sha256::new();
     let mut dir: Vec<ColumnPageHeader> = Vec::with_capacity(spec.columns.len());
+    let mut enc_stats: EncryptedColumnStats = Vec::new();
 
     for col in spec.columns {
         let region_offset = buf.len() as u64;
         let mut region_len = 0u64;
         let mut stats = Vec::with_capacity(col.pages.len());
+        let mut col_minmax: Vec<PageMinMax> = Vec::new();
         for (page_seq, page) in col.pages.iter().enumerate() {
-            if enc.is_some() && page_seq > u16::MAX as usize {
+            if enc.is_some() && page_seq >= u16::MAX as usize {
                 return Err(MongrelError::Full(format!(
-                    "column {:#x} exceeds 65535 pages; encrypted-run page-seq nonce space exhausted",
+                    "column {:#x} exceeds 65534 pages; encrypted-run page-seq nonce space exhausted",
                     col.column_id
                 )));
             }
@@ -602,13 +668,19 @@ fn write_run_vec(
             stat.compressed_len = on_disk.len() as u32;
             stat.uncompressed_len = page.len() as u32;
             // See plan_run: the cleartext directory must not carry plaintext
-            // min/max for encrypted columns. Keep this byte-identical to
-            // plan_run so both writers emit the same run.
+            // min/max for encrypted columns — they move into the encrypted
+            // stats envelope. Keep this byte-identical to plan_run so both
+            // writers emit the same run.
             if enc.is_some() {
-                stat.min = None;
-                stat.max = None;
+                col_minmax.push((stat.min.take(), stat.max.take()));
             }
             stats.push(stat);
+        }
+        if col_minmax
+            .iter()
+            .any(|(mn, mx)| mn.is_some() || mx.is_some())
+        {
+            enc_stats.push((col.column_id, col_minmax));
         }
         let page_flags = if enc.is_some() {
             ColumnPageHeader::PAGE_ENCRYPTED
@@ -648,6 +720,18 @@ fn write_run_vec(
         }
         None => 0,
     };
+    let (encrypted_stats_offset, encrypted_stats_len) = match &enc {
+        Some(e) if !enc_stats.is_empty() => {
+            let plain = bincode::serialize(&enc_stats)?;
+            let nonce = page_nonce(e.nonce_prefix, ENC_STATS_NONCE_COLUMN, ENC_STATS_NONCE_SEQ);
+            let ct = e.cipher.encrypt_page(&nonce, &plain)?;
+            let off = buf.len() as u64;
+            let len = ct.len() as u64;
+            buf.write_all(&ct)?;
+            (off, len)
+        }
+        _ => (0, 0),
+    };
     let footer_offset = buf.len() as u64;
 
     let header_flags = if enc.is_some() {
@@ -674,6 +758,8 @@ fn write_run_vec(
         index_trailer_offset,
         encryption_descriptor_offset,
         footer_offset,
+        encrypted_stats_offset,
+        encrypted_stats_len,
     };
     let header_bytes = bincode::serialize(&header)?;
     if header_bytes.len() > RUN_HEADER_PAD {
@@ -709,6 +795,39 @@ fn page_nonce(nonce_prefix: [u8; 12], column_id: u16, page_seq: u32) -> [u8; 12]
     n[8..10].copy_from_slice(&column_id.to_le_bytes());
     n[10..12].copy_from_slice(&(page_seq as u16).to_le_bytes());
     n
+}
+
+/// Decrypt the run's per-page min/max envelope ([`EncryptedColumnStats`]) and
+/// overlay the bounds onto the in-memory column directory, restoring zone-map
+/// page pruning for encrypted columns. Caller must have verified the run
+/// metadata MAC first (the envelope's offset/len live in the header); the
+/// envelope itself is AES-256-GCM-authenticated, so tampering fails loudly —
+/// the same posture as a tampered page payload.
+fn overlay_encrypted_stats(
+    path: &Path,
+    header: &RunHeader,
+    cipher: &dyn Cipher,
+    nonce_prefix: [u8; 12],
+    dir: &mut [ColumnPageHeader],
+) -> Result<()> {
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(header.encrypted_stats_offset))?;
+    let mut ct = vec![0u8; header.encrypted_stats_len as usize];
+    file.read_exact(&mut ct)?;
+    let nonce = page_nonce(nonce_prefix, ENC_STATS_NONCE_COLUMN, ENC_STATS_NONCE_SEQ);
+    let plain = cipher.decrypt_page(&nonce, &ct)?;
+    let stats: EncryptedColumnStats = bincode::deserialize(&plain)
+        .map_err(|e| MongrelError::Encryption(format!("bad encrypted page-stats envelope: {e}")))?;
+    for (cid, minmax) in stats {
+        let Some(col) = dir.iter_mut().find(|c| c.column_id == cid) else {
+            continue;
+        };
+        for (stat, (mn, mx)) in col.page_stats.iter_mut().zip(minmax) {
+            stat.min = mn;
+            stat.max = mx;
+        }
+    }
+    Ok(())
 }
 
 /// Stable content-address of an immutable run page (the cache key): SHA-256 of
@@ -1469,7 +1588,7 @@ impl RunReader {
     ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let header = read_header(&path)?;
-        let dir = read_column_dir(&path, &header)?;
+        let mut dir = read_column_dir(&path, &header)?;
         let learned = read_learned(&path, &header)?;
         // Unwrap this run's per-file DEK (stored wrapped in its Encryption
         // Descriptor) using the table KEK, then build the page cipher.
@@ -1492,6 +1611,18 @@ impl RunReader {
             // nor forge the tag without the key).
             verify_run_mac(&path, &header, &dir, kek, &desc_bytes)?;
             let enc = crate::encryption::build_run_cipher(kek, &desc_bytes)?;
+            // With the metadata authenticated, decrypt the per-page min/max
+            // envelope (v2 runs) and overlay it so zone-map pruning works on
+            // encrypted columns exactly as it does on plaintext ones.
+            if header.encrypted_stats_offset != 0 {
+                overlay_encrypted_stats(
+                    &path,
+                    &header,
+                    enc.cipher.as_ref(),
+                    enc.nonce_prefix,
+                    &mut dir,
+                )?;
+            }
             (Some(enc.cipher), enc.nonce_prefix)
         } else {
             (None, [0u8; 12])
@@ -2055,8 +2186,13 @@ impl RunReader {
                     .collect(),
                 None => return Ok(RowIdSet::empty()),
             };
-        // Encrypted columns have no cleartext stats — never prune, always scan.
-        let col_encrypted = self.col_encrypted(column_id);
+        // Encrypted columns are pruneable only when this run carries the
+        // decrypted stats envelope (overlaid at open). Without one (a run
+        // whose writer recorded no stats at all), a missing min/max means
+        // "unknown" — never prune — whereas with the envelope (and always for
+        // plaintext runs) a missing min/max means an all-null page.
+        let stats_pruneable =
+            !self.col_encrypted(column_id) || self.header.encrypted_stats_offset != 0;
         let clean_contiguous = self.clean_contiguous_row_ids();
         let mut out = Vec::new();
         let mut page_start = 0usize;
@@ -2064,7 +2200,7 @@ impl RunReader {
             let current_page_start = page_start;
             page_start += nrows;
             // Skip pages that cannot contain a match (or are all-null).
-            let skip = !col_encrypted
+            let skip = stats_pruneable
                 && match (mn, mx) {
                     (Some(mn), Some(mx)) => mx < lo || mn > hi,
                     _ => true,
@@ -2138,8 +2274,13 @@ impl RunReader {
                     .collect(),
                 None => return Ok(RowIdSet::empty()),
             };
-        // Encrypted columns have no cleartext stats — never prune, always scan.
-        let col_encrypted = self.col_encrypted(column_id);
+        // Encrypted columns are pruneable only when this run carries the
+        // decrypted stats envelope (overlaid at open). Without one (a run
+        // whose writer recorded no stats at all), a missing min/max means
+        // "unknown" — never prune — whereas with the envelope (and always for
+        // plaintext runs) a missing min/max means an all-null page.
+        let stats_pruneable =
+            !self.col_encrypted(column_id) || self.header.encrypted_stats_offset != 0;
         let clean_contiguous = self.clean_contiguous_row_ids();
         let mut out = Vec::new();
         let mut page_start = 0usize;
@@ -2148,7 +2289,7 @@ impl RunReader {
             page_start += nrows;
             // A page can be dropped iff every value fails the predicate, i.e. the
             // largest fails the lo-test or the smallest fails the hi-test.
-            let skip = !col_encrypted
+            let skip = stats_pruneable
                 && match (mn, mx) {
                     (Some(mn), Some(mx)) => {
                         let skip_lo = mx < lo || (!lo_inclusive && mx == lo);
@@ -2305,8 +2446,13 @@ impl RunReader {
                 .collect(),
             None => return Ok(Vec::new()),
         };
-        // Encrypted columns have no cleartext stats — never prune, always scan.
-        let col_encrypted = self.col_encrypted(column_id);
+        // Encrypted columns are pruneable only when this run carries the
+        // decrypted stats envelope (overlaid at open). Without one (a run
+        // whose writer recorded no stats at all), a missing min/max means
+        // "unknown" — never prune — whereas with the envelope (and always for
+        // plaintext runs) a missing min/max means an all-null page.
+        let stats_pruneable =
+            !self.col_encrypted(column_id) || self.header.encrypted_stats_offset != 0;
         let (positions, rids) = self.visible_positions_with_rids(snapshot)?;
         let mut out: Vec<u64> = Vec::new();
         let mut vis = 0usize;
@@ -2314,7 +2460,7 @@ impl RunReader {
         for (seq, &(mn, mx, nrows)) in stats.iter().enumerate() {
             let page_end = page_start + nrows;
             // A page can be dropped iff every value fails the predicate.
-            let skip = !col_encrypted
+            let skip = stats_pruneable
                 && match (mn, mx) {
                     (Some(mn), Some(mx)) => mx < lo || mn > hi,
                     _ => true, // all-null / no stats → nulls never match
@@ -2369,15 +2515,20 @@ impl RunReader {
                 .collect(),
             None => return Ok(Vec::new()),
         };
-        // Encrypted columns have no cleartext stats — never prune, always scan.
-        let col_encrypted = self.col_encrypted(column_id);
+        // Encrypted columns are pruneable only when this run carries the
+        // decrypted stats envelope (overlaid at open). Without one (a run
+        // whose writer recorded no stats at all), a missing min/max means
+        // "unknown" — never prune — whereas with the envelope (and always for
+        // plaintext runs) a missing min/max means an all-null page.
+        let stats_pruneable =
+            !self.col_encrypted(column_id) || self.header.encrypted_stats_offset != 0;
         let (positions, rids) = self.visible_positions_with_rids(snapshot)?;
         let mut out: Vec<u64> = Vec::new();
         let mut vis = 0usize;
         let mut page_start = 0usize;
         for (seq, &(mn, mx, nrows)) in stats.iter().enumerate() {
             let page_end = page_start + nrows;
-            let skip = !col_encrypted
+            let skip = stats_pruneable
                 && match (mn, mx) {
                     (Some(mn), Some(mx)) => {
                         let skip_lo = mx < lo || (!lo_inclusive && mx == lo);

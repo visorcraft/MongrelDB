@@ -80,6 +80,27 @@ fn resolve_auto_inc(schema: &Schema) -> Option<AutoIncState> {
     })
 }
 
+/// When a bulk load (`bulk_load` / `bulk_load_columns` / `bulk_load_fast`)
+/// builds the live in-memory indexes.
+///
+/// The engine is correct under either policy: with [`Self::Deferred`] the
+/// indexes are rebuilt lazily by the first `query`/`flush` (Phase 14.7,
+/// `ensure_indexes_complete`), with [`Self::Eager`] they are built — and
+/// checkpointed to `_idx/global.idx` — inside the bulk load itself. The trade
+/// is *where* the build cost lands: `Deferred` keeps the ingest critical path
+/// minimal (write the run, persist the manifest, return); `Eager` gives
+/// predictable first-query latency at the price of a slower load. Serving
+/// deployments that load then immediately serve point queries (e.g. a warm
+/// daemon) may prefer `Eager`; batch/ETL ingest wants `Deferred`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IndexBuildPolicy {
+    /// Defer index building to the first query/flush — fastest ingest (default).
+    #[default]
+    Deferred,
+    /// Build and checkpoint indexes inside the bulk load — fastest first query.
+    Eager,
+}
+
 /// An open MongrelDB table.
 pub struct Table {
     dir: PathBuf,
@@ -157,6 +178,15 @@ pub struct Table {
     /// flush in that state must NOT checkpoint; reopen rebuilds complete indexes
     /// from the runs and resets this to true.
     indexes_complete: bool,
+    /// Where bulk loads put the index-build cost (see [`IndexBuildPolicy`]).
+    index_build_policy: IndexBuildPolicy,
+    /// False when `pk_by_row` may be missing entries for rows present in
+    /// `hot`. Fresh tables start false and puts skip the reverse map — pure
+    /// ingest never pays for it. The first delete that needs it rebuilds it
+    /// from `hot` (the same lazy pattern as `ensure_indexes_complete`), after
+    /// which puts maintain it incrementally so a delete-active workload pays
+    /// the build exactly once.
+    pk_by_row_complete: bool,
     /// Highest epoch whose data is durable in a sorted run (spec §7.1). Recovery
     /// skips replaying WAL records whose commit epoch is `<= flushed_epoch`.
     flushed_epoch: u64,
@@ -945,6 +975,8 @@ impl Table {
             agg_cache: HashMap::new(),
             global_idx_epoch: 0,
             indexes_complete: true,
+            index_build_policy: IndexBuildPolicy::default(),
+            pk_by_row_complete: false,
             flushed_epoch: 0,
             page_cache: ctx.page_cache,
             decoded_cache: ctx.decoded_cache,
@@ -1155,6 +1187,8 @@ impl Table {
             agg_cache: HashMap::new(),
             global_idx_epoch: manifest.global_idx_epoch,
             indexes_complete: true,
+            index_build_policy: IndexBuildPolicy::default(),
+            pk_by_row_complete: false,
             flushed_epoch: manifest.flushed_epoch,
             page_cache: ctx.page_cache,
             decoded_cache: ctx.decoded_cache,
@@ -1201,7 +1235,8 @@ impl Table {
                 db.sparse = loaded.sparse;
                 db.minhash = loaded.minhash;
                 db.learned_range = loaded.learned_range;
-                db.refresh_pk_by_row_from_hot();
+                // `pk_by_row` stays lazy (`pk_by_row_complete == false`): the
+                // first delete rebuilds it from the loaded HOT.
             }
         }
         if !checkpoint_valid {
@@ -1317,6 +1352,7 @@ impl Table {
 
     fn refresh_pk_by_row_from_hot(&mut self) {
         self.pk_by_row.clear();
+        self.pk_by_row_complete = true;
         if self.schema.primary_key().is_none() {
             return;
         }
@@ -1395,9 +1431,12 @@ impl Table {
     }
 
     /// Phase 14.7: if the live indexes are known incomplete (after a bulk
-    /// ingest that deferred index building), rebuild them from the runs now.
-    /// Called lazily by `query` / `query_columns_native` / `flush`.
-    fn ensure_indexes_complete(&mut self) -> Result<()> {
+    /// ingest that deferred index building — see [`IndexBuildPolicy`]),
+    /// rebuild them from the runs now. Called lazily by `query` /
+    /// `query_columns_native` / `flush`; public so external index consumers
+    /// (SQL scans, joins, PK point lookups on a shared handle) can pay the
+    /// one-time build before reading a `&self` index view.
+    pub fn ensure_indexes_complete(&mut self) -> Result<()> {
         if self.indexes_complete {
             crate::trace::QueryTrace::record(|t| {
                 t.index_rebuild = crate::trace::IndexRebuild::AlreadyComplete;
@@ -1480,11 +1519,7 @@ impl Table {
         mut columns: Vec<(u16, Value)>,
     ) -> Result<(RowId, Option<i64>)> {
         let assigned = self.fill_auto_inc(&mut columns)?;
-        let mut col_map = std::collections::HashMap::with_capacity(columns.len());
-        for (c, v) in &columns {
-            col_map.insert(*c, v.clone());
-        }
-        self.schema.validate_not_null(&col_map)?;
+        self.schema.validate_not_null(&columns)?;
         let row_id = self.allocator.alloc();
         let epoch = self.pending_epoch();
         let mut row = Row::new(row_id, epoch);
@@ -1517,11 +1552,7 @@ impl Table {
             filled.push((cols, assigned));
         }
         for (cols, _) in &filled {
-            let mut col_map = std::collections::HashMap::with_capacity(cols.len());
-            for (c, v) in cols {
-                col_map.insert(*c, v.clone());
-            }
-            self.schema.validate_not_null(&col_map)?;
+            self.schema.validate_not_null(cols)?;
         }
         let epoch = self.pending_epoch();
         let mut rows = Vec::with_capacity(filled.len());
@@ -1854,51 +1885,112 @@ impl Table {
         if check_existing_pk {
             self.ensure_indexes_complete()?;
         }
-        let n = rows.len();
-        // Track mutated columns for fine-grained cache invalidation (c).
-        for r in &rows {
+        // Single-row puts — the hot operational path — cannot contain an
+        // intra-batch duplicate, so the winner/loser partition maps are pure
+        // overhead. Same semantics as the batch path below with `losers = ∅`.
+        if rows.len() == 1 {
+            let row = rows.into_iter().next().expect("len checked");
+            return self.apply_put_row_single(row, check_existing_pk);
+        }
+        // One pass per row: track mutated columns, tombstone the previous
+        // owner of the row's PK, index (which places the HOT entry), sample,
+        // and materialize. Each row is applied completely — including its
+        // memtable upsert — before the next row processes, so "the last row
+        // wins" falls out naturally for an intra-batch duplicate PK: the
+        // earlier row is already materialized and gets tombstoned like any
+        // other displaced owner (same visible state as pre-partitioning the
+        // batch into winners and losers, without materializing a winner map
+        // over the whole batch).
+        //
+        // Upsert probing is skipped entirely when no PK owner can be
+        // displaced: `check_existing_pk == false` means every PK is a fresh
+        // engine-assigned AUTO_INCREMENT value; an empty HOT index plus
+        // strictly-increasing batch PKs (the append-style batch, mirroring
+        // `bulk_pk_winner_indices`' fast path) rules out both pre-existing
+        // owners and intra-batch duplicates.
+        let pk_id = self.schema.primary_key().map(|c| c.id);
+        let probe = match pk_id {
+            Some(pid) => {
+                check_existing_pk
+                    && !(self.hot.is_empty() && rows_pk_strictly_increasing(&rows, pid))
+            }
+            None => false,
+        };
+        // The PK reverse map is maintained inline only once a delete has built
+        // it (`pk_by_row_complete`); ingest-only tables never pay for it.
+        let maintain_pk_by_row = pk_id.is_some() && self.pk_by_row_complete;
+        for r in rows {
             for &cid in r.columns.keys() {
                 self.pending_put_cols.insert(cid);
             }
+            match pk_id {
+                Some(pid) if probe || maintain_pk_by_row => {
+                    if let Some(pk_val) = r.columns.get(&pid) {
+                        let key = self.index_lookup_key(pid, pk_val);
+                        if probe {
+                            if let Some(old_rid) = self.hot.get(&key) {
+                                if old_rid != r.row_id {
+                                    self.tombstone_row(old_rid, r.committed_epoch, true);
+                                }
+                            }
+                        }
+                        if maintain_pk_by_row {
+                            self.pk_by_row.insert(r.row_id, key);
+                        }
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    self.hot.insert(r.row_id.0.to_be_bytes().to_vec(), r.row_id);
+                }
+            }
+            self.index_row(&r);
+            self.reservoir.offer(r.row_id.0);
+            self.memtable.upsert(r);
+            // Count as each row lands so a later duplicate's tombstone
+            // decrement (in `tombstone_row`) sees an up-to-date value.
+            self.live_count = self.live_count.saturating_add(1);
         }
-        let (losers, winner_pks) = self.partition_pk_winners(&rows);
-        let epoch = rows.first().map(|r| r.committed_epoch).unwrap_or(Epoch(0));
-        // Tombstone any pre-existing row that owns the same PK as a winner.
-        if check_existing_pk {
-            for (key, &row_id) in &winner_pks {
-                if let Some(old_rid) = self.hot.get(key) {
-                    if old_rid != row_id {
-                        self.tombstone_row(old_rid, epoch, true);
+        Ok(())
+    }
+
+    /// One-row specialization of [`Table::apply_put_rows_inner`]: identical
+    /// upsert semantics (tombstone the previous PK owner, insert into HOT,
+    /// index, sample, materialize) without the per-batch winner/loser maps.
+    fn apply_put_row_single(&mut self, row: Row, check_existing_pk: bool) -> Result<()> {
+        for &cid in row.columns.keys() {
+            self.pending_put_cols.insert(cid);
+        }
+        let epoch = row.committed_epoch;
+        if let Some(pk_col) = self.schema.primary_key() {
+            let pk_id = pk_col.id;
+            if let Some(pk_val) = row.columns.get(&pk_id) {
+                // `index_row` below writes the HOT entry (`index_into` covers
+                // the PK). The reverse map is maintained inline only once a
+                // delete has built it; ingest-only tables never pay for it.
+                let maintain_pk_by_row = self.pk_by_row_complete;
+                if check_existing_pk || maintain_pk_by_row {
+                    let key = self.index_lookup_key(pk_id, pk_val);
+                    if check_existing_pk {
+                        if let Some(old_rid) = self.hot.get(&key) {
+                            if old_rid != row.row_id {
+                                self.tombstone_row(old_rid, epoch, true);
+                            }
+                        }
+                    }
+                    if maintain_pk_by_row {
+                        self.pk_by_row.insert(row.row_id, key);
                     }
                 }
             }
+        } else {
+            self.hot
+                .insert(row.row_id.0.to_be_bytes().to_vec(), row.row_id);
         }
-        // Insert the winners into HOT.
-        for (key, row_id) in winner_pks {
-            self.insert_hot_pk(key, row_id);
-        }
-        if self.schema.primary_key().is_none() {
-            for r in &rows {
-                self.hot.insert(r.row_id.0.to_be_bytes().to_vec(), r.row_id);
-            }
-        }
-        // Index, sample, and materialize only the surviving rows.
-        for r in &rows {
-            if !losers.contains(&r.row_id) {
-                self.index_row(r);
-            }
-        }
-        for r in &rows {
-            if !losers.contains(&r.row_id) {
-                self.reservoir.offer(r.row_id.0);
-            }
-        }
-        for r in rows {
-            if !losers.contains(&r.row_id) {
-                self.memtable.upsert(r);
-            }
-        }
-        self.live_count = self.live_count.saturating_add((n - losers.len()) as u64);
+        self.index_row(&row);
+        self.reservoir.offer(row.row_id.0);
+        self.memtable.upsert(row);
+        self.live_count = self.live_count.saturating_add(1);
         Ok(())
     }
 
@@ -2031,11 +2123,7 @@ impl Table {
 
     /// Validate that `cells` satisfy the schema's NOT NULL constraints.
     pub(crate) fn validate_cells_not_null(&self, cells: &[(u16, Value)]) -> Result<()> {
-        let mut col_map = std::collections::HashMap::with_capacity(cells.len());
-        for (c, v) in cells {
-            col_map.insert(*c, v.clone());
-        }
-        self.schema.validate_not_null(&col_map)
+        self.schema.validate_not_null(cells)
     }
 
     /// Column-major NOT NULL validation for the bulk-load paths. Every schema
@@ -2165,6 +2253,7 @@ impl Table {
         self.minhash = minhash;
         self.learned_range.clear();
         self.pk_by_row.clear();
+        self.pk_by_row_complete = false;
         self.live_count = 0;
         self.reservoir = crate::reservoir::Reservoir::default();
         self.had_deletes = true;
@@ -2215,6 +2304,11 @@ impl Table {
     /// that PK to this row id, remove the entry. Keeps the PK→RowId mapping
     /// consistent after deletes and before upserts.
     fn remove_hot_for_row(&mut self, row_id: RowId, epoch: Epoch) {
+        // Puts leave the reverse map stale to stay off the hot write path;
+        // the first delete that needs it pays one rebuild from `hot`.
+        if !self.pk_by_row_complete {
+            self.refresh_pk_by_row_from_hot();
+        }
         let Some(pk_col) = self.schema.primary_key() else {
             return;
         };
@@ -2290,6 +2384,22 @@ impl Table {
 
     fn index_row(&mut self, row: &Row) {
         if row.deleted {
+            return;
+        }
+        // Plaintext tables index the row as-is; only ENCRYPTED_INDEXABLE
+        // columns need the tokenized copy (`tokenized_for_indexes` clones the
+        // whole row, which would tax every put on unencrypted tables).
+        if self.column_keys.is_empty() {
+            index_into(
+                &self.schema,
+                row,
+                &mut self.hot,
+                &mut self.bitmap,
+                &mut self.ann,
+                &mut self.fm,
+                &mut self.sparse,
+                &mut self.minhash,
+            );
             return;
         }
         let effective_row = self.tokenized_for_indexes(row);
@@ -2595,7 +2705,8 @@ impl Table {
         // marker + rotates the WAL below, which is only safe once all in-flight
         // data is durably in a run.
         self.spill_mutable_run(epoch)?;
-        let eager_index_build = self.indexes_complete
+        let eager_index_build = self.index_build_policy == IndexBuildPolicy::Eager
+            && self.indexes_complete
             && self.run_refs.is_empty()
             && self.memtable.is_empty()
             && self.mutable_run.is_empty();
@@ -2606,27 +2717,13 @@ impl Table {
         // `Row { HashMap }` + `index_into` + the sequential `Value` writer.
         let mut user_columns: Vec<(u16, columnar::NativeColumn)> = {
             use rayon::prelude::*;
-            use std::collections::HashMap;
-            let mut by_col: HashMap<u16, Vec<Value>> = HashMap::new();
-            for cdef in &self.schema.columns {
-                by_col.insert(cdef.id, vec![Value::Null; n]);
-            }
-            for (i, row) in batch.iter().enumerate() {
-                for (id, v) in row {
-                    if let Some(col) = by_col.get_mut(id) {
-                        col[i] = v.clone();
-                    }
-                }
-            }
             self.schema
                 .columns
                 .par_iter()
-                .map(|cdef| {
-                    let vals = by_col.get(&cdef.id).map(|v| v.as_slice()).unwrap_or(&[]);
-                    (cdef.id, columnar::values_to_native(cdef.ty, vals))
-                })
+                .map(|cdef| (cdef.id, columnar::rows_to_native(cdef.ty, &batch, cdef.id)))
                 .collect::<Vec<_>>()
         };
+        drop(batch);
         // Enforce NOT NULL constraints and primary-key upsert semantics before
         // any row id is allocated or bytes hit the run file. Losers of a
         // duplicate primary key are dropped from the encoded run entirely so
@@ -3040,11 +3137,29 @@ impl Table {
         self.indexes_complete
     }
 
+    /// Where bulk loads put the index-build cost (see [`IndexBuildPolicy`]).
+    pub fn index_build_policy(&self) -> IndexBuildPolicy {
+        self.index_build_policy
+    }
+
+    /// Set the bulk-load index-build policy. Takes effect on the next
+    /// `bulk_load` / `bulk_load_columns` / `bulk_load_fast`; never changes
+    /// already-built indexes.
+    pub fn set_index_build_policy(&mut self, policy: IndexBuildPolicy) {
+        self.index_build_policy = policy;
+    }
+
     /// Phase 17.2: broadcast join — return the distinct values in this table's
     /// bitmap index for `column_id` that also exist as a key in `pk_db`'s HOT
     /// index. Avoids loading the entire PK table when the FK column has low
     /// cardinality. Returns `None` if no bitmap index exists for the column.
     pub fn broadcast_join_values(&self, column_id: u16, pk_db: &Table) -> Option<Vec<Vec<u8>>> {
+        // A deferred bulk load leaves the bitmap unbuilt — its (empty) key set
+        // would silently produce an empty join. Decline; the caller falls back
+        // to the PK-side query path, which completes indexes lazily.
+        if !self.indexes_complete {
+            return None;
+        }
         let b = self.bitmap.get(&column_id)?;
         let result: Vec<Vec<u8>> = b
             .keys()
@@ -3612,7 +3727,9 @@ impl Table {
     /// compressed run (delta for sorted Int64, dictionary for low-card Bytes)
     /// with **LZ4** (Phase 15.3 — fast decode for scan-heavy analytical runs),
     /// rotates the WAL, and persists the manifest in a single fsync group.
-    /// Indexes are bulk-built from the typed columns (Phase 14.2).
+    /// Index building follows [`Table::index_build_policy`]: deferred to the
+    /// first query/flush by default, or bulk-built inline from the typed
+    /// columns (Phase 14.2) under [`IndexBuildPolicy::Eager`].
     pub fn bulk_load_columns(
         &mut self,
         user_columns: Vec<(u16, columnar::NativeColumn)>,
@@ -3648,7 +3765,8 @@ impl Table {
         let live_before = self.live_count;
         // Spill pending mutable-run data before the Flush marker + WAL rotation.
         self.spill_mutable_run(epoch)?;
-        let eager_index_build = self.indexes_complete
+        let eager_index_build = self.index_build_policy == IndexBuildPolicy::Eager
+            && self.indexes_complete
             && self.run_refs.is_empty()
             && self.memtable.is_empty()
             && self.mutable_run.is_empty();
@@ -4393,6 +4511,11 @@ impl Table {
         conditions: &[crate::query::Condition],
     ) -> Result<Option<NativePageCursor>> {
         use crate::cursor::build_page_plans;
+        // See `scan_cursor`: incomplete (deferred) indexes cannot resolve
+        // conditions — signal "can't serve" instead of empty survivor sets.
+        if !conditions.is_empty() && !self.indexes_complete {
+            return Ok(None);
+        }
         if self.run_refs.len() != 1 {
             return Ok(None);
         }
@@ -4511,6 +4634,11 @@ impl Table {
         use crate::cursor::{MultiRunCursor, RunStream};
         use crate::sorted_run::SYS_ROW_ID;
         use std::collections::{BinaryHeap, HashMap, HashSet};
+        // See `scan_cursor`: incomplete (deferred) indexes cannot resolve
+        // conditions — signal "can't serve" instead of empty survivor sets.
+        if !conditions.is_empty() && !self.indexes_complete {
+            return Ok(None);
+        }
         if self.run_refs.is_empty() {
             return Ok(None);
         }
@@ -4982,6 +5110,14 @@ impl Table {
         projection: Vec<(u16, TypeId)>,
         conditions: &[crate::query::Condition],
     ) -> Result<Option<Box<dyn crate::cursor::Cursor>>> {
+        // A deferred bulk load leaves the live indexes unbuilt; resolving
+        // conditions against them would return silently-empty survivor sets.
+        // Signal "can't serve" so the caller falls back to a `&mut` path that
+        // runs `ensure_indexes_complete`. (Condition-free scans don't touch
+        // the indexes and stay served.)
+        if !conditions.is_empty() && !self.indexes_complete {
+            return Ok(None);
+        }
         if self.run_refs.len() == 1 {
             Ok(self
                 .native_page_cursor(snapshot, projection, conditions)?
@@ -5105,10 +5241,13 @@ impl Table {
     /// `COUNT(DISTINCT)`, so a null key (from an explicit `Value::Null` put) is
     /// discounted. Returns `None` (caller scans) without a bitmap index on the
     /// column or when the invariant does not hold.
-    pub fn count_distinct_from_bitmap(&self, column_id: u16) -> Result<Option<u64>> {
+    pub fn count_distinct_from_bitmap(&mut self, column_id: u16) -> Result<Option<u64>> {
         if !(self.memtable.is_empty() && self.mutable_run.is_empty() && self.run_refs.len() == 1) {
             return Ok(None);
         }
+        // A deferred bulk load leaves the bitmap unbuilt; complete it before
+        // trusting its key count (same lazy contract as `query`/`flush`).
+        self.ensure_indexes_complete()?;
         let reader = self.open_reader(self.run_refs[0].run_id)?;
         if self.live_count != reader.row_count() as u64 {
             return Ok(None);
@@ -6531,6 +6670,27 @@ fn storage_compatible_type_change(old: TypeId, new: TypeId) -> bool {
         (old, new),
         (TypeId::Int64, TypeId::TimestampNanos) | (TypeId::TimestampNanos, TypeId::Int64)
     )
+}
+
+/// True when every row carries an `Int64` PK value and the sequence is
+/// strictly increasing — no intra-batch duplicate is possible. The row-major
+/// mirror of `native_int64_strictly_increasing` (the `bulk_pk_winner_indices`
+/// fast path), used by `apply_put_rows_inner` to skip upsert probing for
+/// append-style batches.
+fn rows_pk_strictly_increasing(rows: &[Row], pk_id: u16) -> bool {
+    let mut prev: Option<i64> = None;
+    for r in rows {
+        match r.columns.get(&pk_id) {
+            Some(Value::Int64(v)) => {
+                if prev.is_some_and(|p| p >= *v) {
+                    return false;
+                }
+                prev = Some(*v);
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -840,7 +840,13 @@ fn execute_kit_txn(state: &AppState, req: &KitTxnRequest) -> Result<KitTxnRespon
                 }
                 Action::DeleteByPk { table, key } => {
                     let handle = db.table(table)?;
-                    let rid = handle.lock().lookup_pk(&key.encode_key());
+                    let rid = {
+                        let mut guard = handle.lock();
+                        // A deferred bulk load leaves HOT unbuilt; complete it
+                        // before the point lookup (Phase 14.7 lazy contract).
+                        guard.ensure_indexes_complete()?;
+                        guard.lookup_pk(&key.encode_key())
+                    };
                     match rid {
                         Some(r) => {
                             t.delete(table, r)?;

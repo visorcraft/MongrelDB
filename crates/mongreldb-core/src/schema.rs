@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 use crate::constraint::TableConstraints;
 use crate::error::{MongrelError, Result};
@@ -198,7 +197,10 @@ impl Schema {
     /// missing from `columns` or present as `Value::Null`. A column carrying
     /// [`ColumnFlags::AUTO_INCREMENT`] is exempt when omitted/`Null` because the
     /// engine fills it in before this check runs.
-    pub fn validate_not_null(&self, columns: &HashMap<u16, Value>) -> Result<()> {
+    pub fn validate_not_null(&self, columns: &[(u16, Value)]) -> Result<()> {
+        // Rows are short sparse `(id, value)` lists; a linear probe beats
+        // materializing a HashMap (and cloning every Value) per row.
+        let at = |id: u16| columns.iter().find(|(c, _)| *c == id).map(|(_, v)| v);
         for col in &self.columns {
             if col.flags.contains(ColumnFlags::NULLABLE) {
                 continue;
@@ -206,12 +208,12 @@ impl Schema {
             // The engine supplies the AUTO_INCREMENT value, so its absence is
             // legal at this layer (filled in upstream of validation).
             if col.flags.contains(ColumnFlags::AUTO_INCREMENT) {
-                match columns.get(&col.id) {
+                match at(col.id) {
                     None | Some(Value::Null) => continue,
                     Some(_) => {}
                 }
             }
-            match columns.get(&col.id) {
+            match at(col.id) {
                 None => {
                     return Err(MongrelError::InvalidArgument(format!(
                         "column '{}' ({}) is NOT NULL but was omitted",
@@ -411,8 +413,7 @@ mod tests {
             constraints: Default::default(),
         };
         // Omitting the auto-inc column must not trip NOT NULL.
-        let mut cols = HashMap::new();
-        cols.insert(1u16, Value::Bytes(b"x".to_vec()));
+        let cols = vec![(1u16, Value::Bytes(b"x".to_vec()))];
         assert!(s.validate_not_null(&cols).is_ok());
     }
 }

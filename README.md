@@ -7,7 +7,7 @@
 <p align="center">
   <b>A log-structured columnar database for sub-millisecond writes, learned indexes, and AI-native access.</b>
   <br />
-  Custom <code>.sr</code> columnar format · Bε-tree memtable · WAL with group commit · seven index types · hybrid pushdown · MVCC snapshots · page-level encryption · DataFusion SQL · NAPI addon
+  Custom <code>.sr</code> columnar format · Bε-tree memtable · WAL with group commit · eight index kinds · hybrid pushdown · MVCC snapshots · page-level encryption · declarative constraints · DataFusion SQL · NAPI addon
 </p>
 
 <p align="center">
@@ -31,8 +31,8 @@ The write path is an LSM/Bε-tree: an append-only WAL with group commit feeds a
 Bε-tree memtable keyed by `(RowId, Epoch)`, which flushes to immutable sorted
 runs (`.sr` PAX columnar pages). Single-row durable update: **~6 µs**.
 
-The read path merges memtable + sorted runs under MVCC snapshot isolation. Seven
-index types — all resolving through a shared `RowId` space — enable hybrid
+The read path merges memtable + sorted runs under MVCC snapshot isolation. Eight
+index kinds — all resolving through a shared `RowId` space — enable hybrid
 queries that no single traditional index can serve:
 
 | Index | Type | Use case |
@@ -44,6 +44,7 @@ queries that no single traditional index can serve:
 | **HNSW** | Hierarchical navigable small world | Approximate nearest neighbor (recall@10 ≥ 0.90) |
 | **PMA** | Packed memory array | Cache-oblivious mutable sorted runs |
 | **Sparse** | Inverted token lists | SPLADE-style learned-sparse retrieval (top-k by sparse dot product) |
+| **MinHash** | LSH set-similarity | AI dedup/join primitives |
 
 ## Performance profile
 
@@ -51,27 +52,28 @@ Measured on 1M rows, dev sandbox (full results in [`BENCHMARKS.md`](BENCHMARKS.m
 
 | Metric | Value |
 |---|---:|
-| Single-row durable write (`put` + `commit`) | **6.7 µs** |
-| Single-row durable update | **6.1 µs** |
-| `put` (no fsync) | **601 ns** |
-| `commit` (fsync, group commit) | **5.77 µs** |
-| Bulk ingest (typed `bulk_load_columns`) | **26.2 Melem/s** (38 ms) |
-| Bulk ingest (Value API `bulk_load`) | **7.3 Melem/s** (136 ms) |
-| Full columnar scan (LE native-endian) | **11.9 Melem/s** (84 ms) |
-| Full scan (all columns) | **14.1 Melem/s** (71 ms) |
-| Bitmap-equality pushdown | **64.8 Melem/s** (15.4 ms) |
-| Range pushdown (PGM learned index) | **65.9 Melem/s** (15.2 ms) |
-| 1-column projection pushdown | **82.8 Melem/s** (12.1 ms) |
-| Cold SQL filter (`WHERE cost < 250`) | **7.1 ms** |
-| Cold SQL `COUNT(*)` | **257 µs** |
-| Cold SQL join `COUNT(*)` | **1.48 ms** |
+| Single-row durable write (`put` + `commit`) | **7.7 µs** |
+| Single-row durable update | **7.4 µs** |
+| `put` (no fsync) | **580 ns** |
+| `commit` (fsync, group commit) | **5.9 µs** |
+| Bulk ingest (typed `bulk_load_columns`) | **25.7 Melem/s** (38.8 ms) |
+| Bulk ingest (Value API `bulk_load`) | **12.1 Melem/s** (82.4 ms) |
+| Full columnar scan (LE native-endian) | **12.3 Melem/s** (81.5 ms) |
+| Full scan (all columns) | **14.3 Melem/s** (70.1 ms) |
+| Bitmap-equality pushdown | **109.6 Melem/s** (9.1 ms) |
+| Range pushdown (PGM learned index) | **107.5 Melem/s** (9.3 ms) |
+| 1-column projection pushdown | **176.3 Melem/s** (5.7 ms) |
+| Cold SQL filter (`WHERE cost < 250`) | **8.0 ms** |
+| Cold SQL `COUNT(*)` | **255 µs** |
+| Cold SQL join `COUNT(*)` | **1.53 ms** |
 | Warm result-cache hit (any query) | **0.1–0.3 µs** |
-| Storage | **4.17 bytes/row** (3.98 MB / 1M rows) |
+| Storage | **4.17 bytes/row** (4.17 MB / 1M rows) |
 | `COUNT(*)` metadata | **0 µs** (O(1)) |
-| AES-256-GCM encrypt/decrypt | **~1.87 GiB/s** |
+| AES-256-GCM encrypt/decrypt | **~1.88 GiB/s** |
 
-**Cross-engine (1M rows):** single-row writes **2× faster than SQLite, 40× faster than DuckDB**.
-Join `COUNT(*)` **3× faster than DuckDB, 15× faster than SQLite**.
+**Cross-engine (1M rows):** single-row writes **2× faster than SQLite, 39× faster than DuckDB**.
+Bulk insert **2.7× faster than SQLite, 3.9× faster than DuckDB native**. Join
+`COUNT(*)` **2.6× faster than DuckDB, 15× faster than SQLite**.
 
 ## Architecture
 
@@ -94,8 +96,14 @@ Join `COUNT(*)` **3× faster than DuckDB, 15× faster than SQLite**.
 - **Page index:** columns are split into 65 536-row pages with populated
   `PageStat` min/max; the reader skips pages whose `[min,max]` excludes the
   predicate during filtered scans (Parquet-style pruning). Encrypted columns
-  omit plaintext min/max (it would leak values) and fall back to a full scan.
-- **Multi-table:** distinct tables register on one DataFusion context for joins.
+  keep their min/max out of the cleartext directory (it would leak values);
+  the bounds travel in a per-run AES-256-GCM stats envelope decrypted once at
+  open, so encrypted columns prune identically to plaintext ones.
+- **Multi-table:** a `Database` hosts many named tables under a shared WAL;
+  distinct tables register on one DataFusion context for joins.
+- **Constraints:** opt-in per-table declarative unique, foreign-key (with
+  `RESTRICT`/`CASCADE`/`SET NULL` on delete), and CHECK constraints, enforced
+  inside the core transaction path — no application-side validation required.
 - **Arrow bridge:** Constructs `Int64Array`/`Float64Array` directly from typed
   buffers (one memcpy, no per-element builder) for the all-non-null case.
 - **Compaction:** Merges sorted runs with snapshot retention (readers pinning
@@ -111,9 +119,10 @@ Join `COUNT(*)` **3× faster than DuckDB, 15× faster than SQLite**.
   subsequent scans.
 - **Schema evolution:** `add_column` adds a nullable column; old runs read it
   as null.
-- **Daemon:** Optional `mongreldb-server` HTTP daemon (axum/tokio) keeps the
-  `Db` warm for multi-process access. `mongreldb-client` + NAPI
-  `RemoteDatabase` connect to it.
+- **Daemon:** Optional `mongreldb-server` HTTP daemon (axum/tokio) keeps a
+  multi-table `Database` warm for multi-process access, over SQL/native routes
+  and a typed Kit API (`/kit/schema`, `/kit/txn`, `/kit/query`,
+  `/kit/create_table`). `mongreldb-client` + NAPI `RemoteDatabase` connect to it.
 - **GC / check / doctor:** Orphan run + stale WAL + stale shadow cleanup;
   footer checksum verification; best-effort repair.
 
@@ -147,10 +156,10 @@ All key material in memory is wrapped in `Zeroizing` and wiped on drop.
 
 ```rust
 // Create — generates a random salt, persists it to _meta/keys
-let db = Db::create_encrypted(dir, schema, 1, "my-passphrase")?;
+let db = Table::create_encrypted(dir, schema, 1, "my-passphrase")?;
 
 // Open — reads the salt, re-derives the same KEK
-let db = Db::open_encrypted(dir, "my-passphrase")?;
+let db = Table::open_encrypted(dir, "my-passphrase")?;
 ```
 
 ```sh
@@ -166,7 +175,7 @@ cargo build --release --features encryption
 | WAL segments (`_wal/`) | **Yes** (frame-level AES-256-GCM) |
 | Result cache (`_rcache/`) | **Yes** (AES-256-GCM) |
 | Index checkpoint (`_idx/global.idx`) | **Yes** (AES-256-GCM) |
-| Per-page min/max zone maps | Omitted for encrypted columns (would leak values) |
+| Per-page min/max zone maps | **Yes** — per-run encrypted stats envelope (page pruning without plaintext bounds) |
 | Run header / directory | No — but **authenticated** by a required keyed HMAC (tamper-evident) |
 | Manifest / schema | No |
 
@@ -180,8 +189,8 @@ In addition to the passphrase API, you can use a raw key file:
 
 ```rust
 let key = std::fs::read("my.key")?;  // 32+ bytes of random data
-let db = Db::create_with_key(dir, schema, 1, &key)?;
-let db = Db::open_with_key(dir, &key)?;
+let db = Table::create_with_key(dir, schema, 1, &key)?;
+let db = Table::open_with_key(dir, &key)?;
 ```
 
 Generate a key with `openssl rand 32 > my.key`. The raw key path skips
@@ -218,10 +227,12 @@ for blocking read/write methods. `RemoteDatabase` routes to a
 `crates/mongreldb-perf` is a standalone harness comparing MongrelDB (plain +
 encrypted) to SQLite and DuckDB (native / Parquet / CSV) at 100 and 1M rows.
 Measured results and analysis live in [`BENCHMARKS.md`](BENCHMARKS.md). Summary:
-MongrelDB wins single-row writes (**6.7 µs** vs SQLite 13.3 µs, DuckDB 262 µs),
-join `COUNT(*)` (**1.48 ms** vs DuckDB 4.3 ms, SQLite 23 ms), and O(1)
-`count()`. DuckDB-Parquet wins bulk file creation (26 ms via `COPY`). Warm
-result-cache hits are sub-µs across all queries.
+MongrelDB wins single-row writes (**7.7 µs** vs SQLite 14.2 µs, DuckDB 301 µs),
+bulk insert (**75.2 ms** vs SQLite 200.4 ms, DuckDB native 290.7 ms), join
+`COUNT(*)` (**1.53 ms** vs DuckDB 3.95 ms, SQLite 22.8 ms), and O(1)
+`count()`. DuckDB-Parquet wins bulk file creation (26 ms via `COPY`) and has
+the fastest analytical filter. Warm result-cache hits are sub-µs across all
+queries.
 
 ## Setup
 
@@ -251,14 +262,15 @@ cargo run -p mongreldb-core --example hybrid_query --release   # hybrid-query de
 
 ```text
 crates/mongreldb-core/    WAL, memtable, Bε-tree, sorted runs (mmap'd), vectorized
-                          columnar codec, seven indexes (HOT/Bitmap/PGM/FM/HNSW/PMA/
-                          Sparse), page stats, encryption, compaction, GC, check/doctor
+                          columnar codec, eight index kinds (HOT/Bitmap/PGM/FM/HNSW/
+                          PMA/Sparse/MinHash), page stats, encryption, constraints,
+                          compaction, GC, check/doctor
 crates/mongreldb-query/   DataFusion 54 SQL + Arrow frontend (predicate/projection
                           pushdown, multi-table joins, ann_search/sparse_match UDF,
                           result cache, Arrow IPC shadow, materialized views)
 crates/mongreldb-node/    NAPI addon (typed object API; built via `napi`)
-crates/mongreldb-server/  HTTP daemon (axum/tokio; SQL + native query over HTTP)
-crates/mongreldb-client/  lightweight HTTP client for the daemon
+crates/mongreldb-server/  HTTP daemon (axum/tokio; SQL + native query + typed Kit API)
+crates/mongreldb-client/  typed HTTP client for the daemon (SQL/native + Kit API)
 crates/mongreldb-perf/    cross-engine benchmark vs SQLite/DuckDB (standalone)
 crates/mongreldb-core/examples/hybrid_query.rs
                           runnable ann ∩ fm ∩ bitmap hybrid-query demo

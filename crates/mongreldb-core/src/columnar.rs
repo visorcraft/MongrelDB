@@ -775,7 +775,20 @@ impl NativeColumn {
         if validity.is_empty() {
             return 0;
         }
-        (0..n).filter(|&i| !validity_bit(validity, i)).count()
+        // Popcount whole bytes, then mask the partial tail byte (bit i of byte
+        // i/8 = row i·8+bit, LSB-first — same layout as `validity_bit`).
+        let full = n / 8;
+        let mut set = validity[..full.min(validity.len())]
+            .iter()
+            .map(|b| b.count_ones() as usize)
+            .sum::<usize>();
+        let tail_bits = n % 8;
+        if tail_bits > 0 {
+            if let Some(&b) = validity.get(full) {
+                set += (b & ((1u8 << tail_bits) - 1)).count_ones() as usize;
+            }
+        }
+        n - set
     }
 
     /// Approximate heap size (used to bound the decoded-page cache, Phase 15.4).
@@ -1304,6 +1317,89 @@ pub fn values_to_native(ty: TypeId, values: &[Value]) -> NativeColumn {
             offsets.push(0u32);
             for (i, v) in values.iter().enumerate() {
                 if let Value::Bytes(b) = v {
+                    non_null[i] = true;
+                    vals.extend_from_slice(b);
+                }
+                offsets.push(vals.len() as u32);
+            }
+            NativeColumn::Bytes {
+                offsets,
+                values: vals,
+                validity: validity_bitmap_from(non_null),
+            }
+        }
+    }
+}
+
+/// Row-major sparse batch → one typed column, by reference — the zero-clone
+/// transpose behind [`crate::Table::bulk_load`]. Semantically identical to
+/// pre-filling a `Vec<Value>` with `Null` and calling [`values_to_native`],
+/// but never clones a `Value` (no deep `Bytes` copies, no per-column
+/// `Vec<Value>` materialization): each row is scanned for `column_id` (rows
+/// are short sparse `(id, value)` lists) and the payload is read in place.
+/// A missing column id or a non-matching type reads as null, exactly like
+/// [`values_to_native`].
+pub fn rows_to_native(ty: TypeId, rows: &[Vec<(u16, Value)>], column_id: u16) -> NativeColumn {
+    let n = rows.len();
+    let mut non_null = vec![false; n];
+    fn at(row: &[(u16, Value)], column_id: u16) -> Option<&Value> {
+        row.iter().find(|(id, _)| *id == column_id).map(|(_, v)| v)
+    }
+    match ty {
+        TypeId::Int64 | TypeId::TimestampNanos => {
+            let mut data = Vec::with_capacity(n);
+            for (i, row) in rows.iter().enumerate() {
+                match at(row, column_id) {
+                    Some(Value::Int64(x)) => {
+                        non_null[i] = true;
+                        data.push(*x);
+                    }
+                    _ => data.push(0),
+                }
+            }
+            NativeColumn::Int64 {
+                data,
+                validity: validity_bitmap_from(non_null),
+            }
+        }
+        TypeId::Float64 => {
+            let mut data = Vec::with_capacity(n);
+            for (i, row) in rows.iter().enumerate() {
+                match at(row, column_id) {
+                    Some(Value::Float64(x)) => {
+                        non_null[i] = true;
+                        data.push(*x);
+                    }
+                    _ => data.push(0.0),
+                }
+            }
+            NativeColumn::Float64 {
+                data,
+                validity: validity_bitmap_from(non_null),
+            }
+        }
+        TypeId::Bool => {
+            let mut data = Vec::with_capacity(n);
+            for (i, row) in rows.iter().enumerate() {
+                match at(row, column_id) {
+                    Some(Value::Bool(x)) => {
+                        non_null[i] = true;
+                        data.push(if *x { 1 } else { 0 });
+                    }
+                    _ => data.push(0),
+                }
+            }
+            NativeColumn::Bool {
+                data,
+                validity: validity_bitmap_from(non_null),
+            }
+        }
+        _ => {
+            let mut offsets = Vec::with_capacity(n + 1);
+            let mut vals = Vec::new();
+            offsets.push(0u32);
+            for (i, row) in rows.iter().enumerate() {
+                if let Some(Value::Bytes(b)) = at(row, column_id) {
                     non_null[i] = true;
                     vals.extend_from_slice(b);
                 }
