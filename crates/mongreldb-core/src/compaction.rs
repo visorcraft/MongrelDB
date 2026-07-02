@@ -13,6 +13,34 @@ use crate::Result;
 use std::collections::HashMap;
 
 impl Table {
+    /// Background-compaction run-count threshold (§5.9). When a table accumulates
+    /// at least this many sorted runs, every multi-run query pays decode work
+    /// proportional to the run count; `maybe_compact` collapses them back to one.
+    /// Conservative so a steady write stream doesn't compact too eagerly.
+    pub const AUTO_COMPACT_RUN_THRESHOLD: usize = 8;
+
+    /// Whether this table would benefit from compaction right now — the
+    /// query-cost signal for §5.9. Pure run-count topology (no per-query
+    /// bookkeeping): once runs have accumulated past the threshold, scans and
+    /// pushdown queries are paying multi-run fallback cost, so compaction is
+    /// worthwhile. A daemon (or any long-lived holder) polls this.
+    pub fn should_compact(&self) -> bool {
+        self.run_refs().len() >= Self::AUTO_COMPACT_RUN_THRESHOLD
+    }
+
+    /// Compaction as a query optimization (§5.9): if [`should_compact`] reports
+    /// that runs have accumulated past the cost threshold, run [`compact`] and
+    /// return `true`; otherwise no-op and return `false`. Safe to call
+    /// periodically from a background task — [`compact`] is itself a no-op below
+    /// two runs and honors snapshot retention. Returns whether a compaction ran.
+    pub fn maybe_compact(&mut self) -> Result<bool> {
+        if !self.should_compact() {
+            return Ok(false);
+        }
+        self.compact()?;
+        Ok(true)
+    }
+
     /// Merge all runs into a single level-1 run, dropping superseded versions
     /// and tombstones — **but preserving** the version each pinned snapshot
     /// still needs. No-op if there are fewer than two runs.

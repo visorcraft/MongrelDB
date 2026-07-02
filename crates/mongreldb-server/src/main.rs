@@ -1,6 +1,6 @@
 //! mongreldb-server entry point.
 
-use mongreldb_server::build_app;
+use mongreldb_server::{build_app, spawn_auto_compactor};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -16,11 +16,13 @@ async fn main() {
     let db_dir = &args[1];
     let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(8453);
 
-    let db = Database::open(db_dir).unwrap_or_else(|e| {
+    let db = Arc::new(Database::open(db_dir).unwrap_or_else(|e| {
         eprintln!("failed to open {db_dir}: {e}");
         std::process::exit(1);
-    });
-    let app = build_app(Arc::new(db));
+    }));
+    // §5.9: background cost-aware compaction (run-count trigger).
+    spawn_auto_compactor(Arc::clone(&db));
+    let app = build_app(db);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     eprintln!("mongreldb-server listening on http://{addr}");

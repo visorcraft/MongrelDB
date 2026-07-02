@@ -69,16 +69,56 @@ async fn main() {
     let db_dir = &args[1];
     let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(8453);
 
-    let db = Database::open(db_dir).unwrap_or_else(|e| {
+    let db = Arc::new(Database::open(db_dir).unwrap_or_else(|e| {
         eprintln!("failed to open {db_dir}: {e}");
         std::process::exit(1);
-    });
-    let app = build_app(Arc::new(db));
+    }));
+    // §5.9: background cost-aware compaction. A dedicated thread sweeps every
+    // mounted table on a fixed interval and compacts any whose sorted-run
+    // count has crossed `Table::AUTO_COMPACT_RUN_THRESHOLD`, so a long-lived
+    // daemon under a steady stream of small writes doesn't accumulate unbounded
+    // `.sr` files (and multi-run query cost with them). Each table is locked
+    // only for its own compaction; snapshot retention is honored by `compact`.
+    spawn_auto_compactor(Arc::clone(&db));
+    let app = build_app(db);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     eprintln!("mongreldb-server listening on http://{addr}");
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+/// Launch the §5.9 background auto-compaction sweep (run-count cost trigger).
+/// One OS thread, sleeping `interval` between sweeps; each tick locks each
+/// table individually and calls `Table::maybe_compact`. Best-effort: a
+/// compaction error is logged and never aborts the sweep.
+pub fn spawn_auto_compactor(db: Arc<Database>) {
+    std::thread::Builder::new()
+        .name("mongreldb-auto-compact".into())
+        .spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            for name in db.table_names() {
+                let Ok(handle) = db.table(&name) else {
+                    continue;
+                };
+                let mut t = handle.lock();
+                let before = t.run_count();
+                match t.maybe_compact() {
+                    Ok(true) => {
+                        eprintln!(
+                            "[auto-compact] {name}: {} runs -> {}",
+                            before,
+                            t.run_count()
+                        );
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        eprintln!("[auto-compact] {name}: compaction failed: {e}");
+                    }
+                }
+            }
+        })
+        .expect("spawn auto-compact thread");
 }
 
 async fn health() -> StatusCode {
