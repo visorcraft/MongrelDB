@@ -2090,11 +2090,14 @@ impl RunReader {
         // Phase 15.2: best-effort read-ahead. Tell the kernel to page-in the
         // column's full byte range before the workers fan out, overlapping the
         // disk I/O with the upcoming decode CPU.
-        if let (Some(m), Some(first)) = (&self.mmap, ch.page_stats.first()) {
-            let start = first.offset as usize;
-            let end = (ch.page_region_offset as usize) + (ch.page_region_len as usize);
-            if end > start {
-                let _ = m.advise_range(memmap2::Advice::WillNeed, start, end - start);
+        #[cfg(unix)]
+        {
+            if let (Some(m), Some(first)) = (&self.mmap, ch.page_stats.first()) {
+                let start = first.offset as usize;
+                let end = (ch.page_region_offset as usize) + (ch.page_region_len as usize);
+                if end > start {
+                    let _ = m.advise_range(memmap2::Advice::WillNeed, start, end - start);
+                }
             }
         }
         let run_id = self.header.run_id;

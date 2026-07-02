@@ -2191,7 +2191,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-core"
-version = "0.19.4"
+version = "0.19.5"
 dependencies = [
  "aes-gcm",
  "arc-swap",
@@ -2218,7 +2218,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-node"
-version = "0.19.4"
+version = "0.19.5"
 dependencies = [
  "arrow",
  "bincode",
@@ -2236,7 +2236,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-query"
-version = "0.19.4"
+version = "0.19.5"
 dependencies = [
  "arrow",
  "async-trait",

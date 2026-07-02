@@ -1,6 +1,6 @@
 [package]
 name = "mongreldb-server"
-version = "0.19.4"
+version = "0.19.5"
 edition = "2021"
 publish = false
 
@@ -13,8 +13,8 @@ name = "mongreldb_server"
 path = "src/lib.rs"
 
 [dependencies]
-mongreldb-core = { path = "../mongreldb-core", version = "0.19.4", features = ["encryption"] }
-mongreldb-query = { path = "../mongreldb-query", version = "0.19.4" }
+mongreldb-core = { path = "../mongreldb-core", version = "0.19.5", features = ["encryption"] }
+mongreldb-query = { path = "../mongreldb-query", version = "0.19.5" }
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 serde = { version = "1", features = ["derive"] }
