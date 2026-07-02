@@ -71,7 +71,7 @@ fn bitmap_eq_includes_unflushed_overlay_rows() {
         value: Value::Int64(7).encode_key(),
     };
     let count = db
-        .count_conditions(&[cond.clone()], snap)
+        .count_conditions(std::slice::from_ref(&cond), snap)
         .unwrap()
         .expect("bitmap condition is served");
     // 50 flushed + 30 unflushed = 80; the cat=9 row is excluded.
@@ -108,7 +108,6 @@ fn pk_lookup_finds_unflushed_overlay_row() {
         .unwrap();
     db.commit().unwrap();
 
-    let snap = db.snapshot();
     let row = db
         .query(&Query::pk(Value::Int64(42).encode_key()))
         .unwrap();

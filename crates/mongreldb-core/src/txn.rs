@@ -120,6 +120,30 @@ impl<'db> Transaction<'db> {
         })
     }
 
+    /// Stage many puts on the same `table` with one table-id lookup + one
+    /// auto-inc lock pass. Each row is staged individually (same as repeated
+    /// `put`); the savings are the amortized lookups/locks for bulk guard-row
+    /// writes and batched application-row inserts. Returns the assigned
+    /// auto-increment values (`Some` only where the engine filled the column).
+    pub fn put_batch(
+        &mut self,
+        table: &str,
+        rows: Vec<Vec<(u16, Value)>>,
+    ) -> Result<Vec<Option<i64>>> {
+        let id = self.db.table_id(table)?;
+        self.reject_after_truncate(id)?;
+        let handle = self.db.table(table)?;
+        let mut t = handle.lock();
+        let mut assigned = Vec::with_capacity(rows.len());
+        for mut cells in rows {
+            let a = t.fill_auto_inc(&mut cells)?;
+            assigned.push(a);
+            self.staging.push((id, Staged::Put(cells)));
+        }
+        drop(t);
+        Ok(assigned)
+    }
+
     /// Stage a delete of `row_id` on `table`.
     pub fn delete(&mut self, table: &str, row_id: RowId) -> Result<()> {
         let id = self.db.table_id(table)?;
