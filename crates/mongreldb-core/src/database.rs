@@ -1893,7 +1893,6 @@ fn recover_shared_wal(
             _ => {}
         }
     }
-
     for (table_id, (rows, deletes, truncate_epoch, table_epoch)) in stage {
         let Some(handle) = tables.get(&table_id) else {
             continue;

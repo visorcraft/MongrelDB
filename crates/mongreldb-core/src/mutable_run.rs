@@ -76,19 +76,16 @@ impl MutableRun {
 
     /// Newest version of `row_id` with `epoch <= snapshot` (including
     /// tombstones), mirroring `Memtable::get_version`. Returns `None` if no
-    /// version is visible. The PMA iterates ascending, so the last matching
-    /// entry for the row wins.
+    /// version is visible. Seeks straight to `row_id`'s versions via the
+    /// PMA's gappy binary search instead of scanning from the front.
     pub fn get_version(&self, row_id: RowId, snapshot_epoch: Epoch) -> Option<(Epoch, Row)> {
         let mut best: Option<(Epoch, Row)> = None;
-        for ((rid, ep), row) in self.pma.iter() {
-            match rid.cmp(&row_id) {
-                std::cmp::Ordering::Less => continue,
-                std::cmp::Ordering::Greater => break,
-                std::cmp::Ordering::Equal => {
-                    if *ep <= snapshot_epoch {
-                        best = Some((*ep, row.clone()));
-                    }
-                }
+        for ((rid, ep), row) in self.pma.iter_from(&(row_id, Epoch::ZERO)) {
+            if *rid != row_id {
+                break;
+            }
+            if *ep <= snapshot_epoch {
+                best = Some((*ep, row.clone()));
             }
         }
         best

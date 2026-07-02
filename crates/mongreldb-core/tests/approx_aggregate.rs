@@ -55,7 +55,7 @@ fn fill(dir: &std::path::Path, n: i64) -> Table {
 fn approx_is_exact_when_sample_covers_table() {
     // 1000 rows < reservoir capacity (8192) ⇒ the sample is the whole table.
     let dir = tempdir().unwrap();
-    let db = fill(dir.path(), 1000);
+    let mut db = fill(dir.path(), 1000);
 
     let conds = [Condition::BitmapEq {
         column_id: 2,
@@ -95,7 +95,7 @@ fn approx_is_exact_when_sample_covers_table() {
 #[test]
 fn approx_count_unfiltered_is_population() {
     let dir = tempdir().unwrap();
-    let db = fill(dir.path(), 500);
+    let mut db = fill(dir.path(), 500);
     // COUNT(*) with no filter ⇒ exact population, regardless of sample.
     let r = db
         .approx_aggregate(&[], None, ApproxAgg::Count, 1.96)
@@ -112,7 +112,7 @@ fn approx_sampling_brackets_truth() {
     // within a few %.
     let dir = tempdir().unwrap();
     let n = 20_000i64;
-    let db = fill(dir.path(), n);
+    let mut db = fill(dir.path(), n);
 
     let conds = [Condition::BitmapEq {
         column_id: 2,
@@ -168,7 +168,7 @@ fn approx_rebuilt_on_reopen() {
     {
         let _ = fill(&path, 300);
     }
-    let db = Table::open(&path).unwrap();
+    let mut db = Table::open(&path).unwrap();
     let r = db
         .approx_aggregate(&[], None, ApproxAgg::Count, 1.96)
         .unwrap()

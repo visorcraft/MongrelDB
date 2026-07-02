@@ -98,13 +98,29 @@ impl<K: Ord + Clone, V: Clone> Pma<K, V> {
         self.buf.iter().flatten()
     }
 
-    /// Drain all elements in ascending key order.
+    /// Iterate present elements in ascending key order, starting from the
+    /// first entry with key `>= key` (gappy binary search to find the start,
+    /// same cost as [`Self::get`], instead of a linear scan from the front).
+    pub fn iter_from<'a>(&'a self, key: &K) -> impl Iterator<Item = &'a (K, V)> {
+        let start = self.lower_bound_present(key).unwrap_or(self.capacity);
+        self.buf[start..].iter().flatten()
+    }
+
+    /// Drain all elements in ascending key order. Resets the backing array to
+    /// its minimum capacity rather than just clearing slots in place: without
+    /// this, a PMA that grew large (e.g. absorbing a big bulk flush before its
+    /// contents spilled to a sorted run) would stay at that capacity forever
+    /// while logically empty, and every subsequent lookup/iteration over the
+    /// now-empty tier would still walk the old, huge, all-`None` backing
+    /// array — `lower_bound_present`'s gappy search is only `O(log² n)` under
+    /// the density invariant; a fully empty array is the degenerate case
+    /// where every probe scans its whole remaining range without finding
+    /// anything to anchor on, i.e. `O(capacity)`.
     pub fn drain_sorted(&mut self) -> Vec<(K, V)> {
         let mut out: Vec<(K, V)> = self.buf.iter().flatten().cloned().collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
-        for slot in self.buf.iter_mut() {
-            *slot = None;
-        }
+        self.buf = vec![None; LEAF_WINDOW];
+        self.capacity = LEAF_WINDOW;
         self.count = 0;
         out
     }
@@ -116,7 +132,18 @@ impl<K: Ord + Clone, V: Clone> Pma<K, V> {
     /// keeps present elements in ascending order, so binary search lands on a
     /// (possibly empty) slot; each probe walks past the bounded gap to the
     /// nearest present element — O(log² n) thanks to the density invariant.
+    ///
+    /// That invariant assumes a reasonably dense array; a sparse-to-empty one
+    /// is the degenerate case where `first_present_in` can't find an anchor
+    /// and ends up scanning its whole remaining range at each halving step
+    /// (a geometric series summing to `O(capacity)`, not `O(log² n)`). The
+    /// `count == 0` case is both the common one (an emptied tier still sized
+    /// for whatever it used to hold — see `drain_sorted`) and trivially
+    /// correct to short-circuit: no elements, no bound.
     fn lower_bound_present(&self, key: &K) -> Option<usize> {
+        if self.count == 0 {
+            return None;
+        }
         let mut lo: usize = 0;
         let mut hi: usize = self.capacity;
         let mut best: Option<usize> = None;

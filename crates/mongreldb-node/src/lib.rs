@@ -1221,7 +1221,7 @@ impl TableHandle {
         };
         let cid = column_id.map(|c| c as u16);
         let handle = self.db.table(&self.name).map_err(to_napi)?;
-        let g = handle.lock();
+        let mut g = handle.lock();
         let res = g.approx_aggregate(&[], cid, kind, z).map_err(to_napi)?;
         Ok(res.map(|r| {
             serde_json::json!({

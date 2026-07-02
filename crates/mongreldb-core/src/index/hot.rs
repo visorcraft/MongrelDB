@@ -52,13 +52,16 @@ impl HotIndex {
         self.inner.iter().map(|(k, v)| (k.clone(), *v)).collect()
     }
 
-    /// Rebuild from a snapshot produced by [`HotIndex::entries`].
+    /// Rebuild from a snapshot produced by [`HotIndex::entries`] (itself
+    /// already ascending — a `BTreeMap` iterates in key order). `.collect()`
+    /// drives `BTreeMap`'s bulk-build `FromIterator`, which is dramatically
+    /// faster than the equivalent one-at-a-time `insert()` loop for a large,
+    /// already-sorted checkpoint (the common case: this is on the
+    /// `Table::open` hot path, reloading a persisted `_idx/global.idx`).
     pub fn from_entries(entries: Vec<(Vec<u8>, RowId)>) -> Self {
-        let mut inner = BTreeMap::new();
-        for (k, v) in entries {
-            inner.insert(k, v);
+        Self {
+            inner: entries.into_iter().collect(),
         }
-        Self { inner }
     }
 }
 

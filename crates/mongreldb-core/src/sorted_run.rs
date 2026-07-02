@@ -10,7 +10,7 @@ use crate::columnar;
 use crate::encryption::{setup_run_encryption, Cipher, Kek, RunEncryption};
 use crate::epoch::Epoch;
 use crate::error::{MongrelError, Result};
-use crate::index::pgm::{LearnedIndex, PgmIndex};
+use crate::index::pgm::PgmIndex;
 use crate::memtable::{Row, Value};
 use crate::page::{Encoding, PageStat};
 use crate::row_id_set::RowIdSet;
@@ -878,6 +878,63 @@ fn decrypt_or_passthrough(
     }
 }
 
+/// Read just the header and confirm the footer magic, without hashing the
+/// body. Cheap: two small fixed-size reads, no allocation proportional to
+/// run size. Only safe as a substitute for [`read_header`] when the caller
+/// has independent evidence this exact `run_id`'s checksum already verified
+/// in this process (see `open_with_cache`'s `verified_runs` cache) — `.sr`
+/// runs are immutable once written, so a checksum verified once cannot
+/// regress later in the same process lifetime. Still catches gross
+/// corruption (truncation, garbled header) via the magic checks and the
+/// bincode deserialize.
+fn read_header_fast(path: impl AsRef<Path>) -> Result<RunHeader> {
+    let mut file = File::open(path)?;
+    let mut header_buf = vec![0u8; RUN_HEADER_PAD];
+    file.read_exact(&mut header_buf)?;
+    let header: RunHeader = bincode::deserialize(&header_buf)
+        .map_err(|e| MongrelError::InvalidArgument(format!("bad run header: {e}")))?;
+    if header.magic != RUN_MAGIC {
+        return Err(MongrelError::MagicMismatch {
+            what: "sorted run",
+            expected: RUN_MAGIC,
+            got: header.magic,
+        });
+    }
+    file.seek(SeekFrom::Start(header.footer_offset))?;
+    let mut footer_magic = [0u8; 8];
+    file.read_exact(&mut footer_magic)?;
+    if footer_magic != RUN_MAGIC {
+        return Err(MongrelError::MagicMismatch {
+            what: "sorted run footer",
+            expected: RUN_MAGIC,
+            got: footer_magic,
+        });
+    }
+    Ok(header)
+}
+
+/// [`read_header`], but skips the whole-body SHA-256 verification once
+/// `verified_runs` already recorded this `run_id` as checked in this
+/// process. First open of a given run still pays the full check (and
+/// records it); every later `RunReader` construction for the same run_id in
+/// the same process — the common case for a warm/long-lived handle that
+/// re-opens a reader per query, e.g. NAPI or an in-process `compare` run —
+/// reuses that result instead of re-reading and re-hashing the whole file
+/// every time. A fresh run_id (new file, e.g. after a flush/compaction) is
+/// never in the cache, so it always gets the full check on its first read.
+fn read_header_cached(
+    path: impl AsRef<Path>,
+    verified_runs: &parking_lot::Mutex<std::collections::HashSet<u128>>,
+) -> Result<RunHeader> {
+    let header = read_header_fast(path.as_ref())?;
+    if verified_runs.lock().contains(&header.run_id) {
+        return Ok(header);
+    }
+    let verified = read_header(path)?;
+    verified_runs.lock().insert(verified.run_id);
+    Ok(verified)
+}
+
 /// Read and validate a run header (magic + footer checksum).
 pub fn read_header(path: impl AsRef<Path>) -> Result<RunHeader> {
     let mut file = File::open(path)?;
@@ -1544,7 +1601,8 @@ fn row_id_bounds(rows: &[Row]) -> (u64, u64) {
 // ============================ high-level reader ============================
 
 /// Reads a sorted run: decodes columns lazily (cached), answers MVCC point
-/// lookups via the learned index, and materializes visible rows for scans.
+/// lookups via page-pruned `SYS_ROW_ID` bounds, and materializes visible rows
+/// for scans.
 pub struct RunReader {
     file: File,
     mmap: Option<memmap2::Mmap>,
@@ -1558,7 +1616,6 @@ pub struct RunReader {
     /// Per-run nonce prefix (overlaid per page with column_id + page_seq).
     nonce_prefix: [u8; 12],
     col_cache: HashMap<u16, Vec<Value>>,
-    learned: Option<PgmIndex>,
     /// Shared, MVCC content-addressed page cache (Phase 9.2). Caches raw page
     /// bytes (ciphertext when encrypted) so all readers share decoded/decrypted
     /// pages. `None` only in standalone tests.
@@ -1575,9 +1632,10 @@ pub struct RunReader {
 
 impl RunReader {
     pub fn open(path: impl AsRef<Path>, schema: Schema, kek: Option<Arc<Kek>>) -> Result<Self> {
-        Self::open_with_cache(path, schema, kek, None, None, 0)
+        Self::open_with_cache(path, schema, kek, None, None, 0, None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn open_with_cache(
         path: impl AsRef<Path>,
         schema: Schema,
@@ -1585,11 +1643,14 @@ impl RunReader {
         page_cache: Option<Arc<parking_lot::Mutex<crate::cache::PageCache>>>,
         decoded_cache: Option<Arc<parking_lot::Mutex<crate::cache::DecodedPageCache>>>,
         table_id: u64,
+        verified_runs: Option<&parking_lot::Mutex<std::collections::HashSet<u128>>>,
     ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let header = read_header(&path)?;
+        let header = match verified_runs {
+            Some(cache) => read_header_cached(&path, cache)?,
+            None => read_header(&path)?,
+        };
         let mut dir = read_column_dir(&path, &header)?;
-        let learned = read_learned(&path, &header)?;
         // Unwrap this run's per-file DEK (stored wrapped in its Encryption
         // Descriptor) using the table KEK, then build the page cipher.
         let (cipher, nonce_prefix): (Option<Box<dyn Cipher>>, [u8; 12]) = if header.is_encrypted() {
@@ -1648,7 +1709,6 @@ impl RunReader {
             cipher,
             nonce_prefix,
             col_cache: HashMap::new(),
-            learned,
             epoch_override: None,
             page_cache,
             decoded_cache,
@@ -1903,47 +1963,217 @@ impl RunReader {
 
     /// Newest version of `row_id` with `epoch <= snapshot`, including tombstones
     /// (returned as a `Row` with `deleted=true`). `None` if no such version.
+    ///
+    /// Page-pruned: `SYS_ROW_ID` pages carry exact `first_row_id`/`last_row_id`
+    /// bounds (rows are written in ascending `(RowId, Epoch)` order), so this
+    /// decodes only the page(s) that can contain `row_id` instead of the whole
+    /// column — the old implementation decoded every row's `SYS_ROW_ID` (and
+    /// `SYS_EPOCH`) up front, making every single-row point lookup (the common
+    /// case for a PK/unique check feeding insert/update/delete) pay a
+    /// full-column decode. A row's version group can span at most two adjacent
+    /// pages (split at a page boundary mid-group); `candidate_pages` below
+    /// collects every page whose bounds include `row_id`, which is normally
+    /// one page and two only in that split case.
     pub fn get_version(&mut self, row_id: RowId, snapshot: Epoch) -> Result<Option<(Epoch, Row)>> {
+        match self.find_version_page(row_id, snapshot)? {
+            None => Ok(None),
+            Some((epoch, seq, local_index)) => Ok(Some((
+                Epoch(epoch),
+                self.materialize_in_page(seq, local_index)?,
+            ))),
+        }
+    }
+
+    /// Page-pruned search for the newest version of `row_id` with `epoch <=
+    /// snapshot`: `(epoch, page_seq, local_index)`, or `None` if no such
+    /// version exists in this run. Factored out of [`Self::get_version`] so
+    /// [`Self::get_version_column`] can reuse the exact same page-finding
+    /// logic without re-deriving it.
+    fn find_version_page(
+        &mut self,
+        row_id: RowId,
+        snapshot: Epoch,
+    ) -> Result<Option<(u64, usize, usize)>> {
         let n = self.row_count();
         if n == 0 {
             return Ok(None);
         }
-        let target = row_id.0;
-        let row_ids = self.column(SYS_ROW_ID)?.to_vec();
-        let window = self.predict_window(target, n);
-        // Scan the predicted window; fall back to a full binary search if the
-        // learned model missed (e.g. sparse sampling at the tail).
-        let mut start = None;
-        let mut probe = window;
-        if probe.is_empty() {
-            probe = 0..n;
+        let target = row_id.0 as i64;
+        let ch = self.find_header(SYS_ROW_ID)?;
+        let mut page_start = 0u64;
+        let candidate_pages: Vec<(usize, u64)> = ch // (page_seq, row offset of page start)
+            .page_stats
+            .iter()
+            .enumerate()
+            .filter_map(|(seq, s)| {
+                let start = page_start;
+                page_start += s.row_count as u64;
+                (s.first_row_id <= row_id.0 && row_id.0 <= s.last_row_id).then_some((seq, start))
+            })
+            .collect();
+        if candidate_pages.is_empty() {
+            return Ok(None);
         }
-        for i in probe.clone() {
-            if int_at(&row_ids, i) == target {
-                start = Some(i);
-                break;
+        let ty = self.resolve_type(SYS_ROW_ID);
+        let mut best: Option<(u64, usize, usize)> = None; // (epoch, page_seq, local index)
+        for (seq, _page_row_start) in candidate_pages {
+            let page_rows = self.find_header(SYS_ROW_ID)?.page_stats[seq].row_count as usize;
+            let row_ids = match self.decode_page_native_cached(ty, SYS_ROW_ID, seq, page_rows)? {
+                columnar::NativeColumn::Int64 { data, .. } => data,
+                _ => return Err(MongrelError::InvalidArgument("sys row_id not int64".into())),
+            };
+            let local = match row_ids.binary_search(&target) {
+                Ok(i) => i,
+                Err(_) => continue,
+            };
+            let epoch_ty = self.resolve_type(SYS_EPOCH);
+            let epochs =
+                match self.decode_page_native_cached(epoch_ty, SYS_EPOCH, seq, page_rows)? {
+                    columnar::NativeColumn::Int64 { data, .. } => data,
+                    _ => return Err(MongrelError::InvalidArgument("sys epoch not int64".into())),
+                };
+            // `local` is one match; the row-id's full version group is the
+            // contiguous run of equal row-ids around it within this page.
+            let mut lo = local;
+            while lo > 0 && row_ids[lo - 1] == target {
+                lo -= 1;
+            }
+            let mut hi = local;
+            while hi + 1 < row_ids.len() && row_ids[hi + 1] == target {
+                hi += 1;
+            }
+            for (i, &epoch) in epochs[lo..=hi].iter().enumerate() {
+                let epoch = epoch as u64;
+                if epoch <= snapshot.0 && best.map(|(be, ..)| epoch > be).unwrap_or(true) {
+                    best = Some((epoch, seq, lo + i));
+                }
             }
         }
-        let mut idx = start;
-        if idx.is_none() {
-            match row_ids.binary_search_by_key(&target, value_row_id) {
-                Ok(i) => idx = Some(i),
-                Err(_) => return Ok(None),
+        Ok(best)
+    }
+
+    /// Like [`Self::get_version`], but decodes only `column_id` (plus the
+    /// `SYS_DELETED` flag) instead of materializing every schema column via
+    /// [`Self::materialize_in_page`]. For a wide schema this avoids paying to
+    /// decode every other column's page just to read one value and throw the
+    /// rest away — e.g. `Table::remove_hot_for_row`'s PK-only lookup, which
+    /// used to pull the whole row (every column, every page) just for the
+    /// primary key.
+    pub fn get_version_column(
+        &mut self,
+        row_id: RowId,
+        snapshot: Epoch,
+        column_id: u16,
+    ) -> Result<Option<(Epoch, bool, Option<Value>)>> {
+        let Some((epoch, seq, local_index)) = self.find_version_page(row_id, snapshot)? else {
+            return Ok(None);
+        };
+        let page_rows = self.find_header(SYS_ROW_ID)?.page_stats[seq].row_count as usize;
+        let page_start: usize = self.find_header(SYS_ROW_ID)?.page_stats[..seq]
+            .iter()
+            .map(|s| s.row_count as usize)
+            .sum();
+        let global_index = page_start + local_index;
+        let native_at = |slf: &mut Self, cid: u16| -> Result<Option<Value>> {
+            if !slf.dir.iter().any(|h| h.column_id == cid) {
+                return Ok(None);
             }
-        }
-        let mut best: Option<(u64, usize)> = None; // (epoch, index)
-        let mut i = idx.unwrap();
-        while i < n && int_at(&row_ids, i) == target {
-            let epoch = int_at(self.column(SYS_EPOCH)?, i);
-            if epoch <= snapshot.0 && best.map(|(be, _)| epoch > be).unwrap_or(true) {
-                best = Some((epoch, i));
+            let ty = slf.resolve_type(cid);
+            if !matches!(
+                ty,
+                TypeId::Bool
+                    | TypeId::Int8
+                    | TypeId::Int16
+                    | TypeId::Int32
+                    | TypeId::Int64
+                    | TypeId::UInt8
+                    | TypeId::UInt16
+                    | TypeId::UInt32
+                    | TypeId::UInt64
+                    | TypeId::Float32
+                    | TypeId::Float64
+                    | TypeId::TimestampNanos
+                    | TypeId::Date32
+                    | TypeId::Bytes
+            ) {
+                return Ok(slf.column(cid)?.get(global_index).cloned());
             }
-            i += 1;
+            Ok(slf
+                .decode_page_native_cached(ty, cid, seq, page_rows)?
+                .value_at(local_index))
+        };
+        let deleted = matches!(native_at(self, SYS_DELETED)?, Some(Value::Bool(true)));
+        let value = native_at(self, column_id)?;
+        Ok(Some((Epoch(epoch), deleted, value)))
+    }
+
+    /// Build a `Row` from page `seq`'s data at `local_index`, decoding only
+    /// that one page per column instead of [`Self::materialize`]'s whole-column
+    /// `Vec<Value>` decode — used by [`Self::get_version`], which already knows
+    /// the exact page from its page-pruned search. Only for scalar types with a
+    /// [`columnar::NativeColumn`] representation; any other column (e.g. a
+    /// fixed-size `Embedding`, which `NativeColumn` has no variant for) falls
+    /// back to the whole-column path for that column specifically, so this is
+    /// never wrong, only sometimes not faster.
+    fn materialize_in_page(&mut self, seq: usize, local_index: usize) -> Result<Row> {
+        let page_rows = self.find_header(SYS_ROW_ID)?.page_stats[seq].row_count as usize;
+        let page_start: usize = self.find_header(SYS_ROW_ID)?.page_stats[..seq]
+            .iter()
+            .map(|s| s.row_count as usize)
+            .sum();
+        let global_index = page_start + local_index;
+        let native_at = |slf: &mut Self, column_id: u16| -> Result<Option<Value>> {
+            // Absent column (schema evolution: added after this run was
+            // written) reads as null, matching `materialize`'s own guard.
+            if !slf.dir.iter().any(|h| h.column_id == column_id) {
+                return Ok(None);
+            }
+            let ty = slf.resolve_type(column_id);
+            if !matches!(
+                ty,
+                TypeId::Bool
+                    | TypeId::Int8
+                    | TypeId::Int16
+                    | TypeId::Int32
+                    | TypeId::Int64
+                    | TypeId::UInt8
+                    | TypeId::UInt16
+                    | TypeId::UInt32
+                    | TypeId::UInt64
+                    | TypeId::Float32
+                    | TypeId::Float64
+                    | TypeId::TimestampNanos
+                    | TypeId::Date32
+                    | TypeId::Bytes
+            ) {
+                // Not a NativeColumn-representable scalar (e.g. Embedding) —
+                // fall back to the always-correct whole-column decode.
+                return Ok(slf.column(column_id)?.get(global_index).cloned());
+            }
+            Ok(slf
+                .decode_page_native_cached(ty, column_id, seq, page_rows)?
+                .value_at(local_index))
+        };
+        let row_id = RowId(match native_at(self, SYS_ROW_ID)? {
+            Some(Value::Int64(x)) => x as u64,
+            _ => 0,
+        });
+        let committed_epoch = Epoch(match native_at(self, SYS_EPOCH)? {
+            Some(Value::Int64(x)) => x as u64,
+            _ => 0,
+        });
+        let deleted = matches!(native_at(self, SYS_DELETED)?, Some(Value::Bool(true)));
+        let col_ids: Vec<u16> = self.schema.columns.iter().map(|c| c.id).collect();
+        let mut columns = HashMap::new();
+        for id in col_ids {
+            columns.insert(id, native_at(self, id)?.unwrap_or(Value::Null));
         }
-        match best {
-            None => Ok(None),
-            Some((epoch, index)) => Ok(Some((Epoch(epoch), self.materialize(index)?))),
-        }
+        Ok(Row {
+            row_id,
+            committed_epoch,
+            columns,
+            deleted,
+        })
     }
 
     /// Every row in the run (all versions), in `(RowId, Epoch)` order. Used by
@@ -2149,6 +2379,37 @@ impl RunReader {
         let raw = self.read_page_shared(column_id, seq)?;
         let col = columnar::decode_page_native(ty, &raw, nrows)?;
         Ok((col, Some(key)))
+    }
+
+    /// [`Self::decode_page_cached`], but for the sequential point-lookup paths
+    /// (`find_version_page`, `materialize_in_page`, `get_version_column`) via
+    /// [`Self::read_page`] (handles the non-mmap-backed fallback) instead of
+    /// [`Self::read_page_shared`] (mmap-only, for the parallel rayon scan
+    /// path). No rayon pool to avoid blocking here, so a plain `.lock()` is
+    /// fine — unlike the scan path's `try_lock`, this always consults the
+    /// cache rather than skipping it under contention. Without this, every
+    /// point lookup re-decompressed its page from scratch even when a prior
+    /// lookup had just decoded the exact same page (the dominant remaining
+    /// cost measured for `remove_hot_for_row`'s on-disk path).
+    fn decode_page_native_cached(
+        &mut self,
+        ty: TypeId,
+        column_id: u16,
+        seq: usize,
+        nrows: usize,
+    ) -> Result<columnar::NativeColumn> {
+        let key = page_cache_key(self.table_id, self.header.run_id, column_id, seq);
+        if let Some(cache) = &self.decoded_cache {
+            if let Some(hit) = cache.lock().try_get(&key) {
+                return Ok((*hit).clone());
+            }
+        }
+        let raw = self.read_page(column_id, seq)?;
+        let col = columnar::decode_page_native(ty, &raw, nrows)?;
+        if let Some(cache) = &self.decoded_cache {
+            cache.lock().insert(key, std::sync::Arc::new(col.clone()));
+        }
+        Ok(col)
     }
 
     /// Row ids whose Int64 value is in `[lo, hi]`, **skipping pages whose
@@ -2770,16 +3031,6 @@ impl RunReader {
             .collect())
     }
 
-    fn predict_window(&self, target: u64, n: usize) -> std::ops::Range<usize> {
-        let Some(idx) = &self.learned else {
-            return 0..n;
-        };
-        let (lo, hi) = idx.predict(target);
-        let lo = lo.min(n);
-        let hi = if hi == usize::MAX { n } else { hi.min(n) };
-        lo..hi
-    }
-
     pub(crate) fn materialize(&mut self, index: usize) -> Result<Row> {
         let row_id = RowId(int_at(self.column(SYS_ROW_ID)?, index));
         let epoch = Epoch(int_at(self.column(SYS_EPOCH)?, index));
@@ -2868,22 +3119,6 @@ impl RunReader {
     }
 }
 
-fn read_learned(path: &Path, header: &RunHeader) -> Result<Option<PgmIndex>> {
-    if header.index_trailer_offset == 0 {
-        return Ok(None);
-    }
-    let mut file = File::open(path)?;
-    file.seek(SeekFrom::Start(header.index_trailer_offset))?;
-    let len = header
-        .footer_offset
-        .saturating_sub(header.index_trailer_offset);
-    let mut buf = vec![0u8; len as usize];
-    file.read_exact(&mut buf)?;
-    let pgm: PgmIndex = bincode::deserialize(&buf)
-        .map_err(|e| MongrelError::InvalidArgument(format!("bad learned trailer: {e}")))?;
-    Ok(Some(pgm))
-}
-
 fn int_at(vals: &[Value], i: usize) -> u64 {
     match vals.get(i) {
         Some(Value::Int64(x)) => *x as u64,
@@ -2893,13 +3128,6 @@ fn int_at(vals: &[Value], i: usize) -> u64 {
 
 fn bool_at(vals: &[Value], i: usize) -> bool {
     matches!(vals.get(i), Some(Value::Bool(true)))
-}
-
-fn value_row_id(v: &Value) -> u64 {
-    match v {
-        Value::Int64(x) => *x as u64,
-        _ => u64::MAX,
-    }
 }
 
 #[cfg(test)]
@@ -3163,8 +3391,8 @@ mod tests {
             .write_native(&path, &[(1, id_col), (2, name_col)], n, 1)
             .unwrap();
 
-        let mut reader =
-            RunReader::open_with_cache(&path, schema(), None, None, None, 0).expect("open reader");
+        let mut reader = RunReader::open_with_cache(&path, schema(), None, None, None, 0, None)
+            .expect("open reader");
         assert!(reader.has_mmap(), "test env must support read-only mmap");
         assert_eq!(reader.row_count(), header.row_count as usize);
 

@@ -161,6 +161,14 @@ pub struct Table {
     /// Uniform reservoir sample of row ids for approximate analytics
     /// (Phase 8.2). Maintained incrementally on insert; repopulated on open.
     reservoir: crate::reservoir::Reservoir,
+    /// False when `reservoir` needs a full rebuild from `visible_rows` before
+    /// [`Table::approx_aggregate`] can trust it (same lazy pattern as
+    /// [`Table::ensure_indexes_complete`]). Open and WAL-replay leave this
+    /// false instead of eagerly materializing every row — a full-table scan
+    /// no plain insert/update/delete needs — and the first approximate-
+    /// aggregate call pays the rebuild, after which `.offer()` calls maintain
+    /// it incrementally.
+    reservoir_complete: bool,
     /// True once any row has been deleted. The incremental aggregate cache
     /// (Phase 8.3) is only valid for append-only tables, so a single delete
     /// permanently disables incremental maintenance for this table.
@@ -201,6 +209,16 @@ pub struct Table {
     /// Shared decoded-page cache (Phase 15.4): the post-decompress/decrypt typed
     /// page, so repeat scans skip decode. Keyed by `(run_id, column_id, page)`.
     decoded_cache: Arc<parking_lot::Mutex<crate::cache::DecodedPageCache>>,
+    /// `run_id`s whose on-disk footer checksum has already been verified by a
+    /// `RunReader` construction in this process. `.sr` runs are immutable once
+    /// written, so re-hashing an already-verified run's full body on every
+    /// repeat `open_reader` call (every query, every `remove_hot_for_row`) is
+    /// pure waste for a warm/long-lived handle — this cache lets
+    /// `read_header_cached` skip straight to the cheap header+footer-magic
+    /// check after the first open. Scoped per-`Table` (not shared via
+    /// `SharedCtx`) since `run_id` is only unique within one table's own
+    /// manifest.
+    verified_runs: Arc<parking_lot::Mutex<std::collections::HashSet<u128>>>,
     /// Table-level result cache (Phase 19.1): `canonical_query_key(conditions,
     /// projection, epoch)` → the survivor columns as typed `NativeColumn`s. Shared
     /// by the native `Condition` API and (via `query_cached`) the tool-call path,
@@ -971,6 +989,7 @@ impl Table {
             pinned: BTreeMap::new(),
             live_count: 0,
             reservoir: crate::reservoir::Reservoir::default(),
+            reservoir_complete: true,
             had_deletes: false,
             agg_cache: HashMap::new(),
             global_idx_epoch: 0,
@@ -980,6 +999,7 @@ impl Table {
             flushed_epoch: 0,
             page_cache: ctx.page_cache,
             decoded_cache: ctx.decoded_cache,
+            verified_runs: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             snapshots: ctx.snapshots,
             commit_lock: ctx.commit_lock,
             result_cache: Arc::new(parking_lot::Mutex::new(
@@ -1183,6 +1203,7 @@ impl Table {
             pinned: BTreeMap::new(),
             live_count: manifest.live_count,
             reservoir: crate::reservoir::Reservoir::default(),
+            reservoir_complete: false,
             had_deletes: saw_delete,
             agg_cache: HashMap::new(),
             global_idx_epoch: manifest.global_idx_epoch,
@@ -1192,6 +1213,7 @@ impl Table {
             flushed_epoch: manifest.flushed_epoch,
             page_cache: ctx.page_cache,
             decoded_cache: ctx.decoded_cache,
+            verified_runs: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             snapshots: ctx.snapshots,
             commit_lock: ctx.commit_lock,
             result_cache: Arc::new(parking_lot::Mutex::new(
@@ -1287,11 +1309,28 @@ impl Table {
             db.remove_hot_for_row(*rid, *epoch);
         }
 
-        let _ = db.rebuild_reservoir();
+        // The reservoir stays lazy (`reservoir_complete == false`, set above):
+        // rebuilding it means materializing every visible row, which no plain
+        // open/insert/update/delete needs. `ensure_reservoir_complete` pays
+        // that cost on the first `approx_aggregate` call instead.
         // Load the persistent result-cache tier (hardening (b)) so fine-grained
         // invalidation resumes across restart.
         db.result_cache.lock().load_persistent();
         Ok(db)
+    }
+
+    /// Rebuild `reservoir` from every visible row if it isn't already
+    /// complete (lazy — same pattern as [`Self::ensure_indexes_complete`]).
+    /// Open and WAL replay leave the reservoir stale rather than eagerly
+    /// paying a full-table scan; this pays it once, on the first
+    /// [`Self::approx_aggregate`] call.
+    fn ensure_reservoir_complete(&mut self) -> Result<()> {
+        if self.reservoir_complete {
+            return Ok(());
+        }
+        self.rebuild_reservoir()?;
+        self.reservoir_complete = true;
+        Ok(())
     }
 
     /// Repopulate the reservoir sample from all visible rows (used on open so a
@@ -1351,14 +1390,22 @@ impl Table {
     }
 
     fn refresh_pk_by_row_from_hot(&mut self) {
-        self.pk_by_row.clear();
         self.pk_by_row_complete = true;
         if self.schema.primary_key().is_none() {
+            self.pk_by_row.clear();
             return;
         }
-        for (key, row_id) in self.hot.entries() {
-            self.pk_by_row.insert(row_id, key);
-        }
+        // `.collect()` drives `HashMap`'s bulk-build `FromIterator` (reserves
+        // once from the exact-size iterator), instead of growing-and-rehashing
+        // through a one-at-a-time `insert()` loop — same fix as
+        // `HotIndex::from_entries`, same hot path (first delete after a put
+        // streak rebuilds this from the full HOT index).
+        self.pk_by_row = self
+            .hot
+            .entries()
+            .into_iter()
+            .map(|(key, row_id)| (row_id, key))
+            .collect();
     }
 
     fn insert_hot_pk(&mut self, key: Vec<u8>, row_id: RowId) {
@@ -2112,7 +2159,9 @@ impl Table {
             self.memtable.tombstone(rid, epoch);
             self.remove_hot_for_row(rid, epoch);
         }
-        let _ = self.rebuild_reservoir();
+        // Reservoir stays lazy — see `ensure_reservoir_complete` — rather than
+        // eagerly materializing every row on every WAL-replay batch.
+        self.reservoir_complete = false;
         Ok(())
     }
 
@@ -2256,6 +2305,7 @@ impl Table {
         self.pk_by_row_complete = false;
         self.live_count = 0;
         self.reservoir = crate::reservoir::Reservoir::default();
+        self.reservoir_complete = true;
         self.had_deletes = true;
         self.agg_cache.clear();
         self.global_idx_epoch = 0;
@@ -2304,47 +2354,75 @@ impl Table {
     /// that PK to this row id, remove the entry. Keeps the PK→RowId mapping
     /// consistent after deletes and before upserts.
     fn remove_hot_for_row(&mut self, row_id: RowId, epoch: Epoch) {
-        // Puts leave the reverse map stale to stay off the hot write path;
-        // the first delete that needs it pays one rebuild from `hot`.
-        if !self.pk_by_row_complete {
-            self.refresh_pk_by_row_from_hot();
-        }
         let Some(pk_col) = self.schema.primary_key() else {
             return;
         };
-        if let Some(key) = self.pk_by_row.remove(&row_id) {
-            if self.hot.get(&key) == Some(row_id) {
-                self.hot.remove(&key);
+        // Warm path: a prior delete in this process already paid the
+        // reverse-map rebuild below, so it's kept up to date — O(1).
+        if self.pk_by_row_complete {
+            if let Some(key) = self.pk_by_row.remove(&row_id) {
+                if self.hot.get(&key) == Some(row_id) {
+                    self.hot.remove(&key);
+                }
             }
             return;
         }
-        if !self.indexes_complete {
-            return;
-        }
-        // Use get_version (not get) so older visible versions can still reveal
-        // the primary-key value that HOT needs to clean up.
-        let pk_val = self
-            .memtable
-            .get_version(row_id, epoch)
-            .and_then(|(_, r)| r.columns.get(&pk_col.id).cloned())
-            .or_else(|| {
-                self.mutable_run
-                    .get_version(row_id, epoch)
-                    .filter(|(_, r)| !r.deleted)
-                    .and_then(|(_, r)| r.columns.get(&pk_col.id).cloned())
-            })
-            .or_else(|| {
-                self.run_refs.iter().find_map(|rr| {
-                    let mut reader = self.open_reader(rr.run_id).ok()?;
-                    let (_, r) = reader.get_version(row_id, epoch).ok()??;
-                    if r.deleted {
-                        return None;
-                    }
-                    r.columns.get(&pk_col.id).cloned()
+        // Cold path (the common case: a short-lived process — CLI,
+        // NAPI-per-call — that deletes once and exits): derive the PK
+        // straight from the row's own pre-delete version via a targeted
+        // get_version lookup (memtable -> mutable_run -> runs, the same
+        // page-pruned lookup `Table::get` uses) instead of paying
+        // `refresh_pk_by_row_from_hot`'s O(table-size) rebuild for a single
+        // delete. `pk_by_row` is deliberately left incomplete here — same
+        // "puts leave the reverse map stale" tradeoff, extended to this path.
+        //
+        // Look up at `epoch - 1`, not `epoch`: on the live-delete call site
+        // this delete's own tombstone hasn't landed yet either way, but on
+        // the WAL-replay call sites (`recover_apply`, `open_in`) the
+        // memtable tombstone for this exact row/epoch is already applied
+        // before this runs. Querying `epoch` would see that tombstone
+        // (empty columns) and fall through to the full rebuild every time a
+        // replayed delete exists; `epoch - 1` is still >= any real prior
+        // version's committed_epoch (epochs are unique and monotonic), so it
+        // finds the same pre-delete row either way.
+        let lookup_epoch = Epoch(epoch.0.saturating_sub(1));
+        if self.indexes_complete {
+            let pk_val = self
+                .memtable
+                .get_version(row_id, lookup_epoch)
+                .and_then(|(_, r)| r.columns.get(&pk_col.id).cloned())
+                .or_else(|| {
+                    self.mutable_run
+                        .get_version(row_id, lookup_epoch)
+                        .filter(|(_, r)| !r.deleted)
+                        .and_then(|(_, r)| r.columns.get(&pk_col.id).cloned())
                 })
-            });
-        if let Some(pk_val) = pk_val {
-            let key = self.index_lookup_key(pk_col.id, &pk_val);
+                .or_else(|| {
+                    self.run_refs.iter().find_map(|rr| {
+                        let mut reader = self.open_reader(rr.run_id).ok()?;
+                        let (_, deleted, val) = reader
+                            .get_version_column(row_id, lookup_epoch, pk_col.id)
+                            .ok()??;
+                        if deleted {
+                            return None;
+                        }
+                        val
+                    })
+                });
+            if let Some(pk_val) = pk_val {
+                let key = self.index_lookup_key(pk_col.id, &pk_val);
+                if self.hot.get(&key) == Some(row_id) {
+                    self.hot.remove(&key);
+                }
+                return;
+            }
+        }
+        // Fallback: full reverse-map rebuild, guaranteed correct. Reached
+        // when indexes aren't complete yet, or the row was already gone by
+        // the time this ran (e.g. already tombstoned in an overlay ahead of
+        // this HOT cleanup, as `rebuild_indexes_from_runs` does).
+        self.refresh_pk_by_row_from_hot();
+        if let Some(key) = self.pk_by_row.remove(&row_id) {
             if self.hot.get(&key) == Some(row_id) {
                 self.hot.remove(&key);
             }
@@ -3021,24 +3099,76 @@ impl Table {
         // older version in the mutable-run tier and a newer one in the memtable
         // (an update after a flush), so keep the **newest by epoch** across both
         // tiers, not whichever is inserted last.
-        let mut overlay: HashMap<u64, Row> = HashMap::new();
-        let fold_newest = |row: Row, overlay: &mut HashMap<u64, Row>| {
-            overlay
-                .entry(row.row_id.0)
-                .and_modify(|e| {
-                    if row.committed_epoch > e.committed_epoch {
-                        *e = row.clone();
-                    }
-                })
-                .or_insert(row);
-        };
-        for row in self.memtable.visible_versions(snapshot.epoch) {
-            fold_newest(row, &mut overlay);
-        }
-        for row in self.mutable_run.visible_versions(snapshot.epoch) {
-            fold_newest(row, &mut overlay);
+        //
+        // `rids` is already index-resolved (the caller's condition set), so it
+        // is normally tiny relative to the memtable/mutable-run tiers — a
+        // single-row PK/unique check feeding insert/update/delete resolves to
+        // 0 or 1 rid. Materializing every version in both tiers (the old
+        // behavior) cost O(tier size) regardless, which meant an unrelated
+        // full-table-sized scan (plus the drop cost of the resulting map) on
+        // every point lookup once the table grew large. Below the crossover,
+        // a direct per-rid probe (`get_version`, O(log tier size) each) wins;
+        // once `rids` approaches tier size, one linear materializing pass
+        // beats `rids.len()` separate probes, so fall back to it.
+        let tier_size = self.memtable.len() + self.mutable_run.len();
+        let mut overlay: HashMap<u64, Row> = HashMap::with_capacity(rids.len());
+        if rids.len().saturating_mul(24) < tier_size {
+            for &rid in rids {
+                let mem = self.memtable.get_version(RowId(rid), snapshot.epoch);
+                let mrun = self.mutable_run.get_version(RowId(rid), snapshot.epoch);
+                let newest = match (mem, mrun) {
+                    (Some((me, mr)), Some((re, rr))) => Some(if me >= re { mr } else { rr }),
+                    (Some((_, mr)), None) => Some(mr),
+                    (None, Some((_, rr))) => Some(rr),
+                    (None, None) => None,
+                };
+                if let Some(row) = newest {
+                    overlay.insert(rid, row);
+                }
+            }
+        } else {
+            let fold_newest = |row: Row, overlay: &mut HashMap<u64, Row>| {
+                overlay
+                    .entry(row.row_id.0)
+                    .and_modify(|e| {
+                        if row.committed_epoch > e.committed_epoch {
+                            *e = row.clone();
+                        }
+                    })
+                    .or_insert(row);
+            };
+            for row in self.memtable.visible_versions(snapshot.epoch) {
+                fold_newest(row, &mut overlay);
+            }
+            for row in self.mutable_run.visible_versions(snapshot.epoch) {
+                fold_newest(row, &mut overlay);
+            }
         }
         if self.run_refs.len() == 1 {
+            let mut reader = self.open_reader(self.run_refs[0].run_id)?;
+            // Same crossover as the overlay above: `visible_positions_with_rids`
+            // decodes/scans the run's *entire* row-id column regardless of
+            // `rids.len()`, so a point lookup (0 or 1 rid, the common
+            // insert/update/delete case) paid an O(run size) tax for a single
+            // row. Below the crossover, `get_version`'s page-pruned lookup
+            // (`SYS_ROW_ID` pages carry exact row-id bounds) resolves each rid
+            // by decoding only its page, no whole-column decode.
+            if rids.len().saturating_mul(24) < reader.row_count() {
+                for &rid in rids {
+                    if let Some(r) = overlay.get(&rid) {
+                        if !r.deleted {
+                            rows.push(r.clone());
+                        }
+                        continue;
+                    }
+                    if let Some((_, row)) = reader.get_version(RowId(rid), snapshot.epoch)? {
+                        if !row.deleted {
+                            rows.push(row);
+                        }
+                    }
+                }
+                return Ok(rows);
+            }
             // Phase 16.3b: decode the system columns ONCE (via the clean-run-
             // shortcut visibility pass) and binary-search each requested rid,
             // instead of `get_version`-per-rid which re-decoded + cloned the
@@ -3047,7 +3177,6 @@ impl Table {
             // `materialize_batch` call so user columns are decoded once each via
             // the typed, page-cached path (not a per-rid `Vec<Value>` decode +
             // `.cloned()`).
-            let mut reader = self.open_reader(self.run_refs[0].run_id)?;
             let (positions, vis_rids) = reader.visible_positions_with_rids(snapshot.epoch)?;
             // First pass: classify each input rid (overlay / run position /
             // not-found), recording the run positions to fetch in input order.
@@ -5424,13 +5553,14 @@ impl Table {
     /// are index-defined and resolved once to a row-id set that sampled rows are
     /// tested against. `Ok(None)` when there is no usable sample.
     pub fn approx_aggregate(
-        &self,
+        &mut self,
         conditions: &[crate::query::Condition],
         column: Option<u16>,
         agg: ApproxAgg,
         z: f64,
     ) -> Result<Option<ApproxResult>> {
         use crate::query::Condition;
+        self.ensure_reservoir_complete()?;
         let snapshot = self.snapshot();
         let n_pop = self.live_count;
         let sample_rids: Vec<u64> = self.reservoir.row_ids().to_vec();
@@ -5935,6 +6065,7 @@ impl Table {
             Some(self.page_cache.clone()),
             Some(self.decoded_cache.clone()),
             self.table_id,
+            Some(&self.verified_runs),
         )?;
         // Overlay the real commit epoch for uniform-epoch (large-txn spill) runs:
         // their stored `_epoch` is a placeholder; the manifest RunRef carries the
