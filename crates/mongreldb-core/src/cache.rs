@@ -29,6 +29,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub struct CacheStats {
     pub hits: u64,
     pub misses: u64,
+    /// Lookups skipped because the cache shard's lock was contended
+    /// (`try_lock` returned `None`). Non-zero values signal contention that
+    /// sharding or a larger shard count could relieve. (§5.8)
+    pub try_lock_misses: u64,
 }
 
 impl CacheStats {
@@ -91,6 +95,7 @@ impl PageCache {
         CacheStats {
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
+            try_lock_misses: 0,
         }
     }
 
@@ -389,6 +394,7 @@ impl DecodedPageCache {
         CacheStats {
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
+            try_lock_misses: 0,
         }
     }
 
@@ -459,6 +465,112 @@ impl DecodedPageCache {
     }
 }
 
+/// A sharded mutex wrapper for the page caches. Each key routes to one of `N`
+/// independent shards (each with its own lock), so concurrent rayon workers
+/// probing different keys rarely contend on the same lock. A `try_lock` that
+/// fails under contention is counted as a try-lock-miss. (§5.8)
+pub struct Sharded<T> {
+    shards: Vec<parking_lot::Mutex<T>>,
+    try_lock_misses: AtomicU64,
+}
+
+/// Default shard count — balances contention reduction against per-shard
+/// overhead. Each shard gets `total_capacity / SHARDS` of the budget.
+pub const CACHE_SHARDS: usize = 16;
+
+impl<T> Sharded<T> {
+    pub fn new(n_shards: usize, make: impl FnMut() -> T) -> Self {
+        let mut make = make;
+        let shards = (0..n_shards).map(|_| parking_lot::Mutex::new(make())).collect();
+        Self {
+            shards,
+            try_lock_misses: AtomicU64::new(0),
+        }
+    }
+
+    fn idx(&self, key: &[u8; 32]) -> usize {
+        let h = u32::from_le_bytes([key[0], key[1], key[2], key[3]]);
+        (h as usize) % self.shards.len()
+    }
+
+    pub fn try_lock(&self, key: &[u8; 32]) -> Option<parking_lot::MutexGuard<'_, T>> {
+        match self.shards[self.idx(key)].try_lock() {
+            Some(g) => Some(g),
+            None => {
+                self.try_lock_misses.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+
+    pub fn lock(&self, key: &[u8; 32]) -> parking_lot::MutexGuard<'_, T> {
+        self.shards[self.idx(key)].lock()
+    }
+
+    pub fn try_lock_misses(&self) -> u64 {
+        self.try_lock_misses.load(Ordering::Relaxed)
+    }
+}
+
+impl Sharded<PageCache> {
+    pub fn stats(&self) -> CacheStats {
+        let mut total = CacheStats::default();
+        for s in &self.shards {
+            let st = s.lock().stats();
+            total.hits += st.hits;
+            total.misses += st.misses;
+        }
+        total.try_lock_misses = self.try_lock_misses();
+        total
+    }
+
+    pub fn reset_stats(&self) {
+        for s in &self.shards {
+            s.lock().reset_stats();
+        }
+        self.try_lock_misses.store(0, Ordering::Relaxed);
+    }
+
+    pub fn flush_to_disk(&self) {
+        for s in &self.shards {
+            s.lock().flush_to_disk();
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.shards.iter().map(|s| s.lock().len()).sum()
+    }
+
+    #[allow(clippy::len_without_is_empty)]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl Sharded<DecodedPageCache> {
+    pub fn stats(&self) -> CacheStats {
+        let mut total = CacheStats::default();
+        for s in &self.shards {
+            let st = s.lock().stats();
+            total.hits += st.hits;
+            total.misses += st.misses;
+        }
+        total.try_lock_misses = self.try_lock_misses();
+        total
+    }
+
+    pub fn reset_stats(&self) {
+        for s in &self.shards {
+            s.lock().reset_stats();
+        }
+        self.try_lock_misses.store(0, Ordering::Relaxed);
+    }
+
+    pub fn len(&self) -> usize {
+        self.shards.iter().map(|s| s.lock().len()).sum()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,7 +603,7 @@ mod tests {
         let mut cache = PageCache::new(1 << 20);
         let hash = [7u8; 32];
         cache.insert(page(hash, 1, b"v"));
-        assert_eq!(cache.stats(), CacheStats { hits: 0, misses: 0 });
+        assert_eq!(cache.stats(), CacheStats { hits: 0, misses: 0, try_lock_misses: 0 });
 
         // Visible hit (get + try_get).
         assert!(cache.get(&hash, Snapshot::at(Epoch(1))).is_some());
@@ -501,11 +613,11 @@ mod tests {
         assert!(cache.get(&hash, Snapshot::at(Epoch(0))).is_none());
 
         let s = cache.stats();
-        assert_eq!(s, CacheStats { hits: 2, misses: 2 });
+        assert_eq!(s, CacheStats { hits: 2, misses: 2, try_lock_misses: 0 });
         assert!((s.hit_rate() - 0.5).abs() < 1e-9);
 
         cache.reset_stats();
-        assert_eq!(cache.stats(), CacheStats { hits: 0, misses: 0 });
+        assert_eq!(cache.stats(), CacheStats { hits: 0, misses: 0, try_lock_misses: 0 });
         assert_eq!(cache.stats().hit_rate(), 0.0);
     }
 

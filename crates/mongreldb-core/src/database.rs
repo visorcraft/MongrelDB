@@ -58,8 +58,8 @@ pub struct Database {
     catalog: RwLock<Catalog>,
     epoch: Arc<EpochAuthority>,
     snapshots: Arc<SnapshotRegistry>,
-    page_cache: Arc<parking_lot::Mutex<crate::cache::PageCache>>,
-    decoded_cache: Arc<parking_lot::Mutex<crate::cache::DecodedPageCache>>,
+    page_cache: Arc<crate::cache::Sharded<crate::cache::PageCache>>,
+    decoded_cache: Arc<crate::cache::Sharded<crate::cache::DecodedPageCache>>,
     commit_lock: Arc<Mutex<()>>,
     /// One shared WAL multiplexing every table's records (spec §7.2). Owned
     /// behind a `Mutex` so the transaction layer can append + group-sync. Shared
@@ -209,11 +209,21 @@ impl Database {
     ) -> Result<Self> {
         let epoch = Arc::new(EpochAuthority::new(cat.db_epoch));
         let snapshots = Arc::new(SnapshotRegistry::new());
-        let page_cache = Arc::new(parking_lot::Mutex::new(crate::cache::PageCache::new(
-            crate::engine::PAGE_CACHE_CAPACITY,
-        )));
-        let decoded_cache = Arc::new(parking_lot::Mutex::new(
-            crate::cache::DecodedPageCache::new(crate::engine::DECODED_CACHE_CAPACITY),
+        let page_cache = Arc::new(crate::cache::Sharded::new(
+            crate::cache::CACHE_SHARDS,
+            || {
+                crate::cache::PageCache::new(
+                    crate::engine::PAGE_CACHE_CAPACITY / crate::cache::CACHE_SHARDS as u64,
+                )
+            },
+        ));
+        let decoded_cache = Arc::new(crate::cache::Sharded::new(
+            crate::cache::CACHE_SHARDS,
+            || {
+                crate::cache::DecodedPageCache::new(
+                    crate::engine::DECODED_CACHE_CAPACITY / crate::cache::CACHE_SHARDS as u64,
+                )
+            },
         ));
         let commit_lock = Arc::new(Mutex::new(()));
         let wal_dek = crate::encryption::wal_dek_for(kek.as_deref());

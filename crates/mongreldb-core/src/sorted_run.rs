@@ -1619,11 +1619,11 @@ pub struct RunReader {
     /// Shared, MVCC content-addressed page cache (Phase 9.2). Caches raw page
     /// bytes (ciphertext when encrypted) so all readers share decoded/decrypted
     /// pages. `None` only in standalone tests.
-    page_cache: Option<Arc<parking_lot::Mutex<crate::cache::PageCache>>>,
+    page_cache: Option<Arc<crate::cache::Sharded<crate::cache::PageCache>>>,
     /// Shared decoded-page cache (Phase 15.4): the post-decompress/decrypt typed
     /// page, so a repeat scan skips decode. Keyed by `(run_id, column_id,
     /// page_seq)` identity; `None` in standalone tests.
-    decoded_cache: Option<Arc<parking_lot::Mutex<crate::cache::DecodedPageCache>>>,
+    decoded_cache: Option<Arc<crate::cache::Sharded<crate::cache::DecodedPageCache>>>,
     /// Uniform-epoch overlay (see [`RUN_FLAG_UNIFORM_EPOCH`]). When `Some`, every
     /// row's commit epoch is taken to be this value instead of the placeholder
     /// stored in the `_epoch` column. Set by [`Self::set_uniform_epoch`].
@@ -1640,8 +1640,8 @@ impl RunReader {
         path: impl AsRef<Path>,
         schema: Schema,
         kek: Option<Arc<Kek>>,
-        page_cache: Option<Arc<parking_lot::Mutex<crate::cache::PageCache>>>,
-        decoded_cache: Option<Arc<parking_lot::Mutex<crate::cache::DecodedPageCache>>>,
+        page_cache: Option<Arc<crate::cache::Sharded<crate::cache::PageCache>>>,
+        decoded_cache: Option<Arc<crate::cache::Sharded<crate::cache::DecodedPageCache>>>,
         table_id: u64,
         verified_runs: Option<&parking_lot::Mutex<std::collections::HashSet<u128>>>,
     ) -> Result<Self> {
@@ -1829,7 +1829,7 @@ impl RunReader {
         // present, so concurrent readers never re-read or re-decrypt a page.
         let key = page_cache_key(self.table_id, self.header.run_id, column_id, page_seq);
         if let Some(cache) = &self.page_cache {
-            if let Some(bytes) = cache.lock().get(
+            if let Some(bytes) = cache.lock(&key).get(
                 &key,
                 crate::epoch::Snapshot::at(crate::epoch::Epoch(u64::MAX)),
             ) {
@@ -1856,7 +1856,7 @@ impl RunReader {
         };
         // Spill the raw bytes into the shared cache (post-read, pre-decrypt).
         if let Some(cache) = &self.page_cache {
-            cache.lock().insert(crate::page::CachedPage {
+            cache.lock(&key).insert(crate::page::CachedPage {
                 committed_epoch: crate::epoch::Epoch(self.header.epoch_created),
                 content_hash: key,
                 bytes: bytes::Bytes::copy_from_slice(&buf),
@@ -1887,7 +1887,7 @@ impl RunReader {
         // a contended lock. On a hit, avoid the mmap slice + decrypt entirely.
         let key = page_cache_key(self.table_id, self.header.run_id, column_id, page_seq);
         if let Some(cache) = &self.page_cache {
-            if let Some(guard) = cache.try_lock() {
+            if let Some(guard) = cache.try_lock(&key) {
                 if let Some(bytes) = guard.try_get(
                     &key,
                     crate::epoch::Snapshot::at(crate::epoch::Epoch(u64::MAX)),
@@ -1913,7 +1913,7 @@ impl RunReader {
         // readers (and encrypted re-reads) skip the mmap slice + decrypt. Never
         // block the rayon pool — if the lock is contended, just skip the insert.
         if let Some(cache) = &self.page_cache {
-            if let Some(mut guard) = cache.try_lock() {
+            if let Some(mut guard) = cache.try_lock(&key) {
                 guard.insert(crate::page::CachedPage {
                     committed_epoch: crate::epoch::Epoch(self.header.epoch_created),
                     content_hash: key,
@@ -2345,10 +2345,9 @@ impl RunReader {
         // Sequentially cache the freshly-decoded pages — no parallel contention
         // on the insert, so every miss is reliably stored for the next scan.
         if let Some(cache) = &self.decoded_cache {
-            let mut g = cache.lock();
             for (col, key) in parts_keys.iter_mut() {
                 if let Some(k) = key.take() {
-                    g.insert(k, Arc::new(col.clone()));
+                    cache.lock(&k).insert(k, Arc::new(col.clone()));
                 }
             }
         }
@@ -2370,7 +2369,7 @@ impl RunReader {
     ) -> Result<(columnar::NativeColumn, Option<[u8; 32]>)> {
         let key = page_cache_key(self.table_id, run_id, column_id, seq);
         if let Some(cache) = &self.decoded_cache {
-            if let Some(g) = cache.try_lock() {
+            if let Some(g) = cache.try_lock(&key) {
                 if let Some(hit) = g.try_get(&key) {
                     return Ok(((*hit).clone(), None));
                 }
@@ -2400,14 +2399,14 @@ impl RunReader {
     ) -> Result<columnar::NativeColumn> {
         let key = page_cache_key(self.table_id, self.header.run_id, column_id, seq);
         if let Some(cache) = &self.decoded_cache {
-            if let Some(hit) = cache.lock().try_get(&key) {
+            if let Some(hit) = cache.lock(&key).try_get(&key) {
                 return Ok((*hit).clone());
             }
         }
         let raw = self.read_page(column_id, seq)?;
         let col = columnar::decode_page_native(ty, &raw, nrows)?;
         if let Some(cache) = &self.decoded_cache {
-            cache.lock().insert(key, std::sync::Arc::new(col.clone()));
+            cache.lock(&key).insert(key, std::sync::Arc::new(col.clone()));
         }
         Ok(col)
     }

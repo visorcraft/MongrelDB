@@ -200,7 +200,7 @@ pub struct Table {
     flushed_epoch: u64,
     /// Shared, MVCC content-addressed page cache (Phase 9.2). Fed by every
     /// `RunReader::read_page` so all readers share raw (decrypted) page bytes.
-    page_cache: Arc<parking_lot::Mutex<crate::cache::PageCache>>,
+    page_cache: Arc<crate::cache::Sharded<crate::cache::PageCache>>,
     /// Global snapshot-retention registry shared across all tables in a
     /// `Database`. Single-table direct opens get a private one.
     snapshots: Arc<crate::retention::SnapshotRegistry>,
@@ -208,7 +208,7 @@ pub struct Table {
     commit_lock: Arc<parking_lot::Mutex<()>>,
     /// Shared decoded-page cache (Phase 15.4): the post-decompress/decrypt typed
     /// page, so repeat scans skip decode. Keyed by `(run_id, column_id, page)`.
-    decoded_cache: Arc<parking_lot::Mutex<crate::cache::DecodedPageCache>>,
+    decoded_cache: Arc<crate::cache::Sharded<crate::cache::DecodedPageCache>>,
     /// `run_id`s whose on-disk footer checksum has already been verified by a
     /// `RunReader` construction in this process. `.sr` runs are immutable once
     /// written, so re-hashing an already-verified run's full body on every
@@ -780,8 +780,8 @@ fn build_column_keys(kek: Option<&Kek>, schema: &Schema) -> HashMap<u16, ([u8; 3
 /// single table builds a private `SharedCtx` of its own.
 pub(crate) struct SharedCtx {
     pub epoch: Arc<EpochAuthority>,
-    pub page_cache: Arc<parking_lot::Mutex<crate::cache::PageCache>>,
-    pub decoded_cache: Arc<parking_lot::Mutex<crate::cache::DecodedPageCache>>,
+    pub page_cache: Arc<crate::cache::Sharded<crate::cache::PageCache>>,
+    pub decoded_cache: Arc<crate::cache::Sharded<crate::cache::DecodedPageCache>>,
     pub snapshots: Arc<crate::retention::SnapshotRegistry>,
     pub kek: Option<Arc<Kek>>,
     /// Serializes the commit critical section across all tables sharing this
@@ -821,16 +821,33 @@ impl SharedCtx {
     /// on-disk page cache persistence (single-table direct open); `None` keeps
     /// it in-memory (shared across tables in a `Database`).
     pub(crate) fn new(kek: Option<Arc<Kek>>, cache_dir: Option<PathBuf>) -> Self {
-        let mut cache = crate::cache::PageCache::new(PAGE_CACHE_CAPACITY);
-        if let Some(d) = cache_dir {
-            cache = cache.with_persistence(d);
-        }
+        // §5.8: shard the caches to reduce lock contention under parallel
+        // rayon scans. The persistent (single-table) path uses 1 shard (no
+        // contention) so its on-disk load/spill stays simple.
+        let n_shards = if cache_dir.is_some() {
+            1
+        } else {
+            crate::cache::CACHE_SHARDS
+        };
+        let per_shard = PAGE_CACHE_CAPACITY / n_shards as u64;
+        let page_cache = if let Some(d) = cache_dir {
+            Arc::new(crate::cache::Sharded::new(1, || {
+                crate::cache::PageCache::new(PAGE_CACHE_CAPACITY).with_persistence(d.clone())
+            }))
+        } else {
+            Arc::new(crate::cache::Sharded::new(n_shards, || {
+                crate::cache::PageCache::new(per_shard)
+            }))
+        };
+        let decoded_per_shard = DECODED_CACHE_CAPACITY / crate::cache::CACHE_SHARDS as u64;
+        let decoded_cache = Arc::new(crate::cache::Sharded::new(
+            crate::cache::CACHE_SHARDS,
+            || crate::cache::DecodedPageCache::new(decoded_per_shard),
+        ));
         Self {
             epoch: Arc::new(EpochAuthority::new(0)),
-            page_cache: Arc::new(parking_lot::Mutex::new(cache)),
-            decoded_cache: Arc::new(parking_lot::Mutex::new(
-                crate::cache::DecodedPageCache::new(DECODED_CACHE_CAPACITY),
-            )),
+            page_cache,
+            decoded_cache,
             snapshots: Arc::new(crate::retention::SnapshotRegistry::new()),
             kek,
             commit_lock: Arc::new(parking_lot::Mutex::new(())),
@@ -4210,12 +4227,12 @@ impl Table {
     /// Useful for confirming a repeat scan is served from cache or measuring a
     /// query's locality after [`reset_page_cache_stats`](Self::reset_page_cache_stats).
     pub fn page_cache_stats(&self) -> crate::cache::CacheStats {
-        self.page_cache.lock().stats()
+        self.page_cache.stats()
     }
 
     /// Zero the raw-page-cache hit/miss counters.
     pub fn reset_page_cache_stats(&self) {
-        self.page_cache.lock().reset_stats();
+        self.page_cache.reset_stats();
     }
 
     /// The run IDs in level order (Phase 15.5: used by the Arrow IPC shadow to
@@ -6025,18 +6042,18 @@ impl Table {
     /// directory (best-effort). Useful before a clean shutdown so hot pages
     /// survive restart.
     pub fn page_cache_flush(&self) {
-        self.page_cache.lock().flush_to_disk();
+        self.page_cache.flush_to_disk();
     }
 
     /// Number of entries currently in the shared page cache (diagnostic).
     pub fn page_cache_len(&self) -> usize {
-        self.page_cache.lock().len()
+        self.page_cache.len()
     }
 
     /// Number of entries currently in the shared decoded-page cache (Phase
     /// 15.4 diagnostic).
     pub fn decoded_cache_len(&self) -> usize {
-        self.decoded_cache.lock().len()
+        self.decoded_cache.len()
     }
 
     /// Drain the live memtable (prototype/testing helper used by the flush path
