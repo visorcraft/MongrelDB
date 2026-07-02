@@ -14,7 +14,6 @@
 //!
 //! Usage: `mongreldb-server <db_dir> [port]`
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
@@ -26,7 +25,7 @@ use axum::Json;
 use mongreldb_core::schema::{Schema, TypeId};
 use mongreldb_core::{Database, Value};
 use mongreldb_query::MongrelSession;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::json;
 
 mod kit;
@@ -57,35 +56,6 @@ pub fn build_app(db: Arc<Database>) -> axum::Router {
         .route("/kit/query", post(kit::kit_query))
         .route("/kit/create_table", post(kit::kit_create_table))
         .with_state(state)
-}
-
-#[tokio::main]
-async fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        eprintln!("usage: {} <db_dir> [port]", args[0]);
-        std::process::exit(1);
-    }
-    let db_dir = &args[1];
-    let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(8453);
-
-    let db = Arc::new(Database::open(db_dir).unwrap_or_else(|e| {
-        eprintln!("failed to open {db_dir}: {e}");
-        std::process::exit(1);
-    }));
-    // §5.9: background cost-aware compaction. A dedicated thread sweeps every
-    // mounted table on a fixed interval and compacts any whose sorted-run
-    // count has crossed `Table::AUTO_COMPACT_RUN_THRESHOLD`, so a long-lived
-    // daemon under a steady stream of small writes doesn't accumulate unbounded
-    // `.sr` files (and multi-run query cost with them). Each table is locked
-    // only for its own compaction; snapshot retention is honored by `compact`.
-    spawn_auto_compactor(Arc::clone(&db));
-    let app = build_app(db);
-
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    eprintln!("mongreldb-server listening on http://{addr}");
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
 }
 
 /// Launch the §5.9 background auto-compaction sweep (run-count cost trigger).

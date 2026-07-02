@@ -2715,6 +2715,35 @@ impl Table {
         Ok(epoch)
     }
 
+    /// Force a full flush to a `.sr` sorted run regardless of the spill
+    /// threshold. Temporarily lowers `mutable_run_spill_bytes` to 1 so the
+    /// threshold check in [`Self::flush`] always fires. Used by
+    /// [`Self::close`] and the Kit's flush-on-close path (§4.4) so a
+    /// short-lived process (CLI, one-shot script) leaves all pending writes
+    /// durable in a run — keeping WAL segment count bounded across repeated
+    /// invocations. Best-effort: errors are propagated but the threshold is
+    /// always restored.
+    pub fn force_flush(&mut self) -> Result<Epoch> {
+        let saved = self.mutable_run_spill_bytes;
+        self.mutable_run_spill_bytes = 1;
+        let result = self.flush();
+        self.mutable_run_spill_bytes = saved;
+        result
+    }
+
+    /// Best-effort close: force-flush any pending writes to a sorted run so
+    /// the WAL segments can be reaped on the next open. Never panics — a
+    /// flush error is logged and returned but the threshold is always
+    /// restored. Call this as the last action before a short-lived process
+    /// exits (CLI, one-shot script). Not needed for the daemon (its
+    /// background auto-compactor handles run management). (§4.4)
+    pub fn close(&mut self) -> Result<()> {
+        if self.memtable_len() > 0 || self.mutable_run_len() > 0 {
+            self.force_flush()?;
+        }
+        Ok(())
+    }
+
     /// Mark `epoch` as flushed: append a `Flush` marker to the WAL, advance
     /// `flushed_epoch`, and — for a private WAL only — rotate to a fresh segment
     /// so the now-durable-in-a-run records are not replayed. A mounted table's

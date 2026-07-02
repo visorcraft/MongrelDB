@@ -1117,6 +1117,22 @@ impl Database {
             .collect()
     }
 
+    /// Best-effort flush-on-close (§4.4): force-flush every mounted table
+    /// that has pending writes to a `.sr` sorted run, so WAL segments can be
+    /// reaped on the next open. Call this as the last action before a
+    /// short-lived process (CLI, one-shot script) exits. The daemon does not
+    /// need this — its background auto-compactor handles run management.
+    pub fn close(&self) -> Result<()> {
+        for name in self.table_names() {
+            if let Ok(handle) = self.table(&name) {
+                if let Err(e) = handle.lock().close() {
+                    eprintln!("[close] flush failed for {name}: {e}");
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Look up a live table by name.
     pub fn table(&self, name: &str) -> Result<TableHandle> {
         let cat = self.catalog.read();
