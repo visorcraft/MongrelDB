@@ -3879,13 +3879,45 @@ impl Table {
         for condition in conditions {
             sets.push(self.resolve_condition(condition, snapshot)?);
         }
-        let count = RowIdSet::intersect_many(sets).len() as u64;
+        let mut rids = RowIdSet::intersect_many(sets);
+        // §5.1: the in-memory indexes (bitmap/FM/ANN/sparse/minhash) are
+        // append-only across puts (`index_row` adds entries but
+        // `tombstone_row` never removes them), so deletes and PK-displacing
+        // updates leave behind entries for now-tombstoned row-ids. The
+        // materialize paths (`query`, `query_columns_native`) already drop
+        // these via MVCC visibility during row fetch; only the count fast
+        // path trusts raw index cardinality, so prune tombstoned overlay
+        // row-ids here. On a clean table (empty overlay) the bitmap was
+        // rebuilt at flush and is authoritative — the prune is skipped.
+        if !self.memtable.is_empty() || !self.mutable_run.is_empty() {
+            rids.remove_many(self.overlay_tombstoned_rids(snapshot));
+        }
+        let count = rids.len() as u64;
         crate::trace::QueryTrace::record(|t| {
             t.scan_mode = crate::trace::ScanMode::CountSurvivors;
             t.survivor_count = Some(count as usize);
             t.conditions_pushed = conditions.len();
         });
         Ok(Some(count))
+    }
+
+    /// Row-ids whose newest visible overlay version is a tombstone. Used to
+    /// prune stale entries left behind by the append-only in-memory indexes
+    /// (see `count_conditions`). Only unflushed tombstones matter — a flush
+    /// rebuilds indexes from runs and excludes tombstoned rows. (§5.1)
+    fn overlay_tombstoned_rids(&self, snapshot: Snapshot) -> Vec<u64> {
+        let mut out = Vec::new();
+        for row in self.memtable.visible_versions(snapshot.epoch) {
+            if row.deleted {
+                out.push(row.row_id.0);
+            }
+        }
+        for row in self.mutable_run.visible_versions(snapshot.epoch) {
+            if row.deleted {
+                out.push(row.row_id.0);
+            }
+        }
+        out
     }
 
     /// Bulk-load typed columns straight to a new run — the fast ingest path.
