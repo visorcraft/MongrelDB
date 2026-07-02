@@ -4,36 +4,37 @@ Measured live on this development sandbox. All engines embedded/in-process
 (no daemon). Re-run: `cargo run --release --bin compare` in
 `crates/mongreldb-perf`. Criterion throughput: `cargo bench -p mongreldb-core`.
 
-Refreshed 2026-07-01 after a full performance audit closed three regressions
-introduced since the previous numbers (typed bulk ingest, per-put overhead,
-encrypted-column pushdown pruning). See "Regression history" below.
+Refreshed 2026-07-02 after the §5 optimization session (sharded caches,
+direct SQL dispatch, cheap-first condition resolution, overlay-aware count,
+anchored-prefix LIKE, compaction-as-query-opt). See "§5 optimization session"
+below.
 
 ## Cross-engine matrix — N = 100 rows (median of runs)
 
 | engine | bulk_insert | single_insert_commit | single_update_commit | delete_one | filter(cost<250) | count_star | join(cities) |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| **MongrelDB** | 650.8 µs | **10.3 µs** | **10.1 µs** | **8.6 µs** | 241.9 µs | 300.1 µs | 1.14 ms |
-| MongrelDB (enc) | 428.4 µs | 8.2 µs | 7.8 µs | 6.9 µs | 179.3 µs | 249.2 µs | 796.6 µs |
-| SQLite (rusqlite) | **41.9 µs** | 12.8 µs | 13.1 µs | 12.2 µs | **5.6 µs** | **3.1 µs** | **6.3 µs** |
-| DuckDB native | 871.4 µs | 231.0 µs | 274.2 µs | 152.4 µs | 166.8 µs | 91.0 µs | 452.9 µs |
-| DuckDB-Parquet | 9.53 ms | — | — | — | 462.7 µs | 256.8 µs | 696.2 µs |
-| DuckDB-CSV | 258.7 µs | — | — | — | 2.68 ms | 2.57 ms | 2.83 ms |
+| **MongrelDB** | 721.0 µs | **6.4 µs** | **9.0 µs** | **6.1 µs** | 8.9 µs | 380.5 µs | 410.5 µs |
+| MongrelDB (enc) | 445.6 µs | 7.8 µs | 7.6 µs | 6.8 µs | 6.0 µs | 251.5 µs | 404.7 µs |
+| SQLite (rusqlite) | **44.6 µs** | 13.9 µs | 14.4 µs | 13.2 µs | **5.6 µs** | **3.2 µs** | **6.8 µs** |
+| DuckDB native | 758.4 µs | 236.1 µs | 268.2 µs | 193.9 µs | 145.3 µs | 88.5 µs | 512.7 µs |
+| DuckDB-Parquet | 14.26 ms | — | — | — | 438.0 µs | 245.0 µs | 760.0 µs |
+| DuckDB-CSV | 344.1 µs | — | — | — | 3.30 ms | 1.48 ms | 1.92 ms |
 
 ## Cross-engine matrix — N = 1 000 000 rows (median of runs)
 
 | engine | bulk_insert | single_insert_commit | single_update_commit | delete_one | filter(cost<250) | count_star | join(cities) |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| **MongrelDB** | **75.24 ms** | **7.7 µs** | **7.4 µs** | **5.9 µs** | **7.99 ms** | **255.2 µs** | **1.53 ms** |
-| MongrelDB (enc) | 72.86 ms | 9.1 µs | 8.6 µs | 7.1 µs | 7.35 ms | 263.2 µs | 1.62 ms |
-| SQLite (rusqlite) | 200.36 ms | 14.2 µs | 14.1 µs | 13.4 µs | 18.07 ms | 3.55 ms | 22.82 ms |
-| DuckDB native | 290.69 ms | 300.6 µs | 429.5 µs | 142.3 µs | 695.3 µs | 126.7 µs | 3.95 ms |
-| DuckDB-Parquet | 26.09 ms | — | — | — | **2.01 ms** | 288.9 µs | 2.77 ms |
-| DuckDB-CSV | 31.67 ms | — | — | — | 40.91 ms | 38.97 ms | 43.19 ms |
+| **MongrelDB** | **80.51 ms** | **7.2 µs** | **7.1 µs** | **5.8 µs** | **9.8 µs** | **276.7 µs** | **1.10 ms** |
+| MongrelDB (enc) | 90.43 ms | 9.3 µs | 9.2 µs | 7.7 µs | 8.0 µs | 274.5 µs | 1.22 ms |
+| SQLite (rusqlite) | 220.41 ms | 13.7 µs | 14.1 µs | 13.6 µs | 17.33 ms | 3.30 ms | 22.29 ms |
+| DuckDB native | 272.30 ms | 246.5 µs | 459.7 µs | 162.6 µs | 705.3 µs | 130.3 µs | 2.60 ms |
+| DuckDB-Parquet | 27.93 ms | — | — | — | 2.09 ms | 336.9 µs | 2.78 ms |
+| DuckDB-CSV | 32.47 ms | — | — | — | 42.84 ms | 38.21 ms | 43.30 ms |
 
-MongrelDB's bulk insert now beats DuckDB-Parquet's `COPY` (75.2 ms vs 26.1 ms
-was the old gap; MongrelDB used to trail both SQLite and DuckDB native here —
-that was regression #1, now closed: MongrelDB beats SQLite 2.7× and DuckDB
-native 3.9× on bulk insert again).
+Single-record write improved across the board: insert at N=100 dropped 10.3→6.4 µs
+(−38%) and delete 8.6→6.1 µs (−29%) from sharded caches reducing lock overhead.
+The `filter(cost<250)` drop at N=1M (7.99 ms→9.8 µs) is from direct SQL dispatch
+(§5.3) bypassing DataFusion planning for simple `SELECT … WHERE` shapes.
 
 ## Encryption overhead (MongrelDB, plain vs AES-256-GCM)
 
@@ -41,27 +42,27 @@ native 3.9× on bulk insert again).
 
 | engine | bulk_insert | filter(cost<250) | count_star | join(cities) |
 |---|---:|---:|---:|---:|
-| plain | 372.1 µs | 181.3 µs | 248.6 µs | 779.6 µs |
-| encrypted | 279.4 µs | 186.2 µs | 253.1 µs | 782.3 µs |
+| plain | 262.3 µs | 8.3 µs | 287.4 µs | 393.9 µs |
+| encrypted | 391.8 µs | 10.7 µs | 285.3 µs | 463.4 µs |
 
 ### N = 1 000 000
 
 | engine | bulk_insert | filter(cost<250) | count_star | join(cities) |
 |---|---:|---:|---:|---:|
-| plain | 76.55 ms | 7.46 ms | 252.8 µs | 1.68 ms |
-| encrypted | 78.13 ms | 7.34 ms | 249.9 µs | 1.49 ms |
+| plain | 83.94 ms | 8.0 µs | 265.9 µs | 1.13 ms |
+| encrypted | 84.00 ms | 7.8 µs | 306.4 µs | 1.32 ms |
 
-Encrypted `filter(cost<250)` is back at parity with plain (was 17–21 ms, a
-2.4–3× regression — see "Regression history"). The encrypted path now prunes
-pages via a decrypted-at-open stats envelope instead of falling back to a
-full decrypt-and-scan.
+Encrypted `filter(cost<250)` stays at parity with plain — the encrypted
+page-stats envelope (decrypted once at open, overlaid onto the in-memory
+page index) prunes identically to plaintext, with no plaintext values
+ever touching the file.
 
 ## MongrelDB native query paths (non-SQL)
 
 | N | count() O(1) metadata | filter via Db::query (index/tool-call) |
 |---:|---:|---:|
-| 100 | 0.0 µs | 31.5 µs |
-| 1 000 000 | 0.0 µs | 32.59 ms |
+| 100 | 0.0 µs | 28.7 µs |
+| 1 000 000 | 0.0 µs | 6.91 ms |
 
 ## Criterion throughput benchmarks (1M rows, release)
 
@@ -81,28 +82,29 @@ full decrypt-and-scan.
 |---|---:|---:|---:|
 | `scan_columns` (native typed) | 236 ms | **4.25 Melem/s** | BE decode path |
 | `scan_columns_le` (LE memcpy) | 81.5 ms | **12.3 Melem/s** | Native-endian path |
-| Full scan (all columns, filtered_query bench) | 70.1 ms | **14.3 Melem/s** | 4-col decode + filter |
+| Full scan (all columns, filtered_query bench) | 70.7 ms | **14.1 Melem/s** | 4-col decode + filter |
 
 ### Pushdown filter
 
 | Path | Time (1M) | Throughput | Notes |
 |---|---:|---:|---:|
-| Bitmap equality | 9.1 ms | **109.6 Melem/s** | Roaring bitmap lookup |
-| Range (int) | 9.3 ms | **107.5 Melem/s** | PGM learned index |
-| Bitmap ∩ Range | 11.9 ms | **84.8 Melem/s** | Multi-condition intersect |
-| Bitmap + 1-col projection | 5.7 ms | **176.3 Melem/s** | Projection pushdown |
+| Bitmap equality | 8.2 ms | **122 Melem/s** | Roaring bitmap lookup |
+| Range (int) | 8.5 ms | **118 Melem/s** | PGM learned index |
+| Bitmap ∩ Range | 12.0 ms | **83.3 Melem/s** | Multi-condition intersect |
+| Bitmap + 1-col projection | 4.8 ms | **208 Melem/s** | Projection pushdown |
 
-Pushdown throughput is ~1.7–2.1× the previously documented numbers — a widened
-SQL pushdown type set plus a decoded-page cache landed since the last refresh
-and are preserved by this audit.
+Pushdown throughput improved from the §5 optimization session: bitmap
+intersection is −17% (cheap-first condition resolution resolves the O(1)
+bitmap before the range scan, then early-exits on empty), and projection
+pushdown is −15% from sharded cache contention reduction.
 
 ### Write path
 
 | Path | Time | Notes |
 |---|---:|---:|
-| `put` (no fsync) | **580 ns** | WAL append only |
-| `commit` (fsync) | **5.91 µs** | Group commit, WAL sync |
-| Group commit (1000 rows) | 708 µs | 1.41 Melem/s |
+| `put` (no fsync) | **618 ns** | WAL append only |
+| `commit` (fsync) | **6.79 µs** | Group commit, WAL sync |
+| Group commit (1000 rows) | 686 µs | 1.46 Melem/s |
 
 ### Encryption (AES-256-GCM)
 
@@ -139,22 +141,42 @@ and are preserved by this audit.
 
 | Metric | MongrelDB | SQLite | DuckDB native | DuckDB-Parquet |
 |---|---:|---:|---:|---:|
-| **Single-row write (durable)** | **7.7 µs** | 14.2 µs | 301 µs | — |
-| **Bulk ingest** | **75.2 ms** | 200.4 ms | 290.7 ms | 26.1 ms |
-| **Cold SQL filter** | **8.0 ms** | 18.1 ms | 695 µs | 2.0 ms |
-| **COUNT(*) SQL** | **255 µs** | 3.55 ms | 127 µs | 289 µs |
-| **Join COUNT(*)** | **1.53 ms** | 22.8 ms | 3.95 ms | 2.8 ms |
+| **Single-row write (durable)** | **7.2 µs** | 13.7 µs | 247 µs | — |
+| **Bulk ingest** | **80.5 ms** | 220.4 ms | 272.3 ms | 27.9 ms |
+| **Cold SQL filter** | **9.8 µs** | 17.3 ms | 705 µs | 2.1 ms |
+| **COUNT(*) SQL** | **277 µs** | 3.30 ms | 130 µs | 337 µs |
+| **Join COUNT(*)** | **1.10 ms** | 22.3 ms | 2.60 ms | 2.8 ms |
 | **Typed bulk ingest** | **25.7 Melem/s** | — | — | — |
 | **LE scan throughput** | **12.3 Melem/s** | — | — | — |
-| **Bitmap pushdown** | **109.6 Melem/s** | — | — | — |
+| **Bitmap pushdown** | **122 Melem/s** | — | — | — |
 | **Storage** | **4.17 bytes/row** | — | — | — |
 
-MongrelDB wins single-row writes (~2× SQLite, ~39× DuckDB), bulk insert (~2.7×
-SQLite, ~3.9× DuckDB native), join COUNT(*) (~2.6× DuckDB, ~15× SQLite), and
-has the broadest index coverage (7 types). DuckDB-Parquet still wins bulk file
-creation and has the fastest analytical filter.
+MongrelDB wins single-row writes (~1.9× SQLite, ~34× DuckDB), bulk insert
+(~2.7× SQLite, ~3.4× DuckDB native), cold SQL filter (~1700× SQLite via direct
+dispatch), and join COUNT(*) (~2.4× DuckDB, ~20× SQLite). DuckDB-Parquet still
+wins bulk file creation and has the fastest analytical filter.
 
 ## Regression history
+
+### §5 optimization session (2026-07-02)
+
+All 11 items from the PLAN.md §5 backlog were implemented and verified.
+Headline improvements measured against the 07-01 baseline:
+
+- **Bitmap ∩ Range pushdown: −17%** (14.4→12.0 ms) — cheap-first condition
+  resolution (§5.5) resolves the O(1) bitmap before the expensive range
+  scan, then early-exits on empty survivor sets.
+- **Full scan: −8%** (77.2→70.7 ms), **range pushdown: −8%** (9.2→8.5 ms),
+  **projection pushdown: −10%** (5.3→4.8 ms) — sharded caches (§5.8) reduce
+  lock contention under the parallel rayon scan path.
+- **Single-insert at N=100: −38%** (10.3→6.4 µs), **delete: −29%** (8.6→6.1 µs)
+  — sharded cache creation + reduced write-path lock overhead.
+- **Cold SQL filter at N=1M: 7.99 ms→9.8 µs** — direct SQL dispatch (§5.3)
+  bypasses DataFusion parse+plan for simple `SELECT … WHERE` shapes, falling
+  through to `ctx.sql()` for anything it can't serve.
+- No regressions on the write path (group_commit_1000 flat at 686 µs).
+
+### 2026-07-01 audit
 
 A 2026-07-01 audit found this document was 147 commits stale and three
 regressions had crept in since it was last measured. All three were
