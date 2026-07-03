@@ -46,6 +46,7 @@ fn sample_catalog() -> Catalog {
             state: TableState::Live,
             created_epoch: 2,
         }],
+        procedures: Vec::new(),
     }
 }
 

@@ -139,6 +139,28 @@ pub struct SchemaSpec {
     pub indexes: Vec<IndexSpec>,
 }
 
+#[napi(object)]
+pub struct ProcedureSpec {
+    pub json: String,
+}
+
+#[napi(object)]
+pub struct ProcedureInfo {
+    pub json: String,
+}
+
+#[napi(object)]
+pub struct ProcedureCallOptions {
+    pub args_json: Option<String>,
+    pub idempotency_key: Option<String>,
+}
+
+#[napi(object)]
+pub struct ProcedureCallResult {
+    pub epoch: Option<BigInt>,
+    pub result_json: String,
+}
+
 fn to_type_id(ty: &ColumnType, embedding_dim: Option<u32>) -> napi::Result<TypeId> {
     Ok(match ty {
         ColumnType::Bool => TypeId::Bool,
@@ -211,7 +233,83 @@ fn build_schema(spec: SchemaSpec) -> napi::Result<Schema> {
         schema_id: 1,
         columns,
         indexes,
-        colocation: Vec::new(), constraints: Default::default(),
+        colocation: Vec::new(),
+        constraints: Default::default(),
+    })
+}
+
+fn procedure_from_spec(spec: ProcedureSpec) -> napi::Result<mongreldb_core::StoredProcedure> {
+    let parsed: mongreldb_core::StoredProcedure =
+        serde_json::from_str(&spec.json).map_err(|e| {
+            napi::Error::new(
+                napi::Status::InvalidArg,
+                format!("invalid procedure JSON: {e}"),
+            )
+        })?;
+    mongreldb_core::StoredProcedure::new(parsed.name, parsed.mode, parsed.params, parsed.body, 0)
+        .map_err(to_napi)
+}
+
+fn procedure_info(procedure: &mongreldb_core::StoredProcedure) -> napi::Result<ProcedureInfo> {
+    Ok(ProcedureInfo {
+        json: serde_json::to_string(procedure).map_err(|e| {
+            napi::Error::new(
+                napi::Status::GenericFailure,
+                format!("procedure encode: {e}"),
+            )
+        })?,
+    })
+}
+
+fn procedure_args(
+    opts: Option<ProcedureCallOptions>,
+) -> napi::Result<std::collections::HashMap<String, Value>> {
+    let Some(opts) = opts else {
+        return Ok(std::collections::HashMap::new());
+    };
+    let Some(args_json) = opts.args_json else {
+        return Ok(std::collections::HashMap::new());
+    };
+    let raw: serde_json::Value = serde_json::from_str(&args_json).map_err(|e| {
+        napi::Error::new(
+            napi::Status::InvalidArg,
+            format!("invalid procedure args JSON: {e}"),
+        )
+    })?;
+    let obj = raw.as_object().ok_or_else(|| {
+        napi::Error::new(
+            napi::Status::InvalidArg,
+            "procedure args JSON must be an object",
+        )
+    })?;
+    obj.iter()
+        .map(|(key, value)| Ok((key.clone(), json_to_core_value(value)?)))
+        .collect()
+}
+
+fn json_to_core_value(value: &serde_json::Value) -> napi::Result<Value> {
+    Ok(match value {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(value) => Value::Bool(*value),
+        serde_json::Value::Number(value) => {
+            if let Some(value) = value.as_i64() {
+                Value::Int64(value)
+            } else if let Some(value) = value.as_f64() {
+                Value::Float64(value)
+            } else {
+                return Err(napi::Error::new(
+                    napi::Status::InvalidArg,
+                    "unsupported JSON number",
+                ));
+            }
+        }
+        serde_json::Value::String(value) => Value::Bytes(value.as_bytes().to_vec()),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+            return Err(napi::Error::new(
+                napi::Status::InvalidArg,
+                "procedure args only support scalar JSON values",
+            ));
+        }
     })
 }
 
@@ -842,6 +940,85 @@ impl Database {
     #[napi]
     pub fn table_names(&self) -> Vec<String> {
         self.inner.table_names()
+    }
+
+    #[napi]
+    pub fn create_procedure(&self, spec: ProcedureSpec) -> napi::Result<BigInt> {
+        let procedure = procedure_from_spec(spec)?;
+        let created = self.inner.create_procedure(procedure).map_err(to_napi)?;
+        Ok(BigInt::from(created.version))
+    }
+
+    #[napi]
+    pub fn create_or_replace_procedure(&self, spec: ProcedureSpec) -> napi::Result<BigInt> {
+        let procedure = procedure_from_spec(spec)?;
+        let created = self
+            .inner
+            .create_or_replace_procedure(procedure)
+            .map_err(to_napi)?;
+        Ok(BigInt::from(created.version))
+    }
+
+    #[napi]
+    pub fn drop_procedure(&self, name: String) -> napi::Result<()> {
+        self.inner.drop_procedure(&name).map_err(to_napi)
+    }
+
+    #[napi]
+    pub fn procedures(&self) -> napi::Result<Vec<ProcedureInfo>> {
+        self.inner.procedures().iter().map(procedure_info).collect()
+    }
+
+    #[napi]
+    pub fn procedure(&self, name: String) -> napi::Result<Option<ProcedureInfo>> {
+        self.inner
+            .procedure(&name)
+            .as_ref()
+            .map(procedure_info)
+            .transpose()
+    }
+
+    #[napi]
+    pub fn call_procedure(
+        &self,
+        name: String,
+        opts: Option<ProcedureCallOptions>,
+    ) -> napi::Result<ProcedureCallResult> {
+        let args = procedure_args(opts)?;
+        let result = self.inner.call_procedure(&name, args).map_err(to_napi)?;
+        Ok(ProcedureCallResult {
+            epoch: result.epoch.map(BigInt::from),
+            result_json: serde_json::to_string(&result.output).map_err(|e| {
+                napi::Error::new(
+                    napi::Status::GenericFailure,
+                    format!("procedure result: {e}"),
+                )
+            })?,
+        })
+    }
+
+    #[napi]
+    pub async fn call_procedure_async(
+        &self,
+        name: String,
+        opts: Option<ProcedureCallOptions>,
+    ) -> napi::Result<ProcedureCallResult> {
+        let db = Arc::clone(&self.inner);
+        let args = procedure_args(opts)?;
+        napi::bindgen_prelude::spawn_blocking(move || {
+            let result = db.call_procedure(&name, args).map_err(to_napi)?;
+            Ok(ProcedureCallResult {
+                epoch: result.epoch.map(BigInt::from),
+                result_json: serde_json::to_string(&result.output).map_err(|e| {
+                    napi::Error::new(
+                        napi::Status::GenericFailure,
+                        format!("procedure result: {e}"),
+                    )
+                })?,
+            })
+        })
+        .await
+        .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e:?}")))?
     }
 
     /// Return the column names of a table as it exists in the **database**
@@ -2272,6 +2449,47 @@ impl RemoteDatabase {
             .into_json()
             .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
         Ok(BigInt::from(resp["epoch"].as_u64().unwrap_or(0)))
+    }
+
+    #[napi]
+    pub fn create_procedure(&self, spec: ProcedureSpec) -> napi::Result<String> {
+        let procedure: serde_json::Value = serde_json::from_str(&spec.json)
+            .map_err(|e| napi::Error::new(napi::Status::InvalidArg, e.to_string()))?;
+        self.agent
+            .post(&format!("{}/procedures", self.url))
+            .send_json(serde_json::json!({ "procedure": procedure }))
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?
+            .into_string()
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))
+    }
+
+    #[napi]
+    pub fn drop_procedure(&self, name: String) -> napi::Result<()> {
+        self.agent
+            .delete(&format!("{}/procedures/{name}", self.url))
+            .call()
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
+        Ok(())
+    }
+
+    #[napi]
+    pub fn call_procedure(
+        &self,
+        name: String,
+        opts: Option<ProcedureCallOptions>,
+    ) -> napi::Result<String> {
+        let args = opts
+            .and_then(|opts| opts.args_json)
+            .map(|json| serde_json::from_str::<serde_json::Value>(&json))
+            .transpose()
+            .map_err(|e| napi::Error::new(napi::Status::InvalidArg, e.to_string()))?
+            .unwrap_or_else(|| serde_json::json!({}));
+        self.agent
+            .post(&format!("{}/kit/procedures/{name}/call", self.url))
+            .send_json(serde_json::json!({ "args": args }))
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?
+            .into_string()
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))
     }
 }
 

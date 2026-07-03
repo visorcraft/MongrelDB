@@ -27,6 +27,7 @@ pub mod memtable;
 pub mod mutable_run;
 pub mod page;
 pub mod pma;
+pub mod procedure;
 pub mod query;
 pub mod reservoir;
 pub mod retention;
@@ -58,6 +59,10 @@ pub use index::{
 pub use memtable::{Memtable, Row, Value};
 pub use mutable_run::MutableRun;
 pub use page::{CachedPage, Encoding, PageStat};
+pub use procedure::{
+    ProcedureBody, ProcedureCallOutput, ProcedureCallResult, ProcedureCallRow, ProcedureCondition,
+    ProcedureEntry, ProcedureMode, ProcedureParam, ProcedureStep, ProcedureValue, StoredProcedure,
+};
 pub use query::{Condition, Query};
 pub use reservoir::Reservoir;
 pub use retention::{OwnedSnapshotGuard, SnapshotGuard, SnapshotRegistry};

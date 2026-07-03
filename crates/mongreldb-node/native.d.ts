@@ -64,6 +64,20 @@ export interface SchemaSpec {
   columns: Array<ColumnSpec>
   indexes: Array<IndexSpec>
 }
+export interface ProcedureSpec {
+  json: string
+}
+export interface ProcedureInfo {
+  json: string
+}
+export interface ProcedureCallOptions {
+  argsJson?: string
+  idempotencyKey?: string
+}
+export interface ProcedureCallResult {
+  epoch?: bigint
+  resultJson: string
+}
 /**
  * A single cell value. Only the field matching the column type is read; the
  * rest are ignored. `bytes` is raw; `text` is UTF-8 (use for `Bytes` columns
@@ -198,6 +212,13 @@ export declare class Database {
   snapshotEpoch(): bigint
   /** List all live table names. */
   tableNames(): Array<string>
+  createProcedure(spec: ProcedureSpec): bigint
+  createOrReplaceProcedure(spec: ProcedureSpec): bigint
+  dropProcedure(name: string): void
+  procedures(): Array<ProcedureInfo>
+  procedure(name: string): ProcedureInfo | null
+  callProcedure(name: string, opts?: ProcedureCallOptions | undefined | null): ProcedureCallResult
+  callProcedureAsync(name: string, opts?: ProcedureCallOptions | undefined | null): Promise<ProcedureCallResult>
   /**
    * Return the column names of a table as it exists in the **database**
    * (not the code-defined schema). Lets migrations check whether a column
@@ -440,4 +461,7 @@ export declare class RemoteDatabase {
   count(table: string): number
   sql(sql: string): Buffer
   commit(table: string): bigint
+  createProcedure(spec: ProcedureSpec): string
+  dropProcedure(name: string): void
+  callProcedure(name: string, opts?: ProcedureCallOptions | undefined | null): string
 }

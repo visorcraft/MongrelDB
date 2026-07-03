@@ -29,6 +29,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 mod kit;
+mod procedure;
 
 struct AppState {
     db: Arc<Database>,
@@ -49,12 +50,21 @@ pub fn build_app(db: Arc<Database>) -> axum::Router {
         .route("/tables/{name}/commit", post(commit))
         .route("/sql", post(sql))
         .route("/txn", post(txn))
+        .route("/procedures", get(procedure::list).post(procedure::create))
+        .route(
+            "/procedures/{name}",
+            get(procedure::describe)
+                .put(procedure::replace)
+                .delete(procedure::drop_procedure),
+        )
+        .route("/procedures/{name}/call", post(procedure::call))
         // Typed Kit-aware surface (authoritative validation + constraints).
         .route("/kit/schema", get(kit::schema_all))
         .route("/kit/schema/{table}", get(kit::schema_one))
         .route("/kit/txn", post(kit::kit_txn))
         .route("/kit/query", post(kit::kit_query))
         .route("/kit/create_table", post(kit::kit_create_table))
+        .route("/kit/procedures/{name}/call", post(procedure::kit_call))
         .route("/compact", post(compact_all))
         .route("/tables/{name}/compact", post(compact_table))
         .with_state(state)

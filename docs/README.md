@@ -29,6 +29,8 @@ vector similarity, range queries, and more.
    multi-process access over HTTP
 9. **[Maintenance & Operations](09-maintenance.md)** — compaction,
    flush-on-close, cron jobs, GC
+10. **[Stored Procedures](10-stored-procedures.md)** — catalog-backed routines
+    callable from SQL, HTTP, NAPI, and Kit clients
 
 ## Quick Reference
 

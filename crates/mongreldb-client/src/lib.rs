@@ -43,6 +43,9 @@ pub enum KitErrorCode {
     UniqueViolation,
     FkViolation,
     CheckViolation,
+    ProcedureNotFound,
+    ProcedureValidation,
+    ProcedureExecution,
     Conflict,
     BadRequest,
     NotFound,
@@ -62,6 +65,9 @@ impl KitErrorCode {
             KitErrorCode::UniqueViolation => "UNIQUE_VIOLATION",
             KitErrorCode::FkViolation => "FK_VIOLATION",
             KitErrorCode::CheckViolation => "CHECK_VIOLATION",
+            KitErrorCode::ProcedureNotFound => "PROCEDURE_NOT_FOUND",
+            KitErrorCode::ProcedureValidation => "PROCEDURE_VALIDATION",
+            KitErrorCode::ProcedureExecution => "PROCEDURE_EXECUTION",
             KitErrorCode::Conflict => "CONFLICT",
             KitErrorCode::BadRequest => "BAD_REQUEST",
             KitErrorCode::NotFound => "NOT_FOUND",
@@ -75,6 +81,9 @@ impl KitErrorCode {
             "UNIQUE_VIOLATION" => KitErrorCode::UniqueViolation,
             "FK_VIOLATION" => KitErrorCode::FkViolation,
             "CHECK_VIOLATION" => KitErrorCode::CheckViolation,
+            "PROCEDURE_NOT_FOUND" => KitErrorCode::ProcedureNotFound,
+            "PROCEDURE_VALIDATION" => KitErrorCode::ProcedureValidation,
+            "PROCEDURE_EXECUTION" => KitErrorCode::ProcedureExecution,
             "CONFLICT" => KitErrorCode::Conflict,
             "BAD_REQUEST" => KitErrorCode::BadRequest,
             "NOT_FOUND" => KitErrorCode::NotFound,
@@ -276,6 +285,38 @@ pub struct KitQueryRow {
     pub row_id: String,
     /// Flat `[col_id, val, col_id, val, …]` cells.
     pub cells: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProcedureRequest {
+    pub procedure: mongreldb_core::StoredProcedure,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProcedureResponse {
+    pub status: String,
+    pub procedure: mongreldb_core::StoredProcedure,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProceduresResponse {
+    pub procedures: Vec<mongreldb_core::StoredProcedure>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProcedureCallRequest {
+    #[serde(default)]
+    pub args: serde_json::Map<String, serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProcedureCallResponse {
+    pub status: String,
+    #[serde(default)]
+    pub epoch: Option<u64>,
+    pub result: serde_json::Value,
 }
 
 // Internal mirror of the server's error envelope.
@@ -489,6 +530,85 @@ impl MongrelClient {
         let resp = self.check(resp)?;
         let v: serde_json::Value = resp.json()?;
         Ok(v["table_id"].as_u64().unwrap_or(0))
+    }
+
+    pub fn procedures(&self) -> ClientResult<Vec<mongreldb_core::StoredProcedure>> {
+        let resp = self.client.get(self.url("/procedures")).send()?;
+        let resp = self.check(resp)?;
+        Ok(resp.json::<ProceduresResponse>()?.procedures)
+    }
+
+    pub fn procedure(&self, name: &str) -> ClientResult<mongreldb_core::StoredProcedure> {
+        let resp = self
+            .client
+            .get(self.url(&format!("/procedures/{name}")))
+            .send()?;
+        let resp = self.check(resp)?;
+        Ok(resp.json::<ProcedureResponse>()?.procedure)
+    }
+
+    pub fn create_procedure(
+        &self,
+        procedure: mongreldb_core::StoredProcedure,
+    ) -> ClientResult<mongreldb_core::StoredProcedure> {
+        let resp = self
+            .client
+            .post(self.url("/procedures"))
+            .json(&ProcedureRequest { procedure })
+            .send()?;
+        let resp = self.check(resp)?;
+        Ok(resp.json::<ProcedureResponse>()?.procedure)
+    }
+
+    pub fn replace_procedure(
+        &self,
+        name: &str,
+        procedure: mongreldb_core::StoredProcedure,
+    ) -> ClientResult<mongreldb_core::StoredProcedure> {
+        let resp = self
+            .client
+            .put(self.url(&format!("/procedures/{name}")))
+            .json(&ProcedureRequest { procedure })
+            .send()?;
+        let resp = self.check(resp)?;
+        Ok(resp.json::<ProcedureResponse>()?.procedure)
+    }
+
+    pub fn drop_procedure(&self, name: &str) -> ClientResult<()> {
+        let resp = self
+            .client
+            .delete(self.url(&format!("/procedures/{name}")))
+            .send()?;
+        self.check(resp)?;
+        Ok(())
+    }
+
+    pub fn call_procedure(
+        &self,
+        name: &str,
+        req: &ProcedureCallRequest,
+    ) -> ClientResult<ProcedureCallResponse> {
+        let resp = self
+            .client
+            .post(self.url(&format!("/procedures/{name}/call")))
+            .json(req)
+            .send()?;
+        let resp = self.check(resp)?;
+        Ok(resp.json()?)
+    }
+
+    pub fn kit_call_procedure(
+        &self,
+        name: &str,
+        req: &ProcedureCallRequest,
+    ) -> ClientResult<ProcedureCallResponse> {
+        let resp = self
+            .client
+            .post(self.url(&format!("/kit/procedures/{name}/call")))
+            .json(req)
+            .send()?;
+        let resp = self.check(resp)?;
+        Ok(resp.json()?)
     }
 }
 

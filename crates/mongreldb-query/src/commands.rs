@@ -3,6 +3,7 @@ use arrow::array::{ArrayRef, BooleanArray, Int64Array, StringArray};
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 use arrow::record_batch::RecordBatch;
 use mongreldb_core::memtable::{Row, Value};
+use mongreldb_core::procedure::{ProcedureCallOutput, ProcedureCallRow, StoredProcedure};
 use mongreldb_core::rowid::RowId;
 use mongreldb_core::schema::{
     AlterColumn, ColumnDef as CoreColumnDef, ColumnFlags, IndexDef, IndexKind,
@@ -193,6 +194,56 @@ fn try_manual_command(
         let mut names = db.table_names();
         names.sort();
         return Ok(Some(vec![strings_batch("table_name", names)?]));
+    }
+
+    if lower == "show procedures" || lower == "show procedure" {
+        let mut names: Vec<String> = db.procedures().into_iter().map(|p| p.name).collect();
+        names.sort();
+        return Ok(Some(vec![strings_batch("procedure_name", names)?]));
+    }
+
+    if let Some(name) = lower
+        .strip_prefix("describe procedure ")
+        .or_else(|| lower.strip_prefix("desc procedure "))
+    {
+        let name = strip_identifier(name)?;
+        let procedure = db
+            .procedure(name)
+            .ok_or_else(|| MongrelQueryError::Schema(format!("procedure {name:?} not found")))?;
+        return Ok(Some(vec![json_batch(
+            "procedure_json",
+            vec![serde_json::to_string(&procedure)
+                .map_err(|e| MongrelQueryError::Schema(e.to_string()))?],
+        )?]));
+    }
+
+    if lower.starts_with("create or replace procedure ") {
+        let (name, json) = parse_procedure_json(sql, lower, "create or replace procedure ")?;
+        let procedure = procedure_from_json(name, json)?;
+        db.create_or_replace_procedure(procedure)?;
+        return Ok(Some(Vec::new()));
+    }
+
+    if lower.starts_with("create procedure ") {
+        let (name, json) = parse_procedure_json(sql, lower, "create procedure ")?;
+        let procedure = procedure_from_json(name, json)?;
+        db.create_procedure(procedure)?;
+        return Ok(Some(Vec::new()));
+    }
+
+    if let Some(name) = lower.strip_prefix("drop procedure ") {
+        let name = strip_identifier(name)?;
+        db.drop_procedure(name)?;
+        return Ok(Some(Vec::new()));
+    }
+
+    if lower.starts_with("call ") {
+        let (name, args) = parse_call_json(sql, lower)?;
+        let result = db.call_procedure(name, args)?;
+        let json = serde_json::to_string(&procedure_output_json(&result.output))
+            .map_err(|e| MongrelQueryError::Schema(e.to_string()))?;
+        session.clear_cache();
+        return Ok(Some(vec![json_batch("result_json", vec![json])?]));
     }
 
     if let Some(table) = lower
@@ -1543,6 +1594,146 @@ fn strip_identifier(value: &str) -> Result<&str> {
     Ok(value.trim_matches('"').trim_matches('`'))
 }
 
+fn parse_procedure_json<'a>(sql: &'a str, lower: &str, prefix: &str) -> Result<(&'a str, &'a str)> {
+    let body = sql[prefix.len()..].trim();
+    let lower_body = &lower[prefix.len()..];
+    let marker = " as json ";
+    let idx = lower_body
+        .find(marker)
+        .ok_or_else(|| MongrelQueryError::Schema("expected AS JSON '<procedure>'".into()))?;
+    let name = strip_identifier(&body[..idx])?;
+    let json = unquote_sql_string(&body[idx + marker.len()..])?;
+    Ok((name, json))
+}
+
+fn parse_call_json<'a>(sql: &'a str, lower: &'a str) -> Result<(&'a str, HashMap<String, Value>)> {
+    let body = sql[5..].trim().trim_end_matches(';').trim();
+    let lower_body = lower[5..].trim().trim_end_matches(';').trim();
+    let marker = "(json ";
+    let idx = lower_body
+        .find(marker)
+        .ok_or_else(|| MongrelQueryError::Schema("expected CALL name(JSON '<args>')".into()))?;
+    let name = strip_identifier(&body[..idx])?;
+    let rest = body[idx + marker.len()..].trim();
+    let rest = rest
+        .strip_suffix(')')
+        .ok_or_else(|| MongrelQueryError::Schema("expected closing ')' for CALL".into()))?
+        .trim();
+    let json = unquote_sql_string(rest)?;
+    let raw: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| MongrelQueryError::Schema(e.to_string()))?;
+    let obj = raw
+        .as_object()
+        .ok_or_else(|| MongrelQueryError::Schema("CALL args JSON must be an object".into()))?;
+    let mut args = HashMap::new();
+    for (key, value) in obj {
+        args.insert(key.clone(), json_value_to_core(value)?);
+    }
+    Ok((name, args))
+}
+
+fn unquote_sql_string(value: &str) -> Result<&str> {
+    let value = value.trim().trim_end_matches(';').trim();
+    if value.len() < 2 || !value.starts_with('\'') || !value.ends_with('\'') {
+        return Err(MongrelQueryError::Schema(
+            "expected single-quoted JSON".into(),
+        ));
+    }
+    Ok(&value[1..value.len() - 1])
+}
+
+fn procedure_from_json(name: &str, json: &str) -> Result<StoredProcedure> {
+    let parsed: StoredProcedure =
+        serde_json::from_str(json).map_err(|e| MongrelQueryError::Schema(e.to_string()))?;
+    StoredProcedure::new(name, parsed.mode, parsed.params, parsed.body, 0)
+        .map_err(MongrelQueryError::from)
+}
+
+fn json_value_to_core(value: &serde_json::Value) -> Result<Value> {
+    match value {
+        serde_json::Value::Null => Ok(Value::Null),
+        serde_json::Value::Bool(value) => Ok(Value::Bool(*value)),
+        serde_json::Value::Number(value) => {
+            if let Some(value) = value.as_i64() {
+                Ok(Value::Int64(value))
+            } else if let Some(value) = value.as_f64() {
+                Ok(Value::Float64(value))
+            } else {
+                Err(MongrelQueryError::Schema("unsupported JSON number".into()))
+            }
+        }
+        serde_json::Value::String(value) => Ok(Value::Bytes(value.as_bytes().to_vec())),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => Err(
+            MongrelQueryError::Schema("procedure args only support scalar JSON values".into()),
+        ),
+    }
+}
+
+fn procedure_output_json(output: &ProcedureCallOutput) -> serde_json::Value {
+    match output {
+        ProcedureCallOutput::Null => serde_json::Value::Null,
+        ProcedureCallOutput::Scalar(value) => core_value_json(value),
+        ProcedureCallOutput::Row(row) => procedure_row_json(row),
+        ProcedureCallOutput::Rows(rows) => {
+            serde_json::Value::Array(rows.iter().map(procedure_row_json).collect())
+        }
+        ProcedureCallOutput::Object(fields) => serde_json::Value::Object(
+            fields
+                .iter()
+                .map(|(key, value)| (key.clone(), procedure_output_json(value)))
+                .collect(),
+        ),
+        ProcedureCallOutput::Array(values) => {
+            serde_json::Value::Array(values.iter().map(procedure_output_json).collect())
+        }
+    }
+}
+
+fn procedure_row_json(row: &ProcedureCallRow) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    if let Some(row_id) = row.row_id {
+        obj.insert(
+            "row_id".into(),
+            serde_json::Value::String(row_id.0.to_string()),
+        );
+    }
+    let columns = row
+        .columns
+        .iter()
+        .map(|(id, value)| (id.to_string(), core_value_json(value)))
+        .collect();
+    obj.insert("columns".into(), serde_json::Value::Object(columns));
+    serde_json::Value::Object(obj)
+}
+
+fn core_value_json(value: &Value) -> serde_json::Value {
+    match value {
+        Value::Null => serde_json::Value::Null,
+        Value::Bool(value) => serde_json::Value::Bool(*value),
+        Value::Int64(value) => serde_json::Value::from(*value),
+        Value::Float64(value) => serde_json::Number::from_f64(*value)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        Value::Bytes(value) => String::from_utf8(value.clone())
+            .map(serde_json::Value::String)
+            .unwrap_or_else(|_| {
+                serde_json::Value::Array(
+                    value.iter().map(|b| serde_json::Value::from(*b)).collect(),
+                )
+            }),
+        Value::Embedding(value) => serde_json::Value::Array(
+            value
+                .iter()
+                .map(|v| {
+                    serde_json::Number::from_f64(*v as f64)
+                        .map(serde_json::Value::Number)
+                        .unwrap_or(serde_json::Value::Null)
+                })
+                .collect(),
+        ),
+    }
+}
+
 fn compact_all(db: &Arc<Database>) -> Result<()> {
     for table in db.table_names() {
         db.table(&table)?.lock().compact()?;
@@ -1654,4 +1845,8 @@ fn strings_batch(name: &str, values: Vec<String>) -> Result<RecordBatch> {
         vec![Arc::new(StringArray::from(values)) as ArrayRef],
     )
     .map_err(|e| MongrelQueryError::Arrow(e.to_string()))
+}
+
+fn json_batch(name: &str, values: Vec<String>) -> Result<RecordBatch> {
+    strings_batch(name, values)
 }

@@ -29,6 +29,13 @@ class Database {
   createTable(name: string, schema: SchemaSpec): bigint
   table(name: string): TableHandle
   begin(): Transaction
+  createProcedure(spec: ProcedureSpec): bigint
+  createOrReplaceProcedure(spec: ProcedureSpec): bigint
+  dropProcedure(name: string): void
+  procedures(): ProcedureInfo[]
+  procedure(name: string): ProcedureInfo | null
+  callProcedure(name: string, opts?: ProcedureCallOptions): ProcedureCallResult
+  callProcedureAsync(name: string, opts?: ProcedureCallOptions): Promise<ProcedureCallResult>
   sql(sql: string): Promise<Buffer>
   close(): void
 }

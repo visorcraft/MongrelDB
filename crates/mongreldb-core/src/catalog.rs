@@ -12,6 +12,7 @@
 //!   never leaves a half-linked catalog entry.
 
 use crate::error::{MongrelError, Result};
+use crate::procedure::ProcedureEntry;
 use crate::schema::Schema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -55,6 +56,8 @@ pub struct Catalog {
     /// Next shared-WAL segment number to allocate.
     pub next_segment_no: u64,
     pub tables: Vec<CatalogEntry>,
+    #[serde(default)]
+    pub procedures: Vec<ProcedureEntry>,
 }
 
 impl Catalog {

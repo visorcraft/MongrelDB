@@ -10,6 +10,10 @@ use crate::catalog::{self, Catalog, CatalogEntry, TableState, META_DEK_LEN};
 use crate::engine::{SharedCtx, Table};
 use crate::epoch::{Epoch, EpochAuthority, Snapshot};
 use crate::error::{MongrelError, Result};
+use crate::procedure::{
+    ProcedureCallOutput, ProcedureCallResult, ProcedureCallRow, ProcedureCondition, ProcedureEntry,
+    ProcedureStep, ProcedureValue, StoredProcedure,
+};
 use crate::retention::{OwnedSnapshotGuard, SnapshotGuard, SnapshotRegistry};
 use crate::schema::{AlterColumn, ColumnDef, Schema};
 use parking_lot::{Mutex, RwLock};
@@ -352,6 +356,342 @@ impl Database {
         cat.live(name)
             .map(|e| e.table_id)
             .ok_or_else(|| MongrelError::NotFound(format!("table {name:?} not found")))
+    }
+
+    pub fn procedures(&self) -> Vec<StoredProcedure> {
+        self.catalog
+            .read()
+            .procedures
+            .iter()
+            .map(|p| p.procedure.clone())
+            .collect()
+    }
+
+    pub fn procedure(&self, name: &str) -> Option<StoredProcedure> {
+        self.catalog
+            .read()
+            .procedures
+            .iter()
+            .find(|p| p.procedure.name == name)
+            .map(|p| p.procedure.clone())
+    }
+
+    pub fn create_procedure(&self, mut procedure: StoredProcedure) -> Result<StoredProcedure> {
+        let _g = self.ddl_lock.lock();
+        procedure.validate()?;
+        self.validate_procedure_references(&procedure)?;
+        {
+            let cat = self.catalog.read();
+            if cat
+                .procedures
+                .iter()
+                .any(|p| p.procedure.name == procedure.name)
+            {
+                return Err(MongrelError::InvalidArgument(format!(
+                    "procedure {:?} already exists",
+                    procedure.name
+                )));
+            }
+        }
+        let commit_lock = Arc::clone(&self.commit_lock);
+        let _c = commit_lock.lock();
+        let epoch = self.epoch.bump_assigned();
+        procedure.created_epoch = epoch.0;
+        procedure.updated_epoch = epoch.0;
+        {
+            let mut cat = self.catalog.write();
+            cat.procedures.push(ProcedureEntry::from(procedure.clone()));
+            cat.db_epoch = epoch.0;
+        }
+        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+        self.advance_visible(epoch);
+        Ok(procedure)
+    }
+
+    pub fn create_or_replace_procedure(
+        &self,
+        procedure: StoredProcedure,
+    ) -> Result<StoredProcedure> {
+        let _g = self.ddl_lock.lock();
+        procedure.validate()?;
+        self.validate_procedure_references(&procedure)?;
+        let commit_lock = Arc::clone(&self.commit_lock);
+        let _c = commit_lock.lock();
+        let epoch = self.epoch.bump_assigned();
+        let replaced = {
+            let mut cat = self.catalog.write();
+            let next = match cat
+                .procedures
+                .iter()
+                .position(|p| p.procedure.name == procedure.name)
+            {
+                Some(idx) => {
+                    let next = cat.procedures[idx]
+                        .procedure
+                        .replaced(procedure.clone(), epoch.0)?;
+                    cat.procedures[idx] = ProcedureEntry::from(next.clone());
+                    next
+                }
+                None => {
+                    let mut next = procedure;
+                    next.created_epoch = epoch.0;
+                    next.updated_epoch = epoch.0;
+                    cat.procedures.push(ProcedureEntry::from(next.clone()));
+                    next
+                }
+            };
+            cat.db_epoch = epoch.0;
+            next
+        };
+        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+        self.advance_visible(epoch);
+        Ok(replaced)
+    }
+
+    pub fn drop_procedure(&self, name: &str) -> Result<()> {
+        let _g = self.ddl_lock.lock();
+        let commit_lock = Arc::clone(&self.commit_lock);
+        let _c = commit_lock.lock();
+        let epoch = self.epoch.bump_assigned();
+        {
+            let mut cat = self.catalog.write();
+            let before = cat.procedures.len();
+            cat.procedures.retain(|p| p.procedure.name != name);
+            if cat.procedures.len() == before {
+                return Err(MongrelError::NotFound(format!(
+                    "procedure {name:?} not found"
+                )));
+            }
+            cat.db_epoch = epoch.0;
+        }
+        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+        self.advance_visible(epoch);
+        Ok(())
+    }
+
+    pub fn call_procedure(
+        &self,
+        name: &str,
+        args: HashMap<String, crate::Value>,
+    ) -> Result<ProcedureCallResult> {
+        let procedure = self
+            .procedure(name)
+            .ok_or_else(|| MongrelError::NotFound(format!("procedure {name:?} not found")))?;
+        let args = bind_procedure_args(&procedure, args)?;
+        let has_writes = procedure.body.steps.iter().any(ProcedureStep::is_write);
+        let mut outputs: HashMap<String, ProcedureCallOutput> = HashMap::new();
+        if has_writes {
+            let mut tx = self.begin();
+            let run = (|| {
+                for step in &procedure.body.steps {
+                    let output =
+                        self.execute_procedure_step(step, &args, &outputs, Some(&mut tx))?;
+                    outputs.insert(step.id().to_string(), output);
+                }
+                eval_return_output(&procedure.body.return_value, &args, &outputs)
+            })();
+            match run {
+                Ok(output) => {
+                    let epoch = tx.commit()?.0;
+                    Ok(ProcedureCallResult {
+                        epoch: Some(epoch),
+                        output,
+                    })
+                }
+                Err(e) => {
+                    tx.rollback();
+                    Err(e)
+                }
+            }
+        } else {
+            for step in &procedure.body.steps {
+                let output = self.execute_procedure_step(step, &args, &outputs, None)?;
+                outputs.insert(step.id().to_string(), output);
+            }
+            Ok(ProcedureCallResult {
+                epoch: None,
+                output: eval_return_output(&procedure.body.return_value, &args, &outputs)?,
+            })
+        }
+    }
+
+    fn execute_procedure_step(
+        &self,
+        step: &ProcedureStep,
+        args: &HashMap<String, crate::Value>,
+        outputs: &HashMap<String, ProcedureCallOutput>,
+        tx: Option<&mut crate::txn::Transaction<'_>>,
+    ) -> Result<ProcedureCallOutput> {
+        match step {
+            ProcedureStep::NativeQuery {
+                table,
+                conditions,
+                projection,
+                limit,
+                ..
+            } => {
+                let mut q = crate::Query::new();
+                for condition in conditions {
+                    q = q.and(eval_condition(condition, args, outputs)?);
+                }
+                let handle = self.table(table)?;
+                let mut rows = handle.lock().query(&q)?;
+                if let Some(limit) = limit {
+                    rows.truncate(*limit);
+                }
+                let projection = projection.as_ref();
+                Ok(ProcedureCallOutput::Rows(
+                    rows.into_iter()
+                        .map(|row| ProcedureCallRow {
+                            row_id: Some(row.row_id),
+                            columns: match projection {
+                                Some(ids) => row
+                                    .columns
+                                    .into_iter()
+                                    .filter(|(id, _)| ids.contains(id))
+                                    .collect(),
+                                None => row.columns,
+                            },
+                        })
+                        .collect(),
+                ))
+            }
+            ProcedureStep::Put {
+                table,
+                cells,
+                returning,
+                ..
+            } => {
+                let tx = tx.ok_or_else(|| {
+                    MongrelError::InvalidArgument(
+                        "write procedure step requires a transaction".into(),
+                    )
+                })?;
+                let cells = eval_cells(cells, args, outputs)?;
+                if *returning {
+                    let out = tx.put_returning(table, cells)?;
+                    Ok(ProcedureCallOutput::Row(ProcedureCallRow {
+                        row_id: None,
+                        columns: out.row.columns.into_iter().collect(),
+                    }))
+                } else {
+                    tx.put(table, cells)?;
+                    Ok(ProcedureCallOutput::Null)
+                }
+            }
+            ProcedureStep::Upsert {
+                table,
+                cells,
+                update_cells,
+                returning,
+                ..
+            } => {
+                let tx = tx.ok_or_else(|| {
+                    MongrelError::InvalidArgument(
+                        "write procedure step requires a transaction".into(),
+                    )
+                })?;
+                let cells = eval_cells(cells, args, outputs)?;
+                let action = match update_cells {
+                    Some(update_cells) => {
+                        crate::UpsertAction::DoUpdate(eval_cells(update_cells, args, outputs)?)
+                    }
+                    None => crate::UpsertAction::DoNothing,
+                };
+                let out = tx.upsert(table, cells, action)?;
+                if *returning {
+                    Ok(ProcedureCallOutput::Row(ProcedureCallRow {
+                        row_id: None,
+                        columns: out.row.columns.into_iter().collect(),
+                    }))
+                } else {
+                    Ok(ProcedureCallOutput::Null)
+                }
+            }
+            ProcedureStep::DeleteByPk { table, pk, .. } => {
+                let tx = tx.ok_or_else(|| {
+                    MongrelError::InvalidArgument(
+                        "write procedure step requires a transaction".into(),
+                    )
+                })?;
+                let pk = eval_value(pk, args, outputs)?;
+                let handle = self.table(table)?;
+                let row_id = handle.lock().lookup_pk(&pk.encode_key()).ok_or_else(|| {
+                    MongrelError::NotFound("procedure delete_by_pk target not found".into())
+                })?;
+                tx.delete(table, row_id)?;
+                Ok(ProcedureCallOutput::Scalar(crate::Value::Bool(true)))
+            }
+            ProcedureStep::DeleteRows { .. } => Err(MongrelError::InvalidArgument(
+                "DeleteRows procedure step is not supported by the core executor yet".into(),
+            )),
+            ProcedureStep::SqlQuery { .. } => Err(MongrelError::InvalidArgument(
+                "SqlQuery procedure step must be executed by mongreldb-query".into(),
+            )),
+        }
+    }
+
+    fn validate_procedure_references(&self, procedure: &StoredProcedure) -> Result<()> {
+        let cat = self.catalog.read();
+        for step in &procedure.body.steps {
+            let Some(table_name) = step.table() else {
+                continue;
+            };
+            let schema = &cat
+                .live(table_name)
+                .ok_or_else(|| {
+                    MongrelError::InvalidArgument(format!(
+                        "procedure {:?} references unknown table {table_name:?}",
+                        procedure.name
+                    ))
+                })?
+                .schema;
+            match step {
+                ProcedureStep::NativeQuery {
+                    conditions,
+                    projection,
+                    ..
+                } => {
+                    for condition in conditions {
+                        validate_condition_columns(condition, schema)?;
+                    }
+                    if let Some(projection) = projection {
+                        for id in projection {
+                            validate_column_id(*id, schema)?;
+                        }
+                    }
+                }
+                ProcedureStep::Put { cells, .. } => {
+                    for cell in cells {
+                        validate_column_id(cell.column_id, schema)?;
+                    }
+                }
+                ProcedureStep::Upsert {
+                    cells,
+                    update_cells,
+                    ..
+                } => {
+                    for cell in cells {
+                        validate_column_id(cell.column_id, schema)?;
+                    }
+                    if let Some(update_cells) = update_cells {
+                        for cell in update_cells {
+                            validate_column_id(cell.column_id, schema)?;
+                        }
+                    }
+                }
+                ProcedureStep::DeleteByPk { .. } => {
+                    if schema.primary_key().is_none() {
+                        return Err(MongrelError::InvalidArgument(format!(
+                            "procedure {:?} references DeleteByPk on table {table_name:?} without a primary key",
+                            procedure.name
+                        )));
+                    }
+                }
+                ProcedureStep::DeleteRows { .. } | ProcedureStep::SqlQuery { .. } => {}
+            }
+        }
+        Ok(())
     }
 
     /// Begin a new transaction reading at the current visible epoch.
@@ -2025,6 +2365,246 @@ fn recover_shared_wal(
 
     epoch.advance_recovered(Epoch(max_epoch));
     Ok(())
+}
+
+fn validate_condition_columns(condition: &ProcedureCondition, schema: &Schema) -> Result<()> {
+    match condition {
+        ProcedureCondition::Pk { .. } => {
+            if schema.primary_key().is_none() {
+                return Err(MongrelError::InvalidArgument(
+                    "procedure condition Pk references a table without a primary key".into(),
+                ));
+            }
+        }
+        ProcedureCondition::BitmapEq { column_id, .. }
+        | ProcedureCondition::BitmapIn { column_id, .. }
+        | ProcedureCondition::Range { column_id, .. }
+        | ProcedureCondition::RangeF64 { column_id, .. }
+        | ProcedureCondition::IsNull { column_id }
+        | ProcedureCondition::IsNotNull { column_id }
+        | ProcedureCondition::FmContains { column_id, .. } => {
+            validate_column_id(*column_id, schema)?;
+        }
+    }
+    Ok(())
+}
+
+fn bind_procedure_args(
+    procedure: &StoredProcedure,
+    mut args: HashMap<String, crate::Value>,
+) -> Result<HashMap<String, crate::Value>> {
+    let mut out = HashMap::new();
+    for param in &procedure.params {
+        let value = match args.remove(&param.name) {
+            Some(value) => value,
+            None => param.default.clone().ok_or_else(|| {
+                MongrelError::InvalidArgument(format!(
+                    "missing required procedure parameter {:?}",
+                    param.name
+                ))
+            })?,
+        };
+        if !param.nullable && matches!(value, crate::Value::Null) {
+            return Err(MongrelError::InvalidArgument(format!(
+                "procedure parameter {:?} must not be NULL",
+                param.name
+            )));
+        }
+        if !matches!(value, crate::Value::Null) && !value_matches_type(&value, param.ty) {
+            return Err(MongrelError::InvalidArgument(format!(
+                "procedure parameter {:?} has wrong type",
+                param.name
+            )));
+        }
+        out.insert(param.name.clone(), value);
+    }
+    if let Some(extra) = args.keys().next() {
+        return Err(MongrelError::InvalidArgument(format!(
+            "unknown procedure parameter {extra:?}"
+        )));
+    }
+    Ok(out)
+}
+
+fn value_matches_type(value: &crate::Value, ty: crate::TypeId) -> bool {
+    matches!(
+        (value, ty),
+        (crate::Value::Bool(_), crate::TypeId::Bool)
+            | (crate::Value::Int64(_), crate::TypeId::Int8)
+            | (crate::Value::Int64(_), crate::TypeId::Int16)
+            | (crate::Value::Int64(_), crate::TypeId::Int32)
+            | (crate::Value::Int64(_), crate::TypeId::Int64)
+            | (crate::Value::Int64(_), crate::TypeId::UInt8)
+            | (crate::Value::Int64(_), crate::TypeId::UInt16)
+            | (crate::Value::Int64(_), crate::TypeId::UInt32)
+            | (crate::Value::Int64(_), crate::TypeId::UInt64)
+            | (crate::Value::Int64(_), crate::TypeId::TimestampNanos)
+            | (crate::Value::Int64(_), crate::TypeId::Date32)
+            | (crate::Value::Float64(_), crate::TypeId::Float32)
+            | (crate::Value::Float64(_), crate::TypeId::Float64)
+            | (crate::Value::Bytes(_), crate::TypeId::Bytes)
+            | (crate::Value::Embedding(_), crate::TypeId::Embedding { .. })
+    )
+}
+
+fn eval_cells(
+    cells: &[crate::procedure::ProcedureCell],
+    args: &HashMap<String, crate::Value>,
+    outputs: &HashMap<String, ProcedureCallOutput>,
+) -> Result<Vec<(u16, crate::Value)>> {
+    cells
+        .iter()
+        .map(|cell| Ok((cell.column_id, eval_value(&cell.value, args, outputs)?)))
+        .collect()
+}
+
+fn eval_condition(
+    condition: &ProcedureCondition,
+    args: &HashMap<String, crate::Value>,
+    outputs: &HashMap<String, ProcedureCallOutput>,
+) -> Result<crate::Condition> {
+    Ok(match condition {
+        ProcedureCondition::Pk { value } => {
+            crate::Condition::Pk(eval_value(value, args, outputs)?.encode_key())
+        }
+        ProcedureCondition::BitmapEq { column_id, value } => crate::Condition::BitmapEq {
+            column_id: *column_id,
+            value: eval_value(value, args, outputs)?.encode_key(),
+        },
+        ProcedureCondition::BitmapIn { column_id, values } => crate::Condition::BitmapIn {
+            column_id: *column_id,
+            values: values
+                .iter()
+                .map(|value| Ok(eval_value(value, args, outputs)?.encode_key()))
+                .collect::<Result<Vec<_>>>()?,
+        },
+        ProcedureCondition::Range { column_id, lo, hi } => crate::Condition::Range {
+            column_id: *column_id,
+            lo: expect_i64(eval_value(lo, args, outputs)?)?,
+            hi: expect_i64(eval_value(hi, args, outputs)?)?,
+        },
+        ProcedureCondition::RangeF64 {
+            column_id,
+            lo,
+            lo_inclusive,
+            hi,
+            hi_inclusive,
+        } => crate::Condition::RangeF64 {
+            column_id: *column_id,
+            lo: expect_f64(eval_value(lo, args, outputs)?)?,
+            lo_inclusive: *lo_inclusive,
+            hi: expect_f64(eval_value(hi, args, outputs)?)?,
+            hi_inclusive: *hi_inclusive,
+        },
+        ProcedureCondition::IsNull { column_id } => crate::Condition::IsNull {
+            column_id: *column_id,
+        },
+        ProcedureCondition::IsNotNull { column_id } => crate::Condition::IsNotNull {
+            column_id: *column_id,
+        },
+        ProcedureCondition::FmContains { column_id, pattern } => crate::Condition::FmContains {
+            column_id: *column_id,
+            pattern: expect_bytes(eval_value(pattern, args, outputs)?)?,
+        },
+    })
+}
+
+fn eval_value(
+    value: &ProcedureValue,
+    args: &HashMap<String, crate::Value>,
+    outputs: &HashMap<String, ProcedureCallOutput>,
+) -> Result<crate::Value> {
+    match value {
+        ProcedureValue::Literal(value) => Ok(value.clone()),
+        ProcedureValue::Param(name) => args.get(name).cloned().ok_or_else(|| {
+            MongrelError::InvalidArgument(format!("unknown procedure parameter {name:?}"))
+        }),
+        ProcedureValue::StepScalar(id) => match outputs.get(id) {
+            Some(ProcedureCallOutput::Scalar(value)) => Ok(value.clone()),
+            _ => Err(MongrelError::InvalidArgument(format!(
+                "procedure step {id:?} did not return a scalar"
+            ))),
+        },
+        ProcedureValue::StepRows(_) | ProcedureValue::StepRow(_) => {
+            Err(MongrelError::InvalidArgument(
+                "row-valued procedure reference cannot be used as a scalar".into(),
+            ))
+        }
+        ProcedureValue::Object(_) | ProcedureValue::Array(_) => Err(MongrelError::InvalidArgument(
+            "structured procedure value cannot be used as a scalar cell".into(),
+        )),
+    }
+}
+
+fn eval_return_output(
+    value: &ProcedureValue,
+    args: &HashMap<String, crate::Value>,
+    outputs: &HashMap<String, ProcedureCallOutput>,
+) -> Result<ProcedureCallOutput> {
+    match value {
+        ProcedureValue::Literal(value) => Ok(ProcedureCallOutput::Scalar(value.clone())),
+        ProcedureValue::Param(name) => Ok(ProcedureCallOutput::Scalar(
+            args.get(name).cloned().ok_or_else(|| {
+                MongrelError::InvalidArgument(format!("unknown procedure parameter {name:?}"))
+            })?,
+        )),
+        ProcedureValue::StepRows(id)
+        | ProcedureValue::StepRow(id)
+        | ProcedureValue::StepScalar(id) => outputs.get(id).cloned().ok_or_else(|| {
+            MongrelError::InvalidArgument(format!("unknown procedure step output {id:?}"))
+        }),
+        ProcedureValue::Object(fields) => {
+            let mut out = Vec::with_capacity(fields.len());
+            for (name, value) in fields {
+                out.push((name.clone(), eval_return_output(value, args, outputs)?));
+            }
+            Ok(ProcedureCallOutput::Object(out))
+        }
+        ProcedureValue::Array(values) => {
+            let mut out = Vec::with_capacity(values.len());
+            for value in values {
+                out.push(eval_return_output(value, args, outputs)?);
+            }
+            Ok(ProcedureCallOutput::Array(out))
+        }
+    }
+}
+
+fn expect_i64(value: crate::Value) -> Result<i64> {
+    match value {
+        crate::Value::Int64(value) => Ok(value),
+        _ => Err(MongrelError::InvalidArgument(
+            "procedure value must be Int64".into(),
+        )),
+    }
+}
+
+fn expect_f64(value: crate::Value) -> Result<f64> {
+    match value {
+        crate::Value::Float64(value) => Ok(value),
+        _ => Err(MongrelError::InvalidArgument(
+            "procedure value must be Float64".into(),
+        )),
+    }
+}
+
+fn expect_bytes(value: crate::Value) -> Result<Vec<u8>> {
+    match value {
+        crate::Value::Bytes(value) => Ok(value),
+        _ => Err(MongrelError::InvalidArgument(
+            "procedure value must be Bytes".into(),
+        )),
+    }
+}
+
+fn validate_column_id(column_id: u16, schema: &Schema) -> Result<()> {
+    if schema.columns.iter().any(|c| c.id == column_id) {
+        Ok(())
+    } else {
+        Err(MongrelError::InvalidArgument(format!(
+            "unknown column id {column_id}"
+        )))
+    }
 }
 
 /// Replay committed `Op::Ddl` records from the shared WAL into the catalog
