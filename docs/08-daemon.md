@@ -95,6 +95,23 @@ curl -X POST http://127.0.0.1:8453/delete \
   -d '{"row_id": 42}'
 ```
 
+### Compaction
+
+```sh
+# Compact all tables
+curl -X POST http://127.0.0.1:8453/compact
+# → {"status":"ok","compacted":3,"skipped":1}
+
+# Compact one table
+curl -X POST http://127.0.0.1:8453/tables/events/compact
+# → {"status":"compacted","table":"events"}
+```
+
+The daemon also runs a **background auto-compactor** that sweeps every
+30 seconds and merges any table with 8+ sorted runs — so under steady
+write load, query latency stays flat without any manual intervention.
+See [Maintenance & Operations](09-maintenance.md) for details.
+
 ## Connecting from Rust
 
 ```rust

@@ -27,6 +27,8 @@ vector similarity, range queries, and more.
    AES-256-GCM and a passphrase
 8. **[Daemon Mode](08-daemon.md)** — running `mongreldb-server` for
    multi-process access over HTTP
+9. **[Maintenance & Operations](09-maintenance.md)** — compaction,
+   flush-on-close, cron jobs, GC
 
 ## Quick Reference
 
