@@ -82,6 +82,9 @@ pub enum ScanMode {
     /// the raw SQL (sqlparser AST) and served straight from the native column
     /// cursor, bypassing DataFusion parse+plan+optimize entirely.
     DirectDispatch,
+    /// DataFusion scan served by an external table module / virtual table
+    /// provider rather than a native MongrelDB storage table.
+    ExternalModule,
 }
 
 impl fmt::Display for ScanMode {
@@ -96,6 +99,7 @@ impl fmt::Display for ScanMode {
             ScanMode::NativePushdown => "native-pushdown",
             ScanMode::Materialized => "materialized",
             ScanMode::DirectDispatch => "direct-dispatch",
+            ScanMode::ExternalModule => "external-module",
         };
         f.write_str(s)
     }

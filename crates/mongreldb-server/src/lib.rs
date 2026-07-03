@@ -24,22 +24,32 @@ use axum::routing::{get, post};
 use axum::Json;
 use mongreldb_core::schema::{Schema, TypeId};
 use mongreldb_core::{Database, Value};
-use mongreldb_query::MongrelSession;
+use mongreldb_query::{ExternalTableModule, MongrelSession};
 use serde::Deserialize;
 use serde_json::json;
 
 mod kit;
 mod procedure;
+mod trigger;
 
 struct AppState {
     db: Arc<Database>,
     idem: kit::IdempotencyStore,
+    external_modules: Vec<Arc<dyn ExternalTableModule>>,
 }
 
 pub fn build_app(db: Arc<Database>) -> axum::Router {
+    build_app_with_external_modules(db, std::iter::empty::<Arc<dyn ExternalTableModule>>())
+}
+
+pub fn build_app_with_external_modules(
+    db: Arc<Database>,
+    external_modules: impl IntoIterator<Item = Arc<dyn ExternalTableModule>>,
+) -> axum::Router {
     let state = Arc::new(AppState {
         idem: kit::IdempotencyStore::new(db.root()),
         db,
+        external_modules: external_modules.into_iter().collect(),
     });
     axum::Router::new()
         .route("/health", get(health))
@@ -58,6 +68,13 @@ pub fn build_app(db: Arc<Database>) -> axum::Router {
                 .delete(procedure::drop_procedure),
         )
         .route("/procedures/{name}/call", post(procedure::call))
+        .route("/triggers", get(trigger::list).post(trigger::create))
+        .route(
+            "/triggers/{name}",
+            get(trigger::describe)
+                .put(trigger::replace)
+                .delete(trigger::drop_trigger),
+        )
         // Typed Kit-aware surface (authoritative validation + constraints).
         .route("/kit/schema", get(kit::schema_all))
         .route("/kit/schema/{table}", get(kit::schema_one))
@@ -108,9 +125,7 @@ async fn health() -> StatusCode {
 }
 
 /// `POST /compact` — compact all mounted tables.
-async fn compact_all(
-    State(state): State<Arc<AppState>>,
-) -> (StatusCode, Json<serde_json::Value>) {
+async fn compact_all(State(state): State<Arc<AppState>>) -> (StatusCode, Json<serde_json::Value>) {
     match state.db.compact() {
         Ok((compacted, skipped)) => (
             StatusCode::OK,
@@ -133,7 +148,10 @@ async fn compact_table(
     Path(name): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     match state.db.compact_table(&name) {
-        Ok(true) => (StatusCode::OK, Json(json!({ "status": "compacted", "table": name }))),
+        Ok(true) => (
+            StatusCode::OK,
+            Json(json!({ "status": "compacted", "table": name })),
+        ),
         Ok(false) => (
             StatusCode::OK,
             Json(json!({ "status": "skipped", "table": name, "reason": "fewer than 2 runs" })),
@@ -171,8 +189,7 @@ async fn create_table(
             "bytes" | "varchar" | "text" => TypeId::Bytes,
             "bool" => TypeId::Bool,
             other => {
-                return (StatusCode::BAD_REQUEST, format!("unknown type: {other}"))
-                    .into_response()
+                return (StatusCode::BAD_REQUEST, format!("unknown type: {other}")).into_response()
             }
         };
         let mut flags = mongreldb_core::schema::ColumnFlags::empty();
@@ -190,7 +207,8 @@ async fn create_table(
         schema_id: 0,
         columns,
         indexes: vec![],
-        colocation: vec![], constraints: Default::default(),
+        colocation: vec![],
+        constraints: Default::default(),
     };
     if let Err(msg) = validate_table_name(&req.name) {
         return (StatusCode::BAD_REQUEST, msg).into_response();
@@ -205,10 +223,7 @@ async fn list_tables(State(state): State<Arc<AppState>>) -> Json<Vec<String>> {
     Json(state.db.table_names())
 }
 
-async fn drop_table(
-    State(state): State<Arc<AppState>>,
-    Path(name): Path<String>,
-) -> Response {
+async fn drop_table(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
     match state.db.drop_table(&name) {
         Ok(_) => StatusCode::OK.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -228,9 +243,7 @@ pub(crate) fn json_to_value(v: &serde_json::Value, expected: TypeId) -> Value {
         (serde_json::Value::Number(n), TypeId::Int64) => {
             n.as_i64().map(Value::Int64).unwrap_or(Value::Null)
         }
-        (serde_json::Value::String(s), TypeId::Bytes) => {
-            Value::Bytes(s.as_bytes().to_vec())
-        }
+        (serde_json::Value::String(s), TypeId::Bytes) => Value::Bytes(s.as_bytes().to_vec()),
         (serde_json::Value::Bool(b), TypeId::Bool) => Value::Bool(*b),
         (serde_json::Value::Null, _) => Value::Null,
         // Lenient fallbacks for unknown/loosely-typed JSON.
@@ -255,15 +268,14 @@ fn parse_cells(
     row: &[serde_json::Value],
     schema: &mongreldb_core::schema::Schema,
 ) -> Result<Vec<(u16, Value)>, String> {
-    if row.len() % 2 != 0 {
+    if row.len() & 1 != 0 {
         return Err("row must be an even-length array of [col_id, value] pairs".into());
     }
     let mut out = Vec::with_capacity(row.len() / 2);
     for chunk in row.chunks(2) {
         let col_id = chunk[0]
             .as_u64()
-            .ok_or("column id must be a non-negative integer")?
-            as u16;
+            .ok_or("column id must be a non-negative integer")? as u16;
         let expected = schema
             .columns
             .iter()
@@ -308,10 +320,7 @@ async fn put_row(
     }
 }
 
-async fn count(
-    State(state): State<Arc<AppState>>,
-    Path(name): Path<String>,
-) -> Response {
+async fn count(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
     let handle = match state.db.table(&name) {
         Ok(h) => h,
         Err(e) => return (StatusCode::NOT_FOUND, e.to_string()).into_response(),
@@ -319,10 +328,7 @@ async fn count(
     Json(json!({ "count": handle.lock().count() })).into_response()
 }
 
-async fn commit(
-    State(state): State<Arc<AppState>>,
-    Path(name): Path<String>,
-) -> Response {
+async fn commit(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
     let handle = match state.db.table(&name) {
         Ok(h) => h,
         Err(e) => return (StatusCode::NOT_FOUND, e.to_string()).into_response(),
@@ -339,11 +345,11 @@ struct SqlRequest {
     sql: String,
 }
 
-async fn sql(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<SqlRequest>,
-) -> Response {
-    let session = match MongrelSession::open(Arc::clone(&state.db)) {
+async fn sql(State(state): State<Arc<AppState>>, Json(req): Json<SqlRequest>) -> Response {
+    let session = match MongrelSession::open_with_external_modules(
+        Arc::clone(&state.db),
+        state.external_modules.iter().cloned(),
+    ) {
         Ok(s) => s,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
@@ -354,8 +360,8 @@ async fn sql(
             }
             let schema = batches[0].schema();
             let mut buf = Vec::new();
-            let mut writer = arrow::ipc::writer::FileWriter::try_new(&mut buf, schema.as_ref())
-                .unwrap();
+            let mut writer =
+                arrow::ipc::writer::FileWriter::try_new(&mut buf, schema.as_ref()).unwrap();
             for b in &batches {
                 let _ = writer.write(b);
             }
@@ -384,10 +390,7 @@ struct TxnRequest {
     ops: Vec<TxnOp>,
 }
 
-async fn txn(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<TxnRequest>,
-) -> Response {
+async fn txn(State(state): State<Arc<AppState>>, Json(req): Json<TxnRequest>) -> Response {
     // Pre-validate every op against the live schemas before entering the
     // transaction, so malformed input returns 400 without consuming an epoch
     // or poisoning a txn.
@@ -404,16 +407,12 @@ async fn txn(
                 };
                 let handle = match state.db.table(&op.table) {
                     Ok(h) => h,
-                    Err(e) => {
-                        return (StatusCode::NOT_FOUND, e.to_string()).into_response()
-                    }
+                    Err(e) => return (StatusCode::NOT_FOUND, e.to_string()).into_response(),
                 };
                 let schema = handle.lock().schema().clone();
                 let cells = match parse_cells(cells_json, &schema) {
                     Ok(c) => c,
-                    Err(msg) => {
-                        return (StatusCode::BAD_REQUEST, msg).into_response()
-                    }
+                    Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
                 };
                 parsed.push((op.table.clone(), TxnAction::Put(cells)));
             }
@@ -428,11 +427,7 @@ async fn txn(
                 parsed.push((op.table.clone(), TxnAction::Delete(rid)));
             }
             other => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    format!("unknown op: {other}"),
-                )
-                    .into_response()
+                return (StatusCode::BAD_REQUEST, format!("unknown op: {other}")).into_response()
             }
         }
     }

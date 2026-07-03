@@ -2475,10 +2475,13 @@ version = "0.21.0"
 dependencies = [
  "arrow",
  "async-trait",
+ "chrono",
  "datafusion",
+ "datafusion-datasource",
  "futures",
  "mongreldb-core",
  "parking_lot",
+ "serde",
  "serde_json",
  "sqlparser",
  "thiserror 1.0.69",
@@ -2491,6 +2494,7 @@ version = "0.21.0"
 dependencies = [
  "arrow",
  "axum",
+ "datafusion",
  "mongreldb-client",
  "mongreldb-core",
  "mongreldb-query",

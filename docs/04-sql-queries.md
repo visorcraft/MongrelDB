@@ -104,6 +104,9 @@ MongrelDB also registers **Extended SQL Functions** for date/time, JSON,
 string, math, and application-defined function hooks. See
 [Extended SQL Functions](11-extended-sql-functions.md).
 
+For schema introspection, maintenance commands, and planner inspection through
+SQL, see [Operational SQL Commands](12-operational-sql-commands.md).
+
 ## Result Caching
 
 Repeated SQL queries return instantly from cache. The cache is keyed by

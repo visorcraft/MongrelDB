@@ -70,6 +70,13 @@ export interface ProcedureSpec {
 export interface ProcedureInfo {
   json: string
 }
+export interface TriggerSpec {
+  json: string
+  idempotencyKey?: string
+}
+export interface TriggerInfo {
+  json: string
+}
 export interface ProcedureCallOptions {
   argsJson?: string
   idempotencyKey?: string
@@ -217,6 +224,11 @@ export declare class Database {
   dropProcedure(name: string): void
   procedures(): Array<ProcedureInfo>
   procedure(name: string): ProcedureInfo | null
+  createTrigger(spec: TriggerSpec): bigint
+  createOrReplaceTrigger(spec: TriggerSpec): bigint
+  dropTrigger(name: string): void
+  triggers(): Array<TriggerInfo>
+  trigger(name: string): TriggerInfo | null
   callProcedure(name: string, opts?: ProcedureCallOptions | undefined | null): ProcedureCallResult
   callProcedureAsync(name: string, opts?: ProcedureCallOptions | undefined | null): Promise<ProcedureCallResult>
   /**
@@ -463,5 +475,10 @@ export declare class RemoteDatabase {
   commit(table: string): bigint
   createProcedure(spec: ProcedureSpec): string
   dropProcedure(name: string): void
+  createTrigger(spec: TriggerSpec): string
+  replaceTrigger(name: string, spec: TriggerSpec): string
+  dropTrigger(name: string): void
+  triggers(): string
+  trigger(name: string): string
   callProcedure(name: string, opts?: ProcedureCallOptions | undefined | null): string
 }

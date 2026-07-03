@@ -1,6 +1,8 @@
 //! `/kit/txn` + `/kit/schema` typed-server integration tests.
 
-use mongreldb_core::constraint::{CheckConstraint, CheckExpr, FkAction, ForeignKey, TableConstraints, UniqueConstraint};
+use mongreldb_core::constraint::{
+    CheckConstraint, CheckExpr, FkAction, ForeignKey, TableConstraints, UniqueConstraint,
+};
 use mongreldb_core::schema::*;
 use mongreldb_core::{Database, Value};
 use mongreldb_server::build_app;
@@ -9,7 +11,12 @@ use tempfile::tempdir;
 use tower::ServiceExt;
 
 fn col(id: u16, name: &str, ty: TypeId, flags: ColumnFlags) -> ColumnDef {
-    ColumnDef { id, name: name.into(), ty, flags }
+    ColumnDef {
+        id,
+        name: name.into(),
+        ty,
+        flags,
+    }
 }
 
 fn users_schema() -> Schema {
@@ -33,9 +40,26 @@ fn users_schema() -> Schema {
     Schema {
         schema_id: 0,
         columns: vec![
-            col(0, "id", TypeId::Int64, ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY).with(ColumnFlags::AUTO_INCREMENT)),
-            col(1, "email", TypeId::Bytes, ColumnFlags::empty().with(ColumnFlags::NULLABLE)),
-            col(2, "age", TypeId::Int64, ColumnFlags::empty().with(ColumnFlags::NULLABLE)),
+            col(
+                0,
+                "id",
+                TypeId::Int64,
+                ColumnFlags::empty()
+                    .with(ColumnFlags::PRIMARY_KEY)
+                    .with(ColumnFlags::AUTO_INCREMENT),
+            ),
+            col(
+                1,
+                "email",
+                TypeId::Bytes,
+                ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+            ),
+            col(
+                2,
+                "age",
+                TypeId::Int64,
+                ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+            ),
         ],
         indexes: vec![],
         colocation: vec![],
@@ -56,8 +80,18 @@ fn orders_schema() -> Schema {
     Schema {
         schema_id: 0,
         columns: vec![
-            col(10, "oid", TypeId::Int64, ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY)),
-            col(11, "uid", TypeId::Int64, ColumnFlags::empty().with(ColumnFlags::NULLABLE)),
+            col(
+                10,
+                "oid",
+                TypeId::Int64,
+                ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+            ),
+            col(
+                11,
+                "uid",
+                TypeId::Int64,
+                ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+            ),
         ],
         indexes: vec![],
         colocation: vec![],
@@ -87,7 +121,9 @@ async fn post(app: axum::Router, uri: &str, body: serde_json::Value) -> (u16, se
         .await
         .unwrap();
     let status = resp.status().as_u16();
-    let bytes = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024)
+        .await
+        .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
     (status, v)
 }
@@ -104,7 +140,9 @@ async fn get(app: axum::Router, uri: &str) -> (u16, serde_json::Value) {
         .await
         .unwrap();
     let status = resp.status().as_u16();
-    let bytes = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024)
+        .await
+        .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
     (status, v)
 }
@@ -143,7 +181,13 @@ async fn idempotency_persists_across_server_restart() {
     );
     // And the row was not double-inserted.
     let snap = db.snapshot().0;
-    let n = db.table("users").unwrap().lock().visible_rows(snap).unwrap().len();
+    let n = db
+        .table("users")
+        .unwrap()
+        .lock()
+        .visible_rows(snap)
+        .unwrap()
+        .len();
     assert_eq!(n, 1);
 }
 
@@ -220,7 +264,8 @@ async fn kit_txn_fk_insert_violation() {
 async fn kit_txn_upsert_and_delete_by_pk() {
     let (_d, app) = setup().await;
     // Insert a user with explicit id.
-    let b = serde_json::json!({"ops": [{"put": {"table": "users", "cells": [0, 5, 1, "u@x", 2, 20]}}]});
+    let b =
+        serde_json::json!({"ops": [{"put": {"table": "users", "cells": [0, 5, 1, "u@x", 2, 20]}}]});
     let (s, _) = post(app.clone(), "/kit/txn", b).await;
     assert_eq!(s, 200);
     // Upsert same PK → DO NOTHING (unchanged).
@@ -233,7 +278,10 @@ async fn kit_txn_upsert_and_delete_by_pk() {
     let (s, v) = post(app.clone(), "/kit/txn", b).await;
     assert_eq!(s, 200, "body: {v}");
     assert_eq!(v["results"][0]["action"], "updated");
-    assert!(v["results"][0]["row"].as_array().unwrap().contains(&serde_json::json!(21)));
+    assert!(v["results"][0]["row"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!(21)));
     // Delete by PK.
     let b = serde_json::json!({"ops": [{"delete_by_pk": {"table": "users", "pk": 5}}]});
     let (s, v) = post(app.clone(), "/kit/txn", b).await;
@@ -254,7 +302,11 @@ async fn kit_txn_idempotent_replay() {
     // Replay with same key → same response, no new write.
     let (s2, v2) = post(app, "/kit/txn", b).await;
     assert_eq!(s2, 200);
-    assert_eq!(v2["epoch"].as_u64().unwrap(), epoch1, "replay returns cached epoch");
+    assert_eq!(
+        v2["epoch"].as_u64().unwrap(),
+        epoch1,
+        "replay returns cached epoch"
+    );
 }
 
 #[tokio::test]
@@ -299,9 +351,13 @@ async fn kit_query_pk_range_and_projection() {
     assert_eq!(v["rows"].as_array().unwrap().len(), 2);
     // Projection: only cols 0 and 2 appear (no email col 1).
     for r in v["rows"].as_array().unwrap() {
-        let ids: Vec<&serde_json::Value> = r["cells"].as_array().unwrap().iter().step_by(2).collect();
+        let ids: Vec<&serde_json::Value> =
+            r["cells"].as_array().unwrap().iter().step_by(2).collect();
         assert!(ids.contains(&&serde_json::json!(0)) || ids.contains(&&serde_json::json!(2)));
-        assert!(!ids.iter().any(|x| **x == serde_json::json!(1u64)), "email not projected");
+        assert!(
+            !ids.iter().any(|x| **x == serde_json::json!(1u64)),
+            "email not projected"
+        );
     }
 
     // Limit truncates.

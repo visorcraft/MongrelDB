@@ -88,7 +88,11 @@ async fn request(
     let body = body
         .map(|v| axum::body::Body::from(v.to_string()))
         .unwrap_or_else(axum::body::Body::empty);
-    let resp = app.clone().oneshot(builder.body(body).unwrap()).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(builder.body(body).unwrap())
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
         .await

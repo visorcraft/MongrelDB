@@ -39,6 +39,7 @@ use crate::{validate_table_name, AppState};
 pub struct IdempotencyStore {
     dir: std::path::PathBuf,
     committed: Mutex<HashMap<String, KitTxnResponse>>,
+    json_committed: Mutex<HashMap<String, Jval>>,
     in_flight: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
@@ -52,11 +53,12 @@ impl IdempotencyStore {
         Self {
             dir,
             committed: Mutex::new(HashMap::new()),
+            json_committed: Mutex::new(HashMap::new()),
             in_flight: Mutex::new(HashMap::new()),
         }
     }
 
-    fn key_lock(&self, key: &str) -> Arc<Mutex<()>> {
+    pub(crate) fn key_lock(&self, key: &str) -> Arc<Mutex<()>> {
         self.in_flight
             .lock()
             .unwrap()
@@ -105,6 +107,38 @@ impl IdempotencyStore {
             }
         }
         self.committed.lock().unwrap().insert(key, resp);
+    }
+
+    pub(crate) fn get_json(&self, key: &str) -> Option<Jval> {
+        if let Some(v) = self.json_committed.lock().unwrap().get(key).cloned() {
+            return Some(v);
+        }
+        let path = self.path_for(key);
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(_) => return None,
+        };
+        match serde_json::from_slice::<Jval>(&bytes) {
+            Ok(v) => {
+                self.json_committed
+                    .lock()
+                    .unwrap()
+                    .insert(key.to_string(), v.clone());
+                Some(v)
+            }
+            Err(_) => None,
+        }
+    }
+
+    pub(crate) fn store_json(&self, key: String, resp: Jval) {
+        let path = self.path_for(&key);
+        if let Ok(bytes) = serde_json::to_vec(&resp) {
+            let tmp = path.with_extension("json.tmp");
+            if std::fs::write(&tmp, &bytes).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
+        }
+        self.json_committed.lock().unwrap().insert(key, resp);
     }
 }
 
@@ -211,7 +245,9 @@ pub fn error_code(e: &MongrelError) -> &'static str {
     match e {
         MongrelError::Conflict(_) => {
             let m = format!("{e}");
-            if m.contains("UNIQUE") {
+            if is_trigger_error(&m) {
+                "TRIGGER_VALIDATION"
+            } else if m.contains("UNIQUE") {
                 "UNIQUE_VIOLATION"
             } else if m.contains("FOREIGN KEY") {
                 "FK_VIOLATION"
@@ -221,7 +257,9 @@ pub fn error_code(e: &MongrelError) -> &'static str {
         }
         MongrelError::InvalidArgument(_) => {
             let m = format!("{e}");
-            if m.contains("CHECK constraint") {
+            if is_trigger_error(&m) {
+                "TRIGGER_VALIDATION"
+            } else if m.contains("CHECK constraint") {
                 "CHECK_VIOLATION"
             } else {
                 "BAD_REQUEST"
@@ -230,6 +268,12 @@ pub fn error_code(e: &MongrelError) -> &'static str {
         MongrelError::NotFound(_) => "NOT_FOUND",
         _ => "INTERNAL",
     }
+}
+
+fn is_trigger_error(message: &str) -> bool {
+    message.contains("trigger ")
+        || message.contains("Trigger ")
+        || message.contains("external trigger bridge")
 }
 
 // ── Metadata handlers ───────────────────────────────────────────────────────
@@ -245,10 +289,7 @@ pub async fn schema_all(State(state): State<Arc<AppState>>) -> Response {
     Json(json!({ "tables": serde_json::Value::Object(tables) })).into_response()
 }
 
-pub async fn schema_one(
-    State(state): State<Arc<AppState>>,
-    Path(table): Path<String>,
-) -> Response {
+pub async fn schema_one(State(state): State<Arc<AppState>>, Path(table): Path<String>) -> Response {
     match state.db.table(&table) {
         Ok(h) => Json(schema_descriptor(h.lock().schema())).into_response(),
         Err(e) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
@@ -513,10 +554,22 @@ pub struct KitQueryRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JsonCondition {
-    Pk { value: Jval },
-    BitmapEq { column_id: u16, value: Jval },
-    BitmapIn { column_id: u16, values: Vec<Jval> },
-    Range { column_id: u16, lo: i64, hi: i64 },
+    Pk {
+        value: Jval,
+    },
+    BitmapEq {
+        column_id: u16,
+        value: Jval,
+    },
+    BitmapIn {
+        column_id: u16,
+        values: Vec<Jval>,
+    },
+    Range {
+        column_id: u16,
+        lo: i64,
+        hi: i64,
+    },
     RangeF64 {
         column_id: u16,
         lo: f64,
@@ -524,13 +577,35 @@ pub enum JsonCondition {
         hi: f64,
         hi_inclusive: bool,
     },
-    IsNull { column_id: u16 },
-    IsNotNull { column_id: u16 },
-    FmContains { column_id: u16, pattern: String },
-    FmContainsAll { column_id: u16, patterns: Vec<String> },
-    Ann { column_id: u16, query: Vec<f32>, k: usize },
-    SparseMatch { column_id: u16, query: Vec<(u32, f32)>, k: usize },
-    MinHashSimilar { column_id: u16, query: Vec<u64>, k: usize },
+    IsNull {
+        column_id: u16,
+    },
+    IsNotNull {
+        column_id: u16,
+    },
+    FmContains {
+        column_id: u16,
+        pattern: String,
+    },
+    FmContainsAll {
+        column_id: u16,
+        patterns: Vec<String>,
+    },
+    Ann {
+        column_id: u16,
+        query: Vec<f32>,
+        k: usize,
+    },
+    SparseMatch {
+        column_id: u16,
+        query: Vec<(u32, f32)>,
+        k: usize,
+    },
+    MinHashSimilar {
+        column_id: u16,
+        query: Vec<u64>,
+        k: usize,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -580,11 +655,7 @@ pub async fn kit_query(
     let rows = match handle.lock().query(&q) {
         Ok(r) => r,
         Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                e.to_string(),
-            )
-                .into_response();
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
     };
     let mut out: Vec<KitRow> = Vec::new();
@@ -600,9 +671,9 @@ pub async fn kit_query(
                 .iter()
                 .filter(|c| proj.contains(&c.id))
                 .filter_map(|c| {
-                    r.columns.get(&c.id).map(|v| {
-                        vec![json!(c.id), value_to_json(v)]
-                    })
+                    r.columns
+                        .get(&c.id)
+                        .map(|v| vec![json!(c.id), value_to_json(v)])
                 })
                 .flatten()
                 .collect(),
@@ -610,7 +681,9 @@ pub async fn kit_query(
                 .columns
                 .iter()
                 .filter_map(|c| {
-                    r.columns.get(&c.id).map(|v| vec![json!(c.id), value_to_json(v)])
+                    r.columns
+                        .get(&c.id)
+                        .map(|v| vec![json!(c.id), value_to_json(v)])
                 })
                 .flatten()
                 .collect(),
@@ -620,7 +693,11 @@ pub async fn kit_query(
             cells,
         });
     }
-    Json(KitQueryResponse { rows: out, truncated }).into_response()
+    Json(KitQueryResponse {
+        rows: out,
+        truncated,
+    })
+    .into_response()
 }
 
 fn parse_condition(c: &JsonCondition, schema: &Schema) -> std::result::Result<Condition, String> {
@@ -664,27 +741,46 @@ fn parse_condition(c: &JsonCondition, schema: &Schema) -> std::result::Result<Co
             hi: *hi,
             hi_inclusive: *hi_inclusive,
         },
-        JsonCondition::IsNull { column_id } => Condition::IsNull { column_id: *column_id },
-        JsonCondition::IsNotNull { column_id } => Condition::IsNotNull { column_id: *column_id },
+        JsonCondition::IsNull { column_id } => Condition::IsNull {
+            column_id: *column_id,
+        },
+        JsonCondition::IsNotNull { column_id } => Condition::IsNotNull {
+            column_id: *column_id,
+        },
         JsonCondition::FmContains { column_id, pattern } => Condition::FmContains {
             column_id: *column_id,
             pattern: pattern.as_bytes().to_vec(),
         },
-        JsonCondition::FmContainsAll { column_id, patterns } => Condition::FmContainsAll {
+        JsonCondition::FmContainsAll {
+            column_id,
+            patterns,
+        } => Condition::FmContainsAll {
             column_id: *column_id,
             patterns: patterns.iter().map(|s| s.as_bytes().to_vec()).collect(),
         },
-        JsonCondition::Ann { column_id, query, k } => Condition::Ann {
+        JsonCondition::Ann {
+            column_id,
+            query,
+            k,
+        } => Condition::Ann {
             column_id: *column_id,
             query: query.clone(),
             k: *k,
         },
-        JsonCondition::SparseMatch { column_id, query, k } => Condition::SparseMatch {
+        JsonCondition::SparseMatch {
+            column_id,
+            query,
+            k,
+        } => Condition::SparseMatch {
             column_id: *column_id,
             query: query.clone(),
             k: *k,
         },
-        JsonCondition::MinHashSimilar { column_id, query, k } => Condition::MinHashSimilar {
+        JsonCondition::MinHashSimilar {
+            column_id,
+            query,
+            k,
+        } => Condition::MinHashSimilar {
             column_id: *column_id,
             query: query.clone(),
             k: *k,
@@ -692,7 +788,10 @@ fn parse_condition(c: &JsonCondition, schema: &Schema) -> std::result::Result<Co
     })
 }
 
-fn col_type(schema: &Schema, column_id: u16) -> std::result::Result<mongreldb_core::schema::TypeId, String> {
+fn col_type(
+    schema: &Schema,
+    column_id: u16,
+) -> std::result::Result<mongreldb_core::schema::TypeId, String> {
     schema
         .columns
         .iter()
@@ -707,14 +806,23 @@ fn execute_kit_txn(state: &AppState, req: &KitTxnRequest) -> Result<KitTxnRespon
     //    parse cells into typed Values. This gives per-op error attribution
     //    (op_index) for malformed input BEFORE consuming an epoch.
     enum Action {
-        Put { table: String, cells: Vec<(u16, Value)> },
+        Put {
+            table: String,
+            cells: Vec<(u16, Value)>,
+        },
         Upsert {
             table: String,
             cells: Vec<(u16, Value)>,
             update_cells: Option<Vec<(u16, Value)>>,
         },
-        Delete { table: String, row_id: RowId },
-        DeleteByPk { table: String, key: Value },
+        Delete {
+            table: String,
+            row_id: RowId,
+        },
+        DeleteByPk {
+            table: String,
+            key: Value,
+        },
     }
     struct Parsed {
         returning: bool,
@@ -751,8 +859,7 @@ fn execute_kit_txn(state: &AppState, req: &KitTxnRequest) -> Result<KitTxnRespon
                     parse_cells(cells, &schema).map_err(|m| op_error_msg(i, "BAD_REQUEST", m))?;
                 let upd = match update_cells {
                     Some(uc) => Some(
-                        parse_cells(uc, &schema)
-                            .map_err(|m| op_error_msg(i, "BAD_REQUEST", m))?,
+                        parse_cells(uc, &schema).map_err(|m| op_error_msg(i, "BAD_REQUEST", m))?,
                     ),
                     None => None,
                 };
@@ -938,7 +1045,9 @@ fn parse_cells(row: &[Jval], schema: &Schema) -> std::result::Result<Vec<(u16, V
 
 /// Coerce a PK JSON value against the table's declared primary-key column.
 fn pk_value(pk: &Jval, schema: &Schema) -> std::result::Result<Value, String> {
-    let pk_col = schema.primary_key().ok_or("table has no primary_key column")?;
+    let pk_col = schema
+        .primary_key()
+        .ok_or("table has no primary_key column")?;
     Ok(json_to_value(pk, pk_col.ty))
 }
 

@@ -150,6 +150,17 @@ pub struct ProcedureInfo {
 }
 
 #[napi(object)]
+pub struct TriggerSpec {
+    pub json: String,
+    pub idempotency_key: Option<String>,
+}
+
+#[napi(object)]
+pub struct TriggerInfo {
+    pub json: String,
+}
+
+#[napi(object)]
 pub struct ProcedureCallOptions {
     pub args_json: Option<String>,
     pub idempotency_key: Option<String>,
@@ -257,6 +268,37 @@ fn procedure_info(procedure: &mongreldb_core::StoredProcedure) -> napi::Result<P
                 napi::Status::GenericFailure,
                 format!("procedure encode: {e}"),
             )
+        })?,
+    })
+}
+
+fn trigger_from_spec(spec: TriggerSpec) -> napi::Result<mongreldb_core::StoredTrigger> {
+    let parsed: mongreldb_core::StoredTrigger = serde_json::from_str(&spec.json).map_err(|e| {
+        napi::Error::new(
+            napi::Status::InvalidArg,
+            format!("invalid trigger JSON: {e}"),
+        )
+    })?;
+    mongreldb_core::StoredTrigger::new(
+        parsed.name,
+        mongreldb_core::TriggerDefinition {
+            target: parsed.target,
+            timing: parsed.timing,
+            event: parsed.event,
+            update_of: parsed.update_of,
+            target_columns: parsed.target_columns,
+            when: parsed.when,
+            program: parsed.program,
+        },
+        0,
+    )
+    .map_err(to_napi)
+}
+
+fn trigger_info(trigger: &mongreldb_core::StoredTrigger) -> napi::Result<TriggerInfo> {
+    Ok(TriggerInfo {
+        json: serde_json::to_string(trigger).map_err(|e| {
+            napi::Error::new(napi::Status::GenericFailure, format!("trigger encode: {e}"))
         })?,
     })
 }
@@ -975,6 +1017,42 @@ impl Database {
             .procedure(&name)
             .as_ref()
             .map(procedure_info)
+            .transpose()
+    }
+
+    #[napi]
+    pub fn create_trigger(&self, spec: TriggerSpec) -> napi::Result<BigInt> {
+        let trigger = trigger_from_spec(spec)?;
+        let created = self.inner.create_trigger(trigger).map_err(to_napi)?;
+        Ok(BigInt::from(created.version))
+    }
+
+    #[napi]
+    pub fn create_or_replace_trigger(&self, spec: TriggerSpec) -> napi::Result<BigInt> {
+        let trigger = trigger_from_spec(spec)?;
+        let created = self
+            .inner
+            .create_or_replace_trigger(trigger)
+            .map_err(to_napi)?;
+        Ok(BigInt::from(created.version))
+    }
+
+    #[napi]
+    pub fn drop_trigger(&self, name: String) -> napi::Result<()> {
+        self.inner.drop_trigger(&name).map_err(to_napi)
+    }
+
+    #[napi]
+    pub fn triggers(&self) -> napi::Result<Vec<TriggerInfo>> {
+        self.inner.triggers().iter().map(trigger_info).collect()
+    }
+
+    #[napi]
+    pub fn trigger(&self, name: String) -> napi::Result<Option<TriggerInfo>> {
+        self.inner
+            .trigger(&name)
+            .as_ref()
+            .map(trigger_info)
             .transpose()
     }
 
@@ -2470,6 +2548,67 @@ impl RemoteDatabase {
             .call()
             .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
         Ok(())
+    }
+
+    #[napi]
+    pub fn create_trigger(&self, spec: TriggerSpec) -> napi::Result<String> {
+        let trigger: serde_json::Value = serde_json::from_str(&spec.json)
+            .map_err(|e| napi::Error::new(napi::Status::InvalidArg, e.to_string()))?;
+        let mut body = serde_json::json!({ "trigger": trigger });
+        if let Some(idempotency_key) = spec.idempotency_key {
+            body["idempotency_key"] = serde_json::Value::String(idempotency_key);
+        }
+        self.agent
+            .post(&format!("{}/triggers", self.url))
+            .send_json(body)
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?
+            .into_string()
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))
+    }
+
+    #[napi]
+    pub fn replace_trigger(&self, name: String, spec: TriggerSpec) -> napi::Result<String> {
+        let trigger: serde_json::Value = serde_json::from_str(&spec.json)
+            .map_err(|e| napi::Error::new(napi::Status::InvalidArg, e.to_string()))?;
+        let mut body = serde_json::json!({ "trigger": trigger });
+        if let Some(idempotency_key) = spec.idempotency_key {
+            body["idempotency_key"] = serde_json::Value::String(idempotency_key);
+        }
+        self.agent
+            .put(&format!("{}/triggers/{name}", self.url))
+            .send_json(body)
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?
+            .into_string()
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))
+    }
+
+    #[napi]
+    pub fn drop_trigger(&self, name: String) -> napi::Result<()> {
+        self.agent
+            .delete(&format!("{}/triggers/{name}", self.url))
+            .call()
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
+        Ok(())
+    }
+
+    #[napi]
+    pub fn triggers(&self) -> napi::Result<String> {
+        self.agent
+            .get(&format!("{}/triggers", self.url))
+            .call()
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?
+            .into_string()
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))
+    }
+
+    #[napi]
+    pub fn trigger(&self, name: String) -> napi::Result<String> {
+        self.agent
+            .get(&format!("{}/triggers/{name}", self.url))
+            .call()
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?
+            .into_string()
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))
     }
 
     #[napi]

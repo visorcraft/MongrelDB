@@ -47,6 +47,8 @@ fn sample_catalog() -> Catalog {
             created_epoch: 2,
         }],
         procedures: Vec::new(),
+        triggers: Vec::new(),
+        external_tables: Vec::new(),
     }
 }
 

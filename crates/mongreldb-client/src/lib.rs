@@ -46,6 +46,8 @@ pub enum KitErrorCode {
     ProcedureNotFound,
     ProcedureValidation,
     ProcedureExecution,
+    TriggerNotFound,
+    TriggerValidation,
     Conflict,
     BadRequest,
     NotFound,
@@ -68,6 +70,8 @@ impl KitErrorCode {
             KitErrorCode::ProcedureNotFound => "PROCEDURE_NOT_FOUND",
             KitErrorCode::ProcedureValidation => "PROCEDURE_VALIDATION",
             KitErrorCode::ProcedureExecution => "PROCEDURE_EXECUTION",
+            KitErrorCode::TriggerNotFound => "TRIGGER_NOT_FOUND",
+            KitErrorCode::TriggerValidation => "TRIGGER_VALIDATION",
             KitErrorCode::Conflict => "CONFLICT",
             KitErrorCode::BadRequest => "BAD_REQUEST",
             KitErrorCode::NotFound => "NOT_FOUND",
@@ -84,6 +88,8 @@ impl KitErrorCode {
             "PROCEDURE_NOT_FOUND" => KitErrorCode::ProcedureNotFound,
             "PROCEDURE_VALIDATION" => KitErrorCode::ProcedureValidation,
             "PROCEDURE_EXECUTION" => KitErrorCode::ProcedureExecution,
+            "TRIGGER_NOT_FOUND" => KitErrorCode::TriggerNotFound,
+            "TRIGGER_VALIDATION" => KitErrorCode::TriggerValidation,
             "CONFLICT" => KitErrorCode::Conflict,
             "BAD_REQUEST" => KitErrorCode::BadRequest,
             "NOT_FOUND" => KitErrorCode::NotFound,
@@ -292,6 +298,13 @@ pub struct ProcedureRequest {
     pub procedure: mongreldb_core::StoredProcedure,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct TriggerRequest {
+    pub trigger: mongreldb_core::StoredTrigger,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProcedureResponse {
     pub status: String,
@@ -299,8 +312,20 @@ pub struct ProcedureResponse {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct TriggerResponse {
+    #[serde(default)]
+    pub status: Option<String>,
+    pub trigger: mongreldb_core::StoredTrigger,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct ProceduresResponse {
     pub procedures: Vec<mongreldb_core::StoredProcedure>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TriggersResponse {
+    pub triggers: Vec<mongreldb_core::StoredTrigger>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -385,11 +410,7 @@ impl MongrelClient {
         Ok(self.check(resp)?.json()?)
     }
 
-    pub fn create_table(
-        &self,
-        name: &str,
-        columns: Vec<ColumnDefJson>,
-    ) -> ClientResult<u64> {
+    pub fn create_table(&self, name: &str, columns: Vec<ColumnDefJson>) -> ClientResult<u64> {
         let resp = self
             .client
             .post(self.url("/tables"))
@@ -421,11 +442,7 @@ impl MongrelClient {
         Ok(cr.count)
     }
 
-    pub fn put(
-        &self,
-        table: &str,
-        row: Vec<(u16, mongreldb_core::Value)>,
-    ) -> ClientResult<u64> {
+    pub fn put(&self, table: &str, row: Vec<(u16, mongreldb_core::Value)>) -> ClientResult<u64> {
         let json_row: Vec<serde_json::Value> = row
             .iter()
             .flat_map(|(id, v)| vec![serde_json::json!(id), value_to_json(v)])
@@ -495,11 +512,7 @@ impl MongrelClient {
     /// Run a typed atomic batch (`POST /kit/txn`). Constraint violations and
     /// conflicts return [`ClientError::Kit`] with the matching code.
     pub fn kit_txn(&self, req: &KitTxnRequest) -> ClientResult<KitTxnResponse> {
-        let resp = self
-            .client
-            .post(self.url("/kit/txn"))
-            .json(req)
-            .send()?;
+        let resp = self.client.post(self.url("/kit/txn")).json(req).send()?;
         let resp = self.check(resp)?;
         Ok(resp.json()?)
     }
@@ -508,11 +521,7 @@ impl MongrelClient {
     /// and typed cells. Conditions intersect in the row-id space; this is the
     /// native counterpart to SQL reads (which hide row ids).
     pub fn kit_query(&self, req: &KitQueryRequest) -> ClientResult<KitQueryResponse> {
-        let resp = self
-            .client
-            .post(self.url("/kit/query"))
-            .json(req)
-            .send()?;
+        let resp = self.client.post(self.url("/kit/query")).json(req).send()?;
         let resp = self.check(resp)?;
         Ok(resp.json()?)
     }
@@ -609,6 +618,88 @@ impl MongrelClient {
             .send()?;
         let resp = self.check(resp)?;
         Ok(resp.json()?)
+    }
+
+    pub fn triggers(&self) -> ClientResult<Vec<mongreldb_core::StoredTrigger>> {
+        let resp = self.client.get(self.url("/triggers")).send()?;
+        let resp = self.check(resp)?;
+        Ok(resp.json::<TriggersResponse>()?.triggers)
+    }
+
+    pub fn trigger(&self, name: &str) -> ClientResult<mongreldb_core::StoredTrigger> {
+        let resp = self
+            .client
+            .get(self.url(&format!("/triggers/{name}")))
+            .send()?;
+        let resp = self.check(resp)?;
+        Ok(resp.json::<TriggerResponse>()?.trigger)
+    }
+
+    pub fn create_trigger(
+        &self,
+        trigger: mongreldb_core::StoredTrigger,
+    ) -> ClientResult<mongreldb_core::StoredTrigger> {
+        self.create_trigger_with_idempotency_key(trigger, None::<String>)
+    }
+
+    pub fn create_trigger_with_idempotency_key(
+        &self,
+        trigger: mongreldb_core::StoredTrigger,
+        idempotency_key: Option<impl Into<String>>,
+    ) -> ClientResult<mongreldb_core::StoredTrigger> {
+        let resp = self
+            .client
+            .post(self.url("/triggers"))
+            .json(&TriggerRequest {
+                trigger,
+                idempotency_key: idempotency_key.map(Into::into),
+            })
+            .send()?;
+        let resp = self.check(resp)?;
+        Ok(resp.json::<TriggerResponse>()?.trigger)
+    }
+
+    pub fn replace_trigger(
+        &self,
+        name: &str,
+        trigger: mongreldb_core::StoredTrigger,
+    ) -> ClientResult<mongreldb_core::StoredTrigger> {
+        self.replace_trigger_with_idempotency_key(name, trigger, None::<String>)
+    }
+
+    pub fn replace_trigger_with_idempotency_key(
+        &self,
+        name: &str,
+        trigger: mongreldb_core::StoredTrigger,
+        idempotency_key: Option<impl Into<String>>,
+    ) -> ClientResult<mongreldb_core::StoredTrigger> {
+        let resp = self
+            .client
+            .put(self.url(&format!("/triggers/{name}")))
+            .json(&TriggerRequest {
+                trigger,
+                idempotency_key: idempotency_key.map(Into::into),
+            })
+            .send()?;
+        let resp = self.check(resp)?;
+        Ok(resp.json::<TriggerResponse>()?.trigger)
+    }
+
+    pub fn drop_trigger(&self, name: &str) -> ClientResult<()> {
+        self.drop_trigger_with_idempotency_key(name, None::<String>)
+    }
+
+    pub fn drop_trigger_with_idempotency_key(
+        &self,
+        name: &str,
+        idempotency_key: Option<impl Into<String>>,
+    ) -> ClientResult<()> {
+        let mut request = self.client.delete(self.url(&format!("/triggers/{name}")));
+        if let Some(idempotency_key) = idempotency_key {
+            request = request.header("Idempotency-Key", idempotency_key.into());
+        }
+        self.check(request.send()?)?;
+        Ok(())
     }
 }
 

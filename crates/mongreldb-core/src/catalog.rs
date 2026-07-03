@@ -12,8 +12,10 @@
 //!   never leaves a half-linked catalog entry.
 
 use crate::error::{MongrelError, Result};
+use crate::external_table::ExternalTableEntry;
 use crate::procedure::ProcedureEntry;
 use crate::schema::Schema;
+use crate::trigger::TriggerEntry;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::Write;
@@ -58,6 +60,10 @@ pub struct Catalog {
     pub tables: Vec<CatalogEntry>,
     #[serde(default)]
     pub procedures: Vec<ProcedureEntry>,
+    #[serde(default)]
+    pub triggers: Vec<TriggerEntry>,
+    #[serde(default)]
+    pub external_tables: Vec<ExternalTableEntry>,
 }
 
 impl Catalog {

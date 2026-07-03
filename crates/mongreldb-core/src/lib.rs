@@ -6,6 +6,7 @@
 //! formats, MVCC snapshots, page cache, encryption, compaction, and indexes.
 
 #![allow(clippy::module_inception)]
+#![recursion_limit = "256"]
 
 pub mod be_tree;
 pub mod cache;
@@ -19,6 +20,7 @@ pub mod encryption;
 pub mod engine;
 pub mod epoch;
 pub mod error;
+pub mod external_table;
 pub mod gc;
 pub mod global_idx;
 pub mod index;
@@ -36,6 +38,7 @@ pub mod rowid;
 pub mod schema;
 pub mod sorted_run;
 pub mod trace;
+pub mod trigger;
 pub mod tsv;
 pub mod txn;
 pub mod wal;
@@ -44,7 +47,10 @@ pub use be_tree::BeTree;
 pub use cache::PageCache;
 pub use columnar::{decode_column, encode_column};
 pub use cursor::{drain_cursor_to_columns, Cursor, MultiRunCursor, NativePageCursor};
-pub use database::{CheckIssue, Database};
+pub use database::{
+    CheckIssue, Database, ExternalTriggerBaseWrite, ExternalTriggerBridge, ExternalTriggerWrite,
+    ExternalTriggerWriteResult,
+};
 pub use encryption::{Cipher, PlaintextCipher};
 pub use engine::{
     AggState, ApproxAgg, ApproxResult, CachedAgg, ColumnStat, IncrementalAggResult,
@@ -52,6 +58,9 @@ pub use engine::{
 };
 pub use epoch::{Epoch, EpochAuthority, EpochClock, Snapshot};
 pub use error::{MongrelError, Result};
+pub use external_table::{
+    ExternalTableDefinition, ExternalTableEntry, ModuleArg, ModuleCapabilities,
+};
 pub use gc::{CheckReport, DoctorReport, GcReport};
 pub use index::{
     AnnIndex, BitmapIndex, ColumnLearnedRange, FmIndex, HotIndex, LearnedIndex, SparseIndex,
@@ -73,6 +82,11 @@ pub use sorted_run::{
     RunSpec, RunWriter,
 };
 pub use trace::{IndexRebuild, QueryTrace, ScanMode};
+pub use trigger::{
+    StoredTrigger, TriggerCell, TriggerCondition, TriggerConfig, TriggerDefinition, TriggerEntry,
+    TriggerEvent, TriggerExpr, TriggerProgram, TriggerRaiseAction, TriggerStep, TriggerTarget,
+    TriggerTiming, TriggerValue,
+};
 pub use txn::{OwnedRow, PutResult, UpsertAction, UpsertActionKind, UpsertResult};
 pub use wal::{AddedRun, DdlOp, Op, Record, SharedWal, Wal, WalReader, SYSTEM_TXN_ID};
 

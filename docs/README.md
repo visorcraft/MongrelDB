@@ -33,6 +33,10 @@ vector similarity, range queries, and more.
     callable from SQL, HTTP, NAPI, and Kit clients
 11. **[Extended SQL Functions](11-extended-sql-functions.md)** — built-in
     date/time, JSON, string, math, and custom function hooks
+12. **[Operational SQL Commands](12-operational-sql-commands.md)** —
+    PRAGMA introspection, ANALYZE, REINDEX, VACUUM, and EXPLAIN QUERY PLAN
+13. **[Trigger Programs & External Table Modules](13-triggers-and-external-table-modules.md)** —
+    architecture spec for triggers and external table modules
 
 ## Quick Reference
 

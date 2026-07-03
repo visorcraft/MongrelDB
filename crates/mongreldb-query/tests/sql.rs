@@ -873,6 +873,39 @@ async fn metadata_aggregates_count_min_max() {
         .value(0);
     assert_eq!(mn, 0);
     assert_eq!(mx, 99);
+
+    let mixed = session
+        .run("select min(id) as aggregate_min, max(id) as aggregate_max, min(3, 1, 2) as scalar_min, max(3, 1, 2) as scalar_max from travel_trips")
+        .await
+        .unwrap();
+    let aggregate_min = mixed[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap()
+        .value(0);
+    let aggregate_max = mixed[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap()
+        .value(0);
+    let scalar_min = mixed[0]
+        .column(2)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap()
+        .value(0);
+    let scalar_max = mixed[0]
+        .column(3)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(aggregate_min, 0);
+    assert_eq!(aggregate_max, 99);
+    assert_eq!(scalar_min, 1);
+    assert_eq!(scalar_max, 3);
 }
 
 /// Phase 7.1 (P7a/P7b): COUNT(col) and MIN/MAX served from page
@@ -1050,6 +1083,48 @@ async fn metadata_aggregates_skip_the_scan() {
     assert!(
         !plan.contains("MongrelScanExec"),
         "COUNT(*) should be served from stats, not a scan. Plan:\n{plan}"
+    );
+}
+
+#[tokio::test]
+async fn explain_query_plan_returns_compatibility_shape() {
+    let (_dir, session) = setup().await;
+    let explained = session
+        .run(
+            "explain query plan
+             select count(*) as n
+             from travel_trips
+             where destination = 'City 7'
+             group by destination
+             order by destination",
+        )
+        .await
+        .unwrap();
+    assert_eq!(explained[0].schema().field(0).name(), "id");
+    assert_eq!(explained[0].schema().field(1).name(), "parent");
+    assert_eq!(explained[0].schema().field(2).name(), "notused");
+    assert_eq!(explained[0].schema().field(3).name(), "detail");
+    let detail = explained[0]
+        .column(3)
+        .as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .unwrap();
+    assert!(
+        (0..detail.len()).any(|idx| detail.value(idx) == "SEARCH travel_trips USING MONGREL INDEX"),
+        "expected MongrelDB SEARCH detail"
+    );
+    assert!(
+        (0..detail.len()).any(|idx| detail.value(idx) == "USE TEMP B-TREE FOR GROUP BY"),
+        "expected GROUP BY detail"
+    );
+    assert!(
+        (0..detail.len()).any(|idx| detail.value(idx) == "USE TEMP B-TREE FOR ORDER BY"),
+        "expected ORDER BY detail"
+    );
+    assert!(
+        (0..detail.len()).any(|idx| detail.value(idx).contains("logical_plan")
+            || detail.value(idx).contains("physical_plan")),
+        "expected DataFusion plan detail"
     );
 }
 

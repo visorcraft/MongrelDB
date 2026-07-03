@@ -5,9 +5,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use mongreldb_core::procedure::{
-    ProcedureCallOutput, ProcedureCallRow, StoredProcedure,
-};
+use mongreldb_core::procedure::{ProcedureCallOutput, ProcedureCallRow, StoredProcedure};
 use mongreldb_core::Value;
 use serde::Deserialize;
 use serde_json::json;
@@ -32,13 +30,14 @@ pub async fn list(State(state): State<Arc<AppState>>) -> Response {
     Json(json!({ "procedures": state.db.procedures() })).into_response()
 }
 
-pub async fn describe(
-    State(state): State<Arc<AppState>>,
-    Path(name): Path<String>,
-) -> Response {
+pub async fn describe(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
     match state.db.procedure(&name) {
         Some(procedure) => Json(json!({ "procedure": procedure })).into_response(),
-        None => error(StatusCode::NOT_FOUND, "PROCEDURE_NOT_FOUND", "procedure not found"),
+        None => error(
+            StatusCode::NOT_FOUND,
+            "PROCEDURE_NOT_FOUND",
+            "procedure not found",
+        ),
     }
 }
 
@@ -63,7 +62,8 @@ pub async fn replace(
 ) -> Response {
     let mut procedure = req.procedure;
     procedure.name = name;
-    match normalized(procedure).and_then(|procedure| state.db.create_or_replace_procedure(procedure))
+    match normalized(procedure)
+        .and_then(|procedure| state.db.create_or_replace_procedure(procedure))
     {
         Ok(procedure) => Json(json!({ "status": "ok", "procedure": procedure })).into_response(),
         Err(e) => error(
@@ -177,7 +177,9 @@ fn output_json(output: &ProcedureCallOutput) -> serde_json::Value {
         ProcedureCallOutput::Null => serde_json::Value::Null,
         ProcedureCallOutput::Scalar(value) => core_value_json(value),
         ProcedureCallOutput::Row(row) => row_json(row),
-        ProcedureCallOutput::Rows(rows) => serde_json::Value::Array(rows.iter().map(row_json).collect()),
+        ProcedureCallOutput::Rows(rows) => {
+            serde_json::Value::Array(rows.iter().map(row_json).collect())
+        }
         ProcedureCallOutput::Object(fields) => serde_json::Value::Object(
             fields
                 .iter()
@@ -193,7 +195,10 @@ fn output_json(output: &ProcedureCallOutput) -> serde_json::Value {
 fn row_json(row: &ProcedureCallRow) -> serde_json::Value {
     let mut obj = serde_json::Map::new();
     if let Some(row_id) = row.row_id {
-        obj.insert("row_id".into(), serde_json::Value::String(row_id.0.to_string()));
+        obj.insert(
+            "row_id".into(),
+            serde_json::Value::String(row_id.0.to_string()),
+        );
     }
     obj.insert(
         "columns".into(),

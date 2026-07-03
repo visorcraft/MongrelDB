@@ -117,6 +117,13 @@ pub enum Op {
     TruncateTable {
         table_id: u64,
     },
+    /// Durable module-owned state for an external table. The payload is opaque
+    /// to the core; recovery writes the last committed payloads back under
+    /// `_vtab/<name>/state.json`.
+    ExternalTableState {
+        name: String,
+        state: Vec<u8>,
+    },
     /// System marker (txn_id == [`SYSTEM_TXN_ID`]): everything up to
     /// `flushed_epoch` for `table_id` is durable in a sorted run, so recovery
     /// may skip replaying older records for that table.

@@ -25,14 +25,22 @@ pub mod arrow_conv;
 mod commands;
 mod error;
 pub mod extended_sql_functions;
+mod external_modules;
 mod fk_join;
 mod native_agg;
+mod percentile;
 mod scan;
 mod shadow;
 mod udf;
 
 pub use error::{MongrelQueryError, Result};
+pub use external_modules::{
+    ExternalBaseWrite, ExternalModuleDescriptor, ExternalModuleIndex, ExternalModuleRegistry,
+    ExternalPlan, ExternalPlanRequest, ExternalScan, ExternalTable, ExternalTableModule,
+    ExternalTxn, ExternalWriteOp, ExternalWriteResult, ModuleConnectCtx,
+};
 
+use arrow::array::{Array, ArrayRef, Int64Array, StringArray};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
@@ -40,7 +48,9 @@ use datafusion::common::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::{AggregateUDF, Expr, ScalarUDF, TableType, WindowUDF};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
-use mongreldb_core::{AlterColumn, ColumnFlags, Cursor, Database, Table};
+use mongreldb_core::{
+    AlterColumn, ColumnFlags, Cursor, Database, Schema as CoreSchema, Table, TypeId,
+};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -50,6 +60,13 @@ use std::sync::Arc;
 pub struct MongrelProvider {
     db: Arc<Mutex<Table>>,
     schema: SchemaRef,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ViewDef {
+    pub sql: String,
+    pub schema: CoreSchema,
+    pub input_types: HashMap<u16, Option<TypeId>>,
 }
 
 impl MongrelProvider {
@@ -1303,11 +1320,16 @@ pub struct MongrelSession {
     /// Phase 17.3: named materialized views — `view name → defining SQL`.
     /// On `run("SELECT * FROM <view>")`, the defining SQL is executed (or the
     /// result-cache is hit). Invalidated automatically on commit (epoch bump).
-    views: parking_lot::Mutex<HashMap<String, String>>,
+    views: parking_lot::Mutex<HashMap<String, ViewDef>>,
     /// SQL `BEGIN`/`COMMIT` staging for DML statements. Reads remain
     /// snapshot-at-scan; this batches SQL writes atomically when a client sends
     /// an explicit transaction block.
     sql_txn: parking_lot::Mutex<Option<Vec<commands::PendingSqlOp>>>,
+    /// Per-session state for SQL compatibility functions such as changes().
+    sql_fn_state: Arc<extended_sql_functions::ExtendedSqlState>,
+    /// Built-in plus app-provided external table modules available to this
+    /// session.
+    external_modules: Arc<ExternalModuleRegistry>,
 }
 
 /// `(sql, snapshot_epoch) → cached result batches`.
@@ -1321,7 +1343,9 @@ impl MongrelSession {
     pub fn new(db: Table) -> Self {
         let db = Arc::new(Mutex::new(db));
         let ctx = SessionContext::new();
-        register_mongrel_functions(&ctx);
+        let sql_fn_state = Arc::new(extended_sql_functions::ExtendedSqlState::default());
+        register_mongrel_functions(&ctx, Arc::clone(&sql_fn_state));
+        let external_modules = Arc::new(ExternalModuleRegistry::default());
         Self {
             ctx,
             db: Some(db),
@@ -1331,7 +1355,20 @@ impl MongrelSession {
             tables: parking_lot::Mutex::new(HashMap::new()),
             views: parking_lot::Mutex::new(HashMap::new()),
             sql_txn: parking_lot::Mutex::new(None),
+            sql_fn_state,
+            external_modules,
         }
+    }
+
+    pub fn new_with_external_modules(
+        db: Table,
+        modules: impl IntoIterator<Item = Arc<dyn ExternalTableModule>>,
+    ) -> Result<Self> {
+        let session = Self::new(db);
+        for module in modules {
+            session.register_external_module(module)?;
+        }
+        Ok(session)
     }
 
     /// Open a session over a multi-table [`Database`] (spec §12). Auto-registers
@@ -1339,8 +1376,20 @@ impl MongrelSession {
     /// `Database::visible_epoch()` so any table's commit invalidates cached
     /// results.
     pub fn open(database: Arc<Database>) -> Result<Self> {
+        Self::open_with_external_modules(database, std::iter::empty())
+    }
+
+    pub fn open_with_external_modules(
+        database: Arc<Database>,
+        modules: impl IntoIterator<Item = Arc<dyn ExternalTableModule>>,
+    ) -> Result<Self> {
         let ctx = SessionContext::new();
-        register_mongrel_functions(&ctx);
+        let sql_fn_state = Arc::new(extended_sql_functions::ExtendedSqlState::default());
+        register_mongrel_functions(&ctx, Arc::clone(&sql_fn_state));
+        let external_modules = Arc::new(ExternalModuleRegistry::default());
+        for module in modules {
+            external_modules.register(module)?;
+        }
 
         let mut tables: HashMap<String, Arc<Mutex<Table>>> = HashMap::new();
         for name in database.table_names() {
@@ -1349,6 +1398,11 @@ impl MongrelSession {
             ctx.register_table(&name, Arc::new(provider))
                 .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
             tables.insert(name, handle);
+        }
+        for entry in database.external_tables() {
+            let provider = external_modules.external_table_provider(&database, &entry)?;
+            ctx.register_table(&entry.name, provider)
+                .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
         }
 
         // Pick a stable "primary" (lexicographically smallest name) for legacy
@@ -1368,7 +1422,15 @@ impl MongrelSession {
             tables: parking_lot::Mutex::new(tables),
             views: parking_lot::Mutex::new(HashMap::new()),
             sql_txn: parking_lot::Mutex::new(None),
+            sql_fn_state,
+            external_modules,
         })
+    }
+
+    pub fn register_external_module(&self, module: Arc<dyn ExternalTableModule>) -> Result<()> {
+        self.external_modules.register(module)?;
+        self.clear_cache();
+        Ok(())
     }
 
     /// The underlying Table handle (Phase 19.3: used by the daemon for direct
@@ -1383,12 +1445,37 @@ impl MongrelSession {
     /// executed (or served from the result cache) transparently. The view is
     /// automatically invalidated on commit (via the epoch-keyed result cache).
     pub fn create_view(&self, name: &str, sql: &str) {
-        self.views.lock().insert(name.to_string(), sql.to_string());
+        self.create_view_with_schema(name, sql, CoreSchema::default(), HashMap::new());
+    }
+
+    pub(crate) fn create_view_with_schema(
+        &self,
+        name: &str,
+        sql: &str,
+        schema: CoreSchema,
+        input_types: HashMap<u16, Option<TypeId>>,
+    ) {
+        self.views.lock().insert(
+            name.to_string(),
+            ViewDef {
+                sql: sql.to_string(),
+                schema,
+                input_types,
+            },
+        );
     }
 
     /// Drop a named materialized view.
     pub fn drop_view(&self, name: &str) {
         self.views.lock().remove(name);
+    }
+
+    pub(crate) fn view_schema(&self, name: &str) -> Option<CoreSchema> {
+        self.views.lock().get(name).map(|view| view.schema.clone())
+    }
+
+    pub(crate) fn view_definition(&self, name: &str) -> Option<ViewDef> {
+        self.views.lock().get(name).cloned()
     }
 
     /// Register the table under `name` so `select * from <name>` resolves.
@@ -1622,7 +1709,10 @@ impl MongrelSession {
     /// §5.3: simple single-table SELECTs are served by [`try_direct_dispatch`]
     /// (no DataFusion planning) before falling back to the full DataFusion path.
     pub async fn run(&self, sql: &str) -> Result<Vec<RecordBatch>> {
-        if let Some(batches) = commands::try_run_command(self, sql)? {
+        if let Some(inner) = strip_explain_query_plan(sql) {
+            return self.explain_query_plan(inner).await;
+        }
+        if let Some(batches) = commands::try_run_command(self, sql).await? {
             return Ok(batches);
         }
         // P4.2: intercept DDL when a Database is attached.
@@ -1723,6 +1813,8 @@ impl MongrelSession {
         // Phase 17.3: intercept `SELECT ... FROM <view_name>` and rewrite to
         // the view's defining SQL.
         let resolved = self.resolve_view_sql(sql);
+        let resolved = self.rewrite_external_module_compat_sql(&resolved);
+        let resolved = rewrite_compat_function_calls(&resolved);
         // Canonicalize whitespace outside literals/comments so queries that
         // differ only in spacing share a cache key (and parse identically — SQL
         // is whitespace-insensitive between tokens).
@@ -1751,6 +1843,7 @@ impl MongrelSession {
         }
         // Phase 16.5: check the logical-plan cache before re-parsing.
         let plan_start = std::time::Instant::now();
+        let external_module_scan = self.query_references_external_module(sql);
         let df = {
             let cached_plan = self.plan_cache.lock().get(sql).cloned();
             if let Some(plan) = cached_plan {
@@ -1798,6 +1891,11 @@ impl MongrelSession {
                 }
             }
         };
+        if external_module_scan {
+            mongreldb_core::trace::QueryTrace::record(|t| {
+                t.scan_mode = mongreldb_core::trace::ScanMode::ExternalModule;
+            });
+        }
         if result_cacheable {
             self.cache.lock().insert(key, Arc::new(batches.clone()));
         }
@@ -1832,6 +1930,171 @@ impl MongrelSession {
         self.plan_cache.lock().clear();
     }
 
+    async fn explain_query_plan(&self, sql: &str) -> Result<Vec<RecordBatch>> {
+        let explain_sql = format!("EXPLAIN {}", sql.trim().trim_end_matches(';'));
+        let batches = self
+            .ctx
+            .sql(&explain_sql)
+            .await
+            .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?
+            .collect()
+            .await
+            .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
+        let mut detail = self.mongrel_query_plan_details(sql);
+        for batch in &batches {
+            if batch.num_columns() < 2 {
+                continue;
+            }
+            let Some(plan_type) = batch.column(0).as_any().downcast_ref::<StringArray>() else {
+                continue;
+            };
+            let Some(plan) = batch.column(1).as_any().downcast_ref::<StringArray>() else {
+                continue;
+            };
+            for row in 0..batch.num_rows() {
+                let prefix = plan_type.value(row);
+                for line in plan.value(row).lines() {
+                    let line = line.trim();
+                    if !line.is_empty() {
+                        detail.push(format!("DATAFUSION {prefix}: {line}"));
+                    }
+                }
+            }
+        }
+        if detail.is_empty() {
+            detail.push("plan unavailable".to_string());
+        }
+        let ids = (0..detail.len()).map(|i| i as i64).collect::<Vec<_>>();
+        let parents = vec![0_i64; detail.len()];
+        let notused = vec![0_i64; detail.len()];
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+            arrow::datatypes::Field::new("parent", arrow::datatypes::DataType::Int64, false),
+            arrow::datatypes::Field::new("notused", arrow::datatypes::DataType::Int64, false),
+            arrow::datatypes::Field::new("detail", arrow::datatypes::DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(ids)) as ArrayRef,
+                Arc::new(Int64Array::from(parents)),
+                Arc::new(Int64Array::from(notused)),
+                Arc::new(StringArray::from(detail)),
+            ],
+        )
+        .map_err(|e| MongrelQueryError::Arrow(e.to_string()))?;
+        Ok(vec![batch])
+    }
+
+    fn mongrel_query_plan_details(&self, sql: &str) -> Vec<String> {
+        use sqlparser::ast::{GroupByExpr, OrderByKind, SetExpr, Statement};
+        use sqlparser::dialect::PostgreSqlDialect;
+        use sqlparser::parser::Parser;
+
+        let Ok(stmts) = Parser::parse_sql(&PostgreSqlDialect {}, sql) else {
+            return Vec::new();
+        };
+        let Some(Statement::Query(query)) = stmts.first() else {
+            return Vec::new();
+        };
+
+        fn collect(session: &MongrelSession, query: &sqlparser::ast::Query, out: &mut Vec<String>) {
+            use sqlparser::ast::{SetOperator, TableWithJoins};
+            match query.body.as_ref() {
+                SetExpr::Select(select) => {
+                    for TableWithJoins { relation, joins } in &select.from {
+                        session.push_table_plan(relation, select.selection.as_ref(), out);
+                        for join in joins {
+                            session.push_table_plan(&join.relation, None, out);
+                        }
+                    }
+                    if select.distinct.is_some() {
+                        out.push("USE TEMP B-TREE FOR DISTINCT".to_string());
+                    }
+                    let grouped = match &select.group_by {
+                        GroupByExpr::All(_) => true,
+                        GroupByExpr::Expressions(exprs, _) => !exprs.is_empty(),
+                    };
+                    if grouped {
+                        out.push("USE TEMP B-TREE FOR GROUP BY".to_string());
+                    }
+                    let ordered = query.order_by.as_ref().is_some_and(|order_by| {
+                        matches!(order_by.kind, OrderByKind::All(_))
+                            || matches!(&order_by.kind, OrderByKind::Expressions(exprs) if !exprs.is_empty())
+                    });
+                    if ordered {
+                        out.push("USE TEMP B-TREE FOR ORDER BY".to_string());
+                    }
+                }
+                SetExpr::Query(query) => collect(session, query, out),
+                SetExpr::SetOperation {
+                    left, op, right, ..
+                } => {
+                    let label = match op {
+                        SetOperator::Union => "COMPOUND QUERY UNION",
+                        SetOperator::Except => "COMPOUND QUERY EXCEPT",
+                        SetOperator::Intersect => "COMPOUND QUERY INTERSECT",
+                        _ => "COMPOUND QUERY",
+                    };
+                    out.push(label.to_string());
+                    collect_set_expr(session, left, out);
+                    collect_set_expr(session, right, out);
+                }
+                _ => {}
+            }
+        }
+
+        fn collect_set_expr(session: &MongrelSession, expr: &SetExpr, out: &mut Vec<String>) {
+            match expr {
+                SetExpr::Select(select) => {
+                    for table in &select.from {
+                        session.push_table_plan(&table.relation, select.selection.as_ref(), out);
+                    }
+                }
+                SetExpr::Query(query) => collect(session, query, out),
+                SetExpr::SetOperation { left, right, .. } => {
+                    collect_set_expr(session, left, out);
+                    collect_set_expr(session, right, out);
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        collect(self, query, &mut out);
+        out
+    }
+
+    fn push_table_plan(
+        &self,
+        relation: &sqlparser::ast::TableFactor,
+        selection: Option<&sqlparser::ast::Expr>,
+        out: &mut Vec<String>,
+    ) {
+        let sqlparser::ast::TableFactor::Table { name, alias, .. } = relation else {
+            out.push("SCAN SUBQUERY".to_string());
+            return;
+        };
+        let table_name = name.to_string();
+        let display_name = alias
+            .as_ref()
+            .map(|alias| alias.name.value.clone())
+            .unwrap_or_else(|| table_name.clone());
+        let Some(handle) = self.tables.lock().get(&table_name).cloned() else {
+            out.push(format!("SCAN {display_name}"));
+            return;
+        };
+        let schema = handle.lock().schema().clone();
+        let searchable = selection
+            .and_then(|expr| translate_sqlparser_filter(expr, &schema))
+            .is_some_and(|conditions| !conditions.is_empty());
+        if searchable {
+            out.push(format!("SEARCH {display_name} USING MONGREL INDEX"));
+        } else {
+            out.push(format!("SCAN {display_name}"));
+        }
+    }
+
     /// A cache key epoch combining the primary table's epoch with every
     /// secondary table's, so any registered table's commit invalidates cached
     /// results (correctness for multi-table joins).
@@ -1842,10 +2105,85 @@ impl MongrelSession {
             return sql.to_string();
         }
         let mut result = sql.to_string();
-        for (name, view_sql) in views.iter() {
-            result = replace_from_view(&result, name, view_sql);
+        for (name, view) in views.iter() {
+            result = replace_from_view(&result, name, &view.sql);
         }
         result
+    }
+
+    fn rewrite_external_module_compat_sql(&self, sql: &str) -> String {
+        let Some(db) = &self.database else {
+            return sql.to_string();
+        };
+        rewrite_fts_match_compat_sql(sql, db)
+    }
+
+    fn query_references_external_module(&self, sql: &str) -> bool {
+        use sqlparser::ast::Statement;
+        use sqlparser::dialect::PostgreSqlDialect;
+        use sqlparser::parser::Parser;
+
+        Parser::parse_sql(&PostgreSqlDialect {}, sql)
+            .ok()
+            .is_some_and(|statements| {
+                statements.iter().any(|statement| match statement {
+                    Statement::Query(query) => self.query_uses_external_module(query),
+                    _ => false,
+                })
+            })
+    }
+
+    fn query_uses_external_module(&self, query: &sqlparser::ast::Query) -> bool {
+        self.set_expr_uses_external_module(query.body.as_ref())
+    }
+
+    fn set_expr_uses_external_module(&self, expr: &sqlparser::ast::SetExpr) -> bool {
+        use sqlparser::ast::SetExpr;
+
+        match expr {
+            SetExpr::Select(select) => select
+                .from
+                .iter()
+                .any(|table| self.table_with_joins_uses_external_module(table)),
+            SetExpr::Query(query) => self.query_uses_external_module(query),
+            SetExpr::SetOperation { left, right, .. } => {
+                self.set_expr_uses_external_module(left)
+                    || self.set_expr_uses_external_module(right)
+            }
+            _ => false,
+        }
+    }
+
+    fn table_with_joins_uses_external_module(
+        &self,
+        table: &sqlparser::ast::TableWithJoins,
+    ) -> bool {
+        self.table_factor_uses_external_module(&table.relation)
+            || table
+                .joins
+                .iter()
+                .any(|join| self.table_factor_uses_external_module(&join.relation))
+    }
+
+    fn table_factor_uses_external_module(&self, relation: &sqlparser::ast::TableFactor) -> bool {
+        use sqlparser::ast::{Expr, TableFactor};
+
+        match relation {
+            TableFactor::Table { name, args, .. } => {
+                let table_name = name.to_string();
+                self.database
+                    .as_ref()
+                    .is_some_and(|db| db.external_table(&table_name).is_some())
+                    || (args.is_some() && self.external_modules.contains(&table_name))
+            }
+            TableFactor::Function { name, .. } => self.external_modules.contains(&name.to_string()),
+            TableFactor::TableFunction {
+                expr: Expr::Function(func),
+                ..
+            } => self.external_modules.contains(&func.name.to_string()),
+            TableFactor::Derived { subquery, .. } => self.query_uses_external_module(subquery),
+            _ => false,
+        }
     }
 
     /// Cache epoch: uses `Database::visible_epoch()` when a Database is
@@ -1926,10 +2264,687 @@ impl MongrelSession {
     }
 }
 
-fn register_mongrel_functions(ctx: &SessionContext) {
+fn register_mongrel_functions(
+    ctx: &SessionContext,
+    sql_fn_state: Arc<extended_sql_functions::ExtendedSqlState>,
+) {
     ctx.register_udf(ScalarUDF::from(udf::AnnSearchUdf::new()));
     ctx.register_udf(ScalarUDF::from(udf::SparseMatchUdf::new()));
-    extended_sql_functions::register_extended_sql_functions(ctx);
+    ctx.register_udf(ScalarUDF::from(udf::RTreeIntersectsUdf::new()));
+    for udaf in percentile::percentile_udafs() {
+        ctx.register_udaf(udaf);
+    }
+    extended_sql_functions::register_extended_sql_functions_with_state(ctx, sql_fn_state);
+}
+
+fn strip_explain_query_plan(sql: &str) -> Option<&str> {
+    let trimmed = sql.trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+    if !lower.starts_with("explain") {
+        return None;
+    }
+    let after_explain = trimmed.get(7..)?.trim_start();
+    let after_explain_lower = after_explain.to_ascii_lowercase();
+    if !after_explain_lower.starts_with("query") {
+        return None;
+    }
+    let after_query = after_explain.get(5..)?.trim_start();
+    let after_query_lower = after_query.to_ascii_lowercase();
+    if !after_query_lower.starts_with("plan") {
+        return None;
+    }
+    Some(after_query.get(4..)?.trim_start())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqlCompatTokenKind {
+    Ident,
+    String,
+    Dot,
+    LParen,
+    RParen,
+    Comma,
+}
+
+#[derive(Debug, Clone)]
+struct SqlCompatToken {
+    kind: SqlCompatTokenKind,
+    raw: String,
+    normalized: String,
+    start: usize,
+    end: usize,
+}
+
+#[derive(Debug, Clone)]
+struct FtsMatchBinding {
+    query_ref: String,
+}
+
+#[derive(Debug, Clone)]
+struct SqlReplacement {
+    start: usize,
+    end: usize,
+    replacement: String,
+}
+
+fn rewrite_fts_match_compat_sql(sql: &str, db: &Database) -> String {
+    let tokens = sql_compat_tokens(sql);
+    if tokens.is_empty() {
+        return sql.to_string();
+    }
+    let bindings = fts_match_bindings(sql, db, &tokens);
+    if bindings.is_empty() {
+        return sql.to_string();
+    }
+    let unique_refs = bindings
+        .values()
+        .map(|binding| binding.query_ref.as_str())
+        .collect::<HashSet<_>>();
+    let unique_binding = if unique_refs.len() == 1 {
+        bindings.values().next().cloned()
+    } else {
+        None
+    };
+    let mut replacements = Vec::new();
+    for (idx, token) in tokens.iter().enumerate() {
+        if token.kind != SqlCompatTokenKind::Ident || token.normalized != "match" {
+            continue;
+        }
+        let Some(rhs) = tokens.get(idx + 1) else {
+            continue;
+        };
+        if rhs.kind != SqlCompatTokenKind::String {
+            continue;
+        }
+        let Some((lhs_start, _lhs_end, query_ref)) =
+            fts_match_lhs_query_ref(&tokens, idx, &bindings, unique_binding.as_ref())
+        else {
+            continue;
+        };
+        replacements.push(SqlReplacement {
+            start: lhs_start,
+            end: rhs.end,
+            replacement: format!("{query_ref}.query = {}", rhs.raw),
+        });
+    }
+    apply_sql_replacements(sql, &replacements)
+}
+
+fn fts_match_lhs_query_ref(
+    tokens: &[SqlCompatToken],
+    match_idx: usize,
+    bindings: &HashMap<String, FtsMatchBinding>,
+    unique_binding: Option<&FtsMatchBinding>,
+) -> Option<(usize, usize, String)> {
+    if match_idx == 0 {
+        return None;
+    }
+    let lhs = tokens.get(match_idx - 1)?;
+    if lhs.kind != SqlCompatTokenKind::Ident {
+        return None;
+    }
+
+    if match_idx >= 3
+        && tokens.get(match_idx - 2)?.kind == SqlCompatTokenKind::Dot
+        && tokens.get(match_idx - 3)?.kind == SqlCompatTokenKind::Ident
+    {
+        let owner = tokens.get(match_idx - 3)?;
+        let binding = bindings.get(&owner.normalized)?;
+        if lhs.normalized == "query" || lhs.normalized == "text" {
+            return Some((owner.start, lhs.end, binding.query_ref.clone()));
+        }
+        return None;
+    }
+
+    if let Some(binding) = bindings.get(&lhs.normalized) {
+        return Some((lhs.start, lhs.end, binding.query_ref.clone()));
+    }
+    if lhs.normalized == "text" {
+        let binding = unique_binding?;
+        return Some((lhs.start, lhs.end, binding.query_ref.clone()));
+    }
+    None
+}
+
+fn fts_match_bindings(
+    sql: &str,
+    db: &Database,
+    tokens: &[SqlCompatToken],
+) -> HashMap<String, FtsMatchBinding> {
+    let mut out = HashMap::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let token = &tokens[i];
+        let starts_table_ref = token.kind == SqlCompatTokenKind::Ident
+            && matches!(token.normalized.as_str(), "from" | "join");
+        if !starts_table_ref {
+            i += 1;
+            continue;
+        }
+        let mut table_idx = i + 1;
+        if tokens
+            .get(table_idx)
+            .is_some_and(|token| token.kind == SqlCompatTokenKind::LParen)
+        {
+            i += 1;
+            continue;
+        }
+        let Some(table) = tokens.get(table_idx) else {
+            break;
+        };
+        if table.kind != SqlCompatTokenKind::Ident {
+            i += 1;
+            continue;
+        }
+        let mut table_name = table.normalized.clone();
+        let mut table_ref = table.raw.clone();
+        if tokens
+            .get(table_idx + 1)
+            .is_some_and(|token| token.kind == SqlCompatTokenKind::Dot)
+            && tokens
+                .get(table_idx + 2)
+                .is_some_and(|token| token.kind == SqlCompatTokenKind::Ident)
+        {
+            let qualified = tokens.get(table_idx + 2).unwrap();
+            table_name = qualified.normalized.clone();
+            table_ref = sql[table.start..qualified.end].to_string();
+            table_idx += 2;
+        }
+        if !is_fts_docs_table(db, &table_name) {
+            i = table_idx + 1;
+            continue;
+        }
+        let mut query_ref = table_ref.clone();
+        let mut alias_key = None;
+        let mut next = table_idx + 1;
+        if tokens.get(next).is_some_and(|token| {
+            token.kind == SqlCompatTokenKind::Ident && token.normalized == "as"
+        }) {
+            next += 1;
+        }
+        if let Some(alias) = tokens.get(next) {
+            if alias.kind == SqlCompatTokenKind::Ident && !is_table_ref_boundary(&alias.normalized)
+            {
+                alias_key = Some(alias.normalized.clone());
+                query_ref = alias.raw.clone();
+                next += 1;
+            }
+        }
+        out.insert(
+            table_name,
+            FtsMatchBinding {
+                query_ref: query_ref.clone(),
+            },
+        );
+        if let Some(alias_key) = alias_key {
+            out.insert(alias_key, FtsMatchBinding { query_ref });
+        }
+        i = next;
+    }
+    out
+}
+
+fn is_fts_docs_table(db: &Database, name: &str) -> bool {
+    db.external_table(name)
+        .is_some_and(|entry| entry.module == "fts_docs")
+}
+
+fn is_table_ref_boundary(normalized: &str) -> bool {
+    matches!(
+        normalized,
+        "where"
+            | "join"
+            | "left"
+            | "right"
+            | "inner"
+            | "outer"
+            | "full"
+            | "cross"
+            | "on"
+            | "using"
+            | "group"
+            | "order"
+            | "having"
+            | "limit"
+            | "offset"
+            | "union"
+            | "except"
+            | "intersect"
+    )
+}
+
+fn sql_compat_tokens(sql: &str) -> Vec<SqlCompatToken> {
+    let bytes = sql.as_bytes();
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b if b.is_ascii_whitespace() => i += 1,
+            b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                i = skip_block_comment(bytes, i);
+            }
+            b'\'' => {
+                let end = skip_quoted(bytes, i, b'\'');
+                tokens.push(sql_token(sql, SqlCompatTokenKind::String, i, end));
+                i = end;
+            }
+            b'E' | b'e' if i + 1 < bytes.len() && bytes[i + 1] == b'\'' => {
+                let end = skip_quoted(bytes, i + 1, b'\'');
+                tokens.push(sql_token(sql, SqlCompatTokenKind::String, i, end));
+                i = end;
+            }
+            b'$' => {
+                let (end, matched) = skip_dollar_quoted(bytes, i);
+                if matched {
+                    tokens.push(sql_token(sql, SqlCompatTokenKind::String, i, end));
+                    i = end;
+                } else {
+                    i += 1;
+                }
+            }
+            b'"' => {
+                let end = skip_quoted(bytes, i, b'"');
+                let raw = sql[i..end].to_string();
+                let normalized = unquote_sql_ident(&raw).to_ascii_lowercase();
+                tokens.push(SqlCompatToken {
+                    kind: SqlCompatTokenKind::Ident,
+                    raw,
+                    normalized,
+                    start: i,
+                    end,
+                });
+                i = end;
+            }
+            b'.' => {
+                tokens.push(sql_token(sql, SqlCompatTokenKind::Dot, i, i + 1));
+                i += 1;
+            }
+            b'(' => {
+                tokens.push(sql_token(sql, SqlCompatTokenKind::LParen, i, i + 1));
+                i += 1;
+            }
+            b')' => {
+                tokens.push(sql_token(sql, SqlCompatTokenKind::RParen, i, i + 1));
+                i += 1;
+            }
+            b',' => {
+                tokens.push(sql_token(sql, SqlCompatTokenKind::Comma, i, i + 1));
+                i += 1;
+            }
+            b if is_sql_ident_byte(b) => {
+                let start = i;
+                i += 1;
+                while i < bytes.len() && is_sql_ident_byte(bytes[i]) {
+                    i += 1;
+                }
+                tokens.push(sql_token(sql, SqlCompatTokenKind::Ident, start, i));
+            }
+            _ => i += 1,
+        }
+    }
+    tokens
+}
+
+fn sql_token(sql: &str, kind: SqlCompatTokenKind, start: usize, end: usize) -> SqlCompatToken {
+    let raw = sql[start..end].to_string();
+    SqlCompatToken {
+        kind,
+        normalized: raw.to_ascii_lowercase(),
+        raw,
+        start,
+        end,
+    }
+}
+
+fn unquote_sql_ident(raw: &str) -> String {
+    if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
+        raw[1..raw.len() - 1].replace("\"\"", "\"")
+    } else {
+        raw.to_string()
+    }
+}
+
+fn apply_sql_replacements(sql: &str, replacements: &[SqlReplacement]) -> String {
+    if replacements.is_empty() {
+        return sql.to_string();
+    }
+    let mut ordered = replacements.to_vec();
+    ordered.sort_by_key(|replacement| replacement.start);
+    let mut out = String::with_capacity(sql.len());
+    let mut cursor = 0;
+    for replacement in ordered {
+        if replacement.start < cursor || replacement.end > sql.len() {
+            continue;
+        }
+        out.push_str(&sql[cursor..replacement.start]);
+        out.push_str(&replacement.replacement);
+        cursor = replacement.end;
+    }
+    out.push_str(&sql[cursor..]);
+    out
+}
+
+fn rewrite_compat_function_calls(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => i = copy_quoted_to_string(&mut out, bytes, i, b'\''),
+            b'"' => i = copy_quoted_to_string(&mut out, bytes, i, b'"'),
+            b'E' | b'e' if i + 1 < bytes.len() && bytes[i + 1] == b'\'' => {
+                out.push(bytes[i] as char);
+                i += 1;
+                i = copy_quoted_to_string(&mut out, bytes, i, b'\'');
+            }
+            b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
+                out.push('-');
+                out.push('-');
+                i += 2;
+                while i < bytes.len() {
+                    let ch = bytes[i] as char;
+                    out.push(ch);
+                    i += 1;
+                    if ch == '\n' {
+                        break;
+                    }
+                }
+            }
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                let start = i;
+                i = skip_block_comment(bytes, i);
+                out.push_str(&sql[start..i.min(bytes.len())]);
+            }
+            b'$' => {
+                let start_len = out.len();
+                let (next, matched) = copy_dollar_quoted_to_string(&mut out, bytes, i);
+                if matched {
+                    i = next;
+                } else {
+                    out.truncate(start_len);
+                    out.push('$');
+                    i += 1;
+                }
+            }
+            b'g' | b'G' | b'm' | b'M' | b't' | b'T' => {
+                if let Some((replacement, next)) = compat_function_rewrite_at(sql, i) {
+                    out.push_str(&replacement);
+                    i = next;
+                } else {
+                    out.push(bytes[i] as char);
+                    i += 1;
+                }
+            }
+            _ => {
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+fn compat_function_rewrite_at(sql: &str, start: usize) -> Option<(String, usize)> {
+    let bytes = sql.as_bytes();
+    let (name, kind) = if ident_eq_at(bytes, start, b"max") {
+        ("max", CompatRewriteKind::ScalarMax)
+    } else if ident_eq_at(bytes, start, b"min") {
+        ("min", CompatRewriteKind::ScalarMin)
+    } else if ident_eq_at(bytes, start, b"group_concat") {
+        ("group_concat", CompatRewriteKind::GroupConcat)
+    } else if ident_eq_at(bytes, start, b"total") {
+        ("total", CompatRewriteKind::Total)
+    } else {
+        return None;
+    };
+    let before_ok = start == 0 || !is_sql_ident_byte(bytes[start - 1]);
+    let after_name = start + name.len();
+    let after_ok = bytes
+        .get(after_name)
+        .is_some_and(|b| !is_sql_ident_byte(*b));
+    if !before_ok || !after_ok {
+        return None;
+    }
+    let mut open = after_name;
+    while open < bytes.len() && bytes[open].is_ascii_whitespace() {
+        open += 1;
+    }
+    if bytes.get(open) != Some(&b'(') {
+        return None;
+    }
+    let summary = call_arg_summary(sql, open)?;
+    match kind {
+        CompatRewriteKind::ScalarMax if summary.top_level_commas > 0 => {
+            Some(("__mongreldb_scalar_max(".to_string(), open + 1))
+        }
+        CompatRewriteKind::ScalarMin if summary.top_level_commas > 0 => {
+            Some(("__mongreldb_scalar_min(".to_string(), open + 1))
+        }
+        CompatRewriteKind::GroupConcat => {
+            let args = &sql[open + 1..summary.close];
+            let rewritten = if summary.top_level_commas == 0 {
+                format!("string_agg({args}, ',')")
+            } else {
+                format!("string_agg({args})")
+            };
+            Some((rewritten, summary.close + 1))
+        }
+        CompatRewriteKind::Total if summary.top_level_commas == 0 => {
+            let args = &sql[open + 1..summary.close];
+            let suffix_end = aggregate_suffix_end(sql, summary.close + 1);
+            let suffix = &sql[summary.close + 1..suffix_end];
+            Some((
+                format!("coalesce(cast(sum({args}){suffix} as double), 0.0)"),
+                suffix_end,
+            ))
+        }
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CompatRewriteKind {
+    ScalarMax,
+    ScalarMin,
+    GroupConcat,
+    Total,
+}
+
+fn ident_eq_at(bytes: &[u8], start: usize, ident: &[u8]) -> bool {
+    bytes
+        .get(start..start + ident.len())
+        .is_some_and(|slice| slice.eq_ignore_ascii_case(ident))
+}
+
+fn is_sql_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+}
+
+fn keyword_at(bytes: &[u8], start: usize, keyword: &[u8]) -> bool {
+    if !ident_eq_at(bytes, start, keyword) {
+        return false;
+    }
+    let before_ok = start == 0 || !is_sql_ident_byte(bytes[start - 1]);
+    let after = start + keyword.len();
+    let after_ok = after >= bytes.len() || !is_sql_ident_byte(bytes[after]);
+    before_ok && after_ok
+}
+
+fn skip_sql_whitespace(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+fn aggregate_suffix_end(sql: &str, start: usize) -> usize {
+    let bytes = sql.as_bytes();
+    let mut suffix_end = start;
+    let mut i = skip_sql_whitespace(bytes, start);
+
+    if keyword_at(bytes, i, b"filter") {
+        let open = skip_sql_whitespace(bytes, i + b"filter".len());
+        if bytes.get(open) != Some(&b'(') {
+            return start;
+        }
+        let Some(summary) = call_arg_summary(sql, open) else {
+            return start;
+        };
+        suffix_end = summary.close + 1;
+        i = skip_sql_whitespace(bytes, suffix_end);
+    }
+
+    if keyword_at(bytes, i, b"over") {
+        let after_over = skip_sql_whitespace(bytes, i + b"over".len());
+        if bytes.get(after_over) == Some(&b'(') {
+            let Some(summary) = call_arg_summary(sql, after_over) else {
+                return suffix_end;
+            };
+            suffix_end = summary.close + 1;
+        } else {
+            let mut end = after_over;
+            while end < bytes.len() && is_sql_ident_byte(bytes[end]) {
+                end += 1;
+            }
+            if end > after_over {
+                suffix_end = end;
+            }
+        }
+    }
+
+    suffix_end
+}
+
+struct CallArgSummary {
+    close: usize,
+    top_level_commas: usize,
+}
+
+fn call_arg_summary(sql: &str, open: usize) -> Option<CallArgSummary> {
+    let bytes = sql.as_bytes();
+    let mut depth = 1;
+    let mut i = open + 1;
+    let mut top_level_commas = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => i = skip_quoted(bytes, i, b'\''),
+            b'"' => i = skip_quoted(bytes, i, b'"'),
+            b'E' | b'e' if i + 1 < bytes.len() && bytes[i + 1] == b'\'' => {
+                i = skip_quoted(bytes, i + 1, b'\'')
+            }
+            b'$' => {
+                let (next, matched) = skip_dollar_quoted(bytes, i);
+                i = if matched { next } else { i + 1 };
+            }
+            b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                i = skip_block_comment(bytes, i);
+            }
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(CallArgSummary {
+                        close: i,
+                        top_level_commas,
+                    });
+                }
+                i += 1;
+            }
+            b',' if depth == 1 => {
+                top_level_commas += 1;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+fn copy_quoted_to_string(out: &mut String, bytes: &[u8], start: usize, delim: u8) -> usize {
+    let end = skip_quoted(bytes, start, delim);
+    out.push_str(std::str::from_utf8(&bytes[start..end]).unwrap_or_default());
+    end
+}
+
+fn skip_quoted(bytes: &[u8], start: usize, delim: u8) -> usize {
+    let mut i = start;
+    if i < bytes.len() {
+        i += 1;
+    }
+    while i < bytes.len() {
+        if bytes[i] == delim {
+            i += 1;
+            if i < bytes.len() && bytes[i] == delim {
+                i += 1;
+                continue;
+            }
+            break;
+        }
+        i += 1;
+    }
+    i
+}
+
+fn copy_dollar_quoted_to_string(out: &mut String, bytes: &[u8], start: usize) -> (usize, bool) {
+    let (end, matched) = skip_dollar_quoted(bytes, start);
+    if matched {
+        out.push_str(std::str::from_utf8(&bytes[start..end]).unwrap_or_default());
+    }
+    (end, matched)
+}
+
+fn skip_dollar_quoted(bytes: &[u8], start: usize) -> (usize, bool) {
+    if bytes.get(start) != Some(&b'$') {
+        return (start, false);
+    }
+    let mut j = start + 1;
+    while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+        j += 1;
+    }
+    if bytes.get(j) != Some(&b'$') {
+        return (start, false);
+    }
+    let tag = &bytes[start..=j];
+    let mut i = j + 1;
+    while i + tag.len() <= bytes.len() {
+        if &bytes[i..i + tag.len()] == tag {
+            return (i + tag.len(), true);
+        }
+        i += 1;
+    }
+    (start, false)
+}
+
+fn skip_block_comment(bytes: &[u8], start: usize) -> usize {
+    let mut i = start + 2;
+    let mut depth = 1;
+    while i + 1 < bytes.len() && depth > 0 {
+        if bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            depth += 1;
+            i += 2;
+        } else if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+            depth -= 1;
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    i
 }
 
 /// Stable 64-bit cache key for a SQL string (Phase 8.3 incremental cache).
@@ -2570,5 +3585,41 @@ mod tests {
 
         let out = replace_from_view("SELECT * xfrom log", "log", "SELECT 1");
         assert_eq!(out, "SELECT * xfrom log");
+    }
+
+    #[test]
+    fn compat_function_rewrite_handles_sqlite_compatibility_calls() {
+        assert_eq!(
+            rewrite_compat_function_calls("select max(id), min(id) from t"),
+            "select max(id), min(id) from t"
+        );
+        assert_eq!(
+            rewrite_compat_function_calls("select max(1, min(2, 3), 'max(4,5)')"),
+            "select __mongreldb_scalar_max(1, __mongreldb_scalar_min(2, 3), 'max(4,5)')"
+        );
+        assert_eq!(
+            rewrite_compat_function_calls("select /* max(1,2) */ min(1, (2 + 3))"),
+            "select /* max(1,2) */ __mongreldb_scalar_min(1, (2 + 3))"
+        );
+        assert_eq!(
+            rewrite_compat_function_calls("select max_value, min_value from t"),
+            "select max_value, min_value from t"
+        );
+        assert_eq!(
+            rewrite_compat_function_calls(
+                "select group_concat(label), group_concat(label, '|') from t"
+            ),
+            "select string_agg(label, ','), string_agg(label, '|') from t"
+        );
+        assert_eq!(
+            rewrite_compat_function_calls("select total(val), total(val) filter (where grp = 2) from t"),
+            "select coalesce(cast(sum(val) as double), 0.0), coalesce(cast(sum(val) filter (where grp = 2) as double), 0.0) from t"
+        );
+        assert_eq!(
+            rewrite_compat_function_calls(
+                "select total(val) over (partition by grp order by id) from t"
+            ),
+            "select coalesce(cast(sum(val) over (partition by grp order by id) as double), 0.0) from t"
+        );
     }
 }

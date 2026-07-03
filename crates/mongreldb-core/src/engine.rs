@@ -1204,7 +1204,10 @@ impl Table {
                     staged_puts.remove(&txn_id);
                     staged_deletes.remove(&txn_id);
                 }
-                Op::TruncateTable { .. } | Op::Flush { .. } | Op::Ddl(_) => {}
+                Op::TruncateTable { .. }
+                | Op::ExternalTableState { .. }
+                | Op::Flush { .. }
+                | Op::Ddl(_) => {}
             }
         }
 

@@ -1,4 +1,7 @@
-use crate::{MongrelProvider, MongrelQueryError, MongrelSession, Result};
+use crate::{
+    ExternalBaseWrite, ExternalModuleIndex, ExternalModuleRegistry, ExternalWriteOp,
+    MongrelProvider, MongrelQueryError, MongrelSession, Result,
+};
 use arrow::array::{ArrayRef, BooleanArray, Int64Array, StringArray};
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 use arrow::record_batch::RecordBatch;
@@ -10,16 +13,26 @@ use mongreldb_core::schema::{
     Schema as CoreSchema, TypeId,
 };
 use mongreldb_core::Database;
+use mongreldb_core::{
+    ExternalTableDefinition, ExternalTableEntry, ExternalTriggerBaseWrite, ExternalTriggerBridge,
+    ExternalTriggerWrite, ExternalTriggerWriteResult, ModuleArg, StoredTrigger, TriggerCell,
+    TriggerDefinition, TriggerEvent, TriggerExpr, TriggerProgram, TriggerRaiseAction, TriggerStep,
+    TriggerTarget, TriggerTiming, TriggerValue,
+};
 use sqlparser::ast::{
     AlterColumnOperation, AlterTable, AlterTableOperation, Assignment, AssignmentTarget,
-    BinaryOperator, ColumnDef, ColumnOption, CreateIndex, CreateTable, CreateView, DataType,
-    Delete, Expr, FromTable, Ident, IndexColumn, Insert, ObjectName, ObjectType, OnConflictAction,
-    OnInsert, Query, RenameTableNameKind, SetExpr, Statement, TableConstraint, TableFactor,
-    TableObject, TableWithJoins, Truncate, UnaryOperator, Value as SqlValue,
+    BinaryOperator, ColumnDef, ColumnOption, ConditionalStatements, CreateIndex, CreateTable,
+    CreateTrigger, CreateView, DataType, Delete, DropTrigger, Expr, FromTable, FunctionArg,
+    FunctionArgExpr, FunctionArguments, Ident, IndexColumn, Insert, ObjectName, ObjectType,
+    OnConflictAction, OnInsert, Query, RenameTableNameKind, SetExpr, Statement, TableConstraint,
+    TableFactor, TableObject, TableWithJoins, TriggerEvent as SqlTriggerEvent, TriggerObject,
+    TriggerObjectKind, TriggerPeriod, Truncate, UnaryOperator, Value as SqlValue,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::Path;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -32,9 +45,14 @@ pub(crate) enum PendingSqlOp {
         table: String,
         row_id: RowId,
     },
+    ExternalState {
+        table: String,
+        state: Vec<u8>,
+        changes: u64,
+    },
 }
 
-pub(crate) fn try_run_command(
+pub(crate) async fn try_run_command(
     session: &MongrelSession,
     sql: &str,
 ) -> Result<Option<Vec<RecordBatch>>> {
@@ -69,6 +87,32 @@ pub(crate) fn try_run_command(
             create_table(session, db, create)?;
             Vec::new()
         }
+        Statement::CreateVirtualTable {
+            name,
+            if_not_exists,
+            module_name,
+            module_args,
+        } => {
+            create_virtual_table(
+                session,
+                db,
+                name,
+                if_not_exists,
+                module_name.value,
+                module_args.into_iter().map(|arg| arg.value).collect(),
+            )?;
+            Vec::new()
+        }
+        Statement::CreateTrigger(trigger) => {
+            create_trigger(session, db, trigger)?;
+            session.clear_cache();
+            Vec::new()
+        }
+        Statement::DropTrigger(drop) => {
+            drop_trigger(db, drop)?;
+            session.clear_cache();
+            Vec::new()
+        }
         Statement::Drop {
             object_type,
             if_exists,
@@ -84,7 +128,7 @@ pub(crate) fn try_run_command(
             }
             ObjectType::View | ObjectType::MaterializedView => {
                 for name in names {
-                    session.drop_view(&object_name(&name)?);
+                    drop_view(session, db, &object_name(&name)?, if_exists)?;
                 }
                 Vec::new()
             }
@@ -111,11 +155,11 @@ pub(crate) fn try_run_command(
             Vec::new()
         }
         Statement::Update(update) => {
-            update_rows(session, db, update)?;
+            update_rows(session, db, update).await?;
             Vec::new()
         }
         Statement::Delete(delete) => {
-            delete_rows(session, db, delete)?;
+            delete_rows(session, db, delete).await?;
             Vec::new()
         }
         Statement::Truncate(truncate) => {
@@ -134,7 +178,11 @@ pub(crate) fn try_run_command(
         }
         Statement::Commit { .. } => {
             let ops = session.sql_txn.lock().take().unwrap_or_default();
-            apply_ops(db, ops)?;
+            let changes = logical_changes(&ops);
+            let external_tables = external_tables_to_refresh(db, &ops);
+            apply_ops(session, db, ops)?;
+            refresh_external_tables(session, db, &external_tables)?;
+            session.sql_fn_state.record_changes(changes, None);
             session.clear_cache();
             Vec::new()
         }
@@ -142,7 +190,11 @@ pub(crate) fn try_run_command(
             session.sql_txn.lock().take();
             Vec::new()
         }
-        Statement::Analyze(_) => Vec::new(),
+        Statement::Analyze(_) => {
+            analyze_all(db)?;
+            session.clear_cache();
+            Vec::new()
+        }
         Statement::Vacuum(_) => {
             compact_all(db)?;
             session.clear_cache();
@@ -157,7 +209,11 @@ pub(crate) fn try_run_command(
 fn should_parse(lower: &str) -> bool {
     [
         "create table",
+        "create virtual table",
+        "create trigger",
+        "create or replace trigger",
         "drop table",
+        "drop trigger",
         "alter table",
         "create index",
         "drop index",
@@ -194,6 +250,16 @@ fn try_manual_command(
         let mut names = db.table_names();
         names.sort();
         return Ok(Some(vec![strings_batch("table_name", names)?]));
+    }
+
+    if lower.starts_with("create virtual table ") {
+        create_virtual_table_manual(session, db, sql)?;
+        return Ok(Some(Vec::new()));
+    }
+
+    if lower.starts_with("create trigger if not exists ") {
+        create_trigger_if_not_exists_manual(session, db, sql)?;
+        return Ok(Some(Vec::new()));
     }
 
     if lower == "show procedures" || lower == "show procedure" {
@@ -254,19 +320,11 @@ fn try_manual_command(
         return Ok(Some(vec![describe_table(db, table)?]));
     }
 
-    if let Some(inner) = lower.strip_prefix("pragma table_info") {
-        let table = inner
-            .trim()
-            .strip_prefix('(')
-            .and_then(|s| s.strip_suffix(')'))
-            .ok_or_else(|| {
-                MongrelQueryError::Schema("expected PRAGMA table_info(<table>)".into())
-            })?;
-        let table = strip_identifier(table.trim())?;
-        return Ok(Some(vec![pragma_table_info(db, table)?]));
+    if lower.starts_with("pragma ") {
+        return Ok(Some(vec![run_pragma(session, db, sql, lower)?]));
     }
 
-    if lower == "check" || lower == "check database" || lower == "pragma integrity_check" {
+    if lower == "check" || lower == "check database" {
         return Ok(Some(vec![check_batch(db)?]));
     }
 
@@ -277,10 +335,45 @@ fn try_manual_command(
         return Ok(Some(vec![strings_batch("quarantined_table_id", values)?]));
     }
 
+    if lower.starts_with("vacuum into ") {
+        let target = parse_vacuum_into(sql, lower)?;
+        compact_all(db)?;
+        copy_database_dir(db.root(), Path::new(target))?;
+        session.clear_cache();
+        return Ok(Some(Vec::new()));
+    }
+
     if lower == "compact" || lower == "compact database" || lower == "vacuum" {
         compact_all(db)?;
         session.clear_cache();
         return Ok(Some(Vec::new()));
+    }
+
+    if lower == "analyze" || lower.starts_with("analyze ") {
+        analyze_all(db)?;
+        session.clear_cache();
+        return Ok(Some(Vec::new()));
+    }
+
+    if lower == "reindex" || lower.starts_with("reindex ") {
+        let target = lower
+            .strip_prefix("reindex")
+            .map(str::trim)
+            .unwrap_or_default();
+        let target = if target.is_empty() {
+            None
+        } else {
+            Some(strip_identifier(target)?)
+        };
+        reindex(db, target)?;
+        session.clear_cache();
+        return Ok(Some(Vec::new()));
+    }
+
+    if lower.starts_with("attach ") || lower.starts_with("detach ") {
+        return Err(MongrelQueryError::Schema(
+            "ATTACH and DETACH are not supported by MongrelDB SQL sessions; mount additional databases with MongrelSession::register_db or open a separate daemon/database handle".into(),
+        ));
     }
 
     if sql.ends_with(';') {
@@ -311,6 +404,164 @@ fn create_table(session: &MongrelSession, db: &Arc<Database>, create: CreateTabl
     Ok(())
 }
 
+fn create_virtual_table_manual(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    sql: &str,
+) -> Result<()> {
+    let sql = sql.trim().trim_end_matches(';').trim();
+    let lower = sql.to_ascii_lowercase();
+    let mut rest = lower
+        .strip_prefix("create virtual table ")
+        .ok_or_else(|| MongrelQueryError::Schema("expected CREATE VIRTUAL TABLE".into()))?;
+    let mut if_not_exists = false;
+    let original_rest_start = "create virtual table ".len();
+    let mut original_rest = &sql[original_rest_start..];
+    if rest.starts_with("if not exists ") {
+        if_not_exists = true;
+        rest = &rest["if not exists ".len()..];
+        original_rest = &original_rest["if not exists ".len()..];
+    }
+    let Some(using_pos) = rest.find(" using ") else {
+        return Err(MongrelQueryError::Schema(
+            "CREATE VIRTUAL TABLE requires USING module".into(),
+        ));
+    };
+    let name = strip_identifier(original_rest[..using_pos].trim())?.to_string();
+    let after_using = original_rest[using_pos + " using ".len()..].trim();
+    let (module, args) = if let Some(open) = after_using.find('(') {
+        let close = after_using
+            .rfind(')')
+            .ok_or_else(|| MongrelQueryError::Schema("CREATE VIRTUAL TABLE missing ')'".into()))?;
+        let module = strip_identifier(after_using[..open].trim())?.to_string();
+        let args = split_module_args(&after_using[open + 1..close])?;
+        (module, args)
+    } else {
+        (strip_identifier(after_using)?.to_string(), Vec::new())
+    };
+    create_virtual_table_named(session, db, name, if_not_exists, module, args)
+}
+
+fn split_module_args(raw: &str) -> Result<Vec<String>> {
+    let mut args = Vec::new();
+    let mut start = 0;
+    let mut quote = None;
+    let mut expected_closers = Vec::new();
+    let mut chars = raw.char_indices().peekable();
+
+    while let Some((idx, ch)) = chars.next() {
+        if let Some(active_quote) = quote {
+            if ch == active_quote {
+                if chars.peek().is_some_and(|(_, next)| *next == active_quote) {
+                    chars.next();
+                } else {
+                    quote = None;
+                }
+            }
+            continue;
+        }
+
+        match ch {
+            '\'' | '"' | '`' => quote = Some(ch),
+            '(' => expected_closers.push(')'),
+            '[' => expected_closers.push(']'),
+            '{' => expected_closers.push('}'),
+            ')' | ']' | '}' => {
+                if expected_closers.pop() != Some(ch) {
+                    return Err(MongrelQueryError::Schema(
+                        "unbalanced CREATE VIRTUAL TABLE module argument delimiters".into(),
+                    ));
+                }
+            }
+            ',' if expected_closers.is_empty() => {
+                push_module_arg(&mut args, &raw[start..idx])?;
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+
+    if quote.is_some() {
+        return Err(MongrelQueryError::Schema(
+            "unterminated CREATE VIRTUAL TABLE module argument string".into(),
+        ));
+    }
+    if !expected_closers.is_empty() {
+        return Err(MongrelQueryError::Schema(
+            "unbalanced CREATE VIRTUAL TABLE module argument delimiters".into(),
+        ));
+    }
+    push_module_arg(&mut args, &raw[start..])?;
+    Ok(args)
+}
+
+fn push_module_arg(args: &mut Vec<String>, raw: &str) -> Result<()> {
+    let raw = raw.trim();
+    if !raw.is_empty() {
+        args.push(strip_identifier(raw)?.to_string());
+    }
+    Ok(())
+}
+
+fn create_virtual_table(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    name: ObjectName,
+    if_not_exists: bool,
+    module_name: String,
+    module_args: Vec<String>,
+) -> Result<()> {
+    let name = object_name(&name)?;
+    create_virtual_table_named(session, db, name, if_not_exists, module_name, module_args)
+}
+
+fn create_virtual_table_named(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    name: String,
+    if_not_exists: bool,
+    module_name: String,
+    module_args: Vec<String>,
+) -> Result<()> {
+    if db.table_id(&name).is_ok() || db.external_table(&name).is_some() {
+        if if_not_exists {
+            return Ok(());
+        }
+        return Err(MongrelQueryError::Schema(format!(
+            "table {name:?} already exists"
+        )));
+    }
+    let module = module_name.to_ascii_lowercase();
+    let descriptor = session.external_modules.descriptor(&module)?;
+    let args = module_args
+        .into_iter()
+        .map(ModuleArg::Ident)
+        .collect::<Vec<_>>();
+    let entry = ExternalTableEntry::new(
+        name.clone(),
+        ExternalTableDefinition {
+            module,
+            args,
+            declared_schema: descriptor.schema,
+            hidden_columns: descriptor.hidden_columns,
+            options: Default::default(),
+            capabilities: descriptor.capabilities,
+        },
+        0,
+    )
+    .map_err(MongrelQueryError::Core)?;
+    let entry = db.create_external_table(entry)?;
+    let provider = session
+        .external_modules
+        .external_table_provider(db, &entry)?;
+    session
+        .ctx
+        .register_table(&entry.name, provider)
+        .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
+    session.clear_cache();
+    Ok(())
+}
+
 fn drop_table(
     session: &MongrelSession,
     db: &Arc<Database>,
@@ -324,8 +575,826 @@ fn drop_table(
             session.clear_cache();
             Ok(())
         }
+        Err(e)
+            if matches!(e, mongreldb_core::MongrelError::NotFound(_))
+                && db.external_table(name).is_some() =>
+        {
+            let entry = db
+                .external_table(name)
+                .ok_or_else(|| MongrelQueryError::Schema(format!("table {name:?} not found")))?;
+            session
+                .external_modules
+                .destroy_external_table(db, &entry)?;
+            db.drop_external_table(name)?;
+            let _ = session.ctx.deregister_table(name);
+            session.clear_cache();
+            Ok(())
+        }
         Err(e) if if_exists && matches!(e, mongreldb_core::MongrelError::NotFound(_)) => Ok(()),
         Err(e) => Err(e.into()),
+    }
+}
+
+fn drop_view(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    name: &str,
+    if_exists: bool,
+) -> Result<()> {
+    if session.view_definition(name).is_none() {
+        if if_exists {
+            return Ok(());
+        }
+        return Err(MongrelQueryError::Schema(format!(
+            "view {name:?} does not exist"
+        )));
+    }
+    session.drop_view(name);
+    let trigger_names = db
+        .triggers()
+        .into_iter()
+        .filter(|trigger| matches!(&trigger.target, TriggerTarget::View(target) if target == name))
+        .map(|trigger| trigger.name)
+        .collect::<Vec<_>>();
+    for trigger in trigger_names {
+        db.drop_trigger(&trigger)?;
+    }
+    session.clear_cache();
+    Ok(())
+}
+
+fn external_table_write_error(op: &str, entry: &ExternalTableEntry) -> MongrelQueryError {
+    let capability = if entry.capabilities.read_only {
+        "read-only"
+    } else if entry.capabilities.insert_only && op != "INSERT" {
+        "insert-only"
+    } else if !entry.capabilities.writable {
+        "not writable"
+    } else {
+        "not wired to the SQL DML path yet"
+    };
+    MongrelQueryError::Schema(format!(
+        "{op} is not supported for external table {:?} using module {:?} ({capability})",
+        entry.name, entry.module
+    ))
+}
+
+fn ensure_external_write_allowed(op: &str, entry: &ExternalTableEntry) -> Result<()> {
+    let allowed = match op {
+        "INSERT" => {
+            !entry.capabilities.read_only
+                && (entry.capabilities.writable || entry.capabilities.insert_only)
+        }
+        "UPDATE" | "DELETE" => !entry.capabilities.read_only && entry.capabilities.writable,
+        _ => false,
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err(external_table_write_error(op, entry))
+    }
+}
+
+fn refresh_external_table_provider(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    entry: &ExternalTableEntry,
+) -> Result<()> {
+    let _ = session.ctx.deregister_table(&entry.name);
+    let provider = session
+        .external_modules
+        .external_table_provider(db, entry)?;
+    session
+        .ctx
+        .register_table(&entry.name, provider)
+        .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
+    session.clear_cache();
+    Ok(())
+}
+
+fn current_external_rows(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    entry: &ExternalTableEntry,
+) -> Result<Vec<HashMap<u16, Value>>> {
+    if let Some(staged) = session.sql_txn.lock().as_ref() {
+        for op in staged.iter().rev() {
+            if let PendingSqlOp::ExternalState { table, state, .. } = op {
+                if table == &entry.name {
+                    return session
+                        .external_modules
+                        .external_table_rows_from_state(entry, state);
+                }
+            }
+        }
+    }
+    session.external_modules.external_table_rows(db, entry)
+}
+
+fn current_external_state(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    entry: &ExternalTableEntry,
+) -> Result<Vec<u8>> {
+    if let Some(staged) = session.sql_txn.lock().as_ref() {
+        for op in staged.iter().rev() {
+            if let PendingSqlOp::ExternalState { table, state, .. } = op {
+                if table == &entry.name {
+                    return Ok(state.clone());
+                }
+            }
+        }
+    }
+    crate::external_modules::external_table_state_bytes(db, entry)
+}
+
+fn stage_external_write(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    entry: &ExternalTableEntry,
+    op: ExternalWriteOp,
+) -> Result<()> {
+    let base_state = current_external_state(session, db, entry)?;
+    let (state, result, base_writes) = session
+        .external_modules
+        .external_table_write(db, entry, base_state, op)?;
+    let mut ops = base_writes
+        .into_iter()
+        .map(pending_op_from_external_base_write)
+        .collect::<Vec<_>>();
+    ops.push(PendingSqlOp::ExternalState {
+        table: entry.name.clone(),
+        state,
+        changes: result.changes,
+    });
+    let changes = logical_changes(&ops);
+    stage_or_apply(session, db, ops, changes, None)
+}
+
+fn pending_op_from_external_base_write(op: ExternalBaseWrite) -> PendingSqlOp {
+    match op {
+        ExternalBaseWrite::Put { table, cells } => PendingSqlOp::Put { table, cells },
+        ExternalBaseWrite::Delete { table, row_id } => PendingSqlOp::Delete {
+            table,
+            row_id: RowId(row_id),
+        },
+    }
+}
+
+fn insert_external_rows(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    entry: &ExternalTableEntry,
+    insert: Insert,
+) -> Result<()> {
+    ensure_external_write_allowed("INSERT", entry)?;
+    if insert.on.is_some() {
+        return Err(MongrelQueryError::Schema(
+            "INSERT conflict actions are not supported for external tables".into(),
+        ));
+    }
+    let schema = &entry.declared_schema;
+    let columns = insert_columns(schema, &insert.columns)?;
+    let value_rows = values_rows(insert.source.as_deref())?;
+    let mut rows = Vec::with_capacity(value_rows.len());
+    let mut inserted = 0_u64;
+    for value_row in value_rows {
+        if value_row.len() != columns.len() {
+            return Err(MongrelQueryError::Schema(format!(
+                "INSERT has {} values for {} columns",
+                value_row.len(),
+                columns.len()
+            )));
+        }
+        let mut row = HashMap::new();
+        for (column, expr) in columns.iter().zip(value_row.iter()) {
+            row.insert(column.id, expr_to_value(expr, column.ty)?);
+        }
+        rows.push(row);
+        inserted = inserted.saturating_add(1);
+    }
+    let _ = inserted;
+    stage_external_write(session, db, entry, ExternalWriteOp::Insert { rows })
+}
+
+fn update_external_rows(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    entry: &ExternalTableEntry,
+    update: sqlparser::ast::Update,
+) -> Result<()> {
+    ensure_external_write_allowed("UPDATE", entry)?;
+    let schema = &entry.declared_schema;
+    let mut rows = current_external_rows(session, db, entry)?;
+    let mut changed = 0_u64;
+    for row in &mut rows {
+        let matches = match update.selection.as_ref() {
+            Some(selection) => eval_bool_expr(selection, schema, row)?,
+            None => true,
+        };
+        if matches {
+            for assignment in &update.assignments {
+                apply_assignment(schema, row, assignment, None)?;
+            }
+            changed = changed.saturating_add(1);
+        }
+    }
+    stage_external_write(
+        session,
+        db,
+        entry,
+        ExternalWriteOp::ReplaceRows {
+            rows,
+            changes: changed,
+        },
+    )
+}
+
+fn delete_external_rows(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    entry: &ExternalTableEntry,
+    delete: Delete,
+) -> Result<()> {
+    ensure_external_write_allowed("DELETE", entry)?;
+    let schema = &entry.declared_schema;
+    let rows = current_external_rows(session, db, entry)?;
+    let mut kept = Vec::with_capacity(rows.len());
+    let mut deleted = 0_u64;
+    for row in rows {
+        if view_row_matches(delete.selection.as_ref(), schema, &row)? {
+            deleted = deleted.saturating_add(1);
+        } else {
+            kept.push(row);
+        }
+    }
+    stage_external_write(
+        session,
+        db,
+        entry,
+        ExternalWriteOp::ReplaceRows {
+            rows: kept,
+            changes: deleted,
+        },
+    )
+}
+
+fn create_trigger(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    create: CreateTrigger,
+) -> Result<()> {
+    let or_replace = create.or_replace || create.or_alter;
+    let trigger = trigger_from_sql(session, db, create)?;
+    if or_replace {
+        db.create_or_replace_trigger(trigger)?;
+    } else {
+        db.create_trigger(trigger)?;
+    }
+    Ok(())
+}
+
+fn create_trigger_if_not_exists_manual(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    sql: &str,
+) -> Result<()> {
+    let sql = sql.trim().trim_end_matches(';').trim();
+    let rest = &sql["create trigger if not exists ".len()..];
+    let rewritten = format!("create trigger {rest}");
+    let statements = Parser::parse_sql(&GenericDialect {}, &rewritten)
+        .map_err(|e| MongrelQueryError::Schema(format!("SQL parse error: {e}")))?;
+    if statements.len() != 1 {
+        return Err(MongrelQueryError::Schema(
+            "only one statement may be executed at a time".into(),
+        ));
+    }
+    let Statement::CreateTrigger(trigger) = statements.into_iter().next().unwrap() else {
+        return Err(MongrelQueryError::Schema(
+            "expected CREATE TRIGGER IF NOT EXISTS".into(),
+        ));
+    };
+    let name = object_name(&trigger.name)?;
+    if db.trigger(&name).is_some() {
+        return Ok(());
+    }
+    create_trigger(session, db, trigger)?;
+    session.clear_cache();
+    Ok(())
+}
+
+fn drop_trigger(db: &Arc<Database>, drop: DropTrigger) -> Result<()> {
+    if drop.table_name.is_some() {
+        return Err(MongrelQueryError::Schema(
+            "DROP TRIGGER ON <table> is not required; trigger names are database-scoped".into(),
+        ));
+    }
+    let name = object_name(&drop.trigger_name)?;
+    match db.drop_trigger(&name) {
+        Ok(()) => Ok(()),
+        Err(e) if drop.if_exists && matches!(e, mongreldb_core::MongrelError::NotFound(_)) => {
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn trigger_from_sql(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    create: CreateTrigger,
+) -> Result<StoredTrigger> {
+    if create.temporary || create.is_constraint || create.referenced_table_name.is_some() {
+        return Err(MongrelQueryError::Schema(
+            "TEMP/CONSTRAINT/FROM triggers are not supported".into(),
+        ));
+    }
+    if !create.referencing.is_empty() || create.characteristics.is_some() {
+        return Err(MongrelQueryError::Schema(
+            "REFERENCING and trigger characteristics are not supported".into(),
+        ));
+    }
+    if create.exec_body.is_some() {
+        return Err(MongrelQueryError::Schema(
+            "EXECUTE FUNCTION/PROCEDURE trigger bodies are not supported; use BEGIN ... END statements".into(),
+        ));
+    }
+    match create.trigger_object {
+        None | Some(TriggerObjectKind::ForEach(TriggerObject::Row)) => {}
+        Some(_) => {
+            return Err(MongrelQueryError::Schema(
+                "only row-level triggers are supported".into(),
+            ));
+        }
+    }
+
+    let timing = match create.period.unwrap_or(TriggerPeriod::After) {
+        TriggerPeriod::After => TriggerTiming::After,
+        TriggerPeriod::Before => TriggerTiming::Before,
+        TriggerPeriod::InsteadOf => TriggerTiming::InsteadOf,
+        TriggerPeriod::For => {
+            return Err(MongrelQueryError::Schema(
+                "FOR is not a trigger timing".into(),
+            ));
+        }
+    };
+    if create.events.len() != 1 {
+        return Err(MongrelQueryError::Schema(
+            "triggers currently support exactly one event".into(),
+        ));
+    }
+    let (event, update_of) = match &create.events[0] {
+        SqlTriggerEvent::Insert => (TriggerEvent::Insert, Vec::new()),
+        SqlTriggerEvent::Delete => (TriggerEvent::Delete, Vec::new()),
+        SqlTriggerEvent::Update(columns) => (
+            TriggerEvent::Update,
+            columns.iter().map(|c| c.value.clone()).collect(),
+        ),
+        SqlTriggerEvent::Truncate => {
+            return Err(MongrelQueryError::Schema(
+                "TRUNCATE triggers are not supported".into(),
+            ));
+        }
+    };
+    let name = object_name(&create.name)?;
+    let target_name = object_name(&create.table_name)?;
+    let (target, target_schema, target_columns) = match timing {
+        TriggerTiming::Before | TriggerTiming::After => {
+            if session.view_schema(&target_name).is_some() {
+                return Err(MongrelQueryError::Schema(
+                    "views support INSTEAD OF triggers, not BEFORE/AFTER triggers".into(),
+                ));
+            }
+            (
+                TriggerTarget::Table(target_name.clone()),
+                table_schema(db, &target_name)?,
+                Vec::new(),
+            )
+        }
+        TriggerTiming::InsteadOf => {
+            let schema = session.view_schema(&target_name).ok_or_else(|| {
+                MongrelQueryError::Schema(format!(
+                    "INSTEAD OF trigger target view {target_name:?} does not exist"
+                ))
+            })?;
+            if schema.columns.is_empty() {
+                return Err(MongrelQueryError::Schema(
+                    "INSTEAD OF triggers require CREATE VIEW column names".into(),
+                ));
+            }
+            (
+                TriggerTarget::View(target_name.clone()),
+                schema.clone(),
+                schema.columns.clone(),
+            )
+        }
+    };
+    let when = create
+        .condition
+        .as_ref()
+        .map(|expr| trigger_expr_from_sql(expr, &target_schema, event))
+        .transpose()?;
+    let statements = create.statements.ok_or_else(|| {
+        MongrelQueryError::Schema("trigger body must contain BEGIN ... END statements".into())
+    })?;
+    let mut steps = Vec::new();
+    for statement in trigger_statement_list(&statements) {
+        steps.extend(trigger_steps_from_statement(
+            db,
+            statement,
+            &target_schema,
+            event,
+        )?);
+    }
+    let trigger = StoredTrigger::new(
+        name,
+        TriggerDefinition {
+            target,
+            timing,
+            event,
+            update_of,
+            target_columns,
+            when,
+            program: TriggerProgram { steps },
+        },
+        0,
+    )
+    .map_err(MongrelQueryError::Core)?;
+    Ok(trigger)
+}
+
+fn trigger_statement_list(statements: &ConditionalStatements) -> &[Statement] {
+    match statements {
+        ConditionalStatements::Sequence { statements } => statements,
+        ConditionalStatements::BeginEnd(block) => &block.statements,
+    }
+}
+
+fn trigger_steps_from_statement(
+    db: &Arc<Database>,
+    statement: &Statement,
+    trigger_schema: &CoreSchema,
+    event: TriggerEvent,
+) -> Result<Vec<TriggerStep>> {
+    match statement {
+        Statement::Insert(insert) => trigger_insert_steps(db, insert, trigger_schema, event),
+        Statement::Update(update) => trigger_update_step(db, update, trigger_schema, event),
+        Statement::Delete(delete) => trigger_delete_step(db, delete, trigger_schema, event),
+        Statement::Query(query) => trigger_query_step(query, trigger_schema, event),
+        other => Err(MongrelQueryError::Schema(format!(
+            "unsupported trigger body statement: {other}"
+        ))),
+    }
+}
+
+fn trigger_insert_steps(
+    db: &Arc<Database>,
+    insert: &Insert,
+    trigger_schema: &CoreSchema,
+    event: TriggerEvent,
+) -> Result<Vec<TriggerStep>> {
+    if insert.returning.is_some() || insert.on.is_some() {
+        return Err(MongrelQueryError::Schema(
+            "trigger INSERT does not support RETURNING or conflict actions".into(),
+        ));
+    }
+    let table = match &insert.table {
+        TableObject::TableName(name) => object_name(name)?,
+        _ => {
+            return Err(MongrelQueryError::Schema(
+                "trigger INSERT target must be a table name".into(),
+            ));
+        }
+    };
+    let schema = table_schema(db, &table)?;
+    let columns = insert_columns(&schema, &insert.columns)?;
+    let rows = values_rows(insert.source.as_deref())?;
+    let mut steps = Vec::with_capacity(rows.len());
+    for row in rows {
+        if row.len() != columns.len() {
+            return Err(MongrelQueryError::Schema(format!(
+                "trigger INSERT has {} values for {} columns",
+                row.len(),
+                columns.len()
+            )));
+        }
+        let mut cells = Vec::with_capacity(row.len());
+        for (col, expr) in columns.iter().zip(row.iter()) {
+            cells.push(TriggerCell {
+                column_id: col.id,
+                value: trigger_value_from_sql(expr, trigger_schema, event, Some(col.ty))?,
+            });
+        }
+        steps.push(TriggerStep::Insert {
+            table: table.clone(),
+            cells,
+        });
+    }
+    Ok(steps)
+}
+
+fn trigger_update_step(
+    db: &Arc<Database>,
+    update: &sqlparser::ast::Update,
+    trigger_schema: &CoreSchema,
+    event: TriggerEvent,
+) -> Result<Vec<TriggerStep>> {
+    if update.returning.is_some() || update.output.is_some() || update.from.is_some() {
+        return Err(MongrelQueryError::Schema(
+            "trigger UPDATE does not support RETURNING/OUTPUT/FROM".into(),
+        ));
+    }
+    if !update.table.joins.is_empty() {
+        return Err(MongrelQueryError::Schema(
+            "trigger UPDATE with joins is not supported".into(),
+        ));
+    }
+    let table = table_factor_name(&update.table.relation)?;
+    let schema = table_schema(db, &table)?;
+    let pk = trigger_pk_condition(update.selection.as_ref(), &schema, trigger_schema, event)?;
+    let mut cells = Vec::with_capacity(update.assignments.len());
+    for assignment in &update.assignments {
+        let column_name = match &assignment.target {
+            AssignmentTarget::ColumnName(name) => object_name(name)?,
+            AssignmentTarget::Tuple(_) => {
+                return Err(MongrelQueryError::Schema(
+                    "trigger UPDATE tuple assignments are not supported".into(),
+                ));
+            }
+        };
+        let col = schema
+            .column(&column_name)
+            .ok_or_else(|| MongrelQueryError::Schema(format!("unknown column {column_name}")))?;
+        cells.push(TriggerCell {
+            column_id: col.id,
+            value: trigger_value_from_sql(&assignment.value, trigger_schema, event, Some(col.ty))?,
+        });
+    }
+    Ok(vec![TriggerStep::UpdateByPk { table, pk, cells }])
+}
+
+fn trigger_delete_step(
+    db: &Arc<Database>,
+    delete: &Delete,
+    trigger_schema: &CoreSchema,
+    event: TriggerEvent,
+) -> Result<Vec<TriggerStep>> {
+    let table = single_from_table(&delete.from)?;
+    let schema = table_schema(db, &table)?;
+    let pk = trigger_pk_condition(delete.selection.as_ref(), &schema, trigger_schema, event)?;
+    Ok(vec![TriggerStep::DeleteByPk { table, pk }])
+}
+
+fn trigger_query_step(
+    query: &Query,
+    trigger_schema: &CoreSchema,
+    event: TriggerEvent,
+) -> Result<Vec<TriggerStep>> {
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Err(MongrelQueryError::Schema(
+            "trigger SELECT body supports only simple SELECT".into(),
+        ));
+    };
+    if select.projection.len() != 1 || !select.from.is_empty() {
+        return Err(MongrelQueryError::Schema(
+            "trigger SELECT body supports only SELECT RAISE(...)".into(),
+        ));
+    }
+    let sqlparser::ast::SelectItem::UnnamedExpr(Expr::Function(func)) = &select.projection[0]
+    else {
+        return Err(MongrelQueryError::Schema(
+            "trigger SELECT body supports only SELECT RAISE(...)".into(),
+        ));
+    };
+    if !object_name(&func.name)?.eq_ignore_ascii_case("raise") {
+        return Err(MongrelQueryError::Schema(
+            "trigger SELECT body supports only SELECT RAISE(...)".into(),
+        ));
+    }
+    let FunctionArguments::List(args) = &func.args else {
+        return Err(MongrelQueryError::Schema(
+            "RAISE requires argument list".into(),
+        ));
+    };
+    if args.args.is_empty() {
+        return Err(MongrelQueryError::Schema("RAISE requires an action".into()));
+    }
+    let action = raise_action_from_arg(&args.args[0])?;
+    let message = if action == TriggerRaiseAction::Ignore {
+        TriggerValue::Literal(Value::Null)
+    } else {
+        let Some(arg) = args.args.get(1) else {
+            return Err(MongrelQueryError::Schema(
+                "RAISE action requires a message".into(),
+            ));
+        };
+        trigger_value_from_sql(
+            function_arg_expr(arg)?,
+            trigger_schema,
+            event,
+            Some(TypeId::Bytes),
+        )?
+    };
+    Ok(vec![TriggerStep::Raise { action, message }])
+}
+
+fn raise_action_from_arg(arg: &FunctionArg) -> Result<TriggerRaiseAction> {
+    let expr = function_arg_expr(arg)?;
+    let name = match expr {
+        Expr::Identifier(ident) => ident.value.to_ascii_lowercase(),
+        Expr::Value(v) => match sql_value_to_value(&v.value, Some(TypeId::Bytes))? {
+            Value::Bytes(bytes) => String::from_utf8_lossy(&bytes).to_ascii_lowercase(),
+            _ => {
+                return Err(MongrelQueryError::Schema(
+                    "RAISE action must be an identifier or string".into(),
+                ));
+            }
+        },
+        _ => {
+            return Err(MongrelQueryError::Schema(
+                "RAISE action must be an identifier or string".into(),
+            ));
+        }
+    };
+    match name.as_str() {
+        "abort" => Ok(TriggerRaiseAction::Abort),
+        "fail" => Ok(TriggerRaiseAction::Fail),
+        "rollback" => Ok(TriggerRaiseAction::Rollback),
+        "ignore" => Ok(TriggerRaiseAction::Ignore),
+        _ => Err(MongrelQueryError::Schema(format!(
+            "unsupported RAISE action {name:?}"
+        ))),
+    }
+}
+
+fn function_arg_expr(arg: &FunctionArg) -> Result<&Expr> {
+    match arg {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => Ok(expr),
+        _ => Err(MongrelQueryError::Schema(
+            "trigger function arguments must be positional expressions".into(),
+        )),
+    }
+}
+
+fn trigger_pk_condition(
+    selection: Option<&Expr>,
+    step_schema: &CoreSchema,
+    trigger_schema: &CoreSchema,
+    event: TriggerEvent,
+) -> Result<TriggerValue> {
+    let pk = step_schema.primary_key().ok_or_else(|| {
+        MongrelQueryError::Schema("trigger UPDATE/DELETE target needs a primary key".into())
+    })?;
+    let Some(Expr::BinaryOp { left, op, right }) = selection else {
+        return Err(MongrelQueryError::Schema(
+            "trigger UPDATE/DELETE requires WHERE pk = expr".into(),
+        ));
+    };
+    if *op != BinaryOperator::Eq {
+        return Err(MongrelQueryError::Schema(
+            "trigger UPDATE/DELETE requires WHERE pk = expr".into(),
+        ));
+    }
+    if expr_is_column(left, &pk.name) {
+        trigger_value_from_sql(right, trigger_schema, event, Some(pk.ty))
+    } else if expr_is_column(right, &pk.name) {
+        trigger_value_from_sql(left, trigger_schema, event, Some(pk.ty))
+    } else {
+        Err(MongrelQueryError::Schema(format!(
+            "trigger UPDATE/DELETE WHERE must compare primary key {}",
+            pk.name
+        )))
+    }
+}
+
+fn expr_is_column(expr: &Expr, column: &str) -> bool {
+    match expr {
+        Expr::Identifier(ident) => ident.value == column,
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => parts[1].value == column,
+        _ => false,
+    }
+}
+
+fn trigger_expr_from_sql(
+    expr: &Expr,
+    trigger_schema: &CoreSchema,
+    event: TriggerEvent,
+) -> Result<TriggerExpr> {
+    match expr {
+        Expr::Nested(inner) => trigger_expr_from_sql(inner, trigger_schema, event),
+        Expr::BinaryOp { left, op, right } => match op {
+            BinaryOperator::Eq => Ok(TriggerExpr::Eq {
+                left: trigger_value_from_sql(left, trigger_schema, event, None)?,
+                right: trigger_value_from_sql(right, trigger_schema, event, None)?,
+            }),
+            BinaryOperator::NotEq => Ok(TriggerExpr::NotEq {
+                left: trigger_value_from_sql(left, trigger_schema, event, None)?,
+                right: trigger_value_from_sql(right, trigger_schema, event, None)?,
+            }),
+            _ => Err(MongrelQueryError::Schema(format!(
+                "unsupported trigger WHEN operator {op}"
+            ))),
+        },
+        Expr::UnaryOp {
+            op: UnaryOperator::Not,
+            expr,
+        } => invert_trigger_expr(trigger_expr_from_sql(expr, trigger_schema, event)?),
+        Expr::IsNull(inner) => Ok(TriggerExpr::IsNull(trigger_value_from_sql(
+            inner,
+            trigger_schema,
+            event,
+            None,
+        )?)),
+        Expr::IsNotNull(inner) => Ok(TriggerExpr::IsNotNull(trigger_value_from_sql(
+            inner,
+            trigger_schema,
+            event,
+            None,
+        )?)),
+        _ => Ok(TriggerExpr::Value(trigger_value_from_sql(
+            expr,
+            trigger_schema,
+            event,
+            Some(TypeId::Bool),
+        )?)),
+    }
+}
+
+fn invert_trigger_expr(expr: TriggerExpr) -> Result<TriggerExpr> {
+    match expr {
+        TriggerExpr::Eq { left, right } => Ok(TriggerExpr::NotEq { left, right }),
+        TriggerExpr::NotEq { left, right } => Ok(TriggerExpr::Eq { left, right }),
+        TriggerExpr::IsNull(value) => Ok(TriggerExpr::IsNotNull(value)),
+        TriggerExpr::IsNotNull(value) => Ok(TriggerExpr::IsNull(value)),
+        TriggerExpr::Value(TriggerValue::Literal(Value::Bool(value))) => Ok(TriggerExpr::Value(
+            TriggerValue::Literal(Value::Bool(!value)),
+        )),
+        TriggerExpr::Value(value) => Err(MongrelQueryError::Schema(format!(
+            "trigger WHEN NOT only supports comparisons, IS NULL, IS NOT NULL, or boolean literals; got {value:?}"
+        ))),
+    }
+}
+
+fn trigger_value_from_sql(
+    expr: &Expr,
+    trigger_schema: &CoreSchema,
+    event: TriggerEvent,
+    literal_type: Option<TypeId>,
+) -> Result<TriggerValue> {
+    match expr {
+        Expr::Nested(inner) => trigger_value_from_sql(inner, trigger_schema, event, literal_type),
+        Expr::Value(v) => {
+            let value = sql_value_to_value(&v.value, literal_type)?;
+            let value = match literal_type {
+                Some(ty) => coerce_value(value, ty)?,
+                None => value,
+            };
+            Ok(TriggerValue::Literal(value))
+        }
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => match trigger_value_from_sql(expr, trigger_schema, event, literal_type)? {
+            TriggerValue::Literal(Value::Int64(v)) => {
+                Ok(TriggerValue::Literal(Value::Int64(v.saturating_neg())))
+            }
+            TriggerValue::Literal(Value::Float64(v)) => {
+                Ok(TriggerValue::Literal(Value::Float64(-v)))
+            }
+            _ => Err(MongrelQueryError::Schema(
+                "trigger unary minus requires a numeric literal".into(),
+            )),
+        },
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            let row = parts[0].value.to_ascii_lowercase();
+            let column = trigger_schema.column(&parts[1].value).ok_or_else(|| {
+                MongrelQueryError::Schema(format!("unknown trigger column {}", parts[1].value))
+            })?;
+            match row.as_str() {
+                "new" => {
+                    if event == TriggerEvent::Delete {
+                        return Err(MongrelQueryError::Schema(
+                            "DELETE triggers cannot reference NEW".into(),
+                        ));
+                    }
+                    Ok(TriggerValue::NewColumn(column.id))
+                }
+                "old" => {
+                    if event == TriggerEvent::Insert {
+                        return Err(MongrelQueryError::Schema(
+                            "INSERT triggers cannot reference OLD".into(),
+                        ));
+                    }
+                    Ok(TriggerValue::OldColumn(column.id))
+                }
+                _ => Err(MongrelQueryError::Schema(format!(
+                    "unsupported trigger row qualifier {row:?}"
+                ))),
+            }
+        }
+        other => Err(MongrelQueryError::Schema(format!(
+            "unsupported trigger value expression {other}"
+        ))),
     }
 }
 
@@ -336,8 +1405,53 @@ fn create_view(session: &MongrelSession, view: CreateView) -> Result<()> {
         ));
     }
     let name = object_name(&view.name)?;
-    session.create_view(&name, &view.query.to_string());
+    let (schema, input_types) = view_schema_from_columns(&view.columns)?;
+    session.create_view_with_schema(&name, &view.query.to_string(), schema, input_types);
     Ok(())
+}
+
+fn view_schema_from_columns(
+    columns: &[sqlparser::ast::ViewColumnDef],
+) -> Result<(CoreSchema, HashMap<u16, Option<TypeId>>)> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::with_capacity(columns.len());
+    let mut input_types = HashMap::new();
+    for (idx, column) in columns.iter().enumerate() {
+        let name = column.name.value.clone();
+        if !seen.insert(name.clone()) {
+            return Err(MongrelQueryError::Schema(format!(
+                "duplicate view column {name}"
+            )));
+        }
+        let id = u16::try_from(idx + 1).map_err(|_| {
+            MongrelQueryError::Schema("view has too many columns for trigger routing".into())
+        })?;
+        let ty = match &column.data_type {
+            Some(data_type) => sql_type_to_core(data_type)?,
+            None => TypeId::Bytes,
+        };
+        input_types.insert(
+            id,
+            column
+                .data_type
+                .as_ref()
+                .map(sql_type_to_core)
+                .transpose()?,
+        );
+        out.push(CoreColumnDef {
+            id,
+            name,
+            ty,
+            flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+        });
+    }
+    Ok((
+        CoreSchema {
+            columns: out,
+            ..CoreSchema::default()
+        },
+        input_types,
+    ))
 }
 
 fn alter_table(session: &MongrelSession, db: &Arc<Database>, alter: AlterTable) -> Result<()> {
@@ -610,8 +1724,8 @@ fn drop_index(
 }
 
 fn insert_rows(session: &MongrelSession, db: &Arc<Database>, insert: Insert) -> Result<()> {
-    let table = match insert.table {
-        TableObject::TableName(name) => object_name(&name)?,
+    let table = match &insert.table {
+        TableObject::TableName(name) => object_name(name)?,
         _ => {
             return Err(MongrelQueryError::Schema(
                 "INSERT target must be a table name".into(),
@@ -622,6 +1736,12 @@ fn insert_rows(session: &MongrelSession, db: &Arc<Database>, insert: Insert) -> 
         return Err(MongrelQueryError::Schema(
             "INSERT RETURNING is not supported".into(),
         ));
+    }
+    if session.view_definition(&table).is_some() {
+        return insert_view_rows(session, db, &table, insert);
+    }
+    if let Some(entry) = db.external_table(&table) {
+        return insert_external_rows(session, db, &entry, insert);
     }
     let schema = table_schema(db, &table)?;
     let columns = insert_columns(&schema, &insert.columns)?;
@@ -707,10 +1827,289 @@ fn insert_rows(session: &MongrelSession, db: &Arc<Database>, insert: Insert) -> 
             }
         }
     }
-    stage_or_apply(session, db, ops)
+    let changes = logical_changes(&ops);
+    let last_insert_rowid = last_insert_pk(&ops, &schema);
+    stage_or_apply(session, db, ops, changes, last_insert_rowid)
 }
 
-fn update_rows(
+#[derive(Clone)]
+struct SqlTriggerEventImage {
+    kind: TriggerEvent,
+    old: Option<HashMap<u16, Value>>,
+    new: Option<HashMap<u16, Value>>,
+}
+
+fn insert_view_rows(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    view: &str,
+    insert: Insert,
+) -> Result<()> {
+    if insert.on.is_some() {
+        return Err(MongrelQueryError::Schema(
+            "INSERT conflict actions are not supported for views".into(),
+        ));
+    }
+    let view_def = session
+        .view_definition(view)
+        .ok_or_else(|| MongrelQueryError::Schema(format!("view {view:?} does not exist")))?;
+    if view_def.schema.columns.is_empty() {
+        return Err(MongrelQueryError::Schema(
+            "INSERT into a view requires CREATE VIEW column names".into(),
+        ));
+    }
+    let triggers = instead_of_triggers(db, view, TriggerEvent::Insert, None);
+    if triggers.is_empty() {
+        return Err(MongrelQueryError::Schema(format!(
+            "cannot INSERT into view {view:?} without an INSTEAD OF INSERT trigger"
+        )));
+    }
+
+    let columns = insert_columns(&view_def.schema, &insert.columns)?;
+    let rows = values_rows(insert.source.as_deref())?;
+    let mut ops = Vec::new();
+    for row in rows {
+        if row.len() != columns.len() {
+            return Err(MongrelQueryError::Schema(format!(
+                "INSERT has {} values for {} columns",
+                row.len(),
+                columns.len()
+            )));
+        }
+        let mut new = HashMap::new();
+        for (col, expr) in columns.iter().zip(row.iter()) {
+            let mut value = expr_to_untyped_value(expr)?;
+            if let Some(ty) = view_def.input_types.get(&col.id).and_then(|ty| *ty) {
+                value = coerce_value(value, ty)?;
+            }
+            new.insert(col.id, value);
+        }
+        let event = SqlTriggerEventImage {
+            kind: TriggerEvent::Insert,
+            old: None,
+            new: Some(new),
+        };
+        for trigger in &triggers {
+            if execute_instead_of_trigger_program(db, trigger, &event, &mut ops)?
+                == SqlTriggerProgramOutcome::Ignore
+            {
+                break;
+            }
+        }
+    }
+    let changes = logical_changes(&ops);
+    stage_or_apply(session, db, ops, changes, None)
+}
+
+fn instead_of_triggers(
+    db: &Arc<Database>,
+    view: &str,
+    event: TriggerEvent,
+    changed_columns: Option<&[u16]>,
+) -> Vec<StoredTrigger> {
+    db.triggers()
+        .into_iter()
+        .filter(|trigger| {
+            if !trigger.enabled
+                || trigger.timing != TriggerTiming::InsteadOf
+                || trigger.event != event
+                || !matches!(&trigger.target, TriggerTarget::View(target) if target == view)
+            {
+                return false;
+            }
+            if event == TriggerEvent::Update && !trigger.update_of.is_empty() {
+                let Some(changed_columns) = changed_columns else {
+                    return false;
+                };
+                return trigger.update_of.iter().any(|name| {
+                    trigger
+                        .target_columns
+                        .iter()
+                        .find(|column| column.name == *name)
+                        .is_some_and(|column| changed_columns.contains(&column.id))
+                });
+            }
+            true
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqlTriggerProgramOutcome {
+    Continue,
+    Ignore,
+}
+
+fn execute_instead_of_trigger_program(
+    db: &Arc<Database>,
+    trigger: &StoredTrigger,
+    event: &SqlTriggerEventImage,
+    ops: &mut Vec<PendingSqlOp>,
+) -> Result<SqlTriggerProgramOutcome> {
+    if let Some(when) = &trigger.when {
+        if !eval_instead_of_trigger_expr(when, event)? {
+            return Ok(SqlTriggerProgramOutcome::Continue);
+        }
+    }
+    for step in &trigger.program.steps {
+        match step {
+            TriggerStep::SetNew { .. } => {
+                return Err(MongrelQueryError::Schema(
+                    "SET NEW is not valid in INSTEAD OF triggers".into(),
+                ));
+            }
+            TriggerStep::Insert { table, cells } => {
+                ops.push(PendingSqlOp::Put {
+                    table: table.clone(),
+                    cells: eval_instead_of_trigger_cells(cells, event)?,
+                });
+            }
+            TriggerStep::UpdateByPk { table, pk, cells } => {
+                let pk = eval_instead_of_trigger_value(pk, event)?;
+                let handle = db.table(table)?;
+                let row_id = handle.lock().lookup_pk(&pk.encode_key()).ok_or_else(|| {
+                    MongrelQueryError::Schema(format!(
+                        "trigger {:?} update target not found",
+                        trigger.name
+                    ))
+                })?;
+                let old = {
+                    let guard = handle.lock();
+                    guard.get(row_id, guard.snapshot()).ok_or_else(|| {
+                        MongrelQueryError::Schema(format!(
+                            "trigger {:?} update target not visible",
+                            trigger.name
+                        ))
+                    })?
+                };
+                let mut merged = old.columns;
+                for (column_id, value) in eval_instead_of_trigger_cells(cells, event)? {
+                    merged.insert(column_id, value);
+                }
+                ops.push(PendingSqlOp::Delete {
+                    table: table.clone(),
+                    row_id,
+                });
+                ops.push(PendingSqlOp::Put {
+                    table: table.clone(),
+                    cells: map_to_cells(&merged),
+                });
+            }
+            TriggerStep::DeleteByPk { table, pk } => {
+                let pk = eval_instead_of_trigger_value(pk, event)?;
+                let row_id = db
+                    .table(table)?
+                    .lock()
+                    .lookup_pk(&pk.encode_key())
+                    .ok_or_else(|| {
+                        MongrelQueryError::Schema(format!(
+                            "trigger {:?} delete target not found",
+                            trigger.name
+                        ))
+                    })?;
+                ops.push(PendingSqlOp::Delete {
+                    table: table.clone(),
+                    row_id,
+                });
+            }
+            TriggerStep::Select { .. } => {}
+            TriggerStep::Raise { action, message } => match action {
+                TriggerRaiseAction::Ignore => return Ok(SqlTriggerProgramOutcome::Ignore),
+                TriggerRaiseAction::Abort
+                | TriggerRaiseAction::Fail
+                | TriggerRaiseAction::Rollback => {
+                    let message = eval_instead_of_trigger_value(message, event)?;
+                    return Err(MongrelQueryError::Schema(format!(
+                        "trigger {:?} raised: {}",
+                        trigger.name,
+                        trigger_message(message)
+                    )));
+                }
+            },
+        }
+    }
+    Ok(SqlTriggerProgramOutcome::Continue)
+}
+
+fn eval_instead_of_trigger_cells(
+    cells: &[TriggerCell],
+    event: &SqlTriggerEventImage,
+) -> Result<Vec<(u16, Value)>> {
+    cells
+        .iter()
+        .map(|cell| {
+            Ok((
+                cell.column_id,
+                eval_instead_of_trigger_value(&cell.value, event)?,
+            ))
+        })
+        .collect()
+}
+
+fn eval_instead_of_trigger_expr(expr: &TriggerExpr, event: &SqlTriggerEventImage) -> Result<bool> {
+    match expr {
+        TriggerExpr::Value(value) => match eval_instead_of_trigger_value(value, event)? {
+            Value::Bool(value) => Ok(value),
+            Value::Null => Ok(false),
+            other => Err(MongrelQueryError::Schema(format!(
+                "trigger WHEN value must be boolean, got {other:?}"
+            ))),
+        },
+        TriggerExpr::Eq { left, right } => Ok(trigger_values_equal(
+            &eval_instead_of_trigger_value(left, event)?,
+            &eval_instead_of_trigger_value(right, event)?,
+        )),
+        TriggerExpr::NotEq { left, right } => Ok(!trigger_values_equal(
+            &eval_instead_of_trigger_value(left, event)?,
+            &eval_instead_of_trigger_value(right, event)?,
+        )),
+        TriggerExpr::IsNull(value) => Ok(matches!(
+            eval_instead_of_trigger_value(value, event)?,
+            Value::Null
+        )),
+        TriggerExpr::IsNotNull(value) => Ok(!matches!(
+            eval_instead_of_trigger_value(value, event)?,
+            Value::Null
+        )),
+    }
+}
+
+fn eval_instead_of_trigger_value(
+    value: &TriggerValue,
+    event: &SqlTriggerEventImage,
+) -> Result<Value> {
+    match value {
+        TriggerValue::Literal(value) => Ok(value.clone()),
+        TriggerValue::NewColumn(column_id) => {
+            if event.kind == TriggerEvent::Delete {
+                return Err(MongrelQueryError::Schema(
+                    "DELETE triggers cannot reference NEW".into(),
+                ));
+            }
+            event
+                .new
+                .as_ref()
+                .and_then(|row| row.get(column_id))
+                .cloned()
+                .ok_or_else(|| MongrelQueryError::Schema("NEW column is not available".into()))
+        }
+        TriggerValue::OldColumn(column_id) => {
+            if event.kind == TriggerEvent::Insert {
+                return Err(MongrelQueryError::Schema(
+                    "INSERT triggers cannot reference OLD".into(),
+                ));
+            }
+            event
+                .old
+                .as_ref()
+                .and_then(|row| row.get(column_id))
+                .cloned()
+                .ok_or_else(|| MongrelQueryError::Schema("OLD column is not available".into()))
+        }
+    }
+}
+
+async fn update_rows(
     session: &MongrelSession,
     db: &Arc<Database>,
     update: sqlparser::ast::Update,
@@ -726,6 +2125,12 @@ fn update_rows(
         ));
     }
     let table = table_factor_name(&update.table.relation)?;
+    if session.view_definition(&table).is_some() {
+        return update_view_rows(session, db, &table, update).await;
+    }
+    if let Some(entry) = db.external_table(&table) {
+        return update_external_rows(session, db, &entry, update);
+    }
     let (schema, rows) = visible_rows(db, &table)?;
     let mut ops = Vec::new();
     for row in rows {
@@ -744,10 +2149,11 @@ fn update_rows(
             });
         }
     }
-    stage_or_apply(session, db, ops)
+    let changes = logical_changes(&ops);
+    stage_or_apply(session, db, ops, changes, None)
 }
 
-fn delete_rows(session: &MongrelSession, db: &Arc<Database>, delete: Delete) -> Result<()> {
+async fn delete_rows(session: &MongrelSession, db: &Arc<Database>, delete: Delete) -> Result<()> {
     if delete.returning.is_some()
         || delete.output.is_some()
         || delete.using.is_some()
@@ -760,6 +2166,12 @@ fn delete_rows(session: &MongrelSession, db: &Arc<Database>, delete: Delete) -> 
         ));
     }
     let table = single_from_table(&delete.from)?;
+    if session.view_definition(&table).is_some() {
+        return delete_view_rows(session, db, &table, delete).await;
+    }
+    if let Some(entry) = db.external_table(&table) {
+        return delete_external_rows(session, db, &entry, delete);
+    }
     let (schema, rows) = visible_rows(db, &table)?;
     let ops = rows
         .into_iter()
@@ -774,13 +2186,263 @@ fn delete_rows(session: &MongrelSession, db: &Arc<Database>, delete: Delete) -> 
             },
         )
         .collect::<Result<Vec<_>>>()?;
-    stage_or_apply(session, db, ops)
+    let changes = logical_changes(&ops);
+    stage_or_apply(session, db, ops, changes, None)
+}
+
+async fn update_view_rows(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    view: &str,
+    update: sqlparser::ast::Update,
+) -> Result<()> {
+    let view_def = session
+        .view_definition(view)
+        .ok_or_else(|| MongrelQueryError::Schema(format!("view {view:?} does not exist")))?;
+    let changed_columns = view_assignment_targets(&view_def.schema, &update.assignments)?;
+    let triggers = instead_of_triggers(db, view, TriggerEvent::Update, Some(&changed_columns));
+    if triggers.is_empty() {
+        return Err(MongrelQueryError::Schema(format!(
+            "cannot UPDATE view {view:?} without a matching INSTEAD OF UPDATE trigger"
+        )));
+    }
+
+    let rows = materialize_view_rows(session, &view_def).await?;
+    let mut ops = Vec::new();
+    for old in rows {
+        if !view_row_matches(update.selection.as_ref(), &view_def.schema, &old)? {
+            continue;
+        }
+        let mut new = old.clone();
+        for assignment in &update.assignments {
+            apply_view_assignment(
+                &view_def.schema,
+                &view_def.input_types,
+                &mut new,
+                assignment,
+            )?;
+        }
+        let event = SqlTriggerEventImage {
+            kind: TriggerEvent::Update,
+            old: Some(old),
+            new: Some(new),
+        };
+        for trigger in &triggers {
+            if execute_instead_of_trigger_program(db, trigger, &event, &mut ops)?
+                == SqlTriggerProgramOutcome::Ignore
+            {
+                break;
+            }
+        }
+    }
+    let changes = logical_changes(&ops);
+    stage_or_apply(session, db, ops, changes, None)
+}
+
+async fn delete_view_rows(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    view: &str,
+    delete: Delete,
+) -> Result<()> {
+    let view_def = session
+        .view_definition(view)
+        .ok_or_else(|| MongrelQueryError::Schema(format!("view {view:?} does not exist")))?;
+    let triggers = instead_of_triggers(db, view, TriggerEvent::Delete, None);
+    if triggers.is_empty() {
+        return Err(MongrelQueryError::Schema(format!(
+            "cannot DELETE from view {view:?} without an INSTEAD OF DELETE trigger"
+        )));
+    }
+
+    let rows = materialize_view_rows(session, &view_def).await?;
+    let mut ops = Vec::new();
+    for old in rows {
+        if !view_row_matches(delete.selection.as_ref(), &view_def.schema, &old)? {
+            continue;
+        }
+        let event = SqlTriggerEventImage {
+            kind: TriggerEvent::Delete,
+            old: Some(old),
+            new: None,
+        };
+        for trigger in &triggers {
+            if execute_instead_of_trigger_program(db, trigger, &event, &mut ops)?
+                == SqlTriggerProgramOutcome::Ignore
+            {
+                break;
+            }
+        }
+    }
+    let changes = logical_changes(&ops);
+    stage_or_apply(session, db, ops, changes, None)
+}
+
+fn view_assignment_targets(schema: &CoreSchema, assignments: &[Assignment]) -> Result<Vec<u16>> {
+    let mut out = Vec::with_capacity(assignments.len());
+    for assignment in assignments {
+        let column_name = match &assignment.target {
+            AssignmentTarget::ColumnName(name) => object_name(name)?,
+            AssignmentTarget::Tuple(_) => {
+                return Err(MongrelQueryError::Schema(
+                    "view UPDATE tuple assignments are not supported".into(),
+                ));
+            }
+        };
+        let column = schema
+            .column(&column_name)
+            .ok_or_else(|| MongrelQueryError::Schema(format!("unknown column {column_name}")))?;
+        out.push(column.id);
+    }
+    Ok(out)
+}
+
+fn apply_view_assignment(
+    schema: &CoreSchema,
+    input_types: &HashMap<u16, Option<TypeId>>,
+    row: &mut HashMap<u16, Value>,
+    assignment: &Assignment,
+) -> Result<()> {
+    let column_name = match &assignment.target {
+        AssignmentTarget::ColumnName(name) => object_name(name)?,
+        AssignmentTarget::Tuple(_) => {
+            return Err(MongrelQueryError::Schema(
+                "view UPDATE tuple assignments are not supported".into(),
+            ));
+        }
+    };
+    let column = schema
+        .column(&column_name)
+        .ok_or_else(|| MongrelQueryError::Schema(format!("unknown column {column_name}")))?;
+    let mut value = eval_value_expr(&assignment.value, schema, row, None)?;
+    if let Some(ty) = input_types.get(&column.id).and_then(|ty| *ty) {
+        value = coerce_value(value, ty)?;
+    }
+    row.insert(column.id, value);
+    Ok(())
+}
+
+fn view_row_matches(
+    selection: Option<&Expr>,
+    schema: &CoreSchema,
+    row: &HashMap<u16, Value>,
+) -> Result<bool> {
+    match selection {
+        Some(expr) => eval_bool_expr(expr, schema, row),
+        None => Ok(true),
+    }
+}
+
+async fn materialize_view_rows(
+    session: &MongrelSession,
+    view: &crate::ViewDef,
+) -> Result<Vec<HashMap<u16, Value>>> {
+    if view.schema.columns.is_empty() {
+        return Err(MongrelQueryError::Schema(
+            "view write routing requires CREATE VIEW column names".into(),
+        ));
+    }
+    let sql = format!(
+        "SELECT * FROM ({}) AS __mongreldb_view_materialize",
+        view.sql
+    );
+    let sql = crate::rewrite_compat_function_calls(&session.resolve_view_sql(&sql));
+    let df = session
+        .ctx
+        .sql(&sql)
+        .await
+        .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
+    let batches = df
+        .collect()
+        .await
+        .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
+
+    let mut out = Vec::new();
+    for batch in batches {
+        if batch.num_columns() != view.schema.columns.len() {
+            return Err(MongrelQueryError::Schema(format!(
+                "view query returned {} columns for {} declared view columns",
+                batch.num_columns(),
+                view.schema.columns.len()
+            )));
+        }
+        for row_idx in 0..batch.num_rows() {
+            let mut view_row = HashMap::new();
+            for (col_idx, view_col) in view.schema.columns.iter().enumerate() {
+                let scalar = datafusion::common::ScalarValue::try_from_array(
+                    batch.column(col_idx).as_ref(),
+                    row_idx,
+                )
+                .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
+                let mut value = scalar_to_core_value(scalar)?;
+                if let Some(ty) = view.input_types.get(&view_col.id).and_then(|ty| *ty) {
+                    value = coerce_value(value, ty)?;
+                }
+                view_row.insert(view_col.id, value);
+            }
+            out.push(view_row);
+        }
+    }
+    Ok(out)
+}
+
+fn scalar_to_core_value(value: datafusion::common::ScalarValue) -> Result<Value> {
+    use datafusion::common::ScalarValue;
+    if value.is_null() {
+        return Ok(Value::Null);
+    }
+    match value {
+        ScalarValue::Boolean(Some(v)) => Ok(Value::Bool(v)),
+        ScalarValue::Float16(Some(v)) => Ok(Value::Float64(f32::from(v) as f64)),
+        ScalarValue::Float32(Some(v)) => Ok(Value::Float64(v as f64)),
+        ScalarValue::Float64(Some(v)) => Ok(Value::Float64(v)),
+        ScalarValue::Int8(Some(v)) => Ok(Value::Int64(v as i64)),
+        ScalarValue::Int16(Some(v)) => Ok(Value::Int64(v as i64)),
+        ScalarValue::Int32(Some(v)) => Ok(Value::Int64(v as i64)),
+        ScalarValue::Int64(Some(v)) => Ok(Value::Int64(v)),
+        ScalarValue::UInt8(Some(v)) => Ok(Value::Int64(v as i64)),
+        ScalarValue::UInt16(Some(v)) => Ok(Value::Int64(v as i64)),
+        ScalarValue::UInt32(Some(v)) => Ok(Value::Int64(v as i64)),
+        ScalarValue::UInt64(Some(v)) => i64::try_from(v)
+            .map(Value::Int64)
+            .map_err(|_| MongrelQueryError::Schema(format!("view value {v} exceeds i64 range"))),
+        ScalarValue::Utf8(Some(v))
+        | ScalarValue::Utf8View(Some(v))
+        | ScalarValue::LargeUtf8(Some(v)) => Ok(Value::Bytes(v.into_bytes())),
+        ScalarValue::Binary(Some(v))
+        | ScalarValue::BinaryView(Some(v))
+        | ScalarValue::FixedSizeBinary(_, Some(v))
+        | ScalarValue::LargeBinary(Some(v)) => Ok(Value::Bytes(v)),
+        ScalarValue::Date32(Some(v))
+        | ScalarValue::Time32Second(Some(v))
+        | ScalarValue::Time32Millisecond(Some(v)) => Ok(Value::Int64(v as i64)),
+        ScalarValue::Date64(Some(v))
+        | ScalarValue::Time64Microsecond(Some(v))
+        | ScalarValue::Time64Nanosecond(Some(v))
+        | ScalarValue::TimestampSecond(Some(v), _)
+        | ScalarValue::TimestampMillisecond(Some(v), _)
+        | ScalarValue::TimestampMicrosecond(Some(v), _)
+        | ScalarValue::TimestampNanosecond(Some(v), _)
+        | ScalarValue::DurationSecond(Some(v))
+        | ScalarValue::DurationMillisecond(Some(v))
+        | ScalarValue::DurationMicrosecond(Some(v))
+        | ScalarValue::DurationNanosecond(Some(v)) => Ok(Value::Int64(v)),
+        ScalarValue::Dictionary(_, value) | ScalarValue::RunEndEncoded(_, _, value) => {
+            scalar_to_core_value(*value)
+        }
+        other => Err(MongrelQueryError::Schema(format!(
+            "view write routing cannot materialize {other:?}"
+        ))),
+    }
 }
 
 fn truncate_tables(session: &MongrelSession, db: &Arc<Database>, truncate: Truncate) -> Result<()> {
     let mut ops = Vec::new();
     for target in truncate.table_names {
         let table = object_name(&target.name)?;
+        if let Some(entry) = db.external_table(&table) {
+            return Err(external_table_write_error("TRUNCATE", &entry));
+        }
         match visible_rows(db, &table) {
             Ok((_, rows)) => {
                 ops.extend(rows.into_iter().map(|row| PendingSqlOp::Delete {
@@ -797,31 +2459,244 @@ fn truncate_tables(session: &MongrelSession, db: &Arc<Database>, truncate: Trunc
             Err(e) => return Err(e),
         }
     }
-    stage_or_apply(session, db, ops)
+    let changes = logical_changes(&ops);
+    stage_or_apply(session, db, ops, changes, None)
 }
 
 fn stage_or_apply(
     session: &MongrelSession,
     db: &Arc<Database>,
     ops: Vec<PendingSqlOp>,
+    changes: u64,
+    last_insert_rowid: Option<u64>,
 ) -> Result<()> {
     if ops.is_empty() {
+        session.sql_fn_state.record_changes(0, None);
         return Ok(());
     }
     if let Some(staged) = session.sql_txn.lock().as_mut() {
         staged.extend(ops);
+        session
+            .sql_fn_state
+            .record_changes(changes, last_insert_rowid);
         return Ok(());
     }
-    apply_ops(db, ops)?;
+    let external_tables = external_tables_to_refresh(db, &ops);
+    apply_ops(session, db, ops)?;
+    refresh_external_tables(session, db, &external_tables)?;
+    session
+        .sql_fn_state
+        .record_changes(changes, last_insert_rowid);
     session.clear_cache();
     Ok(())
 }
 
-fn apply_ops(db: &Arc<Database>, ops: Vec<PendingSqlOp>) -> Result<()> {
+fn external_tables_in_ops(ops: &[PendingSqlOp]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut names = Vec::new();
+    for op in ops {
+        if let PendingSqlOp::ExternalState { table, .. } = op {
+            if seen.insert(table.clone()) {
+                names.push(table.clone());
+            }
+        }
+    }
+    names
+}
+
+fn external_tables_to_refresh(db: &Arc<Database>, ops: &[PendingSqlOp]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut names = Vec::new();
+    for name in external_tables_in_ops(ops) {
+        if seen.insert(name.clone()) {
+            names.push(name);
+        }
+    }
+    for entry in db.external_tables() {
+        if seen.insert(entry.name.clone()) {
+            names.push(entry.name);
+        }
+    }
+    names
+}
+
+fn refresh_external_tables(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    names: &[String],
+) -> Result<()> {
+    for name in names {
+        if let Some(entry) = db.external_table(name) {
+            refresh_external_table_provider(session, db, &entry)?;
+        }
+    }
+    Ok(())
+}
+
+fn logical_changes(ops: &[PendingSqlOp]) -> u64 {
+    let external = ops
+        .iter()
+        .filter_map(|op| match op {
+            PendingSqlOp::ExternalState { changes, .. } => Some(*changes),
+            _ => None,
+        })
+        .sum::<u64>();
+    let puts = ops
+        .iter()
+        .filter(|op| matches!(op, PendingSqlOp::Put { .. }))
+        .count() as u64;
+    let row_changes = if puts > 0 {
+        puts
+    } else {
+        ops.iter()
+            .filter(|op| matches!(op, PendingSqlOp::Delete { .. }))
+            .count() as u64
+    };
+    external + row_changes
+}
+
+fn last_insert_pk(ops: &[PendingSqlOp], schema: &CoreSchema) -> Option<u64> {
+    let pk = schema.primary_key()?;
+    ops.iter().rev().find_map(|op| match op {
+        PendingSqlOp::Put { cells, .. } => cells.iter().find_map(|(id, value)| {
+            if *id == pk.id {
+                match value {
+                    Value::Int64(value) if *value >= 0 => Some(*value as u64),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }),
+        PendingSqlOp::Delete { .. } => None,
+        PendingSqlOp::ExternalState { .. } => None,
+    })
+}
+
+struct QueryExternalTriggerBridge {
+    db: Arc<Database>,
+    modules: Arc<ExternalModuleRegistry>,
+}
+
+impl ExternalTriggerBridge for QueryExternalTriggerBridge {
+    fn apply_trigger_external_write(
+        &self,
+        entry: &ExternalTableEntry,
+        base_state: Vec<u8>,
+        op: ExternalTriggerWrite,
+    ) -> mongreldb_core::Result<ExternalTriggerWriteResult> {
+        let external_op = match op {
+            ExternalTriggerWrite::Insert { cells, .. } => ExternalWriteOp::Insert {
+                rows: vec![cells.into_iter().collect()],
+            },
+            ExternalTriggerWrite::UpdateByPk { pk, cells, .. } => {
+                let mut rows = self
+                    .modules
+                    .external_table_rows_from_state(entry, &base_state)
+                    .map_err(query_error_to_core)?;
+                let pk_col = entry.declared_schema.primary_key().ok_or_else(|| {
+                    mongreldb_core::MongrelError::InvalidArgument(format!(
+                        "external trigger update target {:?} has no primary key",
+                        entry.name
+                    ))
+                })?;
+                let pk_key = pk.encode_key();
+                let mut changed = 0_u64;
+                for row in &mut rows {
+                    if row
+                        .get(&pk_col.id)
+                        .is_some_and(|value| value.encode_key() == pk_key)
+                    {
+                        for (column_id, value) in &cells {
+                            row.insert(*column_id, value.clone());
+                        }
+                        changed = changed.saturating_add(1);
+                    }
+                }
+                if changed == 0 {
+                    return Err(mongreldb_core::MongrelError::NotFound(format!(
+                        "external trigger update target {:?} row not found",
+                        entry.name
+                    )));
+                }
+                ExternalWriteOp::ReplaceRows {
+                    rows,
+                    changes: changed,
+                }
+            }
+            ExternalTriggerWrite::DeleteByPk { pk, .. } => {
+                let rows = self
+                    .modules
+                    .external_table_rows_from_state(entry, &base_state)
+                    .map_err(query_error_to_core)?;
+                let pk_col = entry.declared_schema.primary_key().ok_or_else(|| {
+                    mongreldb_core::MongrelError::InvalidArgument(format!(
+                        "external trigger delete target {:?} has no primary key",
+                        entry.name
+                    ))
+                })?;
+                let pk_key = pk.encode_key();
+                let before = rows.len();
+                let rows = rows
+                    .into_iter()
+                    .filter(|row| {
+                        !row.get(&pk_col.id)
+                            .is_some_and(|value| value.encode_key() == pk_key)
+                    })
+                    .collect::<Vec<_>>();
+                let changes = before.saturating_sub(rows.len()) as u64;
+                if changes == 0 {
+                    return Err(mongreldb_core::MongrelError::NotFound(format!(
+                        "external trigger delete target {:?} row not found",
+                        entry.name
+                    )));
+                }
+                ExternalWriteOp::ReplaceRows { rows, changes }
+            }
+        };
+        let (state, _result, base_writes) = self
+            .modules
+            .external_table_write(&self.db, entry, base_state, external_op)
+            .map_err(query_error_to_core)?;
+        Ok(ExternalTriggerWriteResult {
+            state,
+            base_writes: base_writes
+                .into_iter()
+                .map(core_base_write_from_query)
+                .collect(),
+        })
+    }
+}
+
+fn core_base_write_from_query(op: ExternalBaseWrite) -> ExternalTriggerBaseWrite {
+    match op {
+        ExternalBaseWrite::Put { table, cells } => ExternalTriggerBaseWrite::Put { table, cells },
+        ExternalBaseWrite::Delete { table, row_id } => ExternalTriggerBaseWrite::Delete {
+            table,
+            row_id: RowId(row_id),
+        },
+    }
+}
+
+fn query_error_to_core(err: MongrelQueryError) -> mongreldb_core::MongrelError {
+    match err {
+        MongrelQueryError::Core(err) => err,
+        MongrelQueryError::Schema(msg) => mongreldb_core::MongrelError::InvalidArgument(msg),
+        MongrelQueryError::Arrow(msg) | MongrelQueryError::DataFusion(msg) => {
+            mongreldb_core::MongrelError::Other(msg)
+        }
+    }
+}
+
+fn apply_ops(session: &MongrelSession, db: &Arc<Database>, ops: Vec<PendingSqlOp>) -> Result<()> {
     if ops.is_empty() {
         return Ok(());
     }
-    db.transaction(|tx| {
+    let bridge = QueryExternalTriggerBridge {
+        db: Arc::clone(db),
+        modules: Arc::clone(&session.external_modules),
+    };
+    db.transaction_with_external_trigger_bridge(&bridge, |tx| {
         for op in ops {
             match op {
                 PendingSqlOp::Put { table, cells } => {
@@ -829,6 +2704,9 @@ fn apply_ops(db: &Arc<Database>, ops: Vec<PendingSqlOp>) -> Result<()> {
                 }
                 PendingSqlOp::Delete { table, row_id } => {
                     tx.delete(&table, row_id)?;
+                }
+                PendingSqlOp::ExternalState { table, state, .. } => {
+                    tx.put_external_state(&table, state)?;
                 }
             }
         }
@@ -1248,6 +3126,25 @@ fn expr_to_value(expr: &Expr, ty: TypeId) -> Result<Value> {
     coerce_value(value, ty)
 }
 
+fn expr_to_untyped_value(expr: &Expr) -> Result<Value> {
+    match expr {
+        Expr::Value(v) => sql_value_to_value(&v.value, None),
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => match expr_to_untyped_value(expr)? {
+            Value::Int64(v) => Ok(Value::Int64(v.saturating_neg())),
+            Value::Float64(v) => Ok(Value::Float64(-v)),
+            _ => Err(MongrelQueryError::Schema(
+                "unary minus requires a numeric literal".into(),
+            )),
+        },
+        _ => Err(MongrelQueryError::Schema(format!(
+            "INSERT values must be literals, got {expr}"
+        ))),
+    }
+}
+
 fn coerce_value(value: Value, ty: TypeId) -> Result<Value> {
     match (value, ty) {
         (Value::Null, _) => Ok(Value::Null),
@@ -1274,6 +3171,34 @@ fn coerce_value(value: Value, ty: TypeId) -> Result<Value> {
         (v, ty) => Err(MongrelQueryError::Schema(format!(
             "value {v:?} cannot be stored in {ty:?}"
         ))),
+    }
+}
+
+fn trigger_values_equal(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Null, Value::Null) => true,
+        (Value::Bool(a), Value::Bool(b)) => a == b,
+        (Value::Int64(a), Value::Int64(b)) => a == b,
+        (Value::Float64(a), Value::Float64(b)) => a.to_bits() == b.to_bits(),
+        (Value::Bytes(a), Value::Bytes(b)) => a == b,
+        (Value::Embedding(a), Value::Embedding(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b.iter())
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+        }
+        _ => false,
+    }
+}
+
+fn trigger_message(value: Value) -> String {
+    match value {
+        Value::Null => "NULL".into(),
+        Value::Bool(value) => value.to_string(),
+        Value::Int64(value) => value.to_string(),
+        Value::Float64(value) => value.to_string(),
+        Value::Bytes(value) => String::from_utf8_lossy(&value).into_owned(),
+        Value::Embedding(value) => format!("{value:?}"),
     }
 }
 
@@ -1329,12 +3254,20 @@ fn visible_rows(db: &Arc<Database>, table: &str) -> Result<(CoreSchema, Vec<Row>
 }
 
 fn table_schema(db: &Arc<Database>, table: &str) -> Result<CoreSchema> {
-    let handle = db.table(table)?;
-    let schema = {
-        let guard = handle.lock();
-        guard.schema().clone()
-    };
-    Ok(schema)
+    match db.table(table) {
+        Ok(handle) => {
+            let schema = {
+                let guard = handle.lock();
+                guard.schema().clone()
+            };
+            Ok(schema)
+        }
+        Err(e) if matches!(e, mongreldb_core::MongrelError::NotFound(_)) => db
+            .external_table(table)
+            .map(|entry| entry.declared_schema)
+            .ok_or_else(|| e.into()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 fn rebuild_table(
@@ -1354,6 +3287,7 @@ fn rebuild_table(
     );
     db.create_table(&temp, new_schema.clone())?;
     let temp_result = apply_ops(
+        session,
         db,
         rows.iter()
             .map(|row| PendingSqlOp::Put {
@@ -1370,6 +3304,7 @@ fn rebuild_table(
     db.drop_table(table)?;
     db.create_table(table, new_schema.clone())?;
     apply_ops(
+        session,
         db,
         rows.iter()
             .map(|row| PendingSqlOp::Put {
@@ -1591,7 +3526,7 @@ fn strip_identifier(value: &str) -> Result<&str> {
     if value.is_empty() {
         return Err(MongrelQueryError::Schema("missing identifier".into()));
     }
-    Ok(value.trim_matches('"').trim_matches('`'))
+    Ok(value.trim_matches('"').trim_matches('`').trim_matches('\''))
 }
 
 fn parse_procedure_json<'a>(sql: &'a str, lower: &str, prefix: &str) -> Result<(&'a str, &'a str)> {
@@ -1742,6 +3677,302 @@ fn compact_all(db: &Arc<Database>) -> Result<()> {
     Ok(())
 }
 
+fn analyze_all(db: &Arc<Database>) -> Result<()> {
+    for table in db.table_names() {
+        let handle = db.table(&table)?;
+        handle.lock().ensure_indexes_complete()?;
+    }
+    Ok(())
+}
+
+fn reindex(db: &Arc<Database>, target: Option<&str>) -> Result<()> {
+    match target {
+        None => {
+            for table in db.table_names() {
+                let handle = db.table(&table)?;
+                let mut guard = handle.lock();
+                guard.ensure_indexes_complete()?;
+                guard.compact()?;
+            }
+        }
+        Some(name) => {
+            if db.table_id(name).is_ok() {
+                let handle = db.table(name)?;
+                let mut guard = handle.lock();
+                guard.ensure_indexes_complete()?;
+                guard.compact()?;
+            } else if let Some(table) = find_index_table(db, name)? {
+                let handle = db.table(&table)?;
+                let mut guard = handle.lock();
+                guard.ensure_indexes_complete()?;
+                guard.compact()?;
+            } else {
+                return Err(MongrelQueryError::Schema(format!(
+                    "REINDEX target {name:?} is not a table or index"
+                )));
+            }
+        }
+    }
+    let _ = db.gc()?;
+    Ok(())
+}
+
+fn parse_vacuum_into<'a>(sql: &'a str, lower: &str) -> Result<&'a str> {
+    let marker = "vacuum into ";
+    let body = sql[marker.len()..].trim().trim_end_matches(';').trim();
+    let lower_body = lower[marker.len()..].trim().trim_end_matches(';').trim();
+    if lower_body.is_empty() {
+        return Err(MongrelQueryError::Schema(
+            "VACUUM INTO requires a target directory path".into(),
+        ));
+    }
+    if body.starts_with('\'') {
+        unquote_sql_string(body)
+    } else {
+        strip_identifier(body)
+    }
+}
+
+fn copy_database_dir(src: &Path, dest: &Path) -> Result<()> {
+    let src = src
+        .canonicalize()
+        .map_err(|e| MongrelQueryError::Schema(e.to_string()))?;
+    if dest.exists() {
+        return Err(MongrelQueryError::Schema(format!(
+            "VACUUM INTO target already exists: {}",
+            dest.display()
+        )));
+    }
+    let parent = dest.parent().unwrap_or_else(|| Path::new("."));
+    if parent.exists() {
+        let parent = parent
+            .canonicalize()
+            .map_err(|e| MongrelQueryError::Schema(e.to_string()))?;
+        if parent.starts_with(&src) {
+            return Err(MongrelQueryError::Schema(
+                "VACUUM INTO target must not be inside the source database directory".into(),
+            ));
+        }
+    }
+    copy_dir_recursive(&src, dest)
+}
+
+fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
+    fs::create_dir_all(dest).map_err(|e| MongrelQueryError::Schema(e.to_string()))?;
+    for entry in fs::read_dir(src).map_err(|e| MongrelQueryError::Schema(e.to_string()))? {
+        let entry = entry.map_err(|e| MongrelQueryError::Schema(e.to_string()))?;
+        let src_path = entry.path();
+        let dest_path = dest.join(entry.file_name());
+        let metadata = entry
+            .metadata()
+            .map_err(|e| MongrelQueryError::Schema(e.to_string()))?;
+        if metadata.is_dir() {
+            copy_dir_recursive(&src_path, &dest_path)?;
+        } else if metadata.is_file() {
+            fs::copy(&src_path, &dest_path)
+                .map_err(|e| MongrelQueryError::Schema(e.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+fn run_pragma(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    sql: &str,
+    lower: &str,
+) -> Result<RecordBatch> {
+    let body = sql
+        .trim()
+        .trim_end_matches(';')
+        .trim()
+        .get(6..)
+        .ok_or_else(|| MongrelQueryError::Schema("expected PRAGMA name".into()))?
+        .trim();
+    let lower_body = lower
+        .trim()
+        .trim_end_matches(';')
+        .trim()
+        .get(6..)
+        .ok_or_else(|| MongrelQueryError::Schema("expected PRAGMA name".into()))?
+        .trim();
+    let (name, arg) = parse_pragma_body(body, lower_body)?;
+    match name.as_str() {
+        "table_info" => pragma_table_info(db, required_pragma_arg(&name, arg.as_deref())?),
+        "table_xinfo" => pragma_table_xinfo(db, required_pragma_arg(&name, arg.as_deref())?),
+        "table_list" => pragma_table_list(session, db, arg.as_deref()),
+        "index_list" => pragma_index_list(session, db, required_pragma_arg(&name, arg.as_deref())?),
+        "index_info" => pragma_index_info(session, db, required_pragma_arg(&name, arg.as_deref())?),
+        "index_xinfo" => {
+            pragma_index_xinfo(session, db, required_pragma_arg(&name, arg.as_deref())?)
+        }
+        "foreign_key_list" => {
+            pragma_foreign_key_list(db, required_pragma_arg(&name, arg.as_deref())?)
+        }
+        "foreign_key_check" => pragma_foreign_key_check(db, arg.as_deref()),
+        "database_list" => pragma_database_list(db),
+        "function_list" => pragma_function_list(),
+        "module_list" => pragma_module_list(session),
+        "trigger_list" => pragma_trigger_list(db),
+        "collation_list" => pragma_collation_list(),
+        "compile_options" => pragma_compile_options(),
+        "integrity_check" => pragma_check_batch(db, "integrity_check"),
+        "quick_check" => pragma_check_batch(db, "quick_check"),
+        "schema_version" => int_batch("schema_version", schema_version(db)),
+        "user_version" => {
+            if let Some(value) = parse_optional_i64(arg.as_deref())? {
+                set_db_pragma_i64(db, "user_version", value)?;
+            }
+            int_batch("user_version", get_db_pragma_i64(db, "user_version")?)
+        }
+        "application_id" => {
+            if let Some(value) = parse_optional_i64(arg.as_deref())? {
+                set_db_pragma_i64(db, "application_id", value)?;
+            }
+            int_batch("application_id", get_db_pragma_i64(db, "application_id")?)
+        }
+        "data_version" => int_batch("data_version", db.visible_epoch().0 as i64),
+        "foreign_keys" => int_batch("foreign_keys", 1),
+        "query_only" => int_batch("query_only", 0),
+        "journal_mode" => strings_batch("journal_mode", vec!["wal".to_string()]),
+        "synchronous" => int_batch("synchronous", 1),
+        "encoding" => strings_batch("encoding", vec!["UTF-8".to_string()]),
+        "page_size" => int_batch("page_size", 4096),
+        "page_count" => int_batch("page_count", db_page_count(db)?),
+        "freelist_count" => int_batch("freelist_count", 0),
+        "cache_size" => int_batch("cache_size", -2000),
+        "automatic_index" => int_batch("automatic_index", 1),
+        "defer_foreign_keys" => int_batch("defer_foreign_keys", 0),
+        "recursive_triggers" => {
+            if let Some(value) = parse_optional_i64(arg.as_deref())? {
+                db.set_recursive_triggers(value != 0);
+            }
+            int_batch(
+                "recursive_triggers",
+                i64::from(db.trigger_config().recursive_triggers),
+            )
+        }
+        "trusted_schema" => int_batch("trusted_schema", 0),
+        "wal_checkpoint" => pragma_wal_checkpoint(db),
+        "optimize" => {
+            analyze_all(db)?;
+            session.clear_cache();
+            strings_batch("optimize", vec!["ok".to_string()])
+        }
+        _other => empty_batch(),
+    }
+}
+
+fn parse_pragma_body(body: &str, lower_body: &str) -> Result<(String, Option<String>)> {
+    let (raw_name, raw_arg) = if let Some(open) = lower_body.find('(') {
+        let close = lower_body
+            .rfind(')')
+            .ok_or_else(|| MongrelQueryError::Schema("expected closing ')' in PRAGMA".into()))?;
+        (&body[..open], Some(&body[open + 1..close]))
+    } else if let Some(eq) = lower_body.find('=') {
+        (&body[..eq], Some(&body[eq + 1..]))
+    } else {
+        (body, None)
+    };
+    let mut name = raw_name.trim().to_ascii_lowercase();
+    if let Some((schema, local)) = name.split_once('.') {
+        if schema != "main" {
+            return Err(MongrelQueryError::Schema(format!(
+                "unsupported PRAGMA schema qualifier {schema:?}"
+            )));
+        }
+        name = local.to_string();
+    }
+    let arg = raw_arg
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(strip_identifier)
+        .transpose()?
+        .map(str::to_string);
+    Ok((name, arg))
+}
+
+fn required_pragma_arg<'a>(name: &str, arg: Option<&'a str>) -> Result<&'a str> {
+    arg.ok_or_else(|| MongrelQueryError::Schema(format!("expected PRAGMA {name}(<name>)")))
+}
+
+fn schema_version(db: &Arc<Database>) -> i64 {
+    db.table_names()
+        .into_iter()
+        .filter_map(|table| {
+            table_schema(db, &table)
+                .ok()
+                .map(|schema| schema.schema_id as i64)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+fn parse_optional_i64(value: Option<&str>) -> Result<Option<i64>> {
+    value
+        .map(|value| {
+            value
+                .trim()
+                .parse::<i64>()
+                .map_err(|e| MongrelQueryError::Schema(format!("invalid PRAGMA integer: {e}")))
+        })
+        .transpose()
+}
+
+fn db_pragma_file(db: &Arc<Database>) -> std::path::PathBuf {
+    db.root().join("_meta").join("sql_pragmas.json")
+}
+
+fn get_db_pragma_i64(db: &Arc<Database>, key: &str) -> Result<i64> {
+    let path = db_pragma_file(db);
+    let Ok(bytes) = fs::read(&path) else {
+        return Ok(0);
+    };
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| MongrelQueryError::Schema(e.to_string()))?;
+    Ok(value.get(key).and_then(|v| v.as_i64()).unwrap_or(0))
+}
+
+fn set_db_pragma_i64(db: &Arc<Database>, key: &str, value: i64) -> Result<()> {
+    let path = db_pragma_file(db);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| MongrelQueryError::Schema(e.to_string()))?;
+    }
+    let mut object = fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    object.insert(key.to_string(), serde_json::Value::from(value));
+    let bytes = serde_json::to_vec_pretty(&serde_json::Value::Object(object))
+        .map_err(|e| MongrelQueryError::Schema(e.to_string()))?;
+    fs::write(path, bytes).map_err(|e| MongrelQueryError::Schema(e.to_string()))
+}
+
+fn db_page_count(db: &Arc<Database>) -> Result<i64> {
+    let bytes = dir_size(db.root())?;
+    Ok(bytes.div_ceil(4096) as i64)
+}
+
+fn dir_size(path: &Path) -> Result<u64> {
+    let mut total = 0_u64;
+    let Ok(entries) = fs::read_dir(path) else {
+        return Ok(0);
+    };
+    for entry in entries {
+        let entry = entry.map_err(|e| MongrelQueryError::Schema(e.to_string()))?;
+        let metadata = entry
+            .metadata()
+            .map_err(|e| MongrelQueryError::Schema(e.to_string()))?;
+        if metadata.is_dir() {
+            total = total.saturating_add(dir_size(&entry.path())?);
+        } else {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    Ok(total)
+}
+
 fn describe_table(db: &Arc<Database>, table: &str) -> Result<RecordBatch> {
     let schema = table_schema(db, table)?;
     let names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
@@ -1786,30 +4017,759 @@ fn pragma_table_info(db: &Arc<Database>, table: &str) -> Result<RecordBatch> {
         .iter()
         .map(|c| format!("{:?}", c.ty))
         .collect();
-    let not_null: Vec<bool> = schema
+    let not_null: Vec<i64> = schema
         .columns
         .iter()
-        .map(|c| !c.flags.contains(ColumnFlags::NULLABLE))
+        .map(|c| i64::from(!c.flags.contains(ColumnFlags::NULLABLE)))
         .collect();
-    let pk: Vec<bool> = schema
+    let dflt_value: Vec<Option<String>> = schema.columns.iter().map(|_| None).collect();
+    let pk: Vec<i64> = schema
         .columns
         .iter()
-        .map(|c| c.flags.contains(ColumnFlags::PRIMARY_KEY))
+        .map(|c| i64::from(c.flags.contains(ColumnFlags::PRIMARY_KEY)))
         .collect();
     RecordBatch::try_new(
         Arc::new(ArrowSchema::new(vec![
             Field::new("cid", ArrowDataType::Int64, false),
             Field::new("name", ArrowDataType::Utf8, false),
             Field::new("type", ArrowDataType::Utf8, false),
-            Field::new("notnull", ArrowDataType::Boolean, false),
-            Field::new("pk", ArrowDataType::Boolean, false),
+            Field::new("notnull", ArrowDataType::Int64, false),
+            Field::new("dflt_value", ArrowDataType::Utf8, true),
+            Field::new("pk", ArrowDataType::Int64, false),
         ])),
         vec![
             Arc::new(Int64Array::from(cid)) as ArrayRef,
             Arc::new(StringArray::from(names)),
             Arc::new(StringArray::from(types)),
-            Arc::new(BooleanArray::from(not_null)),
-            Arc::new(BooleanArray::from(pk)),
+            Arc::new(Int64Array::from(not_null)),
+            Arc::new(StringArray::from(dflt_value)),
+            Arc::new(Int64Array::from(pk)),
+        ],
+    )
+    .map_err(|e| MongrelQueryError::Arrow(e.to_string()))
+}
+
+fn pragma_table_xinfo(db: &Arc<Database>, table: &str) -> Result<RecordBatch> {
+    let schema = table_schema(db, table)?;
+    let hidden_names = db
+        .external_table(table)
+        .map(|entry| entry.hidden_columns)
+        .unwrap_or_default();
+    let cid: Vec<i64> = (0..schema.columns.len()).map(|i| i as i64).collect();
+    let names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+    let types: Vec<String> = schema
+        .columns
+        .iter()
+        .map(|c| format!("{:?}", c.ty))
+        .collect();
+    let not_null: Vec<i64> = schema
+        .columns
+        .iter()
+        .map(|c| i64::from(!c.flags.contains(ColumnFlags::NULLABLE)))
+        .collect();
+    let dflt_value: Vec<Option<String>> = schema.columns.iter().map(|_| None).collect();
+    let pk: Vec<i64> = schema
+        .columns
+        .iter()
+        .map(|c| i64::from(c.flags.contains(ColumnFlags::PRIMARY_KEY)))
+        .collect();
+    let hidden: Vec<i64> = schema
+        .columns
+        .iter()
+        .map(|c| i64::from(hidden_names.iter().any(|name| name == &c.name)))
+        .collect();
+    RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("cid", ArrowDataType::Int64, false),
+            Field::new("name", ArrowDataType::Utf8, false),
+            Field::new("type", ArrowDataType::Utf8, false),
+            Field::new("notnull", ArrowDataType::Int64, false),
+            Field::new("dflt_value", ArrowDataType::Utf8, true),
+            Field::new("pk", ArrowDataType::Int64, false),
+            Field::new("hidden", ArrowDataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(cid)) as ArrayRef,
+            Arc::new(StringArray::from(names)),
+            Arc::new(StringArray::from(types)),
+            Arc::new(Int64Array::from(not_null)),
+            Arc::new(StringArray::from(dflt_value)),
+            Arc::new(Int64Array::from(pk)),
+            Arc::new(Int64Array::from(hidden)),
+        ],
+    )
+    .map_err(|e| MongrelQueryError::Arrow(e.to_string()))
+}
+
+fn pragma_table_list(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    filter: Option<&str>,
+) -> Result<RecordBatch> {
+    let mut schema_name = Vec::new();
+    let mut names = Vec::new();
+    let mut ty = Vec::new();
+    let mut ncol = Vec::new();
+    let mut wr = Vec::new();
+    let mut strict = Vec::new();
+    let filter = filter.map(str::to_ascii_lowercase);
+
+    for table in db.table_names() {
+        if filter
+            .as_deref()
+            .is_some_and(|needle| table.to_ascii_lowercase() != needle)
+        {
+            continue;
+        }
+        let table_schema = table_schema(db, &table)?;
+        schema_name.push("main".to_string());
+        names.push(table);
+        ty.push("table".to_string());
+        ncol.push(table_schema.columns.len() as i64);
+        wr.push(0_i64);
+        strict.push(0_i64);
+    }
+
+    for table in db.external_tables() {
+        if filter
+            .as_deref()
+            .is_some_and(|needle| table.name.to_ascii_lowercase() != needle)
+        {
+            continue;
+        }
+        schema_name.push("main".to_string());
+        names.push(table.name);
+        ty.push("external".to_string());
+        ncol.push(table.declared_schema.columns.len() as i64);
+        wr.push(0_i64);
+        strict.push(0_i64);
+    }
+
+    for (view, _) in session.views.lock().iter() {
+        if filter
+            .as_deref()
+            .is_some_and(|needle| view.to_ascii_lowercase() != needle)
+        {
+            continue;
+        }
+        schema_name.push("main".to_string());
+        names.push(view.clone());
+        ty.push("view".to_string());
+        ncol.push(0_i64);
+        wr.push(0_i64);
+        strict.push(0_i64);
+    }
+
+    let mut order = (0..names.len()).collect::<Vec<_>>();
+    order.sort_by(|a, b| names[*a].cmp(&names[*b]));
+    let schema_name: Vec<String> = order.iter().map(|i| schema_name[*i].clone()).collect();
+    let names: Vec<String> = order.iter().map(|i| names[*i].clone()).collect();
+    let ty: Vec<String> = order.iter().map(|i| ty[*i].clone()).collect();
+    let ncol: Vec<i64> = order.iter().map(|i| ncol[*i]).collect();
+    let wr: Vec<i64> = order.iter().map(|i| wr[*i]).collect();
+    let strict: Vec<i64> = order.iter().map(|i| strict[*i]).collect();
+
+    RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("schema", ArrowDataType::Utf8, false),
+            Field::new("name", ArrowDataType::Utf8, false),
+            Field::new("type", ArrowDataType::Utf8, false),
+            Field::new("ncol", ArrowDataType::Int64, false),
+            Field::new("wr", ArrowDataType::Int64, false),
+            Field::new("strict", ArrowDataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(schema_name)) as ArrayRef,
+            Arc::new(StringArray::from(names)),
+            Arc::new(StringArray::from(ty)),
+            Arc::new(Int64Array::from(ncol)),
+            Arc::new(Int64Array::from(wr)),
+            Arc::new(Int64Array::from(strict)),
+        ],
+    )
+    .map_err(|e| MongrelQueryError::Arrow(e.to_string()))
+}
+
+fn pragma_index_list(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    table: &str,
+) -> Result<RecordBatch> {
+    if let Some(entry) = db.external_table(table) {
+        let indexes = session.external_modules.external_table_indexes(&entry)?;
+        let seq: Vec<i64> = (0..indexes.len()).map(|i| i as i64).collect();
+        let names: Vec<String> = indexes.iter().map(|i| i.name.clone()).collect();
+        let unique: Vec<i64> = indexes.iter().map(|i| i64::from(i.unique)).collect();
+        let origin: Vec<String> = indexes.iter().map(|_| "m".to_string()).collect();
+        let partial: Vec<i64> = indexes.iter().map(|i| i64::from(i.partial)).collect();
+        return index_list_batch(seq, names, unique, origin, partial);
+    }
+    let schema = table_schema(db, table)?;
+    let seq: Vec<i64> = (0..schema.indexes.len()).map(|i| i as i64).collect();
+    let names: Vec<String> = schema.indexes.iter().map(|i| i.name.clone()).collect();
+    let unique: Vec<i64> = schema.indexes.iter().map(|_| 0).collect();
+    let origin: Vec<String> = schema.indexes.iter().map(|_| "c".to_string()).collect();
+    let partial: Vec<i64> = schema.indexes.iter().map(|_| 0).collect();
+    index_list_batch(seq, names, unique, origin, partial)
+}
+
+fn index_list_batch(
+    seq: Vec<i64>,
+    names: Vec<String>,
+    unique: Vec<i64>,
+    origin: Vec<String>,
+    partial: Vec<i64>,
+) -> Result<RecordBatch> {
+    RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("seq", ArrowDataType::Int64, false),
+            Field::new("name", ArrowDataType::Utf8, false),
+            Field::new("unique", ArrowDataType::Int64, false),
+            Field::new("origin", ArrowDataType::Utf8, false),
+            Field::new("partial", ArrowDataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(seq)) as ArrayRef,
+            Arc::new(StringArray::from(names)),
+            Arc::new(Int64Array::from(unique)),
+            Arc::new(StringArray::from(origin)),
+            Arc::new(Int64Array::from(partial)),
+        ],
+    )
+    .map_err(|e| MongrelQueryError::Arrow(e.to_string()))
+}
+
+fn pragma_index_xinfo(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    index: &str,
+) -> Result<RecordBatch> {
+    if let Some((entry, def)) = find_external_module_index(session, db, index)? {
+        return pragma_external_index_xinfo(&entry, &def);
+    }
+    let table = find_index_table(db, index)?.ok_or_else(|| {
+        MongrelQueryError::Schema(format!("index {index:?} does not exist in this database"))
+    })?;
+    let schema = table_schema(db, &table)?;
+    let defs = index_defs(&schema, index);
+    let seqno: Vec<i64> = (0..defs.len()).map(|i| i as i64).collect();
+    let cid: Vec<i64> = defs.iter().map(|idx| idx.column_id as i64).collect();
+    let names: Vec<String> = defs
+        .iter()
+        .map(|idx| column_name(&schema, idx.column_id))
+        .collect();
+    let desc: Vec<i64> = defs.iter().map(|_| 0_i64).collect();
+    let coll: Vec<String> = defs.iter().map(|_| "BINARY".to_string()).collect();
+    let key: Vec<i64> = defs.iter().map(|_| 1_i64).collect();
+    RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("seqno", ArrowDataType::Int64, false),
+            Field::new("cid", ArrowDataType::Int64, false),
+            Field::new("name", ArrowDataType::Utf8, false),
+            Field::new("desc", ArrowDataType::Int64, false),
+            Field::new("coll", ArrowDataType::Utf8, false),
+            Field::new("key", ArrowDataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(seqno)) as ArrayRef,
+            Arc::new(Int64Array::from(cid)),
+            Arc::new(StringArray::from(names)),
+            Arc::new(Int64Array::from(desc)),
+            Arc::new(StringArray::from(coll)),
+            Arc::new(Int64Array::from(key)),
+        ],
+    )
+    .map_err(|e| MongrelQueryError::Arrow(e.to_string()))
+}
+
+fn pragma_index_info(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    index: &str,
+) -> Result<RecordBatch> {
+    if let Some((entry, def)) = find_external_module_index(session, db, index)? {
+        return pragma_external_index_info(&entry, &def);
+    }
+    let table = find_index_table(db, index)?.ok_or_else(|| {
+        MongrelQueryError::Schema(format!("index {index:?} does not exist in this database"))
+    })?;
+    let schema = table_schema(db, &table)?;
+    let defs = index_defs(&schema, index);
+    let seqno: Vec<i64> = (0..defs.len()).map(|i| i as i64).collect();
+    let cid: Vec<i64> = defs.iter().map(|idx| idx.column_id as i64).collect();
+    let names: Vec<String> = defs
+        .iter()
+        .map(|idx| {
+            schema
+                .columns
+                .iter()
+                .find(|col| col.id == idx.column_id)
+                .map(|col| col.name.clone())
+                .unwrap_or_default()
+        })
+        .collect();
+    RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("seqno", ArrowDataType::Int64, false),
+            Field::new("cid", ArrowDataType::Int64, false),
+            Field::new("name", ArrowDataType::Utf8, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(seqno)) as ArrayRef,
+            Arc::new(Int64Array::from(cid)),
+            Arc::new(StringArray::from(names)),
+        ],
+    )
+    .map_err(|e| MongrelQueryError::Arrow(e.to_string()))
+}
+
+fn find_external_module_index(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    index: &str,
+) -> Result<Option<(ExternalTableEntry, ExternalModuleIndex)>> {
+    for entry in db.external_tables() {
+        if let Some(def) = session
+            .external_modules
+            .external_table_indexes(&entry)?
+            .into_iter()
+            .find(|def| def.name == index)
+        {
+            return Ok(Some((entry, def)));
+        }
+    }
+    Ok(None)
+}
+
+fn pragma_external_index_xinfo(
+    entry: &ExternalTableEntry,
+    def: &ExternalModuleIndex,
+) -> Result<RecordBatch> {
+    let seqno: Vec<i64> = (0..def.column_ids.len()).map(|i| i as i64).collect();
+    let cid: Vec<i64> = def.column_ids.iter().map(|id| *id as i64).collect();
+    let names: Vec<String> = def
+        .column_ids
+        .iter()
+        .map(|id| column_name(&entry.declared_schema, *id))
+        .collect();
+    let desc: Vec<i64> = def.column_ids.iter().map(|_| 0_i64).collect();
+    let coll: Vec<String> = def
+        .column_ids
+        .iter()
+        .map(|_| "BINARY".to_string())
+        .collect();
+    let key: Vec<i64> = def.column_ids.iter().map(|_| 1_i64).collect();
+    RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("seqno", ArrowDataType::Int64, false),
+            Field::new("cid", ArrowDataType::Int64, false),
+            Field::new("name", ArrowDataType::Utf8, false),
+            Field::new("desc", ArrowDataType::Int64, false),
+            Field::new("coll", ArrowDataType::Utf8, false),
+            Field::new("key", ArrowDataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(seqno)) as ArrayRef,
+            Arc::new(Int64Array::from(cid)),
+            Arc::new(StringArray::from(names)),
+            Arc::new(Int64Array::from(desc)),
+            Arc::new(StringArray::from(coll)),
+            Arc::new(Int64Array::from(key)),
+        ],
+    )
+    .map_err(|e| MongrelQueryError::Arrow(e.to_string()))
+}
+
+fn pragma_external_index_info(
+    entry: &ExternalTableEntry,
+    def: &ExternalModuleIndex,
+) -> Result<RecordBatch> {
+    let seqno: Vec<i64> = (0..def.column_ids.len()).map(|i| i as i64).collect();
+    let cid: Vec<i64> = def.column_ids.iter().map(|id| *id as i64).collect();
+    let names: Vec<String> = def
+        .column_ids
+        .iter()
+        .map(|id| column_name(&entry.declared_schema, *id))
+        .collect();
+    RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("seqno", ArrowDataType::Int64, false),
+            Field::new("cid", ArrowDataType::Int64, false),
+            Field::new("name", ArrowDataType::Utf8, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(seqno)) as ArrayRef,
+            Arc::new(Int64Array::from(cid)),
+            Arc::new(StringArray::from(names)),
+        ],
+    )
+    .map_err(|e| MongrelQueryError::Arrow(e.to_string()))
+}
+
+fn index_defs<'a>(schema: &'a CoreSchema, index: &str) -> Vec<&'a IndexDef> {
+    let prefix = format!("{index}_");
+    schema
+        .indexes
+        .iter()
+        .filter(|idx| idx.name == index || idx.name.starts_with(&prefix))
+        .collect()
+}
+
+fn pragma_foreign_key_list(db: &Arc<Database>, table: &str) -> Result<RecordBatch> {
+    let schema = table_schema(db, table)?;
+    let mut id = Vec::new();
+    let mut seq = Vec::new();
+    let mut ref_table = Vec::new();
+    let mut from = Vec::new();
+    let mut to = Vec::new();
+    let mut on_update = Vec::new();
+    let mut on_delete = Vec::new();
+    let mut match_kind = Vec::new();
+    for fk in &schema.constraints.foreign_keys {
+        let parent = table_schema(db, &fk.ref_table).ok();
+        for (i, (from_id, to_id)) in fk.columns.iter().zip(fk.ref_columns.iter()).enumerate() {
+            id.push(fk.id as i64);
+            seq.push(i as i64);
+            ref_table.push(fk.ref_table.clone());
+            from.push(column_name(&schema, *from_id));
+            to.push(
+                parent
+                    .as_ref()
+                    .map(|s| column_name(s, *to_id))
+                    .unwrap_or_else(|| to_id.to_string()),
+            );
+            on_update.push("NO ACTION".to_string());
+            on_delete.push(format_fk_action(fk.on_delete).to_string());
+            match_kind.push("NONE".to_string());
+        }
+    }
+    RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("id", ArrowDataType::Int64, false),
+            Field::new("seq", ArrowDataType::Int64, false),
+            Field::new("table", ArrowDataType::Utf8, false),
+            Field::new("from", ArrowDataType::Utf8, false),
+            Field::new("to", ArrowDataType::Utf8, false),
+            Field::new("on_update", ArrowDataType::Utf8, false),
+            Field::new("on_delete", ArrowDataType::Utf8, false),
+            Field::new("match", ArrowDataType::Utf8, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(id)) as ArrayRef,
+            Arc::new(Int64Array::from(seq)),
+            Arc::new(StringArray::from(ref_table)),
+            Arc::new(StringArray::from(from)),
+            Arc::new(StringArray::from(to)),
+            Arc::new(StringArray::from(on_update)),
+            Arc::new(StringArray::from(on_delete)),
+            Arc::new(StringArray::from(match_kind)),
+        ],
+    )
+    .map_err(|e| MongrelQueryError::Arrow(e.to_string()))
+}
+
+fn pragma_foreign_key_check(db: &Arc<Database>, table: Option<&str>) -> Result<RecordBatch> {
+    let mut child_table = Vec::new();
+    let mut rowid = Vec::new();
+    let mut parent_table = Vec::new();
+    let mut fkid = Vec::new();
+    let tables = match table {
+        Some(table) => vec![table.to_string()],
+        None => db.table_names(),
+    };
+
+    for table_name in tables {
+        let (schema, rows) = visible_rows(db, &table_name)?;
+        for fk in &schema.constraints.foreign_keys {
+            let Ok((_parent_schema, parent_rows)) = visible_rows(db, &fk.ref_table) else {
+                for row in &rows {
+                    if fk_row_is_checkable(row, &fk.columns) {
+                        child_table.push(table_name.clone());
+                        rowid.push(row.row_id.0 as i64);
+                        parent_table.push(fk.ref_table.clone());
+                        fkid.push(fk.id as i64);
+                    }
+                }
+                continue;
+            };
+            for row in &rows {
+                let values = fk
+                    .columns
+                    .iter()
+                    .map(|column| row.columns.get(column).cloned().unwrap_or(Value::Null))
+                    .collect::<Vec<_>>();
+                if values.iter().any(|value| matches!(value, Value::Null)) {
+                    continue;
+                }
+                let parent_exists = parent_rows.iter().any(|parent| {
+                    fk.ref_columns
+                        .iter()
+                        .zip(values.iter())
+                        .all(|(column, value)| {
+                            parent.columns.get(column).unwrap_or(&Value::Null) == value
+                        })
+                });
+                if !parent_exists {
+                    child_table.push(table_name.clone());
+                    rowid.push(row.row_id.0 as i64);
+                    parent_table.push(fk.ref_table.clone());
+                    fkid.push(fk.id as i64);
+                }
+            }
+        }
+    }
+
+    RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("table", ArrowDataType::Utf8, false),
+            Field::new("rowid", ArrowDataType::Int64, false),
+            Field::new("parent", ArrowDataType::Utf8, false),
+            Field::new("fkid", ArrowDataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(child_table)) as ArrayRef,
+            Arc::new(Int64Array::from(rowid)),
+            Arc::new(StringArray::from(parent_table)),
+            Arc::new(Int64Array::from(fkid)),
+        ],
+    )
+    .map_err(|e| MongrelQueryError::Arrow(e.to_string()))
+}
+
+fn fk_row_is_checkable(row: &Row, columns: &[u16]) -> bool {
+    columns
+        .iter()
+        .all(|column| !matches!(row.columns.get(column), None | Some(Value::Null)))
+}
+
+fn column_name(schema: &CoreSchema, id: u16) -> String {
+    schema
+        .columns
+        .iter()
+        .find(|col| col.id == id)
+        .map(|col| col.name.clone())
+        .unwrap_or_else(|| id.to_string())
+}
+
+fn format_fk_action(action: mongreldb_core::constraint::FkAction) -> &'static str {
+    match action {
+        mongreldb_core::constraint::FkAction::Restrict => "RESTRICT",
+        mongreldb_core::constraint::FkAction::Cascade => "CASCADE",
+        mongreldb_core::constraint::FkAction::SetNull => "SET NULL",
+    }
+}
+
+fn pragma_database_list(db: &Arc<Database>) -> Result<RecordBatch> {
+    RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("seq", ArrowDataType::Int64, false),
+            Field::new("name", ArrowDataType::Utf8, false),
+            Field::new("file", ArrowDataType::Utf8, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![0])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["main"])),
+            Arc::new(StringArray::from(vec![db.root().display().to_string()])),
+        ],
+    )
+    .map_err(|e| MongrelQueryError::Arrow(e.to_string()))
+}
+
+fn pragma_function_list() -> Result<RecordBatch> {
+    let mut rows = crate::extended_sql_functions::extended_sql_function_names()
+        .into_iter()
+        .filter(|name| {
+            *name != "json_each"
+                && *name != "json_tree"
+                && *name != "jsonb_each"
+                && *name != "jsonb_tree"
+                && *name != "series"
+        })
+        .map(|name| (name.to_string(), "s".to_string(), -1_i64))
+        .collect::<Vec<_>>();
+    rows.push(("ann_search".to_string(), "s".to_string(), 3));
+    rows.push(("sparse_match".to_string(), "s".to_string(), 3));
+    rows.push(("rtree_intersects".to_string(), "s".to_string(), 8));
+    rows.push(("json_each".to_string(), "t".to_string(), 2));
+    rows.push(("json_tree".to_string(), "t".to_string(), 2));
+    rows.push(("jsonb_each".to_string(), "t".to_string(), 2));
+    rows.push(("jsonb_tree".to_string(), "t".to_string(), 2));
+    rows.push(("series".to_string(), "t".to_string(), 3));
+    for (name, narg) in [
+        ("avg", 1),
+        ("count", -1),
+        ("group_concat", -1),
+        ("max", -1),
+        ("median", 1),
+        ("min", -1),
+        ("percentile", 2),
+        ("percentile_cont", 2),
+        ("percentile_disc", 2),
+        ("string_agg", 2),
+        ("sum", 1),
+        ("total", 1),
+    ] {
+        rows.push((name.to_string(), "w".to_string(), narg));
+    }
+    rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    let names = rows.iter().map(|r| r.0.clone()).collect::<Vec<_>>();
+    let builtin = rows.iter().map(|_| 1_i64).collect::<Vec<_>>();
+    let kind = rows.iter().map(|r| r.1.clone()).collect::<Vec<_>>();
+    let enc = rows.iter().map(|_| "utf8".to_string()).collect::<Vec<_>>();
+    let narg = rows.iter().map(|r| r.2).collect::<Vec<_>>();
+    let flags = rows.iter().map(|_| 0_i64).collect::<Vec<_>>();
+    RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("name", ArrowDataType::Utf8, false),
+            Field::new("builtin", ArrowDataType::Int64, false),
+            Field::new("type", ArrowDataType::Utf8, false),
+            Field::new("enc", ArrowDataType::Utf8, false),
+            Field::new("narg", ArrowDataType::Int64, false),
+            Field::new("flags", ArrowDataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(names)) as ArrayRef,
+            Arc::new(Int64Array::from(builtin)),
+            Arc::new(StringArray::from(kind)),
+            Arc::new(StringArray::from(enc)),
+            Arc::new(Int64Array::from(narg)),
+            Arc::new(Int64Array::from(flags)),
+        ],
+    )
+    .map_err(|e| MongrelQueryError::Arrow(e.to_string()))
+}
+
+fn pragma_module_list(session: &MongrelSession) -> Result<RecordBatch> {
+    strings_batch("name", session.external_modules.names())
+}
+
+fn pragma_trigger_list(db: &Arc<Database>) -> Result<RecordBatch> {
+    let triggers = db.triggers();
+    let seq = (0..triggers.len() as i64).collect::<Vec<_>>();
+    let names = triggers
+        .iter()
+        .map(|trigger| trigger.name.clone())
+        .collect::<Vec<_>>();
+    let target_type = triggers
+        .iter()
+        .map(|trigger| match &trigger.target {
+            TriggerTarget::Table(_) => "table".to_string(),
+            TriggerTarget::View(_) => "view".to_string(),
+        })
+        .collect::<Vec<_>>();
+    let target = triggers
+        .iter()
+        .map(|trigger| match &trigger.target {
+            TriggerTarget::Table(name) | TriggerTarget::View(name) => name.clone(),
+        })
+        .collect::<Vec<_>>();
+    let timing = triggers
+        .iter()
+        .map(|trigger| trigger_timing_name(trigger.timing).to_string())
+        .collect::<Vec<_>>();
+    let event = triggers
+        .iter()
+        .map(|trigger| trigger_event_name(trigger.event).to_string())
+        .collect::<Vec<_>>();
+    let enabled = triggers
+        .iter()
+        .map(|trigger| i64::from(trigger.enabled))
+        .collect::<Vec<_>>();
+    let created_epoch = triggers
+        .iter()
+        .map(|trigger| trigger.created_epoch as i64)
+        .collect::<Vec<_>>();
+    let updated_epoch = triggers
+        .iter()
+        .map(|trigger| trigger.updated_epoch as i64)
+        .collect::<Vec<_>>();
+    RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("seq", ArrowDataType::Int64, false),
+            Field::new("name", ArrowDataType::Utf8, false),
+            Field::new("target_type", ArrowDataType::Utf8, false),
+            Field::new("target", ArrowDataType::Utf8, false),
+            Field::new("timing", ArrowDataType::Utf8, false),
+            Field::new("event", ArrowDataType::Utf8, false),
+            Field::new("enabled", ArrowDataType::Int64, false),
+            Field::new("created_epoch", ArrowDataType::Int64, false),
+            Field::new("updated_epoch", ArrowDataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(seq)) as ArrayRef,
+            Arc::new(StringArray::from(names)),
+            Arc::new(StringArray::from(target_type)),
+            Arc::new(StringArray::from(target)),
+            Arc::new(StringArray::from(timing)),
+            Arc::new(StringArray::from(event)),
+            Arc::new(Int64Array::from(enabled)),
+            Arc::new(Int64Array::from(created_epoch)),
+            Arc::new(Int64Array::from(updated_epoch)),
+        ],
+    )
+    .map_err(|e| MongrelQueryError::Arrow(e.to_string()))
+}
+
+fn trigger_timing_name(timing: TriggerTiming) -> &'static str {
+    match timing {
+        TriggerTiming::Before => "BEFORE",
+        TriggerTiming::After => "AFTER",
+        TriggerTiming::InsteadOf => "INSTEAD OF",
+    }
+}
+
+fn trigger_event_name(event: TriggerEvent) -> &'static str {
+    match event {
+        TriggerEvent::Insert => "INSERT",
+        TriggerEvent::Update => "UPDATE",
+        TriggerEvent::Delete => "DELETE",
+    }
+}
+
+fn pragma_collation_list() -> Result<RecordBatch> {
+    RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("seq", ArrowDataType::Int64, false),
+            Field::new("name", ArrowDataType::Utf8, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![0_i64])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["BINARY"])),
+        ],
+    )
+    .map_err(|e| MongrelQueryError::Arrow(e.to_string()))
+}
+
+fn pragma_compile_options() -> Result<RecordBatch> {
+    strings_batch(
+        "compile_options",
+        vec![
+            "DATAFUSION_54".to_string(),
+            "EXTENDED_SQL_FUNCTIONS".to_string(),
+            "JSON_TABLE_FUNCTIONS".to_string(),
+            "LOG_STRUCTURED_STORAGE".to_string(),
+            "MVCC".to_string(),
+            "WAL".to_string(),
+        ],
+    )
+}
+
+fn pragma_wal_checkpoint(db: &Arc<Database>) -> Result<RecordBatch> {
+    for table in db.table_names() {
+        let handle = db.table(&table)?;
+        handle.lock().flush()?;
+    }
+    let _ = db.gc()?;
+    RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("busy", ArrowDataType::Int64, false),
+            Field::new("log", ArrowDataType::Int64, false),
+            Field::new("checkpointed", ArrowDataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![0_i64])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![0_i64])),
+            Arc::new(Int64Array::from(vec![0_i64])),
         ],
     )
     .map_err(|e| MongrelQueryError::Arrow(e.to_string()))
@@ -1833,6 +4793,40 @@ fn check_batch(db: &Arc<Database>) -> Result<RecordBatch> {
         ],
     )
     .map_err(|e| MongrelQueryError::Arrow(e.to_string()))
+}
+
+fn pragma_check_batch(db: &Arc<Database>, column_name: &str) -> Result<RecordBatch> {
+    let issues = db.check();
+    let values = if issues.is_empty() {
+        vec!["ok".to_string()]
+    } else {
+        issues
+            .iter()
+            .map(|issue| {
+                format!(
+                    "{}: {}: {}",
+                    issue.severity, issue.table_name, issue.description
+                )
+            })
+            .collect()
+    };
+    strings_batch(column_name, values)
+}
+
+fn int_batch(name: &str, value: i64) -> Result<RecordBatch> {
+    RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![Field::new(
+            name,
+            ArrowDataType::Int64,
+            false,
+        )])),
+        vec![Arc::new(Int64Array::from(vec![value])) as ArrayRef],
+    )
+    .map_err(|e| MongrelQueryError::Arrow(e.to_string()))
+}
+
+fn empty_batch() -> Result<RecordBatch> {
+    Ok(RecordBatch::new_empty(Arc::new(ArrowSchema::empty())))
 }
 
 fn strings_batch(name: &str, values: Vec<String>) -> Result<RecordBatch> {

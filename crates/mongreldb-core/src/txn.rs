@@ -8,7 +8,7 @@
 //! per-table manifests, and publishes the visible watermark. Rollback (or a
 //! dropped transaction) discards the staging and appends nothing durable.
 
-use crate::database::Database;
+use crate::database::{Database, ExternalTriggerBridge};
 use crate::epoch::{Epoch, Snapshot};
 use crate::error::{MongrelError, Result};
 use crate::memtable::Value;
@@ -61,6 +61,8 @@ pub struct Transaction<'db> {
     txn_id: u64,
     read: Snapshot,
     staging: Vec<(u64 /*table_id*/, Staged)>,
+    external_states: Vec<(String, Vec<u8>)>,
+    external_trigger_bridge: Option<&'db dyn ExternalTriggerBridge>,
     _active: Option<ActiveTxnGuard<'db>>,
 }
 
@@ -72,8 +74,18 @@ impl<'db> Transaction<'db> {
             txn_id,
             read,
             staging: Vec::new(),
+            external_states: Vec::new(),
+            external_trigger_bridge: None,
             _active: Some(guard),
         }
+    }
+
+    pub(crate) fn with_external_trigger_bridge(
+        mut self,
+        bridge: &'db dyn ExternalTriggerBridge,
+    ) -> Self {
+        self.external_trigger_bridge = Some(bridge);
+        self
     }
 
     pub fn read_snapshot(&self) -> Snapshot {
@@ -149,6 +161,18 @@ impl<'db> Transaction<'db> {
         let id = self.db.table_id(table)?;
         self.reject_after_truncate(id)?;
         self.staging.push((id, Staged::Delete(row_id)));
+        Ok(())
+    }
+
+    /// Stage opaque external-table module state. The payload is committed under
+    /// the same WAL `TxnCommit` as ordinary table writes.
+    pub fn put_external_state(&mut self, table: &str, state: Vec<u8>) -> Result<()> {
+        if self.db.external_table(table).is_none() {
+            return Err(MongrelError::NotFound(format!(
+                "external table {table:?} not found"
+            )));
+        }
+        self.external_states.push((table.to_string(), state));
         Ok(())
     }
 
@@ -297,8 +321,13 @@ impl<'db> Transaction<'db> {
 
     /// Commit: durably seal the staging under one epoch and publish it.
     pub fn commit(self) -> Result<Epoch> {
-        self.db
-            .commit_transaction(self.txn_id, self.read.epoch, self.staging)
+        self.db.commit_transaction_with_external_states(
+            self.txn_id,
+            self.read.epoch,
+            self.staging,
+            self.external_states,
+            self.external_trigger_bridge,
+        )
     }
 
     /// Rollback: discard staging. Nothing is appended to the WAL.

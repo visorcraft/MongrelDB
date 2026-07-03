@@ -10,18 +10,28 @@ use crate::catalog::{self, Catalog, CatalogEntry, TableState, META_DEK_LEN};
 use crate::engine::{SharedCtx, Table};
 use crate::epoch::{Epoch, EpochAuthority, Snapshot};
 use crate::error::{MongrelError, Result};
+use crate::external_table::ExternalTableEntry;
+use crate::memtable::Value;
 use crate::procedure::{
     ProcedureCallOutput, ProcedureCallResult, ProcedureCallRow, ProcedureCondition, ProcedureEntry,
     ProcedureStep, ProcedureValue, StoredProcedure,
 };
 use crate::retention::{OwnedSnapshotGuard, SnapshotGuard, SnapshotRegistry};
+use crate::rowid::RowId;
 use crate::schema::{AlterColumn, ColumnDef, Schema};
+use crate::trigger::{
+    StoredTrigger, TriggerCondition, TriggerConfig, TriggerEntry, TriggerEvent, TriggerExpr,
+    TriggerRaiseAction, TriggerStep, TriggerTarget, TriggerTiming, TriggerValue,
+};
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::Arc;
 
 pub const TABLES_DIR: &str = "tables";
+pub const VTAB_DIR: &str = "_vtab";
 pub const META_DIR: &str = "_meta";
 pub const KEYS_FILENAME: &str = "keys";
 
@@ -29,6 +39,72 @@ pub const KEYS_FILENAME: &str = "keys";
 /// than any table. `u64::MAX` is never allocated to a real table (the catalog
 /// mints ids from 0 upward), so [`Database::doctor`] can safely skip them.
 pub const WAL_TABLE_ID: u64 = u64::MAX;
+/// Sentinel `table_id` for `CheckIssue`s that concern external-table module
+/// state instead of an ordinary table.
+pub const EXTERNAL_TABLE_ID: u64 = u64::MAX - 1;
+
+#[derive(Debug, Clone)]
+pub enum ExternalTriggerWrite {
+    Insert {
+        table: String,
+        cells: Vec<(u16, Value)>,
+    },
+    UpdateByPk {
+        table: String,
+        pk: Value,
+        cells: Vec<(u16, Value)>,
+    },
+    DeleteByPk {
+        table: String,
+        pk: Value,
+    },
+}
+
+impl ExternalTriggerWrite {
+    fn table(&self) -> &str {
+        match self {
+            Self::Insert { table, .. }
+            | Self::UpdateByPk { table, .. }
+            | Self::DeleteByPk { table, .. } => table,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExternalTriggerBaseWrite {
+    Put {
+        table: String,
+        cells: Vec<(u16, Value)>,
+    },
+    Delete {
+        table: String,
+        row_id: RowId,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExternalTriggerWriteResult {
+    pub state: Vec<u8>,
+    pub base_writes: Vec<ExternalTriggerBaseWrite>,
+}
+
+impl ExternalTriggerWriteResult {
+    pub fn new(state: Vec<u8>) -> Self {
+        Self {
+            state,
+            base_writes: Vec::new(),
+        }
+    }
+}
+
+pub trait ExternalTriggerBridge {
+    fn apply_trigger_external_write(
+        &self,
+        entry: &ExternalTableEntry,
+        base_state: Vec<u8>,
+        op: ExternalTriggerWrite,
+    ) -> Result<ExternalTriggerWriteResult>;
+}
 
 /// A pending uniform-epoch run written during a large transaction (spec §8.5).
 struct SpilledRun {
@@ -39,6 +115,61 @@ struct SpilledRun {
     row_count: u64,
     min_rid: u64,
     max_rid: u64,
+}
+
+#[derive(Debug, Clone)]
+struct TriggerRowImage {
+    columns: HashMap<u16, Value>,
+}
+
+impl TriggerRowImage {
+    fn from_row(row: crate::memtable::Row) -> Self {
+        Self {
+            columns: row.columns,
+        }
+    }
+
+    fn from_cells(cells: &[(u16, Value)]) -> Self {
+        Self {
+            columns: cells.iter().cloned().collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct WriteEvent {
+    table: String,
+    kind: TriggerEvent,
+    old: Option<TriggerRowImage>,
+    new: Option<TriggerRowImage>,
+    changed_columns: Vec<u16>,
+    op_indices: Vec<usize>,
+    put_idx: Option<usize>,
+    trigger_stack: Vec<String>,
+}
+
+#[derive(Default)]
+struct TriggerExpansion {
+    before: Vec<(u64, crate::txn::Staged)>,
+    before_stacks: Vec<Vec<String>>,
+    before_external: Vec<ExternalTriggerWrite>,
+    after: Vec<(u64, crate::txn::Staged)>,
+    after_stacks: Vec<Vec<String>>,
+    after_external: Vec<ExternalTriggerWrite>,
+    ignored_indices: std::collections::BTreeSet<usize>,
+}
+
+struct TriggerProgramOutput<'a> {
+    added: &'a mut Vec<(u64, crate::txn::Staged)>,
+    added_stacks: &'a mut Vec<Vec<String>>,
+    added_external: &'a mut Vec<ExternalTriggerWrite>,
+    ignored_indices: &'a mut std::collections::BTreeSet<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TriggerProgramOutcome {
+    Continue,
+    Ignore,
 }
 
 /// An integrity issue found by [`Database::check`] (spec §16).
@@ -104,6 +235,8 @@ pub struct Database {
     /// in-flight spill. `None` in production.
     #[doc(hidden)]
     spill_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    trigger_recursive: AtomicBool,
+    trigger_max_depth: AtomicU32,
 }
 
 impl Database {
@@ -331,6 +464,8 @@ impl Database {
             spill_threshold: std::sync::atomic::AtomicU64::new(64 * 1024 * 1024),
             active_spills: Arc::new(crate::retention::ActiveSpills::new()),
             spill_hook: Mutex::new(None),
+            trigger_recursive: AtomicBool::new(TriggerConfig::default().recursive_triggers),
+            trigger_max_depth: AtomicU32::new(TriggerConfig::default().max_depth),
         })
     }
 
@@ -467,6 +602,217 @@ impl Database {
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
         self.advance_visible(epoch);
         Ok(())
+    }
+
+    pub fn triggers(&self) -> Vec<StoredTrigger> {
+        self.catalog
+            .read()
+            .triggers
+            .iter()
+            .map(|t| t.trigger.clone())
+            .collect()
+    }
+
+    pub fn trigger(&self, name: &str) -> Option<StoredTrigger> {
+        self.catalog
+            .read()
+            .triggers
+            .iter()
+            .find(|t| t.trigger.name == name)
+            .map(|t| t.trigger.clone())
+    }
+
+    pub fn create_trigger(&self, mut trigger: StoredTrigger) -> Result<StoredTrigger> {
+        let _g = self.ddl_lock.lock();
+        trigger.validate()?;
+        self.validate_trigger_references(&trigger)?;
+        {
+            let cat = self.catalog.read();
+            if cat.triggers.iter().any(|t| t.trigger.name == trigger.name) {
+                return Err(MongrelError::InvalidArgument(format!(
+                    "trigger {:?} already exists",
+                    trigger.name
+                )));
+            }
+        }
+        let commit_lock = Arc::clone(&self.commit_lock);
+        let _c = commit_lock.lock();
+        let epoch = self.epoch.bump_assigned();
+        trigger.created_epoch = epoch.0;
+        trigger.updated_epoch = epoch.0;
+        {
+            let mut cat = self.catalog.write();
+            cat.triggers.push(TriggerEntry::from(trigger.clone()));
+            cat.db_epoch = epoch.0;
+        }
+        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+        self.advance_visible(epoch);
+        Ok(trigger)
+    }
+
+    pub fn create_or_replace_trigger(&self, trigger: StoredTrigger) -> Result<StoredTrigger> {
+        let _g = self.ddl_lock.lock();
+        trigger.validate()?;
+        self.validate_trigger_references(&trigger)?;
+        let commit_lock = Arc::clone(&self.commit_lock);
+        let _c = commit_lock.lock();
+        let epoch = self.epoch.bump_assigned();
+        let replaced = {
+            let mut cat = self.catalog.write();
+            let next = match cat
+                .triggers
+                .iter()
+                .position(|t| t.trigger.name == trigger.name)
+            {
+                Some(idx) => {
+                    let next = cat.triggers[idx]
+                        .trigger
+                        .replaced(trigger.clone(), epoch.0)?;
+                    cat.triggers[idx] = TriggerEntry::from(next.clone());
+                    next
+                }
+                None => {
+                    let mut next = trigger;
+                    next.created_epoch = epoch.0;
+                    next.updated_epoch = epoch.0;
+                    cat.triggers.push(TriggerEntry::from(next.clone()));
+                    next
+                }
+            };
+            cat.db_epoch = epoch.0;
+            next
+        };
+        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+        self.advance_visible(epoch);
+        Ok(replaced)
+    }
+
+    pub fn drop_trigger(&self, name: &str) -> Result<()> {
+        let _g = self.ddl_lock.lock();
+        let commit_lock = Arc::clone(&self.commit_lock);
+        let _c = commit_lock.lock();
+        let epoch = self.epoch.bump_assigned();
+        {
+            let mut cat = self.catalog.write();
+            let before = cat.triggers.len();
+            cat.triggers.retain(|t| t.trigger.name != name);
+            if cat.triggers.len() == before {
+                return Err(MongrelError::NotFound(format!(
+                    "trigger {name:?} not found"
+                )));
+            }
+            cat.db_epoch = epoch.0;
+        }
+        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+        self.advance_visible(epoch);
+        Ok(())
+    }
+
+    pub fn external_tables(&self) -> Vec<ExternalTableEntry> {
+        self.catalog.read().external_tables.clone()
+    }
+
+    pub fn external_table(&self, name: &str) -> Option<ExternalTableEntry> {
+        self.catalog
+            .read()
+            .external_tables
+            .iter()
+            .find(|t| t.name == name)
+            .cloned()
+    }
+
+    pub fn create_external_table(
+        &self,
+        mut entry: ExternalTableEntry,
+    ) -> Result<ExternalTableEntry> {
+        let _g = self.ddl_lock.lock();
+        entry.validate()?;
+        {
+            let cat = self.catalog.read();
+            if cat.live(&entry.name).is_some()
+                || cat.external_tables.iter().any(|t| t.name == entry.name)
+            {
+                return Err(MongrelError::InvalidArgument(format!(
+                    "table {:?} already exists",
+                    entry.name
+                )));
+            }
+        }
+        let commit_lock = Arc::clone(&self.commit_lock);
+        let _c = commit_lock.lock();
+        let epoch = self.epoch.bump_assigned();
+        entry.created_epoch = epoch.0;
+        {
+            let mut cat = self.catalog.write();
+            cat.external_tables.push(entry.clone());
+            cat.db_epoch = epoch.0;
+        }
+        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+        self.advance_visible(epoch);
+        Ok(entry)
+    }
+
+    pub fn drop_external_table(&self, name: &str) -> Result<()> {
+        let _g = self.ddl_lock.lock();
+        let commit_lock = Arc::clone(&self.commit_lock);
+        let _c = commit_lock.lock();
+        let epoch = self.epoch.bump_assigned();
+        {
+            let mut cat = self.catalog.write();
+            let before = cat.external_tables.len();
+            cat.external_tables.retain(|t| t.name != name);
+            if cat.external_tables.len() == before {
+                return Err(MongrelError::NotFound(format!(
+                    "external table {name:?} not found"
+                )));
+            }
+            cat.db_epoch = epoch.0;
+        }
+        let state_dir = self.root.join(VTAB_DIR).join(name);
+        if state_dir.exists() {
+            std::fs::remove_dir_all(state_dir)?;
+        }
+        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+        self.advance_visible(epoch);
+        Ok(())
+    }
+
+    pub fn commit_external_table_state(&self, name: &str, state: &[u8]) -> Result<Epoch> {
+        let txn_id = self.alloc_txn_id();
+        self.commit_transaction_with_external_states(
+            txn_id,
+            self.epoch.visible(),
+            Vec::new(),
+            vec![(name.to_string(), state.to_vec())],
+            None,
+        )
+    }
+
+    pub fn trigger_config(&self) -> TriggerConfig {
+        use std::sync::atomic::Ordering;
+        TriggerConfig {
+            recursive_triggers: self.trigger_recursive.load(Ordering::Relaxed),
+            max_depth: self.trigger_max_depth.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn set_trigger_config(&self, config: TriggerConfig) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        if config.max_depth == 0 {
+            return Err(MongrelError::InvalidArgument(
+                "trigger max_depth must be greater than 0".into(),
+            ));
+        }
+        self.trigger_recursive
+            .store(config.recursive_triggers, Ordering::Relaxed);
+        self.trigger_max_depth
+            .store(config.max_depth, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub fn set_recursive_triggers(&self, recursive: bool) {
+        use std::sync::atomic::Ordering;
+        self.trigger_recursive.store(recursive, Ordering::Relaxed);
     }
 
     pub fn call_procedure(
@@ -694,11 +1040,63 @@ impl Database {
         Ok(())
     }
 
+    fn validate_trigger_references(&self, trigger: &StoredTrigger) -> Result<()> {
+        let cat = self.catalog.read();
+        let target_schema = match &trigger.target {
+            TriggerTarget::Table(target_name) => cat
+                .live(target_name)
+                .ok_or_else(|| {
+                    MongrelError::InvalidArgument(format!(
+                        "trigger {:?} references unknown target table {target_name:?}",
+                        trigger.name
+                    ))
+                })?
+                .schema
+                .clone(),
+            TriggerTarget::View(_) => Schema {
+                columns: trigger.target_columns.clone(),
+                ..Schema::default()
+            },
+        };
+        for col in &trigger.update_of {
+            if target_schema.column(col).is_none() {
+                return Err(MongrelError::InvalidArgument(format!(
+                    "trigger {:?} UPDATE OF references unknown column {col:?}",
+                    trigger.name
+                )));
+            }
+        }
+        if let Some(expr) = &trigger.when {
+            validate_trigger_expr(expr, &target_schema, trigger.event)?;
+        }
+        for step in &trigger.program.steps {
+            if matches!(step, TriggerStep::SetNew { .. }) && trigger.timing != TriggerTiming::Before
+            {
+                return Err(MongrelError::InvalidArgument(
+                    "SetNew trigger steps are only valid in BEFORE triggers".into(),
+                ));
+            }
+            validate_trigger_step(step, &cat, &target_schema, trigger.event)?;
+        }
+        Ok(())
+    }
+
     /// Begin a new transaction reading at the current visible epoch.
     pub fn begin(&self) -> crate::txn::Transaction<'_> {
         let txn_id = self.alloc_txn_id();
         let read = Snapshot::at(self.epoch.visible());
         crate::txn::Transaction::new(self, txn_id, read)
+    }
+
+    /// Begin a transaction whose trigger programs may route external-table DML
+    /// through an application/query-layer module bridge.
+    pub fn begin_with_external_trigger_bridge<'a>(
+        &'a self,
+        bridge: &'a dyn ExternalTriggerBridge,
+    ) -> crate::txn::Transaction<'a> {
+        let txn_id = self.alloc_txn_id();
+        let read = Snapshot::at(self.epoch.visible());
+        crate::txn::Transaction::new(self, txn_id, read).with_external_trigger_bridge(bridge)
     }
 
     /// Run `f` in a transaction; commit on `Ok`, rollback on `Err`.
@@ -719,10 +1117,661 @@ impl Database {
         }
     }
 
+    /// Run `f` in a transaction with an external-trigger bridge; commit on
+    /// `Ok`, rollback on `Err`.
+    pub fn transaction_with_external_trigger_bridge<'a, T>(
+        &'a self,
+        bridge: &'a dyn ExternalTriggerBridge,
+        f: impl FnOnce(&mut crate::txn::Transaction) -> Result<T>,
+    ) -> Result<T> {
+        let mut tx = self.begin_with_external_trigger_bridge(bridge);
+        match f(&mut tx) {
+            Ok(out) => {
+                tx.commit()?;
+                Ok(out)
+            }
+            Err(e) => {
+                tx.rollback();
+                Err(e)
+            }
+        }
+    }
+
     /// Register a txn in `ActiveTxns` (spec §9.2, review fix #12). Called from
     /// `Transaction::new` so registration happens **before** any read.
     pub(crate) fn register_active(&self, epoch: Epoch) -> crate::txn::ActiveTxnGuard<'_> {
         self.active_txns.register(epoch)
+    }
+
+    fn fill_auto_increment_for_staging(
+        &self,
+        staging: &mut [(u64, crate::txn::Staged)],
+    ) -> Result<()> {
+        let tables = self.tables.read();
+        for (table_id, staged) in staging {
+            if let crate::txn::Staged::Put(cells) = staged {
+                if let Some(handle) = tables.get(table_id) {
+                    let mut t = handle.lock();
+                    t.fill_auto_inc(cells)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn expand_table_triggers(
+        &self,
+        staging: &mut Vec<(u64, crate::txn::Staged)>,
+        read_epoch: Epoch,
+        external_trigger_bridge: Option<&dyn ExternalTriggerBridge>,
+        external_states: &mut Vec<(String, Vec<u8>)>,
+    ) -> Result<()> {
+        let mut external_writes = Vec::new();
+        let config = self.trigger_config();
+        if config.recursive_triggers {
+            let chunk = std::mem::take(staging);
+            let stacks = vec![Vec::new(); chunk.len()];
+            *staging = self.expand_trigger_chunk(
+                chunk,
+                stacks,
+                read_epoch,
+                0,
+                config.max_depth,
+                &mut external_writes,
+            )?;
+            self.apply_external_trigger_writes(
+                external_writes,
+                external_trigger_bridge,
+                external_states,
+                staging,
+            )?;
+            return Ok(());
+        }
+
+        let mut expansion = self.expand_table_triggers_once(staging, read_epoch, None)?;
+        if !expansion.before.is_empty() {
+            let mut final_staging = expansion.before;
+            final_staging.extend(filter_ignored_staging(
+                std::mem::take(staging),
+                &expansion.ignored_indices,
+            ));
+            *staging = final_staging;
+        } else if !expansion.ignored_indices.is_empty() {
+            *staging = filter_ignored_staging(std::mem::take(staging), &expansion.ignored_indices);
+        }
+        staging.append(&mut expansion.after);
+        external_writes.append(&mut expansion.before_external);
+        external_writes.append(&mut expansion.after_external);
+        self.apply_external_trigger_writes(
+            external_writes,
+            external_trigger_bridge,
+            external_states,
+            staging,
+        )?;
+        Ok(())
+    }
+
+    fn expand_trigger_chunk(
+        &self,
+        mut chunk: Vec<(u64, crate::txn::Staged)>,
+        stacks: Vec<Vec<String>>,
+        read_epoch: Epoch,
+        depth: u32,
+        max_depth: u32,
+        external_writes: &mut Vec<ExternalTriggerWrite>,
+    ) -> Result<Vec<(u64, crate::txn::Staged)>> {
+        if chunk.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.fill_auto_increment_for_staging(&mut chunk)?;
+        let expansion = self.expand_table_triggers_once(&mut chunk, read_epoch, Some(&stacks))?;
+        if depth >= max_depth && (!expansion.before.is_empty() || !expansion.after.is_empty()) {
+            let stack = expansion
+                .before_stacks
+                .first()
+                .or_else(|| expansion.after_stacks.first())
+                .cloned()
+                .unwrap_or_default();
+            return Err(MongrelError::Conflict(format!(
+                "trigger recursion exceeded max depth {max_depth}; trigger stack: {}",
+                Self::format_trigger_stack(&stack)
+            )));
+        }
+
+        let mut out = Vec::new();
+        external_writes.extend(expansion.before_external);
+        out.extend(self.expand_trigger_chunk(
+            expansion.before,
+            expansion.before_stacks,
+            read_epoch,
+            depth + 1,
+            max_depth,
+            external_writes,
+        )?);
+        out.extend(filter_ignored_staging(chunk, &expansion.ignored_indices));
+        external_writes.extend(expansion.after_external);
+        out.extend(self.expand_trigger_chunk(
+            expansion.after,
+            expansion.after_stacks,
+            read_epoch,
+            depth + 1,
+            max_depth,
+            external_writes,
+        )?);
+        Ok(out)
+    }
+
+    fn apply_external_trigger_writes(
+        &self,
+        writes: Vec<ExternalTriggerWrite>,
+        bridge: Option<&dyn ExternalTriggerBridge>,
+        external_states: &mut Vec<(String, Vec<u8>)>,
+        staging: &mut Vec<(u64, crate::txn::Staged)>,
+    ) -> Result<()> {
+        if writes.is_empty() {
+            return Ok(());
+        }
+        let bridge = bridge.ok_or_else(|| {
+            MongrelError::InvalidArgument(
+                "trigger program wrote an external table, but this transaction has no external trigger bridge".into(),
+            )
+        })?;
+        for write in writes {
+            let table = write.table().to_string();
+            let entry = self.external_table(&table).ok_or_else(|| {
+                MongrelError::NotFound(format!("external table {table:?} not found"))
+            })?;
+            let base_state = current_external_state_bytes(&self.root, external_states, &table)?;
+            let result = bridge.apply_trigger_external_write(&entry, base_state, write)?;
+            external_states.push((table, result.state));
+            for base_write in result.base_writes {
+                match base_write {
+                    ExternalTriggerBaseWrite::Put { table, cells } => {
+                        let table_id = self.table_id(&table)?;
+                        staging.push((table_id, crate::txn::Staged::Put(cells)));
+                    }
+                    ExternalTriggerBaseWrite::Delete { table, row_id } => {
+                        let table_id = self.table_id(&table)?;
+                        staging.push((table_id, crate::txn::Staged::Delete(row_id)));
+                    }
+                }
+            }
+        }
+        dedup_external_states_in_place(external_states);
+        Ok(())
+    }
+
+    fn expand_table_triggers_once(
+        &self,
+        staging: &mut Vec<(u64, crate::txn::Staged)>,
+        read_epoch: Epoch,
+        trigger_stacks: Option<&[Vec<String>]>,
+    ) -> Result<TriggerExpansion> {
+        let triggers: Vec<StoredTrigger> = self
+            .catalog
+            .read()
+            .triggers
+            .iter()
+            .filter(|entry| {
+                entry.trigger.enabled
+                    && matches!(
+                        entry.trigger.timing,
+                        TriggerTiming::Before | TriggerTiming::After
+                    )
+                    && matches!(entry.trigger.target, TriggerTarget::Table(_))
+            })
+            .map(|entry| entry.trigger.clone())
+            .collect();
+        if triggers.is_empty() || staging.is_empty() {
+            return Ok(TriggerExpansion::default());
+        }
+
+        let before_triggers = triggers
+            .iter()
+            .filter(|trigger| trigger.timing == TriggerTiming::Before)
+            .cloned()
+            .collect::<Vec<_>>();
+        let after_triggers = triggers
+            .iter()
+            .filter(|trigger| trigger.timing == TriggerTiming::After)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let mut before_added = Vec::new();
+        let mut before_stacks = Vec::new();
+        let mut before_external = Vec::new();
+        let mut ignored_indices = std::collections::BTreeSet::new();
+        if !before_triggers.is_empty() {
+            let before_events =
+                self.trigger_events_for_staging(staging, read_epoch, trigger_stacks)?;
+            let mut out = TriggerProgramOutput {
+                added: &mut before_added,
+                added_stacks: &mut before_stacks,
+                added_external: &mut before_external,
+                ignored_indices: &mut ignored_indices,
+            };
+            self.execute_triggers_for_events(
+                &before_triggers,
+                &before_events,
+                Some(staging),
+                &mut out,
+            )?;
+        }
+
+        let after_events = if after_triggers.is_empty() {
+            Vec::new()
+        } else {
+            self.trigger_events_for_staging(staging, read_epoch, trigger_stacks)?
+                .into_iter()
+                .filter(|event| {
+                    !event
+                        .op_indices
+                        .iter()
+                        .any(|idx| ignored_indices.contains(idx))
+                })
+                .collect()
+        };
+
+        let mut after_added = Vec::new();
+        let mut after_stacks = Vec::new();
+        let mut after_external = Vec::new();
+        let mut out = TriggerProgramOutput {
+            added: &mut after_added,
+            added_stacks: &mut after_stacks,
+            added_external: &mut after_external,
+            ignored_indices: &mut ignored_indices,
+        };
+        self.execute_triggers_for_events(&after_triggers, &after_events, None, &mut out)?;
+        Ok(TriggerExpansion {
+            before: before_added,
+            before_stacks,
+            before_external,
+            after: after_added,
+            after_stacks,
+            after_external,
+            ignored_indices,
+        })
+    }
+
+    fn execute_triggers_for_events(
+        &self,
+        triggers: &[StoredTrigger],
+        events: &[WriteEvent],
+        mut staging: Option<&mut Vec<(u64, crate::txn::Staged)>>,
+        out: &mut TriggerProgramOutput<'_>,
+    ) -> Result<()> {
+        for event in events {
+            for trigger in triggers {
+                if event
+                    .op_indices
+                    .iter()
+                    .any(|idx| out.ignored_indices.contains(idx))
+                {
+                    break;
+                }
+                let matches = {
+                    let cat = self.catalog.read();
+                    trigger_matches_event(trigger, event, &cat)?
+                };
+                if !matches {
+                    continue;
+                }
+                if let Some(when) = &trigger.when {
+                    if !eval_trigger_expr(when, event)? {
+                        continue;
+                    }
+                }
+                let trigger_stack = Self::trigger_stack_with(&event.trigger_stack, &trigger.name);
+                if event.trigger_stack.iter().any(|name| name == &trigger.name) {
+                    return Err(MongrelError::Conflict(format!(
+                        "trigger recursion cycle detected; trigger stack: {}",
+                        Self::format_trigger_stack(&trigger_stack)
+                    )));
+                }
+                let outcome = match staging.as_mut() {
+                    Some(staging) => self.execute_trigger_program(
+                        trigger,
+                        event,
+                        Some(&mut **staging),
+                        out,
+                        &trigger_stack,
+                    )?,
+                    None => {
+                        self.execute_trigger_program(trigger, event, None, out, &trigger_stack)?
+                    }
+                };
+                if outcome == TriggerProgramOutcome::Ignore {
+                    out.ignored_indices.extend(event.op_indices.iter().copied());
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn trigger_events_for_staging(
+        &self,
+        staging: &[(u64, crate::txn::Staged)],
+        read_epoch: Epoch,
+        trigger_stacks: Option<&[Vec<String>]>,
+    ) -> Result<Vec<WriteEvent>> {
+        use crate::txn::Staged;
+        use std::collections::{HashMap, VecDeque};
+
+        let snapshot = Snapshot::at(read_epoch);
+        let cat = self.catalog.read();
+        let mut table_names = HashMap::new();
+        let mut table_schemas = HashMap::new();
+        for entry in cat
+            .tables
+            .iter()
+            .filter(|entry| matches!(entry.state, TableState::Live))
+        {
+            table_names.insert(entry.table_id, entry.name.clone());
+            table_schemas.insert(entry.table_id, entry.schema.clone());
+        }
+        drop(cat);
+
+        let mut old_rows: HashMap<usize, TriggerRowImage> = HashMap::new();
+        let mut delete_by_key: HashMap<(u64, Vec<u8>), VecDeque<usize>> = HashMap::new();
+        let mut put_by_key: HashMap<(u64, Vec<u8>), VecDeque<usize>> = HashMap::new();
+
+        for (idx, (table_id, staged)) in staging.iter().enumerate() {
+            let Some(schema) = table_schemas.get(table_id) else {
+                continue;
+            };
+            let Some(pk) = schema.primary_key() else {
+                continue;
+            };
+            match staged {
+                Staged::Delete(row_id) => {
+                    let handle = self.table_by_id(*table_id)?;
+                    let Some(row) = handle.lock().get(*row_id, snapshot) else {
+                        continue;
+                    };
+                    let Some(pk_value) = row.columns.get(&pk.id) else {
+                        continue;
+                    };
+                    old_rows.insert(idx, TriggerRowImage::from_row(row.clone()));
+                    delete_by_key
+                        .entry((*table_id, pk_value.encode_key()))
+                        .or_default()
+                        .push_back(idx);
+                }
+                Staged::Put(cells) => {
+                    if let Some((_, value)) = cells.iter().find(|(id, _)| *id == pk.id) {
+                        put_by_key
+                            .entry((*table_id, value.encode_key()))
+                            .or_default()
+                            .push_back(idx);
+                    }
+                }
+                Staged::Truncate => {}
+            }
+        }
+
+        let mut paired_delete = std::collections::HashSet::new();
+        let mut paired_put = std::collections::HashSet::new();
+        let mut events = Vec::new();
+
+        for (key, deletes) in delete_by_key.iter_mut() {
+            let Some(puts) = put_by_key.get_mut(key) else {
+                continue;
+            };
+            while let (Some(delete_idx), Some(put_idx)) = (deletes.pop_front(), puts.pop_front()) {
+                paired_delete.insert(delete_idx);
+                paired_put.insert(put_idx);
+                let (table_id, _) = &staging[put_idx];
+                let Some(table_name) = table_names.get(table_id).cloned() else {
+                    continue;
+                };
+                let old = old_rows.get(&delete_idx).cloned();
+                let new = match &staging[put_idx].1 {
+                    Staged::Put(cells) => Some(TriggerRowImage::from_cells(cells)),
+                    _ => None,
+                };
+                let changed_columns = changed_columns(old.as_ref(), new.as_ref());
+                events.push(WriteEvent {
+                    table: table_name,
+                    kind: TriggerEvent::Update,
+                    old,
+                    new,
+                    changed_columns,
+                    op_indices: vec![delete_idx, put_idx],
+                    put_idx: Some(put_idx),
+                    trigger_stack: Self::trigger_stack_for_indices(
+                        trigger_stacks,
+                        &[delete_idx, put_idx],
+                    ),
+                });
+            }
+        }
+
+        for (idx, (table_id, staged)) in staging.iter().enumerate() {
+            let Some(table_name) = table_names.get(table_id).cloned() else {
+                continue;
+            };
+            match staged {
+                Staged::Put(cells) if !paired_put.contains(&idx) => {
+                    let new = Some(TriggerRowImage::from_cells(cells));
+                    let changed_columns = cells.iter().map(|(id, _)| *id).collect();
+                    events.push(WriteEvent {
+                        table: table_name,
+                        kind: TriggerEvent::Insert,
+                        old: None,
+                        new,
+                        changed_columns,
+                        op_indices: vec![idx],
+                        put_idx: Some(idx),
+                        trigger_stack: Self::trigger_stack_for_indices(trigger_stacks, &[idx]),
+                    });
+                }
+                Staged::Delete(row_id) if !paired_delete.contains(&idx) => {
+                    let old = match old_rows.get(&idx).cloned() {
+                        Some(old) => Some(old),
+                        None => {
+                            let handle = self.table_by_id(*table_id)?;
+                            let row = handle.lock().get(*row_id, snapshot);
+                            row.map(TriggerRowImage::from_row)
+                        }
+                    };
+                    let Some(old) = old else {
+                        continue;
+                    };
+                    let changed_columns = old.columns.keys().copied().collect();
+                    events.push(WriteEvent {
+                        table: table_name,
+                        kind: TriggerEvent::Delete,
+                        old: Some(old),
+                        new: None,
+                        changed_columns,
+                        op_indices: vec![idx],
+                        put_idx: None,
+                        trigger_stack: Self::trigger_stack_for_indices(trigger_stacks, &[idx]),
+                    });
+                }
+                Staged::Truncate => {}
+                _ => {}
+            }
+        }
+
+        Ok(events)
+    }
+
+    fn execute_trigger_program(
+        &self,
+        trigger: &StoredTrigger,
+        event: &WriteEvent,
+        mut staging: Option<&mut Vec<(u64, crate::txn::Staged)>>,
+        out: &mut TriggerProgramOutput<'_>,
+        trigger_stack: &[String],
+    ) -> Result<TriggerProgramOutcome> {
+        let mut event = event.clone();
+        for step in &trigger.program.steps {
+            match step {
+                TriggerStep::SetNew { cells } => {
+                    if trigger.timing != TriggerTiming::Before {
+                        return Err(MongrelError::InvalidArgument(
+                            "SetNew trigger step is only valid in BEFORE triggers".into(),
+                        ));
+                    }
+                    let put_idx = event.put_idx.ok_or_else(|| {
+                        MongrelError::InvalidArgument(
+                            "SetNew trigger step requires INSERT or UPDATE NEW row".into(),
+                        )
+                    })?;
+                    let staging = staging.as_deref_mut().ok_or_else(|| {
+                        MongrelError::InvalidArgument(
+                            "SetNew trigger step requires mutable trigger staging".into(),
+                        )
+                    })?;
+                    let Some((_, crate::txn::Staged::Put(row_cells))) = staging.get_mut(put_idx)
+                    else {
+                        return Err(MongrelError::InvalidArgument(
+                            "SetNew trigger step target row is not mutable".into(),
+                        ));
+                    };
+                    for (column_id, value) in eval_trigger_cells(cells, &event)? {
+                        row_cells.retain(|(id, _)| *id != column_id);
+                        row_cells.push((column_id, value.clone()));
+                        if let Some(new) = &mut event.new {
+                            new.columns.insert(column_id, value);
+                        }
+                    }
+                    row_cells.sort_by_key(|(id, _)| *id);
+                }
+                TriggerStep::Insert { table, cells } => {
+                    let cells = eval_trigger_cells(cells, &event)?;
+                    if let Ok(table_id) = self.table_id(table) {
+                        out.added.push((table_id, crate::txn::Staged::Put(cells)));
+                        out.added_stacks.push(trigger_stack.to_vec());
+                    } else if self.external_table(table).is_some() {
+                        out.added_external.push(ExternalTriggerWrite::Insert {
+                            table: table.clone(),
+                            cells,
+                        });
+                    } else {
+                        return Err(MongrelError::NotFound(format!(
+                            "trigger {:?} insert target {table:?} not found",
+                            trigger.name
+                        )));
+                    }
+                }
+                TriggerStep::UpdateByPk { table, pk, cells } => {
+                    let pk = eval_trigger_value(pk, &event)?;
+                    let cells = eval_trigger_cells(cells, &event)?;
+                    if self.external_table(table).is_some() {
+                        out.added_external.push(ExternalTriggerWrite::UpdateByPk {
+                            table: table.clone(),
+                            pk,
+                            cells,
+                        });
+                    } else {
+                        let row_id = self
+                            .table(table)?
+                            .lock()
+                            .lookup_pk(&pk.encode_key())
+                            .ok_or_else(|| {
+                                MongrelError::NotFound(format!(
+                                    "trigger {:?} update target not found",
+                                    trigger.name
+                                ))
+                            })?;
+                        let handle = self.table(table)?;
+                        let snapshot = Snapshot::at(self.epoch.visible());
+                        let old = handle.lock().get(row_id, snapshot).ok_or_else(|| {
+                            MongrelError::NotFound(format!(
+                                "trigger {:?} update target not visible",
+                                trigger.name
+                            ))
+                        })?;
+                        let mut merged = old.columns;
+                        for (column_id, value) in cells {
+                            merged.insert(column_id, value);
+                        }
+                        out.added
+                            .push((self.table_id(table)?, crate::txn::Staged::Delete(row_id)));
+                        out.added_stacks.push(trigger_stack.to_vec());
+                        out.added.push((
+                            self.table_id(table)?,
+                            crate::txn::Staged::Put(merged.into_iter().collect()),
+                        ));
+                        out.added_stacks.push(trigger_stack.to_vec());
+                    }
+                }
+                TriggerStep::DeleteByPk { table, pk } => {
+                    let pk = eval_trigger_value(pk, &event)?;
+                    if self.external_table(table).is_some() {
+                        out.added_external.push(ExternalTriggerWrite::DeleteByPk {
+                            table: table.clone(),
+                            pk,
+                        });
+                    } else {
+                        let row_id = self
+                            .table(table)?
+                            .lock()
+                            .lookup_pk(&pk.encode_key())
+                            .ok_or_else(|| {
+                                MongrelError::NotFound(format!(
+                                    "trigger {:?} delete target not found",
+                                    trigger.name
+                                ))
+                            })?;
+                        out.added
+                            .push((self.table_id(table)?, crate::txn::Staged::Delete(row_id)));
+                        out.added_stacks.push(trigger_stack.to_vec());
+                    }
+                }
+                TriggerStep::Select { .. } => {}
+                TriggerStep::Raise { action, message } => match action {
+                    TriggerRaiseAction::Ignore => return Ok(TriggerProgramOutcome::Ignore),
+                    TriggerRaiseAction::Abort
+                    | TriggerRaiseAction::Fail
+                    | TriggerRaiseAction::Rollback => {
+                        let message = eval_trigger_value(message, &event)?;
+                        return Err(MongrelError::Conflict(format!(
+                            "trigger {:?} raised: {}; trigger stack: {}",
+                            trigger.name,
+                            trigger_message(message),
+                            Self::format_trigger_stack(trigger_stack)
+                        )));
+                    }
+                },
+            }
+        }
+        Ok(TriggerProgramOutcome::Continue)
+    }
+
+    fn trigger_stack_for_indices(stacks: Option<&[Vec<String>]>, indices: &[usize]) -> Vec<String> {
+        let Some(stacks) = stacks else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for idx in indices {
+            let Some(stack) = stacks.get(*idx) else {
+                continue;
+            };
+            for name in stack {
+                if !out.iter().any(|existing| existing == name) {
+                    out.push(name.clone());
+                }
+            }
+        }
+        out
+    }
+
+    fn trigger_stack_with(stack: &[String], trigger_name: &str) -> Vec<String> {
+        let mut out = stack.to_vec();
+        out.push(trigger_name.to_string());
+        out
+    }
+
+    fn format_trigger_stack(stack: &[String]) -> String {
+        if stack.is_empty() {
+            "<root>".into()
+        } else {
+            stack.join(" -> ")
+        }
     }
 
     /// Authoritatively validate every declared constraint on the staged write
@@ -1030,11 +2079,13 @@ impl Database {
     ///    with no epoch consumed; assign epoch, append data records + TxnCommit,
     ///    group-sync, record conflict keys.
     /// 3. Publish — apply to tables, advance visible in-order.
-    pub(crate) fn commit_transaction(
+    pub(crate) fn commit_transaction_with_external_states(
         &self,
         txn_id: u64,
         read_epoch: Epoch,
         mut staging: Vec<(u64, crate::txn::Staged)>,
+        external_states: Vec<(String, Vec<u8>)>,
+        external_trigger_bridge: Option<&dyn ExternalTriggerBridge>,
     ) -> Result<Epoch> {
         use crate::memtable::Row;
         use crate::txn::{Staged, StagedOp, WriteKey};
@@ -1048,8 +2099,36 @@ impl Database {
                 "database poisoned by fsync error".into(),
             ));
         }
+        let mut external_states = dedup_external_states(external_states);
+        if !external_states.is_empty() {
+            let cat = self.catalog.read();
+            for (name, _) in &external_states {
+                if !cat.external_tables.iter().any(|entry| entry.name == *name) {
+                    return Err(MongrelError::NotFound(format!(
+                        "external table {name:?} not found"
+                    )));
+                }
+            }
+        }
 
-        // ── 1. Prepare: derive write keys + allocate row ids ──
+        // ── 1. Prepare: fill generated values, expand triggers, validate, then
+        // derive write keys from the final atomic write set.
+        self.fill_auto_increment_for_staging(&mut staging)?;
+        self.expand_table_triggers(
+            &mut staging,
+            read_epoch,
+            external_trigger_bridge,
+            &mut external_states,
+        )?;
+        self.fill_auto_increment_for_staging(&mut staging)?;
+        external_states = dedup_external_states(external_states);
+
+        // Validate declarative constraints (unique / FK / check) under the read
+        // snapshot, outside the WAL mutex. Trigger-produced writes are included
+        // here, so the batch either satisfies every declared constraint or is
+        // rejected atomically.
+        self.validate_constraints(&mut staging, read_epoch)?;
+
         let write_keys = {
             let cat = self.catalog.read();
             let mut keys: Vec<WriteKey> = Vec::new();
@@ -1103,6 +2182,15 @@ impl Database {
                     }),
                 }
             }
+            for (name, _) in &external_states {
+                let mut h = DefaultHasher::new();
+                name.hash(&mut h);
+                keys.push(WriteKey::Unique {
+                    table_id: EXTERNAL_TABLE_ID,
+                    index_id: 0,
+                    key_hash: h.finish(),
+                });
+            }
             keys
         };
 
@@ -1121,30 +2209,6 @@ impl Database {
             ));
         }
         let pre_validate_version = self.conflicts.version();
-
-        // ── 1a½. Fill `AUTO_INCREMENT` columns for every staged put. This must
-        // happen before row ids are allocated and before rows are serialized
-        // (either as streamed Put records or spilled runs), so raw transaction
-        // users get engine-assigned ids just like single-table `put_returning`.
-        {
-            let tables = self.tables.read();
-            for (table_id, staged) in &mut staging {
-                if let Staged::Put(cells) = staged {
-                    if let Some(handle) = tables.get(table_id) {
-                        let mut t = handle.lock();
-                        t.fill_auto_inc(cells)?;
-                    }
-                }
-            }
-        }
-
-        // ── 1a¾. Validate declarative constraints (unique / FK / check) under
-        // the read snapshot, outside the WAL mutex. This is the authoritative
-        // server-side enforcement point: a batch that reaches commit either
-        // satisfies every declared constraint or is rejected atomically — no
-        // partial commit. Concurrent-txn uniqueness is additionally guarded by
-        // the `WriteKey::Unique` keys derived above.
-        self.validate_constraints(&mut staging, read_epoch)?;
 
         // ── 1b. Spill: if a table's staged puts exceed the threshold, write a
         // uniform-epoch pending run (spec §8.5). Rows in the run are NOT
@@ -1266,6 +2330,12 @@ impl Database {
             }
         }
 
+        let mut prepared_external = Vec::with_capacity(external_states.len());
+        for (name, state) in &external_states {
+            let pending = prepare_external_state_file(&self.root, name, state, txn_id)?;
+            prepared_external.push((name.clone(), state.clone(), pending));
+        }
+
         // ── 2. Sequencer: validate-first → assign → append → sync → record ──
         let added_runs: Vec<crate::wal::AddedRun> = spilled
             .iter()
@@ -1297,6 +2367,9 @@ impl Database {
                     if let Some(parent) = s.pending_path.parent() {
                         let _ = std::fs::remove_dir_all(parent);
                     }
+                }
+                for (_, _, pending) in &prepared_external {
+                    let _ = std::fs::remove_file(pending);
                 }
                 return Err(MongrelError::Conflict(
                     "write-write conflict (sequencer delta re-check)".into(),
@@ -1353,6 +2426,17 @@ impl Database {
                     }
                 }
                 applies.push((*table_id, ops));
+            }
+
+            for (name, state, _) in &prepared_external {
+                wal.append(
+                    txn_id,
+                    EXTERNAL_TABLE_ID,
+                    Op::ExternalTableState {
+                        name: name.clone(),
+                        state: state.clone(),
+                    },
+                )?;
             }
 
             let commit_seq = wal.append_commit(txn_id, new_epoch, &added_runs)?;
@@ -1415,6 +2499,9 @@ impl Database {
                     t.persist_manifest(new_epoch)?;
                 }
             }
+        }
+        for (name, _, pending) in &prepared_external {
+            publish_external_state_file(&self.root, name, pending)?;
         }
 
         self.advance_visible(new_epoch);
@@ -1705,6 +2792,12 @@ impl Database {
                 .find(|t| t.table_id == table_id)
                 .ok_or_else(|| MongrelError::NotFound(format!("table {name:?} not found")))?;
             entry.state = TableState::Dropped { at_epoch: epoch.0 };
+            cat.triggers.retain(|trigger| {
+                !matches!(
+                    &trigger.trigger.target,
+                    TriggerTarget::Table(target) if target == name
+                )
+            });
         }
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
         self.tables.write().remove(&table_id);
@@ -1789,6 +2882,14 @@ impl Database {
                 .find(|t| t.table_id == table_id)
                 .ok_or_else(|| MongrelError::NotFound(format!("table {name:?} not found")))?;
             entry.name = new_name.to_string();
+            for trigger in &mut cat.triggers {
+                if matches!(
+                    &trigger.trigger.target,
+                    TriggerTarget::Table(target) if target == name
+                ) {
+                    trigger.trigger = trigger.trigger.retarget_table(new_name, epoch.0)?;
+                }
+            }
         }
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
         // The in-memory table object is keyed by table_id, not name, so it does
@@ -1825,6 +2926,7 @@ impl Database {
             })?;
         let mut table = handle.lock();
         let column = table.prepare_alter_column(column_name, &change)?;
+        let renamed_column = (column.name != column_name).then(|| column.name.clone());
         if table
             .schema()
             .columns
@@ -1870,6 +2972,20 @@ impl Database {
                 .find(|t| t.table_id == table_id)
                 .ok_or_else(|| MongrelError::NotFound(format!("table {table_name:?} not found")))?;
             entry.schema = schema;
+            if let Some(new_column_name) = renamed_column {
+                for trigger in &mut cat.triggers {
+                    if matches!(
+                        &trigger.trigger.target,
+                        TriggerTarget::Table(target) if target == table_name
+                    ) {
+                        trigger.trigger = trigger.trigger.renamed_update_column(
+                            column_name,
+                            new_column_name.clone(),
+                            epoch.0,
+                        )?;
+                    }
+                }
+            }
         }
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
 
@@ -1935,6 +3051,32 @@ impl Database {
             }
         }
         drop(cat);
+
+        let external_names = {
+            let cat = self.catalog.read();
+            cat.external_tables
+                .iter()
+                .map(|entry| entry.name.clone())
+                .collect::<std::collections::HashSet<_>>()
+        };
+        let vtab_dir = self.root.join(VTAB_DIR);
+        if vtab_dir.exists() {
+            for entry in std::fs::read_dir(&vtab_dir)? {
+                let entry = entry?;
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if external_names.contains(name) {
+                    continue;
+                }
+                let path = entry.path();
+                if path.is_dir() {
+                    std::fs::remove_dir_all(path)?;
+                } else {
+                    std::fs::remove_file(path)?;
+                }
+                reclaimed += 1;
+            }
+        }
 
         // Reap compaction-superseded runs whose retire epoch no pinned snapshot
         // can still need (spec §6.4). Each table deletes its own retired files
@@ -2115,6 +3257,30 @@ impl Database {
             }
         }
 
+        let external_names = cat
+            .external_tables
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let vtab_dir = self.root.join(VTAB_DIR);
+        if let Ok(entries) = std::fs::read_dir(&vtab_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if !external_names.contains(name) {
+                    issues.push(CheckIssue {
+                        table_id: EXTERNAL_TABLE_ID,
+                        table_name: name.to_string(),
+                        severity: "warning".into(),
+                        description: format!(
+                            "orphan external table state entry {:?} not referenced by the catalog",
+                            entry.path()
+                        ),
+                    });
+                }
+            }
+        }
+
         // WAL retention / integrity invariant (spec §16): every on-disk WAL
         // segment must open (header magic + version, and the frame cipher must
         // be derivable for an encrypted WAL). A segment that won't open is
@@ -2146,7 +3312,11 @@ impl Database {
         // them disjoint). The admin must address WAL corruption manually.
         let bad_tables: std::collections::HashSet<u64> = issues
             .iter()
-            .filter(|i| i.severity == "error" && i.table_id != WAL_TABLE_ID)
+            .filter(|i| {
+                i.severity == "error"
+                    && i.table_id != WAL_TABLE_ID
+                    && i.table_id != EXTERNAL_TABLE_ID
+            })
             .map(|i| i.table_id)
             .collect();
         if bad_tables.is_empty() {
@@ -2195,6 +3365,99 @@ impl Database {
     pub(crate) fn snapshots(&self) -> &Arc<SnapshotRegistry> {
         &self.snapshots
     }
+}
+
+fn external_state_dir(root: &Path, name: &str) -> PathBuf {
+    root.join(VTAB_DIR).join(name)
+}
+
+fn filter_ignored_staging(
+    staging: Vec<(u64, crate::txn::Staged)>,
+    ignored_indices: &std::collections::BTreeSet<usize>,
+) -> Vec<(u64, crate::txn::Staged)> {
+    if ignored_indices.is_empty() {
+        return staging;
+    }
+    staging
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, staged)| (!ignored_indices.contains(&idx)).then_some(staged))
+        .collect()
+}
+
+fn external_state_file(root: &Path, name: &str) -> PathBuf {
+    external_state_dir(root, name).join("state.json")
+}
+
+fn read_external_state_file(root: &Path, name: &str) -> Result<Vec<u8>> {
+    let path = external_state_file(root, name);
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn current_external_state_bytes(
+    root: &Path,
+    external_states: &[(String, Vec<u8>)],
+    name: &str,
+) -> Result<Vec<u8>> {
+    for (table, state) in external_states.iter().rev() {
+        if table == name {
+            return Ok(state.clone());
+        }
+    }
+    read_external_state_file(root, name)
+}
+
+fn dedup_external_states(external_states: Vec<(String, Vec<u8>)>) -> Vec<(String, Vec<u8>)> {
+    let mut out = external_states;
+    dedup_external_states_in_place(&mut out);
+    out
+}
+
+fn dedup_external_states_in_place(external_states: &mut Vec<(String, Vec<u8>)>) {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(external_states.len());
+    for (name, state) in std::mem::take(external_states).into_iter().rev() {
+        if seen.insert(name.clone()) {
+            out.push((name, state));
+        }
+    }
+    out.reverse();
+    *external_states = out;
+}
+
+fn prepare_external_state_file(
+    root: &Path,
+    name: &str,
+    state: &[u8],
+    txn_id: u64,
+) -> Result<PathBuf> {
+    let dir = external_state_dir(root, name);
+    std::fs::create_dir_all(&dir)?;
+    let pending = dir.join(format!("state.json.{txn_id}.tmp"));
+    {
+        let mut file = std::fs::File::create(&pending)?;
+        file.write_all(state)?;
+        file.sync_all()?;
+    }
+    Ok(pending)
+}
+
+fn publish_external_state_file(root: &Path, name: &str, pending: &Path) -> Result<()> {
+    let path = external_state_file(root, name);
+    std::fs::rename(pending, &path)?;
+    if let Ok(dir) = std::fs::File::open(external_state_dir(root, name)) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
+fn write_external_state_file(root: &Path, name: &str, state: &[u8]) -> Result<()> {
+    let pending = prepare_external_state_file(root, name, state, 0)?;
+    publish_external_state_file(root, name, &pending)
 }
 
 /// Two-pass, `flushed_epoch`-gated recovery of the shared WAL (spec §15).
@@ -2304,7 +3567,10 @@ fn recover_shared_wal(
                     (Vec::new(), Vec::new(), Some(commit_epoch), commit_epoch),
                 );
             }
-            _ => {}
+            Op::ExternalTableState { name, state } => {
+                write_external_state_file(root, &name, &state)?;
+            }
+            Op::Flush { .. } | Op::TxnCommit { .. } | Op::TxnAbort | Op::Ddl(_) => {}
         }
     }
     for (table_id, (rows, deletes, truncate_epoch, table_epoch)) in stage {
@@ -2604,6 +3870,318 @@ fn validate_column_id(column_id: u16, schema: &Schema) -> Result<()> {
         Err(MongrelError::InvalidArgument(format!(
             "unknown column id {column_id}"
         )))
+    }
+}
+
+fn trigger_matches_event(
+    trigger: &StoredTrigger,
+    event: &WriteEvent,
+    cat: &Catalog,
+) -> Result<bool> {
+    if trigger.event != event.kind {
+        return Ok(false);
+    }
+    let TriggerTarget::Table(target) = &trigger.target else {
+        return Ok(false);
+    };
+    if target != &event.table {
+        return Ok(false);
+    }
+    if trigger.event == TriggerEvent::Update && !trigger.update_of.is_empty() {
+        let schema = &cat
+            .live(target)
+            .ok_or_else(|| {
+                MongrelError::InvalidArgument(format!(
+                    "trigger {:?} references unknown table {target:?}",
+                    trigger.name
+                ))
+            })?
+            .schema;
+        let mut watched = Vec::with_capacity(trigger.update_of.len());
+        for name in &trigger.update_of {
+            let col = schema.column(name).ok_or_else(|| {
+                MongrelError::InvalidArgument(format!(
+                    "trigger {:?} references unknown UPDATE OF column {name:?}",
+                    trigger.name
+                ))
+            })?;
+            watched.push(col.id);
+        }
+        if !event
+            .changed_columns
+            .iter()
+            .any(|column_id| watched.contains(column_id))
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn changed_columns(old: Option<&TriggerRowImage>, new: Option<&TriggerRowImage>) -> Vec<u16> {
+    let mut ids = std::collections::BTreeSet::new();
+    if let Some(old) = old {
+        ids.extend(old.columns.keys().copied());
+    }
+    if let Some(new) = new {
+        ids.extend(new.columns.keys().copied());
+    }
+    ids.into_iter()
+        .filter(|id| {
+            old.and_then(|row| row.columns.get(id)) != new.and_then(|row| row.columns.get(id))
+        })
+        .collect()
+}
+
+fn eval_trigger_cells(
+    cells: &[crate::trigger::TriggerCell],
+    event: &WriteEvent,
+) -> Result<Vec<(u16, Value)>> {
+    cells
+        .iter()
+        .map(|cell| Ok((cell.column_id, eval_trigger_value(&cell.value, event)?)))
+        .collect()
+}
+
+fn eval_trigger_expr(expr: &TriggerExpr, event: &WriteEvent) -> Result<bool> {
+    match expr {
+        TriggerExpr::Value(value) => match eval_trigger_value(value, event)? {
+            Value::Bool(value) => Ok(value),
+            Value::Null => Ok(false),
+            other => Err(MongrelError::InvalidArgument(format!(
+                "trigger WHEN value must be boolean, got {other:?}"
+            ))),
+        },
+        TriggerExpr::Eq { left, right } => Ok(values_equal(
+            &eval_trigger_value(left, event)?,
+            &eval_trigger_value(right, event)?,
+        )),
+        TriggerExpr::NotEq { left, right } => Ok(!values_equal(
+            &eval_trigger_value(left, event)?,
+            &eval_trigger_value(right, event)?,
+        )),
+        TriggerExpr::IsNull(value) => Ok(matches!(eval_trigger_value(value, event)?, Value::Null)),
+        TriggerExpr::IsNotNull(value) => {
+            Ok(!matches!(eval_trigger_value(value, event)?, Value::Null))
+        }
+    }
+}
+
+fn eval_trigger_value(value: &TriggerValue, event: &WriteEvent) -> Result<Value> {
+    match value {
+        TriggerValue::Literal(value) => Ok(value.clone()),
+        TriggerValue::NewColumn(column_id) => event
+            .new
+            .as_ref()
+            .and_then(|row| row.columns.get(column_id))
+            .cloned()
+            .ok_or_else(|| MongrelError::InvalidArgument("NEW column is not available".into())),
+        TriggerValue::OldColumn(column_id) => event
+            .old
+            .as_ref()
+            .and_then(|row| row.columns.get(column_id))
+            .cloned()
+            .ok_or_else(|| MongrelError::InvalidArgument("OLD column is not available".into())),
+    }
+}
+
+fn values_equal(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Null, Value::Null) => true,
+        (Value::Bool(a), Value::Bool(b)) => a == b,
+        (Value::Int64(a), Value::Int64(b)) => a == b,
+        (Value::Float64(a), Value::Float64(b)) => a.to_bits() == b.to_bits(),
+        (Value::Bytes(a), Value::Bytes(b)) => a == b,
+        (Value::Embedding(a), Value::Embedding(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b.iter())
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+        }
+        _ => false,
+    }
+}
+
+fn trigger_message(value: Value) -> String {
+    match value {
+        Value::Null => "NULL".into(),
+        Value::Bool(value) => value.to_string(),
+        Value::Int64(value) => value.to_string(),
+        Value::Float64(value) => value.to_string(),
+        Value::Bytes(value) => String::from_utf8_lossy(&value).into_owned(),
+        Value::Embedding(value) => format!("{value:?}"),
+    }
+}
+
+fn validate_trigger_step(
+    step: &TriggerStep,
+    cat: &Catalog,
+    target_schema: &Schema,
+    event: TriggerEvent,
+) -> Result<()> {
+    match step {
+        TriggerStep::SetNew { cells } => {
+            if event == TriggerEvent::Delete {
+                return Err(MongrelError::InvalidArgument(
+                    "SetNew trigger step is not valid for DELETE triggers".into(),
+                ));
+            }
+            for cell in cells {
+                validate_column_id(cell.column_id, target_schema)?;
+                validate_trigger_value(&cell.value, target_schema, event)?;
+            }
+        }
+        TriggerStep::Insert { table, cells } => {
+            let schema = trigger_write_schema(cat, table, "insert")?;
+            for cell in cells {
+                validate_column_id(cell.column_id, schema)?;
+                validate_trigger_value(&cell.value, target_schema, event)?;
+            }
+        }
+        TriggerStep::UpdateByPk { table, pk, cells } => {
+            let schema = trigger_write_schema(cat, table, "update")?;
+            if schema.primary_key().is_none() {
+                return Err(MongrelError::InvalidArgument(format!(
+                    "trigger update_by_pk references table {table:?} without a primary key"
+                )));
+            }
+            validate_trigger_value(pk, target_schema, event)?;
+            for cell in cells {
+                validate_column_id(cell.column_id, schema)?;
+                validate_trigger_value(&cell.value, target_schema, event)?;
+            }
+        }
+        TriggerStep::DeleteByPk { table, pk } => {
+            let schema = trigger_write_schema(cat, table, "delete")?;
+            if schema.primary_key().is_none() {
+                return Err(MongrelError::InvalidArgument(format!(
+                    "trigger delete_by_pk references table {table:?} without a primary key"
+                )));
+            }
+            validate_trigger_value(pk, target_schema, event)?;
+        }
+        TriggerStep::Select {
+            table, conditions, ..
+        } => {
+            let schema = trigger_read_schema(cat, table)?;
+            for condition in conditions {
+                validate_trigger_condition(condition, schema, target_schema, event)?;
+            }
+        }
+        TriggerStep::Raise { message, .. } => {
+            validate_trigger_value(message, target_schema, event)?
+        }
+    }
+    Ok(())
+}
+
+fn trigger_write_schema<'a>(cat: &'a Catalog, table: &str, op: &str) -> Result<&'a Schema> {
+    if let Some(entry) = cat.live(table) {
+        return Ok(&entry.schema);
+    }
+    if let Some(entry) = cat.external_tables.iter().find(|entry| entry.name == table) {
+        let allowed = match op {
+            "insert" => entry.capabilities.writable || entry.capabilities.insert_only,
+            "update" | "delete" => entry.capabilities.writable,
+            _ => false,
+        };
+        if !allowed {
+            return Err(MongrelError::InvalidArgument(format!(
+                "trigger {op} references external table {table:?}, but module {:?} is not writable for that operation",
+                entry.module
+            )));
+        }
+        if !entry.capabilities.transaction_safe {
+            return Err(MongrelError::InvalidArgument(format!(
+                "trigger {op} references external table {table:?}, but module {:?} is not transaction-safe",
+                entry.module
+            )));
+        }
+        return Ok(&entry.declared_schema);
+    }
+    Err(MongrelError::InvalidArgument(format!(
+        "trigger references unknown table {table:?}"
+    )))
+}
+
+fn trigger_read_schema<'a>(cat: &'a Catalog, table: &str) -> Result<&'a Schema> {
+    if let Some(entry) = cat.live(table) {
+        return Ok(&entry.schema);
+    }
+    if let Some(entry) = cat.external_tables.iter().find(|entry| entry.name == table) {
+        if entry.capabilities.trigger_safe {
+            return Ok(&entry.declared_schema);
+        }
+        return Err(MongrelError::InvalidArgument(format!(
+            "trigger reads external table {table:?}, but module {:?} is not trigger-safe",
+            entry.module
+        )));
+    }
+    Err(MongrelError::InvalidArgument(format!(
+        "trigger references unknown table {table:?}"
+    )))
+}
+
+fn validate_trigger_condition(
+    condition: &TriggerCondition,
+    schema: &Schema,
+    target_schema: &Schema,
+    event: TriggerEvent,
+) -> Result<()> {
+    match condition {
+        TriggerCondition::Pk { value } => {
+            if schema.primary_key().is_none() {
+                return Err(MongrelError::InvalidArgument(
+                    "trigger condition Pk references a table without a primary key".into(),
+                ));
+            }
+            validate_trigger_value(value, target_schema, event)
+        }
+        TriggerCondition::Eq { column_id, value } => {
+            validate_column_id(*column_id, schema)?;
+            validate_trigger_value(value, target_schema, event)
+        }
+        TriggerCondition::IsNull { column_id } | TriggerCondition::IsNotNull { column_id } => {
+            validate_column_id(*column_id, schema)
+        }
+    }
+}
+
+fn validate_trigger_expr(expr: &TriggerExpr, schema: &Schema, event: TriggerEvent) -> Result<()> {
+    match expr {
+        TriggerExpr::Value(value) | TriggerExpr::IsNull(value) | TriggerExpr::IsNotNull(value) => {
+            validate_trigger_value(value, schema, event)
+        }
+        TriggerExpr::Eq { left, right } | TriggerExpr::NotEq { left, right } => {
+            validate_trigger_value(left, schema, event)?;
+            validate_trigger_value(right, schema, event)
+        }
+    }
+}
+
+fn validate_trigger_value(
+    value: &TriggerValue,
+    schema: &Schema,
+    event: TriggerEvent,
+) -> Result<()> {
+    match value {
+        TriggerValue::Literal(_) => Ok(()),
+        TriggerValue::NewColumn(id) => {
+            if event == TriggerEvent::Delete {
+                return Err(MongrelError::InvalidArgument(
+                    "DELETE triggers cannot reference NEW".into(),
+                ));
+            }
+            validate_column_id(*id, schema)
+        }
+        TriggerValue::OldColumn(id) => {
+            if event == TriggerEvent::Insert {
+                return Err(MongrelError::InvalidArgument(
+                    "INSERT triggers cannot reference OLD".into(),
+                ));
+            }
+            validate_column_id(*id, schema)
+        }
     }
 }
 
