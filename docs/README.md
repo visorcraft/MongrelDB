@@ -31,6 +31,8 @@ vector similarity, range queries, and more.
    flush-on-close, cron jobs, GC
 10. **[Stored Procedures](10-stored-procedures.md)** — catalog-backed routines
     callable from SQL, HTTP, NAPI, and Kit clients
+11. **[Extended SQL Functions](11-extended-sql-functions.md)** — built-in
+    date/time, JSON, string, math, and custom function hooks
 
 ## Quick Reference
 

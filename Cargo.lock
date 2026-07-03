@@ -2327,6 +2327,7 @@ version = "0.21.0"
 dependencies = [
  "arrow",
  "async-trait",
+ "chrono",
  "datafusion",
  "futures",
  "mongreldb-core",

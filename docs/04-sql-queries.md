@@ -100,6 +100,10 @@ SELECT * FROM docs WHERE ann_search(embedding, '[0.12, 0.45, 0.78, ...]', 10)
 SELECT * FROM docs WHERE sparse_match(content, 'machine learning database', 10)
 ```
 
+MongrelDB also registers **Extended SQL Functions** for date/time, JSON,
+string, math, and application-defined function hooks. See
+[Extended SQL Functions](11-extended-sql-functions.md).
+
 ## Result Caching
 
 Repeated SQL queries return instantly from cache. The cache is keyed by

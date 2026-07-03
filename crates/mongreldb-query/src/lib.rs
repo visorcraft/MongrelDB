@@ -24,6 +24,7 @@
 pub mod arrow_conv;
 mod commands;
 mod error;
+pub mod extended_sql_functions;
 mod fk_join;
 mod native_agg;
 mod scan;
@@ -36,7 +37,7 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::{DataFusionError, Result as DFResult};
-use datafusion::logical_expr::{Expr, TableType};
+use datafusion::logical_expr::{AggregateUDF, Expr, ScalarUDF, TableType, WindowUDF};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
 use mongreldb_core::{AlterColumn, ColumnFlags, Cursor, Database, Table};
@@ -1320,12 +1321,7 @@ impl MongrelSession {
     pub fn new(db: Table) -> Self {
         let db = Arc::new(Mutex::new(db));
         let ctx = SessionContext::new();
-        ctx.register_udf(datafusion::logical_expr::ScalarUDF::from(
-            udf::AnnSearchUdf::new(),
-        ));
-        ctx.register_udf(datafusion::logical_expr::ScalarUDF::from(
-            udf::SparseMatchUdf::new(),
-        ));
+        register_mongrel_functions(&ctx);
         Self {
             ctx,
             db: Some(db),
@@ -1344,12 +1340,7 @@ impl MongrelSession {
     /// results.
     pub fn open(database: Arc<Database>) -> Result<Self> {
         let ctx = SessionContext::new();
-        ctx.register_udf(datafusion::logical_expr::ScalarUDF::from(
-            udf::AnnSearchUdf::new(),
-        ));
-        ctx.register_udf(datafusion::logical_expr::ScalarUDF::from(
-            udf::SparseMatchUdf::new(),
-        ));
+        register_mongrel_functions(&ctx);
 
         let mut tables: HashMap<String, Arc<Mutex<Table>>> = HashMap::new();
         for name in database.table_names() {
@@ -1742,15 +1733,20 @@ impl MongrelSession {
         // sessions created via `new()` + `register_db()`.
         let epoch = self.cache_epoch();
         let key = (sql.to_string(), epoch);
-        if let Some(hit) = self.cache.lock().get(&key) {
-            return Ok((**hit).clone());
+        let result_cacheable = !extended_sql_functions::contains_volatile_extended_function(sql);
+        if result_cacheable {
+            if let Some(hit) = self.cache.lock().get(&key) {
+                return Ok((**hit).clone());
+            }
         }
         // §5.3: direct SQL dispatch for simple single-table SELECTs — bypasses
         // DataFusion parse+plan+optimize. Served batches are memoized into the
         // result cache like the normal path. Returns None (→ fall through) for
         // any shape it cannot serve exactly.
         if let Some(batches) = self.try_direct_dispatch(sql)? {
-            self.cache.lock().insert(key, Arc::new(batches.clone()));
+            if result_cacheable {
+                self.cache.lock().insert(key, Arc::new(batches.clone()));
+            }
             return Ok(batches);
         }
         // Phase 16.5: check the logical-plan cache before re-parsing.
@@ -1802,7 +1798,9 @@ impl MongrelSession {
                 }
             }
         };
-        self.cache.lock().insert(key, Arc::new(batches.clone()));
+        if result_cacheable {
+            self.cache.lock().insert(key, Arc::new(batches.clone()));
+        }
         Ok(batches)
     }
 
@@ -1904,6 +1902,34 @@ impl MongrelSession {
     pub fn context(&self) -> &SessionContext {
         &self.ctx
     }
+
+    /// Register a custom scalar SQL function on this session.
+    ///
+    /// This is the Rust escape hatch for application-defined SQL functions. The
+    /// session's plan and result caches are cleared because function resolution
+    /// can change query output without advancing the storage epoch.
+    pub fn register_scalar_udf(&self, f: ScalarUDF) {
+        self.ctx.register_udf(f);
+        self.clear_cache();
+    }
+
+    /// Register a custom aggregate SQL function on this session.
+    pub fn register_aggregate_udf(&self, f: AggregateUDF) {
+        self.ctx.register_udaf(f);
+        self.clear_cache();
+    }
+
+    /// Register a custom window SQL function on this session.
+    pub fn register_window_udf(&self, f: WindowUDF) {
+        self.ctx.register_udwf(f);
+        self.clear_cache();
+    }
+}
+
+fn register_mongrel_functions(ctx: &SessionContext) {
+    ctx.register_udf(ScalarUDF::from(udf::AnnSearchUdf::new()));
+    ctx.register_udf(ScalarUDF::from(udf::SparseMatchUdf::new()));
+    extended_sql_functions::register_extended_sql_functions(ctx);
 }
 
 /// Stable 64-bit cache key for a SQL string (Phase 8.3 incremental cache).
