@@ -1133,6 +1133,54 @@ impl Database {
         Ok(())
     }
 
+    /// Compact every mounted table: merge all sorted runs into one clean run
+    /// so query cost stays flat (single-run fast path) instead of growing
+    /// with run count. Tables with < 2 runs are skipped (no-op). Each table
+    /// is locked individually for its own compaction; snapshot retention is
+    /// honored by `Table::compact`. Returns `(tables_compacted, tables_skipped)`.
+    pub fn compact(&self) -> Result<(usize, usize)> {
+        let mut compacted = 0;
+        let mut skipped = 0;
+        for name in self.table_names() {
+            let Ok(handle) = self.table(&name) else {
+                continue;
+            };
+            {
+                let mut t = handle.lock();
+                let before = t.run_count();
+                if before < 2 {
+                    skipped += 1;
+                    continue;
+                }
+                match t.compact() {
+                    Ok(()) => {
+                        let after = t.run_count();
+                        compacted += 1;
+                        eprintln!("[compact] {name}: {before} -> {after} runs");
+                    }
+                    Err(e) => {
+                        eprintln!("[compact] {name}: compaction failed: {e}");
+                        skipped += 1;
+                    }
+                }
+            }
+        }
+        Ok((compacted, skipped))
+    }
+
+    /// Compact a single table by name. Returns `Ok(true)` if it was
+    /// compacted, `Ok(false)` if skipped (< 2 runs).
+    pub fn compact_table(&self, name: &str) -> Result<bool> {
+        let handle = self.table(name)?;
+        let mut t = handle.lock();
+        let before = t.run_count();
+        if before < 2 {
+            return Ok(false);
+        }
+        t.compact()?;
+        Ok(t.run_count() < before)
+    }
+
     /// Look up a live table by name.
     pub fn table(&self, name: &str) -> Result<TableHandle> {
         let cat = self.catalog.read();

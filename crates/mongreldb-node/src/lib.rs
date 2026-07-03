@@ -124,6 +124,15 @@ pub struct IndexSpec {
     pub kind: IndexKindSpec,
 }
 
+/// Result of a `compactAll` operation.
+#[napi(object)]
+pub struct CompactStats {
+    /// Number of tables that were merged into a single run.
+    pub compacted: u32,
+    /// Number of tables skipped (fewer than 2 runs, or compaction failed).
+    pub skipped: u32,
+}
+
 #[napi(object)]
 pub struct SchemaSpec {
     pub columns: Vec<ColumnSpec>,
@@ -931,6 +940,24 @@ impl Database {
             "quarantined": quarantined,
         });
         Ok(summary.to_string())
+    }
+
+    /// Compact every table: merge sorted runs into one clean run each so
+    /// query latency stays flat. Tables with fewer than two runs are skipped.
+    #[napi]
+    pub fn compact_all(&self) -> napi::Result<CompactStats> {
+        let (compacted, skipped) = self.inner.compact().map_err(to_napi)?;
+        Ok(CompactStats {
+            compacted: compacted as u32,
+            skipped: skipped as u32,
+        })
+    }
+
+    /// Compact a single table by name. Returns `true` if compacted, `false`
+    /// if skipped (fewer than two runs).
+    #[napi]
+    pub fn compact_table(&self, name: String) -> napi::Result<bool> {
+        self.inner.compact_table(&name).map_err(to_napi)
     }
 
     /// Return the path passed to `withPath` / `open`.

@@ -55,6 +55,8 @@ pub fn build_app(db: Arc<Database>) -> axum::Router {
         .route("/kit/txn", post(kit::kit_txn))
         .route("/kit/query", post(kit::kit_query))
         .route("/kit/create_table", post(kit::kit_create_table))
+        .route("/compact", post(compact_all))
+        .route("/tables/{name}/compact", post(compact_table))
         .with_state(state)
 }
 
@@ -93,6 +95,44 @@ pub fn spawn_auto_compactor(db: Arc<Database>) {
 
 async fn health() -> StatusCode {
     StatusCode::OK
+}
+
+/// `POST /compact` — compact all mounted tables.
+async fn compact_all(
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match state.db.compact() {
+        Ok((compacted, skipped)) => (
+            StatusCode::OK,
+            Json(json!({
+                "status": "ok",
+                "compacted": compacted,
+                "skipped": skipped,
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "status": "error", "message": format!("{e}") })),
+        ),
+    }
+}
+
+/// `POST /tables/{name}/compact` — compact a single table.
+async fn compact_table(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match state.db.compact_table(&name) {
+        Ok(true) => (StatusCode::OK, Json(json!({ "status": "compacted", "table": name }))),
+        Ok(false) => (
+            StatusCode::OK,
+            Json(json!({ "status": "skipped", "table": name, "reason": "fewer than 2 runs" })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "status": "error", "table": name, "message": format!("{e}") })),
+        ),
+    }
 }
 
 #[derive(Deserialize)]

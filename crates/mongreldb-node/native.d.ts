@@ -53,6 +53,13 @@ export interface IndexSpec {
   columnId: number
   kind: IndexKindSpec
 }
+/** Result of a `compactAll` operation. */
+export interface CompactStats {
+  /** Number of tables that were merged into a single run. */
+  compacted: number
+  /** Number of tables skipped (fewer than 2 runs, or compaction failed). */
+  skipped: number
+}
 export interface SchemaSpec {
   columns: Array<ColumnSpec>
   indexes: Array<IndexSpec>
@@ -212,6 +219,16 @@ export declare class Database {
   check(): string
   /** Repair/quarantine corrupt tables. Returns a JSON-string summary. */
   doctor(): string
+  /**
+   * Compact every table: merge sorted runs into one clean run each so
+   * query latency stays flat. Tables with fewer than two runs are skipped.
+   */
+  compactAll(): CompactStats
+  /**
+   * Compact a single table by name. Returns `true` if compacted, `false`
+   * if skipped (fewer than two runs).
+   */
+  compactTable(name: string): boolean
   /** Return the path passed to `withPath` / `open`. */
   directory(): string
   /** Run a cross-table SQL query. Returns Arrow IPC bytes. */
