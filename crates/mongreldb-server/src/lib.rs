@@ -175,6 +175,8 @@ struct ColumnDefJson {
     name: String,
     ty: String,
     primary_key: bool,
+    #[serde(default)]
+    nullable: bool,
 }
 
 async fn create_table(
@@ -195,6 +197,9 @@ async fn create_table(
         let mut flags = mongreldb_core::schema::ColumnFlags::empty();
         if c.primary_key {
             flags = flags.with(mongreldb_core::schema::ColumnFlags::PRIMARY_KEY);
+        }
+        if c.nullable {
+            flags = flags.with(mongreldb_core::schema::ColumnFlags::NULLABLE);
         }
         columns.push(mongreldb_core::schema::ColumnDef {
             id: c.id,

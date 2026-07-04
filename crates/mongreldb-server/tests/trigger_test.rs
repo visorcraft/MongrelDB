@@ -1,6 +1,7 @@
 use mongreldb_core::{
-    ColumnDef, Database, StoredTrigger, TriggerCell, TriggerDefinition, TriggerEvent,
-    TriggerProgram, TriggerStep, TriggerTarget, TriggerTiming, TriggerValue,
+    ColumnDef, ColumnFlags, Database, IndexDef, IndexKind, Schema, StoredTrigger, TriggerCell,
+    TriggerCondition, TriggerDefinition, TriggerEvent, TriggerExpr, TriggerProgram,
+    TriggerRaiseAction, TriggerStep, TriggerTarget, TriggerTiming, TriggerValue, TypeId, Value,
 };
 use mongreldb_server::build_app;
 use std::sync::Arc;
@@ -162,14 +163,7 @@ async fn trigger_endpoint_ddl_is_idempotent_by_key() {
         200,
     )
     .await;
-    let replayed = request(
-        &app,
-        "PUT",
-        "/triggers/users_ai",
-        Some(replace_body),
-        200,
-    )
-    .await;
+    let replayed = request(&app, "PUT", "/triggers/users_ai", Some(replace_body), 200).await;
     assert_eq!(replaced, replayed);
     assert_eq!(replaced["trigger"]["version"], 2);
 
@@ -225,6 +219,43 @@ fn audit_trigger(name: &str, source_table: &str) -> StoredTrigger {
     .unwrap()
 }
 
+fn col_def(id: u16, name: &str, ty: TypeId, flags: ColumnFlags) -> ColumnDef {
+    ColumnDef {
+        id,
+        name: name.into(),
+        ty,
+        flags,
+    }
+}
+
+fn pk_flags() -> ColumnFlags {
+    ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY)
+}
+
+fn create_table_with_bitmap_indexes(
+    db: &Database,
+    name: &str,
+    columns: Vec<ColumnDef>,
+    bitmap_columns: Vec<u16>,
+) {
+    let indexes = bitmap_columns
+        .into_iter()
+        .map(|column_id| IndexDef {
+            name: format!("idx_{column_id}"),
+            column_id,
+            kind: IndexKind::Bitmap,
+        })
+        .collect();
+    let schema = Schema {
+        schema_id: 0,
+        columns,
+        indexes,
+        colocation: Vec::new(),
+        constraints: Default::default(),
+    };
+    db.create_table(name, schema).unwrap();
+}
+
 async fn request(
     app: &axum::Router,
     method: &str,
@@ -277,13 +308,464 @@ async fn request_inner(
         .oneshot(builder.body(body).unwrap())
         .await
         .unwrap();
-    assert_eq!(resp.status().as_u16(), expected_status);
+    let status = resp.status().as_u16();
     let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
         .await
         .unwrap();
+    assert_eq!(status, expected_status);
     if body.is_empty() {
         serde_json::Value::Null
     } else {
         serde_json::from_slice(&body).unwrap()
     }
+}
+
+async fn kit_txn(app: &axum::Router, ops: Vec<serde_json::Value>) -> serde_json::Value {
+    request(
+        app,
+        "POST",
+        "/kit/txn",
+        Some(serde_json::json!({ "ops": ops })),
+        200,
+    )
+    .await
+}
+
+async fn kit_query(
+    app: &axum::Router,
+    table: &str,
+    conditions: Vec<serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    let body = serde_json::json!({
+        "table": table,
+        "conditions": conditions
+    });
+    let resp = request(app, "POST", "/kit/query", Some(body), 200).await;
+    resp["rows"].as_array().unwrap().clone()
+}
+
+fn cell_value(row: &serde_json::Value, column_id: u16) -> Option<&serde_json::Value> {
+    let cells = row["cells"].as_array()?;
+    cells.chunks(2).find_map(|chunk| {
+        if chunk[0].as_u64()? as u16 == column_id {
+            Some(&chunk[1])
+        } else {
+            None
+        }
+    })
+}
+
+#[tokio::test]
+async fn trigger_when_clause_ranges_and_booleans() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    let app = build_app(db);
+
+    request(
+        &app,
+        "POST",
+        "/tables",
+        Some(serde_json::json!({
+            "name": "scores",
+            "columns": [
+                {"id": 1, "name": "id", "ty": "int64", "primary_key": true},
+                {"id": 2, "name": "value", "ty": "int64", "primary_key": false},
+                {"id": 3, "name": "category", "ty": "bytes", "primary_key": false, "nullable": true}
+            ]
+        })),
+        200,
+    )
+    .await;
+    request(
+        &app,
+        "POST",
+        "/tables",
+        Some(serde_json::json!({
+            "name": "audit",
+            "columns": [
+                {"id": 1, "name": "id", "ty": "int64", "primary_key": true},
+                {"id": 2, "name": "value", "ty": "int64", "primary_key": false},
+                {"id": 3, "name": "category", "ty": "bytes", "primary_key": false, "nullable": true}
+            ]
+        })),
+        200,
+    )
+    .await;
+
+    let trigger = StoredTrigger::new(
+        "scores_ai",
+        TriggerDefinition {
+            target: TriggerTarget::Table("scores".into()),
+            timing: TriggerTiming::After,
+            event: TriggerEvent::Insert,
+            update_of: Vec::new(),
+            target_columns: Vec::<ColumnDef>::new(),
+            when: Some(TriggerExpr::Or {
+                left: Box::new(TriggerExpr::And {
+                    left: Box::new(TriggerExpr::Gt {
+                        left: TriggerValue::NewColumn(2),
+                        right: TriggerValue::Literal(Value::Int64(0)),
+                    }),
+                    right: Box::new(TriggerExpr::Lte {
+                        left: TriggerValue::NewColumn(2),
+                        right: TriggerValue::Literal(Value::Int64(100)),
+                    }),
+                }),
+                right: Box::new(TriggerExpr::Not(Box::new(TriggerExpr::IsNull(
+                    TriggerValue::NewColumn(3),
+                )))),
+            }),
+            program: TriggerProgram {
+                steps: vec![TriggerStep::Insert {
+                    table: "audit".into(),
+                    cells: vec![
+                        TriggerCell {
+                            column_id: 1,
+                            value: TriggerValue::NewColumn(1),
+                        },
+                        TriggerCell {
+                            column_id: 2,
+                            value: TriggerValue::NewColumn(2),
+                        },
+                        TriggerCell {
+                            column_id: 3,
+                            value: TriggerValue::NewColumn(3),
+                        },
+                    ],
+                }],
+            },
+        },
+        0,
+    )
+    .unwrap();
+    request(
+        &app,
+        "POST",
+        "/triggers",
+        Some(serde_json::json!({ "trigger": trigger })),
+        200,
+    )
+    .await;
+
+    request(
+        &app,
+        "POST",
+        "/txn",
+        Some(serde_json::json!({
+            "ops": [
+                {"table": "scores", "op": "put", "cells": [1, 1, 2, 50, 3, "a"]},
+                {"table": "scores", "op": "put", "cells": [1, 2, 2, 200, 3, "b"]},
+                {"table": "scores", "op": "put", "cells": [1, 3, 2, -1, 3, null]}
+            ]
+        })),
+        200,
+    )
+    .await;
+
+    let audit_count = request(&app, "GET", "/tables/audit/count", None, 200).await;
+    assert_eq!(audit_count["count"], 2);
+}
+
+#[tokio::test]
+async fn trigger_select_foreach_raises_on_children() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    let app = build_app(db);
+
+    request(
+        &app,
+        "POST",
+        "/tables",
+        Some(serde_json::json!({
+            "name": "parents",
+            "columns": [
+                {"id": 1, "name": "id", "ty": "int64", "primary_key": true}
+            ]
+        })),
+        200,
+    )
+    .await;
+    request(
+        &app,
+        "POST",
+        "/tables",
+        Some(serde_json::json!({
+            "name": "children",
+            "columns": [
+                {"id": 1, "name": "id", "ty": "int64", "primary_key": true},
+                {"id": 2, "name": "parent_id", "ty": "int64", "primary_key": false}
+            ]
+        })),
+        200,
+    )
+    .await;
+
+    let trigger = StoredTrigger::new(
+        "parents_bd",
+        TriggerDefinition {
+            target: TriggerTarget::Table("parents".into()),
+            timing: TriggerTiming::Before,
+            event: TriggerEvent::Delete,
+            update_of: Vec::new(),
+            target_columns: Vec::<ColumnDef>::new(),
+            when: None,
+            program: TriggerProgram {
+                steps: vec![
+                    TriggerStep::Select {
+                        id: "kids".into(),
+                        table: "children".into(),
+                        conditions: vec![TriggerCondition::Eq {
+                            column_id: 2,
+                            value: TriggerValue::OldColumn(1),
+                        }],
+                    },
+                    TriggerStep::Foreach {
+                        id: "kids".into(),
+                        steps: vec![TriggerStep::Raise {
+                            action: TriggerRaiseAction::Abort,
+                            message: TriggerValue::Literal(Value::Bytes(
+                                b"child rows exist".to_vec(),
+                            )),
+                        }],
+                    },
+                ],
+            },
+        },
+        0,
+    )
+    .unwrap();
+    request(
+        &app,
+        "POST",
+        "/triggers",
+        Some(serde_json::json!({ "trigger": trigger })),
+        200,
+    )
+    .await;
+
+    kit_txn(
+        &app,
+        vec![
+            serde_json::json!({"put": {"table": "parents", "cells": [1, 1]}}),
+            serde_json::json!({"put": {"table": "children", "cells": [1, 1, 2, 1]}}),
+        ],
+    )
+    .await;
+
+    let err = request(
+        &app,
+        "POST",
+        "/kit/txn",
+        Some(serde_json::json!({
+            "ops": [{"delete_by_pk": {"table": "parents", "pk": 1}}]
+        })),
+        409,
+    )
+    .await;
+    assert!(err["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("child rows exist"));
+
+    kit_txn(
+        &app,
+        vec![serde_json::json!({"delete_by_pk": {"table": "children", "pk": 1}})],
+    )
+    .await;
+    kit_txn(
+        &app,
+        vec![serde_json::json!({"delete_by_pk": {"table": "parents", "pk": 1}})],
+    )
+    .await;
+
+    let parents_count = request(&app, "GET", "/tables/parents/count", None, 200).await;
+    assert_eq!(parents_count["count"], 0);
+}
+
+#[tokio::test]
+async fn trigger_delete_where_cleans_up_related_rows() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    let app = build_app(Arc::clone(&db));
+
+    create_table_with_bitmap_indexes(
+        &db,
+        "parents",
+        vec![col_def(1, "id", TypeId::Int64, pk_flags())],
+        Vec::new(),
+    );
+    create_table_with_bitmap_indexes(
+        &db,
+        "logs",
+        vec![
+            col_def(1, "id", TypeId::Int64, pk_flags()),
+            col_def(2, "parent_id", TypeId::Int64, ColumnFlags::empty()),
+        ],
+        vec![2],
+    );
+
+    let trigger = StoredTrigger::new(
+        "parents_ad",
+        TriggerDefinition {
+            target: TriggerTarget::Table("parents".into()),
+            timing: TriggerTiming::After,
+            event: TriggerEvent::Delete,
+            update_of: Vec::new(),
+            target_columns: Vec::<ColumnDef>::new(),
+            when: None,
+            program: TriggerProgram {
+                steps: vec![TriggerStep::DeleteWhere {
+                    table: "logs".into(),
+                    conditions: vec![TriggerCondition::Eq {
+                        column_id: 2,
+                        value: TriggerValue::OldColumn(1),
+                    }],
+                }],
+            },
+        },
+        0,
+    )
+    .unwrap();
+    request(
+        &app,
+        "POST",
+        "/triggers",
+        Some(serde_json::json!({ "trigger": trigger })),
+        200,
+    )
+    .await;
+
+    kit_txn(
+        &app,
+        vec![
+            serde_json::json!({"put": {"table": "parents", "cells": [1, 1]}}),
+            serde_json::json!({"put": {"table": "parents", "cells": [1, 2]}}),
+            serde_json::json!({"put": {"table": "logs", "cells": [1, 1, 2, 1]}}),
+            serde_json::json!({"put": {"table": "logs", "cells": [1, 2, 2, 1]}}),
+            serde_json::json!({"put": {"table": "logs", "cells": [1, 3, 2, 2]}}),
+        ],
+    )
+    .await;
+
+    kit_txn(
+        &app,
+        vec![serde_json::json!({"delete_by_pk": {"table": "parents", "pk": 1}})],
+    )
+    .await;
+
+    let logs_count = request(&app, "GET", "/tables/logs/count", None, 200).await;
+    assert_eq!(logs_count["count"], 1);
+
+    let rows = kit_query(
+        &app,
+        "logs",
+        vec![serde_json::json!({"bitmap_eq": {"column_id": 2, "value": 2}})],
+    )
+    .await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(cell_value(&rows[0], 1).unwrap().as_u64().unwrap(), 3);
+}
+
+#[tokio::test]
+async fn trigger_update_where_cascades_value() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    let app = build_app(Arc::clone(&db));
+
+    create_table_with_bitmap_indexes(
+        &db,
+        "parents",
+        vec![
+            col_def(1, "id", TypeId::Int64, pk_flags()),
+            col_def(2, "status", TypeId::Int64, ColumnFlags::empty()),
+        ],
+        Vec::new(),
+    );
+    create_table_with_bitmap_indexes(
+        &db,
+        "children",
+        vec![
+            col_def(1, "id", TypeId::Int64, pk_flags()),
+            col_def(2, "parent_id", TypeId::Int64, ColumnFlags::empty()),
+            col_def(3, "status", TypeId::Int64, ColumnFlags::empty()),
+        ],
+        vec![2],
+    );
+
+    let trigger = StoredTrigger::new(
+        "parents_au",
+        TriggerDefinition {
+            target: TriggerTarget::Table("parents".into()),
+            timing: TriggerTiming::After,
+            event: TriggerEvent::Update,
+            update_of: Vec::new(),
+            target_columns: Vec::<ColumnDef>::new(),
+            when: None,
+            program: TriggerProgram {
+                steps: vec![TriggerStep::UpdateWhere {
+                    table: "children".into(),
+                    conditions: vec![TriggerCondition::Eq {
+                        column_id: 2,
+                        value: TriggerValue::OldColumn(1),
+                    }],
+                    cells: vec![TriggerCell {
+                        column_id: 3,
+                        value: TriggerValue::NewColumn(2),
+                    }],
+                }],
+            },
+        },
+        0,
+    )
+    .unwrap();
+    request(
+        &app,
+        "POST",
+        "/triggers",
+        Some(serde_json::json!({ "trigger": trigger })),
+        200,
+    )
+    .await;
+
+    kit_txn(
+        &app,
+        vec![
+            serde_json::json!({"put": {"table": "parents", "cells": [1, 1, 2, 0]}}),
+            serde_json::json!({"put": {"table": "parents", "cells": [1, 2, 2, 0]}}),
+            serde_json::json!({"put": {"table": "children", "cells": [1, 1, 2, 1, 3, 0]}}),
+            serde_json::json!({"put": {"table": "children", "cells": [1, 2, 2, 1, 3, 0]}}),
+            serde_json::json!({"put": {"table": "children", "cells": [1, 3, 2, 2, 3, 0]}}),
+        ],
+    )
+    .await;
+
+    kit_txn(
+        &app,
+        vec![serde_json::json!({"upsert": {
+            "table": "parents",
+            "cells": [1, 1, 2, 1],
+            "update_cells": [2, 1]
+        }})],
+    )
+    .await;
+
+    let rows = kit_query(
+        &app,
+        "children",
+        vec![serde_json::json!({"bitmap_eq": {"column_id": 2, "value": 1}})],
+    )
+    .await;
+    assert_eq!(rows.len(), 2);
+    for row in &rows {
+        assert_eq!(cell_value(row, 3).unwrap().as_i64().unwrap(), 1);
+    }
+
+    let rows = kit_query(
+        &app,
+        "children",
+        vec![serde_json::json!({"bitmap_eq": {"column_id": 2, "value": 2}})],
+    )
+    .await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(cell_value(&rows[0], 3).unwrap().as_i64().unwrap(), 0);
 }

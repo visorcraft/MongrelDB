@@ -6,7 +6,7 @@
 //! formats, MVCC snapshots, page cache, encryption, compaction, and indexes.
 
 #![allow(clippy::module_inception)]
-#![recursion_limit = "256"]
+#![recursion_limit = "2048"]
 
 pub mod be_tree;
 pub mod cache;

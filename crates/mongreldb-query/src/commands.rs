@@ -1324,8 +1324,21 @@ fn invert_trigger_expr(expr: TriggerExpr) -> Result<TriggerExpr> {
     match expr {
         TriggerExpr::Eq { left, right } => Ok(TriggerExpr::NotEq { left, right }),
         TriggerExpr::NotEq { left, right } => Ok(TriggerExpr::Eq { left, right }),
+        TriggerExpr::Lt { left, right } => Ok(TriggerExpr::Gte { left, right }),
+        TriggerExpr::Lte { left, right } => Ok(TriggerExpr::Gt { left, right }),
+        TriggerExpr::Gt { left, right } => Ok(TriggerExpr::Lte { left, right }),
+        TriggerExpr::Gte { left, right } => Ok(TriggerExpr::Lt { left, right }),
         TriggerExpr::IsNull(value) => Ok(TriggerExpr::IsNotNull(value)),
         TriggerExpr::IsNotNull(value) => Ok(TriggerExpr::IsNull(value)),
+        TriggerExpr::And { left, right } => Ok(TriggerExpr::Or {
+            left: Box::new(invert_trigger_expr(*left)?),
+            right: Box::new(invert_trigger_expr(*right)?),
+        }),
+        TriggerExpr::Or { left, right } => Ok(TriggerExpr::And {
+            left: Box::new(invert_trigger_expr(*left)?),
+            right: Box::new(invert_trigger_expr(*right)?),
+        }),
+        TriggerExpr::Not(inner) => Ok(*inner),
         TriggerExpr::Value(TriggerValue::Literal(Value::Bool(value))) => Ok(TriggerExpr::Value(
             TriggerValue::Literal(Value::Bool(!value)),
         )),
@@ -2013,6 +2026,13 @@ fn execute_instead_of_trigger_program(
                 });
             }
             TriggerStep::Select { .. } => {}
+            TriggerStep::Foreach { .. }
+            | TriggerStep::DeleteWhere { .. }
+            | TriggerStep::UpdateWhere { .. } => {
+                return Err(MongrelQueryError::Schema(
+                    "FOREACH/DELETE WHERE/UPDATE WHERE are not valid in INSTEAD OF triggers".into(),
+                ));
+            }
             TriggerStep::Raise { action, message } => match action {
                 TriggerRaiseAction::Ignore => return Ok(SqlTriggerProgramOutcome::Ignore),
                 TriggerRaiseAction::Abort
@@ -2071,6 +2091,31 @@ fn eval_instead_of_trigger_expr(expr: &TriggerExpr, event: &SqlTriggerEventImage
             eval_instead_of_trigger_value(value, event)?,
             Value::Null
         )),
+        TriggerExpr::Lt { left, right } => Ok(compare_values(
+            &eval_instead_of_trigger_value(left, event)?,
+            &BinaryOperator::Lt,
+            &eval_instead_of_trigger_value(right, event)?,
+        )?),
+        TriggerExpr::Lte { left, right } => Ok(compare_values(
+            &eval_instead_of_trigger_value(left, event)?,
+            &BinaryOperator::LtEq,
+            &eval_instead_of_trigger_value(right, event)?,
+        )?),
+        TriggerExpr::Gt { left, right } => Ok(compare_values(
+            &eval_instead_of_trigger_value(left, event)?,
+            &BinaryOperator::Gt,
+            &eval_instead_of_trigger_value(right, event)?,
+        )?),
+        TriggerExpr::Gte { left, right } => Ok(compare_values(
+            &eval_instead_of_trigger_value(left, event)?,
+            &BinaryOperator::GtEq,
+            &eval_instead_of_trigger_value(right, event)?,
+        )?),
+        TriggerExpr::And { left, right } => Ok(eval_instead_of_trigger_expr(left, event)?
+            && eval_instead_of_trigger_expr(right, event)?),
+        TriggerExpr::Or { left, right } => Ok(eval_instead_of_trigger_expr(left, event)?
+            || eval_instead_of_trigger_expr(right, event)?),
+        TriggerExpr::Not(inner) => Ok(!eval_instead_of_trigger_expr(inner, event)?),
     }
 }
 
@@ -2106,6 +2151,9 @@ fn eval_instead_of_trigger_value(
                 .cloned()
                 .ok_or_else(|| MongrelQueryError::Schema("OLD column is not available".into()))
         }
+        TriggerValue::SelectedColumn(_) => Err(MongrelQueryError::Schema(
+            "SELECTED column is not available in INSTEAD OF triggers".into(),
+        )),
     }
 }
 

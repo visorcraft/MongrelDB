@@ -237,6 +237,7 @@ pub struct Database {
     spill_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     trigger_recursive: AtomicBool,
     trigger_max_depth: AtomicU32,
+    trigger_max_loop_iterations: AtomicU32,
 }
 
 impl Database {
@@ -466,6 +467,9 @@ impl Database {
             spill_hook: Mutex::new(None),
             trigger_recursive: AtomicBool::new(TriggerConfig::default().recursive_triggers),
             trigger_max_depth: AtomicU32::new(TriggerConfig::default().max_depth),
+            trigger_max_loop_iterations: AtomicU32::new(
+                TriggerConfig::default().max_loop_iterations,
+            ),
         })
     }
 
@@ -793,6 +797,7 @@ impl Database {
         TriggerConfig {
             recursive_triggers: self.trigger_recursive.load(Ordering::Relaxed),
             max_depth: self.trigger_max_depth.load(Ordering::Relaxed),
+            max_loop_iterations: self.trigger_max_loop_iterations.load(Ordering::Relaxed),
         }
     }
 
@@ -807,6 +812,8 @@ impl Database {
             .store(config.recursive_triggers, Ordering::Relaxed);
         self.trigger_max_depth
             .store(config.max_depth, Ordering::Relaxed);
+        self.trigger_max_loop_iterations
+            .store(config.max_loop_iterations, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1069,6 +1076,7 @@ impl Database {
         if let Some(expr) = &trigger.when {
             validate_trigger_expr(expr, &target_schema, trigger.event)?;
         }
+        let mut select_schemas: HashMap<String, &Schema> = HashMap::new();
         for step in &trigger.program.steps {
             if matches!(step, TriggerStep::SetNew { .. }) && trigger.timing != TriggerTiming::Before
             {
@@ -1076,7 +1084,13 @@ impl Database {
                     "SetNew trigger steps are only valid in BEFORE triggers".into(),
                 ));
             }
-            validate_trigger_step(step, &cat, &target_schema, trigger.event)?;
+            validate_trigger_step(
+                step,
+                &cat,
+                &target_schema,
+                trigger.event,
+                &mut select_schemas,
+            )?;
         }
         Ok(())
     }
@@ -1178,6 +1192,7 @@ impl Database {
                 0,
                 config.max_depth,
                 &mut external_writes,
+                &config,
             )?;
             self.apply_external_trigger_writes(
                 external_writes,
@@ -1188,7 +1203,7 @@ impl Database {
             return Ok(());
         }
 
-        let mut expansion = self.expand_table_triggers_once(staging, read_epoch, None)?;
+        let mut expansion = self.expand_table_triggers_once(staging, read_epoch, None, &config)?;
         if !expansion.before.is_empty() {
             let mut final_staging = expansion.before;
             final_staging.extend(filter_ignored_staging(
@@ -1219,12 +1234,14 @@ impl Database {
         depth: u32,
         max_depth: u32,
         external_writes: &mut Vec<ExternalTriggerWrite>,
+        config: &TriggerConfig,
     ) -> Result<Vec<(u64, crate::txn::Staged)>> {
         if chunk.is_empty() {
             return Ok(Vec::new());
         }
         self.fill_auto_increment_for_staging(&mut chunk)?;
-        let expansion = self.expand_table_triggers_once(&mut chunk, read_epoch, Some(&stacks))?;
+        let expansion =
+            self.expand_table_triggers_once(&mut chunk, read_epoch, Some(&stacks), config)?;
         if depth >= max_depth && (!expansion.before.is_empty() || !expansion.after.is_empty()) {
             let stack = expansion
                 .before_stacks
@@ -1247,6 +1264,7 @@ impl Database {
             depth + 1,
             max_depth,
             external_writes,
+            config,
         )?);
         out.extend(filter_ignored_staging(chunk, &expansion.ignored_indices));
         external_writes.extend(expansion.after_external);
@@ -1257,6 +1275,7 @@ impl Database {
             depth + 1,
             max_depth,
             external_writes,
+            config,
         )?);
         Ok(out)
     }
@@ -1306,6 +1325,7 @@ impl Database {
         staging: &mut Vec<(u64, crate::txn::Staged)>,
         read_epoch: Epoch,
         trigger_stacks: Option<&[Vec<String>]>,
+        config: &TriggerConfig,
     ) -> Result<TriggerExpansion> {
         let triggers: Vec<StoredTrigger> = self
             .catalog
@@ -1355,6 +1375,8 @@ impl Database {
                 &before_events,
                 Some(staging),
                 &mut out,
+                config,
+                read_epoch,
             )?;
         }
 
@@ -1381,7 +1403,14 @@ impl Database {
             added_external: &mut after_external,
             ignored_indices: &mut ignored_indices,
         };
-        self.execute_triggers_for_events(&after_triggers, &after_events, None, &mut out)?;
+        self.execute_triggers_for_events(
+            &after_triggers,
+            &after_events,
+            None,
+            &mut out,
+            config,
+            read_epoch,
+        )?;
         Ok(TriggerExpansion {
             before: before_added,
             before_stacks,
@@ -1399,6 +1428,8 @@ impl Database {
         events: &[WriteEvent],
         mut staging: Option<&mut Vec<(u64, crate::txn::Staged)>>,
         out: &mut TriggerProgramOutput<'_>,
+        config: &TriggerConfig,
+        read_epoch: Epoch,
     ) -> Result<()> {
         for event in events {
             for trigger in triggers {
@@ -1435,10 +1466,18 @@ impl Database {
                         Some(&mut **staging),
                         out,
                         &trigger_stack,
+                        config,
+                        read_epoch,
                     )?,
-                    None => {
-                        self.execute_trigger_program(trigger, event, None, out, &trigger_stack)?
-                    }
+                    None => self.execute_trigger_program(
+                        trigger,
+                        event,
+                        None,
+                        out,
+                        &trigger_stack,
+                        config,
+                        read_epoch,
+                    )?,
                 };
                 if outcome == TriggerProgramOutcome::Ignore {
                     out.ignored_indices.extend(event.op_indices.iter().copied());
@@ -1605,9 +1644,42 @@ impl Database {
         mut staging: Option<&mut Vec<(u64, crate::txn::Staged)>>,
         out: &mut TriggerProgramOutput<'_>,
         trigger_stack: &[String],
+        config: &TriggerConfig,
+        read_epoch: Epoch,
     ) -> Result<TriggerProgramOutcome> {
         let mut event = event.clone();
-        for step in &trigger.program.steps {
+        let mut select_results: HashMap<String, Vec<TriggerRowImage>> = HashMap::new();
+        self.execute_trigger_steps(
+            trigger,
+            &trigger.program.steps,
+            &mut event,
+            staging.as_deref_mut(),
+            out,
+            trigger_stack,
+            config,
+            &mut select_results,
+            0,
+            None,
+            read_epoch,
+        )
+    }
+
+    fn execute_trigger_steps(
+        &self,
+        trigger: &StoredTrigger,
+        steps: &[TriggerStep],
+        event: &mut WriteEvent,
+        mut staging: Option<&mut Vec<(u64, crate::txn::Staged)>>,
+        out: &mut TriggerProgramOutput<'_>,
+        trigger_stack: &[String],
+        config: &TriggerConfig,
+        select_results: &mut HashMap<String, Vec<TriggerRowImage>>,
+        depth: u32,
+        selected: Option<&TriggerRowImage>,
+        read_epoch: Epoch,
+    ) -> Result<TriggerProgramOutcome> {
+        let _ = depth;
+        for step in steps {
             match step {
                 TriggerStep::SetNew { cells } => {
                     if trigger.timing != TriggerTiming::Before {
@@ -1631,7 +1703,7 @@ impl Database {
                             "SetNew trigger step target row is not mutable".into(),
                         ));
                     };
-                    for (column_id, value) in eval_trigger_cells(cells, &event)? {
+                    for (column_id, value) in eval_trigger_cells(cells, event, selected)? {
                         row_cells.retain(|(id, _)| *id != column_id);
                         row_cells.push((column_id, value.clone()));
                         if let Some(new) = &mut event.new {
@@ -1641,7 +1713,7 @@ impl Database {
                     row_cells.sort_by_key(|(id, _)| *id);
                 }
                 TriggerStep::Insert { table, cells } => {
-                    let cells = eval_trigger_cells(cells, &event)?;
+                    let cells = eval_trigger_cells(cells, event, selected)?;
                     if let Ok(table_id) = self.table_id(table) {
                         out.added.push((table_id, crate::txn::Staged::Put(cells)));
                         out.added_stacks.push(trigger_stack.to_vec());
@@ -1658,8 +1730,8 @@ impl Database {
                     }
                 }
                 TriggerStep::UpdateByPk { table, pk, cells } => {
-                    let pk = eval_trigger_value(pk, &event)?;
-                    let cells = eval_trigger_cells(cells, &event)?;
+                    let pk = eval_trigger_value(pk, event, selected)?;
+                    let cells = eval_trigger_cells(cells, event, selected)?;
                     if self.external_table(table).is_some() {
                         out.added_external.push(ExternalTriggerWrite::UpdateByPk {
                             table: table.clone(),
@@ -1700,7 +1772,7 @@ impl Database {
                     }
                 }
                 TriggerStep::DeleteByPk { table, pk } => {
-                    let pk = eval_trigger_value(pk, &event)?;
+                    let pk = eval_trigger_value(pk, event, selected)?;
                     if self.external_table(table).is_some() {
                         out.added_external.push(ExternalTriggerWrite::DeleteByPk {
                             table: table.clone(),
@@ -1722,13 +1794,144 @@ impl Database {
                         out.added_stacks.push(trigger_stack.to_vec());
                     }
                 }
-                TriggerStep::Select { .. } => {}
+                TriggerStep::Select {
+                    id,
+                    table,
+                    conditions,
+                } => {
+                    let schema = self.table(table)?.lock().schema().clone();
+                    let snapshot = Snapshot::at(read_epoch);
+                    let rows = self.table(table)?.lock().visible_rows(snapshot)?;
+                    let mut matched = Vec::new();
+                    for row in rows {
+                        let image = TriggerRowImage::from_row(row);
+                        let passes = conditions
+                            .iter()
+                            .map(|cond| eval_trigger_condition(cond, event, &image, &schema))
+                            .collect::<Result<Vec<_>>>()?
+                            .into_iter()
+                            .all(|b| b);
+                        if passes {
+                            matched.push(image);
+                        }
+                    }
+                    if let Some(pk) = schema.primary_key() {
+                        matched.sort_by(|a, b| {
+                            let av = a.columns.get(&pk.id).unwrap_or(&Value::Null);
+                            let bv = b.columns.get(&pk.id).unwrap_or(&Value::Null);
+                            value_order(av, bv).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                    }
+                    select_results.insert(id.clone(), matched);
+                }
+                TriggerStep::Foreach { id, steps } => {
+                    let rows = select_results.get(id).ok_or_else(|| {
+                        MongrelError::InvalidArgument(format!(
+                            "trigger {:?} foreach references unknown select id {id:?}",
+                            trigger.name
+                        ))
+                    })?;
+                    if rows.len() > config.max_loop_iterations as usize {
+                        return Err(MongrelError::InvalidArgument(format!(
+                            "trigger {:?} foreach exceeded max_loop_iterations ({})",
+                            trigger.name, config.max_loop_iterations
+                        )));
+                    }
+                    for row in rows.clone() {
+                        let result = self.execute_trigger_steps(
+                            trigger,
+                            steps,
+                            event,
+                            staging.as_deref_mut(),
+                            out,
+                            trigger_stack,
+                            config,
+                            select_results,
+                            depth + 1,
+                            Some(&row),
+                            read_epoch,
+                        )?;
+                        if result == TriggerProgramOutcome::Ignore {
+                            return Ok(TriggerProgramOutcome::Ignore);
+                        }
+                    }
+                }
+                TriggerStep::DeleteWhere { table, conditions } => {
+                    let schema = self.table(table)?.lock().schema().clone();
+                    let snapshot = Snapshot::at(read_epoch);
+                    let rows = self.table(table)?.lock().visible_rows(snapshot)?;
+                    let table_id = self.table_id(table)?;
+                    let mut to_delete = Vec::new();
+                    for row in rows {
+                        let image = TriggerRowImage::from_row(row.clone());
+                        let passes = conditions
+                            .iter()
+                            .map(|cond| eval_trigger_condition(cond, event, &image, &schema))
+                            .collect::<Result<Vec<_>>>()?
+                            .into_iter()
+                            .all(|b| b);
+                        if passes {
+                            to_delete.push((table_id, row.row_id));
+                        }
+                    }
+                    for (table_id, row_id) in to_delete {
+                        out.added
+                            .push((table_id, crate::txn::Staged::Delete(row_id)));
+                        out.added_stacks.push(trigger_stack.to_vec());
+                    }
+                }
+                TriggerStep::UpdateWhere {
+                    table,
+                    conditions,
+                    cells,
+                } => {
+                    let schema = self.table(table)?.lock().schema().clone();
+                    let snapshot = Snapshot::at(read_epoch);
+                    let rows = self.table(table)?.lock().visible_rows(snapshot)?;
+                    let table_id = self.table_id(table)?;
+                    let mut to_update = Vec::new();
+                    for row in rows {
+                        let image = TriggerRowImage::from_row(row.clone());
+                        let passes = conditions
+                            .iter()
+                            .map(|cond| eval_trigger_condition(cond, event, &image, &schema))
+                            .collect::<Result<Vec<_>>>()?
+                            .into_iter()
+                            .all(|b| b);
+                        if passes {
+                            let new_cells = cells
+                                .iter()
+                                .map(|cell| {
+                                    Ok((
+                                        cell.column_id,
+                                        eval_trigger_value(&cell.value, event, Some(&image))?,
+                                    ))
+                                })
+                                .collect::<Result<Vec<_>>>()?;
+                            let mut merged = row.columns.clone();
+                            for (column_id, value) in new_cells {
+                                merged.insert(column_id, value);
+                            }
+                            to_update.push((table_id, row.row_id, merged));
+                        }
+                    }
+                    for (table_id, row_id, merged) in to_update {
+                        out.added
+                            .push((table_id, crate::txn::Staged::Delete(row_id)));
+                        out.added_stacks.push(trigger_stack.to_vec());
+                        out.added.push((
+                            table_id,
+                            crate::txn::Staged::Put(merged.into_iter().collect()),
+                        ));
+                        out.added_stacks.push(trigger_stack.to_vec());
+                    }
+                }
                 TriggerStep::Raise { action, message } => match action {
                     TriggerRaiseAction::Ignore => return Ok(TriggerProgramOutcome::Ignore),
                     TriggerRaiseAction::Abort
                     | TriggerRaiseAction::Fail
                     | TriggerRaiseAction::Rollback => {
-                        let message = eval_trigger_value(message, &event)?;
+                        let message = eval_trigger_value(message, event, selected)?;
                         return Err(MongrelError::Conflict(format!(
                             "trigger {:?} raised: {}; trigger stack: {}",
                             trigger.name,
@@ -3936,16 +4139,22 @@ fn changed_columns(old: Option<&TriggerRowImage>, new: Option<&TriggerRowImage>)
 fn eval_trigger_cells(
     cells: &[crate::trigger::TriggerCell],
     event: &WriteEvent,
+    selected: Option<&TriggerRowImage>,
 ) -> Result<Vec<(u16, Value)>> {
     cells
         .iter()
-        .map(|cell| Ok((cell.column_id, eval_trigger_value(&cell.value, event)?)))
+        .map(|cell| {
+            Ok((
+                cell.column_id,
+                eval_trigger_value(&cell.value, event, selected)?,
+            ))
+        })
         .collect()
 }
 
 fn eval_trigger_expr(expr: &TriggerExpr, event: &WriteEvent) -> Result<bool> {
     match expr {
-        TriggerExpr::Value(value) => match eval_trigger_value(value, event)? {
+        TriggerExpr::Value(value) => match eval_trigger_value(value, event, None)? {
             Value::Bool(value) => Ok(value),
             Value::Null => Ok(false),
             other => Err(MongrelError::InvalidArgument(format!(
@@ -3953,21 +4162,155 @@ fn eval_trigger_expr(expr: &TriggerExpr, event: &WriteEvent) -> Result<bool> {
             ))),
         },
         TriggerExpr::Eq { left, right } => Ok(values_equal(
-            &eval_trigger_value(left, event)?,
-            &eval_trigger_value(right, event)?,
+            &eval_trigger_value(left, event, None)?,
+            &eval_trigger_value(right, event, None)?,
         )),
         TriggerExpr::NotEq { left, right } => Ok(!values_equal(
-            &eval_trigger_value(left, event)?,
-            &eval_trigger_value(right, event)?,
+            &eval_trigger_value(left, event, None)?,
+            &eval_trigger_value(right, event, None)?,
         )),
-        TriggerExpr::IsNull(value) => Ok(matches!(eval_trigger_value(value, event)?, Value::Null)),
-        TriggerExpr::IsNotNull(value) => {
-            Ok(!matches!(eval_trigger_value(value, event)?, Value::Null))
+        TriggerExpr::Lt { left, right } => match value_order(
+            &eval_trigger_value(left, event, None)?,
+            &eval_trigger_value(right, event, None)?,
+        ) {
+            Some(ordering) => Ok(ordering == std::cmp::Ordering::Less),
+            None => Ok(false),
+        },
+        TriggerExpr::Lte { left, right } => match value_order(
+            &eval_trigger_value(left, event, None)?,
+            &eval_trigger_value(right, event, None)?,
+        ) {
+            Some(ordering) => Ok(ordering != std::cmp::Ordering::Greater),
+            None => Ok(false),
+        },
+        TriggerExpr::Gt { left, right } => match value_order(
+            &eval_trigger_value(left, event, None)?,
+            &eval_trigger_value(right, event, None)?,
+        ) {
+            Some(ordering) => Ok(ordering == std::cmp::Ordering::Greater),
+            None => Ok(false),
+        },
+        TriggerExpr::Gte { left, right } => match value_order(
+            &eval_trigger_value(left, event, None)?,
+            &eval_trigger_value(right, event, None)?,
+        ) {
+            Some(ordering) => Ok(ordering != std::cmp::Ordering::Less),
+            None => Ok(false),
+        },
+        TriggerExpr::IsNull(value) => Ok(matches!(
+            eval_trigger_value(value, event, None)?,
+            Value::Null
+        )),
+        TriggerExpr::IsNotNull(value) => Ok(!matches!(
+            eval_trigger_value(value, event, None)?,
+            Value::Null
+        )),
+        TriggerExpr::And { left, right } => {
+            if !eval_trigger_expr(left, event)? {
+                Ok(false)
+            } else {
+                Ok(eval_trigger_expr(right, event)?)
+            }
+        }
+        TriggerExpr::Or { left, right } => {
+            if eval_trigger_expr(left, event)? {
+                Ok(true)
+            } else {
+                Ok(eval_trigger_expr(right, event)?)
+            }
+        }
+        TriggerExpr::Not(expr) => Ok(!eval_trigger_expr(expr, event)?),
+    }
+}
+
+fn eval_trigger_condition(
+    condition: &TriggerCondition,
+    event: &WriteEvent,
+    selected: &TriggerRowImage,
+    schema: &Schema,
+) -> Result<bool> {
+    match condition {
+        TriggerCondition::Pk { value } => {
+            let pk = schema.primary_key().ok_or_else(|| {
+                MongrelError::InvalidArgument(
+                    "trigger condition Pk references a table without a primary key".into(),
+                )
+            })?;
+            let lhs = eval_trigger_value(value, event, Some(selected))?;
+            Ok(values_equal(
+                &lhs,
+                selected.columns.get(&pk.id).unwrap_or(&Value::Null),
+            ))
+        }
+        TriggerCondition::Eq { column_id, value } => Ok(values_equal(
+            selected.columns.get(column_id).unwrap_or(&Value::Null),
+            &eval_trigger_value(value, event, Some(selected))?,
+        )),
+        TriggerCondition::NotEq { column_id, value } => Ok(!values_equal(
+            selected.columns.get(column_id).unwrap_or(&Value::Null),
+            &eval_trigger_value(value, event, Some(selected))?,
+        )),
+        TriggerCondition::Lt { column_id, value } => match value_order(
+            selected.columns.get(column_id).unwrap_or(&Value::Null),
+            &eval_trigger_value(value, event, Some(selected))?,
+        ) {
+            Some(ordering) => Ok(ordering == std::cmp::Ordering::Less),
+            None => Ok(false),
+        },
+        TriggerCondition::Lte { column_id, value } => match value_order(
+            selected.columns.get(column_id).unwrap_or(&Value::Null),
+            &eval_trigger_value(value, event, Some(selected))?,
+        ) {
+            Some(ordering) => Ok(ordering != std::cmp::Ordering::Greater),
+            None => Ok(false),
+        },
+        TriggerCondition::Gt { column_id, value } => match value_order(
+            selected.columns.get(column_id).unwrap_or(&Value::Null),
+            &eval_trigger_value(value, event, Some(selected))?,
+        ) {
+            Some(ordering) => Ok(ordering == std::cmp::Ordering::Greater),
+            None => Ok(false),
+        },
+        TriggerCondition::Gte { column_id, value } => match value_order(
+            selected.columns.get(column_id).unwrap_or(&Value::Null),
+            &eval_trigger_value(value, event, Some(selected))?,
+        ) {
+            Some(ordering) => Ok(ordering != std::cmp::Ordering::Less),
+            None => Ok(false),
+        },
+        TriggerCondition::IsNull { column_id } => Ok(matches!(
+            selected.columns.get(column_id),
+            None | Some(Value::Null)
+        )),
+        TriggerCondition::IsNotNull { column_id } => Ok(!matches!(
+            selected.columns.get(column_id),
+            None | Some(Value::Null)
+        )),
+        TriggerCondition::And { left, right } => {
+            if !eval_trigger_condition(left, event, selected, schema)? {
+                Ok(false)
+            } else {
+                Ok(eval_trigger_condition(right, event, selected, schema)?)
+            }
+        }
+        TriggerCondition::Or { left, right } => {
+            if eval_trigger_condition(left, event, selected, schema)? {
+                Ok(true)
+            } else {
+                Ok(eval_trigger_condition(right, event, selected, schema)?)
+            }
+        }
+        TriggerCondition::Not(condition) => {
+            Ok(!eval_trigger_condition(condition, event, selected, schema)?)
         }
     }
 }
 
-fn eval_trigger_value(value: &TriggerValue, event: &WriteEvent) -> Result<Value> {
+fn eval_trigger_value(
+    value: &TriggerValue,
+    event: &WriteEvent,
+    selected: Option<&TriggerRowImage>,
+) -> Result<Value> {
     match value {
         TriggerValue::Literal(value) => Ok(value.clone()),
         TriggerValue::NewColumn(column_id) => event
@@ -3982,6 +4325,12 @@ fn eval_trigger_value(value: &TriggerValue, event: &WriteEvent) -> Result<Value>
             .and_then(|row| row.columns.get(column_id))
             .cloned()
             .ok_or_else(|| MongrelError::InvalidArgument("OLD column is not available".into())),
+        TriggerValue::SelectedColumn(column_id) => selected
+            .and_then(|row| row.columns.get(column_id))
+            .cloned()
+            .ok_or_else(|| {
+                MongrelError::InvalidArgument("SELECTED column is not available".into())
+            }),
     }
 }
 
@@ -4002,6 +4351,30 @@ fn values_equal(left: &Value, right: &Value) -> bool {
     }
 }
 
+fn value_order(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {
+    match (left, right) {
+        (Value::Null, _) | (_, Value::Null) => None,
+        (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
+        (Value::Int64(a), Value::Int64(b)) => Some(a.cmp(b)),
+        // Cross-type Int64/Float64 comparison coerces the integer to f64.
+        // This matches the spec but can lose precision for i64 values above 2^53.
+        (Value::Int64(a), Value::Float64(b)) => {
+            let af = *a as f64;
+            Some(af.total_cmp(b))
+        }
+        // Cross-type Int64/Float64 comparison coerces the integer to f64.
+        // This matches the spec but can lose precision for i64 values above 2^53.
+        (Value::Float64(a), Value::Int64(b)) => {
+            let bf = *b as f64;
+            Some(a.total_cmp(&bf))
+        }
+        (Value::Float64(a), Value::Float64(b)) => Some(a.total_cmp(b)),
+        (Value::Bytes(a), Value::Bytes(b)) => Some(a.cmp(b)),
+        (Value::Embedding(_), Value::Embedding(_)) => None,
+        _ => None,
+    }
+}
+
 fn trigger_message(value: Value) -> String {
     match value {
         Value::Null => "NULL".into(),
@@ -4013,11 +4386,12 @@ fn trigger_message(value: Value) -> String {
     }
 }
 
-fn validate_trigger_step(
+fn validate_trigger_step<'a>(
     step: &TriggerStep,
-    cat: &Catalog,
+    cat: &'a Catalog,
     target_schema: &Schema,
     event: TriggerEvent,
+    select_schemas: &mut HashMap<String, &'a Schema>,
 ) -> Result<()> {
     match step {
         TriggerStep::SetNew { cells } => {
@@ -4061,11 +4435,50 @@ fn validate_trigger_step(
             validate_trigger_value(pk, target_schema, event)?;
         }
         TriggerStep::Select {
-            table, conditions, ..
+            id,
+            table,
+            conditions,
         } => {
             let schema = trigger_read_schema(cat, table)?;
             for condition in conditions {
                 validate_trigger_condition(condition, schema, target_schema, event)?;
+            }
+            if select_schemas.contains_key(id) {
+                return Err(MongrelError::InvalidArgument(format!(
+                    "duplicate select id {id:?} in trigger program"
+                )));
+            }
+            select_schemas.insert(id.clone(), schema);
+        }
+        TriggerStep::Foreach { id, steps } => {
+            if !select_schemas.contains_key(id) {
+                return Err(MongrelError::InvalidArgument(format!(
+                    "foreach references unknown select id {id:?}"
+                )));
+            }
+            let mut inner_select_schemas = select_schemas.clone();
+            for step in steps {
+                validate_trigger_step(step, cat, target_schema, event, &mut inner_select_schemas)?;
+            }
+        }
+        TriggerStep::DeleteWhere { table, conditions } => {
+            let schema = trigger_write_schema(cat, table, "delete")?;
+            for condition in conditions {
+                validate_trigger_condition(condition, schema, target_schema, event)?;
+            }
+        }
+        TriggerStep::UpdateWhere {
+            table,
+            conditions,
+            cells,
+        } => {
+            let schema = trigger_write_schema(cat, table, "update")?;
+            for condition in conditions {
+                validate_trigger_condition(condition, schema, target_schema, event)?;
+            }
+            for cell in cells {
+                validate_column_id(cell.column_id, schema)?;
+                validate_trigger_value(&cell.value, target_schema, event)?;
             }
         }
         TriggerStep::Raise { message, .. } => {
@@ -4137,12 +4550,24 @@ fn validate_trigger_condition(
             }
             validate_trigger_value(value, target_schema, event)
         }
-        TriggerCondition::Eq { column_id, value } => {
+        TriggerCondition::Eq { column_id, value }
+        | TriggerCondition::NotEq { column_id, value }
+        | TriggerCondition::Lt { column_id, value }
+        | TriggerCondition::Lte { column_id, value }
+        | TriggerCondition::Gt { column_id, value }
+        | TriggerCondition::Gte { column_id, value } => {
             validate_column_id(*column_id, schema)?;
             validate_trigger_value(value, target_schema, event)
         }
         TriggerCondition::IsNull { column_id } | TriggerCondition::IsNotNull { column_id } => {
             validate_column_id(*column_id, schema)
+        }
+        TriggerCondition::And { left, right } | TriggerCondition::Or { left, right } => {
+            validate_trigger_condition(left, schema, target_schema, event)?;
+            validate_trigger_condition(right, schema, target_schema, event)
+        }
+        TriggerCondition::Not(condition) => {
+            validate_trigger_condition(condition, schema, target_schema, event)
         }
     }
 }
@@ -4152,10 +4577,20 @@ fn validate_trigger_expr(expr: &TriggerExpr, schema: &Schema, event: TriggerEven
         TriggerExpr::Value(value) | TriggerExpr::IsNull(value) | TriggerExpr::IsNotNull(value) => {
             validate_trigger_value(value, schema, event)
         }
-        TriggerExpr::Eq { left, right } | TriggerExpr::NotEq { left, right } => {
+        TriggerExpr::Eq { left, right }
+        | TriggerExpr::NotEq { left, right }
+        | TriggerExpr::Lt { left, right }
+        | TriggerExpr::Lte { left, right }
+        | TriggerExpr::Gt { left, right }
+        | TriggerExpr::Gte { left, right } => {
             validate_trigger_value(left, schema, event)?;
             validate_trigger_value(right, schema, event)
         }
+        TriggerExpr::And { left, right } | TriggerExpr::Or { left, right } => {
+            validate_trigger_expr(left, schema, event)?;
+            validate_trigger_expr(right, schema, event)
+        }
+        TriggerExpr::Not(expr) => validate_trigger_expr(expr, schema, event),
     }
 }
 
@@ -4182,6 +4617,10 @@ fn validate_trigger_value(
             }
             validate_column_id(*id, schema)
         }
+        // SELECTED column references are only meaningful inside a foreach loop.
+        // Strict loop-scope validation is deferred to runtime; the executor raises
+        // an error if a selected row is not available.
+        TriggerValue::SelectedColumn(_) => Ok(()),
     }
 }
 
@@ -4324,5 +4763,134 @@ fn sweep_pending_txn_dirs(root: &Path, cat: &Catalog) {
         if txn_dir.exists() {
             let _ = std::fs::remove_dir_all(&txn_dir);
         }
+    }
+}
+
+#[cfg(test)]
+mod trigger_engine_tests {
+    use super::*;
+
+    fn event_with(new_cells: &[(u16, Value)], old_cells: &[(u16, Value)]) -> WriteEvent {
+        WriteEvent {
+            table: "test".into(),
+            kind: TriggerEvent::Insert,
+            new: Some(TriggerRowImage {
+                columns: new_cells.iter().cloned().collect(),
+            }),
+            old: Some(TriggerRowImage {
+                columns: old_cells.iter().cloned().collect(),
+            }),
+            changed_columns: Vec::new(),
+            op_indices: Vec::new(),
+            put_idx: None,
+            trigger_stack: Vec::new(),
+        }
+    }
+
+    fn event_insert(new_cells: &[(u16, Value)]) -> WriteEvent {
+        WriteEvent {
+            table: "test".into(),
+            kind: TriggerEvent::Insert,
+            new: Some(TriggerRowImage {
+                columns: new_cells.iter().cloned().collect(),
+            }),
+            old: None,
+            changed_columns: Vec::new(),
+            op_indices: Vec::new(),
+            put_idx: None,
+            trigger_stack: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn value_order_int64_vs_float64() {
+        assert_eq!(
+            value_order(&Value::Int64(5), &Value::Float64(5.0)),
+            Some(std::cmp::Ordering::Equal)
+        );
+        assert_eq!(
+            value_order(&Value::Int64(5), &Value::Float64(3.0)),
+            Some(std::cmp::Ordering::Greater)
+        );
+        assert_eq!(
+            value_order(&Value::Int64(2), &Value::Float64(3.0)),
+            Some(std::cmp::Ordering::Less)
+        );
+    }
+
+    #[test]
+    fn value_order_null_returns_none() {
+        assert_eq!(value_order(&Value::Int64(5), &Value::Null), None);
+        assert_eq!(value_order(&Value::Null, &Value::Int64(5)), None);
+        assert_eq!(value_order(&Value::Null, &Value::Null), None);
+    }
+
+    #[test]
+    fn value_order_cross_group_returns_none() {
+        assert_eq!(
+            value_order(&Value::Int64(5), &Value::Bytes(b"x".to_vec())),
+            None
+        );
+        assert_eq!(value_order(&Value::Bool(true), &Value::Int64(1)), None);
+        assert_eq!(
+            value_order(
+                &Value::Embedding(vec![1.0, 2.0]),
+                &Value::Embedding(vec![1.0, 2.0])
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn eval_trigger_expr_ranges_and_booleans() {
+        let expr = TriggerExpr::And {
+            left: Box::new(TriggerExpr::Gt {
+                left: TriggerValue::NewColumn(1),
+                right: TriggerValue::Literal(Value::Int64(0)),
+            }),
+            right: Box::new(TriggerExpr::Lte {
+                left: TriggerValue::NewColumn(1),
+                right: TriggerValue::Literal(Value::Int64(100)),
+            }),
+        };
+        assert!(eval_trigger_expr(&expr, &event_insert(&[(1, Value::Int64(50))])).unwrap());
+        assert!(!eval_trigger_expr(&expr, &event_insert(&[(1, Value::Int64(200))])).unwrap());
+        assert!(!eval_trigger_expr(&expr, &event_insert(&[(1, Value::Null)])).unwrap());
+
+        let or_expr = TriggerExpr::Or {
+            left: Box::new(TriggerExpr::Lt {
+                left: TriggerValue::NewColumn(1),
+                right: TriggerValue::Literal(Value::Int64(0)),
+            }),
+            right: Box::new(TriggerExpr::Not(Box::new(TriggerExpr::IsNull(
+                TriggerValue::OldColumn(2),
+            )))),
+        };
+        assert!(eval_trigger_expr(
+            &or_expr,
+            &event_with(&[(1, Value::Int64(5))], &[(2, Value::Int64(99))])
+        )
+        .unwrap());
+        assert!(!eval_trigger_expr(
+            &or_expr,
+            &event_with(&[(1, Value::Int64(5))], &[(2, Value::Null)])
+        )
+        .unwrap());
+
+        assert!(eval_trigger_expr(
+            &TriggerExpr::Value(TriggerValue::Literal(Value::Bool(true))),
+            &event_insert(&[])
+        )
+        .unwrap());
+        assert!(!eval_trigger_expr(
+            &TriggerExpr::Value(TriggerValue::Literal(Value::Bool(false))),
+            &event_insert(&[])
+        )
+        .unwrap());
+        assert!(!eval_trigger_expr(
+            &TriggerExpr::Value(TriggerValue::Literal(Value::Null)),
+            &event_insert(&[])
+        )
+        .unwrap());
     }
 }

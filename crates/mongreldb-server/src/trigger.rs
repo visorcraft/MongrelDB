@@ -86,7 +86,13 @@ pub async fn drop_trigger(
             .db
             .drop_trigger(&name)
             .map(|()| json!({ "status": "ok" }))
-            .map_err(|e| Box::new(error(StatusCode::NOT_FOUND, "TRIGGER_NOT_FOUND", &e.to_string())))
+            .map_err(|e| {
+                Box::new(error(
+                    StatusCode::NOT_FOUND,
+                    "TRIGGER_NOT_FOUND",
+                    &e.to_string(),
+                ))
+            })
     })
 }
 
