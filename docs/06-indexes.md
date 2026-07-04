@@ -73,6 +73,18 @@ IndexDef { name: "status_bm".into(), column_id: 3, kind: IndexKind::Bitmap }
 Condition::BitmapEq { column_id: 3, value: b"active".to_vec() }
 ```
 
+A bitmap index on a `Bytes` column also accelerates **anchored prefix matching**
+(`LIKE 'prefix%'`): `Condition::BytesPrefix` enumerates the bitmap's distinct
+keys and unions those starting with the prefix — an exact lookup with no residual
+re-check, tighter than `FmContains` for anchored matches.
+
+```rust
+IndexDef { name: "key_bm".into(), column_id: 2, kind: IndexKind::Bitmap }
+
+// Query: all rows whose `key` (Bytes) starts with "user:".
+Condition::BytesPrefix { column_id: 2, prefix: b"user:".to_vec() }
+```
+
 ### 3. PGM (Learned Index) — Range Queries
 
 **What it does:** Finds all rows where a numeric column falls within a range.

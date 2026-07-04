@@ -140,9 +140,12 @@ session.clear_cache();
 ## Materialized Views
 
 Register a named SQL query as a view. `SELECT * FROM <view_name>` is
-transparently rewritten to run the view's defining SQL:
+transparently rewritten to run the view's defining SQL. Views can be created
+either through the Rust session API or with standard `CREATE VIEW` / `DROP VIEW`
+SQL:
 
 ```rust
+// Rust API:
 session.create_view(
     "active_users",
     "SELECT * FROM users WHERE status = 'active'"
@@ -152,7 +155,35 @@ session.create_view(
 let batches = session.run("SELECT count(*) FROM active_users").await?;
 ```
 
+```sql
+-- SQL (works in any client that runs SQL: the daemon, the NAPI addon's
+-- db.sql(), the Kit's Database::sql(), etc.):
+CREATE VIEW active_users AS SELECT id, email FROM users WHERE status = 'active';
+SELECT count(*) FROM active_users;
+DROP VIEW IF EXISTS active_users;
+```
+
 Views are invalidated on commit just like regular cached queries.
+
+> **Views are session-scoped, not persisted.** A view lives in the `MongrelSession`
+> that created it — it is not written to the catalog or WAL. The NAPI addon's
+> `Database` and the Kit's `Database` cache one session for the database's
+> lifetime, so a view created via `db.sql("CREATE VIEW ...")` persists across
+> subsequent `sql()` calls on the same handle. Closing and reopening the database
+> starts a fresh session (re-apply any view-defining migrations then). The daemon
+> opens a fresh session per `/sql` HTTP request, so views do **not** persist
+> across daemon calls — define them in a long-lived application process instead.
+
+### Node.js example
+
+```javascript
+import { tableFromIPC } from 'apache-arrow';
+
+// Create the view, then query it in a second sql() call — both hit the same
+// cached session on the Database handle.
+await db.sql('CREATE VIEW vip AS SELECT id, email FROM users WHERE score >= 90');
+const vips = tableFromIPC(await db.sql('SELECT * FROM vip ORDER BY id'));
+```
 
 ## Column Statistics
 

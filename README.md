@@ -206,10 +206,12 @@ In practice, encryption adds negligible latency to bulk ingest and queries
 
 MongrelDB also ships as a native NAPI addon (`crates/mongreldb-node`) — the
 **better-sqlite3 model**: in-process, no HTTP hop, so the sub-ms write latency
-isn't lost to a round-trip. It exposes a **typed object/method API** (not SQL)
-with a hybrid `query` that composes ANN, FM, bitmap equality/IN, and range
-conditions in a single row-id-space intersection. TypeScript types are generated
-at build time, and row ids / counts / epochs cross the FFI as lossless `BigInt`:
+isn't lost to a round-trip. It exposes both a **typed object/method API** and a
+**full SQL surface**: the hybrid `query` composes ANN, FM, bitmap equality/IN,
+range, null, and `BytesPrefix` conditions in a single row-id-space intersection,
+while `db.sql(sql)` runs cross-table SQL (DataFusion) and returns Arrow IPC.
+TypeScript types are generated at build time, and row ids / counts / epochs cross
+the FFI as lossless `BigInt`:
 
 ```sh
 cd crates/mongreldb-node && npm install && npm run build   # release NAPI addon + typings
@@ -219,8 +221,15 @@ A `smoke.mjs` exercises put/get/count and a hybrid query against the live addon.
 Create/open a `Database`, create tables with `createTable`, then operate through
 `db.table(name)`. The table handle exposes `put`, `putBatch`, `bulkLoadTyped`,
 `query`, `queryArrow`, `count`, and `countWhere`; Promise variants are available
-for blocking read/write methods. `RemoteDatabase` routes to a
-`mongreldb-server` daemon for multi-process cache sharing.
+for blocking read/write methods. The `Database` also exposes `sql(sql)` (returns
+Arrow IPC bytes), `createTable`/`dropTable`/`renameTable`, and procedure/trigger
+management. `RemoteDatabase` routes to a `mongreldb-server` daemon for
+multi-process cache sharing.
+
+The addon's `Database` holds a long-lived SQL session for the database's
+lifetime, so session-scoped objects — views (`CREATE VIEW`), prepared
+statements, and the result cache — persist across `sql()` calls. Reopening the
+database starts a fresh session (re-apply any view-defining migrations then).
 
 ## Benchmarks
 

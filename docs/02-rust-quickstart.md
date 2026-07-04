@@ -172,11 +172,15 @@ println!("Found {} rows", results.len());
 | `Pk(key)` | Exact primary-key lookup | HOT (trie) |
 | `BitmapEq { column_id, value }` | Column equals a value | Roaring bitmap |
 | `BitmapIn { column_id, values }` | Column is one of several values | Bitmap union |
+| `BytesPrefix { column_id, prefix }` | Anchored `LIKE 'prefix%'` on a Bytes column | Bitmap key-prefix scan (exact) |
 | `Range { column_id, lo, hi }` | Integer column in a range | PGM learned index |
 | `RangeF64 { column_id, lo, hi, ... }` | Float column in a range | PGM / page prune |
 | `FmContains { column_id, pattern }` | Text contains a substring | FM-index |
+| `FmContainsAll { column_id, patterns }` | Text contains all substrings | FM-index intersection |
 | `Ann { column_id, query, k }` | k nearest neighbors by vector | HNSW |
 | `SparseMatch { column_id, query, k }` | Top-k sparse vector match | Inverted index |
+| `MinHashSimilar { column_id, query, k }` | Top-k Jaccard set similarity | MinHash LSH |
+| `IsNull { column_id }` / `IsNotNull { column_id }` | Null check | Page-stat prune |
 
 ### Combining Conditions
 

@@ -43,22 +43,22 @@ node --version  # should print v16 or higher
 
 ### Option A: Use MongrelDB in a Rust project
 
-Add MongrelDB to your `Cargo.toml`:
+Add MongrelDB to your `Cargo.toml` (both crates are published to crates.io):
 
 ```toml
 [dependencies]
-mongreldb-core = { path = "../path/to/mongreldb/crates/mongreldb-core" }
-mongreldb-query = { path = "../path/to/mongreldb/crates/mongreldb-query" }
+mongreldb-core = "0.24"   # storage engine (always needed)
+mongreldb-query = "0.24"  # SQL frontend (optional; needed for MongrelSession / views / Arrow)
 ```
-
-Or if you're publishing to a registry, replace the paths with version numbers
-once published.
 
 For encryption support, add the `encryption` feature:
 
 ```toml
-mongreldb-core = { path = "...", features = ["encryption"] }
+mongreldb-core = { version = "0.24", features = ["encryption"] }
 ```
+
+To build against a local checkout of the engine instead, use path dependencies
+or a `[patch.crates-io]` block pointing at the repo.
 
 ### Option B: Use MongrelDB in a Node.js project
 

@@ -164,6 +164,39 @@ const arrowBytes = users.queryArrow([
 ]);
 ```
 
+`BytesPrefix` resolves an anchored `LIKE 'prefix%'` exactly on a bitmap-indexed
+`Bytes` column (no residual re-check):
+
+```javascript
+// Find rows whose `key` column (Bytes, bitmap-indexed) starts with "user:".
+const userRows = db.table('events').query([
+  { kind: ConditionKind.BytesPrefix, columnId: 2, text: 'user:' },
+]);
+```
+
+## Running SQL
+
+`db.sql(sql)` runs a SQL statement through the embedded DataFusion frontend and
+returns the result as Arrow IPC bytes (decode with `apache-arrow`'s
+`tableFromIPC`). Read statements return rows; DDL/DML (`CREATE TABLE`,
+`CREATE VIEW`, `INSERT`, `ANALYZE`, `VACUUM`) return an empty buffer.
+
+```javascript
+const { tableFromIPC } = require('apache-arrow');
+
+// Cross-table SQL read → Arrow table.
+const users = tableFromIPC(await db.sql('SELECT id, email FROM users WHERE score > 90'));
+
+// DDL: create a view, then query it in a subsequent call.
+await db.sql("CREATE VIEW vip AS SELECT id, email FROM users WHERE score >= 90");
+const vips = tableFromIPC(await db.sql('SELECT * FROM vip ORDER BY id'));
+```
+
+The `Database` caches its SQL session for the database's lifetime, so
+session-scoped objects — views, prepared statements, the result cache — persist
+across `sql()` calls. Closing and reopening the database starts a fresh session
+(re-apply any view-defining migrations then).
+
 ## Transactions
 
 Use `begin()` for atomic multi-table staging:

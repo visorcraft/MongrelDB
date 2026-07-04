@@ -143,6 +143,96 @@ vector (a list of token IDs with weights), and each row's column 7 stores
 a sparse vector in the same format. This is the retrieval model used by
 SPLADE and other learned sparse retrievers.
 
+### Anchored Prefix on Bytes (Bitmap)
+
+```rust
+Condition::BytesPrefix {
+    column_id: 2,
+    prefix: b"user:".to_vec(),
+}
+```
+
+Finds rows where column 2 (a `Bytes` column with a bitmap index) starts with the
+bytes `user:`. This is the exact equivalent of SQL `LIKE 'prefix%'` (no
+wildcards in `prefix`), but resolves **exactly** — the bitmap's distinct keys are
+enumerated and filtered by prefix, with no residual re-check. Tighter and faster
+than `FmContains` for anchored matches on indexed Bytes columns. Returns an empty
+set if the column has no bitmap index.
+
+### Null checks
+
+```rust
+Condition::IsNull { column_id: 3 }      // column 3 IS NULL
+Condition::IsNotNull { column_id: 3 }   // column 3 IS NOT NULL
+```
+
+Page-stat pruned: pages whose statistics show all-non-null (for `IsNull`) or
+all-null (for `IsNotNull`) are skipped entirely.
+
+### Multi-segment substring (FM-index)
+
+```rust
+Condition::FmContainsAll {
+    column_id: 4,
+    patterns: vec![b"hello".to_vec(), b"world".to_vec()],
+}
+```
+
+Like `FmContains` but intersects multiple substrings (`LIKE '%a%b%c%'`). Returns
+a superset — the caller re-checks order/wildcards if needed.
+
+### Set similarity (MinHash / LSH)
+
+```rust
+Condition::MinHashSimilar {
+    column_id: 8,
+    query: vec![0x1234, 0x5678, 0xabcd],  // hashed query-set members
+    k: 10,
+}
+```
+
+Top-k Jaccard set similarity via MinHash + LSH. The query set arrives as
+pre-hashed members; each row's column 8 stores the same hash signature format.
+
+## Node.js (NAPI addon)
+
+The same condition set is available from JavaScript via `ConditionSpec` and the
+`ConditionKind` enum (TypeScript types ship in `native.d.ts`). Build a query as
+an array of `ConditionSpec` objects and pass it to `table.query(conditions)` (or
+`queryArrow` for Arrow IPC bytes):
+
+```javascript
+import { ConditionKind } from '@visorcraft/mongreldb';
+
+const table = db.table('events');
+
+// Bitmap equality on a low-cardinality column.
+const active = table.query([
+  { kind: ConditionKind.BitmapEq, columnId: 3, text: 'active' },
+]);
+
+// Anchored prefix on a bitmap-indexed Bytes column (exact pushdown).
+const userEvents = table.query([
+  { kind: ConditionKind.BytesPrefix, columnId: 2, text: 'user:' },
+]);
+
+// Hybrid: combine an ANN search with a bitmap filter in one intersection.
+const relevant = table.query([
+  { kind: ConditionKind.Ann, columnId: 6, embedding: queryVector, k: 10 },
+  { kind: ConditionKind.BitmapEq, columnId: 3, text: 'published' },
+]);
+
+// Arrow IPC bytes (zero-copy columnar) instead of JS objects.
+const ipc = table.queryArrow([
+  { kind: ConditionKind.RangeInt, columnId: 1, int64Lo: 100n, int64Hi: 9223372036854775807n },
+]);
+```
+
+`ConditionSpec` fields: `kind`, `columnId`, `int64Lo`/`int64Hi` (BigInt),
+`float64Lo`/`float64Hi`, `text` (used by `BitmapEq`, `FmContains`,
+`BytesPrefix`), `values` (`BitmapIn`, `MinHashSimilar`), `embedding` + `k`
+(`Ann`), `sparseTokens` + `sparseWeights` (`SparseMatch`).
+
 ## Combining Conditions
 
 This is where the Condition API shines. You can mix any conditions on any
