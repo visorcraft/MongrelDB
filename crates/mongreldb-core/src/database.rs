@@ -1226,6 +1226,7 @@ impl Database {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn expand_trigger_chunk(
         &self,
         mut chunk: Vec<(u64, crate::txn::Staged)>,
@@ -1637,11 +1638,12 @@ impl Database {
         Ok(events)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn execute_trigger_program(
         &self,
         trigger: &StoredTrigger,
         event: &WriteEvent,
-        mut staging: Option<&mut Vec<(u64, crate::txn::Staged)>>,
+        staging: Option<&mut Vec<(u64, crate::txn::Staged)>>,
         out: &mut TriggerProgramOutput<'_>,
         trigger_stack: &[String],
         config: &TriggerConfig,
@@ -1653,7 +1655,7 @@ impl Database {
             trigger,
             &trigger.program.steps,
             &mut event,
-            staging.as_deref_mut(),
+            staging,
             out,
             trigger_stack,
             config,
@@ -1664,6 +1666,7 @@ impl Database {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn execute_trigger_steps(
         &self,
         trigger: &StoredTrigger,
