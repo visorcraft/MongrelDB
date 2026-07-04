@@ -119,7 +119,6 @@ fn us(d: Duration) -> String {
 // ── MongrelDB ─────────────────────────────────────────────────────────────
 
 fn mongrel(n: i64, encrypted: bool) -> Times {
-    let dir = tempfile::tempdir().unwrap();
     let mut t = Times::default();
 
     // bulk_insert: time a fresh bulk_load
