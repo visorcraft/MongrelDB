@@ -118,7 +118,13 @@ export const enum ConditionKind {
   IsNotNull = 9,
   FmContainsAll = 10,
   SparseMatch = 11,
-  MinHashSimilar = 12
+  MinHashSimilar = 12,
+  /**
+   * Anchored prefix match `LIKE 'prefix%'` on a Bytes column with a bitmap
+   * index. Exact (no residual re-check) — the bitmap's distinct keys are
+   * enumerated and filtered by prefix. The prefix bytes arrive in `text`.
+   */
+  BytesPrefix = 13
 }
 /**
  * One predicate over the shared row-id space. Set the fields appropriate to
@@ -264,7 +270,11 @@ export declare class Database {
   compactTable(name: string): boolean
   /** Return the path passed to `withPath` / `open`. */
   directory(): string
-  /** Run a cross-table SQL query. Returns Arrow IPC bytes. */
+  /**
+   * Run a cross-table SQL query. Returns Arrow IPC bytes. The session is
+   * held for the database's lifetime, so session-scoped objects (views,
+   * prepared statements, the result cache) persist across calls.
+   */
   sql(sql: string): Promise<Buffer>
   /** Flush + release. Optional — the `Database` also drops on GC. */
   close(): void

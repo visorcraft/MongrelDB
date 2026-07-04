@@ -469,6 +469,10 @@ pub enum ConditionKind {
     FmContainsAll,
     SparseMatch,
     MinHashSimilar,
+    /// Anchored prefix match `LIKE 'prefix%'` on a Bytes column with a bitmap
+    /// index. Exact (no residual re-check) — the bitmap's distinct keys are
+    /// enumerated and filtered by prefix. The prefix bytes arrive in `text`.
+    BytesPrefix,
 }
 
 /// One predicate over the shared row-id space. Set the fields appropriate to
@@ -585,6 +589,10 @@ fn build_condition(spec: &ConditionSpec) -> napi::Result<Condition> {
                 k: spec.k.unwrap_or(10) as usize,
             }
         }
+        ConditionKind::BytesPrefix => Condition::BytesPrefix {
+            column_id: spec.column_id,
+            prefix: text_bytes(spec)?,
+        },
     })
 }
 
@@ -687,6 +695,12 @@ use mongreldb_core::Database as CoreDatabase;
 pub struct Database {
     inner: Arc<CoreDatabase>,
     path: String,
+    /// Lazily-initialized long-lived SQL session. Views, prepared statements,
+    /// and the result cache are session-scoped (the engine does not persist
+    /// them), so the addon holds one session for the database's lifetime
+    /// rather than opening one per `sql()` call — mirroring how the daemon
+    /// and long-lived apps use MongrelDB.
+    session: parking_lot::Mutex<Option<mongreldb_query::MongrelSession>>,
 }
 
 /// A handle to one table inside a [`Database`].
@@ -912,6 +926,7 @@ impl Database {
         Ok(Database {
             inner: Arc::new(db),
             path,
+            session: parking_lot::Mutex::new(None),
         })
     }
 
@@ -922,6 +937,7 @@ impl Database {
         Ok(Database {
             inner: Arc::new(db),
             path,
+            session: parking_lot::Mutex::new(None),
         })
     }
 
@@ -1221,16 +1237,24 @@ impl Database {
         self.path.clone()
     }
 
-    /// Run a cross-table SQL query. Returns Arrow IPC bytes.
+    /// Run a cross-table SQL query. Returns Arrow IPC bytes. The session is
+    /// held for the database's lifetime, so session-scoped objects (views,
+    /// prepared statements, the result cache) persist across calls.
     #[napi]
     pub async fn sql(&self, sql: String) -> napi::Result<Buffer> {
-        let db = Arc::clone(&self.inner);
-        let session = mongreldb_query::MongrelSession::open(db)
-            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e:?}")))?;
+        // Take the cached session out of the mutex (or build one on first use)
+        // so no lock is held across the async `run`.
+        let session = match self.session.lock().take() {
+            Some(s) => s,
+            None => mongreldb_query::MongrelSession::open(Arc::clone(&self.inner))
+                .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e:?}")))?,
+        };
         let batches = session
             .run(&sql)
             .await
             .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e:?}")))?;
+        // Preserve the session (and any views/state created during the call).
+        *self.session.lock() = Some(session);
         native_cols_to_ipc_from_batches(&batches)
     }
 
@@ -1256,6 +1280,7 @@ impl Database {
         Ok(Database {
             inner: Arc::new(db),
             path,
+            session: parking_lot::Mutex::new(None),
         })
     }
 
@@ -1266,6 +1291,7 @@ impl Database {
         Ok(Database {
             inner: Arc::new(db),
             path,
+            session: parking_lot::Mutex::new(None),
         })
     }
 }

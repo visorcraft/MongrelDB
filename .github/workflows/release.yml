@@ -1,5 +1,6 @@
 # Builds the native addon and publishes @visorcraft/mongreldb to npm, and
-# publishes the mongreldb-core Rust crate to crates.io, on a tag.
+# publishes the mongreldb-core and mongreldb-query Rust crates to crates.io,
+# on a tag.
 #
 # Single-platform: bundles a linux-x64-gnu .node (matches what ships today), so
 # the package only installs on linux-x64 — fine for the Roamarr container and a
@@ -16,9 +17,10 @@
 # npm/crates.io both refuse to republish an existing version, so the tag must
 # be a new version.
 #
-# mongreldb-query is not published (never has been; nothing outside this repo
-# depends on it — only mongreldb-core is a public crates.io dependency, e.g.
-# for MongrelDB Kit).
+# mongreldb-query is published alongside mongreldb-core (MongrelDB Kit's Rust
+# crate depends on it for its SQL surface — Database::sql()/sql_arrow() and
+# view/analyze/vacuum migration ops). mongreldb-core publishes first, since
+# mongreldb-query depends on it and crates.io strips path deps at publish time.
 #
 # Requires repo secrets:
 #   NPM_TOKEN            — granular npm token, read+write on @visorcraft
@@ -76,5 +78,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - run: cargo publish -p mongreldb-core
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      # mongreldb-query depends on mongreldb-core (published above) and is in
+      # turn a dependency of mongreldb-kit's SQL surface. Must follow core.
+      - run: cargo publish -p mongreldb-query
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
