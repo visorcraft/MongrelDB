@@ -1,6 +1,6 @@
 //! mongreldb-server entry point.
 
-use mongreldb_server::{build_app, spawn_auto_compactor};
+use mongreldb_server::{build_app_with_config, spawn_auto_compactor};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -10,11 +10,38 @@ use mongreldb_core::Database;
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: {} <db_dir> [port]", args[0]);
+        eprintln!("usage: {} <db_dir> [port] [--auth-token <token>] [--max-connections <n>]", args[0]);
         std::process::exit(1);
     }
     let db_dir = &args[1];
     let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(8453);
+
+    // Parse optional flags from the remaining args.
+    let mut auth_token: Option<String> = None;
+    let mut max_connections: Option<usize> = None;
+    let mut i = 3;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--auth-token" => {
+                auth_token = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--max-connections" => {
+                max_connections = args.get(i + 1).and_then(|s| s.parse().ok());
+                i += 2;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    if auth_token.is_some() {
+        eprintln!("authentication enabled (Bearer token required)");
+    }
+    if let Some(max) = max_connections {
+        eprintln!("connection limit: {max}");
+    }
 
     let db = Arc::new(Database::open(db_dir).unwrap_or_else(|e| {
         eprintln!("failed to open {db_dir}: {e}");
@@ -22,7 +49,7 @@ async fn main() {
     }));
     // §5.9: background cost-aware compaction (run-count trigger).
     spawn_auto_compactor(Arc::clone(&db));
-    let app = build_app(db);
+    let app = build_app_with_config(db, std::iter::empty(), auth_token, max_connections);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     eprintln!("mongreldb-server listening on http://{addr}");

@@ -36,22 +36,34 @@ struct AppState {
     db: Arc<Database>,
     idem: kit::IdempotencyStore,
     external_modules: Vec<Arc<dyn ExternalTableModule>>,
+    auth_token: Option<String>,
 }
 
 pub fn build_app(db: Arc<Database>) -> axum::Router {
-    build_app_with_external_modules(db, std::iter::empty::<Arc<dyn ExternalTableModule>>())
+    build_app_with_config(db, std::iter::empty::<Arc<dyn ExternalTableModule>>(), None, None)
 }
 
 pub fn build_app_with_external_modules(
     db: Arc<Database>,
     external_modules: impl IntoIterator<Item = Arc<dyn ExternalTableModule>>,
 ) -> axum::Router {
+    build_app_with_config(db, external_modules, None, None)
+}
+
+/// Build the daemon router with optional auth token and max-connections limit.
+pub fn build_app_with_config(
+    db: Arc<Database>,
+    external_modules: impl IntoIterator<Item = Arc<dyn ExternalTableModule>>,
+    auth_token: Option<String>,
+    max_connections: Option<usize>,
+) -> axum::Router {
     let state = Arc::new(AppState {
         idem: kit::IdempotencyStore::new(db.root()),
         db,
         external_modules: external_modules.into_iter().collect(),
+        auth_token,
     });
-    axum::Router::new()
+    let router = axum::Router::new()
         .route("/health", get(health))
         .route("/tables", get(list_tables).post(create_table))
         .route("/tables/{name}", axum::routing::delete(drop_table))
@@ -84,7 +96,48 @@ pub fn build_app_with_external_modules(
         .route("/kit/procedures/{name}/call", post(procedure::kit_call))
         .route("/compact", post(compact_all))
         .route("/tables/{name}/compact", post(compact_table))
-        .with_state(state)
+        .with_state(state.clone());
+
+    // Apply auth middleware if a token is configured.
+    let router = if state.auth_token.is_some() {
+        router.layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
+    } else {
+        router
+    };
+
+    // Apply connection limit if configured.
+    let router = if let Some(max) = max_connections {
+        router.layer(tower::limit::ConcurrencyLimitLayer::new(max))
+    } else {
+        router
+    };
+
+    router
+}
+
+/// Bearer-token auth middleware. Checks `Authorization: Bearer <token>` header
+/// against the configured token. If no token is configured on AppState, auth
+/// is disabled (all requests pass through).
+async fn auth_middleware(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<axum::response::Response, axum::http::StatusCode> {
+    let expected = state.auth_token.as_ref().unwrap();
+    let header = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let provided = header.strip_prefix("Bearer ").unwrap_or("");
+    if provided == expected {
+        Ok(next.run(req).await)
+    } else {
+        Err(axum::http::StatusCode::UNAUTHORIZED)
+    }
 }
 
 /// Launch the §5.9 background auto-compaction sweep (run-count cost trigger).
@@ -459,4 +512,70 @@ async fn txn(State(state): State<Arc<AppState>>, Json(req): Json<TxnRequest>) ->
 enum TxnAction {
     Put(Vec<(u16, Value)>),
     Delete(u64),
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+    use mongreldb_core::Database;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn auth_rejects_missing_token() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(Database::create(dir.path()).unwrap());
+        let app = build_app_with_config(db, std::iter::empty(), Some("secret".into()), None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        // Give the server a moment to start.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://{addr}/health"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn auth_accepts_valid_token() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(Database::create(dir.path()).unwrap());
+        let app = build_app_with_config(db, std::iter::empty(), Some("secret".into()), None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://{addr}/health"))
+            .header("Authorization", "Bearer secret")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn no_auth_when_token_unset() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(Database::create(dir.path()).unwrap());
+        let app = build_app_with_config(db, std::iter::empty(), None, None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://{addr}/health"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
 }
