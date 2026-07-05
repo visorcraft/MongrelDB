@@ -90,6 +90,9 @@ pub enum IndexKindSpec {
     Ann,
     Sparse,
     MinHash,
+    /// Learned zonemap (PGM) for ordered range predicates. Engine SQL aliases:
+    /// `brin`, `learned_range`, `range`.
+    LearnedRange,
 }
 
 #[napi(object)]
@@ -237,6 +240,7 @@ fn build_schema(spec: SchemaSpec) -> napi::Result<Schema> {
                 IndexKindSpec::Ann => IndexKind::Ann,
                 IndexKindSpec::Sparse => IndexKind::Sparse,
                 IndexKindSpec::MinHash => IndexKind::MinHash,
+                IndexKindSpec::LearnedRange => IndexKind::LearnedRange,
             },
         })
         .collect();

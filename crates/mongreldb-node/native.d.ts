@@ -17,7 +17,12 @@ export const enum IndexKindSpec {
   FmIndex = 1,
   Ann = 2,
   Sparse = 3,
-  MinHash = 4
+  MinHash = 4,
+  /**
+   * Learned zonemap (PGM) for ordered range predicates. Engine SQL aliases:
+   * `brin`, `learned_range`, `range`.
+   */
+  LearnedRange = 5
 }
 export interface ColumnSpec {
   id: number
