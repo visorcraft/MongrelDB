@@ -55,16 +55,19 @@ fn schema() -> Schema {
             IndexDef {
                 name: "blurb_fm".into(),
                 column_id: 3,
+                predicate: None,
                 kind: IndexKind::FmIndex,
             },
             IndexDef {
                 name: "category_bm".into(),
                 column_id: 4,
+                predicate: None,
                 kind: IndexKind::Bitmap,
             },
             IndexDef {
                 name: "vec_ann".into(),
                 column_id: 5,
+                predicate: None,
                 kind: IndexKind::Ann,
             },
         ],

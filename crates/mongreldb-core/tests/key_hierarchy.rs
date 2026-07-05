@@ -61,6 +61,7 @@ fn schema_indexable_eq() -> Schema {
             name: "label_eq".into(),
             column_id: 2,
             kind: IndexKind::Bitmap,
+            predicate: None,
         }],
         colocation: vec![],
         constraints: Default::default(),

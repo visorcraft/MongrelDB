@@ -27,6 +27,7 @@ fn schema() -> Schema {
             name: "v_learned".into(),
             column_id: 2,
             kind: IndexKind::LearnedRange,
+            predicate: None,
         }],
         colocation: vec![],
         constraints: Default::default(),

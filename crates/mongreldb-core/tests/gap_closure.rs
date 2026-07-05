@@ -183,6 +183,7 @@ fn native_aggregate_matches_expected() {
             name: "v_bitmap".into(),
             column_id: 2,
             kind: IndexKind::Bitmap,
+            predicate: None,
         }],
         colocation: vec![],
         constraints: Default::default(),

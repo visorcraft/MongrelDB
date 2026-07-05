@@ -583,6 +583,7 @@ async fn join_and_planning_diagnostics() {
             name: "orders_cust_bm".into(),
             column_id: 2,
             kind: IndexKind::Bitmap,
+            predicate: None,
         }],
         colocation: vec![],
         constraints: Default::default(),

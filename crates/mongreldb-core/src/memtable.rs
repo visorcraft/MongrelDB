@@ -54,7 +54,11 @@ impl Value {
                 out
             }
             Value::Decimal(d) => d.to_be_bytes().to_vec(),
-            Value::Interval { months, days, nanos } => {
+            Value::Interval {
+                months,
+                days,
+                nanos,
+            } => {
                 let mut out = Vec::with_capacity(20);
                 out.extend_from_slice(&months.to_be_bytes());
                 out.extend_from_slice(&days.to_be_bytes());

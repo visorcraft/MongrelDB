@@ -1566,7 +1566,8 @@ impl MongrelSession {
         if let Some(db) = &self.database {
             for t in db.triggers() {
                 let target_name = match &t.target {
-                    mongreldb_core::trigger::TriggerTarget::Table(n) | mongreldb_core::trigger::TriggerTarget::View(n) => n.clone(),
+                    mongreldb_core::trigger::TriggerTarget::Table(n)
+                    | mongreldb_core::trigger::TriggerTarget::View(n) => n.clone(),
                 };
                 types.push("trigger".into());
                 names.push(t.name.clone());

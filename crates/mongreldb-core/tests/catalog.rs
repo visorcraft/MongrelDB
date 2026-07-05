@@ -27,6 +27,7 @@ fn sample_schema() -> Schema {
             name: "pk".into(),
             column_id: 1,
             kind: IndexKind::Bitmap,
+            predicate: None,
         }],
         colocation: vec![],
         constraints: Default::default(),

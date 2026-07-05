@@ -215,7 +215,11 @@ impl Tri {
             }
             Value::Interval { .. } => Tri::Unknown,
             Value::Decimal(d) => {
-                if *d != 0 { Tri::True } else { Tri::False }
+                if *d != 0 {
+                    Tri::True
+                } else {
+                    Tri::False
+                }
             }
         }
     }

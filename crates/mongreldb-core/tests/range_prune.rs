@@ -45,6 +45,7 @@ fn schema() -> Schema {
             name: "tag_bm".into(),
             column_id: 4,
             kind: IndexKind::Bitmap,
+            predicate: None,
         }],
         colocation: vec![],
         constraints: Default::default(),

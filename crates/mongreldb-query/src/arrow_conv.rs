@@ -197,9 +197,7 @@ pub(crate) fn arrow_data_type(ty: &TypeId) -> Result<DataType> {
             Arc::new(Field::new("item", DataType::Float32, true)),
             *dim as i32,
         ),
-        TypeId::Decimal128 { precision, scale } => {
-            DataType::Decimal128(*precision, *scale)
-        }
+        TypeId::Decimal128 { precision, scale } => DataType::Decimal128(*precision, *scale),
     })
 }
 

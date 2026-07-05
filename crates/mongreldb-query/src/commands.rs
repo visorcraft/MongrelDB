@@ -311,9 +311,7 @@ fn try_manual_command(
                 sp.truncate(pos);
                 len
             })
-            .ok_or_else(|| {
-                MongrelQueryError::Schema(format!("no savepoint named '{name}'"))
-            })?;
+            .ok_or_else(|| MongrelQueryError::Schema(format!("no savepoint named '{name}'")))?;
         if let Some(ops) = staged.as_ref() {
             let mut ops = ops.clone();
             ops.truncate(target_len);
@@ -573,13 +571,18 @@ fn parse_notify_args(_lower_rest: &str, original_rest: &str) -> Result<(String, 
     // Pattern: NOTIFY channel_name  or  NOTIFY channel_name, 'payload'
     let trimmed = original_rest.trim().trim_end_matches(';').trim();
     if let Some((channel, payload)) = trimmed.split_once(',') {
-        let channel = channel.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+        let channel = channel
+            .trim()
+            .trim_matches(|c| c == '"' || c == '\'')
+            .to_string();
         let payload = payload.trim().trim_matches(|c| c == '\'').to_string();
         Ok((channel, Some(payload)))
     } else {
         let channel = trimmed.trim_matches(|c| c == '"' || c == '\'').to_string();
         if channel.is_empty() {
-            return Err(MongrelQueryError::Schema("NOTIFY requires a channel name".into()));
+            return Err(MongrelQueryError::Schema(
+                "NOTIFY requires a channel name".into(),
+            ));
         }
         Ok((channel, None))
     }
@@ -1876,11 +1879,8 @@ fn create_index(session: &MongrelSession, db: &Arc<Database>, index: CreateIndex
             "CREATE UNIQUE INDEX is not supported by core SQL; use MongrelDB Kit unique constraints".into(),
         ));
     }
-    if index.predicate.is_some() {
-        return Err(MongrelQueryError::Schema(
-            "partial indexes are not supported".into(),
-        ));
-    }
+    // Serialize the partial-index predicate (if any) as a SQL string.
+    let predicate = index.predicate.as_ref().map(|expr| expr.to_string());
     let table = object_name(&index.table_name)?;
     let mut schema = table_schema(db, &table)?;
     let name = index
@@ -1909,6 +1909,14 @@ fn create_index(session: &MongrelSession, db: &Arc<Database>, index: CreateIndex
         index.columns,
         index_kind_from_sql(index.using.as_ref())?,
     )?;
+    // Attach the predicate to the newly created index defs.
+    if let Some(pred) = &predicate {
+        for idx in schema.indexes.iter_mut() {
+            if idx.name.starts_with(&name) {
+                idx.predicate = Some(pred.clone());
+            }
+        }
+    }
     rebuild_table(session, db, &table, schema)?;
     session.clear_cache();
     Ok(())
@@ -2399,9 +2407,7 @@ fn apply_order_by(
         for expr in order_by {
             let col_name = match &expr.expr {
                 sqlparser::ast::Expr::Identifier(ident) => &ident.value,
-                sqlparser::ast::Expr::CompoundIdentifier(idents) => {
-                    &idents.last().unwrap().value
-                }
+                sqlparser::ast::Expr::CompoundIdentifier(idents) => &idents.last().unwrap().value,
                 _ => continue,
             };
             let col_id = match name_to_id.get(col_name) {
@@ -3194,7 +3200,10 @@ fn sql_type_to_core(data_type: &DataType) -> Result<TypeId> {
         "varchar" | "character varying" | "char varying" | "text" | "string" | "bytes"
         | "bytea" | "blob" | "varbinary" | "binary" => Ok(TypeId::Bytes),
         "boolean" | "bool" => Ok(TypeId::Bool),
-        "decimal" | "numeric" => Ok(TypeId::Decimal128 { precision: 38, scale: 2 }),
+        "decimal" | "numeric" => Ok(TypeId::Decimal128 {
+            precision: 38,
+            scale: 2,
+        }),
         "date" => Ok(TypeId::Date32),
         "time" => Ok(TypeId::Time64),
         "timestamp" | "datetime" => Ok(TypeId::TimestampNanos),
@@ -3541,7 +3550,11 @@ fn trigger_message(value: Value) -> String {
         Value::Bytes(value) => String::from_utf8_lossy(&value).into_owned(),
         Value::Embedding(value) => format!("{value:?}"),
         Value::Decimal(value) => value.to_string(),
-        Value::Interval { months, days, nanos } => format!("{months} months {days} days {nanos} nanos"),
+        Value::Interval {
+            months,
+            days,
+            nanos,
+        } => format!("{months} months {days} days {nanos} nanos"),
     }
 }
 
@@ -3723,6 +3736,7 @@ fn add_index_defs(
             name: idx_name,
             column_id: col.id,
             kind,
+            predicate: None,
         });
     }
     Ok(())
@@ -4011,7 +4025,11 @@ fn core_value_json(value: &Value) -> serde_json::Value {
                 .collect(),
         ),
         Value::Decimal(value) => serde_json::Value::String(value.to_string()),
-        Value::Interval { months, days, nanos } => serde_json::json!({"months": months, "days": days, "nanos": nanos}),
+        Value::Interval {
+            months,
+            days,
+            nanos,
+        } => serde_json::json!({"months": months, "days": days, "nanos": nanos}),
     }
 }
 
@@ -4555,7 +4573,11 @@ fn pragma_index_list(
     let names: Vec<String> = schema.indexes.iter().map(|i| i.name.clone()).collect();
     let unique: Vec<i64> = schema.indexes.iter().map(|_| 0).collect();
     let origin: Vec<String> = schema.indexes.iter().map(|_| "c".to_string()).collect();
-    let partial: Vec<i64> = schema.indexes.iter().map(|_| 0).collect();
+    let partial: Vec<i64> = schema
+        .indexes
+        .iter()
+        .map(|idx| idx.predicate.is_some() as i64)
+        .collect();
     index_list_batch(seq, names, unique, origin, partial)
 }
 

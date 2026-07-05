@@ -52,8 +52,12 @@ impl TypeId {
             TypeId::Int8 | TypeId::UInt8 => Some(1),
             TypeId::Int16 | TypeId::UInt16 => Some(2),
             TypeId::Int32 | TypeId::UInt32 | TypeId::Float32 | TypeId::Date32 => Some(4),
-            TypeId::Int64 | TypeId::UInt64 | TypeId::Float64 | TypeId::TimestampNanos
-            | TypeId::Date64 | TypeId::Time64 => Some(8),
+            TypeId::Int64
+            | TypeId::UInt64
+            | TypeId::Float64
+            | TypeId::TimestampNanos
+            | TypeId::Date64
+            | TypeId::Time64 => Some(8),
             TypeId::Bytes | TypeId::Embedding { .. } => None,
             TypeId::Decimal128 { .. } => Some(16),
             TypeId::Interval => Some(20), // i64 months + i32 days + i64 nanos
@@ -178,6 +182,11 @@ pub struct IndexDef {
     pub name: String,
     pub column_id: u16,
     pub kind: IndexKind,
+    /// Partial index predicate: a SQL WHERE clause expression serialized as
+    /// a string (e.g. `"deleted_at IS NULL"`). Only rows matching this
+    /// predicate are indexed. `None` means all rows are indexed (full index).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predicate: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

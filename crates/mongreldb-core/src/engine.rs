@@ -6089,6 +6089,7 @@ impl Table {
             name: format!("{}_learned_range", column_name),
             column_id: cid,
             kind: IndexKind::LearnedRange,
+            predicate: None,
         });
         self.schema.schema_id = self.schema.schema_id.saturating_add(1);
         write_schema(&self.dir, &self.schema)?;

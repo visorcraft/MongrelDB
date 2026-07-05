@@ -28,6 +28,7 @@ fn schema() -> Schema {
             name: "name_bm".into(),
             column_id: 2,
             kind: IndexKind::Bitmap,
+            predicate: None,
         }],
         colocation: vec![],
         constraints: Default::default(),

@@ -39,6 +39,7 @@ fn schema() -> Schema {
             name: "cat_bitmap".into(),
             column_id: 2,
             kind: IndexKind::Bitmap,
+            predicate: None,
         }],
         colocation: vec![],
         constraints: Default::default(),

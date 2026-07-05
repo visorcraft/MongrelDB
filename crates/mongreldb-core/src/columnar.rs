@@ -41,7 +41,11 @@ pub fn encode_column(ty: TypeId, values: &[Value]) -> Result<Vec<u8>> {
             })?
         }
         TypeId::Interval => fixed_encode(values, 20, |v| match v {
-            Value::Interval { months, days, nanos } => {
+            Value::Interval {
+                months,
+                days,
+                nanos,
+            } => {
                 let mut out = Vec::with_capacity(20);
                 out.extend_from_slice(&months.to_be_bytes());
                 out.extend_from_slice(&days.to_be_bytes());
@@ -170,7 +174,11 @@ pub fn decode_column(ty: TypeId, page: &[u8], n: usize, le: bool) -> Result<Vec<
                 let months = i64::from_be_bytes(b[0..8].try_into().unwrap());
                 let days = i32::from_be_bytes(b[8..12].try_into().unwrap());
                 let nanos = i64::from_be_bytes(b[12..20].try_into().unwrap());
-                Value::Interval { months, days, nanos }
+                Value::Interval {
+                    months,
+                    days,
+                    nanos,
+                }
             }
             other => {
                 return Err(MongrelError::Schema(format!(
@@ -1083,10 +1091,12 @@ fn full_validity(n: usize) -> Vec<u8> {
 pub fn null_native(ty: TypeId, n: usize) -> NativeColumn {
     let validity = vec![0u8; n.div_ceil(8)];
     match ty {
-        TypeId::Int64 | TypeId::TimestampNanos | TypeId::Date64 | TypeId::Time64 => NativeColumn::Int64 {
-            data: vec![0; n],
-            validity,
-        },
+        TypeId::Int64 | TypeId::TimestampNanos | TypeId::Date64 | TypeId::Time64 => {
+            NativeColumn::Int64 {
+                data: vec![0; n],
+                validity,
+            }
+        }
         TypeId::Float64 => NativeColumn::Float64 {
             data: vec![0.0; n],
             validity,

@@ -6,11 +6,14 @@ use mongreldb_core::schema::TypeId;
 
 #[test]
 fn decimal_encode_decode_roundtrip() {
-    let ty = TypeId::Decimal128 { precision: 38, scale: 2 };
+    let ty = TypeId::Decimal128 {
+        precision: 38,
+        scale: 2,
+    };
     let values = vec![
-        Value::Decimal(12345),    // 123.45
-        Value::Decimal(-67890),   // -678.90
-        Value::Decimal(0),        // 0.00
+        Value::Decimal(12345),  // 123.45
+        Value::Decimal(-67890), // -678.90
+        Value::Decimal(0),      // 0.00
         Value::Null,
         Value::Decimal(i128::MAX),
     ];

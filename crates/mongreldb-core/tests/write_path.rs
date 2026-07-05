@@ -31,6 +31,7 @@ fn schema() -> Schema {
             name: "by_label".into(),
             column_id: 2,
             kind: IndexKind::Bitmap,
+            predicate: None,
         }],
         colocation: vec![],
         constraints: Default::default(),

@@ -39,11 +39,13 @@ fn test_schema() -> Schema {
                 name: "city_bm".into(),
                 column_id: 2,
                 kind: IndexKind::Bitmap,
+                predicate: None,
             },
             IndexDef {
                 name: "cost_lr".into(),
                 column_id: 3,
                 kind: IndexKind::LearnedRange,
+                predicate: None,
             },
         ],
         colocation: vec![],

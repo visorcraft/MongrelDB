@@ -87,11 +87,13 @@ fn users_schema() -> Schema {
                 name: "pk".into(),
                 column_id: 1,
                 kind: IndexKind::Bitmap,
+                predicate: None,
             },
             IndexDef {
                 name: "status_idx".into(),
                 column_id: 2,
                 kind: IndexKind::Bitmap,
+                predicate: None,
             },
         ],
         colocation: Vec::new(),

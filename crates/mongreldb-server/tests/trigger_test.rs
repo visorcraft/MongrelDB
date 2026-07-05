@@ -244,6 +244,7 @@ fn create_table_with_bitmap_indexes(
             name: format!("idx_{column_id}"),
             column_id,
             kind: IndexKind::Bitmap,
+            predicate: None,
         })
         .collect();
     let schema = Schema {

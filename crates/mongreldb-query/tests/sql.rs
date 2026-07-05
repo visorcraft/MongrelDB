@@ -46,11 +46,13 @@ fn schema() -> Schema {
                 name: "dest_bitmap".into(),
                 column_id: 2,
                 kind: mongreldb_core::schema::IndexKind::Bitmap,
+                predicate: None,
             },
             mongreldb_core::schema::IndexDef {
                 name: "dest_fm".into(),
                 column_id: 2,
                 kind: mongreldb_core::schema::IndexKind::FmIndex,
+                predicate: None,
             },
         ],
         colocation: vec![],
@@ -366,6 +368,7 @@ fn vec_schema() -> Schema {
             name: "vec_ann".into(),
             column_id: 2,
             kind: mongreldb_core::schema::IndexKind::Ann,
+            predicate: None,
         }],
         colocation: vec![],
         constraints: Default::default(),
@@ -435,6 +438,7 @@ fn cities_schema() -> Schema {
             name: "country_bitmap".into(),
             column_id: 2,
             kind: mongreldb_core::schema::IndexKind::Bitmap,
+            predicate: None,
         }],
         colocation: vec![],
         constraints: Default::default(),
@@ -618,6 +622,7 @@ async fn multi_run_streams_and_limit_short_circuits() {
             name: "v_bm".into(),
             column_id: 2,
             kind: IndexKind::Bitmap,
+            predicate: None,
         }],
         colocation: vec![],
         constraints: Default::default(),
@@ -1383,7 +1388,10 @@ async fn information_schema_lists_tables() {
         .await
         .unwrap();
     let rows = total_rows(&batches);
-    assert!(rows >= 1, "information_schema.tables should list the travel_trips table, got {rows}");
+    assert!(
+        rows >= 1,
+        "information_schema.tables should list the travel_trips table, got {rows}"
+    );
 }
 
 #[tokio::test]
@@ -1414,10 +1422,7 @@ async fn attach_database_enables_cross_db_query() {
     session.run(&attach_sql).await.unwrap();
 
     // Query the attached table by qualified name (alias_table).
-    let batches = session
-        .run("SELECT id FROM other_items")
-        .await
-        .unwrap();
+    let batches = session.run("SELECT id FROM other_items").await.unwrap();
     let rows = total_rows(&batches);
     assert_eq!(rows, 1, "attached table should have 1 row, got {rows}");
 }

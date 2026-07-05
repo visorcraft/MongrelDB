@@ -58,6 +58,7 @@ fn trips_schema() -> Schema {
             name: "dest_bm".into(),
             column_id: 2,
             kind: IndexKind::Bitmap,
+            predicate: None,
         }],
         colocation: vec![],
         constraints: Default::default(),

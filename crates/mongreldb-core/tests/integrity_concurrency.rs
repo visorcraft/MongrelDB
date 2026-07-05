@@ -26,6 +26,7 @@ fn test_schema() -> Schema {
             name: "value_bitmap".into(),
             column_id: 1,
             kind: IndexKind::Bitmap,
+            predicate: None,
         }],
         colocation: vec![],
         constraints: Default::default(),

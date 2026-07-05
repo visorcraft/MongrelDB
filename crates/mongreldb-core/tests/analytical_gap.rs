@@ -29,6 +29,7 @@ fn schema() -> Schema {
             name: "cost_bm".into(),
             column_id: 2,
             kind: IndexKind::Bitmap,
+            predicate: None,
         }],
         colocation: vec![],
         constraints: Default::default(),

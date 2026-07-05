@@ -372,8 +372,11 @@ impl Database {
         let lock_path = root.join("_meta").join(".lock");
         let canonical = lock_path.canonicalize().unwrap_or(lock_path.clone());
         let lock_file = {
-            static LOCKED_PATHS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> = std::sync::OnceLock::new();
-            let locked = LOCKED_PATHS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+            static LOCKED_PATHS: std::sync::OnceLock<
+                std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+            > = std::sync::OnceLock::new();
+            let locked = LOCKED_PATHS
+                .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
             let mut guard = locked.lock().unwrap();
             if guard.contains(&canonical) {
                 // Already locked by this process — allow the re-open.
@@ -385,11 +388,12 @@ impl Database {
                     .write(true)
                     .open(&lock_path)?;
                 use fs2::FileExt;
-                f.try_lock_exclusive()
-                    .map_err(|e| MongrelError::Io(std::io::Error::other(format!(
+                f.try_lock_exclusive().map_err(|e| {
+                    MongrelError::Io(std::io::Error::other(format!(
                         "database at {} is locked by another process: {e}",
                         root.display()
-                    ))))?;
+                    )))
+                })?;
                 guard.insert(canonical.clone());
                 Some(f)
             }
@@ -4472,7 +4476,11 @@ fn trigger_message(value: Value) -> String {
         Value::Bytes(value) => String::from_utf8_lossy(&value).into_owned(),
         Value::Embedding(value) => format!("{value:?}"),
         Value::Decimal(value) => value.to_string(),
-        Value::Interval { months, days, nanos } => format!("{months}m {days}d {nanos}ns"),
+        Value::Interval {
+            months,
+            days,
+            nanos,
+        } => format!("{months}m {days}d {nanos}ns"),
     }
 }
 
