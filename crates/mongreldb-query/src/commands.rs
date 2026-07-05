@@ -3192,8 +3192,13 @@ fn sql_type_to_core(data_type: &DataType) -> Result<TypeId> {
             Ok(TypeId::Float64)
         }
         "varchar" | "character varying" | "char varying" | "text" | "string" | "bytes"
-        | "bytea" | "blob" | "varbinary" => Ok(TypeId::Bytes),
+        | "bytea" | "blob" | "varbinary" | "binary" => Ok(TypeId::Bytes),
         "boolean" | "bool" => Ok(TypeId::Bool),
+        "decimal" | "numeric" => Ok(TypeId::Decimal128 { precision: 38, scale: 2 }),
+        "date" => Ok(TypeId::Date32),
+        "time" => Ok(TypeId::Time64),
+        "timestamp" | "datetime" => Ok(TypeId::TimestampNanos),
+        "interval" => Ok(TypeId::Interval),
         other => Err(MongrelQueryError::Schema(format!(
             "unsupported column type: {other}"
         ))),
@@ -3536,6 +3541,7 @@ fn trigger_message(value: Value) -> String {
         Value::Bytes(value) => String::from_utf8_lossy(&value).into_owned(),
         Value::Embedding(value) => format!("{value:?}"),
         Value::Decimal(value) => value.to_string(),
+        Value::Interval { months, days, nanos } => format!("{months} months {days} days {nanos} nanos"),
     }
 }
 
@@ -4005,6 +4011,7 @@ fn core_value_json(value: &Value) -> serde_json::Value {
                 .collect(),
         ),
         Value::Decimal(value) => serde_json::Value::String(value.to_string()),
+        Value::Interval { months, days, nanos } => serde_json::json!({"months": months, "days": days, "nanos": nanos}),
     }
 }
 

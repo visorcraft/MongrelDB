@@ -363,6 +363,10 @@ fn type_name(ty: mongreldb_core::schema::TypeId) -> &'static str {
         Date32 => "date32",
         Bytes => "bytes",
         Embedding { .. } => "embedding",
+        Date64 => "date64",
+        Time64 => "time64",
+        Interval => "interval",
+        Decimal128 { .. } => "decimal128",
     }
 }
 
@@ -1080,5 +1084,7 @@ pub(crate) fn value_to_json(v: &Value) -> Jval {
                 .collect();
             Jval::Array(arr)
         }
+        Value::Decimal(d) => Jval::String(d.to_string()),
+        Value::Interval { .. } => Jval::Null,
     }
 }

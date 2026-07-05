@@ -33,9 +33,22 @@ pub fn encode_column(ty: TypeId, values: &[Value]) -> Result<Vec<u8>> {
             Value::Null => Ok(vec![0; 8]),
             _ => Err(type_mismatch(ty, v)),
         })?,
-        TypeId::TimestampNanos => fixed_encode(values, 8, |v| match v {
-            Value::Int64(x) => Ok(x.to_be_bytes().to_vec()),
-            Value::Null => Ok(vec![0; 8]),
+        TypeId::TimestampNanos | TypeId::Date64 | TypeId::Time64 => {
+            fixed_encode(values, 8, |v| match v {
+                Value::Int64(x) => Ok(x.to_be_bytes().to_vec()),
+                Value::Null => Ok(vec![0; 8]),
+                _ => Err(type_mismatch(ty, v)),
+            })?
+        }
+        TypeId::Interval => fixed_encode(values, 20, |v| match v {
+            Value::Interval { months, days, nanos } => {
+                let mut out = Vec::with_capacity(20);
+                out.extend_from_slice(&months.to_be_bytes());
+                out.extend_from_slice(&days.to_be_bytes());
+                out.extend_from_slice(&nanos.to_be_bytes());
+                Ok(out)
+            }
+            Value::Null => Ok(vec![0; 20]),
             _ => Err(type_mismatch(ty, v)),
         })?,
         TypeId::Bool => fixed_encode(values, 1, |v| match v {
@@ -112,7 +125,7 @@ pub fn decode_column(ty: TypeId, page: &[u8], n: usize, le: bool) -> Result<Vec<
             continue;
         }
         let val = match ty {
-            TypeId::Int64 | TypeId::TimestampNanos => {
+            TypeId::Int64 | TypeId::TimestampNanos | TypeId::Date64 | TypeId::Time64 => {
                 let b = take(payload, &mut cur, 8)?;
                 Value::Int64(i64_at(&b))
             }
@@ -151,6 +164,13 @@ pub fn decode_column(ty: TypeId, page: &[u8], n: usize, le: bool) -> Result<Vec<
                 let b = take(payload, &mut cur, 16)?;
                 let arr: [u8; 16] = b.try_into().unwrap();
                 Value::Decimal(i128::from_be_bytes(arr))
+            }
+            TypeId::Interval => {
+                let b = take(payload, &mut cur, 20)?;
+                let months = i64::from_be_bytes(b[0..8].try_into().unwrap());
+                let days = i32::from_be_bytes(b[8..12].try_into().unwrap());
+                let nanos = i64::from_be_bytes(b[12..20].try_into().unwrap());
+                Value::Interval { months, days, nanos }
             }
             other => {
                 return Err(MongrelError::Schema(format!(
@@ -259,6 +279,8 @@ fn advance_null(ty: &TypeId, payload: &[u8], cur: &mut usize) -> Result<()> {
         TypeId::Int32 | TypeId::UInt32 | TypeId::Date32 => 4,
         TypeId::Bool => 1,
         TypeId::Decimal128 { .. } => 16,
+        TypeId::Date64 | TypeId::Time64 => 8,
+        TypeId::Interval => 20,
         // Variable-length types: null rows have no payload bytes; the offsets
         // table covers them, so nothing to advance here.
         TypeId::Bytes | TypeId::Embedding { .. } => return Ok(()),
@@ -1061,7 +1083,7 @@ fn full_validity(n: usize) -> Vec<u8> {
 pub fn null_native(ty: TypeId, n: usize) -> NativeColumn {
     let validity = vec![0u8; n.div_ceil(8)];
     match ty {
-        TypeId::Int64 | TypeId::TimestampNanos => NativeColumn::Int64 {
+        TypeId::Int64 | TypeId::TimestampNanos | TypeId::Date64 | TypeId::Time64 => NativeColumn::Int64 {
             data: vec![0; n],
             validity,
         },
@@ -1274,7 +1296,7 @@ pub fn values_to_native(ty: TypeId, values: &[Value]) -> NativeColumn {
     let n = values.len();
     let mut non_null = vec![false; n];
     match ty {
-        TypeId::Int64 | TypeId::TimestampNanos => {
+        TypeId::Int64 | TypeId::TimestampNanos | TypeId::Date64 | TypeId::Time64 => {
             let mut data = Vec::with_capacity(n);
             for (i, v) in values.iter().enumerate() {
                 match v {
@@ -1357,7 +1379,7 @@ pub fn rows_to_native(ty: TypeId, rows: &[Vec<(u16, Value)>], column_id: u16) ->
         row.iter().find(|(id, _)| *id == column_id).map(|(_, v)| v)
     }
     match ty {
-        TypeId::Int64 | TypeId::TimestampNanos => {
+        TypeId::Int64 | TypeId::TimestampNanos | TypeId::Date64 | TypeId::Time64 => {
             let mut data = Vec::with_capacity(n);
             for (i, row) in rows.iter().enumerate() {
                 match at(row, column_id) {
@@ -1689,7 +1711,7 @@ pub fn decode_page_native(ty: TypeId, page: &[u8], n: usize) -> Result<NativeCol
 
     // Step 4: plain payload — dispatch on type.
     match ty {
-        TypeId::Int64 | TypeId::TimestampNanos => {
+        TypeId::Int64 | TypeId::TimestampNanos | TypeId::Date64 | TypeId::Time64 => {
             let (validity, p) = split_validity(&raw)?;
             Ok(NativeColumn::Int64 {
                 data: take_i64(p)?,

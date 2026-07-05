@@ -22,6 +22,14 @@ pub enum TypeId {
     Float64,
     TimestampNanos,
     Date32,
+    /// Millisecond-precision date (days since epoch × 86400000). Same i64
+    /// storage as TimestampNanos; distinct for SQL type affinity.
+    Date64,
+    /// Nanosecond-precision time-of-day (no date component). Stored as i64.
+    Time64,
+    /// SQL INTERVAL (months + days + nanoseconds). Stored as 16 bytes
+    /// (i64 months, i32 days, i64 nanos).
+    Interval,
     /// Variable-length bytes (covers UTF-8 strings).
     Bytes,
     /// Fixed-size binary embedding of `dim` f32 components.
@@ -44,9 +52,11 @@ impl TypeId {
             TypeId::Int8 | TypeId::UInt8 => Some(1),
             TypeId::Int16 | TypeId::UInt16 => Some(2),
             TypeId::Int32 | TypeId::UInt32 | TypeId::Float32 | TypeId::Date32 => Some(4),
-            TypeId::Int64 | TypeId::UInt64 | TypeId::Float64 | TypeId::TimestampNanos => Some(8),
+            TypeId::Int64 | TypeId::UInt64 | TypeId::Float64 | TypeId::TimestampNanos
+            | TypeId::Date64 | TypeId::Time64 => Some(8),
             TypeId::Bytes | TypeId::Embedding { .. } => None,
             TypeId::Decimal128 { .. } => Some(16),
+            TypeId::Interval => Some(20), // i64 months + i32 days + i64 nanos
         }
     }
 }

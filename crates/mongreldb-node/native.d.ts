@@ -9,8 +9,12 @@ export const enum ColumnType {
   Float64 = 2,
   TimestampNanos = 3,
   Date32 = 4,
-  Bytes = 5,
-  Embedding = 6
+  Date64 = 5,
+  Time64 = 6,
+  Interval = 7,
+  Bytes = 8,
+  Embedding = 9,
+  Decimal128 = 10
 }
 export const enum IndexKindSpec {
   Bitmap = 0,

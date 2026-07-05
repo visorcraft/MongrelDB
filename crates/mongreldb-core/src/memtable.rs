@@ -28,6 +28,12 @@ pub enum Value {
     /// Unscaled decimal value (i128). The column's `TypeId::Decimal128`
     /// carries the precision/scale for formatting.
     Decimal(i128),
+    /// SQL INTERVAL value: months, days, nanoseconds.
+    Interval {
+        months: i64,
+        days: i32,
+        nanos: i64,
+    },
 }
 
 impl Value {
@@ -48,6 +54,13 @@ impl Value {
                 out
             }
             Value::Decimal(d) => d.to_be_bytes().to_vec(),
+            Value::Interval { months, days, nanos } => {
+                let mut out = Vec::with_capacity(20);
+                out.extend_from_slice(&months.to_be_bytes());
+                out.extend_from_slice(&days.to_be_bytes());
+                out.extend_from_slice(&nanos.to_be_bytes());
+                out
+            }
         }
     }
 }
@@ -88,6 +101,7 @@ impl Row {
                 Value::Bytes(b) => 16 + b.len() as u64,
                 Value::Embedding(v) => 16 + (v.len() as u64) * 4,
                 Value::Decimal(_) => 16,
+                Value::Interval { .. } => 20,
             };
         }
         n

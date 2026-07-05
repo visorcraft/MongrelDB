@@ -364,23 +364,36 @@ impl Database {
         existing: bool,
     ) -> Result<Self> {
         // Acquire an exclusive cross-process lock on the database directory.
-        // This prevents two processes from opening the same DB simultaneously
-        // (which would corrupt data). The lock is held for the Database's
-        // lifetime via the `_lock` field.
+        // This prevents two *processes* from opening the same DB simultaneously
+        // (which would corrupt data). Multiple opens within the *same* process
+        // are allowed (they share memory via Arc) — so we track locked paths in
+        // a process-global set and skip re-locking if already held.
         std::fs::create_dir_all(root.join("_meta")).ok();
         let lock_path = root.join("_meta").join(".lock");
-        let lock_file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&lock_path)?;
-        use fs2::FileExt;
-        lock_file
-            .try_lock_exclusive()
-            .map_err(|e| MongrelError::Io(std::io::Error::other(format!(
-                "database at {} is locked by another process: {e}",
-                root.display()
-            ))))?;
+        let canonical = lock_path.canonicalize().unwrap_or(lock_path.clone());
+        let lock_file = {
+            static LOCKED_PATHS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> = std::sync::OnceLock::new();
+            let locked = LOCKED_PATHS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+            let mut guard = locked.lock().unwrap();
+            if guard.contains(&canonical) {
+                // Already locked by this process — allow the re-open.
+                None
+            } else {
+                let f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .write(true)
+                    .open(&lock_path)?;
+                use fs2::FileExt;
+                f.try_lock_exclusive()
+                    .map_err(|e| MongrelError::Io(std::io::Error::other(format!(
+                        "database at {} is locked by another process: {e}",
+                        root.display()
+                    ))))?;
+                guard.insert(canonical.clone());
+                Some(f)
+            }
+        };
 
         let epoch = Arc::new(EpochAuthority::new(cat.db_epoch));
         let snapshots = Arc::new(SnapshotRegistry::new());
@@ -507,7 +520,7 @@ impl Database {
             trigger_max_loop_iterations: AtomicU32::new(
                 TriggerConfig::default().max_loop_iterations,
             ),
-            _lock: Some(lock_file),
+            _lock: lock_file,
             notify: {
                 let (tx, _rx) = tokio::sync::broadcast::channel(256);
                 tx
@@ -4459,6 +4472,7 @@ fn trigger_message(value: Value) -> String {
         Value::Bytes(value) => String::from_utf8_lossy(&value).into_owned(),
         Value::Embedding(value) => format!("{value:?}"),
         Value::Decimal(value) => value.to_string(),
+        Value::Interval { months, days, nanos } => format!("{months}m {days}d {nanos}ns"),
     }
 }
 

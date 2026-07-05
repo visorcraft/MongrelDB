@@ -88,6 +88,7 @@ fn value_to_string(v: &Value) -> String {
             format!("[{}]", inner.join(","))
         }
         Value::Decimal(d) => d.to_string(),
+        Value::Interval { months, days, nanos } => format!("{months}m {days}d {nanos}ns"),
     }
 }
 
