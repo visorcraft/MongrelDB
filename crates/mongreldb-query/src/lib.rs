@@ -1321,10 +1321,17 @@ pub struct MongrelSession {
     /// On `run("SELECT * FROM <view>")`, the defining SQL is executed (or the
     /// result-cache is hit). Invalidated automatically on commit (epoch bump).
     views: parking_lot::Mutex<HashMap<String, ViewDef>>,
+    /// Databases attached via `ATTACH 'path' AS alias`, kept alive for the
+    /// session's lifetime so their tables remain registered on the DataFusion
+    /// context. Keyed by alias.
+    attached_databases: parking_lot::Mutex<HashMap<String, Arc<Database>>>,
     /// SQL `BEGIN`/`COMMIT` staging for DML statements. Reads remain
     /// snapshot-at-scan; this batches SQL writes atomically when a client sends
     /// an explicit transaction block.
     sql_txn: parking_lot::Mutex<Option<Vec<commands::PendingSqlOp>>>,
+    /// SAVEPOINT stack: `(name, staged-ops-length-at-savepoint)`. Truncated on
+    /// `ROLLBACK TO name` and removed on `RELEASE name`.
+    savepoints: parking_lot::Mutex<Vec<(String, usize)>>,
     /// Per-session state for SQL compatibility functions such as changes().
     sql_fn_state: Arc<extended_sql_functions::ExtendedSqlState>,
     /// Built-in plus app-provided external table modules available to this
@@ -1354,6 +1361,8 @@ impl MongrelSession {
             plan_cache: parking_lot::Mutex::new(HashMap::new()),
             tables: parking_lot::Mutex::new(HashMap::new()),
             views: parking_lot::Mutex::new(HashMap::new()),
+            attached_databases: parking_lot::Mutex::new(HashMap::new()),
+            savepoints: parking_lot::Mutex::new(Vec::new()),
             sql_txn: parking_lot::Mutex::new(None),
             sql_fn_state,
             external_modules,
@@ -1421,6 +1430,8 @@ impl MongrelSession {
             plan_cache: parking_lot::Mutex::new(HashMap::new()),
             tables: parking_lot::Mutex::new(tables),
             views: parking_lot::Mutex::new(HashMap::new()),
+            attached_databases: parking_lot::Mutex::new(HashMap::new()),
+            savepoints: parking_lot::Mutex::new(Vec::new()),
             sql_txn: parking_lot::Mutex::new(None),
             sql_fn_state,
             external_modules,
@@ -1525,6 +1536,71 @@ impl MongrelSession {
     /// (`CREATE TABLE`, `DROP TABLE`, `ALTER TABLE`) are intercepted when a
     /// `Database` is attached and mapped to the catalog. Repeated identical SQL
     /// against the same snapshot returns the cached batches without re-executing.
+    /// Intercept `SELECT ... FROM sqlite_master` / `sqlite_schema` and return
+    /// a synthesized batch listing tables, indexes, views, and triggers (the
+    /// SQLite compatibility virtual table). Returns `None` if the SQL doesn't
+    /// reference either name.
+    fn try_sqlite_master(&self, sql: &str) -> Result<Option<Vec<RecordBatch>>> {
+        let lower = sql.to_ascii_lowercase();
+        if !lower.contains("sqlite_master") && !lower.contains("sqlite_schema") {
+            return Ok(None);
+        }
+        use arrow::array::{ArrayRef, Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+
+        let mut types: Vec<String> = Vec::new();
+        let mut names: Vec<String> = Vec::new();
+        let mut tbl_names: Vec<String> = Vec::new();
+
+        // Tables.
+        for name in self.tables.lock().keys() {
+            types.push("table".into());
+            names.push(name.clone());
+            tbl_names.push(name.clone());
+        }
+        // Views (session-scoped).
+        for name in self.views.lock().keys() {
+            types.push("view".into());
+            names.push(name.clone());
+            tbl_names.push(name.clone());
+        }
+        // Triggers (engine-side, if a Database is attached).
+        if let Some(db) = &self.database {
+            for t in db.triggers() {
+                let target_name = match &t.target {
+                    mongreldb_core::trigger::TriggerTarget::Table(n) | mongreldb_core::trigger::TriggerTarget::View(n) => n.clone(),
+                };
+                types.push("trigger".into());
+                names.push(t.name.clone());
+                tbl_names.push(target_name);
+            }
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("type", DataType::Utf8, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("tbl_name", DataType::Utf8, false),
+            Field::new("rootpage", DataType::Int64, false),
+            Field::new("sql", DataType::Utf8, true),
+        ]));
+        let n = names.len();
+        let rootpages: Vec<i64> = vec![0; n];
+        let sqls: Vec<Option<&str>> = vec![None; n];
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(types)) as ArrayRef,
+                Arc::new(StringArray::from(names)) as ArrayRef,
+                Arc::new(StringArray::from(tbl_names)) as ArrayRef,
+                Arc::new(Int64Array::from(rootpages)) as ArrayRef,
+                Arc::new(StringArray::from(sqls)) as ArrayRef,
+            ],
+        )
+        .map_err(|e| MongrelQueryError::Arrow(e.to_string()))?;
+        Ok(Some(vec![batch]))
+    }
+
     /// §5.3 direct SQL dispatch: recognize a simple single-table `SELECT` from
     /// the raw SQL via the vendored `sqlparser` AST and serve it straight from
     /// the native column cursor, **bypassing DataFusion parse+plan+optimize**.
@@ -1830,6 +1906,14 @@ impl MongrelSession {
             if let Some(hit) = self.cache.lock().get(&key) {
                 return Ok((**hit).clone());
             }
+        }
+        // sqlite_master / sqlite_schema compatibility: intercept SELECTs that
+        // reference the catalog virtual table and synthesize a result batch.
+        if let Some(batches) = self.try_sqlite_master(sql)? {
+            if result_cacheable {
+                self.cache.lock().insert(key, Arc::new(batches.clone()));
+            }
+            return Ok(batches);
         }
         // §5.3: direct SQL dispatch for simple single-table SELECTs — bypasses
         // DataFusion parse+plan+optimize. Served batches are memoized into the

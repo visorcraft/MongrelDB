@@ -2368,6 +2368,7 @@ dependencies = [
  "futures",
  "mongreldb-core",
  "parking_lot",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",

@@ -32,7 +32,7 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -242,6 +242,68 @@ fn try_manual_command(
     sql: &str,
     lower: &str,
 ) -> Result<Option<Vec<RecordBatch>>> {
+    // ATTACH/DETACH don't require a primary Database — they mount external ones.
+    if lower.starts_with("attach ") {
+        return attach_database(session, sql);
+    }
+    if lower.starts_with("detach ") {
+        return detach_database(session, sql);
+    }
+
+    // SAVEPOINT / RELEASE / ROLLBACK TO — operate on the session's SQL staging.
+    if let Some(rest) = lower.strip_prefix("savepoint ") {
+        let name = rest.trim().trim_end_matches(';').trim().to_string();
+        let staged = session.sql_txn.lock();
+        let mut sp = session.savepoints.lock();
+        let len = staged.as_ref().map_or(0, |v| v.len());
+        sp.push((name, len));
+        return Ok(Some(Vec::new()));
+    }
+    if let Some(rest) = lower.strip_prefix("release ") {
+        let name = rest
+            .trim()
+            .strip_prefix("savepoint ")
+            .unwrap_or(rest.trim())
+            .trim_end_matches(';')
+            .trim()
+            .to_string();
+        let mut sp = session.savepoints.lock();
+        if name.is_empty() {
+            sp.pop();
+        } else if let Some(pos) = sp.iter().rposition(|(n, _)| n == &name) {
+            sp.truncate(pos);
+        }
+        return Ok(Some(Vec::new()));
+    }
+    if let Some(rest) = lower.strip_prefix("rollback to ") {
+        let name = rest
+            .trim()
+            .strip_prefix("savepoint ")
+            .unwrap_or(rest.trim())
+            .trim_end_matches(';')
+            .trim()
+            .to_string();
+        let mut sp = session.savepoints.lock();
+        let staged = session.sql_txn.lock();
+        let target_len = sp
+            .iter()
+            .rposition(|(n, _)| n == &name)
+            .map(|pos| {
+                let len = sp[pos].1;
+                sp.truncate(pos);
+                len
+            })
+            .ok_or_else(|| {
+                MongrelQueryError::Schema(format!("no savepoint named '{name}'"))
+            })?;
+        if let Some(ops) = staged.as_ref() {
+            let mut ops = ops.clone();
+            ops.truncate(target_len);
+            *session.sql_txn.lock() = Some(ops);
+        }
+        return Ok(Some(Vec::new()));
+    }
+
     let Some(db) = session.database.as_ref() else {
         return Ok(None);
     };
@@ -370,12 +432,6 @@ fn try_manual_command(
         return Ok(Some(Vec::new()));
     }
 
-    if lower.starts_with("attach ") || lower.starts_with("detach ") {
-        return Err(MongrelQueryError::Schema(
-            "ATTACH and DETACH are not supported by MongrelDB SQL sessions; mount additional databases with MongrelSession::register_db or open a separate daemon/database handle".into(),
-        ));
-    }
-
     if sql.ends_with(';') {
         return try_manual_command(
             session,
@@ -385,6 +441,128 @@ fn try_manual_command(
     }
 
     Ok(None)
+}
+
+/// `ATTACH 'path' AS alias` — open a second MongrelDB database directory and
+/// register all its tables on the session's DataFusion context, prefixed with
+/// `alias.`. This enables cross-database SQL joins (e.g.
+/// `SELECT * FROM alias.users JOIN local.orders`).
+fn attach_database(session: &MongrelSession, sql: &str) -> Result<Option<Vec<RecordBatch>>> {
+    // Parse: ATTACH 'path' AS alias  (also: ATTACH DATABASE 'path' AS alias)
+    let lower = sql.to_ascii_lowercase();
+    let rest = lower
+        .strip_prefix("attach ")
+        .unwrap_or("")
+        .strip_prefix("database ")
+        .unwrap_or("");
+    // Extract quoted path and AS alias.
+    let (path, alias) = parse_attach_args(rest, sql)?;
+    let attached_db = Arc::new(Database::open(&path)?);
+    let table_names = attached_db.table_names();
+    for name in &table_names {
+        let handle = attached_db.table(name)?;
+        let provider = MongrelProvider::new(handle.clone())?;
+        // Register under a qualified name `{alias}_{name}` (using underscore,
+        // not dot — DataFusion's `schema.table` resolution requires catalog
+        // setup for dot-qualified names). This avoids collisions with tables
+        // from the primary database.
+        let qualified = format!("{alias}_{name}");
+        session
+            .ctx
+            .register_table(&qualified, Arc::new(provider))
+            .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
+        session.tables.lock().insert(qualified, handle);
+        // Also register the bare name if no collision exists.
+        let bare_provider = MongrelProvider::new(attached_db.table(name)?)?;
+        if session
+            .ctx
+            .register_table(name, Arc::new(bare_provider))
+            .is_ok()
+        {
+            session
+                .tables
+                .lock()
+                .insert(name.clone(), attached_db.table(name)?);
+        }
+    }
+    // Store the attached Database so it stays alive for the session's lifetime.
+    session
+        .attached_databases
+        .lock()
+        .insert(alias.clone(), attached_db);
+    session.clear_cache();
+    Ok(Some(Vec::new()))
+}
+
+/// `DETACH alias` — unregister all tables from the attached database.
+fn detach_database(session: &MongrelSession, sql: &str) -> Result<Option<Vec<RecordBatch>>> {
+    let lower = sql.to_ascii_lowercase();
+    let rest = lower.strip_prefix("detach ").unwrap_or("");
+    let alias = parse_detach_alias(rest)?;
+    let removed = session.attached_databases.lock().remove(&alias);
+    if removed.is_none() {
+        // DETACH of a non-attached alias is a no-op (SQLite: error, but we
+        // tolerate it for idempotency).
+        return Ok(Some(Vec::new()));
+    }
+    // Remove qualified and bare table registrations belonging to this alias.
+    let mut tables = session.tables.lock();
+    let to_remove: Vec<String> = tables
+        .keys()
+        .filter(|k| k.starts_with(&format!("{alias}_")))
+        .cloned()
+        .collect();
+    for name in &to_remove {
+        tables.remove(name);
+        let _ = session.ctx.deregister_table(name);
+    }
+    session.clear_cache();
+    Ok(Some(Vec::new()))
+}
+
+/// Extract the path and alias from `ATTACH ... 'path' AS alias` arguments.
+fn parse_attach_args(_lower_rest: &str, original_sql: &str) -> Result<(PathBuf, String)> {
+    // Parse entirely from the original SQL (not the lowercased version) to avoid
+    // any case/whitespace surprises. Pattern: ATTACH [DATABASE] 'path' AS alias
+    let sql_lower = original_sql.to_ascii_lowercase();
+    // Find the single-quoted path.
+    let path_start = original_sql.find('\'').ok_or_else(|| {
+        MongrelQueryError::Schema("ATTACH requires a quoted path: ATTACH 'path' AS alias".into())
+    })?;
+    let path_end = original_sql[path_start + 1..]
+        .find('\'')
+        .ok_or_else(|| MongrelQueryError::Schema("ATTACH path missing closing quote".into()))?;
+    let path = PathBuf::from(&original_sql[path_start + 1..path_start + 1 + path_end]);
+    // Find the alias: everything after the closing quote, split on " as "
+    // (case-insensitive). The alias is the last token, trimmed of semicolons.
+    let after_path = &sql_lower[path_start + 1 + path_end + 1..];
+    let alias_part = if let Some(as_pos) = after_path.find(" as ") {
+        &after_path[as_pos + 4..]
+    } else {
+        // Also accept the SQL keyword without spaces around it.
+        after_path.trim_start()
+    };
+    let alias = alias_part.trim().trim_end_matches(';').trim().to_string();
+    if alias.is_empty() {
+        return Err(MongrelQueryError::Schema(
+            "ATTACH requires AS alias: ATTACH 'path' AS alias".into(),
+        ));
+    }
+    Ok((path, alias))
+}
+
+fn parse_detach_alias(lower_rest: &str) -> Result<String> {
+    let alias = lower_rest
+        .strip_prefix("database ")
+        .unwrap_or(lower_rest)
+        .trim()
+        .trim_end_matches(';')
+        .trim()
+        .to_string();
+    if alias.is_empty() {
+        return Err(MongrelQueryError::Schema("DETACH requires an alias".into()));
+    }
+    Ok(alias)
 }
 
 fn create_table(session: &MongrelSession, db: &Arc<Database>, create: CreateTable) -> Result<()> {

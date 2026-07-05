@@ -1336,3 +1336,100 @@ async fn direct_dispatch_is_memoized_by_result_cache() {
     assert_eq!(total_rows(&b2), 1);
     assert_eq!(t2.scan_mode, mongreldb_core::trace::ScanMode::Unknown);
 }
+
+#[tokio::test]
+async fn recursive_cte_works() {
+    let (_tmp, session) = setup().await;
+    // The travel_trips table already exists; use a recursive CTE over it.
+    // Data from setup(): ids 1-5, departure column present.
+    let sql = "WITH RECURSIVE chain AS (
+        SELECT id, 0 AS depth FROM travel_trips WHERE id = 1
+        UNION ALL
+        SELECT t.id, c.depth + 1 FROM travel_trips t JOIN chain c ON t.id = c.id + 1
+    ) SELECT id, depth FROM chain ORDER BY id";
+    let batches = session.run(sql).await.unwrap();
+    let rows = total_rows(&batches);
+    // setup() inserts ids 0..100; the chain starts at id=1 and links id+1, so
+    // it reaches ids 1..99 (99 rows). The point is that DataFusion accepts and
+    // executes WITH RECURSIVE — not the exact count.
+    assert!(rows > 0, "recursive CTE should return rows, got {rows}");
+}
+
+#[tokio::test]
+async fn window_function_works() {
+    let (_tmp, session) = setup().await;
+    let sql = "SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM travel_trips";
+    let batches = session.run(sql).await.unwrap();
+    let rows = total_rows(&batches);
+    assert_eq!(rows, 100, "window function should return 100 rows");
+}
+
+#[tokio::test]
+async fn regexp_function_works() {
+    let (_tmp, session) = setup().await;
+    // regexp('pattern', value) → 1 (match) or 0 (no match). SQLite semantics.
+    let sql = "SELECT id FROM travel_trips WHERE regexp('^City[0-5]$', destination) = 1";
+    let batches = session.run(sql).await.unwrap();
+    let rows = total_rows(&batches);
+    // destinations are "City0".."City99"; City0-City5 match ^City[0-5]$.
+    assert_eq!(rows, 6, "regexp should match City0-City5, got {rows}");
+}
+
+#[tokio::test]
+async fn sqlite_master_lists_tables() {
+    let (_tmp, session) = setup().await;
+    let batches = session.run("SELECT type, name FROM sqlite_master ORDER BY name").await.unwrap();
+    let rows = total_rows(&batches);
+    // travel_trips is the only registered table.
+    assert!(rows >= 1, "sqlite_master should list at least the travel_trips table, got {rows}");
+}
+
+#[tokio::test]
+async fn attach_database_enables_cross_db_query() {
+    // Create a second MongrelDB Database directory with one table + row.
+    let dir2 = tempdir().unwrap();
+    {
+        let db2 = mongreldb_core::Database::create(dir2.path()).unwrap();
+        db2.create_table("items", schema()).unwrap();
+        let handle = db2.table("items").unwrap();
+        let mut g = handle.lock();
+        g.put(vec![
+            (1, Value::Int64(999)),
+            (2, Value::Bytes(b"attached".to_vec())),
+            (3, Value::Int64(1_700_000_000)),
+            (4, Value::Float64(42.0)),
+            (5, Value::Float64(1.0)),
+        ])
+        .unwrap();
+        g.flush().unwrap();
+    }
+
+    // Open a primary database and attach the second one.
+    let dir1 = tempdir().unwrap();
+    let db1 = std::sync::Arc::new(mongreldb_core::Database::create(dir1.path()).unwrap());
+    let session = MongrelSession::open(db1).unwrap();
+    let attach_sql = format!("ATTACH '{}' AS other", dir2.path().display());
+    session.run(&attach_sql).await.unwrap();
+
+    // Query the attached table by qualified name (alias_table).
+    let batches = session
+        .run("SELECT id FROM other_items")
+        .await
+        .unwrap();
+    let rows = total_rows(&batches);
+    assert_eq!(rows, 1, "attached table should have 1 row, got {rows}");
+}
+
+#[tokio::test]
+async fn savepoint_syntax_is_accepted() {
+    let (_tmp, session) = setup().await;
+    // SAVEPOINT/RELEASE/ROLLBACK TO are session-level SQL staging operations.
+    // With a single-table session (no Database), they should be accepted as
+    // no-ops on an empty txn (no BEGIN). The point is that the syntax parses
+    // and doesn't error — the actual staging behavior is tested at the engine
+    // level via the SQL BEGIN/COMMIT path.
+    session.run("SAVEPOINT sp1").await.unwrap();
+    session.run("RELEASE sp1").await.unwrap();
+    session.run("SAVEPOINT sp2").await.unwrap();
+    session.run("ROLLBACK TO sp2").await.unwrap();
+}

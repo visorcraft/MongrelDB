@@ -80,10 +80,24 @@ HTTP, and the CLI.
 directory to a new target directory. The target must not already exist and must
 not be inside the source database directory.
 
-`ATTACH` and `DETACH` are intentionally rejected with a policy error. MongrelDB
-mounts additional databases explicitly through `MongrelSession::register_db` or
-separate daemon/database handles so cache invalidation and MVCC ownership stay
-clear.
+`ATTACH 'path' AS alias` opens a second MongrelDB database directory and
+registers all its tables on the current session's DataFusion context. Tables are
+available under the qualified name `alias_<table>` (underscore-qualified, since
+DataFusion's `schema.table` resolution requires catalog setup). `DETACH alias`
+removes the attached tables. This enables cross-database SQL queries within one
+session (e.g. `SELECT * FROM other_users JOIN local_orders`).
+
+`SAVEPOINT name` / `RELEASE name` / `ROLLBACK TO name` provide nested
+sub-transaction control within a SQL `BEGIN`/`COMMIT` block. Savepoints mark a
+position in the staged-ops vector; `ROLLBACK TO` discards ops back to that
+position without aborting the outer transaction.
+
+`SELECT * FROM sqlite_master` (or `sqlite_schema`) returns a SQLite-compatible
+catalog listing all tables, views, and triggers in the session. Columns:
+`type`, `name`, `tbl_name`, `rootpage`, `sql`.
+
+`regexp('pattern', value)` is a scalar UDF returning 1 (match) or 0 (no match),
+using the `regex` crate. Invalid patterns return 0 (SQLite semantics).
 
 ## Trigger Commands
 
@@ -120,8 +134,9 @@ because it does not execute SQL through SQLite's VM.
 
 Implemented beyond the MVP: broader PRAGMA introspection, metadata-backed
 `user_version`/`application_id`, storage accounting PRAGMAs, `wal_checkpoint`,
-`foreign_key_check`, `VACUUM INTO`, aggregate-aware `function_list`, and
-explicit ATTACH/DETACH policy errors. The full profile includes reference-test
-coverage for the supported admin SQL shapes and explicit policy behavior for
-SQLite-specific commands that conflict with MongrelDB's log-structured storage
-model.
+`foreign_key_check`, `VACUUM INTO`, aggregate-aware `function_list`,
+`ATTACH`/`DETACH` (cross-database queries), `SAVEPOINT`/`RELEASE`/`ROLLBACK TO`
+(session-level sub-transactions), `sqlite_master`/`sqlite_schema` (catalog
+introspection), `regexp()` (regex matching UDF), recursive CTEs
+(`WITH RECURSIVE`), window functions (`OVER`/`PARTITION BY`), and
+`EXPLAIN`/`EXPLAIN QUERY PLAN`.

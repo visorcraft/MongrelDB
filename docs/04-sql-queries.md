@@ -190,3 +190,38 @@ const vips = tableFromIPC(await db.sql('SELECT * FROM vip ORDER BY id'));
 For unfiltered scans of insert-only tables, MongrelDB provides exact per-column
 min/max/null_count statistics. DataFusion uses these to answer `MIN(col)`,
 `MAX(col)`, and `COUNT(*)` without scanning any data.
+
+## Recursive CTEs (`WITH RECURSIVE`)
+
+MongrelDB supports `WITH RECURSIVE` for tree traversal, graph queries, and
+hierarchical aggregation — the full DataFusion 54 recursive-CTE engine:
+
+```sql
+WITH RECURSIVE tree AS (
+    SELECT id, parent, 0 AS depth FROM nodes WHERE parent IS NULL
+    UNION ALL
+    SELECT n.id, n.parent, t.depth + 1
+    FROM nodes n JOIN tree t ON n.parent = t.id
+)
+SELECT id, depth FROM tree ORDER BY id;
+```
+
+## Window Functions (`OVER` / `PARTITION BY`)
+
+Standard SQL window functions are supported natively via DataFusion — `ROW_NUMBER()`,
+`RANK()`, `DENSE_RANK()`, `LAG()`, `LEAD()`, `FIRST_VALUE()`, `LAST_VALUE()`,
+`NTILE()`, `PERCENT_RANK()`, `CUME_DIST()`, and aggregate windows (`SUM() OVER`,
+`AVG() OVER` with optional `ROWS`/`RANGE` frames):
+
+```sql
+SELECT id, category, amount,
+       ROW_NUMBER() OVER (PARTITION BY category ORDER BY amount DESC) AS rank,
+       SUM(amount) OVER (PARTITION BY category) AS category_total
+FROM orders ORDER BY category, rank;
+```
+
+## `EXPLAIN` / `EXPLAIN QUERY PLAN`
+
+`EXPLAIN <sql>` and `EXPLAIN QUERY PLAN <sql>` return the DataFusion logical +
+physical plan, annotated with MongrelDB-specific scan-mode details (direct
+dispatch, index pushdown, external module, result-cache hit):

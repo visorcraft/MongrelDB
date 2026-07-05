@@ -131,6 +131,7 @@ pub fn extended_sql_function_names() -> Vec<&'static str> {
         "randomblob",
         "zeroblob",
         "glob",
+        "regexp",
         "length",
         "octet_length",
         "replace",
@@ -352,6 +353,7 @@ enum ExtendedFuncKind {
     RandomBlob,
     ZeroBlob,
     Glob,
+    Regexp,
     Length,
     OctetLength,
     Replace,
@@ -431,6 +433,7 @@ impl ScalarUDFImpl for ExtendedSqlFunc {
             | ExtendedFuncKind::TotalChanges
             | ExtendedFuncKind::LastInsertRowid
             | ExtendedFuncKind::Glob
+            | ExtendedFuncKind::Regexp
             | ExtendedFuncKind::Like
             | ExtendedFuncKind::Length
             | ExtendedFuncKind::OctetLength
@@ -627,6 +630,15 @@ impl ScalarUDFImpl for ExtendedSqlFunc {
                 let pattern = row.text(0)?;
                 let value = row.text(1)?;
                 Some(if glob_match(&pattern, &value) { 1 } else { 0 })
+            }),
+            ExtendedFuncKind::Regexp => eval_int(args, |row| {
+                let pattern = row.text(0)?;
+                let value = row.text(1)?;
+                // SQLite semantics: invalid regex → no match (return 0), not an error.
+                match regex::Regex::new(&pattern) {
+                    Ok(re) => Some(if re.is_match(&value) { 1 } else { 0 }),
+                    Err(_) => Some(0),
+                }
             }),
             ExtendedFuncKind::Length => eval_int(args, |row| {
                 let value = row.scalar(0)?;
@@ -850,6 +862,7 @@ fn extended_functions() -> Vec<ExtendedSqlFunc> {
         ExtendedSqlFunc::new("randomblob", RandomBlob, Volatility::Volatile),
         ExtendedSqlFunc::new("zeroblob", ZeroBlob, Volatility::Immutable),
         ExtendedSqlFunc::new("glob", Glob, Volatility::Immutable),
+        ExtendedSqlFunc::new("regexp", Regexp, Volatility::Immutable),
         ExtendedSqlFunc::new("length", Length, Volatility::Immutable),
         ExtendedSqlFunc::new("octet_length", OctetLength, Volatility::Immutable),
         ExtendedSqlFunc::new("replace", Replace, Volatility::Immutable),
