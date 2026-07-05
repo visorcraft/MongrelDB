@@ -310,10 +310,11 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { ColumnType, IndexKindSpec, ConditionKind, Database, TableHandle, Transaction, TxnTable, WriteBuffer, RemoteDatabase } = nativeBinding
+const { ColumnType, IndexKindSpec, IndexBuildPolicyJs, ConditionKind, Database, TableHandle, Transaction, TxnTable, WriteBuffer, RemoteDatabase } = nativeBinding
 
 module.exports.ColumnType = ColumnType
 module.exports.IndexKindSpec = IndexKindSpec
+module.exports.IndexBuildPolicyJs = IndexBuildPolicyJs
 module.exports.ConditionKind = ConditionKind
 module.exports.Database = Database
 module.exports.TableHandle = TableHandle

@@ -65,6 +65,28 @@ export interface CompactStats {
   /** Number of tables skipped (fewer than 2 runs, or compaction failed). */
   skipped: number
 }
+/** Page-cache statistics for one table (hits / misses / lock contention). */
+export interface CacheStatsJs {
+  hits: number
+  misses: number
+  /** Lookups skipped because the cache shard's lock was contended. */
+  tryLockMisses: number
+  /** Fraction of lookups served from cache in `[0, 1]`. */
+  hitRate: number
+}
+/** Trigger execution policy — recursion, depth caps, loop limits. */
+export interface TriggerConfigJs {
+  recursiveTriggers: boolean
+  maxDepth: number
+  maxLoopIterations: number
+}
+/** Index build policy: defer to first query (fastest ingest) or build eagerly. */
+export const enum IndexBuildPolicyJs {
+  /** Defer index building to the first query/flush — fastest ingest (default). */
+  Deferred = 0,
+  /** Build and checkpoint indexes inside the bulk load — fastest first query. */
+  Eager = 1
+}
 export interface SchemaSpec {
   columns: Array<ColumnSpec>
   indexes: Array<IndexSpec>
@@ -283,6 +305,43 @@ export declare class Database {
   sql(sql: string): Promise<Buffer>
   /** Flush + release. Optional — the `Database` also drops on GC. */
   close(): void
+  /**
+   * Set the per-table spill threshold (bytes). When a transaction's staged
+   * bytes for a single table exceed this, rows are written as a uniform-epoch
+   * pending run instead of streamed Put records.
+   */
+  setSpillThreshold(bytes: number): void
+  /** Enable or disable recursive trigger execution (database-wide). */
+  setRecursiveTriggers(enabled: boolean): void
+  /** Read the current trigger execution policy. */
+  triggerConfig(): TriggerConfigJs
+  /** Set the trigger execution policy. `max_depth` must be > 0. */
+  setTriggerConfig(config: TriggerConfigJs): void
+  /** Set a table's compaction zstd level (-1 = default, 0 = none, 1..22). */
+  setTableCompactionZstdLevel(name: string, level: number): void
+  /** Set a table's result-cache max bytes. */
+  setTableResultCacheMaxBytes(name: string, maxBytes: number): void
+  /** Set a table's mutable-run spill threshold (bytes). */
+  setTableMutableRunSpillBytes(name: string, bytes: number): void
+  /** Set a table's WAL sync byte threshold (bytes between group-syncs). */
+  setTableSyncByteThreshold(name: string, threshold: number): void
+  /**
+   * Set a table's index build policy (`Deferred` for fast ingest, `Eager`
+   * for fast first query).
+   */
+  setTableIndexBuildPolicy(name: string, policy: IndexBuildPolicyJs): void
+  /** Page-cache statistics for a table. */
+  tablePageCacheStats(name: string): CacheStatsJs
+  /** Number of sorted runs a table currently has (compaction target: 1). */
+  tableRunCount(name: string): number
+  /** Memtable length (uncommitted staged rows) for a table. */
+  tableMemtableLen(name: string): number
+  /** Mutable-run length for a table. */
+  tableMutableRunLen(name: string): number
+  /** Page-cache entry count for a table. */
+  tablePageCacheLen(name: string): number
+  /** Decoded-page-cache entry count for a table. */
+  tableDecodedCacheLen(name: string): number
   /**
    * Create a fresh encrypted database (page-level AES-256-GCM; the database
    * KEK is derived from `passphrase` via Argon2id + HKDF).

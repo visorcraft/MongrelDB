@@ -136,6 +136,34 @@ pub struct CompactStats {
     pub skipped: u32,
 }
 
+/// Page-cache statistics for one table (hits / misses / lock contention).
+#[napi(object)]
+pub struct CacheStatsJs {
+    pub hits: i64,
+    pub misses: i64,
+    /// Lookups skipped because the cache shard's lock was contended.
+    pub try_lock_misses: i64,
+    /// Fraction of lookups served from cache in `[0, 1]`.
+    pub hit_rate: f64,
+}
+
+/// Trigger execution policy — recursion, depth caps, loop limits.
+#[napi(object)]
+pub struct TriggerConfigJs {
+    pub recursive_triggers: bool,
+    pub max_depth: u32,
+    pub max_loop_iterations: u32,
+}
+
+/// Index build policy: defer to first query (fastest ingest) or build eagerly.
+#[napi]
+pub enum IndexBuildPolicyJs {
+    /// Defer index building to the first query/flush — fastest ingest (default).
+    Deferred,
+    /// Build and checkpoint indexes inside the bulk load — fastest first query.
+    Eager,
+}
+
 #[napi(object)]
 pub struct SchemaSpec {
     pub columns: Vec<ColumnSpec>,
@@ -1266,6 +1294,167 @@ impl Database {
     #[napi]
     pub fn close(&self) -> napi::Result<()> {
         Ok(())
+    }
+
+    // ── storage tuning & introspection (Tier 3) ─────────────────────────────
+
+    /// Set the per-table spill threshold (bytes). When a transaction's staged
+    /// bytes for a single table exceed this, rows are written as a uniform-epoch
+    /// pending run instead of streamed Put records.
+    #[napi]
+    pub fn set_spill_threshold(&self, bytes: i64) -> napi::Result<()> {
+        self.inner.set_spill_threshold(bytes.max(0) as u64);
+        Ok(())
+    }
+
+    /// Enable or disable recursive trigger execution (database-wide).
+    #[napi]
+    pub fn set_recursive_triggers(&self, enabled: bool) -> napi::Result<()> {
+        self.inner.set_recursive_triggers(enabled);
+        Ok(())
+    }
+
+    /// Read the current trigger execution policy.
+    #[napi]
+    pub fn trigger_config(&self) -> napi::Result<TriggerConfigJs> {
+        let c = self.inner.trigger_config();
+        Ok(TriggerConfigJs {
+            recursive_triggers: c.recursive_triggers,
+            max_depth: c.max_depth,
+            max_loop_iterations: c.max_loop_iterations,
+        })
+    }
+
+    /// Set the trigger execution policy. `max_depth` must be > 0.
+    #[napi]
+    pub fn set_trigger_config(&self, config: TriggerConfigJs) -> napi::Result<()> {
+        self.inner
+            .set_trigger_config(mongreldb_core::trigger::TriggerConfig {
+                recursive_triggers: config.recursive_triggers,
+                max_depth: config.max_depth,
+                max_loop_iterations: config.max_loop_iterations,
+            })
+            .map_err(to_napi)
+    }
+
+    /// Set a table's compaction zstd level (-1 = default, 0 = none, 1..22).
+    #[napi]
+    pub fn set_table_compaction_zstd_level(
+        &self,
+        name: String,
+        level: i32,
+    ) -> napi::Result<()> {
+        let handle = self.inner.table(&name).map_err(to_napi)?;
+        handle.lock().set_compaction_zstd_level(level);
+        Ok(())
+    }
+
+    /// Set a table's result-cache max bytes.
+    #[napi]
+    pub fn set_table_result_cache_max_bytes(
+        &self,
+        name: String,
+        max_bytes: i64,
+    ) -> napi::Result<()> {
+        let handle = self.inner.table(&name).map_err(to_napi)?;
+        handle
+            .lock()
+            .set_result_cache_max_bytes(max_bytes.max(0) as u64);
+        Ok(())
+    }
+
+    /// Set a table's mutable-run spill threshold (bytes).
+    #[napi]
+    pub fn set_table_mutable_run_spill_bytes(
+        &self,
+        name: String,
+        bytes: i64,
+    ) -> napi::Result<()> {
+        let handle = self.inner.table(&name).map_err(to_napi)?;
+        handle.lock().set_mutable_run_spill_bytes(bytes.max(0) as u64);
+        Ok(())
+    }
+
+    /// Set a table's WAL sync byte threshold (bytes between group-syncs).
+    #[napi]
+    pub fn set_table_sync_byte_threshold(
+        &self,
+        name: String,
+        threshold: i64,
+    ) -> napi::Result<()> {
+        let handle = self.inner.table(&name).map_err(to_napi)?;
+        handle.lock().set_sync_byte_threshold(threshold.max(0) as u64);
+        Ok(())
+    }
+
+    /// Set a table's index build policy (`Deferred` for fast ingest, `Eager`
+    /// for fast first query).
+    #[napi]
+    pub fn set_table_index_build_policy(
+        &self,
+        name: String,
+        policy: IndexBuildPolicyJs,
+    ) -> napi::Result<()> {
+        let handle = self.inner.table(&name).map_err(to_napi)?;
+        let p = match policy {
+            IndexBuildPolicyJs::Deferred => mongreldb_core::IndexBuildPolicy::Deferred,
+            IndexBuildPolicyJs::Eager => mongreldb_core::IndexBuildPolicy::Eager,
+        };
+        handle.lock().set_index_build_policy(p);
+        Ok(())
+    }
+
+    /// Page-cache statistics for a table.
+    #[napi]
+    pub fn table_page_cache_stats(&self, name: String) -> napi::Result<CacheStatsJs> {
+        let handle = self.inner.table(&name).map_err(to_napi)?;
+        let s = handle.lock().page_cache_stats();
+        Ok(CacheStatsJs {
+            hits: s.hits as i64,
+            misses: s.misses as i64,
+            try_lock_misses: s.try_lock_misses as i64,
+            hit_rate: s.hit_rate(),
+        })
+    }
+
+    /// Number of sorted runs a table currently has (compaction target: 1).
+    #[napi]
+    pub fn table_run_count(&self, name: String) -> napi::Result<u32> {
+        let handle = self.inner.table(&name).map_err(to_napi)?;
+        let n = handle.lock().run_count();
+        Ok(n as u32)
+    }
+
+    /// Memtable length (uncommitted staged rows) for a table.
+    #[napi]
+    pub fn table_memtable_len(&self, name: String) -> napi::Result<u32> {
+        let handle = self.inner.table(&name).map_err(to_napi)?;
+        let n = handle.lock().memtable_len();
+        Ok(n as u32)
+    }
+
+    /// Mutable-run length for a table.
+    #[napi]
+    pub fn table_mutable_run_len(&self, name: String) -> napi::Result<u32> {
+        let handle = self.inner.table(&name).map_err(to_napi)?;
+        let n = handle.lock().mutable_run_len();
+        Ok(n as u32)
+    }
+
+    /// Page-cache entry count for a table.
+    #[napi]
+    pub fn table_page_cache_len(&self, name: String) -> napi::Result<u32> {
+        let handle = self.inner.table(&name).map_err(to_napi)?;
+        let n = handle.lock().page_cache_len();
+        Ok(n as u32)
+    }
+
+    /// Decoded-page-cache entry count for a table.
+    #[napi]
+    pub fn table_decoded_cache_len(&self, name: String) -> napi::Result<u32> {
+        let handle = self.inner.table(&name).map_err(to_napi)?;
+        let n = handle.lock().decoded_cache_len();
+        Ok(n as u32)
     }
 }
 
