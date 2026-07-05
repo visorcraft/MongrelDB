@@ -18,6 +18,7 @@ fn base_schema() -> Schema {
         indexes: Vec::new(),
         colocation: Vec::new(),
         constraints: Default::default(),
+        clustered: false,
     }
 }
 
@@ -33,6 +34,7 @@ fn external_schema() -> Schema {
         indexes: Vec::new(),
         colocation: Vec::new(),
         constraints: Default::default(),
+        clustered: false,
     }
 }
 

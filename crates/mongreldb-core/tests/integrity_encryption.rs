@@ -47,6 +47,7 @@ fn schema_with_indexable_bitmap() -> Schema {
         }],
         colocation: vec![],
         constraints: Default::default(),
+        clustered: false,
     }
 }
 
@@ -77,6 +78,7 @@ fn schema_with_indexable_range() -> Schema {
         }],
         colocation: vec![],
         constraints: Default::default(),
+        clustered: false,
     }
 }
 
@@ -111,6 +113,7 @@ fn schema_plain_encrypted_mix() -> Schema {
         }],
         colocation: vec![],
         constraints: Default::default(),
+        clustered: false,
     }
 }
 

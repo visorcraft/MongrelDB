@@ -3386,6 +3386,7 @@ fn parse_create_table(sql: &str) -> Result<(String, mongreldb_core::schema::Sche
             indexes: vec![],
             colocation: vec![],
             constraints: Default::default(),
+            clustered: false,
         },
     ))
 }

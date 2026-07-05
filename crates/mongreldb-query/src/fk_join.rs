@@ -1316,6 +1316,7 @@ mod tests {
             indexes: vec![],
             colocation: vec![],
             constraints: Default::default(),
+            clustered: false,
         };
         let mut countries =
             Table::create(dir.path().join("countries").as_path(), countries_schema, 1).unwrap();
@@ -1348,6 +1349,7 @@ mod tests {
             }],
             colocation: vec![],
             constraints: Default::default(),
+            clustered: false,
         };
         let mut users = Table::create(dir.path().join("users").as_path(), users_schema, 1).unwrap();
         for u in 0..10i64 {

@@ -19,6 +19,7 @@ fn schema() -> Schema {
         indexes: Vec::new(),
         colocation: vec![],
         constraints: Default::default(),
+        clustered: false,
     }
 }
 
@@ -187,6 +188,7 @@ fn native_aggregate_matches_expected() {
         }],
         colocation: vec![],
         constraints: Default::default(),
+        clustered: false,
     };
     let mut db = Table::create(dir.path(), schema, 1).unwrap();
     let n = 50_000i64;

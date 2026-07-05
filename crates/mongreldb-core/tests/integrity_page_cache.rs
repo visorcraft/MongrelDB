@@ -41,6 +41,7 @@ fn schema_plain() -> Schema {
         }],
         colocation: vec![],
         constraints: Default::default(),
+        clustered: false,
     }
 }
 
@@ -517,6 +518,7 @@ mod encrypted {
             }],
             colocation: vec![],
             constraints: Default::default(),
+            clustered: false,
         }
     }
 
@@ -545,6 +547,7 @@ mod encrypted {
             }],
             colocation: vec![],
             constraints: Default::default(),
+            clustered: false,
         }
     }
 

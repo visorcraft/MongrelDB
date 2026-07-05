@@ -67,6 +67,7 @@ fn users_schema(email_unique: bool, check_age: bool) -> Schema {
         indexes: vec![],
         colocation: vec![],
         constraints: cons,
+        clustered: false,
     }
 }
 
@@ -100,6 +101,7 @@ fn orders_schema_with_fk() -> Schema {
         indexes: vec![],
         colocation: vec![],
         constraints: cons,
+        clustered: false,
     }
 }
 
@@ -541,6 +543,7 @@ fn fk_cascade_transitive() {
             indexes: vec![],
             colocation: vec![],
             constraints: items_cons,
+            clustered: false,
         },
     )
     .unwrap();

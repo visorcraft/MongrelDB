@@ -73,6 +73,7 @@ fn schema() -> Schema {
         ],
         colocation: vec![],
         constraints: Default::default(),
+        clustered: false,
     }
 }
 

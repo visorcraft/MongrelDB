@@ -43,6 +43,7 @@ fn schema() -> Schema {
         }],
         colocation: vec![],
         constraints: Default::default(),
+        clustered: false,
     }
 }
 
@@ -128,6 +129,7 @@ fn minhash_intersects_with_another_condition() {
         ],
         colocation: vec![],
         constraints: Default::default(),
+        clustered: false,
     };
     let mut db = Table::create(dir.path(), sc, 1).unwrap();
     db.bulk_load(vec![

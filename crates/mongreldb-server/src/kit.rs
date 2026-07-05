@@ -406,6 +406,7 @@ pub struct KitCreateTableRequest {
     pub columns: Vec<KitColumnDef>,
     #[serde(default)]
     pub constraints: TableConstraints,
+    clustered: false,
 }
 
 #[derive(Debug, Deserialize)]
@@ -483,6 +484,7 @@ pub async fn kit_create_table(
         indexes: vec![],
         colocation: vec![],
         constraints: req.constraints,
+        clustered: false,
     };
     match state.db.create_table(&req.name, schema) {
         Ok(id) => Json(json!({ "table_id": id })).into_response(),

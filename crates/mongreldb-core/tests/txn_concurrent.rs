@@ -18,6 +18,7 @@ fn pk_schema(name: &str) -> Schema {
         indexes: vec![],
         colocation: vec![],
         constraints: Default::default(),
+        clustered: false,
     }
 }
 

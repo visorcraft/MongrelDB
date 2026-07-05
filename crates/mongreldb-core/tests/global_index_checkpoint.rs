@@ -63,6 +63,7 @@ fn schema() -> Schema {
         ],
         colocation: vec![],
         constraints: Default::default(),
+        clustered: false,
     }
 }
 
@@ -299,6 +300,7 @@ fn ann_and_sparse_roundtrip_through_checkpoint() {
         ],
         colocation: vec![],
         constraints: Default::default(),
+        clustered: false,
     };
     let dir = tempdir().unwrap();
     {
@@ -374,6 +376,7 @@ fn bulk_load_columns_builds_indexes_and_checkpoints() {
         }],
         colocation: vec![],
         constraints: Default::default(),
+        clustered: false,
     };
     let dir = tempdir().unwrap();
     {

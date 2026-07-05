@@ -29,6 +29,7 @@ fn users_schema() -> Schema {
         }],
         colocation: Vec::new(),
         constraints: Default::default(),
+        clustered: false,
     }
 }
 

@@ -253,6 +253,7 @@ fn create_table_with_bitmap_indexes(
         indexes,
         colocation: Vec::new(),
         constraints: Default::default(),
+        clustered: false,
     };
     db.create_table(name, schema).unwrap();
 }

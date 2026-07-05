@@ -54,6 +54,7 @@ fn schema() -> Schema {
         }],
         colocation: vec![],
         constraints: Default::default(),
+        clustered: false,
     }
 }
 
@@ -135,6 +136,7 @@ fn sparse_match_intersects_bitmap() {
         ],
         colocation: vec![],
         constraints: Default::default(),
+        clustered: false,
     };
     let mut db = Table::create(dir.path(), sc, 1).unwrap();
     // cat "a": docs 0,1 contain "quick"; cat "b": doc 2 also contains "quick".

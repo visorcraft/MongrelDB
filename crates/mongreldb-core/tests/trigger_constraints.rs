@@ -28,6 +28,7 @@ fn base_schema() -> Schema {
         indexes: Vec::new(),
         colocation: Vec::new(),
         constraints: TableConstraints::default(),
+        clustered: false,
     }
 }
 
@@ -47,6 +48,7 @@ fn unique_audit_schema() -> Schema {
         indexes: Vec::new(),
         colocation: Vec::new(),
         constraints,
+        clustered: false,
     }
 }
 
@@ -69,6 +71,7 @@ fn check_audit_schema() -> Schema {
         indexes: Vec::new(),
         colocation: Vec::new(),
         constraints,
+        clustered: false,
     }
 }
 
@@ -91,6 +94,7 @@ fn fk_audit_schema() -> Schema {
         indexes: Vec::new(),
         colocation: Vec::new(),
         constraints,
+        clustered: false,
     }
 }
 
@@ -310,6 +314,7 @@ fn parents_schema() -> Schema {
         indexes: Vec::new(),
         colocation: Vec::new(),
         constraints: TableConstraints::default(),
+        clustered: false,
     }
 }
 
@@ -323,6 +328,7 @@ fn parents_with_status_schema() -> Schema {
         indexes: Vec::new(),
         colocation: Vec::new(),
         constraints: TableConstraints::default(),
+        clustered: false,
     }
 }
 
@@ -337,6 +343,7 @@ fn children_schema() -> Schema {
         indexes: Vec::new(),
         colocation: Vec::new(),
         constraints: TableConstraints::default(),
+        clustered: false,
     }
 }
 
@@ -350,6 +357,7 @@ fn logs_schema() -> Schema {
         indexes: Vec::new(),
         colocation: Vec::new(),
         constraints: TableConstraints::default(),
+        clustered: false,
     }
 }
 
@@ -369,6 +377,7 @@ fn nullable_category_schema() -> Schema {
         indexes: Vec::new(),
         colocation: Vec::new(),
         constraints: TableConstraints::default(),
+        clustered: false,
     }
 }
 

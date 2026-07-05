@@ -3100,6 +3100,7 @@ fn schema_from_create_table(create: &CreateTable) -> Result<CoreSchema> {
         indexes: Vec::new(),
         colocation: Vec::new(),
         constraints: Default::default(),
+        clustered: false,
     };
     for constraint in &create.constraints {
         match constraint {

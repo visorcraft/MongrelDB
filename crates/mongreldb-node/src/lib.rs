@@ -287,6 +287,7 @@ fn build_schema(spec: SchemaSpec) -> napi::Result<Schema> {
         indexes,
         colocation: Vec::new(),
         constraints: Default::default(),
+        clustered: false,
     })
 }
 

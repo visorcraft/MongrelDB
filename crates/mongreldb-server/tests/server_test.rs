@@ -45,6 +45,7 @@ impl ExternalTableModule for ServerRowsModule {
                 indexes: Vec::new(),
                 colocation: Vec::new(),
                 constraints: Default::default(),
+                clustered: false,
             },
             hidden_columns: Vec::new(),
             capabilities: ModuleCapabilities {

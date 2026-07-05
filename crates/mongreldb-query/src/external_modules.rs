@@ -779,6 +779,7 @@ fn json_descriptor() -> ExternalModuleDescriptor {
             indexes: Vec::new(),
             colocation: Vec::new(),
             constraints: Default::default(),
+            clustered: false,
         },
         hidden_columns: vec!["json".to_string(), "root".to_string()],
         capabilities: ModuleCapabilities {
@@ -844,6 +845,7 @@ impl ExternalTableModule for SchemaTablesModule {
                 indexes: Vec::new(),
                 colocation: Vec::new(),
                 constraints: Default::default(),
+                clustered: false,
             },
             hidden_columns: Vec::new(),
             capabilities: catalog_capabilities(),
@@ -920,6 +922,7 @@ impl ExternalTableModule for DbStatModule {
                 indexes: Vec::new(),
                 colocation: Vec::new(),
                 constraints: Default::default(),
+                clustered: false,
             },
             hidden_columns: Vec::new(),
             capabilities: catalog_capabilities(),
@@ -1425,6 +1428,7 @@ fn kv_store_schema() -> CoreSchema {
         indexes: Vec::new(),
         colocation: Vec::new(),
         constraints: Default::default(),
+        clustered: false,
     }
 }
 
@@ -1782,6 +1786,7 @@ fn fts_docs_schema() -> CoreSchema {
         indexes: Vec::new(),
         colocation: Vec::new(),
         constraints: Default::default(),
+        clustered: false,
     }
 }
 
@@ -2697,6 +2702,7 @@ fn rtree_rects_schema() -> CoreSchema {
         indexes: Vec::new(),
         colocation: Vec::new(),
         constraints: Default::default(),
+        clustered: false,
     }
 }
 
@@ -2797,6 +2803,7 @@ impl ExternalTableModule for SeriesModule {
                 indexes: Vec::new(),
                 colocation: Vec::new(),
                 constraints: Default::default(),
+                clustered: false,
             },
             hidden_columns: vec!["start".to_string(), "stop".to_string(), "step".to_string()],
             capabilities: ModuleCapabilities {

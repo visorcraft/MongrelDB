@@ -67,6 +67,7 @@ fn mk_schema() -> Schema {
         indexes: vec![],
         colocation: vec![],
         constraints: cons,
+        clustered: false,
     }
 }
 
@@ -85,6 +86,7 @@ fn audit_schema() -> Schema {
         indexes: vec![],
         colocation: vec![],
         constraints: Default::default(),
+        clustered: false,
     }
 }
 

@@ -25,6 +25,7 @@ fn base_schema() -> Schema {
         indexes: Vec::new(),
         colocation: Vec::new(),
         constraints: Default::default(),
+        clustered: false,
     }
 }
 

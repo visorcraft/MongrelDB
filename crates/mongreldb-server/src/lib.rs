@@ -343,6 +343,7 @@ async fn create_table(
         indexes: vec![],
         colocation: vec![],
         constraints: Default::default(),
+        clustered: false,
     };
     if let Err(msg) = validate_table_name(&req.name) {
         return (StatusCode::BAD_REQUEST, msg).into_response();
@@ -678,6 +679,7 @@ mod wal_stream_tests {
             indexes: vec![],
             colocation: vec![],
             constraints: Default::default(),
+            clustered: false,
         };
         db.create_table("items", table_schema).unwrap();
         // Write a row to generate WAL records.

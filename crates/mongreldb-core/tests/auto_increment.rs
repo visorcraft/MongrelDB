@@ -29,6 +29,7 @@ fn ai_schema() -> Schema {
         indexes: vec![],
         colocation: vec![],
         constraints: Default::default(),
+        clustered: false,
     }
 }
 
@@ -54,6 +55,7 @@ fn ai_int_schema() -> Schema {
         indexes: vec![],
         colocation: vec![],
         constraints: Default::default(),
+        clustered: false,
     }
 }
 
@@ -206,6 +208,7 @@ fn rejects_invalid_auto_inc_schema() {
         indexes: vec![],
         colocation: vec![],
         constraints: Default::default(),
+        clustered: false,
     };
     assert!(Table::create(dir.path(), bad, 1).is_err());
 }
@@ -429,6 +432,7 @@ fn no_pk_schema() -> Schema {
         indexes: vec![],
         colocation: vec![],
         constraints: Default::default(),
+        clustered: false,
     }
 }
 

@@ -155,6 +155,7 @@ mod tests {
             indexes: Vec::new(),
             colocation: vec![],
             constraints: Default::default(),
+            clustered: false,
         }
     }
 

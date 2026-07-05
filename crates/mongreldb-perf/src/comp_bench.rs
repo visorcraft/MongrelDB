@@ -77,6 +77,7 @@ fn schema() -> Schema {
         ],
         colocation: vec![],
         constraints: Default::default(),
+        clustered: false,
     }
 }
 
@@ -100,6 +101,7 @@ fn users_schema() -> Schema {
         indexes: vec![],
         colocation: vec![],
         constraints: Default::default(),
+        clustered: false,
     }
 }
 

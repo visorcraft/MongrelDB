@@ -206,6 +206,10 @@ pub struct Schema {
     /// them authoritatively at commit (see [`crate::database`]).
     #[serde(default)]
     pub constraints: TableConstraints,
+    /// When true, the table is clustered on its primary key: sorted runs are
+    /// keyed by PK bytes rather than by `RowId`. Defaults to false.
+    #[serde(default)]
+    pub clustered: bool,
 }
 
 impl Schema {
@@ -347,6 +351,7 @@ mod tests {
             indexes: vec![],
             colocation: vec![],
             constraints: Default::default(),
+            clustered: false,
         };
         assert!(s.validate_auto_increment().is_ok());
         assert_eq!(s.auto_increment_column().unwrap().id, 0);
@@ -373,6 +378,7 @@ mod tests {
             indexes: vec![],
             colocation: vec![],
             constraints: Default::default(),
+            clustered: false,
         };
         assert!(s.validate_auto_increment().is_err());
     }
@@ -390,6 +396,7 @@ mod tests {
             indexes: vec![],
             colocation: vec![],
             constraints: Default::default(),
+            clustered: false,
         };
         assert!(s.validate_auto_increment().is_err());
     }
@@ -416,6 +423,7 @@ mod tests {
             indexes: vec![],
             colocation: vec![],
             constraints: Default::default(),
+            clustered: false,
         };
         assert!(s.validate_auto_increment().is_err());
     }
@@ -437,6 +445,7 @@ mod tests {
             indexes: vec![],
             colocation: vec![],
             constraints: Default::default(),
+            clustered: false,
         };
         // Omitting the auto-inc column must not trip NOT NULL.
         let cols = vec![(1u16, Value::Bytes(b"x".to_vec()))];

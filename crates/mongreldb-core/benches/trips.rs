@@ -49,6 +49,7 @@ fn schema() -> Schema {
         indexes: Vec::new(),
         colocation: vec![],
         constraints: Default::default(),
+        clustered: false,
     }
 }
 

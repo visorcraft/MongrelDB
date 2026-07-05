@@ -169,6 +169,7 @@ fn app_rows_schema() -> Schema {
         indexes: vec![],
         colocation: vec![],
         constraints: Default::default(),
+        clustered: false,
     }
 }
 
@@ -310,6 +311,7 @@ fn app_txn_schema() -> Schema {
         indexes: vec![],
         colocation: vec![],
         constraints: Default::default(),
+        clustered: false,
     }
 }
 
@@ -417,6 +419,7 @@ fn orders_schema() -> Schema {
         indexes: vec![],
         colocation: vec![],
         constraints: Default::default(),
+        clustered: false,
     }
 }
 
@@ -440,6 +443,7 @@ fn customers_schema() -> Schema {
         indexes: vec![],
         colocation: vec![],
         constraints: Default::default(),
+        clustered: false,
     }
 }
 
@@ -587,6 +591,7 @@ async fn join_and_planning_diagnostics() {
         }],
         colocation: vec![],
         constraints: Default::default(),
+        clustered: false,
     };
     let dir = tempdir().unwrap();
     let db = Arc::new(Database::create(dir.path()).unwrap());

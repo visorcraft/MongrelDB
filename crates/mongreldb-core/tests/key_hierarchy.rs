@@ -35,6 +35,7 @@ fn schema() -> Schema {
         indexes: vec![],
         colocation: vec![],
         constraints: Default::default(),
+        clustered: false,
     }
 }
 
@@ -65,6 +66,7 @@ fn schema_indexable_eq() -> Schema {
         }],
         colocation: vec![],
         constraints: Default::default(),
+        clustered: false,
     }
 }
 

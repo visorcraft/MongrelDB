@@ -26,6 +26,7 @@ fn schema(nullable_v: bool) -> Schema {
         indexes: vec![],
         colocation: vec![],
         constraints: Default::default(),
+        clustered: false,
     }
 }
 

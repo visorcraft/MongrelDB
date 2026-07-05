@@ -79,6 +79,7 @@ fn main_schema() -> Schema {
         ],
         colocation: vec![],
         constraints: Default::default(),
+        clustered: false,
     }
 }
 
@@ -107,6 +108,7 @@ fn ann_schema() -> Schema {
         }],
         colocation: vec![],
         constraints: Default::default(),
+        clustered: false,
     }
 }
 
@@ -130,6 +132,7 @@ fn orders_schema() -> Schema {
         indexes: vec![],
         colocation: vec![],
         constraints: Default::default(),
+        clustered: false,
     }
 }
 
@@ -153,6 +156,7 @@ fn customers_schema() -> Schema {
         indexes: vec![],
         colocation: vec![],
         constraints: Default::default(),
+        clustered: false,
     }
 }
 
@@ -832,6 +836,7 @@ async fn schema_evolution_reads_null_for_old_rows() {
         indexes: vec![],
         colocation: vec![],
         constraints: Default::default(),
+        clustered: false,
     };
 
     let dir = tempdir().unwrap();

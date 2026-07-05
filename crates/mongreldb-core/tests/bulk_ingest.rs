@@ -96,6 +96,7 @@ fn schema() -> Schema {
         ],
         colocation: vec![],
         constraints: Default::default(),
+        clustered: false,
     }
 }
 
@@ -342,6 +343,7 @@ fn parallel_column_encoding_round_trips() {
         indexes: Vec::new(),
         colocation: vec![],
         constraints: Default::default(),
+        clustered: false,
     };
     let mut db = Table::create(dir.path(), sc, 1).unwrap();
     // >1 page per column (PAGE_ROWS = 65 536) so native_column_pages takes the
@@ -542,6 +544,7 @@ fn bulk_load_fast_run_is_larger_than_zstd() {
         indexes: Vec::new(),
         colocation: vec![],
         constraints: Default::default(),
+        clustered: false,
     };
     let mk = |dir| {
         let mut db = Table::create(dir, sc.clone(), 1).unwrap();
