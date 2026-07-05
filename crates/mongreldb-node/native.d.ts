@@ -496,4 +496,14 @@ export declare class RemoteDatabase {
   triggers(): string
   trigger(name: string): string
   callProcedure(name: string, opts?: ProcedureCallOptions | undefined | null): string
+  /**
+   * Compact every table on the daemon (POST /compact). Returns
+   * `{ compacted, skipped }`.
+   */
+  compact(): CompactStats
+  /**
+   * Compact a single table on the daemon (POST /tables/{name}/compact).
+   * Returns `true` if compacted, `false` if skipped (fewer than 2 runs).
+   */
+  compactTable(name: string): boolean
 }

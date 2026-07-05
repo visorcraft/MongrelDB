@@ -2660,6 +2660,37 @@ impl RemoteDatabase {
             .into_string()
             .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))
     }
+
+    /// Compact every table on the daemon (POST /compact). Returns
+    /// `{ compacted, skipped }`.
+    #[napi]
+    pub fn compact(&self) -> napi::Result<CompactStats> {
+        let resp: serde_json::Value = self
+            .agent
+            .post(&format!("{}/compact", self.url))
+            .call()
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?
+            .into_json()
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
+        Ok(CompactStats {
+            compacted: resp["compacted"].as_u64().unwrap_or(0) as u32,
+            skipped: resp["skipped"].as_u64().unwrap_or(0) as u32,
+        })
+    }
+
+    /// Compact a single table on the daemon (POST /tables/{name}/compact).
+    /// Returns `true` if compacted, `false` if skipped (fewer than 2 runs).
+    #[napi]
+    pub fn compact_table(&self, name: String) -> napi::Result<bool> {
+        let resp: serde_json::Value = self
+            .agent
+            .post(&format!("{}/tables/{name}/compact", self.url))
+            .call()
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?
+            .into_json()
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
+        Ok(resp["status"].as_str() == Some("compacted"))
+    }
 }
 
 // ── Phase 20.4 helpers ────────────────────────────────────────────────────
