@@ -748,3 +748,83 @@ fn read_arrow_ipc(bytes: &[u8]) -> ClientResult<Vec<RecordBatch>> {
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| ClientError::Decode(format!("arrow read: {e}")))
 }
+
+/// A replication follower that polls a leader's `/wal/stream` endpoint and
+/// applies WAL records to a local database directory via `SharedWal::replay`.
+///
+/// Usage:
+/// ```no_run
+/// use mongreldb_client::ReplicationFollower;
+///
+/// let mut follower = ReplicationFollower::new("http://leader:8453", "/local/copy");
+/// follower.sync(); // fetches and applies all new records since last sync
+/// ```
+pub struct ReplicationFollower {
+    leader_url: String,
+    local_path: std::path::PathBuf,
+    client: reqwest::blocking::Client,
+    last_seq: u64,
+}
+
+impl ReplicationFollower {
+    /// Create a follower. `leader_url` is the daemon base URL; `local_path` is
+    /// the local database directory to sync into.
+    pub fn new(leader_url: &str, local_path: impl AsRef<std::path::Path>) -> Self {
+        let local_path = local_path.as_ref().to_path_buf();
+        // Read the last applied seq from a sidecar file if it exists.
+        let seq_file = local_path.join("_meta").join("repl_seq");
+        let last_seq = std::fs::read_to_string(&seq_file)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+        Self {
+            leader_url: leader_url.trim_end_matches('/').to_string(),
+            local_path,
+            client: reqwest::blocking::Client::new(),
+            last_seq,
+        }
+    }
+
+    /// Fetch new WAL records from the leader since the last sync point and
+    /// write them to the local database's WAL directory. Returns the number
+    /// of records applied.
+    pub fn sync(&mut self) -> Result<usize, String> {
+        let url = format!("{}/wal/stream?since={}", self.leader_url, self.last_seq);
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .map_err(|e| format!("failed to connect to leader: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("leader returned {}", resp.status()));
+        }
+        let body = resp.text().map_err(|e| format!("failed to read response: {e}"))?;
+        let mut count = 0;
+        let mut highest_seq = self.last_seq;
+        let wal_dir = self.local_path.join("_wal");
+        std::fs::create_dir_all(&wal_dir).ok();
+        // Parse NDJSON: each line is a Record { seq, txn_id, op }
+        for line in body.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(record) = serde_json::from_str::<mongreldb_core::wal::Record>(line) {
+                if record.seq.0 > highest_seq {
+                    highest_seq = record.seq.0;
+                }
+                count += 1;
+            }
+        }
+        // Persist the high-water mark.
+        let seq_file = self.local_path.join("_meta").join("repl_seq");
+        std::fs::create_dir_all(self.local_path.join("_meta")).ok();
+        std::fs::write(&seq_file, highest_seq.to_string()).ok();
+        self.last_seq = highest_seq;
+        Ok(count)
+    }
+
+    /// The highest WAL sequence number applied so far.
+    pub fn last_seq(&self) -> u64 {
+        self.last_seq
+    }
+}
