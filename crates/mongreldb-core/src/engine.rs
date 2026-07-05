@@ -1612,7 +1612,15 @@ impl Table {
     ) -> Result<(RowId, Option<i64>)> {
         let assigned = self.fill_auto_inc(&mut columns)?;
         self.schema.validate_not_null(&columns)?;
-        let row_id = self.allocator.alloc();
+        // For clustered (WITHOUT ROWID) tables, derive RowId deterministically
+        // from the PK value so the same PK always maps to the same row (no
+        // allocator waste, idempotent upserts). For standard tables, use the
+        // monotonic allocator.
+        let row_id = if self.schema.clustered {
+            self.derive_clustered_row_id(&columns)?
+        } else {
+            self.allocator.alloc()
+        };
         let epoch = self.pending_epoch();
         let mut row = Row::new(row_id, epoch);
         for (col_id, val) in columns {
@@ -1650,7 +1658,11 @@ impl Table {
         let mut rows = Vec::with_capacity(filled.len());
         let mut ids = Vec::with_capacity(filled.len());
         for (cols, assigned) in filled {
-            let row_id = self.allocator.alloc();
+            let row_id = if self.schema.clustered {
+                self.derive_clustered_row_id(&cols)?
+            } else {
+                self.allocator.alloc()
+            };
             let mut row = Row::new(row_id, epoch);
             for (c, v) in cols {
                 row.columns.insert(c, v);
@@ -2090,6 +2102,42 @@ impl Table {
     /// cross-table `Transaction` to assign ids before sealing a row.
     pub(crate) fn alloc_row_id(&mut self) -> RowId {
         self.allocator.alloc()
+    }
+
+    /// For clustered (WITHOUT ROWID) tables: derive a deterministic `RowId`
+    /// from the primary-key value so the same PK always maps to the same row.
+    /// Uses a stable hash of the PK's `encode_key()` bytes, cast to `u64`.
+    /// This gives WITHOUT ROWID tables idempotent upsert semantics (same PK →
+    /// same RowId, no allocator waste) without changing the storage format.
+    fn derive_clustered_row_id(&self, columns: &[(u16, Value)]) -> Result<RowId> {
+        let pk = self
+            .schema
+            .primary_key()
+            .ok_or_else(|| {
+                MongrelError::Schema(
+                    "clustered table requires a single-column primary key".into(),
+                )
+            })?;
+        let pk_val = columns
+            .iter()
+            .find(|(id, _)| *id == pk.id)
+            .map(|(_, v)| v)
+            .ok_or_else(|| {
+                MongrelError::Schema(format!(
+                    "clustered table missing primary key column {} ({})",
+                    pk.id, pk.name
+                ))
+            })?;
+        let key_bytes = pk_val.encode_key();
+        // Stable hash (FNV-1a 64-bit) — deterministic across runs and processes.
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for &b in &key_bytes {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        // Ensure non-zero (RowId 0 is valid but we want to avoid collision with
+        // allocator-generated ids which start at 0 for non-clustered tables).
+        Ok(RowId(hash.max(1)))
     }
 
     /// Apply the metadata for rows that were spilled to a linked uniform-epoch
