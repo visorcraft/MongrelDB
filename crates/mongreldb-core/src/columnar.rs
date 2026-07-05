@@ -50,6 +50,11 @@ pub fn encode_column(ty: TypeId, values: &[Value]) -> Result<Vec<u8>> {
         })?,
         TypeId::Bytes => bytes_encode(values)?,
         TypeId::Embedding { dim } => embedding_encode(values, dim)?,
+        TypeId::Decimal128 { .. } => fixed_encode(values, 16, |v| match v {
+            Value::Decimal(d) => Ok(d.to_be_bytes().to_vec()),
+            Value::Null => Ok(vec![0; 16]),
+            _ => Err(type_mismatch(ty, v)),
+        })?,
         other => {
             return Err(MongrelError::Schema(format!(
                 "encoding for type {other:?} not implemented yet"
@@ -141,6 +146,11 @@ pub fn decode_column(ty: TypeId, page: &[u8], n: usize, le: bool) -> Result<Vec<
                     acc.push(f32::from_bits(u32::from_be_bytes(b.try_into().unwrap())));
                 }
                 Value::Embedding(acc)
+            }
+            TypeId::Decimal128 { .. } => {
+                let b = take(payload, &mut cur, 16)?;
+                let arr: [u8; 16] = b.try_into().unwrap();
+                Value::Decimal(i128::from_be_bytes(arr))
             }
             other => {
                 return Err(MongrelError::Schema(format!(
@@ -248,6 +258,7 @@ fn advance_null(ty: &TypeId, payload: &[u8], cur: &mut usize) -> Result<()> {
         TypeId::Int64 | TypeId::Float64 | TypeId::TimestampNanos => 8,
         TypeId::Int32 | TypeId::UInt32 | TypeId::Date32 => 4,
         TypeId::Bool => 1,
+        TypeId::Decimal128 { .. } => 16,
         // Variable-length types: null rows have no payload bytes; the offsets
         // table covers them, so nothing to advance here.
         TypeId::Bytes | TypeId::Embedding { .. } => return Ok(()),

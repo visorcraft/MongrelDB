@@ -25,6 +25,9 @@ pub enum Value {
     Float64(f64),
     Bytes(Vec<u8>),
     Embedding(Vec<f32>),
+    /// Unscaled decimal value (i128). The column's `TypeId::Decimal128`
+    /// carries the precision/scale for formatting.
+    Decimal(i128),
 }
 
 impl Value {
@@ -44,6 +47,7 @@ impl Value {
                 }
                 out
             }
+            Value::Decimal(d) => d.to_be_bytes().to_vec(),
         }
     }
 }
@@ -83,6 +87,7 @@ impl Row {
                 Value::Float64(_) => 8,
                 Value::Bytes(b) => 16 + b.len() as u64,
                 Value::Embedding(v) => 16 + (v.len() as u64) * 4,
+                Value::Decimal(_) => 16,
             };
         }
         n

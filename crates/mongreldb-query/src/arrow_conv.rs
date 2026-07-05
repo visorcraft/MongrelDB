@@ -194,6 +194,9 @@ pub(crate) fn arrow_data_type(ty: &TypeId) -> Result<DataType> {
             Arc::new(Field::new("item", DataType::Float32, true)),
             *dim as i32,
         ),
+        TypeId::Decimal128 { precision, scale } => {
+            DataType::Decimal128(*precision, *scale)
+        }
     })
 }
 
@@ -302,6 +305,18 @@ pub fn build_array(ty: TypeId, values: &[Value]) -> Result<ArrayRef> {
                         }
                         b.append(false);
                     }
+                }
+            }
+            Arc::new(b.finish())
+        }
+        TypeId::Decimal128 { precision, scale } => {
+            let mut b = arrow::array::Decimal128Builder::new()
+                .with_precision_and_scale(precision, scale)
+                .map_err(|e| MongrelQueryError::Arrow(e.to_string()))?;
+            for v in values {
+                match v {
+                    Value::Decimal(d) => b.append_value(*d),
+                    _ => b.append_null(),
                 }
             }
             Arc::new(b.finish())

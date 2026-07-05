@@ -4409,6 +4409,7 @@ fn trigger_message(value: Value) -> String {
         Value::Float64(value) => value.to_string(),
         Value::Bytes(value) => String::from_utf8_lossy(&value).into_owned(),
         Value::Embedding(value) => format!("{value:?}"),
+        Value::Decimal(value) => value.to_string(),
     }
 }
 

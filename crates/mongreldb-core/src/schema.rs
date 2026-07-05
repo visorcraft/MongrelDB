@@ -28,6 +28,12 @@ pub enum TypeId {
     Embedding {
         dim: u32,
     },
+    /// Fixed-point decimal (i128 unscaled value, precision, scale). SQL:
+    /// `mongreldb_decimal(precision, scale)` or `DECIMAL(p, s)`.
+    Decimal128 {
+        precision: u8,
+        scale: i8,
+    },
 }
 
 impl TypeId {
@@ -40,6 +46,7 @@ impl TypeId {
             TypeId::Int32 | TypeId::UInt32 | TypeId::Float32 | TypeId::Date32 => Some(4),
             TypeId::Int64 | TypeId::UInt64 | TypeId::Float64 | TypeId::TimestampNanos => Some(8),
             TypeId::Bytes | TypeId::Embedding { .. } => None,
+            TypeId::Decimal128 { .. } => Some(16),
         }
     }
 }

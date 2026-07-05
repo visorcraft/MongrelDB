@@ -213,6 +213,13 @@ impl Tri {
                     Tri::True
                 }
             }
+            Value::Decimal(d) => {
+                if *d != 0 {
+                    Tri::True
+                } else {
+                    Tri::False
+                }
+            }
         }
     }
 }

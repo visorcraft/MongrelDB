@@ -2656,6 +2656,7 @@ fn scalar_to_core_value(value: datafusion::common::ScalarValue) -> Result<Value>
         ScalarValue::Dictionary(_, value) | ScalarValue::RunEndEncoded(_, _, value) => {
             scalar_to_core_value(*value)
         }
+        ScalarValue::Decimal128(Some(v), _, _) => Ok(Value::Decimal(v)),
         other => Err(MongrelQueryError::Schema(format!(
             "view write routing cannot materialize {other:?}"
         ))),
@@ -3425,6 +3426,7 @@ fn trigger_message(value: Value) -> String {
         Value::Float64(value) => value.to_string(),
         Value::Bytes(value) => String::from_utf8_lossy(&value).into_owned(),
         Value::Embedding(value) => format!("{value:?}"),
+        Value::Decimal(value) => value.to_string(),
     }
 }
 
@@ -3439,6 +3441,7 @@ fn compare_values(left: &Value, op: &BinaryOperator, right: &Value) -> Result<bo
         (Value::Float64(a), Value::Int64(b)) => a.partial_cmp(&(*b as f64)),
         (Value::Bytes(a), Value::Bytes(b)) => a.partial_cmp(b),
         (Value::Bool(a), Value::Bool(b)) => a.partial_cmp(b),
+        (Value::Decimal(a), Value::Decimal(b)) => a.partial_cmp(b),
         _ => None,
     };
     let Some(ordering) = ordering else {
@@ -3892,6 +3895,7 @@ fn core_value_json(value: &Value) -> serde_json::Value {
                 })
                 .collect(),
         ),
+        Value::Decimal(value) => serde_json::Value::String(value.to_string()),
     }
 }
 
