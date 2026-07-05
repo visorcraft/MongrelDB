@@ -1157,8 +1157,20 @@ impl Database {
 
     /// Begin a new transaction reading at the current visible epoch.
     pub fn begin(&self) -> crate::txn::Transaction<'_> {
+        self.begin_with_isolation(crate::txn::IsolationLevel::default())
+    }
+
+    /// Begin a transaction with a specific isolation level.
+    pub fn begin_with_isolation(
+        &self,
+        level: crate::txn::IsolationLevel,
+    ) -> crate::txn::Transaction<'_> {
         let txn_id = self.alloc_txn_id();
-        let read = Snapshot::at(self.epoch.visible());
+        let epoch = match level {
+            crate::txn::IsolationLevel::ReadCommitted => self.epoch.visible(),
+            _ => self.epoch.visible(),
+        };
+        let read = Snapshot::at(epoch);
         crate::txn::Transaction::new(self, txn_id, read)
     }
 

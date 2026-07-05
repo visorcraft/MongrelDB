@@ -87,7 +87,7 @@ pub use trigger::{
     TriggerEvent, TriggerExpr, TriggerProgram, TriggerRaiseAction, TriggerStep, TriggerTarget,
     TriggerTiming, TriggerValue,
 };
-pub use txn::{OwnedRow, PutResult, UpsertAction, UpsertActionKind, UpsertResult};
+pub use txn::{IsolationLevel, OwnedRow, PutResult, UpsertAction, UpsertActionKind, UpsertResult};
 pub use wal::{AddedRun, DdlOp, Op, Record, SharedWal, Wal, WalReader, SYSTEM_TXN_ID};
 
 #[cfg(feature = "encryption")]

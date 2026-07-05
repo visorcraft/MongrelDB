@@ -829,3 +829,21 @@ mod tests {
         assert_eq!(at.min_read_epoch(), u64::MAX);
     }
 }
+
+/// Transaction isolation level. MongrelDB defaults to `Snapshot` (SI).
+///
+/// - `Snapshot`: reads see a consistent snapshot taken at `begin`; writes
+///   conflict on first-committer-wins for overlapping keys.
+/// - `ReadCommitted`: each read sees the latest committed epoch (no stale
+///   reads within a long transaction). Weaker than Snapshot but avoids
+///   aborts from read-write conflicts.
+/// - `Serializable`: same as Snapshot under MongrelDB's optimistic model —
+///   the conflict index already detects write-skew. Explicitly marked so
+///   callers can request the strongest level without behavioral surprise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IsolationLevel {
+    #[default]
+    Snapshot,
+    ReadCommitted,
+    Serializable,
+}
