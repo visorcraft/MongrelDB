@@ -241,6 +241,21 @@ pub struct Database {
     /// Exclusive cross-process lock held for the database's lifetime to prevent
     /// two processes from opening the same directory concurrently.
     _lock: Option<std::fs::File>,
+    /// Lightweight notification channel for CDC / NOTIFY-LISTEN. Each committed
+    /// transaction that produces `Put`/`Delete` ops publishes a `ChangeEvent`
+    /// here. Subscribers (daemon `/events` endpoint, application listeners)
+    /// receive them asynchronously.
+    notify: tokio::sync::broadcast::Sender<ChangeEvent>,
+}
+
+/// A data-change event published on commit (CDC / NOTIFY-LISTEN).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ChangeEvent {
+    pub channel: String,
+    pub table: String,
+    pub op: String,
+    pub epoch: u64,
+    pub message: Option<String>,
 }
 
 impl Database {
@@ -493,6 +508,10 @@ impl Database {
                 TriggerConfig::default().max_loop_iterations,
             ),
             _lock: Some(lock_file),
+            notify: {
+                let (tx, _rx) = tokio::sync::broadcast::channel(256);
+                tx
+            },
         })
     }
 
@@ -843,6 +862,24 @@ impl Database {
     pub fn set_recursive_triggers(&self, recursive: bool) {
         use std::sync::atomic::Ordering;
         self.trigger_recursive.store(recursive, Ordering::Relaxed);
+    }
+
+    /// Subscribe to change-data-capture events. Returns a receiver that yields
+    /// `ChangeEvent`s for every committed `Put`/`Delete`/`NOTIFY`.
+    pub fn subscribe_changes(&self) -> tokio::sync::broadcast::Receiver<ChangeEvent> {
+        self.notify.subscribe()
+    }
+
+    /// Publish a notification message on a named channel. Reaches all active
+    /// subscribers (daemon `/events`, application listeners).
+    pub fn notify(&self, channel: &str, message: Option<String>) {
+        let _ = self.notify.send(ChangeEvent {
+            channel: channel.to_string(),
+            table: String::new(),
+            op: "notify".into(),
+            epoch: self.epoch.visible().0,
+            message,
+        });
     }
 
     pub fn call_procedure(

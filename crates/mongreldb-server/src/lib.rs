@@ -97,6 +97,7 @@ pub fn build_app_with_config(
         .route("/compact", post(compact_all))
         .route("/tables/{name}/compact", post(compact_table))
         .route("/wal/stream", get(wal_stream))
+        .route("/events", get(events_stream))
         .with_state(state.clone());
 
     // Apply auth middleware if a token is configured.
@@ -182,6 +183,37 @@ async fn wal_stream(
 #[derive(serde::Deserialize)]
 struct WalStreamParams {
     since: Option<u64>,
+}
+
+/// `GET /events` — stream change-data-capture events (from NOTIFY/LISTEN and
+/// committed Put/Delete operations) as newline-delimited JSON. Each line is
+/// a JSON `ChangeEvent { channel, table, op, epoch, message }`.
+async fn events_stream(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> Result<Response, StatusCode> {
+    let mut rx = state.db.subscribe_changes();
+    let body = tokio::task::spawn_blocking(move || {
+        // Drain the current backlog (non-blocking).
+        let mut out = String::new();
+        while let Ok(event) = rx.try_recv() {
+            if let Ok(json) = serde_json::to_string(&event) {
+                out.push_str(&json);
+                out.push('\n');
+            }
+        }
+        out
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/x-ndjson".to_string()),
+            (header::CACHE_CONTROL, "no-cache".to_string()),
+        ],
+        body,
+    )
+        .into_response())
 }
 
 /// Launch the §5.9 background auto-compaction sweep (run-count cost trigger).

@@ -250,6 +250,24 @@ fn try_manual_command(
         return detach_database(session, sql);
     }
 
+    // NOTIFY channel [, payload] — publish a notification on a named channel.
+    if let Some(rest) = lower.strip_prefix("notify ") {
+        let original_rest = &sql["notify ".len()..];
+        let (channel, payload) = parse_notify_args(rest, original_rest)?;
+        if let Some(db) = &session.database {
+            db.notify(&channel, payload);
+        }
+        return Ok(Some(Vec::new()));
+    }
+    // LISTEN channel — accepted as a no-op at the SQL layer (subscribers
+    // connect via /events SSE or Database::subscribe_changes).
+    if let Some(_rest) = lower.strip_prefix("listen ") {
+        return Ok(Some(Vec::new()));
+    }
+    if let Some(_rest) = lower.strip_prefix("unlisten ") {
+        return Ok(Some(Vec::new()));
+    }
+
     // SAVEPOINT / RELEASE / ROLLBACK TO — operate on the session's SQL staging.
     if let Some(rest) = lower.strip_prefix("savepoint ") {
         let name = rest.trim().trim_end_matches(';').trim().to_string();
@@ -549,6 +567,22 @@ fn parse_attach_args(_lower_rest: &str, original_sql: &str) -> Result<(PathBuf, 
         ));
     }
     Ok((path, alias))
+}
+
+fn parse_notify_args(_lower_rest: &str, original_rest: &str) -> Result<(String, Option<String>)> {
+    // Pattern: NOTIFY channel_name  or  NOTIFY channel_name, 'payload'
+    let trimmed = original_rest.trim().trim_end_matches(';').trim();
+    if let Some((channel, payload)) = trimmed.split_once(',') {
+        let channel = channel.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+        let payload = payload.trim().trim_matches(|c| c == '\'').to_string();
+        Ok((channel, Some(payload)))
+    } else {
+        let channel = trimmed.trim_matches(|c| c == '"' || c == '\'').to_string();
+        if channel.is_empty() {
+            return Err(MongrelQueryError::Schema("NOTIFY requires a channel name".into()));
+        }
+        Ok((channel, None))
+    }
 }
 
 fn parse_detach_alias(lower_rest: &str) -> Result<String> {
