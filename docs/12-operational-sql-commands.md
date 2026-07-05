@@ -94,8 +94,7 @@ position without aborting the outer transaction.
 
 `SELECT * FROM information_schema.tables` returns a catalog listing all tables,
 views, and triggers in the session. Columns: `type`, `name`, `tbl_name`,
-`rootpage`, `sql`. The SQLite-compat aliases `sqlite_master` and
-`sqlite_schema` also work for tooling/ORM compatibility.
+`rootpage`, `sql`.
 
 `regexp('pattern', value)` is a scalar UDF returning 1 (match) or 0 (no match),
 using the `regex` crate. Invalid patterns return 0 (SQLite semantics).
@@ -137,7 +136,7 @@ Implemented beyond the MVP: broader PRAGMA introspection, metadata-backed
 `user_version`/`application_id`, storage accounting PRAGMAs, `wal_checkpoint`,
 `foreign_key_check`, `VACUUM INTO`, aggregate-aware `function_list`,
 `ATTACH`/`DETACH` (cross-database queries), `SAVEPOINT`/`RELEASE`/`ROLLBACK TO`
-(session-level sub-transactions), `sqlite_master`/`sqlite_schema` (catalog
+(session-level sub-transactions), `information_schema.tables` (catalog
 introspection), `regexp()` (regex matching UDF), recursive CTEs
 (`WITH RECURSIVE`), window functions (`OVER`/`PARTITION BY`), and
 `EXPLAIN`/`EXPLAIN QUERY PLAN`.

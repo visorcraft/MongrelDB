@@ -6,7 +6,7 @@ Measured live on this development sandbox. All engines embedded/in-process
 
 Refreshed 2026-07-05 against engine v0.28.0 (after the Tier 1–3 Kit gap
 closures and SQLite-parity SQL features — recursive CTEs, window functions,
-REGEXP, sqlite_master, ATTACH, SAVEPOINTs). All changes were query-layer
+REGEXP, information_schema.tables, ATTACH, SAVEPOINTs). All changes were query-layer
 additions; the core write/read hot path is unchanged. Numbers are within
 sandbox noise of the 2026-07-02 §5 baseline. See "§5 optimization session"
 below for that session's improvements.
@@ -35,7 +35,7 @@ below for that session's improvements.
 
 Numbers are within sandbox noise of the 2026-07-02 §5 baseline. The Tier 1–3
 Kit gap closures and SQLite-parity SQL features (recursive CTEs, window functions,
-REGEXP, sqlite_master, ATTACH, SAVEPOINTs) are all query-layer additions; the
+REGEXP, information_schema.tables, ATTACH, SAVEPOINTs) are all query-layer additions; the
 core write/read hot path is unchanged. Cross-engine leads are preserved:
 single-row writes ~1.8× SQLite / ~37× DuckDB, cold filter ~2000× SQLite /
 ~80× DuckDB, join COUNT(*) ~19× SQLite / ~3.4× DuckDB.

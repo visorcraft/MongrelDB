@@ -267,11 +267,11 @@ async fn extended_string_and_math_functions() {
              soundex('Robert') as sx, \
              unistr('A\\u0042') as uni, \
              unistr_quote('a\\b') as uni_quote, \
-             sqlite_compileoption_get(0) as compile_get, \
-             sqlite_compileoption_used('WAL') as compile_used, \
-             sqlite_offset(1) as off, \
-             sqlite_version() as compat_version, \
-             sqlite_source_id() as source_id",
+             mongreldb_compileoption_get(0) as compile_get, \
+             mongreldb_compileoption_used('WAL') as compile_used, \
+             mongreldb_offset(1) as off, \
+             mongreldb_version() as compat_version, \
+             mongreldb_source_id() as source_id",
         )
         .await
         .unwrap();

@@ -121,7 +121,7 @@ SELECT typeof(1.5);
 SELECT unicode('Az'), unistr('A\u0042'), unistr_quote('a\b');
 SELECT lower('AZ'), upper('az'), trim('  x  ');
 SELECT likely(score > 90), ifnull(NULL, 'fallback'), iif(1, 'yes', 'no');
-SELECT sqlite_compileoption_get(0), sqlite_compileoption_used('WAL');
+SELECT mongreldb_compileoption_get(0), mongreldb_compileoption_used('WAL');
 ```
 
 Supported functions:
@@ -168,9 +168,9 @@ Supported functions:
 | `iif(cond, then, else)` / `if(...)` | same as selected branch | Conditional expression helper |
 | `nullif(lhs, rhs)` | same as `lhs` | Returns `NULL` when arguments compare equal |
 | `soundex(value)` | text | Four-character Soundex code |
-| `sqlite_compileoption_get(n)` / `sqlite_compileoption_used(name)` | text/int | Compatibility accessors for MongrelDB SQL capability flags |
-| `sqlite_offset(value)` | int | Returns `NULL`; MongrelDB does not expose page offsets through SQL |
-| `sqlite_version()` / `sqlite_source_id()` | text | Compatibility accessors returning MongrelDB query-layer version/source text |
+| `mongreldb_compileoption_get(n)` / `mongreldb_compileoption_used(name)` | text/int | Compatibility accessors for MongrelDB SQL capability flags |
+| `mongreldb_offset(value)` | int | Returns `NULL`; MongrelDB does not expose page offsets through SQL |
+| `mongreldb_version()` / `mongreldb_source_id()` | text | Compatibility accessors returning MongrelDB query-layer version/source text |
 | `load_extension(...)` | error | Explicitly disabled |
 
 ## Aggregate and Window Functions

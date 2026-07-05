@@ -237,7 +237,7 @@ const matched = tableFromIPC(await db.sql(
 ));
 ```
 
-**Catalog introspection** — `information_schema.tables` lists tables, views, and triggers (`sqlite_master`/`sqlite_schema` also work as compat aliases):
+**Catalog introspection** — `information_schema.tables` lists tables, views, and triggers:
 
 ```javascript
 const catalog = tableFromIPC(await db.sql(

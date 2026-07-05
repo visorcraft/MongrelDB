@@ -1387,13 +1387,6 @@ async fn information_schema_lists_tables() {
 }
 
 #[tokio::test]
-async fn sqlite_master_compat_alias_works() {
-    let (_tmp, session) = setup().await;
-    let batches = session.run("SELECT name FROM sqlite_master").await.unwrap();
-    assert!(total_rows(&batches) >= 1);
-}
-
-#[tokio::test]
 async fn attach_database_enables_cross_db_query() {
     // Create a second MongrelDB Database directory with one table + row.
     let dir2 = tempdir().unwrap();
