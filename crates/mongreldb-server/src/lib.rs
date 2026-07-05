@@ -96,6 +96,7 @@ pub fn build_app_with_config(
         .route("/kit/procedures/{name}/call", post(procedure::kit_call))
         .route("/compact", post(compact_all))
         .route("/tables/{name}/compact", post(compact_table))
+        .route("/wal/stream", get(wal_stream))
         .with_state(state.clone());
 
     // Apply auth middleware if a token is configured.
@@ -109,13 +110,11 @@ pub fn build_app_with_config(
     };
 
     // Apply connection limit if configured.
-    let router = if let Some(max) = max_connections {
+    if let Some(max) = max_connections {
         router.layer(tower::limit::ConcurrencyLimitLayer::new(max))
     } else {
         router
-    };
-
-    router
+    }
 }
 
 /// Bearer-token auth middleware. Checks `Authorization: Bearer <token>` header
@@ -138,6 +137,51 @@ async fn auth_middleware(
     } else {
         Err(axum::http::StatusCode::UNAUTHORIZED)
     }
+}
+
+/// `GET /wal/stream?since=<seq>` — stream committed WAL records as
+/// newline-delimited JSON for replication followers. Each line is a JSON
+/// object `{ "seq": N, "txn_id": N, "op": {...} }`.
+async fn wal_stream(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<WalStreamParams>,
+) -> Result<Response, StatusCode> {
+    let db_root = state.db.root().to_path_buf();
+    let since = params.since.unwrap_or(0);
+
+    // Read all committed WAL records with seq > since and stream as NDJSON.
+    let body = tokio::task::spawn_blocking(move || -> Result<String, String> {
+        let records = mongreldb_core::wal::SharedWal::replay(&db_root).map_err(|e| e.to_string())?;
+        let mut out = String::new();
+        for record in records.iter().filter(|r| r.seq.0 > since) {
+            if let Ok(json) = serde_json::to_string(record) {
+                out.push_str(&json);
+                out.push('\n');
+            }
+        }
+        Ok(out)
+    })
+    .await
+    .map_err(|_e| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let body = body.map_err(|e| {
+        eprintln!("wal_stream error: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/x-ndjson".to_string()),
+            (header::CACHE_CONTROL, "no-cache".to_string()),
+        ],
+        body,
+    )
+        .into_response())
+}
+
+#[derive(serde::Deserialize)]
+struct WalStreamParams {
+    since: Option<u64>,
 }
 
 /// Launch the §5.9 background auto-compaction sweep (run-count cost trigger).
@@ -577,5 +621,49 @@ mod auth_tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
+    }
+}
+
+#[cfg(test)]
+mod wal_stream_tests {
+    use super::*;
+    use mongreldb_core::Database;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn wal_stream_returns_records_after_commit() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(Database::create(dir.path()).unwrap());
+        let table_schema = mongreldb_core::schema::Schema {
+            schema_id: 1,
+            columns: vec![mongreldb_core::schema::ColumnDef {
+                id: 1,
+                name: "id".into(),
+                ty: TypeId::Int64,
+                flags: mongreldb_core::schema::ColumnFlags::empty()
+                    .with(mongreldb_core::schema::ColumnFlags::PRIMARY_KEY),
+            }],
+            indexes: vec![],
+            colocation: vec![],
+            constraints: Default::default(),
+        };
+        db.create_table("items", table_schema).unwrap();
+        // Write a row to generate WAL records.
+        let handle = db.table("items").unwrap();
+        handle.lock().put(vec![(1, Value::Int64(1))]).unwrap();
+        handle.lock().flush().unwrap();
+
+        let app = build_app(db);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let resp = reqwest::get(format!("http://{addr}/wal/stream")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = resp.text().await.unwrap();
+        // Should contain at least one record (the flush commit).
+        assert!(!body.is_empty(), "wal_stream should return records");
+        assert!(body.contains("seq"), "response should contain seq field");
     }
 }
