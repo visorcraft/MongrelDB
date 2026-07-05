@@ -2335,6 +2335,65 @@ fn eval_instead_of_trigger_value(
     }
 }
 
+/// Extract a `usize` from a SQL `Expr` (e.g. `Expr::Value(Number("5", false))`).
+fn expr_to_usize(expr: &sqlparser::ast::Expr) -> Option<usize> {
+    use sqlparser::ast::{Expr, Value as SqlValue};
+    match expr {
+        Expr::Value(v) => match &v.value {
+            SqlValue::Number(s, _) => s.parse().ok(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Sort rows by ORDER BY expressions. Each `OrderByExpr` maps to a column
+/// name; we resolve the name to a column id via the schema, then compare
+/// the encoded key bytes for ordering.
+fn apply_order_by(
+    rows: &mut [mongreldb_core::memtable::Row],
+    order_by: &[sqlparser::ast::OrderByExpr],
+    schema: &mongreldb_core::schema::Schema,
+) -> Result<()> {
+    // Build a name → column_id lookup from the schema.
+    let name_to_id: HashMap<String, u16> = schema
+        .columns
+        .iter()
+        .map(|c| (c.name.clone(), c.id))
+        .collect();
+    rows.sort_by(|a, b| {
+        for expr in order_by {
+            let col_name = match &expr.expr {
+                sqlparser::ast::Expr::Identifier(ident) => &ident.value,
+                sqlparser::ast::Expr::CompoundIdentifier(idents) => {
+                    &idents.last().unwrap().value
+                }
+                _ => continue,
+            };
+            let col_id = match name_to_id.get(col_name) {
+                Some(id) => *id,
+                None => continue,
+            };
+            let va = a.columns.get(&col_id);
+            let vb = b.columns.get(&col_id);
+            let ord = match (va, vb) {
+                (Some(va), Some(vb)) => va.encode_key().cmp(&vb.encode_key()),
+                _ => std::cmp::Ordering::Equal,
+            };
+            let ord = if expr.options.asc == Some(false) {
+                ord.reverse()
+            } else {
+                ord
+            };
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+    Ok(())
+}
+
 async fn update_rows(
     session: &MongrelSession,
     db: &Arc<Database>,
@@ -2358,22 +2417,33 @@ async fn update_rows(
         return update_external_rows(session, db, &entry, update);
     }
     let (schema, rows) = visible_rows(db, &table)?;
-    let mut ops = Vec::new();
-    for row in rows {
-        if predicate_matches(update.selection.as_ref(), &schema, &row)? {
-            let mut merged = row.columns.clone();
-            for assignment in &update.assignments {
-                apply_assignment(&schema, &mut merged, assignment, None)?;
-            }
-            ops.push(PendingSqlOp::Delete {
-                table: table.clone(),
-                row_id: row.row_id,
-            });
-            ops.push(PendingSqlOp::Put {
-                table: table.clone(),
-                cells: map_to_cells(&merged),
-            });
+    let mut matched: Vec<_> = rows
+        .into_iter()
+        .filter(|row| predicate_matches(update.selection.as_ref(), &schema, row).unwrap_or(false))
+        .collect();
+    // Apply ORDER BY + LIMIT if present.
+    if !update.order_by.is_empty() {
+        apply_order_by(&mut matched, &update.order_by, &schema)?;
+    }
+    if let Some(limit_expr) = &update.limit {
+        if let Some(n) = expr_to_usize(limit_expr) {
+            matched.truncate(n);
         }
+    }
+    let mut ops = Vec::new();
+    for row in &matched {
+        let mut merged = row.columns.clone();
+        for assignment in &update.assignments {
+            apply_assignment(&schema, &mut merged, assignment, None)?;
+        }
+        ops.push(PendingSqlOp::Delete {
+            table: table.clone(),
+            row_id: row.row_id,
+        });
+        ops.push(PendingSqlOp::Put {
+            table: table.clone(),
+            cells: map_to_cells(&merged),
+        });
     }
     let changes = logical_changes(&ops);
     stage_or_apply(session, db, ops, changes, None)
@@ -2384,11 +2454,9 @@ async fn delete_rows(session: &MongrelSession, db: &Arc<Database>, delete: Delet
         || delete.output.is_some()
         || delete.using.is_some()
         || !delete.tables.is_empty()
-        || !delete.order_by.is_empty()
-        || delete.limit.is_some()
     {
         return Err(MongrelQueryError::Schema(
-            "DELETE USING/RETURNING/ORDER BY/LIMIT and multi-table DELETE are not supported".into(),
+            "DELETE USING/RETURNING and multi-table DELETE are not supported".into(),
         ));
     }
     let table = single_from_table(&delete.from)?;
@@ -2399,19 +2467,26 @@ async fn delete_rows(session: &MongrelSession, db: &Arc<Database>, delete: Delet
         return delete_external_rows(session, db, &entry, delete);
     }
     let (schema, rows) = visible_rows(db, &table)?;
-    let ops = rows
+    let mut matched: Vec<_> = rows
         .into_iter()
-        .filter_map(
-            |row| match predicate_matches(delete.selection.as_ref(), &schema, &row) {
-                Ok(true) => Some(Ok(PendingSqlOp::Delete {
-                    table: table.clone(),
-                    row_id: row.row_id,
-                })),
-                Ok(false) => None,
-                Err(e) => Some(Err(e)),
-            },
-        )
-        .collect::<Result<Vec<_>>>()?;
+        .filter(|row| predicate_matches(delete.selection.as_ref(), &schema, row).unwrap_or(false))
+        .collect();
+    // Apply ORDER BY + LIMIT if present.
+    if !delete.order_by.is_empty() {
+        apply_order_by(&mut matched, &delete.order_by, &schema)?;
+    }
+    if let Some(limit_expr) = &delete.limit {
+        if let Some(n) = expr_to_usize(limit_expr) {
+            matched.truncate(n);
+        }
+    }
+    let ops = matched
+        .into_iter()
+        .map(|row| PendingSqlOp::Delete {
+            table: table.clone(),
+            row_id: row.row_id,
+        })
+        .collect::<Vec<_>>();
     let changes = logical_changes(&ops);
     stage_or_apply(session, db, ops, changes, None)
 }
