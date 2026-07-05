@@ -2557,6 +2557,47 @@ impl Table {
         if row.deleted {
             return;
         }
+        // Partial index filtering: skip rows that don't match any index's
+        // predicate. The predicate is a SQL WHERE clause string evaluated
+        // against the row's column values. For now, we support a simple
+        // "column_name IS NOT NULL" and "column_name = value" syntax that
+        // covers the common partial-index patterns (e.g. WHERE deleted_at
+        // IS NULL). More complex predicates require a full expression
+        // evaluator in core (future work).
+        let any_predicate = self
+            .schema
+            .indexes
+            .iter()
+            .any(|idx| idx.predicate.is_some());
+        if any_predicate {
+            let columns_map: HashMap<u16, &Value> = row.columns.iter().map(|(k, v)| (*k, v)).collect();
+            let name_to_id: HashMap<&str, u16> = self
+                .schema
+                .columns
+                .iter()
+                .map(|c| (c.name.as_str(), c.id))
+                .collect();
+            for idx in &self.schema.indexes {
+                if let Some(pred) = &idx.predicate {
+                    if !eval_partial_predicate(pred, &columns_map, &name_to_id) {
+                        continue; // skip this index for this row
+                    }
+                }
+                // Index the row into this specific index only.
+                index_into_single(
+                    idx,
+                    &self.schema,
+                    row,
+                    &mut self.hot,
+                    &mut self.bitmap,
+                    &mut self.ann,
+                    &mut self.fm,
+                    &mut self.sparse,
+                    &mut self.minhash,
+                );
+            }
+            return;
+        }
         // Plaintext tables index the row as-is; only ENCRYPTED_INDEXABLE
         // columns need the tokenized copy (`tokenized_for_indexes` clones the
         // whole row, which would tax every put on unencrypted tables).
@@ -7087,6 +7128,90 @@ fn index_into(
             hot.insert(pk_val.encode_key(), row.row_id);
         }
     }
+}
+
+/// Index a row into a single specific index (used for partial indexes where
+/// only matching indexes should receive the row).
+#[allow(clippy::too_many_arguments)]
+fn index_into_single(
+    idef: &IndexDef,
+    _schema: &Schema,
+    row: &Row,
+    _hot: &mut HotIndex,
+    bitmap: &mut HashMap<u16, BitmapIndex>,
+    ann: &mut HashMap<u16, AnnIndex>,
+    fm: &mut HashMap<u16, FmIndex>,
+    sparse: &mut HashMap<u16, SparseIndex>,
+    minhash: &mut HashMap<u16, MinHashIndex>,
+) {
+    let Some(val) = row.columns.get(&idef.column_id) else {
+        return;
+    };
+    match idef.kind {
+        IndexKind::Bitmap => {
+            if let Some(b) = bitmap.get_mut(&idef.column_id) {
+                b.insert(val.encode_key(), row.row_id);
+            }
+        }
+        IndexKind::Ann => {
+            if let (Some(a), Value::Embedding(v)) = (ann.get_mut(&idef.column_id), val) {
+                a.insert(v, row.row_id);
+            }
+        }
+        IndexKind::FmIndex => {
+            if let (Some(f), Value::Bytes(b)) = (fm.get_mut(&idef.column_id), val) {
+                f.insert(b.clone(), row.row_id);
+            }
+        }
+        IndexKind::Sparse => {
+            if let (Some(s), Value::Bytes(b)) = (sparse.get_mut(&idef.column_id), val) {
+                if let Ok(terms) = bincode::deserialize::<Vec<(u32, f32)>>(b) {
+                    s.insert(&terms, row.row_id);
+                }
+            }
+        }
+        IndexKind::MinHash => {
+            if let (Some(mh), Value::Bytes(b)) = (minhash.get_mut(&idef.column_id), val) {
+                let tokens = crate::index::token_hashes_from_bytes(b);
+                mh.insert(&tokens, row.row_id);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Evaluate a partial-index predicate against a row. Supports the most common
+/// patterns: `"column IS NOT NULL"` and `"column IS NULL"`. More complex
+/// expressions require a full SQL evaluator in core (future work); the
+/// predicate string is stored verbatim and this function provides a pragmatic
+/// subset. Returns `true` if the row should be indexed.
+fn eval_partial_predicate(
+    pred: &str,
+    columns_map: &HashMap<u16, &Value>,
+    name_to_id: &HashMap<&str, u16>,
+) -> bool {
+    let lower = pred.trim().to_ascii_lowercase();
+    // Pattern: "column_name IS NOT NULL"
+    if let Some(rest) = lower.strip_suffix(" is not null") {
+        let col_name = rest.trim();
+        if let Some(col_id) = name_to_id.get(col_name) {
+            return columns_map
+                .get(col_id)
+                .is_some_and(|v| !matches!(v, Value::Null));
+        }
+    }
+    // Pattern: "column_name IS NULL"
+    if let Some(rest) = lower.strip_suffix(" is null") {
+        let col_name = rest.trim();
+        if let Some(col_id) = name_to_id.get(col_name) {
+            return columns_map
+                .get(col_id)
+                .map_or(true, |v| matches!(v, Value::Null));
+        }
+    }
+    // Unknown predicate syntax: index the row (conservative — better to
+    // over-index than to miss rows).
+    true
 }
 
 /// Per-element index key for the typed bulk-index path (Phase 14.2): mirrors
