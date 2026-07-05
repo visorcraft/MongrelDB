@@ -406,7 +406,6 @@ pub struct KitCreateTableRequest {
     pub columns: Vec<KitColumnDef>,
     #[serde(default)]
     pub constraints: TableConstraints,
-    clustered: false,
 }
 
 #[derive(Debug, Deserialize)]

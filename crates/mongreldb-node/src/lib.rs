@@ -277,8 +277,8 @@ fn build_schema(spec: SchemaSpec) -> napi::Result<Schema> {
                 IndexKindSpec::Sparse => IndexKind::Sparse,
                 IndexKindSpec::MinHash => IndexKind::MinHash,
                 IndexKindSpec::LearnedRange => IndexKind::LearnedRange,
-            predicate: None,
             },
+            predicate: None,
         })
         .collect();
     Ok(Schema {

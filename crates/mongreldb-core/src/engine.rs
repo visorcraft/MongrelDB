@@ -2110,14 +2110,9 @@ impl Table {
     /// This gives WITHOUT ROWID tables idempotent upsert semantics (same PK →
     /// same RowId, no allocator waste) without changing the storage format.
     fn derive_clustered_row_id(&self, columns: &[(u16, Value)]) -> Result<RowId> {
-        let pk = self
-            .schema
-            .primary_key()
-            .ok_or_else(|| {
-                MongrelError::Schema(
-                    "clustered table requires a single-column primary key".into(),
-                )
-            })?;
+        let pk = self.schema.primary_key().ok_or_else(|| {
+            MongrelError::Schema("clustered table requires a single-column primary key".into())
+        })?;
         let pk_val = columns
             .iter()
             .find(|(id, _)| *id == pk.id)
@@ -2570,7 +2565,8 @@ impl Table {
             .iter()
             .any(|idx| idx.predicate.is_some());
         if any_predicate {
-            let columns_map: HashMap<u16, &Value> = row.columns.iter().map(|(k, v)| (*k, v)).collect();
+            let columns_map: HashMap<u16, &Value> =
+                row.columns.iter().map(|(k, v)| (*k, v)).collect();
             let name_to_id: HashMap<&str, u16> = self
                 .schema
                 .columns
