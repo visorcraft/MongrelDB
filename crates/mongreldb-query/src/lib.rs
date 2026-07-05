@@ -1534,15 +1534,16 @@ impl MongrelSession {
     /// against the same snapshot returns the cached batches without re-executing.
     /// Run a SQL statement and return the result batches. DDL statements
     /// (`CREATE TABLE`, `DROP TABLE`, `ALTER TABLE`) are intercepted when a
-    /// `Database` is attached and mapped to the catalog. Repeated identical SQL
-    /// against the same snapshot returns the cached batches without re-executing.
-    /// Intercept `SELECT ... FROM sqlite_master` / `sqlite_schema` and return
-    /// a synthesized batch listing tables, indexes, views, and triggers (the
-    /// SQLite compatibility virtual table). Returns `None` if the SQL doesn't
-    /// reference either name.
-    fn try_sqlite_master(&self, sql: &str) -> Result<Option<Vec<RecordBatch>>> {
+    /// Intercept `SELECT ... FROM information_schema.tables` (and the
+    /// backward-compat aliases `sqlite_master` / `sqlite_schema`) and return
+    /// a synthesized batch listing tables, views, and triggers. Returns
+    /// `None` if the SQL doesn't reference any known catalog name.
+    fn try_catalog_introspection(&self, sql: &str) -> Result<Option<Vec<RecordBatch>>> {
         let lower = sql.to_ascii_lowercase();
-        if !lower.contains("sqlite_master") && !lower.contains("sqlite_schema") {
+        if !lower.contains("information_schema.tables")
+            && !lower.contains("sqlite_master")
+            && !lower.contains("sqlite_schema")
+        {
             return Ok(None);
         }
         use arrow::array::{ArrayRef, Int64Array, StringArray};
@@ -1907,9 +1908,9 @@ impl MongrelSession {
                 return Ok((**hit).clone());
             }
         }
-        // sqlite_master / sqlite_schema compatibility: intercept SELECTs that
-        // reference the catalog virtual table and synthesize a result batch.
-        if let Some(batches) = self.try_sqlite_master(sql)? {
+        // information_schema.tables (and sqlite_master/sqlite_schema compat):
+        // intercept catalog-introspection SELECTs and synthesize a result batch.
+        if let Some(batches) = self.try_catalog_introspection(sql)? {
             if result_cacheable {
                 self.cache.lock().insert(key, Arc::new(batches.clone()));
             }

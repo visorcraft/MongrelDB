@@ -1376,12 +1376,21 @@ async fn regexp_function_works() {
 }
 
 #[tokio::test]
-async fn sqlite_master_lists_tables() {
+async fn information_schema_lists_tables() {
     let (_tmp, session) = setup().await;
-    let batches = session.run("SELECT type, name FROM sqlite_master ORDER BY name").await.unwrap();
+    let batches = session
+        .run("SELECT type, name FROM information_schema.tables ORDER BY name")
+        .await
+        .unwrap();
     let rows = total_rows(&batches);
-    // travel_trips is the only registered table.
-    assert!(rows >= 1, "sqlite_master should list at least the travel_trips table, got {rows}");
+    assert!(rows >= 1, "information_schema.tables should list the travel_trips table, got {rows}");
+}
+
+#[tokio::test]
+async fn sqlite_master_compat_alias_works() {
+    let (_tmp, session) = setup().await;
+    let batches = session.run("SELECT name FROM sqlite_master").await.unwrap();
+    assert!(total_rows(&batches) >= 1);
 }
 
 #[tokio::test]

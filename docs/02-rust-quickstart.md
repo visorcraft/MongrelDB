@@ -235,7 +235,7 @@ let batches = session.run("
 ").await?;
 
 // Catalog introspection.
-let batches = session.run("SELECT type, name FROM sqlite_master ORDER BY name").await?;
+let batches = session.run("SELECT type, name FROM information_schema.tables ORDER BY name").await?;
 
 // Cross-database query via ATTACH.
 session.run("ATTACH '/path/to/other' AS other").await?;

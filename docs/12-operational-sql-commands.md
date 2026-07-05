@@ -92,9 +92,10 @@ sub-transaction control within a SQL `BEGIN`/`COMMIT` block. Savepoints mark a
 position in the staged-ops vector; `ROLLBACK TO` discards ops back to that
 position without aborting the outer transaction.
 
-`SELECT * FROM sqlite_master` (or `sqlite_schema`) returns a SQLite-compatible
-catalog listing all tables, views, and triggers in the session. Columns:
-`type`, `name`, `tbl_name`, `rootpage`, `sql`.
+`SELECT * FROM information_schema.tables` returns a catalog listing all tables,
+views, and triggers in the session. Columns: `type`, `name`, `tbl_name`,
+`rootpage`, `sql`. The SQLite-compat aliases `sqlite_master` and
+`sqlite_schema` also work for tooling/ORM compatibility.
 
 `regexp('pattern', value)` is a scalar UDF returning 1 (match) or 0 (no match),
 using the `regex` crate. Invalid patterns return 0 (SQLite semantics).
