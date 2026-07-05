@@ -238,6 +238,9 @@ pub struct Database {
     trigger_recursive: AtomicBool,
     trigger_max_depth: AtomicU32,
     trigger_max_loop_iterations: AtomicU32,
+    /// Exclusive cross-process lock held for the database's lifetime to prevent
+    /// two processes from opening the same directory concurrently.
+    _lock: Option<std::fs::File>,
 }
 
 impl Database {
@@ -345,6 +348,25 @@ impl Database {
         meta_dek: Option<[u8; META_DEK_LEN]>,
         existing: bool,
     ) -> Result<Self> {
+        // Acquire an exclusive cross-process lock on the database directory.
+        // This prevents two processes from opening the same DB simultaneously
+        // (which would corrupt data). The lock is held for the Database's
+        // lifetime via the `_lock` field.
+        std::fs::create_dir_all(root.join("_meta")).ok();
+        let lock_path = root.join("_meta").join(".lock");
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)?;
+        use fs2::FileExt;
+        lock_file
+            .try_lock_exclusive()
+            .map_err(|e| MongrelError::Io(std::io::Error::other(format!(
+                "database at {} is locked by another process: {e}",
+                root.display()
+            ))))?;
+
         let epoch = Arc::new(EpochAuthority::new(cat.db_epoch));
         let snapshots = Arc::new(SnapshotRegistry::new());
         let page_cache = Arc::new(crate::cache::Sharded::new(
@@ -470,6 +492,7 @@ impl Database {
             trigger_max_loop_iterations: AtomicU32::new(
                 TriggerConfig::default().max_loop_iterations,
             ),
+            _lock: Some(lock_file),
         })
     }
 
