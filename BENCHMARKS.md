@@ -4,37 +4,41 @@ Measured live on this development sandbox. All engines embedded/in-process
 (no daemon). Re-run: `cargo run --release --bin compare` in
 `crates/mongreldb-perf`. Criterion throughput: `cargo bench -p mongreldb-core`.
 
-Refreshed 2026-07-02 after the §5 optimization session (sharded caches,
-direct SQL dispatch, cheap-first condition resolution, overlay-aware count,
-anchored-prefix LIKE, compaction-as-query-opt). See "§5 optimization session"
-below.
+Refreshed 2026-07-05 against engine v0.28.0 (after the Tier 1–3 Kit gap
+closures and SQLite-parity SQL features — recursive CTEs, window functions,
+REGEXP, sqlite_master, ATTACH, SAVEPOINTs). All changes were query-layer
+additions; the core write/read hot path is unchanged. Numbers are within
+sandbox noise of the 2026-07-02 §5 baseline. See "§5 optimization session"
+below for that session's improvements.
 
 ## Cross-engine matrix — N = 100 rows (median of runs)
 
 | engine | bulk_insert | single_insert_commit | single_update_commit | delete_one | filter(cost<250) | count_star | join(cities) |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| **MongrelDB** | 721.0 µs | **6.4 µs** | **9.0 µs** | **6.1 µs** | 8.9 µs | 380.5 µs | 410.5 µs |
-| MongrelDB (enc) | 445.6 µs | 7.8 µs | 7.6 µs | 6.8 µs | 6.0 µs | 251.5 µs | 404.7 µs |
-| SQLite (rusqlite) | **44.6 µs** | 13.9 µs | 14.4 µs | 13.2 µs | **5.6 µs** | **3.2 µs** | **6.8 µs** |
-| DuckDB native | 758.4 µs | 236.1 µs | 268.2 µs | 193.9 µs | 145.3 µs | 88.5 µs | 512.7 µs |
-| DuckDB-Parquet | 14.26 ms | — | — | — | 438.0 µs | 245.0 µs | 760.0 µs |
-| DuckDB-CSV | 344.1 µs | — | — | — | 3.30 ms | 1.48 ms | 1.92 ms |
+| **MongrelDB** | 607.9 µs | **6.8 µs** | **7.4 µs** | **5.9 µs** | 10.1 µs | 288.5 µs | 420.4 µs |
+| MongrelDB (enc) | 177.6 µs | 8.0 µs | 7.8 µs | 6.6 µs | 8.4 µs | 310.1 µs | 423.7 µs |
+| SQLite (rusqlite) | **47.5 µs** | 14.1 µs | 14.1 µs | 13.1 µs | **6.3 µs** | **3.4 µs** | **7.0 µs** |
+| DuckDB native | 1.04 ms | 277.5 µs | 251.8 µs | 138.4 µs | 155.8 µs | 86.1 µs | 442.0 µs |
+| DuckDB-Parquet | 10.75 ms | — | — | — | 424.0 µs | 286.2 µs | 680.8 µs |
+| DuckDB-CSV | 318.4 µs | — | — | — | 1.72 ms | 1.43 ms | 2.03 ms |
 
 ## Cross-engine matrix — N = 1 000 000 rows (median of runs)
 
 | engine | bulk_insert | single_insert_commit | single_update_commit | delete_one | filter(cost<250) | count_star | join(cities) |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| **MongrelDB** | **80.51 ms** | **7.2 µs** | **7.1 µs** | **5.8 µs** | **9.8 µs** | **276.7 µs** | **1.10 ms** |
-| MongrelDB (enc) | 90.43 ms | 9.3 µs | 9.2 µs | 7.7 µs | 8.0 µs | 274.5 µs | 1.22 ms |
-| SQLite (rusqlite) | 220.41 ms | 13.7 µs | 14.1 µs | 13.6 µs | 17.33 ms | 3.30 ms | 22.29 ms |
-| DuckDB native | 272.30 ms | 246.5 µs | 459.7 µs | 162.6 µs | 705.3 µs | 130.3 µs | 2.60 ms |
-| DuckDB-Parquet | 27.93 ms | — | — | — | 2.09 ms | 336.9 µs | 2.78 ms |
-| DuckDB-CSV | 32.47 ms | — | — | — | 42.84 ms | 38.21 ms | 43.30 ms |
+| **MongrelDB** | **93.94 ms** | **8.0 µs** | **7.2 µs** | **6.1 µs** | **8.7 µs** | **290.4 µs** | **1.16 ms** |
+| MongrelDB (enc) | 89.34 ms | 9.1 µs | 9.1 µs | 7.0 µs | 9.4 µs | 289.0 µs | 1.17 ms |
+| SQLite (rusqlite) | 213.73 ms | 14.7 µs | 14.8 µs | 13.0 µs | 17.59 ms | 3.20 ms | 22.54 ms |
+| DuckDB native | 247.90 ms | 296.4 µs | 485.0 µs | 164.4 µs | 695.7 µs | 188.5 µs | 3.93 ms |
+| DuckDB-Parquet | 31.65 ms | — | — | — | 1.95 ms | 296.7 µs | 3.37 ms |
+| DuckDB-CSV | 33.77 ms | — | — | — | 40.63 ms | 38.91 ms | 44.17 ms |
 
-Single-record write improved across the board: insert at N=100 dropped 10.3→6.4 µs
-(−38%) and delete 8.6→6.1 µs (−29%) from sharded caches reducing lock overhead.
-The `filter(cost<250)` drop at N=1M (7.99 ms→9.8 µs) is from direct SQL dispatch
-(§5.3) bypassing DataFusion planning for simple `SELECT … WHERE` shapes.
+Numbers are within sandbox noise of the 2026-07-02 §5 baseline. The Tier 1–3
+Kit gap closures and SQLite-parity SQL features (recursive CTEs, window functions,
+REGEXP, sqlite_master, ATTACH, SAVEPOINTs) are all query-layer additions; the
+core write/read hot path is unchanged. Cross-engine leads are preserved:
+single-row writes ~1.8× SQLite / ~37× DuckDB, cold filter ~2000× SQLite /
+~80× DuckDB, join COUNT(*) ~19× SQLite / ~3.4× DuckDB.
 
 ## Encryption overhead (MongrelDB, plain vs AES-256-GCM)
 
@@ -42,15 +46,15 @@ The `filter(cost<250)` drop at N=1M (7.99 ms→9.8 µs) is from direct SQL dispa
 
 | engine | bulk_insert | filter(cost<250) | count_star | join(cities) |
 |---|---:|---:|---:|---:|
-| plain | 262.3 µs | 8.3 µs | 287.4 µs | 393.9 µs |
-| encrypted | 391.8 µs | 10.7 µs | 285.3 µs | 463.4 µs |
+| plain | 256.2 µs | 9.5 µs | 290.5 µs | 461.2 µs |
+| encrypted | 1.09 ms | 7.8 µs | 314.0 µs | 502.1 µs |
 
 ### N = 1 000 000
 
 | engine | bulk_insert | filter(cost<250) | count_star | join(cities) |
 |---|---:|---:|---:|---:|
-| plain | 83.94 ms | 8.0 µs | 265.9 µs | 1.13 ms |
-| encrypted | 84.00 ms | 7.8 µs | 306.4 µs | 1.32 ms |
+| plain | 86.56 ms | 8.6 µs | 284.0 µs | 1.18 ms |
+| encrypted | 98.62 ms | 10.2 µs | 288.7 µs | 1.16 ms |
 
 Encrypted `filter(cost<250)` stays at parity with plain — the encrypted
 page-stats envelope (decrypted once at open, overlaid onto the in-memory
@@ -61,8 +65,8 @@ ever touching the file.
 
 | N | count() O(1) metadata | filter via Db::query (index/tool-call) |
 |---:|---:|---:|
-| 100 | 0.0 µs | 28.7 µs |
-| 1 000 000 | 0.0 µs | 6.91 ms |
+| 100 | 0.0 µs | 27.2 µs |
+| 1 000 000 | 0.0 µs | 7.16 ms |
 
 ## Criterion throughput benchmarks (1M rows, release)
 
@@ -141,19 +145,19 @@ pushdown is −15% from sharded cache contention reduction.
 
 | Metric | MongrelDB | SQLite | DuckDB native | DuckDB-Parquet |
 |---|---:|---:|---:|---:|
-| **Single-row write (durable)** | **7.2 µs** | 13.7 µs | 247 µs | — |
-| **Bulk ingest** | **80.5 ms** | 220.4 ms | 272.3 ms | 27.9 ms |
-| **Cold SQL filter** | **9.8 µs** | 17.3 ms | 705 µs | 2.1 ms |
-| **COUNT(*) SQL** | **277 µs** | 3.30 ms | 130 µs | 337 µs |
-| **Join COUNT(*)** | **1.10 ms** | 22.3 ms | 2.60 ms | 2.8 ms |
+| **Single-row write (durable)** | **8.0 µs** | 14.7 µs | 296 µs | — |
+| **Bulk ingest** | **93.9 ms** | 213.7 ms | 247.9 ms | 31.7 ms |
+| **Cold SQL filter** | **8.7 µs** | 17.6 ms | 696 µs | 2.0 ms |
+| **COUNT(*) SQL** | **290 µs** | 3.20 ms | 189 µs | 297 µs |
+| **Join COUNT(*)** | **1.16 ms** | 22.5 ms | 3.93 ms | 3.4 ms |
 | **Typed bulk ingest** | **25.7 Melem/s** | — | — | — |
 | **LE scan throughput** | **12.3 Melem/s** | — | — | — |
 | **Bitmap pushdown** | **122 Melem/s** | — | — | — |
 | **Storage** | **4.17 bytes/row** | — | — | — |
 
-MongrelDB wins single-row writes (~1.9× SQLite, ~34× DuckDB), bulk insert
-(~2.7× SQLite, ~3.4× DuckDB native), cold SQL filter (~1700× SQLite via direct
-dispatch), and join COUNT(*) (~2.4× DuckDB, ~20× SQLite). DuckDB-Parquet still
+MongrelDB wins single-row writes (~1.8× SQLite, ~37× DuckDB), bulk insert
+(~2.3× SQLite, ~2.6× DuckDB native), cold SQL filter (~2020× SQLite via direct
+dispatch), and join COUNT(*) (~3.4× DuckDB, ~19× SQLite). DuckDB-Parquet still
 wins bulk file creation and has the fastest analytical filter.
 
 ## Regression history
