@@ -2431,7 +2431,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-client"
-version = "0.27.0"
+version = "0.28.0"
 dependencies = [
  "arrow",
  "mongreldb-core",
@@ -2444,7 +2444,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-core"
-version = "0.27.0"
+version = "0.28.0"
 dependencies = [
  "aes-gcm",
  "arc-swap",
@@ -2471,7 +2471,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-query"
-version = "0.27.0"
+version = "0.28.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -2481,6 +2481,7 @@ dependencies = [
  "futures",
  "mongreldb-core",
  "parking_lot",
+ "regex",
  "serde",
  "serde_json",
  "sqlparser",
@@ -2490,7 +2491,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-server"
-version = "0.27.0"
+version = "0.28.0"
 dependencies = [
  "arrow",
  "axum",
