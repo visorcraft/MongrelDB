@@ -197,6 +197,75 @@ session-scoped objects — views, prepared statements, the result cache — pers
 across `sql()` calls. Closing and reopening the database starts a fresh session
 (re-apply any view-defining migrations then).
 
+## Advanced SQL: CTEs, Windows, Regex, Catalog
+
+The SQL surface (`db.sql()`) runs DataFusion 54, which supports a rich SQL
+dialect. These features are all accessible through `await db.sql(sql)`:
+
+**Recursive CTEs** — tree traversal, hierarchy queries:
+
+```javascript
+const { tableFromIPC } = require('apache-arrow');
+
+const batches = tableFromIPC(await db.sql(`
+  WITH RECURSIVE tree AS (
+    SELECT id, parent, 0 AS depth FROM nodes WHERE parent IS NULL
+    UNION ALL
+    SELECT n.id, n.parent, t.depth + 1
+    FROM nodes n JOIN tree t ON n.parent = t.id
+  )
+  SELECT id, depth FROM tree ORDER BY id
+`));
+```
+
+**Window functions** — rankings, running totals, time-series:
+
+```javascript
+const result = tableFromIPC(await db.sql(`
+  SELECT category, amount,
+         ROW_NUMBER() OVER (PARTITION BY category ORDER BY amount DESC) AS rank,
+         SUM(amount) OVER (PARTITION BY category) AS total
+  FROM orders
+`));
+```
+
+**Regex matching** — `regexp('pattern', value)` returns 1 (match) or 0:
+
+```javascript
+const matched = tableFromIPC(await db.sql(
+  "SELECT id, email FROM users WHERE regexp('^.*@example\\\\.com$', email) = 1"
+));
+```
+
+**Catalog introspection** — `sqlite_master` lists tables, views, and triggers:
+
+```javascript
+const catalog = tableFromIPC(await db.sql(
+  'SELECT type, name FROM sqlite_master ORDER BY name'
+));
+```
+
+**Cross-database queries** — `ATTACH` opens a second database:
+
+```javascript
+await db.sql("ATTACH '/path/to/other-db' AS other");
+const crossDb = tableFromIPC(await db.sql(
+  'SELECT id FROM other_users WHERE id > 100'
+));
+await db.sql('DETACH other');
+```
+
+**Sub-transactions** — `SAVEPOINT` within a `BEGIN`/`COMMIT` block:
+
+```javascript
+await db.sql('BEGIN');
+await db.sql("INSERT INTO users VALUES (1, 'alice@example.com')");
+await db.sql('SAVEPOINT sp1');
+await db.sql("INSERT INTO users VALUES (2, 'bob@example.com')");
+await db.sql('ROLLBACK TO sp1');  // discards bob, keeps alice
+await db.sql('COMMIT');
+```
+
 ## Transactions
 
 Use `begin()` for atomic multi-table staging:

@@ -199,6 +199,62 @@ let results = db.query(&q).unwrap();
 See [Native Queries](05-native-queries.md) for a deep dive on condition
 combinations.
 
+## SQL Queries (CTEs, Windows, Regex, Catalog)
+
+For analytical queries, joins, and SQL-stdlib features, use `MongrelSession`
+which wraps DataFusion 54. This gives you the full SQL surface — recursive CTEs,
+window functions, `regexp()`, catalog introspection, and more:
+
+```rust
+use mongreldb_query::MongrelSession;
+use std::sync::Arc;
+
+let session = MongrelSession::open(Arc::new(db))?;
+
+// Recursive CTE — tree traversal.
+let batches = session.run("
+    WITH RECURSIVE tree AS (
+        SELECT id, parent, 0 AS depth FROM nodes WHERE parent IS NULL
+        UNION ALL
+        SELECT n.id, n.parent, t.depth + 1
+        FROM nodes n JOIN tree t ON n.parent = t.id
+    )
+    SELECT id, depth FROM tree ORDER BY id
+").await?;
+
+// Window function — ranking within partitions.
+let batches = session.run("
+    SELECT category, amount,
+           ROW_NUMBER() OVER (PARTITION BY category ORDER BY amount DESC) AS rank
+    FROM orders
+").await?;
+
+// Regex matching.
+let batches = session.run("
+    SELECT id FROM users WHERE regexp('^admin.*', name) = 1
+").await?;
+
+// Catalog introspection.
+let batches = session.run("SELECT type, name FROM sqlite_master ORDER BY name").await?;
+
+// Cross-database query via ATTACH.
+session.run("ATTACH '/path/to/other' AS other").await?;
+let batches = session.run("SELECT id FROM other_users WHERE id > 100").await?;
+session.run("DETACH other").await?;
+
+// Sub-transactions (SAVEPOINT).
+session.run("BEGIN").await?;
+session.run("INSERT INTO logs VALUES (1, 'hello')").await?;
+session.run("SAVEPOINT sp1").await?;
+session.run("INSERT INTO logs VALUES (2, 'world')").await?;
+session.run("ROLLBACK TO sp1").await?;  // discards 'world', keeps 'hello'
+session.run("COMMIT").await?;
+```
+
+See [SQL Queries](04-sql-queries.md) for the full SQL surface and
+[Operational SQL Commands](12-operational-sql-commands.md) for catalog/maintenance
+commands.
+
 ## Transactions
 
 MongrelDB uses a simple commit model. All `put()` and `delete()` calls go into
