@@ -37,6 +37,8 @@ struct AppState {
     idem: kit::IdempotencyStore,
     external_modules: Vec<Arc<dyn ExternalTableModule>>,
     auth_token: Option<String>,
+    /// When true, authenticate via catalog users (HTTP Basic auth).
+    user_auth: bool,
 }
 
 pub fn build_app(db: Arc<Database>) -> axum::Router {
@@ -57,11 +59,23 @@ pub fn build_app_with_config(
     auth_token: Option<String>,
     max_connections: Option<usize>,
 ) -> axum::Router {
+    build_app_full(db, external_modules, auth_token, max_connections, false)
+}
+
+/// Build the daemon router with full auth configuration including user-based auth.
+pub fn build_app_full(
+    db: Arc<Database>,
+    external_modules: impl IntoIterator<Item = Arc<dyn ExternalTableModule>>,
+    auth_token: Option<String>,
+    max_connections: Option<usize>,
+    user_auth: bool,
+) -> axum::Router {
     let state = Arc::new(AppState {
         idem: kit::IdempotencyStore::new(db.root()),
         db,
         external_modules: external_modules.into_iter().collect(),
         auth_token,
+        user_auth,
     });
     let router = axum::Router::new()
         .route("/health", get(health))
@@ -100,44 +114,92 @@ pub fn build_app_with_config(
         .route("/events", get(events_stream))
         .with_state(state.clone());
 
-    // Apply auth middleware if a token is configured.
-    let router = if state.auth_token.is_some() {
+    // Apply auth middleware if token auth or user auth is enabled.
+    if state.auth_token.is_some() || state.user_auth {
         router.layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
         ))
     } else {
         router
-    };
-
-    // Apply connection limit if configured.
-    if let Some(max) = max_connections {
-        router.layer(tower::limit::ConcurrencyLimitLayer::new(max))
-    } else {
-        router
     }
-}
+    .layer({
+        // Apply connection limit if configured.
+        if let Some(max) = max_connections {
+            Some(tower::limit::ConcurrencyLimitLayer::new(max))
+        } else {
+            None
+        }
+    })
 
-/// Bearer-token auth middleware. Checks `Authorization: Bearer <token>` header
-/// against the configured token. If no token is configured on AppState, auth
-/// is disabled (all requests pass through).
+/// Auth middleware supporting three modes:
+/// 1. **Token** (`--auth-token <token>`): checks `Authorization: Bearer <token>`.
+/// 2. **User auth** (`--auth-users`): checks `Authorization: Basic <base64(user:pass)>`
+///    against catalog users (Argon2id-verified). Injects a `Principal` into
+///    request extensions.
+/// 3. **Both**: token OR valid user credentials accepted.
 async fn auth_middleware(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
-    req: axum::extract::Request,
+    mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Result<axum::response::Response, axum::http::StatusCode> {
-    let expected = state.auth_token.as_ref().unwrap();
     let header = req
         .headers()
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let provided = header.strip_prefix("Bearer ").unwrap_or("");
-    if provided == expected {
-        Ok(next.run(req).await)
-    } else {
-        Err(axum::http::StatusCode::UNAUTHORIZED)
+
+    // Mode 1: Token auth (Bearer).
+    if let Some(token) = &state.auth_token {
+        if let Some(provided) = header.strip_prefix("Bearer ") {
+            if provided == token {
+                return Ok(next.run(req).await);
+            }
+        }
     }
+
+    // Mode 2: User auth (Basic).
+    if state.user_auth {
+        if let Some(encoded) = header.strip_prefix("Basic ") {
+            if let Ok(decoded) = base64_decode(encoded) {
+                if let Ok(creds) = std::str::from_utf8(&decoded) {
+                    if let Some((username, password)) = creds.split_once(':') {
+                        if let Ok(Some(_user)) = state.db.verify_user(username, password) {
+                            // Inject the principal for permission checks.
+                            if let Some(principal) = state.db.resolve_principal(username) {
+                                req.extensions_mut().insert(principal);
+                            }
+                            return Ok(next.run(req).await);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Err(axum::http::StatusCode::UNAUTHORIZED)
+}
+
+/// Minimal Base64 decoder (no extra dep).
+fn base64_decode(input: &str) -> Result<Vec<u8>, ()> {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let input: Vec<u8> = input.bytes().filter(|&b| b != b'\n' && b != b'\r' && b != b' ').collect();
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let mut buf = 0u32;
+    let mut bits = 0u32;
+    for &b in &input {
+        if b == b'=' {
+            break;
+        }
+        let val = TABLE.iter().position(|&t| t == b).ok_or(())? as u32;
+        buf = (buf << 6) | val;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+        }
+    }
+    Ok(out)
 }
 
 /// `GET /wal/stream?since=<seq>` — stream committed WAL records as

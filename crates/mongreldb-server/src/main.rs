@@ -19,6 +19,7 @@ async fn main() {
     // Parse optional flags from the remaining args.
     let mut auth_token: Option<String> = None;
     let mut max_connections: Option<usize> = None;
+    let mut user_auth = false;
     let mut i = 3;
     while i < args.len() {
         match args[i].as_str() {
@@ -30,6 +31,10 @@ async fn main() {
                 max_connections = args.get(i + 1).and_then(|s| s.parse().ok());
                 i += 2;
             }
+            "--auth-users" => {
+                user_auth = true;
+                i += 1;
+            }
             _ => {
                 i += 1;
             }
@@ -37,7 +42,10 @@ async fn main() {
     }
 
     if auth_token.is_some() {
-        eprintln!("authentication enabled (Bearer token required)");
+        eprintln!("token authentication enabled (Authorization: Bearer <token>)");
+    }
+    if user_auth {
+        eprintln!("user authentication enabled (Authorization: Basic <user:pass>)");
     }
     if let Some(max) = max_connections {
         eprintln!("connection limit: {max}");
@@ -49,7 +57,13 @@ async fn main() {
     }));
     // §5.9: background cost-aware compaction (run-count trigger).
     spawn_auto_compactor(Arc::clone(&db));
-    let app = build_app_with_config(db, std::iter::empty(), auth_token, max_connections);
+    let app = mongreldb_server::build_app_full(
+        db,
+        std::iter::empty(),
+        auth_token,
+        max_connections,
+        user_auth,
+    );
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     eprintln!("mongreldb-server listening on http://{addr}");
