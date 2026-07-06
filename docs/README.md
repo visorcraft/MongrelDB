@@ -40,6 +40,10 @@ vector similarity, range queries, and more.
 14. **[Users, Roles & Permissions](14-auth.md)** — catalog-stored users with
     Argon2id passwords, roles, `GRANT`/`REVOKE`, and daemon (HTTP Basic +
     Bearer token) authentication
+15. **[Credential Enforcement](15-credential-enforcement.md)** — opt-in
+    `require_auth` storage-layer enforcement: credentialed open/create
+    constructors, the full enforcement matrix, composition with encryption,
+    and offline recovery
 
 ## Quick Reference
 
