@@ -1,6 +1,6 @@
 //! mongreldb-server entry point.
 
-use mongreldb_server::{build_app_with_config, spawn_auto_compactor};
+use mongreldb_server::spawn_auto_compactor;
 use std::net::SocketAddr;
 use std::sync::Arc;
 

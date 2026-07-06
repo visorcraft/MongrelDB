@@ -115,22 +115,22 @@ pub fn build_app_full(
         .with_state(state.clone());
 
     // Apply auth middleware if token auth or user auth is enabled.
-    if state.auth_token.is_some() || state.user_auth {
+    let router = if state.auth_token.is_some() || state.user_auth {
         router.layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
         ))
     } else {
         router
+    };
+
+    // Apply connection limit if configured.
+    if let Some(max) = max_connections {
+        router.layer(tower::limit::ConcurrencyLimitLayer::new(max))
+    } else {
+        router
     }
-    .layer({
-        // Apply connection limit if configured.
-        if let Some(max) = max_connections {
-            Some(tower::limit::ConcurrencyLimitLayer::new(max))
-        } else {
-            None
-        }
-    })
+}
 
 /// Auth middleware supporting three modes:
 /// 1. **Token** (`--auth-token <token>`): checks `Authorization: Bearer <token>`.
