@@ -86,3 +86,9 @@ jobs:
       - run: cargo publish -p mongreldb-query
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      # mongreldb-server (the HTTP daemon) publishes last — it depends on both
+      # mongreldb-core and mongreldb-query.
+      - run: cargo publish -p mongreldb-server
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
