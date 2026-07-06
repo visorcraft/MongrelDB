@@ -1,0 +1,182 @@
+//! User, role, and credential management for MongrelDB's catalog-level auth.
+//!
+//! Users and roles are stored in the engine's `Catalog` struct (alongside
+//! procedures and triggers), persisted via `catalog::write_atomic`. This
+//! module provides the types and the Argon2id password hashing layer.
+//!
+//! The daemon (`mongreldb-server`) authenticates HTTP requests via HTTP Basic
+//! auth (username:password) when `--auth-users` is enabled. Each authenticated
+//! request carries a [`Principal`] in its extensions; permission checks use
+//! [`Database::check_permission`].
+
+use serde::{Deserialize, Serialize};
+
+/// A stored user with Argon2id-hashed credentials.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserEntry {
+    /// Stable, monotonic user id.
+    pub id: u64,
+    /// Unique username (case-sensitive).
+    pub username: String,
+    /// Argon2id PHC string (includes salt + params; verifiable via
+    /// `PasswordVerifier::verify`).
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    pub password_hash: String,
+    /// Role names granted to this user.
+    #[serde(default)]
+    pub roles: Vec<String>,
+    /// Bypasses all permission checks (full admin).
+    #[serde(default)]
+    pub is_admin: bool,
+    /// Epoch at which the user was created.
+    pub created_epoch: u64,
+}
+
+/// A named collection of permissions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoleEntry {
+    /// Unique role name (case-sensitive).
+    pub name: String,
+    /// Permissions granted to this role.
+    #[serde(default)]
+    pub permissions: Vec<Permission>,
+    /// Epoch at which the role was created.
+    pub created_epoch: u64,
+}
+
+/// A permission granted to a role. Mirrors SQL `GRANT` / `REVOKE`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Permission {
+    /// All permissions on all tables (`GRANT ALL`).
+    All,
+    /// `SELECT` on a specific table.
+    Select { table: String },
+    /// `INSERT` on a specific table.
+    Insert { table: String },
+    /// `UPDATE` on a specific table.
+    Update { table: String },
+    /// `DELETE` on a specific table.
+    Delete { table: String },
+    /// DDL: `CREATE` / `DROP` / `ALTER TABLE`.
+    Ddl,
+    /// Admin: `CREATE USER` / `GRANT` / `REVOKE` / `CREATE ROLE`.
+    Admin,
+}
+
+impl Permission {
+    /// Check whether this permission satisfies a required permission. `All`
+    /// satisfies everything; `Select { table: "*" }` is not wildcarded (it
+    /// matches a table literally named `*`).
+    pub fn satisfies(&self, required: &Permission) -> bool {
+        match (self, required) {
+            (Permission::All, _) => true,
+            (Permission::Admin, Permission::Admin) => true,
+            (Permission::Ddl, Permission::Ddl) => true,
+            (Permission::Select { table: a }, Permission::Select { table: b }) => a == b,
+            (Permission::Insert { table: a }, Permission::Insert { table: b }) => a == b,
+            (Permission::Update { table: a }, Permission::Update { table: b }) => a == b,
+            (Permission::Delete { table: a }, Permission::Delete { table: b }) => a == b,
+            _ => false,
+        }
+    }
+}
+
+/// The authenticated identity for a single HTTP request. Injected by the
+/// auth middleware into request extensions.
+#[derive(Debug, Clone)]
+pub struct Principal {
+    pub username: String,
+    pub is_admin: bool,
+    pub roles: Vec<String>,
+    /// All permissions from all roles the user belongs to, pre-resolved.
+    pub permissions: Vec<Permission>,
+}
+
+impl Principal {
+    /// Check whether this principal has the required permission.
+    pub fn has_permission(&self, required: &Permission) -> bool {
+        if self.is_admin {
+            return true;
+        }
+        self.permissions.iter().any(|p| p.satisfies(required))
+    }
+}
+
+// ── Password hashing (Argon2id) ──────────────────────────────────────────
+
+/// Hash a password using Argon2id with a fresh random salt.
+///
+/// Returns a PHC string that encodes the algorithm, version, parameters, salt,
+/// and hash — suitable for storage as `UserEntry::password_hash` and verifiable
+/// via [`verify_password`].
+pub fn hash_password(password: &str) -> Result<String, String> {
+    use argon2::{
+        password_hash::{PasswordHasher, SaltString},
+        Algorithm, Argon2, Version,
+    };
+    use getrandom::getrandom;
+    // Reuse the same OWASP-minimum parameters as the encryption KEK derivation.
+    let params = argon2::Params::new(19 * 1024, 2, 1, None).map_err(|e| e.to_string())?;
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    // Generate salt via getrandom (always available in core, no feature gate).
+    let mut salt_bytes = [0u8; 32];
+    getrandom(&mut salt_bytes).map_err(|e| e.to_string())?;
+    let salt = SaltString::encode_b64(&salt_bytes).map_err(|e| e.to_string())?;
+    let hash = argon2
+        .hash_password(password.as_bytes(), &salt)
+        .map_err(|e| e.to_string())?;
+    Ok(hash.to_string())
+}
+
+/// Verify a password against a stored PHC hash. Returns `Ok(true)` on match,
+/// `Ok(false)` on mismatch, `Err` on malformed hash.
+pub fn verify_password(password: &str, phc_hash: &str) -> Result<bool, String> {
+    use argon2::{password_hash::PasswordVerifier, Argon2};
+    let parsed_hash =
+        argon2::PasswordHash::new(phc_hash).map_err(|e| format!("malformed hash: {e}"))?;
+    Ok(Argon2::default()
+        .verify_password(password.as_bytes(), &parsed_hash)
+        .is_ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn password_hash_round_trip() {
+        let password = "correct horse battery staple";
+        let hash = hash_password(password).unwrap();
+        assert!(verify_password(password, &hash).unwrap());
+        assert!(!verify_password("wrong password", &hash).unwrap());
+    }
+
+    #[test]
+    fn permission_satisfies() {
+        assert!(Permission::All.satisfies(&Permission::Select { table: "t".into() }));
+        assert!(Permission::Select { table: "t".into() }
+            .satisfies(&Permission::Select { table: "t".into() }));
+        assert!(
+            !Permission::Select { table: "t".into() }.satisfies(&Permission::Select {
+                table: "other".into()
+            })
+        );
+        assert!(!Permission::Select { table: "t".into() }
+            .satisfies(&Permission::Insert { table: "t".into() }));
+    }
+
+    #[test]
+    fn principal_admin_bypasses_checks() {
+        let principal = Principal {
+            username: "admin".into(),
+            is_admin: true,
+            roles: vec![],
+            permissions: vec![],
+        };
+        assert!(principal.has_permission(&Permission::Admin));
+        assert!(principal.has_permission(&Permission::Select {
+            table: "anything".into()
+        }));
+    }
+}

@@ -667,6 +667,289 @@ impl Database {
         Ok(())
     }
 
+    // ── User / role / credentials management ─────────────────────────────
+
+    /// List all catalog users (password hashes included — callers should not
+    /// serialize them externally).
+    pub fn users(&self) -> Vec<crate::auth::UserEntry> {
+        self.catalog.read().users.clone()
+    }
+
+    /// List all catalog roles.
+    pub fn roles(&self) -> Vec<crate::auth::RoleEntry> {
+        self.catalog.read().roles.clone()
+    }
+
+    /// Create a new user with an Argon2id-hashed password.
+    pub fn create_user(&self, username: &str, password: &str) -> Result<crate::auth::UserEntry> {
+        let hash = crate::auth::hash_password(password).map_err(MongrelError::Other)?;
+        let epoch = self.epoch.bump_assigned();
+        let id = {
+            let mut cat = self.catalog.write();
+            if cat.users.iter().any(|u| u.username == username) {
+                return Err(MongrelError::InvalidArgument(format!(
+                    "user {username:?} already exists"
+                )));
+            }
+            cat.next_user_id += 1;
+            let id = cat.next_user_id;
+            let entry = crate::auth::UserEntry {
+                id,
+                username: username.into(),
+                password_hash: hash,
+                roles: Vec::new(),
+                is_admin: false,
+                created_epoch: epoch.0,
+            };
+            cat.users.push(entry.clone());
+            cat.db_epoch = epoch.0;
+            entry
+        };
+        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+        self.advance_visible(epoch);
+        Ok(id)
+    }
+
+    /// Drop a user by username.
+    pub fn drop_user(&self, username: &str) -> Result<()> {
+        let epoch = self.epoch.bump_assigned();
+        {
+            let mut cat = self.catalog.write();
+            let before = cat.users.len();
+            cat.users.retain(|u| u.username != username);
+            if cat.users.len() == before {
+                return Err(MongrelError::NotFound(format!(
+                    "user {username:?} not found"
+                )));
+            }
+            cat.db_epoch = epoch.0;
+        }
+        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+        self.advance_visible(epoch);
+        Ok(())
+    }
+
+    /// Change a user's password.
+    pub fn alter_user_password(&self, username: &str, new_password: &str) -> Result<()> {
+        let hash = crate::auth::hash_password(new_password).map_err(MongrelError::Other)?;
+        let epoch = self.epoch.bump_assigned();
+        {
+            let mut cat = self.catalog.write();
+            let user = cat
+                .users
+                .iter_mut()
+                .find(|u| u.username == username)
+                .ok_or_else(|| MongrelError::NotFound(format!("user {username:?} not found")))?;
+            user.password_hash = hash;
+            cat.db_epoch = epoch.0;
+        }
+        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+        self.advance_visible(epoch);
+        Ok(())
+    }
+
+    /// Verify credentials. Returns `Some(entry)` on success, `None` on
+    /// mismatch, `Err` on engine error.
+    pub fn verify_user(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> Result<Option<crate::auth::UserEntry>> {
+        let cat = self.catalog.read();
+        let Some(user) = cat.users.iter().find(|u| u.username == username) else {
+            return Ok(None);
+        };
+        if user.password_hash.is_empty() {
+            return Ok(None);
+        }
+        let ok = crate::auth::verify_password(password, &user.password_hash)
+            .map_err(MongrelError::Other)?;
+        if ok {
+            Ok(Some(user.clone()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Grant admin privileges to a user (bypasses all permission checks).
+    pub fn set_user_admin(&self, username: &str, is_admin: bool) -> Result<()> {
+        let epoch = self.epoch.bump_assigned();
+        {
+            let mut cat = self.catalog.write();
+            let user = cat
+                .users
+                .iter_mut()
+                .find(|u| u.username == username)
+                .ok_or_else(|| MongrelError::NotFound(format!("user {username:?} not found")))?;
+            user.is_admin = is_admin;
+            cat.db_epoch = epoch.0;
+        }
+        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+        self.advance_visible(epoch);
+        Ok(())
+    }
+
+    /// Create a new role.
+    pub fn create_role(&self, name: &str) -> Result<crate::auth::RoleEntry> {
+        let epoch = self.epoch.bump_assigned();
+        let entry = {
+            let mut cat = self.catalog.write();
+            if cat.roles.iter().any(|r| r.name == name) {
+                return Err(MongrelError::InvalidArgument(format!(
+                    "role {name:?} already exists"
+                )));
+            }
+            let entry = crate::auth::RoleEntry {
+                name: name.into(),
+                permissions: Vec::new(),
+                created_epoch: epoch.0,
+            };
+            cat.roles.push(entry.clone());
+            cat.db_epoch = epoch.0;
+            entry
+        };
+        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+        self.advance_visible(epoch);
+        Ok(entry)
+    }
+
+    /// Drop a role by name.
+    pub fn drop_role(&self, name: &str) -> Result<()> {
+        let epoch = self.epoch.bump_assigned();
+        {
+            let mut cat = self.catalog.write();
+            let before = cat.roles.len();
+            cat.roles.retain(|r| r.name != name);
+            if cat.roles.len() == before {
+                return Err(MongrelError::NotFound(format!("role {name:?} not found")));
+            }
+            // Remove the role from all users.
+            for user in &mut cat.users {
+                user.roles.retain(|r| r != name);
+            }
+            cat.db_epoch = epoch.0;
+        }
+        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+        self.advance_visible(epoch);
+        Ok(())
+    }
+
+    /// Grant a role to a user.
+    pub fn grant_role(&self, username: &str, role_name: &str) -> Result<()> {
+        let epoch = self.epoch.bump_assigned();
+        {
+            let mut cat = self.catalog.write();
+            if !cat.roles.iter().any(|r| r.name == role_name) {
+                return Err(MongrelError::NotFound(format!(
+                    "role {role_name:?} not found"
+                )));
+            }
+            let user = cat
+                .users
+                .iter_mut()
+                .find(|u| u.username == username)
+                .ok_or_else(|| MongrelError::NotFound(format!("user {username:?} not found")))?;
+            if !user.roles.contains(&role_name.to_string()) {
+                user.roles.push(role_name.into());
+            }
+            cat.db_epoch = epoch.0;
+        }
+        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+        self.advance_visible(epoch);
+        Ok(())
+    }
+
+    /// Revoke a role from a user.
+    pub fn revoke_role(&self, username: &str, role_name: &str) -> Result<()> {
+        let epoch = self.epoch.bump_assigned();
+        {
+            let mut cat = self.catalog.write();
+            let user = cat
+                .users
+                .iter_mut()
+                .find(|u| u.username == username)
+                .ok_or_else(|| MongrelError::NotFound(format!("user {username:?} not found")))?;
+            user.roles.retain(|r| r != role_name);
+            cat.db_epoch = epoch.0;
+        }
+        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+        self.advance_visible(epoch);
+        Ok(())
+    }
+
+    /// Grant a permission to a role.
+    pub fn grant_permission(
+        &self,
+        role_name: &str,
+        permission: crate::auth::Permission,
+    ) -> Result<()> {
+        let epoch = self.epoch.bump_assigned();
+        {
+            let mut cat = self.catalog.write();
+            let role = cat
+                .roles
+                .iter_mut()
+                .find(|r| r.name == role_name)
+                .ok_or_else(|| MongrelError::NotFound(format!("role {role_name:?} not found")))?;
+            if !role.permissions.contains(&permission) {
+                role.permissions.push(permission);
+            }
+            cat.db_epoch = epoch.0;
+        }
+        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+        self.advance_visible(epoch);
+        Ok(())
+    }
+
+    /// Revoke a permission from a role.
+    pub fn revoke_permission(
+        &self,
+        role_name: &str,
+        permission: crate::auth::Permission,
+    ) -> Result<()> {
+        let epoch = self.epoch.bump_assigned();
+        {
+            let mut cat = self.catalog.write();
+            let role = cat
+                .roles
+                .iter_mut()
+                .find(|r| r.name == role_name)
+                .ok_or_else(|| MongrelError::NotFound(format!("role {role_name:?} not found")))?;
+            role.permissions.retain(|p| p != &permission);
+            cat.db_epoch = epoch.0;
+        }
+        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+        self.advance_visible(epoch);
+        Ok(())
+    }
+
+    /// Resolve a user into a [`crate::auth::Principal`] by collecting all
+    /// permissions from their roles. Returns `None` if the user doesn't exist.
+    pub fn resolve_principal(&self, username: &str) -> Option<crate::auth::Principal> {
+        let cat = self.catalog.read();
+        let user = cat.users.iter().find(|u| u.username == username)?;
+        let mut permissions = Vec::new();
+        for role_name in &user.roles {
+            if let Some(role) = cat.roles.iter().find(|r| &r.name == role_name) {
+                permissions.extend(role.permissions.iter().cloned());
+            }
+        }
+        Some(crate::auth::Principal {
+            username: user.username.clone(),
+            is_admin: user.is_admin,
+            roles: user.roles.clone(),
+            permissions,
+        })
+    }
+
+    /// Check whether a user has a specific permission (via their roles).
+    pub fn check_permission(&self, username: &str, permission: &crate::auth::Permission) -> bool {
+        match self.resolve_principal(username) {
+            Some(p) => p.has_permission(permission),
+            None => false,
+        }
+    }
+
     pub fn triggers(&self) -> Vec<StoredTrigger> {
         self.catalog
             .read()

@@ -64,6 +64,15 @@ pub struct Catalog {
     pub triggers: Vec<TriggerEntry>,
     #[serde(default)]
     pub external_tables: Vec<ExternalTableEntry>,
+    /// Catalog-level user accounts (Argon2id-hashed credentials).
+    #[serde(default)]
+    pub users: Vec<crate::auth::UserEntry>,
+    /// Catalog-level role definitions.
+    #[serde(default)]
+    pub roles: Vec<crate::auth::RoleEntry>,
+    /// Next monotonic user id to allocate.
+    #[serde(default)]
+    pub next_user_id: u64,
 }
 
 impl Catalog {

@@ -8,6 +8,7 @@
 #![allow(clippy::module_inception)]
 #![recursion_limit = "2048"]
 
+pub mod auth;
 pub mod be_tree;
 pub mod cache;
 pub mod catalog;
@@ -43,6 +44,7 @@ pub mod tsv;
 pub mod txn;
 pub mod wal;
 
+pub use auth::{hash_password, verify_password, Permission, Principal, RoleEntry, UserEntry};
 pub use be_tree::BeTree;
 pub use cache::PageCache;
 pub use columnar::{decode_column, encode_column};

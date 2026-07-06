@@ -268,6 +268,163 @@ fn try_manual_command(
         return Ok(Some(Vec::new()));
     }
 
+    // User/role/credentials management — operate on the catalog.
+    if let Some(_rest) = lower.strip_prefix("create user ") {
+        let original_rest = &sql["create user ".len()..];
+        let trimmed = original_rest.trim().trim_end_matches(';').trim();
+        let (name, password) =
+            if let Some(idx) = trimmed.to_ascii_lowercase().find(" with password ") {
+                let name = trimmed[..idx]
+                    .trim()
+                    .trim_matches(|c| c == '"' || c == '\'')
+                    .to_string();
+                let pw_part = &trimmed[idx + " with password ".len()..];
+                let pw = pw_part.trim().trim_matches('\'').to_string();
+                (name, pw)
+            } else {
+                (
+                    trimmed.trim_matches(|c| c == '"' || c == '\'').to_string(),
+                    String::new(),
+                )
+            };
+        if name.is_empty() {
+            return Err(MongrelQueryError::Schema(
+                "CREATE USER requires a name".into(),
+            ));
+        }
+        let Some(db) = &session.database else {
+            return Ok(Some(Vec::new()));
+        };
+        db.create_user(&name, &password)?;
+        return Ok(Some(Vec::new()));
+    }
+    if let Some(_rest) = lower.strip_prefix("alter user ") {
+        let original_rest = &sql["alter user ".len()..];
+        let trimmed = original_rest.trim().trim_end_matches(';').trim();
+        let (name, password) = if let Some(idx) = trimmed.to_ascii_lowercase().find(" password ") {
+            let name = trimmed[..idx]
+                .trim()
+                .trim_matches(|c| c == '"' || c == '\'')
+                .to_string();
+            let pw = trimmed[idx + " password ".len()..]
+                .trim()
+                .trim_matches('\'')
+                .to_string();
+            (name, pw)
+        } else {
+            return Err(MongrelQueryError::Schema(
+                "ALTER USER requires: ALTER USER <name> PASSWORD '<new>'".into(),
+            ));
+        };
+        let Some(db) = &session.database else {
+            return Ok(Some(Vec::new()));
+        };
+        db.alter_user_password(&name, &password)?;
+        return Ok(Some(Vec::new()));
+    }
+    if let Some(rest) = lower.strip_prefix("drop user ") {
+        let name = rest.trim().trim_end_matches(';').trim().to_string();
+        if let Some(db) = &session.database {
+            db.drop_user(&name)?;
+        }
+        return Ok(Some(Vec::new()));
+    }
+    if let Some(rest) = lower.strip_prefix("create role ") {
+        let name = rest.trim().trim_end_matches(';').trim().to_string();
+        if let Some(db) = &session.database {
+            db.create_role(&name)?;
+        }
+        return Ok(Some(Vec::new()));
+    }
+    if let Some(rest) = lower.strip_prefix("drop role ") {
+        let name = rest.trim().trim_end_matches(';').trim().to_string();
+        if let Some(db) = &session.database {
+            db.drop_role(&name)?;
+        }
+        return Ok(Some(Vec::new()));
+    }
+    if lower.starts_with("grant ") || lower.starts_with("revoke ") {
+        let is_grant = lower.starts_with("grant ");
+        let rest = &lower[if is_grant { 6 } else { 7 }..];
+        let original_rest = &sql[if is_grant { 6 } else { 7 }..];
+        // GRANT <perm> ON <table> TO <role>  |  GRANT <role> TO <user>
+        // REVOKE <perm> ON <table> FROM <role> | REVOKE <role> FROM <user>
+        let sep = if is_grant { " to " } else { " from " };
+        let Some(sep_idx) = rest.find(sep) else {
+            return Err(MongrelQueryError::Schema(format!(
+                "{} requires ... {} <target>",
+                if is_grant { "GRANT" } else { "REVOKE" },
+                if is_grant { "TO" } else { "FROM" }
+            )));
+        };
+        let left = &original_rest[..sep_idx].trim();
+        let target = original_rest[sep_idx + sep.len()..]
+            .trim()
+            .trim_end_matches(';')
+            .trim();
+        let Some(db) = &session.database else {
+            return Ok(Some(Vec::new()));
+        };
+        if left.to_ascii_lowercase().contains(" on ") {
+            // GRANT SELECT ON table TO role
+            let on_idx = left.to_ascii_lowercase().find(" on ").unwrap();
+            let perm_str = &left[..on_idx].trim().to_ascii_lowercase();
+            let table = &original_rest[..sep_idx][on_idx + 4..]
+                .trim()
+                .trim_matches(|c| c == '"' || c == '\'');
+            let table = table.trim_end_matches(';').trim();
+            let permission = match perm_str.as_str() {
+                "select" => mongreldb_core::auth::Permission::Select {
+                    table: table.to_string(),
+                },
+                "insert" => mongreldb_core::auth::Permission::Insert {
+                    table: table.to_string(),
+                },
+                "update" => mongreldb_core::auth::Permission::Update {
+                    table: table.to_string(),
+                },
+                "delete" => mongreldb_core::auth::Permission::Delete {
+                    table: table.to_string(),
+                },
+                "all" => mongreldb_core::auth::Permission::All,
+                "ddl" => mongreldb_core::auth::Permission::Ddl,
+                "admin" => mongreldb_core::auth::Permission::Admin,
+                other => {
+                    return Err(MongrelQueryError::Schema(format!(
+                        "unknown permission {other}"
+                    )))
+                }
+            };
+            if is_grant {
+                db.grant_permission(target, permission)?;
+            } else {
+                db.revoke_permission(target, permission)?;
+            }
+        } else {
+            // GRANT role TO user
+            if is_grant {
+                db.grant_role(target, left.trim())?;
+            } else {
+                db.revoke_role(target, left.trim())?;
+            }
+        }
+        return Ok(Some(Vec::new()));
+    }
+    if lower == "show users" || lower == "show user" {
+        if let Some(db) = &session.database {
+            let names: Vec<String> = db.users().into_iter().map(|u| u.username).collect();
+            return Ok(Some(vec![strings_batch("username", names)?]));
+        }
+        return Ok(Some(Vec::new()));
+    }
+    if lower == "show roles" || lower == "show role" {
+        if let Some(db) = &session.database {
+            let names: Vec<String> = db.roles().into_iter().map(|r| r.name).collect();
+            return Ok(Some(vec![strings_batch("role_name", names)?]));
+        }
+        return Ok(Some(Vec::new()));
+    }
+
     // SAVEPOINT / RELEASE / ROLLBACK TO — operate on the session's SQL staging.
     if let Some(rest) = lower.strip_prefix("savepoint ") {
         let name = rest.trim().trim_end_matches(';').trim().to_string();

@@ -51,6 +51,9 @@ fn sample_catalog() -> Catalog {
         procedures: Vec::new(),
         triggers: Vec::new(),
         external_tables: Vec::new(),
+        users: Vec::new(),
+        roles: Vec::new(),
+        next_user_id: 0,
     }
 }
 
