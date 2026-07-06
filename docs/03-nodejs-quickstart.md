@@ -315,6 +315,35 @@ console.log(remote.count('users'));
 const arrow = remote.sql('SELECT * FROM users WHERE score > 90');
 ```
 
+## Users, Roles & Permissions
+
+Catalog users have Argon2id-hashed passwords and belong to zero or more
+roles; each role carries a set of permissions. See
+**[Users, Roles & Permissions](14-auth.md)** for the full model.
+
+```javascript
+const { Database } = require('./index.js');
+const db = Database.open('./my_database');
+
+// Users
+db.createUser('alice', 's3cret-pw');
+db.alterUserPassword('alice', 'new-pw');
+console.log(db.verifyUser('alice', 'new-pw')); // true
+db.setUserAdmin('alice', true);
+console.log(db.users());                       // ['alice']
+
+// Roles + permissions (string vocabulary: all, admin, ddl, select:table, …)
+db.createRole('analyst');
+db.grantPermission('analyst', 'select:orders');
+db.grantPermission('analyst', 'insert:orders');
+db.grantRole('alice', 'analyst');
+console.log(db.roles());                       // ['analyst']
+```
+
+For the HTTP daemon, start with `--auth-token <token>` (Bearer),
+`--auth-users` (HTTP Basic against catalog users), or both. See
+**[Daemon Mode](08-daemon.md#authentication)**.
+
 ## Closing
 
 ```javascript

@@ -283,6 +283,39 @@ db.compact().unwrap();  // merges all runs into one, removes dead rows
 Compaction is safe to run while reads are happening — MVCC snapshots ensure
 readers see a consistent view.
 
+## Users, Roles & Permissions
+
+Catalog users have Argon2id-hashed passwords and belong to zero or more
+roles; each role carries a set of permissions. See
+**[Users, Roles & Permissions](14-auth.md)** for the full model.
+
+```rust
+use mongreldb_core::Database;
+use mongreldb_core::auth::Permission;
+
+let db = Database::open("./mydb")?;
+
+// Users
+db.create_user("alice", "s3cret-pw")?;
+db.alter_user_password("alice", "new-pw")?;
+assert!(db.verify_user("alice", "new-pw")?.is_some());
+db.set_user_admin("alice", true)?;
+for u in db.users() { println!("{}", u.username); }
+
+// Roles + permissions
+db.create_role("analyst")?;
+db.grant_permission("analyst", Permission::Select { table: "orders".into() })?;
+db.grant_permission("analyst", Permission::Insert { table: "orders".into() })?;
+db.grant_role("alice", "analyst")?;
+
+// Application-layer access check
+assert!(db.check_permission("alice", &Permission::Select { table: "orders".into() }));
+```
+
+For the HTTP daemon, start with `--auth-token <token>` (Bearer),
+`--auth-users` (HTTP Basic against catalog users), or both. See
+**[Daemon Mode](08-daemon.md#authentication)**.
+
 ## Closing
 
 MongrelDB saves to disk on every `commit()` and `flush()`. When your program

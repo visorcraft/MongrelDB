@@ -36,19 +36,53 @@ listening for HTTP requests on `127.0.0.1:8453`.
 
 ## Authentication
 
-When `--auth-token <token>` is set, every request must include an
-`Authorization: Bearer <token>` header. Requests without the correct token
-receive `401 Unauthorized`. When no token is configured (the default), auth
-is disabled for local development.
+The daemon supports three auth modes — they can be combined:
+
+1. **Token** (`--auth-token <token>`): every request must carry
+   `Authorization: Bearer <token>`. A single string compare — fast.
+2. **User** (`--auth-users`): every request must carry
+   `Authorization: Basic <base64(user:pass)>` against a catalog user
+   (Argon2id-verified). The matching `Principal` is injected into request
+   extensions for permission checks.
+3. **Both** (`--auth-token` **and** `--auth-users`): token **or** valid user
+   credentials accepted.
+
+When no flag is set (the default), auth is disabled for local development.
 
 ```sh
-# With auth enabled:
+# Token only — fastest for service-to-service traffic.
+mongreldb-server ./my_database 8453 --auth-token my-secret-token
+
+# User auth — per-identity credentials, verified against the catalog.
+mongreldb-server ./my_database 8453 --auth-users
+
+# Both — token OR valid user accepted.
+mongreldb-server ./my_database 8453 --auth-token my-secret-token --auth-users --max-connections 100
+```
+
+```sh
+# Bearer token
 curl -H "Authorization: Bearer my-secret-token" http://127.0.0.1:8453/health
 # → "ok"
 
-# Without the header:
+# Basic auth against a catalog user
+curl -u alice:s3cret-pw http://127.0.0.1:8453/health
+# → "ok"
+
+# No credentials
 curl http://127.0.0.1:8453/health
 # → 401 Unauthorized
+```
+
+Manage users on a running daemon through the SQL endpoint (or any of the
+other surfaces documented in **[Users, Roles & Permissions](14-auth.md)**):
+
+```sh
+# Create the first admin user before enabling --auth-users in production.
+curl -X POST http://127.0.0.1:8453/sql \
+  -H "Authorization: Bearer my-secret-token" \
+  -H "Content-Type: application/json" \
+  -d '{"sql": "CREATE USER alice WITH PASSWORD '\''s3cret-pw'\''; ALTER USER alice ADMIN"}'
 ```
 
 ## Connection Pooling
@@ -228,6 +262,7 @@ repeated queries are fast — warm result-cache hits return in ~0.1 µs.
 
 The daemon listens on `127.0.0.1` by default. For production:
 
-1. Use `--auth-token` to require a Bearer token on every request.
+1. Use `--auth-token` for service-to-service traffic, or `--auth-users` for
+   per-identity credentials (see **[Users, Roles & Permissions](14-auth.md)**).
 2. Use `--max-connections` to prevent resource exhaustion.
 3. Put a TLS-terminating reverse proxy (nginx, Caddy) in front for HTTPS.

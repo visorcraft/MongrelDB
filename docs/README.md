@@ -37,6 +37,9 @@ vector similarity, range queries, and more.
     PRAGMA introspection, ANALYZE, REINDEX, VACUUM, and EXPLAIN QUERY PLAN
 13. **[Trigger Programs & External Table Modules](13-triggers-and-external-table-modules.md)** —
     architecture spec for triggers and external table modules
+14. **[Users, Roles & Permissions](14-auth.md)** — catalog-stored users with
+    Argon2id passwords, roles, `GRANT`/`REVOKE`, and daemon (HTTP Basic +
+    Bearer token) authentication
 
 ## Quick Reference
 
