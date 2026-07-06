@@ -14,7 +14,10 @@ export const enum ColumnType {
   Interval = 7,
   Bytes = 8,
   Embedding = 9,
-  Decimal128 = 10
+  Decimal128 = 10,
+  Uuid = 11,
+  Json = 12,
+  Array = 13
 }
 export const enum IndexKindSpec {
   Bitmap = 0,

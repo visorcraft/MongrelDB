@@ -186,6 +186,9 @@ pub(crate) fn arrow_data_type(ty: &TypeId) -> Result<DataType> {
         TypeId::Date64 => DataType::Date64,
         TypeId::Time64 => DataType::Time64(arrow::datatypes::TimeUnit::Nanosecond),
         TypeId::Interval => DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano),
+        TypeId::Uuid => DataType::FixedSizeBinary(16),
+        TypeId::Json => DataType::Utf8,
+        TypeId::Array { .. } => DataType::Utf8,
         TypeId::UInt8 => DataType::UInt8,
         TypeId::UInt16 => DataType::UInt16,
         TypeId::UInt32 => DataType::UInt32,
@@ -317,6 +320,31 @@ pub fn build_array(ty: TypeId, values: &[Value]) -> Result<ArrayRef> {
             for v in values {
                 match v {
                     Value::Decimal(d) => b.append_value(*d),
+                    _ => b.append_null(),
+                }
+            }
+            Arc::new(b.finish())
+        }
+        TypeId::Uuid => {
+            let mut b = arrow::array::FixedSizeBinaryBuilder::new(16);
+            for v in values {
+                match v {
+                    Value::Uuid(arr) => {
+                        b.append_value(arr).ok();
+                    }
+                    _ => {
+                        b.append_null();
+                    }
+                }
+            }
+            Arc::new(b.finish())
+        }
+        TypeId::Json | TypeId::Array { .. } => {
+            let mut b = arrow::array::StringBuilder::new();
+            for v in values {
+                match v {
+                    Value::Json(val) => b.append_value(String::from_utf8_lossy(val)),
+                    Value::Bytes(val) => b.append_value(String::from_utf8_lossy(val)),
                     _ => b.append_null(),
                 }
             }

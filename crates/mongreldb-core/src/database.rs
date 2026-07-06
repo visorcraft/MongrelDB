@@ -4481,6 +4481,8 @@ fn trigger_message(value: Value) -> String {
             days,
             nanos,
         } => format!("{months}m {days}d {nanos}ns"),
+        Value::Uuid(b) => b.iter().map(|x| format!("{x:02x}")).collect(),
+        Value::Json(b) => String::from_utf8_lossy(&b).into_owned(),
     }
 }
 

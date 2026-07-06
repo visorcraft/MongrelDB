@@ -214,6 +214,7 @@ impl Tri {
                 }
             }
             Value::Interval { .. } => Tri::Unknown,
+            Value::Uuid(_) | Value::Json(_) => Tri::Unknown,
             Value::Decimal(d) => {
                 if *d != 0 {
                     Tri::True

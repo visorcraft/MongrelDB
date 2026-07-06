@@ -30,6 +30,18 @@ pub enum TypeId {
     /// SQL INTERVAL (months + days + nanoseconds). Stored as 16 bytes
     /// (i64 months, i32 days, i64 nanos).
     Interval,
+    /// RFC 4122 UUID. Stored as 16-byte fixed-width (big-endian for sort order).
+    Uuid,
+    /// JSON value stored as UTF-8 bytes. Distinct from `Bytes` at the type level
+    /// so SQL functions and clients know to parse/validate JSON.
+    Json,
+    /// Variable-length array of homogeneous values (e.g. `int[]`, `text[]`).
+    /// Stored as JSON arrays in a Bytes column (SQL-level typed as Array).
+    /// The `element_type` is advisory — the Kit layer and DataFusion handle
+    /// the actual element encoding.
+    Array {
+        element_type: u8,
+    },
     /// Variable-length bytes (covers UTF-8 strings).
     Bytes,
     /// Fixed-size binary embedding of `dim` f32 components.
@@ -60,6 +72,8 @@ impl TypeId {
             | TypeId::Time64 => Some(8),
             TypeId::Bytes | TypeId::Embedding { .. } => None,
             TypeId::Decimal128 { .. } => Some(16),
+            TypeId::Uuid => Some(16),
+            TypeId::Json | TypeId::Array { .. } => None,
             TypeId::Interval => Some(20), // i64 months + i32 days + i64 nanos
         }
     }

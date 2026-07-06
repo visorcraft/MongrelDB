@@ -85,6 +85,9 @@ pub enum ColumnType {
     Bytes,
     Embedding,
     Decimal128,
+    Uuid,
+    Json,
+    Array,
 }
 
 #[napi]
@@ -219,6 +222,9 @@ fn to_type_id(ty: &ColumnType, embedding_dim: Option<u32>) -> napi::Result<TypeI
         ColumnType::Interval => TypeId::Interval,
         ColumnType::Bytes => TypeId::Bytes,
         ColumnType::Decimal128 => TypeId::Decimal128 { precision: 38, scale: 2 },
+        ColumnType::Uuid => TypeId::Uuid,
+        ColumnType::Json => TypeId::Json,
+        ColumnType::Array => TypeId::Array { element_type: 0 },
         ColumnType::Embedding => TypeId::Embedding {
             dim: embedding_dim.ok_or_else(|| {
                 napi::Error::new(
@@ -490,7 +496,8 @@ fn from_value(v: &Value, column_id: u16) -> Cell {
             Err(_) => cell.bytes = Some(Buffer::from(b.clone())),
         },
         Value::Embedding(e) => cell.embedding = Some(e.iter().map(|x| *x as f64).collect()),
-        Value::Decimal(_) | Value::Interval { .. } => {
+        Value::Decimal(_) | Value::Interval { .. } | Value::Uuid(_)
+        | Value::Json(_) => {
             // These types don't have a Cell representation yet; encode as null.
         }
     }
@@ -2529,7 +2536,8 @@ impl TypedColumn {
             | ColumnType::Time64 => self.data.len() / 8,
             ColumnType::Bool => self.data.len(),
             ColumnType::Bytes | ColumnType::Embedding | ColumnType::Interval
-            | ColumnType::Decimal128 => {
+            | ColumnType::Decimal128 | ColumnType::Uuid | ColumnType::Json
+            | ColumnType::Array => {
                 return Err(napi::Error::new(
                     napi::Status::InvalidArg,
                     "Bytes/Embedding columns not supported in bulk_load_typed; use bulk_load",

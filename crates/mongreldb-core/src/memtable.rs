@@ -34,6 +34,10 @@ pub enum Value {
         days: i32,
         nanos: i64,
     },
+    /// RFC 4122 UUID (16 bytes, big-endian for sort order).
+    Uuid([u8; 16]),
+    /// JSON value stored as a UTF-8 byte sequence.
+    Json(Vec<u8>),
 }
 
 impl Value {
@@ -65,6 +69,8 @@ impl Value {
                 out.extend_from_slice(&nanos.to_be_bytes());
                 out
             }
+            Value::Uuid(b) => b.to_vec(),
+            Value::Json(b) => b.clone(),
         }
     }
 }
@@ -106,6 +112,8 @@ impl Row {
                 Value::Embedding(v) => 16 + (v.len() as u64) * 4,
                 Value::Decimal(_) => 16,
                 Value::Interval { .. } => 20,
+                Value::Uuid(_) => 16,
+                Value::Json(b) => 16 + b.len() as u64,
             };
         }
         n

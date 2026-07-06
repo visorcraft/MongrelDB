@@ -65,7 +65,12 @@ pub fn encode_column(ty: TypeId, values: &[Value]) -> Result<Vec<u8>> {
             Value::Null => Ok(vec![0; 4]),
             _ => Err(type_mismatch(ty, v)),
         })?,
-        TypeId::Bytes => bytes_encode(values)?,
+        TypeId::Bytes | TypeId::Json => bytes_encode(values)?,
+        TypeId::Uuid => fixed_encode(values, 16, |v| match v {
+            Value::Uuid(b) => Ok(b.to_vec()),
+            Value::Null => Ok(vec![0; 16]),
+            _ => Err(type_mismatch(ty, v)),
+        })?,
         TypeId::Embedding { dim } => embedding_encode(values, dim)?,
         TypeId::Decimal128 { .. } => fixed_encode(values, 16, |v| match v {
             Value::Decimal(d) => Ok(d.to_be_bytes().to_vec()),
@@ -150,11 +155,22 @@ pub fn decode_column(ty: TypeId, page: &[u8], n: usize, le: bool) -> Result<Vec<
                 };
                 Value::Int64(v as i64)
             }
-            TypeId::Bytes => {
+            TypeId::Bytes | TypeId::Json => {
                 let bytes_start = (n + 1) * 8;
                 let lo = read_off(payload, i, le);
                 let hi = read_off(payload, i + 1, le);
-                Value::Bytes(payload[bytes_start + lo..bytes_start + hi].to_vec())
+                let data = payload[bytes_start + lo..bytes_start + hi].to_vec();
+                if matches!(ty, TypeId::Json) {
+                    Value::Json(data)
+                } else {
+                    Value::Bytes(data)
+                }
+            }
+            TypeId::Uuid => {
+                let b = take(payload, &mut cur, 16)?;
+                let mut arr = [0u8; 16];
+                arr.copy_from_slice(&b);
+                Value::Uuid(arr)
             }
             TypeId::Embedding { dim } => {
                 let mut acc = Vec::with_capacity(dim as usize);
@@ -289,6 +305,8 @@ fn advance_null(ty: &TypeId, payload: &[u8], cur: &mut usize) -> Result<()> {
         TypeId::Decimal128 { .. } => 16,
         TypeId::Date64 | TypeId::Time64 => 8,
         TypeId::Interval => 20,
+        TypeId::Uuid => 16,
+        TypeId::Json => return Ok(()), // variable-length, same as Bytes
         // Variable-length types: null rows have no payload bytes; the offsets
         // table covers them, so nothing to advance here.
         TypeId::Bytes | TypeId::Embedding { .. } => return Ok(()),

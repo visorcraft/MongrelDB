@@ -3209,6 +3209,9 @@ fn sql_type_to_core(data_type: &DataType) -> Result<TypeId> {
         "time" => Ok(TypeId::Time64),
         "timestamp" | "datetime" => Ok(TypeId::TimestampNanos),
         "interval" => Ok(TypeId::Interval),
+        "uuid" | "uniqueidentifier" => Ok(TypeId::Uuid),
+        "json" | "jsonb" => Ok(TypeId::Json),
+        "array" | "list" => Ok(TypeId::Array { element_type: 0 }),
         other => Err(MongrelQueryError::Schema(format!(
             "unsupported column type: {other}"
         ))),
@@ -3556,6 +3559,8 @@ fn trigger_message(value: Value) -> String {
             days,
             nanos,
         } => format!("{months} months {days} days {nanos} nanos"),
+        Value::Uuid(b) => b.iter().map(|x| format!("{x:02x}")).collect(),
+        Value::Json(b) => String::from_utf8_lossy(&b).into_owned(),
     }
 }
 
@@ -3571,6 +3576,8 @@ fn compare_values(left: &Value, op: &BinaryOperator, right: &Value) -> Result<bo
         (Value::Bytes(a), Value::Bytes(b)) => a.partial_cmp(b),
         (Value::Bool(a), Value::Bool(b)) => a.partial_cmp(b),
         (Value::Decimal(a), Value::Decimal(b)) => a.partial_cmp(b),
+        (Value::Uuid(a), Value::Uuid(b)) => a.partial_cmp(b),
+        (Value::Json(a), Value::Json(b)) => a.partial_cmp(b),
         _ => None,
     };
     let Some(ordering) = ordering else {
@@ -4031,6 +4038,13 @@ fn core_value_json(value: &Value) -> serde_json::Value {
             days,
             nanos,
         } => serde_json::json!({"months": months, "days": days, "nanos": nanos}),
+        Value::Uuid(b) => {
+            let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+            serde_json::Value::String(hex)
+        }
+        Value::Json(b) => serde_json::from_slice(b).unwrap_or_else(|_| {
+            serde_json::Value::String(String::from_utf8_lossy(b).into_owned())
+        }),
     }
 }
 
