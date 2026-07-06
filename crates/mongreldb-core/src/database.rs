@@ -1316,13 +1316,51 @@ impl Database {
             cat.db_epoch = epoch.0;
         }
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
-        // Cache the admin principal on this handle.
+        // Cache the admin principal on this handle + update the shared auth
+        // state so mounted tables start enforcing immediately.
         *self.principal.write() = Some(crate::auth::Principal {
             username: admin_username.to_string(),
             is_admin: true,
             roles: Vec::new(),
             permissions: Vec::new(),
         });
+        self.auth_state.set_require_auth(true);
+        Ok(())
+    }
+
+    /// Disable `require_auth` on this database, reverting it to credentialless
+    /// mode. This is the **recovery** path — it requires the handle to already
+    /// be open (and therefore already authenticated if `require_auth` was on).
+    ///
+    /// After this call, the database can be reopened with plain
+    /// [`open`](Self::open) / [`open_encrypted`](Self::open_encrypted) without
+    /// credentials. All existing users and roles are preserved in the catalog
+    /// (so `require_auth` can be re-enabled without recreating them), but they
+    /// are no longer consulted for enforcement.
+    ///
+    /// For true **offline** recovery (when credentials are lost and no
+    /// authenticated handle is available), the caller opens the database
+    /// directly via the catalog file (filesystem access required) and calls
+    /// this method — see the CLI's `auth disable-offline` command.
+    ///
+    /// See `docs/auth-enforcement-spec.md` §4.7.
+    pub fn disable_auth(&self) -> Result<()> {
+        let epoch = self.epoch.bump_assigned();
+        {
+            let mut cat = self.catalog.write();
+            if !cat.require_auth {
+                return Err(MongrelError::InvalidArgument(
+                    "database does not have require_auth enabled".into(),
+                ));
+            }
+            cat.require_auth = false;
+            cat.db_epoch = epoch.0;
+        }
+        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+        // Clear the cached principal — enforcement is now off.
+        *self.principal.write() = None;
+        // Update the shared auth state so mounted tables also stop enforcing.
+        self.auth_state.set_require_auth(false);
         Ok(())
     }
 

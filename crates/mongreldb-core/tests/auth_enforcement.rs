@@ -285,6 +285,55 @@ fn enable_auth_rejects_duplicate_username() {
     );
 }
 
+/// `disable_auth` reverts a credentialed database to credentialless. After
+/// disable, plain `open` works without credentials, and existing users/roles
+/// are preserved in the catalog.
+#[test]
+fn disable_auth_reverts_to_credentialless() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+
+    // Create credentialed + add some data.
+    {
+        let db = Database::create_with_credentials(&path, "admin", "admin-pw").unwrap();
+        db.create_table("orders", int_pk_schema()).unwrap();
+        db.create_user("alice", "alice-pw").unwrap();
+        db.create_role("analyst").unwrap();
+    }
+
+    // Reopen with credentials, then disable.
+    {
+        let db = Database::open_with_credentials(&path, "admin", "admin-pw").unwrap();
+        assert!(db.require_auth_enabled());
+        db.disable_auth().unwrap();
+        assert!(!db.require_auth_enabled());
+    }
+
+    // Plain open now works without credentials.
+    let db = Database::open(&path).unwrap();
+    assert!(!db.require_auth_enabled());
+
+    // Users/roles preserved (auth data is still in the catalog, just not enforced).
+    assert_eq!(db.users().len(), 2); // admin + alice
+    assert_eq!(db.roles().len(), 1); // analyst
+
+    // Can re-enable later.
+    db.enable_auth("admin2", "new-pw").unwrap();
+    assert!(db.require_auth_enabled());
+}
+
+/// `disable_auth` refuses if auth is already disabled.
+#[test]
+fn disable_auth_refuses_if_already_disabled() {
+    let dir = tempdir().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    let err = db.disable_auth().unwrap_err();
+    assert!(
+        matches!(err, MongrelError::InvalidArgument(_)),
+        "got {err:?}"
+    );
+}
+
 /// `refresh_principal` picks up a newly granted permission without
 /// re-verifying the password (spec §9 decision 3).
 #[test]

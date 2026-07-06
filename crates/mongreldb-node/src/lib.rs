@@ -1045,6 +1045,12 @@ impl Database {
             .map_err(to_napi)
     }
 
+    /// Disable `require_auth`, reverting to credentialless mode (recovery).
+    #[napi]
+    pub fn disable_auth(&self) -> napi::Result<()> {
+        self.inner.disable_auth().map_err(to_napi)
+    }
+
     /// Returns `true` if this database has `require_auth = true`.
     #[napi]
     pub fn require_auth_enabled(&self) -> bool {

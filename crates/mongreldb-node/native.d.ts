@@ -260,6 +260,8 @@ export declare class Database {
    * only be reopened via `openWithCredentials`.
    */
   enableAuth(adminUsername: string, adminPassword: string): void
+  /** Disable `require_auth`, reverting to credentialless mode (recovery). */
+  disableAuth(): void
   /** Returns `true` if this database has `require_auth = true`. */
   requireAuthEnabled(): boolean
   /**
