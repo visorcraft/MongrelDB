@@ -1476,6 +1476,121 @@ impl Database {
         let n = handle.lock().decoded_cache_len();
         Ok(n as u32)
     }
+
+    // ── user/role/credentials management ──────────────────────────────────
+
+    /// Create a catalog user with an Argon2id-hashed password.
+    #[napi]
+    pub fn create_user(&self, username: String, password: String) -> napi::Result<()> {
+        self.inner.create_user(&username, &password).map_err(to_napi)?;
+        Ok(())
+    }
+
+    /// Drop a user by username.
+    #[napi]
+    pub fn drop_user(&self, username: String) -> napi::Result<()> {
+        self.inner.drop_user(&username).map_err(to_napi)
+    }
+
+    /// Change a user's password.
+    #[napi]
+    pub fn alter_user_password(&self, username: String, new_password: String) -> napi::Result<()> {
+        self.inner
+            .alter_user_password(&username, &new_password)
+            .map_err(to_napi)
+    }
+
+    /// Verify credentials. Returns true on success.
+    #[napi]
+    pub fn verify_user(&self, username: String, password: String) -> napi::Result<bool> {
+        let result = self.inner.verify_user(&username, &password).map_err(to_napi)?;
+        Ok(result.is_some())
+    }
+
+    /// Grant or revoke admin privileges on a user.
+    #[napi]
+    pub fn set_user_admin(&self, username: String, is_admin: bool) -> napi::Result<()> {
+        self.inner.set_user_admin(&username, is_admin).map_err(to_napi)
+    }
+
+    /// List all usernames.
+    #[napi]
+    pub fn users(&self) -> napi::Result<Vec<String>> {
+        Ok(self.inner.users().into_iter().map(|u| u.username).collect())
+    }
+
+    /// Create a role.
+    #[napi]
+    pub fn create_role(&self, name: String) -> napi::Result<()> {
+        self.inner.create_role(&name).map_err(to_napi)?;
+        Ok(())
+    }
+
+    /// Drop a role.
+    #[napi]
+    pub fn drop_role(&self, name: String) -> napi::Result<()> {
+        self.inner.drop_role(&name).map_err(to_napi)
+    }
+
+    /// List all role names.
+    #[napi]
+    pub fn roles(&self) -> napi::Result<Vec<String>> {
+        Ok(self.inner.roles().into_iter().map(|r| r.name).collect())
+    }
+
+    /// Grant a role to a user.
+    #[napi]
+    pub fn grant_role(&self, username: String, role_name: String) -> napi::Result<()> {
+        self.inner.grant_role(&username, &role_name).map_err(to_napi)
+    }
+
+    /// Revoke a role from a user.
+    #[napi]
+    pub fn revoke_role(&self, username: String, role_name: String) -> napi::Result<()> {
+        self.inner.revoke_role(&username, &role_name).map_err(to_napi)
+    }
+
+    /// Grant a permission to a role. `permission` is one of: "all", "ddl",
+    /// "admin", or "select:table", "insert:table", "update:table", "delete:table".
+    #[napi]
+    pub fn grant_permission(&self, role_name: String, permission: String) -> napi::Result<()> {
+        let perm = parse_permission(&permission)?;
+        self.inner.grant_permission(&role_name, perm).map_err(to_napi)
+    }
+
+    /// Revoke a permission from a role.
+    #[napi]
+    pub fn revoke_permission(&self, role_name: String, permission: String) -> napi::Result<()> {
+        let perm = parse_permission(&permission)?;
+        self.inner.revoke_permission(&role_name, perm).map_err(to_napi)
+    }
+}
+
+fn parse_permission(s: &str) -> napi::Result<mongreldb_core::auth::Permission> {
+    let lower = s.to_ascii_lowercase();
+    Ok(match lower.as_str() {
+        "all" => mongreldb_core::auth::Permission::All,
+        "ddl" => mongreldb_core::auth::Permission::Ddl,
+        "admin" => mongreldb_core::auth::Permission::Admin,
+        _ if lower.starts_with("select:") => mongreldb_core::auth::Permission::Select {
+            table: lower[7..].to_string(),
+        },
+        _ if lower.starts_with("insert:") => mongreldb_core::auth::Permission::Insert {
+            table: lower[7..].to_string(),
+        },
+        _ if lower.starts_with("update:") => mongreldb_core::auth::Permission::Update {
+            table: lower[7..].to_string(),
+        },
+        _ if lower.starts_with("delete:") => mongreldb_core::auth::Permission::Delete {
+            table: lower[7..].to_string(),
+        },
+        other => {
+            return Err(napi::Error::new(
+                napi::Status::InvalidArg,
+                format!("unknown permission '{other}'. Use: all, ddl, admin, select:table, insert:table, update:table, delete:table"),
+            ));
+        }
+    })
 }
 
 /// Encrypted constructors. The `encryption` feature is **on by default**; build

@@ -349,6 +349,35 @@ export declare class Database {
   tablePageCacheLen(name: string): number
   /** Decoded-page-cache entry count for a table. */
   tableDecodedCacheLen(name: string): number
+  /** Create a catalog user with an Argon2id-hashed password. */
+  createUser(username: string, password: string): void
+  /** Drop a user by username. */
+  dropUser(username: string): void
+  /** Change a user's password. */
+  alterUserPassword(username: string, newPassword: string): void
+  /** Verify credentials. Returns true on success. */
+  verifyUser(username: string, password: string): boolean
+  /** Grant or revoke admin privileges on a user. */
+  setUserAdmin(username: string, isAdmin: boolean): void
+  /** List all usernames. */
+  users(): Array<string>
+  /** Create a role. */
+  createRole(name: string): void
+  /** Drop a role. */
+  dropRole(name: string): void
+  /** List all role names. */
+  roles(): Array<string>
+  /** Grant a role to a user. */
+  grantRole(username: string, roleName: string): void
+  /** Revoke a role from a user. */
+  revokeRole(username: string, roleName: string): void
+  /**
+   * Grant a permission to a role. `permission` is one of: "all", "ddl",
+   * "admin", or "select:table", "insert:table", "update:table", "delete:table".
+   */
+  grantPermission(roleName: string, permission: string): void
+  /** Revoke a permission from a role. */
+  revokePermission(roleName: string, permission: string): void
   /**
    * Create a fresh encrypted database (page-level AES-256-GCM; the database
    * KEK is derived from `passphrase` via Argon2id + HKDF).
