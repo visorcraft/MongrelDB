@@ -88,7 +88,8 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
       # mongreldb-server (the HTTP daemon) publishes last — it depends on both
-      # mongreldb-core and mongreldb-query.
-      - run: cargo publish -p mongreldb-server
+      # mongreldb-core and mongreldb-query. It's a standalone crate (own
+      # [workspace]), so we cd into it.
+      - run: cd crates/mongreldb-server && cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
