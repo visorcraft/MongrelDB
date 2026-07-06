@@ -71,7 +71,7 @@ Measured on 1M rows, dev sandbox (full results in [`BENCHMARKS.md`](BENCHMARKS.m
 | `COUNT(*)` metadata | **0 µs** (O(1)) |
 | AES-256-GCM encrypt/decrypt | **~1.88 GiB/s** |
 
-**Cross-engine (1M rows, v0.28.0):** single-row writes **1.8× faster than SQLite, 37× faster than DuckDB**.
+**Cross-engine (1M rows, v0.31.1):** single-row writes **1.8× faster than SQLite, 37× faster than DuckDB**.
 Bulk insert **2.3× faster than SQLite, 2.6× faster than DuckDB native**. Join
 `COUNT(*)` **3.4× faster than DuckDB, 19× faster than SQLite**.
 

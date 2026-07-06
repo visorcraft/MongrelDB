@@ -65,9 +65,17 @@ vector similarity, range queries, and more.
 |---|---|---|
 | `Int64` | `i64` | `BigInt` |
 | `Float64` | `f64` | `Number` |
-| `Bytes` (text/binary) | `Vec<u8>` | `Buffer` / `string` |
 | `Bool` | `bool` | `boolean` |
-| `Embedding` (fixed-size f32 vector) | `Vec<f32>` | `Float32Array` |
+| `Decimal128` | `i128` | `string` |
+| `TimestampNanos` | `i64` | `BigInt` |
+| `Date32`/`Date64` | `i32`/`i64` | `Number` |
+| `Time64` | `i64` | `BigInt` |
+| `Interval` | `{months,days,nanos}` | `{months,days,nanos}` |
+| `Uuid` | `[u8; 16]` | `string` |
+| `Json` | `Vec<u8>` | `string` |
+| `Array` | `Vec<u8>` (JSON) | `unknown[]` |
+| `Bytes` (text/binary) | `Vec<u8>` | `Buffer` / `string` |
+| `Embedding` | `Vec<f32>` | `Float32Array` |
 
 ## Repository
 

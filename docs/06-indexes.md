@@ -4,8 +4,8 @@ Indexes are how databases find data fast. Without an index, finding rows that
 match a condition requires scanning every row. With an index, the database
 jumps directly to the matching rows.
 
-MongrelDB has seven index types — each designed for a different kind of query.
-Most databases have one or two index types. Having seven means MongrelDB can
+MongrelDB has eight index types — each designed for a different kind of query.
+Most databases have one or two index types. Having eight means MongrelDB can
 accelerate search patterns that other databases can't (like semantic vector
 search or substring search).
 
@@ -32,7 +32,7 @@ You can also add a PGM range index after data is loaded:
 db.add_learned_range_index("timestamp")?;
 ```
 
-## The Seven Index Types
+## The Eight Index Types
 
 ### 1. HOT (Height-Optimized Trie) — Primary Key Lookup
 
@@ -202,3 +202,39 @@ intersection — rows matching ALL conditions — gets decoded.
 
 This means adding more indexes makes multi-condition queries faster, not
 slower. Each index narrows the result set before any data is scanned.
+
+## Partial Indexes
+
+A partial index covers only rows matching a `WHERE` predicate. This is useful
+for large tables where queries typically filter on a condition (e.g. only
+active records):
+
+```sql
+-- Index only non-deleted rows
+CREATE INDEX idx_active_users ON users (email) WHERE deleted_at IS NULL;
+```
+
+The predicate is stored on `IndexDef` and evaluated at index-build time. Rows
+not matching the predicate are skipped. Supported predicate patterns:
+- `column IS NOT NULL` — index only non-null rows
+- `column IS NULL` — index only null rows
+- Unknown patterns conservatively index all rows.
+
+`PRAGMA index_list(table)` shows `partial = 1` for indexes with a predicate.
+
+## WITHOUT ROWID (Clustered Primary Key)
+
+Tables created with `WITHOUT ROWID` use the primary key as the physical row
+identity — sorted runs are logically keyed by PK rather than by a separate
+monotonic `RowId`. This gives:
+
+- **Idempotent upserts** — same PK always maps to the same row (no RowId
+  allocation waste on repeated puts).
+- **No hidden RowId** — the PK IS the row identity.
+
+```sql
+CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT) WITHOUT ROWID;
+```
+
+The engine derives a deterministic `RowId` from the PK value (stable FNV-1a
+hash) so the existing sorted-run and HOT-index infrastructure works unchanged.

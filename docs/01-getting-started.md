@@ -47,8 +47,8 @@ Add MongrelDB to your `Cargo.toml` (both crates are published to crates.io):
 
 ```toml
 [dependencies]
-mongreldb-core = "0.24"   # storage engine (always needed)
-mongreldb-query = "0.24"  # SQL frontend (optional; needed for MongrelSession / views / Arrow)
+mongreldb-core = "0.31"   # storage engine (always needed)
+mongreldb-query = "0.31"  # SQL frontend (optional; needed for MongrelSession / views / Arrow)
 ```
 
 For encryption support, add the `encryption` feature:

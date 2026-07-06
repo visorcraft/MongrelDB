@@ -1,4 +1,4 @@
-# Daemon Mode (mongreldb-server)
+# Daemon Mode (mongrelDB-server)
 
 By default, MongrelDB runs embedded inside your application. But sometimes
 you want a long-lived database process that multiple applications can share —
@@ -7,30 +7,55 @@ like a traditional database server, but lightweight.
 The `mongreldb-server` daemon solves this. It opens the database once, keeps
 indexes and caches warm in memory, and serves queries over HTTP.
 
-## When to Use the Daemon
+## Installation
 
-| Scenario | Embedded | Daemon |
-|---|---|---|
-| Single application | ✓ | |
-| CLI tool that opens, queries, closes | ✓ | |
-| Multiple processes sharing one database | | ✓ |
-| Web server + background workers | | ✓ |
-| Long-running analytics with warm cache | | ✓ |
+```sh
+# Install from crates.io
+cargo install mongreldb-server
+
+# Or build from source
+cd crates/mongreldb-server
+cargo build --release
+```
 
 ## Starting the Daemon
 
-Build and run the server:
-
 ```sh
-cd crates/mongreldb-server
-cargo build --release
+# Basic: start serving a database on the default port (8453)
+mongreldb-server ./my_database 8453
 
-# Start serving a database on the default port (8453)
-./target/release/mongreldb-server ./my_database 8453
+# With authentication (Bearer token required on all requests)
+mongreldb-server ./my_database 8453 --auth-token my-secret-token
+
+# With connection limit (max 100 concurrent requests)
+mongreldb-server ./my_database 8453 --auth-token my-secret-token --max-connections 100
 ```
 
 The daemon opens the database, builds indexes (if needed), and starts
 listening for HTTP requests on `127.0.0.1:8453`.
+
+## Authentication
+
+When `--auth-token <token>` is set, every request must include an
+`Authorization: Bearer <token>` header. Requests without the correct token
+receive `401 Unauthorized`. When no token is configured (the default), auth
+is disabled for local development.
+
+```sh
+# With auth enabled:
+curl -H "Authorization: Bearer my-secret-token" http://127.0.0.1:8453/health
+# → "ok"
+
+# Without the header:
+curl http://127.0.0.1:8453/health
+# → 401 Unauthorized
+```
+
+## Connection Pooling
+
+When `--max-connections N` is set, the daemon caps concurrent in-flight
+requests via a `ConcurrencyLimitLayer`. Requests beyond the limit wait in a
+queue. Default: unlimited (all requests handled immediately).
 
 ## API Endpoints
 
@@ -44,14 +69,22 @@ curl http://127.0.0.1:8453/health
 # → "ok"
 ```
 
-### Row Count
+### Table Management
 
 ```sh
-curl http://127.0.0.1:8453/count
-# → { "count": 1000000 }
+# List tables
+curl http://127.0.0.1:8453/tables
+
+# Create a table
+curl -X POST http://127.0.0.1:8453/tables \
+  -H "Content-Type: application/json" \
+  -d '{"name": "events", "columns": [...]}'
+
+# Drop a table
+curl -X DELETE http://127.0.0.1:8453/tables/events
 ```
 
-### SQL Query
+### SQL
 
 ```sh
 curl -X POST http://127.0.0.1:8453/sql \
@@ -60,39 +93,50 @@ curl -X POST http://127.0.0.1:8453/sql \
 # → Arrow IPC bytes (binary)
 ```
 
-### Native Condition Query
+### Typed Kit API
+
+The daemon serves a typed Kit API with authoritative constraint enforcement:
 
 ```sh
-curl -X POST http://127.0.0.1:8453/query \
+# Get the full schema catalog
+curl http://127.0.0.1:8453/kit/schema
+
+# Atomic typed write batch (put/upsert/delete with idempotency keys)
+curl -X POST http://127.0.0.1:8453/kit/txn \
   -H "Content-Type: application/json" \
-  -d '{
-    "conditions": [
-      {"kind": "bitmap_eq", "column_id": 2, "value": "premium"},
-      {"kind": "range_f64", "column_id": 3, "lo": 100.0, "hi": 500.0}
-    ],
-    "projection": [1, 2, 3]
-  }'
-# → Arrow IPC bytes (binary)
+  -d '{"operations": [...], "idempotency_key": "..."}'
+
+# Typed query with conditions
+curl -X POST http://127.0.0.1:8453/kit/query \
+  -H "Content-Type: application/json" \
+  -d '{"table": "events", "conditions": [...]}'
 ```
 
-### Write Data
+### Row-Level Operations
 
 ```sh
-curl -X POST http://127.0.0.1:8453/put \
+# Put a row
+curl -X POST http://127.0.0.1:8453/tables/events/put \
   -H "Content-Type: application/json" \
   -d '{"row": [[1, 42], [2, "alice@test.com"], [3, 95.5]]}'
-# → { "row_id": "1000001" }
 
-curl -X POST http://127.0.0.1:8453/commit
-# → { "epoch": 5 }
+# Count rows
+curl http://127.0.0.1:8453/tables/events/count
+
+# Commit pending writes
+curl -X POST http://127.0.0.1:8453/tables/events/commit
 ```
 
-### Delete
+### Procedures and Triggers
 
 ```sh
-curl -X POST http://127.0.0.1:8453/delete \
-  -H "Content-Type: application/json" \
-  -d '{"row_id": 42}'
+# List/create/drop/call stored procedures
+curl http://127.0.0.1:8453/procedures
+curl -X POST http://127.0.0.1:8453/procedures -d '...'
+curl -X POST http://127.0.0.1:8453/procedures/my_proc/call -d '{"args": {...}}'
+
+# List/create/drop triggers
+curl http://127.0.0.1:8453/triggers
 ```
 
 ### Compaction
@@ -100,17 +144,46 @@ curl -X POST http://127.0.0.1:8453/delete \
 ```sh
 # Compact all tables
 curl -X POST http://127.0.0.1:8453/compact
-# → {"status":"ok","compacted":3,"skipped":1}
 
 # Compact one table
 curl -X POST http://127.0.0.1:8453/tables/events/compact
-# → {"status":"compacted","table":"events"}
 ```
 
 The daemon also runs a **background auto-compactor** that sweeps every
-30 seconds and merges any table with 8+ sorted runs — so under steady
-write load, query latency stays flat without any manual intervention.
-See [Maintenance & Operations](09-maintenance.md) for details.
+30 seconds and merges any table with 8+ sorted runs.
+
+## Change Data Capture (NOTIFY / LISTEN)
+
+The daemon publishes change events to a broadcast channel. Applications can
+subscribe via the `GET /events` endpoint, which streams events as
+newline-delimited JSON (`ChangeEvent { channel, table, op, epoch, message }`):
+
+```sh
+# Stream change events
+curl http://127.0.0.1:8453/events
+# {"channel":"","table":"events","op":"put","epoch":5,"message":null}
+# {"channel":"alerts","table":"","op":"notify","epoch":6,"message":"threshold exceeded"}
+```
+
+SQL `NOTIFY channel [, 'payload']` publishes a notification on a named
+channel; `LISTEN channel` is accepted (subscribers connect via `/events`).
+
+## Replication (WAL Streaming)
+
+The daemon exposes `GET /wal/stream?since=<seq>` which streams committed WAL
+records as newline-delimited JSON (`{ seq, txn_id, op }`). A follower
+polls this endpoint and applies records to a local database copy:
+
+```rust
+use mongreldb_client::ReplicationFollower;
+
+let mut follower = ReplicationFollower::new("http://leader:8453", "/local/copy");
+let n = follower.sync()?;  // fetch + count new records
+println!("applied {n} records, up to seq {}", follower.last_seq());
+```
+
+This enables async leader→follower replication for read scaling and disaster
+recovery.
 
 ## Connecting from Rust
 
@@ -123,38 +196,38 @@ let client = MongrelClient::new("http://127.0.0.1:8453");
 let batches = client.sql("SELECT * FROM events WHERE score > 90")?;
 
 // Row count
-let count = client.count()?;
+let count = client.count("events")?;
 
-// Write
-client.put(vec![(1, Value::Int64(42)), (2, Value::Bytes(b"hello".to_vec())])?;
-client.commit()?;
+// Typed Kit operations
+let schema = client.kit_schema()?;
 ```
 
 ## Connecting from Node.js
 
 ```javascript
-const { RemoteDatabase } = require('./index.js');
+const { RemoteDatabase } = require('@visorcraft/mongreldb');
 
 const db = new RemoteDatabase('http://127.0.0.1:8453');
 
-const count = db.count();
+const count = db.count('events');
 const arrowBytes = db.sql('SELECT * FROM events LIMIT 100');
-db.commit();
+
+// Compact tables remotely
+db.compact();
+db.compactTable('events');
 ```
 
 ## How It Works
 
-The daemon holds the `Db` open with all indexes in memory. Every HTTP request
-locks the database mutex, executes the query, and returns the result. Because
-the indexes and caches stay warm between requests, repeated queries are fast.
-
-The daemon does not currently support concurrent queries (they're serialized
-by the mutex). If you need parallelism, run multiple daemon instances on
-different ports, each with its own database.
+The daemon holds the `Database` open with all indexes in memory. HTTP
+requests are handled asynchronously (axum + tokio), with an optional
+concurrency limit. Because the indexes and caches stay warm between requests,
+repeated queries are fast — warm result-cache hits return in ~0.1 µs.
 
 ## Security
 
-The daemon listens on `127.0.0.1` only — it's not accessible from other
-machines by default. There is no authentication. If you need remote access
-or auth, put a reverse proxy (like nginx or Caddy) in front with TLS and
-authentication.
+The daemon listens on `127.0.0.1` by default. For production:
+
+1. Use `--auth-token` to require a Bearer token on every request.
+2. Use `--max-connections` to prevent resource exhaustion.
+3. Put a TLS-terminating reverse proxy (nginx, Caddy) in front for HTTPS.
