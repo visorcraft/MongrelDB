@@ -9,6 +9,7 @@
 #![recursion_limit = "2048"]
 
 pub mod auth;
+pub mod auth_state;
 pub mod be_tree;
 pub mod cache;
 pub mod catalog;

@@ -2122,6 +2122,11 @@ fn insert_rows(session: &MongrelSession, db: &Arc<Database>, insert: Insert) -> 
             ));
         }
     };
+    // SQL INSERT → require Insert permission on the target table.
+    db.require_table(
+        &table,
+        mongreldb_core::auth_state::RequiredPermission::Insert,
+    )?;
     if insert.returning.is_some() {
         return Err(MongrelQueryError::Schema(
             "INSERT RETURNING is not supported".into(),
@@ -2607,6 +2612,16 @@ async fn update_rows(
         ));
     }
     let table = table_factor_name(&update.table.relation)?;
+    // SQL UPDATE → require Update permission on the target table (also
+    // requires Select for the implicit read of the rows to update).
+    db.require_table(
+        &table,
+        mongreldb_core::auth_state::RequiredPermission::Update,
+    )?;
+    db.require_table(
+        &table,
+        mongreldb_core::auth_state::RequiredPermission::Select,
+    )?;
     if session.view_definition(&table).is_some() {
         return update_view_rows(session, db, &table, update).await;
     }
@@ -2657,6 +2672,16 @@ async fn delete_rows(session: &MongrelSession, db: &Arc<Database>, delete: Delet
         ));
     }
     let table = single_from_table(&delete.from)?;
+    // SQL DELETE → require Delete permission on the target table (also
+    // requires Select for the implicit read of the rows to delete).
+    db.require_table(
+        &table,
+        mongreldb_core::auth_state::RequiredPermission::Delete,
+    )?;
+    db.require_table(
+        &table,
+        mongreldb_core::auth_state::RequiredPermission::Select,
+    )?;
     if session.view_definition(&table).is_some() {
         return delete_view_rows(session, db, &table, delete).await;
     }
@@ -2939,6 +2964,11 @@ fn truncate_tables(session: &MongrelSession, db: &Arc<Database>, truncate: Trunc
     let mut ops = Vec::new();
     for target in truncate.table_names {
         let table = object_name(&target.name)?;
+        // SQL TRUNCATE → require Delete permission on each target table.
+        db.require_table(
+            &table,
+            mongreldb_core::auth_state::RequiredPermission::Delete,
+        )?;
         if let Some(entry) = db.external_table(&table) {
             return Err(external_table_write_error("TRUNCATE", &entry));
         }

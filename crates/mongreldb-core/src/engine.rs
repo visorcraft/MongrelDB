@@ -105,6 +105,15 @@ pub enum IndexBuildPolicy {
 pub struct Table {
     dir: PathBuf,
     table_id: u64,
+    /// The table's catalog name, set at mount time. Used by the auth
+    /// enforcement layer to check `Select`/`Insert`/`Update`/`Delete`
+    /// permissions against this specific table.
+    name: String,
+    /// Optional auth checker for per-operation enforcement. `None` on
+    /// credentialless databases (the default); `Some` when the database has
+    /// `require_auth = true`. The checker is shared (via `Arc`) so it sees
+    /// live updates to the principal and the `require_auth` flag.
+    auth: Option<Arc<dyn crate::auth_state::TableAuthChecker>>,
     wal: WalSink,
     memtable: Memtable,
     /// PMA-backed mutable-run LSM tier (Phase 11.1). A flush drains the
@@ -794,6 +803,12 @@ pub(crate) struct SharedCtx {
     /// write through the one shared WAL (no private `_wal/` dir is created).
     /// `None` for a directly-opened standalone table, which keeps a private WAL.
     pub shared: Option<SharedWalCtx>,
+    /// The table's catalog name (for auth enforcement). `None` on standalone
+    /// direct-open tables that have no catalog entry.
+    pub table_name: Option<String>,
+    /// Auth checker for per-operation enforcement. `None` on credentialless
+    /// databases; cloned from the `Database`'s `auth_state` wrapper.
+    pub auth: Option<Arc<dyn crate::auth_state::TableAuthChecker>>,
 }
 
 /// Handles a mounted table needs to write to the database's single shared WAL
@@ -852,6 +867,8 @@ impl SharedCtx {
             kek,
             commit_lock: Arc::new(parking_lot::Mutex::new(())),
             shared: None,
+            table_name: None,
+            auth: None,
         }
     }
 }
@@ -1004,6 +1021,8 @@ impl Table {
         Ok(Self {
             dir,
             table_id,
+            name: ctx.table_name.unwrap_or_default(),
+            auth: ctx.auth,
             wal,
             memtable: Memtable::new(),
             mutable_run: MutableRun::new(),
@@ -1216,6 +1235,8 @@ impl Table {
         let mut db = Self {
             dir,
             table_id: manifest.table_id,
+            name: ctx.table_name.unwrap_or_default(),
+            auth: ctx.auth,
             wal,
             memtable,
             mutable_run: MutableRun::new(),
@@ -1596,9 +1617,42 @@ impl Table {
     /// arrives at the next [`Table::commit`] (or [`Table::flush`]).
     ///
     /// For an `AUTO_INCREMENT` primary key, omit the column (or pass
+    /// Auth enforcement helpers. Each delegates to the optional
+    /// [`TableAuthChecker`] (set at mount time from the `Database`'s auth
+    /// state). On a credentialless database (`auth = None`), these are
+    /// no-ops. The `name` field provides the table name for the permission
+    /// check without needing a reference back to `Database`.
+    fn require(&self, perm: crate::auth_state::RequiredPermission) -> Result<()> {
+        match &self.auth {
+            Some(checker) => checker.check(&self.name, perm),
+            None => Ok(()),
+        }
+    }
+    /// Check `Select` permission on this table. Public so that read entry
+    /// points that don't go through `Table::query` (e.g. `MongrelProvider::scan`,
+    /// `Table::count`) can enforce before reading. On a credentialless database
+    /// this is a no-op.
+    pub fn require_select(&self) -> Result<()> {
+        self.require(crate::auth_state::RequiredPermission::Select)
+    }
+    fn require_insert(&self) -> Result<()> {
+        self.require(crate::auth_state::RequiredPermission::Insert)
+    }
+    /// Currently unused on `Table` directly (updates go through `Transaction`),
+    /// but kept for API completeness — the four `require_*` helpers mirror the
+    /// four table-level permission kinds.
+    #[allow(dead_code)]
+    fn require_update(&self) -> Result<()> {
+        self.require(crate::auth_state::RequiredPermission::Update)
+    }
+    fn require_delete(&self) -> Result<()> {
+        self.require(crate::auth_state::RequiredPermission::Delete)
+    }
+
     /// [`Value::Null`]) and the engine assigns the next counter value; use
     /// [`Table::put_returning`] to learn that assigned value.
     pub fn put(&mut self, columns: Vec<(u16, Value)>) -> Result<RowId> {
+        self.require_insert()?;
         Ok(self.put_returning(columns)?.0)
     }
 
@@ -1610,6 +1664,7 @@ impl Table {
         &mut self,
         mut columns: Vec<(u16, Value)>,
     ) -> Result<(RowId, Option<i64>)> {
+        self.require_insert()?;
         let assigned = self.fill_auto_inc(&mut columns)?;
         self.schema.validate_not_null(&columns)?;
         // For clustered (WITHOUT ROWID) tables, derive RowId deterministically
@@ -1633,6 +1688,7 @@ impl Table {
     /// Bulk upsert: many rows under a single WAL record + one index pass. Far
     /// cheaper than `put` in a loop for batch ingest.
     pub fn put_batch(&mut self, batch: Vec<Vec<(u16, Value)>>) -> Result<Vec<RowId>> {
+        self.require_insert()?;
         Ok(self
             .put_batch_returning(batch)?
             .into_iter()
@@ -2335,6 +2391,7 @@ impl Table {
 
     /// Logically delete `row_id` (effective at the next commit).
     pub fn delete(&mut self, row_id: RowId) -> Result<()> {
+        self.require_delete()?;
         let epoch = self.pending_epoch();
         self.wal_append_data(Op::Delete {
             table_id: self.table_id,
@@ -2360,6 +2417,7 @@ impl Table {
 
     /// Durably remove every row in the table once the current write span commits.
     pub fn truncate(&mut self) -> Result<()> {
+        self.require_delete()?;
         let epoch = self.pending_epoch();
         self.wal_append_data(Op::TruncateTable {
             table_id: self.table_id,
@@ -3216,6 +3274,7 @@ impl Table {
     /// survivors are materialized at the current snapshot. This is the AI-native
     /// "compose primitives" surface (`semsearch ∩ fm_contains ∩ cat_in`).
     pub fn query(&mut self, q: &crate::query::Query) -> Result<Vec<Row>> {
+        self.require_select()?;
         self.ensure_indexes_complete()?;
         let snapshot = self.snapshot();
         crate::trace::QueryTrace::record(|t| {

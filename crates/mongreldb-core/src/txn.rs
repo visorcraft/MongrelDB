@@ -105,6 +105,8 @@ impl<'db> Transaction<'db> {
     /// counter. The value is staged in `cells`, so the commit path writes the
     /// same id into the row.
     pub fn put(&mut self, table: &str, mut cells: Vec<(u16, Value)>) -> Result<Option<i64>> {
+        self.db
+            .require_table(table, crate::auth_state::RequiredPermission::Insert)?;
         let id = self.db.table_id(table)?;
         self.reject_after_truncate(id)?;
         let handle = self.db.table(table)?;
@@ -120,6 +122,8 @@ impl<'db> Transaction<'db> {
         table: &str,
         mut cells: Vec<(u16, Value)>,
     ) -> Result<PutResult> {
+        self.db
+            .require_table(table, crate::auth_state::RequiredPermission::Insert)?;
         let id = self.db.table_id(table)?;
         self.reject_after_truncate(id)?;
         let handle = self.db.table(table)?;
@@ -142,6 +146,8 @@ impl<'db> Transaction<'db> {
         table: &str,
         rows: Vec<Vec<(u16, Value)>>,
     ) -> Result<Vec<Option<i64>>> {
+        self.db
+            .require_table(table, crate::auth_state::RequiredPermission::Insert)?;
         let id = self.db.table_id(table)?;
         self.reject_after_truncate(id)?;
         let handle = self.db.table(table)?;
@@ -158,6 +164,8 @@ impl<'db> Transaction<'db> {
 
     /// Stage a delete of `row_id` on `table`.
     pub fn delete(&mut self, table: &str, row_id: RowId) -> Result<()> {
+        self.db
+            .require_table(table, crate::auth_state::RequiredPermission::Delete)?;
         let id = self.db.table_id(table)?;
         self.reject_after_truncate(id)?;
         self.staging.push((id, Staged::Delete(row_id)));
@@ -177,6 +185,8 @@ impl<'db> Transaction<'db> {
     }
 
     pub fn delete_many(&mut self, table: &str, row_ids: Vec<RowId>) -> Result<Vec<OwnedRow>> {
+        self.db
+            .require_table(table, crate::auth_state::RequiredPermission::Delete)?;
         let id = self.db.table_id(table)?;
         self.reject_after_truncate(id)?;
         let snap = self.read;
@@ -200,6 +210,8 @@ impl<'db> Transaction<'db> {
         table: &str,
         updates: Vec<(RowId, Vec<(u16, Value)>)>,
     ) -> Result<Vec<OwnedRow>> {
+        self.db
+            .require_table(table, crate::auth_state::RequiredPermission::Update)?;
         let id = self.db.table_id(table)?;
         self.reject_after_truncate(id)?;
         let snap = self.read;
@@ -227,6 +239,11 @@ impl<'db> Transaction<'db> {
         mut insert_cells: Vec<(u16, Value)>,
         action: UpsertAction,
     ) -> Result<UpsertResult> {
+        // Upsert may insert or update. Check Insert up front (the common
+        // path); the DoUpdate branch additionally checks Update before
+        // mutating an existing row.
+        self.db
+            .require_table(table, crate::auth_state::RequiredPermission::Insert)?;
         let id = self.db.table_id(table)?;
         self.reject_after_truncate(id)?;
         match (self.existing_pk_row(table, &insert_cells)?, action) {
@@ -250,6 +267,9 @@ impl<'db> Transaction<'db> {
                 auto_inc: None,
             }),
             (Some((old_id, old_row)), UpsertAction::DoUpdate(update_cells)) => {
+                // The update branch requires Update permission.
+                self.db
+                    .require_table(table, crate::auth_state::RequiredPermission::Update)?;
                 let merged = merge_cells(old_row.columns.clone(), update_cells);
                 if columns_equal(&old_row.columns, &merged) {
                     return Ok(UpsertResult {
@@ -271,6 +291,8 @@ impl<'db> Transaction<'db> {
     }
 
     pub fn truncate(&mut self, table: &str) -> Result<()> {
+        self.db
+            .require_table(table, crate::auth_state::RequiredPermission::Delete)?;
         let id = self.db.table_id(table)?;
         for (table_id, op) in &self.staging {
             if *table_id == id && !matches!(op, Staged::Truncate) {

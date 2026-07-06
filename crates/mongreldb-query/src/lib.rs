@@ -138,6 +138,10 @@ impl TableProvider for MongrelProvider {
             DataFusionError::External(Box::new(MongrelQueryError::Core(e)))
         };
         let mut db = self.db.lock();
+        // Enforce Select permission before any read path (count metadata,
+        // count_conditions, or full scan_cursor). On a credentialless database
+        // this is a no-op.
+        db.require_select().map_err(core_err)?;
         let snap = db.snapshot();
         let schema_ref = db.schema().clone();
 
@@ -1686,6 +1690,14 @@ impl MongrelSession {
             Some(h) => h,
             None => return Ok(None),
         };
+
+        // SQL SELECT → require Select permission on the target table.
+        if let Some(db) = &self.database {
+            db.require_table(
+                &table_name,
+                mongreldb_core::auth_state::RequiredPermission::Select,
+            )?;
+        }
 
         let mut db = handle.lock();
         let schema = db.schema().clone();

@@ -1,12 +1,12 @@
 [package]
 name = "mongreldb-client"
-version = "0.33.0"
+version = "0.34.0"
 edition = "2021"
 publish = false
 
 [dependencies]
-mongreldb-core = { path = "../mongreldb-core", version = "0.33.0" }
-mongreldb-query = { path = "../mongreldb-query", version = "0.33.0" }
+mongreldb-core = { path = "../mongreldb-core", version = "0.34.0" }
+mongreldb-query = { path = "../mongreldb-query", version = "0.34.0" }
 reqwest = { version = "0.12", features = ["blocking", "json"] }
 arrow = "58"
 serde = { version = "1", features = ["derive"] }

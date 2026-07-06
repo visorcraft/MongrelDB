@@ -372,3 +372,244 @@ fn encrypted_and_credentialed_compose() {
         Database::open_encrypted_with_credentials(&path, "passphrase", "admin", "s3cret").unwrap();
     assert!(db.require_auth_enabled());
 }
+
+// ── Phase 2: Table / Transaction / SQL enforcement ─────────────────────────
+
+/// A user with `Insert` on a table can put rows via Transaction, but cannot
+/// delete or query (no `Delete`/`Select` permission).
+#[test]
+fn transaction_put_enforces_insert_permission() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    {
+        let db = Database::create_with_credentials(&path, "admin", "admin-pw").unwrap();
+        db.create_table("orders", int_pk_schema()).unwrap();
+        db.create_user("writer", "writer-pw").unwrap();
+        db.create_role("insert_only").unwrap();
+        db.grant_permission(
+            "insert_only",
+            Permission::Insert {
+                table: "orders".into(),
+            },
+        )
+        .unwrap();
+        db.grant_role("writer", "insert_only").unwrap();
+    }
+    let db = Database::open_with_credentials(&path, "writer", "writer-pw").unwrap();
+
+    // put via Transaction → Insert allowed.
+    let mut txn = db.begin();
+    txn.put("orders", vec![(1, Value::Int64(1))]).unwrap();
+    txn.commit().unwrap();
+
+    // delete via Transaction → Delete denied.
+    let mut txn = db.begin();
+    match txn.delete("orders", mongreldb_core::RowId(1)) {
+        Err(MongrelError::PermissionDenied { .. }) => {}
+        other => panic!("expected PermissionDenied for delete, got {other:?}"),
+    }
+    txn.rollback();
+
+    // query via Table → Select denied.
+    let handle = db.table("orders").unwrap();
+    let err = handle
+        .lock()
+        .query(&mongreldb_core::query::Query::new())
+        .unwrap_err();
+    assert!(
+        matches!(err, MongrelError::PermissionDenied { .. }),
+        "got {err:?}"
+    );
+}
+
+/// A user with only `Select` can query but not put.
+#[test]
+fn table_query_enforces_select_permission() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    {
+        let db = Database::create_with_credentials(&path, "admin", "admin-pw").unwrap();
+        db.create_table("orders", int_pk_schema()).unwrap();
+        // Seed a row as admin.
+        let mut txn = db.begin();
+        txn.put("orders", vec![(1, Value::Int64(42))]).unwrap();
+        txn.commit().unwrap();
+        db.create_user("reader", "reader-pw").unwrap();
+        db.create_role("read_only").unwrap();
+        db.grant_permission(
+            "read_only",
+            Permission::Select {
+                table: "orders".into(),
+            },
+        )
+        .unwrap();
+        db.grant_role("reader", "read_only").unwrap();
+    }
+    let db = Database::open_with_credentials(&path, "reader", "reader-pw").unwrap();
+
+    // query → Select allowed.
+    let handle = db.table("orders").unwrap();
+    let rows = {
+        let mut guard = handle.lock();
+        guard.query(&mongreldb_core::query::Query::new()).unwrap()
+    };
+    assert_eq!(rows.len(), 1);
+
+    // put via Table → Insert denied.
+    let err = handle.lock().put(vec![(1, Value::Int64(99))]).unwrap_err();
+    assert!(
+        matches!(err, MongrelError::PermissionDenied { .. }),
+        "got {err:?}"
+    );
+}
+
+/// Transaction `update_many` requires `Update`; `upsert` with DoUpdate also
+/// requires `Update` on the update branch.
+#[test]
+fn transaction_update_enforces_update_permission() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    {
+        let db = Database::create_with_credentials(&path, "admin", "admin-pw").unwrap();
+        db.create_table("orders", int_pk_schema()).unwrap();
+        let mut txn = db.begin();
+        txn.put("orders", vec![(1, Value::Int64(1))]).unwrap();
+        txn.commit().unwrap();
+        db.create_user("writer", "writer-pw").unwrap();
+        db.create_role("insert_select").unwrap();
+        db.grant_permission(
+            "insert_select",
+            Permission::Insert {
+                table: "orders".into(),
+            },
+        )
+        .unwrap();
+        db.grant_permission(
+            "insert_select",
+            Permission::Select {
+                table: "orders".into(),
+            },
+        )
+        .unwrap();
+        db.grant_role("writer", "insert_select").unwrap();
+    }
+    let db = Database::open_with_credentials(&path, "writer", "writer-pw").unwrap();
+
+    // update_many → Update denied (only has Insert + Select).
+    let mut txn = db.begin();
+    let result = txn.update_many(
+        "orders",
+        vec![(mongreldb_core::RowId(1), vec![(1, Value::Int64(2))])],
+    );
+    match result {
+        Err(MongrelError::PermissionDenied { .. }) => {}
+        other => panic!("expected PermissionDenied for update_many, got {other:?}"),
+    }
+    txn.rollback();
+}
+
+/// Table::put_batch and Table::delete are enforced (direct table access path,
+/// not via Transaction).
+#[test]
+fn direct_table_access_enforces_permissions() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    {
+        let db = Database::create_with_credentials(&path, "admin", "admin-pw").unwrap();
+        db.create_table("orders", int_pk_schema()).unwrap();
+        db.create_user("reader", "reader-pw").unwrap();
+        db.create_role("read_only").unwrap();
+        db.grant_permission(
+            "read_only",
+            Permission::Select {
+                table: "orders".into(),
+            },
+        )
+        .unwrap();
+        db.grant_role("reader", "read_only").unwrap();
+    }
+    let db = Database::open_with_credentials(&path, "reader", "reader-pw").unwrap();
+
+    // Direct put on table → Insert denied.
+    let handle = db.table("orders").unwrap();
+    let err = handle.lock().put(vec![(1, Value::Int64(1))]).unwrap_err();
+    assert!(
+        matches!(err, MongrelError::PermissionDenied { .. }),
+        "got {err:?}"
+    );
+    // Direct put_batch → Insert denied.
+    let err = handle
+        .lock()
+        .put_batch(vec![vec![(1, Value::Int64(1))]])
+        .unwrap_err();
+    assert!(
+        matches!(err, MongrelError::PermissionDenied { .. }),
+        "got {err:?}"
+    );
+    // Direct truncate → Delete denied.
+    let err = handle.lock().truncate().unwrap_err();
+    assert!(
+        matches!(err, MongrelError::PermissionDenied { .. }),
+        "got {err:?}"
+    );
+}
+
+/// Admin bypass works at the Table/Transaction layer too (is_admin short-
+/// circuits all checks).
+#[test]
+fn admin_bypasses_table_and_transaction_checks() {
+    let dir = tempdir().unwrap();
+    let db = Database::create_with_credentials(dir.path(), "admin", "s3cret").unwrap();
+    db.create_table("orders", int_pk_schema()).unwrap();
+
+    // Admin can do everything via Transaction.
+    let mut txn = db.begin();
+    txn.put("orders", vec![(1, Value::Int64(1))]).unwrap();
+    txn.delete("orders", mongreldb_core::RowId(1)).unwrap();
+    txn.commit().unwrap();
+
+    // Admin can do everything via direct Table access.
+    let handle = db.table("orders").unwrap();
+    handle.lock().put(vec![(1, Value::Int64(2))]).unwrap();
+    handle
+        .lock()
+        .query(&mongreldb_core::query::Query::new())
+        .unwrap();
+    handle.lock().truncate().unwrap();
+}
+
+/// `Permission::All` satisfies all table-level operations at the Table/
+/// Transaction layer (but still not Admin, per spec §9 decision 2).
+#[test]
+fn all_permission_satisfies_all_table_operations() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    {
+        let db = Database::create_with_credentials(&path, "admin", "admin-pw").unwrap();
+        db.create_table("orders", int_pk_schema()).unwrap();
+        db.create_user("power", "power-pw").unwrap();
+        db.create_role("super").unwrap();
+        db.grant_permission("super", Permission::All).unwrap();
+        db.grant_role("power", "super").unwrap();
+    }
+    let db = Database::open_with_credentials(&path, "power", "power-pw").unwrap();
+
+    // All table-level operations succeed.
+    let mut txn = db.begin();
+    txn.put("orders", vec![(1, Value::Int64(1))]).unwrap();
+    txn.delete("orders", mongreldb_core::RowId(1)).unwrap();
+    txn.commit().unwrap();
+
+    let handle = db.table("orders").unwrap();
+    handle.lock().put(vec![(1, Value::Int64(2))]).unwrap();
+    handle
+        .lock()
+        .query(&mongreldb_core::query::Query::new())
+        .unwrap();
+
+    // But Admin operations are still denied.
+    match db.create_user("intruder", "pw") {
+        Err(MongrelError::PermissionDenied { .. }) => {}
+        other => panic!("expected PermissionDenied for create_user, got {other:?}"),
+    }
+}

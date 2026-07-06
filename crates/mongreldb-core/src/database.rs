@@ -256,6 +256,12 @@ pub struct Database {
     /// `RwLock` for `catalog` and `tables`.
     /// See `docs/auth-enforcement-spec.md`.
     principal: RwLock<Option<crate::auth::Principal>>,
+    /// Shared, cloneable handle to the auth state (require_auth flag from the
+    /// catalog + the principal). Cloned into every mounted `Table` so the
+    /// Table layer can enforce permissions without holding a reference back
+    /// to `Database` (which would create a cycle). `AuthState` is already
+    /// cheaply cloneable (inner `Arc`), so no outer `Arc` is needed.
+    auth_state: crate::auth_state::AuthState,
 }
 
 /// A data-change event published on commit (CDC / NOTIFY-LISTEN).
@@ -656,6 +662,15 @@ impl Database {
             recover_ddl_from_wal(&root, &mut cat, meta_dek.as_ref(), wal_dek.as_ref())?;
         }
 
+        // Build the shared auth state early — it's cloned into every mounted
+        // Table's SharedCtx so the Table layer can enforce permissions without
+        // a reference back to Database. The `require_auth` flag is mirrored
+        // from the catalog; `enable_auth` / `refresh_principal` update it live.
+        let auth_state = crate::auth_state::AuthState::new(cat.require_auth, principal.clone());
+        let auth_checker: Option<Arc<dyn crate::auth_state::TableAuthChecker>> = Some(Arc::new(
+            crate::auth_state::DefaultTableAuthChecker::new(auth_state.clone()),
+        ));
+
         // Open every live table against the shared context. Mounted tables have
         // no private WAL (B1) — `open_in` just loads the manifest/runs and
         // advances the shared epoch authority to its manifest epoch, so the
@@ -680,6 +695,8 @@ impl Database {
                     poisoned: Arc::clone(&poisoned),
                     txn_ids: Arc::clone(&txn_ids),
                 }),
+                table_name: Some(entry.name.clone()),
+                auth: auth_checker.clone(),
             };
             let t = Table::open_in(&tdir, ctx)?;
             tables.insert(entry.table_id, Arc::new(Mutex::new(t)));
@@ -751,6 +768,7 @@ impl Database {
                 tx
             },
             principal: RwLock::new(principal),
+            auth_state,
         })
     }
 
@@ -1209,6 +1227,17 @@ impl Database {
         self.principal.read().clone()
     }
 
+    /// Build a `TableAuthChecker` from the current auth state. Used when
+    /// mounting a new table (`create_table`) so the table inherits the
+    /// database's enforcement configuration. The checker reads the live
+    /// `require_auth` flag and cached principal, so changes via `enable_auth`
+    /// / `refresh_principal` propagate to already-mounted tables.
+    fn table_auth_checker(&self) -> Option<Arc<dyn crate::auth_state::TableAuthChecker>> {
+        Some(Arc::new(crate::auth_state::DefaultTableAuthChecker::new(
+            self.auth_state.clone(),
+        )))
+    }
+
     /// Re-resolve the cached principal from the on-disk catalog. Long-lived
     /// handles (e.g. a daemon) call this after a `REVOKE` or role change —
     /// possibly made by a different handle to the same database — to pick up
@@ -1317,6 +1346,18 @@ impl Database {
                 principal: p.username.clone(),
             })
         }
+    }
+
+    /// Convenience: enforce a table-level permission (`Select`/`Insert`/
+    /// `Update`/`Delete`) by table name. Used by the Transaction layer and
+    /// other callers that know the operation kind + table name but don't want
+    /// to construct the full `Permission` enum value themselves.
+    pub fn require_table(
+        &self,
+        table: &str,
+        perm: crate::auth_state::RequiredPermission,
+    ) -> Result<()> {
+        self.require(&perm.into_permission(table))
     }
 
     pub fn triggers(&self) -> Vec<StoredTrigger> {
@@ -3680,6 +3721,8 @@ impl Database {
                 poisoned: Arc::clone(&self.poisoned),
                 txn_ids: Arc::clone(&self.next_txn_id),
             }),
+            table_name: Some(name.to_string()),
+            auth: self.table_auth_checker(),
         };
         let table = Table::create_in(&tdir, schema.clone(), table_id, ctx)?;
 
