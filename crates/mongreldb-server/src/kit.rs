@@ -663,7 +663,7 @@ pub async fn kit_query(
     let rows = match handle.lock().query(&q) {
         Ok(r) => r,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            return (crate::status_for_error(&e), e.to_string()).into_response();
         }
     };
     let mut out: Vec<KitRow> = Vec::new();

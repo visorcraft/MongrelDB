@@ -32,6 +32,32 @@ mod kit;
 mod procedure;
 mod trigger;
 
+/// Map an engine error to the appropriate HTTP status code for defense-in-depth.
+/// Auth errors get 401/403; everything else stays 500. This ensures that even
+/// after the HTTP auth middleware lets a request through, the storage layer's
+/// permission checks surface as the right status (not a generic 500).
+fn status_for_error(e: &mongreldb_core::MongrelError) -> StatusCode {
+    use mongreldb_core::MongrelError;
+    match e {
+        MongrelError::AuthRequired | MongrelError::InvalidCredentials { .. } => {
+            StatusCode::UNAUTHORIZED
+        }
+        MongrelError::AuthNotRequired => StatusCode::BAD_REQUEST,
+        MongrelError::PermissionDenied { .. } => StatusCode::FORBIDDEN,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+/// Map a query-layer error (which wraps engine errors via `Core(...)`) to the
+/// appropriate HTTP status code.
+fn status_for_query_error(e: &mongreldb_query::MongrelQueryError) -> StatusCode {
+    use mongreldb_query::MongrelQueryError;
+    match e {
+        MongrelQueryError::Core(core) => status_for_error(core),
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
 struct AppState {
     db: Arc<Database>,
     idem: kit::IdempotencyStore,
@@ -412,7 +438,7 @@ async fn create_table(
     }
     match state.db.create_table(&req.name, schema) {
         Ok(id) => Json(json!({ "table_id": id })).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => (status_for_error(&e), e.to_string()).into_response(),
     }
 }
 
@@ -423,7 +449,7 @@ async fn list_tables(State(state): State<Arc<AppState>>) -> Json<Vec<String>> {
 async fn drop_table(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
     match state.db.drop_table(&name) {
         Ok(_) => StatusCode::OK.into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => (status_for_error(&e), e.to_string()).into_response(),
     }
 }
 
@@ -513,7 +539,7 @@ async fn put_row(
     };
     match g.put(row) {
         Ok(rid) => Json(json!({ "row_id": rid.0.to_string() })).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => (status_for_error(&e), e.to_string()).into_response(),
     }
 }
 
@@ -533,7 +559,7 @@ async fn commit(State(state): State<Arc<AppState>>, Path(name): Path<String>) ->
     let mut g = handle.lock();
     match g.commit() {
         Ok(epoch) => Json(json!({ "epoch": epoch.0 })).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => (status_for_error(&e), e.to_string()).into_response(),
     }
 }
 
@@ -548,7 +574,7 @@ async fn sql(State(state): State<Arc<AppState>>, Json(req): Json<SqlRequest>) ->
         state.external_modules.iter().cloned(),
     ) {
         Ok(s) => s,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => return (status_for_query_error(&e), e.to_string()).into_response(),
     };
     match session.run(&req.sql).await {
         Ok(batches) => {
@@ -570,7 +596,7 @@ async fn sql(State(state): State<Arc<AppState>>, Json(req): Json<SqlRequest>) ->
             )
                 .into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => (status_for_query_error(&e), e.to_string()).into_response(),
     }
 }
 
@@ -644,7 +670,7 @@ async fn txn(State(state): State<Arc<AppState>>, Json(req): Json<TxnRequest>) ->
     });
     match result {
         Ok(_) => Json(json!({ "status": "committed" })).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => (status_for_error(&e), e.to_string()).into_response(),
     }
 }
 

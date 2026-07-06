@@ -993,6 +993,72 @@ impl Database {
         })
     }
 
+    /// Open an existing database that has `require_auth = true`, verifying
+    /// the supplied credentials. Every subsequent operation on the returned
+    /// handle is checked against the authenticated principal's permissions.
+    /// Throws if the database does not require auth (use `open` instead) or
+    /// if the credentials are invalid.
+    #[napi]
+    pub fn open_with_credentials(
+        path: String,
+        username: String,
+        password: String,
+    ) -> napi::Result<Database> {
+        let db =
+            CoreDatabase::open_with_credentials(&path, &username, &password).map_err(to_napi)?;
+        Ok(Database {
+            inner: Arc::new(db),
+            path,
+            session: parking_lot::Mutex::new(None),
+        })
+    }
+
+    /// Create a fresh database with `require_auth = true` and a single admin
+    /// user. The returned handle is already authenticated as that admin.
+    #[napi(factory)]
+    pub fn create_with_credentials(
+        path: String,
+        admin_username: String,
+        admin_password: String,
+    ) -> napi::Result<Database> {
+        let db = CoreDatabase::create_with_credentials(&path, &admin_username, &admin_password)
+            .map_err(to_napi)?;
+        Ok(Database {
+            inner: Arc::new(db),
+            path,
+            session: parking_lot::Mutex::new(None),
+        })
+    }
+
+    /// Convert a credentialless database to a credentialed one in place:
+    /// creates the first admin user, sets `require_auth = true`, and caches
+    /// the admin principal on this handle. After this call, the database can
+    /// only be reopened via `openWithCredentials`.
+    #[napi]
+    pub fn enable_auth(
+        &self,
+        admin_username: String,
+        admin_password: String,
+    ) -> napi::Result<()> {
+        self.inner
+            .enable_auth(&admin_username, &admin_password)
+            .map_err(to_napi)
+    }
+
+    /// Returns `true` if this database has `require_auth = true`.
+    #[napi]
+    pub fn require_auth_enabled(&self) -> bool {
+        self.inner.require_auth_enabled()
+    }
+
+    /// Re-resolve the cached principal from the on-disk catalog, picking up
+    /// role/permission changes made by other handles. No-op on credentialless
+    /// databases.
+    #[napi]
+    pub fn refresh_principal(&self) -> napi::Result<()> {
+        self.inner.refresh_principal().map_err(to_napi)
+    }
+
     /// Create a new table with the given schema.
     #[napi]
     pub fn create_table(&self, name: String, schema: SchemaSpec) -> napi::Result<BigInt> {
@@ -1616,6 +1682,50 @@ impl Database {
     #[napi]
     pub fn open_encrypted(path: String, passphrase: String) -> napi::Result<Database> {
         let db = CoreDatabase::open_encrypted(&path, &passphrase).map_err(to_napi)?;
+        Ok(Database {
+            inner: Arc::new(db),
+            path,
+            session: parking_lot::Mutex::new(None),
+        })
+    }
+
+    /// Open an existing encrypted database that has `require_auth = true`,
+    /// combining the encryption passphrase with credential verification.
+    #[napi]
+    pub fn open_encrypted_with_credentials(
+        path: String,
+        passphrase: String,
+        username: String,
+        password: String,
+    ) -> napi::Result<Database> {
+        let db = CoreDatabase::open_encrypted_with_credentials(
+            &path, &passphrase, &username, &password,
+        )
+        .map_err(to_napi)?;
+        Ok(Database {
+            inner: Arc::new(db),
+            path,
+            session: parking_lot::Mutex::new(None),
+        })
+    }
+
+    /// Create a fresh encrypted database with `require_auth = true` and a
+    /// single admin user. Composes encryption-at-rest with credential
+    /// enforcement.
+    #[napi(factory)]
+    pub fn create_encrypted_with_credentials(
+        path: String,
+        passphrase: String,
+        admin_username: String,
+        admin_password: String,
+    ) -> napi::Result<Database> {
+        let db = CoreDatabase::create_encrypted_with_credentials(
+            &path,
+            &passphrase,
+            &admin_username,
+            &admin_password,
+        )
+        .map_err(to_napi)?;
         Ok(Database {
             inner: Arc::new(db),
             path,

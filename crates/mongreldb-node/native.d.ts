@@ -240,6 +240,34 @@ export declare class Database {
   static withPath(path: string): Database
   /** Open an existing database from disk. */
   static open(path: string): Database
+  /**
+   * Open an existing database that has `require_auth = true`, verifying
+   * the supplied credentials. Every subsequent operation on the returned
+   * handle is checked against the authenticated principal's permissions.
+   * Throws if the database does not require auth (use `open` instead) or
+   * if the credentials are invalid.
+   */
+  static openWithCredentials(path: string, username: string, password: string): Database
+  /**
+   * Create a fresh database with `require_auth = true` and a single admin
+   * user. The returned handle is already authenticated as that admin.
+   */
+  static createWithCredentials(path: string, adminUsername: string, adminPassword: string): Database
+  /**
+   * Convert a credentialless database to a credentialed one in place:
+   * creates the first admin user, sets `require_auth = true`, and caches
+   * the admin principal on this handle. After this call, the database can
+   * only be reopened via `openWithCredentials`.
+   */
+  enableAuth(adminUsername: string, adminPassword: string): void
+  /** Returns `true` if this database has `require_auth = true`. */
+  requireAuthEnabled(): boolean
+  /**
+   * Re-resolve the cached principal from the on-disk catalog, picking up
+   * role/permission changes made by other handles. No-op on credentialless
+   * databases.
+   */
+  refreshPrincipal(): void
   /** Create a new table with the given schema. */
   createTable(name: string, schema: SchemaSpec): bigint
   /** Drop a table by name. */
@@ -385,6 +413,17 @@ export declare class Database {
   static createEncrypted(path: string, passphrase: string): Database
   /** Open an existing encrypted database with its passphrase. */
   static openEncrypted(path: string, passphrase: string): Database
+  /**
+   * Open an existing encrypted database that has `require_auth = true`,
+   * combining the encryption passphrase with credential verification.
+   */
+  static openEncryptedWithCredentials(path: string, passphrase: string, username: string, password: string): Database
+  /**
+   * Create a fresh encrypted database with `require_auth = true` and a
+   * single admin user. Composes encryption-at-rest with credential
+   * enforcement.
+   */
+  static createEncryptedWithCredentials(path: string, passphrase: string, adminUsername: string, adminPassword: string): Database
 }
 /** A handle to one table inside a [`Database`]. */
 export declare class TableHandle {
