@@ -7,7 +7,7 @@
 <p align="center">
   <b>A log-structured columnar database for sub-millisecond writes, learned indexes, and AI-native access.</b>
   <br />
-  Custom <code>.sr</code> columnar format · Bε-tree memtable · WAL with group commit · eight index kinds · hybrid pushdown · MVCC snapshots · page-level encryption · declarative constraints · DataFusion SQL · NAPI addon
+  Custom <code>.sr</code> columnar format · Bε-tree memtable · WAL with group commit · eight index kinds · hybrid pushdown · MVCC snapshots · page-level encryption · declarative constraints · user/role auth · replication · change data capture · DataFusion SQL · NAPI addon
 </p>
 
 <p align="center">
@@ -71,7 +71,7 @@ Measured on 1M rows, dev sandbox (full results in [`BENCHMARKS.md`](BENCHMARKS.m
 | `COUNT(*)` metadata | **0 µs** (O(1)) |
 | AES-256-GCM encrypt/decrypt | **~1.88 GiB/s** |
 
-**Cross-engine (1M rows, v0.31.1):** single-row writes **1.8× faster than SQLite, 37× faster than DuckDB**.
+**Cross-engine (1M rows, latest):** single-row writes **1.8× faster than SQLite, 37× faster than DuckDB**.
 Bulk insert **2.3× faster than SQLite, 2.6× faster than DuckDB native**. Join
 `COUNT(*)` **3.4× faster than DuckDB, 19× faster than SQLite**.
 
@@ -123,6 +123,13 @@ Bulk insert **2.3× faster than SQLite, 2.6× faster than DuckDB native**. Join
   multi-table `Database` warm for multi-process access, over SQL/native routes
   and a typed Kit API (`/kit/schema`, `/kit/txn`, `/kit/query`,
   `/kit/create_table`). `mongreldb-client` + NAPI `RemoteDatabase` connect to it.
+- **Authentication:** `CREATE USER` / `CREATE ROLE` / `GRANT` / `REVOKE` with
+  Argon2id password hashing. Daemon supports Bearer token (`--auth-token`) and
+  HTTP Basic auth (`--auth-users`). Connection pooling via `--max-connections`.
+- **Replication:** `GET /wal/stream` streams committed WAL records; the
+  `ReplicationFollower` client applies them to a local copy for read scaling.
+- **Change data capture:** `NOTIFY` / `LISTEN` SQL commands + `GET /events`
+  SSE endpoint for real-time change notifications.
 - **GC / check / doctor:** Orphan run + stale WAL + stale shadow cleanup;
   footer checksum verification; best-effort repair.
 
