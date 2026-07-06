@@ -4042,9 +4042,8 @@ fn core_value_json(value: &Value) -> serde_json::Value {
             let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
             serde_json::Value::String(hex)
         }
-        Value::Json(b) => serde_json::from_slice(b).unwrap_or_else(|_| {
-            serde_json::Value::String(String::from_utf8_lossy(b).into_owned())
-        }),
+        Value::Json(b) => serde_json::from_slice(b)
+            .unwrap_or_else(|_| serde_json::Value::String(String::from_utf8_lossy(b).into_owned())),
     }
 }
 

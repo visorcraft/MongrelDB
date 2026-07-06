@@ -367,6 +367,9 @@ fn type_name(ty: mongreldb_core::schema::TypeId) -> &'static str {
         Time64 => "time64",
         Interval => "interval",
         Decimal128 { .. } => "decimal128",
+        Uuid => "uuid",
+        Json => "json",
+        Array { .. } => "array",
     }
 }
 
@@ -1086,6 +1089,7 @@ pub(crate) fn value_to_json(v: &Value) -> Jval {
             Jval::Array(arr)
         }
         Value::Decimal(d) => Jval::String(d.to_string()),
+        Value::Uuid(_) | Value::Json(_) => Jval::Null,
         Value::Interval { .. } => Jval::Null,
     }
 }

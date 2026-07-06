@@ -1,6 +1,6 @@
 [package]
 name = "mongreldb-server"
-version = "0.30.2"
+version = "0.31.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "HTTP daemon for MongrelDB — serves SQL, native queries, and typed Kit API over HTTP for multi-process access."
@@ -15,8 +15,8 @@ name = "mongreldb_server"
 path = "src/lib.rs"
 
 [dependencies]
-mongreldb-core = { path = "../mongreldb-core", version = "0.30.2", features = ["encryption"] }
-mongreldb-query = { path = "../mongreldb-query", version = "0.30.2" }
+mongreldb-core = { path = "../mongreldb-core", version = "0.31.0", features = ["encryption"] }
+mongreldb-query = { path = "../mongreldb-query", version = "0.31.0" }
 axum = "0.8"
 tower = { version = "0.5", features = ["limit"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
