@@ -1607,8 +1607,7 @@ impl MongrelSession {
     /// the raw SQL via the vendored `sqlparser` AST and serve it straight from
     /// the native column cursor, **bypassing DataFusion parse+plan+optimize**.
     /// Returns `Ok(None)` (→ fall through to `ctx.sql()`) for any shape it
-    /// cannot serve *exactly*, or on any parse error. See the design doc at
-    /// `docs/superpowers/plans/2026-07-02-direct-sql-dispatch.md`.
+    /// cannot serve *exactly*, or on any parse error.
     fn try_direct_dispatch(&self, sql: &str) -> Result<Option<Vec<RecordBatch>>> {
         use arrow::array::ArrayRef;
         use mongreldb_core::Condition;
