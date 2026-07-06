@@ -62,6 +62,14 @@ pub(crate) async fn try_run_command(
     }
 
     let lower = trimmed.to_ascii_lowercase();
+
+    // WITH RECURSIVE — DataFusion v54's recursive CTE support is incomplete
+    // (it mis-handles column aliases on the base case). Intercept and evaluate
+    // iteratively using the standard naive recursive-evaluation algorithm.
+    if lower.starts_with("with recursive ") {
+        return try_recursive_cte(session, trimmed).await;
+    }
+
     if let Some(batch) = try_manual_command(session, trimmed, &lower)? {
         return Ok(Some(batch));
     }
@@ -72,9 +80,12 @@ pub(crate) async fn try_run_command(
     let dialect = GenericDialect {};
     let statements = Parser::parse_sql(&dialect, trimmed)
         .map_err(|e| MongrelQueryError::Schema(format!("SQL parse error: {e}")))?;
+
+    // Single-statement dispatch (multi-statement is handled by run() before
+    // reaching this point).
     if statements.len() != 1 {
         return Err(MongrelQueryError::Schema(
-            "only one statement may be executed at a time".into(),
+            "expected exactly one statement".into(),
         ));
     }
 
@@ -84,7 +95,7 @@ pub(crate) async fn try_run_command(
 
     let out = match statements.into_iter().next().unwrap() {
         Statement::CreateTable(create) => {
-            create_table(session, db, create)?;
+            create_table(session, db, &create).await?;
             Vec::new()
         }
         Statement::CreateVirtualTable {
@@ -147,7 +158,7 @@ pub(crate) async fn try_run_command(
             Vec::new()
         }
         Statement::CreateView(view) => {
-            create_view(session, view)?;
+            create_view(session, view).await?;
             Vec::new()
         }
         Statement::Insert(insert) => {
@@ -759,21 +770,254 @@ fn parse_detach_alias(lower_rest: &str) -> Result<String> {
     Ok(alias)
 }
 
-fn create_table(session: &MongrelSession, db: &Arc<Database>, create: CreateTable) -> Result<()> {
+async fn create_table(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    create: &CreateTable,
+) -> Result<()> {
     let name = object_name(&create.name)?;
     if create.if_not_exists && db.table_id(&name).is_ok() {
         return Ok(());
     }
-    if create.query.is_some() {
-        return Err(MongrelQueryError::Schema(
-            "CREATE TABLE AS SELECT is not supported by MongrelDB SQL DDL".into(),
-        ));
+
+    // CREATE TABLE AS SELECT — execute the query, infer the schema from the
+    // result, create the table, and bulk-insert the rows.
+    if let Some(query) = create.query.as_deref() {
+        return create_table_as_select(session, db, &name, query).await;
     }
-    let schema = schema_from_create_table(&create)?;
+
+    let schema = schema_from_create_table(create)?;
     db.create_table(&name, schema)?;
     register_table(session, db, &name)?;
     session.clear_cache();
     Ok(())
+}
+
+/// Execute `CREATE TABLE name AS SELECT ...`: run the inner query, infer the
+/// table schema from the Arrow result, create the table, and insert all rows.
+fn create_table_as_select<'a>(
+    session: &'a MongrelSession,
+    db: &'a Arc<Database>,
+    table_name: &'a str,
+    query: &'a sqlparser::ast::Query,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+    let select_sql = format!("SELECT * FROM ({}) AS ctas_source", query.to_string());
+    Box::pin(async move {
+        let batches = Box::pin(session.run(&select_sql))
+            .await
+            .map_err(MongrelQueryError::from)?;
+
+        if batches.is_empty() {
+            return Err(MongrelQueryError::Schema(
+                "CREATE TABLE AS SELECT produced no result (cannot infer schema)".into(),
+            ));
+        }
+        let arrow_schema = batches[0].schema();
+
+        // Build a MongrelDB Schema from the Arrow fields.
+        use mongreldb_core::schema::{
+            ColumnDef as CoreColumnDef, ColumnFlags, Schema as CoreSchema, TypeId,
+        };
+        let mut columns = Vec::new();
+        for (i, field) in arrow_schema.fields().iter().enumerate() {
+            let ty = arrow_data_type_to_type_id(field.data_type())?;
+            columns.push(CoreColumnDef {
+                id: (i + 1) as u16,
+                name: field.name().clone(),
+                ty,
+                flags: if i == 0 {
+                    ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY)
+                } else {
+                    ColumnFlags::empty().with(ColumnFlags::NULLABLE)
+                },
+            });
+        }
+
+        let schema = CoreSchema {
+            schema_id: 0,
+            columns,
+            indexes: vec![],
+            colocation: vec![],
+            constraints: Default::default(),
+            clustered: false,
+        };
+
+        db.create_table(table_name, schema)?;
+        register_table(session, db, table_name)?;
+
+        // Bulk-insert all rows from the result batches.
+        let handle = db.table(table_name)?;
+        let mut txn = db.begin();
+        for batch in &batches {
+            let col_count = batch.num_columns();
+            for row_idx in 0..batch.num_rows() {
+                let mut cells = Vec::with_capacity(col_count);
+                for (col_idx, col) in batch.columns().iter().enumerate() {
+                    let value = arrow_cell_to_value(col, row_idx)?;
+                    cells.push(((col_idx + 1) as u16, value));
+                }
+                txn.put(table_name, cells)?;
+            }
+        }
+        txn.commit()?;
+        session.clear_cache();
+        Ok(())
+    })
+}
+
+/// Map an Arrow `DataType` to a MongrelDB `TypeId`.
+fn arrow_data_type_to_type_id(dt: &arrow::datatypes::DataType) -> Result<TypeId> {
+    use arrow::datatypes::DataType;
+    Ok(match dt {
+        DataType::Boolean => TypeId::Bool,
+        DataType::Int8 => TypeId::Int8,
+        DataType::Int16 => TypeId::Int16,
+        DataType::Int32 => TypeId::Int32,
+        DataType::Int64 => TypeId::Int64,
+        DataType::UInt8 => TypeId::UInt8,
+        DataType::UInt16 => TypeId::UInt16,
+        DataType::UInt32 => TypeId::UInt32,
+        DataType::UInt64 => TypeId::UInt64,
+        DataType::Float32 => TypeId::Float32,
+        DataType::Float64 => TypeId::Float64,
+        DataType::Utf8 | DataType::LargeUtf8 => TypeId::Bytes,
+        DataType::Binary | DataType::LargeBinary => TypeId::Bytes,
+        DataType::Date32 => TypeId::Date32,
+        DataType::Date64 => TypeId::Date64,
+        DataType::Timestamp(_, _) => TypeId::TimestampNanos,
+        _ => {
+            return Err(MongrelQueryError::Schema(format!(
+                "CREATE TABLE AS SELECT does not support Arrow type {dt:?}"
+            )))
+        }
+    })
+}
+
+/// Extract a MongrelDB `Value` from an Arrow array cell at `row_idx`.
+fn arrow_cell_to_value(
+    array: &std::sync::Arc<dyn arrow::array::Array>,
+    row_idx: usize,
+) -> Result<Value> {
+    use arrow::array::*;
+    if array.is_null(row_idx) {
+        return Ok(Value::Null);
+    }
+    Ok(match array.data_type() {
+        arrow::datatypes::DataType::Boolean => Value::Bool(
+            array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap()
+                .value(row_idx),
+        ),
+        arrow::datatypes::DataType::Int8 => Value::Int64(
+            array
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .unwrap()
+                .value(row_idx) as i64,
+        ),
+        arrow::datatypes::DataType::Int16 => Value::Int64(
+            array
+                .as_any()
+                .downcast_ref::<Int16Array>()
+                .unwrap()
+                .value(row_idx) as i64,
+        ),
+        arrow::datatypes::DataType::Int32 => Value::Int64(
+            array
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(row_idx) as i64,
+        ),
+        arrow::datatypes::DataType::Int64 => Value::Int64(
+            array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(row_idx),
+        ),
+        arrow::datatypes::DataType::UInt8 => Value::Int64(
+            array
+                .as_any()
+                .downcast_ref::<UInt8Array>()
+                .unwrap()
+                .value(row_idx) as i64,
+        ),
+        arrow::datatypes::DataType::UInt16 => Value::Int64(
+            array
+                .as_any()
+                .downcast_ref::<UInt16Array>()
+                .unwrap()
+                .value(row_idx) as i64,
+        ),
+        arrow::datatypes::DataType::UInt32 => Value::Int64(
+            array
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .unwrap()
+                .value(row_idx) as i64,
+        ),
+        arrow::datatypes::DataType::UInt64 => Value::Int64(
+            array
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .value(row_idx) as i64,
+        ),
+        arrow::datatypes::DataType::Float32 => Value::Float64(
+            array
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap()
+                .value(row_idx) as f64,
+        ),
+        arrow::datatypes::DataType::Float64 => Value::Float64(
+            array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(row_idx),
+        ),
+        arrow::datatypes::DataType::Utf8 | arrow::datatypes::DataType::LargeUtf8 => Value::Bytes(
+            array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .or_else(|| {
+                    array
+                        .as_any()
+                        .downcast_ref::<LargeStringArray>()
+                        .map(|a| a as &dyn std::any::Any)
+                        .and_then(|a| a.downcast_ref::<StringArray>())
+                })
+                .ok_or_else(|| MongrelQueryError::Arrow("expected StringArray".into()))?
+                .value(row_idx)
+                .as_bytes()
+                .to_vec(),
+        ),
+        arrow::datatypes::DataType::Binary => Value::Bytes(
+            array
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap()
+                .value(row_idx)
+                .to_vec(),
+        ),
+        arrow::datatypes::DataType::LargeBinary => Value::Bytes(
+            array
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .unwrap()
+                .value(row_idx)
+                .to_vec(),
+        ),
+        other => {
+            return Err(MongrelQueryError::Schema(format!(
+                "CTAS does not support value extraction from Arrow type {other:?}"
+            )))
+        }
+    })
 }
 
 fn create_virtual_table_manual(
@@ -1783,13 +2027,45 @@ fn trigger_value_from_sql(
     }
 }
 
-fn create_view(session: &MongrelSession, view: CreateView) -> Result<()> {
-    if view.materialized {
-        return Err(MongrelQueryError::Schema(
-            "CREATE MATERIALIZED VIEW is not supported; use CREATE VIEW".into(),
-        ));
-    }
+async fn create_view(session: &MongrelSession, view: CreateView) -> Result<()> {
     let name = object_name(&view.name)?;
+
+    if view.materialized {
+        // CREATE MATERIALIZED VIEW — physically materialize the query result as
+        // a table (like CTAS). The defining SQL is registered as a regular view
+        // so `REFRESH MATERIALIZED VIEW name` can re-execute it.
+        let Some(db) = &session.database else {
+            return Err(MongrelQueryError::Schema(
+                "CREATE MATERIALIZED VIEW requires a Database".into(),
+            ));
+        };
+        // Drop the existing table if IF NOT EXISTS is set and it already exists.
+        if view.if_not_exists && db.table_id(&name).is_ok() {
+            return Ok(());
+        }
+        if db.table_id(&name).is_ok() {
+            return Err(MongrelQueryError::Schema(format!(
+                "table or materialized view {name:?} already exists"
+            )));
+        }
+        // Store the view definition for REFRESH.
+        session.create_view_with_schema(
+            &name,
+            &view.query.to_string(),
+            mongreldb_core::schema::Schema {
+                schema_id: 0,
+                columns: vec![],
+                indexes: vec![],
+                colocation: vec![],
+                constraints: Default::default(),
+                clustered: false,
+            },
+            std::collections::HashMap::new(),
+        );
+        // Materialize: execute the query and create a physical table.
+        return create_table_as_select(session, db, &name, &view.query).await;
+    }
+
     let (schema, input_types) = view_schema_from_columns(&view.columns)?;
     session.create_view_with_schema(&name, &view.query.to_string(), schema, input_types);
     Ok(())
@@ -5412,4 +5688,223 @@ fn strings_batch(name: &str, values: Vec<String>) -> Result<RecordBatch> {
 
 fn json_batch(name: &str, values: Vec<String>) -> Result<RecordBatch> {
     strings_batch(name, values)
+}
+
+// ── Recursive CTE evaluation ───────────────────────────────────────────────
+
+/// Evaluate a `WITH RECURSIVE` CTE using the standard naive algorithm:
+///
+/// 1. Execute the base (non-recursive) query.
+/// 2. Register the result as a temp table named after the CTE.
+/// 3. Repeatedly execute the recursive arm (which references the CTE name),
+///    appending new rows to the temp table, until no new rows are produced.
+/// 4. Execute the outer query against the final temp table.
+///
+/// DataFusion v54's built-in recursive CTE support has a column-alias bug, so
+/// we intercept and evaluate ourselves before DataFusion sees the query.
+async fn try_recursive_cte(
+    session: &MongrelSession,
+    sql: &str,
+) -> Result<Option<Vec<RecordBatch>>> {
+    use sqlparser::ast::{SetExpr, Statement};
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::parser::Parser;
+
+    let statements = Parser::parse_sql(&PostgreSqlDialect {}, sql)
+        .map_err(|e| MongrelQueryError::Schema(format!("recursive CTE parse error: {e}")))?;
+    if statements.len() != 1 {
+        return Err(MongrelQueryError::Schema(
+            "recursive CTE requires exactly one statement".into(),
+        ));
+    }
+
+    let Statement::Query(query) = statements.into_iter().next().unwrap() else {
+        return Ok(None);
+    };
+
+    let with = query
+        .with
+        .as_ref()
+        .ok_or_else(|| MongrelQueryError::Schema("expected WITH RECURSIVE".into()))?;
+    if !with.recursive {
+        return Ok(None);
+    }
+    if with.cte_tables.len() != 1 {
+        return Err(MongrelQueryError::Schema(
+            "only a single recursive CTE is supported".into(),
+        ));
+    }
+
+    let cte = &with.cte_tables[0];
+    let cte_name = cte.alias.name.to_string();
+    let cte_body = &*cte.query.body;
+
+    // Extract the CTE's declared column names (e.g. `counter(n)` → ["n"]).
+    // These are used to rename the temp table's columns so the recursive arm
+    // can reference them by name (DataFusion doesn't propagate CTE column aliases).
+    let cte_col_names: Vec<String> = cte
+        .alias
+        .columns
+        .iter()
+        .map(|c| c.name.value.clone())
+        .collect();
+
+    // Extract base + recursive queries from the UNION [ALL] set operation.
+    let (base_sql, recursive_sql, union_all) = match cte_body {
+        SetExpr::SetOperation {
+            op,
+            set_quantifier,
+            left,
+            right,
+            ..
+        } => {
+            if !matches!(op, sqlparser::ast::SetOperator::Union) {
+                return Err(MongrelQueryError::Schema(
+                    "recursive CTE supports UNION only".into(),
+                ));
+            }
+            let is_all = matches!(set_quantifier, sqlparser::ast::SetQuantifier::All);
+            let base_sql = format!("SELECT * FROM ({}) AS base", left.to_string());
+            let recursive_sql = format!("SELECT * FROM ({}) AS recur", right.to_string());
+            (base_sql, recursive_sql, is_all)
+        }
+        _ => {
+            return Err(MongrelQueryError::Schema(
+                "recursive CTE body must be a UNION set operation".into(),
+            ));
+        }
+    };
+
+    // 1. Execute the base query.
+    let base_batches = Box::pin(session.run(&base_sql)).await?;
+    if base_batches.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+
+    let schema = base_batches[0].schema();
+
+    // Rename the batch columns to match the CTE's declared column names so the
+    // recursive arm can reference them by name (e.g. `n` instead of `"Int64(1)"`).
+    let renamed_schema =
+        if !cte_col_names.is_empty() && cte_col_names.len() == schema.fields().len() {
+            let new_fields: Vec<_> = schema
+                .fields()
+                .iter()
+                .enumerate()
+                .map(|(i, f)| {
+                    arrow::datatypes::Field::new(
+                        &cte_col_names[i],
+                        f.data_type().clone(),
+                        f.is_nullable(),
+                    )
+                })
+                .collect();
+            std::sync::Arc::new(arrow::datatypes::Schema::new(new_fields))
+        } else {
+            schema.clone()
+        };
+
+    // Re-cast each base batch with the renamed schema.
+    let all_batches: Vec<RecordBatch> = base_batches
+        .iter()
+        .map(|b| {
+            RecordBatch::try_new(renamed_schema.clone(), b.columns().to_vec())
+                .map_err(|e| MongrelQueryError::Arrow(e.to_string()))
+        })
+        .collect::<Result<_>>()?;
+
+    let mut all_batches = all_batches;
+
+    // Register initial result under the CTE name.
+    let merged = arrow::compute::concat_batches(&renamed_schema, &all_batches)
+        .map_err(|e| MongrelQueryError::Arrow(e.to_string()))?;
+    let _ = session.ctx.register_batch(&cte_name, merged.clone());
+
+    // 2. Iteratively execute the recursive arm using the semi-naive
+    //    (delta-only) algorithm: each iteration evaluates the recursive arm
+    //    against only the NEW rows from the previous iteration (the "delta"),
+    //    not the full accumulated table. This avoids infinite recursion with
+    //    UNION ALL and is the standard evaluation strategy.
+    let max_iterations = 10_000;
+    let mut delta_merged = merged.clone();
+    for iteration in 0..max_iterations {
+        // Register ONLY the delta (new rows) as the CTE name, so the recursive
+        // arm sees only the rows added in the previous iteration.
+        // Deregister first to ensure DataFusion drops any cached scan plan.
+        let _ = session.ctx.deregister_table(&cte_name);
+        let _ = session.ctx.register_batch(&cte_name, delta_merged.clone());
+        session.clear_cache();
+        session.plan_cache.lock().clear();
+
+        let new_batches = Box::pin(session.run(&recursive_sql)).await?;
+        let new_rows: usize = new_batches.iter().map(|b| b.num_rows()).sum();
+        if new_rows == 0 {
+            break;
+        }
+
+        // Re-cast new batches to the CTE's renamed schema.
+        let recast_batches: Vec<RecordBatch> = new_batches
+            .iter()
+            .map(|b| {
+                RecordBatch::try_new(renamed_schema.clone(), b.columns().to_vec())
+                    .map_err(|e| MongrelQueryError::Arrow(e.to_string()))
+            })
+            .collect::<Result<_>>()?;
+
+        // The new delta is the recast batches from this iteration.
+        delta_merged = arrow::compute::concat_batches(&renamed_schema, &recast_batches)
+            .map_err(|e| MongrelQueryError::Arrow(e.to_string()))?;
+
+        // Accumulate into all_batches.
+        all_batches.extend(recast_batches);
+    }
+
+    // Register the full accumulated result as the CTE name for the outer query.
+    let full_merged = arrow::compute::concat_batches(&renamed_schema, &all_batches)
+        .map_err(|e| MongrelQueryError::Arrow(e.to_string()))?;
+    let _ = session.ctx.deregister_table(&cte_name);
+    let _ = session.ctx.register_batch(&cte_name, full_merged);
+
+    // Clear caches so the outer query sees the freshly registered CTE table.
+    session.clear_cache();
+    session.plan_cache.lock().clear();
+
+    // 3. Execute the outer query (after the CTE definition).
+    let outer_select = extract_outer_query(sql)?;
+    let result = Box::pin(session.run(&outer_select)).await?;
+    Ok(Some(result))
+}
+
+/// Extract the outer query from a WITH RECURSIVE statement.
+/// Given `WITH RECURSIVE name(cols) AS (...) <outer>`, return `<outer>`.
+fn extract_outer_query(sql: &str) -> Result<String> {
+    // Find the matching closing parenthesis for the CTE's AS (...).
+    // Strategy: scan for "AS (" (case-insensitive), then track depth.
+    let lower = sql.to_ascii_lowercase();
+    let as_pos = lower.find(" as (").ok_or_else(|| {
+        MongrelQueryError::Schema("could not find 'AS (' in recursive CTE".into())
+    })?;
+    let paren_start = as_pos + 4; // position of the '('
+    let mut depth = 0i32;
+    let mut paren_end = paren_start;
+    for (i, c) in sql[paren_start..].char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    paren_end = paren_start + i + 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let outer = sql[paren_end..].trim().trim_end_matches(';').trim();
+    if outer.is_empty() {
+        return Err(MongrelQueryError::Schema(
+            "recursive CTE requires an outer query".into(),
+        ));
+    }
+    Ok(outer.to_string())
 }

@@ -1797,8 +1797,52 @@ impl MongrelSession {
         if let Some(inner) = strip_explain_query_plan(sql) {
             return self.explain_query_plan(inner).await;
         }
+
+        // Multi-statement support: if the SQL contains semicolons, first try
+        // to split into individual statements. This must happen BEFORE command
+        // dispatch because `try_run_command` would fail on multi-statement SQL.
+        // But CREATE TRIGGER bodies contain semicolons inside BEGIN...END, so
+        // we only split if the first semicolon is NOT inside a BEGIN...END block.
+        let trimmed = sql.trim();
+        if trimmed.contains(';') && !is_trigger_body(trimmed) {
+            let stmts = split_sql_statements(trimmed);
+            if stmts.len() > 1 {
+                let mut last = Vec::new();
+                for stmt in &stmts {
+                    let stmt = stmt.trim();
+                    if stmt.is_empty() {
+                        continue;
+                    }
+                    last = Box::pin(self.run(stmt)).await?;
+                }
+                return Ok(last);
+            }
+        }
+
+        // Try command dispatch (handles DDL/DML/triggers/views/etc.).
         if let Some(batches) = commands::try_run_command(self, sql).await? {
             return Ok(batches);
+        }
+
+        // Multi-statement support: if the SQL wasn't handled as a single
+        // command and contains semicolons, split into individual statements
+        // and execute each sequentially. This catches `SELECT 1; SELECT 2`
+        // style multi-statement queries. Commands with semicolons in their
+        // bodies (CREATE TRIGGER ... BEGIN ... END;) are handled above.
+        let trimmed = sql.trim();
+        if trimmed.contains(';') {
+            let stmts = split_sql_statements(trimmed);
+            if stmts.len() > 1 {
+                let mut last = Vec::new();
+                for stmt in &stmts {
+                    let stmt = stmt.trim();
+                    if stmt.is_empty() {
+                        continue;
+                    }
+                    last = Box::pin(self.run(stmt)).await?;
+                }
+                return Ok(last);
+            }
         }
         // P4.2: intercept DDL when a Database is attached.
         let lower = sql.trim_start().to_lowercase();
@@ -2364,10 +2408,148 @@ fn register_mongrel_functions(
     ctx.register_udf(ScalarUDF::from(udf::AnnSearchUdf::new()));
     ctx.register_udf(ScalarUDF::from(udf::SparseMatchUdf::new()));
     ctx.register_udf(ScalarUDF::from(udf::RTreeIntersectsUdf::new()));
+    ctx.register_udf(ScalarUDF::from(udf::FtsRankUdf::new()));
     for udaf in percentile::percentile_udafs() {
         ctx.register_udaf(udaf);
     }
     extended_sql_functions::register_extended_sql_functions_with_state(ctx, sql_fn_state);
+}
+
+/// Check if the SQL is a CREATE TRIGGER statement with a BEGIN...END body.
+/// These contain semicolons inside the body that must NOT be split.
+fn is_trigger_body(sql: &str) -> bool {
+    let lower = sql.to_ascii_lowercase();
+    if !lower.contains("create trigger") && !lower.contains("create or replace trigger") {
+        return false;
+    }
+    lower.contains("begin") && lower.contains("end")
+}
+
+/// Split a SQL string into individual statements on semicolons, respecting
+/// single-quoted strings (`'...'`), double-quoted identifiers (`"..."`),
+/// dollar-quoting (`$$...$$` or `$tag$...$tag$`), and line/block comments.
+/// A trailing semicolon is not an empty statement.
+fn split_sql_statements(sql: &str) -> Vec<String> {
+    let b = sql.as_bytes();
+    let n = b.len();
+    let mut stmts = Vec::new();
+    let mut current = String::new();
+    let mut i = 0;
+    while i < n {
+        let c = b[i];
+        // Line comment: skip to end of line.
+        if c == b'-' && i + 1 < n && b[i + 1] == b'-' {
+            while i < n && b[i] != b'\n' {
+                current.push(c as char);
+                i += 1;
+            }
+            continue;
+        }
+        // Block comment: skip to matching close.
+        if c == b'/' && i + 1 < n && b[i + 1] == b'*' {
+            current.push_str("/*");
+            i += 2;
+            let mut depth = 1;
+            while i + 1 < n && depth > 0 {
+                if b[i] == b'/' && b[i + 1] == b'*' {
+                    depth += 1;
+                    current.push_str("/*");
+                    i += 2;
+                } else if b[i] == b'*' && b[i + 1] == b'/' {
+                    depth -= 1;
+                    current.push_str("*/");
+                    i += 2;
+                } else {
+                    current.push(b[i] as char);
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        // Single-quoted string.
+        if c == b'\'' {
+            current.push('\'');
+            i += 1;
+            while i < n {
+                current.push(b[i] as char);
+                if b[i] == b'\'' {
+                    // Check for doubled quote escape.
+                    if i + 1 < n && b[i + 1] == b'\'' {
+                        current.push('\'');
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        // Double-quoted identifier.
+        if c == b'"' {
+            current.push('"');
+            i += 1;
+            while i < n {
+                current.push(b[i] as char);
+                if b[i] == b'"' {
+                    if i + 1 < n && b[i + 1] == b'"' {
+                        current.push('"');
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        // Dollar-quoting: $tag$ ... $tag$
+        if c == b'$' {
+            // Try to read a dollar-quote opener.
+            let start = i;
+            let mut tag_end = i + 1;
+            while tag_end < n && b[tag_end] != b'$' && b[tag_end].is_ascii_alphanumeric() {
+                tag_end += 1;
+            }
+            if tag_end < n && b[tag_end] == b'$' {
+                let tag = &sql[start..=tag_end];
+                current.push_str(tag);
+                i = tag_end + 1;
+                // Find the closing tag.
+                while i < n {
+                    if b[i] == b'$' && sql[i..].starts_with(tag) {
+                        current.push_str(tag);
+                        i += tag.len();
+                        break;
+                    }
+                    current.push(b[i] as char);
+                    i += 1;
+                }
+                continue;
+            }
+        }
+        // Semicolon — statement boundary.
+        if c == b';' {
+            current.push(';');
+            let trimmed = current.trim();
+            if !trimmed.is_empty() && trimmed != ";" {
+                stmts.push(current.clone());
+            }
+            current.clear();
+            i += 1;
+            continue;
+        }
+        current.push(c as char);
+        i += 1;
+    }
+    // Trailing content without a semicolon.
+    let trimmed = current.trim();
+    if !trimmed.is_empty() {
+        stmts.push(current);
+    }
+    stmts
 }
 
 fn strip_explain_query_plan(sql: &str) -> Option<&str> {
