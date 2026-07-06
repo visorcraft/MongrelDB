@@ -11,7 +11,7 @@
 //! lets the daemon (or any future multi-tenant layer) provide its own
 //! principal source — e.g. one that reads from per-request state — while the
 //! embedded default checker reads the `Database`'s cached principal. See
-//! `docs/auth-enforcement-spec.md` §4.3.
+//! `docs/15-credential-enforcement.md` §4.3.
 
 use crate::auth::Principal;
 use crate::error::{MongrelError, Result};

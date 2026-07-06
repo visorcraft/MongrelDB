@@ -312,6 +312,38 @@ db.grant_role("alice", "analyst")?;
 assert!(db.check_permission("alice", &Permission::Select { table: "orders".into() }));
 ```
 
+### Credential enforcement (require_auth)
+
+By default, permissions are advisory. To make the storage layer enforce them
+on every operation, create or convert the database with `require_auth`:
+
+```rust
+use mongreldb_core::Database;
+use mongreldb_core::auth::Permission;
+
+// Create a database that requires credentials for every operation.
+let db = Database::create_with_credentials("./mydb", "admin", "s3cret-pw")?;
+
+// Reopen requires credentials.
+let db = Database::open_with_credentials("./mydb", "admin", "s3cret-pw")?;
+
+// Convert an existing credentialless database.
+let db = Database::open("./existing")?;
+db.enable_auth("admin", "s3cret-pw")?;
+
+// Revert to credentialless (recovery).
+let db = Database::open_with_credentials("./mydb", "admin", "s3cret-pw")?;
+db.disable_auth()?;
+
+// Encrypted + credentialed.
+let db = Database::create_encrypted_with_credentials(
+    "./secure", "passphrase", "admin", "s3cret-pw",
+)?;
+```
+
+See **[Credential Enforcement](15-credential-enforcement.md)** for the full
+matrix and per-operation permission requirements.
+
 For the HTTP daemon, start with `--auth-token <token>` (Bearer),
 `--auth-users` (HTTP Basic against catalog users), or both. See
 **[Daemon Mode](08-daemon.md#authentication)**.

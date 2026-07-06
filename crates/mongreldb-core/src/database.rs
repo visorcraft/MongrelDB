@@ -254,7 +254,7 @@ pub struct Database {
     /// reads the principal, while writes happen only at open, `enable_auth`,
     /// and `refresh_principal`. This matches the engine's existing use of
     /// `RwLock` for `catalog` and `tables`.
-    /// See `docs/auth-enforcement-spec.md`.
+    /// See `docs/15-credential-enforcement.md`.
     principal: RwLock<Option<crate::auth::Principal>>,
     /// Shared, cloneable handle to the auth state (require_auth flag from the
     /// catalog + the principal). Cloned into every mounted `Table` so the
@@ -397,7 +397,7 @@ impl Database {
     /// the database's mode. Returns [`MongrelError::InvalidCredentials`] on a
     /// bad username/password.
     ///
-    /// See `docs/auth-enforcement-spec.md`.
+    /// See `docs/15-credential-enforcement.md`.
     pub fn open_with_credentials(
         root: impl AsRef<Path>,
         username: &str,
@@ -486,7 +486,7 @@ impl Database {
     /// This is the bootstrap path: there is no window where the database
     /// requires auth but has no users.
     ///
-    /// See `docs/auth-enforcement-spec.md`.
+    /// See `docs/15-credential-enforcement.md`.
     pub fn create_with_credentials(
         root: impl AsRef<Path>,
         admin_username: &str,
@@ -1282,7 +1282,7 @@ impl Database {
     /// the conversion path for existing databases; for fresh databases,
     /// `create_with_credentials` sets everything up atomically.
     ///
-    /// See `docs/auth-enforcement-spec.md`.
+    /// See `docs/15-credential-enforcement.md`.
     pub fn enable_auth(&self, admin_username: &str, admin_password: &str) -> Result<()> {
         let password_hash =
             crate::auth::hash_password(admin_password).map_err(MongrelError::Other)?;
@@ -1343,7 +1343,7 @@ impl Database {
     /// directly via the catalog file (filesystem access required) and calls
     /// this method — see the CLI's `auth disable-offline` command.
     ///
-    /// See `docs/auth-enforcement-spec.md` §4.7.
+    /// See `docs/15-credential-enforcement.md` §4.7.
     pub fn disable_auth(&self) -> Result<()> {
         let epoch = self.epoch.bump_assigned();
         {

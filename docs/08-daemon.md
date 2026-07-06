@@ -85,6 +85,21 @@ curl -X POST http://127.0.0.1:8453/sql \
   -d '{"sql": "CREATE USER alice WITH PASSWORD '\''s3cret-pw'\''; ALTER USER alice ADMIN"}'
 ```
 
+### require_auth databases
+
+When a database has `require_auth = true` (see
+[Credential Enforcement](15-credential-enforcement.md)), the daemon **must**
+run with `--auth-users` (or `--auth-users` plus `--auth-token`). Token-only
+mode (`--auth-token` without `--auth-users`) is insufficient because it does
+not resolve a catalog `Principal` — the storage layer needs a real user to
+check per-operation permissions.
+
+With `--auth-users`, each request's HTTP Basic credentials are verified against
+the catalog and the resolved `Principal` is checked at the storage layer too
+(defense in depth). A request that passes the HTTP gate but maps to an
+under-privileged principal will be rejected by the storage layer with `403
+Forbidden`.
+
 ## Connection Pooling
 
 When `--max-connections N` is set, the daemon caps concurrent in-flight

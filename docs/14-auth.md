@@ -264,6 +264,40 @@ curl -X POST http://127.0.0.1:8453/sql \
   -d '{"sql": "CREATE USER alice WITH PASSWORD '\''s3cret-pw'\''; ALTER USER alice ADMIN"}'
 ```
 
+## Enforcement: advisory vs. required
+
+By default, the permissions described above are **advisory** — the catalog
+stores users, roles, and permissions, but nothing enforces them at the storage
+layer. Application code can call `db.check_permission(username, &perm)` to
+consult the catalog, but reads and writes themselves are not gated.
+
+**Credential enforcement** (`require_auth`) makes permissions **required** at
+the storage layer. When a database's catalog has `require_auth = true`:
+
+- Every open must supply valid credentials (`open_with_credentials` /
+  `open_encrypted_with_credentials`). Plain `open` fails with `AuthRequired`.
+- Every `Table`/`Transaction`/`MongrelSession` operation is checked against the
+  authenticated principal's permissions. Insufficient permissions return
+  `PermissionDenied`.
+- A stolen database file alone cannot be queried — valid credentials are
+  required to use the MongrelDB API.
+
+This is opt-in per database. Existing credentialless databases open unchanged.
+
+```rust
+use mongreldb_core::Database;
+
+// Create a database with require_auth = true and one admin user.
+let db = Database::create_with_credentials("./my_db", "admin", "s3cret-pw")?;
+
+// Reopen requires credentials — plain open fails.
+let db = Database::open_with_credentials("./my_db", "admin", "s3cret-pw")?;
+```
+
+For the full enforcement matrix, per-language examples, threat model, and
+recovery procedures, see
+**[Credential Enforcement](15-credential-enforcement.md)**.
+
 ## Operational notes
 
 - **Bootstrapping the first admin.** A freshly created database has no

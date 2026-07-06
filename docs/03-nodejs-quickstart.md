@@ -340,6 +340,38 @@ db.grantRole('alice', 'analyst');
 console.log(db.roles());                       // ['analyst']
 ```
 
+### Credential enforcement (require_auth)
+
+By default, permissions are advisory. To make the storage layer enforce them,
+create a database with `require_auth`:
+
+```javascript
+const { Database } = require('./index.js');
+
+// Create a database that requires credentials for every operation.
+const db = Database.createWithCredentials('./mydb', 'admin', 's3cret-pw');
+
+// Reopen requires credentials — plain Database.open fails.
+const db2 = Database.openWithCredentials('./mydb', 'admin', 's3cret-pw');
+
+// Convert an existing credentialless database.
+db.enableAuth('admin', 's3cret-pw');
+
+// Revert to credentialless (recovery).
+db.disableAuth();
+
+// Check enforcement status.
+console.log(db.requireAuthEnabled()); // true
+
+// Encrypted + credentialed.
+const secure = Database.createEncryptedWithCredentials(
+    './secure', 'passphrase', 'admin', 's3cret-pw'
+);
+```
+
+See **[Credential Enforcement](15-credential-enforcement.md)** for the full
+matrix and per-operation permission requirements.
+
 For the HTTP daemon, start with `--auth-token <token>` (Bearer),
 `--auth-users` (HTTP Basic against catalog users), or both. See
 **[Daemon Mode](08-daemon.md#authentication)**.

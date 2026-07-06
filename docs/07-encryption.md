@@ -143,3 +143,32 @@ the passphrase, and the DEKs cannot be unwrapped without the KEK.
 
 Store your passphrase securely — a password manager, a secrets service, or
 wherever you store other critical credentials.
+
+## Composing with credential enforcement
+
+Encryption (data-at-rest) and credential enforcement (logical access control)
+are orthogonal layers. A database can be both encrypted and credentialed:
+
+```rust
+use mongreldb_core::Database;
+
+// Create an encrypted + credentialed database in one call.
+let db = Database::create_encrypted_with_credentials(
+    "./secure_db",
+    "my-passphrase",    // encryption
+    "admin",            // auth
+    "s3cret-pw",
+)?;
+
+// Reopen requires both the passphrase and the credentials.
+let db = Database::open_encrypted_with_credentials(
+    "./secure_db",
+    "my-passphrase",
+    "admin",
+    "s3cret-pw",
+)?;
+```
+
+The passphrase protects the bytes on disk; the credentials protect the
+operations. Losing either makes the data inaccessible. See
+**[Credential Enforcement](15-credential-enforcement.md)** for details.

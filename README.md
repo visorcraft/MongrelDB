@@ -7,7 +7,7 @@
 <p align="center">
   <b>A log-structured columnar database for sub-millisecond writes, learned indexes, and AI-native access.</b>
   <br />
-  Custom <code>.sr</code> columnar format · Bε-tree memtable · WAL with group commit · eight index kinds · hybrid pushdown · MVCC snapshots · page-level encryption · declarative constraints · user/role auth · replication · change data capture · DataFusion SQL · NAPI addon
+  Custom <code>.sr</code> columnar format · Bε-tree memtable · WAL with group commit · eight index kinds · hybrid pushdown · MVCC snapshots · page-level encryption · declarative constraints · user/role auth · credential enforcement · replication · change data capture · DataFusion SQL · NAPI addon
 </p>
 
 <p align="center">
@@ -125,7 +125,11 @@ Bulk insert **2.3× faster than SQLite, 2.6× faster than DuckDB native**. Join
   `/kit/create_table`). `mongreldb-client` + NAPI `RemoteDatabase` connect to it.
 - **Authentication:** `CREATE USER` / `CREATE ROLE` / `GRANT` / `REVOKE` with
   Argon2id password hashing. Daemon supports Bearer token (`--auth-token`) and
-  HTTP Basic auth (`--auth-users`). Connection pooling via `--max-connections`.
+  HTTP Basic auth (`--auth-users`). **Credential enforcement**
+  (`require_auth`) makes permissions required at the storage layer — every open
+  and operation is checked against the authenticated principal. Connection
+  pooling via `--max-connections`. See
+  [Credential Enforcement](docs/15-credential-enforcement.md).
 - **Replication:** `GET /wal/stream` streams committed WAL records; the
   `ReplicationFollower` client applies them to a local copy for read scaling.
 - **Change data capture:** `NOTIFY` / `LISTEN` SQL commands + `GET /events`

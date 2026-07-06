@@ -76,7 +76,7 @@ pub struct Catalog {
     /// When true, every Database/Table/Transaction/MongrelSession operation
     /// requires an authenticated `Principal` with sufficient permission.
     /// Defaults to false → existing credentialless databases open unchanged.
-    /// See `docs/auth-enforcement-spec.md`.
+    /// See `docs/15-credential-enforcement.md`.
     #[serde(default)]
     pub require_auth: bool,
 }

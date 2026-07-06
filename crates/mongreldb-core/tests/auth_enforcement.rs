@@ -1,7 +1,7 @@
 //! Phase 1 — optional credential enforcement at the storage layer.
 //!
 //! These tests cover the engine-level matrix from
-//! `docs/auth-enforcement-spec.md` §4.3: create-with-credentials bootstrap,
+//! `docs/15-credential-enforcement.md` §4.3: create-with-credentials bootstrap,
 //! credentialed open, the DDL/admin/maintenance enforcement points, and
 //! fail-closed semantics. Table/Transaction/SQL enforcement lands in Phase 2.
 
