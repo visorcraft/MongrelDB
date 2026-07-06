@@ -54,6 +54,7 @@ fn sample_catalog() -> Catalog {
         users: Vec::new(),
         roles: Vec::new(),
         next_user_id: 0,
+        require_auth: false,
     }
 }
 

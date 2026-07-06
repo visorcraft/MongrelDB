@@ -246,6 +246,16 @@ pub struct Database {
     /// here. Subscribers (daemon `/events` endpoint, application listeners)
     /// receive them asynchronously.
     notify: tokio::sync::broadcast::Sender<ChangeEvent>,
+    /// The authenticated principal for this handle. `None` on databases
+    /// opened without credentials (the default — `require_auth = false`),
+    /// `Some` on credentialed opens. Consulted by every enforcement point
+    /// when the catalog's `require_auth` flag is set. Behind an `RwLock`
+    /// because the access pattern is read-heavy: every `require()` call
+    /// reads the principal, while writes happen only at open, `enable_auth`,
+    /// and `refresh_principal`. This matches the engine's existing use of
+    /// `RwLock` for `catalog` and `tables`.
+    /// See `docs/auth-enforcement-spec.md`.
+    principal: RwLock<Option<crate::auth::Principal>>,
 }
 
 /// A data-change event published on commit (CDC / NOTIFY-LISTEN).
@@ -256,6 +266,33 @@ pub struct ChangeEvent {
     pub op: String,
     pub epoch: u64,
     pub message: Option<String>,
+}
+
+/// Manual `Debug` for `Database` — surfaces the diagnostics-relevant fields
+/// (root, epoch, table count, encryption/auth state) without requiring every
+/// internal type (Table, GroupCommit, broadcast sender, etc.) to impl Debug.
+/// The raw field types carry locks, trait objects, and channels that have no
+/// useful `Debug` output, so a hand-written impl is clearer than peppering
+/// `#[allow(dead_code)]` skip attributes across two dozen fields.
+impl std::fmt::Debug for Database {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let cat = self.catalog.read();
+        let principal_guard = self.principal.read();
+        let principal: &str = principal_guard
+            .as_ref()
+            .map(|p| p.username.as_str())
+            .unwrap_or("<none>");
+        f.debug_struct("Database")
+            .field("root", &self.root)
+            .field("db_epoch", &cat.db_epoch)
+            .field("open_generation", &cat.open_generation)
+            .field("tables", &cat.tables.len())
+            .field("visible_epoch", &self.epoch.visible().0)
+            .field("encrypted", &self.kek.is_some())
+            .field("require_auth", &cat.require_auth)
+            .field("principal", &principal)
+            .finish()
+    }
 }
 
 impl Database {
@@ -300,7 +337,7 @@ impl Database {
         let meta_dek = crate::encryption::meta_dek_for(kek.as_deref());
         let cat = Catalog::empty();
         catalog::write_atomic(&root, &cat, meta_dek.as_ref())?;
-        Self::finish_open(root, cat, kek, meta_dek, false)
+        Self::finish_open(root, cat, kek, meta_dek, false, None)
     }
 
     /// Open an existing plaintext database.
@@ -344,6 +381,178 @@ impl Database {
         Self::open_inner(root, Some(kek), None)
     }
 
+    /// Open an existing plaintext database that has `require_auth = true`,
+    /// verifying the supplied credentials up front and caching the resolved
+    /// [`Principal`] on the returned handle. Every subsequent operation will
+    /// be checked against that principal.
+    ///
+    /// Returns [`MongrelError::AuthNotRequired`] if the database does not have
+    /// `require_auth` enabled — callers must pick the matching constructor for
+    /// the database's mode. Returns [`MongrelError::InvalidCredentials`] on a
+    /// bad username/password.
+    ///
+    /// See `docs/auth-enforcement-spec.md`.
+    pub fn open_with_credentials(
+        root: impl AsRef<Path>,
+        username: &str,
+        password: &str,
+    ) -> Result<Self> {
+        Self::open_inner_with_credentials(root, None, username, password)
+    }
+
+    /// Open an existing encrypted database that has `require_auth = true`,
+    /// combining the encryption passphrase flow with credential verification.
+    #[cfg(feature = "encryption")]
+    pub fn open_encrypted_with_credentials(
+        root: impl AsRef<Path>,
+        passphrase: &str,
+        username: &str,
+        password: &str,
+    ) -> Result<Self> {
+        let root = root.as_ref();
+        let salt_bytes = std::fs::read(root.join(META_DIR).join(KEYS_FILENAME))
+            .map_err(|e| MongrelError::NotFound(format!("encryption salt file: {e}")))?;
+        let mut salt = [0u8; crate::encryption::SALT_LEN];
+        salt.copy_from_slice(&salt_bytes);
+        let kek = Arc::new(crate::encryption::Kek::derive(passphrase, &salt)?);
+        Self::open_inner_with_credentials(root, Some(kek), username, password)
+    }
+
+    /// Shared credentialed-open inner: read the catalog, verify the database
+    /// requires auth, verify the password, resolve the principal, and pass
+    /// everything to `finish_open` in one shot. This avoids the chicken-and-egg
+    /// problem where `finish_open`'s fail-closed check (`require_auth &&
+    /// principal.is_none()`) would fire before a post-open `authenticate()`
+    /// could supply the principal.
+    fn open_inner_with_credentials(
+        root: impl AsRef<Path>,
+        kek: Option<Arc<crate::encryption::Kek>>,
+        username: &str,
+        password: &str,
+    ) -> Result<Self> {
+        let root = root.as_ref().to_path_buf();
+        let meta_dek = crate::encryption::meta_dek_for(kek.as_deref());
+        let cat = catalog::read(&root, meta_dek.as_ref())?
+            .ok_or_else(|| MongrelError::NotFound(format!("no catalog found at {:?}", root)))?;
+
+        // Fail early if the database is not in require_auth mode — the caller
+        // picked the wrong constructor.
+        if !cat.require_auth {
+            return Err(MongrelError::AuthNotRequired);
+        }
+
+        // Verify credentials against the on-disk catalog before constructing
+        // the full Database handle. This reads users/hashes directly from the
+        // loaded catalog rather than going through the Database::verify_user
+        // method (which requires a constructed Database).
+        let user = cat
+            .users
+            .iter()
+            .find(|u| u.username == username)
+            .filter(|u| !u.password_hash.is_empty())
+            .ok_or_else(|| MongrelError::InvalidCredentials {
+                username: username.to_string(),
+            })?;
+        let password_ok = crate::auth::verify_password(password, &user.password_hash)
+            .map_err(MongrelError::Other)?;
+        if !password_ok {
+            return Err(MongrelError::InvalidCredentials {
+                username: username.to_string(),
+            });
+        }
+
+        // Resolve the principal from the catalog (roles + permissions).
+        let principal =
+            Self::resolve_principal_from_catalog(&cat, &user.username).ok_or_else(|| {
+                MongrelError::InvalidCredentials {
+                    username: username.to_string(),
+                }
+            })?;
+
+        Self::finish_open(root, cat, kek, meta_dek, true, Some(principal))
+    }
+
+    /// Create a fresh plaintext database with `require_auth = true` and a
+    /// single admin user. The returned handle is already authenticated as
+    /// that admin — every subsequent operation is checked against the admin
+    /// principal (which bypasses all permission checks via `is_admin`).
+    ///
+    /// This is the bootstrap path: there is no window where the database
+    /// requires auth but has no users.
+    ///
+    /// See `docs/auth-enforcement-spec.md`.
+    pub fn create_with_credentials(
+        root: impl AsRef<Path>,
+        admin_username: &str,
+        admin_password: &str,
+    ) -> Result<Self> {
+        Self::create_inner_with_credentials(root, None, admin_username, admin_password)
+    }
+
+    /// Create a fresh encrypted database with `require_auth = true` and a
+    /// single admin user. Composes encryption-at-rest with credential
+    /// enforcement.
+    #[cfg(feature = "encryption")]
+    pub fn create_encrypted_with_credentials(
+        root: impl AsRef<Path>,
+        passphrase: &str,
+        admin_username: &str,
+        admin_password: &str,
+    ) -> Result<Self> {
+        let root = root.as_ref();
+        std::fs::create_dir_all(root)?;
+        std::fs::create_dir_all(root.join(META_DIR))?;
+        let salt = crate::encryption::random_salt();
+        std::fs::write(root.join(META_DIR).join(KEYS_FILENAME), salt)?;
+        let kek = Arc::new(crate::encryption::Kek::derive(passphrase, &salt)?);
+        Self::create_inner_with_credentials(root, Some(kek), admin_username, admin_password)
+    }
+
+    fn create_inner_with_credentials(
+        root: impl AsRef<Path>,
+        kek: Option<Arc<crate::encryption::Kek>>,
+        admin_username: &str,
+        admin_password: &str,
+    ) -> Result<Self> {
+        let root = root.as_ref().to_path_buf();
+        std::fs::create_dir_all(&root)?;
+        std::fs::create_dir_all(root.join(TABLES_DIR))?;
+        let meta_dek = crate::encryption::meta_dek_for(kek.as_deref());
+
+        // Build the initial catalog with require_auth = true and one admin user.
+        let password_hash =
+            crate::auth::hash_password(admin_password).map_err(MongrelError::Other)?;
+        let mut cat = Catalog::empty();
+        cat.require_auth = true;
+        cat.next_user_id = 1;
+        cat.users.push(crate::auth::UserEntry {
+            id: 1,
+            username: admin_username.to_string(),
+            password_hash,
+            roles: Vec::new(),
+            is_admin: true,
+            created_epoch: 0,
+        });
+        catalog::write_atomic(&root, &cat, meta_dek.as_ref())?;
+
+        // The handle is constructed already authenticated as the admin user
+        // it just created — no separate verify step needed.
+        let admin_principal = crate::auth::Principal {
+            username: admin_username.to_string(),
+            is_admin: true,
+            roles: Vec::new(),
+            permissions: Vec::new(),
+        };
+        Ok(Self::finish_open(
+            root,
+            cat,
+            kek,
+            meta_dek,
+            false,
+            Some(admin_principal),
+        )?)
+    }
+
     fn open_inner(
         root: impl AsRef<Path>,
         kek: Option<Arc<crate::encryption::Kek>>,
@@ -353,7 +562,7 @@ impl Database {
         let meta_dek = crate::encryption::meta_dek_for(kek.as_deref());
         let cat = catalog::read(&root, meta_dek.as_ref())?
             .ok_or_else(|| MongrelError::NotFound(format!("no catalog found at {:?}", root)))?;
-        Self::finish_open(root, cat, kek, meta_dek, true)
+        Self::finish_open(root, cat, kek, meta_dek, true, None)
     }
 
     fn finish_open(
@@ -362,6 +571,7 @@ impl Database {
         kek: Option<Arc<crate::encryption::Kek>>,
         meta_dek: Option<[u8; META_DEK_LEN]>,
         existing: bool,
+        principal: Option<crate::auth::Principal>,
     ) -> Result<Self> {
         // Acquire an exclusive cross-process lock on the database directory.
         // This prevents two *processes* from opening the same DB simultaneously
@@ -498,6 +708,17 @@ impl Database {
         // Seed the shared txn-id allocator now that the generation is final.
         *txn_ids.lock() = next_txn_id;
 
+        // Fail-closed: an existing database with `require_auth = true` must be
+        // opened with credentials (a non-None principal). The credentialed
+        // constructors pass the principal through finish_open; the plain
+        // open/open_encrypted paths pass None and are rejected here. A brand-
+        // new database (`existing = false`) never has require_auth set yet
+        // (create_with_credentials sets it in the catalog before construction
+        // AND passes the principal), so the check only gates the reopen path.
+        if existing && cat.require_auth && principal.is_none() {
+            return Err(MongrelError::AuthRequired);
+        }
+
         Ok(Self {
             root,
             catalog: RwLock::new(cat),
@@ -529,6 +750,7 @@ impl Database {
                 let (tx, _rx) = tokio::sync::broadcast::channel(256);
                 tx
             },
+            principal: RwLock::new(principal),
         })
     }
 
@@ -575,6 +797,7 @@ impl Database {
     }
 
     pub fn create_procedure(&self, mut procedure: StoredProcedure) -> Result<StoredProcedure> {
+        self.require(&crate::auth::Permission::Ddl)?;
         let _g = self.ddl_lock.lock();
         procedure.validate()?;
         self.validate_procedure_references(&procedure)?;
@@ -647,6 +870,7 @@ impl Database {
     }
 
     pub fn drop_procedure(&self, name: &str) -> Result<()> {
+        self.require(&crate::auth::Permission::Ddl)?;
         let _g = self.ddl_lock.lock();
         let commit_lock = Arc::clone(&self.commit_lock);
         let _c = commit_lock.lock();
@@ -682,6 +906,7 @@ impl Database {
 
     /// Create a new user with an Argon2id-hashed password.
     pub fn create_user(&self, username: &str, password: &str) -> Result<crate::auth::UserEntry> {
+        self.require(&crate::auth::Permission::Admin)?;
         let hash = crate::auth::hash_password(password).map_err(MongrelError::Other)?;
         let epoch = self.epoch.bump_assigned();
         let id = {
@@ -712,6 +937,7 @@ impl Database {
 
     /// Drop a user by username.
     pub fn drop_user(&self, username: &str) -> Result<()> {
+        self.require(&crate::auth::Permission::Admin)?;
         let epoch = self.epoch.bump_assigned();
         {
             let mut cat = self.catalog.write();
@@ -731,6 +957,7 @@ impl Database {
 
     /// Change a user's password.
     pub fn alter_user_password(&self, username: &str, new_password: &str) -> Result<()> {
+        self.require(&crate::auth::Permission::Admin)?;
         let hash = crate::auth::hash_password(new_password).map_err(MongrelError::Other)?;
         let epoch = self.epoch.bump_assigned();
         {
@@ -773,6 +1000,7 @@ impl Database {
 
     /// Grant admin privileges to a user (bypasses all permission checks).
     pub fn set_user_admin(&self, username: &str, is_admin: bool) -> Result<()> {
+        self.require(&crate::auth::Permission::Admin)?;
         let epoch = self.epoch.bump_assigned();
         {
             let mut cat = self.catalog.write();
@@ -791,6 +1019,7 @@ impl Database {
 
     /// Create a new role.
     pub fn create_role(&self, name: &str) -> Result<crate::auth::RoleEntry> {
+        self.require(&crate::auth::Permission::Admin)?;
         let epoch = self.epoch.bump_assigned();
         let entry = {
             let mut cat = self.catalog.write();
@@ -815,6 +1044,7 @@ impl Database {
 
     /// Drop a role by name.
     pub fn drop_role(&self, name: &str) -> Result<()> {
+        self.require(&crate::auth::Permission::Admin)?;
         let epoch = self.epoch.bump_assigned();
         {
             let mut cat = self.catalog.write();
@@ -836,6 +1066,7 @@ impl Database {
 
     /// Grant a role to a user.
     pub fn grant_role(&self, username: &str, role_name: &str) -> Result<()> {
+        self.require(&crate::auth::Permission::Admin)?;
         let epoch = self.epoch.bump_assigned();
         {
             let mut cat = self.catalog.write();
@@ -861,6 +1092,7 @@ impl Database {
 
     /// Revoke a role from a user.
     pub fn revoke_role(&self, username: &str, role_name: &str) -> Result<()> {
+        self.require(&crate::auth::Permission::Admin)?;
         let epoch = self.epoch.bump_assigned();
         {
             let mut cat = self.catalog.write();
@@ -883,6 +1115,7 @@ impl Database {
         role_name: &str,
         permission: crate::auth::Permission,
     ) -> Result<()> {
+        self.require(&crate::auth::Permission::Admin)?;
         let epoch = self.epoch.bump_assigned();
         {
             let mut cat = self.catalog.write();
@@ -907,6 +1140,7 @@ impl Database {
         role_name: &str,
         permission: crate::auth::Permission,
     ) -> Result<()> {
+        self.require(&crate::auth::Permission::Admin)?;
         let epoch = self.epoch.bump_assigned();
         {
             let mut cat = self.catalog.write();
@@ -927,6 +1161,17 @@ impl Database {
     /// permissions from their roles. Returns `None` if the user doesn't exist.
     pub fn resolve_principal(&self, username: &str) -> Option<crate::auth::Principal> {
         let cat = self.catalog.read();
+        Self::resolve_principal_from_catalog(&cat, username)
+    }
+
+    /// Resolve a username to a [`Principal`] directly from a catalog snapshot,
+    /// without needing a constructed `Database`. Used by the credentialed open
+    /// path (which must verify credentials before the `Database` exists) and
+    /// by [`resolve_principal`](Self::resolve_principal).
+    fn resolve_principal_from_catalog(
+        cat: &Catalog,
+        username: &str,
+    ) -> Option<crate::auth::Principal> {
         let user = cat.users.iter().find(|u| u.username == username)?;
         let mut permissions = Vec::new();
         for role_name in &user.roles {
@@ -950,6 +1195,130 @@ impl Database {
         }
     }
 
+    /// Returns `true` if this database's catalog has `require_auth = true`.
+    /// When true, every operation consults the cached [`Principal`] via
+    /// [`require`](Self::require).
+    pub fn require_auth_enabled(&self) -> bool {
+        self.catalog.read().require_auth
+    }
+
+    /// A snapshot of the cached principal for this handle, if any. `None` for
+    /// databases opened without credentials (the default). Returns a clone
+    /// because the principal lives behind an `RwLock`.
+    pub fn principal(&self) -> Option<crate::auth::Principal> {
+        self.principal.read().clone()
+    }
+
+    /// Re-resolve the cached principal from the on-disk catalog. Long-lived
+    /// handles (e.g. a daemon) call this after a `REVOKE` or role change —
+    /// possibly made by a different handle to the same database — to pick up
+    /// the new effective permissions without re-verifying the password.
+    ///
+    /// This reloads the catalog from disk first, so changes committed by other
+    /// handles (or other processes) are visible. The username is taken from
+    /// the existing cached principal; if the user has since been dropped,
+    /// returns [`MongrelError::InvalidCredentials`].
+    ///
+    /// No-op (returns `Ok(())`) on a credentialless database, or on a
+    /// credentialed database whose cached principal is `None`.
+    pub fn refresh_principal(&self) -> Result<()> {
+        let username = match self.principal.read().clone() {
+            Some(p) => p.username,
+            None => return Ok(()),
+        };
+        // Reload the catalog from disk so role/permission changes made by
+        // other handles (or processes) are reflected. The in-memory catalog
+        // is only updated by mutations on *this* handle.
+        let cat = catalog::read(&self.root, self.meta_dek.as_ref())?
+            .ok_or_else(|| MongrelError::NotFound("catalog vanished during refresh".into()))?;
+        // Swap in the reloaded catalog so subsequent operations on this handle
+        // also see the updated permissions/roles.
+        *self.catalog.write() = cat.clone();
+        match Self::resolve_principal_from_catalog(&cat, &username) {
+            Some(p) => {
+                *self.principal.write() = Some(p);
+                Ok(())
+            }
+            None => Err(MongrelError::InvalidCredentials { username }),
+        }
+    }
+
+    /// Convert a credentialless database to a credentialed one: create the
+    /// first admin user, set `require_auth = true`, and cache the admin
+    /// principal on this handle so subsequent operations on the same handle
+    /// continue to work. After this call, the database can only be reopened
+    /// via `open_with_credentials` / `open_encrypted_with_credentials`.
+    ///
+    /// Refuses if the database already has `require_auth = true`. This is
+    /// the conversion path for existing databases; for fresh databases,
+    /// `create_with_credentials` sets everything up atomically.
+    ///
+    /// See `docs/auth-enforcement-spec.md`.
+    pub fn enable_auth(&self, admin_username: &str, admin_password: &str) -> Result<()> {
+        let password_hash =
+            crate::auth::hash_password(admin_password).map_err(MongrelError::Other)?;
+        let epoch = self.epoch.bump_assigned();
+        {
+            let mut cat = self.catalog.write();
+            if cat.require_auth {
+                return Err(MongrelError::InvalidArgument(
+                    "database already has require_auth enabled".into(),
+                ));
+            }
+            // Reject a duplicate username so the bootstrap doesn't silently
+            // shadow an existing user.
+            if cat.users.iter().any(|u| u.username == admin_username) {
+                return Err(MongrelError::InvalidArgument(format!(
+                    "user {admin_username:?} already exists"
+                )));
+            }
+            cat.next_user_id = cat.next_user_id.max(1);
+            let id = cat.next_user_id;
+            cat.next_user_id += 1;
+            cat.users.push(crate::auth::UserEntry {
+                id,
+                username: admin_username.to_string(),
+                password_hash,
+                roles: Vec::new(),
+                is_admin: true,
+                created_epoch: epoch.0,
+            });
+            cat.require_auth = true;
+            cat.db_epoch = epoch.0;
+        }
+        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+        // Cache the admin principal on this handle.
+        *self.principal.write() = Some(crate::auth::Principal {
+            username: admin_username.to_string(),
+            is_admin: true,
+            roles: Vec::new(),
+            permissions: Vec::new(),
+        });
+        Ok(())
+    }
+
+    /// Enforcement check: if the catalog has `require_auth = true`, verify
+    /// that the cached principal satisfies `perm`. Called by every
+    /// enforcement point (DDL, admin, maintenance, and — in Phase 2 —
+    /// Table/Transaction/MongrelSession operations).
+    ///
+    /// On a credentialless database this is a no-op (`Ok(())`).
+    pub fn require(&self, perm: &crate::auth::Permission) -> Result<()> {
+        if !self.catalog.read().require_auth {
+            return Ok(());
+        }
+        let guard = self.principal.read();
+        let p = guard.as_ref().ok_or(MongrelError::AuthRequired)?;
+        if p.has_permission(perm) {
+            Ok(())
+        } else {
+            Err(MongrelError::PermissionDenied {
+                required: perm.clone(),
+                principal: p.username.clone(),
+            })
+        }
+    }
+
     pub fn triggers(&self) -> Vec<StoredTrigger> {
         self.catalog
             .read()
@@ -969,6 +1338,7 @@ impl Database {
     }
 
     pub fn create_trigger(&self, mut trigger: StoredTrigger) -> Result<StoredTrigger> {
+        self.require(&crate::auth::Permission::Ddl)?;
         let _g = self.ddl_lock.lock();
         trigger.validate()?;
         self.validate_trigger_references(&trigger)?;
@@ -1034,6 +1404,7 @@ impl Database {
     }
 
     pub fn drop_trigger(&self, name: &str) -> Result<()> {
+        self.require(&crate::auth::Permission::Ddl)?;
         let _g = self.ddl_lock.lock();
         let commit_lock = Arc::clone(&self.commit_lock);
         let _c = commit_lock.lock();
@@ -1071,6 +1442,7 @@ impl Database {
         &self,
         mut entry: ExternalTableEntry,
     ) -> Result<ExternalTableEntry> {
+        self.require(&crate::auth::Permission::Ddl)?;
         let _g = self.ddl_lock.lock();
         entry.validate()?;
         {
@@ -1099,6 +1471,7 @@ impl Database {
     }
 
     pub fn drop_external_table(&self, name: &str) -> Result<()> {
+        self.require(&crate::auth::Permission::Ddl)?;
         let _g = self.ddl_lock.lock();
         let commit_lock = Arc::clone(&self.commit_lock);
         let _c = commit_lock.lock();
@@ -1187,6 +1560,10 @@ impl Database {
         name: &str,
         args: HashMap<String, crate::Value>,
     ) -> Result<ProcedureCallResult> {
+        // v1 requires ALL to call procedures on a require_auth database; a
+        // finer SECURITY DEFINER-style marker is a future extension (spec §9
+        // decision 1).
+        self.require(&crate::auth::Permission::All)?;
         let procedure = self
             .procedure(name)
             .ok_or_else(|| MongrelError::NotFound(format!("procedure {name:?} not found")))?;
@@ -3144,6 +3521,7 @@ impl Database {
     /// is locked individually for its own compaction; snapshot retention is
     /// honored by `Table::compact`. Returns `(tables_compacted, tables_skipped)`.
     pub fn compact(&self) -> Result<(usize, usize)> {
+        self.require(&crate::auth::Permission::Ddl)?;
         let mut compacted = 0;
         let mut skipped = 0;
         for name in self.table_names() {
@@ -3176,6 +3554,7 @@ impl Database {
     /// Compact a single table by name. Returns `Ok(true)` if it was
     /// compacted, `Ok(false)` if skipped (< 2 runs).
     pub fn compact_table(&self, name: &str) -> Result<bool> {
+        self.require(&crate::auth::Permission::Ddl)?;
         let handle = self.table(name)?;
         let mut t = handle.lock();
         let before = t.run_count();
@@ -3220,6 +3599,7 @@ impl Database {
         use crate::wal::DdlOp;
         use std::sync::atomic::Ordering;
 
+        self.require(&crate::auth::Permission::Ddl)?;
         if self.poisoned.load(Ordering::Relaxed) {
             return Err(MongrelError::Other(
                 "database poisoned by fsync error".into(),
@@ -3329,6 +3709,7 @@ impl Database {
         use crate::wal::DdlOp;
         use std::sync::atomic::Ordering;
 
+        self.require(&crate::auth::Permission::Ddl)?;
         if self.poisoned.load(Ordering::Relaxed) {
             return Err(MongrelError::Other(
                 "database poisoned by fsync error".into(),
@@ -3396,6 +3777,7 @@ impl Database {
         use crate::wal::DdlOp;
         use std::sync::atomic::Ordering;
 
+        self.require(&crate::auth::Permission::Ddl)?;
         if self.poisoned.load(Ordering::Relaxed) {
             return Err(MongrelError::Other(
                 "database poisoned by fsync error".into(),
@@ -3485,6 +3867,7 @@ impl Database {
         use crate::wal::DdlOp;
         use std::sync::atomic::Ordering;
 
+        self.require(&crate::auth::Permission::Ddl)?;
         if self.poisoned.load(Ordering::Relaxed) {
             return Err(MongrelError::Other(
                 "database poisoned by fsync error".into(),
@@ -3577,6 +3960,7 @@ impl Database {
     ///
     /// Returns the number of items reclaimed.
     pub fn gc(&self) -> Result<usize> {
+        self.require(&crate::auth::Permission::Ddl)?;
         let min_active = self.snapshots.min_active(self.epoch.visible()).0;
         let mut reclaimed = 0;
 

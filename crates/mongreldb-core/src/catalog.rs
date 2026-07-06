@@ -73,6 +73,12 @@ pub struct Catalog {
     /// Next monotonic user id to allocate.
     #[serde(default)]
     pub next_user_id: u64,
+    /// When true, every Database/Table/Transaction/MongrelSession operation
+    /// requires an authenticated `Principal` with sufficient permission.
+    /// Defaults to false → existing credentialless databases open unchanged.
+    /// See `docs/auth-enforcement-spec.md`.
+    #[serde(default)]
+    pub require_auth: bool,
 }
 
 impl Catalog {

@@ -65,11 +65,17 @@ pub enum Permission {
 }
 
 impl Permission {
-    /// Check whether this permission satisfies a required permission. `All`
-    /// satisfies everything; `Select { table: "*" }` is not wildcarded (it
-    /// matches a table literally named `*`).
+    /// Check whether this permission satisfies a required permission.
+    ///
+    /// `All` satisfies every non-admin permission (DDL + all table-level
+    /// operations) but does **not** satisfy `Admin` — user/role management
+    /// is gated behind `is_admin = true` on the principal, not grantable via
+    /// `Permission::All` (spec §9 decision 2). `Select { table: "*" }` is
+    /// not wildcarded (it matches a table literally named `*`).
     pub fn satisfies(&self, required: &Permission) -> bool {
         match (self, required) {
+            // All grants every non-admin permission.
+            (Permission::All, Permission::Admin) => false,
             (Permission::All, _) => true,
             (Permission::Admin, Permission::Admin) => true,
             (Permission::Ddl, Permission::Ddl) => true,
@@ -78,6 +84,20 @@ impl Permission {
             (Permission::Update { table: a }, Permission::Update { table: b }) => a == b,
             (Permission::Delete { table: a }, Permission::Delete { table: b }) => a == b,
             _ => false,
+        }
+    }
+}
+
+impl std::fmt::Display for Permission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Permission::All => write!(f, "ALL"),
+            Permission::Admin => write!(f, "ADMIN"),
+            Permission::Ddl => write!(f, "DDL"),
+            Permission::Select { table } => write!(f, "SELECT ON {table}"),
+            Permission::Insert { table } => write!(f, "INSERT ON {table}"),
+            Permission::Update { table } => write!(f, "UPDATE ON {table}"),
+            Permission::Delete { table } => write!(f, "DELETE ON {table}"),
         }
     }
 }
@@ -154,7 +174,13 @@ mod tests {
 
     #[test]
     fn permission_satisfies() {
+        // All satisfies DDL and table-level permissions...
+        assert!(Permission::All.satisfies(&Permission::Ddl));
         assert!(Permission::All.satisfies(&Permission::Select { table: "t".into() }));
+        assert!(Permission::All.satisfies(&Permission::Insert { table: "t".into() }));
+        // ...but NOT Admin (spec §9 decision 2 — only is_admin grants admin).
+        assert!(!Permission::All.satisfies(&Permission::Admin));
+        // Exact table match.
         assert!(Permission::Select { table: "t".into() }
             .satisfies(&Permission::Select { table: "t".into() }));
         assert!(
@@ -162,8 +188,11 @@ mod tests {
                 table: "other".into()
             })
         );
+        // Cross-kind never satisfies.
         assert!(!Permission::Select { table: "t".into() }
             .satisfies(&Permission::Insert { table: "t".into() }));
+        // Ddl does not satisfy Admin either.
+        assert!(!Permission::Ddl.satisfies(&Permission::Admin));
     }
 
     #[test]

@@ -43,6 +43,17 @@ pub enum MongrelError {
     Full(String),
     #[error("transaction conflict: {0}")]
     Conflict(String),
+    #[error("authentication required: this database has require_auth enabled; reopen with open_with_credentials / open_encrypted_with_credentials")]
+    AuthRequired,
+    #[error("authentication not required: this database does not have require_auth enabled; use the plain open/create constructors")]
+    AuthNotRequired,
+    #[error("invalid credentials for user {username:?}")]
+    InvalidCredentials { username: String },
+    #[error("permission denied: principal {principal:?} lacks {required}")]
+    PermissionDenied {
+        required: crate::auth::Permission,
+        principal: String,
+    },
     #[error("{0}")]
     Other(String),
 }
