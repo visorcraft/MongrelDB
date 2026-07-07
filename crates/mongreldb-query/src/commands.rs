@@ -5780,11 +5780,15 @@ async fn try_recursive_cte(
                 .iter()
                 .enumerate()
                 .map(|(i, f)| {
-                    arrow::datatypes::Field::new(
-                        &cte_col_names[i],
-                        f.data_type().clone(),
-                        f.is_nullable(),
-                    )
+                    // Use the CTE's declared column name. If the base query
+                    // produced a Null type (e.g. `SELECT NULL`), use Int64
+                    // nullable instead — Null can't hold values from the
+                    // recursive arm.
+                    let dt = match f.data_type() {
+                        arrow::datatypes::DataType::Null => arrow::datatypes::DataType::Int64,
+                        other => other.clone(),
+                    };
+                    arrow::datatypes::Field::new(&cte_col_names[i], dt, true)
                 })
                 .collect();
             std::sync::Arc::new(arrow::datatypes::Schema::new(new_fields))
@@ -5792,11 +5796,29 @@ async fn try_recursive_cte(
             schema.clone()
         };
 
-    // Re-cast each base batch with the renamed schema.
+    // Re-cast each base batch with the renamed schema. If the base query
+    // produced Null-type columns (e.g. `SELECT NULL`), convert them to
+    // the target type as all-null arrays.
     let all_batches: Vec<RecordBatch> = base_batches
         .iter()
         .map(|b| {
-            RecordBatch::try_new(renamed_schema.clone(), b.columns().to_vec())
+            let cols: Vec<ArrayRef> = b
+                .columns()
+                .iter()
+                .enumerate()
+                .map(|(i, col)| {
+                    let target_dt = renamed_schema.field(i).data_type();
+                    if col.data_type() == &arrow::datatypes::DataType::Null
+                        && target_dt != &arrow::datatypes::DataType::Null
+                    {
+                        // Replace NullArray with an all-null array of the target type.
+                        arrow::array::new_null_array(target_dt, col.len())
+                    } else {
+                        col.clone()
+                    }
+                })
+                .collect();
+            RecordBatch::try_new(renamed_schema.clone(), cols)
                 .map_err(|e| MongrelQueryError::Arrow(e.to_string()))
         })
         .collect::<Result<_>>()?;
