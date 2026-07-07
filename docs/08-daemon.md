@@ -34,6 +34,145 @@ mongreldb-server ./my_database 8453 --auth-token my-secret-token --max-connectio
 The daemon opens the database, builds indexes (if needed), and starts
 listening for HTTP requests on `127.0.0.1:8453`.
 
+## Running as a daemon (--daemon mode)
+
+The `--daemon` flag forks the server into the background, detaches from the
+terminal, and writes a PID file:
+
+```sh
+# Start in background with a PID file
+mongreldb-server ./my_database --daemon
+
+# Custom PID file location
+mongreldb-server ./my_database --daemon --pidfile /var/run/mongreldb.pid
+
+# With auth + encryption
+mongreldb-server ./my_database --daemon --port 8453 --auth-token my-secret --passphrase my-encryption-key
+```
+
+The server handles `SIGINT` (Ctrl+C) and `SIGTERM` gracefully — it flushes all
+tables, writes pending data to disk, removes the PID file, and exits with code 0.
+
+## Keeping the daemon running (auto-restart)
+
+For production deployments, use a process supervisor to ensure the daemon
+restarts automatically if it crashes or the host reboots.
+
+### systemd (recommended for Linux)
+
+Install the systemd unit file (shipped at
+`crates/mongreldb-server/mongreldb-server.service`):
+
+```sh
+# Copy the binary and unit file
+sudo cp mongreldb-server /usr/local/bin/
+sudo cp mongreldb-server.service /etc/systemd/system/
+
+# Edit the unit file to match your database path and auth settings
+sudo nano /etc/systemd/system/mongreldb-server.service
+
+# Enable and start
+sudo systemctl daemon-reload
+sudo systemctl enable mongreldb-server
+sudo systemctl start mongreldb-server
+
+# Check status
+sudo systemctl status mongreldb-server
+
+# View logs
+sudo journalctl -u mongreldb-server -f
+```
+
+The unit file template:
+```ini
+[Unit]
+Description=MongrelDB Server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mongreldb-server /var/lib/mongreldb 8453
+Restart=always
+RestartSec=3
+User=mongreldb
+Group=mongreldb
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+```
+
+With `Restart=always`, systemd restarts the daemon within 3 seconds if it
+crashes, and automatically starts it on boot.
+
+### Docker
+
+```sh
+# Build a Docker image
+docker build -t mongreldb-server .
+
+# Run with auto-restart
+docker run -d \
+  --name mongreldb \
+  --restart=always \
+  -p 8453:8453 \
+  -v ./my_database:/data \
+  mongreldb-server \
+  /data --port 8453 --auth-token my-secret
+```
+
+The `--restart=always` policy restarts the container on crash, daemon exit,
+or host reboot (when Docker itself starts).
+
+### supervisord
+
+```ini
+[program:mongreldb]
+command=/usr/local/bin/mongreldb-server /var/lib/mongreldb --port 8453
+directory=/var/lib/mongreldb
+autostart=true
+autorestart=true
+startsecs=3
+stderr_logfile=/var/log/mongreldb/error.log
+stdout_logfile=/var/log/mongreldb/output.log
+user=mongreldb
+```
+
+### Kubernetes
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mongreldb
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mongreldb
+  template:
+    metadata:
+      labels:
+        app: mongreldb
+    spec:
+      containers:
+      - name: mongreldb
+        image: mongreldb-server:latest
+        args: ["/data", "--port", "8453"]
+        ports:
+        - containerPort: 8453
+        volumeMounts:
+        - name: data
+          mountPath: /data
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: mongreldb-data
+```
+
+Kubernetes restarts pods automatically via its health checks and
+self-healing mechanisms.
+
 ## Authentication
 
 The daemon supports three auth modes — they can be combined:

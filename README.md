@@ -128,6 +128,12 @@ Bulk insert **2.3× faster than SQLite, 2.6× faster than DuckDB native**. Join
   multi-table `Database` warm for multi-process access, over SQL/native routes
   and a typed Kit API (`/kit/schema`, `/kit/txn`, `/kit/query`,
   `/kit/create_table`). `mongreldb-client` + NAPI `RemoteDatabase` connect to it.
+  Use `--daemon` to run in the background, or deploy with
+  systemd/Docker/supervisord for auto-restart. See
+  [Daemon Mode](docs/08-daemon.md#running-as-a-daemon---daemon-mode) for details.
+  Notable flags: `--daemon` (background + PID file), `--pidfile <path>`,
+  `--port <n>`, `--auth-token`/`--auth-users` (auth), `--max-connections <n>`,
+  and `--passphrase <key>` (page-level encryption).
 - **Authentication:** `CREATE USER` / `CREATE ROLE` / `GRANT` / `REVOKE` with
   Argon2id password hashing. Daemon supports Bearer token (`--auth-token`) and
   HTTP Basic auth (`--auth-users`). **Credential enforcement**

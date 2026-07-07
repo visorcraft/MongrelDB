@@ -1,0 +1,20 @@
+[Unit]
+Description=MongrelDB Server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mongreldb-server /var/lib/mongreldb 8453
+Restart=always
+RestartSec=3
+User=mongreldb
+Group=mongreldb
+
+# Optional: enable auth
+# ExecStart=/usr/local/bin/mongreldb-server /var/lib/mongreldb --port 8453 --auth-token my-secret
+
+# Limits
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
