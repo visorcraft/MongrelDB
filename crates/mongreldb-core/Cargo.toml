@@ -9,7 +9,7 @@ description = "MongrelDB core: log-structured columnar store with sub-ms writes,
 
 [dependencies]
 thiserror = "1"
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 bincode = "1"
 bytes = "1"
