@@ -1806,6 +1806,14 @@ impl MongrelSession {
         let trimmed = sql.trim();
         if trimmed.contains(';') && !is_trigger_body(trimmed) {
             let stmts = split_sql_statements(trimmed);
+            // If all statements are empty (e.g. ";;;"), return empty result.
+            let non_empty: Vec<&String> = stmts
+                .iter()
+                .filter(|s| !s.trim().is_empty() && s.trim() != ";")
+                .collect();
+            if non_empty.is_empty() {
+                return Ok(Vec::new());
+            }
             if stmts.len() > 1 {
                 let mut last = Vec::new();
                 for stmt in &stmts {

@@ -5750,7 +5750,7 @@ async fn try_recursive_cte(
         .collect();
 
     // Extract base + recursive queries from the UNION [ALL] set operation.
-    let (base_sql, recursive_sql, union_all) = match cte_body {
+    let (base_sql, recursive_sql, _union_all) = match cte_body {
         SetExpr::SetOperation {
             op,
             set_quantifier,
@@ -5827,10 +5827,9 @@ async fn try_recursive_cte(
     //    UNION ALL and is the standard evaluation strategy.
     let max_iterations = 10_000;
     let mut delta_merged = merged.clone();
-    for iteration in 0..max_iterations {
+    for _ in 0..max_iterations {
         // Register ONLY the delta (new rows) as the CTE name, so the recursive
         // arm sees only the rows added in the previous iteration.
-        // Deregister first to ensure DataFusion drops any cached scan plan.
         let _ = session.ctx.deregister_table(&cte_name);
         let _ = session.ctx.register_batch(&cte_name, delta_merged.clone());
         session.clear_cache();
@@ -5855,8 +5854,52 @@ async fn try_recursive_cte(
         delta_merged = arrow::compute::concat_batches(&renamed_schema, &recast_batches)
             .map_err(|e| MongrelQueryError::Arrow(e.to_string()))?;
 
-        // Accumulate into all_batches.
-        all_batches.extend(recast_batches);
+        // For UNION (non-ALL), deduplicate the delta against the accumulated
+        // set before accumulating. Register the full set, run SELECT DISTINCT,
+        // and use only the genuinely new rows as the delta.
+        if !_union_all && !all_batches.is_empty() {
+            let full_merged = arrow::compute::concat_batches(&renamed_schema, &all_batches)
+                .map_err(|e| MongrelQueryError::Arrow(e.to_string()))?;
+            let _ = session.ctx.deregister_table(&cte_name);
+            let _ = session.ctx.register_batch(&cte_name, full_merged);
+            session.clear_cache();
+            session.plan_cache.lock().clear();
+
+            // Deduplicate everything (accumulated + new delta).
+            let combined: Vec<RecordBatch> = all_batches
+                .iter()
+                .cloned()
+                .chain(std::iter::once(delta_merged.clone()))
+                .collect();
+            let combined_merged = arrow::compute::concat_batches(&renamed_schema, &combined)
+                .map_err(|e| MongrelQueryError::Arrow(e.to_string()))?;
+            let _ = session.ctx.deregister_table(&cte_name);
+            let _ = session.ctx.register_batch(&cte_name, combined_merged);
+            session.clear_cache();
+            session.plan_cache.lock().clear();
+
+            let deduped =
+                Box::pin(session.run(&format!("SELECT DISTINCT * FROM {}", cte_name))).await?;
+            let deduped_merged = arrow::compute::concat_batches(&renamed_schema, &deduped)
+                .map_err(|e| MongrelQueryError::Arrow(e.to_string()))?;
+            let prev_total: usize = all_batches.iter().map(|b| b.num_rows()).sum();
+            all_batches = deduped;
+            let new_total: usize = all_batches.iter().map(|b| b.num_rows()).sum();
+            if new_total == prev_total {
+                break; // No genuinely new rows.
+            }
+            // The delta is just the new rows = deduped total - previous total.
+            // Since we can't easily extract just the new rows from the deduped
+            // set, use the full deduped set as the next delta. This is less
+            // efficient but correct — the recursive arm will re-evaluate against
+            // the full set and SELECT DISTINCT will prevent accumulation.
+            let deduped_merged = arrow::compute::concat_batches(&renamed_schema, &all_batches)
+                .map_err(|e| MongrelQueryError::Arrow(e.to_string()))?;
+            delta_merged = deduped_merged;
+        } else {
+            // UNION ALL: just accumulate.
+            all_batches.extend(recast_batches);
+        }
     }
 
     // Register the full accumulated result as the CTE name for the outer query.
