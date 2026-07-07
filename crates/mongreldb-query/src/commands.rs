@@ -2032,14 +2032,16 @@ async fn create_view(session: &MongrelSession, view: CreateView) -> Result<()> {
 
     if view.materialized {
         // CREATE MATERIALIZED VIEW — physically materialize the query result as
-        // a table (like CTAS). The defining SQL is registered as a regular view
-        // so `REFRESH MATERIALIZED VIEW name` can re-execute it.
+        // a table (like CTAS). The materialized view is a real table — it does
+        // NOT register a session-scoped view definition (that would shadow the
+        // physical table and make the "snapshot" behave like a live view).
+        // The defining SQL is preserved only in the CREATE statement itself;
+        // a future REFRESH MATERIALIZED VIEW would need to store it separately.
         let Some(db) = &session.database else {
             return Err(MongrelQueryError::Schema(
                 "CREATE MATERIALIZED VIEW requires a Database".into(),
             ));
         };
-        // Drop the existing table if IF NOT EXISTS is set and it already exists.
         if view.if_not_exists && db.table_id(&name).is_ok() {
             return Ok(());
         }
@@ -2048,20 +2050,6 @@ async fn create_view(session: &MongrelSession, view: CreateView) -> Result<()> {
                 "table or materialized view {name:?} already exists"
             )));
         }
-        // Store the view definition for REFRESH.
-        session.create_view_with_schema(
-            &name,
-            &view.query.to_string(),
-            mongreldb_core::schema::Schema {
-                schema_id: 0,
-                columns: vec![],
-                indexes: vec![],
-                colocation: vec![],
-                constraints: Default::default(),
-                clustered: false,
-            },
-            std::collections::HashMap::new(),
-        );
         // Materialize: execute the query and create a physical table.
         return create_table_as_select(session, db, &name, &view.query).await;
     }
