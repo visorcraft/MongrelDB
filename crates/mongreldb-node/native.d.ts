@@ -17,7 +17,8 @@ export const enum ColumnType {
   Decimal128 = 10,
   Uuid = 11,
   Json = 12,
-  Array = 13
+  Array = 13,
+  Enum = 14
 }
 export const enum IndexKindSpec {
   Bitmap = 0,
@@ -44,6 +45,13 @@ export interface ColumnSpec {
    * validated; applying defaults to existing rows is not yet implemented.
    */
   defaultValue?: Cell
+  /**
+   * Optional dynamic default expression: `"now"` or `"uuid"`. Takes
+   * precedence over `default_value` when set.
+   */
+  defaultExpr?: string
+  /** Required when `ty == Enum`: the list of allowed variant strings. */
+  enumVariants?: Array<string>
   /**
    * Engine-managed monotonic identity allocator for an `Int64` primary key.
    * When `true`, the engine assigns the next counter value on insert if the
