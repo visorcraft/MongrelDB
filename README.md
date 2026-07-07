@@ -7,7 +7,7 @@
 <p align="center">
   <b>A log-structured columnar database for sub-millisecond writes, learned indexes, and AI-native access.</b>
   <br />
-  Custom <code>.sr</code> columnar format · Bε-tree memtable · WAL with group commit · eight index kinds · hybrid pushdown · MVCC snapshots · page-level encryption · declarative constraints · user/role auth · credential enforcement · replication · change data capture · DataFusion SQL · NAPI addon
+  Custom <code>.sr</code> columnar format · Bε-tree memtable · WAL with group commit · eight index kinds · hybrid pushdown · MVCC snapshots · page-level encryption · declarative constraints · user/role auth · credential enforcement · replication · change data capture · DataFusion SQL · recursive CTEs · window functions · CREATE TABLE AS SELECT · materialized views · multi-statement SQL · FTS ranking · NAPI addon
 </p>
 
 <p align="center">
@@ -101,6 +101,11 @@ Bulk insert **2.3× faster than SQLite, 2.6× faster than DuckDB native**. Join
   open, so encrypted columns prune identically to plaintext ones.
 - **Multi-table:** a `Database` hosts many named tables under a shared WAL;
   distinct tables register on one DataFusion context for joins.
+- **SQL surface:** DataFusion 54 with `WITH RECURSIVE` CTEs, window functions
+  (`OVER`/`PARTITION BY`), `CREATE TABLE AS SELECT`, session-scoped
+  `CREATE VIEW` plus `CREATE MATERIALIZED VIEW`, multi-statement execution in a
+  single `run()` call, and an FTS ranking UDF
+  (`mongreldb_fts_rank`) alongside the `fts_docs` virtual table.
 - **Constraints:** opt-in per-table declarative unique, foreign-key (with
   `RESTRICT`/`CASCADE`/`SET NULL` on delete), and CHECK constraints, enforced
   inside the core transaction path — no application-side validation required.

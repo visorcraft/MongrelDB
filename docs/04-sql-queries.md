@@ -36,6 +36,19 @@ let batches = session.run("SELECT * FROM users WHERE score > 90").await?;
 `batches` is a `Vec<RecordBatch>` — Arrow's in-memory columnar format. Each
 batch holds up to 65,536 rows.
 
+### Multi-statement execution
+
+Multiple SQL statements separated by semicolons can be executed in a single
+`run()` call. Each statement is executed sequentially; the result of the last
+statement is returned. DDL/DML statements return empty result sets.
+
+```sql
+-- Execute DDL + DML + SELECT in one call.
+CREATE TABLE temp AS SELECT * FROM orders WHERE amount > 100;
+INSERT INTO temp (id, amount) VALUES (999, 500.0);
+SELECT count(*) FROM temp;
+```
+
 ### SELECT
 
 ```sql
@@ -137,7 +150,7 @@ To force a cold run (bypass cache):
 session.clear_cache();
 ```
 
-## Materialized Views
+## Views (CREATE VIEW)
 
 Register a named SQL query as a view. `SELECT * FROM <view_name>` is
 transparently rewritten to run the view's defining SQL. Views can be created
@@ -184,6 +197,48 @@ import { tableFromIPC } from 'apache-arrow';
 await db.sql('CREATE VIEW vip AS SELECT id, email FROM users WHERE score >= 90');
 const vips = tableFromIPC(await db.sql('SELECT * FROM vip ORDER BY id'));
 ```
+
+## Materialized Views (CREATE MATERIALIZED VIEW)
+
+A materialized view physically materializes its defining query as a real
+table — the data is stored, not computed on read. This is useful for
+expensive aggregations or joins that are queried frequently.
+
+```sql
+-- Create a materialized view that stores a pre-computed summary.
+CREATE MATERIALIZED VIEW daily_totals AS
+  SELECT date_trunc('day', created_at) AS day, SUM(amount) AS total
+  FROM orders GROUP BY day;
+
+-- Query it like a regular table — no recomputation.
+SELECT * FROM daily_totals WHERE day > '2026-01-01';
+```
+
+Materialized views are physically tables — they occupy storage and support
+indexes. The defining SQL is stored so the view can be refreshed
+(re-materialized) in a future release. To drop one, use `DROP TABLE` or
+`DROP MATERIALIZED VIEW`.
+
+**Views vs. Materialized Views:** regular `CREATE VIEW` stores only the SQL
+definition and recomputes on every read (session-scoped); `CREATE MATERIALIZED
+VIEW` stores the result rows and reads from the materialized table.
+
+## CREATE TABLE AS SELECT
+
+Create a new table and populate it from a query in one statement. The schema
+(column names and types) is inferred from the query result.
+
+```sql
+CREATE TABLE high_value_orders AS
+  SELECT * FROM orders WHERE amount > 1000;
+
+-- The new table is a regular table — add indexes, query it, etc.
+SELECT count(*) FROM high_value_orders;
+```
+
+The first column of the query becomes the primary key of the new table; all
+other columns are nullable. To customize the schema, create the table
+explicitly and `INSERT INTO ... SELECT`.
 
 ## Column Statistics
 

@@ -197,6 +197,24 @@ and running-frame windows against SQLite on a shared corpus. The percentile
 family follows SQLite's percentile-extension rules and is covered by direct
 expected-value tests because SQLite builds often omit that extension.
 
+## Full-Text Search
+
+| Function | Returns | Description |
+|---|---|---|
+| `mongreldb_fts_rank(text, query)` | Float64 | BM25-inspired relevance score for `text` against whitespace-tokenized `query`. Higher = more relevant. |
+
+```sql
+-- Rank rows by relevance to a query, returning the most relevant first.
+SELECT id, title, mongreldb_fts_rank(content, 'database performance') AS score
+FROM articles
+ORDER BY score DESC
+LIMIT 10;
+```
+
+For accurate full-text search with a maintained inverted index and global IDF,
+use the `fts_docs` virtual table module (see
+[Extended SQL & virtual tables](extended-sql-and-virtual-tables.md)).
+
 ## Custom Functions
 
 Rust applications can register custom DataFusion functions on a session:
