@@ -1265,7 +1265,11 @@ impl Database {
         *self.catalog.write() = cat.clone();
         match Self::resolve_principal_from_catalog(&cat, &username) {
             Some(p) => {
-                *self.principal.write() = Some(p);
+                *self.principal.write() = Some(p.clone());
+                // Update the shared auth state so mounted Tables see the new
+                // permissions immediately (Tables read from AuthState, not from
+                // self.principal).
+                self.auth_state.set_principal(Some(p));
                 Ok(())
             }
             None => Err(MongrelError::InvalidCredentials { username }),

@@ -94,7 +94,8 @@ impl AuthState {
         let guard = self.inner.principal.read();
         let p = guard.as_ref().ok_or(MongrelError::AuthRequired)?;
         let required = perm.into_permission(table_name);
-        if p.has_permission(&required) {
+        let has = p.has_permission(&required);
+        if has {
             Ok(())
         } else {
             Err(MongrelError::PermissionDenied {
