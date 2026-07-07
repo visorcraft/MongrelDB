@@ -34,24 +34,28 @@ fn trips_schema() -> Schema {
                 name: "id".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
             },
             ColumnDef {
                 id: 2,
                 name: "destination".into(),
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty(),
+                default_value: None,
             },
             ColumnDef {
                 id: 3,
                 name: "cost".into(),
                 ty: TypeId::Float64,
                 flags: ColumnFlags::empty(),
+                default_value: None,
             },
             ColumnDef {
                 id: 4,
                 name: "ts".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty(),
+                default_value: None,
             },
         ],
         indexes: vec![IndexDef {
@@ -75,12 +79,14 @@ fn cities_schema() -> Schema {
                 name: "city_name".into(),
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
             },
             ColumnDef {
                 id: 2,
                 name: "country".into(),
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty(),
+                default_value: None,
             },
         ],
         indexes: vec![],
@@ -728,8 +734,7 @@ fn main() {
     for &n in &[100i64, 1_000_000] {
         let m = mongrel(n, false);
         let me = mongrel(n, true);
-        let mut rows = vec![];
-        rows.push(row("plain", &m, &cols2));
+        let mut rows = vec![row("plain", &m, &cols2)];
         rows.push(row("encrypted", &me, &cols2));
         table(&format!("N = {n}"), &cols2, &rows);
     }

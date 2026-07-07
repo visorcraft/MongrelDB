@@ -15,12 +15,14 @@ fn sample_schema() -> Schema {
                 name: "id".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
             },
             ColumnDef {
                 id: 2,
                 name: "secret".into(),
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty(),
+                default_value: None,
             },
         ],
         indexes: vec![IndexDef {

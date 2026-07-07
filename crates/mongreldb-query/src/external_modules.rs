@@ -801,6 +801,7 @@ fn json_column(id: u16, name: &str, ty: TypeId, nullable: bool) -> CoreColumnDef
         } else {
             ColumnFlags::empty()
         },
+        default_value: None,
     }
 }
 
@@ -986,6 +987,7 @@ fn catalog_column(id: u16, name: &str, ty: TypeId, nullable: bool) -> CoreColumn
         } else {
             ColumnFlags::empty()
         },
+        default_value: None,
     }
 }
 
@@ -1417,12 +1419,14 @@ fn kv_store_schema() -> CoreSchema {
                 name: "key".to_string(),
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
             },
             CoreColumnDef {
                 id: 2,
                 name: "value".to_string(),
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+                default_value: None,
             },
         ],
         indexes: Vec::new(),
@@ -1581,7 +1585,7 @@ fn core_rows_to_batches(
                 .iter()
                 .map(|row| row.get(&column.id).cloned().unwrap_or(Value::Null))
                 .collect::<Vec<_>>();
-            arrow_conv::build_array(column.ty, &values)
+            arrow_conv::build_array(column.ty.clone(), &values)
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(vec![RecordBatch::try_new(arrow_schema, arrays)
@@ -1751,36 +1755,42 @@ fn fts_docs_schema() -> CoreSchema {
                 name: "doc_id".to_string(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
             },
             CoreColumnDef {
                 id: 2,
                 name: "text".to_string(),
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+                default_value: None,
             },
             CoreColumnDef {
                 id: 3,
                 name: "query".to_string(),
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+                default_value: None,
             },
             CoreColumnDef {
                 id: 4,
                 name: "rank".to_string(),
                 ty: TypeId::Float64,
                 flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+                default_value: None,
             },
             CoreColumnDef {
                 id: 5,
                 name: "snippet".to_string(),
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+                default_value: None,
             },
             CoreColumnDef {
                 id: 6,
                 name: "highlight".to_string(),
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+                default_value: None,
             },
         ],
         indexes: Vec::new(),
@@ -2689,6 +2699,7 @@ fn rtree_rects_schema() -> CoreSchema {
                 name: "id".to_string(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
             },
             rect_column(2, "min_x"),
             rect_column(3, "max_x"),
@@ -2712,6 +2723,7 @@ fn rect_column(id: u16, name: &str) -> CoreColumnDef {
         name: name.to_string(),
         ty: TypeId::Float64,
         flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+        default_value: None,
     }
 }
 
@@ -2780,24 +2792,28 @@ impl ExternalTableModule for SeriesModule {
                         name: "value".to_string(),
                         ty: TypeId::Int64,
                         flags: ColumnFlags::empty(),
+                        default_value: None,
                     },
                     CoreColumnDef {
                         id: 2,
                         name: "start".to_string(),
                         ty: TypeId::Int64,
                         flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+                        default_value: None,
                     },
                     CoreColumnDef {
                         id: 3,
                         name: "stop".to_string(),
                         ty: TypeId::Int64,
                         flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+                        default_value: None,
                     },
                     CoreColumnDef {
                         id: 4,
                         name: "step".to_string(),
                         ty: TypeId::Int64,
                         flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+                        default_value: None,
                     },
                 ],
                 indexes: Vec::new(),

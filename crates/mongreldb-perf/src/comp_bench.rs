@@ -17,42 +17,49 @@ fn schema() -> Schema {
                 name: "id".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
             },
             ColumnDef {
                 id: 2,
                 name: "category".into(),
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty(),
+                default_value: None,
             },
             ColumnDef {
                 id: 3,
                 name: "status".into(),
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty(),
+                default_value: None,
             },
             ColumnDef {
                 id: 4,
                 name: "amount".into(),
                 ty: TypeId::Float64,
                 flags: ColumnFlags::empty(),
+                default_value: None,
             },
             ColumnDef {
                 id: 5,
                 name: "ts".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty(),
+                default_value: None,
             },
             ColumnDef {
                 id: 6,
                 name: "user_id".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty(),
+                default_value: None,
             },
             ColumnDef {
                 id: 7,
                 name: "region".into(),
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty(),
+                default_value: None,
             },
         ],
         indexes: vec![
@@ -60,19 +67,19 @@ fn schema() -> Schema {
                 name: "cat_bm".into(),
                 column_id: 2,
                 kind: IndexKind::Bitmap,
-            predicate: None,
+                predicate: None,
             },
             IndexDef {
                 name: "status_bm".into(),
                 column_id: 3,
                 kind: IndexKind::Bitmap,
-            predicate: None,
+                predicate: None,
             },
             IndexDef {
                 name: "region_bm".into(),
                 column_id: 7,
                 kind: IndexKind::Bitmap,
-            predicate: None,
+                predicate: None,
             },
         ],
         colocation: vec![],
@@ -90,12 +97,14 @@ fn users_schema() -> Schema {
                 name: "uid".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
             },
             ColumnDef {
                 id: 2,
                 name: "region".into(),
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty(),
+                default_value: None,
             },
         ],
         indexes: vec![],
@@ -131,7 +140,7 @@ struct Stats {
 }
 
 fn measure(runs: Vec<Duration>) -> Stats {
-    let mut sorted: Vec<f64> = runs.into_iter().map(|d| ms(d)).collect();
+    let mut sorted: Vec<f64> = runs.into_iter().map(ms).collect();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let n = sorted.len();
     Stats {

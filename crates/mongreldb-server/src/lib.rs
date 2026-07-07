@@ -422,7 +422,7 @@ async fn create_table(
             id: c.id,
             name: c.name.clone(),
             ty,
-            flags,
+            flags,            default_value: None,
         });
     }
     let schema = Schema {
@@ -458,7 +458,7 @@ struct PutRequest {
     row: Vec<serde_json::Value>,
 }
 
-pub(crate) fn json_to_value(v: &serde_json::Value, expected: TypeId) -> Value {
+pub(crate) fn json_to_value(v: &serde_json::Value, expected: &TypeId) -> Value {
     match (v, expected) {
         (serde_json::Value::Number(n), TypeId::Float64) => {
             n.as_f64().map(Value::Float64).unwrap_or(Value::Null)
@@ -467,6 +467,13 @@ pub(crate) fn json_to_value(v: &serde_json::Value, expected: TypeId) -> Value {
             n.as_i64().map(Value::Int64).unwrap_or(Value::Null)
         }
         (serde_json::Value::String(s), TypeId::Bytes) => Value::Bytes(s.as_bytes().to_vec()),
+        (serde_json::Value::String(s), TypeId::Enum { variants }) => {
+            if variants.iter().any(|v| v == s) {
+                Value::Bytes(s.as_bytes().to_vec())
+            } else {
+                Value::Null
+            }
+        }
         (serde_json::Value::Bool(b), TypeId::Bool) => Value::Bool(*b),
         (serde_json::Value::Null, _) => Value::Null,
         // Lenient fallbacks for unknown/loosely-typed JSON.
@@ -503,9 +510,9 @@ fn parse_cells(
             .columns
             .iter()
             .find(|c| c.id == col_id)
-            .map(|c| c.ty)
+            .map(|c| c.ty.clone())
             .ok_or_else(|| format!("unknown column id {col_id}"))?;
-        let val = json_to_value(&chunk[1], expected);
+        let val = json_to_value(&chunk[1], &expected);
         out.push((col_id, val));
     }
     Ok(out)
@@ -762,7 +769,7 @@ mod wal_stream_tests {
                 name: "id".into(),
                 ty: TypeId::Int64,
                 flags: mongreldb_core::schema::ColumnFlags::empty()
-                    .with(mongreldb_core::schema::ColumnFlags::PRIMARY_KEY),
+                    .with(mongreldb_core::schema::ColumnFlags::PRIMARY_KEY),            default_value: None,
             }],
             indexes: vec![],
             colocation: vec![],

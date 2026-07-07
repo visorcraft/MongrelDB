@@ -19,18 +19,21 @@ fn schema_plain() -> Schema {
                 name: "id".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
             },
             ColumnDef {
                 id: 2,
                 name: "v".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty(),
+                default_value: None,
             },
             ColumnDef {
                 id: 3,
                 name: "label".into(),
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty(),
+                default_value: None,
             },
         ],
         indexes: vec![IndexDef {
@@ -502,12 +505,14 @@ mod encrypted {
                     name: "id".into(),
                     ty: TypeId::Int64,
                     flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                    default_value: None,
                 },
                 ColumnDef {
                     id: 2,
                     name: "label".into(),
                     ty: TypeId::Bytes,
                     flags: ColumnFlags::empty().with(ColumnFlags::ENCRYPTED_INDEXABLE),
+                    default_value: None,
                 },
             ],
             indexes: vec![IndexDef {
@@ -531,12 +536,14 @@ mod encrypted {
                     name: "id".into(),
                     ty: TypeId::Int64,
                     flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                    default_value: None,
                 },
                 ColumnDef {
                     id: 2,
                     name: "score".into(),
                     ty: TypeId::Int64,
                     flags: ColumnFlags::empty().with(ColumnFlags::ENCRYPTED_INDEXABLE),
+                    default_value: None,
                 },
             ],
             indexes: vec![IndexDef {

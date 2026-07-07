@@ -112,6 +112,7 @@ impl<'db> Transaction<'db> {
         let handle = self.db.table(table)?;
         let mut t = handle.lock();
         let assigned = t.fill_auto_inc(&mut cells)?;
+        t.apply_defaults(&mut cells)?;
         drop(t);
         self.staging.push((id, Staged::Put(cells)));
         Ok(assigned)
@@ -127,7 +128,10 @@ impl<'db> Transaction<'db> {
         let id = self.db.table_id(table)?;
         self.reject_after_truncate(id)?;
         let handle = self.db.table(table)?;
-        let assigned = handle.lock().fill_auto_inc(&mut cells)?;
+        let mut t = handle.lock();
+        let assigned = t.fill_auto_inc(&mut cells)?;
+        t.apply_defaults(&mut cells)?;
+        drop(t);
         let row = owned_row_from_cells(&cells);
         self.staging.push((id, Staged::Put(cells)));
         Ok(PutResult {
@@ -155,6 +159,7 @@ impl<'db> Transaction<'db> {
         let mut assigned = Vec::with_capacity(rows.len());
         for mut cells in rows {
             let a = t.fill_auto_inc(&mut cells)?;
+            t.apply_defaults(&mut cells)?;
             assigned.push(a);
             self.staging.push((id, Staged::Put(cells)));
         }
@@ -248,11 +253,11 @@ impl<'db> Transaction<'db> {
         self.reject_after_truncate(id)?;
         match (self.existing_pk_row(table, &insert_cells)?, action) {
             (None, _) => {
-                let assigned = self
-                    .db
-                    .table(table)?
-                    .lock()
-                    .fill_auto_inc(&mut insert_cells)?;
+                let handle = self.db.table(table)?;
+                let mut t = handle.lock();
+                let assigned = t.fill_auto_inc(&mut insert_cells)?;
+                t.apply_defaults(&mut insert_cells)?;
+                drop(t);
                 let row = owned_row_from_cells(&insert_cells);
                 self.staging.push((id, Staged::Put(insert_cells)));
                 Ok(UpsertResult {

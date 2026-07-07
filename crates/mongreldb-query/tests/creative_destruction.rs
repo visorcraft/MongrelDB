@@ -19,18 +19,21 @@ fn setup() -> (tempfile::TempDir, Arc<Database>) {
                 name: "id".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
             },
             ColumnDef {
                 id: 2,
                 name: "text_col".into(),
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty(),
+                default_value: None,
             },
             ColumnDef {
                 id: 3,
                 name: "nullable_col".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+                default_value: None,
             },
         ],
         indexes: vec![],
@@ -111,6 +114,7 @@ fn run(db: &Arc<Database>, sql: &str) -> Result<Vec<Vec<(String, String)>>, Stri
     Ok(rows)
 }
 
+#[allow(dead_code)]
 fn run_ok(db: &Arc<Database>, sql: &str) -> usize {
     run(db, sql).map(|r| r.len()).unwrap_or(0)
 }
@@ -121,7 +125,7 @@ fn ctas_table_name_with_special_chars() {
     let (_dir, db) = setup();
     // Quoted table name with semicolons — the quotes protect against injection.
     // The semicolons are part of the identifier, not SQL. This is correct behavior.
-    let result = run(&db, "CREATE TABLE \"safe_name\" AS SELECT id FROM t");
+    let _result = run(&db, "CREATE TABLE \"safe_name\" AS SELECT id FROM t");
     // Original table should still exist regardless of the outcome.
     assert!(
         db.table("t").is_ok(),
@@ -342,7 +346,7 @@ fn fts_rank_in_where_clause() {
 
 // 16. Auth: encrypted + disable_auth
 #[test]
-#[cfg(feature = "encryption")]
+
 fn auth_encrypted_disable_auth() {
     let dir = tempdir().unwrap();
     let path = dir.path();
@@ -370,6 +374,7 @@ fn ctas_large_dataset() {
             name: "id".into(),
             ty: TypeId::Int64,
             flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+            default_value: None,
         }],
         indexes: vec![],
         colocation: vec![],
@@ -450,12 +455,14 @@ fn fts_rank_very_long_text() {
                 name: "id".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
             },
             ColumnDef {
                 id: 2,
                 name: "body".into(),
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty(),
+                default_value: None,
             },
         ],
         indexes: vec![],
@@ -501,6 +508,7 @@ fn auth_all_permission_on_ctas_table() {
                     name: "id".into(),
                     ty: TypeId::Int64,
                     flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                    default_value: None,
                 }],
                 indexes: vec![],
                 colocation: vec![],

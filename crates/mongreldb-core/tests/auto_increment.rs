@@ -18,12 +18,14 @@ fn ai_schema() -> Schema {
                 flags: ColumnFlags::empty()
                     .with(ColumnFlags::PRIMARY_KEY)
                     .with(ColumnFlags::AUTO_INCREMENT),
+                default_value: None,
             },
             ColumnDef {
                 id: 2,
                 name: "label".into(),
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty(),
+                default_value: None,
             },
         ],
         indexes: vec![],
@@ -44,12 +46,14 @@ fn ai_int_schema() -> Schema {
                 flags: ColumnFlags::empty()
                     .with(ColumnFlags::PRIMARY_KEY)
                     .with(ColumnFlags::AUTO_INCREMENT),
+                default_value: None,
             },
             ColumnDef {
                 id: 2,
                 name: "value".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty(),
+                default_value: None,
             },
         ],
         indexes: vec![],
@@ -204,6 +208,7 @@ fn rejects_invalid_auto_inc_schema() {
             flags: ColumnFlags::empty()
                 .with(ColumnFlags::PRIMARY_KEY)
                 .with(ColumnFlags::AUTO_INCREMENT),
+            default_value: None,
         }],
         indexes: vec![],
         colocation: vec![],
@@ -428,6 +433,7 @@ fn no_pk_schema() -> Schema {
             name: "label".into(),
             ty: TypeId::Bytes,
             flags: ColumnFlags::empty(),
+            default_value: None,
         }],
         indexes: vec![],
         colocation: vec![],
@@ -486,7 +492,7 @@ fn add_column_can_create_auto_increment_primary_key() {
     let flags = ColumnFlags::empty()
         .with(ColumnFlags::PRIMARY_KEY)
         .with(ColumnFlags::AUTO_INCREMENT);
-    let id = t.add_column("id", TypeId::Int64, flags).unwrap();
+    let id = t.add_column("id", TypeId::Int64, flags, None).unwrap();
     assert_eq!(id, 3, "new column id follows the existing max column id");
 
     let (_, assigned) = t

@@ -12,6 +12,7 @@ fn clustered_schema() -> CoreSchema {
             name: "id".into(),
             ty: TypeId::Int64,
             flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+            default_value: None,
         }],
         indexes: vec![],
         colocation: vec![],

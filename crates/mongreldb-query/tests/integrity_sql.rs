@@ -25,30 +25,35 @@ fn main_schema() -> Schema {
                 name: "id".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
             },
             ColumnDef {
                 id: 2,
                 name: "name".into(),
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty(),
+                default_value: None,
             },
             ColumnDef {
                 id: 3,
                 name: "cat".into(),
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty(),
+                default_value: None,
             },
             ColumnDef {
                 id: 4,
                 name: "amount".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty(),
+                default_value: None,
             },
             ColumnDef {
                 id: 5,
                 name: "score".into(),
                 ty: TypeId::Float64,
                 flags: ColumnFlags::empty(),
+                default_value: None,
             },
         ],
         indexes: vec![
@@ -92,12 +97,14 @@ fn ann_schema() -> Schema {
                 name: "id".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
             },
             ColumnDef {
                 id: 2,
                 name: "vec".into(),
                 ty: TypeId::Embedding { dim: 8 },
                 flags: ColumnFlags::empty(),
+                default_value: None,
             },
         ],
         indexes: vec![IndexDef {
@@ -121,12 +128,14 @@ fn orders_schema() -> Schema {
                 name: "id".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
             },
             ColumnDef {
                 id: 2,
                 name: "customer_id".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty(),
+                default_value: None,
             },
         ],
         indexes: vec![],
@@ -145,12 +154,14 @@ fn customers_schema() -> Schema {
                 name: "id".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
             },
             ColumnDef {
                 id: 2,
                 name: "name".into(),
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty(),
+                default_value: None,
             },
         ],
         indexes: vec![],
@@ -240,7 +251,7 @@ fn sql_rows(batches: &[RecordBatch], schema: &Schema) -> Vec<ComparableRow> {
                     continue;
                 }
                 if let Some(cdef) = schema.column(name) {
-                    if let Some(v) = arrow_cell(batch.column(j), r, cdef.ty) {
+                    if let Some(v) = arrow_cell(batch.column(j), r, cdef.ty.clone()) {
                         cols.insert(cdef.id, v);
                     }
                 }
@@ -825,12 +836,14 @@ async fn schema_evolution_reads_null_for_old_rows() {
                 name: "id".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
             },
             ColumnDef {
                 id: 2,
                 name: "amount".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty(),
+                default_value: None,
             },
         ],
         indexes: vec![],
@@ -852,6 +865,7 @@ async fn schema_evolution_reads_null_for_old_rows() {
         "note",
         TypeId::Bytes,
         ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+        None,
     )
     .unwrap();
     for i in 10..20i64 {

@@ -60,7 +60,7 @@ pub fn drain_cursor_to_columns(
         .enumerate()
         .map(|(j, pieces)| {
             let col = if pieces.is_empty() {
-                crate::columnar::null_native(projection[j].1, 0)
+                crate::columnar::null_native(projection[j].1.clone(), 0)
             } else {
                 NativeColumn::concat(&pieces)
             };
@@ -124,7 +124,7 @@ impl NativePageCursor {
 
     /// The projected column types, in output order.
     pub fn projection_types(&self) -> Vec<TypeId> {
-        self.projection.iter().map(|(_, t)| *t).collect()
+        self.projection.iter().map(|(_, t)| t.clone()).collect()
     }
 
     /// Total surviving rows still to be yielded across all remaining plans plus
@@ -160,10 +160,10 @@ impl NativePageCursor {
                 // survivor positions (mirroring RunReader::column_native).
                 let col = if self.reader.has_column(*cid) {
                     let page = self.reader.read_page(*cid, plan.seq)?;
-                    let decoded = decode_page_native(*ty, &page, nrows)?;
+                    let decoded = decode_page_native(ty.clone(), &page, nrows)?;
                     decoded.gather(&plan.positions)
                 } else {
-                    crate::columnar::null_native(*ty, plan.positions.len())
+                    crate::columnar::null_native(ty.clone(), plan.positions.len())
                 };
                 cols.push(col);
             }
@@ -287,9 +287,9 @@ impl MultiRunCursor {
         for (cid, ty) in &self.projection {
             let col = if stream.reader.has_column(*cid) {
                 let page = stream.reader.read_page(*cid, page_seq)?;
-                decode_page_native(*ty, &page, nrows)?
+                decode_page_native(ty.clone(), &page, nrows)?
             } else {
-                crate::columnar::null_native(*ty, nrows)
+                crate::columnar::null_native(ty.clone(), nrows)
             };
             cols.push(col);
         }
@@ -301,7 +301,7 @@ impl MultiRunCursor {
 
 impl Cursor for MultiRunCursor {
     fn projection_types(&self) -> Vec<TypeId> {
-        self.projection.iter().map(|(_, t)| *t).collect()
+        self.projection.iter().map(|(_, t)| t.clone()).collect()
     }
 
     fn remaining_rows(&self) -> usize {

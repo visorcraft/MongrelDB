@@ -21,6 +21,7 @@ fn schema_with_indexable_bitmap() -> Schema {
                 name: "id".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
             },
             ColumnDef {
                 id: 2,
@@ -29,6 +30,7 @@ fn schema_with_indexable_bitmap() -> Schema {
                 flags: ColumnFlags::empty()
                     .with(ColumnFlags::ENCRYPTED)
                     .with(ColumnFlags::ENCRYPTED_INDEXABLE),
+                default_value: None,
             },
             ColumnDef {
                 id: 3,
@@ -37,6 +39,7 @@ fn schema_with_indexable_bitmap() -> Schema {
                 flags: ColumnFlags::empty()
                     .with(ColumnFlags::ENCRYPTED)
                     .with(ColumnFlags::NULLABLE),
+                default_value: None,
             },
         ],
         indexes: vec![IndexDef {
@@ -60,6 +63,7 @@ fn schema_with_indexable_range() -> Schema {
                 name: "id".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
             },
             ColumnDef {
                 id: 2,
@@ -68,6 +72,7 @@ fn schema_with_indexable_range() -> Schema {
                 flags: ColumnFlags::empty()
                     .with(ColumnFlags::ENCRYPTED)
                     .with(ColumnFlags::ENCRYPTED_INDEXABLE),
+                default_value: None,
             },
         ],
         indexes: vec![IndexDef {
@@ -91,18 +96,21 @@ fn schema_plain_encrypted_mix() -> Schema {
                 name: "id".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
             },
             ColumnDef {
                 id: 2,
                 name: "plain_label".into(),
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty(),
+                default_value: None,
             },
             ColumnDef {
                 id: 3,
                 name: "secret".into(),
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty().with(ColumnFlags::ENCRYPTED),
+                default_value: None,
             },
         ],
         indexes: vec![IndexDef {
@@ -424,6 +432,7 @@ fn encrypted_schema_evolution() {
                 "new_col",
                 TypeId::Int64,
                 ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+                None,
             )
             .unwrap();
         db.put(vec![

@@ -549,14 +549,7 @@ impl Database {
             roles: Vec::new(),
             permissions: Vec::new(),
         };
-        Ok(Self::finish_open(
-            root,
-            cat,
-            kek,
-            meta_dek,
-            false,
-            Some(admin_principal),
-        )?)
+        Self::finish_open(root, cat, kek, meta_dek, false, Some(admin_principal))
     }
 
     fn open_inner(
@@ -4723,7 +4716,7 @@ fn bind_procedure_args(
                 param.name
             )));
         }
-        if !matches!(value, crate::Value::Null) && !value_matches_type(&value, param.ty) {
+        if !matches!(value, crate::Value::Null) && !value_matches_type(&value, param.ty.clone()) {
             return Err(MongrelError::InvalidArgument(format!(
                 "procedure parameter {:?} has wrong type",
                 param.name

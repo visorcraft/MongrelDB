@@ -17,7 +17,7 @@ fn decimal_encode_decode_roundtrip() {
         Value::Null,
         Value::Decimal(i128::MAX),
     ];
-    let page = encode_column(ty, &values).unwrap();
+    let page = encode_column(ty.clone(), &values).unwrap();
     let decoded = decode_column(ty, &page, values.len(), false).unwrap();
     assert_eq!(decoded, values);
 }

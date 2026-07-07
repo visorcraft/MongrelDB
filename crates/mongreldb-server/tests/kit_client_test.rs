@@ -18,7 +18,7 @@ fn col(id: u16, name: &str, ty: TypeId, flags: ColumnFlags) -> ColumnDef {
         id,
         name: name.into(),
         ty,
-        flags,
+        flags,            default_value: None,
     }
 }
 

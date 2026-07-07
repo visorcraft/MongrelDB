@@ -84,7 +84,12 @@ pub struct CheckConstraint {
 /// row's cells. Terms ([`CheckExpr::Col`] / [`CheckExpr::Lit`]) resolve to
 /// [`Value`]; comparisons and logical ops are boolean. Any comparison involving
 /// `Value::Null` yields three-valued `Unknown`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+///
+/// The [`CheckExpr::Regex`] variant stores the pattern string for serde/equality
+/// and caches the compiled [`regex::Regex`] in a [`std::sync::OnceLock`] (populated
+/// on first evaluation). The cache is `#[serde(skip)]` and excluded from
+/// [`PartialEq`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CheckExpr {
     /// Constant true (the trivially-satisfied CHECK).
     True,
@@ -103,6 +108,58 @@ pub enum CheckExpr {
     And(Box<CheckExpr>, Box<CheckExpr>),
     Or(Box<CheckExpr>, Box<CheckExpr>),
     Not(Box<CheckExpr>),
+    /// Regex pattern match against a column's value (PostgreSQL `~`/`~*`/`!~`/`!~*`).
+    /// The column value must be `Value::Bytes` (UTF-8 string); non-bytes and null
+    /// yield `Unknown` (CHECK passes). `negated` inverts the match result;
+    /// `case_insensitive` enables case-insensitive matching. The Rust `regex`
+    /// crate is linear-time (no catastrophic backtracking), so ReDoS is not a
+    /// concern.
+    Regex {
+        col: u16,
+        pattern: String,
+        negated: bool,
+        case_insensitive: bool,
+        #[serde(skip)]
+        cached: std::sync::OnceLock<regex::Regex>,
+    },
+}
+
+impl PartialEq for CheckExpr {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::True, Self::True) => true,
+            (Self::Col(a), Self::Col(b)) => a == b,
+            (Self::Lit(a), Self::Lit(b)) => a == b,
+            (Self::IsNull(a), Self::IsNull(b)) => a == b,
+            (Self::IsNotNull(a), Self::IsNotNull(b)) => a == b,
+            (Self::Eq(a1, a2), Self::Eq(b1, b2)) => a1 == b1 && a2 == b2,
+            (Self::Ne(a1, a2), Self::Ne(b1, b2)) => a1 == b1 && a2 == b2,
+            (Self::Lt(a1, a2), Self::Lt(b1, b2)) => a1 == b1 && a2 == b2,
+            (Self::Le(a1, a2), Self::Le(b1, b2)) => a1 == b1 && a2 == b2,
+            (Self::Gt(a1, a2), Self::Gt(b1, b2)) => a1 == b1 && a2 == b2,
+            (Self::Ge(a1, a2), Self::Ge(b1, b2)) => a1 == b1 && a2 == b2,
+            (Self::And(a1, a2), Self::And(b1, b2)) => a1 == b1 && a2 == b2,
+            (Self::Or(a1, a2), Self::Or(b1, b2)) => a1 == b1 && a2 == b2,
+            (Self::Not(a), Self::Not(b)) => a == b,
+            (
+                Self::Regex {
+                    col: ac,
+                    pattern: ap,
+                    negated: an,
+                    case_insensitive: ai,
+                    ..
+                },
+                Self::Regex {
+                    col: bc,
+                    pattern: bp,
+                    negated: bn,
+                    case_insensitive: bi,
+                    ..
+                },
+            ) => ac == bc && ap == bp && an == bn && ai == bi,
+            _ => false,
+        }
+    }
 }
 
 /// Three-valued logic result for CHECK evaluation.
@@ -118,6 +175,34 @@ impl CheckExpr {
     /// satisfied unless this returns [`Tri::False`].
     pub fn satisfied(&self, cells: &HashMap<u16, Value>) -> bool {
         !matches!(self.eval(cells), Tri::False)
+    }
+
+    /// Validate that all regex patterns in this expression compile successfully.
+    /// Call at DDL time (table creation / constraint addition) so invalid
+    /// patterns are rejected eagerly rather than silently never-matching at
+    /// first commit.
+    pub fn validate(&self) -> Result<()> {
+        match self {
+            CheckExpr::Eq(a, b)
+            | CheckExpr::Ne(a, b)
+            | CheckExpr::Lt(a, b)
+            | CheckExpr::Le(a, b)
+            | CheckExpr::Gt(a, b)
+            | CheckExpr::Ge(a, b)
+            | CheckExpr::And(a, b)
+            | CheckExpr::Or(a, b) => {
+                a.validate()?;
+                b.validate()?;
+            }
+            CheckExpr::Not(a) => a.validate()?,
+            CheckExpr::Regex { pattern, .. } => {
+                regex::Regex::new(pattern).map_err(|e| {
+                    MongrelError::InvalidArgument(format!("invalid regex pattern: {e}"))
+                })?;
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     fn eval(&self, cells: &HashMap<u16, Value>) -> Tri {
@@ -157,6 +242,34 @@ impl CheckExpr {
             CheckExpr::And(a, b) => and3(a.eval(cells), b.eval(cells)),
             CheckExpr::Or(a, b) => or3(a.eval(cells), b.eval(cells)),
             CheckExpr::Not(a) => not3(a.eval(cells)),
+            CheckExpr::Regex {
+                col,
+                pattern,
+                negated,
+                case_insensitive,
+                cached,
+            } => match cells.get(col) {
+                None | Some(Value::Null) => Tri::Unknown,
+                Some(Value::Bytes(b)) => {
+                    let re = cached.get_or_init(|| {
+                        let mut builder = regex::RegexBuilder::new(pattern);
+                        builder.case_insensitive(*case_insensitive);
+                        // Invalid patterns are rejected at DDL validation; if we
+                        // reach here with an invalid pattern, create a regex that
+                        // never matches (safe default).
+                        builder
+                            .build()
+                            .unwrap_or_else(|_| regex::Regex::new("$^").unwrap())
+                    });
+                    let matched = re.is_match(std::str::from_utf8(b).unwrap_or(""));
+                    match (*negated, matched) {
+                        (false, true) | (true, false) => Tri::True,
+                        (false, false) | (true, true) => Tri::False,
+                    }
+                }
+                // Non-bytes values (numbers, bools, etc.) are not regex-matchable.
+                Some(_) => Tri::Unknown,
+            },
         }
     }
 
@@ -400,5 +513,98 @@ mod tests {
         // distinct values → distinct keys
         let k2 = encode_composite_key(&[1, 2], &m(&[(1, Value::Int64(6)), (2, Value::Int64(7))]));
         assert_ne!(k.unwrap(), k2.unwrap());
+    }
+
+    fn regex_expr(col: u16, pattern: &str, negated: bool, ci: bool) -> CheckExpr {
+        CheckExpr::Regex {
+            col,
+            pattern: pattern.to_string(),
+            negated,
+            case_insensitive: ci,
+            cached: std::sync::OnceLock::new(),
+        }
+    }
+
+    #[test]
+    fn check_regex_match() {
+        let e = regex_expr(1, r"^a\w+z$", false, false);
+        assert!(e.satisfied(&m(&[(1, Value::Bytes(b"abz".to_vec()))])));
+        assert!(e.satisfied(&m(&[(1, Value::Bytes(b"alfredz".to_vec()))])));
+        assert!(!e.satisfied(&m(&[(1, Value::Bytes(b"abc".to_vec()))])));
+    }
+
+    #[test]
+    fn check_regex_null_is_unknown() {
+        let e = regex_expr(1, r"^\d+$", false, false);
+        assert!(e.satisfied(&m(&[(1, Value::Null)])));
+        assert!(e.satisfied(&m(&[]))); // column absent
+    }
+
+    #[test]
+    fn check_regex_negated() {
+        let e = regex_expr(1, r"^\d+$", true, false);
+        assert!(e.satisfied(&m(&[(1, Value::Bytes(b"abc".to_vec()))])));
+        assert!(!e.satisfied(&m(&[(1, Value::Bytes(b"123".to_vec()))])));
+    }
+
+    #[test]
+    fn check_regex_case_insensitive() {
+        let e = regex_expr(1, r"^hello$", false, true);
+        assert!(e.satisfied(&m(&[(1, Value::Bytes(b"HELLO".to_vec()))])));
+        assert!(e.satisfied(&m(&[(1, Value::Bytes(b"Hello".to_vec()))])));
+    }
+
+    #[test]
+    fn check_regex_non_bytes_is_unknown() {
+        let e = regex_expr(1, r"\d+", false, false);
+        // Int64 is not regex-matchable → Unknown → satisfied
+        assert!(e.satisfied(&m(&[(1, Value::Int64(42))])));
+    }
+
+    #[test]
+    fn check_regex_validate_rejects_invalid_pattern() {
+        assert!(regex_expr(1, "[", false, false).validate().is_err());
+        assert!(regex_expr(1, r"^\d+$", false, false).validate().is_ok());
+    }
+
+    #[test]
+    fn check_regex_partial_eq_ignores_cache() {
+        let a = regex_expr(1, r"^\d+$", false, false);
+        let b = regex_expr(1, r"^\d+$", false, false);
+        assert_eq!(a, b);
+        // Populate cache on one — equality still holds because cached is ignored.
+        a.satisfied(&m(&[(1, Value::Bytes(b"1".to_vec()))]));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn check_regex_serde_roundtrip() {
+        let e = regex_expr(1, r"^\w+@[\w.]+$", true, true);
+        let json = serde_json::to_string(&e).unwrap();
+        // Ensure the `cached` OnceLock field is NOT serialized.
+        assert!(!json.contains("cached"));
+        let de: CheckExpr = serde_json::from_str(&json).unwrap();
+        assert_eq!(e, de);
+        // Deserialized regex still evaluates correctly.
+        assert!(de.satisfied(&m(&[(1, Value::Bytes(b"not-an-email".to_vec()))])));
+        assert!(!de.satisfied(&m(&[(1, Value::Bytes(b"a@b.com".to_vec()))])));
+    }
+
+    #[test]
+    fn check_regex_inside_logical_ops() {
+        // col 1 matches digits AND col 2 is not null
+        let e = CheckExpr::And(
+            Box::new(regex_expr(1, r"^\d+$", false, false)),
+            Box::new(CheckExpr::IsNotNull(2)),
+        );
+        assert!(e.satisfied(&m(&[
+            (1, Value::Bytes(b"42".to_vec())),
+            (2, Value::Int64(1))
+        ])));
+        assert!(!e.satisfied(&m(&[(1, Value::Bytes(b"42".to_vec())), (2, Value::Null)])));
+        assert!(!e.satisfied(&m(&[
+            (1, Value::Bytes(b"abc".to_vec())),
+            (2, Value::Int64(1))
+        ])));
     }
 }

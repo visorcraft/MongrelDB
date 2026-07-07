@@ -183,6 +183,7 @@ mod tests {
                 name: "v".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
             }],
             indexes: Vec::new(),
             colocation: vec![],

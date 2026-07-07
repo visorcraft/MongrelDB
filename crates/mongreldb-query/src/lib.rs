@@ -225,13 +225,13 @@ impl TableProvider for MongrelProvider {
                 .columns
                 .iter()
                 .find(|c| c.id == *cid)
-                .map(|c| c.ty)
+                .map(|c| c.ty.clone())
                 .ok_or_else(|| {
                     DataFusionError::External(Box::new(MongrelQueryError::Arrow(format!(
                         "unknown column {cid}"
                     ))))
                 })?;
-            proj_pairs.push((*cid, ty));
+            proj_pairs.push((*cid, ty.clone()));
             types.push(ty);
         }
 
@@ -355,7 +355,7 @@ impl TableProvider for MongrelProvider {
                     let arrays = ordered
                         .iter()
                         .zip(types.iter())
-                        .map(|(col, &ty)| arrow_conv::native_to_array(ty, col))
+                        .map(|(col, ty)| arrow_conv::native_to_array(ty.clone(), col))
                         .collect::<Result<_>>()
                         .unwrap_or_default();
                     (dir, rid, arrays, scan_schema.clone())
@@ -1164,7 +1164,7 @@ fn translate_sqlparser_predicate(
                         None
                     }
                 }
-                Lt | LtEq | Gt | GtEq if is_int_ty(cdef.ty) => {
+                Lt | LtEq | Gt | GtEq if is_int_ty(cdef.ty.clone()) => {
                     let n = match v {
                         Value::Int64(n) => n,
                         _ => return None,
@@ -1183,7 +1183,7 @@ fn translate_sqlparser_predicate(
                         hi,
                     })
                 }
-                Lt | LtEq | Gt | GtEq if is_float_ty(cdef.ty) => {
+                Lt | LtEq | Gt | GtEq if is_float_ty(cdef.ty.clone()) => {
                     let f = match v {
                         Value::Float64(f) => f,
                         _ => return None,
@@ -1214,7 +1214,7 @@ fn translate_sqlparser_predicate(
         } if !negated => {
             let name = sp_ident_name(expr)?;
             let cdef = col_def(name)?;
-            if is_int_ty(cdef.ty) {
+            if is_int_ty(cdef.ty.clone()) {
                 let lo = match sp_literal(low)? {
                     Value::Int64(n) => n,
                     _ => return None,
@@ -1228,7 +1228,7 @@ fn translate_sqlparser_predicate(
                     lo,
                     hi,
                 })
-            } else if is_float_ty(cdef.ty) {
+            } else if is_float_ty(cdef.ty.clone()) {
                 let lo = match sp_literal(low)? {
                     Value::Float64(f) => f,
                     _ => return None,
@@ -1774,7 +1774,7 @@ impl MongrelSession {
                 .columns
                 .iter()
                 .find(|c| c.id == *cid)
-                .map(|c| c.ty)
+                .map(|c| c.ty.clone())
                 .unwrap_or(mongreldb_core::schema::TypeId::Int64);
             arrays.push(arrow_conv::native_to_array(ty, &col)?);
         }
@@ -3576,6 +3576,7 @@ fn parse_create_table(sql: &str) -> Result<(String, mongreldb_core::schema::Sche
             name: col_name.to_string(),
             ty,
             flags,
+            default_value: None,
         });
     }
 

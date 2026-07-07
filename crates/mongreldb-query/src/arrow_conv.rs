@@ -38,7 +38,7 @@ fn all_bits_set(validity: &[u8], n: usize) -> bool {
 /// For the common all-non-null case on fixed-width columns, constructs the Arrow
 /// array directly from the typed buffer (one memcpy, no per-element builder).
 pub fn native_to_array(ty: TypeId, col: &NativeColumn) -> Result<ArrayRef> {
-    Ok(match (ty, col) {
+    Ok(match (ty.clone(), col) {
         (TypeId::Int64 | TypeId::TimestampNanos, NativeColumn::Int64 { data, validity }) => {
             if all_bits_set(validity, data.len()) {
                 Arc::new(Int64Array::new(data.clone().into(), None))
@@ -81,7 +81,7 @@ pub fn native_to_array(ty: TypeId, col: &NativeColumn) -> Result<ArrayRef> {
             Arc::new(b.finish())
         }
         (
-            TypeId::Bytes,
+            TypeId::Bytes | TypeId::Enum { .. },
             NativeColumn::Bytes {
                 offsets,
                 values,
@@ -154,7 +154,7 @@ pub fn native_columns_to_batch(
             .find(|(id, _)| *id == cdef.id)
             .map(|(_, c)| c)
             .ok_or_else(|| MongrelQueryError::Arrow(format!("missing column {}", cdef.id)))?;
-        arrays.push(native_to_array(cdef.ty, col)?);
+        arrays.push(native_to_array(cdef.ty.clone(), col)?);
     }
     let fields: Vec<Field> = schema
         .columns
@@ -201,6 +201,7 @@ pub(crate) fn arrow_data_type(ty: &TypeId) -> Result<DataType> {
             *dim as i32,
         ),
         TypeId::Decimal128 { precision, scale } => DataType::Decimal128(*precision, *scale),
+        TypeId::Enum { .. } => DataType::Utf8,
     })
 }
 
@@ -209,7 +210,11 @@ pub fn rows_to_batch(
     rows: &[mongreldb_core::Row],
     schema: &MongrelSchema,
 ) -> Result<arrow::record_batch::RecordBatch> {
-    let fields: Vec<(u16, TypeId)> = schema.columns.iter().map(|c| (c.id, c.ty)).collect();
+    let fields: Vec<(u16, TypeId)> = schema
+        .columns
+        .iter()
+        .map(|c| (c.id, c.ty.clone()))
+        .collect();
     let arrays: Vec<ArrayRef> = fields
         .iter()
         .map(|(col_id, ty)| {
@@ -217,7 +222,7 @@ pub fn rows_to_batch(
                 .iter()
                 .map(|r| r.columns.get(col_id).cloned().unwrap_or(Value::Null))
                 .collect();
-            build_array(*ty, &vals)
+            build_array(ty.clone(), &vals)
         })
         .collect::<Result<_>>()?;
     let arrow_fields: Vec<Field> = schema
@@ -282,7 +287,7 @@ pub fn build_array(ty: TypeId, values: &[Value]) -> Result<ArrayRef> {
             }
             Arc::new(b.finish())
         }
-        TypeId::Bytes => {
+        TypeId::Bytes | TypeId::Enum { .. } => {
             let mut b = StringBuilder::new();
             for v in values {
                 match v {
@@ -372,7 +377,7 @@ pub fn columns_to_batch(
             .find(|(id, _)| *id == cdef.id)
             .map(|(_, v)| v.as_slice())
             .unwrap_or(&[]);
-        arrays.push(build_array(cdef.ty, vals)?);
+        arrays.push(build_array(cdef.ty.clone(), vals)?);
     }
     let arrow_fields: Vec<Field> = schema
         .columns

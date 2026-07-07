@@ -479,7 +479,7 @@ fn build_chunk_batch(
     let mut arrays = Vec::with_capacity(columns.len());
     for (col, ty) in columns.iter().zip(types.iter()) {
         let slice = col.slice_range(start, end);
-        arrays.push(native_to_array_owned(*ty, slice).map_err(df_err)?);
+        arrays.push(native_to_array_owned(ty.clone(), slice).map_err(df_err)?);
     }
     RecordBatch::try_new(schema.clone(), arrays)
         .map_err(|e| df_err(MongrelQueryError::Arrow(e.to_string())))
@@ -495,7 +495,7 @@ fn build_cursor_batch(
 ) -> datafusion::common::Result<RecordBatch> {
     let mut arrays = Vec::with_capacity(cols.len());
     for (col, ty) in cols.into_iter().zip(types.iter()) {
-        arrays.push(native_to_array_owned(*ty, col).map_err(df_err)?);
+        arrays.push(native_to_array_owned(ty.clone(), col).map_err(df_err)?);
     }
     RecordBatch::try_new(schema.clone(), arrays)
         .map_err(|e| df_err(MongrelQueryError::Arrow(e.to_string())))

@@ -25,6 +25,7 @@ bytemuck = "1"
 rayon = "1.12"
 zeroize = { version = "1", features = ["alloc"] }
 getrandom = "0.2"
+regex = "1"
 
 # Optional: native page-level encryption (AES-256-GCM) with the key hierarchy
 # (Argon2id + HKDF KEK -> wrapped per-file DEK).

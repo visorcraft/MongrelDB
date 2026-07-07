@@ -22,7 +22,9 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use mongreldb_core::constraint::TableConstraints;
 use mongreldb_core::query::{Condition, Query};
-use mongreldb_core::schema::{ColumnDef, ColumnFlags, Schema, TypeId};
+use mongreldb_core::schema::{
+    ColumnDef, ColumnFlags, DefaultExpr, Schema, TypeId,
+};
 use mongreldb_core::txn::{UpsertAction, UpsertActionKind};
 use mongreldb_core::{MongrelError, RowId, Value};
 use serde::{Deserialize, Serialize};
@@ -304,7 +306,7 @@ fn schema_descriptor(schema: &Schema) -> Jval {
             json!({
                 "id": c.id,
                 "name": c.name,
-                "ty": type_name(c.ty),
+                "ty": type_name(&c.ty),
                 "primary_key": c.flags.contains(ColumnFlags::PRIMARY_KEY),
                 "nullable": c.flags.contains(ColumnFlags::NULLABLE),
                 "auto_increment": c.flags.contains(ColumnFlags::AUTO_INCREMENT),
@@ -345,7 +347,7 @@ fn schema_descriptor(schema: &Schema) -> Jval {
     })
 }
 
-fn type_name(ty: mongreldb_core::schema::TypeId) -> &'static str {
+fn type_name(ty: &mongreldb_core::schema::TypeId) -> &'static str {
     use mongreldb_core::schema::TypeId::*;
     match ty {
         Bool => "bool",
@@ -370,6 +372,7 @@ fn type_name(ty: mongreldb_core::schema::TypeId) -> &'static str {
         Uuid => "uuid",
         Json => "json",
         Array { .. } => "array",
+        Enum { .. } => "enum",
     }
 }
 
@@ -426,6 +429,31 @@ pub struct KitColumnDef {
     pub encrypted: bool,
     #[serde(default)]
     pub encrypted_indexable: bool,
+    #[serde(default)]
+    pub enum_variants: Option<Vec<String>>,
+    #[serde(default)]
+    pub default_expr: Option<String>,
+}
+
+/// Convert a KitColumnDef's default_expr field into an engine DefaultExpr.
+#[allow(clippy::result_large_err)]
+fn kit_default_expr(
+    c: &KitColumnDef,
+    _ty: &TypeId,
+) -> std::result::Result<Option<DefaultExpr>, axum::response::Response> {
+    match c.default_expr.as_deref() {
+        Some("now") => Ok(Some(DefaultExpr::Now)),
+        Some("uuid") => Ok(Some(DefaultExpr::Uuid)),
+        Some(other) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(KitErrorEnvelope {
+                status: "aborted".into(),
+                error: KitError::new("BAD_REQUEST", format!("unknown default_expr \"{other}\"")),
+            }),
+        )
+            .into_response()),
+        None => Ok(None),
+    }
 }
 
 pub async fn kit_create_table(
@@ -444,17 +472,34 @@ pub async fn kit_create_table(
     }
     let mut columns = Vec::with_capacity(req.columns.len());
     for c in &req.columns {
-        let ty = match parse_type_name(&c.ty) {
-            Ok(t) => t,
-            Err(msg) => {
+        let ty = if c.ty == "enum" {
+            let variants = c.enum_variants.clone().unwrap_or_default();
+            if variants.is_empty() {
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(KitErrorEnvelope {
                         status: "aborted".into(),
-                        error: KitError::new("BAD_REQUEST", msg),
+                        error: KitError::new("BAD_REQUEST", "enum column requires non-empty enum_variants"),
                     }),
                 )
                     .into_response();
+            }
+            TypeId::Enum {
+                variants: variants.into(),
+            }
+        } else {
+            match parse_type_name(&c.ty) {
+                Ok(t) => t,
+                Err(msg) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(KitErrorEnvelope {
+                            status: "aborted".into(),
+                            error: KitError::new("BAD_REQUEST", msg),
+                        }),
+                    )
+                        .into_response();
+                }
             }
         };
         let mut flags = ColumnFlags::empty();
@@ -476,8 +521,12 @@ pub async fn kit_create_table(
         columns.push(ColumnDef {
             id: c.id,
             name: c.name.clone(),
-            ty,
+            ty: ty.clone(),
             flags,
+            default_value: match kit_default_expr(c, &ty) {
+                Ok(v) => v,
+                Err(resp) => return resp,
+            },
         });
     }
     let schema = Schema {
@@ -712,13 +761,13 @@ fn parse_condition(c: &JsonCondition, schema: &Schema) -> std::result::Result<Co
     Ok(match c {
         JsonCondition::Pk { value } => {
             let pk = schema.primary_key().ok_or("table has no primary key")?;
-            Condition::Pk(json_to_value(value, pk.ty).encode_key())
+            Condition::Pk(json_to_value(value, &pk.ty).encode_key())
         }
         JsonCondition::BitmapEq { column_id, value } => {
             let ty = col_type(schema, *column_id)?;
             Condition::BitmapEq {
                 column_id: *column_id,
-                value: json_to_value(value, ty).encode_key(),
+                value: json_to_value(value, &ty).encode_key(),
             }
         }
         JsonCondition::BitmapIn { column_id, values } => {
@@ -727,7 +776,7 @@ fn parse_condition(c: &JsonCondition, schema: &Schema) -> std::result::Result<Co
                 column_id: *column_id,
                 values: values
                     .iter()
-                    .map(|v| json_to_value(v, ty).encode_key())
+                    .map(|v| json_to_value(v, &ty).encode_key())
                     .collect(),
             }
         }
@@ -804,7 +853,7 @@ fn col_type(
         .columns
         .iter()
         .find(|c| c.id == column_id)
-        .map(|c| c.ty)
+        .map(|c| c.ty.clone())
         .ok_or_else(|| format!("unknown column id {column_id}"))
 }
 
@@ -1044,9 +1093,9 @@ fn parse_cells(row: &[Jval], schema: &Schema) -> std::result::Result<Vec<(u16, V
             .columns
             .iter()
             .find(|c| c.id == col_id)
-            .map(|c| c.ty)
+            .map(|c| c.ty.clone())
             .ok_or_else(|| format!("unknown column id {col_id}"))?;
-        out.push((col_id, json_to_value(&chunk[1], expected)));
+        out.push((col_id, json_to_value(&chunk[1], &expected)));
     }
     Ok(out)
 }
@@ -1056,7 +1105,7 @@ fn pk_value(pk: &Jval, schema: &Schema) -> std::result::Result<Value, String> {
     let pk_col = schema
         .primary_key()
         .ok_or("table has no primary_key column")?;
-    Ok(json_to_value(pk, pk_col.ty))
+    Ok(json_to_value(pk, &pk_col.ty))
 }
 
 fn row_to_json(row: &mongreldb_core::txn::OwnedRow) -> Vec<Jval> {

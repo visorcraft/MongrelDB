@@ -2339,7 +2339,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-core"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "aes-gcm",
  "arc-swap",
@@ -2357,6 +2357,7 @@ dependencies = [
  "memmap2",
  "parking_lot",
  "rayon",
+ "regex",
  "roaring",
  "serde",
  "serde_json",
@@ -2370,7 +2371,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-query"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "arrow",
  "async-trait",

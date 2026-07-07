@@ -64,7 +64,7 @@ pub fn import_tsv(schema: &Schema, text: &str) -> Result<Vec<Vec<(u16, Value)>>>
                     .columns
                     .iter()
                     .find(|c| c.id == col_id)
-                    .map(|c| c.ty)
+                    .map(|c| c.ty.clone())
                     .unwrap_or(TypeId::Bytes);
                 parse_value(&unescaped, ty)?
             };
@@ -168,12 +168,14 @@ mod tests {
                     name: "id".into(),
                     ty: TypeId::Int64,
                     flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                    default_value: None,
                 },
                 ColumnDef {
                     id: 2,
                     name: "note".into(),
                     ty: TypeId::Bytes,
                     flags: ColumnFlags::empty(),
+                    default_value: None,
                 },
             ],
             indexes: Vec::new(),

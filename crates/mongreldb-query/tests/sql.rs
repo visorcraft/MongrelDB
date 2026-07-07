@@ -15,30 +15,35 @@ fn schema() -> Schema {
                 name: "id".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
             },
             ColumnDef {
                 id: 2,
                 name: "destination".into(),
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty(),
+                default_value: None,
             },
             ColumnDef {
                 id: 3,
                 name: "departure".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty(),
+                default_value: None,
             },
             ColumnDef {
                 id: 4,
                 name: "cost".into(),
                 ty: TypeId::Float64,
                 flags: ColumnFlags::empty(),
+                default_value: None,
             },
             ColumnDef {
                 id: 5,
                 name: "rating".into(),
                 ty: TypeId::Float64,
                 flags: ColumnFlags::empty(),
+                default_value: None,
             },
         ],
         indexes: vec![
@@ -314,6 +319,7 @@ async fn is_null_and_is_not_null_partition_rows() {
         "note",
         TypeId::Bytes,
         ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+        None,
     )
     .unwrap();
     for i in 60..100i64 {
@@ -357,12 +363,14 @@ fn vec_schema() -> Schema {
                 name: "id".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
             },
             ColumnDef {
                 id: 2,
                 name: "vec".into(),
                 ty: TypeId::Embedding { dim: 8 },
                 flags: ColumnFlags::empty(),
+                default_value: None,
             },
         ],
         indexes: vec![mongreldb_core::schema::IndexDef {
@@ -428,12 +436,14 @@ fn cities_schema() -> Schema {
                 name: "city_name".into(),
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
             },
             ColumnDef {
                 id: 2,
                 name: "country".into(),
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty(),
+                default_value: None,
             },
         ],
         indexes: vec![mongreldb_core::schema::IndexDef {
@@ -538,12 +548,14 @@ async fn streaming_scan_emits_multiple_batches() {
                 name: "id".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
             },
             ColumnDef {
                 id: 2,
                 name: "v".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty(),
+                default_value: None,
             },
         ],
         indexes: vec![],
@@ -614,12 +626,14 @@ async fn multi_run_streams_and_limit_short_circuits() {
                 name: "id".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
             },
             ColumnDef {
                 id: 2,
                 name: "v".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty(),
+                default_value: None,
             },
         ],
         indexes: vec![IndexDef {
@@ -678,12 +692,14 @@ async fn cursor_page_pruning_is_exact() {
                 name: "id".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
             },
             ColumnDef {
                 id: 2,
                 name: "v".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty(),
+                default_value: None,
             },
         ],
         indexes: vec![],
@@ -749,12 +765,14 @@ async fn zero_copy_preserves_nulls() {
                 name: "id".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
             },
             ColumnDef {
                 id: 2,
                 name: "v".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+                default_value: None,
             },
         ],
         indexes: vec![],
@@ -826,6 +844,7 @@ async fn cursor_handles_schema_evolution() {
         "note",
         TypeId::Bytes,
         ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+        None,
     )
     .unwrap();
 
@@ -946,6 +965,7 @@ async fn metadata_aggregates_count_col_and_null_column() {
         "empty_i",
         TypeId::Int64,
         ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+        None,
     )
     .unwrap(); // absent from the run ⇒ every row reads NULL, still one run
     let session = MongrelSession::new(db);
@@ -1050,6 +1070,7 @@ async fn count_col_excludes_schema_evolution_nulls_on_scan() {
         "empty_i",
         TypeId::Int64,
         ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+        None,
     )
     .unwrap();
     let session = MongrelSession::new(db);

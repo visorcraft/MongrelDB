@@ -20,18 +20,21 @@ fn test_schema() -> Schema {
                 name: "id".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
             },
             ColumnDef {
                 id: 2,
                 name: "city".into(),
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+                default_value: None,
             },
             ColumnDef {
                 id: 3,
                 name: "cost".into(),
                 ty: TypeId::Float64,
                 flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+                default_value: None,
             },
         ],
         indexes: vec![

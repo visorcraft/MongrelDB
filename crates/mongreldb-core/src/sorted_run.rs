@@ -1297,7 +1297,7 @@ impl<'a> RunWriter<'a> {
                     choose_encoding_native(&cdef.ty, col)
                 };
                 let (pages, stats) =
-                    native_column_pages(cdef.ty, col, encoding, compress, le, &bounds)?;
+                    native_column_pages(cdef.ty.clone(), col, encoding, compress, le, &bounds)?;
                 Ok(ColumnPayload {
                     column_id: cdef.id,
                     type_id_tag: type_tag(&cdef.ty),
@@ -1387,7 +1387,7 @@ impl<'a> RunWriter<'a> {
                 .iter()
                 .map(|r| r.columns.get(&cdef.id).cloned().unwrap_or(Value::Null))
                 .collect();
-            let (pages, stats, encoding) = value_column_pages(cdef.ty, &vals, &bounds)?;
+            let (pages, stats, encoding) = value_column_pages(cdef.ty.clone(), &vals, &bounds)?;
             columns.push(ColumnPayload {
                 column_id: cdef.id,
                 type_id_tag: type_tag(&cdef.ty),
@@ -1488,8 +1488,8 @@ fn native_column_pages(
     let encode_one =
         |&(s, e, frid, lrid): &(usize, usize, u64, u64)| -> Result<(Vec<u8>, PageStat)> {
             let chunk = col.slice_range(s, e);
-            let stat = columnar::page_stat_for(ty, &chunk, frid, lrid);
-            let page = columnar::encode_page_native(ty, &chunk, encoding, compress, le)?;
+            let stat = columnar::page_stat_for(ty.clone(), &chunk, frid, lrid);
+            let page = columnar::encode_page_native(ty.clone(), &chunk, encoding, compress, le)?;
             Ok((page, stat))
         };
     // Single-page columns skip the thread-pool handshake.
@@ -1516,9 +1516,9 @@ fn value_column_pages(
     let mut stats = Vec::with_capacity(bounds.len());
     for &(s, e, frid, lrid) in bounds {
         let chunk = &vals[s..e];
-        pages.push(columnar::encode_page(ty, chunk, encoding)?);
-        let native = columnar::values_to_native(ty, chunk);
-        stats.push(columnar::page_stat_for(ty, &native, frid, lrid));
+        pages.push(columnar::encode_page(ty.clone(), chunk, encoding)?);
+        let native = columnar::values_to_native(ty.clone(), chunk);
+        stats.push(columnar::page_stat_for(ty.clone(), &native, frid, lrid));
     }
     Ok((pages, stats, encoding))
 }
@@ -1787,7 +1787,7 @@ impl RunReader {
                 .columns
                 .iter()
                 .find(|c| c.id == column_id)
-                .map(|c| c.ty)
+                .map(|c| c.ty.clone())
                 .unwrap_or(TypeId::Bytes),
         }
     }
@@ -1954,7 +1954,7 @@ impl RunReader {
             let mut decoded: Vec<Value> = Vec::with_capacity(self.row_count());
             for (seq, &pr) in page_rows.iter().enumerate() {
                 let page = self.read_page(column_id, seq)?;
-                decoded.extend(columnar::decode_page(ty, &page, pr)?);
+                decoded.extend(columnar::decode_page(ty.clone(), &page, pr)?);
             }
             self.col_cache.insert(column_id, decoded);
         }
@@ -2018,10 +2018,11 @@ impl RunReader {
         let mut best: Option<(u64, usize, usize)> = None; // (epoch, page_seq, local index)
         for (seq, _page_row_start) in candidate_pages {
             let page_rows = self.find_header(SYS_ROW_ID)?.page_stats[seq].row_count as usize;
-            let row_ids = match self.decode_page_native_cached(ty, SYS_ROW_ID, seq, page_rows)? {
-                columnar::NativeColumn::Int64 { data, .. } => data,
-                _ => return Err(MongrelError::InvalidArgument("sys row_id not int64".into())),
-            };
+            let row_ids =
+                match self.decode_page_native_cached(ty.clone(), SYS_ROW_ID, seq, page_rows)? {
+                    columnar::NativeColumn::Int64 { data, .. } => data,
+                    _ => return Err(MongrelError::InvalidArgument("sys row_id not int64".into())),
+                };
             let local = match row_ids.binary_search(&target) {
                 Ok(i) => i,
                 Err(_) => continue,
@@ -2270,14 +2271,14 @@ impl RunReader {
                 .into_par_iter()
                 .map(|seq| {
                     let raw = reader.read_page_shared(column_id, seq)?;
-                    columnar::decode_page_native(ty, &raw, page_rows[seq])
+                    columnar::decode_page_native(ty.clone(), &raw, page_rows[seq])
                 })
                 .collect::<Result<Vec<_>>>()?
         } else {
             let mut out = Vec::with_capacity(page_count);
             for (seq, &pr) in page_rows.iter().enumerate() {
                 let page = self.read_page(column_id, seq)?;
-                out.push(columnar::decode_page_native(ty, &page, pr)?);
+                out.push(columnar::decode_page_native(ty.clone(), &page, pr)?);
             }
             out
         };
@@ -2337,7 +2338,9 @@ impl RunReader {
         let mut parts_keys: Vec<(columnar::NativeColumn, Option<[u8; 32]>)> = if page_count > 1 {
             (0..page_count)
                 .into_par_iter()
-                .map(|seq| self.decode_page_cached(ty, column_id, seq, page_rows[seq], run_id))
+                .map(|seq| {
+                    self.decode_page_cached(ty.clone(), column_id, seq, page_rows[seq], run_id)
+                })
                 .collect::<Result<Vec<_>>>()?
         } else {
             vec![self.decode_page_cached(ty, column_id, 0, page_rows[0], run_id)?]
@@ -2629,7 +2632,7 @@ impl RunReader {
                 continue;
             }
             let val_page = self.read_page(column_id, seq)?;
-            let col = columnar::decode_page_native(ty, &val_page, nrows)?;
+            let col = columnar::decode_page_native(ty.clone(), &val_page, nrows)?;
             let validity = col.validity();
             if clean_contiguous {
                 for i in 0..nrows {
@@ -2857,7 +2860,7 @@ impl RunReader {
             let skip = (want_nulls && null_count == 0) || (!want_nulls && null_count == nrows);
             if !skip {
                 let val_page = self.read_page(column_id, seq)?;
-                let col = columnar::decode_page_native(ty, &val_page, nrows)?;
+                let col = columnar::decode_page_native(ty.clone(), &val_page, nrows)?;
                 let validity = col.validity();
                 while vis < positions.len() && positions[vis] < page_end {
                     let local = positions[vis] - page_start;
@@ -3149,12 +3152,14 @@ mod tests {
                     name: "id".into(),
                     ty: TypeId::Int64,
                     flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                    default_value: None,
                 },
                 ColumnDef {
                     id: 2,
                     name: "name".into(),
                     ty: TypeId::Bytes,
                     flags: ColumnFlags::empty(),
+                    default_value: None,
                 },
             ],
             indexes: Vec::new(),

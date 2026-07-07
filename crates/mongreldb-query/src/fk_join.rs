@@ -316,7 +316,7 @@ pub(crate) fn try_fk_join(
                 is_fk: true,
                 column_id: c.id,
                 name: c.name.clone(),
-                ty: c.ty,
+                ty: c.ty.clone(),
             })
             .collect();
         let mut out_rows: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
@@ -905,7 +905,7 @@ fn output_columns(
                 is_fk: true,
                 column_id: c.id,
                 name: c.name.clone(),
-                ty: c.ty,
+                ty: c.ty.clone(),
             });
         }
         for c in &pk_schema.columns {
@@ -913,7 +913,7 @@ fn output_columns(
                 is_fk: false,
                 column_id: c.id,
                 name: c.name.clone(),
-                ty: c.ty,
+                ty: c.ty.clone(),
             });
         }
         Ok(out)
@@ -940,18 +940,22 @@ fn resolve_out_col(
     if let Some(rel) = &col.relation {
         let t = rel.table();
         if Some(t) == fk_side.alias.as_deref() || t == fk_side.table {
-            return fk_schema.column(&col.name).map(|c| (true, c.id, c.ty));
+            return fk_schema
+                .column(&col.name)
+                .map(|c| (true, c.id, c.ty.clone()));
         }
         if Some(t) == pk_side.alias.as_deref() || t == pk_side.table {
-            return pk_schema.column(&col.name).map(|c| (false, c.id, c.ty));
+            return pk_schema
+                .column(&col.name)
+                .map(|c| (false, c.id, c.ty.clone()));
         }
         return None;
     }
     let in_fk = fk_schema.column(&col.name);
     let in_pk = pk_schema.column(&col.name);
     match (in_fk, in_pk) {
-        (Some(c), None) => Some((true, c.id, c.ty)),
-        (None, Some(c)) => Some((false, c.id, c.ty)),
+        (Some(c), None) => Some((true, c.id, c.ty.clone())),
+        (None, Some(c)) => Some((false, c.id, c.ty.clone())),
         _ => None,
     }
 }
@@ -1053,7 +1057,7 @@ fn build_output_batch(rows: &[Vec<Value>], out_cols: &[OutCol]) -> Result<Record
     let mut fields: Vec<Field> = Vec::with_capacity(out_cols.len());
     for (i, oc) in out_cols.iter().enumerate() {
         let vals: Vec<Value> = rows.iter().map(|r| r[i].clone()).collect();
-        arrays.push(build_array(oc.ty, &vals)?);
+        arrays.push(build_array(oc.ty.clone(), &vals)?);
         fields.push(Field::new(&oc.name, arrow_data_type(&oc.ty)?, true));
     }
     RecordBatch::try_new(Arc::new(arrow::datatypes::Schema::new(fields)), arrays)
@@ -1312,6 +1316,7 @@ mod tests {
                 name: "cid".into(),
                 ty: MTy::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
             }],
             indexes: vec![],
             colocation: vec![],
@@ -1333,12 +1338,14 @@ mod tests {
                     name: "uid".into(),
                     ty: MTy::Int64,
                     flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                    default_value: None,
                 },
                 ColumnDef {
                     id: 2,
                     name: "country".into(),
                     ty: MTy::Int64,
                     flags: ColumnFlags::empty(),
+                    default_value: None,
                 },
             ],
             indexes: vec![IndexDef {

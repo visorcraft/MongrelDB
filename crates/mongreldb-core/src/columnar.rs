@@ -26,18 +26,18 @@ pub fn encode_column(ty: TypeId, values: &[Value]) -> Result<Vec<u8>> {
         TypeId::Int64 => fixed_encode(values, 8, |v| match v {
             Value::Int64(x) => Ok(x.to_be_bytes().to_vec()),
             Value::Null => Ok(vec![0; 8]),
-            _ => Err(type_mismatch(ty, v)),
+            _ => Err(type_mismatch(ty.clone(), v)),
         })?,
         TypeId::Float64 => fixed_encode(values, 8, |v| match v {
             Value::Float64(f) => Ok(f.to_bits().to_be_bytes().to_vec()),
             Value::Null => Ok(vec![0; 8]),
-            _ => Err(type_mismatch(ty, v)),
+            _ => Err(type_mismatch(ty.clone(), v)),
         })?,
         TypeId::TimestampNanos | TypeId::Date64 | TypeId::Time64 => {
             fixed_encode(values, 8, |v| match v {
                 Value::Int64(x) => Ok(x.to_be_bytes().to_vec()),
                 Value::Null => Ok(vec![0; 8]),
-                _ => Err(type_mismatch(ty, v)),
+                _ => Err(type_mismatch(ty.clone(), v)),
             })?
         }
         TypeId::Interval => fixed_encode(values, 20, |v| match v {
@@ -53,29 +53,29 @@ pub fn encode_column(ty: TypeId, values: &[Value]) -> Result<Vec<u8>> {
                 Ok(out)
             }
             Value::Null => Ok(vec![0; 20]),
-            _ => Err(type_mismatch(ty, v)),
+            _ => Err(type_mismatch(ty.clone(), v)),
         })?,
         TypeId::Bool => fixed_encode(values, 1, |v| match v {
             Value::Bool(b) => Ok(vec![*b as u8]),
             Value::Null => Ok(vec![0]),
-            _ => Err(type_mismatch(ty, v)),
+            _ => Err(type_mismatch(ty.clone(), v)),
         })?,
         TypeId::Int32 | TypeId::UInt32 | TypeId::Date32 => fixed_encode(values, 4, |v| match v {
             Value::Int64(x) => Ok((*x as i32).to_be_bytes().to_vec()),
             Value::Null => Ok(vec![0; 4]),
-            _ => Err(type_mismatch(ty, v)),
+            _ => Err(type_mismatch(ty.clone(), v)),
         })?,
-        TypeId::Bytes | TypeId::Json => bytes_encode(values)?,
+        TypeId::Bytes | TypeId::Json | TypeId::Enum { .. } => bytes_encode(values)?,
         TypeId::Uuid => fixed_encode(values, 16, |v| match v {
             Value::Uuid(b) => Ok(b.to_vec()),
             Value::Null => Ok(vec![0; 16]),
-            _ => Err(type_mismatch(ty, v)),
+            _ => Err(type_mismatch(ty.clone(), v)),
         })?,
         TypeId::Embedding { dim } => embedding_encode(values, dim)?,
         TypeId::Decimal128 { .. } => fixed_encode(values, 16, |v| match v {
             Value::Decimal(d) => Ok(d.to_be_bytes().to_vec()),
             Value::Null => Ok(vec![0; 16]),
-            _ => Err(type_mismatch(ty, v)),
+            _ => Err(type_mismatch(ty.clone(), v)),
         })?,
         other => {
             return Err(MongrelError::Schema(format!(
@@ -155,7 +155,7 @@ pub fn decode_column(ty: TypeId, page: &[u8], n: usize, le: bool) -> Result<Vec<
                 };
                 Value::Int64(v as i64)
             }
-            TypeId::Bytes | TypeId::Json => {
+            TypeId::Bytes | TypeId::Json | TypeId::Enum { .. } => {
                 let bytes_start = (n + 1) * 8;
                 let lo = read_off(payload, i, le);
                 let hi = read_off(payload, i + 1, le);
@@ -306,7 +306,7 @@ fn advance_null(ty: &TypeId, payload: &[u8], cur: &mut usize) -> Result<()> {
         TypeId::Date64 | TypeId::Time64 => 8,
         TypeId::Interval => 20,
         TypeId::Uuid => 16,
-        TypeId::Json => return Ok(()), // variable-length, same as Bytes
+        TypeId::Json | TypeId::Enum { .. } => return Ok(()), // variable-length, same as Bytes
         // Variable-length types: null rows have no payload bytes; the offsets
         // table covers them, so nothing to advance here.
         TypeId::Bytes | TypeId::Embedding { .. } => return Ok(()),
@@ -410,7 +410,9 @@ fn max_decompressed_bytes(ty: TypeId, n: usize, algo: u8) -> usize {
         return validity + 8 + n.saturating_mul(4) + n.saturating_mul(4 + MAX_VAR_BYTES_PER_ROW);
     }
     let payload = match ty {
-        TypeId::Bytes => (n + 1).saturating_mul(8) + n.saturating_mul(MAX_VAR_BYTES_PER_ROW),
+        TypeId::Bytes | TypeId::Enum { .. } => {
+            (n + 1).saturating_mul(8) + n.saturating_mul(MAX_VAR_BYTES_PER_ROW)
+        }
         TypeId::Embedding { dim } => (dim as usize).saturating_mul(8).saturating_mul(n),
         _ => n.saturating_mul(ty.fixed_size().unwrap_or(8)),
     };
@@ -458,7 +460,7 @@ pub fn encode_page(ty: TypeId, values: &[Value], encoding: Encoding) -> Result<V
             out.extend(encode_column(ty, values)?);
             out
         }
-        Encoding::Dictionary if matches!(ty, TypeId::Bytes) => {
+        Encoding::Dictionary if matches!(ty, TypeId::Bytes | TypeId::Enum { .. }) => {
             let dict = dict_encode_bytes(values);
             let mut out = vec![ALGO_ZSTD_DICT];
             out.extend(zstd_compress(&dict)?);
@@ -491,11 +493,11 @@ pub fn decode_page(ty: TypeId, page: &[u8], n: usize) -> Result<Vec<Value>> {
     let raw: &[u8] = match base {
         ALGO_PLAIN => body,
         ALGO_ZSTD_PLAIN | ALGO_ZSTD_DICT | ALGO_ZSTD_DELTA => {
-            raw_owned = zstd_decompress(body, max_decompressed_bytes(ty, n, base))?;
+            raw_owned = zstd_decompress(body, max_decompressed_bytes(ty.clone(), n, base))?;
             &raw_owned
         }
         ALGO_LZ4_PLAIN | ALGO_LZ4_DICT | ALGO_LZ4_DELTA => {
-            raw_owned = lz4_decompress(body, max_decompressed_bytes(ty, n, base))?;
+            raw_owned = lz4_decompress(body, max_decompressed_bytes(ty.clone(), n, base))?;
             &raw_owned
         }
         other => {
@@ -1501,7 +1503,7 @@ pub fn encode_page_native(
     le: bool,
 ) -> Result<Vec<u8>> {
     let raw = matches!(compress, Compress::Plain) || matches!(encoding, Encoding::Plain);
-    Ok(match (ty, col) {
+    Ok(match (ty.clone(), col) {
         (TypeId::Int64 | TypeId::TimestampNanos, NativeColumn::Int64 { data, validity }) => {
             if matches!(encoding, Encoding::Delta) && !raw {
                 let mut payload = Vec::with_capacity(4 + validity.len() + data.len() * 8);
@@ -1695,12 +1697,14 @@ pub fn decode_page_native(ty: TypeId, page: &[u8], n: usize) -> Result<NativeCol
     // Step 1: obtain the uncompressed (validity-prefixed) payload.
     let raw: Cow<[u8]> = match base {
         ALGO_PLAIN => Cow::Borrowed(body),
-        ALGO_ZSTD_PLAIN | ALGO_ZSTD_DELTA | ALGO_ZSTD_DICT => {
-            Cow::Owned(zstd_decompress(body, max_decompressed_bytes(ty, n, base))?)
-        }
-        ALGO_LZ4_PLAIN | ALGO_LZ4_DELTA | ALGO_LZ4_DICT => {
-            Cow::Owned(lz4_decompress(body, max_decompressed_bytes(ty, n, base))?)
-        }
+        ALGO_ZSTD_PLAIN | ALGO_ZSTD_DELTA | ALGO_ZSTD_DICT => Cow::Owned(zstd_decompress(
+            body,
+            max_decompressed_bytes(ty.clone(), n, base),
+        )?),
+        ALGO_LZ4_PLAIN | ALGO_LZ4_DELTA | ALGO_LZ4_DICT => Cow::Owned(lz4_decompress(
+            body,
+            max_decompressed_bytes(ty.clone(), n, base),
+        )?),
         _ => unreachable!(),
     };
 

@@ -9,7 +9,7 @@ use mongreldb_core::memtable::{Row, Value};
 use mongreldb_core::procedure::{ProcedureCallOutput, ProcedureCallRow, StoredProcedure};
 use mongreldb_core::rowid::RowId;
 use mongreldb_core::schema::{
-    AlterColumn, ColumnDef as CoreColumnDef, ColumnFlags, IndexDef, IndexKind,
+    AlterColumn, ColumnDef as CoreColumnDef, ColumnFlags, DefaultExpr, IndexDef, IndexKind,
     Schema as CoreSchema, TypeId,
 };
 use mongreldb_core::Database;
@@ -801,11 +801,9 @@ fn create_table_as_select<'a>(
     table_name: &'a str,
     query: &'a sqlparser::ast::Query,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
-    let select_sql = format!("SELECT * FROM ({}) AS ctas_source", query.to_string());
+    let select_sql = format!("SELECT * FROM ({}) AS ctas_source", query);
     Box::pin(async move {
-        let batches = Box::pin(session.run(&select_sql))
-            .await
-            .map_err(MongrelQueryError::from)?;
+        let batches = Box::pin(session.run(&select_sql)).await?;
 
         if batches.is_empty() {
             return Err(MongrelQueryError::Schema(
@@ -816,7 +814,7 @@ fn create_table_as_select<'a>(
 
         // Build a MongrelDB Schema from the Arrow fields.
         use mongreldb_core::schema::{
-            ColumnDef as CoreColumnDef, ColumnFlags, Schema as CoreSchema, TypeId,
+            ColumnDef as CoreColumnDef, ColumnFlags, Schema as CoreSchema,
         };
         let mut columns = Vec::new();
         for (i, field) in arrow_schema.fields().iter().enumerate() {
@@ -830,6 +828,7 @@ fn create_table_as_select<'a>(
                 } else {
                     ColumnFlags::empty().with(ColumnFlags::NULLABLE)
                 },
+                default_value: None,
             });
         }
 
@@ -846,7 +845,7 @@ fn create_table_as_select<'a>(
         register_table(session, db, table_name)?;
 
         // Bulk-insert all rows from the result batches.
-        let handle = db.table(table_name)?;
+        let _handle = db.table(table_name)?;
         let mut txn = db.begin();
         for batch in &batches {
             let col_count = batch.num_columns();
@@ -1384,7 +1383,7 @@ fn insert_external_rows(
         }
         let mut row = HashMap::new();
         for (column, expr) in columns.iter().zip(value_row.iter()) {
-            row.insert(column.id, expr_to_value(expr, column.ty)?);
+            row.insert(column.id, expr_to_value(expr, column.ty.clone())?);
         }
         rows.push(row);
         inserted = inserted.saturating_add(1);
@@ -1698,7 +1697,7 @@ fn trigger_insert_steps(
         for (col, expr) in columns.iter().zip(row.iter()) {
             cells.push(TriggerCell {
                 column_id: col.id,
-                value: trigger_value_from_sql(expr, trigger_schema, event, Some(col.ty))?,
+                value: trigger_value_from_sql(expr, trigger_schema, event, Some(col.ty.clone()))?,
             });
         }
         steps.push(TriggerStep::Insert {
@@ -1743,7 +1742,12 @@ fn trigger_update_step(
             .ok_or_else(|| MongrelQueryError::Schema(format!("unknown column {column_name}")))?;
         cells.push(TriggerCell {
             column_id: col.id,
-            value: trigger_value_from_sql(&assignment.value, trigger_schema, event, Some(col.ty))?,
+            value: trigger_value_from_sql(
+                &assignment.value,
+                trigger_schema,
+                event,
+                Some(col.ty.clone()),
+            )?,
         });
     }
     Ok(vec![TriggerStep::UpdateByPk { table, pk, cells }])
@@ -1872,9 +1876,9 @@ fn trigger_pk_condition(
         ));
     }
     if expr_is_column(left, &pk.name) {
-        trigger_value_from_sql(right, trigger_schema, event, Some(pk.ty))
+        trigger_value_from_sql(right, trigger_schema, event, Some(pk.ty.clone()))
     } else if expr_is_column(right, &pk.name) {
-        trigger_value_from_sql(left, trigger_schema, event, Some(pk.ty))
+        trigger_value_from_sql(left, trigger_schema, event, Some(pk.ty.clone()))
     } else {
         Err(MongrelQueryError::Schema(format!(
             "trigger UPDATE/DELETE WHERE must compare primary key {}",
@@ -1973,7 +1977,7 @@ fn trigger_value_from_sql(
     match expr {
         Expr::Nested(inner) => trigger_value_from_sql(inner, trigger_schema, event, literal_type),
         Expr::Value(v) => {
-            let value = sql_value_to_value(&v.value, literal_type)?;
+            let value = sql_value_to_value(&v.value, literal_type.clone())?;
             let value = match literal_type {
                 Some(ty) => coerce_value(value, ty)?,
                 None => value,
@@ -2092,6 +2096,7 @@ fn view_schema_from_columns(
             name,
             ty,
             flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+            default_value: None,
         });
     }
     Ok((
@@ -2234,10 +2239,15 @@ fn alter_column(
                 AlterColumn::set_type(sql_type_to_core(&data_type)?),
             )?;
         }
-        AlterColumnOperation::SetDefault { .. } | AlterColumnOperation::DropDefault => {
-            return Err(MongrelQueryError::Schema(
-                "column defaults are not persisted by MongrelDB core SQL DDL".into(),
-            ));
+        AlterColumnOperation::SetDefault { value, .. } => {
+            db.alter_column(
+                table,
+                &column.value,
+                AlterColumn::set_default(sql_expr_to_default(&value)?),
+            )?;
+        }
+        AlterColumnOperation::DropDefault => {
+            db.alter_column(table, &column.value, AlterColumn::drop_default())?;
         }
         other => {
             return Err(MongrelQueryError::Schema(format!(
@@ -2416,7 +2426,7 @@ fn insert_rows(session: &MongrelSession, db: &Arc<Database>, insert: Insert) -> 
         }
         let mut cells = Vec::with_capacity(row.len());
         for (col, expr) in columns.iter().zip(row.iter()) {
-            cells.push((col.id, expr_to_value(expr, col.ty)?));
+            cells.push((col.id, expr_to_value(expr, col.ty.clone())?));
         }
 
         match &insert.on {
@@ -2538,7 +2548,7 @@ fn insert_view_rows(
         let mut new = HashMap::new();
         for (col, expr) in columns.iter().zip(row.iter()) {
             let mut value = expr_to_untyped_value(expr)?;
-            if let Some(ty) = view_def.input_types.get(&col.id).and_then(|ty| *ty) {
+            if let Some(ty) = view_def.input_types.get(&col.id).and_then(|ty| ty.clone()) {
                 value = coerce_value(value, ty)?;
             }
             new.insert(col.id, value);
@@ -3102,7 +3112,7 @@ fn apply_view_assignment(
         .column(&column_name)
         .ok_or_else(|| MongrelQueryError::Schema(format!("unknown column {column_name}")))?;
     let mut value = eval_value_expr(&assignment.value, schema, row, None)?;
-    if let Some(ty) = input_types.get(&column.id).and_then(|ty| *ty) {
+    if let Some(ty) = input_types.get(&column.id).and_then(|ty| ty.clone()) {
         value = coerce_value(value, ty)?;
     }
     row.insert(column.id, value);
@@ -3162,7 +3172,7 @@ async fn materialize_view_rows(
                 )
                 .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
                 let mut value = scalar_to_core_value(scalar)?;
-                if let Some(ty) = view.input_types.get(&view_col.id).and_then(|ty| *ty) {
+                if let Some(ty) = view.input_types.get(&view_col.id).and_then(|ty| ty.clone()) {
                     value = coerce_value(value, ty)?;
                 }
                 view_row.insert(view_col.id, value);
@@ -3591,6 +3601,7 @@ fn core_column_from_sql(
     let mut flags = ColumnFlags::empty().with(ColumnFlags::NULLABLE);
     let mut primary_key = table_primary_key;
     let mut auto_increment = false;
+    let mut default_value: Option<DefaultExpr> = None;
     for opt in &col.options {
         match &opt.option {
             ColumnOption::NotNull => flags = flags.without(ColumnFlags::NULLABLE),
@@ -3616,10 +3627,9 @@ fn core_column_from_sql(
                     "column UNIQUE, REFERENCES, and CHECK constraints are provided by MongrelDB Kit, not core SQL DDL".into(),
                 ));
             }
-            ColumnOption::Default(_) => {
-                return Err(MongrelQueryError::Schema(
-                    "column defaults are not persisted by MongrelDB core SQL DDL".into(),
-                ));
+            ColumnOption::Default(expr) => {
+                // Accept literal defaults plus DEFAULT NOW() / DEFAULT UUID().
+                default_value = Some(sql_expr_to_default(expr)?);
             }
             _ => {}
         }
@@ -3637,10 +3647,49 @@ fn core_column_from_sql(
         name: col.name.value.clone(),
         ty: sql_type_to_core(&col.data_type)?,
         flags,
+        default_value,
     })
 }
 
+/// Convert a SQL `DEFAULT <expr>` into an engine [`DefaultExpr`]. Accepts:
+/// - `DEFAULT TRUE` / `DEFAULT FALSE` / `DEFAULT NULL` / `DEFAULT <literal>`
+/// - `DEFAULT NOW()` / `DEFAULT CURRENT_TIMESTAMP`
+/// - `DEFAULT UUID()`
+fn sql_expr_to_default(expr: &Expr) -> Result<DefaultExpr> {
+    match expr {
+        Expr::Function(f) => {
+            let name = f.name.to_string().to_ascii_lowercase();
+            match name.as_str() {
+                "now" | "current_timestamp" => Ok(DefaultExpr::Now),
+                "uuid" => Ok(DefaultExpr::Uuid),
+                _ => Err(MongrelQueryError::Schema(format!(
+                    "unsupported DEFAULT function: {name}"
+                ))),
+            }
+        }
+        other => {
+            let v = expr_to_untyped_value(other)?;
+            Ok(DefaultExpr::Static(v))
+        }
+    }
+}
+
 fn sql_type_to_core(data_type: &DataType) -> Result<TypeId> {
+    // Handle ENUM specially — we need the variant list, which the string-based
+    // approach below would discard.
+    if let DataType::Enum(members, _) = data_type {
+        use sqlparser::ast::EnumMember;
+        let variants: Vec<String> = members
+            .iter()
+            .map(|m| match m {
+                EnumMember::Name(n) => n.clone(),
+                EnumMember::NamedValue(n, _) => n.clone(),
+            })
+            .collect();
+        return Ok(TypeId::Enum {
+            variants: Arc::from(variants),
+        });
+    }
     let text = data_type.to_string().to_ascii_lowercase();
     let base = text.split('(').next().unwrap_or(text.as_str()).trim();
     match base {
@@ -3717,7 +3766,7 @@ fn apply_assignment(
         .column(&column_name)
         .ok_or_else(|| MongrelQueryError::Schema(format!("unknown column {column_name}")))?;
     let value = eval_value_expr(&assignment.value, schema, row, excluded)?;
-    row.insert(column.id, coerce_value(value, column.ty)?);
+    row.insert(column.id, coerce_value(value, column.ty.clone())?);
     Ok(())
 }
 
@@ -3909,11 +3958,11 @@ fn sql_value_to_value(value: &SqlValue, target: Option<TypeId>) -> Result<Value>
 
 fn expr_to_value(expr: &Expr, ty: TypeId) -> Result<Value> {
     let value = match expr {
-        Expr::Value(v) => sql_value_to_value(&v.value, Some(ty))?,
+        Expr::Value(v) => sql_value_to_value(&v.value, Some(ty.clone()))?,
         Expr::UnaryOp {
             op: UnaryOperator::Minus,
             expr,
-        } => match expr_to_value(expr, ty)? {
+        } => match expr_to_value(expr, ty.clone())? {
             Value::Int64(v) => Value::Int64(v.saturating_neg()),
             Value::Float64(v) => Value::Float64(-v),
             _ => {
@@ -3966,6 +4015,16 @@ fn coerce_value(value: Value, ty: TypeId) -> Result<Value> {
         (Value::Float64(v), TypeId::Float64 | TypeId::Float32) => Ok(Value::Float64(v)),
         (Value::Int64(v), TypeId::Float64 | TypeId::Float32) => Ok(Value::Float64(v as f64)),
         (Value::Bytes(v), TypeId::Bytes) => Ok(Value::Bytes(v)),
+        (Value::Bytes(v), TypeId::Enum { variants }) => {
+            if variants.iter().any(|x| x.as_bytes() == &v[..]) {
+                Ok(Value::Bytes(v))
+            } else {
+                let s = String::from_utf8_lossy(&v);
+                Err(MongrelQueryError::Schema(format!(
+                    "'{s}' is not a valid ENUM variant (allowed: {variants:?})"
+                )))
+            }
+        }
         (Value::Bytes(v), TypeId::Embedding { .. }) => {
             let text =
                 String::from_utf8(v).map_err(|e| MongrelQueryError::Schema(e.to_string()))?;
@@ -5752,8 +5811,8 @@ async fn try_recursive_cte(
                 ));
             }
             let is_all = matches!(set_quantifier, sqlparser::ast::SetQuantifier::All);
-            let base_sql = format!("SELECT * FROM ({}) AS base", left.to_string());
-            let recursive_sql = format!("SELECT * FROM ({}) AS recur", right.to_string());
+            let base_sql = format!("SELECT * FROM ({}) AS base", left);
+            let recursive_sql = format!("SELECT * FROM ({}) AS recur", right);
             (base_sql, recursive_sql, is_all)
         }
         _ => {
@@ -5890,7 +5949,7 @@ async fn try_recursive_cte(
 
             let deduped =
                 Box::pin(session.run(&format!("SELECT DISTINCT * FROM {}", cte_name))).await?;
-            let deduped_merged = arrow::compute::concat_batches(&renamed_schema, &deduped)
+            let _deduped_merged = arrow::compute::concat_batches(&renamed_schema, &deduped)
                 .map_err(|e| MongrelQueryError::Arrow(e.to_string()))?;
             let prev_total: usize = all_batches.iter().map(|b| b.num_rows()).sum();
             all_batches = deduped;

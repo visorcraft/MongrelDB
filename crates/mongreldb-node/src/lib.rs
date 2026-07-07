@@ -18,7 +18,7 @@
 
 use mongreldb_core::query::{Condition, Query};
 use mongreldb_core::schema::{
-    AlterColumn, ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId,
+    AlterColumn, ColumnDef, ColumnFlags, DefaultExpr, IndexDef, IndexKind, Schema, TypeId,
 };
 use mongreldb_core::{RowId, Value};
 use napi::bindgen_prelude::{BigInt, Buffer};
@@ -88,6 +88,7 @@ pub enum ColumnType {
     Uuid,
     Json,
     Array,
+    Enum,
 }
 
 #[napi]
@@ -114,6 +115,11 @@ pub struct ColumnSpec {
     /// Optional default value for schema-evolution back-fill. Currently only
     /// validated; applying defaults to existing rows is not yet implemented.
     pub default_value: Option<Cell>,
+    /// Optional dynamic default expression: `"now"` or `"uuid"`. Takes
+    /// precedence over `default_value` when set.
+    pub default_expr: Option<String>,
+    /// Required when `ty == Enum`: the list of allowed variant strings.
+    pub enum_variants: Option<Vec<String>>,
     /// Engine-managed monotonic identity allocator for an `Int64` primary key.
     /// When `true`, the engine assigns the next counter value on insert if the
     /// column is omitted/null, and explicit ids advance the counter past them.
@@ -210,7 +216,11 @@ pub struct ProcedureCallResult {
     pub result_json: String,
 }
 
-fn to_type_id(ty: &ColumnType, embedding_dim: Option<u32>) -> napi::Result<TypeId> {
+fn to_type_id(
+    ty: &ColumnType,
+    embedding_dim: Option<u32>,
+    enum_variants: Option<&[String]>,
+) -> napi::Result<TypeId> {
     Ok(match ty {
         ColumnType::Bool => TypeId::Bool,
         ColumnType::Int64 => TypeId::Int64,
@@ -225,6 +235,16 @@ fn to_type_id(ty: &ColumnType, embedding_dim: Option<u32>) -> napi::Result<TypeI
         ColumnType::Uuid => TypeId::Uuid,
         ColumnType::Json => TypeId::Json,
         ColumnType::Array => TypeId::Array { element_type: 0 },
+        ColumnType::Enum => TypeId::Enum {
+            variants: enum_variants
+                .ok_or_else(|| {
+                    napi::Error::new(
+                        napi::Status::InvalidArg,
+                        "enum_variants is required for Enum columns",
+                    )
+                })?
+                .into(),
+        },
         ColumnType::Embedding => TypeId::Embedding {
             dim: embedding_dim.ok_or_else(|| {
                 napi::Error::new(
@@ -256,17 +276,36 @@ fn to_column_flags(column: &ColumnSpec) -> ColumnFlags {
     flags
 }
 
+/// Convert a JS `ColumnSpec`'s default fields into an engine `DefaultExpr`.
+fn build_default_expr(c: &ColumnSpec, ty: &TypeId) -> napi::Result<Option<DefaultExpr>> {
+    match c.default_expr.as_deref() {
+        Some("now") => Ok(Some(DefaultExpr::Now)),
+        Some("uuid") => Ok(Some(DefaultExpr::Uuid)),
+        Some(other) => Err(napi::Error::new(
+            napi::Status::InvalidArg,
+            format!("unknown default_expr \"{other}\""),
+        )),
+        None => match &c.default_value {
+            Some(cell) => Ok(Some(DefaultExpr::Static(cell.to_value(ty)?))),
+            None => Ok(None),
+        },
+    }
+}
+
 fn build_schema(spec: SchemaSpec) -> napi::Result<Schema> {
     let columns = spec
         .columns
         .into_iter()
         .map(|c| {
             let flags = to_column_flags(&c);
+            let ty = to_type_id(&c.ty, c.embedding_dim, c.enum_variants.as_deref())?;
+            let default_value = build_default_expr(&c, &ty)?;
             Ok::<ColumnDef, napi::Error>(ColumnDef {
                 id: c.id,
                 name: c.name,
-                ty: to_type_id(&c.ty, c.embedding_dim)?,
+                ty,
                 flags,
+                default_value,
             })
         })
         .collect::<napi::Result<Vec<_>>>()?;
@@ -438,7 +477,7 @@ impl Cell {
         }
     }
 
-    fn to_value(&self, ty: TypeId) -> napi::Result<Value> {
+    fn to_value(&self, ty: &TypeId) -> napi::Result<Value> {
         // A cell whose value field for its column type is absent represents SQL
         // NULL. Callers that mean zero/empty must set the field explicitly.
         Ok(match ty {
@@ -452,6 +491,10 @@ impl Cell {
             },
             TypeId::Float64 => match self.float64 {
                 Some(f) => Value::Float64(f),
+                None => Value::Null,
+            },
+            TypeId::Enum { .. } => match &self.text {
+                Some(s) => Value::Bytes(s.as_bytes().to_vec()),
                 None => Value::Null,
             },
             TypeId::Bytes => {
@@ -919,9 +962,9 @@ fn cell_pairs_table(
                 .columns
                 .iter()
                 .find(|cd| cd.id == c.column_id)
-                .map(|cd| cd.ty)
+                .map(|cd| cd.ty.clone())
                 .unwrap_or(TypeId::Bytes);
-            Ok((c.column_id, c.to_value(ty)?))
+            Ok((c.column_id, c.to_value(&ty)?))
         })
         .collect()
 }
@@ -1253,7 +1296,7 @@ impl Database {
     /// a default value so existing rows can be evolved safely.
     #[napi]
     pub fn add_column(&self, table: String, column: ColumnSpec) -> napi::Result<BigInt> {
-        if !column.nullable && column.default_value.is_none() {
+        if !column.nullable && column.default_value.is_none() && column.default_expr.is_none() {
             return Err(napi::Error::new(
                 napi::Status::InvalidArg,
                 "non-null column added without default",
@@ -1261,9 +1304,12 @@ impl Database {
         }
         let handle = self.inner.table(&table).map_err(to_napi)?;
         let mut g = handle.lock();
-        let ty = to_type_id(&column.ty, column.embedding_dim)?;
+        let ty = to_type_id(&column.ty, column.embedding_dim, column.enum_variants.as_deref())?;
         let flags = to_column_flags(&column);
-        let id = g.add_column(&column.name, ty, flags).map_err(to_napi)?;
+        let default_value = build_default_expr(&column, &ty)?;
+        let id = g
+            .add_column(&column.name, ty, flags, default_value)
+            .map_err(to_napi)?;
         Ok(BigInt::from(id as u64))
     }
 
@@ -1277,8 +1323,9 @@ impl Database {
         column_name: String,
         column: ColumnSpec,
     ) -> napi::Result<BigInt> {
-        let ty = to_type_id(&column.ty, column.embedding_dim)?;
+        let ty = to_type_id(&column.ty, column.embedding_dim, column.enum_variants.as_deref())?;
         let flags = to_column_flags(&column);
+        let default_value = build_default_expr(&column, &ty)?;
         let altered = self
             .inner
             .alter_column(
@@ -1288,6 +1335,7 @@ impl Database {
                     name: Some(column.name),
                     ty: Some(ty),
                     flags: Some(flags),
+                    default_value: Some(default_value),
                 },
             )
             .map_err(to_napi)?;
@@ -2768,7 +2816,7 @@ impl TypedColumn {
             ColumnType::Bool => self.data.len(),
             ColumnType::Bytes | ColumnType::Embedding | ColumnType::Interval
             | ColumnType::Decimal128 | ColumnType::Uuid | ColumnType::Json
-            | ColumnType::Array => {
+            | ColumnType::Array | ColumnType::Enum => {
                 return Err(napi::Error::new(
                     napi::Status::InvalidArg,
                     "Bytes/Embedding columns not supported in bulk_load_typed; use bulk_load",
@@ -3177,7 +3225,7 @@ fn native_cols_to_ipc(
                 .columns
                 .iter()
                 .find(|c| c.id == *id)
-                .map(|c| c.ty)
+                .map(|c| c.ty.clone())
                 .unwrap_or(mongreldb_core::schema::TypeId::Bytes);
             arrow_from_native(ty, col)
         })

@@ -17,12 +17,14 @@ fn base_schema() -> Schema {
                 name: "id".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
             },
             ColumnDef {
                 id: 2,
                 name: "v".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty(),
+                default_value: None,
             },
         ],
         indexes: vec![],
@@ -41,18 +43,21 @@ fn schema_with_bitmap() -> Schema {
                 name: "id".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
             },
             ColumnDef {
                 id: 2,
                 name: "tag".into(),
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+                default_value: None,
             },
             ColumnDef {
                 id: 3,
                 name: "score".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+                default_value: None,
             },
         ],
         indexes: vec![IndexDef {
@@ -322,6 +327,7 @@ fn schema_evolution_add_column_reads_null_for_old_rows() {
                 "extra",
                 TypeId::Int64,
                 ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+                None,
             )
             .unwrap();
         assert_eq!(new_cid, 3);
@@ -378,6 +384,7 @@ fn schema_evolution_query_on_new_column_does_not_crash() {
             "extra",
             TypeId::Int64,
             ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+            None,
         )
         .unwrap();
 
@@ -454,18 +461,21 @@ fn schema_with_not_null() -> Schema {
                 name: "id".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
             },
             ColumnDef {
                 id: 2,
                 name: "req".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty(),
+                default_value: None,
             },
             ColumnDef {
                 id: 3,
                 name: "opt".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+                default_value: None,
             },
         ],
         indexes: vec![],
@@ -678,6 +688,7 @@ fn reopen_after_add_column_without_flush() {
                 "extra",
                 TypeId::Bytes,
                 ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+                None,
             )
             .unwrap();
         put2(&mut t, 2, 20);
@@ -795,6 +806,7 @@ fn add_column_does_not_change_count() {
             "extra",
             TypeId::Int64,
             ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+            None,
         )
         .unwrap();
     assert_eq!(t.count(), 2, "add_column must not change live row count");

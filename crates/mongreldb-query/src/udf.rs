@@ -309,7 +309,7 @@ impl ScalarUDFImpl for FtsRankUdf {
                     return Some(0.0);
                 }
                 // Term frequency in this document.
-                let doc_len = doc_terms.len() as f64;
+                let _doc_len = doc_terms.len() as f64;
                 let score: f64 = query_terms
                     .iter()
                     .map(|qt| {
@@ -321,9 +321,8 @@ impl ScalarUDFImpl for FtsRankUdf {
                             // Without global IDF, use log(1 + tf) as a proxy.
                             let k1 = 1.2;
                             let b = 0.75;
-                            let tf_component =
-                                (tf * (k1 + 1.0)) / (tf + k1 * (1.0 - b + b * (doc_len / doc_len)));
-                            tf_component
+                            // Simplified BM25: avgdl≈doc_len so doc_len/avgdl = 1.
+                            (tf * (k1 + 1.0)) / (tf + k1 * (1.0 - b + b))
                         }
                     })
                     .sum();

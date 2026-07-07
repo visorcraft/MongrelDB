@@ -15,6 +15,7 @@ fn schema() -> Schema {
             name: "id".into(),
             ty: TypeId::Int64,
             flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+            default_value: None,
         }],
         indexes: Vec::new(),
         colocation: vec![],
@@ -53,6 +54,7 @@ fn schema_evolution_reads_old_rows_as_null() {
             "note",
             TypeId::Bytes,
             ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+            None,
         )
         .unwrap();
     assert!(new_id > 1);
@@ -172,12 +174,14 @@ fn native_aggregate_matches_expected() {
                 name: "id".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
             },
             ColumnDef {
                 id: 2,
                 name: "v".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty(),
+                default_value: None,
             },
         ],
         indexes: vec![IndexDef {

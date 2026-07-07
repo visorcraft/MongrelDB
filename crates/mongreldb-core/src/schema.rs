@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 use crate::constraint::TableConstraints;
 use crate::error::{MongrelError, Result};
@@ -6,7 +7,7 @@ use crate::memtable::Value;
 
 /// Logical column types. The on-disk Arrow encoding is chosen at flush based on
 /// [`TypeId`] and run-time stats (e.g. low-cardinality strings → dictionary).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum TypeId {
     Bool,
@@ -54,11 +55,19 @@ pub enum TypeId {
         precision: u8,
         scale: i8,
     },
+    /// SQL ENUM: stored as `Value::Bytes(variant_name_utf8)`, validated against
+    /// the `variants` list at write time. Dictionary-encoded on disk like
+    /// `Bytes` (low-cardinality sweet spot). Membership is enforced at the
+    /// write edge (SQL `coerce_value`, HTTP `json_to_value`), not at the core
+    /// commit path.
+    Enum {
+        variants: Arc<[String]>,
+    },
 }
 
 impl TypeId {
     /// Fixed size in bytes for fixed-width types, else `None`.
-    pub const fn fixed_size(self) -> Option<usize> {
+    pub fn fixed_size(&self) -> Option<usize> {
         match self {
             TypeId::Bool => Some(1),
             TypeId::Int8 | TypeId::UInt8 => Some(1),
@@ -70,7 +79,7 @@ impl TypeId {
             | TypeId::TimestampNanos
             | TypeId::Date64
             | TypeId::Time64 => Some(8),
-            TypeId::Bytes | TypeId::Embedding { .. } => None,
+            TypeId::Bytes | TypeId::Embedding { .. } | TypeId::Enum { .. } => None,
             TypeId::Decimal128 { .. } => Some(16),
             TypeId::Uuid => Some(16),
             TypeId::Json | TypeId::Array { .. } => None,
@@ -130,13 +139,33 @@ impl ColumnFlags {
     }
 }
 
+/// A default-value expression stored on a column definition and applied
+/// authoritatively by the engine at insert stage time (before NOT NULL
+/// validation) when the column is omitted or explicitly `Null`. Sequence
+/// defaults are handled separately via [`ColumnFlags::AUTO_INCREMENT`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum DefaultExpr {
+    /// A literal value applied verbatim.
+    Static(Value),
+    /// Current timestamp as an ISO-8601 UTC string (`Value::Bytes`). Resolved
+    /// at stage time (per-row).
+    Now,
+    /// A random RFC 4122 UUID (`Value::Uuid`). Resolved at stage time.
+    Uuid,
+}
+
 /// A column definition. `id` is stable, monotonic, and never reused.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ColumnDef {
     pub id: u16,
     pub name: String,
     pub ty: TypeId,
     pub flags: ColumnFlags,
+    /// Optional default expression applied at insert stage time when the column
+    /// is omitted or explicitly `Null`. Serialized for catalog persistence;
+    /// old catalogs without this field deserialize to `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_value: Option<DefaultExpr>,
 }
 
 /// Metadata updates supported by native ALTER COLUMN.
@@ -145,6 +174,10 @@ pub struct AlterColumn {
     pub name: Option<String>,
     pub ty: Option<TypeId>,
     pub flags: Option<ColumnFlags>,
+    /// `None` = leave default unchanged, `Some(None)` = drop default,
+    /// `Some(Some(expr))` = set/replace default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_value: Option<Option<DefaultExpr>>,
 }
 
 impl AlterColumn {
@@ -153,6 +186,7 @@ impl AlterColumn {
             name: Some(name.into()),
             ty: None,
             flags: None,
+            default_value: None,
         }
     }
 
@@ -161,6 +195,7 @@ impl AlterColumn {
             name: None,
             ty: Some(ty),
             flags: None,
+            default_value: None,
         }
     }
 
@@ -169,6 +204,25 @@ impl AlterColumn {
             name: None,
             ty: None,
             flags: Some(flags),
+            default_value: None,
+        }
+    }
+
+    pub fn set_default(expr: DefaultExpr) -> Self {
+        Self {
+            name: None,
+            ty: None,
+            flags: None,
+            default_value: Some(Some(expr)),
+        }
+    }
+
+    pub fn drop_default() -> Self {
+        Self {
+            name: None,
+            ty: None,
+            flags: None,
+            default_value: Some(None),
         }
     }
 }
@@ -320,6 +374,81 @@ impl Schema {
             .iter()
             .find(|c| c.flags.contains(ColumnFlags::AUTO_INCREMENT))
     }
+
+    /// Validate that every column carrying a `default_value` has a
+    /// type-compatible expression. Called at table creation and ALTER COLUMN
+    /// so an invalid default never reaches the insert path.
+    pub fn validate_defaults(&self) -> Result<()> {
+        for col in &self.columns {
+            let Some(expr) = &col.default_value else {
+                continue;
+            };
+            match expr {
+                DefaultExpr::Static(v) => {
+                    if !value_matches_type(v, col.ty.clone()) {
+                        return Err(MongrelError::Schema(format!(
+                            "DEFAULT value for column '{}' ({:?}) does not match type {:?}",
+                            col.name, v, col.ty
+                        )));
+                    }
+                }
+                DefaultExpr::Now => {
+                    if !matches!(
+                        col.ty,
+                        TypeId::Bytes | TypeId::TimestampNanos | TypeId::Date64
+                    ) {
+                        return Err(MongrelError::Schema(format!(
+                            "DEFAULT NOW() on column '{}' requires Bytes/TimestampNanos/Date64, is {:?}",
+                            col.name, col.ty
+                        )));
+                    }
+                }
+                DefaultExpr::Uuid => {
+                    if !matches!(col.ty, TypeId::Uuid | TypeId::Bytes) {
+                        return Err(MongrelError::Schema(format!(
+                            "DEFAULT UUID() on column '{}' requires Uuid/Bytes, is {:?}",
+                            col.name, col.ty
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Check that a [`Value`] is compatible with a [`TypeId`] for default-value
+/// validation. More lenient than full type-checking: `Null` is universally
+/// accepted (it means "DEFAULT NULL"), and `Bytes` covers UTF-8 string types.
+pub(crate) fn value_matches_type(v: &Value, ty: TypeId) -> bool {
+    matches!(
+        (v, ty),
+        (Value::Null, _)
+            | (Value::Bool(_), TypeId::Bool)
+            | (
+                Value::Int64(_),
+                TypeId::Int8 | TypeId::Int16 | TypeId::Int32 | TypeId::Int64
+            )
+            | (Value::Float64(_), TypeId::Float32 | TypeId::Float64)
+            | (
+                Value::Bytes(_),
+                TypeId::Bytes
+                    | TypeId::Json
+                    | TypeId::Uuid
+                    | TypeId::Date64
+                    | TypeId::Time64
+                    | TypeId::Enum { .. }
+            )
+            | (
+                Value::Int64(_),
+                TypeId::TimestampNanos | TypeId::Date32 | TypeId::Date64 | TypeId::Time64
+            )
+            | (Value::Uuid(_), TypeId::Uuid)
+            | (Value::Decimal(_), TypeId::Decimal128 { .. })
+            | (Value::Json(_), TypeId::Json)
+            | (Value::Embedding(_), TypeId::Embedding { .. })
+            | (Value::Interval { .. }, TypeId::Interval)
+    )
 }
 
 #[cfg(test)]
@@ -349,6 +478,7 @@ mod tests {
             name: name.into(),
             ty,
             flags,
+            default_value: None,
         }
     }
 
@@ -464,5 +594,147 @@ mod tests {
         // Omitting the auto-inc column must not trip NOT NULL.
         let cols = vec![(1u16, Value::Bytes(b"x".to_vec()))];
         assert!(s.validate_not_null(&cols).is_ok());
+    }
+
+    fn col_with_default(
+        id: u16,
+        name: &str,
+        ty: TypeId,
+        flags: ColumnFlags,
+        dv: DefaultExpr,
+    ) -> ColumnDef {
+        ColumnDef {
+            id,
+            name: name.into(),
+            ty,
+            flags,
+            default_value: Some(dv),
+        }
+    }
+
+    #[test]
+    fn validate_defaults_accepts_matching_static() {
+        let s = Schema {
+            schema_id: 1,
+            columns: vec![col_with_default(
+                0,
+                "active",
+                TypeId::Bool,
+                ColumnFlags::empty(),
+                DefaultExpr::Static(Value::Bool(true)),
+            )],
+            indexes: vec![],
+            colocation: vec![],
+            constraints: Default::default(),
+            clustered: false,
+        };
+        assert!(s.validate_defaults().is_ok());
+    }
+
+    #[test]
+    fn validate_defaults_rejects_mismatched_static() {
+        let s = Schema {
+            schema_id: 1,
+            columns: vec![col_with_default(
+                0,
+                "count",
+                TypeId::Int64,
+                ColumnFlags::empty(),
+                DefaultExpr::Static(Value::Bytes(b"oops".to_vec())),
+            )],
+            indexes: vec![],
+            colocation: vec![],
+            constraints: Default::default(),
+            clustered: false,
+        };
+        assert!(s.validate_defaults().is_err());
+    }
+
+    #[test]
+    fn validate_defaults_now_requires_temporal_or_bytes() {
+        let ok = Schema {
+            schema_id: 1,
+            columns: vec![col_with_default(
+                0,
+                "ts",
+                TypeId::Bytes,
+                ColumnFlags::empty(),
+                DefaultExpr::Now,
+            )],
+            indexes: vec![],
+            colocation: vec![],
+            constraints: Default::default(),
+            clustered: false,
+        };
+        assert!(ok.validate_defaults().is_ok());
+
+        let bad = Schema {
+            schema_id: 1,
+            columns: vec![col_with_default(
+                0,
+                "ts",
+                TypeId::Int64,
+                ColumnFlags::empty(),
+                DefaultExpr::Now,
+            )],
+            indexes: vec![],
+            colocation: vec![],
+            constraints: Default::default(),
+            clustered: false,
+        };
+        assert!(bad.validate_defaults().is_err());
+    }
+
+    #[test]
+    fn validate_defaults_uuid_requires_uuid_or_bytes() {
+        let ok = Schema {
+            schema_id: 1,
+            columns: vec![col_with_default(
+                0,
+                "id",
+                TypeId::Uuid,
+                ColumnFlags::empty(),
+                DefaultExpr::Uuid,
+            )],
+            indexes: vec![],
+            colocation: vec![],
+            constraints: Default::default(),
+            clustered: false,
+        };
+        assert!(ok.validate_defaults().is_ok());
+
+        let bad = Schema {
+            schema_id: 1,
+            columns: vec![col_with_default(
+                0,
+                "id",
+                TypeId::Bool,
+                ColumnFlags::empty(),
+                DefaultExpr::Uuid,
+            )],
+            indexes: vec![],
+            colocation: vec![],
+            constraints: Default::default(),
+            clustered: false,
+        };
+        assert!(bad.validate_defaults().is_err());
+    }
+
+    #[test]
+    fn serde_roundtrip_column_def_with_default() {
+        let c = col_with_default(
+            0,
+            "x",
+            TypeId::Bytes,
+            ColumnFlags::empty(),
+            DefaultExpr::Static(Value::Bytes(b"hello".to_vec())),
+        );
+        let json = serde_json::to_string(&c).unwrap();
+        let de: ColumnDef = serde_json::from_str(&json).unwrap();
+        assert_eq!(c, de);
+        // ColumnDef without default deserializes to None.
+        let old_json = r#"{"id":0,"name":"y","ty":{"kind":"bytes"},"flags":{"bits":0}}"#;
+        let old: ColumnDef = serde_json::from_str(old_json).unwrap();
+        assert!(old.default_value.is_none());
     }
 }

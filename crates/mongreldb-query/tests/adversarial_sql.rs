@@ -17,24 +17,28 @@ fn setup_orders() -> (tempfile::TempDir, Arc<Database>) {
                 name: "id".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
             },
             ColumnDef {
                 id: 2,
                 name: "amount".into(),
                 ty: TypeId::Float64,
                 flags: ColumnFlags::empty(),
+                default_value: None,
             },
             ColumnDef {
                 id: 3,
                 name: "category".into(),
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty(),
+                default_value: None,
             },
             ColumnDef {
                 id: 4,
                 name: "parent_id".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+                default_value: None,
             },
         ],
         indexes: vec![],
@@ -79,12 +83,14 @@ fn setup_empty() -> (tempfile::TempDir, Arc<Database>) {
                 name: "id".into(),
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
             },
             ColumnDef {
                 id: 2,
                 name: "val".into(),
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty(),
+                default_value: None,
             },
         ],
         indexes: vec![],
@@ -202,7 +208,7 @@ fn recursive_cte_recursive_on_real_table() {
     )
     .unwrap();
     // id=1 → children: id=2 (parent_id=1), id=3 (parent_id=2), etc.
-    assert!(rows.len() >= 1, "should walk at least 1 row");
+    assert!(!rows.is_empty(), "should walk at least 1 row");
     assert_eq!(rows[0][0].1, "1");
 }
 
@@ -643,6 +649,7 @@ fn cred_enable_then_reopen_without() {
                     name: "id".into(),
                     ty: TypeId::Int64,
                     flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                    default_value: None,
                 }],
                 indexes: vec![],
                 colocation: vec![],
@@ -695,6 +702,7 @@ fn cred_permission_denied_on_table() {
                     name: "id".into(),
                     ty: TypeId::Int64,
                     flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                    default_value: None,
                 }],
                 indexes: vec![],
                 colocation: vec![],
@@ -738,6 +746,7 @@ fn cred_all_permission_not_admin() {
                     name: "id".into(),
                     ty: TypeId::Int64,
                     flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                    default_value: None,
                 }],
                 indexes: vec![],
                 colocation: vec![],
@@ -768,7 +777,6 @@ fn cred_all_permission_not_admin() {
     ));
 }
 
-#[cfg(feature = "encryption")]
 #[test]
 fn cred_encrypted_with_credentials_wrong_passphrase() {
     let dir = tempdir().unwrap();
@@ -777,7 +785,7 @@ fn cred_encrypted_with_credentials_wrong_passphrase() {
     // Wrong passphrase → can't decrypt catalog.
     let err = Database::open_encrypted(dir.path(), "wrong").unwrap_err();
     assert!(
-        !matches!(err, mongreldb_core::MongrelError::AuthRequired { .. }),
+        !matches!(err, mongreldb_core::MongrelError::AuthRequired),
         "wrong passphrase should fail at decryption, not at auth"
     );
 }

@@ -39,6 +39,34 @@ pub const META_DIR: &str = "_meta";
 pub const RCACHE_DIR: &str = "_rcache";
 pub const KEYS_FILENAME: &str = "keys";
 pub const SCHEMA_FILENAME: &str = "schema.json";
+
+/// Current UTC time as an ISO-8601 string in bytes (e.g. `b"2024-07-07T14:30:00Z"`).
+/// Used by `DefaultExpr::Now` at stage time.
+fn iso_now_bytes() -> Vec<u8> {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (hour, minute, second) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let (year, month, day) = civil_from_days(days);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z").into_bytes()
+}
+
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
 const DEFAULT_SYNC_BYTE_THRESHOLD: u64 = 0; // manual commit only (pure group commit)
 pub(crate) const PAGE_CACHE_CAPACITY: u64 = 64 * 1024 * 1024; // 64 MiB shared page cache
 pub(crate) const DECODED_CACHE_CAPACITY: u64 = 64 * 1024 * 1024; // 64 MiB shared decoded-page cache (Phase 15.4)
@@ -983,6 +1011,7 @@ impl Table {
         ctx: SharedCtx,
     ) -> Result<Self> {
         schema.validate_auto_increment()?;
+        schema.validate_defaults()?;
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(dir.join(RUNS_DIR))?;
         write_schema(&dir, &schema)?;
@@ -1510,7 +1539,7 @@ impl Table {
                 .columns
                 .iter()
                 .find(|c| c.id == cid)
-                .map(|c| c.ty)
+                .map(|c| c.ty.clone())
                 .unwrap_or(TypeId::Int64);
             match ty {
                 TypeId::Int64 | TypeId::TimestampNanos | TypeId::Date32 => {
@@ -1666,6 +1695,7 @@ impl Table {
     ) -> Result<(RowId, Option<i64>)> {
         self.require_insert()?;
         let assigned = self.fill_auto_inc(&mut columns)?;
+        self.apply_defaults(&mut columns)?;
         self.schema.validate_not_null(&columns)?;
         // For clustered (WITHOUT ROWID) tables, derive RowId deterministically
         // from the PK value so the same PK always maps to the same row (no
@@ -1705,6 +1735,7 @@ impl Table {
         let mut filled: Vec<FilledAutoIncRow> = Vec::with_capacity(batch.len());
         for mut cols in batch {
             let assigned = self.fill_auto_inc(&mut cols)?;
+            self.apply_defaults(&mut cols)?;
             filled.push((cols, assigned));
         }
         for (cols, _) in &filled {
@@ -1766,6 +1797,46 @@ impl Table {
             }
         };
         Ok(assigned)
+    }
+
+    /// Apply column default expressions to `columns` at stage time (before
+    /// NOT NULL validation). For each column carrying a `default_value`, if the
+    /// column is omitted or explicitly `Null`, the default is applied. Explicit
+    /// values are never overridden. Called after [`fill_auto_inc`](Self::fill_auto_inc)
+    /// and before `validate_not_null`.
+    pub fn apply_defaults(&self, columns: &mut Vec<(u16, Value)>) -> Result<()> {
+        for col in &self.schema.columns {
+            let Some(expr) = &col.default_value else {
+                continue;
+            };
+            // Skip AUTO_INCREMENT columns — handled by fill_auto_inc.
+            if col.flags.contains(ColumnFlags::AUTO_INCREMENT) {
+                continue;
+            }
+            let pos = columns.iter().position(|(c, _)| *c == col.id);
+            let needs_default = match pos {
+                None => true,
+                Some(i) => matches!(columns[i].1, Value::Null),
+            };
+            if !needs_default {
+                continue;
+            }
+            let v = match expr {
+                crate::schema::DefaultExpr::Static(v) => v.clone(),
+                crate::schema::DefaultExpr::Now => Value::Bytes(iso_now_bytes()),
+                crate::schema::DefaultExpr::Uuid => {
+                    let mut buf = [0u8; 16];
+                    getrandom::getrandom(&mut buf)
+                        .map_err(|e| MongrelError::Other(format!("UUID generation failed: {e}")))?;
+                    Value::Uuid(buf)
+                }
+            };
+            match pos {
+                None => columns.push((col.id, v)),
+                Some(i) => columns[i].1 = v,
+            }
+        }
+        Ok(())
     }
 
     /// Allocate the next identity value, seeding the counter first if needed.
@@ -2364,7 +2435,7 @@ impl Table {
     ) -> Option<Vec<usize>> {
         let pk_col = self.schema.primary_key()?;
         let pk_id = pk_col.id;
-        let pk_ty = pk_col.ty;
+        let pk_ty = pk_col.ty.clone();
         let by_id: HashMap<u16, &columnar::NativeColumn> =
             columns.iter().map(|(id, c)| (*id, c)).collect();
         let pk_native = by_id.get(&pk_id)?;
@@ -2375,7 +2446,7 @@ impl Table {
         let mut last: HashMap<Vec<u8>, usize> = HashMap::new();
         let mut null_pk_rows: Vec<usize> = Vec::new();
         for i in 0..n {
-            match bulk_index_key(&self.column_keys, pk_id, pk_ty, pk_native, i) {
+            match bulk_index_key(&self.column_keys, pk_id, pk_ty.clone(), pk_native, i) {
                 Some(key) => {
                     last.insert(key, i);
                 }
@@ -3015,7 +3086,12 @@ impl Table {
             self.schema
                 .columns
                 .par_iter()
-                .map(|cdef| (cdef.id, columnar::rows_to_native(cdef.ty, &batch, cdef.id)))
+                .map(|cdef| {
+                    (
+                        cdef.id,
+                        columnar::rows_to_native(cdef.ty.clone(), &batch, cdef.id),
+                    )
+                })
                 .collect::<Vec<_>>()
         };
         drop(batch);
@@ -4273,15 +4349,19 @@ impl Table {
         }
         let by_id: std::collections::HashMap<u16, &columnar::NativeColumn> =
             columns.iter().map(|(id, c)| (*id, c)).collect();
-        let ty_of: std::collections::HashMap<u16, TypeId> =
-            self.schema.columns.iter().map(|c| (c.id, c.ty)).collect();
+        let ty_of: std::collections::HashMap<u16, TypeId> = self
+            .schema
+            .columns
+            .iter()
+            .map(|c| (c.id, c.ty.clone()))
+            .collect();
         let pk_id = self.schema.primary_key().map(|c| c.id);
 
         for (i, &rid) in row_ids.iter().enumerate() {
             let row_id = RowId(rid);
             if let Some(pid) = pk_id {
                 if let Some(col) = by_id.get(&pid) {
-                    let ty = ty_of.get(&pid).copied().unwrap_or(TypeId::Int64);
+                    let ty = ty_of.get(&pid).cloned().unwrap_or(TypeId::Int64);
                     if let Some(key) = bulk_index_key(&self.column_keys, pid, ty, col, i) {
                         self.insert_hot_pk(key, row_id);
                     }
@@ -4291,7 +4371,7 @@ impl Table {
                 let Some(col) = by_id.get(&idef.column_id) else {
                     continue;
                 };
-                let ty = ty_of.get(&idef.column_id).copied().unwrap_or(TypeId::Int64);
+                let ty = ty_of.get(&idef.column_id).cloned().unwrap_or(TypeId::Int64);
                 match idef.kind {
                     IndexKind::Bitmap => {
                         if let Some(b) = self.bitmap.get_mut(&idef.column_id) {
@@ -4402,7 +4482,7 @@ impl Table {
                     .columns
                     .iter()
                     .find(|c| c.id == id)
-                    .map(|c| c.ty)
+                    .map(|c| c.ty.clone())
                     .unwrap_or(TypeId::Bytes);
                 (id, columnar::values_to_native(ty, &vals))
             })
@@ -4717,7 +4797,7 @@ impl Table {
                     .columns
                     .iter()
                     .find(|c| c.id == cid)
-                    .map(|c| c.ty)
+                    .map(|c| c.ty.clone())
                     .unwrap_or(TypeId::Bytes);
                 (cid, ty)
             })
@@ -4796,7 +4876,7 @@ impl Table {
                                 proj_pairs
                                     .iter()
                                     .find(|(c, _)| c == &id)
-                                    .map(|(_, t)| *t)
+                                    .map(|(_, t)| t.clone())
                                     .unwrap_or(TypeId::Bytes),
                                 0,
                             ),
@@ -4897,7 +4977,7 @@ impl Table {
                 .iter()
                 .map(|r| r.columns.get(cid).cloned().unwrap_or(Value::Null))
                 .collect();
-            cols.push((*cid, columnar::values_to_native(*ty, &vals)));
+            cols.push((*cid, columnar::values_to_native(ty.clone(), &vals)));
         }
         Ok(Some(cols))
     }
@@ -5345,7 +5425,7 @@ impl Table {
                 .iter()
                 .map(|r| r.columns.get(cid).cloned().unwrap_or(Value::Null))
                 .collect();
-            cols.push(columnar::values_to_native(*ty, &vals));
+            cols.push(columnar::values_to_native(ty.clone(), &vals));
         }
         cols
     }
@@ -5594,7 +5674,8 @@ impl Table {
             None => return Ok(None),
         };
         let ty = self.column_type(cid);
-        let Some(mut cursor) = self.scan_cursor(snapshot, vec![(cid, ty)], conditions)? else {
+        let Some(mut cursor) = self.scan_cursor(snapshot, vec![(cid, ty.clone())], conditions)?
+        else {
             return Ok(None);
         };
         match ty {
@@ -5837,7 +5918,7 @@ impl Table {
             .columns
             .iter()
             .find(|c| c.id == cid)
-            .map(|c| c.ty)
+            .map(|c| c.ty.clone())
             .unwrap_or(TypeId::Bytes)
     }
 
@@ -6092,12 +6173,16 @@ impl Table {
             next.name = trimmed.to_string();
         }
 
-        if let Some(ty) = change.ty {
-            next.ty = ty;
+        if let Some(ty) = &change.ty {
+            next.ty = ty.clone();
         }
         if let Some(flags) = change.flags {
             validate_alter_column_flags(old.flags, flags)?;
             next.flags = flags;
+        }
+
+        if let Some(default_change) = &change.default_value {
+            next.default_value = default_change.clone();
         }
 
         validate_alter_column_type(&self.schema, &old, &next, self.has_stored_versions())?;
@@ -6126,6 +6211,7 @@ impl Table {
         self.schema.columns[idx] = column;
         self.schema.schema_id = self.schema.schema_id.saturating_add(1);
         self.schema.validate_auto_increment()?;
+        self.schema.validate_defaults()?;
         self.auto_inc = resolve_auto_inc(&self.schema);
         self.column_keys = build_column_keys(self.kek.as_deref(), &self.schema);
         write_schema(&self.dir, &self.schema)?;
@@ -6164,7 +6250,13 @@ impl Table {
     /// back as null for the new column until re-written. Persists the new schema
     /// and manifest. The caller supplies the full [`ColumnFlags`] so migrations
     /// can add `PRIMARY KEY` / `AUTO_INCREMENT` columns correctly.
-    pub fn add_column(&mut self, name: &str, ty: TypeId, flags: ColumnFlags) -> Result<u16> {
+    pub fn add_column(
+        &mut self,
+        name: &str,
+        ty: TypeId,
+        flags: ColumnFlags,
+        default_value: Option<crate::schema::DefaultExpr>,
+    ) -> Result<u16> {
         if self.schema.columns.iter().any(|c| c.name == name) {
             return Err(MongrelError::Schema(format!(
                 "column {name} already exists"
@@ -6176,9 +6268,11 @@ impl Table {
             name: name.to_string(),
             ty,
             flags,
+            default_value,
         });
         self.schema.schema_id = self.schema.schema_id.saturating_add(1);
         self.schema.validate_auto_increment()?;
+        self.schema.validate_defaults()?;
         if flags.contains(ColumnFlags::AUTO_INCREMENT) {
             self.auto_inc = resolve_auto_inc(&self.schema);
         }
@@ -6211,7 +6305,7 @@ impl Table {
             .columns
             .iter()
             .find(|c| c.id == cid)
-            .map(|c| c.ty)
+            .map(|c| c.ty.clone())
             .unwrap_or(TypeId::Int64);
         if !matches!(
             ty,
@@ -7090,7 +7184,7 @@ fn validate_alter_column_type(
             old.name
         )));
     }
-    if !has_stored_versions || storage_compatible_type_change(old.ty, next.ty) {
+    if !has_stored_versions || storage_compatible_type_change(old.ty.clone(), next.ty.clone()) {
         return Ok(());
     }
     Err(MongrelError::Schema(format!(
