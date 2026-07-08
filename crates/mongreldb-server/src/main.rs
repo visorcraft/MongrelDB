@@ -259,12 +259,11 @@ async fn main() {
         }
     }
 
-    // Open the database (optionally encrypted). If the catalog file doesn't
-    // exist yet, create it automatically (create-if-not-missing). We check for
-    // the CATALOG file explicitly rather than blindly falling back to create()
-    // on any open error — create() writes an empty catalog and would destroy
-    // an existing database if the open failed for a transient reason (e.g.,
-    // lock contention from a process that hasn't fully released yet).
+    // Open the database (optionally encrypted), or create it if the catalog
+    // is absent. CATALOG existence is now also enforced by `create` itself,
+    // but we branch here so the error path on a populated dir is `open`'s
+    // (more specific) error, not the generic "database already exists" from
+    // `create`.
     let catalog_exists = std::path::Path::new(&args.db_dir)
         .join("CATALOG")
         .exists();
