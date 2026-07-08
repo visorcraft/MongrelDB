@@ -54,8 +54,7 @@ fn main() {
         "flock_holder" => {
             use fs2::FileExt;
             let lock_path = std::path::PathBuf::from(&dir).join("_meta").join(".lock");
-            std::fs::create_dir_all(lock_path.parent().unwrap())
-                .expect("create _meta dir");
+            std::fs::create_dir_all(lock_path.parent().unwrap()).expect("create _meta dir");
             let f = std::fs::OpenOptions::new()
                 .create(true)
                 .truncate(false)

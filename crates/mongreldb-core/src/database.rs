@@ -191,7 +191,7 @@ pub type TableHandle = Arc<Mutex<Table>>;
 /// All fields default to the same values the convenience
 /// [`Database::open`] / [`Database::open_encrypted`] / etc. constructors use,
 /// so `OpenOptions::default()` round-trips the historical behavior exactly.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct OpenOptions {
     /// Maximum time, in milliseconds, to wait for the cross-process database
     /// lock (`_meta/.lock`) before failing the open with `MongrelError::Io`.
@@ -208,14 +208,6 @@ pub struct OpenOptions {
     /// misses, and WAL appends already serialize through in-process locks
     /// that handle their own contention.
     pub lock_timeout_ms: u32,
-}
-
-impl Default for OpenOptions {
-    fn default() -> Self {
-        Self {
-            lock_timeout_ms: 0,
-        }
-    }
 }
 
 impl OpenOptions {
@@ -395,6 +387,7 @@ impl Database {
     #[cfg(feature = "encryption")]
     pub fn create_encrypted(root: impl AsRef<Path>, passphrase: &str) -> Result<Self> {
         let root = root.as_ref();
+        Self::reject_existing_database(root)?;
         std::fs::create_dir_all(root)?;
         std::fs::create_dir_all(root.join(META_DIR))?;
         let salt = crate::encryption::random_salt();
@@ -408,6 +401,7 @@ impl Database {
     #[cfg(feature = "encryption")]
     pub fn create_with_key(root: impl AsRef<Path>, key: &[u8]) -> Result<Self> {
         let root = root.as_ref();
+        Self::reject_existing_database(root)?;
         std::fs::create_dir_all(root)?;
         std::fs::create_dir_all(root.join(META_DIR))?;
         let salt = crate::encryption::random_salt();
@@ -421,17 +415,7 @@ impl Database {
         kek: Option<Arc<crate::encryption::Kek>>,
     ) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
-        // Refuse to overwrite an existing database. If CATALOG exists, the
-        // directory already contains a real database — silently replacing it
-        // with an empty catalog would destroy all data.
-        let catalog_path = root.join(catalog::CATALOG_FILENAME);
-        if catalog_path.exists() {
-            return Err(MongrelError::InvalidArgument(format!(
-                "database already exists at {}; use Database::open() to open it, \
-                 or remove the directory first",
-                root.display()
-            )));
-        }
+        Self::reject_existing_database(&root)?;
         std::fs::create_dir_all(&root)?;
         std::fs::create_dir_all(root.join(TABLES_DIR))?;
         let meta_dek = crate::encryption::meta_dek_for(kek.as_deref());
@@ -582,21 +566,12 @@ impl Database {
     /// Open an existing database with non-default [`OpenOptions`].
     ///
     /// Use this when you need cross-process lock retries (`lock_timeout_ms`)
-    /// rather than the fail-fast default. All the [`Database::open`],
-    /// [`Database::open_encrypted`], [`Database::open_with_key`],
-    /// [`Database::open_with_credentials`], and
-    /// [`Database::open_encrypted_with_credentials`] paths route through here
-    /// internally with their previous defaults preserved.
-    pub fn open_with_options(
-        root: impl AsRef<Path>,
-        options: OpenOptions,
-    ) -> Result<Self> {
-        // No encryption, no auth — the plain-text, anonymous-open path. Other
-        // entry points (encrypted / credentialed) keep their existing
-        // constructors and don't accept `OpenOptions` to avoid multiplying
-        // the entry-surface; callers who need those modes plus a lock timeout
-        // can fork this method or use the timeout set on the cross-process
-        // caller side. Today: keeps the surface tight.
+    /// rather than the fail-fast default. The other open constructors keep
+    /// their previous defaults; use their `*_with_options` variants when they
+    /// need the same timeout behavior.
+    pub fn open_with_options(root: impl AsRef<Path>, options: OpenOptions) -> Result<Self> {
+        // No encryption, no auth; encrypted and credentialed paths have their
+        // own `*_with_options` constructors.
         Self::open_inner_with_lock_timeout(root, None, None, options.lock_timeout_ms)
     }
 
@@ -677,7 +652,15 @@ impl Database {
                 }
             })?;
 
-        Self::finish_open(root, cat, kek, meta_dek, true, Some(principal), lock_timeout_ms)
+        Self::finish_open(
+            root,
+            cat,
+            kek,
+            meta_dek,
+            true,
+            Some(principal),
+            lock_timeout_ms,
+        )
     }
 
     /// Create a fresh plaintext database with `require_auth = true` and a
@@ -708,6 +691,7 @@ impl Database {
         admin_password: &str,
     ) -> Result<Self> {
         let root = root.as_ref();
+        Self::reject_existing_database(root)?;
         std::fs::create_dir_all(root)?;
         std::fs::create_dir_all(root.join(META_DIR))?;
         let salt = crate::encryption::random_salt();
@@ -723,6 +707,7 @@ impl Database {
         admin_password: &str,
     ) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
+        Self::reject_existing_database(&root)?;
         std::fs::create_dir_all(&root)?;
         std::fs::create_dir_all(root.join(TABLES_DIR))?;
         let meta_dek = crate::encryption::meta_dek_for(kek.as_deref());
@@ -754,6 +739,19 @@ impl Database {
         Self::finish_open(root, cat, kek, meta_dek, false, Some(admin_principal), 0)
     }
 
+    fn reject_existing_database(root: &Path) -> Result<()> {
+        // Refuse to overwrite an existing database. If CATALOG exists, the
+        // directory already contains a real database; replacing it destroys data.
+        if root.join(catalog::CATALOG_FILENAME).exists() {
+            return Err(MongrelError::InvalidArgument(format!(
+                "database already exists at {}; use Database::open() to open it, \
+                 or remove the directory first",
+                root.display()
+            )));
+        }
+        Ok(())
+    }
+
     fn open_inner(
         root: impl AsRef<Path>,
         kek: Option<Arc<crate::encryption::Kek>>,
@@ -783,19 +781,18 @@ impl Database {
             return f.try_lock_exclusive();
         }
         // Per-call deadline so a single stray 50ms sleep can't overshoot the budget.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
         let mut next_sleep = std::time::Duration::from_millis(1);
         loop {
             match f.try_lock_exclusive() {
                 Ok(()) => return Ok(()),
-                Err(_) => {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     let now = std::time::Instant::now();
                     if now >= deadline {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::WouldBlock,
-                            format!(
-                                "could not acquire database lock within {timeout_ms}ms"
-                            ),
+                            format!("could not acquire database lock within {timeout_ms}ms"),
                         ));
                     }
                     let remaining = deadline - now;
@@ -803,8 +800,11 @@ impl Database {
                     std::thread::sleep(sleep);
                     // Cap the per-iteration sleep so a single back-off step
                     // never overshoots the remaining budget.
-                    next_sleep = next_sleep.saturating_mul(10).min(std::time::Duration::from_millis(50));
+                    next_sleep = next_sleep
+                        .saturating_mul(10)
+                        .min(std::time::Duration::from_millis(50));
                 }
+                Err(e) => return Err(e),
             }
         }
     }

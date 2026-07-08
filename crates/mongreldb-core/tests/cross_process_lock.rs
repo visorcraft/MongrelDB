@@ -50,7 +50,7 @@ fn spawn_sub(role: &str, dir: &std::path::Path) -> (std::process::Child, mpsc::R
     let (tx, rx) = mpsc::channel::<String>();
     std::thread::spawn(move || {
         let reader = std::io::BufReader::new(stdout);
-        for line in reader.lines().flatten() {
+        for line in reader.lines().map_while(Result::ok) {
             if tx.send(line).is_err() {
                 break;
             }
@@ -58,7 +58,7 @@ fn spawn_sub(role: &str, dir: &std::path::Path) -> (std::process::Child, mpsc::R
     });
     std::thread::spawn(move || {
         let reader = std::io::BufReader::new(stderr);
-        for _line in reader.lines().flatten() {
+        for _line in reader.lines().map_while(Result::ok) {
             // Drain stderr so the child doesn't block on a full stderr pipe.
         }
     });
@@ -212,7 +212,9 @@ fn lock_timeout_expires_with_error() {
         let result = Database::open_with_options(&dir_path, opts);
         let took = started.elapsed();
         match result {
-            Ok(_) => done_tx.send(format!("UNEXPECTED OK after {took:?}")).unwrap(),
+            Ok(_) => done_tx
+                .send(format!("UNEXPECTED OK after {took:?}"))
+                .unwrap(),
             Err(e) => done_tx.send(format!("ERR after {took:?}: {e}")).unwrap(),
         }
     });
