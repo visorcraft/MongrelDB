@@ -224,9 +224,33 @@ Argon2id (~0.1ms vs ~50ms for passphrases).
 In practice, encryption adds negligible latency to bulk ingest and queries
 (measured at <5% overhead on 1M-row workloads).
 
+## Language Clients
+
+MongrelDB supports 11 languages across two integration tiers:
+
+- **Tier 1 (Embedded):** The engine runs in-process via native bindings. No daemon, zero serialization overhead.
+- **Tier 2 (HTTP):** A pure-language HTTP client connects to a running `mongreldb-server` daemon. No native dependencies.
+
+| Language | Tier | Repository | Install |
+|---|---|---|---|
+| **Rust** | 1 (direct) | [MongrelDB](https://github.com/visorcraft/MongrelDB) | `cargo add mongreldb-core` |
+| **TypeScript** | 1 (NAPI) | [MongrelDB Kit](https://github.com/visorcraft/MongrelDB-Kit) | `npm install @visorcraft/mongreldb-kit` |
+| **Python** | 1 (PyO3) | [MongrelDB Kit](https://github.com/visorcraft/MongrelDB-Kit) | `pip install mongreldb-kit` |
+| **PHP** | 2 (HTTP) | [MongrelDB-PHP](https://github.com/visorcraft/MongrelDB-PHP) | `composer require visorcraft/mongreldb-php` |
+| **Go** | 2 (HTTP) | [MongrelDB-Go](https://github.com/visorcraft/MongrelDB-Go) | `go get github.com/visorcraft/mongreldb-go` |
+| **Java/Kotlin** | 2 (HTTP) | [MongrelDB-Java](https://github.com/visorcraft/MongrelDB-Java) | Maven/Gradle |
+| **C#/.NET** | 2 (HTTP) | [MongrelDB-DotNet](https://github.com/visorcraft/MongrelDB-DotNet) | `dotnet add package Visorcraft.MongrelDB` |
+| **Ruby** | 2 (HTTP) | [MongrelDB-Ruby](https://github.com/visorcraft/MongrelDB-Ruby) | `gem install mongreldb` |
+| **Swift** | 2 (HTTP) | [MongrelDB-Swift](https://github.com/visorcraft/MongrelDB-Swift) | Swift Package Manager |
+| **Zig** | 2 (HTTP) | [MongrelDB-Zig](https://github.com/visorcraft/MongrelDB-Zig) | `zig fetch` |
+| **D** | 2 (HTTP) | [MongrelDB-D](https://github.com/visorcraft/MongrelDB-D) | `dub add mongreldb` |
+| **Nim** | 2 (HTTP) | [MongrelDB-Nim](https://github.com/visorcraft/MongrelDB-Nim) | `nimble install mongreldb` |
+
+The **[C ABI](crates/mongreldb-ffi)** (`mongreldb-ffi`) provides a stable C interface over the engine core, enabling future Tier-1 native bindings in any language with C FFI support.
+
 ## Node.js addon
 
-MongrelDB also ships as a native NAPI addon (`crates/mongreldb-node`) — the
+MongrelDB also ships as a native NAPI addon (`crates/mongreldb-node`) - the
 **better-sqlite3 model**: in-process, no HTTP hop, so the sub-ms write latency
 isn't lost to a round-trip. It exposes both a **typed object/method API** and a
 **full SQL surface**: the hybrid `query` composes ANN, FM, bitmap equality/IN,
@@ -249,8 +273,8 @@ management. `RemoteDatabase` routes to a `mongreldb-server` daemon for
 multi-process cache sharing.
 
 The addon's `Database` holds a long-lived SQL session for the database's
-lifetime, so session-scoped objects — views (`CREATE VIEW`), prepared
-statements, and the result cache — persist across `sql()` calls. Reopening the
+lifetime, so session-scoped objects - views (`CREATE VIEW`), prepared
+statements, and the result cache - persist across `sql()` calls. Reopening the
 database starts a fresh session (re-apply any view-defining migrations then).
 
 ## Benchmarks
@@ -302,6 +326,7 @@ crates/mongreldb-query/   DataFusion 54 SQL + Arrow frontend (predicate/projecti
 crates/mongreldb-node/    NAPI addon (typed object API; built via `napi`)
 crates/mongreldb-server/  HTTP daemon (axum/tokio; SQL + native query + typed Kit API)
 crates/mongreldb-client/  typed HTTP client for the daemon (SQL/native + Kit API)
+crates/mongreldb-ffi/     C ABI over the engine core (foundation for native bindings)
 crates/mongreldb-perf/    cross-engine benchmark vs SQLite/DuckDB (standalone)
 crates/mongreldb-core/examples/hybrid_query.rs
                           runnable ann ∩ fm ∩ bitmap hybrid-query demo
