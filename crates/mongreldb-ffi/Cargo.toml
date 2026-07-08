@@ -1,0 +1,19 @@
+[package]
+name = "mongreldb-ffi"
+version = "0.42.1"
+edition = "2021"
+publish = false
+description = "C ABI for MongrelDB core — the foundation for native language bindings"
+
+[lib]
+name = "mongreldb_ffi"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+mongreldb-core = { path = "../mongreldb-core", version = "0.42.1" }
+
+[dev-dependencies]
+cc = "1"
+
+# Standalone crate — not a workspace member.
+[workspace]

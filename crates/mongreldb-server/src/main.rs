@@ -1,7 +1,11 @@
 //! mongreldb-server entry point.
 //!
 //! Supports `--daemon` mode (fork into background), graceful signal handling
-//! (SIGINT/SIGTERM flush all tables then exit), and a proper flag parser.
+//! (SIGINT/SIGTERM flush all tables then exit), a proper flag parser, and
+//! subcommands for deterministic-stable snapshots:
+//!
+//!   mongreldb-server snapshot <db_dir>   — checkpoint to a stable byte image
+//!   mongreldb-server restore  <db_dir>   — open + verify + checkpoint
 
 use mongreldb_core::Database;
 use mongreldb_server::{build_app_full, spawn_auto_compactor};
@@ -209,6 +213,35 @@ fn daemonize(pidfile: &str) -> Result<(), String> {
 
 #[tokio::main]
 async fn main() {
+    // ── Subcommand dispatch ─────────────────────────────────────────────────
+    //
+    // `snapshot` and `restore` are one-shot maintenance subcommands that
+    // operate on the database directory and exit (they do NOT start the HTTP
+    // server). Everything else is the daemon mode.
+    let raw: Vec<String> = std::env::args().collect();
+    if raw.len() >= 2 {
+        match raw[1].as_str() {
+            "snapshot" => {
+                let db_dir = raw.get(2).cloned().unwrap_or_else(|| {
+                    eprintln!("usage: mongreldb-server snapshot <db_dir>");
+                    std::process::exit(1);
+                });
+                cmd_snapshot(&db_dir);
+                return;
+            }
+            "restore" => {
+                let db_dir = raw.get(2).cloned().unwrap_or_else(|| {
+                    eprintln!("usage: mongreldb-server restore <db_dir>");
+                    std::process::exit(1);
+                });
+                cmd_restore(&db_dir);
+                return;
+            }
+            _ => {}
+        }
+    }
+
+    // ── Daemon mode ─────────────────────────────────────────────────────────
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {
@@ -325,5 +358,66 @@ fn shutdown(db: &Arc<Database>, pidfile: &str, daemon: bool) {
     eprintln!("shutdown complete");
     if daemon {
         let _ = std::fs::remove_file(pidfile);
+    }
+}
+
+// ── Subcommand handlers ─────────────────────────────────────────────────────
+
+/// `mongreldb-server snapshot <db_dir>`
+///
+/// Produce a deterministic-stable byte image: flush all writes, compact all
+/// tables, reap all WAL segments, rotate to a fresh empty segment. The
+/// resulting directory can be safely `git add`-ed and `git checkout`-ed
+/// without stale WAL tail bytes or segment count drift.
+fn cmd_snapshot(db_dir: &str) {
+    let db = match Database::open(db_dir).or_else(|_| Database::create(db_dir)) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("error: cannot open {}: {e}", db_dir);
+            std::process::exit(1);
+        }
+    };
+    match db.checkpoint() {
+        Ok(()) => {
+            println!("snapshot stable at {}", db_dir);
+        }
+        Err(e) => {
+            eprintln!("error: checkpoint failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `mongreldb-server restore <db_dir>`
+///
+/// Open the database (replaying any remaining WAL), verify integrity, then
+/// checkpoint to a stable state. Use this after `git checkout` to ensure the
+/// directory is in a consistent, deterministic state before use.
+fn cmd_restore(db_dir: &str) {
+    let db = match Database::open(db_dir).or_else(|_| Database::create(db_dir)) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("error: cannot open {}: {e}", db_dir);
+            std::process::exit(1);
+        }
+    };
+
+    // Verify integrity (check for issues like torn writes, checksum mismatches).
+    let issues = db.check();
+    if !issues.is_empty() {
+        eprintln!("warning: {} integrity issue(s) found:", issues.len());
+        for issue in &issues {
+            eprintln!("  - {:?}", issue);
+        }
+    }
+
+    match db.checkpoint() {
+        Ok(()) => {
+            println!("restored and checkpointed at {}", db_dir);
+        }
+        Err(e) => {
+            eprintln!("error: checkpoint failed: {e}");
+            std::process::exit(1);
+        }
     }
 }

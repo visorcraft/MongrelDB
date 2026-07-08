@@ -4230,6 +4230,58 @@ impl Database {
 
         Ok(reclaimed)
     }
+
+    /// Produce a deterministic-stable byte image of the database directory.
+    ///
+    /// After `checkpoint()`:
+    ///   - All pending writes are flushed to sorted runs (no memtable data).
+    ///   - Each table is compacted to a single sorted run (no run fragmentation).
+    ///   - All non-active WAL segments are deleted (data is durable in runs).
+    ///   - The active WAL segment is rotated to a fresh empty segment.
+    ///   - Dropped-table directories are removed.
+    ///   - All manifests + catalog are persisted.
+    ///
+    /// The resulting directory is byte-stable: `git add` captures a snapshot
+    /// that `git checkout` restores deterministically. No stale WAL tail bytes,
+    /// no unbounded segment growth, no mutable-run spill files.
+    ///
+    /// This is the engine primitive behind `mongreldb snapshot <dir>` (CLI).
+    /// It does NOT clear the exclusive lock — the caller still owns the
+    /// database handle.
+    pub fn checkpoint(&self) -> Result<()> {
+        // 1. Force-flush every table's pending writes to sorted runs.
+        self.close()?;
+
+        // 2. Compact every table to a single run (merge all fragments).
+        let _ = self.compact()?;
+
+        // 3. GC everything: dropped-table dirs, stale _txn dirs, retired runs,
+        //    and all WAL segments whose data is now durable in runs.
+        self.gc()?;
+
+        // 4. Rotate the active WAL segment to a fresh empty one so the old
+        //    active segment (which may have tail bytes) is reaped by gc_segments.
+        let next_segment_no = self.catalog.read().next_segment_no;
+        {
+            let mut wal = self.shared_wal.lock();
+            wal.rotate(next_segment_no)?;
+            // Now the old active segment is non-active → reap it + any others.
+            wal.gc_segments(u64::MAX)?;
+        }
+
+        // 5. Persist the catalog with the bumped next_segment_no.
+        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+
+        // 6. Persist every table's manifest (force_flush/compact already did
+        //    this, but a final pass ensures consistency after WAL rotation).
+        let tables = self.tables.read();
+        let visible = self.epoch.visible();
+        for handle in tables.values() {
+            handle.lock().persist_manifest(visible)?;
+        }
+
+        Ok(())
+    }
     fn alloc_txn_id(&self) -> u64 {
         let mut g = self.next_txn_id.lock();
         let id = *g;
