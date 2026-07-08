@@ -368,3 +368,24 @@ let db = Db::open("./mydb").unwrap();
 This reads the manifest, replays the WAL, and rebuilds indexes. If a
 global index checkpoint exists, it's loaded directly (fast reopen). Otherwise
 indexes are rebuilt from the sorted runs.
+
+## Cross-Process Lock Contention
+
+By default, [`Database::open`] is **fail-fast**: if another process already
+holds the cross-process lock on `<dir>/_meta/.lock`, the open returns
+`MongrelError::Io` immediately. That mirrors the historical `try_lock_exclusive`
+semantics and lets coordinating callers bring their own retry logic.
+
+If you'd rather have SQLite-style `busy_timeout` semantics — block for up to
+N ms waiting for the lock before giving up — opt in with
+[`Database::open_with_options`].
+
+```rust
+use mongreldb_core::{Database, OpenOptions};
+
+let opts = OpenOptions::default().with_lock_timeout_ms(5_000);
+let db = Database::open_with_options("./mydb", opts)?;
+```
+
+Backoff schedule: 1ms → 10ms → 50ms, capped at `lock_timeout_ms`. Set `0` to
+keep the fail-fast default.

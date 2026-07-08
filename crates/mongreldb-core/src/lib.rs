@@ -52,7 +52,7 @@ pub use columnar::{decode_column, encode_column};
 pub use cursor::{drain_cursor_to_columns, Cursor, MultiRunCursor, NativePageCursor};
 pub use database::{
     CheckIssue, Database, ExternalTriggerBaseWrite, ExternalTriggerBridge, ExternalTriggerWrite,
-    ExternalTriggerWriteResult,
+    ExternalTriggerWriteResult, OpenOptions,
 };
 pub use encryption::{Cipher, PlaintextCipher};
 pub use engine::{

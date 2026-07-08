@@ -1,5 +1,6 @@
 .worktrees/
 target/
+/.cargo/
 PLAN.md
 AGENTS.md
 CLAUDE.md
