@@ -1,7 +1,7 @@
 //! P1.4 — multi-table `Database` shares one epoch clock, caches, and snapshot
 //! registry across tables; reopen sees every table.
 
-use mongreldb_core::{schema::*, Database, Epoch, Value};
+use mongreldb_core::{schema::*, Database, Epoch, MongrelError, Value};
 use std::sync::Arc;
 use std::thread;
 use tempfile::tempdir;
@@ -40,6 +40,15 @@ fn items_schema() -> Schema {
     }
 }
 
+fn assert_existing_database_error(err: MongrelError) {
+    match err {
+        MongrelError::InvalidArgument(msg) => {
+            assert!(msg.contains("database already exists"), "got: {msg}")
+        }
+        other => panic!("expected existing database error, got {other:?}"),
+    }
+}
+
 #[test]
 fn database_creates_tables_and_shares_one_clock() {
     let dir = tempdir().unwrap();
@@ -72,6 +81,66 @@ fn database_creates_tables_and_shares_one_clock() {
     assert_eq!(db.table_names().len(), 2);
     let _t = db.table("orders").unwrap();
     let _t = db.table("items").unwrap();
+}
+
+#[test]
+fn create_refuses_existing_database_without_replacing_catalog() {
+    let dir = tempdir().unwrap();
+    {
+        let db = Database::create(dir.path()).unwrap();
+        db.create_table("orders", orders_schema()).unwrap();
+    }
+
+    assert_existing_database_error(Database::create(dir.path()).unwrap_err());
+    assert_existing_database_error(
+        Database::create_with_credentials(dir.path(), "admin", "pw").unwrap_err(),
+    );
+
+    let db = Database::open(dir.path()).unwrap();
+    assert!(db.table_names().iter().any(|name| name == "orders"));
+    assert!(!db.require_auth_enabled());
+}
+
+#[cfg(feature = "encryption")]
+#[test]
+fn encrypted_create_refuses_existing_database_without_rewriting_keys() {
+    let dir = tempdir().unwrap();
+    {
+        let db = Database::create_encrypted(dir.path(), "right").unwrap();
+        db.create_table("orders", orders_schema()).unwrap();
+    }
+    let key_path = dir.path().join("_meta").join("keys");
+    let keys_before = std::fs::read(&key_path).unwrap();
+
+    assert_existing_database_error(Database::create_encrypted(dir.path(), "wrong").unwrap_err());
+
+    assert_eq!(std::fs::read(&key_path).unwrap(), keys_before);
+    let db = Database::open_encrypted(dir.path(), "right").unwrap();
+    assert!(db.table_names().iter().any(|name| name == "orders"));
+}
+
+#[cfg(feature = "encryption")]
+#[test]
+fn encrypted_credentialed_create_refuses_existing_database_without_rewriting_keys() {
+    let dir = tempdir().unwrap();
+    {
+        let db =
+            Database::create_encrypted_with_credentials(dir.path(), "right", "admin", "s3cret")
+                .unwrap();
+        db.create_table("orders", orders_schema()).unwrap();
+    }
+    let key_path = dir.path().join("_meta").join("keys");
+    let keys_before = std::fs::read(&key_path).unwrap();
+
+    assert_existing_database_error(
+        Database::create_encrypted_with_credentials(dir.path(), "wrong", "admin", "pw")
+            .unwrap_err(),
+    );
+
+    assert_eq!(std::fs::read(&key_path).unwrap(), keys_before);
+    let db =
+        Database::open_encrypted_with_credentials(dir.path(), "right", "admin", "s3cret").unwrap();
+    assert!(db.table_names().iter().any(|name| name == "orders"));
 }
 
 #[test]
