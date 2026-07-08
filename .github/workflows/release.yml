@@ -2,10 +2,8 @@
 # publishes the mongreldb-core and mongreldb-query Rust crates to crates.io,
 # on a tag.
 #
-# Single-platform: bundles a linux-x64-gnu .node (matches what ships today), so
-# the package only installs on linux-x64 — fine for the Roamarr container and a
-# Linux dev box. To go multi-platform later, split this into a build matrix and
-# napi platform packages (@visorcraft/mongreldb-native-<triple>).
+# Bundles linux-x64-gnu and linux-arm64-gnu .node files so low-power ARM64
+# Linux hosts can install from npm without compiling the addon locally.
 #
 # Publish this BEFORE @visorcraft/mongreldb-kit — the kit's release installs
 # this package from npm to satisfy its peer dependency.
@@ -35,6 +33,7 @@ on:
 permissions:
   contents: write
   id-token: write # npm provenance
+  packages: write
 
 jobs:
   publish:
@@ -46,6 +45,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -60,6 +61,16 @@ jobs:
       - run: npm ci
 
       - run: npm run build
+
+      - run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - run: npx napi build --release --platform --strip --target aarch64-unknown-linux-gnu --js false
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+
+      - run: test -f mongreldb.linux-arm64-gnu.node
 
       # Sanity gate: the freshly built addon must load before we publish.
       - run: node -e "require('./index.js'); console.log('addon loads OK')"
@@ -107,9 +118,18 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             asset: mongreldb-server-linux-x64
             apt: ''
+            linker: ''
+            ar: ''
           - target: x86_64-unknown-linux-musl
             asset: mongreldb-server-linux-x64-musl
             apt: musl-tools
+            linker: ''
+            ar: ''
+          - target: aarch64-unknown-linux-gnu
+            asset: mongreldb-server-linux-arm64
+            apt: gcc-aarch64-linux-gnu
+            linker: aarch64-linux-gnu-gcc
+            ar: aarch64-linux-gnu-ar
     steps:
       - uses: actions/checkout@v4
 
@@ -126,6 +146,10 @@ jobs:
 
       - run: cargo build --release --bin mongreldb-server --target ${{ matrix.target }}
         working-directory: crates/mongreldb-server
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
+          CC_aarch64_unknown_linux_gnu: ${{ matrix.linker }}
+          AR_aarch64_unknown_linux_gnu: ${{ matrix.ar }}
 
       - run: |
           mkdir -p dist
@@ -170,3 +194,35 @@ jobs:
           files: |
             dist/mongreldb-server-darwin-arm64
             dist/mongreldb-server-darwin-universal
+
+  release-server-image:
+    runs-on: ubuntu-latest
+    needs: [publish, publish-crate]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/visorcraft/mongreldb-server
+          tags: |
+            type=ref,event=tag
+            type=raw,value=latest
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

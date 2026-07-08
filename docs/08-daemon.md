@@ -15,8 +15,9 @@ cargo install mongreldb-server
 
 # Or install a release binary
 VERSION=v0.43.3
+ASSET=mongreldb-server-linux-x64 # use mongreldb-server-linux-arm64 on ARM64 Linux
 curl -L -o /usr/local/bin/mongreldb-server \
-  "https://github.com/visorcraft/MongrelDB/releases/download/${VERSION}/mongreldb-server-linux-x64"
+  "https://github.com/visorcraft/MongrelDB/releases/download/${VERSION}/${ASSET}"
 chmod +x /usr/local/bin/mongreldb-server
 
 # Or build from source
@@ -114,8 +115,8 @@ crashes, and automatically starts it on boot.
 ### Docker
 
 ```sh
-# Build a Docker image
-docker build -t mongreldb-server .
+# Pull the multi-arch release image
+docker pull ghcr.io/visorcraft/mongreldb-server:v0.43.3
 
 # Run with auto-restart
 docker run -d \
@@ -123,7 +124,7 @@ docker run -d \
   --restart=always \
   -p 8453:8453 \
   -v ./my_database:/data \
-  mongreldb-server \
+  ghcr.io/visorcraft/mongreldb-server:v0.43.3 \
   /data --port 8453 --auth-token my-secret
 ```
 
