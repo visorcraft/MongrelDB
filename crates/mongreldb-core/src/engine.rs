@@ -6257,12 +6257,39 @@ impl Table {
         flags: ColumnFlags,
         default_value: Option<crate::schema::DefaultExpr>,
     ) -> Result<u16> {
+        self.add_column_with_id(name, ty, flags, default_value, None)
+    }
+
+    pub fn add_column_with_id(
+        &mut self,
+        name: &str,
+        ty: TypeId,
+        flags: ColumnFlags,
+        default_value: Option<crate::schema::DefaultExpr>,
+        requested_id: Option<u16>,
+    ) -> Result<u16> {
         if self.schema.columns.iter().any(|c| c.name == name) {
             return Err(MongrelError::Schema(format!(
                 "column {name} already exists"
             )));
         }
-        let id = self.schema.columns.iter().map(|c| c.id).max().unwrap_or(0) + 1;
+        let id = if let Some(id) = requested_id.filter(|id| *id != 0) {
+            if self.schema.columns.iter().any(|c| c.id == id) {
+                return Err(MongrelError::Schema(format!(
+                    "column id {id} already exists"
+                )));
+            }
+            id
+        } else {
+            self.schema
+                .columns
+                .iter()
+                .map(|c| c.id)
+                .max()
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or_else(|| MongrelError::Schema("column id space exhausted".into()))?
+        };
         self.schema.columns.push(ColumnDef {
             id,
             name: name.to_string(),

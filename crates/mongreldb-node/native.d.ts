@@ -316,6 +316,11 @@ export declare class Database {
    */
   tableColumns(name: string): Array<string>
   /**
+   * Return the physical column specs of a table as they exist in the
+   * database. Column `id`/`name` are authoritative for schema mappers.
+   */
+  tableColumnSpecs(name: string): Array<ColumnSpec>
+  /**
    * Add a column to an existing table. The column must be nullable or supply
    * a default value so existing rows can be evolved safely.
    */

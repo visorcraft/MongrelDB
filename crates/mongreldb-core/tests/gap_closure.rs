@@ -80,6 +80,33 @@ fn schema_evolution_reads_old_rows_as_null() {
 }
 
 #[test]
+fn add_column_can_use_requested_id() {
+    let dir = tempdir().unwrap();
+    let mut db = Table::create(dir.path(), schema(), 1).unwrap();
+
+    let id = db
+        .add_column_with_id(
+            "note",
+            TypeId::Bytes,
+            ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+            None,
+            Some(7),
+        )
+        .unwrap();
+
+    assert_eq!(id, 7);
+    assert!(db
+        .add_column_with_id(
+            "other",
+            TypeId::Bytes,
+            ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+            None,
+            Some(7),
+        )
+        .is_err());
+}
+
+#[test]
 fn doctor_drops_a_corrupt_run() {
     let dir = tempdir().unwrap();
     let mut db = Table::create(dir.path(), schema(), 1).unwrap();

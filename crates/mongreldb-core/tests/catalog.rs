@@ -41,7 +41,6 @@ fn sample_catalog() -> Catalog {
     Catalog {
         db_epoch: 7,
         next_table_id: 3,
-        open_generation: 1,
         next_segment_no: 4,
         tables: vec![CatalogEntry {
             table_id: 1,
@@ -68,7 +67,6 @@ fn catalog_roundtrips_plaintext_and_dir_fsync() {
     let got = catalog::read(dir.path(), None).unwrap().unwrap();
     assert_eq!(got.db_epoch, 7);
     assert_eq!(got.next_table_id, 3);
-    assert_eq!(got.open_generation, 1);
     assert_eq!(got.next_segment_no, 4);
     assert_eq!(got.tables.len(), 1);
     assert_eq!(got.tables[0].name, "orders");

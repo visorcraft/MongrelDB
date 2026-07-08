@@ -13,6 +13,12 @@ indexes and caches warm in memory, and serves queries over HTTP.
 # Install from crates.io
 cargo install mongreldb-server
 
+# Or install a release binary
+VERSION=v0.43.3
+curl -L -o /usr/local/bin/mongreldb-server \
+  "https://github.com/visorcraft/MongrelDB/releases/download/${VERSION}/mongreldb-server-linux-x64"
+chmod +x /usr/local/bin/mongreldb-server
+
 # Or build from source
 cd crates/mongreldb-server
 cargo build --release

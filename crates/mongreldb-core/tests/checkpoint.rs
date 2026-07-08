@@ -47,12 +47,21 @@ fn checkpoint_produces_stable_directory() {
     let handle = db.table("items").unwrap();
     {
         let mut t = handle.lock();
-        t.put(vec![(1, Value::Int64(1)), (2, Value::Bytes(b"alice".to_vec()))])
-            .unwrap();
-        t.put(vec![(1, Value::Int64(2)), (2, Value::Bytes(b"bob".to_vec()))])
-            .unwrap();
-        t.put(vec![(1, Value::Int64(3)), (2, Value::Bytes(b"carol".to_vec()))])
-            .unwrap();
+        t.put(vec![
+            (1, Value::Int64(1)),
+            (2, Value::Bytes(b"alice".to_vec())),
+        ])
+        .unwrap();
+        t.put(vec![
+            (1, Value::Int64(2)),
+            (2, Value::Bytes(b"bob".to_vec())),
+        ])
+        .unwrap();
+        t.put(vec![
+            (1, Value::Int64(3)),
+            (2, Value::Bytes(b"carol".to_vec())),
+        ])
+        .unwrap();
         t.commit().unwrap();
     }
 

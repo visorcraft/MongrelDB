@@ -168,9 +168,7 @@ impl EpochAuthority {
         // has no committed data, so readers correctly skip it.
         loop {
             let next = vis + 1;
-            if pending.remove(&next) {
-                vis = next;
-            } else if abandoned.remove(&next) {
+            if pending.remove(&next) || abandoned.remove(&next) {
                 vis = next;
             } else {
                 break;
@@ -197,9 +195,7 @@ impl EpochAuthority {
         let mut vis = self.visible.load(Ordering::Acquire);
         loop {
             let next = vis + 1;
-            if pending.remove(&next) {
-                vis = next;
-            } else if abandoned.remove(&next) {
+            if pending.remove(&next) || abandoned.remove(&next) {
                 vis = next;
             } else {
                 break;
@@ -321,7 +317,11 @@ mod tests {
         // Abandon e1 first (before e2/e3 are published). The watermark advances
         // past e1 (no data there), but stops at e2 (not yet published/abandoned).
         a.abandon(e1);
-        assert_eq!(a.visible(), Epoch(1), "e1 abandoned, watermark at 1, e2 pending");
+        assert_eq!(
+            a.visible(),
+            Epoch(1),
+            "e1 abandoned, watermark at 1, e2 pending"
+        );
 
         // Now publish e2 — should advance to 2.
         a.publish_in_order(e2);

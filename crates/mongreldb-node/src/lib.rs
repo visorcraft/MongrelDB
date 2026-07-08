@@ -256,6 +256,51 @@ fn to_type_id(
     })
 }
 
+fn from_column_def(column: &ColumnDef) -> ColumnSpec {
+    let (ty, embedding_dim, enum_variants) = match &column.ty {
+        TypeId::Bool => (ColumnType::Bool, None, None),
+        TypeId::Int8
+        | TypeId::Int16
+        | TypeId::Int32
+        | TypeId::Int64
+        | TypeId::UInt8
+        | TypeId::UInt16
+        | TypeId::UInt32
+        | TypeId::UInt64 => (ColumnType::Int64, None, None),
+        TypeId::Float32 | TypeId::Float64 => (ColumnType::Float64, None, None),
+        TypeId::TimestampNanos => (ColumnType::TimestampNanos, None, None),
+        TypeId::Date32 => (ColumnType::Date32, None, None),
+        TypeId::Date64 => (ColumnType::Date64, None, None),
+        TypeId::Time64 => (ColumnType::Time64, None, None),
+        TypeId::Interval => (ColumnType::Interval, None, None),
+        TypeId::Bytes => (ColumnType::Bytes, None, None),
+        TypeId::Embedding { dim } => (ColumnType::Embedding, Some(*dim), None),
+        TypeId::Decimal128 { .. } => (ColumnType::Decimal128, None, None),
+        TypeId::Uuid => (ColumnType::Uuid, None, None),
+        TypeId::Json => (ColumnType::Json, None, None),
+        TypeId::Array { .. } => (ColumnType::Array, None, None),
+        TypeId::Enum { variants } => (ColumnType::Enum, None, Some(variants.to_vec())),
+    };
+    ColumnSpec {
+        id: column.id,
+        name: column.name.clone(),
+        ty,
+        primary_key: column.flags.contains(ColumnFlags::PRIMARY_KEY),
+        nullable: column.flags.contains(ColumnFlags::NULLABLE),
+        embedding_dim,
+        default_value: None,
+        default_expr: match column.default_value {
+            Some(DefaultExpr::Now) => Some("now".into()),
+            Some(DefaultExpr::Uuid) => Some("uuid".into()),
+            _ => None,
+        },
+        enum_variants,
+        auto_increment: Some(column.flags.contains(ColumnFlags::AUTO_INCREMENT)),
+        encrypted: Some(column.flags.contains(ColumnFlags::ENCRYPTED)),
+        encrypted_indexable: Some(column.flags.contains(ColumnFlags::ENCRYPTED_INDEXABLE)),
+    }
+}
+
 fn to_column_flags(column: &ColumnSpec) -> ColumnFlags {
     let mut flags = ColumnFlags::empty();
     if column.primary_key {
@@ -1292,6 +1337,15 @@ impl Database {
         Ok(g.schema().columns.iter().map(|c| c.name.clone()).collect())
     }
 
+    /// Return the physical column specs of a table as they exist in the
+    /// database. Column `id`/`name` are authoritative for schema mappers.
+    #[napi]
+    pub fn table_column_specs(&self, name: String) -> napi::Result<Vec<ColumnSpec>> {
+        let handle = self.inner.table(&name).map_err(to_napi)?;
+        let g = handle.lock();
+        Ok(g.schema().columns.iter().map(from_column_def).collect())
+    }
+
     /// Add a column to an existing table. The column must be nullable or supply
     /// a default value so existing rows can be evolved safely.
     #[napi]
@@ -1308,7 +1362,13 @@ impl Database {
         let flags = to_column_flags(&column);
         let default_value = build_default_expr(&column, &ty)?;
         let id = g
-            .add_column(&column.name, ty, flags, default_value)
+            .add_column_with_id(
+                &column.name,
+                ty,
+                flags,
+                default_value,
+                if column.id == 0 { None } else { Some(column.id) },
+            )
             .map_err(to_napi)?;
         Ok(BigInt::from(id as u64))
     }
