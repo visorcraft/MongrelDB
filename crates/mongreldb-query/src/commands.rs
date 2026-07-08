@@ -312,7 +312,12 @@ fn try_manual_command(
     if let Some(_rest) = lower.strip_prefix("alter user ") {
         let original_rest = &sql["alter user ".len()..];
         let trimmed = original_rest.trim().trim_end_matches(';').trim();
-        let (name, password) = if let Some(idx) = trimmed.to_ascii_lowercase().find(" password ") {
+        let lower_trimmed = trimmed.to_ascii_lowercase();
+        let Some(db) = &session.database else {
+            return Ok(Some(Vec::new()));
+        };
+        // ALTER USER <name> PASSWORD '<new>'
+        if let Some(idx) = lower_trimmed.find(" password ") {
             let name = trimmed[..idx]
                 .trim()
                 .trim_matches(|c| c == '"' || c == '\'')
@@ -321,17 +326,30 @@ fn try_manual_command(
                 .trim()
                 .trim_matches('\'')
                 .to_string();
-            (name, pw)
-        } else {
-            return Err(MongrelQueryError::Schema(
-                "ALTER USER requires: ALTER USER <name> PASSWORD '<new>'".into(),
-            ));
-        };
-        let Some(db) = &session.database else {
+            db.alter_user_password(&name, &pw)?;
             return Ok(Some(Vec::new()));
-        };
-        db.alter_user_password(&name, &password)?;
-        return Ok(Some(Vec::new()));
+        }
+        // ALTER USER <name> NOT ADMIN
+        if lower_trimmed.ends_with(" not admin") {
+            let name = trimmed[..trimmed.len() - " not admin".len()]
+                .trim()
+                .trim_matches(|c| c == '"' || c == '\'')
+                .to_string();
+            db.set_user_admin(&name, false)?;
+            return Ok(Some(Vec::new()));
+        }
+        // ALTER USER <name> ADMIN
+        if lower_trimmed.ends_with(" admin") {
+            let name = trimmed[..trimmed.len() - " admin".len()]
+                .trim()
+                .trim_matches(|c| c == '"' || c == '\'')
+                .to_string();
+            db.set_user_admin(&name, true)?;
+            return Ok(Some(Vec::new()));
+        }
+        return Err(MongrelQueryError::Schema(
+            "ALTER USER requires: ALTER USER <name> PASSWORD '<new>' | ADMIN | NOT ADMIN".into(),
+        ));
     }
     if let Some(rest) = lower.strip_prefix("drop user ") {
         let name = rest.trim().trim_end_matches(';').trim().to_string();

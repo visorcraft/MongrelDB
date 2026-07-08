@@ -393,7 +393,18 @@ fn parse_type_name(s: &str) -> std::result::Result<TypeId, String> {
         "timestamp_nanos" | "timestamp" => TimestampNanos,
         "date32" | "date" => Date32,
         "bytes" | "varchar" | "text" | "string" => Bytes,
-        other if other.starts_with("embedding") => Embedding { dim: 0 },
+        // embedding(N) or embedding<N> — fixed-dimension vector column.
+        other if other.starts_with("embedding") => {
+            let rest = other.trim_start_matches("embedding").trim();
+            let dim_str = rest
+                .trim_start_matches(['(', '<'])
+                .trim_end_matches([')', '>'])
+                .trim();
+            let dim: u32 = dim_str
+                .parse()
+                .map_err(|_| format!("invalid embedding dimension '{dim_str}'; expected embedding(<dim>)"))?;
+            Embedding { dim }
+        }
         other => return Err(format!("unknown type: {other}")),
     })
 }

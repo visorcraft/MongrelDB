@@ -475,6 +475,18 @@ pub(crate) fn json_to_value(v: &serde_json::Value, expected: &TypeId) -> Value {
             }
         }
         (serde_json::Value::Bool(b), TypeId::Bool) => Value::Bool(*b),
+        // Embedding input: a JSON array of numbers, validated against the
+        // declared dimension. Mismatched length or non-numeric elements → Null.
+        (serde_json::Value::Array(arr), TypeId::Embedding { dim }) => {
+            if arr.len() as u32 != *dim {
+                return Value::Null;
+            }
+            let vec: Option<Vec<f32>> = arr
+                .iter()
+                .map(|el| el.as_f64().map(|f| f as f32))
+                .collect();
+            vec.map(Value::Embedding).unwrap_or(Value::Null)
+        }
         (serde_json::Value::Null, _) => Value::Null,
         // Lenient fallbacks for unknown/loosely-typed JSON.
         (serde_json::Value::Number(n), _) => {
