@@ -380,6 +380,17 @@ impl Database {
         kek: Option<Arc<crate::encryption::Kek>>,
     ) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
+        // Refuse to overwrite an existing database. If CATALOG exists, the
+        // directory already contains a real database — silently replacing it
+        // with an empty catalog would destroy all data.
+        let catalog_path = root.join(catalog::CATALOG_FILENAME);
+        if catalog_path.exists() {
+            return Err(MongrelError::InvalidArgument(format!(
+                "database already exists at {}; use Database::open() to open it, \
+                 or remove the directory first",
+                root.display()
+            )));
+        }
         std::fs::create_dir_all(&root)?;
         std::fs::create_dir_all(root.join(TABLES_DIR))?;
         let meta_dek = crate::encryption::meta_dek_for(kek.as_deref());
