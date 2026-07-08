@@ -226,7 +226,7 @@ In practice, encryption adds negligible latency to bulk ingest and queries
 
 ## Language Clients
 
-MongrelDB supports 11 languages across two integration tiers:
+MongrelDB supports 12 languages across two integration tiers:
 
 - **Tier 1 (Embedded):** The engine runs in-process via native bindings. No daemon, zero serialization overhead.
 - **Tier 2 (HTTP):** A pure-language HTTP client connects to a running `mongreldb-server` daemon. No native dependencies.
