@@ -260,3 +260,103 @@ fn engine_holder_blocks_in_process_open() {
     holder.kill().expect("kill holder");
     let _ = holder.wait();
 }
+
+/// End-to-end worked example of the new `OpenOptions::lock_timeout_ms` knob:
+/// 4 real subprocesses each open the same DB, each commits 25 transactions
+/// in a tight loop. Without the timeout knob this would hit EAGAIN as soon
+/// as a second writer tried to open while another held the lock; with
+/// `lock_timeout_ms = 5_000` every writer waits its turn, all 4 succeed,
+/// and the row count matches.
+///
+/// Regression guard: if the new `lock_timeout_ms` knob regresses to fail-fast
+/// (or the lock acquisition gets dropped entirely), this test fails loudly.
+#[test]
+fn cross_process_writers_all_succeed() {
+    const N_WRITERS: i64 = 4;
+    const ROWS_PER_WRITER: i64 = 25;
+    const LOCK_TIMEOUT_MS: u32 = 5_000;
+
+    let dir = TempDir::new().unwrap();
+    pre_create(dir.path());
+
+    // Each writer is its own OS process; they race on the cross-process
+    // lock from the moment they try to open. With the new timeout knob
+    // they should all complete cleanly.
+    let sub_path = std::env::var("CARGO_BIN_EXE_cross_process_lock_sub")
+        .expect("CARGO_BIN_EXE_cross_process_lock_sub must be set by cargo test");
+    let mut handles = Vec::new();
+    for writer_id in 0..N_WRITERS {
+        let mut cmd = std::process::Command::new(&sub_path);
+        cmd.arg("writer")
+            .arg(dir.path())
+            .arg(writer_id.to_string())
+            .arg(LOCK_TIMEOUT_MS.to_string())
+            .arg(ROWS_PER_WRITER.to_string())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = cmd.spawn().expect("spawn writer");
+        let stdout = child.stdout.take().expect("writer stdout");
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader};
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        handles.push((child, rx));
+    }
+
+    // Wait for all writers to report DONE <id>. Failures (e.g. lock timeout
+    // expiry, fsync errors) cause a non-zero exit which we surface via
+    // `child.wait()` below.
+    let mut completed: Vec<i64> = Vec::new();
+    let mut failed: Vec<(i64, String, Option<i32>)> = Vec::new();
+    for (mut child, rx) in handles {
+        let writer_id_line = wait_for_line_with(&rx, |l| l.starts_with("DONE"), Duration::from_secs(30))
+            .unwrap_or_else(|| {
+                failed.push((-1, "writer never reported DONE".to_string(), None));
+                String::new()
+            });
+        let status = child.wait().expect("wait writer");
+        if !status.success() {
+            failed.push((-1, format!("writer exited non-zero: {status}"), status.code()));
+            continue;
+        }
+        // Parse "DONE <writer_id>" — the writer_id was passed positionally
+        // so we trust the order of completion matches the order of spawn.
+        let parsed_id = writer_id_line
+            .strip_prefix("DONE ")
+            .and_then(|s| s.parse::<i64>().ok());
+        if let Some(id) = parsed_id {
+            completed.push(id);
+        } else {
+            failed.push((-1, format!("malformed DONE line: {writer_id_line:?}"), None));
+        }
+    }
+
+    assert!(
+        failed.is_empty(),
+        "writers failed: {failed:?}; expected all {} to succeed with lock_timeout_ms={LOCK_TIMEOUT_MS}",
+        N_WRITERS
+    );
+    assert_eq!(
+        completed.len() as i64,
+        N_WRITERS,
+        "expected {N_WRITERS} writers to complete, got {completed:?}"
+    );
+
+    // Verify the row count: every writer committed ROWS_PER_WRITER rows.
+    // We open the parent in this process to count — this only works because
+    // all writers have exited and released their locks.
+    let db = Database::open(dir.path()).expect("parent open after writers done");
+    let table = db.table("items").expect("items table");
+    let count = table.lock().count();
+    assert_eq!(
+        count,
+        (N_WRITERS * ROWS_PER_WRITER) as u64,
+        "expected {} rows total, got {count}",
+        N_WRITERS * ROWS_PER_WRITER
+    );
+}

@@ -1,6 +1,6 @@
 //! Sub-binary for `tests/cross_process_lock.rs`.
 //!
-//! Two roles:
+//! Roles:
 //!
 //! - `flock_holder <dir>`: open `<dir>/_meta/.lock` and immediately acquire
 //!   an exclusive `flock(2)` on it (via `fs2`); print `READY` (flushed)
@@ -14,6 +14,19 @@
 //!   full engine mount path as a sanity check that the cross-process
 //!   lock via the engine itself works the same way.
 //!
+//! - `create_then_exit <dir>`: runs `Database::create` then exits. Used to
+//!   pre-create a DB in a subprocess so the parent's per-process
+//!   `LOCKED_PATHS` skip doesn't mask the cross-process contention these
+//!   tests are designed to observe.
+//!
+//! - `writer <dir> <writer_id> <lock_timeout_ms> <rows>`: opens the
+//!   database with a configurable cross-process lock timeout, commits
+//!   `rows` transactions on the `items` table (each transaction inserts
+//!   one row keyed by `(writer_id, idx)`), and exits. Used by
+//!   `tests/cross_process_lock.rs::cross_process_writers_all_succeed` to
+//!   exercise the new `OpenOptions::lock_timeout_ms` knob with real
+//!   parallel writers.
+//!
 //! Built automatically as a bin target; located at
 //! `$CARGO_BIN_EXE_cross_process_lock_sub`.
 
@@ -22,6 +35,9 @@ use std::process::exit;
 use std::time::{Duration, Instant};
 
 use mongreldb_core::Database;
+use mongreldb_core::OpenOptions as CoreOpenOptions;
+use mongreldb_core::schema::{ColumnDef, ColumnFlags, Schema, TypeId};
+use mongreldb_core::Value;
 
 fn spin_forever(started: Instant) -> ! {
     loop {
@@ -33,12 +49,48 @@ fn spin_forever(started: Instant) -> ! {
     }
 }
 
+fn writer_schema() -> Schema {
+    Schema {
+        schema_id: 1,
+        columns: vec![
+            ColumnDef {
+                id: 1,
+                name: "writer".into(),
+                ty: TypeId::Int64,
+                flags: ColumnFlags::empty(),
+                default_value: None,
+            },
+            ColumnDef {
+                id: 2,
+                name: "idx".into(),
+                ty: TypeId::Int64,
+                flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
+            },
+            ColumnDef {
+                id: 3,
+                name: "payload".into(),
+                ty: TypeId::Bytes,
+                flags: ColumnFlags::empty(),
+                default_value: None,
+            },
+        ],
+        indexes: Vec::new(),
+        colocation: Vec::new(),
+        constraints: Default::default(),
+        clustered: false,
+    }
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let role = match args.next() {
         Some(r) => r,
         None => {
-            eprintln!("usage: cross_process_lock_sub <flock_holder|engine_holder> <dir>");
+            eprintln!(
+                "usage: cross_process_lock_sub <flock_holder|engine_holder|create_then_exit|writer> \
+                 <dir> [writer_args...]"
+            );
             exit(2);
         }
     };
@@ -68,14 +120,19 @@ fn main() {
             spin_forever(Instant::now());
         }
         "create_then_exit" => {
-            // Pre-create the database in a separate process so the parent's
-            // per-process `LOCKED_PATHS` skip doesn't mask the cross-process
-            // contention we're trying to test. Used by `tests/cross_process_lock.rs`.
             let path = std::path::Path::new(&dir);
-            let _db = Database::create(path).expect("create then exit");
-            // Drop `_db` so the OS flock is released before the parent's
-            // test opens. We exit immediately after; the parent takes over.
-            drop(_db);
+            let db = Database::create(path).expect("create then exit");
+            // Ensure the `items` table exists so writers have a known schema.
+            // `create_table` errors with `InvalidArgument` if it already does;
+            // that's fine because `create_then_exit` may be re-run against a
+            // populated directory in some tests.
+            match db.create_table("items", writer_schema()) {
+                Ok(_) => {}
+                Err(mongreldb_core::MongrelError::InvalidArgument(msg))
+                    if msg.contains("already exists") => {}
+                Err(e) => panic!("create items table: {e}"),
+            }
+            drop(db);
             println!("CREATED");
             std::io::stdout().flush().expect("flush CREATED");
             exit(0);
@@ -83,11 +140,56 @@ fn main() {
         "engine_holder" => {
             let path = std::path::Path::new(&dir);
             let db = Database::open(path).expect("engine_holder acquire lock");
-            // Cheap liveness probe to keep the engine mount fully exercised.
             let _ = db.catalog_snapshot();
             println!("READY");
             std::io::stdout().flush().expect("flush READY");
             spin_forever(Instant::now());
+        }
+        "writer" => {
+            // writer <dir> <writer_id> <lock_timeout_ms> <rows>
+            let writer_id: i64 = args
+                .next()
+                .expect("missing writer_id")
+                .parse()
+                .expect("writer_id must be i64");
+            let lock_timeout_ms: u32 = args
+                .next()
+                .expect("missing lock_timeout_ms")
+                .parse()
+                .expect("lock_timeout_ms must be u32");
+            let rows: i64 = args
+                .next()
+                .expect("missing rows")
+                .parse()
+                .expect("rows must be i64");
+
+            println!("Writer starting: ID={}, Timeout={}ms, Rows={}", writer_id, lock_timeout_ms, rows); // Debug print
+
+            let path = std::path::Path::new(&dir);
+            let opts = CoreOpenOptions::default().with_lock_timeout_ms(lock_timeout_ms);
+            let db = Database::open_with_options(path, opts).expect("writer open");
+            let table = db
+                .table("items")
+                .expect("items table missing")
+                .clone();
+
+            for idx in 0..rows {
+                let payload = format!("w{writer_id}-r{idx}");
+                println!("Writer {writer_id} attempting insert at idx {idx}"); // Added for debugging
+                let mut guard = table.lock();
+                guard
+                    .put(vec![
+                        (1, Value::Int64(writer_id)),
+                        (2, Value::Int64(idx)),
+                        (3, Value::Bytes(payload.into_bytes())),
+                    ])
+                    .expect("put");
+                guard.commit().expect("commit");
+            }
+
+            println!("DONE {writer_id}");
+            std::io::stdout().flush().expect("flush DONE");
+            exit(0);
         }
         other => {
             eprintln!("unknown role: {other}");
