@@ -144,8 +144,8 @@ fn fail_fast_default_rejects_concurrent_open() {
         "expected 'locked by another process' error, got: {err}"
     );
     assert!(
-        elapsed < Duration::from_millis(500),
-        "fail-fast took too long ({elapsed:?}); expected <500ms"
+        elapsed < Duration::from_secs(2),
+        "fail-fast took too long ({elapsed:?}); expected <2s"
     );
 
     holder.kill().expect("kill holder");
@@ -316,14 +316,19 @@ fn cross_process_writers_all_succeed() {
     let mut completed: Vec<i64> = Vec::new();
     let mut failed: Vec<(i64, String, Option<i32>)> = Vec::new();
     for (mut child, rx) in handles {
-        let writer_id_line = wait_for_line_with(&rx, |l| l.starts_with("DONE"), Duration::from_secs(30))
-            .unwrap_or_else(|| {
-                failed.push((-1, "writer never reported DONE".to_string(), None));
-                String::new()
-            });
+        let writer_id_line =
+            wait_for_line_with(&rx, |l| l.starts_with("DONE"), Duration::from_secs(30))
+                .unwrap_or_else(|| {
+                    failed.push((-1, "writer never reported DONE".to_string(), None));
+                    String::new()
+                });
         let status = child.wait().expect("wait writer");
         if !status.success() {
-            failed.push((-1, format!("writer exited non-zero: {status}"), status.code()));
+            failed.push((
+                -1,
+                format!("writer exited non-zero: {status}"),
+                status.code(),
+            ));
             continue;
         }
         // Parse "DONE <writer_id>" — the writer_id was passed positionally

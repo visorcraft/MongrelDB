@@ -34,9 +34,9 @@ use std::io::Write;
 use std::process::exit;
 use std::time::{Duration, Instant};
 
+use mongreldb_core::schema::{ColumnDef, ColumnFlags, Schema, TypeId};
 use mongreldb_core::Database;
 use mongreldb_core::OpenOptions as CoreOpenOptions;
-use mongreldb_core::schema::{ColumnDef, ColumnFlags, Schema, TypeId};
 use mongreldb_core::Value;
 
 fn spin_forever(started: Instant) -> ! {
@@ -162,24 +162,18 @@ fn main() {
                 .parse()
                 .expect("rows must be i64");
 
-            println!("Writer starting: ID={}, Timeout={}ms, Rows={}", writer_id, lock_timeout_ms, rows); // Debug print
-
             let path = std::path::Path::new(&dir);
             let opts = CoreOpenOptions::default().with_lock_timeout_ms(lock_timeout_ms);
             let db = Database::open_with_options(path, opts).expect("writer open");
-            let table = db
-                .table("items")
-                .expect("items table missing")
-                .clone();
+            let table = db.table("items").expect("items table missing").clone();
 
             for idx in 0..rows {
                 let payload = format!("w{writer_id}-r{idx}");
-                println!("Writer {writer_id} attempting insert at idx {idx}"); // Added for debugging
                 let mut guard = table.lock();
                 guard
                     .put(vec![
                         (1, Value::Int64(writer_id)),
-                        (2, Value::Int64(idx)),
+                        (2, Value::Int64(writer_id * rows + idx)),
                         (3, Value::Bytes(payload.into_bytes())),
                     ])
                     .expect("put");

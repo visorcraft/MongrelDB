@@ -1,14 +1,14 @@
 [package]
 name = "mongreldb-client"
-version = "0.44.0"
+version = "0.44.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "HTTP client library for MongrelDB Server."
 repository = "https://github.com/visorcraft/MongrelDB"
 
 [dependencies]
-mongreldb-core = { path = "../mongreldb-core", version = "0.44.0" }
-mongreldb-query = { path = "../mongreldb-query", version = "0.44.0" }
+mongreldb-core = { path = "../mongreldb-core", version = "0.44.1" }
+mongreldb-query = { path = "../mongreldb-query", version = "0.44.1" }
 reqwest = { version = "0.12", features = ["blocking", "json"] }
 arrow = "58"
 serde = { version = "1", features = ["derive"] }
