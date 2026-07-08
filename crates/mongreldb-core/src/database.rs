@@ -186,6 +186,47 @@ pub struct CheckIssue {
 /// writes.
 pub type TableHandle = Arc<Mutex<Table>>;
 
+/// Knobs for [`Database::open_with_options`].
+///
+/// All fields default to the same values the convenience
+/// [`Database::open`] / [`Database::open_encrypted`] / etc. constructors use,
+/// so `OpenOptions::default()` round-trips the historical behavior exactly.
+#[derive(Clone, Debug)]
+pub struct OpenOptions {
+    /// Maximum time, in milliseconds, to wait for the cross-process database
+    /// lock (`_meta/.lock`) before failing the open with `MongrelError::Io`.
+    ///
+    /// `0` (the default) preserves the historical fail-fast semantics: a
+    /// single `try_lock_exclusive` call, no retry, no sleep. SQLite-style
+    /// `busy_timeout` semantics kick in once this is non-zero — the open
+    /// sleeps with progressively wider backoff (1ms → 10ms → 50ms) until
+    /// either the lock is acquired or `lock_timeout_ms` elapses, at which
+    /// point the open returns the same `Io(WouldBlock)` error the fail-fast
+    /// path would.
+    ///
+    /// Only the cross-process lock is affected. Mounted tables, page-cache
+    /// misses, and WAL appends already serialize through in-process locks
+    /// that handle their own contention.
+    pub lock_timeout_ms: u32,
+}
+
+impl Default for OpenOptions {
+    fn default() -> Self {
+        Self {
+            lock_timeout_ms: 0,
+        }
+    }
+}
+
+impl OpenOptions {
+    /// Set [`OpenOptions::lock_timeout_ms`]. `0` keeps the fail-fast default;
+    /// SQLite-style applications typically pick 1_000 – 5_000ms.
+    pub fn with_lock_timeout_ms(mut self, ms: u32) -> Self {
+        self.lock_timeout_ms = ms;
+        self
+    }
+}
+
 /// A multi-table database: one catalog, one epoch clock, shared caches, a
 /// shared WAL, and a live map of name → `Arc<Table>`.
 pub struct Database {
@@ -385,7 +426,7 @@ impl Database {
         let meta_dek = crate::encryption::meta_dek_for(kek.as_deref());
         let cat = Catalog::empty();
         catalog::write_atomic(&root, &cat, meta_dek.as_ref())?;
-        Self::finish_open(root, cat, kek, meta_dek, false, None)
+        Self::finish_open(root, cat, kek, meta_dek, false, None, 0)
     }
 
     /// Open an existing plaintext database.
@@ -403,6 +444,23 @@ impl Database {
         salt.copy_from_slice(&salt_bytes);
         let kek = Arc::new(crate::encryption::Kek::derive(passphrase, &salt)?);
         Self::open_inner(root, Some(kek), None)
+    }
+
+    /// Open an existing encrypted database with a configurable cross-process
+    /// lock timeout. Mirrors [`open_with_options`](Self::open_with_options).
+    #[cfg(feature = "encryption")]
+    pub fn open_encrypted_with_options(
+        root: impl AsRef<Path>,
+        passphrase: &str,
+        options: OpenOptions,
+    ) -> Result<Self> {
+        let root = root.as_ref();
+        let salt_bytes = std::fs::read(root.join(META_DIR).join(KEYS_FILENAME))
+            .map_err(|e| MongrelError::NotFound(format!("encryption salt file: {e}")))?;
+        let mut salt = [0u8; crate::encryption::SALT_LEN];
+        salt.copy_from_slice(&salt_bytes);
+        let kek = Arc::new(crate::encryption::Kek::derive(passphrase, &salt)?);
+        Self::open_inner_with_lock_timeout(root, Some(kek), None, options.lock_timeout_ms)
     }
 
     /// Open an existing encrypted database using a raw high-entropy key.
@@ -448,6 +506,24 @@ impl Database {
         Self::open_inner_with_credentials(root, None, username, password)
     }
 
+    /// Open with credentials and a configurable cross-process lock timeout.
+    /// Mirrors [`open_with_options`](Self::open_with_options) for the
+    /// credentialed path.
+    pub fn open_with_credentials_and_options(
+        root: impl AsRef<Path>,
+        username: &str,
+        password: &str,
+        options: OpenOptions,
+    ) -> Result<Self> {
+        Self::open_inner_with_credentials_and_lock_timeout(
+            root,
+            None,
+            username,
+            password,
+            options.lock_timeout_ms,
+        )
+    }
+
     /// Open an existing encrypted database that has `require_auth = true`,
     /// combining the encryption passphrase flow with credential verification.
     #[cfg(feature = "encryption")]
@@ -466,6 +542,66 @@ impl Database {
         Self::open_inner_with_credentials(root, Some(kek), username, password)
     }
 
+    /// Open an encrypted + credentialed database with a configurable
+    /// cross-process lock timeout. Mirrors
+    /// [`open_encrypted_with_options`](Self::open_encrypted_with_options).
+    #[cfg(feature = "encryption")]
+    pub fn open_encrypted_with_credentials_and_options(
+        root: impl AsRef<Path>,
+        passphrase: &str,
+        username: &str,
+        password: &str,
+        options: OpenOptions,
+    ) -> Result<Self> {
+        let root = root.as_ref();
+        let salt_bytes = std::fs::read(root.join(META_DIR).join(KEYS_FILENAME))
+            .map_err(|e| MongrelError::NotFound(format!("encryption salt file: {e}")))?;
+        let mut salt = [0u8; crate::encryption::SALT_LEN];
+        salt.copy_from_slice(&salt_bytes);
+        let kek = Arc::new(crate::encryption::Kek::derive(passphrase, &salt)?);
+        Self::open_inner_with_credentials_and_lock_timeout(
+            root,
+            Some(kek),
+            username,
+            password,
+            options.lock_timeout_ms,
+        )
+    }
+
+    /// Open an existing database with non-default [`OpenOptions`].
+    ///
+    /// Use this when you need cross-process lock retries (`lock_timeout_ms`)
+    /// rather than the fail-fast default. All the [`Database::open`],
+    /// [`Database::open_encrypted`], [`Database::open_with_key`],
+    /// [`Database::open_with_credentials`], and
+    /// [`Database::open_encrypted_with_credentials`] paths route through here
+    /// internally with their previous defaults preserved.
+    pub fn open_with_options(
+        root: impl AsRef<Path>,
+        options: OpenOptions,
+    ) -> Result<Self> {
+        // No encryption, no auth — the plain-text, anonymous-open path. Other
+        // entry points (encrypted / credentialed) keep their existing
+        // constructors and don't accept `OpenOptions` to avoid multiplying
+        // the entry-surface; callers who need those modes plus a lock timeout
+        // can fork this method or use the timeout set on the cross-process
+        // caller side. Today: keeps the surface tight.
+        Self::open_inner_with_lock_timeout(root, None, None, options.lock_timeout_ms)
+    }
+
+    fn open_inner_with_lock_timeout(
+        root: impl AsRef<Path>,
+        kek: Option<Arc<crate::encryption::Kek>>,
+        _meta_dek_override: Option<[u8; META_DEK_LEN]>,
+        lock_timeout_ms: u32,
+    ) -> Result<Self> {
+        let root = root.as_ref().to_path_buf();
+        let meta_dek = crate::encryption::meta_dek_for(kek.as_deref());
+        let cat = catalog::read(&root, meta_dek.as_ref())?
+            .ok_or_else(|| MongrelError::NotFound(format!("no catalog found at {:?}", root)))?;
+        Self::finish_open(root, cat, kek, meta_dek, true, None, lock_timeout_ms)
+    }
+
     /// Shared credentialed-open inner: read the catalog, verify the database
     /// requires auth, verify the password, resolve the principal, and pass
     /// everything to `finish_open` in one shot. This avoids the chicken-and-egg
@@ -477,6 +613,19 @@ impl Database {
         kek: Option<Arc<crate::encryption::Kek>>,
         username: &str,
         password: &str,
+    ) -> Result<Self> {
+        Self::open_inner_with_credentials_and_lock_timeout(root, kek, username, password, 0)
+    }
+
+    /// Credentialed-open with an explicit cross-process lock timeout. The
+    /// timeout is opt-in: callers that don't pass `OpenOptions` keep the
+    /// historical fail-fast behavior via the wrapper above.
+    fn open_inner_with_credentials_and_lock_timeout(
+        root: impl AsRef<Path>,
+        kek: Option<Arc<crate::encryption::Kek>>,
+        username: &str,
+        password: &str,
+        lock_timeout_ms: u32,
     ) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         let meta_dek = crate::encryption::meta_dek_for(kek.as_deref());
@@ -517,7 +666,7 @@ impl Database {
                 }
             })?;
 
-        Self::finish_open(root, cat, kek, meta_dek, true, Some(principal))
+        Self::finish_open(root, cat, kek, meta_dek, true, Some(principal), lock_timeout_ms)
     }
 
     /// Create a fresh plaintext database with `require_auth = true` and a
@@ -591,7 +740,7 @@ impl Database {
             roles: Vec::new(),
             permissions: Vec::new(),
         };
-        Self::finish_open(root, cat, kek, meta_dek, false, Some(admin_principal))
+        Self::finish_open(root, cat, kek, meta_dek, false, Some(admin_principal), 0)
     }
 
     fn open_inner(
@@ -603,7 +752,50 @@ impl Database {
         let meta_dek = crate::encryption::meta_dek_for(kek.as_deref());
         let cat = catalog::read(&root, meta_dek.as_ref())?
             .ok_or_else(|| MongrelError::NotFound(format!("no catalog found at {:?}", root)))?;
-        Self::finish_open(root, cat, kek, meta_dek, true, None)
+        Self::finish_open(root, cat, kek, meta_dek, true, None, 0)
+    }
+
+    /// Acquire an exclusive advisory lock on `f`, retrying on `EAGAIN`/`EWOULDBLOCK`
+    /// until `timeout_ms` elapses, mirroring SQLite's `busy_timeout` semantics.
+    ///
+    /// `timeout_ms == 0` is the fail-fast path: a single `try_lock_exclusive` call,
+    /// no retry, no sleep. Existing open paths rely on that fail-fast default for
+    /// backwards compatibility — opt in with `OpenOptions::lock_timeout_ms`.
+    ///
+    /// Backoff schedule: 1ms → 10ms → 50ms → 50ms → ... until `timeout_ms`.
+    /// Total elapsed (not just sleep time) is bounded by `timeout_ms`, so the
+    /// caller never blocks past its budget even at the tail of a busy lock
+    /// holder's lock-window.
+    fn fs_lock_exclusive(f: &std::fs::File, timeout_ms: u32) -> std::io::Result<()> {
+        use fs2::FileExt;
+        if timeout_ms == 0 {
+            return f.try_lock_exclusive();
+        }
+        // Per-call deadline so a single stray 50ms sleep can't overshoot the budget.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
+        let mut next_sleep = std::time::Duration::from_millis(1);
+        loop {
+            match f.try_lock_exclusive() {
+                Ok(()) => return Ok(()),
+                Err(_) => {
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::WouldBlock,
+                            format!(
+                                "could not acquire database lock within {timeout_ms}ms"
+                            ),
+                        ));
+                    }
+                    let remaining = deadline - now;
+                    let sleep = next_sleep.min(remaining);
+                    std::thread::sleep(sleep);
+                    // Cap the per-iteration sleep so a single back-off step
+                    // never overshoots the remaining budget.
+                    next_sleep = next_sleep.saturating_mul(10).min(std::time::Duration::from_millis(50));
+                }
+            }
+        }
     }
 
     fn finish_open(
@@ -613,6 +805,7 @@ impl Database {
         meta_dek: Option<[u8; META_DEK_LEN]>,
         existing: bool,
         principal: Option<crate::auth::Principal>,
+        lock_timeout_ms: u32,
     ) -> Result<Self> {
         // Acquire an exclusive cross-process lock on the database directory.
         // This prevents two *processes* from opening the same DB simultaneously
@@ -638,8 +831,7 @@ impl Database {
                     .truncate(false)
                     .write(true)
                     .open(&lock_path)?;
-                use fs2::FileExt;
-                f.try_lock_exclusive().map_err(|e| {
+                Self::fs_lock_exclusive(&f, lock_timeout_ms).map_err(|e| {
                     MongrelError::Io(std::io::Error::other(format!(
                         "database at {} is locked by another process: {e}",
                         root.display()
