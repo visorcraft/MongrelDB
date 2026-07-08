@@ -4266,14 +4266,28 @@ impl Database {
         //    and all WAL segments whose data is now durable in runs.
         self.gc()?;
 
-        // 4. Rotate the active WAL segment to a fresh empty one so the old
-        //    active segment (which may have tail bytes) is reaped by gc_segments.
-        let next_segment_no = self.catalog.read().next_segment_no;
+        // 4. Reap ALL WAL segments (all data is durable in runs after flush +
+        //    compact). Delete every segment file, then the reopen creates a
+        //    fresh empty one via SharedWal::open. We can't use gc_segments alone
+        //    because it skips the active segment — and leaving a stale active
+        //    segment with pre-checkpoint tail bytes causes a magic-mismatch or
+        //    truncated-read panic on reopen.
         {
-            let mut wal = self.shared_wal.lock();
-            wal.rotate(next_segment_no)?;
-            // Now the old active segment is non-active → reap it + any others.
-            wal.gc_segments(u64::MAX)?;
+            let wal = self.shared_wal.lock();
+            let active = wal.active_segment_no();
+            drop(wal);
+            // Remove every segment file including the active one.
+            let wal_dir = self.root.join("_wal");
+            if wal_dir.exists() {
+                for entry in std::fs::read_dir(&wal_dir)? {
+                    let entry = entry?;
+                    let path = entry.path();
+                    if path.extension().is_some_and(|ext| ext == "wal") {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            }
+            let _ = active; // tracked for debugging
         }
 
         // 5. Persist the catalog with the bumped next_segment_no.

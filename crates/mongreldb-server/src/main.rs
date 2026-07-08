@@ -259,19 +259,28 @@ async fn main() {
         }
     }
 
-    // Open the database (optionally encrypted). If the catalog doesn't exist
-    // yet, create it automatically (create-if-not-missing).
+    // Open the database (optionally encrypted). If the catalog file doesn't
+    // exist yet, create it automatically (create-if-not-missing). We check for
+    // the CATALOG file explicitly rather than blindly falling back to create()
+    // on any open error — create() writes an empty catalog and would destroy
+    // an existing database if the open failed for a transient reason (e.g.,
+    // lock contention from a process that hasn't fully released yet).
+    let catalog_exists = std::path::Path::new(&args.db_dir)
+        .join("CATALOG")
+        .exists();
     let db = if let Some(ref pw) = args.passphrase {
         Arc::new(Database::open_encrypted(&args.db_dir, pw).unwrap_or_else(|e| {
             eprintln!("failed to open {}: {e}", args.db_dir);
             std::process::exit(1);
         }))
+    } else if catalog_exists {
+        Arc::new(Database::open(&args.db_dir).unwrap_or_else(|e| {
+            eprintln!("failed to open {}: {e}", args.db_dir);
+            std::process::exit(1);
+        }))
     } else {
-        Arc::new(
-            Database::open(&args.db_dir)
-                .or_else(|_| Database::create(&args.db_dir))
-                .unwrap_or_else(|e| {
-                    eprintln!("failed to open or create {}: {e}", args.db_dir);
+        Arc::new(Database::create(&args.db_dir).unwrap_or_else(|e| {
+            eprintln!("failed to create {}: {e}", args.db_dir);
                     std::process::exit(1);
                 }),
         )
@@ -352,9 +361,22 @@ async fn main() {
     shutdown(&db, &pidfile, args.daemon);
 }
 
-/// Flush all tables and remove the pidfile (if we wrote one).
+/// Flush all tables, checkpoint to a stable on-disk state, and remove the
+/// pidfile (if we wrote one). The checkpoint ensures the database directory
+/// is deterministic after shutdown — no stale WAL segments, no fragmented
+/// runs — so `git status` shows clean when the directory is tracked.
 fn shutdown(db: &Arc<Database>, pidfile: &str, daemon: bool) {
-    let _ = db.close();
+    // Checkpoint: flush + compact + reap WAL segments + rotate active segment.
+    // This normalizes the on-disk state to a deterministic form.
+    match db.checkpoint() {
+        Ok(()) => eprintln!("checkpoint complete"),
+        Err(e) => {
+            // Checkpoint failure is non-fatal during shutdown — fall back to
+            // a best-effort close so the process can still exit cleanly.
+            eprintln!("checkpoint failed (falling back to close): {e}");
+            let _ = db.close();
+        }
+    }
     eprintln!("shutdown complete");
     if daemon {
         let _ = std::fs::remove_file(pidfile);
