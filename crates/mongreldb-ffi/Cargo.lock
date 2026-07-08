@@ -288,7 +288,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-core"
-version = "0.42.1"
+version = "0.43.1"
 dependencies = [
  "arc-swap",
  "argon2",
@@ -315,7 +315,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-ffi"
-version = "0.42.1"
+version = "0.43.1"
 dependencies = [
  "cc",
  "mongreldb-core",

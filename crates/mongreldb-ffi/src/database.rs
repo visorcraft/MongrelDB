@@ -78,7 +78,9 @@ pub unsafe extern "C" fn mongreldb_create(path: *const c_char) -> mongreldb_data
     }
 }
 
-/// Open an existing database from disk. Returns a handle or null on error.
+/// Open an existing database from disk. If the catalog doesn't exist yet,
+/// create it automatically (create-if-not-missing, matching the daemon's
+/// behavior). Returns a handle or null on error.
 ///
 /// # Safety
 /// `path` must be a NUL-terminated UTF-8 C string.
@@ -89,7 +91,7 @@ pub unsafe extern "C" fn mongreldb_open(path: *const c_char) -> mongreldb_databa
         Ok(p) => p,
         Err(_code) => return std::ptr::null_mut(),
     };
-    match CoreDatabase::open(&path) {
+    match CoreDatabase::open(&path).or_else(|_| CoreDatabase::create(&path)) {
         Ok(db) => FFIDatabase::new(db).into_handle(),
         Err(e) => {
             set_error(&e);
