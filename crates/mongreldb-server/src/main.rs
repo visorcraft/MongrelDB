@@ -226,17 +226,22 @@ async fn main() {
         }
     }
 
-    // Open the database (optionally encrypted).
+    // Open the database (optionally encrypted). If the catalog doesn't exist
+    // yet, create it automatically (create-if-not-missing).
     let db = if let Some(ref pw) = args.passphrase {
         Arc::new(Database::open_encrypted(&args.db_dir, pw).unwrap_or_else(|e| {
             eprintln!("failed to open {}: {e}", args.db_dir);
             std::process::exit(1);
         }))
     } else {
-        Arc::new(Database::open(&args.db_dir).unwrap_or_else(|e| {
-            eprintln!("failed to open {}: {e}", args.db_dir);
-            std::process::exit(1);
-        }))
+        Arc::new(
+            Database::open(&args.db_dir)
+                .or_else(|_| Database::create(&args.db_dir))
+                .unwrap_or_else(|e| {
+                    eprintln!("failed to open or create {}: {e}", args.db_dir);
+                    std::process::exit(1);
+                }),
+        )
     };
 
     // §5.9: background cost-aware compaction (run-count trigger).

@@ -264,6 +264,48 @@ pub struct Database {
     auth_state: crate::auth_state::AuthState,
 }
 
+/// RAII guard that ensures an assigned epoch is resolved (published or
+/// abandoned) on every code path, including early `?` returns.
+///
+/// On drop, if not disarmed, calls [`EpochAuthority::abandon`] — the operation
+/// failed, so the epoch must not become visible to readers. On success, the
+/// caller calls [`EpochAuthority::publish_in_order`] and then
+/// [`Self::disarm`] to prevent the abandon.
+///
+/// This is the root-cause fix for the epoch-hole bug: previously, if a DDL or
+/// auth operation failed after `bump_assigned` but before `advance_visible`,
+/// the epoch was never published, permanently blocking the in-order watermark
+/// and making all subsequent queries return empty results.
+struct EpochGuard<'a> {
+    authority: &'a EpochAuthority,
+    epoch: Epoch,
+    armed: bool,
+}
+
+impl<'a> EpochGuard<'a> {
+    fn new(authority: &'a EpochAuthority, epoch: Epoch) -> Self {
+        Self {
+            authority,
+            epoch,
+            armed: true,
+        }
+    }
+
+    /// Mark the epoch as successfully published. Call this after
+    /// `publish_in_order` to prevent the guard from abandoning the epoch.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for EpochGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.authority.abandon(self.epoch);
+        }
+    }
+}
+
 /// A data-change event published on commit (CDC / NOTIFY-LISTEN).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ChangeEvent {
@@ -828,6 +870,7 @@ impl Database {
         let commit_lock = Arc::clone(&self.commit_lock);
         let _c = commit_lock.lock();
         let epoch = self.epoch.bump_assigned();
+        let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
         procedure.created_epoch = epoch.0;
         procedure.updated_epoch = epoch.0;
         {
@@ -836,7 +879,8 @@ impl Database {
             cat.db_epoch = epoch.0;
         }
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
-        self.advance_visible(epoch);
+        self.epoch.publish_in_order(epoch);
+        _epoch_guard.disarm();
         Ok(procedure)
     }
 
@@ -850,6 +894,7 @@ impl Database {
         let commit_lock = Arc::clone(&self.commit_lock);
         let _c = commit_lock.lock();
         let epoch = self.epoch.bump_assigned();
+        let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
         let replaced = {
             let mut cat = self.catalog.write();
             let next = match cat
@@ -876,7 +921,8 @@ impl Database {
             next
         };
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
-        self.advance_visible(epoch);
+        self.epoch.publish_in_order(epoch);
+        _epoch_guard.disarm();
         Ok(replaced)
     }
 
@@ -886,6 +932,7 @@ impl Database {
         let commit_lock = Arc::clone(&self.commit_lock);
         let _c = commit_lock.lock();
         let epoch = self.epoch.bump_assigned();
+        let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
         {
             let mut cat = self.catalog.write();
             let before = cat.procedures.len();
@@ -898,7 +945,8 @@ impl Database {
             cat.db_epoch = epoch.0;
         }
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
-        self.advance_visible(epoch);
+        self.epoch.publish_in_order(epoch);
+        _epoch_guard.disarm();
         Ok(())
     }
 
@@ -920,6 +968,7 @@ impl Database {
         self.require(&crate::auth::Permission::Admin)?;
         let hash = crate::auth::hash_password(password).map_err(MongrelError::Other)?;
         let epoch = self.epoch.bump_assigned();
+        let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
         let id = {
             let mut cat = self.catalog.write();
             if cat.users.iter().any(|u| u.username == username) {
@@ -942,7 +991,8 @@ impl Database {
             entry
         };
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
-        self.advance_visible(epoch);
+        self.epoch.publish_in_order(epoch);
+        _epoch_guard.disarm();
         Ok(id)
     }
 
@@ -950,6 +1000,7 @@ impl Database {
     pub fn drop_user(&self, username: &str) -> Result<()> {
         self.require(&crate::auth::Permission::Admin)?;
         let epoch = self.epoch.bump_assigned();
+        let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
         {
             let mut cat = self.catalog.write();
             let before = cat.users.len();
@@ -962,7 +1013,8 @@ impl Database {
             cat.db_epoch = epoch.0;
         }
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
-        self.advance_visible(epoch);
+        self.epoch.publish_in_order(epoch);
+        _epoch_guard.disarm();
         Ok(())
     }
 
@@ -971,6 +1023,7 @@ impl Database {
         self.require(&crate::auth::Permission::Admin)?;
         let hash = crate::auth::hash_password(new_password).map_err(MongrelError::Other)?;
         let epoch = self.epoch.bump_assigned();
+        let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
         {
             let mut cat = self.catalog.write();
             let user = cat
@@ -982,7 +1035,8 @@ impl Database {
             cat.db_epoch = epoch.0;
         }
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
-        self.advance_visible(epoch);
+        self.epoch.publish_in_order(epoch);
+        _epoch_guard.disarm();
         Ok(())
     }
 
@@ -1013,6 +1067,7 @@ impl Database {
     pub fn set_user_admin(&self, username: &str, is_admin: bool) -> Result<()> {
         self.require(&crate::auth::Permission::Admin)?;
         let epoch = self.epoch.bump_assigned();
+        let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
         {
             let mut cat = self.catalog.write();
             let user = cat
@@ -1024,7 +1079,8 @@ impl Database {
             cat.db_epoch = epoch.0;
         }
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
-        self.advance_visible(epoch);
+        self.epoch.publish_in_order(epoch);
+        _epoch_guard.disarm();
         Ok(())
     }
 
@@ -1032,6 +1088,7 @@ impl Database {
     pub fn create_role(&self, name: &str) -> Result<crate::auth::RoleEntry> {
         self.require(&crate::auth::Permission::Admin)?;
         let epoch = self.epoch.bump_assigned();
+        let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
         let entry = {
             let mut cat = self.catalog.write();
             if cat.roles.iter().any(|r| r.name == name) {
@@ -1049,7 +1106,8 @@ impl Database {
             entry
         };
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
-        self.advance_visible(epoch);
+        self.epoch.publish_in_order(epoch);
+        _epoch_guard.disarm();
         Ok(entry)
     }
 
@@ -1057,6 +1115,7 @@ impl Database {
     pub fn drop_role(&self, name: &str) -> Result<()> {
         self.require(&crate::auth::Permission::Admin)?;
         let epoch = self.epoch.bump_assigned();
+        let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
         {
             let mut cat = self.catalog.write();
             let before = cat.roles.len();
@@ -1071,7 +1130,8 @@ impl Database {
             cat.db_epoch = epoch.0;
         }
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
-        self.advance_visible(epoch);
+        self.epoch.publish_in_order(epoch);
+        _epoch_guard.disarm();
         Ok(())
     }
 
@@ -1079,6 +1139,7 @@ impl Database {
     pub fn grant_role(&self, username: &str, role_name: &str) -> Result<()> {
         self.require(&crate::auth::Permission::Admin)?;
         let epoch = self.epoch.bump_assigned();
+        let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
         {
             let mut cat = self.catalog.write();
             if !cat.roles.iter().any(|r| r.name == role_name) {
@@ -1097,7 +1158,8 @@ impl Database {
             cat.db_epoch = epoch.0;
         }
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
-        self.advance_visible(epoch);
+        self.epoch.publish_in_order(epoch);
+        _epoch_guard.disarm();
         Ok(())
     }
 
@@ -1105,6 +1167,7 @@ impl Database {
     pub fn revoke_role(&self, username: &str, role_name: &str) -> Result<()> {
         self.require(&crate::auth::Permission::Admin)?;
         let epoch = self.epoch.bump_assigned();
+        let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
         {
             let mut cat = self.catalog.write();
             let user = cat
@@ -1116,7 +1179,8 @@ impl Database {
             cat.db_epoch = epoch.0;
         }
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
-        self.advance_visible(epoch);
+        self.epoch.publish_in_order(epoch);
+        _epoch_guard.disarm();
         Ok(())
     }
 
@@ -1128,6 +1192,7 @@ impl Database {
     ) -> Result<()> {
         self.require(&crate::auth::Permission::Admin)?;
         let epoch = self.epoch.bump_assigned();
+        let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
         {
             let mut cat = self.catalog.write();
             let role = cat
@@ -1141,7 +1206,8 @@ impl Database {
             cat.db_epoch = epoch.0;
         }
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
-        self.advance_visible(epoch);
+        self.epoch.publish_in_order(epoch);
+        _epoch_guard.disarm();
         Ok(())
     }
 
@@ -1153,6 +1219,7 @@ impl Database {
     ) -> Result<()> {
         self.require(&crate::auth::Permission::Admin)?;
         let epoch = self.epoch.bump_assigned();
+        let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
         {
             let mut cat = self.catalog.write();
             let role = cat
@@ -1164,7 +1231,8 @@ impl Database {
             cat.db_epoch = epoch.0;
         }
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
-        self.advance_visible(epoch);
+        self.epoch.publish_in_order(epoch);
+        _epoch_guard.disarm();
         Ok(())
     }
 
@@ -1284,6 +1352,7 @@ impl Database {
         let password_hash =
             crate::auth::hash_password(admin_password).map_err(MongrelError::Other)?;
         let epoch = self.epoch.bump_assigned();
+        let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
         {
             let mut cat = self.catalog.write();
             if cat.require_auth {
@@ -1322,6 +1391,8 @@ impl Database {
             permissions: Vec::new(),
         });
         self.auth_state.set_require_auth(true);
+        self.epoch.publish_in_order(epoch);
+        _epoch_guard.disarm();
         Ok(())
     }
 
@@ -1343,6 +1414,7 @@ impl Database {
     /// See `docs/15-credential-enforcement.md` §4.7.
     pub fn disable_auth(&self) -> Result<()> {
         let epoch = self.epoch.bump_assigned();
+        let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
         {
             let mut cat = self.catalog.write();
             if !cat.require_auth {
@@ -1358,6 +1430,8 @@ impl Database {
         *self.principal.write() = None;
         // Update the shared auth state so mounted tables also stop enforcing.
         self.auth_state.set_require_auth(false);
+        self.epoch.publish_in_order(epoch);
+        _epoch_guard.disarm();
         Ok(())
     }
 
@@ -1430,6 +1504,7 @@ impl Database {
         let commit_lock = Arc::clone(&self.commit_lock);
         let _c = commit_lock.lock();
         let epoch = self.epoch.bump_assigned();
+        let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
         trigger.created_epoch = epoch.0;
         trigger.updated_epoch = epoch.0;
         {
@@ -1438,7 +1513,8 @@ impl Database {
             cat.db_epoch = epoch.0;
         }
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
-        self.advance_visible(epoch);
+        self.epoch.publish_in_order(epoch);
+        _epoch_guard.disarm();
         Ok(trigger)
     }
 
@@ -1449,6 +1525,7 @@ impl Database {
         let commit_lock = Arc::clone(&self.commit_lock);
         let _c = commit_lock.lock();
         let epoch = self.epoch.bump_assigned();
+        let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
         let replaced = {
             let mut cat = self.catalog.write();
             let next = match cat
@@ -1475,7 +1552,8 @@ impl Database {
             next
         };
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
-        self.advance_visible(epoch);
+        self.epoch.publish_in_order(epoch);
+        _epoch_guard.disarm();
         Ok(replaced)
     }
 
@@ -1485,6 +1563,7 @@ impl Database {
         let commit_lock = Arc::clone(&self.commit_lock);
         let _c = commit_lock.lock();
         let epoch = self.epoch.bump_assigned();
+        let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
         {
             let mut cat = self.catalog.write();
             let before = cat.triggers.len();
@@ -1497,7 +1576,8 @@ impl Database {
             cat.db_epoch = epoch.0;
         }
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
-        self.advance_visible(epoch);
+        self.epoch.publish_in_order(epoch);
+        _epoch_guard.disarm();
         Ok(())
     }
 
@@ -1535,6 +1615,7 @@ impl Database {
         let commit_lock = Arc::clone(&self.commit_lock);
         let _c = commit_lock.lock();
         let epoch = self.epoch.bump_assigned();
+        let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
         entry.created_epoch = epoch.0;
         {
             let mut cat = self.catalog.write();
@@ -1542,7 +1623,8 @@ impl Database {
             cat.db_epoch = epoch.0;
         }
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
-        self.advance_visible(epoch);
+        self.epoch.publish_in_order(epoch);
+        _epoch_guard.disarm();
         Ok(entry)
     }
 
@@ -1552,6 +1634,7 @@ impl Database {
         let commit_lock = Arc::clone(&self.commit_lock);
         let _c = commit_lock.lock();
         let epoch = self.epoch.bump_assigned();
+        let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
         {
             let mut cat = self.catalog.write();
             let before = cat.external_tables.len();
@@ -1568,7 +1651,8 @@ impl Database {
             std::fs::remove_dir_all(state_dir)?;
         }
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
-        self.advance_visible(epoch);
+        self.epoch.publish_in_order(epoch);
+        _epoch_guard.disarm();
         Ok(())
     }
 
@@ -3380,7 +3464,7 @@ impl Database {
                 content_hash: [0u8; 32],
             })
             .collect();
-        let (new_epoch, applies, commit_seq) = {
+        let (new_epoch, mut _epoch_guard, applies, commit_seq) = {
             let mut wal = self.shared_wal.lock();
 
             // Re-check only if the conflict index advanced since pre-validation
@@ -3408,6 +3492,7 @@ impl Database {
             }
 
             let new_epoch = self.epoch.bump_assigned();
+            let _epoch_guard = EpochGuard::new(self.epoch.as_ref(), new_epoch);
             let mut applies: Vec<(u64, Vec<StagedOp>)> = Vec::new();
 
             for (idx, (table_id, staged)) in staging.iter().enumerate() {
@@ -3477,7 +3562,7 @@ impl Database {
             // moves out of this critical section to the group-commit coordinator
             // so concurrent committers share a single leader fsync.
             self.conflicts.record(&write_keys, new_epoch);
-            (new_epoch, applies, commit_seq)
+            (new_epoch, _epoch_guard, applies, commit_seq)
         };
 
         // ── 2b. Durability: one leader fsync serves this whole batch (P3.2). ──
@@ -3535,17 +3620,9 @@ impl Database {
             publish_external_state_file(&self.root, name, pending)?;
         }
 
-        self.advance_visible(new_epoch);
+        self.epoch.publish_in_order(new_epoch);
+        _epoch_guard.disarm();
         Ok(new_epoch)
-    }
-
-    /// Advance `visible` in-order: epoch E becomes visible only once E and all
-    /// prior unpublished epochs have finished publishing (spec §9.3e). The
-    /// in-order gate lives on the shared [`EpochAuthority`] so this path, the
-    /// single-table `Table::commit` path, and DDL all share one watermark and
-    /// can never publish out of assigned order under concurrency.
-    fn advance_visible(&self, published: Epoch) {
-        self.epoch.publish_in_order(published);
     }
 
     /// Register a read snapshot at the current visible epoch and return it with
@@ -3703,6 +3780,7 @@ impl Database {
             id
         };
         let epoch = self.epoch.bump_assigned();
+        let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
         let txn_id = self.alloc_txn_id();
 
         // Stamp the schema_id with the unique table_id so every table in the
@@ -3778,7 +3856,8 @@ impl Database {
             .write()
             .insert(table_id, Arc::new(Mutex::new(table)));
 
-        self.advance_visible(epoch);
+        self.epoch.publish_in_order(epoch);
+        _epoch_guard.disarm();
         Ok(table_id)
     }
 
@@ -3805,6 +3884,7 @@ impl Database {
         let commit_lock = Arc::clone(&self.commit_lock);
         let _c = commit_lock.lock();
         let epoch = self.epoch.bump_assigned();
+        let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
         let txn_id = self.alloc_txn_id();
         let commit_seq = {
             let mut wal = self.shared_wal.lock();
@@ -3839,7 +3919,8 @@ impl Database {
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
         self.tables.write().remove(&table_id);
 
-        self.advance_visible(epoch);
+        self.epoch.publish_in_order(epoch);
+        _epoch_guard.disarm();
         Ok(())
     }
 
@@ -3893,6 +3974,7 @@ impl Database {
         let commit_lock = Arc::clone(&self.commit_lock);
         let _c = commit_lock.lock();
         let epoch = self.epoch.bump_assigned();
+        let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
         let txn_id = self.alloc_txn_id();
         let commit_seq = {
             let mut wal = self.shared_wal.lock();
@@ -3932,7 +4014,8 @@ impl Database {
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
         // The in-memory table object is keyed by table_id, not name, so it does
         // not move and live TableHandles remain valid.
-        self.advance_visible(epoch);
+        self.epoch.publish_in_order(epoch);
+        _epoch_guard.disarm();
         Ok(())
     }
 
@@ -3979,6 +4062,7 @@ impl Database {
         let commit_lock = Arc::clone(&self.commit_lock);
         let _c = commit_lock.lock();
         let epoch = self.epoch.bump_assigned();
+        let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
         let txn_id = self.alloc_txn_id();
         let column_json = DdlOp::encode_column(&column)?;
         let commit_seq = {
@@ -4028,7 +4112,8 @@ impl Database {
         }
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
 
-        self.advance_visible(epoch);
+        self.epoch.publish_in_order(epoch);
+        _epoch_guard.disarm();
         Ok(column)
     }
 

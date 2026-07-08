@@ -91,6 +91,14 @@ impl EpochClock {
 /// the in-order reader watermark, advanced only once a committed txn has been
 /// fully published. Readers pin `visible`; writers reserve `assigned`. The two
 /// counters decouple "what order commits happened" from "what is safe to read".
+///
+/// ## Epoch abandonment
+///
+/// An assigned epoch that will never be published (because the operation that
+/// reserved it failed before applying any writes) can be **abandoned** via
+/// [`Self::abandon`]. The in-order watermark advances past abandoned epochs
+/// just as it does for published ones — readers never observe data at an
+/// abandoned epoch because no data was committed there.
 #[derive(Debug)]
 pub struct EpochAuthority {
     assigned: AtomicU64,
@@ -101,6 +109,10 @@ pub struct EpochAuthority {
     /// `Table::commit`, and DDL) so the watermark only ever advances in assigned
     /// order regardless of which path or thread completes first.
     pending: Mutex<BTreeSet<u64>>,
+    /// Epochs that were assigned but will never be published (the operation
+    /// failed after `bump_assigned` but before any writes were applied). The
+    /// watermark skips these just as it would a published epoch.
+    abandoned: Mutex<BTreeSet<u64>>,
 }
 
 impl EpochAuthority {
@@ -109,6 +121,7 @@ impl EpochAuthority {
             assigned: AtomicU64::new(start),
             visible: AtomicU64::new(start),
             pending: Mutex::new(BTreeSet::new()),
+            abandoned: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -141,19 +154,59 @@ impl EpochAuthority {
 
     /// Publish a fully-committed `e` and advance `visible` in assigned order:
     /// `e` becomes visible only once it and every prior assigned epoch have
-    /// also been published (spec §9.3e). Because the pending set lives on the
+    /// also been published (or abandoned). Because the pending set lives on the
     /// shared authority, interleaved commits from different paths/threads can
     /// never make the watermark jump past an epoch whose writes are not yet
-    /// applied. Each assigned epoch must call this exactly once.
+    /// applied. Each assigned epoch must call either this or [`Self::abandon`]
+    /// exactly once.
     pub fn publish_in_order(&self, e: Epoch) {
         let mut pending = self.pending.lock();
+        let mut abandoned = self.abandoned.lock();
         pending.insert(e.0);
         let mut vis = self.visible.load(Ordering::Acquire);
-        while pending.remove(&(vis + 1)) {
-            vis += 1;
+        // Advance past both published and abandoned epochs. An abandoned epoch
+        // has no committed data, so readers correctly skip it.
+        loop {
+            let next = vis + 1;
+            if pending.remove(&next) {
+                vis = next;
+            } else if abandoned.remove(&next) {
+                vis = next;
+            } else {
+                break;
+            }
         }
         // `vis` only ever moves forward here; `publish_visible` is monotonic.
         drop(pending);
+        drop(abandoned);
+        self.publish_visible(Epoch(vis));
+    }
+
+    /// Abandon an assigned epoch that will never be published (the operation
+    /// failed after `bump_assigned` but before any writes were applied). The
+    /// in-order watermark advances past it just as for a published epoch — no
+    /// data exists at an abandoned epoch, so readers correctly skip it.
+    pub fn abandon(&self, e: Epoch) {
+        let mut pending = self.pending.lock();
+        let mut abandoned = self.abandoned.lock();
+        // Remove from pending if it was already published (idempotent).
+        pending.remove(&e.0);
+        // Mark as abandoned so publish_in_order can skip it.
+        abandoned.insert(e.0);
+        // Try to advance the watermark past any now-resolvable holes.
+        let mut vis = self.visible.load(Ordering::Acquire);
+        loop {
+            let next = vis + 1;
+            if pending.remove(&next) {
+                vis = next;
+            } else if abandoned.remove(&next) {
+                vis = next;
+            } else {
+                break;
+            }
+        }
+        drop(pending);
+        drop(abandoned);
         self.publish_visible(Epoch(vis));
     }
 
@@ -234,6 +287,48 @@ mod tests {
 
         // Filling the gap drains everything consecutively in one shot.
         a.publish_in_order(e1);
+        assert_eq!(a.visible(), Epoch(3));
+    }
+
+    #[test]
+    fn abandon_unblocks_watermark() {
+        let a = EpochAuthority::new(0);
+        let e1 = a.bump_assigned();
+        let e2 = a.bump_assigned(); // this one will be abandoned (operation failed)
+        let e3 = a.bump_assigned();
+
+        // e3 is published but can't advance past the e2 hole.
+        a.publish_in_order(e3);
+        assert_eq!(a.visible(), Epoch(0), "e3 gated on e1 and e2");
+
+        // e1 is published — advances to 1, but still gated on e2.
+        a.publish_in_order(e1);
+        assert_eq!(a.visible(), Epoch(1), "e1 visible but e2 hole remains");
+
+        // e2 is abandoned (operation failed) — watermark should advance past it
+        // and drain e3.
+        a.abandon(e2);
+        assert_eq!(a.visible(), Epoch(3), "abandoning e2 drains e3");
+    }
+
+    #[test]
+    fn abandon_before_publish_of_later_epochs() {
+        let a = EpochAuthority::new(0);
+        let e1 = a.bump_assigned();
+        let e2 = a.bump_assigned();
+        let e3 = a.bump_assigned();
+
+        // Abandon e1 first (before e2/e3 are published). The watermark advances
+        // past e1 (no data there), but stops at e2 (not yet published/abandoned).
+        a.abandon(e1);
+        assert_eq!(a.visible(), Epoch(1), "e1 abandoned, watermark at 1, e2 pending");
+
+        // Now publish e2 — should advance to 2.
+        a.publish_in_order(e2);
+        assert_eq!(a.visible(), Epoch(2));
+
+        // Publish e3 — advances to 3.
+        a.publish_in_order(e3);
         assert_eq!(a.visible(), Epoch(3));
     }
 }
