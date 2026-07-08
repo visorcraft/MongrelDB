@@ -333,7 +333,7 @@ impl std::fmt::Debug for Database {
         f.debug_struct("Database")
             .field("root", &self.root)
             .field("db_epoch", &cat.db_epoch)
-            .field("open_generation", &cat.open_generation)
+            .field("open_generation", &"sidecar")
             .field("tables", &cat.tables.len())
             .field("visible_epoch", &self.epoch.visible().0)
             .field("encrypted", &self.kek.is_some())
@@ -751,12 +751,19 @@ impl Database {
 
         // Bump `open_generation` on every open and scope transaction ids by it
         // (`txn_id = (generation << 32) | counter`), so ids never alias across
-        // reopens (review fix #11). Persist the bumped generation to the catalog.
-        if existing {
-            cat.open_generation = cat.open_generation.wrapping_add(1);
-            catalog::write_atomic(&root, &cat, meta_dek.as_ref())?;
-        }
-        let next_txn_id = (cat.open_generation << 32) | 1;
+        // reopens (review fix #11). Persist the bumped generation to a sidecar
+        // file (`_meta/generation`) rather than CATALOG, so CATALOG stays
+        // byte-stable across bare opens for content-addressed storage.
+        let open_generation = if existing {
+            let meta_dir = root.join(META_DIR);
+            let gen = catalog::read_generation(&meta_dir);
+            let bumped = gen.wrapping_add(1);
+            catalog::write_generation(&meta_dir, bumped)?;
+            bumped
+        } else {
+            0
+        };
+        let next_txn_id = (open_generation << 32) | 1;
         // Seed the shared txn-id allocator now that the generation is final.
         *txn_ids.lock() = next_txn_id;
 

@@ -2,7 +2,7 @@
 //!
 //! The catalog records every table's id, name, schema, and live/dropped state
 //! plus the DB-wide monotonic counters (`db_epoch`, `next_table_id`,
-//! `open_generation`, `next_segment_no`). It is rewritten atomically on every
+//! `open_generation` (sidecar), `next_segment_no`). CATALOG is rewritten on
 //! DDL and persisted to `<root>/CATALOG` with:
 //!
 //! - a fixed magic + SHA-256 integrity tag for plaintext, or
@@ -47,14 +47,17 @@ pub struct CatalogEntry {
 }
 
 /// The full in-memory catalog, mirrored on disk by [`write_atomic`].
+///
+/// Note: `open_generation` is intentionally **not** stored here — it bumps on
+/// every open, and keeping it in CATALOG would dirty the working tree even for
+/// a bare read. It lives in a separate sidecar file (`_meta/generation`) that
+/// callers can `.gitignore` for content-addressed storage workflows.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Catalog {
     /// Highest epoch ever assigned by this DB's commit sequencer.
     pub db_epoch: u64,
     /// Next table id to allocate.
     pub next_table_id: u64,
-    /// Bumped (and fsynced) on every open to scope `txn_id` across reopens.
-    pub open_generation: u64,
     /// Next shared-WAL segment number to allocate.
     pub next_segment_no: u64,
     pub tables: Vec<CatalogEntry>,
@@ -79,6 +82,55 @@ pub struct Catalog {
     /// See `docs/15-credential-enforcement.md`.
     #[serde(default)]
     pub require_auth: bool,
+}
+
+/// The `open_generation` counter, stored in `_meta/generation` (NOT in CATALOG).
+/// Bumped on every open to scope `txn_id` across reopens so ids never alias.
+///
+/// Kept as a sidecar so that CATALOG is stable across bare opens — the only
+/// volatile bytes in the database directory during a read-only session are
+/// this 8-byte file + `.lock` + caches, all of which can be `.gitignore`-d.
+pub const GENERATION_FILENAME: &str = "generation";
+
+/// Read `open_generation` from `_meta/generation`. Returns 0 if the file is
+/// missing (first open or after a fresh `create`). On legacy databases that
+/// stored `open_generation` inside CATALOG, the migration path is: if the
+/// sidecar doesn't exist, default to 0 (the counter only needs to be
+/// monotonic within a process's lifetime for txn-id uniqueness).
+pub fn read_generation(meta_dir: &Path) -> u64 {
+    let p = meta_dir.join(GENERATION_FILENAME);
+    match std::fs::read(&p) {
+        Ok(bytes) => {
+            if bytes.len() >= 8 {
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(&bytes[..8]);
+                u64::from_le_bytes(arr)
+            } else {
+                0
+            }
+        }
+        Err(_) => 0,
+    }
+}
+
+/// Write `open_generation` to `_meta/generation` atomically (temp + rename +
+/// fsync). This is intentionally a separate file from CATALOG so that CATALOG
+/// stays byte-stable across bare opens (the generation counter is the only
+/// field that changes on every open).
+pub fn write_generation(meta_dir: &Path, generation: u64) -> Result<()> {
+    std::fs::create_dir_all(meta_dir)?;
+    let tmp = meta_dir.join(format!(".{GENERATION_FILENAME}.tmp"));
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&generation.to_le_bytes())?;
+        f.sync_all()?;
+    }
+    let dest = meta_dir.join(GENERATION_FILENAME);
+    std::fs::rename(&tmp, &dest)?;
+    if let Ok(d) = std::fs::File::open(meta_dir) {
+        let _ = d.sync_all();
+    }
+    Ok(())
 }
 
 impl Catalog {
