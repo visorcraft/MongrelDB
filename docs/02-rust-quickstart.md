@@ -55,9 +55,9 @@ let mut db = Db::create("./mydb", schema, 1).unwrap();
 
 ### Column Flags
 
-- `PRIMARY_KEY` — marks the column as the primary key (enables fast point lookups)
-- `NULLABLE` — the column can contain null values
-- `ENCRYPTED_INDEXABLE` — the column is encrypted but still searchable (requires encryption)
+- `PRIMARY_KEY` - marks the column as the primary key (enables fast point lookups)
+- `NULLABLE` - the column can contain null values
+- `ENCRYPTED_INDEXABLE` - the column is encrypted but still searchable (requires encryption)
 
 ## Writing Data
 
@@ -76,11 +76,11 @@ db.commit().unwrap();  // make it durable
 ```
 
 `put()` always creates a new row. To "update" an existing row, you write a new
-version — MongrelDB keeps track of which version is current.
+version - MongrelDB keeps track of which version is current.
 
 ### Batch Insert
 
-For inserting many rows at once, use `put_batch` — it groups them into one
+For inserting many rows at once, use `put_batch` - it groups them into one
 WAL write:
 
 ```rust
@@ -137,7 +137,7 @@ let name = row.columns.get(&2);
 ### Get the Row Count
 
 ```rust
-let count = db.count();  // O(1) — doesn't scan any data
+let count = db.count();  // O(1) - doesn't scan any data
 ```
 
 ### Delete a Row
@@ -150,7 +150,7 @@ db.commit().unwrap();
 ## Querying with Conditions
 
 The Condition API lets you search using indexes without SQL. You build a
-query by combining conditions — all conditions are ANDed together.
+query by combining conditions - all conditions are ANDed together.
 
 ```rust
 use mongreldb_core::query::{Condition, Query};
@@ -202,7 +202,7 @@ combinations.
 ## SQL Queries (CTEs, Windows, Regex, Catalog)
 
 For analytical queries, joins, and SQL-stdlib features, use `MongrelSession`
-which wraps DataFusion 54. This gives you the full SQL surface — recursive CTEs,
+which wraps DataFusion 54. This gives you the full SQL surface - recursive CTEs,
 window functions, `regexp()`, catalog introspection, and more:
 
 ```rust
@@ -211,7 +211,7 @@ use std::sync::Arc;
 
 let session = MongrelSession::open(Arc::new(db))?;
 
-// Recursive CTE — tree traversal.
+// Recursive CTE - tree traversal.
 let batches = session.run("
     WITH RECURSIVE tree AS (
         SELECT id, parent, 0 AS depth FROM nodes WHERE parent IS NULL
@@ -222,7 +222,7 @@ let batches = session.run("
     SELECT id, depth FROM tree ORDER BY id
 ").await?;
 
-// Window function — ranking within partitions.
+// Window function - ranking within partitions.
 let batches = session.run("
     SELECT category, amount,
            ROW_NUMBER() OVER (PARTITION BY category ORDER BY amount DESC) AS rank
@@ -280,7 +280,7 @@ merges sorted runs and removes obsolete data:
 db.compact().unwrap();  // merges all runs into one, removes dead rows
 ```
 
-Compaction is safe to run while reads are happening — MVCC snapshots ensure
+Compaction is safe to run while reads are happening - MVCC snapshots ensure
 readers see a consistent view.
 
 ## Users, Roles & Permissions
@@ -356,7 +356,7 @@ also explicitly flush and close:
 
 ```rust
 db.flush().unwrap();  // commit + move data to columnar format
-// db is dropped here — Rust's Drop trait handles cleanup
+// db is dropped here - Rust's Drop trait handles cleanup
 ```
 
 ## Reopening
@@ -376,8 +376,8 @@ holds the cross-process lock on `<dir>/_meta/.lock`, the open returns
 `MongrelError::Io` immediately. That mirrors the historical `try_lock_exclusive`
 semantics and lets coordinating callers bring their own retry logic.
 
-If you'd rather have SQLite-style `busy_timeout` semantics — block for up to
-N ms waiting for the lock before giving up — opt in with
+If you'd rather have SQLite-style `busy_timeout` semantics - block for up to
+N ms waiting for the lock before giving up - opt in with
 [`Database::open_with_options`].
 
 ```rust

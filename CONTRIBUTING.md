@@ -55,7 +55,7 @@ cargo test --workspace --all-features
 ```
 
 All three must pass with zero warnings. If a check fails, fix the root
-cause — don't `--no-verify`, don't silence clippy lints with `#[allow(...)]`
+cause - don't `--no-verify`, don't silence clippy lints with `#[allow(...)]`
 unless you justify it in the PR description.
 
 If you touched performance-sensitive code, also run the relevant benchmarks:
@@ -86,7 +86,7 @@ cargo run -p mongreldb-perf --release --bin compare mongrel  # cross-engine matr
 
 - **Edition / toolchain.** Rust 2021, MSRV 1.80. Don't bump the MSRV
   casually.
-- **Formatting.** `cargo fmt --all`. No custom `rustfmt.toml` — the
+- **Formatting.** `cargo fmt --all`. No custom `rustfmt.toml` - the
   default style is canonical.
 - **Linting.** `cargo clippy --workspace --all-targets --all-features
   -- -D warnings` must pass with no warnings.
@@ -110,7 +110,7 @@ cargo run -p mongreldb-perf --release --bin compare mongrel  # cross-engine matr
 - Every blocking method has an `*Async` variant that offloads to
   `spawn_blocking`.
 - Row IDs, counts, and epochs cross the FFI as `BigInt` (not JS Number).
-- Single-row `put` stays synchronous and durable — never route it
+- Single-row `put` stays synchronous and durable - never route it
   through a buffer or background thread.
 
 ### Commit messages
@@ -148,7 +148,7 @@ to solve before proposing the solution.
 ## Security
 
 If you find a vulnerability, **do not** open a public GitHub issue.
-Report it privately through GitHub's private vulnerability reporting —
+Report it privately through GitHub's private vulnerability reporting -
 the repository's **Security** tab → **Report a vulnerability**. The full
 policy is in [`SECURITY.md`](SECURITY.md).
 
@@ -161,4 +161,4 @@ you agree that your changes are made available under the same license.
   done a license review first.
 - New third-party dependencies must be MIT or Apache-2.0 licensed.
 
-Thanks again — looking forward to your PR.
+Thanks again - looking forward to your PR.

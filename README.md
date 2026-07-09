@@ -23,7 +23,7 @@
 ## What is MongrelDB?
 
 MongrelDB is an embedded, single-node database engine optimized for
-**operational workloads** — sub-millisecond single-row writes and updates on a
+**operational workloads** - sub-millisecond single-row writes and updates on a
 custom columnar format, with a rich index set designed for AI-native access
 patterns. **New to MongrelDB? Start with the [docs](docs/).**
 
@@ -32,7 +32,7 @@ Bε-tree memtable keyed by `(RowId, Epoch)`, which flushes to immutable sorted
 runs (`.sr` PAX columnar pages). Single-row durable update: **~7 µs**.
 
 The read path merges memtable + sorted runs under MVCC snapshot isolation. Eight
-index kinds — all resolving through a shared `RowId` space — enable hybrid
+index kinds - all resolving through a shared `RowId` space - enable hybrid
 queries that no single traditional index can serve:
 
 | Index | Type | Use case |
@@ -66,7 +66,7 @@ Measured on 1M rows, dev sandbox (full results in [`BENCHMARKS.md`](BENCHMARKS.m
 | Cold SQL filter (`WHERE cost < 250`) | **8.7 µs** |
 | Cold SQL `COUNT(*)` | **290 µs** |
 | Cold SQL join `COUNT(*)` | **1.16 ms** |
-| Warm result-cache hit (any query) | **0.1–0.3 µs** |
+| Warm result-cache hit (any query) | **0.1-0.3 µs** |
 | Storage | **4.17 bytes/row** (4.17 MB / 1M rows) |
 | `COUNT(*)` metadata | **0 µs** (O(1)) |
 | AES-256-GCM encrypt/decrypt | **~1.88 GiB/s** |
@@ -108,7 +108,7 @@ Bulk insert **2.3× faster than SQLite, 2.6× faster than DuckDB native**. Join
   (`mongreldb_fts_rank`) alongside the `fts_docs` virtual table.
 - **Constraints:** opt-in per-table declarative unique, foreign-key (with
   `RESTRICT`/`CASCADE`/`SET NULL` on delete), and CHECK constraints, enforced
-  inside the core transaction path — no application-side validation required.
+  inside the core transaction path - no application-side validation required.
 - **Arrow bridge:** Constructs `Int64Array`/`Float64Array` directly from typed
   buffers (one memcpy, no per-element builder) for the all-non-null case.
 - **Compaction:** Merges sorted runs with snapshot retention (readers pinning
@@ -137,7 +137,7 @@ Bulk insert **2.3× faster than SQLite, 2.6× faster than DuckDB native**. Join
 - **Authentication:** `CREATE USER` / `CREATE ROLE` / `GRANT` / `REVOKE` with
   Argon2id password hashing. Daemon supports Bearer token (`--auth-token`) and
   HTTP Basic auth (`--auth-users`). **Credential enforcement**
-  (`require_auth`) makes permissions required at the storage layer — every open
+  (`require_auth`) makes permissions required at the storage layer - every open
   and operation is checked against the authenticated principal. Connection
   pooling via `--max-connections`. See
   [Credential Enforcement](docs/15-credential-enforcement.md).
@@ -152,7 +152,7 @@ Bulk insert **2.3× faster than SQLite, 2.6× faster than DuckDB native**. Join
 
 MongrelDB supports optional page-level encryption via AES-256-GCM (enabled
 with the `encryption` feature). The **secret is a passphrase or a raw key
-file** — there is no KMS integration or environment-variable mechanism.
+file** - there is no KMS integration or environment-variable mechanism.
 
 ### Key hierarchy
 
@@ -177,10 +177,10 @@ All key material in memory is wrapped in `Zeroizing` and wiped on drop.
 ### Usage
 
 ```rust
-// Create — generates a random salt, persists it to _meta/keys
+// Create - generates a random salt, persists it to _meta/keys
 let db = Table::create_encrypted(dir, schema, 1, "my-passphrase")?;
 
-// Open — reads the salt, re-derives the same KEK
+// Open - reads the salt, re-derives the same KEK
 let db = Table::open_encrypted(dir, "my-passphrase")?;
 ```
 
@@ -197,8 +197,8 @@ cargo build --release --features encryption
 | WAL segments (`_wal/`) | **Yes** (frame-level AES-256-GCM) |
 | Result cache (`_rcache/`) | **Yes** (AES-256-GCM) |
 | Index checkpoint (`_idx/global.idx`) | **Yes** (AES-256-GCM) |
-| Per-page min/max zone maps | **Yes** — per-run encrypted stats envelope (page pruning without plaintext bounds) |
-| Run header / directory | No — but **authenticated** by a required keyed HMAC (tamper-evident) |
+| Per-page min/max zone maps | **Yes** - per-run encrypted stats envelope (page pruning without plaintext bounds) |
+| Run header / directory | No - but **authenticated** by a required keyed HMAC (tamper-evident) |
 | Manifest / schema | No |
 
 Tampering an encrypted run's cleartext metadata (offsets, page stats, structure)

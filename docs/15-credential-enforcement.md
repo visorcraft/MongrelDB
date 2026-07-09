@@ -1,6 +1,6 @@
 # Credential Enforcement (require_auth)
 
-By default, MongrelDB databases are credentialless — you create one and start
+By default, MongrelDB databases are credentialless - you create one and start
 reading and writing immediately, like SQLite. **Credential enforcement** is an
 opt-in security layer that makes the storage layer require authenticated
 credentials for every read, write, DDL, admin, and SQL operation.
@@ -8,11 +8,11 @@ credentials for every read, write, DDL, admin, and SQL operation.
 When enabled, a database carries `require_auth = true` in its catalog. Every
 subsequent open must supply valid username/password credentials, and every
 operation is checked against the authenticated principal's permissions. A
-stolen database file alone cannot be queried — even with the bytes, an attacker
+stolen database file alone cannot be queried - even with the bytes, an attacker
 needs valid credentials to use the MongrelDB API.
 
 > **Not a substitute for encryption.** Credential enforcement is a
-> *logical-access* control — it gates the MongrelDB API, not the raw bytes.
+> *logical-access* control - it gates the MongrelDB API, not the raw bytes.
 > For data-at-rest protection, combine it with MongrelDB's page-level
 > AES-256-GCM encryption (`create_encrypted_with_credentials`). See
 > [Encryption](07-encryption.md).
@@ -26,7 +26,7 @@ needs valid credentials to use the MongrelDB API.
 use mongreldb_core::Database;
 
 let db = Database::create_with_credentials("./secure_db", "admin", "s3cret-pw")?;
-// db is already authenticated as admin — every operation is checked.
+// db is already authenticated as admin - every operation is checked.
 db.create_table("orders", schema)?;
 ```
 
@@ -110,7 +110,7 @@ To revert a credentialed database to credentialless mode:
 ```rust
 let db = Database::open_with_credentials("./secure_db", "admin", "s3cret-pw")?;
 db.disable_auth()?;
-// The database is now credentialless — plain open works.
+// The database is now credentialless - plain open works.
 ```
 
 **CLI:**
@@ -119,11 +119,11 @@ mongreldb-kit auth disable-offline ./secure_db
 # WARNING: disabling require_auth on ./secure_db
 # This reverts the database to credentialless mode...
 # proceed? [y/N] y
-# require_auth disabled — database is now credentialless
+# require_auth disabled - database is now credentialless
 ```
 
 If credentials are lost entirely, the database directory's catalog file can be
-edited directly (filesystem access required) — see [Threat model](#threat-model)
+edited directly (filesystem access required) - see [Threat model](#threat-model)
 below.
 
 ## How it works
@@ -132,7 +132,7 @@ below.
 
 The catalog (the `_meta/CATALOG` blob that stores table schemas, procedures,
 triggers, users, and roles) has a `require_auth: bool` field. It defaults to
-`false` (backward compatible — old databases open unchanged). When `true`,
+`false` (backward compatible - old databases open unchanged). When `true`,
 every `Database::open` without credentials fails with `AuthRequired`, and every
 operation consults the cached principal's permissions.
 
@@ -165,7 +165,7 @@ time has this flag.
 
 **`All` does not imply `Admin`:** `Permission::All` grants every table-level
 and DDL permission but NOT admin (user/role management). Only `is_admin = true`
-grants admin. This is a deliberate design decision — see the spec §9.
+grants admin. This is a deliberate design decision - see the spec §9.
 
 ### The `AuthState` abstraction
 
@@ -175,8 +175,8 @@ This handle is cloned into every mounted `Table`, so the Table layer can
 enforce without a reference back to `Database` (avoiding a reference cycle).
 
 The `TableAuthChecker` trait lets the daemon (or any future multi-tenant
-layer) provide its own principal source — e.g. one that reads from per-request
-state — while the embedded default reads the open-time cached principal.
+layer) provide its own principal source - e.g. one that reads from per-request
+state - while the embedded default reads the open-time cached principal.
 
 ### Composing with encryption
 
@@ -222,7 +222,7 @@ The key points for enforcement:
 | `Update { table }` | `Update` on that specific table |
 | `Delete { table }` | `Delete` on that specific table |
 
-There are no wildcards — `Select { table: "*" }` matches a table literally
+There are no wildcards - `Select { table: "*" }` matches a table literally
 named `*`. Grant `All` for full access (minus admin).
 
 ## Error types
@@ -238,7 +238,7 @@ named `*`. Grant `All` for full access (minus admin).
 
 The daemon's HTTP auth middleware (Bearer token or HTTP Basic) runs *before*
 the request reaches the storage layer. With credential enforcement, the
-storage layer *also* checks permissions — defense in depth:
+storage layer *also* checks permissions - defense in depth:
 
 ```sh
 # Start the daemon with user auth for a require_auth database.
@@ -263,10 +263,10 @@ doesn't resolve a catalog `Principal` for per-operation checks.
 
 - An attacker with read access to the database *file path* but **not** the
   credentials cannot query, mutate, or enumerate data through the MongrelDB
-  API — even if they copy the bytes. (For encrypted databases, they also
+  API - even if they copy the bytes. (For encrypted databases, they also
   can't decrypt the bytes without the passphrase.)
 - A compromised low-privilege service account cannot escalate beyond its
-  granted permissions — the storage layer enforces what the HTTP layer
+  granted permissions - the storage layer enforces what the HTTP layer
   asserted.
 - Application bugs that forget to check permissions are caught by the storage
   layer anyway.
@@ -278,7 +278,7 @@ doesn't resolve a catalog `Principal` for per-operation checks.
   encryption or HSM-backed keys for that layer.
 - An attacker who can write to `_meta/` and call `disable_auth` (or edit the
   catalog file). Filesystem permissions on the database directory are the
-  boundary — document this in your operations runbook.
+  boundary - document this in your operations runbook.
 - Brute-force of weak passwords. Argon2id (~50ms/verify) limits online
   guessing to ~20/sec/core. For offline brute-force of a stolen hash, the same
   Argon2id cost applies. v1 does not implement lockout/throttling.

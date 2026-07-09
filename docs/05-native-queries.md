@@ -1,12 +1,12 @@
 # Native Queries (Condition API)
 
 The Condition API is MongrelDB's signature feature. Instead of SQL strings,
-you build queries by composing typed conditions — each backed by a specific
+you build queries by composing typed conditions - each backed by a specific
 index. This lets you combine search modes that no SQL engine can express in
 a single query.
 
 For example, you can find rows that **contain text "rust"** AND **are within
-a price range** AND **are semantically similar to a vector** — all in one
+a price range** AND **are semantically similar to a vector** - all in one
 call, with each condition resolved by its own index.
 
 ## Building a Query
@@ -32,7 +32,7 @@ let q = Query::new()
 let results = db.query(&q).unwrap();
 ```
 
-All conditions are ANDed together — a row must match every condition to be
+All conditions are ANDed together - a row must match every condition to be
 in the result set.
 
 ## Condition Types
@@ -43,7 +43,7 @@ in the result set.
 Condition::Pk(42i64.to_be_bytes().to_vec())
 ```
 
-Finds the single row with primary key 42. Uses the HOT trie index — O(log n)
+Finds the single row with primary key 42. Uses the HOT trie index - O(log n)
 point lookup. This is the fastest way to fetch one row.
 
 ### Bitmap Equality
@@ -55,7 +55,7 @@ Condition::BitmapEq {
 }
 ```
 
-Finds all rows where column 2 equals "premium". Uses a Roaring bitmap — each
+Finds all rows where column 2 equals "premium". Uses a Roaring bitmap - each
 distinct value maps to a compressed bitmap of row IDs. Best for columns with
 a small number of distinct values (categories, statuses, regions).
 
@@ -82,7 +82,7 @@ Condition::Range {
 ```
 
 Finds rows where column 5 is between 1700000000 and 1700001000 (inclusive).
-Uses the PGM learned index — a machine-learning model that predicts where
+Uses the PGM learned index - a machine-learning model that predicts where
 values are located in the sorted data, giving sub-linear lookup time.
 
 ### Range (Float)
@@ -110,7 +110,7 @@ Condition::FmContains {
 ```
 
 Finds rows where column 4 contains the text "database" anywhere. Uses a
-Burrows-Wheeler Transform + wavelet tree — the same family of techniques
+Burrows-Wheeler Transform + wavelet tree - the same family of techniques
 used by full-text search engines. Searches in time proportional to the
 pattern length, not the data size.
 
@@ -125,7 +125,7 @@ Condition::Ann {
 ```
 
 Finds the 10 rows whose embedding vector (stored in column 6) is closest to
-the query vector. Uses HNSW (Hierarchical Navigable Small World) — a graph
+the query vector. Uses HNSW (Hierarchical Navigable Small World) - a graph
 index that gives approximate nearest neighbor search with recall@10 ≥ 90%.
 
 ### Sparse Retrieval (SPLADE-style)
@@ -154,7 +154,7 @@ Condition::BytesPrefix {
 
 Finds rows where column 2 (a `Bytes` column with a bitmap index) starts with the
 bytes `user:`. This is the exact equivalent of SQL `LIKE 'prefix%'` (no
-wildcards in `prefix`), but resolves **exactly** — the bitmap's distinct keys are
+wildcards in `prefix`), but resolves **exactly** - the bitmap's distinct keys are
 enumerated and filtered by prefix, with no residual re-check. Tighter and faster
 than `FmContains` for anchored matches on indexed Bytes columns. Returns an empty
 set if the column has no bitmap index.
@@ -179,7 +179,7 @@ Condition::FmContainsAll {
 ```
 
 Like `FmContains` but intersects multiple substrings (`LIKE '%a%b%c%'`). Returns
-a superset — the caller re-checks order/wildcards if needed.
+a superset - the caller re-checks order/wildcards if needed.
 
 ### Set similarity (MinHash / LSH)
 
@@ -236,11 +236,11 @@ const ipc = table.queryArrow([
 ## Combining Conditions
 
 This is where the Condition API shines. You can mix any conditions on any
-columns — they all resolve through the shared RowId space:
+columns - they all resolve through the shared RowId space:
 
 ```rust
 // "Find premium users, in a price range, whose profile mentions 'rust',
-//  and whose embedding is close to this vector — top 5 by similarity"
+//  and whose embedding is close to this vector - top 5 by similarity"
 let q = Query::new()
     .and(Condition::BitmapEq {
         column_id: 2,
@@ -271,7 +271,7 @@ storage into row objects).
 ## Projection
 
 By default, `query()` returns all columns. To fetch only specific columns
-(faster — less decoding):
+(faster - less decoding):
 
 ```rust
 let snap = db.snapshot();
@@ -282,7 +282,7 @@ let cols = db.query_columns_native(
 ).unwrap();
 ```
 
-This returns `NativeColumn` typed buffers instead of `Row` objects — even
+This returns `NativeColumn` typed buffers instead of `Row` objects - even
 faster for bulk processing.
 
 ## Cached Queries

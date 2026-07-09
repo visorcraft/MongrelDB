@@ -193,7 +193,7 @@ const vips = tableFromIPC(await db.sql('SELECT * FROM vip ORDER BY id'));
 ```
 
 The `Database` caches its SQL session for the database's lifetime, so
-session-scoped objects — views, prepared statements, the result cache — persist
+session-scoped objects - views, prepared statements, the result cache - persist
 across `sql()` calls. Closing and reopening the database starts a fresh session
 (re-apply any view-defining migrations then).
 
@@ -202,7 +202,7 @@ across `sql()` calls. Closing and reopening the database starts a fresh session
 The SQL surface (`db.sql()`) runs DataFusion 54, which supports a rich SQL
 dialect. These features are all accessible through `await db.sql(sql)`:
 
-**Recursive CTEs** — tree traversal, hierarchy queries:
+**Recursive CTEs** - tree traversal, hierarchy queries:
 
 ```javascript
 const { tableFromIPC } = require('apache-arrow');
@@ -218,7 +218,7 @@ const batches = tableFromIPC(await db.sql(`
 `));
 ```
 
-**Window functions** — rankings, running totals, time-series:
+**Window functions** - rankings, running totals, time-series:
 
 ```javascript
 const result = tableFromIPC(await db.sql(`
@@ -229,7 +229,7 @@ const result = tableFromIPC(await db.sql(`
 `));
 ```
 
-**Regex matching** — `regexp('pattern', value)` returns 1 (match) or 0:
+**Regex matching** - `regexp('pattern', value)` returns 1 (match) or 0:
 
 ```javascript
 const matched = tableFromIPC(await db.sql(
@@ -237,7 +237,7 @@ const matched = tableFromIPC(await db.sql(
 ));
 ```
 
-**Catalog introspection** — `information_schema.tables` lists tables, views, and triggers:
+**Catalog introspection** - `information_schema.tables` lists tables, views, and triggers:
 
 ```javascript
 const catalog = tableFromIPC(await db.sql(
@@ -245,7 +245,7 @@ const catalog = tableFromIPC(await db.sql(
 ));
 ```
 
-**Cross-database queries** — `ATTACH` opens a second database:
+**Cross-database queries** - `ATTACH` opens a second database:
 
 ```javascript
 await db.sql("ATTACH '/path/to/other-db' AS other");
@@ -255,7 +255,7 @@ const crossDb = tableFromIPC(await db.sql(
 await db.sql('DETACH other');
 ```
 
-**Sub-transactions** — `SAVEPOINT` within a `BEGIN`/`COMMIT` block:
+**Sub-transactions** - `SAVEPOINT` within a `BEGIN`/`COMMIT` block:
 
 ```javascript
 await db.sql('BEGIN');
@@ -351,7 +351,7 @@ const { Database } = require('./index.js');
 // Create a database that requires credentials for every operation.
 const db = Database.createWithCredentials('./mydb', 'admin', 's3cret-pw');
 
-// Reopen requires credentials — plain Database.open fails.
+// Reopen requires credentials - plain Database.open fails.
 const db2 = Database.openWithCredentials('./mydb', 'admin', 's3cret-pw');
 
 // Convert an existing credentialless database.

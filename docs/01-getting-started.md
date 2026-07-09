@@ -2,7 +2,7 @@
 
 ## What is MongrelDB?
 
-MongrelDB is an embedded database — meaning it runs inside your application
+MongrelDB is an embedded database - meaning it runs inside your application
 process, not as a separate server. Think of it like SQLite: no separate
 database server to install or manage. You add it to your project, open a
 file on disk, and start reading and writing data.
@@ -68,7 +68,7 @@ npm install
 npm run build
 ```
 
-This produces `mongreldb.<platform>.node` — a native addon you can `require()`
+This produces `mongreldb.<platform>.node` - a native addon you can `require()`
 from JavaScript. See [Node.js Quick Start](03-nodejs-quickstart.md) for details.
 
 ## Your First Database
@@ -126,7 +126,7 @@ fn main() {
     let row = db.get(row_id, snap).unwrap();
     println!("Name: {:?}", row.columns.get(&2));  // prints "Alice"
 
-    // 6. Get the row count (instant — doesn't scan the data)
+    // 6. Get the row count (instant - doesn't scan the data)
     println!("Row count: {}", db.count());
 }
 ```
@@ -143,13 +143,13 @@ cargo run --release
 
 A MongrelDB table has a fixed set of columns defined by a schema. Each column
 has a type (`Int64`, `Float64`, `Bytes` for text/binary, `Bool`). Each row has
-a unique `RowId` — an internal ID assigned by the database.
+a unique `RowId` - an internal ID assigned by the database.
 
 ### Writes Are Append-Only
 
 When you write or update a row, MongrelDB doesn't modify the old data in place.
 Instead, it appends the new version to a write-ahead log (WAL). This is what
-makes writes so fast — there's no random-access disk I/O, just sequential
+makes writes so fast - there's no random-access disk I/O, just sequential
 appends. Old data gets cleaned up later during a process called compaction.
 
 ### Commits
@@ -161,14 +161,14 @@ which commits and then moves data from the WAL into the columnar storage format.
 
 ### Snapshots
 
-Reading always happens at a specific "snapshot" — a point-in-time view of the
+Reading always happens at a specific "snapshot" - a point-in-time view of the
 data. This means writes happening while you read don't affect your results.
 Get a snapshot with `db.snapshot()`, then pass it to read methods.
 
 ## Next Steps
 
-- [Rust Quick Start](02-rust-quickstart.md) — full API walkthrough
-- [Node.js Quick Start](03-nodejs-quickstart.md) — JavaScript/TypeScript guide
-- [SQL Queries](04-sql-queries.md) — running SQL with DataFusion
-- [Indexes](06-indexes.md) — choosing the right index for your queries
-- [Encryption](07-encryption.md) — protecting data at rest
+- [Rust Quick Start](02-rust-quickstart.md) - full API walkthrough
+- [Node.js Quick Start](03-nodejs-quickstart.md) - JavaScript/TypeScript guide
+- [SQL Queries](04-sql-queries.md) - running SQL with DataFusion
+- [Indexes](06-indexes.md) - choosing the right index for your queries
+- [Encryption](07-encryption.md) - protecting data at rest

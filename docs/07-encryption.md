@@ -7,7 +7,7 @@ storage disk.
 
 ## The Short Version
 
-You control encryption with a **passphrase** — a string you choose. There's no
+You control encryption with a **passphrase** - a string you choose. There's no
 key file to manage, no environment variable to set, no cloud KMS to configure.
 If you have the passphrase, you can read the data. If you don't, you can't.
 
@@ -19,8 +19,8 @@ let db = Db::create_encrypted("./mydb", schema, 1, "my-secret-passphrase")?;
 let db = Db::open_encrypted("./mydb", "my-secret-passphrase")?;
 ```
 
-That's it. Everything else — key derivation, per-page encryption, key wrapping
-— happens automatically.
+That's it. Everything else - key derivation, per-page encryption, key wrapping
+- happens automatically.
 
 ## Enabling the Feature
 
@@ -41,9 +41,9 @@ system. You don't need to understand this to use encryption, but it helps to
 know why it's secure:
 
 1. **Passphrase → KEK.** Your passphrase is run through Argon2id (a
-   memory-hard key derivation function that's deliberately slow — about 19 MB
+   memory-hard key derivation function that's deliberately slow - about 19 MB
    of memory and 2 iterations). This produces a 256-bit Key-Encryption Key
-   (KEK). A random 16-byte salt is stored on disk (the salt is not secret —
+   (KEK). A random 16-byte salt is stored on disk (the salt is not secret -
    its purpose is to ensure different databases with the same passphrase
    produce different keys).
 
@@ -57,7 +57,7 @@ know why it's secure:
    search) without revealing the plaintext. This uses HMAC for equality
    tokens and order-preserving encryption (OPE) for range queries.
 
-All keys in memory are held in `Zeroizing` wrappers — they're overwritten
+All keys in memory are held in `Zeroizing` wrappers - they're overwritten
 with zeros when no longer needed.
 
 ## What Gets Encrypted
@@ -87,7 +87,7 @@ let key = std::fs::read("my.key")?;  // 32+ bytes of random data
 let db = Db::create_with_key(dir, schema, 1, &key)?;
 let db = Db::open_with_key(dir, &key)?;
 ```
-Skips Argon2id — uses HKDF-SHA256 only (~0.1ms). The key must already be
+Skips Argon2id - uses HKDF-SHA256 only (~0.1ms). The key must already be
 high-entropy (generate one with `openssl rand 32 > my.key`).
 
 Both paths produce the same KEK; all downstream encryption (sorted runs, WAL,
@@ -117,7 +117,7 @@ MongrelDB will:
 - The bitmap/HOT indexes use the token, so they work without decrypting
 
 This means `Condition::BitmapEq { column_id: 2, value: ... }` still works
-on encrypted columns — the value is tokenized the same way before lookup.
+on encrypted columns - the value is tokenized the same way before lookup.
 
 ## Performance
 
@@ -130,7 +130,7 @@ In practice, encryption adds less than 5% overhead to bulk operations:
 | Cold SQL filter | 7.5 ms | 7.3 ms | negligible |
 | SQL join | 1.68 ms | 1.49 ms | negligible |
 
-(The encrypted path is sometimes faster due to differences in run layout —
+(The encrypted path is sometimes faster due to differences in run layout -
 this is within measurement noise. Encrypted columns prune pages via a
 decrypted-at-open stats envelope, so filtered reads scan the same page count
 as plaintext.)
@@ -141,7 +141,7 @@ If you lose the passphrase, the data is unrecoverable. There is no back door,
 no recovery key, no master override. The KEK cannot be reconstructed without
 the passphrase, and the DEKs cannot be unwrapped without the KEK.
 
-Store your passphrase securely — a password manager, a secrets service, or
+Store your passphrase securely - a password manager, a secrets service, or
 wherever you store other critical credentials.
 
 ## Composing with credential enforcement

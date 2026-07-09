@@ -3,8 +3,8 @@
 MongrelDB ships a catalog-stored authentication system: **users** with
 Argon2id-hashed passwords, **roles** that group permissions, and a
 `GRANT`/`REVOKE` model for table-level access control. The same model is
-exposed through four surfaces — the embedded Rust API, the Node.js NAPI
-addon, the Python binding, and the HTTP daemon — and through SQL DDL
+exposed through four surfaces - the embedded Rust API, the Node.js NAPI
+addon, the Python binding, and the HTTP daemon - and through SQL DDL
 (`CREATE USER`, `GRANT`, …).
 
 Users and roles live **inside the catalog** alongside tables, procedures, and
@@ -12,18 +12,18 @@ triggers. They are invisible to `table_names()` and never collide with your
 own table names. Old database files without users deserialize with empty
 user/role lists, so enabling auth is always backward-compatible.
 
-> Passwords are hashed with **Argon2id** (19 MiB memory, t=2, p=1 — the same
+> Passwords are hashed with **Argon2id** (19 MiB memory, t=2, p=1 - the same
 > OWASP-recommended parameters used for the encryption KEK). Plaintext
 > passwords are never stored or logged.
 
 ## Concepts
 
-- **User** — an identity with a unique username and an Argon2id password hash.
+- **User** - an identity with a unique username and an Argon2id password hash.
   An `is_admin` flag short-circuits all permission checks.
-- **Role** — a named bundle of permissions. Users belong to zero or more
+- **Role** - a named bundle of permissions. Users belong to zero or more
   roles; their effective permissions are the union of permissions across all
   their roles.
-- **Permission** — one of:
+- **Permission** - one of:
   | Permission | Meaning |
   | --- | --- |
   | `All` | Every permission on every table (`GRANT ALL`). |
@@ -36,7 +36,7 @@ user/role lists, so enabling auth is always backward-compatible.
 
   `All` satisfies any required permission; otherwise the permission kinds
   must match exactly (a `Select` does not satisfy an `Insert`). Table names
-  are matched literally — `"*"` is a real table name, not a wildcard.
+  are matched literally - `"*"` is a real table name, not a wildcard.
 
 ## SQL DDL
 
@@ -229,7 +229,7 @@ mongreldb-kit role drop   ./my_database analyst
 
 ## Daemon (HTTP) authentication
 
-`mongreldb-server` supports three auth modes — they can be combined:
+`mongreldb-server` supports three auth modes - they can be combined:
 
 1. **Token** (`--auth-token <token>`): every request must carry
    `Authorization: Bearer <token>`.
@@ -266,7 +266,7 @@ curl -X POST http://127.0.0.1:8453/sql \
 
 ## Enforcement: advisory vs. required
 
-By default, the permissions described above are **advisory** — the catalog
+By default, the permissions described above are **advisory** - the catalog
 stores users, roles, and permissions, but nothing enforces them at the storage
 layer. Application code can call `db.check_permission(username, &perm)` to
 consult the catalog, but reads and writes themselves are not gated.
@@ -279,7 +279,7 @@ the storage layer. When a database's catalog has `require_auth = true`:
 - Every `Table`/`Transaction`/`MongrelSession` operation is checked against the
   authenticated principal's permissions. Insufficient permissions return
   `PermissionDenied`.
-- A stolen database file alone cannot be queried — valid credentials are
+- A stolen database file alone cannot be queried - valid credentials are
   required to use the MongrelDB API.
 
 This is opt-in per database. Existing credentialless databases open unchanged.
@@ -290,7 +290,7 @@ use mongreldb_core::Database;
 // Create a database with require_auth = true and one admin user.
 let db = Database::create_with_credentials("./my_db", "admin", "s3cret-pw")?;
 
-// Reopen requires credentials — plain open fails.
+// Reopen requires credentials - plain open fails.
 let db = Database::open_with_credentials("./my_db", "admin", "s3cret-pw")?;
 ```
 
@@ -314,5 +314,5 @@ recovery procedures, see
   auth file to back up.
 - **Performance.** `verify_user` runs one Argon2id hash comparison (~50 ms
   on typical hardware). The daemon caches the resolved `Principal` for the
-  lifetime of the request only — for high-QPS authenticated workloads,
+  lifetime of the request only - for high-QPS authenticated workloads,
   prefer the Bearer token mode, which is a single string compare.

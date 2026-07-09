@@ -27,10 +27,10 @@ MongrelDB supports optional page-level encryption using AES-256-GCM
 
 The optional HTTP daemon (`mongreldb-server`) has these properties:
 
-- Binds to `127.0.0.1` only — not accessible from other machines.
-- **No authentication** — any local process can query, write, or
+- Binds to `127.0.0.1` only - not accessible from other machines.
+- **No authentication** - any local process can query, write, or
   delete data.
-- No TLS — traffic is plaintext on the loopback interface.
+- No TLS - traffic is plaintext on the loopback interface.
 - No rate limiting or request size caps.
 
 For remote access or multi-tenant environments, place a reverse proxy
@@ -42,8 +42,8 @@ not expose the daemon directly to a network.
 - SQL queries are parsed by DataFusion 54, which applies its own input
   validation and parameterization.
 - The native Condition API accepts typed parameters (column IDs, value
-  bytes, numeric ranges) — no string interpolation, no injection surface.
-- Bulk-load paths accept typed buffers (`NativeColumn`) — invalid
+  bytes, numeric ranges) - no string interpolation, no injection surface.
+- Bulk-load paths accept typed buffers (`NativeColumn`) - invalid
   buffer lengths are rejected by the `validate()` method on
   deserialization.
 

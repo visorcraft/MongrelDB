@@ -1,7 +1,7 @@
 # Daemon Mode (mongrelDB-server)
 
 By default, MongrelDB runs embedded inside your application. But sometimes
-you want a long-lived database process that multiple applications can share —
+you want a long-lived database process that multiple applications can share -
 like a traditional database server, but lightweight.
 
 The `mongreldb-server` daemon solves this. It opens the database once, keeps
@@ -57,7 +57,7 @@ mongreldb-server ./my_database --daemon --pidfile /var/run/mongreldb.pid
 mongreldb-server ./my_database --daemon --port 8453 --auth-token my-secret --passphrase my-encryption-key
 ```
 
-The server handles `SIGINT` (Ctrl+C) and `SIGTERM` gracefully — it flushes all
+The server handles `SIGINT` (Ctrl+C) and `SIGTERM` gracefully - it flushes all
 tables, writes pending data to disk, removes the PID file, and exits with code 0.
 
 ## Keeping the daemon running (auto-restart)
@@ -182,10 +182,10 @@ self-healing mechanisms.
 
 ## Authentication
 
-The daemon supports three auth modes — they can be combined:
+The daemon supports three auth modes - they can be combined:
 
 1. **Token** (`--auth-token <token>`): every request must carry
-   `Authorization: Bearer <token>`. A single string compare — fast.
+   `Authorization: Bearer <token>`. A single string compare - fast.
 2. **User** (`--auth-users`): every request must carry
    `Authorization: Basic <base64(user:pass)>` against a catalog user
    (Argon2id-verified). The matching `Principal` is injected into request
@@ -196,13 +196,13 @@ The daemon supports three auth modes — they can be combined:
 When no flag is set (the default), auth is disabled for local development.
 
 ```sh
-# Token only — fastest for service-to-service traffic.
+# Token only - fastest for service-to-service traffic.
 mongreldb-server ./my_database 8453 --auth-token my-secret-token
 
-# User auth — per-identity credentials, verified against the catalog.
+# User auth - per-identity credentials, verified against the catalog.
 mongreldb-server ./my_database 8453 --auth-users
 
-# Both — token OR valid user accepted.
+# Both - token OR valid user accepted.
 mongreldb-server ./my_database 8453 --auth-token my-secret-token --auth-users --max-connections 100
 ```
 
@@ -237,7 +237,7 @@ When a database has `require_auth = true` (see
 [Credential Enforcement](15-credential-enforcement.md)), the daemon **must**
 run with `--auth-users` (or `--auth-users` plus `--auth-token`). Token-only
 mode (`--auth-token` without `--auth-users`) is insufficient because it does
-not resolve a catalog `Principal` — the storage layer needs a real user to
+not resolve a catalog `Principal` - the storage layer needs a real user to
 check per-operation permissions.
 
 With `--auth-users`, each request's HTTP Basic credentials are verified against
@@ -417,7 +417,7 @@ db.compactTable('events');
 The daemon holds the `Database` open with all indexes in memory. HTTP
 requests are handled asynchronously (axum + tokio), with an optional
 concurrency limit. Because the indexes and caches stay warm between requests,
-repeated queries are fast — warm result-cache hits return in ~0.1 µs.
+repeated queries are fast - warm result-cache hits return in ~0.1 µs.
 
 ## Security
 

@@ -54,10 +54,10 @@ class TableHandle {
 }
 ```
 
-### Hybrid query — the differentiator
+### Hybrid query - the differentiator
 
 `query` intersects row-id sets from any combination of the six index types in a
-single in-process call — something no HTTP vector DB or SQL FTS pipeline can do
+single in-process call - something no HTTP vector DB or SQL FTS pipeline can do
 in one hop:
 
 ```ts

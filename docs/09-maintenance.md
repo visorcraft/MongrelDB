@@ -2,7 +2,7 @@
 
 MongrelDB is log-structured: writes append to a WAL, then flush to
 immutable `.sr` (sorted run) files. Over time, frequent writes create
-multiple runs per table — which is fine (readers merge them under MVCC),
+multiple runs per table - which is fine (readers merge them under MVCC),
 but query latency is best when each table has one clean run. Compaction
 merges all runs back into one.
 
@@ -12,7 +12,7 @@ merges all runs back into one.
 
 | Pattern | Runs accumulate? | Action |
 |---|---|---|
-| Daemon (long-lived) | Auto-compacted every 30s | None — the background sweep handles it |
+| Daemon (long-lived) | Auto-compacted every 30s | None - the background sweep handles it |
 | CLI / embedded (open, write, close) | One tiny run per invocation | Compact periodically (cron) or on startup |
 | Bulk load + occasional updates | Few runs | Compact after a burst of updates |
 
@@ -27,7 +27,7 @@ let run_count = db.table("events")?.lock().run_count();
 
 If you're running `mongreldb-server`, a background thread sweeps every
 table every 30 seconds and compacts any with 8+ runs. No configuration
-needed — this is always on.
+needed - this is always on.
 
 ### Manual compaction
 
@@ -39,7 +39,7 @@ mongreldb-kit-cli compact /path/to/db
 ```
 
 This opens the database, compacts every table, and exits. Safe to run
-at any time — readers pin their own snapshot and are unaffected.
+at any time - readers pin their own snapshot and are unaffected.
 
 #### HTTP (daemon)
 
@@ -105,7 +105,7 @@ Or against a running daemon:
 
 ### What compaction does
 
-1. Reads all live rows across every sorted run (honoring MVCC — readers
+1. Reads all live rows across every sorted run (honoring MVCC - readers
    with pinned snapshots are unaffected).
 2. Writes a single new clean `.sr` run.
 3. Atomically swaps the table's run list to the new run.
@@ -120,7 +120,7 @@ the pre-compaction state intact.
 
 For short-lived processes (CLI invocations, one-shot scripts), MongrelDB
 provides an explicit close that force-flushes pending writes to a `.sr`
-run before exit. This keeps WAL segments bounded — without it, each
+run before exit. This keeps WAL segments bounded - without it, each
 process leaves unflushed WAL data that accumulates across invocations.
 
 The CLI calls `close()` automatically after every write command. In
@@ -131,7 +131,7 @@ application code:
 db.close()?;  // force-flush + exit
 
 // Rust (core)
-db.close()?;  // same — sweeps all tables
+db.close()?;  // same - sweeps all tables
 ```
 
 ```typescript

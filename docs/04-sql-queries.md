@@ -33,7 +33,7 @@ session.register_db("orders", orders_db).await?;
 let batches = session.run("SELECT * FROM users WHERE score > 90").await?;
 ```
 
-`batches` is a `Vec<RecordBatch>` — Arrow's in-memory columnar format. Each
+`batches` is a `Vec<RecordBatch>` - Arrow's in-memory columnar format. Each
 batch holds up to 65,536 rows.
 
 ### Multi-statement execution
@@ -84,7 +84,7 @@ before any data is scanned. This is called **predicate pushdown**:
 
 | SQL pattern | Index used | Behavior |
 |---|---|---|
-| `col = 'value'` | Bitmap or PK | Exact — returns only matching rows |
+| `col = 'value'` | Bitmap or PK | Exact - returns only matching rows |
 | `col IN ('a', 'b', 'c')` | Bitmap union | Exact |
 | `col > 5`, `col BETWEEN 1 AND 10` | PGM learned index / page prune | Exact |
 | `col LIKE '%text%'` | FM-index | Returns a superset (DataFusion re-checks) |
@@ -93,7 +93,7 @@ before any data is scanned. This is called **predicate pushdown**:
 
 Conditions that MongrelDB can't push down (complex expressions, OR logic)
 are handled by DataFusion's own filter after the scan. This is always correct
-— pushdown only makes things faster, never wrong.
+- pushdown only makes things faster, never wrong.
 
 ## Special UDFs
 
@@ -127,11 +127,11 @@ Repeated SQL queries return instantly from cache. The cache is keyed by
 stale results automatically:
 
 ```rust
-// First run — actually executes the query
+// First run - actually executes the query
 let r1 = session.run("SELECT count(*) FROM users WHERE score > 90").await?;
 // ~7 ms
 
-// Second run — cache hit, returns pre-computed result
+// Second run - cache hit, returns pre-computed result
 let r2 = session.run("SELECT count(*) FROM users WHERE score > 90").await?;
 // ~0.1 µs
 
@@ -139,7 +139,7 @@ let r2 = session.run("SELECT count(*) FROM users WHERE score > 90").await?;
 db.put(new_row).unwrap();
 db.commit().unwrap();
 
-// Third run — cache miss, re-executes
+// Third run - cache miss, re-executes
 let r3 = session.run("SELECT count(*) FROM users WHERE score > 90").await?;
 // ~7 ms
 ```
@@ -179,20 +179,20 @@ DROP VIEW IF EXISTS active_users;
 Views are invalidated on commit just like regular cached queries.
 
 > **Views are session-scoped, not persisted.** A view lives in the `MongrelSession`
-> that created it — it is not written to the catalog or WAL. The NAPI addon's
+> that created it - it is not written to the catalog or WAL. The NAPI addon's
 > `Database` and the Kit's `Database` cache one session for the database's
 > lifetime, so a view created via `db.sql("CREATE VIEW ...")` persists across
 > subsequent `sql()` calls on the same handle. Closing and reopening the database
 > starts a fresh session (re-apply any view-defining migrations then). The daemon
 > opens a fresh session per `/sql` HTTP request, so views do **not** persist
-> across daemon calls — define them in a long-lived application process instead.
+> across daemon calls - define them in a long-lived application process instead.
 
 ### Node.js example
 
 ```javascript
 import { tableFromIPC } from 'apache-arrow';
 
-// Create the view, then query it in a second sql() call — both hit the same
+// Create the view, then query it in a second sql() call - both hit the same
 // cached session on the Database handle.
 await db.sql('CREATE VIEW vip AS SELECT id, email FROM users WHERE score >= 90');
 const vips = tableFromIPC(await db.sql('SELECT * FROM vip ORDER BY id'));
@@ -201,7 +201,7 @@ const vips = tableFromIPC(await db.sql('SELECT * FROM vip ORDER BY id'));
 ## Materialized Views (CREATE MATERIALIZED VIEW)
 
 A materialized view physically materializes its defining query as a real
-table — the data is stored, not computed on read. This is useful for
+table - the data is stored, not computed on read. This is useful for
 expensive aggregations or joins that are queried frequently.
 
 ```sql
@@ -210,11 +210,11 @@ CREATE MATERIALIZED VIEW daily_totals AS
   SELECT date_trunc('day', created_at) AS day, SUM(amount) AS total
   FROM orders GROUP BY day;
 
--- Query it like a regular table — no recomputation.
+-- Query it like a regular table - no recomputation.
 SELECT * FROM daily_totals WHERE day > '2026-01-01';
 ```
 
-Materialized views are physically tables — they occupy storage and support
+Materialized views are physically tables - they occupy storage and support
 indexes. The defining SQL is stored so the view can be refreshed
 (re-materialized) in a future release. To drop one, use `DROP TABLE` or
 `DROP MATERIALIZED VIEW`.
@@ -232,7 +232,7 @@ Create a new table and populate it from a query in one statement. The schema
 CREATE TABLE high_value_orders AS
   SELECT * FROM orders WHERE amount > 1000;
 
--- The new table is a regular table — add indexes, query it, etc.
+-- The new table is a regular table - add indexes, query it, etc.
 SELECT count(*) FROM high_value_orders;
 ```
 
@@ -249,7 +249,7 @@ min/max/null_count statistics. DataFusion uses these to answer `MIN(col)`,
 ## Recursive CTEs (`WITH RECURSIVE`)
 
 MongrelDB supports `WITH RECURSIVE` for tree traversal, graph queries, and
-hierarchical aggregation — the full DataFusion 54 recursive-CTE engine:
+hierarchical aggregation - the full DataFusion 54 recursive-CTE engine:
 
 ```sql
 WITH RECURSIVE tree AS (
@@ -263,7 +263,7 @@ SELECT id, depth FROM tree ORDER BY id;
 
 ## Window Functions (`OVER` / `PARTITION BY`)
 
-Standard SQL window functions are supported natively via DataFusion — `ROW_NUMBER()`,
+Standard SQL window functions are supported natively via DataFusion - `ROW_NUMBER()`,
 `RANK()`, `DENSE_RANK()`, `LAG()`, `LEAD()`, `FIRST_VALUE()`, `LAST_VALUE()`,
 `NTILE()`, `PERCENT_RANK()`, `CUME_DIST()`, and aggregate windows (`SUM() OVER`,
 `AVG() OVER` with optional `ROWS`/`RANGE` frames):
