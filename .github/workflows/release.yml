@@ -20,6 +20,13 @@
 # view/analyze/vacuum migration ops). mongreldb-core publishes first, since
 # mongreldb-query depends on it and crates.io strips path deps at publish time.
 #
+# Job graph (max parallelism, native arch runners — no QEMU):
+#   wave 1 (parallel): publish-crate · build-addon[x64|arm64] · image-amd64 · image-arm64
+#   wave 2 (parallel): publish-npm (needs build-addon) · image-manifest (needs image-amd64+arm64)
+#   wave 3:            release-linux/darwin-binaries (needs publish-npm + publish-crate)
+# The arm64 addon .node and arm64 server image build on ubuntu-24.04-arm
+# (native, free for public repos), avoiding hours of QEMU emulation.
+#
 # Requires repo secrets:
 #   NPM_TOKEN            — granular npm token, read+write on @visorcraft
 #   CARGO_REGISTRY_TOKEN — crates.io API token, publish scope
@@ -36,50 +43,6 @@ permissions:
   packages: write
 
 jobs:
-  publish:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: crates/mongreldb-node
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: stable
-          targets: aarch64-unknown-linux-gnu
-
-      - uses: Swatinem/rust-cache@v2.9.1
-        with:
-          workspaces: crates/mongreldb-node
-
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 24
-          registry-url: https://registry.npmjs.org
-          scope: '@visorcraft'
-
-      - run: npm ci
-
-      - run: npm run build
-
-      - run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
-
-      - run: npx napi build --release --platform --strip --target aarch64-unknown-linux-gnu --js false
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
-
-      - run: test -f mongreldb.linux-arm64-gnu.node
-
-      # Sanity gate: the freshly built addon must load before we publish.
-      - run: node -e "require('./index.js'); console.log('addon loads OK')"
-
-      - run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-
   publish-crate:
     runs-on: ubuntu-latest
     steps:
@@ -112,9 +75,163 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
-  release-linux-binaries:
+  # Build each platform's .node on its native arch runner (x64 on ubuntu-latest,
+  # arm64 on ubuntu-24.04-arm), in parallel. The x64 job also emits the shared
+  # native.js/native.d.ts wrappers. Artifacts are reassembled by publish-npm.
+  build-addon:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            node-file: mongreldb.linux-x64-gnu.node
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            node-file: mongreldb.linux-arm64-gnu.node
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        working-directory: crates/mongreldb-node
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: crates/mongreldb-node
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - run: npm ci
+
+      # x64 build also generates the JS/DTS wrappers consumed by every arch.
+      - run: npx napi build --release --platform --strip --target ${{ matrix.target }} --js native.js --dts native.d.ts
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+      - run: npx napi build --release --platform --strip --target ${{ matrix.target }} --js false
+        if: matrix.target != 'x86_64-unknown-linux-gnu'
+
+      - run: test -f ${{ matrix.node-file }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.node-file }}
+          path: crates/mongreldb-node/${{ matrix.node-file }}
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        with:
+          name: addon-js
+          path: |
+            crates/mongreldb-node/native.js
+            crates/mongreldb-node/native.d.ts
+          if-no-files-found: error
+
+  publish-npm:
+    needs: [build-addon]
     runs-on: ubuntu-latest
-    needs: [publish, publish-crate]
+    defaults:
+      run:
+        working-directory: crates/mongreldb-node
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          scope: '@visorcraft'
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: crates/mongreldb-node
+          merge-multiple: true
+
+      - run: |
+          test -f mongreldb.linux-x64-gnu.node
+          test -f mongreldb.linux-arm64-gnu.node
+          test -f native.js
+          test -f native.d.ts
+
+      # Sanity gate: the freshly built addon must load before we publish.
+      - run: node -e "require('./index.js'); console.log('addon loads OK')"
+
+      - run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # Each arch's server image builds natively (no QEMU), pushed under an
+  # arch-suffixed tag; image-manifest merges them into the version + latest tags.
+  image-amd64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: ghcr.io/visorcraft/mongreldb-server:${{ github.ref_name }}-amd64
+
+  image-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/arm64
+          push: true
+          provenance: false
+          tags: ghcr.io/visorcraft/mongreldb-server:${{ github.ref_name }}-arm64
+
+  image-manifest:
+    needs: [image-amd64, image-arm64]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - run: |
+          docker buildx imagetools create \
+            -t ghcr.io/visorcraft/mongreldb-server:${{ github.ref_name }} \
+            -t ghcr.io/visorcraft/mongreldb-server:latest \
+            ghcr.io/visorcraft/mongreldb-server:${{ github.ref_name }}-amd64 \
+            ghcr.io/visorcraft/mongreldb-server:${{ github.ref_name }}-arm64
+
+  release-linux-binaries:
+    needs: [publish-npm, publish-crate]
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         include:
@@ -165,8 +282,8 @@ jobs:
           files: dist/${{ matrix.asset }}
 
   release-darwin-binaries:
+    needs: [publish-npm, publish-crate]
     runs-on: macos-14
-    needs: [publish, publish-crate]
     steps:
       - uses: actions/checkout@v7
 
@@ -199,35 +316,3 @@ jobs:
           files: |
             dist/mongreldb-server-darwin-arm64
             dist/mongreldb-server-darwin-universal
-
-  release-server-image:
-    runs-on: ubuntu-latest
-    needs: [publish, publish-crate]
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: docker/setup-qemu-action@v4
-
-      - uses: docker/setup-buildx-action@v4
-
-      - uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: ghcr.io/visorcraft/mongreldb-server
-          tags: |
-            type=ref,event=tag
-            type=raw,value=latest
-
-      - uses: docker/build-push-action@v7
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
