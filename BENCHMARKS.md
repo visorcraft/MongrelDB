@@ -127,6 +127,7 @@ pushdown is −15% from sharded cache contention reduction.
 | Total size (1M rows) | 4.17 MB |
 
 ## Methodology
+n- **HTTP loopback:** `mongreldb-server` on `127.0.0.1`, Python `httpx` client, 10k iterations per op, release build.
 
 - All measurements on this dev sandbox (Linux, release build, `--all-features`).
 - **Cross-engine:** all engines embedded in-process (no daemon/HTTP). SQLite
@@ -205,3 +206,14 @@ root-caused and fixed the same day; the numbers above reflect the fix.
    run-level AES-256-GCM-encrypted stats envelope, decrypted once at open and
    overlaid onto the in-memory page index — encrypted columns prune exactly
    like plaintext ones, with no plaintext values ever touching the file.
+## HTTP loopback (Tier 2)
+
+Measured against `mongreldb-server` on `127.0.0.1`, release build, 10,000 iterations per op, single-row JSON request body. Python `httpx` client, `time.perf_counter_ns()` per call.
+
+| op | p50 | p95 | p99 | max | throughput |
+|---|---:|---:|---:|---:|---:|
+| `PUT /tables/bench/put` | 0.22 ms | 0.37 ms | 0.62 ms | 5.67 ms | 4,026 ops/s |
+| `POST /kit/txn` commit | 0.21 ms | 0.36 ms | 0.53 ms | 5.91 ms | 4,350 ops/s |
+
+`PUT` and `commit` are within noise of each other; `fsync` is in the commit path but does not dominate on this hardware (NVMe). The HTTP-tier ceiling is set by `axum`'s handler dispatch, JSON parse/serialize, and the TCP round trip, not the engine. The native Tier 1 path is ~25-30× faster than this; see "Criterion throughput benchmarks → Write path" above.
+

@@ -29,7 +29,7 @@ patterns. **New to MongrelDB? Start with the [docs](docs/).**
 
 The write path is an LSM/Bε-tree: an append-only WAL with group commit feeds a
 Bε-tree memtable keyed by `(RowId, Epoch)`, which flushes to immutable sorted
-runs (`.sr` PAX columnar pages). Single-row durable update: **~6 µs**.
+runs (`.sr` PAX columnar pages). Single-row durable update: **~7 µs**.
 
 The read path merges memtable + sorted runs under MVCC snapshot isolation. Eight
 index kinds — all resolving through a shared `RowId` space — enable hybrid
@@ -52,20 +52,20 @@ Measured on 1M rows, dev sandbox (full results in [`BENCHMARKS.md`](BENCHMARKS.m
 
 | Metric | Value |
 |---|---:|
-| Single-row durable write (`put` + `commit`) | **7.7 µs** |
-| Single-row durable update | **7.4 µs** |
-| `put` (no fsync) | **580 ns** |
-| `commit` (fsync, group commit) | **5.9 µs** |
+| Single-row durable write (`put` + `commit`) | **8.0 µs** |
+| Single-row durable update | **7.2 µs** |
+| `put` (no fsync) | **618 ns** |
+| `commit` (fsync, group commit) | **6.79 µs** |
 | Bulk ingest (typed `bulk_load_columns`) | **25.7 Melem/s** (38.8 ms) |
 | Bulk ingest (Value API `bulk_load`) | **12.1 Melem/s** (82.4 ms) |
 | Full columnar scan (LE native-endian) | **12.3 Melem/s** (81.5 ms) |
-| Full scan (all columns) | **14.3 Melem/s** (70.1 ms) |
-| Bitmap-equality pushdown | **109.6 Melem/s** (9.1 ms) |
-| Range pushdown (PGM learned index) | **107.5 Melem/s** (9.3 ms) |
-| 1-column projection pushdown | **176.3 Melem/s** (5.7 ms) |
-| Cold SQL filter (`WHERE cost < 250`) | **8.0 ms** |
-| Cold SQL `COUNT(*)` | **255 µs** |
-| Cold SQL join `COUNT(*)` | **1.53 ms** |
+| Full scan (all columns) | **14.1 Melem/s** (70.7 ms) |
+| Bitmap-equality pushdown | **122 Melem/s** (8.2 ms) |
+| Range pushdown (PGM learned index) | **118 Melem/s** (8.5 ms) |
+| 1-column projection pushdown | **208 Melem/s** (4.8 ms) |
+| Cold SQL filter (`WHERE cost < 250`) | **8.7 µs** |
+| Cold SQL `COUNT(*)` | **290 µs** |
+| Cold SQL join `COUNT(*)` | **1.16 ms** |
 | Warm result-cache hit (any query) | **0.1–0.3 µs** |
 | Storage | **4.17 bytes/row** (4.17 MB / 1M rows) |
 | `COUNT(*)` metadata | **0 µs** (O(1)) |
@@ -282,10 +282,10 @@ database starts a fresh session (re-apply any view-defining migrations then).
 `crates/mongreldb-perf` is a standalone harness comparing MongrelDB (plain +
 encrypted) to SQLite and DuckDB (native / Parquet / CSV) at 100 and 1M rows.
 Measured results and analysis live in [`BENCHMARKS.md`](BENCHMARKS.md). Summary:
-MongrelDB wins single-row writes (**7.7 µs** vs SQLite 14.2 µs, DuckDB 301 µs),
-bulk insert (**75.2 ms** vs SQLite 200.4 ms, DuckDB native 290.7 ms), join
-`COUNT(*)` (**1.53 ms** vs DuckDB 3.95 ms, SQLite 22.8 ms), and O(1)
-`count()`. DuckDB-Parquet wins bulk file creation (26 ms via `COPY`) and has
+MongrelDB wins single-row writes (**8.0 µs** vs SQLite 14.7 µs, DuckDB 296 µs),
+bulk insert (**93.9 ms** vs SQLite 213.7 ms, DuckDB native 247.9 ms), join
+`COUNT(*)` (**1.16 ms** vs DuckDB 3.93 ms, SQLite 22.5 ms), and O(1)
+`count()`. DuckDB-Parquet wins bulk file creation (31.65 ms via `COPY`) and has
 the fastest analytical filter. Warm result-cache hits are sub-µs across all
 queries.
 

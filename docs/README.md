@@ -38,7 +38,7 @@ vector similarity, range queries, and more.
 13. **[Trigger Programs & External Table Modules](13-triggers-and-external-table-modules.md)** —
     architecture spec for triggers and external table modules
 14. **[Users, Roles & Permissions](14-auth.md)** — catalog-stored users with
-    Argon2id passwords, roles, `GRANT`/`REVOKE`, and daemon (HTTP Basic +
+    Argon2id password hashing, roles, `GRANT`/`REVOKE`, and daemon (HTTP Basic +
     Bearer token) authentication
 15. **[Credential Enforcement](15-credential-enforcement.md)** — opt-in
     `require_auth` storage-layer enforcement: credentialed open/create
@@ -51,11 +51,11 @@ vector similarity, range queries, and more.
 
 | Operation | Speed |
 |---|---:|
-| Single-row write (durable) | 6.7 µs |
-| Bulk ingest (typed) | 26.2M rows/sec |
-| Columnar scan | 11.9M rows/sec |
-| Bitmap equality lookup | 64.8M rows/sec |
-| Warm cache hit | 0.1 µs |
+| Single-row write (durable) | **8.0 µs** |
+| Bulk ingest (typed) | **25.7 Melem/s** (38.8 ms) |
+| Columnar scan | **12.3 Melem/s** (81.5 ms) |
+| Bitmap equality lookup | **122 Melem/s** (8.2 ms) |
+| Warm cache hit | **0.1–0.3 µs** |
 | Storage | 4.17 bytes/row |
 
 ### Supported Languages
