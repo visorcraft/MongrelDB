@@ -585,6 +585,10 @@ async fn commit(State(state): State<Arc<AppState>>, Path(name): Path<String>) ->
 #[derive(Deserialize)]
 struct SqlRequest {
     sql: String,
+    /// Output format: `"json"` for a JSON array of row objects, `"arrow"` (the
+    /// default) for Arrow IPC file bytes.
+    #[serde(default)]
+    format: Option<String>,
 }
 
 async fn sql(State(state): State<Arc<AppState>>, Json(req): Json<SqlRequest>) -> Response {
@@ -597,6 +601,12 @@ async fn sql(State(state): State<Arc<AppState>>, Json(req): Json<SqlRequest>) ->
     };
     match session.run(&req.sql).await {
         Ok(batches) => {
+            // JSON format: serialize batches as a JSON array of row objects.
+            if req.format.as_deref() == Some("json") {
+                return sql_json_response(&batches);
+            }
+
+            // Default Arrow IPC format (backward compatible).
             if batches.is_empty() {
                 return StatusCode::OK.into_response();
             }
@@ -616,6 +626,114 @@ async fn sql(State(state): State<Arc<AppState>>, Json(req): Json<SqlRequest>) ->
                 .into_response()
         }
         Err(e) => (status_for_query_error(&e), e.to_string()).into_response(),
+    }
+}
+
+/// Serialize Arrow record batches into a JSON array of row objects.
+/// Each row becomes a JSON object keyed by column name, with values converted
+/// to JSON-native types (numbers, strings, booleans, null, arrays).
+fn sql_json_response(batches: &[arrow::record_batch::RecordBatch]) -> Response {
+    if batches.is_empty() {
+        return (
+            [(header::CONTENT_TYPE, "application/json")],
+            b"[]" as &[u8],
+        )
+            .into_response();
+    }
+
+    // Collect all rows across batches into a JSON array.
+    let mut rows: Vec<serde_json::Value> = Vec::new();
+    for batch in batches {
+        let schema = batch.schema();
+        let num_rows = batch.num_rows();
+        for row_idx in 0..num_rows {
+            let mut row_obj = serde_json::Map::new();
+            for (col_idx, col) in batch.columns().iter().enumerate() {
+                let col_name = schema.field(col_idx).name();
+                let val = arrow_value_to_json(col, row_idx);
+                row_obj.insert(col_name.clone(), val);
+            }
+            rows.push(serde_json::Value::Object(row_obj));
+        }
+    }
+
+    let body = serde_json::to_vec(&rows).unwrap_or_else(|_| b"[]".to_vec());
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+        .into_response()
+}
+
+/// Convert a single Arrow array value at `row_idx` to a JSON value.
+fn arrow_value_to_json(
+    arr: &dyn arrow::array::Array,
+    row_idx: usize,
+) -> serde_json::Value {
+    use arrow::array::*;
+    use arrow::datatypes::DataType;
+
+    if arr.is_null(row_idx) {
+        return serde_json::Value::Null;
+    }
+
+    match arr.data_type() {
+        DataType::Boolean => {
+            serde_json::Value::Bool(arr.as_any().downcast_ref::<BooleanArray>().unwrap().value(row_idx))
+        }
+        DataType::Int8 => {
+            serde_json::Value::Number(serde_json::Number::from(arr.as_any().downcast_ref::<Int8Array>().unwrap().value(row_idx) as i64))
+        }
+        DataType::Int16 => {
+            serde_json::Value::Number(serde_json::Number::from(arr.as_any().downcast_ref::<Int16Array>().unwrap().value(row_idx) as i64))
+        }
+        DataType::Int32 => {
+            serde_json::Value::Number(serde_json::Number::from(arr.as_any().downcast_ref::<Int32Array>().unwrap().value(row_idx) as i64))
+        }
+        DataType::Int64 => {
+            serde_json::Value::Number(serde_json::Number::from(arr.as_any().downcast_ref::<Int64Array>().unwrap().value(row_idx)))
+        }
+        DataType::UInt8 => {
+            serde_json::Value::Number(serde_json::Number::from(arr.as_any().downcast_ref::<UInt8Array>().unwrap().value(row_idx) as u64))
+        }
+        DataType::UInt16 => {
+            serde_json::Value::Number(serde_json::Number::from(arr.as_any().downcast_ref::<UInt16Array>().unwrap().value(row_idx) as u64))
+        }
+        DataType::UInt32 => {
+            serde_json::Value::Number(serde_json::Number::from(arr.as_any().downcast_ref::<UInt32Array>().unwrap().value(row_idx) as u64))
+        }
+        DataType::UInt64 => {
+            serde_json::Value::Number(serde_json::Number::from(arr.as_any().downcast_ref::<UInt64Array>().unwrap().value(row_idx)))
+        }
+        DataType::Float32 => {
+            let v = arr.as_any().downcast_ref::<Float32Array>().unwrap().value(row_idx);
+            serde_json::Number::from_f64(v as f64)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null)
+        }
+        DataType::Float64 => {
+            let v = arr.as_any().downcast_ref::<Float64Array>().unwrap().value(row_idx);
+            serde_json::Number::from_f64(v)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null)
+        }
+        DataType::Utf8 => {
+            serde_json::Value::String(arr.as_any().downcast_ref::<StringArray>().unwrap().value(row_idx).to_string())
+        }
+        DataType::LargeUtf8 => {
+            serde_json::Value::String(arr.as_any().downcast_ref::<LargeStringArray>().unwrap().value(row_idx).to_string())
+        }
+        DataType::Binary => {
+            let v = arr.as_any().downcast_ref::<BinaryArray>().unwrap().value(row_idx);
+            serde_json::Value::String(String::from_utf8_lossy(v).into_owned())
+        }
+        DataType::LargeBinary => {
+            let v = arr.as_any().downcast_ref::<LargeBinaryArray>().unwrap().value(row_idx);
+            serde_json::Value::String(String::from_utf8_lossy(v).into_owned())
+        }
+        DataType::Null => serde_json::Value::Null,
+        // For complex types (lists, structs, etc.), fall back to debug string.
+        _ => serde_json::Value::String(format!("{:?}", arr.data_type())),
     }
 }
 
