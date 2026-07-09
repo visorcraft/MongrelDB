@@ -121,6 +121,8 @@ pub struct MongrelClient {
 #[derive(Serialize)]
 struct SqlReq {
     sql: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    format: Option<&'static str>,
 }
 
 #[derive(Deserialize)]
@@ -478,6 +480,7 @@ impl MongrelClient {
             .post(self.url("/sql"))
             .json(&SqlReq {
                 sql: sql.to_string(),
+                format: Some("arrow"), // Rust client decodes Arrow IPC directly
             })
             .send()?;
         let resp = self.check(resp)?;

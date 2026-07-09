@@ -585,8 +585,8 @@ async fn commit(State(state): State<Arc<AppState>>, Path(name): Path<String>) ->
 #[derive(Deserialize)]
 struct SqlRequest {
     sql: String,
-    /// Output format: `"json"` for a JSON array of row objects, `"arrow"` (the
-    /// default) for Arrow IPC file bytes.
+    /// Output format: `"json"` (the default) for a JSON array of row objects,
+    /// `"arrow"` for Arrow IPC file bytes.
     #[serde(default)]
     format: Option<String>,
 }
@@ -601,32 +601,39 @@ async fn sql(State(state): State<Arc<AppState>>, Json(req): Json<SqlRequest>) ->
     };
     match session.run(&req.sql).await {
         Ok(batches) => {
-            // JSON format: serialize batches as a JSON array of row objects.
-            if req.format.as_deref() == Some("json") {
-                return sql_json_response(&batches);
+            // Arrow IPC format: opt-in via format:"arrow".
+            // JSON is the default (sensible for HTTP clients).
+            if req.format.as_deref() == Some("arrow") {
+                return sql_arrow_response(&batches);
             }
 
-            // Default Arrow IPC format (backward compatible).
-            if batches.is_empty() {
-                return StatusCode::OK.into_response();
-            }
-            let schema = batches[0].schema();
-            let mut buf = Vec::new();
-            let mut writer =
-                arrow::ipc::writer::FileWriter::try_new(&mut buf, schema.as_ref()).unwrap();
-            for b in &batches {
-                let _ = writer.write(b);
-            }
-            let _ = writer.finish();
-            drop(writer);
-            (
-                [(header::CONTENT_TYPE, "application/vnd.apache.arrow.file")],
-                buf,
-            )
-                .into_response()
+            // Default JSON format.
+            sql_json_response(&batches)
         }
         Err(e) => (status_for_query_error(&e), e.to_string()).into_response(),
     }
+}
+
+/// Serialize Arrow record batches as Arrow IPC file bytes. This is the
+/// high-performance binary format for clients with Arrow library support.
+fn sql_arrow_response(batches: &[arrow::record_batch::RecordBatch]) -> Response {
+    if batches.is_empty() {
+        return StatusCode::OK.into_response();
+    }
+    let schema = batches[0].schema();
+    let mut buf = Vec::new();
+    let mut writer =
+        arrow::ipc::writer::FileWriter::try_new(&mut buf, schema.as_ref()).unwrap();
+    for b in batches {
+        let _ = writer.write(b);
+    }
+    let _ = writer.finish();
+    drop(writer);
+    (
+        [(header::CONTENT_TYPE, "application/vnd.apache.arrow.file")],
+        buf,
+    )
+        .into_response()
 }
 
 /// Serialize Arrow record batches into a JSON array of row objects using the

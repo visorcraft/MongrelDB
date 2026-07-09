@@ -3091,7 +3091,7 @@ impl RemoteDatabase {
         let resp = self
             .agent
             .post(&format!("{}/sql", self.url))
-            .send_json(serde_json::json!({ "sql": sql }))
+            .send_json(serde_json::json!({ "sql": sql, "format": "arrow" }))
             .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
         let bytes = resp
             .into_string()
