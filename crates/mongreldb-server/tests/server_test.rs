@@ -301,7 +301,8 @@ async fn sql_endpoint_uses_startup_external_module_allowlist() {
     assert_eq!(resp.status(), 200);
 
     let query_body = serde_json::json!({
-        "sql": "SELECT label FROM app_rows ORDER BY id"
+        "sql": "SELECT label FROM app_rows ORDER BY id",
+        "format": "arrow",
     });
     let resp = app
         .oneshot(
