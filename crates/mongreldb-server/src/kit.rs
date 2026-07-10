@@ -460,7 +460,11 @@ pub struct KitColumnDef {
     pub encrypted_indexable: bool,
     #[serde(default)]
     pub enum_variants: Option<Vec<String>>,
-    #[serde(default)]
+    // Accept legacy `default_value` key alongside `default_expr` so clients
+    // built against the engine field name (e.g. generic schema migrations,
+    // cross-language code generators) still work. Either key populates the
+    // same `kit_default_expr` string discriminator.
+    #[serde(default, alias = "default_value")]
     pub default_expr: Option<String>,
 }
 
