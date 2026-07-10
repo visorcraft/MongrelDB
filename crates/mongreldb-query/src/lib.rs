@@ -1341,6 +1341,10 @@ pub struct MongrelSession {
     /// Built-in plus app-provided external table modules available to this
     /// session.
     external_modules: Arc<ExternalModuleRegistry>,
+    /// Names of `PREPARE`d statements tracked so they can be `DEALLOCATE`d when
+    /// DDL invalidates the tables they reference (DataFusion's prepared-plan
+    /// store is not cleared by the session's own result/plan caches).
+    prepared_names: parking_lot::Mutex<std::collections::HashSet<String>>,
 }
 
 /// `(sql, snapshot_epoch) → cached result batches`.
@@ -1370,6 +1374,7 @@ impl MongrelSession {
             sql_txn: parking_lot::Mutex::new(None),
             sql_fn_state,
             external_modules,
+            prepared_names: parking_lot::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -1439,6 +1444,7 @@ impl MongrelSession {
             sql_txn: parking_lot::Mutex::new(None),
             sql_fn_state,
             external_modules,
+            prepared_names: parking_lot::Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -1864,6 +1870,7 @@ impl MongrelSession {
                     .register_table(&name, Arc::new(provider))
                     .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
                 self.tables.lock().insert(name, handle);
+                self.invalidate_prepared_statements().await;
                 self.clear_cache();
                 return Ok(Vec::new());
             }
@@ -1884,6 +1891,7 @@ impl MongrelSession {
                         .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
                     self.tables.lock().remove(&name);
                 }
+                self.invalidate_prepared_statements().await;
                 self.clear_cache();
                 return Ok(Vec::new());
             }
@@ -1942,6 +1950,7 @@ impl MongrelSession {
                         self.refresh_registered_table(db, &table_name)?;
                     }
                 }
+                self.invalidate_prepared_statements().await;
                 self.clear_cache();
                 return Ok(Vec::new());
             }
@@ -1963,7 +1972,8 @@ impl MongrelSession {
         let epoch = self.cache_epoch();
         let key = (sql.to_string(), epoch);
         let result_cacheable = !extended_sql_functions::contains_volatile_extended_function(sql)
-            && !is_explain_analyze(sql);
+            && !is_explain_analyze(sql)
+            && !is_prepared_stmt_sql(sql);
         if result_cacheable {
             if let Some(hit) = self.cache.lock().get(&key) {
                 return Ok((**hit).clone());
@@ -1991,7 +2001,14 @@ impl MongrelSession {
         let plan_start = std::time::Instant::now();
         let external_module_scan = self.query_references_external_module(sql);
         let df = {
-            let cached_plan = self.plan_cache.lock().get(sql).cloned();
+            // Bypass the logical-plan cache for prepared-statement commands:
+            // EXECUTE with varying params would otherwise create one cache
+            // entry per parameter set (unbounded growth), and PREPARE/DEALLOCATE
+            // are one-shot control statements.
+            let use_plan_cache = !is_prepared_stmt_sql(sql);
+            let cached_plan = use_plan_cache
+                .then(|| self.plan_cache.lock().get(sql).cloned())
+                .flatten();
             if let Some(plan) = cached_plan {
                 datafusion::dataframe::DataFrame::new(self.ctx.state(), plan)
             } else {
@@ -2000,12 +2017,17 @@ impl MongrelSession {
                     .sql(sql)
                     .await
                     .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
-                self.plan_cache
-                    .lock()
-                    .insert(sql.to_string(), df.logical_plan().clone());
+                if use_plan_cache {
+                    self.plan_cache
+                        .lock()
+                        .insert(sql.to_string(), df.logical_plan().clone());
+                }
                 df
             }
         };
+        // Track prepared-statement names so DDL can DEALLOCATE them (prevents a
+        // prepared plan from querying a detached/old table after DROP+recreate).
+        self.track_prepared_name(sql);
         // Priority 8: record logical-planning time (parse + plan; ~0 on a
         // plan-cache hit), separate from execution.
         let planning_nanos = plan_start.elapsed().as_nanos() as u64;
@@ -2074,6 +2096,41 @@ impl MongrelSession {
     pub fn clear_cache(&self) {
         self.cache.lock().clear();
         self.plan_cache.lock().clear();
+    }
+
+    /// Record/remove a prepared-statement name from the tracking set. Called
+    /// after the DataFusion execution path runs a `PREPARE`/`DEALLOCATE` so the
+    /// session knows which names to invalidate when DDL changes the schema.
+    fn track_prepared_name(&self, sql: &str) {
+        let lower = sql.trim_start().to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("prepare ") {
+            if let Some(name) = parse_stmt_ident(rest) {
+                self.prepared_names.lock().insert(name);
+            }
+        } else if let Some(rest) = lower.strip_prefix("deallocate ") {
+            if let Some(name) = parse_stmt_ident(rest) {
+                self.prepared_names.lock().remove(&name);
+            }
+        }
+    }
+
+    /// `DEALLOCATE` every tracked prepared statement. Called on table DDL so a
+    /// prepared plan cannot keep querying a dropped/altered/recreated table
+    /// (DataFusion's prepared-plan store is otherwise untouched by `clear_cache`
+    /// and would retain a plan bound to the old table provider). Errors from an
+    /// unknown name are ignored (the plan was never stored, e.g. a failed
+    /// PREPARE whose name was optimistically tracked).
+    pub async fn invalidate_prepared_statements(&self) {
+        let names: Vec<String> = self.prepared_names.lock().drain().collect();
+        for name in names {
+            // `DEALLOCATE <name>` — no params, safe (name was validated at
+            // PREPARE time on the server path; here it came from our own
+            // tracking so it is a bare identifier).
+            let sql = format!("DEALLOCATE {name}");
+            if self.ctx.sql(&sql).await.is_err() {
+                // Unknown/stale name — ignore; the goal is just to drop it.
+            }
+        }
     }
 
     async fn explain_query_plan(&self, sql: &str) -> Result<Vec<RecordBatch>> {
@@ -2578,6 +2635,30 @@ fn strip_explain_query_plan(sql: &str) -> Option<&str> {
         return None;
     }
     Some(after_query.get(4..)?.trim_start())
+}
+
+/// Whether `sql` is a `PREPARE`/`EXECUTE`/`DEALLOCATE` statement. These must
+/// bypass the session result + logical-plan caches: `EXECUTE name($p)` with
+/// varying params would otherwise create one cache entry per parameter set
+/// (unbounded growth), and the prepared plan itself is already held by the
+/// DataFusion context.
+fn is_prepared_stmt_sql(sql: &str) -> bool {
+    let lower = sql.trim_start().to_ascii_lowercase();
+    lower.starts_with("prepare ")
+        || lower.starts_with("execute ")
+        || lower.starts_with("deallocate ")
+}
+
+/// Parse the first identifier from the text following a `PREPARE`/`DEALLOCATE`
+/// keyword (e.g. `"gt AS SELECT ..."` → `"gt"`, `"p"` → `"p"`), stripping
+/// surrounding quotes. Used to track prepared-statement names.
+fn parse_stmt_ident(s: &str) -> Option<String> {
+    let tok = s
+        .trim_start()
+        .split(|c: char| c.is_whitespace() || c == '(')
+        .next()?;
+    let t = tok.trim_matches(|c| c == '"' || c == '`' || c == '\'');
+    (!t.is_empty()).then(|| t.to_string())
 }
 
 /// Whether `sql` is an `EXPLAIN ANALYZE ...` statement. EXPLAIN ANALYZE falls

@@ -3191,6 +3191,29 @@ impl Database {
                         else {
                             continue;
                         };
+                        // Suppress ON DELETE cascade/set-null when this "delete"
+                        // is actually half of an UPDATE encoded as Delete(old)+
+                        // Put(new): if a staged Put in the SAME table still
+                        // provides the referenced parent key, the parent still
+                        // exists (its non-key columns changed) and the children
+                        // must be left alone. A genuine delete, or an update
+                        // that CHANGES the referenced key, has no preserving Put
+                        // → cascade fires as before.
+                        let key_preserved = staging.iter().any(|(t, op)| {
+                            if *t != table_id {
+                                return false;
+                            }
+                            let Staged::Put(cells) = op else {
+                                return false;
+                            };
+                            let map: HashMap<u16, crate::memtable::Value> =
+                                cells.iter().cloned().collect();
+                            encode_composite_key(&fk.ref_columns, &map).as_deref()
+                                == Some(parent_key.as_slice())
+                        });
+                        if key_preserved {
+                            continue;
+                        }
                         match fk.on_delete {
                             FkAction::Restrict => continue,
                             FkAction::Cascade => {

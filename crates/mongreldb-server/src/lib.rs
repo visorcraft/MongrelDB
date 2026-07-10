@@ -255,19 +255,23 @@ async fn auth_middleware(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
+    // Track the attempted identity + failure reason so EVERY 401 path emits
+    // exactly one `login.fail` audit event (missing, malformed, wrong token,
+    // wrong password are all logged — no unauthenticated probe goes unrecorded).
+    let mut attempted = String::new();
+    let mut fail_reason = "no credentials provided".to_string();
+
     // Mode 1: Token auth (Bearer).
     if let Some(token) = &state.auth_token {
         if let Some(provided) = header.strip_prefix("Bearer ") {
+            attempted = "token".to_string();
             if provided == token {
                 state
                     .audit
                     .record("token", "login.ok", "bearer token accepted");
                 return Ok(next.run(req).await);
-            } else {
-                state
-                    .audit
-                    .record("token", "login.fail", "invalid bearer token");
             }
+            fail_reason = "invalid bearer token".to_string();
         }
     }
 
@@ -277,6 +281,7 @@ async fn auth_middleware(
             if let Ok(decoded) = base64_decode(encoded) {
                 if let Ok(creds) = std::str::from_utf8(&decoded) {
                     if let Some((username, password)) = creds.split_once(':') {
+                        attempted = username.to_string();
                         if let Ok(Some(_user)) = state.db.verify_user(username, password) {
                             state
                                 .audit
@@ -286,17 +291,26 @@ async fn auth_middleware(
                                 req.extensions_mut().insert(principal);
                             }
                             return Ok(next.run(req).await);
-                        } else {
-                            state
-                                .audit
-                                .record(username, "login.fail", "invalid basic credentials");
                         }
+                        fail_reason = "invalid basic credentials".to_string();
+                    } else {
+                        fail_reason = "malformed basic credentials (no ':')".to_string();
                     }
+                } else {
+                    fail_reason = "malformed basic credentials (non-utf8)".to_string();
                 }
+            } else {
+                fail_reason = "malformed basic credentials (bad base64)".to_string();
             }
         }
     }
 
+    let who = if attempted.is_empty() {
+        "anonymous"
+    } else {
+        attempted.as_str()
+    };
+    state.audit.record(who, "login.fail", fail_reason);
     Err(axum::http::StatusCode::UNAUTHORIZED)
 }
 
@@ -558,17 +572,19 @@ fn validate_stmt_name(name: &str) -> Result<(), String> {
 
 /// Render a JSON value as a safe SQL literal for `EXECUTE` parameter binding.
 /// Values are escaped so a client cannot inject SQL through a parameter.
-fn render_sql_literal(v: &serde_json::Value) -> String {
+/// Returns `Err` for non-scalar JSON (arrays/objects) so the caller rejects the
+/// request with 400 rather than silently binding NULL.
+fn render_sql_literal(v: &serde_json::Value) -> Result<String, String> {
     match v {
-        serde_json::Value::Null => "NULL".into(),
+        serde_json::Value::Null => Ok("NULL".into()),
         serde_json::Value::Bool(b) => {
             if *b {
-                "TRUE".into()
+                Ok("TRUE".into())
             } else {
-                "FALSE".into()
+                Ok("FALSE".into())
             }
         }
-        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Number(n) => Ok(n.to_string()),
         // Single-quote, doubling embedded single quotes (SQL-standard escape).
         serde_json::Value::String(s) => {
             let mut out = String::with_capacity(s.len() + 2);
@@ -581,11 +597,10 @@ fn render_sql_literal(v: &serde_json::Value) -> String {
                 }
             }
             out.push('\'');
-            out
+            Ok(out)
         }
-        // Arrays/objects are not supported as scalar params; render as NULL so a
-        // malformed request fails the cast rather than injecting.
-        _ => "NULL".into(),
+        // Arrays/objects are not valid scalar params; reject explicitly.
+        _ => Err("prepared-statement parameters must be scalar (null/bool/number/string)".into()),
     }
 }
 
@@ -616,6 +631,9 @@ async fn prepare_statement(
             .into_response();
     };
     let _guard = entry.lock.lock().await;
+    if entry.is_closed() {
+        return (StatusCode::NOT_FOUND, "session no longer available").into_response();
+    }
     entry.touch();
     let sql = format!("PREPARE {} AS {}", req.name, req.sql);
     match entry.session.run(&sql).await {
@@ -653,15 +671,47 @@ async fn execute_statement(
             .into_response();
     };
     let _guard = entry.lock.lock().await;
+    if entry.is_closed() {
+        return (StatusCode::NOT_FOUND, "session no longer available").into_response();
+    }
     entry.touch();
     state.metrics.inc_sql_queries();
-    let literals: Vec<String> = req.params.iter().map(render_sql_literal).collect();
+    let literals: Vec<String> = match req
+        .params
+        .iter()
+        .map(render_sql_literal)
+        .collect::<Result<_, _>>()
+    {
+        Ok(v) => v,
+        Err(msg) => {
+            state.metrics.inc_sql_errors();
+            return (StatusCode::BAD_REQUEST, msg).into_response();
+        }
+    };
     let sql = format!("EXECUTE {}({})", req.name, literals.join(", "));
-    match entry.session.run(&sql).await {
+    let start = std::time::Instant::now();
+    let result = entry.session.run(&sql).await;
+    let elapsed = start.elapsed();
+    if elapsed >= state.slow_query_threshold {
+        state.metrics.inc_slow_queries();
+        eprintln!(
+            "[slow-query] {}\u{00b5}s \u{2014} EXECUTE {}",
+            elapsed.as_micros(),
+            req.name
+        );
+    }
+    match result {
         Ok(batches) => dispatch_sql_format(req.format.as_deref(), &batches),
         Err(e) => {
             state.metrics.inc_sql_errors();
-            (status_for_query_error(&e), e.to_string()).into_response()
+            // A reference to an unprepared/unknown statement is a client error.
+            let msg = format!("{e}");
+            let status = if msg.contains("does not exist") {
+                StatusCode::NOT_FOUND
+            } else {
+                status_for_query_error(&e)
+            };
+            (status, format!("{msg} ({}µs)", elapsed.as_micros())).into_response()
         }
     }
 }
@@ -685,6 +735,9 @@ async fn deallocate_statement(
             .into_response();
     };
     let _guard = entry.lock.lock().await;
+    if entry.is_closed() {
+        return (StatusCode::NOT_FOUND, "session no longer available").into_response();
+    }
     entry.touch();
     let sql = format!("DEALLOCATE {name}");
     match entry.session.run(&sql).await {
@@ -991,6 +1044,11 @@ async fn sql(
         // Serialize per-session access so two concurrent requests on the same
         // token cannot interleave a transaction's staged writes.
         let _guard = entry.lock.lock().await;
+        // Re-check closed: the session may have been closed/evicted between
+        // get() and acquiring the lock.
+        if entry.is_closed() {
+            return (StatusCode::NOT_FOUND, "session no longer available").into_response();
+        }
         entry.touch();
         execute_sql(&state, &principal, &entry.session, req).await
     } else {
@@ -1005,9 +1063,10 @@ async fn sql(
     }
 }
 
-/// Run one SQL request against a given session: bump counters, audit DDL,
-/// execute under a trace capture, log slow queries, and dispatch the response
-/// format. Shared by the pooled-session and fresh-session paths.
+/// Run one SQL request against a given session: bump counters, audit DDL
+/// (after execution, with redaction), log slow queries on both success and
+/// failure, and dispatch the response format. Shared by the pooled-session and
+/// fresh-session paths.
 async fn execute_sql(
     state: &AppState,
     principal: &Option<mongreldb_core::Principal>,
@@ -1015,37 +1074,34 @@ async fn execute_sql(
     req: SqlRequest,
 ) -> Response {
     state.metrics.inc_sql_queries();
-    // Audit DDL / privilege statements attributed to the resolved principal.
-    // Non-DDL reads are not audited here (auth events cover access).
-    if audit::is_audited_sql(&req.sql) {
-        let actor = principal
-            .as_ref()
-            .map(|p| p.username.clone())
-            .unwrap_or_else(|| "anonymous".to_string());
-        let snippet: String = req.sql.chars().take(160).collect();
-        state.audit.record(actor, "ddl", snippet);
-    }
+    let audited = audit::is_audited_sql(&req.sql);
+    let actor = request_owner(state, principal);
     let start = std::time::Instant::now();
-    // `run_sql_traced` captures a QueryTrace (scan path, index rebuild, pages
-    // decoded, planning nanos) which we surface in the slow-query log when the
-    // request exceeds the configured threshold.
-    let traced = session.run_sql_traced(&req.sql).await;
+    // NOTE: deliberately NOT using `run_sql_traced` here. Its thread-local
+    // push/pop spans an `.await`, and on a multi-threaded tokio runtime the
+    // task can resume on a different thread, corrupting the trace stack and
+    // leaking scopes. Wall-clock timing is sufficient for slow-query detection
+    // and works across awaits.
+    let result = session.run(&req.sql).await;
     let elapsed = start.elapsed();
-    match traced {
-        Ok((batches, trace)) => {
-            if elapsed >= state.slow_query_threshold {
-                state.metrics.inc_slow_queries();
-                let micros = elapsed.as_micros();
-                eprintln!(
-                    "[slow-query] {micros}\u{00b5}s ({} planning) \u{2014} {trace}",
-                    trace.planning_nanos
-                );
-            }
-            // Arrow IPC format: opt-in via format:"arrow".
-            // JSON is the default (sensible for HTTP clients).
-            // Arrow IPC *streaming* format: opt-in via format:"arrow-stream".
-            dispatch_sql_format(req.format.as_deref(), &batches)
-        }
+    // Slow-query logging covers BOTH success and failure (the slowest errors
+    // matter most for diagnosis), checked before branching on the outcome.
+    if elapsed >= state.slow_query_threshold {
+        state.metrics.inc_slow_queries();
+        let preview: String = req.sql.chars().take(80).collect();
+        eprintln!(
+            "[slow-query] {}\u{00b5}s \u{2014} {preview}",
+            elapsed.as_micros()
+        );
+    }
+    // Audit DDL/privilege AFTER execution so the outcome (ok/fail) is captured.
+    // `redacted_ddl_detail` never logs credential literals.
+    if audited {
+        let (action, detail) = audit::redacted_ddl_detail(&req.sql, result.is_ok());
+        state.audit.record(actor, action, detail);
+    }
+    match result {
+        Ok(batches) => dispatch_sql_format(req.format.as_deref(), &batches),
         Err(e) => {
             state.metrics.inc_sql_errors();
             (
@@ -1096,11 +1152,11 @@ fn sql_arrow_stream_response(batches: &[arrow::record_batch::RecordBatch]) -> Re
     const STREAM_CT: &str = "application/vnd.apache.arrow.stream";
 
     if batches.is_empty() {
-        return (
-            [(header::CONTENT_TYPE, STREAM_CT)],
-            axum::body::Body::empty(),
-        )
-            .into_response();
+        // No batches → no schema available. An empty body is not a valid Arrow
+        // IPC stream (which must contain at least a schema + EOS marker), so
+        // return 204 No Content without the Arrow content type rather than a
+        // body an Arrow reader cannot decode.
+        return StatusCode::NO_CONTENT.into_response();
     }
 
     let schema = batches[0].schema();
@@ -1121,35 +1177,39 @@ fn sql_arrow_stream_response(batches: &[arrow::record_batch::RecordBatch]) -> Re
 
     // Lazy per-batch + end-of-stream serialization. State carries the writer so
     // each batch appends exactly one IPC message; we drain after every write.
+    // A serialization failure yields an `Err` from the body stream so the
+    // client observes a truncated/broken transfer instead of a silently
+    // shortened 200 response.
     let batch_stream = stream::unfold(
         (writer, batches_owned, 0_usize, false),
         |(mut w, batches, idx, eos)| async move {
             if idx < batches.len() {
-                // Encode one record-batch message; on failure end the stream.
-                if w.write(&batches[idx]).is_err() {
-                    return None;
+                match w.write(&batches[idx]) {
+                    Ok(()) => {
+                        let chunk = std::mem::take(w.get_mut());
+                        Some((Ok(chunk), (w, batches, idx + 1, eos)))
+                    }
+                    Err(e) => Some((Err(std::io::Error::other(e)), (w, batches, idx, eos))),
                 }
-                let chunk = std::mem::take(w.get_mut());
-                if chunk.is_empty() {
-                    return None;
-                }
-                Some((chunk, (w, batches, idx + 1, eos)))
             } else if !eos {
-                if w.finish().is_err() {
-                    return None;
+                match w.finish() {
+                    Ok(()) => {
+                        let chunk = std::mem::take(w.get_mut());
+                        Some((Ok(chunk), (w, batches, idx, true)))
+                    }
+                    Err(e) => Some((Err(std::io::Error::other(e)), (w, batches, idx, eos))),
                 }
-                let chunk = std::mem::take(w.get_mut());
-                Some((chunk, (w, batches, idx, true)))
             } else {
                 None
             }
         },
     );
 
-    // Schema first, then batches + EOS.
-    let full = stream::iter([schema_chunk]).chain(batch_stream);
-    let body_stream = full.map(Ok::<Vec<u8>, std::io::Error>);
-    let body = axum::body::Body::from_stream(body_stream);
+    // Schema first, then batches + EOS. Each item is already `Result<Vec<u8>,
+    // io::Error>` so a mid-stream encode failure surfaces as a body error.
+    let schema_item: Result<Vec<u8>, std::io::Error> = Ok(schema_chunk);
+    let full = stream::iter([schema_item]).chain(batch_stream);
+    let body = axum::body::Body::from_stream(full);
     ([(header::CONTENT_TYPE, STREAM_CT)], body).into_response()
 }
 
@@ -1720,8 +1780,8 @@ mod audit_tests {
             .await
             .unwrap();
         assert!(
-            body.contains("\"action\":\"ddl\""),
-            "audit should record the DDL statement: {body}"
+            body.contains("\"action\":\"ddl.ok\""),
+            "audit should record the successful DDL statement: {body}"
         );
         assert!(
             body.contains("CREATE TABLE"),
@@ -1731,6 +1791,44 @@ mod audit_tests {
         assert!(
             !body.contains("SELECT 1"),
             "non-DDL reads should not be audited: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_redacts_credential_passwords() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(Database::create(dir.path()).unwrap());
+        let app = build_app(db);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = reqwest::Client::new();
+        // A CREATE USER carrying a plaintext password must be audited but the
+        // password must NEVER reach /audit or stderr.
+        let _ = client
+            .post(format!("http://{addr}/sql"))
+            .json(&json!({ "sql": "CREATE USER alice WITH PASSWORD 'topsecret'" }))
+            .send()
+            .await
+            .unwrap();
+
+        let body = client
+            .get(format!("http://{addr}/audit"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            !body.contains("topsecret"),
+            "password must never appear in the audit log: {body}"
+        );
+        assert!(
+            body.contains("redacted credential statement"),
+            "credential DDL should be recorded as redacted: {body}"
         );
     }
 

@@ -22,6 +22,7 @@
 //!   transaction (effective rollback).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -37,6 +38,11 @@ pub struct SessionEntry {
     last_used: std::sync::Mutex<Instant>,
     /// Held for the duration of a request to serialize per-session access.
     pub lock: tokio::sync::Mutex<()>,
+    /// Set when the session is closed/evicted. `get()` rejects closed entries,
+    /// and request handlers re-check it after acquiring the lock so an in-flight
+    /// request that obtained an `Arc` just before eviction aborts rather than
+    /// committing into a closed session.
+    closed: AtomicBool,
 }
 
 impl SessionEntry {
@@ -44,6 +50,15 @@ impl SessionEntry {
         if let Ok(mut t) = self.last_used.lock() {
             *t = Instant::now();
         }
+    }
+
+    /// Whether this entry has been closed/evicted and must reject new work.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    fn mark_closed(&self) {
+        self.closed.store(true, Ordering::Release);
     }
 
     fn idle_for_at_least(&self, timeout: Duration) -> bool {
@@ -91,48 +106,72 @@ impl SessionStore {
                 owner,
                 last_used: std::sync::Mutex::new(Instant::now()),
                 lock: tokio::sync::Mutex::new(()),
+                closed: AtomicBool::new(false),
             }),
         );
         Some(token)
     }
 
-    /// Look up a session by token, verifying the caller owns it. Returns a
-    /// cloned `Arc<SessionEntry>` (the store lock is released immediately; the
-    /// caller holds the entry's per-session lock for the request duration).
-    /// Returns `None` for an unknown token OR an ownership mismatch.
+    /// Look up a session by token, verifying the caller owns it and the session
+    /// is not closed. Returns a cloned `Arc<SessionEntry>` (the store lock is
+    /// released immediately; the caller holds the entry's per-session lock for
+    /// the request duration, and must re-check `is_closed()` after locking).
+    /// Returns `None` for an unknown token, an ownership mismatch, or a closed
+    /// session.
     pub fn get(&self, token: &str, owner: &str) -> Option<Arc<SessionEntry>> {
         let guard = self.sessions.lock().ok()?;
         let entry = guard.get(token)?;
-        if entry.owner != owner {
+        if entry.owner != owner || entry.is_closed() {
             return None;
         }
         Some(Arc::clone(entry))
     }
 
-    /// Remove and drop a session (any staged transaction is discarded). Returns
-    /// whether a session was removed. Rejects non-owners.
+    /// Remove and drop a session, marking it closed first so any request that
+    /// already holds an `Arc` aborts after acquiring the lock. Returns whether a
+    /// session was removed. Rejects non-owners.
     pub fn close(&self, token: &str, owner: &str) -> bool {
         if let Ok(mut guard) = self.sessions.lock() {
             if let Some(entry) = guard.get(token) {
                 if entry.owner != owner {
                     return false;
                 }
+                entry.mark_closed();
             }
             return guard.remove(token).is_some();
         }
         false
     }
 
-    /// Evict every session idle for longer than the configured timeout. Called
+    /// Evict every session idle for longer than the configured timeout, skipping
+    /// any session with an in-flight request (per-session lock held). Called
     /// periodically by [`spawn_session_reaper`]. Returns the count evicted.
     pub fn sweep_idle(&self) -> usize {
         let Ok(mut guard) = self.sessions.lock() else {
             return 0;
         };
         let timeout = self.idle_timeout;
-        let before = guard.len();
-        guard.retain(|_, entry| !entry.idle_for_at_least(timeout));
-        before - guard.len()
+        // Collect tokens to evict: idle AND not currently in-flight (its
+        // per-session lock is acquirable). Holding the store lock prevents new
+        // lookups while we decide; try_lock fails exactly when a request holds
+        // or is acquiring the session lock.
+        let to_evict: Vec<String> = guard
+            .iter()
+            .filter_map(|(token, entry)| {
+                if entry.idle_for_at_least(timeout) && entry.lock.try_lock().is_ok() {
+                    Some(token.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let count = to_evict.len();
+        for token in &to_evict {
+            if let Some(entry) = guard.remove(token) {
+                entry.mark_closed();
+            }
+        }
+        count
     }
 
     /// Current number of live sessions (diagnostics / tests).
@@ -161,27 +200,18 @@ pub fn spawn_session_reaper(store: Arc<SessionStore>) {
         .expect("spawn session-reaper");
 }
 
-/// Generate an opaque, hard-to-guess session token. Reads 16 bytes from
-/// `/dev/urandom` (Linux/macOS) and hex-encodes them; falls back to a
-/// time+counter-derived value only if the OS source is unavailable.
+/// Generate an opaque, cryptographically-random session token. Reads 16 bytes
+/// from `/dev/urandom` (Linux/macOS) and hex-encodes them. Session tokens are
+/// bearer capabilities, so there is NO predictable fallback: if the OS RNG is
+/// unavailable, this returns `None` and the caller rejects session creation
+/// (HTTP 503) rather than handing out a guessable token.
 fn random_token() -> Option<String> {
-    if let Some(bytes) = read_urandom(16) {
-        let mut n = 0u128;
-        for &b in &bytes {
-            n = (n << 8) | b as u128;
-        }
-        return Some(format!("{n:032x}"));
+    let bytes = read_urandom(16)?;
+    let mut n = 0u128;
+    for &b in &bytes {
+        n = (n << 8) | b as u128;
     }
-    // Fallback: less secure but still unique within a process lifetime.
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let c = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let mixed = nanos ^ (c as u128);
-    Some(format!("{mixed:032x}"))
+    Some(format!("{n:032x}"))
 }
 
 fn read_urandom(n: usize) -> Option<Vec<u8>> {

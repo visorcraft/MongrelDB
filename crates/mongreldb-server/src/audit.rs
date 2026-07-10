@@ -87,18 +87,59 @@ fn now_unix_nanos() -> u128 {
         .unwrap_or(0)
 }
 
-/// Whether a SQL string is a DDL or privilege statement that should be audited.
-/// Conservative keyword prefix check (case-insensitive); false positives only
-/// mean an extra audit line, never a missed one.
+/// Whether a SQL string contains a DDL or privilege statement that should be
+/// audited. Checks EACH `;`-separated segment after stripping leading comments,
+/// so multi-statement evasion (`SELECT 1; DROP TABLE t`) and leading-comment
+/// evasion (`/* x */ DROP TABLE t`) are both caught. Conservative (case-
+/// insensitive prefix match); a naive `;` split may over-match a literal `;`
+/// inside a string, but that only adds a harmless extra audit line — it never
+/// misses a DDL statement.
 pub fn is_audited_sql(sql: &str) -> bool {
-    let s = sql.trim_start();
-    let lower = s.to_ascii_lowercase();
-    lower.starts_with("create ")
-        || lower.starts_with("drop ")
-        || lower.starts_with("alter ")
-        || lower.starts_with("grant ")
-        || lower.starts_with("revoke ")
-        || lower.starts_with("truncate ")
+    sql.split(';').any(|seg| {
+        let lower = strip_leading_comments_and_ws(seg).to_ascii_lowercase();
+        lower.starts_with("create ")
+            || lower.starts_with("drop ")
+            || lower.starts_with("alter ")
+            || lower.starts_with("grant ")
+            || lower.starts_with("revoke ")
+            || lower.starts_with("truncate ")
+    })
+}
+
+/// Strip leading whitespace and SQL comments (`-- line\n` and `/* block */`)
+/// so a DDL keyword buried after a comment is still recognized.
+fn strip_leading_comments_and_ws(mut s: &str) -> &str {
+    loop {
+        let trimmed = s.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("--") {
+            // line comment: skip to end-of-line
+            s = rest.split_once('\n').map(|(_, r)| r).unwrap_or("");
+        } else if let Some(rest) = trimmed.strip_prefix("/*") {
+            // block comment: skip to closing */
+            s = rest.split_once("*/").map(|(_, r)| r).unwrap_or("");
+        } else if trimmed.len() == s.len() {
+            return trimmed;
+        } else {
+            s = trimmed;
+        }
+    }
+}
+
+/// Produce a `(action, detail)` pair for auditing a DDL/privilege statement.
+/// `ok` selects `"ddl.ok"` vs `"ddl.fail"` (recorded AFTER execution so the
+/// outcome is captured). `detail` is a redacted snippet: credential-bearing
+/// statements (`... PASSWORD ...`) are NEVER logged verbatim — the whole
+/// statement is replaced with a placeholder so passwords never reach `/audit`
+/// or stderr.
+pub fn redacted_ddl_detail(sql: &str, ok: bool) -> (&'static str, String) {
+    let action = if ok { "ddl.ok" } else { "ddl.fail" };
+    let detail = if sql.to_ascii_lowercase().contains("password") {
+        // CREATE/ALTER USER ... PASSWORD '...' — redact entirely.
+        "[redacted credential statement]".to_string()
+    } else {
+        sql.chars().take(120).collect()
+    };
+    (action, detail)
 }
 
 #[cfg(test)]
@@ -140,5 +181,33 @@ mod tests {
         // Non-DDL is not audited.
         assert!(!is_audited_sql("SELECT * FROM t"));
         assert!(!is_audited_sql("INSERT INTO t VALUES (1)"));
+    }
+
+    #[test]
+    fn is_audited_sql_catches_multistatement_and_comment_evasion() {
+        // DDL hidden behind a leading SELECT in a multi-statement body.
+        assert!(is_audited_sql("SELECT 1; DROP TABLE t"));
+        assert!(is_audited_sql(
+            "BEGIN; INSERT INTO t VALUES (1); TRUNCATE t"
+        ));
+        // DDL behind leading comments.
+        assert!(is_audited_sql("/* hint */ DROP TABLE t"));
+        assert!(is_audited_sql("-- ignore me\nALTER TABLE t ADD COLUMN c"));
+        // Pure reads with comments are still not audited.
+        assert!(!is_audited_sql("/* x */ SELECT 1"));
+    }
+
+    #[test]
+    fn redacted_ddl_detail_redacts_passwords() {
+        // Credential-bearing SQL is fully redacted on both outcomes.
+        let (act, det) = redacted_ddl_detail("CREATE USER alice WITH PASSWORD 's3cret'", true);
+        assert_eq!(act, "ddl.ok");
+        assert!(!det.contains("s3cret"), "password must not appear: {det}");
+        assert!(!det.contains("alice"), "redacted wholesale");
+        let (act, _) = redacted_ddl_detail("ALTER USER bob WITH PASSWORD 'pw'", false);
+        assert_eq!(act, "ddl.fail");
+        // Non-credential DDL passes through (truncated).
+        let (_, det) = redacted_ddl_detail("DROP TABLE items", true);
+        assert!(det.contains("DROP TABLE items"));
     }
 }

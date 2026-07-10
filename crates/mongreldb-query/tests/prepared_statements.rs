@@ -46,9 +46,7 @@ async fn prepare_then_execute_reuses_plan() {
 #[tokio::test]
 async fn deallocate_removes_prepared() {
     let (_dir, s) = session().await;
-    s.run("PREPARE p2 AS SELECT $1")
-        .await
-        .unwrap();
+    s.run("PREPARE p2 AS SELECT $1").await.unwrap();
     s.run("DEALLOCATE p2").await.unwrap();
     // After DEALLOCATE, EXECUTE must fail.
     let err = s.run("EXECUTE p2(1)").await;

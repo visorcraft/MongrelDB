@@ -447,6 +447,52 @@ fn fk_cyclical_same_txn_inserts() {
 }
 
 #[test]
+fn fk_cascade_does_not_fire_on_key_preserving_update() {
+    let dir = tempdir().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.create_table("users", users_schema(false, false))
+        .unwrap();
+    db.create_table("orders", orders_schema_with_action(FkAction::Cascade))
+        .unwrap();
+
+    // A user and a child order referencing them.
+    db.transaction(|t| {
+        t.put(
+            "users",
+            row(&[(0, Value::Int64(1)), (1, Value::Bytes(b"a@x".to_vec()))]),
+        )?;
+        t.put(
+            "orders",
+            row(&[(10, Value::Int64(50)), (11, Value::Int64(1))]),
+        )?;
+        Ok::<_, mongreldb_core::MongrelError>(())
+    })
+    .unwrap();
+    assert_eq!(visible_count(&db, "orders"), 1);
+
+    // Simulate a SQL UPDATE of the user's email: delete + re-put with the SAME
+    // primary key (id=1). The referenced key is preserved, so ON DELETE
+    // CASCADE must NOT delete the child order.
+    let user_rid = row_id_of(&db, "users", 0, &Value::Int64(1));
+    db.transaction(|t| {
+        t.delete("users", user_rid)?;
+        t.put(
+            "users",
+            row(&[(0, Value::Int64(1)), (1, Value::Bytes(b"b@x".to_vec()))]),
+        )?;
+        Ok::<_, mongreldb_core::MongrelError>(())
+    })
+    .unwrap();
+
+    assert_eq!(
+        visible_count(&db, "orders"),
+        1,
+        "cascade must not fire when the parent key is preserved by an update"
+    );
+    assert_eq!(visible_count(&db, "users"), 1);
+}
+
+#[test]
 fn constraints_persist_across_reopen() {
     let dir = tempdir().unwrap();
     {
