@@ -28,7 +28,9 @@ use mongreldb_query::{ExternalTableModule, MongrelSession};
 use serde::Deserialize;
 use serde_json::json;
 
+mod audit;
 mod kit;
+mod metrics;
 mod procedure;
 mod trigger;
 
@@ -58,6 +60,25 @@ fn status_for_query_error(e: &mongreldb_query::MongrelQueryError) -> StatusCode 
     }
 }
 
+/// Extractor that pulls the authenticated [`mongreldb_core::Principal`] (if the
+/// auth middleware injected one) from request extensions without erroring when
+/// absent (e.g. token-authenticated requests carry no `Principal`).
+struct OptionalPrincipal(Option<mongreldb_core::Principal>);
+
+impl<S> axum::extract::FromRequestParts<S> for OptionalPrincipal
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(OptionalPrincipal(parts.extensions.get::<mongreldb_core::Principal>().cloned()))
+    }
+}
+
 struct AppState {
     db: Arc<Database>,
     idem: kit::IdempotencyStore,
@@ -65,6 +86,12 @@ struct AppState {
     auth_token: Option<String>,
     /// When true, authenticate via catalog users (HTTP Basic auth).
     user_auth: bool,
+    /// Daemon-wide Prometheus-style counters, shared by all handlers.
+    metrics: Arc<metrics::Metrics>,
+    /// `/sql` requests slower than this are logged as slow queries.
+    slow_query_threshold: std::time::Duration,
+    /// Bounded security audit log (auth + DDL/privilege events).
+    audit: Arc<audit::AuditLog>,
 }
 
 pub fn build_app(db: Arc<Database>) -> axum::Router {
@@ -102,9 +129,14 @@ pub fn build_app_full(
         external_modules: external_modules.into_iter().collect(),
         auth_token,
         user_auth,
+        metrics: Arc::new(metrics::Metrics::default()),
+        slow_query_threshold: metrics::slow_query_threshold(),
+        audit: Arc::new(audit::AuditLog::new(8192)),
     });
     let router = axum::Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics_handler))
+        .route("/audit", get(audit_handler))
         .route("/tables", get(list_tables).post(create_table))
         .route("/tables/{name}", axum::routing::delete(drop_table))
         .route("/tables/{name}/put", post(put_row))
@@ -179,7 +211,10 @@ async fn auth_middleware(
     if let Some(token) = &state.auth_token {
         if let Some(provided) = header.strip_prefix("Bearer ") {
             if provided == token {
+                state.audit.record("token", "login.ok", "bearer token accepted");
                 return Ok(next.run(req).await);
+            } else {
+                state.audit.record("token", "login.fail", "invalid bearer token");
             }
         }
     }
@@ -191,11 +226,18 @@ async fn auth_middleware(
                 if let Ok(creds) = std::str::from_utf8(&decoded) {
                     if let Some((username, password)) = creds.split_once(':') {
                         if let Ok(Some(_user)) = state.db.verify_user(username, password) {
+                            state
+                                .audit
+                                .record(username, "login.ok", "basic credentials accepted");
                             // Inject the principal for permission checks.
                             if let Some(principal) = state.db.resolve_principal(username) {
                                 req.extensions_mut().insert(principal);
                             }
                             return Ok(next.run(req).await);
+                        } else {
+                            state
+                                .audit
+                                .record(username, "login.fail", "invalid basic credentials");
                         }
                     }
                 }
@@ -339,6 +381,32 @@ pub fn spawn_auto_compactor(db: Arc<Database>) {
 
 async fn health() -> StatusCode {
     StatusCode::OK
+}
+
+/// `GET /audit` — recent security-audit events (auth + DDL/privilege) as a JSON
+/// array, oldest-first. Subject to the same auth middleware as every other
+/// route. This is a best-effort in-memory ring buffer, not a tamper-evident
+/// log (see `audit` module docs).
+async fn audit_handler(State(state): State<Arc<AppState>>) -> Response {
+    let recent = state.audit.recent();
+    Json(recent).into_response()
+}
+
+
+/// `mongreldb_tables` gauge. Subject to the same auth middleware as every other
+/// route (scrape with the configured Bearer token / Basic credentials).
+async fn metrics_handler(State(state): State<Arc<AppState>>) -> Response {
+    let body = state
+        .metrics
+        .prometheus_text(state.db.table_names().len());
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8".to_string(),
+        )],
+        body,
+    )
+        .into_response()
 }
 
 /// `POST /compact` — compact all mounted tables.
@@ -562,6 +630,7 @@ async fn put_row(
         Ok(r) => r,
         Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
     };
+    state.metrics.inc_puts();
     match g.put(row) {
         Ok(rid) => Json(json!({ "row_id": rid.0.to_string() })).into_response(),
         Err(e) => (status_for_error(&e), e.to_string()).into_response(),
@@ -582,6 +651,7 @@ async fn commit(State(state): State<Arc<AppState>>, Path(name): Path<String>) ->
         Err(e) => return (StatusCode::NOT_FOUND, e.to_string()).into_response(),
     };
     let mut g = handle.lock();
+    state.metrics.inc_commits();
     match g.commit() {
         Ok(epoch) => Json(json!({ "epoch": epoch.0 })).into_response(),
         Err(e) => (status_for_error(&e), e.to_string()).into_response(),
@@ -597,7 +667,11 @@ struct SqlRequest {
     format: Option<String>,
 }
 
-async fn sql(State(state): State<Arc<AppState>>, Json(req): Json<SqlRequest>) -> Response {
+async fn sql(
+    State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
+    Json(req): Json<SqlRequest>,
+) -> Response {
     let session = match MongrelSession::open_with_external_modules(
         Arc::clone(&state.db),
         state.external_modules.iter().cloned(),
@@ -605,18 +679,57 @@ async fn sql(State(state): State<Arc<AppState>>, Json(req): Json<SqlRequest>) ->
         Ok(s) => s,
         Err(e) => return (status_for_query_error(&e), e.to_string()).into_response(),
     };
-    match session.run(&req.sql).await {
-        Ok(batches) => {
+    state.metrics.inc_sql_queries();
+    // Audit DDL / privilege statements attributed to the resolved principal.
+    // Non-DDL reads are not audited here (auth events cover access).
+    if audit::is_audited_sql(&req.sql) {
+        let actor = principal
+            .as_ref()
+            .map(|p| p.username.clone())
+            .unwrap_or_else(|| "anonymous".to_string());
+        let snippet: String = req.sql.chars().take(160).collect();
+        state.audit.record(actor, "ddl", snippet);
+    }
+    let start = std::time::Instant::now();
+    // `run_sql_traced` captures a QueryTrace (scan path, index rebuild, pages
+    // decoded, planning nanos) which we surface in the slow-query log when the
+    // request exceeds the configured threshold.
+    let traced = session.run_sql_traced(&req.sql).await;
+    let elapsed = start.elapsed();
+    match traced {
+        Ok((batches, trace)) => {
+            if elapsed >= state.slow_query_threshold {
+                state.metrics.inc_slow_queries();
+                let micros = elapsed.as_micros();
+                eprintln!(
+                    "[slow-query] {micros}\u{00b5}s ({} planning) \u{2014} {trace}",
+                    trace.planning_nanos
+                );
+            }
             // Arrow IPC format: opt-in via format:"arrow".
             // JSON is the default (sensible for HTTP clients).
             if req.format.as_deref() == Some("arrow") {
                 return sql_arrow_response(&batches);
             }
+            // Arrow IPC *streaming* format: opt-in via format:"arrow-stream".
+            // Serializes and emits one record-batch IPC message at a time so the
+            // client receives batches incrementally and the server never holds a
+            // single contiguous serialization buffer for the whole result.
+            if req.format.as_deref() == Some("arrow-stream") {
+                return sql_arrow_stream_response(&batches);
+            }
 
             // Default JSON format.
             sql_json_response(&batches)
         }
-        Err(e) => (status_for_query_error(&e), e.to_string()).into_response(),
+        Err(e) => {
+            state.metrics.inc_sql_errors();
+            (
+                status_for_query_error(&e),
+                format!("{e} ({}µs)", elapsed.as_micros()),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -640,6 +753,81 @@ fn sql_arrow_response(batches: &[arrow::record_batch::RecordBatch]) -> Response 
         buf,
     )
         .into_response()
+}
+
+/// Serialize Arrow record batches as a **streaming** Arrow IPC stream
+/// (`application/vnd.apache.arrow.stream`). Unlike [`sql_arrow_response`]
+/// (which builds one contiguous IPC *file* `Vec<u8>`), this yields the schema
+/// message, then one record-batch message, then the end-of-stream marker — each
+/// serialized lazily as the response body is polled. The client receives the
+/// first batch before later batches are encoded, and the server's peak memory
+/// is the source `RecordBatch`es plus a single IPC message at a time (no whole-
+/// result serialization buffer).
+///
+/// The source batches are still materialized as a `Vec<RecordBatch>` by the
+/// query layer (a consequence of the result cache + native fast paths); a
+/// future streaming query path could feed this body directly.
+fn sql_arrow_stream_response(batches: &[arrow::record_batch::RecordBatch]) -> Response {
+    use futures::{stream, StreamExt};
+
+    const STREAM_CT: &str = "application/vnd.apache.arrow.stream";
+
+    if batches.is_empty() {
+        return (
+            [(header::CONTENT_TYPE, STREAM_CT)],
+            axum::body::Body::empty(),
+        )
+            .into_response();
+    }
+
+    let schema = batches[0].schema();
+    let mut writer = match arrow::ipc::writer::StreamWriter::try_new(Vec::new(), schema.as_ref()) {
+        Ok(w) => w,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("arrow stream init error: {e}"),
+            )
+                .into_response()
+        }
+    };
+    // `try_new` synchronously writes the schema message; drain it so it becomes
+    // the first chunk yielded to the client.
+    let schema_chunk: Vec<u8> = std::mem::take(writer.get_mut());
+    let batches_owned: Vec<arrow::record_batch::RecordBatch> = batches.to_vec();
+
+    // Lazy per-batch + end-of-stream serialization. State carries the writer so
+    // each batch appends exactly one IPC message; we drain after every write.
+    let batch_stream = stream::unfold(
+        (writer, batches_owned, 0_usize, false),
+        |(mut w, batches, idx, eos)| async move {
+            if idx < batches.len() {
+                // Encode one record-batch message; on failure end the stream.
+                if w.write(&batches[idx]).is_err() {
+                    return None;
+                }
+                let chunk = std::mem::take(w.get_mut());
+                if chunk.is_empty() {
+                    return None;
+                }
+                Some((chunk, (w, batches, idx + 1, eos)))
+            } else if !eos {
+                if w.finish().is_err() {
+                    return None;
+                }
+                let chunk = std::mem::take(w.get_mut());
+                Some((chunk, (w, batches, idx, true)))
+            } else {
+                None
+            }
+        },
+    );
+
+    // Schema first, then batches + EOS.
+    let full = stream::iter([schema_chunk]).chain(batch_stream);
+    let body_stream = full.map(Ok::<Vec<u8>, std::io::Error>);
+    let body = axum::body::Body::from_stream(body_stream);
+    ([(header::CONTENT_TYPE, STREAM_CT)], body).into_response()
 }
 
 /// Serialize Arrow record batches into a JSON array of row objects using the
@@ -732,6 +920,7 @@ async fn txn(State(state): State<Arc<AppState>>, Json(req): Json<TxnRequest>) ->
         }
     }
 
+    state.metrics.inc_txns();
     let result = state.db.transaction(|t| {
         for (table, action) in &parsed {
             match action {
@@ -864,5 +1053,380 @@ mod wal_stream_tests {
         // Should contain at least one record (the flush commit).
         assert!(!body.is_empty(), "wal_stream should return records");
         assert!(body.contains("seq"), "response should contain seq field");
+    }
+}
+
+#[cfg(test)]
+mod metrics_tests {
+    use super::*;
+    use mongreldb_core::Database;
+    use tempfile::tempdir;
+
+    /// Helper: spin up a daemon over a fresh DB with one `items(id int64 pk)`
+    /// table pre-created, returning the bound address.
+    async fn setup() -> std::net::SocketAddr {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(Database::create(dir.path()).unwrap());
+        let table_schema = mongreldb_core::schema::Schema {
+            schema_id: 1,
+            columns: vec![mongreldb_core::schema::ColumnDef {
+                id: 1,
+                name: "id".into(),
+                ty: TypeId::Int64,
+                flags: mongreldb_core::schema::ColumnFlags::empty()
+                    .with(mongreldb_core::schema::ColumnFlags::PRIMARY_KEY),
+                default_value: None,
+            }],
+            indexes: vec![],
+            colocation: vec![],
+            constraints: Default::default(),
+            clustered: false,
+        };
+        db.create_table("items", table_schema).unwrap();
+        let app = build_app(db);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        addr
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_returns_prometheus_text() {
+        let addr = setup().await;
+        let client = reqwest::Client::new();
+
+        // Exercise a few handlers to bump counters.
+        let _ = client
+            .post(format!("http://{addr}/tables/items/put"))
+            .json(&json!({ "row": [1, 1] }))
+            .send()
+            .await
+            .unwrap();
+        let _ = client
+            .post(format!("http://{addr}/sql"))
+            .json(&json!({ "sql": "SELECT count(*) FROM items" }))
+            .send()
+            .await
+            .unwrap();
+
+        let resp = client.get(format!("http://{addr}/metrics")).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(ct.contains("text/plain"), "content-type is prometheus text: {ct}");
+        let body = resp.text().await.unwrap();
+        // Prometheus series + type lines are present.
+        assert!(body.contains("# TYPE mongreldb_sql_queries_total counter"));
+        assert!(body.contains("# TYPE mongreldb_puts_total counter"));
+        assert!(body.contains("# TYPE mongreldb_tables gauge"));
+        // Counters were bumped: at least one query and one put were served.
+        assert!(
+            body.contains("mongreldb_sql_queries_total 1"),
+            "sql_queries counter should reflect the /sql call: {body}"
+        );
+        assert!(
+            body.contains("mongreldb_puts_total 1"),
+            "puts counter should reflect the put call: {body}"
+        );
+        // The tables gauge reflects the single `items` table.
+        assert!(body.contains("mongreldb_tables 1"));
+    }
+
+    #[tokio::test]
+    async fn metrics_error_counter_increments_on_bad_sql() {
+        let addr = setup().await;
+        let client = reqwest::Client::new();
+        // A query against a non-existent table errors at the engine layer.
+        let _ = client
+            .post(format!("http://{addr}/sql"))
+            .json(&json!({ "sql": "SELECT * FROM does_not_exist" }))
+            .send()
+            .await
+            .unwrap();
+        let body = client
+            .get(format!("http://{addr}/metrics"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            body.contains("mongreldb_sql_errors_total 1"),
+            "sql_errors should increment on a failed query: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn arrow_stream_returns_ipc_stream_bytes() {
+        let addr = setup().await;
+        let client = reqwest::Client::new();
+        // Insert a couple of rows so there are real batches to stream, then
+        // flush so the rows are durable/visible to a fresh SQL session.
+        for i in 1..=3 {
+            let resp = client
+                .post(format!("http://{addr}/tables/items/put"))
+                .json(&json!({ "row": [1, i] }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "put should succeed");
+        }
+        let _ = client
+            .post(format!("http://{addr}/tables/items/commit"))
+            .send()
+            .await
+            .unwrap();
+        // Sanity: the rows are durable and visible to the table handle.
+        let count_body = client
+            .get(format!("http://{addr}/tables/items/count"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            count_body.contains("\"count\":3"),
+            "expected 3 visible rows, got: {count_body}"
+        );
+        let resp = client
+            .post(format!("http://{addr}/sql"))
+            .json(&json!({ "sql": "SELECT count(*) FROM items", "format": "arrow-stream" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "streaming query should succeed");
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            ct.contains("application/vnd.apache.arrow.stream"),
+            "content-type should be the arrow stream format: {ct}"
+        );
+        let bytes = resp.bytes().await.unwrap();
+        // Arrow IPC streams begin with the magic continuation marker
+        // 0xFFFFFFFF followed by the schema message length. The stream must be
+        // non-empty (3 rows were written) and end with the EOS marker.
+        assert!(
+            !bytes.is_empty(),
+            "arrow stream body should contain schema + batch + EOS"
+        );
+        assert!(
+            bytes.starts_with(&0xFFFFFFFFu32.to_le_bytes()),
+            "arrow stream must begin with the IPC continuation marker"
+        );
+        assert!(
+            bytes.ends_with(&[0u8, 0, 0, 0]),
+            "arrow stream should end with the EOS marker (trailing zero length)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use std::sync::Arc as StdArc;
+
+    /// Unit-level check: feed two synthetic batches through the streaming
+    /// serializer and re-parse the resulting IPC stream end-to-end. This
+    /// validates the per-message chunking (schema + N batches + EOS) without
+    /// depending on the engine's scan visibility.
+    #[tokio::test]
+    async fn arrow_stream_serializes_multiple_batches_roundtrip() {
+        let schema = StdArc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let b1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![StdArc::new(Int64Array::from(vec![1, 2]))],
+        )
+        .unwrap();
+        let b2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![StdArc::new(Int64Array::from(vec![3, 4, 5]))],
+        )
+        .unwrap();
+
+        let resp = sql_arrow_stream_response(&[b1, b2]);
+        let bytes =
+            axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+
+        // Begins with the IPC continuation marker.
+        assert!(bytes.starts_with(&0xFFFFFFFFu32.to_le_bytes()));
+
+        // Re-parse the full stream and confirm all rows survived the chunked
+        // serialization.
+        let slice: &[u8] = bytes.as_ref();
+        let mut reader = arrow::ipc::reader::StreamReader::try_new(slice, None).unwrap();
+        let mut total_rows = 0;
+        for batch in reader.by_ref() {
+            let batch = batch.expect("each IPC message should decode");
+            total_rows += batch.num_rows();
+        }
+        assert_eq!(total_rows, 5, "all rows should round-trip through the stream");
+    }
+
+    #[tokio::test]
+    async fn arrow_stream_empty_batches_yield_empty_body() {
+        let resp = sql_arrow_stream_response(&[]);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        assert!(bytes.is_empty(), "no batches \u{2192} empty stream body");
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    use mongreldb_core::Database;
+    use tempfile::tempdir;
+
+    /// Build a daemon with user-auth enabled plus one catalog user `alice`.
+    async fn auth_setup(password: &str) -> std::net::SocketAddr {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(Database::create(dir.path()).unwrap());
+        db.create_user("alice", password).unwrap();
+        let app = build_app_full(
+            db,
+            std::iter::empty::<Arc<dyn ExternalTableModule>>(),
+            None,
+            None,
+            true,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        addr
+    }
+
+    #[tokio::test]
+    async fn audit_records_login_success_and_failure() {
+        let addr = auth_setup("s3cret").await;
+        let client = reqwest::Client::new();
+
+        // Successful basic auth.
+        let resp = client
+            .get(format!("http://{addr}/health"))
+            .header("Authorization", basic("alice", "s3cret"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        // Failed basic auth (wrong password).
+        let resp = client
+            .get(format!("http://{addr}/health"))
+            .header("Authorization", basic("alice", "wrong"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+
+        let body = client
+            .get(format!("http://{addr}/audit"))
+            .header("Authorization", basic("alice", "s3cret"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            body.contains("\"action\":\"login.ok\""),
+            "audit should record the successful login: {body}"
+        );
+        assert!(
+            body.contains("\"action\":\"login.fail\""),
+            "audit should record the failed login: {body}"
+        );
+        assert!(
+            body.contains("\"principal\":\"alice\""),
+            "audit should attribute events to alice: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_records_ddl_sql() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(Database::create(dir.path()).unwrap());
+        let app = build_app(db);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client = reqwest::Client::new();
+        let _ = client
+            .post(format!("http://{addr}/sql"))
+            .json(&json!({ "sql": "CREATE TABLE t (id BIGINT PRIMARY KEY)" }))
+            .send()
+            .await
+            .unwrap();
+        // A plain SELECT is NOT audited.
+        let _ = client
+            .post(format!("http://{addr}/sql"))
+            .json(&json!({ "sql": "SELECT 1" }))
+            .send()
+            .await
+            .unwrap();
+
+        let body = client
+            .get(format!("http://{addr}/audit"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            body.contains("\"action\":\"ddl\""),
+            "audit should record the DDL statement: {body}"
+        );
+        assert!(
+            body.contains("CREATE TABLE"),
+            "audit detail should carry the DDL snippet: {body}"
+        );
+        // SELECT must not appear.
+        assert!(
+            !body.contains("SELECT 1"),
+            "non-DDL reads should not be audited: {body}"
+        );
+    }
+
+    fn basic(user: &str, pass: &str) -> String {
+        let raw = format!("{user}:{pass}");
+        format!("Basic {}", base64_encode(raw.as_bytes()))
+    }
+
+    fn base64_encode(input: &[u8]) -> String {
+        const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        let mut buf = 0u32;
+        let mut bits = 0u32;
+        for &b in input {
+            buf = (buf << 8) | b as u32;
+            bits += 8;
+            while bits >= 6 {
+                bits -= 6;
+                out.push(TABLE[((buf >> bits) & 0x3F) as usize] as char);
+            }
+        }
+        if bits > 0 {
+            out.push(TABLE[((buf << (6 - bits)) & 0x3F) as usize] as char);
+        }
+        while !out.len().is_multiple_of(4) {
+            out.push('=');
+        }
+        out
     }
 }

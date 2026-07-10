@@ -3326,6 +3326,31 @@ impl Database {
                                 }
                             }
                         }
+                        // Final-write-set FK validation: a parent inserted in
+                        // THIS transaction also satisfies the FK. This enables
+                        // atomic parent+child batches and cyclical/mutual FK
+                        // inserts within a single transaction — the child sees
+                        // the staged parent put even though it is not committed
+                        // yet.
+                        if !found {
+                            for (st_table, st_op) in staging.iter() {
+                                if *st_table != parent_id {
+                                    continue;
+                                }
+                                if let Staged::Put(pcells) = st_op {
+                                    let pmap: HashMap<u16, crate::memtable::Value> =
+                                        pcells.iter().cloned().collect();
+                                    if let Some(pkey) =
+                                        encode_composite_key(&fk.ref_columns, &pmap)
+                                    {
+                                        if pkey == child_key {
+                                            found = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         if !found {
                             return Err(MongrelError::Conflict(format!(
                                 "FOREIGN KEY '{}' on table '{tname}' has no matching parent in '{}'",

@@ -1962,7 +1962,8 @@ impl MongrelSession {
         // sessions created via `new()` + `register_db()`.
         let epoch = self.cache_epoch();
         let key = (sql.to_string(), epoch);
-        let result_cacheable = !extended_sql_functions::contains_volatile_extended_function(sql);
+        let result_cacheable = !extended_sql_functions::contains_volatile_extended_function(sql)
+            && !is_explain_analyze(sql);
         if result_cacheable {
             if let Some(hit) = self.cache.lock().get(&key) {
                 return Ok((**hit).clone());
@@ -2577,6 +2578,20 @@ fn strip_explain_query_plan(sql: &str) -> Option<&str> {
         return None;
     }
     Some(after_query.get(4..)?.trim_start())
+}
+
+/// Whether `sql` is an `EXPLAIN ANALYZE ...` statement. EXPLAIN ANALYZE falls
+/// through to DataFusion 54 (which executes the plan and reports per-operator
+/// timing), but its output must never be result-cached: the timing metrics are
+/// request-specific and would be misleading on a cache hit.
+fn is_explain_analyze(sql: &str) -> bool {
+    let trimmed = sql.trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+    if !lower.starts_with("explain") {
+        return false;
+    }
+    let after = trimmed[7..].trim_start();
+    after.to_ascii_lowercase().starts_with("analyze")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

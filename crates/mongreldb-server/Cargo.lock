@@ -2509,6 +2509,7 @@ dependencies = [
  "arrow",
  "axum",
  "datafusion",
+ "futures",
  "libc",
  "mongreldb-client",
  "mongreldb-core",

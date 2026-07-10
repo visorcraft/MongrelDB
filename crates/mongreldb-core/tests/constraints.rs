@@ -329,6 +329,100 @@ fn fk_rejects_orphan_and_restricts_delete() {
 }
 
 #[test]
+fn fk_same_txn_parent_and_child_insert() {
+    let dir = tempdir().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.create_table("users", users_schema(false, false)).unwrap();
+    db.create_table("orders", orders_schema_with_fk()).unwrap();
+
+    // Single transaction: insert a user AND an order referencing them. The
+    // parent is not yet committed when the child's FK is validated, so this
+    // requires final-write-set FK validation (the child sees the staged
+    // parent put within the same batch).
+    let r = db.transaction(|t| {
+        t.put(
+            "users",
+            row(&[(0, Value::Int64(7)), (1, Value::Bytes(b"p@x".to_vec()))]),
+        )?;
+        t.put("orders", row(&[(10, Value::Int64(70)), (11, Value::Int64(7))]))?;
+        Ok(())
+    });
+    assert!(
+        r.is_ok(),
+        "same-txn parent+child insert should satisfy FK: {:?}",
+        r
+    );
+}
+
+#[test]
+fn fk_cyclical_same_txn_inserts() {
+    // Two tables that mutually reference each other. Inserting a row in each
+    // (each referencing the other) within a single transaction must succeed
+    // under final-write-set FK validation.
+    let dir = tempdir().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+
+    // a(id pk, bid -> b.id) ; b(id pk, aid -> a.id)
+    let a_schema = {
+        let mut cons = TableConstraints::default();
+        cons.foreign_keys.push(ForeignKey {
+            id: 1,
+            name: "a_b_fk".into(),
+            columns: vec![11],
+            ref_table: "b".into(),
+            ref_columns: vec![10],
+            on_delete: FkAction::Restrict,
+        });
+        Schema {
+            schema_id: 0,
+            columns: vec![
+                col(10, "id", TypeId::Int64, ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY)),
+                col(11, "bid", TypeId::Int64, ColumnFlags::empty().with(ColumnFlags::NULLABLE)),
+            ],
+            indexes: vec![],
+            colocation: vec![],
+            constraints: cons,
+            clustered: false,
+        }
+    };
+    let b_schema = {
+        let mut cons = TableConstraints::default();
+        cons.foreign_keys.push(ForeignKey {
+            id: 2,
+            name: "b_a_fk".into(),
+            columns: vec![11],
+            ref_table: "a".into(),
+            ref_columns: vec![10],
+            on_delete: FkAction::Restrict,
+        });
+        Schema {
+            schema_id: 0,
+            columns: vec![
+                col(10, "id", TypeId::Int64, ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY)),
+                col(11, "aid", TypeId::Int64, ColumnFlags::empty().with(ColumnFlags::NULLABLE)),
+            ],
+            indexes: vec![],
+            colocation: vec![],
+            constraints: cons,
+            clustered: false,
+        }
+    };
+    db.create_table("a", a_schema).unwrap();
+    db.create_table("b", b_schema).unwrap();
+
+    let r = db.transaction(|t| {
+        t.put("a", row(&[(10, Value::Int64(1)), (11, Value::Int64(2))]))?;
+        t.put("b", row(&[(10, Value::Int64(2)), (11, Value::Int64(1))]))?;
+        Ok(())
+    });
+    assert!(
+        r.is_ok(),
+        "cyclical same-txn inserts should satisfy FK: {:?}",
+        r
+    );
+}
+
+#[test]
 fn constraints_persist_across_reopen() {
     let dir = tempdir().unwrap();
     {
