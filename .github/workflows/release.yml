@@ -127,7 +127,7 @@ jobs:
       - uses: actions/upload-artifact@v7
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         with:
-          name: addon-js
+          name: mongreldb.addon-js
           path: |
             crates/mongreldb-node/native.js
             crates/mongreldb-node/native.d.ts
@@ -150,6 +150,7 @@ jobs:
 
       - uses: actions/download-artifact@v8
         with:
+          pattern: 'mongreldb.*'
           path: crates/mongreldb-node
           merge-multiple: true
 
