@@ -118,13 +118,13 @@ jobs:
 
       - run: test -f ${{ matrix.node-file }}
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.node-file }}
           path: crates/mongreldb-node/${{ matrix.node-file }}
           if-no-files-found: error
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         with:
           name: addon-js
@@ -148,7 +148,7 @@ jobs:
           registry-url: https://registry.npmjs.org
           scope: '@visorcraft'
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: crates/mongreldb-node
           merge-multiple: true
