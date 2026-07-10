@@ -186,6 +186,12 @@ pub fn build_app_with_sessions(
         .route("/txn", post(txn))
         .route("/sessions", post(create_session))
         .route("/sessions/{id}", axum::routing::delete(close_session))
+        .route("/sessions/{id}/prepare", post(prepare_statement))
+        .route("/sessions/{id}/execute", post(execute_statement))
+        .route(
+            "/sessions/{id}/statements/{name}",
+            axum::routing::delete(deallocate_statement),
+        )
         .route("/procedures", get(procedure::list).post(procedure::create))
         .route(
             "/procedures/{name}",
@@ -519,6 +525,171 @@ async fn close_session(
             "session not found or not owned by caller",
         )
             .into_response()
+    }
+}
+
+/// Choose the response serialization for a result set: `"arrow"` (IPC file),
+/// `"arrow-stream"` (streaming IPC), or JSON (the default).
+fn dispatch_sql_format(
+    format: Option<&str>,
+    batches: &[arrow::record_batch::RecordBatch],
+) -> Response {
+    match format {
+        Some("arrow") => sql_arrow_response(batches),
+        Some("arrow-stream") => sql_arrow_stream_response(batches),
+        _ => sql_json_response(batches),
+    }
+}
+
+/// Validate a prepared-statement name: bare identifier only
+/// (`[A-Za-z_][A-Za-z0-9_]*`). Prevents SQL injection via the name, which is
+/// interpolated into `PREPARE <name> AS ...` / `EXECUTE <name>(...)`.
+fn validate_stmt_name(name: &str) -> Result<(), String> {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return Err("statement name must start with a letter or underscore".into()),
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err("statement name may contain only letters, digits, or underscore".into());
+    }
+    Ok(())
+}
+
+/// Render a JSON value as a safe SQL literal for `EXECUTE` parameter binding.
+/// Values are escaped so a client cannot inject SQL through a parameter.
+fn render_sql_literal(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Null => "NULL".into(),
+        serde_json::Value::Bool(b) => {
+            if *b {
+                "TRUE".into()
+            } else {
+                "FALSE".into()
+            }
+        }
+        serde_json::Value::Number(n) => n.to_string(),
+        // Single-quote, doubling embedded single quotes (SQL-standard escape).
+        serde_json::Value::String(s) => {
+            let mut out = String::with_capacity(s.len() + 2);
+            out.push('\'');
+            for c in s.chars() {
+                if c == '\'' {
+                    out.push_str("''");
+                } else {
+                    out.push(c);
+                }
+            }
+            out.push('\'');
+            out
+        }
+        // Arrays/objects are not supported as scalar params; render as NULL so a
+        // malformed request fails the cast rather than injecting.
+        _ => "NULL".into(),
+    }
+}
+
+#[derive(Deserialize)]
+struct PrepareRequest {
+    name: String,
+    sql: String,
+}
+
+/// `POST /sessions/{id}/prepare` — parse+plan `sql` once and store it under
+/// `name` on the session. Subsequent `EXECUTE name(...)` calls (via this
+/// endpoint or `EXECUTE` SQL) reuse the cached plan, skipping re-planning.
+async fn prepare_statement(
+    State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
+    Path(id): Path<String>,
+    Json(req): Json<PrepareRequest>,
+) -> Response {
+    if let Err(msg) = validate_stmt_name(&req.name) {
+        return (StatusCode::BAD_REQUEST, msg).into_response();
+    }
+    let owner = request_owner(&state, &principal);
+    let Some(entry) = state.sessions.get(&id, &owner) else {
+        return (
+            StatusCode::NOT_FOUND,
+            "session not found or not owned by caller",
+        )
+            .into_response();
+    };
+    let _guard = entry.lock.lock().await;
+    entry.touch();
+    let sql = format!("PREPARE {} AS {}", req.name, req.sql);
+    match entry.session.run(&sql).await {
+        Ok(_) => Json(json!({ "prepared": req.name })).into_response(),
+        Err(e) => (status_for_query_error(&e), e.to_string()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct ExecuteRequest {
+    name: String,
+    params: Vec<serde_json::Value>,
+    #[serde(default)]
+    format: Option<String>,
+}
+
+/// `POST /sessions/{id}/execute` — run a previously-prepared statement with
+/// typed parameters, reusing its cached plan. Returns the same formats as
+/// `/sql` (`json` default, `arrow`, `arrow-stream`).
+async fn execute_statement(
+    State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
+    Path(id): Path<String>,
+    Json(req): Json<ExecuteRequest>,
+) -> Response {
+    if let Err(msg) = validate_stmt_name(&req.name) {
+        return (StatusCode::BAD_REQUEST, msg).into_response();
+    }
+    let owner = request_owner(&state, &principal);
+    let Some(entry) = state.sessions.get(&id, &owner) else {
+        return (
+            StatusCode::NOT_FOUND,
+            "session not found or not owned by caller",
+        )
+            .into_response();
+    };
+    let _guard = entry.lock.lock().await;
+    entry.touch();
+    state.metrics.inc_sql_queries();
+    let literals: Vec<String> = req.params.iter().map(render_sql_literal).collect();
+    let sql = format!("EXECUTE {}({})", req.name, literals.join(", "));
+    match entry.session.run(&sql).await {
+        Ok(batches) => dispatch_sql_format(req.format.as_deref(), &batches),
+        Err(e) => {
+            state.metrics.inc_sql_errors();
+            (status_for_query_error(&e), e.to_string()).into_response()
+        }
+    }
+}
+
+/// `DELETE /sessions/{id}/statements/{name}` — drop a prepared statement from
+/// the session (SQL `DEALLOCATE`).
+async fn deallocate_statement(
+    State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
+    Path((id, name)): Path<(String, String)>,
+) -> Response {
+    if let Err(msg) = validate_stmt_name(&name) {
+        return (StatusCode::BAD_REQUEST, msg).into_response();
+    }
+    let owner = request_owner(&state, &principal);
+    let Some(entry) = state.sessions.get(&id, &owner) else {
+        return (
+            StatusCode::NOT_FOUND,
+            "session not found or not owned by caller",
+        )
+            .into_response();
+    };
+    let _guard = entry.lock.lock().await;
+    entry.touch();
+    let sql = format!("DEALLOCATE {name}");
+    match entry.session.run(&sql).await {
+        Ok(_) => Json(json!({ "deallocated": name })).into_response(),
+        Err(e) => (status_for_query_error(&e), e.to_string()).into_response(),
     }
 }
 
@@ -872,19 +1043,8 @@ async fn execute_sql(
             }
             // Arrow IPC format: opt-in via format:"arrow".
             // JSON is the default (sensible for HTTP clients).
-            if req.format.as_deref() == Some("arrow") {
-                return sql_arrow_response(&batches);
-            }
             // Arrow IPC *streaming* format: opt-in via format:"arrow-stream".
-            // Serializes and emits one record-batch IPC message at a time so the
-            // client receives batches incrementally and the server never holds a
-            // single contiguous serialization buffer for the whole result.
-            if req.format.as_deref() == Some("arrow-stream") {
-                return sql_arrow_stream_response(&batches);
-            }
-
-            // Default JSON format.
-            sql_json_response(&batches)
+            dispatch_sql_format(req.format.as_deref(), &batches)
         }
         Err(e) => {
             state.metrics.inc_sql_errors();
@@ -1784,5 +1944,97 @@ mod session_tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
         assert_eq!(count_items(&client, &addr).await, 1);
+    }
+
+    #[tokio::test]
+    async fn prepared_statement_prepare_execute_and_reuse() {
+        let (_dir, addr) = setup().await;
+        let client = reqwest::Client::new();
+        let session = open_session(&client, &addr).await;
+        sql_on(
+            &client,
+            &addr,
+            &session,
+            "INSERT INTO items (id) VALUES (1), (2), (3), (4)",
+        )
+        .await;
+
+        // Prepare a parameterized query once.
+        let resp = client
+            .post(format!("http://{addr}/sessions/{session}/prepare"))
+            .json(&json!({"name":"gt","sql":"SELECT id FROM items WHERE id > $1"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        // Execute with param 2 → ids 3,4.
+        let resp = client
+            .post(format!("http://{addr}/sessions/{session}/execute"))
+            .json(&json!({"name":"gt","params":[2]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = resp.json::<serde_json::Value>().await.unwrap();
+        let arr = body
+            .as_array()
+            .expect("execute returns a JSON array of rows");
+        assert_eq!(arr.len(), 2, "ids > 2 are {{3,4}}: {body}");
+
+        // Re-execute with a different param → reuses the cached plan, fewer rows.
+        let resp = client
+            .post(format!("http://{addr}/sessions/{session}/execute"))
+            .json(&json!({"name":"gt","params":[3]}))
+            .send()
+            .await
+            .unwrap();
+        let body = resp.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(body.as_array().unwrap().len(), 1, "ids > 3 is {{4}}");
+    }
+
+    #[tokio::test]
+    async fn prepared_statement_deallocate_then_execute_fails() {
+        let (_dir, addr) = setup().await;
+        let client = reqwest::Client::new();
+        let session = open_session(&client, &addr).await;
+        let _ = client
+            .post(format!("http://{addr}/sessions/{session}/prepare"))
+            .json(&json!({"name":"p","sql":"SELECT $1"}))
+            .send()
+            .await
+            .unwrap();
+        let resp = client
+            .delete(format!("http://{addr}/sessions/{session}/statements/p"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        // Execute after deallocate must error.
+        let resp = client
+            .post(format!("http://{addr}/sessions/{session}/execute"))
+            .json(&json!({"name":"p","params":[1]}))
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(resp.status(), 200, "execute after DEALLOCATE must fail");
+    }
+
+    #[tokio::test]
+    async fn prepared_statement_rejects_bad_name() {
+        let (_dir, addr) = setup().await;
+        let client = reqwest::Client::new();
+        let session = open_session(&client, &addr).await;
+        let resp = client
+            .post(format!("http://{addr}/sessions/{session}/prepare"))
+            .json(&json!({"name":"1bad","sql":"SELECT 1"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            400,
+            "statement name starting with a digit must be rejected"
+        );
     }
 }
