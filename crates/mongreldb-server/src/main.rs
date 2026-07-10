@@ -8,7 +8,9 @@
 //!   mongreldb-server restore  <db_dir>   — open + verify + checkpoint
 
 use mongreldb_core::Database;
-use mongreldb_server::{build_app_full, spawn_auto_compactor};
+use mongreldb_server::{
+    build_app_with_sessions, spawn_auto_compactor, spawn_session_reaper, SessionStore,
+};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -19,6 +21,8 @@ struct Args {
     auth_token: Option<String>,
     user_auth: bool,
     max_connections: Option<usize>,
+    max_sessions: usize,
+    session_idle_timeout_secs: u64,
     passphrase: Option<String>,
     daemon: bool,
     pidfile: Option<String>,
@@ -41,6 +45,8 @@ OPTIONS:
     --auth-token <token>        Enable Bearer token authentication
     --auth-users                Enable Basic user authentication
     --max-connections <n>       Max concurrent connections
+    --max-sessions <n>          Max live sessions for cross-request txns (default 256)
+    --session-idle-timeout <s>  Idle session reaping timeout in seconds (default 300)
     --passphrase <passphrase>   Open an encrypted database
     --daemon                    Fork into the background (daemonize)
     --pidfile <path>            PID file path (default: <db_dir>/mongreldb.pid)
@@ -61,6 +67,8 @@ fn parse_args() -> Result<Args, String> {
     let mut auth_token: Option<String> = None;
     let mut user_auth = false;
     let mut max_connections: Option<usize> = None;
+    let mut max_sessions: usize = 256;
+    let mut session_idle_timeout_secs: u64 = 300;
     let mut passphrase: Option<String> = None;
     let mut daemon = false;
     let mut pidfile: Option<String> = None;
@@ -97,6 +105,22 @@ fn parse_args() -> Result<Args, String> {
                     v.parse::<usize>()
                         .map_err(|_| format!("--max-connections: invalid value '{v}'"))?,
                 );
+                i += 2;
+            }
+            "--max-sessions" => {
+                let v = raw.get(i + 1).ok_or("--max-sessions requires a value")?;
+                max_sessions = v
+                    .parse::<usize>()
+                    .map_err(|_| format!("--max-sessions: invalid value '{v}'"))?;
+                i += 2;
+            }
+            "--session-idle-timeout" => {
+                let v = raw
+                    .get(i + 1)
+                    .ok_or("--session-idle-timeout requires a value")?;
+                session_idle_timeout_secs = v
+                    .parse::<u64>()
+                    .map_err(|_| format!("--session-idle-timeout: invalid value '{v}'"))?;
                 i += 2;
             }
             "--passphrase" => {
@@ -141,6 +165,8 @@ fn parse_args() -> Result<Args, String> {
         auth_token,
         user_auth,
         max_connections,
+        max_sessions,
+        session_idle_timeout_secs,
         passphrase,
         daemon,
         pidfile,
@@ -277,12 +303,21 @@ async fn main() {
     // §5.9: background cost-aware compaction (run-count trigger).
     spawn_auto_compactor(Arc::clone(&db));
 
-    let app = build_app_full(
+    // Cross-request session store for interactive transactions. The reaper
+    // shares this Arc so it sweeps the same map the handlers use.
+    let sessions = Arc::new(SessionStore::new(
+        args.max_sessions,
+        std::time::Duration::from_secs(args.session_idle_timeout_secs),
+    ));
+    spawn_session_reaper(Arc::clone(&sessions));
+
+    let app = build_app_with_sessions(
         db.clone(),
         std::iter::empty(),
         args.auth_token.clone(),
         args.max_connections,
         args.user_auth,
+        sessions,
     );
 
     if args.auth_token.is_some() {
@@ -294,6 +329,10 @@ async fn main() {
     if let Some(max) = args.max_connections {
         eprintln!("connection limit: {max}");
     }
+    eprintln!(
+        "sessions: max {} (idle timeout {}s) \u{2014} cross-request txns via X-Session-ID",
+        args.max_sessions, args.session_idle_timeout_secs
+    );
 
     let addr = SocketAddr::from(([127, 0, 0, 1], args.port));
     eprintln!("mongreldb-server listening on http://{addr}");

@@ -32,7 +32,10 @@ mod audit;
 mod kit;
 mod metrics;
 mod procedure;
+mod sessions;
 mod trigger;
+
+pub use sessions::{spawn_session_reaper, SessionStore};
 
 /// Map an engine error to the appropriate HTTP status code for defense-in-depth.
 /// Auth errors get 401/403; everything else stays 500. This ensures that even
@@ -94,6 +97,9 @@ struct AppState {
     slow_query_threshold: std::time::Duration,
     /// Bounded security audit log (auth + DDL/privilege events).
     audit: Arc<audit::AuditLog>,
+    /// Token-keyed pool of live sessions for cross-request interactive
+    /// transactions (`X-Session-ID` on `/sql`).
+    sessions: Arc<sessions::SessionStore>,
 }
 
 pub fn build_app(db: Arc<Database>) -> axum::Router {
@@ -123,12 +129,38 @@ pub fn build_app_with_config(
 }
 
 /// Build the daemon router with full auth configuration including user-based auth.
+/// Sessions are enabled with a default capacity (256) and idle timeout (300 s).
 pub fn build_app_full(
     db: Arc<Database>,
     external_modules: impl IntoIterator<Item = Arc<dyn ExternalTableModule>>,
     auth_token: Option<String>,
     max_connections: Option<usize>,
     user_auth: bool,
+) -> axum::Router {
+    let sessions = Arc::new(sessions::SessionStore::new(
+        default_max_sessions(),
+        default_session_idle_timeout(),
+    ));
+    build_app_with_sessions(
+        db,
+        external_modules,
+        auth_token,
+        max_connections,
+        user_auth,
+        sessions,
+    )
+}
+
+/// Build the daemon router with an explicit, externally-owned session store.
+/// The caller (typically `main`) keeps the `Arc<SessionStore>` so it can spawn
+/// the idle reaper against the same map the handlers use.
+pub fn build_app_with_sessions(
+    db: Arc<Database>,
+    external_modules: impl IntoIterator<Item = Arc<dyn ExternalTableModule>>,
+    auth_token: Option<String>,
+    max_connections: Option<usize>,
+    user_auth: bool,
+    sessions: Arc<sessions::SessionStore>,
 ) -> axum::Router {
     let state = Arc::new(AppState {
         idem: kit::IdempotencyStore::new(db.root()),
@@ -139,6 +171,7 @@ pub fn build_app_full(
         metrics: Arc::new(metrics::Metrics::default()),
         slow_query_threshold: metrics::slow_query_threshold(),
         audit: Arc::new(audit::AuditLog::new(8192)),
+        sessions,
     });
     let router = axum::Router::new()
         .route("/health", get(health))
@@ -151,6 +184,8 @@ pub fn build_app_full(
         .route("/tables/{name}/commit", post(commit))
         .route("/sql", post(sql))
         .route("/txn", post(txn))
+        .route("/sessions", post(create_session))
+        .route("/sessions/{id}", axum::routing::delete(close_session))
         .route("/procedures", get(procedure::list).post(procedure::create))
         .route(
             "/procedures/{name}",
@@ -405,6 +440,86 @@ async fn health() -> StatusCode {
 async fn audit_handler(State(state): State<Arc<AppState>>) -> Response {
     let recent = state.audit.recent();
     Json(recent).into_response()
+}
+
+/// Default max live sessions when `--max-sessions` is not given.
+fn default_max_sessions() -> usize {
+    std::env::var("MONGRELBL_MAX_SESSIONS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(256)
+}
+
+/// Default idle-session timeout when `--session-idle-timeout` is not given.
+fn default_session_idle_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(
+        std::env::var("MONGRELBL_SESSION_IDLE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300),
+    )
+}
+
+/// The principal a request is attributed to, for session ownership: a resolved
+/// user principal wins; otherwise `token` when token auth is active; else
+/// `anonymous` (no auth configured).
+fn request_owner(state: &AppState, principal: &Option<mongreldb_core::Principal>) -> String {
+    if let Some(p) = principal {
+        return p.username.clone();
+    }
+    if state.auth_token.is_some() {
+        return "token".into();
+    }
+    "anonymous".into()
+}
+
+/// `POST /sessions` — open a long-lived session for cross-request interactive
+/// transactions. Returns `{"session_id": "..."}`; send `X-Session-ID: <token>`
+/// on subsequent `/sql` requests to route to it. The session is owned by the
+/// authenticated principal and auto-expires after the idle timeout.
+async fn create_session(
+    State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
+) -> Response {
+    let owner = request_owner(&state, &principal);
+    let session = match MongrelSession::open_with_external_modules(
+        Arc::clone(&state.db),
+        state.external_modules.iter().cloned(),
+    ) {
+        Ok(s) => s,
+        Err(e) => return (status_for_query_error(&e), e.to_string()).into_response(),
+    };
+    match state.sessions.create(session, owner.clone()) {
+        Some(token) => {
+            state.audit.record(owner, "session.open", "session created");
+            Json(json!({ "session_id": token })).into_response()
+        }
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "session limit reached; close an idle session or raise --max-sessions",
+        )
+            .into_response(),
+    }
+}
+
+/// `DELETE /sessions/{id}` — close a session, discarding any open (staged but
+/// uncommitted) transaction. Only the owning principal may close it.
+async fn close_session(
+    State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
+    Path(id): Path<String>,
+) -> Response {
+    let owner = request_owner(&state, &principal);
+    if state.sessions.close(&id, &owner) {
+        state.audit.record(owner, "session.close", "session closed");
+        StatusCode::OK.into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            "session not found or not owned by caller",
+        )
+            .into_response()
+    }
 }
 
 /// `mongreldb_tables` gauge. Subject to the same auth middleware as every other
@@ -681,15 +796,53 @@ struct SqlRequest {
 async fn sql(
     State(state): State<Arc<AppState>>,
     OptionalPrincipal(principal): OptionalPrincipal,
+    headers: axum::http::HeaderMap,
     Json(req): Json<SqlRequest>,
 ) -> Response {
-    let session = match MongrelSession::open_with_external_modules(
-        Arc::clone(&state.db),
-        state.external_modules.iter().cloned(),
-    ) {
-        Ok(s) => s,
-        Err(e) => return (status_for_query_error(&e), e.to_string()).into_response(),
-    };
+    // Session routing: an `X-Session-ID` header routes the request to a pooled
+    // long-lived session, enabling cross-request `BEGIN`/`INSERT`/`COMMIT`
+    // transactions. Without the header, a fresh ephemeral session is used
+    // (the historical behavior).
+    let session_id = headers
+        .get("x-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+
+    if let Some(sid) = session_id {
+        let owner = request_owner(&state, &principal);
+        let Some(entry) = state.sessions.get(&sid, &owner) else {
+            return (
+                StatusCode::NOT_FOUND,
+                "session not found or not owned by caller",
+            )
+                .into_response();
+        };
+        // Serialize per-session access so two concurrent requests on the same
+        // token cannot interleave a transaction's staged writes.
+        let _guard = entry.lock.lock().await;
+        entry.touch();
+        execute_sql(&state, &principal, &entry.session, req).await
+    } else {
+        let session = match MongrelSession::open_with_external_modules(
+            Arc::clone(&state.db),
+            state.external_modules.iter().cloned(),
+        ) {
+            Ok(s) => s,
+            Err(e) => return (status_for_query_error(&e), e.to_string()).into_response(),
+        };
+        execute_sql(&state, &principal, &session, req).await
+    }
+}
+
+/// Run one SQL request against a given session: bump counters, audit DDL,
+/// execute under a trace capture, log slow queries, and dispatch the response
+/// format. Shared by the pooled-session and fresh-session paths.
+async fn execute_sql(
+    state: &AppState,
+    principal: &Option<mongreldb_core::Principal>,
+    session: &MongrelSession,
+    req: SqlRequest,
+) -> Response {
     state.metrics.inc_sql_queries();
     // Audit DDL / privilege statements attributed to the resolved principal.
     // Non-DDL reads are not audited here (auth events cover access).
@@ -1446,5 +1599,190 @@ mod audit_tests {
             out.push('=');
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use mongreldb_core::Database;
+    use tempfile::tempdir;
+
+    /// Spin up a daemon over a fresh DB with one `items(id int64 pk)` table.
+    /// Returns the TempDir (must be held alive for the test's duration — dropping
+    /// it deletes the database directory mid-test) and the bound address.
+    async fn setup() -> (tempfile::TempDir, std::net::SocketAddr) {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(Database::create(dir.path()).unwrap());
+        let table_schema = mongreldb_core::schema::Schema {
+            schema_id: 1,
+            columns: vec![mongreldb_core::schema::ColumnDef {
+                id: 1,
+                name: "id".into(),
+                ty: TypeId::Int64,
+                flags: mongreldb_core::schema::ColumnFlags::empty()
+                    .with(mongreldb_core::schema::ColumnFlags::PRIMARY_KEY),
+                default_value: None,
+            }],
+            indexes: vec![],
+            colocation: vec![],
+            constraints: Default::default(),
+            clustered: false,
+        };
+        db.create_table("items", table_schema).unwrap();
+        let app = build_app(db);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        (dir, addr)
+    }
+
+    /// Open a session and return its token.
+    async fn open_session(client: &reqwest::Client, addr: &std::net::SocketAddr) -> String {
+        let resp = client
+            .post(format!("http://{addr}/sessions"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        resp.json::<serde_json::Value>()
+            .await
+            .unwrap()
+            .get("session_id")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    async fn sql_on(
+        client: &reqwest::Client,
+        addr: &std::net::SocketAddr,
+        session: &str,
+        sql: &str,
+    ) -> reqwest::Response {
+        client
+            .post(format!("http://{addr}/sql"))
+            .header("X-Session-ID", session)
+            .json(&json!({ "sql": sql }))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn count_items(client: &reqwest::Client, addr: &std::net::SocketAddr) -> u64 {
+        client
+            .get(format!("http://{addr}/tables/items/count"))
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()
+            .get("count")
+            .unwrap()
+            .as_u64()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cross_request_transaction_commits() {
+        let (_dir, addr) = setup().await;
+        let client = reqwest::Client::new();
+        let session = open_session(&client, &addr).await;
+
+        // BEGIN, INSERT, COMMIT — each its own HTTP request on the same session.
+        let r = sql_on(&client, &addr, &session, "BEGIN").await;
+        assert_eq!(r.status(), 200);
+        let r = sql_on(
+            &client,
+            &addr,
+            &session,
+            "INSERT INTO items (id) VALUES (1)",
+        )
+        .await;
+        assert_eq!(r.status(), 200, "INSERT should stage successfully");
+        // Not yet committed → not visible to other connections.
+        assert_eq!(count_items(&client, &addr).await, 0);
+        let r = sql_on(&client, &addr, &session, "COMMIT").await;
+        assert_eq!(r.status(), 200);
+
+        // After COMMIT the row is durable and visible.
+        assert_eq!(count_items(&client, &addr).await, 1);
+    }
+
+    #[tokio::test]
+    async fn cross_request_transaction_rolls_back() {
+        let (_dir, addr) = setup().await;
+        let client = reqwest::Client::new();
+        let session = open_session(&client, &addr).await;
+
+        sql_on(&client, &addr, &session, "BEGIN").await;
+        sql_on(
+            &client,
+            &addr,
+            &session,
+            "INSERT INTO items (id) VALUES (5)",
+        )
+        .await;
+        // ROLLBACK discards the staged insert.
+        let r = sql_on(&client, &addr, &session, "ROLLBACK").await;
+        assert_eq!(r.status(), 200);
+        assert_eq!(
+            count_items(&client, &addr).await,
+            0,
+            "rollback discards staged writes"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_session_id_is_404() {
+        let (_dir, addr) = setup().await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{addr}/sql"))
+            .header("X-Session-ID", "does-not-exist")
+            .json(&json!({ "sql": "SELECT 1" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn close_session_ends_cross_request_state() {
+        let (_dir, addr) = setup().await;
+        let client = reqwest::Client::new();
+        let session = open_session(&client, &addr).await;
+
+        // BEGIN on the session, then close it → staged txn is discarded.
+        sql_on(&client, &addr, &session, "BEGIN").await;
+        let r = client
+            .delete(format!("http://{addr}/sessions/{session}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+
+        // The session token is now invalid.
+        let resp = sql_on(&client, &addr, &session, "COMMIT").await;
+        assert_eq!(resp.status(), 404, "closed session is no longer usable");
+    }
+
+    #[tokio::test]
+    async fn no_session_header_uses_fresh_ephemeral_session() {
+        // Without X-Session-ID, BEGIN..COMMIT must still work within a single
+        // multi-statement /sql body (the historical behavior is preserved).
+        let (_dir, addr) = setup().await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{addr}/sql"))
+            .json(&json!({ "sql": "INSERT INTO items (id) VALUES (42)" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(count_items(&client, &addr).await, 1);
     }
 }
