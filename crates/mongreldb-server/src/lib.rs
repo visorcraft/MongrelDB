@@ -448,7 +448,13 @@ async fn list_tables(State(state): State<Arc<AppState>>) -> Json<Vec<String>> {
 
 async fn drop_table(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
     match state.db.drop_table(&name) {
-        Ok(_) => StatusCode::OK.into_response(),
+        Ok(_) => {
+            // Invalidate cached idempotency entries. A cached transaction
+            // may reference the dropped table; replaying it would silently
+            // report success without writing to the recreated table.
+            state.idem.clear();
+            StatusCode::OK.into_response()
+        }
         Err(e) => (status_for_error(&e), e.to_string()).into_response(),
     }
 }

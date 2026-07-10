@@ -111,6 +111,24 @@ impl IdempotencyStore {
         self.committed.lock().unwrap().insert(key, resp);
     }
 
+    /// Invalidate all cached idempotency entries. Called when a table is
+    /// dropped, because any cached transaction may reference the dropped
+    /// table. Replaying such a cached response would silently report success
+    /// without applying the transaction to the new (empty) table.
+    pub(crate) fn clear(&self) {
+        self.committed.lock().unwrap().clear();
+        self.json_committed.lock().unwrap().clear();
+        // Best-effort disk cleanup.
+        if let Ok(entries) = std::fs::read_dir(&self.dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|ext| ext == "json") {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+    }
+
     pub(crate) fn get_json(&self, key: &str) -> Option<Jval> {
         if let Some(v) = self.json_committed.lock().unwrap().get(key).cloned() {
             return Some(v);
