@@ -226,7 +226,7 @@ In practice, encryption adds negligible latency to bulk ingest and queries
 
 ## Language Clients
 
-MongrelDB supports **21 languages** across two integration tiers:
+MongrelDB supports **34 languages** across two integration tiers:
 
 - **Tier 1 (Embedded):** The engine runs in-process via native bindings. No daemon, zero serialization overhead.
 - **Tier 2 (HTTP):** A pure-language HTTP client connects to a running `mongreldb-server` daemon. No native dependencies.
@@ -239,20 +239,33 @@ MongrelDB supports **21 languages** across two integration tiers:
 | **C** | 2 (HTTP) | [MongrelDB-C](https://github.com/visorcraft/MongrelDB-C) | CMake (links libcurl) |
 | **C#/.NET** | 2 (HTTP) | [MongrelDB-DotNet](https://github.com/visorcraft/MongrelDB-DotNet) | `dotnet add package Visorcraft.MongrelDB` |
 | **C++** | 2 (HTTP) | [MongrelDB-CPP](https://github.com/visorcraft/MongrelDB-CPP) | CMake (header-only, links libcurl) |
+| **Clojure** | 2 (HTTP) | [MongrelDB-Clojure](https://github.com/visorcraft/MongrelDB-Clojure) | deps.edn / Leiningen |
+| **Crystal** | 2 (HTTP) | [MongrelDB-Crystal](https://github.com/visorcraft/MongrelDB-Crystal) | `shards add mongreldb` |
 | **D** | 2 (HTTP) | [MongrelDB-D](https://github.com/visorcraft/MongrelDB-D) | `dub add mongreldb` |
 | **Dart** | 2 (HTTP) | [MongrelDB-Dart](https://github.com/visorcraft/MongrelDB-Dart) | `dart pub add mongreldb` |
 | **Elixir** | 2 (HTTP) | [MongrelDB-Elixir](https://github.com/visorcraft/MongrelDB-Elixir) | `{:mongreldb, "~> 0.1"}` in `mix.exs` |
+| **Erlang** | 2 (HTTP) | [MongrelDB-Erlang](https://github.com/visorcraft/MongrelDB-Erlang) | rebar3 |
+| **F#** | 2 (HTTP) | [MongrelDB-FSharp](https://github.com/visorcraft/MongrelDB-FSharp) | `dotnet add reference` |
+| **Fortran** | 2 (HTTP) | [MongrelDB-Fortran](https://github.com/visorcraft/MongrelDB-Fortran) | fpm |
+| **Gleam** | 2 (HTTP) | [MongrelDB-Gleam](https://github.com/visorcraft/MongrelDB-Gleam) | `gleam add mongreldb` |
 | **Go** | 2 (HTTP) | [MongrelDB-Go](https://github.com/visorcraft/MongrelDB-Go) | `go get github.com/visorcraft/mongreldb-go` |
 | **Java** | 2 (HTTP) | [MongrelDB-Java](https://github.com/visorcraft/MongrelDB-Java) | Maven/Gradle |
 | **Julia** | 2 (HTTP) | [MongrelDB-Julia](https://github.com/visorcraft/MongrelDB-Julia) | `] add MongrelDB` |
 | **Kotlin** | 2 (HTTP) | [MongrelDB-Kotlin](https://github.com/visorcraft/MongrelDB-Kotlin) | Gradle |
 | **Lua** | 2 (HTTP) | [MongrelDB-Lua](https://github.com/visorcraft/MongrelDB-Lua) | `luarocks install mongreldb` |
+| **Mojo** | 2 (HTTP) | [MongrelDB-Mojo](https://github.com/visorcraft/MongrelDB-Mojo) | `magic add mongreldb` |
 | **Nim** | 2 (HTTP) | [MongrelDB-Nim](https://github.com/visorcraft/MongrelDB-Nim) | `nimble install mongreldb` |
+| **Objective-C** | 2 (HTTP) | [MongrelDB-ObjC](https://github.com/visorcraft/MongrelDB-ObjC) | CMake (links Foundation) |
+| **Odin** | 2 (HTTP) | [MongrelDB-Odin](https://github.com/visorcraft/MongrelDB-Odin) | `odin build` |
 | **Perl** | 2 (HTTP) | [MongrelDB-Perl](https://github.com/visorcraft/MongrelDB-Perl) | `cpanm MongrelDB` |
 | **PHP** | 2 (HTTP) | [MongrelDB-PHP](https://github.com/visorcraft/MongrelDB-PHP) | `composer require visorcraft/mongreldb-php` |
+| **PowerShell** | 2 (HTTP) | [MongrelDB-Powershell](https://github.com/visorcraft/MongrelDB-Powershell) | `Import-Module mongreldb` |
 | **R** | 2 (HTTP) | [MongrelDB-R](https://github.com/visorcraft/MongrelDB-R) | `install.packages("mongreldb")` |
 | **Ruby** | 2 (HTTP) | [MongrelDB-Ruby](https://github.com/visorcraft/MongrelDB-Ruby) | `gem install mongreldb` |
+| **Scala** | 2 (HTTP) | [MongrelDB-Scala](https://github.com/visorcraft/MongrelDB-Scala) | sbt |
 | **Swift** | 2 (HTTP) | [MongrelDB-Swift](https://github.com/visorcraft/MongrelDB-Swift) | Swift Package Manager |
+| **Tcl** | 2 (HTTP) | [MongrelDB-Tcl](https://github.com/visorcraft/MongrelDB-Tcl) | `package require mongreldb` |
+| **V** | 2 (HTTP) | [MongrelDB-V](https://github.com/visorcraft/MongrelDB-V) | `v install` |
 | **Zig** | 2 (HTTP) | [MongrelDB-Zig](https://github.com/visorcraft/MongrelDB-Zig) | `zig fetch` |
 
 The **[C ABI](crates/mongreldb-ffi)** (`mongreldb-ffi`) provides a stable C interface over the engine core, enabling future Tier-1 native bindings in any language with C FFI support. The C and C++ clients also bundle this header for direct native embedding via `libmongreldb`.
