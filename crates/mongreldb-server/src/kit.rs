@@ -22,9 +22,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use mongreldb_core::constraint::TableConstraints;
 use mongreldb_core::query::{Condition, Query};
-use mongreldb_core::schema::{
-    ColumnDef, ColumnFlags, DefaultExpr, Schema, TypeId,
-};
+use mongreldb_core::schema::{ColumnDef, ColumnFlags, DefaultExpr, Schema, TypeId};
 use mongreldb_core::txn::{UpsertAction, UpsertActionKind};
 use mongreldb_core::{MongrelError, RowId, Value};
 use serde::{Deserialize, Serialize};
@@ -418,9 +416,9 @@ fn parse_type_name(s: &str) -> std::result::Result<TypeId, String> {
                 .trim_start_matches(['(', '<'])
                 .trim_end_matches([')', '>'])
                 .trim();
-            let dim: u32 = dim_str
-                .parse()
-                .map_err(|_| format!("invalid embedding dimension '{dim_str}'; expected embedding(<dim>)"))?;
+            let dim: u32 = dim_str.parse().map_err(|_| {
+                format!("invalid embedding dimension '{dim_str}'; expected embedding(<dim>)")
+            })?;
             Embedding { dim }
         }
         other => return Err(format!("unknown type: {other}")),
@@ -512,7 +510,10 @@ pub async fn kit_create_table(
                     StatusCode::BAD_REQUEST,
                     Json(KitErrorEnvelope {
                         status: "aborted".into(),
-                        error: KitError::new("BAD_REQUEST", "enum column requires non-empty enum_variants"),
+                        error: KitError::new(
+                            "BAD_REQUEST",
+                            "enum column requires non-empty enum_variants",
+                        ),
                     }),
                 )
                     .into_response();

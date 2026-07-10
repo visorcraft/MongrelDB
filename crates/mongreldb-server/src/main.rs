@@ -75,9 +75,7 @@ fn parse_args() -> Result<Args, String> {
                 std::process::exit(0);
             }
             "--port" => {
-                let v = raw
-                    .get(i + 1)
-                    .ok_or("--port requires a value")?;
+                let v = raw.get(i + 1).ok_or("--port requires a value")?;
                 port = Some(
                     v.parse::<u16>()
                         .map_err(|_| format!("--port: invalid port '{v}'"))?,
@@ -85,9 +83,7 @@ fn parse_args() -> Result<Args, String> {
                 i += 2;
             }
             "--auth-token" => {
-                let v = raw
-                    .get(i + 1)
-                    .ok_or("--auth-token requires a value")?;
+                let v = raw.get(i + 1).ok_or("--auth-token requires a value")?;
                 auth_token = Some(v.clone());
                 i += 2;
             }
@@ -96,9 +92,7 @@ fn parse_args() -> Result<Args, String> {
                 i += 1;
             }
             "--max-connections" => {
-                let v = raw
-                    .get(i + 1)
-                    .ok_or("--max-connections requires a value")?;
+                let v = raw.get(i + 1).ok_or("--max-connections requires a value")?;
                 max_connections = Some(
                     v.parse::<usize>()
                         .map_err(|_| format!("--max-connections: invalid value '{v}'"))?,
@@ -106,9 +100,7 @@ fn parse_args() -> Result<Args, String> {
                 i += 2;
             }
             "--passphrase" => {
-                let v = raw
-                    .get(i + 1)
-                    .ok_or("--passphrase requires a value")?;
+                let v = raw.get(i + 1).ok_or("--passphrase requires a value")?;
                 passphrase = Some(v.clone());
                 i += 2;
             }
@@ -117,9 +109,7 @@ fn parse_args() -> Result<Args, String> {
                 i += 1;
             }
             "--pidfile" => {
-                let v = raw
-                    .get(i + 1)
-                    .ok_or("--pidfile requires a value")?;
+                let v = raw.get(i + 1).ok_or("--pidfile requires a value")?;
                 pidfile = Some(v.clone());
                 i += 2;
             }
@@ -264,14 +254,14 @@ async fn main() {
     // but we branch here so the error path on a populated dir is `open`'s
     // (more specific) error, not the generic "database already exists" from
     // `create`.
-    let catalog_exists = std::path::Path::new(&args.db_dir)
-        .join("CATALOG")
-        .exists();
+    let catalog_exists = std::path::Path::new(&args.db_dir).join("CATALOG").exists();
     let db = if let Some(ref pw) = args.passphrase {
-        Arc::new(Database::open_encrypted(&args.db_dir, pw).unwrap_or_else(|e| {
-            eprintln!("failed to open {}: {e}", args.db_dir);
-            std::process::exit(1);
-        }))
+        Arc::new(
+            Database::open_encrypted(&args.db_dir, pw).unwrap_or_else(|e| {
+                eprintln!("failed to open {}: {e}", args.db_dir);
+                std::process::exit(1);
+            }),
+        )
     } else if catalog_exists {
         Arc::new(Database::open(&args.db_dir).unwrap_or_else(|e| {
             eprintln!("failed to open {}: {e}", args.db_dir);
@@ -280,9 +270,8 @@ async fn main() {
     } else {
         Arc::new(Database::create(&args.db_dir).unwrap_or_else(|e| {
             eprintln!("failed to create {}: {e}", args.db_dir);
-                    std::process::exit(1);
-                }),
-        )
+            std::process::exit(1);
+        }))
     };
 
     // §5.9: background cost-aware compaction (run-count trigger).
@@ -322,8 +311,7 @@ async fn main() {
     {
         use tokio::signal::unix::{signal, SignalKind};
 
-        let mut sigterm =
-            signal(SignalKind::terminate()).expect("install SIGTERM handler");
+        let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
         tokio::select! {
             result = axum::serve(listener, app) => {
                 if let Err(e) = result {

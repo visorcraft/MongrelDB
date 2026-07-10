@@ -3340,8 +3340,7 @@ impl Database {
                                 if let Staged::Put(pcells) = st_op {
                                     let pmap: HashMap<u16, crate::memtable::Value> =
                                         pcells.iter().cloned().collect();
-                                    if let Some(pkey) =
-                                        encode_composite_key(&fk.ref_columns, &pmap)
+                                    if let Some(pkey) = encode_composite_key(&fk.ref_columns, &pmap)
                                     {
                                         if pkey == child_key {
                                             found = true;

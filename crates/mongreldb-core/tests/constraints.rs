@@ -332,7 +332,8 @@ fn fk_rejects_orphan_and_restricts_delete() {
 fn fk_same_txn_parent_and_child_insert() {
     let dir = tempdir().unwrap();
     let db = Database::create(dir.path()).unwrap();
-    db.create_table("users", users_schema(false, false)).unwrap();
+    db.create_table("users", users_schema(false, false))
+        .unwrap();
     db.create_table("orders", orders_schema_with_fk()).unwrap();
 
     // Single transaction: insert a user AND an order referencing them. The
@@ -344,7 +345,10 @@ fn fk_same_txn_parent_and_child_insert() {
             "users",
             row(&[(0, Value::Int64(7)), (1, Value::Bytes(b"p@x".to_vec()))]),
         )?;
-        t.put("orders", row(&[(10, Value::Int64(70)), (11, Value::Int64(7))]))?;
+        t.put(
+            "orders",
+            row(&[(10, Value::Int64(70)), (11, Value::Int64(7))]),
+        )?;
         Ok(())
     });
     assert!(
@@ -376,8 +380,18 @@ fn fk_cyclical_same_txn_inserts() {
         Schema {
             schema_id: 0,
             columns: vec![
-                col(10, "id", TypeId::Int64, ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY)),
-                col(11, "bid", TypeId::Int64, ColumnFlags::empty().with(ColumnFlags::NULLABLE)),
+                col(
+                    10,
+                    "id",
+                    TypeId::Int64,
+                    ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                ),
+                col(
+                    11,
+                    "bid",
+                    TypeId::Int64,
+                    ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+                ),
             ],
             indexes: vec![],
             colocation: vec![],
@@ -398,8 +412,18 @@ fn fk_cyclical_same_txn_inserts() {
         Schema {
             schema_id: 0,
             columns: vec![
-                col(10, "id", TypeId::Int64, ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY)),
-                col(11, "aid", TypeId::Int64, ColumnFlags::empty().with(ColumnFlags::NULLABLE)),
+                col(
+                    10,
+                    "id",
+                    TypeId::Int64,
+                    ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                ),
+                col(
+                    11,
+                    "aid",
+                    TypeId::Int64,
+                    ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+                ),
             ],
             indexes: vec![],
             colocation: vec![],

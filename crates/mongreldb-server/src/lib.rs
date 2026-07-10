@@ -75,7 +75,9 @@ where
         parts: &mut axum::http::request::Parts,
         _state: &S,
     ) -> Result<Self, Self::Rejection> {
-        Ok(OptionalPrincipal(parts.extensions.get::<mongreldb_core::Principal>().cloned()))
+        Ok(OptionalPrincipal(
+            parts.extensions.get::<mongreldb_core::Principal>().cloned(),
+        ))
     }
 }
 
@@ -95,7 +97,12 @@ struct AppState {
 }
 
 pub fn build_app(db: Arc<Database>) -> axum::Router {
-    build_app_with_config(db, std::iter::empty::<Arc<dyn ExternalTableModule>>(), None, None)
+    build_app_with_config(
+        db,
+        std::iter::empty::<Arc<dyn ExternalTableModule>>(),
+        None,
+        None,
+    )
 }
 
 pub fn build_app_with_external_modules(
@@ -211,10 +218,14 @@ async fn auth_middleware(
     if let Some(token) = &state.auth_token {
         if let Some(provided) = header.strip_prefix("Bearer ") {
             if provided == token {
-                state.audit.record("token", "login.ok", "bearer token accepted");
+                state
+                    .audit
+                    .record("token", "login.ok", "bearer token accepted");
                 return Ok(next.run(req).await);
             } else {
-                state.audit.record("token", "login.fail", "invalid bearer token");
+                state
+                    .audit
+                    .record("token", "login.fail", "invalid bearer token");
             }
         }
     }
@@ -251,7 +262,10 @@ async fn auth_middleware(
 /// Minimal Base64 decoder (no extra dep).
 fn base64_decode(input: &str) -> Result<Vec<u8>, ()> {
     const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let input: Vec<u8> = input.bytes().filter(|&b| b != b'\n' && b != b'\r' && b != b' ').collect();
+    let input: Vec<u8> = input
+        .bytes()
+        .filter(|&b| b != b'\n' && b != b'\r' && b != b' ')
+        .collect();
     let mut out = Vec::with_capacity(input.len() * 3 / 4);
     let mut buf = 0u32;
     let mut bits = 0u32;
@@ -282,7 +296,8 @@ async fn wal_stream(
 
     // Read all committed WAL records with seq > since and stream as NDJSON.
     let body = tokio::task::spawn_blocking(move || -> Result<String, String> {
-        let records = mongreldb_core::wal::SharedWal::replay(&db_root).map_err(|e| e.to_string())?;
+        let records =
+            mongreldb_core::wal::SharedWal::replay(&db_root).map_err(|e| e.to_string())?;
         let mut out = String::new();
         for record in records.iter().filter(|r| r.seq.0 > since) {
             if let Ok(json) = serde_json::to_string(record) {
@@ -392,13 +407,10 @@ async fn audit_handler(State(state): State<Arc<AppState>>) -> Response {
     Json(recent).into_response()
 }
 
-
 /// `mongreldb_tables` gauge. Subject to the same auth middleware as every other
 /// route (scrape with the configured Bearer token / Basic credentials).
 async fn metrics_handler(State(state): State<Arc<AppState>>) -> Response {
-    let body = state
-        .metrics
-        .prometheus_text(state.db.table_names().len());
+    let body = state.metrics.prometheus_text(state.db.table_names().len());
     (
         [(
             header::CONTENT_TYPE,
@@ -490,7 +502,8 @@ async fn create_table(
             id: c.id,
             name: c.name.clone(),
             ty,
-            flags,            default_value: None,
+            flags,
+            default_value: None,
         });
     }
     let schema = Schema {
@@ -555,10 +568,8 @@ pub(crate) fn json_to_value(v: &serde_json::Value, expected: &TypeId) -> Value {
             if arr.len() as u32 != *dim {
                 return Value::Null;
             }
-            let vec: Option<Vec<f32>> = arr
-                .iter()
-                .map(|el| el.as_f64().map(|f| f as f32))
-                .collect();
+            let vec: Option<Vec<f32>> =
+                arr.iter().map(|el| el.as_f64().map(|f| f as f32)).collect();
             vec.map(Value::Embedding).unwrap_or(Value::Null)
         }
         (serde_json::Value::Null, _) => Value::Null,
@@ -741,8 +752,7 @@ fn sql_arrow_response(batches: &[arrow::record_batch::RecordBatch]) -> Response 
     }
     let schema = batches[0].schema();
     let mut buf = Vec::new();
-    let mut writer =
-        arrow::ipc::writer::FileWriter::try_new(&mut buf, schema.as_ref()).unwrap();
+    let mut writer = arrow::ipc::writer::FileWriter::try_new(&mut buf, schema.as_ref()).unwrap();
     for b in batches {
         let _ = writer.write(b);
     }
@@ -837,11 +847,7 @@ fn sql_arrow_stream_response(batches: &[arrow::record_batch::RecordBatch]) -> Re
 /// serde_json::Value allocations.
 fn sql_json_response(batches: &[arrow::record_batch::RecordBatch]) -> Response {
     if batches.is_empty() {
-        return (
-            [(header::CONTENT_TYPE, "application/json")],
-            b"[]" as &[u8],
-        )
-            .into_response();
+        return ([(header::CONTENT_TYPE, "application/json")], b"[]" as &[u8]).into_response();
     }
 
     let mut buf = Vec::new();
@@ -858,11 +864,7 @@ fn sql_json_response(batches: &[arrow::record_batch::RecordBatch]) -> Response {
         let _ = writer.finish();
     }
 
-    (
-        [(header::CONTENT_TYPE, "application/json")],
-        buf,
-    )
-        .into_response()
+    ([(header::CONTENT_TYPE, "application/json")], buf).into_response()
 }
 
 #[derive(Deserialize)]
@@ -1028,7 +1030,8 @@ mod wal_stream_tests {
                 name: "id".into(),
                 ty: TypeId::Int64,
                 flags: mongreldb_core::schema::ColumnFlags::empty()
-                    .with(mongreldb_core::schema::ColumnFlags::PRIMARY_KEY),            default_value: None,
+                    .with(mongreldb_core::schema::ColumnFlags::PRIMARY_KEY),
+                default_value: None,
             }],
             indexes: vec![],
             colocation: vec![],
@@ -1047,7 +1050,9 @@ mod wal_stream_tests {
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let resp = reqwest::get(format!("http://{addr}/wal/stream")).await.unwrap();
+        let resp = reqwest::get(format!("http://{addr}/wal/stream"))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 200);
         let body = resp.text().await.unwrap();
         // Should contain at least one record (the flush commit).
@@ -1110,7 +1115,11 @@ mod metrics_tests {
             .await
             .unwrap();
 
-        let resp = client.get(format!("http://{addr}/metrics")).send().await.unwrap();
+        let resp = client
+            .get(format!("http://{addr}/metrics"))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 200);
         let ct = resp
             .headers()
@@ -1118,7 +1127,10 @@ mod metrics_tests {
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default()
             .to_string();
-        assert!(ct.contains("text/plain"), "content-type is prometheus text: {ct}");
+        assert!(
+            ct.contains("text/plain"),
+            "content-type is prometheus text: {ct}"
+        );
         let body = resp.text().await.unwrap();
         // Prometheus series + type lines are present.
         assert!(body.contains("# TYPE mongreldb_sql_queries_total counter"));
@@ -1258,8 +1270,9 @@ mod streaming_tests {
         .unwrap();
 
         let resp = sql_arrow_stream_response(&[b1, b2]);
-        let bytes =
-            axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
 
         // Begins with the IPC continuation marker.
         assert!(bytes.starts_with(&0xFFFFFFFFu32.to_le_bytes()));
@@ -1273,13 +1286,18 @@ mod streaming_tests {
             let batch = batch.expect("each IPC message should decode");
             total_rows += batch.num_rows();
         }
-        assert_eq!(total_rows, 5, "all rows should round-trip through the stream");
+        assert_eq!(
+            total_rows, 5,
+            "all rows should round-trip through the stream"
+        );
     }
 
     #[tokio::test]
     async fn arrow_stream_empty_batches_yield_empty_body() {
         let resp = sql_arrow_stream_response(&[]);
-        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
         assert!(bytes.is_empty(), "no batches \u{2192} empty stream body");
     }
 }

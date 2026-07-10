@@ -235,6 +235,10 @@ fn core_value_json(value: &Value) -> serde_json::Value {
         ),
         Value::Decimal(d) => serde_json::Value::String(d.to_string()),
         Value::Uuid(_) | Value::Json(_) => serde_json::Value::Null,
-        Value::Interval { months, days, nanos } => serde_json::json!({"months": months, "days": days, "nanos": nanos}),
+        Value::Interval {
+            months,
+            days,
+            nanos,
+        } => serde_json::json!({"months": months, "days": days, "nanos": nanos}),
     }
 }
