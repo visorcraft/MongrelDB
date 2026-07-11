@@ -5,6 +5,7 @@ use crate::{
 use arrow::array::{ArrayRef, BooleanArray, Int64Array, StringArray};
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 use arrow::record_batch::RecordBatch;
+use mongreldb_core::constraint::{CheckConstraint as CoreCheckConstraint, CheckExpr};
 use mongreldb_core::memtable::{Row, Value};
 use mongreldb_core::procedure::{ProcedureCallOutput, ProcedureCallRow, StoredProcedure};
 use mongreldb_core::rowid::RowId;
@@ -21,12 +22,13 @@ use mongreldb_core::{
 };
 use sqlparser::ast::{
     AlterColumnOperation, AlterTable, AlterTableOperation, Assignment, AssignmentTarget,
-    BinaryOperator, ColumnDef, ColumnOption, ConditionalStatements, CreateIndex, CreateTable,
-    CreateTrigger, CreateView, DataType, Delete, DropTrigger, Expr, FromTable, FunctionArg,
-    FunctionArgExpr, FunctionArguments, Ident, IndexColumn, Insert, ObjectName, ObjectType,
-    OnConflictAction, OnInsert, Query, RenameTableNameKind, SetExpr, Statement, TableConstraint,
-    TableFactor, TableObject, TableWithJoins, TriggerEvent as SqlTriggerEvent, TriggerObject,
-    TriggerObjectKind, TriggerPeriod, Truncate, UnaryOperator, Value as SqlValue,
+    BinaryOperator, ColumnDef, ColumnOption, ConditionalStatements, CreateIndex, CreatePolicy,
+    CreatePolicyCommand, CreatePolicyType, CreateTable, CreateTrigger, CreateView, DataType,
+    Delete, DropPolicy, DropTrigger, Expr, FromTable, FunctionArg, FunctionArgExpr,
+    FunctionArguments, Ident, IndexColumn, Insert, ObjectName, ObjectType, OnConflictAction,
+    OnInsert, Owner, Query, RenameTableNameKind, SetExpr, Statement, TableConstraint, TableFactor,
+    TableObject, TableWithJoins, TriggerEvent as SqlTriggerEvent, TriggerObject, TriggerObjectKind,
+    TriggerPeriod, Truncate, UnaryOperator, Value as SqlValue,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -52,6 +54,17 @@ pub(crate) enum PendingSqlOp {
     },
 }
 
+const MAX_STAGED_SQL_OPS: usize = 10_000;
+
+fn ensure_staging_capacity(current: usize, additional: usize) -> Result<()> {
+    if additional > MAX_STAGED_SQL_OPS.saturating_sub(current) {
+        return Err(MongrelQueryError::Schema(format!(
+            "SQL transaction exceeds limit of {MAX_STAGED_SQL_OPS} staged operations"
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) async fn try_run_command(
     session: &MongrelSession,
     sql: &str,
@@ -70,6 +83,17 @@ pub(crate) async fn try_run_command(
         return try_recursive_cte(session, trimmed).await;
     }
 
+    if lower.starts_with("refresh materialized view ") {
+        let name = strip_identifier(&trimmed["refresh materialized view ".len()..])?;
+        if name.chars().any(char::is_whitespace) {
+            return Err(MongrelQueryError::Schema(
+                "REFRESH MATERIALIZED VIEW requires one unqualified name".into(),
+            ));
+        }
+        refresh_materialized_view(session, name).await?;
+        return Ok(Some(Vec::new()));
+    }
+
     if let Some(batch) = try_manual_command(session, trimmed, &lower)? {
         return Ok(Some(batch));
     }
@@ -77,8 +101,9 @@ pub(crate) async fn try_run_command(
         return Ok(None);
     }
 
+    let (parse_sql, ttl_clause) = extract_create_table_ttl(trimmed)?;
     let dialect = GenericDialect {};
-    let statements = Parser::parse_sql(&dialect, trimmed)
+    let statements = Parser::parse_sql(&dialect, &parse_sql)
         .map_err(|e| MongrelQueryError::Schema(format!("SQL parse error: {e}")))?;
 
     // Single-statement dispatch (multi-statement is handled by run() before
@@ -95,7 +120,8 @@ pub(crate) async fn try_run_command(
 
     let out = match statements.into_iter().next().unwrap() {
         Statement::CreateTable(create) => {
-            create_table(session, db, &create).await?;
+            require_ddl(session, db)?;
+            create_table(session, db, &create, ttl_clause.as_ref()).await?;
             Vec::new()
         }
         Statement::CreateVirtualTable {
@@ -104,6 +130,7 @@ pub(crate) async fn try_run_command(
             module_name,
             module_args,
         } => {
+            require_ddl(session, db)?;
             create_virtual_table(
                 session,
                 db,
@@ -115,13 +142,23 @@ pub(crate) async fn try_run_command(
             Vec::new()
         }
         Statement::CreateTrigger(trigger) => {
+            require_ddl(session, db)?;
             create_trigger(session, db, trigger)?;
             session.clear_cache();
             Vec::new()
         }
         Statement::DropTrigger(drop) => {
+            require_ddl(session, db)?;
             drop_trigger(db, drop)?;
             session.clear_cache();
+            Vec::new()
+        }
+        Statement::CreatePolicy(policy) => {
+            create_policy(session, db, policy)?;
+            Vec::new()
+        }
+        Statement::DropPolicy(policy) => {
+            drop_policy(session, db, policy)?;
             Vec::new()
         }
         Statement::Drop {
@@ -130,34 +167,46 @@ pub(crate) async fn try_run_command(
             names,
             table,
             ..
-        } => match object_type {
-            ObjectType::Table => {
-                for name in names {
-                    drop_table(session, db, &object_name(&name)?, if_exists)?;
+        } => {
+            require_ddl(session, db)?;
+            match object_type {
+                ObjectType::Table => {
+                    for name in names {
+                        drop_table(session, db, &object_name(&name)?, if_exists)?;
+                    }
+                    Vec::new()
                 }
-                Vec::new()
-            }
-            ObjectType::View | ObjectType::MaterializedView => {
-                for name in names {
-                    drop_view(session, db, &object_name(&name)?, if_exists)?;
+                ObjectType::View => {
+                    for name in names {
+                        drop_view(session, db, &object_name(&name)?, if_exists)?;
+                    }
+                    Vec::new()
                 }
-                Vec::new()
+                ObjectType::MaterializedView => {
+                    for name in names {
+                        drop_materialized_view(session, db, &object_name(&name)?, if_exists)?;
+                    }
+                    Vec::new()
+                }
+                ObjectType::Index => {
+                    drop_index(session, db, names, table, if_exists)?;
+                    Vec::new()
+                }
+                _ => return Ok(None),
             }
-            ObjectType::Index => {
-                drop_index(session, db, names, table, if_exists)?;
-                Vec::new()
-            }
-            _ => return Ok(None),
-        },
+        }
         Statement::AlterTable(alter) => {
+            require_ddl(session, db)?;
             alter_table(session, db, alter)?;
             Vec::new()
         }
         Statement::CreateIndex(index) => {
+            require_ddl(session, db)?;
             create_index(session, db, index)?;
             Vec::new()
         }
         Statement::CreateView(view) => {
+            require_ddl(session, db)?;
             create_view(session, view).await?;
             Vec::new()
         }
@@ -202,11 +251,13 @@ pub(crate) async fn try_run_command(
             Vec::new()
         }
         Statement::Analyze(_) => {
+            require_ddl(session, db)?;
             analyze_all(db)?;
             session.clear_cache();
             Vec::new()
         }
         Statement::Vacuum(_) => {
+            require_ddl(session, db)?;
             compact_all(db)?;
             session.clear_cache();
             Vec::new()
@@ -215,6 +266,97 @@ pub(crate) async fn try_run_command(
     };
 
     Ok(Some(out))
+}
+
+#[derive(Debug, Clone)]
+struct ParsedTtlClause {
+    column: String,
+    duration_nanos: u64,
+}
+
+/// Strip MongrelDB's `TTL_COLUMN <column> TTL '<duration>'` suffix before
+/// handing the standard portion to sqlparser.
+fn extract_create_table_ttl(sql: &str) -> Result<(String, Option<ParsedTtlClause>)> {
+    if !sql
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("create table")
+    {
+        return Ok((sql.to_string(), None));
+    }
+    let Some(close) = sql.rfind(')') else {
+        return Ok((sql.to_string(), None));
+    };
+    let tail = sql[close + 1..].trim().trim_end_matches(';').trim();
+    if tail.is_empty() {
+        return Ok((sql.to_string(), None));
+    }
+    let lower_tail = tail.to_ascii_lowercase();
+    let Some(rest) = lower_tail.strip_prefix("ttl_column ") else {
+        return Ok((sql.to_string(), None));
+    };
+    let Some(ttl_pos) = rest.find(" ttl ") else {
+        return Err(MongrelQueryError::Schema(
+            "TTL syntax: TTL_COLUMN <timestamp_column> TTL '<duration>'".into(),
+        ));
+    };
+    let prefix_len = "ttl_column ".len();
+    let column = tail[prefix_len..prefix_len + ttl_pos]
+        .trim()
+        .trim_matches('"')
+        .to_string();
+    if column.is_empty() {
+        return Err(MongrelQueryError::Schema(
+            "TTL_COLUMN requires a column name".into(),
+        ));
+    }
+    let duration = tail[prefix_len + ttl_pos + " ttl ".len()..].trim();
+    let duration_nanos = parse_ttl_duration(duration)?;
+    Ok((
+        sql[..=close].to_string(),
+        Some(ParsedTtlClause {
+            column,
+            duration_nanos,
+        }),
+    ))
+}
+
+fn parse_ttl_duration(input: &str) -> Result<u64> {
+    let literal = input.trim().trim_matches('\'').trim();
+    let mut parts = literal.split_whitespace();
+    let amount: u64 = parts
+        .next()
+        .ok_or_else(|| MongrelQueryError::Schema("TTL duration is empty".into()))?
+        .parse()
+        .map_err(|_| MongrelQueryError::Schema(format!("invalid TTL duration {input}")))?;
+    let unit = parts
+        .next()
+        .ok_or_else(|| MongrelQueryError::Schema("TTL duration requires a unit".into()))?
+        .to_ascii_lowercase();
+    if parts.next().is_some() || amount == 0 {
+        return Err(MongrelQueryError::Schema(format!(
+            "invalid TTL duration {input}"
+        )));
+    }
+    let multiplier = match unit.as_str() {
+        "ns" | "nanosecond" | "nanoseconds" => 1,
+        "us" | "microsecond" | "microseconds" => 1_000,
+        "ms" | "millisecond" | "milliseconds" => 1_000_000,
+        "s" | "second" | "seconds" => 1_000_000_000,
+        "m" | "minute" | "minutes" => 60_000_000_000,
+        "h" | "hour" | "hours" => 3_600_000_000_000,
+        "d" | "day" | "days" => 86_400_000_000_000,
+        "w" | "week" | "weeks" => 604_800_000_000_000,
+        _ => {
+            return Err(MongrelQueryError::Schema(format!(
+                "unsupported TTL duration unit {unit}"
+            )))
+        }
+    };
+    amount
+        .checked_mul(multiplier)
+        .filter(|value| *value <= i64::MAX as u64)
+        .ok_or_else(|| MongrelQueryError::Schema("TTL duration is too large".into()))
 }
 
 fn should_parse(lower: &str) -> bool {
@@ -232,6 +374,8 @@ fn should_parse(lower: &str) -> bool {
         "drop view",
         "create materialized view",
         "drop materialized view",
+        "create policy",
+        "drop policy",
         "insert",
         "replace",
         "update",
@@ -248,11 +392,49 @@ fn should_parse(lower: &str) -> bool {
     .any(|prefix| lower.starts_with(prefix))
 }
 
+fn require_ddl(session: &MongrelSession, db: &Arc<Database>) -> Result<()> {
+    db.require_for(
+        session.principal().as_ref(),
+        &mongreldb_core::Permission::Ddl,
+    )?;
+    Ok(())
+}
+
 fn try_manual_command(
     session: &MongrelSession,
     sql: &str,
     lower: &str,
 ) -> Result<Option<Vec<RecordBatch>>> {
+    let admin_command = [
+        "create user ",
+        "alter user ",
+        "drop user ",
+        "create role ",
+        "drop role ",
+        "grant ",
+        "revoke ",
+        "create mask ",
+        "drop mask ",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix));
+    if admin_command {
+        if let Some(db) = &session.database {
+            db.require_for(
+                session.principal().as_ref(),
+                &mongreldb_core::Permission::Admin,
+            )?;
+        }
+    }
+    if lower.starts_with("attach ") || lower.starts_with("detach ") {
+        if let Some(db) = &session.database {
+            db.require_for(
+                session.principal().as_ref(),
+                &mongreldb_core::Permission::Ddl,
+            )?;
+        }
+    }
+
     // ATTACH/DETACH don't require a primary Database — they mount external ones.
     if lower.starts_with("attach ") {
         return attach_database(session, sql);
@@ -276,6 +458,15 @@ fn try_manual_command(
         return Ok(Some(Vec::new()));
     }
     if let Some(_rest) = lower.strip_prefix("unlisten ") {
+        return Ok(Some(Vec::new()));
+    }
+
+    if lower.starts_with("create mask ") {
+        create_mask(session, sql)?;
+        return Ok(Some(Vec::new()));
+    }
+    if lower.starts_with("drop mask ") {
+        drop_mask(session, sql)?;
         return Ok(Some(Vec::new()));
     }
 
@@ -397,33 +588,12 @@ fn try_manual_command(
         if left.to_ascii_lowercase().contains(" on ") {
             // GRANT SELECT ON table TO role
             let on_idx = left.to_ascii_lowercase().find(" on ").unwrap();
-            let perm_str = &left[..on_idx].trim().to_ascii_lowercase();
+            let perm_text = left[..on_idx].trim();
             let table = &original_rest[..sep_idx][on_idx + 4..]
                 .trim()
                 .trim_matches(|c| c == '"' || c == '\'');
             let table = table.trim_end_matches(';').trim();
-            let permission = match perm_str.as_str() {
-                "select" => mongreldb_core::auth::Permission::Select {
-                    table: table.to_string(),
-                },
-                "insert" => mongreldb_core::auth::Permission::Insert {
-                    table: table.to_string(),
-                },
-                "update" => mongreldb_core::auth::Permission::Update {
-                    table: table.to_string(),
-                },
-                "delete" => mongreldb_core::auth::Permission::Delete {
-                    table: table.to_string(),
-                },
-                "all" => mongreldb_core::auth::Permission::All,
-                "ddl" => mongreldb_core::auth::Permission::Ddl,
-                "admin" => mongreldb_core::auth::Permission::Admin,
-                other => {
-                    return Err(MongrelQueryError::Schema(format!(
-                        "unknown permission {other}"
-                    )))
-                }
-            };
+            let permission = parse_grant_permission(db, perm_text, table)?;
             if is_grant {
                 db.grant_permission(target, permission)?;
             } else {
@@ -601,8 +771,7 @@ fn try_manual_command(
 
     if lower.starts_with("vacuum into ") {
         let target = parse_vacuum_into(sql, lower)?;
-        compact_all(db)?;
-        copy_database_dir(db.root(), Path::new(target))?;
+        db.hot_backup(Path::new(target))?;
         session.clear_cache();
         return Ok(Some(Vec::new()));
     }
@@ -643,6 +812,227 @@ fn try_manual_command(
     }
 
     Ok(None)
+}
+
+fn parse_grant_permission(
+    db: &Arc<Database>,
+    permission: &str,
+    table: &str,
+) -> Result<mongreldb_core::Permission> {
+    use mongreldb_core::Permission;
+
+    let lower = permission.to_ascii_lowercase();
+    if let Some(open) = permission.find('(') {
+        let close = permission.rfind(')').ok_or_else(|| {
+            MongrelQueryError::Schema("column permission requires closing ')'".into())
+        })?;
+        if close < open || !permission[close + 1..].trim().is_empty() {
+            return Err(MongrelQueryError::Schema(
+                "invalid column permission list".into(),
+            ));
+        }
+        let operation = lower[..open].trim();
+        let schema = table_schema(db, table)?;
+        let mut columns = permission[open + 1..close]
+            .split(',')
+            .map(|column| column.trim().trim_matches('"').to_string())
+            .collect::<Vec<_>>();
+        if columns.is_empty() || columns.iter().any(String::is_empty) {
+            return Err(MongrelQueryError::Schema(
+                "column permission list cannot be empty".into(),
+            ));
+        }
+        for column in &columns {
+            if schema.column(column).is_none() {
+                return Err(MongrelQueryError::Schema(format!(
+                    "unknown grant column {column} on {table}"
+                )));
+            }
+        }
+        columns.sort();
+        columns.dedup();
+        return match operation {
+            "select" => Ok(Permission::SelectColumns {
+                table: table.to_string(),
+                columns,
+            }),
+            "insert" => Ok(Permission::InsertColumns {
+                table: table.to_string(),
+                columns,
+            }),
+            "update" => Ok(Permission::UpdateColumns {
+                table: table.to_string(),
+                columns,
+            }),
+            _ => Err(MongrelQueryError::Schema(format!(
+                "column grants are unsupported for {operation}"
+            ))),
+        };
+    }
+    match lower.trim() {
+        "select" => Ok(Permission::Select {
+            table: table.to_string(),
+        }),
+        "insert" => Ok(Permission::Insert {
+            table: table.to_string(),
+        }),
+        "update" => Ok(Permission::Update {
+            table: table.to_string(),
+        }),
+        "delete" => Ok(Permission::Delete {
+            table: table.to_string(),
+        }),
+        "all" => Ok(Permission::All),
+        "ddl" => Ok(Permission::Ddl),
+        "admin" => Ok(Permission::Admin),
+        other => Err(MongrelQueryError::Schema(format!(
+            "unknown permission {other}"
+        ))),
+    }
+}
+
+fn create_mask(session: &MongrelSession, sql: &str) -> Result<()> {
+    let Some(db) = &session.database else {
+        return Ok(());
+    };
+    let body = sql["create mask ".len()..]
+        .trim()
+        .trim_end_matches(';')
+        .trim();
+    let lower = body.to_ascii_lowercase();
+    let on = lower
+        .find(" on ")
+        .ok_or_else(|| MongrelQueryError::Schema("CREATE MASK requires ON".into()))?;
+    let name = body[..on].trim().trim_matches('"').to_string();
+    if name.is_empty() {
+        return Err(MongrelQueryError::Schema(
+            "CREATE MASK requires a name".into(),
+        ));
+    }
+    let after_on = &body[on + " on ".len()..];
+    let after_on_lower = after_on.to_ascii_lowercase();
+    let using = after_on_lower
+        .find(" using ")
+        .ok_or_else(|| MongrelQueryError::Schema("CREATE MASK requires USING".into()))?;
+    let target = after_on[..using].trim();
+    let open = target.find('(').ok_or_else(|| {
+        MongrelQueryError::Schema("CREATE MASK target must be table(column)".into())
+    })?;
+    let close = target.rfind(')').ok_or_else(|| {
+        MongrelQueryError::Schema("CREATE MASK target must be table(column)".into())
+    })?;
+    if close < open || !target[close + 1..].trim().is_empty() {
+        return Err(MongrelQueryError::Schema(
+            "CREATE MASK target must be table(column)".into(),
+        ));
+    }
+    let table = target[..open].trim().trim_matches('"').to_string();
+    let column_name = target[open + 1..close].trim().trim_matches('"').to_string();
+    let schema = table_schema(db, &table)?;
+    let column = schema
+        .column(&column_name)
+        .ok_or_else(|| MongrelQueryError::Schema(format!("unknown mask column {column_name}")))?;
+    let strategy_and_except = after_on[using + " using ".len()..].trim();
+    let lower_strategy = strategy_and_except.to_ascii_lowercase();
+    let except = lower_strategy.find(" except ");
+    let strategy_text = except
+        .map(|index| strategy_and_except[..index].trim())
+        .unwrap_or(strategy_and_except);
+    let exempt_subjects = except
+        .map(|index| parse_mask_subjects(&strategy_and_except[index + " except ".len()..]))
+        .transpose()?
+        .unwrap_or_default();
+    let lower_strategy = strategy_text.to_ascii_lowercase();
+    let strategy = if lower_strategy == "null" {
+        mongreldb_core::MaskStrategy::Null
+    } else if lower_strategy == "sha256" {
+        mongreldb_core::MaskStrategy::Sha256
+    } else if lower_strategy.starts_with("redact ") {
+        mongreldb_core::MaskStrategy::Redact {
+            replacement: unquote_sql_string(strategy_text["redact ".len()..].trim())?.to_string(),
+        }
+    } else {
+        return Err(MongrelQueryError::Schema(
+            "mask strategy must be NULL, SHA256, or REDACT '<text>'".into(),
+        ));
+    };
+    let mut security = db.security_catalog();
+    if security
+        .masks
+        .iter()
+        .any(|mask| mask.table == table && mask.name == name)
+    {
+        return Err(MongrelQueryError::Schema(format!(
+            "mask {name} already exists on {table}"
+        )));
+    }
+    security.masks.push(mongreldb_core::ColumnMask {
+        name,
+        table: table.clone(),
+        column: column.id,
+        strategy,
+        exempt_subjects,
+    });
+    db.set_security_catalog_as(security, session.principal().as_ref())?;
+    session.refresh_registered_table(db, &table)?;
+    session.clear_cache();
+    Ok(())
+}
+
+fn parse_mask_subjects(input: &str) -> Result<Vec<String>> {
+    let input = input.trim();
+    if !input.starts_with('(') || !input.ends_with(')') {
+        return Err(MongrelQueryError::Schema(
+            "mask EXCEPT requires a parenthesized subject list".into(),
+        ));
+    }
+    let subjects = input[1..input.len() - 1]
+        .split(',')
+        .map(|subject| subject.trim().trim_matches('"').to_string())
+        .collect::<Vec<_>>();
+    if subjects.is_empty() || subjects.iter().any(String::is_empty) {
+        return Err(MongrelQueryError::Schema(
+            "mask EXCEPT subject list cannot be empty".into(),
+        ));
+    }
+    Ok(subjects)
+}
+
+fn drop_mask(session: &MongrelSession, sql: &str) -> Result<()> {
+    let Some(db) = &session.database else {
+        return Ok(());
+    };
+    let mut body = sql["drop mask ".len()..]
+        .trim()
+        .trim_end_matches(';')
+        .trim();
+    let if_exists = body.to_ascii_lowercase().starts_with("if exists ");
+    if if_exists {
+        body = body["if exists ".len()..].trim();
+    }
+    let lower = body.to_ascii_lowercase();
+    let on = lower
+        .find(" on ")
+        .ok_or_else(|| MongrelQueryError::Schema("DROP MASK requires ON <table>".into()))?;
+    let name = body[..on].trim().trim_matches('"');
+    let table = body[on + " on ".len()..].trim().trim_matches('"');
+    let mut security = db.security_catalog();
+    let old_len = security.masks.len();
+    security
+        .masks
+        .retain(|mask| mask.table != table || mask.name != name);
+    if security.masks.len() == old_len {
+        if if_exists {
+            return Ok(());
+        }
+        return Err(MongrelQueryError::Schema(format!(
+            "mask {name} does not exist on {table}"
+        )));
+    }
+    db.set_security_catalog_as(security, session.principal().as_ref())?;
+    session.refresh_registered_table(db, table)?;
+    session.clear_cache();
+    Ok(())
 }
 
 /// `ATTACH 'path' AS alias` — open a second MongrelDB database directory and
@@ -792,6 +1182,7 @@ async fn create_table(
     session: &MongrelSession,
     db: &Arc<Database>,
     create: &CreateTable,
+    ttl: Option<&ParsedTtlClause>,
 ) -> Result<()> {
     let name = object_name(&create.name)?;
     if create.if_not_exists && db.table_id(&name).is_ok() {
@@ -801,11 +1192,34 @@ async fn create_table(
     // CREATE TABLE AS SELECT — execute the query, infer the schema from the
     // result, create the table, and bulk-insert the rows.
     if let Some(query) = create.query.as_deref() {
+        if ttl.is_some() {
+            return Err(MongrelQueryError::Schema(
+                "CREATE TABLE AS SELECT does not support TTL_COLUMN".into(),
+            ));
+        }
         return create_table_as_select(session, db, &name, query).await;
     }
 
     let schema = schema_from_create_table(create)?;
+    if let Some(ttl) = ttl {
+        let column = schema
+            .columns
+            .iter()
+            .find(|column| column.name == ttl.column)
+            .ok_or_else(|| {
+                MongrelQueryError::Schema(format!("unknown TTL column {}", ttl.column))
+            })?;
+        if column.ty != TypeId::TimestampNanos {
+            return Err(MongrelQueryError::Schema(format!(
+                "TTL column {} must be TIMESTAMP",
+                ttl.column
+            )));
+        }
+    }
     db.create_table(&name, schema)?;
+    if let Some(ttl) = ttl {
+        db.set_table_ttl(&name, &ttl.column, ttl.duration_nanos)?;
+    }
     register_table(session, db, &name)?;
     session.clear_cache();
     Ok(())
@@ -864,7 +1278,7 @@ fn create_table_as_select<'a>(
 
         // Bulk-insert all rows from the result batches.
         let _handle = db.table(table_name)?;
-        let mut txn = db.begin();
+        let mut txn = db.begin_as(session.principal());
         for batch in &batches {
             let col_count = batch.num_columns();
             for row_idx in 0..batch.num_rows() {
@@ -1252,6 +1666,27 @@ fn drop_view(
     for trigger in trigger_names {
         db.drop_trigger(&trigger)?;
     }
+    session.clear_cache();
+    Ok(())
+}
+
+fn drop_materialized_view(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    name: &str,
+    if_exists: bool,
+) -> Result<()> {
+    if db.materialized_view(name).is_none() {
+        if if_exists {
+            return Ok(());
+        }
+        return Err(MongrelQueryError::Schema(format!(
+            "materialized view {name:?} does not exist"
+        )));
+    }
+    db.drop_table(name)?;
+    let _ = session.ctx.deregister_table(name);
+    session.tables.lock().remove(name);
     session.clear_cache();
     Ok(())
 }
@@ -2053,12 +2488,6 @@ async fn create_view(session: &MongrelSession, view: CreateView) -> Result<()> {
     let name = object_name(&view.name)?;
 
     if view.materialized {
-        // CREATE MATERIALIZED VIEW — physically materialize the query result as
-        // a table (like CTAS). The materialized view is a real table — it does
-        // NOT register a session-scoped view definition (that would shadow the
-        // physical table and make the "snapshot" behave like a live view).
-        // The defining SQL is preserved only in the CREATE statement itself;
-        // a future REFRESH MATERIALIZED VIEW would need to store it separately.
         let Some(db) = &session.database else {
             return Err(MongrelQueryError::Schema(
                 "CREATE MATERIALIZED VIEW requires a Database".into(),
@@ -2072,13 +2501,554 @@ async fn create_view(session: &MongrelSession, view: CreateView) -> Result<()> {
                 "table or materialized view {name:?} already exists"
             )));
         }
-        // Materialize: execute the query and create a physical table.
-        return create_table_as_select(session, db, &name, &view.query).await;
+        let query = view.query.to_string();
+        create_table_as_select(session, db, &name, &view.query).await?;
+        let incremental = infer_incremental_aggregate(db, &name, &view.query)?;
+        let mut definition = mongreldb_core::MaterializedViewEntry {
+            name: name.clone(),
+            query,
+            last_refresh_epoch: db.visible_epoch().0,
+            incremental,
+        };
+        let definition_result = if definition.incremental.is_some() {
+            rebuild_incremental_aggregate(db, &mut definition).map(|_| ())
+        } else {
+            db.set_materialized_view(definition).map_err(Into::into)
+        };
+        if let Err(error) = definition_result {
+            let _ = db.drop_table(&name);
+            let _ = session.ctx.deregister_table(&name);
+            session.tables.lock().remove(&name);
+            return Err(error);
+        }
+        return Ok(());
     }
 
     let (schema, input_types) = view_schema_from_columns(&view.columns)?;
     session.create_view_with_schema(&name, &view.query.to_string(), schema, input_types);
     Ok(())
+}
+
+async fn refresh_materialized_view(session: &MongrelSession, name: &str) -> Result<()> {
+    let db = session.database.as_ref().ok_or_else(|| {
+        MongrelQueryError::Schema("REFRESH MATERIALIZED VIEW requires a Database".into())
+    })?;
+    if session.sql_txn.lock().is_some() {
+        return Err(MongrelQueryError::Schema(
+            "REFRESH MATERIALIZED VIEW is not allowed inside an explicit transaction".into(),
+        ));
+    }
+    let mut definition = db.materialized_view(name).ok_or_else(|| {
+        MongrelQueryError::Schema(format!("materialized view {name:?} does not exist"))
+    })?;
+    if definition.incremental.is_some() {
+        if refresh_incremental_aggregate(db, &mut definition)?.is_none() {
+            rebuild_incremental_aggregate(db, &mut definition)?;
+        }
+        session.clear_cache();
+        return Ok(());
+    }
+    let schema = table_schema(db, name)?;
+    let batches = Box::pin(session.run(&definition.query)).await?;
+    for batch in &batches {
+        if batch.num_columns() != schema.columns.len() {
+            return Err(MongrelQueryError::Schema(format!(
+                "materialized view {name:?} query now returns {} columns; expected {}",
+                batch.num_columns(),
+                schema.columns.len()
+            )));
+        }
+    }
+
+    let mut transaction = db.begin_as(session.principal());
+    transaction.truncate(name)?;
+    for batch in &batches {
+        for row_index in 0..batch.num_rows() {
+            let mut cells = Vec::with_capacity(batch.num_columns());
+            for (column_index, column) in batch.columns().iter().enumerate() {
+                cells.push((
+                    schema.columns[column_index].id,
+                    arrow_cell_to_value(column, row_index)?,
+                ));
+            }
+            transaction.put(name, cells)?;
+        }
+    }
+    transaction.set_materialized_view_definition(definition)?;
+    transaction.commit()?;
+    session.clear_cache();
+    Ok(())
+}
+
+struct AggregateState {
+    group: Value,
+    count: i64,
+    sums: HashMap<u16, i64>,
+}
+
+struct AggregateDelta {
+    group: Value,
+    count: i64,
+    sums: HashMap<u16, i64>,
+}
+
+fn infer_incremental_aggregate(
+    db: &Arc<Database>,
+    target: &str,
+    query: &Query,
+) -> Result<Option<mongreldb_core::IncrementalAggregateView>> {
+    if query.with.is_some()
+        || query.limit_clause.is_some()
+        || query.fetch.is_some()
+        || !query.locks.is_empty()
+        || query.for_clause.is_some()
+        || query.settings.is_some()
+        || query.format_clause.is_some()
+        || !query.pipe_operators.is_empty()
+    {
+        return Ok(None);
+    }
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(None);
+    };
+    if select.distinct.is_some()
+        || select.top.is_some()
+        || select.from.len() != 1
+        || !select.from[0].joins.is_empty()
+        || select.selection.is_some()
+        || select.prewhere.is_some()
+        || select.having.is_some()
+        || !select.lateral_views.is_empty()
+        || !select.connect_by.is_empty()
+        || !select.cluster_by.is_empty()
+        || !select.distribute_by.is_empty()
+        || !select.sort_by.is_empty()
+        || !select.named_window.is_empty()
+        || select.qualify.is_some()
+    {
+        return Ok(None);
+    }
+    let TableFactor::Table {
+        name,
+        args,
+        with_hints,
+        version,
+        partitions,
+        json_path,
+        sample,
+        index_hints,
+        ..
+    } = &select.from[0].relation
+    else {
+        return Ok(None);
+    };
+    if args.is_some()
+        || !with_hints.is_empty()
+        || version.is_some()
+        || !partitions.is_empty()
+        || json_path.is_some()
+        || sample.is_some()
+        || !index_hints.is_empty()
+    {
+        return Ok(None);
+    }
+    let source_table = object_name(name)?;
+    if source_table == target {
+        return Ok(None);
+    }
+    let source_schema = table_schema(db, &source_table)?;
+    let target_schema = table_schema(db, target)?;
+    let sqlparser::ast::GroupByExpr::Expressions(group_by, modifiers) = &select.group_by else {
+        return Ok(None);
+    };
+    if group_by.len() != 1 || !modifiers.is_empty() || select.projection.len() < 2 {
+        return Ok(None);
+    }
+    let Some(group_name) = check_expr_column_name(&group_by[0]) else {
+        return Ok(None);
+    };
+    let Some(first) = select_item_expr(&select.projection[0]) else {
+        return Ok(None);
+    };
+    if check_expr_column_name(first) != Some(group_name) {
+        return Ok(None);
+    }
+    let group_column = source_schema.column(group_name).ok_or_else(|| {
+        MongrelQueryError::Schema(format!("unknown aggregate group column {group_name}"))
+    })?;
+    if group_column.flags.contains(ColumnFlags::NULLABLE)
+        || !matches!(
+            group_column.ty,
+            TypeId::Bool | TypeId::Int64 | TypeId::Bytes
+        )
+    {
+        return Ok(None);
+    }
+    if target_schema.columns.len() != select.projection.len() {
+        return Ok(None);
+    }
+
+    let mut outputs = Vec::new();
+    let mut count_output_column = None;
+    for (index, item) in select.projection.iter().enumerate().skip(1) {
+        let Some(Expr::Function(function)) = select_item_expr(item) else {
+            return Ok(None);
+        };
+        if !matches!(function.parameters, FunctionArguments::None)
+            || function.filter.is_some()
+            || function.null_treatment.is_some()
+            || function.over.is_some()
+            || !function.within_group.is_empty()
+        {
+            return Ok(None);
+        }
+        let FunctionArguments::List(arguments) = &function.args else {
+            return Ok(None);
+        };
+        if arguments.duplicate_treatment.is_some() || !arguments.clauses.is_empty() {
+            return Ok(None);
+        }
+        let output_column = target_schema.columns[index].id;
+        let function_name = object_name(&function.name)?.to_ascii_lowercase();
+        let kind = match function_name.as_str() {
+            "count"
+                if arguments.args.len() == 1
+                    && matches!(
+                        &arguments.args[0],
+                        FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
+                    ) =>
+            {
+                if count_output_column.replace(output_column).is_some() {
+                    return Ok(None);
+                }
+                mongreldb_core::IncrementalAggregateKind::Count
+            }
+            "sum" if arguments.args.len() == 1 => {
+                let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) = &arguments.args[0] else {
+                    return Ok(None);
+                };
+                let Some(source_name) = check_expr_column_name(expr) else {
+                    return Ok(None);
+                };
+                let source_column = source_schema.column(source_name).ok_or_else(|| {
+                    MongrelQueryError::Schema(format!("unknown aggregate SUM column {source_name}"))
+                })?;
+                if source_column.flags.contains(ColumnFlags::NULLABLE)
+                    || source_column.ty != TypeId::Int64
+                {
+                    return Ok(None);
+                }
+                mongreldb_core::IncrementalAggregateKind::Sum {
+                    source_column: source_column.id,
+                }
+            }
+            _ => return Ok(None),
+        };
+        outputs.push(mongreldb_core::IncrementalAggregateOutput {
+            output_column,
+            kind,
+        });
+    }
+    let Some(count_output_column) = count_output_column else {
+        return Ok(None);
+    };
+    Ok(Some(mongreldb_core::IncrementalAggregateView {
+        source_table_id: db.table_id(&source_table)?,
+        source_table,
+        group_column: group_column.id,
+        group_output_column: target_schema.columns[0].id,
+        outputs,
+        count_output_column,
+        checkpoint_event_id: format!("{}:{}", db.visible_epoch().0, u32::MAX),
+    }))
+}
+
+fn select_item_expr(item: &sqlparser::ast::SelectItem) -> Option<&Expr> {
+    match item {
+        sqlparser::ast::SelectItem::UnnamedExpr(expr)
+        | sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } => Some(expr),
+        _ => None,
+    }
+}
+
+fn check_expr_column_name(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Identifier(identifier) => Some(&identifier.value),
+        Expr::CompoundIdentifier(parts) => parts.last().map(|identifier| identifier.value.as_str()),
+        _ => None,
+    }
+}
+
+fn rebuild_incremental_aggregate(
+    db: &Arc<Database>,
+    definition: &mut mongreldb_core::MaterializedViewEntry,
+) -> Result<mongreldb_core::Epoch> {
+    let mut plan = definition.incremental.clone().ok_or_else(|| {
+        MongrelQueryError::Schema("materialized view has no incremental plan".into())
+    })?;
+    let (snapshot, _retention) = db.snapshot_owned();
+    let source_rows = db
+        .table(&plan.source_table)?
+        .lock()
+        .visible_rows(snapshot)?;
+    let mut groups = std::collections::BTreeMap::<Vec<u8>, AggregateState>::new();
+    for row in &source_rows {
+        let group = row
+            .columns
+            .get(&plan.group_column)
+            .cloned()
+            .ok_or_else(|| {
+                MongrelQueryError::Schema("incremental group column is missing".into())
+            })?;
+        if matches!(group, Value::Null) {
+            return Err(MongrelQueryError::Schema(
+                "incremental group column cannot be NULL".into(),
+            ));
+        }
+        let state = groups
+            .entry(group.encode_key())
+            .or_insert_with(|| AggregateState {
+                group,
+                count: 0,
+                sums: HashMap::new(),
+            });
+        state.count = state
+            .count
+            .checked_add(1)
+            .ok_or_else(|| MongrelQueryError::Schema("COUNT overflow".into()))?;
+        for output in &plan.outputs {
+            if let mongreldb_core::IncrementalAggregateKind::Sum { source_column } = output.kind {
+                let Some(Value::Int64(value)) = row.columns.get(&source_column) else {
+                    return Err(MongrelQueryError::Schema(
+                        "incremental SUM column must be non-null BIGINT".into(),
+                    ));
+                };
+                let sum = state.sums.entry(source_column).or_insert(0);
+                *sum = sum
+                    .checked_add(*value)
+                    .ok_or_else(|| MongrelQueryError::Schema("SUM overflow".into()))?;
+            }
+        }
+    }
+
+    plan.checkpoint_event_id = format!("{}:{}", snapshot.epoch.0, u32::MAX);
+    definition.incremental = Some(plan.clone());
+    let mut transaction = db.begin();
+    transaction.truncate(&definition.name)?;
+    for state in groups.into_values() {
+        transaction.put(
+            &definition.name,
+            aggregate_cells(&plan, state.group, state.count, &state.sums)?,
+        )?;
+    }
+    transaction.set_materialized_view_definition(definition.clone())?;
+    let epoch = transaction.commit()?;
+    definition.last_refresh_epoch = epoch.0;
+    Ok(epoch)
+}
+
+fn refresh_incremental_aggregate(
+    db: &Arc<Database>,
+    definition: &mut mongreldb_core::MaterializedViewEntry,
+) -> Result<Option<mongreldb_core::Epoch>> {
+    let mut plan = definition.incremental.clone().ok_or_else(|| {
+        MongrelQueryError::Schema("materialized view has no incremental plan".into())
+    })?;
+    let changes = db.change_events_since(Some(&plan.checkpoint_event_id))?;
+    if changes.gap {
+        return Ok(None);
+    }
+    let mut deltas = std::collections::BTreeMap::<Vec<u8>, AggregateDelta>::new();
+    for event in changes
+        .events
+        .iter()
+        .filter(|event| event.table_id == Some(plan.source_table_id))
+    {
+        let rows = match event.op.as_str() {
+            "put" => event
+                .data
+                .clone()
+                .and_then(|value| serde_json::from_value::<Vec<Row>>(value).ok()),
+            "put_run" => event
+                .data
+                .as_ref()
+                .and_then(|value| value.get("rows"))
+                .cloned()
+                .and_then(|value| serde_json::from_value::<Vec<Row>>(value).ok()),
+            "delete" => {
+                let Some(data) = event.data.as_ref() else {
+                    return Ok(None);
+                };
+                let expected = data
+                    .get("row_ids")
+                    .and_then(serde_json::Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or(0);
+                let rows = data
+                    .get("before")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value::<Vec<Row>>(value).ok());
+                if rows.as_ref().map(Vec::len) != Some(expected) {
+                    return Ok(None);
+                }
+                rows
+            }
+            "truncate" => return Ok(None),
+            _ => Some(Vec::new()),
+        };
+        let Some(rows) = rows else {
+            return Ok(None);
+        };
+        let sign = if event.op == "delete" { -1 } else { 1 };
+        for row in &rows {
+            if !apply_aggregate_delta(&mut deltas, &plan, row, sign) {
+                return Ok(None);
+            }
+        }
+    }
+
+    let view_rows = db
+        .table(&definition.name)?
+        .lock()
+        .visible_rows(db.snapshot().0)?;
+    let existing: HashMap<Vec<u8>, Row> = view_rows
+        .into_iter()
+        .filter_map(|row| {
+            let key = row
+                .columns
+                .get(&plan.group_output_column)
+                .map(Value::encode_key);
+            key.map(|key| (key, row))
+        })
+        .collect();
+    let mut deletes = Vec::new();
+    let mut updates = Vec::new();
+    let mut inserts = Vec::new();
+    for (key, delta) in deltas {
+        let current = existing.get(&key);
+        let current_count = match current.and_then(|row| row.columns.get(&plan.count_output_column))
+        {
+            Some(Value::Int64(count)) => *count,
+            Some(_) => return Ok(None),
+            None => 0,
+        };
+        let Some(next_count) = current_count.checked_add(delta.count) else {
+            return Ok(None);
+        };
+        if next_count < 0 {
+            return Ok(None);
+        }
+        if next_count == 0 {
+            if let Some(row) = current {
+                deletes.push(row.row_id);
+            }
+            continue;
+        }
+        let mut sums = HashMap::new();
+        for output in &plan.outputs {
+            let mongreldb_core::IncrementalAggregateKind::Sum { source_column } = output.kind
+            else {
+                continue;
+            };
+            let current_sum = match current.and_then(|row| row.columns.get(&output.output_column)) {
+                Some(Value::Int64(sum)) => *sum,
+                Some(_) => return Ok(None),
+                None => 0,
+            };
+            let Some(next_sum) =
+                current_sum.checked_add(delta.sums.get(&source_column).copied().unwrap_or(0))
+            else {
+                return Ok(None);
+            };
+            sums.insert(source_column, next_sum);
+        }
+        let cells = aggregate_cells(&plan, delta.group, next_count, &sums)?;
+        if let Some(row) = current {
+            updates.push((row.row_id, cells));
+        } else {
+            inserts.push(cells);
+        }
+    }
+
+    plan.checkpoint_event_id = format!("{}:{}", changes.current_epoch, u32::MAX);
+    definition.incremental = Some(plan);
+    let mut transaction = db.begin();
+    for row_id in deletes {
+        transaction.delete(&definition.name, row_id)?;
+    }
+    if !updates.is_empty() {
+        transaction.update_many(&definition.name, updates)?;
+    }
+    for cells in inserts {
+        transaction.put(&definition.name, cells)?;
+    }
+    transaction.set_materialized_view_definition(definition.clone())?;
+    let epoch = transaction.commit()?;
+    definition.last_refresh_epoch = epoch.0;
+    Ok(Some(epoch))
+}
+
+fn apply_aggregate_delta(
+    deltas: &mut std::collections::BTreeMap<Vec<u8>, AggregateDelta>,
+    plan: &mongreldb_core::IncrementalAggregateView,
+    row: &Row,
+    sign: i64,
+) -> bool {
+    let Some(group) = row.columns.get(&plan.group_column).cloned() else {
+        return false;
+    };
+    if matches!(group, Value::Null) {
+        return false;
+    }
+    let delta = deltas
+        .entry(group.encode_key())
+        .or_insert_with(|| AggregateDelta {
+            group,
+            count: 0,
+            sums: HashMap::new(),
+        });
+    let Some(count) = delta.count.checked_add(sign) else {
+        return false;
+    };
+    delta.count = count;
+    for output in &plan.outputs {
+        let mongreldb_core::IncrementalAggregateKind::Sum { source_column } = output.kind else {
+            continue;
+        };
+        let Some(Value::Int64(value)) = row.columns.get(&source_column) else {
+            return false;
+        };
+        let Some(signed) = value.checked_mul(sign) else {
+            return false;
+        };
+        let sum = delta.sums.entry(source_column).or_insert(0);
+        let Some(next) = sum.checked_add(signed) else {
+            return false;
+        };
+        *sum = next;
+    }
+    true
+}
+
+fn aggregate_cells(
+    plan: &mongreldb_core::IncrementalAggregateView,
+    group: Value,
+    count: i64,
+    sums: &HashMap<u16, i64>,
+) -> Result<Vec<(u16, Value)>> {
+    let mut cells = vec![(plan.group_output_column, group)];
+    for output in &plan.outputs {
+        let value = match output.kind {
+            mongreldb_core::IncrementalAggregateKind::Count => Value::Int64(count),
+            mongreldb_core::IncrementalAggregateKind::Sum { source_column } => {
+                Value::Int64(sums.get(&source_column).copied().ok_or_else(|| {
+                    MongrelQueryError::Schema("incremental SUM state is missing".into())
+                })?)
+            }
+        };
+        cells.push((output.output_column, value));
+    }
+    Ok(cells)
 }
 
 fn view_schema_from_columns(
@@ -2124,6 +3094,205 @@ fn view_schema_from_columns(
         },
         input_types,
     ))
+}
+
+fn create_policy(session: &MongrelSession, db: &Arc<Database>, policy: CreatePolicy) -> Result<()> {
+    db.require_for(
+        session.principal().as_ref(),
+        &mongreldb_core::Permission::Admin,
+    )?;
+    let table = object_name(&policy.table_name)?;
+    let schema = table_schema(db, &table)?;
+    let command = match policy.command.unwrap_or(CreatePolicyCommand::All) {
+        CreatePolicyCommand::All => mongreldb_core::PolicyCommand::All,
+        CreatePolicyCommand::Select => mongreldb_core::PolicyCommand::Select,
+        CreatePolicyCommand::Insert => mongreldb_core::PolicyCommand::Insert,
+        CreatePolicyCommand::Update => mongreldb_core::PolicyCommand::Update,
+        CreatePolicyCommand::Delete => mongreldb_core::PolicyCommand::Delete,
+    };
+    let subjects = policy
+        .to
+        .unwrap_or_else(|| vec![Owner::Ident(Ident::new("public"))])
+        .into_iter()
+        .map(|owner| policy_subject(session, db, owner))
+        .collect::<Result<Vec<_>>>()?;
+    let using = policy
+        .using
+        .as_ref()
+        .map(|expression| lower_security_expr(expression, &schema))
+        .transpose()?
+        .or(Some(mongreldb_core::SecurityExpr::True));
+    let with_check = policy
+        .with_check
+        .as_ref()
+        .map(|expression| lower_security_expr(expression, &schema))
+        .transpose()?;
+    let mut security = db.security_catalog();
+    if security
+        .policies
+        .iter()
+        .any(|existing| existing.table == table && existing.name == policy.name.value)
+    {
+        return Err(MongrelQueryError::Schema(format!(
+            "policy {} already exists on {table}",
+            policy.name.value
+        )));
+    }
+    security.policies.push(mongreldb_core::RowPolicy {
+        name: policy.name.value,
+        table: table.clone(),
+        command,
+        subjects,
+        permissive: !matches!(policy.policy_type, Some(CreatePolicyType::Restrictive)),
+        using,
+        with_check,
+    });
+    db.set_security_catalog_as(security, session.principal().as_ref())?;
+    session.refresh_registered_table(db, &table)?;
+    session.clear_cache();
+    Ok(())
+}
+
+fn drop_policy(session: &MongrelSession, db: &Arc<Database>, policy: DropPolicy) -> Result<()> {
+    db.require_for(
+        session.principal().as_ref(),
+        &mongreldb_core::Permission::Admin,
+    )?;
+    let table = object_name(&policy.table_name)?;
+    let mut security = db.security_catalog();
+    let old_len = security.policies.len();
+    security
+        .policies
+        .retain(|existing| existing.table != table || existing.name != policy.name.value);
+    if security.policies.len() == old_len {
+        if policy.if_exists {
+            return Ok(());
+        }
+        return Err(MongrelQueryError::Schema(format!(
+            "policy {} does not exist on {table}",
+            policy.name.value
+        )));
+    }
+    db.set_security_catalog_as(security, session.principal().as_ref())?;
+    session.refresh_registered_table(db, &table)?;
+    session.clear_cache();
+    Ok(())
+}
+
+fn policy_subject(session: &MongrelSession, db: &Arc<Database>, owner: Owner) -> Result<String> {
+    match owner {
+        Owner::Ident(ident) => Ok(ident.value),
+        Owner::CurrentUser | Owner::SessionUser => session
+            .principal()
+            .or_else(|| db.principal_snapshot())
+            .map(|principal| principal.username)
+            .ok_or(MongrelQueryError::Core(
+                mongreldb_core::MongrelError::AuthRequired,
+            )),
+        Owner::CurrentRole => Err(MongrelQueryError::Schema(
+            "CURRENT_ROLE is ambiguous when multiple roles are active".into(),
+        )),
+    }
+}
+
+fn lower_security_expr(expr: &Expr, schema: &CoreSchema) -> Result<mongreldb_core::SecurityExpr> {
+    use mongreldb_core::SecurityExpr;
+    match expr {
+        Expr::Nested(expression) => lower_security_expr(expression, schema),
+        Expr::UnaryOp {
+            op: UnaryOperator::Not,
+            expr,
+        } => Ok(SecurityExpr::Not {
+            expression: Box::new(lower_security_expr(expr, schema)?),
+        }),
+        Expr::BinaryOp { left, op, right }
+            if matches!(op, BinaryOperator::And | BinaryOperator::Or) =>
+        {
+            let left = Box::new(lower_security_expr(left, schema)?);
+            let right = Box::new(lower_security_expr(right, schema)?);
+            Ok(match op {
+                BinaryOperator::And => SecurityExpr::And { left, right },
+                BinaryOperator::Or => SecurityExpr::Or { left, right },
+                _ => unreachable!(),
+            })
+        }
+        Expr::BinaryOp { left, op, right }
+            if matches!(op, BinaryOperator::Eq | BinaryOperator::NotEq) =>
+        {
+            let equality = lower_security_equality(left, right, schema)
+                .or_else(|_| lower_security_equality(right, left, schema))?;
+            if matches!(op, BinaryOperator::NotEq) {
+                Ok(SecurityExpr::Not {
+                    expression: Box::new(equality),
+                })
+            } else {
+                Ok(equality)
+            }
+        }
+        Expr::Value(value) if matches!(value.value, SqlValue::Boolean(true)) => {
+            Ok(SecurityExpr::True)
+        }
+        Expr::Value(value) if matches!(value.value, SqlValue::Boolean(false)) => {
+            Ok(SecurityExpr::Not {
+                expression: Box::new(SecurityExpr::True),
+            })
+        }
+        _ => Err(MongrelQueryError::Schema(format!(
+            "unsupported policy expression {expr}; use column = literal/CURRENT_USER with AND, OR, NOT"
+        ))),
+    }
+}
+
+fn lower_security_equality(
+    column: &Expr,
+    value: &Expr,
+    schema: &CoreSchema,
+) -> Result<mongreldb_core::SecurityExpr> {
+    let column_name = match column {
+        Expr::Identifier(ident) => &ident.value,
+        Expr::CompoundIdentifier(idents) => {
+            &idents
+                .last()
+                .ok_or_else(|| MongrelQueryError::Schema("empty policy column".into()))?
+                .value
+        }
+        _ => {
+            return Err(MongrelQueryError::Schema(
+                "policy equality requires a column".into(),
+            ))
+        }
+    };
+    let column = schema
+        .column(column_name)
+        .ok_or_else(|| MongrelQueryError::Schema(format!("unknown policy column {column_name}")))?;
+    if is_current_user_expr(value) {
+        if !matches!(column.ty, TypeId::Bytes | TypeId::Enum { .. }) {
+            return Err(MongrelQueryError::Schema(
+                "CURRENT_USER requires a string/bytes policy column".into(),
+            ));
+        }
+        return Ok(mongreldb_core::SecurityExpr::ColumnEqCurrentUser { column: column.id });
+    }
+    let value = expr_to_value(value, column.ty.clone())?;
+    if matches!(value, Value::Null) {
+        return Err(MongrelQueryError::Schema(
+            "policy equality with NULL is not supported".into(),
+        ));
+    }
+    Ok(mongreldb_core::SecurityExpr::ColumnEqValue {
+        column: column.id,
+        value,
+    })
+}
+
+fn is_current_user_expr(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Function(function)
+            if function.name.to_string().eq_ignore_ascii_case("current_user")
+                || function.name.to_string().eq_ignore_ascii_case("session_user")
+                || function.name.to_string().eq_ignore_ascii_case("user")
+    )
 }
 
 fn alter_table(session: &MongrelSession, db: &Arc<Database>, alter: AlterTable) -> Result<()> {
@@ -2223,6 +3392,20 @@ fn alter_table(session: &MongrelSession, db: &Arc<Database>, alter: AlterTable) 
             }
             rebuild_table(session, db, &table_name, schema)?;
         }
+        AlterTableOperation::EnableRowLevelSecurity => {
+            let mut security = db.security_catalog();
+            if !security.rls_tables.contains(&table_name) {
+                security.rls_tables.push(table_name.clone());
+            }
+            db.set_security_catalog_as(security, session.principal().as_ref())?;
+            session.refresh_registered_table(db, &table_name)?;
+        }
+        AlterTableOperation::DisableRowLevelSecurity => {
+            let mut security = db.security_catalog();
+            security.rls_tables.retain(|table| table != &table_name);
+            db.set_security_catalog_as(security, session.principal().as_ref())?;
+            session.refresh_registered_table(db, &table_name)?;
+        }
         other => {
             return Err(MongrelQueryError::Schema(format!(
                 "unsupported ALTER TABLE operation: {other}"
@@ -2292,7 +3475,12 @@ fn add_table_constraint(
                     .map(|c| format!("idx_{}", c.column.expr))
                     .unwrap_or_else(|| "idx".to_string())
             });
-            add_index_defs(&mut schema, &name, idx.columns, index_kind_from_sql(idx.index_type.as_ref())?)?;
+            add_index_defs(
+                &mut schema,
+                &name,
+                idx.columns,
+                index_kind_from_sql(idx.index_type.as_ref())?,
+            )?;
             rebuild_table(session, db, table, schema)
         }
         TableConstraint::FulltextOrSpatial(idx) => {
@@ -2312,12 +3500,32 @@ fn add_table_constraint(
         TableConstraint::PrimaryKey(pk) => Err(MongrelQueryError::Schema(format!(
             "adding primary keys after table creation is not supported: {pk}"
         ))),
+        TableConstraint::Check(check) => {
+            if check.enforced == Some(false) {
+                return Err(MongrelQueryError::Schema(
+                    "NOT ENFORCED CHECK constraints are not supported".into(),
+                ));
+            }
+            let mut schema = table_schema(db, table)?;
+            let expr = lower_check_expr(&check.expr, &schema)?;
+            expr.validate()?;
+            let id = (schema.constraints.checks.len() + 1) as u16;
+            schema.constraints.checks.push(CoreCheckConstraint {
+                id,
+                name: check
+                    .name
+                    .map(|name| name.value)
+                    .unwrap_or_else(|| format!("check_{id}")),
+                expr,
+            });
+            rebuild_table(session, db, table, schema)
+        }
         TableConstraint::Unique(_)
         | TableConstraint::ForeignKey(_)
-        | TableConstraint::Check(_)
         | TableConstraint::PrimaryKeyUsingIndex(_)
         | TableConstraint::UniqueUsingIndex(_) => Err(MongrelQueryError::Schema(
-            "UNIQUE, FOREIGN KEY, and CHECK enforcement is provided by MongrelDB Kit, not core SQL DDL".into(),
+            "UNIQUE and FOREIGN KEY enforcement is provided by MongrelDB Kit, not core SQL DDL"
+                .into(),
         )),
     }
 }
@@ -3296,6 +4504,7 @@ fn stage_or_apply(
         return Ok(());
     }
     if let Some(staged) = session.sql_txn.lock().as_mut() {
+        ensure_staging_capacity(staged.len(), ops.len())?;
         staged.extend(ops);
         session
             .sql_fn_state
@@ -3517,14 +4726,26 @@ fn apply_ops(session: &MongrelSession, db: &Arc<Database>, ops: Vec<PendingSqlOp
         db: Arc::clone(db),
         modules: Arc::clone(&session.external_modules),
     };
-    db.transaction_with_external_trigger_bridge(&bridge, |tx| {
-        for op in ops {
+    db.transaction_with_external_trigger_bridge_as(&bridge, session.principal(), |tx| {
+        let mut ops = ops.into_iter().peekable();
+        while let Some(op) = ops.next() {
             match op {
                 PendingSqlOp::Put { table, cells } => {
                     tx.put(&table, cells)?;
                 }
                 PendingSqlOp::Delete { table, row_id } => {
-                    tx.delete(&table, row_id)?;
+                    let paired_update = matches!(
+                        ops.peek(),
+                        Some(PendingSqlOp::Put { table: put_table, .. }) if put_table == &table
+                    );
+                    if paired_update {
+                        let Some(PendingSqlOp::Put { cells, .. }) = ops.next() else {
+                            unreachable!("peeked update put")
+                        };
+                        tx.update_many(&table, vec![(row_id, cells)])?;
+                    } else {
+                        tx.delete(&table, row_id)?;
+                    }
                 }
                 PendingSqlOp::ExternalState { table, state, .. } => {
                     tx.put_external_state(&table, state)?;
@@ -3554,14 +4775,14 @@ fn schema_from_create_table(create: &CreateTable) -> Result<CoreSchema> {
             TableConstraint::FulltextOrSpatial(idx) if idx.fulltext => {
                 let _ = idx;
             }
+            TableConstraint::Check(_) => {}
             TableConstraint::Unique(_)
             | TableConstraint::ForeignKey(_)
-            | TableConstraint::Check(_)
             | TableConstraint::PrimaryKeyUsingIndex(_)
             | TableConstraint::UniqueUsingIndex(_)
             | TableConstraint::FulltextOrSpatial(_) => {
                 return Err(MongrelQueryError::Schema(
-                    "UNIQUE, FOREIGN KEY, CHECK, and SPATIAL constraints are not enforced by core SQL DDL; use MongrelDB Kit for those constraints".into(),
+                    "UNIQUE, FOREIGN KEY, and SPATIAL constraints are not enforced by core SQL DDL; use MongrelDB Kit for those constraints".into(),
                 ));
             }
         }
@@ -3604,11 +4825,223 @@ fn schema_from_create_table(create: &CreateTable) -> Result<CoreSchema> {
                     .unwrap_or_else(|| "fulltext_idx".into());
                 add_index_defs(&mut schema, &name, idx.columns.clone(), IndexKind::FmIndex)?;
             }
+            TableConstraint::Check(check) => {
+                if check.enforced == Some(false) {
+                    return Err(MongrelQueryError::Schema(
+                        "NOT ENFORCED CHECK constraints are not supported".into(),
+                    ));
+                }
+                let expr = lower_check_expr(&check.expr, &schema)?;
+                expr.validate()?;
+                let id = (schema.constraints.checks.len() + 1) as u16;
+                schema.constraints.checks.push(CoreCheckConstraint {
+                    id,
+                    name: check
+                        .name
+                        .as_ref()
+                        .map(|name| name.value.clone())
+                        .unwrap_or_else(|| format!("check_{id}")),
+                    expr,
+                });
+            }
             _ => {}
+        }
+    }
+    for column in &create.columns {
+        for option in &column.options {
+            if let ColumnOption::Check(check) = &option.option {
+                if check.enforced == Some(false) {
+                    return Err(MongrelQueryError::Schema(
+                        "NOT ENFORCED CHECK constraints are not supported".into(),
+                    ));
+                }
+                let expr = lower_check_expr(&check.expr, &schema)?;
+                expr.validate()?;
+                let id = (schema.constraints.checks.len() + 1) as u16;
+                schema.constraints.checks.push(CoreCheckConstraint {
+                    id,
+                    name: check
+                        .name
+                        .as_ref()
+                        .map(|name| name.value.clone())
+                        .unwrap_or_else(|| format!("check_{}_{}", column.name.value, id)),
+                    expr,
+                });
+            }
         }
     }
     schema.validate_auto_increment()?;
     Ok(schema)
+}
+
+fn lower_check_expr(expr: &Expr, schema: &CoreSchema) -> Result<CheckExpr> {
+    let boxed = |expr| lower_check_expr(expr, schema).map(Box::new);
+    match expr {
+        Expr::Nested(expr) => lower_check_expr(expr, schema),
+        Expr::Identifier(identifier) => schema
+            .column(&identifier.value)
+            .map(|column| CheckExpr::Col(column.id))
+            .ok_or_else(|| {
+                MongrelQueryError::Schema(format!(
+                    "CHECK references unknown column {}",
+                    identifier.value
+                ))
+            }),
+        Expr::CompoundIdentifier(parts) => {
+            let name = parts
+                .last()
+                .ok_or_else(|| MongrelQueryError::Schema("empty CHECK column reference".into()))?;
+            schema
+                .column(&name.value)
+                .map(|column| CheckExpr::Col(column.id))
+                .ok_or_else(|| {
+                    MongrelQueryError::Schema(format!(
+                        "CHECK references unknown column {}",
+                        name.value
+                    ))
+                })
+        }
+        Expr::Value(value) => Ok(CheckExpr::Lit(sql_value_to_value(&value.value, None)?)),
+        Expr::IsNull(expr) => Ok(CheckExpr::IsNull(check_column_id(expr, schema)?)),
+        Expr::IsNotNull(expr) => Ok(CheckExpr::IsNotNull(check_column_id(expr, schema)?)),
+        Expr::UnaryOp {
+            op: UnaryOperator::Not,
+            expr,
+        } => Ok(CheckExpr::Not(boxed(expr)?)),
+        Expr::UnaryOp {
+            op: UnaryOperator::Plus,
+            expr,
+        } => lower_check_expr(expr, schema),
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => Ok(CheckExpr::Sub(
+            Box::new(CheckExpr::Lit(Value::Int64(0))),
+            boxed(expr)?,
+        )),
+        Expr::BinaryOp { left, op, right } => {
+            let left_lowered = || boxed(left);
+            let right_lowered = || boxed(right);
+            match op {
+                BinaryOperator::Eq => Ok(CheckExpr::Eq(left_lowered()?, right_lowered()?)),
+                BinaryOperator::NotEq => Ok(CheckExpr::Ne(left_lowered()?, right_lowered()?)),
+                BinaryOperator::Lt => Ok(CheckExpr::Lt(left_lowered()?, right_lowered()?)),
+                BinaryOperator::LtEq => Ok(CheckExpr::Le(left_lowered()?, right_lowered()?)),
+                BinaryOperator::Gt => Ok(CheckExpr::Gt(left_lowered()?, right_lowered()?)),
+                BinaryOperator::GtEq => Ok(CheckExpr::Ge(left_lowered()?, right_lowered()?)),
+                BinaryOperator::And => Ok(CheckExpr::And(left_lowered()?, right_lowered()?)),
+                BinaryOperator::Or => Ok(CheckExpr::Or(left_lowered()?, right_lowered()?)),
+                BinaryOperator::Plus => Ok(CheckExpr::Add(left_lowered()?, right_lowered()?)),
+                BinaryOperator::Minus => Ok(CheckExpr::Sub(left_lowered()?, right_lowered()?)),
+                BinaryOperator::Multiply => Ok(CheckExpr::Mul(left_lowered()?, right_lowered()?)),
+                BinaryOperator::Divide => Ok(CheckExpr::Div(left_lowered()?, right_lowered()?)),
+                BinaryOperator::Modulo => Ok(CheckExpr::Mod(left_lowered()?, right_lowered()?)),
+                BinaryOperator::PGRegexMatch | BinaryOperator::Regexp => {
+                    lower_regex_check(left, right, schema, false, false)
+                }
+                BinaryOperator::PGRegexIMatch => {
+                    lower_regex_check(left, right, schema, false, true)
+                }
+                BinaryOperator::PGRegexNotMatch => {
+                    lower_regex_check(left, right, schema, true, false)
+                }
+                BinaryOperator::PGRegexNotIMatch => {
+                    lower_regex_check(left, right, schema, true, true)
+                }
+                BinaryOperator::Custom(operator)
+                    if matches!(operator.as_str(), "~" | "~*" | "!~" | "!~*") =>
+                {
+                    lower_regex_check(
+                        left,
+                        right,
+                        schema,
+                        operator.starts_with('!'),
+                        operator.ends_with('*'),
+                    )
+                }
+                _ => Err(MongrelQueryError::Schema(format!(
+                    "unsupported CHECK operator {op}"
+                ))),
+            }
+        }
+        Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => {
+            let between = CheckExpr::And(
+                Box::new(CheckExpr::Ge(boxed(expr)?, boxed(low)?)),
+                Box::new(CheckExpr::Le(boxed(expr)?, boxed(high)?)),
+            );
+            Ok(if *negated {
+                CheckExpr::Not(Box::new(between))
+            } else {
+                between
+            })
+        }
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let mut lowered = list
+                .iter()
+                .map(|value| Ok(CheckExpr::Eq(boxed(expr)?, boxed(value)?)));
+            let first = lowered
+                .next()
+                .transpose()?
+                .unwrap_or_else(|| CheckExpr::Not(Box::new(CheckExpr::True)));
+            let any = lowered.try_fold(first, |left, right: Result<CheckExpr>| {
+                Ok::<_, MongrelQueryError>(CheckExpr::Or(Box::new(left), Box::new(right?)))
+            })?;
+            Ok(if *negated {
+                CheckExpr::Not(Box::new(any))
+            } else {
+                any
+            })
+        }
+        Expr::Cast { expr, .. } => lower_check_expr(expr, schema),
+        _ => Err(MongrelQueryError::Schema(format!(
+            "unsupported CHECK expression: {expr}"
+        ))),
+    }
+}
+
+fn check_column_id(expr: &Expr, schema: &CoreSchema) -> Result<u16> {
+    match lower_check_expr(expr, schema)? {
+        CheckExpr::Col(column_id) => Ok(column_id),
+        _ => Err(MongrelQueryError::Schema(
+            "IS NULL in CHECK requires a column reference".into(),
+        )),
+    }
+}
+
+fn lower_regex_check(
+    left: &Expr,
+    right: &Expr,
+    schema: &CoreSchema,
+    negated: bool,
+    case_insensitive: bool,
+) -> Result<CheckExpr> {
+    let col = check_column_id(left, schema)?;
+    let pattern = match lower_check_expr(right, schema)? {
+        CheckExpr::Lit(Value::Bytes(pattern)) => String::from_utf8(pattern).map_err(|error| {
+            MongrelQueryError::Schema(format!("CHECK regex pattern is not UTF-8: {error}"))
+        })?,
+        _ => {
+            return Err(MongrelQueryError::Schema(
+                "CHECK regex requires a string literal pattern".into(),
+            ))
+        }
+    };
+    Ok(CheckExpr::Regex {
+        col,
+        pattern,
+        negated,
+        case_insensitive,
+        cached: std::sync::OnceLock::new(),
+    })
 }
 
 fn core_column_from_sql(
@@ -3640,9 +5073,10 @@ fn core_column_from_sql(
                     flags = flags.without(ColumnFlags::NULLABLE);
                 }
             }
-            ColumnOption::Unique(_) | ColumnOption::ForeignKey(_) | ColumnOption::Check(_) => {
+            ColumnOption::Check(_) => {}
+            ColumnOption::Unique(_) | ColumnOption::ForeignKey(_) => {
                 return Err(MongrelQueryError::Schema(
-                    "column UNIQUE, REFERENCES, and CHECK constraints are provided by MongrelDB Kit, not core SQL DDL".into(),
+                    "column UNIQUE and REFERENCES constraints are provided by MongrelDB Kit, not core SQL DDL".into(),
                 ));
             }
             ColumnOption::Default(expr) => {
@@ -4169,7 +5603,37 @@ fn rebuild_table(
     table: &str,
     new_schema: CoreSchema,
 ) -> Result<()> {
+    let saved_security = db.security_catalog();
+    let saved_permissions = db
+        .roles()
+        .into_iter()
+        .flat_map(|role| {
+            let role_name = role.name;
+            role.permissions
+                .into_iter()
+                .filter(|permission| permission_targets_table(permission, table))
+                .map(move |permission| (role_name.clone(), permission))
+        })
+        .collect::<Vec<_>>();
+    if saved_security.table_has_objects(table) || !saved_permissions.is_empty() {
+        db.require_for(
+            session.principal().as_ref(),
+            &mongreldb_core::Permission::Admin,
+        )?;
+        validate_rebuilt_security(table, &new_schema, &saved_security)?;
+    }
     let (_, rows) = visible_rows(db, table)?;
+    let ttl = {
+        let handle = db.table(table)?;
+        let guard = handle.lock();
+        guard.ttl().and_then(|policy| {
+            new_schema
+                .columns
+                .iter()
+                .find(|column| column.id == policy.column_id)
+                .map(|column| (column.name.clone(), policy.duration_nanos))
+        })
+    };
     let temp = format!(
         "__mongrel_tmp_rebuild_{}_{}",
         table,
@@ -4179,6 +5643,9 @@ fn rebuild_table(
             .unwrap_or(0)
     );
     db.create_table(&temp, new_schema.clone())?;
+    if let Some((column, duration_nanos)) = &ttl {
+        db.set_table_ttl(&temp, column, *duration_nanos)?;
+    }
     let temp_result = apply_ops(
         session,
         db,
@@ -4196,6 +5663,17 @@ fn rebuild_table(
 
     db.drop_table(table)?;
     db.create_table(table, new_schema.clone())?;
+    if let Some((column, duration_nanos)) = &ttl {
+        db.set_table_ttl(table, column, *duration_nanos)?;
+    }
+    if saved_security.table_has_objects(table) {
+        db.set_security_catalog_as(saved_security, session.principal().as_ref())?;
+    }
+    for (role, permission) in saved_permissions {
+        if let Some(permission) = permission_for_rebuilt_schema(permission, &new_schema) {
+            db.grant_permission(&role, permission)?;
+        }
+    }
     apply_ops(
         session,
         db,
@@ -4210,6 +5688,98 @@ fn rebuild_table(
     let _ = session.ctx.deregister_table(table);
     session.tables.lock().remove(table);
     register_table(session, db, table)?;
+    Ok(())
+}
+
+fn permission_targets_table(permission: &mongreldb_core::Permission, table: &str) -> bool {
+    use mongreldb_core::Permission;
+    matches!(
+        permission,
+        Permission::Select { table: target }
+            | Permission::Insert { table: target }
+            | Permission::Update { table: target }
+            | Permission::Delete { table: target }
+            | Permission::SelectColumns { table: target, .. }
+            | Permission::InsertColumns { table: target, .. }
+            | Permission::UpdateColumns { table: target, .. }
+            if target == table
+    )
+}
+
+fn permission_for_rebuilt_schema(
+    permission: mongreldb_core::Permission,
+    schema: &CoreSchema,
+) -> Option<mongreldb_core::Permission> {
+    use mongreldb_core::Permission;
+    let retain_columns = |mut columns: Vec<String>| {
+        columns.retain(|column| schema.column(column).is_some());
+        (!columns.is_empty()).then_some(columns)
+    };
+    match permission {
+        Permission::SelectColumns { table, columns } => {
+            retain_columns(columns).map(|columns| Permission::SelectColumns { table, columns })
+        }
+        Permission::InsertColumns { table, columns } => {
+            retain_columns(columns).map(|columns| Permission::InsertColumns { table, columns })
+        }
+        Permission::UpdateColumns { table, columns } => {
+            retain_columns(columns).map(|columns| Permission::UpdateColumns { table, columns })
+        }
+        permission => Some(permission),
+    }
+}
+
+fn validate_rebuilt_security(
+    table: &str,
+    schema: &CoreSchema,
+    security: &mongreldb_core::SecurityCatalog,
+) -> Result<()> {
+    fn validate_expr(expr: &mongreldb_core::SecurityExpr, schema: &CoreSchema) -> Result<()> {
+        match expr {
+            mongreldb_core::SecurityExpr::True => Ok(()),
+            mongreldb_core::SecurityExpr::ColumnEqCurrentUser { column }
+            | mongreldb_core::SecurityExpr::ColumnEqValue { column, .. } => {
+                if schema
+                    .columns
+                    .iter()
+                    .any(|candidate| candidate.id == *column)
+                {
+                    Ok(())
+                } else {
+                    Err(MongrelQueryError::Schema(format!(
+                        "cannot drop column {column}: row policy depends on it"
+                    )))
+                }
+            }
+            mongreldb_core::SecurityExpr::And { left, right }
+            | mongreldb_core::SecurityExpr::Or { left, right } => {
+                validate_expr(left, schema)?;
+                validate_expr(right, schema)
+            }
+            mongreldb_core::SecurityExpr::Not { expression } => validate_expr(expression, schema),
+        }
+    }
+
+    for policy in security
+        .policies
+        .iter()
+        .filter(|policy| policy.table == table)
+    {
+        if let Some(expression) = &policy.using {
+            validate_expr(expression, schema)?;
+        }
+        if let Some(expression) = &policy.with_check {
+            validate_expr(expression, schema)?;
+        }
+    }
+    for mask in security.masks.iter().filter(|mask| mask.table == table) {
+        if !schema.columns.iter().any(|column| column.id == mask.column) {
+            return Err(MongrelQueryError::Schema(format!(
+                "cannot drop column {}: mask {} depends on it",
+                mask.column, mask.name
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -4238,7 +5808,12 @@ fn current_column_flags(db: &Arc<Database>, table: &str, column: &str) -> Result
 
 fn register_table(session: &MongrelSession, db: &Arc<Database>, name: &str) -> Result<()> {
     let handle = db.table(name)?;
-    let provider = MongrelProvider::new(handle.clone())?;
+    let provider = MongrelProvider::new_secured(
+        handle.clone(),
+        Arc::clone(db),
+        name.to_string(),
+        session.principal(),
+    )?;
     session
         .ctx
         .register_table(name, Arc::new(provider))
@@ -4637,49 +6212,6 @@ fn parse_vacuum_into<'a>(sql: &'a str, lower: &str) -> Result<&'a str> {
     } else {
         strip_identifier(body)
     }
-}
-
-fn copy_database_dir(src: &Path, dest: &Path) -> Result<()> {
-    let src = src
-        .canonicalize()
-        .map_err(|e| MongrelQueryError::Schema(e.to_string()))?;
-    if dest.exists() {
-        return Err(MongrelQueryError::Schema(format!(
-            "VACUUM INTO target already exists: {}",
-            dest.display()
-        )));
-    }
-    let parent = dest.parent().unwrap_or_else(|| Path::new("."));
-    if parent.exists() {
-        let parent = parent
-            .canonicalize()
-            .map_err(|e| MongrelQueryError::Schema(e.to_string()))?;
-        if parent.starts_with(&src) {
-            return Err(MongrelQueryError::Schema(
-                "VACUUM INTO target must not be inside the source database directory".into(),
-            ));
-        }
-    }
-    copy_dir_recursive(&src, dest)
-}
-
-fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
-    fs::create_dir_all(dest).map_err(|e| MongrelQueryError::Schema(e.to_string()))?;
-    for entry in fs::read_dir(src).map_err(|e| MongrelQueryError::Schema(e.to_string()))? {
-        let entry = entry.map_err(|e| MongrelQueryError::Schema(e.to_string()))?;
-        let src_path = entry.path();
-        let dest_path = dest.join(entry.file_name());
-        let metadata = entry
-            .metadata()
-            .map_err(|e| MongrelQueryError::Schema(e.to_string()))?;
-        if metadata.is_dir() {
-            copy_dir_recursive(&src_path, &dest_path)?;
-        } else if metadata.is_file() {
-            fs::copy(&src_path, &dest_path)
-                .map_err(|e| MongrelQueryError::Schema(e.to_string()))?;
-        }
-    }
-    Ok(())
 }
 
 fn run_pragma(
@@ -5348,7 +6880,7 @@ fn pragma_foreign_key_list(db: &Arc<Database>, table: &str) -> Result<RecordBatc
                     .map(|s| column_name(s, *to_id))
                     .unwrap_or_else(|| to_id.to_string()),
             );
-            on_update.push("NO ACTION".to_string());
+            on_update.push(format_fk_action(fk.on_update).to_string());
             on_delete.push(format_fk_action(fk.on_delete).to_string());
             match_kind.push("NONE".to_string());
         }
@@ -6037,4 +7569,16 @@ fn extract_outer_query(sql: &str) -> Result<String> {
         ));
     }
     Ok(outer.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn staged_sql_operations_are_capped() {
+        assert!(ensure_staging_capacity(MAX_STAGED_SQL_OPS - 1, 1).is_ok());
+        let error = ensure_staging_capacity(MAX_STAGED_SQL_OPS, 1).unwrap_err();
+        assert!(error.to_string().contains("10000 staged operations"));
+    }
 }

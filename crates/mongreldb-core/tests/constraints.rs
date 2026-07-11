@@ -95,6 +95,7 @@ fn orders_schema_with_fk() -> Schema {
         ref_table: "users".into(),
         ref_columns: vec![0],
         on_delete: FkAction::Restrict,
+        on_update: FkAction::Restrict,
     });
     Schema {
         schema_id: 0,
@@ -112,8 +113,116 @@ fn orders_schema_with_action(action: FkAction) -> Schema {
     s
 }
 
+fn orders_schema_with_update_action(action: FkAction) -> Schema {
+    let mut schema = orders_schema_with_fk();
+    schema.constraints.foreign_keys[0].on_update = action;
+    schema
+}
+
 fn row(pairs: &[(u16, Value)]) -> Vec<(u16, Value)> {
     pairs.to_vec()
+}
+
+fn setup_update_fk(action: FkAction) -> (tempfile::TempDir, Database, RowId, RowId) {
+    let dir = tempdir().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.create_table("users", users_schema(false, false))
+        .unwrap();
+    db.create_table("orders", orders_schema_with_update_action(action))
+        .unwrap();
+    db.transaction(|transaction| {
+        transaction.put("users", row(&[(0, Value::Int64(1))]))?;
+        transaction.put(
+            "orders",
+            row(&[(10, Value::Int64(10)), (11, Value::Int64(1))]),
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    let snapshot = db.snapshot().0;
+    let user = db
+        .table("users")
+        .unwrap()
+        .lock()
+        .visible_rows(snapshot)
+        .unwrap()[0]
+        .row_id;
+    let order = db
+        .table("orders")
+        .unwrap()
+        .lock()
+        .visible_rows(snapshot)
+        .unwrap()[0]
+        .row_id;
+    (dir, db, user, order)
+}
+
+#[test]
+fn fk_on_update_restrict_uses_final_write_set() {
+    let (_dir, db, user, order) = setup_update_fk(FkAction::Restrict);
+    let error = db
+        .transaction(|transaction| {
+            transaction.update_many("users", vec![(user, row(&[(0, Value::Int64(2))]))])?;
+            Ok(())
+        })
+        .unwrap_err();
+    assert!(error.to_string().contains("restricts update"));
+
+    // Moving the child to the parent's new key in the same transaction leaves
+    // a valid final write set and must not trip RESTRICT.
+    db.transaction(|transaction| {
+        transaction.update_many("users", vec![(user, row(&[(0, Value::Int64(2))]))])?;
+        transaction.update_many("orders", vec![(order, row(&[(11, Value::Int64(2))]))])?;
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn fk_on_update_cascade_rewrites_child_key() {
+    let (_dir, db, user, _order) = setup_update_fk(FkAction::Cascade);
+    db.transaction(|transaction| {
+        transaction.update_many("users", vec![(user, row(&[(0, Value::Int64(2))]))])?;
+        Ok(())
+    })
+    .unwrap();
+    let rows = db
+        .table("orders")
+        .unwrap()
+        .lock()
+        .visible_rows(db.snapshot().0)
+        .unwrap();
+    assert_eq!(rows[0].columns.get(&11), Some(&Value::Int64(2)));
+}
+
+#[test]
+fn fk_on_update_set_null_rewrites_child_key() {
+    let (_dir, db, user, _order) = setup_update_fk(FkAction::SetNull);
+    db.transaction(|transaction| {
+        transaction.update_many("users", vec![(user, row(&[(0, Value::Int64(2))]))])?;
+        Ok(())
+    })
+    .unwrap();
+    let rows = db
+        .table("orders")
+        .unwrap()
+        .lock()
+        .visible_rows(db.snapshot().0)
+        .unwrap();
+    assert_eq!(rows[0].columns.get(&11), Some(&Value::Null));
+}
+
+#[test]
+fn fk_on_update_ignores_non_key_changes() {
+    let (_dir, db, user, _order) = setup_update_fk(FkAction::Restrict);
+    db.transaction(|transaction| {
+        transaction.update_many(
+            "users",
+            vec![(user, row(&[(1, Value::Bytes(b"new@example.com".to_vec()))]))],
+        )?;
+        Ok(())
+    })
+    .unwrap();
 }
 
 #[test]
@@ -376,6 +485,7 @@ fn fk_cyclical_same_txn_inserts() {
             ref_table: "b".into(),
             ref_columns: vec![10],
             on_delete: FkAction::Restrict,
+            on_update: FkAction::Restrict,
         });
         Schema {
             schema_id: 0,
@@ -408,6 +518,7 @@ fn fk_cyclical_same_txn_inserts() {
             ref_table: "a".into(),
             ref_columns: vec![10],
             on_delete: FkAction::Restrict,
+            on_update: FkAction::Restrict,
         });
         Schema {
             schema_id: 0,
@@ -686,6 +797,7 @@ fn fk_cascade_transitive() {
         ref_table: "orders".into(),
         ref_columns: vec![10],
         on_delete: FkAction::Cascade,
+        on_update: FkAction::Restrict,
     });
     db.create_table(
         "items",
@@ -770,4 +882,33 @@ fn fk_restrict_still_blocks_when_mixed() {
     let err = r.unwrap_err();
     assert!(matches!(err, MongrelError::Conflict(_)));
     assert!(format!("{err}").contains("restricts delete"));
+}
+
+#[test]
+fn invalid_check_is_rejected_before_durable_create() {
+    let dir = tempdir().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    let mut schema = users_schema(false, false);
+    schema
+        .constraints
+        .checks
+        .push(mongreldb_core::constraint::CheckConstraint {
+            id: 1,
+            name: "invalid_regex".into(),
+            expr: CheckExpr::Regex {
+                col: 1,
+                pattern: "[".into(),
+                negated: false,
+                case_insensitive: false,
+                cached: std::sync::OnceLock::new(),
+            },
+        });
+
+    let error = db.create_table("users", schema).unwrap_err();
+    assert!(error.to_string().contains("invalid regex pattern"));
+    assert!(db.table_names().is_empty());
+    drop(db);
+
+    let reopened = Database::open(dir.path()).unwrap();
+    assert!(reopened.table_names().is_empty());
 }

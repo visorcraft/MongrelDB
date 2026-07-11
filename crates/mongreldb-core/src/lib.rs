@@ -10,6 +10,7 @@
 
 pub mod auth;
 pub mod auth_state;
+pub mod backup;
 pub mod be_tree;
 pub mod cache;
 pub mod catalog;
@@ -30,14 +31,17 @@ pub mod manifest;
 pub mod memtable;
 pub mod mutable_run;
 pub mod page;
+pub mod pitr;
 pub mod pma;
 pub mod procedure;
 pub mod query;
+pub mod replication;
 pub mod reservoir;
 pub mod retention;
 pub(crate) mod row_id_set;
 pub mod rowid;
 pub mod schema;
+pub mod security;
 pub mod sorted_run;
 pub mod trace;
 pub mod trigger;
@@ -45,14 +49,22 @@ pub mod tsv;
 pub mod txn;
 pub mod wal;
 
-pub use auth::{hash_password, verify_password, Permission, Principal, RoleEntry, UserEntry};
+pub use auth::{
+    hash_password, verify_password, ColumnAccess, ColumnOperation, Permission, Principal,
+    RoleEntry, UserEntry,
+};
+pub use backup::{verify_backup, BackupFile, BackupManifest, BackupReport};
 pub use be_tree::BeTree;
 pub use cache::PageCache;
+pub use catalog::{
+    IncrementalAggregateKind, IncrementalAggregateOutput, IncrementalAggregateView,
+    MaterializedViewEntry,
+};
 pub use columnar::{decode_column, encode_column};
 pub use cursor::{drain_cursor_to_columns, Cursor, MultiRunCursor, NativePageCursor};
 pub use database::{
-    CheckIssue, Database, ExternalTriggerBaseWrite, ExternalTriggerBridge, ExternalTriggerWrite,
-    ExternalTriggerWriteResult, OpenOptions,
+    CdcBatch, ChangeEvent, CheckIssue, Database, ExternalTriggerBaseWrite, ExternalTriggerBridge,
+    ExternalTriggerWrite, ExternalTriggerWriteResult, OpenOptions,
 };
 pub use encryption::{Cipher, PlaintextCipher};
 pub use engine::{
@@ -68,18 +80,31 @@ pub use gc::{CheckReport, DoctorReport, GcReport};
 pub use index::{
     AnnIndex, BitmapIndex, ColumnLearnedRange, FmIndex, HotIndex, LearnedIndex, SparseIndex,
 };
+pub use manifest::TtlPolicy;
 pub use memtable::{Memtable, Row, Value};
 pub use mutable_run::MutableRun;
 pub use page::{CachedPage, Encoding, PageStat};
+pub use pitr::{
+    read_pitr_manifest, restore_pitr, PitrArchiveManifest, PitrArchiveReport, PitrChunkRef,
+    PitrCommitPoint, PitrCredentials, PitrTarget,
+};
 pub use procedure::{
     ProcedureBody, ProcedureCallOutput, ProcedureCallResult, ProcedureCallRow, ProcedureCondition,
     ProcedureEntry, ProcedureMode, ProcedureParam, ProcedureStep, ProcedureValue, StoredProcedure,
 };
 pub use query::{Condition, Query};
+pub use replication::{
+    is_replica, replica_epoch, write_replica_epoch, ReplicationBatch, ReplicationSnapshot,
+};
 pub use reservoir::Reservoir;
 pub use retention::{OwnedSnapshotGuard, SnapshotGuard, SnapshotRegistry};
 pub use rowid::{RowId, RowIdAllocator};
-pub use schema::{AlterColumn, ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
+pub use schema::{
+    AlterColumn, ColumnDef, ColumnFlags, DefaultExpr, IndexDef, IndexKind, Schema, TypeId,
+};
+pub use security::{
+    ColumnMask, MaskStrategy, PolicyCommand, RowPolicy, SecurityCatalog, SecurityExpr,
+};
 pub use sorted_run::{
     read_column_dir, read_header, write_run, write_run_with, ColumnPayload, RunHeader, RunReader,
     RunSpec, RunWriter,

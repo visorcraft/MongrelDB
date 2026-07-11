@@ -26,6 +26,24 @@ impl Table {
     /// worthwhile. A daemon (or any long-lived holder) polls this.
     pub fn should_compact(&self) -> bool {
         self.run_refs().len() >= Self::AUTO_COMPACT_RUN_THRESHOLD
+            || (self.ttl().is_some()
+                && !self.run_refs().is_empty()
+                && self.has_expired_run_rows().unwrap_or(false))
+    }
+
+    fn has_expired_run_rows(&self) -> Result<bool> {
+        let now_nanos = crate::engine::unix_nanos_now();
+        for run in self.run_refs() {
+            let mut reader = self.open_reader(run.run_id)?;
+            if reader
+                .all_rows()?
+                .iter()
+                .any(|row| self.row_expired_at(row, now_nanos))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Compaction as a query optimization (§5.9): if [`should_compact`] reports
@@ -43,13 +61,16 @@ impl Table {
 
     /// Merge all runs into a single level-1 run, dropping superseded versions
     /// and tombstones — **but preserving** the version each pinned snapshot
-    /// still needs. No-op if there are fewer than two runs.
+    /// still needs. No-op if there are fewer than two runs, unless a one-run
+    /// TTL table has expired payloads to reclaim.
     pub fn compact(&mut self) -> Result<()> {
-        if self.run_refs().len() < 2 {
+        let reclaim_ttl = self.ttl().is_some() && self.has_expired_run_rows()?;
+        if self.run_refs().len() < 2 && !reclaim_ttl {
             return Ok(());
         }
         let min_active = self.min_active_snapshot();
         let old_refs: Vec<RunRef> = self.run_refs().to_vec();
+        let now_nanos = crate::engine::unix_nanos_now();
 
         // Fold the mutable-run tier into the compaction input (Phase 11.1) so
         // its rows are merged and rewritten to the output run. Draining here is
@@ -75,14 +96,40 @@ impl Table {
         }
 
         let mut rows: Vec<Row> = Vec::new();
+        let mut expired_reclaimed = false;
+        let mut current_live_count = 0u64;
         for (_, mut vers) in all {
             vers.sort_by_key(|r| r.committed_epoch);
-            rows.extend(select_keep(&vers, min_active));
+            let newest = vers.last().expect("at least one version");
+            let newest_epoch = newest.committed_epoch;
+            if !newest.deleted && !self.row_expired_at(newest, now_nanos) {
+                current_live_count += 1;
+            }
+            for row in select_keep(&vers, min_active) {
+                if self.row_expired_at(&row, now_nanos) {
+                    expired_reclaimed = true;
+                    // If an older snapshot still needs a pre-expiry version,
+                    // keep a payload-free tombstone at the newest epoch. Merely
+                    // dropping the expired newest version could resurrect the
+                    // older row for current readers after the rewrite.
+                    if row.committed_epoch == newest_epoch
+                        && min_active.is_some_and(|epoch| newest_epoch > epoch)
+                    {
+                        let mut tombstone = row;
+                        tombstone.deleted = true;
+                        tombstone.columns.clear();
+                        rows.push(tombstone);
+                    }
+                } else {
+                    rows.push(row);
+                }
+            }
         }
         rows.sort_by_key(|r| (r.row_id, r.committed_epoch));
 
-        // Recompute the live-row counter from the merged survivors.
-        self.live_count = rows.iter().filter(|r| !r.deleted).count() as u64;
+        // Count logical rows at the current epoch, not retained historical
+        // versions (which may leave several non-deleted records per RowId).
+        self.live_count = current_live_count;
 
         let retire_epoch = self.current_epoch().0;
         if rows.is_empty() {
@@ -98,7 +145,7 @@ impl Table {
             self.persist_manifest(self.current_epoch())?;
             // No live rows remain; the in-memory indexes are stale → drop the
             // checkpoint so reopen rebuilds (empty) instead of loading it.
-            self.invalidate_index_checkpoint();
+            self.mark_indexes_incomplete();
             return Ok(());
         }
 
@@ -136,15 +183,18 @@ impl Table {
         // checkpoint with empty learned_range and fall back to page-pruned scans).
         self.build_learned_ranges()?;
         self.clear_result_cache();
-        self.checkpoint_indexes(self.current_epoch());
+        if expired_reclaimed {
+            self.mark_indexes_incomplete();
+        } else {
+            self.checkpoint_indexes(self.current_epoch());
+        }
         Ok(())
     }
 }
 
-/// Versions to keep for one `RowId` given the oldest pinned snapshot. Always
-/// keeps the newest version; if snapshots are active, also keeps the newest
-/// version `<= min_active` (the one the oldest snapshot sees). Tombstones are
-/// only dropped when no snapshot is active.
+/// Versions to keep for one `RowId` given the oldest queryable snapshot. Every
+/// transition at or after the floor is retained, plus the boundary version
+/// visible at the floor. With no floor, only the current live version remains.
 fn select_keep(vers: &[Row], min_active: Option<Epoch>) -> Vec<Row> {
     let newest = vers.last().expect("at least one version").clone();
     match min_active {
@@ -156,12 +206,14 @@ fn select_keep(vers: &[Row], min_active: Option<Epoch>) -> Vec<Row> {
             }
         }
         Some(min_e) => {
-            let mut keep = vec![newest.clone()];
-            // Newest version visible to the oldest snapshot.
-            if let Some(v) = vers.iter().rev().find(|v| v.committed_epoch <= min_e) {
-                if v.committed_epoch != newest.committed_epoch {
-                    keep.push(v.clone());
+            let recent_start = vers.partition_point(|row| row.committed_epoch < min_e);
+            let mut keep = vers[recent_start..].to_vec();
+            if recent_start > 0 && keep.first().map_or(true, |row| row.committed_epoch > min_e) {
+                let boundary = vers[recent_start - 1].clone();
+                if keep.is_empty() && boundary.deleted {
+                    return Vec::new();
                 }
+                keep.insert(0, boundary);
             }
             keep
         }

@@ -38,7 +38,12 @@ impl Table {
     /// segment. Safe to run any time; readers pin snapshots, not files.
     pub fn gc(&self) -> Result<GcReport> {
         let mut report = GcReport::default();
-        let live: HashSet<u128> = self.run_refs().iter().map(|r| r.run_id).collect();
+        let live: HashSet<u128> = self
+            .run_refs()
+            .iter()
+            .map(|r| r.run_id)
+            .chain(self.retiring_run_ids())
+            .collect();
 
         for entry in std::fs::read_dir(self.runs_dir())? {
             let entry = entry?;

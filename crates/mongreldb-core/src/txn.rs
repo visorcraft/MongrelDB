@@ -20,6 +20,10 @@ use parking_lot::{Condvar, Mutex as PlMutex};
 pub(crate) enum Staged {
     Put(Vec<(u16, Value)>),
     Delete(RowId),
+    /// Full post-update row image paired with its old row id. Kept distinct
+    /// through trigger/FK expansion so ON UPDATE cannot be confused with a
+    /// coincidental delete plus insert.
+    Update(RowId, Vec<(u16, Value)>),
     Truncate,
 }
 
@@ -62,6 +66,8 @@ pub struct Transaction<'db> {
     read: Snapshot,
     staging: Vec<(u64 /*table_id*/, Staged)>,
     external_states: Vec<(String, Vec<u8>)>,
+    materialized_view_updates: Vec<crate::catalog::MaterializedViewEntry>,
+    principal: Option<crate::auth::Principal>,
     external_trigger_bridge: Option<&'db dyn ExternalTriggerBridge>,
     _active: Option<ActiveTxnGuard<'db>>,
 }
@@ -75,6 +81,8 @@ impl<'db> Transaction<'db> {
             read,
             staging: Vec::new(),
             external_states: Vec::new(),
+            materialized_view_updates: Vec::new(),
+            principal: None,
             external_trigger_bridge: None,
             _active: Some(guard),
         }
@@ -85,6 +93,11 @@ impl<'db> Transaction<'db> {
         bridge: &'db dyn ExternalTriggerBridge,
     ) -> Self {
         self.external_trigger_bridge = Some(bridge);
+        self
+    }
+
+    pub(crate) fn with_principal(mut self, principal: Option<crate::auth::Principal>) -> Self {
+        self.principal = principal;
         self
     }
 
@@ -105,10 +118,8 @@ impl<'db> Transaction<'db> {
     /// counter. The value is staged in `cells`, so the commit path writes the
     /// same id into the row.
     pub fn put(&mut self, table: &str, mut cells: Vec<(u16, Value)>) -> Result<Option<i64>> {
-        self.db
-            .require_table(table, crate::auth_state::RequiredPermission::Insert)?;
+        self.require_columns(table, crate::auth::ColumnOperation::Insert, &cells)?;
         let id = self.db.table_id(table)?;
-        self.reject_after_truncate(id)?;
         let handle = self.db.table(table)?;
         let mut t = handle.lock();
         let assigned = t.fill_auto_inc(&mut cells)?;
@@ -123,10 +134,8 @@ impl<'db> Transaction<'db> {
         table: &str,
         mut cells: Vec<(u16, Value)>,
     ) -> Result<PutResult> {
-        self.db
-            .require_table(table, crate::auth_state::RequiredPermission::Insert)?;
+        self.require_columns(table, crate::auth::ColumnOperation::Insert, &cells)?;
         let id = self.db.table_id(table)?;
-        self.reject_after_truncate(id)?;
         let handle = self.db.table(table)?;
         let mut t = handle.lock();
         let assigned = t.fill_auto_inc(&mut cells)?;
@@ -150,10 +159,10 @@ impl<'db> Transaction<'db> {
         table: &str,
         rows: Vec<Vec<(u16, Value)>>,
     ) -> Result<Vec<Option<i64>>> {
-        self.db
-            .require_table(table, crate::auth_state::RequiredPermission::Insert)?;
+        for cells in &rows {
+            self.require_columns(table, crate::auth::ColumnOperation::Insert, cells)?;
+        }
         let id = self.db.table_id(table)?;
-        self.reject_after_truncate(id)?;
         let handle = self.db.table(table)?;
         let mut t = handle.lock();
         let mut assigned = Vec::with_capacity(rows.len());
@@ -169,8 +178,7 @@ impl<'db> Transaction<'db> {
 
     /// Stage a delete of `row_id` on `table`.
     pub fn delete(&mut self, table: &str, row_id: RowId) -> Result<()> {
-        self.db
-            .require_table(table, crate::auth_state::RequiredPermission::Delete)?;
+        self.require_delete(table)?;
         let id = self.db.table_id(table)?;
         self.reject_after_truncate(id)?;
         self.staging.push((id, Staged::Delete(row_id)));
@@ -189,9 +197,29 @@ impl<'db> Transaction<'db> {
         Ok(())
     }
 
-    pub fn delete_many(&mut self, table: &str, row_ids: Vec<RowId>) -> Result<Vec<OwnedRow>> {
+    /// Stage a materialized-view checkpoint in the same durable commit as its
+    /// row deltas. This makes incremental refresh replay idempotent after a
+    /// crash: data and the Last-Event-ID watermark advance together.
+    pub fn set_materialized_view_definition(
+        &mut self,
+        definition: crate::catalog::MaterializedViewEntry,
+    ) -> Result<()> {
         self.db
-            .require_table(table, crate::auth_state::RequiredPermission::Delete)?;
+            .require_for(self.principal.as_ref(), &crate::auth::Permission::Ddl)?;
+        if self.db.table_id(&definition.name).is_err() {
+            return Err(MongrelError::NotFound(format!(
+                "materialized view table {:?} not found",
+                definition.name
+            )));
+        }
+        self.materialized_view_updates
+            .retain(|current| current.name != definition.name);
+        self.materialized_view_updates.push(definition);
+        Ok(())
+    }
+
+    pub fn delete_many(&mut self, table: &str, row_ids: Vec<RowId>) -> Result<Vec<OwnedRow>> {
+        self.require_delete(table)?;
         let id = self.db.table_id(table)?;
         self.reject_after_truncate(id)?;
         let snap = self.read;
@@ -215,23 +243,23 @@ impl<'db> Transaction<'db> {
         table: &str,
         updates: Vec<(RowId, Vec<(u16, Value)>)>,
     ) -> Result<Vec<OwnedRow>> {
-        self.db
-            .require_table(table, crate::auth_state::RequiredPermission::Update)?;
+        for (_, cells) in &updates {
+            self.require_columns(table, crate::auth::ColumnOperation::Update, cells)?;
+        }
         let id = self.db.table_id(table)?;
         self.reject_after_truncate(id)?;
         let snap = self.read;
         let handle = self.db.table(table)?;
         let t = handle.lock();
         let mut post_images = Vec::with_capacity(updates.len());
-        let mut staged = Vec::with_capacity(updates.len() * 2);
+        let mut staged = Vec::with_capacity(updates.len());
         for (old_id, new_cells) in updates {
             let old_row = t
                 .get(old_id, snap)
                 .ok_or_else(|| MongrelError::NotFound(format!("row {old_id:?} not found")))?;
             let merged = merge_cells(old_row.columns.into_iter().collect(), new_cells);
             post_images.push(owned_row_from_cells(&merged));
-            staged.push((id, Staged::Delete(old_id)));
-            staged.push((id, Staged::Put(merged)));
+            staged.push((id, Staged::Update(old_id, merged)));
         }
         drop(t);
         self.staging.extend(staged);
@@ -247,8 +275,7 @@ impl<'db> Transaction<'db> {
         // Upsert may insert or update. Check Insert up front (the common
         // path); the DoUpdate branch additionally checks Update before
         // mutating an existing row.
-        self.db
-            .require_table(table, crate::auth_state::RequiredPermission::Insert)?;
+        self.require_columns(table, crate::auth::ColumnOperation::Insert, &insert_cells)?;
         let id = self.db.table_id(table)?;
         self.reject_after_truncate(id)?;
         match (self.existing_pk_row(table, &insert_cells)?, action) {
@@ -273,8 +300,7 @@ impl<'db> Transaction<'db> {
             }),
             (Some((old_id, old_row)), UpsertAction::DoUpdate(update_cells)) => {
                 // The update branch requires Update permission.
-                self.db
-                    .require_table(table, crate::auth_state::RequiredPermission::Update)?;
+                self.require_columns(table, crate::auth::ColumnOperation::Update, &update_cells)?;
                 let merged = merge_cells(old_row.columns.clone(), update_cells);
                 if columns_equal(&old_row.columns, &merged) {
                     return Ok(UpsertResult {
@@ -284,8 +310,7 @@ impl<'db> Transaction<'db> {
                     });
                 }
                 let row = owned_row_from_cells(&merged);
-                self.staging.push((id, Staged::Delete(old_id)));
-                self.staging.push((id, Staged::Put(merged)));
+                self.staging.push((id, Staged::Update(old_id, merged)));
                 Ok(UpsertResult {
                     action: UpsertActionKind::Updated,
                     row,
@@ -296,8 +321,7 @@ impl<'db> Transaction<'db> {
     }
 
     pub fn truncate(&mut self, table: &str) -> Result<()> {
-        self.db
-            .require_table(table, crate::auth_state::RequiredPermission::Delete)?;
+        self.require_delete(table)?;
         let id = self.db.table_id(table)?;
         for (table_id, op) in &self.staging {
             if *table_id == id && !matches!(op, Staged::Truncate) {
@@ -321,6 +345,26 @@ impl<'db> Transaction<'db> {
             ));
         }
         Ok(())
+    }
+
+    fn require_columns(
+        &self,
+        table: &str,
+        operation: crate::auth::ColumnOperation,
+        cells: &[(u16, Value)],
+    ) -> Result<()> {
+        let columns = cells.iter().map(|(column, _)| *column).collect::<Vec<_>>();
+        self.db
+            .require_columns_for(table, operation, &columns, self.principal.as_ref())
+    }
+
+    fn require_delete(&self, table: &str) -> Result<()> {
+        self.db.require_for(
+            self.principal.as_ref(),
+            &crate::auth::Permission::Delete {
+                table: table.to_string(),
+            },
+        )
     }
 
     fn existing_pk_row(
@@ -353,6 +397,8 @@ impl<'db> Transaction<'db> {
             self.read.epoch,
             self.staging,
             self.external_states,
+            self.materialized_view_updates,
+            self.principal,
             self.external_trigger_bridge,
         )
     }

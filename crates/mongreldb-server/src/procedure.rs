@@ -10,7 +10,7 @@ use mongreldb_core::Value;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::AppState;
+use crate::{request_principal, AppState, OptionalPrincipal};
 
 #[derive(Deserialize)]
 pub struct ProcedureRequest {
@@ -26,11 +26,24 @@ pub struct CallRequest {
     idempotency_key: Option<String>,
 }
 
-pub async fn list(State(state): State<Arc<AppState>>) -> Response {
+pub async fn list(
+    State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
+) -> Response {
+    if let Err(response) = require_ddl(&state, &principal) {
+        return response;
+    }
     Json(json!({ "procedures": state.db.procedures() })).into_response()
 }
 
-pub async fn describe(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
+pub async fn describe(
+    State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
+    Path(name): Path<String>,
+) -> Response {
+    if let Err(response) = require_ddl(&state, &principal) {
+        return response;
+    }
     match state.db.procedure(&name) {
         Some(procedure) => Json(json!({ "procedure": procedure })).into_response(),
         None => error(
@@ -43,8 +56,12 @@ pub async fn describe(State(state): State<Arc<AppState>>, Path(name): Path<Strin
 
 pub async fn create(
     State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
     Json(req): Json<ProcedureRequest>,
 ) -> Response {
+    if let Err(response) = require_ddl(&state, &principal) {
+        return response;
+    }
     match normalized(req.procedure).and_then(|procedure| state.db.create_procedure(procedure)) {
         Ok(procedure) => Json(json!({ "status": "ok", "procedure": procedure })).into_response(),
         Err(e) => error(
@@ -57,9 +74,13 @@ pub async fn create(
 
 pub async fn replace(
     State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
     Path(name): Path<String>,
     Json(req): Json<ProcedureRequest>,
 ) -> Response {
+    if let Err(response) = require_ddl(&state, &principal) {
+        return response;
+    }
     let mut procedure = req.procedure;
     procedure.name = name;
     match normalized(procedure)
@@ -76,8 +97,12 @@ pub async fn replace(
 
 pub async fn drop_procedure(
     State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
     Path(name): Path<String>,
 ) -> Response {
+    if let Err(response) = require_ddl(&state, &principal) {
+        return response;
+    }
     match state.db.drop_procedure(&name) {
         Ok(()) => Json(json!({ "status": "ok" })).into_response(),
         Err(e) => error(StatusCode::NOT_FOUND, "PROCEDURE_NOT_FOUND", &e.to_string()),
@@ -86,21 +111,38 @@ pub async fn drop_procedure(
 
 pub async fn call(
     State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
     Path(name): Path<String>,
     Json(req): Json<CallRequest>,
 ) -> Response {
-    call_inner(state, name, req)
+    call_inner(
+        state.clone(),
+        name,
+        req,
+        request_principal(&state, &principal),
+    )
 }
 
 pub async fn kit_call(
     State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
     Path(name): Path<String>,
     Json(req): Json<CallRequest>,
 ) -> Response {
-    call_inner(state, name, req)
+    call_inner(
+        state.clone(),
+        name,
+        req,
+        request_principal(&state, &principal),
+    )
 }
 
-fn call_inner(state: Arc<AppState>, name: String, req: CallRequest) -> Response {
+fn call_inner(
+    state: Arc<AppState>,
+    name: String,
+    req: CallRequest,
+    principal: Option<mongreldb_core::Principal>,
+) -> Response {
     let args = match req
         .args
         .iter()
@@ -110,7 +152,7 @@ fn call_inner(state: Arc<AppState>, name: String, req: CallRequest) -> Response 
         Ok(args) => args,
         Err(e) => return error(StatusCode::BAD_REQUEST, "PROCEDURE_VALIDATION", &e),
     };
-    match state.db.call_procedure(&name, args) {
+    match state.db.call_procedure_as(&name, args, principal.as_ref()) {
         Ok(result) => Json(json!({
             "status": "ok",
             "epoch": result.epoch,
@@ -126,6 +168,20 @@ fn call_inner(state: Arc<AppState>, name: String, req: CallRequest) -> Response 
             &e.to_string(),
         ),
     }
+}
+
+#[allow(clippy::result_large_err)]
+fn require_ddl(
+    state: &AppState,
+    principal: &Option<mongreldb_core::Principal>,
+) -> Result<(), Response> {
+    state
+        .db
+        .require_for(
+            request_principal(state, principal).as_ref(),
+            &mongreldb_core::Permission::Ddl,
+        )
+        .map_err(|error| (crate::status_for_error(&error), error.to_string()).into_response())
 }
 
 fn normalized(procedure: StoredProcedure) -> mongreldb_core::Result<StoredProcedure> {

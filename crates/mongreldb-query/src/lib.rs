@@ -40,19 +40,25 @@ pub use external_modules::{
     ExternalTxn, ExternalWriteOp, ExternalWriteResult, ModuleConnectCtx,
 };
 
+pub type MongrelRecordBatchStream = datafusion::physical_plan::SendableRecordBatchStream;
+
 use arrow::array::{Array, ArrayRef, Int64Array, StringArray};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::{AggregateUDF, Expr, ScalarUDF, TableType, WindowUDF};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
 use mongreldb_core::{
-    AlterColumn, ColumnFlags, Cursor, Database, Schema as CoreSchema, Table, TypeId,
+    AlterColumn, ColumnFlags, Cursor, Database, OwnedSnapshotGuard, Schema as CoreSchema, Snapshot,
+    Table, TypeId,
 };
 use parking_lot::Mutex;
+use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::sync::Arc;
 
 /// A MongrelDB table exposed to DataFusion. Holds the live `Table` behind a mutex;
@@ -60,6 +66,30 @@ use std::sync::Arc;
 pub struct MongrelProvider {
     db: Arc<Mutex<Table>>,
     schema: SchemaRef,
+    core_schema: CoreSchema,
+    snapshot: Option<Snapshot>,
+    _retention: Option<Arc<OwnedSnapshotGuard>>,
+    security: Option<ProviderSecurity>,
+}
+
+#[derive(Clone)]
+struct ProviderSecurity {
+    database: Arc<Database>,
+    table: String,
+    principal: Option<mongreldb_core::Principal>,
+    principal_catalog_bound: bool,
+}
+
+impl ProviderSecurity {
+    fn principal(&self) -> Option<mongreldb_core::Principal> {
+        self.principal.as_ref().and_then(|principal| {
+            if self.principal_catalog_bound {
+                self.database.resolve_principal(&principal.username)
+            } else {
+                Some(principal.clone())
+            }
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -71,11 +101,65 @@ pub(crate) struct ViewDef {
 
 impl MongrelProvider {
     pub fn new(db: Arc<Mutex<Table>>) -> Result<Self> {
-        let schema = {
+        let (schema, core_schema) = {
             let db = db.lock();
-            arrow_conv::arrow_schema(db.schema())?
+            (arrow_conv::arrow_schema(db.schema())?, db.schema().clone())
         };
-        Ok(Self { db, schema })
+        Ok(Self {
+            db,
+            schema,
+            core_schema,
+            snapshot: None,
+            _retention: None,
+            security: None,
+        })
+    }
+
+    pub(crate) fn new_secured(
+        db: Arc<Mutex<Table>>,
+        database: Arc<Database>,
+        table: String,
+        principal: Option<mongreldb_core::Principal>,
+    ) -> Result<Self> {
+        let core_schema = db.lock().schema().clone();
+        let schema = arrow_conv::arrow_schema(&core_schema)?;
+        Ok(Self {
+            db,
+            schema,
+            core_schema,
+            snapshot: None,
+            _retention: None,
+            security: Some(ProviderSecurity {
+                principal_catalog_bound: principal.as_ref().is_some_and(|principal| {
+                    database.resolve_principal(&principal.username).is_some()
+                }),
+                database,
+                table,
+                principal,
+            }),
+        })
+    }
+
+    fn new_historical(
+        db: Arc<Mutex<Table>>,
+        snapshot: Snapshot,
+        retention: OwnedSnapshotGuard,
+        security: Option<ProviderSecurity>,
+    ) -> Result<Self> {
+        let full_schema = {
+            let db = db.lock();
+            db.schema().clone()
+        };
+        let core_schema = full_schema;
+        let schema = arrow_conv::arrow_schema(&core_schema)?;
+        Ok(Self {
+            db,
+            schema,
+            core_schema,
+            snapshot: Some(snapshot),
+            _retention: Some(Arc::new(retention)),
+            security,
+        })
     }
 
     pub fn arrow_schema(&self) -> SchemaRef {
@@ -87,6 +171,22 @@ impl std::fmt::Debug for MongrelProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MongrelProvider").finish_non_exhaustive()
     }
+}
+
+struct AsOfRegistration {
+    ctx: SessionContext,
+    table_name: String,
+}
+
+impl Drop for AsOfRegistration {
+    fn drop(&mut self) {
+        let _ = self.ctx.deregister_table(&self.table_name);
+    }
+}
+
+struct AsOfQuery {
+    sql: String,
+    registration: AsOfRegistration,
 }
 
 #[async_trait::async_trait]
@@ -108,6 +208,12 @@ impl TableProvider for MongrelProvider {
         filters: &[&Expr],
     ) -> DFResult<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
         use datafusion::logical_expr::TableProviderFilterPushDown;
+        if self.snapshot.is_some() || self.security.is_some() {
+            return Ok(vec![
+                TableProviderFilterPushDown::Unsupported;
+                filters.len()
+            ]);
+        }
         let schema_ref = self.db.lock().schema().clone();
         Ok(filters
             .iter()
@@ -137,23 +243,88 @@ impl TableProvider for MongrelProvider {
         let core_err = |e: mongreldb_core::MongrelError| {
             DataFusionError::External(Box::new(MongrelQueryError::Core(e)))
         };
+        if let Some(security) = &self.security {
+            let principal = security.principal();
+            let allowed = security
+                .database
+                .select_column_ids_for(&security.table, principal.as_ref())
+                .map_err(core_err)?;
+            let projected = projection
+                .map(|projection| {
+                    projection
+                        .iter()
+                        .filter_map(|index| self.core_schema.columns.get(*index))
+                        .map(|column| column.id)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|| {
+                    self.core_schema
+                        .columns
+                        .iter()
+                        .map(|column| column.id)
+                        .collect()
+                });
+            if projected.iter().any(|column| !allowed.contains(column)) {
+                security
+                    .database
+                    .require_columns_for(
+                        &security.table,
+                        mongreldb_core::ColumnOperation::Select,
+                        &projected,
+                        principal.as_ref(),
+                    )
+                    .map_err(core_err)?;
+            }
+            let rows = {
+                let table = self.db.lock();
+                let snapshot = self.snapshot.unwrap_or_else(|| table.snapshot());
+                table.visible_rows(snapshot).map_err(core_err)?
+            };
+            let rows = security
+                .database
+                .secure_rows_for(&security.table, rows, principal.as_ref())
+                .map_err(core_err)?;
+            if projection.is_some_and(Vec::is_empty) {
+                return Ok(Arc::new(scan::MongrelScanExec::new_row_count(rows.len())));
+            }
+            let batch = arrow_conv::rows_to_batch(&rows, &self.core_schema)
+                .map_err(|error| DataFusionError::External(Box::new(error)))?;
+            let batch = match projection {
+                Some(projection) => batch.project(projection).map_err(|error| {
+                    DataFusionError::External(Box::new(MongrelQueryError::Arrow(error.to_string())))
+                })?,
+                None => batch,
+            };
+            let schema = batch.schema();
+            let statistics = (0..batch.num_columns())
+                .map(|_| scan::to_col_statistics(None))
+                .collect();
+            return Ok(Arc::new(scan::MongrelScanExec::new_batch(
+                schema, batch, statistics,
+            )));
+        }
         let mut db = self.db.lock();
         // Enforce Select permission before any read path (count metadata,
         // count_conditions, or full scan_cursor). On a credentialless database
         // this is a no-op.
         db.require_select().map_err(core_err)?;
-        let snap = db.snapshot();
+        let historical = self.snapshot.is_some();
+        let snap = self.snapshot.unwrap_or_else(|| db.snapshot());
         let schema_ref = db.schema().clone();
 
         // Translate WHERE filters into index-backed Conditions.
-        let translated: Vec<mongreldb_core::Condition> = filters
-            .iter()
-            .filter_map(|f| {
-                translate_filter(f, &schema_ref)
-                    .or_else(|| translate_ann_search(f, &schema_ref))
-                    .or_else(|| translate_sparse_match(f, &schema_ref))
-            })
-            .collect();
+        let translated: Vec<mongreldb_core::Condition> = if historical {
+            Vec::new()
+        } else {
+            filters
+                .iter()
+                .filter_map(|f| {
+                    translate_filter(f, &schema_ref)
+                        .or_else(|| translate_ann_search(f, &schema_ref))
+                        .or_else(|| translate_sparse_match(f, &schema_ref))
+                })
+                .collect()
+        };
 
         // Index-served conditions require complete live indexes; a deferred
         // bulk load pays its one-time build here (Phase 14.7 lazy contract).
@@ -166,7 +337,9 @@ impl TableProvider for MongrelProvider {
         // WHERE ⇒ decode one column through the pushdown path to count survivors.
         let empty_proj = projection.map(|p| p.is_empty()).unwrap_or(false);
         if empty_proj {
-            let total: usize = if translated.is_empty() {
+            let total: usize = if historical {
+                db.visible_rows(snap).map_err(core_err)?.len()
+            } else if translated.is_empty() {
                 mongreldb_core::trace::QueryTrace::record(|t| {
                     t.scan_mode = mongreldb_core::trace::ScanMode::CountMetadata;
                 });
@@ -238,7 +411,7 @@ impl TableProvider for MongrelProvider {
         // Phase 7.1: exact per-column min/max from page stats, but only for an
         // unfiltered full scan over an insert-only table (gated in core). A
         // pushed WHERE or a table with deletes ⇒ all-Absent (DataFusion scans).
-        let col_stats_map = if translated.is_empty() {
+        let col_stats_map = if !historical && translated.is_empty() {
             db.exact_column_stats(snap, &col_ids).map_err(core_err)?
         } else {
             None
@@ -251,7 +424,8 @@ impl TableProvider for MongrelProvider {
         // Phase 15.5: Arrow IPC shadow — zero-copy scan for clean single-run
         // unfiltered tables. The shadow is a derived Arrow IPC file that was
         // written on a prior scan; reading it avoids per-column decode entirely.
-        if translated.is_empty()
+        if !historical
+            && translated.is_empty()
             && db.run_count() == 1
             && db.memtable_is_empty()
             && db.mutable_run_len() == 0
@@ -341,7 +515,8 @@ impl TableProvider for MongrelProvider {
             u128,
             Vec<arrow::array::ArrayRef>,
             SchemaRef,
-        )> = if translated.is_empty()
+        )> = if !historical
+            && translated.is_empty()
             && db.run_count() == 1
             && db.memtable_is_empty()
             && db.mutable_run_len() == 0
@@ -1316,9 +1491,11 @@ pub struct MongrelSession {
     /// the cache epoch is driven by `Database::visible_epoch()` instead of the
     /// legacy `combined_epoch()` fold.
     database: Option<Arc<Database>>,
+    principal: Option<mongreldb_core::Principal>,
+    principal_catalog_bound: bool,
     cache: ResultCache,
     /// Phase 16.5: logical-plan cache keyed by SQL string.
-    plan_cache: parking_lot::Mutex<HashMap<String, datafusion::logical_expr::LogicalPlan>>,
+    plan_cache: parking_lot::Mutex<BoundedLru<String, datafusion::logical_expr::LogicalPlan>>,
     /// `table name → owning Table handle` for every registered table.
     tables: parking_lot::Mutex<HashMap<String, Arc<Mutex<Table>>>>,
     /// Phase 17.3: named materialized views — `view name → defining SQL`.
@@ -1349,7 +1526,70 @@ pub struct MongrelSession {
 
 /// `(sql, snapshot_epoch) → cached result batches`.
 type CacheKey = (String, u64);
-type ResultCache = parking_lot::Mutex<std::collections::HashMap<CacheKey, Arc<Vec<RecordBatch>>>>;
+type ResultCache = parking_lot::Mutex<BoundedLru<CacheKey, Arc<Vec<RecordBatch>>>>;
+
+const SESSION_CACHE_MAX_ENTRIES: usize = 1024;
+
+struct BoundedLru<K, V> {
+    entries: HashMap<K, (V, u64)>,
+    clock: u64,
+    capacity: usize,
+}
+
+impl<K: Clone + Eq + Hash, V> BoundedLru<K, V> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            clock: 0,
+            capacity: capacity.max(1),
+        }
+    }
+
+    fn get<Q>(&mut self, key: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+        Q: Eq + Hash + ?Sized,
+    {
+        self.clock = self.clock.wrapping_add(1);
+        let (value, last_used) = self.entries.get_mut(key)?;
+        *last_used = self.clock;
+        Some(value)
+    }
+
+    fn insert(&mut self, key: K, value: V) {
+        self.clock = self.clock.wrapping_add(1);
+        if let Some(entry) = self.entries.get_mut(&key) {
+            *entry = (value, self.clock);
+            return;
+        }
+        if self.entries.len() >= self.capacity {
+            // ponytail: scan 1024 entries on eviction; use a linked map if misses get hot.
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, last_used))| *last_used)
+                .map(|(key, _)| key.clone())
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(key, (value, self.clock));
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.clock = 0;
+    }
+}
+
+fn buffered_stream(batches: Vec<RecordBatch>) -> MongrelRecordBatchStream {
+    let schema = batches
+        .first()
+        .map(RecordBatch::schema)
+        .unwrap_or_else(|| Arc::new(arrow::datatypes::Schema::empty()));
+    let stream = futures::stream::iter(batches.into_iter().map(Ok::<RecordBatch, DataFusionError>));
+    Box::pin(RecordBatchStreamAdapter::new(schema, stream))
+}
 
 impl MongrelSession {
     /// Create a session over a live `Table`. Takes ownership; wrap in `Arc` if you
@@ -1365,8 +1605,10 @@ impl MongrelSession {
             ctx,
             db: Some(db),
             database: None,
-            cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            plan_cache: parking_lot::Mutex::new(HashMap::new()),
+            principal: None,
+            principal_catalog_bound: false,
+            cache: parking_lot::Mutex::new(BoundedLru::new(SESSION_CACHE_MAX_ENTRIES)),
+            plan_cache: parking_lot::Mutex::new(BoundedLru::new(SESSION_CACHE_MAX_ENTRIES)),
             tables: parking_lot::Mutex::new(HashMap::new()),
             views: parking_lot::Mutex::new(HashMap::new()),
             attached_databases: parking_lot::Mutex::new(HashMap::new()),
@@ -1397,14 +1639,29 @@ impl MongrelSession {
         Self::open_with_external_modules(database, std::iter::empty())
     }
 
+    pub fn open_as(database: Arc<Database>, principal: mongreldb_core::Principal) -> Result<Self> {
+        Self::open_with_external_modules_as(database, std::iter::empty(), Some(principal))
+    }
+
     pub fn open_with_external_modules(
         database: Arc<Database>,
         modules: impl IntoIterator<Item = Arc<dyn ExternalTableModule>>,
+    ) -> Result<Self> {
+        Self::open_with_external_modules_as(database, modules, None)
+    }
+
+    pub fn open_with_external_modules_as(
+        database: Arc<Database>,
+        modules: impl IntoIterator<Item = Arc<dyn ExternalTableModule>>,
+        principal: Option<mongreldb_core::Principal>,
     ) -> Result<Self> {
         let ctx = SessionContext::new();
         let sql_fn_state = Arc::new(extended_sql_functions::ExtendedSqlState::default());
         register_mongrel_functions(&ctx, Arc::clone(&sql_fn_state));
         let external_modules = Arc::new(ExternalModuleRegistry::default());
+        let principal_catalog_bound = principal
+            .as_ref()
+            .is_some_and(|principal| database.resolve_principal(&principal.username).is_some());
         for module in modules {
             external_modules.register(module)?;
         }
@@ -1412,7 +1669,12 @@ impl MongrelSession {
         let mut tables: HashMap<String, Arc<Mutex<Table>>> = HashMap::new();
         for name in database.table_names() {
             let handle = database.table(&name)?;
-            let provider = MongrelProvider::new(handle.clone())?;
+            let provider = MongrelProvider::new_secured(
+                handle.clone(),
+                Arc::clone(&database),
+                name.clone(),
+                principal.clone(),
+            )?;
             ctx.register_table(&name, Arc::new(provider))
                 .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
             tables.insert(name, handle);
@@ -1435,8 +1697,10 @@ impl MongrelSession {
             ctx,
             db: primary,
             database: Some(database),
-            cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            plan_cache: parking_lot::Mutex::new(HashMap::new()),
+            principal,
+            principal_catalog_bound,
+            cache: parking_lot::Mutex::new(BoundedLru::new(SESSION_CACHE_MAX_ENTRIES)),
+            plan_cache: parking_lot::Mutex::new(BoundedLru::new(SESSION_CACHE_MAX_ENTRIES)),
             tables: parking_lot::Mutex::new(tables),
             views: parking_lot::Mutex::new(HashMap::new()),
             attached_databases: parking_lot::Mutex::new(HashMap::new()),
@@ -1446,6 +1710,30 @@ impl MongrelSession {
             external_modules,
             prepared_names: parking_lot::Mutex::new(std::collections::HashSet::new()),
         })
+    }
+
+    pub fn principal(&self) -> Option<mongreldb_core::Principal> {
+        self.principal.as_ref().and_then(|principal| {
+            if self.principal_catalog_bound {
+                self.database
+                    .as_ref()
+                    .and_then(|database| database.resolve_principal(&principal.username))
+            } else {
+                Some(principal.clone())
+            }
+        })
+    }
+
+    fn security_context_active(&self) -> bool {
+        self.principal.is_some()
+            || self.database.as_ref().is_some_and(|database| {
+                database.principal_snapshot().is_some() || {
+                    let security = database.security_catalog();
+                    !security.rls_tables.is_empty()
+                        || !security.policies.is_empty()
+                        || !security.masks.is_empty()
+                }
+            })
     }
 
     pub fn register_external_module(&self, module: Arc<dyn ExternalTableModule>) -> Result<()> {
@@ -1532,7 +1820,12 @@ impl MongrelSession {
             .deregister_table(name)
             .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
         let handle = db.table(name)?;
-        let provider = MongrelProvider::new(handle.clone())?;
+        let provider = MongrelProvider::new_secured(
+            handle.clone(),
+            Arc::clone(db),
+            name.to_string(),
+            self.principal.clone(),
+        )?;
         self.ctx
             .register_table(name, Arc::new(provider))
             .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
@@ -1561,7 +1854,14 @@ impl MongrelSession {
         let mut tbl_names: Vec<String> = Vec::new();
 
         // Tables.
-        for name in self.tables.lock().keys() {
+        let principal = self.principal();
+        let can_see = |name: &str| match &self.database {
+            Some(database) => database
+                .select_column_ids_for(name, principal.as_ref())
+                .is_ok(),
+            None => true,
+        };
+        for name in self.tables.lock().keys().filter(|name| can_see(name)) {
             types.push("table".into());
             names.push(name.clone());
             tbl_names.push(name.clone());
@@ -1579,6 +1879,9 @@ impl MongrelSession {
                     mongreldb_core::trigger::TriggerTarget::Table(n)
                     | mongreldb_core::trigger::TriggerTarget::View(n) => n.clone(),
                 };
+                if !can_see(&target_name) {
+                    continue;
+                }
                 types.push("trigger".into());
                 names.push(t.name.clone());
                 tbl_names.push(target_name);
@@ -1615,6 +1918,10 @@ impl MongrelSession {
     /// Returns `Ok(None)` (→ fall through to `ctx.sql()`) for any shape it
     /// cannot serve *exactly*, or on any parse error.
     fn try_direct_dispatch(&self, sql: &str) -> Result<Option<Vec<RecordBatch>>> {
+        if self.security_context_active() {
+            return Ok(None);
+        }
+
         use arrow::array::ArrayRef;
         use mongreldb_core::Condition;
         use sqlparser::ast::{Expr, Query, SelectItem, SetExpr, Statement, TableFactor};
@@ -1795,6 +2102,269 @@ impl MongrelSession {
         Ok(Some(vec![batch]))
     }
 
+    async fn dataframe(&self, sql: &str) -> Result<datafusion::dataframe::DataFrame> {
+        // Prepared commands have their own DataFusion store. Caching EXECUTE
+        // would create one entry per parameter set.
+        let use_plan_cache = !is_prepared_stmt_sql(sql);
+        if let Some(plan) = use_plan_cache
+            .then(|| self.plan_cache.lock().get(sql).cloned())
+            .flatten()
+        {
+            return Ok(datafusion::dataframe::DataFrame::new(
+                self.ctx.state(),
+                plan,
+            ));
+        }
+
+        let df = self
+            .ctx
+            .sql(sql)
+            .await
+            .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
+        if use_plan_cache {
+            self.plan_cache
+                .lock()
+                .insert(sql.to_string(), df.logical_plan().clone());
+        }
+        Ok(df)
+    }
+
+    fn prepare_as_of_query(&self, sql: &str) -> Result<Option<AsOfQuery>> {
+        static AS_OF_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        static NEXT_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let re = AS_OF_RE.get_or_init(|| {
+            regex::Regex::new(
+                r#"(?i)\b(FROM|JOIN)\s+("[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s+AS\s+OF\s+EPOCH\s+([0-9]+)\b"#,
+            )
+            .expect("valid AS OF regex")
+        });
+        let mut captures = re.captures_iter(sql);
+        let Some(capture) = captures.next() else {
+            return Ok(None);
+        };
+        if captures.next().is_some() {
+            return Err(MongrelQueryError::Schema(
+                "AS OF EPOCH currently supports one historical table per query".into(),
+            ));
+        }
+        let database = self.database.as_ref().ok_or_else(|| {
+            MongrelQueryError::Schema("AS OF EPOCH requires a Database-backed session".into())
+        })?;
+        let whole = capture.get(0).expect("whole AS OF match");
+        let keyword = capture.get(1).expect("FROM/JOIN capture").as_str();
+        let table_token = capture.get(2).expect("table capture").as_str();
+        let table_name = table_token.trim_matches('"');
+        let epoch = capture
+            .get(3)
+            .expect("epoch capture")
+            .as_str()
+            .parse::<u64>()
+            .map_err(|error| MongrelQueryError::Schema(format!("AS OF epoch: {error}")))?;
+        let temp_id = NEXT_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temp_name = format!("__mongrel_as_of_{temp_id}");
+
+        // Preserve an explicit alias after the epoch. Without one, alias the
+        // temporary provider back to the original table name so qualifiers
+        // such as `events.id` keep working.
+        let mut replace_end = whole.end();
+        let mut alias = table_token.to_string();
+        let tail = &sql[replace_end..];
+        let whitespace = tail.len() - tail.trim_start().len();
+        let trimmed_tail = tail.trim_start();
+        if trimmed_tail
+            .get(..3)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("as "))
+        {
+            let alias_text = &trimmed_tail[3..];
+            let alias_len = alias_text
+                .find(|character: char| {
+                    character.is_ascii_whitespace() || character == ',' || character == ';'
+                })
+                .unwrap_or(alias_text.len());
+            if alias_len == 0 {
+                return Err(MongrelQueryError::Schema(
+                    "AS OF EPOCH AS requires an alias".into(),
+                ));
+            }
+            alias = alias_text[..alias_len].to_string();
+            replace_end += whitespace + 3 + alias_len;
+        } else {
+            let alias_len = trimmed_tail
+                .find(|character: char| {
+                    character.is_ascii_whitespace() || character == ',' || character == ';'
+                })
+                .unwrap_or(trimmed_tail.len());
+            let candidate = &trimmed_tail[..alias_len];
+            let keyword = candidate.to_ascii_lowercase();
+            let clause_keyword = matches!(
+                keyword.as_str(),
+                "where"
+                    | "join"
+                    | "left"
+                    | "right"
+                    | "inner"
+                    | "outer"
+                    | "cross"
+                    | "full"
+                    | "on"
+                    | "group"
+                    | "order"
+                    | "having"
+                    | "limit"
+                    | "offset"
+                    | "union"
+                    | "intersect"
+                    | "except"
+            );
+            let valid_alias = candidate
+                .as_bytes()
+                .first()
+                .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_' || *byte == b'"');
+            if alias_len > 0 && valid_alias && !clause_keyword {
+                alias = candidate.to_string();
+                replace_end += whitespace + alias_len;
+            }
+        }
+        let replacement = format!("{keyword} {temp_name} AS {alias}");
+        let mut rewritten = String::with_capacity(sql.len() + replacement.len());
+        rewritten.push_str(&sql[..whole.start()]);
+        rewritten.push_str(&replacement);
+        rewritten.push_str(&sql[replace_end..]);
+
+        let (snapshot, retention) = database.snapshot_at_owned(mongreldb_core::Epoch(epoch))?;
+        let handle = database.table(table_name)?;
+        let provider = MongrelProvider::new_historical(
+            handle,
+            snapshot,
+            retention,
+            Some(ProviderSecurity {
+                database: Arc::clone(database),
+                table: table_name.to_string(),
+                principal: self.principal.clone(),
+                principal_catalog_bound: self.principal_catalog_bound,
+            }),
+        )?;
+        self.ctx
+            .register_table(&temp_name, Arc::new(provider))
+            .map_err(|error| MongrelQueryError::DataFusion(error.to_string()))?;
+        Ok(Some(AsOfQuery {
+            sql: rewritten,
+            registration: AsOfRegistration {
+                ctx: self.ctx.clone(),
+                table_name: temp_name,
+            },
+        }))
+    }
+
+    async fn run_as_of(&self, query: AsOfQuery) -> Result<Vec<RecordBatch>> {
+        let AsOfQuery { sql, registration } = query;
+        let _registration = registration;
+        let plan_start = std::time::Instant::now();
+        let dataframe = self
+            .ctx
+            .sql(&sql)
+            .await
+            .map_err(|error| MongrelQueryError::DataFusion(error.to_string()))?;
+        mongreldb_core::trace::QueryTrace::record(|trace| {
+            trace.planning_nanos = plan_start.elapsed().as_nanos() as u64;
+        });
+        dataframe
+            .collect()
+            .await
+            .map_err(|error| MongrelQueryError::DataFusion(error.to_string()))
+    }
+
+    async fn run_as_of_stream(&self, query: AsOfQuery) -> Result<MongrelRecordBatchStream> {
+        use futures::StreamExt;
+
+        let AsOfQuery { sql, registration } = query;
+        let dataframe = self
+            .ctx
+            .sql(&sql)
+            .await
+            .map_err(|error| MongrelQueryError::DataFusion(error.to_string()))?;
+        let stream = dataframe
+            .execute_stream()
+            .await
+            .map_err(|error| MongrelQueryError::DataFusion(error.to_string()))?;
+        let schema = stream.schema();
+        let guarded = futures::stream::unfold(
+            (stream, registration),
+            |(mut stream, registration)| async move {
+                stream
+                    .next()
+                    .await
+                    .map(|item| (item, (stream, registration)))
+            },
+        );
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, guarded)))
+    }
+
+    /// Execute SQL as a DataFusion record-batch stream. Query results bypass
+    /// the result cache and native batch-producing fast paths. Commands and
+    /// MongrelDB's recursive-CTE compatibility path remain buffered because
+    /// they do not produce a DataFusion stream.
+    pub async fn run_stream(&self, sql: &str) -> Result<MongrelRecordBatchStream> {
+        if strip_explain_query_plan(sql).is_some() {
+            return self.run(sql).await.map(buffered_stream);
+        }
+
+        let trimmed = sql.trim();
+        if trimmed.contains(';') && !is_trigger_body(trimmed) {
+            let stmts = split_sql_statements(trimmed);
+            let non_empty: Vec<&str> = stmts
+                .iter()
+                .map(String::as_str)
+                .filter(|stmt| !stmt.trim().is_empty() && stmt.trim() != ";")
+                .collect();
+            if non_empty.is_empty() {
+                return Ok(buffered_stream(Vec::new()));
+            }
+            if stmts.len() > 1 {
+                for stmt in &non_empty[..non_empty.len() - 1] {
+                    self.run(stmt).await?;
+                }
+                return Box::pin(self.run_stream(non_empty[non_empty.len() - 1])).await;
+            }
+        }
+
+        if let Some(batches) = commands::try_run_command(self, sql).await? {
+            return Ok(buffered_stream(batches));
+        }
+
+        if let Some(query) = self.prepare_as_of_query(sql)? {
+            return self.run_as_of_stream(query).await;
+        }
+
+        let resolved = self.resolve_view_sql(sql);
+        let resolved = self.rewrite_external_module_compat_sql(&resolved);
+        let resolved = rewrite_compat_function_calls(&resolved);
+        let effective_sql = normalize_sql(&resolved);
+        let sql = effective_sql.as_str();
+
+        if let Some(batches) = self.try_catalog_introspection(sql)? {
+            return Ok(buffered_stream(batches));
+        }
+
+        let plan_start = std::time::Instant::now();
+        let external_module_scan = self.query_references_external_module(sql);
+        let df = self.dataframe(sql).await?;
+        self.track_prepared_name(sql);
+        mongreldb_core::trace::QueryTrace::record(|trace| {
+            trace.planning_nanos = plan_start.elapsed().as_nanos() as u64;
+        });
+        let stream = df
+            .execute_stream()
+            .await
+            .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
+        if external_module_scan {
+            mongreldb_core::trace::QueryTrace::record(|trace| {
+                trace.scan_mode = mongreldb_core::trace::ScanMode::ExternalModule;
+            });
+        }
+        Ok(stream)
+    }
+
     /// Run a SQL statement: DDL/commands are intercepted; otherwise a result
     /// cache keyed by `(normalized SQL, snapshot epoch)` memoizes batches.
     /// §5.3: simple single-table SELECTs are served by [`try_direct_dispatch`]
@@ -1862,10 +2432,16 @@ impl MongrelSession {
         let lower = sql.trim_start().to_lowercase();
         if lower.starts_with("create table") {
             if let Some(db) = &self.database {
+                db.require_for(self.principal().as_ref(), &mongreldb_core::Permission::Ddl)?;
                 let (name, schema) = parse_create_table(sql)?;
                 db.create_table(&name, schema)?;
                 let handle = db.table(&name)?;
-                let provider = MongrelProvider::new(handle.clone())?;
+                let provider = MongrelProvider::new_secured(
+                    handle.clone(),
+                    Arc::clone(db),
+                    name.clone(),
+                    self.principal.clone(),
+                )?;
                 self.ctx
                     .register_table(&name, Arc::new(provider))
                     .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
@@ -1877,6 +2453,7 @@ impl MongrelSession {
         }
         if lower.starts_with("drop table") {
             if let Some(db) = &self.database {
+                db.require_for(self.principal().as_ref(), &mongreldb_core::Permission::Ddl)?;
                 let (name, if_exists) = parse_drop_table(sql)?;
                 let drop_result = db.drop_table(&name);
                 if let Err(e) = drop_result {
@@ -1898,6 +2475,7 @@ impl MongrelSession {
         }
         if lower.starts_with("alter table") {
             if let Some(db) = &self.database {
+                db.require_for(self.principal().as_ref(), &mongreldb_core::Permission::Ddl)?;
                 match parse_alter_table(sql)? {
                     ParsedAlterTable::RenameTable { old_name, new_name } => {
                         db.rename_table(&old_name, &new_name)?;
@@ -1909,7 +2487,12 @@ impl MongrelSession {
                             .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
                         self.tables.lock().remove(&old_name);
                         let handle = db.table(&new_name)?;
-                        let provider = MongrelProvider::new(handle.clone())?;
+                        let provider = MongrelProvider::new_secured(
+                            handle.clone(),
+                            Arc::clone(db),
+                            new_name.clone(),
+                            self.principal.clone(),
+                        )?;
                         self.ctx
                             .register_table(&new_name, Arc::new(provider))
                             .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
@@ -1956,6 +2539,10 @@ impl MongrelSession {
             }
         }
 
+        if let Some(query) = self.prepare_as_of_query(sql)? {
+            return self.run_as_of(query).await;
+        }
+
         // Phase 17.3: intercept `SELECT ... FROM <view_name>` and rewrite to
         // the view's defining SQL.
         let resolved = self.resolve_view_sql(sql);
@@ -1971,9 +2558,15 @@ impl MongrelSession {
         // sessions created via `new()` + `register_db()`.
         let epoch = self.cache_epoch();
         let key = (sql.to_string(), epoch);
+        let has_ttl_table = self
+            .tables
+            .lock()
+            .values()
+            .any(|table| table.lock().ttl().is_some());
         let result_cacheable = !extended_sql_functions::contains_volatile_extended_function(sql)
             && !is_explain_analyze(sql)
-            && !is_prepared_stmt_sql(sql);
+            && !is_prepared_stmt_sql(sql)
+            && !has_ttl_table;
         if result_cacheable {
             if let Some(hit) = self.cache.lock().get(&key) {
                 return Ok((**hit).clone());
@@ -2000,31 +2593,7 @@ impl MongrelSession {
         // Phase 16.5: check the logical-plan cache before re-parsing.
         let plan_start = std::time::Instant::now();
         let external_module_scan = self.query_references_external_module(sql);
-        let df = {
-            // Bypass the logical-plan cache for prepared-statement commands:
-            // EXECUTE with varying params would otherwise create one cache
-            // entry per parameter set (unbounded growth), and PREPARE/DEALLOCATE
-            // are one-shot control statements.
-            let use_plan_cache = !is_prepared_stmt_sql(sql);
-            let cached_plan = use_plan_cache
-                .then(|| self.plan_cache.lock().get(sql).cloned())
-                .flatten();
-            if let Some(plan) = cached_plan {
-                datafusion::dataframe::DataFrame::new(self.ctx.state(), plan)
-            } else {
-                let df = self
-                    .ctx
-                    .sql(sql)
-                    .await
-                    .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
-                if use_plan_cache {
-                    self.plan_cache
-                        .lock()
-                        .insert(sql.to_string(), df.logical_plan().clone());
-                }
-                df
-            }
-        };
+        let df = self.dataframe(sql).await?;
         // Track prepared-statement names so DDL can DEALLOCATE them (prevents a
         // prepared plan from querying a detached/old table after DROP+recreate).
         self.track_prepared_name(sql);
@@ -2420,6 +2989,9 @@ impl MongrelSession {
         plan: &datafusion::logical_expr::LogicalPlan,
         cache_key: u64,
     ) -> Result<Option<RecordBatch>> {
+        if self.security_context_active() {
+            return Ok(None);
+        }
         let Some(primary) = self.db.as_ref() else {
             return Ok(None);
         };
@@ -2436,6 +3008,9 @@ impl MongrelSession {
         &self,
         plan: &datafusion::logical_expr::LogicalPlan,
     ) -> Result<Option<Vec<RecordBatch>>> {
+        if self.security_context_active() {
+            return Ok(None);
+        }
         let tables = self.tables.lock();
         fk_join::try_fk_join(&tables, plan)
     }
@@ -3873,6 +4448,49 @@ fn parse_type_tail(s: &str) -> Result<mongreldb_core::schema::TypeId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_lru_evicts_least_recently_used() {
+        let mut cache = BoundedLru::new(2);
+        cache.insert("a", 1);
+        cache.insert("b", 2);
+        assert_eq!(cache.get("a"), Some(&1));
+        cache.insert("c", 3);
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.get("b"), None);
+        assert_eq!(cache.get("a"), Some(&1));
+        assert_eq!(cache.get("c"), Some(&3));
+    }
+
+    #[tokio::test]
+    async fn streaming_query_bypasses_result_cache() {
+        use futures::StreamExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let database = Arc::new(Database::create(dir.path()).unwrap());
+        let session = MongrelSession::open(database).unwrap();
+        let mut stream = session.run_stream("SELECT 1 AS value").await.unwrap();
+        let batch = stream.next().await.unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert!(stream.next().await.is_none());
+        assert!(session.cache.lock().entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ttl_tables_bypass_epoch_keyed_result_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = Arc::new(Database::create(dir.path()).unwrap());
+        let session = MongrelSession::open(database).unwrap();
+        session
+            .run(
+                "CREATE TABLE events (id BIGINT PRIMARY KEY, ts TIMESTAMP) \
+                 TTL_COLUMN ts TTL '1 day'",
+            )
+            .await
+            .unwrap();
+        session.run("SELECT * FROM events").await.unwrap();
+        assert!(session.cache.lock().entries.is_empty());
+    }
 
     #[test]
     fn normalize_collapses_and_trims_whitespace() {

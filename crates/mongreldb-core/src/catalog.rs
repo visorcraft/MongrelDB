@@ -46,6 +46,39 @@ pub struct CatalogEntry {
     pub created_epoch: u64,
 }
 
+/// Persistent definition for a physical materialized-view table.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MaterializedViewEntry {
+    pub name: String,
+    pub query: String,
+    pub last_refresh_epoch: u64,
+    #[serde(default)]
+    pub incremental: Option<IncrementalAggregateView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IncrementalAggregateView {
+    pub source_table: String,
+    pub source_table_id: u64,
+    pub group_column: u16,
+    pub group_output_column: u16,
+    pub outputs: Vec<IncrementalAggregateOutput>,
+    pub count_output_column: u16,
+    pub checkpoint_event_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IncrementalAggregateOutput {
+    pub output_column: u16,
+    pub kind: IncrementalAggregateKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum IncrementalAggregateKind {
+    Count,
+    Sum { source_column: u16 },
+}
+
 /// The full in-memory catalog, mirrored on disk by [`write_atomic`].
 ///
 /// Note: `open_generation` is intentionally **not** stored here — it bumps on
@@ -67,6 +100,10 @@ pub struct Catalog {
     pub triggers: Vec<TriggerEntry>,
     #[serde(default)]
     pub external_tables: Vec<ExternalTableEntry>,
+    #[serde(default)]
+    pub materialized_views: Vec<MaterializedViewEntry>,
+    #[serde(default)]
+    pub security: crate::security::SecurityCatalog,
     /// Catalog-level user accounts (Argon2id-hashed credentials).
     #[serde(default)]
     pub users: Vec<crate::auth::UserEntry>,

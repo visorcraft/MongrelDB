@@ -2046,15 +2046,12 @@ impl TableHandle {
     #[napi]
     pub fn rows_at_epoch(&self, epoch: BigInt) -> napi::Result<Vec<RowJs>> {
         let epoch = epoch.get_u64().1;
-        let current = self.db.visible_epoch().0;
-        if epoch > current {
-            return Err(napi::Error::from_reason(format!(
-                "epoch {epoch} is in the future (current committed epoch is {current})"
-            )));
-        }
+        let (snap, _retention) = self
+            .db
+            .snapshot_at_owned(mongreldb_core::Epoch(epoch))
+            .map_err(to_napi)?;
         let handle = self.db.table(&self.name).map_err(to_napi)?;
         let g = handle.lock();
-        let snap = mongreldb_core::epoch::Snapshot::at(mongreldb_core::Epoch(epoch));
         let rows = g.visible_rows(snap).map_err(to_napi)?;
         Ok(rows.iter().map(|r| row_to_js_table(&g, r)).collect())
     }

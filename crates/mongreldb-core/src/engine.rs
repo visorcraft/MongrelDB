@@ -16,7 +16,7 @@ use crate::global_idx;
 use crate::index::{
     AnnIndex, BitmapIndex, ColumnLearnedRange, FmIndex, HotIndex, MinHashIndex, SparseIndex,
 };
-use crate::manifest::{self, Manifest, RunRef};
+use crate::manifest::{self, Manifest, RunRef, TtlPolicy};
 use crate::memtable::{Memtable, Row, Value};
 use crate::mutable_run::MutableRun;
 use crate::row_id_set::RowIdSet;
@@ -52,6 +52,13 @@ fn iso_now_bytes() -> Vec<u8> {
     let (hour, minute, second) = (rem / 3600, (rem % 3600) / 60, rem % 60);
     let (year, month, day) = civil_from_days(days);
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z").into_bytes()
+}
+
+pub(crate) fn unix_nanos_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
 }
 
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
@@ -142,6 +149,9 @@ pub struct Table {
     /// `require_auth = true`. The checker is shared (via `Arc`) so it sees
     /// live updates to the principal and the `require_auth` flag.
     auth: Option<Arc<dyn crate::auth_state::TableAuthChecker>>,
+    /// Logical writes are forbidden when this table belongs to a replication
+    /// follower. Replication itself appends through the database WAL API.
+    read_only: bool,
     wal: WalSink,
     memtable: Memtable,
     /// PMA-backed mutable-run LSM tier (Phase 11.1). A flush drains the
@@ -290,6 +300,9 @@ pub struct Table {
     /// Engine-managed `AUTO_INCREMENT` counter (`None` for tables without an
     /// auto-increment primary key). See [`AutoIncState`].
     auto_inc: Option<AutoIncState>,
+    /// Manifest-backed timestamp retention policy. Its wall-clock cutoff is
+    /// evaluated once per read/compaction operation, never cached by epoch.
+    ttl: Option<TtlPolicy>,
 }
 
 // `Table` is `Sync`: every field is either plain data, an `Arc`, a `Vec`/`HashMap`
@@ -837,6 +850,8 @@ pub(crate) struct SharedCtx {
     /// Auth checker for per-operation enforcement. `None` on credentialless
     /// databases; cloned from the `Database`'s `auth_state` wrapper.
     pub auth: Option<Arc<dyn crate::auth_state::TableAuthChecker>>,
+    /// Whether logical writes must be rejected for a replica database.
+    pub read_only: bool,
 }
 
 /// Handles a mounted table needs to write to the database's single shared WAL
@@ -850,6 +865,7 @@ pub(crate) struct SharedWalCtx {
     pub group: Arc<GroupCommit>,
     pub poisoned: Arc<AtomicBool>,
     pub txn_ids: Arc<parking_lot::Mutex<u64>>,
+    pub change_wake: tokio::sync::broadcast::Sender<()>,
 }
 
 /// Where a table's WAL records go. A standalone table owns a `Private` WAL; a
@@ -897,6 +913,7 @@ impl SharedCtx {
             shared: None,
             table_name: None,
             auth: None,
+            read_only: false,
         }
     }
 }
@@ -1052,6 +1069,7 @@ impl Table {
             table_id,
             name: ctx.table_name.unwrap_or_default(),
             auth: ctx.auth,
+            read_only: ctx.read_only,
             wal,
             memtable: Memtable::new(),
             mutable_run: MutableRun::new(),
@@ -1105,6 +1123,7 @@ impl Table {
             pending_truncate: None,
             wal_dek,
             auto_inc,
+            ttl: None,
         })
     }
 
@@ -1255,7 +1274,9 @@ impl Table {
                 Op::TruncateTable { .. }
                 | Op::ExternalTableState { .. }
                 | Op::Flush { .. }
-                | Op::Ddl(_) => {}
+                | Op::Ddl(_)
+                | Op::BeforeImage { .. }
+                | Op::CommitTimestamp { .. } => {}
             }
         }
 
@@ -1266,6 +1287,7 @@ impl Table {
             table_id: manifest.table_id,
             name: ctx.table_name.unwrap_or_default(),
             auth: ctx.auth,
+            read_only: ctx.read_only,
             wal,
             memtable,
             mutable_run: MutableRun::new(),
@@ -1324,6 +1346,7 @@ impl Table {
             pending_truncate: None,
             wal_dek,
             auto_inc,
+            ttl: manifest.ttl,
         };
 
         // Advance the (possibly shared) epoch authority to this table's manifest
@@ -1450,9 +1473,13 @@ impl Table {
         self.sparse = sparse;
         self.minhash = minhash;
         let snapshot = Epoch(u64::MAX);
+        let ttl_now = unix_nanos_now();
         for rr in self.run_refs.clone() {
             let mut reader = self.open_reader(rr.run_id)?;
             for row in reader.visible_rows(snapshot)? {
+                if self.row_expired_at(&row, ttl_now) {
+                    continue;
+                }
                 let tok_row = self.tokenized_for_indexes(&row);
                 index_into(
                     &self.schema,
@@ -1469,14 +1496,14 @@ impl Table {
         for row in self.mutable_run.visible_versions(snapshot) {
             if row.deleted {
                 self.remove_hot_for_row(row.row_id, snapshot);
-            } else {
+            } else if !self.row_expired_at(&row, ttl_now) {
                 self.index_row(&row);
             }
         }
         for row in self.memtable.visible_versions(snapshot) {
             if row.deleted {
                 self.remove_hot_for_row(row.row_id, snapshot);
-            } else {
+            } else if !self.row_expired_at(&row, ttl_now) {
                 self.index_row(&row);
             }
         }
@@ -1628,6 +1655,7 @@ impl Table {
     /// Append a data record (`Put`/`Delete`) for the current auto-commit txn to
     /// whichever WAL backs this table.
     fn wal_append_data(&mut self, op: Op) -> Result<()> {
+        self.ensure_writable()?;
         let txn_id = self.ensure_txn_id();
         let table_id = self.table_id;
         match &mut self.wal {
@@ -1639,6 +1667,14 @@ impl Table {
             }
         }
         Ok(())
+    }
+
+    fn ensure_writable(&self) -> Result<()> {
+        if self.read_only {
+            Err(MongrelError::ReadOnlyReplica)
+        } else {
+            Ok(())
+        }
     }
 
     /// Upsert a row. Allocates a [`RowId`], appends a (non-fsynced) WAL record,
@@ -1768,6 +1804,7 @@ impl Table {
     /// and advances the counter past it. Returns `Some(value)` when the engine
     /// allocated (so the caller can surface it), `None` otherwise.
     pub fn fill_auto_inc(&mut self, columns: &mut Vec<(u16, Value)>) -> Result<Option<i64>> {
+        self.ensure_writable()?;
         let Some(cid) = self.auto_inc.as_ref().map(|a| a.column_id) else {
             return Ok(None);
         };
@@ -2077,6 +2114,7 @@ impl Table {
     /// aborted reservation simply leaves a gap, which the never-reuse rule
     /// permits.
     pub fn reserve_auto_inc(&mut self) -> Result<Option<i64>> {
+        self.ensure_writable()?;
         if self.auto_inc.is_none() {
             return Ok(None);
         }
@@ -2385,6 +2423,10 @@ impl Table {
         self.flushed_epoch
     }
 
+    pub(crate) fn set_flushed_epoch(&mut self, epoch: Epoch) {
+        self.flushed_epoch = self.flushed_epoch.max(epoch.0);
+    }
+
     /// Validate that `cells` satisfy the schema's NOT NULL constraints.
     pub(crate) fn validate_cells_not_null(&self, cells: &[(u16, Value)]) -> Result<()> {
         self.schema.validate_not_null(cells)
@@ -2401,21 +2443,45 @@ impl Table {
         let by_id: HashMap<u16, &columnar::NativeColumn> =
             columns.iter().map(|(id, c)| (*id, c)).collect();
         for col in &self.schema.columns {
-            if col.flags.contains(ColumnFlags::NULLABLE) {
-                continue;
-            }
-            match by_id.get(&col.id) {
-                None => {
-                    return Err(MongrelError::InvalidArgument(format!(
-                        "column '{}' ({}) is NOT NULL but was omitted from the bulk load",
-                        col.name, col.id
-                    )));
-                }
-                Some(c) => {
-                    if c.null_count(n) != 0 {
+            if !col.flags.contains(ColumnFlags::NULLABLE) {
+                match by_id.get(&col.id) {
+                    None => {
                         return Err(MongrelError::InvalidArgument(format!(
-                            "column '{}' ({}) is NOT NULL but the bulk load contains nulls",
+                            "column '{}' ({}) is NOT NULL but was omitted from the bulk load",
                             col.name, col.id
+                        )));
+                    }
+                    Some(c) => {
+                        if c.null_count(n) != 0 {
+                            return Err(MongrelError::InvalidArgument(format!(
+                                "column '{}' ({}) is NOT NULL but the bulk load contains nulls",
+                                col.name, col.id
+                            )));
+                        }
+                    }
+                }
+            }
+            if let TypeId::Enum { variants } = &col.ty {
+                let Some(columnar::NativeColumn::Bytes { .. }) = by_id.get(&col.id).copied() else {
+                    if by_id.contains_key(&col.id) {
+                        return Err(MongrelError::InvalidArgument(format!(
+                            "column '{}' ({}) enum requires a bytes column",
+                            col.name, col.id
+                        )));
+                    }
+                    continue;
+                };
+                for index in 0..n {
+                    let Some(value) = columnar::native_bytes_at(by_id[&col.id], index) else {
+                        continue;
+                    };
+                    if !variants.iter().any(|variant| variant.as_bytes() == value) {
+                        return Err(MongrelError::InvalidArgument(format!(
+                            "column '{}' ({}) enum value {:?} is not one of {:?}",
+                            col.name,
+                            col.id,
+                            String::from_utf8_lossy(value),
+                            variants
                         )));
                     }
                 }
@@ -2788,6 +2854,7 @@ impl Table {
     /// standalone table fsyncs its private WAL; a mounted table seals into the
     /// shared WAL and defers the fsync to the group-commit coordinator (B1).
     pub fn commit(&mut self) -> Result<Epoch> {
+        self.ensure_writable()?;
         if self.is_shared() {
             self.commit_shared()
         } else {
@@ -2896,6 +2963,7 @@ impl Table {
         self.invalidate_pending_cache();
         self.persist_manifest(new_epoch)?;
         self.epoch.publish_in_order(new_epoch);
+        let _ = s.change_wake.send(());
         // Next auto-commit span allocates a fresh shared txn id.
         self.current_txn_id = 0;
         Ok(new_epoch)
@@ -3203,6 +3271,7 @@ impl Table {
             Some(ai) if ai.seeded => ai.next,
             _ => 0,
         };
+        m.ttl = self.ttl;
         let meta_dek = self.manifest_meta_dek();
         manifest::write_atomic(&self.dir, &mut m, meta_dek.as_ref())?;
         Ok(())
@@ -3246,6 +3315,11 @@ impl Table {
         let _ = self.persist_manifest(self.epoch.visible());
     }
 
+    pub(crate) fn mark_indexes_incomplete(&mut self) {
+        self.indexes_complete = false;
+        self.invalidate_index_checkpoint();
+    }
+
     /// Read the row at `row_id` visible to `snapshot`, merging the newest
     /// version across the memtable and all sorted runs.
     pub fn get(&self, row_id: RowId, snapshot: Snapshot) -> Option<Row> {
@@ -3266,8 +3340,9 @@ impl Table {
                 best = Some((epoch, row));
             }
         }
+        let now_nanos = unix_nanos_now();
         match best {
-            Some((_, r)) if r.deleted => None,
+            Some((_, r)) if r.deleted || self.row_expired_at(&r, now_nanos) => None,
             Some((_, r)) => Some(r),
             None => None,
         }
@@ -3299,9 +3374,16 @@ impl Table {
                 fold(row);
             }
         }
+        let now_nanos = unix_nanos_now();
         let mut out: Vec<Row> = best
             .into_values()
-            .filter_map(|(_, r)| if r.deleted { None } else { Some(r) })
+            .filter_map(|(_, r)| {
+                if r.deleted || self.row_expired_at(&r, now_nanos) {
+                    None
+                } else {
+                    Some(r)
+                }
+            })
             .collect();
         out.sort_by_key(|r| r.row_id);
         Ok(out)
@@ -3314,7 +3396,11 @@ impl Table {
     /// `HashMap`/`Row` materialization**. Falls back to [`Self::visible_rows`]
     /// pivoted to columns when the memtable is live or runs overlap.
     pub fn visible_columns(&self, snapshot: Snapshot) -> Result<Vec<(u16, Vec<Value>)>> {
-        if self.memtable.is_empty() && self.mutable_run.is_empty() && self.run_refs.len() == 1 {
+        if self.ttl.is_none()
+            && self.memtable.is_empty()
+            && self.mutable_run.is_empty()
+            && self.run_refs.len() == 1
+        {
             let rr = self.run_refs[0].clone();
             let mut reader = self.open_reader(rr.run_id)?;
             let idxs = reader.visible_indices(snapshot.epoch)?;
@@ -3342,7 +3428,12 @@ impl Table {
 
     /// Resolve a primary-key value to a row id (latest version).
     pub fn lookup_pk(&self, key: &[u8]) -> Option<RowId> {
-        self.hot.get(key)
+        let row_id = self.hot.get(key)?;
+        if self.ttl.is_none() || self.get(row_id, Snapshot::at(Epoch(u64::MAX))).is_some() {
+            Some(row_id)
+        } else {
+            None
+        }
     }
 
     /// Run a conjunctive query over the shared row-id space: each condition
@@ -3401,6 +3492,7 @@ impl Table {
     pub fn rows_for_rids(&self, rids: &[u64], snapshot: Snapshot) -> Result<Vec<Row>> {
         use std::collections::HashMap;
         let mut rows = Vec::with_capacity(rids.len());
+        let ttl_now = unix_nanos_now();
         // Overlay (memtable + mutable-run) newest visible version per rid —
         // these shadow any stale version stored in a run. A rid may have an
         // older version in the mutable-run tier and a newer one in the memtable
@@ -3474,6 +3566,7 @@ impl Table {
                         }
                     }
                 }
+                rows.retain(|row| !self.row_expired_at(row, ttl_now));
                 return Ok(rows);
             }
             // Phase 16.3b: decode the system columns ONCE (via the clean-run-
@@ -3526,6 +3619,7 @@ impl Table {
                     }
                 }
             }
+            rows.retain(|row| !self.row_expired_at(row, ttl_now));
             return Ok(rows);
         }
         // Multi-run: one reader per run; newest visible version across all runs
@@ -3557,6 +3651,7 @@ impl Table {
                 }
             }
         }
+        rows.retain(|row| !self.row_expired_at(row, ttl_now));
         Ok(rows)
     }
 
@@ -4109,11 +4204,92 @@ impl Table {
     pub(crate) fn min_active_snapshot(&self) -> Option<Epoch> {
         let local = self.pinned.keys().next().copied();
         let global = self.snapshots.min_pinned();
-        match (local, global) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (Some(a), None) => Some(a),
-            (None, b) => b,
+        let history = self.snapshots.history_floor(self.current_epoch());
+        [local, global, history].into_iter().flatten().min()
+    }
+
+    /// Configure timestamp-column retention on a standalone table. Mounted
+    /// databases should use [`crate::Database::set_table_ttl`] so the DDL is
+    /// WAL-replicated.
+    pub fn set_ttl(&mut self, column_name: &str, duration_nanos: u64) -> Result<()> {
+        self.ensure_writable()?;
+        let policy = self.prepare_ttl_policy(column_name, duration_nanos)?;
+        self.apply_ttl_policy_at(Some(policy), self.current_epoch())
+    }
+
+    pub fn clear_ttl(&mut self) -> Result<()> {
+        self.ensure_writable()?;
+        self.apply_ttl_policy_at(None, self.current_epoch())
+    }
+
+    pub fn ttl(&self) -> Option<TtlPolicy> {
+        self.ttl
+    }
+
+    pub(crate) fn prepare_ttl_policy(
+        &self,
+        column_name: &str,
+        duration_nanos: u64,
+    ) -> Result<TtlPolicy> {
+        if duration_nanos == 0 || duration_nanos > i64::MAX as u64 {
+            return Err(MongrelError::InvalidArgument(
+                "TTL duration must be between 1 and i64::MAX nanoseconds".into(),
+            ));
         }
+        let column = self
+            .schema
+            .columns
+            .iter()
+            .find(|column| column.name == column_name)
+            .ok_or_else(|| MongrelError::Schema(format!("unknown TTL column {column_name}")))?;
+        if column.ty != TypeId::TimestampNanos {
+            return Err(MongrelError::Schema(format!(
+                "TTL column {column_name} must be TimestampNanos, is {:?}",
+                column.ty
+            )));
+        }
+        Ok(TtlPolicy {
+            column_id: column.id,
+            duration_nanos,
+        })
+    }
+
+    pub(crate) fn apply_ttl_policy_at(
+        &mut self,
+        policy: Option<TtlPolicy>,
+        epoch: Epoch,
+    ) -> Result<()> {
+        if let Some(policy) = policy {
+            let column = self
+                .schema
+                .columns
+                .iter()
+                .find(|column| column.id == policy.column_id)
+                .ok_or_else(|| {
+                    MongrelError::Schema(format!("unknown TTL column id {}", policy.column_id))
+                })?;
+            if column.ty != TypeId::TimestampNanos
+                || policy.duration_nanos == 0
+                || policy.duration_nanos > i64::MAX as u64
+            {
+                return Err(MongrelError::Schema("invalid TTL policy".into()));
+            }
+        }
+        self.ttl = policy;
+        self.agg_cache.clear();
+        self.clear_result_cache();
+        let _ = std::fs::remove_dir_all(self.dir.join("_shadow"));
+        self.persist_manifest(epoch)
+    }
+
+    pub(crate) fn row_expired_at(&self, row: &Row, now_nanos: i64) -> bool {
+        let Some(policy) = self.ttl else {
+            return false;
+        };
+        let Some(Value::Int64(timestamp)) = row.columns.get(&policy.column_id) else {
+            return false;
+        };
+        timestamp.saturating_add(policy.duration_nanos as i64) <= now_nanos
     }
 
     pub fn current_epoch(&self) -> Epoch {
@@ -4124,10 +4300,16 @@ impl Table {
         self.memtable.len()
     }
 
-    /// Live (non-deleted) row count, O(1) from a manifest-maintained counter —
-    /// the metadata `COUNT(*)` fast path (no scan).
+    /// Live row count. O(1) without TTL; TTL tables scan because wall-clock
+    /// expiry can change without a commit epoch.
     pub fn count(&self) -> u64 {
-        self.live_count
+        if self.ttl.is_none() {
+            self.live_count
+        } else {
+            self.visible_rows(self.snapshot())
+                .map(|rows| rows.len() as u64)
+                .unwrap_or(self.live_count)
+        }
     }
 
     /// Count rows matching an index-backed conjunctive predicate without
@@ -4139,6 +4321,13 @@ impl Table {
         snapshot: Snapshot,
     ) -> Result<Option<u64>> {
         use crate::query::Condition;
+        if self.ttl.is_some() {
+            return self
+                .query(&crate::query::Query {
+                    conditions: conditions.to_vec(),
+                })
+                .map(|rows| Some(rows.len() as u64));
+        }
         if conditions.is_empty() {
             return Ok(Some(self.live_count));
         }
@@ -4425,7 +4614,11 @@ impl Table {
             Some(p) => p.to_vec(),
             None => self.schema.columns.iter().map(|c| c.id).collect(),
         };
-        if self.memtable.is_empty() && self.mutable_run.is_empty() && self.run_refs.len() == 1 {
+        if self.ttl.is_none()
+            && self.memtable.is_empty()
+            && self.mutable_run.is_empty()
+            && self.run_refs.len() == 1
+        {
             let rr = self.run_refs[0].clone();
             let mut reader = self.open_reader(rr.run_id)?;
             let idxs = reader.visible_indices_native(snapshot.epoch)?;
@@ -4521,7 +4714,7 @@ impl Table {
     /// `RUN_FLAG_CLEAN` set (Phase 15.5: the shadow is zero-copy only for clean
     /// runs).
     pub fn single_run_is_clean(&self) -> bool {
-        if self.run_refs.len() != 1 {
+        if self.ttl.is_some() || self.run_refs.len() != 1 {
             return false;
         }
         self.open_reader(self.run_refs[0].run_id)
@@ -4573,6 +4766,11 @@ impl Table {
         projection: Option<&[u16]>,
         snapshot: Snapshot,
     ) -> Result<Option<Vec<(u16, columnar::NativeColumn)>>> {
+        // Wall-clock expiry changes without an MVCC epoch, so an epoch-keyed
+        // result can become stale while sitting in the cache.
+        if self.ttl.is_some() {
+            return self.query_columns_native(conditions, projection, snapshot);
+        }
         if conditions.is_empty() {
             return self.query_columns_native(conditions, projection, snapshot);
         }
@@ -4608,6 +4806,9 @@ impl Table {
     /// [`Table::query_columns_native_cached`]). On a hit returns the cached rows (no
     /// re-resolve, no re-decode).
     pub fn query_cached(&mut self, q: &crate::query::Query) -> Result<Vec<Row>> {
+        if self.ttl.is_some() {
+            return self.query(q);
+        }
         if q.conditions.is_empty() {
             return self.query(q);
         }
@@ -4741,6 +4942,11 @@ impl Table {
         snapshot: Snapshot,
     ) -> Result<Option<Vec<(u16, columnar::NativeColumn)>>> {
         use crate::query::Condition;
+        // TTL reads use the materialized visibility path so the wall-clock
+        // cutoff is captured once and applied to every storage tier.
+        if self.ttl.is_some() {
+            return Ok(None);
+        }
         if conditions.is_empty() {
             return Ok(None);
         }
@@ -5003,6 +5209,9 @@ impl Table {
         conditions: &[crate::query::Condition],
     ) -> Result<Option<NativePageCursor>> {
         use crate::cursor::build_page_plans;
+        if self.ttl.is_some() {
+            return Ok(None);
+        }
         // See `scan_cursor`: incomplete (deferred) indexes cannot resolve
         // conditions — signal "can't serve" instead of empty survivor sets.
         if !conditions.is_empty() && !self.indexes_complete {
@@ -5126,6 +5335,9 @@ impl Table {
         use crate::cursor::{MultiRunCursor, RunStream};
         use crate::sorted_run::SYS_ROW_ID;
         use std::collections::{BinaryHeap, HashMap, HashSet};
+        if self.ttl.is_some() {
+            return Ok(None);
+        }
         // See `scan_cursor`: incomplete (deferred) indexes cannot resolve
         // conditions — signal "can't serve" instead of empty survivor sets.
         if !conditions.is_empty() && !self.indexes_complete {
@@ -5616,6 +5828,9 @@ impl Table {
         projection: Vec<(u16, TypeId)>,
         conditions: &[crate::query::Condition],
     ) -> Result<Option<Box<dyn crate::cursor::Cursor>>> {
+        if self.ttl.is_some() {
+            return Ok(None);
+        }
         // A deferred bulk load leaves the live indexes unbuilt; resolving
         // conditions against them would return silently-empty survivor sets.
         // Signal "can't serve" so the caller falls back to a `&mut` path that
@@ -5655,6 +5870,9 @@ impl Table {
         conditions: &[crate::query::Condition],
         agg: NativeAgg,
     ) -> Result<Option<NativeAggResult>> {
+        if self.ttl.is_some() {
+            return Ok(None);
+        }
         // 1. Single clean run + no WHERE ⇒ MIN/MAX/COUNT(col) from page stats.
         if self.run_refs.len() == 1 && conditions.is_empty() {
             if let Some(res) = self.aggregate_from_stats(snapshot, column, agg)? {
@@ -5749,6 +5967,9 @@ impl Table {
     /// discounted. Returns `None` (caller scans) without a bitmap index on the
     /// column or when the invariant does not hold.
     pub fn count_distinct_from_bitmap(&mut self, column_id: u16) -> Result<Option<u64>> {
+        if self.ttl.is_some() {
+            return Ok(None);
+        }
         if !(self.memtable.is_empty() && self.mutable_run.is_empty() && self.run_refs.len() == 1) {
             return Ok(None);
         }
@@ -5798,8 +6019,10 @@ impl Table {
         // delta range would silently skip just-committed rows — disable the
         // incremental path entirely in that case. The mutable-run tier holding
         // un-spilled data also disables it (those rows aren't in a run yet).
-        let incremental_ok =
-            !self.had_deletes && self.memtable.is_empty() && self.mutable_run.is_empty();
+        let incremental_ok = self.ttl.is_none()
+            && !self.had_deletes
+            && self.memtable.is_empty()
+            && self.mutable_run.is_empty();
 
         // Incremental path: append-only, no pending writes, warm cache, advanced
         // epoch.
@@ -5940,7 +6163,7 @@ impl Table {
         use crate::query::Condition;
         self.ensure_reservoir_complete()?;
         let snapshot = self.snapshot();
-        let n_pop = self.live_count;
+        let n_pop = self.count();
         let sample_rids: Vec<u64> = self.reservoir.row_ids().to_vec();
         if sample_rids.is_empty() {
             return Ok(None);
@@ -6082,7 +6305,11 @@ impl Table {
         _snapshot: Snapshot,
         projection: &[u16],
     ) -> Result<Option<HashMap<u16, ColumnStat>>> {
-        if !(self.memtable.is_empty() && self.mutable_run.is_empty() && self.run_refs.len() == 1) {
+        if self.ttl.is_some()
+            || !(self.memtable.is_empty()
+                && self.mutable_run.is_empty()
+                && self.run_refs.len() == 1)
+        {
             return Ok(None);
         }
         let reader = self.open_reader(self.run_refs[0].run_id)?;
@@ -6137,6 +6364,10 @@ impl Table {
 
     pub fn schema(&self) -> &Schema {
         &self.schema
+    }
+
+    pub(crate) fn set_catalog_name(&mut self, name: String) {
+        self.name = name;
     }
 
     pub(crate) fn prepare_alter_column(
@@ -6222,6 +6453,7 @@ impl Table {
     }
 
     pub fn alter_column(&mut self, column_name: &str, change: AlterColumn) -> Result<ColumnDef> {
+        self.ensure_writable()?;
         let column = self.prepare_alter_column(column_name, &change)?;
         self.apply_altered_column(column.clone())?;
         Ok(column)
@@ -6268,6 +6500,7 @@ impl Table {
         default_value: Option<crate::schema::DefaultExpr>,
         requested_id: Option<u16>,
     ) -> Result<u16> {
+        self.ensure_writable()?;
         if self.schema.columns.iter().any(|c| c.name == name) {
             return Err(MongrelError::Schema(format!(
                 "column {name} already exists"
@@ -6320,6 +6553,7 @@ impl Table {
     /// Requires exactly one sorted run (call after `flush`). The index is
     /// rebuilt automatically on subsequent flushes.
     pub fn add_learned_range_index(&mut self, column_name: &str) -> Result<()> {
+        self.ensure_writable()?;
         let cid = self
             .schema
             .columns
@@ -6436,7 +6670,11 @@ impl Table {
     /// Physically delete retired run files whose `retire_epoch` no pinned reader
     /// can still need (`min_active >= retire_epoch`), drop them from the queue,
     /// and persist the manifest if anything changed. Returns the count reaped.
-    pub(crate) fn reap_retiring(&mut self, min_active: Epoch) -> Result<usize> {
+    pub(crate) fn reap_retiring(
+        &mut self,
+        min_active: Epoch,
+        backup_pinned: &std::collections::HashSet<u128>,
+    ) -> Result<usize> {
         if self.retiring.is_empty() {
             return Ok(0);
         }
@@ -6448,7 +6686,7 @@ impl Table {
         // error is ignored) and `check()` excludes `retiring` ids from orphan
         // detection, so the lingering entries are harmless until then.
         for r in std::mem::take(&mut self.retiring) {
-            if min_active.0 >= r.retire_epoch {
+            if min_active.0 >= r.retire_epoch && !backup_pinned.contains(&r.run_id) {
                 let _ = std::fs::remove_file(self.run_path(r.run_id as u64));
                 reaped += 1;
             } else {
@@ -6497,6 +6735,10 @@ impl Table {
 
     pub(crate) fn run_refs(&self) -> &[RunRef] {
         &self.run_refs
+    }
+
+    pub(crate) fn retiring_run_ids(&self) -> impl Iterator<Item = u128> + '_ {
+        self.retiring.iter().map(|run| run.run_id)
     }
 
     pub(crate) fn runs_dir(&self) -> PathBuf {

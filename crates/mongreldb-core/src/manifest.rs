@@ -18,15 +18,15 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub const MANIFEST_MAGIC: [u8; 8] = *b"MONGRMFT";
-/// Bumped to 3 when the per-table `auto_inc_next` counter was added. NOTE: the
+/// Bumped to 4 when the per-table TTL policy was added. NOTE: the
 /// manifest is serialized with `bincode`, which is positional and not self-
 /// describing, so `#[serde(default)]` on new fields does NOT give cross-version
 /// read compatibility — a manifest written by an older binary cannot be decoded
 /// by a newer one (and vice-versa). The project carries no on-disk
 /// compatibility guarantee pre-1.0; instead, [`read`] peeks `format_version`
-/// and deserializes a [`LegacyManifestV2`] for older files (synthesizing
-/// `auto_inc_next = 0` = unseeded) so existing database directories still open.
-pub const MANIFEST_VERSION: u16 = 3;
+/// and deserializes the matching legacy shape so existing database directories
+/// still open.
+pub const MANIFEST_VERSION: u16 = 4;
 pub const MANIFEST_FILENAME: &str = "_mf";
 /// 32-byte meta DEK length (matches [`crate::encryption::DEK_LEN`]).
 pub const META_DEK_LEN: usize = DEK_LEN;
@@ -52,6 +52,15 @@ pub struct RetiredRun {
     /// compaction epoch is served by the merged run, whose `epoch_created`
     /// equals `retire_epoch`).
     pub retire_epoch: u64,
+}
+
+/// Per-table time-to-live policy. Rows whose timestamp plus `duration_nanos`
+/// is at or before wall-clock now are hidden from reads and reclaimed by
+/// compaction. A missing/null timestamp never expires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TtlPolicy {
+    pub column_id: u16,
+    pub duration_nanos: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,6 +93,28 @@ pub struct Manifest {
     /// predates this field), so the engine must seed it from `max(existing id)`
     /// on first use. Always `0` for tables without an `AUTO_INCREMENT` column.
     #[serde(default)]
+    pub auto_inc_next: i64,
+    /// Optional timestamp-column retention policy. See [`TtlPolicy`].
+    #[serde(default)]
+    pub ttl: Option<TtlPolicy>,
+    pub checksum: [u8; 32],
+}
+
+/// The on-disk manifest shape written by mongreldb `MANIFEST_VERSION == 3`
+/// (before TTL policy storage was added).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LegacyManifestV3 {
+    pub magic: [u8; 8],
+    pub format_version: u16,
+    pub table_id: u64,
+    pub current_epoch: u64,
+    pub next_row_id: u64,
+    pub schema_id: u64,
+    pub runs: Vec<RunRef>,
+    pub global_idx_epoch: u64,
+    pub live_count: u64,
+    pub flushed_epoch: u64,
+    pub retiring: Vec<RetiredRun>,
     pub auto_inc_next: i64,
     pub checksum: [u8; 32],
 }
@@ -122,6 +153,7 @@ impl Manifest {
             flushed_epoch: 0,
             retiring: Vec::new(),
             auto_inc_next: 0,
+            ttl: None,
             checksum: [0u8; 32],
         }
     }
@@ -143,6 +175,26 @@ impl Manifest {
             flushed_epoch: legacy.flushed_epoch,
             retiring: legacy.retiring,
             auto_inc_next: 0,
+            ttl: None,
+            checksum: legacy.checksum,
+        }
+    }
+
+    pub fn from_legacy_v3(legacy: LegacyManifestV3) -> Self {
+        Manifest {
+            magic: legacy.magic,
+            format_version: MANIFEST_VERSION,
+            table_id: legacy.table_id,
+            current_epoch: legacy.current_epoch,
+            next_row_id: legacy.next_row_id,
+            schema_id: legacy.schema_id,
+            runs: legacy.runs,
+            global_idx_epoch: legacy.global_idx_epoch,
+            live_count: legacy.live_count,
+            flushed_epoch: legacy.flushed_epoch,
+            retiring: legacy.retiring,
+            auto_inc_next: legacy.auto_inc_next,
+            ttl: None,
             checksum: legacy.checksum,
         }
     }
@@ -221,10 +273,9 @@ pub fn write_atomic(
 /// Read the manifest from `<dir>/_mf`, verifying magic and checksum (plaintext)
 /// or the GCM tag (encrypted). `meta_dek` must match the one used at write.
 ///
-/// Older on-disk manifests (written with `MANIFEST_VERSION < 3`) are decoded via
-/// [`LegacyManifestV2`] and migrated forward; their `auto_inc_next` synthesizes
-/// to `0` (unseeded), so existing database directories open unchanged and the
-/// engine seeds the identity counter from `max(id)` on first use.
+/// Older on-disk manifests are decoded through their exact positional shape and
+/// migrated forward. Version 2 synthesizes an unseeded auto-increment counter;
+/// versions 2 and 3 synthesize no TTL policy.
 pub fn read(dir: impl AsRef<Path>, meta_dek: Option<&[u8; META_DEK_LEN]>) -> Result<Manifest> {
     let path = dir.as_ref().join(MANIFEST_FILENAME);
     let bytes = fs::read(&path)?;
@@ -240,11 +291,21 @@ pub fn read(dir: impl AsRef<Path>, meta_dek: Option<&[u8; META_DEK_LEN]>) -> Res
             got: header.magic,
         });
     }
-    let manifest = if header.format_version < MANIFEST_VERSION {
-        let legacy: LegacyManifestV2 = bincode::deserialize(&plaintext)?;
-        Manifest::from_legacy(legacy)
-    } else {
-        bincode::deserialize::<Manifest>(&plaintext)?
+    let manifest = match header.format_version {
+        0..=2 => {
+            let legacy: LegacyManifestV2 = bincode::deserialize(&plaintext)?;
+            Manifest::from_legacy(legacy)
+        }
+        3 => {
+            let legacy: LegacyManifestV3 = bincode::deserialize(&plaintext)?;
+            Manifest::from_legacy_v3(legacy)
+        }
+        MANIFEST_VERSION => bincode::deserialize::<Manifest>(&plaintext)?,
+        version => {
+            return Err(MongrelError::InvalidArgument(format!(
+                "manifest version {version} is newer than supported version {MANIFEST_VERSION}"
+            )))
+        }
     };
     Ok(manifest)
 }
@@ -288,6 +349,10 @@ mod tests {
         m.next_row_id = 100;
         m.flushed_epoch = 7;
         m.auto_inc_next = 42;
+        m.ttl = Some(TtlPolicy {
+            column_id: 3,
+            duration_nanos: 60_000_000_000,
+        });
         m.runs.push(RunRef {
             run_id: 0xDEAD,
             level: 0,
@@ -302,6 +367,7 @@ mod tests {
         assert_eq!(read_back.next_row_id, 100);
         assert_eq!(read_back.flushed_epoch, 7);
         assert_eq!(read_back.auto_inc_next, 42);
+        assert_eq!(read_back.ttl, m.ttl);
         assert_eq!(read_back.format_version, MANIFEST_VERSION);
         assert_eq!(read_back.runs.len(), 1);
         assert_eq!(read_back.runs[0].run_id, 0xDEAD);
@@ -336,6 +402,39 @@ mod tests {
         assert_eq!(m.next_row_id, 18);
         assert_eq!(m.format_version, MANIFEST_VERSION);
         assert_eq!(m.auto_inc_next, 0, "legacy counter must come back unseeded");
+        assert_eq!(m.ttl, None);
+    }
+
+    #[test]
+    fn reads_legacy_v3_manifest_migrating_ttl() {
+        let dir = tempdir().unwrap();
+        let mut legacy = LegacyManifestV3 {
+            magic: MANIFEST_MAGIC,
+            format_version: 3,
+            table_id: 8,
+            current_epoch: 5,
+            next_row_id: 20,
+            schema_id: 2,
+            runs: Vec::new(),
+            global_idx_epoch: 0,
+            live_count: 10,
+            flushed_epoch: 4,
+            retiring: Vec::new(),
+            auto_inc_next: 99,
+            checksum: [0u8; 32],
+        };
+        let bytes = bincode::serialize(&legacy).unwrap();
+        legacy.checksum = Sha256::digest(&bytes).into();
+        fs::write(
+            dir.path().join(MANIFEST_FILENAME),
+            bincode::serialize(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let m = read(dir.path(), None).unwrap();
+        assert_eq!(m.format_version, MANIFEST_VERSION);
+        assert_eq!(m.auto_inc_next, 99);
+        assert_eq!(m.ttl, None);
     }
 
     #[test]

@@ -187,6 +187,7 @@ pub struct mongreldb_foreign_key {
     pub ref_table: *const c_char,
     pub ref_columns: U16Slice,
     pub on_delete: mongreldb_fk_action,
+    pub on_update: mongreldb_fk_action,
 }
 
 // ── type/flag resolution helpers ──────────────────────────────────────────
@@ -375,6 +376,7 @@ impl SchemaBuilder {
             ref_table,
             ref_columns,
             on_delete: fk.on_delete.to_core(),
+            on_update: fk.on_update.to_core(),
         });
         Ok(())
     }

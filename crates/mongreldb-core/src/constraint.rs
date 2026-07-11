@@ -45,7 +45,8 @@ pub struct UniqueConstraint {
     pub columns: Vec<u16>,
 }
 
-/// ON DELETE action for a [`ForeignKey`].
+/// Referential action for a [`ForeignKey`] parent delete or referenced-key
+/// update.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum FkAction {
     /// Reject the parent delete if any child row references it (default).
@@ -69,6 +70,8 @@ pub struct ForeignKey {
     pub ref_columns: Vec<u16>,
     #[serde(default)]
     pub on_delete: FkAction,
+    #[serde(default)]
+    pub on_update: FkAction,
 }
 
 /// A CHECK constraint: the row is rejected when `expr` evaluates to `False`
@@ -97,6 +100,11 @@ pub enum CheckExpr {
     Col(u16),
     /// A literal value.
     Lit(Value),
+    Add(Box<CheckExpr>, Box<CheckExpr>),
+    Sub(Box<CheckExpr>, Box<CheckExpr>),
+    Mul(Box<CheckExpr>, Box<CheckExpr>),
+    Div(Box<CheckExpr>, Box<CheckExpr>),
+    Mod(Box<CheckExpr>, Box<CheckExpr>),
     IsNull(u16),
     IsNotNull(u16),
     Eq(Box<CheckExpr>, Box<CheckExpr>),
@@ -130,6 +138,11 @@ impl PartialEq for CheckExpr {
             (Self::True, Self::True) => true,
             (Self::Col(a), Self::Col(b)) => a == b,
             (Self::Lit(a), Self::Lit(b)) => a == b,
+            (Self::Add(a1, a2), Self::Add(b1, b2))
+            | (Self::Sub(a1, a2), Self::Sub(b1, b2))
+            | (Self::Mul(a1, a2), Self::Mul(b1, b2))
+            | (Self::Div(a1, a2), Self::Div(b1, b2))
+            | (Self::Mod(a1, a2), Self::Mod(b1, b2)) => a1 == b1 && a2 == b2,
             (Self::IsNull(a), Self::IsNull(b)) => a == b,
             (Self::IsNotNull(a), Self::IsNotNull(b)) => a == b,
             (Self::Eq(a1, a2), Self::Eq(b1, b2)) => a1 == b1 && a2 == b2,
@@ -190,13 +203,24 @@ impl CheckExpr {
             | CheckExpr::Gt(a, b)
             | CheckExpr::Ge(a, b)
             | CheckExpr::And(a, b)
-            | CheckExpr::Or(a, b) => {
+            | CheckExpr::Or(a, b)
+            | CheckExpr::Add(a, b)
+            | CheckExpr::Sub(a, b)
+            | CheckExpr::Mul(a, b)
+            | CheckExpr::Div(a, b)
+            | CheckExpr::Mod(a, b) => {
                 a.validate()?;
                 b.validate()?;
             }
             CheckExpr::Not(a) => a.validate()?,
-            CheckExpr::Regex { pattern, .. } => {
-                regex::Regex::new(pattern).map_err(|e| {
+            CheckExpr::Regex {
+                pattern,
+                case_insensitive,
+                ..
+            } => {
+                let mut builder = regex::RegexBuilder::new(pattern);
+                builder.case_insensitive(*case_insensitive);
+                builder.build().map_err(|e| {
                     MongrelError::InvalidArgument(format!("invalid regex pattern: {e}"))
                 })?;
             }
@@ -213,6 +237,11 @@ impl CheckExpr {
                 Some(v) => Tri::from_truthy(v),
             },
             CheckExpr::Lit(v) => Tri::from_truthy(v),
+            CheckExpr::Add(_, _)
+            | CheckExpr::Sub(_, _)
+            | CheckExpr::Mul(_, _)
+            | CheckExpr::Div(_, _)
+            | CheckExpr::Mod(_, _) => Tri::from_truthy(&self.eval_term(cells)),
             CheckExpr::IsNull(id) => match cells.get(id) {
                 None | Some(Value::Null) => Tri::True,
                 Some(_) => Tri::False,
@@ -279,11 +308,62 @@ impl CheckExpr {
         match self {
             CheckExpr::Col(id) => cells.get(id).cloned().unwrap_or(Value::Null),
             CheckExpr::Lit(v) => v.clone(),
+            CheckExpr::Add(a, b) => arithmetic(a.eval_term(cells), b.eval_term(cells), Arith::Add),
+            CheckExpr::Sub(a, b) => arithmetic(a.eval_term(cells), b.eval_term(cells), Arith::Sub),
+            CheckExpr::Mul(a, b) => arithmetic(a.eval_term(cells), b.eval_term(cells), Arith::Mul),
+            CheckExpr::Div(a, b) => arithmetic(a.eval_term(cells), b.eval_term(cells), Arith::Div),
+            CheckExpr::Mod(a, b) => arithmetic(a.eval_term(cells), b.eval_term(cells), Arith::Mod),
             other => match other.eval(cells) {
                 Tri::True => Value::Int64(1),
                 Tri::False | Tri::Unknown => Value::Null,
             },
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Arith {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+}
+
+fn arithmetic(left: Value, right: Value, op: Arith) -> Value {
+    match (left, right) {
+        (Value::Int64(left), Value::Int64(right)) => {
+            let value = match op {
+                Arith::Add => left.checked_add(right),
+                Arith::Sub => left.checked_sub(right),
+                Arith::Mul => left.checked_mul(right),
+                Arith::Div => left.checked_div(right),
+                Arith::Mod => left.checked_rem(right),
+            };
+            value.map(Value::Int64).unwrap_or(Value::Null)
+        }
+        (Value::Int64(left), Value::Float64(right)) => arithmetic_float(left as f64, right, op),
+        (Value::Float64(left), Value::Int64(right)) => arithmetic_float(left, right as f64, op),
+        (Value::Float64(left), Value::Float64(right)) => arithmetic_float(left, right, op),
+        _ => Value::Null,
+    }
+}
+
+fn arithmetic_float(left: f64, right: f64, op: Arith) -> Value {
+    if matches!(op, Arith::Div | Arith::Mod) && right == 0.0 {
+        return Value::Null;
+    }
+    let value = match op {
+        Arith::Add => left + right,
+        Arith::Sub => left - right,
+        Arith::Mul => left * right,
+        Arith::Div => left / right,
+        Arith::Mod => left % right,
+    };
+    if value.is_finite() {
+        Value::Float64(value)
+    } else {
+        Value::Null
     }
 }
 
@@ -492,6 +572,43 @@ mod tests {
         );
         assert!(e.satisfied(&m(&[(1, Value::Int64(5))])));
         assert!(!e.satisfied(&m(&[(1, Value::Int64(20))])));
+    }
+
+    #[test]
+    fn check_arithmetic_terms() {
+        let e = CheckExpr::Le(
+            Box::new(CheckExpr::Mul(
+                Box::new(CheckExpr::Add(
+                    Box::new(CheckExpr::Col(1)),
+                    Box::new(CheckExpr::Lit(Value::Int64(2))),
+                )),
+                Box::new(CheckExpr::Col(2)),
+            )),
+            Box::new(CheckExpr::Lit(Value::Int64(20))),
+        );
+        assert!(e.satisfied(&m(&[(1, Value::Int64(3)), (2, Value::Int64(4))])));
+        assert!(!e.satisfied(&m(&[(1, Value::Int64(4)), (2, Value::Int64(4))])));
+    }
+
+    #[test]
+    fn check_arithmetic_error_is_unknown() {
+        let divide_by_zero = CheckExpr::Eq(
+            Box::new(CheckExpr::Div(
+                Box::new(CheckExpr::Col(1)),
+                Box::new(CheckExpr::Lit(Value::Int64(0))),
+            )),
+            Box::new(CheckExpr::Lit(Value::Int64(1))),
+        );
+        assert!(divide_by_zero.satisfied(&m(&[(1, Value::Int64(10))])));
+
+        let overflow = CheckExpr::Gt(
+            Box::new(CheckExpr::Add(
+                Box::new(CheckExpr::Col(1)),
+                Box::new(CheckExpr::Lit(Value::Int64(1))),
+            )),
+            Box::new(CheckExpr::Lit(Value::Int64(0))),
+        );
+        assert!(overflow.satisfied(&m(&[(1, Value::Int64(i64::MAX))])));
     }
 
     #[test]

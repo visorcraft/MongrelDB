@@ -216,6 +216,7 @@ typedef struct {
     const char *ref_table;
     mongreldb_u16_slice ref_columns;
     mongreldb_fk_action on_delete;
+    mongreldb_fk_action on_update;
 } mongreldb_foreign_key;
 
 /* ── Condition struct ───────────────────────────────────────────────────── */

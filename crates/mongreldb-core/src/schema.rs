@@ -291,40 +291,63 @@ impl Schema {
             .find(|c| c.flags.contains(ColumnFlags::PRIMARY_KEY))
     }
 
-    /// Return an error if any column that is not marked NULLABLE is either
-    /// missing from `columns` or present as `Value::Null`. A column carrying
-    /// [`ColumnFlags::AUTO_INCREMENT`] is exempt when omitted/`Null` because the
-    /// engine fills it in before this check runs.
+    /// Validate row-level type constraints owned directly by the schema.
+    /// Non-null columns must be present, and enum values must belong to their
+    /// declared variant set. AUTO_INCREMENT columns may be omitted because the
+    /// engine fills them before validation.
     pub fn validate_not_null(&self, columns: &[(u16, Value)]) -> Result<()> {
         // Rows are short sparse `(id, value)` lists; a linear probe beats
         // materializing a HashMap (and cloning every Value) per row.
         let at = |id: u16| columns.iter().find(|(c, _)| *c == id).map(|(_, v)| v);
         for col in &self.columns {
-            if col.flags.contains(ColumnFlags::NULLABLE) {
-                continue;
-            }
-            // The engine supplies the AUTO_INCREMENT value, so its absence is
-            // legal at this layer (filled in upstream of validation).
-            if col.flags.contains(ColumnFlags::AUTO_INCREMENT) {
+            if !col.flags.contains(ColumnFlags::NULLABLE) {
+                // The engine supplies the AUTO_INCREMENT value, so its absence is
+                // legal at this layer (filled in upstream of validation).
+                if col.flags.contains(ColumnFlags::AUTO_INCREMENT) {
+                    match at(col.id) {
+                        None | Some(Value::Null) => continue,
+                        Some(_) => {}
+                    }
+                }
                 match at(col.id) {
-                    None | Some(Value::Null) => continue,
+                    None => {
+                        return Err(MongrelError::InvalidArgument(format!(
+                            "column '{}' ({}) is NOT NULL but was omitted",
+                            col.name, col.id
+                        )));
+                    }
+                    Some(Value::Null) => {
+                        return Err(MongrelError::InvalidArgument(format!(
+                            "column '{}' ({}) is NOT NULL but got NULL",
+                            col.name, col.id
+                        )));
+                    }
                     Some(_) => {}
                 }
             }
-            match at(col.id) {
-                None => {
-                    return Err(MongrelError::InvalidArgument(format!(
-                        "column '{}' ({}) is NOT NULL but was omitted",
-                        col.name, col.id
-                    )));
+            if let TypeId::Enum { variants } = &col.ty {
+                match at(col.id) {
+                    None | Some(Value::Null) => {}
+                    Some(Value::Bytes(value))
+                        if variants
+                            .iter()
+                            .any(|variant| variant.as_bytes() == value.as_slice()) => {}
+                    Some(Value::Bytes(value)) => {
+                        return Err(MongrelError::InvalidArgument(format!(
+                            "column '{}' ({}) enum value {:?} is not one of {:?}",
+                            col.name,
+                            col.id,
+                            String::from_utf8_lossy(value),
+                            variants
+                        )));
+                    }
+                    Some(value) => {
+                        return Err(MongrelError::InvalidArgument(format!(
+                            "column '{}' ({}) enum requires a string/bytes value, got {value:?}",
+                            col.name, col.id
+                        )));
+                    }
                 }
-                Some(Value::Null) => {
-                    return Err(MongrelError::InvalidArgument(format!(
-                        "column '{}' ({}) is NOT NULL but got NULL",
-                        col.name, col.id
-                    )));
-                }
-                Some(_) => {}
             }
         }
         Ok(())
@@ -594,6 +617,43 @@ mod tests {
         // Omitting the auto-inc column must not trip NOT NULL.
         let cols = vec![(1u16, Value::Bytes(b"x".to_vec()))];
         assert!(s.validate_not_null(&cols).is_ok());
+    }
+
+    #[test]
+    fn enum_membership_is_enforced_for_nullable_and_required_columns() {
+        let variants: std::sync::Arc<[String]> =
+            vec!["user".to_string(), "admin".to_string()].into();
+        let required = Schema {
+            columns: vec![col(
+                1,
+                "role",
+                TypeId::Enum {
+                    variants: variants.clone(),
+                },
+                ColumnFlags::empty(),
+            )],
+            ..Schema::default()
+        };
+        assert!(required
+            .validate_not_null(&[(1, Value::Bytes(b"user".to_vec()))])
+            .is_ok());
+        assert!(required
+            .validate_not_null(&[(1, Value::Bytes(b"owner".to_vec()))])
+            .is_err());
+
+        let nullable = Schema {
+            columns: vec![col(
+                1,
+                "role",
+                TypeId::Enum { variants },
+                ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+            )],
+            ..Schema::default()
+        };
+        assert!(nullable.validate_not_null(&[(1, Value::Null)]).is_ok());
+        assert!(nullable
+            .validate_not_null(&[(1, Value::Bytes(b"owner".to_vec()))])
+            .is_err());
     }
 
     fn col_with_default(

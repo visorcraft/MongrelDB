@@ -58,6 +58,12 @@ pub enum Permission {
     Update { table: String },
     /// `DELETE` on a specific table.
     Delete { table: String },
+    /// `SELECT` limited to named columns.
+    SelectColumns { table: String, columns: Vec<String> },
+    /// `INSERT` limited to named columns.
+    InsertColumns { table: String, columns: Vec<String> },
+    /// `UPDATE` limited to named columns.
+    UpdateColumns { table: String, columns: Vec<String> },
     /// DDL: `CREATE` / `DROP` / `ALTER TABLE`.
     Ddl,
     /// Admin: `CREATE USER` / `GRANT` / `REVOKE` / `CREATE ROLE`.
@@ -83,6 +89,36 @@ impl Permission {
             (Permission::Insert { table: a }, Permission::Insert { table: b }) => a == b,
             (Permission::Update { table: a }, Permission::Update { table: b }) => a == b,
             (Permission::Delete { table: a }, Permission::Delete { table: b }) => a == b,
+            (
+                Permission::SelectColumns {
+                    table: a,
+                    columns: granted,
+                },
+                Permission::SelectColumns {
+                    table: b,
+                    columns: required,
+                },
+            )
+            | (
+                Permission::InsertColumns {
+                    table: a,
+                    columns: granted,
+                },
+                Permission::InsertColumns {
+                    table: b,
+                    columns: required,
+                },
+            )
+            | (
+                Permission::UpdateColumns {
+                    table: a,
+                    columns: granted,
+                },
+                Permission::UpdateColumns {
+                    table: b,
+                    columns: required,
+                },
+            ) => a == b && required.iter().all(|column| granted.contains(column)),
             _ => false,
         }
     }
@@ -98,6 +134,15 @@ impl std::fmt::Display for Permission {
             Permission::Insert { table } => write!(f, "INSERT ON {table}"),
             Permission::Update { table } => write!(f, "UPDATE ON {table}"),
             Permission::Delete { table } => write!(f, "DELETE ON {table}"),
+            Permission::SelectColumns { table, columns } => {
+                write!(f, "SELECT ({}) ON {table}", columns.join(", "))
+            }
+            Permission::InsertColumns { table, columns } => {
+                write!(f, "INSERT ({}) ON {table}", columns.join(", "))
+            }
+            Permission::UpdateColumns { table, columns } => {
+                write!(f, "UPDATE ({}) ON {table}", columns.join(", "))
+            }
         }
     }
 }
@@ -121,6 +166,84 @@ impl Principal {
         }
         self.permissions.iter().any(|p| p.satisfies(required))
     }
+
+    pub fn column_access(&self, table: &str, operation: ColumnOperation) -> ColumnAccess {
+        if self.is_admin
+            || self
+                .permissions
+                .iter()
+                .any(|permission| matches!(permission, Permission::All))
+        {
+            return ColumnAccess::All;
+        }
+        let full = self
+            .permissions
+            .iter()
+            .any(|permission| match (operation, permission) {
+                (ColumnOperation::Select, Permission::Select { table: granted })
+                | (ColumnOperation::Insert, Permission::Insert { table: granted })
+                | (ColumnOperation::Update, Permission::Update { table: granted }) => {
+                    granted == table
+                }
+                _ => false,
+            });
+        if full {
+            return ColumnAccess::All;
+        }
+        let mut columns = Vec::new();
+        for permission in &self.permissions {
+            let grant = match (operation, permission) {
+                (
+                    ColumnOperation::Select,
+                    Permission::SelectColumns {
+                        table: granted,
+                        columns,
+                    },
+                )
+                | (
+                    ColumnOperation::Insert,
+                    Permission::InsertColumns {
+                        table: granted,
+                        columns,
+                    },
+                )
+                | (
+                    ColumnOperation::Update,
+                    Permission::UpdateColumns {
+                        table: granted,
+                        columns,
+                    },
+                ) if granted == table => Some(columns),
+                _ => None,
+            };
+            if let Some(grant) = grant {
+                for column in grant {
+                    if !columns.contains(column) {
+                        columns.push(column.clone());
+                    }
+                }
+            }
+        }
+        if columns.is_empty() {
+            ColumnAccess::Denied
+        } else {
+            ColumnAccess::Columns(columns)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnOperation {
+    Select,
+    Insert,
+    Update,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ColumnAccess {
+    All,
+    Columns(Vec<String>),
+    Denied,
 }
 
 // ── Password hashing (Argon2id) ──────────────────────────────────────────

@@ -766,7 +766,11 @@ pub struct ReplicationFollower {
     leader_url: String,
     local_path: std::path::PathBuf,
     client: reqwest::blocking::Client,
-    last_seq: u64,
+    last_epoch: u64,
+    bearer_token: Option<String>,
+    basic_auth: Option<(String, String)>,
+    local_passphrase: Option<String>,
+    local_credentials: Option<(String, String)>,
 }
 
 impl ReplicationFollower {
@@ -774,60 +778,184 @@ impl ReplicationFollower {
     /// the local database directory to sync into.
     pub fn new(leader_url: &str, local_path: impl AsRef<std::path::Path>) -> Self {
         let local_path = local_path.as_ref().to_path_buf();
-        // Read the last applied seq from a sidecar file if it exists.
-        let seq_file = local_path.join("_meta").join("repl_seq");
-        let last_seq = std::fs::read_to_string(&seq_file)
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0);
+        let last_epoch = mongreldb_core::replica_epoch(&local_path).unwrap_or(0);
         Self {
             leader_url: leader_url.trim_end_matches('/').to_string(),
             local_path,
             client: reqwest::blocking::Client::new(),
-            last_seq,
+            last_epoch,
+            bearer_token: None,
+            basic_auth: None,
+            local_passphrase: None,
+            local_credentials: None,
         }
     }
 
-    /// Fetch new WAL records from the leader since the last sync point and
-    /// write them to the local database's WAL directory. Returns the number
-    /// of records applied.
+    pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
+        self.bearer_token = Some(token.into());
+        self
+    }
+
+    pub fn with_basic_auth(
+        mut self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        self.basic_auth = Some((username.into(), password.into()));
+        self
+    }
+
+    pub fn with_local_encryption_passphrase(mut self, passphrase: impl Into<String>) -> Self {
+        self.local_passphrase = Some(passphrase.into());
+        self
+    }
+
+    pub fn with_local_credentials(
+        mut self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        self.local_credentials = Some((username.into(), password.into()));
+        self
+    }
+
+    /// Bootstrap when needed, fetch complete committed transactions, append
+    /// them durably, recover the local database, then advance the watermark.
     pub fn sync(&mut self) -> Result<usize, String> {
-        let url = format!("{}/wal/stream?since={}", self.leader_url, self.last_seq);
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .map_err(|e| format!("failed to connect to leader: {e}"))?;
+        if !self.local_path.join("CATALOG").exists() {
+            self.bootstrap()?;
+        } else if !mongreldb_core::is_replica(&self.local_path) {
+            return Err(format!(
+                "refusing to overwrite non-replica database at {}",
+                self.local_path.display()
+            ));
+        }
+
+        let mut resp = self.fetch_wal()?;
+        if resp.status() == reqwest::StatusCode::CONFLICT {
+            self.bootstrap()?;
+            resp = self.fetch_wal()?;
+        }
         if !resp.status().is_success() {
             return Err(format!("leader returned {}", resp.status()));
         }
-        let body = resp.text().map_err(|e| format!("failed to read response: {e}"))?;
-        let mut count = 0;
-        let mut highest_seq = self.last_seq;
-        let wal_dir = self.local_path.join("_wal");
-        std::fs::create_dir_all(&wal_dir).ok();
-        // Parse NDJSON: each line is a Record { seq, txn_id, op }
+        let leader_epoch = resp
+            .headers()
+            .get("x-mongreldb-current-epoch")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(self.last_epoch);
+        let body = resp
+            .text()
+            .map_err(|e| format!("failed to read response: {e}"))?;
+        let mut records = Vec::new();
         for line in body.lines() {
             if line.trim().is_empty() {
                 continue;
             }
-            if let Ok(record) = serde_json::from_str::<mongreldb_core::wal::Record>(line) {
-                if record.seq.0 > highest_seq {
-                    highest_seq = record.seq.0;
-                }
-                count += 1;
-            }
+            records.push(
+                serde_json::from_str::<mongreldb_core::wal::Record>(line)
+                    .map_err(|error| format!("invalid WAL record from leader: {error}"))?,
+            );
         }
-        // Persist the high-water mark.
-        let seq_file = self.local_path.join("_meta").join("repl_seq");
-        std::fs::create_dir_all(self.local_path.join("_meta")).ok();
-        std::fs::write(&seq_file, highest_seq.to_string()).ok();
-        self.last_seq = highest_seq;
-        Ok(count)
+        if records.is_empty() {
+            if leader_epoch > self.last_epoch {
+                return Err("leader returned no WAL records for a newer epoch".into());
+            }
+            return Ok(0);
+        }
+
+        let local = self.open_local()?;
+        let applied_epoch = local
+            .append_replication_batch(&records)
+            .map_err(|error| error.to_string())?;
+        drop(local);
+        let recovered = self.open_local()?;
+        if recovered.visible_epoch().0 < applied_epoch {
+            return Err(format!(
+                "replica recovery stopped at epoch {}, expected {applied_epoch}",
+                recovered.visible_epoch().0
+            ));
+        }
+        drop(recovered);
+        mongreldb_core::write_replica_epoch(&self.local_path, applied_epoch)
+            .map_err(|error| error.to_string())?;
+        self.last_epoch = applied_epoch;
+        Ok(records.len())
     }
 
-    /// The highest WAL sequence number applied so far.
+    pub fn bootstrap(&mut self) -> Result<(), String> {
+        let url = format!("{}/replication/snapshot", self.leader_url);
+        let response = self
+            .request(&url)
+            .send()
+            .map_err(|error| format!("failed to fetch replication snapshot: {error}"))?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "leader snapshot endpoint returned {}",
+                response.status()
+            ));
+        }
+        let bytes = response
+            .bytes()
+            .map_err(|error| format!("failed to read replication snapshot: {error}"))?;
+        let snapshot = mongreldb_core::ReplicationSnapshot::decode(&bytes)
+            .map_err(|error| error.to_string())?;
+        snapshot
+            .install(&self.local_path)
+            .map_err(|error| error.to_string())?;
+        self.last_epoch = snapshot.epoch();
+        Ok(())
+    }
+
+    fn fetch_wal(&self) -> Result<reqwest::blocking::Response, String> {
+        let url = format!("{}/wal/stream?since={}", self.leader_url, self.last_epoch);
+        self.request(&url)
+            .send()
+            .map_err(|error| format!("failed to connect to leader: {error}"))
+    }
+
+    fn request(&self, url: &str) -> reqwest::blocking::RequestBuilder {
+        let request = self.client.get(url);
+        if let Some(token) = &self.bearer_token {
+            request.bearer_auth(token)
+        } else if let Some((username, password)) = &self.basic_auth {
+            request.basic_auth(username, Some(password))
+        } else {
+            request
+        }
+    }
+
+    fn open_local(&self) -> Result<mongreldb_core::Database, String> {
+        let result = match (&self.local_passphrase, &self.local_credentials) {
+            (Some(passphrase), Some((username, password))) => {
+                mongreldb_core::Database::open_encrypted_with_credentials(
+                    &self.local_path,
+                    passphrase,
+                    username,
+                    password,
+                )
+            }
+            (Some(passphrase), None) => {
+                mongreldb_core::Database::open_encrypted(&self.local_path, passphrase)
+            }
+            (None, Some((username, password))) => mongreldb_core::Database::open_with_credentials(
+                &self.local_path,
+                username,
+                password,
+            ),
+            (None, None) => mongreldb_core::Database::open(&self.local_path),
+        };
+        result.map_err(|error| format!("failed to open local replica: {error}"))
+    }
+
+    /// The highest leader commit epoch applied so far.
+    pub fn last_epoch(&self) -> u64 {
+        self.last_epoch
+    }
+
+    /// Backward-compatible alias for [`Self::last_epoch`].
     pub fn last_seq(&self) -> u64 {
-        self.last_seq
+        self.last_epoch
     }
 }

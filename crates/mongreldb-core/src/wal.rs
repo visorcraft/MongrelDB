@@ -6,6 +6,7 @@
 //! and bumps the epoch.
 
 use crate::epoch::Epoch;
+use crate::manifest::TtlPolicy;
 use crate::rowid::RowId;
 use crate::schema::{ColumnDef, Schema};
 use crate::{MongrelError, Result};
@@ -15,6 +16,13 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
+
+fn unix_nanos_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
+}
 
 pub const WAL_MAGIC: [u8; 8] = *b"MONGRWAL";
 const WAL_VERSION: u16 = 3;
@@ -82,6 +90,21 @@ pub enum DdlOp {
         table_id: u64,
         new_name: String,
     },
+    /// Replace or clear a table's manifest-backed TTL policy.
+    SetTtl {
+        table_id: u64,
+        policy_json: Vec<u8>,
+    },
+    /// Create or update a persistent materialized-view definition. Appended at
+    /// the end of the enum to preserve earlier bincode discriminants.
+    SetMaterializedView {
+        name: String,
+        definition_json: Vec<u8>,
+    },
+    /// Full persistent RLS/masking catalog replacement.
+    SetSecurityCatalog {
+        security_json: Vec<u8>,
+    },
 }
 
 impl DdlOp {
@@ -101,6 +124,36 @@ impl DdlOp {
 
     pub fn decode_column(bytes: &[u8]) -> Result<ColumnDef> {
         serde_json::from_slice(bytes).map_err(|e| MongrelError::Other(format!("column json: {e}")))
+    }
+
+    pub fn encode_ttl(policy: Option<TtlPolicy>) -> Result<Vec<u8>> {
+        serde_json::to_vec(&policy).map_err(|e| MongrelError::Other(format!("TTL json: {e}")))
+    }
+
+    pub fn decode_ttl(bytes: &[u8]) -> Result<Option<TtlPolicy>> {
+        serde_json::from_slice(bytes).map_err(|e| MongrelError::Other(format!("TTL json: {e}")))
+    }
+
+    pub fn encode_materialized_view(
+        definition: &crate::catalog::MaterializedViewEntry,
+    ) -> Result<Vec<u8>> {
+        serde_json::to_vec(definition)
+            .map_err(|e| MongrelError::Other(format!("materialized view json: {e}")))
+    }
+
+    pub fn decode_materialized_view(bytes: &[u8]) -> Result<crate::catalog::MaterializedViewEntry> {
+        serde_json::from_slice(bytes)
+            .map_err(|e| MongrelError::Other(format!("materialized view json: {e}")))
+    }
+
+    pub fn encode_security(security: &crate::security::SecurityCatalog) -> Result<Vec<u8>> {
+        serde_json::to_vec(security)
+            .map_err(|e| MongrelError::Other(format!("security catalog json: {e}")))
+    }
+
+    pub fn decode_security(bytes: &[u8]) -> Result<crate::security::SecurityCatalog> {
+        serde_json::from_slice(bytes)
+            .map_err(|e| MongrelError::Other(format!("security catalog json: {e}")))
     }
 }
 
@@ -140,6 +193,19 @@ pub enum Op {
     /// Aborts a transaction; its staged records are discarded on recovery.
     TxnAbort,
     Ddl(DdlOp),
+    /// Row image captured immediately before a Delete in the same committed
+    /// transaction. Recovery ignores it; durable CDC uses it for delete/update
+    /// deltas. Appended last to preserve all earlier bincode discriminants.
+    BeforeImage {
+        table_id: u64,
+        row_id: RowId,
+        row: Vec<u8>,
+    },
+    /// Wall-clock UTC nanoseconds recorded immediately before TxnCommit. PITR
+    /// uses this durable ledger to map timestamp cutoffs to commit epochs.
+    CommitTimestamp {
+        unix_nanos: u64,
+    },
 }
 
 impl Record {
@@ -707,6 +773,18 @@ impl SharedWal {
 
     /// Append a `TxnCommit` marker sealing `txn_id` at `epoch`.
     pub fn append_commit(&mut self, txn_id: u64, epoch: Epoch, added: &[AddedRun]) -> Result<u64> {
+        self.append_commit_at(txn_id, epoch, added, unix_nanos_now())
+    }
+
+    pub fn append_commit_at(
+        &mut self,
+        txn_id: u64,
+        epoch: Epoch,
+        added: &[AddedRun],
+        unix_nanos: u64,
+    ) -> Result<u64> {
+        self.active
+            .append_txn(txn_id, Op::CommitTimestamp { unix_nanos })?;
         Ok(self
             .active
             .append_txn(
@@ -784,11 +862,29 @@ impl SharedWal {
     /// the prior ones (so a crash mid-recovery can re-replay), which means old
     /// segments accumulate; this is what reaps them once their data is durable.
     pub fn gc_segments(&mut self, min_retained_seq: u64) -> Result<usize> {
+        self.gc_segments_retain_recent(min_retained_seq, 0)
+    }
+
+    /// [`Self::gc_segments`] while retaining the newest `retain_recent`
+    /// rotated segments for replication followers. The active segment is
+    /// retained separately and does not count toward this limit.
+    pub fn gc_segments_retain_recent(
+        &mut self,
+        min_retained_seq: u64,
+        retain_recent: usize,
+    ) -> Result<usize> {
         let mut segments = list_segment_numbers(&self.wal_dir)?;
         segments.sort_unstable();
+        let retained: Vec<u64> = segments
+            .iter()
+            .rev()
+            .filter(|segment| **segment != self.active_segment_no)
+            .take(retain_recent)
+            .copied()
+            .collect();
         let mut reaped = 0;
         for n in segments {
-            if n == self.active_segment_no {
+            if n == self.active_segment_no || retained.contains(&n) {
                 continue; // never delete the segment we're appending to
             }
             let path = Self::segment_path(&self.wal_dir, n);
@@ -958,6 +1054,27 @@ mod shared_wal_tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn shared_wal_gc_retains_recent_rotated_segments() {
+        let dir = tempdir().unwrap();
+        let mut wal = SharedWal::create(dir.path(), Epoch(0)).unwrap();
+        for segment in 0..4u64 {
+            wal.append_commit(segment + 1, Epoch(segment + 1), &[])
+                .unwrap();
+            wal.group_sync().unwrap();
+            if segment < 3 {
+                wal.rotate(segment + 1).unwrap();
+            }
+        }
+        assert_eq!(wal.gc_segments_retain_recent(u64::MAX, 2).unwrap(), 1);
+        let count = std::fs::read_dir(dir.path().join("_wal"))
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "wal"))
+            .count();
+        assert_eq!(count, 3, "active plus two retained segments");
     }
 }
 

@@ -8,7 +8,7 @@ use mongreldb_core::{StoredTrigger, TriggerDefinition};
 use serde::Deserialize;
 use serde_json::{json, Value as Jval};
 
-use crate::AppState;
+use crate::{request_principal, AppState, OptionalPrincipal};
 
 #[derive(Deserialize)]
 pub struct TriggerRequest {
@@ -17,11 +17,24 @@ pub struct TriggerRequest {
     idempotency_key: Option<String>,
 }
 
-pub async fn list(State(state): State<Arc<AppState>>) -> Response {
+pub async fn list(
+    State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
+) -> Response {
+    if let Err(response) = require_ddl(&state, &principal) {
+        return response;
+    }
     Json(json!({ "triggers": state.db.triggers() })).into_response()
 }
 
-pub async fn describe(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
+pub async fn describe(
+    State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
+    Path(name): Path<String>,
+) -> Response {
+    if let Err(response) = require_ddl(&state, &principal) {
+        return response;
+    }
     match state.db.trigger(&name) {
         Some(trigger) => Json(json!({ "trigger": trigger })).into_response(),
         None => error(
@@ -35,8 +48,12 @@ pub async fn describe(State(state): State<Arc<AppState>>, Path(name): Path<Strin
 pub async fn create(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
     Json(req): Json<TriggerRequest>,
 ) -> Response {
+    if let Err(response) = require_ddl(&state, &principal) {
+        return response;
+    }
     let key = request_idempotency_key(&headers, req.idempotency_key.as_deref());
     idempotent_json(&state, "trigger:create", key, || {
         normalized(req.trigger)
@@ -55,9 +72,13 @@ pub async fn create(
 pub async fn replace(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
     Path(name): Path<String>,
     Json(req): Json<TriggerRequest>,
 ) -> Response {
+    if let Err(response) = require_ddl(&state, &principal) {
+        return response;
+    }
     let mut trigger = req.trigger;
     trigger.name = name;
     let key = request_idempotency_key(&headers, req.idempotency_key.as_deref());
@@ -78,8 +99,12 @@ pub async fn replace(
 pub async fn drop_trigger(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
     Path(name): Path<String>,
 ) -> Response {
+    if let Err(response) = require_ddl(&state, &principal) {
+        return response;
+    }
     let key = request_idempotency_key(&headers, None);
     idempotent_json(&state, "trigger:drop", key, || {
         state
@@ -110,6 +135,20 @@ fn normalized(trigger: StoredTrigger) -> mongreldb_core::Result<StoredTrigger> {
         },
         0,
     )
+}
+
+#[allow(clippy::result_large_err)]
+fn require_ddl(
+    state: &AppState,
+    principal: &Option<mongreldb_core::Principal>,
+) -> Result<(), Response> {
+    state
+        .db
+        .require_for(
+            request_principal(state, principal).as_ref(),
+            &mongreldb_core::Permission::Ddl,
+        )
+        .map_err(|error| (crate::status_for_error(&error), error.to_string()).into_response())
 }
 
 fn error(status: StatusCode, code: &str, message: &str) -> Response {

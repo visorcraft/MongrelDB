@@ -10,6 +10,7 @@ use crate::epoch::Epoch;
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Set of transaction ids that are currently spilling into `_txn/<txn_id>/`
@@ -72,13 +73,39 @@ impl Drop for SpillGuard {
 pub struct SnapshotRegistry {
     /// `epoch -> count` of currently-pinned reader snapshots.
     live: Mutex<BTreeMap<u64, u64>>,
+    /// Number of prior commit epochs compaction must keep queryable. Zero
+    /// preserves the current-state-only behavior.
+    history_epochs: AtomicU64,
+    /// Earliest epoch known to have been protected since history was enabled.
+    history_start: AtomicU64,
 }
 
 impl SnapshotRegistry {
     pub fn new() -> Self {
         Self {
             live: Mutex::new(BTreeMap::new()),
+            history_epochs: AtomicU64::new(0),
+            history_start: AtomicU64::new(0),
         }
+    }
+
+    pub fn configure_history(&self, epochs: u64, start_epoch: Epoch) {
+        self.history_start.store(start_epoch.0, Ordering::Release);
+        self.history_epochs.store(epochs, Ordering::Release);
+    }
+
+    pub fn history_config(&self) -> (u64, Epoch) {
+        (
+            self.history_epochs.load(Ordering::Acquire),
+            Epoch(self.history_start.load(Ordering::Acquire)),
+        )
+    }
+
+    /// Earliest epoch guaranteed available by the rolling history window.
+    /// Returns `None` when historical retention is disabled.
+    pub fn history_floor(&self, visible: Epoch) -> Option<Epoch> {
+        let (epochs, start) = self.history_config();
+        (epochs > 0).then(|| Epoch(start.0.max(visible.0.saturating_sub(epochs))))
     }
 
     /// Register a pinned reader at `epoch`. The snapshot stays retained until

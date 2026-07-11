@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Jval};
 
 use crate::json_to_value;
-use crate::{validate_table_name, AppState};
+use crate::{request_principal, validate_table_name, AppState, OptionalPrincipal};
 
 /// Per-server idempotency store: idempotency key → committed response, backed
 /// by an on-disk `<root>/_idem/` directory so retry-after-restart (not just
@@ -296,22 +296,42 @@ fn is_trigger_error(message: &str) -> bool {
 
 // ── Metadata handlers ───────────────────────────────────────────────────────
 
-pub async fn schema_all(State(state): State<Arc<AppState>>) -> Response {
+pub async fn schema_all(
+    State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
+) -> Response {
+    let principal = request_principal(&state, &principal);
     let names = state.db.table_names();
     let mut tables = serde_json::Map::new();
     for name in &names {
-        if let Ok(h) = state.db.table(name) {
-            tables.insert(name.clone(), schema_descriptor(h.lock().schema()));
+        if let Ok(schema) = visible_schema(&state, name, principal.as_ref()) {
+            tables.insert(name.clone(), schema_descriptor(&schema));
         }
     }
     Json(json!({ "tables": serde_json::Value::Object(tables) })).into_response()
 }
 
-pub async fn schema_one(State(state): State<Arc<AppState>>, Path(table): Path<String>) -> Response {
-    match state.db.table(&table) {
-        Ok(h) => Json(schema_descriptor(h.lock().schema())).into_response(),
-        Err(e) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
+pub async fn schema_one(
+    State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
+    Path(table): Path<String>,
+) -> Response {
+    let principal = request_principal(&state, &principal);
+    match visible_schema(&state, &table, principal.as_ref()) {
+        Ok(schema) => Json(schema_descriptor(&schema)).into_response(),
+        Err(e) => (crate::status_for_error(&e), e.to_string()).into_response(),
     }
+}
+
+fn visible_schema(
+    state: &AppState,
+    table: &str,
+    principal: Option<&mongreldb_core::Principal>,
+) -> mongreldb_core::Result<Schema> {
+    let allowed = state.db.select_column_ids_for(table, principal)?;
+    let mut schema = state.db.table(table)?.lock().schema().clone();
+    schema.columns.retain(|column| allowed.contains(&column.id));
+    Ok(schema)
 }
 
 fn schema_descriptor(schema: &Schema) -> Jval {
@@ -347,6 +367,7 @@ fn schema_descriptor(schema: &Schema) -> Jval {
                 "ref_table": f.ref_table,
                 "ref_columns": f.ref_columns,
                 "on_delete": format!("{:?}", f.on_delete).to_lowercase(),
+                "on_update": format!("{:?}", f.on_update).to_lowercase(),
             })
         })
         .collect();
@@ -489,8 +510,15 @@ fn kit_default_expr(
 
 pub async fn kit_create_table(
     State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
     Json(req): Json<KitCreateTableRequest>,
 ) -> Response {
+    if let Err(error) = state.db.require_for(
+        request_principal(&state, &principal).as_ref(),
+        &mongreldb_core::Permission::Ddl,
+    ) {
+        return (crate::status_for_error(&error), error.to_string()).into_response();
+    }
     if let Err(msg) = validate_table_name(&req.name) {
         return (
             StatusCode::BAD_REQUEST,
@@ -588,11 +616,21 @@ pub async fn kit_create_table(
 
 pub async fn kit_txn(
     State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
     Json(req): Json<KitTxnRequest>,
 ) -> Response {
+    let principal = request_principal(&state, &principal);
     // Idempotency: if a key is present, serialize same-key requests and return
     // any previously-committed response verbatim.
-    if let Some(key) = req.idempotency_key.clone() {
+    if let Some(key) = req.idempotency_key.clone().map(|key| {
+        format!(
+            "{}:{key}",
+            principal
+                .as_ref()
+                .map(|principal| principal.username.as_str())
+                .unwrap_or("anonymous")
+        )
+    }) {
         if let Some(cached) = state.idem.get(&key) {
             return Json(cached).into_response();
         }
@@ -601,13 +639,13 @@ pub async fn kit_txn(
         if let Some(cached) = state.idem.get(&key) {
             return Json(cached).into_response();
         }
-        let resp = execute_kit_txn(&state, &req);
+        let resp = execute_kit_txn(&state, &req, principal.clone());
         if let Ok(out) = &resp {
             state.idem.store(key.clone(), out.clone());
         }
         return txn_response(resp);
     }
-    txn_response(execute_kit_txn(&state, &req))
+    txn_response(execute_kit_txn(&state, &req, principal))
 }
 
 /// Convert a `Result<KitTxnResponse, Response>` (Ok = committed batch, Err =
@@ -713,13 +751,61 @@ pub struct KitRow {
 
 pub async fn kit_query(
     State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
     Json(req): Json<KitQueryRequest>,
 ) -> Response {
+    let principal = request_principal(&state, &principal);
     let handle = match state.db.table(&req.table) {
         Ok(h) => h,
         Err(e) => return (StatusCode::NOT_FOUND, e.to_string()).into_response(),
     };
     let schema = handle.lock().schema().clone();
+    let allowed = match state
+        .db
+        .select_column_ids_for(&req.table, principal.as_ref())
+    {
+        Ok(allowed) => allowed,
+        Err(error) => {
+            return (crate::status_for_error(&error), error.to_string()).into_response();
+        }
+    };
+    let projection_ids = req
+        .projection
+        .as_ref()
+        .filter(|projection| !projection.is_empty())
+        .cloned()
+        .unwrap_or_else(|| allowed.clone());
+    let mut required = projection_ids.clone();
+    for condition in &req.conditions {
+        match condition {
+            JsonCondition::Pk { .. } => {
+                if let Some(primary_key) = schema.primary_key() {
+                    required.push(primary_key.id);
+                }
+            }
+            JsonCondition::BitmapEq { column_id, .. }
+            | JsonCondition::BitmapIn { column_id, .. }
+            | JsonCondition::Range { column_id, .. }
+            | JsonCondition::RangeF64 { column_id, .. }
+            | JsonCondition::IsNull { column_id }
+            | JsonCondition::IsNotNull { column_id }
+            | JsonCondition::FmContains { column_id, .. }
+            | JsonCondition::FmContainsAll { column_id, .. }
+            | JsonCondition::Ann { column_id, .. }
+            | JsonCondition::SparseMatch { column_id, .. }
+            | JsonCondition::MinHashSimilar { column_id, .. } => required.push(*column_id),
+        }
+    }
+    required.sort_unstable();
+    required.dedup();
+    if let Err(error) = state.db.require_columns_for(
+        &req.table,
+        mongreldb_core::ColumnOperation::Select,
+        &required,
+        principal.as_ref(),
+    ) {
+        return (crate::status_for_error(&error), error.to_string()).into_response();
+    }
 
     // Translate JSON conditions → engine Conditions.
     let mut q = Query::new();
@@ -739,14 +825,24 @@ pub async fn kit_query(
         }
     }
 
-    let projection: Option<std::collections::HashSet<u16>> =
-        req.projection.as_ref().map(|p| p.iter().copied().collect());
+    let projection = projection_ids
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
 
     let limit = req.limit.unwrap_or(usize::MAX);
     let rows = match handle.lock().query(&q) {
         Ok(r) => r,
         Err(e) => {
             return (crate::status_for_error(&e), e.to_string()).into_response();
+        }
+    };
+    let rows = match state
+        .db
+        .secure_rows_for(&req.table, rows, principal.as_ref())
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            return (crate::status_for_error(&error), error.to_string()).into_response();
         }
     };
     let mut out: Vec<KitRow> = Vec::new();
@@ -756,29 +852,17 @@ pub async fn kit_query(
             truncated = true;
             break;
         }
-        let cells: Vec<Jval> = match &projection {
-            Some(proj) => schema
-                .columns
-                .iter()
-                .filter(|c| proj.contains(&c.id))
-                .filter_map(|c| {
-                    r.columns
-                        .get(&c.id)
-                        .map(|v| vec![json!(c.id), value_to_json(v)])
-                })
-                .flatten()
-                .collect(),
-            None => schema
-                .columns
-                .iter()
-                .filter_map(|c| {
-                    r.columns
-                        .get(&c.id)
-                        .map(|v| vec![json!(c.id), value_to_json(v)])
-                })
-                .flatten()
-                .collect(),
-        };
+        let cells: Vec<Jval> = schema
+            .columns
+            .iter()
+            .filter(|column| projection.contains(&column.id))
+            .filter_map(|column| {
+                r.columns
+                    .get(&column.id)
+                    .map(|value| vec![json!(column.id), value_to_json(value)])
+            })
+            .flatten()
+            .collect();
         out.push(KitRow {
             row_id: r.row_id.0.to_string(),
             cells,
@@ -892,7 +976,11 @@ fn col_type(
 }
 
 #[allow(clippy::result_large_err)]
-fn execute_kit_txn(state: &AppState, req: &KitTxnRequest) -> Result<KitTxnResponse, Response> {
+fn execute_kit_txn(
+    state: &AppState,
+    req: &KitTxnRequest,
+    principal: Option<mongreldb_core::Principal>,
+) -> Result<KitTxnResponse, Response> {
     // 1. Structural pre-validation: resolve each op against the live schemas and
     //    parse cells into typed Values. This gives per-op error attribution
     //    (op_index) for malformed input BEFORE consuming an epoch.
@@ -991,12 +1079,13 @@ fn execute_kit_txn(state: &AppState, req: &KitTxnRequest) -> Result<KitTxnRespon
     //    enforcement (unique / FK / check) is authoritative at commit; any
     //    violation aborts the entire batch atomically (no partial commit).
     let db = Arc::clone(&state.db);
-    let outcome: mongreldb_core::Result<Vec<KitOpResult>> = db.transaction(|t| {
+    let mut transaction = db.begin_as(principal);
+    let outcome: mongreldb_core::Result<Vec<KitOpResult>> = (|| {
         let mut results: Vec<KitOpResult> = Vec::with_capacity(parsed.len());
         for p in &parsed {
             match &p.action {
                 Action::Put { table, cells } => {
-                    let pr = t.put_returning(table, cells.clone())?;
+                    let pr = transaction.put_returning(table, cells.clone())?;
                     results.push(KitOpResult::Put {
                         row_id: None,
                         auto_inc: pr.auto_inc,
@@ -1016,7 +1105,7 @@ fn execute_kit_txn(state: &AppState, req: &KitTxnRequest) -> Result<KitTxnRespon
                         Some(uc) => UpsertAction::DoUpdate(uc.clone()),
                         None => UpsertAction::DoNothing,
                     };
-                    let ur = t.upsert(table, cells.clone(), action)?;
+                    let ur = transaction.upsert(table, cells.clone(), action)?;
                     let action_str = match ur.action {
                         UpsertActionKind::Inserted => "inserted",
                         UpsertActionKind::Updated => "updated",
@@ -1033,7 +1122,7 @@ fn execute_kit_txn(state: &AppState, req: &KitTxnRequest) -> Result<KitTxnRespon
                     });
                 }
                 Action::Delete { table, row_id } => {
-                    t.delete(table, *row_id)?;
+                    transaction.delete(table, *row_id)?;
                     results.push(KitOpResult::Deleted);
                 }
                 Action::DeleteByPk { table, key } => {
@@ -1047,7 +1136,7 @@ fn execute_kit_txn(state: &AppState, req: &KitTxnRequest) -> Result<KitTxnRespon
                     };
                     match rid {
                         Some(r) => {
-                            t.delete(table, r)?;
+                            transaction.delete(table, r)?;
                             results.push(KitOpResult::Deleted);
                         }
                         None => results.push(KitOpResult::NotFound),
@@ -1055,15 +1144,20 @@ fn execute_kit_txn(state: &AppState, req: &KitTxnRequest) -> Result<KitTxnRespon
                 }
             }
         }
+        transaction.commit()?;
         Ok(results)
-    });
+    })();
 
     let results = match outcome {
         Ok(r) => r,
         Err(e) => {
             let code = error_code(&e);
+            let status = match crate::status_for_error(&e) {
+                StatusCode::INTERNAL_SERVER_ERROR => StatusCode::CONFLICT,
+                status => status,
+            };
             return Err((
-                StatusCode::CONFLICT,
+                status,
                 Json(KitErrorEnvelope {
                     status: "aborted".into(),
                     error: KitError::new(code, format!("{e}")),

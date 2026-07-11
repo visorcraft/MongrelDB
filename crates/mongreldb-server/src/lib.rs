@@ -49,6 +49,7 @@ fn status_for_error(e: &mongreldb_core::MongrelError) -> StatusCode {
         }
         MongrelError::AuthNotRequired => StatusCode::BAD_REQUEST,
         MongrelError::PermissionDenied { .. } => StatusCode::FORBIDDEN,
+        MongrelError::ReadOnlyReplica => StatusCode::CONFLICT,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -162,6 +163,10 @@ pub fn build_app_with_sessions(
     user_auth: bool,
     sessions: Arc<sessions::SessionStore>,
 ) -> axum::Router {
+    db.set_replication_wal_retention_segments(default_replication_wal_segments());
+    if let Err(error) = db.set_history_retention_epochs(default_history_retention_epochs()) {
+        eprintln!("[history] failed to configure retention: {error}");
+    }
     let state = Arc::new(AppState {
         idem: kit::IdempotencyStore::new(db.root()),
         db,
@@ -217,6 +222,7 @@ pub fn build_app_with_sessions(
         .route("/compact", post(compact_all))
         .route("/tables/{name}/compact", post(compact_table))
         .route("/wal/stream", get(wal_stream))
+        .route("/replication/snapshot", get(replication_snapshot))
         .route("/events", get(events_stream))
         .with_state(state.clone());
 
@@ -339,45 +345,105 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, ()> {
     Ok(out)
 }
 
-/// `GET /wal/stream?since=<seq>` — stream committed WAL records as
+/// `GET /wal/stream?since=<epoch>` — return complete committed WAL
+/// transactions after the follower epoch. A 409 response means retained WAL
+/// cannot close the gap and the follower must fetch `/replication/snapshot`.
+/// Records are newline-delimited JSON.
 /// newline-delimited JSON for replication followers. Each line is a JSON
 /// object `{ "seq": N, "txn_id": N, "op": {...} }`.
 async fn wal_stream(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
     axum::extract::Query(params): axum::extract::Query<WalStreamParams>,
 ) -> Result<Response, StatusCode> {
-    let db_root = state.db.root().to_path_buf();
+    state
+        .db
+        .require_for(
+            request_principal(&state, &principal).as_ref(),
+            &mongreldb_core::Permission::Admin,
+        )
+        .map_err(|error| status_for_error(&error))?;
     let since = params.since.unwrap_or(0);
-
-    // Read all committed WAL records with seq > since and stream as NDJSON.
-    let body = tokio::task::spawn_blocking(move || -> Result<String, String> {
-        let records =
-            mongreldb_core::wal::SharedWal::replay(&db_root).map_err(|e| e.to_string())?;
-        let mut out = String::new();
-        for record in records.iter().filter(|r| r.seq.0 > since) {
-            if let Ok(json) = serde_json::to_string(record) {
-                out.push_str(&json);
-                out.push('\n');
-            }
-        }
-        Ok(out)
-    })
-    .await
-    .map_err(|_e| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let body = body.map_err(|e| {
+    let db = Arc::clone(&state.db);
+    let batch = tokio::task::spawn_blocking(move || db.replication_batch_since(since))
+        .await
+        .map_err(|_e| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let batch = batch.map_err(|e| {
         eprintln!("wal_stream error: {e}");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-
-    Ok((
+    if batch.requires_snapshot {
+        let mut response = (
+            StatusCode::CONFLICT,
+            "replication snapshot required: WAL retention gap or spilled run",
+        )
+            .into_response();
+        set_replication_headers(&mut response, batch.current_epoch, batch.earliest_epoch);
+        return Ok(response);
+    }
+    let mut body = String::new();
+    for record in &batch.records {
+        let json = serde_json::to_string(record).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        body.push_str(&json);
+        body.push('\n');
+    }
+    let mut response = (
         [
             (header::CONTENT_TYPE, "application/x-ndjson".to_string()),
             (header::CACHE_CONTROL, "no-cache".to_string()),
         ],
         body,
     )
-        .into_response())
+        .into_response();
+    set_replication_headers(&mut response, batch.current_epoch, batch.earliest_epoch);
+    Ok(response)
+}
+
+async fn replication_snapshot(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
+) -> Response {
+    if let Err(error) = state.db.require_for(
+        request_principal(&state, &principal).as_ref(),
+        &mongreldb_core::Permission::Admin,
+    ) {
+        return (status_for_error(&error), error.to_string()).into_response();
+    }
+    let db = Arc::clone(&state.db);
+    let snapshot = match tokio::task::spawn_blocking(move || db.replication_snapshot()).await {
+        Ok(Ok(snapshot)) => snapshot,
+        Ok(Err(error)) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
+    };
+    let epoch = snapshot.epoch();
+    // ponytail: bootstrap buffers one image; add framed file streaming when
+    // real snapshot sizes make this memory ceiling measurable.
+    match snapshot.encode() {
+        Ok(bytes) => {
+            let mut response =
+                ([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response();
+            set_replication_headers(&mut response, epoch, None);
+            response
+        }
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+fn set_replication_headers(response: &mut Response, current: u64, earliest: Option<u64>) {
+    response.headers_mut().insert(
+        "x-mongreldb-current-epoch",
+        current.to_string().parse().unwrap(),
+    );
+    if let Some(earliest) = earliest {
+        response.headers_mut().insert(
+            "x-mongreldb-earliest-epoch",
+            earliest.to_string().parse().unwrap(),
+        );
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -385,34 +451,177 @@ struct WalStreamParams {
     since: Option<u64>,
 }
 
-/// `GET /events` — stream change-data-capture events (from NOTIFY/LISTEN and
-/// committed Put/Delete operations) as newline-delimited JSON. Each line is
-/// a JSON `ChangeEvent { channel, table, op, epoch, message }`.
+/// `GET /events` — long-lived SSE for durable WAL-backed row changes plus
+/// ephemeral SQL NOTIFY messages. `Last-Event-ID` resumes from a stable
+/// `<commit_epoch>:<operation_index>` id. A retention gap returns 409 before
+/// the stream starts, or a terminal `gap` SSE if the client falls behind.
 async fn events_stream(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
+    headers: axum::http::HeaderMap,
 ) -> Result<Response, StatusCode> {
-    let mut rx = state.db.subscribe_changes();
-    let body = tokio::task::spawn_blocking(move || {
-        // Drain the current backlog (non-blocking).
-        let mut out = String::new();
-        while let Ok(event) = rx.try_recv() {
-            if let Ok(json) = serde_json::to_string(&event) {
-                out.push_str(&json);
-                out.push('\n');
-            }
-        }
-        out
-    })
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use futures::Stream;
+    use std::collections::VecDeque;
+    use std::convert::Infallible;
 
-    Ok((
-        [
-            (header::CONTENT_TYPE, "application/x-ndjson".to_string()),
-            (header::CACHE_CONTROL, "no-cache".to_string()),
-        ],
-        body,
-    )
+    state
+        .db
+        .require_for(
+            request_principal(&state, &principal).as_ref(),
+            &mongreldb_core::Permission::Admin,
+        )
+        .map_err(|error| status_for_error(&error))?;
+
+    struct State {
+        db: Arc<Database>,
+        receiver: tokio::sync::broadcast::Receiver<mongreldb_core::ChangeEvent>,
+        change_wake: tokio::sync::broadcast::Receiver<()>,
+        interval: tokio::time::Interval,
+        pending: VecDeque<mongreldb_core::ChangeEvent>,
+        last_id: Option<String>,
+        poll_now: bool,
+        done: bool,
+    }
+
+    fn event(change: mongreldb_core::ChangeEvent) -> Event {
+        let id = change.id.clone();
+        let kind = if change.op == "notify" {
+            "notify"
+        } else {
+            "change"
+        };
+        let mut event = Event::default().event(kind).data(
+            serde_json::to_string(&change)
+                .unwrap_or_else(|error| format!(r#"{{"error":"{error}"}}"#)),
+        );
+        if let Some(id) = id {
+            event = event.id(id);
+        }
+        event
+    }
+
+    let last_id = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let receiver = state.db.subscribe_changes();
+    let change_wake = state.db.subscribe_change_commits();
+    let db = Arc::clone(&state.db);
+    let resume = last_id.clone();
+    let initial = tokio::task::spawn_blocking(move || db.change_events_since(resume.as_deref()))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|error| match error {
+            mongreldb_core::MongrelError::InvalidArgument(_) => StatusCode::BAD_REQUEST,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        })?;
+    if initial.gap {
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "cdc retention gap",
+                "earliest_epoch": initial.earliest_epoch,
+                "current_epoch": initial.current_epoch,
+            })),
+        )
+            .into_response());
+    }
+
+    let stream: std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>> = Box::pin(
+        futures::stream::unfold(
+            State {
+                db: Arc::clone(&state.db),
+                receiver,
+                change_wake,
+                interval: tokio::time::interval(std::time::Duration::from_millis(250)),
+                pending: initial.events.into(),
+                last_id,
+                poll_now: false,
+                done: false,
+            },
+            |mut stream| async move {
+                if stream.done {
+                    return None;
+                }
+                loop {
+                    if stream.poll_now {
+                        stream.poll_now = false;
+                        let db = Arc::clone(&stream.db);
+                        let last_id = stream.last_id.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            db.change_events_since(last_id.as_deref())
+                        })
+                        .await
+                        {
+                            Ok(Ok(batch)) if batch.gap => {
+                                stream.done = true;
+                                let gap = Event::default().event("gap").data(
+                                    json!({
+                                        "error": "cdc retention gap",
+                                        "earliest_epoch": batch.earliest_epoch,
+                                        "current_epoch": batch.current_epoch,
+                                    })
+                                    .to_string(),
+                                );
+                                return Some((Ok(gap), stream));
+                            }
+                            Ok(Ok(batch)) => stream.pending.extend(batch.events),
+                            Ok(Err(error)) => {
+                                stream.done = true;
+                                return Some((
+                                    Ok(Event::default().event("error").data(error.to_string())),
+                                    stream,
+                                ));
+                            }
+                            Err(error) => {
+                                stream.done = true;
+                                return Some((
+                                    Ok(Event::default().event("error").data(error.to_string())),
+                                    stream,
+                                ));
+                            }
+                        }
+                    }
+                    if let Some(change) = stream.pending.pop_front() {
+                        if let Some(id) = &change.id {
+                            stream.last_id = Some(id.clone());
+                        }
+                        return Some((Ok(event(change)), stream));
+                    }
+                    tokio::select! {
+                        received = stream.receiver.recv() => {
+                            match received {
+                                Ok(change) => return Some((Ok(event(change)), stream)),
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {},
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                    return None;
+                                }
+                            }
+                        }
+                        received = stream.change_wake.recv() => {
+                            match received {
+                                Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                    stream.poll_now = true;
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
+                            }
+                        }
+                        _ = stream.interval.tick() => {
+                            stream.poll_now = true;
+                        }
+                    }
+                }
+            },
+        ),
+    );
+
+    Ok(Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(std::time::Duration::from_secs(15))
+                .text("keep-alive"),
+        )
         .into_response())
 }
 
@@ -457,7 +666,16 @@ async fn health() -> StatusCode {
 /// array, oldest-first. Subject to the same auth middleware as every other
 /// route. This is a best-effort in-memory ring buffer, not a tamper-evident
 /// log (see `audit` module docs).
-async fn audit_handler(State(state): State<Arc<AppState>>) -> Response {
+async fn audit_handler(
+    State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
+) -> Response {
+    if let Err(error) = state.db.require_for(
+        request_principal(&state, &principal).as_ref(),
+        &mongreldb_core::Permission::Admin,
+    ) {
+        return (status_for_error(&error), error.to_string()).into_response();
+    }
     let recent = state.audit.recent();
     Json(recent).into_response()
 }
@@ -480,6 +698,25 @@ fn default_session_idle_timeout() -> std::time::Duration {
     )
 }
 
+fn default_replication_wal_segments() -> usize {
+    let replication = std::env::var("MONGRELDB_REPLICATION_WAL_SEGMENTS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(16);
+    let cdc = std::env::var("MONGRELDB_CDC_WAL_SEGMENTS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(16);
+    replication.max(cdc)
+}
+
+fn default_history_retention_epochs() -> u64 {
+    std::env::var("MONGRELDB_HISTORY_RETENTION_EPOCHS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1024)
+}
+
 /// The principal a request is attributed to, for session ownership: a resolved
 /// user principal wins; otherwise `token` when token auth is active; else
 /// `anonymous` (no auth configured).
@@ -493,6 +730,23 @@ fn request_owner(state: &AppState, principal: &Option<mongreldb_core::Principal>
     "anonymous".into()
 }
 
+fn request_principal(
+    state: &AppState,
+    principal: &Option<mongreldb_core::Principal>,
+) -> Option<mongreldb_core::Principal> {
+    principal.clone().or_else(|| {
+        state
+            .auth_token
+            .as_ref()
+            .map(|_| mongreldb_core::Principal {
+                username: "token".into(),
+                is_admin: true,
+                roles: Vec::new(),
+                permissions: Vec::new(),
+            })
+    })
+}
+
 /// `POST /sessions` — open a long-lived session for cross-request interactive
 /// transactions. Returns `{"session_id": "..."}`; send `X-Session-ID: <token>`
 /// on subsequent `/sql` requests to route to it. The session is owned by the
@@ -502,9 +756,10 @@ async fn create_session(
     OptionalPrincipal(principal): OptionalPrincipal,
 ) -> Response {
     let owner = request_owner(&state, &principal);
-    let session = match MongrelSession::open_with_external_modules(
+    let session = match MongrelSession::open_with_external_modules_as(
         Arc::clone(&state.db),
         state.external_modules.iter().cloned(),
+        request_principal(&state, &principal),
     ) {
         Ok(s) => s,
         Err(e) => return (status_for_query_error(&e), e.to_string()).into_response(),
@@ -542,15 +797,14 @@ async fn close_session(
     }
 }
 
-/// Choose the response serialization for a result set: `"arrow"` (IPC file),
-/// `"arrow-stream"` (streaming IPC), or JSON (the default).
-fn dispatch_sql_format(
+/// Choose a buffered response serialization: `"arrow"` (IPC file) or JSON.
+/// Streaming IPC is dispatched before query collection.
+fn dispatch_buffered_sql_format(
     format: Option<&str>,
     batches: &[arrow::record_batch::RecordBatch],
 ) -> Response {
     match format {
         Some("arrow") => sql_arrow_response(batches),
-        Some("arrow-stream") => sql_arrow_stream_response(batches),
         _ => sql_json_response(batches),
     }
 }
@@ -690,7 +944,19 @@ async fn execute_statement(
     };
     let sql = format!("EXECUTE {}({})", req.name, literals.join(", "));
     let start = std::time::Instant::now();
-    let result = entry.session.run(&sql).await;
+    let result = if req.format.as_deref() == Some("arrow-stream") {
+        entry
+            .session
+            .run_stream(&sql)
+            .await
+            .map(sql_arrow_stream_response)
+    } else {
+        entry
+            .session
+            .run(&sql)
+            .await
+            .map(|batches| dispatch_buffered_sql_format(req.format.as_deref(), &batches))
+    };
     let elapsed = start.elapsed();
     if elapsed >= state.slow_query_threshold {
         state.metrics.inc_slow_queries();
@@ -701,7 +967,7 @@ async fn execute_statement(
         );
     }
     match result {
-        Ok(batches) => dispatch_sql_format(req.format.as_deref(), &batches),
+        Ok(response) => response,
         Err(e) => {
             state.metrics.inc_sql_errors();
             // A reference to an unprepared/unknown statement is a client error.
@@ -748,7 +1014,16 @@ async fn deallocate_statement(
 
 /// `mongreldb_tables` gauge. Subject to the same auth middleware as every other
 /// route (scrape with the configured Bearer token / Basic credentials).
-async fn metrics_handler(State(state): State<Arc<AppState>>) -> Response {
+async fn metrics_handler(
+    State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
+) -> Response {
+    if let Err(error) = state.db.require_for(
+        request_principal(&state, &principal).as_ref(),
+        &mongreldb_core::Permission::Admin,
+    ) {
+        return (status_for_error(&error), error.to_string()).into_response();
+    }
     let body = state.metrics.prometheus_text(state.db.table_names().len());
     (
         [(
@@ -761,7 +1036,19 @@ async fn metrics_handler(State(state): State<Arc<AppState>>) -> Response {
 }
 
 /// `POST /compact` — compact all mounted tables.
-async fn compact_all(State(state): State<Arc<AppState>>) -> (StatusCode, Json<serde_json::Value>) {
+async fn compact_all(
+    State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if let Err(error) = state.db.require_for(
+        request_principal(&state, &principal).as_ref(),
+        &mongreldb_core::Permission::Ddl,
+    ) {
+        return (
+            status_for_error(&error),
+            Json(json!({ "status": "error", "message": error.to_string() })),
+        );
+    }
     match state.db.compact() {
         Ok((compacted, skipped)) => (
             StatusCode::OK,
@@ -781,8 +1068,18 @@ async fn compact_all(State(state): State<Arc<AppState>>) -> (StatusCode, Json<se
 /// `POST /tables/{name}/compact` — compact a single table.
 async fn compact_table(
     State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
     Path(name): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    if let Err(error) = state.db.require_for(
+        request_principal(&state, &principal).as_ref(),
+        &mongreldb_core::Permission::Ddl,
+    ) {
+        return (
+            status_for_error(&error),
+            Json(json!({ "status": "error", "table": name, "message": error.to_string() })),
+        );
+    }
     match state.db.compact_table(&name) {
         Ok(true) => (
             StatusCode::OK,
@@ -817,8 +1114,15 @@ struct ColumnDefJson {
 
 async fn create_table(
     State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
     Json(req): Json<CreateTableRequest>,
 ) -> Response {
+    if let Err(error) = state.db.require_for(
+        request_principal(&state, &principal).as_ref(),
+        &mongreldb_core::Permission::Ddl,
+    ) {
+        return (status_for_error(&error), error.to_string()).into_response();
+    }
     let mut columns = Vec::new();
     for c in &req.columns {
         let ty = match c.ty.as_str() {
@@ -862,11 +1166,37 @@ async fn create_table(
     }
 }
 
-async fn list_tables(State(state): State<Arc<AppState>>) -> Json<Vec<String>> {
-    Json(state.db.table_names())
+async fn list_tables(
+    State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
+) -> Json<Vec<String>> {
+    let principal = request_principal(&state, &principal);
+    Json(
+        state
+            .db
+            .table_names()
+            .into_iter()
+            .filter(|table| {
+                state
+                    .db
+                    .select_column_ids_for(table, principal.as_ref())
+                    .is_ok()
+            })
+            .collect(),
+    )
 }
 
-async fn drop_table(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
+async fn drop_table(
+    State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
+    Path(name): Path<String>,
+) -> Response {
+    if let Err(error) = state.db.require_for(
+        request_principal(&state, &principal).as_ref(),
+        &mongreldb_core::Permission::Ddl,
+    ) {
+        return (status_for_error(&error), error.to_string()).into_response();
+    }
     match state.db.drop_table(&name) {
         Ok(_) => {
             // Invalidate cached idempotency entries. A cached transaction
@@ -967,6 +1297,7 @@ pub(crate) fn validate_table_name(name: &str) -> Result<(), String> {
 
 async fn put_row(
     State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
     Path(name): Path<String>,
     Json(req): Json<PutRequest>,
 ) -> Response {
@@ -974,28 +1305,44 @@ async fn put_row(
         Ok(h) => h,
         Err(e) => return (StatusCode::NOT_FOUND, e.to_string()).into_response(),
     };
-    let mut g = handle.lock();
-    let schema = g.schema().clone();
+    let schema = handle.lock().schema().clone();
     let row = match parse_cells(&req.row, &schema) {
         Ok(r) => r,
         Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
     };
     state.metrics.inc_puts();
-    match g.put(row) {
+    let principal = request_principal(&state, &principal);
+    match state.db.put_for(&name, row, principal.as_ref()) {
         Ok(rid) => Json(json!({ "row_id": rid.0.to_string() })).into_response(),
         Err(e) => (status_for_error(&e), e.to_string()).into_response(),
     }
 }
 
-async fn count(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
-    let handle = match state.db.table(&name) {
-        Ok(h) => h,
-        Err(e) => return (StatusCode::NOT_FOUND, e.to_string()).into_response(),
-    };
-    Json(json!({ "count": handle.lock().count() })).into_response()
+async fn count(
+    State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
+    Path(name): Path<String>,
+) -> Response {
+    let principal = request_principal(&state, &principal);
+    match state.db.count_for(&name, principal.as_ref()) {
+        Ok(count) => Json(json!({ "count": count })).into_response(),
+        Err(error) => (status_for_error(&error), error.to_string()).into_response(),
+    }
 }
 
-async fn commit(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
+async fn commit(
+    State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
+    Path(name): Path<String>,
+) -> Response {
+    if let Err(error) = state.db.require_for(
+        request_principal(&state, &principal).as_ref(),
+        &mongreldb_core::Permission::Update {
+            table: name.clone(),
+        },
+    ) {
+        return (status_for_error(&error), error.to_string()).into_response();
+    }
     let handle = match state.db.table(&name) {
         Ok(h) => h,
         Err(e) => return (StatusCode::NOT_FOUND, e.to_string()).into_response(),
@@ -1052,9 +1399,10 @@ async fn sql(
         entry.touch();
         execute_sql(&state, &principal, &entry.session, req).await
     } else {
-        let session = match MongrelSession::open_with_external_modules(
+        let session = match MongrelSession::open_with_external_modules_as(
             Arc::clone(&state.db),
             state.external_modules.iter().cloned(),
+            request_principal(&state, &principal),
         ) {
             Ok(s) => s,
             Err(e) => return (status_for_query_error(&e), e.to_string()).into_response(),
@@ -1082,7 +1430,17 @@ async fn execute_sql(
     // task can resume on a different thread, corrupting the trace stack and
     // leaking scopes. Wall-clock timing is sufficient for slow-query detection
     // and works across awaits.
-    let result = session.run(&req.sql).await;
+    let result = if req.format.as_deref() == Some("arrow-stream") {
+        session
+            .run_stream(&req.sql)
+            .await
+            .map(sql_arrow_stream_response)
+    } else {
+        session
+            .run(&req.sql)
+            .await
+            .map(|batches| dispatch_buffered_sql_format(req.format.as_deref(), &batches))
+    };
     let elapsed = start.elapsed();
     // Slow-query logging covers BOTH success and failure (the slowest errors
     // matter most for diagnosis), checked before branching on the outcome.
@@ -1101,7 +1459,7 @@ async fn execute_sql(
         state.audit.record(actor, action, detail);
     }
     match result {
-        Ok(batches) => dispatch_sql_format(req.format.as_deref(), &batches),
+        Ok(response) => response,
         Err(e) => {
             state.metrics.inc_sql_errors();
             (
@@ -1134,32 +1492,14 @@ fn sql_arrow_response(batches: &[arrow::record_batch::RecordBatch]) -> Response 
         .into_response()
 }
 
-/// Serialize Arrow record batches as a **streaming** Arrow IPC stream
-/// (`application/vnd.apache.arrow.stream`). Unlike [`sql_arrow_response`]
-/// (which builds one contiguous IPC *file* `Vec<u8>`), this yields the schema
-/// message, then one record-batch message, then the end-of-stream marker — each
-/// serialized lazily as the response body is polled. The client receives the
-/// first batch before later batches are encoded, and the server's peak memory
-/// is the source `RecordBatch`es plus a single IPC message at a time (no whole-
-/// result serialization buffer).
-///
-/// The source batches are still materialized as a `Vec<RecordBatch>` by the
-/// query layer (a consequence of the result cache + native fast paths); a
-/// future streaming query path could feed this body directly.
-fn sql_arrow_stream_response(batches: &[arrow::record_batch::RecordBatch]) -> Response {
+/// Serialize a DataFusion record-batch stream as Arrow streaming IPC. The body
+/// holds only the active query batch and one serialized IPC message.
+fn sql_arrow_stream_response(batches: mongreldb_query::MongrelRecordBatchStream) -> Response {
     use futures::{stream, StreamExt};
 
     const STREAM_CT: &str = "application/vnd.apache.arrow.stream";
 
-    if batches.is_empty() {
-        // No batches → no schema available. An empty body is not a valid Arrow
-        // IPC stream (which must contain at least a schema + EOS marker), so
-        // return 204 No Content without the Arrow content type rather than a
-        // body an Arrow reader cannot decode.
-        return StatusCode::NO_CONTENT.into_response();
-    }
-
-    let schema = batches[0].schema();
+    let schema = batches.schema();
     let mut writer = match arrow::ipc::writer::StreamWriter::try_new(Vec::new(), schema.as_ref()) {
         Ok(w) => w,
         Err(e) => {
@@ -1173,34 +1513,26 @@ fn sql_arrow_stream_response(batches: &[arrow::record_batch::RecordBatch]) -> Re
     // `try_new` synchronously writes the schema message; drain it so it becomes
     // the first chunk yielded to the client.
     let schema_chunk: Vec<u8> = std::mem::take(writer.get_mut());
-    let batches_owned: Vec<arrow::record_batch::RecordBatch> = batches.to_vec();
-
-    // Lazy per-batch + end-of-stream serialization. State carries the writer so
-    // each batch appends exactly one IPC message; we drain after every write.
-    // A serialization failure yields an `Err` from the body stream so the
-    // client observes a truncated/broken transfer instead of a silently
-    // shortened 200 response.
     let batch_stream = stream::unfold(
-        (writer, batches_owned, 0_usize, false),
-        |(mut w, batches, idx, eos)| async move {
-            if idx < batches.len() {
-                match w.write(&batches[idx]) {
+        (batches, Some(writer)),
+        |(mut batches, writer)| async move {
+            let mut writer = writer?;
+            match batches.next().await {
+                Some(Ok(batch)) => match writer.write(&batch) {
                     Ok(()) => {
-                        let chunk = std::mem::take(w.get_mut());
-                        Some((Ok(chunk), (w, batches, idx + 1, eos)))
+                        let chunk = std::mem::take(writer.get_mut());
+                        Some((Ok(chunk), (batches, Some(writer))))
                     }
-                    Err(e) => Some((Err(std::io::Error::other(e)), (w, batches, idx, eos))),
-                }
-            } else if !eos {
-                match w.finish() {
+                    Err(error) => Some((Err(std::io::Error::other(error)), (batches, None))),
+                },
+                Some(Err(error)) => Some((Err(std::io::Error::other(error)), (batches, None))),
+                None => match writer.finish() {
                     Ok(()) => {
-                        let chunk = std::mem::take(w.get_mut());
-                        Some((Ok(chunk), (w, batches, idx, true)))
+                        let chunk = std::mem::take(writer.get_mut());
+                        Some((Ok(chunk), (batches, None)))
                     }
-                    Err(e) => Some((Err(std::io::Error::other(e)), (w, batches, idx, eos))),
-                }
-            } else {
-                None
+                    Err(error) => Some((Err(std::io::Error::other(error)), (batches, None))),
+                },
             }
         },
     );
@@ -1253,7 +1585,11 @@ struct TxnRequest {
     ops: Vec<TxnOp>,
 }
 
-async fn txn(State(state): State<Arc<AppState>>, Json(req): Json<TxnRequest>) -> Response {
+async fn txn(
+    State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
+    Json(req): Json<TxnRequest>,
+) -> Response {
     // Pre-validate every op against the live schemas before entering the
     // transaction, so malformed input returns 400 without consuming an epoch
     // or poisoning a txn.
@@ -1296,19 +1632,20 @@ async fn txn(State(state): State<Arc<AppState>>, Json(req): Json<TxnRequest>) ->
     }
 
     state.metrics.inc_txns();
-    let result = state.db.transaction(|t| {
+    let mut transaction = state.db.begin_as(request_principal(&state, &principal));
+    let result = (|| {
         for (table, action) in &parsed {
             match action {
                 TxnAction::Put(cells) => {
-                    t.put(table, cells.clone())?;
+                    transaction.put(table, cells.clone())?;
                 }
                 TxnAction::Delete(rid) => {
-                    t.delete(table, mongreldb_core::RowId(*rid))?;
+                    transaction.delete(table, mongreldb_core::RowId(*rid))?;
                 }
             }
         }
-        Ok(())
-    });
+        transaction.commit()
+    })();
     match result {
         Ok(_) => Json(json!({ "status": "committed" })).into_response(),
         Err(e) => (status_for_error(&e), e.to_string()).into_response(),
@@ -1389,6 +1726,7 @@ mod auth_tests {
 #[cfg(test)]
 mod wal_stream_tests {
     use super::*;
+    use mongreldb_client::ReplicationFollower;
     use mongreldb_core::Database;
     use tempfile::tempdir;
 
@@ -1431,6 +1769,92 @@ mod wal_stream_tests {
         // Should contain at least one record (the flush commit).
         assert!(!body.is_empty(), "wal_stream should return records");
         assert!(body.contains("seq"), "response should contain seq field");
+    }
+
+    #[tokio::test]
+    async fn follower_bootstraps_and_applies_incremental_commit() {
+        let leader_dir = tempdir().unwrap();
+        let follower_dir = tempdir().unwrap();
+        let follower_path = follower_dir.path().join("copy");
+        let db = Arc::new(Database::create(leader_dir.path()).unwrap());
+        db.create_table(
+            "items",
+            mongreldb_core::schema::Schema {
+                schema_id: 1,
+                columns: vec![mongreldb_core::schema::ColumnDef {
+                    id: 1,
+                    name: "id".into(),
+                    ty: TypeId::Int64,
+                    flags: mongreldb_core::schema::ColumnFlags::empty()
+                        .with(mongreldb_core::schema::ColumnFlags::PRIMARY_KEY),
+                    default_value: None,
+                }],
+                indexes: vec![],
+                colocation: vec![],
+                constraints: Default::default(),
+                clustered: false,
+            },
+        )
+        .unwrap();
+        let handle = db.table("items").unwrap();
+        handle.lock().put(vec![(1, Value::Int64(1))]).unwrap();
+        handle.lock().commit().unwrap();
+
+        let app = build_app_with_config(
+            Arc::clone(&db),
+            std::iter::empty::<Arc<dyn ExternalTableModule>>(),
+            Some("replication-secret".into()),
+            None,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let leader_url = format!("http://{addr}");
+        let first_path = follower_path.clone();
+        let (mut follower, initial) = tokio::task::spawn_blocking(move || {
+            let mut follower = ReplicationFollower::new(&leader_url, first_path)
+                .with_bearer_token("replication-secret");
+            let applied = follower.sync().unwrap();
+            (follower, applied)
+        })
+        .await
+        .unwrap();
+        assert_eq!(initial, 0);
+
+        handle.lock().put(vec![(1, Value::Int64(2))]).unwrap();
+        handle.lock().commit().unwrap();
+        let applied = tokio::task::spawn_blocking(move || {
+            let count = follower.sync().unwrap();
+            (follower, count)
+        })
+        .await
+        .unwrap();
+        follower = applied.0;
+        assert!(applied.1 > 0);
+        assert!(follower.last_epoch() > 0);
+
+        let replica = Database::open(&follower_path).unwrap();
+        assert_eq!(replica.table("items").unwrap().lock().count(), 2);
+        drop(replica);
+
+        db.set_spill_threshold(1);
+        db.transaction(|txn| {
+            txn.put("items", vec![(1, Value::Int64(3))])?;
+            Ok(())
+        })
+        .unwrap();
+        let (follower_after_bootstrap, applied) = tokio::task::spawn_blocking(move || {
+            let count = follower.sync().unwrap();
+            (follower, count)
+        })
+        .await
+        .unwrap();
+        assert_eq!(applied, 0, "spilled run should trigger safe rebootstrap");
+        assert!(follower_after_bootstrap.last_epoch() > 0);
+        let replica = Database::open(&follower_path).unwrap();
+        assert_eq!(replica.table("items").unwrap().lock().count(), 3);
     }
 }
 
@@ -1622,7 +2046,20 @@ mod streaming_tests {
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use datafusion::common::DataFusionError;
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use futures::StreamExt;
     use std::sync::Arc as StdArc;
+
+    fn batch_stream(batches: Vec<RecordBatch>) -> mongreldb_query::MongrelRecordBatchStream {
+        let schema = batches
+            .first()
+            .map(RecordBatch::schema)
+            .unwrap_or_else(|| StdArc::new(Schema::empty()));
+        let batches =
+            futures::stream::iter(batches.into_iter().map(Ok::<RecordBatch, DataFusionError>));
+        Box::pin(RecordBatchStreamAdapter::new(schema, batches))
+    }
 
     /// Unit-level check: feed two synthetic batches through the streaming
     /// serializer and re-parse the resulting IPC stream end-to-end. This
@@ -1642,7 +2079,7 @@ mod streaming_tests {
         )
         .unwrap();
 
-        let resp = sql_arrow_stream_response(&[b1, b2]);
+        let resp = sql_arrow_stream_response(batch_stream(vec![b1, b2]));
         let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
             .await
             .unwrap();
@@ -1666,12 +2103,31 @@ mod streaming_tests {
     }
 
     #[tokio::test]
-    async fn arrow_stream_empty_batches_yield_empty_body() {
-        let resp = sql_arrow_stream_response(&[]);
+    async fn arrow_stream_emits_schema_before_first_batch() {
+        let schema = StdArc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let pending = futures::stream::pending::<Result<RecordBatch, DataFusionError>>();
+        let batches = Box::pin(RecordBatchStreamAdapter::new(schema, pending));
+        let mut body = sql_arrow_stream_response(batches)
+            .into_body()
+            .into_data_stream();
+
+        let chunk = tokio::time::timeout(std::time::Duration::from_millis(100), body.next())
+            .await
+            .expect("schema chunk should not wait for a query batch")
+            .unwrap()
+            .unwrap();
+        assert!(chunk.starts_with(&0xFFFFFFFFu32.to_le_bytes()));
+    }
+
+    #[tokio::test]
+    async fn arrow_stream_empty_query_is_valid_ipc() {
+        let resp = sql_arrow_stream_response(batch_stream(Vec::new()));
         let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
             .await
             .unwrap();
-        assert!(bytes.is_empty(), "no batches \u{2192} empty stream body");
+        let slice: &[u8] = bytes.as_ref();
+        let reader = arrow::ipc::reader::StreamReader::try_new(slice, None).unwrap();
+        assert_eq!(reader.count(), 0);
     }
 }
 
@@ -1686,6 +2142,7 @@ mod audit_tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(Database::create(dir.path()).unwrap());
         db.create_user("alice", password).unwrap();
+        db.set_user_admin("alice", true).unwrap();
         let app = build_app_full(
             db,
             std::iter::empty::<Arc<dyn ExternalTableModule>>(),

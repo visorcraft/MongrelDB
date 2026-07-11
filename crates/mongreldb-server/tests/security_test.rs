@@ -1,0 +1,224 @@
+use axum::body::{to_bytes, Body};
+use axum::http::{Request, StatusCode};
+use mongreldb_core::{
+    ColumnDef, ColumnFlags, ColumnMask, Database, MaskStrategy, Permission, PolicyCommand,
+    Principal, RowPolicy, Schema, SecurityCatalog, SecurityExpr, TypeId, Value,
+};
+use mongreldb_query::ExternalTableModule;
+use mongreldb_server::build_app_full;
+use serde_json::{json, Value as JsonValue};
+use std::sync::Arc;
+use tower::ServiceExt;
+
+fn schema() -> Schema {
+    Schema {
+        columns: vec![
+            ColumnDef {
+                id: 1,
+                name: "id".into(),
+                ty: TypeId::Int64,
+                flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
+            },
+            ColumnDef {
+                id: 2,
+                name: "owner".into(),
+                ty: TypeId::Bytes,
+                flags: ColumnFlags::empty(),
+                default_value: None,
+            },
+            ColumnDef {
+                id: 3,
+                name: "secret".into(),
+                ty: TypeId::Bytes,
+                flags: ColumnFlags::empty(),
+                default_value: None,
+            },
+            ColumnDef {
+                id: 4,
+                name: "value".into(),
+                ty: TypeId::Int64,
+                flags: ColumnFlags::empty(),
+                default_value: None,
+            },
+        ],
+        clustered: true,
+        ..Schema::default()
+    }
+}
+
+fn request(method: &str, uri: &str, body: JsonValue) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("authorization", "Basic YWxpY2U6cHc=")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn user_principal_secures_sql_native_kit_and_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    db.create_table("docs", schema()).unwrap();
+    db.transaction(|transaction| {
+        transaction.put(
+            "docs",
+            vec![
+                (1, Value::Int64(1)),
+                (2, Value::Bytes(b"alice".to_vec())),
+                (3, Value::Bytes(b"alice-secret".to_vec())),
+                (4, Value::Int64(10)),
+            ],
+        )?;
+        transaction.put(
+            "docs",
+            vec![
+                (1, Value::Int64(2)),
+                (2, Value::Bytes(b"bob".to_vec())),
+                (3, Value::Bytes(b"bob-secret".to_vec())),
+                (4, Value::Int64(20)),
+            ],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    db.create_user("alice", "pw").unwrap();
+    db.create_role("tenant").unwrap();
+    for permission in [
+        Permission::SelectColumns {
+            table: "docs".into(),
+            columns: vec!["id".into(), "owner".into(), "secret".into()],
+        },
+        Permission::InsertColumns {
+            table: "docs".into(),
+            columns: vec!["id".into(), "owner".into(), "secret".into(), "value".into()],
+        },
+    ] {
+        db.grant_permission("tenant", permission).unwrap();
+    }
+    db.grant_role("alice", "tenant").unwrap();
+    db.set_security_catalog_as(
+        SecurityCatalog {
+            rls_tables: vec!["docs".into()],
+            policies: vec![RowPolicy {
+                name: "owner_only".into(),
+                table: "docs".into(),
+                command: PolicyCommand::All,
+                subjects: vec!["public".into()],
+                permissive: true,
+                using: Some(SecurityExpr::ColumnEqCurrentUser { column: 2 }),
+                with_check: Some(SecurityExpr::ColumnEqCurrentUser { column: 2 }),
+            }],
+            masks: vec![ColumnMask {
+                name: "hide_secret".into(),
+                table: "docs".into(),
+                column: 3,
+                strategy: MaskStrategy::Redact {
+                    replacement: "***".into(),
+                },
+                exempt_subjects: Vec::new(),
+            }],
+        },
+        Some(&Principal {
+            username: "admin".into(),
+            is_admin: true,
+            roles: Vec::new(),
+            permissions: Vec::new(),
+        }),
+    )
+    .unwrap();
+
+    let app = build_app_full(
+        Arc::clone(&db),
+        std::iter::empty::<Arc<dyn ExternalTableModule>>(),
+        None,
+        None,
+        true,
+    );
+
+    for uri in ["/audit", "/metrics", "/events", "/wal/stream?since=0"] {
+        let response = app
+            .clone()
+            .oneshot(request("GET", uri, json!({})))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{uri}");
+    }
+
+    let response = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/sql",
+            json!({ "sql": "SELECT id, secret FROM docs ORDER BY id" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: JsonValue =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
+    assert_eq!(body, json!([{ "id": 1, "secret": "***" }]));
+
+    let response = app
+        .clone()
+        .oneshot(request("GET", "/tables/docs/count", json!({})))
+        .await
+        .unwrap();
+    let body: JsonValue =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
+    assert_eq!(body, json!({ "count": 1 }));
+
+    let response = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/kit/query",
+            json!({ "table": "docs", "projection": [1, 2, 3] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: JsonValue =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
+    assert_eq!(body["rows"].as_array().unwrap().len(), 1);
+    assert!(body["rows"][0]["cells"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("***")));
+
+    let response = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/tables/docs/put",
+            json!({ "row": [1, 3, 2, "bob", 3, "stolen", 4, 30] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let response = app
+        .clone()
+        .oneshot(request("POST", "/sessions", json!({})))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: JsonValue =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
+    let session_id = body["session_id"].as_str().unwrap();
+    let mut session_request = request(
+        "POST",
+        "/sql",
+        json!({ "sql": "SELECT COUNT(*) AS n FROM docs" }),
+    );
+    session_request
+        .headers_mut()
+        .insert("x-session-id", session_id.parse().unwrap());
+    let response = app.oneshot(session_request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: JsonValue =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
+    assert_eq!(body, json!([{ "n": 1 }]));
+}

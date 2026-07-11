@@ -87,6 +87,7 @@ fn orders_schema(action: FkAction) -> Schema {
         ref_table: "users".into(),
         ref_columns: vec![0],
         on_delete: action,
+        on_update: FkAction::Restrict,
     });
     Schema {
         schema_id: 0,
