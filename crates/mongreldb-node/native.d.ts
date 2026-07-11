@@ -651,7 +651,7 @@ export declare class RemoteDatabase {
   setHistoryRetentionEpochs(epochs: bigint): void
   historyRetentionEpochs(): bigint
   earliestRetainedEpoch(): bigint
-  count(table: string): number
+  count(table: string): bigint
   sql(sql: string): Buffer
   commit(table: string): bigint
   createProcedure(spec: ProcedureSpec): string

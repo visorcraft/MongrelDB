@@ -23,6 +23,7 @@ use mongreldb_core::schema::{
 use mongreldb_core::{RowId, Value};
 use napi::bindgen_prelude::{BigInt, Buffer};
 use napi_derive::napi;
+use std::io::Read;
 use std::sync::Arc;
 
 /// Map core errors to NAPI with stable category prefixes so the JS wrapper can
@@ -3160,7 +3161,7 @@ impl RemoteDatabase {
     }
 
     #[napi]
-    pub fn count(&self, table: String) -> napi::Result<f64> {
+    pub fn count(&self, table: String) -> napi::Result<BigInt> {
         let resp: serde_json::Value = self
             .agent
             .get(&format!("{}/tables/{table}/count", self.url))
@@ -3168,7 +3169,7 @@ impl RemoteDatabase {
             .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?
             .into_json()
             .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
-        Ok(resp["count"].as_f64().unwrap_or(0.0))
+        Ok(BigInt::from(resp["count"].as_u64().unwrap_or(0)))
     }
 
     #[napi]
@@ -3178,10 +3179,11 @@ impl RemoteDatabase {
             .post(&format!("{}/sql", self.url))
             .send_json(serde_json::json!({ "sql": sql, "format": "arrow" }))
             .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
-        let bytes = resp
-            .into_string()
+        let mut bytes = Vec::new();
+        resp.into_reader()
+            .read_to_end(&mut bytes)
             .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
-        Ok(Buffer::from(bytes.into_bytes()))
+        Ok(Buffer::from(bytes))
     }
 
     #[napi]
