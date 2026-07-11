@@ -228,3 +228,57 @@ async fn user_principal_secures_sql_native_kit_and_sessions() {
         serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
     assert_eq!(body, json!([{ "n": 1 }]));
 }
+
+#[tokio::test]
+async fn admin_principal_allows_history_retention() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    db.create_user("admin", "pw").unwrap();
+    db.set_user_admin("admin", true).unwrap();
+
+    let app = build_app_full(
+        Arc::clone(&db),
+        std::iter::empty::<Arc<dyn ExternalTableModule>>(),
+        None,
+        None,
+        true,
+    );
+
+    let admin_basic = "Basic YWRtaW46cHc="; // admin:pw
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/history/retention")
+                .header("authorization", admin_basic)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: JsonValue =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
+    assert!(body["history_retention_epochs"].is_u64());
+    assert!(body["earliest_retained_epoch"].is_u64());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/history/retention")
+                .header("authorization", admin_basic)
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"history_retention_epochs": 7}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: JsonValue =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
+    assert_eq!(body["history_retention_epochs"], 7);
+    assert!(body["earliest_retained_epoch"].is_u64());
+}

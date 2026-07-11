@@ -16,6 +16,7 @@ use mongreldb_server::{build_app, build_app_with_external_modules};
 use std::io::Cursor;
 use std::sync::Arc;
 use tempfile::tempdir;
+use tower::ServiceExt;
 
 struct ServerRowsModule;
 
@@ -128,9 +129,6 @@ async fn multi_table_server_endpoints() {
     let dir = tempdir().unwrap();
     let db = Arc::new(Database::create(dir.path()).unwrap());
     let app = build_app(db);
-
-    // Use tower's oneshot to test the router in-process.
-    use tower::ServiceExt;
 
     // Health check.
     let resp = app
@@ -330,4 +328,203 @@ async fn sql_endpoint_uses_startup_external_module_allowlist() {
         .unwrap();
     assert_eq!(labels.value(0), "one");
     assert_eq!(labels.value(1), "two");
+}
+
+async fn get_json(app: axum::Router, uri: &str) -> (u16, serde_json::Value) {
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let bytes = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, v)
+}
+
+async fn put_json(
+    app: axum::Router,
+    uri: &str,
+    body: serde_json::Value,
+) -> (u16, serde_json::Value) {
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("PUT")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let bytes = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, v)
+}
+
+async fn post_json(
+    app: axum::Router,
+    uri: &str,
+    body: serde_json::Value,
+) -> (u16, serde_json::Value) {
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let bytes = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, v)
+}
+
+#[tokio::test]
+async fn history_retention_get_returns_exact_shape() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    let app = build_app(db);
+    let (status, body) = get_json(app, "/history/retention").await;
+    assert_eq!(status, 200);
+    assert_eq!(body["history_retention_epochs"], 1024);
+    assert_eq!(body["earliest_retained_epoch"], 0);
+}
+
+#[tokio::test]
+async fn history_retention_put_returns_exact_shape_and_persists() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    let app = build_app(Arc::clone(&db));
+    let (status, body) = put_json(
+        app,
+        "/history/retention",
+        serde_json::json!({"history_retention_epochs": 7}),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["history_retention_epochs"], 7);
+    assert_eq!(body["earliest_retained_epoch"], 0);
+    assert_eq!(db.history_retention_epochs(), 7);
+
+    drop(db);
+    let reopened = Arc::new(Database::open(dir.path()).unwrap());
+    assert_eq!(reopened.history_retention_epochs(), 7);
+}
+
+#[tokio::test]
+async fn history_retention_put_rejects_non_u64() {
+    let dir = tempdir().unwrap();
+    let app = build_app(Arc::new(Database::create(dir.path()).unwrap()));
+    for value in [
+        serde_json::json!(-1),
+        serde_json::json!(1.5),
+        serde_json::json!("7"),
+    ] {
+        let (status, _) = put_json(
+            app.clone(),
+            "/history/retention",
+            serde_json::json!({"history_retention_epochs": value}),
+        )
+        .await;
+        assert_eq!(status, 400, "value {value} should be rejected");
+    }
+}
+
+#[tokio::test]
+async fn history_retention_cannot_restore_lost_history() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    db.create_table(
+        "items",
+        Schema {
+            schema_id: 0,
+            columns: vec![
+                ColumnDef {
+                    id: 1,
+                    name: "id".into(),
+                    ty: TypeId::Int64,
+                    flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                    default_value: None,
+                },
+                ColumnDef {
+                    id: 2,
+                    name: "value".into(),
+                    ty: TypeId::Int64,
+                    flags: ColumnFlags::empty(),
+                    default_value: None,
+                },
+            ],
+            indexes: Vec::new(),
+            colocation: Vec::new(),
+            constraints: Default::default(),
+            clustered: false,
+        },
+    )
+    .unwrap();
+
+    let app = build_app(Arc::clone(&db));
+
+    // Establish initial retention window.
+    let (status, _) = put_json(
+        app.clone(),
+        "/history/retention",
+        serde_json::json!({"history_retention_epochs": 2}),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    // Advance visible epochs so that some history is pruned.
+    for value in [1, 2, 3, 4] {
+        let (status, _) = post_json(
+            app.clone(),
+            "/tables/items/put",
+            serde_json::json!({"row": [1, 1, 2, value]}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let (status, _) = post_json(
+            app.clone(),
+            "/tables/items/commit",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, 200);
+    }
+
+    let (status, before) = get_json(app.clone(), "/history/retention").await;
+    assert_eq!(status, 200);
+    let earliest_before = before["earliest_retained_epoch"].as_u64().unwrap();
+    assert!(earliest_before > 0, "history should have been pruned");
+
+    // Expanding the window cannot restore already-pruned epochs.
+    let (status, after) = put_json(
+        app.clone(),
+        "/history/retention",
+        serde_json::json!({"history_retention_epochs": 100}),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        after["earliest_retained_epoch"].as_u64().unwrap(),
+        earliest_before,
+        "earliest retained epoch must not move backward"
+    );
 }
