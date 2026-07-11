@@ -1,0 +1,35 @@
+[package]
+name = "mongreldb-kit-ffi"
+version = "0.48.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+description = "C ABI for MongrelDB Kit - schema model, migrations, query builder, and validation for native bindings"
+repository = "https://github.com/visorcraft/MongrelDB"
+keywords = ["mongreldb", "database", "ffi", "c-abi", "migrations"]
+categories = ["database", "external-ffi-bindings"]
+# `publish = false` is deliberate: this crate is a cdylib/staticlib artifact,
+# distributed as prebuilt native libraries via GitHub release archives
+# (libmongreldb_kit.{so,dylib,dll} + header). It is not a consumable Rust crate.
+
+[lib]
+# Lib name `mongreldb_kit` produces libmongreldb_kit.so / .dylib / .a /
+# mongreldb_kit.lib so downstream C/C++ users link with -lmongreldb_kit.
+name = "mongreldb_kit"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+# `mongreldb-kit` is renamed to `kit` to avoid clashing with this crate's own
+# lib name (`mongreldb_kit`). Without the rename, integration tests
+# `use mongreldb_kit::*` would be ambiguous between our FFI crate and the
+# upstream Kit crate.
+kit = { package = "mongreldb-kit", version = "0.48" }
+mongreldb-kit-core = "0.48"
+parking_lot = "0.12"
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[dev-dependencies]
+cc = "1"
+
+# Standalone crate - not a workspace member.
+[workspace]

@@ -145,8 +145,101 @@ jobs:
         with:
           files: dist/${{ matrix.archive }}
 
-  # Also publish a standalone headers archive so downstream build systems can
-  # fetch just mongreldb.h without downloading any platform archive.
+  # Build the Kit FFI (libmongreldb_kit) for the same 6 platform targets.
+  # This is the Kit layer (schema model, migrations, query builder, validation).
+  build-kit-native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: mongreldb-kit-native-linux-x64-gnu.tar.gz
+            apt: ''
+            zip: false
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            archive: mongreldb-kit-native-linux-x64-musl.tar.gz
+            apt: musl-tools
+            zip: false
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: mongreldb-kit-native-linux-arm64-gnu.tar.gz
+            apt: gcc-aarch64-linux-gnu
+            zip: false
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            archive: mongreldb-kit-native-darwin-arm64.tar.gz
+            apt: ''
+            zip: false
+          - runner: macos-13
+            target: x86_64-apple-darwin
+            archive: mongreldb-kit-native-darwin-x64.tar.gz
+            apt: ''
+            zip: false
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: mongreldb-kit-native-windows-x64.zip
+            apt: ''
+            zip: true
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        working-directory: crates/mongreldb-kit-ffi
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: crates/mongreldb-kit-ffi
+
+      - if: matrix.apt != ''
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt }}
+
+      - run: cargo build --release --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CC_x86_64_unknown_linux_musl: musl-gcc
+
+      - name: Package (Linux/macOS)
+        if: matrix.zip == false
+        working-directory: .
+        run: |
+          mkdir -p dist/mongreldb-kit-native/lib dist/mongreldb-kit-native/include
+          cp crates/mongreldb-kit-ffi/target/${{ matrix.target }}/release/libmongreldb_kit.so \
+             crates/mongreldb-kit-ffi/target/${{ matrix.target }}/release/libmongreldb_kit.a \
+             dist/mongreldb-kit-native/lib/ 2>/dev/null || true
+          cp crates/mongreldb-kit-ffi/target/${{ matrix.target }}/release/libmongreldb_kit.dylib \
+             crates/mongreldb-kit-ffi/target/${{ matrix.target }}/release/libmongreldb_kit.a \
+             dist/mongreldb-kit-native/lib/ 2>/dev/null || true
+          cp crates/mongreldb-kit-ffi/include/mongreldb_kit.h dist/mongreldb-kit-native/include/
+          tar -czf dist/${{ matrix.archive }} -C dist mongreldb-kit-native
+
+      - name: Package (Windows)
+        if: matrix.zip == true
+        working-directory: .
+        shell: bash
+        run: |
+          mkdir -p dist/mongreldb-kit-native/lib dist/mongreldb-kit-native/include
+          cp crates/mongreldb-kit-ffi/target/${{ matrix.target }}/release/mongreldb_kit.dll \
+             crates/mongreldb-kit-ffi/target/${{ matrix.target }}/release/mongreldb_kit.dll.lib \
+             dist/mongreldb-kit-native/lib/ 2>/dev/null || true
+          cp crates/mongreldb-kit-ffi/target/${{ matrix.target }}/release/mongreldb_kit.dll.lib \
+             dist/mongreldb-kit-native/lib/mongreldb_kit.lib 2>/dev/null || true
+          cp crates/mongreldb-kit-ffi/include/mongreldb_kit.h dist/mongreldb-kit-native/include/
+          (cd dist && 7z a ${{ matrix.archive }} mongreldb-kit-native)
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: dist/${{ matrix.archive }}
+
+  # Also publish a standalone headers archive (both mongreldb.h and
+  # mongreldb_kit.h) so downstream build systems can fetch just headers.
   release-headers:
     runs-on: ubuntu-latest
     steps:
@@ -155,6 +248,7 @@ jobs:
       - run: |
           mkdir -p dist/mongreldb-headers/include
           cp crates/mongreldb-ffi/include/mongreldb.h dist/mongreldb-headers/include/
+          cp crates/mongreldb-kit-ffi/include/mongreldb_kit.h dist/mongreldb-headers/include/
           tar -czf dist/mongreldb-headers.tar.gz -C dist mongreldb-headers
 
       - uses: softprops/action-gh-release@v3
