@@ -299,3 +299,128 @@ fn ffi_auth_create_user_and_verify() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ── SQL execution tests ────────────────────────────────────────────────────
+
+/// Helper: run SQL and return the IPC bytes (freeing is caller's job).
+unsafe fn run_sql(db: mongreldb_database_t, sql: &str) -> (i32, *mut u8, usize) {
+    let mut buf: *mut u8 = std::ptr::null_mut();
+    let mut len: usize = 0;
+    let ret = mongreldb_database_sql(db, cstr(sql), &mut buf, &mut len);
+    (ret, buf, len)
+}
+
+#[test]
+fn ffi_sql_ddl_returns_empty_or_nonempty() {
+    let dir = make_tempdir();
+    let path = dir.to_str().unwrap();
+
+    unsafe {
+        let db = make_test_db(path);
+
+        // CREATE TABLE via SQL.
+        let (ret, buf, len) = run_sql(
+            db,
+            "CREATE TABLE items (id INT64 PRIMARY KEY, qty INT64)",
+        );
+        assert_eq!(
+            ret,
+            0,
+            "CREATE TABLE via SQL failed: {}",
+            rust_str(mongreldb_last_error())
+        );
+        // DDL produces no result rows: zero-length IPC buffer.
+        assert_eq!(len, 0, "DDL should produce empty IPC buffer");
+        mongreldb_free_sql_result(buf, len);
+
+        mongreldb_database_free(db);
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ffi_sql_insert_and_select() {
+    let dir = make_tempdir();
+    let path = dir.to_str().unwrap();
+
+    unsafe {
+        let db = make_test_db(path);
+
+        let (ret, _, _) = run_sql(
+            db,
+            "CREATE TABLE products (id INT64 PRIMARY KEY, name VARCHAR, price FLOAT64)",
+        );
+        assert_eq!(ret, 0, "CREATE failed: {}", rust_str(mongreldb_last_error()));
+
+        // Insert two rows via SQL.
+        let (ret, _, _) = run_sql(
+            db,
+            "INSERT INTO products (id, name, price) VALUES (1, 'widget', 9.99)",
+        );
+        assert_eq!(ret, 0, "INSERT 1 failed: {}", rust_str(mongreldb_last_error()));
+
+        let (ret, _, _) = run_sql(
+            db,
+            "INSERT INTO products (id, name, price) VALUES (2, 'gadget', 19.99)",
+        );
+        assert_eq!(ret, 0, "INSERT 2 failed: {}", rust_str(mongreldb_last_error()));
+
+        // SELECT should return Arrow IPC file bytes (non-empty, starts with
+        // the ARROW1 magic).
+        let (ret, buf, len) = run_sql(db, "SELECT id, name, price FROM products ORDER BY id");
+        assert_eq!(ret, 0, "SELECT failed: {}", rust_str(mongreldb_last_error()));
+        assert!(len > 0, "SELECT should produce non-empty IPC buffer");
+        assert!(
+            len >= 6,
+            "IPC buffer too small to contain ARROW1 magic"
+        );
+        // Arrow IPC file format starts with "ARROW1\0".
+        let magic = std::slice::from_raw_parts(buf, 6);
+        assert_eq!(
+            &magic[..6],
+            b"ARROW1",
+            "IPC buffer should start with ARROW1 magic"
+        );
+        mongreldb_free_sql_result(buf, len);
+
+        // Verify the row count via SQL.
+        let (ret, buf, len) = run_sql(db, "SELECT COUNT() AS n FROM products");
+        assert_eq!(ret, 0, "COUNT failed: {}", rust_str(mongreldb_last_error()));
+        assert!(len > 0, "COUNT should produce IPC output");
+        mongreldb_free_sql_result(buf, len);
+
+        mongreldb_database_free(db);
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ffi_sql_error_handling() {
+    let dir = make_tempdir();
+    let path = dir.to_str().unwrap();
+
+    unsafe {
+        let db = make_test_db(path);
+
+        // Invalid SQL should return a negative error code with a message.
+        let (ret, buf, len) = run_sql(db, "SELECT FROM nonexistent_table");
+        assert!(
+            ret < 0,
+            "invalid SQL should return negative error code, got {}",
+            ret
+        );
+        let msg = rust_str(mongreldb_last_error());
+        assert!(
+            !msg.is_empty(),
+            "error message should be set for failed SQL"
+        );
+        // On error, the buffer should not have been allocated.
+        mongreldb_free_sql_result(buf, len);
+
+        mongreldb_database_free(db);
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

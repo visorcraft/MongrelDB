@@ -10,6 +10,7 @@ use crate::cstr::{cstr_to_string, string_into_raw};
 use crate::error::{clear, set_error, set_error_msg, ErrorCode};
 use crate::schema::{self, mongreldb_schema_t};
 use mongreldb_core::Database as CoreDatabase;
+use parking_lot::Mutex;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_void};
 use std::sync::Arc;
@@ -19,19 +20,31 @@ pub type mongreldb_database_t = *mut c_void;
 
 /// The Rust-side wrapper behind [`mongreldb_database_t`]. Holds the database
 /// behind an `Arc` so table/transaction sub-handles can clone it.
+///
+/// The `sql_session` field lazily caches a `MongrelSession` (the DataFusion
+/// SQL engine) so repeated `mongreldb_database_sql` calls reuse the same
+/// session and its view/catalog state. It is opened on first SQL use and
+/// stays alive for the lifetime of the handle.
 pub struct FFIDatabase {
     pub db: Arc<CoreDatabase>,
+    pub(crate) sql_session: Mutex<Option<mongreldb_query::MongrelSession>>,
 }
 
 impl FFIDatabase {
     pub fn new(db: CoreDatabase) -> Self {
-        Self { db: Arc::new(db) }
+        Self {
+            db: Arc::new(db),
+            sql_session: Mutex::new(None),
+        }
     }
 
     /// Wrap an existing `Arc<CoreDatabase>` (used by sub-handles that share the
     /// same underlying database).
     pub fn from_arc(db: Arc<CoreDatabase>) -> Self {
-        Self { db }
+        Self {
+            db,
+            sql_session: Mutex::new(None),
+        }
     }
 
     /// Hand ownership to C as an opaque pointer.

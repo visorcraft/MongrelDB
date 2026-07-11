@@ -161,6 +161,49 @@ int main(void) {
     assert(ok == 0);
     printf("11. wrong password rejected\n");
 
+    /* ── SQL execution ──────────────────────────────────────────────── */
+
+    /* Create a table via SQL DDL. DDL produces no result rows (empty IPC). */
+    uint8_t *sql_buf = NULL;
+    size_t sql_len = 0;
+    CHECK(mongreldb_database_sql(db,
+        "CREATE TABLE sql_items (id INT64 PRIMARY KEY, label VARCHAR, price FLOAT64)",
+        &sql_buf, &sql_len));
+    assert(sql_len == 0);
+    mongreldb_free_sql_result(sql_buf, sql_len);
+    printf("12. SQL CREATE TABLE\n");
+
+    /* Insert rows via SQL DML. Also produces no result rows. */
+    CHECK(mongreldb_database_sql(db,
+        "INSERT INTO sql_items (id, label, price) VALUES (1, 'widget', 9.99)",
+        &sql_buf, &sql_len));
+    assert(sql_len == 0);
+    mongreldb_free_sql_result(sql_buf, sql_len);
+
+    CHECK(mongreldb_database_sql(db,
+        "INSERT INTO sql_items (id, label, price) VALUES (2, 'gadget', 19.99)",
+        &sql_buf, &sql_len));
+    assert(sql_len == 0);
+    mongreldb_free_sql_result(sql_buf, sql_len);
+    printf("13. SQL INSERT 2 rows\n");
+
+    /* SELECT returns Arrow IPC file bytes (starts with "ARROW1" magic). */
+    CHECK(mongreldb_database_sql(db,
+        "SELECT id, label, price FROM sql_items ORDER BY id",
+        &sql_buf, &sql_len));
+    assert(sql_len >= 6);
+    assert(memcmp(sql_buf, "ARROW1", 6) == 0);
+    mongreldb_free_sql_result(sql_buf, sql_len);
+    printf("14. SQL SELECT returned %zu bytes of Arrow IPC\n", sql_len);
+
+    /* SQL error: querying a nonexistent table should fail with a message. */
+    int32_t sql_rc = mongreldb_database_sql(db,
+        "SELECT * FROM no_such_table", &sql_buf, &sql_len);
+    assert(sql_rc < 0);
+    assert(strlen(mongreldb_last_error()) > 0);
+    mongreldb_free_sql_result(sql_buf, sql_len);
+    printf("15. SQL error handled correctly\n");
+
     /* ── Cleanup ─────────────────────────────────────────────────────── */
     mongreldb_database_free(db);
     printf("\nAll C smoke tests passed!\n");

@@ -49,6 +49,7 @@ pub mod database;
 pub mod error;
 pub mod query;
 pub mod schema;
+pub mod sql;
 pub mod table;
 pub mod transaction;
 pub mod value;
@@ -71,6 +72,9 @@ pub use database::{
     mongreldb_database_free, mongreldb_database_table_names, mongreldb_drop_table, mongreldb_open,
     mongreldb_open_with_credentials, mongreldb_rename_table,
 };
+
+// SQL execution (DataFusion via MongrelSession; returns Arrow IPC file bytes).
+pub use sql::{mongreldb_database_sql, mongreldb_database_sql_refresh, mongreldb_free_sql_result};
 
 // `mongreldb_database_table` lives in the `table` module (it returns a table
 // handle); re-export it alongside the other table FFI functions below.

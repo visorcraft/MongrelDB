@@ -299,6 +299,36 @@ int32_t mongreldb_drop_table(mongreldb_database_t *db, const char *name);
 int32_t mongreldb_rename_table(
     mongreldb_database_t *db, const char *name, const char *new_name);
 
+/* ── SQL execution ──────────────────────────────────────────────────────── */
+/*
+ * Run a SQL statement via the DataFusion engine (same engine the daemon and
+ * Kit use). Results are returned as Arrow IPC *file* bytes (the format Arrow
+ * calls "IPC file" or "Feather v2" - starts with the 6-byte "ARROW1" magic).
+ * DDL/DML statements that produce no rows return a zero-length buffer
+ * (*out_len = 0). Decode with any Arrow IPC file reader (e.g. the C++
+ * arrow::ipc::RecordBatchFileReader, nanoarrow, or pyarrow.ipc.open_file).
+ *
+ * The session is cached on the database handle so repeated calls reuse
+ * catalog/view state. After a table create/drop via the FFI (not via SQL),
+ * call mongreldb_database_sql_refresh() so the session sees the new tables.
+ *
+ * The caller owns *out_buf and must free it with mongreldb_free_sql_result().
+ * On error, *out_buf is unchanged and a negative code is returned (call
+ * mongreldb_last_error() for details).
+ */
+int32_t mongreldb_database_sql(
+    mongreldb_database_t *db, const char *sql,
+    uint8_t **out_buf, size_t *out_len);
+
+/* Rebuild the cached SQL session so it sees the current table set after a
+ * schema change made outside SQL (e.g. via mongreldb_create_table). Returns
+ * MDB_OK on success. */
+int32_t mongreldb_database_sql_refresh(mongreldb_database_t *db);
+
+/* Free a byte buffer returned by mongreldb_database_sql(). Safe to call with
+ * NULL or a zero-length buffer. */
+void mongreldb_free_sql_result(uint8_t *ptr, size_t len);
+
 /* ── Schema builder ─────────────────────────────────────────────────────── */
 
 mongreldb_schema_builder_t *mongreldb_schema_begin(void);
