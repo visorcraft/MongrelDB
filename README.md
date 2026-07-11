@@ -245,9 +245,9 @@ MongrelDB supports **34 languages** across two integration tiers:
 | **Rust** | 1 (direct) | [MongrelDB](https://github.com/visorcraft/MongrelDB) | `cargo add mongreldb-core` |
 | **TypeScript** | 1 (NAPI) | [MongrelDB Kit](https://github.com/visorcraft/MongrelDB-Kit) | `npm install @visorcraft/mongreldb-kit` |
 | **Python** | 1 (PyO3) | [MongrelDB Kit](https://github.com/visorcraft/MongrelDB-Kit) | `pip install mongreldb-kit` |
-| **C** | 2 (HTTP) | [MongrelDB-C](https://github.com/visorcraft/MongrelDB-C) | CMake (links libcurl) |
+| **C** | 1/2 (native + HTTP) | [MongrelDB-C](https://github.com/visorcraft/MongrelDB-C) | CMake (links libcurl) or prebuilt `libmongreldb` |
 | **C#/.NET** | 2 (HTTP) | [MongrelDB-DotNet](https://github.com/visorcraft/MongrelDB-DotNet) | `dotnet add package Visorcraft.MongrelDB` |
-| **C++** | 2 (HTTP) | [MongrelDB-CPP](https://github.com/visorcraft/MongrelDB-CPP) | CMake (header-only, links libcurl) |
+| **C++** | 1/2 (native + HTTP) | [MongrelDB-CPP](https://github.com/visorcraft/MongrelDB-CPP) | CMake (header-only, links libcurl) or prebuilt `libmongreldb` |
 | **Clojure** | 2 (HTTP) | [MongrelDB-Clojure](https://github.com/visorcraft/MongrelDB-Clojure) | deps.edn / Leiningen |
 | **Crystal** | 2 (HTTP) | [MongrelDB-Crystal](https://github.com/visorcraft/MongrelDB-Crystal) | `shards add mongreldb` |
 | **D** | 2 (HTTP) | [MongrelDB-D](https://github.com/visorcraft/MongrelDB-D) | `dub add mongreldb` |
@@ -277,7 +277,22 @@ MongrelDB supports **34 languages** across two integration tiers:
 | **V** | 2 (HTTP) | [MongrelDB-V](https://github.com/visorcraft/MongrelDB-V) | `v install` |
 | **Zig** | 2 (HTTP) | [MongrelDB-Zig](https://github.com/visorcraft/MongrelDB-Zig) | `zig fetch` |
 
-The **[C ABI](crates/mongreldb-ffi)** (`mongreldb-ffi`) provides a stable C interface over the engine core, enabling future Tier-1 native bindings in any language with C FFI support. The C and C++ clients also bundle this header for direct native embedding via `libmongreldb`.
+The **[C ABI](crates/mongreldb-ffi)** (`mongreldb-ffi`) provides a stable C interface over the engine core: opaque handles, typed queries, transactions, auth, **SQL execution** (DataFusion, returns Arrow IPC), and **migration planning/checksums** (JSON in/out, language-neutral). A second FFI crate, **[mongreldb-kit-ffi](crates/mongreldb-kit-ffi)**, adds the Kit layer (schema model, full migration runner, query builder execution) as `libmongreldb_kit`. The C and C++ clients bundle both headers for direct native embedding.
+
+### Native libraries (prebuilt)
+
+Prebuilt `libmongreldb` and `libmongreldb_kit` are attached to every release for six platform targets:
+
+| Platform | Archive |
+|---|---|
+| Linux x64 (glibc) | `mongreldb-native-linux-x64-gnu.tar.gz` + `mongreldb-kit-native-linux-x64-gnu.tar.gz` |
+| Linux x64 (musl) | `mongreldb-native-linux-x64-musl.tar.gz` + `mongreldb-kit-native-linux-x64-musl.tar.gz` |
+| Linux arm64 (glibc) | `mongreldb-native-linux-arm64-gnu.tar.gz` + `mongreldb-kit-native-linux-arm64-gnu.tar.gz` |
+| macOS arm64 | `mongreldb-native-darwin-arm64.tar.gz` + `mongreldb-kit-native-darwin-arm64.tar.gz` |
+| macOS x64 | `mongreldb-native-darwin-x64.tar.gz` + `mongreldb-kit-native-darwin-x64.tar.gz` |
+| Windows x64 | `mongreldb-native-windows-x64.zip` + `mongreldb-kit-native-windows-x64.zip` |
+
+Each archive contains `lib/` (shared + static libraries) and `include/` (the C header). Download from the [releases page](https://github.com/visorcraft/MongrelDB/releases). See the C and C++ client READMEs for linking instructions.
 
 ## Node.js addon
 
@@ -357,7 +372,8 @@ crates/mongreldb-query/   DataFusion 54 SQL + Arrow frontend (predicate/projecti
 crates/mongreldb-node/    NAPI addon (typed object API; built via `napi`)
 crates/mongreldb-server/  HTTP daemon (axum/tokio; SQL + native query + typed Kit API)
 crates/mongreldb-client/  typed HTTP client for the daemon (SQL/native + Kit API)
-crates/mongreldb-ffi/     C ABI over the engine core (foundation for native bindings)
+crates/mongreldb-ffi/     C ABI over the engine core (SQL, migrations, foundation for native bindings)
+crates/mongreldb-kit-ffi/ C ABI over MongrelDB Kit (schema model, migration runner, query builder)
 crates/mongreldb-perf/    cross-engine benchmark vs SQLite/DuckDB (standalone)
 crates/mongreldb-core/examples/hybrid_query.rs
                           runnable ann ∩ fm ∩ bitmap hybrid-query demo
