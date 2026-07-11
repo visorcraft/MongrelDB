@@ -10,7 +10,7 @@ use mongreldb_core::{
     Database, StoredTrigger, TriggerCell, TriggerDefinition, TriggerEvent, TriggerProgram,
     TriggerRaiseAction, TriggerStep, TriggerTarget, TriggerTiming, TriggerValue, Value,
 };
-use mongreldb_server::build_app;
+use mongreldb_server::{build_app, build_app_full};
 use tempfile::TempDir;
 
 fn col(id: u16, name: &str, ty: TypeId, flags: ColumnFlags) -> ColumnDef {
@@ -187,6 +187,36 @@ impl Server {
 
     fn client(&self) -> MongrelClient {
         MongrelClient::new(&self.base_url)
+    }
+
+    fn start_with_auth() -> Self {
+        let dir = TempDir::new().unwrap();
+        let dir_path = dir.path().to_path_buf();
+        let db = Database::create(&dir_path).unwrap();
+        db.create_table("users", mk_schema()).unwrap();
+        db.create_user("alice", "pw").unwrap();
+        let app = build_app_full(Arc::new(db), std::iter::empty(), None, None, true);
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = rt.block_on(async {
+            tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap()
+        });
+        let addr = listener.local_addr().unwrap();
+        let join = thread::spawn(move || {
+            rt.block_on(async {
+                axum::serve(listener, app).await.unwrap();
+            });
+        });
+        Server {
+            _dir: dir,
+            base_url: format!("http://{addr}"),
+            _join: join,
+        }
     }
 }
 
@@ -407,4 +437,51 @@ fn client_legacy_endpoints_still_checked() {
     // count on a missing table → typed HTTP error (404 path, plain Http).
     let err = c.count("nope").unwrap_err();
     assert!(matches!(err, ClientError::Http { .. }), "got {err:?}");
+}
+
+#[test]
+fn client_history_retention_round_trips() {
+    let srv = Server::start();
+    let c = srv.client();
+
+    let initial = c.history_retention_epochs().unwrap();
+
+    let resp = c.set_history_retention_epochs(7).unwrap();
+    assert_eq!(resp.history_retention_epochs, 7);
+    assert_eq!(c.history_retention_epochs().unwrap(), 7);
+
+    // Earliest retained epoch is stable once history has advanced; it should not
+    // move backward when retention is expanded again.
+    let earliest_after_shrink = c.earliest_retained_epoch().unwrap();
+
+    let resp = c.set_history_retention_epochs(100).unwrap();
+    assert_eq!(resp.history_retention_epochs, 100);
+    assert_eq!(c.history_retention_epochs().unwrap(), 100);
+    assert_eq!(
+        c.earliest_retained_epoch().unwrap(),
+        earliest_after_shrink,
+        "earliest retained epoch must not move backward"
+    );
+
+    // Setting it back to the initial value restores the original retention window.
+    c.set_history_retention_epochs(initial).unwrap();
+    assert_eq!(c.history_retention_epochs().unwrap(), initial);
+}
+
+#[test]
+fn client_history_retention_propagates_http_errors() {
+    let srv = Server::start_with_auth();
+    let c = srv.client();
+
+    let err = c.history_retention_epochs().unwrap_err();
+    match err {
+        ClientError::Http { status, .. } => assert_eq!(status, 401),
+        other => panic!("expected HTTP 401, got {other:?}"),
+    }
+
+    let err = c.set_history_retention_epochs(7).unwrap_err();
+    match err {
+        ClientError::Http { status, .. } => assert_eq!(status, 401),
+        other => panic!("expected HTTP 401, got {other:?}"),
+    }
 }
