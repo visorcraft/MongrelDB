@@ -393,6 +393,7 @@ async fn kit_create_table_self_services_constraints_over_http() {
             {"id": 0, "name": "id", "ty": "int64", "primary_key": true, "auto_increment": true},
             {"id": 1, "name": "email", "ty": "bytes", "nullable": true},
             {"id": 2, "name": "level", "ty": "int64", "nullable": true},
+            {"id": 3, "name": "label", "ty": "varchar", "nullable": false, "default_value": "draft"},
         ],
         "constraints": {
             "uniques": [{"id": 1, "name": "email_unique", "columns": [1]}],
@@ -420,6 +421,18 @@ async fn kit_create_table_self_services_constraints_over_http() {
     .await;
     assert_eq!(s, 200, "body: {v}");
     assert!(v["results"][0]["auto_inc"].as_i64().unwrap() >= 1);
+    let (s, v) = post(
+        app.clone(),
+        "/kit/query",
+        serde_json::json!({"table":"accounts"}),
+    )
+    .await;
+    assert_eq!(s, 200, "query body: {v}");
+    assert!(v["rows"][0]["cells"]
+        .as_array()
+        .unwrap()
+        .windows(2)
+        .any(|pair| pair == [serde_json::json!(3), serde_json::json!("draft")]));
 
     // Duplicate email → UNIQUE_VIOLATION (constraint enforced end-to-end).
     let (s, v) = post(

@@ -479,33 +479,64 @@ pub struct KitColumnDef {
     pub encrypted_indexable: bool,
     #[serde(default)]
     pub enum_variants: Option<Vec<String>>,
-    // Accept legacy `default_value` key alongside `default_expr` so clients
-    // built against the engine field name (e.g. generic schema migrations,
-    // cross-language code generators) still work. Either key populates the
-    // same `kit_default_expr` string discriminator.
-    #[serde(default, alias = "default_value")]
+    // `default_expr` accepts the dynamic `now` / `uuid` discriminators.
+    #[serde(default)]
     pub default_expr: Option<String>,
+    // `default_value` accepts a static JSON scalar and keeps the legacy
+    // `"now"` / `"uuid"` string forms working as dynamic defaults.
+    #[serde(default)]
+    pub default_value: Option<Jval>,
 }
 
-/// Convert a KitColumnDef's default_expr field into an engine DefaultExpr.
+/// Convert a KitColumnDef's default fields into an engine DefaultExpr.
 #[allow(clippy::result_large_err)]
 fn kit_default_expr(
     c: &KitColumnDef,
-    _ty: &TypeId,
+    ty: &TypeId,
 ) -> std::result::Result<Option<DefaultExpr>, axum::response::Response> {
-    match c.default_expr.as_deref() {
-        Some("now") => Ok(Some(DefaultExpr::Now)),
-        Some("uuid") => Ok(Some(DefaultExpr::Uuid)),
-        Some(other) => Err((
-            StatusCode::BAD_REQUEST,
-            Json(KitErrorEnvelope {
-                status: "aborted".into(),
-                error: KitError::new("BAD_REQUEST", format!("unknown default_expr \"{other}\"")),
-            }),
-        )
-            .into_response()),
-        None => Ok(None),
+    if let Some(expr) = c.default_expr.as_deref() {
+        return match expr {
+            "now" => Ok(Some(DefaultExpr::Now)),
+            "uuid" => Ok(Some(DefaultExpr::Uuid)),
+            other => Err((
+                StatusCode::BAD_REQUEST,
+                Json(KitErrorEnvelope {
+                    status: "aborted".into(),
+                    error: KitError::new(
+                        "BAD_REQUEST",
+                        format!("unknown default_expr \"{other}\""),
+                    ),
+                }),
+            )
+                .into_response()),
+        };
     }
+    let Some(value) = &c.default_value else {
+        return Ok(None);
+    };
+    if let Some(expr) = value.as_str() {
+        match expr {
+            "now" => return Ok(Some(DefaultExpr::Now)),
+            "uuid" => return Ok(Some(DefaultExpr::Uuid)),
+            _ => {}
+        }
+    }
+    if let (Jval::String(value), TypeId::Enum { variants }) = (value, ty) {
+        if !variants.iter().any(|variant| variant == value) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(KitErrorEnvelope {
+                    status: "aborted".into(),
+                    error: KitError::new(
+                        "BAD_REQUEST",
+                        format!("default enum value \"{value}\" is not declared"),
+                    ),
+                }),
+            )
+                .into_response());
+        }
+    }
+    Ok(Some(DefaultExpr::Static(json_to_value(value, ty))))
 }
 
 pub async fn kit_create_table(
