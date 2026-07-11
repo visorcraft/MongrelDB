@@ -242,12 +242,12 @@ MongrelDB supports **34 languages** across two integration tiers:
 
 | Language | Tier | Repository | Install |
 |---|---|---|---|
-| **Rust** | 1 (direct) | [MongrelDB](https://github.com/visorcraft/MongrelDB) | `cargo add mongreldb-core` |
-| **TypeScript** | 1 (NAPI) | [MongrelDB Kit](https://github.com/visorcraft/MongrelDB-Kit) | `npm install @visorcraft/mongreldb-kit` |
-| **Python** | 1 (PyO3) | [MongrelDB Kit](https://github.com/visorcraft/MongrelDB-Kit) | `pip install mongreldb-kit` |
-| **C** | 1 (Native)<br>2 (HTTP) | [MongrelDB-C](https://github.com/visorcraft/MongrelDB-C) | CMake (links libcurl) or prebuilt `libmongreldb` |
-| **C#/.NET** | 1 (Native)<br>2 (HTTP) | [MongrelDB-DotNet](https://github.com/visorcraft/MongrelDB-DotNet) | `dotnet add package Visorcraft.MongrelDB` or `Visorcraft.MongrelDB.Native` |
-| **C++** | 1 (Native)<br>2 (HTTP) | [MongrelDB-CPP](https://github.com/visorcraft/MongrelDB-CPP) | CMake (header-only, links libcurl) or prebuilt `libmongreldb` |
+| **Rust** | 1&nbsp;(Direct) | [MongrelDB](https://github.com/visorcraft/MongrelDB) | `cargo add mongreldb-core` |
+| **TypeScript** | 1&nbsp;(NAPI) | [MongrelDB Kit](https://github.com/visorcraft/MongrelDB-Kit) | `npm install @visorcraft/mongreldb-kit` |
+| **Python** | 1&nbsp;(PyO3) | [MongrelDB Kit](https://github.com/visorcraft/MongrelDB-Kit) | `pip install mongreldb-kit` |
+| **C** | 1&nbsp;(Native)<br>2&nbsp;(HTTP) | [MongrelDB-C](https://github.com/visorcraft/MongrelDB-C) | CMake (links libcurl) or prebuilt `libmongreldb` |
+| **C#/.NET** | 1&nbsp;(Native)<br>2&nbsp;(HTTP) | [MongrelDB-DotNet](https://github.com/visorcraft/MongrelDB-DotNet) | `dotnet add package Visorcraft.MongrelDB` or `Visorcraft.MongrelDB.Native` |
+| **C++** | 1&nbsp;(Native)<br>2&nbsp;(HTTP) | [MongrelDB-CPP](https://github.com/visorcraft/MongrelDB-CPP) | CMake (header-only, links libcurl) or prebuilt `libmongreldb` |
 | **Clojure** | 2 (HTTP) | [MongrelDB-Clojure](https://github.com/visorcraft/MongrelDB-Clojure) | deps.edn / Leiningen |
 | **Crystal** | 2 (HTTP) | [MongrelDB-Crystal](https://github.com/visorcraft/MongrelDB-Crystal) | `shards add mongreldb` |
 | **D** | 2 (HTTP) | [MongrelDB-D](https://github.com/visorcraft/MongrelDB-D) | `dub add mongreldb` |
@@ -258,9 +258,9 @@ MongrelDB supports **34 languages** across two integration tiers:
 | **Fortran** | 2 (HTTP) | [MongrelDB-Fortran](https://github.com/visorcraft/MongrelDB-Fortran) | fpm |
 | **Gleam** | 2 (HTTP) | [MongrelDB-Gleam](https://github.com/visorcraft/MongrelDB-Gleam) | `gleam add mongreldb` |
 | **Go** | 2 (HTTP) | [MongrelDB-Go](https://github.com/visorcraft/MongrelDB-Go) | `go get github.com/visorcraft/mongreldb-go` |
-| **Java** | 1 (Native)<br>2 (HTTP) | [MongrelDB-Java](https://github.com/visorcraft/MongrelDB-Java) | Maven/Gradle + `libmongreldb_jni` |
+| **Java** | 1&nbsp;(Native)<br>2&nbsp;(HTTP) | [MongrelDB-Java](https://github.com/visorcraft/MongrelDB-Java) | Maven/Gradle + `libmongreldb_jni` |
 | **Julia** | 2 (HTTP) | [MongrelDB-Julia](https://github.com/visorcraft/MongrelDB-Julia) | `] add MongrelDB` |
-| **Kotlin** | 1 (Native)<br>2 (HTTP) | [MongrelDB-Kotlin](https://github.com/visorcraft/MongrelDB-Kotlin) | Gradle + `libmongreldb_jni` |
+| **Kotlin** | 1&nbsp;(Native)<br>2&nbsp;(HTTP) | [MongrelDB-Kotlin](https://github.com/visorcraft/MongrelDB-Kotlin) | Gradle + `libmongreldb_jni` |
 | **Lua** | 2 (HTTP) | [MongrelDB-Lua](https://github.com/visorcraft/MongrelDB-Lua) | `luarocks install mongreldb` |
 | **Mojo** | 2 (HTTP) | [MongrelDB-Mojo](https://github.com/visorcraft/MongrelDB-Mojo) | `magic add mongreldb` |
 | **Nim** | 2 (HTTP) | [MongrelDB-Nim](https://github.com/visorcraft/MongrelDB-Nim) | `nimble install mongreldb` |
@@ -271,7 +271,7 @@ MongrelDB supports **34 languages** across two integration tiers:
 | **PowerShell** | 2 (HTTP) | [MongrelDB-Powershell](https://github.com/visorcraft/MongrelDB-Powershell) | `Import-Module mongreldb` |
 | **R** | 2 (HTTP) | [MongrelDB-R](https://github.com/visorcraft/MongrelDB-R) | `install.packages("mongreldb")` |
 | **Ruby** | 2 (HTTP) | [MongrelDB-Ruby](https://github.com/visorcraft/MongrelDB-Ruby) | `gem install mongreldb` |
-| **Scala** | 1 (Native)<br>2 (HTTP) | [MongrelDB-Scala](https://github.com/visorcraft/MongrelDB-Scala) | sbt + `libmongreldb_jni` |
+| **Scala** | 1&nbsp;(Native)<br>2&nbsp;(HTTP) | [MongrelDB-Scala](https://github.com/visorcraft/MongrelDB-Scala) | sbt + `libmongreldb_jni` |
 | **Swift** | 2 (HTTP) | [MongrelDB-Swift](https://github.com/visorcraft/MongrelDB-Swift) | Swift Package Manager |
 | **Tcl** | 2 (HTTP) | [MongrelDB-Tcl](https://github.com/visorcraft/MongrelDB-Tcl) | `package require mongreldb` |
 | **V** | 2 (HTTP) | [MongrelDB-V](https://github.com/visorcraft/MongrelDB-V) | `v install` |
