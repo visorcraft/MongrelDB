@@ -95,3 +95,20 @@ jobs:
           workspaces: crates/mongreldb-kit-ffi
       - run: cargo build --release
       - run: cargo test --release
+
+  # JNI shim crate (standalone - own workspace). Builds as a cdylib loaded
+  # by the JVM. Compile-check only (no JVM round-trip in CI yet).
+  jni:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/mongreldb-jni
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: crates/mongreldb-jni
+      - run: cargo build --release

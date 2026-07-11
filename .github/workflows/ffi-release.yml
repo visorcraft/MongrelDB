@@ -254,3 +254,142 @@ jobs:
       - uses: softprops/action-gh-release@v3
         with:
           files: dist/mongreldb-headers.tar.gz
+
+  # Build the JNI shim (libmongreldb_jni) for the JVM clients (Java, Kotlin,
+  # Scala). Produces a fat JAR with all platform natives bundled, plus
+  # per-platform JARs.
+  build-jni:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            os: linux
+            arch: x64
+            apt: ''
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            os: linux
+            arch: x64-musl
+            apt: musl-tools
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            os: linux
+            arch: arm64
+            apt: gcc-aarch64-linux-gnu
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            os: darwin
+            arch: arm64
+            apt: ''
+          - runner: macos-13
+            target: x86_64-apple-darwin
+            os: darwin
+            arch: x64
+            apt: ''
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            os: windows
+            arch: x64
+            apt: ''
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: crates/mongreldb-jni
+
+      - if: matrix.apt != ''
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt }}
+
+      - name: Build JNI library
+        working-directory: crates/mongreldb-jni
+        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CC_x86_64_unknown_linux_musl: musl-gcc
+
+      - name: Stage native library (Unix)
+        if: matrix.os != 'windows'
+        run: |
+          mkdir -p staging/native/${{ matrix.os }}/${{ matrix.arch }}
+          ext="so"
+          if [ "${{ matrix.os }}" = "darwin" ]; then ext="dylib"; fi
+          cp crates/mongreldb-jni/target/${{ matrix.target }}/release/libmongreldb_jni.$ext \
+             staging/native/${{ matrix.os }}/${{ matrix.arch }}/
+
+      - name: Stage native library (Windows)
+        if: matrix.os == 'windows'
+        shell: bash
+        run: |
+          mkdir -p staging/native/windows/${{ matrix.arch }}
+          cp crates/mongreldb-jni/target/${{ matrix.target }}/release/mongreldb_jni.dll \
+             staging/native/windows/${{ matrix.arch }}/
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 11
+
+      - name: Build per-platform JAR
+        working-directory: crates/mongreldb-jni/java
+        run: |
+          # Copy staged native lib into the JAR resources path.
+          mkdir -p src/main/resources/native/${{ matrix.os }}/${{ matrix.arch }}
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            cp ../../../../staging/native/windows/${{ matrix.arch }}/* src/main/resources/native/windows/${{ matrix.arch }}/
+          else
+            cp ../../../../staging/native/${{ matrix.os }}/${{ matrix.arch }}/* src/main/resources/native/${{ matrix.os }}/${{ matrix.arch }}/
+          fi
+          mvn -B -ntp package
+          # Rename to include platform in the filename.
+          cp target/mongreldb-jni-0.48.0.jar ../../../../dist/mongreldb-jni-0.48.0-${{ matrix.os }}-${{ matrix.arch }}.jar
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: jni-${{ matrix.os }}-${{ matrix.arch }}
+          path: staging/native/**
+          if-no-files-found: error
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: dist/mongreldb-jni-*.jar
+
+  # Assemble the fat JAR (all platforms) from the per-platform artifacts.
+  build-jni-fat:
+    needs: [build-jni]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 11
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: jni-*
+          path: staging
+          merge-multiple: true
+
+      - name: Build fat JAR
+        working-directory: crates/mongreldb-jni/java
+        run: |
+          mkdir -p src/main/resources/native
+          cp -r ../../../../staging/native/* src/main/resources/native/
+          mvn -B -ntp package
+          mkdir -p ../../../../dist
+          cp target/mongreldb-jni-0.48.0.jar ../../../../dist/mongreldb-jni-0.48.0.jar
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: dist/mongreldb-jni-0.48.0.jar

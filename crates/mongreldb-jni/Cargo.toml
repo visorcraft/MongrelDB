@@ -1,0 +1,28 @@
+[package]
+name = "mongreldb-jni"
+version = "0.48.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+description = "JNI shim for MongrelDB - in-process embedded engine for Java, Kotlin, and Scala"
+repository = "https://github.com/visorcraft/MongrelDB"
+keywords = ["mongreldb", "database", "jni", "java", "bindings"]
+categories = ["database", "external-ffi-bindings"]
+
+[lib]
+# Lib name `mongreldb_jni` produces libmongreldb_jni.so / .dylib /
+# mongreldb_jni.dll, loaded by the JVM via System.load().
+name = "mongreldb_jni"
+crate-type = ["cdylib"]
+
+[dependencies]
+# The Kit crate wraps the engine with schema model, migrations, and query
+# builder execution. Resolved from crates.io (same as mongreldb-kit-ffi).
+mongreldb-kit = "0.48"
+mongreldb-kit-core = "0.48"
+# The jni crate provides Rust bindings to the JNI API.
+jni = { version = "0.21", features = ["invocation"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+
+# Standalone crate - not a workspace member.
+[workspace]
