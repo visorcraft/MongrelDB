@@ -291,7 +291,10 @@ fn from_column_def(column: &ColumnDef) -> ColumnSpec {
         primary_key: column.flags.contains(ColumnFlags::PRIMARY_KEY),
         nullable: column.flags.contains(ColumnFlags::NULLABLE),
         embedding_dim,
-        default_value: None,
+        default_value: match &column.default_value {
+            Some(DefaultExpr::Static(v)) => Some(from_value(v, column.id)),
+            _ => None,
+        },
         default_expr: match column.default_value {
             Some(DefaultExpr::Now) => Some("now".into()),
             Some(DefaultExpr::Uuid) => Some("uuid".into()),
