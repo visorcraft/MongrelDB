@@ -399,9 +399,9 @@ async fn post_json(
 
 #[tokio::test]
 async fn history_retention_get_returns_exact_shape() {
-    std::env::remove_var("MONGRELDB_HISTORY_RETENTION_EPOCHS");
     let dir = tempdir().unwrap();
     let db = Arc::new(Database::create(dir.path()).unwrap());
+    db.set_history_retention_epochs(1024).unwrap();
     let app = build_app(db);
     let (status, body) = get_json(app, "/history/retention").await;
     assert_eq!(status, 200);
@@ -440,6 +440,7 @@ async fn history_retention_put_rejects_non_u64() {
         serde_json::json!(-1),
         serde_json::json!(1.5),
         serde_json::json!("7"),
+        serde_json::json!(1e20),
     ] {
         let (status, _) = put_json(
             app.clone(),

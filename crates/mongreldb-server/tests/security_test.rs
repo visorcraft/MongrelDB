@@ -261,6 +261,7 @@ async fn admin_principal_allows_history_retention() {
     assert_eq!(response.status(), StatusCode::OK);
     let body: JsonValue =
         serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
+    assert_eq!(body.as_object().unwrap().len(), 2);
     assert!(body["history_retention_epochs"].is_u64());
     assert!(body["earliest_retained_epoch"].is_u64());
 
@@ -281,6 +282,7 @@ async fn admin_principal_allows_history_retention() {
     assert_eq!(response.status(), StatusCode::OK);
     let body: JsonValue =
         serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
+    assert_eq!(body.as_object().unwrap().len(), 2);
     assert_eq!(body["history_retention_epochs"], 7);
     assert!(body["earliest_retained_epoch"].is_u64());
 }
