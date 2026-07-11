@@ -6583,7 +6583,7 @@ fn pragma_table_list(
         strict.push(0_i64);
     }
 
-    for (view, _) in session.views.lock().iter() {
+    for view in session.views.lock().keys() {
         if filter
             .as_deref()
             .is_some_and(|needle| view.to_ascii_lowercase() != needle)
