@@ -329,6 +329,41 @@ int32_t mongreldb_database_sql_refresh(mongreldb_database_t *db);
  * NULL or a zero-length buffer. */
 void mongreldb_free_sql_result(uint8_t *ptr, size_t len);
 
+/* ── Migration planning ─────────────────────────────────────────────────── */
+/*
+ * Migration *planning* and *checksum* logic is centralized in the FFI so every
+ * language binding produces identical results. The *execution* (applying each
+ * MigrationOp to a live database) is done by the host language using the
+ * existing FFI functions (mongreldb_create_table, mongreldb_database_sql, etc.).
+ *
+ * All functions use JSON for the complex Migration/MigrationOp types:
+ *   Migration: {"version":1,"name":"initial","ops":[...]}
+ *   MigrationOp variants: see docs/migrations.md for the full list.
+ */
+
+/* Plan pending migrations. Takes applied_json (migrations already in the db)
+ * and desired_json (the full app-defined ordered set), returns a JSON array
+ * of pending migrations (version > max applied), sorted by version. The
+ * result is written to *out_json (NUL-terminated UTF-8, caller frees with
+ * mongreldb_free_migrate_string). Returns MDB_OK on success. */
+int32_t mongreldb_plan_migrations_json(
+    const char *applied_json,
+    const char *desired_json,
+    const char **out_json);
+
+/* Compute the canonical SHA-256 checksum for a single migration (identical
+ * across all language bindings). Takes version, name, and ops_json (a JSON
+ * array of MigrationOp). Result is a 64-char hex string written to
+ * *out_checksum (caller frees with mongreldb_free_migrate_string). */
+int32_t mongreldb_migration_checksum_json(
+    int64_t version,
+    const char *name,
+    const char *ops_json,
+    const char **out_checksum);
+
+/* Free a string returned by the migration functions above. */
+void mongreldb_free_migrate_string(char *ptr);
+
 /* ── Schema builder ─────────────────────────────────────────────────────── */
 
 mongreldb_schema_builder_t *mongreldb_schema_begin(void);

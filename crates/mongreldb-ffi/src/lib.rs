@@ -47,6 +47,7 @@ pub mod auth;
 pub mod cstr;
 pub mod database;
 pub mod error;
+pub mod migrate;
 pub mod query;
 pub mod schema;
 pub mod sql;
@@ -75,6 +76,12 @@ pub use database::{
 
 // SQL execution (DataFusion via MongrelSession; returns Arrow IPC file bytes).
 pub use sql::{mongreldb_database_sql, mongreldb_database_sql_refresh, mongreldb_free_sql_result};
+
+// Migration planning and checksums (JSON in/out, language-neutral).
+pub use migrate::{
+    mongreldb_free_migrate_string, mongreldb_migration_checksum_json,
+    mongreldb_plan_migrations_json,
+};
 
 // `mongreldb_database_table` lives in the `table` module (it returns a table
 // handle); re-export it alongside the other table FFI functions below.

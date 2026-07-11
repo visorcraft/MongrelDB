@@ -204,6 +204,38 @@ int main(void) {
     mongreldb_free_sql_result(sql_buf, sql_len);
     printf("15. SQL error handled correctly\n");
 
+    /* ── Migration planning ─────────────────────────────────────────── */
+
+    /* Compute checksum for a single create_table migration. */
+    const char *ops_json = "[{\"create_table\":{\"name\":\"users\"}}]";
+    const char *checksum = NULL;
+    CHECK(mongreldb_migration_checksum_json(1, "initial", ops_json, &checksum));
+    assert(checksum != NULL);
+    assert(strlen(checksum) == 64); /* SHA-256 hex */
+    mongreldb_free_migrate_string((char *)checksum);
+    printf("16. migration checksum computed\n");
+
+    /* Plan: no applied → all desired are pending. */
+    const char *applied = "[]";
+    const char *desired =
+        "[{\"version\":1,\"name\":\"initial\",\"ops\":[{\"create_table\":{\"name\":\"users\"}}]},"
+        "{\"version\":2,\"name\":\"add_idx\",\"ops\":[{\"add_index\":{\"table\":\"users\",\"index\":\"idx\"}}]}]";
+    const char *plan_json = NULL;
+    CHECK(mongreldb_plan_migrations_json(applied, desired, &plan_json));
+    assert(plan_json != NULL);
+    assert(strstr(plan_json, "\"version\":1") != NULL);
+    assert(strstr(plan_json, "\"version\":2") != NULL);
+    mongreldb_free_migrate_string((char *)plan_json);
+    printf("17. migration plan: both pending\n");
+
+    /* Plan: version 1 applied → only version 2 pending. */
+    applied = "[{\"version\":1,\"name\":\"initial\",\"ops\":[]}]";
+    CHECK(mongreldb_plan_migrations_json(applied, desired, &plan_json));
+    assert(strstr(plan_json, "\"version\":1") == NULL);
+    assert(strstr(plan_json, "\"version\":2") != NULL);
+    mongreldb_free_migrate_string((char *)plan_json);
+    printf("18. migration plan: only v2 pending\n");
+
     /* ── Cleanup ─────────────────────────────────────────────────────── */
     mongreldb_database_free(db);
     printf("\nAll C smoke tests passed!\n");

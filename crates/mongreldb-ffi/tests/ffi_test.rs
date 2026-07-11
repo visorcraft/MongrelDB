@@ -424,3 +424,96 @@ fn ffi_sql_error_handling() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ── Migration planning tests ───────────────────────────────────────────────
+
+#[test]
+fn ffi_migration_checksum() {
+    unsafe {
+        // Compute the checksum for a single create_table migration.
+        let ops = r#"[{"create_table":{"name":"users"}}]"#;
+        let mut out: *const std::os::raw::c_char = std::ptr::null();
+        let ret = mongreldb_migration_checksum_json(
+            1,
+            cstr("initial"),
+            cstr(ops),
+            &mut out,
+        );
+        assert_eq!(ret, 0, "checksum failed: {}", rust_str(mongreldb_last_error()));
+        let checksum = rust_str(out);
+        mongreldb_free_migrate_string(out as *mut _);
+
+        // SHA-256 hex = 64 chars.
+        assert_eq!(checksum.len(), 64, "checksum should be 64 hex chars");
+        assert!(
+            checksum.chars().all(|c| c.is_ascii_hexdigit()),
+            "checksum should be hex: {}",
+            checksum
+        );
+    }
+}
+
+#[test]
+fn ffi_migration_plan() {
+    unsafe {
+        // No applied migrations → all desired are pending.
+        let applied = "[]";
+        let desired = r#"[
+            {"version":1,"name":"initial","ops":[{"create_table":{"name":"users"}}]},
+            {"version":2,"name":"add_index","ops":[{"add_index":{"table":"users","index":"idx_email"}}]}
+        ]"#;
+
+        let mut out: *const std::os::raw::c_char = std::ptr::null();
+        let ret = mongreldb_plan_migrations_json(
+            cstr(applied),
+            cstr(desired),
+            &mut out,
+        );
+        assert_eq!(ret, 0, "plan failed: {}", rust_str(mongreldb_last_error()));
+        let result = rust_str(out);
+        mongreldb_free_migrate_string(out as *mut _);
+
+        // Both migrations should be pending (no applied).
+        assert!(result.contains("\"version\":1"), "result should contain version 1: {}", result);
+        assert!(result.contains("\"version\":2"), "result should contain version 2: {}", result);
+
+        // Now with version 1 applied, only version 2 should be pending.
+        let applied1 = r#"[{"version":1,"name":"initial","ops":[]}]"#;
+        let ret = mongreldb_plan_migrations_json(
+            cstr(applied1),
+            cstr(desired),
+            &mut out,
+        );
+        assert_eq!(ret, 0);
+        let result2 = rust_str(out);
+        mongreldb_free_migrate_string(out as *mut _);
+
+        assert!(
+            !result2.contains("\"version\":1"),
+            "version 1 should not be pending: {}",
+            result2
+        );
+        assert!(
+            result2.contains("\"version\":2"),
+            "version 2 should be pending: {}",
+            result2
+        );
+    }
+}
+
+#[test]
+fn ffi_migration_invalid_json() {
+    unsafe {
+        let mut out: *const std::os::raw::c_char = std::ptr::null();
+        let ret = mongreldb_plan_migrations_json(
+            cstr("not json"),
+            cstr("[]"),
+            &mut out,
+        );
+        assert!(ret < 0, "invalid JSON should return error, got {}", ret);
+        assert!(
+            !rust_str(mongreldb_last_error()).is_empty(),
+            "error message should be set"
+        );
+    }
+}
