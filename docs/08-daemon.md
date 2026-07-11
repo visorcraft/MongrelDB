@@ -311,6 +311,11 @@ curl -X POST http://127.0.0.1:8453/sql \
 
 The daemon serves a typed Kit API with authoritative constraint enforcement:
 
+> **Compatibility note:** `default_value` is interpreted as a literal JSON
+> scalar. The legacy behavior of treating `default_value: "now"` or
+> `default_value: "uuid"` as dynamic defaults has been removed. Use
+> `default_expr: "now"` or `default_expr: "uuid"` for dynamic defaults.
+
 ```sh
 # Get the full schema catalog
 curl http://127.0.0.1:8453/kit/schema
