@@ -271,7 +271,9 @@ async fn admin_principal_allows_history_retention() {
                 .uri("/history/retention")
                 .header("authorization", admin_basic)
                 .header("content-type", "application/json")
-                .body(Body::from(json!({"history_retention_epochs": 7}).to_string()))
+                .body(Body::from(
+                    json!({"history_retention_epochs": 7}).to_string(),
+                ))
                 .unwrap(),
         )
         .await

@@ -151,26 +151,6 @@ async fn get(app: axum::Router, uri: &str) -> (u16, serde_json::Value) {
     (status, v)
 }
 
-async fn put(app: axum::Router, uri: &str, body: serde_json::Value) -> (u16, serde_json::Value) {
-    let resp = app
-        .oneshot(
-            axum::http::Request::builder()
-                .method("PUT")
-                .uri(uri)
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(body.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = resp.status().as_u16();
-    let bytes = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024)
-        .await
-        .unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
-    (status, v)
-}
-
 async fn setup_shared() -> (tempfile::TempDir, Arc<Database>, axum::Router) {
     let dir = tempdir().unwrap();
     let db = Arc::new(Database::create(dir.path()).unwrap());
@@ -223,46 +203,6 @@ async fn schema_endpoint_returns_constraints() {
     assert_eq!(v["constraints"]["uniques"][0]["name"], "email_unique");
     assert_eq!(v["constraints"]["checks"][0]["name"], "age_nonneg");
     assert_eq!(v["columns"][0]["auto_increment"], true);
-}
-
-#[tokio::test]
-async fn history_retention_endpoint_round_trips_and_reopens() {
-    let dir = tempdir().unwrap();
-    let db = Arc::new(Database::create(dir.path()).unwrap());
-    let app = build_app(Arc::clone(&db));
-    let (status, body) = get(app.clone(), "/history/retention").await;
-    assert_eq!(status, 200);
-    assert_eq!(body["history_retention_epochs"], 1024);
-    assert_eq!(body["earliest_retained_epoch"], 0);
-
-    let (status, body) = put(
-        app,
-        "/history/retention",
-        serde_json::json!({"history_retention_epochs": 7}),
-    )
-    .await;
-    assert_eq!(status, 200);
-    assert_eq!(body["history_retention_epochs"], 7);
-    assert_eq!(body["earliest_retained_epoch"], 0);
-
-    drop(db);
-    let reopened = Arc::new(Database::open(dir.path()).unwrap());
-    assert_eq!(reopened.history_retention_epochs(), 7);
-}
-
-#[tokio::test]
-async fn history_retention_endpoint_rejects_non_u64() {
-    let dir = tempdir().unwrap();
-    let app = build_app(Arc::new(Database::create(dir.path()).unwrap()));
-    for value in [serde_json::json!(-1), serde_json::json!(1.5), serde_json::json!("7")] {
-        let (status, _) = put(
-            app.clone(),
-            "/history/retention",
-            serde_json::json!({"history_retention_epochs": value}),
-        )
-        .await;
-        assert_eq!(status, 400);
-    }
 }
 
 #[tokio::test]

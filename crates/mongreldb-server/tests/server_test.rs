@@ -399,11 +399,13 @@ async fn post_json(
 
 #[tokio::test]
 async fn history_retention_get_returns_exact_shape() {
+    std::env::remove_var("MONGRELDB_HISTORY_RETENTION_EPOCHS");
     let dir = tempdir().unwrap();
     let db = Arc::new(Database::create(dir.path()).unwrap());
     let app = build_app(db);
     let (status, body) = get_json(app, "/history/retention").await;
     assert_eq!(status, 200);
+    assert_eq!(body.as_object().unwrap().len(), 2);
     assert_eq!(body["history_retention_epochs"], 1024);
     assert_eq!(body["earliest_retained_epoch"], 0);
 }
@@ -420,6 +422,7 @@ async fn history_retention_put_returns_exact_shape_and_persists() {
     )
     .await;
     assert_eq!(status, 200);
+    assert_eq!(body.as_object().unwrap().len(), 2);
     assert_eq!(body["history_retention_epochs"], 7);
     assert_eq!(body["earliest_retained_epoch"], 0);
     assert_eq!(db.history_retention_epochs(), 7);
@@ -500,17 +503,14 @@ async fn history_retention_cannot_restore_lost_history() {
         )
         .await;
         assert_eq!(status, 200);
-        let (status, _) = post_json(
-            app.clone(),
-            "/tables/items/commit",
-            serde_json::json!({}),
-        )
-        .await;
+        let (status, _) =
+            post_json(app.clone(), "/tables/items/commit", serde_json::json!({})).await;
         assert_eq!(status, 200);
     }
 
     let (status, before) = get_json(app.clone(), "/history/retention").await;
     assert_eq!(status, 200);
+    assert_eq!(before.as_object().unwrap().len(), 2);
     let earliest_before = before["earliest_retained_epoch"].as_u64().unwrap();
     assert!(earliest_before > 0, "history should have been pruned");
 
@@ -522,6 +522,7 @@ async fn history_retention_cannot_restore_lost_history() {
     )
     .await;
     assert_eq!(status, 200);
+    assert_eq!(after.as_object().unwrap().len(), 2);
     assert_eq!(
         after["earliest_retained_epoch"].as_u64().unwrap(),
         earliest_before,
