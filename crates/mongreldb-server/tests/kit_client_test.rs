@@ -446,14 +446,28 @@ fn client_history_retention_round_trips() {
 
     let initial = c.history_retention_epochs().unwrap();
 
-    let resp = c.set_history_retention_epochs(7).unwrap();
-    assert_eq!(resp.history_retention_epochs, 7);
-    assert_eq!(c.history_retention_epochs().unwrap(), 7);
+    // Advance visible epochs by writing data.
+    for _ in 0..4 {
+        c.put(
+            "users",
+            vec![
+                (0, Value::Null),
+                (1, Value::Bytes(b"a@x".to_vec())),
+                (2, Value::Int64(30)),
+            ],
+        )
+        .unwrap();
+        c.commit("users").unwrap();
+    }
 
-    // Earliest retained epoch is stable once history has advanced; it should not
-    // move backward when retention is expanded again.
+    // Shrink the retention window so some history is pruned.
+    let resp = c.set_history_retention_epochs(2).unwrap();
+    assert_eq!(resp.history_retention_epochs, 2);
+    assert_eq!(c.history_retention_epochs().unwrap(), 2);
     let earliest_after_shrink = c.earliest_retained_epoch().unwrap();
+    assert!(earliest_after_shrink > 0, "history should have been pruned");
 
+    // Expanding the window cannot restore already-pruned epochs.
     let resp = c.set_history_retention_epochs(100).unwrap();
     assert_eq!(resp.history_retention_epochs, 100);
     assert_eq!(c.history_retention_epochs().unwrap(), 100);
