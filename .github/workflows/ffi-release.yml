@@ -1,0 +1,162 @@
+# Builds prebuilt native libraries (libmongreldb) for the C ABI and attaches
+# them to the GitHub release. These archives are the foundation for all
+# Tier-1 native language bindings: each language client fetches the archive
+# for its platform, links libmongreldb, and includes mongreldb.h.
+#
+# The mongreldb-ffi crate is `publish = false` (it is a cdylib/staticlib
+# artifact, not a consumable Rust crate), so it is never sent to crates.io.
+# Instead, each release produces per-platform archives containing:
+#   lib/   - libmongreldb.{so,dylib,dll} + libmongreldb.{a,lib}
+#   include/mongreldb.h
+#
+# Triggered on the same `v*` tag push as release.yml. Runs in parallel with
+# the other release jobs (it does not depend on crates.io or npm publishing).
+#
+# Platform matrix (6 targets, all built natively - no QEMU):
+#   linux-x64-gnu      ubuntu-latest     x86_64-unknown-linux-gnu
+#   linux-x64-musl     ubuntu-latest     x86_64-unknown-linux-musl
+#   linux-arm64-gnu    ubuntu-24.04-arm  aarch64-unknown-linux-gnu
+#   darwin-arm64       macos-14          aarch64-apple-darwin
+#   darwin-x64         macos-13          x86_64-apple-darwin
+#   windows-x64        windows-latest    x86_64-pc-windows-msvc
+name: FFI Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: mongreldb-native-linux-x64-gnu.tar.gz
+            apt: ''
+            linker: ''
+            ar: ''
+            zip: false
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            archive: mongreldb-native-linux-x64-musl.tar.gz
+            apt: musl-tools
+            linker: ''
+            ar: ''
+            zip: false
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: mongreldb-native-linux-arm64-gnu.tar.gz
+            apt: gcc-aarch64-linux-gnu
+            linker: ''
+            ar: ''
+            zip: false
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            archive: mongreldb-native-darwin-arm64.tar.gz
+            apt: ''
+            linker: ''
+            ar: ''
+            zip: false
+          - runner: macos-13
+            target: x86_64-apple-darwin
+            archive: mongreldb-native-darwin-x64.tar.gz
+            apt: ''
+            linker: ''
+            ar: ''
+            zip: false
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: mongreldb-native-windows-x64.zip
+            apt: ''
+            linker: ''
+            ar: ''
+            zip: true
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        working-directory: crates/mongreldb-ffi
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: crates/mongreldb-ffi
+
+      - if: matrix.apt != ''
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt }}
+
+      # Build the cdylib + staticlib. The crate has crate-type =
+      # ["cdylib", "staticlib", "rlib"], so this produces all three. We build
+      # for the matrix target; cross-compilation uses the apt-installed
+      # toolchains (musl-gcc for musl, aarch64-linux-gnu-gcc for arm64).
+      - run: cargo build --release --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
+          CC_aarch64_unknown_linux_gnu: ${{ matrix.linker }}
+          AR_aarch64_unknown_linux_gnu: ${{ matrix.ar }}
+
+      - name: Package (Linux/macOS)
+        if: matrix.zip == false
+        working-directory: .
+        run: |
+          mkdir -p dist/mongreldb-native/lib dist/mongreldb-native/include
+          # Copy the shared and static libs, stripping the target dir prefix.
+          cp crates/mongreldb-ffi/target/${{ matrix.target }}/release/libmongreldb.so \
+             crates/mongreldb-ffi/target/${{ matrix.target }}/release/libmongreldb.a \
+             dist/mongreldb-native/lib/ 2>/dev/null || true
+          cp crates/mongreldb-ffi/target/${{ matrix.target }}/release/libmongreldb.dylib \
+             crates/mongreldb-ffi/target/${{ matrix.target }}/release/libmongreldb.a \
+             dist/mongreldb-native/lib/ 2>/dev/null || true
+          cp crates/mongreldb-ffi/include/mongreldb.h dist/mongreldb-native/include/
+          # Also copy the staticlib under a .lib alias for MSVC consumers who
+          # grab the cross-compiled archive (harmless on non-Windows).
+          tar -czf dist/${{ matrix.archive }} -C dist mongreldb-native
+
+      - name: Package (Windows)
+        if: matrix.zip == true
+        working-directory: .
+        shell: bash
+        run: |
+          mkdir -p dist/mongreldb-native/lib dist/mongreldb-native/include
+          cp crates/mongreldb-ffi/target/${{ matrix.target }}/release/mongreldb.dll \
+             crates/mongreldb-ffi/target/${{ matrix.target }}/release/mongreldb.dll.lib \
+             dist/mongreldb-native/lib/ 2>/dev/null || true
+          cp crates/mongreldb-ffi/target/${{ matrix.target }}/release/mongreldb.dll.lib \
+             dist/mongreldb-native/lib/mongreldb.lib 2>/dev/null || true
+          cp crates/mongreldb-ffi/target/${{ matrix.target }}/release/libmongreldb.a \
+             dist/mongreldb-native/lib/ 2>/dev/null || true
+          cp crates/mongreldb-ffi/include/mongreldb.h dist/mongreldb-native/include/
+          (cd dist && 7z a ${{ matrix.archive }} mongreldb-native)
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: dist/${{ matrix.archive }}
+
+  # Also publish a standalone headers archive so downstream build systems can
+  # fetch just mongreldb.h without downloading any platform archive.
+  release-headers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - run: |
+          mkdir -p dist/mongreldb-headers/include
+          cp crates/mongreldb-ffi/include/mongreldb.h dist/mongreldb-headers/include/
+          tar -czf dist/mongreldb-headers.tar.gz -C dist mongreldb-headers
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: dist/mongreldb-headers.tar.gz

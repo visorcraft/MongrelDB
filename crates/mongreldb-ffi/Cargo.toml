@@ -1,19 +1,40 @@
 [package]
 name = "mongreldb-ffi"
-version = "0.43.1"
+version = "0.48.0"
 edition = "2021"
 publish = false
-description = "C ABI for MongrelDB core — the foundation for native language bindings"
+license = "MIT OR Apache-2.0"
+description = "C ABI for MongrelDB - the foundation for native (Tier-1) language bindings"
+repository = "https://github.com/visorcraft/MongrelDB"
+keywords = ["mongreldb", "database", "ffi", "c-abi", "bindings"]
+categories = ["database", "external-ffi-bindings"]
+# `publish = false` is deliberate: this crate is a cdylib/staticlib artifact,
+# distributed as prebuilt native libraries via GitHub release archives
+# (libmongreldb.{so,dylib,dll} + header). It is not a consumable Rust crate.
 
 [lib]
-name = "mongreldb_ffi"
+# Lib name `mongreldb` produces libmongreldb.so / .dylib / .a / mongreldb.lib
+# so downstream C/C++ users link with -lmongreldb. The crate package name
+# remains `mongreldb-ffi`; only the output artifact name changes.
+name = "mongreldb"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-mongreldb-core = { path = "../mongreldb-core", version = "0.43.1" }
+mongreldb-core = { path = "../mongreldb-core", version = "0.48.0" }
+# SQL execution (DataFusion) lives in mongreldb-query, not core. The FFI
+# drives it through an internal tokio runtime, mirroring mongreldb-kit and
+# the NAPI addon.
+mongreldb-query = { path = "../mongreldb-query", version = "0.48.0" }
+# Migration planning/checksum (shared with all language bindings via kit-core).
+# Resolved from crates.io since the FFI is a standalone crate.
+mongreldb-kit-core = "0.48"
+arrow = "58"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync"] }
+parking_lot = "0.12"
+serde_json = { version = "1", features = ["preserve_order"] }
 
 [dev-dependencies]
 cc = "1"
 
-# Standalone crate — not a workspace member.
+# Standalone crate - not a workspace member.
 [workspace]

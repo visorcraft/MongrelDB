@@ -57,3 +57,23 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm test
+
+  # C ABI crate (standalone - own workspace). The FFI builds as a cdylib +
+  # staticlib and is exercised by Rust round-trip tests plus a C smoke test
+  # compiled with cc. This keeps the ABI from bit-rotting between releases.
+  ffi:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/mongreldb-ffi
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: crates/mongreldb-ffi
+      # Build the release cdylib first so the C smoke test can link it.
+      - run: cargo build --release
+      - run: cargo test --release

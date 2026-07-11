@@ -3,7 +3,7 @@
 //! These tests link against the rlib and call the `extern "C"` functions
 //! directly, verifying that the FFI layer correctly marshals types.
 
-use mongreldb_ffi::*;
+use mongreldb::*;
 use std::ffi::{CStr, CString};
 
 fn make_tempdir() -> std::path::PathBuf {

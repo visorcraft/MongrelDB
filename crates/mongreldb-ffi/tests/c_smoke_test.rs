@@ -1,4 +1,4 @@
-//! Compiles and runs the C smoke test against libmongreldb_ffi.
+//! Compiles and runs the C smoke test against libmongreldb.
 
 #[test]
 fn c_smoke_test() {
@@ -23,7 +23,7 @@ fn c_smoke_test() {
             header.parent().unwrap().to_str().unwrap(),
             "-L",
             lib_path.to_str().unwrap(),
-            "-lmongreldb_ffi",
+            "-lmongreldb",
             "-Wl,-rpath",
             lib_path.to_str().unwrap(),
             "-lpthread",

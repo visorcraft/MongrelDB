@@ -1,5 +1,5 @@
 fn main() {
-    use mongreldb_ffi::*;
+    use mongreldb::*;
     println!("Rust CValue size: {}", std::mem::size_of::<CValue>());
     println!("Rust CValue align: {}", std::mem::align_of::<CValue>());
     println!("Rust CValueTag size: {}", std::mem::size_of::<CValueTag>());
