@@ -25,7 +25,7 @@ use axum::Json;
 use mongreldb_core::schema::{Schema, TypeId};
 use mongreldb_core::{Database, Value};
 use mongreldb_query::{ExternalTableModule, MongrelSession};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 mod audit;
@@ -180,6 +180,10 @@ pub fn build_app_with_sessions(
     });
     let router = axum::Router::new()
         .route("/health", get(health))
+        .route(
+            "/history/retention",
+            get(history_retention).put(set_history_retention),
+        )
         .route("/metrics", get(metrics_handler))
         .route("/audit", get(audit_handler))
         .route("/tables", get(list_tables).post(create_table))
@@ -660,6 +664,64 @@ pub fn spawn_auto_compactor(db: Arc<Database>) {
 
 async fn health() -> StatusCode {
     StatusCode::OK
+}
+
+#[derive(Debug, Deserialize)]
+struct HistoryRetentionRequest {
+    #[serde(default)]
+    history_retention_epochs: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+struct HistoryRetentionResponse {
+    history_retention_epochs: u64,
+    earliest_retained_epoch: u64,
+}
+
+fn history_retention_response(db: &Database) -> HistoryRetentionResponse {
+    HistoryRetentionResponse {
+        history_retention_epochs: db.history_retention_epochs(),
+        earliest_retained_epoch: db.earliest_retained_epoch().0,
+    }
+}
+
+/// `GET /history/retention` — inspect the durable MVCC history window.
+async fn history_retention(
+    State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
+) -> Response {
+    if let Err(error) = state.db.require_for(
+        request_principal(&state, &principal).as_ref(),
+        &mongreldb_core::Permission::Admin,
+    ) {
+        return (status_for_error(&error), error.to_string()).into_response();
+    }
+    Json(history_retention_response(&state.db)).into_response()
+}
+
+/// `PUT /history/retention` — set the durable MVCC history window.
+async fn set_history_retention(
+    State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
+    Json(request): Json<HistoryRetentionRequest>,
+) -> Response {
+    if let Err(error) = state.db.require_for(
+        request_principal(&state, &principal).as_ref(),
+        &mongreldb_core::Permission::Admin,
+    ) {
+        return (status_for_error(&error), error.to_string()).into_response();
+    }
+    let Some(epochs) = request.history_retention_epochs.as_u64() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "history_retention_epochs must be a u64"})),
+        )
+            .into_response();
+    };
+    match state.db.set_history_retention_epochs(epochs) {
+        Ok(()) => Json(history_retention_response(&state.db)).into_response(),
+        Err(error) => (status_for_error(&error), error.to_string()).into_response(),
+    }
 }
 
 /// `GET /audit` — recent security-audit events (auth + DDL/privilege) as a JSON

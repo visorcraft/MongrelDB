@@ -41,6 +41,25 @@ mongreldb-server ./my_database 8453 --auth-token my-secret-token --max-connectio
 The daemon opens the database, builds indexes (if needed), and starts
 listening for HTTP requests on `127.0.0.1:8453`.
 
+## History retention
+
+The daemon defaults to 1024 retained commit epochs. Override startup behavior
+with `MONGRELDB_HISTORY_RETENTION_EPOCHS`. Authenticated administrators can
+inspect or change the durable window while the daemon runs:
+
+```http
+GET /history/retention
+PUT /history/retention
+Content-Type: application/json
+
+{"history_retention_epochs": 1024}
+```
+
+Both responses contain `history_retention_epochs` and
+`earliest_retained_epoch`. The routes require `ADMIN` permission when catalog
+authentication is enabled. Increasing the window cannot restore history that
+was already pruned.
+
 ## Running as a daemon (--daemon mode)
 
 The `--daemon` flag forks the server into the background, detaches from the

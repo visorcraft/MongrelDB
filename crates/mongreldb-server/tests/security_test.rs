@@ -138,7 +138,13 @@ async fn user_principal_secures_sql_native_kit_and_sessions() {
         true,
     );
 
-    for uri in ["/audit", "/metrics", "/events", "/wal/stream?since=0"] {
+    for uri in [
+        "/audit",
+        "/metrics",
+        "/events",
+        "/wal/stream?since=0",
+        "/history/retention",
+    ] {
         let response = app
             .clone()
             .oneshot(request("GET", uri, json!({})))

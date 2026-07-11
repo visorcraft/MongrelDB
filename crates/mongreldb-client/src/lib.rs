@@ -130,6 +130,12 @@ struct CountResp {
     count: u64,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct HistoryRetention {
+    pub history_retention_epochs: u64,
+    pub earliest_retained_epoch: u64,
+}
+
 /// Server-side schema metadata for one table (subset of the server's descriptor).
 #[derive(Debug, Clone, Deserialize)]
 pub struct TableSchemaInfo {
@@ -403,6 +409,28 @@ impl MongrelClient {
     pub fn health(&self) -> ClientResult<String> {
         let resp = self.client.get(self.url("/health")).send()?;
         self.check(resp)?.text().map_err(Into::into)
+    }
+
+    pub fn set_history_retention_epochs(&self, epochs: u64) -> ClientResult<HistoryRetention> {
+        let resp = self
+            .client
+            .put(self.url("/history/retention"))
+            .json(&serde_json::json!({"history_retention_epochs": epochs}))
+            .send()?;
+        Ok(self.check(resp)?.json()?)
+    }
+
+    pub fn history_retention_epochs(&self) -> ClientResult<u64> {
+        Ok(self.history_retention()?.history_retention_epochs)
+    }
+
+    pub fn earliest_retained_epoch(&self) -> ClientResult<u64> {
+        Ok(self.history_retention()?.earliest_retained_epoch)
+    }
+
+    fn history_retention(&self) -> ClientResult<HistoryRetention> {
+        let resp = self.client.get(self.url("/history/retention")).send()?;
+        Ok(self.check(resp)?.json()?)
     }
 
     // ── Table management ──

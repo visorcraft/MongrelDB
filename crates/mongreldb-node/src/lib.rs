@@ -3117,6 +3117,46 @@ impl RemoteDatabase {
     }
 
     #[napi]
+    pub fn set_history_retention_epochs(&self, epochs: BigInt) -> napi::Result<()> {
+        let epochs = bigint_to_u64(&epochs)?;
+        self.agent
+            .put(&format!("{}/history/retention", self.url))
+            .send_json(serde_json::json!({"history_retention_epochs": epochs}))
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?
+            .into_json::<serde_json::Value>()
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
+        Ok(())
+    }
+
+    #[napi]
+    pub fn history_retention_epochs(&self) -> napi::Result<BigInt> {
+        let response: serde_json::Value = self
+            .agent
+            .get(&format!("{}/history/retention", self.url))
+            .call()
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?
+            .into_json()
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
+        Ok(BigInt::from(
+            response["history_retention_epochs"].as_u64().unwrap_or(0),
+        ))
+    }
+
+    #[napi]
+    pub fn earliest_retained_epoch(&self) -> napi::Result<BigInt> {
+        let response: serde_json::Value = self
+            .agent
+            .get(&format!("{}/history/retention", self.url))
+            .call()
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?
+            .into_json()
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
+        Ok(BigInt::from(
+            response["earliest_retained_epoch"].as_u64().unwrap_or(0),
+        ))
+    }
+
+    #[napi]
     pub fn count(&self, table: String) -> napi::Result<f64> {
         let resp: serde_json::Value = self
             .agent

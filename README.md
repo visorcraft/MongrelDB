@@ -134,6 +134,9 @@ Bulk insert **2.3× faster than SQLite, 2.6× faster than DuckDB native**. Join
   Notable flags: `--daemon` (background + PID file), `--pidfile <path>`,
   `--port <n>`, `--auth-token`/`--auth-users` (auth), `--max-connections <n>`,
   and `--passphrase <key>` (page-level encryption).
+  MVCC history retention defaults to 1024 epochs, can be set at startup with
+  `MONGRELDB_HISTORY_RETENTION_EPOCHS`, and can be inspected or changed by an
+  administrator through `GET`/`PUT /history/retention`.
 - **Authentication:** `CREATE USER` / `CREATE ROLE` / `GRANT` / `REVOKE` with
   Argon2id password hashing. Daemon supports Bearer token (`--auth-token`) and
   HTTP Basic auth (`--auth-users`). **Credential enforcement**

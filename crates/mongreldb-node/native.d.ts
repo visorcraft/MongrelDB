@@ -648,6 +648,9 @@ export declare class RemoteDatabase {
   constructor(url: string)
   health(): string
   tableNames(): Array<string>
+  setHistoryRetentionEpochs(epochs: bigint): void
+  historyRetentionEpochs(): bigint
+  earliestRetainedEpoch(): bigint
   count(table: string): number
   sql(sql: string): Buffer
   commit(table: string): bigint

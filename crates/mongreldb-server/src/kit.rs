@@ -482,10 +482,23 @@ pub struct KitColumnDef {
     // `default_expr` accepts the dynamic `now` / `uuid` discriminators.
     #[serde(default)]
     pub default_expr: Option<String>,
-    // `default_value` accepts a static JSON scalar and keeps the legacy
-    // `"now"` / `"uuid"` string forms working as dynamic defaults.
+    // `default_value` accepts a static JSON scalar, including explicit null.
     #[serde(default)]
-    pub default_value: Option<Jval>,
+    pub default_value: KitStaticDefault,
+}
+
+/// Presence-aware default value. `None` means the key was omitted; `Some(Null)`
+/// means the caller explicitly requested a static JSON null default.
+#[derive(Debug, Default)]
+pub struct KitStaticDefault(pub Option<Jval>);
+
+impl<'de> Deserialize<'de> for KitStaticDefault {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(Self(Some(Jval::deserialize(deserializer)?)))
+    }
 }
 
 /// Convert a KitColumnDef's default fields into an engine DefaultExpr.
@@ -511,16 +524,9 @@ fn kit_default_expr(
                 .into_response()),
         };
     }
-    let Some(value) = &c.default_value else {
+    let Some(value) = c.default_value.0.as_ref() else {
         return Ok(None);
     };
-    if let Some(expr) = value.as_str() {
-        match expr {
-            "now" => return Ok(Some(DefaultExpr::Now)),
-            "uuid" => return Ok(Some(DefaultExpr::Uuid)),
-            _ => {}
-        }
-    }
     if let (Jval::String(value), TypeId::Enum { variants }) = (value, ty) {
         if !variants.iter().any(|variant| variant == value) {
             return Err((
