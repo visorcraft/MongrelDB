@@ -3171,7 +3171,7 @@ impl Table {
         self.validate_columns_not_null(&user_columns, n)?;
         let winner_idx = self
             .bulk_pk_winner_indices(&user_columns, n)
-            .and_then(|idx| if idx.len() == n { None } else { Some(idx) });
+            .filter(|idx| idx.len() != n);
         let (write_columns, write_n): (Vec<(u16, columnar::NativeColumn)>, usize) =
             match winner_idx.as_deref() {
                 Some(idx) => {
@@ -4452,7 +4452,7 @@ impl Table {
         self.validate_columns_not_null(&user_columns, n)?;
         let winner_idx = self
             .bulk_pk_winner_indices(&user_columns, n)
-            .and_then(|idx| if idx.len() == n { None } else { Some(idx) });
+            .filter(|idx| idx.len() != n);
         let (write_columns, write_n): (Vec<(u16, columnar::NativeColumn)>, usize) =
             match winner_idx.as_deref() {
                 Some(idx) => {
