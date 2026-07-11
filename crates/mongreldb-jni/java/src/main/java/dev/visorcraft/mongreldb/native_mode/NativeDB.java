@@ -27,12 +27,27 @@ public class NativeDB implements AutoCloseable {
     private long handle;
     private boolean closed;
 
-    static {
-        NativeLoader.ensureLoaded();
+    private static volatile boolean nativeLoaded = false;
+
+    /**
+     * Ensures the native library is loaded. Called lazily by the constructors
+     * so that merely referencing the class (e.g. in a test guard) does not
+     * crash with {@link UnsatisfiedLinkError}.
+     */
+    private static void ensureNative() {
+        if (!nativeLoaded) {
+            synchronized (NativeDB.class) {
+                if (!nativeLoaded) {
+                    NativeLoader.ensureLoaded();
+                    nativeLoaded = true;
+                }
+            }
+        }
     }
 
     /** Opens an existing database (creates if missing). */
     public NativeDB(String path) {
+        ensureNative();
         this.handle = nativeOpen(path);
         if (this.handle == 0) {
             throw new RuntimeException("Failed to open database: " + path);
@@ -41,6 +56,7 @@ public class NativeDB implements AutoCloseable {
 
     /** Creates a fresh database with a JSON schema. */
     public static NativeDB create(String path, String schemaJson) {
+        ensureNative();
         long h = nativeCreate(path, schemaJson);
         if (h == 0) {
             throw new RuntimeException("Failed to create database: " + path);
@@ -51,6 +67,20 @@ public class NativeDB implements AutoCloseable {
     }
 
     private NativeDB() {}
+
+    /**
+     * Checks whether the native library can be loaded. Safe to call at any
+     * time; returns {@code false} instead of throwing if the library is
+     * missing. Tests use this to decide whether to skip.
+     */
+    public static boolean nativeAvailable() {
+        try {
+            ensureNative();
+            return true;
+        } catch (UnsatisfiedLinkError e) {
+            return false;
+        }
+    }
 
     // ── Instance methods (delegate to static JNI with the handle) ──────────
 

@@ -7,7 +7,7 @@
 //! # JNI method mapping
 //!
 //! Each exported function follows the JNI naming convention:
-//! `Java_dev_visorcraft_mongreldb_native_mode_NativeDB_native<method>`.
+//! `Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_native<method>`.
 //!
 //! The JVM class `dev.visorcraft.mongreldb.native.NativeDB` declares these
 //! as `native` methods. The handle (Kit `Database` wrapped in `Rc<RefCell>`)
@@ -89,7 +89,7 @@ fn db_to_handle(db: JniDatabase) -> jlong {
 
 /// Opens an existing Kit database. Java: `native long open(String path)`.
 #[no_mangle]
-pub extern "system" fn Java_dev_visorcraft_mongreldb_native_mode_NativeDB_nativeOpen(
+pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativeOpen(
     mut env: JNIEnv,
     _class: JClass,
     path: JString,
@@ -109,7 +109,7 @@ pub extern "system" fn Java_dev_visorcraft_mongreldb_native_mode_NativeDB_native
 /// Creates a fresh Kit database with a JSON schema.
 /// Java: `native long create(String path, String schemaJson)`.
 #[no_mangle]
-pub extern "system" fn Java_dev_visorcraft_mongreldb_native_mode_NativeDB_nativeCreate(
+pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativeCreate(
     mut env: JNIEnv,
     _class: JClass,
     path: JString,
@@ -141,7 +141,7 @@ pub extern "system" fn Java_dev_visorcraft_mongreldb_native_mode_NativeDB_native
 
 /// Closes and frees the database handle. Java: `native void close(long handle)`.
 #[no_mangle]
-pub extern "system" fn Java_dev_visorcraft_mongreldb_native_mode_NativeDB_nativeClose(
+pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativeClose(
     _env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -158,7 +158,7 @@ pub extern "system" fn Java_dev_visorcraft_mongreldb_native_mode_NativeDB_native
 /// Runs SQL and returns a JSON array of row objects.
 /// Java: `native String sqlRows(long handle, String sql)`.
 #[no_mangle]
-pub extern "system" fn Java_dev_visorcraft_mongreldb_native_mode_NativeDB_nativeSqlRows(
+pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativeSqlRows(
     mut env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -201,7 +201,7 @@ pub extern "system" fn Java_dev_visorcraft_mongreldb_native_mode_NativeDB_native
 /// Runs SQL and returns Arrow IPC file bytes.
 /// Java: `native byte[] sqlArrow(long handle, String sql)`.
 #[no_mangle]
-pub extern "system" fn Java_dev_visorcraft_mongreldb_native_mode_NativeDB_nativeSqlArrow(
+pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativeSqlArrow(
     mut env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -232,7 +232,7 @@ pub extern "system" fn Java_dev_visorcraft_mongreldb_native_mode_NativeDB_native
 /// Runs the Kit migration runner.
 /// Java: `native void migrate(long handle, String migrationsJson)`.
 #[no_mangle]
-pub extern "system" fn Java_dev_visorcraft_mongreldb_native_mode_NativeDB_nativeMigrate(
+pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativeMigrate(
     mut env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -280,7 +280,7 @@ pub extern "system" fn Java_dev_visorcraft_mongreldb_native_mode_NativeDB_native
 /// Reads applied migrations as a JSON array.
 /// Java: `native String appliedMigrations(long handle)`.
 #[no_mangle]
-pub extern "system" fn Java_dev_visorcraft_mongreldb_native_mode_NativeDB_nativeAppliedMigrations(
+pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativeAppliedMigrations(
     mut env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -310,7 +310,7 @@ pub extern "system" fn Java_dev_visorcraft_mongreldb_native_mode_NativeDB_native
 /// Rebuild the SQL session after schema changes.
 /// Java: `native void refreshSqlSession(long handle)`.
 #[no_mangle]
-pub extern "system" fn Java_dev_visorcraft_mongreldb_native_mode_NativeDB_nativeRefreshSqlSession(
+pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativeRefreshSqlSession(
     mut env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -327,7 +327,7 @@ pub extern "system" fn Java_dev_visorcraft_mongreldb_native_mode_NativeDB_native
 /// Runs a SELECT query via the Kit query builder.
 /// Java: `native String querySelect(long handle, String queryJson)`.
 #[no_mangle]
-pub extern "system" fn Java_dev_visorcraft_mongreldb_native_mode_NativeDB_nativeQuerySelect(
+pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativeQuerySelect(
     mut env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -338,7 +338,7 @@ pub extern "system" fn Java_dev_visorcraft_mongreldb_native_mode_NativeDB_native
 
 /// Runs a JOIN query.
 #[no_mangle]
-pub extern "system" fn Java_dev_visorcraft_mongreldb_native_mode_NativeDB_nativeQueryJoin(
+pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativeQueryJoin(
     mut env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -349,7 +349,7 @@ pub extern "system" fn Java_dev_visorcraft_mongreldb_native_mode_NativeDB_native
 
 /// Runs an AGGREGATE query.
 #[no_mangle]
-pub extern "system" fn Java_dev_visorcraft_mongreldb_native_mode_NativeDB_nativeQueryAggregate(
+pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativeQueryAggregate(
     mut env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -360,7 +360,7 @@ pub extern "system" fn Java_dev_visorcraft_mongreldb_native_mode_NativeDB_native
 
 /// Runs an INSERT query.
 #[no_mangle]
-pub extern "system" fn Java_dev_visorcraft_mongreldb_native_mode_NativeDB_nativeQueryInsert(
+pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativeQueryInsert(
     mut env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -371,7 +371,7 @@ pub extern "system" fn Java_dev_visorcraft_mongreldb_native_mode_NativeDB_native
 
 /// Runs an UPDATE query.
 #[no_mangle]
-pub extern "system" fn Java_dev_visorcraft_mongreldb_native_mode_NativeDB_nativeQueryUpdate(
+pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativeQueryUpdate(
     mut env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -382,7 +382,7 @@ pub extern "system" fn Java_dev_visorcraft_mongreldb_native_mode_NativeDB_native
 
 /// Runs an UPSERT query.
 #[no_mangle]
-pub extern "system" fn Java_dev_visorcraft_mongreldb_native_mode_NativeDB_nativeQueryUpsert(
+pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativeQueryUpsert(
     mut env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -393,7 +393,7 @@ pub extern "system" fn Java_dev_visorcraft_mongreldb_native_mode_NativeDB_native
 
 /// Runs a DELETE query.
 #[no_mangle]
-pub extern "system" fn Java_dev_visorcraft_mongreldb_native_mode_NativeDB_nativeQueryDelete(
+pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativeQueryDelete(
     mut env: JNIEnv,
     _class: JClass,
     handle: jlong,
