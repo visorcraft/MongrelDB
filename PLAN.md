@@ -141,10 +141,10 @@ Current state:
   `rows_at_epoch`, but not the three retention controls.
 - The 31 Tier 2 clients cannot implement the retention API until the
   `mongreldb-server` contract is frozen; that contract is now in place.
-- All 34 languages can already express static string, number, and boolean
-  defaults. All except Lua can express an explicit JSON-null field. No Tier 2
-  repository has one focused wire test covering string, number, boolean, and
-  null together. PHP and Swift also lack focused `default_expr` wire coverage.
+- All 34 languages can already express static string, number, boolean, and
+  explicit JSON-null defaults. No Tier 2 repository has one focused wire test
+  covering string, number, boolean, and null together. PHP and Swift also lack
+  focused `default_expr` wire coverage.
 - `KitColumnDef.default_value` is now deserialized with presence awareness:
   a missing field means no default and an explicit JSON null becomes
   `DefaultExpr::Static(Value::Null)`. The legacy reinterpretation of
@@ -271,7 +271,7 @@ typed `default_value`, then any legacy string field.
 | Java `mongreldb_java` ✅ | Add `setHistoryRetentionEpochs(long)`, `historyRetentionEpochs()`, and `earliestRetainedEpoch()` to `src/main/java/dev/visorcraft/mongreldb/MongrelDB.java`. Generic maps already preserve scalars. | Extend `src/test/java/dev/visorcraft/mongreldb/MongrelDBWireShapeTest.java` and `src/test/java/dev/visorcraft/mongreldb/MongrelDBLiveTest.java`; update `README.md` and `docs/quickstart.md`. |
 | Julia `mongreldb_julia` ✅ | Export `setHistoryRetentionEpochs`, `historyRetentionEpochs`, and `earliestRetainedEpoch` from `src/MongrelDB.jl`. `Dict` plus `nothing` already preserves the scalar matrix. | Extend `test/wire_shape_test.jl`, `test/json_test.jl`, and `test/live_test.jl`; update `README.md` and `docs/quickstart.md`. |
 | Kotlin `mongreldb_kotlin` ✅ | Add `setHistoryRetentionEpochs(Long)`, `historyRetentionEpochs()`, and `earliestRetainedEpoch()` to `src/main/kotlin/dev/visorcraft/mongreldb/MongrelDB.kt`. Generic nullable maps already preserve scalars. | Extend `src/test/kotlin/dev/visorcraft/mongreldb/CreateTableWireShapeTest.kt` and `src/test/kotlin/dev/visorcraft/mongreldb/MongrelDBLiveTest.kt`; update `README.md` and the stale defaults section in `docs/quickstart.md`. |
-| Lua `mongreldb_lua` | First add a public JSON-null sentinel and encoder branch in `src/mongreldb/json.lua`; Lua `nil` deletes a table key and cannot represent explicit null. Then add `Client:setHistoryRetentionEpochs`, `Client:historyRetentionEpochs`, and `Client:earliestRetainedEpoch` to `src/mongreldb/init.lua`. | Extend `tests/json_test.lua`, `tests/wire_shape_test.lua`, and `tests/live_test.lua`; update `README.md` and `docs/quickstart.md`. |
+| Lua `mongreldb_lua` ✅ | First add a public JSON-null sentinel and encoder branch in `src/mongreldb/json.lua`; Lua `nil` deletes a table key and cannot represent explicit null. Then add `Client:setHistoryRetentionEpochs`, `Client:historyRetentionEpochs`, and `Client:earliestRetainedEpoch` to `src/mongreldb/init.lua`. | Extend `tests/json_test.lua`, `tests/wire_shape_test.lua`, and `tests/live_test.lua`; update `README.md` and `docs/quickstart.md`. |
 | Mojo `mongreldb_mojo` | Add `set_history_retention_epochs`, `history_retention_epochs`, and `earliest_retained_epoch` to `src/mongreldb/mongreldb.mojo`. Python-backed dictionaries already preserve scalars. | Extend `tests/wire_shape_test.mojo` and `tests/live_test.mojo`; update `README.md` and `docs/quickstart.md`. |
 | Nim `mongreldb_nim` | Add `setHistoryRetentionEpochs`, `historyRetentionEpochs`, and `earliestRetainedEpoch` to `src/mongreldb.nim`. Keep `Column.defaultValueJson`; explicit null uses `some(newJNull())`. | Extend `tests/test_wire_shape.nim` and `src/mongreldb/tests/live_test.nim`; update `README.md` and the stale defaults section in `docs/quickstart.md`. |
 | Objective-C `mongreldb_objc` | Add `setHistoryRetentionEpochs:error:`, `historyRetentionEpochs:`, and `earliestRetainedEpoch:` to `src/MongrelDBClient.h` and `src/MongrelDBClient.m`. `defaultValueJSON` already accepts `NSNull`. | Extend `tests/test_wire_shape.m` and `tests/test_mongreldb.m`; update `README.md` and `docs/quickstart.md`. |
