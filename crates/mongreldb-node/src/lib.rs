@@ -231,7 +231,10 @@ fn to_type_id(
         ColumnType::Time64 => TypeId::Time64,
         ColumnType::Interval => TypeId::Interval,
         ColumnType::Bytes => TypeId::Bytes,
-        ColumnType::Decimal128 => TypeId::Decimal128 { precision: 38, scale: 2 },
+        ColumnType::Decimal128 => TypeId::Decimal128 {
+            precision: 38,
+            scale: 2,
+        },
         ColumnType::Uuid => TypeId::Uuid,
         ColumnType::Json => TypeId::Json,
         ColumnType::Array => TypeId::Array { element_type: 0 },
@@ -584,8 +587,7 @@ fn from_value(v: &Value, column_id: u16) -> Cell {
             Err(_) => cell.bytes = Some(Buffer::from(b.clone())),
         },
         Value::Embedding(e) => cell.embedding = Some(e.iter().map(|x| *x as f64).collect()),
-        Value::Decimal(_) | Value::Interval { .. } | Value::Uuid(_)
-        | Value::Json(_) => {
+        Value::Decimal(_) | Value::Interval { .. } | Value::Uuid(_) | Value::Json(_) => {
             // These types don't have a Cell representation yet; encode as null.
         }
     }
@@ -1123,11 +1125,7 @@ impl Database {
     /// the admin principal on this handle. After this call, the database can
     /// only be reopened via `openWithCredentials`.
     #[napi]
-    pub fn enable_auth(
-        &self,
-        admin_username: String,
-        admin_password: String,
-    ) -> napi::Result<()> {
+    pub fn enable_auth(&self, admin_username: String, admin_password: String) -> napi::Result<()> {
         self.inner
             .enable_auth(&admin_username, &admin_password)
             .map_err(to_napi)
@@ -1204,6 +1202,30 @@ impl Database {
     #[napi]
     pub fn snapshot_epoch(&self) -> BigInt {
         BigInt::from(self.inner.visible_epoch().0)
+    }
+
+    /// Set how many committed epochs of history to retain for MVCC time-travel
+    /// reads (`rowsAtEpoch`). The default keeps only the latest epoch, so raise
+    /// this to read past snapshots. The setting persists across close/reopen and
+    /// cannot restore history that was already pruned.
+    #[napi]
+    pub fn set_history_retention_epochs(&self, epochs: i64) -> napi::Result<()> {
+        self.inner
+            .set_history_retention_epochs(epochs.max(0) as u64)
+            .map_err(to_napi)
+    }
+
+    /// The configured history-retention depth — how many committed epochs are
+    /// kept for time-travel reads.
+    #[napi]
+    pub fn history_retention_epochs(&self) -> BigInt {
+        BigInt::from(self.inner.history_retention_epochs())
+    }
+
+    /// The oldest epoch still retained for time-travel reads (`rowsAtEpoch`).
+    #[napi]
+    pub fn earliest_retained_epoch(&self) -> BigInt {
+        BigInt::from(self.inner.earliest_retained_epoch().0)
     }
 
     /// List all live table names.
@@ -1358,7 +1380,11 @@ impl Database {
         }
         let handle = self.inner.table(&table).map_err(to_napi)?;
         let mut g = handle.lock();
-        let ty = to_type_id(&column.ty, column.embedding_dim, column.enum_variants.as_deref())?;
+        let ty = to_type_id(
+            &column.ty,
+            column.embedding_dim,
+            column.enum_variants.as_deref(),
+        )?;
         let flags = to_column_flags(&column);
         let default_value = build_default_expr(&column, &ty)?;
         let id = g
@@ -1367,7 +1393,11 @@ impl Database {
                 ty,
                 flags,
                 default_value,
-                if column.id == 0 { None } else { Some(column.id) },
+                if column.id == 0 {
+                    None
+                } else {
+                    Some(column.id)
+                },
             )
             .map_err(to_napi)?;
         Ok(BigInt::from(id as u64))
@@ -1383,7 +1413,11 @@ impl Database {
         column_name: String,
         column: ColumnSpec,
     ) -> napi::Result<BigInt> {
-        let ty = to_type_id(&column.ty, column.embedding_dim, column.enum_variants.as_deref())?;
+        let ty = to_type_id(
+            &column.ty,
+            column.embedding_dim,
+            column.enum_variants.as_deref(),
+        )?;
         let flags = to_column_flags(&column);
         let default_value = build_default_expr(&column, &ty)?;
         let altered = self
@@ -1539,11 +1573,7 @@ impl Database {
 
     /// Set a table's compaction zstd level (-1 = default, 0 = none, 1..22).
     #[napi]
-    pub fn set_table_compaction_zstd_level(
-        &self,
-        name: String,
-        level: i32,
-    ) -> napi::Result<()> {
+    pub fn set_table_compaction_zstd_level(&self, name: String, level: i32) -> napi::Result<()> {
         let handle = self.inner.table(&name).map_err(to_napi)?;
         handle.lock().set_compaction_zstd_level(level);
         Ok(())
@@ -1565,25 +1595,21 @@ impl Database {
 
     /// Set a table's mutable-run spill threshold (bytes).
     #[napi]
-    pub fn set_table_mutable_run_spill_bytes(
-        &self,
-        name: String,
-        bytes: i64,
-    ) -> napi::Result<()> {
+    pub fn set_table_mutable_run_spill_bytes(&self, name: String, bytes: i64) -> napi::Result<()> {
         let handle = self.inner.table(&name).map_err(to_napi)?;
-        handle.lock().set_mutable_run_spill_bytes(bytes.max(0) as u64);
+        handle
+            .lock()
+            .set_mutable_run_spill_bytes(bytes.max(0) as u64);
         Ok(())
     }
 
     /// Set a table's WAL sync byte threshold (bytes between group-syncs).
     #[napi]
-    pub fn set_table_sync_byte_threshold(
-        &self,
-        name: String,
-        threshold: i64,
-    ) -> napi::Result<()> {
+    pub fn set_table_sync_byte_threshold(&self, name: String, threshold: i64) -> napi::Result<()> {
         let handle = self.inner.table(&name).map_err(to_napi)?;
-        handle.lock().set_sync_byte_threshold(threshold.max(0) as u64);
+        handle
+            .lock()
+            .set_sync_byte_threshold(threshold.max(0) as u64);
         Ok(())
     }
 
@@ -1662,7 +1688,9 @@ impl Database {
     /// Create a catalog user with an Argon2id-hashed password.
     #[napi]
     pub fn create_user(&self, username: String, password: String) -> napi::Result<()> {
-        self.inner.create_user(&username, &password).map_err(to_napi)?;
+        self.inner
+            .create_user(&username, &password)
+            .map_err(to_napi)?;
         Ok(())
     }
 
@@ -1683,14 +1711,19 @@ impl Database {
     /// Verify credentials. Returns true on success.
     #[napi]
     pub fn verify_user(&self, username: String, password: String) -> napi::Result<bool> {
-        let result = self.inner.verify_user(&username, &password).map_err(to_napi)?;
+        let result = self
+            .inner
+            .verify_user(&username, &password)
+            .map_err(to_napi)?;
         Ok(result.is_some())
     }
 
     /// Grant or revoke admin privileges on a user.
     #[napi]
     pub fn set_user_admin(&self, username: String, is_admin: bool) -> napi::Result<()> {
-        self.inner.set_user_admin(&username, is_admin).map_err(to_napi)
+        self.inner
+            .set_user_admin(&username, is_admin)
+            .map_err(to_napi)
     }
 
     /// List all usernames.
@@ -1721,13 +1754,17 @@ impl Database {
     /// Grant a role to a user.
     #[napi]
     pub fn grant_role(&self, username: String, role_name: String) -> napi::Result<()> {
-        self.inner.grant_role(&username, &role_name).map_err(to_napi)
+        self.inner
+            .grant_role(&username, &role_name)
+            .map_err(to_napi)
     }
 
     /// Revoke a role from a user.
     #[napi]
     pub fn revoke_role(&self, username: String, role_name: String) -> napi::Result<()> {
-        self.inner.revoke_role(&username, &role_name).map_err(to_napi)
+        self.inner
+            .revoke_role(&username, &role_name)
+            .map_err(to_napi)
     }
 
     /// Grant a permission to a role. `permission` is one of: "all", "ddl",
@@ -1735,14 +1772,18 @@ impl Database {
     #[napi]
     pub fn grant_permission(&self, role_name: String, permission: String) -> napi::Result<()> {
         let perm = parse_permission(&permission)?;
-        self.inner.grant_permission(&role_name, perm).map_err(to_napi)
+        self.inner
+            .grant_permission(&role_name, perm)
+            .map_err(to_napi)
     }
 
     /// Revoke a permission from a role.
     #[napi]
     pub fn revoke_permission(&self, role_name: String, permission: String) -> napi::Result<()> {
         let perm = parse_permission(&permission)?;
-        self.inner.revoke_permission(&role_name, perm).map_err(to_napi)
+        self.inner
+            .revoke_permission(&role_name, perm)
+            .map_err(to_napi)
     }
 }
 
@@ -1812,10 +1853,9 @@ impl Database {
         username: String,
         password: String,
     ) -> napi::Result<Database> {
-        let db = CoreDatabase::open_encrypted_with_credentials(
-            &path, &passphrase, &username, &password,
-        )
-        .map_err(to_napi)?;
+        let db =
+            CoreDatabase::open_encrypted_with_credentials(&path, &passphrase, &username, &password)
+                .map_err(to_napi)?;
         Ok(Database {
             inner: Arc::new(db),
             path,
@@ -2871,9 +2911,14 @@ impl TypedColumn {
             | ColumnType::Date64
             | ColumnType::Time64 => self.data.len() / 8,
             ColumnType::Bool => self.data.len(),
-            ColumnType::Bytes | ColumnType::Embedding | ColumnType::Interval
-            | ColumnType::Decimal128 | ColumnType::Uuid | ColumnType::Json
-            | ColumnType::Array | ColumnType::Enum => {
+            ColumnType::Bytes
+            | ColumnType::Embedding
+            | ColumnType::Interval
+            | ColumnType::Decimal128
+            | ColumnType::Uuid
+            | ColumnType::Json
+            | ColumnType::Array
+            | ColumnType::Enum => {
                 return Err(napi::Error::new(
                     napi::Status::InvalidArg,
                     "Bytes/Embedding columns not supported in bulk_load_typed; use bulk_load",

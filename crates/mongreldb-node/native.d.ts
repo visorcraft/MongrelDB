@@ -295,6 +295,20 @@ export declare class Database {
   begin(): Transaction
   /** The current reader-visible epoch — the database-wide snapshot point. */
   snapshotEpoch(): bigint
+  /**
+   * Set how many committed epochs of history to retain for MVCC time-travel
+   * reads (`rowsAtEpoch`). The default keeps only the latest epoch, so raise
+   * this to read past snapshots. The setting persists across close/reopen and
+   * cannot restore history that was already pruned.
+   */
+  setHistoryRetentionEpochs(epochs: number): void
+  /**
+   * The configured history-retention depth — how many committed epochs are
+   * kept for time-travel reads.
+   */
+  historyRetentionEpochs(): bigint
+  /** The oldest epoch still retained for time-travel reads (`rowsAtEpoch`). */
+  earliestRetainedEpoch(): bigint
   /** List all live table names. */
   tableNames(): Array<string>
   createProcedure(spec: ProcedureSpec): bigint
