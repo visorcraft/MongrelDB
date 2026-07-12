@@ -191,8 +191,9 @@ Condition::MinHashSimilar {
 }
 ```
 
-Top-k Jaccard set similarity via MinHash + LSH. The query set arrives as
-pre-hashed members; each row's column 8 stores the same hash signature format.
+The column stores a JSON array of set members. MongrelDB hashes the members
+and builds an internal MinHash signature; queries provide the corresponding
+set members or hashes.
 
 ## Node.js (NAPI addon)
 

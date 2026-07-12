@@ -46,6 +46,36 @@ queries that no single traditional index can serve:
 | **Sparse** | Inverted token lists | SPLADE-style learned-sparse retrieval (top-k by sparse dot product) |
 | **MinHash** | LSH set-similarity | AI dedup/join primitives |
 
+## AI-native retrieval
+
+MongrelDB keeps operational data and model-derived representations in the
+same transactional row. Dense embeddings, learned-sparse vectors, lexical
+content, set fingerprints, metadata, and timestamps can each use a specialized
+index while resolving through one shared RowId space.
+
+This supports:
+
+- RAG retrieval with dense ANN, sparse retrieval, lexical constraints, and
+  metadata filters;
+- ingestion-time near-duplicate detection with MinHash/LSH plus exact Jaccard
+  verification;
+- agent memory retrieval by meaning, entities, recency, tenant, and memory type;
+- prompt caching and training-data deduplication;
+- local and embedded AI applications without a separate vector service.
+
+| Signal | Index | Typical role |
+|---|---|---|
+| Dense embedding | HNSW | Semantic candidate generation |
+| Sparse vector | Inverted sparse index | Rare-term and learned lexical relevance |
+| Text | FM-index | Exact substring constraints |
+| Token/entity/shingle set | MinHash/LSH | Near-duplicate and set-overlap candidates |
+| Tenant/category/status | Roaring bitmap | Access control and metadata filters |
+| Time/score | PGM learned range | Recency and numeric constraints |
+
+Native conditions currently compose as conjunctive candidate-set filters.
+Applications requiring blended relevance should over-fetch candidates and
+perform exact reranking; scored hybrid retrieval is on the roadmap.
+
 ## Performance profile
 
 Measured on 1M rows, dev sandbox (full results in [`BENCHMARKS.md`](BENCHMARKS.md)):
