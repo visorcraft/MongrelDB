@@ -1,7 +1,7 @@
 # PLAN: Declarative and operational follow-up
 
-Status: **partially complete** as of 2026-07-11. All scheduled work is
-shipped except Tier-2 Language Client Support, which remains incomplete.
+Status: **partially complete** as of 2026-07-12. Language Client Support is
+now complete; the operational program items below remain in progress.
 
 ## Shipped
 
