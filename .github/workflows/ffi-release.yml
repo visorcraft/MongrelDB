@@ -401,3 +401,71 @@ jobs:
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: dist/mongreldb-jni-0.50.1.jar
+
+  # Publish the fat JAR (with all bundled native libraries) to Maven Central.
+  # Runs after build-jni-fat assembles the fat JAR; re-uses its checkout and
+  # resources. The release profile attaches sources + javadoc, GPG-signs, and
+  # uploads via the central-publishing-maven-plugin.
+  deploy-jni:
+    needs: [build-jni-fat]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 11
+
+      - name: Import GPG signing key
+        run: |
+          echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --dearmor --output /tmp/signing.gpg
+          echo "GPG_DEARMORED_PATH=/tmp/signing.gpg" >> "$GITHUB_ENV"
+
+      - name: Configure Maven settings.xml
+        run: |
+          mkdir -p ~/.m2
+          cat > ~/.m2/settings.xml <<'XML'
+          <settings>
+            <servers>
+              <server>
+                <id>central</id>
+                <username>${env.CENTRAL_USERNAME}</username>
+                <password>${env.CENTRAL_PASSWORD}</password>
+              </server>
+            </servers>
+            <profiles>
+              <profile>
+                <id>gpg</id>
+                <properties>
+                  <gpg.executable>gpg</gpg.executable>
+                  <gpg.keyname>${env.GPG_KEY_ID}</gpg.keyname>
+                  <gpg.passphrase>${env.GPG_PASSPHRASE}</gpg.passphrase>
+                  <gpg.homedir>/tmp/gpg-home</gpg.homedir>
+                </properties>
+              </profile>
+            </profiles>
+          </settings>
+          XML
+          mkdir -p /tmp/gpg-home
+          chmod 700 /tmp/gpg-home
+          GNUPGHOME=/tmp/gpg-home gpg --batch --import /tmp/signing.gpg
+
+      - name: Stage all native libs into JAR resources
+        uses: actions/download-artifact@v8
+        with:
+          pattern: jni-*
+          path: staging/native
+          merge-multiple: true
+
+      - name: Deploy fat JAR to Maven Central
+        working-directory: crates/mongreldb-jni/java
+        env:
+          CENTRAL_USERNAME: ${{ secrets.CENTRAL_USERNAME }}
+          CENTRAL_PASSWORD: ${{ secrets.CENTRAL_PASSWORD }}
+          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          mkdir -p src/main/resources/native
+          cp -r ../../../staging/native/* src/main/resources/native/
+          mvn -B -ntp -Prelease deploy

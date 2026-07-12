@@ -15,10 +15,34 @@
 
   <licenses>
     <license>
-      <name>MIT OR Apache-2.0</name>
-      <url>https://github.com/visorcraft/MongrelDB/blob/master/LICENSE</url>
+      <name>MIT License</name>
+      <url>https://opensource.org/licenses/MIT</url>
+    </license>
+    <license>
+      <name>Apache License, Version 2.0</name>
+      <url>https://www.apache.org/licenses/LICENSE-2.0.txt</url>
     </license>
   </licenses>
+
+  <developers>
+    <developer>
+      <name>Visorcraft</name>
+      <email>support@visorcraft.com</email>
+      <organization>Visorcraft</organization>
+      <organizationUrl>https://www.visorcraft.com</organizationUrl>
+    </developer>
+  </developers>
+
+  <scm>
+    <connection>scm:git:https://github.com/visorcraft/MongrelDB.git</connection>
+    <developerConnection>scm:git:https://github.com/visorcraft/MongrelDB.git</developerConnection>
+    <url>https://github.com/visorcraft/MongrelDB</url>
+  </scm>
+
+  <issueManagement>
+    <system>GitHub</system>
+    <url>https://github.com/visorcraft/MongrelDB/issues</url>
+  </issueManagement>
 
   <properties>
     <maven.compiler.release>11</maven.compiler.release>
@@ -34,4 +58,83 @@
       </plugin>
     </plugins>
   </build>
+
+  <!--
+    Release profile: activated with -Prelease during `mvn deploy` in CI.
+    Produces sources + javadoc JARs, GPG-signs everything, and uploads to
+    Maven Central via the Central Publishing Portal (OSSRH replacement).
+    Requires ~/.m2/settings.xml with a <server> id="central" entry holding
+    the portal token + credentials, and a GPG key on the keyring.
+  -->
+  <profiles>
+    <profile>
+      <id>release</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-source-plugin</artifactId>
+            <version>3.3.1</version>
+            <executions>
+              <execution>
+                <id>attach-sources</id>
+                <goals>
+                  <goal>jar-no-fork</goal>
+                </goals>
+              </execution>
+            </executions>
+          </plugin>
+
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-javadoc-plugin</artifactId>
+            <version>3.11.2</version>
+            <executions>
+              <execution>
+                <id>attach-javadocs</id>
+                <goals>
+                  <goal>jar</goal>
+                </goals>
+              </execution>
+            </executions>
+          </plugin>
+
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-gpg-plugin</artifactId>
+            <version>3.2.7</version>
+            <executions>
+              <execution>
+                <id>sign-artifacts</id>
+                <phase>verify</phase>
+                <goals>
+                  <goal>sign</goal>
+                </goals>
+                <configuration>
+                  <gpgArguments>
+                    <arg>--pinentry-mode</arg>
+                    <arg>loopback</arg>
+                  </gpgArguments>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+
+          <plugin>
+            <groupId>org.sonatype.central</groupId>
+            <artifactId>central-publishing-maven-plugin</artifactId>
+            <version>0.7.0</version>
+            <extensions>true</extensions>
+            <configuration>
+              <publishingServerId>central</publishingServerId>
+              <!-- In CI we want the upload to block until Central acks the
+                   deployment; fail the build if it's rejected. -->
+              <autoPublish>true</autoPublish>
+              <waitUntil>published</waitUntil>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
 </project>
