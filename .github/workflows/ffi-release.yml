@@ -385,7 +385,7 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           pattern: jni-*
-          path: staging
+          path: staging/native
           merge-multiple: true
 
       - name: Build fat JAR
