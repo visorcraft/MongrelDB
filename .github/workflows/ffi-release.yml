@@ -59,8 +59,8 @@ jobs:
             target: aarch64-unknown-linux-gnu
             archive: mongreldb-native-linux-arm64-gnu.tar.gz
             apt: gcc-aarch64-linux-gnu
-            linker: ''
-            ar: ''
+            linker: aarch64-linux-gnu-gcc
+            ar: aarch64-linux-gnu-ar
             zip: false
           - runner: macos-14
             target: aarch64-apple-darwin
@@ -345,6 +345,7 @@ jobs:
 
       - name: Build per-platform JAR
         working-directory: crates/mongreldb-jni/java
+        shell: bash
         run: |
           # Copy staged native lib into the JAR resources path.
           mkdir -p src/main/resources/native/${{ matrix.os }}/${{ matrix.arch }}
