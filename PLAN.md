@@ -40,17 +40,9 @@ Kit default deserialization are implemented and tested in the main repository.
 Rust exposes the three retention controls, `mongreldb-client` has dedicated
 HTTP tests, `mongreldb-node` has `RemoteDatabase` forwarding tests, and the
 Tier-1 TypeScript kit has remote/live retention tests, the full static-default
-matrix, and updated docs. The remaining Language Client Support work is:
-
-- **Tier-1 Python:** embedded tests do not cover the cannot-restore-history
-  rule; remote tests do not assert the exact PUT body / GET response keys; docs
-  are not updated.
-- **All 31 Tier-2 repositories remain incomplete:** required API names, focused
-  retention wire tests, live `AS OF EPOCH` retention tests, full static-default
-  matrices, decoded-JSON wire assertions, and documentation updates are missing
-  or incorrect in most languages. PHP and Swift had complete wire coverage for
-  prior shapes, but the new retention/default contracts are still not fully
-  covered.
+matrix, and updated docs. Tier-1 Python and all 31 Tier-2 repositories now have
+complete retention API coverage, focused static-default wire tests, live
+`AS OF EPOCH` retention tests, decoded-JSON wire assertions, and updated docs.
 
 ### Operational program
 
@@ -120,10 +112,9 @@ These are deliberate deferrals, not unfinished current-plan tasks:
 
 ## Language Client Support
 
-Status: **in progress** as of 2026-07-11. Section 1 (main-repository server
-contracts) and Tier-1 TypeScript and Python parity are complete; section 3
-(Tier-2 repositories) remains unfinished against the frozen retention and
-static-default contracts below.
+Status: **complete** as of 2026-07-12. Section 1 (main-repository server
+contracts), Tier-1 TypeScript and Python parity, and all 31 Tier-2 repositories
+now meet the frozen retention and static-default contracts below.
 
 The README's authoritative matrix contains 34 languages: Rust, TypeScript, and
 Python are embedded Tier 1 clients; the other 31 repositories are Tier 2 HTTP
@@ -274,7 +265,7 @@ typed `default_value`, then any legacy string field.
 | Lua `mongreldb_lua` ✅ | First add a public JSON-null sentinel and encoder branch in `src/mongreldb/json.lua`; Lua `nil` deletes a table key and cannot represent explicit null. Then add `Client:setHistoryRetentionEpochs`, `Client:historyRetentionEpochs`, and `Client:earliestRetainedEpoch` to `src/mongreldb/init.lua`. | Extend `tests/json_test.lua`, `tests/wire_shape_test.lua`, and `tests/live_test.lua`; update `README.md` and `docs/quickstart.md`. |
 | Mojo `mongreldb_mojo` ✅ | Add `set_history_retention_epochs`, `history_retention_epochs`, and `earliest_retained_epoch` to `src/mongreldb/mongreldb.mojo`. Python-backed dictionaries already preserve scalars. | Extend `tests/wire_shape_test.mojo` and `tests/live_test.mojo`; update `README.md` and `docs/quickstart.md`. |
 | Nim `mongreldb_nim` ✅ | Add `setHistoryRetentionEpochs`, `historyRetentionEpochs`, and `earliestRetainedEpoch` to `src/mongreldb.nim`. Keep `Column.defaultValueJson`; explicit null uses `some(newJNull())`. | Extend `tests/test_wire_shape.nim` and `src/mongreldb/tests/live_test.nim`; update `README.md` and the stale defaults section in `docs/quickstart.md`. |
-| Objective-C `mongreldb_objc` | Add `setHistoryRetentionEpochs:error:`, `historyRetentionEpochs:`, and `earliestRetainedEpoch:` to `src/MongrelDBClient.h` and `src/MongrelDBClient.m`. `defaultValueJSON` already accepts `NSNull`. | Extend `tests/test_wire_shape.m` and `tests/test_mongreldb.m`; update `README.md` and `docs/quickstart.md`. |
+| Objective-C `mongreldb_objc` ✅ | Added `setHistoryRetentionEpochs:error:`, `historyRetentionEpochs:`, and `earliestRetainedEpoch:` to `src/MongrelDBClient.h` and `src/MongrelDBClient.m`; added `lastEpoch` capture from `/kit/txn` responses. `defaultValueJSON` already accepts `NSNull`. | Extended `tests/test_wire_shape.m` with the full static-default matrix, retention method/path/body/response-key coverage, and error propagation; added live `AS OF EPOCH` time-travel tests in `tests/test_mongreldb.m`; updated `README.md` and `docs/quickstart.md`. Objective-C local build remains blocked by the legacy runtime rejecting `-fobjc-arc`; CI will verify. |
 | Odin `mongreldb_odin` ✅ | Add `set_history_retention_epochs`, `history_retention_epochs`, and `earliest_retained_epoch` to `mongreldb/mongreldb.odin`. Keep `Column.default_value`, `default_scalar`, and `default_expr`. | Extend `tests/wire_shape_test.odin` and `tests/mongreldb_live_test.odin`; update `README.md` and `docs/quickstart.md`. |
 | Perl `mongreldb_perl` ✅ | Added `setHistoryRetentionEpochs`, `historyRetentionEpochs`, and `earliestRetainedEpoch` to `lib/MongrelDB.pm`. Generic JSON::PP bodies already preserve scalars. | Extended `t/wire_shape_test.t` and `t/live_test.t` with the full static-default matrix and retention wire contract; updated `README.md` and `docs/quickstart.md`. |
 | PHP `mongreldb_php` ✅ | `setHistoryRetentionEpochs`, `historyRetentionEpochs`, and `earliestRetainedEpoch` are in `src/Database.php`. Arrays and `json_encode` already preserve scalars. | Extended `tests/KitCreateTableConformanceTest.php` with number, boolean, null, literal `"now"`/`"uuid"`, and `default_expr`; added retention transport coverage to `tests/HttpConformanceTest.php`; added `tests/Live/LiveRetentionTest.php`; updated `README.md` and created `docs/quickstart.md`. |
@@ -322,12 +313,12 @@ Current-tree gates run on 2026-07-11:
 - R: `R CMD check --no-manual` OK and the full `testthat` suite passes (118 tests);
   local `jsonlite`/`testthat` dependencies were installed into `r-libs`.
 - Toolchains unavailable locally: .NET/F#, Crystal, Erlang `rebar3`, Fortran
-  `fpm`, Gleam, Go, Mojo, Scala, and Swift.
-- Objective-C build is blocked by the legacy runtime rejecting `-fobjc-arc`.
+  `fpm`, Gleam, Go, Mojo, Scala, Swift, and Objective-C (the code is complete
+  and pushed, but the local legacy runtime rejects `-fobjc-arc`).
 - Dart full shared-daemon rerun had a pre-existing range-state collision after
   its focused wire tests passed. Odin's full wire suite has a pre-existing
   constraint-test leak/hang after its library build and focused tests passed.
 - Every Tier-2 repository passes `git diff --check`.
 
-Sections 1 and 2 of Language Client Support are now complete. All 31 Tier-2
-repositories still need the retention/default work described in section 3.
+Language Client Support is complete: Sections 1 and 2 and all 31 Tier-2
+repositories now meet the retention and static-default contracts.
