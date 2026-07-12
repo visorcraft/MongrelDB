@@ -18,7 +18,7 @@
 //! The handle uses `Rc<RefCell>` (single-threaded). Each thread should create
 //! its own `NativeDB` instance. Cross-thread sharing requires a `Mutex`.
 
-use jni::objects::{JClass, JString, JValue};
+use jni::objects::{JClass, JString};
 use jni::sys::{jbyteArray, jlong, jstring};
 use jni::JNIEnv;
 use mongreldb_kit::Database as KitDatabase;
@@ -47,26 +47,13 @@ fn jstring_to_string(env: &mut JNIEnv, s: JString) -> String {
 /// be a fully-qualified JVM class name using slashes (e.g. "dev/visorcraft/
 /// mongreldb/QueryException").
 fn throw_java(env: &mut JNIEnv, class: &str, message: &str) {
-    let class_ref = env.find_class(class).ok();
-    if let Some(cls) = class_ref {
-        let _ = env.new_string(message).and_then(|msg| {
-            env.new_object(&cls, "(Ljava/lang/String;)V", &[JValue::Object(&msg.into())])
-        });
-    }
+    let _ = env.throw_new(class, message);
 }
 
 /// Map a KitError to a Java exception and throw it. Returns the jlong/error
 /// value the JNI function should return (0 for handles, empty for void).
 fn throw_kit_error(env: &mut JNIEnv, e: &mongreldb_kit::KitError) {
-    let msg = format!("{e}");
-    let class = match e {
-        mongreldb_kit::KitError::Validation(_) => "dev/visorcraft/mongreldb/QueryException",
-        mongreldb_kit::KitError::Storage(_) | mongreldb_kit::KitError::Integrity(_) => {
-            "dev/visorcraft/mongreldb/QueryException"
-        }
-        _ => "dev/visorcraft/mongreldb/QueryException",
-    };
-    throw_java(env, class, &msg);
+    throw_java(env, "dev/visorcraft/mongreldb/QueryException", &format!("{e}"));
 }
 
 /// SAFETY: cast a jlong handle back to the JniDatabase wrapper.

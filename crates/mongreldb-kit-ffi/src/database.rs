@@ -11,6 +11,7 @@ use std::path::Path;
 use std::rc::Rc;
 
 /// Opaque Kit database handle.
+#[allow(non_camel_case_types)]
 pub type mongreldb_kit_database_t = *mut c_void;
 
 /// The Rust-side wrapper behind [`mongreldb_kit_database_t`]. Uses `Rc<RefCell>`
