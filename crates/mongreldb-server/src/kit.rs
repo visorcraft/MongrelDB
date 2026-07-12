@@ -22,7 +22,9 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use mongreldb_core::constraint::TableConstraints;
 use mongreldb_core::query::{Condition, Query};
-use mongreldb_core::schema::{ColumnDef, ColumnFlags, DefaultExpr, Schema, TypeId};
+use mongreldb_core::schema::{
+    ColumnDef, ColumnFlags, DefaultExpr, IndexDef, IndexKind, Schema, TypeId,
+};
 use mongreldb_core::txn::{UpsertAction, UpsertActionKind};
 use mongreldb_core::{MongrelError, RowId, Value};
 use serde::{Deserialize, Serialize};
@@ -377,11 +379,35 @@ fn schema_descriptor(schema: &Schema) -> Jval {
         .iter()
         .map(|c| json!({ "id": c.id, "name": c.name }))
         .collect();
+    let indexes: Vec<Jval> = schema
+        .indexes
+        .iter()
+        .map(|index| {
+            json!({
+                "name": index.name,
+                "column_id": index.column_id,
+                "kind": index_kind_name(index.kind),
+                "predicate": index.predicate,
+            })
+        })
+        .collect();
     json!({
         "schema_id": schema.schema_id,
         "columns": columns,
+        "indexes": indexes,
         "constraints": { "uniques": uniques, "foreign_keys": fks, "checks": checks },
     })
+}
+
+fn index_kind_name(kind: IndexKind) -> &'static str {
+    match kind {
+        IndexKind::Bitmap => "bitmap",
+        IndexKind::FmIndex => "fm_index",
+        IndexKind::Ann => "ann",
+        IndexKind::LearnedRange => "learned_range",
+        IndexKind::MinHash => "minhash",
+        IndexKind::Sparse => "sparse",
+    }
 }
 
 fn type_name(ty: &mongreldb_core::schema::TypeId) -> &'static str {
@@ -459,7 +485,55 @@ pub struct KitCreateTableRequest {
     pub name: String,
     pub columns: Vec<KitColumnDef>,
     #[serde(default)]
+    pub indexes: Vec<KitIndexDef>,
+    #[serde(default)]
     pub constraints: TableConstraints,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct KitIndexDef {
+    pub name: String,
+    pub column_id: u16,
+    pub kind: String,
+}
+
+fn kit_index_kind(kind: &str) -> std::result::Result<IndexKind, String> {
+    match kind {
+        "bitmap" => Ok(IndexKind::Bitmap),
+        "fm" | "fm_index" => Ok(IndexKind::FmIndex),
+        "ann" | "hnsw" => Ok(IndexKind::Ann),
+        "learned_range" | "range" => Ok(IndexKind::LearnedRange),
+        "minhash" | "lsh" => Ok(IndexKind::MinHash),
+        "sparse" => Ok(IndexKind::Sparse),
+        _ => Err(format!("unknown index kind: {kind}")),
+    }
+}
+
+fn validate_index_type(kind: IndexKind, ty: &TypeId) -> bool {
+    match kind {
+        IndexKind::Ann => matches!(ty, TypeId::Embedding { .. }),
+        IndexKind::Sparse | IndexKind::MinHash | IndexKind::FmIndex => {
+            matches!(ty, TypeId::Bytes)
+        }
+        IndexKind::LearnedRange => matches!(
+            ty,
+            TypeId::Int8
+                | TypeId::Int16
+                | TypeId::Int32
+                | TypeId::Int64
+                | TypeId::UInt8
+                | TypeId::UInt16
+                | TypeId::UInt32
+                | TypeId::UInt64
+                | TypeId::Float32
+                | TypeId::Float64
+                | TypeId::TimestampNanos
+                | TypeId::Date32
+                | TypeId::Date64
+                | TypeId::Time64
+        ),
+        IndexKind::Bitmap => !matches!(ty, TypeId::Embedding { .. }),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -628,10 +702,42 @@ pub async fn kit_create_table(
             },
         });
     }
+    let mut names = std::collections::HashSet::new();
+    let mut indexes = Vec::with_capacity(req.indexes.len());
+    for index in &req.indexes {
+        if !names.insert(&index.name) {
+            return kit_bad_request(format!("duplicate index name: {}", index.name));
+        }
+        let Some(column) = columns.iter().find(|column| column.id == index.column_id) else {
+            return kit_bad_request(format!(
+                "index {} references unknown column {}",
+                index.name, index.column_id
+            ));
+        };
+        let kind = match kit_index_kind(&index.kind) {
+            Ok(kind) => kind,
+            Err(message) => return kit_bad_request(message),
+        };
+        if !validate_index_type(kind, &column.ty) {
+            return kit_bad_request(format!(
+                "index {} kind {} is incompatible with column {} type {}",
+                index.name,
+                index.kind,
+                index.column_id,
+                type_name(&column.ty)
+            ));
+        }
+        indexes.push(IndexDef {
+            name: index.name.clone(),
+            column_id: index.column_id,
+            kind,
+            predicate: None,
+        });
+    }
     let schema = Schema {
         schema_id: 0,
         columns,
-        indexes: vec![],
+        indexes,
         colocation: vec![],
         constraints: req.constraints,
         clustered: false,
@@ -647,6 +753,17 @@ pub async fn kit_create_table(
         )
             .into_response(),
     }
+}
+
+fn kit_bad_request(message: String) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(KitErrorEnvelope {
+            status: "aborted".into(),
+            error: KitError::new("BAD_REQUEST", message),
+        }),
+    )
+        .into_response()
 }
 
 // ── Typed transaction handler ───────────────────────────────────────────────
@@ -767,9 +884,16 @@ pub enum JsonCondition {
         query: Vec<(u32, f32)>,
         k: usize,
     },
+    #[serde(rename = "minhash_similar", alias = "min_hash_similar")]
     MinHashSimilar {
         column_id: u16,
         query: Vec<u64>,
+        k: usize,
+    },
+    #[serde(rename = "minhash_similar_members")]
+    MinHashSimilarMembers {
+        column_id: u16,
+        members: Vec<Jval>,
         k: usize,
     },
 }
@@ -830,7 +954,8 @@ pub async fn kit_query(
             | JsonCondition::FmContainsAll { column_id, .. }
             | JsonCondition::Ann { column_id, .. }
             | JsonCondition::SparseMatch { column_id, .. }
-            | JsonCondition::MinHashSimilar { column_id, .. } => required.push(*column_id),
+            | JsonCondition::MinHashSimilar { column_id, .. }
+            | JsonCondition::MinHashSimilarMembers { column_id, .. } => required.push(*column_id),
         }
     }
     required.sort_unstable();
@@ -995,6 +1120,19 @@ fn parse_condition(c: &JsonCondition, schema: &Schema) -> std::result::Result<Co
         } => Condition::MinHashSimilar {
             column_id: *column_id,
             query: query.clone(),
+            k: *k,
+        },
+        JsonCondition::MinHashSimilarMembers {
+            column_id,
+            members,
+            k,
+        } => Condition::MinHashSimilar {
+            column_id: *column_id,
+            query: members
+                .iter()
+                .map(mongreldb_core::index::minhash_member_hash_v1)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(str::to_string)?,
             k: *k,
         },
     })
@@ -1251,18 +1389,98 @@ fn parse_cells(row: &[Jval], schema: &Schema) -> std::result::Result<Vec<(u16, V
     }
     let mut out = Vec::with_capacity(row.len() / 2);
     for chunk in row.chunks(2) {
-        let col_id = chunk[0]
+        let raw_col_id = chunk[0]
             .as_u64()
-            .ok_or("column id must be a non-negative integer")? as u16;
-        let expected = schema
+            .ok_or("column id must be a non-negative integer")?;
+        let col_id = u16::try_from(raw_col_id).map_err(|_| "column id must fit u16")?;
+        let column = schema
             .columns
             .iter()
             .find(|c| c.id == col_id)
-            .map(|c| c.ty.clone())
             .ok_or_else(|| format!("unknown column id {col_id}"))?;
-        out.push((col_id, json_to_value(&chunk[1], &expected)));
+        out.push((
+            col_id,
+            kit_value(&chunk[1], column, &schema.indexes)
+                .map_err(|message| format!("column {col_id}: {message}"))?,
+        ));
     }
     Ok(out)
+}
+
+fn kit_value(value: &Jval, column: &ColumnDef, indexes: &[IndexDef]) -> Result<Value, String> {
+    if value.is_null() {
+        return Ok(Value::Null);
+    }
+    match &column.ty {
+        TypeId::Embedding { dim } => {
+            let values = value
+                .as_array()
+                .ok_or("embedding must be a numeric array")?;
+            if values.len() != *dim as usize {
+                return Err(format!(
+                    "embedding dimension must be {dim}, got {}",
+                    values.len()
+                ));
+            }
+            Ok(values
+                .iter()
+                .map(|value| {
+                    let value = value.as_f64().ok_or("embedding value must be numeric")?;
+                    let value = value as f32;
+                    value
+                        .is_finite()
+                        .then_some(value)
+                        .ok_or("embedding value must be finite f32")
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(Value::Embedding)?)
+        }
+        TypeId::Bytes
+            if indexes
+                .iter()
+                .any(|index| index.column_id == column.id && index.kind == IndexKind::Sparse) =>
+        {
+            let pairs = value
+                .as_array()
+                .ok_or("sparse vector must be an array of [token_id, weight]")?;
+            let mut terms = std::collections::BTreeMap::<u32, f32>::new();
+            for pair in pairs {
+                let pair = pair
+                    .as_array()
+                    .filter(|pair| pair.len() == 2)
+                    .ok_or("sparse term must be [token_id, weight]")?;
+                let token = pair[0]
+                    .as_u64()
+                    .and_then(|token| u32::try_from(token).ok())
+                    .ok_or("sparse token_id must fit u32")?;
+                let weight = pair[1].as_f64().ok_or("sparse weight must be numeric")? as f32;
+                if !weight.is_finite() {
+                    return Err("sparse weight must be finite f32".into());
+                }
+                *terms.entry(token).or_default() += weight;
+            }
+            bincode::serialize(&terms.into_iter().collect::<Vec<_>>())
+                .map(Value::Bytes)
+                .map_err(|error| error.to_string())
+        }
+        TypeId::Bytes
+            if indexes
+                .iter()
+                .any(|index| index.column_id == column.id && index.kind == IndexKind::MinHash) =>
+        {
+            let members = value.as_array().ok_or("set must be an array")?;
+            if members
+                .iter()
+                .any(|member| !matches!(member, Jval::String(_) | Jval::Number(_) | Jval::Bool(_)))
+            {
+                return Err("set members must be strings, numbers, or booleans".into());
+            }
+            serde_json::to_vec(members)
+                .map(Value::Bytes)
+                .map_err(|error| error.to_string())
+        }
+        _ => Ok(json_to_value(value, &column.ty)),
+    }
 }
 
 /// Coerce a PK JSON value against the table's declared primary-key column.
@@ -1305,5 +1523,65 @@ pub(crate) fn value_to_json(v: &Value) -> Jval {
         Value::Decimal(d) => Jval::String(d.to_string()),
         Value::Uuid(_) | Value::Json(_) => Jval::Null,
         Value::Interval { .. } => Jval::Null,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn column(id: u16, ty: TypeId) -> ColumnDef {
+        ColumnDef {
+            id,
+            name: format!("c{id}"),
+            ty,
+            flags: ColumnFlags::empty(),
+            default_value: None,
+        }
+    }
+
+    #[test]
+    fn ai_wire_values_are_strict_and_canonical() {
+        let embedding = column(1, TypeId::Embedding { dim: 2 });
+        assert_eq!(
+            kit_value(&json!([1, -1]), &embedding, &[]).unwrap(),
+            Value::Embedding(vec![1.0, -1.0])
+        );
+        assert!(kit_value(&json!([1]), &embedding, &[])
+            .unwrap_err()
+            .contains("dimension"));
+
+        let sparse = column(2, TypeId::Bytes);
+        let sparse_index = IndexDef {
+            name: "sparse".into(),
+            column_id: 2,
+            kind: IndexKind::Sparse,
+            predicate: None,
+        };
+        let Value::Bytes(encoded) = kit_value(
+            &json!([[2, 1.0], [1, 2.0], [2, 3.0]]),
+            &sparse,
+            &[sparse_index],
+        )
+        .unwrap() else {
+            panic!("expected bytes")
+        };
+        assert_eq!(
+            bincode::deserialize::<Vec<(u32, f32)>>(&encoded).unwrap(),
+            vec![(1, 2.0), (2, 4.0)]
+        );
+
+        let set = column(3, TypeId::Bytes);
+        let set_index = IndexDef {
+            name: "set".into(),
+            column_id: 3,
+            kind: IndexKind::MinHash,
+            predicate: None,
+        };
+        assert_eq!(
+            kit_value(&json!(["a", 1, true]), &set, &[set_index.clone()]).unwrap(),
+            Value::Bytes(br#"["a",1,true]"#.to_vec())
+        );
+        assert!(kit_value(&json!([{"bad": true}]), &set, &[set_index]).is_err());
     }
 }

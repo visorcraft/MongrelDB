@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 pub const IDX_MAGIC: [u8; 8] = *b"MONGRIDX";
-pub const IDX_VERSION: u16 = 1;
+pub const IDX_VERSION: u16 = 2;
 pub const IDX_DIR: &str = "_idx";
 pub const IDX_FILENAME: &str = "global.idx";
 

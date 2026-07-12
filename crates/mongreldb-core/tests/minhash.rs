@@ -235,7 +235,9 @@ fn minhash_scale_timing() {
     // Build a corpus with ~10% near-dup density.
     let mut rng_state: u64 = 0x9E3779B97F4A7C15;
     let mut next_u64 = || {
-        rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        rng_state = rng_state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         rng_state
     };
     let vocab: u64 = 8192;
@@ -252,7 +254,10 @@ fn minhash_scale_timing() {
     }
     db.bulk_load(rows).unwrap();
     let ingest_ms = t0.elapsed().as_millis();
-    eprintln!("\n[demo2] ingested {n} rows in {ingest_ms}ms ({} rows/sec)", (n as u128 * 1000 / (ingest_ms.max(1) as u128)));
+    eprintln!(
+        "\n[demo2] ingested {n} rows in {ingest_ms}ms ({} rows/sec)",
+        (n as u128 * 1000 / (ingest_ms.max(1) as u128))
+    );
 
     // Pick 50 query docs at random, time MinHashSimilar queries.
     let q_n: usize = 50;
@@ -262,7 +267,9 @@ fn minhash_scale_timing() {
     let mut times_us: Vec<u128> = Vec::with_capacity(q_n);
     let mut total_pairs: usize = 0;
     for &id in &sample_ids {
-        let toks = match db.query(&Query::new().and(Condition::Pk(id.to_be_bytes().to_vec()))).unwrap()
+        let toks = match db
+            .query(&Query::new().and(Condition::Pk(id.to_be_bytes().to_vec())))
+            .unwrap()
             .into_iter()
             .find_map(|r| match r.columns.get(&2) {
                 Some(Value::Bytes(b)) => Some(b.clone()),
@@ -277,11 +284,13 @@ fn minhash_scale_timing() {
             .map(|t| minhash_token_hash(&t.to_string()))
             .collect();
         let t = Instant::now();
-        let res = db.query(&Query::new().and(Condition::MinHashSimilar {
-            column_id: 2,
-            query: hashes,
-            k,
-        })).unwrap();
+        let res = db
+            .query(&Query::new().and(Condition::MinHashSimilar {
+                column_id: 2,
+                query: hashes,
+                k,
+            }))
+            .unwrap();
         times_us.push(t.elapsed().as_micros());
         total_pairs += res.len();
     }
@@ -291,8 +300,17 @@ fn minhash_scale_timing() {
         times_us[idx]
     };
     eprintln!("[demo2] {q_n} queries over {n}-row MinHash index (k={k})");
-    eprintln!("[demo2]   min={}µs  p50={}µs  p95={}µs  max={}µs",
-              times_us[0], p(0.50), p(0.95), times_us.last().copied().unwrap_or(0));
-    eprintln!("[demo2] avg candidates/query = {}/{} = {}",
-              total_pairs, q_n, total_pairs / q_n.max(1));
+    eprintln!(
+        "[demo2]   min={}µs  p50={}µs  p95={}µs  max={}µs",
+        times_us[0],
+        p(0.50),
+        p(0.95),
+        times_us.last().copied().unwrap_or(0)
+    );
+    eprintln!(
+        "[demo2] avg candidates/query = {}/{} = {}",
+        total_pairs,
+        q_n,
+        total_pairs / q_n.max(1)
+    );
 }

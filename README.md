@@ -7,7 +7,7 @@
 <p align="center">
   <b>A log-structured columnar database for sub-millisecond writes, learned indexes, and AI-native access.</b>
   <br />
-  Custom <code>.sr</code> columnar format · Bε-tree memtable · WAL with group commit · eight index kinds · hybrid pushdown · MVCC snapshots · page-level encryption · declarative constraints · user/role auth · credential enforcement · replication · change data capture · DataFusion SQL · recursive CTEs · window functions · CREATE TABLE AS SELECT · materialized views · multi-statement SQL · FTS ranking · NAPI addon
+  Custom <code>.sr</code> columnar format · Bε-tree memtable · WAL with group commit · six secondary index kinds · multi-index intersection · MVCC snapshots · page-level encryption · declarative constraints · user/role auth · credential enforcement · replication · change data capture · DataFusion SQL · recursive CTEs · window functions · CREATE TABLE AS SELECT · materialized views · multi-statement SQL · FTS ranking · NAPI addon
 </p>
 
 <p align="center">
@@ -31,20 +31,22 @@ The write path is an LSM/Bε-tree: an append-only WAL with group commit feeds a
 Bε-tree memtable keyed by `(RowId, Epoch)`, which flushes to immutable sorted
 runs (`.sr` PAX columnar pages). Single-row durable update: **~7 µs**.
 
-The read path merges memtable + sorted runs under MVCC snapshot isolation. Eight
-index kinds - all resolving through a shared `RowId` space - enable hybrid
-queries that no single traditional index can serve:
+The read path merges memtable + sorted runs under MVCC snapshot isolation. Six
+user-creatable secondary index kinds resolve through a shared `RowId` space.
+Native conditions compose as strict intersections:
 
 | Index | Type | Use case |
 |---|---|---|
-| **HOT** | Height-optimized trie | Primary-key point lookup |
 | **Bitmap** | Roaring bitmap | Equality on low-cardinality columns |
 | **PGM** | Learned (shrinking-cone, ε-bounded) | Range queries |
 | **FM-index** | BWT + wavelet tree | Substring containment |
-| **HNSW** | Hierarchical navigable small world | Approximate nearest neighbor (recall@10 ≥ 0.90) |
-| **PMA** | Packed memory array | Cache-oblivious mutable sorted runs |
+| **ANN** | Binary-quantized HNSW, Hamming distance | Approximate nearest neighbor candidates |
 | **Sparse** | Inverted token lists | SPLADE-style learned-sparse retrieval (top-k by sparse dot product) |
 | **MinHash** | LSH set-similarity | AI dedup/join primitives |
+
+HNSW implements `Ann`; PGM implements `LearnedRange`. PMA is an internal
+mutable-run tier. The implicit primary-key surface currently uses a `BTreeMap`
+stand-in rather than a completed HOT trie.
 
 ## AI-native retrieval
 
@@ -73,8 +75,10 @@ This supports:
 | Time/score | PGM learned range | Recency and numeric constraints |
 
 Native conditions currently compose as conjunctive candidate-set filters.
-Applications requiring blended relevance should over-fetch candidates and
-perform exact reranking; scored hybrid retrieval is on the roadmap.
+ANN, Sparse, and MinHash calculate scores internally, but `Query` returns only
+surviving rows. MinHash returns approximate LSH candidates; exact verification
+is caller-side and cannot recover an LSH miss. Applications requiring blended
+relevance should query retrievers separately and rerank them.
 
 ## Performance profile
 
@@ -400,8 +404,8 @@ cargo run -p mongreldb-core --example hybrid_query --release   # hybrid-query de
 
 ```text
 crates/mongreldb-core/    WAL, memtable, Bε-tree, sorted runs (mmap'd), vectorized
-                          columnar codec, eight index kinds (HOT/Bitmap/PGM/FM/HNSW/
-                          PMA/Sparse/MinHash), page stats, encryption, constraints,
+                          columnar codec, six secondary index kinds (Bitmap/PGM/FM/
+                          ANN/Sparse/MinHash), page stats, encryption, constraints,
                           compaction, GC, check/doctor
 crates/mongreldb-query/   DataFusion 54 SQL + Arrow frontend (predicate/projection
                           pushdown, multi-table joins, ann_search/sparse_match UDF,

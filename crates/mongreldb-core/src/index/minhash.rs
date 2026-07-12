@@ -23,13 +23,30 @@ const NUM_PERM: usize = 128;
 const NUM_BANDS: usize = 32;
 const ROWS_PER_BAND: usize = NUM_PERM / NUM_BANDS;
 
-/// Deterministic 64-bit hash of a set token. Shared by index build (document
-/// tokens) and query construction (query tokens) so their signatures compare.
+/// Stable v1 hash for a string set member.
 pub fn minhash_token_hash(token: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    token.hash(&mut h);
-    h.finish()
+    minhash_member_hash_v1(&serde_json::Value::String(token.into())).unwrap()
+}
+
+/// Stable, typed XXH3-64 hash contract for public raw-member queries and
+/// persisted MinHash-derived index state.
+pub fn minhash_member_hash_v1(member: &serde_json::Value) -> Result<u64, &'static str> {
+    let mut canonical = Vec::new();
+    match member {
+        serde_json::Value::String(value) => {
+            canonical.push(0x01);
+            canonical.extend_from_slice(value.as_bytes());
+        }
+        serde_json::Value::Number(value) => {
+            canonical.push(0x02);
+            canonical.extend_from_slice(value.to_string().as_bytes());
+        }
+        serde_json::Value::Bool(value) => {
+            canonical.extend_from_slice(&[0x03, u8::from(*value)]);
+        }
+        _ => return Err("set member must be a string, number, or boolean"),
+    }
+    Ok(xxhash_rust::xxh3::xxh3_64_with_seed(&canonical, 0))
 }
 
 /// Tokenize a set-valued column cell (a JSON array, or a JSON string holding
@@ -45,14 +62,10 @@ pub fn token_hashes_from_bytes(bytes: &[u8]) -> Vec<u64> {
         _ => return Vec::new(),
     };
     let mut set = HashSet::new();
-    for v in arr {
-        let token = match v {
-            serde_json::Value::String(s) => s,
-            serde_json::Value::Number(n) => n.to_string(),
-            serde_json::Value::Bool(b) => b.to_string(),
-            _ => continue,
-        };
-        set.insert(minhash_token_hash(&token));
+    for member in arr {
+        if let Ok(hash) = minhash_member_hash_v1(&member) {
+            set.insert(hash);
+        }
     }
     set.into_iter().collect()
 }
@@ -194,6 +207,27 @@ pub type MinHashEntries = Vec<(RowId, Vec<u32>)>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stable_typed_hash_vectors() {
+        assert_eq!(minhash_token_hash("1"), 4_601_219_942_126_179_299);
+        assert_eq!(
+            minhash_member_hash_v1(&serde_json::json!(1)).unwrap(),
+            6_001_628_596_940_409_521
+        );
+        assert_eq!(
+            minhash_member_hash_v1(&serde_json::json!(true)).unwrap(),
+            16_169_524_375_275_942_869
+        );
+        assert_ne!(
+            minhash_token_hash("1"),
+            minhash_member_hash_v1(&serde_json::json!(1)).unwrap()
+        );
+        assert_ne!(
+            minhash_token_hash("true"),
+            minhash_member_hash_v1(&serde_json::json!(true)).unwrap()
+        );
+    }
 
     fn set(tokens: &[&str]) -> Vec<u64> {
         tokens.iter().map(|t| minhash_token_hash(t)).collect()

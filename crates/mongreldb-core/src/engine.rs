@@ -3485,6 +3485,151 @@ impl Table {
         self.rows_for_rids(&rids, snapshot)
     }
 
+    /// Return an index's ordered candidates without discarding scores.
+    pub fn retrieve(
+        &mut self,
+        retriever: &crate::query::Retriever,
+    ) -> Result<Vec<crate::query::RetrieverHit>> {
+        use crate::query::Retriever;
+        self.require_select()?;
+        self.ensure_indexes_complete()?;
+        let (column_id, k) = match retriever {
+            Retriever::Ann {
+                column_id,
+                query,
+                k,
+            } => {
+                let index = self.ann.get(column_id).ok_or_else(|| {
+                    MongrelError::InvalidArgument(format!("column {column_id} has no ANN index"))
+                })?;
+                if query.len() != index.dim() {
+                    return Err(MongrelError::InvalidArgument(format!(
+                        "ANN query dimension must be {}, got {}",
+                        index.dim(),
+                        query.len()
+                    )));
+                }
+                if query.iter().any(|value| !value.is_finite()) {
+                    return Err(MongrelError::InvalidArgument(
+                        "ANN query values must be finite".into(),
+                    ));
+                }
+                (*column_id, *k)
+            }
+            Retriever::Sparse {
+                column_id,
+                query,
+                k,
+            } => {
+                if !self.sparse.contains_key(column_id) {
+                    return Err(MongrelError::InvalidArgument(format!(
+                        "column {column_id} has no Sparse index"
+                    )));
+                }
+                if query.is_empty() || query.iter().any(|(_, weight)| !weight.is_finite()) {
+                    return Err(MongrelError::InvalidArgument(
+                        "Sparse query must be non-empty with finite weights".into(),
+                    ));
+                }
+                (*column_id, *k)
+            }
+            Retriever::MinHash {
+                column_id,
+                members,
+                k,
+            } => {
+                if !self.minhash.contains_key(column_id) {
+                    return Err(MongrelError::InvalidArgument(format!(
+                        "column {column_id} has no MinHash index"
+                    )));
+                }
+                if members.is_empty() {
+                    return Err(MongrelError::InvalidArgument(
+                        "MinHash members must not be empty".into(),
+                    ));
+                }
+                (*column_id, *k)
+            }
+        };
+        if k == 0 {
+            return Err(MongrelError::InvalidArgument(
+                "retriever k must be > 0".into(),
+            ));
+        }
+        debug_assert!(self
+            .schema
+            .columns
+            .iter()
+            .any(|column| column.id == column_id));
+        Ok(self.retrieve_index(retriever))
+    }
+
+    fn retrieve_index(
+        &self,
+        retriever: &crate::query::Retriever,
+    ) -> Vec<crate::query::RetrieverHit> {
+        use crate::query::{Retriever, RetrieverHit, RetrieverScore, SetMember};
+        let scored: Vec<(RowId, RetrieverScore)> = match retriever {
+            Retriever::Ann {
+                column_id,
+                query,
+                k,
+            } => self
+                .ann
+                .get(column_id)
+                .map(|index| {
+                    index
+                        .search(query, *k)
+                        .into_iter()
+                        .map(|(row_id, score)| (row_id, RetrieverScore::AnnHammingDistance(score)))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Retriever::Sparse {
+                column_id,
+                query,
+                k,
+            } => self
+                .sparse
+                .get(column_id)
+                .map(|index| {
+                    index
+                        .search(query, *k)
+                        .into_iter()
+                        .map(|(row_id, score)| (row_id, RetrieverScore::SparseDotProduct(score)))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Retriever::MinHash {
+                column_id,
+                members,
+                k,
+            } => self
+                .minhash
+                .get(column_id)
+                .map(|index| {
+                    let hashes: Vec<_> = members.iter().map(SetMember::hash_v1).collect();
+                    index
+                        .search(&hashes, *k)
+                        .into_iter()
+                        .map(|(row_id, score)| {
+                            (row_id, RetrieverScore::MinHashEstimatedJaccard(score))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+        scored
+            .into_iter()
+            .enumerate()
+            .map(|(rank, (row_id, score))| RetrieverHit {
+                row_id,
+                rank: rank + 1,
+                score,
+            })
+            .collect()
+    }
+
     /// Materialize the MVCC-visible, non-deleted rows for `rids` at `snapshot`,
     /// preserving the input order. Rows whose newest visible version is a
     /// tombstone, or that no longer exist, are omitted. Shared by index-served

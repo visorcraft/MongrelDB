@@ -5888,6 +5888,7 @@ fn index_kind_from_sql(using: Option<&sqlparser::ast::IndexType>) -> Result<Inde
         "brin" | "learned_range" | "range" => Ok(IndexKind::LearnedRange),
         "ann" | "hnsw" => Ok(IndexKind::Ann),
         "sparse" => Ok(IndexKind::Sparse),
+        "minhash" | "lsh" => Ok(IndexKind::MinHash),
         other => Err(MongrelQueryError::Schema(format!(
             "unsupported index type: {other}"
         ))),

@@ -79,6 +79,61 @@ pub enum Condition {
     IsNotNull { column_id: u16 },
 }
 
+/// Ordered candidate generator. Unlike [`Condition`], retrieval preserves the
+/// index score and rank.
+#[derive(Debug, Clone)]
+pub enum Retriever {
+    Ann {
+        column_id: u16,
+        query: Vec<f32>,
+        k: usize,
+    },
+    Sparse {
+        column_id: u16,
+        query: Vec<(u32, f32)>,
+        k: usize,
+    },
+    MinHash {
+        column_id: u16,
+        members: Vec<SetMember>,
+        k: usize,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum SetMember {
+    String(String),
+    Number(serde_json::Number),
+    Boolean(bool),
+}
+
+impl SetMember {
+    pub fn hash_v1(&self) -> u64 {
+        let value = match self {
+            Self::String(value) => serde_json::Value::String(value.clone()),
+            Self::Number(value) => serde_json::Value::Number(value.clone()),
+            Self::Boolean(value) => serde_json::Value::Bool(*value),
+        };
+        crate::index::minhash_member_hash_v1(&value).expect("SetMember is always scalar")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RetrieverScore {
+    AnnHammingDistance(u32),
+    SparseDotProduct(f32),
+    MinHashEstimatedJaccard(f32),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RetrieverHit {
+    pub row_id: crate::RowId,
+    /// One-based rank.
+    pub rank: usize,
+    pub score: RetrieverScore,
+}
+
 /// A conjunctive query. Empty ⇒ all rows.
 #[derive(Debug, Default, Clone)]
 pub struct Query {
@@ -111,8 +166,20 @@ pub fn canonical_query_key(
     projection: Option<&[u16]>,
     epoch: u64,
 ) -> u64 {
+    canonical_query_key_with_version(QUERY_CACHE_KEY_VERSION, conditions, projection, epoch)
+}
+
+const QUERY_CACHE_KEY_VERSION: u64 = 2;
+
+fn canonical_query_key_with_version(
+    version: u64,
+    conditions: &[Condition],
+    projection: Option<&[u16]>,
+    epoch: u64,
+) -> u64 {
     let fold = |seed: u64, b: u64| -> u64 { seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(b) };
-    let mut acc = fold(0xA5A5_A5A5_A5A5_A5A5, epoch);
+    let mut acc = fold(0xA5A5_A5A5_A5A5_A5A5, version);
+    acc = fold(acc, epoch);
     // Order-independent: per-condition digests, sorted, then folded.
     let mut digests: Vec<u64> = conditions.iter().map(hash_condition).collect();
     digests.sort_unstable();
@@ -189,17 +256,18 @@ fn hash_condition(c: &Condition) -> u64 {
             column_id,
             patterns,
         } => {
-            10u8.hash(&mut h);
+            5u8.hash(&mut h);
             column_id.hash(&mut h);
             let mut sorted: Vec<&[u8]> = patterns.iter().map(|p| p.as_slice()).collect();
             sorted.sort();
+            sorted.dedup();
             sorted.len().hash(&mut h);
             for p in sorted {
                 p.hash(&mut h);
             }
         }
         Condition::Range { column_id, lo, hi } => {
-            5u8.hash(&mut h);
+            6u8.hash(&mut h);
             column_id.hash(&mut h);
             lo.hash(&mut h);
             hi.hash(&mut h);
@@ -211,7 +279,7 @@ fn hash_condition(c: &Condition) -> u64 {
             hi,
             hi_inclusive,
         } => {
-            6u8.hash(&mut h);
+            7u8.hash(&mut h);
             column_id.hash(&mut h);
             lo.to_bits().hash(&mut h);
             lo_inclusive.hash(&mut h);
@@ -223,7 +291,7 @@ fn hash_condition(c: &Condition) -> u64 {
             query,
             k,
         } => {
-            7u8.hash(&mut h);
+            8u8.hash(&mut h);
             column_id.hash(&mut h);
             k.hash(&mut h);
             let mut q: Vec<(u32, u32)> = query.iter().map(|(t, w)| (*t, w.to_bits())).collect();
@@ -238,25 +306,26 @@ fn hash_condition(c: &Condition) -> u64 {
             query,
             k,
         } => {
-            10u8.hash(&mut h);
+            9u8.hash(&mut h);
             column_id.hash(&mut h);
             k.hash(&mut h);
             let mut q = query.clone();
             q.sort_unstable();
+            q.dedup();
             for t in q {
                 t.hash(&mut h);
             }
         }
         Condition::IsNull { column_id } => {
-            8u8.hash(&mut h);
+            10u8.hash(&mut h);
             column_id.hash(&mut h);
         }
         Condition::IsNotNull { column_id } => {
-            9u8.hash(&mut h);
+            11u8.hash(&mut h);
             column_id.hash(&mut h);
         }
         Condition::BytesPrefix { column_id, prefix } => {
-            11u8.hash(&mut h);
+            12u8.hash(&mut h);
             column_id.hash(&mut h);
             prefix.hash(&mut h);
         }
@@ -336,6 +405,42 @@ mod tests {
             canonical_query_key(&a.conditions, None, e),
             canonical_query_key(&b.conditions, None, e),
             "condition order must not affect the key"
+        );
+
+        let minhash = Condition::MinHashSimilar {
+            column_id: 4,
+            query: vec![3, 1, 1, 2],
+            k: 5,
+        };
+        let minhash_canonical = Condition::MinHashSimilar {
+            column_id: 4,
+            query: vec![1, 2, 3],
+            k: 5,
+        };
+        assert_eq!(
+            canonical_query_key(std::slice::from_ref(&minhash), None, e),
+            canonical_query_key(&[minhash_canonical], None, e),
+        );
+
+        let fm = Condition::FmContainsAll {
+            column_id: 4,
+            patterns: vec![b"b".to_vec(), b"a".to_vec(), b"a".to_vec()],
+        };
+        let fm_canonical = Condition::FmContainsAll {
+            column_id: 4,
+            patterns: vec![b"a".to_vec(), b"b".to_vec()],
+        };
+        assert_eq!(
+            canonical_query_key(std::slice::from_ref(&fm), None, e),
+            canonical_query_key(&[fm_canonical], None, e),
+        );
+        assert_ne!(
+            canonical_query_key(std::slice::from_ref(&fm), None, e),
+            canonical_query_key(std::slice::from_ref(&minhash), None, e),
+        );
+        assert_ne!(
+            canonical_query_key_with_version(1, &a.conditions, None, e),
+            canonical_query_key_with_version(2, &a.conditions, None, e),
         );
 
         // BitmapIn dedup + sort.

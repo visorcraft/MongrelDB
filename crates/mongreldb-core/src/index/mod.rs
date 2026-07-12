@@ -20,6 +20,8 @@ pub use bitmap::BitmapIndex;
 pub use fm_index::FmIndex;
 pub use hot::HotIndex;
 pub use learned_range::{ColumnLearnedRange, ColumnLearnedRangeSnapshot};
-pub use minhash::{minhash_token_hash, token_hashes_from_bytes, MinHashIndex};
+pub use minhash::{
+    minhash_member_hash_v1, minhash_token_hash, token_hashes_from_bytes, MinHashIndex,
+};
 pub use pgm::LearnedIndex;
 pub use sparse::SparseIndex;
