@@ -2,10 +2,14 @@
 # Bump the MongrelDB workspace version everywhere it's pinned: the shared
 # workspace.package.version (covers mongreldb-core/mongreldb-query via
 # `version.workspace = true`), each standalone crate's own version
-# (mongreldb-client/-perf/-server/-node) plus their internal path-dependency
-# pins on mongreldb-core/mongreldb-query, and the Node addon's
-# package.json/package-lock.json. Then regenerates every Cargo.lock (root
-# workspace + each standalone crate) so the bump is fully reflected.
+# (mongreldb-client/-perf/-server/-node/-ffi/-kit-ffi/-jni) plus their internal
+# path-dependency pins on mongreldb-core/mongreldb-query, the Node addon's
+# package.json/package-lock.json, the JNI pom.xml, the README JAR filenames,
+# and the ffi-release workflow JAR filenames. Then regenerates every Cargo.lock
+# (root workspace + each standalone crate) so the bump is fully reflected.
+#
+# Note: external crates.io deps (mongreldb-kit / mongreldb-kit-core) are NOT
+# bumped — those track the separate mongreldb-kit repo's release cycle.
 #
 # Usage: scripts/bump-version.sh NEW_VERSION
 # Example: scripts/bump-version.sh 0.19.5
@@ -30,6 +34,9 @@ echo "Bumping mongreldb $OLD -> $NEW"
 
 # Every Cargo.toml carrying this workspace's own version and/or a path-dep
 # pin on mongreldb-core/mongreldb-query. Add new standalone crates here.
+# Note: standalone FFI/JNI/kit-ffi crates depend on mongreldb-kit from
+# crates.io (e.g. "0.48") — those pins are intentionally NOT bumped here
+# because they track the separate mongreldb-kit repo's release cycle.
 CARGO_FILES=(
   Cargo.toml
   crates/mongreldb-query/Cargo.toml
@@ -37,6 +44,9 @@ CARGO_FILES=(
   crates/mongreldb-perf/Cargo.toml
   crates/mongreldb-server/Cargo.toml
   crates/mongreldb-node/Cargo.toml
+  crates/mongreldb-ffi/Cargo.toml
+  crates/mongreldb-kit-ffi/Cargo.toml
+  crates/mongreldb-jni/Cargo.toml
 )
 for f in "${CARGO_FILES[@]}"; do
   sed -i "s/version = \"$OLD\"/version = \"$NEW\"/g" "$f"
@@ -44,9 +54,18 @@ done
 sed -i "s/\"version\": \"$OLD\"/\"version\": \"$NEW\"/g" \
   crates/mongreldb-node/package.json crates/mongreldb-node/package-lock.json
 
+# JNI Maven pom.xml version.
+sed -i "s|<version>$OLD</version>|<version>$NEW</version>|g" \
+  crates/mongreldb-jni/java/pom.xml
+
+# README and ffi-release workflow JAR filenames (mongreldb-jni-VERSION-*.jar).
+sed -i "s/mongreldb-jni-$OLD/mongreldb-jni-$NEW/g" \
+  README.md .github/workflows/ffi-release.yml
+
 echo "Regenerating lockfiles (this compiles each crate; can take a while)..."
 cargo check --workspace --all-features >/dev/null
-for d in mongreldb-client mongreldb-server mongreldb-perf mongreldb-node; do
+for d in mongreldb-client mongreldb-server mongreldb-perf mongreldb-node \
+         mongreldb-ffi mongreldb-kit-ffi mongreldb-jni; do
   echo "  crates/$d"
   (cd "crates/$d" && cargo check >/dev/null)
 done
@@ -54,7 +73,10 @@ done
 # Safety net: catch any file the hardcoded list above missed (e.g. a new
 # crate). Warns rather than fails -- Cargo.lock/target/node_modules always
 # mention the old version transitively and are expected here.
-STRAY="$(grep -rl "\"$OLD\"" --include="*.toml" --include="*.json" . 2>/dev/null \
+STRAY="$(grep -rl "\"$OLD\"" \
+  --include="*.toml" --include="*.json" --include="*.xml" \
+  --include="*.yml" --include="*.yaml" --include="*.md" \
+  . 2>/dev/null \
   | grep -v -E "/target/|node_modules|Cargo\.lock" || true)"
 if [[ -n "$STRAY" ]]; then
   echo "warning: these files still mention $OLD -- check whether they need the bump too:" >&2
