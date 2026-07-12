@@ -53,7 +53,11 @@ fn throw_java(env: &mut JNIEnv, class: &str, message: &str) {
 /// Map a KitError to a Java exception and throw it. Returns the jlong/error
 /// value the JNI function should return (0 for handles, empty for void).
 fn throw_kit_error(env: &mut JNIEnv, e: &mongreldb_kit::KitError) {
-    throw_java(env, "com/visorcraft/mongreldb/QueryException", &format!("{e}"));
+    throw_java(
+        env,
+        "com/visorcraft/mongreldb/QueryException",
+        &format!("{e}"),
+    );
 }
 
 /// SAFETY: cast a jlong handle back to the JniDatabase wrapper.
@@ -154,7 +158,11 @@ pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativ
     let db = match unsafe { handle_to_db(handle) } {
         Some(d) => d,
         None => {
-            throw_java(&mut env, "com/visorcraft/mongreldb/QueryException", "database handle is null");
+            throw_java(
+                &mut env,
+                "com/visorcraft/mongreldb/QueryException",
+                "database handle is null",
+            );
             return std::ptr::null_mut();
         }
     };
@@ -197,7 +205,11 @@ pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativ
     let db = match unsafe { handle_to_db(handle) } {
         Some(d) => d,
         None => {
-            throw_java(&mut env, "com/visorcraft/mongreldb/QueryException", "database handle is null");
+            throw_java(
+                &mut env,
+                "com/visorcraft/mongreldb/QueryException",
+                "database handle is null",
+            );
             return std::ptr::null_mut();
         }
     };
@@ -228,7 +240,11 @@ pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativ
     let db = match unsafe { handle_to_db(handle) } {
         Some(d) => d,
         None => {
-            throw_java(&mut env, "com/visorcraft/mongreldb/QueryException", "database handle is null");
+            throw_java(
+                &mut env,
+                "com/visorcraft/mongreldb/QueryException",
+                "database handle is null",
+            );
             return;
         }
     };
@@ -275,7 +291,11 @@ pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativ
     let db = match unsafe { handle_to_db(handle) } {
         Some(d) => d,
         None => {
-            throw_java(&mut env, "com/visorcraft/mongreldb/QueryException", "database handle is null");
+            throw_java(
+                &mut env,
+                "com/visorcraft/mongreldb/QueryException",
+                "database handle is null",
+            );
             return std::ptr::null_mut();
         }
     };
@@ -396,63 +416,81 @@ fn query_dispatch(env: &mut JNIEnv, handle: jlong, query_json: JString, kind: &s
     let db = match unsafe { handle_to_db(handle) } {
         Some(d) => d,
         None => {
-            throw_java(env, "com/visorcraft/mongreldb/QueryException", "database handle is null");
+            throw_java(
+                env,
+                "com/visorcraft/mongreldb/QueryException",
+                "database handle is null",
+            );
             return std::ptr::null_mut();
         }
     };
     let json_str = jstring_to_string(env, query_json);
 
-    use mongreldb_kit_core::{AggregateQuery, Delete, Insert, JoinQuery, Query, Select, Update, Upsert};
+    use mongreldb_kit_core::{
+        AggregateQuery, Delete, Insert, JoinQuery, Query, Select, Update, Upsert,
+    };
 
-    let result_json = db.db.borrow().transaction(0, |txn| -> Result<String, mongreldb_kit::KitError> {
-        match kind {
-            "select" => {
-                let q: Select = serde_json::from_str(&json_str)
-                    .map_err(|e| mongreldb_kit::KitError::Storage(e.to_string()))?;
-                let rows = txn.select(&Query::Select(q.clone()))?;
-                let maps: Vec<_> = rows.iter().map(|r| &r.values).collect();
-                serde_json::to_string(&maps).map_err(|e| mongreldb_kit::KitError::Storage(e.to_string()))
-            }
-            "join" => {
-                let q: JoinQuery = serde_json::from_str(&json_str)
-                    .map_err(|e| mongreldb_kit::KitError::Storage(e.to_string()))?;
-                let rows = txn.join(&q.clone())?;
-                serde_json::to_string(&rows).map_err(|e| mongreldb_kit::KitError::Storage(e.to_string()))
-            }
-            "aggregate" => {
-                let q: AggregateQuery = serde_json::from_str(&json_str)
-                    .map_err(|e| mongreldb_kit::KitError::Storage(e.to_string()))?;
-                let rows = txn.aggregate(&q.clone())?;
-                let maps: Vec<_> = rows.iter().map(|r| &r.values).collect();
-                serde_json::to_string(&maps).map_err(|e| mongreldb_kit::KitError::Storage(e.to_string()))
-            }
-            "insert" => {
-                let q: Insert = serde_json::from_str(&json_str)
-                    .map_err(|e| mongreldb_kit::KitError::Storage(e.to_string()))?;
-                let vals = txn.execute(&Query::Insert(q.clone()))?;
-                serde_json::to_string(&vals).map_err(|e| mongreldb_kit::KitError::Storage(e.to_string()))
-            }
-            "update" => {
-                let q: Update = serde_json::from_str(&json_str)
-                    .map_err(|e| mongreldb_kit::KitError::Storage(e.to_string()))?;
-                let vals = txn.execute(&Query::Update(q.clone()))?;
-                serde_json::to_string(&vals).map_err(|e| mongreldb_kit::KitError::Storage(e.to_string()))
-            }
-            "upsert" => {
-                let q: Upsert = serde_json::from_str(&json_str)
-                    .map_err(|e| mongreldb_kit::KitError::Storage(e.to_string()))?;
-                let vals = txn.execute(&Query::Upsert(q.clone()))?;
-                serde_json::to_string(&vals).map_err(|e| mongreldb_kit::KitError::Storage(e.to_string()))
-            }
-            "delete" => {
-                let q: Delete = serde_json::from_str(&json_str)
-                    .map_err(|e| mongreldb_kit::KitError::Storage(e.to_string()))?;
-                let vals = txn.execute(&Query::Delete(q.clone()))?;
-                serde_json::to_string(&vals).map_err(|e| mongreldb_kit::KitError::Storage(e.to_string()))
-            }
-            _ => Err(mongreldb_kit::KitError::Storage(format!("unknown query kind: {kind}"))),
-        }
-    });
+    let result_json =
+        db.db
+            .borrow()
+            .transaction(0, |txn| -> Result<String, mongreldb_kit::KitError> {
+                match kind {
+                    "select" => {
+                        let q: Select = serde_json::from_str(&json_str)
+                            .map_err(|e| mongreldb_kit::KitError::Storage(e.to_string()))?;
+                        let rows = txn.select(&Query::Select(q.clone()))?;
+                        let maps: Vec<_> = rows.iter().map(|r| &r.values).collect();
+                        serde_json::to_string(&maps)
+                            .map_err(|e| mongreldb_kit::KitError::Storage(e.to_string()))
+                    }
+                    "join" => {
+                        let q: JoinQuery = serde_json::from_str(&json_str)
+                            .map_err(|e| mongreldb_kit::KitError::Storage(e.to_string()))?;
+                        let rows = txn.join(&q.clone())?;
+                        serde_json::to_string(&rows)
+                            .map_err(|e| mongreldb_kit::KitError::Storage(e.to_string()))
+                    }
+                    "aggregate" => {
+                        let q: AggregateQuery = serde_json::from_str(&json_str)
+                            .map_err(|e| mongreldb_kit::KitError::Storage(e.to_string()))?;
+                        let rows = txn.aggregate(&q.clone())?;
+                        let maps: Vec<_> = rows.iter().map(|r| &r.values).collect();
+                        serde_json::to_string(&maps)
+                            .map_err(|e| mongreldb_kit::KitError::Storage(e.to_string()))
+                    }
+                    "insert" => {
+                        let q: Insert = serde_json::from_str(&json_str)
+                            .map_err(|e| mongreldb_kit::KitError::Storage(e.to_string()))?;
+                        let vals = txn.execute(&Query::Insert(q.clone()))?;
+                        serde_json::to_string(&vals)
+                            .map_err(|e| mongreldb_kit::KitError::Storage(e.to_string()))
+                    }
+                    "update" => {
+                        let q: Update = serde_json::from_str(&json_str)
+                            .map_err(|e| mongreldb_kit::KitError::Storage(e.to_string()))?;
+                        let vals = txn.execute(&Query::Update(q.clone()))?;
+                        serde_json::to_string(&vals)
+                            .map_err(|e| mongreldb_kit::KitError::Storage(e.to_string()))
+                    }
+                    "upsert" => {
+                        let q: Upsert = serde_json::from_str(&json_str)
+                            .map_err(|e| mongreldb_kit::KitError::Storage(e.to_string()))?;
+                        let vals = txn.execute(&Query::Upsert(q.clone()))?;
+                        serde_json::to_string(&vals)
+                            .map_err(|e| mongreldb_kit::KitError::Storage(e.to_string()))
+                    }
+                    "delete" => {
+                        let q: Delete = serde_json::from_str(&json_str)
+                            .map_err(|e| mongreldb_kit::KitError::Storage(e.to_string()))?;
+                        let vals = txn.execute(&Query::Delete(q.clone()))?;
+                        serde_json::to_string(&vals)
+                            .map_err(|e| mongreldb_kit::KitError::Storage(e.to_string()))
+                    }
+                    _ => Err(mongreldb_kit::KitError::Storage(format!(
+                        "unknown query kind: {kind}"
+                    ))),
+                }
+            });
 
     match result_json {
         Ok(json) => env

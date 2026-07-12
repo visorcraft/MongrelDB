@@ -1,6 +1,6 @@
-package dev.visorcraft.mongreldb.native_mode;
+package com.visorcraft.mongreldb.native_mode;
 
-import dev.visorcraft.mongreldb.native_package.NativeLoader;
+import com.visorcraft.mongreldb.native_package.NativeLoader;
 
 /**
  * In-process embedded MongrelDB database via JNI. No daemon, no HTTP overhead -

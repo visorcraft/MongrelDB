@@ -1,4 +1,4 @@
-package dev.visorcraft.mongreldb.native_package;
+package com.visorcraft.mongreldb.native_package;
 
 import java.io.IOException;
 import java.io.InputStream;
