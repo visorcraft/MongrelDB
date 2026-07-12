@@ -9,7 +9,7 @@ file on disk, and start reading and writing data.
 
 What makes MongrelDB different is how fast it is at single-row operations
 (writes, updates, deletes) and how many ways it can search data. A single
-row write takes about 6 microseconds. It has seven different index types,
+row write takes about 6 microseconds. It has eight different index types,
 including ones for text search, similarity search, and AI embeddings.
 
 ## Prerequisites

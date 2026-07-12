@@ -21,7 +21,7 @@ vector similarity, range queries, and more.
    engine, WHERE pushdown, result caching, materialized views
 5. **[Native Queries](05-native-queries.md)** - the Condition API: composing
    bitmap + range + text + vector searches in a single call
-6. **[Indexes](06-indexes.md)** - the seven index types explained, and when
+6. **[Indexes](06-indexes.md)** - the eight index types explained, and when
    to use each
 7. **[Encryption](07-encryption.md)** - protecting data at rest with
    AES-256-GCM and a passphrase
