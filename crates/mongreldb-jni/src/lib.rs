@@ -7,9 +7,9 @@
 //! # JNI method mapping
 //!
 //! Each exported function follows the JNI naming convention:
-//! `Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_native<method>`.
+//! `Java_com_visorcraft_mongreldb_native_1mode_NativeDB_native<method>`.
 //!
-//! The JVM class `dev.visorcraft.mongreldb.native.NativeDB` declares these
+//! The JVM class `com.visorcraft.mongreldb.native.NativeDB` declares these
 //! as `native` methods. The handle (Kit `Database` wrapped in `Rc<RefCell>`)
 //! is passed as a `jlong` (reinterpret cast).
 //!
@@ -44,7 +44,7 @@ fn jstring_to_string(env: &mut JNIEnv, s: JString) -> String {
 }
 
 /// Throw a Java exception with the given class and message. The class should
-/// be a fully-qualified JVM class name using slashes (e.g. "dev/visorcraft/
+/// be a fully-qualified JVM class name using slashes (e.g. "com/visorcraft/
 /// mongreldb/QueryException").
 fn throw_java(env: &mut JNIEnv, class: &str, message: &str) {
     let _ = env.throw_new(class, message);
@@ -53,7 +53,7 @@ fn throw_java(env: &mut JNIEnv, class: &str, message: &str) {
 /// Map a KitError to a Java exception and throw it. Returns the jlong/error
 /// value the JNI function should return (0 for handles, empty for void).
 fn throw_kit_error(env: &mut JNIEnv, e: &mongreldb_kit::KitError) {
-    throw_java(env, "dev/visorcraft/mongreldb/QueryException", &format!("{e}"));
+    throw_java(env, "com/visorcraft/mongreldb/QueryException", &format!("{e}"));
 }
 
 /// SAFETY: cast a jlong handle back to the JniDatabase wrapper.
@@ -76,7 +76,7 @@ fn db_to_handle(db: JniDatabase) -> jlong {
 
 /// Opens an existing Kit database. Java: `native long open(String path)`.
 #[no_mangle]
-pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativeOpen(
+pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeOpen(
     mut env: JNIEnv,
     _class: JClass,
     path: JString,
@@ -96,7 +96,7 @@ pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativ
 /// Creates a fresh Kit database with a JSON schema.
 /// Java: `native long create(String path, String schemaJson)`.
 #[no_mangle]
-pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativeCreate(
+pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeCreate(
     mut env: JNIEnv,
     _class: JClass,
     path: JString,
@@ -109,7 +109,7 @@ pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativ
         Err(e) => {
             throw_java(
                 &mut env,
-                "dev/visorcraft/mongreldb/QueryException",
+                "com/visorcraft/mongreldb/QueryException",
                 &format!("failed to parse schema JSON: {e}"),
             );
             return 0;
@@ -128,7 +128,7 @@ pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativ
 
 /// Closes and frees the database handle. Java: `native void close(long handle)`.
 #[no_mangle]
-pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativeClose(
+pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeClose(
     _env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -145,7 +145,7 @@ pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativ
 /// Runs SQL and returns a JSON array of row objects.
 /// Java: `native String sqlRows(long handle, String sql)`.
 #[no_mangle]
-pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativeSqlRows(
+pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeSqlRows(
     mut env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -154,7 +154,7 @@ pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativ
     let db = match unsafe { handle_to_db(handle) } {
         Some(d) => d,
         None => {
-            throw_java(&mut env, "dev/visorcraft/mongreldb/QueryException", "database handle is null");
+            throw_java(&mut env, "com/visorcraft/mongreldb/QueryException", "database handle is null");
             return std::ptr::null_mut();
         }
     };
@@ -173,7 +173,7 @@ pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativ
         Err(e) => {
             throw_java(
                 &mut env,
-                "dev/visorcraft/mongreldb/QueryException",
+                "com/visorcraft/mongreldb/QueryException",
                 &format!("JSON serialization failed: {e}"),
             );
             return std::ptr::null_mut();
@@ -188,7 +188,7 @@ pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativ
 /// Runs SQL and returns Arrow IPC file bytes.
 /// Java: `native byte[] sqlArrow(long handle, String sql)`.
 #[no_mangle]
-pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativeSqlArrow(
+pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeSqlArrow(
     mut env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -197,7 +197,7 @@ pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativ
     let db = match unsafe { handle_to_db(handle) } {
         Some(d) => d,
         None => {
-            throw_java(&mut env, "dev/visorcraft/mongreldb/QueryException", "database handle is null");
+            throw_java(&mut env, "com/visorcraft/mongreldb/QueryException", "database handle is null");
             return std::ptr::null_mut();
         }
     };
@@ -219,7 +219,7 @@ pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativ
 /// Runs the Kit migration runner.
 /// Java: `native void migrate(long handle, String migrationsJson)`.
 #[no_mangle]
-pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativeMigrate(
+pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeMigrate(
     mut env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -228,7 +228,7 @@ pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativ
     let db = match unsafe { handle_to_db(handle) } {
         Some(d) => d,
         None => {
-            throw_java(&mut env, "dev/visorcraft/mongreldb/QueryException", "database handle is null");
+            throw_java(&mut env, "com/visorcraft/mongreldb/QueryException", "database handle is null");
             return;
         }
     };
@@ -239,7 +239,7 @@ pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativ
         Err(e) => {
             throw_java(
                 &mut env,
-                "dev/visorcraft/mongreldb/QueryException",
+                "com/visorcraft/mongreldb/QueryException",
                 &format!("failed to parse migrations JSON: {e}"),
             );
             return;
@@ -252,7 +252,7 @@ pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativ
         Err(_) => {
             throw_java(
                 &mut env,
-                "dev/visorcraft/mongreldb/QueryException",
+                "com/visorcraft/mongreldb/QueryException",
                 "database is in use (borrow conflict)",
             );
             return;
@@ -267,7 +267,7 @@ pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativ
 /// Reads applied migrations as a JSON array.
 /// Java: `native String appliedMigrations(long handle)`.
 #[no_mangle]
-pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativeAppliedMigrations(
+pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeAppliedMigrations(
     mut env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -275,7 +275,7 @@ pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativ
     let db = match unsafe { handle_to_db(handle) } {
         Some(d) => d,
         None => {
-            throw_java(&mut env, "dev/visorcraft/mongreldb/QueryException", "database handle is null");
+            throw_java(&mut env, "com/visorcraft/mongreldb/QueryException", "database handle is null");
             return std::ptr::null_mut();
         }
     };
@@ -297,7 +297,7 @@ pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativ
 /// Rebuild the SQL session after schema changes.
 /// Java: `native void refreshSqlSession(long handle)`.
 #[no_mangle]
-pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativeRefreshSqlSession(
+pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeRefreshSqlSession(
     mut env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -314,7 +314,7 @@ pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativ
 /// Runs a SELECT query via the Kit query builder.
 /// Java: `native String querySelect(long handle, String queryJson)`.
 #[no_mangle]
-pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativeQuerySelect(
+pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeQuerySelect(
     mut env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -325,7 +325,7 @@ pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativ
 
 /// Runs a JOIN query.
 #[no_mangle]
-pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativeQueryJoin(
+pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeQueryJoin(
     mut env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -336,7 +336,7 @@ pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativ
 
 /// Runs an AGGREGATE query.
 #[no_mangle]
-pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativeQueryAggregate(
+pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeQueryAggregate(
     mut env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -347,7 +347,7 @@ pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativ
 
 /// Runs an INSERT query.
 #[no_mangle]
-pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativeQueryInsert(
+pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeQueryInsert(
     mut env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -358,7 +358,7 @@ pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativ
 
 /// Runs an UPDATE query.
 #[no_mangle]
-pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativeQueryUpdate(
+pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeQueryUpdate(
     mut env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -369,7 +369,7 @@ pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativ
 
 /// Runs an UPSERT query.
 #[no_mangle]
-pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativeQueryUpsert(
+pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeQueryUpsert(
     mut env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -380,7 +380,7 @@ pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativ
 
 /// Runs a DELETE query.
 #[no_mangle]
-pub extern "system" fn Java_dev_visorcraft_mongreldb_native_1mode_NativeDB_nativeQueryDelete(
+pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeQueryDelete(
     mut env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -396,7 +396,7 @@ fn query_dispatch(env: &mut JNIEnv, handle: jlong, query_json: JString, kind: &s
     let db = match unsafe { handle_to_db(handle) } {
         Some(d) => d,
         None => {
-            throw_java(env, "dev/visorcraft/mongreldb/QueryException", "database handle is null");
+            throw_java(env, "com/visorcraft/mongreldb/QueryException", "database handle is null");
             return std::ptr::null_mut();
         }
     };
