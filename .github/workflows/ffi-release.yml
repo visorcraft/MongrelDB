@@ -277,11 +277,6 @@ jobs:
             os: linux
             arch: x64
             apt: ''
-          - runner: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            os: linux
-            arch: x64-musl
-            apt: musl-tools
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             os: linux
@@ -360,6 +355,7 @@ jobs:
           fi
           mvn -B -ntp package
           # Rename to include platform in the filename.
+          mkdir -p ../../../dist
           cp target/mongreldb-jni-0.49.0.jar ../../../dist/mongreldb-jni-0.49.0-${{ matrix.os }}-${{ matrix.arch }}.jar
 
       - uses: actions/upload-artifact@v7
