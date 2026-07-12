@@ -3494,9 +3494,14 @@ impl Table {
         &mut self,
         retriever: &crate::query::Retriever,
     ) -> Result<Vec<crate::query::RetrieverHit>> {
-        use crate::query::Retriever;
         self.require_select()?;
         self.ensure_indexes_complete()?;
+        self.validate_retriever(retriever)?;
+        Ok(self.retrieve_index(retriever))
+    }
+
+    fn validate_retriever(&self, retriever: &crate::query::Retriever) -> Result<()> {
+        use crate::query::Retriever;
         let (column_id, k) = match retriever {
             Retriever::Ann {
                 column_id,
@@ -3565,7 +3570,7 @@ impl Table {
             .columns
             .iter()
             .any(|column| column.id == column_id));
-        Ok(self.retrieve_index(retriever))
+        Ok(())
     }
 
     fn retrieve_index(
@@ -3632,6 +3637,377 @@ impl Table {
                 score,
             })
             .collect()
+    }
+
+    fn retrieve_filtered(
+        &self,
+        retriever: &crate::query::Retriever,
+        allowed: &RowIdSet,
+    ) -> Vec<crate::query::RetrieverHit> {
+        use crate::query::{Retriever, RetrieverHit, RetrieverScore, SetMember};
+        let scored: Vec<(RowId, RetrieverScore)> = match retriever {
+            Retriever::Ann {
+                column_id,
+                query,
+                k,
+            } => {
+                let Some(index) = self.ann.get(column_id) else {
+                    return Vec::new();
+                };
+                let cap = index.len().min(k.saturating_mul(64).max(1024));
+                let mut breadth = (*k).max(1).min(cap);
+                let mut filtered = loop {
+                    let mut seen = std::collections::HashSet::new();
+                    let filtered: Vec<_> = index
+                        .search(query, breadth)
+                        .into_iter()
+                        .filter(|(row_id, _)| allowed.contains(row_id.0) && seen.insert(*row_id))
+                        .map(|(row_id, score)| (row_id, RetrieverScore::AnnHammingDistance(score)))
+                        .collect();
+                    if filtered.len() >= *k || breadth >= cap {
+                        break filtered;
+                    }
+                    breadth = breadth.saturating_mul(2).min(cap);
+                };
+                filtered.truncate(*k);
+                filtered
+            }
+            Retriever::Sparse {
+                column_id,
+                query,
+                k,
+            } => self
+                .sparse
+                .get(column_id)
+                .map(|index| {
+                    index
+                        .search_filtered(query, *k, |row_id| allowed.contains(row_id.0))
+                        .into_iter()
+                        .map(|(row_id, score)| (row_id, RetrieverScore::SparseDotProduct(score)))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Retriever::MinHash {
+                column_id,
+                members,
+                k,
+            } => self
+                .minhash
+                .get(column_id)
+                .map(|index| {
+                    let hashes: Vec<_> = members.iter().map(SetMember::hash_v1).collect();
+                    index
+                        .search_filtered(&hashes, *k, |row_id| allowed.contains(row_id.0))
+                        .into_iter()
+                        .map(|(row_id, score)| {
+                            (row_id, RetrieverScore::MinHashEstimatedJaccard(score))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+        scored
+            .into_iter()
+            .enumerate()
+            .map(|(rank, (row_id, score))| RetrieverHit {
+                row_id,
+                rank: rank + 1,
+                score,
+            })
+            .collect()
+    }
+
+    /// Filter-aware union and reciprocal-rank fusion over scored retrievers.
+    pub fn search(
+        &mut self,
+        request: &crate::query::SearchRequest,
+    ) -> Result<Vec<crate::query::SearchHit>> {
+        use crate::query::{ComponentScore, Fusion, SearchHit};
+        self.require_select()?;
+        self.ensure_indexes_complete()?;
+        if request.limit == 0 {
+            return Err(MongrelError::InvalidArgument(
+                "search limit must be > 0".into(),
+            ));
+        }
+        if request.retrievers.is_empty() {
+            return Err(MongrelError::InvalidArgument(
+                "search requires at least one retriever".into(),
+            ));
+        }
+        let mut names = std::collections::HashSet::new();
+        for named in &request.retrievers {
+            if named.name.is_empty() || !names.insert(named.name.as_str()) {
+                return Err(MongrelError::InvalidArgument(
+                    "retriever names must be non-empty and unique".into(),
+                ));
+            }
+            if !named.weight.is_finite() || named.weight < 0.0 {
+                return Err(MongrelError::InvalidArgument(
+                    "retriever weight must be finite and non-negative".into(),
+                ));
+            }
+            self.validate_retriever(&named.retriever)?;
+        }
+        let projection = request
+            .projection
+            .clone()
+            .unwrap_or_else(|| self.schema.columns.iter().map(|column| column.id).collect());
+        for column_id in &projection {
+            if !self
+                .schema
+                .columns
+                .iter()
+                .any(|column| column.id == *column_id)
+            {
+                return Err(MongrelError::ColumnNotFound(column_id.to_string()));
+            }
+        }
+
+        let snapshot = self.snapshot();
+        let allowed = if request.must.is_empty() {
+            None
+        } else {
+            let mut sets = Vec::with_capacity(request.must.len());
+            for condition in &request.must {
+                sets.push(self.resolve_condition(condition, snapshot)?);
+            }
+            Some(RowIdSet::intersect_many(sets))
+        };
+        if allowed.as_ref().is_some_and(RowIdSet::is_empty) {
+            return Ok(Vec::new());
+        }
+
+        let constant = match request.fusion {
+            Fusion::ReciprocalRank { constant } => constant,
+        };
+        let mut retrievers: Vec<_> = request.retrievers.iter().collect();
+        retrievers.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut fused: std::collections::HashMap<RowId, (f64, Vec<ComponentScore>)> =
+            std::collections::HashMap::new();
+        for named in retrievers {
+            let hits = match &allowed {
+                Some(allowed) => self.retrieve_filtered(&named.retriever, allowed),
+                None => self.retrieve_index(&named.retriever),
+            };
+            for hit in hits {
+                let contribution = named.weight / (constant as f64 + hit.rank as f64);
+                let entry = fused.entry(hit.row_id).or_default();
+                entry.0 += contribution;
+                entry.1.push(ComponentScore {
+                    retriever_name: named.name.clone(),
+                    rank: hit.rank,
+                    raw_score: hit.score,
+                    contribution,
+                });
+            }
+        }
+        let mut ranked: Vec<_> = fused.into_iter().collect();
+        ranked.sort_by(|(a_row, (a_score, _)), (b_row, (b_score, _))| {
+            b_score.total_cmp(a_score).then_with(|| a_row.cmp(b_row))
+        });
+
+        let row_ids: Vec<_> = ranked.iter().map(|(row_id, _)| row_id.0).collect();
+        let sentinel = projection
+            .first()
+            .copied()
+            .or_else(|| self.schema.columns.first().map(|column| column.id));
+        let mut cells: std::collections::HashMap<RowId, std::collections::HashMap<u16, Value>> =
+            std::collections::HashMap::new();
+        if let Some(column_id) = sentinel {
+            for (row_id, value) in self.values_for_rids(&row_ids, column_id, snapshot)? {
+                cells.entry(row_id).or_default().insert(column_id, value);
+            }
+        }
+        for &column_id in &projection {
+            if Some(column_id) == sentinel {
+                continue;
+            }
+            for (row_id, value) in self.values_for_rids(&row_ids, column_id, snapshot)? {
+                cells.entry(row_id).or_default().insert(column_id, value);
+            }
+        }
+
+        let mut out = Vec::with_capacity(request.limit);
+        for (row_id, (fused_score, mut components)) in ranked {
+            let Some(row_cells) = cells.remove(&row_id) else {
+                continue;
+            };
+            components.sort_by(|a, b| a.retriever_name.cmp(&b.retriever_name));
+            out.push(SearchHit {
+                row_id,
+                cells: projection
+                    .iter()
+                    .filter_map(|column_id| {
+                        row_cells
+                            .get(column_id)
+                            .cloned()
+                            .map(|value| (*column_id, value))
+                    })
+                    .collect(),
+                components,
+                fused_score,
+            });
+            if out.len() == request.limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// MinHash candidate generation followed by exact Jaccard verification.
+    /// An empty query set returns no hits.
+    pub fn set_similarity(
+        &mut self,
+        request: &crate::query::SetSimilarityRequest,
+    ) -> Result<Vec<crate::query::SetSimilarityHit>> {
+        use crate::query::{Retriever, RetrieverScore, SetSimilarityHit};
+        if request.members.is_empty() {
+            return Ok(Vec::new());
+        }
+        if request.candidate_k == 0 || request.limit == 0 {
+            return Err(MongrelError::InvalidArgument(
+                "candidate_k and limit must be > 0".into(),
+            ));
+        }
+        if !request.min_jaccard.is_finite() || !(0.0..=1.0).contains(&request.min_jaccard) {
+            return Err(MongrelError::InvalidArgument(
+                "min_jaccard must be finite and between 0 and 1".into(),
+            ));
+        }
+        let hits = self.retrieve(&Retriever::MinHash {
+            column_id: request.column_id,
+            members: request.members.clone(),
+            k: request.candidate_k,
+        })?;
+        let snapshot = self.snapshot();
+        let row_ids: Vec<_> = hits.iter().map(|hit| hit.row_id.0).collect();
+        let values = self.values_for_rids(&row_ids, request.column_id, snapshot)?;
+        let query: std::collections::HashSet<_> = request.members.iter().cloned().collect();
+        let estimates: std::collections::HashMap<_, _> = hits
+            .into_iter()
+            .filter_map(|hit| match hit.score {
+                RetrieverScore::MinHashEstimatedJaccard(score) => Some((hit.row_id, score)),
+                _ => None,
+            })
+            .collect();
+        let mut exact = Vec::new();
+        for (row_id, value) in values {
+            let Value::Bytes(bytes) = value else {
+                continue;
+            };
+            let Ok(serde_json::Value::Array(members)) = serde_json::from_slice(&bytes) else {
+                continue;
+            };
+            let stored: std::collections::HashSet<_> = members
+                .iter()
+                .filter_map(|member| match member {
+                    serde_json::Value::String(value) => {
+                        Some(crate::query::SetMember::String(value.clone()))
+                    }
+                    serde_json::Value::Number(value) => {
+                        Some(crate::query::SetMember::Number(value.clone()))
+                    }
+                    serde_json::Value::Bool(value) => {
+                        Some(crate::query::SetMember::Boolean(*value))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let union = query.union(&stored).count();
+            let score = if union == 0 {
+                1.0
+            } else {
+                query.intersection(&stored).count() as f32 / union as f32
+            };
+            if score >= request.min_jaccard {
+                exact.push(SetSimilarityHit {
+                    row_id,
+                    estimated_jaccard: estimates.get(&row_id).copied().unwrap_or_default(),
+                    exact_jaccard: score,
+                });
+            }
+        }
+        exact.sort_by(|a, b| {
+            b.exact_jaccard
+                .total_cmp(&a.exact_jaccard)
+                .then_with(|| a.row_id.cmp(&b.row_id))
+        });
+        exact.truncate(request.limit);
+        Ok(exact)
+    }
+
+    /// Fetch one column for visible row ids without decoding unrelated columns.
+    fn values_for_rids(
+        &self,
+        row_ids: &[u64],
+        column_id: u16,
+        snapshot: Snapshot,
+    ) -> Result<Vec<(RowId, Value)>> {
+        let mut readers: Vec<_> = self
+            .run_refs
+            .iter()
+            .map(|run| self.open_reader(run.run_id))
+            .collect::<Result<_>>()?;
+        let now = unix_nanos_now();
+        let mut out = Vec::with_capacity(row_ids.len());
+        for &raw_row_id in row_ids {
+            let row_id = RowId(raw_row_id);
+            let mem = self.memtable.get_version(row_id, snapshot.epoch);
+            let mutable = self.mutable_run.get_version(row_id, snapshot.epoch);
+            let overlay = match (mem, mutable) {
+                (Some((a_epoch, a)), Some((b_epoch, b))) => Some(if a_epoch >= b_epoch {
+                    (a_epoch, a)
+                } else {
+                    (b_epoch, b)
+                }),
+                (Some(value), None) | (None, Some(value)) => Some(value),
+                (None, None) => None,
+            };
+            if let Some((_, row)) = overlay {
+                if !row.deleted && !self.row_expired_at(&row, now) {
+                    if let Some(value) = row.columns.get(&column_id) {
+                        out.push((row_id, value.clone()));
+                    }
+                }
+                continue;
+            }
+
+            let mut best: Option<(Epoch, bool, Option<Value>, usize)> = None;
+            for (index, reader) in readers.iter_mut().enumerate() {
+                if let Some((epoch, deleted, value)) =
+                    reader.get_version_column(row_id, snapshot.epoch, column_id)?
+                {
+                    if best
+                        .as_ref()
+                        .map(|(best_epoch, ..)| epoch > *best_epoch)
+                        .unwrap_or(true)
+                    {
+                        best = Some((epoch, deleted, value, index));
+                    }
+                }
+            }
+            let Some((_, false, Some(value), reader_index)) = best else {
+                continue;
+            };
+            if let Some(ttl) = self.ttl {
+                if ttl.column_id != column_id {
+                    if let Some((_, _, Some(Value::Int64(timestamp)))) = readers[reader_index]
+                        .get_version_column(row_id, snapshot.epoch, ttl.column_id)?
+                    {
+                        if timestamp.saturating_add(ttl.duration_nanos as i64) <= now {
+                            continue;
+                        }
+                    }
+                } else if let Value::Int64(timestamp) = value {
+                    if timestamp.saturating_add(ttl.duration_nanos as i64) <= now {
+                        continue;
+                    }
+                }
+            }
+            out.push((row_id, value));
+        }
+        Ok(out)
     }
 
     /// Materialize the MVCC-visible, non-deleted rows for `rids` at `snapshot`,

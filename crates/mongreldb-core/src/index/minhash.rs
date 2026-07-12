@@ -153,6 +153,15 @@ impl MinHashIndex {
     /// first), truncated to `k`. Candidates are the rows sharing ≥1 LSH band
     /// bucket with the query — a sub-linear subset of the table.
     pub fn search(&self, query_token_hashes: &[u64], k: usize) -> Vec<(RowId, f32)> {
+        self.search_filtered(query_token_hashes, k, |_| true)
+    }
+
+    pub fn search_filtered(
+        &self,
+        query_token_hashes: &[u64],
+        k: usize,
+        allowed: impl Fn(RowId) -> bool,
+    ) -> Vec<(RowId, f32)> {
         let Some(qsig) = signature(query_token_hashes) else {
             return Vec::new();
         };
@@ -164,13 +173,16 @@ impl MinHashIndex {
         }
         let mut scored: Vec<(RowId, f32)> = candidates
             .into_iter()
-            .map(|idx| {
+            .filter_map(|idx| {
                 let (rid, sig) = &self.sigs[idx as usize];
+                if !allowed(*rid) {
+                    return None;
+                }
                 let matches = sig.iter().zip(&qsig).filter(|(a, b)| a == b).count();
-                (*rid, matches as f32 / NUM_PERM as f32)
+                Some((*rid, matches as f32 / NUM_PERM as f32))
             })
             .collect();
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         scored.truncate(k);
         scored
     }

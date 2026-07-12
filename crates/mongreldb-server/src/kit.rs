@@ -21,7 +21,10 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use mongreldb_core::constraint::TableConstraints;
-use mongreldb_core::query::{Condition, Query, Retriever, RetrieverScore, SetMember};
+use mongreldb_core::query::{
+    Condition, Fusion, NamedRetriever, Query, Retriever, RetrieverScore, SearchRequest, SetMember,
+    SetSimilarityRequest,
+};
 use mongreldb_core::schema::{
     ColumnDef, ColumnFlags, DefaultExpr, IndexDef, IndexKind, Schema, TypeId,
 };
@@ -987,6 +990,20 @@ fn set_member(value: &Jval) -> Result<SetMember, String> {
     }
 }
 
+fn retriever_score_json(score: RetrieverScore) -> Jval {
+    match score {
+        RetrieverScore::AnnHammingDistance(value) => {
+            json!({"kind":"ann_hamming_distance","value":value})
+        }
+        RetrieverScore::SparseDotProduct(value) => {
+            json!({"kind":"sparse_dot_product","value":value})
+        }
+        RetrieverScore::MinHashEstimatedJaccard(value) => {
+            json!({"kind":"minhash_estimated_jaccard","value":value})
+        }
+    }
+}
+
 pub async fn kit_retrieve(
     State(state): State<Arc<AppState>>,
     OptionalPrincipal(principal): OptionalPrincipal,
@@ -1016,17 +1033,235 @@ pub async fn kit_retrieve(
             "hits": hits.into_iter().map(|hit| json!({
                 "row_id": hit.row_id.0.to_string(),
                 "rank": hit.rank,
-                "score": match hit.score {
-                    RetrieverScore::AnnHammingDistance(value) => json!({"kind":"ann_hamming_distance","value":value}),
-                    RetrieverScore::SparseDotProduct(value) => json!({"kind":"sparse_dot_product","value":value}),
-                    RetrieverScore::MinHashEstimatedJaccard(value) => json!({"kind":"minhash_estimated_jaccard","value":value}),
-                }
+                "score": retriever_score_json(hit.score)
             })).collect::<Vec<_>>()
-        })).into_response(),
-        Err(error) => (StatusCode::BAD_REQUEST, Json(KitErrorEnvelope {
-            status: "aborted".into(),
-            error: KitError::new("BAD_REQUEST", error.to_string()),
-        })).into_response(),
+        }))
+        .into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(KitErrorEnvelope {
+                status: "aborted".into(),
+                error: KitError::new("BAD_REQUEST", error.to_string()),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct KitSearchRequest {
+    pub table: String,
+    #[serde(default)]
+    pub must: Vec<JsonCondition>,
+    pub retrievers: Vec<KitNamedRetriever>,
+    pub fusion: KitFusion,
+    pub limit: usize,
+    #[serde(default)]
+    pub projection: Option<Vec<u16>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct KitNamedRetriever {
+    pub name: String,
+    #[serde(default = "default_retriever_weight")]
+    pub weight: f64,
+    #[serde(flatten)]
+    pub retriever: JsonRetriever,
+}
+
+fn default_retriever_weight() -> f64 {
+    1.0
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KitFusion {
+    ReciprocalRank { constant: u32 },
+}
+
+pub async fn kit_search(
+    State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
+    Json(req): Json<KitSearchRequest>,
+) -> Response {
+    let principal = request_principal(&state, &principal);
+    let handle = match state.db.table(&req.table) {
+        Ok(handle) => handle,
+        Err(error) => return (StatusCode::NOT_FOUND, error.to_string()).into_response(),
+    };
+    let schema = handle.lock().schema().clone();
+    let mut required = req
+        .projection
+        .clone()
+        .unwrap_or_else(|| schema.columns.iter().map(|column| column.id).collect());
+    for condition in &req.must {
+        match condition {
+            JsonCondition::Pk { .. } => {
+                if let Some(primary_key) = schema.primary_key() {
+                    required.push(primary_key.id);
+                }
+            }
+            JsonCondition::BitmapEq { column_id, .. }
+            | JsonCondition::BitmapIn { column_id, .. }
+            | JsonCondition::Range { column_id, .. }
+            | JsonCondition::RangeF64 { column_id, .. }
+            | JsonCondition::IsNull { column_id }
+            | JsonCondition::IsNotNull { column_id }
+            | JsonCondition::FmContains { column_id, .. }
+            | JsonCondition::FmContainsAll { column_id, .. }
+            | JsonCondition::Ann { column_id, .. }
+            | JsonCondition::SparseMatch { column_id, .. }
+            | JsonCondition::MinHashSimilar { column_id, .. }
+            | JsonCondition::MinHashSimilarMembers { column_id, .. } => required.push(*column_id),
+        }
+    }
+    required.extend(
+        req.retrievers
+            .iter()
+            .map(|retriever| retriever.retriever.column_id()),
+    );
+    required.sort_unstable();
+    required.dedup();
+    if let Err(error) = state.db.require_columns_for(
+        &req.table,
+        mongreldb_core::ColumnOperation::Select,
+        &required,
+        principal.as_ref(),
+    ) {
+        return (crate::status_for_error(&error), error.to_string()).into_response();
+    }
+    let must = match req
+        .must
+        .iter()
+        .map(|condition| parse_condition(condition, &schema))
+        .collect::<Result<_, _>>()
+    {
+        Ok(must) => must,
+        Err(message) => return kit_bad_request(message),
+    };
+    let retrievers = match req
+        .retrievers
+        .iter()
+        .map(|retriever| {
+            Ok(NamedRetriever {
+                name: retriever.name.clone(),
+                weight: retriever.weight,
+                retriever: retriever.retriever.to_core()?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()
+    {
+        Ok(retrievers) => retrievers,
+        Err(message) => return kit_bad_request(message),
+    };
+    let fusion = match req.fusion {
+        KitFusion::ReciprocalRank { constant } => Fusion::ReciprocalRank { constant },
+    };
+    let (mut hits, rows) = {
+        let mut table = handle.lock();
+        let hits = match table.search(&SearchRequest {
+            must,
+            retrievers,
+            fusion,
+            limit: req.limit,
+            projection: req.projection.clone(),
+        }) {
+            Ok(hits) => hits,
+            Err(error) => return kit_bad_request(error.to_string()),
+        };
+        let row_ids: Vec<_> = hits.iter().map(|hit| hit.row_id.0).collect();
+        let snapshot = table.snapshot();
+        let rows = match table.rows_for_rids(&row_ids, snapshot) {
+            Ok(rows) => rows,
+            Err(error) => return kit_bad_request(error.to_string()),
+        };
+        (hits, rows)
+    };
+    let secured = match state
+        .db
+        .secure_rows_for(&req.table, rows, principal.as_ref())
+    {
+        Ok(rows) => rows,
+        Err(error) => return (crate::status_for_error(&error), error.to_string()).into_response(),
+    };
+    let secured: std::collections::HashMap<_, _> =
+        secured.into_iter().map(|row| (row.row_id, row)).collect();
+    hits.retain_mut(|hit| {
+        let Some(row) = secured.get(&hit.row_id) else {
+            return false;
+        };
+        for (column_id, value) in &mut hit.cells {
+            if let Some(masked) = row.columns.get(column_id) {
+                *value = masked.clone();
+            }
+        }
+        true
+    });
+    Json(json!({
+        "hits": hits.into_iter().map(|hit| json!({
+            "row_id": hit.row_id.0.to_string(),
+            "cells": hit.cells.into_iter().flat_map(|(column_id, value)| [json!(column_id), value_to_json(&value)]).collect::<Vec<_>>(),
+            "components": hit.components.into_iter().map(|component| json!({
+                "retriever_name": component.retriever_name,
+                "rank": component.rank,
+                "raw_score": retriever_score_json(component.raw_score),
+                "contribution": component.contribution,
+            })).collect::<Vec<_>>(),
+            "fused_score": hit.fused_score,
+        })).collect::<Vec<_>>()
+    }))
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct KitSetSimilarityRequest {
+    pub table: String,
+    pub column_id: u16,
+    pub members: Vec<Jval>,
+    pub candidate_k: usize,
+    pub min_jaccard: f32,
+    pub limit: usize,
+}
+
+pub async fn kit_set_similarity(
+    State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
+    Json(req): Json<KitSetSimilarityRequest>,
+) -> Response {
+    let principal = request_principal(&state, &principal);
+    if let Err(error) = state.db.require_columns_for(
+        &req.table,
+        mongreldb_core::ColumnOperation::Select,
+        &[req.column_id],
+        principal.as_ref(),
+    ) {
+        return (crate::status_for_error(&error), error.to_string()).into_response();
+    }
+    let members = match req.members.iter().map(set_member).collect::<Result<_, _>>() {
+        Ok(members) => members,
+        Err(message) => return kit_bad_request(message),
+    };
+    let handle = match state.db.table(&req.table) {
+        Ok(handle) => handle,
+        Err(error) => return (StatusCode::NOT_FOUND, error.to_string()).into_response(),
+    };
+    let result = handle.lock().set_similarity(&SetSimilarityRequest {
+        column_id: req.column_id,
+        members,
+        candidate_k: req.candidate_k,
+        min_jaccard: req.min_jaccard,
+        limit: req.limit,
+    });
+    match result {
+        Ok(hits) => Json(json!({
+            "hits": hits.into_iter().map(|hit| json!({
+                "row_id": hit.row_id.0.to_string(),
+                "estimated_jaccard": hit.estimated_jaccard,
+                "exact_jaccard": hit.exact_jaccard,
+            })).collect::<Vec<_>>()
+        }))
+        .into_response(),
+        Err(error) => kit_bad_request(error.to_string()),
     }
 }
 

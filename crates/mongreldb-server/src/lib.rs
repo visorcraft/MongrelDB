@@ -223,6 +223,8 @@ pub fn build_app_with_sessions(
         .route("/kit/txn", post(kit::kit_txn))
         .route("/kit/query", post(kit::kit_query))
         .route("/kit/retrieve", post(kit::kit_retrieve))
+        .route("/kit/set_similarity", post(kit::kit_set_similarity))
+        .route("/kit/search", post(kit::kit_search))
         .route("/kit/create_table", post(kit::kit_create_table))
         .route("/kit/procedures/{name}/call", post(procedure::kit_call))
         .route("/compact", post(compact_all))

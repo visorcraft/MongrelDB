@@ -77,8 +77,12 @@ This supports:
 Native conditions currently compose as conjunctive candidate-set filters.
 ANN, Sparse, and MinHash calculate scores internally, but `Query` returns only
 surviving rows. MinHash returns approximate LSH candidates; exact verification
-is caller-side and cannot recover an LSH miss. Applications requiring blended
-relevance should query retrievers separately and rerank them.
+cannot recover an LSH miss. The scored `Retriever` API and `/kit/retrieve`
+preserve raw scores; `/kit/set_similarity` adds exact Jaccard verification.
+`SearchRequest` and `/kit/search` apply hard filters first, union named
+retrievers, fuse ranks with deterministic RRF, and return component plus fused
+scores. Filtered ANN uses adaptive over-fetch with a bounded search breadth, so
+a highly selective filter may honestly return fewer than `k` approximate hits.
 
 ## Performance profile
 

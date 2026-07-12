@@ -134,6 +134,59 @@ pub struct RetrieverHit {
     pub score: RetrieverScore,
 }
 
+#[derive(Debug, Clone)]
+pub struct SetSimilarityRequest {
+    pub column_id: u16,
+    pub members: Vec<SetMember>,
+    pub candidate_k: usize,
+    pub min_jaccard: f32,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetSimilarityHit {
+    pub row_id: crate::RowId,
+    pub estimated_jaccard: f32,
+    pub exact_jaccard: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchRequest {
+    pub must: Vec<Condition>,
+    pub retrievers: Vec<NamedRetriever>,
+    pub fusion: Fusion,
+    pub limit: usize,
+    pub projection: Option<Vec<u16>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NamedRetriever {
+    pub name: String,
+    pub weight: f64,
+    pub retriever: Retriever,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Fusion {
+    ReciprocalRank { constant: u32 },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComponentScore {
+    pub retriever_name: String,
+    pub rank: usize,
+    pub raw_score: RetrieverScore,
+    pub contribution: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchHit {
+    pub row_id: crate::RowId,
+    pub cells: Vec<(u16, crate::Value)>,
+    pub components: Vec<ComponentScore>,
+    pub fused_score: f64,
+}
+
 /// A conjunctive query. Empty ⇒ all rows.
 #[derive(Debug, Default, Clone)]
 pub struct Query {

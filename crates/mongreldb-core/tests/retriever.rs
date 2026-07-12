@@ -1,4 +1,7 @@
-use mongreldb_core::query::{Retriever, RetrieverScore, SetMember};
+use mongreldb_core::query::{
+    Condition, Fusion, NamedRetriever, Retriever, RetrieverScore, SearchRequest, SetMember,
+    SetSimilarityRequest,
+};
 use mongreldb_core::schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
 use mongreldb_core::{Table, Value};
 use tempfile::tempdir;
@@ -69,7 +72,7 @@ fn seed(table: &mut Table) {
             (2, Value::Embedding(vec![-1.0; 8])),
             (
                 3,
-                Value::Bytes(bincode::serialize(&vec![(1, 1.0f32)]).unwrap()),
+                Value::Bytes(bincode::serialize(&vec![(2, 1.0f32)]).unwrap()),
             ),
             (4, members(&["a", "b", "c", "x"])),
         ],
@@ -162,4 +165,101 @@ fn scored_retrievers_validate_input() {
             k: 1,
         })
         .is_err());
+}
+
+#[test]
+fn exact_set_similarity_filters_sorts_and_limits() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path(), schema(), 1).unwrap();
+    seed(&mut table);
+    let request = SetSimilarityRequest {
+        column_id: 4,
+        members: ["a", "b", "c", "d"]
+            .into_iter()
+            .map(|value| SetMember::String(value.into()))
+            .collect(),
+        candidate_k: 10,
+        min_jaccard: 0.0,
+        limit: 10,
+    };
+    let hits = table.set_similarity(&request).unwrap();
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].exact_jaccard, 1.0);
+    assert_eq!(hits[1].exact_jaccard, 0.6);
+
+    let hits = table
+        .set_similarity(&SetSimilarityRequest {
+            min_jaccard: 0.7,
+            limit: 1,
+            ..request.clone()
+        })
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].exact_jaccard, 1.0);
+
+    assert!(table
+        .set_similarity(&SetSimilarityRequest {
+            members: vec![],
+            ..request
+        })
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn hybrid_search_filters_unions_and_fuses_deterministically() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path(), schema(), 1).unwrap();
+    seed(&mut table);
+    let ann = NamedRetriever {
+        name: "dense".into(),
+        weight: 1.0,
+        retriever: Retriever::Ann {
+            column_id: 2,
+            query: vec![1.0; 8],
+            k: 1,
+        },
+    };
+    let sparse = NamedRetriever {
+        name: "sparse".into(),
+        weight: 1.0,
+        retriever: Retriever::Sparse {
+            column_id: 3,
+            query: vec![(2, 1.0)],
+            k: 1,
+        },
+    };
+    let request = SearchRequest {
+        must: vec![],
+        retrievers: vec![ann.clone(), sparse.clone()],
+        fusion: Fusion::ReciprocalRank { constant: 60 },
+        limit: 10,
+        projection: Some(vec![1]),
+    };
+    let hits = table.search(&request).unwrap();
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].row_id.0, 0);
+    assert_eq!(hits[1].row_id.0, 1);
+    assert_eq!(hits[0].fused_score, 1.0 / 61.0);
+    assert_eq!(hits[0].cells, vec![(1, Value::Int64(1))]);
+    assert_eq!(hits[0].components[0].retriever_name, "dense");
+    assert_eq!(hits[1].components[0].retriever_name, "sparse");
+
+    let reversed = table
+        .search(&SearchRequest {
+            retrievers: vec![sparse, ann],
+            ..request.clone()
+        })
+        .unwrap();
+    assert_eq!(reversed, hits);
+
+    let filtered = table
+        .search(&SearchRequest {
+            must: vec![Condition::Pk(Value::Int64(2).encode_key())],
+            retrievers: request.retrievers.clone(),
+            ..request
+        })
+        .unwrap();
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].cells, vec![(1, Value::Int64(2))]);
 }

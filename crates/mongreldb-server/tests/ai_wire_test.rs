@@ -126,6 +126,37 @@ async fn kit_ai_indexes_work_over_wire_and_validate_values() {
     assert_eq!(body["hits"][0]["score"]["kind"], "sparse_dot_product");
     assert_eq!(body["hits"][0]["score"]["value"], 4.0);
 
+    let exact = serde_json::json!({
+        "table":"docs", "column_id":5, "members":["a","b","c","d"],
+        "candidate_k":10, "min_jaccard":0.7, "limit":10
+    });
+    let (status, body) = request(app.clone(), "POST", "/kit/set_similarity", Some(exact)).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["hits"].as_array().unwrap().len(), 1);
+    assert_eq!(body["hits"][0]["exact_jaccard"], 1.0);
+
+    let search = serde_json::json!({
+        "table":"docs",
+        "must":[{"bitmap_eq":{"column_id":2,"value":"published"}}],
+        "retrievers":[
+            {"name":"dense","weight":1.0,"ann":{"column_id":4,"query":[1,-1,1,-1,1,-1,1,-1],"k":1}},
+            {"name":"sparse","weight":1.0,"sparse":{"column_id":3,"query":[[2,1.0]],"k":1}}
+        ],
+        "fusion":{"reciprocal_rank":{"constant":60}},
+        "limit":10,
+        "projection":[1]
+    });
+    let (status, body) = request(app.clone(), "POST", "/kit/search", Some(search)).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["hits"].as_array().unwrap().len(), 2, "{body}");
+    assert_eq!(body["hits"][0]["cells"], serde_json::json!([1, 1]));
+    assert_eq!(body["hits"][1]["cells"], serde_json::json!([1, 3]));
+    assert!(body["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|hit| hit["fused_score"].as_f64().unwrap() > 0.0));
+
     let invalid = serde_json::json!({"ops":[{"put":{"table":"docs","cells":[1,9,4,[1,2]]}}]});
     let (status, body) = request(app, "POST", "/kit/txn", Some(invalid)).await;
     assert_eq!(status, 400, "{body}");

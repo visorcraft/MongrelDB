@@ -38,11 +38,22 @@ impl SparseIndex {
 
     /// Top-k row ids by sparse dot product with `query` (highest score first).
     pub fn search(&self, query: &[(u32, f32)], k: usize) -> Vec<(RowId, f32)> {
+        self.search_filtered(query, k, |_| true)
+    }
+
+    pub fn search_filtered(
+        &self,
+        query: &[(u32, f32)],
+        k: usize,
+        allowed: impl Fn(RowId) -> bool,
+    ) -> Vec<(RowId, f32)> {
         let mut scores: HashMap<u64, f32> = HashMap::new();
         for &(token, q_weight) in query {
             if let Some(list) = self.postings.get(&token) {
                 for &(rid, d_weight) in list {
-                    *scores.entry(rid.0).or_insert(0.0) += q_weight * d_weight;
+                    if allowed(rid) {
+                        *scores.entry(rid.0).or_insert(0.0) += q_weight * d_weight;
+                    }
                 }
             }
         }
@@ -50,7 +61,7 @@ impl SparseIndex {
             .into_iter()
             .map(|(rid, score)| (RowId(rid), score))
             .collect();
-        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         ranked.truncate(k);
         ranked
     }
