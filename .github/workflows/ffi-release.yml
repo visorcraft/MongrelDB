@@ -17,7 +17,7 @@
 #   linux-x64-musl     ubuntu-latest     x86_64-unknown-linux-musl
 #   linux-arm64-gnu    ubuntu-24.04-arm  aarch64-unknown-linux-gnu
 #   darwin-arm64       macos-14          aarch64-apple-darwin
-#   darwin-x64         macos-13          x86_64-apple-darwin
+#   darwin-x64         macos-15          x86_64-apple-darwin
 #   windows-x64        windows-latest    x86_64-pc-windows-msvc
 name: FFI Release
 
@@ -25,6 +25,12 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to upload artifacts to (e.g. v0.49.0)'
+        required: true
+        default: 'v0.49.0'
 
 permissions:
   contents: write
@@ -63,7 +69,7 @@ jobs:
             linker: ''
             ar: ''
             zip: false
-          - runner: macos-13
+          - runner: macos-15
             target: x86_64-apple-darwin
             archive: mongreldb-native-darwin-x64.tar.gz
             apt: ''
@@ -143,6 +149,7 @@ jobs:
 
       - uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: dist/${{ matrix.archive }}
 
   # Build the Kit FFI (libmongreldb_kit) for the same 6 platform targets.
@@ -172,7 +179,7 @@ jobs:
             archive: mongreldb-kit-native-darwin-arm64.tar.gz
             apt: ''
             zip: false
-          - runner: macos-13
+          - runner: macos-15
             target: x86_64-apple-darwin
             archive: mongreldb-kit-native-darwin-x64.tar.gz
             apt: ''
@@ -236,6 +243,7 @@ jobs:
 
       - uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: dist/${{ matrix.archive }}
 
   # Also publish a standalone headers archive (both mongreldb.h and
@@ -253,6 +261,7 @@ jobs:
 
       - uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: dist/mongreldb-headers.tar.gz
 
   # Build the JNI shim (libmongreldb_jni) for the JVM clients (Java, Kotlin,
@@ -283,7 +292,7 @@ jobs:
             os: darwin
             arch: arm64
             apt: ''
-          - runner: macos-13
+          - runner: macos-15
             target: x86_64-apple-darwin
             os: darwin
             arch: x64
@@ -345,13 +354,13 @@ jobs:
           # Copy staged native lib into the JAR resources path.
           mkdir -p src/main/resources/native/${{ matrix.os }}/${{ matrix.arch }}
           if [ "${{ matrix.os }}" = "windows" ]; then
-            cp ../../../../staging/native/windows/${{ matrix.arch }}/* src/main/resources/native/windows/${{ matrix.arch }}/
+            cp ../../../staging/native/windows/${{ matrix.arch }}/* src/main/resources/native/windows/${{ matrix.arch }}/
           else
-            cp ../../../../staging/native/${{ matrix.os }}/${{ matrix.arch }}/* src/main/resources/native/${{ matrix.os }}/${{ matrix.arch }}/
+            cp ../../../staging/native/${{ matrix.os }}/${{ matrix.arch }}/* src/main/resources/native/${{ matrix.os }}/${{ matrix.arch }}/
           fi
           mvn -B -ntp package
           # Rename to include platform in the filename.
-          cp target/mongreldb-jni-0.49.0.jar ../../../../dist/mongreldb-jni-0.49.0-${{ matrix.os }}-${{ matrix.arch }}.jar
+          cp target/mongreldb-jni-0.49.0.jar ../../../dist/mongreldb-jni-0.49.0-${{ matrix.os }}-${{ matrix.arch }}.jar
 
       - uses: actions/upload-artifact@v7
         with:
@@ -361,6 +370,7 @@ jobs:
 
       - uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: dist/mongreldb-jni-*.jar
 
   # Assemble the fat JAR (all platforms) from the per-platform artifacts.
@@ -385,11 +395,12 @@ jobs:
         working-directory: crates/mongreldb-jni/java
         run: |
           mkdir -p src/main/resources/native
-          cp -r ../../../../staging/native/* src/main/resources/native/
+          cp -r ../../../staging/native/* src/main/resources/native/
           mvn -B -ntp package
-          mkdir -p ../../../../dist
-          cp target/mongreldb-jni-0.49.0.jar ../../../../dist/mongreldb-jni-0.49.0.jar
+          mkdir -p ../../../dist
+          cp target/mongreldb-jni-0.49.0.jar ../../../dist/mongreldb-jni-0.49.0.jar
 
       - uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: dist/mongreldb-jni-0.49.0.jar
