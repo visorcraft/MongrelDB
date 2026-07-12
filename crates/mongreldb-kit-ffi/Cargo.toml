@@ -23,8 +23,8 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 # lib name (`mongreldb_kit`). Without the rename, integration tests
 # `use mongreldb_kit::*` would be ambiguous between our FFI crate and the
 # upstream Kit crate.
-kit = { package = "mongreldb-kit", version = "0.48" }
-mongreldb-kit-core = "0.48"
+kit = { package = "mongreldb-kit", version = "0.49" }
+mongreldb-kit-core = "0.49"
 parking_lot = "0.12"
 serde_json = { version = "1", features = ["preserve_order"] }
 
