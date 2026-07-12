@@ -222,6 +222,7 @@ pub fn build_app_with_sessions(
         .route("/kit/schema/{table}", get(kit::schema_one))
         .route("/kit/txn", post(kit::kit_txn))
         .route("/kit/query", post(kit::kit_query))
+        .route("/kit/retrieve", post(kit::kit_retrieve))
         .route("/kit/create_table", post(kit::kit_create_table))
         .route("/kit/procedures/{name}/call", post(procedure::kit_call))
         .route("/compact", post(compact_all))

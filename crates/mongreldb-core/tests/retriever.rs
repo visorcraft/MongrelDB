@@ -134,7 +134,7 @@ fn scored_retrievers_preserve_order_and_reopen() {
             _ => false,
         }));
 
-    table.flush().unwrap();
+    table.close().unwrap();
     drop(table);
     let mut reopened = Table::open(dir.path()).unwrap();
     assert_eq!(reopened.retrieve(&ann).unwrap(), ann_hits);

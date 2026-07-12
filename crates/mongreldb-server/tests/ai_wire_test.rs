@@ -105,7 +105,7 @@ async fn kit_ai_indexes_work_over_wire_and_validate_values() {
 
     let cases = [
         serde_json::json!({"ann":{"column_id":4,"query":[1,-1,1,-1,1,-1,1,-1],"k":1}}),
-        serde_json::json!({"sparse_match":{"column_id":3,"query":[[1,2.0],[2,1.0]],"k":1}}),
+        serde_json::json!({"sparse_match":{"column_id":3,"query":[[1,2.0]],"k":1}}),
         serde_json::json!({"minhash_similar_members":{"column_id":5,"members":["a","b","c","d"],"k":1}}),
     ];
     for condition in cases {
@@ -115,6 +115,16 @@ async fn kit_ai_indexes_work_over_wire_and_validate_values() {
         assert_eq!(body["rows"].as_array().unwrap().len(), 1, "{body}");
         assert_eq!(body["rows"][0]["cells"], serde_json::json!([1, 1]));
     }
+
+    let retrieve = serde_json::json!({
+        "table":"docs",
+        "retriever":{"sparse":{"column_id":3,"query":[[1,2.0]],"k":2}}
+    });
+    let (status, body) = request(app.clone(), "POST", "/kit/retrieve", Some(retrieve)).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["hits"][0]["rank"], 1);
+    assert_eq!(body["hits"][0]["score"]["kind"], "sparse_dot_product");
+    assert_eq!(body["hits"][0]["score"]["value"], 4.0);
 
     let invalid = serde_json::json!({"ops":[{"put":{"table":"docs","cells":[1,9,4,[1,2]]}}]});
     let (status, body) = request(app, "POST", "/kit/txn", Some(invalid)).await;

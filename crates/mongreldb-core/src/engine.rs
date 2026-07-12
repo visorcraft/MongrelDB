@@ -1254,16 +1254,20 @@ impl Table {
                 Op::TxnCommit { epoch, .. } => {
                     let commit_epoch = Epoch(epoch);
                     if let Some(puts) = staged_puts.remove(&txn_id) {
-                        for row in &puts {
-                            memtable.upsert(row.clone());
+                        if commit_epoch.0 > manifest.flushed_epoch {
+                            for row in &puts {
+                                memtable.upsert(row.clone());
+                            }
+                            replayed_puts.entry(commit_epoch).or_default().extend(puts);
                         }
-                        replayed_puts.entry(commit_epoch).or_default().extend(puts);
                     }
                     if let Some(dels) = staged_deletes.remove(&txn_id) {
                         saw_delete = true;
-                        for rid in dels {
-                            memtable.tombstone(rid, commit_epoch);
-                            replayed_deletes.push((rid, commit_epoch));
+                        if commit_epoch.0 > manifest.flushed_epoch {
+                            for rid in dels {
+                                memtable.tombstone(rid, commit_epoch);
+                                replayed_deletes.push((rid, commit_epoch));
+                            }
                         }
                     }
                 }

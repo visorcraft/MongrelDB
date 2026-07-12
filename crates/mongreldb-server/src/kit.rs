@@ -21,7 +21,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use mongreldb_core::constraint::TableConstraints;
-use mongreldb_core::query::{Condition, Query};
+use mongreldb_core::query::{Condition, Query, Retriever, RetrieverScore, SetMember};
 use mongreldb_core::schema::{
     ColumnDef, ColumnFlags, DefaultExpr, IndexDef, IndexKind, Schema, TypeId,
 };
@@ -908,6 +908,126 @@ pub struct KitQueryResponse {
 pub struct KitRow {
     pub row_id: String,
     pub cells: Vec<Jval>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct KitRetrieveRequest {
+    pub table: String,
+    pub retriever: JsonRetriever,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JsonRetriever {
+    Ann {
+        column_id: u16,
+        query: Vec<f32>,
+        k: usize,
+    },
+    Sparse {
+        column_id: u16,
+        query: Vec<(u32, f32)>,
+        k: usize,
+    },
+    MinHash {
+        column_id: u16,
+        members: Vec<Jval>,
+        k: usize,
+    },
+}
+
+impl JsonRetriever {
+    fn column_id(&self) -> u16 {
+        match self {
+            Self::Ann { column_id, .. }
+            | Self::Sparse { column_id, .. }
+            | Self::MinHash { column_id, .. } => *column_id,
+        }
+    }
+
+    fn to_core(&self) -> Result<Retriever, String> {
+        Ok(match self {
+            Self::Ann {
+                column_id,
+                query,
+                k,
+            } => Retriever::Ann {
+                column_id: *column_id,
+                query: query.clone(),
+                k: *k,
+            },
+            Self::Sparse {
+                column_id,
+                query,
+                k,
+            } => Retriever::Sparse {
+                column_id: *column_id,
+                query: query.clone(),
+                k: *k,
+            },
+            Self::MinHash {
+                column_id,
+                members,
+                k,
+            } => Retriever::MinHash {
+                column_id: *column_id,
+                members: members.iter().map(set_member).collect::<Result<_, _>>()?,
+                k: *k,
+            },
+        })
+    }
+}
+
+fn set_member(value: &Jval) -> Result<SetMember, String> {
+    match value {
+        Jval::String(value) => Ok(SetMember::String(value.clone())),
+        Jval::Number(value) => Ok(SetMember::Number(value.clone())),
+        Jval::Bool(value) => Ok(SetMember::Boolean(*value)),
+        _ => Err("set member must be a string, number, or boolean".into()),
+    }
+}
+
+pub async fn kit_retrieve(
+    State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
+    Json(req): Json<KitRetrieveRequest>,
+) -> Response {
+    let principal = request_principal(&state, &principal);
+    let column_id = req.retriever.column_id();
+    if let Err(error) = state.db.require_columns_for(
+        &req.table,
+        mongreldb_core::ColumnOperation::Select,
+        &[column_id],
+        principal.as_ref(),
+    ) {
+        return (crate::status_for_error(&error), error.to_string()).into_response();
+    }
+    let retriever = match req.retriever.to_core() {
+        Ok(retriever) => retriever,
+        Err(message) => return kit_bad_request(message),
+    };
+    let handle = match state.db.table(&req.table) {
+        Ok(handle) => handle,
+        Err(error) => return (StatusCode::NOT_FOUND, error.to_string()).into_response(),
+    };
+    let result = handle.lock().retrieve(&retriever);
+    match result {
+        Ok(hits) => Json(json!({
+            "hits": hits.into_iter().map(|hit| json!({
+                "row_id": hit.row_id.0.to_string(),
+                "rank": hit.rank,
+                "score": match hit.score {
+                    RetrieverScore::AnnHammingDistance(value) => json!({"kind":"ann_hamming_distance","value":value}),
+                    RetrieverScore::SparseDotProduct(value) => json!({"kind":"sparse_dot_product","value":value}),
+                    RetrieverScore::MinHashEstimatedJaccard(value) => json!({"kind":"minhash_estimated_jaccard","value":value}),
+                }
+            })).collect::<Vec<_>>()
+        })).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, Json(KitErrorEnvelope {
+            status: "aborted".into(),
+            error: KitError::new("BAD_REQUEST", error.to_string()),
+        })).into_response(),
+    }
 }
 
 pub async fn kit_query(
