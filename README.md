@@ -318,12 +318,12 @@ In practice, encryption adds negligible latency to bulk ingest and queries
 
 ## Language Clients
 
-MongrelDB supports **34 languages** across two integration tiers:
+MongrelDB supports **35 languages** across two integration tiers:
 
 - **Tier 1 (Embedded):** The engine runs in-process via native bindings. No daemon, zero serialization overhead.
 - **Tier 2 (HTTP):** A pure-language HTTP client connects to a running `mongreldb-server` daemon. No native dependencies.
 
-**Tier 1 (Embedded)** - 9 languages with in-process native bindings:
+**Tier 1 (Embedded)** - 10 languages with in-process native bindings:
 
 | Language | Binding | Repository | Install |
 |---|---|---|---|
@@ -332,6 +332,7 @@ MongrelDB supports **34 languages** across two integration tiers:
 | **C#/.NET** | Native (P/Invoke) + HTTP | [MongrelDB-DotNet](https://github.com/visorcraft/MongrelDB-DotNet) | `dotnet add package Visorcraft.MongrelDB.Native` (or `Visorcraft.MongrelDB` for HTTP) |
 | **Java** | Native (JNI) + HTTP | [MongrelDB-Java](https://github.com/visorcraft/MongrelDB-Java) | Maven/Gradle + `libmongreldb_jni` |
 | **Kotlin** | Native (JNI) + HTTP | [MongrelDB-Kotlin](https://github.com/visorcraft/MongrelDB-Kotlin) | Gradle + `libmongreldb_jni` |
+| **Kotlin/Native** | Native (C ABI) + HTTP | [MongrelDB-Kotlin-Native](https://github.com/visorcraft/MongrelDB-Kotlin-Native) | Gradle + prebuilt `libmongreldb_kit` (cinterop) |
 | **Python** | Native (PyO3) | [MongrelDB Kit](https://github.com/visorcraft/MongrelDB-Kit) | `pip install mongreldb-kit` |
 | **Rust** | Native (Direct) | [MongrelDB](https://github.com/visorcraft/MongrelDB) | `cargo add mongreldb-core` |
 | **Scala** | Native (JNI) + HTTP | [MongrelDB-Scala](https://github.com/visorcraft/MongrelDB-Scala) | sbt + `libmongreldb_jni` |
@@ -367,7 +368,7 @@ MongrelDB supports **34 languages** across two integration tiers:
 | **V** | `net.http` | [MongrelDB-V](https://github.com/visorcraft/MongrelDB-V) | `v install` |
 | **Zig** | `std.http` | [MongrelDB-Zig](https://github.com/visorcraft/MongrelDB-Zig) | `zig fetch` |
 
-The **[C ABI](crates/mongreldb-ffi)** (`mongreldb-ffi`) provides a stable C interface over the engine core: opaque handles, typed queries, transactions, auth, **SQL execution** (DataFusion, returns Arrow IPC), and **migration planning/checksums** (JSON in/out, language-neutral). A second FFI crate, **[mongreldb-kit-ffi](crates/mongreldb-kit-ffi)**, adds the Kit layer (schema model, full migration runner, query builder execution) as `libmongreldb_kit`. A third binding crate, **[mongreldb-jni](crates/mongreldb-jni)**, provides a JNI shim (`libmongreldb_jni`) for Java, Kotlin, and Scala. The C and C++ clients bundle both C ABI headers for direct native embedding.
+The **[C ABI](crates/mongreldb-ffi)** (`mongreldb-ffi`) provides a stable C interface over the engine core: opaque handles, typed queries, transactions, auth, **SQL execution** (DataFusion, returns Arrow IPC), and **migration planning/checksums** (JSON in/out, language-neutral). A second FFI crate, **[mongreldb-kit-ffi](crates/mongreldb-kit-ffi)**, adds the Kit layer (schema model, full migration runner, query builder execution) as `libmongreldb_kit`. A third binding crate, **[mongreldb-jni](crates/mongreldb-jni)**, provides a JNI shim (`libmongreldb_jni`) for Java, Kotlin, and Scala. The C and C++ clients bundle both C ABI headers for direct native embedding, and the Kotlin/Native client uses cinterop against the same headers.
 
 ### Native libraries (prebuilt)
 
@@ -382,7 +383,7 @@ Prebuilt `libmongreldb` (core engine), `libmongreldb_kit` (Kit layer), and `libm
 | macOS x64 | `mongreldb-native-darwin-x64.tar.gz` + `mongreldb-kit-native-darwin-x64.tar.gz` | `mongreldb-jni-0.52.3-darwin-x64.jar` |
 | Windows x64 | `mongreldb-native-windows-x64.zip` + `mongreldb-kit-native-windows-x64.zip` | `mongreldb-jni-0.52.3-windows-x64.jar` |
 
-A fat JAR (`mongreldb-jni-0.52.3.jar`) with all platforms bundled is also published. Each C/C++ archive contains `lib/` (shared + static libraries) and `include/` (the C header). Download from the [releases page](https://github.com/visorcraft/MongrelDB/releases). See the C, C++, .NET, Java, Kotlin, and Scala client READMEs for linking instructions.
+A fat JAR (`mongreldb-jni-0.52.3.jar`) with all platforms bundled is also published. Each C/C++ archive contains `lib/` (shared + static libraries) and `include/` (the C header). Download from the [releases page](https://github.com/visorcraft/MongrelDB/releases). See the C, C++, .NET, Java, Kotlin, Kotlin/Native, and Scala client READMEs for linking instructions.
 
 ## Node.js addon
 
