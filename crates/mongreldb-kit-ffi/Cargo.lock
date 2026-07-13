@@ -2239,7 +2239,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-kit-ffi"
-version = "0.50.1"
+version = "0.51.0"
 dependencies = [
  "cc",
  "mongreldb-kit",
