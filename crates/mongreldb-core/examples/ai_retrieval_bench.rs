@@ -372,7 +372,7 @@ fn main() {
         .map(|metadata| metadata.len())
         .unwrap_or_default();
     let index_payloads = mongreldb_core::global_idx::plaintext_record_sizes(dir.path())
-        .unwrap()
+        .unwrap_or_default()
         .into_iter()
         .map(|record| {
             serde_json::json!({
