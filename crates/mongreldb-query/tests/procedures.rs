@@ -28,6 +28,7 @@ fn users_schema() -> Schema {
             column_id: 2,
             kind: IndexKind::Bitmap,
             predicate: None,
+            options: Default::default(),
         }],
         colocation: Vec::new(),
         constraints: Default::default(),

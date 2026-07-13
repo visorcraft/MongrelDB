@@ -44,15 +44,19 @@ pub struct ColumnLearnedRange {
 impl ColumnLearnedRange {
     /// Build from `(value, row_id)` pairs in any order.
     pub fn build_i64(pairs: &[(i64, u64)]) -> Self {
+        Self::build_i64_with_epsilon(pairs, 16)
+    }
+
+    pub fn build_i64_with_epsilon(pairs: &[(i64, u64)], epsilon: usize) -> Self {
         let mut sorted: Vec<(u64, u64)> = pairs.iter().map(|(v, r)| (i64_key(*v), *r)).collect();
         sorted.sort_unstable_by_key(|(k, _)| *k);
         let keys: Vec<u64> = sorted.iter().map(|(k, _)| *k).collect();
         let row_ids: Vec<u64> = sorted.iter().map(|(_, r)| *r).collect();
         let points: Vec<(u64, usize)> = keys.iter().enumerate().map(|(i, k)| (*k, i)).collect();
         let pgm = if points.is_empty() {
-            PgmIndex::build(&[], 16)
+            PgmIndex::build(&[], epsilon)
         } else {
-            PgmIndex::build(&points, 16)
+            PgmIndex::build(&points, epsilon)
         };
         Self { keys, row_ids, pgm }
     }
@@ -131,15 +135,19 @@ impl ColumnLearnedRange {
 
     /// Build from `(f64_value, row_id)` pairs (Phase 13.3).
     pub fn build_f64(pairs: &[(f64, u64)]) -> Self {
+        Self::build_f64_with_epsilon(pairs, 16)
+    }
+
+    pub fn build_f64_with_epsilon(pairs: &[(f64, u64)], epsilon: usize) -> Self {
         let mut sorted: Vec<(u64, u64)> = pairs.iter().map(|(v, r)| (f64_key(*v), *r)).collect();
         sorted.sort_unstable_by_key(|(k, _)| *k);
         let keys: Vec<u64> = sorted.iter().map(|(k, _)| *k).collect();
         let row_ids: Vec<u64> = sorted.iter().map(|(_, r)| *r).collect();
         let points: Vec<(u64, usize)> = keys.iter().enumerate().map(|(i, k)| (*k, i)).collect();
         let pgm = if points.is_empty() {
-            PgmIndex::build(&[], 16)
+            PgmIndex::build(&[], epsilon)
         } else {
-            PgmIndex::build(&points, 16)
+            PgmIndex::build(&points, epsilon)
         };
         Self { keys, row_ids, pgm }
     }

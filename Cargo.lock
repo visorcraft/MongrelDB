@@ -2376,6 +2376,7 @@ version = "0.50.1"
 dependencies = [
  "arrow",
  "async-trait",
+ "bincode",
  "chrono",
  "datafusion",
  "datafusion-datasource",

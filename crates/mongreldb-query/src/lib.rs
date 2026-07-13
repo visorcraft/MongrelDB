@@ -30,6 +30,7 @@ mod fk_join;
 mod native_agg;
 mod percentile;
 mod scan;
+mod scored_sql;
 mod shadow;
 mod udf;
 
@@ -1497,7 +1498,7 @@ pub struct MongrelSession {
     /// Phase 16.5: logical-plan cache keyed by SQL string.
     plan_cache: parking_lot::Mutex<BoundedLru<String, datafusion::logical_expr::LogicalPlan>>,
     /// `table name → owning Table handle` for every registered table.
-    tables: parking_lot::Mutex<HashMap<String, Arc<Mutex<Table>>>>,
+    tables: scored_sql::TableMap,
     /// Phase 17.3: named materialized views — `view name → defining SQL`.
     /// On `run("SELECT * FROM <view>")`, the defining SQL is executed (or the
     /// result-cache is hit). Invalidated automatically on commit (epoch bump).
@@ -1600,6 +1601,8 @@ impl MongrelSession {
         let ctx = SessionContext::new();
         let sql_fn_state = Arc::new(extended_sql_functions::ExtendedSqlState::default());
         register_mongrel_functions(&ctx, Arc::clone(&sql_fn_state));
+        let tables = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        scored_sql::register(&ctx, Arc::clone(&tables), None, None);
         let external_modules = Arc::new(ExternalModuleRegistry::default());
         Self {
             ctx,
@@ -1609,7 +1612,7 @@ impl MongrelSession {
             principal_catalog_bound: false,
             cache: parking_lot::Mutex::new(BoundedLru::new(SESSION_CACHE_MAX_ENTRIES)),
             plan_cache: parking_lot::Mutex::new(BoundedLru::new(SESSION_CACHE_MAX_ENTRIES)),
-            tables: parking_lot::Mutex::new(HashMap::new()),
+            tables,
             views: parking_lot::Mutex::new(HashMap::new()),
             attached_databases: parking_lot::Mutex::new(HashMap::new()),
             savepoints: parking_lot::Mutex::new(Vec::new()),
@@ -1692,6 +1695,13 @@ impl MongrelSession {
             names.sort();
             names.first().and_then(|n| tables.get(*n).cloned())
         };
+        let tables = Arc::new(parking_lot::Mutex::new(tables));
+        scored_sql::register(
+            &ctx,
+            Arc::clone(&tables),
+            Some(Arc::clone(&database)),
+            principal.clone(),
+        );
 
         Ok(Self {
             ctx,
@@ -1701,7 +1711,7 @@ impl MongrelSession {
             principal_catalog_bound,
             cache: parking_lot::Mutex::new(BoundedLru::new(SESSION_CACHE_MAX_ENTRIES)),
             plan_cache: parking_lot::Mutex::new(BoundedLru::new(SESSION_CACHE_MAX_ENTRIES)),
-            tables: parking_lot::Mutex::new(tables),
+            tables,
             views: parking_lot::Mutex::new(HashMap::new()),
             attached_databases: parking_lot::Mutex::new(HashMap::new()),
             savepoints: parking_lot::Mutex::new(Vec::new()),

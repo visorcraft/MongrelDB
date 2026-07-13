@@ -100,6 +100,16 @@ pub enum Retriever {
     },
 }
 
+impl Retriever {
+    pub fn column_id(&self) -> u16 {
+        match self {
+            Self::Ann { column_id, .. }
+            | Self::Sparse { column_id, .. }
+            | Self::MinHash { column_id, .. } => *column_id,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 pub enum SetMember {

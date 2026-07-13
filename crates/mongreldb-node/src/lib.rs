@@ -376,6 +376,7 @@ fn build_schema(spec: SchemaSpec) -> napi::Result<Schema> {
                 IndexKindSpec::LearnedRange => IndexKind::LearnedRange,
             },
             predicate: None,
+            options: Default::default(),
         })
         .collect();
     Ok(Schema {

@@ -391,6 +391,7 @@ fn schema_descriptor(schema: &Schema) -> Jval {
                 "column_id": index.column_id,
                 "kind": index_kind_name(index.kind),
                 "predicate": index.predicate,
+                "options": index.options,
             })
         })
         .collect();
@@ -498,6 +499,8 @@ pub struct KitIndexDef {
     pub name: String,
     pub column_id: u16,
     pub kind: String,
+    #[serde(default)]
+    pub options: mongreldb_core::schema::IndexOptions,
 }
 
 fn kit_index_kind(kind: &str) -> std::result::Result<IndexKind, String> {
@@ -735,6 +738,7 @@ pub async fn kit_create_table(
             column_id: index.column_id,
             kind,
             predicate: None,
+            options: index.options.clone(),
         });
     }
     let schema = Schema {
@@ -1814,6 +1818,9 @@ fn kit_value(value: &Jval, column: &ColumnDef, indexes: &[IndexDef]) -> Result<V
                 }
                 *terms.entry(token).or_default() += weight;
             }
+            if terms.values().any(|weight| !weight.is_finite()) {
+                return Err("summed sparse weight must be finite f32".into());
+            }
             bincode::serialize(&terms.into_iter().collect::<Vec<_>>())
                 .map(Value::Bytes)
                 .map_err(|error| error.to_string())
@@ -1912,6 +1919,7 @@ mod tests {
             column_id: 2,
             kind: IndexKind::Sparse,
             predicate: None,
+            options: Default::default(),
         };
         let Value::Bytes(encoded) = kit_value(
             &json!([[2, 1.0], [1, 2.0], [2, 3.0]]),
@@ -1932,9 +1940,15 @@ mod tests {
             column_id: 3,
             kind: IndexKind::MinHash,
             predicate: None,
+            options: Default::default(),
         };
         assert_eq!(
-            kit_value(&json!(["a", 1, true]), &set, &[set_index.clone()]).unwrap(),
+            kit_value(
+                &json!(["a", 1, true]),
+                &set,
+                std::slice::from_ref(&set_index),
+            )
+            .unwrap(),
             Value::Bytes(br#"["a",1,true]"#.to_vec())
         );
         assert!(kit_value(&json!([{"bad": true}]), &set, &[set_index]).is_err());

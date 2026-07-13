@@ -18,20 +18,30 @@ pub struct AnnIndex {
     dim: usize,
     bytes_per_vec: usize,
     graph: Hnsw,
+    ef_search: usize,
 }
 
 impl AnnIndex {
     pub fn new(dim: usize) -> Self {
+        Self::with_options(dim, M, EF_CONSTRUCTION, EF_SEARCH)
+    }
+
+    pub fn with_options(dim: usize, m: usize, ef_construction: usize, ef_search: usize) -> Self {
         let bytes_per_vec = dim.div_ceil(8);
         Self {
             dim,
             bytes_per_vec,
-            graph: Hnsw::new(bytes_per_vec, M, EF_CONSTRUCTION),
+            graph: Hnsw::new(bytes_per_vec, m, ef_construction),
+            ef_search,
         }
     }
 
     pub fn dim(&self) -> usize {
         self.dim
+    }
+
+    pub fn ef_search(&self) -> usize {
+        self.ef_search
     }
 
     /// Quantize an f32 vector to a packed bit vector (1 bit per dim, sign bit).
@@ -61,7 +71,7 @@ impl AnnIndex {
     /// k-nearest by Hamming distance.
     pub fn search(&self, query: &[f32], k: usize) -> Vec<(RowId, u32)> {
         let q = self.quantize(query);
-        self.graph.search(&q, k, EF_SEARCH)
+        self.graph.search(&q, k, self.ef_search)
     }
 
     pub fn len(&self) -> usize {
@@ -86,6 +96,13 @@ impl AnnIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn custom_search_breadth_survives_checkpoint() {
+        let index = AnnIndex::with_options(8, 8, 32, 17);
+        assert_eq!(index.ef_search(), 17);
+        assert_eq!(AnnIndex::thaw(&index.freeze()).unwrap().ef_search(), 17);
+    }
 
     #[test]
     fn nearest_finds_similar_vector() {

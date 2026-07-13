@@ -1029,6 +1029,9 @@ impl Table {
     ) -> Result<Self> {
         schema.validate_auto_increment()?;
         schema.validate_defaults()?;
+        for index in &schema.indexes {
+            index.validate_options()?;
+        }
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(dir.join(RUNS_DIR))?;
         write_schema(&dir, &schema)?;
@@ -1168,6 +1171,9 @@ impl Table {
         let manifest_meta_dek = crate::encryption::meta_dek_for(ctx.kek.as_deref());
         let manifest = manifest::read(&dir, manifest_meta_dek.as_ref())?;
         let schema: Schema = read_schema(&dir)?;
+        for index in &schema.indexes {
+            index.validate_options()?;
+        }
         let replay_epoch = Epoch(manifest.current_epoch);
         let (wal_dek, cache_dek) = derive_subkeys(ctx.kek.as_deref(), manifest.table_id);
         // B1: a mounted table has no private WAL — its committed records live in
@@ -1549,12 +1555,21 @@ impl Table {
         if self.run_refs.len() != 1 {
             return Ok(());
         }
-        let cols: Vec<u16> = self
+        let cols: Vec<(u16, usize)> = self
             .schema
             .indexes
             .iter()
             .filter(|i| i.kind == IndexKind::LearnedRange)
-            .map(|i| i.column_id)
+            .map(|i| {
+                (
+                    i.column_id,
+                    i.options
+                        .learned_range
+                        .as_ref()
+                        .map(|options| options.epsilon)
+                        .unwrap_or(16),
+                )
+            })
             .collect();
         if cols.is_empty() {
             return Ok(());
@@ -1564,7 +1579,7 @@ impl Table {
             columnar::NativeColumn::Int64 { data, .. } => data.iter().map(|x| *x as u64).collect(),
             _ => return Ok(()),
         };
-        for cid in cols {
+        for (cid, epsilon) in cols {
             let ty = self
                 .schema
                 .columns
@@ -1580,8 +1595,10 @@ impl Table {
                             .zip(row_ids.iter())
                             .map(|(v, r)| (*v, *r))
                             .collect();
-                        self.learned_range
-                            .insert(cid, ColumnLearnedRange::build_i64(&pairs));
+                        self.learned_range.insert(
+                            cid,
+                            ColumnLearnedRange::build_i64_with_epsilon(&pairs, epsilon),
+                        );
                     }
                 }
                 TypeId::Float64 => {
@@ -1593,8 +1610,10 @@ impl Table {
                             .zip(row_ids.iter())
                             .map(|(v, r)| (*v, *r))
                             .collect();
-                        self.learned_range
-                            .insert(cid, ColumnLearnedRange::build_f64(&pairs));
+                        self.learned_range.insert(
+                            cid,
+                            ColumnLearnedRange::build_f64_with_epsilon(&pairs, epsilon),
+                        );
                     }
                 }
                 _ => {}
@@ -7114,6 +7133,7 @@ impl Table {
             column_id: cid,
             kind: IndexKind::LearnedRange,
             predicate: None,
+            options: Default::default(),
         });
         self.schema.schema_id = self.schema.schema_id.saturating_add(1);
         write_schema(&self.dir, &self.schema)?;
@@ -7931,7 +7951,16 @@ fn empty_indexes(schema: &Schema) -> SecondaryIndexes {
                         _ => None,
                     })
                     .unwrap_or(0);
-                ann.insert(idef.column_id, AnnIndex::new(dim));
+                let options = idef.options.ann.clone().unwrap_or_default();
+                ann.insert(
+                    idef.column_id,
+                    AnnIndex::with_options(
+                        dim,
+                        options.m,
+                        options.ef_construction,
+                        options.ef_search,
+                    ),
+                );
             }
             IndexKind::FmIndex => {
                 fm.insert(idef.column_id, FmIndex::new());
@@ -7940,7 +7969,11 @@ fn empty_indexes(schema: &Schema) -> SecondaryIndexes {
                 sparse.insert(idef.column_id, SparseIndex::new());
             }
             IndexKind::MinHash => {
-                minhash.insert(idef.column_id, MinHashIndex::new());
+                let options = idef.options.minhash.clone().unwrap_or_default();
+                minhash.insert(
+                    idef.column_id,
+                    MinHashIndex::with_options(options.permutations, options.bands),
+                );
             }
             _ => {}
         }

@@ -83,6 +83,15 @@ preserve raw scores; `/kit/set_similarity` adds exact Jaccard verification.
 retrievers, fuse ranks with deterministic RRF, and return component plus fused
 scores. Filtered ANN uses adaptive over-fetch with a bounded search breadth, so
 a highly selective filter may honestly return fewer than `k` approximate hits.
+SQL exposes projected scored table functions: `ann_search_scored`,
+`sparse_search_scored`, `minhash_search_scored`, `set_similarity_scored`, and
+`hybrid_search_scored`.
+
+Index options preserve existing defaults when omitted. `CREATE INDEX ... WITH
+(...)` and Kit schema definitions can tune ANN `m`, `ef_construction`, and
+`ef_search`; MinHash `permutations` and `bands`; and learned-range `epsilon`.
+ANN remains binary-sign quantized. Full-precision and product-quantized ANN are
+not implemented.
 
 ## Performance profile
 

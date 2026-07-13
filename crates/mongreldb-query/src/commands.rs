@@ -10,8 +10,9 @@ use mongreldb_core::memtable::{Row, Value};
 use mongreldb_core::procedure::{ProcedureCallOutput, ProcedureCallRow, StoredProcedure};
 use mongreldb_core::rowid::RowId;
 use mongreldb_core::schema::{
-    AlterColumn, ColumnDef as CoreColumnDef, ColumnFlags, DefaultExpr, IndexDef, IndexKind,
-    Schema as CoreSchema, TypeId,
+    AlterColumn, AnnOptions, AnnQuantization, ColumnDef as CoreColumnDef, ColumnFlags, DefaultExpr,
+    IndexDef, IndexKind, IndexOptions, LearnedRangeOptions, MinHashOptions, Schema as CoreSchema,
+    TypeId,
 };
 use mongreldb_core::Database;
 use mongreldb_core::{
@@ -3560,18 +3561,21 @@ fn create_index(session: &MongrelSession, db: &Arc<Database>, index: CreateIndex
             "index {name} already exists on {table}"
         )));
     }
-    add_index_defs(
-        &mut schema,
-        &name,
-        index.columns,
-        index_kind_from_sql(index.using.as_ref())?,
-    )?;
+    let kind = index_kind_from_sql(index.using.as_ref())?;
+    let options = parse_index_options(kind, &index.with)?;
+    add_index_defs(&mut schema, &name, index.columns, kind)?;
     // Attach the predicate to the newly created index defs.
     if let Some(pred) = &predicate {
         for idx in schema.indexes.iter_mut() {
             if idx.name.starts_with(&name) {
                 idx.predicate = Some(pred.clone());
             }
+        }
+    }
+    for idx in schema.indexes.iter_mut() {
+        if idx.name == name || idx.name.starts_with(&format!("{name}_")) {
+            idx.options = options.clone();
+            idx.validate_options()?;
         }
     }
     rebuild_table(session, db, &table, schema)?;
@@ -5848,6 +5852,7 @@ fn add_index_defs(
             column_id: col.id,
             kind,
             predicate: None,
+            options: Default::default(),
         });
     }
     Ok(())
@@ -5893,6 +5898,92 @@ fn index_kind_from_sql(using: Option<&sqlparser::ast::IndexType>) -> Result<Inde
             "unsupported index type: {other}"
         ))),
     }
+}
+
+fn parse_index_options(kind: IndexKind, expressions: &[Expr]) -> Result<IndexOptions> {
+    let mut options = IndexOptions::default();
+    for expression in expressions {
+        let Expr::BinaryOp { left, op, right } = expression else {
+            return Err(MongrelQueryError::Schema(
+                "index WITH options must use name = integer".into(),
+            ));
+        };
+        if *op != BinaryOperator::Eq {
+            return Err(MongrelQueryError::Schema(
+                "index WITH options must use name = integer".into(),
+            ));
+        }
+        let Expr::Identifier(name) = left.as_ref() else {
+            return Err(MongrelQueryError::Schema(
+                "index option name must be an identifier".into(),
+            ));
+        };
+        let option_name = name.value.to_ascii_lowercase();
+        if kind == IndexKind::Ann && option_name == "quantization" {
+            let quantization = match right.as_ref() {
+                Expr::Identifier(value) => value.value.clone(),
+                Expr::Value(value) => match &value.value {
+                    SqlValue::SingleQuotedString(value) | SqlValue::DoubleQuotedString(value) => {
+                        value.clone()
+                    }
+                    _ => String::new(),
+                },
+                _ => String::new(),
+            };
+            if quantization != "binary_sign" {
+                return Err(MongrelQueryError::Schema(
+                    "ANN quantization must be 'binary_sign'".into(),
+                ));
+            }
+            options
+                .ann
+                .get_or_insert_with(AnnOptions::default)
+                .quantization = AnnQuantization::BinarySign;
+            continue;
+        }
+        let value = expr_to_usize(right).ok_or_else(|| {
+            MongrelQueryError::Schema(format!("index option {} must be an integer", name.value))
+        })?;
+        match (kind, option_name.as_str()) {
+            (IndexKind::Ann, "m") => options.ann.get_or_insert_with(AnnOptions::default).m = value,
+            (IndexKind::Ann, "ef_construction") => {
+                options
+                    .ann
+                    .get_or_insert_with(AnnOptions::default)
+                    .ef_construction = value
+            }
+            (IndexKind::Ann, "ef_search") => {
+                options
+                    .ann
+                    .get_or_insert_with(AnnOptions::default)
+                    .ef_search = value
+            }
+            (IndexKind::MinHash, "permutations") => {
+                options
+                    .minhash
+                    .get_or_insert_with(MinHashOptions::default)
+                    .permutations = value
+            }
+            (IndexKind::MinHash, "bands") => {
+                options
+                    .minhash
+                    .get_or_insert_with(MinHashOptions::default)
+                    .bands = value
+            }
+            (IndexKind::LearnedRange, "epsilon") => {
+                options
+                    .learned_range
+                    .get_or_insert_with(LearnedRangeOptions::default)
+                    .epsilon = value
+            }
+            (_, option) => {
+                return Err(MongrelQueryError::Schema(format!(
+                    "unsupported {kind:?} index option: {option}"
+                )))
+            }
+        }
+    }
+    Ok(options)
 }
 
 fn index_column_name(index_col: &IndexColumn) -> Result<String> {
@@ -7581,5 +7672,56 @@ mod tests {
         assert!(ensure_staging_capacity(MAX_STAGED_SQL_OPS - 1, 1).is_ok());
         let error = ensure_staging_capacity(MAX_STAGED_SQL_OPS, 1).unwrap_err();
         assert!(error.to_string().contains("10000 staged operations"));
+    }
+
+    #[test]
+    fn create_index_with_options_parses_typed_values() {
+        let statement = Parser::parse_sql(
+            &GenericDialect {},
+            "CREATE INDEX mh ON docs USING minhash (members) WITH (permutations = 64, bands = 16)",
+        )
+        .unwrap()
+        .remove(0);
+        let Statement::CreateIndex(index) = statement else {
+            panic!("expected CREATE INDEX")
+        };
+        assert_eq!(
+            index_kind_from_sql(index.using.as_ref()).unwrap(),
+            IndexKind::MinHash
+        );
+        let options = parse_index_options(IndexKind::MinHash, &index.with).unwrap();
+        let minhash = options.minhash.unwrap();
+        assert_eq!(minhash.permutations, 64);
+        assert_eq!(minhash.bands, 16);
+
+        let statement = Parser::parse_sql(
+            &GenericDialect {},
+            "CREATE INDEX mh ON docs USING lsh (members)",
+        )
+        .unwrap()
+        .remove(0);
+        let Statement::CreateIndex(index) = statement else {
+            panic!("expected CREATE INDEX")
+        };
+        assert_eq!(
+            index_kind_from_sql(index.using.as_ref()).unwrap(),
+            IndexKind::MinHash
+        );
+
+        let statement = Parser::parse_sql(
+            &GenericDialect {},
+            "CREATE INDEX ann ON docs USING ann (embedding) WITH (m = 8, ef_construction = 32, ef_search = 17, quantization = 'binary_sign')",
+        )
+        .unwrap()
+        .remove(0);
+        let Statement::CreateIndex(index) = statement else {
+            panic!("expected CREATE INDEX")
+        };
+        let ann = parse_index_options(IndexKind::Ann, &index.with)
+            .unwrap()
+            .ann
+            .unwrap();
+        assert_eq!((ann.m, ann.ef_construction, ann.ef_search), (8, 32, 17));
+        assert_eq!(ann.quantization, AnnQuantization::BinarySign);
     }
 }

@@ -245,6 +245,98 @@ pub enum IndexKind {
     Sparse,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct IndexOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ann: Option<AnnOptions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minhash: Option<MinHashOptions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learned_range: Option<LearnedRangeOptions>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnnOptions {
+    #[serde(default = "default_ann_m")]
+    pub m: usize,
+    #[serde(default = "default_ann_ef_construction")]
+    pub ef_construction: usize,
+    #[serde(default = "default_ann_ef_search")]
+    pub ef_search: usize,
+    #[serde(default)]
+    pub quantization: AnnQuantization,
+}
+
+impl Default for AnnOptions {
+    fn default() -> Self {
+        Self {
+            m: default_ann_m(),
+            ef_construction: default_ann_ef_construction(),
+            ef_search: default_ann_ef_search(),
+            quantization: AnnQuantization::BinarySign,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnnQuantization {
+    #[default]
+    BinarySign,
+}
+
+const fn default_ann_m() -> usize {
+    16
+}
+const fn default_ann_ef_construction() -> usize {
+    64
+}
+const fn default_ann_ef_search() -> usize {
+    64
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MinHashOptions {
+    #[serde(default = "default_minhash_permutations")]
+    pub permutations: usize,
+    #[serde(default = "default_minhash_bands")]
+    pub bands: usize,
+}
+
+impl Default for MinHashOptions {
+    fn default() -> Self {
+        Self {
+            permutations: default_minhash_permutations(),
+            bands: default_minhash_bands(),
+        }
+    }
+}
+
+const fn default_minhash_permutations() -> usize {
+    128
+}
+const fn default_minhash_bands() -> usize {
+    32
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LearnedRangeOptions {
+    #[serde(default = "default_learned_range_epsilon")]
+    pub epsilon: usize,
+}
+
+impl Default for LearnedRangeOptions {
+    fn default() -> Self {
+        Self {
+            epsilon: default_learned_range_epsilon(),
+        }
+    }
+}
+
+const fn default_learned_range_epsilon() -> usize {
+    16
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexDef {
     pub name: String,
@@ -255,6 +347,61 @@ pub struct IndexDef {
     /// predicate are indexed. `None` means all rows are indexed (full index).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub predicate: Option<String>,
+    #[serde(default)]
+    pub options: IndexOptions,
+}
+
+impl IndexDef {
+    pub fn validate_options(&self) -> Result<()> {
+        if self.options.ann.is_some() && self.kind != IndexKind::Ann
+            || self.options.minhash.is_some() && self.kind != IndexKind::MinHash
+            || self.options.learned_range.is_some() && self.kind != IndexKind::LearnedRange
+        {
+            return Err(MongrelError::Schema(format!(
+                "index {} has options for a different index kind",
+                self.name
+            )));
+        }
+        if let Some(options) = &self.options.ann {
+            if options.m == 0
+                || options.ef_construction < options.m
+                || options.ef_search == 0
+                || options.m > 256
+                || options.ef_construction > 65_536
+                || options.ef_search > 65_536
+            {
+                return Err(MongrelError::Schema(format!(
+                    "invalid ANN options for index {}",
+                    self.name
+                )));
+            }
+        }
+        if let Some(options) = &self.options.minhash {
+            if options.permutations == 0
+                || options.bands == 0
+                || options.permutations % options.bands != 0
+                || options.permutations > 4096
+                || options.bands > 1024
+            {
+                return Err(MongrelError::Schema(format!(
+                    "invalid MinHash options for index {}",
+                    self.name
+                )));
+            }
+        }
+        if self
+            .options
+            .learned_range
+            .as_ref()
+            .is_some_and(|options| options.epsilon == 0 || options.epsilon > 1_048_576)
+        {
+            return Err(MongrelError::Schema(format!(
+                "invalid learned-range options for index {}",
+                self.name
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -477,6 +624,36 @@ pub(crate) fn value_matches_type(v: &Value, ty: TypeId) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn index_options_preserve_defaults_and_validate_bounds() {
+        let defaults = IndexDef {
+            name: "ann".into(),
+            column_id: 1,
+            kind: IndexKind::Ann,
+            predicate: None,
+            options: IndexOptions::default(),
+        };
+        assert!(defaults.validate_options().is_ok());
+        let json = serde_json::to_string(&defaults).unwrap();
+        let restored: IndexDef = serde_json::from_str(&json).unwrap();
+        assert!(restored.options.ann.is_none());
+
+        let invalid = IndexDef {
+            name: "minhash".into(),
+            column_id: 2,
+            kind: IndexKind::MinHash,
+            predicate: None,
+            options: IndexOptions {
+                minhash: Some(MinHashOptions {
+                    permutations: 127,
+                    bands: 32,
+                }),
+                ..Default::default()
+            },
+        };
+        assert!(invalid.validate_options().is_err());
+    }
 
     #[test]
     fn flag_composition() {
