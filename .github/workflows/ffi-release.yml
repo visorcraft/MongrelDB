@@ -419,8 +419,14 @@ jobs:
 
       - name: Import GPG signing key
         run: |
+          # Import the ASCII-armored key into the default keyring so the
+          # maven-gpg-plugin finds it via gpg's normal homedir resolution.
           echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --dearmor --output /tmp/signing.gpg
-          echo "GPG_DEARMORED_PATH=/tmp/signing.gpg" >> "$GITHUB_ENV"
+          mkdir -p ~/.gnupg
+          chmod 700 ~/.gnupg
+          gpg --batch --import /tmp/signing.gpg
+          # Trust the key ultimately so gpg doesn't prompt during signing.
+          echo -e "5\ny\n" | gpg --batch --command-fd 0 --expert --edit-key ${{ secrets.GPG_KEY_ID }} trust
 
       - name: Configure Maven settings.xml
         run: |
@@ -434,22 +440,8 @@ jobs:
                 <password>${env.CENTRAL_PASSWORD}</password>
               </server>
             </servers>
-            <profiles>
-              <profile>
-                <id>gpg</id>
-                <properties>
-                  <gpg.executable>gpg</gpg.executable>
-                  <gpg.keyname>${env.GPG_KEY_ID}</gpg.keyname>
-                  <gpg.passphrase>${env.GPG_PASSPHRASE}</gpg.passphrase>
-                  <gpg.homedir>/tmp/gpg-home</gpg.homedir>
-                </properties>
-              </profile>
-            </profiles>
           </settings>
           XML
-          mkdir -p /tmp/gpg-home
-          chmod 700 /tmp/gpg-home
-          GNUPGHOME=/tmp/gpg-home gpg --batch --import /tmp/signing.gpg
 
       - name: Stage all native libs into JAR resources
         uses: actions/download-artifact@v8
@@ -463,9 +455,9 @@ jobs:
         env:
           CENTRAL_USERNAME: ${{ secrets.CENTRAL_USERNAME }}
           CENTRAL_PASSWORD: ${{ secrets.CENTRAL_PASSWORD }}
-          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
-          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
           mkdir -p src/main/resources/native
           cp -r ../../../staging/native/* src/main/resources/native/
-          mvn -B -ntp -Prelease deploy
+          mvn -B -ntp -Prelease deploy \
+            -Dgpg.keyname=${{ secrets.GPG_KEY_ID }} \
+            -Dgpg.passphrase=${{ secrets.GPG_PASSPHRASE }}
