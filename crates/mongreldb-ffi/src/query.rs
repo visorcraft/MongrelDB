@@ -319,12 +319,13 @@ fn minhash_members_to_hashes(
 
 // ── query builder ─────────────────────────────────────────────────────────
 
-/// Accumulates conditions + optional projection + optional limit and builds a
-/// core [`Query`]. Exposed to C as `mongreldb_query_t`.
+/// Accumulates conditions, optional projection/limit, and offset, then builds
+/// a core [`Query`]. Exposed to C as `mongreldb_query_t`.
 pub struct FFIQuery {
     pub conditions: Vec<Condition>,
     pub projection: Option<Vec<u16>>,
     pub limit: Option<usize>,
+    pub offset: usize,
 }
 
 impl FFIQuery {
@@ -333,6 +334,7 @@ impl FFIQuery {
             conditions: Vec::new(),
             projection: None,
             limit: Some(MAX_FINAL_LIMIT),
+            offset: 0,
         }
     }
 
@@ -349,6 +351,7 @@ impl FFIQuery {
             q = q.and(c.clone());
         }
         q.with_limit(self.limit.unwrap_or(MAX_FINAL_LIMIT))
+            .with_offset(self.offset)
     }
 }
 
@@ -489,6 +492,24 @@ pub unsafe extern "C" fn mongreldb_query_set_limit(q: mongreldb_query_t, limit: 
     0
 }
 
+/// Set the number of matching rows to skip before applying the result limit.
+///
+/// # Safety
+/// `q` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn mongreldb_query_set_offset(q: mongreldb_query_t, offset: u64) -> i32 {
+    clear();
+    let Some(query) = as_query_mut(q) else {
+        return ErrorCode::InvalidArgument.as_return();
+    };
+    let Ok(offset) = usize::try_from(offset) else {
+        return set_error_msg(ErrorCode::InvalidArgument, "offset exceeds platform size")
+            .as_return();
+    };
+    query.offset = offset;
+    0
+}
+
 /// Finalize the builder into a built query handle. The opaque handle already
 /// holds the [`FFIQuery`] (conditions + projection + limit), so the same pointer
 /// is returned, now semantically a built query.
@@ -572,6 +593,9 @@ mod tests {
                 ..Default::default()
             };
             assert_ne!(mongreldb_query_add(query, &condition), 0);
+            assert_eq!(mongreldb_query_set_offset(query, 12), 0);
+            assert_eq!(as_query(query).unwrap().offset, 12);
+            assert_eq!(as_query(query).unwrap().build().offset, 12);
             mongreldb_query_free(query);
         }
     }

@@ -432,6 +432,16 @@ async fn kit_query_pk_range_and_projection() {
     assert_eq!(v["rows"].as_array().unwrap().len(), 1);
     assert_eq!(v["truncated"], true);
 
+    // Offset is applied before the per-request result cap.
+    let q = serde_json::json!({"table": "users", "limit": 1, "offset": 2});
+    let (s, v) = post(app.clone(), "/kit/query", q).await;
+    assert_eq!(s, 200);
+    assert_eq!(v["rows"].as_array().unwrap().len(), 1);
+    assert!(v["rows"][0]["cells"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!(3)));
+
     // Empty conditions ⇒ all rows.
     let q = serde_json::json!({"table": "users"});
     let (s, v) = post(app, "/kit/query", q).await;

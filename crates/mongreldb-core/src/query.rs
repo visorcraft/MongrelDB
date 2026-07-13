@@ -249,6 +249,7 @@ pub struct SearchHit {
 pub struct Query {
     pub conditions: Vec<Condition>,
     pub limit: Option<usize>,
+    pub offset: usize,
 }
 
 impl Query {
@@ -261,6 +262,10 @@ impl Query {
     }
     pub fn with_limit(mut self, limit: usize) -> Self {
         self.limit = Some(limit);
+        self
+    }
+    pub fn with_offset(mut self, offset: usize) -> Self {
+        self.offset = offset;
         self
     }
     pub fn pk(key: Vec<u8>) -> Self {

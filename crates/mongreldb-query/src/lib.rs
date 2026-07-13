@@ -336,6 +336,7 @@ impl TableProvider for MongrelProvider {
                                     &mongreldb_core::Query {
                                         conditions: ai_conditions.clone(),
                                         limit: Some(mongreldb_core::query::MAX_FINAL_LIMIT),
+                                        offset: 0,
                                     },
                                     snapshot,
                                     allowed,

@@ -501,6 +501,11 @@ export declare class TableHandle {
   deleteByPkInt64(value: bigint): void
   /** Hybrid index query. */
   query(conditions: Array<ConditionSpec>): Array<RowJs>
+  /**
+   * Return one stable row-id-ordered page. Each page keeps the native query
+   * result ceiling while `offset` allows callers to reach the full table.
+   */
+  queryPage(conditions: Array<ConditionSpec>, limit: number, offset: number): Array<RowJs>
   /** Binary ANN candidate search followed by exact float-vector reranking. */
   annRerank(columnId: number, query: Array<number>, candidateK: number, limit: number, metric: string): Array<AnnRerankHitJs>
   /**

@@ -904,6 +904,9 @@ pub struct KitQueryRequest {
     /// Cap on the number of returned rows (after intersection).
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Number of matching rows to skip before applying `limit`.
+    #[serde(default)]
+    pub offset: usize,
 }
 
 /// A condition over the row-id space, mirroring `mongreldb_core::query::Condition`
@@ -1570,7 +1573,9 @@ pub async fn kit_query(
             }
         }
     }
-    q = q.with_limit(mongreldb_core::query::MAX_FINAL_LIMIT);
+    q = q
+        .with_limit(mongreldb_core::query::MAX_FINAL_LIMIT)
+        .with_offset(req.offset);
 
     let projection = projection_ids
         .into_iter()

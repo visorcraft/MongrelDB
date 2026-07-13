@@ -328,7 +328,7 @@ curl -X POST http://127.0.0.1:8453/kit/txn \
 # Typed query with conditions
 curl -X POST http://127.0.0.1:8453/kit/query \
   -H "Content-Type: application/json" \
-  -d '{"table": "events", "conditions": [...]}'
+  -d '{"table": "events", "conditions": [...], "limit": 1000, "offset": 10000}'
 ```
 
 ### Row-Level Operations

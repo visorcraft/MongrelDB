@@ -2183,6 +2183,45 @@ impl TableHandle {
         Ok(rows.iter().map(|r| row_to_js_table(&g, r)).collect())
     }
 
+    /// Return one stable row-id-ordered page. Each page keeps the native query
+    /// result ceiling while `offset` allows callers to reach the full table.
+    #[napi]
+    pub fn query_page(
+        &self,
+        conditions: Vec<ConditionSpec>,
+        limit: u32,
+        offset: f64,
+    ) -> napi::Result<Vec<RowJs>> {
+        let limit = limit as usize;
+        if limit == 0 || limit > mongreldb_core::query::MAX_FINAL_LIMIT {
+            return Err(napi::Error::new(
+                napi::Status::InvalidArg,
+                format!(
+                    "query limit must be between 1 and {}",
+                    mongreldb_core::query::MAX_FINAL_LIMIT
+                ),
+            ));
+        }
+        if !offset.is_finite()
+            || offset < 0.0
+            || offset.fract() != 0.0
+            || offset > 9_007_199_254_740_991.0
+            || offset > usize::MAX as f64
+        {
+            return Err(napi::Error::new(
+                napi::Status::InvalidArg,
+                "query offset must be a safe non-negative integer",
+            ));
+        }
+        let handle = self.db.table(&self.name).map_err(to_napi)?;
+        let mut g = handle.lock();
+        let q = build_query_from_conditions(build_conditions(&conditions)?)
+            .with_limit(limit)
+            .with_offset(offset as usize);
+        let rows = g.query_cached(&q).map_err(to_napi)?;
+        Ok(rows.iter().map(|r| row_to_js_table(&g, r)).collect())
+    }
+
     /// Binary ANN candidate search followed by exact float-vector reranking.
     #[napi]
     pub fn ann_rerank(

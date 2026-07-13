@@ -155,6 +155,54 @@ fn public_ai_cardinalities_fail_closed() {
 }
 
 #[test]
+fn native_query_offset_applies_before_limit() {
+    let (_dir, mut table) = table();
+    for id in 2..=4 {
+        table
+            .put(vec![
+                (1, Value::Int64(id)),
+                (2, Value::Embedding(vec![1.0; 8])),
+                (
+                    3,
+                    Value::Bytes(bincode::serialize(&vec![(id as u32, 1.0)]).unwrap()),
+                ),
+                (4, Value::Bytes(b"[]".to_vec())),
+            ])
+            .unwrap();
+    }
+    table.commit().unwrap();
+
+    let rows = table
+        .query(&mongreldb_core::Query::new().with_offset(2).with_limit(1))
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].columns[&1], Value::Int64(3));
+
+    let range = Condition::Range {
+        column_id: 1,
+        lo: 1,
+        hi: 4,
+    };
+    let first_page = table
+        .query_cached(
+            &mongreldb_core::Query::new()
+                .and(range.clone())
+                .with_limit(1),
+        )
+        .unwrap();
+    let third_page = table
+        .query_cached(
+            &mongreldb_core::Query::new()
+                .and(range)
+                .with_offset(2)
+                .with_limit(1),
+        )
+        .unwrap();
+    assert_eq!(first_page[0].columns[&1], Value::Int64(1));
+    assert_eq!(third_page[0].columns[&1], Value::Int64(3));
+}
+
+#[test]
 fn ai_scores_remain_finite_or_return_typed_errors() {
     let (_dir, mut table) = table();
     let sparse = table

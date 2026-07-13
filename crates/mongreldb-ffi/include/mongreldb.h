@@ -416,6 +416,7 @@ int32_t mongreldb_query_add(
 int32_t mongreldb_query_set_projection(
     mongreldb_query_t *q, const uint16_t *cols, size_t len);
 int32_t mongreldb_query_set_limit(mongreldb_query_t *q, uint64_t limit);
+int32_t mongreldb_query_set_offset(mongreldb_query_t *q, uint64_t offset);
 mongreldb_query_t *mongreldb_query_build(mongreldb_query_t *q);
 void mongreldb_query_free(mongreldb_query_t *q);
 

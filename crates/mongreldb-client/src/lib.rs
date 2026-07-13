@@ -296,6 +296,8 @@ pub struct KitQueryRequest {
     pub projection: Option<Vec<u16>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

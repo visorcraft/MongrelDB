@@ -3510,7 +3510,7 @@ impl Table {
                 )));
             }
         }
-        self.query_conditions_at(&q.conditions, snapshot, allowed, q.limit)
+        self.query_conditions_at(&q.conditions, snapshot, allowed, q.limit, q.offset)
     }
 
     /// Unbounded internal SQL join helper. Public request surfaces must use
@@ -3529,7 +3529,7 @@ impl Table {
                 crate::query::MAX_HARD_CONDITIONS
             )));
         }
-        self.query_conditions_at(conditions, snapshot, None, None)
+        self.query_conditions_at(conditions, snapshot, None, None, 0)
     }
 
     fn query_conditions_at(
@@ -3538,6 +3538,7 @@ impl Table {
         snapshot: Snapshot,
         allowed: Option<&std::collections::HashSet<RowId>>,
         limit: Option<usize>,
+        offset: usize,
     ) -> Result<Vec<Row>> {
         crate::trace::QueryTrace::record(|t| {
             t.run_count = self.run_refs.len();
@@ -3556,6 +3557,7 @@ impl Table {
             if let Some(allowed) = allowed {
                 rows.retain(|row| allowed.contains(&row.row_id));
             }
+            rows.drain(..offset.min(rows.len()));
             if let Some(limit) = limit {
                 rows.truncate(limit);
             }
@@ -3587,6 +3589,7 @@ impl Table {
         if let Some(allowed) = allowed {
             rids.retain(|row_id| allowed.contains(&RowId(*row_id)));
         }
+        rids.drain(..offset.min(rids.len()));
         if let Some(limit) = limit {
             rids.truncate(limit);
         }
@@ -6065,7 +6068,8 @@ impl Table {
             return self.query(q);
         }
         let key = crate::query::canonical_query_key(&q.conditions, None, 0)
-            ^ (q.limit.unwrap_or(usize::MAX) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            ^ (q.limit.unwrap_or(usize::MAX) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ (q.offset as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
         if let Some(hit) = self.result_cache.lock().get_rows(key) {
             crate::trace::QueryTrace::record(|t| {
                 t.result_cache_hit = true;
