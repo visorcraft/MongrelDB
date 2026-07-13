@@ -1029,6 +1029,7 @@ impl Table {
     ) -> Result<Self> {
         schema.validate_auto_increment()?;
         schema.validate_defaults()?;
+        schema.validate_ai()?;
         for index in &schema.indexes {
             index.validate_options()?;
         }
@@ -1171,6 +1172,7 @@ impl Table {
         let manifest_meta_dek = crate::encryption::meta_dek_for(ctx.kek.as_deref());
         let manifest = manifest::read(&dir, manifest_meta_dek.as_ref())?;
         let schema: Schema = read_schema(&dir)?;
+        schema.validate_ai()?;
         for index in &schema.indexes {
             index.validate_options()?;
         }
@@ -1331,7 +1333,9 @@ impl Table {
             live_count: manifest.live_count,
             reservoir: crate::reservoir::Reservoir::default(),
             reservoir_complete: false,
-            had_deletes: saw_delete,
+            had_deletes: saw_delete
+                || manifest.runs.iter().map(|run| run.row_count).sum::<u64>()
+                    != manifest.live_count,
             agg_cache: HashMap::new(),
             global_idx_epoch: manifest.global_idx_epoch,
             indexes_complete: true,
@@ -1473,7 +1477,7 @@ impl Table {
         Ok(())
     }
 
-    fn rebuild_indexes_from_runs(&mut self) -> Result<()> {
+    pub(crate) fn rebuild_indexes_from_runs(&mut self) -> Result<()> {
         self.hot = HotIndex::new();
         self.pk_by_row.clear();
         let (bitmap, ann, fm, sparse, minhash) = empty_indexes(&self.schema);
@@ -1755,7 +1759,7 @@ impl Table {
         self.require_insert()?;
         let assigned = self.fill_auto_inc(&mut columns)?;
         self.apply_defaults(&mut columns)?;
-        self.schema.validate_not_null(&columns)?;
+        self.schema.validate_values(&columns)?;
         // For clustered (WITHOUT ROWID) tables, derive RowId deterministically
         // from the PK value so the same PK always maps to the same row (no
         // allocator waste, idempotent upserts). For standard tables, use the
@@ -1798,7 +1802,7 @@ impl Table {
             filled.push((cols, assigned));
         }
         for (cols, _) in &filled {
-            self.schema.validate_not_null(cols)?;
+            self.schema.validate_values(cols)?;
         }
         let epoch = self.pending_epoch();
         let mut rows = Vec::with_capacity(filled.len());
@@ -2452,7 +2456,7 @@ impl Table {
 
     /// Validate that `cells` satisfy the schema's NOT NULL constraints.
     pub(crate) fn validate_cells_not_null(&self, cells: &[(u16, Value)]) -> Result<()> {
-        self.schema.validate_not_null(cells)
+        self.schema.validate_values(cells)
     }
 
     /// Column-major NOT NULL validation for the bulk-load paths. Every schema
@@ -3157,6 +3161,9 @@ impl Table {
         if n == 0 {
             return Ok(epoch);
         }
+        for row in &batch {
+            self.schema.validate_values(row)?;
+        }
         let live_before = self.live_count;
         // Spill any pending mutable-run data first: bulk_load writes a Flush
         // marker + rotates the WAL below, which is only safe once all in-flight
@@ -3513,10 +3520,20 @@ impl Table {
         &mut self,
         retriever: &crate::query::Retriever,
     ) -> Result<Vec<crate::query::RetrieverHit>> {
+        self.retrieve_with_allowed(retriever, None)
+    }
+
+    /// Scored retrieval restricted to caller-authorized row IDs. Core MVCC,
+    /// tombstone, and TTL eligibility is always applied before ranking.
+    pub fn retrieve_with_allowed(
+        &mut self,
+        retriever: &crate::query::Retriever,
+        allowed: Option<&std::collections::HashSet<RowId>>,
+    ) -> Result<Vec<crate::query::RetrieverHit>> {
         self.require_select()?;
         self.ensure_indexes_complete()?;
         self.validate_retriever(retriever)?;
-        Ok(self.retrieve_index(retriever))
+        self.retrieve_filtered(retriever, self.snapshot(), None, allowed)
     }
 
     fn validate_retriever(&self, retriever: &crate::query::Retriever) -> Result<()> {
@@ -3592,77 +3609,55 @@ impl Table {
         Ok(())
     }
 
-    fn retrieve_index(
-        &self,
-        retriever: &crate::query::Retriever,
-    ) -> Vec<crate::query::RetrieverHit> {
-        use crate::query::{Retriever, RetrieverHit, RetrieverScore, SetMember};
-        let scored: Vec<(RowId, RetrieverScore)> = match retriever {
-            Retriever::Ann {
+    fn validate_condition(&self, condition: &crate::query::Condition) -> Result<()> {
+        use crate::query::Condition;
+        match condition {
+            Condition::Ann {
                 column_id,
                 query,
                 k,
-            } => self
-                .ann
-                .get(column_id)
-                .map(|index| {
-                    index
-                        .search(query, *k)
-                        .into_iter()
-                        .map(|(row_id, score)| (row_id, RetrieverScore::AnnHammingDistance(score)))
-                        .collect()
-                })
-                .unwrap_or_default(),
-            Retriever::Sparse {
+            } => self.validate_retriever(&crate::query::Retriever::Ann {
+                column_id: *column_id,
+                query: query.clone(),
+                k: *k,
+            }),
+            Condition::SparseMatch {
                 column_id,
                 query,
                 k,
-            } => self
-                .sparse
-                .get(column_id)
-                .map(|index| {
-                    index
-                        .search(query, *k)
-                        .into_iter()
-                        .map(|(row_id, score)| (row_id, RetrieverScore::SparseDotProduct(score)))
-                        .collect()
-                })
-                .unwrap_or_default(),
-            Retriever::MinHash {
+            } => self.validate_retriever(&crate::query::Retriever::Sparse {
+                column_id: *column_id,
+                query: query.clone(),
+                k: *k,
+            }),
+            Condition::MinHashSimilar {
                 column_id,
-                members,
+                query,
                 k,
-            } => self
-                .minhash
-                .get(column_id)
-                .map(|index| {
-                    let hashes: Vec<_> = members.iter().map(SetMember::hash_v1).collect();
-                    index
-                        .search(&hashes, *k)
-                        .into_iter()
-                        .map(|(row_id, score)| {
-                            (row_id, RetrieverScore::MinHashEstimatedJaccard(score))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
-        };
-        scored
-            .into_iter()
-            .enumerate()
-            .map(|(rank, (row_id, score))| RetrieverHit {
-                row_id,
-                rank: rank + 1,
-                score,
-            })
-            .collect()
+            } => {
+                if !self.minhash.contains_key(column_id) {
+                    return Err(MongrelError::InvalidArgument(format!(
+                        "column {column_id} has no MinHash index"
+                    )));
+                }
+                if query.is_empty() || *k == 0 {
+                    return Err(MongrelError::InvalidArgument(
+                        "MinHash query must be non-empty and k must be > 0".into(),
+                    ));
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
     }
 
     fn retrieve_filtered(
         &self,
         retriever: &crate::query::Retriever,
-        allowed: &RowIdSet,
-    ) -> Vec<crate::query::RetrieverHit> {
+        snapshot: Snapshot,
+        hard_filter: Option<&RowIdSet>,
+        allowed: Option<&std::collections::HashSet<RowId>>,
+    ) -> Result<Vec<crate::query::RetrieverHit>> {
         use crate::query::{Retriever, RetrieverHit, RetrieverScore, SetMember};
         let scored: Vec<(RowId, RetrieverScore)> = match retriever {
             Retriever::Ann {
@@ -3671,16 +3666,36 @@ impl Table {
                 k,
             } => {
                 let Some(index) = self.ann.get(column_id) else {
-                    return Vec::new();
+                    return Ok(Vec::new());
                 };
-                let cap = index.len().min(k.saturating_mul(64).max(1024));
+                let cap = index.len();
+                if cap == 0 {
+                    return Ok(Vec::new());
+                }
                 let mut breadth = (*k).max(1).min(cap);
+                let mut eligibility = std::collections::HashMap::new();
                 let mut filtered = loop {
                     let mut seen = std::collections::HashSet::new();
-                    let filtered: Vec<_> = index
-                        .search(query, breadth)
+                    let raw = index.search(query, breadth)?;
+                    let unchecked: Vec<_> = raw
+                        .iter()
+                        .map(|(row_id, _)| *row_id)
+                        .filter(|row_id| !eligibility.contains_key(row_id))
+                        .filter(|row_id| {
+                            hard_filter.map_or(true, |filter| filter.contains(row_id.0))
+                                && allowed.map_or(true, |allowed| allowed.contains(row_id))
+                        })
+                        .collect();
+                    let eligible = self.eligible_candidate_ids(&unchecked, *column_id, snapshot)?;
+                    for row_id in unchecked {
+                        eligibility.insert(row_id, eligible.contains(&row_id));
+                    }
+                    let filtered: Vec<_> = raw
                         .into_iter()
-                        .filter(|(row_id, _)| allowed.contains(row_id.0) && seen.insert(*row_id))
+                        .filter(|(row_id, _)| {
+                            seen.insert(*row_id)
+                                && eligibility.get(row_id).copied().unwrap_or(false)
+                        })
                         .map(|(row_id, score)| (row_id, RetrieverScore::AnnHammingDistance(score)))
                         .collect();
                     if filtered.len() >= *k || breadth >= cap {
@@ -3698,13 +3713,44 @@ impl Table {
             } => self
                 .sparse
                 .get(column_id)
-                .map(|index| {
-                    index
-                        .search_filtered(query, *k, |row_id| allowed.contains(row_id.0))
-                        .into_iter()
-                        .map(|(row_id, score)| (row_id, RetrieverScore::SparseDotProduct(score)))
-                        .collect()
+                .map(|index| -> Result<Vec<_>> {
+                    let mut breadth = (*k).max(1);
+                    let mut eligibility = std::collections::HashMap::new();
+                    loop {
+                        let raw = index.search(query, breadth);
+                        let unchecked: Vec<_> = raw
+                            .iter()
+                            .map(|(row_id, _)| *row_id)
+                            .filter(|row_id| !eligibility.contains_key(row_id))
+                            .filter(|row_id| {
+                                hard_filter.map_or(true, |filter| filter.contains(row_id.0))
+                                    && allowed.map_or(true, |allowed| allowed.contains(row_id))
+                            })
+                            .collect();
+                        let eligible =
+                            self.eligible_candidate_ids(&unchecked, *column_id, snapshot)?;
+                        for row_id in unchecked {
+                            eligibility.insert(row_id, eligible.contains(&row_id));
+                        }
+                        let filtered: Vec<_> = raw
+                            .iter()
+                            .filter(|(row_id, _)| eligibility.get(row_id).copied().unwrap_or(false))
+                            .take(*k)
+                            .map(|(row_id, score)| {
+                                (*row_id, RetrieverScore::SparseDotProduct(*score))
+                            })
+                            .collect();
+                        if filtered.len() >= *k || raw.len() < breadth {
+                            break Ok(filtered);
+                        }
+                        let next = breadth.saturating_mul(2);
+                        if next == breadth {
+                            break Ok(filtered);
+                        }
+                        breadth = next;
+                    }
                 })
+                .transpose()?
                 .unwrap_or_default(),
             Retriever::MinHash {
                 column_id,
@@ -3713,19 +3759,48 @@ impl Table {
             } => self
                 .minhash
                 .get(column_id)
-                .map(|index| {
+                .map(|index| -> Result<Vec<_>> {
                     let hashes: Vec<_> = members.iter().map(SetMember::hash_v1).collect();
-                    index
-                        .search_filtered(&hashes, *k, |row_id| allowed.contains(row_id.0))
-                        .into_iter()
-                        .map(|(row_id, score)| {
-                            (row_id, RetrieverScore::MinHashEstimatedJaccard(score))
-                        })
-                        .collect()
+                    let mut breadth = (*k).max(1);
+                    let mut eligibility = std::collections::HashMap::new();
+                    loop {
+                        let raw = index.search(&hashes, breadth);
+                        let unchecked: Vec<_> = raw
+                            .iter()
+                            .map(|(row_id, _)| *row_id)
+                            .filter(|row_id| !eligibility.contains_key(row_id))
+                            .filter(|row_id| {
+                                hard_filter.map_or(true, |filter| filter.contains(row_id.0))
+                                    && allowed.map_or(true, |allowed| allowed.contains(row_id))
+                            })
+                            .collect();
+                        let eligible =
+                            self.eligible_candidate_ids(&unchecked, *column_id, snapshot)?;
+                        for row_id in unchecked {
+                            eligibility.insert(row_id, eligible.contains(&row_id));
+                        }
+                        let filtered: Vec<_> = raw
+                            .iter()
+                            .filter(|(row_id, _)| eligibility.get(row_id).copied().unwrap_or(false))
+                            .take(*k)
+                            .map(|(row_id, score)| {
+                                (*row_id, RetrieverScore::MinHashEstimatedJaccard(*score))
+                            })
+                            .collect();
+                        if filtered.len() >= *k || raw.len() < breadth {
+                            break Ok(filtered);
+                        }
+                        let next = breadth.saturating_mul(2);
+                        if next == breadth {
+                            break Ok(filtered);
+                        }
+                        breadth = next;
+                    }
                 })
+                .transpose()?
                 .unwrap_or_default(),
         };
-        scored
+        Ok(scored
             .into_iter()
             .enumerate()
             .map(|(rank, (row_id, score))| RetrieverHit {
@@ -3733,13 +3808,82 @@ impl Table {
                 rank: rank + 1,
                 score,
             })
-            .collect()
+            .collect())
+    }
+
+    fn eligible_candidate_ids(
+        &self,
+        candidates: &[RowId],
+        _column_id: u16,
+        snapshot: Snapshot,
+    ) -> Result<std::collections::HashSet<RowId>> {
+        if !self.had_deletes && self.ttl.is_none() && snapshot.epoch == self.snapshot().epoch {
+            return Ok(candidates.iter().copied().collect());
+        }
+        let mut readers: Vec<_> = self
+            .run_refs
+            .iter()
+            .map(|run| self.open_reader(run.run_id))
+            .collect::<Result<_>>()?;
+        let now = unix_nanos_now();
+        let mut eligible = std::collections::HashSet::with_capacity(candidates.len());
+        for &row_id in candidates {
+            let mem = self.memtable.get_version(row_id, snapshot.epoch);
+            let mutable = self.mutable_run.get_version(row_id, snapshot.epoch);
+            let overlay = match (mem, mutable) {
+                (Some(left), Some(right)) => Some(if left.0 >= right.0 { left } else { right }),
+                (Some(value), None) | (None, Some(value)) => Some(value),
+                (None, None) => None,
+            };
+            if let Some((_, row)) = overlay {
+                if !row.deleted && !self.row_expired_at(&row, now) {
+                    eligible.insert(row_id);
+                }
+                continue;
+            }
+            let mut best: Option<(Epoch, bool, usize)> = None;
+            for (index, reader) in readers.iter_mut().enumerate() {
+                if let Some((epoch, deleted)) =
+                    reader.get_version_visibility(row_id, snapshot.epoch)?
+                {
+                    if best
+                        .as_ref()
+                        .map(|(best_epoch, ..)| epoch > *best_epoch)
+                        .unwrap_or(true)
+                    {
+                        best = Some((epoch, deleted, index));
+                    }
+                }
+            }
+            let Some((_, false, reader_index)) = best else {
+                continue;
+            };
+            if let Some(ttl) = self.ttl {
+                if let Some((_, _, Some(Value::Int64(timestamp)))) = readers[reader_index]
+                    .get_version_column(row_id, snapshot.epoch, ttl.column_id)?
+                {
+                    if timestamp.saturating_add(ttl.duration_nanos as i64) <= now {
+                        continue;
+                    }
+                }
+            }
+            eligible.insert(row_id);
+        }
+        Ok(eligible)
     }
 
     /// Filter-aware union and reciprocal-rank fusion over scored retrievers.
     pub fn search(
         &mut self,
         request: &crate::query::SearchRequest,
+    ) -> Result<Vec<crate::query::SearchHit>> {
+        self.search_with_allowed(request, None)
+    }
+
+    pub fn search_with_allowed(
+        &mut self,
+        request: &crate::query::SearchRequest,
+        authorized: Option<&std::collections::HashSet<RowId>>,
     ) -> Result<Vec<crate::query::SearchHit>> {
         use crate::query::{ComponentScore, Fusion, SearchHit};
         self.require_select()?;
@@ -3784,7 +3928,7 @@ impl Table {
         }
 
         let snapshot = self.snapshot();
-        let allowed = if request.must.is_empty() {
+        let hard_filter = if request.must.is_empty() {
             None
         } else {
             let mut sets = Vec::with_capacity(request.must.len());
@@ -3793,7 +3937,7 @@ impl Table {
             }
             Some(RowIdSet::intersect_many(sets))
         };
-        if allowed.as_ref().is_some_and(RowIdSet::is_empty) {
+        if hard_filter.as_ref().is_some_and(RowIdSet::is_empty) {
             return Ok(Vec::new());
         }
 
@@ -3805,10 +3949,12 @@ impl Table {
         let mut fused: std::collections::HashMap<RowId, (f64, Vec<ComponentScore>)> =
             std::collections::HashMap::new();
         for named in retrievers {
-            let hits = match &allowed {
-                Some(allowed) => self.retrieve_filtered(&named.retriever, allowed),
-                None => self.retrieve_index(&named.retriever),
-            };
+            let hits = self.retrieve_filtered(
+                &named.retriever,
+                snapshot,
+                hard_filter.as_ref(),
+                authorized,
+            )?;
             for hit in hits {
                 let contribution = named.weight / (constant as f64 + hit.rank as f64);
                 let entry = fused.entry(hit.row_id).or_default();
@@ -3880,9 +4026,132 @@ impl Table {
         &mut self,
         request: &crate::query::SetSimilarityRequest,
     ) -> Result<Vec<crate::query::SetSimilarityHit>> {
+        self.set_similarity_with_allowed(request, None)
+    }
+
+    /// Binary ANN candidate generation followed by exact float-vector reranking.
+    pub fn ann_rerank(
+        &mut self,
+        request: &crate::query::AnnRerankRequest,
+    ) -> Result<Vec<crate::query::AnnRerankHit>> {
+        self.ann_rerank_with_allowed(request, None)
+    }
+
+    pub fn ann_rerank_with_allowed(
+        &mut self,
+        request: &crate::query::AnnRerankRequest,
+        allowed: Option<&std::collections::HashSet<RowId>>,
+    ) -> Result<Vec<crate::query::AnnRerankHit>> {
+        use crate::query::{AnnRerankHit, Retriever, RetrieverScore, VectorMetric};
+        if request.candidate_k == 0 || request.limit == 0 {
+            return Err(MongrelError::InvalidArgument(
+                "candidate_k and limit must be > 0".into(),
+            ));
+        }
+        let hits = self.retrieve_with_allowed(
+            &Retriever::Ann {
+                column_id: request.column_id,
+                query: request.query.clone(),
+                k: request.candidate_k,
+            },
+            allowed,
+        )?;
+        let distances: std::collections::HashMap<_, _> = hits
+            .iter()
+            .filter_map(|hit| match hit.score {
+                RetrieverScore::AnnHammingDistance(distance) => Some((hit.row_id, distance)),
+                _ => None,
+            })
+            .collect();
+        let row_ids: Vec<_> = hits.iter().map(|hit| hit.row_id.0).collect();
+        let values = self.values_for_rids(&row_ids, request.column_id, self.snapshot())?;
+        let query_norm = request
+            .query
+            .iter()
+            .map(|value| value * value)
+            .sum::<f32>()
+            .sqrt();
+        let mut reranked = values
+            .into_iter()
+            .filter_map(|(row_id, value)| {
+                let Value::Embedding(vector) = value else {
+                    return None;
+                };
+                let dot = request
+                    .query
+                    .iter()
+                    .zip(&vector)
+                    .map(|(left, right)| left * right)
+                    .sum::<f32>();
+                let exact_score = match request.metric {
+                    VectorMetric::DotProduct => dot,
+                    VectorMetric::Cosine => {
+                        let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
+                        if query_norm == 0.0 || norm == 0.0 {
+                            0.0
+                        } else {
+                            dot / (query_norm * norm)
+                        }
+                    }
+                    VectorMetric::Euclidean => request
+                        .query
+                        .iter()
+                        .zip(&vector)
+                        .map(|(left, right)| (left - right).powi(2))
+                        .sum::<f32>()
+                        .sqrt(),
+                };
+                Some(AnnRerankHit {
+                    row_id,
+                    hamming_distance: distances.get(&row_id).copied().unwrap_or_default(),
+                    exact_score,
+                })
+            })
+            .collect::<Vec<_>>();
+        reranked.sort_by(|left, right| {
+            let score = match request.metric {
+                VectorMetric::Euclidean => left.exact_score.total_cmp(&right.exact_score),
+                VectorMetric::Cosine | VectorMetric::DotProduct => {
+                    right.exact_score.total_cmp(&left.exact_score)
+                }
+            };
+            score.then_with(|| left.row_id.cmp(&right.row_id))
+        });
+        reranked.truncate(request.limit);
+        Ok(reranked)
+    }
+
+    pub fn set_similarity_with_allowed(
+        &mut self,
+        request: &crate::query::SetSimilarityRequest,
+        allowed: Option<&std::collections::HashSet<RowId>>,
+    ) -> Result<Vec<crate::query::SetSimilarityHit>> {
+        self.set_similarity_explained_with_allowed(request, allowed)
+            .map(|(hits, _)| hits)
+    }
+
+    pub fn set_similarity_explained(
+        &mut self,
+        request: &crate::query::SetSimilarityRequest,
+    ) -> Result<(
+        Vec<crate::query::SetSimilarityHit>,
+        crate::query::SetSimilarityTrace,
+    )> {
+        self.set_similarity_explained_with_allowed(request, None)
+    }
+
+    fn set_similarity_explained_with_allowed(
+        &mut self,
+        request: &crate::query::SetSimilarityRequest,
+        allowed: Option<&std::collections::HashSet<RowId>>,
+    ) -> Result<(
+        Vec<crate::query::SetSimilarityHit>,
+        crate::query::SetSimilarityTrace,
+    )> {
         use crate::query::{Retriever, RetrieverScore, SetSimilarityHit};
+        let mut trace = crate::query::SetSimilarityTrace::default();
         if request.members.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), trace));
         }
         if request.candidate_k == 0 || request.limit == 0 {
             return Err(MongrelError::InvalidArgument(
@@ -3894,14 +4163,22 @@ impl Table {
                 "min_jaccard must be finite and between 0 and 1".into(),
             ));
         }
-        let hits = self.retrieve(&Retriever::MinHash {
-            column_id: request.column_id,
-            members: request.members.clone(),
-            k: request.candidate_k,
-        })?;
+        let started = std::time::Instant::now();
+        let hits = self.retrieve_with_allowed(
+            &Retriever::MinHash {
+                column_id: request.column_id,
+                members: request.members.clone(),
+                k: request.candidate_k,
+            },
+            allowed,
+        )?;
+        trace.candidate_generation_us = started.elapsed().as_micros() as u64;
+        trace.candidate_count = hits.len();
         let snapshot = self.snapshot();
         let row_ids: Vec<_> = hits.iter().map(|hit| hit.row_id.0).collect();
+        let started = std::time::Instant::now();
         let values = self.values_for_rids(&row_ids, request.column_id, snapshot)?;
+        trace.gather_us = started.elapsed().as_micros() as u64;
         let query: std::collections::HashSet<_> = request.members.iter().cloned().collect();
         let estimates: std::collections::HashMap<_, _> = hits
             .into_iter()
@@ -3910,29 +4187,39 @@ impl Table {
                 _ => None,
             })
             .collect();
+        let started = std::time::Instant::now();
+        let parsed: Vec<_> = values
+            .into_iter()
+            .filter_map(|(row_id, value)| {
+                let Value::Bytes(bytes) = value else {
+                    return None;
+                };
+                let Ok(serde_json::Value::Array(members)) = serde_json::from_slice(&bytes) else {
+                    return None;
+                };
+                let stored = members
+                    .into_iter()
+                    .filter_map(|member| match member {
+                        serde_json::Value::String(value) => {
+                            Some(crate::query::SetMember::String(value))
+                        }
+                        serde_json::Value::Number(value) => {
+                            Some(crate::query::SetMember::Number(value))
+                        }
+                        serde_json::Value::Bool(value) => {
+                            Some(crate::query::SetMember::Boolean(value))
+                        }
+                        _ => None,
+                    })
+                    .collect::<std::collections::HashSet<_>>();
+                Some((row_id, stored))
+            })
+            .collect();
+        trace.parse_us = started.elapsed().as_micros() as u64;
+        trace.verified_count = parsed.len();
+        let started = std::time::Instant::now();
         let mut exact = Vec::new();
-        for (row_id, value) in values {
-            let Value::Bytes(bytes) = value else {
-                continue;
-            };
-            let Ok(serde_json::Value::Array(members)) = serde_json::from_slice(&bytes) else {
-                continue;
-            };
-            let stored: std::collections::HashSet<_> = members
-                .iter()
-                .filter_map(|member| match member {
-                    serde_json::Value::String(value) => {
-                        Some(crate::query::SetMember::String(value.clone()))
-                    }
-                    serde_json::Value::Number(value) => {
-                        Some(crate::query::SetMember::Number(value.clone()))
-                    }
-                    serde_json::Value::Bool(value) => {
-                        Some(crate::query::SetMember::Boolean(*value))
-                    }
-                    _ => None,
-                })
-                .collect();
+        for (row_id, stored) in parsed {
             let union = query.union(&stored).count();
             let score = if union == 0 {
                 1.0
@@ -3953,7 +4240,8 @@ impl Table {
                 .then_with(|| a.row_id.cmp(&b.row_id))
         });
         exact.truncate(request.limit);
-        Ok(exact)
+        trace.score_us = started.elapsed().as_micros() as u64;
+        Ok((exact, trace))
     }
 
     /// Fetch one column for visible row ids without decoding unrelated columns.
@@ -4313,6 +4601,7 @@ impl Table {
         snapshot: Snapshot,
     ) -> Result<RowIdSet> {
         use crate::query::Condition;
+        self.validate_condition(c)?;
         Ok(match c {
             Condition::Pk(key) => {
                 let lookup = self
@@ -4392,41 +4681,59 @@ impl Table {
                 column_id,
                 query,
                 k,
-            } => self
-                .ann
-                .get(column_id)
-                .map(|a| {
-                    RowIdSet::from_unsorted(
-                        a.search(query, *k).into_iter().map(|(r, _)| r.0).collect(),
-                    )
-                })
-                .unwrap_or_else(RowIdSet::empty),
+            } => RowIdSet::from_unsorted(
+                self.retrieve_filtered(
+                    &crate::query::Retriever::Ann {
+                        column_id: *column_id,
+                        query: query.clone(),
+                        k: *k,
+                    },
+                    snapshot,
+                    None,
+                    None,
+                )?
+                .into_iter()
+                .map(|hit| hit.row_id.0)
+                .collect(),
+            ),
             Condition::SparseMatch {
                 column_id,
                 query,
                 k,
-            } => self
-                .sparse
-                .get(column_id)
-                .map(|s| {
-                    RowIdSet::from_unsorted(
-                        s.search(query, *k).into_iter().map(|(r, _)| r.0).collect(),
-                    )
-                })
-                .unwrap_or_else(RowIdSet::empty),
+            } => RowIdSet::from_unsorted(
+                self.retrieve_filtered(
+                    &crate::query::Retriever::Sparse {
+                        column_id: *column_id,
+                        query: query.clone(),
+                        k: *k,
+                    },
+                    snapshot,
+                    None,
+                    None,
+                )?
+                .into_iter()
+                .map(|hit| hit.row_id.0)
+                .collect(),
+            ),
             Condition::MinHashSimilar {
                 column_id,
                 query,
                 k,
-            } => self
-                .minhash
-                .get(column_id)
-                .map(|mh| {
+            } => match self.minhash.get(column_id) {
+                Some(index) => {
+                    let candidates = index.candidate_row_ids(query);
+                    let eligible =
+                        self.eligible_candidate_ids(&candidates, *column_id, snapshot)?;
                     RowIdSet::from_unsorted(
-                        mh.search(query, *k).into_iter().map(|(r, _)| r.0).collect(),
+                        index
+                            .search_filtered(query, *k, |row_id| eligible.contains(&row_id))
+                            .into_iter()
+                            .map(|(row_id, _)| row_id.0)
+                            .collect(),
                     )
-                })
-                .unwrap_or_else(RowIdSet::empty),
+                }
+                None => RowIdSet::empty(),
+            },
             Condition::Range { column_id, lo, hi } => {
                 // Build the candidate set from the durable tier — the learned
                 // index (built from sorted runs) or a single page-pruned run —
@@ -5275,7 +5582,7 @@ impl Table {
     fn resolve_footprint(
         &self,
         conditions: &[crate::query::Condition],
-        _snapshot: Snapshot,
+        snapshot: Snapshot,
     ) -> roaring::RoaringBitmap {
         if !self.memtable.is_empty() || !self.mutable_run.is_empty() {
             return roaring::RoaringBitmap::new();
@@ -5286,7 +5593,7 @@ impl Table {
         // Try the single-run fast path.
         if self.run_refs.len() == 1 {
             if let Ok(mut reader) = self.open_reader(self.run_refs[0].run_id) {
-                if let Ok(rids) = self.resolve_survivor_rids(conditions, &mut reader) {
+                if let Ok(rids) = self.resolve_survivor_rids(conditions, &mut reader, snapshot) {
                     return rids.to_roaring_lossy();
                 }
             }
@@ -5786,7 +6093,7 @@ impl Table {
         let survivors = if conditions.is_empty() {
             None
         } else {
-            Some(self.resolve_survivor_rids(conditions, &mut reader)?)
+            Some(self.resolve_survivor_rids(conditions, &mut reader, snapshot)?)
         };
 
         // Exclude overlay rids from the run portion: their version in the run
@@ -6194,10 +6501,12 @@ impl Table {
         &self,
         conditions: &[crate::query::Condition],
         reader: &mut RunReader,
+        snapshot: Snapshot,
     ) -> Result<RowIdSet> {
         use crate::query::Condition;
         let mut sets: Vec<RowIdSet> = Vec::new();
         for c in conditions {
+            self.validate_condition(c)?;
             let s: RowIdSet = match c {
                 Condition::Pk(key) => {
                     let lookup = self
@@ -6273,41 +6582,59 @@ impl Table {
                     column_id,
                     query,
                     k,
-                } => self
-                    .ann
-                    .get(column_id)
-                    .map(|a| {
-                        RowIdSet::from_unsorted(
-                            a.search(query, *k).into_iter().map(|(r, _)| r.0).collect(),
-                        )
-                    })
-                    .unwrap_or_else(RowIdSet::empty),
+                } => RowIdSet::from_unsorted(
+                    self.retrieve_filtered(
+                        &crate::query::Retriever::Ann {
+                            column_id: *column_id,
+                            query: query.clone(),
+                            k: *k,
+                        },
+                        snapshot,
+                        None,
+                        None,
+                    )?
+                    .into_iter()
+                    .map(|hit| hit.row_id.0)
+                    .collect(),
+                ),
                 Condition::SparseMatch {
                     column_id,
                     query,
                     k,
-                } => self
-                    .sparse
-                    .get(column_id)
-                    .map(|s| {
-                        RowIdSet::from_unsorted(
-                            s.search(query, *k).into_iter().map(|(r, _)| r.0).collect(),
-                        )
-                    })
-                    .unwrap_or_else(RowIdSet::empty),
+                } => RowIdSet::from_unsorted(
+                    self.retrieve_filtered(
+                        &crate::query::Retriever::Sparse {
+                            column_id: *column_id,
+                            query: query.clone(),
+                            k: *k,
+                        },
+                        snapshot,
+                        None,
+                        None,
+                    )?
+                    .into_iter()
+                    .map(|hit| hit.row_id.0)
+                    .collect(),
+                ),
                 Condition::MinHashSimilar {
                     column_id,
                     query,
                     k,
-                } => self
-                    .minhash
-                    .get(column_id)
-                    .map(|mh| {
+                } => match self.minhash.get(column_id) {
+                    Some(index) => {
+                        let candidates = index.candidate_row_ids(query);
+                        let eligible =
+                            self.eligible_candidate_ids(&candidates, *column_id, snapshot)?;
                         RowIdSet::from_unsorted(
-                            mh.search(query, *k).into_iter().map(|(r, _)| r.0).collect(),
+                            index
+                                .search_filtered(query, *k, |row_id| eligible.contains(&row_id))
+                                .into_iter()
+                                .map(|(row_id, _)| row_id.0)
+                                .collect(),
                         )
-                    })
-                    .unwrap_or_else(RowIdSet::empty),
+                    }
+                    None => RowIdSet::empty(),
+                },
                 Condition::Range { column_id, lo, hi } => {
                     if let Some(li) = self.learned_range.get(column_id) {
                         RowIdSet::from_unsorted(li.range(*lo, *hi).into_iter().collect())
@@ -8071,7 +8398,7 @@ fn index_into(
             }
             IndexKind::Ann => {
                 if let (Some(a), Value::Embedding(v)) = (ann.get_mut(&idef.column_id), val) {
-                    a.insert(v, row.row_id);
+                    a.insert_validated(v, row.row_id);
                 }
             }
             IndexKind::FmIndex => {
@@ -8131,7 +8458,7 @@ fn index_into_single(
         }
         IndexKind::Ann => {
             if let (Some(a), Value::Embedding(v)) = (ann.get_mut(&idef.column_id), val) {
-                a.insert(v, row.row_id);
+                a.insert_validated(v, row.row_id);
             }
         }
         IndexKind::FmIndex => {

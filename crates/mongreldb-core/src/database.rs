@@ -1537,6 +1537,29 @@ impl Database {
         Ok(output)
     }
 
+    /// Row IDs allowed to enter scored ranking. `None` means no RLS filter.
+    pub fn authorized_candidate_ids_for(
+        &self,
+        table: &str,
+        principal: Option<&crate::auth::Principal>,
+    ) -> Result<Option<std::collections::HashSet<RowId>>> {
+        if !self.catalog.read().security.rls_enabled(table) {
+            return Ok(None);
+        }
+        // ponytail: full RLS universe scan; replace with policy-column candidate checks if RLS search throughput matters.
+        let handle = self.table(table)?;
+        let rows = {
+            let table = handle.lock();
+            table.visible_rows(table.snapshot())?
+        };
+        Ok(Some(
+            self.secure_rows_for(table, rows, principal)?
+                .into_iter()
+                .map(|row| row.row_id)
+                .collect(),
+        ))
+    }
+
     /// Read visible rows with column authorization, RLS, and masks applied.
     pub fn rows_for(
         &self,
@@ -5785,6 +5808,11 @@ impl Database {
         // re-validating, corrupting the catalog on reopen. Validating here
         // keeps the WAL free of schemas that can never be opened.
         schema.validate_auto_increment()?;
+        schema.validate_defaults()?;
+        schema.validate_ai()?;
+        for index in &schema.indexes {
+            index.validate_options()?;
+        }
         for constraint in &schema.constraints.checks {
             constraint.expr.validate()?;
         }

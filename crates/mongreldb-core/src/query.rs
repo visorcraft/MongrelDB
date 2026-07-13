@@ -110,6 +110,10 @@ impl Retriever {
     }
 }
 
+pub fn encode_sparse_vector(terms: &[(u32, f32)]) -> crate::Result<Vec<u8>> {
+    Ok(bincode::serialize(terms)?)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 pub enum SetMember {
@@ -136,6 +140,29 @@ pub enum RetrieverScore {
     MinHashEstimatedJaccard(f32),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VectorMetric {
+    Cosine,
+    DotProduct,
+    Euclidean,
+}
+
+#[derive(Debug, Clone)]
+pub struct AnnRerankRequest {
+    pub column_id: u16,
+    pub query: Vec<f32>,
+    pub candidate_k: usize,
+    pub limit: usize,
+    pub metric: VectorMetric,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AnnRerankHit {
+    pub row_id: crate::RowId,
+    pub hamming_distance: u32,
+    pub exact_score: f32,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RetrieverHit {
     pub row_id: crate::RowId,
@@ -158,6 +185,16 @@ pub struct SetSimilarityHit {
     pub row_id: crate::RowId,
     pub estimated_jaccard: f32,
     pub exact_jaccard: f32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SetSimilarityTrace {
+    pub candidate_generation_us: u64,
+    pub gather_us: u64,
+    pub parse_us: u64,
+    pub score_us: u64,
+    pub candidate_count: usize,
+    pub verified_count: usize,
 }
 
 #[derive(Debug, Clone)]

@@ -193,6 +193,22 @@ impl MinHashIndex {
         scored
     }
 
+    pub fn candidate_row_ids(&self, query_token_hashes: &[u64]) -> Vec<RowId> {
+        let Some(signature) = signature(query_token_hashes, self.permutations) else {
+            return Vec::new();
+        };
+        let mut candidates = HashSet::new();
+        for band in 0..self.bands {
+            if let Some(indices) =
+                self.buckets
+                    .get(&band_key(band, &signature, self.permutations / self.bands))
+            {
+                candidates.extend(indices.iter().map(|index| self.sigs[*index as usize].0));
+            }
+        }
+        candidates.into_iter().collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.sigs.is_empty()
     }
@@ -270,15 +286,20 @@ mod tests {
 
     #[test]
     fn stable_typed_hash_vectors() {
-        assert_eq!(minhash_token_hash("1"), 4_601_219_942_126_179_299);
-        assert_eq!(
-            minhash_member_hash_v1(&serde_json::json!(1)).unwrap(),
-            6_001_628_596_940_409_521
-        );
-        assert_eq!(
-            minhash_member_hash_v1(&serde_json::json!(true)).unwrap(),
-            16_169_524_375_275_942_869
-        );
+        let fixtures: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("../../../../docs/ai/minhash-v1-golden.json"))
+                .unwrap();
+        for fixture in fixtures {
+            let expected = fixture["expected"]
+                .as_str()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap();
+            assert_eq!(
+                minhash_member_hash_v1(&fixture["member"]).unwrap(),
+                expected
+            );
+        }
         assert_ne!(
             minhash_token_hash("1"),
             minhash_member_hash_v1(&serde_json::json!(1)).unwrap()

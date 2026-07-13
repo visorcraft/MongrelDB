@@ -173,8 +173,20 @@ Bulk insert **2.3× faster than SQLite, 2.6× faster than DuckDB native**. Join
   as null.
 - **Daemon:** Optional `mongreldb-server` HTTP daemon (axum/tokio) keeps a
   multi-table `Database` warm for multi-process access, over SQL/native routes
-  and a typed Kit API (`/kit/schema`, `/kit/txn`, `/kit/query`,
-  `/kit/create_table`). `mongreldb-client` + NAPI `RemoteDatabase` connect to it.
+  and a typed Kit API (`/kit/create_table`, `/kit/schema`, `/kit/txn`,
+  `/kit/query`, `/kit/retrieve`, `/kit/set_similarity`, `/kit/search`).
+  `mongreldb-client` + NAPI `RemoteDatabase` connect to it.
+
+AI retrieval availability:
+
+| Surface | Boolean Query | Scored Retriever | Exact Set | Hybrid Search |
+|---|---:|---:|---:|---:|
+| Rust core | Yes | Yes | Yes | Yes |
+| Kit HTTP | Yes | Yes | Yes | Yes |
+| SQL | Yes | Yes | Yes | Yes |
+| NAPI embedded | Yes | No typed helper | No typed helper | No typed helper |
+| C FFI | Yes | No typed helper | No typed helper | No typed helper |
+| HTTP clients | Raw HTTP routes | Raw HTTP routes | Raw HTTP routes | Raw HTTP routes |
   Use `--daemon` to run in the background, or deploy with
   systemd/Docker/supervisord for auto-restart. See
   [Daemon Mode](docs/08-daemon.md#running-as-a-daemon---daemon-mode) for details.

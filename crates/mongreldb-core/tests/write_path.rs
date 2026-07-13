@@ -123,9 +123,13 @@ fn write_path_prototype() {
 
     // ANN: 8-dim toy embeddings.
     let mut ann = AnnIndex::new(8);
-    ann.insert(&[1.0, 1.0, 1.0, 1.0, -1.0, -1.0, -1.0, -1.0], RowId(0));
-    ann.insert(&[-1.0, -1.0, -1.0, -1.0, 1.0, 1.0, 1.0, 1.0], RowId(1));
-    let top = ann.search(&[1.0, 1.0, 1.0, 1.0, -1.0, -1.0, -1.0, -1.0], 1);
+    ann.insert(&[1.0, 1.0, 1.0, 1.0, -1.0, -1.0, -1.0, -1.0], RowId(0))
+        .unwrap();
+    ann.insert(&[-1.0, -1.0, -1.0, -1.0, 1.0, 1.0, 1.0, 1.0], RowId(1))
+        .unwrap();
+    let top = ann
+        .search(&[1.0, 1.0, 1.0, 1.0, -1.0, -1.0, -1.0, -1.0], 1)
+        .unwrap();
     assert_eq!(top[0].0, RowId(0));
 
     // The shared row-id space lets an agent compose these freely.

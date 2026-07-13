@@ -210,8 +210,17 @@ async fn kit_ai_indexes_work_over_wire_and_validate_values() {
             serde_json::json!({"ops":[{"put":{"table":"docs","cells":[1,9,column_id,value]}}]});
         let (status, body) = request(app.clone(), "POST", "/kit/txn", Some(invalid)).await;
         assert_eq!(status, 400, "{body}");
-        assert!(body["error"]["message"].as_str().unwrap().contains(message));
+    assert!(body["error"]["message"].as_str().unwrap().contains(message));
     }
+
+    let invalid_query = serde_json::json!({
+        "table":"docs",
+        "conditions":[{"ann":{"column_id":4,"query":[1,2],"k":1}}],
+        "projection":[1]
+    });
+    let (status, body) = request(app.clone(), "POST", "/kit/query", Some(invalid_query)).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.to_string().contains("dimension"));
 
     drop(app);
     let reopened = Arc::new(Database::open(dir.path()).unwrap());

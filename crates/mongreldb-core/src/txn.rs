@@ -705,6 +705,8 @@ impl GroupCommit {
             // the WAL lock) so followers can queue up behind us.
             st.syncing = true;
             drop(st);
+            // ponytail: fixed 50 µs batch window; make adaptive if isolated commit latency matters.
+            std::thread::sleep(std::time::Duration::from_micros(50));
             let res = wal.lock().group_sync();
             st = self.inner.lock();
             st.syncing = false;
