@@ -82,14 +82,18 @@ struct ProviderSecurity {
 }
 
 impl ProviderSecurity {
-    fn principal(&self) -> Option<mongreldb_core::Principal> {
-        self.principal.as_ref().and_then(|principal| {
-            if self.principal_catalog_bound {
-                self.database.resolve_principal(&principal.username)
-            } else {
-                Some(principal.clone())
-            }
-        })
+    fn principal(&self) -> mongreldb_core::Result<Option<mongreldb_core::Principal>> {
+        let Some(principal) = &self.principal else {
+            return Ok(None);
+        };
+        if self.principal_catalog_bound {
+            self.database
+                .resolve_principal(&principal.username)
+                .map(Some)
+                .ok_or(mongreldb_core::MongrelError::AuthRequired)
+        } else {
+            Ok(Some(principal.clone()))
+        }
     }
 }
 
@@ -209,13 +213,27 @@ impl TableProvider for MongrelProvider {
         filters: &[&Expr],
     ) -> DFResult<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
         use datafusion::logical_expr::TableProviderFilterPushDown;
-        if self.snapshot.is_some() || self.security.is_some() {
+        if self.snapshot.is_some() {
             return Ok(vec![
                 TableProviderFilterPushDown::Unsupported;
                 filters.len()
             ]);
         }
         let schema_ref = self.db.lock().schema().clone();
+        if self.security.is_some() {
+            return Ok(filters
+                .iter()
+                .map(|filter| {
+                    if translate_ann_search(filter, &schema_ref).is_some()
+                        || translate_sparse_match(filter, &schema_ref).is_some()
+                    {
+                        TableProviderFilterPushDown::Exact
+                    } else {
+                        TableProviderFilterPushDown::Unsupported
+                    }
+                })
+                .collect());
+        }
         Ok(filters
             .iter()
             .map(|f| match translate_filter(f, &schema_ref) {
@@ -245,7 +263,7 @@ impl TableProvider for MongrelProvider {
             DataFusionError::External(Box::new(MongrelQueryError::Core(e)))
         };
         if let Some(security) = &self.security {
-            let principal = security.principal();
+            let principal = security.principal().map_err(core_err)?;
             let allowed = security
                 .database
                 .select_column_ids_for(&security.table, principal.as_ref())
@@ -276,15 +294,62 @@ impl TableProvider for MongrelProvider {
                     )
                     .map_err(core_err)?;
             }
-            let rows = {
-                let table = self.db.lock();
-                let snapshot = self.snapshot.unwrap_or_else(|| table.snapshot());
-                table.visible_rows(snapshot).map_err(core_err)?
+            let ai_conditions = filters
+                .iter()
+                .filter_map(|filter| {
+                    translate_ann_search(filter, &self.core_schema)
+                        .or_else(|| translate_sparse_match(filter, &self.core_schema))
+                })
+                .collect::<Vec<_>>();
+            let mut required_columns = projected.clone();
+            required_columns.extend(mongreldb_core::query::condition_columns(&ai_conditions));
+            required_columns.sort_unstable();
+            required_columns.dedup();
+            let rows = if let Some(snapshot) = self.snapshot {
+                let rows = self.db.lock().visible_rows(snapshot).map_err(core_err)?;
+                security
+                    .database
+                    .secure_rows_for(&security.table, rows, principal.as_ref())
+                    .map_err(core_err)?
+            } else {
+                security
+                    .database
+                    .with_authorized_read(
+                        &security.table,
+                        principal.as_ref(),
+                        security.principal_catalog_bound,
+                        |table, snapshot, allowed, effective_principal| {
+                            security.database.require_columns_for(
+                                &security.table,
+                                mongreldb_core::ColumnOperation::Select,
+                                &required_columns,
+                                effective_principal,
+                            )?;
+                            let rows = if ai_conditions.is_empty() {
+                                let mut rows = table.visible_rows(snapshot)?;
+                                if let Some(allowed) = allowed {
+                                    rows.retain(|row| allowed.contains(&row.row_id));
+                                }
+                                rows
+                            } else {
+                                table.query_at_with_allowed(
+                                    &mongreldb_core::Query {
+                                        conditions: ai_conditions.clone(),
+                                        limit: Some(mongreldb_core::query::MAX_FINAL_LIMIT),
+                                    },
+                                    snapshot,
+                                    allowed,
+                                )?
+                            };
+                            security.database.secure_rows_for(
+                                &security.table,
+                                rows,
+                                effective_principal,
+                            )
+                        },
+                    )
+                    .map_err(core_err)?
             };
-            let rows = security
-                .database
-                .secure_rows_for(&security.table, rows, principal.as_ref())
-                .map_err(core_err)?;
             if projection.is_some_and(Vec::is_empty) {
                 return Ok(Arc::new(scan::MongrelScanExec::new_row_count(rows.len())));
             }
@@ -972,11 +1037,11 @@ pub(crate) fn translate_ann_search(
         Expr::Literal(ScalarValue::Utf8(Some(s)), _) => s.as_str(),
         _ => return None,
     };
-    let k: i64 = match k_expr {
+    let k: usize = match k_expr {
         Expr::Literal(scalar, _) => match scalar {
-            ScalarValue::Int64(Some(k)) => *k,
-            ScalarValue::UInt64(Some(k)) => *k as i64,
-            ScalarValue::Int32(Some(k)) => *k as i64,
+            ScalarValue::Int64(Some(k)) => usize::try_from(*k).ok()?,
+            ScalarValue::UInt64(Some(k)) => usize::try_from(*k).ok()?,
+            ScalarValue::Int32(Some(k)) => usize::try_from(*k).ok()?,
             _ => return None,
         },
         _ => return None,
@@ -985,7 +1050,7 @@ pub(crate) fn translate_ann_search(
     Some(Condition::Ann {
         column_id: cdef.id,
         query,
-        k: k.max(1) as usize,
+        k,
     })
 }
 
@@ -1014,11 +1079,11 @@ pub(crate) fn translate_sparse_match(
         Expr::Literal(ScalarValue::Utf8(Some(s)), _) => s.as_str(),
         _ => return None,
     };
-    let k: i64 = match k_expr {
+    let k: usize = match k_expr {
         Expr::Literal(scalar, _) => match scalar {
-            ScalarValue::Int64(Some(k)) => *k,
-            ScalarValue::UInt64(Some(k)) => *k as i64,
-            ScalarValue::Int32(Some(k)) => *k as i64,
+            ScalarValue::Int64(Some(k)) => usize::try_from(*k).ok()?,
+            ScalarValue::UInt64(Some(k)) => usize::try_from(*k).ok()?,
+            ScalarValue::Int32(Some(k)) => usize::try_from(*k).ok()?,
             _ => return None,
         },
         _ => return None,
@@ -1027,7 +1092,7 @@ pub(crate) fn translate_sparse_match(
     Some(Condition::SparseMatch {
         column_id: cdef.id,
         query,
-        k: k.max(1) as usize,
+        k,
     })
 }
 
@@ -1602,7 +1667,7 @@ impl MongrelSession {
         let sql_fn_state = Arc::new(extended_sql_functions::ExtendedSqlState::default());
         register_mongrel_functions(&ctx, Arc::clone(&sql_fn_state));
         let tables = Arc::new(parking_lot::Mutex::new(HashMap::new()));
-        scored_sql::register(&ctx, Arc::clone(&tables), None, None);
+        scored_sql::register(&ctx, Arc::clone(&tables), None, None, false);
         let external_modules = Arc::new(ExternalModuleRegistry::default());
         Self {
             ctx,
@@ -1701,6 +1766,7 @@ impl MongrelSession {
             Arc::clone(&tables),
             Some(Arc::clone(&database)),
             principal.clone(),
+            principal_catalog_bound,
         );
 
         Ok(Self {

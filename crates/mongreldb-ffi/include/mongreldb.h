@@ -41,6 +41,7 @@ typedef struct mongreldb_schema_builder mongreldb_schema_builder_t;
 typedef struct mongreldb_schema         mongreldb_schema_t;
 typedef struct mongreldb_query          mongreldb_query_t;
 typedef struct mongreldb_result         mongreldb_result_t;
+typedef struct mongreldb_ann_rerank_result mongreldb_ann_rerank_result_t;
 
 /* ── Error codes ────────────────────────────────────────────────────────── */
 
@@ -128,6 +129,12 @@ typedef enum {
     MDB_COND_IS_NULL        = 11,
     MDB_COND_IS_NOT_NULL    = 12,
 } mongreldb_condition_kind;
+
+typedef enum {
+    MDB_VECTOR_COSINE    = 0,
+    MDB_VECTOR_DOT       = 1,
+    MDB_VECTOR_EUCLIDEAN = 2,
+} mongreldb_vector_metric;
 
 /* ── Value tagged union ─────────────────────────────────────────────────── */
 
@@ -251,6 +258,12 @@ typedef struct {
     uint64_t row_id;
     mongreldb_cell_slice cells;
 } mongreldb_row;
+
+typedef struct {
+    uint64_t row_id;
+    uint32_t hamming_distance;
+    float exact_score;
+} mongreldb_ann_rerank_hit;
 
 typedef struct {
     uint16_t column_id;
@@ -415,6 +428,16 @@ int32_t mongreldb_result_row(mongreldb_result_t *r, size_t index, mongreldb_row 
 size_t mongreldb_row_cell_count(const mongreldb_row *row);
 mongreldb_cell mongreldb_row_cell(const mongreldb_row *row, size_t index);
 void mongreldb_result_free(mongreldb_result_t *r);
+
+mongreldb_ann_rerank_result_t *mongreldb_table_ann_rerank(
+    mongreldb_table_t *t, uint16_t column_id,
+    mongreldb_embedding_view query, size_t candidate_k, size_t limit,
+    mongreldb_vector_metric metric);
+size_t mongreldb_ann_rerank_result_count(mongreldb_ann_rerank_result_t *r);
+int32_t mongreldb_ann_rerank_result_hit(
+    mongreldb_ann_rerank_result_t *r, size_t index,
+    mongreldb_ann_rerank_hit *out_hit);
+void mongreldb_ann_rerank_result_free(mongreldb_ann_rerank_result_t *r);
 
 /* ── Transaction (staging buffer) ───────────────────────────────────────── */
 

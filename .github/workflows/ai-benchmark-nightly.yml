@@ -1,0 +1,52 @@
+name: AI 1M qualification
+
+on:
+  schedule:
+    - cron: "0 6 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      QUAL_DIR: /tmp/mongreldb-ai-1m
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2.9.1
+      - name: Capture source identity
+        run: |
+          mkdir -p "$QUAL_DIR"
+          git status --porcelain > "$QUAL_DIR/git-status.txt"
+          {
+            git rev-parse HEAD
+            rustc --version
+            cargo --version
+          } > "$QUAL_DIR/versions.txt"
+      - name: Run and validate 1M benchmark
+        run: |
+          MONGRELDB_AI_QUALIFICATION=1 \
+          MONGRELDB_AI_BENCH_ROWS=1000000 \
+          MONGRELDB_AI_BENCH_QUERIES=50 \
+          cargo run -p mongreldb-core --release --example ai_retrieval_bench \
+            > "$QUAL_DIR/ai-benchmark-1m.json" \
+            2> "$QUAL_DIR/ai-benchmark-1m.log"
+          python3 scripts/validate-ai-benchmark.py \
+            "$QUAL_DIR/ai-benchmark-1m.json" \
+            docs/ai/benchmark-thresholds.json \
+            --expected-sha "$GITHUB_SHA" \
+            --expected-rows 1000000 \
+            --skip-thresholds \
+            2>&1 | tee "$QUAL_DIR/ai-benchmark-validation.log"
+          test -z "$(git status --porcelain)"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: mongreldb-ai-1m-${{ github.sha }}
+          path: /tmp/mongreldb-ai-1m/

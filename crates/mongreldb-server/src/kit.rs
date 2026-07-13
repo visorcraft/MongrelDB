@@ -22,8 +22,8 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use mongreldb_core::constraint::TableConstraints;
 use mongreldb_core::query::{
-    Condition, Fusion, NamedRetriever, Query, Retriever, RetrieverScore, SearchRequest, SetMember,
-    SetSimilarityRequest,
+    AnnRerankRequest, Condition, Fusion, NamedRetriever, Query, Retriever, RetrieverScore,
+    SearchRequest, SetMember, SetSimilarityRequest, VectorMetric,
 };
 use mongreldb_core::schema::{
     ColumnDef, ColumnFlags, DefaultExpr, IndexDef, IndexKind, Schema, TypeId,
@@ -36,33 +36,25 @@ use serde_json::{json, Value as Jval};
 use crate::json_to_value;
 use crate::{request_principal, validate_table_name, AppState, OptionalPrincipal};
 
-const AUTHORIZED_READ_RETRIES: usize = 3;
-
 fn retry_authorized<T, F>(
     state: &AppState,
     table: &str,
     principal: Option<&mongreldb_core::Principal>,
-    mut read: F,
+    read: F,
 ) -> Result<T, MongrelError>
 where
     F: FnMut(
+        &mut mongreldb_core::Table,
         mongreldb_core::Snapshot,
         Option<&HashSet<RowId>>,
+        Option<&mongreldb_core::Principal>,
     ) -> Result<T, MongrelError>,
 {
-    for attempt in 0..AUTHORIZED_READ_RETRIES {
-        let snapshot = state.db.authorized_read_snapshot(table, principal)?;
-        let result = read(snapshot.table_snapshot, snapshot.allowed_row_ids.as_ref())?;
-        if state.db.authorized_read_snapshot_valid(&snapshot) {
-            return Ok(result);
-        }
-        if attempt + 1 == AUTHORIZED_READ_RETRIES {
-            return Err(MongrelError::Conflict(
-                "security policy changed during scored read".into(),
-            ));
-        }
-    }
-    unreachable!()
+    let catalog_bound = principal
+        .is_some_and(|principal| state.db.resolve_principal(&principal.username).is_some());
+    state
+        .db
+        .with_authorized_read(table, principal, catalog_bound, read)
 }
 
 /// Per-server idempotency store: idempotency key → committed response, backed
@@ -353,7 +345,7 @@ pub async fn schema_one(
     let principal = request_principal(&state, &principal);
     match visible_schema(&state, &table, principal.as_ref()) {
         Ok(schema) => Json(schema_descriptor(&schema)).into_response(),
-        Err(e) => (crate::status_for_error(&e), e.to_string()).into_response(),
+        Err(error) => kit_core_error(&error),
     }
 }
 
@@ -684,7 +676,7 @@ pub async fn kit_create_table(
         request_principal(&state, &principal).as_ref(),
         &mongreldb_core::Permission::Ddl,
     ) {
-        return (crate::status_for_error(&error), error.to_string()).into_response();
+        return kit_core_error(&error);
     }
     if let Err(msg) = validate_table_name(&req.name) {
         return (
@@ -818,6 +810,31 @@ fn kit_bad_request(message: String) -> Response {
         Json(KitErrorEnvelope {
             status: "aborted".into(),
             error: KitError::new("BAD_REQUEST", message),
+        }),
+    )
+        .into_response()
+}
+
+fn kit_core_error(error: &MongrelError) -> Response {
+    let (status, code) = match error {
+        MongrelError::InvalidArgument(_)
+        | MongrelError::Schema(_)
+        | MongrelError::ColumnNotFound(_) => (StatusCode::BAD_REQUEST, "BAD_REQUEST"),
+        MongrelError::AuthRequired | MongrelError::InvalidCredentials { .. } => {
+            (StatusCode::UNAUTHORIZED, "AUTH_REQUIRED")
+        }
+        MongrelError::PermissionDenied { .. } => {
+            (StatusCode::FORBIDDEN, "PERMISSION_DENIED")
+        }
+        MongrelError::NotFound(_) => (StatusCode::NOT_FOUND, "NOT_FOUND"),
+        MongrelError::Conflict(_) => (StatusCode::CONFLICT, "CONFLICT"),
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL"),
+    };
+    (
+        status,
+        Json(KitErrorEnvelope {
+            status: "aborted".into(),
+            error: KitError::new(code, error.to_string()),
         }),
     )
         .into_response()
@@ -974,6 +991,34 @@ pub struct KitRetrieveRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct KitAnnRerankRequest {
+    pub table: String,
+    pub column_id: u16,
+    pub query: Vec<f32>,
+    pub candidate_k: usize,
+    pub limit: usize,
+    pub metric: KitVectorMetric,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KitVectorMetric {
+    Cosine,
+    DotProduct,
+    Euclidean,
+}
+
+impl From<KitVectorMetric> for VectorMetric {
+    fn from(metric: KitVectorMetric) -> Self {
+        match metric {
+            KitVectorMetric::Cosine => Self::Cosine,
+            KitVectorMetric::DotProduct => Self::DotProduct,
+            KitVectorMetric::Euclidean => Self::Euclidean,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JsonRetriever {
     Ann {
@@ -1058,6 +1103,35 @@ fn retriever_score_json(score: RetrieverScore) -> Jval {
     }
 }
 
+pub async fn kit_ai_metrics(
+    State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
+) -> Response {
+    let principal = request_principal(&state, &principal);
+    if !principal.as_ref().is_some_and(|principal| principal.is_admin) {
+        return kit_core_error(&MongrelError::PermissionDenied {
+            required: mongreldb_core::Permission::Admin,
+            principal: principal
+                .as_ref()
+                .map(|principal| principal.username.clone())
+                .unwrap_or_else(|| "anonymous".into()),
+        });
+    }
+    let stats = state.db.rls_cache_stats();
+    Json(json!({
+        "rls_cache": {
+            "entries": stats.entries,
+            "bytes": stats.bytes,
+            "hits": stats.hits,
+            "misses": stats.misses,
+            "evictions": stats.evictions,
+            "build_nanos": stats.build_nanos,
+            "rows_evaluated": stats.rows_evaluated,
+        }
+    }))
+    .into_response()
+}
+
 pub async fn kit_retrieve(
     State(state): State<Arc<AppState>>,
     OptionalPrincipal(principal): OptionalPrincipal,
@@ -1071,21 +1145,17 @@ pub async fn kit_retrieve(
         &[column_id],
         principal.as_ref(),
     ) {
-        return (crate::status_for_error(&error), error.to_string()).into_response();
+        return kit_core_error(&error);
     }
     let retriever = match req.retriever.to_core() {
         Ok(retriever) => retriever,
         Err(message) => return kit_bad_request(message),
     };
-    let handle = match state.db.table(&req.table) {
-        Ok(handle) => handle,
-        Err(error) => return (StatusCode::NOT_FOUND, error.to_string()).into_response(),
-    };
     let result = retry_authorized(
         &state,
         &req.table,
         principal.as_ref(),
-        |snapshot, allowed| handle.lock().retrieve_at(&retriever, snapshot, allowed),
+        |table, snapshot, allowed, _| table.retrieve_at(&retriever, snapshot, allowed),
     );
     match result {
         Ok(hits) => Json(json!({
@@ -1096,7 +1166,46 @@ pub async fn kit_retrieve(
             })).collect::<Vec<_>>()
         }))
         .into_response(),
-        Err(error) => (crate::status_for_error(&error), error.to_string()).into_response(),
+        Err(error) => kit_core_error(&error),
+    }
+}
+
+pub async fn kit_ann_rerank(
+    State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
+    Json(req): Json<KitAnnRerankRequest>,
+) -> Response {
+    let principal = request_principal(&state, &principal);
+    if let Err(error) = state.db.require_columns_for(
+        &req.table,
+        mongreldb_core::ColumnOperation::Select,
+        &[req.column_id],
+        principal.as_ref(),
+    ) {
+        return kit_core_error(&error);
+    }
+    let request = AnnRerankRequest {
+        column_id: req.column_id,
+        query: req.query,
+        candidate_k: req.candidate_k,
+        limit: req.limit,
+        metric: req.metric.into(),
+    };
+    match retry_authorized(
+        &state,
+        &req.table,
+        principal.as_ref(),
+        |table, snapshot, allowed, _| table.ann_rerank_at(&request, snapshot, allowed),
+    ) {
+        Ok(hits) => Json(json!({
+            "hits": hits.into_iter().map(|hit| json!({
+                "row_id": hit.row_id.0.to_string(),
+                "hamming_distance": hit.hamming_distance,
+                "exact_score": hit.exact_score,
+            })).collect::<Vec<_>>()
+        }))
+        .into_response(),
+        Err(error) => kit_core_error(&error),
     }
 }
 
@@ -1110,6 +1219,12 @@ pub struct KitSearchRequest {
     pub limit: usize,
     #[serde(default)]
     pub projection: Option<Vec<u16>>,
+    #[serde(default)]
+    pub deadline_ms: Option<u64>,
+    #[serde(default)]
+    pub max_work: Option<usize>,
+    #[serde(default)]
+    pub explain: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1137,9 +1252,23 @@ pub async fn kit_search(
     Json(req): Json<KitSearchRequest>,
 ) -> Response {
     let principal = request_principal(&state, &principal);
+    if req.explain && !principal.as_ref().is_some_and(|principal| principal.is_admin) {
+        return kit_core_error(&MongrelError::PermissionDenied {
+            required: mongreldb_core::Permission::Admin,
+            principal: principal
+                .as_ref()
+                .map(|principal| principal.username.clone())
+                .unwrap_or_else(|| "anonymous".into()),
+        });
+    }
+    let deadline_ms = req.deadline_ms.unwrap_or(30_000);
+    if deadline_ms == 0 || deadline_ms > 60_000 {
+        return kit_bad_request("deadline_ms must be between 1 and 60000".into());
+    }
+    let started = std::time::Instant::now();
     let handle = match state.db.table(&req.table) {
         Ok(handle) => handle,
-        Err(error) => return (StatusCode::NOT_FOUND, error.to_string()).into_response(),
+        Err(error) => return kit_core_error(&error),
     };
     let schema = handle.lock().schema().clone();
     let mut required = req
@@ -1180,7 +1309,7 @@ pub async fn kit_search(
         &required,
         principal.as_ref(),
     ) {
-        return (crate::status_for_error(&error), error.to_string()).into_response();
+        return kit_core_error(&error);
     }
     let must = match req
         .must
@@ -1206,6 +1335,22 @@ pub async fn kit_search(
         Ok(retrievers) => retrievers,
         Err(message) => return kit_bad_request(message),
     };
+    let estimated_work = retrievers
+        .iter()
+        .map(|named| match &named.retriever {
+            Retriever::Ann { k, .. }
+            | Retriever::Sparse { k, .. }
+            | Retriever::MinHash { k, .. } => *k,
+        })
+        .sum::<usize>()
+        .saturating_add(req.must.len())
+        .saturating_add(req.projection.as_ref().map_or(0, Vec::len));
+    let max_work = req.max_work.unwrap_or(1_000_000);
+    if max_work == 0 || max_work > 1_000_000 || estimated_work > max_work {
+        return kit_bad_request(format!(
+            "AI work budget exceeded: estimated {estimated_work}, max {max_work}"
+        ));
+    }
     let fusion = match req.fusion {
         KitFusion::ReciprocalRank { constant } => Fusion::ReciprocalRank { constant },
     };
@@ -1216,27 +1361,31 @@ pub async fn kit_search(
         limit: req.limit,
         projection: req.projection.clone(),
     };
-    let (mut hits, secured) = match retry_authorized(
-        &state,
-        &req.table,
-        principal.as_ref(),
-        |snapshot, allowed| {
-            let (hits, rows) = {
-                let mut table = handle.lock();
+    let (result, trace) = mongreldb_core::trace::QueryTrace::capture(|| {
+        retry_authorized(
+            &state,
+            &req.table,
+            principal.as_ref(),
+            |table, snapshot, allowed, effective_principal| {
                 let hits = table.search_at(&request, snapshot, allowed)?;
                 let row_ids: Vec<_> = hits.iter().map(|hit| hit.row_id.0).collect();
                 let rows = table.rows_for_rids(&row_ids, snapshot)?;
-                (hits, rows)
-            };
-            let secured = state
-                .db
-                .secure_rows_for(&req.table, rows, principal.as_ref())?;
-            Ok((hits, secured))
-        },
-    ) {
+                let secured = state
+                    .db
+                    .secure_rows_for(&req.table, rows, effective_principal)?;
+                Ok((hits, secured))
+            },
+        )
+    });
+    let (mut hits, secured) = match result {
         Ok(result) => result,
-        Err(error) => return (crate::status_for_error(&error), error.to_string()).into_response(),
+        Err(error) => return kit_core_error(&error),
     };
+    if started.elapsed().as_millis() > u128::from(deadline_ms) {
+        return kit_core_error(&MongrelError::Conflict(
+            "AI query deadline exceeded".into(),
+        ));
+    }
     let secured: std::collections::HashMap<_, _> =
         secured.into_iter().map(|row| (row.row_id, row)).collect();
     hits.retain_mut(|hit| {
@@ -1250,7 +1399,7 @@ pub async fn kit_search(
         }
         true
     });
-    Json(json!({
+    let mut response = json!({
         "hits": hits.into_iter().map(|hit| json!({
             "row_id": hit.row_id.0.to_string(),
             "cells": hit.cells.into_iter().flat_map(|(column_id, value)| [json!(column_id), value_to_json(&value)]).collect::<Vec<_>>(),
@@ -1262,8 +1411,25 @@ pub async fn kit_search(
             })).collect::<Vec<_>>(),
             "fused_score": hit.fused_score,
         })).collect::<Vec<_>>()
-    }))
-    .into_response()
+    });
+    if req.explain {
+        response["trace"] = json!({
+            "authorization_nanos": trace.authorization_nanos,
+            "rls_cache_hit": trace.rls_cache_hit,
+            "rls_rows_evaluated": trace.rls_rows_evaluated,
+            "authorization_retries": trace.authorization_retries,
+            "hard_filter_nanos": trace.hard_filter_nanos,
+            "ann_candidate_nanos": trace.ann_candidate_nanos,
+            "sparse_candidate_nanos": trace.sparse_candidate_nanos,
+            "minhash_candidate_nanos": trace.minhash_candidate_nanos,
+            "candidate_count": trace.candidate_count,
+            "union_size": trace.union_size,
+            "fusion_nanos": trace.fusion_nanos,
+            "projection_nanos": trace.projection_nanos,
+            "total_nanos": trace.total_nanos,
+        });
+    }
+    Json(response).into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -1288,15 +1454,11 @@ pub async fn kit_set_similarity(
         &[req.column_id],
         principal.as_ref(),
     ) {
-        return (crate::status_for_error(&error), error.to_string()).into_response();
+        return kit_core_error(&error);
     }
     let members = match req.members.iter().map(set_member).collect::<Result<_, _>>() {
         Ok(members) => members,
         Err(message) => return kit_bad_request(message),
-    };
-    let handle = match state.db.table(&req.table) {
-        Ok(handle) => handle,
-        Err(error) => return (StatusCode::NOT_FOUND, error.to_string()).into_response(),
     };
     let request = SetSimilarityRequest {
         column_id: req.column_id,
@@ -1309,7 +1471,9 @@ pub async fn kit_set_similarity(
         &state,
         &req.table,
         principal.as_ref(),
-        |snapshot, allowed| handle.lock().set_similarity_at(&request, snapshot, allowed),
+        |table, snapshot, allowed, _| {
+            table.set_similarity_at(&request, snapshot, allowed)
+        },
     );
     match result {
         Ok(hits) => Json(json!({
@@ -1320,7 +1484,7 @@ pub async fn kit_set_similarity(
             })).collect::<Vec<_>>()
         }))
         .into_response(),
-        Err(error) => kit_bad_request(error.to_string()),
+        Err(error) => kit_core_error(&error),
     }
 }
 
@@ -1332,7 +1496,7 @@ pub async fn kit_query(
     let principal = request_principal(&state, &principal);
     let handle = match state.db.table(&req.table) {
         Ok(h) => h,
-        Err(e) => return (StatusCode::NOT_FOUND, e.to_string()).into_response(),
+        Err(error) => return kit_core_error(&error),
     };
     let schema = handle.lock().schema().clone();
     let allowed = match state
@@ -1341,7 +1505,7 @@ pub async fn kit_query(
     {
         Ok(allowed) => allowed,
         Err(error) => {
-            return (crate::status_for_error(&error), error.to_string()).into_response();
+            return kit_core_error(&error);
         }
     };
     let projection_ids = req
@@ -1350,6 +1514,12 @@ pub async fn kit_query(
         .filter(|projection| !projection.is_empty())
         .cloned()
         .unwrap_or_else(|| allowed.clone());
+    if projection_ids.len() > mongreldb_core::query::MAX_PROJECTION_COLUMNS {
+        return kit_bad_request(format!(
+            "projection exceeds {} columns",
+            mongreldb_core::query::MAX_PROJECTION_COLUMNS
+        ));
+    }
     let mut required = projection_ids.clone();
     for condition in &req.conditions {
         match condition {
@@ -1380,7 +1550,7 @@ pub async fn kit_query(
         &required,
         principal.as_ref(),
     ) {
-        return (crate::status_for_error(&error), error.to_string()).into_response();
+        return kit_core_error(&error);
     }
 
     // Translate JSON conditions → engine Conditions.
@@ -1400,31 +1570,37 @@ pub async fn kit_query(
             }
         }
     }
+    q = q.with_limit(mongreldb_core::query::MAX_FINAL_LIMIT);
 
     let projection = projection_ids
         .into_iter()
         .collect::<std::collections::HashSet<_>>();
 
-    let limit = req.limit.unwrap_or(usize::MAX);
-    let rows = match handle.lock().query(&q) {
-        Ok(r) => r,
-        Err(e) => {
-            let status = if matches!(e, mongreldb_core::MongrelError::InvalidArgument(_)) {
-                StatusCode::BAD_REQUEST
-            } else {
-                crate::status_for_error(&e)
-            };
-            return (status, e.to_string()).into_response();
-        }
-    };
-    let rows = match state
-        .db
-        .secure_rows_for(&req.table, rows, principal.as_ref())
-    {
+    let limit = req
+        .limit
+        .unwrap_or(mongreldb_core::query::MAX_FINAL_LIMIT);
+    if limit > mongreldb_core::query::MAX_FINAL_LIMIT {
+        return kit_bad_request(format!(
+            "limit exceeds {}",
+            mongreldb_core::query::MAX_FINAL_LIMIT
+        ));
+    }
+    let principal_catalog_bound = principal
+        .as_ref()
+        .is_some_and(|principal| state.db.resolve_principal(&principal.username).is_some());
+    let rows = match state.db.with_authorized_read(
+        &req.table,
+        principal.as_ref(),
+        principal_catalog_bound,
+        |table, snapshot, allowed, effective_principal| {
+            let rows = table.query_at_with_allowed(&q, snapshot, allowed)?;
+            state
+                .db
+                .secure_rows_for(&req.table, rows, effective_principal)
+        },
+    ) {
         Ok(rows) => rows,
-        Err(error) => {
-            return (crate::status_for_error(&error), error.to_string()).into_response();
-        }
+        Err(error) => return kit_core_error(&error),
     };
     let mut out: Vec<KitRow> = Vec::new();
     let mut truncated = false;

@@ -15,6 +15,16 @@ FROM ann_search_scored('docs', 'embedding', '[1,-1,1,-1]', 20, 'id,body')
 ORDER BY ann_distance, id;
 ```
 
+Exact float-vector reranking is available when binary ANN recall is not enough:
+
+```sql
+SELECT id, hamming_distance, exact_score
+FROM ann_search_exact(
+  'docs', 'embedding', '[1,-1,1,-1]', 100, 10, 'cosine', 'id'
+)
+ORDER BY search_rank;
+```
+
 ```sql
 SELECT id, sparse_score
 FROM sparse_search_scored('docs', 'sparse', '[[1,2.0],[2,1.0]]', 20, 'id');
@@ -39,4 +49,7 @@ and fused with RRF. The result adds `search_rank`, `fused_score`, and a JSON
 contribution.
 
 Table functions obey normal table and column authorization. System columns stay
-hidden. Existing Boolean predicate UDFs remain unchanged.
+hidden. Retrieval runs when the physical scan executes, so cached logical plans,
+prepared statements, and views see current rows, indexes, roles, policies, and
+masks. Boolean ANN and Sparse predicates use the same authorization-aware
+pushdown. If pushdown is unavailable, they fail closed.

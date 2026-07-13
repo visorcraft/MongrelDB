@@ -179,6 +179,112 @@ fn ffi_specialized_column_rejects_wrong_value_before_write() {
 }
 
 #[test]
+fn ffi_exact_ann_rerank_returns_scored_hit() {
+    let dir = make_tempdir();
+    unsafe {
+        let db = make_test_db(dir.to_str().unwrap());
+        let builder = mongreldb_schema_begin();
+        for column in [
+            mongreldb_column_def {
+                id: 1,
+                name: cstr("id"),
+                ty: mongreldb_type_id::Int64,
+                flags: MONGRELDB_COL_PRIMARY_KEY,
+                embedding_dim: 0,
+                decimal_precision: 0,
+                decimal_scale: 0,
+                enum_variants: StringArray::default(),
+            },
+            mongreldb_column_def {
+                id: 2,
+                name: cstr("embedding"),
+                ty: mongreldb_type_id::Embedding,
+                flags: MONGRELDB_COL_EMBEDDING_BINARY_QUANTIZED,
+                embedding_dim: 2,
+                decimal_precision: 0,
+                decimal_scale: 0,
+                enum_variants: StringArray::default(),
+            },
+        ] {
+            assert_eq!(mongreldb_schema_add_column(builder, &column), 0);
+        }
+        assert_eq!(
+            mongreldb_schema_add_index(
+                builder,
+                &mongreldb_index_def {
+                    name: cstr("ann_idx"),
+                    column_id: 2,
+                    kind: mongreldb_index_kind::Ann,
+                },
+            ),
+            0
+        );
+        let schema = mongreldb_schema_build(builder);
+        let mut table_id = 0;
+        assert_eq!(
+            mongreldb_create_table(db, cstr("docs"), schema, &mut table_id),
+            0
+        );
+        let table = mongreldb_database_table(db, cstr("docs"));
+        let mut first_row_id = 0;
+        for (id, embedding) in [(1, [1.0_f32, 0.0]), (2, [0.0_f32, 1.0])] {
+            let mut cells = [
+                mongreldb_cell_input {
+                    column_id: 1,
+                    value: CValue::int64(id),
+                },
+                mongreldb_cell_input {
+                    column_id: 2,
+                    value: CValue {
+                        tag: CValueTag::Embedding,
+                        payload: CValuePayload {
+                            embedding: EmbeddingSlice {
+                                data: embedding.as_ptr(),
+                                len: embedding.len(),
+                            },
+                        },
+                    },
+                },
+            ];
+            let cells = make_cell_input_array(&mut cells);
+            let mut row_id = 0;
+            assert_eq!(mongreldb_table_put(table, &cells, &mut row_id), 0);
+            if id == 1 {
+                first_row_id = row_id;
+            }
+        }
+
+        let query = [1.0_f32, 0.0];
+        let result = mongreldb_table_ann_rerank(
+            table,
+            2,
+            EmbeddingSlice {
+                data: query.as_ptr(),
+                len: query.len(),
+            },
+            2,
+            1,
+            mongreldb_vector_metric::Cosine,
+        );
+        assert!(
+            !result.is_null(),
+            "rerank failed: {}",
+            rust_str(mongreldb_last_error())
+        );
+        assert_eq!(mongreldb_ann_rerank_result_count(result), 1);
+        let mut hit = mongreldb_ann_rerank_hit::default();
+        assert_eq!(mongreldb_ann_rerank_result_hit(result, 0, &mut hit), 0);
+        assert_eq!(hit.row_id, first_row_id);
+        assert_eq!(hit.exact_score, 1.0);
+        mongreldb_ann_rerank_result_free(result);
+
+        mongreldb_table_free(table);
+        mongreldb_database_free(db);
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn ffi_database_create_open_close() {
     let dir = make_tempdir();
     let path = dir.to_str().unwrap();

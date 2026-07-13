@@ -169,6 +169,9 @@ pub struct Table {
     /// Manifest-endorsed epoch at open; used to seed the (shared) epoch
     /// authority on a fresh open. Updated whenever the manifest is persisted.
     persisted_epoch: u64,
+    /// Table-local content generation used by authorization caches. Unlike the
+    /// shared MVCC epoch, unrelated table commits do not change this value.
+    data_generation: u64,
     schema: Schema,
     hot: HotIndex,
     /// Table Key-Encryption Key (Argon2id+HKDF from the passphrase). Each run
@@ -1082,6 +1085,7 @@ impl Table {
             allocator: RowIdAllocator::new(0),
             epoch: ctx.epoch,
             persisted_epoch: 0,
+            data_generation: 0,
             schema,
             hot: HotIndex::new(),
             kek: ctx.kek,
@@ -1308,6 +1312,7 @@ impl Table {
             allocator,
             epoch: ctx.epoch,
             persisted_epoch,
+            data_generation: persisted_epoch,
             schema,
             hot: HotIndex::new(),
             kek: ctx.kek,
@@ -2247,6 +2252,7 @@ impl Table {
             // decrement (in `tombstone_row`) sees an up-to-date value.
             self.live_count = self.live_count.saturating_add(1);
         }
+        self.data_generation = self.data_generation.wrapping_add(1);
         Ok(())
     }
 
@@ -2287,6 +2293,7 @@ impl Table {
         self.reservoir.offer(row.row_id.0);
         self.memtable.upsert(row);
         self.live_count = self.live_count.saturating_add(1);
+        self.data_generation = self.data_generation.wrapping_add(1);
         Ok(())
     }
 
@@ -2378,6 +2385,7 @@ impl Table {
             }
         }
         self.live_count = self.live_count.saturating_add((n - losers.len()) as u64);
+        self.data_generation = self.data_generation.wrapping_add(1);
         Ok(())
     }
 
@@ -2627,6 +2635,7 @@ impl Table {
         self.pending_dels.clear();
         self.clear_result_cache();
         self.invalidate_index_checkpoint();
+        self.data_generation = self.data_generation.wrapping_add(1);
         Ok(())
     }
 
@@ -2635,6 +2644,7 @@ impl Table {
     pub(crate) fn apply_delete(&mut self, row_id: RowId, epoch: Epoch) {
         self.remove_hot_for_row(row_id, epoch);
         self.tombstone_row(row_id, epoch, true);
+        self.data_generation = self.data_generation.wrapping_add(1);
     }
 
     /// Tombstone `row_id` at `epoch`. When `adjust_live_count` is true the
@@ -2925,6 +2935,7 @@ impl Table {
         // lower assigned epoch whose writes are not yet applied (spec §9.3e).
         self.epoch.publish_in_order(new_epoch);
         self.current_txn_id += 1;
+        self.data_generation = self.data_generation.wrapping_add(1);
         Ok(new_epoch)
     }
 
@@ -2993,6 +3004,7 @@ impl Table {
         let _ = s.change_wake.send(());
         // Next auto-commit span allocates a fresh shared txn id.
         self.current_txn_id = 0;
+        self.data_generation = self.data_generation.wrapping_add(1);
         Ok(new_epoch)
     }
 
@@ -3471,9 +3483,62 @@ impl Table {
     /// survivors are materialized at the current snapshot. This is the AI-native
     /// "compose primitives" surface (`semsearch ∩ fm_contains ∩ cat_in`).
     pub fn query(&mut self, q: &crate::query::Query) -> Result<Vec<Row>> {
+        self.query_at_with_allowed(q, self.snapshot(), None)
+    }
+
+    /// Execute a conjunctive query at one snapshot, applying authorization
+    /// before ranked ANN, Sparse, and MinHash top-k selection.
+    pub fn query_at_with_allowed(
+        &mut self,
+        q: &crate::query::Query,
+        snapshot: Snapshot,
+        allowed: Option<&std::collections::HashSet<RowId>>,
+    ) -> Result<Vec<Row>> {
         self.require_select()?;
         self.ensure_indexes_complete()?;
-        let snapshot = self.snapshot();
+        if q.conditions.len() > crate::query::MAX_HARD_CONDITIONS {
+            return Err(MongrelError::InvalidArgument(format!(
+                "query exceeds {} conditions",
+                crate::query::MAX_HARD_CONDITIONS
+            )));
+        }
+        if let Some(limit) = q.limit {
+            if limit == 0 || limit > crate::query::MAX_FINAL_LIMIT {
+                return Err(MongrelError::InvalidArgument(format!(
+                    "query limit must be between 1 and {}",
+                    crate::query::MAX_FINAL_LIMIT
+                )));
+            }
+        }
+        self.query_conditions_at(&q.conditions, snapshot, allowed, q.limit)
+    }
+
+    /// Unbounded internal SQL join helper. Public request surfaces must use
+    /// [`Self::query_at_with_allowed`] and its result ceiling.
+    #[doc(hidden)]
+    pub fn query_all_at(
+        &mut self,
+        conditions: &[crate::query::Condition],
+        snapshot: Snapshot,
+    ) -> Result<Vec<Row>> {
+        self.require_select()?;
+        self.ensure_indexes_complete()?;
+        if conditions.len() > crate::query::MAX_HARD_CONDITIONS {
+            return Err(MongrelError::InvalidArgument(format!(
+                "query exceeds {} conditions",
+                crate::query::MAX_HARD_CONDITIONS
+            )));
+        }
+        self.query_conditions_at(conditions, snapshot, None, None)
+    }
+
+    fn query_conditions_at(
+        &self,
+        conditions: &[crate::query::Condition],
+        snapshot: Snapshot,
+        allowed: Option<&std::collections::HashSet<RowId>>,
+        limit: Option<usize>,
+    ) -> Result<Vec<Row>> {
         crate::trace::QueryTrace::record(|t| {
             t.run_count = self.run_refs.len();
             t.memtable_rows = self.memtable.len();
@@ -3482,15 +3547,22 @@ impl Table {
         // A conjunction with no predicates matches every visible row (the
         // documented "Empty ⇒ all rows" contract); `intersect_sets` of zero
         // sets would otherwise wrongly yield the empty set.
-        if q.conditions.is_empty() {
+        if conditions.is_empty() {
             crate::trace::QueryTrace::record(|t| {
                 t.scan_mode = crate::trace::ScanMode::Materialized;
                 t.row_materialized = true;
             });
-            return self.visible_rows(snapshot);
+            let mut rows = self.visible_rows(snapshot)?;
+            if let Some(allowed) = allowed {
+                rows.retain(|row| allowed.contains(&row.row_id));
+            }
+            if let Some(limit) = limit {
+                rows.truncate(limit);
+            }
+            return Ok(rows);
         }
         crate::trace::QueryTrace::record(|t| {
-            t.conditions_pushed = q.conditions.len();
+            t.conditions_pushed = conditions.len();
             t.scan_mode = crate::trace::ScanMode::Materialized;
             t.row_materialized = true;
         });
@@ -3500,18 +3572,24 @@ impl Table {
         // `intersect_many` noticed an empty set; now a selective bitmap/PK that
         // eliminates all rows short-circuits the rest. Correctness is unchanged
         // (intersection with an empty set is empty either way).
-        let mut ordered: Vec<&crate::query::Condition> = q.conditions.iter().collect();
+        let mut ordered: Vec<&crate::query::Condition> = conditions.iter().collect();
         ordered.sort_by_key(|c| condition_cost_rank(c));
         let mut sets: Vec<RowIdSet> = Vec::with_capacity(ordered.len());
         for c in &ordered {
-            let s = self.resolve_condition(c, snapshot)?;
+            let s = self.resolve_condition_with_allowed(c, snapshot, allowed)?;
             let empty = s.is_empty();
             sets.push(s);
             if empty {
                 break;
             }
         }
-        let rids = RowIdSet::intersect_many(sets).into_sorted_vec();
+        let mut rids = RowIdSet::intersect_many(sets).into_sorted_vec();
+        if let Some(allowed) = allowed {
+            rids.retain(|row_id| allowed.contains(&RowId(*row_id)));
+        }
+        if let Some(limit) = limit {
+            rids.truncate(limit);
+        }
         self.rows_for_rids(&rids, snapshot)
     }
 
@@ -3555,7 +3633,7 @@ impl Table {
     }
 
     fn validate_retriever(&self, retriever: &crate::query::Retriever) -> Result<()> {
-        use crate::query::Retriever;
+        use crate::query::{Retriever, MAX_RETRIEVER_K, MAX_SET_MEMBERS, MAX_SPARSE_TERMS};
         let (column_id, k) = match retriever {
             Retriever::Ann {
                 column_id,
@@ -3594,6 +3672,11 @@ impl Table {
                         "Sparse query must be non-empty with finite weights".into(),
                     ));
                 }
+                if query.len() > MAX_SPARSE_TERMS {
+                    return Err(MongrelError::InvalidArgument(format!(
+                        "Sparse query exceeds {MAX_SPARSE_TERMS} terms"
+                    )));
+                }
                 (*column_id, *k)
             }
             Retriever::MinHash {
@@ -3611,6 +3694,11 @@ impl Table {
                         "MinHash members must not be empty".into(),
                     ));
                 }
+                if members.len() > MAX_SET_MEMBERS {
+                    return Err(MongrelError::InvalidArgument(format!(
+                        "MinHash query exceeds {MAX_SET_MEMBERS} members"
+                    )));
+                }
                 (*column_id, *k)
             }
         };
@@ -3618,6 +3706,11 @@ impl Table {
             return Err(MongrelError::InvalidArgument(
                 "retriever k must be > 0".into(),
             ));
+        }
+        if k > MAX_RETRIEVER_K {
+            return Err(MongrelError::InvalidArgument(format!(
+                "retriever k exceeds {MAX_RETRIEVER_K}"
+            )));
         }
         debug_assert!(self
             .schema
@@ -3663,7 +3756,29 @@ impl Table {
                         "MinHash query must be non-empty and k must be > 0".into(),
                     ));
                 }
+                if query.len() > crate::query::MAX_SET_MEMBERS || *k > crate::query::MAX_RETRIEVER_K
+                {
+                    return Err(MongrelError::InvalidArgument(format!(
+                        "MinHash query must have <= {} members and k <= {}",
+                        crate::query::MAX_SET_MEMBERS,
+                        crate::query::MAX_RETRIEVER_K
+                    )));
+                }
                 Ok(())
+            }
+            Condition::BitmapIn { values, .. } if values.len() > crate::query::MAX_SET_MEMBERS => {
+                Err(MongrelError::InvalidArgument(format!(
+                    "bitmap IN exceeds {} values",
+                    crate::query::MAX_SET_MEMBERS
+                )))
+            }
+            Condition::FmContainsAll { patterns, .. }
+                if patterns.len() > crate::query::MAX_HARD_CONDITIONS =>
+            {
+                Err(MongrelError::InvalidArgument(format!(
+                    "FM query exceeds {} patterns",
+                    crate::query::MAX_HARD_CONDITIONS
+                )))
             }
             _ => Ok(()),
         }
@@ -3677,6 +3792,7 @@ impl Table {
         allowed: Option<&std::collections::HashSet<RowId>>,
     ) -> Result<Vec<crate::query::RetrieverHit>> {
         use crate::query::{Retriever, RetrieverHit, RetrieverScore, SetMember};
+        let started = std::time::Instant::now();
         let scored: Vec<(RowId, RetrieverScore)> = match retriever {
             Retriever::Ann {
                 column_id,
@@ -3818,6 +3934,23 @@ impl Table {
                 .transpose()?
                 .unwrap_or_default(),
         };
+        let elapsed = started.elapsed().as_nanos() as u64;
+        crate::trace::QueryTrace::record(|trace| {
+            match retriever {
+                Retriever::Ann { .. } => {
+                    trace.ann_candidate_nanos = trace.ann_candidate_nanos.saturating_add(elapsed)
+                }
+                Retriever::Sparse { .. } => {
+                    trace.sparse_candidate_nanos =
+                        trace.sparse_candidate_nanos.saturating_add(elapsed)
+                }
+                Retriever::MinHash { .. } => {
+                    trace.minhash_candidate_nanos =
+                        trace.minhash_candidate_nanos.saturating_add(elapsed)
+                }
+            }
+            trace.candidate_count = trace.candidate_count.saturating_add(scored.len());
+        });
         Ok(scored
             .into_iter()
             .enumerate()
@@ -3925,7 +4058,11 @@ impl Table {
         snapshot: Snapshot,
         authorized: Option<&std::collections::HashSet<RowId>>,
     ) -> Result<Vec<crate::query::SearchHit>> {
-        use crate::query::{ComponentScore, Fusion, SearchHit};
+        use crate::query::{
+            ComponentScore, Condition, Fusion, SearchHit, MAX_FINAL_LIMIT, MAX_HARD_CONDITIONS,
+            MAX_PROJECTION_COLUMNS, MAX_RETRIEVERS, MAX_RETRIEVER_WEIGHT,
+        };
+        let total_started = std::time::Instant::now();
         self.require_select()?;
         self.ensure_indexes_complete()?;
         if request.limit == 0 {
@@ -3933,9 +4070,37 @@ impl Table {
                 "search limit must be > 0".into(),
             ));
         }
+        if request.limit > MAX_FINAL_LIMIT {
+            return Err(MongrelError::InvalidArgument(format!(
+                "search limit exceeds {MAX_FINAL_LIMIT}"
+            )));
+        }
         if request.retrievers.is_empty() {
             return Err(MongrelError::InvalidArgument(
                 "search requires at least one retriever".into(),
+            ));
+        }
+        if request.retrievers.len() > MAX_RETRIEVERS {
+            return Err(MongrelError::InvalidArgument(format!(
+                "search exceeds {MAX_RETRIEVERS} retrievers"
+            )));
+        }
+        if request.must.len() > MAX_HARD_CONDITIONS {
+            return Err(MongrelError::InvalidArgument(format!(
+                "search exceeds {MAX_HARD_CONDITIONS} hard conditions"
+            )));
+        }
+        if request.must.iter().any(|condition| {
+            matches!(
+                condition,
+                Condition::Ann { .. }
+                    | Condition::SparseMatch { .. }
+                    | Condition::MinHashSimilar { .. }
+            )
+        }) {
+            return Err(MongrelError::InvalidArgument(
+                "ranked ANN, Sparse, and MinHash conditions must be retrievers, not must filters"
+                    .into(),
             ));
         }
         let mut names = std::collections::HashSet::new();
@@ -3945,10 +4110,13 @@ impl Table {
                     "retriever names must be non-empty and unique".into(),
                 ));
             }
-            if !named.weight.is_finite() || named.weight < 0.0 {
-                return Err(MongrelError::InvalidArgument(
-                    "retriever weight must be finite and non-negative".into(),
-                ));
+            if !named.weight.is_finite()
+                || named.weight < 0.0
+                || named.weight > MAX_RETRIEVER_WEIGHT
+            {
+                return Err(MongrelError::InvalidArgument(format!(
+                    "retriever weight must be finite, non-negative, and <= {MAX_RETRIEVER_WEIGHT}"
+                )));
             }
             self.validate_retriever(&named.retriever)?;
         }
@@ -3956,6 +4124,11 @@ impl Table {
             .projection
             .clone()
             .unwrap_or_else(|| self.schema.columns.iter().map(|column| column.id).collect());
+        if projection.len() > MAX_PROJECTION_COLUMNS {
+            return Err(MongrelError::InvalidArgument(format!(
+                "projection exceeds {MAX_PROJECTION_COLUMNS} columns"
+            )));
+        }
         for column_id in &projection {
             if !self
                 .schema
@@ -3967,6 +4140,7 @@ impl Table {
             }
         }
 
+        let hard_filter_started = std::time::Instant::now();
         let hard_filter = if request.must.is_empty() {
             None
         } else {
@@ -3976,6 +4150,11 @@ impl Table {
             }
             Some(RowIdSet::intersect_many(sets))
         };
+        crate::trace::QueryTrace::record(|trace| {
+            trace.hard_filter_nanos = trace
+                .hard_filter_nanos
+                .saturating_add(hard_filter_started.elapsed().as_nanos() as u64);
+        });
         if hard_filter.as_ref().is_some_and(RowIdSet::is_empty) {
             return Ok(Vec::new());
         }
@@ -3985,6 +4164,7 @@ impl Table {
         };
         let mut retrievers: Vec<_> = request.retrievers.iter().collect();
         retrievers.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut fusion_nanos = 0u64;
         let mut fused: std::collections::HashMap<RowId, (f64, Vec<ComponentScore>)> =
             std::collections::HashMap::new();
         for named in retrievers {
@@ -3994,10 +4174,21 @@ impl Table {
                 hard_filter.as_ref(),
                 authorized,
             )?;
+            let fusion_started = std::time::Instant::now();
             for hit in hits {
                 let contribution = named.weight / (constant as f64 + hit.rank as f64);
+                if !contribution.is_finite() {
+                    return Err(MongrelError::InvalidArgument(
+                        "retriever contribution must be finite".into(),
+                    ));
+                }
                 let entry = fused.entry(hit.row_id).or_default();
                 entry.0 += contribution;
+                if !entry.0.is_finite() {
+                    return Err(MongrelError::InvalidArgument(
+                        "fused score must be finite".into(),
+                    ));
+                }
                 entry.1.push(ComponentScore {
                     retriever_name: named.name.clone(),
                     rank: hit.rank,
@@ -4005,12 +4196,21 @@ impl Table {
                     contribution,
                 });
             }
+            fusion_nanos = fusion_nanos.saturating_add(fusion_started.elapsed().as_nanos() as u64);
         }
+        let union_size = fused.len();
         let mut ranked: Vec<_> = fused.into_iter().collect();
+        let sort_started = std::time::Instant::now();
         ranked.sort_by(|(a_row, (a_score, _)), (b_row, (b_score, _))| {
             b_score.total_cmp(a_score).then_with(|| a_row.cmp(b_row))
         });
+        fusion_nanos = fusion_nanos.saturating_add(sort_started.elapsed().as_nanos() as u64);
+        crate::trace::QueryTrace::record(|trace| {
+            trace.union_size = union_size;
+            trace.fusion_nanos = trace.fusion_nanos.saturating_add(fusion_nanos);
+        });
 
+        let projection_started = std::time::Instant::now();
         let row_ids: Vec<_> = ranked.iter().map(|(row_id, _)| row_id.0).collect();
         let sentinel = projection
             .first()
@@ -4032,7 +4232,7 @@ impl Table {
             }
         }
 
-        let mut out = Vec::with_capacity(request.limit);
+        let mut out = Vec::with_capacity(request.limit.min(ranked.len()));
         for (row_id, (fused_score, mut components)) in ranked {
             let Some(row_cells) = cells.remove(&row_id) else {
                 continue;
@@ -4056,6 +4256,14 @@ impl Table {
                 break;
             }
         }
+        crate::trace::QueryTrace::record(|trace| {
+            trace.projection_nanos = trace
+                .projection_nanos
+                .saturating_add(projection_started.elapsed().as_nanos() as u64);
+            trace.total_nanos = trace
+                .total_nanos
+                .saturating_add(total_started.elapsed().as_nanos() as u64);
+        });
         Ok(out)
     }
 
@@ -4100,11 +4308,18 @@ impl Table {
         snapshot: Snapshot,
         allowed: Option<&std::collections::HashSet<RowId>>,
     ) -> Result<Vec<crate::query::AnnRerankHit>> {
-        use crate::query::{AnnRerankHit, Retriever, RetrieverScore, VectorMetric};
+        use crate::query::{
+            AnnRerankHit, Retriever, RetrieverScore, VectorMetric, MAX_FINAL_LIMIT, MAX_RETRIEVER_K,
+        };
         if request.candidate_k == 0 || request.limit == 0 {
             return Err(MongrelError::InvalidArgument(
                 "candidate_k and limit must be > 0".into(),
             ));
+        }
+        if request.candidate_k > MAX_RETRIEVER_K || request.limit > MAX_FINAL_LIMIT {
+            return Err(MongrelError::InvalidArgument(format!(
+                "candidate_k must be <= {MAX_RETRIEVER_K} and limit <= {MAX_FINAL_LIMIT}"
+            )));
         }
         let hits = self.retrieve_at_with_allowed(
             &Retriever::Ann {
@@ -4123,50 +4338,61 @@ impl Table {
             })
             .collect();
         let row_ids: Vec<_> = hits.iter().map(|hit| hit.row_id.0).collect();
+        let gather_started = std::time::Instant::now();
         let values = self.values_for_rids_batch(&row_ids, request.column_id, snapshot)?;
+        let gather_nanos = gather_started.elapsed().as_nanos() as u64;
+        let score_started = std::time::Instant::now();
         let query_norm = request
             .query
             .iter()
-            .map(|value| value * value)
-            .sum::<f32>()
+            .map(|value| f64::from(*value).powi(2))
+            .sum::<f64>()
             .sqrt();
-        let mut reranked = values
-            .into_iter()
-            .filter_map(|(row_id, value)| {
-                let Value::Embedding(vector) = value else {
-                    return None;
-                };
-                let dot = request
+        let mut reranked = Vec::with_capacity(values.len().min(request.limit));
+        for (row_id, value) in values {
+            let Value::Embedding(vector) = value else {
+                continue;
+            };
+            let dot = request
+                .query
+                .iter()
+                .zip(&vector)
+                .map(|(left, right)| f64::from(*left) * f64::from(*right))
+                .sum::<f64>();
+            let exact_score = match request.metric {
+                VectorMetric::DotProduct => dot,
+                VectorMetric::Cosine => {
+                    let norm = vector
+                        .iter()
+                        .map(|value| f64::from(*value).powi(2))
+                        .sum::<f64>()
+                        .sqrt();
+                    if query_norm == 0.0 || norm == 0.0 {
+                        0.0
+                    } else {
+                        dot / (query_norm * norm)
+                    }
+                }
+                VectorMetric::Euclidean => request
                     .query
                     .iter()
                     .zip(&vector)
-                    .map(|(left, right)| left * right)
-                    .sum::<f32>();
-                let exact_score = match request.metric {
-                    VectorMetric::DotProduct => dot,
-                    VectorMetric::Cosine => {
-                        let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
-                        if query_norm == 0.0 || norm == 0.0 {
-                            0.0
-                        } else {
-                            dot / (query_norm * norm)
-                        }
-                    }
-                    VectorMetric::Euclidean => request
-                        .query
-                        .iter()
-                        .zip(&vector)
-                        .map(|(left, right)| (left - right).powi(2))
-                        .sum::<f32>()
-                        .sqrt(),
-                };
-                Some(AnnRerankHit {
-                    row_id,
-                    hamming_distance: distances.get(&row_id).copied().unwrap_or_default(),
-                    exact_score,
-                })
-            })
-            .collect::<Vec<_>>();
+                    .map(|(left, right)| (f64::from(*left) - f64::from(*right)).powi(2))
+                    .sum::<f64>()
+                    .sqrt(),
+            };
+            let exact_score = exact_score as f32;
+            if !exact_score.is_finite() {
+                return Err(MongrelError::InvalidArgument(
+                    "exact ANN score must be finite".into(),
+                ));
+            }
+            reranked.push(AnnRerankHit {
+                row_id,
+                hamming_distance: distances.get(&row_id).copied().unwrap_or_default(),
+                exact_score,
+            });
+        }
         reranked.sort_by(|left, right| {
             let score = match request.metric {
                 VectorMetric::Euclidean => left.exact_score.total_cmp(&right.exact_score),
@@ -4177,6 +4403,13 @@ impl Table {
             score.then_with(|| left.row_id.cmp(&right.row_id))
         });
         reranked.truncate(request.limit);
+        crate::trace::QueryTrace::record(|trace| {
+            trace.exact_vector_gather_nanos =
+                trace.exact_vector_gather_nanos.saturating_add(gather_nanos);
+            trace.exact_vector_score_nanos = trace
+                .exact_vector_score_nanos
+                .saturating_add(score_started.elapsed().as_nanos() as u64);
+        });
         Ok(reranked)
     }
 
@@ -4208,7 +4441,10 @@ impl Table {
         Vec<crate::query::SetSimilarityHit>,
         crate::query::SetSimilarityTrace,
     )> {
-        use crate::query::{Retriever, RetrieverScore, SetSimilarityHit};
+        use crate::query::{
+            Retriever, RetrieverScore, SetSimilarityHit, MAX_FINAL_LIMIT, MAX_RETRIEVER_K,
+            MAX_SET_MEMBERS,
+        };
         let mut trace = crate::query::SetSimilarityTrace::default();
         if request.members.is_empty() {
             return Ok((Vec::new(), trace));
@@ -4217,6 +4453,14 @@ impl Table {
             return Err(MongrelError::InvalidArgument(
                 "candidate_k and limit must be > 0".into(),
             ));
+        }
+        if request.candidate_k > MAX_RETRIEVER_K
+            || request.limit > MAX_FINAL_LIMIT
+            || request.members.len() > MAX_SET_MEMBERS
+        {
+            return Err(MongrelError::InvalidArgument(format!(
+                "candidate_k must be <= {MAX_RETRIEVER_K}, limit <= {MAX_FINAL_LIMIT}, and members <= {MAX_SET_MEMBERS}"
+            )));
         }
         if !request.min_jaccard.is_finite() || !(0.0..=1.0).contains(&request.min_jaccard) {
             return Err(MongrelError::InvalidArgument(
@@ -4301,6 +4545,17 @@ impl Table {
         });
         exact.truncate(request.limit);
         trace.score_us = started.elapsed().as_micros() as u64;
+        crate::trace::QueryTrace::record(|query_trace| {
+            query_trace.exact_set_gather_nanos = query_trace
+                .exact_set_gather_nanos
+                .saturating_add(trace.gather_us.saturating_mul(1_000));
+            query_trace.exact_set_parse_nanos = query_trace
+                .exact_set_parse_nanos
+                .saturating_add(trace.parse_us.saturating_mul(1_000));
+            query_trace.exact_set_score_nanos = query_trace
+                .exact_set_score_nanos
+                .saturating_add(trace.score_us.saturating_mul(1_000));
+        });
         Ok((exact, trace))
     }
 
@@ -4700,6 +4955,15 @@ impl Table {
         c: &crate::query::Condition,
         snapshot: Snapshot,
     ) -> Result<RowIdSet> {
+        self.resolve_condition_with_allowed(c, snapshot, None)
+    }
+
+    fn resolve_condition_with_allowed(
+        &self,
+        c: &crate::query::Condition,
+        snapshot: Snapshot,
+        allowed: Option<&std::collections::HashSet<RowId>>,
+    ) -> Result<RowIdSet> {
         use crate::query::Condition;
         self.validate_condition(c)?;
         Ok(match c {
@@ -4790,7 +5054,7 @@ impl Table {
                     },
                     snapshot,
                     None,
-                    None,
+                    allowed,
                 )?
                 .into_iter()
                 .map(|hit| hit.row_id.0)
@@ -4809,7 +5073,7 @@ impl Table {
                     },
                     snapshot,
                     None,
-                    None,
+                    allowed,
                 )?
                 .into_iter()
                 .map(|hit| hit.row_id.0)
@@ -4826,7 +5090,10 @@ impl Table {
                         self.eligible_candidate_ids(&candidates, *column_id, snapshot)?;
                     RowIdSet::from_unsorted(
                         index
-                            .search_filtered(query, *k, |row_id| eligible.contains(&row_id))
+                            .search_filtered(query, *k, |row_id| {
+                                eligible.contains(&row_id)
+                                    && allowed.map_or(true, |allowed| allowed.contains(&row_id))
+                            })
                             .into_iter()
                             .map(|(row_id, _)| row_id.0)
                             .collect(),
@@ -5125,6 +5392,11 @@ impl Table {
         Snapshot::at(self.epoch.visible())
     }
 
+    /// Generation of this table's row contents for table-local caches.
+    pub fn data_generation(&self) -> u64 {
+        self.data_generation
+    }
+
     /// Pin the current epoch as a read snapshot; compaction will preserve the
     /// versions it needs until [`Table::unpin_snapshot`] is called.
     pub fn pin_snapshot(&mut self) -> Snapshot {
@@ -5279,11 +5551,20 @@ impl Table {
     ) -> Result<Option<u64>> {
         use crate::query::Condition;
         if self.ttl.is_some() {
-            return self
-                .query(&crate::query::Query {
-                    conditions: conditions.to_vec(),
-                })
-                .map(|rows| Some(rows.len() as u64));
+            if conditions.is_empty() {
+                return Ok(Some(self.visible_rows(snapshot)?.len() as u64));
+            }
+            let mut sets = Vec::with_capacity(conditions.len());
+            for condition in conditions {
+                sets.push(self.resolve_condition(condition, snapshot)?);
+            }
+            let survivors = RowIdSet::intersect_many(sets);
+            let rows = self.visible_rows(snapshot)?;
+            return Ok(Some(
+                rows.into_iter()
+                    .filter(|row| survivors.contains(row.row_id.0))
+                    .count() as u64,
+            ));
         }
         if conditions.is_empty() {
             return Ok(Some(self.count()));
@@ -5481,6 +5762,7 @@ impl Table {
             self.checkpoint_indexes(epoch);
         }
         self.clear_result_cache();
+        self.data_generation = self.data_generation.wrapping_add(1);
         Ok(epoch)
     }
 
@@ -5782,7 +6064,8 @@ impl Table {
         if q.conditions.is_empty() {
             return self.query(q);
         }
-        let key = crate::query::canonical_query_key(&q.conditions, None, 0);
+        let key = crate::query::canonical_query_key(&q.conditions, None, 0)
+            ^ (q.limit.unwrap_or(usize::MAX) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         if let Some(hit) = self.result_cache.lock().get_rows(key) {
             crate::trace::QueryTrace::record(|t| {
                 t.result_cache_hit = true;

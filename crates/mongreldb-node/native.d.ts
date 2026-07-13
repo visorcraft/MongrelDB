@@ -194,6 +194,11 @@ export interface RowJs {
   rowId: bigint
   cells: Array<Cell>
 }
+export interface AnnRerankHitJs {
+  rowId: bigint
+  hammingDistance: number
+  exactScore: number
+}
 export interface OwnedRowJs {
   cells: Array<Cell>
 }
@@ -496,6 +501,8 @@ export declare class TableHandle {
   deleteByPkInt64(value: bigint): void
   /** Hybrid index query. */
   query(conditions: Array<ConditionSpec>): Array<RowJs>
+  /** Binary ANN candidate search followed by exact float-vector reranking. */
+  annRerank(columnId: number, query: Array<number>, candidateK: number, limit: number, metric: string): Array<AnnRerankHitJs>
   /**
    * Read every row of this table visible at commit `epoch` — a point-in-time
    * (MVCC time-travel) read. `epoch` must not exceed the current visible

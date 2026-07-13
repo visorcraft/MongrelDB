@@ -11,8 +11,8 @@ use crate::cstr::cstr_to_string;
 use crate::database::{as_db, mongreldb_database_t, FFIDatabase};
 use crate::error::{clear, set_error, set_error_msg, ErrorCode};
 use crate::query::{self, mongreldb_query_t};
-use crate::value::{value_to_c, CValue};
-use mongreldb_core::query::Query as CoreQuery;
+use crate::value::{value_to_c, CValue, EmbeddingSlice};
+use mongreldb_core::query::{AnnRerankRequest, Query as CoreQuery, VectorMetric};
 use mongreldb_core::schema::{Schema, TypeId};
 use mongreldb_core::{RowId, Value};
 use std::os::raw::c_void;
@@ -22,6 +22,40 @@ use std::sync::Arc;
 pub type mongreldb_table_t = *mut c_void;
 /// Opaque result handle.
 pub type mongreldb_result_t = *mut c_void;
+/// Opaque exact ANN rerank result handle.
+pub type mongreldb_ann_rerank_result_t = *mut c_void;
+
+/// Exact vector metric used by [`mongreldb_table_ann_rerank`].
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum mongreldb_vector_metric {
+    Cosine = 0,
+    DotProduct = 1,
+    Euclidean = 2,
+}
+
+impl From<mongreldb_vector_metric> for VectorMetric {
+    fn from(value: mongreldb_vector_metric) -> Self {
+        match value {
+            mongreldb_vector_metric::Cosine => Self::Cosine,
+            mongreldb_vector_metric::DotProduct => Self::DotProduct,
+            mongreldb_vector_metric::Euclidean => Self::Euclidean,
+        }
+    }
+}
+
+/// One exact ANN rerank hit.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct mongreldb_ann_rerank_hit {
+    pub row_id: u64,
+    pub hamming_distance: u32,
+    pub exact_score: f32,
+}
+
+struct FFIAnnRerankResult {
+    hits: Vec<mongreldb_ann_rerank_hit>,
+}
 
 /// One cell: a column id + a tagged value.
 #[repr(C)]
@@ -120,6 +154,19 @@ unsafe fn as_result(handle: mongreldb_result_t) -> Option<&'static FFIResult> {
         return None;
     }
     Some(&*(handle as *const FFIResult))
+}
+
+unsafe fn as_ann_rerank_result(
+    handle: mongreldb_ann_rerank_result_t,
+) -> Option<&'static FFIAnnRerankResult> {
+    if handle.is_null() {
+        set_error_msg(
+            ErrorCode::InvalidArgument,
+            "ANN rerank result handle is null",
+        );
+        return None;
+    }
+    Some(&*(handle as *const FFIAnnRerankResult))
 }
 
 /// Marshal a core row into a `Vec<(u16, Value)>` in schema column order,
@@ -398,6 +445,105 @@ pub unsafe extern "C" fn mongreldb_table_query(
         row_cell_drops: Vec::new(),
     }
     .into_handle()
+}
+
+/// Run binary ANN candidate generation followed by exact float-vector reranking.
+/// Returns a result handle, or null on error.
+///
+/// # Safety
+/// `t` must be a valid table handle. `query.data` must be valid for `query.len`
+/// floats. The returned handle must be freed with
+/// [`mongreldb_ann_rerank_result_free`].
+#[no_mangle]
+pub unsafe extern "C" fn mongreldb_table_ann_rerank(
+    t: mongreldb_table_t,
+    column_id: u16,
+    query: EmbeddingSlice,
+    candidate_k: usize,
+    limit: usize,
+    metric: mongreldb_vector_metric,
+) -> mongreldb_ann_rerank_result_t {
+    clear();
+    let Some(table) = as_table(t) else {
+        return std::ptr::null_mut();
+    };
+    let request = AnnRerankRequest {
+        column_id,
+        query: query.to_vec(),
+        candidate_k,
+        limit,
+        metric: metric.into(),
+    };
+    let handle = match table.db.table(&table.name) {
+        Ok(handle) => handle,
+        Err(error) => {
+            set_error(&error);
+            return std::ptr::null_mut();
+        }
+    };
+    let hits = match handle.lock().ann_rerank(&request) {
+        Ok(hits) => hits,
+        Err(error) => {
+            set_error(&error);
+            return std::ptr::null_mut();
+        }
+    };
+    let hits = hits
+        .into_iter()
+        .map(|hit| mongreldb_ann_rerank_hit {
+            row_id: hit.row_id.0,
+            hamming_distance: hit.hamming_distance,
+            exact_score: hit.exact_score,
+        })
+        .collect();
+    Box::into_raw(Box::new(FFIAnnRerankResult { hits })) as mongreldb_ann_rerank_result_t
+}
+
+/// Number of exact ANN rerank hits. Returns 0 on null and sets an error.
+#[no_mangle]
+pub unsafe extern "C" fn mongreldb_ann_rerank_result_count(
+    result: mongreldb_ann_rerank_result_t,
+) -> usize {
+    clear();
+    as_ann_rerank_result(result)
+        .map(|result| result.hits.len())
+        .unwrap_or_default()
+}
+
+/// Copy one exact ANN rerank hit into `out_hit`.
+#[no_mangle]
+pub unsafe extern "C" fn mongreldb_ann_rerank_result_hit(
+    result: mongreldb_ann_rerank_result_t,
+    index: usize,
+    out_hit: *mut mongreldb_ann_rerank_hit,
+) -> i32 {
+    clear();
+    let Some(result) = as_ann_rerank_result(result) else {
+        return ErrorCode::InvalidArgument.as_return();
+    };
+    if out_hit.is_null() {
+        return set_error_msg(ErrorCode::InvalidArgument, "out_hit is null").as_return();
+    }
+    let Some(hit) = result.hits.get(index) else {
+        return set_error_msg(
+            ErrorCode::InvalidArgument,
+            format!(
+                "ANN rerank hit index {index} out of bounds (len {})",
+                result.hits.len()
+            ),
+        )
+        .as_return();
+    };
+    *out_hit = *hit;
+    0
+}
+
+/// Free an exact ANN rerank result handle. No-op on null.
+#[no_mangle]
+pub unsafe extern "C" fn mongreldb_ann_rerank_result_free(result: mongreldb_ann_rerank_result_t) {
+    if !result.is_null() {
+        drop(Box::from_raw(result as *mut FFIAnnRerankResult));
+    }
 }
 
 /// Live row count (O(1)). Returns 0 on success and writes the count into

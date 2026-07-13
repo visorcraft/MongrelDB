@@ -145,3 +145,70 @@ fn stale_authorization_snapshot_is_rejected_before_result_publish() {
     assert!(fresh_hits.is_empty());
 }
 
+#[test]
+fn authorized_read_retries_security_change_and_uses_table_local_cache_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    db.create_table("docs", schema()).unwrap();
+    db.create_table("other", schema()).unwrap();
+    db.transaction(|transaction| {
+        transaction.put(
+            "docs",
+            vec![
+                (1, Value::Int64(1)),
+                (2, Value::Bytes(b"alice".to_vec())),
+                (3, Value::Bytes(mongreldb_core::query::encode_sparse_vector(&[(1, 1.0)])?)),
+            ],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    db.set_security_catalog_as(
+        policy(SecurityExpr::ColumnEqCurrentUser { column: 2 }),
+        Some(&admin()),
+    )
+    .unwrap();
+    let principal = alice();
+    db.authorized_read_snapshot("docs", Some(&principal)).unwrap();
+    db.authorized_read_snapshot("docs", Some(&principal)).unwrap();
+    let before = db.rls_cache_stats();
+    assert_eq!(before.misses, 1);
+    assert_eq!(before.hits, 1);
+
+    db.transaction(|transaction| {
+        transaction.put(
+            "other",
+            vec![
+                (1, Value::Int64(1)),
+                (2, Value::Bytes(b"other".to_vec())),
+                (3, Value::Bytes(mongreldb_core::query::encode_sparse_vector(&[(2, 1.0)])?)),
+            ],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    db.authorized_read_snapshot("docs", Some(&principal)).unwrap();
+    let after = db.rls_cache_stats();
+    assert_eq!(after.misses, before.misses);
+    assert_eq!(after.hits, before.hits + 1);
+    assert!(after.bytes > 0);
+
+    let calls = std::cell::Cell::new(0usize);
+    let rows = db
+        .with_authorized_read("docs", Some(&principal), false, |table, snapshot, allowed, _| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                db.set_security_catalog_as(
+                    policy(SecurityExpr::ColumnEqValue {
+                        column: 2,
+                        value: Value::Bytes(b"bob".to_vec()),
+                    }),
+                    Some(&admin()),
+                )?;
+            }
+            table.query_at_with_allowed(&mongreldb_core::Query::new(), snapshot, allowed)
+        })
+        .unwrap();
+    assert_eq!(calls.get(), 2);
+    assert!(rows.is_empty());
+}

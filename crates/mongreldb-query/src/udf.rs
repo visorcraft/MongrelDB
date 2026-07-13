@@ -7,9 +7,8 @@
 //! Both UDFs exist so `WHERE ann_search(vec, …)` / `WHERE sparse_match(col, …)`
 //! parse and the logical plan types. The real top-k is served by
 //! [`crate::MongrelProvider`]'s filter pushdown, which returns `Exact` so
-//! DataFusion never evaluates these UDFs at runtime. If one *is* evaluated
-//! (pushdown declined), it passes every row through — correct only when an index
-//! serves the query, which is the documented precondition.
+//! DataFusion never evaluates these UDFs at runtime. If pushdown is declined,
+//! evaluation fails closed instead of silently passing rows through.
 
 use arrow::array::{
     Array, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, UInt32Array,
@@ -58,10 +57,10 @@ impl ScalarUDFImpl for AnnSearchUdf {
         Ok(arrow::datatypes::DataType::Boolean)
     }
 
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        let n = args.number_rows;
-        let arr = Arc::new(BooleanArray::from(vec![true; n])) as Arc<dyn Array>;
-        Ok(ColumnarValue::Array(arr))
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        Err(DataFusionError::Execution(
+            "ann_search requires MongrelDB index pushdown".into(),
+        ))
     }
 }
 
@@ -104,10 +103,10 @@ impl ScalarUDFImpl for SparseMatchUdf {
         Ok(arrow::datatypes::DataType::Boolean)
     }
 
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        let n = args.number_rows;
-        let arr = Arc::new(BooleanArray::from(vec![true; n])) as Arc<dyn Array>;
-        Ok(ColumnarValue::Array(arr))
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        Err(DataFusionError::Execution(
+            "sparse_match requires MongrelDB index pushdown".into(),
+        ))
     }
 }
 

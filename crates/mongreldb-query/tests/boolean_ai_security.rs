@@ -1,4 +1,4 @@
-use arrow::array::{Int64Array, UInt64Array};
+use arrow::array::Int64Array;
 use mongreldb_core::{Database, Principal};
 use mongreldb_query::MongrelSession;
 use std::sync::Arc;
@@ -13,7 +13,7 @@ fn admin() -> Principal {
 }
 
 #[tokio::test]
-async fn scored_sql_ranks_only_authorized_rows() {
+async fn secured_boolean_sparse_filters_rls_before_top_k() {
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(Database::create(dir.path()).unwrap());
     let admin = MongrelSession::open_as(Arc::clone(&db), admin()).unwrap();
@@ -32,13 +32,16 @@ async fn scored_sql_ranks_only_authorized_rows() {
     }
     let alice =
         MongrelSession::open_as(Arc::clone(&db), db.resolve_principal("alice").unwrap()).unwrap();
-    let rows = alice
-        .run("SELECT * FROM sparse_search_scored('docs','sparse','[[1,1.0]]',2,'id')")
+    let batches = alice
+        .run("SELECT id FROM docs WHERE sparse_match(sparse,'[[1,1.0]]',1)")
         .await
         .unwrap();
-    assert_eq!(rows.iter().map(|batch| batch.num_rows()).sum::<usize>(), 1);
     assert_eq!(
-        rows[0]
+        batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+        1
+    );
+    assert_eq!(
+        batches[0]
             .column(0)
             .as_any()
             .downcast_ref::<Int64Array>()
@@ -46,21 +49,4 @@ async fn scored_sql_ranks_only_authorized_rows() {
             .value(0),
         1
     );
-    assert_eq!(
-        rows[0]
-            .column(1)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap()
-            .value(0),
-        1
-    );
-    admin
-        .run("REVOKE SELECT (sparse) ON docs FROM tenant")
-        .await
-        .unwrap();
-    assert!(alice
-        .run("SELECT * FROM sparse_search_scored('docs','sparse','[[1,1.0]]',2,'id')")
-        .await
-        .is_err());
 }

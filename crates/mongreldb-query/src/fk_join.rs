@@ -33,7 +33,7 @@ use arrow::datatypes::Field;
 use arrow::record_batch::RecordBatch;
 use datafusion::common::Column;
 use datafusion::logical_expr::{Expr, JoinType, LogicalPlan, Operator};
-use mongreldb_core::{schema::IndexKind, Condition, Query, Row, Schema, Table, TypeId, Value};
+use mongreldb_core::{schema::IndexKind, Condition, Row, Schema, Table, TypeId, Value};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -178,30 +178,27 @@ pub(crate) fn try_fk_join(
                 } else {
                     drop(pk_db);
                     let mut pk_db2 = lock_db(&jc.pk_table, tables);
+                    let snapshot = pk_db2.snapshot();
                     let rows = pk_db2
-                        .query(&Query {
-                            conditions: pk_conds.clone(),
-                        })
+                        .query_all_at(&pk_conds, snapshot)
                         .map_err(MongrelQueryError::Core)?;
                     (rows, pk_col_id)
                 }
             } else {
                 drop(pk_db);
                 let mut pk_db2 = lock_db(&jc.pk_table, tables);
+                let snapshot = pk_db2.snapshot();
                 let rows = pk_db2
-                    .query(&Query {
-                        conditions: pk_conds.clone(),
-                    })
+                    .query_all_at(&pk_conds, snapshot)
                     .map_err(MongrelQueryError::Core)?;
                 (rows, pk_col_id)
             }
         } else {
             drop(pk_db);
             let mut pk_db2 = lock_db(&jc.pk_table, tables);
+            let snapshot = pk_db2.snapshot();
             let rows = pk_db2
-                .query(&Query {
-                    conditions: pk_conds.clone(),
-                })
+                .query_all_at(&pk_conds, snapshot)
                 .map_err(MongrelQueryError::Core)?;
             (rows, pk_col_id)
         }

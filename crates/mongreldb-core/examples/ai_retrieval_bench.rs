@@ -115,6 +115,8 @@ fn env_usize(name: &str, default: usize) -> usize {
 }
 
 fn main() {
+    let qualification_mode =
+        std::env::var("MONGRELDB_AI_QUALIFICATION").is_ok_and(|value| value == "1");
     let rows = env_usize("MONGRELDB_AI_BENCH_ROWS", 100_000);
     let queries = env_usize("MONGRELDB_AI_BENCH_QUERIES", 50);
     let ann_options = AnnOptions {
@@ -189,6 +191,11 @@ fn main() {
     let mut minhash_verify_parse_us = Vec::new();
     let mut minhash_verify_score_us = Vec::new();
     let mut hybrid_us = Vec::new();
+    let mut hybrid_ann_us = Vec::new();
+    let mut hybrid_sparse_us = Vec::new();
+    let mut hybrid_hard_filter_us = Vec::new();
+    let mut hybrid_fusion_us = Vec::new();
+    let mut hybrid_projection_us = Vec::new();
     let mut graph_recall = 0.0;
     let mut cosine_recall = 0.0;
     let rerank_candidates = [10usize, 50, 100, 200];
@@ -343,8 +350,8 @@ fn main() {
             .collect::<HashSet<_>>()
             .len();
         let started = Instant::now();
-        table
-            .search(&SearchRequest {
+        let (result, trace) = mongreldb_core::trace::QueryTrace::capture(|| {
+            table.search(&SearchRequest {
                 must: vec![Condition::BitmapEq {
                     column_id: 2,
                     value: b"even".to_vec(),
@@ -365,24 +372,46 @@ fn main() {
                 limit: 10,
                 projection: Some(vec![1]),
             })
-            .unwrap();
+        });
+        result.unwrap();
         hybrid_us.push(started.elapsed().as_micros());
+        hybrid_ann_us.push(trace.ann_candidate_nanos as u128 / 1_000);
+        hybrid_sparse_us.push(trace.sparse_candidate_nanos as u128 / 1_000);
+        hybrid_hard_filter_us.push(trace.hard_filter_nanos as u128 / 1_000);
+        hybrid_fusion_us.push(trace.fusion_nanos as u128 / 1_000);
+        hybrid_projection_us.push(trace.projection_nanos as u128 / 1_000);
     }
-    let checkpoint_bytes = std::fs::metadata(dir.path().join("_idx/global.idx"))
-        .map(|metadata| metadata.len())
-        .unwrap_or_default();
-    let index_payloads = mongreldb_core::global_idx::plaintext_record_sizes(dir.path())
-        .unwrap_or_default()
-        .into_iter()
-        .map(|record| {
-            serde_json::json!({
-                "kind": record.kind,
-                "column_id": record.column_id,
-                "payload_bytes": record.payload_bytes,
-                "payload_bytes_per_row": record.payload_bytes as f64 / rows as f64,
+    let checkpoint_path = dir.path().join("_idx/global.idx");
+    let checkpoint_inspection = (|| -> Result<(u64, Vec<serde_json::Value>), String> {
+        let checkpoint_bytes = std::fs::metadata(&checkpoint_path)
+            .map_err(|error| format!("metadata {}: {error}", checkpoint_path.display()))?
+            .len();
+        let records = mongreldb_core::global_idx::plaintext_record_sizes(dir.path())
+            .map_err(|error| format!("inspect {}: {error}", checkpoint_path.display()))?;
+        if records.is_empty() {
+            return Err(format!(
+                "inspect {}: checkpoint has no payload records",
+                checkpoint_path.display()
+            ));
+        }
+        let payloads = records
+            .into_iter()
+            .map(|record| {
+                serde_json::json!({
+                    "kind": record.kind,
+                    "column_id": record.column_id,
+                    "payload_bytes": record.payload_bytes,
+                    "payload_bytes_per_row": record.payload_bytes as f64 / rows as f64,
+                })
             })
-        })
-        .collect::<Vec<_>>();
+            .collect();
+        Ok((checkpoint_bytes, payloads))
+    })();
+    let (checkpoint_bytes, index_payloads, checkpoint_status, checkpoint_error) =
+        match checkpoint_inspection {
+            Ok((bytes, payloads)) => (bytes, payloads, "ok", None),
+            Err(error) => (0, Vec::new(), "error", Some(error)),
+        };
     let base_table_bytes = std::fs::read_dir(dir.path().join("_runs"))
         .into_iter()
         .flatten()
@@ -421,28 +450,35 @@ fn main() {
         .ok()
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
         .unwrap_or_default();
-    println!(
-        "{}",
-        serde_json::json!({
-            "git_sha": git_sha,
-            "git_dirty": git_dirty,
-            "hardware": {"arch": std::env::consts::ARCH, "os": std::env::consts::OS, "label": std::env::var("MONGRELDB_BENCH_HARDWARE").unwrap_or_default()},
-            "rustc": rustc,
-            "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
-            "features": "default",
-            "warmup_queries": 5.min(rows),
-            "rows": rows,
-            "queries": queries,
-            "build_ms": build_ms,
-            "checkpoint_bytes": checkpoint_bytes,
-            "index_bytes_per_row": checkpoint_bytes as f64 / rows as f64,
-            "base_table_bytes": base_table_bytes,
-            "base_table_bytes_per_row": base_table_bytes as f64 / rows as f64,
-            "index_payloads": index_payloads,
-            "ann": {"options": ann_options, "p50_us": percentile(&mut ann_us, 0.50), "p95_us": percentile(&mut ann_us, 0.95), "hamming_recall_at_10": graph_recall / queries as f64, "cosine_recall_at_10": cosine_recall / queries as f64, "exact_rerank": ann_rerank},
-            "sparse": {"p50_us": percentile(&mut sparse_us, 0.50), "p95_us": percentile(&mut sparse_us, 0.95), "average_postings_visited": sparse_postings_visited as f64 / queries as f64},
-            "minhash": {"p50_us": percentile(&mut minhash_us, 0.50), "p95_us": percentile(&mut minhash_us, 0.95), "verification_p50_us": percentile(&mut minhash_verify_us, 0.50), "verification_p95_us": percentile(&mut minhash_verify_us, 0.95), "verification_gather_p50_us": percentile(&mut minhash_verify_gather_us, 0.50), "verification_gather_p95_us": percentile(&mut minhash_verify_gather_us, 0.95), "verification_parse_p50_us": percentile(&mut minhash_verify_parse_us, 0.50), "verification_parse_p95_us": percentile(&mut minhash_verify_parse_us, 0.95), "verification_score_p50_us": percentile(&mut minhash_verify_score_us, 0.50), "verification_score_p95_us": percentile(&mut minhash_verify_score_us, 0.95), "candidate_recall_at_10": minhash_candidate_recall / queries as f64, "average_candidates": minhash_candidate_count as f64 / queries as f64, "estimated_exact_mean_absolute_error": minhash_error / minhash_error_samples.max(1) as f64},
-            "hybrid": {"p50_us": percentile(&mut hybrid_us, 0.50), "p95_us": percentile(&mut hybrid_us, 0.95), "average_union_size": hybrid_union_size as f64 / queries as f64},
-        })
-    );
+    let report = serde_json::json!({
+        "git_sha": git_sha,
+        "git_dirty": git_dirty,
+        "qualification_mode": qualification_mode,
+        "hardware": {"arch": std::env::consts::ARCH, "os": std::env::consts::OS, "label": std::env::var("MONGRELDB_BENCH_HARDWARE").unwrap_or_default()},
+        "rustc": rustc,
+        "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
+        "features": "default",
+        "warmup_queries": 5.min(rows),
+        "rows": rows,
+        "queries": queries,
+        "build_ms": build_ms,
+        "checkpoint_bytes": checkpoint_bytes,
+        "checkpoint_inspection": {
+            "status": checkpoint_status,
+            "error": checkpoint_error,
+        },
+        "index_bytes_per_row": checkpoint_bytes as f64 / rows as f64,
+        "base_table_bytes": base_table_bytes,
+        "base_table_bytes_per_row": base_table_bytes as f64 / rows as f64,
+        "index_payloads": index_payloads,
+        "ann": {"options": ann_options, "p50_us": percentile(&mut ann_us, 0.50), "p95_us": percentile(&mut ann_us, 0.95), "hamming_recall_at_10": graph_recall / queries as f64, "cosine_recall_at_10": cosine_recall / queries as f64, "exact_rerank": ann_rerank},
+        "sparse": {"p50_us": percentile(&mut sparse_us, 0.50), "p95_us": percentile(&mut sparse_us, 0.95), "average_postings_visited": sparse_postings_visited as f64 / queries as f64},
+        "minhash": {"p50_us": percentile(&mut minhash_us, 0.50), "p95_us": percentile(&mut minhash_us, 0.95), "verification_p50_us": percentile(&mut minhash_verify_us, 0.50), "verification_p95_us": percentile(&mut minhash_verify_us, 0.95), "verification_gather_p50_us": percentile(&mut minhash_verify_gather_us, 0.50), "verification_gather_p95_us": percentile(&mut minhash_verify_gather_us, 0.95), "verification_parse_p50_us": percentile(&mut minhash_verify_parse_us, 0.50), "verification_parse_p95_us": percentile(&mut minhash_verify_parse_us, 0.95), "verification_score_p50_us": percentile(&mut minhash_verify_score_us, 0.50), "verification_score_p95_us": percentile(&mut minhash_verify_score_us, 0.95), "candidate_recall_at_10": minhash_candidate_recall / queries as f64, "average_candidates": minhash_candidate_count as f64 / queries as f64, "estimated_exact_mean_absolute_error": minhash_error / minhash_error_samples.max(1) as f64},
+        "hybrid": {"p50_us": percentile(&mut hybrid_us, 0.50), "p95_us": percentile(&mut hybrid_us, 0.95), "ann_candidate_p95_us": percentile(&mut hybrid_ann_us, 0.95), "sparse_candidate_p95_us": percentile(&mut hybrid_sparse_us, 0.95), "hard_filter_p95_us": percentile(&mut hybrid_hard_filter_us, 0.95), "fusion_p95_us": percentile(&mut hybrid_fusion_us, 0.95), "projection_p95_us": percentile(&mut hybrid_projection_us, 0.95), "average_union_size": hybrid_union_size as f64 / queries as f64},
+    });
+    println!("{report}");
+    if qualification_mode && checkpoint_status != "ok" {
+        eprintln!("checkpoint inspection failed in qualification mode");
+        std::process::exit(2);
+    }
 }

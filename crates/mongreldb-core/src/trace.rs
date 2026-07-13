@@ -192,6 +192,26 @@ pub struct QueryTrace {
     /// from execution). `0` on a result-cache hit (planning was skipped) or when
     /// the plan came from the logical-plan cache.
     pub planning_nanos: u64,
+    /// Authorization/RLS candidate-cache work for the query.
+    pub authorization_nanos: u64,
+    pub rls_cache_hit: bool,
+    pub rls_rows_evaluated: usize,
+    pub authorization_retries: usize,
+    /// AI retrieval stage timings and bounded cardinalities.
+    pub hard_filter_nanos: u64,
+    pub ann_candidate_nanos: u64,
+    pub sparse_candidate_nanos: u64,
+    pub minhash_candidate_nanos: u64,
+    pub candidate_count: usize,
+    pub union_size: usize,
+    pub fusion_nanos: u64,
+    pub exact_vector_gather_nanos: u64,
+    pub exact_vector_score_nanos: u64,
+    pub exact_set_gather_nanos: u64,
+    pub exact_set_parse_nanos: u64,
+    pub exact_set_score_nanos: u64,
+    pub projection_nanos: u64,
+    pub total_nanos: u64,
 }
 
 impl QueryTrace {

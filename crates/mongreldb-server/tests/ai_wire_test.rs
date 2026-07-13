@@ -164,6 +164,22 @@ async fn kit_ai_indexes_work_over_wire_and_validate_values() {
     assert_eq!(body["hits"].as_array().unwrap().len(), 1);
     assert_eq!(body["hits"][0]["exact_jaccard"], 1.0);
 
+    let ann_rerank = serde_json::json!({
+        "table":"docs", "column_id":4,
+        "query":[1,-1,1,-1,1,-1,1,-1],
+        "candidate_k":10, "limit":2, "metric":"cosine"
+    });
+    let (status, body) = request(
+        app.clone(),
+        "POST",
+        "/kit/ann_rerank",
+        Some(ann_rerank),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body["hits"][0]["exact_score"].as_f64().unwrap().is_finite());
+    assert!(body["hits"][0]["hamming_distance"].is_number());
+
     let search = serde_json::json!({
         "table":"docs",
         "must":[{"bitmap_eq":{"column_id":2,"value":"published"}}],

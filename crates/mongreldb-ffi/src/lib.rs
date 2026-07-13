@@ -102,8 +102,10 @@ pub use query::{
 
 // Table ops + result iteration.
 pub use table::{
-    mongreldb_database_table, mongreldb_result_count, mongreldb_result_free, mongreldb_result_row,
-    mongreldb_row_cell, mongreldb_row_cell_count, mongreldb_table_count, mongreldb_table_delete,
+    mongreldb_ann_rerank_result_count, mongreldb_ann_rerank_result_free,
+    mongreldb_ann_rerank_result_hit, mongreldb_database_table, mongreldb_result_count,
+    mongreldb_result_free, mongreldb_result_row, mongreldb_row_cell, mongreldb_row_cell_count,
+    mongreldb_table_ann_rerank, mongreldb_table_count, mongreldb_table_delete,
     mongreldb_table_free, mongreldb_table_put, mongreldb_table_put_batch, mongreldb_table_query,
 };
 
@@ -132,8 +134,9 @@ pub use schema::{
     MONGRELDB_COL_ENCRYPTED_INDEXABLE, MONGRELDB_COL_NULLABLE, MONGRELDB_COL_PRIMARY_KEY,
 };
 pub use table::{
-    mongreldb_cell, mongreldb_cell_input, mongreldb_cell_input_array, mongreldb_cell_slice,
-    mongreldb_result_t, mongreldb_row, mongreldb_row_input_array, mongreldb_table_t,
+    mongreldb_ann_rerank_hit, mongreldb_ann_rerank_result_t, mongreldb_cell, mongreldb_cell_input,
+    mongreldb_cell_input_array, mongreldb_cell_slice, mongreldb_result_t, mongreldb_row,
+    mongreldb_row_input_array, mongreldb_table_t, mongreldb_vector_metric,
 };
 pub use transaction::mongreldb_transaction_t;
 pub use value::{

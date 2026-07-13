@@ -179,14 +179,14 @@ Bulk insert **2.3× faster than SQLite, 2.6× faster than DuckDB native**. Join
 
 AI retrieval availability:
 
-| Surface | Boolean Query | Scored Retriever | Exact Set | Hybrid Search |
-|---|---:|---:|---:|---:|
-| Rust core | Yes | Yes | Yes | Yes |
-| Kit HTTP | Yes | Yes | Yes | Yes |
-| SQL | Yes | Yes | Yes | Yes |
-| NAPI embedded | Yes | No typed helper | No typed helper | No typed helper |
-| C FFI | Yes | No typed helper | No typed helper | No typed helper |
-| HTTP clients | Raw HTTP routes | Raw HTTP routes | Raw HTTP routes | Raw HTTP routes |
+| Surface | Boolean Query | Scored Retriever | Exact ANN rerank | Exact Set | Hybrid Search |
+|---|---:|---:|---:|---:|---:|
+| Rust core | Yes | Yes | Yes | Yes | Yes |
+| Kit HTTP | Yes | Yes | Yes | Yes | Yes |
+| SQL | Yes | Yes | Yes | Yes | Yes |
+| NAPI embedded | Yes | No typed helper | Yes | No typed helper | No typed helper |
+| C FFI | Yes | No typed helper | Yes | No typed helper | No typed helper |
+| Rust HTTP client | Yes | Yes | Yes | Yes | Yes |
   Use `--daemon` to run in the background, or deploy with
   systemd/Docker/supervisord for auto-restart. See
   [Daemon Mode](docs/08-daemon.md#running-as-a-daemon---daemon-mode) for details.

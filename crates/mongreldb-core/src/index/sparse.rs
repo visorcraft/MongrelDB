@@ -37,7 +37,7 @@ impl SparseIndex {
     }
 
     /// Top-k row ids by sparse dot product with `query` (highest score first).
-    pub fn search(&self, query: &[(u32, f32)], k: usize) -> Vec<(RowId, f32)> {
+    pub fn search(&self, query: &[(u32, f32)], k: usize) -> Vec<(RowId, f64)> {
         self.search_filtered(query, k, |_| true)
     }
 
@@ -46,18 +46,19 @@ impl SparseIndex {
         query: &[(u32, f32)],
         k: usize,
         allowed: impl Fn(RowId) -> bool,
-    ) -> Vec<(RowId, f32)> {
-        let mut scores: HashMap<u64, f32> = HashMap::new();
+    ) -> Vec<(RowId, f64)> {
+        let mut scores: HashMap<u64, f64> = HashMap::new();
         for &(token, q_weight) in query {
             if let Some(list) = self.postings.get(&token) {
                 for &(rid, d_weight) in list {
                     if allowed(rid) {
-                        *scores.entry(rid.0).or_insert(0.0) += q_weight * d_weight;
+                        *scores.entry(rid.0).or_insert(0.0) +=
+                            f64::from(q_weight) * f64::from(d_weight);
                     }
                 }
             }
         }
-        let mut ranked: Vec<(RowId, f32)> = scores
+        let mut ranked: Vec<(RowId, f64)> = scores
             .into_iter()
             .map(|(rid, score)| (RowId(rid), score))
             .collect();

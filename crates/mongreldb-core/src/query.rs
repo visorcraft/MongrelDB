@@ -6,6 +6,16 @@
 //! intersects the sets and materializes the survivors — letting an agent express
 //! `semsearch ∩ fm_contains ∩ cat_in`, which no SQL FTS pipeline can.
 
+/// Hard safety ceilings shared by every public query surface.
+pub const MAX_FINAL_LIMIT: usize = 10_000;
+pub const MAX_RETRIEVER_K: usize = 100_000;
+pub const MAX_RETRIEVERS: usize = 32;
+pub const MAX_SPARSE_TERMS: usize = 65_536;
+pub const MAX_SET_MEMBERS: usize = 65_536;
+pub const MAX_PROJECTION_COLUMNS: usize = 4_096;
+pub const MAX_HARD_CONDITIONS: usize = 256;
+pub const MAX_RETRIEVER_WEIGHT: f64 = 1_000_000.0;
+
 /// One predicate over the row-id space.
 #[derive(Debug, Clone)]
 pub enum Condition {
@@ -136,7 +146,7 @@ impl SetMember {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RetrieverScore {
     AnnHammingDistance(u32),
-    SparseDotProduct(f32),
+    SparseDotProduct(f64),
     MinHashEstimatedJaccard(f32),
 }
 
@@ -235,9 +245,10 @@ pub struct SearchHit {
 }
 
 /// A conjunctive query. Empty ⇒ all rows.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Query {
     pub conditions: Vec<Condition>,
+    pub limit: Option<usize>,
 }
 
 impl Query {
@@ -246,6 +257,10 @@ impl Query {
     }
     pub fn and(mut self, c: Condition) -> Self {
         self.conditions.push(c);
+        self
+    }
+    pub fn with_limit(mut self, limit: usize) -> Self {
+        self.limit = Some(limit);
         self
     }
     pub fn pk(key: Vec<u8>) -> Self {

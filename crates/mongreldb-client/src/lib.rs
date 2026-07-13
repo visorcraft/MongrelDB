@@ -322,6 +322,36 @@ pub struct KitRetrieveResponse {
     pub hits: Vec<KitRetrieverHit>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct KitAnnRerankRequest {
+    pub table: String,
+    pub column_id: u16,
+    pub query: Vec<f32>,
+    pub candidate_k: usize,
+    pub limit: usize,
+    pub metric: KitVectorMetric,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KitVectorMetric {
+    Cosine,
+    DotProduct,
+    Euclidean,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct KitAnnRerankResponse {
+    pub hits: Vec<KitAnnRerankHit>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct KitAnnRerankHit {
+    pub row_id: String,
+    pub hamming_distance: u32,
+    pub exact_score: f32,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct KitRetrieverHit {
     pub row_id: String,
@@ -367,11 +397,19 @@ pub struct KitSearchRequest {
     pub limit: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub projection: Option<Vec<u16>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deadline_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_work: Option<usize>,
+    #[serde(default)]
+    pub explain: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct KitSearchResponse {
     pub hits: Vec<KitSearchHit>,
+    #[serde(default)]
+    pub trace: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -650,6 +688,19 @@ impl MongrelClient {
         let resp = self
             .client
             .post(self.url("/kit/retrieve"))
+            .json(req)
+            .send()?;
+        let resp = self.check(resp)?;
+        Ok(resp.json()?)
+    }
+
+    pub fn kit_ann_rerank(
+        &self,
+        req: &KitAnnRerankRequest,
+    ) -> ClientResult<KitAnnRerankResponse> {
+        let resp = self
+            .client
+            .post(self.url("/kit/ann_rerank"))
             .json(req)
             .send()?;
         let resp = self.check(resp)?;

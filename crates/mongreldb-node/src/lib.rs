@@ -16,7 +16,7 @@
 
 #![deny(clippy::all)]
 
-use mongreldb_core::query::{Condition, Query};
+use mongreldb_core::query::{AnnRerankRequest, Condition, Query, VectorMetric};
 use mongreldb_core::schema::{
     AlterColumn, ColumnDef, ColumnFlags, DefaultExpr, IndexDef, IndexKind, Schema, TypeId,
 };
@@ -653,6 +653,35 @@ pub struct ConditionSpec {
 }
 
 fn build_condition(spec: &ConditionSpec) -> napi::Result<Condition> {
+    if matches!(
+        spec.kind,
+        ConditionKind::Ann | ConditionKind::SparseMatch | ConditionKind::MinHashSimilar
+    ) {
+        let k = spec.k.unwrap_or(10) as usize;
+        if k == 0 || k > mongreldb_core::query::MAX_RETRIEVER_K {
+            return Err(napi::Error::new(
+                napi::Status::InvalidArg,
+                format!(
+                    "condition k must be between 1 and {}",
+                    mongreldb_core::query::MAX_RETRIEVER_K
+                ),
+            ));
+        }
+    }
+    if spec
+        .values
+        .as_ref()
+        .is_some_and(|values| values.len() > mongreldb_core::query::MAX_SET_MEMBERS)
+        || spec
+            .sparse_tokens
+            .as_ref()
+            .is_some_and(|tokens| tokens.len() > mongreldb_core::query::MAX_SPARSE_TERMS)
+    {
+        return Err(napi::Error::new(
+            napi::Status::InvalidArg,
+            "condition cardinality exceeds the public query limit",
+        ));
+    }
     Ok(match spec.kind {
         ConditionKind::Pk => Condition::Pk(text_bytes(spec)?),
         ConditionKind::BitmapEq => Condition::BitmapEq {
@@ -767,7 +796,51 @@ fn text_values(spec: &ConditionSpec) -> napi::Result<Vec<Vec<u8>>> {
 }
 
 fn build_conditions(specs: &[ConditionSpec]) -> napi::Result<Vec<Condition>> {
+    if specs.len() > mongreldb_core::query::MAX_HARD_CONDITIONS {
+        return Err(napi::Error::new(
+            napi::Status::InvalidArg,
+            format!(
+                "query exceeds {} conditions",
+                mongreldb_core::query::MAX_HARD_CONDITIONS
+            ),
+        ));
+    }
     specs.iter().map(build_condition).collect()
+}
+
+#[cfg(test)]
+mod condition_limit_tests {
+    use super::*;
+
+    fn spec(kind: ConditionKind) -> ConditionSpec {
+        ConditionSpec {
+            kind,
+            column_id: 1,
+            int64_lo: None,
+            int64_hi: None,
+            float64_lo: None,
+            float64_hi: None,
+            text: Some("key".into()),
+            values: None,
+            embedding: None,
+            k: None,
+            sparse_tokens: None,
+            sparse_weights: None,
+        }
+    }
+
+    #[test]
+    fn napi_condition_limits_are_rejected() {
+        let mut ann = spec(ConditionKind::Ann);
+        ann.embedding = Some(vec![1.0]);
+        ann.k = Some(mongreldb_core::query::MAX_RETRIEVER_K as u32 + 1);
+        assert!(build_condition(&ann).is_err());
+
+        let conditions = (0..=mongreldb_core::query::MAX_HARD_CONDITIONS)
+            .map(|_| spec(ConditionKind::Pk))
+            .collect::<Vec<_>>();
+        assert!(build_conditions(&conditions).is_err());
+    }
 }
 
 /// Finalize a mergeable `AggState` to a JSON scalar, keeping integer-ness for
@@ -799,13 +872,20 @@ fn build_query_from_conditions(conditions: Vec<Condition>) -> Query {
     for c in conditions {
         q = q.and(c);
     }
-    q
+    q.with_limit(mongreldb_core::query::MAX_FINAL_LIMIT)
 }
 
 #[napi(object)]
 pub struct RowJs {
     pub row_id: BigInt,
     pub cells: Vec<Cell>,
+}
+
+#[napi(object)]
+pub struct AnnRerankHitJs {
+    pub row_id: BigInt,
+    pub hamming_distance: u32,
+    pub exact_score: f64,
 }
 
 #[napi(object)]
@@ -2091,7 +2171,68 @@ impl TableHandle {
         let mut g = handle.lock();
         let q = build_query_from_conditions(build_conditions(&conditions)?);
         let rows = g.query_cached(&q).map_err(to_napi)?;
+        if rows.len() > mongreldb_core::query::MAX_FINAL_LIMIT {
+            return Err(napi::Error::new(
+                napi::Status::InvalidArg,
+                format!(
+                    "query result exceeds {} rows",
+                    mongreldb_core::query::MAX_FINAL_LIMIT
+                ),
+            ));
+        }
         Ok(rows.iter().map(|r| row_to_js_table(&g, r)).collect())
+    }
+
+    /// Binary ANN candidate search followed by exact float-vector reranking.
+    #[napi]
+    pub fn ann_rerank(
+        &self,
+        column_id: u16,
+        query: Vec<f64>,
+        candidate_k: u32,
+        limit: u32,
+        metric: String,
+    ) -> napi::Result<Vec<AnnRerankHitJs>> {
+        let metric = match metric.as_str() {
+            "cosine" => VectorMetric::Cosine,
+            "dot_product" | "dot" => VectorMetric::DotProduct,
+            "euclidean" | "l2" => VectorMetric::Euclidean,
+            _ => {
+                return Err(napi::Error::new(
+                    napi::Status::InvalidArg,
+                    "metric must be cosine, dot_product, or euclidean",
+                ))
+            }
+        };
+        let query = query
+            .into_iter()
+            .map(|value| {
+                let value = value as f32;
+                value.is_finite().then_some(value).ok_or_else(|| {
+                    napi::Error::new(napi::Status::InvalidArg, "query values must be finite")
+                })
+            })
+            .collect::<napi::Result<Vec<_>>>()?;
+        let handle = self.db.table(&self.name).map_err(to_napi)?;
+        let mut table = handle.lock();
+        table
+            .ann_rerank(&AnnRerankRequest {
+                column_id,
+                query,
+                candidate_k: candidate_k as usize,
+                limit: limit as usize,
+                metric,
+            })
+            .map(|hits| {
+                hits.into_iter()
+                    .map(|hit| AnnRerankHitJs {
+                        row_id: BigInt::from(hit.row_id.0),
+                        hamming_distance: hit.hamming_distance,
+                        exact_score: f64::from(hit.exact_score),
+                    })
+                    .collect()
+            })
+            .map_err(to_napi)
     }
 
     /// Read every row of this table visible at commit `epoch` — a point-in-time
@@ -2390,6 +2531,19 @@ fn query_arrow_inner(
     let cols = g
         .query_columns_native(&conds, Some(&proj), snap)
         .map_err(to_napi)?;
+    if cols
+        .as_ref()
+        .and_then(|columns| columns.first())
+        .is_some_and(|(_, column)| column.len() > mongreldb_core::query::MAX_FINAL_LIMIT)
+    {
+        return Err(napi::Error::new(
+            napi::Status::InvalidArg,
+            format!(
+                "query result exceeds {} rows",
+                mongreldb_core::query::MAX_FINAL_LIMIT
+            ),
+        ));
+    }
     match cols {
         Some(cols) => Ok(Buffer::from(native_cols_to_ipc(&cols, g.schema())?)),
         None => Ok(Buffer::from(Vec::new())),

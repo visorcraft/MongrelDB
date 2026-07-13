@@ -10,8 +10,18 @@
   checkpoint is opened. Original stored set members are unchanged.
 - Existing Boolean `Query` conditions still intersect and discard scores.
   `Retriever`, `set_similarity`, and `SearchRequest` are separate scored APIs.
+- Exact ANN reranking is public through `POST /kit/ann_rerank`,
+  `MongrelClient::kit_ann_rerank`, `ann_search_exact(...)` SQL,
+  `Table.annRerank(...)` in NAPI, and `mongreldb_table_ann_rerank` in C.
+- AI result cardinalities are bounded. Oversized limits, retriever lists,
+  Sparse terms, MinHash members, projections, and unsafe weights return typed
+  errors.
+- Secured Boolean and scored SQL rank only authorized candidates. Scored table
+  functions execute live instead of freezing rows during logical planning.
+- Kit AI endpoints now use one JSON error envelope. The RLS candidate cache is
+  byte-bounded and keyed by table-local data generation.
 - Index options are backward compatible when absent. Existing defaults remain
   ANN 16/64/64 with binary-sign quantization, MinHash 128/32, and learned-range
   epsilon 16.
-- Clean release qualification logs and the 100k AI benchmark are uploaded by
+- Clean release qualification logs, strict JSON validation, and the 100k AI benchmark are uploaded by
   the [CI qualification job](https://github.com/visorcraft/MongrelDB/actions/workflows/ci.yml).

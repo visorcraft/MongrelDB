@@ -10,7 +10,10 @@ use crate::cstr::cstr_to_string;
 use crate::error::{clear, set_error_msg, ErrorCode};
 use crate::value::{ByteSlice, EmbeddingSlice};
 use mongreldb_core::index::minhash_token_hash;
-use mongreldb_core::query::{Condition, Query};
+use mongreldb_core::query::{
+    Condition, Query, MAX_FINAL_LIMIT, MAX_HARD_CONDITIONS, MAX_PROJECTION_COLUMNS,
+    MAX_RETRIEVER_K, MAX_SET_MEMBERS, MAX_SPARSE_TERMS,
+};
 use std::os::raw::{c_char, c_void};
 
 /// Opaque query handle.
@@ -149,6 +152,27 @@ impl Default for mongreldb_condition {
 /// # Safety
 /// All pointers inside `c` must be valid for their lengths.
 pub unsafe fn build_condition(c: &mongreldb_condition) -> Result<Condition, ErrorCode> {
+    if matches!(
+        c.kind,
+        mongreldb_condition_kind::Ann
+            | mongreldb_condition_kind::SparseMatch
+            | mongreldb_condition_kind::MinHashSimilar
+    ) && (c.k == 0 || c.k as usize > MAX_RETRIEVER_K)
+    {
+        return Err(set_error_msg(
+            ErrorCode::InvalidArgument,
+            format!("condition k must be between 1 and {MAX_RETRIEVER_K}"),
+        ));
+    }
+    if c.byte_values.len > MAX_SET_MEMBERS
+        || c.minhash_members.len > MAX_SET_MEMBERS
+        || c.sparse.len > MAX_SPARSE_TERMS
+    {
+        return Err(set_error_msg(
+            ErrorCode::InvalidArgument,
+            "condition cardinality exceeds the public query limit",
+        ));
+    }
     Ok(match c.kind {
         mongreldb_condition_kind::Pk => {
             let key = c.bytes.to_vec();
@@ -308,7 +332,7 @@ impl FFIQuery {
         Self {
             conditions: Vec::new(),
             projection: None,
-            limit: None,
+            limit: Some(MAX_FINAL_LIMIT),
         }
     }
 
@@ -324,7 +348,7 @@ impl FFIQuery {
         for c in &self.conditions {
             q = q.and(c.clone());
         }
-        q
+        q.with_limit(self.limit.unwrap_or(MAX_FINAL_LIMIT))
     }
 }
 
@@ -394,6 +418,13 @@ pub unsafe extern "C" fn mongreldb_query_add(
     let c = &*cond;
     match build_condition(c) {
         Ok(core_c) => {
+            if query.conditions.len() >= MAX_HARD_CONDITIONS {
+                return set_error_msg(
+                    ErrorCode::InvalidArgument,
+                    format!("query exceeds {MAX_HARD_CONDITIONS} conditions"),
+                )
+                .as_return();
+            }
             query.add(core_c);
             0
         }
@@ -420,13 +451,20 @@ pub unsafe extern "C" fn mongreldb_query_set_projection(
     if cols.is_null() || len == 0 {
         query.projection = None;
     } else {
+        if len > MAX_PROJECTION_COLUMNS {
+            return set_error_msg(
+                ErrorCode::InvalidArgument,
+                format!("projection exceeds {MAX_PROJECTION_COLUMNS} columns"),
+            )
+            .as_return();
+        }
         // SAFETY: caller guarantees `cols` is valid for `len`.
         query.projection = Some(std::slice::from_raw_parts(cols, len).to_vec());
     }
     0
 }
 
-/// Set the result limit (max rows to return). `0` clears the limit.
+/// Set the result limit (max rows to return). `0` restores the safe default.
 ///
 /// # Safety
 /// `q` must be valid.
@@ -436,11 +474,18 @@ pub unsafe extern "C" fn mongreldb_query_set_limit(q: mongreldb_query_t, limit: 
     let Some(query) = as_query_mut(q) else {
         return ErrorCode::InvalidArgument.as_return();
     };
-    query.limit = if limit == 0 {
-        None
+    if limit > MAX_FINAL_LIMIT as u64 {
+        return set_error_msg(
+            ErrorCode::InvalidArgument,
+            format!("limit exceeds {MAX_FINAL_LIMIT}"),
+        )
+        .as_return();
+    }
+    query.limit = Some(if limit == 0 {
+        MAX_FINAL_LIMIT
     } else {
-        Some(limit as usize)
-    };
+        limit as usize
+    });
     0
 }
 
@@ -499,4 +544,35 @@ pub unsafe fn as_query(q: mongreldb_query_t) -> Option<&'static FFIQuery> {
         return None;
     }
     Some(&*(q as *const FFIQuery))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ffi_query_limits_fail_before_copying_input() {
+        unsafe {
+            let query = mongreldb_query_begin();
+            assert!(!query.is_null());
+            assert_ne!(
+                mongreldb_query_set_limit(query, MAX_FINAL_LIMIT as u64 + 1),
+                0
+            );
+            let column = 1u16;
+            assert_ne!(
+                mongreldb_query_set_projection(query, &column, MAX_PROJECTION_COLUMNS + 1,),
+                0
+            );
+            let condition = mongreldb_condition {
+                kind: mongreldb_condition_kind::Ann,
+                column_id: 2,
+                k: MAX_RETRIEVER_K as u32 + 1,
+                embedding: EmbeddingSlice { data: &1.0, len: 1 },
+                ..Default::default()
+            };
+            assert_ne!(mongreldb_query_add(query, &condition), 0);
+            mongreldb_query_free(query);
+        }
+    }
 }

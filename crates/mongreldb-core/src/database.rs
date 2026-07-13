@@ -24,7 +24,7 @@ use crate::trigger::{
     TriggerRaiseAction, TriggerStep, TriggerTarget, TriggerTiming, TriggerValue,
 };
 use parking_lot::{Mutex, RwLock};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize};
@@ -350,12 +350,102 @@ pub struct CheckIssue {
 /// One optimistic authorization snapshot for a complete scored read.
 #[derive(Debug, Clone)]
 pub struct AuthorizedReadSnapshot {
+    pub table: String,
     pub table_snapshot: Snapshot,
+    pub data_generation: u64,
     pub security_version: u64,
     pub allowed_row_ids: Option<HashSet<RowId>>,
 }
 
-type RlsCache = HashMap<(String, u64, u64, String), HashSet<RowId>>;
+type RlsCacheKey = (String, u64, u64, String);
+
+/// Runtime statistics for the byte-bounded RLS candidate cache.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RlsCacheStats {
+    pub entries: usize,
+    pub bytes: usize,
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+    pub build_nanos: u64,
+    pub rows_evaluated: u64,
+}
+
+const RLS_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Default)]
+struct RlsCache {
+    entries: HashMap<RlsCacheKey, (Arc<HashSet<RowId>>, usize)>,
+    lru: VecDeque<RlsCacheKey>,
+    bytes: usize,
+    hits: u64,
+    misses: u64,
+    evictions: u64,
+    build_nanos: u64,
+    rows_evaluated: u64,
+}
+
+impl RlsCache {
+    fn get(&mut self, key: &RlsCacheKey) -> Option<Arc<HashSet<RowId>>> {
+        let value = self.entries.get(key).map(|(value, _)| Arc::clone(value));
+        if value.is_some() {
+            self.hits = self.hits.saturating_add(1);
+            self.touch(key);
+        } else {
+            self.misses = self.misses.saturating_add(1);
+        }
+        value
+    }
+
+    fn insert(&mut self, key: RlsCacheKey, value: Arc<HashSet<RowId>>) {
+        let bytes = key
+            .0
+            .len()
+            .saturating_add(key.3.len())
+            .saturating_add(
+                value
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<RowId>() * 3),
+            )
+            .saturating_add(std::mem::size_of::<RlsCacheKey>());
+        if bytes > RLS_CACHE_MAX_BYTES {
+            return;
+        }
+        if let Some((_, old_bytes)) = self.entries.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(old_bytes);
+        }
+        self.lru.retain(|candidate| candidate != &key);
+        while self.bytes.saturating_add(bytes) > RLS_CACHE_MAX_BYTES {
+            let Some(oldest) = self.lru.pop_front() else {
+                break;
+            };
+            if let Some((_, old_bytes)) = self.entries.remove(&oldest) {
+                self.bytes = self.bytes.saturating_sub(old_bytes);
+                self.evictions = self.evictions.saturating_add(1);
+            }
+        }
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.lru.push_back(key.clone());
+        self.entries.insert(key, (value, bytes));
+    }
+
+    fn touch(&mut self, key: &RlsCacheKey) {
+        self.lru.retain(|candidate| candidate != key);
+        self.lru.push_back(key.clone());
+    }
+
+    fn stats(&self) -> RlsCacheStats {
+        RlsCacheStats {
+            entries: self.entries.len(),
+            bytes: self.bytes,
+            hits: self.hits,
+            misses: self.misses,
+            evictions: self.evictions,
+            build_nanos: self.build_nanos,
+            rows_evaluated: self.rows_evaluated,
+        }
+    }
+}
 
 /// A handle to a live table inside a [`Database`]. Writes take the inner lock
 /// (P1); P3.3 replaces this with lock-free `ArcSwap` reads + a publish lock for
@@ -1232,7 +1322,7 @@ impl Database {
             root,
             read_only,
             catalog: RwLock::new(cat),
-            rls_cache: Mutex::new(HashMap::new()),
+            rls_cache: Mutex::new(RlsCache::default()),
             epoch,
             snapshots,
             page_cache,
@@ -1561,53 +1651,47 @@ impl Database {
             .allowed_row_ids)
     }
 
-    /// Capture one table snapshot and the security version used to authorize it.
-    /// The caller must validate the returned version before publishing results.
-    pub fn authorized_read_snapshot(
+    fn allowed_row_ids_locked(
         &self,
-        table: &str,
+        table_name: &str,
+        table: &Table,
+        table_snapshot: Snapshot,
+        security: &crate::security::SecurityCatalog,
+        security_version: u64,
         principal: Option<&crate::auth::Principal>,
-    ) -> Result<AuthorizedReadSnapshot> {
-        let (security, security_version) = {
-            let catalog = self.catalog.read();
-            (catalog.security.clone(), catalog.security_version)
-        };
-        let handle = self.table(table)?;
-        let table_snapshot = {
-            let table = handle.lock();
-            table.snapshot()
-        };
-        let allowed_row_ids = if security.rls_enabled(table) {
-            // ponytail: full RLS universe scan; replace with policy-column candidate checks if RLS search throughput matters.
-            let cached = self.principal.read().clone();
-            let principal = principal
-                .or(cached.as_ref())
-                .ok_or(MongrelError::AuthRequired)?;
-            let mut roles = principal.roles.clone();
-            roles.sort_unstable();
-            let principal_key = format!("{}:{}:{roles:?}", principal.username, principal.is_admin);
-            let cache_key = (
-                table.to_string(),
-                table_snapshot.epoch.0,
-                security_version,
-                principal_key,
-            );
-            if let Some(allowed) = self.rls_cache.lock().get(&cache_key).cloned() {
-                return Ok(AuthorizedReadSnapshot {
-                    table_snapshot,
-                    security_version,
-                    allowed_row_ids: Some(allowed),
-                });
-            }
-            let rows = {
-                let table = handle.lock();
-                table.visible_rows(table_snapshot)?
-            };
-            let allowed: HashSet<_> = rows
-                .into_iter()
+    ) -> Result<Option<Arc<HashSet<RowId>>>> {
+        if !security.rls_enabled(table_name) {
+            return Ok(None);
+        }
+        let authorization_started = std::time::Instant::now();
+        let principal = principal.ok_or(MongrelError::AuthRequired)?;
+        let mut roles = principal.roles.clone();
+        roles.sort_unstable();
+        let principal_key = format!("{}:{}:{roles:?}", principal.username, principal.is_admin);
+        let cache_key = (
+            table_name.to_string(),
+            table.data_generation(),
+            security_version,
+            principal_key,
+        );
+        if let Some(allowed) = self.rls_cache.lock().get(&cache_key) {
+            crate::trace::QueryTrace::record(|trace| {
+                trace.rls_cache_hit = true;
+                trace.authorization_nanos = trace
+                    .authorization_nanos
+                    .saturating_add(authorization_started.elapsed().as_nanos() as u64);
+            });
+            return Ok(Some(allowed));
+        }
+        // ponytail: full RLS universe scan; replace with policy-column candidate checks if RLS search throughput matters.
+        let started = std::time::Instant::now();
+        let rows = table.visible_rows(table_snapshot)?;
+        let rows_evaluated = rows.len() as u64;
+        let allowed = Arc::new(
+            rows.into_iter()
                 .filter(|row| {
                     security.row_allowed(
-                        table,
+                        table_name,
                         crate::security::PolicyCommand::Select,
                         row,
                         principal,
@@ -1615,25 +1699,164 @@ impl Database {
                     )
                 })
                 .map(|row| row.row_id)
-                .collect();
-            let mut cache = self.rls_cache.lock();
-            if cache.len() >= 1024 {
-                cache.clear();
+                .collect(),
+        );
+        let mut cache = self.rls_cache.lock();
+        cache.build_nanos = cache
+            .build_nanos
+            .saturating_add(started.elapsed().as_nanos() as u64);
+        cache.rows_evaluated = cache.rows_evaluated.saturating_add(rows_evaluated);
+        cache.insert(cache_key, Arc::clone(&allowed));
+        crate::trace::QueryTrace::record(|trace| {
+            trace.rls_rows_evaluated = trace
+                .rls_rows_evaluated
+                .saturating_add(rows_evaluated as usize);
+            trace.authorization_nanos = trace
+                .authorization_nanos
+                .saturating_add(authorization_started.elapsed().as_nanos() as u64);
+        });
+        Ok(Some(allowed))
+    }
+
+    fn principal_for_authorized_read(
+        &self,
+        catalog: &Catalog,
+        principal: Option<&crate::auth::Principal>,
+        catalog_bound: bool,
+    ) -> Result<Option<crate::auth::Principal>> {
+        let principal = principal.cloned().or_else(|| self.principal.read().clone());
+        let Some(principal) = principal else {
+            return Ok(None);
+        };
+        if catalog_bound
+            || catalog
+                .users
+                .iter()
+                .any(|user| user.username == principal.username)
+        {
+            return Self::resolve_principal_from_catalog(catalog, &principal.username)
+                .map(Some)
+                .ok_or(MongrelError::AuthRequired);
+        }
+        Ok(Some(principal))
+    }
+
+    /// Run authorization, candidate generation, ranking, and materialization
+    /// while holding one table generation. Security changes cause a bounded
+    /// retry before any result is published.
+    pub fn with_authorized_read<T, F>(
+        &self,
+        table_name: &str,
+        principal: Option<&crate::auth::Principal>,
+        catalog_bound: bool,
+        mut read: F,
+    ) -> Result<T>
+    where
+        F: FnMut(
+            &mut Table,
+            Snapshot,
+            Option<&HashSet<RowId>>,
+            Option<&crate::auth::Principal>,
+        ) -> Result<T>,
+    {
+        const RETRIES: usize = 3;
+        let handle = self.table(table_name)?;
+        for attempt in 0..RETRIES {
+            crate::trace::QueryTrace::record(|trace| {
+                trace.authorization_retries = attempt;
+            });
+            let (security, security_version, effective_principal) = {
+                let catalog = self.catalog.read();
+                (
+                    catalog.security.clone(),
+                    catalog.security_version,
+                    self.principal_for_authorized_read(&catalog, principal, catalog_bound)?,
+                )
+            };
+            let result = {
+                let mut table = handle.lock();
+                let snapshot = table.snapshot();
+                let allowed = self.allowed_row_ids_locked(
+                    table_name,
+                    &table,
+                    snapshot,
+                    &security,
+                    security_version,
+                    effective_principal.as_ref(),
+                )?;
+                read(
+                    &mut table,
+                    snapshot,
+                    allowed.as_deref(),
+                    effective_principal.as_ref(),
+                )?
+            };
+            if self.catalog.read().security_version == security_version {
+                return Ok(result);
             }
-            cache.insert(cache_key, allowed.clone());
-            Some(allowed)
-        } else {
-            None
+            if attempt + 1 == RETRIES {
+                return Err(MongrelError::Conflict(
+                    "security policy changed during scored read".into(),
+                ));
+            }
+        }
+        unreachable!()
+    }
+
+    /// Capture one table snapshot and the security version used to authorize it.
+    /// The caller must validate the returned version before publishing results.
+    pub fn authorized_read_snapshot(
+        &self,
+        table: &str,
+        principal: Option<&crate::auth::Principal>,
+    ) -> Result<AuthorizedReadSnapshot> {
+        let (security, security_version, effective_principal) = {
+            let catalog = self.catalog.read();
+            (
+                catalog.security.clone(),
+                catalog.security_version,
+                self.principal_for_authorized_read(&catalog, principal, false)?,
+            )
+        };
+        let handle = self.table(table)?;
+        let (table_snapshot, data_generation, allowed_row_ids) = {
+            let table_handle = handle.lock();
+            let table_snapshot = table_handle.snapshot();
+            let data_generation = table_handle.data_generation();
+            let allowed = self.allowed_row_ids_locked(
+                table,
+                &table_handle,
+                table_snapshot,
+                &security,
+                security_version,
+                effective_principal.as_ref(),
+            )?;
+            (
+                table_snapshot,
+                data_generation,
+                allowed.map(|allowed| (*allowed).clone()),
+            )
         };
         Ok(AuthorizedReadSnapshot {
+            table: table.to_string(),
             table_snapshot,
+            data_generation,
             security_version,
             allowed_row_ids,
         })
     }
 
     pub fn authorized_read_snapshot_valid(&self, snapshot: &AuthorizedReadSnapshot) -> bool {
-        self.catalog.read().security_version == snapshot.security_version
+        if self.catalog.read().security_version != snapshot.security_version {
+            return false;
+        }
+        self.table(&snapshot.table)
+            .ok()
+            .is_some_and(|table| table.lock().data_generation() == snapshot.data_generation)
+    }
+
+    pub fn rls_cache_stats(&self) -> RlsCacheStats {
+        self.rls_cache.lock().stats()
     }
 
     /// Read visible rows with column authorization, RLS, and masks applied.
