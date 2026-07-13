@@ -189,7 +189,7 @@ jobs:
           cargo run --manifest-path crates/mongreldb-server/Cargo.toml --release -- "$RUNNER_TEMP/mongreldb-ai-wire" --port 8080 > "$QUAL_DIR/ai-wire-server.log" 2>&1 &
           server_pid=$!
           trap 'kill "$server_pid"' EXIT
-          for _ in {1..30}; do
+          for _ in {1..900}; do
             if curl --fail --silent http://127.0.0.1:8080/health >/dev/null; then
               break
             fi
