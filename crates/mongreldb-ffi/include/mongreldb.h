@@ -229,7 +229,7 @@ typedef struct {
 /* ── Condition struct ───────────────────────────────────────────────────── */
 
 typedef struct {
-    mongreldb_condition_kind kind;
+    int32_t kind;
     uint16_t column_id;
     int64_t int64_lo;
     int64_t int64_hi;
@@ -433,7 +433,7 @@ void mongreldb_result_free(mongreldb_result_t *r);
 mongreldb_ann_rerank_result_t *mongreldb_table_ann_rerank(
     mongreldb_table_t *t, uint16_t column_id,
     mongreldb_embedding_view query, size_t candidate_k, size_t limit,
-    mongreldb_vector_metric metric);
+    int32_t metric);
 size_t mongreldb_ann_rerank_result_count(mongreldb_ann_rerank_result_t *r);
 int32_t mongreldb_ann_rerank_result_hit(
     mongreldb_ann_rerank_result_t *r, size_t index,

@@ -4061,6 +4061,16 @@ impl Table {
         snapshot: Snapshot,
         authorized: Option<&std::collections::HashSet<RowId>>,
     ) -> Result<Vec<crate::query::SearchHit>> {
+        self.search_at_with_allowed_and_context(request, snapshot, authorized, None)
+    }
+
+    pub fn search_at_with_allowed_and_context(
+        &mut self,
+        request: &crate::query::SearchRequest,
+        snapshot: Snapshot,
+        authorized: Option<&std::collections::HashSet<RowId>>,
+        context: Option<&crate::query::AiExecutionContext>,
+    ) -> Result<Vec<crate::query::SearchHit>> {
         use crate::query::{
             ComponentScore, Condition, Fusion, SearchHit, MAX_FINAL_LIMIT, MAX_HARD_CONDITIONS,
             MAX_PROJECTION_COLUMNS, MAX_RETRIEVERS, MAX_RETRIEVER_WEIGHT,
@@ -4149,6 +4159,9 @@ impl Table {
         } else {
             let mut sets = Vec::with_capacity(request.must.len());
             for condition in &request.must {
+                if let Some(context) = context {
+                    context.checkpoint()?;
+                }
                 sets.push(self.resolve_condition(condition, snapshot)?);
             }
             Some(RowIdSet::intersect_many(sets))
@@ -4171,6 +4184,9 @@ impl Table {
         let mut fused: std::collections::HashMap<RowId, (f64, Vec<ComponentScore>)> =
             std::collections::HashMap::new();
         for named in retrievers {
+            if let Some(context) = context {
+                context.checkpoint()?;
+            }
             let hits = self.retrieve_filtered(
                 &named.retriever,
                 snapshot,
@@ -4179,11 +4195,19 @@ impl Table {
             )?;
             let fusion_started = std::time::Instant::now();
             for hit in hits {
+                if let Some(context) = context {
+                    context.consume(1)?;
+                }
                 let contribution = named.weight / (constant as f64 + hit.rank as f64);
                 if !contribution.is_finite() {
                     return Err(MongrelError::InvalidArgument(
                         "retriever contribution must be finite".into(),
                     ));
+                }
+                if !fused.contains_key(&hit.row_id)
+                    && fused.len() >= crate::query::MAX_FUSED_CANDIDATES
+                {
+                    return Err(MongrelError::WorkBudgetExceeded);
                 }
                 let entry = fused.entry(hit.row_id).or_default();
                 entry.0 += contribution;
@@ -4204,9 +4228,16 @@ impl Table {
         let union_size = fused.len();
         let mut ranked: Vec<_> = fused.into_iter().collect();
         let sort_started = std::time::Instant::now();
-        ranked.sort_by(|(a_row, (a_score, _)), (b_row, (b_score, _))| {
-            b_score.total_cmp(a_score).then_with(|| a_row.cmp(b_row))
-        });
+        let order =
+            |(a_row, (a_score, _)): &(RowId, (f64, Vec<ComponentScore>)),
+             (b_row, (b_score, _)): &(RowId, (f64, Vec<ComponentScore>))| {
+                b_score.total_cmp(a_score).then_with(|| a_row.cmp(b_row))
+            };
+        if ranked.len() > request.limit {
+            let (_, _, _) = ranked.select_nth_unstable_by(request.limit, order);
+            ranked.truncate(request.limit);
+        }
+        ranked.sort_by(order);
         fusion_nanos = fusion_nanos.saturating_add(sort_started.elapsed().as_nanos() as u64);
         crate::trace::QueryTrace::record(|trace| {
             trace.union_size = union_size;
@@ -4215,6 +4246,9 @@ impl Table {
 
         let projection_started = std::time::Instant::now();
         let row_ids: Vec<_> = ranked.iter().map(|(row_id, _)| row_id.0).collect();
+        if let Some(context) = context {
+            context.consume(row_ids.len().saturating_mul(projection.len().max(1)))?;
+        }
         let sentinel = projection
             .first()
             .copied()

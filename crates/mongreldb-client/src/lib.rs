@@ -118,6 +118,48 @@ pub struct MongrelClient {
     client: reqwest::blocking::Client,
 }
 
+impl MongrelClient {
+    /// Add a Bearer token to every request. Chain after `new` as a builder.
+    pub fn with_bearer_token(mut self, token: impl AsRef<str>) -> Self {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Ok(value) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token.as_ref())) {
+            headers.insert(reqwest::header::AUTHORIZATION, value);
+            self.client = reqwest::blocking::Client::builder()
+                .default_headers(headers)
+                .build()
+                .expect("valid reqwest default headers");
+        }
+        self
+    }
+
+    /// Add HTTP Basic credentials to every request. Chain after `new` as a builder.
+    pub fn with_basic_auth(mut self, username: impl AsRef<str>, password: impl AsRef<str>) -> Self {
+        let value = format!(
+            "Basic {}",
+            base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                format!("{}:{}", username.as_ref(), password.as_ref()),
+            )
+        );
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_str(&value).expect("valid basic auth header"),
+        );
+        self.client = reqwest::blocking::Client::builder()
+            .default_headers(headers)
+            .build()
+            .expect("valid reqwest basic auth client");
+        self
+    }
+}
+
+/// Async counterpart for Kit and health calls.
+pub struct AsyncMongrelClient {
+    base_url: String,
+    client: reqwest::Client,
+}
+
 #[derive(Serialize)]
 struct SqlReq {
     sql: String,
@@ -902,6 +944,80 @@ impl MongrelClient {
         }
         self.check(request.send()?)?;
         Ok(())
+    }
+}
+
+impl AsyncMongrelClient {
+    pub fn new(url: &str) -> Self {
+        Self {
+            base_url: url.trim_end_matches('/').to_string(),
+            client: reqwest::Client::new(),
+        }
+    }
+
+    pub fn with_bearer_token(mut self, token: impl AsRef<str>) -> Self {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token.as_ref()))
+                .expect("valid bearer auth header"),
+        );
+        self.client = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .expect("valid reqwest bearer auth client");
+        self
+    }
+
+    pub fn with_basic_auth(mut self, username: impl AsRef<str>, password: impl AsRef<str>) -> Self {
+        let value = format!(
+            "Basic {}",
+            base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                format!("{}:{}", username.as_ref(), password.as_ref()),
+            )
+        );
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_str(&value).expect("valid basic auth header"),
+        );
+        self.client = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .expect("valid reqwest basic auth client");
+        self
+    }
+
+    pub async fn health(&self) -> ClientResult<String> {
+        let response = self
+            .client
+            .get(format!("{}{path}", self.base_url, path = "/health"))
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(ClientError::Http {
+                status: response.status().as_u16(),
+                body: response.text().await.unwrap_or_default(),
+            });
+        }
+        Ok(response.text().await?)
+    }
+
+    pub async fn kit_search(&self, req: &KitSearchRequest) -> ClientResult<KitSearchResponse> {
+        let response = self
+            .client
+            .post(format!("{}{path}", self.base_url, path = "/kit/search"))
+            .json(req)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(ClientError::Http {
+                status: response.status().as_u16(),
+                body: response.text().await.unwrap_or_default(),
+            });
+        }
+        Ok(response.json().await?)
     }
 }
 

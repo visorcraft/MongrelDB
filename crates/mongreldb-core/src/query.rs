@@ -15,6 +15,61 @@ pub const MAX_SET_MEMBERS: usize = 65_536;
 pub const MAX_PROJECTION_COLUMNS: usize = 4_096;
 pub const MAX_HARD_CONDITIONS: usize = 256;
 pub const MAX_RETRIEVER_WEIGHT: f64 = 1_000_000.0;
+pub const MAX_FUSED_CANDIDATES: usize = 1_000_000;
+
+/// Cooperative deadline, cancellation, and work-budget state for expensive
+/// AI queries. Index loops call `checkpoint` and charge work with `consume`.
+#[derive(Debug, Clone)]
+pub struct AiExecutionContext {
+    deadline: Option<std::time::Instant>,
+    remaining_work: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl AiExecutionContext {
+    pub fn new(deadline: Option<std::time::Instant>, work_budget: usize) -> Self {
+        Self {
+            deadline,
+            remaining_work: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(work_budget)),
+            cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    pub fn with_timeout(timeout: std::time::Duration, work_budget: usize) -> Self {
+        Self::new(Some(std::time::Instant::now() + timeout), work_budget)
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn checkpoint(&self) -> crate::Result<()> {
+        if self.cancelled.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(crate::MongrelError::Cancelled);
+        }
+        if self
+            .deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            return Err(crate::MongrelError::DeadlineExceeded);
+        }
+        Ok(())
+    }
+
+    pub fn consume(&self, work: usize) -> crate::Result<()> {
+        self.checkpoint()?;
+        let result = self.remaining_work.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |remaining| remaining.checked_sub(work),
+        );
+        if result.is_err() {
+            return Err(crate::MongrelError::WorkBudgetExceeded);
+        }
+        self.checkpoint()
+    }
+}
 
 /// One predicate over the row-id space.
 #[derive(Debug, Clone)]
@@ -598,5 +653,26 @@ mod tests {
             canonical_query_key(&a.conditions, Some(&proj), e),
             canonical_query_key(&a.conditions, Some(&proj_rev), e),
         );
+
+        let budget = AiExecutionContext::new(None, 2);
+        budget.consume(1).unwrap();
+        assert!(matches!(
+            budget.consume(2),
+            Err(crate::MongrelError::WorkBudgetExceeded)
+        ));
+        budget.cancel();
+        assert!(matches!(
+            budget.checkpoint(),
+            Err(crate::MongrelError::Cancelled)
+        ));
+
+        let expired = AiExecutionContext::new(
+            Some(std::time::Instant::now() - std::time::Duration::from_millis(1)),
+            1,
+        );
+        assert!(matches!(
+            expired.checkpoint(),
+            Err(crate::MongrelError::DeadlineExceeded)
+        ));
     }
 }

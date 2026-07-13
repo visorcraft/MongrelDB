@@ -264,7 +264,7 @@ fn ffi_exact_ann_rerank_returns_scored_hit() {
             },
             2,
             1,
-            mongreldb_vector_metric::Cosine,
+            mongreldb_vector_metric::Cosine as i32,
         );
         assert!(
             !result.is_null(),
@@ -277,6 +277,19 @@ fn ffi_exact_ann_rerank_returns_scored_hit() {
         assert_eq!(hit.row_id, first_row_id);
         assert_eq!(hit.exact_score, 1.0);
         mongreldb_ann_rerank_result_free(result);
+
+        let invalid = mongreldb_table_ann_rerank(
+            table,
+            2,
+            EmbeddingSlice {
+                data: query.as_ptr(),
+                len: query.len(),
+            },
+            2,
+            1,
+            99,
+        );
+        assert!(invalid.is_null());
 
         mongreldb_table_free(table);
         mongreldb_database_free(db);

@@ -53,6 +53,9 @@ fn status_for_error(e: &mongreldb_core::MongrelError) -> StatusCode {
         MongrelError::Conflict(_) => StatusCode::CONFLICT,
         MongrelError::ReadOnlyReplica => StatusCode::CONFLICT,
         MongrelError::NotFound(_) => StatusCode::NOT_FOUND,
+        MongrelError::DeadlineExceeded
+        | MongrelError::WorkBudgetExceeded
+        | MongrelError::Cancelled => StatusCode::CONFLICT,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }

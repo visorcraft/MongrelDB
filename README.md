@@ -7,7 +7,7 @@
 <p align="center">
   <b>A log-structured columnar database for sub-millisecond writes, learned indexes, and AI-native access.</b>
   <br />
-  Custom <code>.sr</code> columnar format · Bε-tree memtable · WAL with group commit · six secondary index kinds · exact ANN reranking · multi-index intersection · MVCC snapshots · page-level encryption · declarative constraints · user/role auth · credential enforcement · replication · change data capture · DataFusion SQL · recursive CTEs · window functions · CREATE TABLE AS SELECT · materialized views · multi-statement SQL · FTS ranking · NAPI addon
+  Custom <code>.sr</code> columnar format · Bε-tree memtable · WAL with group commit · eight secondary index kinds · exact ANN reranking · multi-index intersection · MVCC snapshots · page-level encryption · declarative constraints · user/role auth · credential enforcement · replication · change data capture · DataFusion SQL · recursive CTEs · window functions · CREATE TABLE AS SELECT · materialized views · multi-statement SQL · FTS ranking · NAPI addon
 </p>
 
 <p align="center">
@@ -196,6 +196,11 @@ AI retrieval availability:
 | NAPI embedded | Yes | No typed helper | Yes | No typed helper | No typed helper |
 | C FFI | Yes | No typed helper | Yes | No typed helper | No typed helper |
 | Rust HTTP client | Yes | Yes | Yes | Yes | Yes |
+
+Credentialed NAPI and C FFI typed reads use the same row-level security and
+column-mask checks as the core API. Raw `Table` access remains an explicit
+in-process, policy-unaware engine API. `MongrelClient` and
+`AsyncMongrelClient` support Bearer and HTTP Basic auth builders.
   Use `--daemon` to run in the background, or deploy with
   systemd/Docker/supervisord for auto-restart. See
   [Daemon Mode](docs/08-daemon.md#running-as-a-daemon---daemon-mode) for details.
@@ -361,14 +366,14 @@ Prebuilt `libmongreldb` (core engine), `libmongreldb_kit` (Kit layer), and `libm
 
 | Platform | C/C++ archives | JVM JAR |
 |---|---|---|
-| Linux x64 (glibc) | `mongreldb-native-linux-x64-gnu.tar.gz` + `mongreldb-kit-native-linux-x64-gnu.tar.gz` | `mongreldb-jni-0.52.1-linux-x64.jar` |
-| Linux x64 (musl) | `mongreldb-native-linux-x64-musl.tar.gz` + `mongreldb-kit-native-linux-x64-musl.tar.gz` | `mongreldb-jni-0.52.1-linux-x64-musl.jar` |
-| Linux arm64 (glibc) | `mongreldb-native-linux-arm64-gnu.tar.gz` + `mongreldb-kit-native-linux-arm64-gnu.tar.gz` | `mongreldb-jni-0.52.1-linux-arm64.jar` |
-| macOS arm64 | `mongreldb-native-darwin-arm64.tar.gz` + `mongreldb-kit-native-darwin-arm64.tar.gz` | `mongreldb-jni-0.52.1-darwin-arm64.jar` |
-| macOS x64 | `mongreldb-native-darwin-x64.tar.gz` + `mongreldb-kit-native-darwin-x64.tar.gz` | `mongreldb-jni-0.52.1-darwin-x64.jar` |
-| Windows x64 | `mongreldb-native-windows-x64.zip` + `mongreldb-kit-native-windows-x64.zip` | `mongreldb-jni-0.52.1-windows-x64.jar` |
+| Linux x64 (glibc) | `mongreldb-native-linux-x64-gnu.tar.gz` + `mongreldb-kit-native-linux-x64-gnu.tar.gz` | `mongreldb-jni-0.52.2-linux-x64.jar` |
+| Linux x64 (musl) | `mongreldb-native-linux-x64-musl.tar.gz` + `mongreldb-kit-native-linux-x64-musl.tar.gz` | `mongreldb-jni-0.52.2-linux-x64-musl.jar` |
+| Linux arm64 (glibc) | `mongreldb-native-linux-arm64-gnu.tar.gz` + `mongreldb-kit-native-linux-arm64-gnu.tar.gz` | `mongreldb-jni-0.52.2-linux-arm64.jar` |
+| macOS arm64 | `mongreldb-native-darwin-arm64.tar.gz` + `mongreldb-kit-native-darwin-arm64.tar.gz` | `mongreldb-jni-0.52.2-darwin-arm64.jar` |
+| macOS x64 | `mongreldb-native-darwin-x64.tar.gz` + `mongreldb-kit-native-darwin-x64.tar.gz` | `mongreldb-jni-0.52.2-darwin-x64.jar` |
+| Windows x64 | `mongreldb-native-windows-x64.zip` + `mongreldb-kit-native-windows-x64.zip` | `mongreldb-jni-0.52.2-windows-x64.jar` |
 
-A fat JAR (`mongreldb-jni-0.52.1.jar`) with all platforms bundled is also published. Each C/C++ archive contains `lib/` (shared + static libraries) and `include/` (the C header). Download from the [releases page](https://github.com/visorcraft/MongrelDB/releases). See the C, C++, .NET, Java, Kotlin, and Scala client READMEs for linking instructions.
+A fat JAR (`mongreldb-jni-0.52.2.jar`) with all platforms bundled is also published. Each C/C++ archive contains `lib/` (shared + static libraries) and `include/` (the C header). Download from the [releases page](https://github.com/visorcraft/MongrelDB/releases). See the C, C++, .NET, Java, Kotlin, and Scala client READMEs for linking instructions.
 
 ## Node.js addon
 

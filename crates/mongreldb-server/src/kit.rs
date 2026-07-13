@@ -1111,14 +1111,11 @@ pub async fn kit_ai_metrics(
     OptionalPrincipal(principal): OptionalPrincipal,
 ) -> Response {
     let principal = request_principal(&state, &principal);
-    if !principal.as_ref().is_some_and(|principal| principal.is_admin) {
-        return kit_core_error(&MongrelError::PermissionDenied {
-            required: mongreldb_core::Permission::Admin,
-            principal: principal
-                .as_ref()
-                .map(|principal| principal.username.clone())
-                .unwrap_or_else(|| "anonymous".into()),
-        });
+    if let Err(error) = state
+        .db
+        .require_for(principal.as_ref(), &mongreldb_core::Permission::Admin)
+    {
+        return kit_core_error(&error);
     }
     let stats = state.db.rls_cache_stats();
     Json(json!({
@@ -1255,20 +1252,18 @@ pub async fn kit_search(
     Json(req): Json<KitSearchRequest>,
 ) -> Response {
     let principal = request_principal(&state, &principal);
-    if req.explain && !principal.as_ref().is_some_and(|principal| principal.is_admin) {
-        return kit_core_error(&MongrelError::PermissionDenied {
-            required: mongreldb_core::Permission::Admin,
-            principal: principal
-                .as_ref()
-                .map(|principal| principal.username.clone())
-                .unwrap_or_else(|| "anonymous".into()),
-        });
+    if req.explain {
+        if let Err(error) = state
+            .db
+            .require_for(principal.as_ref(), &mongreldb_core::Permission::Admin)
+        {
+            return kit_core_error(&error);
+        }
     }
     let deadline_ms = req.deadline_ms.unwrap_or(30_000);
     if deadline_ms == 0 || deadline_ms > 60_000 {
         return kit_bad_request("deadline_ms must be between 1 and 60000".into());
     }
-    let started = std::time::Instant::now();
     let handle = match state.db.table(&req.table) {
         Ok(handle) => handle,
         Err(error) => return kit_core_error(&error),
@@ -1364,13 +1359,22 @@ pub async fn kit_search(
         limit: req.limit,
         projection: req.projection.clone(),
     };
+    let context = mongreldb_core::query::AiExecutionContext::with_timeout(
+        std::time::Duration::from_millis(deadline_ms),
+        max_work,
+    );
     let (result, trace) = mongreldb_core::trace::QueryTrace::capture(|| {
         retry_authorized(
             &state,
             &req.table,
             principal.as_ref(),
             |table, snapshot, allowed, effective_principal| {
-                let hits = table.search_at(&request, snapshot, allowed)?;
+                let hits = table.search_at_with_allowed_and_context(
+                    &request,
+                    snapshot,
+                    allowed,
+                    Some(&context),
+                )?;
                 let row_ids: Vec<_> = hits.iter().map(|hit| hit.row_id.0).collect();
                 let rows = table.rows_for_rids(&row_ids, snapshot)?;
                 let secured = state
@@ -1384,10 +1388,8 @@ pub async fn kit_search(
         Ok(result) => result,
         Err(error) => return kit_core_error(&error),
     };
-    if started.elapsed().as_millis() > u128::from(deadline_ms) {
-        return kit_core_error(&MongrelError::Conflict(
-            "AI query deadline exceeded".into(),
-        ));
+    if let Err(error) = context.checkpoint() {
+        return kit_core_error(&error);
     }
     let secured: std::collections::HashMap<_, _> =
         secured.into_iter().map(|row| (row.row_id, row)).collect();

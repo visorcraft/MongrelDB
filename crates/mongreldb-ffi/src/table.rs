@@ -34,16 +34,6 @@ pub enum mongreldb_vector_metric {
     Euclidean = 2,
 }
 
-impl From<mongreldb_vector_metric> for VectorMetric {
-    fn from(value: mongreldb_vector_metric) -> Self {
-        match value {
-            mongreldb_vector_metric::Cosine => Self::Cosine,
-            mongreldb_vector_metric::DotProduct => Self::DotProduct,
-            mongreldb_vector_metric::Euclidean => Self::Euclidean,
-        }
-    }
-}
-
 /// One exact ANN rerank hit.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -407,9 +397,11 @@ pub unsafe extern "C" fn mongreldb_table_query(
             return std::ptr::null_mut();
         }
     };
-    let mut g = handle.lock();
-    let schema = g.schema().clone();
-    let rows = match g.query_cached(&core_query) {
+    let schema = handle.lock().schema().clone();
+    let rows = match table
+        .db
+        .query_for_current_principal(&table.name, &core_query, projection.as_deref())
+    {
         Ok(r) => r,
         Err(e) => {
             set_error(&e);
@@ -461,27 +453,35 @@ pub unsafe extern "C" fn mongreldb_table_ann_rerank(
     query: EmbeddingSlice,
     candidate_k: usize,
     limit: usize,
-    metric: mongreldb_vector_metric,
+    metric: i32,
 ) -> mongreldb_ann_rerank_result_t {
     clear();
     let Some(table) = as_table(t) else {
         return std::ptr::null_mut();
+    };
+    let metric = match metric {
+        0 => VectorMetric::Cosine,
+        1 => VectorMetric::DotProduct,
+        2 => VectorMetric::Euclidean,
+        value => {
+            set_error_msg(
+                ErrorCode::InvalidArgument,
+                format!("invalid vector metric {value}; expected 0, 1, or 2"),
+            );
+            return std::ptr::null_mut();
+        }
     };
     let request = AnnRerankRequest {
         column_id,
         query: query.to_vec(),
         candidate_k,
         limit,
-        metric: metric.into(),
+        metric,
     };
-    let handle = match table.db.table(&table.name) {
-        Ok(handle) => handle,
-        Err(error) => {
-            set_error(&error);
-            return std::ptr::null_mut();
-        }
-    };
-    let hits = match handle.lock().ann_rerank(&request) {
+    let hits = match table
+        .db
+        .ann_rerank_for_current_principal(&table.name, &request)
+    {
         Ok(hits) => hits,
         Err(error) => {
             set_error(&error);
@@ -560,12 +560,10 @@ pub unsafe extern "C" fn mongreldb_table_count(t: mongreldb_table_t, out_count: 
     if out_count.is_null() {
         return set_error_msg(ErrorCode::InvalidArgument, "out_count is null").as_return();
     }
-    let handle = match table.db.table(&table.name) {
-        Ok(h) => h,
-        Err(e) => return set_error(&e).as_return(),
+    *out_count = match table.db.count_for(&table.name, None) {
+        Ok(count) => count,
+        Err(error) => return set_error(&error).as_return(),
     };
-    let g = handle.lock();
-    *out_count = g.count();
     0
 }
 

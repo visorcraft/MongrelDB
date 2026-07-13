@@ -96,7 +96,8 @@ impl Default for SparseTermArray {
 /// matching payload field(s); unused fields are ignored.
 #[repr(C)]
 pub struct mongreldb_condition {
-    pub kind: mongreldb_condition_kind,
+    /// C ABI integer. Invalid values are rejected before dispatch.
+    pub kind: i32,
     /// Column id the condition applies to (ignored for `Pk`).
     pub column_id: u16,
     /// Integer range bounds (lo/hi). Used by `RangeInt` and `Pk` (int64 PK in
@@ -128,7 +129,7 @@ pub struct mongreldb_condition {
 impl Default for mongreldb_condition {
     fn default() -> Self {
         Self {
-            kind: mongreldb_condition_kind::Pk,
+            kind: mongreldb_condition_kind::Pk as i32,
             column_id: 0,
             int64_lo: 0,
             int64_hi: 0,
@@ -152,8 +153,29 @@ impl Default for mongreldb_condition {
 /// # Safety
 /// All pointers inside `c` must be valid for their lengths.
 pub unsafe fn build_condition(c: &mongreldb_condition) -> Result<Condition, ErrorCode> {
+    let kind = match c.kind {
+        0 => mongreldb_condition_kind::Pk,
+        1 => mongreldb_condition_kind::BitmapEq,
+        2 => mongreldb_condition_kind::BitmapIn,
+        3 => mongreldb_condition_kind::BytesPrefix,
+        4 => mongreldb_condition_kind::Ann,
+        5 => mongreldb_condition_kind::FmContains,
+        6 => mongreldb_condition_kind::FmContainsAll,
+        7 => mongreldb_condition_kind::RangeInt,
+        8 => mongreldb_condition_kind::RangeF64,
+        9 => mongreldb_condition_kind::SparseMatch,
+        10 => mongreldb_condition_kind::MinHashSimilar,
+        11 => mongreldb_condition_kind::IsNull,
+        12 => mongreldb_condition_kind::IsNotNull,
+        value => {
+            return Err(set_error_msg(
+                ErrorCode::InvalidArgument,
+                format!("invalid condition kind {value}"),
+            ));
+        }
+    };
     if matches!(
-        c.kind,
+        kind,
         mongreldb_condition_kind::Ann
             | mongreldb_condition_kind::SparseMatch
             | mongreldb_condition_kind::MinHashSimilar
@@ -173,7 +195,7 @@ pub unsafe fn build_condition(c: &mongreldb_condition) -> Result<Condition, Erro
             "condition cardinality exceeds the public query limit",
         ));
     }
-    Ok(match c.kind {
+    Ok(match kind {
         mongreldb_condition_kind::Pk => {
             let key = c.bytes.to_vec();
             Condition::Pk(key)
@@ -586,7 +608,7 @@ mod tests {
                 0
             );
             let condition = mongreldb_condition {
-                kind: mongreldb_condition_kind::Ann,
+                kind: mongreldb_condition_kind::Ann as i32,
                 column_id: 2,
                 k: MAX_RETRIEVER_K as u32 + 1,
                 embedding: EmbeddingSlice { data: &1.0, len: 1 },

@@ -1803,6 +1803,104 @@ impl Database {
         unreachable!()
     }
 
+    /// Execute a native conjunctive read with the database principal's row
+    /// policy, column grants, and masks applied. Raw [`Table`] methods remain
+    /// policy-unaware; language bindings must use this boundary for reads.
+    pub fn query_for_current_principal(
+        &self,
+        table_name: &str,
+        query: &crate::query::Query,
+        projection: Option<&[u16]>,
+    ) -> Result<Vec<crate::memtable::Row>> {
+        let condition_columns = crate::query::condition_columns(&query.conditions);
+        self.with_authorized_read(
+            table_name,
+            None,
+            true,
+            |table, snapshot, allowed, principal| {
+                let allowed_columns = self.select_column_ids_for(table_name, principal)?;
+                self.require_columns_for(
+                    table_name,
+                    crate::auth::ColumnOperation::Select,
+                    &condition_columns,
+                    principal,
+                )?;
+                if let Some(projection) = projection {
+                    self.require_columns_for(
+                        table_name,
+                        crate::auth::ColumnOperation::Select,
+                        projection,
+                        principal,
+                    )?;
+                }
+                let mut rows = table.query_at_with_allowed(query, snapshot, allowed)?;
+                let projection =
+                    projection.map(|columns| columns.iter().copied().collect::<HashSet<_>>());
+                for row in &mut rows {
+                    row.columns.retain(|column, _| {
+                        allowed_columns.contains(column)
+                            && projection
+                                .as_ref()
+                                .map_or(true, |projection| projection.contains(column))
+                    });
+                }
+                self.secure_rows_for(table_name, rows, principal)
+            },
+        )
+    }
+
+    /// Read one row with the database principal's row policy, column grants,
+    /// and masks applied.
+    pub fn get_for_current_principal(
+        &self,
+        table_name: &str,
+        row_id: RowId,
+    ) -> Result<Option<crate::memtable::Row>> {
+        self.with_authorized_read(
+            table_name,
+            None,
+            true,
+            |table, snapshot, allowed, principal| {
+                let allowed_columns = self.select_column_ids_for(table_name, principal)?;
+                let Some(row) = table.get(row_id, snapshot) else {
+                    return Ok(None);
+                };
+                if allowed.is_some_and(|allowed| !allowed.contains(&row.row_id)) {
+                    return Ok(None);
+                }
+                let mut rows = self.secure_rows_for(table_name, vec![row], principal)?;
+                if let Some(row) = rows.first_mut() {
+                    row.columns
+                        .retain(|column, _| allowed_columns.contains(column));
+                }
+                Ok(rows.pop())
+            },
+        )
+    }
+
+    /// Run exact ANN reranking over only rows authorized for this database
+    /// handle. The embedding column still requires normal column access.
+    pub fn ann_rerank_for_current_principal(
+        &self,
+        table_name: &str,
+        request: &crate::query::AnnRerankRequest,
+    ) -> Result<Vec<crate::query::AnnRerankHit>> {
+        self.with_authorized_read(
+            table_name,
+            None,
+            true,
+            |table, snapshot, allowed, principal| {
+                self.require_columns_for(
+                    table_name,
+                    crate::auth::ColumnOperation::Select,
+                    &[request.column_id],
+                    principal,
+                )?;
+                table.ann_rerank_at(request, snapshot, allowed)
+            },
+        )
+    }
+
     /// Capture one table snapshot and the security version used to authorize it.
     /// The caller must validate the returned version before publishing results.
     pub fn authorized_read_snapshot(

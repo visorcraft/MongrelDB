@@ -2051,49 +2051,47 @@ impl TableHandle {
     /// Live row count (O(1)).
     #[napi]
     pub fn count(&self) -> napi::Result<BigInt> {
-        let handle = self.db.table(&self.name).map_err(to_napi)?;
-        let g = handle.lock();
-        Ok(BigInt::from(g.count()))
+        self.db
+            .count_for(&self.name, None)
+            .map(BigInt::from)
+            .map_err(to_napi)
     }
 
     /// Count rows matching a native conjunctive predicate without materializing rows when possible.
     #[napi]
     pub fn count_where(&self, conditions: Vec<ConditionSpec>) -> napi::Result<BigInt> {
-        let handle = self.db.table(&self.name).map_err(to_napi)?;
-        let mut g = handle.lock();
-        if conditions.is_empty() {
-            return Ok(BigInt::from(g.count()));
-        }
         let core_conditions = build_conditions(&conditions)?;
-        let snap = g.snapshot();
-        if let Some(count) = g
-            .count_conditions(&core_conditions, snap)
-            .map_err(to_napi)?
-        {
-            return Ok(BigInt::from(count));
-        }
         let q = build_query_from_conditions(core_conditions);
-        let rows = g.query_cached(&q).map_err(to_napi)?;
+        let rows = self
+            .db
+            .query_for_current_principal(&self.name, &q, None)
+            .map_err(to_napi)?;
         Ok(BigInt::from(rows.len() as u64))
     }
 
     /// Point read by row id.
     #[napi]
     pub fn get(&self, row_id: BigInt) -> napi::Result<Option<RowJs>> {
+        let rid = RowId(bigint_to_u64(&row_id)?);
+        let row = self
+            .db
+            .get_for_current_principal(&self.name, rid)
+            .map_err(to_napi)?;
         let handle = self.db.table(&self.name).map_err(to_napi)?;
         let g = handle.lock();
-        let snap = g.snapshot();
-        Ok(g.get(RowId(bigint_to_u64(&row_id)?), snap)
-            .map(|r| row_to_js_table(&g, &r)))
+        Ok(row.as_ref().map(|r| row_to_js_table(&g, r)))
     }
 
     /// Point read by a text primary key.
     #[napi]
     pub fn get_by_pk_text(&self, text: String) -> napi::Result<Option<RowJs>> {
-        let handle = self.db.table(&self.name).map_err(to_napi)?;
-        let mut g = handle.lock();
         let q = Query::pk(text.into_bytes());
-        let rows = g.query_cached(&q).map_err(to_napi)?;
+        let rows = self
+            .db
+            .query_for_current_principal(&self.name, &q, None)
+            .map_err(to_napi)?;
+        let handle = self.db.table(&self.name).map_err(to_napi)?;
+        let g = handle.lock();
         Ok(rows.first().map(|r| row_to_js_table(&g, r)))
     }
 
@@ -2115,10 +2113,13 @@ impl TableHandle {
     /// Point read by an Int64 primary key.
     #[napi]
     pub fn get_by_pk_int64(&self, value: BigInt) -> napi::Result<Option<RowJs>> {
-        let handle = self.db.table(&self.name).map_err(to_napi)?;
-        let mut g = handle.lock();
         let q = Query::pk(bigint_to_i64(&value)?.to_be_bytes().to_vec());
-        let rows = g.query_cached(&q).map_err(to_napi)?;
+        let rows = self
+            .db
+            .query_for_current_principal(&self.name, &q, None)
+            .map_err(to_napi)?;
+        let handle = self.db.table(&self.name).map_err(to_napi)?;
+        let g = handle.lock();
         Ok(rows.first().map(|r| row_to_js_table(&g, r)))
     }
 
@@ -2167,10 +2168,11 @@ impl TableHandle {
     /// Hybrid index query.
     #[napi]
     pub fn query(&self, conditions: Vec<ConditionSpec>) -> napi::Result<Vec<RowJs>> {
-        let handle = self.db.table(&self.name).map_err(to_napi)?;
-        let mut g = handle.lock();
         let q = build_query_from_conditions(build_conditions(&conditions)?);
-        let rows = g.query_cached(&q).map_err(to_napi)?;
+        let rows = self
+            .db
+            .query_for_current_principal(&self.name, &q, None)
+            .map_err(to_napi)?;
         if rows.len() > mongreldb_core::query::MAX_FINAL_LIMIT {
             return Err(napi::Error::new(
                 napi::Status::InvalidArg,
@@ -2180,6 +2182,8 @@ impl TableHandle {
                 ),
             ));
         }
+        let handle = self.db.table(&self.name).map_err(to_napi)?;
+        let g = handle.lock();
         Ok(rows.iter().map(|r| row_to_js_table(&g, r)).collect())
     }
 
@@ -2213,12 +2217,15 @@ impl TableHandle {
                 "query offset must be a safe non-negative integer",
             ));
         }
-        let handle = self.db.table(&self.name).map_err(to_napi)?;
-        let mut g = handle.lock();
         let q = build_query_from_conditions(build_conditions(&conditions)?)
             .with_limit(limit)
             .with_offset(offset as usize);
-        let rows = g.query_cached(&q).map_err(to_napi)?;
+        let rows = self
+            .db
+            .query_for_current_principal(&self.name, &q, None)
+            .map_err(to_napi)?;
+        let handle = self.db.table(&self.name).map_err(to_napi)?;
+        let g = handle.lock();
         Ok(rows.iter().map(|r| row_to_js_table(&g, r)).collect())
     }
 
@@ -2252,10 +2259,8 @@ impl TableHandle {
                 })
             })
             .collect::<napi::Result<Vec<_>>>()?;
-        let handle = self.db.table(&self.name).map_err(to_napi)?;
-        let mut table = handle.lock();
-        table
-            .ann_rerank(&AnnRerankRequest {
+        self.db
+            .ann_rerank_for_current_principal(&self.name, &AnnRerankRequest {
                 column_id,
                 query,
                 candidate_k: candidate_k as usize,
@@ -2413,8 +2418,8 @@ impl TableHandle {
     #[napi]
     pub fn query_arrow(&self, conditions: Vec<ConditionSpec>) -> napi::Result<Buffer> {
         let handle = self.db.table(&self.name).map_err(to_napi)?;
-        let mut g = handle.lock();
-        query_arrow_inner(&mut g, &conditions)
+        let g = handle.lock();
+        query_arrow_inner(&self.db, &self.name, &g, &conditions)
     }
 
     // ── async variants ──
@@ -2457,9 +2462,7 @@ impl TableHandle {
         let db = Arc::clone(&self.db);
         let name = self.name.clone();
         napi::bindgen_prelude::spawn_blocking(move || {
-            let handle = db.table(&name).map_err(to_napi)?;
-            let g = handle.lock();
-            Ok(BigInt::from(g.count()))
+            db.count_for(&name, None).map(BigInt::from).map_err(to_napi)
         })
         .await
         .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e:?}")))?
@@ -2497,11 +2500,12 @@ impl TableHandle {
         let name = self.name.clone();
         let row_id_u64 = bigint_to_u64(&row_id)?;
         napi::bindgen_prelude::spawn_blocking(move || -> napi::Result<Option<RowJs>> {
+            let row = db
+                .get_for_current_principal(&name, RowId(row_id_u64))
+                .map_err(to_napi)?;
             let handle = db.table(&name).map_err(to_napi)?;
             let g = handle.lock();
-            let snap = g.snapshot();
-            Ok(g.get(RowId(row_id_u64), snap)
-                .map(|r| row_to_js_table(&g, &r)))
+            Ok(row.as_ref().map(|r| row_to_js_table(&g, r)))
         })
         .await
         .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e:?}")))?
@@ -2512,10 +2516,12 @@ impl TableHandle {
         let db = Arc::clone(&self.db);
         let name = self.name.clone();
         napi::bindgen_prelude::spawn_blocking(move || -> napi::Result<Vec<RowJs>> {
-            let handle = db.table(&name).map_err(to_napi)?;
-            let mut g = handle.lock();
             let q = build_query_from_conditions(build_conditions(&conditions)?);
-            let rows = g.query_cached(&q).map_err(to_napi)?;
+            let rows = db
+                .query_for_current_principal(&name, &q, None)
+                .map_err(to_napi)?;
+            let handle = db.table(&name).map_err(to_napi)?;
+            let g = handle.lock();
             Ok(rows.iter().map(|r| row_to_js_table(&g, r)).collect())
         })
         .await
@@ -2541,8 +2547,8 @@ impl TableHandle {
         let name = self.name.clone();
         napi::bindgen_prelude::spawn_blocking(move || -> napi::Result<Buffer> {
             let handle = db.table(&name).map_err(to_napi)?;
-            let mut g = handle.lock();
-            query_arrow_inner(&mut g, &conditions)
+            let g = handle.lock();
+            query_arrow_inner(&db, &name, &g, &conditions)
         })
         .await
         .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e:?}")))?
@@ -2552,7 +2558,9 @@ impl TableHandle {
 /// Shared body for `query_arrow` / `query_arrow_async`: resolve the conditions
 /// to native columns under a fresh snapshot and serialize them to Arrow IPC.
 fn query_arrow_inner(
-    g: &mut mongreldb_core::Table,
+    db: &CoreDatabase,
+    table_name: &str,
+    g: &mongreldb_core::Table,
     conditions: &[ConditionSpec],
 ) -> napi::Result<Buffer> {
     if conditions.is_empty() {
@@ -2565,16 +2573,11 @@ fn query_arrow_inner(
     for c in conditions {
         conds.push(build_condition(c)?);
     }
-    let snap = g.snapshot();
-    let proj: Vec<u16> = g.schema().columns.iter().map(|c| c.id).collect();
-    let cols = g
-        .query_columns_native(&conds, Some(&proj), snap)
+    let query = build_query_from_conditions(conds);
+    let rows = db
+        .query_for_current_principal(table_name, &query, None)
         .map_err(to_napi)?;
-    if cols
-        .as_ref()
-        .and_then(|columns| columns.first())
-        .is_some_and(|(_, column)| column.len() > mongreldb_core::query::MAX_FINAL_LIMIT)
-    {
+    if rows.len() > mongreldb_core::query::MAX_FINAL_LIMIT {
         return Err(napi::Error::new(
             napi::Status::InvalidArg,
             format!(
@@ -2583,10 +2586,11 @@ fn query_arrow_inner(
             ),
         ));
     }
-    match cols {
-        Some(cols) => Ok(Buffer::from(native_cols_to_ipc(&cols, g.schema())?)),
-        None => Ok(Buffer::from(Vec::new())),
+    if rows.is_empty() {
+        return Ok(Buffer::from(Vec::new()));
     }
+    let cols = rows_to_native_cols(&rows, g.schema());
+    Ok(Buffer::from(native_cols_to_ipc(&cols, g.schema())?))
 }
 
 /// A cross-table transaction (P5.2). Stage puts/deletes across tables; commit
@@ -3534,6 +3538,99 @@ impl RemoteDatabase {
 }
 
 // ── Phase 20.4 helpers ────────────────────────────────────────────────────
+
+fn rows_to_native_cols(
+    rows: &[mongreldb_core::memtable::Row],
+    schema: &mongreldb_core::schema::Schema,
+) -> Vec<(u16, mongreldb_core::columnar::NativeColumn)> {
+    use mongreldb_core::columnar::NativeColumn;
+    use mongreldb_core::schema::TypeId;
+    let validity = |values: &[Option<()>]| {
+        let mut bits = vec![0u8; values.len().div_ceil(8)];
+        for (index, value) in values.iter().enumerate() {
+            if value.is_some() {
+                bits[index / 8] |= 1 << (index % 8);
+            }
+        }
+        bits
+    };
+    schema
+        .columns
+        .iter()
+        .map(|column| {
+            let column_id = column.id;
+            let values = rows
+                .iter()
+                .map(|row| row.columns.get(&column.id))
+                .collect::<Vec<_>>();
+            let native = match column.ty {
+                TypeId::Int64 | TypeId::TimestampNanos | TypeId::Date32 => {
+                    let values = values
+                        .iter()
+                        .map(|value| value.and_then(|value| match value {
+                            Value::Int64(value) => Some(*value),
+                            _ => None,
+                        }))
+                        .collect::<Vec<_>>();
+                    NativeColumn::Int64 {
+                        validity: validity(&values.iter().map(|value| value.map(|_| ())).collect::<Vec<_>>()),
+                        data: values.into_iter().map(|value| value.unwrap_or_default()).collect(),
+                    }
+                }
+                TypeId::Float64 => {
+                    let values = values
+                        .iter()
+                        .map(|value| value.and_then(|value| match value {
+                            Value::Float64(value) => Some(*value),
+                            _ => None,
+                        }))
+                        .collect::<Vec<_>>();
+                    NativeColumn::Float64 {
+                        validity: validity(&values.iter().map(|value| value.map(|_| ())).collect::<Vec<_>>()),
+                        data: values.into_iter().map(|value| value.unwrap_or_default()).collect(),
+                    }
+                }
+                TypeId::Bool => {
+                    let values = values
+                        .iter()
+                        .map(|value| value.and_then(|value| match value {
+                            Value::Bool(value) => Some(*value as u8),
+                            _ => None,
+                        }))
+                        .collect::<Vec<_>>();
+                    NativeColumn::Bool {
+                        validity: validity(&values.iter().map(|value| value.map(|_| ())).collect::<Vec<_>>()),
+                        data: values.into_iter().map(|value| value.unwrap_or_default()).collect(),
+                    }
+                }
+                _ => {
+                    let values = values
+                        .iter()
+                        .map(|value| value.and_then(|value| match value {
+                            Value::Bytes(value) | Value::Json(value) => Some(value.as_slice()),
+                            _ => None,
+                        }))
+                        .collect::<Vec<_>>();
+                    let mut offsets = Vec::with_capacity(values.len() + 1);
+                    let mut bytes = Vec::new();
+                    offsets.push(0);
+                    for value in &values {
+                        if let Some(value) = value {
+                            bytes.extend_from_slice(value);
+                        }
+                        offsets.push(bytes.len() as u32);
+                    }
+                    NativeColumn::Bytes {
+                        validity: validity(&values.iter().map(|value| value.map(|_| ())).collect::<Vec<_>>()),
+                        offsets,
+                        values: bytes,
+                    }
+                }
+            };
+            (column_id, native)
+        })
+        .collect()
+}
 
 fn native_cols_to_ipc(
     cols: &[(u16, mongreldb_core::columnar::NativeColumn)],
