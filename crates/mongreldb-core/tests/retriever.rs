@@ -1,6 +1,6 @@
 use mongreldb_core::query::{
-    Condition, Fusion, NamedRetriever, Query, Retriever, RetrieverScore, SearchRequest, SetMember,
-    SetSimilarityRequest,
+    AnnRerankRequest, Condition, Fusion, NamedRetriever, Query, Retriever, RetrieverScore,
+    SearchRequest, SetMember, SetSimilarityRequest, VectorMetric,
 };
 use mongreldb_core::schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
 use mongreldb_core::{Table, Value};
@@ -25,6 +25,13 @@ fn schema() -> Schema {
             column(2, "embedding", TypeId::Embedding { dim: 8 }, false),
             column(3, "sparse", TypeId::Bytes, false),
             column(4, "members", TypeId::Bytes, false),
+            ColumnDef {
+                id: 5,
+                name: "created_at".into(),
+                ty: TypeId::TimestampNanos,
+                flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+                default_value: None,
+            },
         ],
         indexes: vec![
             IndexDef {
@@ -90,6 +97,7 @@ fn scored_retrievers_preserve_order_and_reopen() {
     let dir = tempdir().unwrap();
     let mut table = Table::create(dir.path(), schema(), 1).unwrap();
     seed(&mut table);
+    table.flush().unwrap();
 
     let ann = Retriever::Ann {
         column_id: 2,
@@ -215,6 +223,111 @@ fn scored_retrievers_validate_input() {
 }
 
 #[test]
+fn stale_index_entries_never_consume_top_k() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path(), schema(), 1).unwrap();
+    seed(&mut table);
+    table.flush().unwrap();
+    let nearest = table
+        .retrieve(&Retriever::Ann {
+            column_id: 2,
+            query: vec![1.0; 8],
+            k: 1,
+        })
+        .unwrap()[0]
+        .row_id;
+    table.delete(nearest).unwrap();
+    table.commit().unwrap();
+    table.flush().unwrap();
+    table.compact().unwrap();
+
+    let ann = table
+        .retrieve(&Retriever::Ann {
+            column_id: 2,
+            query: vec![1.0; 8],
+            k: 1,
+        })
+        .unwrap();
+    assert_eq!(ann.len(), 1);
+    assert_ne!(ann[0].row_id, nearest);
+    assert_eq!(ann[0].rank, 1);
+    assert!(table
+        .retrieve(&Retriever::Sparse {
+            column_id: 3,
+            query: vec![(1, 1.0)],
+            k: 2,
+        })
+        .unwrap()
+        .iter()
+        .all(|hit| hit.row_id != nearest));
+    assert!(table
+        .retrieve(&Retriever::MinHash {
+            column_id: 4,
+            members: ["a", "b", "c", "d"]
+                .into_iter()
+                .map(|value| SetMember::String(value.into()))
+                .collect(),
+            k: 2,
+        })
+        .unwrap()
+        .iter()
+        .all(|hit| hit.row_id != nearest));
+    table.close().unwrap();
+    drop(table);
+    let mut reopened = Table::open(dir.path()).unwrap();
+    let hits = reopened
+        .retrieve(&Retriever::Ann {
+            column_id: 2,
+            query: vec![1.0; 8],
+            k: 2,
+        })
+        .unwrap();
+    assert!(hits.iter().all(|hit| hit.row_id != nearest));
+}
+
+#[test]
+fn ttl_expired_candidates_never_consume_top_k() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path(), schema(), 1).unwrap();
+    table.set_ttl("created_at", 1).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64;
+    for (id, embedding, created_at) in [
+        (1, vec![1.0; 8], now - 1_000_000),
+        (2, vec![-1.0; 8], now + 60_000_000_000),
+    ] {
+        table
+            .put(vec![
+                (1, Value::Int64(id)),
+                (2, Value::Embedding(embedding)),
+                (
+                    3,
+                    Value::Bytes(mongreldb_core::query::encode_sparse_vector(&[(1, 1.0)]).unwrap()),
+                ),
+                (4, members(&["a", "b"])),
+                (5, Value::Int64(created_at)),
+            ])
+            .unwrap();
+    }
+    table.commit().unwrap();
+    let hits = table
+        .retrieve(&Retriever::Ann {
+            column_id: 2,
+            query: vec![1.0; 8],
+            k: 1,
+        })
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].rank, 1);
+    assert_eq!(
+        table.get(hits[0].row_id, table.snapshot()).unwrap().columns[&1],
+        Value::Int64(2)
+    );
+}
+
+#[test]
 fn exact_set_similarity_filters_sorts_and_limits() {
     let dir = tempdir().unwrap();
     let mut table = Table::create(dir.path(), schema(), 1).unwrap();
@@ -252,6 +365,46 @@ fn exact_set_similarity_filters_sorts_and_limits() {
         })
         .unwrap()
         .is_empty());
+}
+
+#[test]
+fn ann_candidates_can_be_exactly_reranked() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path(), schema(), 1).unwrap();
+    table
+        .put(vec![
+            (1, Value::Int64(1)),
+            (2, Value::Embedding(vec![1.0; 8])),
+            (
+                3,
+                Value::Bytes(bincode::serialize(&vec![(9u32, 0.0f32)]).unwrap()),
+            ),
+            (4, members(&[])),
+        ])
+        .unwrap();
+    table
+        .put(vec![
+            (1, Value::Int64(2)),
+            (2, Value::Embedding(vec![2.0; 8])),
+            (
+                3,
+                Value::Bytes(bincode::serialize(&vec![(9u32, 0.0f32)]).unwrap()),
+            ),
+            (4, members(&[])),
+        ])
+        .unwrap();
+    table.commit().unwrap();
+    let hits = table
+        .ann_rerank(&AnnRerankRequest {
+            column_id: 2,
+            query: vec![1.0; 8],
+            candidate_k: 2,
+            limit: 1,
+            metric: VectorMetric::DotProduct,
+        })
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].exact_score, 16.0);
 }
 
 #[test]

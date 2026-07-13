@@ -428,6 +428,8 @@ pub struct Schema {
 }
 
 impl Schema {
+    pub const MAX_EMBEDDING_DIM: u32 = 65_536;
+
     pub fn column(&self, name: &str) -> Option<&ColumnDef> {
         self.columns.iter().find(|c| c.name == name)
     }
@@ -436,6 +438,162 @@ impl Schema {
         self.columns
             .iter()
             .find(|c| c.flags.contains(ColumnFlags::PRIMARY_KEY))
+    }
+
+    /// Validate AI column/index representation and embedding values.
+    pub fn validate_ai(&self) -> Result<()> {
+        for column in &self.columns {
+            if let TypeId::Embedding { dim } = column.ty {
+                if dim == 0 || dim > Self::MAX_EMBEDDING_DIM {
+                    return Err(MongrelError::Schema(format!(
+                        "embedding column '{}' dimension must be between 1 and {}",
+                        column.name,
+                        Self::MAX_EMBEDDING_DIM
+                    )));
+                }
+            }
+        }
+        for index in &self.indexes {
+            let column = self
+                .columns
+                .iter()
+                .find(|column| column.id == index.column_id)
+                .ok_or_else(|| {
+                    MongrelError::Schema(format!(
+                        "index '{}' references unknown column {}",
+                        index.name, index.column_id
+                    ))
+                })?;
+            let expected = match index.kind {
+                IndexKind::Ann => Some("Embedding"),
+                IndexKind::Sparse | IndexKind::MinHash | IndexKind::FmIndex => Some("Bytes"),
+                _ => None,
+            };
+            if let Some(expected) = expected {
+                let valid = match index.kind {
+                    IndexKind::Ann => matches!(column.ty, TypeId::Embedding { .. }),
+                    _ => column.ty == TypeId::Bytes,
+                };
+                if !valid {
+                    return Err(MongrelError::Schema(format!(
+                        "{:?} index '{}' requires a {expected} column",
+                        index.kind, index.name
+                    )));
+                }
+                if self
+                    .indexes
+                    .iter()
+                    .filter(|other| {
+                        other.column_id == index.column_id
+                            && matches!(
+                                other.kind,
+                                IndexKind::Ann
+                                    | IndexKind::Sparse
+                                    | IndexKind::MinHash
+                                    | IndexKind::FmIndex
+                            )
+                    })
+                    .count()
+                    > 1
+                {
+                    return Err(MongrelError::Schema(format!(
+                        "column '{}' may have only one ANN, Sparse, MinHash, or FM representation index",
+                        column.name
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_values(&self, columns: &[(u16, Value)]) -> Result<()> {
+        self.validate_not_null(columns)?;
+        for (column_id, value) in columns {
+            let Some(column) = self.columns.iter().find(|column| column.id == *column_id) else {
+                return Err(MongrelError::ColumnNotFound(column_id.to_string()));
+            };
+            if let TypeId::Embedding { dim } = &column.ty {
+                let Value::Embedding(values) = value else {
+                    if matches!(value, Value::Null) {
+                        continue;
+                    }
+                    return Err(MongrelError::InvalidArgument(format!(
+                        "embedding column '{}' requires an embedding value",
+                        column.name
+                    )));
+                };
+                if values.len() != *dim as usize {
+                    return Err(MongrelError::InvalidArgument(format!(
+                        "embedding column '{}' dimension must be {}, got {}",
+                        column.name,
+                        dim,
+                        values.len()
+                    )));
+                }
+                if values.iter().any(|value| !value.is_finite()) {
+                    return Err(MongrelError::InvalidArgument(format!(
+                        "embedding column '{}' values must be finite",
+                        column.name
+                    )));
+                }
+            }
+            if let Value::Bytes(bytes) = value {
+                match self
+                    .indexes
+                    .iter()
+                    .find(|index| {
+                        index.column_id == *column_id
+                            && matches!(index.kind, IndexKind::Sparse | IndexKind::MinHash)
+                    })
+                    .map(|index| index.kind)
+                {
+                    Some(IndexKind::Sparse) => {
+                        let terms: Vec<(u32, f32)> = bincode::deserialize(bytes).map_err(|_| {
+                            MongrelError::InvalidArgument(format!(
+                                "sparse column '{}' requires an encoded sparse vector",
+                                column.name
+                            ))
+                        })?;
+                        if terms.is_empty() || terms.iter().any(|(_, weight)| !weight.is_finite()) {
+                            return Err(MongrelError::InvalidArgument(format!(
+                                "sparse column '{}' must be non-empty with finite weights",
+                                column.name
+                            )));
+                        }
+                    }
+                    Some(IndexKind::MinHash) => {
+                        let members: serde_json::Value =
+                            serde_json::from_slice(bytes).map_err(|_| {
+                                MongrelError::InvalidArgument(format!(
+                                    "MinHash column '{}' requires a JSON array",
+                                    column.name
+                                ))
+                            })?;
+                        let serde_json::Value::Array(members) = members else {
+                            return Err(MongrelError::InvalidArgument(format!(
+                                "MinHash column '{}' requires a JSON array",
+                                column.name
+                            )));
+                        };
+                        if members.iter().any(|member| {
+                            !matches!(
+                                member,
+                                serde_json::Value::String(_)
+                                    | serde_json::Value::Number(_)
+                                    | serde_json::Value::Bool(_)
+                            )
+                        }) {
+                            return Err(MongrelError::InvalidArgument(format!(
+                                "MinHash column '{}' members must be scalar",
+                                column.name
+                            )));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Validate row-level type constraints owned directly by the schema.
@@ -638,6 +796,13 @@ mod tests {
         let json = serde_json::to_string(&defaults).unwrap();
         let restored: IndexDef = serde_json::from_str(&json).unwrap();
         assert!(restored.options.ann.is_none());
+        let legacy: IndexDef = serde_json::from_value(serde_json::json!({
+            "name": "legacy_ann",
+            "column_id": 1,
+            "kind": "Ann"
+        }))
+        .unwrap();
+        assert!(legacy.options.ann.is_none());
 
         let invalid = IndexDef {
             name: "minhash".into(),

@@ -7,6 +7,7 @@
 
 use crate::index::hnsw::Hnsw;
 use crate::rowid::RowId;
+use crate::{MongrelError, Result};
 
 const M: usize = 16;
 const EF_CONSTRUCTION: usize = 64;
@@ -45,33 +46,65 @@ impl AnnIndex {
     }
 
     /// Quantize an f32 vector to a packed bit vector (1 bit per dim, sign bit).
-    pub fn quantize(&self, vec: &[f32]) -> Vec<u8> {
-        assert_eq!(vec.len(), self.dim, "embedding dimension mismatch");
+    pub fn quantize(&self, vec: &[f32]) -> Result<Vec<u8>> {
+        if vec.len() != self.dim {
+            return Err(MongrelError::InvalidArgument(format!(
+                "embedding dimension must be {}, got {}",
+                self.dim,
+                vec.len()
+            )));
+        }
+        if vec.iter().any(|value| !value.is_finite()) {
+            return Err(MongrelError::InvalidArgument(
+                "embedding values must be finite".into(),
+            ));
+        }
         let mut out = vec![0u8; self.bytes_per_vec];
         for (i, v) in vec.iter().enumerate() {
             if *v > 0.0 {
                 out[i / 8] |= 1 << (i % 8);
             }
         }
-        out
+        Ok(out)
     }
 
     /// Insert a quantized vector for `row_id`.
-    pub fn insert_quantized(&mut self, bits: Vec<u8>, row_id: RowId) {
-        assert_eq!(bits.len(), self.bytes_per_vec, "quantized length mismatch");
+    pub fn insert_quantized(&mut self, bits: Vec<u8>, row_id: RowId) -> Result<()> {
+        if bits.len() != self.bytes_per_vec {
+            return Err(MongrelError::InvalidArgument(format!(
+                "quantized vector length must be {}, got {}",
+                self.bytes_per_vec,
+                bits.len()
+            )));
+        }
         self.graph.insert(bits, row_id);
+        Ok(())
     }
 
     /// Convenience: quantize then insert.
-    pub fn insert(&mut self, vec: &[f32], row_id: RowId) {
-        let bits = self.quantize(vec);
-        self.insert_quantized(bits, row_id);
+    pub fn insert(&mut self, vec: &[f32], row_id: RowId) -> Result<()> {
+        let bits = self.quantize(vec)?;
+        self.insert_quantized(bits, row_id)
+    }
+
+    pub(crate) fn insert_validated(&mut self, vec: &[f32], row_id: RowId) {
+        if vec.len() != self.dim || vec.iter().any(|value| !value.is_finite()) {
+            // Historical malformed rows are quarantined from the derived index.
+            return;
+        }
+        let mut bits = vec![0u8; self.bytes_per_vec];
+        for (i, value) in vec.iter().enumerate() {
+            if *value > 0.0 {
+                bits[i / 8] |= 1 << (i % 8);
+            }
+        }
+        self.graph.insert(bits, row_id);
     }
 
     /// k-nearest by Hamming distance.
-    pub fn search(&self, query: &[f32], k: usize) -> Vec<(RowId, u32)> {
-        let q = self.quantize(query);
-        self.graph.search(&q, k, self.ef_search)
+    pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<(RowId, u32)>> {
+        let q = self.quantize(query)?;
+        Ok(self.graph.search(&q, k, self.ef_search))
     }
 
     pub fn len(&self) -> usize {
@@ -112,18 +145,20 @@ mod tests {
                 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0,
             ],
             RowId(0),
-        );
+        )
+        .unwrap();
         idx.insert(
             &[
                 -1.0, 1.0, -1.0, -1.0, 1.0, -1.0, -1.0, 1.0, -1.0, -1.0, 1.0, -1.0, -1.0, 1.0,
                 -1.0, -1.0,
             ],
             RowId(1),
-        );
+        )
+        .unwrap();
         let query = [
             1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0,
         ];
-        let top = idx.search(&query, 1);
+        let top = idx.search(&query, 1).unwrap();
         assert_eq!(top[0].0, RowId(0));
         assert_eq!(top[0].1, 0); // identical → distance 0
     }
@@ -131,9 +166,11 @@ mod tests {
     #[test]
     fn quantize_uses_sign_bit() {
         let idx = AnnIndex::new(16);
-        let bits = idx.quantize(&[
-            1.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        ]);
+        let bits = idx
+            .quantize(&[
+                1.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ])
+            .unwrap();
         assert_eq!(bits[0] & 0b0000_1001, 0b0000_1001); // bits 0 and 3 set
     }
 }

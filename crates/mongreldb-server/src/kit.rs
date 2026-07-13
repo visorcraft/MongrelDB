@@ -335,7 +335,28 @@ fn visible_schema(
 ) -> mongreldb_core::Result<Schema> {
     let allowed = state.db.select_column_ids_for(table, principal)?;
     let mut schema = state.db.table(table)?.lock().schema().clone();
+    let restricted = allowed.len() != schema.columns.len();
     schema.columns.retain(|column| allowed.contains(&column.id));
+    schema
+        .indexes
+        .retain(|index| allowed.contains(&index.column_id));
+    schema
+        .constraints
+        .uniques
+        .retain(|unique| unique.columns.iter().all(|column| allowed.contains(column)));
+    schema
+        .constraints
+        .foreign_keys
+        .retain(|foreign_key| {
+            !restricted
+                && foreign_key
+                    .columns
+                    .iter()
+                    .all(|column| allowed.contains(column))
+        });
+    if restricted {
+        schema.constraints.checks.clear();
+    }
     Ok(schema)
 }
 
@@ -1031,7 +1052,16 @@ pub async fn kit_retrieve(
         Ok(handle) => handle,
         Err(error) => return (StatusCode::NOT_FOUND, error.to_string()).into_response(),
     };
-    let result = handle.lock().retrieve(&retriever);
+    let allowed = match state
+        .db
+        .authorized_candidate_ids_for(&req.table, principal.as_ref())
+    {
+        Ok(allowed) => allowed,
+        Err(error) => return (crate::status_for_error(&error), error.to_string()).into_response(),
+    };
+    let result = handle
+        .lock()
+        .retrieve_with_allowed(&retriever, allowed.as_ref());
     match result {
         Ok(hits) => Json(json!({
             "hits": hits.into_iter().map(|hit| json!({
@@ -1161,15 +1191,25 @@ pub async fn kit_search(
     let fusion = match req.fusion {
         KitFusion::ReciprocalRank { constant } => Fusion::ReciprocalRank { constant },
     };
+    let allowed = match state
+        .db
+        .authorized_candidate_ids_for(&req.table, principal.as_ref())
+    {
+        Ok(allowed) => allowed,
+        Err(error) => return (crate::status_for_error(&error), error.to_string()).into_response(),
+    };
     let (mut hits, rows) = {
         let mut table = handle.lock();
-        let hits = match table.search(&SearchRequest {
-            must,
-            retrievers,
-            fusion,
-            limit: req.limit,
-            projection: req.projection.clone(),
-        }) {
+        let hits = match table.search_with_allowed(
+            &SearchRequest {
+                must,
+                retrievers,
+                fusion,
+                limit: req.limit,
+                projection: req.projection.clone(),
+            },
+            allowed.as_ref(),
+        ) {
             Ok(hits) => hits,
             Err(error) => return kit_bad_request(error.to_string()),
         };
@@ -1249,13 +1289,23 @@ pub async fn kit_set_similarity(
         Ok(handle) => handle,
         Err(error) => return (StatusCode::NOT_FOUND, error.to_string()).into_response(),
     };
-    let result = handle.lock().set_similarity(&SetSimilarityRequest {
-        column_id: req.column_id,
-        members,
-        candidate_k: req.candidate_k,
-        min_jaccard: req.min_jaccard,
-        limit: req.limit,
-    });
+    let allowed = match state
+        .db
+        .authorized_candidate_ids_for(&req.table, principal.as_ref())
+    {
+        Ok(allowed) => allowed,
+        Err(error) => return (crate::status_for_error(&error), error.to_string()).into_response(),
+    };
+    let result = handle.lock().set_similarity_with_allowed(
+        &SetSimilarityRequest {
+            column_id: req.column_id,
+            members,
+            candidate_k: req.candidate_k,
+            min_jaccard: req.min_jaccard,
+            limit: req.limit,
+        },
+        allowed.as_ref(),
+    );
     match result {
         Ok(hits) => Json(json!({
             "hits": hits.into_iter().map(|hit| json!({
@@ -1354,7 +1404,12 @@ pub async fn kit_query(
     let rows = match handle.lock().query(&q) {
         Ok(r) => r,
         Err(e) => {
-            return (crate::status_for_error(&e), e.to_string()).into_response();
+            let status = if matches!(e, mongreldb_core::MongrelError::InvalidArgument(_)) {
+                StatusCode::BAD_REQUEST
+            } else {
+                crate::status_for_error(&e)
+            };
+            return (status, e.to_string()).into_response();
         }
     };
     let rows = match state

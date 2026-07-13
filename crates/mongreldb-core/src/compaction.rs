@@ -178,16 +178,16 @@ impl Table {
             self.retire_run(rr.run_id, retire_epoch);
         }
         self.persist_manifest(self.current_epoch())?;
+        // Derived indexes must match the compacted live run. Otherwise removed
+        // tombstones remain in a newly stamped checkpoint and reappear on open.
+        self.rebuild_indexes_from_runs()?;
         // Compaction yields exactly one run → (re)build the learned-range PGMs
         // so the checkpoint captures them (otherwise reopen would load a
         // checkpoint with empty learned_range and fall back to page-pruned scans).
         self.build_learned_ranges()?;
         self.clear_result_cache();
-        if expired_reclaimed {
-            self.mark_indexes_incomplete();
-        } else {
-            self.checkpoint_indexes(self.current_epoch());
-        }
+        let _ = expired_reclaimed;
+        self.checkpoint_indexes(self.current_epoch());
         Ok(())
     }
 }

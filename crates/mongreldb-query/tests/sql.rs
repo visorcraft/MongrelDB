@@ -1730,3 +1730,45 @@ async fn create_minhash_index_after_rows_backfills_candidates() {
         .unwrap();
     assert_eq!(rows.len(), 1);
 }
+
+#[tokio::test]
+async fn sql_only_sparse_and_set_constructors_ingest() {
+    use arrow::array::Float32Array;
+
+    let dir = tempdir().unwrap();
+    let database = std::sync::Arc::new(mongreldb_core::Database::create(dir.path()).unwrap());
+    let session = MongrelSession::open(std::sync::Arc::clone(&database)).unwrap();
+    session
+        .run("CREATE TABLE ai_docs (id BIGINT PRIMARY KEY, sparse TEXT, members TEXT)")
+        .await
+        .unwrap();
+    session
+        .run("CREATE INDEX ai_sparse ON ai_docs USING sparse (sparse)")
+        .await
+        .unwrap();
+    session
+        .run("CREATE INDEX ai_members ON ai_docs USING minhash (members)")
+        .await
+        .unwrap();
+    session
+        .run(r#"INSERT INTO ai_docs VALUES (1, mongreldb_sparse_vector('[[7,1.5],[7,0.5]]'), mongreldb_set('["a","b"]'))"#)
+        .await
+        .unwrap();
+    let hits = session
+        .run("SELECT * FROM sparse_search_scored('ai_docs','sparse','[[7,1.0]]',5,'id')")
+        .await
+        .unwrap();
+    assert_eq!(
+        hits[0]
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap()
+            .value(0),
+        2.0
+    );
+    assert!(session
+        .run("UPDATE ai_docs SET sparse = mongreldb_sparse_vector('[[7,NaN]]') WHERE id = 1")
+        .await
+        .is_err());
+}

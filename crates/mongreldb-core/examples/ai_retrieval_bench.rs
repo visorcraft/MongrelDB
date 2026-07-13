@@ -168,6 +168,9 @@ fn main() {
     let mut sparse_us = Vec::new();
     let mut minhash_us = Vec::new();
     let mut minhash_verify_us = Vec::new();
+    let mut minhash_verify_gather_us = Vec::new();
+    let mut minhash_verify_parse_us = Vec::new();
+    let mut minhash_verify_score_us = Vec::new();
     let mut hybrid_us = Vec::new();
     let mut graph_recall = 0.0;
     let mut cosine_recall = 0.0;
@@ -280,8 +283,8 @@ fn main() {
             minhash_error_samples += 1;
         }
         let started = Instant::now();
-        table
-            .set_similarity(&SetSimilarityRequest {
+        let (_, trace) = table
+            .set_similarity_explained(&SetSimilarityRequest {
                 column_id: 5,
                 members: member_values,
                 candidate_k: 100,
@@ -290,6 +293,9 @@ fn main() {
             })
             .unwrap();
         minhash_verify_us.push(started.elapsed().as_micros());
+        minhash_verify_gather_us.push(trace.gather_us as u128);
+        minhash_verify_parse_us.push(trace.parse_us as u128);
+        minhash_verify_score_us.push(trace.score_us as u128);
         hybrid_union_size += ann_hits
             .iter()
             .map(|hit| hit.row_id)
@@ -350,6 +356,11 @@ fn main() {
         .ok()
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
         .unwrap_or_default();
+    let git_dirty = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()
+        .is_some_and(|output| !output.stdout.is_empty());
     let rustc = std::process::Command::new("rustc")
         .arg("--version")
         .output()
@@ -360,6 +371,7 @@ fn main() {
         "{}",
         serde_json::json!({
             "git_sha": git_sha,
+            "git_dirty": git_dirty,
             "hardware": {"arch": std::env::consts::ARCH, "os": std::env::consts::OS, "label": std::env::var("MONGRELDB_BENCH_HARDWARE").unwrap_or_default()},
             "rustc": rustc,
             "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
@@ -375,7 +387,7 @@ fn main() {
             "index_payloads": index_payloads,
             "ann": {"p50_us": percentile(&mut ann_us, 0.50), "p95_us": percentile(&mut ann_us, 0.95), "hamming_recall_at_10": graph_recall / queries as f64, "cosine_recall_at_10": cosine_recall / queries as f64},
             "sparse": {"p50_us": percentile(&mut sparse_us, 0.50), "p95_us": percentile(&mut sparse_us, 0.95), "average_postings_visited": sparse_postings_visited as f64 / queries as f64},
-            "minhash": {"p50_us": percentile(&mut minhash_us, 0.50), "p95_us": percentile(&mut minhash_us, 0.95), "verification_p50_us": percentile(&mut minhash_verify_us, 0.50), "verification_p95_us": percentile(&mut minhash_verify_us, 0.95), "candidate_recall_at_10": minhash_candidate_recall / queries as f64, "average_candidates": minhash_candidate_count as f64 / queries as f64, "estimated_exact_mean_absolute_error": minhash_error / minhash_error_samples.max(1) as f64},
+            "minhash": {"p50_us": percentile(&mut minhash_us, 0.50), "p95_us": percentile(&mut minhash_us, 0.95), "verification_p50_us": percentile(&mut minhash_verify_us, 0.50), "verification_p95_us": percentile(&mut minhash_verify_us, 0.95), "verification_gather_p50_us": percentile(&mut minhash_verify_gather_us, 0.50), "verification_gather_p95_us": percentile(&mut minhash_verify_gather_us, 0.95), "verification_parse_p50_us": percentile(&mut minhash_verify_parse_us, 0.50), "verification_parse_p95_us": percentile(&mut minhash_verify_parse_us, 0.95), "verification_score_p50_us": percentile(&mut minhash_verify_score_us, 0.50), "verification_score_p95_us": percentile(&mut minhash_verify_score_us, 0.95), "candidate_recall_at_10": minhash_candidate_recall / queries as f64, "average_candidates": minhash_candidate_count as f64 / queries as f64, "estimated_exact_mean_absolute_error": minhash_error / minhash_error_samples.max(1) as f64},
             "hybrid": {"p50_us": percentile(&mut hybrid_us, 0.50), "p95_us": percentile(&mut hybrid_us, 0.95), "average_union_size": hybrid_union_size as f64 / queries as f64},
         })
     );

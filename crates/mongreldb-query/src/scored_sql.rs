@@ -321,10 +321,19 @@ impl TableFunctionImpl for ScoredFunction {
                 .map_err(|error| DataFusionError::Plan(error.to_string()))?;
         }
         let retriever = parse_retriever(self.kind, column_id, &query, k)?;
+        let allowed = self
+            .database
+            .as_ref()
+            .map(|database| {
+                database.authorized_candidate_ids_for(&table_name, self.principal.as_ref())
+            })
+            .transpose()
+            .map_err(|error| DataFusionError::Execution(error.to_string()))?
+            .flatten();
         let (hits, rows) = {
             let mut table = handle.lock();
             let hits = table
-                .retrieve(&retriever)
+                .retrieve_with_allowed(&retriever, allowed.as_ref())
                 .map_err(|error| DataFusionError::Execution(error.to_string()))?;
             let row_ids: Vec<_> = hits.iter().map(|hit| hit.row_id.0).collect();
             let snapshot = table.snapshot();
@@ -480,16 +489,28 @@ impl ScoredFunction {
                 )
                 .map_err(|error| DataFusionError::Plan(error.to_string()))?;
         }
+        let allowed = self
+            .database
+            .as_ref()
+            .map(|database| {
+                database.authorized_candidate_ids_for(&table_name, self.principal.as_ref())
+            })
+            .transpose()
+            .map_err(|error| DataFusionError::Execution(error.to_string()))?
+            .flatten();
         let (hits, rows) = {
             let mut table = handle.lock();
             let hits = table
-                .set_similarity(&SetSimilarityRequest {
-                    column_id,
-                    members,
-                    candidate_k,
-                    min_jaccard,
-                    limit,
-                })
+                .set_similarity_with_allowed(
+                    &SetSimilarityRequest {
+                        column_id,
+                        members,
+                        candidate_k,
+                        min_jaccard,
+                        limit,
+                    },
+                    allowed.as_ref(),
+                )
                 .map_err(|error| DataFusionError::Execution(error.to_string()))?;
             let row_ids: Vec<_> = hits.iter().map(|hit| hit.row_id.0).collect();
             let snapshot = table.snapshot();
@@ -616,18 +637,30 @@ impl ScoredFunction {
                 )
                 .map_err(|error| DataFusionError::Plan(error.to_string()))?;
         }
+        let allowed = self
+            .database
+            .as_ref()
+            .map(|database| {
+                database.authorized_candidate_ids_for(&table_name, self.principal.as_ref())
+            })
+            .transpose()
+            .map_err(|error| DataFusionError::Execution(error.to_string()))?
+            .flatten();
         let (hits, rows) = {
             let mut table = handle.lock();
             let hits = table
-                .search(&SearchRequest {
-                    must,
-                    retrievers,
-                    fusion: Fusion::ReciprocalRank {
-                        constant: spec.rrf_constant,
+                .search_with_allowed(
+                    &SearchRequest {
+                        must,
+                        retrievers,
+                        fusion: Fusion::ReciprocalRank {
+                            constant: spec.rrf_constant,
+                        },
+                        limit: spec.limit,
+                        projection: Some(projection.clone()),
                     },
-                    limit: spec.limit,
-                    projection: Some(projection.clone()),
-                })
+                    allowed.as_ref(),
+                )
                 .map_err(|error| DataFusionError::Execution(error.to_string()))?;
             let row_ids: Vec<_> = hits.iter().map(|hit| hit.row_id.0).collect();
             let snapshot = table.snapshot();

@@ -4,6 +4,7 @@ use mongreldb_core::{
     ColumnDef, ColumnFlags, ColumnMask, Database, MaskStrategy, Permission, PolicyCommand,
     Principal, RowPolicy, Schema, SecurityCatalog, SecurityExpr, TypeId, Value,
 };
+use mongreldb_core::{IndexDef, IndexKind};
 use mongreldb_query::ExternalTableModule;
 use mongreldb_server::build_app_full;
 use serde_json::{json, Value as JsonValue};
@@ -41,6 +42,29 @@ fn schema() -> Schema {
                 flags: ColumnFlags::empty(),
                 default_value: None,
             },
+            ColumnDef {
+                id: 5,
+                name: "sparse".into(),
+                ty: TypeId::Bytes,
+                flags: ColumnFlags::empty(),
+                default_value: None,
+            },
+        ],
+        indexes: vec![
+            IndexDef {
+                name: "sparse".into(),
+                column_id: 5,
+                kind: IndexKind::Sparse,
+                predicate: None,
+                options: Default::default(),
+            },
+            IndexDef {
+                name: "hidden_value".into(),
+                column_id: 4,
+                kind: IndexKind::Bitmap,
+                predicate: None,
+                options: Default::default(),
+            },
         ],
         clustered: true,
         ..Schema::default()
@@ -70,6 +94,10 @@ async fn user_principal_secures_sql_native_kit_and_sessions() {
                 (2, Value::Bytes(b"alice".to_vec())),
                 (3, Value::Bytes(b"alice-secret".to_vec())),
                 (4, Value::Int64(10)),
+                (
+                    5,
+                    Value::Bytes(mongreldb_core::query::encode_sparse_vector(&[(1, 1.0)])?),
+                ),
             ],
         )?;
         transaction.put(
@@ -79,6 +107,10 @@ async fn user_principal_secures_sql_native_kit_and_sessions() {
                 (2, Value::Bytes(b"bob".to_vec())),
                 (3, Value::Bytes(b"bob-secret".to_vec())),
                 (4, Value::Int64(20)),
+                (
+                    5,
+                    Value::Bytes(mongreldb_core::query::encode_sparse_vector(&[(1, 10.0)])?),
+                ),
             ],
         )?;
         Ok(())
@@ -89,7 +121,7 @@ async fn user_principal_secures_sql_native_kit_and_sessions() {
     for permission in [
         Permission::SelectColumns {
             table: "docs".into(),
-            columns: vec!["id".into(), "owner".into(), "secret".into()],
+            columns: vec!["id".into(), "owner".into(), "secret".into(), "sparse".into()],
         },
         Permission::InsertColumns {
             table: "docs".into(),
@@ -166,6 +198,43 @@ async fn user_principal_secures_sql_native_kit_and_sessions() {
     let body: JsonValue =
         serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
     assert_eq!(body, json!([{ "id": 1, "secret": "***" }]));
+
+    let response = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/kit/retrieve",
+            json!({
+                "table":"docs",
+                "retriever":{"sparse":{"column_id":5,"query":[[1,1.0]],"k":2}}
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: JsonValue =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
+    assert_eq!(body["hits"].as_array().unwrap().len(), 1);
+    assert_eq!(body["hits"][0]["rank"], 1);
+
+    let response = app
+        .clone()
+        .oneshot(request("GET", "/kit/schema/docs", json!({})))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: JsonValue =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
+    assert!(body["columns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|column| column["id"] != 4));
+    assert!(body["indexes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|index| index["column_id"] != 4));
 
     let response = app
         .clone()

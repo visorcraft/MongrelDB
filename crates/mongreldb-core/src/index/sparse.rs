@@ -66,6 +66,16 @@ impl SparseIndex {
         ranked
     }
 
+    pub fn candidate_row_ids(&self, query: &[(u32, f32)]) -> Vec<RowId> {
+        let mut row_ids = std::collections::HashSet::new();
+        for (token, _) in query {
+            if let Some(postings) = self.postings.get(token) {
+                row_ids.extend(postings.iter().map(|(row_id, _)| *row_id));
+            }
+        }
+        row_ids.into_iter().collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.postings.is_empty()
     }

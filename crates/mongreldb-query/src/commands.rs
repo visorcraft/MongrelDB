@@ -5338,6 +5338,7 @@ fn eval_value_expr(
     match expr {
         Expr::Nested(e) => eval_value_expr(e, schema, row, excluded),
         Expr::Value(v) => sql_value_to_value(&v.value, None),
+        Expr::Function(function) => ai_constructor_value(function),
         Expr::Identifier(ident) => {
             let col = schema.column(&ident.value).ok_or_else(|| {
                 MongrelQueryError::Schema(format!("unknown column {}", ident.value))
@@ -5415,6 +5416,7 @@ fn sql_value_to_value(value: &SqlValue, target: Option<TypeId>) -> Result<Value>
 fn expr_to_value(expr: &Expr, ty: TypeId) -> Result<Value> {
     let value = match expr {
         Expr::Value(v) => sql_value_to_value(&v.value, Some(ty.clone()))?,
+        Expr::Function(function) => ai_constructor_value(function)?,
         Expr::UnaryOp {
             op: UnaryOperator::Minus,
             expr,
@@ -5434,6 +5436,77 @@ fn expr_to_value(expr: &Expr, ty: TypeId) -> Result<Value> {
         }
     };
     coerce_value(value, ty)
+}
+
+fn ai_constructor_value(function: &sqlparser::ast::Function) -> Result<Value> {
+    let name = function.name.to_string().to_ascii_lowercase();
+    if !matches!(name.as_str(), "mongreldb_sparse_vector" | "mongreldb_set") {
+        return Err(MongrelQueryError::Schema(format!(
+            "unsupported value function: {name}"
+        )));
+    }
+    let FunctionArguments::List(arguments) = &function.args else {
+        return Err(MongrelQueryError::Schema(format!(
+            "{name} requires one JSON string argument"
+        )));
+    };
+    if arguments.args.len() != 1 {
+        return Err(MongrelQueryError::Schema(format!(
+            "{name} requires one JSON string argument"
+        )));
+    }
+    let Value::Bytes(json) = expr_to_untyped_value(function_arg_expr(&arguments.args[0])?)? else {
+        return Err(MongrelQueryError::Schema(format!(
+            "{name} requires one JSON string argument"
+        )));
+    };
+    if name == "mongreldb_sparse_vector" {
+        let terms: Vec<(u32, f32)> = serde_json::from_slice(&json).map_err(|error| {
+            MongrelQueryError::Schema(format!("invalid sparse vector JSON: {error}"))
+        })?;
+        if terms.is_empty() || terms.iter().any(|(_, weight)| !weight.is_finite()) {
+            return Err(MongrelQueryError::Schema(
+                "sparse vector must be non-empty with finite weights".into(),
+            ));
+        }
+        let mut canonical = std::collections::BTreeMap::new();
+        for (token, weight) in terms {
+            let total = canonical.entry(token).or_insert(0.0f32);
+            *total += weight;
+            if !total.is_finite() {
+                return Err(MongrelQueryError::Schema(
+                    "sparse vector weights overflowed".into(),
+                ));
+            }
+        }
+        return mongreldb_core::query::encode_sparse_vector(
+            &canonical.into_iter().collect::<Vec<_>>(),
+        )
+        .map(Value::Bytes)
+        .map_err(MongrelQueryError::Core);
+    }
+    let members: Vec<serde_json::Value> = serde_json::from_slice(&json)
+        .map_err(|error| MongrelQueryError::Schema(format!("invalid set JSON: {error}")))?;
+    if members.iter().any(|member| {
+        !matches!(
+            member,
+            serde_json::Value::String(_)
+                | serde_json::Value::Number(_)
+                | serde_json::Value::Bool(_)
+        )
+    }) {
+        return Err(MongrelQueryError::Schema(
+            "set members must be strings, numbers, or booleans".into(),
+        ));
+    }
+    let canonical: std::collections::BTreeSet<_> = members
+        .into_iter()
+        .map(|member| serde_json::to_string(&member))
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|error| MongrelQueryError::Schema(error.to_string()))?;
+    Ok(Value::Bytes(
+        format!("[{}]", canonical.into_iter().collect::<Vec<_>>().join(",")).into_bytes(),
+    ))
 }
 
 fn expr_to_untyped_value(expr: &Expr) -> Result<Value> {

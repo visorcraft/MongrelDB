@@ -425,8 +425,10 @@ mod tests {
 
         let mut ann_map = HashMap::new();
         let mut ann = AnnIndex::new(8);
-        ann.insert(&[1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0], RowId(0));
-        ann.insert(&[-1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0], RowId(1));
+        ann.insert(&[1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0], RowId(0))
+            .unwrap();
+        ann.insert(&[-1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0], RowId(1))
+            .unwrap();
         ann_map.insert(11u16, ann);
 
         let mut sparse_map = HashMap::new();
@@ -467,7 +469,9 @@ mod tests {
         let red_ids: Vec<u32> = red.iter().collect();
         assert_eq!(red_ids, vec![1, 3]);
         assert_eq!(loaded.fm[&9].locate(b"fox").len(), 2);
-        let top = loaded.ann[&11].search(&[1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0], 1);
+        let top = loaded.ann[&11]
+            .search(&[1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0], 1)
+            .unwrap();
         assert_eq!(top[0].0, RowId(0));
         let sp_top = loaded.sparse[&13].search(&[(1, 1.0), (2, 1.0)], 2);
         assert_eq!(sp_top[0].0, RowId(0));

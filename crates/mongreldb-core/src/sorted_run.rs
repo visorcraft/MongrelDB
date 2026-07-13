@@ -2108,6 +2108,28 @@ impl RunReader {
         Ok(Some((Epoch(epoch), deleted, value)))
     }
 
+    /// Newest version epoch and tombstone flag without decoding a user column.
+    pub fn get_version_visibility(
+        &mut self,
+        row_id: RowId,
+        snapshot: Epoch,
+    ) -> Result<Option<(Epoch, bool)>> {
+        let Some((epoch, seq, local_index)) = self.find_version_page(row_id, snapshot)? else {
+            return Ok(None);
+        };
+        let page_rows = self.find_header(SYS_ROW_ID)?.page_stats[seq].row_count as usize;
+        let deleted = match self.decode_page_native_cached(
+            self.resolve_type(SYS_DELETED),
+            SYS_DELETED,
+            seq,
+            page_rows,
+        )? {
+            columnar::NativeColumn::Bool { data, .. } => data[local_index] != 0,
+            _ => return Err(MongrelError::InvalidArgument("sys deleted not bool".into())),
+        };
+        Ok(Some((Epoch(epoch), deleted)))
+    }
+
     /// Build a `Row` from page `seq`'s data at `local_index`, decoding only
     /// that one page per column instead of [`Self::materialize`]'s whole-column
     /// `Vec<Value>` decode — used by [`Self::get_version`], which already knows
