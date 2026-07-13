@@ -34,7 +34,7 @@ jobs:
           MONGRELDB_AI_QUALIFICATION=1 \
           MONGRELDB_AI_BENCH_ROWS=1000000 \
           MONGRELDB_AI_BENCH_QUERIES=50 \
-          cargo run -p mongreldb-core --release --example ai_retrieval_bench \
+          cargo run -p mongreldb-core --release --all-features --example ai_retrieval_bench \
             > "$QUAL_DIR/ai-benchmark-1m.json" \
             2> "$QUAL_DIR/ai-benchmark-1m.log"
           python3 scripts/validate-ai-benchmark.py \

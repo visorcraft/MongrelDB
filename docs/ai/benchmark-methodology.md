@@ -5,11 +5,11 @@ Run the deterministic manual/nightly harness in release mode:
 ```bash
 MONGRELDB_AI_BENCH_ROWS=100000 \
 MONGRELDB_AI_BENCH_QUERIES=50 \
-cargo run -p mongreldb-core --release --example ai_retrieval_bench
+cargo run -p mongreldb-core --release --all-features --example ai_retrieval_bench
 
 MONGRELDB_AI_BENCH_ROWS=1000000 \
 MONGRELDB_AI_BENCH_QUERIES=50 \
-cargo run -p mongreldb-core --release --example ai_retrieval_bench
+cargo run -p mongreldb-core --release --all-features --example ai_retrieval_bench
 ```
 
 Release qualification is strict and validates the emitted JSON:
@@ -18,7 +18,7 @@ Release qualification is strict and validates the emitted JSON:
 MONGRELDB_AI_QUALIFICATION=1 \
 MONGRELDB_AI_BENCH_ROWS=100000 \
 MONGRELDB_AI_BENCH_QUERIES=50 \
-cargo run -p mongreldb-core --release --example ai_retrieval_bench \
+cargo run -p mongreldb-core --release --all-features --example ai_retrieval_bench \
   > ai-benchmark-100k.json
 python3 scripts/validate-ai-benchmark.py \
   ai-benchmark-100k.json docs/ai/benchmark-thresholds.json \
@@ -40,7 +40,12 @@ exhaustive Hamming, end-to-end ANN recall against exhaustive cosine, and
 filtered hybrid latency, exact ANN rerank latency/recall, and explicit
 checkpoint inspection status. Hybrid output includes candidate, hard-filter,
 fusion, and projection p95 stage timings. Sparse and MinHash use deterministic
-corpus/query shapes. No pull-request test asserts wall-clock thresholds.
+corpus/query shapes. Qualification also proves a 100,000-candidate query only
+projects its 20-row ranked window, then measures clean and operational layouts,
+5% updates, 1% deletes, TTL, nine immutable runs, hot and mutable tiers,
+candidate-aware RLS at 1%, 10%, and 50% selectivity, column masks, encrypted AI
+columns, and a labeled support-retrieval corpus. No pull-request test asserts
+wall-clock thresholds.
 
 Publish reports with named CPU, memory, compiler, build features, warmup policy,
 and the unmodified JSON output. Do not compare index bytes with base-table

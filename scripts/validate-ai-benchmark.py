@@ -74,8 +74,33 @@ def main():
         require(operational.get("immutable_runs", 0) > 1, "operational profile must contain multiple runs")
         require(operational.get("hot_memtable_rows", 0) > 0, "operational profile must retain a hot memtable")
         require(operational.get("mutable_run_rows", 0) > 0, "operational profile must retain a mutable run")
+        multi_tenant = nested(report, "qualification_profiles.multi_tenant")
+        require(multi_tenant.get("rows") == expected_rows, "multi-tenant profile row count is incomplete")
+        require(multi_tenant.get("column_masks", 0) > 0, "multi-tenant profile must configure a column mask")
+        rls_profiles = multi_tenant.get("profiles", [])
+        require(
+            {entry.get("selectivity") for entry in rls_profiles} == {0.01, 0.10, 0.50},
+            "multi-tenant profile selectivity matrix is incomplete",
+        )
+        for entry in rls_profiles:
+            require(entry.get("hits") == 10, "multi-tenant profile must return ten authorized hits")
+            require(entry.get("rows_evaluated", 0) > 0, "multi-tenant profile did not evaluate RLS")
+            require(
+                entry.get("policy_columns_decoded") == entry.get("rows_evaluated"),
+                "multi-tenant profile decoded unrelated policy columns",
+            )
+        encrypted = nested(report, "qualification_profiles.encrypted")
+        require(encrypted.get("enabled") is True, "encrypted profile must run in qualification")
+        require(encrypted.get("rows", 0) > 0, "encrypted profile is empty")
+        require(encrypted.get("hits", 0) > 0, "encrypted profile retrieval returned no hits")
+        realistic = nested(report, "qualification_profiles.realistic")
+        require(realistic.get("rows", 0) > 0, "realistic profile is empty")
+        require(
+            realistic.get("exact_rerank_recall_at_4") == 1.0,
+            "realistic profile exact-rerank recall must be 1.0",
+        )
     except (KeyError, TypeError):
-        errors.append("missing clean or operational qualification profile")
+        errors.append("missing qualification profile")
 
     payloads = report.get("index_payloads", [])
     payload_kinds = {payload.get("kind") for payload in payloads if payload.get("payload_bytes", 0) > 0}

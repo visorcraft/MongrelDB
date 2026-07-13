@@ -149,7 +149,13 @@ async fn kit_ai_indexes_work_over_wire_and_validate_values() {
         "table":"docs",
         "retriever":{"sparse":{"column_id":3,"query":[[1,2.0]],"k":2}}
     });
-    let (status, body) = request(app.clone(), "POST", "/kit/retrieve", Some(retrieve)).await;
+    let (status, body) = request(
+        app.clone(),
+        "POST",
+        "/kit/retrieve",
+        Some(retrieve.clone()),
+    )
+    .await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["hits"][0]["rank"], 1);
     assert_eq!(body["hits"][0]["score"]["kind"], "sparse_dot_product");
@@ -159,7 +165,13 @@ async fn kit_ai_indexes_work_over_wire_and_validate_values() {
         "table":"docs", "column_id":5, "members":["a","b","c","d"],
         "candidate_k":10, "min_jaccard":0.7, "limit":10
     });
-    let (status, body) = request(app.clone(), "POST", "/kit/set_similarity", Some(exact)).await;
+    let (status, body) = request(
+        app.clone(),
+        "POST",
+        "/kit/set_similarity",
+        Some(exact.clone()),
+    )
+    .await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["hits"].as_array().unwrap().len(), 1);
     assert_eq!(body["hits"][0]["exact_jaccard"], 1.0);
@@ -173,7 +185,7 @@ async fn kit_ai_indexes_work_over_wire_and_validate_values() {
         app.clone(),
         "POST",
         "/kit/ann_rerank",
-        Some(ann_rerank),
+        Some(ann_rerank.clone()),
     )
     .await;
     assert_eq!(status, 200, "{body}");
@@ -199,7 +211,13 @@ async fn kit_ai_indexes_work_over_wire_and_validate_values() {
         "projection":[1],
         "explain":true
     });
-    let (status, body) = request(app.clone(), "POST", "/kit/search", Some(search)).await;
+    let (status, body) = request(
+        app.clone(),
+        "POST",
+        "/kit/search",
+        Some(search.clone()),
+    )
+    .await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["hits"].as_array().unwrap().len(), 2, "{body}");
     assert_eq!(body["hits"][0]["cells"], serde_json::json!([1, 3]));
@@ -215,6 +233,18 @@ async fn kit_ai_indexes_work_over_wire_and_validate_values() {
 
     let (status, body) = request(app.clone(), "GET", "/kit/ai/metrics", None).await;
     assert_eq!(status, 200, "{body}");
+
+    for (path, mut request_body) in [
+        ("/kit/retrieve", retrieve),
+        ("/kit/set_similarity", exact),
+        ("/kit/ann_rerank", ann_rerank),
+        ("/kit/search", search),
+    ] {
+        request_body["max_work"] = serde_json::json!(1);
+        let (status, body) = request(app.clone(), "POST", path, Some(request_body)).await;
+        assert_eq!(status, 429, "{path}: {body}");
+        assert_eq!(body["error"]["code"], "WORK_BUDGET_EXCEEDED", "{body}");
+    }
 
     let invalid = serde_json::json!({"ops":[{"put":{"table":"docs","cells":[1,9,4,[1,2]]}}]});
     let (status, body) = request(app.clone(), "POST", "/kit/txn", Some(invalid)).await;

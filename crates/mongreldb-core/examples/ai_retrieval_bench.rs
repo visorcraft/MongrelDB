@@ -134,6 +134,105 @@ fn env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn realistic_profile() -> serde_json::Value {
+    let dir = tempfile::tempdir().unwrap();
+    let column = |id, name: &str, ty, primary_key| ColumnDef {
+        id,
+        name: name.into(),
+        ty,
+        flags: if primary_key {
+            ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY)
+        } else {
+            ColumnFlags::empty()
+        },
+        default_value: None,
+    };
+    let mut table = Table::create(
+        dir.path(),
+        Schema {
+            schema_id: 2,
+            columns: vec![
+                column(1, "id", TypeId::Int64, true),
+                column(2, "text", TypeId::Bytes, false),
+                column(3, "embedding", TypeId::Embedding { dim: 3 }, false),
+                column(4, "sparse", TypeId::Bytes, false),
+            ],
+            indexes: vec![
+                index("embedding", 3, IndexKind::Ann),
+                index("sparse", 4, IndexKind::Sparse),
+            ],
+            ..Schema::default()
+        },
+        2,
+    )
+    .unwrap();
+    let documents = [
+        "reset a forgotten account password",
+        "change login credentials securely",
+        "recover access after password loss",
+        "enable multi factor account login",
+        "refund a duplicate card charge",
+        "invoice shows the wrong subscription amount",
+        "payment failed during plan renewal",
+        "download a receipt for billing records",
+        "application crashes while importing data",
+        "service returns an error during startup",
+        "debug a timeout in the desktop client",
+        "collect logs for a reproducible software bug",
+    ];
+    let mut truth = [HashSet::new(), HashSet::new(), HashSet::new()];
+    for (id, text) in documents.iter().enumerate() {
+        let topic = id / 4;
+        let vector = (0..3)
+            .map(|dimension| if dimension == topic { 1.0 } else { -1.0 })
+            .collect();
+        let row_id = table
+            .put(vec![
+                (1, Value::Int64(id as i64)),
+                (2, Value::Bytes(text.as_bytes().to_vec())),
+                (3, Value::Embedding(vector)),
+                (
+                    4,
+                    Value::Bytes(
+                        bincode::serialize(&vec![(topic as u32, 1.0f32), (id as u32 + 10, 0.5)])
+                            .unwrap(),
+                    ),
+                ),
+            ])
+            .unwrap();
+        truth[topic].insert(row_id.0);
+    }
+    table.commit().unwrap();
+    table.close().unwrap();
+    let mut recall_sum = 0.0;
+    let mut latency = Vec::new();
+    for (topic, expected) in truth.iter().enumerate() {
+        let query = (0..3)
+            .map(|dimension| if dimension == topic { 1.0 } else { -1.0 })
+            .collect();
+        let started = Instant::now();
+        let hits = table
+            .ann_rerank(&AnnRerankRequest {
+                column_id: 3,
+                query,
+                candidate_k: documents.len(),
+                limit: 4,
+                metric: VectorMetric::Cosine,
+            })
+            .unwrap();
+        latency.push(started.elapsed().as_micros());
+        recall_sum += recall(hits.into_iter().map(|hit| hit.row_id.0), expected, 4);
+    }
+    serde_json::json!({
+        "name": "curated_support_corpus",
+        "rows": documents.len(),
+        "queries": 3,
+        "exact_rerank_recall_at_4": recall_sum / 3.0,
+        "p50_us": percentile(&mut latency, 0.50),
+        "p95_us": percentile(&mut latency, 0.95),
+    })
+}
+
 fn main() {
     let qualification_mode =
         std::env::var("MONGRELDB_AI_QUALIFICATION").is_ok_and(|value| value == "1");
@@ -623,6 +722,52 @@ fn main() {
             operational_projection_rows.saturating_add(trace.projection_rows);
     }
     let operational_build_ms = operational_started.elapsed().as_millis();
+    #[cfg(feature = "encryption")]
+    let encrypted_profile = {
+        let encrypted_rows = rows.min(env_usize("MONGRELDB_AI_BENCH_ENCRYPTED_ROWS", 10_000));
+        let encrypted_dir = tempfile::tempdir().unwrap();
+        let mut encrypted = Table::create_encrypted(
+            encrypted_dir.path(),
+            schema(),
+            3,
+            "qualification-passphrase",
+        )
+        .unwrap();
+        let build_started = Instant::now();
+        for id in 0..encrypted_rows {
+            encrypted
+                .put(vec![
+                    (1, Value::Int64(id as i64)),
+                    (2, Value::Bytes(b"encrypted".to_vec())),
+                    (3, Value::Embedding(embedding(id))),
+                    (
+                        4,
+                        Value::Bytes(bincode::serialize(&stored_sparse(id)).unwrap()),
+                    ),
+                    (5, Value::Bytes(serde_json::to_vec(&members(id)).unwrap())),
+                    (6, Value::Int64(ingested_at)),
+                    (7, Value::Bytes(owner(id).as_bytes().to_vec())),
+                ])
+                .unwrap();
+        }
+        encrypted.commit().unwrap();
+        encrypted.close().unwrap();
+        let build_ms = build_started.elapsed().as_millis();
+        let started = Instant::now();
+        let hits = encrypted
+            .ann_rerank(&AnnRerankRequest {
+                column_id: 3,
+                query: embedding(0),
+                candidate_k: encrypted_rows.min(100),
+                limit: encrypted_rows.min(10),
+                metric: VectorMetric::Cosine,
+            })
+            .unwrap();
+        serde_json::json!({"enabled": true, "rows": encrypted_rows, "build_ms": build_ms, "exact_rerank_us": started.elapsed().as_micros(), "hits": hits.len(), "encrypted_columns": ["embedding", "sparse", "members"]})
+    };
+    #[cfg(not(feature = "encryption"))]
+    let encrypted_profile = serde_json::json!({"enabled": false});
+    let realistic_profile = realistic_profile();
     let git_sha = std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
         .output()
@@ -661,7 +806,7 @@ fn main() {
         "hardware": {"arch": std::env::consts::ARCH, "os": std::env::consts::OS, "label": std::env::var("MONGRELDB_BENCH_HARDWARE").unwrap_or_default()},
         "rustc": rustc,
         "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
-        "features": "default",
+        "features": if cfg!(feature = "encryption") { "all" } else { "default" },
         "warmup_queries": 5.min(rows),
         "rows": rows,
         "queries": queries,
@@ -684,6 +829,8 @@ fn main() {
             "clean": {"rows": rows, "deletes": 0, "updates": 0, "ttl": false},
             "operational": {"rows": rows, "updates": update_count, "deletes": delete_count, "ttl": true, "immutable_runs": table.run_count(), "hot_memtable_rows": table.memtable_len(), "mutable_run_rows": table.mutable_run_len(), "mutation_ms": operational_build_ms, "retrieval_p50_us": percentile(&mut operational_us, 0.50), "retrieval_p95_us": percentile(&mut operational_us, 0.95), "average_projection_rows": operational_projection_rows as f64 / queries.min(10) as f64},
             "multi_tenant": {"rows": rows, "column_masks": rls_security.masks.len(), "profiles": rls_profiles},
+            "encrypted": encrypted_profile,
+            "realistic": realistic_profile,
         },
     });
     println!("{report}");

@@ -303,11 +303,12 @@ struct ScoredFunction {
     runtime: Arc<ScoredRuntime>,
 }
 
+type ScoredExecution =
+    dyn Fn(&mongreldb_core::query::AiExecutionContext) -> DFResult<RecordBatch> + Send + Sync;
+
 struct LiveScoredProvider {
     schema: SchemaRef,
-    execute: Arc<
-        dyn Fn(&mongreldb_core::query::AiExecutionContext) -> DFResult<RecordBatch> + Send + Sync,
-    >,
+    execute: Arc<ScoredExecution>,
     runtime: Arc<ScoredRuntime>,
 }
 

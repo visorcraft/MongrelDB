@@ -1727,11 +1727,11 @@ impl Database {
         table_name: &str,
         table: &Table,
         table_snapshot: Snapshot,
-        security: &crate::security::SecurityCatalog,
-        security_version: u64,
+        security_state: (&crate::security::SecurityCatalog, u64),
         principal: Option<&crate::auth::Principal>,
         context: Option<&crate::query::AiExecutionContext>,
     ) -> Result<Option<Arc<HashSet<RowId>>>> {
+        let (security, security_version) = security_state;
         if !security.rls_enabled(table_name) {
             return Ok(None);
         }
@@ -1881,8 +1881,7 @@ impl Database {
                     table_name,
                     &table,
                     snapshot,
-                    &security,
-                    security_version,
+                    (&security, security_version),
                     effective_principal.as_ref(),
                     context,
                 )?;
@@ -2105,8 +2104,7 @@ impl Database {
                 table,
                 &table_handle,
                 table_snapshot,
-                &security,
-                security_version,
+                (&security, security_version),
                 effective_principal.as_ref(),
                 None,
             )?;

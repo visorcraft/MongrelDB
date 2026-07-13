@@ -409,7 +409,9 @@ recovery.
 ```rust
 use mongreldb_client::MongrelClient;
 
-let client = MongrelClient::new("http://127.0.0.1:8453");
+let client = MongrelClient::builder("http://127.0.0.1:8453")
+    .bearer_token("token")
+    .build()?;
 
 // SQL
 let batches = client.sql("SELECT * FROM events WHERE score > 90")?;
@@ -420,6 +422,9 @@ let count = client.count("events")?;
 // Typed Kit operations
 let schema = client.kit_schema()?;
 ```
+
+Use `.basic_auth(username, password)` for HTTP Basic. `AsyncMongrelClient`
+provides the same builders and typed AI routes for Tokio applications.
 
 ## Connecting from Node.js
 

@@ -201,7 +201,7 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 MONGRELDB_DB_PATH="$RUNNER_TEMP/mongreldb-ai-wire" python3 tools/ai-wire/demo_minhash.py 2>&1 | tee "$QUAL_DIR/ai-wire-minhash.log"
       - name: AI benchmark
         run: |
-          MONGRELDB_AI_QUALIFICATION=1 MONGRELDB_AI_BENCH_ROWS=100000 MONGRELDB_AI_BENCH_QUERIES=50 cargo run -p mongreldb-core --release --example ai_retrieval_bench > "$QUAL_DIR/ai-benchmark-100k.json" 2> "$QUAL_DIR/ai-benchmark-100k.log"
+          MONGRELDB_AI_QUALIFICATION=1 MONGRELDB_AI_BENCH_ROWS=100000 MONGRELDB_AI_BENCH_QUERIES=50 cargo run -p mongreldb-core --release --all-features --example ai_retrieval_bench > "$QUAL_DIR/ai-benchmark-100k.json" 2> "$QUAL_DIR/ai-benchmark-100k.log"
           python3 scripts/validate-ai-benchmark.py "$QUAL_DIR/ai-benchmark-100k.json" docs/ai/benchmark-thresholds.json --expected-sha "$GITHUB_SHA" 2>&1 | tee "$QUAL_DIR/ai-benchmark-validation.log"
           test -z "$(git status --porcelain)"
       - uses: actions/upload-artifact@v7

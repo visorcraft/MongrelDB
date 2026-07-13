@@ -81,8 +81,11 @@ cannot recover an LSH miss. The scored `Retriever` API and `/kit/retrieve`
 preserve raw scores; `/kit/set_similarity` adds exact Jaccard verification.
 `SearchRequest` and `/kit/search` apply hard filters first, union named
 retrievers, fuse ranks with deterministic RRF, and return component plus fused
-scores. Filtered ANN uses adaptive over-fetch with a bounded search breadth, so
-a highly selective filter may honestly return fewer than `k` approximate hits.
+scores. An optional post-fusion exact-vector stage reranks a bounded candidate
+window while preserving the original fused score, exact score, final score,
+and final rank. Filtered retrieval evaluates RLS only for new approximate
+candidates and adaptively over-fetches, so a highly selective policy may
+honestly return fewer than `k` hits.
 SQL exposes projected scored table functions: `ann_search_scored`,
 `sparse_search_scored`, `minhash_search_scored`, `set_similarity_scored`, and
 `hybrid_search_scored`. `ann_search_exact` and the matching Rust, Kit HTTP,
@@ -92,8 +95,14 @@ full-precision vectors using cosine similarity, dot product, or L2 distance.
 Every public AI surface rejects non-finite or oversized input. Shared ceilings
 include 10,000 final hits, 100,000 candidates per retriever, 32 retrievers, 256
 hard conditions, 65,536 sparse terms or set members, and 4,096 projected
-columns. `/kit/search` also enforces a caller-adjustable work budget and a
-1-60,000 ms deadline, defaulting to 30,000 ms.
+columns. Hybrid unions stop at 250,000 candidates and materialize only ranked
+result windows. Every scored Kit endpoint accepts `deadline_ms` and `max_work`,
+runs off Tokio workers, cooperatively cancels engine work, and shares a bounded
+concurrency semaphore. Configure lower server ceilings with
+`MONGRELDB_AI_MAX_FUSED_CANDIDATES` and `MONGRELDB_AI_MAX_CONCURRENT`.
+Scored SQL uses the same controls through `MONGRELDB_SQL_AI_TIMEOUT_MS`,
+`MONGRELDB_SQL_AI_MAX_WORK`, `MONGRELDB_SQL_AI_MAX_FUSED_CANDIDATES`, and
+`MONGRELDB_SQL_AI_MAX_CONCURRENT`.
 
 Index options preserve existing defaults when omitted. `CREATE INDEX ... WITH
 (...)` and Kit schema definitions can tune ANN `m`, `ef_construction`, and
