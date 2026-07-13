@@ -63,7 +63,7 @@ unsafe fn make_simple_table(db: mongreldb_database_t, name: &str) {
     let col1 = mongreldb_column_def {
         id: 1,
         name: cstr("id"),
-        ty: mongreldb_type_id::Int64,
+        ty: mongreldb_type_id::Int64 as i32,
         flags: MONGRELDB_COL_PRIMARY_KEY,
         embedding_dim: 0,
         decimal_precision: 0,
@@ -76,7 +76,7 @@ unsafe fn make_simple_table(db: mongreldb_database_t, name: &str) {
     let col2 = mongreldb_column_def {
         id: 2,
         name: cstr("name"),
-        ty: mongreldb_type_id::Bytes,
+        ty: mongreldb_type_id::Bytes as i32,
         flags: MONGRELDB_COL_NULLABLE,
         embedding_dim: 0,
         decimal_precision: 0,
@@ -118,7 +118,7 @@ fn ffi_specialized_column_rejects_wrong_value_before_write() {
             mongreldb_column_def {
                 id: 1,
                 name: cstr("id"),
-                ty: mongreldb_type_id::Int64,
+                ty: mongreldb_type_id::Int64 as i32,
                 flags: MONGRELDB_COL_PRIMARY_KEY,
                 embedding_dim: 0,
                 decimal_precision: 0,
@@ -128,7 +128,7 @@ fn ffi_specialized_column_rejects_wrong_value_before_write() {
             mongreldb_column_def {
                 id: 2,
                 name: cstr("sparse"),
-                ty: mongreldb_type_id::Bytes,
+                ty: mongreldb_type_id::Bytes as i32,
                 flags: 0,
                 embedding_dim: 0,
                 decimal_precision: 0,
@@ -144,7 +144,7 @@ fn ffi_specialized_column_rejects_wrong_value_before_write() {
                 &mongreldb_index_def {
                     name: cstr("sparse_idx"),
                     column_id: 2,
-                    kind: mongreldb_index_kind::Sparse,
+                    kind: mongreldb_index_kind::Sparse as i32,
                 },
             ),
             0
@@ -188,7 +188,7 @@ fn ffi_exact_ann_rerank_returns_scored_hit() {
             mongreldb_column_def {
                 id: 1,
                 name: cstr("id"),
-                ty: mongreldb_type_id::Int64,
+                ty: mongreldb_type_id::Int64 as i32,
                 flags: MONGRELDB_COL_PRIMARY_KEY,
                 embedding_dim: 0,
                 decimal_precision: 0,
@@ -198,7 +198,7 @@ fn ffi_exact_ann_rerank_returns_scored_hit() {
             mongreldb_column_def {
                 id: 2,
                 name: cstr("embedding"),
-                ty: mongreldb_type_id::Embedding,
+                ty: mongreldb_type_id::Embedding as i32,
                 flags: MONGRELDB_COL_EMBEDDING_BINARY_QUANTIZED,
                 embedding_dim: 2,
                 decimal_precision: 0,
@@ -214,7 +214,7 @@ fn ffi_exact_ann_rerank_returns_scored_hit() {
                 &mongreldb_index_def {
                     name: cstr("ann_idx"),
                     column_id: 2,
-                    kind: mongreldb_index_kind::Ann,
+                    kind: mongreldb_index_kind::Ann as i32,
                 },
             ),
             0
@@ -236,7 +236,7 @@ fn ffi_exact_ann_rerank_returns_scored_hit() {
                 mongreldb_cell_input {
                     column_id: 2,
                     value: CValue {
-                        tag: CValueTag::Embedding,
+                        tag: CValueTag::Embedding as i32,
                         payload: CValuePayload {
                             embedding: EmbeddingSlice {
                                 data: embedding.as_ptr(),
@@ -368,7 +368,7 @@ fn ffi_put_and_query() {
             mongreldb_cell_input {
                 column_id: 2,
                 value: CValue {
-                    tag: CValueTag::Bytes,
+                    tag: CValueTag::Bytes as i32,
                     payload: CValuePayload {
                         bytes: ByteSlice::from_slice(&hello),
                     },

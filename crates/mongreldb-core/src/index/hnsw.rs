@@ -7,7 +7,9 @@
 //! an `ef`-beam. This is the standard HNSW (Malkov & Yashunin); `recall@k` is
 //! verified against brute force in the tests.
 
+use crate::query::AiExecutionContext;
 use crate::rowid::RowId;
+use crate::Result;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
 
@@ -135,21 +137,35 @@ impl Hnsw {
     /// k-nearest neighbors of `query_bits` (Hamming). `ef` controls the beam
     /// width (larger ⇒ higher recall).
     pub fn search(&self, query_bits: &[u8], k: usize, ef: usize) -> Vec<(RowId, Dist)> {
+        self.search_with_context(query_bits, k, ef, None)
+            .expect("context-free HNSW search cannot fail")
+    }
+
+    pub fn search_with_context(
+        &self,
+        query_bits: &[u8],
+        k: usize,
+        ef: usize,
+        context: Option<&AiExecutionContext>,
+    ) -> Result<Vec<(RowId, Dist)>> {
         let Some(entry) = self.entry else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
+        if let Some(context) = context {
+            context.checkpoint()?;
+        }
         let ef = ef.max(k);
         let mut ep: Vec<(Dist, usize)> = vec![(hamming(query_bits, &self.vectors[entry]), entry)];
         for lc in (1..=self.max_level).rev() {
-            ep = self.search_layer(query_bits, ep, 1, lc);
+            ep = self.search_layer_with_context(query_bits, ep, 1, lc, context)?;
         }
-        let mut results = self.search_layer(query_bits, ep, ef, 0);
+        let mut results = self.search_layer_with_context(query_bits, ep, ef, 0, context)?;
         results.sort_by_key(|(d, _)| *d);
-        results
+        Ok(results
             .into_iter()
             .take(k)
             .map(|(d, n)| (self.row_ids[n], d))
-            .collect()
+            .collect())
     }
 
     /// Greedy/beam best-first search on a single layer; returns up to `ef`
@@ -191,6 +207,49 @@ impl Hnsw {
             }
         }
         results.into_vec()
+    }
+
+    fn search_layer_with_context(
+        &self,
+        query_bits: &[u8],
+        entry_points: Vec<(Dist, usize)>,
+        ef: usize,
+        layer: i32,
+        context: Option<&AiExecutionContext>,
+    ) -> Result<Vec<(Dist, usize)>> {
+        let mut visited: HashSet<usize> = entry_points.iter().map(|(_, n)| *n).collect();
+        let mut candidates: BinaryHeap<Reverse<(Dist, usize)>> = entry_points
+            .iter()
+            .map(|(d, n)| Reverse((*d, *n)))
+            .collect();
+        let mut results: BinaryHeap<(Dist, usize)> =
+            entry_points.iter().map(|(d, n)| (*d, *n)).collect();
+        while let Some(Reverse((cd, c))) = candidates.pop() {
+            if let Some(context) = context {
+                context.checkpoint()?;
+            }
+            let worst = results.peek().map(|(d, _)| *d).unwrap_or(Dist::MAX);
+            if cd > worst && results.len() >= ef {
+                break;
+            }
+            for &e in &self.graph[c][layer as usize] {
+                if visited.insert(e) {
+                    if let Some(context) = context {
+                        context.consume(1)?;
+                    }
+                    let d = hamming(query_bits, &self.vectors[e]);
+                    let w = results.peek().map(|(dd, _)| *dd).unwrap_or(Dist::MAX);
+                    if d < w || results.len() < ef {
+                        candidates.push(Reverse((d, e)));
+                        results.push((d, e));
+                        if results.len() > ef {
+                            results.pop();
+                        }
+                    }
+                }
+            }
+        }
+        Ok(results.into_vec())
     }
 }
 

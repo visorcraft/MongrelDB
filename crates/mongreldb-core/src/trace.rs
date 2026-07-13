@@ -196,6 +196,7 @@ pub struct QueryTrace {
     pub authorization_nanos: u64,
     pub rls_cache_hit: bool,
     pub rls_rows_evaluated: usize,
+    pub rls_policy_columns_decoded: usize,
     pub authorization_retries: usize,
     /// AI retrieval stage timings and bounded cardinalities.
     pub hard_filter_nanos: u64,
@@ -211,6 +212,9 @@ pub struct QueryTrace {
     pub exact_set_parse_nanos: u64,
     pub exact_set_score_nanos: u64,
     pub projection_nanos: u64,
+    pub projection_rows: usize,
+    pub projection_cells: usize,
+    pub work_consumed: usize,
     pub total_nanos: u64,
 }
 

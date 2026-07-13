@@ -1,3 +1,5 @@
+#![allow(non_camel_case_types)]
+
 //! MongrelDB C ABI (`mongreldb-ffi`) — a stable, language-agnostic C interface
 //! over [`mongreldb_core`], the foundation for native language bindings.
 //!

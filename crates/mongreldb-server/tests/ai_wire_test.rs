@@ -188,19 +188,33 @@ async fn kit_ai_indexes_work_over_wire_and_validate_values() {
             {"name":"sparse","weight":1.0,"sparse":{"column_id":3,"query":[[2,1.0]],"k":1}}
         ],
         "fusion":{"reciprocal_rank":{"constant":60}},
+        "rerank":{"exact_vector":{
+            "embedding_column":4,
+            "query":[1,-1,1,-1,1,-1,-1,-1],
+            "metric":"cosine",
+            "candidate_limit":10,
+            "weight":1.0
+        }},
         "limit":10,
-        "projection":[1]
+        "projection":[1],
+        "explain":true
     });
     let (status, body) = request(app.clone(), "POST", "/kit/search", Some(search)).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["hits"].as_array().unwrap().len(), 2, "{body}");
-    assert_eq!(body["hits"][0]["cells"], serde_json::json!([1, 1]));
-    assert_eq!(body["hits"][1]["cells"], serde_json::json!([1, 3]));
+    assert_eq!(body["hits"][0]["cells"], serde_json::json!([1, 3]));
+    assert_eq!(body["hits"][1]["cells"], serde_json::json!([1, 1]));
+    assert_eq!(body["hits"][0]["final_rank"], 1);
+    assert!(body["hits"][0]["exact_rerank_score"].is_number());
     assert!(body["hits"]
         .as_array()
         .unwrap()
         .iter()
         .all(|hit| hit["fused_score"].as_f64().unwrap() > 0.0));
+    assert!(body["trace"].is_object(), "{body}");
+
+    let (status, body) = request(app.clone(), "GET", "/kit/ai/metrics", None).await;
+    assert_eq!(status, 200, "{body}");
 
     let invalid = serde_json::json!({"ops":[{"put":{"table":"docs","cells":[1,9,4,[1,2]]}}]});
     let (status, body) = request(app.clone(), "POST", "/kit/txn", Some(invalid)).await;

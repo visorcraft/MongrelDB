@@ -414,6 +414,60 @@ console.log('smoke: TxnTable sub-API ✓');
 }
 console.log('smoke: full-range Int64 / BigInt ✓');
 
+// ── Credentialed native reads honor RLS and masks ─────────────────────────
+{
+  const dir = makeTempDir();
+  const admin = Database.createWithCredentials(dir, 'admin', 'admin-pw');
+  admin.createTable('docs', {
+    columns: [
+      { id: 1, name: 'id', ty: ColumnType.Int64, primaryKey: true, nullable: false },
+      { id: 2, name: 'owner', ty: ColumnType.Bytes, primaryKey: false, nullable: false },
+      { id: 3, name: 'secret', ty: ColumnType.Bytes, primaryKey: false, nullable: false },
+      { id: 4, name: 'embedding', ty: ColumnType.Embedding, primaryKey: false, nullable: false, embeddingDim: 2 },
+    ],
+    indexes: [{ name: 'ann', columnId: 4, kind: 2 }],
+  });
+  const docs = admin.getTable('docs');
+  docs.put([
+    { columnId: 1, int64: 1n },
+    { columnId: 2, text: 'alice' },
+    { columnId: 3, text: 'alice-secret' },
+    { columnId: 4, embedding: [0.9, 0.1] },
+  ]);
+  docs.put([
+    { columnId: 1, int64: 2n },
+    { columnId: 2, text: 'bob' },
+    { columnId: 3, text: 'bob-secret' },
+    { columnId: 4, embedding: [1.0, 0.0] },
+  ]);
+  docs.commit();
+  admin.createUser('alice', 'alice-pw');
+  admin.createRole('reader');
+  admin.grantPermission('reader', 'select:docs');
+  admin.grantRole('alice', 'reader');
+  await admin.sql('ALTER TABLE docs ENABLE ROW LEVEL SECURITY');
+  await admin.sql('CREATE POLICY owner_only ON docs FOR SELECT TO PUBLIC USING (owner = CURRENT_USER)');
+  await admin.sql("CREATE MASK hide_secret ON docs(secret) USING REDACT '***'");
+
+  const alice = Database.openWithCredentials(dir, 'alice', 'alice-pw');
+  const aliceDocs = alice.getTable('docs');
+  const rows = aliceDocs.query([{ kind: ConditionKind.Ann, columnId: 4, embedding: [1, 0], k: 2 }]);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].cells.find((cell) => cell.columnId === 1).int64, 1n);
+  assert.equal(rows[0].cells.find((cell) => cell.columnId === 3).text, '***');
+  const reranked = aliceDocs.annRerank(4, [1, 0], 2, 1, 'cosine');
+  assert.equal(reranked.length, 1);
+  assert.equal(reranked[0].rowId, rows[0].rowId);
+  assert.equal(docs.query([]).length, 2);
+
+  admin.revokeRole('alice', 'reader');
+  assert.throws(() => aliceDocs.query([]), /PermissionDenied|permission denied/);
+  alice.close();
+  admin.close();
+  rmSync(dir, { recursive: true });
+}
+console.log('smoke: credentialed native RLS ✓');
+
 // ── Typed primary-key get/delete ───────────────────────────────────────────
 {
   const dir9 = makeTempDir();

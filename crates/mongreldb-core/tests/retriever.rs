@@ -434,6 +434,7 @@ fn hybrid_search_filters_unions_and_fuses_deterministically() {
         must: vec![],
         retrievers: vec![ann.clone(), sparse.clone()],
         fusion: Fusion::ReciprocalRank { constant: 60 },
+        rerank: None,
         limit: 10,
         projection: Some(vec![1]),
     };

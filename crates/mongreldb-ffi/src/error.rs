@@ -96,7 +96,7 @@ impl Drop for LastError {
     fn drop(&mut self) {
         // SAFETY: `message` was produced by `CString::into_raw` and is owned
         // exclusively by this struct.
-        drop_cstring_ptr(self.message);
+        unsafe { drop_cstring_ptr(self.message) };
         self.message = std::ptr::null_mut();
     }
 }
@@ -114,7 +114,7 @@ pub fn set_error(e: &MongrelError) -> ErrorCode {
         CString::new(msg).unwrap_or_else(|_| CString::new("error message contained NUL").unwrap());
     LAST_ERROR.with(|cell| {
         let mut last = cell.borrow_mut();
-        drop_cstring_ptr(last.message);
+        unsafe { drop_cstring_ptr(last.message) };
         last.code = code.as_return();
         last.message = cstring.into_raw();
     });
@@ -128,7 +128,7 @@ pub fn set_error_msg(code: ErrorCode, msg: impl Into<String>) -> ErrorCode {
         .unwrap_or_else(|_| CString::new("error message contained NUL").unwrap());
     LAST_ERROR.with(|cell| {
         let mut last = cell.borrow_mut();
-        drop_cstring_ptr(last.message);
+        unsafe { drop_cstring_ptr(last.message) };
         last.code = code.as_return();
         last.message = cstring.into_raw();
     });
@@ -140,7 +140,7 @@ pub fn set_error_msg(code: ErrorCode, msg: impl Into<String>) -> ErrorCode {
 pub fn clear() {
     LAST_ERROR.with(|cell| {
         let mut last = cell.borrow_mut();
-        drop_cstring_ptr(last.message);
+        unsafe { drop_cstring_ptr(last.message) };
         last.code = ErrorCode::Ok.as_return();
         last.message = std::ptr::null_mut();
     });
@@ -178,7 +178,7 @@ pub extern "C" fn mongreldb_last_error_code() -> i32 {
 /// [`mongreldb_last_error`] on the same thread, and must not have been passed
 /// to this function before.
 #[no_mangle]
-pub extern "C" fn mongreldb_free_error_string(ptr: *mut c_char) {
+pub unsafe extern "C" fn mongreldb_free_error_string(ptr: *mut c_char) {
     // Note: the thread-local still owns the pointer; if the caller frees the
     // active one, clear the slot so Drop doesn't double-free.
     if ptr.is_null() {
@@ -197,7 +197,7 @@ pub extern "C" fn mongreldb_free_error_string(ptr: *mut c_char) {
 
 /// Read a `*const c_char` into a Rust `String`, categorizing a null pointer as
 /// an [`ErrorCode::InvalidArgument`] error. Used pervasively by the FFI layer.
-pub fn require_string(ptr: *const c_char, what: &str) -> Result<String, ErrorCode> {
+pub unsafe fn require_string(ptr: *const c_char, what: &str) -> Result<String, ErrorCode> {
     if ptr.is_null() {
         return Err(set_error_msg(
             ErrorCode::InvalidArgument,
@@ -209,7 +209,7 @@ pub fn require_string(ptr: *const c_char, what: &str) -> Result<String, ErrorCod
 }
 
 /// Re-export so other modules can borrow the `CStr` slice form too.
-pub fn cstr_bytes<'a>(ptr: *const c_char) -> &'a [u8] {
+pub unsafe fn cstr_bytes<'a>(ptr: *const c_char) -> &'a [u8] {
     // SAFETY: caller guarantees a valid NUL-terminated C string that outlives
     // the borrow.
     unsafe { CStr::from_ptr(ptr).to_bytes() }

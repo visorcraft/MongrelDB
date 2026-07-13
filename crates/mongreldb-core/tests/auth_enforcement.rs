@@ -6,7 +6,12 @@
 //! fail-closed semantics. Table/Transaction/SQL enforcement lands in Phase 2.
 
 use mongreldb_core::auth::Permission;
-use mongreldb_core::{schema::*, Database, MongrelError, Value};
+use mongreldb_core::{
+    query::{AnnRerankRequest, Condition, Query, VectorMetric},
+    schema::*,
+    ColumnMask, Database, MaskStrategy, MongrelError, PolicyCommand, RowPolicy, SecurityCatalog,
+    SecurityExpr, Value,
+};
 use tempfile::tempdir;
 
 fn int_pk_schema() -> Schema {
@@ -24,6 +29,187 @@ fn int_pk_schema() -> Schema {
         constraints: Default::default(),
         clustered: false,
     }
+}
+
+#[test]
+fn secure_native_wrappers_apply_rls_masks_and_live_revocation() {
+    let dir = tempdir().unwrap();
+    let path = dir.path();
+    let admin = Database::create_with_credentials(path, "admin", "admin-pw").unwrap();
+    admin
+        .create_table(
+            "docs",
+            Schema {
+                schema_id: 2,
+                columns: vec![
+                    ColumnDef {
+                        id: 1,
+                        name: "id".into(),
+                        ty: TypeId::Int64,
+                        flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                        default_value: None,
+                    },
+                    ColumnDef {
+                        id: 2,
+                        name: "owner".into(),
+                        ty: TypeId::Bytes,
+                        flags: ColumnFlags::empty(),
+                        default_value: None,
+                    },
+                    ColumnDef {
+                        id: 3,
+                        name: "secret".into(),
+                        ty: TypeId::Bytes,
+                        flags: ColumnFlags::empty(),
+                        default_value: None,
+                    },
+                    ColumnDef {
+                        id: 4,
+                        name: "embedding".into(),
+                        ty: TypeId::Embedding { dim: 2 },
+                        flags: ColumnFlags::empty(),
+                        default_value: None,
+                    },
+                ],
+                indexes: vec![IndexDef {
+                    name: "ann".into(),
+                    column_id: 4,
+                    kind: IndexKind::Ann,
+                    predicate: None,
+                    options: Default::default(),
+                }],
+                ..Schema::default()
+            },
+        )
+        .unwrap();
+    let mut transaction = admin.begin();
+    transaction
+        .put(
+            "docs",
+            vec![
+                (1, Value::Int64(1)),
+                (2, Value::Bytes(b"alice".to_vec())),
+                (3, Value::Bytes(b"alice-secret".to_vec())),
+                (4, Value::Embedding(vec![0.9, -0.1])),
+            ],
+        )
+        .unwrap();
+    for id in 3..=10 {
+        transaction
+            .put(
+                "docs",
+                vec![
+                    (1, Value::Int64(id)),
+                    (2, Value::Bytes(b"bob".to_vec())),
+                    (3, Value::Bytes(b"hidden".to_vec())),
+                    (4, Value::Embedding(vec![-1.0, -1.0])),
+                ],
+            )
+            .unwrap();
+    }
+    transaction
+        .put(
+            "docs",
+            vec![
+                (1, Value::Int64(2)),
+                (2, Value::Bytes(b"bob".to_vec())),
+                (3, Value::Bytes(b"bob-secret".to_vec())),
+                (4, Value::Embedding(vec![1.0, 0.0])),
+            ],
+        )
+        .unwrap();
+    transaction.commit().unwrap();
+    for user in ["alice", "bob"] {
+        admin.create_user(user, &format!("{user}-pw")).unwrap();
+    }
+    admin.create_role("reader").unwrap();
+    admin
+        .grant_permission(
+            "reader",
+            Permission::Select {
+                table: "docs".into(),
+            },
+        )
+        .unwrap();
+    admin.grant_role("alice", "reader").unwrap();
+    admin.grant_role("bob", "reader").unwrap();
+    admin
+        .set_security_catalog(SecurityCatalog {
+            rls_tables: vec!["docs".into()],
+            policies: vec![RowPolicy {
+                name: "owner_only".into(),
+                table: "docs".into(),
+                command: PolicyCommand::Select,
+                subjects: vec!["public".into()],
+                permissive: true,
+                using: Some(SecurityExpr::ColumnEqCurrentUser { column: 2 }),
+                with_check: None,
+            }],
+            masks: vec![ColumnMask {
+                name: "redact_secret".into(),
+                table: "docs".into(),
+                column: 3,
+                strategy: MaskStrategy::Redact {
+                    replacement: "***".into(),
+                },
+                exempt_subjects: vec!["admin".into()],
+            }],
+        })
+        .unwrap();
+
+    let alice = Database::open_with_credentials(path, "alice", "alice-pw").unwrap();
+    let rows = alice
+        .query_for_current_principal("docs", &Query::new(), None)
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].columns.get(&1), Some(&Value::Int64(1)));
+    assert_eq!(
+        rows[0].columns.get(&3),
+        Some(&Value::Bytes(b"***".to_vec()))
+    );
+    let ann_rows = alice
+        .query_for_current_principal(
+            "docs",
+            &Query::new().and(Condition::Ann {
+                column_id: 4,
+                query: vec![1.0, 0.0],
+                k: 10,
+            }),
+            None,
+        )
+        .unwrap();
+    assert_eq!(ann_rows.len(), 1);
+    assert_eq!(ann_rows[0].columns.get(&1), Some(&Value::Int64(1)));
+    let (reranked, trace) = mongreldb_core::trace::QueryTrace::capture(|| {
+        alice.ann_rerank_for_current_principal(
+            "docs",
+            &AnnRerankRequest {
+                column_id: 4,
+                query: vec![1.0, 0.0],
+                candidate_k: 1,
+                limit: 1,
+                metric: VectorMetric::Cosine,
+            },
+        )
+    });
+    let reranked = reranked.unwrap();
+    assert_eq!(reranked.len(), 1);
+    assert_eq!(reranked[0].row_id, rows[0].row_id);
+    assert!(trace.rls_rows_evaluated < 10, "{trace:?}");
+    assert_eq!(trace.rls_policy_columns_decoded, trace.rls_rows_evaluated);
+    assert_eq!(
+        admin
+            .query_for_current_principal("docs", &Query::new(), None)
+            .unwrap()
+            .len(),
+        10
+    );
+
+    admin.revoke_role("alice", "reader").unwrap();
+    assert!(matches!(
+        alice.query_for_current_principal("docs", &Query::new(), None),
+        Err(MongrelError::PermissionDenied { .. })
+    ));
 }
 
 /// A credentialless database has `require_auth = false`, the `require()`

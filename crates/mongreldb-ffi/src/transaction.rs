@@ -48,7 +48,7 @@ enum StagedOp {
 /// a mutex-protected staging buffer.
 pub struct FFITransaction {
     pub db: Arc<CoreDatabase>,
-    pub staging: Mutex<Vec<StagedOp>>,
+    staging: Mutex<Vec<StagedOp>>,
 }
 
 impl FFITransaction {
@@ -377,7 +377,10 @@ fn apply_txn(db: &CoreDatabase, stage: &[StagedOp]) -> Result<Epoch, ErrorCode> 
 // (the cell-pair conversion goes through `cell_inputs_to_pairs`, but the
 // import documents the value-marshal path).
 #[allow(dead_code)]
-fn _ensure_c_to_value_imported(v: &crate::value::CValue, ty: &TypeId) -> Value {
+fn _ensure_c_to_value_imported(
+    v: &crate::value::CValue,
+    ty: &TypeId,
+) -> Result<Value, crate::error::ErrorCode> {
     // SAFETY: only invoked from this module's own tests with valid values.
     unsafe { c_to_value(v, ty) }
 }

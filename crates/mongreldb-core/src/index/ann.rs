@@ -103,8 +103,18 @@ impl AnnIndex {
 
     /// k-nearest by Hamming distance.
     pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<(RowId, u32)>> {
+        self.search_with_context(query, k, None)
+    }
+
+    pub fn search_with_context(
+        &self,
+        query: &[f32],
+        k: usize,
+        context: Option<&crate::query::AiExecutionContext>,
+    ) -> Result<Vec<(RowId, u32)>> {
         let q = self.quantize(query)?;
-        Ok(self.graph.search(&q, k, self.ef_search))
+        self.graph
+            .search_with_context(&q, k, self.ef_search, context)
     }
 
     pub fn len(&self) -> usize {

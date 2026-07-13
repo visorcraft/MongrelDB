@@ -60,6 +60,218 @@ static void make_simple_table(mongreldb_database_t *db, const char *name) {
     /* create_table consumes the schema handle — do NOT free it. */
 }
 
+static void expect_invalid(int32_t rc, const char *message) {
+    assert(rc == MDB_ERR_INVALID_ARGUMENT);
+    assert(mongreldb_last_error_code() == MDB_ERR_INVALID_ARGUMENT);
+    assert(strcmp(mongreldb_last_error(), message) == 0);
+}
+
+static void test_invalid_discriminants(mongreldb_database_t *db) {
+    mongreldb_schema_builder_t *builder = mongreldb_schema_begin();
+    mongreldb_column_def bad_column = {
+        .id = 9, .name = "bad", .ty = 99,
+    };
+    expect_invalid(
+        mongreldb_schema_add_column(builder, &bad_column),
+        "invalid type id 99");
+
+    mongreldb_index_def bad_index = {
+        .name = "bad_idx", .column_id = 1, .kind = 99,
+    };
+    expect_invalid(
+        mongreldb_schema_add_index(builder, &bad_index),
+        "invalid index kind 99");
+
+    mongreldb_foreign_key bad_fk = {
+        .id = 1, .name = "bad_fk", .ref_table = "items",
+        .on_delete = 99, .on_update = MDB_FK_RESTRICT,
+    };
+    expect_invalid(
+        mongreldb_schema_add_foreign_key(builder, &bad_fk),
+        "invalid foreign key action 99");
+    mongreldb_schema_builder_free(builder);
+
+    mongreldb_table_t *table = mongreldb_database_table(db, "items");
+    assert(table);
+    mongreldb_cell_input bad_cell = { .column_id = 1 };
+    bad_cell.value.tag = 99;
+    mongreldb_cell_input_array bad_cells = { .data = &bad_cell, .len = 1 };
+    expect_invalid(
+        mongreldb_table_put(table, &bad_cells, NULL),
+        "invalid value tag 99");
+
+    mongreldb_query_t *query = mongreldb_query_begin();
+    mongreldb_condition bad_condition = { .kind = 99 };
+    expect_invalid(
+        mongreldb_query_add(query, &bad_condition),
+        "invalid condition kind 99");
+    mongreldb_query_free(query);
+    mongreldb_table_free(table);
+}
+
+static void put_secure_row(
+    mongreldb_table_t *table,
+    int64_t id,
+    const char *owner,
+    const char *secret,
+    const float embedding[2]) {
+    mongreldb_cell_input cells[4] = {0};
+    cells[0].column_id = 1;
+    cells[0].value.tag = MDB_VALUE_INT64;
+    cells[0].value.v.i64 = id;
+    cells[1].column_id = 2;
+    cells[1].value.tag = MDB_VALUE_BYTES;
+    cells[1].value.v.bytes.data = (const uint8_t *)owner;
+    cells[1].value.v.bytes.len = strlen(owner);
+    cells[2].column_id = 3;
+    cells[2].value.tag = MDB_VALUE_BYTES;
+    cells[2].value.v.bytes.data = (const uint8_t *)secret;
+    cells[2].value.v.bytes.len = strlen(secret);
+    cells[3].column_id = 4;
+    cells[3].value.tag = MDB_VALUE_EMBEDDING;
+    cells[3].value.v.embedding.data = embedding;
+    cells[3].value.v.embedding.len = 2;
+    mongreldb_cell_input_array input = { .data = cells, .len = 4 };
+    CHECK(mongreldb_table_put(table, &input, NULL));
+}
+
+static mongreldb_result_t *ann_query(mongreldb_table_t *table, const float embedding[2]) {
+    mongreldb_query_t *query = mongreldb_query_begin();
+    mongreldb_condition condition = {0};
+    condition.kind = MDB_COND_ANN;
+    condition.column_id = 4;
+    condition.k = 2;
+    condition.embedding.data = embedding;
+    condition.embedding.len = 2;
+    CHECK(mongreldb_query_add(query, &condition));
+    mongreldb_result_t *result = mongreldb_table_query(table, query);
+    mongreldb_query_free(query);
+    return result;
+}
+
+static void test_authenticated_native_reads(void) {
+    char tmpl[] = "/tmp/mdb_c_auth_test_XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    if (!dir) { perror("mkdtemp"); exit(1); }
+
+    mongreldb_database_t *admin =
+        mongreldb_create_with_credentials(dir, "admin", "admin-pw");
+    assert(admin);
+
+    mongreldb_schema_builder_t *builder = mongreldb_schema_begin();
+    mongreldb_string_array no_variants = {0};
+    mongreldb_column_def columns[] = {
+        { .id = 1, .name = "id", .ty = MDB_TYPE_INT64,
+          .flags = MDB_COL_PRIMARY_KEY, .enum_variants = no_variants },
+        { .id = 2, .name = "owner", .ty = MDB_TYPE_BYTES,
+          .enum_variants = no_variants },
+        { .id = 3, .name = "secret", .ty = MDB_TYPE_BYTES,
+          .enum_variants = no_variants },
+        { .id = 4, .name = "embedding", .ty = MDB_TYPE_EMBEDDING,
+          .flags = MDB_COL_EMBEDDING_BINARY_QUANTIZED,
+          .embedding_dim = 2, .enum_variants = no_variants },
+    };
+    for (size_t i = 0; i < sizeof(columns) / sizeof(columns[0]); i++) {
+        CHECK(mongreldb_schema_add_column(builder, &columns[i]));
+    }
+    mongreldb_index_def index = {
+        .name = "ann_idx", .column_id = 4, .kind = MDB_INDEX_ANN,
+    };
+    CHECK(mongreldb_schema_add_index(builder, &index));
+    mongreldb_schema_t *schema = mongreldb_schema_build(builder);
+    assert(schema);
+    mongreldb_schema_builder_free(builder);
+    uint64_t table_id = 0;
+    CHECK(mongreldb_create_table(admin, "docs", schema, &table_id));
+
+    mongreldb_table_t *admin_table = mongreldb_database_table(admin, "docs");
+    assert(admin_table);
+    const float alice_embedding[2] = {0.0f, 1.0f};
+    const float bob_embedding[2] = {1.0f, 0.0f};
+    put_secure_row(admin_table, 1, "alice", "alice-secret", alice_embedding);
+    put_secure_row(admin_table, 2, "bob", "bob-secret", bob_embedding);
+
+    CHECK(mongreldb_create_user(admin, "alice", "alice-pw"));
+    CHECK(mongreldb_create_role(admin, "reader"));
+    CHECK(mongreldb_grant_permission(admin, "reader", "select:docs"));
+    CHECK(mongreldb_grant_role(admin, "alice", "reader"));
+    CHECK(mongreldb_database_sql_refresh(admin));
+    uint8_t *sql_buf = NULL;
+    size_t sql_len = 0;
+    CHECK(mongreldb_database_sql(admin,
+        "ALTER TABLE docs ENABLE ROW LEVEL SECURITY", &sql_buf, &sql_len));
+    mongreldb_free_sql_result(sql_buf, sql_len);
+    CHECK(mongreldb_database_sql(admin,
+        "CREATE POLICY owner_only ON docs FOR SELECT TO PUBLIC USING (owner = CURRENT_USER)",
+        &sql_buf, &sql_len));
+    mongreldb_free_sql_result(sql_buf, sql_len);
+    CHECK(mongreldb_database_sql(admin,
+        "CREATE MASK hide_secret ON docs(secret) USING REDACT '***'",
+        &sql_buf, &sql_len));
+    mongreldb_free_sql_result(sql_buf, sql_len);
+
+    mongreldb_database_t *alice =
+        mongreldb_open_with_credentials(dir, "alice", "alice-pw");
+    assert(alice);
+    mongreldb_table_t *alice_table = mongreldb_database_table(alice, "docs");
+    assert(alice_table);
+
+    mongreldb_result_t *result = ann_query(alice_table, bob_embedding);
+    assert(result);
+    assert(mongreldb_result_count(result) == 1);
+    mongreldb_row row = {0};
+    CHECK(mongreldb_result_row(result, 0, &row));
+    int saw_owner = 0;
+    int saw_mask = 0;
+    for (size_t i = 0; i < mongreldb_row_cell_count(&row); i++) {
+        mongreldb_cell cell = {0};
+        CHECK(mongreldb_row_cell(&row, i, &cell));
+        if (cell.column_id == 2) {
+            saw_owner = cell.value.tag == MDB_VALUE_BYTES &&
+                cell.value.v.bytes.len == 5 &&
+                memcmp(cell.value.v.bytes.data, "alice", 5) == 0;
+        }
+        if (cell.column_id == 3) {
+            saw_mask = cell.value.tag == MDB_VALUE_BYTES &&
+                cell.value.v.bytes.len == 3 &&
+                memcmp(cell.value.v.bytes.data, "***", 3) == 0;
+        }
+    }
+    assert(saw_owner && saw_mask);
+    mongreldb_result_free(result);
+
+    mongreldb_ann_rerank_result_t *reranked = mongreldb_table_ann_rerank(
+        alice_table, 4,
+        (mongreldb_embedding_view){ .data = bob_embedding, .len = 2 },
+        2, 1, MDB_VECTOR_COSINE);
+    assert(reranked);
+    assert(mongreldb_ann_rerank_result_count(reranked) == 1);
+    mongreldb_ann_rerank_result_free(reranked);
+
+    reranked = mongreldb_table_ann_rerank(
+        alice_table, 4,
+        (mongreldb_embedding_view){ .data = bob_embedding, .len = 2 },
+        2, 1, 99);
+    assert(reranked == NULL);
+    assert(mongreldb_last_error_code() == MDB_ERR_INVALID_ARGUMENT);
+    assert(strcmp(mongreldb_last_error(),
+        "invalid vector metric 99; expected 0, 1, or 2") == 0);
+
+    result = ann_query(admin_table, bob_embedding);
+    assert(result && mongreldb_result_count(result) == 2);
+    mongreldb_result_free(result);
+
+    CHECK(mongreldb_revoke_role(admin, "alice", "reader"));
+    result = ann_query(alice_table, bob_embedding);
+    assert(result == NULL);
+    assert(mongreldb_last_error_code() == MDB_ERR_UNAUTHORIZED);
+
+    mongreldb_table_free(alice_table);
+    mongreldb_database_free(alice);
+    mongreldb_table_free(admin_table);
+    mongreldb_database_free(admin);
+}
+
 int main(void) {
     /* ── Database lifecycle ──────────────────────────────────────────── */
     mongreldb_database_t *db = create_test_db();
@@ -68,6 +280,8 @@ int main(void) {
     /* ── Schema + table ──────────────────────────────────────────────── */
     make_simple_table(db, "items");
     printf("2. table created\n");
+    test_invalid_discriminants(db);
+    printf("2a. invalid discriminants rejected\n");
 
     /* ── Table put ───────────────────────────────────────────────────── */
     mongreldb_table_t *table = mongreldb_database_table(db, "items");
@@ -111,7 +325,8 @@ int main(void) {
     CHECK(mongreldb_result_row(result, 0, &row));
     assert(mongreldb_row_cell_count(&row) >= 1);
 
-    mongreldb_cell c0 = mongreldb_row_cell(&row, 0);
+    mongreldb_cell c0 = {0};
+    CHECK(mongreldb_row_cell(&row, 0, &c0));
     printf("6. row 0: col_id=%u, tag=%d, i64=%lld\n", c0.column_id, c0.value.tag, (long long)c0.value.v.i64);
 
     mongreldb_result_free(result);
@@ -238,6 +453,8 @@ int main(void) {
 
     /* ── Cleanup ─────────────────────────────────────────────────────── */
     mongreldb_database_free(db);
+    test_authenticated_native_reads();
+    printf("19. authenticated native reads enforced\n");
     printf("\nAll C smoke tests passed!\n");
     return 0;
 }

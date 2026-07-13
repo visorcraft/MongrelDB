@@ -84,16 +84,6 @@ pub enum mongreldb_fk_action {
     SetNull = 2,
 }
 
-impl mongreldb_fk_action {
-    fn to_core(self) -> FkAction {
-        match self {
-            mongreldb_fk_action::Restrict => FkAction::Restrict,
-            mongreldb_fk_action::Cascade => FkAction::Cascade,
-            mongreldb_fk_action::SetNull => FkAction::SetNull,
-        }
-    }
-}
-
 // ── structs ───────────────────────────────────────────────────────────────
 
 /// A borrowed byte slice for column-id arrays (unique constraints / FKs).
@@ -136,7 +126,8 @@ impl Default for StringArray {
 pub struct mongreldb_column_def {
     pub id: u16,
     pub name: *const c_char,
-    pub ty: mongreldb_type_id,
+    /// C ABI integer. Invalid values are rejected by the builder.
+    pub ty: i32,
     pub flags: u32,
     /// Required when `ty == Embedding`.
     pub embedding_dim: u32,
@@ -167,7 +158,8 @@ pub const MONGRELDB_COL_AUTO_INCREMENT: u32 = ColumnFlags::AUTO_INCREMENT;
 pub struct mongreldb_index_def {
     pub name: *const c_char,
     pub column_id: u16,
-    pub kind: mongreldb_index_kind,
+    /// C ABI integer. Invalid values are rejected by the builder.
+    pub kind: i32,
 }
 
 /// A multi-column uniqueness constraint.
@@ -186,8 +178,9 @@ pub struct mongreldb_foreign_key {
     pub columns: U16Slice,
     pub ref_table: *const c_char,
     pub ref_columns: U16Slice,
-    pub on_delete: mongreldb_fk_action,
-    pub on_update: mongreldb_fk_action,
+    /// C ABI integers. Invalid values are rejected by the builder.
+    pub on_delete: i32,
+    pub on_update: i32,
 }
 
 // ── type/flag resolution helpers ──────────────────────────────────────────
@@ -211,45 +204,78 @@ fn cstr_to_string_lossy(ptr: *const c_char, what: &str) -> Result<String, ErrorC
 
 /// Build a core [`TypeId`] from a C type id + side fields.
 pub fn type_id_from_c(
-    ty: mongreldb_type_id,
+    ty: i32,
     embedding_dim: u32,
     decimal_precision: u8,
     decimal_scale: i8,
     enum_variants: &StringArray,
 ) -> Result<TypeId, ErrorCode> {
     Ok(match ty {
-        mongreldb_type_id::Bool => TypeId::Bool,
-        mongreldb_type_id::Int8 => TypeId::Int8,
-        mongreldb_type_id::Int16 => TypeId::Int16,
-        mongreldb_type_id::Int32 => TypeId::Int32,
-        mongreldb_type_id::Int64 => TypeId::Int64,
-        mongreldb_type_id::UInt8 => TypeId::UInt8,
-        mongreldb_type_id::UInt16 => TypeId::UInt16,
-        mongreldb_type_id::UInt32 => TypeId::UInt32,
-        mongreldb_type_id::UInt64 => TypeId::UInt64,
-        mongreldb_type_id::Float32 => TypeId::Float32,
-        mongreldb_type_id::Float64 => TypeId::Float64,
-        mongreldb_type_id::TimestampNanos => TypeId::TimestampNanos,
-        mongreldb_type_id::Date32 => TypeId::Date32,
-        mongreldb_type_id::Date64 => TypeId::Date64,
-        mongreldb_type_id::Time64 => TypeId::Time64,
-        mongreldb_type_id::Interval => TypeId::Interval,
-        mongreldb_type_id::Uuid => TypeId::Uuid,
-        mongreldb_type_id::Json => TypeId::Json,
-        mongreldb_type_id::Array => TypeId::Array { element_type: 0 },
-        mongreldb_type_id::Bytes => TypeId::Bytes,
-        mongreldb_type_id::Embedding => TypeId::Embedding { dim: embedding_dim },
-        mongreldb_type_id::Decimal128 => TypeId::Decimal128 {
+        0 => TypeId::Bool,
+        1 => TypeId::Int8,
+        2 => TypeId::Int16,
+        3 => TypeId::Int32,
+        4 => TypeId::Int64,
+        5 => TypeId::UInt8,
+        6 => TypeId::UInt16,
+        7 => TypeId::UInt32,
+        8 => TypeId::UInt64,
+        9 => TypeId::Float32,
+        10 => TypeId::Float64,
+        11 => TypeId::TimestampNanos,
+        12 => TypeId::Date32,
+        13 => TypeId::Date64,
+        14 => TypeId::Time64,
+        15 => TypeId::Interval,
+        16 => TypeId::Uuid,
+        17 => TypeId::Json,
+        18 => TypeId::Array { element_type: 0 },
+        19 => TypeId::Bytes,
+        20 => TypeId::Embedding { dim: embedding_dim },
+        21 => TypeId::Decimal128 {
             precision: decimal_precision,
             scale: decimal_scale,
         },
-        mongreldb_type_id::Enum => {
+        22 => {
             let variants = string_array_to_vec(enum_variants)?;
             TypeId::Enum {
                 variants: Arc::from(variants),
             }
         }
+        _ => {
+            return Err(set_error_msg(
+                ErrorCode::InvalidArgument,
+                format!("invalid type id {ty}"),
+            ));
+        }
     })
+}
+
+fn index_kind_from_c(kind: i32) -> Result<IndexKind, ErrorCode> {
+    match kind {
+        0 => Ok(IndexKind::Bitmap),
+        1 => Ok(IndexKind::FmIndex),
+        2 => Ok(IndexKind::Ann),
+        3 => Ok(IndexKind::LearnedRange),
+        4 => Ok(IndexKind::MinHash),
+        5 => Ok(IndexKind::Sparse),
+        _ => Err(set_error_msg(
+            ErrorCode::InvalidArgument,
+            format!("invalid index kind {kind}"),
+        )),
+    }
+}
+
+fn fk_action_from_c(action: i32) -> Result<FkAction, ErrorCode> {
+    match action {
+        0 => Ok(FkAction::Restrict),
+        1 => Ok(FkAction::Cascade),
+        2 => Ok(FkAction::SetNull),
+        _ => Err(set_error_msg(
+            ErrorCode::InvalidArgument,
+            format!("invalid foreign key action {action}"),
+        )),
+    }
 }
 
 /// Read a [`StringArray] into an owned `Vec<String>`.
@@ -334,14 +360,7 @@ impl SchemaBuilder {
     /// Append a secondary index.
     pub fn add_index(&mut self, i: &mongreldb_index_def) -> Result<(), ErrorCode> {
         let name = cstr_to_string_lossy(i.name, "index name")?;
-        let kind = match i.kind {
-            mongreldb_index_kind::Bitmap => IndexKind::Bitmap,
-            mongreldb_index_kind::FmIndex => IndexKind::FmIndex,
-            mongreldb_index_kind::Ann => IndexKind::Ann,
-            mongreldb_index_kind::LearnedRange => IndexKind::LearnedRange,
-            mongreldb_index_kind::MinHash => IndexKind::MinHash,
-            mongreldb_index_kind::Sparse => IndexKind::Sparse,
-        };
+        let kind = index_kind_from_c(i.kind)?;
         self.indexes.push(IndexDef {
             name,
             column_id: i.column_id,
@@ -376,8 +395,8 @@ impl SchemaBuilder {
             columns,
             ref_table,
             ref_columns,
-            on_delete: fk.on_delete.to_core(),
-            on_update: fk.on_update.to_core(),
+            on_delete: fk_action_from_c(fk.on_delete)?,
+            on_update: fk_action_from_c(fk.on_update)?,
         });
         Ok(())
     }
@@ -401,6 +420,12 @@ impl SchemaBuilder {
             },
             clustered: self.clustered,
         }
+    }
+}
+
+impl Default for SchemaBuilder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -452,7 +477,7 @@ pub unsafe extern "C" fn mongreldb_schema_add_column(
     col: *const mongreldb_column_def,
 ) -> i32 {
     clear();
-    let Some(b) = (as_builder_mut(builder)) else {
+    let Some(b) = as_builder_mut(builder) else {
         return set_error_msg(ErrorCode::InvalidArgument, "schema builder handle is null")
             .as_return();
     };
@@ -476,7 +501,7 @@ pub unsafe extern "C" fn mongreldb_schema_add_index(
     idx: *const mongreldb_index_def,
 ) -> i32 {
     clear();
-    let Some(b) = (as_builder_mut(builder)) else {
+    let Some(b) = as_builder_mut(builder) else {
         return set_error_msg(ErrorCode::InvalidArgument, "schema builder handle is null")
             .as_return();
     };
@@ -500,7 +525,7 @@ pub unsafe extern "C" fn mongreldb_schema_add_unique(
     u: *const mongreldb_unique_constraint,
 ) -> i32 {
     clear();
-    let Some(b) = (as_builder_mut(builder)) else {
+    let Some(b) = as_builder_mut(builder) else {
         return set_error_msg(ErrorCode::InvalidArgument, "schema builder handle is null")
             .as_return();
     };
@@ -523,7 +548,7 @@ pub unsafe extern "C" fn mongreldb_schema_add_foreign_key(
     fk: *const mongreldb_foreign_key,
 ) -> i32 {
     clear();
-    let Some(b) = (as_builder_mut(builder)) else {
+    let Some(b) = as_builder_mut(builder) else {
         return set_error_msg(ErrorCode::InvalidArgument, "schema builder handle is null")
             .as_return();
     };
@@ -546,7 +571,7 @@ pub unsafe extern "C" fn mongreldb_schema_set_clustered(
     clustered: u8,
 ) -> i32 {
     clear();
-    let Some(b) = (as_builder_mut(builder)) else {
+    let Some(b) = as_builder_mut(builder) else {
         return set_error_msg(ErrorCode::InvalidArgument, "schema builder handle is null")
             .as_return();
     };

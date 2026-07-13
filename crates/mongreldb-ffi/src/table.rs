@@ -264,7 +264,7 @@ pub unsafe fn cell_inputs_to_pairs(
             .map(|cd| cd.ty.clone())
             .unwrap_or(TypeId::Bytes);
         // SAFETY: the caller guarantees the CValue's pointers are valid.
-        let v = crate::value::c_to_value(&ci.value, &ty);
+        let v = crate::value::c_to_value(&ci.value, &ty)?;
         out.push((ci.column_id, v));
     }
     Ok(out)

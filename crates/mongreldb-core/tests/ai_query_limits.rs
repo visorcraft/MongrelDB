@@ -1,7 +1,7 @@
 use mongreldb_core::query::{
-    AnnRerankRequest, Condition, Fusion, NamedRetriever, Retriever, SearchRequest, SetMember,
-    VectorMetric, MAX_FINAL_LIMIT, MAX_PROJECTION_COLUMNS, MAX_RETRIEVERS, MAX_RETRIEVER_K,
-    MAX_SET_MEMBERS, MAX_SPARSE_TERMS,
+    AiExecutionContext, AnnRerankRequest, Condition, Fusion, NamedRetriever, Retriever,
+    SearchRequest, SetMember, VectorMetric, MAX_FINAL_LIMIT, MAX_FUSED_CANDIDATES,
+    MAX_PROJECTION_COLUMNS, MAX_RETRIEVERS, MAX_RETRIEVER_K, MAX_SET_MEMBERS, MAX_SPARSE_TERMS,
 };
 use mongreldb_core::schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
 use mongreldb_core::{MongrelError, Table, Value};
@@ -80,6 +80,7 @@ fn search(retrievers: Vec<NamedRetriever>, limit: usize) -> SearchRequest {
         must: vec![],
         retrievers,
         fusion: Fusion::ReciprocalRank { constant: 60 },
+        rerank: None,
         limit,
         projection: Some(vec![1]),
     }
@@ -234,4 +235,124 @@ fn ai_scores_remain_finite_or_return_typed_errors() {
         })
         .unwrap();
     assert!(hits[0].exact_score.is_finite());
+}
+
+#[test]
+fn actual_work_budget_and_cancellation_fail_with_typed_errors() {
+    let (_dir, mut table) = table();
+    let snapshot = table.snapshot();
+    let sparse = Retriever::Sparse {
+        column_id: 3,
+        query: vec![(1, 1.0)],
+        k: 1,
+    };
+
+    let exhausted = AiExecutionContext::new(None, 0);
+    assert!(matches!(
+        table.retrieve_at_with_candidate_authorization_and_context(
+            &sparse,
+            snapshot,
+            None,
+            Some(&exhausted),
+        ),
+        Err(MongrelError::WorkBudgetExceeded)
+    ));
+
+    let cancelled = AiExecutionContext::new(None, usize::MAX);
+    cancelled.cancel();
+    assert!(matches!(
+        table.search_at_with_candidate_authorization_and_context(
+            &search(vec![named("sparse".into(), sparse.clone())], 1),
+            snapshot,
+            None,
+            Some(&cancelled),
+        ),
+        Err(MongrelError::Cancelled)
+    ));
+    assert_eq!(table.retrieve(&sparse).unwrap().len(), 1);
+}
+
+#[test]
+fn fused_union_ceiling_projection_charging_and_zero_weight_are_enforced() {
+    let (_dir, mut table) = table();
+    table
+        .put(vec![
+            (1, Value::Int64(2)),
+            (2, Value::Embedding(vec![-1.0; 8])),
+            (
+                3,
+                Value::Bytes(bincode::serialize(&vec![(2u32, 1.0f32)]).unwrap()),
+            ),
+            (4, Value::Bytes(serde_json::to_vec(&vec!["b"]).unwrap())),
+        ])
+        .unwrap();
+    table.commit().unwrap();
+    let snapshot = table.snapshot();
+    let sparse = |term| Retriever::Sparse {
+        column_id: 3,
+        query: vec![(term, 1.0)],
+        k: 1,
+    };
+
+    let ceiling =
+        AiExecutionContext::with_limits(std::time::Duration::from_secs(30), usize::MAX, 1);
+    assert!(matches!(
+        table.search_at_with_candidate_authorization_and_context(
+            &search(
+                vec![
+                    named("first".into(), sparse(1)),
+                    named("second".into(), sparse(2)),
+                ],
+                1,
+            ),
+            snapshot,
+            None,
+            Some(&ceiling),
+        ),
+        Err(MongrelError::WorkBudgetExceeded)
+    ));
+
+    let narrow_context = AiExecutionContext::with_limits(
+        std::time::Duration::from_secs(30),
+        usize::MAX,
+        MAX_FUSED_CANDIDATES,
+    );
+    table
+        .search_at_with_candidate_authorization_and_context(
+            &search(vec![named("sparse".into(), sparse(1))], 1),
+            snapshot,
+            None,
+            Some(&narrow_context),
+        )
+        .unwrap();
+    let mut full_projection = search(vec![named("sparse".into(), sparse(1))], 1);
+    full_projection.projection = None;
+    let full_context = AiExecutionContext::with_limits(
+        std::time::Duration::from_secs(30),
+        usize::MAX,
+        MAX_FUSED_CANDIDATES,
+    );
+    table
+        .search_at_with_candidate_authorization_and_context(
+            &full_projection,
+            snapshot,
+            None,
+            Some(&full_context),
+        )
+        .unwrap();
+    assert!(full_context.consumed_work() > narrow_context.consumed_work());
+
+    let mut skipped = named("disabled".into(), ann(1));
+    skipped.weight = 0.0;
+    let zero_context = AiExecutionContext::new(None, 0);
+    assert!(table
+        .search_at_with_candidate_authorization_and_context(
+            &search(vec![skipped], 1),
+            snapshot,
+            None,
+            Some(&zero_context),
+        )
+        .unwrap()
+        .is_empty());
+    assert_eq!(zero_context.consumed_work(), 0);
 }

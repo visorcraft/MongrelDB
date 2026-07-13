@@ -375,11 +375,11 @@ pub unsafe extern "C" fn mongreldb_rename_table(
 
 // ── small argument helpers ────────────────────────────────────────────────
 
-fn require_path(ptr: *const c_char) -> Result<String, ErrorCode> {
+unsafe fn require_path(ptr: *const c_char) -> Result<String, ErrorCode> {
     require_str_named(ptr, "path")
 }
 
-fn require_str_named(ptr: *const c_char, what: &str) -> Result<String, ErrorCode> {
+unsafe fn require_str_named(ptr: *const c_char, what: &str) -> Result<String, ErrorCode> {
     if ptr.is_null() {
         return Err(set_error_msg(
             ErrorCode::InvalidArgument,

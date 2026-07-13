@@ -12,11 +12,86 @@ use mongreldb_core::query::{
 };
 use mongreldb_core::{Database, Principal, Schema, Table, TypeId, Value};
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 pub(crate) type TableMap = Arc<Mutex<HashMap<String, Arc<Mutex<Table>>>>>;
+
+pub(crate) struct ScoredRuntime {
+    timeout_ms: AtomicU64,
+    max_work: AtomicUsize,
+    max_fused_candidates: AtomicUsize,
+    semaphore: Arc<tokio::sync::Semaphore>,
+}
+
+impl ScoredRuntime {
+    pub(crate) fn from_env() -> Arc<Self> {
+        let value = |name: &str, default: usize| {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .filter(|value: &usize| *value > 0)
+                .unwrap_or(default)
+        };
+        Arc::new(Self {
+            timeout_ms: AtomicU64::new(value("MONGRELDB_SQL_AI_TIMEOUT_MS", 30_000) as u64),
+            max_work: AtomicUsize::new(value("MONGRELDB_SQL_AI_MAX_WORK", 1_000_000)),
+            max_fused_candidates: AtomicUsize::new(
+                value(
+                    "MONGRELDB_SQL_AI_MAX_FUSED_CANDIDATES",
+                    mongreldb_core::query::MAX_FUSED_CANDIDATES,
+                )
+                .min(mongreldb_core::query::MAX_FUSED_CANDIDATES),
+            ),
+            semaphore: Arc::new(tokio::sync::Semaphore::new(value(
+                "MONGRELDB_SQL_AI_MAX_CONCURRENT",
+                4,
+            ))),
+        })
+    }
+
+    pub(crate) fn configure(
+        &self,
+        timeout: Duration,
+        max_work: usize,
+        max_fused_candidates: usize,
+    ) -> mongreldb_core::Result<()> {
+        if timeout.is_zero() || max_work == 0 || max_fused_candidates == 0 {
+            return Err(mongreldb_core::MongrelError::InvalidArgument(
+                "scored SQL limits must be greater than zero".into(),
+            ));
+        }
+        if max_fused_candidates > mongreldb_core::query::MAX_FUSED_CANDIDATES {
+            return Err(mongreldb_core::MongrelError::InvalidArgument(format!(
+                "maximum fused candidates exceeds {}",
+                mongreldb_core::query::MAX_FUSED_CANDIDATES
+            )));
+        }
+        self.timeout_ms.store(
+            timeout.as_millis().clamp(1, u64::MAX as u128) as u64,
+            Ordering::Release,
+        );
+        self.max_work.store(max_work, Ordering::Release);
+        self.max_fused_candidates
+            .store(max_fused_candidates, Ordering::Release);
+        Ok(())
+    }
+
+    fn execution(&self) -> (Duration, mongreldb_core::query::AiExecutionContext) {
+        let timeout = Duration::from_millis(self.timeout_ms.load(Ordering::Acquire));
+        (
+            timeout,
+            mongreldb_core::query::AiExecutionContext::with_limits(
+                timeout,
+                self.max_work.load(Ordering::Acquire),
+                self.max_fused_candidates.load(Ordering::Acquire),
+            ),
+        )
+    }
+}
 
 #[derive(serde::Deserialize)]
 struct HybridSpec {
@@ -225,11 +300,25 @@ struct ScoredFunction {
     database: Option<Arc<Database>>,
     principal: Option<Principal>,
     principal_catalog_bound: bool,
+    runtime: Arc<ScoredRuntime>,
 }
 
 struct LiveScoredProvider {
     schema: SchemaRef,
-    execute: Arc<dyn Fn() -> DFResult<RecordBatch> + Send + Sync>,
+    execute: Arc<
+        dyn Fn(&mongreldb_core::query::AiExecutionContext) -> DFResult<RecordBatch> + Send + Sync,
+    >,
+    runtime: Arc<ScoredRuntime>,
+}
+
+struct CancelOnDrop(Option<mongreldb_core::query::AiExecutionContext>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if let Some(context) = &self.0 {
+            context.cancel();
+        }
+    }
 }
 
 impl fmt::Debug for LiveScoredProvider {
@@ -255,7 +344,39 @@ impl TableProvider for LiveScoredProvider {
         _filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let mut batch = (self.execute)()?;
+        let (timeout, context) = self.runtime.execution();
+        let started = std::time::Instant::now();
+        let permit = tokio::time::timeout(timeout, self.runtime.semaphore.clone().acquire_owned())
+            .await
+            .map_err(|_| DataFusionError::Execution("scored SQL deadline exceeded".into()))?
+            .map_err(|_| DataFusionError::Execution("scored SQL cancelled".into()))?;
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(DataFusionError::Execution(
+                "scored SQL deadline exceeded".into(),
+            ));
+        }
+        let execute = Arc::clone(&self.execute);
+        let worker_context = context.clone();
+        let mut cancel = CancelOnDrop(Some(context.clone()));
+        let mut task = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            execute(&worker_context)
+        });
+        let result = match tokio::time::timeout(remaining, &mut task).await {
+            Ok(result) => result.map_err(|error| {
+                DataFusionError::Execution(format!("scored SQL worker failed: {error}"))
+            })?,
+            Err(_) => {
+                context.cancel();
+                let _ = task.await;
+                Err(DataFusionError::Execution(
+                    "scored SQL deadline exceeded".into(),
+                ))
+            }
+        };
+        cancel.0 = None;
+        let mut batch = result?;
         if let Some(projection) = projection {
             batch = batch.project(projection)?;
         }
@@ -284,6 +405,7 @@ pub(crate) fn register(
     database: Option<Arc<Database>>,
     principal: Option<Principal>,
     principal_catalog_bound: bool,
+    runtime: Arc<ScoredRuntime>,
 ) {
     for (name, kind) in [
         ("ann_search_scored", Kind::Ann),
@@ -301,6 +423,7 @@ pub(crate) fn register(
                 database: database.clone(),
                 principal: principal.clone(),
                 principal_catalog_bound,
+                runtime: Arc::clone(&runtime),
             }),
         );
     }
@@ -308,11 +431,16 @@ pub(crate) fn register(
 
 fn live_provider(
     schema: SchemaRef,
-    execute: impl Fn() -> DFResult<RecordBatch> + Send + Sync + 'static,
+    runtime: Arc<ScoredRuntime>,
+    execute: impl Fn(&mongreldb_core::query::AiExecutionContext) -> DFResult<RecordBatch>
+        + Send
+        + Sync
+        + 'static,
 ) -> Arc<dyn TableProvider> {
     Arc::new(LiveScoredProvider {
         schema,
         execute: Arc::new(execute),
+        runtime,
     })
 }
 
@@ -334,20 +462,30 @@ fn with_scored_read<T>(
     table_name: &str,
     principal: Option<&Principal>,
     principal_catalog_bound: bool,
+    context: &mongreldb_core::query::AiExecutionContext,
     mut read: impl FnMut(
         &mut Table,
         mongreldb_core::Snapshot,
-        Option<&HashSet<mongreldb_core::RowId>>,
+        Option<&mongreldb_core::security::CandidateAuthorization<'_>>,
         Option<&Principal>,
     ) -> mongreldb_core::Result<T>,
 ) -> DFResult<T> {
     match database {
         Some(database) => database
-            .with_authorized_read(table_name, principal, principal_catalog_bound, read)
+            .with_authorized_scored_read_context(
+                table_name,
+                principal,
+                principal_catalog_bound,
+                Some(context),
+                read,
+            )
             .map_err(|error| DataFusionError::Execution(error.to_string())),
         None => {
             let mut table = handle.lock();
             let snapshot = table.snapshot();
+            context
+                .checkpoint()
+                .map_err(|error| DataFusionError::Execution(error.to_string()))?;
             read(&mut table, snapshot, None, principal)
                 .map_err(|error| DataFusionError::Execution(error.to_string()))
         }
@@ -449,100 +587,109 @@ impl TableFunctionImpl for ScoredFunction {
         let principal_catalog_bound = self.principal_catalog_bound;
         let kind = self.kind;
         let batch_schema = Arc::clone(&provider_schema);
-        Ok(live_provider(provider_schema, move || {
-            let (hits, rows) = with_scored_read(
-                database.as_ref(),
-                &handle,
-                &table_name,
-                principal.as_ref(),
-                principal_catalog_bound,
-                |table, snapshot, allowed, effective_principal| {
-                    if let Some(database) = &database {
-                        database.require_columns_for(
-                            &table_name,
-                            mongreldb_core::ColumnOperation::Select,
-                            &required_columns,
-                            effective_principal,
+        Ok(live_provider(
+            provider_schema,
+            Arc::clone(&self.runtime),
+            move |context| {
+                let (hits, rows) = with_scored_read(
+                    database.as_ref(),
+                    &handle,
+                    &table_name,
+                    principal.as_ref(),
+                    principal_catalog_bound,
+                    context,
+                    |table, snapshot, authorization, effective_principal| {
+                        if let Some(database) = &database {
+                            database.require_columns_for(
+                                &table_name,
+                                mongreldb_core::ColumnOperation::Select,
+                                &required_columns,
+                                effective_principal,
+                            )?;
+                        }
+                        let hits = table.retrieve_at_with_candidate_authorization_and_context(
+                            &retriever,
+                            snapshot,
+                            authorization,
+                            Some(context),
+                        )?;
+                        let row_ids: Vec<_> = hits.iter().map(|hit| hit.row_id.0).collect();
+                        let mut rows =
+                            table.rows_for_rids_with_context(&row_ids, snapshot, context)?;
+                        if let Some(database) = &database {
+                            database.mask_rows_for(&table_name, &mut rows, effective_principal)?;
+                        }
+                        Ok((hits, rows))
+                    },
+                )?;
+                let scores: HashMap<_, _> = hits
+                    .into_iter()
+                    .map(|hit| (hit.row_id, (hit.rank, hit.score)))
+                    .collect();
+                let rows: Vec<_> = rows
+                    .into_iter()
+                    .filter(|row| scores.contains_key(&row.row_id))
+                    .collect();
+                let projected = projected_schema(&schema, &projection);
+                let base = crate::arrow_conv::rows_to_batch(&rows, &projected)
+                    .map_err(|error| DataFusionError::Execution(error.to_string()))?;
+                let ranks: Vec<_> = rows
+                    .iter()
+                    .map(|row| scores[&row.row_id].0 as u64)
+                    .collect();
+                let mut fields = base
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|field| field.as_ref().clone())
+                    .collect::<Vec<_>>();
+                let mut arrays = base.columns().to_vec();
+                fields.push(Field::new("search_rank", DataType::UInt64, false));
+                arrays.push(Arc::new(UInt64Array::from(ranks)) as ArrayRef);
+                match kind {
+                    Kind::Ann => {
+                        fields.push(Field::new("ann_distance", DataType::UInt32, false));
+                        arrays.push(Arc::new(UInt32Array::from(
+                            rows.iter()
+                                .map(|row| match scores[&row.row_id].1 {
+                                    RetrieverScore::AnnHammingDistance(score) => score,
+                                    _ => unreachable!(),
+                                })
+                                .collect::<Vec<_>>(),
+                        )));
+                    }
+                    Kind::Sparse => {
+                        append_float_score(
+                            "sparse_score",
+                            &rows,
+                            &scores,
+                            &mut fields,
+                            &mut arrays,
+                            |score| match score {
+                                RetrieverScore::SparseDotProduct(score) => score,
+                                _ => unreachable!(),
+                            },
                         )?;
                     }
-                    let hits = table.retrieve_at(&retriever, snapshot, allowed)?;
-                    let row_ids: Vec<_> = hits.iter().map(|hit| hit.row_id.0).collect();
-                    let rows = table.rows_for_rids(&row_ids, snapshot)?;
-                    let rows = match &database {
-                        Some(database) => {
-                            database.secure_rows_for(&table_name, rows, effective_principal)?
-                        }
-                        None => rows,
-                    };
-                    Ok((hits, rows))
-                },
-            )?;
-            let scores: HashMap<_, _> = hits
-                .into_iter()
-                .map(|hit| (hit.row_id, (hit.rank, hit.score)))
-                .collect();
-            let rows: Vec<_> = rows
-                .into_iter()
-                .filter(|row| scores.contains_key(&row.row_id))
-                .collect();
-            let projected = projected_schema(&schema, &projection);
-            let base = crate::arrow_conv::rows_to_batch(&rows, &projected)
-                .map_err(|error| DataFusionError::Execution(error.to_string()))?;
-            let ranks: Vec<_> = rows
-                .iter()
-                .map(|row| scores[&row.row_id].0 as u64)
-                .collect();
-            let mut fields = base
-                .schema()
-                .fields()
-                .iter()
-                .map(|field| field.as_ref().clone())
-                .collect::<Vec<_>>();
-            let mut arrays = base.columns().to_vec();
-            fields.push(Field::new("search_rank", DataType::UInt64, false));
-            arrays.push(Arc::new(UInt64Array::from(ranks)) as ArrayRef);
-            match kind {
-                Kind::Ann => {
-                    fields.push(Field::new("ann_distance", DataType::UInt32, false));
-                    arrays.push(Arc::new(UInt32Array::from(
-                        rows.iter()
-                            .map(|row| match scores[&row.row_id].1 {
-                                RetrieverScore::AnnHammingDistance(score) => score,
+                    Kind::MinHash => {
+                        append_float_score(
+                            "estimated_jaccard",
+                            &rows,
+                            &scores,
+                            &mut fields,
+                            &mut arrays,
+                            |score| match score {
+                                RetrieverScore::MinHashEstimatedJaccard(score) => score as f64,
                                 _ => unreachable!(),
-                            })
-                            .collect::<Vec<_>>(),
-                    )));
+                            },
+                        )?;
+                    }
+                    Kind::AnnExact | Kind::ExactSet | Kind::Hybrid => unreachable!(),
                 }
-                Kind::Sparse => {
-                    append_float_score(
-                        "sparse_score",
-                        &rows,
-                        &scores,
-                        &mut fields,
-                        &mut arrays,
-                        |score| match score {
-                            RetrieverScore::SparseDotProduct(score) => score,
-                            _ => unreachable!(),
-                        },
-                    )?;
-                }
-                Kind::MinHash => {
-                    append_float_score(
-                        "estimated_jaccard",
-                        &rows,
-                        &scores,
-                        &mut fields,
-                        &mut arrays,
-                        |score| match score {
-                            RetrieverScore::MinHashEstimatedJaccard(score) => score as f64,
-                            _ => unreachable!(),
-                        },
-                    )?;
-                }
-                Kind::AnnExact | Kind::ExactSet | Kind::Hybrid => unreachable!(),
-            }
-            RecordBatch::try_new(Arc::clone(&batch_schema), arrays).map_err(DataFusionError::from)
-        }))
+                RecordBatch::try_new(Arc::clone(&batch_schema), arrays)
+                    .map_err(DataFusionError::from)
+            },
+        ))
     }
 }
 
@@ -630,72 +777,83 @@ impl ScoredFunction {
         let principal = self.principal.clone();
         let principal_catalog_bound = self.principal_catalog_bound;
         let batch_schema = Arc::clone(&provider_schema);
-        Ok(live_provider(provider_schema, move || {
-            let (hits, rows) = with_scored_read(
-                database.as_ref(),
-                &handle,
-                &table_name,
-                principal.as_ref(),
-                principal_catalog_bound,
-                |table, snapshot, allowed, effective_principal| {
-                    if let Some(database) = &database {
-                        database.require_columns_for(
-                            &table_name,
-                            mongreldb_core::ColumnOperation::Select,
-                            &required_columns,
-                            effective_principal,
-                        )?;
-                    }
-                    let hits = table.ann_rerank_at(&request, snapshot, allowed)?;
-                    let row_ids = hits.iter().map(|hit| hit.row_id.0).collect::<Vec<_>>();
-                    let rows = table.rows_for_rids(&row_ids, snapshot)?;
-                    let rows = match &database {
-                        Some(database) => {
-                            database.secure_rows_for(&table_name, rows, effective_principal)?
+        Ok(live_provider(
+            provider_schema,
+            Arc::clone(&self.runtime),
+            move |context| {
+                let (hits, rows) = with_scored_read(
+                    database.as_ref(),
+                    &handle,
+                    &table_name,
+                    principal.as_ref(),
+                    principal_catalog_bound,
+                    context,
+                    |table, snapshot, authorization, effective_principal| {
+                        if let Some(database) = &database {
+                            database.require_columns_for(
+                                &table_name,
+                                mongreldb_core::ColumnOperation::Select,
+                                &required_columns,
+                                effective_principal,
+                            )?;
                         }
-                        None => rows,
-                    };
-                    Ok((hits, rows))
-                },
-            )?;
-            let scores = hits
-                .into_iter()
-                .enumerate()
-                .map(|(rank, hit)| {
-                    (
-                        hit.row_id,
-                        (rank as u64 + 1, hit.hamming_distance, hit.exact_score),
-                    )
-                })
-                .collect::<HashMap<_, _>>();
-            let mut rows = rows
-                .into_iter()
-                .filter(|row| scores.contains_key(&row.row_id))
-                .collect::<Vec<_>>();
-            rows.sort_by_key(|row| scores[&row.row_id].0);
-            let base =
-                crate::arrow_conv::rows_to_batch(&rows, &projected_schema(&schema, &projection))
-                    .map_err(|error| DataFusionError::Execution(error.to_string()))?;
-            let mut arrays = base.columns().to_vec();
-            arrays.extend([
-                Arc::new(UInt64Array::from(
-                    rows.iter()
-                        .map(|row| scores[&row.row_id].0)
-                        .collect::<Vec<_>>(),
-                )) as ArrayRef,
-                Arc::new(UInt32Array::from(
-                    rows.iter()
-                        .map(|row| scores[&row.row_id].1)
-                        .collect::<Vec<_>>(),
-                )) as ArrayRef,
-                Arc::new(Float32Array::from(
-                    rows.iter()
-                        .map(|row| scores[&row.row_id].2)
-                        .collect::<Vec<_>>(),
-                )) as ArrayRef,
-            ]);
-            RecordBatch::try_new(Arc::clone(&batch_schema), arrays).map_err(DataFusionError::from)
-        }))
+                        let hits = table.ann_rerank_at_with_candidate_authorization_and_context(
+                            &request,
+                            snapshot,
+                            authorization,
+                            Some(context),
+                        )?;
+                        let row_ids = hits.iter().map(|hit| hit.row_id.0).collect::<Vec<_>>();
+                        let mut rows =
+                            table.rows_for_rids_with_context(&row_ids, snapshot, context)?;
+                        if let Some(database) = &database {
+                            database.mask_rows_for(&table_name, &mut rows, effective_principal)?;
+                        }
+                        Ok((hits, rows))
+                    },
+                )?;
+                let scores = hits
+                    .into_iter()
+                    .enumerate()
+                    .map(|(rank, hit)| {
+                        (
+                            hit.row_id,
+                            (rank as u64 + 1, hit.hamming_distance, hit.exact_score),
+                        )
+                    })
+                    .collect::<HashMap<_, _>>();
+                let mut rows = rows
+                    .into_iter()
+                    .filter(|row| scores.contains_key(&row.row_id))
+                    .collect::<Vec<_>>();
+                rows.sort_by_key(|row| scores[&row.row_id].0);
+                let base = crate::arrow_conv::rows_to_batch(
+                    &rows,
+                    &projected_schema(&schema, &projection),
+                )
+                .map_err(|error| DataFusionError::Execution(error.to_string()))?;
+                let mut arrays = base.columns().to_vec();
+                arrays.extend([
+                    Arc::new(UInt64Array::from(
+                        rows.iter()
+                            .map(|row| scores[&row.row_id].0)
+                            .collect::<Vec<_>>(),
+                    )) as ArrayRef,
+                    Arc::new(UInt32Array::from(
+                        rows.iter()
+                            .map(|row| scores[&row.row_id].1)
+                            .collect::<Vec<_>>(),
+                    )) as ArrayRef,
+                    Arc::new(Float32Array::from(
+                        rows.iter()
+                            .map(|row| scores[&row.row_id].2)
+                            .collect::<Vec<_>>(),
+                    )) as ArrayRef,
+                ]);
+                RecordBatch::try_new(Arc::clone(&batch_schema), arrays)
+                    .map_err(DataFusionError::from)
+            },
+        ))
     }
 
     fn exact_set_provider(&self, args: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
@@ -780,71 +938,81 @@ impl ScoredFunction {
         let principal = self.principal.clone();
         let principal_catalog_bound = self.principal_catalog_bound;
         let batch_schema = Arc::clone(&provider_schema);
-        Ok(live_provider(provider_schema, move || {
-            let (hits, rows) = with_scored_read(
-                database.as_ref(),
-                &handle,
-                &table_name,
-                principal.as_ref(),
-                principal_catalog_bound,
-                |table, snapshot, allowed, effective_principal| {
-                    if let Some(database) = &database {
-                        database.require_columns_for(
-                            &table_name,
-                            mongreldb_core::ColumnOperation::Select,
-                            &required_columns,
-                            effective_principal,
-                        )?;
-                    }
-                    let hits = table.set_similarity_at(&request, snapshot, allowed)?;
-                    let row_ids: Vec<_> = hits.iter().map(|hit| hit.row_id.0).collect();
-                    let rows = table.rows_for_rids(&row_ids, snapshot)?;
-                    let rows = match &database {
-                        Some(database) => {
-                            database.secure_rows_for(&table_name, rows, effective_principal)?
+        Ok(live_provider(
+            provider_schema,
+            Arc::clone(&self.runtime),
+            move |context| {
+                let (hits, rows) = with_scored_read(
+                    database.as_ref(),
+                    &handle,
+                    &table_name,
+                    principal.as_ref(),
+                    principal_catalog_bound,
+                    context,
+                    |table, snapshot, authorization, effective_principal| {
+                        if let Some(database) = &database {
+                            database.require_columns_for(
+                                &table_name,
+                                mongreldb_core::ColumnOperation::Select,
+                                &required_columns,
+                                effective_principal,
+                            )?;
                         }
-                        None => rows,
-                    };
-                    Ok((hits, rows))
-                },
-            )?;
-            let scores: HashMap<_, _> = hits
-                .into_iter()
-                .enumerate()
-                .map(|(rank, hit)| {
-                    (
-                        hit.row_id,
-                        (rank as u64 + 1, hit.estimated_jaccard, hit.exact_jaccard),
-                    )
-                })
-                .collect();
-            let rows: Vec<_> = rows
-                .into_iter()
-                .filter(|row| scores.contains_key(&row.row_id))
-                .collect();
-            let projected = projected_schema(&schema, &projection);
-            let base = crate::arrow_conv::rows_to_batch(&rows, &projected)
-                .map_err(|error| DataFusionError::Execution(error.to_string()))?;
-            let mut arrays = base.columns().to_vec();
-            arrays.extend([
-                Arc::new(UInt64Array::from(
-                    rows.iter()
-                        .map(|row| scores[&row.row_id].0)
-                        .collect::<Vec<_>>(),
-                )) as ArrayRef,
-                Arc::new(Float32Array::from(
-                    rows.iter()
-                        .map(|row| scores[&row.row_id].1)
-                        .collect::<Vec<_>>(),
-                )) as ArrayRef,
-                Arc::new(Float32Array::from(
-                    rows.iter()
-                        .map(|row| scores[&row.row_id].2)
-                        .collect::<Vec<_>>(),
-                )) as ArrayRef,
-            ]);
-            RecordBatch::try_new(Arc::clone(&batch_schema), arrays).map_err(DataFusionError::from)
-        }))
+                        let hits = table
+                            .set_similarity_at_with_candidate_authorization_and_context(
+                                &request,
+                                snapshot,
+                                authorization,
+                                Some(context),
+                            )?;
+                        let row_ids: Vec<_> = hits.iter().map(|hit| hit.row_id.0).collect();
+                        let mut rows =
+                            table.rows_for_rids_with_context(&row_ids, snapshot, context)?;
+                        if let Some(database) = &database {
+                            database.mask_rows_for(&table_name, &mut rows, effective_principal)?;
+                        }
+                        Ok((hits, rows))
+                    },
+                )?;
+                let scores: HashMap<_, _> = hits
+                    .into_iter()
+                    .enumerate()
+                    .map(|(rank, hit)| {
+                        (
+                            hit.row_id,
+                            (rank as u64 + 1, hit.estimated_jaccard, hit.exact_jaccard),
+                        )
+                    })
+                    .collect();
+                let rows: Vec<_> = rows
+                    .into_iter()
+                    .filter(|row| scores.contains_key(&row.row_id))
+                    .collect();
+                let projected = projected_schema(&schema, &projection);
+                let base = crate::arrow_conv::rows_to_batch(&rows, &projected)
+                    .map_err(|error| DataFusionError::Execution(error.to_string()))?;
+                let mut arrays = base.columns().to_vec();
+                arrays.extend([
+                    Arc::new(UInt64Array::from(
+                        rows.iter()
+                            .map(|row| scores[&row.row_id].0)
+                            .collect::<Vec<_>>(),
+                    )) as ArrayRef,
+                    Arc::new(Float32Array::from(
+                        rows.iter()
+                            .map(|row| scores[&row.row_id].1)
+                            .collect::<Vec<_>>(),
+                    )) as ArrayRef,
+                    Arc::new(Float32Array::from(
+                        rows.iter()
+                            .map(|row| scores[&row.row_id].2)
+                            .collect::<Vec<_>>(),
+                    )) as ArrayRef,
+                ]);
+                RecordBatch::try_new(Arc::clone(&batch_schema), arrays)
+                    .map_err(DataFusionError::from)
+            },
+        ))
     }
 
     fn hybrid_provider(&self, args: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
@@ -919,6 +1087,7 @@ impl ScoredFunction {
             fusion: Fusion::ReciprocalRank {
                 constant: spec.rrf_constant,
             },
+            rerank: None,
             limit: spec.limit,
             projection: Some(projection.clone()),
         };
@@ -935,75 +1104,84 @@ impl ScoredFunction {
         let principal = self.principal.clone();
         let principal_catalog_bound = self.principal_catalog_bound;
         let batch_schema = Arc::clone(&provider_schema);
-        Ok(live_provider(provider_schema, move || {
-            let (hits, rows) = with_scored_read(
-                database.as_ref(),
-                &handle,
-                &table_name,
-                principal.as_ref(),
-                principal_catalog_bound,
-                |table, snapshot, allowed, effective_principal| {
-                    if let Some(database) = &database {
-                        database.require_columns_for(
-                            &table_name,
-                            mongreldb_core::ColumnOperation::Select,
-                            &required_columns,
-                            effective_principal,
-                        )?;
-                    }
-                    let hits = table.search_at(&request, snapshot, allowed)?;
-                    let row_ids: Vec<_> = hits.iter().map(|hit| hit.row_id.0).collect();
-                    let rows = table.rows_for_rids(&row_ids, snapshot)?;
-                    let rows = match &database {
-                        Some(database) => {
-                            database.secure_rows_for(&table_name, rows, effective_principal)?
+        Ok(live_provider(
+            provider_schema,
+            Arc::clone(&self.runtime),
+            move |context| {
+                let (hits, rows) = with_scored_read(
+                    database.as_ref(),
+                    &handle,
+                    &table_name,
+                    principal.as_ref(),
+                    principal_catalog_bound,
+                    context,
+                    |table, snapshot, authorization, effective_principal| {
+                        if let Some(database) = &database {
+                            database.require_columns_for(
+                                &table_name,
+                                mongreldb_core::ColumnOperation::Select,
+                                &required_columns,
+                                effective_principal,
+                            )?;
                         }
-                        None => rows,
+                        let hits = table.search_at_with_candidate_authorization_and_context(
+                            &request,
+                            snapshot,
+                            authorization,
+                            Some(context),
+                        )?;
+                        let row_ids: Vec<_> = hits.iter().map(|hit| hit.row_id.0).collect();
+                        let mut rows =
+                            table.rows_for_rids_with_context(&row_ids, snapshot, context)?;
+                        if let Some(database) = &database {
+                            database.mask_rows_for(&table_name, &mut rows, effective_principal)?;
+                        }
+                        Ok((hits, rows))
+                    },
+                )?;
+                let mut rows_by_id: HashMap<_, _> =
+                    rows.into_iter().map(|row| (row.row_id, row)).collect();
+                let mut output_rows = Vec::new();
+                let mut ranks = Vec::new();
+                let mut fused_scores = Vec::new();
+                let mut component_json = Vec::new();
+                for (rank, hit) in hits.into_iter().enumerate() {
+                    let Some(row) = rows_by_id.remove(&hit.row_id) else {
+                        continue;
                     };
-                    Ok((hits, rows))
-                },
-            )?;
-            let mut rows_by_id: HashMap<_, _> =
-                rows.into_iter().map(|row| (row.row_id, row)).collect();
-            let mut output_rows = Vec::new();
-            let mut ranks = Vec::new();
-            let mut fused_scores = Vec::new();
-            let mut component_json = Vec::new();
-            for (rank, hit) in hits.into_iter().enumerate() {
-                let Some(row) = rows_by_id.remove(&hit.row_id) else {
-                    continue;
-                };
-                output_rows.push(row);
-                ranks.push(rank as u64 + 1);
-                fused_scores.push(hit.fused_score);
-                component_json.push(
-                    serde_json::to_string(
-                        &hit.components
-                            .into_iter()
-                            .map(|component| {
-                                serde_json::json!({
-                                    "retriever_name": component.retriever_name,
-                                    "rank": component.rank,
-                                    "raw_score": score_json(component.raw_score),
-                                    "contribution": component.contribution,
+                    output_rows.push(row);
+                    ranks.push(rank as u64 + 1);
+                    fused_scores.push(hit.fused_score);
+                    component_json.push(
+                        serde_json::to_string(
+                            &hit.components
+                                .into_iter()
+                                .map(|component| {
+                                    serde_json::json!({
+                                        "retriever_name": component.retriever_name,
+                                        "rank": component.rank,
+                                        "raw_score": score_json(component.raw_score),
+                                        "contribution": component.contribution,
+                                    })
                                 })
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                    .map_err(|error| DataFusionError::Execution(error.to_string()))?,
-                );
-            }
-            let projected = projected_schema(&schema, &projection);
-            let base = crate::arrow_conv::rows_to_batch(&output_rows, &projected)
-                .map_err(|error| DataFusionError::Execution(error.to_string()))?;
-            let mut arrays = base.columns().to_vec();
-            arrays.extend([
-                Arc::new(UInt64Array::from(ranks)) as ArrayRef,
-                Arc::new(Float64Array::from(fused_scores)) as ArrayRef,
-                Arc::new(StringArray::from(component_json)) as ArrayRef,
-            ]);
-            RecordBatch::try_new(Arc::clone(&batch_schema), arrays).map_err(DataFusionError::from)
-        }))
+                                .collect::<Vec<_>>(),
+                        )
+                        .map_err(|error| DataFusionError::Execution(error.to_string()))?,
+                    );
+                }
+                let projected = projected_schema(&schema, &projection);
+                let base = crate::arrow_conv::rows_to_batch(&output_rows, &projected)
+                    .map_err(|error| DataFusionError::Execution(error.to_string()))?;
+                let mut arrays = base.columns().to_vec();
+                arrays.extend([
+                    Arc::new(UInt64Array::from(ranks)) as ArrayRef,
+                    Arc::new(Float64Array::from(fused_scores)) as ArrayRef,
+                    Arc::new(StringArray::from(component_json)) as ArrayRef,
+                ]);
+                RecordBatch::try_new(Arc::clone(&batch_schema), arrays)
+                    .map_err(DataFusionError::from)
+            },
+        ))
     }
 }
 

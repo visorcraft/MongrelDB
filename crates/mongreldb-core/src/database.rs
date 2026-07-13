@@ -1608,6 +1608,16 @@ impl Database {
         rows: Vec<crate::memtable::Row>,
         principal: Option<&crate::auth::Principal>,
     ) -> Result<Vec<crate::memtable::Row>> {
+        self.secure_rows_for_with_context(table, rows, principal, None)
+    }
+
+    pub fn secure_rows_for_with_context(
+        &self,
+        table: &str,
+        rows: Vec<crate::memtable::Row>,
+        principal: Option<&crate::auth::Principal>,
+        context: Option<&crate::query::AiExecutionContext>,
+    ) -> Result<Vec<crate::memtable::Row>> {
         let security = self.catalog.read().security.clone();
         if !security.table_has_security(table) {
             return Ok(rows);
@@ -1626,6 +1636,9 @@ impl Database {
         };
         let mut output = Vec::new();
         for mut row in rows {
+            if let Some(context) = context {
+                context.consume(1)?;
+            }
             if security.row_allowed(
                 table,
                 crate::security::PolicyCommand::Select,
@@ -1638,6 +1651,64 @@ impl Database {
             }
         }
         Ok(output)
+    }
+
+    /// Apply column masks to already RLS-authorized scored hits without a
+    /// second row gather or policy evaluation.
+    pub fn mask_search_hits_for(
+        &self,
+        table: &str,
+        hits: &mut [crate::query::SearchHit],
+        principal: Option<&crate::auth::Principal>,
+    ) -> Result<()> {
+        let security = self.catalog.read().security.clone();
+        if !security.table_has_security(table) {
+            return Ok(());
+        }
+        let owned;
+        let principal = match principal {
+            Some(principal) => principal,
+            None => {
+                owned = self.principal.read().clone();
+                let Some(principal) = owned.as_ref() else {
+                    return Ok(());
+                };
+                principal
+            }
+        };
+        for hit in hits {
+            security.apply_masks_to_cells(table, &mut hit.cells, principal);
+        }
+        Ok(())
+    }
+
+    /// Apply masks to rows already admitted by candidate-aware RLS.
+    pub fn mask_rows_for(
+        &self,
+        table: &str,
+        rows: &mut [crate::memtable::Row],
+        principal: Option<&crate::auth::Principal>,
+    ) -> Result<()> {
+        let security = self.catalog.read().security.clone();
+        if !security.table_has_security(table) {
+            return Ok(());
+        }
+        let owned;
+        let principal = match principal {
+            Some(principal) => principal,
+            None => {
+                owned = self
+                    .principal
+                    .read()
+                    .clone()
+                    .ok_or(MongrelError::AuthRequired)?;
+                &owned
+            }
+        };
+        for row in rows {
+            security.apply_masks(table, row, principal);
+        }
+        Ok(())
     }
 
     /// Row IDs allowed to enter scored ranking. `None` means no RLS filter.
@@ -1659,6 +1730,7 @@ impl Database {
         security: &crate::security::SecurityCatalog,
         security_version: u64,
         principal: Option<&crate::auth::Principal>,
+        context: Option<&crate::query::AiExecutionContext>,
     ) -> Result<Option<Arc<HashSet<RowId>>>> {
         if !security.rls_enabled(table_name) {
             return Ok(None);
@@ -1683,24 +1755,31 @@ impl Database {
             });
             return Ok(Some(allowed));
         }
+        if let Some(context) = context {
+            context.checkpoint()?;
+        }
         // ponytail: full RLS universe scan; replace with policy-column candidate checks if RLS search throughput matters.
         let started = std::time::Instant::now();
         let rows = table.visible_rows(table_snapshot)?;
         let rows_evaluated = rows.len() as u64;
-        let allowed = Arc::new(
-            rows.into_iter()
-                .filter(|row| {
-                    security.row_allowed(
+        let mut allowed = HashSet::new();
+        for chunk in rows.chunks(256) {
+            if let Some(context) = context {
+                context.consume(chunk.len())?;
+            }
+            allowed.extend(chunk.iter().filter_map(|row| {
+                security
+                    .row_allowed(
                         table_name,
                         crate::security::PolicyCommand::Select,
                         row,
                         principal,
                         false,
                     )
-                })
-                .map(|row| row.row_id)
-                .collect(),
-        );
+                    .then_some(row.row_id)
+            }));
+        }
+        let allowed = Arc::new(allowed);
         let mut cache = self.rls_cache.lock();
         cache.build_nanos = cache
             .build_nanos
@@ -1749,6 +1828,25 @@ impl Database {
         table_name: &str,
         principal: Option<&crate::auth::Principal>,
         catalog_bound: bool,
+        read: F,
+    ) -> Result<T>
+    where
+        F: FnMut(
+            &mut Table,
+            Snapshot,
+            Option<&HashSet<RowId>>,
+            Option<&crate::auth::Principal>,
+        ) -> Result<T>,
+    {
+        self.with_authorized_read_context(table_name, principal, catalog_bound, None, read)
+    }
+
+    pub fn with_authorized_read_context<T, F>(
+        &self,
+        table_name: &str,
+        principal: Option<&crate::auth::Principal>,
+        catalog_bound: bool,
+        context: Option<&crate::query::AiExecutionContext>,
         mut read: F,
     ) -> Result<T>
     where
@@ -1759,6 +1857,9 @@ impl Database {
             Option<&crate::auth::Principal>,
         ) -> Result<T>,
     {
+        if principal.is_none() && self.principal.read().is_some() {
+            self.refresh_principal()?;
+        }
         const RETRIES: usize = 3;
         let handle = self.table(table_name)?;
         for attempt in 0..RETRIES {
@@ -1783,11 +1884,84 @@ impl Database {
                     &security,
                     security_version,
                     effective_principal.as_ref(),
+                    context,
                 )?;
                 read(
                     &mut table,
                     snapshot,
                     allowed.as_deref(),
+                    effective_principal.as_ref(),
+                )?
+            };
+            if self.catalog.read().security_version == security_version {
+                return Ok(result);
+            }
+            if attempt + 1 == RETRIES {
+                return Err(MongrelError::Conflict(
+                    "security policy changed during scored read".into(),
+                ));
+            }
+        }
+        unreachable!()
+    }
+
+    /// Scored-read authorization that evaluates RLS only for approximate
+    /// candidates. This avoids a full-table policy scan on cache misses while
+    /// preserving one table generation and security-version retry.
+    pub fn with_authorized_scored_read_context<T, F>(
+        &self,
+        table_name: &str,
+        principal: Option<&crate::auth::Principal>,
+        catalog_bound: bool,
+        context: Option<&crate::query::AiExecutionContext>,
+        mut read: F,
+    ) -> Result<T>
+    where
+        F: FnMut(
+            &mut Table,
+            Snapshot,
+            Option<&crate::security::CandidateAuthorization<'_>>,
+            Option<&crate::auth::Principal>,
+        ) -> Result<T>,
+    {
+        if principal.is_none() && self.principal.read().is_some() {
+            self.refresh_principal()?;
+        }
+        const RETRIES: usize = 3;
+        let handle = self.table(table_name)?;
+        for attempt in 0..RETRIES {
+            if let Some(context) = context {
+                context.checkpoint()?;
+            }
+            crate::trace::QueryTrace::record(|trace| {
+                trace.authorization_retries = attempt;
+            });
+            let (security, security_version, effective_principal) = {
+                let catalog = self.catalog.read();
+                (
+                    catalog.security.clone(),
+                    catalog.security_version,
+                    self.principal_for_authorized_read(&catalog, principal, catalog_bound)?,
+                )
+            };
+            let result = {
+                let mut table = handle.lock();
+                let snapshot = table.snapshot();
+                let candidate_authorization = if security.rls_enabled(table_name) {
+                    Some(crate::security::CandidateAuthorization {
+                        table: table_name,
+                        security: &security,
+                        principal: effective_principal
+                            .as_ref()
+                            .ok_or(MongrelError::AuthRequired)?,
+                    })
+                } else {
+                    None
+                };
+                read(
+                    &mut table,
+                    snapshot,
+                    candidate_authorization.as_ref(),
                     effective_principal.as_ref(),
                 )?
             };
@@ -1885,18 +2059,24 @@ impl Database {
         table_name: &str,
         request: &crate::query::AnnRerankRequest,
     ) -> Result<Vec<crate::query::AnnRerankHit>> {
-        self.with_authorized_read(
+        self.with_authorized_scored_read_context(
             table_name,
             None,
             true,
-            |table, snapshot, allowed, principal| {
+            None,
+            |table, snapshot, authorization, principal| {
                 self.require_columns_for(
                     table_name,
                     crate::auth::ColumnOperation::Select,
                     &[request.column_id],
                     principal,
                 )?;
-                table.ann_rerank_at(request, snapshot, allowed)
+                table.ann_rerank_at_with_candidate_authorization_and_context(
+                    request,
+                    snapshot,
+                    authorization,
+                    None,
+                )
             },
         )
     }
@@ -1928,6 +2108,7 @@ impl Database {
                 &security,
                 security_version,
                 effective_principal.as_ref(),
+                None,
             )?;
             (
                 table_snapshot,
@@ -1963,6 +2144,9 @@ impl Database {
         table: &str,
         principal: Option<&crate::auth::Principal>,
     ) -> Result<Vec<crate::memtable::Row>> {
+        if principal.is_none() && self.principal.read().is_some() {
+            self.refresh_principal()?;
+        }
         let allowed = self.select_column_ids_for(table, principal)?;
         let handle = self.table(table)?;
         let rows = {
@@ -1982,6 +2166,9 @@ impl Database {
         table: &str,
         principal: Option<&crate::auth::Principal>,
     ) -> Result<u64> {
+        if principal.is_none() && self.principal.read().is_some() {
+            self.refresh_principal()?;
+        }
         self.select_column_ids_for(table, principal)?;
         if self.security_active_for(table) {
             Ok(self.rows_for(table, principal)?.len() as u64)

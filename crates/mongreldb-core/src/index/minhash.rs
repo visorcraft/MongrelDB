@@ -193,6 +193,43 @@ impl MinHashIndex {
         scored
     }
 
+    pub fn search_with_context(
+        &self,
+        query_token_hashes: &[u64],
+        k: usize,
+        context: Option<&crate::query::AiExecutionContext>,
+    ) -> crate::Result<Vec<(RowId, f32)>> {
+        let Some(qsig) = signature(query_token_hashes, self.permutations) else {
+            return Ok(Vec::new());
+        };
+        let mut candidates: HashSet<u32> = HashSet::new();
+        for b in 0..self.bands {
+            if let Some(context) = context {
+                context.consume(1)?;
+            }
+            if let Some(indices) =
+                self.buckets
+                    .get(&band_key(b, &qsig, self.permutations / self.bands))
+            {
+                candidates.extend(indices.iter().copied());
+            }
+        }
+        let mut scored = Vec::with_capacity(candidates.len().min(k));
+        for chunk in candidates.into_iter().collect::<Vec<_>>().chunks(256) {
+            if let Some(context) = context {
+                context.consume(chunk.len())?;
+            }
+            for idx in chunk {
+                let (rid, sig) = &self.sigs[*idx as usize];
+                let matches = sig.iter().zip(&qsig).filter(|(a, b)| a == b).count();
+                scored.push((*rid, matches as f32 / self.permutations as f32));
+            }
+        }
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        scored.truncate(k);
+        Ok(scored)
+    }
+
     pub fn candidate_row_ids(&self, query_token_hashes: &[u64]) -> Vec<RowId> {
         let Some(signature) = signature(query_token_hashes, self.permutations) else {
             return Vec::new();

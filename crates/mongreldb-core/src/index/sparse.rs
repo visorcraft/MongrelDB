@@ -11,6 +11,7 @@
 //! space, so `sparse_match ∩ fm_contains ∩ bitmap_eq` composes in one query.
 
 use crate::rowid::RowId;
+use crate::Result;
 use std::collections::HashMap;
 
 /// Inverted index over weighted sparse vectors, keyed by token id.
@@ -65,6 +66,38 @@ impl SparseIndex {
         ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         ranked.truncate(k);
         ranked
+    }
+
+    pub fn search_with_context(
+        &self,
+        query: &[(u32, f32)],
+        k: usize,
+        context: Option<&crate::query::AiExecutionContext>,
+    ) -> Result<Vec<(RowId, f64)>> {
+        let mut scores: HashMap<u64, f64> = HashMap::new();
+        for &(token, q_weight) in query {
+            if let Some(context) = context {
+                context.checkpoint()?;
+            }
+            if let Some(list) = self.postings.get(&token) {
+                for chunk in list.chunks(256) {
+                    if let Some(context) = context {
+                        context.consume(chunk.len())?;
+                    }
+                    for &(rid, d_weight) in chunk {
+                        *scores.entry(rid.0).or_insert(0.0) +=
+                            f64::from(q_weight) * f64::from(d_weight);
+                    }
+                }
+            }
+        }
+        let mut ranked: Vec<_> = scores
+            .into_iter()
+            .map(|(rid, score)| (RowId(rid), score))
+            .collect();
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        ranked.truncate(k);
+        Ok(ranked)
     }
 
     pub fn candidate_row_ids(&self, query: &[(u32, f32)]) -> Vec<RowId> {

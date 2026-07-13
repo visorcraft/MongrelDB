@@ -2417,9 +2417,7 @@ impl TableHandle {
     /// use `Database.sql` for full scans.
     #[napi]
     pub fn query_arrow(&self, conditions: Vec<ConditionSpec>) -> napi::Result<Buffer> {
-        let handle = self.db.table(&self.name).map_err(to_napi)?;
-        let g = handle.lock();
-        query_arrow_inner(&self.db, &self.name, &g, &conditions)
+        query_arrow_inner(&self.db, &self.name, &conditions)
     }
 
     // ── async variants ──
@@ -2546,9 +2544,7 @@ impl TableHandle {
         let db = Arc::clone(&self.db);
         let name = self.name.clone();
         napi::bindgen_prelude::spawn_blocking(move || -> napi::Result<Buffer> {
-            let handle = db.table(&name).map_err(to_napi)?;
-            let g = handle.lock();
-            query_arrow_inner(&db, &name, &g, &conditions)
+            query_arrow_inner(&db, &name, &conditions)
         })
         .await
         .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e:?}")))?
@@ -2560,7 +2556,6 @@ impl TableHandle {
 fn query_arrow_inner(
     db: &CoreDatabase,
     table_name: &str,
-    g: &mongreldb_core::Table,
     conditions: &[ConditionSpec],
 ) -> napi::Result<Buffer> {
     if conditions.is_empty() {
@@ -2589,6 +2584,8 @@ fn query_arrow_inner(
     if rows.is_empty() {
         return Ok(Buffer::from(Vec::new()));
     }
+    let handle = db.table(table_name).map_err(to_napi)?;
+    let g = handle.lock();
     let cols = rows_to_native_cols(&rows, g.schema());
     Ok(Buffer::from(native_cols_to_ipc(&cols, g.schema())?))
 }

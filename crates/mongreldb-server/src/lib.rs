@@ -53,9 +53,9 @@ fn status_for_error(e: &mongreldb_core::MongrelError) -> StatusCode {
         MongrelError::Conflict(_) => StatusCode::CONFLICT,
         MongrelError::ReadOnlyReplica => StatusCode::CONFLICT,
         MongrelError::NotFound(_) => StatusCode::NOT_FOUND,
-        MongrelError::DeadlineExceeded
-        | MongrelError::WorkBudgetExceeded
-        | MongrelError::Cancelled => StatusCode::CONFLICT,
+        MongrelError::DeadlineExceeded => StatusCode::GATEWAY_TIMEOUT,
+        MongrelError::WorkBudgetExceeded => StatusCode::TOO_MANY_REQUESTS,
+        MongrelError::Cancelled => StatusCode::from_u16(499).expect("499 is valid"),
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -66,6 +66,11 @@ fn status_for_query_error(e: &mongreldb_query::MongrelQueryError) -> StatusCode 
     use mongreldb_query::MongrelQueryError;
     match e {
         MongrelQueryError::Core(core) => status_for_error(core),
+        _ if e.to_string().contains("deadline exceeded") => StatusCode::GATEWAY_TIMEOUT,
+        _ if e.to_string().contains("work budget exceeded") => StatusCode::TOO_MANY_REQUESTS,
+        _ if e.to_string().contains("cancelled") => {
+            StatusCode::from_u16(499).expect("499 is valid")
+        }
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -107,6 +112,8 @@ struct AppState {
     /// Token-keyed pool of live sessions for cross-request interactive
     /// transactions (`X-Session-ID` on `/sql`).
     sessions: Arc<sessions::SessionStore>,
+    /// Bounds CPU-heavy AI work submitted to Tokio's blocking pool.
+    ai_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 pub fn build_app(db: Arc<Database>) -> axum::Router {
@@ -183,6 +190,7 @@ pub fn build_app_with_sessions(
         slow_query_threshold: metrics::slow_query_threshold(),
         audit: Arc::new(audit::AuditLog::new(8192)),
         sessions,
+        ai_semaphore: Arc::new(tokio::sync::Semaphore::new(default_ai_max_concurrent())),
     });
     let router = axum::Router::new()
         .route("/health", get(health))
@@ -788,6 +796,14 @@ fn default_history_retention_epochs() -> u64 {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(1024)
+}
+
+fn default_ai_max_concurrent() -> usize {
+    std::env::var("MONGRELDB_AI_MAX_CONCURRENT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(4)
 }
 
 /// The principal a request is attributed to, for session ownership: a resolved

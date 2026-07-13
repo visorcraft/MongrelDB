@@ -7,7 +7,10 @@ use mongreldb_core::query::{
 use mongreldb_core::schema::{
     AnnOptions, ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId,
 };
-use mongreldb_core::{Table, Value};
+use mongreldb_core::{
+    ColumnMask, MaskStrategy, PolicyCommand, Principal, RowPolicy, SecurityCatalog, SecurityExpr,
+    Table, Value,
+};
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
@@ -37,6 +40,12 @@ fn sparse(id: usize) -> Vec<(u32, f32)> {
         .collect()
 }
 
+fn stored_sparse(id: usize) -> Vec<(u32, f32)> {
+    let mut vector = sparse(id);
+    vector.push((9_000, 0.01));
+    vector
+}
+
 fn members(id: usize) -> Vec<String> {
     member_ids(id)
         .into_iter()
@@ -46,6 +55,15 @@ fn members(id: usize) -> Vec<String> {
 
 fn member_ids(id: usize) -> [usize; 8] {
     std::array::from_fn(|offset| (id + offset * 31) % 16_384)
+}
+
+fn owner(id: usize) -> &'static str {
+    match id % 100 {
+        0 => "tenant_1",
+        1..=10 => "tenant_10",
+        11..=60 => "tenant_50",
+        _ => "other",
+    }
 }
 
 fn exact_jaccard(left: usize, right: usize) -> f32 {
@@ -75,6 +93,8 @@ fn schema() -> Schema {
             column(3, "embedding", TypeId::Embedding { dim: DIM as u32 }, false),
             column(4, "sparse", TypeId::Bytes, false),
             column(5, "members", TypeId::Bytes, false),
+            column(6, "ingested_at", TypeId::TimestampNanos, false),
+            column(7, "owner", TypeId::Bytes, false),
         ],
         indexes: vec![
             index("status", 2, IndexKind::Bitmap),
@@ -135,27 +155,40 @@ fn main() {
         .ann = Some(ann_options.clone());
     let dir = tempfile::tempdir().unwrap();
     let mut table = Table::create(dir.path(), benchmark_schema, 1).unwrap();
+    let ingested_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+        .min(i64::MAX as u128) as i64;
+    let mut row_ids = Vec::with_capacity(rows);
     let build_started = Instant::now();
     for id in 0..rows {
-        table
-            .put(vec![
-                (1, Value::Int64(id as i64)),
-                (
-                    2,
-                    Value::Bytes(
-                        if id % 2 == 0 {
-                            b"even".as_slice()
-                        } else {
-                            b"odd".as_slice()
-                        }
-                        .to_vec(),
+        row_ids.push(
+            table
+                .put(vec![
+                    (1, Value::Int64(id as i64)),
+                    (
+                        2,
+                        Value::Bytes(
+                            if id % 2 == 0 {
+                                b"even".as_slice()
+                            } else {
+                                b"odd".as_slice()
+                            }
+                            .to_vec(),
+                        ),
                     ),
-                ),
-                (3, Value::Embedding(embedding(id))),
-                (4, Value::Bytes(bincode::serialize(&sparse(id)).unwrap())),
-                (5, Value::Bytes(serde_json::to_vec(&members(id)).unwrap())),
-            ])
-            .unwrap();
+                    (3, Value::Embedding(embedding(id))),
+                    (
+                        4,
+                        Value::Bytes(bincode::serialize(&stored_sparse(id)).unwrap()),
+                    ),
+                    (5, Value::Bytes(serde_json::to_vec(&members(id)).unwrap())),
+                    (6, Value::Int64(ingested_at)),
+                    (7, Value::Bytes(owner(id).as_bytes().to_vec())),
+                ])
+                .unwrap(),
+        );
     }
     table.commit().unwrap();
     table.close().unwrap();
@@ -369,6 +402,7 @@ fn main() {
                     },
                 ],
                 fusion: Fusion::ReciprocalRank { constant: 60 },
+                rerank: None,
                 limit: 10,
                 projection: Some(vec![1]),
             })
@@ -380,6 +414,96 @@ fn main() {
         hybrid_hard_filter_us.push(trace.hard_filter_nanos as u128 / 1_000);
         hybrid_fusion_us.push(trace.fusion_nanos as u128 / 1_000);
         hybrid_projection_us.push(trace.projection_nanos as u128 / 1_000);
+    }
+    let bounded_window_k = rows.min(mongreldb_core::query::MAX_RETRIEVER_K);
+    let (bounded_window_result, bounded_window_trace) =
+        mongreldb_core::trace::QueryTrace::capture(|| {
+            table.search(&SearchRequest {
+                must: Vec::new(),
+                retrievers: vec![NamedRetriever {
+                    name: "broad_sparse".into(),
+                    weight: 1.0,
+                    retriever: Retriever::Sparse {
+                        column_id: 4,
+                        query: vec![(9_000, 1.0)],
+                        k: bounded_window_k,
+                    },
+                }],
+                fusion: Fusion::ReciprocalRank { constant: 60 },
+                rerank: None,
+                limit: 10,
+                projection: Some(vec![1]),
+            })
+        });
+    let bounded_window_hits = bounded_window_result.unwrap().len();
+    let rls_security = SecurityCatalog {
+        rls_tables: vec!["docs".into()],
+        policies: vec![RowPolicy {
+            name: "owner_only".into(),
+            table: "docs".into(),
+            command: PolicyCommand::Select,
+            subjects: vec!["public".into()],
+            permissive: true,
+            using: Some(SecurityExpr::ColumnEqCurrentUser { column: 7 }),
+            with_check: None,
+        }],
+        masks: vec![ColumnMask {
+            name: "mask_status".into(),
+            table: "docs".into(),
+            column: 2,
+            strategy: MaskStrategy::Redact {
+                replacement: "***".into(),
+            },
+            exempt_subjects: Vec::new(),
+        }],
+    };
+    let mut rls_profiles = Vec::new();
+    for (username, selectivity) in [("tenant_1", 0.01), ("tenant_10", 0.10), ("tenant_50", 0.50)] {
+        let principal = Principal {
+            username: username.into(),
+            is_admin: false,
+            roles: Vec::new(),
+            permissions: Vec::new(),
+        };
+        let authorization = mongreldb_core::security::CandidateAuthorization {
+            table: "docs",
+            security: &rls_security,
+            principal: &principal,
+        };
+        let context = mongreldb_core::query::AiExecutionContext::new(None, usize::MAX);
+        let started = Instant::now();
+        let (result, trace) = mongreldb_core::trace::QueryTrace::capture(|| {
+            table.search_at_with_candidate_authorization_and_context(
+                &SearchRequest {
+                    must: Vec::new(),
+                    retrievers: vec![NamedRetriever {
+                        name: "broad_sparse".into(),
+                        weight: 1.0,
+                        retriever: Retriever::Sparse {
+                            column_id: 4,
+                            query: vec![(9_000, 1.0)],
+                            k: 100,
+                        },
+                    }],
+                    fusion: Fusion::ReciprocalRank { constant: 60 },
+                    rerank: None,
+                    limit: 10,
+                    projection: Some(vec![1, 2]),
+                },
+                table.snapshot(),
+                Some(&authorization),
+                Some(&context),
+            )
+        });
+        rls_profiles.push(serde_json::json!({
+            "selectivity": selectivity,
+            "hits": result.unwrap().len(),
+            "latency_us": started.elapsed().as_micros(),
+            "authorization_nanos": trace.authorization_nanos,
+            "rows_evaluated": trace.rls_rows_evaluated,
+            "policy_columns_decoded": trace.rls_policy_columns_decoded,
+            "work_consumed": context.consumed_work(),
+        }));
     }
     let checkpoint_path = dir.path().join("_idx/global.idx");
     let checkpoint_inspection = (|| -> Result<(u64, Vec<serde_json::Value>), String> {
@@ -419,6 +543,86 @@ fn main() {
         .filter_map(|entry| entry.metadata().ok())
         .map(|metadata| metadata.len())
         .sum::<u64>();
+    let operational_started = Instant::now();
+    let update_count = rows / 20;
+    table.set_mutable_run_spill_bytes(1);
+    for batch in 0..8 {
+        let start = update_count * batch / 8;
+        let end = update_count * (batch + 1) / 8;
+        for id in start..end {
+            table
+                .put(vec![
+                    (1, Value::Int64(id as i64)),
+                    (2, Value::Bytes(b"updated".to_vec())),
+                    (3, Value::Embedding(embedding(id))),
+                    (
+                        4,
+                        Value::Bytes(bincode::serialize(&stored_sparse(id)).unwrap()),
+                    ),
+                    (5, Value::Bytes(serde_json::to_vec(&members(id)).unwrap())),
+                    (6, Value::Int64(ingested_at)),
+                    (7, Value::Bytes(owner(id).as_bytes().to_vec())),
+                ])
+                .unwrap();
+        }
+        table.commit().unwrap();
+        table.flush().unwrap();
+    }
+    table.set_mutable_run_spill_bytes(u64::MAX);
+    if rows > 0 {
+        table
+            .put(vec![
+                (1, Value::Int64(0)),
+                (2, Value::Bytes(b"updated".to_vec())),
+                (3, Value::Embedding(embedding(0))),
+                (
+                    4,
+                    Value::Bytes(bincode::serialize(&stored_sparse(0)).unwrap()),
+                ),
+                (5, Value::Bytes(serde_json::to_vec(&members(0)).unwrap())),
+                (6, Value::Int64(ingested_at)),
+                (7, Value::Bytes(owner(0).as_bytes().to_vec())),
+            ])
+            .unwrap();
+        table.flush().unwrap();
+    }
+    let delete_count = rows / 100;
+    for row_id in row_ids.iter().take(delete_count) {
+        table.delete(*row_id).unwrap();
+    }
+    table.commit().unwrap();
+    table
+        .set_ttl("ingested_at", 24 * 60 * 60 * 1_000_000_000)
+        .unwrap();
+    let mut operational_us = Vec::new();
+    let mut operational_projection_rows = 0usize;
+    for query_number in 0..queries.min(10) {
+        let id = query_number * rows / queries.min(10);
+        let started = Instant::now();
+        let (result, trace) = mongreldb_core::trace::QueryTrace::capture(|| {
+            table.search(&SearchRequest {
+                must: Vec::new(),
+                retrievers: vec![NamedRetriever {
+                    name: "sparse".into(),
+                    weight: 1.0,
+                    retriever: Retriever::Sparse {
+                        column_id: 4,
+                        query: sparse(id),
+                        k: 100,
+                    },
+                }],
+                fusion: Fusion::ReciprocalRank { constant: 60 },
+                rerank: None,
+                limit: 10,
+                projection: Some(vec![1]),
+            })
+        });
+        result.unwrap();
+        operational_us.push(started.elapsed().as_micros());
+        operational_projection_rows =
+            operational_projection_rows.saturating_add(trace.projection_rows);
+    }
+    let operational_build_ms = operational_started.elapsed().as_millis();
     let git_sha = std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
         .output()
@@ -475,6 +679,12 @@ fn main() {
         "sparse": {"p50_us": percentile(&mut sparse_us, 0.50), "p95_us": percentile(&mut sparse_us, 0.95), "average_postings_visited": sparse_postings_visited as f64 / queries as f64},
         "minhash": {"p50_us": percentile(&mut minhash_us, 0.50), "p95_us": percentile(&mut minhash_us, 0.95), "verification_p50_us": percentile(&mut minhash_verify_us, 0.50), "verification_p95_us": percentile(&mut minhash_verify_us, 0.95), "verification_gather_p50_us": percentile(&mut minhash_verify_gather_us, 0.50), "verification_gather_p95_us": percentile(&mut minhash_verify_gather_us, 0.95), "verification_parse_p50_us": percentile(&mut minhash_verify_parse_us, 0.50), "verification_parse_p95_us": percentile(&mut minhash_verify_parse_us, 0.95), "verification_score_p50_us": percentile(&mut minhash_verify_score_us, 0.50), "verification_score_p95_us": percentile(&mut minhash_verify_score_us, 0.95), "candidate_recall_at_10": minhash_candidate_recall / queries as f64, "average_candidates": minhash_candidate_count as f64 / queries as f64, "estimated_exact_mean_absolute_error": minhash_error / minhash_error_samples.max(1) as f64},
         "hybrid": {"p50_us": percentile(&mut hybrid_us, 0.50), "p95_us": percentile(&mut hybrid_us, 0.95), "ann_candidate_p95_us": percentile(&mut hybrid_ann_us, 0.95), "sparse_candidate_p95_us": percentile(&mut hybrid_sparse_us, 0.95), "hard_filter_p95_us": percentile(&mut hybrid_hard_filter_us, 0.95), "fusion_p95_us": percentile(&mut hybrid_fusion_us, 0.95), "projection_p95_us": percentile(&mut hybrid_projection_us, 0.95), "average_union_size": hybrid_union_size as f64 / queries as f64},
+        "bounded_window": {"requested_candidates": bounded_window_k, "union_size": bounded_window_trace.union_size, "final_limit": 10, "hits": bounded_window_hits, "projection_rows": bounded_window_trace.projection_rows, "projection_cells": bounded_window_trace.projection_cells},
+        "qualification_profiles": {
+            "clean": {"rows": rows, "deletes": 0, "updates": 0, "ttl": false},
+            "operational": {"rows": rows, "updates": update_count, "deletes": delete_count, "ttl": true, "immutable_runs": table.run_count(), "hot_memtable_rows": table.memtable_len(), "mutable_run_rows": table.mutable_run_len(), "mutation_ms": operational_build_ms, "retrieval_p50_us": percentile(&mut operational_us, 0.50), "retrieval_p95_us": percentile(&mut operational_us, 0.95), "average_projection_rows": operational_projection_rows as f64 / queries.min(10) as f64},
+            "multi_tenant": {"rows": rows, "column_masks": rls_security.masks.len(), "profiles": rls_profiles},
+        },
     });
     println!("{report}");
     if qualification_mode && checkpoint_status != "ok" {

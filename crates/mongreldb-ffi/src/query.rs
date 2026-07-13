@@ -314,7 +314,7 @@ pub unsafe fn sparse_array_to_vec(arr: &SparseTermArray) -> Vec<(u32, f32)> {
 }
 
 /// Hash the minhash member strings into `Vec<u64>`.
-fn minhash_members_to_hashes(
+unsafe fn minhash_members_to_hashes(
     members: &crate::value::MinHashMembers,
 ) -> Result<Vec<u64>, ErrorCode> {
     if members.items.is_null() || members.len == 0 {
@@ -374,6 +374,12 @@ impl FFIQuery {
         }
         q.with_limit(self.limit.unwrap_or(MAX_FINAL_LIMIT))
             .with_offset(self.offset)
+    }
+}
+
+impl Default for FFIQuery {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

@@ -11,7 +11,7 @@ use std::os::raw::c_char;
 /// # Panics
 /// Panics if the bytes are not valid UTF-8 (FFI strings are documented as
 /// UTF-8). A caller passing invalid UTF-8 has violated the contract.
-pub fn cstr_to_string(ptr: *const c_char, what: &str) -> String {
+pub unsafe fn cstr_to_string(ptr: *const c_char, what: &str) -> String {
     // SAFETY: caller guarantees `ptr` is a valid NUL-terminated C string.
     let bytes = unsafe { CStr::from_ptr(ptr).to_bytes() };
     std::str::from_utf8(bytes)
@@ -34,10 +34,10 @@ pub unsafe fn drop_cstring_ptr_unchecked(ptr: *mut c_char) {
 
 /// Reclaim a `CString::into_raw` pointer. Null is a no-op. Safe wrapper used
 /// by [`crate::error`] so its `Drop` impl can't accidentally cause UB.
-pub fn drop_cstring_ptr(ptr: *mut c_char) {
+pub unsafe fn drop_cstring_ptr(ptr: *mut c_char) {
     // SAFETY: the only producers of these pointers are `CString::into_raw`
     // calls inside this crate, and each pointer is reclaimed exactly once.
-    unsafe { drop_cstring_ptr_unchecked(ptr) }
+    drop_cstring_ptr_unchecked(ptr)
 }
 
 /// Hand ownership of a `String` to C as a NUL-terminated `*mut c_char`. The

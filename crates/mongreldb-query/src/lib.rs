@@ -1585,6 +1585,7 @@ pub struct MongrelSession {
     /// Built-in plus app-provided external table modules available to this
     /// session.
     external_modules: Arc<ExternalModuleRegistry>,
+    scored_runtime: Arc<scored_sql::ScoredRuntime>,
     /// Names of `PREPARE`d statements tracked so they can be `DEALLOCATE`d when
     /// DDL invalidates the tables they reference (DataFusion's prepared-plan
     /// store is not cleared by the session's own result/plan caches).
@@ -1668,7 +1669,15 @@ impl MongrelSession {
         let sql_fn_state = Arc::new(extended_sql_functions::ExtendedSqlState::default());
         register_mongrel_functions(&ctx, Arc::clone(&sql_fn_state));
         let tables = Arc::new(parking_lot::Mutex::new(HashMap::new()));
-        scored_sql::register(&ctx, Arc::clone(&tables), None, None, false);
+        let scored_runtime = scored_sql::ScoredRuntime::from_env();
+        scored_sql::register(
+            &ctx,
+            Arc::clone(&tables),
+            None,
+            None,
+            false,
+            Arc::clone(&scored_runtime),
+        );
         let external_modules = Arc::new(ExternalModuleRegistry::default());
         Self {
             ctx,
@@ -1685,6 +1694,7 @@ impl MongrelSession {
             sql_txn: parking_lot::Mutex::new(None),
             sql_fn_state,
             external_modules,
+            scored_runtime,
             prepared_names: parking_lot::Mutex::new(std::collections::HashSet::new()),
         }
     }
@@ -1762,12 +1772,14 @@ impl MongrelSession {
             names.first().and_then(|n| tables.get(*n).cloned())
         };
         let tables = Arc::new(parking_lot::Mutex::new(tables));
+        let scored_runtime = scored_sql::ScoredRuntime::from_env();
         scored_sql::register(
             &ctx,
             Arc::clone(&tables),
             Some(Arc::clone(&database)),
             principal.clone(),
             principal_catalog_bound,
+            Arc::clone(&scored_runtime),
         );
 
         Ok(Self {
@@ -1785,6 +1797,7 @@ impl MongrelSession {
             sql_txn: parking_lot::Mutex::new(None),
             sql_fn_state,
             external_modules,
+            scored_runtime,
             prepared_names: parking_lot::Mutex::new(std::collections::HashSet::new()),
         })
     }
@@ -1799,6 +1812,18 @@ impl MongrelSession {
                 Some(principal.clone())
             }
         })
+    }
+
+    /// Set timeout, work, and fused-union limits for scored SQL functions.
+    pub fn set_scored_execution_limits(
+        &self,
+        statement_timeout: std::time::Duration,
+        max_work: usize,
+        max_fused_candidates: usize,
+    ) -> Result<()> {
+        self.scored_runtime
+            .configure(statement_timeout, max_work, max_fused_candidates)
+            .map_err(Into::into)
     }
 
     fn security_context_active(&self) -> bool {

@@ -15,6 +15,13 @@ pub struct SecurityCatalog {
     pub masks: Vec<ColumnMask>,
 }
 
+/// Security state used to evaluate only scored retrieval candidates.
+pub struct CandidateAuthorization<'a> {
+    pub table: &'a str,
+    pub security: &'a SecurityCatalog,
+    pub principal: &'a Principal,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RowPolicy {
     pub name: String,
@@ -144,6 +151,47 @@ impl SecurityCatalog {
             *value = mask.strategy.apply(value);
         }
     }
+
+    pub fn apply_masks_to_cells(
+        &self,
+        table: &str,
+        cells: &mut [(u16, Value)],
+        principal: &Principal,
+    ) {
+        if principal.is_admin {
+            return;
+        }
+        for mask in self.masks.iter().filter(|mask| mask.table == table) {
+            if !mask.exempt_subjects.is_empty() && subject_matches(&mask.exempt_subjects, principal)
+            {
+                continue;
+            }
+            if let Some((_, value)) = cells
+                .iter_mut()
+                .find(|(column_id, _)| *column_id == mask.column)
+            {
+                *value = mask.strategy.apply(value);
+            }
+        }
+    }
+
+    /// Columns needed to evaluate applicable SELECT policies for one principal.
+    pub fn select_policy_columns(&self, table: &str, principal: &Principal) -> Vec<u16> {
+        let mut columns = Vec::new();
+        for policy in self.policies.iter().filter(|policy| {
+            policy.table == table
+                && (matches!(policy.command, PolicyCommand::All)
+                    || policy.command == PolicyCommand::Select)
+                && subject_matches(&policy.subjects, principal)
+        }) {
+            if let Some(expression) = &policy.using {
+                expression.collect_columns(&mut columns);
+            }
+        }
+        columns.sort_unstable();
+        columns.dedup();
+        columns
+    }
 }
 
 impl SecurityExpr {
@@ -166,6 +214,19 @@ impl SecurityExpr {
                 left.eval(row, principal) || right.eval(row, principal)
             }
             SecurityExpr::Not { expression } => !expression.eval(row, principal),
+        }
+    }
+
+    fn collect_columns(&self, columns: &mut Vec<u16>) {
+        match self {
+            SecurityExpr::True => {}
+            SecurityExpr::ColumnEqCurrentUser { column }
+            | SecurityExpr::ColumnEqValue { column, .. } => columns.push(*column),
+            SecurityExpr::And { left, right } | SecurityExpr::Or { left, right } => {
+                left.collect_columns(columns);
+                right.collect_columns(columns);
+            }
+            SecurityExpr::Not { expression } => expression.collect_columns(columns),
         }
     }
 }

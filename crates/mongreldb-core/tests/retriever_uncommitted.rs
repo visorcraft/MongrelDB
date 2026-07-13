@@ -146,6 +146,7 @@ fn standalone_retrievers_do_not_see_put_before_commit() {
                 retriever: ann(),
             }],
             fusion: Fusion::ReciprocalRank { constant: 60 },
+            rerank: None,
             limit: 1,
             projection: None,
         })

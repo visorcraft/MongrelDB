@@ -49,6 +49,11 @@ pub enum KitErrorCode {
     TriggerNotFound,
     TriggerValidation,
     Conflict,
+    AuthRequired,
+    PermissionDenied,
+    DeadlineExceeded,
+    WorkBudgetExceeded,
+    Cancelled,
     BadRequest,
     NotFound,
     Internal,
@@ -73,6 +78,11 @@ impl KitErrorCode {
             KitErrorCode::TriggerNotFound => "TRIGGER_NOT_FOUND",
             KitErrorCode::TriggerValidation => "TRIGGER_VALIDATION",
             KitErrorCode::Conflict => "CONFLICT",
+            KitErrorCode::AuthRequired => "AUTH_REQUIRED",
+            KitErrorCode::PermissionDenied => "PERMISSION_DENIED",
+            KitErrorCode::DeadlineExceeded => "DEADLINE_EXCEEDED",
+            KitErrorCode::WorkBudgetExceeded => "WORK_BUDGET_EXCEEDED",
+            KitErrorCode::Cancelled => "CANCELLED",
             KitErrorCode::BadRequest => "BAD_REQUEST",
             KitErrorCode::NotFound => "NOT_FOUND",
             KitErrorCode::Internal => "INTERNAL",
@@ -91,6 +101,11 @@ impl KitErrorCode {
             "TRIGGER_NOT_FOUND" => KitErrorCode::TriggerNotFound,
             "TRIGGER_VALIDATION" => KitErrorCode::TriggerValidation,
             "CONFLICT" => KitErrorCode::Conflict,
+            "AUTH_REQUIRED" => KitErrorCode::AuthRequired,
+            "PERMISSION_DENIED" => KitErrorCode::PermissionDenied,
+            "DEADLINE_EXCEEDED" => KitErrorCode::DeadlineExceeded,
+            "WORK_BUDGET_EXCEEDED" => KitErrorCode::WorkBudgetExceeded,
+            "CANCELLED" => KitErrorCode::Cancelled,
             "BAD_REQUEST" => KitErrorCode::BadRequest,
             "NOT_FOUND" => KitErrorCode::NotFound,
             "INTERNAL" => KitErrorCode::Internal,
@@ -118,38 +133,145 @@ pub struct MongrelClient {
     client: reqwest::blocking::Client,
 }
 
-impl MongrelClient {
-    /// Add a Bearer token to every request. Chain after `new` as a builder.
-    pub fn with_bearer_token(mut self, token: impl AsRef<str>) -> Self {
-        let mut headers = reqwest::header::HeaderMap::new();
-        if let Ok(value) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token.as_ref())) {
-            headers.insert(reqwest::header::AUTHORIZATION, value);
-            self.client = reqwest::blocking::Client::builder()
-                .default_headers(headers)
-                .build()
-                .expect("valid reqwest default headers");
+/// Builder for a blocking [`MongrelClient`]. Authorization is installed as a
+/// sensitive default header, so every route uses it and debug output redacts it.
+pub struct MongrelClientBuilder {
+    base_url: String,
+    authorization: Option<reqwest::header::HeaderValue>,
+    invalid_authorization: bool,
+}
+
+/// Builder for an [`AsyncMongrelClient`].
+pub struct AsyncMongrelClientBuilder {
+    base_url: String,
+    authorization: Option<reqwest::header::HeaderValue>,
+    invalid_authorization: bool,
+}
+
+fn bearer_header(token: &str) -> ClientResult<reqwest::header::HeaderValue> {
+    sensitive_header(format!("Bearer {token}"))
+}
+
+fn basic_header(username: &str, password: &str) -> ClientResult<reqwest::header::HeaderValue> {
+    let encoded = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        format!("{username}:{password}"),
+    );
+    sensitive_header(format!("Basic {encoded}"))
+}
+
+fn sensitive_header(value: String) -> ClientResult<reqwest::header::HeaderValue> {
+    let mut value = reqwest::header::HeaderValue::from_str(&value)
+        .map_err(|_| ClientError::Transport("invalid authorization credentials".into()))?;
+    value.set_sensitive(true);
+    Ok(value)
+}
+
+fn default_headers(
+    authorization: Option<reqwest::header::HeaderValue>,
+) -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(value) = authorization {
+        headers.insert(reqwest::header::AUTHORIZATION, value);
+    }
+    headers
+}
+
+impl MongrelClientBuilder {
+    pub fn bearer_token(mut self, token: impl AsRef<str>) -> Self {
+        match bearer_header(token.as_ref()) {
+            Ok(value) => self.authorization = Some(value),
+            Err(_) => self.invalid_authorization = true,
         }
+        self
+    }
+
+    pub fn basic_auth(
+        mut self,
+        username: impl AsRef<str>,
+        password: impl AsRef<str>,
+    ) -> Self {
+        match basic_header(username.as_ref(), password.as_ref()) {
+            Ok(value) => self.authorization = Some(value),
+            Err(_) => self.invalid_authorization = true,
+        }
+        self
+    }
+
+    pub fn build(self) -> ClientResult<MongrelClient> {
+        if self.invalid_authorization {
+            return Err(ClientError::Transport(
+                "invalid authorization credentials".into(),
+            ));
+        }
+        let client = reqwest::blocking::Client::builder()
+            .default_headers(default_headers(self.authorization))
+            .build()?;
+        Ok(MongrelClient {
+            base_url: self.base_url,
+            client,
+        })
+    }
+}
+
+impl AsyncMongrelClientBuilder {
+    pub fn bearer_token(mut self, token: impl AsRef<str>) -> Self {
+        match bearer_header(token.as_ref()) {
+            Ok(value) => self.authorization = Some(value),
+            Err(_) => self.invalid_authorization = true,
+        }
+        self
+    }
+
+    pub fn basic_auth(
+        mut self,
+        username: impl AsRef<str>,
+        password: impl AsRef<str>,
+    ) -> Self {
+        match basic_header(username.as_ref(), password.as_ref()) {
+            Ok(value) => self.authorization = Some(value),
+            Err(_) => self.invalid_authorization = true,
+        }
+        self
+    }
+
+    pub fn build(self) -> ClientResult<AsyncMongrelClient> {
+        if self.invalid_authorization {
+            return Err(ClientError::Transport(
+                "invalid authorization credentials".into(),
+            ));
+        }
+        let client = reqwest::Client::builder()
+            .default_headers(default_headers(self.authorization))
+            .build()?;
+        Ok(AsyncMongrelClient {
+            base_url: self.base_url,
+            client,
+        })
+    }
+}
+
+impl MongrelClient {
+    /// Add a Bearer token to every request. Backward-compatible shortcut.
+    pub fn with_bearer_token(mut self, token: impl AsRef<str>) -> Self {
+        self.client = reqwest::blocking::Client::builder()
+            .default_headers(default_headers(Some(
+                bearer_header(token.as_ref()).expect("valid bearer credentials"),
+            )))
+            .build()
+            .expect("valid reqwest client");
         self
     }
 
     /// Add HTTP Basic credentials to every request. Chain after `new` as a builder.
     pub fn with_basic_auth(mut self, username: impl AsRef<str>, password: impl AsRef<str>) -> Self {
-        let value = format!(
-            "Basic {}",
-            base64::Engine::encode(
-                &base64::engine::general_purpose::STANDARD,
-                format!("{}:{}", username.as_ref(), password.as_ref()),
-            )
-        );
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
-            reqwest::header::AUTHORIZATION,
-            reqwest::header::HeaderValue::from_str(&value).expect("valid basic auth header"),
-        );
         self.client = reqwest::blocking::Client::builder()
-            .default_headers(headers)
+            .default_headers(default_headers(Some(
+                basic_header(username.as_ref(), password.as_ref())
+                    .expect("valid basic credentials"),
+            )))
             .build()
-            .expect("valid reqwest basic auth client");
+            .expect("valid reqwest client");
         self
     }
 }
@@ -355,6 +477,23 @@ pub struct KitQueryRow {
     pub cells: Vec<serde_json::Value>,
 }
 
+/// Cooperative execution limits accepted by every Kit AI endpoint.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct AiExecutionOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deadline_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_work: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct WithAiExecutionOptions<'a, T> {
+    #[serde(flatten)]
+    request: &'a T,
+    #[serde(flatten)]
+    options: &'a AiExecutionOptions,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct KitRetrieveRequest {
     pub table: String,
@@ -438,6 +577,8 @@ pub struct KitSearchRequest {
     pub must: Vec<serde_json::Value>,
     pub retrievers: Vec<serde_json::Value>,
     pub fusion: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rerank: Option<serde_json::Value>,
     pub limit: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub projection: Option<Vec<u16>>,
@@ -462,6 +603,12 @@ pub struct KitSearchHit {
     pub cells: Vec<serde_json::Value>,
     pub components: Vec<KitComponentScore>,
     pub fused_score: f64,
+    #[serde(default)]
+    pub exact_rerank_score: Option<f32>,
+    #[serde(default)]
+    pub final_score: Option<f64>,
+    #[serde(default)]
+    pub final_rank: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -540,11 +687,16 @@ struct KitErrorBody {
 }
 
 impl MongrelClient {
-    pub fn new(url: &str) -> Self {
-        Self {
-            base_url: url.trim_end_matches('/').to_string(),
-            client: reqwest::blocking::Client::new(),
+    pub fn builder(url: impl AsRef<str>) -> MongrelClientBuilder {
+        MongrelClientBuilder {
+            base_url: url.as_ref().trim_end_matches('/').to_string(),
+            authorization: None,
+            invalid_authorization: false,
         }
+    }
+
+    pub fn new(url: &str) -> Self {
+        Self::builder(url).build().expect("valid client URL")
     }
 
     fn url(&self, path: &str) -> String {
@@ -729,10 +881,21 @@ impl MongrelClient {
     }
 
     pub fn kit_retrieve(&self, req: &KitRetrieveRequest) -> ClientResult<KitRetrieveResponse> {
+        self.kit_retrieve_with_options(req, &AiExecutionOptions::default())
+    }
+
+    pub fn kit_retrieve_with_options(
+        &self,
+        req: &KitRetrieveRequest,
+        options: &AiExecutionOptions,
+    ) -> ClientResult<KitRetrieveResponse> {
         let resp = self
             .client
             .post(self.url("/kit/retrieve"))
-            .json(req)
+            .json(&WithAiExecutionOptions {
+                request: req,
+                options,
+            })
             .send()?;
         let resp = self.check(resp)?;
         Ok(resp.json()?)
@@ -742,10 +905,21 @@ impl MongrelClient {
         &self,
         req: &KitAnnRerankRequest,
     ) -> ClientResult<KitAnnRerankResponse> {
+        self.kit_ann_rerank_with_options(req, &AiExecutionOptions::default())
+    }
+
+    pub fn kit_ann_rerank_with_options(
+        &self,
+        req: &KitAnnRerankRequest,
+        options: &AiExecutionOptions,
+    ) -> ClientResult<KitAnnRerankResponse> {
         let resp = self
             .client
             .post(self.url("/kit/ann_rerank"))
-            .json(req)
+            .json(&WithAiExecutionOptions {
+                request: req,
+                options,
+            })
             .send()?;
         let resp = self.check(resp)?;
         Ok(resp.json()?)
@@ -755,10 +929,21 @@ impl MongrelClient {
         &self,
         req: &KitSetSimilarityRequest,
     ) -> ClientResult<KitSetSimilarityResponse> {
+        self.kit_set_similarity_with_options(req, &AiExecutionOptions::default())
+    }
+
+    pub fn kit_set_similarity_with_options(
+        &self,
+        req: &KitSetSimilarityRequest,
+        options: &AiExecutionOptions,
+    ) -> ClientResult<KitSetSimilarityResponse> {
         let resp = self
             .client
             .post(self.url("/kit/set_similarity"))
-            .json(req)
+            .json(&WithAiExecutionOptions {
+                request: req,
+                options,
+            })
             .send()?;
         let resp = self.check(resp)?;
         Ok(resp.json()?)
@@ -768,6 +953,11 @@ impl MongrelClient {
         let resp = self.client.post(self.url("/kit/search")).json(req).send()?;
         let resp = self.check(resp)?;
         Ok(resp.json()?)
+    }
+
+    pub fn kit_ai_metrics(&self) -> ClientResult<serde_json::Value> {
+        let resp = self.client.get(self.url("/kit/ai/metrics")).send()?;
+        Ok(self.check(resp)?.json()?)
     }
 
     /// Create a constraint-bearing table over HTTP (`POST /kit/create_table`).
@@ -948,76 +1138,161 @@ impl MongrelClient {
 }
 
 impl AsyncMongrelClient {
-    pub fn new(url: &str) -> Self {
-        Self {
-            base_url: url.trim_end_matches('/').to_string(),
-            client: reqwest::Client::new(),
+    pub fn builder(url: impl AsRef<str>) -> AsyncMongrelClientBuilder {
+        AsyncMongrelClientBuilder {
+            base_url: url.as_ref().trim_end_matches('/').to_string(),
+            authorization: None,
+            invalid_authorization: false,
         }
     }
 
+    pub fn new(url: &str) -> Self {
+        Self::builder(url).build().expect("valid client URL")
+    }
+
     pub fn with_bearer_token(mut self, token: impl AsRef<str>) -> Self {
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
-            reqwest::header::AUTHORIZATION,
-            reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token.as_ref()))
-                .expect("valid bearer auth header"),
-        );
         self.client = reqwest::Client::builder()
-            .default_headers(headers)
+            .default_headers(default_headers(Some(
+                bearer_header(token.as_ref()).expect("valid bearer credentials"),
+            )))
             .build()
-            .expect("valid reqwest bearer auth client");
+            .expect("valid reqwest client");
         self
     }
 
     pub fn with_basic_auth(mut self, username: impl AsRef<str>, password: impl AsRef<str>) -> Self {
-        let value = format!(
-            "Basic {}",
-            base64::Engine::encode(
-                &base64::engine::general_purpose::STANDARD,
-                format!("{}:{}", username.as_ref(), password.as_ref()),
-            )
-        );
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
-            reqwest::header::AUTHORIZATION,
-            reqwest::header::HeaderValue::from_str(&value).expect("valid basic auth header"),
-        );
         self.client = reqwest::Client::builder()
-            .default_headers(headers)
+            .default_headers(default_headers(Some(
+                basic_header(username.as_ref(), password.as_ref())
+                    .expect("valid basic credentials"),
+            )))
             .build()
-            .expect("valid reqwest basic auth client");
+            .expect("valid reqwest client");
         self
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("{}{path}", self.base_url)
+    }
+
+    async fn check(&self, response: reqwest::Response) -> ClientResult<reqwest::Response> {
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response);
+        }
+        let status_u16 = status.as_u16();
+        let body = response.text().await.unwrap_or_default();
+        if let Ok(env) = serde_json::from_str::<KitErrorEnvelope>(&body) {
+            return Err(ClientError::Kit {
+                code: KitErrorCode::from_str(&env.error.code),
+                message: env.error.message,
+                op_index: env.error.op_index,
+                status: status_u16,
+            });
+        }
+        Err(ClientError::Http {
+            status: status_u16,
+            body,
+        })
     }
 
     pub async fn health(&self) -> ClientResult<String> {
         let response = self
             .client
-            .get(format!("{}{path}", self.base_url, path = "/health"))
+            .get(self.url("/health"))
             .send()
             .await?;
-        if !response.status().is_success() {
-            return Err(ClientError::Http {
-                status: response.status().as_u16(),
-                body: response.text().await.unwrap_or_default(),
-            });
-        }
-        Ok(response.text().await?)
+        Ok(self.check(response).await?.text().await?)
+    }
+
+    pub async fn kit_retrieve(
+        &self,
+        req: &KitRetrieveRequest,
+    ) -> ClientResult<KitRetrieveResponse> {
+        self.kit_retrieve_with_options(req, &AiExecutionOptions::default())
+            .await
+    }
+
+    pub async fn kit_retrieve_with_options(
+        &self,
+        req: &KitRetrieveRequest,
+        options: &AiExecutionOptions,
+    ) -> ClientResult<KitRetrieveResponse> {
+        let response = self
+            .client
+            .post(self.url("/kit/retrieve"))
+            .json(&WithAiExecutionOptions {
+                request: req,
+                options,
+            })
+            .send()
+            .await?;
+        Ok(self.check(response).await?.json().await?)
+    }
+
+    pub async fn kit_ann_rerank(
+        &self,
+        req: &KitAnnRerankRequest,
+    ) -> ClientResult<KitAnnRerankResponse> {
+        self.kit_ann_rerank_with_options(req, &AiExecutionOptions::default())
+            .await
+    }
+
+    pub async fn kit_ann_rerank_with_options(
+        &self,
+        req: &KitAnnRerankRequest,
+        options: &AiExecutionOptions,
+    ) -> ClientResult<KitAnnRerankResponse> {
+        let response = self
+            .client
+            .post(self.url("/kit/ann_rerank"))
+            .json(&WithAiExecutionOptions {
+                request: req,
+                options,
+            })
+            .send()
+            .await?;
+        Ok(self.check(response).await?.json().await?)
+    }
+
+    pub async fn kit_set_similarity(
+        &self,
+        req: &KitSetSimilarityRequest,
+    ) -> ClientResult<KitSetSimilarityResponse> {
+        self.kit_set_similarity_with_options(req, &AiExecutionOptions::default())
+            .await
+    }
+
+    pub async fn kit_set_similarity_with_options(
+        &self,
+        req: &KitSetSimilarityRequest,
+        options: &AiExecutionOptions,
+    ) -> ClientResult<KitSetSimilarityResponse> {
+        let response = self
+            .client
+            .post(self.url("/kit/set_similarity"))
+            .json(&WithAiExecutionOptions {
+                request: req,
+                options,
+            })
+            .send()
+            .await?;
+        Ok(self.check(response).await?.json().await?)
     }
 
     pub async fn kit_search(&self, req: &KitSearchRequest) -> ClientResult<KitSearchResponse> {
         let response = self
             .client
-            .post(format!("{}{path}", self.base_url, path = "/kit/search"))
+            .post(self.url("/kit/search"))
             .json(req)
             .send()
             .await?;
-        if !response.status().is_success() {
-            return Err(ClientError::Http {
-                status: response.status().as_u16(),
-                body: response.text().await.unwrap_or_default(),
-            });
-        }
-        Ok(response.json().await?)
+        Ok(self.check(response).await?.json().await?)
+    }
+
+    pub async fn kit_ai_metrics(&self) -> ClientResult<serde_json::Value> {
+        let response = self.client.get(self.url("/kit/ai/metrics")).send().await?;
+        Ok(self.check(response).await?.json().await?)
     }
 }
 

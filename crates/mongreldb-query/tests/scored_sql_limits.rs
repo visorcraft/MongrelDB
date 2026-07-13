@@ -2,6 +2,7 @@ use mongreldb_core::schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema
 use mongreldb_core::{Database, Value};
 use mongreldb_query::MongrelSession;
 use std::sync::Arc;
+use std::time::Duration;
 
 async fn session() -> (tempfile::TempDir, MongrelSession) {
     let dir = tempfile::tempdir().unwrap();
@@ -154,4 +155,22 @@ async fn exact_ann_rerank_is_available_in_scored_sql() {
         .unwrap()
         .value(0);
     assert!(score.is_finite());
+}
+
+#[tokio::test]
+async fn scored_sql_enforces_execution_work_budget() {
+    let (_dir, session) = session().await;
+    session
+        .set_scored_execution_limits(
+            Duration::from_secs(30),
+            1,
+            mongreldb_core::query::MAX_FUSED_CANDIDATES,
+        )
+        .unwrap();
+    let error = session
+        .run(r#"SELECT * FROM hybrid_search_scored('docs','{"retrievers":[{"name":"dense","ann":{"column":"embedding","query":[1,1,1,1,1,1,1,1],"k":1}}],"limit":1}','id')"#)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("work budget exceeded"), "{error}");
 }

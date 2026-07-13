@@ -45,16 +45,17 @@ typedef struct mongreldb_ann_rerank_result mongreldb_ann_rerank_result_t;
 
 /* ── Error codes ────────────────────────────────────────────────────────── */
 
-#define MDB_OK                   0
-#define MDB_ERR_NOT_FOUND       -1
-#define MDB_ERR_CONFLICT        -2
-#define MDB_ERR_AUTH_REQUIRED   -3
-#define MDB_ERR_PERMISSION      -4
-#define MDB_ERR_SCHEMA          -5
-#define MDB_ERR_INVALID_ARG     -6
-#define MDB_ERR_IO              -7
-#define MDB_ERR_ENCRYPTION      -8
-#define MDB_ERR_OTHER           -9
+#define MDB_OK                    0
+#define MDB_ERR_INVALID_ARGUMENT -1
+#define MDB_ERR_INVALID_ARG      MDB_ERR_INVALID_ARGUMENT
+#define MDB_ERR_NOT_FOUND        -2
+#define MDB_ERR_CONFLICT         -3
+#define MDB_ERR_SCHEMA           -4
+#define MDB_ERR_COLUMN_NOT_FOUND -5
+#define MDB_ERR_UNAUTHORIZED     -6
+#define MDB_ERR_FULL             -7
+#define MDB_ERR_IO               -8
+#define MDB_ERR_UNKNOWN          -99
 
 /* ── Column flags (bitmask) ─────────────────────────────────────────────── */
 
@@ -162,15 +163,35 @@ typedef struct {
 } mongreldb_embedding_view;
 
 typedef struct {
+    const mongreldb_bytes_view *items;
+    size_t len;
+} mongreldb_bytes_view_array;
+
+typedef struct {
+    uint32_t token;
+    float weight;
+} mongreldb_sparse_term;
+
+typedef struct {
+    const mongreldb_sparse_term *items;
+    size_t len;
+} mongreldb_sparse_term_array;
+
+typedef struct {
+    const char *const *items;
+    size_t len;
+} mongreldb_minhash_members;
+
+typedef struct {
     int64_t months;
     int32_t days;
     int64_t nanos;
 } mongreldb_interval;
 
 typedef struct {
-    mongreldb_value_tag tag;
+    int32_t tag;
     union {
-        bool b;
+        uint8_t b;
         int64_t i64;
         double f64;
         mongreldb_bytes_view bytes;
@@ -196,7 +217,7 @@ typedef struct {
 typedef struct {
     uint16_t id;
     const char *name;
-    mongreldb_type_id ty;
+    int32_t ty;
     uint32_t flags;
     uint32_t embedding_dim;
     uint8_t decimal_precision;
@@ -207,7 +228,7 @@ typedef struct {
 typedef struct {
     const char *name;
     uint16_t column_id;
-    mongreldb_index_kind kind;
+    int32_t kind;
 } mongreldb_index_def;
 
 typedef struct {
@@ -222,8 +243,8 @@ typedef struct {
     mongreldb_u16_slice columns;
     const char *ref_table;
     mongreldb_u16_slice ref_columns;
-    mongreldb_fk_action on_delete;
-    mongreldb_fk_action on_update;
+    int32_t on_delete;
+    int32_t on_update;
 } mongreldb_foreign_key;
 
 /* ── Condition struct ───────────────────────────────────────────────────── */
@@ -235,11 +256,14 @@ typedef struct {
     int64_t int64_hi;
     double float64_lo;
     double float64_hi;
-    bool lo_inclusive;
-    bool hi_inclusive;
-    mongreldb_bytes_view bytes;        /* PK key, BitmapEq value, FmContains pattern */
+    uint8_t lo_inclusive;
+    uint8_t hi_inclusive;
+    uint32_t k;
+    mongreldb_bytes_view bytes; /* PK key, BitmapEq value, FmContains pattern */
+    mongreldb_bytes_view_array byte_values; /* BitmapIn, FmContainsAll */
     mongreldb_embedding_view embedding; /* ANN query vector */
-    mongreldb_bytes_view min_hash;     /* MinHash members (u64 array reinterpreted) */
+    mongreldb_sparse_term_array sparse; /* SparseMatch */
+    mongreldb_minhash_members minhash_members; /* MinHashSimilar */
 } mongreldb_condition;
 
 /* ── Table row/cell structs ─────────────────────────────────────────────── */
@@ -427,7 +451,8 @@ mongreldb_result_t *mongreldb_table_query(
 size_t mongreldb_result_count(mongreldb_result_t *r);
 int32_t mongreldb_result_row(mongreldb_result_t *r, size_t index, mongreldb_row *out_row);
 size_t mongreldb_row_cell_count(const mongreldb_row *row);
-mongreldb_cell mongreldb_row_cell(const mongreldb_row *row, size_t index);
+int32_t mongreldb_row_cell(
+    const mongreldb_row *row, size_t index, mongreldb_cell *out_cell);
 void mongreldb_result_free(mongreldb_result_t *r);
 
 mongreldb_ann_rerank_result_t *mongreldb_table_ann_rerank(

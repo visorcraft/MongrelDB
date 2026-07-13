@@ -202,14 +202,15 @@ impl std::fmt::Debug for CValuePayload {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct CValue {
-    pub tag: CValueTag,
+    /// C ABI integer. Invalid values are rejected before reading the union.
+    pub tag: i32,
     pub payload: CValuePayload,
 }
 
 impl Default for CValue {
     fn default() -> Self {
         Self {
-            tag: CValueTag::Null,
+            tag: CValueTag::Null as i32,
             payload: CValuePayload { int64: 0 },
         }
     }
@@ -223,21 +224,21 @@ impl CValue {
 
     pub fn boolean(b: bool) -> Self {
         Self {
-            tag: CValueTag::Bool,
+            tag: CValueTag::Bool as i32,
             payload: CValuePayload { boolean: b as u8 },
         }
     }
 
     pub fn int64(n: i64) -> Self {
         Self {
-            tag: CValueTag::Int64,
+            tag: CValueTag::Int64 as i32,
             payload: CValuePayload { int64: n },
         }
     }
 
     pub fn float64(f: f64) -> Self {
         Self {
-            tag: CValueTag::Float64,
+            tag: CValueTag::Float64 as i32,
             payload: CValuePayload { float64: f },
         }
     }
@@ -259,7 +260,7 @@ pub fn value_to_c(v: &Value, backing: &mut Vec<Vec<u8>>) -> CValue {
             backing.push(b.clone());
             let slice = ByteSlice::from_slice(backing.last().unwrap());
             CValue {
-                tag: CValueTag::Bytes,
+                tag: CValueTag::Bytes as i32,
                 payload: CValuePayload { bytes: slice },
             }
         }
@@ -270,7 +271,7 @@ pub fn value_to_c(v: &Value, backing: &mut Vec<Vec<u8>>) -> CValue {
             backing.push(bytes);
             let ptr = backing.last().unwrap().as_ptr() as *const f32;
             CValue {
-                tag: CValueTag::Embedding,
+                tag: CValueTag::Embedding as i32,
                 payload: CValuePayload {
                     embedding: EmbeddingSlice {
                         data: ptr,
@@ -280,7 +281,7 @@ pub fn value_to_c(v: &Value, backing: &mut Vec<Vec<u8>>) -> CValue {
             }
         }
         Value::Decimal(d) => CValue {
-            tag: CValueTag::Decimal,
+            tag: CValueTag::Decimal as i32,
             payload: CValuePayload {
                 decimal: CDecimal128::from_i128(*d),
             },
@@ -290,7 +291,7 @@ pub fn value_to_c(v: &Value, backing: &mut Vec<Vec<u8>>) -> CValue {
             days,
             nanos,
         } => CValue {
-            tag: CValueTag::Interval,
+            tag: CValueTag::Interval as i32,
             payload: CValuePayload {
                 interval: CInterval {
                     months: *months,
@@ -300,14 +301,14 @@ pub fn value_to_c(v: &Value, backing: &mut Vec<Vec<u8>>) -> CValue {
             },
         },
         Value::Uuid(b) => CValue {
-            tag: CValueTag::Uuid,
+            tag: CValueTag::Uuid as i32,
             payload: CValuePayload { uuid: *b },
         },
         Value::Json(b) => {
             backing.push(b.clone());
             let slice = ByteSlice::from_slice(backing.last().unwrap());
             CValue {
-                tag: CValueTag::Json,
+                tag: CValueTag::Json as i32,
                 payload: CValuePayload { json: slice },
             }
         }
@@ -335,9 +336,31 @@ fn bytemuck_cast_f32(v: &[f32]) -> Vec<u8> {
 /// # Safety
 /// The caller guarantees that any pointer in `cv.payload` is valid for its
 /// length, and that the discriminant/payload pairing is consistent.
-pub unsafe fn c_to_value(cv: &CValue, ty: &TypeId) -> Value {
+pub unsafe fn c_to_value(
+    cv: &CValue,
+    ty: &TypeId,
+) -> Result<Value, crate::error::ErrorCode> {
+    use crate::error::{set_error_msg, ErrorCode};
     use CValueTag::*;
-    match (cv.tag, ty) {
+    let tag = match cv.tag {
+        0 => Null,
+        1 => Bool,
+        2 => Int64,
+        3 => Float64,
+        4 => Bytes,
+        5 => Embedding,
+        6 => Decimal,
+        7 => Interval,
+        8 => Uuid,
+        9 => Json,
+        value => {
+            return Err(set_error_msg(
+                ErrorCode::InvalidArgument,
+                format!("invalid value tag {value}"),
+            ));
+        }
+    };
+    Ok(match (tag, ty) {
         // Null is always null regardless of column type.
         (Null, _) => Value::Null,
 
@@ -382,7 +405,7 @@ pub unsafe fn c_to_value(cv: &CValue, ty: &TypeId) -> Value {
         // FFI total: a caller who set the wrong tag for the column type gets
         // a NULL rather than UB.
         _ => Value::Null,
-    }
+    })
 }
 
 /// Re-export some raw type aliases for the generated headers / downstream

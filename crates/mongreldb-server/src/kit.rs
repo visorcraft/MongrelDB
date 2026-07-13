@@ -13,7 +13,7 @@
 //! authoritatively at commit — concurrent conflicting writers cannot both
 //! commit, and a violating batch is rejected atomically (no partial commit).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{Path, State};
@@ -36,25 +36,122 @@ use serde_json::{json, Value as Jval};
 use crate::json_to_value;
 use crate::{request_principal, validate_table_name, AppState, OptionalPrincipal};
 
-fn retry_authorized<T, F>(
+const DEFAULT_AI_DEADLINE_MS: u64 = 30_000;
+const MAX_AI_DEADLINE_MS: u64 = 60_000;
+const DEFAULT_AI_WORK: usize = 1_000_000;
+const MAX_AI_WORK: usize = 1_000_000;
+
+fn max_ai_fused_candidates() -> usize {
+    std::env::var("MONGRELDB_AI_MAX_FUSED_CANDIDATES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value: &usize| {
+            *value > 0 && *value <= mongreldb_core::query::MAX_FUSED_CANDIDATES
+        })
+        .unwrap_or(mongreldb_core::query::MAX_FUSED_CANDIDATES)
+}
+
+fn ai_execution_options(
+    deadline_ms: Option<u64>,
+    max_work: Option<usize>,
+) -> Result<(std::time::Duration, mongreldb_core::query::AiExecutionContext), MongrelError> {
+    let deadline_ms = deadline_ms.unwrap_or(DEFAULT_AI_DEADLINE_MS);
+    if deadline_ms == 0 || deadline_ms > MAX_AI_DEADLINE_MS {
+        return Err(MongrelError::InvalidArgument(format!(
+            "deadline_ms must be between 1 and {MAX_AI_DEADLINE_MS}"
+        )));
+    }
+    let max_work = max_work.unwrap_or(DEFAULT_AI_WORK);
+    if max_work == 0 || max_work > MAX_AI_WORK {
+        return Err(MongrelError::InvalidArgument(format!(
+            "max_work must be between 1 and {MAX_AI_WORK}"
+        )));
+    }
+    let duration = std::time::Duration::from_millis(deadline_ms);
+    Ok((
+        duration,
+        mongreldb_core::query::AiExecutionContext::with_limits(
+            duration,
+            max_work,
+            max_ai_fused_candidates(),
+        ),
+    ))
+}
+
+struct CancelOnDrop(Option<mongreldb_core::query::AiExecutionContext>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if let Some(context) = &self.0 {
+            context.cancel();
+        }
+    }
+}
+
+async fn run_ai<T, F>(
+    state: Arc<AppState>,
+    timeout: std::time::Duration,
+    context: mongreldb_core::query::AiExecutionContext,
+    work: F,
+) -> Result<T, MongrelError>
+where
+    T: Send + 'static,
+    F: FnOnce(&mongreldb_core::query::AiExecutionContext) -> Result<T, MongrelError>
+        + Send
+        + 'static,
+{
+    let started = std::time::Instant::now();
+    let permit = tokio::time::timeout(timeout, state.ai_semaphore.clone().acquire_owned())
+        .await
+        .map_err(|_| MongrelError::DeadlineExceeded)?
+        .map_err(|_| MongrelError::Cancelled)?;
+    let remaining = timeout.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        return Err(MongrelError::DeadlineExceeded);
+    }
+    let worker_context = context.clone();
+    let mut cancel = CancelOnDrop(Some(context.clone()));
+    let mut task = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work(&worker_context)
+    });
+    let result = match tokio::time::timeout(remaining, &mut task).await {
+        Ok(result) => result
+            .map_err(|error| MongrelError::Other(format!("AI worker failed: {error}")))?,
+        Err(_) => {
+            context.cancel();
+            let _ = task.await;
+            Err(MongrelError::DeadlineExceeded)
+        }
+    };
+    cancel.0 = None;
+    result
+}
+
+fn retry_authorized_context<T, F>(
     state: &AppState,
     table: &str,
     principal: Option<&mongreldb_core::Principal>,
+    context: &mongreldb_core::query::AiExecutionContext,
     read: F,
 ) -> Result<T, MongrelError>
 where
     F: FnMut(
         &mut mongreldb_core::Table,
         mongreldb_core::Snapshot,
-        Option<&HashSet<RowId>>,
+        Option<&mongreldb_core::security::CandidateAuthorization<'_>>,
         Option<&mongreldb_core::Principal>,
     ) -> Result<T, MongrelError>,
 {
     let catalog_bound = principal
         .is_some_and(|principal| state.db.resolve_principal(&principal.username).is_some());
-    state
-        .db
-        .with_authorized_read(table, principal, catalog_bound, read)
+    state.db.with_authorized_scored_read_context(
+        table,
+        principal,
+        catalog_bound,
+        Some(context),
+        read,
+    )
 }
 
 /// Per-server idempotency store: idempotency key → committed response, backed
@@ -828,6 +925,14 @@ fn kit_core_error(error: &MongrelError) -> Response {
         }
         MongrelError::NotFound(_) => (StatusCode::NOT_FOUND, "NOT_FOUND"),
         MongrelError::Conflict(_) => (StatusCode::CONFLICT, "CONFLICT"),
+        MongrelError::DeadlineExceeded => (StatusCode::GATEWAY_TIMEOUT, "DEADLINE_EXCEEDED"),
+        MongrelError::WorkBudgetExceeded => {
+            (StatusCode::TOO_MANY_REQUESTS, "WORK_BUDGET_EXCEEDED")
+        }
+        MongrelError::Cancelled => (
+            StatusCode::from_u16(499).expect("499 is valid"),
+            "CANCELLED",
+        ),
         _ => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL"),
     };
     (
@@ -991,6 +1096,10 @@ pub struct KitRow {
 pub struct KitRetrieveRequest {
     pub table: String,
     pub retriever: JsonRetriever,
+    #[serde(default)]
+    pub deadline_ms: Option<u64>,
+    #[serde(default)]
+    pub max_work: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1001,6 +1110,10 @@ pub struct KitAnnRerankRequest {
     pub candidate_k: usize,
     pub limit: usize,
     pub metric: KitVectorMetric,
+    #[serde(default)]
+    pub deadline_ms: Option<u64>,
+    #[serde(default)]
+    pub max_work: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -1137,6 +1250,10 @@ pub async fn kit_retrieve(
     OptionalPrincipal(principal): OptionalPrincipal,
     Json(req): Json<KitRetrieveRequest>,
 ) -> Response {
+    let (timeout, context) = match ai_execution_options(req.deadline_ms, req.max_work) {
+        Ok(options) => options,
+        Err(error) => return kit_core_error(&error),
+    };
     let principal = request_principal(&state, &principal);
     let column_id = req.retriever.column_id();
     if let Err(error) = state.db.require_columns_for(
@@ -1151,12 +1268,25 @@ pub async fn kit_retrieve(
         Ok(retriever) => retriever,
         Err(message) => return kit_bad_request(message),
     };
-    let result = retry_authorized(
-        &state,
-        &req.table,
-        principal.as_ref(),
-        |table, snapshot, allowed, _| table.retrieve_at(&retriever, snapshot, allowed),
-    );
+    let table_name = req.table;
+    let worker_state = Arc::clone(&state);
+    let result = run_ai(state, timeout, context, move |context| {
+        retry_authorized_context(
+            &worker_state,
+            &table_name,
+            principal.as_ref(),
+            context,
+            |table, snapshot, authorization, _| {
+                table.retrieve_at_with_candidate_authorization_and_context(
+                    &retriever,
+                    snapshot,
+                    authorization,
+                    Some(context),
+                )
+            },
+        )
+    })
+    .await;
     match result {
         Ok(hits) => Json(json!({
             "hits": hits.into_iter().map(|hit| json!({
@@ -1175,6 +1305,10 @@ pub async fn kit_ann_rerank(
     OptionalPrincipal(principal): OptionalPrincipal,
     Json(req): Json<KitAnnRerankRequest>,
 ) -> Response {
+    let (timeout, context) = match ai_execution_options(req.deadline_ms, req.max_work) {
+        Ok(options) => options,
+        Err(error) => return kit_core_error(&error),
+    };
     let principal = request_principal(&state, &principal);
     if let Err(error) = state.db.require_columns_for(
         &req.table,
@@ -1191,12 +1325,26 @@ pub async fn kit_ann_rerank(
         limit: req.limit,
         metric: req.metric.into(),
     };
-    match retry_authorized(
-        &state,
-        &req.table,
-        principal.as_ref(),
-        |table, snapshot, allowed, _| table.ann_rerank_at(&request, snapshot, allowed),
-    ) {
+    let table_name = req.table;
+    let worker_state = Arc::clone(&state);
+    match run_ai(state, timeout, context, move |context| {
+        retry_authorized_context(
+            &worker_state,
+            &table_name,
+            principal.as_ref(),
+            context,
+            |table, snapshot, authorization, _| {
+                table.ann_rerank_at_with_candidate_authorization_and_context(
+                    &request,
+                    snapshot,
+                    authorization,
+                    Some(context),
+                )
+            },
+        )
+    })
+    .await
+    {
         Ok(hits) => Json(json!({
             "hits": hits.into_iter().map(|hit| json!({
                 "row_id": hit.row_id.0.to_string(),
@@ -1216,6 +1364,8 @@ pub struct KitSearchRequest {
     pub must: Vec<JsonCondition>,
     pub retrievers: Vec<KitNamedRetriever>,
     pub fusion: KitFusion,
+    #[serde(default)]
+    pub rerank: Option<KitRerank>,
     pub limit: usize,
     #[serde(default)]
     pub projection: Option<Vec<u16>>,
@@ -1225,6 +1375,19 @@ pub struct KitSearchRequest {
     pub max_work: Option<usize>,
     #[serde(default)]
     pub explain: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KitRerank {
+    ExactVector {
+        embedding_column: u16,
+        query: Vec<f32>,
+        metric: KitVectorMetric,
+        candidate_limit: usize,
+        #[serde(default = "default_retriever_weight")]
+        weight: f64,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -1246,28 +1409,13 @@ pub enum KitFusion {
     ReciprocalRank { constant: u32 },
 }
 
-pub async fn kit_search(
-    State(state): State<Arc<AppState>>,
-    OptionalPrincipal(principal): OptionalPrincipal,
-    Json(req): Json<KitSearchRequest>,
-) -> Response {
-    let principal = request_principal(&state, &principal);
-    if req.explain {
-        if let Err(error) = state
-            .db
-            .require_for(principal.as_ref(), &mongreldb_core::Permission::Admin)
-        {
-            return kit_core_error(&error);
-        }
-    }
-    let deadline_ms = req.deadline_ms.unwrap_or(30_000);
-    if deadline_ms == 0 || deadline_ms > 60_000 {
-        return kit_bad_request("deadline_ms must be between 1 and 60000".into());
-    }
-    let handle = match state.db.table(&req.table) {
-        Ok(handle) => handle,
-        Err(error) => return kit_core_error(&error),
-    };
+fn execute_kit_search(
+    state: &AppState,
+    principal: Option<&mongreldb_core::Principal>,
+    req: &KitSearchRequest,
+    context: &mongreldb_core::query::AiExecutionContext,
+) -> Result<Jval, MongrelError> {
+    let handle = state.db.table(&req.table)?;
     let schema = handle.lock().schema().clone();
     let mut required = req
         .projection
@@ -1291,7 +1439,9 @@ pub async fn kit_search(
             | JsonCondition::Ann { column_id, .. }
             | JsonCondition::SparseMatch { column_id, .. }
             | JsonCondition::MinHashSimilar { column_id, .. }
-            | JsonCondition::MinHashSimilarMembers { column_id, .. } => required.push(*column_id),
+            | JsonCondition::MinHashSimilarMembers { column_id, .. } => {
+                required.push(*column_id)
+            }
         }
     }
     required.extend(
@@ -1299,111 +1449,123 @@ pub async fn kit_search(
             .iter()
             .map(|retriever| retriever.retriever.column_id()),
     );
+    if let Some(KitRerank::ExactVector {
+        embedding_column, ..
+    }) = &req.rerank
+    {
+        required.push(*embedding_column);
+    }
     required.sort_unstable();
     required.dedup();
-    if let Err(error) = state.db.require_columns_for(
+    state.db.require_columns_for(
         &req.table,
         mongreldb_core::ColumnOperation::Select,
         &required,
-        principal.as_ref(),
-    ) {
-        return kit_core_error(&error);
-    }
-    let must = match req
+        principal,
+    )?;
+    let must = req
         .must
         .iter()
         .map(|condition| parse_condition(condition, &schema))
-        .collect::<Result<_, _>>()
-    {
-        Ok(must) => must,
-        Err(message) => return kit_bad_request(message),
-    };
-    let retrievers = match req
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(MongrelError::InvalidArgument)?;
+    let retrievers = req
         .retrievers
         .iter()
         .map(|retriever| {
             Ok(NamedRetriever {
                 name: retriever.name.clone(),
                 weight: retriever.weight,
-                retriever: retriever.retriever.to_core()?,
+                retriever: retriever
+                    .retriever
+                    .to_core()
+                    .map_err(MongrelError::InvalidArgument)?,
             })
         })
-        .collect::<Result<Vec<_>, String>>()
-    {
-        Ok(retrievers) => retrievers,
-        Err(message) => return kit_bad_request(message),
-    };
-    let estimated_work = retrievers
+        .collect::<Result<Vec<_>, MongrelError>>()?;
+    let projection_work = req
+        .projection
+        .as_ref()
+        .map_or(schema.columns.len(), Vec::len);
+    let mut estimated_work = retrievers
         .iter()
-        .map(|named| match &named.retriever {
-            Retriever::Ann { k, .. }
-            | Retriever::Sparse { k, .. }
-            | Retriever::MinHash { k, .. } => *k,
-        })
-        .sum::<usize>()
-        .saturating_add(req.must.len())
-        .saturating_add(req.projection.as_ref().map_or(0, Vec::len));
-    let max_work = req.max_work.unwrap_or(1_000_000);
-    if max_work == 0 || max_work > 1_000_000 || estimated_work > max_work {
-        return kit_bad_request(format!(
-            "AI work budget exceeded: estimated {estimated_work}, max {max_work}"
-        ));
+        .filter(|named| named.weight != 0.0)
+        .try_fold(
+            req.must
+                .len()
+                .checked_add(projection_work)
+                .ok_or(MongrelError::WorkBudgetExceeded)?,
+            |total, named| {
+                let k = match &named.retriever {
+                    Retriever::Ann { k, .. }
+                    | Retriever::Sparse { k, .. }
+                    | Retriever::MinHash { k, .. } => *k,
+                };
+                total
+                    .checked_add(k)
+                    .ok_or(MongrelError::WorkBudgetExceeded)
+            },
+        )?;
+    if let Some(KitRerank::ExactVector {
+        candidate_limit, ..
+    }) = &req.rerank
+    {
+        estimated_work = estimated_work
+            .checked_add(*candidate_limit)
+            .ok_or(MongrelError::WorkBudgetExceeded)?;
     }
-    let fusion = match req.fusion {
-        KitFusion::ReciprocalRank { constant } => Fusion::ReciprocalRank { constant },
+    if estimated_work > context.work_limit() {
+        return Err(MongrelError::WorkBudgetExceeded);
+    }
+    let fusion = match &req.fusion {
+        KitFusion::ReciprocalRank { constant } => Fusion::ReciprocalRank {
+            constant: *constant,
+        },
     };
     let request = SearchRequest {
         must,
         retrievers,
         fusion,
+        rerank: req.rerank.as_ref().map(|rerank| match rerank {
+            KitRerank::ExactVector {
+                embedding_column,
+                query,
+                metric,
+                candidate_limit,
+                weight,
+            } => mongreldb_core::query::Rerank::ExactVector {
+                embedding_column: *embedding_column,
+                query: query.clone(),
+                metric: (*metric).into(),
+                candidate_limit: *candidate_limit,
+                weight: *weight,
+            },
+        }),
         limit: req.limit,
         projection: req.projection.clone(),
     };
-    let context = mongreldb_core::query::AiExecutionContext::with_timeout(
-        std::time::Duration::from_millis(deadline_ms),
-        max_work,
-    );
     let (result, trace) = mongreldb_core::trace::QueryTrace::capture(|| {
-        retry_authorized(
-            &state,
+        retry_authorized_context(
+            state,
             &req.table,
-            principal.as_ref(),
-            |table, snapshot, allowed, effective_principal| {
-                let hits = table.search_at_with_allowed_and_context(
+            principal,
+            context,
+            |table, snapshot, authorization, effective_principal| {
+                let mut hits = table.search_at_with_candidate_authorization_and_context(
                     &request,
                     snapshot,
-                    allowed,
-                    Some(&context),
+                    authorization,
+                    Some(context),
                 )?;
-                let row_ids: Vec<_> = hits.iter().map(|hit| hit.row_id.0).collect();
-                let rows = table.rows_for_rids(&row_ids, snapshot)?;
-                let secured = state
+                state
                     .db
-                    .secure_rows_for(&req.table, rows, effective_principal)?;
-                Ok((hits, secured))
+                    .mask_search_hits_for(&req.table, &mut hits, effective_principal)?;
+                Ok(hits)
             },
         )
     });
-    let (mut hits, secured) = match result {
-        Ok(result) => result,
-        Err(error) => return kit_core_error(&error),
-    };
-    if let Err(error) = context.checkpoint() {
-        return kit_core_error(&error);
-    }
-    let secured: std::collections::HashMap<_, _> =
-        secured.into_iter().map(|row| (row.row_id, row)).collect();
-    hits.retain_mut(|hit| {
-        let Some(row) = secured.get(&hit.row_id) else {
-            return false;
-        };
-        for (column_id, value) in &mut hit.cells {
-            if let Some(masked) = row.columns.get(column_id) {
-                *value = masked.clone();
-            }
-        }
-        true
-    });
+    let hits = result?;
+    context.checkpoint()?;
     let mut response = json!({
         "hits": hits.into_iter().map(|hit| json!({
             "row_id": hit.row_id.0.to_string(),
@@ -1415,6 +1577,9 @@ pub async fn kit_search(
                 "contribution": component.contribution,
             })).collect::<Vec<_>>(),
             "fused_score": hit.fused_score,
+            "exact_rerank_score": hit.exact_rerank_score,
+            "final_score": hit.final_score,
+            "final_rank": hit.final_rank,
         })).collect::<Vec<_>>()
     });
     if req.explain {
@@ -1422,6 +1587,7 @@ pub async fn kit_search(
             "authorization_nanos": trace.authorization_nanos,
             "rls_cache_hit": trace.rls_cache_hit,
             "rls_rows_evaluated": trace.rls_rows_evaluated,
+            "rls_policy_columns_decoded": trace.rls_policy_columns_decoded,
             "authorization_retries": trace.authorization_retries,
             "hard_filter_nanos": trace.hard_filter_nanos,
             "ann_candidate_nanos": trace.ann_candidate_nanos,
@@ -1431,10 +1597,42 @@ pub async fn kit_search(
             "union_size": trace.union_size,
             "fusion_nanos": trace.fusion_nanos,
             "projection_nanos": trace.projection_nanos,
+            "projection_rows": trace.projection_rows,
+            "projection_cells": trace.projection_cells,
+            "work_consumed": trace.work_consumed,
             "total_nanos": trace.total_nanos,
         });
     }
-    Json(response).into_response()
+    Ok(response)
+}
+
+pub async fn kit_search(
+    State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
+    Json(req): Json<KitSearchRequest>,
+) -> Response {
+    let principal = request_principal(&state, &principal);
+    if req.explain {
+        if let Err(error) = state
+            .db
+            .require_for(principal.as_ref(), &mongreldb_core::Permission::Admin)
+        {
+            return kit_core_error(&error);
+        }
+    }
+    let (timeout, context) = match ai_execution_options(req.deadline_ms, req.max_work) {
+        Ok(options) => options,
+        Err(error) => return kit_core_error(&error),
+    };
+    let worker_state = Arc::clone(&state);
+    match run_ai(state, timeout, context, move |context| {
+        execute_kit_search(&worker_state, principal.as_ref(), &req, context)
+    })
+    .await
+    {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => kit_core_error(&error),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1445,6 +1643,10 @@ pub struct KitSetSimilarityRequest {
     pub candidate_k: usize,
     pub min_jaccard: f32,
     pub limit: usize,
+    #[serde(default)]
+    pub deadline_ms: Option<u64>,
+    #[serde(default)]
+    pub max_work: Option<usize>,
 }
 
 pub async fn kit_set_similarity(
@@ -1452,6 +1654,10 @@ pub async fn kit_set_similarity(
     OptionalPrincipal(principal): OptionalPrincipal,
     Json(req): Json<KitSetSimilarityRequest>,
 ) -> Response {
+    let (timeout, context) = match ai_execution_options(req.deadline_ms, req.max_work) {
+        Ok(options) => options,
+        Err(error) => return kit_core_error(&error),
+    };
     let principal = request_principal(&state, &principal);
     if let Err(error) = state.db.require_columns_for(
         &req.table,
@@ -1472,14 +1678,25 @@ pub async fn kit_set_similarity(
         min_jaccard: req.min_jaccard,
         limit: req.limit,
     };
-    let result = retry_authorized(
-        &state,
-        &req.table,
-        principal.as_ref(),
-        |table, snapshot, allowed, _| {
-            table.set_similarity_at(&request, snapshot, allowed)
-        },
-    );
+    let table_name = req.table;
+    let worker_state = Arc::clone(&state);
+    let result = run_ai(state, timeout, context, move |context| {
+        retry_authorized_context(
+            &worker_state,
+            &table_name,
+            principal.as_ref(),
+            context,
+            |table, snapshot, authorization, _| {
+                table.set_similarity_at_with_candidate_authorization_and_context(
+                    &request,
+                    snapshot,
+                    authorization,
+                    Some(context),
+                )
+            },
+        )
+    })
+    .await;
     match result {
         Ok(hits) => Json(json!({
             "hits": hits.into_iter().map(|hit| json!({

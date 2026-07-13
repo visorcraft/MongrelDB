@@ -176,6 +176,7 @@ async fn user_principal_secures_sql_native_kit_and_sessions() {
         "/events",
         "/wal/stream?since=0",
         "/history/retention",
+        "/kit/ai/metrics",
     ] {
         let response = app
             .clone()
@@ -184,6 +185,32 @@ async fn user_principal_secures_sql_native_kit_and_sessions() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN, "{uri}");
     }
+
+    let response = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/kit/search",
+            json!({
+                "table":"docs",
+                "must":[],
+                "retrievers":[{
+                    "name":"sparse",
+                    "weight":1.0,
+                    "sparse":{"column_id":5,"query":[[1,1.0]],"k":1}
+                }],
+                "fusion":{"reciprocal_rank":{"constant":60}},
+                "limit":1,
+                "projection":[1],
+                "explain":true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body: JsonValue =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "PERMISSION_DENIED");
 
     let response = app
         .clone()
@@ -333,6 +360,20 @@ async fn admin_principal_allows_history_retention() {
     assert_eq!(body.as_object().unwrap().len(), 2);
     assert!(body["history_retention_epochs"].is_u64());
     assert!(body["earliest_retained_epoch"].is_u64());
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/kit/ai/metrics")
+                .header("authorization", admin_basic)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 
     let response = app
         .oneshot(

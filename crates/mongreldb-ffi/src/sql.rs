@@ -15,7 +15,7 @@
 //! `arrow_util::batches_to_ipc`.
 
 use crate::database::{as_db, mongreldb_database_t};
-use crate::error::{clear, set_error, set_error_msg, ErrorCode};
+use crate::error::{clear, set_error_msg, ErrorCode};
 use arrow::ipc::writer::FileWriter;
 use mongreldb_query::MongrelSession;
 use std::os::raw::c_char;

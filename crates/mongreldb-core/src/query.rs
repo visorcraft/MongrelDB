@@ -15,13 +15,16 @@ pub const MAX_SET_MEMBERS: usize = 65_536;
 pub const MAX_PROJECTION_COLUMNS: usize = 4_096;
 pub const MAX_HARD_CONDITIONS: usize = 256;
 pub const MAX_RETRIEVER_WEIGHT: f64 = 1_000_000.0;
-pub const MAX_FUSED_CANDIDATES: usize = 1_000_000;
+pub const MAX_FUSED_CANDIDATES: usize = 250_000;
 
 /// Cooperative deadline, cancellation, and work-budget state for expensive
 /// AI queries. Index loops call `checkpoint` and charge work with `consume`.
 #[derive(Debug, Clone)]
 pub struct AiExecutionContext {
     deadline: Option<std::time::Instant>,
+    query_time_nanos: i64,
+    initial_work: usize,
+    max_fused_candidates: usize,
     remaining_work: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
@@ -30,6 +33,12 @@ impl AiExecutionContext {
     pub fn new(deadline: Option<std::time::Instant>, work_budget: usize) -> Self {
         Self {
             deadline,
+            query_time_nanos: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos().min(i64::MAX as u128) as i64)
+                .unwrap_or(0),
+            initial_work: work_budget,
+            max_fused_candidates: MAX_FUSED_CANDIDATES,
             remaining_work: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(work_budget)),
             cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
@@ -37,6 +46,16 @@ impl AiExecutionContext {
 
     pub fn with_timeout(timeout: std::time::Duration, work_budget: usize) -> Self {
         Self::new(Some(std::time::Instant::now() + timeout), work_budget)
+    }
+
+    pub fn with_limits(
+        timeout: std::time::Duration,
+        work_budget: usize,
+        max_fused_candidates: usize,
+    ) -> Self {
+        let mut context = Self::with_timeout(timeout, work_budget);
+        context.max_fused_candidates = max_fused_candidates.min(MAX_FUSED_CANDIDATES);
+        context
     }
 
     pub fn cancel(&self) {
@@ -68,6 +87,25 @@ impl AiExecutionContext {
             return Err(crate::MongrelError::WorkBudgetExceeded);
         }
         self.checkpoint()
+    }
+
+    pub fn consumed_work(&self) -> usize {
+        self.initial_work.saturating_sub(
+            self.remaining_work
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
+    }
+
+    pub fn work_limit(&self) -> usize {
+        self.initial_work
+    }
+
+    pub fn query_time_nanos(&self) -> i64 {
+        self.query_time_nanos
+    }
+
+    pub fn max_fused_candidates(&self) -> usize {
+        self.max_fused_candidates
     }
 }
 
@@ -267,8 +305,20 @@ pub struct SearchRequest {
     pub must: Vec<Condition>,
     pub retrievers: Vec<NamedRetriever>,
     pub fusion: Fusion,
+    pub rerank: Option<Rerank>,
     pub limit: usize,
     pub projection: Option<Vec<u16>>,
+}
+
+#[derive(Debug, Clone)]
+pub enum Rerank {
+    ExactVector {
+        embedding_column: u16,
+        query: Vec<f32>,
+        metric: VectorMetric,
+        candidate_limit: usize,
+        weight: f64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -297,6 +347,10 @@ pub struct SearchHit {
     pub cells: Vec<(u16, crate::Value)>,
     pub components: Vec<ComponentScore>,
     pub fused_score: f64,
+    pub exact_rerank_score: Option<f32>,
+    pub final_score: f64,
+    /// One-based rank after optional reranking.
+    pub final_rank: usize,
 }
 
 /// A conjunctive query. Empty ⇒ all rows.

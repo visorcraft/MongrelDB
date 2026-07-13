@@ -47,6 +47,35 @@ def main():
     except (KeyError, TypeError):
         errors.append("missing checkpoint_inspection.status")
     require(report.get("checkpoint_bytes", 0) > 0, "checkpoint is empty")
+    try:
+        bounded = nested(report, "bounded_window")
+        expected_union = min(expected_rows, 100_000)
+        require(bounded.get("union_size") == expected_union, "bounded-window union is incomplete")
+        require(bounded.get("hits") == 10, "bounded-window final hit count must be 10")
+        require(
+            bounded.get("projection_rows", expected_union) <= 20,
+            "bounded-window projected more than the ranked refill window",
+        )
+        require(
+            bounded.get("projection_cells", expected_union) <= 20,
+            "bounded-window decoded more than the ranked refill window",
+        )
+    except (KeyError, TypeError):
+        errors.append("missing bounded_window")
+    try:
+        clean = nested(report, "qualification_profiles.clean")
+        operational = nested(report, "qualification_profiles.operational")
+        require(clean.get("rows") == expected_rows, "clean profile row count is incomplete")
+        require(clean.get("updates") == 0 and clean.get("deletes") == 0, "clean profile is mutated")
+        require(operational.get("rows") == expected_rows, "operational profile row count is incomplete")
+        require(operational.get("updates") == expected_rows // 20, "operational profile must apply 5% updates")
+        require(operational.get("deletes") == expected_rows // 100, "operational profile must apply 1% deletes")
+        require(operational.get("ttl") is True, "operational profile must enable TTL")
+        require(operational.get("immutable_runs", 0) > 1, "operational profile must contain multiple runs")
+        require(operational.get("hot_memtable_rows", 0) > 0, "operational profile must retain a hot memtable")
+        require(operational.get("mutable_run_rows", 0) > 0, "operational profile must retain a mutable run")
+    except (KeyError, TypeError):
+        errors.append("missing clean or operational qualification profile")
 
     payloads = report.get("index_payloads", [])
     payload_kinds = {payload.get("kind") for payload in payloads if payload.get("payload_bytes", 0) > 0}
