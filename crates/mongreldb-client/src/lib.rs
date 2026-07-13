@@ -141,7 +141,17 @@ pub struct HistoryRetention {
 pub struct TableSchemaInfo {
     pub schema_id: u64,
     pub columns: Vec<ColumnMeta>,
+    #[serde(default)]
+    pub indexes: Vec<IndexMeta>,
     pub constraints: ConstraintMeta,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct IndexMeta {
+    pub name: String,
+    pub column_id: u16,
+    pub kind: String,
+    pub predicate: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -299,6 +309,85 @@ pub struct KitQueryRow {
     pub row_id: String,
     /// Flat `[col_id, val, col_id, val, …]` cells.
     pub cells: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct KitRetrieveRequest {
+    pub table: String,
+    pub retriever: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct KitRetrieveResponse {
+    pub hits: Vec<KitRetrieverHit>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct KitRetrieverHit {
+    pub row_id: String,
+    pub rank: usize,
+    pub score: KitScore,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct KitScore {
+    pub kind: String,
+    pub value: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct KitSetSimilarityRequest {
+    pub table: String,
+    pub column_id: u16,
+    pub members: Vec<serde_json::Value>,
+    pub candidate_k: usize,
+    pub min_jaccard: f32,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct KitSetSimilarityResponse {
+    pub hits: Vec<KitSetSimilarityHit>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct KitSetSimilarityHit {
+    pub row_id: String,
+    pub estimated_jaccard: f32,
+    pub exact_jaccard: f32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct KitSearchRequest {
+    pub table: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub must: Vec<serde_json::Value>,
+    pub retrievers: Vec<serde_json::Value>,
+    pub fusion: serde_json::Value,
+    pub limit: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub projection: Option<Vec<u16>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct KitSearchResponse {
+    pub hits: Vec<KitSearchHit>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct KitSearchHit {
+    pub row_id: String,
+    pub cells: Vec<serde_json::Value>,
+    pub components: Vec<KitComponentScore>,
+    pub fused_score: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct KitComponentScore {
+    pub retriever_name: String,
+    pub rank: usize,
+    pub raw_score: KitScore,
+    pub contribution: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -553,6 +642,35 @@ impl MongrelClient {
     /// native counterpart to SQL reads (which hide row ids).
     pub fn kit_query(&self, req: &KitQueryRequest) -> ClientResult<KitQueryResponse> {
         let resp = self.client.post(self.url("/kit/query")).json(req).send()?;
+        let resp = self.check(resp)?;
+        Ok(resp.json()?)
+    }
+
+    pub fn kit_retrieve(&self, req: &KitRetrieveRequest) -> ClientResult<KitRetrieveResponse> {
+        let resp = self
+            .client
+            .post(self.url("/kit/retrieve"))
+            .json(req)
+            .send()?;
+        let resp = self.check(resp)?;
+        Ok(resp.json()?)
+    }
+
+    pub fn kit_set_similarity(
+        &self,
+        req: &KitSetSimilarityRequest,
+    ) -> ClientResult<KitSetSimilarityResponse> {
+        let resp = self
+            .client
+            .post(self.url("/kit/set_similarity"))
+            .json(req)
+            .send()?;
+        let resp = self.check(resp)?;
+        Ok(resp.json()?)
+    }
+
+    pub fn kit_search(&self, req: &KitSearchRequest) -> ClientResult<KitSearchResponse> {
+        let resp = self.client.post(self.url("/kit/search")).json(req).send()?;
         let resp = self.check(resp)?;
         Ok(resp.json()?)
     }

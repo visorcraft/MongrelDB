@@ -1,5 +1,5 @@
 use mongreldb_core::query::{
-    Condition, Fusion, NamedRetriever, Retriever, RetrieverScore, SearchRequest, SetMember,
+    Condition, Fusion, NamedRetriever, Query, Retriever, RetrieverScore, SearchRequest, SetMember,
     SetSimilarityRequest,
 };
 use mongreldb_core::schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
@@ -32,18 +32,21 @@ fn schema() -> Schema {
                 column_id: 2,
                 kind: IndexKind::Ann,
                 predicate: None,
+                options: Default::default(),
             },
             IndexDef {
                 name: "sparse".into(),
                 column_id: 3,
                 kind: IndexKind::Sparse,
                 predicate: None,
+                options: Default::default(),
             },
             IndexDef {
                 name: "minhash".into(),
                 column_id: 4,
                 kind: IndexKind::MinHash,
                 predicate: None,
+                options: Default::default(),
             },
         ],
         colocation: vec![],
@@ -137,6 +140,50 @@ fn scored_retrievers_preserve_order_and_reopen() {
             _ => false,
         }));
 
+    for (retriever, condition) in [
+        (
+            ann.clone(),
+            Condition::Ann {
+                column_id: 2,
+                query: vec![1.0; 8],
+                k: 2,
+            },
+        ),
+        (
+            sparse.clone(),
+            Condition::SparseMatch {
+                column_id: 3,
+                query: vec![(1, 1.0)],
+                k: 2,
+            },
+        ),
+        (
+            minhash.clone(),
+            Condition::MinHashSimilar {
+                column_id: 4,
+                query: ["a", "b", "c", "d"]
+                    .into_iter()
+                    .map(mongreldb_core::index::minhash_token_hash)
+                    .collect(),
+                k: 2,
+            },
+        ),
+    ] {
+        let retrieved: std::collections::HashSet<_> = table
+            .retrieve(&retriever)
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.row_id)
+            .collect();
+        let queried: std::collections::HashSet<_> = table
+            .query(&Query::new().and(condition))
+            .unwrap()
+            .into_iter()
+            .map(|row| row.row_id)
+            .collect();
+        assert_eq!(retrieved, queried);
+    }
+
     table.close().unwrap();
     drop(table);
     let mut reopened = Table::open(dir.path()).unwrap();
@@ -186,6 +233,7 @@ fn exact_set_similarity_filters_sorts_and_limits() {
     assert_eq!(hits.len(), 2);
     assert_eq!(hits[0].exact_jaccard, 1.0);
     assert_eq!(hits[1].exact_jaccard, 0.6);
+    assert_ne!(hits[1].estimated_jaccard, hits[1].exact_jaccard);
 
     let hits = table
         .set_similarity(&SetSimilarityRequest {
@@ -200,7 +248,7 @@ fn exact_set_similarity_filters_sorts_and_limits() {
     assert!(table
         .set_similarity(&SetSimilarityRequest {
             members: vec![],
-            ..request
+            ..request.clone()
         })
         .unwrap()
         .is_empty());
@@ -257,9 +305,19 @@ fn hybrid_search_filters_unions_and_fuses_deterministically() {
         .search(&SearchRequest {
             must: vec![Condition::Pk(Value::Int64(2).encode_key())],
             retrievers: request.retrievers.clone(),
-            ..request
+            ..request.clone()
         })
         .unwrap();
     assert_eq!(filtered.len(), 1);
     assert_eq!(filtered[0].cells, vec![(1, Value::Int64(2))]);
+
+    let duplicate = request.retrievers[0].clone();
+    assert!(table
+        .search(&SearchRequest {
+            retrievers: vec![duplicate.clone(), duplicate],
+            ..request
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("unique"));
 }

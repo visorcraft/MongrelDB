@@ -347,6 +347,7 @@ impl SchemaBuilder {
             column_id: i.column_id,
             kind,
             predicate: None,
+            options: Default::default(),
         });
         Ok(())
     }

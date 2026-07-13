@@ -14,14 +14,12 @@
 
 use crate::rowid::RowId;
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
 
 /// Number of hash permutations in a signature (estimator resolution).
 const NUM_PERM: usize = 128;
 /// Number of LSH bands. `NUM_PERM / NUM_BANDS` rows per band. With 128/32 the
-/// candidate threshold (P≈0.5) sits near Jaccard ≈ 0.42.
+/// candidate threshold (P≈0.5) sits near Jaccard ≈ 0.3826.
 const NUM_BANDS: usize = 32;
-const ROWS_PER_BAND: usize = NUM_PERM / NUM_BANDS;
 
 /// Stable v1 hash for a string set member.
 pub fn minhash_token_hash(token: &str) -> u64 {
@@ -78,35 +76,26 @@ fn splitmix64(mut x: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// The `NUM_PERM` `(a, b)` permutation coefficients — fixed for all time so
-/// signatures are stable across processes and across a rebuild-from-runs.
-fn coeffs() -> &'static [(u64, u64); NUM_PERM] {
-    static COEFFS: OnceLock<[(u64, u64); NUM_PERM]> = OnceLock::new();
-    COEFFS.get_or_init(|| {
-        let mut c = [(0u64, 0u64); NUM_PERM];
-        for (i, slot) in c.iter_mut().enumerate() {
-            let a = splitmix64(0xA5A5_0000 ^ (i as u64).wrapping_mul(2)) | 1;
-            let b = splitmix64(0x5A5A_0000 ^ ((i as u64).wrapping_mul(2) + 1));
-            *slot = (a, b);
-        }
-        c
-    })
+fn coefficient(i: usize) -> (u64, u64) {
+    let a = splitmix64(0xA5A5_0000 ^ (i as u64).wrapping_mul(2)) | 1;
+    let b = splitmix64(0x5A5A_0000 ^ ((i as u64).wrapping_mul(2) + 1));
+    (a, b)
 }
 
 /// MinHash signature (`NUM_PERM` u32 mins) of a set of token hashes. `None` for
 /// the empty set.
-fn signature(token_hashes: &[u64]) -> Option<Vec<u32>> {
+fn signature(token_hashes: &[u64], permutations: usize) -> Option<Vec<u32>> {
     if token_hashes.is_empty() {
         return None;
     }
-    let coeffs = coeffs();
-    let mut sig = vec![u32::MAX; NUM_PERM];
+    let mut sig = vec![u32::MAX; permutations];
     for &h in token_hashes {
-        for (i, &(a, b)) in coeffs.iter().enumerate() {
+        for (i, slot) in sig.iter_mut().enumerate() {
+            let (a, b) = coefficient(i);
             let p = a.wrapping_mul(h).wrapping_add(b);
             let v = (p >> 32) as u32;
-            if v < sig[i] {
-                sig[i] = v;
+            if v < *slot {
+                *slot = v;
             }
         }
     }
@@ -114,17 +103,18 @@ fn signature(token_hashes: &[u64]) -> Option<Vec<u32>> {
 }
 
 /// LSH bucket key for band `b` of a signature.
-fn band_key(b: usize, sig: &[u32]) -> u64 {
+fn band_key(b: usize, sig: &[u32], rows_per_band: usize) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     (b as u64).hash(&mut h);
-    let lo = b * ROWS_PER_BAND;
-    sig[lo..lo + ROWS_PER_BAND].hash(&mut h);
+    let lo = b * rows_per_band;
+    sig[lo..lo + rows_per_band].hash(&mut h);
     h.finish()
 }
 
-#[derive(Default)]
 pub struct MinHashIndex {
+    permutations: usize,
+    bands: usize,
     /// Per-row signatures, in insertion order.
     sigs: Vec<(RowId, Vec<u32>)>,
     /// LSH band bucket → indices into `sigs`. Derived from `sigs`; rebuilt on
@@ -134,17 +124,30 @@ pub struct MinHashIndex {
 
 impl MinHashIndex {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_options(NUM_PERM, NUM_BANDS)
+    }
+
+    pub fn with_options(permutations: usize, bands: usize) -> Self {
+        assert!(permutations > 0 && bands > 0 && permutations % bands == 0);
+        Self {
+            permutations,
+            bands,
+            sigs: Vec::new(),
+            buckets: HashMap::new(),
+        }
     }
 
     /// Index a row's set (as token hashes). Empty sets are skipped.
     pub fn insert(&mut self, token_hashes: &[u64], row_id: RowId) {
-        let Some(sig) = signature(token_hashes) else {
+        let Some(sig) = signature(token_hashes, self.permutations) else {
             return;
         };
         let idx = self.sigs.len() as u32;
-        for b in 0..NUM_BANDS {
-            self.buckets.entry(band_key(b, &sig)).or_default().push(idx);
+        for b in 0..self.bands {
+            self.buckets
+                .entry(band_key(b, &sig, self.permutations / self.bands))
+                .or_default()
+                .push(idx);
         }
         self.sigs.push((row_id, sig));
     }
@@ -162,12 +165,15 @@ impl MinHashIndex {
         k: usize,
         allowed: impl Fn(RowId) -> bool,
     ) -> Vec<(RowId, f32)> {
-        let Some(qsig) = signature(query_token_hashes) else {
+        let Some(qsig) = signature(query_token_hashes, self.permutations) else {
             return Vec::new();
         };
         let mut candidates: HashSet<u32> = HashSet::new();
-        for b in 0..NUM_BANDS {
-            if let Some(v) = self.buckets.get(&band_key(b, &qsig)) {
+        for b in 0..self.bands {
+            if let Some(v) = self
+                .buckets
+                .get(&band_key(b, &qsig, self.permutations / self.bands))
+            {
                 candidates.extend(v.iter().copied());
             }
         }
@@ -179,7 +185,7 @@ impl MinHashIndex {
                     return None;
                 }
                 let matches = sig.iter().zip(&qsig).filter(|(a, b)| a == b).count();
-                Some((*rid, matches as f32 / NUM_PERM as f32))
+                Some((*rid, matches as f32 / self.permutations as f32))
             })
             .collect();
         scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -191,6 +197,10 @@ impl MinHashIndex {
         self.sigs.is_empty()
     }
 
+    pub fn options(&self) -> (usize, usize) {
+        (self.permutations, self.bands)
+    }
+
     /// Snapshot the signatures for checkpointing (buckets are derived).
     pub fn entries(&self) -> Vec<(RowId, Vec<u32>)> {
         self.sigs.clone()
@@ -198,19 +208,57 @@ impl MinHashIndex {
 
     /// Rebuild from a snapshot produced by [`MinHashIndex::entries`].
     pub fn from_entries(entries: Vec<(RowId, Vec<u32>)>) -> Self {
+        Self::from_entries_with_options(entries, NUM_PERM, NUM_BANDS)
+    }
+
+    pub fn from_entries_with_options(
+        entries: Vec<(RowId, Vec<u32>)>,
+        permutations: usize,
+        bands: usize,
+    ) -> Self {
         let mut idx = Self {
+            permutations,
+            bands,
             sigs: Vec::with_capacity(entries.len()),
             buckets: HashMap::new(),
         };
         for (rid, sig) in entries {
             let i = idx.sigs.len() as u32;
-            for b in 0..NUM_BANDS {
-                idx.buckets.entry(band_key(b, &sig)).or_default().push(i);
+            for b in 0..bands {
+                idx.buckets
+                    .entry(band_key(b, &sig, permutations / bands))
+                    .or_default()
+                    .push(i);
             }
             idx.sigs.push((rid, sig));
         }
         idx
     }
+
+    pub fn snapshot(&self) -> MinHashSnapshot {
+        MinHashSnapshot {
+            permutations: self.permutations,
+            bands: self.bands,
+            entries: self.entries(),
+        }
+    }
+
+    pub fn from_snapshot(snapshot: MinHashSnapshot) -> Self {
+        Self::from_entries_with_options(snapshot.entries, snapshot.permutations, snapshot.bands)
+    }
+}
+
+impl Default for MinHashIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct MinHashSnapshot {
+    pub permutations: usize,
+    pub bands: usize,
+    pub entries: MinHashEntries,
 }
 
 /// Checkpoint payload type (kept explicit for the global-index serde).
@@ -239,6 +287,33 @@ mod tests {
             minhash_token_hash("true"),
             minhash_member_hash_v1(&serde_json::json!(true)).unwrap()
         );
+    }
+
+    #[test]
+    fn custom_options_survive_snapshot() {
+        let mut index = MinHashIndex::with_options(64, 16);
+        let query = set(&["a", "b", "c", "d"]);
+        index.insert(&query, RowId(7));
+        let restored = MinHashIndex::from_snapshot(index.snapshot());
+        assert_eq!(restored.options(), (64, 16));
+        assert_eq!(restored.search(&query, 1)[0].0, RowId(7));
+        assert_eq!(restored.search(&query, 1)[0].1, 1.0);
+    }
+
+    #[test]
+    fn exact_verification_cannot_recover_an_lsh_miss() {
+        let base = set(&["a", "b", "c", "d"]);
+        let mut index = MinHashIndex::with_options(1, 1);
+        index.insert(&base, RowId(1));
+        let missed = (0..100)
+            .map(|candidate| set(&["a", "b", "c", &format!("x{candidate}")]))
+            .find(|query| index.search(query, 1).is_empty())
+            .expect("one-permutation LSH must miss a near set in this fixture");
+        assert_eq!(
+            base.iter().filter(|token| missed.contains(token)).count(),
+            3
+        );
+        assert!(index.search(&missed, 1).is_empty());
     }
 
     fn set(tokens: &[&str]) -> Vec<u64> {

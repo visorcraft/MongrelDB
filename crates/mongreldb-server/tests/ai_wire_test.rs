@@ -46,8 +46,8 @@ async fn kit_ai_indexes_work_over_wire_and_validate_values() {
         "indexes": [
             {"name": "status_bm", "column_id": 2, "kind": "bitmap"},
             {"name": "sparse_idx", "column_id": 3, "kind": "sparse"},
-            {"name": "embedding_ann", "column_id": 4, "kind": "hnsw"},
-            {"name": "members_minhash", "column_id": 5, "kind": "lsh"}
+            {"name": "embedding_ann", "column_id": 4, "kind": "hnsw", "options":{"ann":{"m":8,"ef_construction":32,"ef_search":17}}},
+            {"name": "members_minhash", "column_id": 5, "kind": "lsh", "options":{"minhash":{"permutations":64,"bands":16}}}
         ]
     });
     let (status, body) = request(app.clone(), "POST", "/kit/create_table", Some(create)).await;
@@ -58,6 +58,11 @@ async fn kit_ai_indexes_work_over_wire_and_validate_values() {
     assert_eq!(schema["indexes"].as_array().unwrap().len(), 4);
     assert_eq!(schema["indexes"][2]["kind"], "ann");
     assert_eq!(schema["indexes"][3]["kind"], "minhash");
+    assert_eq!(schema["indexes"][2]["options"]["ann"]["ef_search"], 17);
+    assert_eq!(
+        schema["indexes"][3]["options"]["minhash"]["permutations"],
+        64
+    );
 
     let rows = [
         serde_json::json!([
@@ -116,6 +121,30 @@ async fn kit_ai_indexes_work_over_wire_and_validate_values() {
         assert_eq!(body["rows"][0]["cells"], serde_json::json!([1, 1]));
     }
 
+    for condition in [
+        serde_json::json!({"ann":{"column_id":4,"query":[1,-1,1,-1,1,-1,1,-1],"k":3}}),
+        serde_json::json!({"sparse_match":{"column_id":3,"query":[[1,2.0]],"k":3}}),
+        serde_json::json!({"minhash_similar_members":{"column_id":5,"members":["a","b","c","d"],"k":3}}),
+    ] {
+        let query = serde_json::json!({
+            "table":"docs",
+            "conditions":[{"bitmap_eq":{"column_id":2,"value":"published"}}, condition],
+            "projection":[1]
+        });
+        let (status, body) = request(app.clone(), "POST", "/kit/query", Some(query)).await;
+        assert_eq!(status, 200, "{body}");
+        assert!(body["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["cells"] != serde_json::json!([1, 2])));
+        assert!(body["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["cells"] == serde_json::json!([1, 1])));
+    }
+
     let retrieve = serde_json::json!({
         "table":"docs",
         "retriever":{"sparse":{"column_id":3,"query":[[1,2.0]],"k":2}}
@@ -158,10 +187,43 @@ async fn kit_ai_indexes_work_over_wire_and_validate_values() {
         .all(|hit| hit["fused_score"].as_f64().unwrap() > 0.0));
 
     let invalid = serde_json::json!({"ops":[{"put":{"table":"docs","cells":[1,9,4,[1,2]]}}]});
-    let (status, body) = request(app, "POST", "/kit/txn", Some(invalid)).await;
+    let (status, body) = request(app.clone(), "POST", "/kit/txn", Some(invalid)).await;
     assert_eq!(status, 400, "{body}");
     assert!(body["error"]["message"]
         .as_str()
         .unwrap()
         .contains("column 4: embedding dimension must be 8"));
+
+    for (column_id, value, message) in [
+        (
+            3,
+            serde_json::json!("not sparse"),
+            "sparse vector must be an array",
+        ),
+        (
+            5,
+            serde_json::json!([{"nested":true}]),
+            "set members must be strings, numbers, or booleans",
+        ),
+    ] {
+        let invalid =
+            serde_json::json!({"ops":[{"put":{"table":"docs","cells":[1,9,column_id,value]}}]});
+        let (status, body) = request(app.clone(), "POST", "/kit/txn", Some(invalid)).await;
+        assert_eq!(status, 400, "{body}");
+        assert!(body["error"]["message"].as_str().unwrap().contains(message));
+    }
+
+    drop(app);
+    let reopened = Arc::new(Database::open(dir.path()).unwrap());
+    let app = build_app(reopened);
+    for condition in [
+        serde_json::json!({"ann":{"column_id":4,"query":[1,-1,1,-1,1,-1,1,-1],"k":1}}),
+        serde_json::json!({"sparse_match":{"column_id":3,"query":[[1,2.0]],"k":1}}),
+        serde_json::json!({"minhash_similar_members":{"column_id":5,"members":["a","b","c","d"],"k":1}}),
+    ] {
+        let query = serde_json::json!({"table":"docs","conditions":[condition],"projection":[1]});
+        let (status, body) = request(app.clone(), "POST", "/kit/query", Some(query)).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["rows"][0]["cells"], serde_json::json!([1, 1]));
+    }
 }

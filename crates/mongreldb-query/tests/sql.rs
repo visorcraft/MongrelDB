@@ -52,12 +52,14 @@ fn schema() -> Schema {
                 column_id: 2,
                 kind: mongreldb_core::schema::IndexKind::Bitmap,
                 predicate: None,
+                options: Default::default(),
             },
             mongreldb_core::schema::IndexDef {
                 name: "dest_fm".into(),
                 column_id: 2,
                 kind: mongreldb_core::schema::IndexKind::FmIndex,
                 predicate: None,
+                options: Default::default(),
             },
         ],
         colocation: vec![],
@@ -378,6 +380,7 @@ fn vec_schema() -> Schema {
             column_id: 2,
             kind: mongreldb_core::schema::IndexKind::Ann,
             predicate: None,
+            options: Default::default(),
         }],
         colocation: vec![],
         constraints: Default::default(),
@@ -451,6 +454,7 @@ fn cities_schema() -> Schema {
             column_id: 2,
             kind: mongreldb_core::schema::IndexKind::Bitmap,
             predicate: None,
+            options: Default::default(),
         }],
         colocation: vec![],
         constraints: Default::default(),
@@ -641,6 +645,7 @@ async fn multi_run_streams_and_limit_short_circuits() {
             column_id: 2,
             kind: IndexKind::Bitmap,
             predicate: None,
+            options: Default::default(),
         }],
         colocation: vec![],
         constraints: Default::default(),
@@ -1467,4 +1472,261 @@ async fn savepoint_syntax_is_accepted() {
     session.run("RELEASE sp1").await.unwrap();
     session.run("SAVEPOINT sp2").await.unwrap();
     session.run("ROLLBACK TO sp2").await.unwrap();
+}
+
+#[tokio::test]
+async fn scored_search_table_functions_return_projected_rows_and_scores() {
+    use arrow::array::{
+        Float32Array, Float64Array, Int64Array, StringArray, UInt32Array, UInt64Array,
+    };
+    use mongreldb_core::schema::{IndexDef, IndexKind};
+
+    let dir = tempdir().unwrap();
+    let schema = Schema {
+        schema_id: 9,
+        columns: vec![
+            ColumnDef {
+                id: 1,
+                name: "id".into(),
+                ty: TypeId::Int64,
+                flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
+            },
+            ColumnDef {
+                id: 2,
+                name: "embedding".into(),
+                ty: TypeId::Embedding { dim: 8 },
+                flags: ColumnFlags::empty(),
+                default_value: None,
+            },
+            ColumnDef {
+                id: 3,
+                name: "sparse".into(),
+                ty: TypeId::Bytes,
+                flags: ColumnFlags::empty(),
+                default_value: None,
+            },
+            ColumnDef {
+                id: 4,
+                name: "members".into(),
+                ty: TypeId::Bytes,
+                flags: ColumnFlags::empty(),
+                default_value: None,
+            },
+        ],
+        indexes: vec![
+            IndexDef {
+                name: "ann".into(),
+                column_id: 2,
+                kind: IndexKind::Ann,
+                predicate: None,
+                options: Default::default(),
+            },
+            IndexDef {
+                name: "sparse".into(),
+                column_id: 3,
+                kind: IndexKind::Sparse,
+                predicate: None,
+                options: Default::default(),
+            },
+            IndexDef {
+                name: "minhash".into(),
+                column_id: 4,
+                kind: IndexKind::MinHash,
+                predicate: None,
+                options: Default::default(),
+            },
+        ],
+        colocation: vec![],
+        constraints: Default::default(),
+        clustered: false,
+    };
+    let mut table = Table::create(dir.path(), schema, 9).unwrap();
+    table
+        .put(vec![
+            (1, Value::Int64(7)),
+            (2, Value::Embedding(vec![1.0; 8])),
+            (
+                3,
+                Value::Bytes(bincode::serialize(&vec![(1u32, 2.0f32)]).unwrap()),
+            ),
+            (
+                4,
+                Value::Bytes(serde_json::to_vec(&["a", "b", "c", "d"]).unwrap()),
+            ),
+        ])
+        .unwrap();
+    table.commit().unwrap();
+    let session = MongrelSession::new(table);
+    session.register("docs").await.unwrap();
+
+    let ann = session
+        .run("SELECT * FROM ann_search_scored('docs','embedding','[1,1,1,1,1,1,1,1]',1,'id')")
+        .await
+        .unwrap();
+    assert_eq!(
+        ann[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        7
+    );
+    assert_eq!(
+        ann[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .value(0),
+        1
+    );
+    assert_eq!(
+        ann[0]
+            .column(2)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap()
+            .value(0),
+        0
+    );
+
+    let sparse = session
+        .run("SELECT * FROM sparse_search_scored('docs','sparse','[[1,1.5]]',1,'id')")
+        .await
+        .unwrap();
+    assert_eq!(
+        sparse[0]
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap()
+            .value(0),
+        3.0
+    );
+
+    let minhash = session
+        .run(r#"SELECT * FROM minhash_search_scored('docs','members','["a","b","c","d"]',1,'id')"#)
+        .await
+        .unwrap();
+    assert_eq!(
+        minhash[0]
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap()
+            .value(0),
+        1.0
+    );
+
+    let exact = session
+        .run(r#"SELECT * FROM set_similarity_scored('docs','members','["a","b","c","d"]',10,0.9,5,'id')"#)
+        .await
+        .unwrap();
+    assert_eq!(
+        exact[0]
+            .column(3)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap()
+            .value(0),
+        1.0
+    );
+
+    let hybrid = session
+        .run(r#"SELECT * FROM hybrid_search_scored('docs','{"retrievers":[{"name":"dense","ann":{"column":"embedding","query":[1,1,1,1,1,1,1,1],"k":1}},{"name":"sparse","sparse":{"column":"sparse","query":[[1,1.5]],"k":1}}],"limit":5}','id')"#)
+        .await
+        .unwrap();
+    assert_eq!(
+        hybrid[0]
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(0),
+        2.0 / 61.0
+    );
+    let components = hybrid[0]
+        .column(3)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .value(0);
+    assert!(components.contains("dense"));
+    assert!(components.contains("sparse"));
+}
+
+#[tokio::test]
+async fn create_minhash_index_after_rows_backfills_candidates() {
+    let dir = tempdir().unwrap();
+    let database = std::sync::Arc::new(mongreldb_core::Database::create(dir.path()).unwrap());
+    database
+        .create_table(
+            "sets",
+            Schema {
+                schema_id: 10,
+                columns: vec![
+                    ColumnDef {
+                        id: 1,
+                        name: "id".into(),
+                        ty: TypeId::Int64,
+                        flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                        default_value: None,
+                    },
+                    ColumnDef {
+                        id: 2,
+                        name: "members".into(),
+                        ty: TypeId::Bytes,
+                        flags: ColumnFlags::empty(),
+                        default_value: None,
+                    },
+                ],
+                indexes: vec![],
+                colocation: vec![],
+                constraints: Default::default(),
+                clustered: false,
+            },
+        )
+        .unwrap();
+    {
+        let handle = database.table("sets").unwrap();
+        let mut table = handle.lock();
+        table
+            .put(vec![
+                (1, Value::Int64(1)),
+                (
+                    2,
+                    Value::Bytes(serde_json::to_vec(&["a", "b", "c", "d"]).unwrap()),
+                ),
+            ])
+            .unwrap();
+        table.commit().unwrap();
+    }
+    let session = MongrelSession::open(std::sync::Arc::clone(&database)).unwrap();
+    session
+        .run("CREATE INDEX members_mh ON sets USING minhash (members) WITH (permutations = 64, bands = 16)")
+        .await
+        .unwrap();
+    let handle = database.table("sets").unwrap();
+    let mut table = handle.lock();
+    assert_eq!(
+        table.schema().indexes[0].kind,
+        mongreldb_core::IndexKind::MinHash
+    );
+    let options = table.schema().indexes[0].options.minhash.as_ref().unwrap();
+    assert_eq!((options.permutations, options.bands), (64, 16));
+    let rows = table
+        .query(
+            &mongreldb_core::Query::new().and(mongreldb_core::Condition::MinHashSimilar {
+                column_id: 2,
+                query: ["a", "b", "c", "d"]
+                    .into_iter()
+                    .map(mongreldb_core::index::minhash_token_hash)
+                    .collect(),
+                k: 1,
+            }),
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
 }

@@ -1,0 +1,20 @@
+{
+  "scope": "manual release qualification on the named baseline machine",
+  "rows": 100000,
+  "minimum_queries": 10,
+  "ann": {
+    "maximum_p95_us": 800,
+    "minimum_hamming_recall_at_10": 0.70,
+    "minimum_cosine_recall_at_10": 0.15
+  },
+  "sparse": {
+    "maximum_p95_us": 50
+  },
+  "minhash": {
+    "maximum_p95_us": 100,
+    "minimum_candidate_recall_at_10": 0.70
+  },
+  "hybrid": {
+    "maximum_p95_us": 4000
+  }
+}

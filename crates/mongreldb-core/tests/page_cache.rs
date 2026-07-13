@@ -32,6 +32,7 @@ fn schema() -> Schema {
             column_id: 2,
             kind: IndexKind::LearnedRange,
             predicate: None,
+            options: Default::default(),
         }],
         colocation: vec![],
         constraints: Default::default(),

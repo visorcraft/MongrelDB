@@ -42,6 +42,7 @@ fn schema() -> Schema {
             column_id: 2,
             kind: IndexKind::MinHash,
             predicate: None,
+            options: Default::default(),
         }],
         colocation: vec![],
         constraints: Default::default(),
@@ -124,12 +125,14 @@ fn minhash_intersects_with_another_condition() {
                 column_id: 2,
                 kind: IndexKind::Bitmap,
                 predicate: None,
+                options: Default::default(),
             },
             IndexDef {
                 name: "tags_minhash".into(),
                 column_id: 3,
                 kind: IndexKind::MinHash,
                 predicate: None,
+                options: Default::default(),
             },
         ],
         colocation: vec![],
@@ -224,6 +227,7 @@ fn minhash_scale_timing() {
             column_id: 2,
             kind: IndexKind::MinHash,
             predicate: None,
+            options: Default::default(),
         }],
         colocation: vec![],
         constraints: Default::default(),
@@ -256,7 +260,7 @@ fn minhash_scale_timing() {
     let ingest_ms = t0.elapsed().as_millis();
     eprintln!(
         "\n[demo2] ingested {n} rows in {ingest_ms}ms ({} rows/sec)",
-        (n as u128 * 1000 / (ingest_ms.max(1) as u128))
+        n as u128 * 1000 / ingest_ms.max(1)
     );
 
     // Pick 50 query docs at random, time MinHashSimilar queries.

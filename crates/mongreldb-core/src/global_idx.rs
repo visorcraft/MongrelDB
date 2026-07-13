@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 pub const IDX_MAGIC: [u8; 8] = *b"MONGRIDX";
-pub const IDX_VERSION: u16 = 2;
+pub const IDX_VERSION: u16 = 3;
 pub const IDX_DIR: &str = "_idx";
 pub const IDX_FILENAME: &str = "global.idx";
 
@@ -180,11 +180,10 @@ pub fn write_atomic(
     }
     for (&cid, mh) in snap.minhash {
         if !mh.is_empty() {
-            let entries = mh.entries();
             records.push(Record {
                 kind: K_MINHASH,
                 column_id: cid,
-                payload: bincode::serialize(&entries)?,
+                payload: bincode::serialize(&mh.snapshot())?,
             });
         }
     }
@@ -321,11 +320,11 @@ pub fn read(dir: &Path, dek: Option<&[u8; 32]>) -> Result<Option<LoadedIndexes>>
                 );
             }
             K_MINHASH => {
-                let entries: crate::index::minhash::MinHashEntries =
+                let snapshot: crate::index::minhash::MinHashSnapshot =
                     bincode::deserialize(&rec.payload)?;
                 minhash.insert(
                     rec.column_id,
-                    crate::index::MinHashIndex::from_entries(entries),
+                    crate::index::MinHashIndex::from_snapshot(snapshot),
                 );
             }
             K_LEARNED => {
@@ -351,6 +350,49 @@ pub fn read(dir: &Path, dek: Option<&[u8; 32]>) -> Result<Option<LoadedIndexes>>
 /// Remove the checkpoint (e.g. when the manifest no longer endorses it).
 pub fn remove(dir: &Path) {
     let _ = std::fs::remove_file(path(dir));
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexRecordSize {
+    pub kind: &'static str,
+    pub column_id: u16,
+    pub payload_bytes: u64,
+}
+
+/// Inspect per-index payload sizes in a plaintext checkpoint. Benchmark helper;
+/// encrypted checkpoints intentionally return an invalid-magic error.
+pub fn plaintext_record_sizes(dir: &Path) -> Result<Vec<IndexRecordSize>> {
+    let bytes = std::fs::read(path(dir))?;
+    if bytes.len() < 48 || bytes[..8] != IDX_MAGIC {
+        return Err(MongrelError::MagicMismatch {
+            what: "global index",
+            expected: IDX_MAGIC,
+            got: bytes
+                .get(..8)
+                .and_then(|value| value.try_into().ok())
+                .unwrap_or([0; 8]),
+        });
+    }
+    let footer_start = bytes.len() - 40;
+    let body: GlobalIdxBody = bincode::deserialize(&bytes[8..footer_start])?;
+    Ok(body
+        .records
+        .into_iter()
+        .map(|record| IndexRecordSize {
+            kind: match record.kind {
+                K_HOT => "hot_primary",
+                K_BITMAP => "bitmap",
+                K_FM => "fm",
+                K_ANN => "ann",
+                K_SPARSE => "sparse",
+                K_LEARNED => "learned_range",
+                K_MINHASH => "minhash",
+                _ => "unknown",
+            },
+            column_id: record.column_id,
+            payload_bytes: record.payload.len() as u64,
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -438,6 +480,25 @@ mod tests {
     #[test]
     fn read_returns_none_when_absent() {
         let dir = tempdir().unwrap();
+        assert!(read(dir.path(), None).unwrap().is_none());
+    }
+
+    #[test]
+    fn old_checkpoint_version_is_rejected_for_rebuild() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(IDX_DIR)).unwrap();
+        let body = GlobalIdxBody {
+            format_version: IDX_VERSION - 1,
+            table_id: 1,
+            epoch_built: 1,
+            records: vec![],
+        };
+        let mut bytes = IDX_MAGIC.to_vec();
+        bytes.extend(bincode::serialize(&body).unwrap());
+        bytes.extend(IDX_MAGIC);
+        let hash: [u8; 32] = Sha256::digest(&bytes).into();
+        bytes.extend(hash);
+        std::fs::write(path(dir.path()), bytes).unwrap();
         assert!(read(dir.path(), None).unwrap().is_none());
     }
 
