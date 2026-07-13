@@ -7,7 +7,7 @@
 <p align="center">
   <b>A log-structured columnar database for sub-millisecond writes, learned indexes, and AI-native access.</b>
   <br />
-  Custom <code>.sr</code> columnar format · Bε-tree memtable · WAL with group commit · six secondary index kinds · multi-index intersection · MVCC snapshots · page-level encryption · declarative constraints · user/role auth · credential enforcement · replication · change data capture · DataFusion SQL · recursive CTEs · window functions · CREATE TABLE AS SELECT · materialized views · multi-statement SQL · FTS ranking · NAPI addon
+  Custom <code>.sr</code> columnar format · Bε-tree memtable · WAL with group commit · six secondary index kinds · exact ANN reranking · multi-index intersection · MVCC snapshots · page-level encryption · declarative constraints · user/role auth · credential enforcement · replication · change data capture · DataFusion SQL · recursive CTEs · window functions · CREATE TABLE AS SELECT · materialized views · multi-statement SQL · FTS ranking · NAPI addon
 </p>
 
 <p align="center">
@@ -85,12 +85,21 @@ scores. Filtered ANN uses adaptive over-fetch with a bounded search breadth, so
 a highly selective filter may honestly return fewer than `k` approximate hits.
 SQL exposes projected scored table functions: `ann_search_scored`,
 `sparse_search_scored`, `minhash_search_scored`, `set_similarity_scored`, and
-`hybrid_search_scored`.
+`hybrid_search_scored`. `ann_search_exact` and the matching Rust, Kit HTTP,
+NAPI, C FFI, and Rust client APIs rerank binary-HNSW candidates from stored
+full-precision vectors using cosine similarity, dot product, or L2 distance.
+
+Every public AI surface rejects non-finite or oversized input. Shared ceilings
+include 10,000 final hits, 100,000 candidates per retriever, 32 retrievers, 256
+hard conditions, 65,536 sparse terms or set members, and 4,096 projected
+columns. `/kit/search` also enforces a caller-adjustable work budget and a
+1-60,000 ms deadline, defaulting to 30,000 ms.
 
 Index options preserve existing defaults when omitted. `CREATE INDEX ... WITH
 (...)` and Kit schema definitions can tune ANN `m`, `ef_construction`, and
 `ef_search`; MinHash `permutations` and `bands`; and learned-range `epsilon`.
-ANN remains binary-sign quantized. Full-precision and product-quantized ANN are
+The HNSW index remains binary-sign quantized. Exact reranking reads stored
+full-precision vectors, but full-precision and product-quantized ANN indexes are
 not implemented.
 
 ## Performance profile
@@ -192,7 +201,8 @@ AI retrieval availability:
   [Daemon Mode](docs/08-daemon.md#running-as-a-daemon---daemon-mode) for details.
   Notable flags: `--daemon` (background + PID file), `--pidfile <path>`,
   `--port <n>`, `--auth-token`/`--auth-users` (auth), `--max-connections <n>`,
-  and `--passphrase <key>` (page-level encryption).
+  `--max-sessions <n>`, `--session-idle-timeout <s>`, and `--passphrase <key>`
+  (page-level encryption).
   MVCC history retention defaults to 1024 epochs, can be set at startup with
   `MONGRELDB_HISTORY_RETENTION_EPOCHS`, and can be inspected or changed by an
   administrator through `GET`/`PUT /history/retention`. Both endpoints require
@@ -351,14 +361,14 @@ Prebuilt `libmongreldb` (core engine), `libmongreldb_kit` (Kit layer), and `libm
 
 | Platform | C/C++ archives | JVM JAR |
 |---|---|---|
-| Linux x64 (glibc) | `mongreldb-native-linux-x64-gnu.tar.gz` + `mongreldb-kit-native-linux-x64-gnu.tar.gz` | `mongreldb-jni-0.52.0-linux-x64.jar` |
-| Linux x64 (musl) | `mongreldb-native-linux-x64-musl.tar.gz` + `mongreldb-kit-native-linux-x64-musl.tar.gz` | `mongreldb-jni-0.52.0-linux-x64-musl.jar` |
-| Linux arm64 (glibc) | `mongreldb-native-linux-arm64-gnu.tar.gz` + `mongreldb-kit-native-linux-arm64-gnu.tar.gz` | `mongreldb-jni-0.52.0-linux-arm64.jar` |
-| macOS arm64 | `mongreldb-native-darwin-arm64.tar.gz` + `mongreldb-kit-native-darwin-arm64.tar.gz` | `mongreldb-jni-0.52.0-darwin-arm64.jar` |
-| macOS x64 | `mongreldb-native-darwin-x64.tar.gz` + `mongreldb-kit-native-darwin-x64.tar.gz` | `mongreldb-jni-0.52.0-darwin-x64.jar` |
-| Windows x64 | `mongreldb-native-windows-x64.zip` + `mongreldb-kit-native-windows-x64.zip` | `mongreldb-jni-0.52.0-windows-x64.jar` |
+| Linux x64 (glibc) | `mongreldb-native-linux-x64-gnu.tar.gz` + `mongreldb-kit-native-linux-x64-gnu.tar.gz` | `mongreldb-jni-0.52.1-linux-x64.jar` |
+| Linux x64 (musl) | `mongreldb-native-linux-x64-musl.tar.gz` + `mongreldb-kit-native-linux-x64-musl.tar.gz` | `mongreldb-jni-0.52.1-linux-x64-musl.jar` |
+| Linux arm64 (glibc) | `mongreldb-native-linux-arm64-gnu.tar.gz` + `mongreldb-kit-native-linux-arm64-gnu.tar.gz` | `mongreldb-jni-0.52.1-linux-arm64.jar` |
+| macOS arm64 | `mongreldb-native-darwin-arm64.tar.gz` + `mongreldb-kit-native-darwin-arm64.tar.gz` | `mongreldb-jni-0.52.1-darwin-arm64.jar` |
+| macOS x64 | `mongreldb-native-darwin-x64.tar.gz` + `mongreldb-kit-native-darwin-x64.tar.gz` | `mongreldb-jni-0.52.1-darwin-x64.jar` |
+| Windows x64 | `mongreldb-native-windows-x64.zip` + `mongreldb-kit-native-windows-x64.zip` | `mongreldb-jni-0.52.1-windows-x64.jar` |
 
-A fat JAR (`mongreldb-jni-0.52.0.jar`) with all platforms bundled is also published. Each C/C++ archive contains `lib/` (shared + static libraries) and `include/` (the C header). Download from the [releases page](https://github.com/visorcraft/MongrelDB/releases). See the C, C++, .NET, Java, Kotlin, and Scala client READMEs for linking instructions.
+A fat JAR (`mongreldb-jni-0.52.1.jar`) with all platforms bundled is also published. Each C/C++ archive contains `lib/` (shared + static libraries) and `include/` (the C header). Download from the [releases page](https://github.com/visorcraft/MongrelDB/releases). See the C, C++, .NET, Java, Kotlin, and Scala client READMEs for linking instructions.
 
 ## Node.js addon
 
