@@ -11,7 +11,7 @@ use crate::error::{clear, set_error_msg, ErrorCode};
 use crate::value::{ByteSlice, EmbeddingSlice};
 use mongreldb_core::index::minhash_token_hash;
 use mongreldb_core::query::{Condition, Query};
-use std::os::raw::c_void;
+use std::os::raw::{c_char, c_void};
 
 /// Opaque query handle.
 pub type mongreldb_query_t = *mut c_void;
@@ -329,6 +329,43 @@ impl FFIQuery {
 }
 
 // ── FFI lifecycle ─────────────────────────────────────────────────────────
+
+/// Hash one JSON scalar with the stable MinHash v1 contract.
+#[no_mangle]
+pub unsafe extern "C" fn mongreldb_minhash_member_hash_v1_json(
+    member: *const c_char,
+    out_hash: *mut u64,
+) -> i32 {
+    clear();
+    if member.is_null() || out_hash.is_null() {
+        return set_error_msg(
+            ErrorCode::InvalidArgument,
+            "member and out_hash must not be null",
+        )
+        .as_return();
+    }
+    let text = match std::ffi::CStr::from_ptr(member).to_str() {
+        Ok(text) => text,
+        Err(_) => {
+            return set_error_msg(ErrorCode::InvalidArgument, "member is not valid UTF-8")
+                .as_return()
+        }
+    };
+    let value = match serde_json::from_str(text) {
+        Ok(value) => value,
+        Err(_) => {
+            return set_error_msg(ErrorCode::InvalidArgument, "member is not valid JSON")
+                .as_return()
+        }
+    };
+    match mongreldb_core::index::minhash_member_hash_v1(&value) {
+        Ok(hash) => {
+            *out_hash = hash;
+            0
+        }
+        Err(message) => set_error_msg(ErrorCode::InvalidArgument, message).as_return(),
+    }
+}
 
 /// Begin a new query builder. Returns a handle.
 #[no_mangle]

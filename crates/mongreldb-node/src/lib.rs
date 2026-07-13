@@ -73,6 +73,15 @@ fn bigint_to_u64(b: &BigInt) -> napi::Result<u64> {
 
 // ── schema ────────────────────────────────────────────────────────────────
 
+#[napi(js_name = "minhashMemberHashV1")]
+pub fn minhash_member_hash_v1_json(member_json: String) -> napi::Result<String> {
+    let member: serde_json::Value = serde_json::from_str(&member_json)
+        .map_err(|error| napi::Error::new(napi::Status::InvalidArg, error.to_string()))?;
+    mongreldb_core::index::minhash_member_hash_v1(&member)
+        .map(|hash| hash.to_string())
+        .map_err(|error| napi::Error::new(napi::Status::InvalidArg, error))
+}
+
 #[napi]
 pub enum ColumnType {
     Bool,
@@ -2165,12 +2174,10 @@ impl TableHandle {
         let cid = column_id.map(|c| c as u16);
         let conds = build_conditions(&conditions)?;
         // Stable per-(table,column,agg,conditions) cache key.
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        std::hash::Hash::hash(&self.name, &mut hasher);
-        std::hash::Hash::hash(&cid, &mut hasher);
-        std::hash::Hash::hash(&agg, &mut hasher);
-        std::hash::Hash::hash(&format!("{conds:?}"), &mut hasher);
-        let cache_key = std::hash::Hasher::finish(&hasher);
+        let cache_key = mongreldb_core::index::minhash_token_hash(&format!(
+            "{:?}",
+            (&self.name, cid, &agg, &conds)
+        ));
         let handle = self.db.table(&self.name).map_err(to_napi)?;
         let mut g = handle.lock();
         let res = g

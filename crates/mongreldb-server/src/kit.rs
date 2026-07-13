@@ -13,7 +13,7 @@
 //! authoritatively at commit — concurrent conflicting writers cannot both
 //! commit, and a violating batch is rejected atomically (no partial commit).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{Path, State};
@@ -35,6 +35,35 @@ use serde_json::{json, Value as Jval};
 
 use crate::json_to_value;
 use crate::{request_principal, validate_table_name, AppState, OptionalPrincipal};
+
+const AUTHORIZED_READ_RETRIES: usize = 3;
+
+fn retry_authorized<T, F>(
+    state: &AppState,
+    table: &str,
+    principal: Option<&mongreldb_core::Principal>,
+    mut read: F,
+) -> Result<T, MongrelError>
+where
+    F: FnMut(
+        mongreldb_core::Snapshot,
+        Option<&HashSet<RowId>>,
+    ) -> Result<T, MongrelError>,
+{
+    for attempt in 0..AUTHORIZED_READ_RETRIES {
+        let snapshot = state.db.authorized_read_snapshot(table, principal)?;
+        let result = read(snapshot.table_snapshot, snapshot.allowed_row_ids.as_ref())?;
+        if state.db.authorized_read_snapshot_valid(&snapshot) {
+            return Ok(result);
+        }
+        if attempt + 1 == AUTHORIZED_READ_RETRIES {
+            return Err(MongrelError::Conflict(
+                "security policy changed during scored read".into(),
+            ));
+        }
+    }
+    unreachable!()
+}
 
 /// Per-server idempotency store: idempotency key → committed response, backed
 /// by an on-disk `<root>/_idem/` directory so retry-after-restart (not just
@@ -1052,16 +1081,12 @@ pub async fn kit_retrieve(
         Ok(handle) => handle,
         Err(error) => return (StatusCode::NOT_FOUND, error.to_string()).into_response(),
     };
-    let allowed = match state
-        .db
-        .authorized_candidate_ids_for(&req.table, principal.as_ref())
-    {
-        Ok(allowed) => allowed,
-        Err(error) => return (crate::status_for_error(&error), error.to_string()).into_response(),
-    };
-    let result = handle
-        .lock()
-        .retrieve_with_allowed(&retriever, allowed.as_ref());
+    let result = retry_authorized(
+        &state,
+        &req.table,
+        principal.as_ref(),
+        |snapshot, allowed| handle.lock().retrieve_at(&retriever, snapshot, allowed),
+    );
     match result {
         Ok(hits) => Json(json!({
             "hits": hits.into_iter().map(|hit| json!({
@@ -1071,14 +1096,7 @@ pub async fn kit_retrieve(
             })).collect::<Vec<_>>()
         }))
         .into_response(),
-        Err(error) => (
-            StatusCode::BAD_REQUEST,
-            Json(KitErrorEnvelope {
-                status: "aborted".into(),
-                error: KitError::new("BAD_REQUEST", error.to_string()),
-            }),
-        )
-            .into_response(),
+        Err(error) => (crate::status_for_error(&error), error.to_string()).into_response(),
     }
 }
 
@@ -1191,41 +1209,32 @@ pub async fn kit_search(
     let fusion = match req.fusion {
         KitFusion::ReciprocalRank { constant } => Fusion::ReciprocalRank { constant },
     };
-    let allowed = match state
-        .db
-        .authorized_candidate_ids_for(&req.table, principal.as_ref())
-    {
-        Ok(allowed) => allowed,
-        Err(error) => return (crate::status_for_error(&error), error.to_string()).into_response(),
+    let request = SearchRequest {
+        must,
+        retrievers,
+        fusion,
+        limit: req.limit,
+        projection: req.projection.clone(),
     };
-    let (mut hits, rows) = {
-        let mut table = handle.lock();
-        let hits = match table.search_with_allowed(
-            &SearchRequest {
-                must,
-                retrievers,
-                fusion,
-                limit: req.limit,
-                projection: req.projection.clone(),
-            },
-            allowed.as_ref(),
-        ) {
-            Ok(hits) => hits,
-            Err(error) => return kit_bad_request(error.to_string()),
-        };
-        let row_ids: Vec<_> = hits.iter().map(|hit| hit.row_id.0).collect();
-        let snapshot = table.snapshot();
-        let rows = match table.rows_for_rids(&row_ids, snapshot) {
-            Ok(rows) => rows,
-            Err(error) => return kit_bad_request(error.to_string()),
-        };
-        (hits, rows)
-    };
-    let secured = match state
-        .db
-        .secure_rows_for(&req.table, rows, principal.as_ref())
-    {
-        Ok(rows) => rows,
+    let (mut hits, secured) = match retry_authorized(
+        &state,
+        &req.table,
+        principal.as_ref(),
+        |snapshot, allowed| {
+            let (hits, rows) = {
+                let mut table = handle.lock();
+                let hits = table.search_at(&request, snapshot, allowed)?;
+                let row_ids: Vec<_> = hits.iter().map(|hit| hit.row_id.0).collect();
+                let rows = table.rows_for_rids(&row_ids, snapshot)?;
+                (hits, rows)
+            };
+            let secured = state
+                .db
+                .secure_rows_for(&req.table, rows, principal.as_ref())?;
+            Ok((hits, secured))
+        },
+    ) {
+        Ok(result) => result,
         Err(error) => return (crate::status_for_error(&error), error.to_string()).into_response(),
     };
     let secured: std::collections::HashMap<_, _> =
@@ -1289,22 +1298,18 @@ pub async fn kit_set_similarity(
         Ok(handle) => handle,
         Err(error) => return (StatusCode::NOT_FOUND, error.to_string()).into_response(),
     };
-    let allowed = match state
-        .db
-        .authorized_candidate_ids_for(&req.table, principal.as_ref())
-    {
-        Ok(allowed) => allowed,
-        Err(error) => return (crate::status_for_error(&error), error.to_string()).into_response(),
+    let request = SetSimilarityRequest {
+        column_id: req.column_id,
+        members,
+        candidate_k: req.candidate_k,
+        min_jaccard: req.min_jaccard,
+        limit: req.limit,
     };
-    let result = handle.lock().set_similarity_with_allowed(
-        &SetSimilarityRequest {
-            column_id: req.column_id,
-            members,
-            candidate_k: req.candidate_k,
-            min_jaccard: req.min_jaccard,
-            limit: req.limit,
-        },
-        allowed.as_ref(),
+    let result = retry_authorized(
+        &state,
+        &req.table,
+        principal.as_ref(),
+        |snapshot, allowed| handle.lock().set_similarity_at(&request, snapshot, allowed),
     );
     match result {
         Ok(hits) => Json(json!({

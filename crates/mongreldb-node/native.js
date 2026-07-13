@@ -310,8 +310,9 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { ColumnType, IndexKindSpec, IndexBuildPolicyJs, ConditionKind, Database, TableHandle, Transaction, TxnTable, WriteBuffer, RemoteDatabase } = nativeBinding
+const { minhashMemberHashV1, ColumnType, IndexKindSpec, IndexBuildPolicyJs, ConditionKind, Database, TableHandle, Transaction, TxnTable, WriteBuffer, RemoteDatabase } = nativeBinding
 
+module.exports.minhashMemberHashV1 = minhashMemberHashV1
 module.exports.ColumnType = ColumnType
 module.exports.IndexKindSpec = IndexKindSpec
 module.exports.IndexBuildPolicyJs = IndexBuildPolicyJs

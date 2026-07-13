@@ -55,6 +55,7 @@ fn sample_catalog() -> Catalog {
         external_tables: Vec::new(),
         materialized_views: Vec::new(),
         security: Default::default(),
+        security_version: 0,
         users: Vec::new(),
         roles: Vec::new(),
         next_user_id: 0,

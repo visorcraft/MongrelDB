@@ -19,6 +19,23 @@ fn make_tempdir() -> std::path::PathBuf {
     dir
 }
 
+#[test]
+fn ffi_minhash_golden_fixture_matches_v1() {
+    let golden: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+        "../../../docs/ai/minhash-v1-golden.json"
+    ))
+    .unwrap();
+    for fixture in golden {
+        let member = serde_json::to_string(&fixture["member"]).unwrap();
+        let mut hash = 0;
+        let result = unsafe {
+            mongreldb_minhash_member_hash_v1_json(cstr(&member), &mut hash)
+        };
+        assert_eq!(result, 0);
+        assert_eq!(hash.to_string(), fixture["expected"]);
+    }
+}
+
 fn cstr(s: &str) -> *const std::os::raw::c_char {
     CString::new(s).unwrap().into_raw()
 }
@@ -89,6 +106,76 @@ unsafe fn make_cell_input_array(cells: &mut [mongreldb_cell_input]) -> mongreldb
         data: cells.as_ptr(),
         len: cells.len(),
     }
+}
+
+#[test]
+fn ffi_specialized_column_rejects_wrong_value_before_write() {
+    let dir = make_tempdir();
+    unsafe {
+        let db = make_test_db(dir.to_str().unwrap());
+        let builder = mongreldb_schema_begin();
+        for column in [
+            mongreldb_column_def {
+                id: 1,
+                name: cstr("id"),
+                ty: mongreldb_type_id::Int64,
+                flags: MONGRELDB_COL_PRIMARY_KEY,
+                embedding_dim: 0,
+                decimal_precision: 0,
+                decimal_scale: 0,
+                enum_variants: StringArray::default(),
+            },
+            mongreldb_column_def {
+                id: 2,
+                name: cstr("sparse"),
+                ty: mongreldb_type_id::Bytes,
+                flags: 0,
+                embedding_dim: 0,
+                decimal_precision: 0,
+                decimal_scale: 0,
+                enum_variants: StringArray::default(),
+            },
+        ] {
+            assert_eq!(mongreldb_schema_add_column(builder, &column), 0);
+        }
+        assert_eq!(
+            mongreldb_schema_add_index(
+                builder,
+                &mongreldb_index_def {
+                    name: cstr("sparse_idx"),
+                    column_id: 2,
+                    kind: mongreldb_index_kind::Sparse,
+                },
+            ),
+            0
+        );
+        let schema = mongreldb_schema_build(builder);
+        let mut table_id = 0;
+        assert_eq!(
+            mongreldb_create_table(db, cstr("docs"), schema, &mut table_id),
+            0
+        );
+        let table = mongreldb_database_table(db, cstr("docs"));
+        let mut cells = [
+            mongreldb_cell_input {
+                column_id: 1,
+                value: CValue::int64(1),
+            },
+            mongreldb_cell_input {
+                column_id: 2,
+                value: CValue::int64(7),
+            },
+        ];
+        let cells = make_cell_input_array(&mut cells);
+        assert_eq!(mongreldb_table_put(table, &cells, std::ptr::null_mut()), -1);
+        assert!(rust_str(mongreldb_last_error()).contains("requires bytes or NULL"));
+        let mut count = 99;
+        assert_eq!(mongreldb_table_count(table, &mut count), 0);
+        assert_eq!(count, 0);
+        mongreldb_table_free(table);
+        mongreldb_database_free(db);
+    }
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]

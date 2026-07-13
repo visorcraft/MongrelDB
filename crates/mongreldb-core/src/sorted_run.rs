@@ -2921,7 +2921,10 @@ impl RunReader {
         // A uniform-epoch overlay must still gate by snapshot, so skip the clean
         // fast path when an override is active (defensive: spill runs are never
         // written clean).
-        if self.is_clean() && self.epoch_override.is_none() {
+        if self.is_clean()
+            && self.epoch_override.is_none()
+            && self.header.epoch_created <= snapshot.0
+        {
             let row_ids = match self.column_native_shared(SYS_ROW_ID)? {
                 columnar::NativeColumn::Int64 { data, .. } => data,
                 _ => return Err(MongrelError::InvalidArgument("sys row_id not int64".into())),

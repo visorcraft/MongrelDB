@@ -63,8 +63,8 @@ pub use catalog::{
 pub use columnar::{decode_column, encode_column};
 pub use cursor::{drain_cursor_to_columns, Cursor, MultiRunCursor, NativePageCursor};
 pub use database::{
-    CdcBatch, ChangeEvent, CheckIssue, Database, ExternalTriggerBaseWrite, ExternalTriggerBridge,
-    ExternalTriggerWrite, ExternalTriggerWriteResult, OpenOptions,
+    AuthorizedReadSnapshot, CdcBatch, ChangeEvent, CheckIssue, Database, ExternalTriggerBaseWrite,
+    ExternalTriggerBridge, ExternalTriggerWrite, ExternalTriggerWriteResult, OpenOptions,
 };
 pub use encryption::{Cipher, PlaintextCipher};
 pub use engine::{

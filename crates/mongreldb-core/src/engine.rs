@@ -3523,6 +3523,15 @@ impl Table {
         self.retrieve_with_allowed(retriever, None)
     }
 
+    pub fn retrieve_at(
+        &mut self,
+        retriever: &crate::query::Retriever,
+        snapshot: Snapshot,
+        allowed: Option<&std::collections::HashSet<RowId>>,
+    ) -> Result<Vec<crate::query::RetrieverHit>> {
+        self.retrieve_at_with_allowed(retriever, snapshot, allowed)
+    }
+
     /// Scored retrieval restricted to caller-authorized row IDs. Core MVCC,
     /// tombstone, and TTL eligibility is always applied before ranking.
     pub fn retrieve_with_allowed(
@@ -3530,10 +3539,19 @@ impl Table {
         retriever: &crate::query::Retriever,
         allowed: Option<&std::collections::HashSet<RowId>>,
     ) -> Result<Vec<crate::query::RetrieverHit>> {
+        self.retrieve_at_with_allowed(retriever, self.snapshot(), allowed)
+    }
+
+    pub fn retrieve_at_with_allowed(
+        &mut self,
+        retriever: &crate::query::Retriever,
+        snapshot: Snapshot,
+        allowed: Option<&std::collections::HashSet<RowId>>,
+    ) -> Result<Vec<crate::query::RetrieverHit>> {
         self.require_select()?;
         self.ensure_indexes_complete()?;
         self.validate_retriever(retriever)?;
-        self.retrieve_filtered(retriever, self.snapshot(), None, allowed)
+        self.retrieve_filtered(retriever, snapshot, None, allowed)
     }
 
     fn validate_retriever(&self, retriever: &crate::query::Retriever) -> Result<()> {
@@ -3817,7 +3835,11 @@ impl Table {
         _column_id: u16,
         snapshot: Snapshot,
     ) -> Result<std::collections::HashSet<RowId>> {
-        if !self.had_deletes && self.ttl.is_none() && snapshot.epoch == self.snapshot().epoch {
+        if !self.had_deletes
+            && self.ttl.is_none()
+            && self.pending_put_cols.is_empty()
+            && snapshot.epoch == self.snapshot().epoch
+        {
             return Ok(candidates.iter().copied().collect());
         }
         let mut readers: Vec<_> = self
@@ -3880,9 +3902,27 @@ impl Table {
         self.search_with_allowed(request, None)
     }
 
+    pub fn search_at(
+        &mut self,
+        request: &crate::query::SearchRequest,
+        snapshot: Snapshot,
+        authorized: Option<&std::collections::HashSet<RowId>>,
+    ) -> Result<Vec<crate::query::SearchHit>> {
+        self.search_at_with_allowed(request, snapshot, authorized)
+    }
+
     pub fn search_with_allowed(
         &mut self,
         request: &crate::query::SearchRequest,
+        authorized: Option<&std::collections::HashSet<RowId>>,
+    ) -> Result<Vec<crate::query::SearchHit>> {
+        self.search_at_with_allowed(request, self.snapshot(), authorized)
+    }
+
+    pub fn search_at_with_allowed(
+        &mut self,
+        request: &crate::query::SearchRequest,
+        snapshot: Snapshot,
         authorized: Option<&std::collections::HashSet<RowId>>,
     ) -> Result<Vec<crate::query::SearchHit>> {
         use crate::query::{ComponentScore, Fusion, SearchHit};
@@ -3927,7 +3967,6 @@ impl Table {
             }
         }
 
-        let snapshot = self.snapshot();
         let hard_filter = if request.must.is_empty() {
             None
         } else {
@@ -3980,7 +4019,7 @@ impl Table {
         let mut cells: std::collections::HashMap<RowId, std::collections::HashMap<u16, Value>> =
             std::collections::HashMap::new();
         if let Some(column_id) = sentinel {
-            for (row_id, value) in self.values_for_rids(&row_ids, column_id, snapshot)? {
+            for (row_id, value) in self.values_for_rids_batch(&row_ids, column_id, snapshot)? {
                 cells.entry(row_id).or_default().insert(column_id, value);
             }
         }
@@ -3988,7 +4027,7 @@ impl Table {
             if Some(column_id) == sentinel {
                 continue;
             }
-            for (row_id, value) in self.values_for_rids(&row_ids, column_id, snapshot)? {
+            for (row_id, value) in self.values_for_rids_batch(&row_ids, column_id, snapshot)? {
                 cells.entry(row_id).or_default().insert(column_id, value);
             }
         }
@@ -4029,6 +4068,16 @@ impl Table {
         self.set_similarity_with_allowed(request, None)
     }
 
+    pub fn set_similarity_at(
+        &mut self,
+        request: &crate::query::SetSimilarityRequest,
+        snapshot: Snapshot,
+        allowed: Option<&std::collections::HashSet<RowId>>,
+    ) -> Result<Vec<crate::query::SetSimilarityHit>> {
+        self.set_similarity_explained_at(request, snapshot, allowed)
+            .map(|(hits, _)| hits)
+    }
+
     /// Binary ANN candidate generation followed by exact float-vector reranking.
     pub fn ann_rerank(
         &mut self,
@@ -4042,18 +4091,28 @@ impl Table {
         request: &crate::query::AnnRerankRequest,
         allowed: Option<&std::collections::HashSet<RowId>>,
     ) -> Result<Vec<crate::query::AnnRerankHit>> {
+        self.ann_rerank_at(request, self.snapshot(), allowed)
+    }
+
+    pub fn ann_rerank_at(
+        &mut self,
+        request: &crate::query::AnnRerankRequest,
+        snapshot: Snapshot,
+        allowed: Option<&std::collections::HashSet<RowId>>,
+    ) -> Result<Vec<crate::query::AnnRerankHit>> {
         use crate::query::{AnnRerankHit, Retriever, RetrieverScore, VectorMetric};
         if request.candidate_k == 0 || request.limit == 0 {
             return Err(MongrelError::InvalidArgument(
                 "candidate_k and limit must be > 0".into(),
             ));
         }
-        let hits = self.retrieve_with_allowed(
+        let hits = self.retrieve_at_with_allowed(
             &Retriever::Ann {
                 column_id: request.column_id,
                 query: request.query.clone(),
                 k: request.candidate_k,
             },
+            snapshot,
             allowed,
         )?;
         let distances: std::collections::HashMap<_, _> = hits
@@ -4064,7 +4123,7 @@ impl Table {
             })
             .collect();
         let row_ids: Vec<_> = hits.iter().map(|hit| hit.row_id.0).collect();
-        let values = self.values_for_rids(&row_ids, request.column_id, self.snapshot())?;
+        let values = self.values_for_rids_batch(&row_ids, request.column_id, snapshot)?;
         let query_norm = request
             .query
             .iter()
@@ -4126,7 +4185,7 @@ impl Table {
         request: &crate::query::SetSimilarityRequest,
         allowed: Option<&std::collections::HashSet<RowId>>,
     ) -> Result<Vec<crate::query::SetSimilarityHit>> {
-        self.set_similarity_explained_with_allowed(request, allowed)
+        self.set_similarity_explained_at(request, self.snapshot(), allowed)
             .map(|(hits, _)| hits)
     }
 
@@ -4137,12 +4196,13 @@ impl Table {
         Vec<crate::query::SetSimilarityHit>,
         crate::query::SetSimilarityTrace,
     )> {
-        self.set_similarity_explained_with_allowed(request, None)
+        self.set_similarity_explained_at(request, self.snapshot(), None)
     }
 
-    fn set_similarity_explained_with_allowed(
+    fn set_similarity_explained_at(
         &mut self,
         request: &crate::query::SetSimilarityRequest,
+        snapshot: Snapshot,
         allowed: Option<&std::collections::HashSet<RowId>>,
     ) -> Result<(
         Vec<crate::query::SetSimilarityHit>,
@@ -4164,20 +4224,20 @@ impl Table {
             ));
         }
         let started = std::time::Instant::now();
-        let hits = self.retrieve_with_allowed(
+        let hits = self.retrieve_at_with_allowed(
             &Retriever::MinHash {
                 column_id: request.column_id,
                 members: request.members.clone(),
                 k: request.candidate_k,
             },
+            snapshot,
             allowed,
         )?;
         trace.candidate_generation_us = started.elapsed().as_micros() as u64;
         trace.candidate_count = hits.len();
-        let snapshot = self.snapshot();
         let row_ids: Vec<_> = hits.iter().map(|hit| hit.row_id.0).collect();
         let started = std::time::Instant::now();
-        let values = self.values_for_rids(&row_ids, request.column_id, snapshot)?;
+        let values = self.values_for_rids_batch(&row_ids, request.column_id, snapshot)?;
         trace.gather_us = started.elapsed().as_micros() as u64;
         let query: std::collections::HashSet<_> = request.members.iter().cloned().collect();
         let estimates: std::collections::HashMap<_, _> = hits
@@ -4242,6 +4302,46 @@ impl Table {
         exact.truncate(request.limit);
         trace.score_us = started.elapsed().as_micros() as u64;
         Ok((exact, trace))
+    }
+
+    /// Fetch one column for visible row ids without decoding unrelated columns.
+    fn values_for_rids_batch(
+        &self,
+        row_ids: &[u64],
+        column_id: u16,
+        snapshot: Snapshot,
+    ) -> Result<Vec<(RowId, Value)>> {
+        if self.ttl.is_none()
+            && self.memtable.is_empty()
+            && self.mutable_run.is_empty()
+            && self.run_refs.len() == 1
+        {
+            let mut reader = self.open_reader(self.run_refs[0].run_id)?;
+            let (positions, visible_row_ids) =
+                reader.visible_positions_with_rids(snapshot.epoch)?;
+            let requested: Vec<(RowId, usize)> = row_ids
+                .iter()
+                .filter_map(|raw| {
+                    visible_row_ids
+                        .binary_search(&(*raw as i64))
+                        .ok()
+                        .map(|index| (RowId(*raw), positions[index]))
+                })
+                .collect();
+            let values = reader.gather_column(
+                column_id,
+                &requested
+                    .iter()
+                    .map(|(_, position)| *position)
+                    .collect::<Vec<_>>(),
+            )?;
+            return Ok(requested
+                .into_iter()
+                .zip(values)
+                .map(|((row_id, _), value)| (row_id, value))
+                .collect());
+        }
+        self.values_for_rids(row_ids, column_id, snapshot)
     }
 
     /// Fetch one column for visible row ids without decoding unrelated columns.
@@ -5154,7 +5254,13 @@ impl Table {
     /// Live row count. O(1) without TTL; TTL tables scan because wall-clock
     /// expiry can change without a commit epoch.
     pub fn count(&self) -> u64 {
-        if self.ttl.is_none() {
+        if self.ttl.is_none()
+            && self.pending_put_cols.is_empty()
+            && self.pending_delete_rids.is_empty()
+            && self.pending_rows.is_empty()
+            && self.pending_dels.is_empty()
+            && self.pending_truncate.is_none()
+        {
             self.live_count
         } else {
             self.visible_rows(self.snapshot())
@@ -5180,7 +5286,7 @@ impl Table {
                 .map(|rows| Some(rows.len() as u64));
         }
         if conditions.is_empty() {
-            return Ok(Some(self.live_count));
+            return Ok(Some(self.count()));
         }
         let served = |c: &Condition| {
             matches!(
@@ -5204,6 +5310,19 @@ impl Table {
             return Ok(None);
         }
         self.ensure_indexes_complete()?;
+        if !self.pending_put_cols.is_empty()
+            || !self.pending_delete_rids.is_empty()
+            || !self.pending_rows.is_empty()
+            || !self.pending_dels.is_empty()
+            || self.pending_truncate.is_some()
+        {
+            let mut sets = Vec::with_capacity(conditions.len());
+            for condition in conditions {
+                sets.push(self.resolve_condition(condition, snapshot)?);
+            }
+            let rids = RowIdSet::intersect_many(sets).into_sorted_vec();
+            return Ok(Some(self.rows_for_rids(&rids, snapshot)?.len() as u64));
+        }
         let mut sets = Vec::with_capacity(conditions.len());
         for condition in conditions {
             sets.push(self.resolve_condition(condition, snapshot)?);

@@ -49,6 +49,8 @@ fn status_for_error(e: &mongreldb_core::MongrelError) -> StatusCode {
         }
         MongrelError::AuthNotRequired => StatusCode::BAD_REQUEST,
         MongrelError::PermissionDenied { .. } => StatusCode::FORBIDDEN,
+        MongrelError::InvalidArgument(_) => StatusCode::CONFLICT,
+        MongrelError::Conflict(_) => StatusCode::CONFLICT,
         MongrelError::ReadOnlyReplica => StatusCode::CONFLICT,
         MongrelError::NotFound(_) => StatusCode::NOT_FOUND,
         _ => StatusCode::INTERNAL_SERVER_ERROR,

@@ -3,7 +3,7 @@
 //! These tests verify the exact method, path, request body, and response shape
 //! the client sends for the frozen `/history/retention` contract.
 
-use mongreldb_client::{ClientError, MongrelClient};
+use mongreldb_client::{ClientError, KitSetSimilarityRequest, MongrelClient};
 use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -129,4 +129,43 @@ async fn put_propagates_non_2xx_as_http_error() {
         ClientError::Http { status, .. } => assert_eq!(status, 400),
         other => panic!("expected HTTP error, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn kit_set_similarity_sends_every_golden_member_shape() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/kit/set_similarity"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "hits": [{
+                "row_id": "1",
+                "estimated_jaccard": 1.0,
+                "exact_jaccard": 1.0
+            }]
+        })))
+        .expect(6)
+        .mount(&server)
+        .await;
+    let fixtures: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+        "../../../docs/ai/minhash-v1-golden.json"
+    ))
+    .unwrap();
+    let uri = server.uri();
+    tokio::task::spawn_blocking(move || {
+        let client = MongrelClient::new(&uri);
+        for fixture in fixtures {
+            client
+                .kit_set_similarity(&KitSetSimilarityRequest {
+                    table: "docs".into(),
+                    column_id: 2,
+                    members: vec![fixture["member"].clone()],
+                    candidate_k: 10,
+                    min_jaccard: 1.0,
+                    limit: 1,
+                })
+                .unwrap();
+        }
+    })
+    .await
+    .unwrap();
 }

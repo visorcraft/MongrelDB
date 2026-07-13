@@ -13,3 +13,5 @@
 - Index options are backward compatible when absent. Existing defaults remain
   ANN 16/64/64 with binary-sign quantization, MinHash 128/32, and learned-range
   epsilon 16.
+- Clean release qualification logs and the 100k AI benchmark are uploaded by
+  the [CI qualification job](https://github.com/visorcraft/MongrelDB/actions/workflows/ci.yml).

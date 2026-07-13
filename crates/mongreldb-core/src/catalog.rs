@@ -104,6 +104,9 @@ pub struct Catalog {
     pub materialized_views: Vec<MaterializedViewEntry>,
     #[serde(default)]
     pub security: crate::security::SecurityCatalog,
+    /// Monotonic version for optimistic authorization snapshots.
+    #[serde(default)]
+    pub security_version: u64,
     /// Catalog-level user accounts (Argon2id-hashed credentials).
     #[serde(default)]
     pub users: Vec<crate::auth::UserEntry>,

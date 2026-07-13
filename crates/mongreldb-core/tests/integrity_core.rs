@@ -119,7 +119,7 @@ fn uncommitted_rows_are_invisible() {
     let dir = tempdir().unwrap();
     let mut t = Table::create(dir.path(), base_schema(), 1).unwrap();
     put2(&mut t, 1, 10);
-    assert_eq!(t.count(), 1, "live_count tracks uncommitted puts");
+    assert_eq!(t.count(), 0, "uncommitted row must not affect count");
     assert_eq!(
         snapshot_row_ids(&t).len(),
         0,
@@ -127,6 +127,7 @@ fn uncommitted_rows_are_invisible() {
     );
 
     t.commit().unwrap();
+    assert_eq!(t.count(), 1, "committed row affects count");
     assert_eq!(snapshot_row_ids(&t).len(), 1, "committed row visible");
 }
 

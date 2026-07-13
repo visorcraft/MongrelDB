@@ -95,8 +95,9 @@ pub use schema::{
 
 // Query builder.
 pub use query::{
-    mongreldb_query_add, mongreldb_query_begin, mongreldb_query_build, mongreldb_query_free,
-    mongreldb_query_set_limit, mongreldb_query_set_projection,
+    mongreldb_minhash_member_hash_v1_json, mongreldb_query_add, mongreldb_query_begin,
+    mongreldb_query_build, mongreldb_query_free, mongreldb_query_set_limit,
+    mongreldb_query_set_projection,
 };
 
 // Table ops + result iteration.

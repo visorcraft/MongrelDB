@@ -347,6 +347,16 @@ pub struct CheckIssue {
     pub description: String,
 }
 
+/// One optimistic authorization snapshot for a complete scored read.
+#[derive(Debug, Clone)]
+pub struct AuthorizedReadSnapshot {
+    pub table_snapshot: Snapshot,
+    pub security_version: u64,
+    pub allowed_row_ids: Option<HashSet<RowId>>,
+}
+
+type RlsCache = HashMap<(String, u64, u64, String), HashSet<RowId>>;
+
 /// A handle to a live table inside a [`Database`]. Writes take the inner lock
 /// (P1); P3.3 replaces this with lock-free `ArcSwap` reads + a publish lock for
 /// writes.
@@ -392,6 +402,7 @@ pub struct Database {
     /// Set by `_meta/replica`; user writes are rejected on follower copies.
     read_only: bool,
     catalog: RwLock<Catalog>,
+    rls_cache: Mutex<RlsCache>,
     epoch: Arc<EpochAuthority>,
     snapshots: Arc<SnapshotRegistry>,
     page_cache: Arc<crate::cache::Sharded<crate::cache::PageCache>>,
@@ -1221,6 +1232,7 @@ impl Database {
             root,
             read_only,
             catalog: RwLock::new(cat),
+            rls_cache: Mutex::new(HashMap::new()),
             epoch,
             snapshots,
             page_cache,
@@ -1336,6 +1348,7 @@ impl Database {
         {
             let mut catalog = self.catalog.write();
             catalog.security = security;
+            catalog.security_version = catalog.security_version.wrapping_add(1);
             catalog.db_epoch = catalog.db_epoch.max(epoch.0);
         }
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
@@ -1543,21 +1556,84 @@ impl Database {
         table: &str,
         principal: Option<&crate::auth::Principal>,
     ) -> Result<Option<std::collections::HashSet<RowId>>> {
-        if !self.catalog.read().security.rls_enabled(table) {
-            return Ok(None);
-        }
-        // ponytail: full RLS universe scan; replace with policy-column candidate checks if RLS search throughput matters.
-        let handle = self.table(table)?;
-        let rows = {
-            let table = handle.lock();
-            table.visible_rows(table.snapshot())?
+        Ok(self
+            .authorized_read_snapshot(table, principal)?
+            .allowed_row_ids)
+    }
+
+    /// Capture one table snapshot and the security version used to authorize it.
+    /// The caller must validate the returned version before publishing results.
+    pub fn authorized_read_snapshot(
+        &self,
+        table: &str,
+        principal: Option<&crate::auth::Principal>,
+    ) -> Result<AuthorizedReadSnapshot> {
+        let (security, security_version) = {
+            let catalog = self.catalog.read();
+            (catalog.security.clone(), catalog.security_version)
         };
-        Ok(Some(
-            self.secure_rows_for(table, rows, principal)?
+        let handle = self.table(table)?;
+        let table_snapshot = {
+            let table = handle.lock();
+            table.snapshot()
+        };
+        let allowed_row_ids = if security.rls_enabled(table) {
+            // ponytail: full RLS universe scan; replace with policy-column candidate checks if RLS search throughput matters.
+            let cached = self.principal.read().clone();
+            let principal = principal
+                .or(cached.as_ref())
+                .ok_or(MongrelError::AuthRequired)?;
+            let mut roles = principal.roles.clone();
+            roles.sort_unstable();
+            let principal_key = format!("{}:{}:{roles:?}", principal.username, principal.is_admin);
+            let cache_key = (
+                table.to_string(),
+                table_snapshot.epoch.0,
+                security_version,
+                principal_key,
+            );
+            if let Some(allowed) = self.rls_cache.lock().get(&cache_key).cloned() {
+                return Ok(AuthorizedReadSnapshot {
+                    table_snapshot,
+                    security_version,
+                    allowed_row_ids: Some(allowed),
+                });
+            }
+            let rows = {
+                let table = handle.lock();
+                table.visible_rows(table_snapshot)?
+            };
+            let allowed: HashSet<_> = rows
                 .into_iter()
+                .filter(|row| {
+                    security.row_allowed(
+                        table,
+                        crate::security::PolicyCommand::Select,
+                        row,
+                        principal,
+                        false,
+                    )
+                })
                 .map(|row| row.row_id)
-                .collect(),
-        ))
+                .collect();
+            let mut cache = self.rls_cache.lock();
+            if cache.len() >= 1024 {
+                cache.clear();
+            }
+            cache.insert(cache_key, allowed.clone());
+            Some(allowed)
+        } else {
+            None
+        };
+        Ok(AuthorizedReadSnapshot {
+            table_snapshot,
+            security_version,
+            allowed_row_ids,
+        })
+    }
+
+    pub fn authorized_read_snapshot_valid(&self, snapshot: &AuthorizedReadSnapshot) -> bool {
+        self.catalog.read().security_version == snapshot.security_version
     }
 
     /// Read visible rows with column authorization, RLS, and masks applied.
@@ -2220,6 +2296,7 @@ impl Database {
                 created_epoch: epoch.0,
             };
             cat.users.push(entry.clone());
+            cat.security_version = cat.security_version.wrapping_add(1);
             cat.db_epoch = epoch.0;
             entry
         };
@@ -2243,6 +2320,7 @@ impl Database {
                     "user {username:?} not found"
                 )));
             }
+            cat.security_version = cat.security_version.wrapping_add(1);
             cat.db_epoch = epoch.0;
         }
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
@@ -2265,6 +2343,7 @@ impl Database {
                 .find(|u| u.username == username)
                 .ok_or_else(|| MongrelError::NotFound(format!("user {username:?} not found")))?;
             user.password_hash = hash;
+            cat.security_version = cat.security_version.wrapping_add(1);
             cat.db_epoch = epoch.0;
         }
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
@@ -2309,6 +2388,7 @@ impl Database {
                 .find(|u| u.username == username)
                 .ok_or_else(|| MongrelError::NotFound(format!("user {username:?} not found")))?;
             user.is_admin = is_admin;
+            cat.security_version = cat.security_version.wrapping_add(1);
             cat.db_epoch = epoch.0;
         }
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
@@ -2335,6 +2415,7 @@ impl Database {
                 created_epoch: epoch.0,
             };
             cat.roles.push(entry.clone());
+            cat.security_version = cat.security_version.wrapping_add(1);
             cat.db_epoch = epoch.0;
             entry
         };
@@ -2360,6 +2441,7 @@ impl Database {
             for user in &mut cat.users {
                 user.roles.retain(|r| r != name);
             }
+            cat.security_version = cat.security_version.wrapping_add(1);
             cat.db_epoch = epoch.0;
         }
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
@@ -2388,6 +2470,7 @@ impl Database {
             if !user.roles.contains(&role_name.to_string()) {
                 user.roles.push(role_name.into());
             }
+            cat.security_version = cat.security_version.wrapping_add(1);
             cat.db_epoch = epoch.0;
         }
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
@@ -2409,6 +2492,7 @@ impl Database {
                 .find(|u| u.username == username)
                 .ok_or_else(|| MongrelError::NotFound(format!("user {username:?} not found")))?;
             user.roles.retain(|r| r != role_name);
+            cat.security_version = cat.security_version.wrapping_add(1);
             cat.db_epoch = epoch.0;
         }
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
@@ -2434,6 +2518,7 @@ impl Database {
                 .find(|r| r.name == role_name)
                 .ok_or_else(|| MongrelError::NotFound(format!("role {role_name:?} not found")))?;
             merge_permission(&mut role.permissions, permission);
+            cat.security_version = cat.security_version.wrapping_add(1);
             cat.db_epoch = epoch.0;
         }
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
@@ -2459,6 +2544,7 @@ impl Database {
                 .find(|r| r.name == role_name)
                 .ok_or_else(|| MongrelError::NotFound(format!("role {role_name:?} not found")))?;
             revoke_permission_from(&mut role.permissions, &permission);
+            cat.security_version = cat.security_version.wrapping_add(1);
             cat.db_epoch = epoch.0;
         }
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
@@ -2610,6 +2696,7 @@ impl Database {
                 created_epoch: epoch.0,
             });
             cat.require_auth = true;
+            cat.security_version = cat.security_version.wrapping_add(1);
             cat.db_epoch = epoch.0;
         }
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
@@ -2654,6 +2741,7 @@ impl Database {
                 ));
             }
             cat.require_auth = false;
+            cat.security_version = cat.security_version.wrapping_add(1);
             cat.db_epoch = epoch.0;
         }
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
@@ -5947,6 +6035,7 @@ impl Database {
                 role.permissions
                     .retain(|permission| permission_table(permission) != Some(name));
             }
+            cat.security_version = cat.security_version.wrapping_add(1);
         }
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
         self.tables.write().remove(&table_id);
@@ -6069,6 +6158,7 @@ impl Database {
                     rename_permission_table(permission, name, new_name);
                 }
             }
+            cat.security_version = cat.security_version.wrapping_add(1);
         }
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
         // The in-memory table object is keyed by table_id, not name, so it does
@@ -6228,6 +6318,7 @@ impl Database {
                         );
                     }
                 }
+                cat.security_version = cat.security_version.wrapping_add(1);
             }
         }
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
@@ -7952,6 +8043,7 @@ fn recover_ddl_from_wal(
                         role.permissions
                             .retain(|permission| permission_table(permission) != Some(&name));
                     }
+                    cat.security_version = cat.security_version.wrapping_add(1);
                 }
             }
             Op::Ddl(DdlOp::RenameTable {
@@ -7994,6 +8086,7 @@ fn recover_ddl_from_wal(
                             rename_permission_table(permission, &old_name, new_name);
                         }
                     }
+                    cat.security_version = cat.security_version.wrapping_add(1);
                 }
                 // If the entry is absent, its CreateTable was already
                 // checkpointed carrying the post-rename name, so there is
@@ -8032,6 +8125,7 @@ fn recover_ddl_from_wal(
                             rename_permission_column(permission, &table, &old_name, &new_name);
                         }
                     }
+                    cat.security_version = cat.security_version.wrapping_add(1);
                 }
             }
             Op::Ddl(DdlOp::SetTtl {
@@ -8103,6 +8197,7 @@ fn recover_ddl_from_wal(
                 validate_security_catalog(cat, &security)?;
                 if cat.security != security {
                     cat.security = security;
+                    cat.security_version = cat.security_version.wrapping_add(1);
                     changed = true;
                 }
             }

@@ -396,6 +396,7 @@ int32_t mongreldb_table_delete(mongreldb_table_t *t, uint64_t row_id);
 
 /* ── Query builder ──────────────────────────────────────────────────────── */
 
+int32_t mongreldb_minhash_member_hash_v1_json(const char *member, uint64_t *out_hash);
 mongreldb_query_t *mongreldb_query_begin(void);
 int32_t mongreldb_query_add(
     mongreldb_query_t *q, const mongreldb_condition *cond);

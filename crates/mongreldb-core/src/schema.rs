@@ -512,42 +512,21 @@ impl Schema {
             let Some(column) = self.columns.iter().find(|column| column.id == *column_id) else {
                 return Err(MongrelError::ColumnNotFound(column_id.to_string()));
             };
-            if let TypeId::Embedding { dim } = &column.ty {
-                let Value::Embedding(values) = value else {
-                    if matches!(value, Value::Null) {
-                        continue;
-                    }
-                    return Err(MongrelError::InvalidArgument(format!(
-                        "embedding column '{}' requires an embedding value",
-                        column.name
-                    )));
-                };
-                if values.len() != *dim as usize {
-                    return Err(MongrelError::InvalidArgument(format!(
-                        "embedding column '{}' dimension must be {}, got {}",
-                        column.name,
-                        dim,
-                        values.len()
-                    )));
-                }
-                if values.iter().any(|value| !value.is_finite()) {
-                    return Err(MongrelError::InvalidArgument(format!(
-                        "embedding column '{}' values must be finite",
-                        column.name
-                    )));
-                }
-            }
-            if let Value::Bytes(bytes) = value {
-                match self
-                    .indexes
-                    .iter()
-                    .find(|index| {
-                        index.column_id == *column_id
-                            && matches!(index.kind, IndexKind::Sparse | IndexKind::MinHash)
-                    })
-                    .map(|index| index.kind)
-                {
-                    Some(IndexKind::Sparse) => {
+            let representation = self
+                .indexes
+                .iter()
+                .find(|index| {
+                    index.column_id == *column_id
+                        && matches!(
+                            index.kind,
+                            IndexKind::Sparse | IndexKind::MinHash | IndexKind::FmIndex
+                        )
+                })
+                .map(|index| index.kind);
+            match representation {
+                Some(IndexKind::Sparse) => match value {
+                    Value::Null if column.flags.contains(ColumnFlags::NULLABLE) => {}
+                    Value::Bytes(bytes) => {
                         let terms: Vec<(u32, f32)> = bincode::deserialize(bytes).map_err(|_| {
                             MongrelError::InvalidArgument(format!(
                                 "sparse column '{}' requires an encoded sparse vector",
@@ -561,7 +540,16 @@ impl Schema {
                             )));
                         }
                     }
-                    Some(IndexKind::MinHash) => {
+                    _ => {
+                        return Err(MongrelError::InvalidArgument(format!(
+                            "sparse column '{}' requires bytes or NULL",
+                            column.name
+                        )));
+                    }
+                },
+                Some(IndexKind::MinHash) => match value {
+                    Value::Null if column.flags.contains(ColumnFlags::NULLABLE) => {}
+                    Value::Bytes(bytes) => {
                         let members: serde_json::Value =
                             serde_json::from_slice(bytes).map_err(|_| {
                                 MongrelError::InvalidArgument(format!(
@@ -589,7 +577,48 @@ impl Schema {
                             )));
                         }
                     }
-                    _ => {}
+                    _ => {
+                        return Err(MongrelError::InvalidArgument(format!(
+                            "MinHash column '{}' requires bytes or NULL",
+                            column.name
+                        )));
+                    }
+                },
+                Some(IndexKind::FmIndex) => match value {
+                    Value::Null if column.flags.contains(ColumnFlags::NULLABLE) => {}
+                    Value::Bytes(_) => {}
+                    _ => {
+                        return Err(MongrelError::InvalidArgument(format!(
+                            "FM text column '{}' requires bytes or NULL",
+                            column.name
+                        )));
+                    }
+                },
+                _ => {}
+            }
+            if let TypeId::Embedding { dim } = &column.ty {
+                let Value::Embedding(values) = value else {
+                    if matches!(value, Value::Null) {
+                        continue;
+                    }
+                    return Err(MongrelError::InvalidArgument(format!(
+                        "embedding column '{}' requires an embedding value",
+                        column.name
+                    )));
+                };
+                if values.len() != *dim as usize {
+                    return Err(MongrelError::InvalidArgument(format!(
+                        "embedding column '{}' dimension must be {}, got {}",
+                        column.name,
+                        dim,
+                        values.len()
+                    )));
+                }
+                if values.iter().any(|value| !value.is_finite()) {
+                    return Err(MongrelError::InvalidArgument(format!(
+                        "embedding column '{}' values must be finite",
+                        column.name
+                    )));
                 }
             }
         }

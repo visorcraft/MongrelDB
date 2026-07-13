@@ -1,12 +1,14 @@
 //! Manual/nightly AI retrieval characterization. No wall-clock assertions.
 
 use mongreldb_core::query::{
-    Condition, Fusion, NamedRetriever, Retriever, RetrieverScore, SearchRequest, SetMember,
-    SetSimilarityRequest,
+    AnnRerankRequest, Condition, Fusion, NamedRetriever, Retriever, RetrieverScore, SearchRequest,
+    SetMember, SetSimilarityRequest, VectorMetric,
 };
-use mongreldb_core::schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
+use mongreldb_core::schema::{
+    AnnOptions, ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId,
+};
 use mongreldb_core::{Table, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 const DIM: usize = 64;
@@ -105,17 +107,32 @@ fn recall(got: impl Iterator<Item = u64>, truth: &HashSet<u64>, k: usize) -> f64
     got.take(k).filter(|row_id| truth.contains(row_id)).count() as f64 / k as f64
 }
 
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
 fn main() {
-    let rows = std::env::var("MONGRELDB_AI_BENCH_ROWS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(100_000usize);
-    let queries = std::env::var("MONGRELDB_AI_BENCH_QUERIES")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(50usize);
+    let rows = env_usize("MONGRELDB_AI_BENCH_ROWS", 100_000);
+    let queries = env_usize("MONGRELDB_AI_BENCH_QUERIES", 50);
+    let ann_options = AnnOptions {
+        m: env_usize("MONGRELDB_AI_ANN_M", 16),
+        ef_construction: env_usize("MONGRELDB_AI_ANN_EF_CONSTRUCTION", 64),
+        ef_search: env_usize("MONGRELDB_AI_ANN_EF_SEARCH", 64),
+        ..Default::default()
+    };
+    let mut benchmark_schema = schema();
+    benchmark_schema
+        .indexes
+        .iter_mut()
+        .find(|index| index.kind == IndexKind::Ann)
+        .unwrap()
+        .options
+        .ann = Some(ann_options.clone());
     let dir = tempfile::tempdir().unwrap();
-    let mut table = Table::create(dir.path(), schema(), 1).unwrap();
+    let mut table = Table::create(dir.path(), benchmark_schema, 1).unwrap();
     let build_started = Instant::now();
     for id in 0..rows {
         table
@@ -174,6 +191,11 @@ fn main() {
     let mut hybrid_us = Vec::new();
     let mut graph_recall = 0.0;
     let mut cosine_recall = 0.0;
+    let rerank_candidates = [10usize, 50, 100, 200];
+    let mut rerank_us: HashMap<usize, Vec<u128>> =
+        rerank_candidates.iter().map(|k| (*k, Vec::new())).collect();
+    let mut rerank_recall: HashMap<usize, f64> =
+        rerank_candidates.iter().map(|k| (*k, 0.0)).collect();
     let mut minhash_candidate_recall = 0.0;
     let mut minhash_candidate_count = 0usize;
     let mut minhash_error = 0.0f64;
@@ -237,6 +259,24 @@ fn main() {
             .map(|(_, id)| id)
             .collect();
         cosine_recall += recall(ann_hits.iter().map(|hit| hit.row_id.0), &cosine_truth, 10);
+        for candidate_k in rerank_candidates {
+            let started = Instant::now();
+            let hits = table
+                .ann_rerank(&AnnRerankRequest {
+                    column_id: 3,
+                    query: vector.clone(),
+                    candidate_k,
+                    limit: 10,
+                    metric: VectorMetric::Cosine,
+                })
+                .unwrap();
+            rerank_us
+                .get_mut(&candidate_k)
+                .unwrap()
+                .push(started.elapsed().as_micros());
+            *rerank_recall.get_mut(&candidate_k).unwrap() +=
+                recall(hits.iter().map(|hit| hit.row_id.0), &cosine_truth, 10);
+        }
 
         let sparse_retriever = Retriever::Sparse {
             column_id: 4,
@@ -361,6 +401,20 @@ fn main() {
         .output()
         .ok()
         .is_some_and(|output| !output.stdout.is_empty());
+    let ann_rerank: Vec<_> = rerank_candidates
+        .into_iter()
+        .map(|candidate_k| {
+            let times = rerank_us.get_mut(&candidate_k).unwrap();
+            serde_json::json!({
+                "candidate_k": candidate_k,
+                "final_k": 10,
+                "hamming_recall_at_10": graph_recall / queries as f64,
+                "cosine_recall_at_10": rerank_recall[&candidate_k] / queries as f64,
+                "p50_us": percentile(times, 0.50),
+                "p95_us": percentile(times, 0.95),
+            })
+        })
+        .collect();
     let rustc = std::process::Command::new("rustc")
         .arg("--version")
         .output()
@@ -385,7 +439,7 @@ fn main() {
             "base_table_bytes": base_table_bytes,
             "base_table_bytes_per_row": base_table_bytes as f64 / rows as f64,
             "index_payloads": index_payloads,
-            "ann": {"p50_us": percentile(&mut ann_us, 0.50), "p95_us": percentile(&mut ann_us, 0.95), "hamming_recall_at_10": graph_recall / queries as f64, "cosine_recall_at_10": cosine_recall / queries as f64},
+            "ann": {"options": ann_options, "p50_us": percentile(&mut ann_us, 0.50), "p95_us": percentile(&mut ann_us, 0.95), "hamming_recall_at_10": graph_recall / queries as f64, "cosine_recall_at_10": cosine_recall / queries as f64, "exact_rerank": ann_rerank},
             "sparse": {"p50_us": percentile(&mut sparse_us, 0.50), "p95_us": percentile(&mut sparse_us, 0.95), "average_postings_visited": sparse_postings_visited as f64 / queries as f64},
             "minhash": {"p50_us": percentile(&mut minhash_us, 0.50), "p95_us": percentile(&mut minhash_us, 0.95), "verification_p50_us": percentile(&mut minhash_verify_us, 0.50), "verification_p95_us": percentile(&mut minhash_verify_us, 0.95), "verification_gather_p50_us": percentile(&mut minhash_verify_gather_us, 0.50), "verification_gather_p95_us": percentile(&mut minhash_verify_gather_us, 0.95), "verification_parse_p50_us": percentile(&mut minhash_verify_parse_us, 0.50), "verification_parse_p95_us": percentile(&mut minhash_verify_parse_us, 0.95), "verification_score_p50_us": percentile(&mut minhash_verify_score_us, 0.50), "verification_score_p95_us": percentile(&mut minhash_verify_score_us, 0.95), "candidate_recall_at_10": minhash_candidate_recall / queries as f64, "average_candidates": minhash_candidate_count as f64 / queries as f64, "estimated_exact_mean_absolute_error": minhash_error / minhash_error_samples.max(1) as f64},
             "hybrid": {"p50_us": percentile(&mut hybrid_us, 0.50), "p95_us": percentile(&mut hybrid_us, 0.95), "average_union_size": hybrid_union_size as f64 / queries as f64},

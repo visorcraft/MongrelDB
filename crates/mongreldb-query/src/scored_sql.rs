@@ -12,7 +12,7 @@ use mongreldb_core::query::{
 };
 use mongreldb_core::{Database, Principal, Schema, Table, TypeId, Value};
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -321,34 +321,29 @@ impl TableFunctionImpl for ScoredFunction {
                 .map_err(|error| DataFusionError::Plan(error.to_string()))?;
         }
         let retriever = parse_retriever(self.kind, column_id, &query, k)?;
-        let allowed = self
-            .database
-            .as_ref()
-            .map(|database| {
-                database.authorized_candidate_ids_for(&table_name, self.principal.as_ref())
-            })
-            .transpose()
-            .map_err(|error| DataFusionError::Execution(error.to_string()))?
-            .flatten();
-        let (hits, rows) = {
-            let mut table = handle.lock();
-            let hits = table
-                .retrieve_with_allowed(&retriever, allowed.as_ref())
-                .map_err(|error| DataFusionError::Execution(error.to_string()))?;
-            let row_ids: Vec<_> = hits.iter().map(|hit| hit.row_id.0).collect();
-            let snapshot = table.snapshot();
-            let rows = table
-                .rows_for_rids(&row_ids, snapshot)
-                .map_err(|error| DataFusionError::Execution(error.to_string()))?;
-            (hits, rows)
-        };
-        let rows = if let Some(database) = &self.database {
-            database
-                .secure_rows_for(&table_name, rows, self.principal.as_ref())
-                .map_err(|error| DataFusionError::Execution(error.to_string()))?
-        } else {
-            rows
-        };
+        let database = self.database.clone();
+        let principal = self.principal.clone();
+        let (hits, rows) = self.retry_authorized(&table_name, |snapshot, allowed| {
+            let (hits, rows) = {
+                let mut table = handle.lock();
+                let hits = table
+                    .retrieve_at(&retriever, snapshot, allowed)
+                    .map_err(|error| DataFusionError::Execution(error.to_string()))?;
+                let row_ids: Vec<_> = hits.iter().map(|hit| hit.row_id.0).collect();
+                let rows = table
+                    .rows_for_rids(&row_ids, snapshot)
+                    .map_err(|error| DataFusionError::Execution(error.to_string()))?;
+                (hits, rows)
+            };
+            if let Some(database) = &database {
+                database
+                    .secure_rows_for(&table_name, rows, principal.as_ref())
+                    .map_err(|error| DataFusionError::Execution(error.to_string()))
+                    .map(|rows| (hits, rows))
+            } else {
+                Ok((hits, rows))
+            }
+        })?;
         let scores: HashMap<_, _> = hits
             .into_iter()
             .map(|hit| (hit.row_id, (hit.rank, hit.score)))
@@ -433,6 +428,38 @@ impl TableFunctionImpl for ScoredFunction {
 }
 
 impl ScoredFunction {
+    fn retry_authorized<T, F>(&self, table_name: &str, mut read: F) -> DFResult<T>
+    where
+        F: FnMut(mongreldb_core::Snapshot, Option<&HashSet<mongreldb_core::RowId>>) -> DFResult<T>,
+    {
+        const RETRIES: usize = 3;
+        let Some(database) = &self.database else {
+            let handle = self
+                .tables
+                .lock()
+                .get(table_name)
+                .cloned()
+                .ok_or_else(|| DataFusionError::Plan(format!("unknown table: {table_name}")))?;
+            let snapshot = handle.lock().snapshot();
+            return read(snapshot, None);
+        };
+        for attempt in 0..RETRIES {
+            let snapshot = database
+                .authorized_read_snapshot(table_name, self.principal.as_ref())
+                .map_err(|error| DataFusionError::Execution(error.to_string()))?;
+            let result = read(snapshot.table_snapshot, snapshot.allowed_row_ids.as_ref())?;
+            if database.authorized_read_snapshot_valid(&snapshot) {
+                return Ok(result);
+            }
+            if attempt + 1 == RETRIES {
+                return Err(DataFusionError::Execution(
+                    "security policy changed during scored read".into(),
+                ));
+            }
+        }
+        unreachable!()
+    }
+
     fn exact_set_provider(&self, args: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
         if args.len() != 7 {
             return Err(DataFusionError::Plan(
@@ -489,43 +516,36 @@ impl ScoredFunction {
                 )
                 .map_err(|error| DataFusionError::Plan(error.to_string()))?;
         }
-        let allowed = self
-            .database
-            .as_ref()
-            .map(|database| {
-                database.authorized_candidate_ids_for(&table_name, self.principal.as_ref())
-            })
-            .transpose()
-            .map_err(|error| DataFusionError::Execution(error.to_string()))?
-            .flatten();
-        let (hits, rows) = {
-            let mut table = handle.lock();
-            let hits = table
-                .set_similarity_with_allowed(
-                    &SetSimilarityRequest {
-                        column_id,
-                        members,
-                        candidate_k,
-                        min_jaccard,
-                        limit,
-                    },
-                    allowed.as_ref(),
-                )
-                .map_err(|error| DataFusionError::Execution(error.to_string()))?;
-            let row_ids: Vec<_> = hits.iter().map(|hit| hit.row_id.0).collect();
-            let snapshot = table.snapshot();
-            let rows = table
-                .rows_for_rids(&row_ids, snapshot)
-                .map_err(|error| DataFusionError::Execution(error.to_string()))?;
-            (hits, rows)
+        let request = SetSimilarityRequest {
+            column_id,
+            members,
+            candidate_k,
+            min_jaccard,
+            limit,
         };
-        let rows = if let Some(database) = &self.database {
-            database
-                .secure_rows_for(&table_name, rows, self.principal.as_ref())
-                .map_err(|error| DataFusionError::Execution(error.to_string()))?
-        } else {
-            rows
-        };
+        let database = self.database.clone();
+        let principal = self.principal.clone();
+        let (hits, rows) = self.retry_authorized(&table_name, |snapshot, allowed| {
+            let (hits, rows) = {
+                let mut table = handle.lock();
+                let hits = table
+                    .set_similarity_at(&request, snapshot, allowed)
+                    .map_err(|error| DataFusionError::Execution(error.to_string()))?;
+                let row_ids: Vec<_> = hits.iter().map(|hit| hit.row_id.0).collect();
+                let rows = table
+                    .rows_for_rids(&row_ids, snapshot)
+                    .map_err(|error| DataFusionError::Execution(error.to_string()))?;
+                (hits, rows)
+            };
+            if let Some(database) = &database {
+                database
+                    .secure_rows_for(&table_name, rows, principal.as_ref())
+                    .map_err(|error| DataFusionError::Execution(error.to_string()))
+                    .map(|rows| (hits, rows))
+            } else {
+                Ok((hits, rows))
+            }
+        })?;
         let scores: HashMap<_, _> = hits
             .into_iter()
             .enumerate()
@@ -637,45 +657,38 @@ impl ScoredFunction {
                 )
                 .map_err(|error| DataFusionError::Plan(error.to_string()))?;
         }
-        let allowed = self
-            .database
-            .as_ref()
-            .map(|database| {
-                database.authorized_candidate_ids_for(&table_name, self.principal.as_ref())
-            })
-            .transpose()
-            .map_err(|error| DataFusionError::Execution(error.to_string()))?
-            .flatten();
-        let (hits, rows) = {
-            let mut table = handle.lock();
-            let hits = table
-                .search_with_allowed(
-                    &SearchRequest {
-                        must,
-                        retrievers,
-                        fusion: Fusion::ReciprocalRank {
-                            constant: spec.rrf_constant,
-                        },
-                        limit: spec.limit,
-                        projection: Some(projection.clone()),
-                    },
-                    allowed.as_ref(),
-                )
-                .map_err(|error| DataFusionError::Execution(error.to_string()))?;
-            let row_ids: Vec<_> = hits.iter().map(|hit| hit.row_id.0).collect();
-            let snapshot = table.snapshot();
-            let rows = table
-                .rows_for_rids(&row_ids, snapshot)
-                .map_err(|error| DataFusionError::Execution(error.to_string()))?;
-            (hits, rows)
+        let request = SearchRequest {
+            must,
+            retrievers,
+            fusion: Fusion::ReciprocalRank {
+                constant: spec.rrf_constant,
+            },
+            limit: spec.limit,
+            projection: Some(projection.clone()),
         };
-        let rows = if let Some(database) = &self.database {
-            database
-                .secure_rows_for(&table_name, rows, self.principal.as_ref())
-                .map_err(|error| DataFusionError::Execution(error.to_string()))?
-        } else {
-            rows
-        };
+        let database = self.database.clone();
+        let principal = self.principal.clone();
+        let (hits, rows) = self.retry_authorized(&table_name, |snapshot, allowed| {
+            let (hits, rows) = {
+                let mut table = handle.lock();
+                let hits = table
+                    .search_at(&request, snapshot, allowed)
+                    .map_err(|error| DataFusionError::Execution(error.to_string()))?;
+                let row_ids: Vec<_> = hits.iter().map(|hit| hit.row_id.0).collect();
+                let rows = table
+                    .rows_for_rids(&row_ids, snapshot)
+                    .map_err(|error| DataFusionError::Execution(error.to_string()))?;
+                (hits, rows)
+            };
+            if let Some(database) = &database {
+                database
+                    .secure_rows_for(&table_name, rows, principal.as_ref())
+                    .map_err(|error| DataFusionError::Execution(error.to_string()))
+                    .map(|rows| (hits, rows))
+            } else {
+                Ok((hits, rows))
+            }
+        })?;
         let mut rows_by_id: HashMap<_, _> = rows.into_iter().map(|row| (row.row_id, row)).collect();
         let mut output_rows = Vec::new();
         let mut ranks = Vec::new();

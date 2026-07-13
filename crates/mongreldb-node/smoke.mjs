@@ -1,13 +1,40 @@
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
-const { Database, ConditionKind, ColumnType, ConflictError } = require('./index.js');
-import { mkdtempSync, rmSync } from 'node:fs';
+const { Database, ConditionKind, ColumnType, ConflictError, minhashMemberHashV1 } = require('./index.js');
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import assert from 'node:assert';
 
 function makeTempDir() {
   return mkdtempSync(join(tmpdir(), 'mongreldb-smoke-'));
+}
+
+const golden = JSON.parse(
+  readFileSync(new URL('../../docs/ai/minhash-v1-golden.json', import.meta.url), 'utf8'),
+);
+for (const fixture of golden) {
+  assert.equal(minhashMemberHashV1(JSON.stringify(fixture.member)), fixture.expected);
+}
+
+{
+  const dir = makeTempDir();
+  const database = Database.withPath(dir);
+  database.createTable('specialized', {
+    columns: [
+      { id: 1, name: 'id', ty: 1, primaryKey: true, nullable: false },
+      { id: 2, name: 'sparse', ty: 8, primaryKey: false, nullable: false },
+    ],
+    indexes: [{ name: 'sparse_idx', columnId: 2, kind: 3 }],
+  });
+  const table = database.getTable('specialized');
+  assert.throws(
+    () => table.put([{ columnId: 1, int64: 1n }, { columnId: 2, bytes: Buffer.from('bad') }]),
+    /requires an encoded sparse vector/,
+  );
+  assert.equal(table.count(), 0n);
+  database.close();
+  rmSync(dir, { recursive: true });
 }
 
 // ── Multi-table API ───────────────────────────────────────────────────────
@@ -26,7 +53,7 @@ const schemaA = {
 const schemaB = {
   columns: [
     { id: 1, name: 'id', ty: 1, primaryKey: true, nullable: false },
-    { id: 2, name: 'tag', ty: 5, primaryKey: false, nullable: false },
+    { id: 2, name: 'tag', ty: 8, primaryKey: false, nullable: false },
   ],
   indexes: [{ name: 'tag_idx', columnId: 2, kind: 0 }],
 };
@@ -395,7 +422,7 @@ console.log('smoke: full-range Int64 / BigInt ✓');
   // Text primary-key table.
   db9.createTable('text_pk', {
     columns: [
-      { id: 1, name: 'id', ty: 5, primaryKey: true, nullable: false },
+      { id: 1, name: 'id', ty: 8, primaryKey: true, nullable: false },
       { id: 2, name: 'v', ty: 1, primaryKey: false, nullable: false },
     ],
     indexes: [],
@@ -424,7 +451,7 @@ console.log('smoke: full-range Int64 / BigInt ✓');
   db9.createTable('int64_pk', {
     columns: [
       { id: 1, name: 'id', ty: 1, primaryKey: true, nullable: false },
-      { id: 2, name: 'v', ty: 5, primaryKey: false, nullable: false },
+      { id: 2, name: 'v', ty: 8, primaryKey: false, nullable: false },
     ],
     indexes: [],
   });
@@ -687,7 +714,7 @@ console.log('smoke: BigInt range validation ✓');
   ai.createTable('things', {
     columns: [
       { id: 1, name: 'id', ty: 1, primaryKey: true, nullable: false, autoIncrement: true },
-      { id: 2, name: 'label', ty: 5, primaryKey: false, nullable: false },
+      { id: 2, name: 'label', ty: 8, primaryKey: false, nullable: false },
     ],
     indexes: [],
   });

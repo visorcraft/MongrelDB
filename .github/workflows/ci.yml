@@ -131,3 +131,79 @@ jobs:
         with:
           workspaces: crates/mongreldb-jni
       - run: cargo build --release
+
+  qualification:
+    name: Clean release qualification
+    runs-on: ubuntu-latest
+    env:
+      QUAL_DIR: /tmp/mongreldb-qualification
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - name: Capture source identity
+        run: |
+          mkdir -p "$QUAL_DIR"
+          git status --porcelain > "$QUAL_DIR/git-status.txt"
+          {
+            git rev-parse HEAD
+            rustc --version
+            cargo --version
+            node --version
+          } > "$QUAL_DIR/versions.txt"
+      - name: Root format
+        run: cargo fmt --check 2>&1 | tee "$QUAL_DIR/cargo-fmt.log"
+      - name: Root clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tee "$QUAL_DIR/cargo-clippy.log"
+      - name: Root tests
+        run: cargo test --workspace --all-features 2>&1 | tee "$QUAL_DIR/cargo-test.log"
+      - name: Server tests
+        run: |
+          cargo clippy --manifest-path crates/mongreldb-server/Cargo.toml --all-targets --all-features -- -D warnings 2>&1 | tee "$QUAL_DIR/server-clippy.log"
+          cargo test --manifest-path crates/mongreldb-server/Cargo.toml --all-targets --all-features 2>&1 | tee "$QUAL_DIR/server-test.log"
+      - name: Client checks
+        run: |
+          cargo clippy --manifest-path crates/mongreldb-client/Cargo.toml --all-targets --all-features -- -D warnings 2>&1 | tee "$QUAL_DIR/client-clippy.log"
+          cargo test --manifest-path crates/mongreldb-client/Cargo.toml --all-targets --all-features 2>&1 | tee "$QUAL_DIR/client-test.log"
+      - name: Node checks
+        working-directory: crates/mongreldb-node
+        run: |
+          npm ci 2>&1 | tee "$QUAL_DIR/node-ci.log"
+          npm run build 2>&1 | tee "$QUAL_DIR/node-build.log"
+          npm test 2>&1 | tee "$QUAL_DIR/node-test.log"
+          node smoke.mjs 2>&1 | tee "$QUAL_DIR/node-smoke.log"
+      - name: FFI checks
+        run: |
+          cargo build --manifest-path crates/mongreldb-ffi/Cargo.toml --release 2>&1 | tee "$QUAL_DIR/ffi-build.log"
+          cargo test --manifest-path crates/mongreldb-ffi/Cargo.toml --release 2>&1 | tee "$QUAL_DIR/ffi-test.log"
+          cargo build --manifest-path crates/mongreldb-kit-ffi/Cargo.toml --release 2>&1 | tee "$QUAL_DIR/kit-ffi-build.log"
+          cargo test --manifest-path crates/mongreldb-kit-ffi/Cargo.toml --release 2>&1 | tee "$QUAL_DIR/kit-ffi-test.log"
+          cargo build --manifest-path crates/mongreldb-jni/Cargo.toml --release 2>&1 | tee "$QUAL_DIR/jni-build.log"
+      - name: Python MinHash wire fixture
+        run: |
+          cargo run --manifest-path crates/mongreldb-server/Cargo.toml --release -- "$RUNNER_TEMP/mongreldb-ai-wire" --port 8080 > "$QUAL_DIR/ai-wire-server.log" 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid"' EXIT
+          for _ in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:8080/health >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          curl --fail --silent http://127.0.0.1:8080/health >/dev/null
+          PYTHONDONTWRITEBYTECODE=1 MONGRELDB_DB_PATH="$RUNNER_TEMP/mongreldb-ai-wire" python3 tools/ai-wire/demo_minhash.py 2>&1 | tee "$QUAL_DIR/ai-wire-minhash.log"
+      - name: AI benchmark
+        run: |
+          MONGRELDB_AI_BENCH_ROWS=100000 MONGRELDB_AI_BENCH_QUERIES=50 cargo run -p mongreldb-core --release --example ai_retrieval_bench > "$QUAL_DIR/ai-benchmark-100k.json" 2> "$QUAL_DIR/ai-benchmark-100k.log"
+          test -z "$(git status --porcelain)"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: mongreldb-clean-qualification-${{ github.sha }}
+          path: |
+            /tmp/mongreldb-qualification/

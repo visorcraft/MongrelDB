@@ -1772,3 +1772,114 @@ async fn sql_only_sparse_and_set_constructors_ingest() {
         .await
         .is_err());
 }
+
+#[tokio::test]
+async fn sql_ai_values_survive_update_reopen_and_compaction() {
+    let dir = tempdir().unwrap();
+    let database = std::sync::Arc::new(mongreldb_core::Database::create(dir.path()).unwrap());
+    let session = MongrelSession::open(std::sync::Arc::clone(&database)).unwrap();
+    for sql in [
+        "CREATE TABLE ai_lifecycle (id BIGINT PRIMARY KEY, sparse TEXT, members TEXT)",
+        "CREATE INDEX ai_sparse ON ai_lifecycle USING sparse (sparse)",
+        "CREATE INDEX ai_members ON ai_lifecycle USING minhash (members)",
+        "INSERT INTO ai_lifecycle VALUES (1, mongreldb_sparse_vector('[[7,1.5],[7,0.5]]'), mongreldb_set('[\"a\",\"b\"]')), (2, mongreldb_sparse_vector('[[7,1.0]]'), mongreldb_set('[\"b\",\"c\"]'))",
+    ] {
+        session.run(sql).await.unwrap();
+    }
+    assert_eq!(
+        session
+            .run("SELECT * FROM sparse_search_scored('ai_lifecycle','sparse','[[7,1.0]]',5,'id')")
+            .await
+            .unwrap()
+            .iter()
+            .map(|batch| batch.num_rows())
+            .sum::<usize>(),
+        2
+    );
+
+    session
+        .run("UPDATE ai_lifecycle SET sparse = mongreldb_sparse_vector('[[7,2.0]]'), members = mongreldb_set('[\"a\",\"b\",\"c\"]') WHERE id = 1")
+        .await
+        .unwrap();
+    assert_eq!(
+        session
+            .run("SELECT * FROM sparse_search_scored('ai_lifecycle','sparse','[[7,1.0]]',5,'id')")
+            .await
+            .unwrap()
+            .iter()
+            .map(|batch| batch.num_rows())
+            .sum::<usize>(),
+        2
+    );
+    assert!(session
+        .run("UPDATE ai_lifecycle SET sparse = mongreldb_set('[\"wrong\"]') WHERE id = 1")
+        .await
+        .is_err());
+    session
+        .run("DELETE FROM ai_lifecycle WHERE id = 2")
+        .await
+        .unwrap();
+    assert_eq!(
+        session
+            .run("SELECT * FROM set_similarity_scored('ai_lifecycle','members','[\"a\",\"b\",\"c\"]',10,0.0,5,'id')")
+            .await
+            .unwrap()
+            .iter()
+            .map(|batch| batch.num_rows())
+            .sum::<usize>(),
+        1
+    );
+
+    session
+        .run("PREPARE find_ai AS SELECT id FROM ai_lifecycle WHERE id = $1")
+        .await
+        .unwrap();
+    assert_eq!(
+        session.run("EXECUTE find_ai(1)").await.unwrap()[0].num_rows(),
+        1
+    );
+    session.run("BEGIN").await.unwrap();
+    session
+        .run("INSERT INTO ai_lifecycle VALUES (3, mongreldb_sparse_vector('[[99,99.0]]'), mongreldb_set('[\"rollback\"]'))")
+        .await
+        .unwrap();
+    session.run("ROLLBACK").await.unwrap();
+    assert_eq!(
+        session
+            .run("SELECT * FROM sparse_search_scored('ai_lifecycle','sparse','[[99,99.0]]',5,'id')")
+            .await
+            .unwrap()
+            .iter()
+            .map(|batch| batch.num_rows())
+            .sum::<usize>(),
+        0
+    );
+
+    database
+        .table("ai_lifecycle")
+        .unwrap()
+        .lock()
+        .force_flush()
+        .unwrap();
+    drop(session);
+    drop(database);
+
+    let reopened = std::sync::Arc::new(mongreldb_core::Database::open(dir.path()).unwrap());
+    reopened
+        .table("ai_lifecycle")
+        .unwrap()
+        .lock()
+        .compact()
+        .unwrap();
+    let reopened_session = MongrelSession::open(std::sync::Arc::clone(&reopened)).unwrap();
+    assert_eq!(
+        reopened_session
+            .run("SELECT * FROM sparse_search_scored('ai_lifecycle','sparse','[[7,1.0]]',5,'id')")
+            .await
+            .unwrap()
+            .iter()
+            .map(|batch| batch.num_rows())
+            .sum::<usize>(),
+        1
+    );
+}
