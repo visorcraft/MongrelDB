@@ -450,6 +450,57 @@ async fn kit_query_pk_range_and_projection() {
 }
 
 #[tokio::test]
+async fn kit_query_cursor_pins_snapshot_and_request() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    db.create_table("users", users_schema()).unwrap();
+    let app = build_app(Arc::clone(&db));
+    let seed = serde_json::json!({"ops": [
+        {"put": {"table": "users", "cells": [0, 1, 1, "a@x", 2, 30]}},
+        {"put": {"table": "users", "cells": [0, 2, 1, "b@x", 2, 40]}},
+        {"put": {"table": "users", "cells": [0, 3, 1, "c@x", 2, 50]}},
+    ]});
+    assert_eq!(post(app.clone(), "/kit/txn", seed).await.0, 200);
+
+    let first = serde_json::json!({"table": "users", "projection": [0], "limit": 2});
+    let (status, first) = post(app.clone(), "/kit/query", first).await;
+    assert_eq!(status, 200, "body: {first}");
+    assert_eq!(first["rows"].as_array().unwrap().len(), 2);
+    let cursor = first["next_cursor"].as_str().unwrap().to_string();
+
+    let insert = serde_json::json!({"ops": [
+        {"put": {"table": "users", "cells": [0, 4, 1, "d@x", 2, 60]}}
+    ]});
+    assert_eq!(post(app.clone(), "/kit/txn", insert).await.0, 200);
+
+    let second = serde_json::json!({
+        "table": "users",
+        "projection": [0],
+        "limit": 2,
+        "cursor": cursor,
+    });
+    let (status, second) = post(app.clone(), "/kit/query", second).await;
+    assert_eq!(status, 200, "body: {second}");
+    assert_eq!(second["rows"].as_array().unwrap().len(), 1);
+    assert!(second["rows"][0]["cells"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!(3)));
+    assert!(!second.to_string().contains("d@x"));
+    assert_eq!(second["next_cursor"], serde_json::Value::Null);
+
+    let mismatched = serde_json::json!({
+        "table": "users",
+        "projection": [0, 2],
+        "limit": 2,
+        "cursor": first["next_cursor"],
+    });
+    let (status, body) = post(app, "/kit/query", mismatched).await;
+    assert_eq!(status, 400);
+    assert_eq!(body["error"]["code"], "BAD_REQUEST");
+}
+
+#[tokio::test]
 async fn kit_create_table_self_services_constraints_over_http() {
     // A remote client provisions a constraint-bearing table entirely over HTTP
     // (no out-of-band create): unique + check + auto_increment, then exercises

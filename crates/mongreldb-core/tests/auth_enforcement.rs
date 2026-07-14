@@ -9,8 +9,8 @@ use mongreldb_core::auth::Permission;
 use mongreldb_core::{
     query::{AnnRerankRequest, Condition, Query, VectorMetric},
     schema::*,
-    ColumnMask, Database, MaskStrategy, MongrelError, PolicyCommand, RowPolicy, SecurityCatalog,
-    SecurityExpr, Value,
+    ColumnMask, ColumnOperation, Database, MaskStrategy, MongrelError, PolicyCommand,
+    ReadAuthorization, RowPolicy, SecurityCatalog, SecurityExpr, Value,
 };
 use tempfile::tempdir;
 
@@ -210,6 +210,120 @@ fn secure_native_wrappers_apply_rls_masks_and_live_revocation() {
         alice.query_for_current_principal("docs", &Query::new(), None),
         Err(MongrelError::PermissionDenied { .. })
     ));
+}
+
+#[test]
+fn scored_retry_rechecks_live_column_permissions() {
+    let dir = tempdir().unwrap();
+    let admin = Database::create_with_credentials(dir.path(), "admin", "admin-pw").unwrap();
+    admin.create_table("docs", int_pk_schema()).unwrap();
+    admin.create_user("alice", "alice-pw").unwrap();
+    admin.create_role("reader").unwrap();
+    admin
+        .grant_permission(
+            "reader",
+            Permission::SelectColumns {
+                table: "docs".into(),
+                columns: vec!["id".into()],
+            },
+        )
+        .unwrap();
+    admin.grant_role("alice", "reader").unwrap();
+    let alice = admin.resolve_principal("alice").unwrap();
+    let calls = std::cell::Cell::new(0);
+    let result = admin.with_authorized_scored_read_context_at(
+        "docs",
+        Some(&alice),
+        true,
+        Some(&ReadAuthorization {
+            operation: ColumnOperation::Select,
+            columns: vec![1],
+        }),
+        None,
+        None,
+        |_, _, _, principal| {
+            calls.set(calls.get() + 1);
+            assert_eq!(principal.unwrap().username, "alice");
+            admin.revoke_role("alice", "reader")?;
+            Ok(())
+        },
+    );
+    assert!(matches!(result, Err(MongrelError::PermissionDenied { .. })));
+    assert_eq!(calls.get(), 1);
+}
+
+#[test]
+fn authorized_retries_refresh_grants_and_dropped_users() {
+    let dir = tempdir().unwrap();
+    let admin = Database::create_with_credentials(dir.path(), "admin", "admin-pw").unwrap();
+    admin.create_table("docs", int_pk_schema()).unwrap();
+    admin.create_role("reader").unwrap();
+    admin
+        .grant_permission(
+            "reader",
+            Permission::SelectColumns {
+                table: "docs".into(),
+                columns: vec!["id".into()],
+            },
+        )
+        .unwrap();
+
+    admin.create_user("alice", "alice-pw").unwrap();
+    admin.grant_role("alice", "reader").unwrap();
+    let alice = admin.resolve_principal("alice").unwrap();
+    let calls = std::cell::Cell::new(0);
+    let value = admin
+        .with_authorized_read_context(
+            "docs",
+            Some(&alice),
+            true,
+            Some(&ReadAuthorization {
+                operation: ColumnOperation::Select,
+                columns: vec![1],
+            }),
+            None,
+            None,
+            |_, _, _, principal| {
+                calls.set(calls.get() + 1);
+                if calls.get() == 1 {
+                    admin.create_role("new_grant")?;
+                    admin.grant_role("alice", "new_grant")?;
+                } else {
+                    assert!(principal
+                        .unwrap()
+                        .roles
+                        .iter()
+                        .any(|role| role == "new_grant"));
+                }
+                Ok(7)
+            },
+        )
+        .unwrap();
+    assert_eq!(value, 7);
+    assert_eq!(calls.get(), 2);
+
+    admin.create_user("bob", "bob-pw").unwrap();
+    admin.grant_role("bob", "reader").unwrap();
+    let bob = admin.resolve_principal("bob").unwrap();
+    let calls = std::cell::Cell::new(0);
+    let result = admin.with_authorized_scored_read_context_at(
+        "docs",
+        Some(&bob),
+        true,
+        Some(&ReadAuthorization {
+            operation: ColumnOperation::Select,
+            columns: vec![1],
+        }),
+        None,
+        None,
+        |_, _, _, _| {
+            calls.set(calls.get() + 1);
+            admin.drop_user("bob")?;
+            Ok(())
+        },
+    );
+    assert!(matches!(result, Err(MongrelError::AuthRequired)));
+    assert_eq!(calls.get(), 1);
 }
 
 /// A credentialless database has `require_auth = false`, the `require()`
@@ -550,14 +664,7 @@ fn refresh_principal_picks_up_new_grant() {
     admin_db.grant_role("alice", "ddl_role").unwrap();
     drop(admin_db);
 
-    // alice's cached principal still lacks Ddl until refresh.
-    match db.create_table("still_no", int_pk_schema()) {
-        Err(MongrelError::PermissionDenied { .. }) => {}
-        other => panic!("expected PermissionDenied before refresh, got {other:?}"),
-    }
-
-    // After refresh, alice picks up the grant.
-    db.refresh_principal().unwrap();
+    // Existing handles refresh before enforcement and pick up the grant.
     db.create_table("now_yes", int_pk_schema()).unwrap();
 }
 

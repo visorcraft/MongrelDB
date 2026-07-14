@@ -8,14 +8,26 @@
 
 /// Hard safety ceilings shared by every public query surface.
 pub const MAX_FINAL_LIMIT: usize = 10_000;
+pub const MAX_QUERY_OFFSET: usize = 100_000;
 pub const MAX_RETRIEVER_K: usize = 100_000;
 pub const MAX_RETRIEVERS: usize = 32;
 pub const MAX_SPARSE_TERMS: usize = 65_536;
 pub const MAX_SET_MEMBERS: usize = 65_536;
+pub const MAX_SET_MEMBER_BYTES: usize = 1024 * 1024;
+pub const MAX_SET_INPUT_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_PROJECTION_COLUMNS: usize = 4_096;
 pub const MAX_HARD_CONDITIONS: usize = 256;
 pub const MAX_RETRIEVER_WEIGHT: f64 = 1_000_000.0;
 pub const MAX_FUSED_CANDIDATES: usize = 250_000;
+pub const MAX_RAW_INDEX_CANDIDATES: usize = 250_000;
+pub const MAX_RETRIEVER_NAME_BYTES: usize = 128;
+pub(crate) const VECTOR_WORK_QUANTUM: usize = 64;
+pub(crate) const HAMMING_WORK_QUANTUM: usize = 64;
+pub(crate) const PARSE_WORK_QUANTUM: usize = 64;
+
+pub(crate) fn work_units(items: usize, quantum: usize) -> usize {
+    items.div_ceil(quantum).max(1)
+}
 
 /// Cooperative deadline, cancellation, and work-budget state for expensive
 /// AI queries. Index loops call `checkpoint` and charge work with `consume`.
@@ -98,6 +110,11 @@ impl AiExecutionContext {
 
     pub fn work_limit(&self) -> usize {
         self.initial_work
+    }
+
+    pub fn remaining_duration(&self) -> Option<std::time::Duration> {
+        self.deadline
+            .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()))
     }
 
     pub fn query_time_nanos(&self) -> i64 {
@@ -226,6 +243,14 @@ pub enum SetMember {
 }
 
 impl SetMember {
+    pub(crate) fn encoded_len(&self) -> usize {
+        match self {
+            Self::String(value) => value.len(),
+            Self::Number(value) => value.to_string().len(),
+            Self::Boolean(_) => 1,
+        }
+    }
+
     pub fn hash_v1(&self) -> u64 {
         let value = match self {
             Self::String(value) => serde_json::Value::String(value.clone()),
@@ -310,6 +335,12 @@ pub struct SearchRequest {
     pub projection: Option<Vec<u16>>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct SearchAfter {
+    pub final_score: f64,
+    pub row_id: crate::RowId,
+}
+
 #[derive(Debug, Clone)]
 pub enum Rerank {
     ExactVector {
@@ -335,7 +366,7 @@ pub enum Fusion {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ComponentScore {
-    pub retriever_name: String,
+    pub retriever_name: std::sync::Arc<str>,
     pub rank: usize,
     pub raw_score: RetrieverScore,
     pub contribution: f64,

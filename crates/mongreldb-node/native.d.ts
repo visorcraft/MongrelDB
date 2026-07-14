@@ -462,10 +462,7 @@ export declare class Database {
 }
 /** A handle to one table inside a [`Database`]. */
 export declare class TableHandle {
-  /**
-   * Upsert one row. Returns the row id and, when the engine allocated it,
-   * the `AUTO_INCREMENT` value.
-   */
+  /** Durably insert one row. Returns its row id and optional auto-increment value. */
   put(cells: Array<Cell>): PutResult
   /** Group-commit this table's pending writes. */
   commit(): bigint
@@ -493,7 +490,7 @@ export declare class TableHandle {
   getByPkInt64(value: bigint): RowJs | null
   /** Delete a row by storage row id. */
   delete(rowId: bigint): void
-  /** Truncate all rows in this table. Call `commit()` to make it durable. */
+  /** Durably truncate all rows. RLS-secured tables reject truncate. */
   truncate(): void
   /** Delete the first row matching a text primary key. */
   deleteByPkText(text: string): void

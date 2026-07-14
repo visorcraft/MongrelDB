@@ -68,6 +68,7 @@ pub struct Transaction<'db> {
     external_states: Vec<(String, Vec<u8>)>,
     materialized_view_updates: Vec<crate::catalog::MaterializedViewEntry>,
     principal: Option<crate::auth::Principal>,
+    principal_catalog_bound: bool,
     external_trigger_bridge: Option<&'db dyn ExternalTriggerBridge>,
     _active: Option<ActiveTxnGuard<'db>>,
 }
@@ -83,6 +84,7 @@ impl<'db> Transaction<'db> {
             external_states: Vec::new(),
             materialized_view_updates: Vec::new(),
             principal: None,
+            principal_catalog_bound: false,
             external_trigger_bridge: None,
             _active: Some(guard),
         }
@@ -96,8 +98,13 @@ impl<'db> Transaction<'db> {
         self
     }
 
-    pub(crate) fn with_principal(mut self, principal: Option<crate::auth::Principal>) -> Self {
+    pub(crate) fn with_principal(
+        mut self,
+        principal: Option<crate::auth::Principal>,
+        catalog_bound: bool,
+    ) -> Self {
         self.principal = principal;
+        self.principal_catalog_bound = catalog_bound;
         self
     }
 
@@ -321,7 +328,8 @@ impl<'db> Transaction<'db> {
     }
 
     pub fn truncate(&mut self, table: &str) -> Result<()> {
-        self.require_delete(table)?;
+        self.db
+            .require_for(self.principal.as_ref(), &crate::auth::Permission::Admin)?;
         let id = self.db.table_id(table)?;
         for (table_id, op) in &self.staging {
             if *table_id == id && !matches!(op, Staged::Truncate) {
@@ -392,6 +400,21 @@ impl<'db> Transaction<'db> {
 
     /// Commit: durably seal the staging under one epoch and publish it.
     pub fn commit(self) -> Result<Epoch> {
+        self.db
+            .commit_transaction_with_external_states(
+                self.txn_id,
+                self.read.epoch,
+                self.staging,
+                self.external_states,
+                self.materialized_view_updates,
+                self.principal,
+                self.principal_catalog_bound,
+                self.external_trigger_bridge,
+            )
+            .map(|(epoch, _)| epoch)
+    }
+
+    pub fn commit_with_row_ids(self) -> Result<(Epoch, Vec<RowId>)> {
         self.db.commit_transaction_with_external_states(
             self.txn_id,
             self.read.epoch,
@@ -399,6 +422,7 @@ impl<'db> Transaction<'db> {
             self.external_states,
             self.materialized_view_updates,
             self.principal,
+            self.principal_catalog_bound,
             self.external_trigger_bridge,
         )
     }

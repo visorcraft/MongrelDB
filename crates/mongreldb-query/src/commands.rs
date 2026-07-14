@@ -1054,7 +1054,7 @@ fn attach_database(session: &MongrelSession, sql: &str) -> Result<Option<Vec<Rec
     let table_names = attached_db.table_names();
     for name in &table_names {
         let handle = attached_db.table(name)?;
-        let provider = MongrelProvider::new(handle.clone())?;
+        let provider = MongrelProvider::new_handle(handle.clone())?;
         // Register under a qualified name `{alias}_{name}` (using underscore,
         // not dot — DataFusion's `schema.table` resolution requires catalog
         // setup for dot-qualified names). This avoids collisions with tables
@@ -1066,7 +1066,7 @@ fn attach_database(session: &MongrelSession, sql: &str) -> Result<Option<Vec<Rec
             .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
         session.tables.lock().insert(qualified, handle);
         // Also register the bare name if no collision exists.
-        let bare_provider = MongrelProvider::new(attached_db.table(name)?)?;
+        let bare_provider = MongrelProvider::new_handle(attached_db.table(name)?)?;
         if session
             .ctx
             .register_table(name, Arc::new(bare_provider))

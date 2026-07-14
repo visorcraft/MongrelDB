@@ -447,10 +447,177 @@ impl RlsCache {
     }
 }
 
-/// A handle to a live table inside a [`Database`]. Writes take the inner lock
-/// (P1); P3.3 replaces this with lock-free `ArcSwap` reads + a publish lock for
-/// writes.
-pub type TableHandle = Arc<Mutex<Table>>;
+/// Copy-on-write mounted table. Scored reads clone the current `Arc<Table>`;
+/// writers replace it only while a read generation is alive.
+#[derive(Clone)]
+pub struct TableHandle(TableHandleInner);
+
+#[derive(Clone)]
+enum TableHandleInner {
+    CopyOnWrite(Arc<RwLock<Arc<Table>>>),
+    Direct(Arc<Mutex<Table>>),
+}
+
+pub enum TableGuard<'a> {
+    CopyOnWrite(parking_lot::RwLockWriteGuard<'a, Arc<Table>>),
+    Direct(parking_lot::MutexGuard<'a, Table>),
+}
+
+enum TableReadGuard<'a> {
+    CopyOnWrite(parking_lot::RwLockReadGuard<'a, Arc<Table>>),
+    Direct(parking_lot::MutexGuard<'a, Table>),
+}
+
+impl TableHandle {
+    fn new(table: Table) -> Self {
+        Self(TableHandleInner::CopyOnWrite(Arc::new(RwLock::new(
+            Arc::new(table),
+        ))))
+    }
+
+    pub fn from_table(table: Table) -> Self {
+        Self::new(table)
+    }
+
+    pub fn lock(&self) -> TableGuard<'_> {
+        match &self.0 {
+            TableHandleInner::CopyOnWrite(table) => TableGuard::CopyOnWrite(table.write()),
+            TableHandleInner::Direct(table) => TableGuard::Direct(table.lock()),
+        }
+    }
+
+    fn try_lock_for(&self, timeout: std::time::Duration) -> Option<TableGuard<'_>> {
+        match &self.0 {
+            TableHandleInner::CopyOnWrite(table) => {
+                table.try_write_for(timeout).map(TableGuard::CopyOnWrite)
+            }
+            TableHandleInner::Direct(table) => table.try_lock_for(timeout).map(TableGuard::Direct),
+        }
+    }
+
+    fn read(&self) -> TableReadGuard<'_> {
+        match &self.0 {
+            TableHandleInner::CopyOnWrite(table) => TableReadGuard::CopyOnWrite(table.read()),
+            TableHandleInner::Direct(table) => TableReadGuard::Direct(table.lock()),
+        }
+    }
+
+    fn try_read_for(&self, timeout: std::time::Duration) -> Option<TableReadGuard<'_>> {
+        match &self.0 {
+            TableHandleInner::CopyOnWrite(table) => {
+                table.try_read_for(timeout).map(TableReadGuard::CopyOnWrite)
+            }
+            TableHandleInner::Direct(table) => {
+                table.try_lock_for(timeout).map(TableReadGuard::Direct)
+            }
+        }
+    }
+
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (TableHandleInner::CopyOnWrite(left), TableHandleInner::CopyOnWrite(right)) => {
+                Arc::ptr_eq(left, right)
+            }
+            (TableHandleInner::Direct(left), TableHandleInner::Direct(right)) => {
+                Arc::ptr_eq(left, right)
+            }
+            _ => false,
+        }
+    }
+
+    pub fn read_generation_with_context(
+        &self,
+        context: Option<&crate::query::AiExecutionContext>,
+    ) -> Result<(Arc<Table>, Snapshot)> {
+        let mut table = if let Some(context) = context {
+            loop {
+                context.checkpoint()?;
+                let wait = context
+                    .remaining_duration()
+                    .unwrap_or(std::time::Duration::from_millis(5))
+                    .min(std::time::Duration::from_millis(5));
+                if let Some(table) = self.try_read_for(wait) {
+                    break table;
+                }
+            }
+        } else {
+            self.read()
+        };
+        let snapshot = table.snapshot();
+        Ok((table.generation()?, snapshot))
+    }
+}
+
+impl From<Arc<Mutex<Table>>> for TableHandle {
+    fn from(table: Arc<Mutex<Table>>) -> Self {
+        Self(TableHandleInner::Direct(table))
+    }
+}
+
+impl std::ops::Deref for TableGuard<'_> {
+    type Target = Table;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::CopyOnWrite(table) => table.as_ref(),
+            Self::Direct(table) => table,
+        }
+    }
+}
+
+impl std::ops::DerefMut for TableGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::CopyOnWrite(table) => Arc::make_mut(table),
+            Self::Direct(table) => table,
+        }
+    }
+}
+
+impl TableReadGuard<'_> {
+    fn generation(&mut self) -> Result<Arc<Table>> {
+        match self {
+            Self::CopyOnWrite(table) => Ok(Arc::clone(table)),
+            Self::Direct(table) => Ok(Arc::new(table.clone_read_generation()?)),
+        }
+    }
+}
+
+impl std::ops::Deref for TableReadGuard<'_> {
+    type Target = Table;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::CopyOnWrite(table) => table.as_ref(),
+            Self::Direct(table) => table,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ReadAuthorization {
+    pub operation: crate::auth::ColumnOperation,
+    pub columns: Vec<u16>,
+}
+
+pub fn lock_table_with_context<'a>(
+    handle: &'a TableHandle,
+    context: Option<&crate::query::AiExecutionContext>,
+) -> Result<TableGuard<'a>> {
+    let Some(context) = context else {
+        return Ok(handle.lock());
+    };
+    loop {
+        context.checkpoint()?;
+        let wait = context
+            .remaining_duration()
+            .unwrap_or(std::time::Duration::from_millis(5))
+            .min(std::time::Duration::from_millis(5));
+        if let Some(guard) = handle.try_lock_for(wait) {
+            return Ok(guard);
+        }
+    }
+}
 
 /// Knobs for [`Database::open_with_options`].
 ///
@@ -537,10 +704,9 @@ pub struct Database {
     replication_barrier: parking_lot::RwLock<()>,
     /// Number of rotated WAL segments retained for lagging followers.
     replication_wal_retention_segments: AtomicUsize,
-    /// Live immutable run files being copied by online backups. Compaction may
-    /// retire these runs, but GC cannot unlink them until the backup guard
-    /// drops after the atomic install.
-    backup_pins: Mutex<HashMap<(u64, u128), usize>>,
+    /// Live immutable run files used by online backups or scored read
+    /// generations. GC cannot unlink them until every owning guard drops.
+    backup_pins: Arc<Mutex<HashMap<(u64, u128), usize>>>,
     /// Test-only barrier invoked after a transaction writes its spill runs but
     /// before the sequencer/publish, so tests can race `gc()` against an
     /// in-flight spill. `None` in production.
@@ -598,8 +764,8 @@ struct EpochGuard<'a> {
     armed: bool,
 }
 
-struct BackupRunPins<'a> {
-    pins: &'a Mutex<HashMap<(u64, u128), usize>>,
+struct RunPins {
+    pins: Arc<Mutex<HashMap<(u64, u128), usize>>>,
     runs: Vec<(u64, u128)>,
 }
 
@@ -613,7 +779,7 @@ impl Drop for BackupFilePins {
     }
 }
 
-impl Drop for BackupRunPins<'_> {
+impl Drop for RunPins {
     fn drop(&mut self) {
         let mut pins = self.pins.lock();
         for run in &self.runs {
@@ -1274,7 +1440,7 @@ impl Database {
                 read_only,
             };
             let t = Table::open_in(&tdir, ctx)?;
-            tables.insert(entry.table_id, Arc::new(Mutex::new(t)));
+            tables.insert(entry.table_id, TableHandle::new(t));
         }
 
         // Recover transaction writes from the shared WAL (spec §15). This is the
@@ -1342,7 +1508,7 @@ impl Database {
             active_spills: Arc::new(crate::retention::ActiveSpills::new()),
             replication_barrier: parking_lot::RwLock::new(()),
             replication_wal_retention_segments: AtomicUsize::new(0),
-            backup_pins: Mutex::new(HashMap::new()),
+            backup_pins: Arc::new(Mutex::new(HashMap::new())),
             spill_hook: Mutex::new(None),
             backup_hook: Mutex::new(None),
             trigger_recursive: AtomicBool::new(TriggerConfig::default().recursive_triggers),
@@ -1838,15 +2004,26 @@ impl Database {
             Option<&crate::auth::Principal>,
         ) -> Result<T>,
     {
-        self.with_authorized_read_context(table_name, principal, catalog_bound, None, read)
+        self.with_authorized_read_context(
+            table_name,
+            principal,
+            catalog_bound,
+            None,
+            None,
+            None,
+            read,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn with_authorized_read_context<T, F>(
         &self,
         table_name: &str,
         principal: Option<&crate::auth::Principal>,
         catalog_bound: bool,
+        authorization: Option<&ReadAuthorization>,
         context: Option<&crate::query::AiExecutionContext>,
+        snapshot_override: Option<Snapshot>,
         mut read: F,
     ) -> Result<T>
     where
@@ -1874,9 +2051,17 @@ impl Database {
                     self.principal_for_authorized_read(&catalog, principal, catalog_bound)?,
                 )
             };
+            if let Some(authorization) = authorization {
+                self.require_columns_for(
+                    table_name,
+                    authorization.operation,
+                    &authorization.columns,
+                    effective_principal.as_ref(),
+                )?;
+            }
             let result = {
-                let mut table = handle.lock();
-                let snapshot = table.snapshot();
+                let mut table = lock_table_with_context(&handle, context)?;
+                let snapshot = snapshot_override.unwrap_or_else(|| table.snapshot());
                 let allowed = self.allowed_row_ids_locked(
                     table_name,
                     &table,
@@ -1892,6 +2077,9 @@ impl Database {
                     effective_principal.as_ref(),
                 )?
             };
+            if let Some(context) = context {
+                context.checkpoint()?;
+            }
             if self.catalog.read().security_version == security_version {
                 return Ok(result);
             }
@@ -1912,12 +2100,46 @@ impl Database {
         table_name: &str,
         principal: Option<&crate::auth::Principal>,
         catalog_bound: bool,
+        authorization: Option<&ReadAuthorization>,
         context: Option<&crate::query::AiExecutionContext>,
         mut read: F,
     ) -> Result<T>
     where
         F: FnMut(
             &mut Table,
+            Snapshot,
+            Option<&crate::security::CandidateAuthorization<'_>>,
+            Option<&crate::auth::Principal>,
+        ) -> Result<T>,
+    {
+        self.with_authorized_scored_read_context_at(
+            table_name,
+            principal,
+            catalog_bound,
+            authorization,
+            context,
+            None,
+            |table, snapshot, authorization, principal| {
+                let mut table = table.clone();
+                read(&mut table, snapshot, authorization, principal)
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_authorized_scored_read_context_at<T, F>(
+        &self,
+        table_name: &str,
+        principal: Option<&crate::auth::Principal>,
+        catalog_bound: bool,
+        authorization: Option<&ReadAuthorization>,
+        context: Option<&crate::query::AiExecutionContext>,
+        snapshot_override: Option<Snapshot>,
+        mut read: F,
+    ) -> Result<T>
+    where
+        F: FnMut(
+            &Table,
             Snapshot,
             Option<&crate::security::CandidateAuthorization<'_>>,
             Option<&crate::auth::Principal>,
@@ -1943,9 +2165,17 @@ impl Database {
                     self.principal_for_authorized_read(&catalog, principal, catalog_bound)?,
                 )
             };
+            if let Some(authorization) = authorization {
+                self.require_columns_for(
+                    table_name,
+                    authorization.operation,
+                    &authorization.columns,
+                    effective_principal.as_ref(),
+                )?;
+            }
             let result = {
-                let mut table = handle.lock();
-                let snapshot = table.snapshot();
+                let (table, snapshot, _snapshot_guard, _run_pins) =
+                    self.scored_read_generation(&handle, context, snapshot_override)?;
                 let candidate_authorization = if security.rls_enabled(table_name) {
                     Some(crate::security::CandidateAuthorization {
                         table: table_name,
@@ -1958,12 +2188,15 @@ impl Database {
                     None
                 };
                 read(
-                    &mut table,
+                    table.as_ref(),
                     snapshot,
                     candidate_authorization.as_ref(),
                     effective_principal.as_ref(),
                 )?
             };
+            if let Some(context) = context {
+                context.checkpoint()?;
+            }
             if self.catalog.read().security_version == security_version {
                 return Ok(result);
             }
@@ -1974,6 +2207,60 @@ impl Database {
             }
         }
         unreachable!()
+    }
+
+    fn scored_read_generation(
+        &self,
+        handle: &TableHandle,
+        context: Option<&crate::query::AiExecutionContext>,
+        snapshot_override: Option<Snapshot>,
+    ) -> Result<(
+        Arc<Table>,
+        Snapshot,
+        crate::retention::OwnedSnapshotGuard,
+        RunPins,
+    )> {
+        let mut table = if let Some(context) = context {
+            loop {
+                context.checkpoint()?;
+                let wait = context
+                    .remaining_duration()
+                    .unwrap_or(std::time::Duration::from_millis(5))
+                    .min(std::time::Duration::from_millis(5));
+                if let Some(table) = handle.try_read_for(wait) {
+                    break table;
+                }
+            }
+        } else {
+            handle.read()
+        };
+        let (snapshot, snapshot_guard) = if let Some(snapshot) = snapshot_override {
+            self.snapshot_at_owned(snapshot.epoch)?
+        } else {
+            let snapshot = table.snapshot();
+            let guard = self.snapshots.register_owned(snapshot.epoch);
+            (snapshot, guard)
+        };
+        let table_id = table.table_id();
+        let run_keys: Vec<_> = table
+            .active_run_ids()
+            .map(|run_id| (table_id, run_id))
+            .collect();
+        let generation = table.generation()?;
+        let run_pins = self.pin_runs(&run_keys);
+        Ok((generation, snapshot, snapshot_guard, run_pins))
+    }
+
+    fn pin_runs(&self, runs: &[(u64, u128)]) -> RunPins {
+        let mut pins = self.backup_pins.lock();
+        for run in runs {
+            *pins.entry(*run).or_insert(0) += 1;
+        }
+        drop(pins);
+        RunPins {
+            pins: Arc::clone(&self.backup_pins),
+            runs: runs.to_vec(),
+        }
     }
 
     /// Execute a native conjunctive read with the database principal's row
@@ -2058,10 +2345,15 @@ impl Database {
         table_name: &str,
         request: &crate::query::AnnRerankRequest,
     ) -> Result<Vec<crate::query::AnnRerankHit>> {
-        self.with_authorized_scored_read_context(
+        self.with_authorized_scored_read_context_at(
             table_name,
             None,
             true,
+            Some(&ReadAuthorization {
+                operation: crate::auth::ColumnOperation::Select,
+                columns: vec![request.column_id],
+            }),
+            None,
             None,
             |table, snapshot, authorization, principal| {
                 self.require_columns_for(
@@ -2070,7 +2362,7 @@ impl Database {
                     &[request.column_id],
                     principal,
                 )?;
-                table.ann_rerank_at_with_candidate_authorization_and_context(
+                table.ann_rerank_at_with_candidate_authorization_on_generation(
                     request,
                     snapshot,
                     authorization,
@@ -2156,6 +2448,39 @@ impl Database {
             row.columns.retain(|column, _| allowed.contains(column));
         }
         Ok(rows)
+    }
+
+    /// Historical rows use the current principal and security catalog against
+    /// the row values visible at the requested snapshot.
+    pub fn rows_at_epoch_for_current_principal(
+        &self,
+        table_name: &str,
+        snapshot: Snapshot,
+    ) -> Result<Vec<crate::memtable::Row>> {
+        self.with_authorized_read_context(
+            table_name,
+            None,
+            true,
+            Some(&ReadAuthorization {
+                operation: crate::auth::ColumnOperation::Select,
+                columns: Vec::new(),
+            }),
+            None,
+            Some(snapshot),
+            |table, snapshot, allowed, principal| {
+                let allowed_columns = self.select_column_ids_for(table_name, principal)?;
+                let mut rows = table.visible_rows(snapshot)?;
+                if let Some(allowed) = allowed {
+                    rows.retain(|row| allowed.contains(&row.row_id));
+                }
+                rows = self.secure_rows_for(table_name, rows, principal)?;
+                for row in &mut rows {
+                    row.columns
+                        .retain(|column, _| allowed_columns.contains(column));
+                }
+                Ok(rows)
+            },
+        )
     }
 
     /// Count rows visible to a principal without bypassing RLS.
@@ -2345,7 +2670,7 @@ impl Database {
             .tables
             .read()
             .iter()
-            .map(|(id, handle)| (*id, Arc::clone(handle)))
+            .map(|(id, handle)| (*id, handle.clone()))
             .collect();
         handles.sort_by_key(|(id, _)| *id);
         let _table_guards: Vec<_> = handles.iter().map(|(_, handle)| handle.lock()).collect();
@@ -2388,7 +2713,7 @@ impl Database {
                 .tables
                 .read()
                 .iter()
-                .map(|(id, handle)| (*id, Arc::clone(handle)))
+                .map(|(id, handle)| (*id, handle.clone()))
                 .collect();
             handles.sort_by_key(|(id, _)| *id);
             let table_guards: Vec<_> = handles.iter().map(|(_, handle)| handle.lock()).collect();
@@ -2434,8 +2759,8 @@ impl Database {
                     *pins.entry(*key).or_insert(0) += 1;
                 }
             }
-            let _run_pins = BackupRunPins {
-                pins: &self.backup_pins,
+            let _run_pins = RunPins {
+                pins: Arc::clone(&self.backup_pins),
                 runs: run_keys,
             };
             let deferred: HashSet<_> = run_files
@@ -3270,6 +3595,12 @@ impl Database {
         if self.read_only && !matches!(perm, crate::auth::Permission::Select { .. }) {
             return Err(MongrelError::ReadOnlyReplica);
         }
+        if self.principal.read().is_some() {
+            self.refresh_principal().map_err(|error| match error {
+                MongrelError::InvalidCredentials { .. } => MongrelError::AuthRequired,
+                error => error,
+            })?;
+        }
         if !self.catalog.read().require_auth {
             return Ok(());
         }
@@ -3493,8 +3824,10 @@ impl Database {
             vec![(name.to_string(), state.to_vec())],
             Vec::new(),
             None,
+            false,
             None,
         )
+        .map(|(epoch, _)| epoch)
     }
 
     pub fn trigger_config(&self) -> TriggerConfig {
@@ -4051,9 +4384,16 @@ impl Database {
         &self,
         principal: Option<crate::auth::Principal>,
     ) -> crate::txn::Transaction<'_> {
+        let catalog_bound = principal.as_ref().is_some_and(|principal| {
+            self.catalog
+                .read()
+                .users
+                .iter()
+                .any(|user| user.username == principal.username)
+        });
         let txn_id = self.alloc_txn_id();
         let read = Snapshot::at(self.epoch.visible());
-        crate::txn::Transaction::new(self, txn_id, read).with_principal(principal)
+        crate::txn::Transaction::new(self, txn_id, read).with_principal(principal, catalog_bound)
     }
 
     /// Begin a transaction with a specific isolation level.
@@ -4086,11 +4426,18 @@ impl Database {
         bridge: &'a dyn ExternalTriggerBridge,
         principal: Option<crate::auth::Principal>,
     ) -> crate::txn::Transaction<'a> {
+        let catalog_bound = principal.as_ref().is_some_and(|principal| {
+            self.catalog
+                .read()
+                .users
+                .iter()
+                .any(|user| user.username == principal.username)
+        });
         let txn_id = self.alloc_txn_id();
         let read = Snapshot::at(self.epoch.visible());
         crate::txn::Transaction::new(self, txn_id, read)
             .with_external_trigger_bridge(bridge)
-            .with_principal(principal)
+            .with_principal(principal, catalog_bound)
     }
 
     /// Run `f` in a transaction; commit on `Ok`, rollback on `Err`.
@@ -4107,6 +4454,83 @@ impl Database {
             Err(e) => {
                 tx.rollback();
                 Err(e)
+            }
+        }
+    }
+
+    pub fn transaction_with_row_ids<T>(
+        &self,
+        f: impl FnOnce(&mut crate::txn::Transaction) -> Result<T>,
+    ) -> Result<(T, Vec<RowId>)> {
+        let mut tx = self.begin();
+        match f(&mut tx) {
+            Ok(output) => {
+                let (_, row_ids) = tx.commit_with_row_ids()?;
+                Ok((output, row_ids))
+            }
+            Err(error) => {
+                tx.rollback();
+                Err(error)
+            }
+        }
+    }
+
+    pub fn transaction_for_current_principal<T>(
+        &self,
+        f: impl FnOnce(&mut crate::txn::Transaction) -> Result<T>,
+    ) -> Result<T> {
+        if self.principal.read().is_some() {
+            self.refresh_principal()?;
+        }
+        let mut transaction = self.begin_as(self.principal.read().clone());
+        match f(&mut transaction) {
+            Ok(output) => {
+                transaction.commit()?;
+                Ok(output)
+            }
+            Err(error) => {
+                transaction.rollback();
+                Err(error)
+            }
+        }
+    }
+
+    pub fn transaction_for_current_principal_with_epoch<T>(
+        &self,
+        f: impl FnOnce(&mut crate::txn::Transaction) -> Result<T>,
+    ) -> Result<(Epoch, T)> {
+        if self.principal.read().is_some() {
+            self.refresh_principal()?;
+        }
+        let mut transaction = self.begin_as(self.principal.read().clone());
+        match f(&mut transaction) {
+            Ok(output) => {
+                let epoch = transaction.commit()?;
+                Ok((epoch, output))
+            }
+            Err(error) => {
+                transaction.rollback();
+                Err(error)
+            }
+        }
+    }
+
+    pub fn transaction_with_row_ids_for_current_principal<T>(
+        &self,
+        f: impl FnOnce(&mut crate::txn::Transaction) -> Result<T>,
+    ) -> Result<(T, Vec<RowId>)> {
+        if self.principal.read().is_some() {
+            self.refresh_principal()?;
+        }
+        let mut transaction = self.begin_as(self.principal.read().clone());
+        match f(&mut transaction) {
+            Ok(output) => {
+                let (_, row_ids) = transaction.commit_with_row_ids()?;
+                Ok((output, row_ids))
+            }
+            Err(error) => {
+                transaction.rollback();
+                Err(error)
             }
         }
     }
@@ -5505,6 +5929,50 @@ impl Database {
         Ok(())
     }
 
+    fn validate_write_permissions(
+        &self,
+        staging: &[(u64, crate::txn::Staged)],
+        principal: Option<&crate::auth::Principal>,
+    ) -> Result<()> {
+        use crate::txn::Staged;
+
+        let table_names = self
+            .catalog
+            .read()
+            .tables
+            .iter()
+            .filter(|entry| matches!(entry.state, TableState::Live))
+            .map(|entry| (entry.table_id, entry.name.clone()))
+            .collect::<HashMap<_, _>>();
+        for (table_id, operation) in staging {
+            let Some(table) = table_names.get(table_id) else {
+                continue;
+            };
+            match operation {
+                Staged::Put(cells) => self.require_columns_for(
+                    table,
+                    crate::auth::ColumnOperation::Insert,
+                    &cells.iter().map(|(column, _)| *column).collect::<Vec<_>>(),
+                    principal,
+                )?,
+                Staged::Update(_, cells) => self.require_columns_for(
+                    table,
+                    crate::auth::ColumnOperation::Update,
+                    &cells.iter().map(|(column, _)| *column).collect::<Vec<_>>(),
+                    principal,
+                )?,
+                Staged::Delete(_) => self.require_for(
+                    principal,
+                    &crate::auth::Permission::Delete {
+                        table: table.clone(),
+                    },
+                )?,
+                Staged::Truncate => self.require_for(principal, &crate::auth::Permission::Admin)?,
+            }
+        }
+        Ok(())
+    }
+
     fn validate_security_writes(
         &self,
         staging: &[(u64, crate::txn::Staged)],
@@ -5618,9 +6086,10 @@ impl Database {
         mut staging: Vec<(u64, crate::txn::Staged)>,
         external_states: Vec<(String, Vec<u8>)>,
         materialized_view_updates: Vec<crate::catalog::MaterializedViewEntry>,
-        security_principal: Option<crate::auth::Principal>,
+        mut security_principal: Option<crate::auth::Principal>,
+        principal_catalog_bound: bool,
         external_trigger_bridge: Option<&dyn ExternalTriggerBridge>,
-    ) -> Result<Epoch> {
+    ) -> Result<(Epoch, Vec<RowId>)> {
         use crate::memtable::Row;
         use crate::txn::{Staged, StagedOp, WriteKey};
         use crate::wal::Op;
@@ -5631,6 +6100,25 @@ impl Database {
         if self.read_only {
             return Err(MongrelError::ReadOnlyReplica);
         }
+        if principal_catalog_bound {
+            let fresh = catalog::read(&self.root, self.meta_dek.as_ref())?
+                .ok_or_else(|| MongrelError::NotFound("catalog vanished during write".into()))?;
+            *self.catalog.write() = fresh;
+        }
+        let security_version = {
+            let catalog = self.catalog.read();
+            if principal_catalog_bound {
+                let username = security_principal
+                    .as_ref()
+                    .map(|principal| principal.username.as_str())
+                    .ok_or(MongrelError::AuthRequired)?;
+                security_principal = Self::resolve_principal_from_catalog(&catalog, username);
+                if security_principal.is_none() {
+                    return Err(MongrelError::AuthRequired);
+                }
+            }
+            catalog.security_version
+        };
         let _replication_guard = self.replication_barrier.read();
         if self.poisoned.load(Ordering::Relaxed) {
             return Err(MongrelError::Other(
@@ -5687,6 +6175,8 @@ impl Database {
         )?;
         self.fill_auto_increment_for_staging(&mut staging)?;
         external_states = dedup_external_states(external_states);
+
+        self.validate_write_permissions(&staging, security_principal.as_ref())?;
 
         // Validate declarative constraints (unique / FK / check) under the read
         // snapshot, outside the WAL mutex. Trigger-produced writes are included
@@ -5928,6 +6418,30 @@ impl Database {
             }
         }
 
+        let mut spilled_row_ids: HashMap<u64, VecDeque<RowId>> = spilled
+            .iter()
+            .map(|run| {
+                (
+                    run.table_id,
+                    run.rows.iter().map(|row| row.row_id).collect(),
+                )
+            })
+            .collect();
+        let committed_row_ids = staging
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (table_id, staged))| {
+                if !matches!(staged, Staged::Put(_)) {
+                    return None;
+                }
+                prebuilt[index].as_ref().map(|row| row.row_id).or_else(|| {
+                    spilled_row_ids
+                        .get_mut(table_id)
+                        .and_then(VecDeque::pop_front)
+                })
+            })
+            .collect();
+
         let mut prepared_external = Vec::with_capacity(external_states.len());
         for (name, state) in &external_states {
             let pending = prepare_external_state_file(&self.root, name, state, txn_id)?;
@@ -5949,6 +6463,15 @@ impl Database {
             .collect();
         let (new_epoch, mut _epoch_guard, applies, committed_materialized_views, commit_seq) = {
             let mut wal = self.shared_wal.lock();
+
+            let current_security_version = catalog::read(&self.root, self.meta_dek.as_ref())?
+                .ok_or_else(|| MongrelError::NotFound("catalog vanished during write".into()))?
+                .security_version;
+            if current_security_version != security_version {
+                return Err(MongrelError::Conflict(
+                    "security policy changed during write".into(),
+                ));
+            }
 
             // Re-check only if the conflict index advanced since pre-validation
             // (bounded delta — spec §8.5, review fix #17). If the version is
@@ -6166,7 +6689,7 @@ impl Database {
             let _ = self.change_wake.send(());
         }
         _epoch_guard.disarm();
-        Ok(new_epoch)
+        Ok((new_epoch, committed_row_ids))
     }
 
     /// Register a read snapshot at the current visible epoch and return it with
@@ -6471,7 +6994,7 @@ impl Database {
         catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
         self.tables
             .write()
-            .insert(table_id, Arc::new(Mutex::new(table)));
+            .insert(table_id, TableHandle::new(table));
 
         self.epoch.publish_in_order(epoch);
         _epoch_guard.disarm();
@@ -6749,6 +7272,7 @@ impl Database {
                 Vec::new(),
                 Vec::new(),
                 None,
+                false,
                 None,
             )?;
         }

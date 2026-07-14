@@ -33,8 +33,7 @@ use arrow::datatypes::Field;
 use arrow::record_batch::RecordBatch;
 use datafusion::common::Column;
 use datafusion::logical_expr::{Expr, JoinType, LogicalPlan, Operator};
-use mongreldb_core::{schema::IndexKind, Condition, Row, Schema, Table, TypeId, Value};
-use parking_lot::Mutex;
+use mongreldb_core::{schema::IndexKind, Condition, Row, Schema, TableHandle, TypeId, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -45,7 +44,7 @@ type SortInfo = (Vec<(Expr, bool, bool)>, Option<usize>);
 /// bitmap intersection and return the result batches; otherwise `None` (fall
 /// through to DataFusion).
 pub(crate) fn try_fk_join(
-    tables: &HashMap<String, Arc<Mutex<Table>>>,
+    tables: &HashMap<String, TableHandle>,
     plan: &LogicalPlan,
 ) -> Result<Option<Vec<RecordBatch>>> {
     // 1. Peel outer Sort / Limit (captured), Projection (captured), optional
@@ -441,12 +440,12 @@ struct OutCol {
 
 fn lock_db<'a>(
     table: &str,
-    tables: &'a HashMap<String, Arc<Mutex<Table>>>,
-) -> parking_lot::MutexGuard<'a, Table> {
+    tables: &'a HashMap<String, TableHandle>,
+) -> mongreldb_core::TableGuard<'a> {
     tables.get(table).expect("table pre-checked present").lock()
 }
 
-fn with_schema(table: &str, tables: &HashMap<String, Arc<Mutex<Table>>>) -> Result<Schema> {
+fn with_schema(table: &str, tables: &HashMap<String, TableHandle>) -> Result<Schema> {
     let db = lock_db(table, tables);
     Ok(db.schema().clone())
 }
@@ -541,7 +540,7 @@ fn route_conjunct(
     conj: &Expr,
     left: &Side,
     right: &Side,
-    tables: &HashMap<String, Arc<Mutex<Table>>>,
+    tables: &HashMap<String, TableHandle>,
 ) -> Result<Option<bool>> {
     let cols = referenced_columns(conj);
     if cols.is_empty() {
@@ -670,7 +669,7 @@ fn classify(
     join: &datafusion::logical_expr::Join,
     left: &Side,
     right: &Side,
-    tables: &HashMap<String, Arc<Mutex<Table>>>,
+    tables: &HashMap<String, TableHandle>,
 ) -> Result<Option<JoinClass>> {
     // Extract the single equi-condition as (left-ish col, right-ish col) with
     // the side each belongs to.
@@ -803,11 +802,7 @@ fn col_name(expr: &Expr) -> Option<String> {
     }
 }
 
-fn is_pk_column(
-    table: &str,
-    col: &str,
-    tables: &HashMap<String, Arc<Mutex<Table>>>,
-) -> Result<bool> {
+fn is_pk_column(table: &str, col: &str, tables: &HashMap<String, TableHandle>) -> Result<bool> {
     match tables.get(table) {
         Some(arc) => {
             let db = arc.lock();
@@ -821,7 +816,7 @@ fn is_pk_column(
     }
 }
 
-fn has_bitmap(table: &str, col: &str, tables: &HashMap<String, Arc<Mutex<Table>>>) -> Result<bool> {
+fn has_bitmap(table: &str, col: &str, tables: &HashMap<String, TableHandle>) -> Result<bool> {
     let Some(arc) = tables.get(table) else {
         return Ok(false);
     };
@@ -841,7 +836,7 @@ fn has_bitmap(table: &str, col: &str, tables: &HashMap<String, Arc<Mutex<Table>>
 /// would be inexact ⇒ bail to DataFusion).
 fn translate_side(
     table: &str,
-    tables: &HashMap<String, Arc<Mutex<Table>>>,
+    tables: &HashMap<String, TableHandle>,
     conj: &[Expr],
 ) -> Result<Option<Vec<Condition>>> {
     let schema = with_schema(table, tables)?;
@@ -862,7 +857,7 @@ fn output_columns(
     jc: &JoinClass,
     left: &Side,
     right: &Side,
-    tables: &HashMap<String, Arc<Mutex<Table>>>,
+    tables: &HashMap<String, TableHandle>,
 ) -> Result<Vec<OutCol>> {
     let fk_side = if jc.pk_is_left { right } else { left };
     let pk_side = if jc.pk_is_left { left } else { right };
@@ -962,7 +957,7 @@ fn output_schema(
     jc: &JoinClass,
     left: &Side,
     right: &Side,
-    tables: &HashMap<String, Arc<Mutex<Table>>>,
+    tables: &HashMap<String, TableHandle>,
 ) -> Result<Option<arrow::datatypes::Schema>> {
     let cols = output_columns(projection, jc, left, right, tables)?;
     if projection.is_some() && cols.is_empty() {
@@ -1081,7 +1076,7 @@ fn compute_join_aggregate(
     jc: &JoinClass,
     left: &Side,
     right: &Side,
-    tables: &HashMap<String, Arc<Mutex<Table>>>,
+    tables: &HashMap<String, TableHandle>,
     fk_rids: &[u64],
 ) -> Result<Option<Vec<RecordBatch>>> {
     use datafusion::common::ScalarValue;
@@ -1297,13 +1292,12 @@ mod tests {
         ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema as MSchema, TypeId as MTy,
     };
     use mongreldb_core::{Table, Value};
-    use parking_lot::Mutex;
     use std::sync::Arc;
     use tempfile::tempdir;
 
     /// countries(pk `cid` Int64) ; users(pk `uid`, `country` Int64 [bitmap]).
     /// users reference countries by `country`. Join users.country = countries.cid.
-    fn build() -> (tempfile::TempDir, HashMap<String, Arc<Mutex<Table>>>) {
+    fn build() -> (tempfile::TempDir, HashMap<String, TableHandle>) {
         let dir = tempdir().unwrap();
 
         let countries_schema = MSchema {
@@ -1364,17 +1358,17 @@ mod tests {
         }
         users.flush().unwrap();
 
-        let mut tables: HashMap<String, Arc<Mutex<Table>>> = HashMap::new();
-        tables.insert("countries".into(), Arc::new(Mutex::new(countries)));
-        tables.insert("users".into(), Arc::new(Mutex::new(users)));
+        let mut tables: HashMap<String, TableHandle> = HashMap::new();
+        tables.insert("countries".into(), TableHandle::from_table(countries));
+        tables.insert("users".into(), TableHandle::from_table(users));
         (dir, tables)
     }
 
     async fn ctx_with(
-        tables: &HashMap<String, Arc<Mutex<Table>>>,
+        tables: &HashMap<String, TableHandle>,
     ) -> datafusion::prelude::SessionContext {
-        let pu = MongrelProvider::new(Arc::clone(&tables["users"])).unwrap();
-        let pc = MongrelProvider::new(Arc::clone(&tables["countries"])).unwrap();
+        let pu = MongrelProvider::new_handle(tables["users"].clone()).unwrap();
+        let pc = MongrelProvider::new_handle(tables["countries"].clone()).unwrap();
         let ctx = datafusion::prelude::SessionContext::new();
         ctx.register_table("users", Arc::new(pu)).unwrap();
         ctx.register_table("countries", Arc::new(pc)).unwrap();

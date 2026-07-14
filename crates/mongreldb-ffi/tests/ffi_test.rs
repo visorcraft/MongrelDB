@@ -21,16 +21,12 @@ fn make_tempdir() -> std::path::PathBuf {
 
 #[test]
 fn ffi_minhash_golden_fixture_matches_v1() {
-    let golden: Vec<serde_json::Value> = serde_json::from_str(include_str!(
-        "../../../docs/ai/minhash-v1-golden.json"
-    ))
-    .unwrap();
+    let golden: Vec<serde_json::Value> =
+        serde_json::from_str(include_str!("../../../docs/ai/minhash-v1-golden.json")).unwrap();
     for fixture in golden {
         let member = serde_json::to_string(&fixture["member"]).unwrap();
         let mut hash = 0;
-        let result = unsafe {
-            mongreldb_minhash_member_hash_v1_json(cstr(&member), &mut hash)
-        };
+        let result = unsafe { mongreldb_minhash_member_hash_v1_json(cstr(&member), &mut hash) };
         assert_eq!(result, 0);
         assert_eq!(hash.to_string(), fixture["expected"]);
     }
@@ -227,6 +223,7 @@ fn ffi_exact_ann_rerank_returns_scored_hit() {
         );
         let table = mongreldb_database_table(db, cstr("docs"));
         let mut first_row_id = 0;
+        let mut row_ids = Vec::new();
         for (id, embedding) in [(1, [1.0_f32, 0.0]), (2, [0.0_f32, 1.0])] {
             let mut cells = [
                 mongreldb_cell_input {
@@ -249,10 +246,12 @@ fn ffi_exact_ann_rerank_returns_scored_hit() {
             let cells = make_cell_input_array(&mut cells);
             let mut row_id = 0;
             assert_eq!(mongreldb_table_put(table, &cells, &mut row_id), 0);
+            row_ids.push(row_id);
             if id == 1 {
                 first_row_id = row_id;
             }
         }
+        assert_ne!(row_ids[0], row_ids[1]);
 
         let query = [1.0_f32, 0.0];
         let result = mongreldb_table_ann_rerank(
@@ -525,10 +524,7 @@ fn ffi_sql_ddl_returns_empty_or_nonempty() {
         let db = make_test_db(path);
 
         // CREATE TABLE via SQL.
-        let (ret, buf, len) = run_sql(
-            db,
-            "CREATE TABLE items (id INT64 PRIMARY KEY, qty INT64)",
-        );
+        let (ret, buf, len) = run_sql(db, "CREATE TABLE items (id INT64 PRIMARY KEY, qty INT64)");
         assert_eq!(
             ret,
             0,
@@ -557,30 +553,47 @@ fn ffi_sql_insert_and_select() {
             db,
             "CREATE TABLE products (id INT64 PRIMARY KEY, name VARCHAR, price FLOAT64)",
         );
-        assert_eq!(ret, 0, "CREATE failed: {}", rust_str(mongreldb_last_error()));
+        assert_eq!(
+            ret,
+            0,
+            "CREATE failed: {}",
+            rust_str(mongreldb_last_error())
+        );
 
         // Insert two rows via SQL.
         let (ret, _, _) = run_sql(
             db,
             "INSERT INTO products (id, name, price) VALUES (1, 'widget', 9.99)",
         );
-        assert_eq!(ret, 0, "INSERT 1 failed: {}", rust_str(mongreldb_last_error()));
+        assert_eq!(
+            ret,
+            0,
+            "INSERT 1 failed: {}",
+            rust_str(mongreldb_last_error())
+        );
 
         let (ret, _, _) = run_sql(
             db,
             "INSERT INTO products (id, name, price) VALUES (2, 'gadget', 19.99)",
         );
-        assert_eq!(ret, 0, "INSERT 2 failed: {}", rust_str(mongreldb_last_error()));
+        assert_eq!(
+            ret,
+            0,
+            "INSERT 2 failed: {}",
+            rust_str(mongreldb_last_error())
+        );
 
         // SELECT should return Arrow IPC file bytes (non-empty, starts with
         // the ARROW1 magic).
         let (ret, buf, len) = run_sql(db, "SELECT id, name, price FROM products ORDER BY id");
-        assert_eq!(ret, 0, "SELECT failed: {}", rust_str(mongreldb_last_error()));
-        assert!(len > 0, "SELECT should produce non-empty IPC buffer");
-        assert!(
-            len >= 6,
-            "IPC buffer too small to contain ARROW1 magic"
+        assert_eq!(
+            ret,
+            0,
+            "SELECT failed: {}",
+            rust_str(mongreldb_last_error())
         );
+        assert!(len > 0, "SELECT should produce non-empty IPC buffer");
+        assert!(len >= 6, "IPC buffer too small to contain ARROW1 magic");
         // Arrow IPC file format starts with "ARROW1\0".
         let magic = std::slice::from_raw_parts(buf, 6);
         assert_eq!(
@@ -639,13 +652,13 @@ fn ffi_migration_checksum() {
         // Compute the checksum for a single create_table migration.
         let ops = r#"[{"create_table":{"name":"users"}}]"#;
         let mut out: *const std::os::raw::c_char = std::ptr::null();
-        let ret = mongreldb_migration_checksum_json(
-            1,
-            cstr("initial"),
-            cstr(ops),
-            &mut out,
+        let ret = mongreldb_migration_checksum_json(1, cstr("initial"), cstr(ops), &mut out);
+        assert_eq!(
+            ret,
+            0,
+            "checksum failed: {}",
+            rust_str(mongreldb_last_error())
         );
-        assert_eq!(ret, 0, "checksum failed: {}", rust_str(mongreldb_last_error()));
         let checksum = rust_str(out);
         mongreldb_free_migrate_string(out as *mut _);
 
@@ -670,26 +683,26 @@ fn ffi_migration_plan() {
         ]"#;
 
         let mut out: *const std::os::raw::c_char = std::ptr::null();
-        let ret = mongreldb_plan_migrations_json(
-            cstr(applied),
-            cstr(desired),
-            &mut out,
-        );
+        let ret = mongreldb_plan_migrations_json(cstr(applied), cstr(desired), &mut out);
         assert_eq!(ret, 0, "plan failed: {}", rust_str(mongreldb_last_error()));
         let result = rust_str(out);
         mongreldb_free_migrate_string(out as *mut _);
 
         // Both migrations should be pending (no applied).
-        assert!(result.contains("\"version\":1"), "result should contain version 1: {}", result);
-        assert!(result.contains("\"version\":2"), "result should contain version 2: {}", result);
+        assert!(
+            result.contains("\"version\":1"),
+            "result should contain version 1: {}",
+            result
+        );
+        assert!(
+            result.contains("\"version\":2"),
+            "result should contain version 2: {}",
+            result
+        );
 
         // Now with version 1 applied, only version 2 should be pending.
         let applied1 = r#"[{"version":1,"name":"initial","ops":[]}]"#;
-        let ret = mongreldb_plan_migrations_json(
-            cstr(applied1),
-            cstr(desired),
-            &mut out,
-        );
+        let ret = mongreldb_plan_migrations_json(cstr(applied1), cstr(desired), &mut out);
         assert_eq!(ret, 0);
         let result2 = rust_str(out);
         mongreldb_free_migrate_string(out as *mut _);
@@ -711,11 +724,7 @@ fn ffi_migration_plan() {
 fn ffi_migration_invalid_json() {
     unsafe {
         let mut out: *const std::os::raw::c_char = std::ptr::null();
-        let ret = mongreldb_plan_migrations_json(
-            cstr("not json"),
-            cstr("[]"),
-            &mut out,
-        );
+        let ret = mongreldb_plan_migrations_json(cstr("not json"), cstr("[]"), &mut out);
         assert!(ret < 0, "invalid JSON should return error, got {}", ret);
         assert!(
             !rust_str(mongreldb_last_error()).is_empty(),

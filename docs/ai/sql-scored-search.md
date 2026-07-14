@@ -51,5 +51,6 @@ contribution.
 Table functions obey normal table and column authorization. System columns stay
 hidden. Retrieval runs when the physical scan executes, so cached logical plans,
 prepared statements, and views see current rows, indexes, roles, policies, and
-masks. Boolean ANN and Sparse predicates use the same authorization-aware
-pushdown. If pushdown is unavailable, they fail closed.
+masks. Boolean ANN and Sparse predicates remain available only to trusted
+embedded SQL. Remote `/sql` and prepared SQL reject them; use the scored table
+functions so timeout, work, and concurrency limits always apply.

@@ -33,7 +33,7 @@ fn hamming(a: &[u8], b: &[u8]) -> Dist {
 }
 
 /// HNSW over Hamming distance on packed-bit vectors.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Hnsw {
     bytes_per_vec: usize,
     m: usize,
@@ -152,7 +152,10 @@ impl Hnsw {
             return Ok(Vec::new());
         };
         if let Some(context) = context {
-            context.checkpoint()?;
+            context.consume(crate::query::work_units(
+                self.bytes_per_vec,
+                crate::query::HAMMING_WORK_QUANTUM,
+            ))?;
         }
         let ef = ef.max(k);
         let mut ep: Vec<(Dist, usize)> = vec![(hamming(query_bits, &self.vectors[entry]), entry)];
@@ -235,7 +238,10 @@ impl Hnsw {
             for &e in &self.graph[c][layer as usize] {
                 if visited.insert(e) {
                     if let Some(context) = context {
-                        context.consume(1)?;
+                        context.consume(crate::query::work_units(
+                            self.bytes_per_vec,
+                            crate::query::HAMMING_WORK_QUANTUM,
+                        ))?;
                     }
                     let d = hamming(query_bits, &self.vectors[e]);
                     let w = results.peek().map(|(dd, _)| *dd).unwrap_or(Dist::MAX);
@@ -265,6 +271,24 @@ mod tests {
         h.insert(vec![0b1010_1010, 0b0000_1111], RowId(2));
         let top = h.search(&[0b1010_1010, 0b0000_1111], 1, 32);
         assert_eq!(top[0].1, 0); // identical ⇒ distance 0
+    }
+
+    #[test]
+    fn hamming_work_scales_with_vector_width() {
+        let mut narrow = Hnsw::new(1, 8, 32);
+        narrow.insert(vec![0], RowId(0));
+        let narrow_context = AiExecutionContext::new(None, usize::MAX);
+        narrow
+            .search_with_context(&[0], 1, 32, Some(&narrow_context))
+            .unwrap();
+
+        let mut wide = Hnsw::new(128, 8, 32);
+        wide.insert(vec![0; 128], RowId(0));
+        let wide_context = AiExecutionContext::new(None, usize::MAX);
+        wide.search_with_context(&[0; 128], 1, 32, Some(&wide_context))
+            .unwrap();
+
+        assert!(wide_context.consumed_work() > narrow_context.consumed_work());
     }
 
     #[test]

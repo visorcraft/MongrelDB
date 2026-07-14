@@ -1,5 +1,8 @@
 //! Manual/nightly AI retrieval characterization. No wall-clock assertions.
 
+#[path = "support/ai_relevance_suite.rs"]
+mod ai_relevance_suite;
+
 use mongreldb_core::query::{
     AnnRerankRequest, Condition, Fusion, NamedRetriever, Retriever, RetrieverScore, SearchRequest,
     SetMember, SetSimilarityRequest, VectorMetric,
@@ -768,6 +771,7 @@ fn main() {
     #[cfg(not(feature = "encryption"))]
     let encrypted_profile = serde_json::json!({"enabled": false});
     let realistic_profile = realistic_profile();
+    let relevance_suite = ai_relevance_suite::run();
     let git_sha = std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
         .output()
@@ -831,6 +835,7 @@ fn main() {
             "multi_tenant": {"rows": rows, "column_masks": rls_security.masks.len(), "profiles": rls_profiles},
             "encrypted": encrypted_profile,
             "realistic": realistic_profile,
+            "relevance": relevance_suite,
         },
     });
     println!("{report}");

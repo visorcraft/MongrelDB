@@ -99,6 +99,11 @@ are handled by DataFusion's own filter after the scan. This is always correct
 
 MongrelDB registers two SQL user-defined functions for AI-native queries:
 
+These Boolean predicates are for trusted embedded SQL. The daemon rejects them
+on `/sql`, including prepared statements. Remote callers must use
+`ann_search_scored`, `sparse_search_scored`, or `hybrid_search_scored` so AI
+execution limits apply.
+
 ### ANN Search (Vector Similarity)
 
 ```sql

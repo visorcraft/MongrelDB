@@ -99,6 +99,31 @@ def main():
             realistic.get("exact_rerank_recall_at_4") == 1.0,
             "realistic profile exact-rerank recall must be 1.0",
         )
+        relevance = nested(report, "qualification_profiles.relevance")
+        require(relevance.get("documents", 0) >= 15, "relevance corpus has too few documents")
+        require(relevance.get("passages", 0) >= 100, "relevance corpus has too few passages")
+        require(relevance.get("queries", 0) >= 15, "relevance suite has too few queries")
+        require(relevance.get("index_size_bytes", 0) > 0, "relevance index is empty")
+        for mode in ("dense_only", "sparse_only", "rrf", "rrf_exact_vector_rerank"):
+            metrics = relevance.get(mode, {})
+            for metric in (
+                "recall_at_10",
+                "mrr_at_10",
+                "ndcg_at_10",
+                "answer_context_coverage_at_10",
+                "duplicate_suppression",
+                "p50_us",
+                "p95_us",
+            ):
+                value = metrics.get(metric)
+                require(
+                    isinstance(value, (int, float)) and math.isfinite(value),
+                    f"relevance {mode} {metric} must be finite",
+                )
+            require(
+                metrics.get("duplicate_suppression") == 1.0,
+                f"relevance {mode} returned duplicate rows",
+            )
     except (KeyError, TypeError):
         errors.append("missing qualification profile")
 

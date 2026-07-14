@@ -154,9 +154,11 @@ Bulk insert **2.3× faster than SQLite, 2.6× faster than DuckDB native**. Join
   `Snapshot { epoch }`, see only `committed_epoch <= snapshot.epoch`.
 - **Predicate pushdown:** `WHERE col = lit`, `col <,>,<=,>=,BETWEEN`, and
   `col LIKE '%p%'` translate to index-backed conditions (Bitmap/PK, Range,
-  FM-index) resolved to a row-id set; `ann_search(col, '[..]', k)` is a UDF that
-  resolves via HNSW. Conditions intersect in the shared `RowId` space, then only
-  matching rows + requested columns are decoded.
+  FM-index) resolved to a row-id set. Trusted embedded SQL can also use
+  `ann_search(col, '[..]', k)` through HNSW. Remote SQL rejects Boolean ranked
+  AI predicates and requires scored functions with execution limits. Conditions
+  intersect in the shared `RowId` space, then only matching rows + requested
+  columns are decoded.
 - **Projection pushdown:** only the columns the query asks for are decoded.
 - **Page index:** columns are split into 65 536-row pages with populated
   `PageStat` min/max; the reader skips pages whose `[min,max]` excludes the
@@ -200,11 +202,11 @@ AI retrieval availability:
 | Surface | Boolean Query | Scored Retriever | Exact ANN rerank | Exact Set | Hybrid Search |
 |---|---:|---:|---:|---:|---:|
 | Rust core | Yes | Yes | Yes | Yes | Yes |
-| Kit HTTP | Yes | Yes | Yes | Yes | Yes |
-| SQL | Yes | Yes | Yes | Yes | Yes |
+| Kit HTTP | Non-ranked only | Yes | Yes | Yes | Yes |
+| SQL | Embedded only | Yes | Yes | Yes | Yes |
 | NAPI embedded | Yes | No typed helper | Yes | No typed helper | No typed helper |
 | C FFI | Yes | No typed helper | Yes | No typed helper | No typed helper |
-| Rust HTTP client | Yes | Yes | Yes | Yes | Yes |
+| Rust HTTP client | Non-ranked only | Yes | Yes | Yes | Yes |
 
 Credentialed NAPI and C FFI typed reads use the same row-level security and
 column-mask checks as the core API. Raw `Table` access remains an explicit

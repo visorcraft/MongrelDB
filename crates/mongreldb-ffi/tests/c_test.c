@@ -19,9 +19,10 @@
     } \
 } while(0)
 
+static char test_db_dir[] = "/tmp/mdb_c_test_XXXXXX";
+
 static mongreldb_database_t *create_test_db(void) {
-    char tmpl[] = "/tmp/mdb_c_test_XXXXXX";
-    char *dir = mkdtemp(tmpl);
+    char *dir = mkdtemp(test_db_dir);
     if (!dir) { perror("mkdtemp"); exit(1); }
     mongreldb_database_t *db = mongreldb_create(dir);
     if (!db) {
@@ -109,12 +110,13 @@ static void test_invalid_discriminants(mongreldb_database_t *db) {
     mongreldb_table_free(table);
 }
 
-static void put_secure_row(
+static int32_t put_secure_row(
     mongreldb_table_t *table,
     int64_t id,
     const char *owner,
     const char *secret,
-    const float embedding[2]) {
+    const float embedding[2],
+    uint64_t *row_id) {
     mongreldb_cell_input cells[4] = {0};
     cells[0].column_id = 1;
     cells[0].value.tag = MDB_VALUE_INT64;
@@ -132,7 +134,7 @@ static void put_secure_row(
     cells[3].value.v.embedding.data = embedding;
     cells[3].value.v.embedding.len = 2;
     mongreldb_cell_input_array input = { .data = cells, .len = 4 };
-    CHECK(mongreldb_table_put(table, &input, NULL));
+    return mongreldb_table_put(table, &input, row_id);
 }
 
 static mongreldb_result_t *ann_query(mongreldb_table_t *table, const float embedding[2]) {
@@ -188,12 +190,17 @@ static void test_authenticated_native_reads(void) {
     assert(admin_table);
     const float alice_embedding[2] = {0.0f, 1.0f};
     const float bob_embedding[2] = {1.0f, 0.0f};
-    put_secure_row(admin_table, 1, "alice", "alice-secret", alice_embedding);
-    put_secure_row(admin_table, 2, "bob", "bob-secret", bob_embedding);
+    uint64_t alice_row_id = 0;
+    uint64_t bob_row_id = 0;
+    CHECK(put_secure_row(admin_table, 1, "alice", "alice-secret", alice_embedding, &alice_row_id));
+    CHECK(put_secure_row(admin_table, 2, "bob", "bob-secret", bob_embedding, &bob_row_id));
+    assert(alice_row_id != bob_row_id);
 
     CHECK(mongreldb_create_user(admin, "alice", "alice-pw"));
     CHECK(mongreldb_create_role(admin, "reader"));
     CHECK(mongreldb_grant_permission(admin, "reader", "select:docs"));
+    CHECK(mongreldb_grant_permission(admin, "reader", "insert:docs"));
+    CHECK(mongreldb_grant_permission(admin, "reader", "delete:docs"));
     CHECK(mongreldb_grant_role(admin, "alice", "reader"));
     CHECK(mongreldb_database_sql_refresh(admin));
     uint8_t *sql_buf = NULL;
@@ -202,7 +209,7 @@ static void test_authenticated_native_reads(void) {
         "ALTER TABLE docs ENABLE ROW LEVEL SECURITY", &sql_buf, &sql_len));
     mongreldb_free_sql_result(sql_buf, sql_len);
     CHECK(mongreldb_database_sql(admin,
-        "CREATE POLICY owner_only ON docs FOR SELECT TO PUBLIC USING (owner = CURRENT_USER)",
+        "CREATE POLICY owner_only ON docs FOR ALL TO PUBLIC USING (owner = CURRENT_USER) WITH CHECK (owner = CURRENT_USER)",
         &sql_buf, &sql_len));
     mongreldb_free_sql_result(sql_buf, sql_len);
     CHECK(mongreldb_database_sql(admin,
@@ -257,6 +264,40 @@ static void test_authenticated_native_reads(void) {
     assert(strcmp(mongreldb_last_error(),
         "invalid vector metric 99; expected 0, 1, or 2") == 0);
 
+    assert(mongreldb_table_delete(alice_table, bob_row_id) == MDB_ERR_UNAUTHORIZED);
+    mongreldb_transaction_t *forbidden_update = mongreldb_begin(alice);
+    assert(forbidden_update);
+    mongreldb_cell_input bob_cells[4] = {0};
+    bob_cells[0].column_id = 1;
+    bob_cells[0].value.tag = MDB_VALUE_INT64;
+    bob_cells[0].value.v.i64 = 2;
+    bob_cells[1].column_id = 2;
+    bob_cells[1].value.tag = MDB_VALUE_BYTES;
+    bob_cells[1].value.v.bytes.data = (const uint8_t *)"bob";
+    bob_cells[1].value.v.bytes.len = 3;
+    bob_cells[2].column_id = 3;
+    bob_cells[2].value.tag = MDB_VALUE_BYTES;
+    bob_cells[2].value.v.bytes.data = (const uint8_t *)"bob-secret";
+    bob_cells[2].value.v.bytes.len = 10;
+    bob_cells[3].column_id = 4;
+    bob_cells[3].value.tag = MDB_VALUE_EMBEDDING;
+    bob_cells[3].value.v.embedding.data = bob_embedding;
+    bob_cells[3].value.v.embedding.len = 2;
+    mongreldb_cell_input update_cell = {0};
+    update_cell.column_id = 3;
+    update_cell.value.tag = MDB_VALUE_BYTES;
+    update_cell.value.v.bytes.data = (const uint8_t *)"stolen";
+    update_cell.value.v.bytes.len = 6;
+    mongreldb_cell_input_array bob_input = { .data = bob_cells, .len = 4 };
+    mongreldb_cell_input_array update_input = { .data = &update_cell, .len = 1 };
+    CHECK(mongreldb_txn_upsert(forbidden_update, "docs", &bob_input, &update_input));
+    uint64_t forbidden_epoch = 0;
+    assert(mongreldb_txn_commit(forbidden_update, &forbidden_epoch) == MDB_ERR_UNAUTHORIZED);
+    mongreldb_txn_free(forbidden_update);
+    assert(put_secure_row(alice_table, 3, "bob", "forbidden", bob_embedding, NULL) ==
+        MDB_ERR_UNAUTHORIZED);
+    CHECK(put_secure_row(alice_table, 3, "alice", "allowed", alice_embedding, NULL));
+
     result = ann_query(admin_table, bob_embedding);
     assert(result && mongreldb_result_count(result) == 2);
     mongreldb_result_free(result);
@@ -265,6 +306,8 @@ static void test_authenticated_native_reads(void) {
     result = ann_query(alice_table, bob_embedding);
     assert(result == NULL);
     assert(mongreldb_last_error_code() == MDB_ERR_UNAUTHORIZED);
+    assert(put_secure_row(alice_table, 4, "alice", "revoked", alice_embedding, NULL) ==
+        MDB_ERR_UNAUTHORIZED);
 
     mongreldb_table_free(alice_table);
     mongreldb_database_free(alice);
@@ -303,12 +346,18 @@ int main(void) {
 
     uint64_t row_id;
     CHECK(mongreldb_table_put(table, &cell_arr, &row_id));
+    assert(row_id != 42);
+    cells[0].value.v.i64 = 43;
+    cells[1].value.v.bytes.data = (const uint8_t *)"world";
+    uint64_t second_row_id;
+    CHECK(mongreldb_table_put(table, &cell_arr, &second_row_id));
+    assert(second_row_id != row_id);
     printf("3. put row (id=42, name=hello)\n");
 
     /* ── Count ───────────────────────────────────────────────────────── */
     uint64_t count;
     CHECK(mongreldb_table_count(table, &count));
-    assert(count == 1);
+    assert(count == 2);
     printf("4. count = %llu\n", (unsigned long long)count);
 
     /* ── Query ───────────────────────────────────────────────────────── */
@@ -317,12 +366,13 @@ int main(void) {
     assert(result);
 
     size_t n = mongreldb_result_count(result);
-    assert(n == 1);
+    assert(n == 2);
     printf("5. query returned %zu rows\n", n);
 
     /* Read the row (out-parameter pattern) */
     mongreldb_row row;
     CHECK(mongreldb_result_row(result, 0, &row));
+    assert(row.row_id == row_id);
     assert(mongreldb_row_cell_count(&row) >= 1);
 
     mongreldb_cell c0 = {0};
@@ -331,6 +381,9 @@ int main(void) {
 
     mongreldb_result_free(result);
     mongreldb_query_free(query);
+    CHECK(mongreldb_table_delete(table, row_id));
+    CHECK(mongreldb_table_count(table, &count));
+    assert(count == 1);
     mongreldb_table_free(table);
 
     /* ── Transaction ─────────────────────────────────────────────────── */
@@ -451,7 +504,26 @@ int main(void) {
     mongreldb_free_migrate_string((char *)plan_json);
     printf("18. migration plan: only v2 pending\n");
 
-    /* ── Cleanup ─────────────────────────────────────────────────────── */
+    /* ── Cleanup + RowId reopen identity ────────────────────────────── */
+    mongreldb_database_free(db);
+    db = mongreldb_open(test_db_dir);
+    assert(db);
+    table = mongreldb_database_table(db, "items");
+    assert(table);
+    query = mongreldb_query_begin();
+    result = mongreldb_table_query(table, query);
+    assert(result);
+    int found_second = 0;
+    for (size_t i = 0; i < mongreldb_result_count(result); i++) {
+        mongreldb_row reopened_row = {0};
+        CHECK(mongreldb_result_row(result, i, &reopened_row));
+        assert(reopened_row.row_id != row_id);
+        found_second |= reopened_row.row_id == second_row_id;
+    }
+    assert(found_second);
+    mongreldb_result_free(result);
+    mongreldb_query_free(query);
+    mongreldb_table_free(table);
     mongreldb_database_free(db);
     test_authenticated_native_reads();
     printf("19. authenticated native reads enforced\n");

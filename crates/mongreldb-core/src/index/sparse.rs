@@ -15,6 +15,7 @@ use crate::Result;
 use std::collections::HashMap;
 
 /// Inverted index over weighted sparse vectors, keyed by token id.
+#[derive(Clone)]
 pub struct SparseIndex {
     postings: HashMap<u32, Vec<(RowId, f32)>>,
 }
@@ -85,6 +86,11 @@ impl SparseIndex {
                         context.consume(chunk.len())?;
                     }
                     for &(rid, d_weight) in chunk {
+                        if !scores.contains_key(&rid.0)
+                            && scores.len() >= crate::query::MAX_RAW_INDEX_CANDIDATES
+                        {
+                            return Err(crate::MongrelError::WorkBudgetExceeded);
+                        }
                         *scores.entry(rid.0).or_insert(0.0) +=
                             f64::from(q_weight) * f64::from(d_weight);
                     }
@@ -95,8 +101,20 @@ impl SparseIndex {
             .into_iter()
             .map(|(rid, score)| (RowId(rid), score))
             .collect();
-        ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        ranked.truncate(k);
+        if let Some(context) = context {
+            context.consume(ranked.len())?;
+        }
+        let order = |left: &(RowId, f64), right: &(RowId, f64)| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| left.0.cmp(&right.0))
+        };
+        if ranked.len() > k {
+            ranked.select_nth_unstable_by(k, order);
+            ranked.truncate(k);
+        }
+        ranked.sort_by(order);
         Ok(ranked)
     }
 
@@ -154,5 +172,18 @@ mod tests {
         assert_eq!(top[0], (RowId(2), 5.0));
         assert_eq!(top[1], (RowId(0), 3.0));
         assert_eq!(top[2], (RowId(1), 1.0));
+    }
+
+    #[test]
+    fn unique_candidates_stop_at_raw_ceiling() {
+        let mut idx = SparseIndex::new();
+        for row_id in 0..=crate::query::MAX_RAW_INDEX_CANDIDATES {
+            idx.insert(&[(1, 1.0)], RowId(row_id as u64));
+        }
+        let context = crate::query::AiExecutionContext::new(None, usize::MAX);
+        assert!(matches!(
+            idx.search_with_context(&[(1, 1.0)], 1, Some(&context)),
+            Err(crate::MongrelError::WorkBudgetExceeded)
+        ));
     }
 }

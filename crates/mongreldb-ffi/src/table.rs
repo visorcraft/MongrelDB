@@ -305,16 +305,16 @@ pub unsafe extern "C" fn mongreldb_table_put(
     let table_name = table.name.clone();
     match table
         .db
-        .transaction(|tx| tx.put_returning(&table_name, cols))
+        .transaction_with_row_ids_for_current_principal(|tx| tx.put_returning(&table_name, cols))
     {
-        Ok(put_result) => {
+        Ok((_put_result, row_ids)) => {
+            let Some(row_id) = row_ids.first() else {
+                return set_error_msg(ErrorCode::Unknown, "committed put returned no row ID")
+                    .as_return();
+            };
             if !out_row_id.is_null() {
-                // put_returning returns a PutResult with the row but not a
-                // row_id directly (the engine assigns row ids at commit).
-                // For FFI compatibility, return 0 as the row id placeholder.
-                *out_row_id = 0;
+                *out_row_id = row_id.0;
             }
-            let _ = put_result;
             0
         }
         Err(e) => set_error(&e).as_return(),
@@ -358,7 +358,10 @@ pub unsafe extern "C" fn mongreldb_table_put_batch(
     }
     // Route through Database::transaction for proper epoch management.
     let table_name = table.name.clone();
-    match table.db.transaction(|tx| tx.put_batch(&table_name, batch)) {
+    match table
+        .db
+        .transaction_for_current_principal(|tx| tx.put_batch(&table_name, batch))
+    {
         Ok(_) => 0,
         Err(e) => set_error(&e).as_return(),
     }
@@ -398,16 +401,17 @@ pub unsafe extern "C" fn mongreldb_table_query(
         }
     };
     let schema = handle.lock().schema().clone();
-    let rows = match table
-        .db
-        .query_for_current_principal(&table.name, &core_query, projection.as_deref())
-    {
-        Ok(r) => r,
-        Err(e) => {
-            set_error(&e);
-            return std::ptr::null_mut();
-        }
-    };
+    let rows =
+        match table
+            .db
+            .query_for_current_principal(&table.name, &core_query, projection.as_deref())
+        {
+            Ok(r) => r,
+            Err(e) => {
+                set_error(&e);
+                return std::ptr::null_mut();
+            }
+        };
 
     // Materialize rows as `(row_id, Vec<(u16, Value)>)` in schema column order.
     // If a projection is set, keep only those columns; otherwise expand to all
@@ -577,12 +581,9 @@ pub unsafe extern "C" fn mongreldb_table_delete(t: mongreldb_table_t, row_id: u6
     let Some(table) = as_table(t) else {
         return ErrorCode::InvalidArgument.as_return();
     };
-    let handle = match table.db.table(&table.name) {
-        Ok(h) => h,
-        Err(e) => return set_error(&e).as_return(),
-    };
-    let mut g = handle.lock();
-    match g.delete(RowId(row_id)) {
+    match table.db.transaction_for_current_principal(|transaction| {
+        transaction.delete(&table.name, RowId(row_id))
+    }) {
         Ok(()) => 0,
         Err(e) => set_error(&e).as_return(),
     }

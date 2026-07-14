@@ -41,6 +41,30 @@ pub use external_modules::{
     ExternalTxn, ExternalWriteOp, ExternalWriteResult, ModuleConnectCtx,
 };
 
+/// True when SQL calls a ranked Boolean AI UDF. Remote servers use this to
+/// require the bounded scored table functions while embedded sessions retain
+/// the trusted Boolean intersection primitives.
+pub fn contains_boolean_ai_predicate(sql: &str) -> bool {
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::tokenizer::{Token, Tokenizer};
+
+    let Ok(tokens) = Tokenizer::new(&GenericDialect {}, sql).tokenize() else {
+        return false;
+    };
+    let tokens: Vec<_> = tokens
+        .iter()
+        .filter(|token| !matches!(token, Token::Whitespace(_)))
+        .collect();
+    tokens.windows(2).any(|tokens| {
+        matches!(
+            (tokens[0], tokens[1]),
+            (Token::Word(word), Token::LParen)
+                if word.value.eq_ignore_ascii_case("ann_search")
+                    || word.value.eq_ignore_ascii_case("sparse_match")
+        )
+    })
+}
+
 pub type MongrelRecordBatchStream = datafusion::physical_plan::SendableRecordBatchStream;
 
 use arrow::array::{Array, ArrayRef, Int64Array, StringArray};
@@ -54,7 +78,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
 use mongreldb_core::{
     AlterColumn, ColumnFlags, Cursor, Database, OwnedSnapshotGuard, Schema as CoreSchema, Snapshot,
-    Table, TypeId,
+    Table, TableHandle, TypeId,
 };
 use parking_lot::Mutex;
 use std::borrow::Borrow;
@@ -65,7 +89,7 @@ use std::sync::Arc;
 /// A MongrelDB table exposed to DataFusion. Holds the live `Table` behind a mutex;
 /// each scan takes a fresh MVCC snapshot.
 pub struct MongrelProvider {
-    db: Arc<Mutex<Table>>,
+    db: TableHandle,
     schema: SchemaRef,
     core_schema: CoreSchema,
     snapshot: Option<Snapshot>,
@@ -106,6 +130,10 @@ pub(crate) struct ViewDef {
 
 impl MongrelProvider {
     pub fn new(db: Arc<Mutex<Table>>) -> Result<Self> {
+        Self::new_handle(db.into())
+    }
+
+    pub(crate) fn new_handle(db: TableHandle) -> Result<Self> {
         let (schema, core_schema) = {
             let db = db.lock();
             (arrow_conv::arrow_schema(db.schema())?, db.schema().clone())
@@ -121,7 +149,7 @@ impl MongrelProvider {
     }
 
     pub(crate) fn new_secured(
-        db: Arc<Mutex<Table>>,
+        db: TableHandle,
         database: Arc<Database>,
         table: String,
         principal: Option<mongreldb_core::Principal>,
@@ -146,7 +174,7 @@ impl MongrelProvider {
     }
 
     fn new_historical(
-        db: Arc<Mutex<Table>>,
+        db: TableHandle,
         snapshot: Snapshot,
         retention: OwnedSnapshotGuard,
         security: Option<ProviderSecurity>,
@@ -1553,7 +1581,7 @@ fn translate_sqlparser_filter(
 /// when a commit advances the epoch.
 pub struct MongrelSession {
     ctx: SessionContext,
-    db: Option<Arc<Mutex<Table>>>,
+    db: Option<TableHandle>,
     /// P4.1: the multi-table `Database` when opened via `open()`. When `Some`,
     /// the cache epoch is driven by `Database::visible_epoch()` instead of the
     /// legacy `combined_epoch()` fold.
@@ -1665,6 +1693,7 @@ impl MongrelSession {
     /// the `ann_search` UDF so SQL semantic-search predicates parse.
     pub fn new(db: Table) -> Self {
         let db = Arc::new(Mutex::new(db));
+        let handle = TableHandle::from(Arc::clone(&db));
         let ctx = SessionContext::new();
         let sql_fn_state = Arc::new(extended_sql_functions::ExtendedSqlState::default());
         register_mongrel_functions(&ctx, Arc::clone(&sql_fn_state));
@@ -1681,7 +1710,7 @@ impl MongrelSession {
         let external_modules = Arc::new(ExternalModuleRegistry::default());
         Self {
             ctx,
-            db: Some(db),
+            db: Some(handle),
             database: None,
             principal: None,
             principal_catalog_bound: false,
@@ -1745,7 +1774,7 @@ impl MongrelSession {
             external_modules.register(module)?;
         }
 
-        let mut tables: HashMap<String, Arc<Mutex<Table>>> = HashMap::new();
+        let mut tables: HashMap<String, TableHandle> = HashMap::new();
         for name in database.table_names() {
             let handle = database.table(&name)?;
             let provider = MongrelProvider::new_secured(
@@ -1847,7 +1876,7 @@ impl MongrelSession {
     /// The underlying Table handle (Phase 19.3: used by the daemon for direct
     /// put/delete/commit/count access). Returns `None` when the session was
     /// opened over an empty `Database`.
-    pub fn db(&self) -> Option<&Arc<Mutex<Table>>> {
+    pub fn db(&self) -> Option<&TableHandle> {
         self.db.as_ref()
     }
 
@@ -1894,7 +1923,7 @@ impl MongrelSession {
         let db = self.db.clone().ok_or(MongrelQueryError::Core(
             mongreldb_core::MongrelError::NotFound("no primary table".into()),
         ))?;
-        let provider = MongrelProvider::new(db.clone())?;
+        let provider = MongrelProvider::new_handle(db.clone())?;
         self.tables.lock().insert(name.to_string(), db);
         self.ctx
             .register_table(name, Arc::new(provider))
@@ -1910,7 +1939,7 @@ impl MongrelSession {
     pub async fn register_db(&self, name: &str, db: Table) -> Result<()> {
         let db_arc = Arc::new(Mutex::new(db));
         let provider = MongrelProvider::new(db_arc.clone())?;
-        self.tables.lock().insert(name.to_string(), db_arc);
+        self.tables.lock().insert(name.to_string(), db_arc.into());
         self.ctx
             .register_table(name, Arc::new(provider))
             .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
@@ -3075,7 +3104,7 @@ impl MongrelSession {
         let mut combined = primary.lock().snapshot().epoch.0;
         let tables = self.tables.lock();
         for arc in tables.values() {
-            if !Arc::ptr_eq(arc, primary) {
+            if !arc.ptr_eq(primary) {
                 let e = arc.lock().snapshot().epoch.0;
                 combined = combined.wrapping_mul(31).wrapping_add(e);
             }
@@ -4606,6 +4635,19 @@ mod tests {
             normalize_sql("SELECT   a,   b   FROM   t"),
             normalize_sql("SELECT a, b FROM t")
         );
+    }
+
+    #[test]
+    fn boolean_ai_predicate_detection_uses_sql_tokens() {
+        assert!(contains_boolean_ai_predicate(
+            "SELECT * FROM docs WHERE ANN_SEARCH (embedding, '[1]', 1)"
+        ));
+        assert!(contains_boolean_ai_predicate(
+            "PREPARE q AS SELECT * FROM docs WHERE sparse_match(sparse, '[]', 1)"
+        ));
+        assert!(!contains_boolean_ai_predicate(
+            "SELECT 'ann_search(x)', sparse_search_scored('docs', 'sparse', '[]', 1) /* ann_search(x) */"
+        ));
     }
 
     #[test]

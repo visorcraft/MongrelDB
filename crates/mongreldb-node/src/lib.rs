@@ -843,28 +843,48 @@ mod condition_limit_tests {
     }
 }
 
-/// Finalize a mergeable `AggState` to a JSON scalar, keeping integer-ness for
-/// `COUNT`/`MIN`/`MAX`/int `SUM` and a float for averages / float columns.
-fn agg_state_to_json(s: &mongreldb_core::AggState) -> serde_json::Value {
-    use mongreldb_core::AggState::*;
-    let num = |x: f64| {
-        serde_json::Number::from_f64(x)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null)
-    };
-    match s {
-        Count(n) => serde_json::Value::from(*n),
-        SumI { sum, .. } => i64::try_from(*sum)
-            .map(serde_json::Value::from)
-            .unwrap_or_else(|_| num(*sum as f64)),
-        SumF { sum, .. } => num(*sum),
-        AvgI { sum, count } if *count > 0 => num(*sum as f64 / *count as f64),
-        AvgF { sum, count } if *count > 0 => num(*sum / *count as f64),
-        AvgI { .. } | AvgF { .. } => serde_json::Value::Null,
-        MinI(n) | MaxI(n) => serde_json::Value::from(*n),
-        MinF(f) | MaxF(f) => num(*f),
-        Empty => serde_json::Value::Null,
+fn aggregate_rows_json(
+    rows: &[mongreldb_core::memtable::Row],
+    column_id: Option<u16>,
+    aggregate: &str,
+) -> napi::Result<serde_json::Value> {
+    if aggregate == "count" {
+        return Ok(serde_json::Value::from(rows.len() as u64));
     }
+    let column_id = column_id.ok_or_else(|| {
+        napi::Error::new(
+            napi::Status::InvalidArg,
+            format!("columnId is required for {aggregate}"),
+        )
+    })?;
+    let values = rows
+        .iter()
+        .filter_map(|row| match row.columns.get(&column_id) {
+            Some(Value::Int64(value)) => Some(*value as f64),
+            Some(Value::Float64(value)) => Some(*value),
+            Some(Value::Decimal(value)) => Some(*value as f64),
+            _ => None,
+        });
+    let (sum, count, min, max) = values.fold(
+        (0.0, 0u64, f64::INFINITY, f64::NEG_INFINITY),
+        |(sum, count, min, max), value| (sum + value, count + 1, min.min(value), max.max(value)),
+    );
+    let value = match (aggregate, count) {
+        (_, 0) => return Ok(serde_json::Value::Null),
+        ("sum", _) => sum,
+        ("avg", _) => sum / count as f64,
+        ("min", _) => min,
+        ("max", _) => max,
+        _ => {
+            return Err(napi::Error::new(
+                napi::Status::InvalidArg,
+                format!("unknown aggregate '{aggregate}'"),
+            ))
+        }
+    };
+    Ok(serde_json::Number::from_f64(value)
+        .map(serde_json::Value::Number)
+        .unwrap_or(serde_json::Value::Null))
 }
 
 fn build_query_from_conditions(conditions: Vec<Condition>) -> Query {
@@ -2018,31 +2038,41 @@ pub struct PutResult {
 
 #[napi]
 impl TableHandle {
-    /// Upsert one row. Returns the row id and, when the engine allocated it,
-    /// the `AUTO_INCREMENT` value.
+    /// Durably insert one row. Returns its row id and optional auto-increment value.
     #[napi]
     pub fn put(&self, cells: Vec<Cell>) -> napi::Result<PutResult> {
-        let handle = self.db.table(&self.name).map_err(to_napi)?;
-        let mut g = handle.lock();
-        let cols = cell_pairs_table(&g, cells)?;
-        let (rid, auto) = g.put_returning(cols).map_err(to_napi)?;
+        let cols = {
+            let handle = self.db.table(&self.name).map_err(to_napi)?;
+            let g = handle.lock();
+            cell_pairs_table(&g, cells)?
+        };
+        let (result, row_ids) = self
+            .db
+            .transaction_with_row_ids_for_current_principal(|transaction| {
+                transaction.put_returning(&self.name, cols)
+            })
+            .map_err(to_napi)?;
+        let row_id = row_ids
+            .first()
+            .ok_or_else(|| napi::Error::from_reason("committed put returned no row ID"))?;
         Ok(PutResult {
-            row_id: BigInt::from(rid.0),
-            auto_inc: auto.map(BigInt::from),
+            row_id: BigInt::from(row_id.0),
+            auto_inc: result.auto_inc.map(BigInt::from),
         })
     }
 
     /// Group-commit this table's pending writes.
     #[napi]
     pub fn commit(&self) -> napi::Result<BigInt> {
-        let handle = self.db.table(&self.name).map_err(to_napi)?;
-        let mut g = handle.lock();
-        g.commit().map(|e| BigInt::from(e.0)).map_err(to_napi)
+        Ok(BigInt::from(self.db.visible_epoch().0))
     }
 
     /// Flush: commit + drain memtable to a sorted run.
     #[napi]
     pub fn flush(&self) -> napi::Result<BigInt> {
+        self.db
+            .require(&mongreldb_core::Permission::Admin)
+            .map_err(to_napi)?;
         let handle = self.db.table(&self.name).map_err(to_napi)?;
         let mut g = handle.lock();
         g.flush().map(|e| BigInt::from(e.0)).map_err(to_napi)
@@ -2104,6 +2134,11 @@ impl TableHandle {
     /// commit.
     #[napi]
     pub fn reserve_auto_inc(&self) -> napi::Result<Option<BigInt>> {
+        self.db
+            .require(&mongreldb_core::Permission::Insert {
+                table: self.name.clone(),
+            })
+            .map_err(to_napi)?;
         let handle = self.db.table(&self.name).map_err(to_napi)?;
         let mut g = handle.lock();
         let v = g.reserve_auto_inc().map_err(to_napi)?;
@@ -2126,28 +2161,34 @@ impl TableHandle {
     /// Delete a row by storage row id.
     #[napi]
     pub fn delete(&self, row_id: BigInt) -> napi::Result<()> {
-        let handle = self.db.table(&self.name).map_err(to_napi)?;
-        let mut g = handle.lock();
-        g.delete(RowId(bigint_to_u64(&row_id)?)).map_err(to_napi)
+        let row_id = RowId(bigint_to_u64(&row_id)?);
+        self.db
+            .transaction_for_current_principal(|transaction| transaction.delete(&self.name, row_id))
+            .map_err(to_napi)
     }
 
-    /// Truncate all rows in this table. Call `commit()` to make it durable.
+    /// Durably truncate all rows. RLS-secured tables reject truncate.
     #[napi]
     pub fn truncate(&self) -> napi::Result<()> {
-        let handle = self.db.table(&self.name).map_err(to_napi)?;
-        let mut g = handle.lock();
-        g.truncate().map_err(to_napi)
+        self.db
+            .transaction_for_current_principal(|transaction| transaction.truncate(&self.name))
+            .map_err(to_napi)
     }
 
     /// Delete the first row matching a text primary key.
     #[napi]
     pub fn delete_by_pk_text(&self, text: String) -> napi::Result<()> {
-        let handle = self.db.table(&self.name).map_err(to_napi)?;
-        let mut g = handle.lock();
         let q = Query::pk(text.into_bytes());
-        let rows = g.query_cached(&q).map_err(to_napi)?;
+        let rows = self
+            .db
+            .query_for_current_principal(&self.name, &q, None)
+            .map_err(to_napi)?;
         if let Some(r) = rows.first() {
-            g.delete(r.row_id).map_err(to_napi)?;
+            self.db
+                .transaction_for_current_principal(|transaction| {
+                    transaction.delete(&self.name, r.row_id)
+                })
+                .map_err(to_napi)?;
         }
         Ok(())
     }
@@ -2155,12 +2196,17 @@ impl TableHandle {
     /// Delete the first row matching an Int64 primary key.
     #[napi]
     pub fn delete_by_pk_int64(&self, value: BigInt) -> napi::Result<()> {
-        let handle = self.db.table(&self.name).map_err(to_napi)?;
-        let mut g = handle.lock();
         let q = Query::pk(bigint_to_i64(&value)?.to_be_bytes().to_vec());
-        let rows = g.query_cached(&q).map_err(to_napi)?;
+        let rows = self
+            .db
+            .query_for_current_principal(&self.name, &q, None)
+            .map_err(to_napi)?;
         if let Some(r) = rows.first() {
-            g.delete(r.row_id).map_err(to_napi)?;
+            self.db
+                .transaction_for_current_principal(|transaction| {
+                    transaction.delete(&self.name, r.row_id)
+                })
+                .map_err(to_napi)?;
         }
         Ok(())
     }
@@ -2260,13 +2306,16 @@ impl TableHandle {
             })
             .collect::<napi::Result<Vec<_>>>()?;
         self.db
-            .ann_rerank_for_current_principal(&self.name, &AnnRerankRequest {
-                column_id,
-                query,
-                candidate_k: candidate_k as usize,
-                limit: limit as usize,
-                metric,
-            })
+            .ann_rerank_for_current_principal(
+                &self.name,
+                &AnnRerankRequest {
+                    column_id,
+                    query,
+                    candidate_k: candidate_k as usize,
+                    limit: limit as usize,
+                    metric,
+                },
+            )
             .map(|hits| {
                 hits.into_iter()
                     .map(|hit| AnnRerankHitJs {
@@ -2289,9 +2338,12 @@ impl TableHandle {
             .db
             .snapshot_at_owned(mongreldb_core::Epoch(epoch))
             .map_err(to_napi)?;
+        let rows = self
+            .db
+            .rows_at_epoch_for_current_principal(&self.name, snap)
+            .map_err(to_napi)?;
         let handle = self.db.table(&self.name).map_err(to_napi)?;
         let g = handle.lock();
-        let rows = g.visible_rows(snap).map_err(to_napi)?;
         Ok(rows.iter().map(|r| row_to_js_table(&g, r)).collect())
     }
 
@@ -2305,28 +2357,35 @@ impl TableHandle {
         column_id: Option<u32>,
         z: f64,
     ) -> napi::Result<Option<String>> {
-        let kind = match agg.as_str() {
-            "count" => mongreldb_core::ApproxAgg::Count,
-            "sum" => mongreldb_core::ApproxAgg::Sum,
-            "avg" => mongreldb_core::ApproxAgg::Avg,
+        match agg.as_str() {
+            "count" | "sum" | "avg" => {}
             other => {
                 return Err(napi::Error::from_reason(format!(
                     "unknown approx aggregate '{other}'"
                 )))
             }
-        };
+        }
+        if !z.is_finite() || z <= 0.0 {
+            return Err(napi::Error::new(
+                napi::Status::InvalidArg,
+                "z must be finite and > 0",
+            ));
+        }
         let cid = column_id.map(|c| c as u16);
-        let handle = self.db.table(&self.name).map_err(to_napi)?;
-        let mut g = handle.lock();
-        let res = g.approx_aggregate(&[], cid, kind, z).map_err(to_napi)?;
-        Ok(res.map(|r| {
+        let projection = cid.map(|column| vec![column]);
+        let rows = self
+            .db
+            .query_for_current_principal(&self.name, &Query::new(), projection.as_deref())
+            .map_err(to_napi)?;
+        let point = aggregate_rows_json(&rows, cid, &agg)?;
+        Ok(point.as_f64().map(|point| {
             serde_json::json!({
-                "point": r.point,
-                "ci_low": r.ci_low,
-                "ci_high": r.ci_high,
-                "n_population": r.n_population,
-                "n_sample_live": r.n_sample_live,
-                "n_passing": r.n_passing,
+                "point": point,
+                "ci_low": point,
+                "ci_high": point,
+                "n_population": rows.len(),
+                "n_sample_live": rows.len(),
+                "n_passing": rows.len(),
             })
             .to_string()
         }))
@@ -2344,34 +2403,27 @@ impl TableHandle {
         column_id: Option<u32>,
         conditions: Vec<ConditionSpec>,
     ) -> napi::Result<String> {
-        let kind = match agg.as_str() {
-            "count" => mongreldb_core::NativeAgg::Count,
-            "sum" => mongreldb_core::NativeAgg::Sum,
-            "min" => mongreldb_core::NativeAgg::Min,
-            "max" => mongreldb_core::NativeAgg::Max,
-            "avg" => mongreldb_core::NativeAgg::Avg,
+        match agg.as_str() {
+            "count" | "sum" | "min" | "max" | "avg" => {}
             other => {
                 return Err(napi::Error::from_reason(format!(
                     "unknown aggregate '{other}'"
                 )))
             }
-        };
+        }
         let cid = column_id.map(|c| c as u16);
         let conds = build_conditions(&conditions)?;
-        // Stable per-(table,column,agg,conditions) cache key.
-        let cache_key = mongreldb_core::index::minhash_token_hash(&format!(
-            "{:?}",
-            (&self.name, cid, &agg, &conds)
-        ));
-        let handle = self.db.table(&self.name).map_err(to_napi)?;
-        let mut g = handle.lock();
-        let res = g
-            .aggregate_incremental(cache_key, &conds, cid, kind)
+        let query = build_query_from_conditions(conds);
+        let projection = cid.map(|column| vec![column]);
+        let rows = self
+            .db
+            .query_for_current_principal(&self.name, &query, projection.as_deref())
             .map_err(to_napi)?;
+        let value = aggregate_rows_json(&rows, cid, &agg)?;
         Ok(serde_json::json!({
-            "value": agg_state_to_json(&res.state),
-            "incremental": res.incremental,
-            "delta_rows": res.delta_rows,
+            "value": value,
+            "incremental": false,
+            "delta_rows": rows.len(),
         })
         .to_string())
     }
@@ -2381,17 +2433,31 @@ impl TableHandle {
     #[napi]
     pub fn put_batch(&self, rows: Vec<Vec<Cell>>) -> napi::Result<Vec<PutResult>> {
         let handle = self.db.table(&self.name).map_err(to_napi)?;
-        let mut g = handle.lock();
+        let g = handle.lock();
         let mut batch = Vec::with_capacity(rows.len());
         for cells in rows {
             batch.push(cell_pairs_table(&g, cells)?);
         }
-        let rids = g.put_batch_returning(batch).map_err(to_napi)?;
-        Ok(rids
+        drop(g);
+        let row_count = batch.len();
+        let (assigned, row_ids) = self
+            .db
+            .transaction_with_row_ids_for_current_principal(|transaction| {
+                transaction.put_batch(&self.name, batch)
+            })
+            .map_err(to_napi)?;
+        if row_ids.len() < row_count {
+            return Err(napi::Error::from_reason(
+                "committed batch returned too few row IDs",
+            ));
+        }
+        Ok(row_ids
             .into_iter()
-            .map(|(r, a)| PutResult {
-                row_id: BigInt::from(r.0),
-                auto_inc: a.map(BigInt::from),
+            .zip(assigned)
+            .take(row_count)
+            .map(|(row_id, auto_inc)| PutResult {
+                row_id: BigInt::from(row_id.0),
+                auto_inc: auto_inc.map(BigInt::from),
             })
             .collect())
     }
@@ -2401,6 +2467,9 @@ impl TableHandle {
     /// Bytes/Embedding columns are not supported here — use `putBatch`.
     #[napi]
     pub fn bulk_load_typed(&self, columns: Vec<TypedColumn>) -> napi::Result<BigInt> {
+        self.db
+            .require(&mongreldb_core::Permission::Admin)
+            .map_err(to_napi)?;
         let native = columns
             .into_iter()
             .map(|c| c.into_native())
@@ -2428,11 +2497,20 @@ impl TableHandle {
         let name = self.name.clone();
         let (rid, auto) =
             napi::bindgen_prelude::spawn_blocking(move || -> napi::Result<(u64, Option<i64>)> {
-                let handle = db.table(&name).map_err(to_napi)?;
-                let mut g = handle.lock();
-                let cols = cell_pairs_table(&g, cells)?;
-                let (rid, auto) = g.put_returning(cols).map_err(to_napi)?;
-                Ok((rid.0, auto))
+                let cols = {
+                    let handle = db.table(&name).map_err(to_napi)?;
+                    let g = handle.lock();
+                    cell_pairs_table(&g, cells)?
+                };
+                let (result, row_ids) = db
+                    .transaction_with_row_ids_for_current_principal(|transaction| {
+                        transaction.put_returning(&name, cols)
+                    })
+                    .map_err(to_napi)?;
+                let row_id = row_ids
+                    .first()
+                    .ok_or_else(|| napi::Error::from_reason("committed put returned no row ID"))?;
+                Ok((row_id.0, result.auto_inc))
             })
             .await
             .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e:?}")))??;
@@ -2445,14 +2523,9 @@ impl TableHandle {
     #[napi]
     pub async fn commit_async(&self) -> napi::Result<BigInt> {
         let db = Arc::clone(&self.db);
-        let name = self.name.clone();
-        napi::bindgen_prelude::spawn_blocking(move || {
-            let handle = db.table(&name).map_err(to_napi)?;
-            let mut g = handle.lock();
-            g.commit().map(|e| BigInt::from(e.0)).map_err(to_napi)
-        })
-        .await
-        .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e:?}")))?
+        napi::bindgen_prelude::spawn_blocking(move || Ok(BigInt::from(db.visible_epoch().0)))
+            .await
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e:?}")))?
     }
 
     #[napi]
@@ -2471,21 +2544,11 @@ impl TableHandle {
         let db = Arc::clone(&self.db);
         let name = self.name.clone();
         napi::bindgen_prelude::spawn_blocking(move || {
-            let handle = db.table(&name).map_err(to_napi)?;
-            let mut g = handle.lock();
-            if conditions.is_empty() {
-                return Ok(BigInt::from(g.count()));
-            }
             let core_conditions = build_conditions(&conditions)?;
-            let snap = g.snapshot();
-            if let Some(count) = g
-                .count_conditions(&core_conditions, snap)
-                .map_err(to_napi)?
-            {
-                return Ok(BigInt::from(count));
-            }
             let q = build_query_from_conditions(core_conditions);
-            let rows = g.query_cached(&q).map_err(to_napi)?;
+            let rows = db
+                .query_for_current_principal(&name, &q, None)
+                .map_err(to_napi)?;
             Ok(BigInt::from(rows.len() as u64))
         })
         .await
@@ -2531,6 +2594,8 @@ impl TableHandle {
         let db = Arc::clone(&self.db);
         let name = self.name.clone();
         napi::bindgen_prelude::spawn_blocking(move || {
+            db.require(&mongreldb_core::Permission::Admin)
+                .map_err(to_napi)?;
             let handle = db.table(&name).map_err(to_napi)?;
             let mut g = handle.lock();
             g.flush().map(|e| BigInt::from(e.0)).map_err(to_napi)
@@ -3044,56 +3109,56 @@ fn apply_txn(
     db: &CoreDatabase,
     stage: &[(String, TxnOp)],
 ) -> mongreldb_core::Result<(mongreldb_core::Epoch, Vec<OpResult>)> {
-    let mut tx = db.begin();
-    let mut out = Vec::with_capacity(stage.len());
-    for (table, op) in stage {
-        match op {
-            TxnOp::Put { cells, auto_inc } => {
-                let mut result = tx.put_returning(table, cells.clone())?;
-                if result.auto_inc.is_none() {
-                    result.auto_inc = *auto_inc;
+    db.transaction_for_current_principal_with_epoch(|tx| {
+        let mut out = Vec::with_capacity(stage.len());
+        for (table, op) in stage {
+            match op {
+                TxnOp::Put { cells, auto_inc } => {
+                    let mut result = tx.put_returning(table, cells.clone())?;
+                    if result.auto_inc.is_none() {
+                        result.auto_inc = *auto_inc;
+                    }
+                    out.push(OpResult::Put {
+                        table: table.clone(),
+                        result,
+                    });
                 }
-                out.push(OpResult::Put {
-                    table: table.clone(),
-                    result,
-                });
-            }
-            TxnOp::Delete(rid) => {
-                tx.delete(table, *rid)?;
-                out.push(OpResult::None);
-            }
-            TxnOp::Truncate => {
-                tx.truncate(table)?;
-                out.push(OpResult::None);
-            }
-            TxnOp::Upsert {
-                insert_cells,
-                action,
-            } => {
-                let result = tx.upsert(table, insert_cells.clone(), action.clone())?;
-                out.push(OpResult::Upsert {
-                    table: table.clone(),
-                    result,
-                });
-            }
-            TxnOp::UpdateMany { updates } => {
-                let rows = tx.update_many(table, updates.clone())?;
-                out.push(OpResult::Rows {
-                    table: table.clone(),
-                    rows,
-                });
-            }
-            TxnOp::DeleteMany { row_ids } => {
-                let rows = tx.delete_many(table, row_ids.clone())?;
-                out.push(OpResult::Rows {
-                    table: table.clone(),
-                    rows,
-                });
+                TxnOp::Delete(rid) => {
+                    tx.delete(table, *rid)?;
+                    out.push(OpResult::None);
+                }
+                TxnOp::Truncate => {
+                    tx.truncate(table)?;
+                    out.push(OpResult::None);
+                }
+                TxnOp::Upsert {
+                    insert_cells,
+                    action,
+                } => {
+                    let result = tx.upsert(table, insert_cells.clone(), action.clone())?;
+                    out.push(OpResult::Upsert {
+                        table: table.clone(),
+                        result,
+                    });
+                }
+                TxnOp::UpdateMany { updates } => {
+                    let rows = tx.update_many(table, updates.clone())?;
+                    out.push(OpResult::Rows {
+                        table: table.clone(),
+                        rows,
+                    });
+                }
+                TxnOp::DeleteMany { row_ids } => {
+                    let rows = tx.delete_many(table, row_ids.clone())?;
+                    out.push(OpResult::Rows {
+                        table: table.clone(),
+                        rows,
+                    });
+                }
             }
         }
-    }
-    let epoch = tx.commit()?;
-    Ok((epoch, out))
+        Ok(out)
+    })
 }
 
 /// Phase 20.2: a typed column for bulk loading, wrapping JS typed-array data.
@@ -3203,10 +3268,12 @@ impl WriteBuffer {
             return Ok(BigInt::from(handle.lock().current_epoch().0));
         }
         let batch = std::mem::take(&mut self.buffer);
-        let handle = self.db.table(&self.table_name).map_err(to_napi)?;
-        let mut g = handle.lock();
-        g.put_batch(batch).map_err(to_napi)?;
-        let epoch = g.commit().map_err(to_napi)?;
+        let (epoch, _) = self
+            .db
+            .transaction_for_current_principal_with_epoch(|transaction| {
+                transaction.put_batch(&self.table_name, batch)
+            })
+            .map_err(to_napi)?;
         Ok(BigInt::from(epoch.0))
     }
 }
@@ -3564,49 +3631,81 @@ fn rows_to_native_cols(
                 TypeId::Int64 | TypeId::TimestampNanos | TypeId::Date32 => {
                     let values = values
                         .iter()
-                        .map(|value| value.and_then(|value| match value {
-                            Value::Int64(value) => Some(*value),
-                            _ => None,
-                        }))
+                        .map(|value| {
+                            value.and_then(|value| match value {
+                                Value::Int64(value) => Some(*value),
+                                _ => None,
+                            })
+                        })
                         .collect::<Vec<_>>();
                     NativeColumn::Int64 {
-                        validity: validity(&values.iter().map(|value| value.map(|_| ())).collect::<Vec<_>>()),
-                        data: values.into_iter().map(|value| value.unwrap_or_default()).collect(),
+                        validity: validity(
+                            &values
+                                .iter()
+                                .map(|value| value.map(|_| ()))
+                                .collect::<Vec<_>>(),
+                        ),
+                        data: values
+                            .into_iter()
+                            .map(|value| value.unwrap_or_default())
+                            .collect(),
                     }
                 }
                 TypeId::Float64 => {
                     let values = values
                         .iter()
-                        .map(|value| value.and_then(|value| match value {
-                            Value::Float64(value) => Some(*value),
-                            _ => None,
-                        }))
+                        .map(|value| {
+                            value.and_then(|value| match value {
+                                Value::Float64(value) => Some(*value),
+                                _ => None,
+                            })
+                        })
                         .collect::<Vec<_>>();
                     NativeColumn::Float64 {
-                        validity: validity(&values.iter().map(|value| value.map(|_| ())).collect::<Vec<_>>()),
-                        data: values.into_iter().map(|value| value.unwrap_or_default()).collect(),
+                        validity: validity(
+                            &values
+                                .iter()
+                                .map(|value| value.map(|_| ()))
+                                .collect::<Vec<_>>(),
+                        ),
+                        data: values
+                            .into_iter()
+                            .map(|value| value.unwrap_or_default())
+                            .collect(),
                     }
                 }
                 TypeId::Bool => {
                     let values = values
                         .iter()
-                        .map(|value| value.and_then(|value| match value {
-                            Value::Bool(value) => Some(*value as u8),
-                            _ => None,
-                        }))
+                        .map(|value| {
+                            value.and_then(|value| match value {
+                                Value::Bool(value) => Some(*value as u8),
+                                _ => None,
+                            })
+                        })
                         .collect::<Vec<_>>();
                     NativeColumn::Bool {
-                        validity: validity(&values.iter().map(|value| value.map(|_| ())).collect::<Vec<_>>()),
-                        data: values.into_iter().map(|value| value.unwrap_or_default()).collect(),
+                        validity: validity(
+                            &values
+                                .iter()
+                                .map(|value| value.map(|_| ()))
+                                .collect::<Vec<_>>(),
+                        ),
+                        data: values
+                            .into_iter()
+                            .map(|value| value.unwrap_or_default())
+                            .collect(),
                     }
                 }
                 _ => {
                     let values = values
                         .iter()
-                        .map(|value| value.and_then(|value| match value {
-                            Value::Bytes(value) | Value::Json(value) => Some(value.as_slice()),
-                            _ => None,
-                        }))
+                        .map(|value| {
+                            value.and_then(|value| match value {
+                                Value::Bytes(value) | Value::Json(value) => Some(value.as_slice()),
+                                _ => None,
+                            })
+                        })
                         .collect::<Vec<_>>();
                     let mut offsets = Vec::with_capacity(values.len() + 1);
                     let mut bytes = Vec::new();
@@ -3618,7 +3717,12 @@ fn rows_to_native_cols(
                         offsets.push(bytes.len() as u32);
                     }
                     NativeColumn::Bytes {
-                        validity: validity(&values.iter().map(|value| value.map(|_| ())).collect::<Vec<_>>()),
+                        validity: validity(
+                            &values
+                                .iter()
+                                .map(|value| value.map(|_| ()))
+                                .collect::<Vec<_>>(),
+                        ),
                         offsets,
                         values: bytes,
                     }

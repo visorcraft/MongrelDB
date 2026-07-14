@@ -123,6 +123,7 @@ impl Row {
 /// Bε-tree-backed memtable, ordered by `(RowId, Epoch)`. A drop-in replacement
 /// for the prototype skip list: the same MVCC semantics with lower write
 /// amplification (buffered messages flush to children in bulk).
+#[derive(Clone)]
 pub struct Memtable {
     tree: BeTree,
     byte_size: u64,

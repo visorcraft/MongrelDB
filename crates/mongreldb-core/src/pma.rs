@@ -16,6 +16,7 @@ const LEAF_WINDOW: usize = 8; // smallest rebalance window
 const HIGH_WATERMARK: f64 = 0.8; // global density that triggers a grow+redistribute
 
 /// A packed-memory array of `(K, V)` pairs sorted by `K`.
+#[derive(Clone)]
 pub struct Pma<K: Ord + Clone, V: Clone> {
     buf: Vec<Option<(K, V)>>,
     capacity: usize, // power of two

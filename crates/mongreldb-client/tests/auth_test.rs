@@ -76,6 +76,7 @@ fn search_request() -> KitSearchRequest {
         deadline_ms: None,
         max_work: None,
         explain: false,
+        cursor: None,
     }
 }
 
@@ -143,10 +144,12 @@ async fn auth_failures_decode_to_typed_errors() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/kit/search"))
-            .respond_with(ResponseTemplate::new(status).set_body_json(serde_json::json!({
-                "status": "error",
-                "error": {"code": code, "message": "denied"}
-            })))
+            .respond_with(
+                ResponseTemplate::new(status).set_body_json(serde_json::json!({
+                    "status": "error",
+                    "error": {"code": code, "message": "denied"}
+                })),
+            )
             .expect(1)
             .mount(&server)
             .await;

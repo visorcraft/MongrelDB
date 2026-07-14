@@ -8,6 +8,7 @@ use roaring::RoaringBitmap;
 
 /// `value → row-id set`. Values are type-aware encoded bytes (lexicographically
 /// comparable), matching the encoding used for page min/max.
+#[derive(Clone)]
 pub struct BitmapIndex {
     map: std::collections::HashMap<Vec<u8>, RoaringBitmap>,
 }

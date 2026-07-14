@@ -27,6 +27,7 @@ type VersionKey = (RowId, Epoch);
 
 /// The PMA-backed mutable run tier. Holds flushed-but-not-yet-spilled rows in
 /// sorted `(RowId, Epoch)` order.
+#[derive(Clone)]
 pub struct MutableRun {
     pma: Pma<VersionKey, Row>,
     byte_size: u64,

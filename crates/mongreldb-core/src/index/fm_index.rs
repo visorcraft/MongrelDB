@@ -17,10 +17,12 @@ const RANK_BLOCK_BITS: usize = 512;
 const RANK_BLOCK_WORDS: usize = RANK_BLOCK_BITS / 64;
 
 /// A wavelet tree over byte symbols with `rank` (count of `c` in `[0, i)`).
+#[derive(Clone)]
 struct WaveletTree {
     root: WtNode,
 }
 
+#[derive(Clone)]
 enum WtNode {
     Leaf,
     Inner {
@@ -143,6 +145,7 @@ fn rank_node(node: &WtNode, c: u32, i: usize) -> usize {
 /// of rebuilding the suffix array / BWT / wavelet tree on every single insert
 /// (Phase 11.3: amortized incremental updates — the build runs lazily on the
 /// first query after a batch of inserts, not once per row).
+#[derive(Clone)]
 struct Built {
     doc_start: Vec<usize>,
     bwt: Vec<u8>,
@@ -160,6 +163,15 @@ pub struct FmIndex {
     /// so that `FmIndex` (and by extension `Table`) is `Sync` and a `&Table`
     /// can be shared across read threads.
     built: parking_lot::Mutex<Option<Built>>,
+}
+
+impl Clone for FmIndex {
+    fn clone(&self) -> Self {
+        Self {
+            docs: self.docs.clone(),
+            built: parking_lot::Mutex::new(self.built.lock().clone()),
+        }
+    }
 }
 
 impl Default for FmIndex {

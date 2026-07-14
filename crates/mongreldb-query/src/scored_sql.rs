@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-pub(crate) type TableMap = Arc<Mutex<HashMap<String, Arc<Mutex<Table>>>>>;
+pub(crate) type TableMap = Arc<Mutex<HashMap<String, mongreldb_core::TableHandle>>>;
 
 pub(crate) struct ScoredRuntime {
     timeout_ms: AtomicU64,
@@ -314,6 +314,8 @@ struct LiveScoredProvider {
 
 struct CancelOnDrop(Option<mongreldb_core::query::AiExecutionContext>);
 
+const CANCELLATION_GRACE: Duration = Duration::from_millis(100);
+
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
         if let Some(context) = &self.0 {
@@ -370,7 +372,12 @@ impl TableProvider for LiveScoredProvider {
             })?,
             Err(_) => {
                 context.cancel();
-                let _ = task.await;
+                if tokio::time::timeout(CANCELLATION_GRACE, &mut task)
+                    .await
+                    .is_err()
+                {
+                    eprintln!("scored SQL worker exceeded cancellation grace");
+                }
                 Err(DataFusionError::Execution(
                     "scored SQL deadline exceeded".into(),
                 ))
@@ -457,37 +464,48 @@ fn output_schema(schema: &Schema, projection: &[u16], extra: Vec<Field>) -> DFRe
     Ok(Arc::new(ArrowSchema::new(fields)))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn with_scored_read<T>(
     database: Option<&Arc<Database>>,
-    handle: &Arc<Mutex<Table>>,
+    handle: &mongreldb_core::TableHandle,
     table_name: &str,
     principal: Option<&Principal>,
     principal_catalog_bound: bool,
+    required_columns: &[u16],
     context: &mongreldb_core::query::AiExecutionContext,
     mut read: impl FnMut(
-        &mut Table,
+        &Table,
         mongreldb_core::Snapshot,
         Option<&mongreldb_core::security::CandidateAuthorization<'_>>,
         Option<&Principal>,
     ) -> mongreldb_core::Result<T>,
 ) -> DFResult<T> {
     match database {
-        Some(database) => database
-            .with_authorized_scored_read_context(
-                table_name,
-                principal,
-                principal_catalog_bound,
-                Some(context),
-                read,
-            )
-            .map_err(|error| DataFusionError::Execution(error.to_string())),
+        Some(database) => {
+            let authorization = mongreldb_core::ReadAuthorization {
+                operation: mongreldb_core::ColumnOperation::Select,
+                columns: required_columns.to_vec(),
+            };
+            database
+                .with_authorized_scored_read_context_at(
+                    table_name,
+                    principal,
+                    principal_catalog_bound,
+                    Some(&authorization),
+                    Some(context),
+                    None,
+                    read,
+                )
+                .map_err(|error| DataFusionError::Execution(error.to_string()))
+        }
         None => {
-            let mut table = handle.lock();
-            let snapshot = table.snapshot();
+            let (generation, snapshot) = handle
+                .read_generation_with_context(Some(context))
+                .map_err(|error| DataFusionError::Execution(error.to_string()))?;
             context
                 .checkpoint()
                 .map_err(|error| DataFusionError::Execution(error.to_string()))?;
-            read(&mut table, snapshot, None, principal)
+            read(generation.as_ref(), snapshot, None, principal)
                 .map_err(|error| DataFusionError::Execution(error.to_string()))
         }
     }
@@ -598,6 +616,7 @@ impl TableFunctionImpl for ScoredFunction {
                     &table_name,
                     principal.as_ref(),
                     principal_catalog_bound,
+                    &required_columns,
                     context,
                     |table, snapshot, authorization, effective_principal| {
                         if let Some(database) = &database {
@@ -608,7 +627,7 @@ impl TableFunctionImpl for ScoredFunction {
                                 effective_principal,
                             )?;
                         }
-                        let hits = table.retrieve_at_with_candidate_authorization_and_context(
+                        let hits = table.retrieve_at_with_candidate_authorization_on_generation(
                             &retriever,
                             snapshot,
                             authorization,
@@ -788,6 +807,7 @@ impl ScoredFunction {
                     &table_name,
                     principal.as_ref(),
                     principal_catalog_bound,
+                    &required_columns,
                     context,
                     |table, snapshot, authorization, effective_principal| {
                         if let Some(database) = &database {
@@ -798,7 +818,7 @@ impl ScoredFunction {
                                 effective_principal,
                             )?;
                         }
-                        let hits = table.ann_rerank_at_with_candidate_authorization_and_context(
+                        let hits = table.ann_rerank_at_with_candidate_authorization_on_generation(
                             &request,
                             snapshot,
                             authorization,
@@ -949,6 +969,7 @@ impl ScoredFunction {
                     &table_name,
                     principal.as_ref(),
                     principal_catalog_bound,
+                    &required_columns,
                     context,
                     |table, snapshot, authorization, effective_principal| {
                         if let Some(database) = &database {
@@ -960,7 +981,7 @@ impl ScoredFunction {
                             )?;
                         }
                         let hits = table
-                            .set_similarity_at_with_candidate_authorization_and_context(
+                            .set_similarity_at_with_candidate_authorization_on_generation(
                                 &request,
                                 snapshot,
                                 authorization,
@@ -1115,6 +1136,7 @@ impl ScoredFunction {
                     &table_name,
                     principal.as_ref(),
                     principal_catalog_bound,
+                    &required_columns,
                     context,
                     |table, snapshot, authorization, effective_principal| {
                         if let Some(database) = &database {
@@ -1125,7 +1147,7 @@ impl ScoredFunction {
                                 effective_principal,
                             )?;
                         }
-                        let hits = table.search_at_with_candidate_authorization_and_context(
+                        let hits = table.search_at_with_candidate_authorization_on_generation(
                             &request,
                             snapshot,
                             authorization,

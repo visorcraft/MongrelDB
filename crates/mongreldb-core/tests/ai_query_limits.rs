@@ -1,10 +1,11 @@
 use mongreldb_core::query::{
     AiExecutionContext, AnnRerankRequest, Condition, Fusion, NamedRetriever, Retriever,
-    SearchRequest, SetMember, VectorMetric, MAX_FINAL_LIMIT, MAX_FUSED_CANDIDATES,
-    MAX_PROJECTION_COLUMNS, MAX_RETRIEVERS, MAX_RETRIEVER_K, MAX_SET_MEMBERS, MAX_SPARSE_TERMS,
+    SearchRequest, SetMember, SetSimilarityRequest, VectorMetric, MAX_FINAL_LIMIT,
+    MAX_FUSED_CANDIDATES, MAX_PROJECTION_COLUMNS, MAX_RETRIEVERS, MAX_RETRIEVER_K, MAX_SET_MEMBERS,
+    MAX_SPARSE_TERMS,
 };
 use mongreldb_core::schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
-use mongreldb_core::{MongrelError, Table, Value};
+use mongreldb_core::{Database, MongrelError, Table, Value};
 
 fn table() -> (tempfile::TempDir, Table) {
     let dir = tempfile::tempdir().unwrap();
@@ -135,9 +136,41 @@ fn public_ai_cardinalities_fail_closed() {
         }),
         Err(MongrelError::InvalidArgument(_))
     ));
+    assert!(matches!(
+        table.retrieve(&Retriever::MinHash {
+            column_id: 4,
+            members: vec![SetMember::String(
+                "x".repeat(mongreldb_core::query::MAX_SET_MEMBER_BYTES + 1)
+            )],
+            k: 1,
+        }),
+        Err(MongrelError::InvalidArgument(_))
+    ));
 
     let mut request = search(vec![named("ann".into(), ann(1))], 1);
     request.projection = Some(vec![1; MAX_PROJECTION_COLUMNS + 1]);
+    assert!(matches!(
+        table.search(&request),
+        Err(MongrelError::InvalidArgument(_))
+    ));
+
+    let mut request = search(
+        vec![named(
+            "x".repeat(mongreldb_core::query::MAX_RETRIEVER_NAME_BYTES + 1),
+            ann(1),
+        )],
+        1,
+    );
+    assert!(matches!(
+        table.search(&request),
+        Err(MongrelError::InvalidArgument(_))
+    ));
+
+    request = search(vec![named("ann".into(), ann(1))], 1);
+    request.must.push(Condition::BitmapIn {
+        column_id: 1,
+        values: vec![Vec::new(); MAX_SET_MEMBERS + 1],
+    });
     assert!(matches!(
         table.search(&request),
         Err(MongrelError::InvalidArgument(_))
@@ -270,6 +303,164 @@ fn actual_work_budget_and_cancellation_fail_with_typed_errors() {
         Err(MongrelError::Cancelled)
     ));
     assert_eq!(table.retrieve(&sparse).unwrap().len(), 1);
+
+    let tiny_minhash = AiExecutionContext::new(None, 1);
+    assert!(matches!(
+        table.retrieve_at_with_candidate_authorization_and_context(
+            &Retriever::MinHash {
+                column_id: 4,
+                members: vec![SetMember::String("a".into())],
+                k: 1,
+            },
+            snapshot,
+            None,
+            Some(&tiny_minhash),
+        ),
+        Err(MongrelError::WorkBudgetExceeded)
+    ));
+}
+
+fn ann_table(dim: u32) -> (tempfile::TempDir, Table) {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = Schema {
+        columns: vec![
+            ColumnDef {
+                id: 1,
+                name: "id".into(),
+                ty: TypeId::Int64,
+                flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
+            },
+            ColumnDef {
+                id: 2,
+                name: "embedding".into(),
+                ty: TypeId::Embedding { dim },
+                flags: ColumnFlags::empty(),
+                default_value: None,
+            },
+        ],
+        indexes: vec![IndexDef {
+            name: "ann".into(),
+            column_id: 2,
+            kind: IndexKind::Ann,
+            predicate: None,
+            options: Default::default(),
+        }],
+        ..Schema::default()
+    };
+    let mut table = Table::create(dir.path(), schema, 1).unwrap();
+    table
+        .put(vec![
+            (1, Value::Int64(1)),
+            (2, Value::Embedding(vec![1.0; dim as usize])),
+        ])
+        .unwrap();
+    table.commit().unwrap();
+    (dir, table)
+}
+
+#[test]
+fn exact_rerank_work_scales_with_embedding_width() {
+    let (_narrow_dir, mut narrow) = ann_table(128);
+    let narrow_context = AiExecutionContext::new(None, usize::MAX);
+    narrow
+        .ann_rerank_at_with_context(
+            &AnnRerankRequest {
+                column_id: 2,
+                query: vec![1.0; 128],
+                candidate_k: 1,
+                limit: 1,
+                metric: VectorMetric::Cosine,
+            },
+            narrow.snapshot(),
+            None,
+            Some(&narrow_context),
+        )
+        .unwrap();
+
+    let (_wide_dir, mut wide) = ann_table(65_536);
+    let wide_context = AiExecutionContext::new(None, usize::MAX);
+    wide.ann_rerank_at_with_context(
+        &AnnRerankRequest {
+            column_id: 2,
+            query: vec![1.0; 65_536],
+            candidate_k: 1,
+            limit: 1,
+            metric: VectorMetric::Cosine,
+        },
+        wide.snapshot(),
+        None,
+        Some(&wide_context),
+    )
+    .unwrap();
+
+    assert!(wide_context.consumed_work() > narrow_context.consumed_work());
+}
+
+fn set_table(member_count: usize) -> (tempfile::TempDir, Table) {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = Schema {
+        columns: vec![
+            ColumnDef {
+                id: 1,
+                name: "id".into(),
+                ty: TypeId::Int64,
+                flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
+            },
+            ColumnDef {
+                id: 2,
+                name: "members".into(),
+                ty: TypeId::Bytes,
+                flags: ColumnFlags::empty(),
+                default_value: None,
+            },
+        ],
+        indexes: vec![IndexDef {
+            name: "minhash".into(),
+            column_id: 2,
+            kind: IndexKind::MinHash,
+            predicate: None,
+            options: Default::default(),
+        }],
+        ..Schema::default()
+    };
+    let mut table = Table::create(dir.path(), schema, 1).unwrap();
+    table
+        .put(vec![
+            (1, Value::Int64(1)),
+            (
+                2,
+                Value::Bytes(serde_json::to_vec(&vec![true; member_count]).unwrap()),
+            ),
+        ])
+        .unwrap();
+    table.commit().unwrap();
+    (dir, table)
+}
+
+#[test]
+fn exact_set_work_scales_with_stored_member_count() {
+    let request = SetSimilarityRequest {
+        column_id: 2,
+        members: vec![SetMember::Boolean(true)],
+        candidate_k: 1,
+        limit: 1,
+        min_jaccard: 0.0,
+    };
+    let (_small_dir, mut small) = set_table(1);
+    let small_context = AiExecutionContext::new(None, usize::MAX);
+    small
+        .set_similarity_at_with_context(&request, small.snapshot(), None, Some(&small_context))
+        .unwrap();
+
+    let (_large_dir, mut large) = set_table(MAX_SET_MEMBERS);
+    let large_context = AiExecutionContext::new(None, usize::MAX);
+    large
+        .set_similarity_at_with_context(&request, large.snapshot(), None, Some(&large_context))
+        .unwrap();
+
+    assert!(large_context.consumed_work() > small_context.consumed_work());
 }
 
 #[test]
@@ -355,4 +546,241 @@ fn fused_union_ceiling_projection_charging_and_zero_weight_are_enforced() {
         .unwrap()
         .is_empty());
     assert_eq!(zero_context.consumed_work(), 0);
+}
+
+#[test]
+fn authorized_lock_wait_observes_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = Database::create(dir.path()).unwrap();
+    database
+        .create_table(
+            "docs",
+            Schema {
+                columns: vec![ColumnDef {
+                    id: 1,
+                    name: "id".into(),
+                    ty: TypeId::Int64,
+                    flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                    default_value: None,
+                }],
+                ..Schema::default()
+            },
+        )
+        .unwrap();
+    let handle = database.table("docs").unwrap();
+    let guard = handle.lock();
+    let context = AiExecutionContext::with_timeout(std::time::Duration::from_millis(10), 100);
+    let started = std::time::Instant::now();
+    let result = database.with_authorized_scored_read_context_at(
+        "docs",
+        None,
+        false,
+        None,
+        Some(&context),
+        None,
+        |_, _, _, _| Ok(()),
+    );
+    assert!(matches!(result, Err(MongrelError::DeadlineExceeded)));
+    assert!(started.elapsed() < std::time::Duration::from_millis(100));
+    drop(guard);
+
+    database
+        .with_authorized_scored_read_context_at(
+            "docs",
+            None,
+            false,
+            None,
+            None,
+            None,
+            |_, _, _, _| Ok(()),
+        )
+        .unwrap();
+}
+
+#[test]
+fn scored_read_generation_does_not_hold_write_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = std::sync::Arc::new(Database::create(dir.path()).unwrap());
+    database
+        .create_table(
+            "docs",
+            Schema {
+                columns: vec![ColumnDef {
+                    id: 1,
+                    name: "id".into(),
+                    ty: TypeId::Int64,
+                    flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                    default_value: None,
+                }],
+                ..Schema::default()
+            },
+        )
+        .unwrap();
+    let entered = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let reader = {
+        let database = std::sync::Arc::clone(&database);
+        let entered = std::sync::Arc::clone(&entered);
+        let release = std::sync::Arc::clone(&release);
+        std::thread::spawn(move || {
+            database.with_authorized_scored_read_context_at(
+                "docs",
+                None,
+                false,
+                None,
+                None,
+                None,
+                |_, _, _, _| {
+                    entered.wait();
+                    release.wait();
+                    Ok(())
+                },
+            )
+        })
+    };
+    entered.wait();
+
+    let (sent, received) = std::sync::mpsc::channel();
+    let writer = {
+        let handle = database.table("docs").unwrap();
+        std::thread::spawn(move || {
+            let result = (|| {
+                let mut table = handle.lock();
+                table.put(vec![(1, Value::Int64(1))])?;
+                table.commit()?;
+                Ok::<_, MongrelError>(())
+            })();
+            sent.send(result).unwrap();
+        })
+    };
+    let write_result = received.recv_timeout(std::time::Duration::from_millis(500));
+    release.wait();
+    reader.join().unwrap().unwrap();
+    writer.join().unwrap();
+    write_result
+        .expect("same-table write blocked by scored read generation")
+        .unwrap();
+}
+
+#[test]
+fn scored_read_generation_pins_run_files_across_compaction_gc() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = std::sync::Arc::new(Database::create(dir.path()).unwrap());
+    database
+        .create_table(
+            "docs",
+            Schema {
+                columns: vec![
+                    ColumnDef {
+                        id: 1,
+                        name: "id".into(),
+                        ty: TypeId::Int64,
+                        flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                        default_value: None,
+                    },
+                    ColumnDef {
+                        id: 2,
+                        name: "sparse".into(),
+                        ty: TypeId::Bytes,
+                        flags: ColumnFlags::empty(),
+                        default_value: None,
+                    },
+                ],
+                indexes: vec![IndexDef {
+                    name: "sparse".into(),
+                    column_id: 2,
+                    kind: IndexKind::Sparse,
+                    predicate: None,
+                    options: Default::default(),
+                }],
+                ..Schema::default()
+            },
+        )
+        .unwrap();
+    for id in 1..=2 {
+        database
+            .transaction(|transaction| {
+                transaction.put(
+                    "docs",
+                    vec![
+                        (1, Value::Int64(id)),
+                        (
+                            2,
+                            Value::Bytes(bincode::serialize(&vec![(1u32, id as f32)]).unwrap()),
+                        ),
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        database
+            .table("docs")
+            .unwrap()
+            .lock()
+            .force_flush()
+            .unwrap();
+    }
+    assert_eq!(database.table("docs").unwrap().lock().run_count(), 2);
+
+    let entered = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let reader = {
+        let database = std::sync::Arc::clone(&database);
+        let entered = std::sync::Arc::clone(&entered);
+        let release = std::sync::Arc::clone(&release);
+        std::thread::spawn(move || {
+            database.with_authorized_scored_read_context_at(
+                "docs",
+                None,
+                false,
+                None,
+                None,
+                None,
+                |table, snapshot, authorization, _| {
+                    entered.wait();
+                    release.wait();
+                    table.retrieve_at_with_candidate_authorization_on_generation(
+                        &Retriever::Sparse {
+                            column_id: 2,
+                            query: vec![(1, 1.0)],
+                            k: 2,
+                        },
+                        snapshot,
+                        authorization,
+                        None,
+                    )
+                },
+            )
+        })
+    };
+    entered.wait();
+    assert!(database.compact_table("docs").unwrap());
+    database.gc().unwrap();
+    release.wait();
+    assert_eq!(reader.join().unwrap().unwrap().len(), 2);
+
+    assert!(database.gc().unwrap() >= 2);
+    let hits = database
+        .with_authorized_scored_read_context_at(
+            "docs",
+            None,
+            false,
+            None,
+            None,
+            None,
+            |table, snapshot, authorization, _| {
+                table.retrieve_at_with_candidate_authorization_on_generation(
+                    &Retriever::Sparse {
+                        column_id: 2,
+                        query: vec![(1, 1.0)],
+                        k: 2,
+                    },
+                    snapshot,
+                    authorization,
+                    None,
+                )
+            },
+        )
+        .unwrap();
+    assert_eq!(hits.len(), 2);
 }

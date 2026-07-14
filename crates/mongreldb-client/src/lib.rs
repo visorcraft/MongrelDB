@@ -139,6 +139,9 @@ pub struct MongrelClientBuilder {
     base_url: String,
     authorization: Option<reqwest::header::HeaderValue>,
     invalid_authorization: bool,
+    connect_timeout: Option<std::time::Duration>,
+    request_timeout: Option<std::time::Duration>,
+    pool_idle_timeout: Option<std::time::Duration>,
 }
 
 /// Builder for an [`AsyncMongrelClient`].
@@ -146,6 +149,9 @@ pub struct AsyncMongrelClientBuilder {
     base_url: String,
     authorization: Option<reqwest::header::HeaderValue>,
     invalid_authorization: bool,
+    connect_timeout: Option<std::time::Duration>,
+    request_timeout: Option<std::time::Duration>,
+    pool_idle_timeout: Option<std::time::Duration>,
 }
 
 fn bearer_header(token: &str) -> ClientResult<reqwest::header::HeaderValue> {
@@ -178,6 +184,21 @@ fn default_headers(
 }
 
 impl MongrelClientBuilder {
+    pub fn connect_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.connect_timeout = Some(timeout);
+        self
+    }
+
+    pub fn request_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.request_timeout = Some(timeout);
+        self
+    }
+
+    pub fn pool_idle_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.pool_idle_timeout = Some(timeout);
+        self
+    }
+
     pub fn bearer_token(mut self, token: impl AsRef<str>) -> Self {
         match bearer_header(token.as_ref()) {
             Ok(value) => self.authorization = Some(value),
@@ -186,11 +207,7 @@ impl MongrelClientBuilder {
         self
     }
 
-    pub fn basic_auth(
-        mut self,
-        username: impl AsRef<str>,
-        password: impl AsRef<str>,
-    ) -> Self {
+    pub fn basic_auth(mut self, username: impl AsRef<str>, password: impl AsRef<str>) -> Self {
         match basic_header(username.as_ref(), password.as_ref()) {
             Ok(value) => self.authorization = Some(value),
             Err(_) => self.invalid_authorization = true,
@@ -204,9 +221,18 @@ impl MongrelClientBuilder {
                 "invalid authorization credentials".into(),
             ));
         }
-        let client = reqwest::blocking::Client::builder()
-            .default_headers(default_headers(self.authorization))
-            .build()?;
+        let mut builder = reqwest::blocking::Client::builder()
+            .default_headers(default_headers(self.authorization));
+        if let Some(timeout) = self.connect_timeout {
+            builder = builder.connect_timeout(timeout);
+        }
+        if let Some(timeout) = self.request_timeout {
+            builder = builder.timeout(timeout);
+        }
+        if let Some(timeout) = self.pool_idle_timeout {
+            builder = builder.pool_idle_timeout(timeout);
+        }
+        let client = builder.build()?;
         Ok(MongrelClient {
             base_url: self.base_url,
             client,
@@ -215,6 +241,21 @@ impl MongrelClientBuilder {
 }
 
 impl AsyncMongrelClientBuilder {
+    pub fn connect_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.connect_timeout = Some(timeout);
+        self
+    }
+
+    pub fn request_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.request_timeout = Some(timeout);
+        self
+    }
+
+    pub fn pool_idle_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.pool_idle_timeout = Some(timeout);
+        self
+    }
+
     pub fn bearer_token(mut self, token: impl AsRef<str>) -> Self {
         match bearer_header(token.as_ref()) {
             Ok(value) => self.authorization = Some(value),
@@ -223,11 +264,7 @@ impl AsyncMongrelClientBuilder {
         self
     }
 
-    pub fn basic_auth(
-        mut self,
-        username: impl AsRef<str>,
-        password: impl AsRef<str>,
-    ) -> Self {
+    pub fn basic_auth(mut self, username: impl AsRef<str>, password: impl AsRef<str>) -> Self {
         match basic_header(username.as_ref(), password.as_ref()) {
             Ok(value) => self.authorization = Some(value),
             Err(_) => self.invalid_authorization = true,
@@ -241,9 +278,18 @@ impl AsyncMongrelClientBuilder {
                 "invalid authorization credentials".into(),
             ));
         }
-        let client = reqwest::Client::builder()
-            .default_headers(default_headers(self.authorization))
-            .build()?;
+        let mut builder =
+            reqwest::Client::builder().default_headers(default_headers(self.authorization));
+        if let Some(timeout) = self.connect_timeout {
+            builder = builder.connect_timeout(timeout);
+        }
+        if let Some(timeout) = self.request_timeout {
+            builder = builder.timeout(timeout);
+        }
+        if let Some(timeout) = self.pool_idle_timeout {
+            builder = builder.pool_idle_timeout(timeout);
+        }
+        let client = builder.build()?;
         Ok(AsyncMongrelClient {
             base_url: self.base_url,
             client,
@@ -252,27 +298,37 @@ impl AsyncMongrelClientBuilder {
 }
 
 impl MongrelClient {
-    /// Add a Bearer token to every request. Backward-compatible shortcut.
-    pub fn with_bearer_token(mut self, token: impl AsRef<str>) -> Self {
+    pub fn try_with_bearer_token(mut self, token: impl AsRef<str>) -> ClientResult<Self> {
         self.client = reqwest::blocking::Client::builder()
-            .default_headers(default_headers(Some(
-                bearer_header(token.as_ref()).expect("valid bearer credentials"),
-            )))
-            .build()
-            .expect("valid reqwest client");
-        self
+            .default_headers(default_headers(Some(bearer_header(token.as_ref())?)))
+            .build()?;
+        Ok(self)
     }
 
-    /// Add HTTP Basic credentials to every request. Chain after `new` as a builder.
-    pub fn with_basic_auth(mut self, username: impl AsRef<str>, password: impl AsRef<str>) -> Self {
+    pub fn with_bearer_token(self, token: impl AsRef<str>) -> ClientResult<Self> {
+        self.try_with_bearer_token(token)
+    }
+
+    pub fn try_with_basic_auth(
+        mut self,
+        username: impl AsRef<str>,
+        password: impl AsRef<str>,
+    ) -> ClientResult<Self> {
         self.client = reqwest::blocking::Client::builder()
-            .default_headers(default_headers(Some(
-                basic_header(username.as_ref(), password.as_ref())
-                    .expect("valid basic credentials"),
-            )))
-            .build()
-            .expect("valid reqwest client");
-        self
+            .default_headers(default_headers(Some(basic_header(
+                username.as_ref(),
+                password.as_ref(),
+            )?)))
+            .build()?;
+        Ok(self)
+    }
+
+    pub fn with_basic_auth(
+        self,
+        username: impl AsRef<str>,
+        password: impl AsRef<str>,
+    ) -> ClientResult<Self> {
+        self.try_with_basic_auth(username, password)
     }
 }
 
@@ -462,12 +518,16 @@ pub struct KitQueryRequest {
     pub limit: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub offset: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct KitQueryResponse {
     pub rows: Vec<KitQueryRow>,
     pub truncated: bool,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -588,6 +648,8 @@ pub struct KitSearchRequest {
     pub max_work: Option<usize>,
     #[serde(default)]
     pub explain: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -595,6 +657,8 @@ pub struct KitSearchResponse {
     pub hits: Vec<KitSearchHit>,
     #[serde(default)]
     pub trace: Option<serde_json::Value>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -692,6 +756,9 @@ impl MongrelClient {
             base_url: url.as_ref().trim_end_matches('/').to_string(),
             authorization: None,
             invalid_authorization: false,
+            connect_timeout: None,
+            request_timeout: None,
+            pool_idle_timeout: None,
         }
     }
 
@@ -901,10 +968,7 @@ impl MongrelClient {
         Ok(resp.json()?)
     }
 
-    pub fn kit_ann_rerank(
-        &self,
-        req: &KitAnnRerankRequest,
-    ) -> ClientResult<KitAnnRerankResponse> {
+    pub fn kit_ann_rerank(&self, req: &KitAnnRerankRequest) -> ClientResult<KitAnnRerankResponse> {
         self.kit_ann_rerank_with_options(req, &AiExecutionOptions::default())
     }
 
@@ -1143,6 +1207,9 @@ impl AsyncMongrelClient {
             base_url: url.as_ref().trim_end_matches('/').to_string(),
             authorization: None,
             invalid_authorization: false,
+            connect_timeout: None,
+            request_timeout: None,
+            pool_idle_timeout: None,
         }
     }
 
@@ -1150,25 +1217,37 @@ impl AsyncMongrelClient {
         Self::builder(url).build().expect("valid client URL")
     }
 
-    pub fn with_bearer_token(mut self, token: impl AsRef<str>) -> Self {
+    pub fn try_with_bearer_token(mut self, token: impl AsRef<str>) -> ClientResult<Self> {
         self.client = reqwest::Client::builder()
-            .default_headers(default_headers(Some(
-                bearer_header(token.as_ref()).expect("valid bearer credentials"),
-            )))
-            .build()
-            .expect("valid reqwest client");
-        self
+            .default_headers(default_headers(Some(bearer_header(token.as_ref())?)))
+            .build()?;
+        Ok(self)
     }
 
-    pub fn with_basic_auth(mut self, username: impl AsRef<str>, password: impl AsRef<str>) -> Self {
+    pub fn with_bearer_token(self, token: impl AsRef<str>) -> ClientResult<Self> {
+        self.try_with_bearer_token(token)
+    }
+
+    pub fn try_with_basic_auth(
+        mut self,
+        username: impl AsRef<str>,
+        password: impl AsRef<str>,
+    ) -> ClientResult<Self> {
         self.client = reqwest::Client::builder()
-            .default_headers(default_headers(Some(
-                basic_header(username.as_ref(), password.as_ref())
-                    .expect("valid basic credentials"),
-            )))
-            .build()
-            .expect("valid reqwest client");
-        self
+            .default_headers(default_headers(Some(basic_header(
+                username.as_ref(),
+                password.as_ref(),
+            )?)))
+            .build()?;
+        Ok(self)
+    }
+
+    pub fn with_basic_auth(
+        self,
+        username: impl AsRef<str>,
+        password: impl AsRef<str>,
+    ) -> ClientResult<Self> {
+        self.try_with_basic_auth(username, password)
     }
 
     fn url(&self, path: &str) -> String {
@@ -1197,11 +1276,7 @@ impl AsyncMongrelClient {
     }
 
     pub async fn health(&self) -> ClientResult<String> {
-        let response = self
-            .client
-            .get(self.url("/health"))
-            .send()
-            .await?;
+        let response = self.client.get(self.url("/health")).send().await?;
         Ok(self.check(response).await?.text().await?)
     }
 

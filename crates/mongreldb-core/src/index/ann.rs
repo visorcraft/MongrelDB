@@ -14,7 +14,7 @@ const EF_CONSTRUCTION: usize = 64;
 const EF_SEARCH: usize = 64;
 
 /// Quantized vector store keyed by [`RowId`], backed by an HNSW graph.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct AnnIndex {
     dim: usize,
     bytes_per_vec: usize,

@@ -9,6 +9,7 @@ use crate::rowid::RowId;
 use std::collections::BTreeMap;
 
 /// Primary-key index: `key bytes → RowId`.
+#[derive(Clone)]
 pub struct HotIndex {
     inner: BTreeMap<Vec<u8>, RowId>,
 }

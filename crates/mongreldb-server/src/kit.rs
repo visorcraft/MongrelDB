@@ -40,21 +40,26 @@ const DEFAULT_AI_DEADLINE_MS: u64 = 30_000;
 const MAX_AI_DEADLINE_MS: u64 = 60_000;
 const DEFAULT_AI_WORK: usize = 1_000_000;
 const MAX_AI_WORK: usize = 1_000_000;
+const AI_CANCELLATION_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
 
 fn max_ai_fused_candidates() -> usize {
     std::env::var("MONGRELDB_AI_MAX_FUSED_CANDIDATES")
         .ok()
         .and_then(|value| value.parse().ok())
-        .filter(|value: &usize| {
-            *value > 0 && *value <= mongreldb_core::query::MAX_FUSED_CANDIDATES
-        })
+        .filter(|value: &usize| *value > 0 && *value <= mongreldb_core::query::MAX_FUSED_CANDIDATES)
         .unwrap_or(mongreldb_core::query::MAX_FUSED_CANDIDATES)
 }
 
 fn ai_execution_options(
     deadline_ms: Option<u64>,
     max_work: Option<usize>,
-) -> Result<(std::time::Duration, mongreldb_core::query::AiExecutionContext), MongrelError> {
+) -> Result<
+    (
+        std::time::Duration,
+        mongreldb_core::query::AiExecutionContext,
+    ),
+    MongrelError,
+> {
     let deadline_ms = deadline_ms.unwrap_or(DEFAULT_AI_DEADLINE_MS);
     if deadline_ms == 0 || deadline_ms > MAX_AI_DEADLINE_MS {
         return Err(MongrelError::InvalidArgument(format!(
@@ -116,11 +121,17 @@ where
         work(&worker_context)
     });
     let result = match tokio::time::timeout(remaining, &mut task).await {
-        Ok(result) => result
-            .map_err(|error| MongrelError::Other(format!("AI worker failed: {error}")))?,
+        Ok(result) => {
+            result.map_err(|error| MongrelError::Other(format!("AI worker failed: {error}")))?
+        }
         Err(_) => {
             context.cancel();
-            let _ = task.await;
+            if tokio::time::timeout(AI_CANCELLATION_GRACE, &mut task)
+                .await
+                .is_err()
+            {
+                eprintln!("AI worker exceeded cancellation grace");
+            }
             Err(MongrelError::DeadlineExceeded)
         }
     };
@@ -132,12 +143,14 @@ fn retry_authorized_context<T, F>(
     state: &AppState,
     table: &str,
     principal: Option<&mongreldb_core::Principal>,
+    required_columns: &[u16],
     context: &mongreldb_core::query::AiExecutionContext,
+    snapshot_override: Option<mongreldb_core::Snapshot>,
     read: F,
 ) -> Result<T, MongrelError>
 where
     F: FnMut(
-        &mut mongreldb_core::Table,
+        &mongreldb_core::Table,
         mongreldb_core::Snapshot,
         Option<&mongreldb_core::security::CandidateAuthorization<'_>>,
         Option<&mongreldb_core::Principal>,
@@ -145,11 +158,16 @@ where
 {
     let catalog_bound = principal
         .is_some_and(|principal| state.db.resolve_principal(&principal.username).is_some());
-    state.db.with_authorized_scored_read_context(
+    state.db.with_authorized_scored_read_context_at(
         table,
         principal,
         catalog_bound,
+        Some(&mongreldb_core::ReadAuthorization {
+            operation: mongreldb_core::ColumnOperation::Select,
+            columns: required_columns.to_vec(),
+        }),
         Some(context),
+        snapshot_override,
         read,
     )
 }
@@ -462,16 +480,13 @@ fn visible_schema(
         .constraints
         .uniques
         .retain(|unique| unique.columns.iter().all(|column| allowed.contains(column)));
-    schema
-        .constraints
-        .foreign_keys
-        .retain(|foreign_key| {
-            !restricted
-                && foreign_key
-                    .columns
-                    .iter()
-                    .all(|column| allowed.contains(column))
-        });
+    schema.constraints.foreign_keys.retain(|foreign_key| {
+        !restricted
+            && foreign_key
+                .columns
+                .iter()
+                .all(|column| allowed.contains(column))
+    });
     if restricted {
         schema.constraints.checks.clear();
     }
@@ -920,15 +935,11 @@ fn kit_core_error(error: &MongrelError) -> Response {
         MongrelError::AuthRequired | MongrelError::InvalidCredentials { .. } => {
             (StatusCode::UNAUTHORIZED, "AUTH_REQUIRED")
         }
-        MongrelError::PermissionDenied { .. } => {
-            (StatusCode::FORBIDDEN, "PERMISSION_DENIED")
-        }
+        MongrelError::PermissionDenied { .. } => (StatusCode::FORBIDDEN, "PERMISSION_DENIED"),
         MongrelError::NotFound(_) => (StatusCode::NOT_FOUND, "NOT_FOUND"),
         MongrelError::Conflict(_) => (StatusCode::CONFLICT, "CONFLICT"),
         MongrelError::DeadlineExceeded => (StatusCode::GATEWAY_TIMEOUT, "DEADLINE_EXCEEDED"),
-        MongrelError::WorkBudgetExceeded => {
-            (StatusCode::TOO_MANY_REQUESTS, "WORK_BUDGET_EXCEEDED")
-        }
+        MongrelError::WorkBudgetExceeded => (StatusCode::TOO_MANY_REQUESTS, "WORK_BUDGET_EXCEEDED"),
         MongrelError::Cancelled => (
             StatusCode::from_u16(499).expect("499 is valid"),
             "CANCELLED",
@@ -993,10 +1004,9 @@ fn txn_response(r: Result<KitTxnResponse, Response>) -> Response {
 // ── Native typed query endpoint (/kit/query) ────────────────────────────────
 //
 // A row-ID- and typed-cell-returning native query over the engine's `Condition`
-// primitives (PK / bitmap equality / range / ANN / sparse / FM / MinHash / null
-// tests). This is the native counterpart to SQL reads: it returns physical row
-// ids (SQL hides them) and exposes ANN/sparse/MinHash conditions with typed
-// results. Conditions intersect in the row-id space; only survivors decode.
+// primitives (PK / bitmap equality / range / FM / null tests). This is the
+// native counterpart to SQL reads: it returns physical row ids (SQL hides
+// them). Conditions intersect in the row-id space; only survivors decode.
 
 #[derive(Debug, Deserialize)]
 pub struct KitQueryRequest {
@@ -1012,6 +1022,9 @@ pub struct KitQueryRequest {
     /// Number of matching rows to skip before applying `limit`.
     #[serde(default)]
     pub offset: usize,
+    /// Snapshot-pinned continuation token returned by a previous page.
+    #[serde(default)]
+    pub cursor: Option<String>,
 }
 
 /// A condition over the row-id space, mirroring `mongreldb_core::query::Condition`
@@ -1084,12 +1097,67 @@ pub enum JsonCondition {
 pub struct KitQueryResponse {
     pub rows: Vec<KitRow>,
     pub truncated: bool,
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct KitRow {
     pub row_id: String,
     pub cells: Vec<Jval>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct KitQueryCursor {
+    epoch: u64,
+    row_id: u64,
+    fingerprint: u64,
+}
+
+fn kit_query_fingerprint(table: &str, query: &Query, projection: &[u16]) -> u64 {
+    let query_key =
+        mongreldb_core::query::canonical_query_key(&query.conditions, Some(projection), 0);
+    let query_key = query_key.to_le_bytes();
+    table
+        .as_bytes()
+        .iter()
+        .chain(query_key.iter())
+        .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3)
+        })
+}
+
+fn parse_kit_query_cursor(value: &str) -> std::result::Result<KitQueryCursor, String> {
+    let mut parts = value.split(':');
+    if parts.next() != Some("v1") {
+        return Err("invalid query cursor".into());
+    }
+    let epoch = parts
+        .next()
+        .and_then(|part| part.parse().ok())
+        .ok_or_else(|| "invalid query cursor".to_string())?;
+    let row_id = parts
+        .next()
+        .and_then(|part| part.parse().ok())
+        .ok_or_else(|| "invalid query cursor".to_string())?;
+    let fingerprint = parts
+        .next()
+        .and_then(|part| u64::from_str_radix(part, 16).ok())
+        .ok_or_else(|| "invalid query cursor".to_string())?;
+    if parts.next().is_some() {
+        return Err("invalid query cursor".into());
+    }
+    Ok(KitQueryCursor {
+        epoch,
+        row_id,
+        fingerprint,
+    })
+}
+
+fn format_kit_query_cursor(cursor: KitQueryCursor) -> String {
+    format!(
+        "v1:{}:{}:{:016x}",
+        cursor.epoch, cursor.row_id, cursor.fingerprint
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -1275,9 +1343,11 @@ pub async fn kit_retrieve(
             &worker_state,
             &table_name,
             principal.as_ref(),
+            &[column_id],
             context,
+            None,
             |table, snapshot, authorization, _| {
-                table.retrieve_at_with_candidate_authorization_and_context(
+                table.retrieve_at_with_candidate_authorization_on_generation(
                     &retriever,
                     snapshot,
                     authorization,
@@ -1332,9 +1402,11 @@ pub async fn kit_ann_rerank(
             &worker_state,
             &table_name,
             principal.as_ref(),
+            &[request.column_id],
             context,
+            None,
             |table, snapshot, authorization, _| {
-                table.ann_rerank_at_with_candidate_authorization_and_context(
+                table.ann_rerank_at_with_candidate_authorization_on_generation(
                     &request,
                     snapshot,
                     authorization,
@@ -1375,6 +1447,73 @@ pub struct KitSearchRequest {
     pub max_work: Option<usize>,
     #[serde(default)]
     pub explain: bool,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct KitSearchCursor {
+    epoch: u64,
+    final_score: f64,
+    row_id: u64,
+    fingerprint: u64,
+}
+
+fn kit_search_fingerprint(table: &str, request: &SearchRequest) -> u64 {
+    let mut request = request.clone();
+    request.limit = 0;
+    format!("{table}:{request:?}")
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3)
+        })
+}
+
+fn parse_kit_search_cursor(value: &str) -> Result<KitSearchCursor, MongrelError> {
+    let invalid = || MongrelError::InvalidArgument("invalid search cursor".into());
+    let mut parts = value.split(':');
+    if parts.next() != Some("s1") {
+        return Err(invalid());
+    }
+    let epoch = parts
+        .next()
+        .and_then(|part| part.parse().ok())
+        .ok_or_else(&invalid)?;
+    let score_bits = parts
+        .next()
+        .and_then(|part| u64::from_str_radix(part, 16).ok())
+        .ok_or_else(&invalid)?;
+    let row_id = parts
+        .next()
+        .and_then(|part| part.parse().ok())
+        .ok_or_else(&invalid)?;
+    let fingerprint = parts
+        .next()
+        .and_then(|part| u64::from_str_radix(part, 16).ok())
+        .ok_or_else(&invalid)?;
+    if parts.next().is_some() {
+        return Err(invalid());
+    }
+    let final_score = f64::from_bits(score_bits);
+    if !final_score.is_finite() {
+        return Err(invalid());
+    }
+    Ok(KitSearchCursor {
+        epoch,
+        final_score,
+        row_id,
+        fingerprint,
+    })
+}
+
+fn format_kit_search_cursor(cursor: KitSearchCursor) -> String {
+    format!(
+        "s1:{}:{:016x}:{}:{:016x}",
+        cursor.epoch,
+        cursor.final_score.to_bits(),
+        cursor.row_id,
+        cursor.fingerprint
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -1416,7 +1555,9 @@ fn execute_kit_search(
     context: &mongreldb_core::query::AiExecutionContext,
 ) -> Result<Jval, MongrelError> {
     let handle = state.db.table(&req.table)?;
-    let schema = handle.lock().schema().clone();
+    let schema = mongreldb_core::lock_table_with_context(&handle, Some(context))?
+        .schema()
+        .clone();
     let mut required = req
         .projection
         .clone()
@@ -1439,9 +1580,7 @@ fn execute_kit_search(
             | JsonCondition::Ann { column_id, .. }
             | JsonCondition::SparseMatch { column_id, .. }
             | JsonCondition::MinHashSimilar { column_id, .. }
-            | JsonCondition::MinHashSimilarMembers { column_id, .. } => {
-                required.push(*column_id)
-            }
+            | JsonCondition::MinHashSimilarMembers { column_id, .. } => required.push(*column_id),
         }
     }
     required.extend(
@@ -1501,9 +1640,7 @@ fn execute_kit_search(
                     | Retriever::Sparse { k, .. }
                     | Retriever::MinHash { k, .. } => *k,
                 };
-                total
-                    .checked_add(k)
-                    .ok_or(MongrelError::WorkBudgetExceeded)
+                total.checked_add(k).ok_or(MongrelError::WorkBudgetExceeded)
             },
         )?;
     if let Some(KitRerank::ExactVector {
@@ -1544,18 +1681,40 @@ fn execute_kit_search(
         limit: req.limit,
         projection: req.projection.clone(),
     };
+    let fingerprint = kit_search_fingerprint(&req.table, &request);
+    let cursor = req
+        .cursor
+        .as_deref()
+        .map(parse_kit_search_cursor)
+        .transpose()?;
+    if cursor.is_some_and(|cursor| cursor.fingerprint != fingerprint) {
+        return Err(MongrelError::InvalidArgument(
+            "search cursor does not match request".into(),
+        ));
+    }
+    let epoch = cursor
+        .map(|cursor| cursor.epoch)
+        .unwrap_or_else(|| state.db.visible_epoch().0);
+    let search_after = cursor.map(|cursor| mongreldb_core::query::SearchAfter {
+        final_score: cursor.final_score,
+        row_id: RowId(cursor.row_id),
+    });
+    let snapshot = mongreldb_core::Snapshot::at(mongreldb_core::Epoch(epoch));
     let (result, trace) = mongreldb_core::trace::QueryTrace::capture(|| {
         retry_authorized_context(
             state,
             &req.table,
             principal,
+            &required,
             context,
+            Some(snapshot),
             |table, snapshot, authorization, effective_principal| {
-                let mut hits = table.search_at_with_candidate_authorization_and_context(
+                let mut hits = table.search_at_with_candidate_authorization_on_generation_after(
                     &request,
                     snapshot,
                     authorization,
                     Some(context),
+                    search_after,
                 )?;
                 state
                     .db
@@ -1566,7 +1725,20 @@ fn execute_kit_search(
     });
     let hits = result?;
     context.checkpoint()?;
+    let next_cursor = if hits.len() == req.limit {
+        hits.last().map(|hit| {
+            format_kit_search_cursor(KitSearchCursor {
+                epoch,
+                final_score: hit.final_score,
+                row_id: hit.row_id.0,
+                fingerprint,
+            })
+        })
+    } else {
+        None
+    };
     let mut response = json!({
+        "next_cursor": next_cursor,
         "hits": hits.into_iter().map(|hit| json!({
             "row_id": hit.row_id.0.to_string(),
             "cells": hit.cells.into_iter().flat_map(|(column_id, value)| [json!(column_id), value_to_json(&value)]).collect::<Vec<_>>(),
@@ -1685,9 +1857,11 @@ pub async fn kit_set_similarity(
             &worker_state,
             &table_name,
             principal.as_ref(),
+            &[request.column_id],
             context,
+            None,
             |table, snapshot, authorization, _| {
-                table.set_similarity_at_with_candidate_authorization_and_context(
+                table.set_similarity_at_with_candidate_authorization_on_generation(
                     &request,
                     snapshot,
                     authorization,
@@ -1715,6 +1889,29 @@ pub async fn kit_query(
     OptionalPrincipal(principal): OptionalPrincipal,
     Json(req): Json<KitQueryRequest>,
 ) -> Response {
+    if req.cursor.is_some() && req.offset != 0 {
+        return kit_bad_request("offset cannot be combined with cursor".into());
+    }
+    if req.conditions.iter().any(|condition| {
+        matches!(
+            condition,
+            JsonCondition::Ann { .. }
+                | JsonCondition::SparseMatch { .. }
+                | JsonCondition::MinHashSimilar { .. }
+                | JsonCondition::MinHashSimilarMembers { .. }
+        )
+    }) {
+        return kit_bad_request(
+            "ranked AI conditions are not available on /kit/query; use /kit/retrieve or /kit/search"
+                .into(),
+        );
+    }
+    if req.offset > mongreldb_core::query::MAX_QUERY_OFFSET {
+        return kit_bad_request(format!(
+            "offset exceeds {}",
+            mongreldb_core::query::MAX_QUERY_OFFSET
+        ));
+    }
     let principal = request_principal(&state, &principal);
     let handle = match state.db.table(&req.table) {
         Ok(h) => h,
@@ -1792,32 +1989,52 @@ pub async fn kit_query(
             }
         }
     }
-    q = q
-        .with_limit(mongreldb_core::query::MAX_FINAL_LIMIT)
-        .with_offset(req.offset);
+    let limit = req.limit.unwrap_or(mongreldb_core::query::MAX_FINAL_LIMIT);
+    if limit == 0 || limit > mongreldb_core::query::MAX_FINAL_LIMIT {
+        return kit_bad_request(format!(
+            "limit must be between 1 and {}",
+            mongreldb_core::query::MAX_FINAL_LIMIT
+        ));
+    }
+    let fingerprint = kit_query_fingerprint(&req.table, &q, &projection_ids);
+    let cursor = match req.cursor.as_deref().map(parse_kit_query_cursor) {
+        Some(Ok(cursor)) if cursor.fingerprint == fingerprint => Some(cursor),
+        Some(Ok(_)) => return kit_bad_request("query cursor does not match request".into()),
+        Some(Err(error)) => return kit_bad_request(error),
+        None => None,
+    };
+    let epoch = cursor
+        .map(|cursor| cursor.epoch)
+        .unwrap_or_else(|| state.db.visible_epoch().0);
+    let (snapshot, _snapshot_guard) = match state.db.snapshot_at_owned(mongreldb_core::Epoch(epoch))
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => return kit_core_error(&error),
+    };
+    let fetch_limit = limit
+        .saturating_add(1)
+        .min(mongreldb_core::query::MAX_FINAL_LIMIT);
+    q = q.with_limit(fetch_limit).with_offset(req.offset);
+    let after_row_id = cursor.map(|cursor| RowId(cursor.row_id));
 
     let projection = projection_ids
         .into_iter()
         .collect::<std::collections::HashSet<_>>();
-
-    let limit = req
-        .limit
-        .unwrap_or(mongreldb_core::query::MAX_FINAL_LIMIT);
-    if limit > mongreldb_core::query::MAX_FINAL_LIMIT {
-        return kit_bad_request(format!(
-            "limit exceeds {}",
-            mongreldb_core::query::MAX_FINAL_LIMIT
-        ));
-    }
     let principal_catalog_bound = principal
         .as_ref()
         .is_some_and(|principal| state.db.resolve_principal(&principal.username).is_some());
-    let rows = match state.db.with_authorized_read(
+    let rows = match state.db.with_authorized_read_context(
         &req.table,
         principal.as_ref(),
         principal_catalog_bound,
+        Some(&mongreldb_core::ReadAuthorization {
+            operation: mongreldb_core::ColumnOperation::Select,
+            columns: required,
+        }),
+        None,
+        Some(snapshot),
         |table, snapshot, allowed, effective_principal| {
-            let rows = table.query_at_with_allowed(&q, snapshot, allowed)?;
+            let rows = table.query_at_with_allowed_after(&q, snapshot, allowed, after_row_id)?;
             state
                 .db
                 .secure_rows_for(&req.table, rows, effective_principal)
@@ -1826,13 +2043,12 @@ pub async fn kit_query(
         Ok(rows) => rows,
         Err(error) => return kit_core_error(&error),
     };
-    let mut out: Vec<KitRow> = Vec::new();
-    let mut truncated = false;
-    for r in rows {
-        if out.len() >= limit {
-            truncated = true;
-            break;
-        }
+    let truncated = rows.len() > limit
+        || (limit == mongreldb_core::query::MAX_FINAL_LIMIT && rows.len() == limit);
+    let mut out: Vec<KitRow> = Vec::with_capacity(rows.len().min(limit));
+    let mut last_row_id = None;
+    for r in rows.into_iter().take(limit) {
+        last_row_id = Some(r.row_id);
         let cells: Vec<Jval> = schema
             .columns
             .iter()
@@ -1849,9 +2065,21 @@ pub async fn kit_query(
             cells,
         });
     }
+    let next_cursor = if truncated {
+        last_row_id.map(|row_id| {
+            format_kit_query_cursor(KitQueryCursor {
+                epoch,
+                row_id: row_id.0,
+                fingerprint,
+            })
+        })
+    } else {
+        None
+    };
     Json(KitQueryResponse {
         rows: out,
         truncated,
+        next_cursor,
     })
     .into_response()
 }

@@ -965,6 +965,9 @@ async fn prepare_statement(
     if let Err(msg) = validate_stmt_name(&req.name) {
         return (StatusCode::BAD_REQUEST, msg).into_response();
     }
+    if mongreldb_query::contains_boolean_ai_predicate(&req.sql) {
+        return remote_boolean_ai_error();
+    }
     let owner = request_owner(&state, &principal);
     let Some(entry) = state.sessions.get(&id, &owner) else {
         return (
@@ -1510,6 +1513,9 @@ async fn execute_sql(
     session: &MongrelSession,
     req: SqlRequest,
 ) -> Response {
+    if mongreldb_query::contains_boolean_ai_predicate(&req.sql) {
+        return remote_boolean_ai_error();
+    }
     state.metrics.inc_sql_queries();
     let audited = audit::is_audited_sql(&req.sql);
     let actor = request_owner(state, principal);
@@ -1558,6 +1564,14 @@ async fn execute_sql(
                 .into_response()
         }
     }
+}
+
+fn remote_boolean_ai_error() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        "Boolean ANN/Sparse SQL is disabled remotely; use scored SQL functions",
+    )
+        .into_response()
 }
 
 /// Serialize Arrow record batches as Arrow IPC file bytes. This is the

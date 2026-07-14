@@ -1,9 +1,11 @@
-name: AI 1M qualification
+name: AI 1M characterization
 
 on:
   schedule:
     - cron: "0 6 * * 0"
   workflow_dispatch:
+  push:
+    tags: ["v*"]
 
 permissions:
   contents: read
@@ -12,6 +14,8 @@ jobs:
   benchmark:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    permissions:
+      contents: write
     env:
       QUAL_DIR: /tmp/mongreldb-ai-1m
     steps:
@@ -44,9 +48,24 @@ jobs:
             --expected-rows 1000000 \
             --skip-thresholds \
             2>&1 | tee "$QUAL_DIR/ai-benchmark-validation.log"
+          MONGRELDB_AI_CONCURRENCY_ROWS=10000 \
+          MONGRELDB_AI_CONCURRENCY_OPS=25 \
+          cargo run -p mongreldb-core --release --all-features --example ai_concurrency_bench \
+            > "$QUAL_DIR/ai-concurrency.json" \
+            2> "$QUAL_DIR/ai-concurrency.log"
+          python3 scripts/validate-ai-concurrency.py \
+            "$QUAL_DIR/ai-concurrency.json" \
+            2>&1 | tee "$QUAL_DIR/ai-concurrency-validation.log"
           test -z "$(git status --porcelain)"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: mongreldb-ai-1m-${{ github.sha }}
           path: /tmp/mongreldb-ai-1m/
+      - name: Package release characterization
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: tar -C "$QUAL_DIR" -czf /tmp/mongreldb-ai-1m-characterization.tar.gz .
+      - uses: softprops/action-gh-release@v3
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          files: /tmp/mongreldb-ai-1m-characterization.tar.gz

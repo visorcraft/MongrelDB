@@ -335,42 +335,40 @@ pub unsafe extern "C" fn mongreldb_txn_commit(
 
 /// Replay the staged buffer into a fresh core transaction.
 fn apply_txn(db: &CoreDatabase, stage: &[StagedOp]) -> Result<Epoch, ErrorCode> {
-    let mut tx = db.begin();
-    for op in stage {
-        match op {
-            StagedOp::Put { table, cells } => {
-                tx.put_returning(table, cells.clone())
-                    .map_err(|e| set_error(&e))?;
-            }
-            StagedOp::Upsert {
-                table,
-                cells,
-                update_cells,
-            } => {
-                let action = if update_cells.is_empty() {
-                    UpsertAction::DoNothing
-                } else {
-                    UpsertAction::DoUpdate(update_cells.clone())
-                };
-                tx.upsert(table, cells.clone(), action)
-                    .map_err(|e| set_error(&e))?;
-            }
-            StagedOp::Delete { table, row_id } => {
-                tx.delete(table, *row_id).map_err(|e| set_error(&e))?;
-            }
-            StagedOp::DeleteByPk { table, pk } => {
-                // Resolve the PK to a row id, then delete.
-                let handle = db.table(table).map_err(|e| set_error(&e))?;
-                let g = handle.lock();
-                if let Some(rid) = g.lookup_pk(pk) {
-                    drop(g);
-                    tx.delete(table, rid).map_err(|e| set_error(&e))?;
+    db.transaction_for_current_principal_with_epoch(|tx| {
+        for op in stage {
+            match op {
+                StagedOp::Put { table, cells } => {
+                    tx.put_returning(table, cells.clone())?;
                 }
-                // No match → no-op (matches NAPI delete_by_pk_text semantics).
+                StagedOp::Upsert {
+                    table,
+                    cells,
+                    update_cells,
+                } => {
+                    let action = if update_cells.is_empty() {
+                        UpsertAction::DoNothing
+                    } else {
+                        UpsertAction::DoUpdate(update_cells.clone())
+                    };
+                    tx.upsert(table, cells.clone(), action)?;
+                }
+                StagedOp::Delete { table, row_id } => {
+                    tx.delete(table, *row_id)?;
+                }
+                StagedOp::DeleteByPk { table, pk } => {
+                    let rows =
+                        db.query_for_current_principal(table, &Query::pk(pk.clone()), None)?;
+                    if let Some(row) = rows.first() {
+                        tx.delete(table, row.row_id)?;
+                    }
+                }
             }
         }
-    }
-    tx.commit().map_err(|e| set_error(&e))
+        Ok(())
+    })
+    .map(|(epoch, ())| epoch)
+    .map_err(|error| set_error(&error))
 }
 
 // Keep the `c_to_value` import reachable for symmetry with the table module

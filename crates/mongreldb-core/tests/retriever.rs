@@ -444,8 +444,8 @@ fn hybrid_search_filters_unions_and_fuses_deterministically() {
     assert_eq!(hits[1].row_id.0, 1);
     assert_eq!(hits[0].fused_score, 1.0 / 61.0);
     assert_eq!(hits[0].cells, vec![(1, Value::Int64(1))]);
-    assert_eq!(hits[0].components[0].retriever_name, "dense");
-    assert_eq!(hits[1].components[0].retriever_name, "sparse");
+    assert_eq!(hits[0].components[0].retriever_name.as_ref(), "dense");
+    assert_eq!(hits[1].components[0].retriever_name.as_ref(), "sparse");
 
     let reversed = table
         .search(&SearchRequest {

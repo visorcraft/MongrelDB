@@ -10,6 +10,8 @@
   checkpoint is opened. Original stored set members are unchanged.
 - Existing Boolean `Query` conditions still intersect and discard scores.
   `Retriever`, `set_similarity`, and `SearchRequest` are separate scored APIs.
+  Public Kit and remote SQL Boolean surfaces reject ranked ANN, Sparse, and
+  MinHash predicates; callers use the scored APIs instead.
 - Exact ANN reranking is public through `POST /kit/ann_rerank`,
   `MongrelClient::kit_ann_rerank`, `ann_search_exact(...)` SQL,
   `Table.annRerank(...)` in NAPI, and `mongreldb_table_ann_rerank` in C.
@@ -23,6 +25,10 @@
 - Scored Kit and SQL execution now share cooperative deadlines, cancellation,
   actual-work budgets, fused-union limits, bounded blocking execution, and
   concurrency controls.
+- Scored reads pin immutable table generations, so same-table readers no longer
+  serialize and writers are blocked only while a changed generation is cloned.
+- Native Kit reads expose snapshot/RowId cursors. Scored Kit search exposes
+  snapshot/final-score/RowId search-after cursors. Both reject request changes.
 - Hybrid search can apply an optional exact-vector post-fusion reranker while
   preserving component, fused, exact, and final scores.
 - Credentialed NAPI and C typed reads now use database-level RLS, mask, and
@@ -34,5 +40,9 @@
   ANN 16/64/64 with binary-sign quantization, MinHash 128/32, and learned-range
   epsilon 16.
 - Clean release qualification logs, strict JSON validation, bounded-window,
-  mixed-state, RLS, encrypted, realistic-corpus, and 100k AI reports are uploaded by
-  the [CI qualification job](https://github.com/visorcraft/MongrelDB/actions/workflows/ci.yml).
+  mixed-state, RLS, encrypted, real-documentation relevance, concurrency, and
+  100k AI reports are uploaded by the
+  [CI qualification job](https://github.com/visorcraft/MongrelDB/actions/workflows/ci.yml).
+- Tagged releases attach direct, exact-SHA evidence downloads:
+  [100k clean qualification](https://github.com/visorcraft/MongrelDB/releases/latest/download/mongreldb-clean-qualification.tar.gz)
+  and [1M characterization](https://github.com/visorcraft/MongrelDB/releases/latest/download/mongreldb-ai-1m-characterization.tar.gz).

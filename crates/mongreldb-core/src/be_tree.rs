@@ -58,6 +58,7 @@ impl Message {
     }
 }
 
+#[derive(Clone)]
 enum Node {
     Leaf {
         rows: Vec<Row>,
@@ -81,6 +82,7 @@ struct Split {
 }
 
 /// Buffered Bε-tree over `(RowId, Epoch)` → [`Row`].
+#[derive(Clone)]
 pub struct BeTree {
     root: Node,
     mutations: usize,

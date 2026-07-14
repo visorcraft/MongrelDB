@@ -33,7 +33,7 @@ impl From<u64> for RowId {
 }
 
 /// Monotonic allocator for [`RowId`]s.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct RowIdAllocator {
     next: u64,
 }

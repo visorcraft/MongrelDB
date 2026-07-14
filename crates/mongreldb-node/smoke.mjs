@@ -434,7 +434,7 @@ console.log('smoke: full-range Int64 / BigInt ✓');
     { columnId: 3, text: 'alice-secret' },
     { columnId: 4, embedding: [0.9, 0.1] },
   ]);
-  docs.put([
+  const bobPut = docs.put([
     { columnId: 1, int64: 2n },
     { columnId: 2, text: 'bob' },
     { columnId: 3, text: 'bob-secret' },
@@ -444,9 +444,12 @@ console.log('smoke: full-range Int64 / BigInt ✓');
   admin.createUser('alice', 'alice-pw');
   admin.createRole('reader');
   admin.grantPermission('reader', 'select:docs');
+  admin.grantPermission('reader', 'insert:docs');
+  admin.grantPermission('reader', 'update:docs');
+  admin.grantPermission('reader', 'delete:docs');
   admin.grantRole('alice', 'reader');
   await admin.sql('ALTER TABLE docs ENABLE ROW LEVEL SECURITY');
-  await admin.sql('CREATE POLICY owner_only ON docs FOR SELECT TO PUBLIC USING (owner = CURRENT_USER)');
+  await admin.sql('CREATE POLICY owner_only ON docs FOR ALL TO PUBLIC USING (owner = CURRENT_USER) WITH CHECK (owner = CURRENT_USER)');
   await admin.sql("CREATE MASK hide_secret ON docs(secret) USING REDACT '***'");
 
   const alice = Database.openWithCredentials(dir, 'alice', 'alice-pw');
@@ -459,9 +462,44 @@ console.log('smoke: full-range Int64 / BigInt ✓');
   assert.equal(reranked.length, 1);
   assert.equal(reranked[0].rowId, rows[0].rowId);
   assert.equal(docs.query([]).length, 2);
+  assert.equal(await aliceDocs.countWhereAsync([]), 1n);
+  assert.equal(JSON.parse(aliceDocs.approxAggregate('count', null, 1.96)).point, 1);
+  assert.equal(JSON.parse(aliceDocs.incrementalAggregate('count', null, [])).value, 1);
+  assert.equal(aliceDocs.rowsAtEpoch(alice.snapshotEpoch()).length, 1);
+  assert.throws(() => aliceDocs.bulkLoadTyped([]), /PermissionDenied|permission denied/);
+  assert.throws(() => aliceDocs.truncate(), /PermissionDenied|permission denied/);
+  assert.throws(() => aliceDocs.delete(bobPut.rowId), /PermissionDenied|permission denied/);
+  assert.throws(() => aliceDocs.put([
+    { columnId: 1, int64: 3n },
+    { columnId: 2, text: 'bob' },
+    { columnId: 3, text: 'forbidden' },
+    { columnId: 4, embedding: [1, 0] },
+  ]), /PermissionDenied|permission denied/);
+  aliceDocs.put([
+    { columnId: 1, int64: 3n },
+    { columnId: 2, text: 'alice' },
+    { columnId: 3, text: 'allowed' },
+    { columnId: 4, embedding: [1, 0] },
+  ]);
+  assert.equal(await aliceDocs.countWhereAsync([]), 2n);
+
+  const forbiddenUpdate = alice.begin();
+  forbiddenUpdate.upsert('docs', [
+    { columnId: 1, int64: 2n },
+    { columnId: 2, text: 'bob' },
+    { columnId: 3, text: 'bob-secret' },
+    { columnId: 4, embedding: [1, 0] },
+  ], [{ columnId: 3, text: 'stolen' }]);
+  assert.throws(() => forbiddenUpdate.commit(), /PermissionDenied|permission denied/);
 
   admin.revokeRole('alice', 'reader');
   assert.throws(() => aliceDocs.query([]), /PermissionDenied|permission denied/);
+  assert.throws(() => aliceDocs.put([
+    { columnId: 1, int64: 4n },
+    { columnId: 2, text: 'alice' },
+    { columnId: 3, text: 'revoked' },
+    { columnId: 4, embedding: [1, 0] },
+  ]), /PermissionDenied|permission denied/);
   alice.close();
   admin.close();
   rmSync(dir, { recursive: true });

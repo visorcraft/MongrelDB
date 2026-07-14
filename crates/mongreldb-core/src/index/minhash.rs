@@ -102,6 +102,30 @@ fn signature(token_hashes: &[u64], permutations: usize) -> Option<Vec<u32>> {
     Some(sig)
 }
 
+fn signature_with_context(
+    token_hashes: &[u64],
+    permutations: usize,
+    context: Option<&crate::query::AiExecutionContext>,
+) -> crate::Result<Option<Vec<u32>>> {
+    if token_hashes.is_empty() {
+        return Ok(None);
+    }
+    let mut signature = vec![u32::MAX; permutations];
+    for &token_hash in token_hashes {
+        if let Some(context) = context {
+            context.consume(crate::query::work_units(
+                permutations,
+                crate::query::VECTOR_WORK_QUANTUM,
+            ))?;
+        }
+        for (index, slot) in signature.iter_mut().enumerate() {
+            let (a, b) = coefficient(index);
+            *slot = (*slot).min((a.wrapping_mul(token_hash).wrapping_add(b) >> 32) as u32);
+        }
+    }
+    Ok(Some(signature))
+}
+
 /// LSH bucket key for band `b` of a signature.
 fn band_key(b: usize, sig: &[u32], rows_per_band: usize) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -112,6 +136,7 @@ fn band_key(b: usize, sig: &[u32], rows_per_band: usize) -> u64 {
     h.finish()
 }
 
+#[derive(Clone)]
 pub struct MinHashIndex {
     permutations: usize,
     bands: usize,
@@ -199,7 +224,8 @@ impl MinHashIndex {
         k: usize,
         context: Option<&crate::query::AiExecutionContext>,
     ) -> crate::Result<Vec<(RowId, f32)>> {
-        let Some(qsig) = signature(query_token_hashes, self.permutations) else {
+        let Some(qsig) = signature_with_context(query_token_hashes, self.permutations, context)?
+        else {
             return Ok(Vec::new());
         };
         let mut candidates: HashSet<u32> = HashSet::new();
@@ -211,22 +237,46 @@ impl MinHashIndex {
                 self.buckets
                     .get(&band_key(b, &qsig, self.permutations / self.bands))
             {
-                candidates.extend(indices.iter().copied());
+                for &index in indices {
+                    if let Some(context) = context {
+                        context.consume(1)?;
+                    }
+                    if !candidates.contains(&index)
+                        && candidates.len() >= crate::query::MAX_RAW_INDEX_CANDIDATES
+                    {
+                        return Err(crate::MongrelError::WorkBudgetExceeded);
+                    }
+                    candidates.insert(index);
+                }
             }
         }
         let mut scored = Vec::with_capacity(candidates.len().min(k));
-        for chunk in candidates.into_iter().collect::<Vec<_>>().chunks(256) {
+        for index in candidates {
             if let Some(context) = context {
-                context.consume(chunk.len())?;
+                context.consume(crate::query::work_units(
+                    self.permutations,
+                    crate::query::VECTOR_WORK_QUANTUM,
+                ))?;
             }
-            for idx in chunk {
-                let (rid, sig) = &self.sigs[*idx as usize];
-                let matches = sig.iter().zip(&qsig).filter(|(a, b)| a == b).count();
-                scored.push((*rid, matches as f32 / self.permutations as f32));
-            }
+            let (row_id, signature) = &self.sigs[index as usize];
+            let matches = signature
+                .iter()
+                .zip(&qsig)
+                .filter(|(left, right)| left == right)
+                .count();
+            scored.push((*row_id, matches as f32 / self.permutations as f32));
         }
-        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        scored.truncate(k);
+        let order = |left: &(RowId, f32), right: &(RowId, f32)| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| left.0.cmp(&right.0))
+        };
+        if scored.len() > k {
+            scored.select_nth_unstable_by(k, order);
+            scored.truncate(k);
+        }
+        scored.sort_by(order);
         Ok(scored)
     }
 
@@ -405,6 +455,32 @@ mod tests {
         let a = idx.search(&set(&["a", "b", "c", "d"]), 5);
         let b = restored.search(&set(&["a", "b", "c", "d"]), 5);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn hot_bucket_spends_budget_while_expanding() {
+        let query = set(&["common"]);
+        let mut index = MinHashIndex::with_options(4, 1);
+        for row_id in 0..1_000 {
+            index.insert(&query, RowId(row_id));
+        }
+        let context = crate::query::AiExecutionContext::new(None, 2);
+        assert!(matches!(
+            index.search_with_context(&query, 1, Some(&context)),
+            Err(crate::MongrelError::WorkBudgetExceeded)
+        ));
+    }
+
+    #[test]
+    fn maximum_member_query_stops_during_signature_creation() {
+        let index = MinHashIndex::new();
+        let query = vec![7; crate::query::MAX_SET_MEMBERS];
+        let context = crate::query::AiExecutionContext::new(None, 1);
+        assert!(matches!(
+            index.search_with_context(&query, 1, Some(&context)),
+            Err(crate::MongrelError::WorkBudgetExceeded)
+        ));
+        assert_eq!(context.consumed_work(), 0);
     }
 
     #[test]
