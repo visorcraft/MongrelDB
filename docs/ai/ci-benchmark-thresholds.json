@@ -1,0 +1,20 @@
+{
+  "scope": "tagged qualification on GitHub-hosted ubuntu-latest runners",
+  "rows": 100000,
+  "minimum_queries": 10,
+  "ann": {
+    "maximum_p95_us": 2500,
+    "minimum_hamming_recall_at_10": 0.70,
+    "minimum_cosine_recall_at_10": 0.15
+  },
+  "sparse": {
+    "maximum_p95_us": 5000
+  },
+  "minhash": {
+    "maximum_p95_us": 1000,
+    "minimum_candidate_recall_at_10": 0.70
+  },
+  "hybrid": {
+    "maximum_p95_us": 15000
+  }
+}

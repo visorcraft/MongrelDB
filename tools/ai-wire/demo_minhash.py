@@ -9,8 +9,7 @@ assert len(golden) == 6
 run("minhash")
 fixture_rows = {}
 for index, fixture in enumerate(golden, start=100):
-    row_id = 1000 + index
-    fixture_rows[row_id] = fixture["member"]
+    logical_id = 1000 + index
     request(
         "POST",
         "/kit/txn",
@@ -21,7 +20,7 @@ for index, fixture in enumerate(golden, start=100):
                         "table": "ai_wire_minhash",
                         "cells": [
                             1,
-                            row_id,
+                            logical_id,
                             2,
                             "published",
                             3,
@@ -36,22 +35,25 @@ for index, fixture in enumerate(golden, start=100):
             ]
         },
     )
-for row_id, member in fixture_rows.items():
-    result = request(
+    row = request(
         "POST",
         "/kit/query",
         {
             "table": "ai_wire_minhash",
-            "conditions": [
-                {
-                    "minhash_similar_members": {
-                        "column_id": 5,
-                        "members": [member],
-                        "k": 20,
-                    }
-                }
-            ],
+            "conditions": [{"pk": {"value": logical_id}}],
             "projection": [1],
         },
+    )["rows"][0]
+    fixture_rows[row["row_id"]] = fixture["member"]
+for physical_row_id, member in fixture_rows.items():
+    result = request(
+        "POST",
+        "/kit/retrieve",
+        {
+            "table": "ai_wire_minhash",
+            "retriever": {
+                "min_hash": {"column_id": 5, "members": [member], "k": 20}
+            },
+        },
     )
-    assert any(row["cells"] == [1, row_id] for row in result["rows"]), (member, result)
+    assert any(hit["row_id"] == physical_row_id for hit in result["hits"]), (member, result)

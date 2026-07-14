@@ -35,8 +35,8 @@ CREATE = {
     ],
 }
 
-CONDITIONS = {
+RETRIEVERS = {
     "ann": {"ann": {"column_id": 4, "query": [1, -1, 1, -1, 1, -1, 1, -1], "k": 1}},
-    "sparse": {"sparse_match": {"column_id": 3, "query": [[1, 2.0]], "k": 1}},
-    "minhash": {"minhash_similar_members": {"column_id": 5, "members": ["a", "b", "c", "d"], "k": 1}},
+    "sparse": {"sparse": {"column_id": 3, "query": [[1, 2.0]], "k": 1}},
+    "minhash": {"min_hash": {"column_id": 5, "members": ["a", "b", "c", "d"], "k": 1}},
 }

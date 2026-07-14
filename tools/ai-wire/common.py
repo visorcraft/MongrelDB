@@ -7,7 +7,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from fixtures import CONDITIONS, CREATE, ROWS
+from fixtures import CREATE, RETRIEVERS, ROWS
 
 ROOT = Path(__file__).resolve().parents[2]
 BASE_URL = os.environ.get("MONGRELDB_URL", "http://127.0.0.1:8080").rstrip("/")
@@ -64,8 +64,8 @@ def run(kind):
     assert len(schema["indexes"]) == 4, schema
     result = request(
         "POST",
-        "/kit/query",
-        {"table": table, "conditions": [CONDITIONS[kind]], "projection": [1]},
+        "/kit/retrieve",
+        {"table": table, "retriever": RETRIEVERS[kind]},
     )
-    assert result["rows"][0]["cells"] == [1, 1], result
+    assert result["hits"][0]["row_id"] == "0", result
     print(json.dumps(result, sort_keys=True))

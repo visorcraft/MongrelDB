@@ -35,6 +35,10 @@ The validator checks SHA, clean tree, release profile, corpus size, required
 HOT/Bitmap/ANN/Sparse/MinHash payloads, finite values, the 10/50/100/200 exact-rerank
 matrix, and every threshold in `benchmark-thresholds.json`.
 
+The tagged GitHub Actions qualification uses `ci-benchmark-thresholds.json`.
+Hosted runners have variable CPUs, so those ceilings are conservative regression
+guards. `benchmark-thresholds.json` remains the stricter named-baseline gate.
+
 The scheduled `AI 1M characterization` workflow runs strict structural and
 finite-value validation at one million rows. It skips latency/recall thresholds,
 so it is characterization evidence, not a performance qualification gate.
