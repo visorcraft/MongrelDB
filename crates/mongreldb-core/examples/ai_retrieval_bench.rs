@@ -45,8 +45,22 @@ fn sparse(id: usize) -> Vec<(u32, f32)> {
 
 fn stored_sparse(id: usize) -> Vec<(u32, f32)> {
     let mut vector = sparse(id);
-    vector.push((9_000, 0.01));
+    if id < mongreldb_core::query::MAX_RAW_INDEX_CANDIDATES {
+        vector.push((9_000, 0.01));
+    }
     vector
+}
+
+#[cfg(test)]
+#[test]
+fn broad_sparse_fixture_respects_raw_candidate_ceiling() {
+    let ceiling = mongreldb_core::query::MAX_RAW_INDEX_CANDIDATES;
+    assert!(stored_sparse(ceiling - 1)
+        .iter()
+        .any(|(token, _)| *token == 9_000));
+    assert!(stored_sparse(ceiling)
+        .iter()
+        .all(|(token, _)| *token != 9_000));
 }
 
 fn members(id: usize) -> Vec<String> {
