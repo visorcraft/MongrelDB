@@ -27,7 +27,7 @@ use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 pub const TABLES_DIR: &str = "tables";
@@ -600,6 +600,83 @@ pub struct ReadAuthorization {
     pub columns: Vec<u16>,
 }
 
+#[derive(Default, Debug)]
+struct TableWritePermissionNeeds {
+    insert: bool,
+    insert_columns: Vec<u16>,
+    update: bool,
+    update_columns: Vec<u16>,
+    delete: bool,
+    truncate: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    static WRITE_PERMISSION_DECISIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn summarize_write_permissions(
+    staging: &[(u64, crate::txn::Staged)],
+) -> HashMap<u64, TableWritePermissionNeeds> {
+    use crate::txn::Staged;
+
+    let mut needs = HashMap::<u64, TableWritePermissionNeeds>::new();
+    for (table_id, operation) in staging {
+        let table = needs.entry(*table_id).or_default();
+        match operation {
+            Staged::Put(cells) => {
+                table.insert = true;
+                table
+                    .insert_columns
+                    .extend(cells.iter().map(|(column, _)| *column));
+            }
+            Staged::Update(_, cells) => {
+                table.update = true;
+                table
+                    .update_columns
+                    .extend(cells.iter().map(|(column, _)| *column));
+            }
+            Staged::Delete(_) => table.delete = true,
+            Staged::Truncate => table.truncate = true,
+        }
+    }
+    for table in needs.values_mut() {
+        table.insert_columns.sort_unstable();
+        table.insert_columns.dedup();
+        table.update_columns.sort_unstable();
+        table.update_columns.dedup();
+    }
+    needs
+}
+
+struct SecurityCoordinator {
+    /// Lock order: security gate -> commit lock -> shared WAL -> table locks.
+    gate: RwLock<()>,
+    version: AtomicU64,
+}
+
+fn security_coordinator(root: &Path, version: u64) -> Arc<SecurityCoordinator> {
+    static COORDINATORS: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<PathBuf, std::sync::Weak<SecurityCoordinator>>>,
+    > = std::sync::OnceLock::new();
+
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut coordinators = COORDINATORS
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap();
+    coordinators.retain(|_, coordinator| coordinator.strong_count() > 0);
+    if let Some(coordinator) = coordinators.get(&root).and_then(std::sync::Weak::upgrade) {
+        return coordinator;
+    }
+    let coordinator = Arc::new(SecurityCoordinator {
+        gate: RwLock::new(()),
+        version: AtomicU64::new(version),
+    });
+    coordinators.insert(root, Arc::downgrade(&coordinator));
+    coordinator
+}
+
 pub fn lock_table_with_context<'a>(
     handle: &'a TableHandle,
     context: Option<&crate::query::AiExecutionContext>,
@@ -659,6 +736,7 @@ pub struct Database {
     /// Set by `_meta/replica`; user writes are rejected on follower copies.
     read_only: bool,
     catalog: RwLock<Catalog>,
+    security_coordinator: Arc<SecurityCoordinator>,
     rls_cache: Mutex<RlsCache>,
     epoch: Arc<EpochAuthority>,
     snapshots: Arc<SnapshotRegistry>,
@@ -712,6 +790,9 @@ pub struct Database {
     /// in-flight spill. `None` in production.
     #[doc(hidden)]
     spill_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// Test seam after the security read gate is held and before WAL append.
+    #[doc(hidden)]
+    security_commit_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     /// Test seam after a backup boundary is captured and before pinned runs are
     /// copied. Lets tests compact+GC the source at the worst possible moment.
     #[doc(hidden)]
@@ -1406,6 +1487,7 @@ impl Database {
         // a reference back to Database. The `require_auth` flag is mirrored
         // from the catalog; `enable_auth` / `refresh_principal` update it live.
         let auth_state = crate::auth_state::AuthState::new(cat.require_auth, principal.clone());
+        let security_coordinator = security_coordinator(&root, cat.security_version);
         let auth_checker: Option<Arc<dyn crate::auth_state::TableAuthChecker>> = Some(Arc::new(
             crate::auth_state::DefaultTableAuthChecker::new(auth_state.clone()),
         ));
@@ -1488,6 +1570,7 @@ impl Database {
             root,
             read_only,
             catalog: RwLock::new(cat),
+            security_coordinator,
             rls_cache: Mutex::new(RlsCache::default()),
             epoch,
             snapshots,
@@ -1510,6 +1593,7 @@ impl Database {
             replication_wal_retention_segments: AtomicUsize::new(0),
             backup_pins: Arc::new(Mutex::new(HashMap::new())),
             spill_hook: Mutex::new(None),
+            security_commit_hook: Mutex::new(None),
             backup_hook: Mutex::new(None),
             trigger_recursive: AtomicBool::new(TriggerConfig::default().recursive_triggers),
             trigger_max_depth: AtomicU32::new(TriggerConfig::default().max_depth),
@@ -1558,6 +1642,35 @@ impl Database {
         self.catalog.read().security.table_has_security(table)
     }
 
+    fn refresh_security_catalog_if_stale(&self, expected_version: u64) -> Result<()> {
+        if self.catalog.read().security_version == expected_version {
+            return Ok(());
+        }
+        let fresh = catalog::read(&self.root, self.meta_dek.as_ref())?
+            .ok_or_else(|| MongrelError::NotFound("catalog vanished during write".into()))?;
+        self.auth_state.set_require_auth(fresh.require_auth);
+        *self.catalog.write() = fresh;
+        Ok(())
+    }
+
+    fn security_write(&self) -> Result<parking_lot::RwLockWriteGuard<'_, ()>> {
+        let guard = self.security_coordinator.gate.write();
+        let version = self.security_coordinator.version.load(Ordering::Acquire);
+        self.refresh_security_catalog_if_stale(version)?;
+        Ok(guard)
+    }
+
+    /// Caller holds the security write gate. Publish only after the catalog is durable.
+    fn persist_security_catalog(&self, catalog: Catalog) -> Result<()> {
+        catalog::write_atomic(&self.root, &catalog, self.meta_dek.as_ref())?;
+        let version = catalog.security_version;
+        *self.catalog.write() = catalog;
+        self.security_coordinator
+            .version
+            .store(version, Ordering::Release);
+        Ok(())
+    }
+
     /// Persist a complete validated RLS/masking catalog through the WAL.
     pub fn set_security_catalog(&self, security: crate::security::SecurityCatalog) -> Result<()> {
         self.set_security_catalog_as(security, None)
@@ -1579,7 +1692,12 @@ impl Database {
             ));
         }
         let _ddl = self.ddl_lock.lock();
-        validate_security_catalog(&self.catalog.read(), &security)?;
+        // DDL serializes first; write-path order after that is security gate ->
+        // commit lock -> shared WAL.
+        let _security_write = self.security_write()?;
+        self.require_for(principal, &crate::auth::Permission::Admin)?;
+        let mut next_catalog = self.catalog.read().clone();
+        validate_security_catalog(&next_catalog, &security)?;
         let payload = DdlOp::encode_security(&security)?;
         let _commit = self.commit_lock.lock();
         let epoch = self.epoch.bump_assigned();
@@ -1601,13 +1719,10 @@ impl Database {
             .inspect_err(|_| {
                 self.poisoned.store(true, Ordering::Relaxed);
             })?;
-        {
-            let mut catalog = self.catalog.write();
-            catalog.security = security;
-            catalog.security_version = catalog.security_version.wrapping_add(1);
-            catalog.db_epoch = catalog.db_epoch.max(epoch.0);
-        }
-        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+        next_catalog.security = security;
+        next_catalog.security_version = next_catalog.security_version.wrapping_add(1);
+        next_catalog.db_epoch = next_catalog.db_epoch.max(epoch.0);
+        self.persist_security_catalog(next_catalog)?;
         self.epoch.publish_in_order(epoch);
         epoch_guard.disarm();
         Ok(())
@@ -1642,13 +1757,9 @@ impl Database {
         column_ids: &[u16],
         principal: Option<&crate::auth::Principal>,
     ) -> Result<()> {
-        let schema = self
-            .catalog
-            .read()
-            .live(table)
-            .ok_or_else(|| MongrelError::NotFound(format!("table {table:?} not found")))?
-            .schema
-            .clone();
+        if principal.is_none() && !self.auth_state.require_auth() {
+            return Ok(());
+        }
         let cached = self.principal.read().clone();
         let principal = principal.or(cached.as_ref());
         let Some(principal) = principal else {
@@ -1665,6 +1776,23 @@ impl Database {
             };
             return self.require(&permission);
         };
+        let catalog = self.catalog.read();
+        let schema = &catalog
+            .live(table)
+            .ok_or_else(|| MongrelError::NotFound(format!("table {table:?} not found")))?
+            .schema;
+        Self::require_columns_for_principal(table, schema, operation, column_ids, principal)
+    }
+
+    fn require_columns_for_principal(
+        table: &str,
+        schema: &Schema,
+        operation: crate::auth::ColumnOperation,
+        column_ids: &[u16],
+        principal: &crate::auth::Principal,
+    ) -> Result<()> {
+        #[cfg(test)]
+        WRITE_PERMISSION_DECISIONS.with(|decisions| decisions.set(decisions.get() + 1));
         match principal.column_access(table, operation) {
             crate::auth::ColumnAccess::All => Ok(()),
             crate::auth::ColumnAccess::Columns(allowed) => {
@@ -3107,54 +3235,52 @@ impl Database {
     pub fn create_user(&self, username: &str, password: &str) -> Result<crate::auth::UserEntry> {
         self.require(&crate::auth::Permission::Admin)?;
         let hash = crate::auth::hash_password(password).map_err(MongrelError::Other)?;
+        let _security_write = self.security_write()?;
+        self.require(&crate::auth::Permission::Admin)?;
         let epoch = self.epoch.bump_assigned();
         let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
-        let id = {
-            let mut cat = self.catalog.write();
-            if cat.users.iter().any(|u| u.username == username) {
-                return Err(MongrelError::InvalidArgument(format!(
-                    "user {username:?} already exists"
-                )));
-            }
-            cat.next_user_id += 1;
-            let id = cat.next_user_id;
-            let entry = crate::auth::UserEntry {
-                id,
-                username: username.into(),
-                password_hash: hash,
-                roles: Vec::new(),
-                is_admin: false,
-                created_epoch: epoch.0,
-            };
-            cat.users.push(entry.clone());
-            cat.security_version = cat.security_version.wrapping_add(1);
-            cat.db_epoch = epoch.0;
-            entry
+        let mut next_catalog = self.catalog.read().clone();
+        if next_catalog.users.iter().any(|u| u.username == username) {
+            return Err(MongrelError::InvalidArgument(format!(
+                "user {username:?} already exists"
+            )));
+        }
+        next_catalog.next_user_id += 1;
+        let entry = crate::auth::UserEntry {
+            id: next_catalog.next_user_id,
+            username: username.into(),
+            password_hash: hash,
+            roles: Vec::new(),
+            is_admin: false,
+            created_epoch: epoch.0,
         };
-        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+        next_catalog.users.push(entry.clone());
+        next_catalog.security_version = next_catalog.security_version.wrapping_add(1);
+        next_catalog.db_epoch = epoch.0;
+        self.persist_security_catalog(next_catalog)?;
         self.epoch.publish_in_order(epoch);
         _epoch_guard.disarm();
-        Ok(id)
+        Ok(entry)
     }
 
     /// Drop a user by username.
     pub fn drop_user(&self, username: &str) -> Result<()> {
         self.require(&crate::auth::Permission::Admin)?;
+        let _security_write = self.security_write()?;
+        self.require(&crate::auth::Permission::Admin)?;
         let epoch = self.epoch.bump_assigned();
         let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
-        {
-            let mut cat = self.catalog.write();
-            let before = cat.users.len();
-            cat.users.retain(|u| u.username != username);
-            if cat.users.len() == before {
-                return Err(MongrelError::NotFound(format!(
-                    "user {username:?} not found"
-                )));
-            }
-            cat.security_version = cat.security_version.wrapping_add(1);
-            cat.db_epoch = epoch.0;
+        let mut next_catalog = self.catalog.read().clone();
+        let before = next_catalog.users.len();
+        next_catalog.users.retain(|u| u.username != username);
+        if next_catalog.users.len() == before {
+            return Err(MongrelError::NotFound(format!(
+                "user {username:?} not found"
+            )));
         }
-        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+        next_catalog.security_version = next_catalog.security_version.wrapping_add(1);
+        next_catalog.db_epoch = epoch.0;
+        self.persist_security_catalog(next_catalog)?;
         self.epoch.publish_in_order(epoch);
         _epoch_guard.disarm();
         Ok(())
@@ -3164,20 +3290,20 @@ impl Database {
     pub fn alter_user_password(&self, username: &str, new_password: &str) -> Result<()> {
         self.require(&crate::auth::Permission::Admin)?;
         let hash = crate::auth::hash_password(new_password).map_err(MongrelError::Other)?;
+        let _security_write = self.security_write()?;
+        self.require(&crate::auth::Permission::Admin)?;
         let epoch = self.epoch.bump_assigned();
         let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
-        {
-            let mut cat = self.catalog.write();
-            let user = cat
-                .users
-                .iter_mut()
-                .find(|u| u.username == username)
-                .ok_or_else(|| MongrelError::NotFound(format!("user {username:?} not found")))?;
-            user.password_hash = hash;
-            cat.security_version = cat.security_version.wrapping_add(1);
-            cat.db_epoch = epoch.0;
-        }
-        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+        let mut next_catalog = self.catalog.read().clone();
+        let user = next_catalog
+            .users
+            .iter_mut()
+            .find(|u| u.username == username)
+            .ok_or_else(|| MongrelError::NotFound(format!("user {username:?} not found")))?;
+        user.password_hash = hash;
+        next_catalog.security_version = next_catalog.security_version.wrapping_add(1);
+        next_catalog.db_epoch = epoch.0;
+        self.persist_security_catalog(next_catalog)?;
         self.epoch.publish_in_order(epoch);
         _epoch_guard.disarm();
         Ok(())
@@ -3209,20 +3335,20 @@ impl Database {
     /// Grant admin privileges to a user (bypasses all permission checks).
     pub fn set_user_admin(&self, username: &str, is_admin: bool) -> Result<()> {
         self.require(&crate::auth::Permission::Admin)?;
+        let _security_write = self.security_write()?;
+        self.require(&crate::auth::Permission::Admin)?;
         let epoch = self.epoch.bump_assigned();
         let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
-        {
-            let mut cat = self.catalog.write();
-            let user = cat
-                .users
-                .iter_mut()
-                .find(|u| u.username == username)
-                .ok_or_else(|| MongrelError::NotFound(format!("user {username:?} not found")))?;
-            user.is_admin = is_admin;
-            cat.security_version = cat.security_version.wrapping_add(1);
-            cat.db_epoch = epoch.0;
-        }
-        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+        let mut next_catalog = self.catalog.read().clone();
+        let user = next_catalog
+            .users
+            .iter_mut()
+            .find(|u| u.username == username)
+            .ok_or_else(|| MongrelError::NotFound(format!("user {username:?} not found")))?;
+        user.is_admin = is_admin;
+        next_catalog.security_version = next_catalog.security_version.wrapping_add(1);
+        next_catalog.db_epoch = epoch.0;
+        self.persist_security_catalog(next_catalog)?;
         self.epoch.publish_in_order(epoch);
         _epoch_guard.disarm();
         Ok(())
@@ -3231,26 +3357,25 @@ impl Database {
     /// Create a new role.
     pub fn create_role(&self, name: &str) -> Result<crate::auth::RoleEntry> {
         self.require(&crate::auth::Permission::Admin)?;
+        let _security_write = self.security_write()?;
+        self.require(&crate::auth::Permission::Admin)?;
         let epoch = self.epoch.bump_assigned();
         let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
-        let entry = {
-            let mut cat = self.catalog.write();
-            if cat.roles.iter().any(|r| r.name == name) {
-                return Err(MongrelError::InvalidArgument(format!(
-                    "role {name:?} already exists"
-                )));
-            }
-            let entry = crate::auth::RoleEntry {
-                name: name.into(),
-                permissions: Vec::new(),
-                created_epoch: epoch.0,
-            };
-            cat.roles.push(entry.clone());
-            cat.security_version = cat.security_version.wrapping_add(1);
-            cat.db_epoch = epoch.0;
-            entry
+        let mut next_catalog = self.catalog.read().clone();
+        if next_catalog.roles.iter().any(|r| r.name == name) {
+            return Err(MongrelError::InvalidArgument(format!(
+                "role {name:?} already exists"
+            )));
+        }
+        let entry = crate::auth::RoleEntry {
+            name: name.into(),
+            permissions: Vec::new(),
+            created_epoch: epoch.0,
         };
-        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+        next_catalog.roles.push(entry.clone());
+        next_catalog.security_version = next_catalog.security_version.wrapping_add(1);
+        next_catalog.db_epoch = epoch.0;
+        self.persist_security_catalog(next_catalog)?;
         self.epoch.publish_in_order(epoch);
         _epoch_guard.disarm();
         Ok(entry)
@@ -3259,23 +3384,22 @@ impl Database {
     /// Drop a role by name.
     pub fn drop_role(&self, name: &str) -> Result<()> {
         self.require(&crate::auth::Permission::Admin)?;
+        let _security_write = self.security_write()?;
+        self.require(&crate::auth::Permission::Admin)?;
         let epoch = self.epoch.bump_assigned();
         let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
-        {
-            let mut cat = self.catalog.write();
-            let before = cat.roles.len();
-            cat.roles.retain(|r| r.name != name);
-            if cat.roles.len() == before {
-                return Err(MongrelError::NotFound(format!("role {name:?} not found")));
-            }
-            // Remove the role from all users.
-            for user in &mut cat.users {
-                user.roles.retain(|r| r != name);
-            }
-            cat.security_version = cat.security_version.wrapping_add(1);
-            cat.db_epoch = epoch.0;
+        let mut next_catalog = self.catalog.read().clone();
+        let before = next_catalog.roles.len();
+        next_catalog.roles.retain(|r| r.name != name);
+        if next_catalog.roles.len() == before {
+            return Err(MongrelError::NotFound(format!("role {name:?} not found")));
         }
-        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+        for user in &mut next_catalog.users {
+            user.roles.retain(|r| r != name);
+        }
+        next_catalog.security_version = next_catalog.security_version.wrapping_add(1);
+        next_catalog.db_epoch = epoch.0;
+        self.persist_security_catalog(next_catalog)?;
         self.epoch.publish_in_order(epoch);
         _epoch_guard.disarm();
         Ok(())
@@ -3284,27 +3408,27 @@ impl Database {
     /// Grant a role to a user.
     pub fn grant_role(&self, username: &str, role_name: &str) -> Result<()> {
         self.require(&crate::auth::Permission::Admin)?;
+        let _security_write = self.security_write()?;
+        self.require(&crate::auth::Permission::Admin)?;
         let epoch = self.epoch.bump_assigned();
         let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
-        {
-            let mut cat = self.catalog.write();
-            if !cat.roles.iter().any(|r| r.name == role_name) {
-                return Err(MongrelError::NotFound(format!(
-                    "role {role_name:?} not found"
-                )));
-            }
-            let user = cat
-                .users
-                .iter_mut()
-                .find(|u| u.username == username)
-                .ok_or_else(|| MongrelError::NotFound(format!("user {username:?} not found")))?;
-            if !user.roles.contains(&role_name.to_string()) {
-                user.roles.push(role_name.into());
-            }
-            cat.security_version = cat.security_version.wrapping_add(1);
-            cat.db_epoch = epoch.0;
+        let mut next_catalog = self.catalog.read().clone();
+        if !next_catalog.roles.iter().any(|r| r.name == role_name) {
+            return Err(MongrelError::NotFound(format!(
+                "role {role_name:?} not found"
+            )));
         }
-        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+        let user = next_catalog
+            .users
+            .iter_mut()
+            .find(|u| u.username == username)
+            .ok_or_else(|| MongrelError::NotFound(format!("user {username:?} not found")))?;
+        if !user.roles.iter().any(|role| role == role_name) {
+            user.roles.push(role_name.into());
+        }
+        next_catalog.security_version = next_catalog.security_version.wrapping_add(1);
+        next_catalog.db_epoch = epoch.0;
+        self.persist_security_catalog(next_catalog)?;
         self.epoch.publish_in_order(epoch);
         _epoch_guard.disarm();
         Ok(())
@@ -3313,20 +3437,20 @@ impl Database {
     /// Revoke a role from a user.
     pub fn revoke_role(&self, username: &str, role_name: &str) -> Result<()> {
         self.require(&crate::auth::Permission::Admin)?;
+        let _security_write = self.security_write()?;
+        self.require(&crate::auth::Permission::Admin)?;
         let epoch = self.epoch.bump_assigned();
         let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
-        {
-            let mut cat = self.catalog.write();
-            let user = cat
-                .users
-                .iter_mut()
-                .find(|u| u.username == username)
-                .ok_or_else(|| MongrelError::NotFound(format!("user {username:?} not found")))?;
-            user.roles.retain(|r| r != role_name);
-            cat.security_version = cat.security_version.wrapping_add(1);
-            cat.db_epoch = epoch.0;
-        }
-        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+        let mut next_catalog = self.catalog.read().clone();
+        let user = next_catalog
+            .users
+            .iter_mut()
+            .find(|u| u.username == username)
+            .ok_or_else(|| MongrelError::NotFound(format!("user {username:?} not found")))?;
+        user.roles.retain(|r| r != role_name);
+        next_catalog.security_version = next_catalog.security_version.wrapping_add(1);
+        next_catalog.db_epoch = epoch.0;
+        self.persist_security_catalog(next_catalog)?;
         self.epoch.publish_in_order(epoch);
         _epoch_guard.disarm();
         Ok(())
@@ -3339,20 +3463,20 @@ impl Database {
         permission: crate::auth::Permission,
     ) -> Result<()> {
         self.require(&crate::auth::Permission::Admin)?;
+        let _security_write = self.security_write()?;
+        self.require(&crate::auth::Permission::Admin)?;
         let epoch = self.epoch.bump_assigned();
         let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
-        {
-            let mut cat = self.catalog.write();
-            let role = cat
-                .roles
-                .iter_mut()
-                .find(|r| r.name == role_name)
-                .ok_or_else(|| MongrelError::NotFound(format!("role {role_name:?} not found")))?;
-            merge_permission(&mut role.permissions, permission);
-            cat.security_version = cat.security_version.wrapping_add(1);
-            cat.db_epoch = epoch.0;
-        }
-        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+        let mut next_catalog = self.catalog.read().clone();
+        let role = next_catalog
+            .roles
+            .iter_mut()
+            .find(|r| r.name == role_name)
+            .ok_or_else(|| MongrelError::NotFound(format!("role {role_name:?} not found")))?;
+        merge_permission(&mut role.permissions, permission);
+        next_catalog.security_version = next_catalog.security_version.wrapping_add(1);
+        next_catalog.db_epoch = epoch.0;
+        self.persist_security_catalog(next_catalog)?;
         self.epoch.publish_in_order(epoch);
         _epoch_guard.disarm();
         Ok(())
@@ -3365,20 +3489,20 @@ impl Database {
         permission: crate::auth::Permission,
     ) -> Result<()> {
         self.require(&crate::auth::Permission::Admin)?;
+        let _security_write = self.security_write()?;
+        self.require(&crate::auth::Permission::Admin)?;
         let epoch = self.epoch.bump_assigned();
         let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
-        {
-            let mut cat = self.catalog.write();
-            let role = cat
-                .roles
-                .iter_mut()
-                .find(|r| r.name == role_name)
-                .ok_or_else(|| MongrelError::NotFound(format!("role {role_name:?} not found")))?;
-            revoke_permission_from(&mut role.permissions, &permission);
-            cat.security_version = cat.security_version.wrapping_add(1);
-            cat.db_epoch = epoch.0;
-        }
-        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+        let mut next_catalog = self.catalog.read().clone();
+        let role = next_catalog
+            .roles
+            .iter_mut()
+            .find(|r| r.name == role_name)
+            .ok_or_else(|| MongrelError::NotFound(format!("role {role_name:?} not found")))?;
+        revoke_permission_from(&mut role.permissions, &permission);
+        next_catalog.security_version = next_catalog.security_version.wrapping_add(1);
+        next_catalog.db_epoch = epoch.0;
+        self.persist_security_catalog(next_catalog)?;
         self.epoch.publish_in_order(epoch);
         _epoch_guard.disarm();
         Ok(())
@@ -3499,38 +3623,39 @@ impl Database {
     pub fn enable_auth(&self, admin_username: &str, admin_password: &str) -> Result<()> {
         let password_hash =
             crate::auth::hash_password(admin_password).map_err(MongrelError::Other)?;
+        let _security_write = self.security_write()?;
         let epoch = self.epoch.bump_assigned();
         let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
-        {
-            let mut cat = self.catalog.write();
-            if cat.require_auth {
-                return Err(MongrelError::InvalidArgument(
-                    "database already has require_auth enabled".into(),
-                ));
-            }
-            // Reject a duplicate username so the bootstrap doesn't silently
-            // shadow an existing user.
-            if cat.users.iter().any(|u| u.username == admin_username) {
-                return Err(MongrelError::InvalidArgument(format!(
-                    "user {admin_username:?} already exists"
-                )));
-            }
-            cat.next_user_id = cat.next_user_id.max(1);
-            let id = cat.next_user_id;
-            cat.next_user_id += 1;
-            cat.users.push(crate::auth::UserEntry {
-                id,
-                username: admin_username.to_string(),
-                password_hash,
-                roles: Vec::new(),
-                is_admin: true,
-                created_epoch: epoch.0,
-            });
-            cat.require_auth = true;
-            cat.security_version = cat.security_version.wrapping_add(1);
-            cat.db_epoch = epoch.0;
+        let mut next_catalog = self.catalog.read().clone();
+        if next_catalog.require_auth {
+            return Err(MongrelError::InvalidArgument(
+                "database already has require_auth enabled".into(),
+            ));
         }
-        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+        if next_catalog
+            .users
+            .iter()
+            .any(|u| u.username == admin_username)
+        {
+            return Err(MongrelError::InvalidArgument(format!(
+                "user {admin_username:?} already exists"
+            )));
+        }
+        next_catalog.next_user_id = next_catalog.next_user_id.max(1);
+        let id = next_catalog.next_user_id;
+        next_catalog.next_user_id += 1;
+        next_catalog.users.push(crate::auth::UserEntry {
+            id,
+            username: admin_username.to_string(),
+            password_hash,
+            roles: Vec::new(),
+            is_admin: true,
+            created_epoch: epoch.0,
+        });
+        next_catalog.require_auth = true;
+        next_catalog.security_version = next_catalog.security_version.wrapping_add(1);
+        next_catalog.db_epoch = epoch.0;
+        self.persist_security_catalog(next_catalog)?;
         // Cache the admin principal on this handle + update the shared auth
         // state so mounted tables start enforcing immediately.
         *self.principal.write() = Some(crate::auth::Principal {
@@ -3562,20 +3687,19 @@ impl Database {
     ///
     /// See `docs/15-credential-enforcement.md` §4.7.
     pub fn disable_auth(&self) -> Result<()> {
+        let _security_write = self.security_write()?;
         let epoch = self.epoch.bump_assigned();
         let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
-        {
-            let mut cat = self.catalog.write();
-            if !cat.require_auth {
-                return Err(MongrelError::InvalidArgument(
-                    "database does not have require_auth enabled".into(),
-                ));
-            }
-            cat.require_auth = false;
-            cat.security_version = cat.security_version.wrapping_add(1);
-            cat.db_epoch = epoch.0;
+        let mut next_catalog = self.catalog.read().clone();
+        if !next_catalog.require_auth {
+            return Err(MongrelError::InvalidArgument(
+                "database does not have require_auth enabled".into(),
+            ));
         }
-        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+        next_catalog.require_auth = false;
+        next_catalog.security_version = next_catalog.security_version.wrapping_add(1);
+        next_catalog.db_epoch = epoch.0;
+        self.persist_security_catalog(next_catalog)?;
         // Clear the cached principal — enforcement is now off.
         *self.principal.write() = None;
         // Update the shared auth state so mounted tables also stop enforcing.
@@ -5934,40 +6058,65 @@ impl Database {
         staging: &[(u64, crate::txn::Staged)],
         principal: Option<&crate::auth::Principal>,
     ) -> Result<()> {
-        use crate::txn::Staged;
+        if principal.is_none() && !self.auth_state.require_auth() {
+            return Ok(());
+        }
 
-        let table_names = self
-            .catalog
-            .read()
-            .tables
-            .iter()
-            .filter(|entry| matches!(entry.state, TableState::Live))
-            .map(|entry| (entry.table_id, entry.name.clone()))
-            .collect::<HashMap<_, _>>();
-        for (table_id, operation) in staging {
-            let Some(table) = table_names.get(table_id) else {
-                continue;
-            };
-            match operation {
-                Staged::Put(cells) => self.require_columns_for(
-                    table,
+        let cached;
+        let principal = match principal {
+            Some(principal) => principal,
+            None => {
+                if self.principal.read().is_some() {
+                    self.refresh_principal().map_err(|error| match error {
+                        MongrelError::InvalidCredentials { .. } => MongrelError::AuthRequired,
+                        error => error,
+                    })?;
+                }
+                cached = self.principal.read().clone();
+                cached.as_ref().ok_or(MongrelError::AuthRequired)?
+            }
+        };
+        let needs = summarize_write_permissions(staging);
+        let catalog = self.catalog.read();
+
+        if needs.values().any(|need| need.truncate) {
+            self.require_for(Some(principal), &crate::auth::Permission::Admin)?;
+        }
+        for (table_id, need) in needs {
+            let entry = catalog
+                .tables
+                .iter()
+                .find(|entry| entry.table_id == table_id && matches!(entry.state, TableState::Live))
+                .ok_or_else(|| {
+                    MongrelError::NotFound(format!(
+                        "live table {table_id} not found during write validation"
+                    ))
+                })?;
+            if need.insert {
+                Self::require_columns_for_principal(
+                    &entry.name,
+                    &entry.schema,
                     crate::auth::ColumnOperation::Insert,
-                    &cells.iter().map(|(column, _)| *column).collect::<Vec<_>>(),
+                    &need.insert_columns,
                     principal,
-                )?,
-                Staged::Update(_, cells) => self.require_columns_for(
-                    table,
+                )?;
+            }
+            if need.update {
+                Self::require_columns_for_principal(
+                    &entry.name,
+                    &entry.schema,
                     crate::auth::ColumnOperation::Update,
-                    &cells.iter().map(|(column, _)| *column).collect::<Vec<_>>(),
+                    &need.update_columns,
                     principal,
-                )?,
-                Staged::Delete(_) => self.require_for(
-                    principal,
+                )?;
+            }
+            if need.delete {
+                self.require_for(
+                    Some(principal),
                     &crate::auth::Permission::Delete {
-                        table: table.clone(),
+                        table: entry.name.clone(),
                     },
-                )?,
-                Staged::Truncate => self.require_for(principal, &crate::auth::Permission::Admin)?,
+                )?;
             }
         }
         Ok(())
@@ -6100,12 +6249,14 @@ impl Database {
         if self.read_only {
             return Err(MongrelError::ReadOnlyReplica);
         }
+        let observed_security_version = self.security_coordinator.version.load(Ordering::Acquire);
+        self.refresh_security_catalog_if_stale(observed_security_version)?;
         if principal_catalog_bound {
             let fresh = catalog::read(&self.root, self.meta_dek.as_ref())?
                 .ok_or_else(|| MongrelError::NotFound("catalog vanished during write".into()))?;
             *self.catalog.write() = fresh;
         }
-        let security_version = {
+        {
             let catalog = self.catalog.read();
             if principal_catalog_bound {
                 let username = security_principal
@@ -6117,8 +6268,7 @@ impl Database {
                     return Err(MongrelError::AuthRequired);
                 }
             }
-            catalog.security_version
-        };
+        }
         let _replication_guard = self.replication_barrier.read();
         if self.poisoned.load(Ordering::Relaxed) {
             return Err(MongrelError::Other(
@@ -6461,17 +6611,22 @@ impl Database {
                 content_hash: [0u8; 32],
             })
             .collect();
+        // Lock order: security gate -> commit lock -> shared WAL -> table locks.
+        // Security mutations cannot overtake an authorized commit before its
+        // commit marker is durable.
+        let security_guard = self.security_coordinator.gate.read();
+        if self.security_coordinator.version.load(Ordering::Acquire) != observed_security_version {
+            return Err(MongrelError::Conflict(
+                "security policy changed during write".into(),
+            ));
+        }
+        if spill_guard.is_some() {
+            if let Some(hook) = self.security_commit_hook.lock().as_ref() {
+                hook();
+            }
+        }
         let (new_epoch, mut _epoch_guard, applies, committed_materialized_views, commit_seq) = {
             let mut wal = self.shared_wal.lock();
-
-            let current_security_version = catalog::read(&self.root, self.meta_dek.as_ref())?
-                .ok_or_else(|| MongrelError::NotFound("catalog vanished during write".into()))?
-                .security_version;
-            if current_security_version != security_version {
-                return Err(MongrelError::Conflict(
-                    "security policy changed during write".into(),
-                ));
-            }
 
             // Re-check only if the conflict index advanced since pre-validation
             // (bounded delta — spec §8.5, review fix #17). If the version is
@@ -6614,6 +6769,7 @@ impl Database {
             .inspect_err(|_| {
                 self.poisoned.store(true, Ordering::Relaxed);
             })?;
+        drop(security_guard);
 
         // ── 3. Publish: apply non-spilled ops + link spilled runs ──
         {
@@ -7014,6 +7170,8 @@ impl Database {
         }
 
         let _g = self.ddl_lock.lock();
+        let _security_write = self.security_write()?;
+        self.require(&crate::auth::Permission::Ddl)?;
         let table_id = {
             let cat = self.catalog.read();
             cat.live(name)
@@ -7041,32 +7199,40 @@ impl Database {
                 self.poisoned.store(true, Ordering::Relaxed);
             })?;
 
-        {
-            let mut cat = self.catalog.write();
-            let entry = cat
-                .tables
-                .iter_mut()
-                .find(|t| t.table_id == table_id)
-                .ok_or_else(|| MongrelError::NotFound(format!("table {name:?} not found")))?;
-            entry.state = TableState::Dropped { at_epoch: epoch.0 };
-            cat.triggers.retain(|trigger| {
-                !matches!(
-                    &trigger.trigger.target,
-                    TriggerTarget::Table(target) if target == name
-                )
-            });
-            cat.materialized_views
-                .retain(|definition| definition.name != name);
-            cat.security.rls_tables.retain(|table| table != name);
-            cat.security.policies.retain(|policy| policy.table != name);
-            cat.security.masks.retain(|mask| mask.table != name);
-            for role in &mut cat.roles {
-                role.permissions
-                    .retain(|permission| permission_table(permission) != Some(name));
-            }
-            cat.security_version = cat.security_version.wrapping_add(1);
+        let mut next_catalog = self.catalog.read().clone();
+        let entry = next_catalog
+            .tables
+            .iter_mut()
+            .find(|t| t.table_id == table_id)
+            .ok_or_else(|| MongrelError::NotFound(format!("table {name:?} not found")))?;
+        entry.state = TableState::Dropped { at_epoch: epoch.0 };
+        next_catalog.triggers.retain(|trigger| {
+            !matches!(
+                &trigger.trigger.target,
+                TriggerTarget::Table(target) if target == name
+            )
+        });
+        next_catalog
+            .materialized_views
+            .retain(|definition| definition.name != name);
+        next_catalog
+            .security
+            .rls_tables
+            .retain(|table| table != name);
+        next_catalog
+            .security
+            .policies
+            .retain(|policy| policy.table != name);
+        next_catalog
+            .security
+            .masks
+            .retain(|mask| mask.table != name);
+        for role in &mut next_catalog.roles {
+            role.permissions
+                .retain(|permission| permission_table(permission) != Some(name));
         }
-        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+        next_catalog.security_version = next_catalog.security_version.wrapping_add(1);
+        self.persist_security_catalog(next_catalog)?;
         self.tables.write().remove(&table_id);
 
         self.epoch.publish_in_order(epoch);
@@ -7105,6 +7271,8 @@ impl Database {
         }
 
         let _g = self.ddl_lock.lock();
+        let _security_write = self.security_write()?;
+        self.require(&crate::auth::Permission::Ddl)?;
         let table_id = {
             let cat = self.catalog.read();
             let src = cat
@@ -7144,52 +7312,50 @@ impl Database {
                 self.poisoned.store(true, Ordering::Relaxed);
             })?;
 
-        {
-            let mut cat = self.catalog.write();
-            let entry = cat
-                .tables
-                .iter_mut()
-                .find(|t| t.table_id == table_id)
-                .ok_or_else(|| MongrelError::NotFound(format!("table {name:?} not found")))?;
-            entry.name = new_name.to_string();
-            for trigger in &mut cat.triggers {
-                if matches!(
-                    &trigger.trigger.target,
-                    TriggerTarget::Table(target) if target == name
-                ) {
-                    trigger.trigger = trigger.trigger.retarget_table(new_name, epoch.0)?;
-                }
+        let mut next_catalog = self.catalog.read().clone();
+        let entry = next_catalog
+            .tables
+            .iter_mut()
+            .find(|t| t.table_id == table_id)
+            .ok_or_else(|| MongrelError::NotFound(format!("table {name:?} not found")))?;
+        entry.name = new_name.to_string();
+        for trigger in &mut next_catalog.triggers {
+            if matches!(
+                &trigger.trigger.target,
+                TriggerTarget::Table(target) if target == name
+            ) {
+                trigger.trigger = trigger.trigger.retarget_table(new_name, epoch.0)?;
             }
-            if let Some(definition) = cat
-                .materialized_views
-                .iter_mut()
-                .find(|definition| definition.name == name)
-            {
-                definition.name = new_name.to_string();
-            }
-            for table in &mut cat.security.rls_tables {
-                if table == name {
-                    *table = new_name.to_string();
-                }
-            }
-            for policy in &mut cat.security.policies {
-                if policy.table == name {
-                    policy.table = new_name.to_string();
-                }
-            }
-            for mask in &mut cat.security.masks {
-                if mask.table == name {
-                    mask.table = new_name.to_string();
-                }
-            }
-            for role in &mut cat.roles {
-                for permission in &mut role.permissions {
-                    rename_permission_table(permission, name, new_name);
-                }
-            }
-            cat.security_version = cat.security_version.wrapping_add(1);
         }
-        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+        if let Some(definition) = next_catalog
+            .materialized_views
+            .iter_mut()
+            .find(|definition| definition.name == name)
+        {
+            definition.name = new_name.to_string();
+        }
+        for table in &mut next_catalog.security.rls_tables {
+            if table == name {
+                *table = new_name.to_string();
+            }
+        }
+        for policy in &mut next_catalog.security.policies {
+            if policy.table == name {
+                policy.table = new_name.to_string();
+            }
+        }
+        for mask in &mut next_catalog.security.masks {
+            if mask.table == name {
+                mask.table = new_name.to_string();
+            }
+        }
+        for role in &mut next_catalog.roles {
+            for permission in &mut role.permissions {
+                rename_permission_table(permission, name, new_name);
+            }
+        }
+        next_catalog.security_version = next_catalog.security_version.wrapping_add(1);
+        self.persist_security_catalog(next_catalog)?;
         // The in-memory table object is keyed by table_id, not name, so it does
         // not move and live TableHandles remain valid.
         if let Some(table) = self.tables.read().get(&table_id) {
@@ -7276,6 +7442,14 @@ impl Database {
                 None,
             )?;
         }
+        let _security_write = if change.name.is_some() {
+            Some(self.security_write()?)
+        } else {
+            None
+        };
+        if _security_write.is_some() {
+            self.require(&crate::auth::Permission::Ddl)?;
+        }
         let mut table = handle.lock();
         let column = table.prepare_alter_column(column_name, &change)?;
         let renamed_column = (column.name != column_name).then(|| column.name.clone());
@@ -7317,41 +7491,39 @@ impl Database {
         let schema = table.schema().clone();
         drop(table);
 
-        {
-            let mut cat = self.catalog.write();
-            let entry = cat
-                .tables
-                .iter_mut()
-                .find(|t| t.table_id == table_id)
-                .ok_or_else(|| MongrelError::NotFound(format!("table {table_name:?} not found")))?;
-            entry.schema = schema;
-            if let Some(new_column_name) = renamed_column {
-                for trigger in &mut cat.triggers {
-                    if matches!(
-                        &trigger.trigger.target,
-                        TriggerTarget::Table(target) if target == table_name
-                    ) {
-                        trigger.trigger = trigger.trigger.renamed_update_column(
-                            column_name,
-                            new_column_name.clone(),
-                            epoch.0,
-                        )?;
-                    }
+        let mut next_catalog = self.catalog.read().clone();
+        let entry = next_catalog
+            .tables
+            .iter_mut()
+            .find(|t| t.table_id == table_id)
+            .ok_or_else(|| MongrelError::NotFound(format!("table {table_name:?} not found")))?;
+        entry.schema = schema;
+        if let Some(new_column_name) = &renamed_column {
+            for trigger in &mut next_catalog.triggers {
+                if matches!(
+                    &trigger.trigger.target,
+                    TriggerTarget::Table(target) if target == table_name
+                ) {
+                    trigger.trigger = trigger.trigger.renamed_update_column(
+                        column_name,
+                        new_column_name.clone(),
+                        epoch.0,
+                    )?;
                 }
-                for role in &mut cat.roles {
-                    for permission in &mut role.permissions {
-                        rename_permission_column(
-                            permission,
-                            table_name,
-                            column_name,
-                            &new_column_name,
-                        );
-                    }
-                }
-                cat.security_version = cat.security_version.wrapping_add(1);
             }
+            for role in &mut next_catalog.roles {
+                for permission in &mut role.permissions {
+                    rename_permission_column(permission, table_name, column_name, new_column_name);
+                }
+            }
+            next_catalog.security_version = next_catalog.security_version.wrapping_add(1);
         }
-        catalog::write_atomic(&self.root, &self.catalog.read(), self.meta_dek.as_ref())?;
+        if renamed_column.is_some() {
+            self.persist_security_catalog(next_catalog)?;
+        } else {
+            catalog::write_atomic(&self.root, &next_catalog, self.meta_dek.as_ref())?;
+            *self.catalog.write() = next_catalog;
+        }
 
         self.epoch.publish_in_order(epoch);
         _epoch_guard.disarm();
@@ -7656,6 +7828,13 @@ impl Database {
     #[doc(hidden)]
     pub fn __set_spill_hook(&self, f: impl Fn() + Send + Sync + 'static) {
         *self.spill_hook.lock() = Some(Box::new(f));
+    }
+
+    /// Test-only: install a hook invoked while a spilled commit holds the
+    /// security read gate and before it appends to the WAL.
+    #[doc(hidden)]
+    pub fn __set_security_commit_hook(&self, f: impl Fn() + Send + Sync + 'static) {
+        *self.security_commit_hook.lock() = Some(Box::new(f));
     }
 
     /// Test-only: pause an online backup after its consistent boundary is
@@ -9515,6 +9694,99 @@ fn sweep_pending_txn_dirs(root: &Path, cat: &Catalog) {
             .join("_txn");
         if txn_dir.exists() {
             let _ = std::fs::remove_dir_all(&txn_dir);
+        }
+    }
+}
+
+#[cfg(test)]
+mod write_permission_tests {
+    use super::*;
+    use crate::txn::Staged;
+
+    #[test]
+    fn homogeneous_batch_summarizes_to_one_permission_decision() {
+        let staging = (0..10_050)
+            .map(|_| {
+                (
+                    7,
+                    Staged::Put(vec![(2, Value::Int64(2)), (1, Value::Int64(1))]),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let needs = summarize_write_permissions(&staging);
+        let table = needs.get(&7).unwrap();
+        assert_eq!(needs.len(), 1);
+        assert!(table.insert);
+        assert_eq!(table.insert_columns, [1, 2]);
+        assert!(!table.update);
+        assert!(!table.delete);
+        assert!(!table.truncate);
+    }
+
+    #[test]
+    fn mixed_writes_union_columns_and_preserve_empty_operations() {
+        let staging = vec![
+            (7, Staged::Put(vec![(2, Value::Int64(2))])),
+            (7, Staged::Put(vec![(1, Value::Int64(1))])),
+            (7, Staged::Update(RowId(1), Vec::new())),
+            (7, Staged::Delete(RowId(2))),
+            (8, Staged::Truncate),
+        ];
+
+        let needs = summarize_write_permissions(&staging);
+        let table = needs.get(&7).unwrap();
+        assert_eq!(table.insert_columns, [1, 2]);
+        assert!(table.update);
+        assert!(table.update_columns.is_empty());
+        assert!(table.delete);
+        assert!(needs.get(&8).unwrap().truncate);
+    }
+
+    #[test]
+    fn final_permission_decisions_do_not_scale_with_rows() {
+        let credentialless_dir = tempfile::tempdir().unwrap();
+        let credentialless = Database::create(credentialless_dir.path()).unwrap();
+        credentialless.create_table("docs", test_schema()).unwrap();
+        WRITE_PERMISSION_DECISIONS.with(|decisions| decisions.set(0));
+        credentialless
+            .validate_write_permissions(&puts(credentialless.table_id("docs").unwrap()), None)
+            .unwrap();
+        WRITE_PERMISSION_DECISIONS.with(|decisions| assert_eq!(decisions.get(), 0));
+
+        let authenticated_dir = tempfile::tempdir().unwrap();
+        let authenticated =
+            Database::create_with_credentials(authenticated_dir.path(), "admin", "admin-password")
+                .unwrap();
+        authenticated.create_table("docs", test_schema()).unwrap();
+        let admin = authenticated.resolve_principal("admin").unwrap();
+        WRITE_PERMISSION_DECISIONS.with(|decisions| decisions.set(0));
+        authenticated
+            .validate_write_permissions(
+                &puts(authenticated.table_id("docs").unwrap()),
+                Some(&admin),
+            )
+            .unwrap();
+        WRITE_PERMISSION_DECISIONS.with(|decisions| assert_eq!(decisions.get(), 1));
+    }
+
+    fn puts(table_id: u64) -> Vec<(u64, Staged)> {
+        (0..10_050)
+            .map(|id| (table_id, Staged::Put(vec![(1, Value::Int64(id))])))
+            .collect()
+    }
+
+    fn test_schema() -> Schema {
+        Schema {
+            columns: vec![ColumnDef {
+                id: 1,
+                name: "id".into(),
+                ty: TypeId::Int64,
+                flags: crate::schema::ColumnFlags::empty()
+                    .with(crate::schema::ColumnFlags::PRIMARY_KEY),
+                default_value: None,
+            }],
+            ..Schema::default()
         }
     }
 }

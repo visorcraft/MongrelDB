@@ -166,8 +166,19 @@ impl<'db> Transaction<'db> {
         table: &str,
         rows: Vec<Vec<(u16, Value)>>,
     ) -> Result<Vec<Option<i64>>> {
-        for cells in &rows {
-            self.require_columns(table, crate::auth::ColumnOperation::Insert, cells)?;
+        if !rows.is_empty() {
+            let mut columns = rows
+                .iter()
+                .flat_map(|cells| cells.iter().map(|(column, _)| *column))
+                .collect::<Vec<_>>();
+            columns.sort_unstable();
+            columns.dedup();
+            self.db.require_columns_for(
+                table,
+                crate::auth::ColumnOperation::Insert,
+                &columns,
+                self.principal.as_ref(),
+            )?;
         }
         let id = self.db.table_id(table)?;
         let handle = self.db.table(table)?;
@@ -250,8 +261,19 @@ impl<'db> Transaction<'db> {
         table: &str,
         updates: Vec<(RowId, Vec<(u16, Value)>)>,
     ) -> Result<Vec<OwnedRow>> {
-        for (_, cells) in &updates {
-            self.require_columns(table, crate::auth::ColumnOperation::Update, cells)?;
+        if !updates.is_empty() {
+            let mut columns = updates
+                .iter()
+                .flat_map(|(_, cells)| cells.iter().map(|(column, _)| *column))
+                .collect::<Vec<_>>();
+            columns.sort_unstable();
+            columns.dedup();
+            self.db.require_columns_for(
+                table,
+                crate::auth::ColumnOperation::Update,
+                &columns,
+                self.principal.as_ref(),
+            )?;
         }
         let id = self.db.table_id(table)?;
         self.reject_after_truncate(id)?;

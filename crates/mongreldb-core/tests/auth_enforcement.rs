@@ -10,7 +10,9 @@ use mongreldb_core::{
     query::{AnnRerankRequest, Condition, Query, VectorMetric},
     schema::*,
     ColumnMask, ColumnOperation, Database, MaskStrategy, MongrelError, PolicyCommand,
-    ReadAuthorization, RowPolicy, SecurityCatalog, SecurityExpr, Value,
+    ReadAuthorization, RowPolicy, SecurityCatalog, SecurityExpr, StoredTrigger, TriggerCell,
+    TriggerDefinition, TriggerEvent, TriggerProgram, TriggerStep, TriggerTarget, TriggerTiming,
+    TriggerValue, Value,
 };
 use tempfile::tempdir;
 
@@ -28,6 +30,29 @@ fn int_pk_schema() -> Schema {
         colocation: vec![],
         constraints: Default::default(),
         clustered: false,
+    }
+}
+
+fn two_column_schema() -> Schema {
+    Schema {
+        schema_id: 2,
+        columns: vec![
+            ColumnDef {
+                id: 1,
+                name: "id".into(),
+                ty: TypeId::Int64,
+                flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
+            },
+            ColumnDef {
+                id: 2,
+                name: "secret".into(),
+                ty: TypeId::Bytes,
+                flags: ColumnFlags::empty(),
+                default_value: None,
+            },
+        ],
+        ..Schema::default()
     }
 }
 
@@ -849,6 +874,218 @@ fn transaction_update_enforces_update_permission() {
         other => panic!("expected PermissionDenied for update_many, got {other:?}"),
     }
     txn.rollback();
+}
+
+#[test]
+fn batch_column_permissions_cover_every_row() {
+    let dir = tempdir().unwrap();
+    let db = Database::create_with_credentials(dir.path(), "admin", "admin-pw").unwrap();
+    db.create_table("docs", two_column_schema()).unwrap();
+    db.create_user("writer", "writer-pw").unwrap();
+    db.create_role("id_writer").unwrap();
+    db.grant_permission(
+        "id_writer",
+        Permission::InsertColumns {
+            table: "docs".into(),
+            columns: vec!["id".into()],
+        },
+    )
+    .unwrap();
+    db.grant_role("writer", "id_writer").unwrap();
+
+    let writer = db.resolve_principal("writer").unwrap();
+    let mut txn = db.begin_as(Some(writer));
+    let error = txn
+        .put_batch(
+            "docs",
+            vec![
+                vec![(1, Value::Int64(1))],
+                vec![(1, Value::Int64(2)), (2, Value::Bytes(b"denied".to_vec()))],
+            ],
+        )
+        .unwrap_err();
+    assert!(matches!(error, MongrelError::PermissionDenied { .. }));
+}
+
+#[test]
+fn commit_rechecks_revoked_batch_permission() {
+    let dir = tempdir().unwrap();
+    let admin = Database::create_with_credentials(dir.path(), "admin", "admin-pw").unwrap();
+    admin.create_table("docs", int_pk_schema()).unwrap();
+    admin.create_user("writer", "writer-pw").unwrap();
+    admin.create_role("writer_role").unwrap();
+    admin
+        .grant_permission(
+            "writer_role",
+            Permission::Insert {
+                table: "docs".into(),
+            },
+        )
+        .unwrap();
+    admin.grant_role("writer", "writer_role").unwrap();
+    let writer = Database::open_with_credentials(dir.path(), "writer", "writer-pw").unwrap();
+
+    let mut txn = writer.begin();
+    txn.put_batch("docs", vec![vec![(1, Value::Int64(1))]])
+        .unwrap();
+    admin.revoke_role("writer", "writer_role").unwrap();
+
+    let error = txn.commit().unwrap_err();
+    assert!(matches!(error, MongrelError::PermissionDenied { .. }));
+}
+
+#[test]
+fn revocation_during_commit_preparation_fails_before_publish() {
+    let dir = tempdir().unwrap();
+    let admin = Database::create_with_credentials(dir.path(), "admin", "admin-pw").unwrap();
+    admin.create_table("docs", int_pk_schema()).unwrap();
+    admin.create_user("writer", "writer-pw").unwrap();
+    admin.create_role("writer_role").unwrap();
+    admin
+        .grant_permission(
+            "writer_role",
+            Permission::Insert {
+                table: "docs".into(),
+            },
+        )
+        .unwrap();
+    admin.grant_role("writer", "writer_role").unwrap();
+    let writer = Database::open_with_credentials(dir.path(), "writer", "writer-pw").unwrap();
+    writer.set_spill_threshold(1);
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let hook_resume = resume.clone();
+    writer.__set_spill_hook(move || {
+        ready_tx.send(()).unwrap();
+        hook_resume.wait();
+    });
+    let mut transaction = writer.begin();
+    transaction.put("docs", vec![(1, Value::Int64(1))]).unwrap();
+
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            ready_rx.recv().unwrap();
+            admin.revoke_role("writer", "writer_role").unwrap();
+            resume.wait();
+        });
+        let error = transaction.commit().unwrap_err();
+        assert!(matches!(error, MongrelError::Conflict(_)));
+    });
+    assert_eq!(writer.table("docs").unwrap().lock().count(), 0);
+}
+
+#[test]
+fn stale_credentialless_handle_observes_auth_enable_before_commit() {
+    let dir = tempdir().unwrap();
+    let bootstrap = Database::create(dir.path()).unwrap();
+    bootstrap.create_table("docs", int_pk_schema()).unwrap();
+    let stale = Database::open(dir.path()).unwrap();
+    bootstrap.enable_auth("admin", "admin-password").unwrap();
+
+    let mut transaction = stale.begin();
+    transaction.put("docs", vec![(1, Value::Int64(1))]).unwrap();
+    let error = transaction.commit().unwrap_err();
+    assert!(matches!(error, MongrelError::AuthRequired));
+    assert_eq!(stale.table("docs").unwrap().lock().count(), 0);
+}
+
+#[test]
+fn revocation_waits_for_commit_already_inside_security_gate() {
+    let dir = tempdir().unwrap();
+    let admin = Database::create_with_credentials(dir.path(), "admin", "admin-pw").unwrap();
+    admin.create_table("docs", int_pk_schema()).unwrap();
+    admin.create_user("writer", "writer-pw").unwrap();
+    admin.create_role("writer_role").unwrap();
+    admin
+        .grant_permission(
+            "writer_role",
+            Permission::Insert {
+                table: "docs".into(),
+            },
+        )
+        .unwrap();
+    admin.grant_role("writer", "writer_role").unwrap();
+    let writer = Database::open_with_credentials(dir.path(), "writer", "writer-pw").unwrap();
+    writer.set_spill_threshold(1);
+
+    let entered = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let attempted = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook_entered = entered.clone();
+    let hook_attempted = attempted.clone();
+    let hook_done = done.clone();
+    writer.__set_security_commit_hook(move || {
+        hook_entered.wait();
+        hook_attempted.wait();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!hook_done.load(std::sync::atomic::Ordering::Acquire));
+    });
+    let mut transaction = writer.begin();
+    transaction.put("docs", vec![(1, Value::Int64(1))]).unwrap();
+
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            entered.wait();
+            attempted.wait();
+            admin.revoke_role("writer", "writer_role").unwrap();
+            done.store(true, std::sync::atomic::Ordering::Release);
+        });
+        transaction.commit().unwrap();
+    });
+    assert_eq!(writer.table("docs").unwrap().lock().count(), 1);
+}
+
+#[test]
+fn trigger_generated_batch_write_is_finally_authorized() {
+    let dir = tempdir().unwrap();
+    let admin = Database::create_with_credentials(dir.path(), "admin", "admin-pw").unwrap();
+    admin.create_table("base", int_pk_schema()).unwrap();
+    admin.create_table("audit", int_pk_schema()).unwrap();
+    admin
+        .create_trigger(
+            StoredTrigger::new(
+                "base_ai",
+                TriggerDefinition {
+                    target: TriggerTarget::Table("base".into()),
+                    timing: TriggerTiming::After,
+                    event: TriggerEvent::Insert,
+                    update_of: Vec::new(),
+                    target_columns: Vec::new(),
+                    when: None,
+                    program: TriggerProgram {
+                        steps: vec![TriggerStep::Insert {
+                            table: "audit".into(),
+                            cells: vec![TriggerCell {
+                                column_id: 1,
+                                value: TriggerValue::NewColumn(1),
+                            }],
+                        }],
+                    },
+                },
+                0,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    admin.create_user("writer", "writer-pw").unwrap();
+    admin.create_role("base_writer").unwrap();
+    admin
+        .grant_permission(
+            "base_writer",
+            Permission::Insert {
+                table: "base".into(),
+            },
+        )
+        .unwrap();
+    admin.grant_role("writer", "base_writer").unwrap();
+    let writer = Database::open_with_credentials(dir.path(), "writer", "writer-pw").unwrap();
+
+    let mut txn = writer.begin();
+    txn.put("base", vec![(1, Value::Int64(1))]).unwrap();
+    let error = txn.commit().unwrap_err();
+    assert!(matches!(error, MongrelError::PermissionDenied { .. }));
+    assert_eq!(writer.table("base").unwrap().lock().count(), 0);
+    assert_eq!(writer.table("audit").unwrap().lock().count(), 0);
 }
 
 /// Table::put_batch and Table::delete are enforced (direct table access path,
