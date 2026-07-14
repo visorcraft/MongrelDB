@@ -5354,6 +5354,22 @@ impl Table {
             && self.run_refs.len() == 1
         {
             let mut reader = self.open_reader(self.run_refs[0].run_id)?;
+            // Small projections should not decode and scan the run's entire
+            // row-id column. Resolve each requested row through the page-pruned
+            // point path until a full visibility pass becomes cheaper. Keep
+            // this crossover aligned with `rows_for_rids_at_time`.
+            if row_ids.len().saturating_mul(24) < reader.row_count() {
+                let mut values = Vec::with_capacity(row_ids.len());
+                for &raw_row_id in row_ids {
+                    let row_id = RowId(raw_row_id);
+                    if let Some((_, false, Some(value))) =
+                        reader.get_version_column(row_id, snapshot.epoch, column_id)?
+                    {
+                        values.push((row_id, value));
+                    }
+                }
+                return Ok(values);
+            }
             let (positions, visible_row_ids) =
                 reader.visible_positions_with_rids(snapshot.epoch)?;
             let requested: Vec<(RowId, usize)> = row_ids

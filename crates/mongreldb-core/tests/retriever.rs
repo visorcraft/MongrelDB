@@ -475,3 +475,46 @@ fn hybrid_search_filters_unions_and_fuses_deterministically() {
         .to_string()
         .contains("unique"));
 }
+
+#[test]
+fn search_projects_small_candidate_set_from_single_run() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path(), schema(), 1).unwrap();
+    for id in 0..64u32 {
+        table
+            .put(vec![
+                (1, Value::Int64(id as i64)),
+                (2, Value::Embedding(vec![1.0; 8])),
+                (
+                    3,
+                    Value::Bytes(bincode::serialize(&vec![(id, 1.0f32)]).unwrap()),
+                ),
+                (4, members(&[])),
+            ])
+            .unwrap();
+    }
+    table.commit().unwrap();
+    table.close().unwrap();
+
+    let hits = table
+        .search(&SearchRequest {
+            must: vec![],
+            retrievers: vec![NamedRetriever {
+                name: "sparse".into(),
+                weight: 1.0,
+                retriever: Retriever::Sparse {
+                    column_id: 3,
+                    query: vec![(37, 1.0)],
+                    k: 1,
+                },
+            }],
+            fusion: Fusion::ReciprocalRank { constant: 60 },
+            rerank: None,
+            limit: 1,
+            projection: Some(vec![1]),
+        })
+        .unwrap();
+
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].cells, vec![(1, Value::Int64(37))]);
+}
