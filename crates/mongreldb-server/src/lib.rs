@@ -293,6 +293,7 @@ pub fn build_app_with_sessions_and_control(
     });
     let router = axum::Router::new()
         .route("/health", get(health))
+        .route("/capabilities", get(capabilities))
         .route(
             "/history/retention",
             get(history_retention).put(set_history_retention),
@@ -785,6 +786,32 @@ pub fn spawn_auto_compactor(db: Arc<Database>) {
 
 async fn health() -> StatusCode {
     StatusCode::OK
+}
+
+#[derive(Debug, Serialize)]
+struct SqlCancellationCapabilities {
+    version: u8,
+    client_query_ids: bool,
+    cancel_endpoint: bool,
+    query_status: bool,
+    stream_disconnect_cancels: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct CapabilitiesResponse {
+    sql_cancellation: SqlCancellationCapabilities,
+}
+
+async fn capabilities() -> Json<CapabilitiesResponse> {
+    Json(CapabilitiesResponse {
+        sql_cancellation: SqlCancellationCapabilities {
+            version: 1,
+            client_query_ids: true,
+            cancel_endpoint: true,
+            query_status: true,
+            stream_disconnect_cancels: true,
+        },
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -2796,6 +2823,30 @@ mod auth_tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn capabilities_advertise_sql_cancellation_v1() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(Database::create(dir.path()).unwrap());
+        let app = build_app_with_config(db, std::iter::empty(), None, None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let body: serde_json::Value = reqwest::Client::new()
+            .get(format!("http://{addr}/capabilities"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(body["sql_cancellation"]["version"], 1);
+        assert_eq!(body["sql_cancellation"]["client_query_ids"], true);
+        assert_eq!(body["sql_cancellation"]["cancel_endpoint"], true);
+        assert_eq!(body["sql_cancellation"]["query_status"], true);
+        assert_eq!(body["sql_cancellation"]["stream_disconnect_cancels"], true);
     }
 }
 
