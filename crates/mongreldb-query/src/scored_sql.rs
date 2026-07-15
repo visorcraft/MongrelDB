@@ -3,8 +3,15 @@ use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableFunctionArgs, TableFunctionImpl, TableProvider};
 use datafusion::common::{DataFusionError, Result as DFResult, ScalarValue};
+use datafusion::execution::TaskContext;
 use datafusion::logical_expr::{Expr, TableType};
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+    SendableRecordBatchStream,
+};
 use datafusion::prelude::SessionContext;
 use mongreldb_core::query::{
     AnnRerankRequest, Condition, Fusion, NamedRetriever, Retriever, RetrieverScore, SearchRequest,
@@ -17,6 +24,8 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+use crate::query_registry::SqlTaskContext;
 
 pub(crate) type TableMap = Arc<Mutex<HashMap<String, mongreldb_core::TableHandle>>>;
 
@@ -80,15 +89,19 @@ impl ScoredRuntime {
         Ok(())
     }
 
-    fn execution(&self) -> (Duration, mongreldb_core::query::AiExecutionContext) {
+    fn execution(
+        &self,
+        parent: Option<&mongreldb_core::ExecutionControl>,
+    ) -> mongreldb_core::query::AiExecutionContext {
         let timeout = Duration::from_millis(self.timeout_ms.load(Ordering::Acquire));
-        (
-            timeout,
-            mongreldb_core::query::AiExecutionContext::with_limits(
-                timeout,
-                self.max_work.load(Ordering::Acquire),
-                self.max_fused_candidates.load(Ordering::Acquire),
-            ),
+        let deadline = Some(std::time::Instant::now() + timeout);
+        let control = parent
+            .map(|parent| parent.child_with_deadline(deadline))
+            .unwrap_or_else(|| mongreldb_core::ExecutionControl::new(deadline));
+        mongreldb_core::query::AiExecutionContext::with_control(
+            control,
+            self.max_work.load(Ordering::Acquire),
+            self.max_fused_candidates.load(Ordering::Acquire),
         )
     }
 }
@@ -312,6 +325,15 @@ struct LiveScoredProvider {
     runtime: Arc<ScoredRuntime>,
 }
 
+struct LiveScoredExec {
+    props: Arc<PlanProperties>,
+    schema: SchemaRef,
+    execute: Arc<ScoredExecution>,
+    runtime: Arc<ScoredRuntime>,
+    projection: Option<Vec<usize>>,
+    limit: Option<usize>,
+}
+
 struct CancelOnDrop(Option<mongreldb_core::query::AiExecutionContext>);
 
 const CANCELLATION_GRACE: Duration = Duration::from_millis(100);
@@ -328,6 +350,137 @@ impl fmt::Debug for LiveScoredProvider {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LiveScoredProvider").finish_non_exhaustive()
     }
+}
+
+impl fmt::Debug for LiveScoredExec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LiveScoredExec").finish_non_exhaustive()
+    }
+}
+
+impl DisplayAs for LiveScoredExec {
+    fn fmt_as(&self, _format: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "LiveScoredExec")
+    }
+}
+
+impl ExecutionPlan for LiveScoredExec {
+    fn name(&self) -> &str {
+        "LiveScoredExec"
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.props
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        Vec::new()
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        if children.is_empty() {
+            Ok(self)
+        } else {
+            Err(DataFusionError::Internal(
+                "LiveScoredExec is a leaf node and has no children".into(),
+            ))
+        }
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        task_context: Arc<TaskContext>,
+    ) -> DFResult<SendableRecordBatchStream> {
+        if partition != 0 {
+            return Err(DataFusionError::Internal(format!(
+                "LiveScoredExec is single-partition; invalid partition {partition}"
+            )));
+        }
+        let query = task_context
+            .session_config()
+            .get_extension::<SqlTaskContext>()
+            .map(|context| context.query().clone());
+        let context = self
+            .runtime
+            .execution(query.as_ref().map(|query| query.control()));
+        context
+            .checkpoint()
+            .map_err(|error| scored_control_error(query.as_ref(), error))?;
+        let schema = Arc::clone(&self.schema);
+        let stream_schema = Arc::clone(&schema);
+        let execute = Arc::clone(&self.execute);
+        let semaphore = Arc::clone(&self.runtime.semaphore);
+        let projection = self.projection.clone();
+        let limit = self.limit;
+        let item = async move {
+            let mut cancel = CancelOnDrop(Some(context.clone()));
+            let control = context.execution_control().clone();
+            let permit = tokio::select! {
+                permit = semaphore.acquire_owned() => permit.map_err(|_| {
+                    DataFusionError::Execution("scored SQL cancelled".into())
+                })?,
+                _ = control.cancelled() => {
+                    return Err(scored_control_error_from_context(query.as_ref(), &context));
+                }
+            };
+            let worker_context = context.clone();
+            let mut task = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                execute(&worker_context)
+            });
+            let result = tokio::select! {
+                result = &mut task => result.map_err(|error| {
+                    DataFusionError::Execution(format!("scored SQL worker failed: {error}"))
+                })?,
+                _ = control.cancelled() => {
+                    if tokio::time::timeout(CANCELLATION_GRACE, &mut task).await.is_err() {
+                        eprintln!("scored SQL worker exceeded cancellation grace");
+                    }
+                    return Err(scored_control_error_from_context(query.as_ref(), &context));
+                }
+            };
+            cancel.0 = None;
+            let mut batch = result?;
+            if let Some(projection) = projection {
+                batch = batch.project(&projection)?;
+            }
+            if let Some(limit) = limit {
+                batch = batch.slice(0, limit.min(batch.num_rows()));
+            }
+            Ok(batch)
+        };
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            stream_schema,
+            futures::stream::once(item),
+        )))
+    }
+}
+
+fn scored_control_error(
+    query: Option<&crate::RegisteredSqlQuery>,
+    error: mongreldb_core::MongrelError,
+) -> DataFusionError {
+    if let Some(error) = query.and_then(|query| query.checkpoint().err()) {
+        DataFusionError::External(Box::new(error))
+    } else {
+        DataFusionError::Execution(error.to_string())
+    }
+}
+
+fn scored_control_error_from_context(
+    query: Option<&crate::RegisteredSqlQuery>,
+    context: &mongreldb_core::query::AiExecutionContext,
+) -> DataFusionError {
+    scored_control_error(
+        query,
+        context
+            .checkpoint()
+            .expect_err("cancelled scored context must fail its checkpoint"),
+    )
 }
 
 #[async_trait::async_trait]
@@ -347,57 +500,24 @@ impl TableProvider for LiveScoredProvider {
         _filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let (timeout, context) = self.runtime.execution();
-        let started = std::time::Instant::now();
-        let permit = tokio::time::timeout(timeout, self.runtime.semaphore.clone().acquire_owned())
-            .await
-            .map_err(|_| DataFusionError::Execution("scored SQL deadline exceeded".into()))?
-            .map_err(|_| DataFusionError::Execution("scored SQL cancelled".into()))?;
-        let remaining = timeout.saturating_sub(started.elapsed());
-        if remaining.is_zero() {
-            return Err(DataFusionError::Execution(
-                "scored SQL deadline exceeded".into(),
-            ));
-        }
-        let execute = Arc::clone(&self.execute);
-        let worker_context = context.clone();
-        let mut cancel = CancelOnDrop(Some(context.clone()));
-        let mut task = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            execute(&worker_context)
-        });
-        let result = match tokio::time::timeout(remaining, &mut task).await {
-            Ok(result) => result.map_err(|error| {
-                DataFusionError::Execution(format!("scored SQL worker failed: {error}"))
-            })?,
-            Err(_) => {
-                context.cancel();
-                if tokio::time::timeout(CANCELLATION_GRACE, &mut task)
-                    .await
-                    .is_err()
-                {
-                    eprintln!("scored SQL worker exceeded cancellation grace");
-                }
-                Err(DataFusionError::Execution(
-                    "scored SQL deadline exceeded".into(),
-                ))
-            }
+        let schema = match projection {
+            Some(projection) => Arc::new(self.schema.project(projection)?),
+            None => Arc::clone(&self.schema),
         };
-        cancel.0 = None;
-        let mut batch = result?;
-        if let Some(projection) = projection {
-            batch = batch.project(projection)?;
-        }
-        if let Some(limit) = limit {
-            batch = batch.slice(0, limit.min(batch.num_rows()));
-        }
-        let schema = batch.schema();
-        let statistics = (0..batch.num_columns())
-            .map(|_| crate::scan::to_col_statistics(None))
-            .collect();
-        Ok(Arc::new(crate::scan::MongrelScanExec::new_batch(
-            schema, batch, statistics,
-        )))
+        let props = Arc::new(PlanProperties::new(
+            EquivalenceProperties::new(Arc::clone(&schema)),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        ));
+        Ok(Arc::new(LiveScoredExec {
+            props,
+            schema,
+            execute: Arc::clone(&self.execute),
+            runtime: Arc::clone(&self.runtime),
+            projection: projection.cloned(),
+            limit,
+        }))
     }
 }
 

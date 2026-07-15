@@ -2662,8 +2662,7 @@ impl MongrelSession {
         if let Ok(query) = CURRENT_SQL_QUERY.try_with(Clone::clone) {
             return Box::pin(self.run_stream_internal(sql, &query)).await;
         }
-        self.run_stream_with_options(sql, SqlQueryOptions::default())
-            .await
+        Box::pin(self.run_stream_with_options(sql, SqlQueryOptions::default())).await
     }
 
     /// Execute SQL as a DataFusion record-batch stream. Query results bypass
@@ -2789,7 +2788,7 @@ impl MongrelSession {
         if let Ok(query) = CURRENT_SQL_QUERY.try_with(Clone::clone) {
             return Box::pin(self.run_internal(sql, &query)).await;
         }
-        self.run_with_options(sql, SqlQueryOptions::default()).await
+        Box::pin(self.run_with_options(sql, SqlQueryOptions::default())).await
     }
 
     /// Run a SQL statement: DDL/commands are intercepted; otherwise a result

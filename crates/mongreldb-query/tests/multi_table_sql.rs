@@ -122,7 +122,14 @@ impl ExternalTable for AppRowsTable {
         ))
     }
 
-    fn scan(&self, request: &ExternalPlanRequest<'_>) -> DFResult<ExternalScan> {
+    fn scan_with_control(
+        &self,
+        request: &ExternalPlanRequest<'_>,
+        control: &mongreldb_core::ExecutionControl,
+    ) -> DFResult<ExternalScan> {
+        control
+            .checkpoint()
+            .map_err(|error| DataFusionError::Execution(error.to_string()))?;
         let full_columns = vec![
             Arc::new(Int64Array::from(vec![7, 8])) as ArrayRef,
             Arc::new(StringArray::from(vec!["seven", "eight"])) as ArrayRef,
@@ -271,7 +278,14 @@ impl ExternalTable for AppTxnTable {
         ))
     }
 
-    fn scan(&self, request: &ExternalPlanRequest<'_>) -> DFResult<ExternalScan> {
+    fn scan_with_control(
+        &self,
+        request: &ExternalPlanRequest<'_>,
+        control: &mongreldb_core::ExecutionControl,
+    ) -> DFResult<ExternalScan> {
+        control
+            .checkpoint()
+            .map_err(|error| DataFusionError::Execution(error.to_string()))?;
         let mut rows = self.rows.clone();
         rows.sort_by_key(app_txn_key);
         let keys = rows.iter().map(app_txn_key).collect::<Vec<_>>();

@@ -5,11 +5,17 @@ use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, SchemaRef};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::{DataFusionError, Result as DFResult, ScalarValue};
+use datafusion::execution::TaskContext;
 use datafusion::logical_expr::{
     BinaryExpr, Expr, Operator, TableProviderFilterPushDown, TableType,
 };
-use datafusion::physical_plan::ExecutionPlan;
-use datafusion_datasource::memory::MemorySourceConfig;
+use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+    SendableRecordBatchStream,
+};
 use mongreldb_core::catalog::TableState;
 use mongreldb_core::database::{TABLES_DIR, VTAB_DIR};
 use mongreldb_core::schema::{
@@ -22,6 +28,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use crate::query_registry::SqlTaskContext;
 
 pub trait ExternalTableModule: Send + Sync {
     fn name(&self) -> &str;
@@ -91,7 +99,11 @@ pub trait ExternalTableModule: Send + Sync {
 pub trait ExternalTable: std::fmt::Debug + Send + Sync {
     fn schema(&self) -> SchemaRef;
     fn plan(&self, request: &ExternalPlanRequest<'_>) -> DFResult<ExternalPlan>;
-    fn scan(&self, request: &ExternalPlanRequest<'_>) -> DFResult<ExternalScan>;
+    fn scan_with_control(
+        &self,
+        request: &ExternalPlanRequest<'_>,
+        control: &mongreldb_core::ExecutionControl,
+    ) -> DFResult<ExternalScan>;
 }
 
 #[derive(Clone)]
@@ -562,6 +574,151 @@ struct ExternalTableProvider {
     plan_cache: parking_lot::Mutex<HashMap<ExternalPlanCacheKey, ExternalPlan>>,
 }
 
+struct ExternalTableExec {
+    props: Arc<PlanProperties>,
+    schema: SchemaRef,
+    table: Arc<dyn ExternalTable>,
+    projection: Option<Vec<usize>>,
+    filters: Vec<Expr>,
+    limit: Option<usize>,
+}
+
+impl std::fmt::Debug for ExternalTableExec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExternalTableExec").finish_non_exhaustive()
+    }
+}
+
+impl DisplayAs for ExternalTableExec {
+    fn fmt_as(
+        &self,
+        _format: DisplayFormatType,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        write!(f, "ExternalTableExec")
+    }
+}
+
+impl ExecutionPlan for ExternalTableExec {
+    fn name(&self) -> &str {
+        "ExternalTableExec"
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.props
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        Vec::new()
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        if children.is_empty() {
+            Ok(self)
+        } else {
+            Err(DataFusionError::Internal(
+                "ExternalTableExec is a leaf node and has no children".into(),
+            ))
+        }
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        task_context: Arc<TaskContext>,
+    ) -> DFResult<SendableRecordBatchStream> {
+        use futures::TryStreamExt;
+
+        if partition != 0 {
+            return Err(DataFusionError::Internal(format!(
+                "ExternalTableExec is single-partition; invalid partition {partition}"
+            )));
+        }
+        let query = task_context
+            .session_config()
+            .get_extension::<SqlTaskContext>()
+            .map(|context| context.query().clone());
+        let control = query
+            .as_ref()
+            .map(|query| query.control().child_with_deadline(None))
+            .unwrap_or_else(|| mongreldb_core::ExecutionControl::new(None));
+        control
+            .checkpoint()
+            .map_err(|error| external_control_error(query.as_ref(), error))?;
+        let table = Arc::clone(&self.table);
+        let projection = self.projection.clone();
+        let filters = self.filters.clone();
+        let limit = self.limit;
+        let worker_control = control.clone();
+        let future = async move {
+            let mut task = tokio::task::spawn_blocking(move || {
+                let schema = table.schema();
+                let request = ExternalPlanRequest {
+                    projection,
+                    filters: filters
+                        .iter()
+                        .map(|filter| external_filter_from_expr(filter, &schema))
+                        .collect(),
+                    raw_filters: filters.iter().collect(),
+                    order_by: Vec::new(),
+                    limit,
+                    offset: None,
+                };
+                table.scan_with_control(&request, &worker_control)
+            });
+            let scan = tokio::select! {
+                result = &mut task => result.map_err(|error| {
+                    DataFusionError::Execution(format!("external table worker failed: {error}"))
+                })??,
+                _ = control.cancelled() => {
+                    if tokio::time::timeout(std::time::Duration::from_millis(100), &mut task)
+                        .await
+                        .is_err()
+                    {
+                        eprintln!("external table worker exceeded cancellation grace");
+                    }
+                    return Err(external_control_error_from_control(query.as_ref(), &control));
+                }
+            };
+            control
+                .checkpoint()
+                .map_err(|error| external_control_error(query.as_ref(), error))?;
+            Ok(futures::stream::iter(scan.batches.into_iter().map(Ok)))
+        };
+        let stream = futures::stream::once(future).try_flatten();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&self.schema),
+            stream,
+        )))
+    }
+}
+
+fn external_control_error(
+    query: Option<&crate::RegisteredSqlQuery>,
+    error: mongreldb_core::MongrelError,
+) -> DataFusionError {
+    if let Some(error) = query.and_then(|query| query.checkpoint().err()) {
+        DataFusionError::External(Box::new(error))
+    } else {
+        DataFusionError::Execution(error.to_string())
+    }
+}
+
+fn external_control_error_from_control(
+    query: Option<&crate::RegisteredSqlQuery>,
+    control: &mongreldb_core::ExecutionControl,
+) -> DataFusionError {
+    external_control_error(
+        query,
+        control
+            .checkpoint()
+            .expect_err("cancelled external control must fail its checkpoint"),
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ExternalPlanCacheKey {
     projection: Option<Vec<usize>>,
@@ -678,10 +835,25 @@ impl TableProvider for ExternalTableProvider {
             limit,
             offset: None,
         };
-        let scan = self.table.scan(&request)?;
-        let partitions = vec![scan.batches];
-        let exec = MemorySourceConfig::try_new_exec(&partitions, scan.schema, None)?;
-        Ok(exec)
+        let _plan = self.plan(&request)?;
+        let output_schema = match projection {
+            Some(projection) => Arc::new(schema.project(projection)?),
+            None => schema,
+        };
+        let props = Arc::new(PlanProperties::new(
+            EquivalenceProperties::new(Arc::clone(&output_schema)),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        ));
+        Ok(Arc::new(ExternalTableExec {
+            props,
+            schema: output_schema,
+            table: Arc::clone(&self.table),
+            projection: projection.cloned(),
+            filters: filters.to_vec(),
+            limit,
+        }))
     }
 }
 
@@ -750,12 +922,17 @@ impl ExternalTable for JsonExternalTable {
         ))
     }
 
-    fn scan(&self, request: &ExternalPlanRequest<'_>) -> DFResult<ExternalScan> {
-        project_scan(
+    fn scan_with_control(
+        &self,
+        request: &ExternalPlanRequest<'_>,
+        control: &mongreldb_core::ExecutionControl,
+    ) -> DFResult<ExternalScan> {
+        project_scan_with_control(
             self.schema.clone(),
             self.batches.clone(),
             request.projection.as_deref(),
             request.limit,
+            Some(control),
         )
     }
 }
@@ -889,13 +1066,19 @@ impl ExternalTable for SchemaTablesExternalTable {
         unsupported_plan(request)
     }
 
-    fn scan(&self, request: &ExternalPlanRequest<'_>) -> DFResult<ExternalScan> {
-        let batches = schema_tables_batches(&self.db, self.schema.clone())?;
-        project_scan(
+    fn scan_with_control(
+        &self,
+        request: &ExternalPlanRequest<'_>,
+        control: &mongreldb_core::ExecutionControl,
+    ) -> DFResult<ExternalScan> {
+        external_checkpoint(Some(control), 0)?;
+        let batches = schema_tables_batches(&self.db, self.schema.clone(), Some(control))?;
+        project_scan_with_control(
             self.schema.clone(),
             batches,
             request.projection.as_deref(),
             request.limit,
+            Some(control),
         )
     }
 }
@@ -966,13 +1149,19 @@ impl ExternalTable for DbStatExternalTable {
         unsupported_plan(request)
     }
 
-    fn scan(&self, request: &ExternalPlanRequest<'_>) -> DFResult<ExternalScan> {
-        let batches = dbstat_batches(&self.db, self.schema.clone())?;
-        project_scan(
+    fn scan_with_control(
+        &self,
+        request: &ExternalPlanRequest<'_>,
+        control: &mongreldb_core::ExecutionControl,
+    ) -> DFResult<ExternalScan> {
+        external_checkpoint(Some(control), 0)?;
+        let batches = dbstat_batches(&self.db, self.schema.clone(), Some(control))?;
+        project_scan_with_control(
             self.schema.clone(),
             batches,
             request.projection.as_deref(),
             request.limit,
+            Some(control),
         )
     }
 }
@@ -1020,7 +1209,11 @@ fn schema_tables_arrow_schema() -> SchemaRef {
     ]))
 }
 
-fn schema_tables_batches(db: &Arc<Database>, schema: SchemaRef) -> DFResult<Vec<RecordBatch>> {
+fn schema_tables_batches(
+    db: &Arc<Database>,
+    schema: SchemaRef,
+    control: Option<&mongreldb_core::ExecutionControl>,
+) -> DFResult<Vec<RecordBatch>> {
     struct Row {
         name: String,
         ty: String,
@@ -1031,11 +1224,13 @@ fn schema_tables_batches(db: &Arc<Database>, schema: SchemaRef) -> DFResult<Vec<
 
     let catalog = db.catalog_snapshot();
     let mut rows = Vec::new();
-    for table in catalog
+    for (index, table) in catalog
         .tables
         .into_iter()
         .filter(|table| matches!(table.state, TableState::Live))
+        .enumerate()
     {
+        external_checkpoint(control, index)?;
         rows.push(Row {
             name: table.name,
             ty: "table".to_string(),
@@ -1044,7 +1239,8 @@ fn schema_tables_batches(db: &Arc<Database>, schema: SchemaRef) -> DFResult<Vec<
             created_epoch: saturating_i64(table.created_epoch),
         });
     }
-    for table in catalog.external_tables {
+    for (index, table) in catalog.external_tables.into_iter().enumerate() {
+        external_checkpoint(control, index)?;
         rows.push(Row {
             name: table.name,
             ty: "external".to_string(),
@@ -1090,7 +1286,11 @@ fn dbstat_arrow_schema() -> SchemaRef {
     ]))
 }
 
-fn dbstat_batches(db: &Arc<Database>, schema: SchemaRef) -> DFResult<Vec<RecordBatch>> {
+fn dbstat_batches(
+    db: &Arc<Database>,
+    schema: SchemaRef,
+    control: Option<&mongreldb_core::ExecutionControl>,
+) -> DFResult<Vec<RecordBatch>> {
     struct Row {
         name: String,
         ty: String,
@@ -1103,11 +1303,13 @@ fn dbstat_batches(db: &Arc<Database>, schema: SchemaRef) -> DFResult<Vec<RecordB
 
     let catalog = db.catalog_snapshot();
     let mut rows = Vec::new();
-    for table in catalog
+    for (index, table) in catalog
         .tables
         .into_iter()
         .filter(|table| matches!(table.state, TableState::Live))
+        .enumerate()
     {
+        external_checkpoint(control, index)?;
         let handle = db
             .table(&table.name)
             .map_err(|e| DataFusionError::Execution(e.to_string()))?;
@@ -1120,10 +1322,11 @@ fn dbstat_batches(db: &Arc<Database>, schema: SchemaRef) -> DFResult<Vec<RecordB
             runs: Some(saturating_i64(table_guard.run_count() as u64)),
             memtable_rows: Some(saturating_i64(table_guard.memtable_len() as u64)),
             columns: saturating_i64(table.schema.columns.len() as u64),
-            storage_bytes: saturating_i64(dir_size(&table_dir)?),
+            storage_bytes: saturating_i64(dir_size(&table_dir, control)?),
         });
     }
-    for table in catalog.external_tables {
+    for (index, table) in catalog.external_tables.into_iter().enumerate() {
+        external_checkpoint(control, index)?;
         let state_dir = db.root().join(VTAB_DIR).join(&table.name);
         rows.push(Row {
             name: table.name,
@@ -1132,7 +1335,7 @@ fn dbstat_batches(db: &Arc<Database>, schema: SchemaRef) -> DFResult<Vec<RecordB
             runs: None,
             memtable_rows: None,
             columns: saturating_i64(table.declared_schema.columns.len() as u64),
-            storage_bytes: saturating_i64(dir_size(&state_dir)?),
+            storage_bytes: saturating_i64(dir_size(&state_dir, control)?),
         });
     }
     rows.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.ty.cmp(&b.ty)));
@@ -1159,7 +1362,8 @@ fn dbstat_batches(db: &Arc<Database>, schema: SchemaRef) -> DFResult<Vec<RecordB
     )?])
 }
 
-fn dir_size(path: &Path) -> DFResult<u64> {
+fn dir_size(path: &Path, control: Option<&mongreldb_core::ExecutionControl>) -> DFResult<u64> {
+    external_checkpoint(control, 0)?;
     if !path.exists() {
         return Ok(0);
     }
@@ -1173,9 +1377,13 @@ fn dir_size(path: &Path) -> DFResult<u64> {
     }
 
     let mut total = 0_u64;
-    for entry in std::fs::read_dir(path).map_err(|e| DataFusionError::Execution(format!("{e}")))? {
+    for (index, entry) in std::fs::read_dir(path)
+        .map_err(|e| DataFusionError::Execution(format!("{e}")))?
+        .enumerate()
+    {
+        external_checkpoint(control, index)?;
         let entry = entry.map_err(|e| DataFusionError::Execution(format!("{e}")))?;
-        total = total.saturating_add(dir_size(&entry.path())?);
+        total = total.saturating_add(dir_size(&entry.path(), control)?);
     }
     Ok(total)
 }
@@ -1197,16 +1405,28 @@ fn unsupported_plan(request: &ExternalPlanRequest<'_>) -> DFResult<ExternalPlan>
     ))
 }
 
+#[cfg(test)]
 fn project_scan(
     full_schema: SchemaRef,
     batches: Vec<RecordBatch>,
     projection: Option<&[usize]>,
     limit: Option<usize>,
 ) -> DFResult<ExternalScan> {
+    project_scan_with_control(full_schema, batches, projection, limit, None)
+}
+
+fn project_scan_with_control(
+    full_schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+    projection: Option<&[usize]>,
+    limit: Option<usize>,
+    control: Option<&mongreldb_core::ExecutionControl>,
+) -> DFResult<ExternalScan> {
+    external_checkpoint(control, 0)?;
     let Some(projection) = projection else {
         return Ok(ExternalScan {
             schema: full_schema,
-            batches: limit_batches(batches, limit),
+            batches: limit_batches(batches, limit, control)?,
         });
     };
     let schema = Arc::new(ArrowSchema::new(
@@ -1217,12 +1437,14 @@ fn project_scan(
     ));
     let projected = batches
         .into_iter()
-        .map(|batch| {
+        .enumerate()
+        .map(|(index, batch)| {
+            external_checkpoint(control, index)?;
             let columns = projection
                 .iter()
                 .map(|idx| batch.column(*idx).clone())
                 .collect::<Vec<_>>();
-            if columns.is_empty() {
+            let batch = if columns.is_empty() {
                 RecordBatch::try_new_with_options(
                     schema.clone(),
                     columns,
@@ -1230,21 +1452,27 @@ fn project_scan(
                 )
             } else {
                 RecordBatch::try_new(schema.clone(), columns)
-            }
+            };
+            batch.map_err(DataFusionError::from)
         })
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+        .collect::<DFResult<Vec<_>>>()?;
     Ok(ExternalScan {
         schema,
-        batches: limit_batches(projected, limit),
+        batches: limit_batches(projected, limit, control)?,
     })
 }
 
-fn limit_batches(batches: Vec<RecordBatch>, limit: Option<usize>) -> Vec<RecordBatch> {
+fn limit_batches(
+    batches: Vec<RecordBatch>,
+    limit: Option<usize>,
+    control: Option<&mongreldb_core::ExecutionControl>,
+) -> DFResult<Vec<RecordBatch>> {
     let Some(mut remaining) = limit else {
-        return batches;
+        return Ok(batches);
     };
     let mut limited = Vec::new();
-    for batch in batches {
+    for (index, batch) in batches.into_iter().enumerate() {
+        external_checkpoint(control, index)?;
         if remaining == 0 {
             break;
         }
@@ -1252,7 +1480,21 @@ fn limit_batches(batches: Vec<RecordBatch>, limit: Option<usize>) -> Vec<RecordB
         limited.push(batch.slice(0, take));
         remaining -= take;
     }
-    limited
+    Ok(limited)
+}
+
+#[inline]
+fn external_checkpoint(
+    control: Option<&mongreldb_core::ExecutionControl>,
+    index: usize,
+) -> DFResult<()> {
+    if index % 256 == 0 {
+        control
+            .map(mongreldb_core::ExecutionControl::checkpoint)
+            .transpose()
+            .map_err(|error| DataFusionError::Execution(error.to_string()))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1400,12 +1642,17 @@ impl ExternalTable for KvStoreExternalTable {
         unsupported_plan(request)
     }
 
-    fn scan(&self, request: &ExternalPlanRequest<'_>) -> DFResult<ExternalScan> {
-        project_scan(
+    fn scan_with_control(
+        &self,
+        request: &ExternalPlanRequest<'_>,
+        control: &mongreldb_core::ExecutionControl,
+    ) -> DFResult<ExternalScan> {
+        project_scan_with_control(
             self.schema.clone(),
             self.batches.clone(),
             request.projection.as_deref(),
             request.limit,
+            Some(control),
         )
     }
 }
@@ -1708,40 +1955,49 @@ impl ExternalTable for FtsDocsExternalTable {
         ))
     }
 
-    fn scan(&self, request: &ExternalPlanRequest<'_>) -> DFResult<ExternalScan> {
+    fn scan_with_control(
+        &self,
+        request: &ExternalPlanRequest<'_>,
+        control: &mongreldb_core::ExecutionControl,
+    ) -> DFResult<ExternalScan> {
+        external_checkpoint(Some(control), 0)?;
         let query = request
             .raw_filters
             .iter()
             .filter_map(|filter| fts_query_from_expr(filter, &self.options))
             .reduce(FtsQuery::and);
-        let rows = if let Some(query) = query.as_ref() {
-            self.index
-                .candidates(query)
-                .into_iter()
-                .filter_map(|idx| {
-                    let row = self.rows.get(idx)?;
-                    let score = fts_match_score(row, query, &self.options)?;
-                    Some(fts_enrich_row(
-                        row.clone(),
-                        Some(query),
-                        &self.options,
-                        Some(score),
-                    ))
-                })
-                .collect::<Vec<_>>()
+        let mut rows = Vec::new();
+        if let Some(query) = query.as_ref() {
+            for (index, row_index) in self.index.candidates(query).into_iter().enumerate() {
+                external_checkpoint(Some(control), index)?;
+                let Some(row) = self.rows.get(row_index) else {
+                    continue;
+                };
+                let Some(score) = fts_match_score(row, query, &self.options) else {
+                    continue;
+                };
+                rows.push(fts_enrich_row(
+                    row.clone(),
+                    Some(query),
+                    &self.options,
+                    Some(score),
+                ));
+            }
         } else {
-            self.rows
-                .iter()
-                .cloned()
-                .map(|row| fts_enrich_row(row, None, &self.options, None))
-                .collect::<Vec<_>>()
-        };
-        project_scan(
+            rows.reserve(self.rows.len());
+            for (index, row) in self.rows.iter().cloned().enumerate() {
+                external_checkpoint(Some(control), index)?;
+                rows.push(fts_enrich_row(row, None, &self.options, None));
+            }
+        }
+        external_checkpoint(Some(control), 0)?;
+        project_scan_with_control(
             self.schema.clone(),
             core_rows_to_batches(&self.core_schema, rows)
                 .map_err(|e| DataFusionError::Execution(e.to_string()))?,
             request.projection.as_deref(),
             request.limit,
+            Some(control),
         )
     }
 }
@@ -2484,7 +2740,12 @@ impl ExternalTable for RTreeRectsExternalTable {
         ))
     }
 
-    fn scan(&self, request: &ExternalPlanRequest<'_>) -> DFResult<ExternalScan> {
+    fn scan_with_control(
+        &self,
+        request: &ExternalPlanRequest<'_>,
+        control: &mongreldb_core::ExecutionControl,
+    ) -> DFResult<ExternalScan> {
+        external_checkpoint(Some(control), 0)?;
         let mut hidden_bounds = QueryRect::default();
         let mut has_hidden_bounds = false;
         for (column, value) in request
@@ -2503,35 +2764,48 @@ impl ExternalTable for RTreeRectsExternalTable {
         if has_hidden_bounds || query_rects.is_empty() {
             query_rects.push(hidden_bounds);
         }
-        let candidate_rows = query_rects
-            .iter()
-            .map(|bounds| {
-                self.index
-                    .candidates(*bounds)
-                    .into_iter()
-                    .collect::<BTreeSet<_>>()
-            })
-            .reduce(|left, right| left.intersection(&right).copied().collect())
-            .unwrap_or_else(|| self.index.all_rows.iter().copied().collect());
-        let rows = self
-            .rows
-            .iter()
-            .enumerate()
-            .filter(|(idx, row)| {
-                candidate_rows.contains(idx)
-                    && query_rects
-                        .iter()
-                        .all(|bounds| rtree_row_matches(row, *bounds))
-            })
-            .map(|(_, row)| row)
-            .cloned()
-            .collect::<Vec<_>>();
-        project_scan(
+        let mut candidate_rows: Option<BTreeSet<usize>> = None;
+        for bounds in &query_rects {
+            let mut next = BTreeSet::new();
+            for (index, row) in self.index.candidates(*bounds).into_iter().enumerate() {
+                external_checkpoint(Some(control), index)?;
+                next.insert(row);
+            }
+            candidate_rows = Some(match candidate_rows.take() {
+                Some(current) => {
+                    let mut intersection = BTreeSet::new();
+                    for (index, row) in current.into_iter().enumerate() {
+                        external_checkpoint(Some(control), index)?;
+                        if next.contains(&row) {
+                            intersection.insert(row);
+                        }
+                    }
+                    intersection
+                }
+                None => next,
+            });
+        }
+        let candidate_rows =
+            candidate_rows.unwrap_or_else(|| self.index.all_rows.iter().copied().collect());
+        let mut rows = Vec::new();
+        for (index, row) in self.rows.iter().enumerate() {
+            external_checkpoint(Some(control), index)?;
+            if candidate_rows.contains(&index)
+                && query_rects
+                    .iter()
+                    .all(|bounds| rtree_row_matches(row, *bounds))
+            {
+                rows.push(row.clone());
+            }
+        }
+        external_checkpoint(Some(control), 0)?;
+        project_scan_with_control(
             self.schema.clone(),
             core_rows_to_batches(&self.core_schema, rows)
                 .map_err(|e| DataFusionError::Execution(e.to_string()))?,
             request.projection.as_deref(),
             request.limit,
+            Some(control),
         )
     }
 }
@@ -2868,14 +3142,21 @@ impl SeriesExternalTable {
         })
     }
 
-    fn batches(&self, request: &ExternalPlanRequest<'_>) -> DFResult<Vec<RecordBatch>> {
+    fn batches(
+        &self,
+        request: &ExternalPlanRequest<'_>,
+        control: &mongreldb_core::ExecutionControl,
+    ) -> DFResult<Vec<RecordBatch>> {
         let mut values = Vec::new();
         let mut current = self.start;
+        let mut scanned = 0;
         while if self.step > 0 {
             current <= self.stop
         } else {
             current >= self.stop
         } {
+            external_checkpoint(Some(control), scanned)?;
+            scanned += 1;
             if values.len() >= 1_000_000 {
                 return Err(DataFusionError::Plan(
                     "series output is capped at 1,000,000 rows".into(),
@@ -2938,12 +3219,20 @@ impl ExternalTable for SeriesExternalTable {
         ))
     }
 
-    fn scan(&self, request: &ExternalPlanRequest<'_>) -> DFResult<ExternalScan> {
-        project_scan(
+    fn scan_with_control(
+        &self,
+        request: &ExternalPlanRequest<'_>,
+        control: &mongreldb_core::ExecutionControl,
+    ) -> DFResult<ExternalScan> {
+        external_checkpoint(Some(control), 0)?;
+        let batches = self.batches(request, control)?;
+        external_checkpoint(Some(control), 0)?;
+        project_scan_with_control(
             self.schema.clone(),
-            self.batches(request)?,
+            batches,
             request.projection.as_deref(),
             request.limit,
+            Some(control),
         )
     }
 }
