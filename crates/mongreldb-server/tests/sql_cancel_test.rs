@@ -342,17 +342,21 @@ async fn closing_session_cancels_active_query_without_session_lock() {
         .await
         .unwrap();
 
-    let close_task = tokio::spawn(
-        app.clone()
-            .oneshot(request("DELETE", &format!("/sessions/{session_id}"), Value::Null)),
-    );
+    let close_task = tokio::spawn(app.clone().oneshot(request(
+        "DELETE",
+        &format!("/sessions/{session_id}"),
+        Value::Null,
+    )));
     loop {
         let status = app
             .clone()
             .oneshot(request("GET", &format!("/queries/{query_id}"), Value::Null))
             .await
             .unwrap();
-        let phase = json_body(status).await["state"].as_str().unwrap().to_owned();
+        let phase = json_body(status).await["state"]
+            .as_str()
+            .unwrap()
+            .to_owned();
         if phase == "cancelling" {
             break;
         }
@@ -362,7 +366,10 @@ async fn closing_session_cancels_active_query_without_session_lock() {
     assert_eq!(close_task.await.unwrap().unwrap().status(), StatusCode::OK);
     let response = sql_task.await.unwrap().unwrap();
     assert_eq!(response.status().as_u16(), 499);
-    assert_eq!(json_body(response).await["error"]["code"], "QUERY_CANCELLED");
+    assert_eq!(
+        json_body(response).await["error"]["code"],
+        "QUERY_CANCELLED"
+    );
     assert!(sessions.get(&session_id, "anonymous").is_none());
 }
 

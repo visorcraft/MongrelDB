@@ -28,7 +28,8 @@ async fn json_body(response: axum::response::Response) -> Value {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn query_control_is_owner_or_admin_only_and_never_exposes_sql() {
     let directory = tempdir().unwrap();
-    let database = Arc::new(Database::create_with_credentials(directory.path(), "admin", "pw").unwrap());
+    let database =
+        Arc::new(Database::create_with_credentials(directory.path(), "admin", "pw").unwrap());
     database.create_user("alice", "pw").unwrap();
     database.create_user("bob", "pw").unwrap();
     let sessions = Arc::new(SessionStore::new(8, Duration::from_secs(60)));
