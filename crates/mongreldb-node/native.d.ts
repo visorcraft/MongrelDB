@@ -222,6 +222,10 @@ export interface CommitResultJs {
   epoch: bigint
   results: Array<TxnOpResultJs>
 }
+export interface NativeSqlOptions {
+  queryId?: string
+  timeoutMs?: number
+}
 /**
  * Result of an insert: the physical row id plus, when the engine allocated
  * it, the `AUTO_INCREMENT` value written into the row.
@@ -373,6 +377,9 @@ export declare class Database {
    * prepared statements, the result cache) persist across calls.
    */
   sql(sql: string): Promise<Buffer>
+  sqlWithOptions(sql: string, options?: NativeSqlOptions | undefined | null): Promise<Buffer>
+  startSql(sql: string, options?: NativeSqlOptions | undefined | null): NativeSqlQuery
+  cancelSql(queryId: string): boolean
   /** Flush + release. Optional — the `Database` also drops on GC. */
   close(): void
   /**
@@ -459,6 +466,11 @@ export declare class Database {
    * enforcement.
    */
   static createEncryptedWithCredentials(path: string, passphrase: string, adminUsername: string, adminPassword: string): Database
+}
+export declare class NativeSqlQuery {
+  get id(): string
+  cancel(): boolean
+  result(): Promise<Buffer>
 }
 /** A handle to one table inside a [`Database`]. */
 export declare class TableHandle {
@@ -665,6 +677,8 @@ export declare class RemoteDatabase {
   earliestRetainedEpoch(): bigint
   count(table: string): bigint
   sql(sql: string): Buffer
+  sqlWithOptions(sql: string, options?: NativeSqlOptions | undefined | null): Buffer
+  cancelSql(queryId: string): boolean
   commit(table: string): bigint
   createProcedure(spec: ProcedureSpec): string
   dropProcedure(name: string): void
