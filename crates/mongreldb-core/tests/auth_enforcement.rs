@@ -1272,6 +1272,38 @@ fn security_catalog_reload_is_version_gated_and_fails_closed() {
 }
 
 #[test]
+fn failed_security_catalog_persist_does_not_publish_mutation() {
+    let dir = tempdir().unwrap();
+    let db = Database::create_with_credentials(dir.path(), "admin", "admin-pw").unwrap();
+    let before = db.catalog_snapshot();
+    let moved = dir.path().with_extension("temporarily-unavailable");
+
+    std::fs::rename(dir.path(), &moved).unwrap();
+    let result = db.create_role("must_not_publish");
+    std::fs::rename(&moved, dir.path()).unwrap();
+
+    assert!(result.is_err());
+    let after = db.catalog_snapshot();
+    assert_eq!(after.security_version, before.security_version);
+    assert!(after
+        .roles
+        .iter()
+        .all(|role| role.name != "must_not_publish"));
+
+    db.create_role("after_restore").unwrap();
+    drop(db);
+    let reopened = Database::open_with_credentials(dir.path(), "admin", "admin-pw").unwrap();
+    assert!(reopened
+        .roles()
+        .iter()
+        .all(|role| role.name != "must_not_publish"));
+    assert!(reopened
+        .roles()
+        .iter()
+        .any(|role| role.name == "after_restore"));
+}
+
+#[test]
 fn trigger_added_update_column_is_finally_authorized() {
     let dir = tempdir().unwrap();
     let admin = Database::create_with_credentials(dir.path(), "admin", "admin-pw").unwrap();

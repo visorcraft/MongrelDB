@@ -10292,6 +10292,24 @@ mod write_permission_tests {
     }
 
     #[test]
+    fn truncate_validation_checks_admin_once_for_all_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::create_with_credentials(dir.path(), "admin", "admin-password").unwrap();
+        db.create_table("first", test_schema()).unwrap();
+        db.create_table("second", test_schema()).unwrap();
+        let admin = db.resolve_principal("admin").unwrap();
+        let staging = vec![
+            (db.table_id("first").unwrap(), Staged::Truncate),
+            (db.table_id("second").unwrap(), Staged::Truncate),
+        ];
+
+        TABLE_PERMISSION_DECISIONS.with(|decisions| decisions.set(0));
+        db.validate_write_permissions(&staging, Some(&admin))
+            .unwrap();
+        TABLE_PERMISSION_DECISIONS.with(|decisions| assert_eq!(decisions.get(), 1));
+    }
+
+    #[test]
     fn one_table_commit_batches_structural_work() {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::create(dir.path()).unwrap();
