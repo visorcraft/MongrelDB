@@ -328,6 +328,10 @@ curl http://127.0.0.1:8453/queries/00112233445566778899aabbccddeeff
 curl http://127.0.0.1:8453/capabilities
 ```
 
+Status includes safe timing trace fields for queueing, planning, execution,
+and serialization, the cancel-requested and cancel-observed phases, and the
+commit-fence outcome. It never includes raw SQL or parameters.
+
 Query status and cancellation are owner-or-admin operations. Unknown and
 not-owned IDs both return 404. Cancellation after the durable commit fence
 returns 409 with `CANCEL_TOO_LATE`. A client transport timeout or disconnected

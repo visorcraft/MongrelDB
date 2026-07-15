@@ -105,6 +105,42 @@ fn benchmarks(criterion: &mut Criterion) {
             elapsed
         });
     });
+    group.bench_function("cancel_queued_latency", |benchmark| {
+        benchmark.iter_custom(|iterations| {
+            let held = runtime
+                .block_on(session.run_stream("SELECT id FROM items"))
+                .unwrap();
+            let mut elapsed = Duration::ZERO;
+            for _ in 0..iterations {
+                let query_id = QueryId::random().unwrap();
+                let query = session
+                    .register_query(SqlQueryOptions {
+                        query_id: Some(query_id),
+                        timeout: Some(Duration::from_secs(10)),
+                        ..SqlQueryOptions::default()
+                    })
+                    .unwrap();
+                let worker_session = Arc::clone(&session);
+                let worker = runtime
+                    .spawn(async move { worker_session.run_with_query("SELECT 1", query).await });
+                while session
+                    .query_registry()
+                    .status(query_id)
+                    .map_or(true, |status| {
+                        status.phase != mongreldb_query::SqlQueryPhase::Queued
+                    })
+                {
+                    std::thread::yield_now();
+                }
+                let started = Instant::now();
+                assert_eq!(session.cancel_query(query_id), CancelOutcome::Accepted);
+                assert!(runtime.block_on(worker).unwrap().is_err());
+                elapsed += started.elapsed();
+            }
+            drop(held);
+            elapsed
+        });
+    });
     group.finish();
 }
 

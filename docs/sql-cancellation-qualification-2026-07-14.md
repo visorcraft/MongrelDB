@@ -1,8 +1,7 @@
 # SQL Cancellation Qualification, 2026-07-14
 
-This report qualifies the SQL execution-control implementation in the commit
-containing this file. The base before benchmark and documentation changes was
-`40c7c67`.
+The latest benchmark was run from `aa55cbb27c392ed3466c2f1321aaa7d1cd098900`
+with only the queued-latency benchmark itself uncommitted.
 
 ## Environment
 
@@ -26,12 +25,16 @@ cargo bench --manifest-path crates/mongreldb-query/Cargo.toml \
 
 | Measurement | Quick interval |
 |---|---:|
-| Controlled `SELECT 1` | 2.0486 to 2.0570 microseconds |
-| Controlled DataFusion 100k scan and expression aggregate | 25.174 to 26.495 milliseconds |
-| Cancel accepted to scan worker finished | 75.615 to 78.410 microseconds |
+| Controlled `SELECT 1` | 2.1082 to 2.1108 microseconds |
+| Controlled DataFusion 100k scan and expression aggregate | 27.018 to 27.345 milliseconds |
+| Cancel accepted to scan worker finished | 86.625 to 96.768 microseconds |
+| Cancel accepted to queued worker finished | 4.1239 to 4.3059 microseconds |
 
 The scan cancellation interval is below the initial 100 ms native scan p95
-target by over three orders of magnitude. This quick run is a local
+target by over three orders of magnitude. Queued cancellation is below the
+initial 20 ms target by over three orders of magnitude. Criterion reported no
+statistically significant change from the prior quick characterization for
+the first three measurements. This quick run is a local
 characterization, not a statistically complete release artifact. Release CI
 should run Criterion normally and retain `target/criterion` output.
 
@@ -54,6 +57,10 @@ explicit transaction savepoint restore and aborted state
 buffered serialization cancellation
 Arrow stream disconnect cancellation
 session close cancellation
+idle-reaper active-query protection
+prepared planning and execution cancellation
+graceful shutdown cancellation
+commit-fence HTTP outcome and durable status
 owner/admin/cross-user query-control security
 NAPI, C ABI, Rust HTTP client, Kit Rust, TypeScript, Python, and CLI surfaces
 ```

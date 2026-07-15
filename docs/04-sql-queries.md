@@ -73,7 +73,8 @@ Cancellation is cooperative. MongrelDB scans, cursors, residual filters,
 native aggregates, joins, scored search, Arrow conversion, and cooperating
 external modules checkpoint the shared execution control. A non-cooperating
 external module can exceed the configured cancellation grace and is reported
-as stuck.
+as stuck. Shutdown logs only its query ID and phase. The query remains in the
+bounded active registry for administrative inspection until its worker exits.
 
 For autocommit writes, cancellation and the durable commit fence have one
 winner. Cancellation before the fence writes nothing. Once commit owns the
