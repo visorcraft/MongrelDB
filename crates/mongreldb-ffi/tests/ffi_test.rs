@@ -732,3 +732,57 @@ fn ffi_migration_invalid_json() {
         );
     }
 }
+
+#[test]
+fn ffi_sql_query_handle_wait_cancel_and_reuse() {
+    unsafe {
+        let path = make_tempdir();
+        let db = mongreldb_create(cstr(path.to_str().unwrap()));
+        assert!(!db.is_null());
+
+        let query_id = CString::new("00112233445566778899aabbccddeeff").unwrap();
+        let options = mongreldb_sql_options {
+            query_id: query_id.as_ptr(),
+            timeout_ms: 5_000,
+        };
+        let query = mongreldb_sql_query_start(db, cstr("SELECT 1"), &options);
+        assert!(!query.is_null());
+        let mut result = mongreldb_sql_result_t {
+            data: std::ptr::null_mut(),
+            len: 0,
+        };
+        assert_eq!(mongreldb_sql_query_wait(query, &mut result), 0);
+        assert!(result.len > 0);
+        mongreldb_free_sql_result(result.data, result.len);
+        mongreldb_sql_query_free(query);
+
+        let cancel_id = CString::new("ffeeddccbbaa99887766554433221100").unwrap();
+        let cancel_options = mongreldb_sql_options {
+            query_id: cancel_id.as_ptr(),
+            timeout_ms: 30_000,
+        };
+        let query = mongreldb_sql_query_start(
+            db,
+            cstr("SELECT count(*) FROM generate_series(1, 1000000000)"),
+            &cancel_options,
+        );
+        assert!(!query.is_null());
+        assert_eq!(mongreldb_sql_query_cancel(query), 1);
+        let mut cancelled = mongreldb_sql_result_t {
+            data: std::ptr::null_mut(),
+            len: 0,
+        };
+        assert!(mongreldb_sql_query_wait(query, &mut cancelled) < 0);
+        mongreldb_sql_query_free(query);
+
+        let mut data = std::ptr::null_mut();
+        let mut len = 0;
+        assert_eq!(
+            mongreldb_database_sql(db, cstr("SELECT 2"), &mut data, &mut len),
+            0
+        );
+        mongreldb_free_sql_result(data, len);
+        mongreldb_database_free(db);
+        std::fs::remove_dir_all(path).ok();
+    }
+}

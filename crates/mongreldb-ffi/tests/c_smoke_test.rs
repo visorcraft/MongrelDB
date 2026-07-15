@@ -42,10 +42,7 @@ fn c_smoke_test() {
         "-lm",
     ]);
     if sanitize {
-        compiler.args([
-            "-fsanitize=address,undefined",
-            "-fno-omit-frame-pointer",
-        ]);
+        compiler.args(["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]);
     }
     let output = compiler.output().expect("failed to invoke cc");
 

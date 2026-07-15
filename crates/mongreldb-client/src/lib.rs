@@ -128,6 +128,7 @@ impl From<std::io::Error> for ClientError {
 
 pub type ClientResult<T> = std::result::Result<T, ClientError>;
 
+#[derive(Clone)]
 pub struct MongrelClient {
     base_url: String,
     client: reqwest::blocking::Client,
@@ -333,9 +334,56 @@ impl MongrelClient {
 }
 
 /// Async counterpart for Kit and health calls.
+#[derive(Clone)]
 pub struct AsyncMongrelClient {
     base_url: String,
     client: reqwest::Client,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SqlClientOptions {
+    pub query_id: Option<mongreldb_query::QueryId>,
+    pub timeout: Option<std::time::Duration>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteCancelOutcome {
+    Accepted,
+    Cancelling,
+    TooLate,
+    Finished,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RemoteQueryStatus {
+    pub query_id: String,
+    pub state: String,
+    pub operation: String,
+    pub committed: bool,
+    #[serde(default)]
+    pub cancellation_reason: String,
+}
+
+pub struct RemoteSqlQueryHandle {
+    query_id: mongreldb_query::QueryId,
+    client: MongrelClient,
+    result: std::thread::JoinHandle<ClientResult<Vec<RecordBatch>>>,
+}
+
+impl RemoteSqlQueryHandle {
+    pub fn id(&self) -> mongreldb_query::QueryId {
+        self.query_id
+    }
+
+    pub fn cancel(&self) -> ClientResult<RemoteCancelOutcome> {
+        self.client.cancel_sql(self.query_id)
+    }
+
+    pub fn wait(self) -> ClientResult<Vec<RecordBatch>> {
+        self.result
+            .join()
+            .map_err(|_| ClientError::Transport("SQL worker panicked".into()))?
+    }
 }
 
 #[derive(Serialize)]
@@ -343,6 +391,9 @@ struct SqlReq {
     sql: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     format: Option<&'static str>,
+    query_id: mongreldb_query::QueryId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timeout_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -893,17 +944,102 @@ impl MongrelClient {
     // ── SQL read ──
 
     pub fn sql(&self, sql: &str) -> ClientResult<Vec<RecordBatch>> {
-        let resp = self
+        self.sql_with_options(sql, SqlClientOptions::default())
+    }
+
+    pub fn sql_with_options(
+        &self,
+        sql: &str,
+        mut options: SqlClientOptions,
+    ) -> ClientResult<Vec<RecordBatch>> {
+        let query_id = match options.query_id.take() {
+            Some(query_id) => query_id,
+            None => mongreldb_query::QueryId::random()
+                .map_err(|error| ClientError::Transport(error.to_string()))?,
+        };
+        let timeout_ms = options
+            .timeout
+            .map(|timeout| timeout.as_millis().min(u128::from(u64::MAX)) as u64);
+        let response = self
             .client
             .post(self.url("/sql"))
             .json(&SqlReq {
                 sql: sql.to_string(),
                 format: Some("arrow"), // Rust client decodes Arrow IPC directly
+                query_id,
+                timeout_ms,
             })
-            .send()?;
-        let resp = self.check(resp)?;
+            .send();
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                let _ = self.cancel_sql(query_id);
+                return Err(error.into());
+            }
+        };
+        let resp = self.check(response)?;
         let bytes = resp.bytes()?;
         read_arrow_ipc(&bytes)
+    }
+
+    pub fn start_sql(
+        &self,
+        sql: impl Into<String>,
+        mut options: SqlClientOptions,
+    ) -> ClientResult<RemoteSqlQueryHandle> {
+        let query_id = match options.query_id {
+            Some(query_id) => query_id,
+            None => mongreldb_query::QueryId::random()
+                .map_err(|error| ClientError::Transport(error.to_string()))?,
+        };
+        options.query_id = Some(query_id);
+        let client = self.clone();
+        let cancel_client = self.clone();
+        let sql = sql.into();
+        let result = std::thread::Builder::new()
+            .name(format!("mongreldb-sql-{query_id}"))
+            .spawn(move || client.sql_with_options(&sql, options))
+            .map_err(|error| ClientError::Transport(error.to_string()))?;
+        Ok(RemoteSqlQueryHandle {
+            query_id,
+            client: cancel_client,
+            result,
+        })
+    }
+
+    pub fn cancel_sql(
+        &self,
+        query_id: mongreldb_query::QueryId,
+    ) -> ClientResult<RemoteCancelOutcome> {
+        let response = self
+            .client
+            .post(self.url(&format!("/queries/{query_id}/cancel")))
+            .send()?;
+        let status = response.status().as_u16();
+        if status == 409 {
+            return Ok(RemoteCancelOutcome::TooLate);
+        }
+        let response = self.check(response)?;
+        let body: serde_json::Value = response.json()?;
+        match body["state"].as_str() {
+            Some("cancellation_requested") => Ok(RemoteCancelOutcome::Accepted),
+            Some("cancelling") => Ok(RemoteCancelOutcome::Cancelling),
+            Some("finished") => Ok(RemoteCancelOutcome::Finished),
+            state => Err(ClientError::Decode(format!(
+                "unknown SQL cancellation state: {state:?}"
+            ))),
+        }
+    }
+
+    pub fn query_status(
+        &self,
+        query_id: mongreldb_query::QueryId,
+    ) -> ClientResult<RemoteQueryStatus> {
+        let response = self
+            .client
+            .get(self.url(&format!("/queries/{query_id}")))
+            .send()?;
+        self.check(response)?.json().map_err(Into::into)
     }
 
     // ── Atomic txn (legacy, raw) ──
@@ -1278,6 +1414,81 @@ impl AsyncMongrelClient {
     pub async fn health(&self) -> ClientResult<String> {
         let response = self.client.get(self.url("/health")).send().await?;
         Ok(self.check(response).await?.text().await?)
+    }
+
+    pub async fn sql(&self, sql: &str) -> ClientResult<Vec<RecordBatch>> {
+        self.sql_with_options(sql, SqlClientOptions::default())
+            .await
+    }
+
+    pub async fn sql_with_options(
+        &self,
+        sql: &str,
+        mut options: SqlClientOptions,
+    ) -> ClientResult<Vec<RecordBatch>> {
+        let query_id = match options.query_id.take() {
+            Some(query_id) => query_id,
+            None => mongreldb_query::QueryId::random()
+                .map_err(|error| ClientError::Transport(error.to_string()))?,
+        };
+        let timeout_ms = options
+            .timeout
+            .map(|timeout| timeout.as_millis().min(u128::from(u64::MAX)) as u64);
+        let response = self
+            .client
+            .post(self.url("/sql"))
+            .json(&SqlReq {
+                sql: sql.to_string(),
+                format: Some("arrow"),
+                query_id,
+                timeout_ms,
+            })
+            .send()
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                let _ = self.cancel_sql(query_id).await;
+                return Err(error.into());
+            }
+        };
+        let bytes = self.check(response).await?.bytes().await?;
+        read_arrow_ipc(&bytes)
+    }
+
+    pub async fn cancel_sql(
+        &self,
+        query_id: mongreldb_query::QueryId,
+    ) -> ClientResult<RemoteCancelOutcome> {
+        let response = self
+            .client
+            .post(self.url(&format!("/queries/{query_id}/cancel")))
+            .send()
+            .await?;
+        if response.status().as_u16() == 409 {
+            return Ok(RemoteCancelOutcome::TooLate);
+        }
+        let body: serde_json::Value = self.check(response).await?.json().await?;
+        match body["state"].as_str() {
+            Some("cancellation_requested") => Ok(RemoteCancelOutcome::Accepted),
+            Some("cancelling") => Ok(RemoteCancelOutcome::Cancelling),
+            Some("finished") => Ok(RemoteCancelOutcome::Finished),
+            state => Err(ClientError::Decode(format!(
+                "unknown SQL cancellation state: {state:?}"
+            ))),
+        }
+    }
+
+    pub async fn query_status(
+        &self,
+        query_id: mongreldb_query::QueryId,
+    ) -> ClientResult<RemoteQueryStatus> {
+        let response = self
+            .client
+            .get(self.url(&format!("/queries/{query_id}")))
+            .send()
+            .await?;
+        Ok(self.check(response).await?.json().await?)
     }
 
     pub async fn kit_retrieve(

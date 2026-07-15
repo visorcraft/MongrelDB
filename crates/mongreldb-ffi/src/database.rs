@@ -10,7 +10,7 @@ use crate::cstr::{cstr_to_string, string_into_raw};
 use crate::error::{clear, set_error, set_error_msg, ErrorCode};
 use crate::schema::{self, mongreldb_schema_t};
 use mongreldb_core::Database as CoreDatabase;
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_void};
 use std::sync::Arc;
@@ -27,14 +27,14 @@ pub type mongreldb_database_t = *mut c_void;
 /// stays alive for the lifetime of the handle.
 pub struct FFIDatabase {
     pub db: Arc<CoreDatabase>,
-    pub(crate) sql_session: Mutex<Option<mongreldb_query::MongrelSession>>,
+    pub(crate) sql_session: RwLock<Option<Arc<mongreldb_query::MongrelSession>>>,
 }
 
 impl FFIDatabase {
     pub fn new(db: CoreDatabase) -> Self {
         Self {
             db: Arc::new(db),
-            sql_session: Mutex::new(None),
+            sql_session: RwLock::new(None),
         }
     }
 
@@ -43,7 +43,7 @@ impl FFIDatabase {
     pub fn from_arc(db: Arc<CoreDatabase>) -> Self {
         Self {
             db,
-            sql_session: Mutex::new(None),
+            sql_session: RwLock::new(None),
         }
     }
 

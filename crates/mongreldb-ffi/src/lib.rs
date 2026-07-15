@@ -77,7 +77,12 @@ pub use database::{
 };
 
 // SQL execution (DataFusion via MongrelSession; returns Arrow IPC file bytes).
-pub use sql::{mongreldb_database_sql, mongreldb_database_sql_refresh, mongreldb_free_sql_result};
+pub use sql::{
+    mongreldb_database_sql, mongreldb_database_sql_refresh, mongreldb_free_sql_result,
+    mongreldb_sql_options, mongreldb_sql_query_cancel, mongreldb_sql_query_free,
+    mongreldb_sql_query_start, mongreldb_sql_query_t, mongreldb_sql_query_wait,
+    mongreldb_sql_result_t,
+};
 
 // Migration planning and checksums (JSON in/out, language-neutral).
 pub use migrate::{

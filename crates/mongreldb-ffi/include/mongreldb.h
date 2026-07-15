@@ -35,6 +35,7 @@ extern "C" {
 /* ── Opaque handle types ────────────────────────────────────────────────── */
 
 typedef struct mongreldb_database       mongreldb_database_t;
+typedef struct mongreldb_sql_query      mongreldb_sql_query_t;
 typedef struct mongreldb_table          mongreldb_table_t;
 typedef struct mongreldb_transaction    mongreldb_transaction_t;
 typedef struct mongreldb_schema_builder mongreldb_schema_builder_t;
@@ -356,6 +357,31 @@ int32_t mongreldb_rename_table(
 int32_t mongreldb_database_sql(
     mongreldb_database_t *db, const char *sql,
     uint8_t **out_buf, size_t *out_len);
+
+typedef struct mongreldb_sql_options {
+    const char *query_id;
+    uint64_t timeout_ms;
+} mongreldb_sql_options;
+
+typedef struct mongreldb_sql_result_t {
+    uint8_t *data;
+    size_t len;
+} mongreldb_sql_result_t;
+
+mongreldb_sql_query_t *mongreldb_sql_query_start(
+    mongreldb_database_t *db,
+    const char *sql,
+    const mongreldb_sql_options *options);
+
+/* Returns 1 when cancellation is accepted/already active, 0 when durable
+ * commit or completion already won, and a negative error code on bad input. */
+int32_t mongreldb_sql_query_cancel(mongreldb_sql_query_t *query);
+
+int32_t mongreldb_sql_query_wait(
+    mongreldb_sql_query_t *query,
+    mongreldb_sql_result_t *out_result);
+
+void mongreldb_sql_query_free(mongreldb_sql_query_t *query);
 
 /* Rebuild the cached SQL session so it sees the current table set after a
  * schema change made outside SQL (e.g. via mongreldb_create_table). Returns

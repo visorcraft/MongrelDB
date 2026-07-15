@@ -76,15 +76,21 @@ pub unsafe extern "C" fn mongreldb_plan_migrations_json(
     let applied_str = match std::ffi::CStr::from_ptr(applied_json).to_str() {
         Ok(s) => s,
         Err(_) => {
-            return set_error_msg(ErrorCode::InvalidArgument, "applied_json is not valid UTF-8")
-                .as_return();
+            return set_error_msg(
+                ErrorCode::InvalidArgument,
+                "applied_json is not valid UTF-8",
+            )
+            .as_return();
         }
     };
     let desired_str = match std::ffi::CStr::from_ptr(desired_json).to_str() {
         Ok(s) => s,
         Err(_) => {
-            return set_error_msg(ErrorCode::InvalidArgument, "desired_json is not valid UTF-8")
-                .as_return();
+            return set_error_msg(
+                ErrorCode::InvalidArgument,
+                "desired_json is not valid UTF-8",
+            )
+            .as_return();
         }
     };
 
@@ -113,8 +119,11 @@ pub unsafe extern "C" fn mongreldb_plan_migrations_json(
     let json = match serde_json::to_string(&pending) {
         Ok(s) => s,
         Err(e) => {
-            return set_error_msg(ErrorCode::Unknown, format!("failed to serialize result: {e}"))
-                .as_return();
+            return set_error_msg(
+                ErrorCode::Unknown,
+                format!("failed to serialize result: {e}"),
+            )
+            .as_return();
         }
     };
 
@@ -147,21 +156,22 @@ pub unsafe extern "C" fn mongreldb_migration_checksum_json(
 ) -> i32 {
     clear();
     if name.is_null() || ops_json.is_null() {
-        return set_error_msg(ErrorCode::InvalidArgument, "name and ops_json must not be null")
-            .as_return();
-    }
-    if out_checksum.is_null() {
         return set_error_msg(
             ErrorCode::InvalidArgument,
-            "out_checksum must not be null",
+            "name and ops_json must not be null",
         )
         .as_return();
+    }
+    if out_checksum.is_null() {
+        return set_error_msg(ErrorCode::InvalidArgument, "out_checksum must not be null")
+            .as_return();
     }
 
     let name_str = match std::ffi::CStr::from_ptr(name).to_str() {
         Ok(s) => s.to_owned(),
         Err(_) => {
-            return set_error_msg(ErrorCode::InvalidArgument, "name is not valid UTF-8").as_return();
+            return set_error_msg(ErrorCode::InvalidArgument, "name is not valid UTF-8")
+                .as_return();
         }
     };
     let ops_str = match std::ffi::CStr::from_ptr(ops_json).to_str() {

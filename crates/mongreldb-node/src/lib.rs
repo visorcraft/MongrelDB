@@ -38,6 +38,31 @@ fn to_napi(e: mongreldb_core::MongrelError) -> napi::Error {
     napi::Error::new(napi::Status::GenericFailure, msg)
 }
 
+fn query_to_napi(error: mongreldb_query::MongrelQueryError) -> napi::Error {
+    let message = match &error {
+        mongreldb_query::MongrelQueryError::QueryCancelled {
+            query_id, reason, ..
+        } => {
+            format!("__QUERY_CANCELLED__:{query_id}:{reason:?}")
+        }
+        mongreldb_query::MongrelQueryError::DeadlineExceeded {
+            query_id,
+            timeout_ms,
+            ..
+        } => {
+            format!("__DEADLINE_EXCEEDED__:{query_id}:{timeout_ms:?}")
+        }
+        mongreldb_query::MongrelQueryError::QueryIdConflict { query_id } => {
+            format!("__QUERY_ID_CONFLICT__:{query_id}")
+        }
+        mongreldb_query::MongrelQueryError::TransactionAborted => {
+            "__TRANSACTION_ABORTED__:transaction is aborted".into()
+        }
+        _ => error.to_string(),
+    };
+    napi::Error::new(napi::Status::GenericFailure, message)
+}
+
 /// Map a transaction-commit result to JS, preserving conflict categories.
 fn commit_result_to_napi(
     result: mongreldb_core::Result<mongreldb_core::Epoch>,
@@ -956,7 +981,114 @@ pub struct Database {
     /// them), so the addon holds one session for the database's lifetime
     /// rather than opening one per `sql()` call — mirroring how the daemon
     /// and long-lived apps use MongrelDB.
-    session: parking_lot::Mutex<Option<mongreldb_query::MongrelSession>>,
+    session: std::sync::OnceLock<Arc<mongreldb_query::MongrelSession>>,
+}
+
+#[napi(object)]
+pub struct NativeSqlOptions {
+    pub query_id: Option<String>,
+    pub timeout_ms: Option<u32>,
+}
+
+#[napi]
+pub struct NativeSqlQuery {
+    id: mongreldb_query::QueryId,
+    session: Arc<mongreldb_query::MongrelSession>,
+    sql: String,
+    registration: parking_lot::Mutex<Option<mongreldb_query::RegisteredQueryGuard>>,
+}
+
+impl Drop for NativeSqlQuery {
+    fn drop(&mut self) {
+        if self.registration.get_mut().is_some() {
+            let _ = self.id;
+            let _ = self.session.cancel_query(self.id);
+        }
+    }
+}
+
+impl Database {
+    fn sql_session(&self) -> napi::Result<Arc<mongreldb_query::MongrelSession>> {
+        if let Some(session) = self.session.get() {
+            return Ok(Arc::clone(session));
+        }
+        let session = Arc::new(
+            mongreldb_query::MongrelSession::open(Arc::clone(&self.inner))
+                .map_err(query_to_napi)?,
+        );
+        let _ = self.session.set(Arc::clone(&session));
+        Ok(self.session.get().cloned().unwrap_or(session))
+    }
+
+    fn register_sql(
+        &self,
+        sql: String,
+        options: Option<NativeSqlOptions>,
+    ) -> napi::Result<NativeSqlQuery> {
+        let session = self.sql_session()?;
+        let options = options.unwrap_or(NativeSqlOptions {
+            query_id: None,
+            timeout_ms: None,
+        });
+        let query_id = options
+            .query_id
+            .map(|query_id| query_id.parse().map_err(query_to_napi))
+            .transpose()?;
+        if options.timeout_ms == Some(0) {
+            return Err(napi::Error::new(
+                napi::Status::InvalidArg,
+                "timeoutMs must be positive",
+            ));
+        }
+        let query = session
+            .register_query(mongreldb_query::SqlQueryOptions {
+                query_id,
+                timeout: options
+                    .timeout_ms
+                    .map(|timeout| std::time::Duration::from_millis(u64::from(timeout))),
+                ..mongreldb_query::SqlQueryOptions::default()
+            })
+            .map_err(query_to_napi)?;
+        let id = query.id();
+        Ok(NativeSqlQuery {
+            id,
+            session,
+            sql,
+            registration: parking_lot::Mutex::new(Some(
+                mongreldb_query::RegisteredQueryGuard::new(query),
+            )),
+        })
+    }
+}
+
+#[napi]
+impl NativeSqlQuery {
+    #[napi(getter)]
+    pub fn id(&self) -> String {
+        self.id.to_string()
+    }
+
+    #[napi]
+    pub fn cancel(&self) -> bool {
+        matches!(
+            self.session.cancel_query(self.id),
+            mongreldb_query::CancelOutcome::Accepted
+                | mongreldb_query::CancelOutcome::AlreadyCancelling
+        )
+    }
+
+    #[napi]
+    pub async fn result(&self) -> napi::Result<Buffer> {
+        let registration = self.registration.lock().take().ok_or_else(|| {
+            napi::Error::new(napi::Status::GenericFailure, "SQL result already consumed")
+        })?;
+        let batches = self
+            .session
+            .run_with_query(&self.sql, registration.into_query())
+            .await
+            .map_err(query_to_napi)?;
+        native_cols_to_ipc_from_batches(&batches)
+    }
 }
 
 /// A handle to one table inside a [`Database`].
@@ -1182,7 +1314,7 @@ impl Database {
         Ok(Database {
             inner: Arc::new(db),
             path,
-            session: parking_lot::Mutex::new(None),
+            session: std::sync::OnceLock::new(),
         })
     }
 
@@ -1193,7 +1325,7 @@ impl Database {
         Ok(Database {
             inner: Arc::new(db),
             path,
-            session: parking_lot::Mutex::new(None),
+            session: std::sync::OnceLock::new(),
         })
     }
 
@@ -1213,7 +1345,7 @@ impl Database {
         Ok(Database {
             inner: Arc::new(db),
             path,
-            session: parking_lot::Mutex::new(None),
+            session: std::sync::OnceLock::new(),
         })
     }
 
@@ -1230,7 +1362,7 @@ impl Database {
         Ok(Database {
             inner: Arc::new(db),
             path,
-            session: parking_lot::Mutex::new(None),
+            session: std::sync::OnceLock::new(),
         })
     }
 
@@ -1622,20 +1754,35 @@ impl Database {
     /// prepared statements, the result cache) persist across calls.
     #[napi]
     pub async fn sql(&self, sql: String) -> napi::Result<Buffer> {
-        // Take the cached session out of the mutex (or build one on first use)
-        // so no lock is held across the async `run`.
-        let session = match self.session.lock().take() {
-            Some(s) => s,
-            None => mongreldb_query::MongrelSession::open(Arc::clone(&self.inner))
-                .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e:?}")))?,
-        };
-        let batches = session
-            .run(&sql)
-            .await
-            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e:?}")))?;
-        // Preserve the session (and any views/state created during the call).
-        *self.session.lock() = Some(session);
-        native_cols_to_ipc_from_batches(&batches)
+        self.sql_with_options(sql, None).await
+    }
+
+    #[napi]
+    pub async fn sql_with_options(
+        &self,
+        sql: String,
+        options: Option<NativeSqlOptions>,
+    ) -> napi::Result<Buffer> {
+        self.register_sql(sql, options)?.result().await
+    }
+
+    #[napi]
+    pub fn start_sql(
+        &self,
+        sql: String,
+        options: Option<NativeSqlOptions>,
+    ) -> napi::Result<NativeSqlQuery> {
+        self.register_sql(sql, options)
+    }
+
+    #[napi]
+    pub fn cancel_sql(&self, query_id: String) -> napi::Result<bool> {
+        let query_id = query_id.parse().map_err(query_to_napi)?;
+        Ok(matches!(
+            self.sql_session()?.cancel_query(query_id),
+            mongreldb_query::CancelOutcome::Accepted
+                | mongreldb_query::CancelOutcome::AlreadyCancelling
+        ))
     }
 
     /// Flush + release. Optional — the `Database` also drops on GC.
@@ -1943,7 +2090,7 @@ impl Database {
         Ok(Database {
             inner: Arc::new(db),
             path,
-            session: parking_lot::Mutex::new(None),
+            session: std::sync::OnceLock::new(),
         })
     }
 
@@ -1954,7 +2101,7 @@ impl Database {
         Ok(Database {
             inner: Arc::new(db),
             path,
-            session: parking_lot::Mutex::new(None),
+            session: std::sync::OnceLock::new(),
         })
     }
 
@@ -1973,7 +2120,7 @@ impl Database {
         Ok(Database {
             inner: Arc::new(db),
             path,
-            session: parking_lot::Mutex::new(None),
+            session: std::sync::OnceLock::new(),
         })
     }
 
@@ -1997,7 +2144,7 @@ impl Database {
         Ok(Database {
             inner: Arc::new(db),
             path,
-            session: parking_lot::Mutex::new(None),
+            session: std::sync::OnceLock::new(),
         })
     }
 }
@@ -3489,16 +3636,65 @@ impl RemoteDatabase {
 
     #[napi]
     pub fn sql(&self, sql: String) -> napi::Result<Buffer> {
+        self.sql_with_options(sql, None)
+    }
+
+    #[napi]
+    pub fn sql_with_options(
+        &self,
+        sql: String,
+        options: Option<NativeSqlOptions>,
+    ) -> napi::Result<Buffer> {
+        let options = options.unwrap_or(NativeSqlOptions {
+            query_id: None,
+            timeout_ms: None,
+        });
+        if options.timeout_ms == Some(0) {
+            return Err(napi::Error::new(
+                napi::Status::InvalidArg,
+                "timeoutMs must be positive",
+            ));
+        }
+        let query_id = match options.query_id {
+            Some(query_id) => query_id
+                .parse::<mongreldb_query::QueryId>()
+                .map_err(query_to_napi)?,
+            None => mongreldb_query::QueryId::random().map_err(query_to_napi)?,
+        };
         let resp = self
             .agent
             .post(&format!("{}/sql", self.url))
-            .send_json(serde_json::json!({ "sql": sql, "format": "arrow" }))
+            .send_json(serde_json::json!({
+                "sql": sql,
+                "format": "arrow",
+                "query_id": query_id.to_string(),
+                "timeout_ms": options.timeout_ms,
+            }))
             .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
         let mut bytes = Vec::new();
         resp.into_reader()
             .read_to_end(&mut bytes)
             .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
         Ok(Buffer::from(bytes))
+    }
+
+    #[napi]
+    pub fn cancel_sql(&self, query_id: String) -> napi::Result<bool> {
+        let query_id = query_id
+            .parse::<mongreldb_query::QueryId>()
+            .map_err(query_to_napi)?;
+        match self
+            .agent
+            .post(&format!("{}/queries/{query_id}/cancel", self.url))
+            .call()
+        {
+            Ok(response) => Ok(matches!(response.status(), 200 | 202)),
+            Err(ureq::Error::Status(409, _)) => Ok(false),
+            Err(error) => Err(napi::Error::new(
+                napi::Status::GenericFailure,
+                error.to_string(),
+            )),
+        }
     }
 
     #[napi]

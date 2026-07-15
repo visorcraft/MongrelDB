@@ -336,10 +336,7 @@ fn bytemuck_cast_f32(v: &[f32]) -> Vec<u8> {
 /// # Safety
 /// The caller guarantees that any pointer in `cv.payload` is valid for its
 /// length, and that the discriminant/payload pairing is consistent.
-pub unsafe fn c_to_value(
-    cv: &CValue,
-    ty: &TypeId,
-) -> Result<Value, crate::error::ErrorCode> {
+pub unsafe fn c_to_value(cv: &CValue, ty: &TypeId) -> Result<Value, crate::error::ErrorCode> {
     use crate::error::{set_error_msg, ErrorCode};
     use CValueTag::*;
     let tag = match cv.tag {
