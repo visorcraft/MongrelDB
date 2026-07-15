@@ -36,6 +36,56 @@ let batches = session.run("SELECT * FROM users WHERE score > 90").await?;
 `batches` is a `Vec<RecordBatch>` - Arrow's in-memory columnar format. Each
 batch holds up to 65,536 rows.
 
+### Query IDs, deadlines, and cancellation
+
+Controlled execution registers the query before it waits for SQL admission or
+the session execution permit. The deadline therefore includes queueing,
+planning, execution, collection, and managed serialization.
+
+```rust
+use mongreldb_query::{QueryId, SqlQueryOptions};
+use std::time::Duration;
+
+let query_id = QueryId::random()?;
+let session_for_query = session.clone();
+let task = tokio::spawn(async move {
+    session_for_query.run_with_options(
+        "SELECT sum(cost * cost) FROM orders",
+        SqlQueryOptions {
+            query_id: Some(query_id),
+            timeout: Some(Duration::from_secs(30)),
+            ..SqlQueryOptions::default()
+        },
+    ).await
+});
+
+session.cancel_query(query_id);
+let result = task.await?;
+```
+
+`run_stream_with_options` keeps registration alive until the stream ends.
+Dropping an unfinished stream cancels it with `ClientDisconnected`.
+`run_with_query_for_serialization` is for bindings and servers that serialize
+after collection. Its completion guard must remain alive through output
+generation.
+
+Cancellation is cooperative. MongrelDB scans, cursors, residual filters,
+native aggregates, joins, scored search, Arrow conversion, and cooperating
+external modules checkpoint the shared execution control. A non-cooperating
+external module can exceed the configured cancellation grace and is reported
+as stuck.
+
+For autocommit writes, cancellation and the durable commit fence have one
+winner. Cancellation before the fence writes nothing. Once commit owns the
+fence, cancellation returns `TooLate` and the real committed outcome is
+preserved. A failed or cancelled statement inside an explicit transaction
+restores its statement savepoint and aborts the transaction. Only `ROLLBACK`
+is then accepted.
+
+In a multi-statement request without an explicit transaction, earlier
+autocommit statements remain committed. Cancellation errors report the number
+of completed statements and the cancelled statement index.
+
 ### Multi-statement execution
 
 Multiple SQL statements separated by semicolons can be executed in a single

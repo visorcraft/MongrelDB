@@ -1,4 +1,4 @@
-use crate::{MongrelQueryError, Result};
+use crate::{MongrelQueryError, Result, SqlTestHook};
 use mongreldb_core::{CancellationReason, ExecutionControl};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
@@ -502,18 +502,22 @@ pub struct RegisteredSqlQuery {
 
 /// Query-specific state attached to a fresh DataFusion `TaskContext` for each
 /// execution. Reusable logical and physical plans never own this value.
-#[derive(Debug)]
 pub(crate) struct SqlTaskContext {
     query: RegisteredSqlQuery,
+    test_hook: Option<SqlTestHook>,
 }
 
 impl SqlTaskContext {
-    pub(crate) fn new(query: RegisteredSqlQuery) -> Self {
-        Self { query }
+    pub(crate) fn new(query: RegisteredSqlQuery, test_hook: Option<SqlTestHook>) -> Self {
+        Self { query, test_hook }
     }
 
     pub(crate) fn query(&self) -> &RegisteredSqlQuery {
         &self.query
+    }
+
+    pub(crate) fn test_hook(&self) -> Option<&SqlTestHook> {
+        self.test_hook.as_ref()
     }
 }
 

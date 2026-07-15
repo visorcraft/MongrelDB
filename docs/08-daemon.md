@@ -303,9 +303,54 @@ curl -X DELETE http://127.0.0.1:8453/tables/events
 ```sh
 curl -X POST http://127.0.0.1:8453/sql \
   -H "Content-Type: application/json" \
-  -d '{"sql": "SELECT count(*) FROM events WHERE amount > 500"}'
-# → Arrow IPC bytes (binary)
+  -d '{
+    "sql": "SELECT count(*) FROM events WHERE amount > 500",
+    "format": "arrow",
+    "query_id": "00112233445566778899aabbccddeeff",
+    "timeout_ms": 30000
+  }'
+# Response includes X-MongrelDB-Query-ID.
 ```
+
+Clients should generate the 32-hex-character query ID before sending a
+buffered request. Body `query_id` and `timeout_ms` values take precedence over
+`X-MongrelDB-Query-ID` and `X-MongrelDB-Timeout-Ms` headers.
+
+```sh
+# Request cancellation from another connection.
+curl -X POST \
+  http://127.0.0.1:8453/queries/00112233445566778899aabbccddeeff/cancel
+
+# Inspect safe status metadata. Raw SQL is never returned.
+curl http://127.0.0.1:8453/queries/00112233445566778899aabbccddeeff
+
+# Negotiate support instead of guessing from a version string.
+curl http://127.0.0.1:8453/capabilities
+```
+
+Query status and cancellation are owner-or-admin operations. Unknown and
+not-owned IDs both return 404. Cancellation after the durable commit fence
+returns 409 with `CANCEL_TOO_LATE`. A client transport timeout or disconnected
+socket does not by itself prove that a buffered server query stopped. Official
+clients send a separate best-effort cancellation request.
+
+SQL execution limits use these environment variables:
+
+```text
+MONGRELDB_SQL_DEFAULT_TIMEOUT_MS
+MONGRELDB_SQL_MAX_TIMEOUT_MS
+MONGRELDB_SQL_MAX_CONCURRENT
+MONGRELDB_SQL_MAX_ACTIVE_QUERIES
+MONGRELDB_SQL_FINISHED_QUERY_TTL_SECS
+MONGRELDB_SQL_CANCEL_GRACE_MS
+MONGRELDB_SQL_MAX_OUTPUT_BYTES
+MONGRELDB_SQL_MAX_OUTPUT_ROWS
+```
+
+The query deadline starts before the SQL semaphore. Closing a session cancels
+its queued and active queries. Graceful server shutdown rejects new SQL,
+cancels queued and running work, lets commit-critical writes finish, and
+records tasks that exceed cancellation grace.
 
 ### Typed Kit API
 

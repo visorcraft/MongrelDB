@@ -29,3 +29,8 @@ sha2 = "0.10"
 bincode = "1"
 tempfile = "3"
 rusqlite = { version = "0.32", features = ["bundled"] }
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "sql_cancellation"
+harness = false

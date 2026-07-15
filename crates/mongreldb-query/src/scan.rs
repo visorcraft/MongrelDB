@@ -296,10 +296,11 @@ impl ExecutionPlan for MongrelScanExec {
                 "MongrelScanExec is single-partition; invalid partition {partition}"
             )));
         }
-        let query = ctx
-            .session_config()
-            .get_extension::<SqlTaskContext>()
-            .map(|context| context.query().clone());
+        let sql_context = ctx.session_config().get_extension::<SqlTaskContext>();
+        let query = sql_context.as_ref().map(|context| context.query().clone());
+        let test_hook = sql_context
+            .as_ref()
+            .and_then(|context| context.test_hook().cloned());
         checkpoint(query.as_ref())?;
         match &self.source {
             Source::Rows {
@@ -319,14 +320,18 @@ impl ExecutionPlan for MongrelScanExec {
                 let num_chunks = total.div_ceil(PAGE_BATCH_ROWS);
                 let batch_schema = schema.clone();
                 let query = query.clone();
+                let test_hook = test_hook.clone();
                 // Lazily build one batch per chunk: the iterator is only
                 // advanced as DataFusion polls, so a LIMIT satisfied early
                 // never pays the Arrow-conversion cost of later chunks.
                 let chunk_iter = (0..num_chunks).map(move |i| {
+                    if let Some(hook) = &test_hook {
+                        hook(crate::SqlTestHookPoint::BeforeScanBatch);
+                    }
                     checkpoint(query.as_ref())?;
                     let start = i * PAGE_BATCH_ROWS;
                     let end = (start + PAGE_BATCH_ROWS).min(total);
-                    if columns.is_empty() {
+                    let batch = if columns.is_empty() {
                         build_row_count_batch(&batch_schema, end - start)
                     } else {
                         build_chunk_batch(
@@ -337,7 +342,13 @@ impl ExecutionPlan for MongrelScanExec {
                             end,
                             query.as_ref(),
                         )
+                    };
+                    if batch.is_ok() {
+                        if let Some(hook) = &test_hook {
+                            hook(crate::SqlTestHookPoint::AfterScanBatch);
+                        }
                     }
+                    batch
                 });
                 Ok(Box::pin(RecordBatchStreamAdapter::new(
                     schema,
@@ -359,6 +370,7 @@ impl ExecutionPlan for MongrelScanExec {
                     schema: self.schema.clone(),
                     residual: self.residual.clone(),
                     query,
+                    test_hook,
                 };
                 Ok(Box::pin(RecordBatchStreamAdapter::new(
                     self.schema.clone(),
@@ -368,7 +380,15 @@ impl ExecutionPlan for MongrelScanExec {
             Source::Batch(batch) => {
                 let schema = self.schema.clone();
                 let batch = batch.clone();
+                if let Some(hook) = &test_hook {
+                    hook(crate::SqlTestHookPoint::BeforeScanBatch);
+                }
                 let item = checkpoint(query.as_ref()).map(|()| batch);
+                if item.is_ok() {
+                    if let Some(hook) = &test_hook {
+                        hook(crate::SqlTestHookPoint::AfterScanBatch);
+                    }
+                }
                 Ok(Box::pin(RecordBatchStreamAdapter::new(
                     schema,
                     stream::iter(std::iter::once(item)),
@@ -467,12 +487,16 @@ struct CursorBatches {
     schema: SchemaRef,
     residual: Option<Arc<ResidualFilter>>,
     query: Option<RegisteredSqlQuery>,
+    test_hook: Option<crate::SqlTestHook>,
 }
 
 impl Iterator for CursorBatches {
     type Item = datafusion::common::Result<RecordBatch>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if let Some(hook) = &self.test_hook {
+            hook(crate::SqlTestHookPoint::BeforeScanBatch);
+        }
         if let Err(error) = checkpoint(self.query.as_ref()) {
             self.cursor = None;
             return Some(Err(error));
@@ -495,12 +519,14 @@ impl Iterator for CursorBatches {
                     self.cursor = None;
                     return Some(Err(error));
                 }
-                Some(build_cursor_batch(
-                    cols,
-                    &self.types,
-                    &self.schema,
-                    self.query.as_ref(),
-                ))
+                let batch =
+                    build_cursor_batch(cols, &self.types, &self.schema, self.query.as_ref());
+                if batch.is_ok() {
+                    if let Some(hook) = &self.test_hook {
+                        hook(crate::SqlTestHookPoint::AfterScanBatch);
+                    }
+                }
+                Some(batch)
             }
             Ok(None) => {
                 self.cursor = None;
@@ -588,7 +614,7 @@ mod execution_control_tests {
         let config = context
             .session_config()
             .clone()
-            .with_extension(Arc::new(SqlTaskContext::new(query)));
+            .with_extension(Arc::new(SqlTaskContext::new(query, None)));
         Arc::new(context.with_session_config(config))
     }
 

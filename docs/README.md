@@ -44,6 +44,8 @@ vector similarity, range queries, and more.
     `require_auth` storage-layer enforcement: credentialed open/create
     constructors, the full enforcement matrix, composition with encryption,
     and offline recovery
+16. **[SQL Cancellation Qualification](sql-cancellation-qualification-2026-07-14.md)** -
+    query-control correctness coverage and cancellation latency characterization
 
 ## Quick Reference
 

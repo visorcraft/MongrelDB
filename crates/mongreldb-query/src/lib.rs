@@ -2692,7 +2692,10 @@ impl MongrelSession {
         let session_config = task_context
             .session_config()
             .clone()
-            .with_extension(Arc::new(SqlTaskContext::new(query.clone())));
+            .with_extension(Arc::new(SqlTaskContext::new(
+                query.clone(),
+                self.sql_test_hook(),
+            )));
         let task_context = Arc::new(task_context.with_session_config(session_config));
         let physical_plan = tokio::select! {
             biased;
