@@ -33,18 +33,17 @@ pub(crate) fn work_units(items: usize, quantum: usize) -> usize {
 /// AI queries. Index loops call `checkpoint` and charge work with `consume`.
 #[derive(Debug, Clone)]
 pub struct AiExecutionContext {
-    deadline: Option<std::time::Instant>,
+    control: crate::ExecutionControl,
     query_time_nanos: i64,
     initial_work: usize,
     max_fused_candidates: usize,
     remaining_work: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AiExecutionContext {
     pub fn new(deadline: Option<std::time::Instant>, work_budget: usize) -> Self {
         Self {
-            deadline,
+            control: crate::ExecutionControl::new(deadline),
             query_time_nanos: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|duration| duration.as_nanos().min(i64::MAX as u128) as i64)
@@ -52,7 +51,6 @@ impl AiExecutionContext {
             initial_work: work_budget,
             max_fused_candidates: MAX_FUSED_CANDIDATES,
             remaining_work: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(work_budget)),
-            cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -70,22 +68,30 @@ impl AiExecutionContext {
         context
     }
 
+    pub fn with_control(
+        control: crate::ExecutionControl,
+        work_budget: usize,
+        max_fused_candidates: usize,
+    ) -> Self {
+        Self {
+            control,
+            query_time_nanos: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos().min(i64::MAX as u128) as i64)
+                .unwrap_or(0),
+            initial_work: work_budget,
+            max_fused_candidates: max_fused_candidates.min(MAX_FUSED_CANDIDATES),
+            remaining_work: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(work_budget)),
+        }
+    }
+
     pub fn cancel(&self) {
-        self.cancelled
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.control
+            .cancel(crate::CancellationReason::ClientRequest);
     }
 
     pub fn checkpoint(&self) -> crate::Result<()> {
-        if self.cancelled.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(crate::MongrelError::Cancelled);
-        }
-        if self
-            .deadline
-            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
-        {
-            return Err(crate::MongrelError::DeadlineExceeded);
-        }
-        Ok(())
+        self.control.checkpoint()
     }
 
     pub fn consume(&self, work: usize) -> crate::Result<()> {
@@ -113,8 +119,11 @@ impl AiExecutionContext {
     }
 
     pub fn remaining_duration(&self) -> Option<std::time::Duration> {
-        self.deadline
-            .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()))
+        self.control.remaining_duration()
+    }
+
+    pub fn execution_control(&self) -> &crate::ExecutionControl {
+        &self.control
     }
 
     pub fn query_time_nanos(&self) -> i64 {
@@ -1088,6 +1097,18 @@ mod tests {
         assert!(matches!(
             expired.checkpoint(),
             Err(crate::MongrelError::DeadlineExceeded)
+        ));
+
+        let parent = crate::ExecutionControl::new(None);
+        let child = AiExecutionContext::with_control(
+            parent.child_with_deadline(None),
+            10,
+            MAX_FUSED_CANDIDATES,
+        );
+        parent.cancel(crate::CancellationReason::SessionClosed);
+        assert!(matches!(
+            child.checkpoint(),
+            Err(crate::MongrelError::Cancelled)
         ));
     }
 

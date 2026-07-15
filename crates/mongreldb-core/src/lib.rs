@@ -23,6 +23,7 @@ pub mod encryption;
 pub mod engine;
 pub mod epoch;
 pub mod error;
+pub mod execution;
 pub mod external_table;
 pub mod gc;
 pub mod global_idx;
@@ -77,6 +78,7 @@ pub use engine::{
 };
 pub use epoch::{Epoch, EpochAuthority, EpochClock, Snapshot};
 pub use error::{MongrelError, Result};
+pub use execution::{CancellationReason, ExecutionControl};
 pub use external_table::{
     ExternalTableDefinition, ExternalTableEntry, ModuleArg, ModuleCapabilities,
 };

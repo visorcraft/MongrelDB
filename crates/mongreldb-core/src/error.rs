@@ -56,11 +56,11 @@ pub enum MongrelError {
         required: crate::auth::Permission,
         principal: String,
     },
-    #[error("AI query deadline exceeded")]
+    #[error("execution deadline exceeded")]
     DeadlineExceeded,
     #[error("AI query work budget exceeded")]
     WorkBudgetExceeded,
-    #[error("AI query cancelled")]
+    #[error("execution cancelled")]
     Cancelled,
     #[error("cursor stale: {0}")]
     CursorStale(String),
