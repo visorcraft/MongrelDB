@@ -245,6 +245,7 @@ fn read_urandom(n: usize) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use mongreldb_core::Database;
+    use mongreldb_query::{RegisteredQueryGuard, SqlQueryOptions};
     use tempfile::tempdir;
 
     fn make_session() -> MongrelSession {
@@ -298,6 +299,29 @@ mod tests {
         let evicted = store.sweep_idle();
         assert_eq!(evicted, 1);
         assert!(store.get(&token, "alice").is_none());
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn sweep_idle_keeps_active_queries() {
+        let store = SessionStore::new(8, Duration::from_millis(1));
+        let token = store.create(make_session(), "alice".into()).unwrap();
+        let entry = store.get(&token, "alice").unwrap();
+        let query = entry
+            .session
+            .register_query(SqlQueryOptions {
+                session_id: Some(token.clone()),
+                ..SqlQueryOptions::default()
+            })
+            .unwrap();
+        let query = RegisteredQueryGuard::new(query);
+        std::thread::sleep(Duration::from_millis(20));
+
+        assert_eq!(store.sweep_idle(), 0);
+        assert!(store.get(&token, "alice").is_some());
+
+        drop(query);
+        assert_eq!(store.sweep_idle(), 1);
         assert!(store.is_empty());
     }
 }
