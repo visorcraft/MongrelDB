@@ -146,10 +146,8 @@ async fn kit_set_similarity_sends_every_golden_member_shape() {
         .expect(6)
         .mount(&server)
         .await;
-    let fixtures: Vec<serde_json::Value> = serde_json::from_str(include_str!(
-        "../../../docs/ai/minhash-v1-golden.json"
-    ))
-    .unwrap();
+    let fixtures: Vec<serde_json::Value> =
+        serde_json::from_str(include_str!("../../../docs/ai/minhash-v1-golden.json")).unwrap();
     let uri = server.uri();
     tokio::task::spawn_blocking(move || {
         let client = MongrelClient::new(&uri);

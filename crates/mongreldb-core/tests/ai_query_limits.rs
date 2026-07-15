@@ -549,6 +549,42 @@ fn fused_union_ceiling_projection_charging_and_zero_weight_are_enforced() {
 }
 
 #[test]
+fn ann_adaptive_overfetch_stops_at_context_cap_and_reports_exhaustion() {
+    let (_dir, mut table) = table();
+    for id in 2..=20 {
+        table
+            .put(vec![
+                (1, Value::Int64(id)),
+                (2, Value::Embedding(vec![-1.0; 8])),
+                (
+                    3,
+                    Value::Bytes(bincode::serialize(&vec![(id as u32, 1.0f32)]).unwrap()),
+                ),
+                (4, Value::Bytes(serde_json::to_vec(&vec![id]).unwrap())),
+            ])
+            .unwrap();
+    }
+    table.commit().unwrap();
+    let mut request = search(vec![named("ann".into(), ann(5))], 5);
+    request.must = vec![Condition::Pk(Value::Int64(1).encode_key())];
+    let context =
+        AiExecutionContext::with_limits(std::time::Duration::from_secs(30), usize::MAX, 4);
+    let snapshot = table.snapshot();
+    let (hits, trace) = mongreldb_core::trace::QueryTrace::capture(|| {
+        table.search_at_with_candidate_authorization_and_context(
+            &request,
+            snapshot,
+            None,
+            Some(&context),
+        )
+    });
+    let hits = hits.unwrap();
+    assert_eq!(hits.len(), 1);
+    assert!(trace.ann_candidate_cap_hit);
+    assert!(context.consumed_work() < usize::MAX);
+}
+
+#[test]
 fn authorized_lock_wait_observes_deadline() {
     let dir = tempfile::tempdir().unwrap();
     let database = Database::create(dir.path()).unwrap();

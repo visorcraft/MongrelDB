@@ -480,14 +480,8 @@ async fn kit_query_cursor_pins_snapshot_and_request() {
         "cursor": cursor,
     });
     let (status, second) = post(app.clone(), "/kit/query", second).await;
-    assert_eq!(status, 200, "body: {second}");
-    assert_eq!(second["rows"].as_array().unwrap().len(), 1);
-    assert!(second["rows"][0]["cells"]
-        .as_array()
-        .unwrap()
-        .contains(&serde_json::json!(3)));
-    assert!(!second.to_string().contains("d@x"));
-    assert_eq!(second["next_cursor"], serde_json::Value::Null);
+    assert_eq!(status, 409, "body: {second}");
+    assert_eq!(second["error"]["code"], "CURSOR_STALE");
 
     let mismatched = serde_json::json!({
         "table": "users",

@@ -62,6 +62,10 @@ pub enum MongrelError {
     WorkBudgetExceeded,
     #[error("AI query cancelled")]
     Cancelled,
+    #[error("cursor stale: {0}")]
+    CursorStale(String),
+    #[error("cursor expired")]
+    CursorExpired,
     #[error("{0}")]
     Other(String),
 }

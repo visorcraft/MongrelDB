@@ -485,6 +485,7 @@ fn with_scored_read<T>(
             let authorization = mongreldb_core::ReadAuthorization {
                 operation: mongreldb_core::ColumnOperation::Select,
                 columns: required_columns.to_vec(),
+                permissions: Vec::new(),
             };
             database
                 .with_authorized_scored_read_context_at(

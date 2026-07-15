@@ -20,6 +20,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use hmac::{Hmac, Mac};
 use mongreldb_core::constraint::TableConstraints;
 use mongreldb_core::query::{
     AnnRerankRequest, Condition, Fusion, NamedRetriever, Query, Retriever, RetrieverScore,
@@ -32,6 +33,7 @@ use mongreldb_core::txn::{UpsertAction, UpsertActionKind};
 use mongreldb_core::{MongrelError, RowId, Value};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Jval};
+use sha2::{Digest, Sha256};
 
 use crate::json_to_value;
 use crate::{request_principal, validate_table_name, AppState, OptionalPrincipal};
@@ -139,11 +141,13 @@ where
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn retry_authorized_context<T, F>(
     state: &AppState,
     table: &str,
     principal: Option<&mongreldb_core::Principal>,
     required_columns: &[u16],
+    required_permissions: &[mongreldb_core::Permission],
     context: &mongreldb_core::query::AiExecutionContext,
     snapshot_override: Option<mongreldb_core::Snapshot>,
     read: F,
@@ -156,15 +160,48 @@ where
         Option<&mongreldb_core::Principal>,
     ) -> Result<T, MongrelError>,
 {
+    retry_authorized_context_stamped(
+        state,
+        table,
+        principal,
+        required_columns,
+        required_permissions,
+        context,
+        snapshot_override,
+        read,
+    )
+    .map(|(result, _)| result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn retry_authorized_context_stamped<T, F>(
+    state: &AppState,
+    table: &str,
+    principal: Option<&mongreldb_core::Principal>,
+    required_columns: &[u16],
+    required_permissions: &[mongreldb_core::Permission],
+    context: &mongreldb_core::query::AiExecutionContext,
+    snapshot_override: Option<mongreldb_core::Snapshot>,
+    read: F,
+) -> Result<(T, mongreldb_core::AuthorizedReadStamp), MongrelError>
+where
+    F: FnMut(
+        &mongreldb_core::Table,
+        mongreldb_core::Snapshot,
+        Option<&mongreldb_core::security::CandidateAuthorization<'_>>,
+        Option<&mongreldb_core::Principal>,
+    ) -> Result<T, MongrelError>,
+{
     let catalog_bound = principal
         .is_some_and(|principal| state.db.resolve_principal(&principal.username).is_some());
-    state.db.with_authorized_scored_read_context_at(
+    state.db.with_authorized_scored_read_context_at_stamped(
         table,
         principal,
         catalog_bound,
         Some(&mongreldb_core::ReadAuthorization {
             operation: mongreldb_core::ColumnOperation::Select,
             columns: required_columns.to_vec(),
+            permissions: required_permissions.to_vec(),
         }),
         Some(context),
         snapshot_override,
@@ -425,6 +462,8 @@ pub fn error_code(e: &MongrelError) -> &'static str {
             }
         }
         MongrelError::NotFound(_) => "NOT_FOUND",
+        MongrelError::CursorStale(_) => "CURSOR_STALE",
+        MongrelError::CursorExpired => "CURSOR_EXPIRED",
         _ => "INTERNAL",
     }
 }
@@ -938,6 +977,8 @@ fn kit_core_error(error: &MongrelError) -> Response {
         MongrelError::PermissionDenied { .. } => (StatusCode::FORBIDDEN, "PERMISSION_DENIED"),
         MongrelError::NotFound(_) => (StatusCode::NOT_FOUND, "NOT_FOUND"),
         MongrelError::Conflict(_) => (StatusCode::CONFLICT, "CONFLICT"),
+        MongrelError::CursorStale(_) => (StatusCode::CONFLICT, "CURSOR_STALE"),
+        MongrelError::CursorExpired => (StatusCode::GONE, "CURSOR_EXPIRED"),
         MongrelError::DeadlineExceeded => (StatusCode::GATEWAY_TIMEOUT, "DEADLINE_EXCEEDED"),
         MongrelError::WorkBudgetExceeded => (StatusCode::TOO_MANY_REQUESTS, "WORK_BUDGET_EXCEEDED"),
         MongrelError::Cancelled => (
@@ -1022,7 +1063,7 @@ pub struct KitQueryRequest {
     /// Number of matching rows to skip before applying `limit`.
     #[serde(default)]
     pub offset: usize,
-    /// Snapshot-pinned continuation token returned by a previous page.
+    /// Signed, generation-bound continuation token returned by a previous page.
     #[serde(default)]
     pub cursor: Option<String>,
 }
@@ -1106,58 +1147,236 @@ pub struct KitRow {
     pub cells: Vec<Jval>,
 }
 
+const CURSOR_TTL_NANOS: i64 = 5 * 60 * 1_000_000_000;
+const CURSOR_CLOCK_SKEW_NANOS: i64 = 5 * 1_000_000_000;
+
+#[derive(Debug, Clone, Copy)]
+struct KitCursorBinding {
+    returned_count: u64,
+    table_id: u64,
+    schema_id: u64,
+    data_generation: u64,
+    security_version: u64,
+    query_time_nanos: i64,
+    issued_at_nanos: i64,
+    expires_at_nanos: i64,
+    principal_hash: [u8; 32],
+    request_hash: [u8; 32],
+}
+
 #[derive(Debug, Clone, Copy)]
 struct KitQueryCursor {
     epoch: u64,
     row_id: u64,
-    fingerprint: u64,
+    binding: KitCursorBinding,
 }
 
-fn kit_query_fingerprint(table: &str, query: &Query, projection: &[u16]) -> u64 {
-    let query_key =
-        mongreldb_core::query::canonical_query_key(&query.conditions, Some(projection), 0);
-    let query_key = query_key.to_le_bytes();
-    table
-        .as_bytes()
-        .iter()
-        .chain(query_key.iter())
-        .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
-            (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3)
-        })
+fn cursor_now_nanos() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
 }
 
-fn parse_kit_query_cursor(value: &str) -> std::result::Result<KitQueryCursor, String> {
-    let mut parts = value.split(':');
-    if parts.next() != Some("v1") {
-        return Err("invalid query cursor".into());
+fn cursor_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(char::from(HEX[(byte >> 4) as usize]));
+        out.push(char::from(HEX[(byte & 0x0f) as usize]));
     }
-    let epoch = parts
-        .next()
-        .and_then(|part| part.parse().ok())
-        .ok_or_else(|| "invalid query cursor".to_string())?;
-    let row_id = parts
-        .next()
-        .and_then(|part| part.parse().ok())
-        .ok_or_else(|| "invalid query cursor".to_string())?;
-    let fingerprint = parts
-        .next()
-        .and_then(|part| u64::from_str_radix(part, 16).ok())
-        .ok_or_else(|| "invalid query cursor".to_string())?;
-    if parts.next().is_some() {
-        return Err("invalid query cursor".into());
+    out
+}
+
+fn cursor_unhex<const N: usize>(value: &str) -> Option<[u8; N]> {
+    if value.len() != N * 2 {
+        return None;
+    }
+    let mut out = [0u8; N];
+    for (index, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+fn cursor_principal_hash(principal: Option<&mongreldb_core::Principal>) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    match principal {
+        Some(principal) => {
+            hash.update([1]);
+            hash.update((principal.username.len() as u64).to_le_bytes());
+            hash.update(principal.username.as_bytes());
+        }
+        None => hash.update([0]),
+    }
+    hash.finalize().into()
+}
+
+fn cursor_sign(key: &[u8; 32], payload: &str) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts 32-byte keys");
+    mac.update(payload.as_bytes());
+    cursor_hex(&mac.finalize().into_bytes())
+}
+
+fn cursor_verified_payload<'a>(
+    value: &'a str,
+    key: &[u8; 32],
+    kind: &str,
+) -> Result<&'a str, MongrelError> {
+    let invalid = || MongrelError::InvalidArgument(format!("invalid {kind} cursor"));
+    let (payload, tag) = value.rsplit_once(':').ok_or_else(&invalid)?;
+    let tag = cursor_unhex::<32>(tag).ok_or_else(&invalid)?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts 32-byte keys");
+    mac.update(payload.as_bytes());
+    mac.verify_slice(&tag).map_err(|_| invalid())?;
+    Ok(payload)
+}
+
+fn cursor_binding_fields(binding: KitCursorBinding) -> String {
+    format!(
+        "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        binding.returned_count,
+        binding.table_id,
+        binding.schema_id,
+        binding.data_generation,
+        binding.security_version,
+        binding.query_time_nanos,
+        binding.issued_at_nanos,
+        binding.expires_at_nanos,
+        cursor_hex(&binding.principal_hash),
+        cursor_hex(&binding.request_hash),
+    )
+}
+
+fn parse_cursor_binding(
+    parts: &[&str],
+    start: usize,
+    kind: &str,
+) -> Result<KitCursorBinding, MongrelError> {
+    let invalid = || MongrelError::InvalidArgument(format!("invalid {kind} cursor"));
+    if parts.len() != start + 10 {
+        return Err(invalid());
+    }
+    let binding = KitCursorBinding {
+        returned_count: parts[start].parse().map_err(|_| invalid())?,
+        table_id: parts[start + 1].parse().map_err(|_| invalid())?,
+        schema_id: parts[start + 2].parse().map_err(|_| invalid())?,
+        data_generation: parts[start + 3].parse().map_err(|_| invalid())?,
+        security_version: parts[start + 4].parse().map_err(|_| invalid())?,
+        query_time_nanos: parts[start + 5].parse().map_err(|_| invalid())?,
+        issued_at_nanos: parts[start + 6].parse().map_err(|_| invalid())?,
+        expires_at_nanos: parts[start + 7].parse().map_err(|_| invalid())?,
+        principal_hash: cursor_unhex(parts[start + 8]).ok_or_else(&invalid)?,
+        request_hash: cursor_unhex(parts[start + 9]).ok_or_else(&invalid)?,
+    };
+    let lifetime = binding
+        .expires_at_nanos
+        .checked_sub(binding.issued_at_nanos)
+        .ok_or_else(&invalid)?;
+    let now = cursor_now_nanos();
+    if lifetime <= 0
+        || lifetime > CURSOR_TTL_NANOS
+        || binding.issued_at_nanos > now.saturating_add(CURSOR_CLOCK_SKEW_NANOS)
+    {
+        return Err(invalid());
+    }
+    if now > binding.expires_at_nanos {
+        return Err(MongrelError::CursorExpired);
+    }
+    Ok(binding)
+}
+
+fn new_cursor_binding(
+    stamp: mongreldb_core::AuthorizedReadStamp,
+    principal: Option<&mongreldb_core::Principal>,
+    request_hash: [u8; 32],
+    query_time_nanos: i64,
+    returned_count: u64,
+) -> KitCursorBinding {
+    let issued_at_nanos = cursor_now_nanos();
+    KitCursorBinding {
+        returned_count,
+        table_id: stamp.table_id,
+        schema_id: stamp.schema_id,
+        data_generation: stamp.data_generation,
+        security_version: stamp.security_version,
+        query_time_nanos,
+        issued_at_nanos,
+        expires_at_nanos: issued_at_nanos.saturating_add(CURSOR_TTL_NANOS),
+        principal_hash: cursor_principal_hash(principal),
+        request_hash,
+    }
+}
+
+fn validate_cursor_identity(
+    binding: KitCursorBinding,
+    principal: Option<&mongreldb_core::Principal>,
+    request_hash: [u8; 32],
+) -> Result<(), MongrelError> {
+    if binding.request_hash != request_hash {
+        return Err(MongrelError::InvalidArgument(
+            "cursor does not match request".into(),
+        ));
+    }
+    if binding.principal_hash != cursor_principal_hash(principal) {
+        return Err(MongrelError::CursorStale("cursor principal changed".into()));
+    }
+    Ok(())
+}
+
+fn validate_cursor_stamp(
+    binding: KitCursorBinding,
+    epoch: u64,
+    stamp: mongreldb_core::AuthorizedReadStamp,
+) -> Result<(), MongrelError> {
+    if binding.table_id != stamp.table_id
+        || binding.schema_id != stamp.schema_id
+        || binding.data_generation != stamp.data_generation
+        || binding.security_version != stamp.security_version
+        || epoch != stamp.snapshot.epoch.0
+    {
+        return Err(MongrelError::CursorStale(
+            "table, schema, index, or security generation changed".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_kit_query_cursor(value: &str, key: &[u8; 32]) -> Result<KitQueryCursor, MongrelError> {
+    if !value.starts_with("q2:") {
+        return Err(MongrelError::CursorStale(
+            "unsupported query cursor version".into(),
+        ));
+    }
+    let payload = cursor_verified_payload(value, key, "query")?;
+    let parts: Vec<_> = payload.split(':').collect();
+    let invalid = || MongrelError::InvalidArgument("invalid query cursor".into());
+    if parts.first() != Some(&"q2") {
+        return Err(invalid());
     }
     Ok(KitQueryCursor {
-        epoch,
-        row_id,
-        fingerprint,
+        epoch: parts
+            .get(1)
+            .ok_or_else(&invalid)?
+            .parse()
+            .map_err(|_| invalid())?,
+        row_id: parts
+            .get(2)
+            .ok_or_else(&invalid)?
+            .parse()
+            .map_err(|_| invalid())?,
+        binding: parse_cursor_binding(&parts, 3, "query")?,
     })
 }
 
-fn format_kit_query_cursor(cursor: KitQueryCursor) -> String {
-    format!(
-        "v1:{}:{}:{:016x}",
-        cursor.epoch, cursor.row_id, cursor.fingerprint
-    )
+fn format_kit_query_cursor(cursor: KitQueryCursor, key: &[u8; 32]) -> String {
+    let payload = format!(
+        "q2:{}:{}:{}",
+        cursor.epoch,
+        cursor.row_id,
+        cursor_binding_fields(cursor.binding)
+    );
+    format!("{payload}:{}", cursor_sign(key, &payload))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1344,6 +1563,7 @@ pub async fn kit_retrieve(
             &table_name,
             principal.as_ref(),
             &[column_id],
+            &[],
             context,
             None,
             |table, snapshot, authorization, _| {
@@ -1403,6 +1623,7 @@ pub async fn kit_ann_rerank(
             &table_name,
             principal.as_ref(),
             &[request.column_id],
+            &[],
             context,
             None,
             |table, snapshot, authorization, _| {
@@ -1456,44 +1677,33 @@ struct KitSearchCursor {
     epoch: u64,
     final_score: f64,
     row_id: u64,
-    fingerprint: u64,
+    binding: KitCursorBinding,
 }
 
-fn kit_search_fingerprint(table: &str, request: &SearchRequest) -> u64 {
-    let mut request = request.clone();
-    request.limit = 0;
-    format!("{table}:{request:?}")
-        .bytes()
-        .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
-            (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3)
-        })
-}
-
-fn parse_kit_search_cursor(value: &str) -> Result<KitSearchCursor, MongrelError> {
+fn parse_kit_search_cursor(value: &str, key: &[u8; 32]) -> Result<KitSearchCursor, MongrelError> {
+    if !value.starts_with("s2:") {
+        return Err(MongrelError::CursorStale(
+            "unsupported search cursor version".into(),
+        ));
+    }
+    let payload = cursor_verified_payload(value, key, "search")?;
     let invalid = || MongrelError::InvalidArgument("invalid search cursor".into());
-    let mut parts = value.split(':');
-    if parts.next() != Some("s1") {
+    let parts: Vec<_> = payload.split(':').collect();
+    if parts.first() != Some(&"s2") {
         return Err(invalid());
     }
     let epoch = parts
-        .next()
-        .and_then(|part| part.parse().ok())
-        .ok_or_else(&invalid)?;
-    let score_bits = parts
-        .next()
-        .and_then(|part| u64::from_str_radix(part, 16).ok())
-        .ok_or_else(&invalid)?;
+        .get(1)
+        .ok_or_else(&invalid)?
+        .parse()
+        .map_err(|_| invalid())?;
+    let score_bits =
+        u64::from_str_radix(parts.get(2).ok_or_else(&invalid)?, 16).map_err(|_| invalid())?;
     let row_id = parts
-        .next()
-        .and_then(|part| part.parse().ok())
-        .ok_or_else(&invalid)?;
-    let fingerprint = parts
-        .next()
-        .and_then(|part| u64::from_str_radix(part, 16).ok())
-        .ok_or_else(&invalid)?;
-    if parts.next().is_some() {
-        return Err(invalid());
-    }
+        .get(3)
+        .ok_or_else(&invalid)?
+        .parse()
+        .map_err(|_| invalid())?;
     let final_score = f64::from_bits(score_bits);
     if !final_score.is_finite() {
         return Err(invalid());
@@ -1502,18 +1712,19 @@ fn parse_kit_search_cursor(value: &str) -> Result<KitSearchCursor, MongrelError>
         epoch,
         final_score,
         row_id,
-        fingerprint,
+        binding: parse_cursor_binding(&parts, 4, "search")?,
     })
 }
 
-fn format_kit_search_cursor(cursor: KitSearchCursor) -> String {
-    format!(
-        "s1:{}:{:016x}:{}:{:016x}",
+fn format_kit_search_cursor(cursor: KitSearchCursor, key: &[u8; 32]) -> String {
+    let payload = format!(
+        "s2:{}:{:016x}:{}:{}",
         cursor.epoch,
         cursor.final_score.to_bits(),
         cursor.row_id,
-        cursor.fingerprint
-    )
+        cursor_binding_fields(cursor.binding)
+    );
+    format!("{payload}:{}", cursor_sign(key, &payload))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1681,39 +1892,52 @@ fn execute_kit_search(
         limit: req.limit,
         projection: req.projection.clone(),
     };
-    let fingerprint = kit_search_fingerprint(&req.table, &request);
+    let request_hash = mongreldb_core::query::canonical_search_cursor_hash(&req.table, &request);
     let cursor = req
         .cursor
         .as_deref()
-        .map(parse_kit_search_cursor)
+        .map(|value| parse_kit_search_cursor(value, &state.cursor_mac_key))
         .transpose()?;
-    if cursor.is_some_and(|cursor| cursor.fingerprint != fingerprint) {
-        return Err(MongrelError::InvalidArgument(
-            "search cursor does not match request".into(),
-        ));
+    if let Some(cursor) = cursor {
+        validate_cursor_identity(cursor.binding, principal, request_hash)?;
     }
     let epoch = cursor
         .map(|cursor| cursor.epoch)
         .unwrap_or_else(|| state.db.visible_epoch().0);
-    let search_after = cursor.map(|cursor| mongreldb_core::query::SearchAfter {
-        final_score: cursor.final_score,
-        row_id: RowId(cursor.row_id),
-    });
-    let snapshot = mongreldb_core::Snapshot::at(mongreldb_core::Epoch(epoch));
+    let (snapshot, _snapshot_guard) = state.db.snapshot_at_owned(mongreldb_core::Epoch(epoch))?;
+    let search_after = cursor
+        .map(|cursor| {
+            Ok::<_, MongrelError>(mongreldb_core::query::SearchAfter {
+                final_score: cursor.final_score,
+                row_id: RowId(cursor.row_id),
+                returned_count: usize::try_from(cursor.binding.returned_count)
+                    .map_err(|_| MongrelError::InvalidArgument("invalid search cursor".into()))?,
+            })
+        })
+        .transpose()?;
+    let read_context = cursor.map_or_else(
+        || context.clone(),
+        |cursor| context.with_query_time_nanos(cursor.binding.query_time_nanos),
+    );
     let (result, trace) = mongreldb_core::trace::QueryTrace::capture(|| {
-        retry_authorized_context(
+        retry_authorized_context_stamped(
             state,
             &req.table,
             principal,
             &required,
-            context,
+            if req.explain {
+                &[mongreldb_core::Permission::Admin]
+            } else {
+                &[]
+            },
+            &read_context,
             Some(snapshot),
             |table, snapshot, authorization, effective_principal| {
                 let mut hits = table.search_at_with_candidate_authorization_on_generation_after(
                     &request,
                     snapshot,
                     authorization,
-                    Some(context),
+                    Some(&read_context),
                     search_after,
                 )?;
                 state
@@ -1723,16 +1947,37 @@ fn execute_kit_search(
             },
         )
     });
-    let hits = result?;
-    context.checkpoint()?;
+    let (hits, stamp) = result?;
+    if let Some(cursor) = cursor {
+        validate_cursor_stamp(cursor.binding, epoch, stamp)?;
+    }
+    read_context.checkpoint()?;
+    let hit_count = u64::try_from(hits.len())
+        .map_err(|_| MongrelError::InvalidArgument("search result count overflow".into()))?;
     let next_cursor = if hits.len() == req.limit {
         hits.last().map(|hit| {
-            format_kit_search_cursor(KitSearchCursor {
-                epoch,
-                final_score: hit.final_score,
-                row_id: hit.row_id.0,
-                fingerprint,
-            })
+            let binding = match cursor {
+                Some(cursor) => KitCursorBinding {
+                    returned_count: cursor.binding.returned_count.saturating_add(hit_count),
+                    ..cursor.binding
+                },
+                None => new_cursor_binding(
+                    stamp,
+                    principal,
+                    request_hash,
+                    read_context.query_time_nanos(),
+                    hit_count,
+                ),
+            };
+            format_kit_search_cursor(
+                KitSearchCursor {
+                    epoch,
+                    final_score: hit.final_score,
+                    row_id: hit.row_id.0,
+                    binding,
+                },
+                &state.cursor_mac_key,
+            )
         })
     } else {
         None
@@ -1763,6 +2008,7 @@ fn execute_kit_search(
             "authorization_retries": trace.authorization_retries,
             "hard_filter_nanos": trace.hard_filter_nanos,
             "ann_candidate_nanos": trace.ann_candidate_nanos,
+            "ann_candidate_cap_hit": trace.ann_candidate_cap_hit,
             "sparse_candidate_nanos": trace.sparse_candidate_nanos,
             "minhash_candidate_nanos": trace.minhash_candidate_nanos,
             "candidate_count": trace.candidate_count,
@@ -1858,6 +2104,7 @@ pub async fn kit_set_similarity(
             &table_name,
             principal.as_ref(),
             &[request.column_id],
+            &[],
             context,
             None,
             |table, snapshot, authorization, _| {
@@ -1973,22 +2220,15 @@ pub async fn kit_query(
     }
 
     // Translate JSON conditions → engine Conditions.
-    let mut q = Query::new();
-    for c in &req.conditions {
-        match parse_condition(c, &schema) {
-            Ok(cond) => q = q.and(cond),
-            Err(msg) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(KitErrorEnvelope {
-                        status: "aborted".into(),
-                        error: KitError::new("BAD_REQUEST", msg),
-                    }),
-                )
-                    .into_response();
-            }
-        }
-    }
+    let conditions = match req
+        .conditions
+        .iter()
+        .map(|condition| parse_condition(condition, &schema))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(conditions) => conditions,
+        Err(message) => return kit_bad_request(message),
+    };
     let limit = req.limit.unwrap_or(mongreldb_core::query::MAX_FINAL_LIMIT);
     if limit == 0 || limit > mongreldb_core::query::MAX_FINAL_LIMIT {
         return kit_bad_request(format!(
@@ -1996,13 +2236,27 @@ pub async fn kit_query(
             mongreldb_core::query::MAX_FINAL_LIMIT
         ));
     }
-    let fingerprint = kit_query_fingerprint(&req.table, &q, &projection_ids);
-    let cursor = match req.cursor.as_deref().map(parse_kit_query_cursor) {
-        Some(Ok(cursor)) if cursor.fingerprint == fingerprint => Some(cursor),
-        Some(Ok(_)) => return kit_bad_request("query cursor does not match request".into()),
-        Some(Err(error)) => return kit_bad_request(error),
-        None => None,
+    let request_hash = mongreldb_core::query::canonical_query_cursor_hash(
+        &req.table,
+        &conditions,
+        Some(&projection_ids),
+    );
+    let cursor = match req
+        .cursor
+        .as_deref()
+        .map(|value| parse_kit_query_cursor(value, &state.cursor_mac_key))
+        .transpose()
+    {
+        Ok(cursor) => cursor,
+        Err(error) => return kit_core_error(&error),
     };
+    if let Some(cursor) = cursor {
+        if let Err(error) =
+            validate_cursor_identity(cursor.binding, principal.as_ref(), request_hash)
+        {
+            return kit_core_error(&error);
+        }
+    }
     let epoch = cursor
         .map(|cursor| cursor.epoch)
         .unwrap_or_else(|| state.db.visible_epoch().0);
@@ -2014,8 +2268,14 @@ pub async fn kit_query(
     let fetch_limit = limit
         .saturating_add(1)
         .min(mongreldb_core::query::MAX_FINAL_LIMIT);
-    q = q.with_limit(fetch_limit).with_offset(req.offset);
+    let q = Query {
+        conditions,
+        limit: Some(fetch_limit),
+        offset: req.offset,
+    };
     let after_row_id = cursor.map(|cursor| RowId(cursor.row_id));
+    let query_time_nanos =
+        cursor.map_or_else(cursor_now_nanos, |cursor| cursor.binding.query_time_nanos);
 
     let projection = projection_ids
         .into_iter()
@@ -2023,18 +2283,25 @@ pub async fn kit_query(
     let principal_catalog_bound = principal
         .as_ref()
         .is_some_and(|principal| state.db.resolve_principal(&principal.username).is_some());
-    let rows = match state.db.with_authorized_read_context(
+    let (rows, stamp) = match state.db.with_authorized_read_context_stamped(
         &req.table,
         principal.as_ref(),
         principal_catalog_bound,
         Some(&mongreldb_core::ReadAuthorization {
             operation: mongreldb_core::ColumnOperation::Select,
             columns: required,
+            permissions: Vec::new(),
         }),
         None,
         Some(snapshot),
         |table, snapshot, allowed, effective_principal| {
-            let rows = table.query_at_with_allowed_after(&q, snapshot, allowed, after_row_id)?;
+            let rows = table.query_at_with_allowed_after_at_time(
+                &q,
+                snapshot,
+                allowed,
+                after_row_id,
+                query_time_nanos,
+            )?;
             state
                 .db
                 .secure_rows_for(&req.table, rows, effective_principal)
@@ -2043,6 +2310,11 @@ pub async fn kit_query(
         Ok(rows) => rows,
         Err(error) => return kit_core_error(&error),
     };
+    if let Some(cursor) = cursor {
+        if let Err(error) = validate_cursor_stamp(cursor.binding, epoch, stamp) {
+            return kit_core_error(&error);
+        }
+    }
     let truncated = rows.len() > limit
         || (limit == mongreldb_core::query::MAX_FINAL_LIMIT && rows.len() == limit);
     let mut out: Vec<KitRow> = Vec::with_capacity(rows.len().min(limit));
@@ -2067,11 +2339,28 @@ pub async fn kit_query(
     }
     let next_cursor = if truncated {
         last_row_id.map(|row_id| {
-            format_kit_query_cursor(KitQueryCursor {
-                epoch,
-                row_id: row_id.0,
-                fingerprint,
-            })
+            let returned_count = u64::try_from(out.len()).unwrap_or(u64::MAX);
+            let binding = match cursor {
+                Some(cursor) => KitCursorBinding {
+                    returned_count: cursor.binding.returned_count.saturating_add(returned_count),
+                    ..cursor.binding
+                },
+                None => new_cursor_binding(
+                    stamp,
+                    principal.as_ref(),
+                    request_hash,
+                    query_time_nanos,
+                    returned_count,
+                ),
+            };
+            format_kit_query_cursor(
+                KitQueryCursor {
+                    epoch,
+                    row_id: row_id.0,
+                    binding,
+                },
+                &state.cursor_mac_key,
+            )
         })
     } else {
         None
@@ -2640,5 +2929,73 @@ mod tests {
             Value::Bytes(br#"["a",1,true]"#.to_vec())
         );
         assert!(kit_value(&json!([{"bad": true}]), &set, &[set_index]).is_err());
+    }
+
+    #[test]
+    fn cursor_v2_rejects_tampering_expiry_and_other_server_keys() {
+        let key = [7; 32];
+        let stamp = mongreldb_core::AuthorizedReadStamp {
+            table_id: 11,
+            schema_id: 12,
+            data_generation: 13,
+            security_version: 14,
+            snapshot: mongreldb_core::Snapshot::at(mongreldb_core::Epoch(15)),
+        };
+        let binding = new_cursor_binding(stamp, None, [16; 32], 17, 1);
+        let token = format_kit_query_cursor(
+            KitQueryCursor {
+                epoch: 15,
+                row_id: 18,
+                binding,
+            },
+            &key,
+        );
+        assert_eq!(parse_kit_query_cursor(&token, &key).unwrap().row_id, 18);
+
+        let mut tampered = token.into_bytes();
+        let index = tampered.iter().position(|byte| *byte == b'8').unwrap();
+        tampered[index] = b'9';
+        let tampered = String::from_utf8(tampered).unwrap();
+        assert!(matches!(
+            parse_kit_query_cursor(&tampered, &key),
+            Err(MongrelError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            parse_kit_query_cursor(
+                &format_kit_query_cursor(
+                    KitQueryCursor {
+                        epoch: 15,
+                        row_id: 18,
+                        binding,
+                    },
+                    &key,
+                ),
+                &[8; 32]
+            ),
+            Err(MongrelError::InvalidArgument(_))
+        ));
+
+        let now = cursor_now_nanos();
+        let expired = KitCursorBinding {
+            issued_at_nanos: now - CURSOR_TTL_NANOS,
+            expires_at_nanos: now - 1,
+            ..binding
+        };
+        let expired = format_kit_query_cursor(
+            KitQueryCursor {
+                epoch: 15,
+                row_id: 18,
+                binding: expired,
+            },
+            &key,
+        );
+        assert!(matches!(
+            parse_kit_query_cursor(&expired, &key),
+            Err(MongrelError::CursorExpired)
+        ));
+        assert!(matches!(
+            parse_kit_query_cursor("q1:old", &key),
+            Err(MongrelError::CursorStale(_))
+        ));
     }
 }

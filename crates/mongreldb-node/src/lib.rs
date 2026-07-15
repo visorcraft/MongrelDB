@@ -2347,9 +2347,42 @@ impl TableHandle {
         Ok(rows.iter().map(|r| row_to_js_table(&g, r)).collect())
     }
 
-    /// Reservoir-sampled approximate aggregate (`count`/`sum`/`avg`) with a
-    /// `z`-score confidence interval. Returns a JSON object, or `null` when the
-    /// reservoir is empty. `columnId` is required for `sum`/`avg`.
+    /// Exact, security-preserving aggregate over rows matching `conditions`.
+    /// The JSON response reports `mode: "exact"`.
+    #[napi]
+    pub fn aggregate_exact(
+        &self,
+        agg: String,
+        column_id: Option<u32>,
+        conditions: Vec<ConditionSpec>,
+    ) -> napi::Result<String> {
+        match agg.as_str() {
+            "count" | "sum" | "min" | "max" | "avg" => {}
+            other => {
+                return Err(napi::Error::from_reason(format!(
+                    "unknown aggregate '{other}'"
+                )))
+            }
+        }
+        let cid = column_id.map(|column| column as u16);
+        let query = build_query_from_conditions(build_conditions(&conditions)?);
+        let projection = cid.map(|column| vec![column]);
+        let rows = self
+            .db
+            .query_for_current_principal(&self.name, &query, projection.as_deref())
+            .map_err(to_napi)?;
+        let value = aggregate_rows_json(&rows, cid, &agg)?;
+        Ok(serde_json::json!({
+            "mode": "exact",
+            "value": value,
+            "rows": rows.len(),
+        })
+        .to_string())
+    }
+
+    /// Security-preserving exact fallback for the historical approximate
+    /// aggregate API. The response reports `mode: "exact_fallback"`; `z` is
+    /// validated for compatibility. No confidence interval is reported.
     #[napi]
     pub fn approx_aggregate(
         &self,
@@ -2380,9 +2413,9 @@ impl TableHandle {
         let point = aggregate_rows_json(&rows, cid, &agg)?;
         Ok(point.as_f64().map(|point| {
             serde_json::json!({
+                "mode": "exact_fallback",
+                "requested_z": z,
                 "point": point,
-                "ci_low": point,
-                "ci_high": point,
                 "n_population": rows.len(),
                 "n_sample_live": rows.len(),
                 "n_passing": rows.len(),
@@ -2391,11 +2424,9 @@ impl TableHandle {
         }))
     }
 
-    /// Incrementally-maintained aggregate (`count`/`sum`/`min`/`max`/`avg`),
-    /// optionally filtered by pushed-down `conditions`. Returns a JSON object
-    /// `{value, incremental, delta_rows}`; the value is always exact. The engine
-    /// caches per `(table, column, agg, conditions)` and folds in only the delta
-    /// of newly-committed rows once data has spilled to runs.
+    /// Security-preserving exact fallback for the historical incremental
+    /// aggregate API. The response reports `mode: "exact_fallback"` and
+    /// `incremental: false`; every matching row is recomputed.
     #[napi]
     pub fn incremental_aggregate(
         &self,
@@ -2421,6 +2452,7 @@ impl TableHandle {
             .map_err(to_napi)?;
         let value = aggregate_rows_json(&rows, cid, &agg)?;
         Ok(serde_json::json!({
+            "mode": "exact_fallback",
             "value": value,
             "incremental": false,
             "delta_rows": rows.len(),

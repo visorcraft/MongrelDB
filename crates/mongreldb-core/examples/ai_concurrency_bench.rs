@@ -133,6 +133,7 @@ fn main() {
     let authorization = ReadAuthorization {
         operation: ColumnOperation::Select,
         columns: vec![2],
+        permissions: Vec::new(),
     };
     let request = AnnRerankRequest {
         column_id: 2,

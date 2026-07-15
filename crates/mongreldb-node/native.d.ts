@@ -512,17 +512,20 @@ export declare class TableHandle {
    */
   rowsAtEpoch(epoch: bigint): Array<RowJs>
   /**
-   * Reservoir-sampled approximate aggregate (`count`/`sum`/`avg`) with a
-   * `z`-score confidence interval. Returns a JSON object, or `null` when the
-   * reservoir is empty. `columnId` is required for `sum`/`avg`.
+   * Exact, security-preserving aggregate over rows matching `conditions`.
+   * The JSON response reports `mode: "exact"`.
+   */
+  aggregateExact(agg: string, columnId: number | undefined | null, conditions: Array<ConditionSpec>): string
+  /**
+   * Security-preserving exact fallback for the historical approximate
+   * aggregate API. The response reports `mode: "exact_fallback"`; `z` is
+   * validated for compatibility. No confidence interval is reported.
    */
   approxAggregate(agg: string, columnId: number | undefined | null, z: number): string | null
   /**
-   * Incrementally-maintained aggregate (`count`/`sum`/`min`/`max`/`avg`),
-   * optionally filtered by pushed-down `conditions`. Returns a JSON object
-   * `{value, incremental, delta_rows}`; the value is always exact. The engine
-   * caches per `(table, column, agg, conditions)` and folds in only the delta
-   * of newly-committed rows once data has spilled to runs.
+   * Security-preserving exact fallback for the historical incremental
+   * aggregate API. The response reports `mode: "exact_fallback"` and
+   * `incremental: false`; every matching row is recomputed.
    */
   incrementalAggregate(agg: string, columnId: number | undefined | null, conditions: Array<ConditionSpec>): string
   /**

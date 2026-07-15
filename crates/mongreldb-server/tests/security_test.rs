@@ -121,7 +121,12 @@ async fn user_principal_secures_sql_native_kit_and_sessions() {
     for permission in [
         Permission::SelectColumns {
             table: "docs".into(),
-            columns: vec!["id".into(), "owner".into(), "secret".into(), "sparse".into()],
+            columns: vec![
+                "id".into(),
+                "owner".into(),
+                "secret".into(),
+                "sparse".into(),
+            ],
         },
         Permission::InsertColumns {
             table: "docs".into(),

@@ -121,6 +121,12 @@ impl AiExecutionContext {
         self.query_time_nanos
     }
 
+    pub fn with_query_time_nanos(&self, query_time_nanos: i64) -> Self {
+        let mut context = self.clone();
+        context.query_time_nanos = query_time_nanos;
+        context
+    }
+
     pub fn max_fused_candidates(&self) -> usize {
         self.max_fused_candidates
     }
@@ -339,6 +345,7 @@ pub struct SearchRequest {
 pub struct SearchAfter {
     pub final_score: f64,
     pub row_id: crate::RowId,
+    pub returned_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -593,6 +600,329 @@ fn hash_condition(c: &Condition) -> u64 {
     h.finish()
 }
 
+const CURSOR_REQUEST_HASH_VERSION: u64 = 1;
+
+fn cursor_u16(out: &mut Vec<u8>, value: u16) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn cursor_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn cursor_u64(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn cursor_bytes(out: &mut Vec<u8>, value: &[u8]) {
+    cursor_u64(out, value.len() as u64);
+    out.extend_from_slice(value);
+}
+
+fn cursor_condition(condition: &Condition) -> Vec<u8> {
+    let mut out = Vec::new();
+    match condition {
+        Condition::Pk(value) => {
+            out.push(0);
+            cursor_bytes(&mut out, value);
+        }
+        Condition::BitmapEq { column_id, value } => {
+            out.push(1);
+            cursor_u16(&mut out, *column_id);
+            cursor_bytes(&mut out, value);
+        }
+        Condition::BitmapIn { column_id, values } => {
+            out.push(2);
+            cursor_u16(&mut out, *column_id);
+            let mut values = values.clone();
+            values.sort();
+            values.dedup();
+            cursor_u64(&mut out, values.len() as u64);
+            for value in values {
+                cursor_bytes(&mut out, &value);
+            }
+        }
+        Condition::Ann {
+            column_id,
+            query,
+            k,
+        } => {
+            out.push(3);
+            cursor_u16(&mut out, *column_id);
+            cursor_u64(&mut out, *k as u64);
+            cursor_u64(&mut out, query.len() as u64);
+            for value in query {
+                cursor_u32(&mut out, value.to_bits());
+            }
+        }
+        Condition::FmContains { column_id, pattern } => {
+            out.push(4);
+            cursor_u16(&mut out, *column_id);
+            cursor_bytes(&mut out, pattern);
+        }
+        Condition::FmContainsAll {
+            column_id,
+            patterns,
+        } => {
+            out.push(5);
+            cursor_u16(&mut out, *column_id);
+            let mut patterns = patterns.clone();
+            patterns.sort();
+            patterns.dedup();
+            cursor_u64(&mut out, patterns.len() as u64);
+            for pattern in patterns {
+                cursor_bytes(&mut out, &pattern);
+            }
+        }
+        Condition::Range { column_id, lo, hi } => {
+            out.push(6);
+            cursor_u16(&mut out, *column_id);
+            out.extend_from_slice(&lo.to_le_bytes());
+            out.extend_from_slice(&hi.to_le_bytes());
+        }
+        Condition::RangeF64 {
+            column_id,
+            lo,
+            lo_inclusive,
+            hi,
+            hi_inclusive,
+        } => {
+            out.push(7);
+            cursor_u16(&mut out, *column_id);
+            cursor_u64(&mut out, lo.to_bits());
+            out.push(u8::from(*lo_inclusive));
+            cursor_u64(&mut out, hi.to_bits());
+            out.push(u8::from(*hi_inclusive));
+        }
+        Condition::SparseMatch {
+            column_id,
+            query,
+            k,
+        } => {
+            out.push(8);
+            cursor_u16(&mut out, *column_id);
+            cursor_u64(&mut out, *k as u64);
+            let mut query: Vec<_> = query
+                .iter()
+                .map(|(token, weight)| (*token, weight.to_bits()))
+                .collect();
+            query.sort_unstable();
+            cursor_u64(&mut out, query.len() as u64);
+            for (token, weight) in query {
+                cursor_u32(&mut out, token);
+                cursor_u32(&mut out, weight);
+            }
+        }
+        Condition::MinHashSimilar {
+            column_id,
+            query,
+            k,
+        } => {
+            out.push(9);
+            cursor_u16(&mut out, *column_id);
+            cursor_u64(&mut out, *k as u64);
+            let mut query = query.clone();
+            query.sort_unstable();
+            query.dedup();
+            cursor_u64(&mut out, query.len() as u64);
+            for value in query {
+                cursor_u64(&mut out, value);
+            }
+        }
+        Condition::IsNull { column_id } => {
+            out.push(10);
+            cursor_u16(&mut out, *column_id);
+        }
+        Condition::IsNotNull { column_id } => {
+            out.push(11);
+            cursor_u16(&mut out, *column_id);
+        }
+        Condition::BytesPrefix { column_id, prefix } => {
+            out.push(12);
+            cursor_u16(&mut out, *column_id);
+            cursor_bytes(&mut out, prefix);
+        }
+    }
+    out
+}
+
+fn cursor_conditions(out: &mut Vec<u8>, conditions: &[Condition]) {
+    let mut encoded: Vec<_> = conditions.iter().map(cursor_condition).collect();
+    encoded.sort();
+    encoded.dedup();
+    cursor_u64(out, encoded.len() as u64);
+    for condition in encoded {
+        cursor_bytes(out, &condition);
+    }
+}
+
+fn cursor_projection(out: &mut Vec<u8>, projection: Option<&[u16]>) {
+    match projection {
+        Some(projection) => {
+            out.push(1);
+            let mut projection = projection.to_vec();
+            projection.sort_unstable();
+            projection.dedup();
+            cursor_u64(out, projection.len() as u64);
+            for column in projection {
+                cursor_u16(out, column);
+            }
+        }
+        None => out.push(0),
+    }
+}
+
+fn cursor_set_member(member: &SetMember) -> Vec<u8> {
+    let mut out = Vec::new();
+    match member {
+        SetMember::String(value) => {
+            out.push(0);
+            cursor_bytes(&mut out, value.as_bytes());
+        }
+        SetMember::Number(value) => {
+            out.push(1);
+            cursor_bytes(&mut out, value.to_string().as_bytes());
+        }
+        SetMember::Boolean(value) => {
+            out.push(2);
+            out.push(u8::from(*value));
+        }
+    }
+    out
+}
+
+fn cursor_retriever(retriever: &Retriever) -> Vec<u8> {
+    let mut out = Vec::new();
+    match retriever {
+        Retriever::Ann {
+            column_id,
+            query,
+            k,
+        } => {
+            out.push(0);
+            cursor_u16(&mut out, *column_id);
+            cursor_u64(&mut out, *k as u64);
+            cursor_u64(&mut out, query.len() as u64);
+            for value in query {
+                cursor_u32(&mut out, value.to_bits());
+            }
+        }
+        Retriever::Sparse {
+            column_id,
+            query,
+            k,
+        } => {
+            out.push(1);
+            cursor_u16(&mut out, *column_id);
+            cursor_u64(&mut out, *k as u64);
+            let mut query: Vec<_> = query
+                .iter()
+                .map(|(token, weight)| (*token, weight.to_bits()))
+                .collect();
+            query.sort_unstable();
+            cursor_u64(&mut out, query.len() as u64);
+            for (token, weight) in query {
+                cursor_u32(&mut out, token);
+                cursor_u32(&mut out, weight);
+            }
+        }
+        Retriever::MinHash {
+            column_id,
+            members,
+            k,
+        } => {
+            out.push(2);
+            cursor_u16(&mut out, *column_id);
+            cursor_u64(&mut out, *k as u64);
+            let mut members: Vec<_> = members.iter().map(cursor_set_member).collect();
+            members.sort();
+            members.dedup();
+            cursor_u64(&mut out, members.len() as u64);
+            for member in members {
+                cursor_bytes(&mut out, &member);
+            }
+        }
+    }
+    out
+}
+
+fn cursor_sha256(bytes: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes).into()
+}
+
+/// Versioned, canonical request hash for native-query cursor binding.
+pub fn canonical_query_cursor_hash(
+    table: &str,
+    conditions: &[Condition],
+    projection: Option<&[u16]>,
+) -> [u8; 32] {
+    let mut out = Vec::new();
+    cursor_u64(&mut out, CURSOR_REQUEST_HASH_VERSION);
+    out.push(0);
+    cursor_bytes(&mut out, table.as_bytes());
+    cursor_conditions(&mut out, conditions);
+    cursor_projection(&mut out, projection);
+    cursor_sha256(&out)
+}
+
+/// Versioned, canonical request hash for scored-search cursor binding.
+pub fn canonical_search_cursor_hash(table: &str, request: &SearchRequest) -> [u8; 32] {
+    let mut out = Vec::new();
+    cursor_u64(&mut out, CURSOR_REQUEST_HASH_VERSION);
+    out.push(1);
+    cursor_bytes(&mut out, table.as_bytes());
+    cursor_conditions(&mut out, &request.must);
+    let mut retrievers: Vec<Vec<u8>> = request
+        .retrievers
+        .iter()
+        .map(|named| {
+            let mut encoded = Vec::new();
+            cursor_bytes(&mut encoded, named.name.as_bytes());
+            cursor_u64(&mut encoded, named.weight.to_bits());
+            cursor_bytes(&mut encoded, &cursor_retriever(&named.retriever));
+            encoded
+        })
+        .collect();
+    retrievers.sort();
+    cursor_u64(&mut out, retrievers.len() as u64);
+    for retriever in retrievers {
+        cursor_bytes(&mut out, &retriever);
+    }
+    match request.fusion {
+        Fusion::ReciprocalRank { constant } => {
+            out.push(0);
+            cursor_u32(&mut out, constant);
+        }
+    }
+    match &request.rerank {
+        Some(Rerank::ExactVector {
+            embedding_column,
+            query,
+            metric,
+            candidate_limit,
+            weight,
+        }) => {
+            out.push(1);
+            cursor_u16(&mut out, *embedding_column);
+            out.push(match metric {
+                VectorMetric::Cosine => 0,
+                VectorMetric::DotProduct => 1,
+                VectorMetric::Euclidean => 2,
+            });
+            cursor_u64(&mut out, *candidate_limit as u64);
+            cursor_u64(&mut out, weight.to_bits());
+            cursor_u64(&mut out, query.len() as u64);
+            for value in query {
+                cursor_u32(&mut out, value.to_bits());
+            }
+        }
+        None => out.push(0),
+    }
+    cursor_projection(&mut out, request.projection.as_deref());
+    cursor_sha256(&out)
+}
+
 /// Extract the column IDs referenced by a slice of conditions (Phase 19.1
 /// hardening (c)). `Pk` references no user column (it's a row-id lookup) so it
 /// contributes nothing. Used for conservative column-based cache invalidation:
@@ -759,5 +1089,69 @@ mod tests {
             expired.checkpoint(),
             Err(crate::MongrelError::DeadlineExceeded)
         ));
+    }
+
+    #[test]
+    fn cursor_request_hashes_are_canonical_and_semantic() {
+        let a = vec![
+            Condition::BitmapIn {
+                column_id: 2,
+                values: vec![b"b".to_vec(), b"a".to_vec(), b"a".to_vec()],
+            },
+            Condition::Range {
+                column_id: 3,
+                lo: 1,
+                hi: 9,
+            },
+        ];
+        let b = vec![
+            Condition::Range {
+                column_id: 3,
+                lo: 1,
+                hi: 9,
+            },
+            Condition::BitmapIn {
+                column_id: 2,
+                values: vec![b"a".to_vec(), b"b".to_vec()],
+            },
+        ];
+        assert_eq!(
+            canonical_query_cursor_hash("docs", &a, Some(&[2, 1, 2])),
+            canonical_query_cursor_hash("docs", &b, Some(&[1, 2])),
+        );
+        assert_ne!(
+            canonical_query_cursor_hash("docs", &a, Some(&[1, 2])),
+            canonical_query_cursor_hash("other", &a, Some(&[1, 2])),
+        );
+
+        let search = SearchRequest {
+            must: a,
+            retrievers: vec![NamedRetriever {
+                name: "dense".into(),
+                weight: 1.0,
+                retriever: Retriever::Ann {
+                    column_id: 4,
+                    query: vec![1.0, -1.0],
+                    k: 10,
+                },
+            }],
+            fusion: Fusion::ReciprocalRank { constant: 60 },
+            rerank: None,
+            limit: 1,
+            projection: Some(vec![2, 1]),
+        };
+        let mut next_page = search.clone();
+        next_page.limit = 20;
+        next_page.projection = Some(vec![1, 2]);
+        assert_eq!(
+            canonical_search_cursor_hash("docs", &search),
+            canonical_search_cursor_hash("docs", &next_page),
+            "page size and projection order must not change search identity",
+        );
+        next_page.retrievers[0].weight = 2.0;
+        assert_ne!(
+            canonical_search_cursor_hash("docs", &search),
+            canonical_search_cursor_hash("docs", &next_page),
+        );
     }
 }

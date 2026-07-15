@@ -263,6 +263,7 @@ fn scored_retry_rechecks_live_column_permissions() {
         Some(&ReadAuthorization {
             operation: ColumnOperation::Select,
             columns: vec![1],
+            permissions: Vec::new(),
         }),
         None,
         None,
@@ -270,6 +271,48 @@ fn scored_retry_rechecks_live_column_permissions() {
             calls.set(calls.get() + 1);
             assert_eq!(principal.unwrap().username, "alice");
             admin.revoke_role("alice", "reader")?;
+            Ok(())
+        },
+    );
+    assert!(matches!(result, Err(MongrelError::PermissionDenied { .. })));
+    assert_eq!(calls.get(), 1);
+}
+
+#[test]
+fn scored_retry_rechecks_live_admin_permission() {
+    let dir = tempdir().unwrap();
+    let admin = Database::create_with_credentials(dir.path(), "admin", "admin-pw").unwrap();
+    admin.create_table("docs", int_pk_schema()).unwrap();
+    admin.create_user("alice", "alice-pw").unwrap();
+    admin.create_role("reader").unwrap();
+    admin
+        .grant_permission(
+            "reader",
+            Permission::SelectColumns {
+                table: "docs".into(),
+                columns: vec!["id".into()],
+            },
+        )
+        .unwrap();
+    admin.grant_role("alice", "reader").unwrap();
+    admin.set_user_admin("alice", true).unwrap();
+    let alice = admin.resolve_principal("alice").unwrap();
+    let calls = std::cell::Cell::new(0);
+    let result = admin.with_authorized_scored_read_context_at(
+        "docs",
+        Some(&alice),
+        true,
+        Some(&ReadAuthorization {
+            operation: ColumnOperation::Select,
+            columns: vec![1],
+            permissions: vec![Permission::Admin],
+        }),
+        None,
+        None,
+        |_, _, _, principal| {
+            calls.set(calls.get() + 1);
+            assert!(principal.unwrap().is_admin);
+            admin.set_user_admin("alice", false)?;
             Ok(())
         },
     );
@@ -305,6 +348,7 @@ fn authorized_retries_refresh_grants_and_dropped_users() {
             Some(&ReadAuthorization {
                 operation: ColumnOperation::Select,
                 columns: vec![1],
+                permissions: Vec::new(),
             }),
             None,
             None,
@@ -338,6 +382,7 @@ fn authorized_retries_refresh_grants_and_dropped_users() {
         Some(&ReadAuthorization {
             operation: ColumnOperation::Select,
             columns: vec![1],
+            permissions: Vec::new(),
         }),
         None,
         None,
@@ -367,6 +412,20 @@ fn credentialless_database_has_no_enforcement() {
 
     // Operations work without any principal.
     db.create_table("orders", int_pk_schema()).unwrap();
+    db.with_authorized_scored_read_context_at(
+        "orders",
+        None,
+        false,
+        Some(&ReadAuthorization {
+            operation: ColumnOperation::Select,
+            columns: vec![1],
+            permissions: vec![Permission::Admin],
+        }),
+        None,
+        None,
+        |_, _, _, _| Ok(()),
+    )
+    .unwrap();
     db.create_user("alice", "pw").unwrap();
     drop(db);
 }

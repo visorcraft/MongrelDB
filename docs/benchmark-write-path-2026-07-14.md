@@ -103,3 +103,25 @@ not scan all one million rows.
 
 No earlier recorded values exist for the scale, query, or write microbenchmarks.
 These measurements establish their comparison baseline.
+
+## Bounded 1M cursor-generation overlap
+
+`read_generation_characterization` held 32 successive immutable read
+generations while committing 100 single-row writes against a 1,000,000-row
+table. The enforced thresholds are in `docs/read-generation-thresholds.json`.
+
+| Metric | Previous | Current | Threshold |
+|---|---:|---:|---:|
+| Commit p50 | 4.057 ms | 4.076 ms | |
+| Commit p95 | 8.394 ms | 8.840 ms | |
+| Commit p99 | 9.081 ms | 9.259 ms | 500 ms maximum |
+| Peak RSS | 1,168,375,808 bytes | 1,169,690,624 bytes | 1,610,612,736 bytes maximum |
+| Whole-table COW clones | 0 | 0 | 0 |
+| Estimated COW clone bytes | 0 | 0 | 0 |
+| Maximum live generations | 32 | 32 | 32 |
+| Live generations after cursor drop | 0 | 0 | 0 |
+
+The nightly 1M workflow runs the characterization and
+`scripts/validate-read-generation-characterization.py`. This makes commit p99,
+peak RSS, clone amplification, and bounded cursor lifetime release artifacts
+instead of advisory local numbers.

@@ -65,8 +65,8 @@ pub use catalog::{
 pub use columnar::{decode_column, encode_column};
 pub use cursor::{drain_cursor_to_columns, Cursor, MultiRunCursor, NativePageCursor};
 pub use database::{
-    lock_table_with_context, AuthorizedReadSnapshot, CdcBatch, ChangeEvent, CheckIssue, Database,
-    ExternalTriggerBaseWrite, ExternalTriggerBridge, ExternalTriggerWrite,
+    lock_table_with_context, AuthorizedReadSnapshot, AuthorizedReadStamp, CdcBatch, ChangeEvent,
+    CheckIssue, Database, ExternalTriggerBaseWrite, ExternalTriggerBridge, ExternalTriggerWrite,
     ExternalTriggerWriteResult, OpenOptions, ReadAuthorization, TableGenerationStats, TableGuard,
     TableHandle, TableReadGeneration,
 };

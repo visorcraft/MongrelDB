@@ -58,8 +58,10 @@ large exports.
 
 NAPI historical reads evaluate the current principal and current security
 catalog against historical row values. Current RLS, column grants, and masks
-therefore apply. NAPI aggregates are exact over authorized rows. NAPI and C
-writes use live-principal database transactions; RLS `USING`/`WITH CHECK` and
+therefore apply. NAPI `aggregateExact` is exact over authorized rows.
+Compatibility methods `approxAggregate` and `incrementalAggregate` explicitly
+report `mode: "exact_fallback"`; the approximate fallback reports no confidence
+interval. NAPI and C writes use live-principal database transactions; RLS `USING`/`WITH CHECK` and
 column grants apply at commit. Typed NAPI bulk load is admin-only.
 
 The JSON report records git SHA, OS/architecture, corpus size, build time,

@@ -201,6 +201,7 @@ pub struct QueryTrace {
     /// AI retrieval stage timings and bounded cardinalities.
     pub hard_filter_nanos: u64,
     pub ann_candidate_nanos: u64,
+    pub ann_candidate_cap_hit: bool,
     pub sparse_candidate_nanos: u64,
     pub minhash_candidate_nanos: u64,
     pub candidate_count: usize,

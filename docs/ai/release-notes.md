@@ -27,10 +27,19 @@
   concurrency controls.
 - Scored reads pin immutable table generations, so same-table readers no longer
   serialize and writers are blocked only while a changed generation is cloned.
-- Native Kit reads expose snapshot/RowId cursors. Scored Kit search exposes
-  snapshot/final-score/RowId search-after cursors. Both reject request changes.
+- Native Kit reads and scored search use short-lived, HMAC-SHA-256 cursor v2
+  tokens bound to the table, schema/data generation, principal, security
+  version, canonical request, and first-page query time. Generation changes
+  return `CURSOR_STALE`; expiry returns `CURSOR_EXPIRED`. Process-local cursor
+  keys make restart and cross-instance replay fail closed.
 - Hybrid search can apply an optional exact-vector post-fusion reranker while
   preserving component, fused, exact, and final scores.
+- Search continuation preserves global `final_rank`. ANN adaptive over-fetch
+  obeys the raw-candidate and request-specific caps; admin explain output
+  reports `ann_candidate_cap_hit` when selectivity exhausts the cap.
+- NAPI `aggregateExact` is the explicit secured exact aggregate. Historical
+  `approxAggregate` and `incrementalAggregate` report
+  `mode: "exact_fallback"`; they do not claim sampling or incremental work.
 - Credentialed NAPI and C typed reads now use database-level RLS, mask, and
   live-principal enforcement. The C ABI validates integer discriminants before
   converting them to Rust types.
@@ -46,3 +55,5 @@
 - Tagged releases attach direct, exact-SHA evidence downloads:
   [100k clean qualification](https://github.com/visorcraft/MongrelDB/releases/latest/download/mongreldb-clean-qualification.tar.gz)
   and [1M characterization](https://github.com/visorcraft/MongrelDB/releases/latest/download/mongreldb-ai-1m-characterization.tar.gz).
+- The `v0.53.3` assets and exact commit are recorded in the
+  [0.53.3 qualification evidence](release-qualification-v0.53.3.md).

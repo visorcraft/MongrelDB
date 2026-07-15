@@ -61,6 +61,37 @@ pub(crate) fn unix_nanos_now() -> i64 {
         .unwrap_or(0)
 }
 
+fn ann_candidate_cap(
+    index_len: usize,
+    context: Option<&crate::query::AiExecutionContext>,
+) -> usize {
+    index_len
+        .min(crate::query::MAX_RAW_INDEX_CANDIDATES)
+        .min(context.map_or(
+            crate::query::MAX_RAW_INDEX_CANDIDATES,
+            crate::query::AiExecutionContext::max_fused_candidates,
+        ))
+}
+
+#[cfg(test)]
+mod ann_candidate_cap_tests {
+    use super::*;
+
+    #[test]
+    fn raw_and_request_candidate_ceilings_are_both_hard_bounds() {
+        assert_eq!(
+            ann_candidate_cap(crate::query::MAX_RAW_INDEX_CANDIDATES + 1, None),
+            crate::query::MAX_RAW_INDEX_CANDIDATES,
+        );
+        let context = crate::query::AiExecutionContext::with_limits(
+            std::time::Duration::from_secs(1),
+            usize::MAX,
+            17,
+        );
+        assert_eq!(ann_candidate_cap(1_000_000, Some(&context)), 17);
+    }
+}
+
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -3515,6 +3546,11 @@ impl Table {
     /// dropped), merged across the memtable, the mutable-run tier, and all
     /// runs. Ascending `RowId`.
     pub fn visible_rows(&self, snapshot: Snapshot) -> Result<Vec<Row>> {
+        self.visible_rows_at_time(snapshot, unix_nanos_now())
+    }
+
+    #[doc(hidden)]
+    pub fn visible_rows_at_time(&self, snapshot: Snapshot, now_nanos: i64) -> Result<Vec<Row>> {
         let mut best: HashMap<u64, (Epoch, Row)> = HashMap::new();
         let mut fold = |row: Row| {
             best.entry(row.row_id.0)
@@ -3537,7 +3573,6 @@ impl Table {
                 fold(row);
             }
         }
-        let now_nanos = unix_nanos_now();
         let mut out: Vec<Row> = best
             .into_values()
             .filter_map(|(_, r)| {
@@ -3626,6 +3661,24 @@ impl Table {
         allowed: Option<&std::collections::HashSet<RowId>>,
         after_row_id: Option<RowId>,
     ) -> Result<Vec<Row>> {
+        self.query_at_with_allowed_after_at_time(
+            q,
+            snapshot,
+            allowed,
+            after_row_id,
+            unix_nanos_now(),
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn query_at_with_allowed_after_at_time(
+        &mut self,
+        q: &crate::query::Query,
+        snapshot: Snapshot,
+        allowed: Option<&std::collections::HashSet<RowId>>,
+        after_row_id: Option<RowId>,
+        query_time_nanos: i64,
+    ) -> Result<Vec<Row>> {
         self.require_select()?;
         self.ensure_indexes_complete()?;
         if q.conditions.len() > crate::query::MAX_HARD_CONDITIONS {
@@ -3655,6 +3708,7 @@ impl Table {
             q.limit,
             q.offset,
             after_row_id,
+            query_time_nanos,
         )
     }
 
@@ -3674,9 +3728,10 @@ impl Table {
                 crate::query::MAX_HARD_CONDITIONS
             )));
         }
-        self.query_conditions_at(conditions, snapshot, None, None, 0, None)
+        self.query_conditions_at(conditions, snapshot, None, None, 0, None, unix_nanos_now())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn query_conditions_at(
         &self,
         conditions: &[crate::query::Condition],
@@ -3685,6 +3740,7 @@ impl Table {
         limit: Option<usize>,
         offset: usize,
         after_row_id: Option<RowId>,
+        query_time_nanos: i64,
     ) -> Result<Vec<Row>> {
         crate::trace::QueryTrace::record(|t| {
             t.run_count = self.run_refs.len();
@@ -3699,7 +3755,7 @@ impl Table {
                 t.scan_mode = crate::trace::ScanMode::Materialized;
                 t.row_materialized = true;
             });
-            let mut rows = self.visible_rows(snapshot)?;
+            let mut rows = self.visible_rows_at_time(snapshot, query_time_nanos)?;
             if let Some(allowed) = allowed {
                 rows.retain(|row| allowed.contains(&row.row_id));
             }
@@ -3746,7 +3802,7 @@ impl Table {
         if let Some(limit) = limit {
             rids.truncate(limit);
         }
-        self.rows_for_rids(&rids, snapshot)
+        self.rows_for_rids_at_time(&rids, snapshot, query_time_nanos)
     }
 
     /// Return an index's ordered candidates without discarding scores.
@@ -4019,7 +4075,7 @@ impl Table {
                 let Some(index) = self.ann.get(column_id) else {
                     return Ok(Vec::new());
                 };
-                let cap = index.len();
+                let cap = ann_candidate_cap(index.len(), context);
                 if cap == 0 {
                     return Ok(Vec::new());
                 }
@@ -4059,6 +4115,11 @@ impl Table {
                         .map(|(row_id, score)| (row_id, RetrieverScore::AnnHammingDistance(score)))
                         .collect();
                     if filtered.len() >= *k || breadth >= cap {
+                        if filtered.len() < *k && index.len() > cap && breadth >= cap {
+                            crate::trace::QueryTrace::record(|trace| {
+                                trace.ann_candidate_cap_hit = true;
+                            });
+                        }
                         break filtered;
                     }
                     breadth = breadth.saturating_mul(2).min(cap);
@@ -4491,6 +4552,7 @@ impl Table {
             MAX_PROJECTION_COLUMNS, MAX_RETRIEVERS, MAX_RETRIEVER_WEIGHT,
         };
         let total_started = std::time::Instant::now();
+        let rank_offset = after.map_or(0, |after| after.returned_count);
         self.require_select()?;
         if request.limit == 0 {
             return Err(MongrelError::InvalidArgument(
@@ -4934,7 +4996,7 @@ impl Table {
                     continue;
                 };
                 components.sort_by(|a, b| a.retriever_name.cmp(&b.retriever_name));
-                let final_rank = out.len() + 1;
+                let final_rank = rank_offset.saturating_add(out.len()).saturating_add(1);
                 out.push(SearchHit {
                     row_id,
                     cells: projection

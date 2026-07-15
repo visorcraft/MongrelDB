@@ -56,6 +56,17 @@ jobs:
           python3 scripts/validate-ai-concurrency.py \
             "$QUAL_DIR/ai-concurrency.json" \
             2>&1 | tee "$QUAL_DIR/ai-concurrency-validation.log"
+          MONGRELDB_READ_GENERATION_ROWS=1000000 \
+          MONGRELDB_READ_GENERATION_WRITES=100 \
+          MONGRELDB_READ_GENERATION_CURSORS=32 \
+          cargo run -p mongreldb-core --release --all-features \
+            --example read_generation_characterization \
+            > "$QUAL_DIR/read-generation-1m.json" \
+            2> "$QUAL_DIR/read-generation-1m.log"
+          python3 scripts/validate-read-generation-characterization.py \
+            "$QUAL_DIR/read-generation-1m.json" \
+            docs/read-generation-thresholds.json \
+            2>&1 | tee "$QUAL_DIR/read-generation-validation.log"
           test -z "$(git status --porcelain)"
       - uses: actions/upload-artifact@v7
         if: always()

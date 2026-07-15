@@ -56,6 +56,8 @@ fn status_for_error(e: &mongreldb_core::MongrelError) -> StatusCode {
         MongrelError::DeadlineExceeded => StatusCode::GATEWAY_TIMEOUT,
         MongrelError::WorkBudgetExceeded => StatusCode::TOO_MANY_REQUESTS,
         MongrelError::Cancelled => StatusCode::from_u16(499).expect("499 is valid"),
+        MongrelError::CursorStale(_) => StatusCode::CONFLICT,
+        MongrelError::CursorExpired => StatusCode::GONE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -114,6 +116,8 @@ struct AppState {
     sessions: Arc<sessions::SessionStore>,
     /// Bounds CPU-heavy AI work submitted to Tokio's blocking pool.
     ai_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Process-local HMAC key for stateless Kit cursors. Restart invalidates cursors.
+    cursor_mac_key: [u8; 32],
 }
 
 pub fn build_app(db: Arc<Database>) -> axum::Router {
@@ -180,6 +184,8 @@ pub fn build_app_with_sessions(
     if let Err(error) = db.set_history_retention_epochs(default_history_retention_epochs()) {
         eprintln!("[history] failed to configure retention: {error}");
     }
+    let mut cursor_mac_key = [0u8; 32];
+    mongreldb_core::encryption::fill_random(&mut cursor_mac_key);
     let state = Arc::new(AppState {
         idem: kit::IdempotencyStore::new(db.root()),
         db,
@@ -191,6 +197,7 @@ pub fn build_app_with_sessions(
         audit: Arc::new(audit::AuditLog::new(8192)),
         sessions,
         ai_semaphore: Arc::new(tokio::sync::Semaphore::new(default_ai_max_concurrent())),
+        cursor_mac_key,
     });
     let router = axum::Router::new()
         .route("/health", get(health))

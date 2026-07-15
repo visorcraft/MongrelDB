@@ -71,6 +71,26 @@ fn bench_read_generation(c: &mut Criterion) {
             black_box(generation.count());
         });
     });
+    let mut cursors = std::collections::VecDeque::with_capacity(32);
+    group.bench_function("writer_while_32_cursor_generations_live", |b| {
+        b.iter(|| {
+            if cursors.len() == 32 {
+                cursors.pop_front();
+            }
+            let (generation, _) = handle
+                .read_generation_with_context(None)
+                .expect("read generation");
+            cursors.push_back(generation);
+            let clones_before = handle.generation_stats().cow_clone_count;
+            let mut writer = handle.lock();
+            writer.put(vec![(1, Value::Int64(next_id))]).expect("put");
+            writer.commit().expect("commit");
+            next_id += 1;
+            assert_eq!(handle.generation_stats().cow_clone_count, clones_before);
+            black_box(cursors.len());
+        });
+    });
+    drop(cursors);
     group.finish();
 
     #[cfg(target_os = "linux")]

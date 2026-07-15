@@ -238,13 +238,9 @@ async fn kit_ai_indexes_work_over_wire_and_validate_values() {
     page["cursor"] = serde_json::json!(cursor);
     let (status, second_page) =
         request(app.clone(), "POST", "/kit/search", Some(page.clone())).await;
-    assert_eq!(status, 200, "{second_page}");
-    assert_eq!(second_page["hits"].as_array().unwrap().len(), 1);
-    assert_ne!(
-        second_page["hits"][0]["row_id"].as_str().unwrap(),
-        first_row
-    );
-    assert_ne!(second_page["hits"][0]["cells"], serde_json::json!([1, 4]));
+    assert_eq!(status, 409, "{second_page}");
+    assert_eq!(second_page["error"]["code"], "CURSOR_STALE");
+    assert!(!second_page.to_string().contains(&first_row));
 
     page["projection"] = serde_json::json!([1, 2]);
     let (status, body) = request(app.clone(), "POST", "/kit/search", Some(page)).await;

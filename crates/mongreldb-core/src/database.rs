@@ -362,6 +362,16 @@ pub struct AuthorizedReadSnapshot {
     pub allowed_row_ids: Option<HashSet<RowId>>,
 }
 
+/// Exact table/security generation used by one successful authorized read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthorizedReadStamp {
+    pub table_id: u64,
+    pub schema_id: u64,
+    pub data_generation: u64,
+    pub security_version: u64,
+    pub snapshot: Snapshot,
+}
+
 type RlsCacheKey = (String, u64, u64, String);
 
 /// Runtime statistics for the byte-bounded RLS candidate cache.
@@ -683,6 +693,7 @@ impl std::ops::DerefMut for TableGuard<'_> {
 pub struct ReadAuthorization {
     pub operation: crate::auth::ColumnOperation,
     pub columns: Vec<u16>,
+    pub permissions: Vec<crate::auth::Permission>,
 }
 
 #[derive(Default, Debug)]
@@ -2244,8 +2255,39 @@ impl Database {
         authorization: Option<&ReadAuthorization>,
         context: Option<&crate::query::AiExecutionContext>,
         snapshot_override: Option<Snapshot>,
-        mut read: F,
+        read: F,
     ) -> Result<T>
+    where
+        F: FnMut(
+            &mut Table,
+            Snapshot,
+            Option<&HashSet<RowId>>,
+            Option<&crate::auth::Principal>,
+        ) -> Result<T>,
+    {
+        self.with_authorized_read_context_stamped(
+            table_name,
+            principal,
+            catalog_bound,
+            authorization,
+            context,
+            snapshot_override,
+            read,
+        )
+        .map(|(result, _)| result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_authorized_read_context_stamped<T, F>(
+        &self,
+        table_name: &str,
+        principal: Option<&crate::auth::Principal>,
+        catalog_bound: bool,
+        authorization: Option<&ReadAuthorization>,
+        context: Option<&crate::query::AiExecutionContext>,
+        snapshot_override: Option<Snapshot>,
+        mut read: F,
+    ) -> Result<(T, AuthorizedReadStamp)>
     where
         F: FnMut(
             &mut Table,
@@ -2272,6 +2314,9 @@ impl Database {
                 )
             };
             if let Some(authorization) = authorization {
+                for permission in &authorization.permissions {
+                    self.require_for(effective_principal.as_ref(), permission)?;
+                }
                 self.require_columns_for(
                     table_name,
                     authorization.operation,
@@ -2290,12 +2335,20 @@ impl Database {
                     effective_principal.as_ref(),
                     context,
                 )?;
-                read(
+                let stamp = AuthorizedReadStamp {
+                    table_id: table.table_id(),
+                    schema_id: table.schema().schema_id,
+                    data_generation: table.data_generation(),
+                    security_version,
+                    snapshot,
+                };
+                let result = read(
                     &mut table,
                     snapshot,
                     allowed.as_deref(),
                     effective_principal.as_ref(),
-                )?
+                )?;
+                (result, stamp)
             };
             if let Some(context) = context {
                 context.checkpoint()?;
@@ -2355,8 +2408,39 @@ impl Database {
         authorization: Option<&ReadAuthorization>,
         context: Option<&crate::query::AiExecutionContext>,
         snapshot_override: Option<Snapshot>,
-        mut read: F,
+        read: F,
     ) -> Result<T>
+    where
+        F: FnMut(
+            &Table,
+            Snapshot,
+            Option<&crate::security::CandidateAuthorization<'_>>,
+            Option<&crate::auth::Principal>,
+        ) -> Result<T>,
+    {
+        self.with_authorized_scored_read_context_at_stamped(
+            table_name,
+            principal,
+            catalog_bound,
+            authorization,
+            context,
+            snapshot_override,
+            read,
+        )
+        .map(|(result, _)| result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_authorized_scored_read_context_at_stamped<T, F>(
+        &self,
+        table_name: &str,
+        principal: Option<&crate::auth::Principal>,
+        catalog_bound: bool,
+        authorization: Option<&ReadAuthorization>,
+        context: Option<&crate::query::AiExecutionContext>,
+        snapshot_override: Option<Snapshot>,
+        mut read: F,
+    ) -> Result<(T, AuthorizedReadStamp)>
     where
         F: FnMut(
             &Table,
@@ -2386,6 +2470,9 @@ impl Database {
                 )
             };
             if let Some(authorization) = authorization {
+                for permission in &authorization.permissions {
+                    self.require_for(effective_principal.as_ref(), permission)?;
+                }
                 self.require_columns_for(
                     table_name,
                     authorization.operation,
@@ -2407,12 +2494,20 @@ impl Database {
                 } else {
                     None
                 };
-                read(
+                let stamp = AuthorizedReadStamp {
+                    table_id: table.table_id(),
+                    schema_id: table.schema().schema_id,
+                    data_generation: table.data_generation(),
+                    security_version,
+                    snapshot,
+                };
+                let result = read(
                     table.as_ref(),
                     snapshot,
                     candidate_authorization.as_ref(),
                     effective_principal.as_ref(),
-                )?
+                )?;
+                (result, stamp)
             };
             if let Some(context) = context {
                 context.checkpoint()?;
@@ -2574,6 +2669,7 @@ impl Database {
             Some(&ReadAuthorization {
                 operation: crate::auth::ColumnOperation::Select,
                 columns: vec![request.column_id],
+                permissions: Vec::new(),
             }),
             None,
             None,
@@ -2686,6 +2782,7 @@ impl Database {
             Some(&ReadAuthorization {
                 operation: crate::auth::ColumnOperation::Select,
                 columns: Vec::new(),
+                permissions: Vec::new(),
             }),
             None,
             Some(snapshot),
