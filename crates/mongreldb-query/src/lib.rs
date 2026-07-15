@@ -1981,6 +1981,14 @@ impl MongrelSession {
         &self.query_registry
     }
 
+    /// Replace the session-local query registry with a process-wide registry.
+    /// Call this before sharing the session. Servers use one registry so query
+    /// status and cancellation never need the per-session execution lock.
+    pub fn with_query_registry(mut self, registry: Arc<SqlQueryRegistry>) -> Self {
+        self.query_registry = registry;
+        self
+    }
+
     pub fn set_statement_timeout(&self, timeout: Option<std::time::Duration>) {
         *self.statement_timeout.write() = timeout;
     }
@@ -1993,7 +2001,9 @@ impl MongrelSession {
                     .map_or(statement_timeout, |timeout| timeout.min(statement_timeout)),
             );
         }
-        self.query_registry.register(options)
+        let query = self.query_registry.register(options)?;
+        self.fire_test_hook(SqlTestHookPoint::AfterRegistration);
+        Ok(query)
     }
 
     pub fn cancel_query(&self, query_id: QueryId) -> CancelOutcome {
@@ -2010,7 +2020,7 @@ impl MongrelSession {
         self.sql_txn.lock().as_ref().map(Vec::len)
     }
 
-    pub(crate) fn fire_test_hook(&self, point: SqlTestHookPoint) {
+    pub fn fire_test_hook(&self, point: SqlTestHookPoint) {
         let hook = self.test_hook.lock().clone();
         if let Some(hook) = hook {
             hook(point);
@@ -2705,6 +2715,7 @@ impl MongrelSession {
     ) -> Result<MongrelRecordBatchStream> {
         query.set_sql_metadata(sql);
         let guard = RegisteredQueryGuard::new(query.clone());
+        self.fire_test_hook(SqlTestHookPoint::WaitingForSessionPermit);
         let permit = tokio::select! {
             permit = Arc::clone(&self.execution_gate).acquire_owned() => permit.map_err(|_| {
                 MongrelQueryError::InvalidQueryState("session execution gate closed".into())
@@ -2716,6 +2727,7 @@ impl MongrelSession {
             }
         };
         query.transition(SqlQueryPhase::Queued, SqlQueryPhase::Planning)?;
+        self.fire_test_hook(SqlTestHookPoint::Planning);
         query.transition(SqlQueryPhase::Planning, SqlQueryPhase::Executing)?;
         query.begin_statement(0);
         let stream = CURRENT_SQL_QUERY
@@ -2841,6 +2853,7 @@ impl MongrelSession {
     ) -> Result<Vec<RecordBatch>> {
         query.set_sql_metadata(sql);
         let guard = RegisteredQueryGuard::new(query.clone());
+        self.fire_test_hook(SqlTestHookPoint::WaitingForSessionPermit);
         let _permit = tokio::select! {
             permit = Arc::clone(&self.execution_gate).acquire_owned() => permit.map_err(|_| {
                 MongrelQueryError::InvalidQueryState("session execution gate closed".into())
@@ -2852,6 +2865,7 @@ impl MongrelSession {
             }
         };
         query.transition(SqlQueryPhase::Queued, SqlQueryPhase::Planning)?;
+        self.fire_test_hook(SqlTestHookPoint::Planning);
         query.transition(SqlQueryPhase::Planning, SqlQueryPhase::Executing)?;
         query.begin_statement(0);
         let result = CURRENT_SQL_QUERY

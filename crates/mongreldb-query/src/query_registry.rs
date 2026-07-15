@@ -374,6 +374,16 @@ impl SqlQueryRegistry {
         self.state.lock().unwrap().active.len()
     }
 
+    pub fn active_for_session(&self, session_id: &str) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .active
+            .values()
+            .filter(|query| query.session_id.as_deref() == Some(session_id))
+            .count()
+    }
+
     pub fn finished_count(&self) -> usize {
         let mut state = self.state.lock().unwrap();
         self.prune_locked(&mut state);

@@ -97,7 +97,14 @@ impl ExternalTable for ServerRowsTable {
         ))
     }
 
-    fn scan(&self, request: &ExternalPlanRequest<'_>) -> DFResult<ExternalScan> {
+    fn scan_with_control(
+        &self,
+        request: &ExternalPlanRequest<'_>,
+        control: &mongreldb_core::ExecutionControl,
+    ) -> DFResult<ExternalScan> {
+        control
+            .checkpoint()
+            .map_err(|error| datafusion::error::DataFusionError::Execution(error.to_string()))?;
         let full_columns = vec![
             Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
             Arc::new(StringArray::from(vec!["one", "two"])) as ArrayRef,

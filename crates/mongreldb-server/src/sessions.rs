@@ -131,16 +131,22 @@ impl SessionStore {
     /// already holds an `Arc` aborts after acquiring the lock. Returns whether a
     /// session was removed. Rejects non-owners.
     pub fn close(&self, token: &str, owner: &str) -> bool {
+        self.take_for_close(token, owner).is_some()
+    }
+
+    /// Mark closing and remove from new lookups while returning the live entry
+    /// so the caller can cancel its queries and wait a bounded grace period.
+    pub(crate) fn take_for_close(&self, token: &str, owner: &str) -> Option<Arc<SessionEntry>> {
         if let Ok(mut guard) = self.sessions.lock() {
             if let Some(entry) = guard.get(token) {
                 if entry.owner != owner {
-                    return false;
+                    return None;
                 }
                 entry.mark_closed();
             }
-            return guard.remove(token).is_some();
+            return guard.remove(token);
         }
-        false
+        None
     }
 
     /// Evict every session idle for longer than the configured timeout, skipping
@@ -158,7 +164,10 @@ impl SessionStore {
         let to_evict: Vec<String> = guard
             .iter()
             .filter_map(|(token, entry)| {
-                if entry.idle_for_at_least(timeout) && entry.lock.try_lock().is_ok() {
+                if entry.idle_for_at_least(timeout)
+                    && entry.session.query_registry().active_for_session(token) == 0
+                    && entry.lock.try_lock().is_ok()
+                {
                     Some(token.clone())
                 } else {
                     None
@@ -181,6 +190,16 @@ impl SessionStore {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Mark every session closed and remove it from the pool during shutdown.
+    pub(crate) fn close_all(&self) {
+        if let Ok(mut guard) = self.sessions.lock() {
+            for entry in guard.values() {
+                entry.mark_closed();
+            }
+            guard.clear();
+        }
     }
 }
 

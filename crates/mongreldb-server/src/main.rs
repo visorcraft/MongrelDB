@@ -9,7 +9,7 @@
 
 use mongreldb_core::Database;
 use mongreldb_server::{
-    build_app_with_sessions, spawn_auto_compactor, spawn_session_reaper, SessionStore,
+    build_app_with_sessions_and_control, spawn_auto_compactor, spawn_session_reaper, SessionStore,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -311,7 +311,7 @@ async fn main() {
     ));
     spawn_session_reaper(Arc::clone(&sessions));
 
-    let app = build_app_with_sessions(
+    let (app, server_control) = build_app_with_sessions_and_control(
         db.clone(),
         std::iter::empty(),
         args.auth_token.clone(),
@@ -384,6 +384,10 @@ async fn main() {
         }
     }
 
+    let stuck_queries = server_control.shutdown().await;
+    if stuck_queries > 0 {
+        eprintln!("[shutdown] {stuck_queries} SQL query(s) exceeded cancellation grace");
+    }
     shutdown(&db, &pidfile, args.daemon);
 }
 

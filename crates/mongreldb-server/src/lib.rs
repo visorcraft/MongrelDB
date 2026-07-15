@@ -14,6 +14,7 @@
 //!
 //! Usage: `mongreldb-server <db_dir> [port]`
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
@@ -23,8 +24,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Json;
 use mongreldb_core::schema::{Schema, TypeId};
-use mongreldb_core::{Database, Value};
-use mongreldb_query::{ExternalTableModule, MongrelSession};
+use mongreldb_core::{CancellationReason, Database, Value};
+use mongreldb_query::{
+    CancelOutcome, ExternalTableModule, MongrelSession, QueryId, RegisteredQueryGuard,
+    RegisteredSqlQuery, SqlQueryOptions, SqlQueryPhase, SqlQueryRegistry,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -68,11 +72,14 @@ fn status_for_query_error(e: &mongreldb_query::MongrelQueryError) -> StatusCode 
     use mongreldb_query::MongrelQueryError;
     match e {
         MongrelQueryError::Core(core) => status_for_error(core),
-        _ if e.to_string().contains("deadline exceeded") => StatusCode::GATEWAY_TIMEOUT,
-        _ if e.to_string().contains("work budget exceeded") => StatusCode::TOO_MANY_REQUESTS,
-        _ if e.to_string().contains("cancelled") => {
+        MongrelQueryError::DeadlineExceeded { .. } => StatusCode::GATEWAY_TIMEOUT,
+        MongrelQueryError::QueryCancelled { .. } => {
             StatusCode::from_u16(499).expect("499 is valid")
         }
+        MongrelQueryError::QueryIdConflict { .. } => StatusCode::CONFLICT,
+        MongrelQueryError::QueryRegistryFull => StatusCode::SERVICE_UNAVAILABLE,
+        MongrelQueryError::TransactionAborted => StatusCode::CONFLICT,
+        MongrelQueryError::CommitOutcome { .. } => StatusCode::CONFLICT,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -116,8 +123,40 @@ struct AppState {
     sessions: Arc<sessions::SessionStore>,
     /// Bounds CPU-heavy AI work submitted to Tokio's blocking pool.
     ai_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Process-wide SQL registry. Cancellation never takes a session lock.
+    query_registry: Arc<SqlQueryRegistry>,
+    /// Admission control for ordinary SQL, separate from AI workers.
+    sql_semaphore: Arc<tokio::sync::Semaphore>,
+    sql_default_timeout: std::time::Duration,
+    sql_max_timeout: std::time::Duration,
+    sql_cancel_grace: std::time::Duration,
+    accepting_sql: Arc<AtomicBool>,
     /// Process-local HMAC key for stateless Kit cursors. Restart invalidates cursors.
     cursor_mac_key: [u8; 32],
+}
+
+/// Handle retained by the daemon to coordinate graceful SQL shutdown without
+/// coupling signal handling to Axum's router internals.
+#[derive(Clone)]
+pub struct ServerControl {
+    query_registry: Arc<SqlQueryRegistry>,
+    sessions: Arc<sessions::SessionStore>,
+    accepting_sql: Arc<AtomicBool>,
+    cancel_grace: std::time::Duration,
+}
+
+impl ServerControl {
+    pub async fn shutdown(&self) -> usize {
+        self.accepting_sql.store(false, Ordering::Release);
+        self.query_registry
+            .cancel_all(CancellationReason::ServerShutdown);
+        let deadline = tokio::time::Instant::now() + self.cancel_grace;
+        while self.query_registry.active_count() > 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        self.sessions.close_all();
+        self.query_registry.active_count()
+    }
 }
 
 pub fn build_app(db: Arc<Database>) -> axum::Router {
@@ -180,12 +219,49 @@ pub fn build_app_with_sessions(
     user_auth: bool,
     sessions: Arc<sessions::SessionStore>,
 ) -> axum::Router {
+    build_app_with_sessions_and_control(
+        db,
+        external_modules,
+        auth_token,
+        max_connections,
+        user_auth,
+        sessions,
+    )
+    .0
+}
+
+/// Build the daemon router and return a handle for graceful query shutdown.
+pub fn build_app_with_sessions_and_control(
+    db: Arc<Database>,
+    external_modules: impl IntoIterator<Item = Arc<dyn ExternalTableModule>>,
+    auth_token: Option<String>,
+    max_connections: Option<usize>,
+    user_auth: bool,
+    sessions: Arc<sessions::SessionStore>,
+) -> (axum::Router, ServerControl) {
     db.set_replication_wal_retention_segments(default_replication_wal_segments());
     if let Err(error) = db.set_history_retention_epochs(default_history_retention_epochs()) {
         eprintln!("[history] failed to configure retention: {error}");
     }
     let mut cursor_mac_key = [0u8; 32];
     mongreldb_core::encryption::fill_random(&mut cursor_mac_key);
+    let max_active_queries = default_sql_max_active_queries();
+    let query_registry = Arc::new(SqlQueryRegistry::new(
+        max_active_queries,
+        max_active_queries.saturating_mul(2),
+        2 * 1024 * 1024,
+        default_sql_finished_query_ttl(),
+    ));
+    let accepting_sql = Arc::new(AtomicBool::new(true));
+    let sql_cancel_grace = default_sql_cancel_grace();
+    let sql_max_timeout = default_sql_max_timeout();
+    let sql_default_timeout = default_sql_default_timeout().min(sql_max_timeout);
+    let server_control = ServerControl {
+        query_registry: Arc::clone(&query_registry),
+        sessions: Arc::clone(&sessions),
+        accepting_sql: Arc::clone(&accepting_sql),
+        cancel_grace: sql_cancel_grace,
+    };
     let state = Arc::new(AppState {
         idem: kit::IdempotencyStore::new(db.root()),
         db,
@@ -197,6 +273,12 @@ pub fn build_app_with_sessions(
         audit: Arc::new(audit::AuditLog::new(8192)),
         sessions,
         ai_semaphore: Arc::new(tokio::sync::Semaphore::new(default_ai_max_concurrent())),
+        query_registry,
+        sql_semaphore: Arc::new(tokio::sync::Semaphore::new(default_sql_max_concurrent())),
+        sql_default_timeout,
+        sql_max_timeout,
+        sql_cancel_grace,
+        accepting_sql,
         cursor_mac_key,
     });
     let router = axum::Router::new()
@@ -213,6 +295,8 @@ pub fn build_app_with_sessions(
         .route("/tables/{name}/count", get(count))
         .route("/tables/{name}/commit", post(commit))
         .route("/sql", post(sql))
+        .route("/queries/{query_id}", get(query_status))
+        .route("/queries/{query_id}/cancel", post(cancel_query))
         .route("/txn", post(txn))
         .route("/sessions", post(create_session))
         .route("/sessions/{id}", axum::routing::delete(close_session))
@@ -267,11 +351,12 @@ pub fn build_app_with_sessions(
     };
 
     // Apply connection limit if configured.
-    if let Some(max) = max_connections {
+    let router = if let Some(max) = max_connections {
         router.layer(tower::limit::ConcurrencyLimitLayer::new(max))
     } else {
         router
-    }
+    };
+    (router, server_control)
 }
 
 /// Auth middleware supporting three modes:
@@ -813,6 +898,54 @@ fn default_ai_max_concurrent() -> usize {
         .unwrap_or(4)
 }
 
+fn positive_env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn positive_env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn default_sql_default_timeout() -> std::time::Duration {
+    std::time::Duration::from_millis(positive_env_u64("MONGRELDB_SQL_DEFAULT_TIMEOUT_MS", 30_000))
+}
+
+fn default_sql_max_timeout() -> std::time::Duration {
+    std::time::Duration::from_millis(positive_env_u64("MONGRELDB_SQL_MAX_TIMEOUT_MS", 300_000))
+}
+
+fn default_sql_max_concurrent() -> usize {
+    positive_env_usize(
+        "MONGRELDB_SQL_MAX_CONCURRENT",
+        std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(4),
+    )
+}
+
+fn default_sql_max_active_queries() -> usize {
+    positive_env_usize("MONGRELDB_SQL_MAX_ACTIVE_QUERIES", 1_024)
+}
+
+fn default_sql_finished_query_ttl() -> std::time::Duration {
+    std::time::Duration::from_secs(positive_env_u64(
+        "MONGRELDB_SQL_FINISHED_QUERY_TTL_SECS",
+        60,
+    ))
+}
+
+fn default_sql_cancel_grace() -> std::time::Duration {
+    std::time::Duration::from_millis(positive_env_u64("MONGRELDB_SQL_CANCEL_GRACE_MS", 1_000))
+}
+
 /// The principal a request is attributed to, for session ownership: a resolved
 /// user principal wins; otherwise `token` when token auth is active; else
 /// `anonymous` (no auth configured).
@@ -851,13 +984,16 @@ async fn create_session(
     State(state): State<Arc<AppState>>,
     OptionalPrincipal(principal): OptionalPrincipal,
 ) -> Response {
+    if !state.accepting_sql.load(Ordering::Acquire) {
+        return (StatusCode::SERVICE_UNAVAILABLE, "server is shutting down").into_response();
+    }
     let owner = request_owner(&state, &principal);
     let session = match MongrelSession::open_with_external_modules_as(
         Arc::clone(&state.db),
         state.external_modules.iter().cloned(),
         request_principal(&state, &principal),
     ) {
-        Ok(s) => s,
+        Ok(session) => session.with_query_registry(Arc::clone(&state.query_registry)),
         Err(e) => return (status_for_query_error(&e), e.to_string()).into_response(),
     };
     match state.sessions.create(session, owner.clone()) {
@@ -881,7 +1017,17 @@ async fn close_session(
     Path(id): Path<String>,
 ) -> Response {
     let owner = request_owner(&state, &principal);
-    if state.sessions.close(&id, &owner) {
+    if let Some(entry) = state.sessions.take_for_close(&id, &owner) {
+        entry
+            .session
+            .query_registry()
+            .cancel_session(&id, CancellationReason::SessionClosed);
+        let deadline = tokio::time::Instant::now() + state.sql_cancel_grace;
+        while entry.session.query_registry().active_for_session(&id) > 0
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
         state.audit.record(owner, "session.close", "session closed");
         StatusCode::OK.into_response()
     } else {
@@ -958,6 +1104,10 @@ fn render_sql_literal(v: &serde_json::Value) -> Result<String, String> {
 struct PrepareRequest {
     name: String,
     sql: String,
+    #[serde(default)]
+    query_id: Option<QueryId>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
 }
 
 /// `POST /sessions/{id}/prepare` — parse+plan `sql` once and store it under
@@ -967,8 +1117,12 @@ async fn prepare_statement(
     State(state): State<Arc<AppState>>,
     OptionalPrincipal(principal): OptionalPrincipal,
     Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<PrepareRequest>,
 ) -> Response {
+    if !state.accepting_sql.load(Ordering::Acquire) {
+        return (StatusCode::SERVICE_UNAVAILABLE, "server is shutting down").into_response();
+    }
     if let Err(msg) = validate_stmt_name(&req.name) {
         return (StatusCode::BAD_REQUEST, msg).into_response();
     }
@@ -983,15 +1137,50 @@ async fn prepare_statement(
         )
             .into_response();
     };
-    let _guard = entry.lock.lock().await;
+    let (options, query_id) = match resolve_query_options(
+        &state,
+        &headers,
+        req.query_id,
+        req.timeout_ms,
+        owner,
+        Some(id),
+    ) {
+        Ok(options) => options,
+        Err(response) => return *response,
+    };
+    let query = match entry.session.register_query(options) {
+        Ok(query) => query,
+        Err(error) => return query_error_response(&error, Some(query_id)),
+    };
+    let registration = RegisteredQueryGuard::new(query);
+    let _sql_permit = match acquire_sql_permit(&state, &entry.session, registration.query()).await {
+        Ok(permit) => permit,
+        Err(error) => return query_error_response(&error, Some(query_id)),
+    };
+    let _guard = tokio::select! {
+        guard = entry.lock.lock() => guard,
+        _ = registration.query().control().cancelled() => {
+            return query_error_response(
+                &registration.query().checkpoint().unwrap_err(),
+                Some(query_id),
+            );
+        }
+    };
     if entry.is_closed() {
-        return (StatusCode::NOT_FOUND, "session no longer available").into_response();
+        return with_query_id(
+            (StatusCode::NOT_FOUND, "session no longer available").into_response(),
+            query_id,
+        );
     }
     entry.touch();
     let sql = format!("PREPARE {} AS {}", req.name, req.sql);
-    match entry.session.run(&sql).await {
-        Ok(_) => Json(json!({ "prepared": req.name })).into_response(),
-        Err(e) => (status_for_query_error(&e), e.to_string()).into_response(),
+    let query = registration.into_query();
+    match entry.session.run_with_query(&sql, query).await {
+        Ok(_) => with_query_id(
+            Json(json!({ "prepared": req.name })).into_response(),
+            query_id,
+        ),
+        Err(error) => query_error_response(&error, Some(query_id)),
     }
 }
 
@@ -1001,6 +1190,10 @@ struct ExecuteRequest {
     params: Vec<serde_json::Value>,
     #[serde(default)]
     format: Option<String>,
+    #[serde(default)]
+    query_id: Option<QueryId>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
 }
 
 /// `POST /sessions/{id}/execute` — run a previously-prepared statement with
@@ -1010,8 +1203,12 @@ async fn execute_statement(
     State(state): State<Arc<AppState>>,
     OptionalPrincipal(principal): OptionalPrincipal,
     Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<ExecuteRequest>,
 ) -> Response {
+    if !state.accepting_sql.load(Ordering::Acquire) {
+        return (StatusCode::SERVICE_UNAVAILABLE, "server is shutting down").into_response();
+    }
     if let Err(msg) = validate_stmt_name(&req.name) {
         return (StatusCode::BAD_REQUEST, msg).into_response();
     }
@@ -1023,9 +1220,40 @@ async fn execute_statement(
         )
             .into_response();
     };
-    let _guard = entry.lock.lock().await;
+    let (options, query_id) = match resolve_query_options(
+        &state,
+        &headers,
+        req.query_id,
+        req.timeout_ms,
+        owner,
+        Some(id),
+    ) {
+        Ok(options) => options,
+        Err(response) => return *response,
+    };
+    let query = match entry.session.register_query(options) {
+        Ok(query) => query,
+        Err(error) => return query_error_response(&error, Some(query_id)),
+    };
+    let registration = RegisteredQueryGuard::new(query);
+    let _sql_permit = match acquire_sql_permit(&state, &entry.session, registration.query()).await {
+        Ok(permit) => permit,
+        Err(error) => return query_error_response(&error, Some(query_id)),
+    };
+    let _guard = tokio::select! {
+        guard = entry.lock.lock() => guard,
+        _ = registration.query().control().cancelled() => {
+            return query_error_response(
+                &registration.query().checkpoint().unwrap_err(),
+                Some(query_id),
+            );
+        }
+    };
     if entry.is_closed() {
-        return (StatusCode::NOT_FOUND, "session no longer available").into_response();
+        return with_query_id(
+            (StatusCode::NOT_FOUND, "session no longer available").into_response(),
+            query_id,
+        );
     }
     entry.touch();
     state.metrics.inc_sql_queries();
@@ -1044,15 +1272,17 @@ async fn execute_statement(
     let sql = format!("EXECUTE {}({})", req.name, literals.join(", "));
     let start = std::time::Instant::now();
     let result = if req.format.as_deref() == Some("arrow-stream") {
+        let query = registration.into_query();
         entry
             .session
-            .run_stream(&sql)
+            .run_stream_with_query(&sql, query)
             .await
             .map(sql_arrow_stream_response)
     } else {
+        let query = registration.into_query();
         entry
             .session
-            .run(&sql)
+            .run_with_query(&sql, query)
             .await
             .map(|batches| dispatch_buffered_sql_format(req.format.as_deref(), &batches))
     };
@@ -1066,7 +1296,7 @@ async fn execute_statement(
         );
     }
     match result {
-        Ok(response) => response,
+        Ok(response) => with_query_id(response, query_id),
         Err(e) => {
             state.metrics.inc_sql_errors();
             // A reference to an unprepared/unknown statement is a client error.
@@ -1076,7 +1306,14 @@ async fn execute_statement(
             } else {
                 status_for_query_error(&e)
             };
-            (status, format!("{msg} ({}µs)", elapsed.as_micros())).into_response()
+            if status == status_for_query_error(&e) {
+                query_error_response(&e, Some(query_id))
+            } else {
+                with_query_id(
+                    (status, format!("{msg} ({}µs)", elapsed.as_micros())).into_response(),
+                    query_id,
+                )
+            }
         }
     }
 }
@@ -1461,6 +1698,265 @@ struct SqlRequest {
     /// `"arrow"` for Arrow IPC file bytes.
     #[serde(default)]
     format: Option<String>,
+    /// Body values take precedence over the equivalent convenience headers.
+    #[serde(default)]
+    query_id: Option<QueryId>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+fn query_error_response(
+    error: &mongreldb_query::MongrelQueryError,
+    query_id: Option<QueryId>,
+) -> Response {
+    use mongreldb_query::MongrelQueryError;
+    let (code, id) = match error {
+        MongrelQueryError::QueryCancelled { query_id, .. } => ("QUERY_CANCELLED", Some(*query_id)),
+        MongrelQueryError::DeadlineExceeded { query_id, .. } => {
+            ("DEADLINE_EXCEEDED", Some(*query_id))
+        }
+        MongrelQueryError::QueryIdConflict { query_id } => ("QUERY_ID_CONFLICT", Some(*query_id)),
+        MongrelQueryError::QueryRegistryFull => ("QUERY_REGISTRY_FULL", query_id),
+        MongrelQueryError::TransactionAborted => ("TRANSACTION_ABORTED", query_id),
+        MongrelQueryError::CommitOutcome { query_id, .. } => ("COMMIT_OUTCOME", Some(*query_id)),
+        _ => ("QUERY_FAILED", query_id),
+    };
+    let mut response = (
+        status_for_query_error(error),
+        Json(json!({
+            "status": "aborted",
+            "error": {
+                "code": code,
+                "message": error.to_string(),
+                "query_id": id.map(|value| value.to_string()),
+            }
+        })),
+    )
+        .into_response();
+    if let Some(id) = id {
+        add_query_id_header(&mut response, id);
+    }
+    response
+}
+
+fn add_query_id_header(response: &mut Response, query_id: QueryId) {
+    if let Ok(value) = axum::http::HeaderValue::from_str(&query_id.to_string()) {
+        response.headers_mut().insert("x-mongreldb-query-id", value);
+    }
+}
+
+fn with_query_id(mut response: Response, query_id: QueryId) -> Response {
+    add_query_id_header(&mut response, query_id);
+    response
+}
+
+fn bad_query_control_request(message: impl Into<String>, query_id: Option<QueryId>) -> Response {
+    let mut response = (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "status": "aborted",
+            "error": {
+                "code": "INVALID_QUERY_OPTIONS",
+                "message": message.into(),
+                "query_id": query_id.map(|value| value.to_string()),
+            }
+        })),
+    )
+        .into_response();
+    if let Some(query_id) = query_id {
+        add_query_id_header(&mut response, query_id);
+    }
+    response
+}
+
+fn resolve_query_options(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    body_query_id: Option<QueryId>,
+    body_timeout_ms: Option<u64>,
+    owner: String,
+    session_id: Option<String>,
+) -> std::result::Result<(SqlQueryOptions, QueryId), Box<Response>> {
+    let query_id = match body_query_id {
+        Some(query_id) => query_id,
+        None => match headers.get("x-mongreldb-query-id") {
+            Some(value) => {
+                let value = value.to_str().map_err(|_| {
+                    Box::new(bad_query_control_request(
+                        "X-MongrelDB-Query-ID is not valid text",
+                        None,
+                    ))
+                })?;
+                value
+                    .parse()
+                    .map_err(|error: mongreldb_query::MongrelQueryError| {
+                        Box::new(bad_query_control_request(error.to_string(), None))
+                    })?
+            }
+            None => {
+                QueryId::random().map_err(|error| Box::new(query_error_response(&error, None)))?
+            }
+        },
+    };
+    let timeout_ms = match body_timeout_ms {
+        Some(timeout_ms) => timeout_ms,
+        None => match headers.get("x-mongreldb-timeout-ms") {
+            Some(value) => value
+                .to_str()
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or_else(|| {
+                    Box::new(bad_query_control_request(
+                        "X-MongrelDB-Timeout-Ms must be a positive integer",
+                        Some(query_id),
+                    ))
+                })?,
+            None => state
+                .sql_default_timeout
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+        },
+    };
+    if timeout_ms == 0 {
+        return Err(Box::new(bad_query_control_request(
+            "timeout_ms must be positive",
+            Some(query_id),
+        )));
+    }
+    let timeout = std::time::Duration::from_millis(timeout_ms);
+    if timeout > state.sql_max_timeout {
+        return Err(Box::new(bad_query_control_request(
+            format!(
+                "timeout_ms exceeds server maximum of {}",
+                state.sql_max_timeout.as_millis()
+            ),
+            Some(query_id),
+        )));
+    }
+    Ok((
+        SqlQueryOptions {
+            query_id: Some(query_id),
+            timeout: Some(timeout),
+            owner: Some(owner),
+            session_id,
+            parent_control: None,
+        },
+        query_id,
+    ))
+}
+
+async fn acquire_sql_permit(
+    state: &AppState,
+    session: &MongrelSession,
+    query: &RegisteredSqlQuery,
+) -> std::result::Result<tokio::sync::OwnedSemaphorePermit, mongreldb_query::MongrelQueryError> {
+    session.fire_test_hook(mongreldb_query::SqlTestHookPoint::WaitingForSqlPermit);
+    tokio::select! {
+        permit = Arc::clone(&state.sql_semaphore).acquire_owned() => permit.map_err(|_| {
+            mongreldb_query::MongrelQueryError::InvalidQueryState(
+                "SQL admission semaphore closed".into(),
+            )
+        }),
+        _ = query.control().cancelled() => Err(query.checkpoint().unwrap_err()),
+    }
+}
+
+fn caller_may_manage_query(
+    state: &AppState,
+    principal: &Option<mongreldb_core::Principal>,
+    owner: Option<&str>,
+) -> bool {
+    request_principal(state, principal).is_some_and(|principal| principal.is_admin)
+        || owner == Some(request_owner(state, principal).as_str())
+}
+
+fn query_phase_name(phase: SqlQueryPhase) -> &'static str {
+    match phase {
+        SqlQueryPhase::Queued => "queued",
+        SqlQueryPhase::Planning => "planning",
+        SqlQueryPhase::Executing => "executing",
+        SqlQueryPhase::Streaming => "streaming",
+        SqlQueryPhase::Serializing => "serializing",
+        SqlQueryPhase::CommitCritical => "commit_critical",
+        SqlQueryPhase::Cancelling => "cancelling",
+        SqlQueryPhase::Completed => "completed",
+        SqlQueryPhase::Failed => "failed",
+        SqlQueryPhase::Cancelled => "cancelled",
+    }
+}
+
+async fn query_status(
+    State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
+    Path(query_id): Path<String>,
+) -> Response {
+    let Ok(query_id) = query_id.parse::<QueryId>() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(status) = state.query_registry.status(query_id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !caller_may_manage_query(&state, &principal, status.owner.as_deref()) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let response = Json(json!({
+        "query_id": query_id.to_string(),
+        "state": query_phase_name(status.phase),
+        "started_ms_ago": status.started_at.elapsed().as_millis(),
+        "deadline_ms_remaining": status.deadline.map(|deadline| {
+            deadline.saturating_duration_since(std::time::Instant::now()).as_millis()
+        }),
+        "session_id": status.session_id,
+        "operation": status.operation,
+        "committed": status.committed,
+        "completed_statements": status.completed_statements,
+        "statement_index": status.statement_index,
+    }))
+    .into_response();
+    with_query_id(response, query_id)
+}
+
+async fn cancel_query(
+    State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
+    Path(query_id): Path<String>,
+) -> Response {
+    let Ok(query_id) = query_id.parse::<QueryId>() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(status) = state.query_registry.status(query_id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !caller_may_manage_query(&state, &principal, status.owner.as_deref()) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let (http_status, body) = match state.query_registry.cancel(query_id) {
+        CancelOutcome::Accepted => (
+            StatusCode::ACCEPTED,
+            json!({ "query_id": query_id.to_string(), "state": "cancellation_requested" }),
+        ),
+        CancelOutcome::AlreadyCancelling => (
+            StatusCode::OK,
+            json!({ "query_id": query_id.to_string(), "state": "cancelling" }),
+        ),
+        CancelOutcome::TooLate => (
+            StatusCode::CONFLICT,
+            json!({
+                "query_id": query_id.to_string(),
+                "state": "commit_critical",
+                "error": {
+                    "code": "CANCEL_TOO_LATE",
+                    "message": "the query has entered its durable commit phase"
+                }
+            }),
+        ),
+        CancelOutcome::AlreadyFinished => (
+            StatusCode::OK,
+            json!({ "query_id": query_id.to_string(), "state": "finished" }),
+        ),
+        CancelOutcome::NotFound => return StatusCode::NOT_FOUND.into_response(),
+    };
+    with_query_id((http_status, Json(body)).into_response(), query_id)
 }
 
 async fn sql(
@@ -1469,6 +1965,12 @@ async fn sql(
     headers: axum::http::HeaderMap,
     Json(req): Json<SqlRequest>,
 ) -> Response {
+    if !state.accepting_sql.load(Ordering::Acquire) {
+        return (StatusCode::SERVICE_UNAVAILABLE, "server is shutting down").into_response();
+    }
+    if mongreldb_query::contains_boolean_ai_predicate(&req.sql) {
+        return remote_boolean_ai_error();
+    }
     // Session routing: an `X-Session-ID` header routes the request to a pooled
     // long-lived session, enabling cross-request `BEGIN`/`INSERT`/`COMMIT`
     // transactions. Without the header, a fresh ephemeral session is used
@@ -1478,8 +1980,8 @@ async fn sql(
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
 
+    let owner = request_owner(&state, &principal);
     if let Some(sid) = session_id {
-        let owner = request_owner(&state, &principal);
         let Some(entry) = state.sessions.get(&sid, &owner) else {
             return (
                 StatusCode::NOT_FOUND,
@@ -1487,26 +1989,76 @@ async fn sql(
             )
                 .into_response();
         };
-        // Serialize per-session access so two concurrent requests on the same
-        // token cannot interleave a transaction's staged writes.
-        let _guard = entry.lock.lock().await;
+        let (options, query_id) = match resolve_query_options(
+            &state,
+            &headers,
+            req.query_id,
+            req.timeout_ms,
+            owner,
+            Some(sid),
+        ) {
+            Ok(options) => options,
+            Err(response) => return *response,
+        };
+        let query = match entry.session.register_query(options) {
+            Ok(query) => query,
+            Err(error) => return query_error_response(&error, Some(query_id)),
+        };
+        let registration = RegisteredQueryGuard::new(query);
+        let _sql_permit =
+            match acquire_sql_permit(&state, &entry.session, registration.query()).await {
+                Ok(permit) => permit,
+                Err(error) => return query_error_response(&error, Some(query_id)),
+            };
+        // Registration and global admission happen before this session lock.
+        let _guard = tokio::select! {
+            guard = entry.lock.lock() => guard,
+            _ = registration.query().control().cancelled() => {
+                return query_error_response(
+                    &registration.query().checkpoint().unwrap_err(),
+                    Some(query_id),
+                );
+            }
+        };
         // Re-check closed: the session may have been closed/evicted between
         // get() and acquiring the lock.
         if entry.is_closed() {
             return (StatusCode::NOT_FOUND, "session no longer available").into_response();
         }
         entry.touch();
-        execute_sql(&state, &principal, &entry.session, req).await
+        let query = registration.into_query();
+        execute_sql(&state, &principal, &entry.session, req, query, query_id).await
     } else {
         let session = match MongrelSession::open_with_external_modules_as(
             Arc::clone(&state.db),
             state.external_modules.iter().cloned(),
             request_principal(&state, &principal),
         ) {
-            Ok(s) => s,
+            Ok(session) => session.with_query_registry(Arc::clone(&state.query_registry)),
             Err(e) => return (status_for_query_error(&e), e.to_string()).into_response(),
         };
-        execute_sql(&state, &principal, &session, req).await
+        let (options, query_id) = match resolve_query_options(
+            &state,
+            &headers,
+            req.query_id,
+            req.timeout_ms,
+            owner,
+            None,
+        ) {
+            Ok(options) => options,
+            Err(response) => return *response,
+        };
+        let query = match session.register_query(options) {
+            Ok(query) => query,
+            Err(error) => return query_error_response(&error, Some(query_id)),
+        };
+        let registration = RegisteredQueryGuard::new(query);
+        let _sql_permit = match acquire_sql_permit(&state, &session, registration.query()).await {
+            Ok(permit) => permit,
+            Err(error) => return query_error_response(&error, Some(query_id)),
+        };
+        let query = registration.into_query();
+        execute_sql(&state, &principal, &session, req, query, query_id).await
     }
 }
 
@@ -1519,10 +2071,9 @@ async fn execute_sql(
     principal: &Option<mongreldb_core::Principal>,
     session: &MongrelSession,
     req: SqlRequest,
+    query: RegisteredSqlQuery,
+    query_id: QueryId,
 ) -> Response {
-    if mongreldb_query::contains_boolean_ai_predicate(&req.sql) {
-        return remote_boolean_ai_error();
-    }
     state.metrics.inc_sql_queries();
     let audited = audit::is_audited_sql(&req.sql);
     let actor = request_owner(state, principal);
@@ -1534,12 +2085,12 @@ async fn execute_sql(
     // and works across awaits.
     let result = if req.format.as_deref() == Some("arrow-stream") {
         session
-            .run_stream(&req.sql)
+            .run_stream_with_query(&req.sql, query)
             .await
             .map(sql_arrow_stream_response)
     } else {
         session
-            .run(&req.sql)
+            .run_with_query(&req.sql, query)
             .await
             .map(|batches| dispatch_buffered_sql_format(req.format.as_deref(), &batches))
     };
@@ -1561,14 +2112,10 @@ async fn execute_sql(
         state.audit.record(actor, action, detail);
     }
     match result {
-        Ok(response) => response,
+        Ok(response) => with_query_id(response, query_id),
         Err(e) => {
             state.metrics.inc_sql_errors();
-            (
-                status_for_query_error(&e),
-                format!("{e} ({}µs)", elapsed.as_micros()),
-            )
-                .into_response()
+            query_error_response(&e, Some(query_id))
         }
     }
 }
