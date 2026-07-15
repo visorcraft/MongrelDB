@@ -51,6 +51,38 @@ fn current_unix_nanos() -> u64 {
         .as_nanos() as u64
 }
 
+fn incremental_aggregate_cache_key(
+    table: &str,
+    conditions: &[crate::query::Condition],
+    column: Option<u16>,
+    agg: crate::engine::NativeAgg,
+    principal: Option<&crate::auth::Principal>,
+    security_version: u64,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let projection = column.as_ref().map(std::slice::from_ref);
+    let query_key = crate::query::canonical_query_key(conditions, projection, security_version);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    table.hash(&mut hasher);
+    query_key.hash(&mut hasher);
+    match agg {
+        crate::engine::NativeAgg::Count => 0u8,
+        crate::engine::NativeAgg::Sum => 1,
+        crate::engine::NativeAgg::Min => 2,
+        crate::engine::NativeAgg::Max => 3,
+        crate::engine::NativeAgg::Avg => 4,
+    }
+    .hash(&mut hasher);
+    if let Some(principal) = principal {
+        principal.username.hash(&mut hasher);
+        principal.is_admin.hash(&mut hasher);
+        let mut roles = principal.roles.clone();
+        roles.sort_unstable();
+        roles.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 fn read_history_retention(root: &Path, current_epoch: Epoch) -> Result<(u64, Epoch)> {
     let path = root.join(META_DIR).join(HISTORY_RETENTION_FILENAME);
     let text = match std::fs::read_to_string(path) {
@@ -2365,6 +2397,79 @@ impl Database {
         unreachable!()
     }
 
+    fn with_authorized_aggregate_table<T, F>(
+        &self,
+        table_name: &str,
+        columns: &[u16],
+        allow_table_security: bool,
+        mut aggregate: F,
+    ) -> Result<T>
+    where
+        F: FnMut(
+            &mut Table,
+            Option<&crate::security::CandidateAuthorization<'_>>,
+            Option<&crate::auth::Principal>,
+            u64,
+        ) -> Result<T>,
+    {
+        if self.principal.read().is_some() {
+            self.refresh_principal()?;
+        }
+        const RETRIES: usize = 3;
+        let handle = self.table(table_name)?;
+        for attempt in 0..RETRIES {
+            let (security, security_version, effective_principal) = {
+                let catalog = self.catalog.read();
+                (
+                    catalog.security.clone(),
+                    catalog.security_version,
+                    self.principal_for_authorized_read(&catalog, None, true)?,
+                )
+            };
+            self.require_columns_for(
+                table_name,
+                crate::auth::ColumnOperation::Select,
+                columns,
+                effective_principal.as_ref(),
+            )?;
+            if !allow_table_security && security.table_has_security(table_name) {
+                return Err(MongrelError::InvalidArgument(
+                    "incremental aggregate is unsupported while RLS or column masks are active"
+                        .into(),
+                ));
+            }
+            let result = {
+                let mut table = handle.lock();
+                let authorization = if security.rls_enabled(table_name) {
+                    Some(crate::security::CandidateAuthorization {
+                        table: table_name,
+                        security: &security,
+                        principal: effective_principal
+                            .as_ref()
+                            .ok_or(MongrelError::AuthRequired)?,
+                    })
+                } else {
+                    None
+                };
+                aggregate(
+                    &mut table,
+                    authorization.as_ref(),
+                    effective_principal.as_ref(),
+                    security_version,
+                )?
+            };
+            if self.catalog.read().security_version == security_version {
+                return Ok(result);
+            }
+            if attempt + 1 == RETRIES {
+                return Err(MongrelError::Conflict(
+                    "security policy changed during aggregate read".into(),
+                ));
+            }
+        }
+        unreachable!()
+    }
+
     /// Scored-read authorization that evaluates RLS only for approximate
     /// candidates. This avoids a full-table policy scan on cache misses while
     /// preserving one table generation and security-version retry.
@@ -2622,6 +2727,73 @@ impl Database {
                     });
                 }
                 self.secure_rows_for(table_name, rows, principal)
+            },
+        )
+    }
+
+    /// Reservoir aggregate with column grants, RLS, masks, and security-version
+    /// retry applied at the database boundary.
+    pub fn approx_aggregate_for_current_principal(
+        &self,
+        table_name: &str,
+        conditions: &[crate::query::Condition],
+        column: Option<u16>,
+        agg: crate::engine::ApproxAgg,
+        z: f64,
+    ) -> Result<Option<crate::engine::ApproxResult>> {
+        if !z.is_finite() || z <= 0.0 {
+            return Err(MongrelError::InvalidArgument(
+                "z must be finite and > 0".into(),
+            ));
+        }
+        let mut columns = crate::query::condition_columns(conditions);
+        columns.extend(column);
+        columns.sort_unstable();
+        columns.dedup();
+        self.with_authorized_aggregate_table(
+            table_name,
+            &columns,
+            true,
+            |table, authorization, _, _| {
+                table.approx_aggregate_with_candidate_authorization(
+                    conditions,
+                    column,
+                    agg,
+                    z,
+                    authorization,
+                )
+            },
+        )
+    }
+
+    /// Incremental aggregate over an append-only table. Active RLS or masks are
+    /// rejected because the table-global delta cache cannot safely represent a
+    /// secured row universe.
+    pub fn incremental_aggregate_for_current_principal(
+        &self,
+        table_name: &str,
+        conditions: &[crate::query::Condition],
+        column: Option<u16>,
+        agg: crate::engine::NativeAgg,
+    ) -> Result<crate::engine::IncrementalAggResult> {
+        let mut columns = crate::query::condition_columns(conditions);
+        columns.extend(column);
+        columns.sort_unstable();
+        columns.dedup();
+        self.with_authorized_aggregate_table(
+            table_name,
+            &columns,
+            false,
+            |table, _, principal, security_version| {
+                let cache_key = incremental_aggregate_cache_key(
+                    table_name,
+                    conditions,
+                    column,
+                    agg,
+                    principal,
+                    security_version,
+                );
+                table.aggregate_incremental(cache_key, conditions, column, agg)
             },
         )
     }

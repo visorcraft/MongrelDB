@@ -1,7 +1,10 @@
 //! Phase 8.3: incremental aggregate-cache maintenance.
 
 use mongreldb_core::schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
-use mongreldb_core::{AggState, Condition, NativeAgg, Table, Value};
+use mongreldb_core::{
+    AggState, Condition, Database, NativeAgg, Permission, PolicyCommand, RowPolicy,
+    SecurityCatalog, SecurityExpr, Table, Value,
+};
 use tempfile::tempdir;
 
 fn schema() -> Schema {
@@ -52,6 +55,112 @@ fn put_range(db: &mut Table, lo: i64, hi: i64) {
         ])
         .unwrap();
     }
+}
+
+fn put_range_database(db: &Database, lo: i64, hi: i64) {
+    let mut transaction = db.begin();
+    for i in lo..hi {
+        transaction
+            .put(
+                "items",
+                vec![
+                    (1, Value::Int64(i)),
+                    (2, Value::Int64(i % 10)),
+                    (3, Value::Int64(i * 2 + 1)),
+                ],
+            )
+            .unwrap();
+    }
+    transaction.commit().unwrap();
+    db.table("items").unwrap().lock().flush().unwrap();
+}
+
+#[test]
+fn database_wrapper_reuses_incremental_delta_cache() {
+    let dir = tempdir().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.create_table("items", schema()).unwrap();
+    db.table("items")
+        .unwrap()
+        .lock()
+        .set_mutable_run_spill_bytes(1);
+    put_range_database(&db, 0, 100);
+
+    let cold = db
+        .incremental_aggregate_for_current_principal("items", &[], Some(3), NativeAgg::Sum)
+        .unwrap();
+    assert!(!cold.incremental);
+    assert_eq!(cold.state.point(), Some(10_000.0));
+
+    put_range_database(&db, 100, 150);
+    let warm = db
+        .incremental_aggregate_for_current_principal("items", &[], Some(3), NativeAgg::Sum)
+        .unwrap();
+    assert!(warm.incremental);
+    assert_eq!(warm.delta_rows, 50);
+    assert_eq!(warm.state.point(), Some(22_500.0));
+}
+
+#[test]
+fn database_wrapper_invalidates_on_security_change_and_rejects_rls() {
+    let dir = tempdir().unwrap();
+    let admin = Database::create_with_credentials(dir.path(), "admin", "pw").unwrap();
+    admin.create_table("items", schema()).unwrap();
+    admin
+        .table("items")
+        .unwrap()
+        .lock()
+        .set_mutable_run_spill_bytes(1);
+    put_range_database(&admin, 0, 100);
+    admin.create_user("alice", "pw").unwrap();
+    admin.create_role("reader").unwrap();
+    admin
+        .grant_permission(
+            "reader",
+            Permission::Select {
+                table: "items".into(),
+            },
+        )
+        .unwrap();
+    admin.grant_role("alice", "reader").unwrap();
+    let alice = Database::open_with_credentials(dir.path(), "alice", "pw").unwrap();
+
+    let cold = alice
+        .incremental_aggregate_for_current_principal("items", &[], None, NativeAgg::Count)
+        .unwrap();
+    assert!(!cold.incremental);
+    let warm = alice
+        .incremental_aggregate_for_current_principal("items", &[], None, NativeAgg::Count)
+        .unwrap();
+    assert!(warm.incremental);
+
+    admin.create_role("extra").unwrap();
+    admin.grant_role("alice", "extra").unwrap();
+    let invalidated = alice
+        .incremental_aggregate_for_current_principal("items", &[], None, NativeAgg::Count)
+        .unwrap();
+    assert!(!invalidated.incremental);
+
+    admin
+        .set_security_catalog(SecurityCatalog {
+            rls_tables: vec!["items".into()],
+            policies: vec![RowPolicy {
+                name: "visible".into(),
+                table: "items".into(),
+                command: PolicyCommand::Select,
+                subjects: vec!["public".into()],
+                permissive: true,
+                using: Some(SecurityExpr::True),
+                with_check: None,
+            }],
+            masks: Vec::new(),
+        })
+        .unwrap();
+    assert!(matches!(
+        alice.incremental_aggregate_for_current_principal("items", &[], None, NativeAgg::Count),
+        Err(mongreldb_core::MongrelError::InvalidArgument(message))
+            if message.contains("unsupported while RLS or column masks are active")
+    ));
 }
 
 #[test]

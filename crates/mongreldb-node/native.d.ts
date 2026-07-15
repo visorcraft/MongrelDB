@@ -517,15 +517,13 @@ export declare class TableHandle {
    */
   aggregateExact(agg: string, columnId: number | undefined | null, conditions: Array<ConditionSpec>): string
   /**
-   * Security-preserving exact fallback for the historical approximate
-   * aggregate API. The response reports `mode: "exact_fallback"`; `z` is
-   * validated for compatibility. No confidence interval is reported.
+   * Security-preserving reservoir aggregate with a z-controlled confidence
+   * interval. The response reports `mode: "approximate"`.
    */
   approxAggregate(agg: string, columnId: number | undefined | null, z: number): string | null
   /**
-   * Security-preserving exact fallback for the historical incremental
-   * aggregate API. The response reports `mode: "exact_fallback"` and
-   * `incremental: false`; every matching row is recomputed.
+   * Security-preserving incremental aggregate for append-only tables. Active
+   * RLS or masks return an explicit unsupported error.
    */
   incrementalAggregate(agg: string, columnId: number | undefined | null, conditions: Array<ConditionSpec>): string
   /**

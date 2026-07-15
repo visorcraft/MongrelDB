@@ -516,13 +516,13 @@ console.log('smoke: full-range Int64 / BigInt ✓');
   assert.equal(exact.value, 1);
   const approximate = JSON.parse(aliceDocs.approxAggregate('count', null, 1.96));
   assert.equal(approximate.point, 1);
-  assert.equal(approximate.mode, 'exact_fallback');
-  assert.equal('ci_low' in approximate, false);
-  assert.equal('ci_high' in approximate, false);
-  const incremental = JSON.parse(aliceDocs.incrementalAggregate('count', null, []));
-  assert.equal(incremental.value, 1);
-  assert.equal(incremental.mode, 'exact_fallback');
-  assert.equal(incremental.incremental, false);
+  assert.equal(approximate.mode, 'approximate');
+  assert.equal('ci_low' in approximate, true);
+  assert.equal('ci_high' in approximate, true);
+  assert.throws(
+    () => aliceDocs.incrementalAggregate('count', null, []),
+    /unsupported while RLS or column masks are active/,
+  );
   assert.equal(aliceDocs.rowsAtEpoch(alice.snapshotEpoch()).length, 1);
   assert.throws(() => aliceDocs.bulkLoadTyped([]), /PermissionDenied|permission denied/);
   assert.throws(() => aliceDocs.truncate(), /PermissionDenied|permission denied/);
@@ -563,6 +563,47 @@ console.log('smoke: full-range Int64 / BigInt ✓');
   rmSync(dir, { recursive: true });
 }
 console.log('smoke: credentialed native RLS ✓');
+
+// ── Native approximate and incremental aggregate modes ───────────────────
+{
+  const dir = makeTempDir();
+  const db = Database.withPath(dir);
+  db.createTable('items', {
+    columns: [
+      { id: 1, name: 'id', ty: ColumnType.Int64, primaryKey: true, nullable: false },
+      { id: 2, name: 'value', ty: ColumnType.Int64, primaryKey: false, nullable: false },
+    ],
+    indexes: [],
+  });
+  db.setTableMutableRunSpillBytes('items', 1);
+  const items = db.getTable('items');
+  items.putBatch(Array.from({ length: 10 }, (_, id) => [
+    { columnId: 1, int64: BigInt(id) },
+    { columnId: 2, int64: BigInt(id * 2 + 1) },
+  ]));
+  items.flush();
+  const approximate = JSON.parse(items.approxAggregate('sum', 2, 1.96));
+  assert.equal(approximate.mode, 'approximate');
+  assert.equal(approximate.point, 100);
+  const cold = JSON.parse(items.incrementalAggregate('sum', 2, []));
+  assert.equal(cold.mode, 'incremental');
+  assert.equal(cold.incremental, false);
+  items.putBatch(Array.from({ length: 5 }, (_, offset) => {
+    const id = offset + 10;
+    return [
+      { columnId: 1, int64: BigInt(id) },
+      { columnId: 2, int64: BigInt(id * 2 + 1) },
+    ];
+  }));
+  items.flush();
+  const warm = JSON.parse(items.incrementalAggregate('sum', 2, []));
+  assert.equal(warm.incremental, true);
+  assert.equal(warm.delta_rows, 5);
+  assert.equal(warm.value, 225);
+  db.close();
+  rmSync(dir, { recursive: true });
+}
+console.log('smoke: native aggregate modes ✓');
 
 // ── Typed primary-key get/delete ───────────────────────────────────────────
 {

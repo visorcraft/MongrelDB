@@ -6402,6 +6402,10 @@ impl Table {
         self.data_generation
     }
 
+    pub(crate) fn bump_data_generation(&mut self) {
+        self.data_generation = self.data_generation.wrapping_add(1);
+    }
+
     pub(crate) fn table_id(&self) -> u64 {
         self.table_id
     }
@@ -8488,6 +8492,19 @@ impl Table {
         agg: ApproxAgg,
         z: f64,
     ) -> Result<Option<ApproxResult>> {
+        self.approx_aggregate_with_candidate_authorization(conditions, column, agg, z, None)
+    }
+
+    /// Security-aware approximate aggregate. RLS is evaluated only for the
+    /// reservoir candidates, and column masks are applied before aggregation.
+    pub fn approx_aggregate_with_candidate_authorization(
+        &mut self,
+        conditions: &[crate::query::Condition],
+        column: Option<u16>,
+        agg: ApproxAgg,
+        z: f64,
+        authorization: Option<&crate::security::CandidateAuthorization<'_>>,
+    ) -> Result<Option<ApproxResult>> {
         use crate::query::Condition;
         self.ensure_reservoir_complete()?;
         let snapshot = self.snapshot();
@@ -8502,6 +8519,12 @@ impl Table {
         if s == 0 {
             return Ok(None);
         }
+        let authorized = authorization
+            .map(|authorization| {
+                let candidates = live_sample.iter().map(|row| row.row_id).collect::<Vec<_>>();
+                self.policy_allowed_candidate_ids(&candidates, snapshot, authorization, None)
+            })
+            .transpose()?;
 
         // Pre-resolve Ann/Sparse conditions (index-defined predicates) to row-id
         // sets; the per-row predicates below are evaluated exactly.
@@ -8525,6 +8548,12 @@ impl Table {
         };
         let mut passing_vals: Vec<f64> = Vec::with_capacity(s);
         for r in &live_sample {
+            if authorized
+                .as_ref()
+                .is_some_and(|authorized| !authorized.contains(&r.row_id))
+            {
+                continue;
+            }
             // Exact per-row predicate evaluation.
             if !conditions
                 .iter()
@@ -8537,7 +8566,20 @@ impl Table {
                 continue;
             }
             if let Some(cid) = cid {
-                if let Some(v) = as_f64(r.columns.get(&cid)) {
+                let mut cells = r
+                    .columns
+                    .get(&cid)
+                    .cloned()
+                    .map(|value| vec![(cid, value)])
+                    .unwrap_or_default();
+                if let Some(authorization) = authorization {
+                    authorization.security.apply_masks_to_cells(
+                        authorization.table,
+                        &mut cells,
+                        authorization.principal,
+                    );
+                }
+                if let Some(v) = as_f64(cells.first().map(|(_, value)| value)) {
                     passing_vals.push(v);
                 } // nulls ⇒ excluded (matching SQL AVG/SUM null semantics)
             } else {
@@ -8564,12 +8606,31 @@ impl Table {
                 let y: Vec<f64> = live_sample
                     .iter()
                     .map(|r| {
-                        let passes_row = conditions
-                            .iter()
-                            .all(|c| condition_matches_row(c, r, &self.schema))
+                        let passes_row = authorized
+                            .as_ref()
+                            .map_or(true, |authorized| authorized.contains(&r.row_id))
+                            && conditions
+                                .iter()
+                                .all(|c| condition_matches_row(c, r, &self.schema))
                             && index_sets.iter().all(|set| set.contains(r.row_id.0));
                         if passes_row {
-                            cid.and_then(|c| as_f64(r.columns.get(&c))).unwrap_or(0.0)
+                            cid.and_then(|cid| {
+                                let mut cells = r
+                                    .columns
+                                    .get(&cid)
+                                    .cloned()
+                                    .map(|value| vec![(cid, value)])
+                                    .unwrap_or_default();
+                                if let Some(authorization) = authorization {
+                                    authorization.security.apply_masks_to_cells(
+                                        authorization.table,
+                                        &mut cells,
+                                        authorization.principal,
+                                    );
+                                }
+                                as_f64(cells.first().map(|(_, value)| value))
+                            })
+                            .unwrap_or(0.0)
                         } else {
                             0.0
                         }

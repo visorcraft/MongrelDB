@@ -15,7 +15,21 @@ MONGRELDB_AI_CONCURRENCY_ROWS=10000 \
 MONGRELDB_AI_CONCURRENCY_OPS=25 \
 cargo run -p mongreldb-core --release --all-features --example ai_concurrency_bench \
   > ai-concurrency.json
+
+scripts/run-ai-generation-matrix.sh target/ai-generation-matrix
 ```
+
+The matrix runner covers 100k and 1M rows, 128/768/1536-dimensional
+embeddings, short and long scored reads, 1/4/16/32 readers, 0/1/4 writers,
+and retained read generations lasting 0/5/30/60 seconds. Each report includes
+query and commit p50/p95/p99, throughput, peak RSS, clone bytes/write, writer
+wait time, and explicit failure status. It also runs the >250,000-row ANN cap
+memory qualification with sub-1% RLS and exact reranking.
+
+Changing an embedding dimension is only allowed before stored versions exist.
+A table that can issue an ANN cursor already has stored embeddings, so the DDL
+is rejected without changing its generation. Add, drop, and ANN-option
+replacement tests cover successful AI-index schema changes between pages.
 
 Release qualification is strict and validates the emitted JSON:
 
@@ -59,10 +73,16 @@ large exports.
 NAPI historical reads evaluate the current principal and current security
 catalog against historical row values. Current RLS, column grants, and masks
 therefore apply. NAPI `aggregateExact` is exact over authorized rows.
-Compatibility methods `approxAggregate` and `incrementalAggregate` explicitly
-report `mode: "exact_fallback"`; the approximate fallback reports no confidence
-interval. NAPI and C writes use live-principal database transactions; RLS `USING`/`WITH CHECK` and
+`approxAggregate` uses the bounded reservoir and reports `mode: "approximate"`
+with a z-controlled confidence interval after grants, RLS, and masks.
+`incrementalAggregate` reports `mode: "incremental"` and reuses the append-only
+delta cache; it returns an explicit unsupported error while RLS or masks are
+active. NAPI and C writes use live-principal database transactions; RLS `USING`/`WITH CHECK` and
 column grants apply at commit. Typed NAPI bulk load is admin-only.
+
+On credentialless databases, `explain=true` is available because authorization
+is disabled. On credentialed databases, Admin is rechecked inside every scored
+read retry. Failed authorization responses never include the trace.
 
 The JSON report records git SHA, OS/architecture, corpus size, build time,
 base sorted-run bytes, per-index checkpoint payload bytes, p50/p95 latency, ANN graph recall against

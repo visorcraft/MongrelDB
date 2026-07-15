@@ -2933,6 +2933,12 @@ mod tests {
 
     #[test]
     fn cursor_v2_rejects_tampering_expiry_and_other_server_keys() {
+        fn tamper_part(token: &str, index: usize, replacement: &str) -> String {
+            let mut parts = token.split(':').collect::<Vec<_>>();
+            parts[index] = replacement;
+            parts.join(":")
+        }
+
         let key = [7; 32];
         let stamp = mongreldb_core::AuthorizedReadStamp {
             table_id: 11,
@@ -2951,15 +2957,37 @@ mod tests {
             &key,
         );
         assert_eq!(parse_kit_query_cursor(&token, &key).unwrap().row_id, 18);
+        for tampered in [
+            tamper_part(&token, 1, "19"),
+            tamper_part(&token, 2, "20"),
+            tamper_part(&token, 12, &cursor_hex(&[17; 32])),
+        ] {
+            assert!(matches!(
+                parse_kit_query_cursor(&tampered, &key),
+                Err(MongrelError::InvalidArgument(_))
+            ));
+        }
 
-        let mut tampered = token.into_bytes();
-        let index = tampered.iter().position(|byte| *byte == b'8').unwrap();
-        tampered[index] = b'9';
-        let tampered = String::from_utf8(tampered).unwrap();
-        assert!(matches!(
-            parse_kit_query_cursor(&tampered, &key),
-            Err(MongrelError::InvalidArgument(_))
-        ));
+        let search_token = format_kit_search_cursor(
+            KitSearchCursor {
+                epoch: 15,
+                final_score: 0.75,
+                row_id: 18,
+                binding,
+            },
+            &key,
+        );
+        for tampered in [
+            tamper_part(&search_token, 1, "19"),
+            tamper_part(&search_token, 2, "3fe0000000000000"),
+            tamper_part(&search_token, 3, "20"),
+            tamper_part(&search_token, 13, &cursor_hex(&[17; 32])),
+        ] {
+            assert!(matches!(
+                parse_kit_search_cursor(&tampered, &key),
+                Err(MongrelError::InvalidArgument(_))
+            ));
+        }
         assert!(matches!(
             parse_kit_query_cursor(
                 &format_kit_query_cursor(
@@ -2993,8 +3021,29 @@ mod tests {
             parse_kit_query_cursor(&expired, &key),
             Err(MongrelError::CursorExpired)
         ));
+        let expired_search = format_kit_search_cursor(
+            KitSearchCursor {
+                epoch: 15,
+                final_score: 0.75,
+                row_id: 18,
+                binding: KitCursorBinding {
+                    issued_at_nanos: now - CURSOR_TTL_NANOS,
+                    expires_at_nanos: now - 1,
+                    ..binding
+                },
+            },
+            &key,
+        );
+        assert!(matches!(
+            parse_kit_search_cursor(&expired_search, &key),
+            Err(MongrelError::CursorExpired)
+        ));
         assert!(matches!(
             parse_kit_query_cursor("q1:old", &key),
+            Err(MongrelError::CursorStale(_))
+        ));
+        assert!(matches!(
+            parse_kit_search_cursor("s1:old", &key),
             Err(MongrelError::CursorStale(_))
         ));
     }

@@ -9,10 +9,10 @@ use mongreldb_core::auth::Permission;
 use mongreldb_core::{
     query::{AnnRerankRequest, Condition, Query, VectorMetric},
     schema::*,
-    ColumnMask, ColumnOperation, Database, MaskStrategy, MongrelError, PolicyCommand,
-    ReadAuthorization, RowPolicy, SecurityCatalog, SecurityExpr, StoredTrigger, TriggerCell,
-    TriggerDefinition, TriggerEvent, TriggerProgram, TriggerStep, TriggerTarget, TriggerTiming,
-    TriggerValue, Value,
+    ApproxAgg, ColumnMask, ColumnOperation, Database, MaskStrategy, MongrelError, NativeAgg,
+    PolicyCommand, ReadAuthorization, RowPolicy, SecurityCatalog, SecurityExpr, StoredTrigger,
+    TriggerCell, TriggerDefinition, TriggerEvent, TriggerProgram, TriggerStep, TriggerTarget,
+    TriggerTiming, TriggerValue, Value,
 };
 use tempfile::tempdir;
 
@@ -95,6 +95,13 @@ fn secure_native_wrappers_apply_rls_masks_and_live_revocation() {
                         flags: ColumnFlags::empty(),
                         default_value: None,
                     },
+                    ColumnDef {
+                        id: 5,
+                        name: "value".into(),
+                        ty: TypeId::Int64,
+                        flags: ColumnFlags::empty(),
+                        default_value: None,
+                    },
                 ],
                 indexes: vec![IndexDef {
                     name: "ann".into(),
@@ -116,6 +123,7 @@ fn secure_native_wrappers_apply_rls_masks_and_live_revocation() {
                 (2, Value::Bytes(b"alice".to_vec())),
                 (3, Value::Bytes(b"alice-secret".to_vec())),
                 (4, Value::Embedding(vec![0.9, -0.1])),
+                (5, Value::Int64(100)),
             ],
         )
         .unwrap();
@@ -128,6 +136,7 @@ fn secure_native_wrappers_apply_rls_masks_and_live_revocation() {
                     (2, Value::Bytes(b"bob".to_vec())),
                     (3, Value::Bytes(b"hidden".to_vec())),
                     (4, Value::Embedding(vec![-1.0, -1.0])),
+                    (5, Value::Int64(id)),
                 ],
             )
             .unwrap();
@@ -140,6 +149,7 @@ fn secure_native_wrappers_apply_rls_masks_and_live_revocation() {
                 (2, Value::Bytes(b"bob".to_vec())),
                 (3, Value::Bytes(b"bob-secret".to_vec())),
                 (4, Value::Embedding(vec![1.0, 0.0])),
+                (5, Value::Int64(200)),
             ],
         )
         .unwrap();
@@ -170,15 +180,24 @@ fn secure_native_wrappers_apply_rls_masks_and_live_revocation() {
                 using: Some(SecurityExpr::ColumnEqCurrentUser { column: 2 }),
                 with_check: None,
             }],
-            masks: vec![ColumnMask {
-                name: "redact_secret".into(),
-                table: "docs".into(),
-                column: 3,
-                strategy: MaskStrategy::Redact {
-                    replacement: "***".into(),
+            masks: vec![
+                ColumnMask {
+                    name: "redact_secret".into(),
+                    table: "docs".into(),
+                    column: 3,
+                    strategy: MaskStrategy::Redact {
+                        replacement: "***".into(),
+                    },
+                    exempt_subjects: vec!["admin".into()],
                 },
-                exempt_subjects: vec!["admin".into()],
-            }],
+                ColumnMask {
+                    name: "hide_value".into(),
+                    table: "docs".into(),
+                    column: 5,
+                    strategy: MaskStrategy::Null,
+                    exempt_subjects: vec!["admin".into()],
+                },
+            ],
         })
         .unwrap();
 
@@ -222,6 +241,55 @@ fn secure_native_wrappers_apply_rls_masks_and_live_revocation() {
     assert_eq!(reranked[0].row_id, rows[0].row_id);
     assert!(trace.rls_rows_evaluated < 10, "{trace:?}");
     assert_eq!(trace.rls_policy_columns_decoded, trace.rls_rows_evaluated);
+    let approximate = alice
+        .approx_aggregate_for_current_principal("docs", &[], None, ApproxAgg::Count, 1.96)
+        .unwrap()
+        .unwrap();
+    assert_eq!(approximate.point, 1.0);
+    assert_eq!(approximate.n_population, 10);
+    assert_eq!(approximate.n_sample_live, 10);
+    let masked_sum = alice
+        .approx_aggregate_for_current_principal("docs", &[], Some(5), ApproxAgg::Sum, 1.96)
+        .unwrap()
+        .unwrap();
+    assert_eq!(masked_sum.point, 0.0);
+    assert_eq!(masked_sum.n_passing, 0);
+    assert!(matches!(
+        alice.incremental_aggregate_for_current_principal(
+            "docs",
+            &[],
+            None,
+            NativeAgg::Count
+        ),
+        Err(MongrelError::InvalidArgument(message))
+            if message.contains("unsupported while RLS or column masks are active")
+    ));
+    admin
+        .revoke_permission(
+            "reader",
+            Permission::Select {
+                table: "docs".into(),
+            },
+        )
+        .unwrap();
+    admin
+        .grant_permission(
+            "reader",
+            Permission::SelectColumns {
+                table: "docs".into(),
+                columns: vec![
+                    "id".into(),
+                    "owner".into(),
+                    "secret".into(),
+                    "embedding".into(),
+                ],
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        alice.approx_aggregate_for_current_principal("docs", &[], Some(5), ApproxAgg::Sum, 1.96),
+        Err(MongrelError::PermissionDenied { .. })
+    ));
     assert_eq!(
         admin
             .query_for_current_principal("docs", &Query::new(), None)
@@ -233,6 +301,10 @@ fn secure_native_wrappers_apply_rls_masks_and_live_revocation() {
     admin.revoke_role("alice", "reader").unwrap();
     assert!(matches!(
         alice.query_for_current_principal("docs", &Query::new(), None),
+        Err(MongrelError::PermissionDenied { .. })
+    ));
+    assert!(matches!(
+        alice.approx_aggregate_for_current_principal("docs", &[], None, ApproxAgg::Count, 1.96),
         Err(MongrelError::PermissionDenied { .. })
     ));
 }
@@ -271,6 +343,48 @@ fn scored_retry_rechecks_live_column_permissions() {
             calls.set(calls.get() + 1);
             assert_eq!(principal.unwrap().username, "alice");
             admin.revoke_role("alice", "reader")?;
+            Ok(())
+        },
+    );
+    assert!(matches!(result, Err(MongrelError::PermissionDenied { .. })));
+    assert_eq!(calls.get(), 1);
+}
+
+#[test]
+fn scored_retry_rechecks_live_admin_role() {
+    let dir = tempdir().unwrap();
+    let admin = Database::create_with_credentials(dir.path(), "admin", "admin-pw").unwrap();
+    admin.create_table("docs", int_pk_schema()).unwrap();
+    admin.create_user("alice", "alice-pw").unwrap();
+    admin.create_role("operator").unwrap();
+    admin
+        .grant_permission(
+            "operator",
+            Permission::Select {
+                table: "docs".into(),
+            },
+        )
+        .unwrap();
+    admin
+        .grant_permission("operator", Permission::Admin)
+        .unwrap();
+    admin.grant_role("alice", "operator").unwrap();
+    let alice = admin.resolve_principal("alice").unwrap();
+    let calls = std::cell::Cell::new(0);
+    let result = admin.with_authorized_scored_read_context_at(
+        "docs",
+        Some(&alice),
+        true,
+        Some(&ReadAuthorization {
+            operation: ColumnOperation::Select,
+            columns: vec![1],
+            permissions: vec![Permission::Admin],
+        }),
+        None,
+        None,
+        |_, _, _, _| {
+            calls.set(calls.get() + 1);
+            admin.revoke_role("alice", "operator")?;
             Ok(())
         },
     );
@@ -318,6 +432,21 @@ fn scored_retry_rechecks_live_admin_permission() {
     );
     assert!(matches!(result, Err(MongrelError::PermissionDenied { .. })));
     assert_eq!(calls.get(), 1);
+    admin
+        .with_authorized_scored_read_context_at(
+            "docs",
+            Some(&alice),
+            true,
+            Some(&ReadAuthorization {
+                operation: ColumnOperation::Select,
+                columns: vec![1],
+                permissions: Vec::new(),
+            }),
+            None,
+            None,
+            |_, _, _, _| Ok(()),
+        )
+        .unwrap();
 }
 
 #[test]

@@ -2380,9 +2380,8 @@ impl TableHandle {
         .to_string())
     }
 
-    /// Security-preserving exact fallback for the historical approximate
-    /// aggregate API. The response reports `mode: "exact_fallback"`; `z` is
-    /// validated for compatibility. No confidence interval is reported.
+    /// Security-preserving reservoir aggregate with a z-controlled confidence
+    /// interval. The response reports `mode: "approximate"`.
     #[napi]
     pub fn approx_aggregate(
         &self,
@@ -2398,35 +2397,35 @@ impl TableHandle {
                 )))
             }
         }
-        if !z.is_finite() || z <= 0.0 {
-            return Err(napi::Error::new(
-                napi::Status::InvalidArg,
-                "z must be finite and > 0",
-            ));
-        }
         let cid = column_id.map(|c| c as u16);
-        let projection = cid.map(|column| vec![column]);
-        let rows = self
-            .db
-            .query_for_current_principal(&self.name, &Query::new(), projection.as_deref())
-            .map_err(to_napi)?;
-        let point = aggregate_rows_json(&rows, cid, &agg)?;
-        Ok(point.as_f64().map(|point| {
-            serde_json::json!({
-                "mode": "exact_fallback",
-                "requested_z": z,
-                "point": point,
-                "n_population": rows.len(),
-                "n_sample_live": rows.len(),
-                "n_passing": rows.len(),
+        let agg = match agg.as_str() {
+            "count" => mongreldb_core::ApproxAgg::Count,
+            "sum" => mongreldb_core::ApproxAgg::Sum,
+            "avg" => mongreldb_core::ApproxAgg::Avg,
+            _ => unreachable!(),
+        };
+        self.db
+            .approx_aggregate_for_current_principal(&self.name, &[], cid, agg, z)
+            .map_err(to_napi)
+            .map(|result| {
+                result.map(|result| {
+                    serde_json::json!({
+                        "mode": "approximate",
+                        "z": z,
+                        "point": result.point,
+                        "ci_low": result.ci_low,
+                        "ci_high": result.ci_high,
+                        "n_population": result.n_population,
+                        "n_sample_live": result.n_sample_live,
+                        "n_passing": result.n_passing,
+                    })
+                    .to_string()
+                })
             })
-            .to_string()
-        }))
     }
 
-    /// Security-preserving exact fallback for the historical incremental
-    /// aggregate API. The response reports `mode: "exact_fallback"` and
-    /// `incremental: false`; every matching row is recomputed.
+    /// Security-preserving incremental aggregate for append-only tables. Active
+    /// RLS or masks return an explicit unsupported error.
     #[napi]
     pub fn incremental_aggregate(
         &self,
@@ -2444,18 +2443,23 @@ impl TableHandle {
         }
         let cid = column_id.map(|c| c as u16);
         let conds = build_conditions(&conditions)?;
-        let query = build_query_from_conditions(conds);
-        let projection = cid.map(|column| vec![column]);
-        let rows = self
+        let agg = match agg.as_str() {
+            "count" => mongreldb_core::NativeAgg::Count,
+            "sum" => mongreldb_core::NativeAgg::Sum,
+            "min" => mongreldb_core::NativeAgg::Min,
+            "max" => mongreldb_core::NativeAgg::Max,
+            "avg" => mongreldb_core::NativeAgg::Avg,
+            _ => unreachable!(),
+        };
+        let result = self
             .db
-            .query_for_current_principal(&self.name, &query, projection.as_deref())
+            .incremental_aggregate_for_current_principal(&self.name, &conds, cid, agg)
             .map_err(to_napi)?;
-        let value = aggregate_rows_json(&rows, cid, &agg)?;
         Ok(serde_json::json!({
-            "mode": "exact_fallback",
-            "value": value,
-            "incremental": false,
-            "delta_rows": rows.len(),
+            "mode": "incremental",
+            "value": result.state.point(),
+            "incremental": result.incremental,
+            "delta_rows": result.delta_rows,
         })
         .to_string())
     }

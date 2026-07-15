@@ -9,8 +9,6 @@ use mongreldb_core::{
 use std::sync::{Arc, Barrier};
 use std::time::Instant;
 
-const DIM: usize = 64;
-
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -18,8 +16,8 @@ fn env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-fn embedding(id: usize) -> Vec<f32> {
-    (0..DIM)
+fn embedding(id: usize, dimension: usize) -> Vec<f32> {
+    (0..dimension)
         .map(|d| {
             let v = (id as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
                 ^ (d as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -28,7 +26,7 @@ fn embedding(id: usize) -> Vec<f32> {
         .collect()
 }
 
-fn schema() -> Schema {
+fn schema(dimension: usize) -> Schema {
     let column = |id, name: &str, ty, primary_key| ColumnDef {
         id,
         name: name.into(),
@@ -44,7 +42,14 @@ fn schema() -> Schema {
         schema_id: 1,
         columns: vec![
             column(1, "id", TypeId::Int64, true),
-            column(2, "embedding", TypeId::Embedding { dim: DIM as u32 }, false),
+            column(
+                2,
+                "embedding",
+                TypeId::Embedding {
+                    dim: dimension as u32,
+                },
+                false,
+            ),
             column(3, "owner", TypeId::Bytes, false),
         ],
         indexes: vec![IndexDef {
@@ -90,9 +95,18 @@ fn peak_rss_bytes() -> Option<u64> {
 fn main() {
     let rows = env_usize("MONGRELDB_AI_CONCURRENCY_ROWS", 10_000);
     let operations = env_usize("MONGRELDB_AI_CONCURRENCY_OPS", 25);
+    let dimension = env_usize("MONGRELDB_AI_CONCURRENCY_DIM", 128);
+    let read_kind =
+        std::env::var("MONGRELDB_AI_CONCURRENCY_READ_KIND").unwrap_or_else(|_| "short".into());
+    assert!(matches!(read_kind.as_str(), "short" | "long"));
+    let candidate_k = env_usize(
+        "MONGRELDB_AI_CONCURRENCY_CANDIDATE_K",
+        if read_kind == "long" { 10_000 } else { 100 },
+    )
+    .min(rows);
     let dir = tempfile::tempdir().unwrap();
     let database = Arc::new(Database::create(dir.path()).unwrap());
-    database.create_table("docs", schema()).unwrap();
+    database.create_table("docs", schema(dimension)).unwrap();
     {
         let handle = database.table("docs").unwrap();
         let mut table = handle.lock();
@@ -100,7 +114,7 @@ fn main() {
             table
                 .put(vec![
                     (1, Value::Int64(id as i64)),
-                    (2, Value::Embedding(embedding(id))),
+                    (2, Value::Embedding(embedding(id, dimension))),
                     (3, Value::Bytes(b"tenant".to_vec())),
                 ])
                 .unwrap();
@@ -137,8 +151,8 @@ fn main() {
     };
     let request = AnnRerankRequest {
         column_id: 2,
-        query: embedding(0),
-        candidate_k: rows.min(100),
+        query: embedding(0, dimension),
+        candidate_k,
         limit: 10,
         metric: VectorMetric::Cosine,
     };
@@ -146,6 +160,7 @@ fn main() {
     let mut scenarios = Vec::new();
     for readers in [1usize, 4, 16, 32] {
         for writers in [0usize, 1, 4] {
+            let stats_before = database.table("docs").unwrap().generation_stats();
             let barrier = Arc::new(Barrier::new(readers + writers + 1));
             let reader_threads = (0..readers)
                 .map(|_| {
@@ -205,7 +220,7 @@ fn main() {
                                 table
                                     .put(vec![
                                         (1, Value::Int64(id as i64)),
-                                        (2, Value::Embedding(embedding(id))),
+                                        (2, Value::Embedding(embedding(id, dimension))),
                                         (3, Value::Bytes(b"tenant".to_vec())),
                                     ])
                                     .unwrap();
@@ -228,6 +243,11 @@ fn main() {
                 .collect::<Vec<_>>();
             let elapsed = started.elapsed();
             let total = query_latency.len() + commit_latency.len();
+            let stats = database.table("docs").unwrap().generation_stats();
+            let clone_bytes = stats
+                .estimated_cow_clone_bytes
+                .saturating_sub(stats_before.estimated_cow_clone_bytes);
+            let commit_count = writers.saturating_mul(operations);
             scenarios.push(serde_json::json!({
                 "readers": readers,
                 "writers": writers,
@@ -236,6 +256,13 @@ fn main() {
                 "throughput_ops_per_second": total as f64 / elapsed.as_secs_f64(),
                 "elapsed_ms": elapsed.as_millis(),
                 "peak_rss_bytes": peak_rss_bytes(),
+                "clone_bytes_per_write": if commit_count == 0 { 0.0 } else { clone_bytes as f64 / commit_count as f64 },
+                "generation_clone_count": stats.cow_clone_count.saturating_sub(stats_before.cow_clone_count),
+                "generation_clone_bytes": clone_bytes,
+                "generation_clone_nanos": stats.cow_clone_nanos.saturating_sub(stats_before.cow_clone_nanos),
+                "writer_wait_nanos": stats.writer_wait_nanos.saturating_sub(stats_before.writer_wait_nanos),
+                "max_live_read_generations": stats.max_live_read_generations,
+                "oom_or_failure": false,
             }));
         }
     }
@@ -244,6 +271,9 @@ fn main() {
         serde_json::json!({
             "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
             "rows": rows,
+            "embedding_dimension": dimension,
+            "read_kind": read_kind,
+            "candidate_k": candidate_k,
             "operations_per_worker": operations,
             "rls": true,
             "exact_vector_rerank": true,

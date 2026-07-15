@@ -1,6 +1,7 @@
 use mongreldb_core::{
     schema::{ColumnDef, ColumnFlags, Schema, TypeId},
-    AlterColumn, ColumnMask, Database, MaskStrategy, Permission, SecurityCatalog,
+    AlterColumn, ColumnMask, Database, MaskStrategy, Permission, PolicyCommand, RowPolicy,
+    SecurityCatalog, SecurityExpr, Value,
 };
 use mongreldb_server::{build_app, build_app_full};
 use std::sync::Arc;
@@ -55,7 +56,10 @@ async fn post(
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
-    (status, serde_json::from_slice(&bytes).unwrap())
+    let body = serde_json::from_slice(&bytes).unwrap_or_else(
+        |_| serde_json::json!({"message": String::from_utf8_lossy(&bytes).into_owned()}),
+    );
+    (status, body)
 }
 
 async fn setup() -> (TempDir, Arc<Database>, axum::Router) {
@@ -94,6 +98,22 @@ async fn first_cursor(app: axum::Router, authorization: Option<&str>) -> String 
     .await;
     assert_eq!(status, 200, "{body}");
     body["next_cursor"].as_str().unwrap().to_string()
+}
+
+async fn continue_query(
+    app: axum::Router,
+    cursor: &str,
+    authorization: Option<&str>,
+) -> (u16, serde_json::Value) {
+    post(
+        app,
+        "/kit/query",
+        serde_json::json!({
+            "table": "docs", "projection": [1, 2], "limit": 2, "cursor": cursor
+        }),
+        authorization,
+    )
+    .await
 }
 
 #[tokio::test]
@@ -149,6 +169,60 @@ async fn query_cursor_fails_stale_after_insert_update_or_delete() {
         assert_eq!(status, 409, "{body}");
         assert_eq!(body["error"]["code"], "CURSOR_STALE");
     }
+}
+
+#[tokio::test]
+async fn query_cursor_survives_or_fails_typed_after_flush_checkpoint_and_compaction() {
+    for operation in ["flush", "checkpoint", "compact"] {
+        let (_dir, db, app) = setup().await;
+        db.table("docs").unwrap().lock().force_flush().unwrap();
+        if operation == "compact" {
+            db.transaction(|transaction| {
+                transaction.put(
+                    "docs",
+                    vec![
+                        (1, mongreldb_core::Value::Int64(6)),
+                        (2, mongreldb_core::Value::Bytes(b"v6".to_vec())),
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+            db.table("docs").unwrap().lock().force_flush().unwrap();
+        }
+        let cursor = first_cursor(app.clone(), None).await;
+        let (before_status, before_body) = continue_query(app.clone(), &cursor, None).await;
+        assert_eq!(before_status, 200, "{operation}: {before_body}");
+        match operation {
+            "flush" => {
+                db.table("docs").unwrap().lock().flush().unwrap();
+            }
+            "checkpoint" => db.checkpoint().unwrap(),
+            "compact" => db.table("docs").unwrap().lock().compact().unwrap(),
+            _ => unreachable!(),
+        }
+        let (status, body) = continue_query(app, &cursor, None).await;
+        if operation == "checkpoint" {
+            assert_eq!(status, 200, "{operation}: {body}");
+            assert_eq!(body["rows"], before_body["rows"]);
+            assert_eq!(body["truncated"], before_body["truncated"]);
+        } else {
+            assert_eq!(status, 409, "{operation}: {body}");
+            assert_eq!(body["error"]["code"], "CURSOR_STALE");
+        }
+    }
+}
+
+#[tokio::test]
+async fn query_cursor_is_rejected_after_close_and_reopen() {
+    let (dir, db, app) = setup().await;
+    let cursor = first_cursor(app.clone(), None).await;
+    drop(app);
+    db.close().unwrap();
+    drop(db);
+    let reopened = Arc::new(Database::open(dir.path()).unwrap());
+    let (status, body) = continue_query(build_app(reopened), &cursor, None).await;
+    assert_eq!(status, 400, "{body}");
 }
 
 #[tokio::test]
@@ -212,6 +286,82 @@ async fn query_cursor_fails_stale_after_schema_or_security_catalog_change() {
     .await;
     assert_eq!(status, 409, "{body}");
     assert_eq!(body["error"]["code"], "CURSOR_STALE");
+}
+
+#[tokio::test]
+async fn query_cursor_fails_stale_after_rls_add_change_remove_and_mask_change() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create_with_credentials(dir.path(), "admin", "pw").unwrap());
+    db.create_table("docs", schema()).unwrap();
+    db.transaction(|transaction| {
+        for id in 1..=5 {
+            transaction.put(
+                "docs",
+                vec![
+                    (1, Value::Int64(id)),
+                    (2, Value::Bytes(format!("v{id}").into_bytes())),
+                ],
+            )?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    let app = build_app_full(Arc::clone(&db), std::iter::empty(), None, None, true);
+    let admin = "Basic YWRtaW46cHc=";
+    let policy = |value| RowPolicy {
+        name: "visible".into(),
+        table: "docs".into(),
+        command: PolicyCommand::Select,
+        subjects: vec!["public".into()],
+        permissive: true,
+        using: Some(SecurityExpr::ColumnEqValue {
+            column: 1,
+            value: Value::Int64(value),
+        }),
+        with_check: None,
+    };
+    let catalogs = [
+        SecurityCatalog {
+            rls_tables: vec!["docs".into()],
+            policies: vec![policy(1)],
+            masks: Vec::new(),
+        },
+        SecurityCatalog {
+            rls_tables: vec!["docs".into()],
+            policies: vec![policy(2)],
+            masks: Vec::new(),
+        },
+        SecurityCatalog::default(),
+        SecurityCatalog {
+            masks: vec![ColumnMask {
+                name: "mask".into(),
+                table: "docs".into(),
+                column: 2,
+                strategy: MaskStrategy::Null,
+                exempt_subjects: Vec::new(),
+            }],
+            ..SecurityCatalog::default()
+        },
+        SecurityCatalog {
+            masks: vec![ColumnMask {
+                name: "mask".into(),
+                table: "docs".into(),
+                column: 2,
+                strategy: MaskStrategy::Redact {
+                    replacement: "***".into(),
+                },
+                exempt_subjects: Vec::new(),
+            }],
+            ..SecurityCatalog::default()
+        },
+    ];
+    for catalog in catalogs {
+        let cursor = first_cursor(app.clone(), Some(admin)).await;
+        db.set_security_catalog(catalog).unwrap();
+        let (status, body) = continue_query(app.clone(), &cursor, Some(admin)).await;
+        assert_eq!(status, 409, "{body}");
+        assert_eq!(body["error"]["code"], "CURSOR_STALE");
+    }
 }
 
 #[tokio::test]
@@ -388,4 +538,80 @@ async fn query_cursor_fails_stale_after_security_or_principal_change() {
     .await;
     assert_eq!(status, 403, "{body}");
     assert!(body.get("rows").is_none());
+}
+
+#[tokio::test]
+async fn query_cursor_rechecks_projection_grants_owner_and_admin_state() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create_with_credentials(dir.path(), "admin", "pw").unwrap());
+    db.create_table("docs", schema()).unwrap();
+    db.transaction(|transaction| {
+        for id in 1..=5 {
+            transaction.put(
+                "docs",
+                vec![
+                    (1, Value::Int64(id)),
+                    (2, Value::Bytes(format!("v{id}").into_bytes())),
+                ],
+            )?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    for user in ["alice", "carol", "dave"] {
+        db.create_user(user, "pw").unwrap();
+    }
+    db.create_role("columns").unwrap();
+    let both_columns = Permission::SelectColumns {
+        table: "docs".into(),
+        columns: vec!["id".into(), "value".into()],
+    };
+    db.grant_permission("columns", both_columns.clone())
+        .unwrap();
+    db.grant_role("alice", "columns").unwrap();
+    db.create_role("reader").unwrap();
+    db.grant_permission(
+        "reader",
+        Permission::Select {
+            table: "docs".into(),
+        },
+    )
+    .unwrap();
+    db.grant_role("carol", "reader").unwrap();
+    db.grant_role("dave", "reader").unwrap();
+    let app = build_app_full(Arc::clone(&db), std::iter::empty(), None, None, true);
+
+    let alice = "Basic YWxpY2U6cHc=";
+    let cursor = first_cursor(app.clone(), Some(alice)).await;
+    db.revoke_permission("columns", both_columns).unwrap();
+    db.grant_permission(
+        "columns",
+        Permission::SelectColumns {
+            table: "docs".into(),
+            columns: vec!["id".into()],
+        },
+    )
+    .unwrap();
+    let (status, body) = continue_query(app.clone(), &cursor, Some(alice)).await;
+    assert_eq!(status, 403, "{body}");
+    assert!(body.get("rows").is_none());
+
+    let carol = "Basic Y2Fyb2w6cHc=";
+    let cursor = first_cursor(app.clone(), Some(carol)).await;
+    db.drop_user("carol").unwrap();
+    let (status, body) = continue_query(app.clone(), &cursor, Some(carol)).await;
+    assert_eq!(status, 401, "{body}");
+    assert!(body.get("rows").is_none());
+
+    let dave = "Basic ZGF2ZTpwdw==";
+    let cursor = first_cursor(app.clone(), Some(dave)).await;
+    db.set_user_admin("dave", true).unwrap();
+    let (status, body) = continue_query(app.clone(), &cursor, Some(dave)).await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["error"]["code"], "CURSOR_STALE");
+    let cursor = first_cursor(app.clone(), Some(dave)).await;
+    db.set_user_admin("dave", false).unwrap();
+    let (status, body) = continue_query(app, &cursor, Some(dave)).await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["error"]["code"], "CURSOR_STALE");
 }

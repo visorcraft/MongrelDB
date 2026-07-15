@@ -216,6 +216,7 @@ async fn user_principal_secures_sql_native_kit_and_sessions() {
     let body: JsonValue =
         serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
     assert_eq!(body["error"]["code"], "PERMISSION_DENIED");
+    assert!(body.get("trace").is_none());
 
     let response = app
         .clone()

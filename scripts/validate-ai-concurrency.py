@@ -18,6 +18,11 @@ def main():
     require(report.get("profile") == "release", "profile must be release")
     require(report.get("rls") is True, "RLS must be enabled")
     require(report.get("exact_vector_rerank") is True, "exact rerank must be enabled")
+    require(
+        report.get("embedding_dimension") in (128, 768, 1536),
+        "embedding dimension must be 128, 768, or 1536",
+    )
+    require(report.get("read_kind") in ("short", "long"), "read kind missing")
     scenarios = report.get("scenarios", [])
     expected = {(readers, writers) for readers in (1, 4, 16, 32) for writers in (0, 1, 4)}
     require(
@@ -50,6 +55,13 @@ def main():
             f"{readers}/{writers} throughput must be finite and positive",
         )
         require(scenario.get("peak_rss_bytes", 0) > 0, f"{readers}/{writers} peak RSS missing")
+        require(scenario.get("generation_clone_count") == 0, f"{readers}/{writers} cloned table")
+        require(scenario.get("generation_clone_bytes") == 0, f"{readers}/{writers} clone bytes")
+        require(
+            scenario.get("clone_bytes_per_write") == 0,
+            f"{readers}/{writers} clone bytes/write",
+        )
+        require(scenario.get("oom_or_failure") is False, f"{readers}/{writers} failed")
     if errors:
         for error in errors:
             print(f"ERROR: {error}", file=sys.stderr)

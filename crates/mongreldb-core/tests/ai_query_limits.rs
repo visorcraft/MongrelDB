@@ -1,11 +1,15 @@
 use mongreldb_core::query::{
-    AiExecutionContext, AnnRerankRequest, Condition, Fusion, NamedRetriever, Retriever,
+    AiExecutionContext, AnnRerankRequest, Condition, Fusion, NamedRetriever, Rerank, Retriever,
     SearchRequest, SetMember, SetSimilarityRequest, VectorMetric, MAX_FINAL_LIMIT,
     MAX_FUSED_CANDIDATES, MAX_PROJECTION_COLUMNS, MAX_RETRIEVERS, MAX_RETRIEVER_K, MAX_SET_MEMBERS,
     MAX_SPARSE_TERMS,
 };
 use mongreldb_core::schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
-use mongreldb_core::{Database, Epoch, MongrelError, Snapshot, Table, TableHandle, Value};
+use mongreldb_core::security::CandidateAuthorization;
+use mongreldb_core::{
+    Database, Epoch, MongrelError, PolicyCommand, Principal, RowPolicy, SecurityCatalog,
+    SecurityExpr, Snapshot, Table, TableHandle, Value,
+};
 
 fn table() -> (tempfile::TempDir, Table) {
     let dir = tempfile::tempdir().unwrap();
@@ -26,6 +30,7 @@ fn table() -> (tempfile::TempDir, Table) {
             column(2, "embedding", TypeId::Embedding { dim: 8 }, false),
             column(3, "sparse", TypeId::Bytes, false),
             column(4, "members", TypeId::Bytes, false),
+            column(5, "owner", TypeId::Bytes, false),
         ],
         indexes: vec![
             IndexDef {
@@ -62,6 +67,7 @@ fn table() -> (tempfile::TempDir, Table) {
                 Value::Bytes(bincode::serialize(&vec![(1u32, f32::MAX)]).unwrap()),
             ),
             (4, Value::Bytes(serde_json::to_vec(&vec!["a"]).unwrap())),
+            (5, Value::Bytes(b"tenant".to_vec())),
         ])
         .unwrap();
     table.commit().unwrap();
@@ -201,6 +207,7 @@ fn native_query_offset_applies_before_limit() {
                     Value::Bytes(bincode::serialize(&vec![(id as u32, 1.0)]).unwrap()),
                 ),
                 (4, Value::Bytes(b"[]".to_vec())),
+                (5, Value::Bytes(b"tenant".to_vec())),
             ])
             .unwrap();
     }
@@ -475,6 +482,7 @@ fn fused_union_ceiling_projection_charging_and_zero_weight_are_enforced() {
                 Value::Bytes(bincode::serialize(&vec![(2u32, 1.0f32)]).unwrap()),
             ),
             (4, Value::Bytes(serde_json::to_vec(&vec!["b"]).unwrap())),
+            (5, Value::Bytes(b"tenant".to_vec())),
         ])
         .unwrap();
     table.commit().unwrap();
@@ -561,6 +569,7 @@ fn ann_adaptive_overfetch_stops_at_context_cap_and_reports_exhaustion() {
                     Value::Bytes(bincode::serialize(&vec![(id as u32, 1.0f32)]).unwrap()),
                 ),
                 (4, Value::Bytes(serde_json::to_vec(&vec![id]).unwrap())),
+                (5, Value::Bytes(b"tenant".to_vec())),
             ])
             .unwrap();
     }
@@ -582,6 +591,87 @@ fn ann_adaptive_overfetch_stops_at_context_cap_and_reports_exhaustion() {
     assert_eq!(hits.len(), 1);
     assert!(trace.ann_candidate_cap_hit);
     assert!(context.consumed_work() < usize::MAX);
+}
+
+#[test]
+fn ann_cap_returns_sub_percent_rls_hits_and_exactly_reranks_them() {
+    let (_dir, mut table) = table();
+    for id in 2..=1001 {
+        table
+            .put(vec![
+                (1, Value::Int64(id)),
+                (2, Value::Embedding(vec![-1.0; 8])),
+                (
+                    3,
+                    Value::Bytes(bincode::serialize(&vec![(id as u32, 1.0f32)]).unwrap()),
+                ),
+                (4, Value::Bytes(serde_json::to_vec(&vec![id]).unwrap())),
+                (5, Value::Bytes(b"other".to_vec())),
+            ])
+            .unwrap();
+    }
+    table.commit().unwrap();
+    let allowed_row_id = table.retrieve(&ann(1000)).unwrap()[0].row_id.0;
+    let allowed_id = i64::try_from(allowed_row_id + 1).unwrap();
+    let security = SecurityCatalog {
+        rls_tables: vec!["docs".into()],
+        policies: vec![RowPolicy {
+            name: "tenant_only".into(),
+            table: "docs".into(),
+            command: PolicyCommand::Select,
+            subjects: vec!["public".into()],
+            permissive: true,
+            using: Some(SecurityExpr::ColumnEqValue {
+                column: 1,
+                value: Value::Int64(allowed_id),
+            }),
+            with_check: None,
+        }],
+        masks: Vec::new(),
+    };
+    let principal = Principal {
+        username: "tenant".into(),
+        is_admin: false,
+        roles: Vec::new(),
+        permissions: Vec::new(),
+    };
+    let authorization = CandidateAuthorization {
+        table: "docs",
+        security: &security,
+        principal: &principal,
+    };
+    let allowed = table
+        .visible_rows(table.snapshot())
+        .unwrap()
+        .into_iter()
+        .find(|row| row.row_id.0 == allowed_row_id)
+        .unwrap();
+    assert!(security.row_allowed("docs", PolicyCommand::Select, &allowed, &principal, false));
+    let mut request = search(vec![named("ann".into(), ann(5))], 5);
+    request.rerank = Some(Rerank::ExactVector {
+        embedding_column: 2,
+        query: vec![1.0; 8],
+        metric: VectorMetric::Cosine,
+        candidate_limit: 5,
+        weight: 1.0,
+    });
+    let context =
+        AiExecutionContext::with_limits(std::time::Duration::from_secs(30), usize::MAX, 1000);
+    let snapshot = table.snapshot();
+    let (hits, trace) = mongreldb_core::trace::QueryTrace::capture(|| {
+        table.search_at_with_candidate_authorization_and_context(
+            &request,
+            snapshot,
+            Some(&authorization),
+            Some(&context),
+        )
+    });
+    let hits = hits.unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].cells, vec![(1, Value::Int64(allowed_id))]);
+    assert!(hits[0].exact_rerank_score.is_some());
+    assert!(trace.ann_candidate_cap_hit);
+    assert!(trace.rls_rows_evaluated <= 1000);
 }
 
 #[test]
@@ -878,6 +968,7 @@ fn active_generation_keeps_ann_sparse_and_minhash_deltas_private() {
                     Value::Bytes(bincode::serialize(&vec![(1u32, f32::MAX)]).unwrap()),
                 ),
                 (4, Value::Bytes(serde_json::to_vec(&vec!["a"]).unwrap())),
+                (5, Value::Bytes(b"tenant".to_vec())),
             ])
             .unwrap();
         writer.commit().unwrap();

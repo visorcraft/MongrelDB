@@ -37,9 +37,10 @@
 - Search continuation preserves global `final_rank`. ANN adaptive over-fetch
   obeys the raw-candidate and request-specific caps; admin explain output
   reports `ann_candidate_cap_hit` when selectivity exhausts the cap.
-- NAPI `aggregateExact` is the explicit secured exact aggregate. Historical
-  `approxAggregate` and `incrementalAggregate` report
-  `mode: "exact_fallback"`; they do not claim sampling or incremental work.
+- NAPI `aggregateExact` remains the explicit secured exact aggregate.
+  `approxAggregate` now uses the secured reservoir estimator and reports its
+  z-controlled interval. `incrementalAggregate` now uses the append-only delta
+  cache and rejects tables with active RLS or masks.
 - Credentialed NAPI and C typed reads now use database-level RLS, mask, and
   live-principal enforcement. The C ABI validates integer discriminants before
   converting them to Rust types.

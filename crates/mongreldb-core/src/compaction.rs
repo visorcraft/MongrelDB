@@ -146,6 +146,7 @@ impl Table {
             // No live rows remain; the in-memory indexes are stale → drop the
             // checkpoint so reopen rebuilds (empty) instead of loading it.
             self.mark_indexes_incomplete();
+            self.bump_data_generation();
             return Ok(());
         }
 
@@ -188,6 +189,7 @@ impl Table {
         self.clear_result_cache();
         let _ = expired_reclaimed;
         self.checkpoint_indexes(self.current_epoch());
+        self.bump_data_generation();
         Ok(())
     }
 }
