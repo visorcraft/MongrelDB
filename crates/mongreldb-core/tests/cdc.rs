@@ -31,6 +31,11 @@ fn durable_change_events_resume_with_stable_ids() {
             Ok(())
         })
         .unwrap();
+        db.transaction(|transaction| {
+            transaction.put("items", vec![(1, Value::Int64(3))])?;
+            Ok(())
+        })
+        .unwrap();
         assert!(commit_wake.try_recv().is_ok());
 
         let batch = db.change_events_since(None).unwrap();
@@ -42,8 +47,14 @@ fn durable_change_events_resume_with_stable_ids() {
             .collect();
         assert_eq!(changes.len(), 2);
         assert_eq!(changes[0].table, "items");
-        assert_eq!(changes[0].epoch, changes[1].epoch);
-        assert!(changes[0].data.is_some());
+        assert_eq!(
+            changes[0].data.as_ref().unwrap().as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(
+            changes[1].data.as_ref().unwrap().as_array().unwrap().len(),
+            1
+        );
         let ids: Vec<String> = changes
             .iter()
             .map(|event| event.id.clone().unwrap())
@@ -165,27 +176,41 @@ fn delete_cdc_carries_durable_before_image() {
     let dir = tempdir().unwrap();
     let db = Database::create(dir.path()).unwrap();
     db.create_table("items", schema()).unwrap();
-    db.transaction(|transaction| transaction.put("items", vec![(1, Value::Int64(9))]))
-        .unwrap();
-    let row_id = db
+    db.transaction(|transaction| {
+        transaction.put("items", vec![(1, Value::Int64(9))])?;
+        transaction.put("items", vec![(1, Value::Int64(10))])?;
+        Ok(())
+    })
+    .unwrap();
+    let row_ids = db
         .table("items")
         .unwrap()
         .lock()
         .visible_rows(db.snapshot().0)
-        .unwrap()[0]
-        .row_id;
-    db.transaction(|transaction| transaction.delete("items", row_id))
-        .unwrap();
+        .unwrap()
+        .into_iter()
+        .map(|row| row.row_id)
+        .collect::<Vec<_>>();
+    db.transaction(|transaction| {
+        for row_id in &row_ids {
+            transaction.delete("items", *row_id)?;
+        }
+        Ok(())
+    })
+    .unwrap();
 
-    let delete = db
+    let deletes = db
         .change_events_since(None)
         .unwrap()
         .events
         .into_iter()
-        .find(|event| event.op == "delete")
-        .unwrap();
-    let before: Vec<mongreldb_core::Row> =
-        serde_json::from_value(delete.data.unwrap()["before"].clone()).unwrap();
-    assert_eq!(before.len(), 1);
+        .filter(|event| event.op == "delete")
+        .collect::<Vec<_>>();
+    assert_eq!(deletes.len(), 1);
+    let data = deletes[0].data.as_ref().unwrap();
+    assert_eq!(data["row_ids"].as_array().unwrap().len(), 2);
+    let before: Vec<mongreldb_core::Row> = serde_json::from_value(data["before"].clone()).unwrap();
+    assert_eq!(before.len(), 2);
     assert_eq!(before[0].columns.get(&1), Some(&Value::Int64(9)));
+    assert_eq!(before[1].columns.get(&1), Some(&Value::Int64(10)));
 }

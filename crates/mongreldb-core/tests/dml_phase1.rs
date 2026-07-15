@@ -242,6 +242,41 @@ fn update_many_and_delete_many_return_images_and_survive_reopen() {
 }
 
 #[test]
+fn delete_batch_removes_rows_without_returning_images_and_survives_reopen() {
+    let dir = tempdir().unwrap();
+    {
+        let db = Database::create(dir.path()).unwrap();
+        db.create_table("users", users_schema()).unwrap();
+        db.transaction(|tx| {
+            tx.put_batch(
+                "users",
+                vec![row(1, b"alice"), row(2, b"bob"), row(3, b"cara")],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let mut tx = db.begin();
+        tx.delete_batch(
+            "users",
+            vec![row_id_for(&db, "users", 1), row_id_for(&db, "users", 3)],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(db.table("users").unwrap().lock().count(), 1);
+    }
+
+    let reopened = Database::open(dir.path()).unwrap();
+    assert_eq!(reopened.table("users").unwrap().lock().count(), 1);
+    assert!(reopened
+        .table("users")
+        .unwrap()
+        .lock()
+        .lookup_pk(&Value::Int64(2).encode_key())
+        .is_some());
+}
+
+#[test]
 fn transaction_truncate_survives_reopen() {
     let dir = tempdir().unwrap();
     {

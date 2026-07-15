@@ -75,6 +75,42 @@ fn recovery_replays_committed_skips_uncommitted_and_gates_by_flushed_epoch() {
 }
 
 #[test]
+fn recovery_preserves_batched_update_delete_then_put_order() {
+    let dir = tempdir().unwrap();
+    {
+        let db = Database::create(dir.path()).unwrap();
+        db.create_table("items", one_int_schema()).unwrap();
+        db.transaction(|transaction| {
+            transaction.put("items", vec![(1, Value::Int64(1))])?;
+            Ok(())
+        })
+        .unwrap();
+        let row_id = db
+            .table("items")
+            .unwrap()
+            .lock()
+            .visible_rows(db.snapshot().0)
+            .unwrap()[0]
+            .row_id;
+        db.transaction(|transaction| {
+            transaction.update_many("items", vec![(row_id, vec![(1, Value::Int64(2))])])?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    let db = Database::open(dir.path()).unwrap();
+    let rows = db
+        .table("items")
+        .unwrap()
+        .lock()
+        .visible_rows(db.snapshot().0)
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].columns.get(&1), Some(&Value::Int64(2)));
+}
+
+#[test]
 fn recovery_ignores_uncommitted_txn() {
     // A transaction whose records were fsync'd but whose TxnCommit was NOT
     // (crash mid-commit) must not appear after reopen. We simulate this by

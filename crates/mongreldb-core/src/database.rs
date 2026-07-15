@@ -283,6 +283,11 @@ struct SpilledRun {
     max_rid: u64,
 }
 
+struct TableApplyBatch {
+    table_id: u64,
+    ops: Vec<crate::txn::StagedOp>,
+}
+
 #[derive(Debug, Clone)]
 struct TriggerRowImage {
     columns: HashMap<u16, Value>,
@@ -613,6 +618,11 @@ struct TableWritePermissionNeeds {
 #[cfg(test)]
 thread_local! {
     static WRITE_PERMISSION_DECISIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static AUTO_INCREMENT_TABLE_LOCKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PREBUILD_TABLE_LOCKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PUBLISH_TABLE_LOCKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static COMMIT_MANIFEST_WRITES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TABLE_PERMISSION_DECISIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn summarize_write_permissions(
@@ -1736,6 +1746,8 @@ impl Database {
         let Some(principal) = principal else {
             return self.require(permission);
         };
+        #[cfg(test)]
+        TABLE_PERMISSION_DECISIONS.with(|decisions| decisions.set(decisions.get() + 1));
         if principal.has_permission(permission) {
             Ok(())
         } else {
@@ -4708,12 +4720,23 @@ impl Database {
         &self,
         staging: &mut [(u64, crate::txn::Staged)],
     ) -> Result<()> {
+        let mut puts_by_table: HashMap<u64, Vec<usize>> = HashMap::new();
+        for (index, (table_id, staged)) in staging.iter().enumerate() {
+            if matches!(staged, crate::txn::Staged::Put(_)) {
+                puts_by_table.entry(*table_id).or_default().push(index);
+            }
+        }
+
         let tables = self.tables.read();
-        for (table_id, staged) in staging {
-            if let crate::txn::Staged::Put(cells) = staged {
-                if let Some(handle) = tables.get(table_id) {
-                    let mut t = handle.lock();
-                    t.fill_auto_inc(cells)?;
+        for (table_id, indexes) in puts_by_table {
+            if let Some(handle) = tables.get(&table_id) {
+                #[cfg(test)]
+                AUTO_INCREMENT_TABLE_LOCKS.with(|count| count.set(count.get() + 1));
+                let mut t = handle.lock();
+                for index in indexes {
+                    if let crate::txn::Staged::Put(cells) = &mut staging[index].1 {
+                        t.fill_auto_inc(cells)?;
+                    }
                 }
             }
         }
@@ -6531,39 +6554,47 @@ impl Database {
         // Row ids are allocated here, before the sequencer's delta conflict
         // re-check, so a losing txn leaks the ids it reserved — harmless, the
         // u64 row-id space is monotonic and gaps are expected (spills do the same).
-        let mut prebuilt: Vec<Option<Row>> = Vec::with_capacity(staging.len());
-        let mut delete_images: Vec<Option<Row>> = Vec::with_capacity(staging.len());
+        let mut prebuilt: Vec<Option<Row>> = std::iter::repeat_with(|| None)
+            .take(staging.len())
+            .collect();
+        let mut delete_images: Vec<Option<Row>> = std::iter::repeat_with(|| None)
+            .take(staging.len())
+            .collect();
         {
+            let mut indexes_by_table: HashMap<u64, Vec<usize>> = HashMap::new();
+            for (index, (table_id, staged)) in staging.iter().enumerate() {
+                if matches!(staged, Staged::Delete(_))
+                    || matches!(staged, Staged::Put(_) if !spilled_tables.contains(table_id))
+                {
+                    indexes_by_table.entry(*table_id).or_default().push(index);
+                }
+            }
             let tables = self.tables.read();
-            for (table_id, staged) in &staging {
-                match staged {
-                    Staged::Put(cells) if !spilled_tables.contains(table_id) => {
-                        let handle = tables.get(table_id).ok_or_else(|| {
-                            MongrelError::NotFound(format!("table {table_id} not mounted"))
-                        })?;
-                        let mut t = handle.lock();
-                        t.validate_cells_not_null(cells)?;
-                        let row_id = t.alloc_row_id();
-                        drop(t);
-                        let mut row = Row::new(row_id, Epoch(0));
-                        for (c, v) in cells {
-                            row.columns.insert(*c, v.clone());
+            for (table_id, indexes) in indexes_by_table {
+                let handle = tables.get(&table_id).ok_or_else(|| {
+                    MongrelError::NotFound(format!("table {table_id} not mounted"))
+                })?;
+                #[cfg(test)]
+                PREBUILD_TABLE_LOCKS.with(|count| count.set(count.get() + 1));
+                let mut t = handle.lock();
+                for index in indexes {
+                    match &staging[index].1 {
+                        Staged::Put(cells) if !spilled_tables.contains(&table_id) => {
+                            t.validate_cells_not_null(cells)?;
+                            let mut row = Row::new(t.alloc_row_id(), Epoch(0));
+                            for (column, value) in cells {
+                                row.columns.insert(*column, value.clone());
+                            }
+                            prebuilt[index] = Some(row);
                         }
-                        prebuilt.push(Some(row));
-                        delete_images.push(None);
+                        Staged::Delete(row_id) => {
+                            delete_images[index] = t.get(*row_id, Snapshot::at(read_epoch));
+                        }
+                        Staged::Put(_) | Staged::Truncate => {}
+                        Staged::Update(_, _) => {
+                            unreachable!("updates normalized before prepare")
+                        }
                     }
-                    Staged::Delete(row_id) => {
-                        let before = tables.get(table_id).and_then(|handle| {
-                            handle.lock().get(*row_id, Snapshot::at(read_epoch))
-                        });
-                        prebuilt.push(None);
-                        delete_images.push(before);
-                    }
-                    Staged::Put(_) | Staged::Truncate => {
-                        prebuilt.push(None);
-                        delete_images.push(None);
-                    }
-                    Staged::Update(_, _) => unreachable!("updates normalized before prepare"),
                 }
             }
         }
@@ -6654,72 +6685,98 @@ impl Database {
 
             let new_epoch = self.epoch.bump_assigned();
             let _epoch_guard = EpochGuard::new(self.epoch.as_ref(), new_epoch);
-            let mut applies: Vec<(u64, Vec<StagedOp>)> = Vec::new();
+            let mut applies = Vec::<TableApplyBatch>::new();
+            let mut apply_indexes = HashMap::<u64, usize>::new();
             let mut committed_materialized_views = Vec::new();
 
-            for (idx, (table_id, staged)) in staging.iter().enumerate() {
+            let mut index = 0;
+            while index < staging.len() {
+                let table_id = staging[index].0;
+                let batch_index = *apply_indexes.entry(table_id).or_insert_with(|| {
+                    let index = applies.len();
+                    applies.push(TableApplyBatch {
+                        table_id,
+                        ops: Vec::new(),
+                    });
+                    index
+                });
+
                 // Skip puts for tables that were spilled — their data is in a
                 // pending run, not in streamed Put records.
-                if spilled_tables.contains(table_id) && matches!(staged, Staged::Put(_)) {
+                if spilled_tables.contains(&table_id) && matches!(&staging[index].1, Staged::Put(_))
+                {
+                    index += 1;
                     continue;
                 }
-                let mut ops = Vec::new();
-                match staged {
+
+                match &staging[index].1 {
                     Staged::Put(_) => {
-                        // Stamp the pre-built row at the real assigned epoch.
-                        let mut row = prebuilt[idx].take().expect("prebuilt put row");
-                        row.committed_epoch = new_epoch;
-                        let payload = bincode::serialize(&vec![row.clone()])
+                        let mut rows = Vec::new();
+                        while index < staging.len()
+                            && staging[index].0 == table_id
+                            && matches!(&staging[index].1, Staged::Put(_))
+                        {
+                            let mut row = prebuilt[index].take().expect("prebuilt put row");
+                            row.committed_epoch = new_epoch;
+                            rows.push(row);
+                            index += 1;
+                        }
+                        let payload = bincode::serialize(&rows)
                             .map_err(|e| MongrelError::Other(format!("row serialize: {e}")))?;
                         wal.append(
                             txn_id,
-                            *table_id,
+                            table_id,
                             Op::Put {
-                                table_id: *table_id,
+                                table_id,
                                 rows: payload,
                             },
                         )?;
-                        ops.push(StagedOp::Put(row));
+                        applies[batch_index].ops.push(StagedOp::Put(rows));
                     }
-                    Staged::Delete(rid) => {
-                        if let Some(before) = &delete_images[idx] {
-                            wal.append(
-                                txn_id,
-                                *table_id,
-                                Op::BeforeImage {
-                                    table_id: *table_id,
-                                    row_id: *rid,
-                                    row: bincode::serialize(before).map_err(|error| {
-                                        MongrelError::Other(format!(
-                                            "before-image serialize: {error}"
-                                        ))
-                                    })?,
-                                },
-                            )?;
+                    Staged::Delete(_) => {
+                        let mut row_ids = Vec::new();
+                        while index < staging.len()
+                            && staging[index].0 == table_id
+                            && matches!(&staging[index].1, Staged::Delete(_))
+                        {
+                            let Staged::Delete(row_id) = &staging[index].1 else {
+                                unreachable!();
+                            };
+                            if let Some(before) = &delete_images[index] {
+                                wal.append(
+                                    txn_id,
+                                    table_id,
+                                    Op::BeforeImage {
+                                        table_id,
+                                        row_id: *row_id,
+                                        row: bincode::serialize(before).map_err(|error| {
+                                            MongrelError::Other(format!(
+                                                "before-image serialize: {error}"
+                                            ))
+                                        })?,
+                                    },
+                                )?;
+                            }
+                            row_ids.push(*row_id);
+                            index += 1;
                         }
                         wal.append(
                             txn_id,
-                            *table_id,
+                            table_id,
                             Op::Delete {
-                                table_id: *table_id,
-                                row_ids: vec![*rid],
+                                table_id,
+                                row_ids: row_ids.clone(),
                             },
                         )?;
-                        ops.push(StagedOp::Delete(*rid));
+                        applies[batch_index].ops.push(StagedOp::Delete(row_ids));
                     }
                     Staged::Truncate => {
-                        wal.append(
-                            txn_id,
-                            *table_id,
-                            Op::TruncateTable {
-                                table_id: *table_id,
-                            },
-                        )?;
-                        ops.push(StagedOp::Truncate);
+                        wal.append(txn_id, table_id, Op::TruncateTable { table_id })?;
+                        applies[batch_index].ops.push(StagedOp::Truncate);
+                        index += 1;
                     }
                     Staged::Update(_, _) => unreachable!("updates normalized before sequencer"),
                 }
-                applies.push((*table_id, ops));
             }
 
             for (name, state, _) in &prepared_external {
@@ -6773,47 +6830,56 @@ impl Database {
 
         // ── 3. Publish: apply non-spilled ops + link spilled runs ──
         {
+            let mut spilled_by_table: HashMap<u64, Vec<&SpilledRun>> = HashMap::new();
+            for run in &spilled {
+                spilled_by_table.entry(run.table_id).or_default().push(run);
+            }
             let tables = self.tables.read();
             // Apply truncates/deletes before linking spilled replacement rows.
             // This makes TRUNCATE + INSERT a single atomic replace even when
             // the insert side exceeds the spill threshold.
-            for (table_id, ops) in applies {
-                if let Some(handle) = tables.get(&table_id) {
+            for batch in applies {
+                if let Some(handle) = tables.get(&batch.table_id) {
+                    #[cfg(test)]
+                    PUBLISH_TABLE_LOCKS.with(|count| count.set(count.get() + 1));
                     let mut t = handle.lock();
-                    for op in ops {
+                    for op in batch.ops {
                         match op {
-                            StagedOp::Put(row) => t.apply_put_rows(vec![row])?,
-                            StagedOp::Delete(rid) => t.apply_delete(rid, new_epoch),
+                            StagedOp::Put(rows) => t.apply_put_rows(rows)?,
+                            StagedOp::Delete(row_ids) => {
+                                for row_id in row_ids {
+                                    t.apply_delete(row_id, new_epoch);
+                                }
+                            }
                             StagedOp::Truncate => t.apply_truncate(new_epoch)?,
                         }
                     }
-                    t.invalidate_pending_cache();
-                    t.persist_manifest(new_epoch)?;
-                }
-            }
-            for s in &spilled {
-                if let Some(handle) = tables.get(&s.table_id) {
-                    let mut t = handle.lock();
-                    let dest = t.run_path(s.run_id as u64);
-                    std::fs::rename(&s.pending_path, &dest)?;
-                    if let Some(parent) = s.pending_path.parent() {
-                        let _ = std::fs::remove_dir_all(parent);
-                    }
-                    t.link_run(crate::manifest::RunRef {
-                        run_id: s.run_id,
-                        level: 0,
-                        epoch_created: new_epoch.0,
-                        row_count: s.row_count,
-                    });
-                    t.apply_run_metadata(&s.rows)?;
-                    if truncated_tables.contains(&s.table_id) {
-                        // TRUNCATE + spilled puts fully describe this table at
-                        // the commit epoch. Endorse the epoch so clean-reopen
-                        // recovery does not replay the truncate over the
-                        // already-linked replacement run.
-                        t.set_flushed_epoch(new_epoch);
+                    if let Some(runs) = spilled_by_table.remove(&batch.table_id) {
+                        for run in runs {
+                            let dest = t.run_path(run.run_id as u64);
+                            std::fs::rename(&run.pending_path, &dest)?;
+                            if let Some(parent) = run.pending_path.parent() {
+                                let _ = std::fs::remove_dir_all(parent);
+                            }
+                            t.link_run(crate::manifest::RunRef {
+                                run_id: run.run_id,
+                                level: 0,
+                                epoch_created: new_epoch.0,
+                                row_count: run.row_count,
+                            });
+                            t.apply_run_metadata(&run.rows)?;
+                            if truncated_tables.contains(&batch.table_id) {
+                                // TRUNCATE + spilled puts fully describe this table at
+                                // the commit epoch. Endorse the epoch so clean-reopen
+                                // recovery does not replay the truncate over the
+                                // already-linked replacement run.
+                                t.set_flushed_epoch(new_epoch);
+                            }
+                        }
                     }
                     t.invalidate_pending_cache();
+                    #[cfg(test)]
+                    COMMIT_MANIFEST_WRITES.with(|count| count.set(count.get() + 1));
                     t.persist_manifest(new_epoch)?;
                 }
             }
@@ -9768,6 +9834,99 @@ mod write_permission_tests {
             )
             .unwrap();
         WRITE_PERMISSION_DECISIONS.with(|decisions| assert_eq!(decisions.get(), 1));
+    }
+
+    #[test]
+    fn delete_batch_checks_permission_once_when_staged_and_once_when_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::create_with_credentials(dir.path(), "admin", "admin-password").unwrap();
+        db.create_table("docs", test_schema()).unwrap();
+        let admin = db.resolve_principal("admin").unwrap();
+        TABLE_PERMISSION_DECISIONS.with(|decisions| decisions.set(0));
+
+        let mut transaction = db.begin_as(Some(admin));
+        transaction
+            .delete_batch("docs", (0..100).map(RowId).collect())
+            .unwrap();
+        transaction.commit().unwrap();
+
+        TABLE_PERMISSION_DECISIONS.with(|decisions| assert_eq!(decisions.get(), 2));
+    }
+
+    #[test]
+    fn one_table_commit_batches_structural_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::create(dir.path()).unwrap();
+        db.create_table("docs", test_schema()).unwrap();
+        let table_id = db.table_id("docs").unwrap();
+
+        AUTO_INCREMENT_TABLE_LOCKS.with(|count| count.set(0));
+        PREBUILD_TABLE_LOCKS.with(|count| count.set(0));
+        PUBLISH_TABLE_LOCKS.with(|count| count.set(0));
+        COMMIT_MANIFEST_WRITES.with(|count| count.set(0));
+        db.transaction(|transaction| {
+            for id in 0..100 {
+                transaction.put("docs", vec![(1, Value::Int64(id))])?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        AUTO_INCREMENT_TABLE_LOCKS.with(|count| assert_eq!(count.get(), 2));
+        PREBUILD_TABLE_LOCKS.with(|count| assert_eq!(count.get(), 1));
+        PUBLISH_TABLE_LOCKS.with(|count| assert_eq!(count.get(), 1));
+        COMMIT_MANIFEST_WRITES.with(|count| assert_eq!(count.get(), 1));
+
+        let puts = crate::wal::SharedWal::replay(dir.path())
+            .unwrap()
+            .into_iter()
+            .filter_map(|record| match record.op {
+                crate::wal::Op::Put { table_id: id, rows } if id == table_id => Some(
+                    bincode::deserialize::<Vec<crate::memtable::Row>>(&rows)
+                        .unwrap()
+                        .len(),
+                ),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(puts, [100]);
+
+        let row_ids = db
+            .table("docs")
+            .unwrap()
+            .lock()
+            .visible_rows(db.snapshot().0)
+            .unwrap()
+            .into_iter()
+            .take(2)
+            .map(|row| row.row_id)
+            .collect::<Vec<_>>();
+        PREBUILD_TABLE_LOCKS.with(|count| count.set(0));
+        PUBLISH_TABLE_LOCKS.with(|count| count.set(0));
+        COMMIT_MANIFEST_WRITES.with(|count| count.set(0));
+        db.transaction(|transaction| {
+            for row_id in row_ids {
+                transaction.delete("docs", row_id)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        PREBUILD_TABLE_LOCKS.with(|count| assert_eq!(count.get(), 1));
+        PUBLISH_TABLE_LOCKS.with(|count| assert_eq!(count.get(), 1));
+        COMMIT_MANIFEST_WRITES.with(|count| assert_eq!(count.get(), 1));
+
+        let deletes = crate::wal::SharedWal::replay(dir.path())
+            .unwrap()
+            .into_iter()
+            .filter_map(|record| match record.op {
+                crate::wal::Op::Delete {
+                    table_id: id,
+                    row_ids,
+                } if id == table_id => Some(row_ids.len()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(deletes, [2]);
     }
 
     fn puts(table_id: u64) -> Vec<(u64, Staged)> {

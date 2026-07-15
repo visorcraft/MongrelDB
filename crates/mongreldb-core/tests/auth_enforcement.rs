@@ -935,6 +935,46 @@ fn commit_rechecks_revoked_batch_permission() {
 }
 
 #[test]
+fn commit_rechecks_revoked_delete_batch_permission() {
+    let dir = tempdir().unwrap();
+    let admin = Database::create_with_credentials(dir.path(), "admin", "admin-pw").unwrap();
+    admin.create_table("docs", int_pk_schema()).unwrap();
+    admin
+        .transaction(|transaction| {
+            transaction.put("docs", vec![(1, Value::Int64(1))])?;
+            Ok(())
+        })
+        .unwrap();
+    admin.create_user("writer", "writer-pw").unwrap();
+    admin.create_role("delete_role").unwrap();
+    admin
+        .grant_permission(
+            "delete_role",
+            Permission::Delete {
+                table: "docs".into(),
+            },
+        )
+        .unwrap();
+    admin.grant_role("writer", "delete_role").unwrap();
+    let writer = Database::open_with_credentials(dir.path(), "writer", "writer-pw").unwrap();
+    let row_id = writer
+        .table("docs")
+        .unwrap()
+        .lock()
+        .visible_rows(writer.snapshot().0)
+        .unwrap()[0]
+        .row_id;
+
+    let mut transaction = writer.begin();
+    transaction.delete_batch("docs", vec![row_id]).unwrap();
+    admin.revoke_role("writer", "delete_role").unwrap();
+
+    let error = transaction.commit().unwrap_err();
+    assert!(matches!(error, MongrelError::PermissionDenied { .. }));
+    assert_eq!(writer.table("docs").unwrap().lock().count(), 1);
+}
+
+#[test]
 fn revocation_during_commit_preparation_fails_before_publish() {
     let dir = tempdir().unwrap();
     let admin = Database::create_with_credentials(dir.path(), "admin", "admin-pw").unwrap();

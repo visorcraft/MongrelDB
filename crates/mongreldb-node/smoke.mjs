@@ -171,9 +171,57 @@ tx2.put('orders', [
 tx2.rollback();
 assert(db3.getTable('orders').count() === 1n, 'rollback leaves 1 row');
 
+db3.createTable('packed', {
+  columns: [{ id: 1, name: 'id', ty: 1, primaryKey: true, nullable: false }],
+  indexes: [],
+});
+const packIntRows = (values) => {
+  const buffer = Buffer.alloc(4 + values.length * 13);
+  let offset = 0;
+  buffer.writeUInt32LE(values.length, offset);
+  offset += 4;
+  for (const value of values) {
+    buffer.writeUInt16LE(1, offset);
+    buffer.writeUInt16LE(1, offset + 2);
+    buffer.writeUInt8(1, offset + 4);
+    buffer.writeBigInt64LE(value, offset + 5);
+    offset += 13;
+  }
+  return buffer;
+};
+const packIds = (ids) => {
+  const buffer = Buffer.alloc(4 + ids.length * 8);
+  buffer.writeUInt32LE(ids.length, 0);
+  ids.forEach((id, index) => buffer.writeBigUInt64LE(id, 4 + index * 8));
+  return buffer;
+};
+const packedPut = db3.begin();
+packedPut.putPacked('packed', packIntRows([10n, 11n]));
+packedPut.put('packed', [{ columnId: 1, int64: 12n }]);
+const packedPutResult = packedPut.commitReturning();
+assert.deepEqual(packedPutResult.results.map((result) => result.kind), ['none', 'put']);
+const packedRows = db3.getTable('packed').query([]);
+const packedDelete = db3.begin();
+packedDelete.deletePacked('packed', packIds(packedRows.slice(0, 2).map((row) => row.rowId)));
+assert.deepEqual(packedDelete.commitReturning().results.map((result) => result.kind), ['none']);
+assert(db3.getTable('packed').count() === 1n, 'packed batch operations commit');
+const duplicateDelete = db3.begin();
+const remainingPackedId = db3.getTable('packed').query([])[0].rowId;
+duplicateDelete.deletePacked('packed', packIds([remainingPackedId, remainingPackedId]));
+duplicateDelete.commit();
+assert(db3.getTable('packed').count() === 0n, 'duplicate packed row ids retain delete semantics');
+const emptyPacked = db3.begin();
+emptyPacked.putPacked('packed', packIntRows([]));
+emptyPacked.deletePacked('packed', packIds([]));
+assert(emptyPacked.commitReturning().results.length === 0, 'empty packed batches stage nothing');
+const malformedPacked = db3.begin();
+assert.throws(() => malformedPacked.putPacked('packed', Buffer.from([1, 0, 0, 0])));
+assert.throws(() => malformedPacked.deletePacked('packed', Buffer.from([1, 0, 0, 0])));
+assert(malformedPacked.commitReturning().results.length === 0, 'malformed packed batch stages nothing');
+
 db3.close();
 rmSync(dir3, { recursive: true });
-console.log('smoke: cross-table Transaction ✓');
+console.log('smoke: cross-table Transaction + packed batches ✓');
 
 // ── WriteBuffer from Table + atomic visibility ─────────────────────────────
 

@@ -196,10 +196,19 @@ impl<'db> Transaction<'db> {
 
     /// Stage a delete of `row_id` on `table`.
     pub fn delete(&mut self, table: &str, row_id: RowId) -> Result<()> {
+        self.delete_batch(table, vec![row_id])
+    }
+
+    /// Stage deletes without materializing pre-images.
+    pub fn delete_batch(&mut self, table: &str, row_ids: Vec<RowId>) -> Result<()> {
         self.require_delete(table)?;
         let id = self.db.table_id(table)?;
         self.reject_after_truncate(id)?;
-        self.staging.push((id, Staged::Delete(row_id)));
+        self.staging.extend(
+            row_ids
+                .into_iter()
+                .map(|row_id| (id, Staged::Delete(row_id))),
+        );
         Ok(())
     }
 
@@ -491,8 +500,8 @@ fn columns_equal(a: &[(u16, Value)], b: &[(u16, Value)]) -> bool {
 
 /// Staged operation produced after row-id allocation (internal to commit).
 pub(crate) enum StagedOp {
-    Put(crate::memtable::Row),
-    Delete(RowId),
+    Put(Vec<crate::memtable::Row>),
+    Delete(Vec<RowId>),
     Truncate,
 }
 

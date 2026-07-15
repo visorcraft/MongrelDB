@@ -577,12 +577,13 @@ export declare class Transaction {
    * `u16 columnId`, `u8 tag`, payload — tag 0=null, 1=int64 (i64 LE),
    * 2=float64 (f64 LE), 3=bool (u8), 4=bytes (u32 len + bytes; text is UTF-8).
    * The decoded `(column_id, Value)` pairs are identical to what `put` builds.
+   * `commitReturning` emits one `none` result for the whole packed batch.
    */
   putPacked(table: string, payload: Buffer): void
   /**
    * Stage many deletes on `table` from a compact buffer of row ids:
    * `u32 count`, then `count` × `u64 LE` row id. One NAPI crossing instead
-   * of one per row.
+   * of one per row. `commitReturning` emits one `none` result for the batch.
    */
   deletePacked(table: string, payload: Buffer): void
   /**

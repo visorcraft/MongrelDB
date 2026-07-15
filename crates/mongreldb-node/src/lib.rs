@@ -2671,7 +2671,13 @@ enum TxnOp {
         cells: Vec<(u16, Value)>,
         auto_inc: Option<i64>,
     },
+    PutBatch {
+        rows: Vec<Vec<(u16, Value)>>,
+    },
     Delete(RowId),
+    DeleteBatch {
+        row_ids: Vec<RowId>,
+    },
     Truncate,
     Upsert {
         insert_cells: Vec<(u16, Value)>,
@@ -2794,33 +2800,29 @@ impl Transaction {
     /// `u16 columnId`, `u8 tag`, payload — tag 0=null, 1=int64 (i64 LE),
     /// 2=float64 (f64 LE), 3=bool (u8), 4=bytes (u32 len + bytes; text is UTF-8).
     /// The decoded `(column_id, Value)` pairs are identical to what `put` builds.
+    /// `commitReturning` emits one `none` result for the whole packed batch.
     #[napi]
     pub fn put_packed(&self, table: String, payload: Buffer) -> napi::Result<()> {
         let rows = decode_packed_puts(&payload)?;
-        let mut buf = self.staging.lock();
-        buf.reserve(rows.len());
-        for cols in rows {
-            buf.push((
-                table.clone(),
-                TxnOp::Put {
-                    cells: cols,
-                    auto_inc: None,
-                },
-            ));
+        if !rows.is_empty() {
+            self.staging.lock().push((table, TxnOp::PutBatch { rows }));
         }
         Ok(())
     }
 
     /// Stage many deletes on `table` from a compact buffer of row ids:
     /// `u32 count`, then `count` × `u64 LE` row id. One NAPI crossing instead
-    /// of one per row.
+    /// of one per row. `commitReturning` emits one `none` result for the batch.
     #[napi]
     pub fn delete_packed(&self, table: String, payload: Buffer) -> napi::Result<()> {
-        let ids = decode_packed_row_ids(&payload)?;
-        let mut buf = self.staging.lock();
-        buf.reserve(ids.len());
-        for rid in ids {
-            buf.push((table.clone(), TxnOp::Delete(RowId(rid))));
+        let row_ids = decode_packed_row_ids(&payload)?
+            .into_iter()
+            .map(RowId)
+            .collect::<Vec<_>>();
+        if !row_ids.is_empty() {
+            self.staging
+                .lock()
+                .push((table, TxnOp::DeleteBatch { row_ids }));
         }
         Ok(())
     }
@@ -3123,8 +3125,16 @@ fn apply_txn(
                         result,
                     });
                 }
+                TxnOp::PutBatch { rows } => {
+                    tx.put_batch(table, rows.clone())?;
+                    out.push(OpResult::None);
+                }
                 TxnOp::Delete(rid) => {
                     tx.delete(table, *rid)?;
+                    out.push(OpResult::None);
+                }
+                TxnOp::DeleteBatch { row_ids } => {
+                    tx.delete_batch(table, row_ids.clone())?;
                     out.push(OpResult::None);
                 }
                 TxnOp::Truncate => {
