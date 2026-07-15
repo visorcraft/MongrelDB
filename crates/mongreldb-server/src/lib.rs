@@ -2355,10 +2355,11 @@ async fn execute_sql(
     // matter most for diagnosis), checked before branching on the outcome.
     if elapsed >= state.slow_query_threshold {
         state.metrics.inc_slow_queries();
-        let preview: String = req.sql.chars().take(80).collect();
         eprintln!(
-            "[slow-query] {}\u{00b5}s \u{2014} {preview}",
-            elapsed.as_micros()
+            "[slow-query] {}\u{00b5}s query_id={} operation={}",
+            elapsed.as_micros(),
+            query_id,
+            safe_sql_operation(&req.sql)
         );
     }
     // Audit DDL/privilege AFTER execution so the outcome (ok/fail) is captured.
@@ -2374,6 +2375,17 @@ async fn execute_sql(
             tracked_query_error_response(state, &e, Some(query_id))
         }
     }
+}
+
+fn safe_sql_operation(sql: &str) -> String {
+    sql.split_whitespace()
+        .next()
+        .unwrap_or("UNKNOWN")
+        .chars()
+        .filter(|character| character.is_ascii_alphabetic())
+        .take(16)
+        .collect::<String>()
+        .to_ascii_uppercase()
 }
 
 fn remote_boolean_ai_error() -> Response {
@@ -2790,6 +2802,14 @@ mod auth_tests {
     use super::*;
     use mongreldb_core::Database;
     use tempfile::tempdir;
+
+    #[test]
+    fn slow_query_operation_does_not_include_literals() {
+        let sql = "CREATE USER alice PASSWORD 'never-log-this'";
+        let operation = safe_sql_operation(sql);
+        assert_eq!(operation, "CREATE");
+        assert!(!operation.contains("never-log-this"));
+    }
 
     #[tokio::test]
     async fn auth_rejects_missing_token() {
