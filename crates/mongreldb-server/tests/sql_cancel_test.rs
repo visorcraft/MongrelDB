@@ -184,3 +184,104 @@ async fn timeout_validation_and_header_precedence_are_stable() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()["x-mongreldb-query-id"], body_id);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn buffered_serialization_is_cancellable() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    let sessions = Arc::new(SessionStore::new(8, Duration::from_secs(60)));
+    let app = build_app_with_sessions(
+        db,
+        std::iter::empty(),
+        None,
+        None,
+        false,
+        Arc::clone(&sessions),
+    );
+    let opened = app
+        .clone()
+        .oneshot(request("POST", "/sessions", Value::Null))
+        .await
+        .unwrap();
+    let session_id = json_body(opened).await["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let entry = sessions.get(&session_id, "anonymous").unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let hook_barrier = Arc::clone(&barrier);
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    entry.session.set_test_hook(Some(Arc::new(move |point| {
+        if point == SqlTestHookPoint::BeforeSerializationBatch {
+            let _ = entered_tx.send(());
+            hook_barrier.wait();
+        }
+    })));
+
+    let query_id = "11112222333344445555666677778888";
+    let mut sql_request = request(
+        "POST",
+        "/sql",
+        json!({ "sql": "SELECT 1", "query_id": query_id }),
+    );
+    sql_request
+        .headers_mut()
+        .insert("x-session-id", session_id.parse().unwrap());
+    let sql_task = tokio::spawn(app.clone().oneshot(sql_request));
+    tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
+        .await
+        .unwrap();
+
+    let status = app
+        .clone()
+        .oneshot(request("GET", &format!("/queries/{query_id}"), Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(json_body(status).await["state"], "serializing");
+    let cancelled = app
+        .oneshot(request(
+            "POST",
+            &format!("/queries/{query_id}/cancel"),
+            Value::Null,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(cancelled.status(), StatusCode::ACCEPTED);
+    barrier.wait();
+    let response = sql_task.await.unwrap().unwrap();
+    assert_eq!(response.status().as_u16(), 499);
+    assert_eq!(
+        json_body(response).await["error"]["code"],
+        "QUERY_CANCELLED"
+    );
+}
+
+#[tokio::test]
+async fn dropping_arrow_stream_cancels_and_cleans_registry_entry() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    let app = build_app(db);
+    let query_id = "9999aaaabbbbccccddddeeeeffff0000";
+    let response = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/sql",
+            json!({
+                "sql": "SELECT 1",
+                "format": "arrow-stream",
+                "query_id": query_id
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(response);
+
+    let status = app
+        .oneshot(request("GET", &format!("/queries/{query_id}"), Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(status.status(), StatusCode::OK);
+    assert_eq!(json_body(status).await["state"], "cancelled");
+}

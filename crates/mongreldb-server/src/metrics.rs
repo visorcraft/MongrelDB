@@ -29,6 +29,16 @@ pub struct Metrics {
     pub commits: AtomicU64,
     /// Total `POST /txn` atomic batch calls.
     pub txns: AtomicU64,
+    pub sql_cancel_requests: AtomicU64,
+    pub sql_cancelled: AtomicU64,
+    pub sql_cancelled_by_reason: [AtomicU64; 6],
+    pub sql_deadline_exceeded: AtomicU64,
+    pub sql_commit_cancel_winner_cancel: AtomicU64,
+    pub sql_commit_cancel_winner_commit: AtomicU64,
+    pub sql_stuck_after_cancel: AtomicU64,
+    pub sql_output_bytes: AtomicU64,
+    pub sql_cancel_latency_micros: AtomicU64,
+    pub sql_cancel_latency_count: AtomicU64,
 }
 
 impl Metrics {
@@ -68,23 +78,149 @@ impl Metrics {
         self.txns.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn inc_sql_cancel_requests(&self) {
+        self.sql_cancel_requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_sql_cancelled(&self, reason: mongreldb_core::CancellationReason) {
+        self.sql_cancelled.fetch_add(1, Ordering::Relaxed);
+        self.sql_cancelled_by_reason[reason as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_sql_deadline_exceeded(&self) {
+        self.sql_deadline_exceeded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_sql_commit_cancel_winner_cancel(&self) {
+        self.sql_commit_cancel_winner_cancel
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_sql_commit_cancel_winner_commit(&self) {
+        self.sql_commit_cancel_winner_commit
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn add_sql_stuck_after_cancel(&self, count: usize) {
+        self.sql_stuck_after_cancel
+            .fetch_add(count.min(u64::MAX as usize) as u64, Ordering::Relaxed);
+    }
+
+    pub fn add_sql_output_bytes(&self, bytes: usize) {
+        self.sql_output_bytes
+            .fetch_add(bytes.min(u64::MAX as usize) as u64, Ordering::Relaxed);
+    }
+
+    pub fn observe_sql_cancel_latency(&self, latency: std::time::Duration) {
+        self.sql_cancel_latency_micros.fetch_add(
+            latency.as_micros().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
+        self.sql_cancel_latency_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Render the current counter values as a Prometheus text-format body.
     ///
     /// `table_count` is passed in as a gauge (it is read off the live
     /// `Database` at scrape time rather than maintained as a counter).
-    pub fn prometheus_text(&self, table_count: usize) -> String {
+    pub fn prometheus_text(
+        &self,
+        table_count: usize,
+        active_queries: usize,
+        queued_queries: usize,
+        registry_entries: usize,
+        registry_bytes: usize,
+    ) -> String {
         let sql_queries = self.sql_queries.load(Ordering::Relaxed);
         let sql_errors = self.sql_errors.load(Ordering::Relaxed);
         let slow_queries = self.slow_queries.load(Ordering::Relaxed);
         let puts = self.puts.load(Ordering::Relaxed);
         let commits = self.commits.load(Ordering::Relaxed);
         let txns = self.txns.load(Ordering::Relaxed);
+        let cancel_requests = self.sql_cancel_requests.load(Ordering::Relaxed);
+        let cancelled = self.sql_cancelled.load(Ordering::Relaxed);
+        let cancelled_by_reason = self
+            .sql_cancelled_by_reason
+            .each_ref()
+            .map(|counter| counter.load(Ordering::Relaxed));
+        let deadline_exceeded = self.sql_deadline_exceeded.load(Ordering::Relaxed);
+        let race_cancel = self.sql_commit_cancel_winner_cancel.load(Ordering::Relaxed);
+        let race_commit = self.sql_commit_cancel_winner_commit.load(Ordering::Relaxed);
+        let stuck = self.sql_stuck_after_cancel.load(Ordering::Relaxed);
+        let output_bytes = self.sql_output_bytes.load(Ordering::Relaxed);
+        let cancel_latency_micros = self.sql_cancel_latency_micros.load(Ordering::Relaxed);
+        let cancel_latency_count = self.sql_cancel_latency_count.load(Ordering::Relaxed);
 
         let mut out = String::with_capacity(1024);
         // mongreldb_sql_queries_total
         out.push_str("# HELP mongreldb_sql_queries_total Total /sql requests received.\n");
         out.push_str("# TYPE mongreldb_sql_queries_total counter\n");
         out.push_str(&format!("mongreldb_sql_queries_total {sql_queries}\n\n"));
+        out.push_str("# TYPE mongreldb_sql_active_queries gauge\n");
+        out.push_str(&format!(
+            "mongreldb_sql_active_queries {active_queries}\n\n"
+        ));
+        out.push_str("# TYPE mongreldb_sql_queued_queries gauge\n");
+        out.push_str(&format!(
+            "mongreldb_sql_queued_queries {queued_queries}\n\n"
+        ));
+        out.push_str("# TYPE mongreldb_sql_cancel_requests_total counter\n");
+        out.push_str(&format!(
+            "mongreldb_sql_cancel_requests_total {cancel_requests}\n\n"
+        ));
+        out.push_str("# TYPE mongreldb_sql_cancelled_total counter\n");
+        out.push_str(&format!("mongreldb_sql_cancelled_total {cancelled}\n"));
+        for (index, reason) in [
+            "none",
+            "client_request",
+            "deadline",
+            "client_disconnected",
+            "session_closed",
+            "server_shutdown",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            out.push_str(&format!(
+                "mongreldb_sql_cancelled_total{{reason=\"{reason}\"}} {}\n",
+                cancelled_by_reason[index]
+            ));
+        }
+        out.push('\n');
+        out.push_str("# TYPE mongreldb_sql_cancel_latency_seconds summary\n");
+        out.push_str(&format!(
+            "mongreldb_sql_cancel_latency_seconds_sum {}\n",
+            cancel_latency_micros as f64 / 1_000_000.0
+        ));
+        out.push_str(&format!(
+            "mongreldb_sql_cancel_latency_seconds_count {cancel_latency_count}\n\n"
+        ));
+        out.push_str("# TYPE mongreldb_sql_deadline_exceeded_total counter\n");
+        out.push_str(&format!(
+            "mongreldb_sql_deadline_exceeded_total {deadline_exceeded}\n\n"
+        ));
+        out.push_str("# TYPE mongreldb_sql_commit_cancel_races_total counter\n");
+        out.push_str(&format!(
+            "mongreldb_sql_commit_cancel_races_total{{winner=\"cancel\"}} {race_cancel}\n"
+        ));
+        out.push_str(&format!(
+            "mongreldb_sql_commit_cancel_races_total{{winner=\"commit\"}} {race_commit}\n\n"
+        ));
+        out.push_str("# TYPE mongreldb_sql_registry_entries gauge\n");
+        out.push_str(&format!(
+            "mongreldb_sql_registry_entries {registry_entries}\n\n"
+        ));
+        out.push_str("# TYPE mongreldb_sql_registry_bytes gauge\n");
+        out.push_str(&format!(
+            "mongreldb_sql_registry_bytes {registry_bytes}\n\n"
+        ));
+        out.push_str("# TYPE mongreldb_sql_stuck_after_cancel_total counter\n");
+        out.push_str(&format!(
+            "mongreldb_sql_stuck_after_cancel_total {stuck}\n\n"
+        ));
+        out.push_str("# TYPE mongreldb_sql_output_bytes counter\n");
+        out.push_str(&format!("mongreldb_sql_output_bytes {output_bytes}\n\n"));
         // mongreldb_sql_errors_total
         out.push_str("# HELP mongreldb_sql_errors_total /sql requests that returned an error.\n");
         out.push_str("# TYPE mongreldb_sql_errors_total counter\n");
@@ -140,7 +276,7 @@ mod tests {
         m.inc_puts();
         m.inc_commits();
         m.inc_txns();
-        let body = m.prometheus_text(3);
+        let body = m.prometheus_text(3, 1, 1, 2, 512);
         // HELP/TYPE lines present for every series.
         assert!(body.contains("# TYPE mongreldb_sql_queries_total counter"));
         assert!(body.contains("# TYPE mongreldb_sql_errors_total counter"));

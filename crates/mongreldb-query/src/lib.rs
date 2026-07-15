@@ -1724,12 +1724,71 @@ fn buffered_stream(batches: Vec<RecordBatch>) -> MongrelRecordBatchStream {
     Box::pin(RecordBatchStreamAdapter::new(schema, stream))
 }
 
+/// Buffered SQL output whose registry entry and session permit remain live
+/// until response serialization explicitly succeeds or fails.
+pub struct ManagedQueryBatches {
+    batches: Vec<RecordBatch>,
+    query: RegisteredSqlQuery,
+    guard: Option<RegisteredQueryGuard>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl ManagedQueryBatches {
+    pub fn batches(&self) -> &[RecordBatch] {
+        &self.batches
+    }
+
+    pub fn query(&self) -> &RegisteredSqlQuery {
+        &self.query
+    }
+
+    pub fn complete(mut self) {
+        if let Some(guard) = self.guard.take() {
+            guard.complete();
+        }
+        self.permit.take();
+    }
+
+    pub fn fail(mut self) {
+        if let Some(guard) = self.guard.take() {
+            guard.fail();
+        }
+        self.permit.take();
+    }
+}
+
+impl Drop for ManagedQueryBatches {
+    fn drop(&mut self) {
+        if self.guard.is_some() {
+            let _ = self
+                .query
+                .request_cancel(mongreldb_core::CancellationReason::ClientDisconnected);
+            if let Some(guard) = self.guard.take() {
+                guard.fail();
+            }
+        }
+    }
+}
+
 struct ManagedQueryStream {
     inner: MongrelRecordBatchStream,
     schema: SchemaRef,
     query: RegisteredSqlQuery,
     guard: Option<RegisteredQueryGuard>,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    deferred_completion: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+#[derive(Clone)]
+pub struct SqlStreamCompletion {
+    completed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl SqlStreamCompletion {
+    pub fn complete(&self) {
+        self.completed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
 }
 
 struct TransactionStatementGuard<'a> {
@@ -1786,10 +1845,12 @@ impl futures::Stream for ManagedQueryStream {
         match self.inner.as_mut().poll_next(context) {
             std::task::Poll::Ready(None) => {
                 self.query.complete_current_statement();
-                if let Some(guard) = self.guard.take() {
-                    guard.complete();
+                if self.deferred_completion.is_none() {
+                    if let Some(guard) = self.guard.take() {
+                        guard.complete();
+                    }
+                    self.permit.take();
                 }
-                self.permit.take();
                 std::task::Poll::Ready(None)
             }
             std::task::Poll::Ready(Some(Err(error))) => {
@@ -1813,11 +1874,21 @@ impl datafusion::physical_plan::RecordBatchStream for ManagedQueryStream {
 impl Drop for ManagedQueryStream {
     fn drop(&mut self) {
         if self.guard.is_some() {
-            let _ = self
-                .query
-                .request_cancel(mongreldb_core::CancellationReason::ClientDisconnected);
-            if let Some(guard) = self.guard.take() {
-                guard.fail();
+            let completed = self
+                .deferred_completion
+                .as_ref()
+                .is_some_and(|completion| completion.load(std::sync::atomic::Ordering::Acquire));
+            if completed {
+                if let Some(guard) = self.guard.take() {
+                    guard.complete();
+                }
+            } else {
+                let _ = self
+                    .query
+                    .request_cancel(mongreldb_core::CancellationReason::ClientDisconnected);
+                if let Some(guard) = self.guard.take() {
+                    guard.fail();
+                }
             }
         }
     }
@@ -2013,6 +2084,11 @@ impl MongrelSession {
     #[doc(hidden)]
     pub fn set_test_hook(&self, hook: Option<SqlTestHook>) {
         *self.test_hook.lock() = hook;
+    }
+
+    #[doc(hidden)]
+    pub fn sql_test_hook(&self) -> Option<SqlTestHook> {
+        self.test_hook.lock().clone()
     }
 
     #[doc(hidden)]
@@ -2713,6 +2789,29 @@ impl MongrelSession {
         sql: &str,
         query: RegisteredSqlQuery,
     ) -> Result<MongrelRecordBatchStream> {
+        self.run_stream_with_query_mode(sql, query, false)
+            .await
+            .map(|(stream, _)| stream)
+    }
+
+    pub async fn run_stream_with_query_for_serialization(
+        &self,
+        sql: &str,
+        query: RegisteredSqlQuery,
+    ) -> Result<(MongrelRecordBatchStream, SqlStreamCompletion)> {
+        let (stream, completion) = self.run_stream_with_query_mode(sql, query, true).await?;
+        Ok((
+            stream,
+            completion.expect("deferred stream completion is present"),
+        ))
+    }
+
+    async fn run_stream_with_query_mode(
+        &self,
+        sql: &str,
+        query: RegisteredSqlQuery,
+        defer_completion: bool,
+    ) -> Result<(MongrelRecordBatchStream, Option<SqlStreamCompletion>)> {
         query.set_sql_metadata(sql);
         let guard = RegisteredQueryGuard::new(query.clone());
         self.fire_test_hook(SqlTestHookPoint::WaitingForSessionPermit);
@@ -2747,14 +2846,26 @@ impl MongrelSession {
             }
         };
         query.transition(SqlQueryPhase::Executing, SqlQueryPhase::Streaming)?;
+        let deferred_completion =
+            defer_completion.then(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        if defer_completion {
+            query.begin_serialization()?;
+        }
         let schema = stream.schema();
-        Ok(Box::pin(ManagedQueryStream {
+        let completion = deferred_completion
+            .as_ref()
+            .map(|completed| SqlStreamCompletion {
+                completed: Arc::clone(completed),
+            });
+        let stream = Box::pin(ManagedQueryStream {
             inner: stream,
             schema,
             query,
             guard: Some(guard),
             permit: Some(permit),
-        }))
+            deferred_completion,
+        });
+        Ok((stream, completion))
     }
 
     pub async fn run_stream(&self, sql: &str) -> Result<MongrelRecordBatchStream> {
@@ -2882,6 +2993,57 @@ impl MongrelSession {
                 query.complete_current_statement();
                 guard.complete();
                 Ok(batches)
+            }
+            Err(error) => {
+                guard.fail();
+                Err(error)
+            }
+        }
+    }
+
+    /// Execute and collect SQL while deferring registry completion until a
+    /// caller finishes response serialization.
+    pub async fn run_with_query_for_serialization(
+        &self,
+        sql: &str,
+        query: RegisteredSqlQuery,
+    ) -> Result<ManagedQueryBatches> {
+        query.set_sql_metadata(sql);
+        let guard = RegisteredQueryGuard::new(query.clone());
+        self.fire_test_hook(SqlTestHookPoint::WaitingForSessionPermit);
+        let permit = tokio::select! {
+            permit = Arc::clone(&self.execution_gate).acquire_owned() => permit.map_err(|_| {
+                MongrelQueryError::InvalidQueryState("session execution gate closed".into())
+            })?,
+            _ = query.control().cancelled() => {
+                let error = query.checkpoint().unwrap_err();
+                guard.fail();
+                return Err(error);
+            }
+        };
+        query.transition(SqlQueryPhase::Queued, SqlQueryPhase::Planning)?;
+        self.fire_test_hook(SqlTestHookPoint::Planning);
+        query.transition(SqlQueryPhase::Planning, SqlQueryPhase::Executing)?;
+        query.begin_statement(0);
+        let result = CURRENT_SQL_QUERY
+            .scope(query.clone(), async {
+                tokio::select! {
+                    biased;
+                    result = self.run_internal(sql, &query) => result,
+                    _ = query.control().cancelled() => Err(query.checkpoint().unwrap_err()),
+                }
+            })
+            .await;
+        match result {
+            Ok(batches) => {
+                query.complete_current_statement();
+                query.begin_serialization()?;
+                Ok(ManagedQueryBatches {
+                    batches,
+                    query,
+                    guard: Some(guard),
+                    permit: Some(permit),
+                })
             }
             Err(error) => {
                 guard.fail();

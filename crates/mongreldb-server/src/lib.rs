@@ -26,8 +26,9 @@ use axum::Json;
 use mongreldb_core::schema::{Schema, TypeId};
 use mongreldb_core::{CancellationReason, Database, Value};
 use mongreldb_query::{
-    CancelOutcome, ExternalTableModule, MongrelSession, QueryId, RegisteredQueryGuard,
-    RegisteredSqlQuery, SqlQueryOptions, SqlQueryPhase, SqlQueryRegistry,
+    CancelOutcome, ExternalTableModule, ManagedQueryBatches, MongrelSession, QueryId,
+    RegisteredQueryGuard, RegisteredSqlQuery, SqlQueryOptions, SqlQueryPhase, SqlQueryRegistry,
+    SqlStreamCompletion,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -130,6 +131,8 @@ struct AppState {
     sql_default_timeout: std::time::Duration,
     sql_max_timeout: std::time::Duration,
     sql_cancel_grace: std::time::Duration,
+    sql_max_output_bytes: usize,
+    sql_max_output_rows: usize,
     accepting_sql: Arc<AtomicBool>,
     /// Process-local HMAC key for stateless Kit cursors. Restart invalidates cursors.
     cursor_mac_key: [u8; 32],
@@ -143,6 +146,7 @@ pub struct ServerControl {
     sessions: Arc<sessions::SessionStore>,
     accepting_sql: Arc<AtomicBool>,
     cancel_grace: std::time::Duration,
+    metrics: Arc<metrics::Metrics>,
 }
 
 impl ServerControl {
@@ -155,7 +159,9 @@ impl ServerControl {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         self.sessions.close_all();
-        self.query_registry.active_count()
+        let stuck = self.query_registry.active_count();
+        self.metrics.add_sql_stuck_after_cancel(stuck);
+        stuck
     }
 }
 
@@ -256,11 +262,13 @@ pub fn build_app_with_sessions_and_control(
     let sql_cancel_grace = default_sql_cancel_grace();
     let sql_max_timeout = default_sql_max_timeout();
     let sql_default_timeout = default_sql_default_timeout().min(sql_max_timeout);
+    let metrics = Arc::new(metrics::Metrics::default());
     let server_control = ServerControl {
         query_registry: Arc::clone(&query_registry),
         sessions: Arc::clone(&sessions),
         accepting_sql: Arc::clone(&accepting_sql),
         cancel_grace: sql_cancel_grace,
+        metrics: Arc::clone(&metrics),
     };
     let state = Arc::new(AppState {
         idem: kit::IdempotencyStore::new(db.root()),
@@ -268,7 +276,7 @@ pub fn build_app_with_sessions_and_control(
         external_modules: external_modules.into_iter().collect(),
         auth_token,
         user_auth,
-        metrics: Arc::new(metrics::Metrics::default()),
+        metrics,
         slow_query_threshold: metrics::slow_query_threshold(),
         audit: Arc::new(audit::AuditLog::new(8192)),
         sessions,
@@ -278,6 +286,8 @@ pub fn build_app_with_sessions_and_control(
         sql_default_timeout,
         sql_max_timeout,
         sql_cancel_grace,
+        sql_max_output_bytes: default_sql_max_output_bytes(),
+        sql_max_output_rows: default_sql_max_output_rows(),
         accepting_sql,
         cursor_mac_key,
     });
@@ -946,6 +956,14 @@ fn default_sql_cancel_grace() -> std::time::Duration {
     std::time::Duration::from_millis(positive_env_u64("MONGRELDB_SQL_CANCEL_GRACE_MS", 1_000))
 }
 
+fn default_sql_max_output_bytes() -> usize {
+    positive_env_usize("MONGRELDB_SQL_MAX_OUTPUT_BYTES", 64 * 1024 * 1024)
+}
+
+fn default_sql_max_output_rows() -> usize {
+    positive_env_usize("MONGRELDB_SQL_MAX_OUTPUT_ROWS", 1_000_000)
+}
+
 /// The principal a request is attributed to, for session ownership: a resolved
 /// user principal wins; otherwise `token` when token auth is active; else
 /// `anonymous` (no auth configured).
@@ -1041,13 +1059,99 @@ async fn close_session(
 
 /// Choose a buffered response serialization: `"arrow"` (IPC file) or JSON.
 /// Streaming IPC is dispatched before query collection.
-fn dispatch_buffered_sql_format(
+async fn dispatch_buffered_sql_format(
+    state: &AppState,
     format: Option<&str>,
-    batches: &[arrow::record_batch::RecordBatch],
+    output: ManagedQueryBatches,
+    query_id: QueryId,
+    test_hook: Option<mongreldb_query::SqlTestHook>,
 ) -> Response {
-    match format {
-        Some("arrow") => sql_arrow_response(batches),
-        _ => sql_json_response(batches),
+    let format = format.unwrap_or("json").to_owned();
+    let max_rows = state.sql_max_output_rows;
+    let max_bytes = state.sql_max_output_bytes;
+    let serialized = tokio::task::spawn_blocking(move || {
+        let result =
+            serialize_buffered_output(&format, &output, max_rows, max_bytes, test_hook.as_ref());
+        (output, result)
+    })
+    .await;
+    let (output, result) = match serialized {
+        Ok(result) => result,
+        Err(error) => {
+            return with_query_id(
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "status": "aborted",
+                        "error": {
+                            "code": "SERIALIZATION_WORKER_FAILED",
+                            "message": error.to_string(),
+                            "query_id": query_id.to_string(),
+                        }
+                    })),
+                )
+                    .into_response(),
+                query_id,
+            )
+        }
+    };
+    match result {
+        Ok(serialized) => {
+            state.metrics.add_sql_output_bytes(serialized.bytes.len());
+            output.complete();
+            let content_type = if serialized.arrow {
+                "application/vnd.apache.arrow.file"
+            } else {
+                "application/json"
+            };
+            with_query_id(
+                ([(header::CONTENT_TYPE, content_type)], serialized.bytes).into_response(),
+                query_id,
+            )
+        }
+        Err(BufferedSerializationError::Query(error)) => {
+            output.fail();
+            state.metrics.inc_sql_errors();
+            tracked_query_error_response(state, &error, Some(query_id))
+        }
+        Err(BufferedSerializationError::Limit(message)) => {
+            output.fail();
+            state.metrics.inc_sql_errors();
+            with_query_id(
+                (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    Json(json!({
+                        "status": "aborted",
+                        "error": {
+                            "code": "RESULT_LIMIT_EXCEEDED",
+                            "message": message,
+                            "query_id": query_id.to_string(),
+                        }
+                    })),
+                )
+                    .into_response(),
+                query_id,
+            )
+        }
+        Err(BufferedSerializationError::Encoding(message)) => {
+            output.fail();
+            state.metrics.inc_sql_errors();
+            with_query_id(
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "status": "aborted",
+                        "error": {
+                            "code": "SERIALIZATION_FAILED",
+                            "message": message,
+                            "query_id": query_id.to_string(),
+                        }
+                    })),
+                )
+                    .into_response(),
+                query_id,
+            )
+        }
     }
 }
 
@@ -1150,12 +1254,12 @@ async fn prepare_statement(
     };
     let query = match entry.session.register_query(options) {
         Ok(query) => query,
-        Err(error) => return query_error_response(&error, Some(query_id)),
+        Err(error) => return tracked_query_error_response(&state, &error, Some(query_id)),
     };
     let registration = RegisteredQueryGuard::new(query);
     let _sql_permit = match acquire_sql_permit(&state, &entry.session, registration.query()).await {
         Ok(permit) => permit,
-        Err(error) => return query_error_response(&error, Some(query_id)),
+        Err(error) => return tracked_query_error_response(&state, &error, Some(query_id)),
     };
     let _guard = tokio::select! {
         guard = entry.lock.lock() => guard,
@@ -1180,7 +1284,7 @@ async fn prepare_statement(
             Json(json!({ "prepared": req.name })).into_response(),
             query_id,
         ),
-        Err(error) => query_error_response(&error, Some(query_id)),
+        Err(error) => tracked_query_error_response(&state, &error, Some(query_id)),
     }
 }
 
@@ -1233,12 +1337,12 @@ async fn execute_statement(
     };
     let query = match entry.session.register_query(options) {
         Ok(query) => query,
-        Err(error) => return query_error_response(&error, Some(query_id)),
+        Err(error) => return tracked_query_error_response(&state, &error, Some(query_id)),
     };
     let registration = RegisteredQueryGuard::new(query);
-    let _sql_permit = match acquire_sql_permit(&state, &entry.session, registration.query()).await {
+    let sql_permit = match acquire_sql_permit(&state, &entry.session, registration.query()).await {
         Ok(permit) => permit,
-        Err(error) => return query_error_response(&error, Some(query_id)),
+        Err(error) => return tracked_query_error_response(&state, &error, Some(query_id)),
     };
     let _guard = tokio::select! {
         guard = entry.lock.lock() => guard,
@@ -1273,18 +1377,38 @@ async fn execute_statement(
     let start = std::time::Instant::now();
     let result = if req.format.as_deref() == Some("arrow-stream") {
         let query = registration.into_query();
-        entry
+        match entry
             .session
-            .run_stream_with_query(&sql, query)
+            .run_stream_with_query_for_serialization(&sql, query)
             .await
-            .map(sql_arrow_stream_response)
+        {
+            Ok((stream, completion)) => Ok(sql_arrow_stream_response_controlled(
+                stream,
+                completion,
+                sql_permit,
+                state.sql_max_output_rows,
+                state.sql_max_output_bytes,
+                Arc::clone(&state.metrics),
+            )),
+            Err(error) => Err(error),
+        }
     } else {
         let query = registration.into_query();
-        entry
+        match entry
             .session
-            .run_with_query(&sql, query)
+            .run_with_query_for_serialization(&sql, query)
             .await
-            .map(|batches| dispatch_buffered_sql_format(req.format.as_deref(), &batches))
+        {
+            Ok(output) => Ok(dispatch_buffered_sql_format(
+                &state,
+                req.format.as_deref(),
+                output,
+                query_id,
+                entry.session.sql_test_hook(),
+            )
+            .await),
+            Err(error) => Err(error),
+        }
     };
     let elapsed = start.elapsed();
     if elapsed >= state.slow_query_threshold {
@@ -1307,7 +1431,7 @@ async fn execute_statement(
                 status_for_query_error(&e)
             };
             if status == status_for_query_error(&e) {
-                query_error_response(&e, Some(query_id))
+                tracked_query_error_response(&state, &e, Some(query_id))
             } else {
                 with_query_id(
                     (status, format!("{msg} ({}µs)", elapsed.as_micros())).into_response(),
@@ -1360,7 +1484,13 @@ async fn metrics_handler(
     ) {
         return (status_for_error(&error), error.to_string()).into_response();
     }
-    let body = state.metrics.prometheus_text(state.db.table_names().len());
+    let body = state.metrics.prometheus_text(
+        state.db.table_names().len(),
+        state.query_registry.active_count(),
+        state.query_registry.queued_count(),
+        state.query_registry.entry_count(),
+        state.query_registry.approximate_bytes(),
+    );
     (
         [(
             header::CONTENT_TYPE,
@@ -1739,6 +1869,39 @@ fn query_error_response(
     response
 }
 
+fn record_query_error(metrics: &metrics::Metrics, error: &mongreldb_query::MongrelQueryError) {
+    match error {
+        mongreldb_query::MongrelQueryError::QueryCancelled { reason, .. } => {
+            metrics.inc_sql_cancelled(*reason)
+        }
+        mongreldb_query::MongrelQueryError::DeadlineExceeded { .. } => {
+            metrics.inc_sql_deadline_exceeded();
+            metrics.inc_sql_cancelled(CancellationReason::Deadline);
+        }
+        _ => {}
+    }
+}
+
+fn tracked_query_error_response(
+    state: &AppState,
+    error: &mongreldb_query::MongrelQueryError,
+    query_id: Option<QueryId>,
+) -> Response {
+    record_query_error(&state.metrics, error);
+    if let mongreldb_query::MongrelQueryError::QueryCancelled { query_id, .. } = error {
+        if let Some(requested_at) = state
+            .query_registry
+            .status(*query_id)
+            .and_then(|status| status.cancel_requested_at)
+        {
+            state
+                .metrics
+                .observe_sql_cancel_latency(requested_at.elapsed());
+        }
+    }
+    query_error_response(error, query_id)
+}
+
 fn add_query_id_header(response: &mut Response, query_id: QueryId) {
     if let Ok(value) = axum::http::HeaderValue::from_str(&query_id.to_string()) {
         response.headers_mut().insert("x-mongreldb-query-id", value);
@@ -1909,6 +2072,7 @@ async fn query_status(
         "session_id": status.session_id,
         "operation": status.operation,
         "committed": status.committed,
+        "cancellation_reason": format!("{:?}", status.cancellation_reason).to_ascii_lowercase(),
         "completed_statements": status.completed_statements,
         "statement_index": status.statement_index,
     }))
@@ -1930,9 +2094,13 @@ async fn cancel_query(
     if !caller_may_manage_query(&state, &principal, status.owner.as_deref()) {
         return StatusCode::NOT_FOUND.into_response();
     }
+    state.metrics.inc_sql_cancel_requests();
     let (http_status, body) = match state.query_registry.cancel(query_id) {
         CancelOutcome::Accepted => (
-            StatusCode::ACCEPTED,
+            {
+                state.metrics.inc_sql_commit_cancel_winner_cancel();
+                StatusCode::ACCEPTED
+            },
             json!({ "query_id": query_id.to_string(), "state": "cancellation_requested" }),
         ),
         CancelOutcome::AlreadyCancelling => (
@@ -1940,7 +2108,10 @@ async fn cancel_query(
             json!({ "query_id": query_id.to_string(), "state": "cancelling" }),
         ),
         CancelOutcome::TooLate => (
-            StatusCode::CONFLICT,
+            {
+                state.metrics.inc_sql_commit_cancel_winner_commit();
+                StatusCode::CONFLICT
+            },
             json!({
                 "query_id": query_id.to_string(),
                 "state": "commit_critical",
@@ -2002,13 +2173,13 @@ async fn sql(
         };
         let query = match entry.session.register_query(options) {
             Ok(query) => query,
-            Err(error) => return query_error_response(&error, Some(query_id)),
+            Err(error) => return tracked_query_error_response(&state, &error, Some(query_id)),
         };
         let registration = RegisteredQueryGuard::new(query);
-        let _sql_permit =
+        let sql_permit =
             match acquire_sql_permit(&state, &entry.session, registration.query()).await {
                 Ok(permit) => permit,
-                Err(error) => return query_error_response(&error, Some(query_id)),
+                Err(error) => return tracked_query_error_response(&state, &error, Some(query_id)),
             };
         // Registration and global admission happen before this session lock.
         let _guard = tokio::select! {
@@ -2027,7 +2198,16 @@ async fn sql(
         }
         entry.touch();
         let query = registration.into_query();
-        execute_sql(&state, &principal, &entry.session, req, query, query_id).await
+        execute_sql(
+            &state,
+            &principal,
+            &entry.session,
+            req,
+            query,
+            query_id,
+            sql_permit,
+        )
+        .await
     } else {
         let session = match MongrelSession::open_with_external_modules_as(
             Arc::clone(&state.db),
@@ -2050,15 +2230,18 @@ async fn sql(
         };
         let query = match session.register_query(options) {
             Ok(query) => query,
-            Err(error) => return query_error_response(&error, Some(query_id)),
+            Err(error) => return tracked_query_error_response(&state, &error, Some(query_id)),
         };
         let registration = RegisteredQueryGuard::new(query);
-        let _sql_permit = match acquire_sql_permit(&state, &session, registration.query()).await {
+        let sql_permit = match acquire_sql_permit(&state, &session, registration.query()).await {
             Ok(permit) => permit,
-            Err(error) => return query_error_response(&error, Some(query_id)),
+            Err(error) => return tracked_query_error_response(&state, &error, Some(query_id)),
         };
         let query = registration.into_query();
-        execute_sql(&state, &principal, &session, req, query, query_id).await
+        execute_sql(
+            &state, &principal, &session, req, query, query_id, sql_permit,
+        )
+        .await
     }
 }
 
@@ -2073,6 +2256,7 @@ async fn execute_sql(
     req: SqlRequest,
     query: RegisteredSqlQuery,
     query_id: QueryId,
+    sql_permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Response {
     state.metrics.inc_sql_queries();
     let audited = audit::is_audited_sql(&req.sql);
@@ -2084,15 +2268,35 @@ async fn execute_sql(
     // leaking scopes. Wall-clock timing is sufficient for slow-query detection
     // and works across awaits.
     let result = if req.format.as_deref() == Some("arrow-stream") {
-        session
-            .run_stream_with_query(&req.sql, query)
+        match session
+            .run_stream_with_query_for_serialization(&req.sql, query)
             .await
-            .map(sql_arrow_stream_response)
+        {
+            Ok((stream, completion)) => Ok(sql_arrow_stream_response_controlled(
+                stream,
+                completion,
+                sql_permit,
+                state.sql_max_output_rows,
+                state.sql_max_output_bytes,
+                Arc::clone(&state.metrics),
+            )),
+            Err(error) => Err(error),
+        }
     } else {
-        session
-            .run_with_query(&req.sql, query)
+        match session
+            .run_with_query_for_serialization(&req.sql, query)
             .await
-            .map(|batches| dispatch_buffered_sql_format(req.format.as_deref(), &batches))
+        {
+            Ok(output) => Ok(dispatch_buffered_sql_format(
+                state,
+                req.format.as_deref(),
+                output,
+                query_id,
+                session.sql_test_hook(),
+            )
+            .await),
+            Err(error) => Err(error),
+        }
     };
     let elapsed = start.elapsed();
     // Slow-query logging covers BOTH success and failure (the slowest errors
@@ -2115,7 +2319,7 @@ async fn execute_sql(
         Ok(response) => with_query_id(response, query_id),
         Err(e) => {
             state.metrics.inc_sql_errors();
-            query_error_response(&e, Some(query_id))
+            tracked_query_error_response(state, &e, Some(query_id))
         }
     }
 }
@@ -2128,29 +2332,152 @@ fn remote_boolean_ai_error() -> Response {
         .into_response()
 }
 
-/// Serialize Arrow record batches as Arrow IPC file bytes. This is the
-/// high-performance binary format for clients with Arrow library support.
-fn sql_arrow_response(batches: &[arrow::record_batch::RecordBatch]) -> Response {
-    if batches.is_empty() {
-        return StatusCode::OK.into_response();
+#[derive(Debug)]
+struct SerializedOutput {
+    bytes: Vec<u8>,
+    arrow: bool,
+}
+
+#[derive(Debug)]
+enum BufferedSerializationError {
+    Query(mongreldb_query::MongrelQueryError),
+    Limit(String),
+    Encoding(String),
+}
+
+struct LimitedOutput {
+    bytes: Vec<u8>,
+    max_bytes: usize,
+    exceeded: bool,
+}
+
+impl LimitedOutput {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            max_bytes,
+            exceeded: false,
+        }
     }
-    let schema = batches[0].schema();
-    let mut buf = Vec::new();
-    let mut writer = arrow::ipc::writer::FileWriter::try_new(&mut buf, schema.as_ref()).unwrap();
-    for b in batches {
-        let _ = writer.write(b);
+}
+
+impl std::io::Write for LimitedOutput {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.bytes.len().saturating_add(bytes.len()) > self.max_bytes {
+            self.exceeded = true;
+            return Err(std::io::Error::other("SQL output byte limit exceeded"));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
     }
-    let _ = writer.finish();
-    drop(writer);
-    (
-        [(header::CONTENT_TYPE, "application/vnd.apache.arrow.file")],
-        buf,
-    )
-        .into_response()
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialize_buffered_output(
+    format: &str,
+    output: &ManagedQueryBatches,
+    max_rows: usize,
+    max_bytes: usize,
+    test_hook: Option<&mongreldb_query::SqlTestHook>,
+) -> std::result::Result<SerializedOutput, BufferedSerializationError> {
+    const ROW_CHECKPOINT_INTERVAL: usize = 256;
+    let batches = output.batches();
+    let mut rows = 0usize;
+    let mut writer_output = LimitedOutput::new(max_bytes);
+
+    if format == "arrow" {
+        if batches.is_empty() {
+            return Ok(SerializedOutput {
+                bytes: Vec::new(),
+                arrow: true,
+            });
+        }
+        let schema = batches[0].schema();
+        let encoding_result = (|| {
+            let mut writer =
+                arrow::ipc::writer::FileWriter::try_new(&mut writer_output, schema.as_ref())
+                    .map_err(|error| error.to_string())?;
+            for batch in batches {
+                for offset in (0..batch.num_rows()).step_by(ROW_CHECKPOINT_INTERVAL) {
+                    if let Some(hook) = test_hook {
+                        hook(mongreldb_query::SqlTestHookPoint::BeforeSerializationBatch);
+                    }
+                    output
+                        .query()
+                        .checkpoint()
+                        .map_err(|error| error.to_string())?;
+                    let length = ROW_CHECKPOINT_INTERVAL.min(batch.num_rows() - offset);
+                    rows = rows.saturating_add(length);
+                    if rows > max_rows {
+                        return Err("SQL output row limit exceeded".into());
+                    }
+                    writer
+                        .write(&batch.slice(offset, length))
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+            writer.finish().map_err(|error| error.to_string())
+        })();
+        if let Err(error) = encoding_result {
+            if let Err(query_error) = output.query().checkpoint() {
+                return Err(BufferedSerializationError::Query(query_error));
+            }
+            if writer_output.exceeded || rows > max_rows {
+                return Err(BufferedSerializationError::Limit(error));
+            }
+            return Err(BufferedSerializationError::Encoding(error));
+        }
+        return Ok(SerializedOutput {
+            bytes: writer_output.bytes,
+            arrow: true,
+        });
+    }
+
+    let encoding_result = (|| {
+        let mut writer = arrow::json::writer::ArrayWriter::new(&mut writer_output);
+        for batch in batches {
+            for offset in (0..batch.num_rows()).step_by(ROW_CHECKPOINT_INTERVAL) {
+                if let Some(hook) = test_hook {
+                    hook(mongreldb_query::SqlTestHookPoint::BeforeSerializationBatch);
+                }
+                output
+                    .query()
+                    .checkpoint()
+                    .map_err(|error| error.to_string())?;
+                let length = ROW_CHECKPOINT_INTERVAL.min(batch.num_rows() - offset);
+                rows = rows.saturating_add(length);
+                if rows > max_rows {
+                    return Err("SQL output row limit exceeded".into());
+                }
+                let slice = batch.slice(offset, length);
+                writer
+                    .write_batches(&[&slice])
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        writer.finish().map_err(|error| error.to_string())
+    })();
+    if let Err(error) = encoding_result {
+        if let Err(query_error) = output.query().checkpoint() {
+            return Err(BufferedSerializationError::Query(query_error));
+        }
+        if writer_output.exceeded || rows > max_rows {
+            return Err(BufferedSerializationError::Limit(error));
+        }
+        return Err(BufferedSerializationError::Encoding(error));
+    }
+    Ok(SerializedOutput {
+        bytes: writer_output.bytes,
+        arrow: false,
+    })
 }
 
 /// Serialize a DataFusion record-batch stream as Arrow streaming IPC. The body
 /// holds only the active query batch and one serialized IPC message.
+#[cfg(test)]
 fn sql_arrow_stream_response(batches: mongreldb_query::MongrelRecordBatchStream) -> Response {
     use futures::{stream, StreamExt};
 
@@ -2202,31 +2529,123 @@ fn sql_arrow_stream_response(batches: mongreldb_query::MongrelRecordBatchStream)
     ([(header::CONTENT_TYPE, STREAM_CT)], body).into_response()
 }
 
-/// Serialize Arrow record batches into a JSON array of row objects using the
-/// Arrow JSON writer. Each row becomes a JSON object keyed by column name.
-/// This handles all Arrow types correctly (Decimal128, Timestamp, Date32, List,
-/// etc.) and streams directly into a byte buffer without intermediate
-/// serde_json::Value allocations.
-fn sql_json_response(batches: &[arrow::record_batch::RecordBatch]) -> Response {
-    if batches.is_empty() {
-        return ([(header::CONTENT_TYPE, "application/json")], b"[]" as &[u8]).into_response();
-    }
+fn sql_arrow_stream_response_controlled(
+    batches: mongreldb_query::MongrelRecordBatchStream,
+    completion: SqlStreamCompletion,
+    sql_permit: tokio::sync::OwnedSemaphorePermit,
+    max_rows: usize,
+    max_bytes: usize,
+    metrics: Arc<metrics::Metrics>,
+) -> Response {
+    use futures::{stream, StreamExt};
 
-    let mut buf = Vec::new();
-    {
-        let mut writer = arrow::json::writer::ArrayWriter::new(&mut buf);
-        let refs: Vec<&_> = batches.iter().collect();
-        if let Err(e) = writer.write_batches(&refs) {
+    const STREAM_CT: &str = "application/vnd.apache.arrow.stream";
+    let schema = batches.schema();
+    let mut writer = match arrow::ipc::writer::StreamWriter::try_new(Vec::new(), schema.as_ref()) {
+        Ok(writer) => writer,
+        Err(error) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("JSON serialization error: {e}"),
+                format!("arrow stream init error: {error}"),
             )
-                .into_response();
+                .into_response()
         }
-        let _ = writer.finish();
+    };
+    let schema_chunk = std::mem::take(writer.get_mut());
+    if schema_chunk.len() > max_bytes {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "SQL output byte limit exceeded",
+        )
+            .into_response();
     }
-
-    ([(header::CONTENT_TYPE, "application/json")], buf).into_response()
+    metrics.add_sql_output_bytes(schema_chunk.len());
+    let batch_stream = stream::unfold(
+        (
+            batches,
+            Some(writer),
+            completion,
+            Some(sql_permit),
+            0usize,
+            schema_chunk.len(),
+            metrics,
+        ),
+        move |(mut batches, writer, completion, permit, rows, bytes, metrics)| async move {
+            let mut writer = writer?;
+            match batches.next().await {
+                Some(Ok(batch)) => {
+                    let next_rows = rows.saturating_add(batch.num_rows());
+                    if next_rows > max_rows {
+                        return Some((
+                            Err(std::io::Error::other("SQL output row limit exceeded")),
+                            (batches, None, completion, permit, next_rows, bytes, metrics),
+                        ));
+                    }
+                    match writer.write(&batch) {
+                        Ok(()) => {
+                            let chunk = std::mem::take(writer.get_mut());
+                            let next_bytes = bytes.saturating_add(chunk.len());
+                            if next_bytes > max_bytes {
+                                return Some((
+                                    Err(std::io::Error::other("SQL output byte limit exceeded")),
+                                    (
+                                        batches, None, completion, permit, next_rows, next_bytes,
+                                        metrics,
+                                    ),
+                                ));
+                            }
+                            metrics.add_sql_output_bytes(chunk.len());
+                            Some((
+                                Ok(chunk),
+                                (
+                                    batches,
+                                    Some(writer),
+                                    completion,
+                                    permit,
+                                    next_rows,
+                                    next_bytes,
+                                    metrics,
+                                ),
+                            ))
+                        }
+                        Err(error) => Some((
+                            Err(std::io::Error::other(error)),
+                            (batches, None, completion, permit, rows, bytes, metrics),
+                        )),
+                    }
+                }
+                Some(Err(error)) => Some((
+                    Err(std::io::Error::other(error)),
+                    (batches, None, completion, permit, rows, bytes, metrics),
+                )),
+                None => match writer.finish() {
+                    Ok(()) => {
+                        let chunk = std::mem::take(writer.get_mut());
+                        let next_bytes = bytes.saturating_add(chunk.len());
+                        if next_bytes > max_bytes {
+                            return Some((
+                                Err(std::io::Error::other("SQL output byte limit exceeded")),
+                                (batches, None, completion, permit, rows, next_bytes, metrics),
+                            ));
+                        }
+                        metrics.add_sql_output_bytes(chunk.len());
+                        completion.complete();
+                        Some((
+                            Ok(chunk),
+                            (batches, None, completion, permit, rows, next_bytes, metrics),
+                        ))
+                    }
+                    Err(error) => Some((
+                        Err(std::io::Error::other(error)),
+                        (batches, None, completion, permit, rows, bytes, metrics),
+                    )),
+                },
+            }
+        },
+    );
+    let schema_item: Result<Vec<u8>, std::io::Error> = Ok(schema_chunk);
+    let body = axum::body::Body::from_stream(stream::iter([schema_item]).chain(batch_stream));
+    ([(header::CONTENT_TYPE, STREAM_CT)], body).into_response()
 }
 
 #[derive(Deserialize)]
@@ -2785,6 +3204,24 @@ mod streaming_tests {
         let slice: &[u8] = bytes.as_ref();
         let reader = arrow::ipc::reader::StreamReader::try_new(slice, None).unwrap();
         assert_eq!(reader.count(), 0);
+    }
+
+    #[tokio::test]
+    async fn buffered_output_limits_are_typed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StdArc::new(mongreldb_core::Database::create(dir.path()).unwrap());
+        let session = MongrelSession::open(db).unwrap();
+        let query = session.register_query(SqlQueryOptions::default()).unwrap();
+        let output = session
+            .run_with_query_for_serialization("SELECT 1", query)
+            .await
+            .unwrap();
+
+        let row_error = serialize_buffered_output("json", &output, 0, 1024, None).unwrap_err();
+        assert!(matches!(row_error, BufferedSerializationError::Limit(_)));
+        let byte_error = serialize_buffered_output("json", &output, 10, 1, None).unwrap_err();
+        assert!(matches!(byte_error, BufferedSerializationError::Limit(_)));
+        output.fail();
     }
 }
 

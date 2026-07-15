@@ -164,6 +164,7 @@ pub struct QueryStatus {
     pub committed: bool,
     pub completed_statements: usize,
     pub statement_index: usize,
+    pub cancel_requested_at: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -180,6 +181,7 @@ struct RegisteredQuery {
     committed: AtomicBool,
     completed_statements: AtomicUsize,
     statement_index: AtomicUsize,
+    cancel_requested_at: Mutex<Option<Instant>>,
 }
 
 impl RegisteredQuery {
@@ -201,6 +203,7 @@ impl RegisteredQuery {
             committed: self.committed.load(Ordering::Acquire),
             completed_statements: self.completed_statements.load(Ordering::Acquire),
             statement_index: self.statement_index.load(Ordering::Acquire),
+            cancel_requested_at: *self.cancel_requested_at.lock().unwrap(),
         }
     }
 }
@@ -280,6 +283,7 @@ impl SqlQueryRegistry {
             committed: AtomicBool::new(false),
             completed_statements: AtomicUsize::new(0),
             statement_index: AtomicUsize::new(0),
+            cancel_requested_at: Mutex::new(None),
         });
         let mut state = self.state.lock().unwrap();
         self.prune_locked(&mut state);
@@ -384,6 +388,32 @@ impl SqlQueryRegistry {
             .count()
     }
 
+    pub fn queued_count(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .active
+            .values()
+            .filter(|query| query.phase() == SqlQueryPhase::Queued)
+            .count()
+    }
+
+    pub fn entry_count(&self) -> usize {
+        let mut state = self.state.lock().unwrap();
+        self.prune_locked(&mut state);
+        state.active.len() + state.finished.len()
+    }
+
+    pub fn approximate_bytes(&self) -> usize {
+        let mut state = self.state.lock().unwrap();
+        self.prune_locked(&mut state);
+        state.finished_bytes
+            + state
+                .active
+                .len()
+                .saturating_mul(std::mem::size_of::<RegisteredQuery>())
+    }
+
     pub fn finished_count(&self) -> usize {
         let mut state = self.state.lock().unwrap();
         self.prune_locked(&mut state);
@@ -447,6 +477,7 @@ impl RegisteredQuery {
                         )
                         .is_ok()
                     {
+                        *self.cancel_requested_at.lock().unwrap() = Some(Instant::now());
                         self.control.cancel(reason);
                         return CancelOutcome::Accepted;
                     }
@@ -544,6 +575,23 @@ impl RegisteredSqlQuery {
 
     pub fn exit_commit_critical(&self) -> Result<()> {
         self.transition(SqlQueryPhase::CommitCritical, SqlQueryPhase::Executing)
+    }
+
+    pub fn begin_serialization(&self) -> Result<()> {
+        match self.phase() {
+            SqlQueryPhase::Executing => {
+                self.transition(SqlQueryPhase::Executing, SqlQueryPhase::Serializing)
+            }
+            SqlQueryPhase::Streaming => {
+                self.transition(SqlQueryPhase::Streaming, SqlQueryPhase::Serializing)
+            }
+            // A durable COMMIT keeps its fence through response generation.
+            SqlQueryPhase::CommitCritical => Ok(()),
+            phase => Err(MongrelQueryError::InvalidQueryState(format!(
+                "query {} cannot serialize from {phase:?}",
+                self.id()
+            ))),
+        }
     }
 
     pub fn mark_committed(&self) {
