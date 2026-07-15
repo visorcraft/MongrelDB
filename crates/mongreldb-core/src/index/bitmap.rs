@@ -5,12 +5,14 @@
 
 use crate::rowid::RowId;
 use roaring::RoaringBitmap;
+use std::sync::Arc;
 
 /// `value → row-id set`. Values are type-aware encoded bytes (lexicographically
 /// comparable), matching the encoding used for page min/max.
 #[derive(Clone)]
 pub struct BitmapIndex {
-    map: std::collections::HashMap<Vec<u8>, RoaringBitmap>,
+    frozen: Arc<Vec<Arc<std::collections::HashMap<Vec<u8>, RoaringBitmap>>>>,
+    active: std::collections::HashMap<Vec<u8>, RoaringBitmap>,
 }
 
 impl Default for BitmapIndex {
@@ -22,7 +24,8 @@ impl Default for BitmapIndex {
 impl BitmapIndex {
     pub fn new() -> Self {
         Self {
-            map: std::collections::HashMap::new(),
+            frozen: Arc::new(Vec::new()),
+            active: std::collections::HashMap::new(),
         }
     }
 
@@ -32,12 +35,18 @@ impl BitmapIndex {
         // require row ids < 2^32.
         let id32 = u32::try_from(row_id.0)
             .expect("bitmap index supports row_id < 2^32; shard-by-high-bits is a Phase-3 upgrade");
-        self.map.entry(value).or_default().insert(id32);
+        self.active.entry(value).or_default().insert(id32);
     }
 
     /// The row-id set for `value` (empty if absent).
     pub fn get(&self, value: &[u8]) -> RoaringBitmap {
-        self.map.get(value).cloned().unwrap_or_default()
+        let mut rows = self.active.get(value).cloned().unwrap_or_default();
+        for layer in self.frozen.iter() {
+            if let Some(layer_rows) = layer.get(value) {
+                rows |= layer_rows;
+            }
+        }
+        rows
     }
 
     /// Intersection of several sets — the workhorse of multi-condition queries.
@@ -55,24 +64,30 @@ impl BitmapIndex {
     }
 
     pub fn value_count(&self) -> usize {
-        self.map.len()
+        self.keys().len()
     }
 
     /// All distinct values (keys) in this index — Phase 17.2 broadcast join.
-    pub fn keys(&self) -> Vec<&Vec<u8>> {
-        self.map.keys().collect()
+    pub fn keys(&self) -> Vec<Vec<u8>> {
+        let mut keys = std::collections::HashSet::new();
+        keys.extend(self.active.keys().cloned());
+        for layer in self.frozen.iter() {
+            keys.extend(layer.keys().cloned());
+        }
+        keys.into_iter().collect()
     }
 
     /// Snapshot `(value_bytes → serialized RoaringBitmap)` pairs for
     /// checkpointing to `_idx/global.idx`.
     pub fn entries(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
-        self.map
-            .iter()
-            .map(|(k, v)| {
+        self.keys()
+            .into_iter()
+            .map(|k| {
+                let v = self.get(&k);
                 let mut bytes = Vec::new();
                 v.serialize_into(&mut bytes)
                     .expect("roaring serialize is infallible for Vec");
-                (k.clone(), bytes)
+                (k, bytes)
             })
             .collect()
     }
@@ -81,12 +96,27 @@ impl BitmapIndex {
     pub fn from_entries(
         entries: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> std::result::Result<Self, &'static str> {
-        let mut map = std::collections::HashMap::new();
+        let mut active = std::collections::HashMap::new();
         for (k, bytes) in entries {
             let bm = RoaringBitmap::deserialize_from(&bytes[..]).map_err(|_| "bad bitmap bytes")?;
-            map.insert(k, bm);
+            active.insert(k, bm);
         }
-        Ok(Self { map })
+        Ok(Self {
+            frozen: Arc::new(Vec::new()),
+            active,
+        })
+    }
+
+    pub(crate) fn seal(&mut self) {
+        if self.active.is_empty() {
+            return;
+        }
+        let active = std::mem::take(&mut self.active);
+        Arc::make_mut(&mut self.frozen).push(Arc::new(active));
+    }
+
+    pub(crate) fn frozen_layer_count(&self) -> usize {
+        self.frozen.len()
     }
 }
 

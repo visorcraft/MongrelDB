@@ -5718,7 +5718,6 @@ impl Table {
             .keys()
             .into_iter()
             .filter(|k| pk_db.hot.get(k.as_slice()).is_some())
-            .cloned()
             .collect();
         Some(result)
     }
@@ -5841,7 +5840,7 @@ impl Table {
                     let mut acc = roaring::RoaringBitmap::new();
                     for key in b.keys() {
                         if key.starts_with(&lookup_prefix) {
-                            acc |= b.get(key);
+                            acc |= b.get(&key);
                         }
                     }
                     RowIdSet::from_roaring(acc)
@@ -7802,7 +7801,7 @@ impl Table {
                         let mut acc = roaring::RoaringBitmap::new();
                         for key in b.keys() {
                             if key.starts_with(&lookup_prefix) {
-                                acc |= b.get(key);
+                                acc |= b.get(&key);
                             }
                         }
                         RowIdSet::from_roaring(acc)

@@ -14,6 +14,7 @@ use crate::epoch::Epoch;
 use crate::rowid::RowId;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 /// A cell value in the in-memory path. The flush path re-encodes these into
 /// columnar pages; it is intentionally simple for the prototype.
@@ -124,8 +125,16 @@ impl Row {
 /// for the prototype skip list: the same MVCC semantics with lower write
 /// amplification (buffered messages flush to children in bulk).
 #[derive(Clone)]
-pub struct Memtable {
+struct MemtableSegment {
     tree: BeTree,
+    byte_size: u64,
+}
+
+/// Structurally shared committed overlays plus one small mutable write delta.
+#[derive(Clone)]
+pub struct Memtable {
+    frozen: Arc<Vec<Arc<MemtableSegment>>>,
+    active: MemtableSegment,
     byte_size: u64,
 }
 
@@ -138,7 +147,11 @@ impl Default for Memtable {
 impl Memtable {
     pub fn new() -> Self {
         Self {
-            tree: BeTree::new(),
+            frozen: Arc::new(Vec::new()),
+            active: MemtableSegment {
+                tree: BeTree::new(),
+                byte_size: 0,
+            },
             byte_size: 0,
         }
     }
@@ -146,8 +159,10 @@ impl Memtable {
     /// Append a row version (keyed by `(row_id, committed_epoch)`). Versions are
     /// never overwritten; the newest visible one wins at read time.
     pub fn upsert(&mut self, row: Row) {
-        self.byte_size += row.estimated_bytes();
-        self.tree.insert_row(row);
+        let bytes = row.estimated_bytes();
+        self.byte_size = self.byte_size.saturating_add(bytes);
+        self.active.byte_size = self.active.byte_size.saturating_add(bytes);
+        self.active.tree.insert_row(row);
     }
 
     /// Append a tombstone version for `row_id` at `epoch`. The tombstone copies
@@ -171,23 +186,38 @@ impl Memtable {
     /// `epoch <= snapshot`. Returns `None` if that version is a tombstone (or no
     /// such version exists).
     pub fn get(&self, row_id: RowId, snapshot_epoch: Epoch) -> Option<Row> {
-        self.tree.get_visible(row_id, snapshot_epoch)
+        self.get_version(row_id, snapshot_epoch)
+            .and_then(|(_, row)| (!row.deleted).then_some(row))
     }
 
     /// Newest version of `row_id` with `epoch <= snapshot`, **including
     /// tombstones** (as a `Row` with `deleted=true`). Used by the engine to
     /// merge versions across the memtable and sorted runs.
     pub fn get_version(&self, row_id: RowId, snapshot_epoch: Epoch) -> Option<(Epoch, Row)> {
-        self.tree.get_version(row_id, snapshot_epoch)
+        let mut best = self.active.tree.get_version(row_id, snapshot_epoch);
+        for segment in self.frozen.iter().rev() {
+            let Some(candidate) = segment.tree.get_version(row_id, snapshot_epoch) else {
+                continue;
+            };
+            if best.as_ref().is_none_or(|(epoch, _)| candidate.0 > *epoch) {
+                best = Some(candidate);
+            }
+        }
+        best
     }
 
     /// Number of stored versions.
     pub fn len(&self) -> usize {
-        self.tree.mutations()
+        self.active.tree.mutations()
+            + self
+                .frozen
+                .iter()
+                .map(|segment| segment.tree.mutations())
+                .sum::<usize>()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.tree.is_empty()
+        self.active.tree.is_empty() && self.frozen.is_empty()
     }
 
     pub fn approx_bytes(&self) -> u64 {
@@ -208,25 +238,62 @@ impl Memtable {
     /// versions across the memtable and sorted runs.
     pub fn visible_versions(&self, snapshot_epoch: Epoch) -> Vec<Row> {
         let mut by_row: BTreeMap<RowId, Row> = BTreeMap::new();
-        for row in self.tree.versions() {
-            if row.committed_epoch <= snapshot_epoch {
-                by_row
-                    .entry(row.row_id)
-                    .and_modify(|e| {
-                        if row.committed_epoch > e.committed_epoch {
-                            *e = row.clone();
-                        }
-                    })
-                    .or_insert(row);
+        for segment in self
+            .frozen
+            .iter()
+            .map(|segment| &segment.tree)
+            .chain(std::iter::once(&self.active.tree))
+        {
+            for row in segment.versions() {
+                if row.committed_epoch <= snapshot_epoch {
+                    by_row
+                        .entry(row.row_id)
+                        .and_modify(|existing| {
+                            if row.committed_epoch > existing.committed_epoch {
+                                *existing = row.clone();
+                            }
+                        })
+                        .or_insert(row);
+                }
             }
         }
         by_row.into_values().collect()
     }
 
+    /// Freeze the current write delta so future clones share it by `Arc`.
+    pub(crate) fn seal(&mut self) {
+        if self.active.tree.is_empty() {
+            return;
+        }
+        let active = std::mem::replace(
+            &mut self.active,
+            MemtableSegment {
+                tree: BeTree::new(),
+                byte_size: 0,
+            },
+        );
+        Arc::make_mut(&mut self.frozen).push(Arc::new(active));
+    }
+
+    pub(crate) fn frozen_layer_count(&self) -> usize {
+        self.frozen.len()
+    }
+
     /// Drain all versions (for a memtable-to-run flush). Returns them in
     /// ascending `(RowId, Epoch)` order.
     pub fn drain_sorted(&mut self) -> Vec<Row> {
-        let out = std::mem::take(&mut self.tree).into_sorted_rows();
+        let mut out = self
+            .frozen
+            .iter()
+            .flat_map(|segment| segment.tree.versions())
+            .chain(self.active.tree.versions())
+            .collect::<Vec<_>>();
+        out.sort_by_key(|row| (row.row_id, row.committed_epoch));
+        self.frozen = Arc::new(Vec::new());
+        self.active = MemtableSegment {
+            tree: BeTree::new(),
+            byte_size: 0,
+        };
         self.byte_size = 0;
         out
     }

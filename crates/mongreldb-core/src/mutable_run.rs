@@ -20,6 +20,7 @@ use crate::memtable::Row;
 use crate::pma::Pma;
 use crate::rowid::RowId;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// Composite version key — identical to the memtable's, so all versions of one
 /// `RowId` sort contiguously in ascending-epoch order.
@@ -28,8 +29,15 @@ type VersionKey = (RowId, Epoch);
 /// The PMA-backed mutable run tier. Holds flushed-but-not-yet-spilled rows in
 /// sorted `(RowId, Epoch)` order.
 #[derive(Clone)]
-pub struct MutableRun {
+struct MutableRunSegment {
     pma: Pma<VersionKey, Row>,
+    byte_size: u64,
+}
+
+#[derive(Clone)]
+pub struct MutableRun {
+    frozen: Arc<Vec<Arc<MutableRunSegment>>>,
+    active: MutableRunSegment,
     byte_size: u64,
 }
 
@@ -42,7 +50,11 @@ impl Default for MutableRun {
 impl MutableRun {
     pub fn new() -> Self {
         Self {
-            pma: Pma::new(),
+            frozen: Arc::new(Vec::new()),
+            active: MutableRunSegment {
+                pma: Pma::new(),
+                byte_size: 0,
+            },
             byte_size: 0,
         }
     }
@@ -54,20 +66,27 @@ impl MutableRun {
         let batch: Vec<(VersionKey, Row)> = rows
             .into_iter()
             .map(|r| {
-                self.byte_size = self.byte_size.saturating_add(r.estimated_bytes());
+                let bytes = r.estimated_bytes();
+                self.byte_size = self.byte_size.saturating_add(bytes);
+                self.active.byte_size = self.active.byte_size.saturating_add(bytes);
                 ((r.row_id, r.committed_epoch), r)
             })
             .collect();
-        self.pma.extend_sorted(batch);
+        self.active.pma.extend_sorted(batch);
     }
 
     /// Number of stored versions.
     pub fn len(&self) -> usize {
-        self.pma.len()
+        self.active.pma.len()
+            + self
+                .frozen
+                .iter()
+                .map(|segment| segment.pma.len())
+                .sum::<usize>()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.pma.is_empty()
+        self.active.pma.is_empty() && self.frozen.is_empty()
     }
 
     /// Approximate bytes held — the spill-threshold signal.
@@ -81,12 +100,21 @@ impl MutableRun {
     /// PMA's gappy binary search instead of scanning from the front.
     pub fn get_version(&self, row_id: RowId, snapshot_epoch: Epoch) -> Option<(Epoch, Row)> {
         let mut best: Option<(Epoch, Row)> = None;
-        for ((rid, ep), row) in self.pma.iter_from(&(row_id, Epoch::ZERO)) {
-            if *rid != row_id {
-                break;
-            }
-            if *ep <= snapshot_epoch {
-                best = Some((*ep, row.clone()));
+        for pma in self
+            .frozen
+            .iter()
+            .map(|segment| &segment.pma)
+            .chain(std::iter::once(&self.active.pma))
+        {
+            for ((rid, epoch), row) in pma.iter_from(&(row_id, Epoch::ZERO)) {
+                if *rid != row_id {
+                    break;
+                }
+                if *epoch <= snapshot_epoch
+                    && best.as_ref().is_none_or(|(current, _)| *epoch > *current)
+                {
+                    best = Some((*epoch, row.clone()));
+                }
             }
         }
         best
@@ -96,23 +124,58 @@ impl MutableRun {
     /// ascending by `RowId` — mirroring `Memtable::visible_versions`.
     pub fn visible_versions(&self, snapshot_epoch: Epoch) -> Vec<Row> {
         let mut by_row: BTreeMap<RowId, Row> = BTreeMap::new();
-        for ((rid, ep), row) in self.pma.iter() {
-            if *ep <= snapshot_epoch {
-                by_row.insert(*rid, row.clone()); // ascending ⇒ newest wins
+        for pma in self
+            .frozen
+            .iter()
+            .map(|segment| &segment.pma)
+            .chain(std::iter::once(&self.active.pma))
+        {
+            for ((rid, epoch), row) in pma.iter() {
+                if *epoch <= snapshot_epoch
+                    && by_row
+                        .get(rid)
+                        .is_none_or(|current| *epoch > current.committed_epoch)
+                {
+                    by_row.insert(*rid, row.clone());
+                }
             }
         }
         by_row.into_values().collect()
     }
 
+    pub(crate) fn seal(&mut self) {
+        if self.active.pma.is_empty() {
+            return;
+        }
+        let active = std::mem::replace(
+            &mut self.active,
+            MutableRunSegment {
+                pma: Pma::new(),
+                byte_size: 0,
+            },
+        );
+        Arc::make_mut(&mut self.frozen).push(Arc::new(active));
+    }
+
+    pub(crate) fn frozen_layer_count(&self) -> usize {
+        self.frozen.len()
+    }
+
     /// Drain every version in ascending `(RowId, Epoch)` order — the order
     /// `RunWriter::write` requires when spilling to an immutable run.
     pub fn drain_sorted(&mut self) -> Vec<Row> {
-        let out: Vec<Row> = self
-            .pma
-            .drain_sorted()
-            .into_iter()
-            .map(|(_, r)| r)
-            .collect();
+        let mut out = self
+            .frozen
+            .iter()
+            .flat_map(|segment| segment.pma.iter().map(|(_, row)| row.clone()))
+            .chain(self.active.pma.iter().map(|(_, row)| row.clone()))
+            .collect::<Vec<_>>();
+        out.sort_by_key(|row| (row.row_id, row.committed_epoch));
+        self.frozen = Arc::new(Vec::new());
+        self.active = MutableRunSegment {
+            pma: Pma::new(),
+            byte_size: 0,
+        };
         self.byte_size = 0;
         out
     }
