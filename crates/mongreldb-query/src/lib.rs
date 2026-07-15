@@ -29,6 +29,7 @@ mod external_modules;
 mod fk_join;
 mod native_agg;
 mod percentile;
+mod query_registry;
 mod scan;
 mod scored_sql;
 mod shadow;
@@ -39,6 +40,10 @@ pub use external_modules::{
     ExternalBaseWrite, ExternalModuleDescriptor, ExternalModuleIndex, ExternalModuleRegistry,
     ExternalPlan, ExternalPlanRequest, ExternalScan, ExternalTable, ExternalTableModule,
     ExternalTxn, ExternalWriteOp, ExternalWriteResult, ModuleConnectCtx,
+};
+pub use query_registry::{
+    CancelOutcome, QueryId, QueryStatus, RegisteredQueryGuard, RegisteredSqlQuery, SqlQueryOptions,
+    SqlQueryPhase, SqlQueryRegistry,
 };
 
 /// True when SQL calls a ranked Boolean AI UDF. Remote servers use this to

@@ -22,6 +22,8 @@ futures = "0.3"
 async-trait = "0.1"
 thiserror = "1"
 regex = "1"
+getrandom = "0.2"
+sha2 = "0.10"
 
 [dev-dependencies]
 bincode = "1"

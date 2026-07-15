@@ -4719,6 +4719,11 @@ fn query_error_to_core(err: MongrelQueryError) -> mongreldb_core::MongrelError {
         MongrelQueryError::Arrow(msg) | MongrelQueryError::DataFusion(msg) => {
             mongreldb_core::MongrelError::Other(msg)
         }
+        MongrelQueryError::QueryCancelled { .. } => mongreldb_core::MongrelError::Cancelled,
+        MongrelQueryError::DeadlineExceeded { .. } => {
+            mongreldb_core::MongrelError::DeadlineExceeded
+        }
+        other => mongreldb_core::MongrelError::Other(other.to_string()),
     }
 }
 

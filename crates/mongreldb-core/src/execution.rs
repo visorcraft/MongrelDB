@@ -151,10 +151,13 @@ impl ExecutionControl {
     }
 
     pub fn is_cancelled(&self) -> bool {
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.cancel(CancellationReason::Deadline);
+        }
         self.reason() != CancellationReason::None
-            || self
-                .deadline
-                .is_some_and(|deadline| Instant::now() >= deadline)
     }
 }
 
