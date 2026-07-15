@@ -285,3 +285,74 @@ async fn dropping_arrow_stream_cancels_and_cleans_registry_entry() {
     assert_eq!(status.status(), StatusCode::OK);
     assert_eq!(json_body(status).await["state"], "cancelled");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closing_session_cancels_active_query_without_session_lock() {
+    let directory = tempdir().unwrap();
+    let database = Arc::new(Database::create(directory.path()).unwrap());
+    let sessions = Arc::new(SessionStore::new(8, Duration::from_secs(60)));
+    let app = build_app_with_sessions(
+        database,
+        std::iter::empty(),
+        None,
+        None,
+        false,
+        Arc::clone(&sessions),
+    );
+    let opened = app
+        .clone()
+        .oneshot(request("POST", "/sessions", Value::Null))
+        .await
+        .unwrap();
+    let session_id = json_body(opened).await["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let entry = sessions.get(&session_id, "anonymous").unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let hook_barrier = Arc::clone(&barrier);
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    entry.session.set_test_hook(Some(Arc::new(move |point| {
+        if point == SqlTestHookPoint::Planning {
+            entered_tx.send(()).unwrap();
+            hook_barrier.wait();
+        }
+    })));
+
+    let query_id = "1234567890abcdef1234567890abcdef";
+    let mut sql_request = request(
+        "POST",
+        "/sql",
+        json!({ "sql": "SELECT 1", "query_id": query_id }),
+    );
+    sql_request
+        .headers_mut()
+        .insert("x-session-id", session_id.parse().unwrap());
+    let sql_task = tokio::spawn(app.clone().oneshot(sql_request));
+    tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
+        .await
+        .unwrap();
+
+    let close_task = tokio::spawn(
+        app.clone()
+            .oneshot(request("DELETE", &format!("/sessions/{session_id}"), Value::Null)),
+    );
+    loop {
+        let status = app
+            .clone()
+            .oneshot(request("GET", &format!("/queries/{query_id}"), Value::Null))
+            .await
+            .unwrap();
+        let phase = json_body(status).await["state"].as_str().unwrap().to_owned();
+        if phase == "cancelling" {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    barrier.wait();
+    assert_eq!(close_task.await.unwrap().unwrap().status(), StatusCode::OK);
+    let response = sql_task.await.unwrap().unwrap();
+    assert_eq!(response.status().as_u16(), 499);
+    assert_eq!(json_body(response).await["error"]["code"], "QUERY_CANCELLED");
+    assert!(sessions.get(&session_id, "anonymous").is_none());
+}
