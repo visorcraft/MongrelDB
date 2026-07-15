@@ -763,11 +763,11 @@ fn summarize_write_permissions(
                     .insert_columns
                     .extend(cells.iter().map(|(column, _)| *column));
             }
-            Staged::Update(_, cells) => {
+            Staged::Update {
+                changed_columns, ..
+            } => {
                 table.update = true;
-                table
-                    .update_columns
-                    .extend(cells.iter().map(|(column, _)| *column));
+                table.update_columns.extend(changed_columns);
             }
             Staged::Delete(_) => table.delete = true,
             Staged::Truncate => table.truncate = true,
@@ -870,6 +870,7 @@ pub struct Database {
     read_only: bool,
     catalog: RwLock<Catalog>,
     security_coordinator: Arc<SecurityCoordinator>,
+    security_catalog_disk_reads: AtomicU64,
     rls_cache: Mutex<RlsCache>,
     epoch: Arc<EpochAuthority>,
     snapshots: Arc<SnapshotRegistry>,
@@ -1704,6 +1705,7 @@ impl Database {
             read_only,
             catalog: RwLock::new(cat),
             security_coordinator,
+            security_catalog_disk_reads: AtomicU64::new(0),
             rls_cache: Mutex::new(RlsCache::default()),
             epoch,
             snapshots,
@@ -1779,6 +1781,8 @@ impl Database {
         if self.catalog.read().security_version == expected_version {
             return Ok(());
         }
+        self.security_catalog_disk_reads
+            .fetch_add(1, Ordering::Relaxed);
         let fresh = catalog::read(&self.root, self.meta_dek.as_ref())?
             .ok_or_else(|| MongrelError::NotFound("catalog vanished during write".into()))?;
         self.auth_state.set_require_auth(fresh.require_auth);
@@ -3934,13 +3938,14 @@ impl Database {
         )))
     }
 
-    /// Re-resolve the cached principal from the on-disk catalog. Long-lived
+    /// Re-resolve the cached principal from the shared current catalog.
+    /// Long-lived
     /// handles (e.g. a daemon) call this after a `REVOKE` or role change —
     /// possibly made by a different handle to the same database — to pick up
     /// the new effective permissions without re-verifying the password.
     ///
-    /// This reloads the catalog from disk first, so changes committed by other
-    /// handles (or other processes) are visible. The username is taken from
+    /// The process-wide security version reloads from disk only when another
+    /// handle published a newer catalog. The username is taken from
     /// the existing cached principal; if the user has since been dropped,
     /// returns [`MongrelError::InvalidCredentials`].
     ///
@@ -3951,14 +3956,9 @@ impl Database {
             Some(p) => p.username,
             None => return Ok(()),
         };
-        // Reload the catalog from disk so role/permission changes made by
-        // other handles (or processes) are reflected. The in-memory catalog
-        // is only updated by mutations on *this* handle.
-        let cat = catalog::read(&self.root, self.meta_dek.as_ref())?
-            .ok_or_else(|| MongrelError::NotFound("catalog vanished during refresh".into()))?;
-        // Swap in the reloaded catalog so subsequent operations on this handle
-        // also see the updated permissions/roles.
-        *self.catalog.write() = cat.clone();
+        let observed_version = self.security_coordinator.version.load(Ordering::Acquire);
+        self.refresh_security_catalog_if_stale(observed_version)?;
+        let cat = self.catalog.read();
         match Self::resolve_principal_from_catalog(&cat, &username) {
             Some(p) => {
                 *self.principal.write() = Some(p.clone());
@@ -3970,6 +3970,12 @@ impl Database {
             }
             None => Err(MongrelError::InvalidCredentials { username }),
         }
+    }
+
+    /// Number of security-catalog disk reloads performed by this open handle.
+    /// Initial open reads are excluded.
+    pub fn security_catalog_disk_read_count(&self) -> u64 {
+        self.security_catalog_disk_reads.load(Ordering::Relaxed)
     }
 
     /// Convert a credentialless database to a credentialed one: create the
@@ -5467,7 +5473,7 @@ impl Database {
                             .push_back(idx);
                     }
                 }
-                Staged::Update(row_id, _) => {
+                Staged::Update { row_id, .. } => {
                     let handle = self.table_by_id(*table_id)?;
                     let row = handle.lock().get(*row_id, snapshot);
                     if let Some(row) = row {
@@ -5558,7 +5564,7 @@ impl Database {
                         trigger_stack: Self::trigger_stack_for_indices(trigger_stacks, &[idx]),
                     });
                 }
-                Staged::Update(_, cells) => {
+                Staged::Update { new_row: cells, .. } => {
                     let old = old_rows.get(&idx).cloned();
                     let new = Some(TriggerRowImage::from_cells(cells));
                     let changed_columns = changed_columns(old.as_ref(), new.as_ref());
@@ -5643,9 +5649,17 @@ impl Database {
                             "SetNew trigger step requires mutable trigger staging".into(),
                         )
                     })?;
+                    let mut update_changed_columns = None;
                     let row_cells = match staging.get_mut(put_idx).map(|(_, op)| op) {
-                        Some(crate::txn::Staged::Put(cells))
-                        | Some(crate::txn::Staged::Update(_, cells)) => cells,
+                        Some(crate::txn::Staged::Put(cells)) => cells,
+                        Some(crate::txn::Staged::Update {
+                            new_row,
+                            changed_columns,
+                            ..
+                        }) => {
+                            update_changed_columns = Some(changed_columns);
+                            new_row
+                        }
                         _ => {
                             return Err(MongrelError::InvalidArgument(
                                 "SetNew trigger step target row is not mutable".into(),
@@ -5655,11 +5669,18 @@ impl Database {
                     for (column_id, value) in eval_trigger_cells(cells, event, selected)? {
                         row_cells.retain(|(id, _)| *id != column_id);
                         row_cells.push((column_id, value.clone()));
+                        if let Some(changed_columns) = &mut update_changed_columns {
+                            changed_columns.push(column_id);
+                        }
                         if let Some(new) = &mut event.new {
                             new.columns.insert(column_id, value);
                         }
                     }
                     row_cells.sort_by_key(|(id, _)| *id);
+                    if let Some(changed_columns) = update_changed_columns {
+                        changed_columns.sort_unstable();
+                        changed_columns.dedup();
+                    }
                 }
                 TriggerStep::Insert { table, cells } => {
                     let cells = eval_trigger_cells(cells, event, selected)?;
@@ -5706,13 +5727,23 @@ impl Database {
                                 trigger.name
                             ))
                         })?;
+                        let mut changed_columns = cells
+                            .iter()
+                            .map(|(column_id, _)| *column_id)
+                            .collect::<Vec<_>>();
+                        changed_columns.sort_unstable();
+                        changed_columns.dedup();
                         let mut merged = old.columns;
                         for (column_id, value) in cells {
                             merged.insert(column_id, value);
                         }
                         out.added.push((
                             self.table_id(table)?,
-                            crate::txn::Staged::Update(row_id, merged.into_iter().collect()),
+                            crate::txn::Staged::Update {
+                                row_id,
+                                new_row: merged.into_iter().collect(),
+                                changed_columns,
+                            },
                         ));
                         out.added_stacks.push(trigger_stack.to_vec());
                     }
@@ -5835,6 +5866,10 @@ impl Database {
                     let snapshot = Snapshot::at(read_epoch);
                     let rows = self.table(table)?.lock().visible_rows(snapshot)?;
                     let table_id = self.table_id(table)?;
+                    let mut changed_columns =
+                        cells.iter().map(|cell| cell.column_id).collect::<Vec<_>>();
+                    changed_columns.sort_unstable();
+                    changed_columns.dedup();
                     let mut to_update = Vec::new();
                     for row in rows {
                         let image = TriggerRowImage::from_row(row.clone());
@@ -5864,7 +5899,11 @@ impl Database {
                     for (table_id, row_id, merged) in to_update {
                         out.added.push((
                             table_id,
-                            crate::txn::Staged::Update(row_id, merged.into_iter().collect()),
+                            crate::txn::Staged::Update {
+                                row_id,
+                                new_row: merged.into_iter().collect(),
+                                changed_columns: changed_columns.clone(),
+                            },
                         ));
                         out.added_stacks.push(trigger_stack.to_vec());
                     }
@@ -5984,7 +6023,11 @@ impl Database {
                 .iter()
                 .enumerate()
                 .filter_map(|(index, (table_id, op))| match op {
-                    Staged::Update(row_id, cells) if !processed_updates.contains(&index) => {
+                    Staged::Update {
+                        row_id,
+                        new_row: cells,
+                        ..
+                    } if !processed_updates.contains(&index) => {
                         Some((index, *table_id, *row_id, cells.clone()))
                     }
                     _ => None,
@@ -6058,17 +6101,30 @@ impl Database {
                             cells.sort_by_key(|(column_id, _)| *column_id);
                             if let Some(existing_index) = staging.iter().position(|(id, op)| {
                                 *id == *child_id
-                                    && matches!(op, Staged::Update(id, _) if *id == child.row_id)
+                                    && matches!(op, Staged::Update { row_id, .. } if *row_id == child.row_id)
                             }) {
-                                if let Staged::Update(_, existing) = &mut staging[existing_index].1
-                                {
+                                if let Staged::Update {
+                                    new_row: existing,
+                                    changed_columns,
+                                    ..
+                                } = &mut staging[existing_index].1 {
+                                    changed_columns.extend(fk.columns.iter().copied());
+                                    changed_columns.sort_unstable();
+                                    changed_columns.dedup();
                                     if *existing != cells {
                                         *existing = cells;
                                         processed_updates.remove(&existing_index);
                                     }
                                 }
                             } else {
-                                new_ops.push((*child_id, Staged::Update(child.row_id, cells)));
+                                new_ops.push((
+                                    *child_id,
+                                    Staged::Update {
+                                        row_id: child.row_id,
+                                        new_row: cells,
+                                        changed_columns: fk.columns.clone(),
+                                    },
+                                ));
                             }
                         }
                     }
@@ -6170,7 +6226,14 @@ impl Database {
                                             cells.retain(|(k, _)| k != cid);
                                             cells.push((*cid, crate::memtable::Value::Null));
                                         }
-                                        new_ops.push((*child_id, Staged::Update(cr.row_id, cells)));
+                                        new_ops.push((
+                                            *child_id,
+                                            Staged::Update {
+                                                row_id: cr.row_id,
+                                                new_row: cells,
+                                                changed_columns: fk.columns.clone(),
+                                            },
+                                        ));
                                     }
                                 }
                             }
@@ -6190,7 +6253,7 @@ impl Database {
         let staged_deletes: HashSet<(u64, u64)> = staging
             .iter()
             .filter_map(|(t, op)| match op {
-                Staged::Delete(rid) | Staged::Update(rid, _) => Some((*t, rid.0)),
+                Staged::Delete(rid) | Staged::Update { row_id: rid, .. } => Some((*t, rid.0)),
                 _ => None,
             })
             .collect();
@@ -6206,7 +6269,7 @@ impl Database {
             };
             let cells_map: HashMap<u16, crate::memtable::Value>;
             match op {
-                Staged::Put(cells) | Staged::Update(_, cells) => {
+                Staged::Put(cells) | Staged::Update { new_row: cells, .. } => {
                     cells_map = cells.iter().cloned().collect();
 
                     // CHECK constraints.
@@ -6284,7 +6347,11 @@ impl Database {
                                 if *st_table != parent_id {
                                     continue;
                                 }
-                                if let Staged::Put(pcells) | Staged::Update(_, pcells) = st_op {
+                                if let Staged::Put(pcells)
+                                | Staged::Update {
+                                    new_row: pcells, ..
+                                } = st_op
+                                {
                                     let pmap: HashMap<u16, crate::memtable::Value> =
                                         pcells.iter().cloned().collect();
                                     if let Some(pkey) = encode_composite_key(&fk.ref_columns, &pmap)
@@ -6309,7 +6376,7 @@ impl Database {
                     // expanded in Phase A; here the final child write set is
                     // known, so a child explicitly moved/deleted by this same
                     // transaction does not cause a false violation.
-                    if let Staged::Update(row_id, _) = op {
+                    if let Staged::Update { row_id, .. } = op {
                         let parent_handle = self.table_by_id(*table_id)?;
                         let Some(old_parent) = parent_handle.lock().get(*row_id, snapshot) else {
                             continue;
@@ -6341,7 +6408,11 @@ impl Database {
                                         }
                                         match op {
                                             Staged::Delete(id) if *id == child.row_id => Some(None),
-                                            Staged::Update(id, cells) if *id == child.row_id => {
+                                            Staged::Update {
+                                                row_id,
+                                                new_row: cells,
+                                                ..
+                                            } if *row_id == child.row_id => {
                                                 let map: HashMap<u16, Value> =
                                                     cells.iter().cloned().collect();
                                                 Some(encode_composite_key(&fk.columns, &map))
@@ -6560,7 +6631,11 @@ impl Database {
                         return Err(denied(PolicyCommand::Insert));
                     }
                 }
-                Staged::Update(row_id, cells) => {
+                Staged::Update {
+                    row_id,
+                    new_row: cells,
+                    ..
+                } => {
                     let old = self
                         .table_by_id(*table_id)?
                         .lock()
@@ -6625,11 +6700,6 @@ impl Database {
         }
         let observed_security_version = self.security_coordinator.version.load(Ordering::Acquire);
         self.refresh_security_catalog_if_stale(observed_security_version)?;
-        if principal_catalog_bound {
-            let fresh = catalog::read(&self.root, self.meta_dek.as_ref())?
-                .ok_or_else(|| MongrelError::NotFound("catalog vanished during write".into()))?;
-            *self.catalog.write() = fresh;
-        }
         {
             let catalog = self.catalog.read();
             if principal_catalog_bound {
@@ -6700,18 +6770,21 @@ impl Database {
         self.fill_auto_increment_for_staging(&mut staging)?;
         external_states = dedup_external_states(external_states);
 
-        self.validate_write_permissions(&staging, security_principal.as_ref())?;
-
         // Validate declarative constraints (unique / FK / check) under the read
         // snapshot, outside the WAL mutex. Trigger-produced writes are included
         // here, so the batch either satisfies every declared constraint or is
         // rejected atomically.
         self.validate_constraints(&mut staging, read_epoch)?;
+        self.validate_write_permissions(&staging, security_principal.as_ref())?;
         self.validate_security_writes(&staging, read_epoch, security_principal.as_ref())?;
         let mut normalized = Vec::with_capacity(staging.len() * 2);
         for (table_id, op) in staging {
             match op {
-                crate::txn::Staged::Update(row_id, cells) => {
+                crate::txn::Staged::Update {
+                    row_id,
+                    new_row: cells,
+                    ..
+                } => {
                     normalized.push((table_id, crate::txn::Staged::Delete(row_id)));
                     normalized.push((table_id, crate::txn::Staged::Put(cells)));
                 }
@@ -6778,7 +6851,7 @@ impl Database {
                     Staged::Truncate => keys.push(WriteKey::Table {
                         table_id: *table_id,
                     }),
-                    Staged::Update(_, _) => unreachable!("updates normalized before prepare"),
+                    Staged::Update { .. } => unreachable!("updates normalized before prepare"),
                 }
             }
             for (name, _) in &external_states {
@@ -6942,7 +7015,7 @@ impl Database {
                             delete_images[index] = t.get(*row_id, Snapshot::at(read_epoch));
                         }
                         Staged::Put(_) | Staged::Truncate => {}
-                        Staged::Update(_, _) => {
+                        Staged::Update { .. } => {
                             unreachable!("updates normalized before prepare")
                         }
                     }
@@ -7126,7 +7199,7 @@ impl Database {
                         applies[batch_index].ops.push(StagedOp::Truncate);
                         index += 1;
                     }
-                    Staged::Update(_, _) => unreachable!("updates normalized before sequencer"),
+                    Staged::Update { .. } => unreachable!("updates normalized before sequencer"),
                 }
             }
 
@@ -7840,7 +7913,14 @@ impl Database {
                     }
                     let mut cells: Vec<(u16, Value)> = row.columns.into_iter().collect();
                     table.apply_defaults(&mut cells)?;
-                    updates.push((table_id, crate::txn::Staged::Update(row.row_id, cells)));
+                    updates.push((
+                        table_id,
+                        crate::txn::Staged::Update {
+                            row_id: row.row_id,
+                            new_row: cells,
+                            changed_columns: vec![old.id],
+                        },
+                    ));
                 }
                 updates
             } else {
@@ -10146,7 +10226,14 @@ mod write_permission_tests {
         let staging = vec![
             (7, Staged::Put(vec![(2, Value::Int64(2))])),
             (7, Staged::Put(vec![(1, Value::Int64(1))])),
-            (7, Staged::Update(RowId(1), Vec::new())),
+            (
+                7,
+                Staged::Update {
+                    row_id: RowId(1),
+                    new_row: vec![(1, Value::Int64(1)), (2, Value::Int64(2))],
+                    changed_columns: vec![2],
+                },
+            ),
             (7, Staged::Delete(RowId(2))),
             (8, Staged::Truncate),
         ];
@@ -10155,7 +10242,7 @@ mod write_permission_tests {
         let table = needs.get(&7).unwrap();
         assert_eq!(table.insert_columns, [1, 2]);
         assert!(table.update);
-        assert!(table.update_columns.is_empty());
+        assert_eq!(table.update_columns, [2]);
         assert!(table.delete);
         assert!(needs.get(&8).unwrap().truncate);
     }

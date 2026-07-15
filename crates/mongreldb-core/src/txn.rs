@@ -20,10 +20,14 @@ use parking_lot::{Condvar, Mutex as PlMutex};
 pub(crate) enum Staged {
     Put(Vec<(u16, Value)>),
     Delete(RowId),
-    /// Full post-update row image paired with its old row id. Kept distinct
-    /// through trigger/FK expansion so ON UPDATE cannot be confused with a
-    /// coincidental delete plus insert.
-    Update(RowId, Vec<(u16, Value)>),
+    /// Full post-update row image plus the logical columns changed by this
+    /// operation. Authorization uses `changed_columns`; constraints, RLS,
+    /// triggers, WAL publication, and index maintenance use `new_row`.
+    Update {
+        row_id: RowId,
+        new_row: Vec<(u16, Value)>,
+        changed_columns: Vec<u16>,
+    },
     Truncate,
 }
 
@@ -292,12 +296,20 @@ impl<'db> Transaction<'db> {
         let mut post_images = Vec::with_capacity(updates.len());
         let mut staged = Vec::with_capacity(updates.len());
         for (old_id, new_cells) in updates {
+            let changed_columns = changed_columns(&new_cells);
             let old_row = t
                 .get(old_id, snap)
                 .ok_or_else(|| MongrelError::NotFound(format!("row {old_id:?} not found")))?;
             let merged = merge_cells(old_row.columns.into_iter().collect(), new_cells);
             post_images.push(owned_row_from_cells(&merged));
-            staged.push((id, Staged::Update(old_id, merged)));
+            staged.push((
+                id,
+                Staged::Update {
+                    row_id: old_id,
+                    new_row: merged,
+                    changed_columns,
+                },
+            ));
         }
         drop(t);
         self.staging.extend(staged);
@@ -339,6 +351,7 @@ impl<'db> Transaction<'db> {
             (Some((old_id, old_row)), UpsertAction::DoUpdate(update_cells)) => {
                 // The update branch requires Update permission.
                 self.require_columns(table, crate::auth::ColumnOperation::Update, &update_cells)?;
+                let changed_columns = changed_columns(&update_cells);
                 let merged = merge_cells(old_row.columns.clone(), update_cells);
                 if columns_equal(&old_row.columns, &merged) {
                     return Ok(UpsertResult {
@@ -348,7 +361,14 @@ impl<'db> Transaction<'db> {
                     });
                 }
                 let row = owned_row_from_cells(&merged);
-                self.staging.push((id, Staged::Update(old_id, merged)));
+                self.staging.push((
+                    id,
+                    Staged::Update {
+                        row_id: old_id,
+                        new_row: merged,
+                        changed_columns,
+                    },
+                ));
                 Ok(UpsertResult {
                     action: UpsertActionKind::Updated,
                     row,
@@ -483,6 +503,13 @@ fn merge_cells(mut base: Vec<(u16, Value)>, updates: Vec<(u16, Value)>) -> Vec<(
     }
     base.sort_by_key(|(id, _)| *id);
     base
+}
+
+fn changed_columns(cells: &[(u16, Value)]) -> Vec<u16> {
+    let mut columns = cells.iter().map(|(column, _)| *column).collect::<Vec<_>>();
+    columns.sort_unstable();
+    columns.dedup();
+    columns
 }
 
 fn columns_equal(a: &[(u16, Value)], b: &[(u16, Value)]) -> bool {

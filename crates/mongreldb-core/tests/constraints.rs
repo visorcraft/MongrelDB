@@ -5,7 +5,7 @@ use mongreldb_core::constraint::{
     CheckExpr, FkAction, ForeignKey, TableConstraints, UniqueConstraint,
 };
 use mongreldb_core::schema::*;
-use mongreldb_core::{Database, MongrelError, RowId, Value};
+use mongreldb_core::{Database, MongrelError, Permission, Principal, RowId, Value};
 use tempfile::tempdir;
 
 fn col(id: u16, name: &str, ty: TypeId, flags: ColumnFlags) -> ColumnDef {
@@ -193,6 +193,35 @@ fn fk_on_update_cascade_rewrites_child_key() {
         .visible_rows(db.snapshot().0)
         .unwrap();
     assert_eq!(rows[0].columns.get(&11), Some(&Value::Int64(2)));
+}
+
+#[test]
+fn fk_on_update_cascade_authorizes_changed_child_columns() {
+    let (_dir, db, user, _order) = setup_update_fk(FkAction::Cascade);
+    let principal = Principal {
+        username: "writer".into(),
+        is_admin: false,
+        roles: Vec::new(),
+        permissions: vec![Permission::UpdateColumns {
+            table: "users".into(),
+            columns: vec!["id".into()],
+        }],
+    };
+    let mut transaction = db.begin_as(Some(principal));
+    transaction
+        .update_many("users", vec![(user, row(&[(0, Value::Int64(2))]))])
+        .unwrap();
+    assert!(matches!(
+        transaction.commit(),
+        Err(MongrelError::PermissionDenied { .. })
+    ));
+    let rows = db
+        .table("orders")
+        .unwrap()
+        .lock()
+        .visible_rows(db.snapshot().0)
+        .unwrap();
+    assert_eq!(rows[0].columns.get(&11), Some(&Value::Int64(1)));
 }
 
 #[test]

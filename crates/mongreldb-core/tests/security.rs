@@ -135,6 +135,51 @@ fn rls_columns_masks_and_reopen() {
     assert!(!rows[0].columns.contains_key(&4));
     assert_eq!(db.count_for("docs", Some(&alice)).unwrap(), 1);
 
+    let alice_row_id = db
+        .rows_for("docs", Some(&admin))
+        .unwrap()
+        .into_iter()
+        .find(|row| row.columns.get(&1) == Some(&Value::Int64(1)))
+        .unwrap()
+        .row_id;
+    let mut update = db.begin_as(Some(alice.clone()));
+    update
+        .update_many("docs", vec![(alice_row_id, vec![(4, Value::Int64(11))])])
+        .unwrap();
+    update.commit().unwrap();
+
+    let current_alice_row = db
+        .rows_for("docs", Some(&admin))
+        .unwrap()
+        .into_iter()
+        .find(|row| row.columns.get(&1) == Some(&Value::Int64(1)))
+        .unwrap();
+    assert_eq!(current_alice_row.columns.get(&4), Some(&Value::Int64(11)));
+    assert_eq!(
+        current_alice_row.columns.get(&3),
+        Some(&Value::Bytes(b"a-secret".to_vec()))
+    );
+
+    let mut owner_editor = alice.clone();
+    owner_editor.permissions.push(Permission::UpdateColumns {
+        table: "docs".into(),
+        columns: vec!["owner".into()],
+    });
+    let mut rls_denied = db.begin_as(Some(owner_editor));
+    rls_denied
+        .update_many(
+            "docs",
+            vec![(
+                current_alice_row.row_id,
+                vec![(2, Value::Bytes(b"bob".to_vec()))],
+            )],
+        )
+        .unwrap();
+    assert!(matches!(
+        rls_denied.commit(),
+        Err(mongreldb_core::MongrelError::PermissionDenied { .. })
+    ));
+
     let mut allowed = db.begin_as(Some(alice.clone()));
     allowed.put("docs", cells(3, "alice", "new", 30)).unwrap();
     allowed.commit().unwrap();

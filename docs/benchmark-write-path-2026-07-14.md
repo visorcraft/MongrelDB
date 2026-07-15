@@ -125,3 +125,22 @@ The nightly 1M workflow runs the characterization and
 `scripts/validate-read-generation-characterization.py`. This makes commit p99,
 peak RSS, clone amplification, and bounded cursor lifetime release artifacts
 instead of advisory local numbers.
+
+## Authenticated 10k-row batch
+
+The catalog-bound write characterization runs with an unchanged process-wide
+security version:
+
+```bash
+cargo run -p mongreldb-core --release --example authenticated_batch_bench
+```
+
+| Metric | Current |
+|---|---:|
+| Rows committed | 10,000 |
+| Commit latency | 16 ms |
+| Security catalog disk reads | 0 |
+
+The counter excludes the initial database open. A security-version change
+causes exactly one reload on the stale handle; unchanged authenticated commits
+reuse the in-memory catalog.

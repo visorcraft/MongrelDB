@@ -56,6 +56,36 @@ fn two_column_schema() -> Schema {
     }
 }
 
+fn three_column_schema() -> Schema {
+    Schema {
+        schema_id: 3,
+        columns: vec![
+            ColumnDef {
+                id: 1,
+                name: "id".into(),
+                ty: TypeId::Int64,
+                flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
+            },
+            ColumnDef {
+                id: 2,
+                name: "public_title".into(),
+                ty: TypeId::Bytes,
+                flags: ColumnFlags::empty(),
+                default_value: None,
+            },
+            ColumnDef {
+                id: 3,
+                name: "private_notes".into(),
+                ty: TypeId::Bytes,
+                flags: ColumnFlags::empty(),
+                default_value: None,
+            },
+        ],
+        ..Schema::default()
+    }
+}
+
 #[test]
 fn secure_native_wrappers_apply_rls_masks_and_live_revocation() {
     let dir = tempdir().unwrap();
@@ -1065,6 +1095,268 @@ fn transaction_update_enforces_update_permission() {
 }
 
 #[test]
+fn update_authorization_uses_changed_columns_not_full_post_image() {
+    let dir = tempdir().unwrap();
+    let admin = Database::create_with_credentials(dir.path(), "admin", "admin-pw").unwrap();
+    admin.create_table("docs", three_column_schema()).unwrap();
+    admin
+        .transaction(|transaction| {
+            transaction.put(
+                "docs",
+                vec![
+                    (1, Value::Int64(1)),
+                    (2, Value::Bytes(b"old".to_vec())),
+                    (3, Value::Bytes(b"restricted".to_vec())),
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    admin.create_user("writer", "writer-pw").unwrap();
+    admin.create_role("limited_writer").unwrap();
+    admin
+        .grant_permission(
+            "limited_writer",
+            Permission::Select {
+                table: "docs".into(),
+            },
+        )
+        .unwrap();
+    admin
+        .grant_permission(
+            "limited_writer",
+            Permission::Insert {
+                table: "docs".into(),
+            },
+        )
+        .unwrap();
+    admin
+        .grant_permission(
+            "limited_writer",
+            Permission::UpdateColumns {
+                table: "docs".into(),
+                columns: vec!["public_title".into()],
+            },
+        )
+        .unwrap();
+    admin.grant_role("writer", "limited_writer").unwrap();
+    let writer = Database::open_with_credentials(dir.path(), "writer", "writer-pw").unwrap();
+
+    let row_id = admin
+        .table("docs")
+        .unwrap()
+        .lock()
+        .visible_rows(admin.snapshot().0)
+        .unwrap()[0]
+        .row_id;
+    let reads_before = writer.security_catalog_disk_read_count();
+    writer
+        .transaction(|transaction| {
+            transaction.update_many(
+                "docs",
+                vec![(row_id, vec![(2, Value::Bytes(b"changed".to_vec()))])],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(writer.security_catalog_disk_read_count(), reads_before);
+
+    let current = writer
+        .table("docs")
+        .unwrap()
+        .lock()
+        .visible_rows(writer.snapshot().0)
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(current.columns[&2], Value::Bytes(b"changed".to_vec()));
+    assert_eq!(current.columns[&3], Value::Bytes(b"restricted".to_vec()));
+
+    let mut denied = writer.begin();
+    assert!(matches!(
+        denied.update_many(
+            "docs",
+            vec![(
+                current.row_id,
+                vec![(3, Value::Bytes(b"forbidden".to_vec()))]
+            )]
+        ),
+        Err(MongrelError::PermissionDenied { .. })
+    ));
+    denied.rollback();
+
+    writer
+        .transaction(|transaction| {
+            transaction.upsert(
+                "docs",
+                vec![
+                    (1, Value::Int64(1)),
+                    (2, Value::Bytes(b"ignored".to_vec())),
+                    (3, Value::Bytes(b"ignored".to_vec())),
+                ],
+                mongreldb_core::UpsertAction::DoUpdate(vec![(
+                    2,
+                    Value::Bytes(b"upserted".to_vec()),
+                )]),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    let current = writer
+        .table("docs")
+        .unwrap()
+        .lock()
+        .visible_rows(writer.snapshot().0)
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let mut revoked = writer.begin();
+    revoked
+        .update_many(
+            "docs",
+            vec![(current.row_id, vec![(2, Value::Bytes(b"late".to_vec()))])],
+        )
+        .unwrap();
+    admin.revoke_role("writer", "limited_writer").unwrap();
+    assert!(matches!(
+        revoked.commit(),
+        Err(MongrelError::PermissionDenied { .. })
+    ));
+}
+
+#[test]
+fn security_catalog_reload_is_version_gated_and_fails_closed() {
+    let dir = tempdir().unwrap();
+    let admin = Database::create_with_credentials(dir.path(), "admin", "admin-pw").unwrap();
+    admin.create_table("docs", int_pk_schema()).unwrap();
+    admin.create_user("writer", "writer-pw").unwrap();
+    admin.create_role("writer_role").unwrap();
+    admin
+        .grant_permission(
+            "writer_role",
+            Permission::Insert {
+                table: "docs".into(),
+            },
+        )
+        .unwrap();
+    admin.grant_role("writer", "writer_role").unwrap();
+    let writer = Database::open_with_credentials(dir.path(), "writer", "writer-pw").unwrap();
+
+    let before = writer.security_catalog_disk_read_count();
+    writer
+        .transaction(|transaction| {
+            transaction.put("docs", vec![(1, Value::Int64(1))])?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(writer.security_catalog_disk_read_count(), before);
+
+    admin.create_role("unrelated").unwrap();
+    writer
+        .transaction(|transaction| {
+            transaction.put("docs", vec![(1, Value::Int64(2))])?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(writer.security_catalog_disk_read_count(), before + 1);
+
+    admin.create_role("reload_must_fail").unwrap();
+    std::fs::remove_file(dir.path().join("CATALOG")).unwrap();
+    let mut transaction = writer.begin();
+    transaction.put("docs", vec![(1, Value::Int64(3))]).unwrap();
+    assert!(transaction.commit().is_err());
+    assert_eq!(writer.table("docs").unwrap().lock().count(), 2);
+}
+
+#[test]
+fn trigger_added_update_column_is_finally_authorized() {
+    let dir = tempdir().unwrap();
+    let admin = Database::create_with_credentials(dir.path(), "admin", "admin-pw").unwrap();
+    admin.create_table("docs", three_column_schema()).unwrap();
+    admin
+        .create_trigger(
+            StoredTrigger::new(
+                "rewrite_private_notes",
+                TriggerDefinition {
+                    target: TriggerTarget::Table("docs".into()),
+                    timing: TriggerTiming::Before,
+                    event: TriggerEvent::Update,
+                    update_of: Vec::new(),
+                    target_columns: Vec::new(),
+                    when: None,
+                    program: TriggerProgram {
+                        steps: vec![TriggerStep::SetNew {
+                            cells: vec![TriggerCell {
+                                column_id: 3,
+                                value: TriggerValue::Literal(Value::Bytes(b"triggered".to_vec())),
+                            }],
+                        }],
+                    },
+                },
+                0,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    admin
+        .transaction(|transaction| {
+            transaction.put(
+                "docs",
+                vec![
+                    (1, Value::Int64(1)),
+                    (2, Value::Bytes(b"old".to_vec())),
+                    (3, Value::Bytes(b"private".to_vec())),
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    admin.create_user("writer", "writer-pw").unwrap();
+    admin.create_role("limited_writer").unwrap();
+    admin
+        .grant_permission(
+            "limited_writer",
+            Permission::UpdateColumns {
+                table: "docs".into(),
+                columns: vec!["public_title".into()],
+            },
+        )
+        .unwrap();
+    admin.grant_role("writer", "limited_writer").unwrap();
+    let writer = Database::open_with_credentials(dir.path(), "writer", "writer-pw").unwrap();
+    let row_id = admin
+        .table("docs")
+        .unwrap()
+        .lock()
+        .visible_rows(admin.snapshot().0)
+        .unwrap()[0]
+        .row_id;
+    let mut transaction = writer.begin();
+    transaction
+        .update_many(
+            "docs",
+            vec![(row_id, vec![(2, Value::Bytes(b"changed".to_vec()))])],
+        )
+        .unwrap();
+    assert!(matches!(
+        transaction.commit(),
+        Err(MongrelError::PermissionDenied { .. })
+    ));
+    let row = admin
+        .table("docs")
+        .unwrap()
+        .lock()
+        .visible_rows(admin.snapshot().0)
+        .unwrap()[0]
+        .clone();
+    assert_eq!(row.columns[&2], Value::Bytes(b"old".to_vec()));
+    assert_eq!(row.columns[&3], Value::Bytes(b"private".to_vec()));
+}
+
+#[test]
 fn batch_column_permissions_cover_every_row() {
     let dir = tempdir().unwrap();
     let db = Database::create_with_credentials(dir.path(), "admin", "admin-pw").unwrap();
@@ -1120,6 +1412,33 @@ fn commit_rechecks_revoked_batch_permission() {
 
     let error = txn.commit().unwrap_err();
     assert!(matches!(error, MongrelError::PermissionDenied { .. }));
+}
+
+#[test]
+fn commit_fails_auth_required_when_catalog_bound_user_was_dropped() {
+    let dir = tempdir().unwrap();
+    let admin = Database::create_with_credentials(dir.path(), "admin", "admin-pw").unwrap();
+    admin.create_table("docs", int_pk_schema()).unwrap();
+    admin.create_user("writer", "writer-pw").unwrap();
+    admin.create_role("writer_role").unwrap();
+    admin
+        .grant_permission(
+            "writer_role",
+            Permission::Insert {
+                table: "docs".into(),
+            },
+        )
+        .unwrap();
+    admin.grant_role("writer", "writer_role").unwrap();
+    let writer = Database::open_with_credentials(dir.path(), "writer", "writer-pw").unwrap();
+    let mut transaction = writer.begin();
+    transaction.put("docs", vec![(1, Value::Int64(1))]).unwrap();
+    admin.drop_user("writer").unwrap();
+    assert!(matches!(
+        transaction.commit(),
+        Err(MongrelError::AuthRequired)
+    ));
+    assert_eq!(writer.table("docs").unwrap().lock().count(), 0);
 }
 
 #[test]
