@@ -27,6 +27,7 @@
 
 use crate::arrow_conv::{arrow_data_type, build_array};
 use crate::error::{MongrelQueryError, Result};
+use crate::query_registry::RegisteredSqlQuery;
 use crate::{translate_ann_search, translate_filter};
 use arrow::array::{new_empty_array, ArrayRef};
 use arrow::datatypes::Field;
@@ -40,13 +41,23 @@ use std::sync::Arc;
 /// `(sort_expr, asc, nulls_first)` keys plus an optional `LIMIT n` fetch.
 type SortInfo = (Vec<(Expr, bool, bool)>, Option<usize>);
 
+#[inline]
+fn checkpoint(query: Option<&RegisteredSqlQuery>, index: usize) -> Result<()> {
+    if index % 256 == 0 {
+        query.map(RegisteredSqlQuery::checkpoint).transpose()?;
+    }
+    Ok(())
+}
+
 /// If `plan` is a servable FK-join over two registered tables, run it via
 /// bitmap intersection and return the result batches; otherwise `None` (fall
 /// through to DataFusion).
 pub(crate) fn try_fk_join(
     tables: &HashMap<String, TableHandle>,
     plan: &LogicalPlan,
+    query: Option<&RegisteredSqlQuery>,
 ) -> Result<Option<Vec<RecordBatch>>> {
+    checkpoint(query, 0)?;
     // 1. Peel outer Sort / Limit (captured), Projection (captured), optional
     //    top-level Aggregate (Phase 13.4), and any top-level Filter(s) above the
     //    Join (their conjuncts are routed to the side whose columns they
@@ -147,6 +158,7 @@ pub(crate) fn try_fk_join(
     lock_db(&jc.fk_table, tables)
         .ensure_indexes_complete()
         .map_err(MongrelQueryError::Core)?;
+    checkpoint(query, 0)?;
 
     // 5. Resolve the PK side survivor rows; collect their join-column values.
     //    Phase 17.2: broadcast join — when the PK side has no WHERE filter
@@ -168,11 +180,15 @@ pub(crate) fn try_fk_join(
             if let Some(fk_col_id) = fk_schema.column(&jc.fk_name).map(|c| c.id) {
                 if let Some(bcast_values) = fk_db.broadcast_join_values(fk_col_id, &pk_db) {
                     let snap = pk_db.snapshot();
-                    let rows: Vec<_> = bcast_values
-                        .iter()
-                        .filter_map(|v| pk_db.lookup_pk(v))
-                        .filter_map(|rid| pk_db.get(rid, snap))
-                        .collect();
+                    let mut rows = Vec::with_capacity(bcast_values.len());
+                    for (index, value) in bcast_values.iter().enumerate() {
+                        checkpoint(query, index)?;
+                        if let Some(row) =
+                            pk_db.lookup_pk(value).and_then(|rid| pk_db.get(rid, snap))
+                        {
+                            rows.push(row);
+                        }
+                    }
                     (rows, pk_col_id)
                 } else {
                     drop(pk_db);
@@ -202,16 +218,17 @@ pub(crate) fn try_fk_join(
             (rows, pk_col_id)
         }
     };
-    let pk_values: Vec<Vec<u8>> = pk_rows
-        .iter()
-        .map(|r| {
-            r.columns
+    let mut pk_values = Vec::with_capacity(pk_rows.len());
+    for (index, row) in pk_rows.iter().enumerate() {
+        checkpoint(query, index)?;
+        pk_values.push(
+            row.columns
                 .get(&pk_col_id)
                 .cloned()
                 .unwrap_or(Value::Null)
-                .encode_key()
-        })
-        .collect();
+                .encode_key(),
+        );
+    }
     if pk_values.is_empty() {
         // No surviving PK rows ⇒ empty inner-join result.
         return match output_schema(projection, &jc, &left, &right, tables)? {
@@ -265,6 +282,7 @@ pub(crate) fn try_fk_join(
             .map_err(MongrelQueryError::Core)?;
         (rids, fk_col_id)
     };
+    checkpoint(query, 0)?;
 
     // Phase 13.4: if the plan has a top-level Aggregate, compute it directly
     // from the survivor set without materializing rows for a hash join.
@@ -273,7 +291,11 @@ pub(crate) fn try_fk_join(
     }
 
     // Phase 13.6: SEMI / ANTI joins. The FK side must be the probed side.
-    let fk_rid_set: std::collections::HashSet<u64> = fk_rids.iter().copied().collect();
+    let mut fk_rid_set = std::collections::HashSet::with_capacity(fk_rids.len());
+    for (index, row_id) in fk_rids.iter().copied().enumerate() {
+        checkpoint(query, index)?;
+        fk_rid_set.insert(row_id);
+    }
     match jc.join_type {
         JoinType::LeftSemi | JoinType::LeftAnti if !jc.pk_is_left => {}
         JoinType::RightSemi | JoinType::RightAnti if jc.pk_is_left => {}
@@ -316,7 +338,8 @@ pub(crate) fn try_fk_join(
             })
             .collect();
         let mut out_rows: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
-        for r in &rows {
+        for (index, r) in rows.iter().enumerate() {
+            checkpoint(query, index)?;
             let row: Vec<Value> = out_cols
                 .iter()
                 .map(|oc| r.columns.get(&oc.column_id).cloned().unwrap_or(Value::Null))
@@ -356,7 +379,8 @@ pub(crate) fn try_fk_join(
 
     // 8. Pair each FK row with its matched PK row (by encoded join value).
     let mut pk_map: HashMap<Vec<u8>, Row> = HashMap::with_capacity(pk_rows.len());
-    for r in pk_rows {
+    for (index, r) in pk_rows.into_iter().enumerate() {
+        checkpoint(query, index)?;
         let key = r
             .columns
             .get(&pk_col_id)
@@ -366,7 +390,8 @@ pub(crate) fn try_fk_join(
         pk_map.insert(key, r);
     }
     let mut out_rows: Vec<Vec<Value>> = Vec::with_capacity(fk_rows.len());
-    for f in &fk_rows {
+    for (index, f) in fk_rows.iter().enumerate() {
+        checkpoint(query, index)?;
         let fk_val = f
             .columns
             .get(&fk_col_id)
@@ -1383,7 +1408,7 @@ mod tests {
             .sql("select u.uid, u.country from users u join countries c on u.country = c.cid")
             .await
             .unwrap();
-        let out = try_fk_join(&tables, plan.logical_plan()).unwrap();
+        let out = try_fk_join(&tables, plan.logical_plan(), None).unwrap();
         assert!(out.is_some(), "FK-join intercept should fire");
         let batches = out.unwrap();
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -1400,7 +1425,9 @@ mod tests {
             .sql("select u.uid from users u join countries c on u.country = c.cid where c.cid <= 1 order by u.uid")
             .await
             .unwrap();
-        let out = try_fk_join(&tables, plan.logical_plan()).unwrap().unwrap();
+        let out = try_fk_join(&tables, plan.logical_plan(), None)
+            .unwrap()
+            .unwrap();
         let batch = &out[0];
         assert_eq!(batch.num_rows(), 4, "uids 0,1,5,6 reference countries 0,1");
         // Ordered ascending ⇒ first uid is 0.
@@ -1423,7 +1450,7 @@ mod tests {
             .sql("select c.cid from countries c join users u on c.cid = u.country")
             .await
             .unwrap();
-        let out = try_fk_join(&tables, plan.logical_plan()).unwrap();
+        let out = try_fk_join(&tables, plan.logical_plan(), None).unwrap();
         // Still fires: users.country HAS a bitmap, so users is the FK side
         // regardless of SQL order. Expect it to fire.
         assert!(out.is_some(), "intercept fires regardless of join order");
@@ -1437,7 +1464,7 @@ mod tests {
             .sql("select count(*) from users u join countries c on u.country = c.cid")
             .await
             .unwrap();
-        let out = try_fk_join(&tables, plan.logical_plan()).unwrap();
+        let out = try_fk_join(&tables, plan.logical_plan(), None).unwrap();
         assert!(out.is_some(), "aggregate FK-join should fire");
         let batch = &out.unwrap()[0];
         assert_eq!(batch.num_rows(), 1);
@@ -1459,7 +1486,7 @@ mod tests {
             .sql("select count(*) from users u join countries c on u.country = c.cid where c.cid <= 1")
             .await
             .unwrap();
-        let out = try_fk_join(&tables, plan.logical_plan()).unwrap();
+        let out = try_fk_join(&tables, plan.logical_plan(), None).unwrap();
         assert!(out.is_some(), "filtered aggregate FK-join should fire");
         let val = out.unwrap()[0]
             .column(0)
@@ -1479,7 +1506,7 @@ mod tests {
             .sql("select sum(u.uid) from users u join countries c on u.country = c.cid")
             .await
             .unwrap();
-        let out = try_fk_join(&tables, plan.logical_plan()).unwrap();
+        let out = try_fk_join(&tables, plan.logical_plan(), None).unwrap();
         assert!(out.is_some(), "SUM FK-join aggregate should fire");
         let val = out.unwrap()[0]
             .column(0)

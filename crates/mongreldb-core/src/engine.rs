@@ -6916,6 +6916,25 @@ impl Table {
         snapshot: Snapshot,
         projection: Option<&[u16]>,
     ) -> Result<Vec<(u16, columnar::NativeColumn)>> {
+        self.visible_columns_native_inner(snapshot, projection, None)
+    }
+
+    pub fn visible_columns_native_with_control(
+        &self,
+        snapshot: Snapshot,
+        projection: Option<&[u16]>,
+        control: &crate::ExecutionControl,
+    ) -> Result<Vec<(u16, columnar::NativeColumn)>> {
+        self.visible_columns_native_inner(snapshot, projection, Some(control))
+    }
+
+    fn visible_columns_native_inner(
+        &self,
+        snapshot: Snapshot,
+        projection: Option<&[u16]>,
+        control: Option<&crate::ExecutionControl>,
+    ) -> Result<Vec<(u16, columnar::NativeColumn)>> {
+        execution_checkpoint(control, 0)?;
         let wanted: Vec<u16> = match projection {
             Some(p) => p.to_vec(),
             None => self.schema.columns.iter().map(|c| c.id).collect(),
@@ -6928,13 +6947,14 @@ impl Table {
             let rr = self.run_refs[0].clone();
             let mut reader = self.open_reader(rr.run_id)?;
             let idxs = reader.visible_indices_native(snapshot.epoch)?;
+            execution_checkpoint(control, 0)?;
             let all_visible = idxs.len() == reader.row_count();
             // Phase 15.1: decode every requested column in parallel when the
             // reader is mmap-backed. Each column already parallel-decodes its
             // own pages, so a wide table saturates the pool via nested rayon
             // without oversubscribing (work-stealing handles it). Falls back to
             // the sequential `&mut` path when mmap is unavailable.
-            if reader.has_mmap() {
+            if reader.has_mmap() && control.is_none() {
                 use rayon::prelude::*;
                 // Pre-resolve the requested ids that exist in the schema (don't
                 // capture `self` inside the rayon closure).
@@ -6960,7 +6980,8 @@ impl Table {
                 return Ok(cols);
             }
             let mut cols = Vec::with_capacity(wanted.len());
-            for cid in &wanted {
+            for (index, cid) in wanted.iter().enumerate() {
+                execution_checkpoint(control, index)?;
                 let cdef = match self.schema.columns.iter().find(|c| c.id == *cid) {
                     Some(c) => c,
                     None => continue,
@@ -6971,6 +6992,7 @@ impl Table {
             return Ok(cols);
         }
         let vcols = self.visible_columns(snapshot)?;
+        execution_checkpoint(control, 0)?;
         let want_set: std::collections::HashSet<u16> = wanted.iter().copied().collect();
         let out: Vec<(u16, columnar::NativeColumn)> = vcols
             .into_iter()
@@ -7072,13 +7094,34 @@ impl Table {
         projection: Option<&[u16]>,
         snapshot: Snapshot,
     ) -> Result<Option<Vec<(u16, columnar::NativeColumn)>>> {
+        self.query_columns_native_cached_inner(conditions, projection, snapshot, None)
+    }
+
+    pub fn query_columns_native_cached_with_control(
+        &mut self,
+        conditions: &[crate::query::Condition],
+        projection: Option<&[u16]>,
+        snapshot: Snapshot,
+        control: &crate::ExecutionControl,
+    ) -> Result<Option<Vec<(u16, columnar::NativeColumn)>>> {
+        self.query_columns_native_cached_inner(conditions, projection, snapshot, Some(control))
+    }
+
+    fn query_columns_native_cached_inner(
+        &mut self,
+        conditions: &[crate::query::Condition],
+        projection: Option<&[u16]>,
+        snapshot: Snapshot,
+        control: Option<&crate::ExecutionControl>,
+    ) -> Result<Option<Vec<(u16, columnar::NativeColumn)>>> {
+        execution_checkpoint(control, 0)?;
         // Wall-clock expiry changes without an MVCC epoch, so an epoch-keyed
         // result can become stale while sitting in the cache.
         if self.ttl.is_some() {
-            return self.query_columns_native(conditions, projection, snapshot);
+            return self.query_columns_native_inner(conditions, projection, snapshot, control);
         }
         if conditions.is_empty() {
-            return self.query_columns_native(conditions, projection, snapshot);
+            return self.query_columns_native_inner(conditions, projection, snapshot, control);
         }
         // The snapshot epoch is part of the key so two queries with identical
         // conditions/projection but pinned at different snapshots never share a
@@ -7091,10 +7134,12 @@ impl Table {
             });
             return Ok(Some((*hit).clone()));
         }
-        let res = self.query_columns_native(conditions, projection, snapshot)?;
+        let res = self.query_columns_native_inner(conditions, projection, snapshot, control)?;
+        execution_checkpoint(control, 0)?;
         if let Some(cols) = &res {
             let footprint = self.resolve_footprint(conditions, snapshot);
             let condition_cols = crate::query::condition_columns(conditions);
+            execution_checkpoint(control, 0)?;
             self.result_cache.lock().insert(
                 key,
                 CachedEntry {
@@ -7249,7 +7294,28 @@ impl Table {
         projection: Option<&[u16]>,
         snapshot: Snapshot,
     ) -> Result<Option<Vec<(u16, columnar::NativeColumn)>>> {
+        self.query_columns_native_inner(conditions, projection, snapshot, None)
+    }
+
+    pub fn query_columns_native_with_control(
+        &mut self,
+        conditions: &[crate::query::Condition],
+        projection: Option<&[u16]>,
+        snapshot: Snapshot,
+        control: &crate::ExecutionControl,
+    ) -> Result<Option<Vec<(u16, columnar::NativeColumn)>>> {
+        self.query_columns_native_inner(conditions, projection, snapshot, Some(control))
+    }
+
+    fn query_columns_native_inner(
+        &mut self,
+        conditions: &[crate::query::Condition],
+        projection: Option<&[u16]>,
+        snapshot: Snapshot,
+        control: Option<&crate::ExecutionControl>,
+    ) -> Result<Option<Vec<(u16, columnar::NativeColumn)>>> {
         use crate::query::Condition;
+        execution_checkpoint(control, 0)?;
         // TTL reads use the materialized visibility path so the wall-clock
         // cutoff is captured once and applied to every storage tier.
         if self.ttl.is_some() {
@@ -7338,7 +7404,8 @@ impl Table {
                 None
             };
             let mut sets: Vec<RowIdSet> = Vec::new();
-            for c in conditions {
+            for (index, c) in conditions.iter().enumerate() {
+                execution_checkpoint(control, index)?;
                 let s = match c {
                     Condition::Range { column_id, lo, hi }
                         if !self.learned_range.contains_key(column_id) =>
@@ -7412,10 +7479,13 @@ impl Table {
                 let col = reader.column_native(crate::sorted_run::SYS_ROW_ID)?;
                 match col {
                     columnar::NativeColumn::Int64 { data, .. } => {
-                        let mut p: Vec<usize> = candidate_ids
-                            .iter()
-                            .filter_map(|rid| data.binary_search(&(*rid as i64)).ok())
-                            .collect();
+                        let mut p = Vec::with_capacity(candidate_ids.len());
+                        for (index, rid) in candidate_ids.iter().enumerate() {
+                            execution_checkpoint(control, index)?;
+                            if let Ok(position) = data.binary_search(&(*rid as i64)) {
+                                p.push(position);
+                            }
+                        }
                         p.sort_unstable();
                         (p, false)
                     }
@@ -7427,7 +7497,8 @@ impl Table {
                 t.fast_row_id_map = fast_rid;
             });
             let mut cols = Vec::with_capacity(col_ids.len());
-            for cid in &col_ids {
+            for (index, cid) in col_ids.iter().enumerate() {
+                execution_checkpoint(control, index)?;
                 let col = reader.column_native(*cid)?;
                 cols.push((*cid, col.gather(&positions)));
             }
@@ -7447,7 +7518,9 @@ impl Table {
         // (no runs, memtable-only) edge case falls through to `rows_for_rids`.
         // -----------------------------------------------------------------------
         if !self.run_refs.is_empty() {
-            use crate::cursor::{drain_cursor_to_columns, Cursor};
+            use crate::cursor::{
+                drain_cursor_to_columns, drain_cursor_to_columns_with_control, Cursor,
+            };
             let remaining: usize;
             let mut cursor: Box<dyn crate::cursor::Cursor> = if self.run_refs.len() == 1 {
                 let c = self
@@ -7467,7 +7540,12 @@ impl Table {
                     t.survivor_count = Some(remaining);
                 }
             });
-            let cols = drain_cursor_to_columns(cursor.as_mut(), &proj_pairs)?;
+            let cols = match control {
+                Some(control) => {
+                    drain_cursor_to_columns_with_control(cursor.as_mut(), &proj_pairs, control)?
+                }
+                None => drain_cursor_to_columns(cursor.as_mut(), &proj_pairs)?,
+            };
             return Ok(Some(cols));
         }
 
@@ -7480,13 +7558,15 @@ impl Table {
             t.row_materialized = true;
         });
         let mut sets: Vec<RowIdSet> = Vec::with_capacity(conditions.len());
-        for c in conditions {
+        for (index, c) in conditions.iter().enumerate() {
+            execution_checkpoint(control, index)?;
             sets.push(self.resolve_condition(c, snapshot)?);
         }
         let rids = RowIdSet::intersect_many(sets).into_sorted_vec();
         let rows = self.rows_for_rids(&rids, snapshot)?;
         let mut cols: Vec<(u16, columnar::NativeColumn)> = Vec::with_capacity(col_ids.len());
-        for (cid, ty) in &proj_pairs {
+        for (index, (cid, ty)) in proj_pairs.iter().enumerate() {
+            execution_checkpoint(control, index)?;
             let vals: Vec<Value> = rows
                 .iter()
                 .map(|r| r.columns.get(cid).cloned().unwrap_or(Value::Null))
@@ -8202,6 +8282,29 @@ impl Table {
         conditions: &[crate::query::Condition],
         agg: NativeAgg,
     ) -> Result<Option<NativeAggResult>> {
+        self.aggregate_native_inner(snapshot, column, conditions, agg, None)
+    }
+
+    pub fn aggregate_native_with_control(
+        &self,
+        snapshot: Snapshot,
+        column: Option<u16>,
+        conditions: &[crate::query::Condition],
+        agg: NativeAgg,
+        control: &crate::ExecutionControl,
+    ) -> Result<Option<NativeAggResult>> {
+        self.aggregate_native_inner(snapshot, column, conditions, agg, Some(control))
+    }
+
+    fn aggregate_native_inner(
+        &self,
+        snapshot: Snapshot,
+        column: Option<u16>,
+        conditions: &[crate::query::Condition],
+        agg: NativeAgg,
+        control: Option<&crate::ExecutionControl>,
+    ) -> Result<Option<NativeAggResult>> {
+        execution_checkpoint(control, 0)?;
         if self.ttl.is_some() {
             return Ok(None);
         }
@@ -8228,13 +8331,14 @@ impl Table {
         else {
             return Ok(None);
         };
+        execution_checkpoint(control, 0)?;
         match ty {
             TypeId::Int64 | TypeId::TimestampNanos | TypeId::Date32 => {
-                let (count, sum, mn, mx) = accumulate_int(cursor.as_mut())?;
+                let (count, sum, mn, mx) = accumulate_int(cursor.as_mut(), control)?;
                 Ok(Some(pack_int(agg, count, sum, mn, mx)))
             }
             TypeId::Float64 => {
-                let (count, sum, mn, mx) = accumulate_float(cursor.as_mut())?;
+                let (count, sum, mn, mx) = accumulate_float(cursor.as_mut(), control)?;
                 Ok(Some(pack_float(agg, count, sum, mn, mx)))
             }
             _ => Ok(None),
@@ -8342,6 +8446,29 @@ impl Table {
         column: Option<u16>,
         agg: NativeAgg,
     ) -> Result<IncrementalAggResult> {
+        self.aggregate_incremental_inner(cache_key, conditions, column, agg, None)
+    }
+
+    pub fn aggregate_incremental_with_control(
+        &mut self,
+        cache_key: u64,
+        conditions: &[crate::query::Condition],
+        column: Option<u16>,
+        agg: NativeAgg,
+        control: &crate::ExecutionControl,
+    ) -> Result<IncrementalAggResult> {
+        self.aggregate_incremental_inner(cache_key, conditions, column, agg, Some(control))
+    }
+
+    fn aggregate_incremental_inner(
+        &mut self,
+        cache_key: u64,
+        conditions: &[crate::query::Condition],
+        column: Option<u16>,
+        agg: NativeAgg,
+        control: Option<&crate::ExecutionControl>,
+    ) -> Result<IncrementalAggResult> {
+        execution_checkpoint(control, 0)?;
         let snap = self.snapshot();
         let cur_wm = self.allocator.current().0;
         let cur_epoch = snap.epoch.0;
@@ -8368,8 +8495,14 @@ impl Table {
                     });
                 }
                 if cached.epoch < cur_epoch && cached.watermark <= cur_wm {
-                    let delta_rids: Vec<u64> = (cached.watermark..cur_wm).collect();
+                    let delta_len = cur_wm.saturating_sub(cached.watermark) as usize;
+                    let mut delta_rids = Vec::with_capacity(delta_len);
+                    for (index, row_id) in (cached.watermark..cur_wm).enumerate() {
+                        execution_checkpoint(control, index)?;
+                        delta_rids.push(row_id);
+                    }
                     let delta_rows = self.rows_for_rids(&delta_rids, snap)?;
+                    execution_checkpoint(control, 0)?;
                     let index_sets = self.resolve_index_conditions(conditions, snap)?;
                     let delta_state = agg_state_from_rows(
                         &delta_rows,
@@ -8378,6 +8511,7 @@ impl Table {
                         column,
                         agg,
                         &self.schema,
+                        control,
                     )?;
                     let merged = cached.state.merge(delta_state);
                     let delta_n = delta_rids.len() as u64;
@@ -8405,14 +8539,14 @@ impl Table {
         let cursor_ok =
             self.memtable.is_empty() && self.mutable_run.is_empty() && self.run_refs.len() == 1;
         let state = if cursor_ok && agg != NativeAgg::Avg {
-            match self.aggregate_native(snap, column, conditions, agg)? {
+            match self.aggregate_native_inner(snap, column, conditions, agg, control)? {
                 Some(result) => {
                     AggState::from_native(result, agg, column.map(|c| self.column_type(c)))
                 }
-                None => self.agg_state_full_scan(conditions, column, agg, snap)?,
+                None => self.agg_state_full_scan(conditions, column, agg, snap, control)?,
             }
         } else {
-            self.agg_state_full_scan(conditions, column, agg, snap)?
+            self.agg_state_full_scan(conditions, column, agg, snap, control)?
         };
         // Seed only when the watermark is meaningful (no pending writes).
         if incremental_ok {
@@ -8440,10 +8574,21 @@ impl Table {
         column: Option<u16>,
         agg: NativeAgg,
         snap: Snapshot,
+        control: Option<&crate::ExecutionControl>,
     ) -> Result<AggState> {
+        execution_checkpoint(control, 0)?;
         let rows = self.visible_rows(snap)?;
+        execution_checkpoint(control, 0)?;
         let index_sets = self.resolve_index_conditions(conditions, snap)?;
-        agg_state_from_rows(&rows, conditions, &index_sets, column, agg, &self.schema)
+        agg_state_from_rows(
+            &rows,
+            conditions,
+            &index_sets,
+            column,
+            agg,
+            &self.schema,
+            control,
+        )
     }
 
     /// Resolve only the index-defined conditions (`Ann`/`SparseMatch`) to row-id
@@ -9455,6 +9600,7 @@ fn agg_state_from_rows(
     column: Option<u16>,
     agg: NativeAgg,
     schema: &Schema,
+    control: Option<&crate::ExecutionControl>,
 ) -> Result<AggState> {
     let mut count: u64 = 0;
     let mut sum_i: i128 = 0;
@@ -9465,7 +9611,8 @@ fn agg_state_from_rows(
     let mut mx_f: f64 = f64::NEG_INFINITY;
     let mut saw_int = false;
     let mut saw_float = false;
-    for r in rows {
+    for (index, r) in rows.iter().enumerate() {
+        execution_checkpoint(control, index)?;
         if !conditions
             .iter()
             .all(|c| condition_matches_row(c, r, schema))
@@ -9640,21 +9787,29 @@ fn as_f64(v: Option<&Value>) -> Option<f64> {
 /// One-pass vectorized accumulation of `(non-null count, sum, min, max)` over an
 /// Int64 column streamed through `cursor`. The inner loop over a contiguous
 /// `&[i64]` autovectorizes (SIMD) for the all-non-null prefix.
-fn accumulate_int(cursor: &mut dyn crate::cursor::Cursor) -> Result<(u64, i128, i64, i64)> {
+fn accumulate_int(
+    cursor: &mut dyn crate::cursor::Cursor,
+    control: Option<&crate::ExecutionControl>,
+) -> Result<(u64, i128, i64, i64)> {
     let mut count: u64 = 0;
     let mut sum: i128 = 0;
     let mut mn: i64 = i64::MAX;
     let mut mx: i64 = i64::MIN;
     while let Some(cols) = cursor.next_batch()? {
+        execution_checkpoint(control, 0)?;
         if let Some(crate::columnar::NativeColumn::Int64 { data, validity }) = cols.first() {
             if crate::columnar::all_non_null(validity, data.len()) {
                 // All-non-null: vectorized sum/min/max with no per-element branch.
                 count += data.len() as u64;
-                sum += data.iter().map(|&v| v as i128).sum::<i128>();
-                mn = mn.min(*data.iter().min().unwrap_or(&mn));
-                mx = mx.max(*data.iter().max().unwrap_or(&mx));
+                for (chunk_index, chunk) in data.chunks(1024).enumerate() {
+                    execution_checkpoint(control, chunk_index * 1024)?;
+                    sum += chunk.iter().map(|&v| v as i128).sum::<i128>();
+                    mn = mn.min(*chunk.iter().min().unwrap_or(&mn));
+                    mx = mx.max(*chunk.iter().max().unwrap_or(&mx));
+                }
             } else {
                 for (i, &v) in data.iter().enumerate() {
+                    execution_checkpoint(control, i)?;
                     if crate::columnar::validity_bit(validity, i) {
                         count += 1;
                         sum += v as i128;
@@ -9669,20 +9824,28 @@ fn accumulate_int(cursor: &mut dyn crate::cursor::Cursor) -> Result<(u64, i128, 
 }
 
 /// f64 analogue of [`accumulate_int`].
-fn accumulate_float(cursor: &mut dyn crate::cursor::Cursor) -> Result<(u64, f64, f64, f64)> {
+fn accumulate_float(
+    cursor: &mut dyn crate::cursor::Cursor,
+    control: Option<&crate::ExecutionControl>,
+) -> Result<(u64, f64, f64, f64)> {
     let mut count: u64 = 0;
     let mut sum: f64 = 0.0;
     let mut mn: f64 = f64::INFINITY;
     let mut mx: f64 = f64::NEG_INFINITY;
     while let Some(cols) = cursor.next_batch()? {
+        execution_checkpoint(control, 0)?;
         if let Some(crate::columnar::NativeColumn::Float64 { data, validity }) = cols.first() {
             if crate::columnar::all_non_null(validity, data.len()) {
                 count += data.len() as u64;
-                sum += data.iter().sum::<f64>();
-                mn = mn.min(data.iter().copied().fold(f64::INFINITY, f64::min));
-                mx = mx.max(data.iter().copied().fold(f64::NEG_INFINITY, f64::max));
+                for (chunk_index, chunk) in data.chunks(1024).enumerate() {
+                    execution_checkpoint(control, chunk_index * 1024)?;
+                    sum += chunk.iter().sum::<f64>();
+                    mn = mn.min(chunk.iter().copied().fold(f64::INFINITY, f64::min));
+                    mx = mx.max(chunk.iter().copied().fold(f64::NEG_INFINITY, f64::max));
+                }
             } else {
                 for (i, &v) in data.iter().enumerate() {
+                    execution_checkpoint(control, i)?;
                     if crate::columnar::validity_bit(validity, i) {
                         count += 1;
                         sum += v;
@@ -9694,6 +9857,16 @@ fn accumulate_float(cursor: &mut dyn crate::cursor::Cursor) -> Result<(u64, f64,
         }
     }
     Ok((count, sum, mn, mx))
+}
+
+#[inline]
+fn execution_checkpoint(control: Option<&crate::ExecutionControl>, index: usize) -> Result<()> {
+    if index % 256 == 0 {
+        control
+            .map(crate::ExecutionControl::checkpoint)
+            .transpose()?;
+    }
+    Ok(())
 }
 
 fn pack_int(agg: NativeAgg, count: u64, sum: i128, mn: i64, mx: i64) -> NativeAggResult {

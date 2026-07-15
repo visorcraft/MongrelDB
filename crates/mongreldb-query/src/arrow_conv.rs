@@ -12,6 +12,7 @@ use mongreldb_core::schema::{Schema as MongrelSchema, TypeId};
 use std::sync::Arc;
 
 use crate::error::{MongrelQueryError, Result};
+use crate::query_registry::RegisteredSqlQuery;
 
 fn bit_set(validity: &[u8], i: usize) -> bool {
     (validity.get(i / 8).copied().unwrap_or(0) >> (i % 8)) & 1 == 1
@@ -38,6 +39,14 @@ fn all_bits_set(validity: &[u8], n: usize) -> bool {
 /// For the common all-non-null case on fixed-width columns, constructs the Arrow
 /// array directly from the typed buffer (one memcpy, no per-element builder).
 pub fn native_to_array(ty: TypeId, col: &NativeColumn) -> Result<ArrayRef> {
+    native_to_array_with_query(ty, col, None)
+}
+
+pub(crate) fn native_to_array_with_query(
+    ty: TypeId,
+    col: &NativeColumn,
+    query: Option<&RegisteredSqlQuery>,
+) -> Result<ArrayRef> {
     Ok(match (ty.clone(), col) {
         (TypeId::Int64 | TypeId::TimestampNanos, NativeColumn::Int64 { data, validity }) => {
             if all_bits_set(validity, data.len()) {
@@ -45,6 +54,7 @@ pub fn native_to_array(ty: TypeId, col: &NativeColumn) -> Result<ArrayRef> {
             } else {
                 let mut b = Int64Builder::with_capacity(data.len());
                 for (i, v) in data.iter().enumerate() {
+                    checkpoint(query, i)?;
                     if bit_set(validity, i) {
                         b.append_value(*v);
                     } else {
@@ -60,6 +70,7 @@ pub fn native_to_array(ty: TypeId, col: &NativeColumn) -> Result<ArrayRef> {
             } else {
                 let mut b = Float64Builder::with_capacity(data.len());
                 for (i, v) in data.iter().enumerate() {
+                    checkpoint(query, i)?;
                     if bit_set(validity, i) {
                         b.append_value(*v);
                     } else {
@@ -72,6 +83,7 @@ pub fn native_to_array(ty: TypeId, col: &NativeColumn) -> Result<ArrayRef> {
         (TypeId::Bool, NativeColumn::Bool { data, validity }) => {
             let mut b = BooleanBuilder::with_capacity(data.len());
             for (i, v) in data.iter().enumerate() {
+                checkpoint(query, i)?;
                 if bit_set(validity, i) {
                     b.append_value(*v != 0);
                 } else {
@@ -91,6 +103,7 @@ pub fn native_to_array(ty: TypeId, col: &NativeColumn) -> Result<ArrayRef> {
             let n = offsets.len().saturating_sub(1);
             let mut b = StringBuilder::with_capacity(n, values.len());
             for i in 0..n {
+                checkpoint(query, i)?;
                 if bit_set(validity, i) {
                     let lo = offsets[i] as usize;
                     let hi = offsets[i + 1] as usize;
@@ -115,6 +128,15 @@ pub fn native_to_array(ty: TypeId, col: &NativeColumn) -> Result<ArrayRef> {
 /// needed) straight into the Arrow array — no `memcpy`, no per-element builder.
 /// `Bool` / `Bytes` / `Embedding` fall back to the by-reference builder.
 pub fn native_to_array_owned(ty: TypeId, col: NativeColumn) -> Result<ArrayRef> {
+    native_to_array_owned_with_query(ty, col, None)
+}
+
+pub(crate) fn native_to_array_owned_with_query(
+    ty: TypeId,
+    col: NativeColumn,
+    query: Option<&RegisteredSqlQuery>,
+) -> Result<ArrayRef> {
+    query.map(RegisteredSqlQuery::checkpoint).transpose()?;
     Ok(match (ty, col) {
         (TypeId::Int64 | TypeId::TimestampNanos, NativeColumn::Int64 { data, validity }) => {
             let n = data.len();
@@ -125,8 +147,16 @@ pub fn native_to_array_owned(ty: TypeId, col: NativeColumn) -> Result<ArrayRef> 
             Arc::new(Float64Array::new(data.into(), owned_nulls(validity, n)))
         }
         // Everything else: defer to the by-reference builder.
-        (ty, col) => native_to_array(ty, &col)?,
+        (ty, col) => native_to_array_with_query(ty, &col, query)?,
     })
+}
+
+#[inline]
+fn checkpoint(query: Option<&RegisteredSqlQuery>, index: usize) -> Result<()> {
+    if index % 256 == 0 {
+        query.map(RegisteredSqlQuery::checkpoint).transpose()?;
+    }
+    Ok(())
 }
 
 /// Build an Arrow validity (`NullBuffer`) from a MongrelDB validity byte buffer,

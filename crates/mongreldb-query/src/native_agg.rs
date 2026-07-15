@@ -23,6 +23,7 @@ use mongreldb_core::{Condition, NativeAgg, Schema, Snapshot, Table, TypeId};
 use std::sync::Arc;
 
 use crate::error::{MongrelQueryError, Result};
+use crate::query_registry::RegisteredSqlQuery;
 
 /// If `plan` is a servable single-aggregate query over the primary table, run it
 /// natively and return the one-row result batch; otherwise `None` (fall through
@@ -33,7 +34,9 @@ pub(crate) fn try_native_aggregate(
     _snapshot: Snapshot,
     plan: &LogicalPlan,
     cache_key: u64,
+    query: Option<&RegisteredSqlQuery>,
 ) -> Result<Option<RecordBatch>> {
+    query.map(RegisteredSqlQuery::checkpoint).transpose()?;
     let Some(agg) = peel_to_aggregate(plan) else {
         return Ok(None);
     };
@@ -101,9 +104,18 @@ pub(crate) fn try_native_aggregate(
     // delta merge; cold ⇒ vectorized cursor / visible-rows scan that seeds the
     // cache. `aggregate_incremental` always returns a state (it falls back to a
     // full scan for multi-run/memtable layouts, extending native coverage).
-    let result = db
-        .aggregate_incremental(cache_key, &translated, column, agg_kind)
-        .map_err(core_err)?;
+    let result = match query {
+        Some(query) => db.aggregate_incremental_with_control(
+            cache_key,
+            &translated,
+            column,
+            agg_kind,
+            query.control(),
+        ),
+        None => db.aggregate_incremental(cache_key, &translated, column, agg_kind),
+    }
+    .map_err(core_err)?;
+    query.map(RegisteredSqlQuery::checkpoint).transpose()?;
 
     // Build a one-row batch matching the aggregate's output field type.
     let out_schema: SchemaRef = Arc::new(arrow_schema_from_df(&agg.schema));
@@ -326,10 +338,10 @@ mod tests {
         let schema = g.schema().clone();
         let snap = g.snapshot();
         let fired_sum =
-            try_native_aggregate(&mut g, &schema, snap, sum_plan.logical_plan(), 1).unwrap();
+            try_native_aggregate(&mut g, &schema, snap, sum_plan.logical_plan(), 1, None).unwrap();
         assert!(fired_sum.is_some(), "SUM should fire the native path");
         let fired_sel =
-            try_native_aggregate(&mut g, &schema, snap, sel_plan.logical_plan(), 2).unwrap();
+            try_native_aggregate(&mut g, &schema, snap, sel_plan.logical_plan(), 2, None).unwrap();
         assert!(fired_sel.is_none(), "a plain SELECT must fall through");
         // The fired value is correct: sum(v)=sum(0,2,..,1998)=2*sum(0..1000)=999000.
         let b = fired_sum.unwrap();

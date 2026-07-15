@@ -46,27 +46,49 @@ pub fn drain_cursor_to_columns(
     cursor: &mut dyn Cursor,
     projection: &[(u16, TypeId)],
 ) -> Result<Vec<(u16, NativeColumn)>> {
+    drain_cursor_to_columns_inner(cursor, projection, None)
+}
+
+pub fn drain_cursor_to_columns_with_control(
+    cursor: &mut dyn Cursor,
+    projection: &[(u16, TypeId)],
+    control: &crate::ExecutionControl,
+) -> Result<Vec<(u16, NativeColumn)>> {
+    drain_cursor_to_columns_inner(cursor, projection, Some(control))
+}
+
+fn drain_cursor_to_columns_inner(
+    cursor: &mut dyn Cursor,
+    projection: &[(u16, TypeId)],
+    control: Option<&crate::ExecutionControl>,
+) -> Result<Vec<(u16, NativeColumn)>> {
     let ncols = projection.len();
     let mut acc: Vec<Vec<NativeColumn>> = (0..ncols).map(|_| Vec::new()).collect();
     while let Some(batch) = cursor.next_batch()? {
+        control
+            .map(crate::ExecutionControl::checkpoint)
+            .transpose()?;
         for (j, col) in batch.into_iter().enumerate() {
             if j < ncols {
                 acc[j].push(col);
             }
         }
     }
-    Ok(acc
-        .into_iter()
-        .enumerate()
-        .map(|(j, pieces)| {
+    let mut columns = Vec::with_capacity(ncols);
+    for (j, pieces) in acc.into_iter().enumerate() {
+        control
+            .map(crate::ExecutionControl::checkpoint)
+            .transpose()?;
+        columns.push({
             let col = if pieces.is_empty() {
                 crate::columnar::null_native(projection[j].1.clone(), 0)
             } else {
                 NativeColumn::concat(&pieces)
             };
             (projection[j].0, col)
-        })
-        .collect())
+        });
+    }
+    Ok(columns)
 }
 
 /// One page's worth of within-page survivor positions to decode.

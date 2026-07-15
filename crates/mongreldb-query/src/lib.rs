@@ -85,7 +85,7 @@ use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::{AggregateUDF, Expr, ScalarUDF, TableType, WindowUDF};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::{execute_stream, ExecutionPlan};
 use datafusion::prelude::SessionContext;
 use mongreldb_core::{
     AlterColumn, ColumnFlags, Cursor, Database, OwnedSnapshotGuard, Schema as CoreSchema, Snapshot,
@@ -96,6 +96,8 @@ use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::sync::Arc;
+
+use query_registry::SqlTaskContext;
 
 /// A MongrelDB table exposed to DataFusion. Holds the live `Table` behind a mutex;
 /// each scan takes a fresh MVCC snapshot.
@@ -2152,7 +2154,12 @@ impl MongrelSession {
     /// the native column cursor, **bypassing DataFusion parse+plan+optimize**.
     /// Returns `Ok(None)` (→ fall through to `ctx.sql()`) for any shape it
     /// cannot serve *exactly*, or on any parse error.
-    fn try_direct_dispatch(&self, sql: &str) -> Result<Option<Vec<RecordBatch>>> {
+    fn try_direct_dispatch(
+        &self,
+        sql: &str,
+        query: &RegisteredSqlQuery,
+    ) -> Result<Option<Vec<RecordBatch>>> {
+        query.checkpoint()?;
         if self.security_context_active() {
             return Ok(None);
         }
@@ -2167,13 +2174,14 @@ impl MongrelSession {
         let Ok(stmts) = Parser::parse_sql(&PostgreSqlDialect {}, sql) else {
             return Ok(None);
         };
+        query.checkpoint()?;
         if stmts.len() != 1 {
             return Ok(None);
         }
-        let Statement::Query(query) = stmts.into_iter().next().unwrap() else {
+        let Statement::Query(ast_query) = stmts.into_iter().next().unwrap() else {
             return Ok(None);
         };
-        let Query { body, .. } = *query;
+        let Query { body, .. } = *ast_query;
         let select = match *body {
             SetExpr::Select(s) => *s,
             _ => return Ok(None),
@@ -2297,22 +2305,29 @@ impl MongrelSession {
 
         // Execute via the same native column path MongrelProvider::scan uses.
         let cols = if !conditions.is_empty() {
-            match db.query_columns_native_cached(&conditions, Some(&col_ids), snap) {
+            match db.query_columns_native_cached_with_control(
+                &conditions,
+                Some(&col_ids),
+                snap,
+                query.control(),
+            ) {
                 Ok(Some(c)) => c,
                 Ok(None) => db
-                    .visible_columns_native(snap, Some(&col_ids))
+                    .visible_columns_native_with_control(snap, Some(&col_ids), query.control())
                     .map_err(MongrelQueryError::Core)?,
                 Err(_) => return Ok(None),
             }
         } else {
-            db.visible_columns_native(snap, Some(&col_ids))
+            db.visible_columns_native_with_control(snap, Some(&col_ids), query.control())
                 .map_err(MongrelQueryError::Core)?
         };
+        query.checkpoint()?;
         drop(db);
 
         // Order decoded columns into projection order, then build one batch.
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(col_ids.len());
         for cid in &col_ids {
+            query.checkpoint()?;
             let col = cols
                 .iter()
                 .find(|(id, _)| id == cid)
@@ -2324,7 +2339,11 @@ impl MongrelSession {
                 .find(|c| c.id == *cid)
                 .map(|c| c.ty.clone())
                 .unwrap_or(mongreldb_core::schema::TypeId::Int64);
-            arrays.push(arrow_conv::native_to_array(ty, &col)?);
+            arrays.push(arrow_conv::native_to_array_with_query(
+                ty,
+                &col,
+                Some(query),
+            )?);
         }
         let batch_schema = Arc::new(arrow::datatypes::Schema::new(fields));
         let batch = RecordBatch::try_new(batch_schema, arrays)
@@ -2491,7 +2510,58 @@ impl MongrelSession {
         }))
     }
 
-    async fn run_as_of(&self, query: AsOfQuery) -> Result<Vec<RecordBatch>> {
+    async fn execute_dataframe_stream(
+        &self,
+        dataframe: datafusion::dataframe::DataFrame,
+        query: &RegisteredSqlQuery,
+    ) -> Result<MongrelRecordBatchStream> {
+        query.checkpoint()?;
+        let task_context = dataframe.task_ctx();
+        let session_config = task_context
+            .session_config()
+            .clone()
+            .with_extension(Arc::new(SqlTaskContext::new(query.clone())));
+        let task_context = Arc::new(task_context.with_session_config(session_config));
+        let physical_plan = tokio::select! {
+            biased;
+            plan = dataframe.create_physical_plan() => plan
+                .map_err(|error| MongrelQueryError::DataFusion(error.to_string()))?,
+            _ = query.control().cancelled() => return Err(query.checkpoint().unwrap_err()),
+        };
+        query.checkpoint()?;
+        execute_stream(physical_plan, task_context)
+            .map_err(|error| MongrelQueryError::DataFusion(error.to_string()))
+    }
+
+    async fn collect_dataframe(
+        &self,
+        dataframe: datafusion::dataframe::DataFrame,
+        query: &RegisteredSqlQuery,
+    ) -> Result<Vec<RecordBatch>> {
+        use futures::StreamExt;
+
+        let mut stream = self.execute_dataframe_stream(dataframe, query).await?;
+        let mut batches = Vec::new();
+        loop {
+            let item = tokio::select! {
+                biased;
+                _ = query.control().cancelled() => return Err(query.checkpoint().unwrap_err()),
+                item = stream.next() => item,
+            };
+            let Some(batch) = item else {
+                break;
+            };
+            batches.push(batch.map_err(|error| MongrelQueryError::DataFusion(error.to_string()))?);
+            query.checkpoint()?;
+        }
+        Ok(batches)
+    }
+
+    async fn run_as_of(
+        &self,
+        query: AsOfQuery,
+        sql_query: &RegisteredSqlQuery,
+    ) -> Result<Vec<RecordBatch>> {
         let AsOfQuery { sql, registration } = query;
         let _registration = registration;
         let plan_start = std::time::Instant::now();
@@ -2503,13 +2573,14 @@ impl MongrelSession {
         mongreldb_core::trace::QueryTrace::record(|trace| {
             trace.planning_nanos = plan_start.elapsed().as_nanos() as u64;
         });
-        dataframe
-            .collect()
-            .await
-            .map_err(|error| MongrelQueryError::DataFusion(error.to_string()))
+        self.collect_dataframe(dataframe, sql_query).await
     }
 
-    async fn run_as_of_stream(&self, query: AsOfQuery) -> Result<MongrelRecordBatchStream> {
+    async fn run_as_of_stream(
+        &self,
+        query: AsOfQuery,
+        sql_query: &RegisteredSqlQuery,
+    ) -> Result<MongrelRecordBatchStream> {
         use futures::StreamExt;
 
         let AsOfQuery { sql, registration } = query;
@@ -2518,10 +2589,7 @@ impl MongrelSession {
             .sql(&sql)
             .await
             .map_err(|error| MongrelQueryError::DataFusion(error.to_string()))?;
-        let stream = dataframe
-            .execute_stream()
-            .await
-            .map_err(|error| MongrelQueryError::DataFusion(error.to_string()))?;
+        let stream = self.execute_dataframe_stream(dataframe, sql_query).await?;
         let schema = stream.schema();
         let guarded = futures::stream::unfold(
             (stream, registration),
@@ -2638,8 +2706,8 @@ impl MongrelSession {
             return Ok(buffered_stream(batches));
         }
 
-        if let Some(query) = self.prepare_as_of_query(sql)? {
-            return self.run_as_of_stream(query).await;
+        if let Some(as_of_query) = self.prepare_as_of_query(sql)? {
+            return self.run_as_of_stream(as_of_query, query).await;
         }
 
         let resolved = self.resolve_view_sql(sql);
@@ -2659,10 +2727,7 @@ impl MongrelSession {
         mongreldb_core::trace::QueryTrace::record(|trace| {
             trace.planning_nanos = plan_start.elapsed().as_nanos() as u64;
         });
-        let stream = df
-            .execute_stream()
-            .await
-            .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
+        let stream = self.execute_dataframe_stream(df, query).await?;
         if external_module_scan {
             mongreldb_core::trace::QueryTrace::record(|trace| {
                 trace.scan_mode = mongreldb_core::trace::ScanMode::ExternalModule;
@@ -2909,8 +2974,8 @@ impl MongrelSession {
             }
         }
 
-        if let Some(query) = self.prepare_as_of_query(sql)? {
-            return self.run_as_of(query).await;
+        if let Some(as_of_query) = self.prepare_as_of_query(sql)? {
+            return self.run_as_of(as_of_query, query).await;
         }
 
         // Phase 17.3: intercept `SELECT ... FROM <view_name>` and rewrite to
@@ -2955,7 +3020,7 @@ impl MongrelSession {
         // DataFusion parse+plan+optimize. Served batches are memoized into the
         // result cache like the normal path. Returns None (→ fall through) for
         // any shape it cannot serve exactly.
-        if let Some(batches) = self.try_direct_dispatch(sql)? {
+        if let Some(batches) = self.try_direct_dispatch(sql, query)? {
             if result_cacheable {
                 query.checkpoint()?;
                 self.cache.lock().insert(key, Arc::new(batches.clone()));
@@ -2979,13 +3044,13 @@ impl MongrelSession {
         // cache — warm cache ⇒ delta merge on commit; cold ⇒ vectorized scan.
         // Falls through to DataFusion for everything it cannot serve exactly.
         let agg_key = sql_cache_key(sql);
-        let batches = match self.try_native_aggregate(df.logical_plan(), agg_key) {
+        let batches = match self.try_native_aggregate(df.logical_plan(), agg_key, query) {
             Ok(Some(batch)) => vec![batch],
             _ => {
                 // Phase 8.1 fast path: serve a PK↔FK equi-join over two
                 // registered tables via roaring-bitmap intersection, with no
                 // hash-join materialization. Falls through otherwise.
-                match self.try_fk_join(df.logical_plan()) {
+                match self.try_fk_join(df.logical_plan(), query) {
                     Ok(Some(b)) => {
                         // Priority 13: the native FK-bitmap path served the join.
                         mongreldb_core::trace::QueryTrace::record(|t| {
@@ -2993,10 +3058,7 @@ impl MongrelSession {
                         });
                         b
                     }
-                    _ => df
-                        .collect()
-                        .await
-                        .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?,
+                    _ => self.collect_dataframe(df, query).await?,
                 }
             }
         };
@@ -3361,6 +3423,7 @@ impl MongrelSession {
         &self,
         plan: &datafusion::logical_expr::LogicalPlan,
         cache_key: u64,
+        query: &RegisteredSqlQuery,
     ) -> Result<Option<RecordBatch>> {
         if self.security_context_active() {
             return Ok(None);
@@ -3371,7 +3434,7 @@ impl MongrelSession {
         let mut db = primary.lock();
         let schema = db.schema().clone();
         let snap = db.snapshot();
-        native_agg::try_native_aggregate(&mut db, &schema, snap, plan, cache_key)
+        native_agg::try_native_aggregate(&mut db, &schema, snap, plan, cache_key, Some(query))
     }
 
     /// Attempt the Phase 8.1 FK-join (bitmap-intersection) fast path against
@@ -3380,12 +3443,13 @@ impl MongrelSession {
     fn try_fk_join(
         &self,
         plan: &datafusion::logical_expr::LogicalPlan,
+        query: &RegisteredSqlQuery,
     ) -> Result<Option<Vec<RecordBatch>>> {
         if self.security_context_active() {
             return Ok(None);
         }
         let tables = self.tables.lock();
-        fk_join::try_fk_join(&tables, plan)
+        fk_join::try_fk_join(&tables, plan, Some(query))
     }
 
     pub fn context(&self) -> &SessionContext {

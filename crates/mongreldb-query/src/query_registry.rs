@@ -451,6 +451,23 @@ pub struct RegisteredSqlQuery {
     query: Arc<RegisteredQuery>,
 }
 
+/// Query-specific state attached to a fresh DataFusion `TaskContext` for each
+/// execution. Reusable logical and physical plans never own this value.
+#[derive(Debug)]
+pub(crate) struct SqlTaskContext {
+    query: RegisteredSqlQuery,
+}
+
+impl SqlTaskContext {
+    pub(crate) fn new(query: RegisteredSqlQuery) -> Self {
+        Self { query }
+    }
+
+    pub(crate) fn query(&self) -> &RegisteredSqlQuery {
+        &self.query
+    }
+}
+
 impl RegisteredSqlQuery {
     pub fn id(&self) -> QueryId {
         self.query.id

@@ -35,8 +35,9 @@ use mongreldb_core::schema::TypeId;
 use mongreldb_core::Cursor;
 use mongreldb_core::{ColumnStat, Value};
 
-use crate::arrow_conv::native_to_array_owned;
+use crate::arrow_conv::native_to_array_owned_with_query;
 use crate::error::MongrelQueryError;
+use crate::query_registry::{RegisteredSqlQuery, SqlTaskContext};
 
 /// Rows per streamed `RecordBatch`. Matches the encoded 65 536-row page size so
 /// a single batch typically corresponds to exactly one on-disk page.
@@ -288,13 +289,18 @@ impl ExecutionPlan for MongrelScanExec {
     fn execute(
         &self,
         partition: usize,
-        _ctx: Arc<TaskContext>,
+        ctx: Arc<TaskContext>,
     ) -> datafusion::common::Result<SendableRecordBatchStream> {
         if partition != 0 {
             return Err(DataFusionError::Internal(format!(
                 "MongrelScanExec is single-partition; invalid partition {partition}"
             )));
         }
+        let query = ctx
+            .session_config()
+            .get_extension::<SqlTaskContext>()
+            .map(|context| context.query().clone());
+        checkpoint(query.as_ref())?;
         match &self.source {
             Source::Rows {
                 columns,
@@ -312,16 +318,25 @@ impl ExecutionPlan for MongrelScanExec {
                 let schema = self.schema.clone();
                 let num_chunks = total.div_ceil(PAGE_BATCH_ROWS);
                 let batch_schema = schema.clone();
+                let query = query.clone();
                 // Lazily build one batch per chunk: the iterator is only
                 // advanced as DataFusion polls, so a LIMIT satisfied early
                 // never pays the Arrow-conversion cost of later chunks.
                 let chunk_iter = (0..num_chunks).map(move |i| {
+                    checkpoint(query.as_ref())?;
                     let start = i * PAGE_BATCH_ROWS;
                     let end = (start + PAGE_BATCH_ROWS).min(total);
                     if columns.is_empty() {
                         build_row_count_batch(&batch_schema, end - start)
                     } else {
-                        build_chunk_batch(&columns, &types, &batch_schema, start, end)
+                        build_chunk_batch(
+                            &columns,
+                            &types,
+                            &batch_schema,
+                            start,
+                            end,
+                            query.as_ref(),
+                        )
                     }
                 });
                 Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -343,6 +358,7 @@ impl ExecutionPlan for MongrelScanExec {
                     types: Arc::clone(&self.types),
                     schema: self.schema.clone(),
                     residual: self.residual.clone(),
+                    query,
                 };
                 Ok(Box::pin(RecordBatchStreamAdapter::new(
                     self.schema.clone(),
@@ -352,9 +368,10 @@ impl ExecutionPlan for MongrelScanExec {
             Source::Batch(batch) => {
                 let schema = self.schema.clone();
                 let batch = batch.clone();
+                let item = checkpoint(query.as_ref()).map(|()| batch);
                 Ok(Box::pin(RecordBatchStreamAdapter::new(
                     schema,
-                    stream::iter(std::iter::once(Ok(batch))),
+                    stream::iter(std::iter::once(item)),
                 )))
             }
         }
@@ -375,13 +392,21 @@ impl ResidualFilter {
         Self { col_idx, pattern }
     }
     /// Apply the filter to a decoded column batch in-place (gather survivors).
-    pub(crate) fn apply(&self, cols: &mut [NativeColumn]) {
+    pub(crate) fn apply_with_query(
+        &self,
+        cols: &mut [NativeColumn],
+        query: Option<&RegisteredSqlQuery>,
+    ) -> datafusion::common::Result<()> {
         let Some(col) = cols.get(self.col_idx) else {
-            return;
+            return Ok(());
         };
         let n = col.len();
-        let indices: Vec<usize> = (0..n)
-            .filter(|&i| match col {
+        let mut indices = Vec::with_capacity(n);
+        for i in 0..n {
+            if i % 256 == 0 {
+                checkpoint(query)?;
+            }
+            if match col {
                 NativeColumn::Bytes {
                     offsets, values, ..
                 } => {
@@ -390,14 +415,18 @@ impl ResidualFilter {
                     like_match(&self.pattern, &values[lo..hi])
                 }
                 _ => true,
-            })
-            .collect();
+            } {
+                indices.push(i);
+            }
+        }
         if indices.len() == n {
-            return; // All rows match — no gather needed.
+            return Ok(()); // All rows match — no gather needed.
         }
         for col in cols.iter_mut() {
+            checkpoint(query)?;
             *col = col.gather(&indices);
         }
+        Ok(())
     }
 }
 
@@ -437,20 +466,41 @@ struct CursorBatches {
     types: Arc<Vec<TypeId>>,
     schema: SchemaRef,
     residual: Option<Arc<ResidualFilter>>,
+    query: Option<RegisteredSqlQuery>,
 }
 
 impl Iterator for CursorBatches {
     type Item = datafusion::common::Result<RecordBatch>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if let Err(error) = checkpoint(self.query.as_ref()) {
+            self.cursor = None;
+            return Some(Err(error));
+        }
         let cursor = self.cursor.as_mut()?;
         match cursor.next_batch() {
             Ok(Some(mut cols)) => {
+                if let Err(error) = checkpoint(self.query.as_ref()) {
+                    self.cursor = None;
+                    return Some(Err(error));
+                }
                 // Phase 16.3a: apply residual predicate before Arrow conversion.
                 if let Some(r) = &self.residual {
-                    r.apply(&mut cols);
+                    if let Err(error) = r.apply_with_query(&mut cols, self.query.as_ref()) {
+                        self.cursor = None;
+                        return Some(Err(error));
+                    }
                 }
-                Some(build_cursor_batch(cols, &self.types, &self.schema))
+                if let Err(error) = checkpoint(self.query.as_ref()) {
+                    self.cursor = None;
+                    return Some(Err(error));
+                }
+                Some(build_cursor_batch(
+                    cols,
+                    &self.types,
+                    &self.schema,
+                    self.query.as_ref(),
+                ))
             }
             Ok(None) => {
                 self.cursor = None;
@@ -475,11 +525,13 @@ fn build_chunk_batch(
     schema: &SchemaRef,
     start: usize,
     end: usize,
+    query: Option<&RegisteredSqlQuery>,
 ) -> datafusion::common::Result<RecordBatch> {
     let mut arrays = Vec::with_capacity(columns.len());
     for (col, ty) in columns.iter().zip(types.iter()) {
         let slice = col.slice_range(start, end);
-        arrays.push(native_to_array_owned(ty.clone(), slice).map_err(df_err)?);
+        checkpoint(query)?;
+        arrays.push(native_to_array_owned_with_query(ty.clone(), slice, query).map_err(df_err)?);
     }
     RecordBatch::try_new(schema.clone(), arrays)
         .map_err(|e| df_err(MongrelQueryError::Arrow(e.to_string())))
@@ -492,10 +544,12 @@ fn build_cursor_batch(
     cols: Vec<NativeColumn>,
     types: &[TypeId],
     schema: &SchemaRef,
+    query: Option<&RegisteredSqlQuery>,
 ) -> datafusion::common::Result<RecordBatch> {
     let mut arrays = Vec::with_capacity(cols.len());
     for (col, ty) in cols.into_iter().zip(types.iter()) {
-        arrays.push(native_to_array_owned(ty.clone(), col).map_err(df_err)?);
+        checkpoint(query)?;
+        arrays.push(native_to_array_owned_with_query(ty.clone(), col, query).map_err(df_err)?);
     }
     RecordBatch::try_new(schema.clone(), arrays)
         .map_err(|e| df_err(MongrelQueryError::Arrow(e.to_string())))
@@ -512,4 +566,58 @@ fn build_row_count_batch(schema: &SchemaRef, n: usize) -> datafusion::common::Re
 
 fn df_err(e: MongrelQueryError) -> DataFusionError {
     DataFusionError::External(Box::new(e))
+}
+
+fn checkpoint(query: Option<&RegisteredSqlQuery>) -> datafusion::common::Result<()> {
+    query
+        .map(RegisteredSqlQuery::checkpoint)
+        .transpose()
+        .map(|_| ())
+        .map_err(df_err)
+}
+
+#[cfg(test)]
+mod execution_control_tests {
+    use super::*;
+    use crate::query_registry::{SqlQueryOptions, SqlQueryRegistry};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use futures::StreamExt;
+
+    fn task_context(query: RegisteredSqlQuery) -> Arc<TaskContext> {
+        let context = TaskContext::default();
+        let config = context
+            .session_config()
+            .clone()
+            .with_extension(Arc::new(SqlTaskContext::new(query)));
+        Arc::new(context.with_session_config(config))
+    }
+
+    #[tokio::test]
+    async fn reused_physical_plan_gets_fresh_execution_control() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let plan = Arc::new(MongrelScanExec::new(
+            schema,
+            vec![NativeColumn::Int64 {
+                data: vec![1, 2, 3],
+                validity: vec![0b111],
+            }],
+            vec![TypeId::Int64],
+            3,
+            vec![ColumnStatistics::new_unknown()],
+        ));
+        let registry = Arc::new(SqlQueryRegistry::default());
+        let first = registry.register(SqlQueryOptions::default()).unwrap();
+        let second = registry.register(SqlQueryOptions::default()).unwrap();
+
+        assert_ne!(first.id(), second.id());
+        assert_eq!(
+            first.request_cancel(mongreldb_core::CancellationReason::ClientRequest),
+            crate::CancelOutcome::Accepted
+        );
+        assert!(plan.execute(0, task_context(first)).is_err());
+
+        let mut stream = plan.execute(0, task_context(second)).unwrap();
+        assert_eq!(stream.next().await.unwrap().unwrap().num_rows(), 3);
+        assert!(stream.next().await.is_none());
+    }
 }
