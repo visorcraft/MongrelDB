@@ -1,6 +1,6 @@
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
-use mongreldb_core::Database;
+use mongreldb_core::{ColumnDef, ColumnFlags, Database, Schema, TypeId};
 use mongreldb_query::SqlTestHookPoint;
 use mongreldb_server::{
     build_app, build_app_with_sessions, build_app_with_sessions_and_control, SessionStore,
@@ -539,4 +539,106 @@ async fn shutdown_cancels_reads_and_rejects_new_sql() {
             .status(),
         StatusCode::SERVICE_UNAVAILABLE
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn commit_fence_returns_too_late_and_preserves_commit_after_response_drop() {
+    let directory = tempdir().unwrap();
+    let database = Arc::new(Database::create(directory.path()).unwrap());
+    database
+        .create_table(
+            "items",
+            Schema {
+                columns: vec![ColumnDef {
+                    id: 1,
+                    name: "id".into(),
+                    ty: TypeId::Int64,
+                    flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                    default_value: None,
+                }],
+                ..Schema::default()
+            },
+        )
+        .unwrap();
+    let sessions = Arc::new(SessionStore::new(8, Duration::from_secs(60)));
+    let app = build_app_with_sessions(
+        database,
+        std::iter::empty(),
+        None,
+        None,
+        false,
+        Arc::clone(&sessions),
+    );
+    let opened = app
+        .clone()
+        .oneshot(request("POST", "/sessions", Value::Null))
+        .await
+        .unwrap();
+    let session_id = json_body(opened).await["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let entry = sessions.get(&session_id, "anonymous").unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let hook_barrier = Arc::clone(&barrier);
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    entry.session.set_test_hook(Some(Arc::new(move |point| {
+        if point == SqlTestHookPoint::InsideCommitCritical {
+            entered_tx.send(()).unwrap();
+            hook_barrier.wait();
+        }
+    })));
+
+    let query_id = "abcdabcdabcdabcdabcdabcdabcdabcd";
+    let mut sql_request = request(
+        "POST",
+        "/sql",
+        json!({ "sql": "INSERT INTO items (id) VALUES (1)", "query_id": query_id }),
+    );
+    sql_request
+        .headers_mut()
+        .insert("x-session-id", session_id.parse().unwrap());
+    let sql_task = tokio::spawn(app.clone().oneshot(sql_request));
+    tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
+        .await
+        .unwrap();
+
+    let cancel = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            &format!("/queries/{query_id}/cancel"),
+            Value::Null,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(cancel.status(), StatusCode::CONFLICT);
+    assert_eq!(json_body(cancel).await["error"]["code"], "CANCEL_TOO_LATE");
+    barrier.wait();
+    let response = sql_task.await.unwrap().unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(response);
+
+    let status = app
+        .clone()
+        .oneshot(request("GET", &format!("/queries/{query_id}"), Value::Null))
+        .await
+        .unwrap();
+    let status = json_body(status).await;
+    assert_eq!(status["state"], "completed");
+    assert_eq!(status["committed"], true);
+    assert_eq!(status["trace"]["commit_fence_outcome"], "commit_won");
+
+    entry.session.set_test_hook(None);
+    let mut count = request(
+        "POST",
+        "/sql",
+        json!({ "sql": "SELECT count(*) AS n FROM items" }),
+    );
+    count
+        .headers_mut()
+        .insert("x-session-id", session_id.parse().unwrap());
+    let count = app.oneshot(count).await.unwrap();
+    assert_eq!(count.status(), StatusCode::OK);
+    assert_eq!(json_body(count).await[0]["n"], 1);
 }
