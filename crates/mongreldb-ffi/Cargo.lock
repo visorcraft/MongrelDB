@@ -2080,7 +2080,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-core"
-version = "0.53.3"
+version = "0.54.0"
 dependencies = [
  "arc-swap",
  "argon2",
@@ -2108,7 +2108,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-ffi"
-version = "0.53.3"
+version = "0.54.0"
 dependencies = [
  "arrow",
  "cc",
@@ -2137,7 +2137,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-query"
-version = "0.53.3"
+version = "0.54.0"
 dependencies = [
  "arrow",
  "async-trait",
