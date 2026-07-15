@@ -7080,6 +7080,7 @@ impl Database {
                 hook();
             }
         }
+        let commit_guard = self.commit_lock.lock();
         let (new_epoch, mut _epoch_guard, applies, committed_materialized_views, commit_seq) = {
             let mut wal = self.shared_wal.lock();
 
@@ -7243,6 +7244,7 @@ impl Database {
                 commit_seq,
             )
         };
+        drop(commit_guard);
 
         // ── 2b. Durability: one leader fsync serves this whole batch (P3.2). ──
         self.group
