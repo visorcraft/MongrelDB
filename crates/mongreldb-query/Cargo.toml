@@ -30,6 +30,7 @@ bincode = "1"
 tempfile = "3"
 rusqlite = { version = "0.32", features = ["bundled"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
+mongreldb-core = { path = "../mongreldb-core", version = "0.54.1", features = ["encryption"] }
 
 [[bench]]
 name = "sql_cancellation"
