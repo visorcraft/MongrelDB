@@ -72,6 +72,12 @@ pub fn contains_boolean_ai_predicate(sql: &str) -> bool {
 
 pub type MongrelRecordBatchStream = datafusion::physical_plan::SendableRecordBatchStream;
 
+tokio::task_local! {
+    // Carries one registered query through command helpers that recursively
+    // execute SQL. DataFusion operators receive control through TaskContext.
+    static CURRENT_SQL_QUERY: RegisteredSqlQuery;
+}
+
 use arrow::array::{Array, ArrayRef, Int64Array, StringArray};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -1623,6 +1629,9 @@ pub struct MongrelSession {
     /// DDL invalidates the tables they reference (DataFusion's prepared-plan
     /// store is not cleared by the session's own result/plan caches).
     prepared_names: parking_lot::Mutex<std::collections::HashSet<String>>,
+    query_registry: Arc<SqlQueryRegistry>,
+    execution_gate: Arc<tokio::sync::Semaphore>,
+    statement_timeout: parking_lot::RwLock<Option<std::time::Duration>>,
 }
 
 /// `(sql, snapshot_epoch) → cached result batches`.
@@ -1692,6 +1701,67 @@ fn buffered_stream(batches: Vec<RecordBatch>) -> MongrelRecordBatchStream {
     Box::pin(RecordBatchStreamAdapter::new(schema, stream))
 }
 
+struct ManagedQueryStream {
+    inner: MongrelRecordBatchStream,
+    schema: SchemaRef,
+    query: RegisteredSqlQuery,
+    guard: Option<RegisteredQueryGuard>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl futures::Stream for ManagedQueryStream {
+    type Item = datafusion::common::Result<RecordBatch>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        if let Err(error) = self.query.checkpoint() {
+            if let Some(guard) = self.guard.take() {
+                guard.fail();
+            }
+            self.permit.take();
+            return std::task::Poll::Ready(Some(Err(DataFusionError::External(Box::new(error)))));
+        }
+        match self.inner.as_mut().poll_next(context) {
+            std::task::Poll::Ready(None) => {
+                if let Some(guard) = self.guard.take() {
+                    guard.complete();
+                }
+                self.permit.take();
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Ready(Some(Err(error))) => {
+                if let Some(guard) = self.guard.take() {
+                    guard.fail();
+                }
+                self.permit.take();
+                std::task::Poll::Ready(Some(Err(error)))
+            }
+            item => item,
+        }
+    }
+}
+
+impl datafusion::physical_plan::RecordBatchStream for ManagedQueryStream {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+}
+
+impl Drop for ManagedQueryStream {
+    fn drop(&mut self) {
+        if self.guard.is_some() {
+            let _ = self
+                .query
+                .request_cancel(mongreldb_core::CancellationReason::ClientDisconnected);
+            if let Some(guard) = self.guard.take() {
+                guard.fail();
+            }
+        }
+    }
+}
+
 impl MongrelSession {
     /// Create a session over a live `Table`. Takes ownership; wrap in `Arc` if you
     /// need to keep a handle for writes after registering the provider. Registers
@@ -1730,6 +1800,9 @@ impl MongrelSession {
             external_modules,
             scored_runtime,
             prepared_names: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            query_registry: Arc::new(SqlQueryRegistry::default()),
+            execution_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            statement_timeout: parking_lot::RwLock::new(None),
         }
     }
 
@@ -1833,7 +1906,33 @@ impl MongrelSession {
             external_modules,
             scored_runtime,
             prepared_names: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            query_registry: Arc::new(SqlQueryRegistry::default()),
+            execution_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            statement_timeout: parking_lot::RwLock::new(None),
         })
+    }
+
+    pub fn query_registry(&self) -> &Arc<SqlQueryRegistry> {
+        &self.query_registry
+    }
+
+    pub fn set_statement_timeout(&self, timeout: Option<std::time::Duration>) {
+        *self.statement_timeout.write() = timeout;
+    }
+
+    pub fn register_query(&self, mut options: SqlQueryOptions) -> Result<RegisteredSqlQuery> {
+        if let Some(statement_timeout) = *self.statement_timeout.read() {
+            options.timeout = Some(
+                options
+                    .timeout
+                    .map_or(statement_timeout, |timeout| timeout.min(statement_timeout)),
+            );
+        }
+        self.query_registry.register(options)
+    }
+
+    pub fn cancel_query(&self, query_id: QueryId) -> CancelOutcome {
+        self.query_registry.cancel(query_id)
     }
 
     pub fn principal(&self) -> Option<mongreldb_core::Principal> {
@@ -2436,13 +2535,81 @@ impl MongrelSession {
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, guarded)))
     }
 
+    pub async fn run_stream_with_options(
+        &self,
+        sql: &str,
+        options: SqlQueryOptions,
+    ) -> Result<MongrelRecordBatchStream> {
+        let query = self.register_query(options)?;
+        self.run_stream_with_query(sql, query).await
+    }
+
+    pub async fn run_stream_with_query(
+        &self,
+        sql: &str,
+        query: RegisteredSqlQuery,
+    ) -> Result<MongrelRecordBatchStream> {
+        query.set_sql_metadata(sql);
+        let guard = RegisteredQueryGuard::new(query.clone());
+        let permit = tokio::select! {
+            permit = Arc::clone(&self.execution_gate).acquire_owned() => permit.map_err(|_| {
+                MongrelQueryError::InvalidQueryState("session execution gate closed".into())
+            })?,
+            _ = query.control().cancelled() => {
+                let error = query.checkpoint().unwrap_err();
+                guard.fail();
+                return Err(error);
+            }
+        };
+        query.transition(SqlQueryPhase::Queued, SqlQueryPhase::Planning)?;
+        query.transition(SqlQueryPhase::Planning, SqlQueryPhase::Executing)?;
+        let stream = CURRENT_SQL_QUERY
+            .scope(query.clone(), async {
+                tokio::select! {
+                    biased;
+                    result = self.run_stream_internal(sql, &query) => result,
+                    _ = query.control().cancelled() => Err(query.checkpoint().unwrap_err()),
+                }
+            })
+            .await;
+        let stream = match stream {
+            Ok(stream) => stream,
+            Err(error) => {
+                guard.fail();
+                return Err(error);
+            }
+        };
+        query.transition(SqlQueryPhase::Executing, SqlQueryPhase::Streaming)?;
+        let schema = stream.schema();
+        Ok(Box::pin(ManagedQueryStream {
+            inner: stream,
+            schema,
+            query,
+            guard: Some(guard),
+            permit: Some(permit),
+        }))
+    }
+
+    pub async fn run_stream(&self, sql: &str) -> Result<MongrelRecordBatchStream> {
+        if let Ok(query) = CURRENT_SQL_QUERY.try_with(Clone::clone) {
+            return Box::pin(self.run_stream_internal(sql, &query)).await;
+        }
+        self.run_stream_with_options(sql, SqlQueryOptions::default())
+            .await
+    }
+
     /// Execute SQL as a DataFusion record-batch stream. Query results bypass
     /// the result cache and native batch-producing fast paths. Commands and
     /// MongrelDB's recursive-CTE compatibility path remain buffered because
     /// they do not produce a DataFusion stream.
-    pub async fn run_stream(&self, sql: &str) -> Result<MongrelRecordBatchStream> {
+    async fn run_stream_internal(
+        &self,
+        sql: &str,
+        query: &RegisteredSqlQuery,
+    ) -> Result<MongrelRecordBatchStream> {
+        query.checkpoint()?;
         if strip_explain_query_plan(sql).is_some() {
-            return self.run(sql).await.map(buffered_stream);
+            return self.run_internal(sql, query).await.map(buffered_stream);
         }
 
         let trimmed = sql.trim();
@@ -2458,12 +2625,15 @@ impl MongrelSession {
             }
             if stmts.len() > 1 {
                 for stmt in &non_empty[..non_empty.len() - 1] {
-                    self.run(stmt).await?;
+                    query.checkpoint()?;
+                    Box::pin(self.run_internal(stmt, query)).await?;
                 }
-                return Box::pin(self.run_stream(non_empty[non_empty.len() - 1])).await;
+                return Box::pin(self.run_stream_internal(non_empty[non_empty.len() - 1], query))
+                    .await;
             }
         }
 
+        query.checkpoint()?;
         if let Some(batches) = commands::try_run_command(self, sql).await? {
             return Ok(buffered_stream(batches));
         }
@@ -2501,11 +2671,72 @@ impl MongrelSession {
         Ok(stream)
     }
 
+    pub async fn run_with_options(
+        &self,
+        sql: &str,
+        options: SqlQueryOptions,
+    ) -> Result<Vec<RecordBatch>> {
+        let query = self.register_query(options)?;
+        self.run_with_query(sql, query).await
+    }
+
+    pub async fn run_with_query(
+        &self,
+        sql: &str,
+        query: RegisteredSqlQuery,
+    ) -> Result<Vec<RecordBatch>> {
+        query.set_sql_metadata(sql);
+        let guard = RegisteredQueryGuard::new(query.clone());
+        let _permit = tokio::select! {
+            permit = Arc::clone(&self.execution_gate).acquire_owned() => permit.map_err(|_| {
+                MongrelQueryError::InvalidQueryState("session execution gate closed".into())
+            })?,
+            _ = query.control().cancelled() => {
+                let error = query.checkpoint().unwrap_err();
+                guard.fail();
+                return Err(error);
+            }
+        };
+        query.transition(SqlQueryPhase::Queued, SqlQueryPhase::Planning)?;
+        query.transition(SqlQueryPhase::Planning, SqlQueryPhase::Executing)?;
+        let result = CURRENT_SQL_QUERY
+            .scope(query.clone(), async {
+                tokio::select! {
+                    biased;
+                    result = self.run_internal(sql, &query) => result,
+                    _ = query.control().cancelled() => Err(query.checkpoint().unwrap_err()),
+                }
+            })
+            .await;
+        match result {
+            Ok(batches) => {
+                guard.complete();
+                Ok(batches)
+            }
+            Err(error) => {
+                guard.fail();
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn run(&self, sql: &str) -> Result<Vec<RecordBatch>> {
+        if let Ok(query) = CURRENT_SQL_QUERY.try_with(Clone::clone) {
+            return Box::pin(self.run_internal(sql, &query)).await;
+        }
+        self.run_with_options(sql, SqlQueryOptions::default()).await
+    }
+
     /// Run a SQL statement: DDL/commands are intercepted; otherwise a result
     /// cache keyed by `(normalized SQL, snapshot epoch)` memoizes batches.
     /// §5.3: simple single-table SELECTs are served by [`try_direct_dispatch`]
     /// (no DataFusion planning) before falling back to the full DataFusion path.
-    pub async fn run(&self, sql: &str) -> Result<Vec<RecordBatch>> {
+    async fn run_internal(
+        &self,
+        sql: &str,
+        query: &RegisteredSqlQuery,
+    ) -> Result<Vec<RecordBatch>> {
+        query.checkpoint()?;
         if let Some(inner) = strip_explain_query_plan(sql) {
             return self.explain_query_plan(inner).await;
         }
@@ -2533,13 +2764,15 @@ impl MongrelSession {
                     if stmt.is_empty() {
                         continue;
                     }
-                    last = Box::pin(self.run(stmt)).await?;
+                    query.checkpoint()?;
+                    last = Box::pin(self.run_internal(stmt, query)).await?;
                 }
                 return Ok(last);
             }
         }
 
         // Try command dispatch (handles DDL/DML/triggers/views/etc.).
+        query.checkpoint()?;
         if let Some(batches) = commands::try_run_command(self, sql).await? {
             return Ok(batches);
         }
@@ -2559,7 +2792,8 @@ impl MongrelSession {
                     if stmt.is_empty() {
                         continue;
                     }
-                    last = Box::pin(self.run(stmt)).await?;
+                    query.checkpoint()?;
+                    last = Box::pin(self.run_internal(stmt, query)).await?;
                 }
                 return Ok(last);
             }
@@ -2712,6 +2946,7 @@ impl MongrelSession {
         // and synthesize a result batch.
         if let Some(batches) = self.try_catalog_introspection(sql)? {
             if result_cacheable {
+                query.checkpoint()?;
                 self.cache.lock().insert(key, Arc::new(batches.clone()));
             }
             return Ok(batches);
@@ -2722,6 +2957,7 @@ impl MongrelSession {
         // any shape it cannot serve exactly.
         if let Some(batches) = self.try_direct_dispatch(sql)? {
             if result_cacheable {
+                query.checkpoint()?;
                 self.cache.lock().insert(key, Arc::new(batches.clone()));
             }
             return Ok(batches);
@@ -2770,6 +3006,7 @@ impl MongrelSession {
             });
         }
         if result_cacheable {
+            query.checkpoint()?;
             self.cache.lock().insert(key, Arc::new(batches.clone()));
         }
         Ok(batches)
