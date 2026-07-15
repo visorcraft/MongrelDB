@@ -49,7 +49,14 @@ async fn sql_returns_supplied_and_generated_query_ids() {
         .await
         .unwrap();
     assert_eq!(status.status(), StatusCode::OK);
-    assert_eq!(json_body(status).await["state"], "completed");
+    let status = json_body(status).await;
+    assert_eq!(status["state"], "completed");
+    assert!(status["trace"]["queue_duration_us"].is_number());
+    assert!(status["trace"]["planning_duration_us"].is_number());
+    assert!(status["trace"]["execution_duration_us"].is_number());
+    assert!(status["trace"]["serialization_duration_us"].is_number());
+    assert_eq!(status["trace"]["commit_fence_outcome"], "not_reached");
+    assert!(status.get("sql").is_none());
 
     let generated = app
         .oneshot(request("POST", "/sql", json!({ "sql": "SELECT 1" })))

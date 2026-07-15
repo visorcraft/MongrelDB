@@ -42,8 +42,8 @@ pub use external_modules::{
     ExternalTxn, ExternalWriteOp, ExternalWriteResult, ModuleConnectCtx,
 };
 pub use query_registry::{
-    CancelOutcome, QueryId, QueryStatus, RegisteredQueryGuard, RegisteredSqlQuery, SqlQueryOptions,
-    SqlQueryPhase, SqlQueryRegistry,
+    CancelOutcome, CommitFenceOutcome, QueryId, QueryStatus, RegisteredQueryGuard,
+    RegisteredSqlQuery, SqlQueryOptions, SqlQueryPhase, SqlQueryRegistry,
 };
 
 /// True when SQL calls a ranked Boolean AI UDF. Remote servers use this to

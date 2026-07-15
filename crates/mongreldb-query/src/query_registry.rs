@@ -165,6 +165,65 @@ pub struct QueryStatus {
     pub completed_statements: usize,
     pub statement_index: usize,
     pub cancel_requested_at: Option<Instant>,
+    pub queue_duration: Duration,
+    pub planning_duration: Duration,
+    pub execution_duration: Duration,
+    pub serialization_duration: Duration,
+    pub cancel_requested_phase: Option<SqlQueryPhase>,
+    pub cancel_observed_phase: Option<SqlQueryPhase>,
+    pub commit_fence_outcome: CommitFenceOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitFenceOutcome {
+    NotReached,
+    CancelWon,
+    CommitWon,
+}
+
+#[derive(Debug, Clone)]
+struct QueryTrace {
+    phase_started_at: Instant,
+    queue_duration: Duration,
+    planning_duration: Duration,
+    execution_duration: Duration,
+    serialization_duration: Duration,
+    cancel_requested_phase: Option<SqlQueryPhase>,
+    cancel_observed_phase: Option<SqlQueryPhase>,
+    commit_fence_outcome: CommitFenceOutcome,
+}
+
+impl QueryTrace {
+    fn new(started_at: Instant) -> Self {
+        Self {
+            phase_started_at: started_at,
+            queue_duration: Duration::ZERO,
+            planning_duration: Duration::ZERO,
+            execution_duration: Duration::ZERO,
+            serialization_duration: Duration::ZERO,
+            cancel_requested_phase: None,
+            cancel_observed_phase: None,
+            commit_fence_outcome: CommitFenceOutcome::NotReached,
+        }
+    }
+
+    fn transition(&mut self, phase: SqlQueryPhase) {
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(self.phase_started_at);
+        match phase {
+            SqlQueryPhase::Queued => self.queue_duration += elapsed,
+            SqlQueryPhase::Planning => self.planning_duration += elapsed,
+            SqlQueryPhase::Executing | SqlQueryPhase::Streaming | SqlQueryPhase::CommitCritical => {
+                self.execution_duration += elapsed
+            }
+            SqlQueryPhase::Serializing => self.serialization_duration += elapsed,
+            SqlQueryPhase::Cancelling
+            | SqlQueryPhase::Completed
+            | SqlQueryPhase::Failed
+            | SqlQueryPhase::Cancelled => {}
+        }
+        self.phase_started_at = now;
+    }
 }
 
 #[derive(Debug)]
@@ -182,6 +241,7 @@ struct RegisteredQuery {
     completed_statements: AtomicUsize,
     statement_index: AtomicUsize,
     cancel_requested_at: Mutex<Option<Instant>>,
+    trace: Mutex<QueryTrace>,
 }
 
 impl RegisteredQuery {
@@ -190,6 +250,8 @@ impl RegisteredQuery {
     }
 
     fn status(&self) -> QueryStatus {
+        let mut trace = self.trace.lock().unwrap().clone();
+        trace.transition(self.phase());
         QueryStatus {
             query_id: self.id,
             owner: self.owner.clone(),
@@ -204,7 +266,18 @@ impl RegisteredQuery {
             completed_statements: self.completed_statements.load(Ordering::Acquire),
             statement_index: self.statement_index.load(Ordering::Acquire),
             cancel_requested_at: *self.cancel_requested_at.lock().unwrap(),
+            queue_duration: trace.queue_duration,
+            planning_duration: trace.planning_duration,
+            execution_duration: trace.execution_duration,
+            serialization_duration: trace.serialization_duration,
+            cancel_requested_phase: trace.cancel_requested_phase,
+            cancel_observed_phase: trace.cancel_observed_phase,
+            commit_fence_outcome: trace.commit_fence_outcome,
         }
+    }
+
+    fn record_transition(&self, phase: SqlQueryPhase) {
+        self.trace.lock().unwrap().transition(phase);
     }
 }
 
@@ -270,6 +343,7 @@ impl SqlQueryRegistry {
             Some(parent) => parent.child_with_deadline(deadline),
             None => ExecutionControl::new(deadline),
         };
+        let started_at = Instant::now();
         let query = Arc::new(RegisteredQuery {
             id,
             owner: options.owner,
@@ -277,13 +351,14 @@ impl SqlQueryRegistry {
             deadline: control.deadline(),
             control,
             phase: AtomicU8::new(SqlQueryPhase::Queued as u8),
-            started_at: Instant::now(),
+            started_at,
             operation: Mutex::new("UNKNOWN".into()),
             sql_fingerprint: Mutex::new([0; 32]),
             committed: AtomicBool::new(false),
             completed_statements: AtomicUsize::new(0),
             statement_index: AtomicUsize::new(0),
             cancel_requested_at: Mutex::new(None),
+            trace: Mutex::new(QueryTrace::new(started_at)),
         });
         let mut state = self.state.lock().unwrap();
         self.prune_locked(&mut state);
@@ -378,6 +453,16 @@ impl SqlQueryRegistry {
         self.state.lock().unwrap().active.len()
     }
 
+    pub fn active_statuses(&self) -> Vec<QueryStatus> {
+        self.state
+            .lock()
+            .unwrap()
+            .active
+            .values()
+            .map(|query| query.status())
+            .collect()
+    }
+
     pub fn active_for_session(&self, session_id: &str) -> usize {
         self.state
             .lock()
@@ -422,7 +507,9 @@ impl SqlQueryRegistry {
 
     fn finish(&self, query: &Arc<RegisteredQuery>, phase: SqlQueryPhase) {
         debug_assert!(phase.is_terminal());
+        let previous = query.phase();
         query.phase.store(phase as u8, Ordering::Release);
+        query.record_transition(previous);
         let status = query.status();
         let approximate_bytes = std::mem::size_of::<FinishedQuery>()
             + status.owner.as_ref().map_or(0, String::len)
@@ -478,6 +565,10 @@ impl RegisteredQuery {
                         .is_ok()
                     {
                         *self.cancel_requested_at.lock().unwrap() = Some(Instant::now());
+                        let mut trace = self.trace.lock().unwrap();
+                        trace.transition(phase);
+                        trace.cancel_requested_phase = Some(phase);
+                        trace.commit_fence_outcome = CommitFenceOutcome::CancelWon;
                         self.control.cancel(reason);
                         return CancelOutcome::Accepted;
                     }
@@ -558,7 +649,7 @@ impl RegisteredSqlQuery {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .map(|_| ())
+            .map(|_| self.query.record_transition(expected))
             .map_err(|actual| {
                 let actual = SqlQueryPhase::from_u8(actual);
                 if actual == SqlQueryPhase::Cancelling {
@@ -573,8 +664,13 @@ impl RegisteredSqlQuery {
     }
 
     pub fn enter_commit_critical(&self) -> Result<()> {
-        self.checkpoint()?;
-        self.transition(SqlQueryPhase::Executing, SqlQueryPhase::CommitCritical)
+        if let Err(error) = self.checkpoint() {
+            self.query.trace.lock().unwrap().commit_fence_outcome = CommitFenceOutcome::CancelWon;
+            return Err(error);
+        }
+        self.transition(SqlQueryPhase::Executing, SqlQueryPhase::CommitCritical)?;
+        self.query.trace.lock().unwrap().commit_fence_outcome = CommitFenceOutcome::CommitWon;
+        Ok(())
     }
 
     pub fn exit_commit_critical(&self) -> Result<()> {
@@ -622,7 +718,8 @@ impl RegisteredSqlQuery {
     }
 
     pub fn checkpoint(&self) -> Result<()> {
-        self.query
+        let result = self
+            .query
             .control
             .checkpoint()
             .map_err(|error| match error {
@@ -647,7 +744,12 @@ impl RegisteredSqlQuery {
                 }
                 mongreldb_core::MongrelError::Cancelled => self.cancellation_error(),
                 other => MongrelQueryError::Core(other),
-            })
+            });
+        if result.is_err() && self.query.control.is_cancelled() {
+            let mut trace = self.query.trace.lock().unwrap();
+            trace.cancel_observed_phase = trace.cancel_requested_phase.or(Some(self.phase()));
+        }
+        result
     }
 
     pub fn complete(&self) {
@@ -797,6 +899,13 @@ mod tests {
                     CancelOutcome::Accepted
                 );
                 assert!(query.enter_commit_critical().is_err());
+                let status = query.status();
+                assert_eq!(
+                    status.cancel_requested_phase,
+                    Some(SqlQueryPhase::Executing)
+                );
+                assert_eq!(status.cancel_observed_phase, Some(SqlQueryPhase::Executing));
+                assert_eq!(status.commit_fence_outcome, CommitFenceOutcome::CancelWon);
             } else {
                 query.enter_commit_critical().unwrap();
                 assert_eq!(
@@ -805,7 +914,9 @@ mod tests {
                 );
                 query.mark_committed();
                 query.complete();
-                assert!(registry.status(query.id()).unwrap().committed);
+                let status = registry.status(query.id()).unwrap();
+                assert!(status.committed);
+                assert_eq!(status.commit_fence_outcome, CommitFenceOutcome::CommitWon);
             }
         }
     }

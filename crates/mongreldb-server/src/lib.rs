@@ -159,7 +159,15 @@ impl ServerControl {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         self.sessions.close_all();
-        let stuck = self.query_registry.active_count();
+        let stuck_queries = self.query_registry.active_statuses();
+        for status in &stuck_queries {
+            eprintln!(
+                "[sql-cancel-stuck] query_id={} phase={}",
+                status.query_id,
+                query_phase_name(status.phase)
+            );
+        }
+        let stuck = stuck_queries.len();
         self.metrics.add_sql_stuck_after_cancel(stuck);
         stuck
     }
@@ -2075,6 +2083,14 @@ fn query_phase_name(phase: SqlQueryPhase) -> &'static str {
     }
 }
 
+fn commit_fence_outcome_name(outcome: mongreldb_query::CommitFenceOutcome) -> &'static str {
+    match outcome {
+        mongreldb_query::CommitFenceOutcome::NotReached => "not_reached",
+        mongreldb_query::CommitFenceOutcome::CancelWon => "cancel_won",
+        mongreldb_query::CommitFenceOutcome::CommitWon => "commit_won",
+    }
+}
+
 async fn query_status(
     State(state): State<Arc<AppState>>,
     OptionalPrincipal(principal): OptionalPrincipal,
@@ -2102,6 +2118,15 @@ async fn query_status(
         "cancellation_reason": format!("{:?}", status.cancellation_reason).to_ascii_lowercase(),
         "completed_statements": status.completed_statements,
         "statement_index": status.statement_index,
+        "trace": {
+            "queue_duration_us": status.queue_duration.as_micros(),
+            "planning_duration_us": status.planning_duration.as_micros(),
+            "execution_duration_us": status.execution_duration.as_micros(),
+            "serialization_duration_us": status.serialization_duration.as_micros(),
+            "cancel_requested_phase": status.cancel_requested_phase.map(query_phase_name),
+            "cancel_observed_phase": status.cancel_observed_phase.map(query_phase_name),
+            "commit_fence_outcome": commit_fence_outcome_name(status.commit_fence_outcome),
+        },
     }))
     .into_response();
     with_query_id(response, query_id)
