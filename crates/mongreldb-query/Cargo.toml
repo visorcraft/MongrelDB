@@ -8,7 +8,7 @@ repository.workspace = true
 description = "DataFusion SQL + Arrow frontend for MongrelDB."
 
 [dependencies]
-mongreldb-core = { path = "../mongreldb-core", version = "0.54.1" }
+mongreldb-core = { path = "../mongreldb-core", version = "0.55.0" }
 datafusion = "54.0.0"
 datafusion-datasource = "54.0.0"
 arrow = "58"
@@ -30,7 +30,7 @@ bincode = "1"
 tempfile = "3"
 rusqlite = { version = "0.32", features = ["bundled"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
-mongreldb-core = { path = "../mongreldb-core", version = "0.54.1", features = ["encryption"] }
+mongreldb-core = { path = "../mongreldb-core", version = "0.55.0", features = ["encryption"] }
 
 [[bench]]
 name = "sql_cancellation"

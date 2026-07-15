@@ -1,6 +1,6 @@
 [package]
 name = "mongreldb-jni"
-version = "0.54.1"
+version = "0.55.0"
 edition = "2021"
 publish = false
 license = "MIT OR Apache-2.0"
