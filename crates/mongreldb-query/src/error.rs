@@ -17,11 +17,15 @@ pub enum MongrelQueryError {
     QueryCancelled {
         query_id: crate::QueryId,
         reason: mongreldb_core::CancellationReason,
+        completed_statements: usize,
+        cancelled_statement_index: usize,
     },
     #[error("query {query_id} deadline exceeded")]
     DeadlineExceeded {
         query_id: crate::QueryId,
         timeout_ms: Option<u64>,
+        completed_statements: usize,
+        cancelled_statement_index: usize,
     },
     #[error("query id {query_id} is already active")]
     QueryIdConflict { query_id: crate::QueryId },

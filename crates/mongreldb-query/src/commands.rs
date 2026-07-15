@@ -1,6 +1,7 @@
 use crate::{
     ExternalBaseWrite, ExternalModuleIndex, ExternalModuleRegistry, ExternalWriteOp,
-    MongrelProvider, MongrelQueryError, MongrelSession, Result,
+    MongrelProvider, MongrelQueryError, MongrelSession, RegisteredSqlQuery, Result,
+    SqlTestHookPoint,
 };
 use arrow::array::{ArrayRef, BooleanArray, Int64Array, StringArray};
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
@@ -66,9 +67,17 @@ fn ensure_staging_capacity(current: usize, additional: usize) -> Result<()> {
     Ok(())
 }
 
+fn enter_commit_fence(session: &MongrelSession, query: &RegisteredSqlQuery) -> Result<()> {
+    session.fire_test_hook(SqlTestHookPoint::BeforeCommitFence);
+    query.enter_commit_critical()?;
+    session.fire_test_hook(SqlTestHookPoint::InsideCommitCritical);
+    Ok(())
+}
+
 pub(crate) async fn try_run_command(
     session: &MongrelSession,
     sql: &str,
+    query: &RegisteredSqlQuery,
 ) -> Result<Option<Vec<RecordBatch>>> {
     let trimmed = sql.trim();
     if trimmed.is_empty() {
@@ -95,7 +104,7 @@ pub(crate) async fn try_run_command(
         return Ok(Some(Vec::new()));
     }
 
-    if let Some(batch) = try_manual_command(session, trimmed, &lower)? {
+    if let Some(batch) = try_manual_command(session, trimmed, &lower, query)? {
         return Ok(Some(batch));
     }
     if !should_parse(&lower) {
@@ -119,7 +128,34 @@ pub(crate) async fn try_run_command(
         return Ok(None);
     };
 
-    let out = match statements.into_iter().next().unwrap() {
+    let statement = statements.into_iter().next().unwrap();
+    let ddl_fence = matches!(
+        &statement,
+        Statement::CreateTable(_)
+            | Statement::CreateVirtualTable { .. }
+            | Statement::CreateTrigger(_)
+            | Statement::DropTrigger(_)
+            | Statement::CreatePolicy(_)
+            | Statement::DropPolicy(_)
+            | Statement::AlterTable(_)
+            | Statement::CreateIndex(_)
+            | Statement::CreateView(_)
+            | Statement::Analyze(_)
+            | Statement::Vacuum(_)
+    ) || matches!(
+        &statement,
+        Statement::Drop {
+            object_type: ObjectType::Table
+                | ObjectType::View
+                | ObjectType::MaterializedView
+                | ObjectType::Index,
+            ..
+        }
+    );
+    if ddl_fence {
+        enter_commit_fence(session, query)?;
+    }
+    let out = match statement {
         Statement::CreateTable(create) => {
             require_ddl(session, db)?;
             create_table(session, db, &create, ttl_clause.as_ref()).await?;
@@ -235,20 +271,44 @@ pub(crate) async fn try_run_command(
                 ));
             }
             *staged = Some(Vec::new());
+            *session.sql_txn_aborted.lock() = false;
+            session.savepoints.lock().clear();
             Vec::new()
         }
         Statement::Commit { .. } => {
+            if *session.sql_txn_aborted.lock() {
+                return Err(MongrelQueryError::TransactionAborted);
+            }
+            enter_commit_fence(session, query)?;
             let ops = session.sql_txn.lock().take().unwrap_or_default();
             let changes = logical_changes(&ops);
             let external_tables = external_tables_to_refresh(db, &ops);
-            apply_ops(session, db, ops)?;
-            refresh_external_tables(session, db, &external_tables)?;
+            if let Err(error) = apply_ops(session, db, ops.clone()) {
+                *session.sql_txn.lock() = Some(ops);
+                *session.sql_txn_aborted.lock() = true;
+                query.exit_commit_critical()?;
+                return Err(error);
+            }
+            query.mark_committed();
+            if let Err(error) = refresh_external_tables(session, db, &external_tables) {
+                *session.sql_txn_aborted.lock() = false;
+                session.savepoints.lock().clear();
+                return Err(MongrelQueryError::CommitOutcome {
+                    query_id: query.id(),
+                    committed: true,
+                    message: error.to_string(),
+                });
+            }
+            *session.sql_txn_aborted.lock() = false;
+            session.savepoints.lock().clear();
             session.sql_fn_state.record_changes(changes, None);
             session.clear_cache();
             Vec::new()
         }
         Statement::Rollback { .. } => {
             session.sql_txn.lock().take();
+            *session.sql_txn_aborted.lock() = false;
+            session.savepoints.lock().clear();
             Vec::new()
         }
         Statement::Analyze(_) => {
@@ -265,6 +325,11 @@ pub(crate) async fn try_run_command(
         }
         _ => return Ok(None),
     };
+
+    if ddl_fence {
+        query.mark_committed();
+        query.exit_commit_critical()?;
+    }
 
     Ok(Some(out))
 }
@@ -405,6 +470,57 @@ fn try_manual_command(
     session: &MongrelSession,
     sql: &str,
     lower: &str,
+    query: &RegisteredSqlQuery,
+) -> Result<Option<Vec<RecordBatch>>> {
+    if !manual_command_is_durable(lower) {
+        return try_manual_command_body(session, sql, lower, query);
+    }
+    enter_commit_fence(session, query)?;
+    let result = try_manual_command_body(session, sql, lower, query);
+    if result.is_ok() {
+        query.mark_committed();
+    }
+    query.exit_commit_critical()?;
+    result
+}
+
+fn manual_command_is_durable(lower: &str) -> bool {
+    [
+        "create user ",
+        "alter user ",
+        "drop user ",
+        "create role ",
+        "drop role ",
+        "grant ",
+        "revoke ",
+        "create mask ",
+        "drop mask ",
+        "create virtual table ",
+        "create trigger if not exists ",
+        "create procedure ",
+        "create or replace procedure ",
+        "drop procedure ",
+        "call ",
+        "doctor",
+        "vacuum into ",
+        "compact",
+        "vacuum",
+        "analyze",
+        "reindex",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix))
+        || (lower.starts_with("pragma ")
+            && (lower.contains('=')
+                || lower.starts_with("pragma optimize")
+                || lower.starts_with("pragma wal_checkpoint")))
+}
+
+fn try_manual_command_body(
+    session: &MongrelSession,
+    sql: &str,
+    lower: &str,
+    query: &RegisteredSqlQuery,
 ) -> Result<Option<Vec<RecordBatch>>> {
     let admin_command = [
         "create user ",
@@ -809,6 +925,7 @@ fn try_manual_command(
             session,
             sql.trim_end_matches(';').trim(),
             lower.trim_end_matches(';'),
+            query,
         );
     }
 
@@ -4510,18 +4627,34 @@ fn stage_or_apply(
     if let Some(staged) = session.sql_txn.lock().as_mut() {
         ensure_staging_capacity(staged.len(), ops.len())?;
         staged.extend(ops);
+        session.fire_test_hook(SqlTestHookPoint::AfterStatementStaging);
+        session.current_query()?.checkpoint()?;
         session
             .sql_fn_state
             .record_changes(changes, last_insert_rowid);
         return Ok(());
     }
+    let query = session.current_query()?;
+    enter_commit_fence(session, &query)?;
     let external_tables = external_tables_to_refresh(db, &ops);
-    apply_ops(session, db, ops)?;
-    refresh_external_tables(session, db, &external_tables)?;
+    if let Err(error) = apply_ops(session, db, ops) {
+        query.exit_commit_critical()?;
+        return Err(error);
+    }
+    query.mark_committed();
+    if let Err(error) = refresh_external_tables(session, db, &external_tables) {
+        query.exit_commit_critical()?;
+        return Err(MongrelQueryError::CommitOutcome {
+            query_id: query.id(),
+            committed: true,
+            message: error.to_string(),
+        });
+    }
     session
         .sql_fn_state
         .record_changes(changes, last_insert_rowid);
     session.clear_cache();
+    query.exit_commit_critical()?;
     Ok(())
 }
 

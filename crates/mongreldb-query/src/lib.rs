@@ -72,6 +72,24 @@ pub fn contains_boolean_ai_predicate(sql: &str) -> bool {
 
 pub type MongrelRecordBatchStream = datafusion::physical_plan::SendableRecordBatchStream;
 
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqlTestHookPoint {
+    AfterRegistration,
+    WaitingForSqlPermit,
+    WaitingForSessionPermit,
+    Planning,
+    BeforeScanBatch,
+    AfterScanBatch,
+    BeforeCommitFence,
+    InsideCommitCritical,
+    AfterStatementStaging,
+    BeforeSerializationBatch,
+}
+
+#[doc(hidden)]
+pub type SqlTestHook = Arc<dyn Fn(SqlTestHookPoint) + Send + Sync>;
+
 tokio::task_local! {
     // Carries one registered query through command helpers that recursively
     // execute SQL. DataFusion operators receive control through TaskContext.
@@ -1618,6 +1636,8 @@ pub struct MongrelSession {
     /// snapshot-at-scan; this batches SQL writes atomically when a client sends
     /// an explicit transaction block.
     sql_txn: parking_lot::Mutex<Option<Vec<commands::PendingSqlOp>>>,
+    /// Failed/cancelled explicit transactions accept only a full `ROLLBACK`.
+    sql_txn_aborted: parking_lot::Mutex<bool>,
     /// SAVEPOINT stack: `(name, staged-ops-length-at-savepoint)`. Truncated on
     /// `ROLLBACK TO name` and removed on `RELEASE name`.
     savepoints: parking_lot::Mutex<Vec<(String, usize)>>,
@@ -1634,6 +1654,7 @@ pub struct MongrelSession {
     query_registry: Arc<SqlQueryRegistry>,
     execution_gate: Arc<tokio::sync::Semaphore>,
     statement_timeout: parking_lot::RwLock<Option<std::time::Duration>>,
+    test_hook: parking_lot::Mutex<Option<SqlTestHook>>,
 }
 
 /// `(sql, snapshot_epoch) → cached result batches`.
@@ -1711,6 +1732,43 @@ struct ManagedQueryStream {
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
+struct TransactionStatementGuard<'a> {
+    session: &'a MongrelSession,
+    savepoint: Option<usize>,
+    completed: bool,
+}
+
+impl<'a> TransactionStatementGuard<'a> {
+    fn new(session: &'a MongrelSession, enabled: bool) -> Self {
+        let savepoint = enabled
+            .then(|| session.sql_txn.lock().as_ref().map(Vec::len))
+            .flatten();
+        Self {
+            session,
+            savepoint,
+            completed: false,
+        }
+    }
+
+    fn complete(mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for TransactionStatementGuard<'_> {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        if let Some(savepoint) = self.savepoint {
+            if let Some(ops) = self.session.sql_txn.lock().as_mut() {
+                ops.truncate(savepoint);
+                *self.session.sql_txn_aborted.lock() = true;
+            }
+        }
+    }
+}
+
 impl futures::Stream for ManagedQueryStream {
     type Item = datafusion::common::Result<RecordBatch>;
 
@@ -1727,6 +1785,7 @@ impl futures::Stream for ManagedQueryStream {
         }
         match self.inner.as_mut().poll_next(context) {
             std::task::Poll::Ready(None) => {
+                self.query.complete_current_statement();
                 if let Some(guard) = self.guard.take() {
                     guard.complete();
                 }
@@ -1798,6 +1857,7 @@ impl MongrelSession {
             attached_databases: parking_lot::Mutex::new(HashMap::new()),
             savepoints: parking_lot::Mutex::new(Vec::new()),
             sql_txn: parking_lot::Mutex::new(None),
+            sql_txn_aborted: parking_lot::Mutex::new(false),
             sql_fn_state,
             external_modules,
             scored_runtime,
@@ -1805,6 +1865,7 @@ impl MongrelSession {
             query_registry: Arc::new(SqlQueryRegistry::default()),
             execution_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             statement_timeout: parking_lot::RwLock::new(None),
+            test_hook: parking_lot::Mutex::new(None),
         }
     }
 
@@ -1904,6 +1965,7 @@ impl MongrelSession {
             attached_databases: parking_lot::Mutex::new(HashMap::new()),
             savepoints: parking_lot::Mutex::new(Vec::new()),
             sql_txn: parking_lot::Mutex::new(None),
+            sql_txn_aborted: parking_lot::Mutex::new(false),
             sql_fn_state,
             external_modules,
             scored_runtime,
@@ -1911,6 +1973,7 @@ impl MongrelSession {
             query_registry: Arc::new(SqlQueryRegistry::default()),
             execution_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             statement_timeout: parking_lot::RwLock::new(None),
+            test_hook: parking_lot::Mutex::new(None),
         })
     }
 
@@ -1935,6 +1998,29 @@ impl MongrelSession {
 
     pub fn cancel_query(&self, query_id: QueryId) -> CancelOutcome {
         self.query_registry.cancel(query_id)
+    }
+
+    #[doc(hidden)]
+    pub fn set_test_hook(&self, hook: Option<SqlTestHook>) {
+        *self.test_hook.lock() = hook;
+    }
+
+    #[doc(hidden)]
+    pub fn staged_sql_operation_count(&self) -> Option<usize> {
+        self.sql_txn.lock().as_ref().map(Vec::len)
+    }
+
+    pub(crate) fn fire_test_hook(&self, point: SqlTestHookPoint) {
+        let hook = self.test_hook.lock().clone();
+        if let Some(hook) = hook {
+            hook(point);
+        }
+    }
+
+    pub(crate) fn current_query(&self) -> Result<RegisteredSqlQuery> {
+        CURRENT_SQL_QUERY.try_with(Clone::clone).map_err(|_| {
+            MongrelQueryError::InvalidQueryState("SQL command has no registered query".into())
+        })
     }
 
     pub fn principal(&self) -> Option<mongreldb_core::Principal> {
@@ -2631,6 +2717,7 @@ impl MongrelSession {
         };
         query.transition(SqlQueryPhase::Queued, SqlQueryPhase::Planning)?;
         query.transition(SqlQueryPhase::Planning, SqlQueryPhase::Executing)?;
+        query.begin_statement(0);
         let stream = CURRENT_SQL_QUERY
             .scope(query.clone(), async {
                 tokio::select! {
@@ -2691,17 +2778,20 @@ impl MongrelSession {
                 return Ok(buffered_stream(Vec::new()));
             }
             if stmts.len() > 1 {
-                for stmt in &non_empty[..non_empty.len() - 1] {
+                for (index, stmt) in non_empty[..non_empty.len() - 1].iter().enumerate() {
+                    query.begin_statement(index);
                     query.checkpoint()?;
                     Box::pin(self.run_internal(stmt, query)).await?;
+                    query.complete_statement(index);
                 }
+                query.begin_statement(non_empty.len() - 1);
                 return Box::pin(self.run_stream_internal(non_empty[non_empty.len() - 1], query))
                     .await;
             }
         }
 
         query.checkpoint()?;
-        if let Some(batches) = commands::try_run_command(self, sql).await? {
+        if let Some(batches) = commands::try_run_command(self, sql, query).await? {
             return Ok(buffered_stream(batches));
         }
 
@@ -2763,6 +2853,7 @@ impl MongrelSession {
         };
         query.transition(SqlQueryPhase::Queued, SqlQueryPhase::Planning)?;
         query.transition(SqlQueryPhase::Planning, SqlQueryPhase::Executing)?;
+        query.begin_statement(0);
         let result = CURRENT_SQL_QUERY
             .scope(query.clone(), async {
                 tokio::select! {
@@ -2774,6 +2865,7 @@ impl MongrelSession {
             .await;
         match result {
             Ok(batches) => {
+                query.complete_current_statement();
                 guard.complete();
                 Ok(batches)
             }
@@ -2796,6 +2888,25 @@ impl MongrelSession {
     /// §5.3: simple single-table SELECTs are served by [`try_direct_dispatch`]
     /// (no DataFusion planning) before falling back to the full DataFusion path.
     async fn run_internal(
+        &self,
+        sql: &str,
+        query: &RegisteredSqlQuery,
+    ) -> Result<Vec<RecordBatch>> {
+        let normalized = sql.trim().trim_end_matches(';').trim().to_ascii_lowercase();
+        let full_rollback = matches!(normalized.as_str(), "rollback" | "rollback transaction");
+        let transaction_open = self.sql_txn.lock().is_some();
+        if transaction_open && *self.sql_txn_aborted.lock() && !full_rollback {
+            return Err(MongrelQueryError::TransactionAborted);
+        }
+        let statement = TransactionStatementGuard::new(self, transaction_open && !full_rollback);
+        let result = Box::pin(self.run_internal_body(sql, query)).await;
+        if result.is_ok() {
+            statement.complete();
+        }
+        result
+    }
+
+    async fn run_internal_body(
         &self,
         sql: &str,
         query: &RegisteredSqlQuery,
@@ -2823,13 +2934,17 @@ impl MongrelSession {
             }
             if stmts.len() > 1 {
                 let mut last = Vec::new();
+                let mut statement_index = 0;
                 for stmt in &stmts {
                     let stmt = stmt.trim();
                     if stmt.is_empty() {
                         continue;
                     }
+                    query.begin_statement(statement_index);
                     query.checkpoint()?;
                     last = Box::pin(self.run_internal(stmt, query)).await?;
+                    query.complete_statement(statement_index);
+                    statement_index += 1;
                 }
                 return Ok(last);
             }
@@ -2837,7 +2952,7 @@ impl MongrelSession {
 
         // Try command dispatch (handles DDL/DML/triggers/views/etc.).
         query.checkpoint()?;
-        if let Some(batches) = commands::try_run_command(self, sql).await? {
+        if let Some(batches) = commands::try_run_command(self, sql, query).await? {
             return Ok(batches);
         }
 
@@ -2851,13 +2966,17 @@ impl MongrelSession {
             let stmts = split_sql_statements(trimmed);
             if stmts.len() > 1 {
                 let mut last = Vec::new();
+                let mut statement_index = 0;
                 for stmt in &stmts {
                     let stmt = stmt.trim();
                     if stmt.is_empty() {
                         continue;
                     }
+                    query.begin_statement(statement_index);
                     query.checkpoint()?;
                     last = Box::pin(self.run_internal(stmt, query)).await?;
+                    query.complete_statement(statement_index);
+                    statement_index += 1;
                 }
                 return Ok(last);
             }

@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -162,6 +162,8 @@ pub struct QueryStatus {
     pub sql_fingerprint: [u8; 32],
     pub cancellation_reason: CancellationReason,
     pub committed: bool,
+    pub completed_statements: usize,
+    pub statement_index: usize,
 }
 
 #[derive(Debug)]
@@ -176,6 +178,8 @@ struct RegisteredQuery {
     operation: Mutex<String>,
     sql_fingerprint: Mutex<[u8; 32]>,
     committed: AtomicBool,
+    completed_statements: AtomicUsize,
+    statement_index: AtomicUsize,
 }
 
 impl RegisteredQuery {
@@ -195,6 +199,8 @@ impl RegisteredQuery {
             sql_fingerprint: *self.sql_fingerprint.lock().unwrap(),
             cancellation_reason: self.control.reason(),
             committed: self.committed.load(Ordering::Acquire),
+            completed_statements: self.completed_statements.load(Ordering::Acquire),
+            statement_index: self.statement_index.load(Ordering::Acquire),
         }
     }
 }
@@ -272,6 +278,8 @@ impl SqlQueryRegistry {
             operation: Mutex::new("UNKNOWN".into()),
             sql_fingerprint: Mutex::new([0; 32]),
             committed: AtomicBool::new(false),
+            completed_statements: AtomicUsize::new(0),
+            statement_index: AtomicUsize::new(0),
         });
         let mut state = self.state.lock().unwrap();
         self.prune_locked(&mut state);
@@ -524,8 +532,27 @@ impl RegisteredSqlQuery {
         self.transition(SqlQueryPhase::Executing, SqlQueryPhase::CommitCritical)
     }
 
+    pub fn exit_commit_critical(&self) -> Result<()> {
+        self.transition(SqlQueryPhase::CommitCritical, SqlQueryPhase::Executing)
+    }
+
     pub fn mark_committed(&self) {
         self.query.committed.store(true, Ordering::Release);
+    }
+
+    pub fn begin_statement(&self, index: usize) {
+        self.query.statement_index.store(index, Ordering::Release);
+    }
+
+    pub fn complete_statement(&self, index: usize) {
+        self.query
+            .completed_statements
+            .store(index.saturating_add(1), Ordering::Release);
+    }
+
+    pub fn complete_current_statement(&self) {
+        let index = self.query.statement_index.load(Ordering::Acquire);
+        self.complete_statement(index);
     }
 
     pub fn request_cancel(&self, reason: CancellationReason) -> CancelOutcome {
@@ -546,6 +573,14 @@ impl RegisteredSqlQuery {
                                 .as_millis()
                                 .min(u128::from(u64::MAX)) as u64
                         }),
+                        completed_statements: self
+                            .query
+                            .completed_statements
+                            .load(Ordering::Acquire),
+                        cancelled_statement_index: self
+                            .query
+                            .statement_index
+                            .load(Ordering::Acquire),
                     }
                 }
                 mongreldb_core::MongrelError::Cancelled => self.cancellation_error(),
@@ -584,10 +619,14 @@ impl RegisteredSqlQuery {
                         .as_millis()
                         .min(u128::from(u64::MAX)) as u64
                 }),
+                completed_statements: self.query.completed_statements.load(Ordering::Acquire),
+                cancelled_statement_index: self.query.statement_index.load(Ordering::Acquire),
             },
             reason => MongrelQueryError::QueryCancelled {
                 query_id: self.id(),
                 reason,
+                completed_statements: self.query.completed_statements.load(Ordering::Acquire),
+                cancelled_statement_index: self.query.statement_index.load(Ordering::Acquire),
             },
         }
     }
