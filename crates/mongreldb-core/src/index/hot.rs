@@ -128,8 +128,20 @@ impl HotIndex {
             },
         );
         Arc::make_mut(&mut self.frozen).push(Arc::new(active));
+        if self.frozen.len() >= crate::MAX_READ_GENERATION_LAYERS {
+            self.consolidate();
+        }
     }
 
+    fn consolidate(&mut self) {
+        let inserted = self.entries().into_iter().collect();
+        self.frozen = Arc::new(vec![Arc::new(HotSegment {
+            inserted,
+            removed: HashSet::new(),
+        })]);
+    }
+
+    #[cfg(test)]
     pub(crate) fn frozen_layer_count(&self) -> usize {
         self.frozen.len()
     }
@@ -149,5 +161,19 @@ mod tests {
         assert_eq!(h.get(b"carol"), None);
         h.insert(b"alice".to_vec(), RowId(9));
         assert_eq!(h.get(b"alice"), Some(RowId(9)));
+    }
+
+    #[test]
+    fn sealed_generations_share_entries_and_consolidate() {
+        let mut writer = HotIndex::new();
+        for id in 0..crate::MAX_READ_GENERATION_LAYERS as u64 + 2 {
+            writer.insert(id.to_be_bytes().to_vec(), RowId(id));
+            writer.seal();
+        }
+        assert!(writer.frozen_layer_count() < crate::MAX_READ_GENERATION_LAYERS);
+        let generation = writer.clone();
+        writer.insert(b"new".to_vec(), RowId(99));
+        assert_eq!(generation.get(b"new"), None);
+        assert_eq!(writer.get(b"new"), Some(RowId(99)));
     }
 }

@@ -199,7 +199,10 @@ impl Memtable {
             let Some(candidate) = segment.tree.get_version(row_id, snapshot_epoch) else {
                 continue;
             };
-            if best.as_ref().is_none_or(|(epoch, _)| candidate.0 > *epoch) {
+            if best
+                .as_ref()
+                .map_or(true, |(epoch, _)| candidate.0 > *epoch)
+            {
                 best = Some(candidate);
             }
         }
@@ -273,8 +276,27 @@ impl Memtable {
             },
         );
         Arc::make_mut(&mut self.frozen).push(Arc::new(active));
+        if self.frozen.len() >= crate::MAX_READ_GENERATION_LAYERS {
+            self.consolidate();
+        }
     }
 
+    fn consolidate(&mut self) {
+        let mut tree = BeTree::new();
+        for row in self
+            .frozen
+            .iter()
+            .flat_map(|segment| segment.tree.versions())
+        {
+            tree.insert_row(row);
+        }
+        self.frozen = Arc::new(vec![Arc::new(MemtableSegment {
+            tree,
+            byte_size: self.byte_size,
+        })]);
+    }
+
+    #[cfg(test)]
     pub(crate) fn frozen_layer_count(&self) -> usize {
         self.frozen.len()
     }
@@ -329,6 +351,20 @@ mod tests {
         assert!(m.get(RowId(1), Epoch(9)).is_none());
         // A snapshot before the tombstone still sees the live version.
         assert!(m.get(RowId(1), Epoch(1)).is_some());
+    }
+
+    #[test]
+    fn sealed_generations_share_rows_and_consolidate() {
+        let mut writer = Memtable::new();
+        for id in 0..crate::MAX_READ_GENERATION_LAYERS as u64 + 2 {
+            writer.upsert(row(id, id + 1));
+            writer.seal();
+        }
+        assert!(writer.frozen_layer_count() < crate::MAX_READ_GENERATION_LAYERS);
+        let generation = writer.clone();
+        writer.upsert(row(99, 99));
+        assert!(generation.get(RowId(99), Epoch(99)).is_none());
+        assert!(writer.get(RowId(99), Epoch(99)).is_some());
     }
 
     #[test]

@@ -14,6 +14,7 @@
 
 use crate::rowid::RowId;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 /// Number of hash permutations in a signature (estimator resolution).
 const NUM_PERM: usize = 128;
@@ -137,14 +138,53 @@ fn band_key(b: usize, sig: &[u32], rows_per_band: usize) -> u64 {
 }
 
 #[derive(Clone)]
-pub struct MinHashIndex {
-    permutations: usize,
-    bands: usize,
+struct MinHashSegment {
     /// Per-row signatures, in insertion order.
     sigs: Vec<(RowId, Vec<u32>)>,
     /// LSH band bucket → indices into `sigs`. Derived from `sigs`; rebuilt on
     /// restore rather than checkpointed.
     buckets: HashMap<u64, Vec<u32>>,
+}
+
+impl MinHashSegment {
+    fn new() -> Self {
+        Self {
+            sigs: Vec::new(),
+            buckets: HashMap::new(),
+        }
+    }
+
+    fn insert(&mut self, row_id: RowId, signature: Vec<u32>, permutations: usize, bands: usize) {
+        let index = self.sigs.len() as u32;
+        for band in 0..bands {
+            self.buckets
+                .entry(band_key(band, &signature, permutations / bands))
+                .or_default()
+                .push(index);
+        }
+        self.sigs.push((row_id, signature));
+    }
+
+    fn candidates(&self, signature: &[u32], permutations: usize, bands: usize) -> HashSet<u32> {
+        let mut candidates = HashSet::new();
+        for band in 0..bands {
+            if let Some(indices) =
+                self.buckets
+                    .get(&band_key(band, signature, permutations / bands))
+            {
+                candidates.extend(indices.iter().copied());
+            }
+        }
+        candidates
+    }
+}
+
+#[derive(Clone)]
+pub struct MinHashIndex {
+    permutations: usize,
+    bands: usize,
+    frozen: Arc<Vec<Arc<MinHashSegment>>>,
+    active: MinHashSegment,
 }
 
 impl MinHashIndex {
@@ -157,8 +197,8 @@ impl MinHashIndex {
         Self {
             permutations,
             bands,
-            sigs: Vec::new(),
-            buckets: HashMap::new(),
+            frozen: Arc::new(Vec::new()),
+            active: MinHashSegment::new(),
         }
     }
 
@@ -167,14 +207,8 @@ impl MinHashIndex {
         let Some(sig) = signature(token_hashes, self.permutations) else {
             return;
         };
-        let idx = self.sigs.len() as u32;
-        for b in 0..self.bands {
-            self.buckets
-                .entry(band_key(b, &sig, self.permutations / self.bands))
-                .or_default()
-                .push(idx);
-        }
-        self.sigs.push((row_id, sig));
+        self.active
+            .insert(row_id, sig, self.permutations, self.bands);
     }
 
     /// Candidate row ids for a query set, ranked by estimated Jaccard (highest
@@ -193,26 +227,25 @@ impl MinHashIndex {
         let Some(qsig) = signature(query_token_hashes, self.permutations) else {
             return Vec::new();
         };
-        let mut candidates: HashSet<u32> = HashSet::new();
-        for b in 0..self.bands {
-            if let Some(v) = self
-                .buckets
-                .get(&band_key(b, &qsig, self.permutations / self.bands))
-            {
-                candidates.extend(v.iter().copied());
+        let mut scored = HashMap::<RowId, f32>::new();
+        for segment in self.layers() {
+            for index in segment.candidates(&qsig, self.permutations, self.bands) {
+                let (row_id, signature) = &segment.sigs[index as usize];
+                if allowed(*row_id) {
+                    let matches = signature
+                        .iter()
+                        .zip(&qsig)
+                        .filter(|(left, right)| left == right)
+                        .count();
+                    let score = matches as f32 / self.permutations as f32;
+                    scored
+                        .entry(*row_id)
+                        .and_modify(|current| *current = current.max(score))
+                        .or_insert(score);
+                }
             }
         }
-        let mut scored: Vec<(RowId, f32)> = candidates
-            .into_iter()
-            .filter_map(|idx| {
-                let (rid, sig) = &self.sigs[idx as usize];
-                if !allowed(*rid) {
-                    return None;
-                }
-                let matches = sig.iter().zip(&qsig).filter(|(a, b)| a == b).count();
-                Some((*rid, matches as f32 / self.permutations as f32))
-            })
-            .collect();
+        let mut scored: Vec<_> = scored.into_iter().collect();
         scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         scored.truncate(k);
         scored
@@ -228,44 +261,57 @@ impl MinHashIndex {
         else {
             return Ok(Vec::new());
         };
-        let mut candidates: HashSet<u32> = HashSet::new();
-        for b in 0..self.bands {
-            if let Some(context) = context {
-                context.consume(1)?;
-            }
-            if let Some(indices) =
-                self.buckets
-                    .get(&band_key(b, &qsig, self.permutations / self.bands))
-            {
-                for &index in indices {
-                    if let Some(context) = context {
-                        context.consume(1)?;
+        let mut scored = HashMap::<RowId, f32>::new();
+        for segment in self.layers() {
+            let mut candidates = HashSet::new();
+            let mut candidate_rows = HashSet::new();
+            for band in 0..self.bands {
+                if let Some(context) = context {
+                    context.consume(1)?;
+                }
+                if let Some(indices) =
+                    segment
+                        .buckets
+                        .get(&band_key(band, &qsig, self.permutations / self.bands))
+                {
+                    for &index in indices {
+                        if let Some(context) = context {
+                            context.consume(1)?;
+                        }
+                        let row_id = segment.sigs[index as usize].0;
+                        if !scored.contains_key(&row_id)
+                            && !candidate_rows.contains(&row_id)
+                            && scored.len() + candidate_rows.len()
+                                >= crate::query::MAX_RAW_INDEX_CANDIDATES
+                        {
+                            return Err(crate::MongrelError::WorkBudgetExceeded);
+                        }
+                        candidates.insert(index);
+                        candidate_rows.insert(row_id);
                     }
-                    if !candidates.contains(&index)
-                        && candidates.len() >= crate::query::MAX_RAW_INDEX_CANDIDATES
-                    {
-                        return Err(crate::MongrelError::WorkBudgetExceeded);
-                    }
-                    candidates.insert(index);
                 }
             }
-        }
-        let mut scored = Vec::with_capacity(candidates.len().min(k));
-        for index in candidates {
-            if let Some(context) = context {
-                context.consume(crate::query::work_units(
-                    self.permutations,
-                    crate::query::VECTOR_WORK_QUANTUM,
-                ))?;
+            for index in candidates {
+                if let Some(context) = context {
+                    context.consume(crate::query::work_units(
+                        self.permutations,
+                        crate::query::VECTOR_WORK_QUANTUM,
+                    ))?;
+                }
+                let (row_id, signature) = &segment.sigs[index as usize];
+                let matches = signature
+                    .iter()
+                    .zip(&qsig)
+                    .filter(|(left, right)| left == right)
+                    .count();
+                let score = matches as f32 / self.permutations as f32;
+                scored
+                    .entry(*row_id)
+                    .and_modify(|current| *current = current.max(score))
+                    .or_insert(score);
             }
-            let (row_id, signature) = &self.sigs[index as usize];
-            let matches = signature
-                .iter()
-                .zip(&qsig)
-                .filter(|(left, right)| left == right)
-                .count();
-            scored.push((*row_id, matches as f32 / self.permutations as f32));
         }
+        let mut scored: Vec<_> = scored.into_iter().collect();
         let order = |left: &(RowId, f32), right: &(RowId, f32)| {
             right
                 .1
@@ -285,19 +331,16 @@ impl MinHashIndex {
             return Vec::new();
         };
         let mut candidates = HashSet::new();
-        for band in 0..self.bands {
-            if let Some(indices) =
-                self.buckets
-                    .get(&band_key(band, &signature, self.permutations / self.bands))
-            {
-                candidates.extend(indices.iter().map(|index| self.sigs[*index as usize].0));
+        for segment in self.layers() {
+            for index in segment.candidates(&signature, self.permutations, self.bands) {
+                candidates.insert(segment.sigs[index as usize].0);
             }
         }
         candidates.into_iter().collect()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.sigs.is_empty()
+        self.active.sigs.is_empty() && self.frozen.is_empty()
     }
 
     pub fn options(&self) -> (usize, usize) {
@@ -306,7 +349,9 @@ impl MinHashIndex {
 
     /// Snapshot the signatures for checkpointing (buckets are derived).
     pub fn entries(&self) -> Vec<(RowId, Vec<u32>)> {
-        self.sigs.clone()
+        self.layers()
+            .flat_map(|segment| segment.sigs.iter().cloned())
+            .collect()
     }
 
     /// Rebuild from a snapshot produced by [`MinHashIndex::entries`].
@@ -319,21 +364,9 @@ impl MinHashIndex {
         permutations: usize,
         bands: usize,
     ) -> Self {
-        let mut idx = Self {
-            permutations,
-            bands,
-            sigs: Vec::with_capacity(entries.len()),
-            buckets: HashMap::new(),
-        };
+        let mut idx = Self::with_options(permutations, bands);
         for (rid, sig) in entries {
-            let i = idx.sigs.len() as u32;
-            for b in 0..bands {
-                idx.buckets
-                    .entry(band_key(b, &sig, permutations / bands))
-                    .or_default()
-                    .push(i);
-            }
-            idx.sigs.push((rid, sig));
+            idx.active.insert(rid, sig, permutations, bands);
         }
         idx
     }
@@ -348,6 +381,37 @@ impl MinHashIndex {
 
     pub fn from_snapshot(snapshot: MinHashSnapshot) -> Self {
         Self::from_entries_with_options(snapshot.entries, snapshot.permutations, snapshot.bands)
+    }
+
+    fn layers(&self) -> impl Iterator<Item = &MinHashSegment> {
+        self.frozen
+            .iter()
+            .map(Arc::as_ref)
+            .chain(std::iter::once(&self.active))
+    }
+
+    pub(crate) fn seal(&mut self) {
+        if self.active.sigs.is_empty() {
+            return;
+        }
+        let active = std::mem::replace(&mut self.active, MinHashSegment::new());
+        Arc::make_mut(&mut self.frozen).push(Arc::new(active));
+        if self.frozen.len() >= crate::MAX_READ_GENERATION_LAYERS {
+            self.consolidate();
+        }
+    }
+
+    fn consolidate(&mut self) {
+        let mut segment = MinHashSegment::new();
+        for (row_id, signature) in self.entries() {
+            segment.insert(row_id, signature, self.permutations, self.bands);
+        }
+        self.frozen = Arc::new(vec![Arc::new(segment)]);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn frozen_layer_count(&self) -> usize {
+        self.frozen.len()
     }
 }
 
@@ -406,6 +470,21 @@ mod tests {
         assert_eq!(restored.options(), (64, 16));
         assert_eq!(restored.search(&query, 1)[0].0, RowId(7));
         assert_eq!(restored.search(&query, 1)[0].1, 1.0);
+    }
+
+    #[test]
+    fn sealed_generations_merge_signatures_and_consolidate() {
+        let mut writer = MinHashIndex::with_options(64, 16);
+        let query = set(&["a", "b", "c"]);
+        for id in 0..crate::MAX_READ_GENERATION_LAYERS as u64 + 2 {
+            writer.insert(&query, RowId(id));
+            writer.seal();
+        }
+        assert!(writer.frozen_layer_count() < crate::MAX_READ_GENERATION_LAYERS);
+        let generation = writer.clone();
+        writer.insert(&query, RowId(99));
+        assert!(!generation.candidate_row_ids(&query).contains(&RowId(99)));
+        assert!(writer.candidate_row_ids(&query).contains(&RowId(99)));
     }
 
     #[test]

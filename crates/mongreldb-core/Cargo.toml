@@ -53,6 +53,10 @@ name = "write_path"
 harness = false
 
 [[bench]]
+name = "read_generation"
+harness = false
+
+[[bench]]
 name = "trips"
 harness = false
 

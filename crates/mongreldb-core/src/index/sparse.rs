@@ -13,17 +13,22 @@
 use crate::rowid::RowId;
 use crate::Result;
 use std::collections::HashMap;
+use std::sync::Arc;
+
+type Postings = HashMap<u32, Vec<(RowId, f32)>>;
 
 /// Inverted index over weighted sparse vectors, keyed by token id.
 #[derive(Clone)]
 pub struct SparseIndex {
-    postings: HashMap<u32, Vec<(RowId, f32)>>,
+    frozen: Arc<Vec<Arc<Postings>>>,
+    active: Postings,
 }
 
 impl SparseIndex {
     pub fn new() -> Self {
         Self {
-            postings: HashMap::new(),
+            frozen: Arc::new(Vec::new()),
+            active: HashMap::new(),
         }
     }
 
@@ -31,10 +36,7 @@ impl SparseIndex {
     /// tokens within one doc accumulate).
     pub fn insert(&mut self, terms: &[(u32, f32)], row_id: RowId) {
         for &(token, weight) in terms {
-            self.postings
-                .entry(token)
-                .or_default()
-                .push((row_id, weight));
+            self.active.entry(token).or_default().push((row_id, weight));
         }
     }
 
@@ -51,11 +53,13 @@ impl SparseIndex {
     ) -> Vec<(RowId, f64)> {
         let mut scores: HashMap<u64, f64> = HashMap::new();
         for &(token, q_weight) in query {
-            if let Some(list) = self.postings.get(&token) {
-                for &(rid, d_weight) in list {
-                    if allowed(rid) {
-                        *scores.entry(rid.0).or_insert(0.0) +=
-                            f64::from(q_weight) * f64::from(d_weight);
+            for postings in self.layers() {
+                if let Some(list) = postings.get(&token) {
+                    for &(rid, d_weight) in list {
+                        if allowed(rid) {
+                            *scores.entry(rid.0).or_insert(0.0) +=
+                                f64::from(q_weight) * f64::from(d_weight);
+                        }
                     }
                 }
             }
@@ -80,19 +84,21 @@ impl SparseIndex {
             if let Some(context) = context {
                 context.checkpoint()?;
             }
-            if let Some(list) = self.postings.get(&token) {
-                for chunk in list.chunks(256) {
-                    if let Some(context) = context {
-                        context.consume(chunk.len())?;
-                    }
-                    for &(rid, d_weight) in chunk {
-                        if !scores.contains_key(&rid.0)
-                            && scores.len() >= crate::query::MAX_RAW_INDEX_CANDIDATES
-                        {
-                            return Err(crate::MongrelError::WorkBudgetExceeded);
+            for postings in self.layers() {
+                if let Some(list) = postings.get(&token) {
+                    for chunk in list.chunks(256) {
+                        if let Some(context) = context {
+                            context.consume(chunk.len())?;
                         }
-                        *scores.entry(rid.0).or_insert(0.0) +=
-                            f64::from(q_weight) * f64::from(d_weight);
+                        for &(rid, d_weight) in chunk {
+                            if !scores.contains_key(&rid.0)
+                                && scores.len() >= crate::query::MAX_RAW_INDEX_CANDIDATES
+                            {
+                                return Err(crate::MongrelError::WorkBudgetExceeded);
+                            }
+                            *scores.entry(rid.0).or_insert(0.0) +=
+                                f64::from(q_weight) * f64::from(d_weight);
+                        }
                     }
                 }
             }
@@ -121,32 +127,71 @@ impl SparseIndex {
     pub fn candidate_row_ids(&self, query: &[(u32, f32)]) -> Vec<RowId> {
         let mut row_ids = std::collections::HashSet::new();
         for (token, _) in query {
-            if let Some(postings) = self.postings.get(token) {
-                row_ids.extend(postings.iter().map(|(row_id, _)| *row_id));
+            for postings in self.layers() {
+                if let Some(list) = postings.get(token) {
+                    row_ids.extend(list.iter().map(|(row_id, _)| *row_id));
+                }
             }
         }
         row_ids.into_iter().collect()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.postings.is_empty()
+        self.active.is_empty() && self.frozen.is_empty()
     }
 
     /// Snapshot the inverted lists for checkpointing to `_idx/global.idx`.
     pub fn entries(&self) -> Vec<(u32, Vec<(RowId, f32)>)> {
-        self.postings
-            .iter()
-            .map(|(t, list)| (*t, list.clone()))
-            .collect()
+        let mut entries = HashMap::<u32, Vec<(RowId, f32)>>::new();
+        for postings in self.layers() {
+            for (token, list) in postings {
+                entries.entry(*token).or_default().extend(list);
+            }
+        }
+        entries.into_iter().collect()
     }
 
     /// Rebuild from a snapshot produced by [`SparseIndex::entries`].
     pub fn from_entries(entries: Vec<(u32, Vec<(RowId, f32)>)>) -> Self {
-        let mut postings = HashMap::new();
+        let mut active = HashMap::new();
         for (t, list) in entries {
-            postings.insert(t, list);
+            active.insert(t, list);
         }
-        Self { postings }
+        Self {
+            frozen: Arc::new(Vec::new()),
+            active,
+        }
+    }
+
+    fn layers(&self) -> impl Iterator<Item = &Postings> {
+        self.frozen
+            .iter()
+            .map(Arc::as_ref)
+            .chain(std::iter::once(&self.active))
+    }
+
+    pub(crate) fn seal(&mut self) {
+        if self.active.is_empty() {
+            return;
+        }
+        Arc::make_mut(&mut self.frozen).push(Arc::new(std::mem::take(&mut self.active)));
+        if self.frozen.len() >= crate::MAX_READ_GENERATION_LAYERS {
+            self.consolidate();
+        }
+    }
+
+    fn consolidate(&mut self) {
+        let entries = self.entries();
+        let mut postings = HashMap::new();
+        for (token, list) in entries {
+            postings.insert(token, list);
+        }
+        self.frozen = Arc::new(vec![Arc::new(postings)]);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn frozen_layer_count(&self) -> usize {
+        self.frozen.len()
     }
 }
 
@@ -185,5 +230,21 @@ mod tests {
             idx.search_with_context(&[(1, 1.0)], 1, Some(&context)),
             Err(crate::MongrelError::WorkBudgetExceeded)
         ));
+    }
+
+    #[test]
+    fn sealed_generations_merge_postings_and_consolidate() {
+        let mut writer = SparseIndex::new();
+        for id in 0..crate::MAX_READ_GENERATION_LAYERS as u64 + 2 {
+            writer.insert(&[(1, 1.0)], RowId(id));
+            writer.seal();
+        }
+        assert!(writer.frozen_layer_count() < crate::MAX_READ_GENERATION_LAYERS);
+        let generation = writer.clone();
+        writer.insert(&[(1, 10.0)], RowId(99));
+        assert!(!generation
+            .candidate_row_ids(&[(1, 1.0)])
+            .contains(&RowId(99)));
+        assert!(writer.candidate_row_ids(&[(1, 1.0)]).contains(&RowId(99)));
     }
 }

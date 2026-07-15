@@ -111,7 +111,7 @@ impl MutableRun {
                     break;
                 }
                 if *epoch <= snapshot_epoch
-                    && best.as_ref().is_none_or(|(current, _)| *epoch > *current)
+                    && best.as_ref().map_or(true, |(current, _)| *epoch > *current)
                 {
                     best = Some((*epoch, row.clone()));
                 }
@@ -134,7 +134,7 @@ impl MutableRun {
                 if *epoch <= snapshot_epoch
                     && by_row
                         .get(rid)
-                        .is_none_or(|current| *epoch > current.committed_epoch)
+                        .map_or(true, |current| *epoch > current.committed_epoch)
                 {
                     by_row.insert(*rid, row.clone());
                 }
@@ -155,8 +155,31 @@ impl MutableRun {
             },
         );
         Arc::make_mut(&mut self.frozen).push(Arc::new(active));
+        if self.frozen.len() >= crate::MAX_READ_GENERATION_LAYERS {
+            self.consolidate();
+        }
     }
 
+    fn consolidate(&mut self) {
+        let mut rows = self
+            .frozen
+            .iter()
+            .flat_map(|segment| segment.pma.iter().map(|(_, row)| row.clone()))
+            .collect::<Vec<_>>();
+        rows.sort_by_key(|row| (row.row_id, row.committed_epoch));
+        let mut pma = Pma::new();
+        pma.extend_sorted(
+            rows.into_iter()
+                .map(|row| ((row.row_id, row.committed_epoch), row))
+                .collect(),
+        );
+        self.frozen = Arc::new(vec![Arc::new(MutableRunSegment {
+            pma,
+            byte_size: self.byte_size,
+        })]);
+    }
+
+    #[cfg(test)]
     pub(crate) fn frozen_layer_count(&self) -> usize {
         self.frozen.len()
     }
@@ -229,6 +252,20 @@ mod tests {
         // Before the tombstone the live version is visible.
         let v0 = mr.get_version(RowId(1), Epoch(1)).unwrap().1;
         assert!(!v0.deleted);
+    }
+
+    #[test]
+    fn sealed_generations_share_rows_and_consolidate() {
+        let mut writer = MutableRun::new();
+        for id in 0..crate::MAX_READ_GENERATION_LAYERS as u64 + 2 {
+            writer.insert_many(vec![row(id, id + 1, id as i64)]);
+            writer.seal();
+        }
+        assert!(writer.frozen_layer_count() < crate::MAX_READ_GENERATION_LAYERS);
+        let generation = writer.clone();
+        writer.insert_many(vec![row(99, 99, 99)]);
+        assert!(generation.get_version(RowId(99), Epoch(99)).is_none());
+        assert!(writer.get_version(RowId(99), Epoch(99)).is_some());
     }
 
     #[test]

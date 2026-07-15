@@ -5,14 +5,17 @@
 
 use crate::rowid::RowId;
 use roaring::RoaringBitmap;
+use std::collections::HashMap;
 use std::sync::Arc;
+
+type BitmapLayer = HashMap<Vec<u8>, RoaringBitmap>;
 
 /// `value → row-id set`. Values are type-aware encoded bytes (lexicographically
 /// comparable), matching the encoding used for page min/max.
 #[derive(Clone)]
 pub struct BitmapIndex {
-    frozen: Arc<Vec<Arc<std::collections::HashMap<Vec<u8>, RoaringBitmap>>>>,
-    active: std::collections::HashMap<Vec<u8>, RoaringBitmap>,
+    frozen: Arc<Vec<Arc<BitmapLayer>>>,
+    active: BitmapLayer,
 }
 
 impl Default for BitmapIndex {
@@ -25,7 +28,7 @@ impl BitmapIndex {
     pub fn new() -> Self {
         Self {
             frozen: Arc::new(Vec::new()),
-            active: std::collections::HashMap::new(),
+            active: HashMap::new(),
         }
     }
 
@@ -96,7 +99,7 @@ impl BitmapIndex {
     pub fn from_entries(
         entries: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> std::result::Result<Self, &'static str> {
-        let mut active = std::collections::HashMap::new();
+        let mut active = HashMap::new();
         for (k, bytes) in entries {
             let bm = RoaringBitmap::deserialize_from(&bytes[..]).map_err(|_| "bad bitmap bytes")?;
             active.insert(k, bm);
@@ -113,8 +116,22 @@ impl BitmapIndex {
         }
         let active = std::mem::take(&mut self.active);
         Arc::make_mut(&mut self.frozen).push(Arc::new(active));
+        if self.frozen.len() >= crate::MAX_READ_GENERATION_LAYERS {
+            self.consolidate();
+        }
     }
 
+    fn consolidate(&mut self) {
+        let mut merged = HashMap::<Vec<u8>, RoaringBitmap>::new();
+        for layer in self.frozen.iter() {
+            for (key, rows) in layer.iter() {
+                *merged.entry(key.clone()).or_default() |= rows;
+            }
+        }
+        self.frozen = Arc::new(vec![Arc::new(merged)]);
+    }
+
+    #[cfg(test)]
     pub(crate) fn frozen_layer_count(&self) -> usize {
         self.frozen.len()
     }
@@ -141,5 +158,19 @@ mod tests {
         let both = BitmapIndex::intersect(&[red, us]);
         let ids: Vec<u32> = both.iter().collect();
         assert_eq!(ids, vec![1, 3]);
+    }
+
+    #[test]
+    fn sealed_generations_share_bitmaps_and_consolidate() {
+        let mut writer = BitmapIndex::new();
+        for id in 0..crate::MAX_READ_GENERATION_LAYERS as u64 + 2 {
+            writer.insert(b"all".to_vec(), RowId(id));
+            writer.seal();
+        }
+        assert!(writer.frozen_layer_count() < crate::MAX_READ_GENERATION_LAYERS);
+        let generation = writer.clone();
+        writer.insert(b"new".to_vec(), RowId(99));
+        assert!(generation.get(b"new").is_empty());
+        assert!(writer.get(b"new").contains(99));
     }
 }

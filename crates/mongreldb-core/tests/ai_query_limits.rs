@@ -5,7 +5,7 @@ use mongreldb_core::query::{
     MAX_SPARSE_TERMS,
 };
 use mongreldb_core::schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
-use mongreldb_core::{Database, MongrelError, Table, Value};
+use mongreldb_core::{Database, Epoch, MongrelError, Snapshot, Table, TableHandle, Value};
 
 fn table() -> (tempfile::TempDir, Table) {
     let dir = tempfile::tempdir().unwrap();
@@ -783,4 +783,98 @@ fn scored_read_generation_pins_run_files_across_compaction_gc() {
         )
         .unwrap();
     assert_eq!(hits.len(), 2);
+}
+
+#[test]
+fn read_generations_are_immutable_shared_and_cow_free() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = Database::create(dir.path()).unwrap();
+    database
+        .create_table(
+            "docs",
+            Schema {
+                columns: vec![ColumnDef {
+                    id: 1,
+                    name: "id".into(),
+                    ty: TypeId::Int64,
+                    flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                    default_value: None,
+                }],
+                ..Schema::default()
+            },
+        )
+        .unwrap();
+    let handle = database.table("docs").unwrap();
+    let (first, _) = handle.read_generation_with_context(None).unwrap();
+    let (second, _) = handle.read_generation_with_context(None).unwrap();
+    assert_eq!(handle.generation_stats().active_read_generations, 2);
+
+    {
+        let mut writer = handle.lock();
+        writer.put(vec![(1, Value::Int64(1))]).unwrap();
+        writer.commit().unwrap();
+        assert_eq!(writer.count(), 1);
+    }
+
+    assert_eq!(first.count(), 0);
+    assert_eq!(second.count(), 0);
+    let stats = handle.generation_stats();
+    assert_eq!(stats.cow_clone_count, 0);
+    assert_eq!(stats.estimated_cow_clone_bytes, 0);
+    assert_eq!(stats.max_live_read_generations, 2);
+    drop((first, second));
+    assert_eq!(handle.generation_stats().active_read_generations, 0);
+}
+
+#[test]
+fn active_generation_keeps_ann_sparse_and_minhash_deltas_private() {
+    let (_dir, table) = table();
+    let handle = TableHandle::from_table(table);
+    let (generation, _) = handle.read_generation_with_context(None).unwrap();
+    {
+        let mut writer = handle.lock();
+        writer
+            .put(vec![
+                (1, Value::Int64(2)),
+                (2, Value::Embedding(vec![1.0; 8])),
+                (
+                    3,
+                    Value::Bytes(bincode::serialize(&vec![(1u32, f32::MAX)]).unwrap()),
+                ),
+                (4, Value::Bytes(serde_json::to_vec(&vec!["a"]).unwrap())),
+            ])
+            .unwrap();
+        writer.commit().unwrap();
+    }
+
+    let retrievers = [
+        ann(10),
+        Retriever::Sparse {
+            column_id: 3,
+            query: vec![(1, 1.0)],
+            k: 10,
+        },
+        Retriever::MinHash {
+            column_id: 4,
+            members: vec![SetMember::String("a".into())],
+            k: 10,
+        },
+    ];
+    for retriever in retrievers {
+        let old = generation
+            .retrieve_at_with_candidate_authorization_on_generation(
+                &retriever,
+                Snapshot::at(Epoch(u64::MAX)),
+                None,
+                None,
+            )
+            .unwrap();
+        let current = handle
+            .lock()
+            .retrieve_with_allowed(&retriever, None)
+            .unwrap();
+        assert_eq!(old.len(), 1);
+        assert_eq!(current.len(), 2);
+    }
+    assert_eq!(handle.generation_stats().cow_clone_count, 0);
 }

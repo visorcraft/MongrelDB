@@ -136,6 +136,111 @@ pub enum IndexBuildPolicy {
     Eager,
 }
 
+#[derive(Clone)]
+struct ReversePkSegment {
+    values: HashMap<RowId, Vec<u8>>,
+    removed: HashSet<RowId>,
+}
+
+#[derive(Clone)]
+struct ReversePkMap {
+    frozen: Arc<Vec<Arc<ReversePkSegment>>>,
+    active: ReversePkSegment,
+}
+
+impl ReversePkMap {
+    fn new() -> Self {
+        Self {
+            frozen: Arc::new(Vec::new()),
+            active: ReversePkSegment {
+                values: HashMap::new(),
+                removed: HashSet::new(),
+            },
+        }
+    }
+
+    fn from_entries(entries: impl IntoIterator<Item = (RowId, Vec<u8>)>) -> Self {
+        let mut map = Self::new();
+        map.active.values.extend(entries);
+        map
+    }
+
+    fn insert(&mut self, row_id: RowId, key: Vec<u8>) {
+        self.active.removed.remove(&row_id);
+        self.active.values.insert(row_id, key);
+    }
+
+    fn get(&self, row_id: &RowId) -> Option<&Vec<u8>> {
+        if let Some(key) = self.active.values.get(row_id) {
+            return Some(key);
+        }
+        if self.active.removed.contains(row_id) {
+            return None;
+        }
+        for segment in self.frozen.iter().rev() {
+            if let Some(key) = segment.values.get(row_id) {
+                return Some(key);
+            }
+            if segment.removed.contains(row_id) {
+                return None;
+            }
+        }
+        None
+    }
+
+    fn remove(&mut self, row_id: &RowId) -> Option<Vec<u8>> {
+        let previous = self.get(row_id).cloned();
+        self.active.values.remove(row_id);
+        self.active.removed.insert(*row_id);
+        previous
+    }
+
+    fn clear(&mut self) {
+        *self = Self::new();
+    }
+
+    fn entries(&self) -> HashMap<RowId, Vec<u8>> {
+        let mut entries = HashMap::new();
+        for segment in self
+            .frozen
+            .iter()
+            .map(Arc::as_ref)
+            .chain(std::iter::once(&self.active))
+        {
+            for row_id in &segment.removed {
+                entries.remove(row_id);
+            }
+            entries.extend(
+                segment
+                    .values
+                    .iter()
+                    .map(|(row_id, key)| (*row_id, key.clone())),
+            );
+        }
+        entries
+    }
+
+    fn seal(&mut self) {
+        if self.active.values.is_empty() && self.active.removed.is_empty() {
+            return;
+        }
+        let active = std::mem::replace(
+            &mut self.active,
+            ReversePkSegment {
+                values: HashMap::new(),
+                removed: HashSet::new(),
+            },
+        );
+        Arc::make_mut(&mut self.frozen).push(Arc::new(active));
+        if self.frozen.len() >= crate::MAX_READ_GENERATION_LAYERS {
+            self.frozen = Arc::new(vec![Arc::new(ReversePkSegment {
+                values: self.entries(),
+                removed: HashSet::new(),
+            })]);
+        }
+    }
+}
+
 /// An open MongrelDB table.
 #[derive(Clone)]
 pub struct Table {
@@ -200,9 +305,9 @@ pub struct Table {
     minhash: HashMap<u16, MinHashIndex>,
     /// Per-column learned (PGM) range indexes for `IndexKind::LearnedRange`
     /// columns, built from the single sorted run.
-    learned_range: HashMap<u16, ColumnLearnedRange>,
+    learned_range: Arc<HashMap<u16, ColumnLearnedRange>>,
     /// Reverse primary-key map for HOT cleanup on row-id deletes.
-    pk_by_row: HashMap<RowId, Vec<u8>>,
+    pk_by_row: ReversePkMap,
     /// Refcounted pinned read snapshots (epoch → count); compaction must not GC
     /// versions an active snapshot still needs.
     pinned: BTreeMap<Epoch, usize>,
@@ -227,7 +332,7 @@ pub struct Table {
     /// Incremental aggregate cache (Phase 8.3): caller-supplied key → the
     /// mergeable aggregate state, the row-id watermark it covers, and the
     /// epoch. A re-query after more inserts processes only the delta and merges.
-    agg_cache: HashMap<u64, CachedAgg>,
+    agg_cache: Arc<HashMap<u64, CachedAgg>>,
     /// The manifest epoch the on-disk `_idx/global.idx` checkpoint covers (0 if
     /// there is no checkpoint). Updated by [`Table::checkpoint_indexes`]; persisted
     /// in the manifest so reopen loads the checkpoint instead of rebuilding.
@@ -1111,14 +1216,14 @@ impl Table {
             fm,
             sparse,
             minhash,
-            learned_range: HashMap::new(),
-            pk_by_row: HashMap::new(),
+            learned_range: Arc::new(HashMap::new()),
+            pk_by_row: ReversePkMap::new(),
             pinned: BTreeMap::new(),
             live_count: 0,
             reservoir: crate::reservoir::Reservoir::default(),
             reservoir_complete: true,
             had_deletes: false,
-            agg_cache: HashMap::new(),
+            agg_cache: Arc::new(HashMap::new()),
             global_idx_epoch: 0,
             indexes_complete: true,
             index_build_policy: IndexBuildPolicy::default(),
@@ -1343,8 +1448,8 @@ impl Table {
             fm: HashMap::new(),
             sparse: HashMap::new(),
             minhash: HashMap::new(),
-            learned_range: HashMap::new(),
-            pk_by_row: HashMap::new(),
+            learned_range: Arc::new(HashMap::new()),
+            pk_by_row: ReversePkMap::new(),
             pinned: BTreeMap::new(),
             live_count: manifest.live_count,
             reservoir: crate::reservoir::Reservoir::default(),
@@ -1352,7 +1457,7 @@ impl Table {
             had_deletes: saw_delete
                 || manifest.runs.iter().map(|run| run.row_count).sum::<u64>()
                     != manifest.live_count,
-            agg_cache: HashMap::new(),
+            agg_cache: Arc::new(HashMap::new()),
             global_idx_epoch: manifest.global_idx_epoch,
             indexes_complete: true,
             index_build_policy: IndexBuildPolicy::default(),
@@ -1404,7 +1509,7 @@ impl Table {
                 db.fm = loaded.fm;
                 db.sparse = loaded.sparse;
                 db.minhash = loaded.minhash;
-                db.learned_range = loaded.learned_range;
+                db.learned_range = Arc::new(loaded.learned_range);
                 // `pk_by_row` stays lazy (`pk_by_row_complete == false`): the
                 // first delete rebuilds it from the loaded HOT.
             }
@@ -1552,12 +1657,12 @@ impl Table {
         // through a one-at-a-time `insert()` loop — same fix as
         // `HotIndex::from_entries`, same hot path (first delete after a put
         // streak rebuilds this from the full HOT index).
-        self.pk_by_row = self
-            .hot
-            .entries()
-            .into_iter()
-            .map(|(key, row_id)| (row_id, key))
-            .collect();
+        self.pk_by_row = ReversePkMap::from_entries(
+            self.hot
+                .entries()
+                .into_iter()
+                .map(|(key, row_id)| (row_id, key)),
+        );
     }
 
     fn insert_hot_pk(&mut self, key: Vec<u8>, row_id: RowId) {
@@ -1571,7 +1676,7 @@ impl Table {
     /// columns from the single sorted run. Serves `Condition::Range` sub-linearly
     /// on the fast path; no-op when there isn't exactly one run.
     pub(crate) fn build_learned_ranges(&mut self) -> Result<()> {
-        self.learned_range.clear();
+        self.learned_range = Arc::new(HashMap::new());
         if self.run_refs.len() != 1 {
             return Ok(());
         }
@@ -1615,7 +1720,7 @@ impl Table {
                             .zip(row_ids.iter())
                             .map(|(v, r)| (*v, *r))
                             .collect();
-                        self.learned_range.insert(
+                        Arc::make_mut(&mut self.learned_range).insert(
                             cid,
                             ColumnLearnedRange::build_i64_with_epsilon(&pairs, epsilon),
                         );
@@ -1630,7 +1735,7 @@ impl Table {
                             .zip(row_ids.iter())
                             .map(|(v, r)| (*v, *r))
                             .collect();
-                        self.learned_range.insert(
+                        Arc::make_mut(&mut self.learned_range).insert(
                             cid,
                             ColumnLearnedRange::build_f64_with_epsilon(&pairs, epsilon),
                         );
@@ -2631,14 +2736,14 @@ impl Table {
         self.fm = fm;
         self.sparse = sparse;
         self.minhash = minhash;
-        self.learned_range.clear();
+        self.learned_range = Arc::new(HashMap::new());
         self.pk_by_row.clear();
         self.pk_by_row_complete = false;
         self.live_count = 0;
         self.reservoir = crate::reservoir::Reservoir::default();
         self.reservoir_complete = true;
         self.had_deletes = true;
-        self.agg_cache.clear();
+        self.agg_cache = Arc::new(HashMap::new());
         self.global_idx_epoch = 0;
         self.indexes_complete = true;
         self.pending_delete_rids.clear();
@@ -2680,7 +2785,7 @@ impl Table {
         // A delete makes the incremental aggregate cache (row-id watermark
         // delta) unsafe — permanently disable it for this table.
         self.had_deletes = true;
-        self.agg_cache.clear();
+        self.agg_cache = Arc::new(HashMap::new());
     }
 
     /// If `row_id` has a primary-key value and the HOT index currently maps
@@ -6239,17 +6344,45 @@ impl Table {
         self.table_id
     }
 
-    #[doc(hidden)]
-    pub fn clone_read_generation(&mut self) -> Result<Self> {
+    pub(crate) fn clone_read_generation(&mut self) -> Result<Self> {
         self.ensure_indexes_complete()?;
+        self.memtable.seal();
+        self.mutable_run.seal();
+        self.hot.seal();
+        for index in self.bitmap.values_mut() {
+            index.seal();
+        }
+        for index in self.ann.values_mut() {
+            index.seal();
+        }
+        for index in self.fm.values_mut() {
+            index.seal();
+        }
+        for index in self.sparse.values_mut() {
+            index.seal();
+        }
+        for index in self.minhash.values_mut() {
+            index.seal();
+        }
+        self.pk_by_row.seal();
         let mut generation = self.clone();
         generation.read_only = true;
         generation.wal = WalSink::ReadOnly;
+        generation.pending_delete_rids.clear();
+        generation.pending_put_cols.clear();
         generation.pending_rows.clear();
         generation.pending_rows_auto_inc.clear();
         generation.pending_dels.clear();
         generation.pending_truncate = None;
+        generation.agg_cache = Arc::new(HashMap::new());
         Ok(generation)
+    }
+
+    pub(crate) fn estimated_clone_bytes(&self) -> u64 {
+        (std::mem::size_of::<Self>() as u64)
+            .saturating_add(self.memtable.approx_bytes())
+            .saturating_add(self.mutable_run.approx_bytes())
+            .saturating_add(self.live_count.saturating_mul(64))
     }
 
     /// Pin the current epoch as a read snapshot; compaction will preserve the
@@ -6354,7 +6487,7 @@ impl Table {
             }
         }
         self.ttl = policy;
-        self.agg_cache.clear();
+        self.agg_cache = Arc::new(HashMap::new());
         self.clear_result_cache();
         let _ = std::fs::remove_dir_all(self.dir.join("_shadow"));
         self.persist_manifest(epoch)
@@ -8182,7 +8315,7 @@ impl Table {
                     )?;
                     let merged = cached.state.merge(delta_state);
                     let delta_n = delta_rids.len() as u64;
-                    self.agg_cache.insert(
+                    Arc::make_mut(&mut self.agg_cache).insert(
                         cache_key,
                         CachedAgg {
                             state: merged.clone(),
@@ -8217,7 +8350,7 @@ impl Table {
         };
         // Seed only when the watermark is meaningful (no pending writes).
         if incremental_ok {
-            self.agg_cache.insert(
+            Arc::make_mut(&mut self.agg_cache).insert(
                 cache_key,
                 CachedAgg {
                     state: state.clone(),

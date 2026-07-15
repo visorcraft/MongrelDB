@@ -9,6 +9,7 @@
 
 use crate::rowid::RowId;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 const SA_SAMPLE_RATE: usize = 4;
 /// Bits per rank block — the within-block scan is `O(BITS/64) = O(1)` words, so
@@ -155,7 +156,7 @@ struct Built {
     n: usize,
 }
 
-pub struct FmIndex {
+struct FmSegment {
     docs: Vec<(Vec<u8>, RowId)>,
     /// `None` (dirty) when inserts have landed since the last build; rebuilt
     /// lazily by [`Self::ensure_built`]. The query methods take `&self`, so this
@@ -165,7 +166,7 @@ pub struct FmIndex {
     built: parking_lot::Mutex<Option<Built>>,
 }
 
-impl Clone for FmIndex {
+impl Clone for FmSegment {
     fn clone(&self) -> Self {
         Self {
             docs: self.docs.clone(),
@@ -174,13 +175,7 @@ impl Clone for FmIndex {
     }
 }
 
-impl Default for FmIndex {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl FmIndex {
+impl FmSegment {
     pub fn new() -> Self {
         Self {
             docs: Vec::new(),
@@ -360,18 +355,6 @@ impl FmIndex {
         }
     }
 
-    /// Count documents containing `pattern` as a substring.
-    pub fn count(&self, pattern: &[u8]) -> usize {
-        if pattern.is_empty() {
-            return self.docs.len();
-        }
-        let (lo, hi) = self.backward(pattern);
-        if lo >= hi {
-            return 0;
-        }
-        self.locate_range(lo, hi).len()
-    }
-
     /// Row ids of documents containing `pattern` (deduplicated).
     pub fn locate(&self, pattern: &[u8]) -> Vec<RowId> {
         if pattern.is_empty() {
@@ -382,6 +365,97 @@ impl FmIndex {
             return Vec::new();
         }
         self.locate_range(lo, hi)
+    }
+}
+
+/// Immutable FM generations plus one append-only write delta.
+#[derive(Clone)]
+pub struct FmIndex {
+    frozen: Arc<Vec<Arc<FmSegment>>>,
+    active: FmSegment,
+}
+
+impl Default for FmIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FmIndex {
+    pub fn new() -> Self {
+        Self {
+            frozen: Arc::new(Vec::new()),
+            active: FmSegment::new(),
+        }
+    }
+
+    pub fn insert(&mut self, text: Vec<u8>, row_id: RowId) {
+        self.active.insert(text, row_id);
+    }
+
+    pub fn doc_count(&self) -> usize {
+        self.active.doc_count()
+            + self
+                .frozen
+                .iter()
+                .map(|segment| segment.doc_count())
+                .sum::<usize>()
+    }
+
+    pub fn docs(&self) -> Vec<(Vec<u8>, RowId)> {
+        self.layers().flat_map(FmSegment::docs).collect()
+    }
+
+    pub fn from_docs(docs: Vec<(Vec<u8>, RowId)>) -> Self {
+        Self {
+            frozen: Arc::new(Vec::new()),
+            active: FmSegment::from_docs(docs),
+        }
+    }
+
+    pub fn flush_build(&self) {
+        for segment in self.layers() {
+            segment.flush_build();
+        }
+    }
+
+    pub fn count(&self, pattern: &[u8]) -> usize {
+        self.locate(pattern).len()
+    }
+
+    pub fn locate(&self, pattern: &[u8]) -> Vec<RowId> {
+        let mut seen = HashSet::new();
+        self.layers()
+            .flat_map(|segment| segment.locate(pattern))
+            .filter(|row_id| seen.insert(*row_id))
+            .collect()
+    }
+
+    fn layers(&self) -> impl Iterator<Item = &FmSegment> {
+        self.frozen
+            .iter()
+            .map(Arc::as_ref)
+            .chain(std::iter::once(&self.active))
+    }
+
+    pub(crate) fn seal(&mut self) {
+        if self.active.doc_count() == 0 {
+            return;
+        }
+        let active = std::mem::replace(&mut self.active, FmSegment::new());
+        Arc::make_mut(&mut self.frozen).push(Arc::new(active));
+        if self.frozen.len() >= crate::MAX_READ_GENERATION_LAYERS {
+            self.consolidate();
+        }
+    }
+
+    fn consolidate(&mut self) {
+        self.frozen = Arc::new(vec![Arc::new(FmSegment::from_docs(self.docs()))]);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn frozen_layer_count(&self) -> usize {
+        self.frozen.len()
     }
 }
 
@@ -405,6 +479,20 @@ mod tests {
         assert_eq!(idx.count(b"ox"), 3);
         assert_eq!(idx.count(b""), 4);
         assert_eq!(idx.count(b"missing"), 0);
+    }
+
+    #[test]
+    fn sealed_generations_merge_documents_and_consolidate() {
+        let mut writer = FmIndex::new();
+        for id in 0..crate::MAX_READ_GENERATION_LAYERS as u64 + 2 {
+            writer.insert(format!("doc {id}").into_bytes(), RowId(id));
+            writer.seal();
+        }
+        assert!(writer.frozen_layer_count() < crate::MAX_READ_GENERATION_LAYERS);
+        let generation = writer.clone();
+        writer.insert(b"new needle".to_vec(), RowId(99));
+        assert!(generation.locate(b"needle").is_empty());
+        assert_eq!(writer.locate(b"needle"), vec![RowId(99)]);
     }
 
     #[test]

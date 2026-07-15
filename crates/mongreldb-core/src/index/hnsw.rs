@@ -69,6 +69,17 @@ impl Hnsw {
         self.vectors.is_empty()
     }
 
+    pub(crate) fn options(&self) -> (usize, usize) {
+        (self.m, self.ef_construction)
+    }
+
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (Vec<u8>, RowId)> + '_ {
+        self.vectors
+            .iter()
+            .cloned()
+            .zip(self.row_ids.iter().copied())
+    }
+
     fn next_uniform(&mut self) -> f64 {
         self.rng_state = self.rng_state.wrapping_add(0x6D2B_79F5);
         let mut z = self.rng_state;

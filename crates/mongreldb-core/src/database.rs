@@ -452,10 +452,78 @@ impl RlsCache {
     }
 }
 
-/// Copy-on-write mounted table. Scored reads clone the current `Arc<Table>`;
-/// writers replace it only while a read generation is alive.
+/// Mounted table with immutable, structurally shared scored-read generations.
 #[derive(Clone)]
-pub struct TableHandle(TableHandleInner);
+pub struct TableHandle {
+    inner: TableHandleInner,
+    generation_metrics: Arc<TableGenerationMetrics>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TableGenerationStats {
+    pub active_read_generations: usize,
+    pub max_live_read_generations: usize,
+    pub cow_clone_count: u64,
+    pub cow_clone_nanos: u64,
+    pub estimated_cow_clone_bytes: u64,
+    pub writer_wait_nanos: u64,
+}
+
+#[derive(Default)]
+#[doc(hidden)]
+pub struct TableGenerationMetrics {
+    active_read_generations: AtomicUsize,
+    max_live_read_generations: AtomicUsize,
+    cow_clone_count: AtomicU64,
+    cow_clone_nanos: AtomicU64,
+    estimated_cow_clone_bytes: AtomicU64,
+    writer_wait_nanos: AtomicU64,
+}
+
+impl TableGenerationMetrics {
+    fn activate(self: &Arc<Self>, table: Table) -> Arc<TableReadGeneration> {
+        let active = self.active_read_generations.fetch_add(1, Ordering::Relaxed) + 1;
+        self.max_live_read_generations
+            .fetch_max(active, Ordering::Relaxed);
+        Arc::new(TableReadGeneration {
+            table,
+            metrics: Arc::clone(self),
+        })
+    }
+
+    fn stats(&self) -> TableGenerationStats {
+        TableGenerationStats {
+            active_read_generations: self.active_read_generations.load(Ordering::Relaxed),
+            max_live_read_generations: self.max_live_read_generations.load(Ordering::Relaxed),
+            cow_clone_count: self.cow_clone_count.load(Ordering::Relaxed),
+            cow_clone_nanos: self.cow_clone_nanos.load(Ordering::Relaxed),
+            estimated_cow_clone_bytes: self.estimated_cow_clone_bytes.load(Ordering::Relaxed),
+            writer_wait_nanos: self.writer_wait_nanos.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Immutable, structurally shared snapshot used by scored readers.
+pub struct TableReadGeneration {
+    table: Table,
+    metrics: Arc<TableGenerationMetrics>,
+}
+
+impl std::ops::Deref for TableReadGeneration {
+    type Target = Table;
+
+    fn deref(&self) -> &Self::Target {
+        &self.table
+    }
+}
+
+impl Drop for TableReadGeneration {
+    fn drop(&mut self) {
+        self.metrics
+            .active_read_generations
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 #[derive(Clone)]
 enum TableHandleInner {
@@ -464,20 +532,21 @@ enum TableHandleInner {
 }
 
 pub enum TableGuard<'a> {
-    CopyOnWrite(parking_lot::RwLockWriteGuard<'a, Arc<Table>>),
-    Direct(parking_lot::MutexGuard<'a, Table>),
-}
-
-enum TableReadGuard<'a> {
-    CopyOnWrite(parking_lot::RwLockReadGuard<'a, Arc<Table>>),
-    Direct(parking_lot::MutexGuard<'a, Table>),
+    CopyOnWrite {
+        table: parking_lot::RwLockWriteGuard<'a, Arc<Table>>,
+        metrics: Arc<TableGenerationMetrics>,
+    },
+    Direct {
+        table: parking_lot::MutexGuard<'a, Table>,
+    },
 }
 
 impl TableHandle {
     fn new(table: Table) -> Self {
-        Self(TableHandleInner::CopyOnWrite(Arc::new(RwLock::new(
-            Arc::new(table),
-        ))))
+        Self {
+            inner: TableHandleInner::CopyOnWrite(Arc::new(RwLock::new(Arc::new(table)))),
+            generation_metrics: Arc::new(TableGenerationMetrics::default()),
+        }
     }
 
     pub fn from_table(table: Table) -> Self {
@@ -485,41 +554,47 @@ impl TableHandle {
     }
 
     pub fn lock(&self) -> TableGuard<'_> {
-        match &self.0 {
-            TableHandleInner::CopyOnWrite(table) => TableGuard::CopyOnWrite(table.write()),
-            TableHandleInner::Direct(table) => TableGuard::Direct(table.lock()),
-        }
+        let started = std::time::Instant::now();
+        let guard = match &self.inner {
+            TableHandleInner::CopyOnWrite(table) => TableGuard::CopyOnWrite {
+                table: table.write(),
+                metrics: Arc::clone(&self.generation_metrics),
+            },
+            TableHandleInner::Direct(table) => TableGuard::Direct {
+                table: table.lock(),
+            },
+        };
+        self.generation_metrics.writer_wait_nanos.fetch_add(
+            started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
+        guard
     }
 
     fn try_lock_for(&self, timeout: std::time::Duration) -> Option<TableGuard<'_>> {
-        match &self.0 {
+        let started = std::time::Instant::now();
+        let guard = match &self.inner {
             TableHandleInner::CopyOnWrite(table) => {
-                table.try_write_for(timeout).map(TableGuard::CopyOnWrite)
+                table
+                    .try_write_for(timeout)
+                    .map(|table| TableGuard::CopyOnWrite {
+                        table,
+                        metrics: Arc::clone(&self.generation_metrics),
+                    })
             }
-            TableHandleInner::Direct(table) => table.try_lock_for(timeout).map(TableGuard::Direct),
-        }
-    }
-
-    fn read(&self) -> TableReadGuard<'_> {
-        match &self.0 {
-            TableHandleInner::CopyOnWrite(table) => TableReadGuard::CopyOnWrite(table.read()),
-            TableHandleInner::Direct(table) => TableReadGuard::Direct(table.lock()),
-        }
-    }
-
-    fn try_read_for(&self, timeout: std::time::Duration) -> Option<TableReadGuard<'_>> {
-        match &self.0 {
-            TableHandleInner::CopyOnWrite(table) => {
-                table.try_read_for(timeout).map(TableReadGuard::CopyOnWrite)
-            }
-            TableHandleInner::Direct(table) => {
-                table.try_lock_for(timeout).map(TableReadGuard::Direct)
-            }
-        }
+            TableHandleInner::Direct(table) => table
+                .try_lock_for(timeout)
+                .map(|table| TableGuard::Direct { table }),
+        };
+        self.generation_metrics.writer_wait_nanos.fetch_add(
+            started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
+        guard
     }
 
     pub fn ptr_eq(&self, other: &Self) -> bool {
-        match (&self.0, &other.0) {
+        match (&self.inner, &other.inner) {
             (TableHandleInner::CopyOnWrite(left), TableHandleInner::CopyOnWrite(right)) => {
                 Arc::ptr_eq(left, right)
             }
@@ -533,7 +608,7 @@ impl TableHandle {
     pub fn read_generation_with_context(
         &self,
         context: Option<&crate::query::AiExecutionContext>,
-    ) -> Result<(Arc<Table>, Snapshot)> {
+    ) -> Result<(Arc<TableReadGeneration>, Snapshot)> {
         let mut table = if let Some(context) = context {
             loop {
                 context.checkpoint()?;
@@ -541,21 +616,29 @@ impl TableHandle {
                     .remaining_duration()
                     .unwrap_or(std::time::Duration::from_millis(5))
                     .min(std::time::Duration::from_millis(5));
-                if let Some(table) = self.try_read_for(wait) {
+                if let Some(table) = self.try_lock_for(wait) {
                     break table;
                 }
             }
         } else {
-            self.read()
+            self.lock()
         };
         let snapshot = table.snapshot();
-        Ok((table.generation()?, snapshot))
+        let generation = table.clone_read_generation()?;
+        Ok((self.generation_metrics.activate(generation), snapshot))
+    }
+
+    pub fn generation_stats(&self) -> TableGenerationStats {
+        self.generation_metrics.stats()
     }
 }
 
 impl From<Arc<Mutex<Table>>> for TableHandle {
     fn from(table: Arc<Mutex<Table>>) -> Self {
-        Self(TableHandleInner::Direct(table))
+        Self {
+            inner: TableHandleInner::Direct(table),
+            generation_metrics: Arc::new(TableGenerationMetrics::default()),
+        }
     }
 }
 
@@ -564,8 +647,8 @@ impl std::ops::Deref for TableGuard<'_> {
 
     fn deref(&self) -> &Self::Target {
         match self {
-            Self::CopyOnWrite(table) => table.as_ref(),
-            Self::Direct(table) => table,
+            Self::CopyOnWrite { table, .. } => table.as_ref(),
+            Self::Direct { table } => table,
         }
     }
 }
@@ -573,28 +656,25 @@ impl std::ops::Deref for TableGuard<'_> {
 impl std::ops::DerefMut for TableGuard<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         match self {
-            Self::CopyOnWrite(table) => Arc::make_mut(table),
-            Self::Direct(table) => table,
-        }
-    }
-}
-
-impl TableReadGuard<'_> {
-    fn generation(&mut self) -> Result<Arc<Table>> {
-        match self {
-            Self::CopyOnWrite(table) => Ok(Arc::clone(table)),
-            Self::Direct(table) => Ok(Arc::new(table.clone_read_generation()?)),
-        }
-    }
-}
-
-impl std::ops::Deref for TableReadGuard<'_> {
-    type Target = Table;
-
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Self::CopyOnWrite(table) => table.as_ref(),
-            Self::Direct(table) => table,
+            Self::CopyOnWrite { table, metrics } => {
+                if Arc::strong_count(table) > 1 {
+                    let estimated_bytes = table.estimated_clone_bytes();
+                    let started = std::time::Instant::now();
+                    let table = Arc::make_mut(table);
+                    metrics.cow_clone_count.fetch_add(1, Ordering::Relaxed);
+                    metrics.cow_clone_nanos.fetch_add(
+                        started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+                        Ordering::Relaxed,
+                    );
+                    metrics
+                        .estimated_cow_clone_bytes
+                        .fetch_add(estimated_bytes, Ordering::Relaxed);
+                    table
+                } else {
+                    Arc::get_mut(table).expect("unique table Arc")
+                }
+            }
+            Self::Direct { table } => table,
         }
     }
 }
@@ -2355,7 +2435,7 @@ impl Database {
         context: Option<&crate::query::AiExecutionContext>,
         snapshot_override: Option<Snapshot>,
     ) -> Result<(
-        Arc<Table>,
+        Arc<TableReadGeneration>,
         Snapshot,
         crate::retention::OwnedSnapshotGuard,
         RunPins,
@@ -2367,12 +2447,12 @@ impl Database {
                     .remaining_duration()
                     .unwrap_or(std::time::Duration::from_millis(5))
                     .min(std::time::Duration::from_millis(5));
-                if let Some(table) = handle.try_read_for(wait) {
+                if let Some(table) = handle.try_lock_for(wait) {
                     break table;
                 }
             }
         } else {
-            handle.read()
+            handle.lock()
         };
         let (snapshot, snapshot_guard) = if let Some(snapshot) = snapshot_override {
             self.snapshot_at_owned(snapshot.epoch)?
@@ -2386,7 +2466,9 @@ impl Database {
             .active_run_ids()
             .map(|run_id| (table_id, run_id))
             .collect();
-        let generation = table.generation()?;
+        let generation = handle
+            .generation_metrics
+            .activate(table.clone_read_generation()?);
         let run_pins = self.pin_runs(&run_keys);
         Ok((generation, snapshot, snapshot_guard, run_pins))
     }
@@ -9947,6 +10029,44 @@ mod write_permission_tests {
             }],
             ..Schema::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod generation_metrics_tests {
+    use super::*;
+    use crate::schema::{ColumnDef, ColumnFlags, Schema, TypeId};
+
+    #[test]
+    fn legacy_cow_fallback_is_measured() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = Table::create(
+            dir.path(),
+            Schema {
+                columns: vec![ColumnDef {
+                    id: 1,
+                    name: "id".into(),
+                    ty: TypeId::Int64,
+                    flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                    default_value: None,
+                }],
+                ..Schema::default()
+            },
+            1,
+        )
+        .unwrap();
+        let handle = TableHandle::from_table(table);
+        let held = match &handle.inner {
+            TableHandleInner::CopyOnWrite(slot) => Arc::clone(&slot.read()),
+            TableHandleInner::Direct(_) => unreachable!(),
+        };
+
+        handle.lock().set_sync_byte_threshold(1);
+
+        let stats = handle.generation_stats();
+        assert_eq!(stats.cow_clone_count, 1);
+        assert!(stats.estimated_cow_clone_bytes > 0);
+        drop(held);
     }
 }
 

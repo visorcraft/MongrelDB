@@ -8,14 +8,27 @@
 use crate::index::hnsw::Hnsw;
 use crate::rowid::RowId;
 use crate::{MongrelError, Result};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 const M: usize = 16;
 const EF_CONSTRUCTION: usize = 64;
 const EF_SEARCH: usize = 64;
 
 /// Quantized vector store keyed by [`RowId`], backed by an HNSW graph.
-#[derive(serde::Serialize, serde::Deserialize, Clone)]
+#[derive(Clone)]
 pub struct AnnIndex {
+    dim: usize,
+    bytes_per_vec: usize,
+    m: usize,
+    ef_construction: usize,
+    ef_search: usize,
+    frozen: Arc<Vec<Arc<Hnsw>>>,
+    active: Hnsw,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct AnnCheckpoint {
     dim: usize,
     bytes_per_vec: usize,
     graph: Hnsw,
@@ -32,8 +45,11 @@ impl AnnIndex {
         Self {
             dim,
             bytes_per_vec,
-            graph: Hnsw::new(bytes_per_vec, m, ef_construction),
+            m,
+            ef_construction,
             ef_search,
+            frozen: Arc::new(Vec::new()),
+            active: Hnsw::new(bytes_per_vec, m, ef_construction),
         }
     }
 
@@ -77,7 +93,7 @@ impl AnnIndex {
                 bits.len()
             )));
         }
-        self.graph.insert(bits, row_id);
+        self.active.insert(bits, row_id);
         Ok(())
     }
 
@@ -98,7 +114,7 @@ impl AnnIndex {
                 bits[i / 8] |= 1 << (i % 8);
             }
         }
-        self.graph.insert(bits, row_id);
+        self.active.insert(bits, row_id);
     }
 
     /// k-nearest by Hamming distance.
@@ -113,26 +129,97 @@ impl AnnIndex {
         context: Option<&crate::query::AiExecutionContext>,
     ) -> Result<Vec<(RowId, u32)>> {
         let q = self.quantize(query)?;
-        self.graph
-            .search_with_context(&q, k, self.ef_search, context)
+        let mut best = HashMap::<RowId, u32>::new();
+        for graph in self
+            .frozen
+            .iter()
+            .map(Arc::as_ref)
+            .chain(std::iter::once(&self.active))
+        {
+            for (row_id, distance) in graph.search_with_context(&q, k, self.ef_search, context)? {
+                best.entry(row_id)
+                    .and_modify(|current| *current = (*current).min(distance))
+                    .or_insert(distance);
+            }
+        }
+        let mut results: Vec<_> = best.into_iter().collect();
+        results.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+        results.truncate(k);
+        Ok(results)
     }
 
     pub fn len(&self) -> usize {
-        self.graph.len()
+        self.active.len() + self.frozen.iter().map(|graph| graph.len()).sum::<usize>()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.graph.is_empty()
+        self.active.is_empty() && self.frozen.is_empty()
     }
 
     /// Checkpoint the whole HNSW graph (O(N) load, no O(N log N) rebuild).
     pub fn freeze(&self) -> Vec<u8> {
-        bincode::serialize(self).expect("ann index serializable")
+        let mut graph = Hnsw::new(self.bytes_per_vec, self.m, self.ef_construction);
+        for layer in self
+            .frozen
+            .iter()
+            .map(Arc::as_ref)
+            .chain(std::iter::once(&self.active))
+        {
+            for (bits, row_id) in layer.entries() {
+                graph.insert(bits, row_id);
+            }
+        }
+        bincode::serialize(&AnnCheckpoint {
+            dim: self.dim,
+            bytes_per_vec: self.bytes_per_vec,
+            graph,
+            ef_search: self.ef_search,
+        })
+        .expect("ann index serializable")
     }
 
     /// Rehydrate from bytes produced by [`AnnIndex::freeze`].
     pub fn thaw(bytes: &[u8]) -> std::result::Result<Self, bincode::Error> {
-        bincode::deserialize(bytes)
+        let checkpoint: AnnCheckpoint = bincode::deserialize(bytes)?;
+        let (m, ef_construction) = checkpoint.graph.options();
+        Ok(Self {
+            dim: checkpoint.dim,
+            bytes_per_vec: checkpoint.bytes_per_vec,
+            m,
+            ef_construction,
+            ef_search: checkpoint.ef_search,
+            frozen: Arc::new(vec![Arc::new(checkpoint.graph)]),
+            active: Hnsw::new(checkpoint.bytes_per_vec, m, ef_construction),
+        })
+    }
+
+    pub(crate) fn seal(&mut self) {
+        if self.active.is_empty() {
+            return;
+        }
+        let active = std::mem::replace(
+            &mut self.active,
+            Hnsw::new(self.bytes_per_vec, self.m, self.ef_construction),
+        );
+        Arc::make_mut(&mut self.frozen).push(Arc::new(active));
+        if self.frozen.len() >= crate::MAX_READ_GENERATION_LAYERS {
+            self.consolidate();
+        }
+    }
+
+    fn consolidate(&mut self) {
+        let mut graph = Hnsw::new(self.bytes_per_vec, self.m, self.ef_construction);
+        for layer in self.frozen.iter() {
+            for (bits, row_id) in layer.entries() {
+                graph.insert(bits, row_id);
+            }
+        }
+        self.frozen = Arc::new(vec![Arc::new(graph)]);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn frozen_layer_count(&self) -> usize {
+        self.frozen.len()
     }
 }
 
@@ -182,5 +269,28 @@ mod tests {
             ])
             .unwrap();
         assert_eq!(bits[0] & 0b0000_1001, 0b0000_1001); // bits 0 and 3 set
+    }
+
+    #[test]
+    fn sealed_generations_merge_graphs_and_consolidate() {
+        let mut writer = AnnIndex::new(8);
+        for id in 0..crate::MAX_READ_GENERATION_LAYERS as u64 + 2 {
+            let vector = if id % 2 == 0 { [1.0; 8] } else { [-1.0; 8] };
+            writer.insert(&vector, RowId(id)).unwrap();
+            writer.seal();
+        }
+        assert!(writer.frozen_layer_count() < crate::MAX_READ_GENERATION_LAYERS);
+        let generation = writer.clone();
+        writer.insert(&[1.0; 8], RowId(99)).unwrap();
+        assert!(!generation
+            .search(&[1.0; 8], generation.len())
+            .unwrap()
+            .iter()
+            .any(|(row_id, _)| *row_id == RowId(99)));
+        assert!(writer
+            .search(&[1.0; 8], writer.len())
+            .unwrap()
+            .iter()
+            .any(|(row_id, _)| *row_id == RowId(99)));
     }
 }

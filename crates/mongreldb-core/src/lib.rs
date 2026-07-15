@@ -49,6 +49,8 @@ pub mod tsv;
 pub mod txn;
 pub mod wal;
 
+pub(crate) const MAX_READ_GENERATION_LAYERS: usize = 8;
+
 pub use auth::{
     hash_password, verify_password, ColumnAccess, ColumnOperation, Permission, Principal,
     RoleEntry, UserEntry,
@@ -65,7 +67,8 @@ pub use cursor::{drain_cursor_to_columns, Cursor, MultiRunCursor, NativePageCurs
 pub use database::{
     lock_table_with_context, AuthorizedReadSnapshot, CdcBatch, ChangeEvent, CheckIssue, Database,
     ExternalTriggerBaseWrite, ExternalTriggerBridge, ExternalTriggerWrite,
-    ExternalTriggerWriteResult, OpenOptions, ReadAuthorization, TableGuard, TableHandle,
+    ExternalTriggerWriteResult, OpenOptions, ReadAuthorization, TableGenerationStats, TableGuard,
+    TableHandle, TableReadGeneration,
 };
 pub use encryption::{Cipher, PlaintextCipher};
 pub use engine::{
