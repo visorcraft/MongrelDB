@@ -144,3 +144,27 @@ cargo run -p mongreldb-core --release --example authenticated_batch_bench
 The counter excludes the initial database open. A security-version change
 causes exactly one reload on the stale handle; unchanged authenticated commits
 reuse the in-memory catalog.
+
+## Completion audit, 2026-07-15
+
+Audit code: `4fe155a`
+
+| Benchmark | Audit result |
+|---|---:|
+| 10,050-row Kit paging test | 182 ms |
+| Full TypeScript Kit suite | 8.99 s, 308 passed |
+| Authenticated 10,000-row batch | 17 ms, 0 catalog disk reads |
+| 1M read-generation creation, 10-run median | 1.46335 us |
+| 1M overlap commit p50, five-run median | 4.249 ms |
+| 1M overlap commit p95, five-run median | 8.215 ms |
+| 1M overlap commit p99, five-run median | 8.888 ms |
+| 1M overlap peak RSS, five-run median | 1,168,220,160 bytes |
+| Whole-table COW clones | 0 |
+| Maximum live generations | 32 |
+| Live generations after cursor drop | 0 |
+
+The prior 1M creation median was 1.45410 us. The audit median is 0.64% higher,
+within the 5% acceptance bound. All five overlap runs passed
+`scripts/validate-read-generation-characterization.py`; one had a transient
+118.837 ms commit p99, while the five-run median remained 8.888 ms and below
+the earlier tracked 9.259 ms result.
