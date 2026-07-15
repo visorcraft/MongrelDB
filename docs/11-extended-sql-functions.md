@@ -213,7 +213,7 @@ LIMIT 10;
 
 For accurate full-text search with a maintained inverted index and global IDF,
 use the `fts_docs` virtual table module (see
-[Extended SQL & virtual tables](extended-sql-and-virtual-tables.md)).
+[Triggers and external tables](13-triggers-and-external-table-modules.md)).
 
 ## Custom Functions
 
@@ -231,14 +231,3 @@ resolution can change query output without advancing the storage epoch.
 Built-in DataFusion aggregate and window functions remain available through the
 normal SQL planner. MongrelDB's registration hooks are for application-defined
 extensions that need to live alongside the built-in function set.
-
-## Full Profile Status
-
-Implemented beyond the MVP: recursive `json_tree`, jsonb compatibility aliases,
-bracket-quoted JSON paths, broader `printf`/`format` flags, complete core GLOB
-character classes, Unicode case conversion, per-session DML counters, the common
-math function set, long-tail core scalar compatibility functions, and
-SQLite-reference aggregate/window parity coverage, including exact
-percentile-family aggregates. Exact edge-case alignment is covered by focused
-function tests plus the SQLite-reference aggregate/window corpus and remains the
-compatibility contract for future additions.

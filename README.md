@@ -5,9 +5,9 @@
 <h1 align="center">MongrelDB</h1>
 
 <p align="center">
-  <b>A log-structured columnar database for sub-millisecond writes, learned indexes, and AI-native access.</b>
+  <b>A log-structured columnar database for operational writes, learned indexes, and AI-native access.</b>
   <br />
-  Custom <code>.sr</code> columnar format · Bε-tree memtable · WAL with group commit · eight secondary index kinds · exact ANN reranking · multi-index intersection · MVCC snapshots · page-level encryption · declarative constraints · user/role auth · credential enforcement · replication · change data capture · DataFusion SQL · recursive CTEs · window functions · CREATE TABLE AS SELECT · materialized views · multi-statement SQL · FTS ranking · NAPI addon
+  Custom <code>.sr</code> columnar format · Bε-tree memtable · WAL with group commit · six public secondary index kinds · exact ANN reranking · multi-index intersection · MVCC snapshots · page-level encryption · declarative constraints · user/role auth · credential enforcement · replication · change data capture · DataFusion SQL · recursive CTEs · window functions · CREATE TABLE AS SELECT · materialized views · multi-statement SQL · FTS ranking · NAPI addon
 </p>
 
 <p align="center">
@@ -22,14 +22,13 @@
 
 ## What is MongrelDB?
 
-MongrelDB is an embedded, single-node database engine optimized for
-**operational workloads** - sub-millisecond single-row writes and updates on a
-custom columnar format, with a rich index set designed for AI-native access
-patterns. **New to MongrelDB? Start with the [docs](docs/).**
+MongrelDB is an embedded, single-node database engine for operational workloads
+on a custom columnar format, with a rich index set designed for AI-native
+access patterns. **New to MongrelDB? Start with the [docs](docs/).**
 
 The write path is an LSM/Bε-tree: an append-only WAL with group commit feeds a
 Bε-tree memtable keyed by `(RowId, Epoch)`, which flushes to immutable sorted
-runs (`.sr` PAX columnar pages). Single-row durable update: **~7 µs**.
+runs (`.sr` PAX columnar pages).
 
 The read path merges memtable + sorted runs under MVCC snapshot isolation. Six
 user-creatable secondary index kinds resolve through a shared `RowId` space.
@@ -115,32 +114,17 @@ not implemented.
 
 ## Performance profile
 
-Measured on 1M rows, dev sandbox (full results in [`BENCHMARKS.md`](BENCHMARKS.md)):
+Latest local release-build measurements are in
+[`BENCHMARKS.md`](BENCHMARKS.md). Selected one-million-row results:
 
 | Metric | Value |
 |---|---:|
-| Single-row durable write (`put` + `commit`) | **8.0 µs** |
-| Single-row durable update | **7.2 µs** |
-| `put` (no fsync) | **618 ns** |
-| `commit` (fsync, group commit) | **6.79 µs** |
-| Bulk ingest (typed `bulk_load_columns`) | **25.7 Melem/s** (38.8 ms) |
-| Bulk ingest (Value API `bulk_load`) | **12.1 Melem/s** (82.4 ms) |
-| Full columnar scan (LE native-endian) | **12.3 Melem/s** (81.5 ms) |
-| Full scan (all columns) | **14.1 Melem/s** (70.7 ms) |
-| Bitmap-equality pushdown | **122 Melem/s** (8.2 ms) |
-| Range pushdown (PGM learned index) | **118 Melem/s** (8.5 ms) |
-| 1-column projection pushdown | **208 Melem/s** (4.8 ms) |
-| Cold SQL filter (`WHERE cost < 250`) | **8.7 µs** |
-| Cold SQL `COUNT(*)` | **290 µs** |
-| Cold SQL join `COUNT(*)` | **1.16 ms** |
-| Warm result-cache hit (any query) | **0.1-0.3 µs** |
-| Storage | **4.17 bytes/row** (4.17 MB / 1M rows) |
-| `COUNT(*)` metadata | **0 µs** (O(1)) |
-| AES-256-GCM encrypt/decrypt | **~1.88 GiB/s** |
-
-**Cross-engine (1M rows, latest):** single-row writes **1.8× faster than SQLite, 37× faster than DuckDB**.
-Bulk insert **2.3× faster than SQLite, 2.6× faster than DuckDB native**. Join
-`COUNT(*)` **3.4× faster than DuckDB, 19× faster than SQLite**.
+| Typed bulk load | **58.471 ms**, 17.102 M rows/s |
+| Typed full scan | **83.707 ms**, 11.946 M rows/s |
+| Bitmap equality | **8.0387 ms** |
+| Put without fsync | **4.4828 µs** |
+| Commit with fsync | **4.6721 ms** |
+| 1,000 puts plus commit | **7.7071 ms**, 129.75 K rows/s |
 
 ## Architecture
 
@@ -186,8 +170,7 @@ Bulk insert **2.3× faster than SQLite, 2.6× faster than DuckDB native**. Join
   See [Encryption](#encryption) below.
 - **Result cache:** Fine-grained invalidation (footprint + condition-column
   based, not coarse epoch wipe). Persistent on-disk tier (`_rcache/`). Wired
-  into SQL scan + NAPI query + native Condition API. Warm cache hits return
-  pre-computed Arrow batches in ~0.1 µs.
+  into SQL scan + NAPI query + native Condition API.
 - **Arrow IPC shadow:** Zero-copy read cache for clean single-run tables
   (`_shadow/`). Lazy-written on first scan, zero-copy RecordBatch on
   subsequent scans.
@@ -311,14 +294,14 @@ let db = Table::create_with_key(dir, schema, 1, &key)?;
 let db = Table::open_with_key(dir, &key)?;
 ```
 
-Generate a key with `openssl rand 32 > my.key`. The raw key path skips
-Argon2id (~0.1ms vs ~50ms for passphrases).
+Generate a key with `openssl rand 32 > my.key`. The raw-key path skips the
+deliberately expensive Argon2id passphrase derivation.
 
 ### Performance overhead
 
-~1.87 GiB/s encrypt/decrypt throughput (AES-256-GCM, hardware-accelerated).
-In practice, encryption adds negligible latency to bulk ingest and queries
-(measured at <5% overhead on 1M-row workloads).
+Encryption cost depends on CPU support, page size, and workload. Measure it on
+deployment-class hardware with
+`cargo bench -p mongreldb-core --bench page_encryption`.
 
 ## Language Clients
 
@@ -339,7 +322,7 @@ MongrelDB supports **35 languages** across two integration tiers:
 | **Python** | Native (PyO3) | [MongrelDB Kit](https://github.com/visorcraft/MongrelDB-Kit) | `pip install mongreldb-kit` |
 | **Rust** | Native (Direct) | [MongrelDB](https://github.com/visorcraft/MongrelDB) | `cargo add mongreldb-core` |
 | **Scala** | Native (JNI) + HTTP | [MongrelDB-Scala](https://github.com/visorcraft/MongrelDB-Scala) | sbt + `libmongreldb_jni` |
-| **TypeScript** | Native (NAPI) | [MongrelDB Kit](https://github.com/visorcraft/MongrelDB-Kit) | `npm install @visorcraft/mongreldb-kit` |
+| **TypeScript** | Native (NAPI) | [MongrelDB](https://github.com/visorcraft/MongrelDB) | `npm install @visorcraft/mongreldb` |
 
 **Tier 2 (HTTP)** - 26 languages with pure HTTP clients:
 
@@ -349,7 +332,7 @@ MongrelDB supports **35 languages** across two integration tiers:
 | **Crystal** | `HTTP::Client` | [MongrelDB-Crystal](https://github.com/visorcraft/MongrelDB-Crystal) | `shards add mongreldb` |
 | **D** | `requests` | [MongrelDB-D](https://github.com/visorcraft/MongrelDB-D) | `dub add mongreldb` |
 | **Dart** | `http` | [MongrelDB-Dart](https://github.com/visorcraft/MongrelDB-Dart) | `dart pub add mongreldb` |
-| **Elixir** | `Req` | [MongrelDB-Elixir](https://github.com/visorcraft/MongrelDB-Elixir) | `{:mongreldb, "~> 0.1"}` in `mix.exs` |
+| **Elixir** | `Req` | [MongrelDB-Elixir](https://github.com/visorcraft/MongrelDB-Elixir) | `{:mongreldb, "~> 0.55"}` in `mix.exs` |
 | **Erlang** | `httpc` | [MongrelDB-Erlang](https://github.com/visorcraft/MongrelDB-Erlang) | rebar3 |
 | **F#** | `HttpClient` | [MongrelDB-FSharp](https://github.com/visorcraft/MongrelDB-FSharp) | `dotnet add reference` |
 | **Fortran** | `curl` | [MongrelDB-Fortran](https://github.com/visorcraft/MongrelDB-Fortran) | fpm |
@@ -391,9 +374,8 @@ A fat JAR (`mongreldb-jni-0.55.0.jar`) with all platforms bundled is also publis
 
 ## Node.js addon
 
-MongrelDB also ships as a native NAPI addon (`crates/mongreldb-node`) - the
-**better-sqlite3 model**: in-process, no HTTP hop, so the sub-ms write latency
-isn't lost to a round-trip. It exposes both a **typed object/method API** and a
+MongrelDB also ships as a native NAPI addon (`crates/mongreldb-node`) using an
+in-process model with no HTTP hop. It exposes both a **typed object/method API** and a
 **full SQL surface**: the hybrid `query` composes ANN, FM, bitmap equality/IN,
 range, null, and `BytesPrefix` conditions in a single row-id-space intersection,
 while `db.sql(sql)` runs cross-table SQL (DataFusion) and returns Arrow IPC.
@@ -401,8 +383,11 @@ TypeScript types are generated at build time, and row ids / counts / epochs cros
 the FFI as lossless `BigInt`:
 
 ```sh
-cd crates/mongreldb-node && npm install && npm run build   # release NAPI addon + typings
+npm install @visorcraft/mongreldb
 ```
+
+Repository contributors can build the release addon with
+`cd crates/mongreldb-node && npm install && npm run build`.
 
 A `smoke.mjs` exercises put/get/count and a hybrid query against the live addon.
 Create/open a `Database`, create tables with `createTable`, then operate through
@@ -420,19 +405,14 @@ database starts a fresh session (re-apply any view-defining migrations then).
 
 ## Benchmarks
 
-`crates/mongreldb-perf` is a standalone harness comparing MongrelDB (plain +
-encrypted) to SQLite and DuckDB (native / Parquet / CSV) at 100 and 1M rows.
-Measured results and analysis live in [`BENCHMARKS.md`](BENCHMARKS.md). Summary:
-MongrelDB wins single-row writes (**8.0 µs** vs SQLite 14.7 µs, DuckDB 296 µs),
-bulk insert (**93.9 ms** vs SQLite 213.7 ms, DuckDB native 247.9 ms), join
-`COUNT(*)` (**1.16 ms** vs DuckDB 3.93 ms, SQLite 22.5 ms), and O(1)
-`count()`. DuckDB-Parquet wins bulk file creation (31.65 ms via `COPY`) and has
-the fastest analytical filter. Warm result-cache hits are sub-µs across all
-queries.
+Current release-build measurements, commands, hardware, and methodology live
+in [`BENCHMARKS.md`](BENCHMARKS.md). `crates/mongreldb-perf` remains the
+standalone SQLite and DuckDB comparison harness; rerun it before publishing
+cross-engine claims.
 
 ## Setup
 
-**Prerequisites:** Rust ≥ 1.80 (Node.js ≥ 16 for the addon).
+**Prerequisites:** current stable Rust and Node.js 22+ for the addon.
 
 ```sh
 git clone https://github.com/visorcraft/MongrelDB.git
@@ -473,7 +453,7 @@ crates/mongreldb-jni/     JNI shim for the JVM (Java, Kotlin, Scala)
 crates/mongreldb-perf/    cross-engine benchmark vs SQLite/DuckDB (standalone)
 crates/mongreldb-core/examples/hybrid_query.rs
                           runnable ann ∩ fm ∩ bitmap hybrid-query demo
-BENCHMARKS.md             measured cross-engine performance matrix
+BENCHMARKS.md             latest local performance measurements and commands
 ```
 
 ## License

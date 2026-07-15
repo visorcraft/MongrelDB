@@ -1,22 +1,19 @@
 # Node.js Quick Start
 
 MongrelDB ships as a native NAPI addon. It runs in-process, so write and query
-latency are not hidden behind an HTTP hop. Build the addon in release mode:
+latency are not hidden behind an HTTP hop. Install the published package:
 
 ```sh
-cd crates/mongreldb-node
-npm install
-npm run build
+npm install @visorcraft/mongreldb
 ```
 
-This generates `mongreldb.<platform>.node`, `native.js`, and `native.d.ts`.
-The hand-written `index.js` wrapper re-exports the native API and adds a
-retrying transaction helper.
+Repository contributors can build `crates/mongreldb-node` with
+`npm install && npm run build`. Use release mode for performance work.
 
 ## Create A Database
 
 ```javascript
-const { Database, ColumnType, IndexKindSpec } = require('./index.js');
+const { Database, ColumnType, IndexKindSpec } = require('@visorcraft/mongreldb');
 
 const db = Database.withPath('./my_data');
 

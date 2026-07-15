@@ -21,7 +21,7 @@ vector similarity, range queries, and more.
    engine, WHERE pushdown, result caching, materialized views
 5. **[Native Queries](05-native-queries.md)** - the Condition API: composing
    bitmap + range + text + vector searches in a single call
-6. **[Indexes](06-indexes.md)** - the eight index types explained, and when
+6. **[Indexes](06-indexes.md)** - the six public index kinds, and when
    to use each
 7. **[Encryption](07-encryption.md)** - protecting data at rest with
    AES-256-GCM and a passphrase
@@ -35,8 +35,8 @@ vector similarity, range queries, and more.
     date/time, JSON, string, math, and custom function hooks
 12. **[Operational SQL Commands](12-operational-sql-commands.md)** -
     PRAGMA introspection, ANALYZE, REINDEX, VACUUM, and EXPLAIN QUERY PLAN
-13. **[Trigger Programs & External Table Modules](13-triggers-and-external-table-modules.md)** -
-    architecture spec for triggers and external table modules
+13. **[Triggers & External Tables](13-triggers-and-external-table-modules.md)** -
+    current trigger behavior and built-in or app-provided virtual tables
 14. **[Users, Roles & Permissions](14-auth.md)** - catalog-stored users with
     Argon2id password hashing, roles, `GRANT`/`REVOKE`, and daemon (HTTP Basic +
     Bearer token) authentication
@@ -44,28 +44,31 @@ vector similarity, range queries, and more.
     `require_auth` storage-layer enforcement: credentialed open/create
     constructors, the full enforcement matrix, composition with encryption,
     and offline recovery
-16. **[SQL Cancellation Qualification](sql-cancellation-qualification-2026-07-14.md)** -
-    query-control correctness coverage and cancellation latency characterization
+16. **[Client Conformance](16-client-conformance.md)** - required behavior
+    shared by Rust, TypeScript, Python, and CLI surfaces
 
 ## Quick Reference
 
-### Performance (1M rows)
+### Performance
 
 | Operation | Speed |
 |---|---:|
-| Single-row write (durable) | **8.0 µs** |
-| Bulk ingest (typed) | **25.7 Melem/s** (38.8 ms) |
-| Columnar scan | **12.3 Melem/s** (81.5 ms) |
-| Bitmap equality lookup | **122 Melem/s** (8.2 ms) |
-| Warm cache hit | **0.1-0.3 µs** |
-| Storage | 4.17 bytes/row |
+| Typed bulk load, 1M rows | **58.471 ms** |
+| Typed full scan, 1M rows | **83.707 ms** |
+| Bitmap equality, 1M rows | **8.0387 ms** |
+| Commit with fsync | **4.6721 ms** |
+| 1,000 puts plus commit | **7.7071 ms** |
+| Kit paging, 10,050 rows | **182 ms** |
+
+See [current measurements](../BENCHMARKS.md) for hardware, commands, and the
+complete latest result set.
 
 ### Supported Languages
 
 | Language | Package | Status |
 |---|---|---|
 | Rust | `mongreldb-core` + `mongreldb-query` | Full API |
-| Node.js / TypeScript | `mongreldb-node` (NAPI addon) | Full API |
+| Node.js / TypeScript | `@visorcraft/mongreldb` | Full API |
 | HTTP (any language) | `mongreldb-server` daemon | SQL + native query |
 
 ### Data Types

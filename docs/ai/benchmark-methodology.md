@@ -51,7 +51,7 @@ matrix, and every threshold in `benchmark-thresholds.json`.
 
 The tagged GitHub Actions qualification uses `ci-benchmark-thresholds.json`.
 Hosted runners have variable CPUs, so those ceilings are conservative regression
-guards. `benchmark-thresholds.json` remains the stricter named-baseline gate.
+guards. `benchmark-thresholds.json` remains the stricter reference-machine gate.
 
 The scheduled `AI 1M characterization` workflow runs strict structural and
 finite-value validation at one million rows. It skips latency/recall thresholds,
@@ -105,5 +105,6 @@ wall-clock thresholds.
 
 Publish reports with named CPU, memory, compiler, build features, warmup policy,
 and the unmodified JSON output. Do not compare index bytes with base-table
-columnar bytes as if they measured the same object. Establish a baseline before
-adding regression thresholds. A 10M-row run is optional release qualification.
+columnar bytes as if they measured the same object. Measure the reference
+machine before adding regression thresholds. A 10M-row run is optional release
+qualification.

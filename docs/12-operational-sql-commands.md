@@ -129,14 +129,3 @@ logical and physical plan details.
 Bare `EXPLAIN` is delegated to DataFusion and returns its `plan_type`/`plan`
 diagnostic table. MongrelDB does not expose SQLite virtual-machine bytecode,
 because it does not execute SQL through SQLite's VM.
-
-## Full Profile Status
-
-Implemented beyond the MVP: broader PRAGMA introspection, metadata-backed
-`user_version`/`application_id`, storage accounting PRAGMAs, `wal_checkpoint`,
-`foreign_key_check`, `VACUUM INTO`, aggregate-aware `function_list`,
-`ATTACH`/`DETACH` (cross-database queries), `SAVEPOINT`/`RELEASE`/`ROLLBACK TO`
-(session-level sub-transactions), `information_schema.tables` (catalog
-introspection), `regexp()` (regex matching UDF), recursive CTEs
-(`WITH RECURSIVE`), window functions (`OVER`/`PARTITION BY`), and
-`EXPLAIN`/`EXPLAIN QUERY PLAN`.

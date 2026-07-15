@@ -4,10 +4,9 @@ Indexes are how databases find data fast. Without an index, finding rows that
 match a condition requires scanning every row. With an index, the database
 jumps directly to the matching rows.
 
-MongrelDB has eight index types - each designed for a different kind of query.
-Most databases have one or two index types. Having eight means MongrelDB can
-accelerate search patterns that other databases can't (like semantic vector
-search or substring search).
+MongrelDB exposes six secondary index kinds: Bitmap, LearnedRange, FmIndex,
+Ann, Sparse, and MinHash. Primary-key lookup and the PMA mutable-run tier are
+internal and require no schema declaration.
 
 ## How to Declare Indexes
 
@@ -32,15 +31,14 @@ You can also add a PGM range index after data is loaded:
 db.add_learned_range_index("timestamp")?;
 ```
 
-## The Eight Index Types
+## Index Types
 
-### 1. HOT (Height-Optimized Trie) - Primary Key Lookup
+### Primary Key Lookup
 
 **What it does:** Instantly finds a row by its primary key value.
 
-**How it works:** A trie (prefix tree) that's been flattened to minimize
-height. Looking up a key walks the trie structure - O(key length), not
-O(number of rows).
+**How it works:** The primary-key lookup surface is implicit. Its current
+in-memory implementation uses a `BTreeMap`.
 
 **When to use:** Always - it's automatically built on whichever column you
 mark `PRIMARY_KEY`.
@@ -52,7 +50,7 @@ let q = Query::pk(42i64.to_be_bytes().to_vec());
 let row = db.query(&q)?;
 ```
 
-### 2. Bitmap (Roaring) - Equality on Low-Cardinality Columns
+### Bitmap (Roaring) - Equality on Low-Cardinality Columns
 
 **What it does:** Finds all rows where a column equals a specific value.
 
@@ -85,7 +83,7 @@ IndexDef { name: "key_bm".into(), column_id: 2, kind: IndexKind::Bitmap }
 Condition::BytesPrefix { column_id: 2, prefix: b"user:".to_vec() }
 ```
 
-### 3. PGM (Learned Index) - Range Queries
+### PGM (Learned Index) - Range Queries
 
 **What it does:** Finds all rows where a numeric column falls within a range.
 
@@ -105,7 +103,7 @@ IndexDef { name: "price_pgm".into(), column_id: 3, kind: IndexKind::LearnedRange
 Condition::RangeF64 { column_id: 3, lo: 50.0, lo_inclusive: true, hi: 200.0, hi_inclusive: true }
 ```
 
-### 4. FM-index - Substring Search
+### FM-index - Substring Search
 
 **What it does:** Finds all rows where a text column contains a given substring.
 
@@ -124,15 +122,15 @@ IndexDef { name: "content_fm".into(), column_id: 4, kind: IndexKind::FmIndex }
 Condition::FmContains { column_id: 4, pattern: b"database".to_vec() }
 ```
 
-### 5. HNSW - Vector Similarity Search
+### HNSW - Vector Similarity Search
 
-**What it does:** Finds the k rows whose embedding vector is closest (by
-Euclidean or cosine distance) to a query vector.
+**What it does:** Generates approximate nearest-neighbor candidates from an
+embedding column using binary-sign Hamming distance. Exact cosine, dot-product,
+or L2 reranking is available as a bounded second stage.
 
 **How it works:** Builds a multi-layer graph where similar vectors are
-connected by edges. Search walks the graph from a random entry point,
-greedily moving toward the query. Achieves recall@10 ≥ 90% with sub-linear
-time.
+connected by edges. Search walks the graph toward the query and returns a
+bounded candidate set.
 
 **When to use:** Embedding columns for AI/ML applications - semantic search,
 recommendation, deduplication, clustering.
@@ -145,7 +143,7 @@ recommendation, deduplication, clustering.
 Condition::Ann { column_id: 6, query: vec![0.1, 0.45, 0.78, ...], k: 10 }
 ```
 
-### 6. PMA (Packed Memory Array) - Cache-Oblivious Sorted Runs
+### PMA Mutable-Run Tier
 
 **What it does:** Maintains a sorted array that supports fast inserts without
 the pointer-chasing of a B-tree.
@@ -157,7 +155,7 @@ while maintaining cache-friendly sequential access.
 **When to use:** Internal data structure for sorted runs - not directly
 user-facing, but contributes to fast scan and merge performance.
 
-### 7. Sparse - SPLADE-style Sparse Retrieval
+### Sparse - SPLADE-style Sparse Retrieval
 
 **What it does:** Ranks rows by sparse dot-product score against a query
 sparse vector.
@@ -182,16 +180,32 @@ Condition::SparseMatch {
 }
 ```
 
+### MinHash - Set Similarity
+
+**What it does:** Generates approximate candidates for rows whose member sets
+have high Jaccard similarity.
+
+**How it works:** Typed XXH3-64 member hashes feed MinHash signatures and LSH
+buckets. Exact Jaccard verification can refine returned candidates but cannot
+recover a missed LSH candidate.
+
+**When to use:** Near-duplicate detection, set overlap, and similarity joins.
+
+```rust
+IndexDef { name: "members_mh".into(), column_id: 8, kind: IndexKind::MinHash }
+```
+
 ## Choosing the Right Index
 
 | Your query pattern | Recommended index |
 |---|---|
-| Fetch one row by ID | HOT (automatic on PK) |
+| Fetch one row by ID | Primary-key lookup (automatic) |
 | `WHERE category = 'X'` (few categories) | Bitmap |
 | `WHERE price BETWEEN 10 AND 50` | PGM (LearnedRange) |
 | `WHERE content LIKE '%keyword%'` | FM-index |
 | Find similar items by embedding | HNSW |
 | Rank documents by token relevance | Sparse |
+| Find similar sets or duplicates | MinHash |
 | Multiple equality filters | Multiple Bitmap indexes |
 
 ## Multiple Indexes Intersect

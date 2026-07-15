@@ -5,19 +5,17 @@
 MongrelDB is an embedded database - meaning it runs inside your application
 process, not as a separate server. Think of it like SQLite: no separate
 database server to install or manage. You add it to your project, open a
-file on disk, and start reading and writing data.
+database directory, and start reading and writing data.
 
-What makes MongrelDB different is how fast it is at single-row operations
-(writes, updates, deletes) and how many ways it can search data. A single
-row write takes about 6 microseconds. It has eight different index types,
-including ones for text search, similarity search, and AI embeddings.
+MongrelDB combines operational writes with six public secondary index kinds,
+including text, vector, sparse, set-similarity, equality, and range search.
 
 ## Prerequisites
 
 You need one of these:
 
-- **Rust** 1.80 or newer (to use MongrelDB as a Rust library)
-- **Node.js** 16 or newer (to use MongrelDB as a Node.js addon)
+- **Current stable Rust** to use MongrelDB as a Rust library
+- **Node.js 22 or newer** to use MongrelDB as a Node.js addon
 - Both is fine too
 
 ### Installing Rust
@@ -27,7 +25,7 @@ If you don't have Rust yet:
 ```sh
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source ~/.cargo/env
-rustc --version  # should print 1.80.0 or higher
+rustc --version
 ```
 
 ### Installing Node.js
@@ -36,7 +34,7 @@ Download from [nodejs.org](https://nodejs.org) or use a version manager like
 `nvm`. Verify with:
 
 ```sh
-node --version  # should print v16 or higher
+node --version  # should print v22 or higher
 ```
 
 ## Installation
@@ -47,14 +45,14 @@ Add MongrelDB to your `Cargo.toml` (both crates are published to crates.io):
 
 ```toml
 [dependencies]
-mongreldb-core = "0.31"   # storage engine (always needed)
-mongreldb-query = "0.31"  # SQL frontend (optional; needed for MongrelSession / views / Arrow)
+mongreldb-core = "0.55.0"   # storage engine
+mongreldb-query = "0.55.0"  # SQL frontend
 ```
 
 For encryption support, add the `encryption` feature:
 
 ```toml
-mongreldb-core = { version = "0.24", features = ["encryption"] }
+mongreldb-core = { version = "0.55.0", features = ["encryption"] }
 ```
 
 To build against a local checkout of the engine instead, use path dependencies
@@ -63,13 +61,10 @@ or a `[patch.crates-io]` block pointing at the repo.
 ### Option B: Use MongrelDB in a Node.js project
 
 ```sh
-cd crates/mongreldb-node
-npm install
-npm run build
+npm install @visorcraft/mongreldb
 ```
 
-This produces `mongreldb.<platform>.node` - a native addon you can `require()`
-from JavaScript. See [Node.js Quick Start](03-nodejs-quickstart.md) for details.
+See [Node.js Quick Start](03-nodejs-quickstart.md) for details.
 
 ## Your First Database
 
@@ -155,9 +150,9 @@ appends. Old data gets cleaned up later during a process called compaction.
 ### Commits
 
 After calling `put()` or `delete()`, your changes are in memory but not yet
-guaranteed to survive a crash. Calling `commit()` flushes the WAL to disk
-(an `fsync`). This takes about 6 microseconds. You can also call `flush()`,
-which commits and then moves data from the WAL into the columnar storage format.
+guaranteed to survive a crash. Calling `commit()` flushes the WAL to disk with
+`fsync`. You can also call `flush()`, which commits and then moves data from the
+WAL into the columnar storage format.
 
 ### Snapshots
 

@@ -1,5 +1,5 @@
 {
-  "scope": "manual release qualification on the named baseline machine",
+  "scope": "manual release qualification on the reference machine",
   "rows": 100000,
   "minimum_queries": 10,
   "ann": {

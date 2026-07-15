@@ -312,7 +312,6 @@ recovery procedures, see
 - **Storage.** Users and roles serialize as part of the catalog (the same
   `_meta` blob that stores procedures and triggers); there is no separate
   auth file to back up.
-- **Performance.** `verify_user` runs one Argon2id hash comparison (~50 ms
-  on typical hardware). The daemon caches the resolved `Principal` for the
-  lifetime of the request only - for high-QPS authenticated workloads,
-  prefer the Bearer token mode, which is a single string compare.
+- **Performance.** `verify_user` runs one deliberately expensive Argon2id hash
+  comparison. The daemon caches the resolved `Principal` for one request. Use
+  Bearer token mode when its shared-secret model fits the deployment.

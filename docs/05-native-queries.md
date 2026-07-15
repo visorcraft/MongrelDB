@@ -292,8 +292,7 @@ faster for bulk processing.
 let results = db.query_cached(&q).unwrap();
 ```
 
-Same as `query()` but checks the result cache first. On a cache hit, returns
-the pre-computed result in ~0.1 µs. The cache is invalidated intelligently
+Same as `query()` but checks the result cache first. The cache is invalidated
 when committed changes affect the query's footprint.
 
 ## When to Use Conditions vs SQL

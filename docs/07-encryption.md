@@ -79,7 +79,7 @@ MongrelDB supports two ways to provide the encryption key:
 let db = Db::create_encrypted(dir, schema, 1, "my-secret-passphrase")?;
 let db = Db::open_encrypted(dir, "my-secret-passphrase")?;
 ```
-Uses Argon2id (~50ms) to stretch the passphrase into a strong key.
+Uses Argon2id to stretch the passphrase into a strong key.
 
 **Raw key** (machine-generated, fast derivation):
 ```rust
@@ -87,7 +87,7 @@ let key = std::fs::read("my.key")?;  // 32+ bytes of random data
 let db = Db::create_with_key(dir, schema, 1, &key)?;
 let db = Db::open_with_key(dir, &key)?;
 ```
-Skips Argon2id - uses HKDF-SHA256 only (~0.1ms). The key must already be
+Skips Argon2id and uses HKDF-SHA256 only. The key must already be
 high-entropy (generate one with `openssl rand 32 > my.key`).
 
 Both paths produce the same KEK; all downstream encryption (sorted runs, WAL,
@@ -121,19 +121,10 @@ on encrypted columns - the value is tokenized the same way before lookup.
 
 ## Performance
 
-AES-256-GCM runs at about **1.87 GiB/s** with hardware acceleration (AES-NI).
-In practice, encryption adds less than 5% overhead to bulk operations:
-
-| Operation | Plain | Encrypted | Overhead |
-|---|---|---|---|
-| Bulk ingest (1M rows) | 76.6 ms | 78.1 ms | ~2% |
-| Cold SQL filter | 7.5 ms | 7.3 ms | negligible |
-| SQL join | 1.68 ms | 1.49 ms | negligible |
-
-(The encrypted path is sometimes faster due to differences in run layout -
-this is within measurement noise. Encrypted columns prune pages via a
-decrypted-at-open stats envelope, so filtered reads scan the same page count
-as plaintext.)
+Encryption cost depends on the CPU, page size, and workload. Run
+`cargo bench -p mongreldb-core --bench page_encryption` on deployment-class
+hardware. Encrypted columns still prune pages through the stats envelope
+decrypted at open.
 
 ## Losing the Passphrase
 

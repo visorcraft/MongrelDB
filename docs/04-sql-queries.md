@@ -139,8 +139,8 @@ before any data is scanned. This is called **predicate pushdown**:
 | `col IN ('a', 'b', 'c')` | Bitmap union | Exact |
 | `col > 5`, `col BETWEEN 1 AND 10` | PGM learned index / page prune | Exact |
 | `col LIKE '%text%'` | FM-index | Returns a superset (DataFusion re-checks) |
-| `ann_search(col, '[0.1, 0.2, ...]', 10)` | HNSW | Exact (custom UDF) |
-| `sparse_match(col, 'query text', 10)` | Sparse inverted index | Exact (custom UDF) |
+| `ann_search(col, '[0.1, 0.2, ...]', 10)` | HNSW | Approximate top-k predicate |
+| `sparse_match(col, 'query text', 10)` | Sparse inverted index | Ranked top-k predicate |
 
 Conditions that MongrelDB can't push down (complex expressions, OR logic)
 are handled by DataFusion's own filter after the scan. This is always correct
@@ -183,21 +183,18 @@ Repeated SQL queries return instantly from cache. The cache is keyed by
 stale results automatically:
 
 ```rust
-// First run - actually executes the query
+// First run executes the query.
 let r1 = session.run("SELECT count(*) FROM users WHERE score > 90").await?;
-// ~7 ms
 
-// Second run - cache hit, returns pre-computed result
+// Second run can return the cached result.
 let r2 = session.run("SELECT count(*) FROM users WHERE score > 90").await?;
-// ~0.1 µs
 
 // After a write + commit, cache is invalidated
 db.put(new_row).unwrap();
 db.commit().unwrap();
 
-// Third run - cache miss, re-executes
+// Third run misses because committed data changed.
 let r3 = session.run("SELECT count(*) FROM users WHERE score > 90").await?;
-// ~7 ms
 ```
 
 To force a cold run (bypass cache):
@@ -270,10 +267,9 @@ CREATE MATERIALIZED VIEW daily_totals AS
 SELECT * FROM daily_totals WHERE day > '2026-01-01';
 ```
 
-Materialized views are physically tables - they occupy storage and support
-indexes. The defining SQL is stored so the view can be refreshed
-(re-materialized) in a future release. To drop one, use `DROP TABLE` or
-`DROP MATERIALIZED VIEW`.
+Materialized views are physically stored tables and support indexes. They do
+not refresh automatically. Drop and recreate one when its source data changes.
+Use `DROP TABLE` or `DROP MATERIALIZED VIEW` to remove it.
 
 **Views vs. Materialized Views:** regular `CREATE VIEW` stores only the SQL
 definition and recomputes on every read (session-scoped); `CREATE MATERIALIZED
