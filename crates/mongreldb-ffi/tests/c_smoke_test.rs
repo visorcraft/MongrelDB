@@ -19,6 +19,13 @@ fn c_smoke_test() {
     assert!(header.exists(), "mongreldb.h not found at {:?}", header);
     assert!(c_source.exists(), "c_test.c not found at {:?}", c_source);
 
+    let status = Command::new("cargo")
+        .args(["build", "--release"])
+        .current_dir(&crate_root)
+        .status()
+        .expect("failed to build C library");
+    assert!(status.success(), "failed to build C library");
+
     // Compile the C test, linking against the shared library.
     let mut compiler = Command::new("cc");
     compiler.args([
