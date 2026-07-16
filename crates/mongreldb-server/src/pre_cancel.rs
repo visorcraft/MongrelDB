@@ -403,7 +403,17 @@ mod tests {
             store.lookup_for_registration(id(1), "bob", Some("b")),
             RegistrationLookup::NoReservation
         );
-        assert_eq!(store.approximate_bytes(), 0);
+        let state = store.lock();
+        assert!(state.entries.is_empty());
+        assert!(state.by_query_id.is_empty());
+        assert_eq!(
+            state.approximate_bytes,
+            state
+                .owner_rates
+                .values()
+                .map(|rate| rate.approximate_bytes)
+                .sum::<usize>()
+        );
     }
 
     #[test]
