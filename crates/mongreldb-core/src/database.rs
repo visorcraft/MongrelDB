@@ -52,25 +52,219 @@ fn advance_security_version(catalog: &mut Catalog) -> Result<()> {
     Ok(())
 }
 
-fn process_locked_paths() -> &'static Mutex<HashSet<PathBuf>> {
-    static LOCKED_PATHS: std::sync::OnceLock<Mutex<HashSet<PathBuf>>> = std::sync::OnceLock::new();
-    LOCKED_PATHS.get_or_init(|| Mutex::new(HashSet::new()))
+type OpenLeaseId = u64;
+
+static DATABASE_OPEN_WAIT_COUNT: AtomicU64 = AtomicU64::new(0);
+static DATABASE_OPEN_FAILURE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DatabaseOpenMetrics {
+    pub lock_waits: u64,
+    pub failures: u64,
 }
 
-struct DatabaseFileLock {
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum DatabaseOpenKey {
+    IntendedPath(PathBuf),
+    FileIdentity(crate::durable_file::DurableFileIdentity),
+}
+
+#[derive(Debug)]
+enum ProcessOpenState {
+    Opening { lease_id: OpenLeaseId },
+    Open { lease_id: OpenLeaseId },
+    Closing { lease_id: OpenLeaseId },
+}
+
+impl ProcessOpenState {
+    fn lease_id(&self) -> OpenLeaseId {
+        match self {
+            Self::Opening { lease_id } | Self::Open { lease_id } | Self::Closing { lease_id } => {
+                *lease_id
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct ProcessOpenRegistry {
+    next_lease_id: OpenLeaseId,
+    entries: HashMap<DatabaseOpenKey, ProcessOpenState>,
+}
+
+fn process_open_registry() -> &'static Mutex<ProcessOpenRegistry> {
+    static REGISTRY: std::sync::OnceLock<Mutex<ProcessOpenRegistry>> = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(ProcessOpenRegistry::default()))
+}
+
+fn same_process_locked(path: &Path) -> MongrelError {
+    MongrelError::DatabaseLocked {
+        path: path.to_path_buf(),
+        message: "database is already open in this process; reuse the existing Arc<Database>"
+            .into(),
+    }
+}
+
+struct OpenReservation {
+    lease_id: OpenLeaseId,
+    keys: Vec<DatabaseOpenKey>,
+    committed: bool,
+}
+
+impl OpenReservation {
+    fn acquire(key: DatabaseOpenKey, display_path: &Path) -> Result<Self> {
+        let mut registry = process_open_registry().lock();
+        if registry.entries.contains_key(&key) {
+            DATABASE_OPEN_FAILURE_COUNT.fetch_add(1, Ordering::Relaxed);
+            return Err(same_process_locked(display_path));
+        }
+        registry.next_lease_id = registry.next_lease_id.checked_add(1).ok_or_else(|| {
+            MongrelError::Full("process database-open lease namespace exhausted".into())
+        })?;
+        let lease_id = registry.next_lease_id;
+        registry
+            .entries
+            .insert(key.clone(), ProcessOpenState::Opening { lease_id });
+        Ok(Self {
+            lease_id,
+            keys: vec![key],
+            committed: false,
+        })
+    }
+
+    fn into_lease(
+        mut self,
+        bootstrap_file: std::fs::File,
+        canonical_path: PathBuf,
+    ) -> ExclusiveDatabaseLease {
+        self.committed = true;
+        ExclusiveDatabaseLease {
+            lease_id: self.lease_id,
+            keys: std::mem::take(&mut self.keys),
+            bootstrap_file,
+            legacy_file: None,
+            canonical_path,
+            durable_root: None,
+            owner_pid: std::process::id(),
+            opened: false,
+        }
+    }
+}
+
+impl Drop for OpenReservation {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        DATABASE_OPEN_FAILURE_COUNT.fetch_add(1, Ordering::Relaxed);
+        let mut registry = process_open_registry().lock();
+        for key in &self.keys {
+            if registry
+                .entries
+                .get(key)
+                .is_some_and(|state| state.lease_id() == self.lease_id)
+            {
+                registry.entries.remove(key);
+            }
+        }
+    }
+}
+
+struct ExclusiveDatabaseLease {
+    lease_id: OpenLeaseId,
+    keys: Vec<DatabaseOpenKey>,
     bootstrap_file: std::fs::File,
     legacy_file: Option<std::fs::File>,
     canonical_path: PathBuf,
     durable_root: Option<Arc<crate::durable_file::DurableRoot>>,
+    owner_pid: u32,
+    opened: bool,
 }
 
-impl Drop for DatabaseFileLock {
+impl ExclusiveDatabaseLease {
+    fn claim_root_identity(&mut self, root: &crate::durable_file::DurableRoot) -> Result<()> {
+        let key = DatabaseOpenKey::FileIdentity(root.file_identity()?);
+        if self.keys.contains(&key) {
+            return Ok(());
+        }
+        let mut registry = process_open_registry().lock();
+        if registry.entries.contains_key(&key) {
+            return Err(same_process_locked(&self.canonical_path));
+        }
+        registry.entries.insert(
+            key.clone(),
+            ProcessOpenState::Opening {
+                lease_id: self.lease_id,
+            },
+        );
+        self.keys.push(key);
+        Ok(())
+    }
+
+    fn mark_open(&mut self) -> Result<()> {
+        let mut registry = process_open_registry().lock();
+        if self.keys.iter().any(|key| {
+            registry
+                .entries
+                .get(key)
+                .is_none_or(|state| state.lease_id() != self.lease_id)
+        }) {
+            return Err(MongrelError::Conflict(
+                "database-open reservation changed during initialization".into(),
+            ));
+        }
+        for key in &self.keys {
+            registry.entries.insert(
+                key.clone(),
+                ProcessOpenState::Open {
+                    lease_id: self.lease_id,
+                },
+            );
+        }
+        self.opened = true;
+        Ok(())
+    }
+}
+
+impl Drop for ExclusiveDatabaseLease {
     fn drop(&mut self) {
+        if std::process::id() != self.owner_pid {
+            return;
+        }
+        if !self.opened {
+            DATABASE_OPEN_FAILURE_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+        {
+            let mut registry = process_open_registry().lock();
+            for key in &self.keys {
+                if registry
+                    .entries
+                    .get(key)
+                    .is_some_and(|state| state.lease_id() == self.lease_id)
+                {
+                    registry.entries.insert(
+                        key.clone(),
+                        ProcessOpenState::Closing {
+                            lease_id: self.lease_id,
+                        },
+                    );
+                }
+            }
+        }
         if let Some(file) = &self.legacy_file {
             let _ = fs2::FileExt::unlock(file);
         }
         let _ = fs2::FileExt::unlock(&self.bootstrap_file);
-        process_locked_paths().lock().remove(&self.canonical_path);
+        let mut registry = process_open_registry().lock();
+        for key in &self.keys {
+            if registry
+                .entries
+                .get(key)
+                .is_some_and(|state| state.lease_id() == self.lease_id)
+            {
+                registry.entries.remove(key);
+            }
+        }
     }
 }
 
@@ -1207,19 +1401,20 @@ pub fn lock_table_with_context<'a>(
 #[derive(Clone, Debug, Default)]
 pub struct OpenOptions {
     /// Maximum time, in milliseconds, to wait for the cross-process database
-    /// lock (`_meta/.lock`) before failing the open with `MongrelError::Io`.
+    /// lock (`_meta/.lock`) before failing with `MongrelError::DatabaseLocked`.
     ///
     /// `0` (the default) preserves the historical fail-fast semantics: a
     /// single `try_lock_exclusive` call, no retry, no sleep. SQLite-style
     /// `busy_timeout` semantics kick in once this is non-zero — the open
     /// sleeps with progressively wider backoff (1ms → 10ms → 50ms) until
     /// either the lock is acquired or `lock_timeout_ms` elapses, at which
-    /// point the open returns the same `Io(WouldBlock)` error the fail-fast
-    /// path would.
+    /// point the open returns the same typed lock error as the fail-fast path.
     ///
     /// Only the cross-process lock is affected. Mounted tables, page-cache
     /// misses, and WAL appends already serialize through in-process locks
-    /// that handle their own contention.
+    /// that handle their own contention. A second independent open in the
+    /// same process always returns `DatabaseLocked` immediately; share the
+    /// existing `Arc<Database>` instead.
     pub lock_timeout_ms: u32,
 }
 
@@ -1310,9 +1505,6 @@ pub struct Database {
     trigger_recursive: AtomicBool,
     trigger_max_depth: AtomicU32,
     trigger_max_loop_iterations: AtomicU32,
-    /// Exclusive cross-process lock held for the database's lifetime to prevent
-    /// two processes from opening the same directory concurrently.
-    _lock: Option<DatabaseFileLock>,
     /// Lightweight channel for ephemeral SQL NOTIFY messages. Durable row CDC
     /// is reconstructed from the WAL by [`Database::change_events_since`].
     notify: tokio::sync::broadcast::Sender<ChangeEvent>,
@@ -1335,6 +1527,8 @@ pub struct Database {
     /// to `Database` (which would create a cycle). `AuthState` is already
     /// cheaply cloneable (inner `Arc`), so no outer `Arc` is needed.
     auth_state: crate::auth_state::AuthState,
+    /// Final field so every storage resource drops before the exclusive lease.
+    _lock: Option<ExclusiveDatabaseLease>,
 }
 
 struct RunPins {
@@ -1440,6 +1634,44 @@ impl std::fmt::Debug for Database {
 }
 
 impl Database {
+    pub fn open_metrics() -> DatabaseOpenMetrics {
+        DatabaseOpenMetrics {
+            lock_waits: DATABASE_OPEN_WAIT_COUNT.load(Ordering::Relaxed),
+            failures: DATABASE_OPEN_FAILURE_COUNT.load(Ordering::Relaxed),
+        }
+    }
+
+    fn ensure_owner_process(&self) -> Result<()> {
+        let current_pid = std::process::id();
+        let owner_pid = self
+            ._lock
+            .as_ref()
+            .map(|lease| lease.owner_pid)
+            .unwrap_or(current_pid);
+        if current_pid == owner_pid {
+            Ok(())
+        } else {
+            Err(MongrelError::ForkedProcess {
+                owner_pid,
+                current_pid,
+            })
+        }
+    }
+
+    /// Explicitly close the final shared database owner.
+    pub fn shutdown(self: Arc<Self>) -> Result<()> {
+        match Arc::try_unwrap(self) {
+            Ok(database) => {
+                database.ensure_owner_process()?;
+                drop(database);
+                Ok(())
+            }
+            Err(database) => Err(MongrelError::DatabaseBusy {
+                strong_handles: Arc::strong_count(&database),
+            }),
+        }
+    }
+
     fn canonical_lock_target(root: &Path) -> std::io::Result<(PathBuf, PathBuf)> {
         if let Ok(canonical) = root.canonicalize() {
             let lock_dir = canonical.parent().ok_or_else(|| {
@@ -1481,52 +1713,32 @@ impl Database {
         Ok((canonical, lock_dir))
     }
 
-    fn acquire_database_lock(root: &Path, timeout_ms: u32) -> Result<DatabaseFileLock> {
+    fn acquire_database_lock(root: &Path, timeout_ms: u32) -> Result<ExclusiveDatabaseLease> {
         use std::hash::{Hash, Hasher};
 
         let (canonical_path, lock_dir) = Self::canonical_lock_target(root)?;
-        {
-            let mut locked = process_locked_paths().lock();
-            if !locked.insert(canonical_path.clone()) {
-                return Err(MongrelError::DatabaseLocked {
-                    path: root.to_path_buf(),
-                    message: "already open in this process".into(),
-                });
-            }
-        }
+        let reservation =
+            OpenReservation::acquire(DatabaseOpenKey::IntendedPath(canonical_path.clone()), root)?;
 
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         canonical_path.hash(&mut hasher);
         let lock_path = lock_dir.join(format!(".mongreldb-{:016x}.lock", hasher.finish()));
-        let file = match std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
-            .open(lock_path)
-        {
-            Ok(file) => file,
-            Err(error) => {
-                process_locked_paths().lock().remove(&canonical_path);
-                return Err(error.into());
-            }
-        };
+            .open(lock_path)?;
         if let Err(error) = Self::fs_lock_exclusive(&file, timeout_ms) {
-            process_locked_paths().lock().remove(&canonical_path);
             return Err(MongrelError::DatabaseLocked {
                 path: root.to_path_buf(),
                 message: error.to_string(),
             });
         }
-        Ok(DatabaseFileLock {
-            bootstrap_file: file,
-            legacy_file: None,
-            canonical_path,
-            durable_root: None,
-        })
+        Ok(reservation.into_lease(file, canonical_path))
     }
 
     fn acquire_legacy_database_lock(
-        lock: &mut DatabaseFileLock,
+        lock: &mut ExclusiveDatabaseLease,
         root: &Path,
         timeout_ms: u32,
     ) -> Result<()> {
@@ -1566,7 +1778,7 @@ impl Database {
             .map_err(Into::into)
     }
 
-    fn begin_create(root: impl AsRef<Path>) -> Result<(PathBuf, DatabaseFileLock)> {
+    fn begin_create(root: impl AsRef<Path>) -> Result<(PathBuf, ExclusiveDatabaseLease)> {
         let requested_root = root.as_ref();
         let mut lock = Self::acquire_database_lock(requested_root, 0)?;
         let root = lock.canonical_path.clone();
@@ -1577,6 +1789,7 @@ impl Database {
                 "database root changed while it was being created".into(),
             ));
         }
+        lock.claim_root_identity(&durable_root)?;
         durable_root.create_directory_all(META_DIR)?;
         lock.durable_root = Some(durable_root);
         let io_root = lock
@@ -1592,25 +1805,27 @@ impl Database {
     fn begin_open(
         root: impl AsRef<Path>,
         lock_timeout_ms: u32,
-    ) -> Result<(PathBuf, DatabaseFileLock)> {
+    ) -> Result<(PathBuf, ExclusiveDatabaseLease)> {
         let root = root.as_ref();
-        let durable_root = crate::durable_file::DurableRoot::open(root).map_err(|error| {
+        let canonical_root = root.canonicalize().map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 MongrelError::NotFound(format!("database root {}: {error}", root.display()))
             } else {
                 error.into()
             }
         })?;
+        let durable_root = crate::durable_file::DurableRoot::open(&canonical_root)?;
         Self::begin_open_durable(durable_root, lock_timeout_ms)
     }
 
     fn begin_open_durable(
         durable_root: crate::durable_file::DurableRoot,
         lock_timeout_ms: u32,
-    ) -> Result<(PathBuf, DatabaseFileLock)> {
+    ) -> Result<(PathBuf, ExclusiveDatabaseLease)> {
         let io_root = durable_root.io_path()?;
         let current_root = io_root.canonicalize()?;
         let mut lock = Self::acquire_database_lock(&current_root, lock_timeout_ms)?;
+        lock.claim_root_identity(&durable_root)?;
         lock.durable_root = Some(Arc::new(durable_root));
         let io_root = lock
             .durable_root
@@ -1664,7 +1879,7 @@ impl Database {
     fn create_inner(
         root: PathBuf,
         kek: Option<Arc<crate::encryption::Kek>>,
-        lock: DatabaseFileLock,
+        lock: ExclusiveDatabaseLease,
     ) -> Result<Self> {
         crate::durable_file::create_directory_all(&root.join(TABLES_DIR))?;
         let meta_dek = crate::encryption::meta_dek_for(kek.as_deref());
@@ -1814,7 +2029,7 @@ impl Database {
     fn open_inner_locked(
         root: PathBuf,
         kek: Option<Arc<crate::encryption::Kek>>,
-        lock: DatabaseFileLock,
+        lock: ExclusiveDatabaseLease,
     ) -> Result<Self> {
         let meta_dek = crate::encryption::meta_dek_for(kek.as_deref());
         let mut cat = catalog::read_durable(
@@ -1893,7 +2108,7 @@ impl Database {
         kek: Option<Arc<crate::encryption::Kek>>,
         username: &str,
         password: &str,
-        lock: DatabaseFileLock,
+        lock: ExclusiveDatabaseLease,
     ) -> Result<Self> {
         let meta_dek = crate::encryption::meta_dek_for(kek.as_deref());
         let mut cat = catalog::read_durable(
@@ -2013,7 +2228,7 @@ impl Database {
         kek: Option<Arc<crate::encryption::Kek>>,
         admin_username: &str,
         admin_password: &str,
-        lock: DatabaseFileLock,
+        lock: ExclusiveDatabaseLease,
     ) -> Result<Self> {
         crate::durable_file::create_directory_all(&root.join(TABLES_DIR))?;
         let meta_dek = crate::encryption::meta_dek_for(kek.as_deref());
@@ -2102,7 +2317,7 @@ impl Database {
     fn open_replica_recovery_inner(
         root: PathBuf,
         kek: Option<Arc<crate::encryption::Kek>>,
-        lock: DatabaseFileLock,
+        lock: ExclusiveDatabaseLease,
     ) -> Result<Self> {
         if !root.join(META_DIR).join("replica").is_file() {
             return Err(MongrelError::InvalidArgument(
@@ -2183,10 +2398,15 @@ impl Database {
         let deadline =
             std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
         let mut next_sleep = std::time::Duration::from_millis(1);
+        let mut recorded_wait = false;
         loop {
             match f.try_lock_exclusive() {
                 Ok(()) => return Ok(()),
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if !recorded_wait {
+                        DATABASE_OPEN_WAIT_COUNT.fetch_add(1, Ordering::Relaxed);
+                        recorded_wait = true;
+                    }
                     let now = std::time::Instant::now();
                     if now >= deadline {
                         return Err(std::io::Error::new(
@@ -2218,7 +2438,7 @@ impl Database {
         recovery_checkpoint: Option<Catalog>,
         recovery_records: Option<Vec<crate::wal::Record>>,
         principal: Option<crate::auth::Principal>,
-        lock: DatabaseFileLock,
+        lock: ExclusiveDatabaseLease,
     ) -> Result<Self> {
         let durable_root = Arc::clone(lock.durable_root.as_ref().ok_or_else(|| {
             MongrelError::Other("database root descriptor was not pinned".into())
@@ -2535,6 +2755,8 @@ impl Database {
         let next_txn_id = (open_generation << 32) | 1;
         // Seed the shared txn-id allocator now that the generation is final.
         *txn_ids.lock() = next_txn_id;
+        let mut lock = lock;
+        lock.mark_open()?;
 
         Ok(Self {
             root,
@@ -2574,7 +2796,6 @@ impl Database {
             trigger_max_loop_iterations: AtomicU32::new(
                 TriggerConfig::default().max_loop_iterations,
             ),
-            _lock: Some(lock),
             notify: {
                 let (tx, _rx) = tokio::sync::broadcast::channel(256);
                 tx
@@ -2582,6 +2803,7 @@ impl Database {
             change_wake,
             principal: RwLock::new(principal),
             auth_state,
+            _lock: Some(lock),
         })
     }
 
@@ -4440,6 +4662,7 @@ impl Database {
     /// post-commit publication failure. Ordinary table/catalog state is made
     /// coherent before poison; file-backed external modules use this gate.
     pub fn ensure_consistent_read(&self) -> Result<()> {
+        self.ensure_owner_process()?;
         if self.poisoned.load(Ordering::Relaxed) {
             return Err(MongrelError::Other(
                 "database poisoned by post-commit failure; reopen required".into(),
@@ -6118,6 +6341,7 @@ impl Database {
     ///
     /// On a credentialless database this is a no-op (`Ok(())`).
     pub fn require(&self, perm: &crate::auth::Permission) -> Result<()> {
+        self.ensure_owner_process()?;
         if self.read_only && !matches!(perm, crate::auth::Permission::Select { .. }) {
             return Err(MongrelError::ReadOnlyReplica);
         }
@@ -10386,6 +10610,7 @@ impl Database {
 
     /// Look up a live table by name.
     pub fn table(&self, name: &str) -> Result<TableHandle> {
+        self.ensure_owner_process()?;
         let cat = self.catalog.read();
         let entry = cat
             .live(name)
@@ -12096,6 +12321,7 @@ impl Database {
         Ok(())
     }
     fn alloc_txn_id(&self) -> Result<u64> {
+        self.ensure_owner_process()?;
         crate::txn::allocate_txn_id(&self.next_txn_id)
     }
 

@@ -369,11 +369,34 @@ This reads the manifest, replays the WAL, and rebuilds indexes. If a
 global index checkpoint exists, it's loaded directly (fast reopen). Otherwise
 indexes are rebuilt from the sorted runs.
 
+## One Open Storage Core
+
+One process may independently open a database root only once. Share that
+database with `Arc<Database>` instead of reopening it per request:
+
+```rust
+use std::sync::Arc;
+
+let database = Arc::new(Database::open("./mydb")?);
+let api_database = Arc::clone(&database);
+let worker_database = Arc::clone(&database);
+```
+
+Dropping one clone only decrements the reference count. The final owner keeps
+the WAL, catalog, tables, and exclusive lock alive until it drops. To request
+an explicit final close, call `database.shutdown()`; it returns
+`MongrelError::DatabaseBusy` while other clones remain.
+
+A second independent open returns `MongrelError::DatabaseLocked` immediately,
+including through relative, dotted, or symlink aliases. `lock_timeout_ms` does
+not make a same-process reopen wait. Do not use an open database after `fork`;
+open it after `exec` in the child.
+
 ## Cross-Process Lock Contention
 
 By default, [`Database::open`] is **fail-fast**: if another process already
 holds the cross-process lock on `<dir>/_meta/.lock`, the open returns
-`MongrelError::Io` immediately. That mirrors the historical `try_lock_exclusive`
+`MongrelError::DatabaseLocked` immediately. That mirrors the historical `try_lock_exclusive`
 semantics and lets coordinating callers bring their own retry logic.
 
 If you'd rather have SQLite-style `busy_timeout` semantics - block for up to

@@ -53,6 +53,7 @@ tempfile = "3"
 criterion = "0.5"
 bincode = "1"
 sha2 = "0.10"
+libc = "0.2"
 
 [[bench]]
 name = "write_path"

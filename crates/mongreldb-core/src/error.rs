@@ -12,6 +12,10 @@ pub enum MongrelError {
         path: std::path::PathBuf,
         message: String,
     },
+    #[error("database still has {strong_handles} shared handles")]
+    DatabaseBusy { strong_handles: usize },
+    #[error("database handle belongs to process {owner_pid}, not post-fork process {current_pid}; open after exec")]
+    ForkedProcess { owner_pid: u32, current_pid: u32 },
     #[error("serialization error: {0}")]
     Serialization(#[from] bincode::Error),
     #[error("corrupt wal record at offset {offset}: {reason}")]

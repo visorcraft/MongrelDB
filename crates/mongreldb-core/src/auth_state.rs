@@ -32,6 +32,7 @@ pub struct AuthState {
 
 #[derive(Debug)]
 struct AuthStateInner {
+    owner_pid: u32,
     /// The require_auth flag, read live from the catalog. This is a `RwLock<bool>`
     /// mirror of `Catalog::require_auth` — kept here so the Table layer can
     /// read it without acquiring the full catalog lock on every operation.
@@ -48,6 +49,7 @@ impl AuthState {
     pub fn new(require_auth: bool, principal: Option<Principal>) -> Self {
         Self {
             inner: Arc::new(AuthStateInner {
+                owner_pid: std::process::id(),
                 require_auth: RwLock::new(require_auth),
                 principal: RwLock::new(principal),
             }),
@@ -88,6 +90,13 @@ impl AuthState {
     /// This is the primary entry point called by `Table` and `Transaction`
     /// enforcement points.
     pub fn require(&self, table_name: &str, perm: RequiredPermission) -> Result<()> {
+        let current_pid = std::process::id();
+        if current_pid != self.inner.owner_pid {
+            return Err(MongrelError::ForkedProcess {
+                owner_pid: self.inner.owner_pid,
+                current_pid,
+            });
+        }
         if !self.require_auth() {
             return Ok(());
         }

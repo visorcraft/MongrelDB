@@ -2,6 +2,15 @@ use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+/// Stable identity for a descriptor-pinned durable directory.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum DurableFileIdentity {
+    #[cfg(unix)]
+    Unix { device: u64, inode: u64 },
+    #[cfg(windows)]
+    Windows { volume_serial: u32, file_index: u64 },
+}
+
 /// Descriptor-pinned root for durable state owned by a database.
 ///
 /// Every relative operation rejects `..`, symlinks, reparse points, and
@@ -132,6 +141,45 @@ impl DurableRoot {
 
     pub fn canonical_path(&self) -> &Path {
         &self.canonical_path
+    }
+
+    /// Return the stable identity of the pinned directory handle.
+    pub fn file_identity(&self) -> io::Result<DurableFileIdentity> {
+        #[cfg(all(
+            unix,
+            any(target_os = "linux", target_os = "android", target_vendor = "apple")
+        ))]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = self.directory.metadata()?;
+            return Ok(DurableFileIdentity::Unix {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            });
+        }
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            let metadata = self.directory.metadata()?;
+            return Ok(DurableFileIdentity::Windows {
+                volume_serial: metadata.volume_serial_number().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "directory has no volume identity",
+                    )
+                })?,
+                file_index: metadata.file_index().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::Unsupported, "directory has no file identity")
+                })?,
+            });
+        }
+
+        #[allow(unreachable_code)]
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "durable root identity is unsupported on this platform",
+        ))
     }
 
     /// Stable operational path backed by the pinned directory descriptor.

@@ -154,6 +154,9 @@ Latest local release-build measurements are in
   open, so encrypted columns prune identically to plaintext ones.
 - **Multi-table:** a `Database` hosts many named tables under a shared WAL;
   distinct tables register on one DataFusion context for joins.
+- **Exclusive open:** one process owns one storage core per durable root.
+  Share `Arc<Database>` across workers and sessions; a second independent
+  open, including path aliases, returns `DatabaseLocked` immediately.
 - **SQL surface:** DataFusion 54 with `WITH RECURSIVE` CTEs, window functions
   (`OVER`/`PARTITION BY`), `CREATE TABLE AS SELECT`, session-scoped
   `CREATE VIEW` plus `CREATE MATERIALIZED VIEW`, multi-statement execution in a

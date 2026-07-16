@@ -2355,6 +2355,7 @@ dependencies = [
  "getrandom 0.2.17",
  "hkdf",
  "hmac",
+ "libc",
  "lz4_flex 0.11.6",
  "memmap2",
  "parking_lot",

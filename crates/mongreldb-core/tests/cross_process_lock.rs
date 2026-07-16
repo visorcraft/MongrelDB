@@ -4,10 +4,8 @@
 //! Every test follows the same shape:
 //!
 //! 1. `create_then_exit`: spawn a subprocess that runs `Database::create`
-//!    and exits. This produces a populated `<dir>` and is the only way to
-//!    pre-create the DB without polluting the parent's per-process
-//!    `LOCKED_PATHS` set (which would mask the cross-process contention
-//!    we're trying to observe).
+//!    and exits. This produces a populated `<dir>` without retaining a
+//!    process-local open reservation in the parent.
 //! 2. `flock_holder`: spawn a subprocess that acquires a direct
 //!    `flock(2)` on `<dir>/_meta/.lock` and spins. This is what another
 //!    process holding the database lock looks like at the kernel level —
@@ -84,9 +82,8 @@ fn wait_for_line(rx: &mpsc::Receiver<String>, want: &str, timeout: Duration) -> 
 
 fn pre_create(dir: &std::path::Path) {
     // Spawn a subprocess that runs `Database::create` and exits. This
-    // populates the directory without polluting the parent's per-process
-    // `LOCKED_PATHS` set (which would mask the cross-process contention
-    // these tests are designed to observe).
+    // populates the directory without retaining a process-local reservation
+    // in the parent.
     let (mut sub, rx) = spawn_sub("create_then_exit", dir);
     let line = wait_for_line_with(&rx, |l| l == "CREATED", Duration::from_secs(5))
         .expect("create_then_exit");
@@ -199,6 +196,42 @@ fn fail_fast_default_rejects_concurrent_open() {
         elapsed < Duration::from_secs(2),
         "fail-fast took too long ({elapsed:?}); expected <2s"
     );
+
+    holder.kill().expect("kill holder");
+    let _ = holder.wait();
+}
+
+#[test]
+fn waiting_open_does_not_block_unrelated_database_open() {
+    let blocked = TempDir::new().unwrap();
+    let unrelated = TempDir::new().unwrap();
+    pre_create(blocked.path());
+    pre_create(unrelated.path());
+    let (mut holder, holder_rx) = spawn_sub("flock_holder", blocked.path());
+    assert!(wait_for_line(&holder_rx, "READY", Duration::from_secs(5)));
+
+    let blocked_path = blocked.path().to_path_buf();
+    let metrics_before = Database::open_metrics();
+    let (started_tx, started_rx) = mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        Database::open_with_options(
+            blocked_path,
+            OpenOptions::default().with_lock_timeout_ms(750),
+        )
+    });
+    started_rx.recv().unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+
+    let started = Instant::now();
+    let database = Database::open(unrelated.path()).unwrap();
+    assert!(started.elapsed() < Duration::from_millis(500));
+    drop(database);
+    assert!(matches!(
+        waiter.join().unwrap(),
+        Err(mongreldb_core::MongrelError::DatabaseLocked { .. })
+    ));
+    assert!(Database::open_metrics().lock_waits > metrics_before.lock_waits);
 
     holder.kill().expect("kill holder");
     let _ = holder.wait();
