@@ -112,7 +112,10 @@ fn rank1(bits: &[u64], len: usize, rank_prefix: &[usize], i: usize) -> usize {
     for w in &bits[w_start..full.min(w_start + RANK_BLOCK_WORDS)] {
         ones += w.count_ones() as usize;
     }
-    if i % 64 != 0 && full < bits.len() && (full >= w_start && full < w_start + RANK_BLOCK_WORDS) {
+    if !i.is_multiple_of(64)
+        && full < bits.len()
+        && (full >= w_start && full < w_start + RANK_BLOCK_WORDS)
+    {
         ones += (bits[full] & ((1u64 << (i % 64)) - 1)).count_ones() as usize;
     }
     ones

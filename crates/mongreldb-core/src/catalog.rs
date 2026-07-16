@@ -436,7 +436,7 @@ pub fn read(dir: &Path, meta_dek: Option<&[u8; META_DEK_LEN]>) -> Result<Option<
     let file = match crate::durable_file::open_regular_nofollow(&p) {
         Ok(file) => file,
         Err(MongrelError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
+        Err(e) => return Err(e),
     };
     read_file(file, meta_dek)
 }

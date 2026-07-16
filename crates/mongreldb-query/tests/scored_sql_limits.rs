@@ -84,8 +84,7 @@ async fn scored_sql_limits_fail_with_errors() {
         .await
         .is_err());
 
-    let projection = std::iter::repeat("id")
-        .take(mongreldb_core::query::MAX_PROJECTION_COLUMNS + 1)
+    let projection = std::iter::repeat_n("id", mongreldb_core::query::MAX_PROJECTION_COLUMNS + 1)
         .collect::<Vec<_>>()
         .join(",");
     assert!(session

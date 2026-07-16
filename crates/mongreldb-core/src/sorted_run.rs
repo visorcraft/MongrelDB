@@ -1978,7 +1978,7 @@ impl RunVisibleVersionCursor {
                 return Ok(None);
             }
         }
-        if self.within_page % 256 == 0 {
+        if self.within_page.is_multiple_of(256) {
             control.checkpoint()?;
         }
         let position = self.within_page;
@@ -2012,9 +2012,8 @@ impl RunVisibleVersionCursor {
                     break;
                 }
                 if candidate.committed_epoch <= self.snapshot
-                    && best.map_or(true, |current| {
-                        candidate.committed_epoch > current.committed_epoch
-                    })
+                    && best
+                        .is_none_or(|current| candidate.committed_epoch > current.committed_epoch)
                 {
                     best = Some(candidate);
                 }

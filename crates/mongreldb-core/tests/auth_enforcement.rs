@@ -127,7 +127,7 @@ fn query_as(
                     allowed_columns.contains(column)
                         && projection
                             .as_ref()
-                            .map_or(true, |projection| projection.contains(column))
+                            .is_none_or(|projection| projection.contains(column))
                 });
             }
             db.secure_rows_for(table_name, rows, effective_principal)

@@ -637,7 +637,7 @@ fn command_checkpoint(
     query: &RegisteredSqlQuery,
     index: usize,
 ) -> Result<()> {
-    if index % COMMAND_CHECKPOINT_ROWS == 0 {
+    if index.is_multiple_of(COMMAND_CHECKPOINT_ROWS) {
         session.fire_test_hook(SqlTestHookPoint::BeforeScanBatch);
         query.checkpoint()?;
     }
@@ -3461,7 +3461,7 @@ fn trigger_insert_steps(
     let mut steps = Vec::with_capacity(rows.len());
     let mut expanded_values = 0_usize;
     for row in rows {
-        if expanded_values % COMMAND_CHECKPOINT_ROWS == 0 {
+        if expanded_values.is_multiple_of(COMMAND_CHECKPOINT_ROWS) {
             session.fire_test_hook(SqlTestHookPoint::DuringTriggerExpansion);
             query.checkpoint()?;
         }
@@ -3474,7 +3474,7 @@ fn trigger_insert_steps(
         }
         let mut cells = Vec::with_capacity(row.len());
         for (col, expr) in columns.iter().zip(row.iter()) {
-            if expanded_values % COMMAND_CHECKPOINT_ROWS == 0 {
+            if expanded_values.is_multiple_of(COMMAND_CHECKPOINT_ROWS) {
                 session.fire_test_hook(SqlTestHookPoint::DuringTriggerExpansion);
                 query.checkpoint()?;
             }
@@ -5913,13 +5913,13 @@ fn apply_order_by(
     drop(keys);
     let mut permutation_steps = 0_usize;
     for index in 0..rows.len() {
-        if permutation_steps % COMMAND_CHECKPOINT_ROWS == 0 {
+        if permutation_steps.is_multiple_of(COMMAND_CHECKPOINT_ROWS) {
             session.fire_test_hook(SqlTestHookPoint::DuringOrderedDmlPermutation);
             query.checkpoint()?;
         }
         permutation_steps = permutation_steps.saturating_add(1);
         while destination[index] != index {
-            if permutation_steps % COMMAND_CHECKPOINT_ROWS == 0 {
+            if permutation_steps.is_multiple_of(COMMAND_CHECKPOINT_ROWS) {
                 session.fire_test_hook(SqlTestHookPoint::DuringOrderedDmlPermutation);
                 query.checkpoint()?;
             }
@@ -6766,9 +6766,9 @@ impl ExternalTriggerBridge for QueryExternalTriggerBridge {
                     if row_index % COMMAND_CHECKPOINT_ROWS == 0 {
                         self.query.checkpoint().map_err(query_error_to_core)?;
                     }
-                    if !row
+                    if row
                         .get(&pk_col.id)
-                        .is_some_and(|value| value.encode_key() == pk_key)
+                        .is_none_or(|value| value.encode_key() != pk_key)
                     {
                         kept.push(row);
                     }
@@ -7815,7 +7815,7 @@ fn like_match(value: &str, pattern: &str, query: &RegisteredSqlQuery) -> Result<
     let mut steps = 0_usize;
 
     while value_index < value.len() {
-        if steps % COMMAND_CHECKPOINT_ROWS == 0 {
+        if steps.is_multiple_of(COMMAND_CHECKPOINT_ROWS) {
             query.checkpoint()?;
         }
         steps = steps.saturating_add(1);
@@ -8980,7 +8980,7 @@ fn dir_size(path: &Path, query: &RegisteredSqlQuery, scanned: &mut usize) -> Res
         return Ok(0);
     };
     for entry in entries {
-        if *scanned % COMMAND_CHECKPOINT_ROWS == 0 {
+        if (*scanned).is_multiple_of(COMMAND_CHECKPOINT_ROWS) {
             query.checkpoint()?;
         }
         *scanned += 1;

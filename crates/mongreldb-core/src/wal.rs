@@ -1494,7 +1494,7 @@ fn replay_wal_layout(
             };
             total
                 .checked_add(bytes)
-                .ok_or_else(|| MongrelError::ResourceLimitExceeded {
+                .ok_or(MongrelError::ResourceLimitExceeded {
                     resource: "WAL recovery bytes",
                     requested: usize::MAX,
                     limit: MAX_RECOVERY_WAL_BYTES as usize,
@@ -1893,7 +1893,7 @@ impl SharedWal {
             self.wal_dek.as_ref(),
         )?;
         self.group_sync_count += 1;
-        let highest = self.active.next_seq_val().checked_sub(1).unwrap_or(0);
+        let highest = self.active.next_seq_val().saturating_sub(1);
         if highest > self.durable_seq {
             self.durable_seq = highest;
         }
@@ -1957,7 +1957,7 @@ impl SharedWal {
             self.open_generation,
             self.wal_dek.as_ref(),
         )?;
-        let highest = self.active.next_seq_val().checked_sub(1).unwrap_or(0);
+        let highest = self.active.next_seq_val().saturating_sub(1);
         self.durable_seq = self.durable_seq.max(highest);
         let previous_segment_hash = hash_segment(&self.wal_root, self.active_segment_no)?;
         let cipher = match &self.wal_dek {

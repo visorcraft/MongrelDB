@@ -126,9 +126,7 @@ fn benchmarks(criterion: &mut Criterion) {
                 while session
                     .query_registry()
                     .status(query_id)
-                    .map_or(true, |status| {
-                        status.phase != mongreldb_query::SqlQueryPhase::Queued
-                    })
+                    .is_none_or(|status| status.phase != mongreldb_query::SqlQueryPhase::Queued)
                 {
                     std::thread::yield_now();
                 }

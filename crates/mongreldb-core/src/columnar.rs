@@ -1126,7 +1126,7 @@ impl NativeColumn {
 }
 
 fn full_validity(n: usize) -> Vec<u8> {
-    validity_bitmap_from(std::iter::repeat(true).take(n))
+    validity_bitmap_from(std::iter::repeat_n(true, n))
 }
 
 /// An all-null typed column of length `n` (for schema-evolved columns absent
@@ -1172,7 +1172,7 @@ pub fn all_non_null(validity: &[u8], n: usize) -> bool {
     if !validity[..full].iter().all(|&b| b == 0xFF) {
         return false;
     }
-    if n % 8 != 0 {
+    if !n.is_multiple_of(8) {
         let mask = (1u8 << (n % 8)) - 1;
         (validity.get(full).copied().unwrap_or(0) & mask) == mask
     } else {

@@ -78,7 +78,7 @@ fn commit_prepare_checkpoint(
     control: Option<&crate::ExecutionControl>,
     index: usize,
 ) -> Result<()> {
-    if index % 256 == 0 {
+    if index.is_multiple_of(256) {
         if let Some(control) = control {
             control.checkpoint()?;
         }
@@ -2201,6 +2201,7 @@ impl Database {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn finish_open(
         root: PathBuf,
         cat: Catalog,
@@ -3882,7 +3883,7 @@ impl Database {
                         allowed_columns.contains(column)
                             && projection
                                 .as_ref()
-                                .map_or(true, |projection| projection.contains(column))
+                                .is_none_or(|projection| projection.contains(column))
                     });
                 }
                 self.secure_rows_for(table_name, rows, principal)
@@ -10953,9 +10954,9 @@ impl Database {
                     )))
                 }
             };
-            if !catalog
+            if catalog
                 .live(new_name)
-                .is_some_and(|entry| entry.table_id == replaced_table_id)
+                .is_none_or(|entry| entry.table_id != replaced_table_id)
             {
                 return Err(MongrelError::Conflict(format!(
                     "table {new_name:?} changed while its replacement was built"
@@ -11393,11 +11394,11 @@ impl Database {
         let result: Result<(ColumnDef, Option<Epoch>)> = (|| {
             let _security_write = self.security_write()?;
             self.require(&crate::auth::Permission::Ddl)?;
-            if !self
+            if self
                 .catalog
                 .read()
                 .live(table_name)
-                .is_some_and(|entry| entry.table_id == table_id)
+                .is_none_or(|entry| entry.table_id != table_id)
             {
                 return Err(MongrelError::Conflict(format!(
                     "table {table_name:?} changed during ALTER"
@@ -14858,10 +14859,9 @@ fn validate_recovered_schema(schema: &Schema) -> Result<()> {
                 foreign_key.name
             )));
         }
-        if matches!(foreign_key.on_delete, crate::constraint::FkAction::SetNull)
-            || matches!(foreign_key.on_update, crate::constraint::FkAction::SetNull)
-        {
-            if foreign_key.columns.iter().any(|id| {
+        if (matches!(foreign_key.on_delete, crate::constraint::FkAction::SetNull)
+            || matches!(foreign_key.on_update, crate::constraint::FkAction::SetNull))
+            && foreign_key.columns.iter().any(|id| {
                 schema
                     .columns
                     .iter()
@@ -14869,12 +14869,12 @@ fn validate_recovered_schema(schema: &Schema) -> Result<()> {
                     .is_none_or(|column| {
                         !column.flags.contains(crate::schema::ColumnFlags::NULLABLE)
                     })
-            }) {
-                return Err(MongrelError::Schema(format!(
-                    "foreign key {:?} uses SET NULL on a non-nullable column",
-                    foreign_key.name
-                )));
-            }
+            })
+        {
+            return Err(MongrelError::Schema(format!(
+                "foreign key {:?} uses SET NULL on a non-nullable column",
+                foreign_key.name
+            )));
         }
     }
     for check in &schema.constraints.checks {

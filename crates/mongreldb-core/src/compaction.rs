@@ -129,7 +129,7 @@ impl Table {
             control.checkpoint()?;
             let mut reader = self.open_reader(rr.run_id)?;
             for row in reader.all_rows()? {
-                if scanned % 256 == 0 {
+                if scanned.is_multiple_of(256) {
                     control.checkpoint()?;
                 }
                 scanned += 1;
@@ -137,7 +137,7 @@ impl Table {
             }
         }
         for row in mutable_rows {
-            if scanned % 256 == 0 {
+            if scanned.is_multiple_of(256) {
                 control.checkpoint()?;
             }
             scanned += 1;
@@ -313,7 +313,7 @@ fn select_keep(vers: &[Row], min_active: Option<Epoch>) -> Vec<Row> {
         Some(min_e) => {
             let recent_start = vers.partition_point(|row| row.committed_epoch < min_e);
             let mut keep = vers[recent_start..].to_vec();
-            if recent_start > 0 && keep.first().map_or(true, |row| row.committed_epoch > min_e) {
+            if recent_start > 0 && keep.first().is_none_or(|row| row.committed_epoch > min_e) {
                 let boundary = vers[recent_start - 1].clone();
                 if keep.is_empty() && boundary.deleted {
                     return Vec::new();

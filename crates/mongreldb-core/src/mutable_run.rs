@@ -111,7 +111,7 @@ impl MutableRun {
                     break;
                 }
                 if *epoch <= snapshot_epoch
-                    && best.as_ref().map_or(true, |(current, _)| *epoch > *current)
+                    && best.as_ref().is_none_or(|(current, _)| *epoch > *current)
                 {
                     best = Some((*epoch, row.clone()));
                 }
@@ -134,7 +134,7 @@ impl MutableRun {
                 if *epoch <= snapshot_epoch
                     && by_row
                         .get(rid)
-                        .map_or(true, |current| *epoch > current.committed_epoch)
+                        .is_none_or(|current| *epoch > current.committed_epoch)
                 {
                     by_row.insert(*rid, row.clone());
                 }

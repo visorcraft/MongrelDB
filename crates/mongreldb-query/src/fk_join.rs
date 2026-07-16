@@ -43,7 +43,7 @@ type SortInfo = (Vec<(Expr, bool, bool)>, Option<usize>);
 
 #[inline]
 fn checkpoint(query: Option<&RegisteredSqlQuery>, index: usize) -> Result<()> {
-    if index % 256 == 0 {
+    if index.is_multiple_of(256) {
         query.map(RegisteredSqlQuery::checkpoint).transpose()?;
     }
     Ok(())

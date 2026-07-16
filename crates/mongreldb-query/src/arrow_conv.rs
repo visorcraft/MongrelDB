@@ -27,7 +27,7 @@ fn all_bits_set(validity: &[u8], n: usize) -> bool {
     if !validity[..full].iter().all(|&b| b == 0xFF) {
         return false;
     }
-    if n % 8 != 0 {
+    if !n.is_multiple_of(8) {
         let mask = (1u8 << (n % 8)) - 1;
         (validity.get(full).copied().unwrap_or(0) & mask) == mask
     } else {
@@ -153,7 +153,7 @@ pub(crate) fn native_to_array_owned_with_query(
 
 #[inline]
 fn checkpoint(query: Option<&RegisteredSqlQuery>, index: usize) -> Result<()> {
-    if index % 256 == 0 {
+    if index.is_multiple_of(256) {
         query.map(RegisteredSqlQuery::checkpoint).transpose()?;
     }
     Ok(())

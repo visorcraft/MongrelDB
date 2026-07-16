@@ -214,7 +214,7 @@ fn merge_controlled_visible_sources(
     }
     let mut merged = 0_usize;
     while let Some(Reverse((row_id, source_index))) = heap.pop() {
-        if merged % 256 == 0 {
+        if merged.is_multiple_of(256) {
             control.checkpoint()?;
         }
         merged += 1;
@@ -2081,7 +2081,7 @@ impl Table {
             }
             let mut reader = self.open_reader(rr.run_id)?;
             for row in reader.visible_rows(snapshot)? {
-                if scanned % 256 == 0 {
+                if scanned.is_multiple_of(256) {
                     if let Some(control) = control {
                         control.checkpoint()?;
                     }
@@ -2104,7 +2104,7 @@ impl Table {
             }
         }
         for row in self.mutable_run.visible_versions(snapshot) {
-            if scanned % 256 == 0 {
+            if scanned.is_multiple_of(256) {
                 if let Some(control) = control {
                     control.checkpoint()?;
                 }
@@ -2117,7 +2117,7 @@ impl Table {
             }
         }
         for row in self.memtable.visible_versions(snapshot) {
-            if scanned % 256 == 0 {
+            if scanned.is_multiple_of(256) {
                 if let Some(control) = control {
                     control.checkpoint()?;
                 }
@@ -2863,7 +2863,7 @@ impl Table {
         })?;
         if self.is_shared() {
             self.pending_rows_auto_inc
-                .extend(std::iter::repeat(auto_inc_generated).take(rows.len()));
+                .extend(std::iter::repeat_n(auto_inc_generated, rows.len()));
             self.pending_rows.extend(rows);
         } else {
             self.apply_put_rows_inner(rows, !auto_inc_generated)?;
@@ -4998,8 +4998,8 @@ impl Table {
                         .map(|(row_id, _)| *row_id)
                         .filter(|row_id| !eligibility.contains_key(row_id))
                         .filter(|row_id| {
-                            hard_filter.map_or(true, |filter| filter.contains(row_id.0))
-                                && allowed.map_or(true, |allowed| allowed.contains(row_id))
+                            hard_filter.is_none_or(|filter| filter.contains(row_id.0))
+                                && allowed.is_none_or(|allowed| allowed.contains(row_id))
                         })
                         .collect();
                     let eligible = self.eligible_and_authorized_candidate_ids(
@@ -5053,8 +5053,8 @@ impl Table {
                             .map(|(row_id, _)| *row_id)
                             .filter(|row_id| !eligibility.contains_key(row_id))
                             .filter(|row_id| {
-                                hard_filter.map_or(true, |filter| filter.contains(row_id.0))
-                                    && allowed.map_or(true, |allowed| allowed.contains(row_id))
+                                hard_filter.is_none_or(|filter| filter.contains(row_id.0))
+                                    && allowed.is_none_or(|allowed| allowed.contains(row_id))
                             })
                             .collect();
                         let eligible = self.eligible_and_authorized_candidate_ids(
@@ -5117,8 +5117,8 @@ impl Table {
                             .map(|(row_id, _)| *row_id)
                             .filter(|row_id| !eligibility.contains_key(row_id))
                             .filter(|row_id| {
-                                hard_filter.map_or(true, |filter| filter.contains(row_id.0))
-                                    && allowed.map_or(true, |allowed| allowed.contains(row_id))
+                                hard_filter.is_none_or(|filter| filter.contains(row_id.0))
+                                    && allowed.is_none_or(|allowed| allowed.contains(row_id))
                             })
                             .collect();
                         let eligible = self.eligible_and_authorized_candidate_ids(
@@ -7003,7 +7003,7 @@ impl Table {
                         index
                             .search_filtered(query, *k, |row_id| {
                                 eligible.contains(&row_id)
-                                    && allowed.map_or(true, |allowed| allowed.contains(&row_id))
+                                    && allowed.is_none_or(|allowed| allowed.contains(&row_id))
                             })
                             .into_iter()
                             .map(|(row_id, _)| row_id.0)
@@ -8882,7 +8882,7 @@ impl Table {
         if all_index_served {
             return Ok(rows
                 .into_iter()
-                .filter(|r| survivors.map_or(true, |s| s.contains(r.row_id.0)))
+                .filter(|r| survivors.is_none_or(|s| s.contains(r.row_id.0)))
                 .collect());
         }
         // Mixed: compute per-condition index sets for non-range conditions, and
@@ -9662,7 +9662,7 @@ impl Table {
                     .map(|r| {
                         let passes_row = authorized
                             .as_ref()
-                            .map_or(true, |authorized| authorized.contains(&r.row_id))
+                            .is_none_or(|authorized| authorized.contains(&r.row_id))
                             && conditions
                                 .iter()
                                 .all(|c| condition_matches_row(c, r, &self.schema))
@@ -10898,7 +10898,7 @@ fn accumulate_float(
 
 #[inline]
 fn execution_checkpoint(control: Option<&crate::ExecutionControl>, index: usize) -> Result<()> {
-    if index % 256 == 0 {
+    if index.is_multiple_of(256) {
         control
             .map(crate::ExecutionControl::checkpoint)
             .transpose()?;
@@ -11241,7 +11241,7 @@ fn eval_partial_predicate(
         if let Some(col_id) = name_to_id.get(col_name) {
             return columns_map
                 .get(col_id)
-                .map_or(true, |v| matches!(v, Value::Null));
+                .is_none_or(|v| matches!(v, Value::Null));
         }
     }
     // Unknown predicate syntax: index the row (conservative — better to

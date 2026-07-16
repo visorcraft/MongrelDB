@@ -100,10 +100,10 @@ impl DurableRoot {
                 let path = rustix::fs::getpath(&directory).map_err(io::Error::from)?;
                 PathBuf::from(OsStr::from_bytes(path.to_bytes()))
             };
-            return Ok(Self {
+            Ok(Self {
                 canonical_path,
                 directory,
-            });
+            })
         }
 
         #[cfg(windows)]
@@ -1279,7 +1279,7 @@ pub(crate) fn open_regular_nofollow(path: &Path) -> crate::Result<std::fs::File>
                 path.display()
             )));
         }
-        return Ok(std::fs::File::from(fd));
+        Ok(std::fs::File::from(fd))
     }
 
     #[cfg(windows)]
@@ -1332,13 +1332,13 @@ where
             Mode::empty(),
         )
         .map_err(io::Error::from)?;
-        return walk_unix_directory(
+        walk_unix_directory(
             directory,
             Path::new(""),
             &mut include,
             &mut on_directory,
             &mut on_file,
-        );
+        )
     }
 
     #[cfg(windows)]

@@ -193,7 +193,7 @@ impl MinHashIndex {
     }
 
     pub fn with_options(permutations: usize, bands: usize) -> Self {
-        assert!(permutations > 0 && bands > 0 && permutations % bands == 0);
+        assert!(permutations > 0 && bands > 0 && permutations.is_multiple_of(bands));
         Self {
             permutations,
             bands,

@@ -89,7 +89,11 @@ fn schema() -> Schema {
 fn emb(label: &str) -> Vec<f32> {
     let mut v = vec![0.0f32; DIM];
     for (i, b) in label.bytes().cycle().take(DIM).enumerate() {
-        v[i] = if (b + i as u8) % 3 == 0 { 1.0 } else { -1.0 };
+        v[i] = if (b + i as u8).is_multiple_of(3) {
+            1.0
+        } else {
+            -1.0
+        };
     }
     v
 }

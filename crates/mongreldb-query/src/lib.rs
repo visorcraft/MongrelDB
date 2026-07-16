@@ -2963,9 +2963,7 @@ impl MongrelSession {
             || db
                 .count_conditions(&conditions, snap)
                 .map_err(MongrelQueryError::Core)?
-                .map_or(true, |rows| {
-                    rows > current_collection_limits().max_rows as u64
-                })
+                .is_none_or(|rows| rows > current_collection_limits().max_rows as u64)
         {
             return Ok(None);
         }

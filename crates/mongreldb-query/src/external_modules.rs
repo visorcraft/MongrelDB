@@ -1638,7 +1638,7 @@ fn external_checkpoint(
     control: Option<&mongreldb_core::ExecutionControl>,
     index: usize,
 ) -> DFResult<()> {
-    if index % 256 == 0 {
+    if index.is_multiple_of(256) {
         control
             .map(mongreldb_core::ExecutionControl::checkpoint)
             .transpose()

@@ -1719,7 +1719,7 @@ fn json_array_row(row: &RowArgs) -> Option<String> {
 }
 
 fn json_object_row(row: &RowArgs) -> Option<String> {
-    if row.len() % 2 != 0 {
+    if !row.len().is_multiple_of(2) {
         return None;
     }
     let mut obj = JsonMap::new();
@@ -2318,7 +2318,7 @@ fn apply_printf_width(mut text: String, width: Option<usize>, left: bool, zero: 
     let pad = width - len;
     let ch = if zero { '0' } else { ' ' };
     if left {
-        text.extend(std::iter::repeat(ch).take(pad));
+        text.extend(std::iter::repeat_n(ch, pad));
         text
     } else if zero && matches!(text.as_bytes().first(), Some(b'+' | b'-' | b' ')) {
         let sign = text.remove(0);
