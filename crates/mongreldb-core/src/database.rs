@@ -1593,7 +1593,14 @@ impl Database {
         root: impl AsRef<Path>,
         lock_timeout_ms: u32,
     ) -> Result<(PathBuf, DatabaseFileLock)> {
-        let durable_root = crate::durable_file::DurableRoot::open(root.as_ref())?;
+        let root = root.as_ref();
+        let durable_root = crate::durable_file::DurableRoot::open(root).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                MongrelError::NotFound(format!("database root {}: {error}", root.display()))
+            } else {
+                error.into()
+            }
+        })?;
         Self::begin_open_durable(durable_root, lock_timeout_ms)
     }
 

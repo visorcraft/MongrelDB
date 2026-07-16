@@ -99,6 +99,16 @@ fn close_flushes_and_reopens_committed_rows() {
 }
 
 #[test]
+fn open_missing_database_returns_not_found() {
+    let dir = tempdir().unwrap();
+
+    assert!(matches!(
+        Database::open(dir.path().join("missing")),
+        Err(MongrelError::NotFound(_))
+    ));
+}
+
+#[test]
 fn create_refuses_existing_database_without_replacing_catalog() {
     let dir = tempdir().unwrap();
     {
