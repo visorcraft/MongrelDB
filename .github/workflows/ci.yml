@@ -203,7 +203,7 @@ jobs:
       - name: Python MinHash wire fixture
         run: |
           cargo build --manifest-path crates/mongreldb-server/Cargo.toml --release > "$QUAL_DIR/ai-wire-server.log" 2>&1
-          crates/mongreldb-server/target/release/mongreldb-server "$RUNNER_TEMP/mongreldb-ai-wire" --port 8080 >> "$QUAL_DIR/ai-wire-server.log" 2>&1 &
+          "$CARGO_TARGET_DIR/release/mongreldb-server" "$RUNNER_TEMP/mongreldb-ai-wire" --port 8080 >> "$QUAL_DIR/ai-wire-server.log" 2>&1 &
           server_pid=$!
           trap 'kill "$server_pid"' EXIT
           for _ in {1..60}; do
