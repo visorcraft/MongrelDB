@@ -1,0 +1,24 @@
+# yamllint configuration for MongrelDB.
+#
+# GitHub Actions workflows routinely use long `run:` command lines, the
+# top-level `on:` trigger key, and omit a leading `---`. These are idiomatic
+# for Actions YAML but trip yamllint's strict defaults, so relax the rules
+# that don't apply to workflow files. Structural checks (indentation, syntax,
+# trailing spaces, bracket/brace matching) stay strict.
+extends: default
+
+rules:
+  # Workflows legitimately start without an explicit document marker.
+  document-start: disable
+  # The Actions `on:` trigger key is parsed as a truthy value by the YAML
+  # spec; GH Actions handles it correctly, so don't flag it.
+  truthy:
+    check-keys: false
+  # `run:` steps and long URLs are frequently wider than 80 columns.
+  line-length:
+    max: 200
+    allow-non-breakable-words: true
+    allow-non-breakable-inline-mappings: true
+  # Allow inline comments that don't start at column 1 (common in `with:`
+  # blocks); still flag comments with no space before the `#`.
+  comments-indentation: disable

@@ -39,7 +39,7 @@ on:
 
 permissions:
   contents: write
-  id-token: write # npm provenance
+  id-token: write  # npm provenance
   packages: write
 
 jobs:

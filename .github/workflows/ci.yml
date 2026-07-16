@@ -210,10 +210,21 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 MONGRELDB_DB_PATH="$RUNNER_TEMP/mongreldb-ai-wire" python3 tools/ai-wire/demo_minhash.py 2>&1 | tee "$QUAL_DIR/ai-wire-minhash.log"
       - name: AI benchmark
         run: |
-          MONGRELDB_AI_QUALIFICATION=1 MONGRELDB_AI_BENCH_ROWS=100000 MONGRELDB_AI_BENCH_QUERIES=50 cargo run -p mongreldb-core --release --all-features --example ai_retrieval_bench > "$QUAL_DIR/ai-benchmark-100k.json" 2> "$QUAL_DIR/ai-benchmark-100k.log"
+          MONGRELDB_AI_QUALIFICATION=1 \
+            MONGRELDB_AI_BENCH_ROWS=100000 MONGRELDB_AI_BENCH_QUERIES=50 \
+            cargo run -p mongreldb-core --release --all-features \
+            --example ai_retrieval_bench \
+            > "$QUAL_DIR/ai-benchmark-100k.json" 2> "$QUAL_DIR/ai-benchmark-100k.log"
           cp docs/ai/ci-benchmark-thresholds.json "$QUAL_DIR/"
-          python3 scripts/validate-ai-benchmark.py "$QUAL_DIR/ai-benchmark-100k.json" docs/ai/ci-benchmark-thresholds.json --expected-sha "$GITHUB_SHA" 2>&1 | tee "$QUAL_DIR/ai-benchmark-validation.log"
-          MONGRELDB_AI_CONCURRENCY_ROWS=10000 MONGRELDB_AI_CONCURRENCY_OPS=25 cargo run -p mongreldb-core --release --all-features --example ai_concurrency_bench > "$QUAL_DIR/ai-concurrency.json" 2> "$QUAL_DIR/ai-concurrency.log"
+          python3 scripts/validate-ai-benchmark.py \
+            "$QUAL_DIR/ai-benchmark-100k.json" \
+            docs/ai/ci-benchmark-thresholds.json \
+            --expected-sha "$GITHUB_SHA" 2>&1 \
+            | tee "$QUAL_DIR/ai-benchmark-validation.log"
+          MONGRELDB_AI_CONCURRENCY_ROWS=10000 MONGRELDB_AI_CONCURRENCY_OPS=25 \
+            cargo run -p mongreldb-core --release --all-features \
+            --example ai_concurrency_bench \
+            > "$QUAL_DIR/ai-concurrency.json" 2> "$QUAL_DIR/ai-concurrency.log"
           python3 scripts/validate-ai-concurrency.py "$QUAL_DIR/ai-concurrency.json" 2>&1 | tee "$QUAL_DIR/ai-concurrency-validation.log"
           test -z "$(git status --porcelain)"
       - uses: actions/upload-artifact@v7
