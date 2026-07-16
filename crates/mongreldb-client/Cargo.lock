@@ -2423,7 +2423,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-client"
-version = "0.58.3"
+version = "0.58.4"
 dependencies = [
  "arrow",
  "base64",
@@ -2441,7 +2441,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-core"
-version = "0.58.3"
+version = "0.58.4"
 dependencies = [
  "aes-gcm",
  "arc-swap",
@@ -2474,7 +2474,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-query"
-version = "0.58.3"
+version = "0.58.4"
 dependencies = [
  "aes-gcm",
  "arrow",

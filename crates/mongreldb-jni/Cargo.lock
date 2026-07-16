@@ -2288,7 +2288,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-jni"
-version = "0.58.3"
+version = "0.58.4"
 dependencies = [
  "jni",
  "mongreldb-kit",
