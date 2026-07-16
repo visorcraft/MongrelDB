@@ -60,7 +60,8 @@ pub unsafe extern "C" fn mongreldb_kit_query_select_json(
         Err(code) => return code.as_return(),
     };
     if out_json.is_null() {
-        return set_error_msg(KitErrorCode::InvalidArgument, "out_json must not be null").as_return();
+        return set_error_msg(KitErrorCode::InvalidArgument, "out_json must not be null")
+            .as_return();
     }
     let select: Select = match serde_json::from_str(qstr) {
         Ok(s) => s,
@@ -73,7 +74,9 @@ pub unsafe extern "C" fn mongreldb_kit_query_select_json(
         }
     };
 
-    let result = h.db.borrow().transaction(0, |txn| txn.select(&Query::Select(select.clone())));
+    let result =
+        h.db.borrow()
+            .transaction(0, |txn| txn.select(&Query::Select(select.clone())));
     let rows = match result {
         Ok(r) => r,
         Err(e) => return set_error(&e).as_return(),
@@ -98,7 +101,8 @@ pub unsafe extern "C" fn mongreldb_kit_query_join_json(
         Err(code) => return code.as_return(),
     };
     if out_json.is_null() {
-        return set_error_msg(KitErrorCode::InvalidArgument, "out_json must not be null").as_return();
+        return set_error_msg(KitErrorCode::InvalidArgument, "out_json must not be null")
+            .as_return();
     }
     let jq: JoinQuery = match serde_json::from_str(qstr) {
         Ok(s) => s,
@@ -136,7 +140,8 @@ pub unsafe extern "C" fn mongreldb_kit_query_aggregate_json(
         Err(code) => return code.as_return(),
     };
     if out_json.is_null() {
-        return set_error_msg(KitErrorCode::InvalidArgument, "out_json must not be null").as_return();
+        return set_error_msg(KitErrorCode::InvalidArgument, "out_json must not be null")
+            .as_return();
     }
     let agg: AggregateQuery = match serde_json::from_str(qstr) {
         Ok(s) => s,
@@ -149,7 +154,9 @@ pub unsafe extern "C" fn mongreldb_kit_query_aggregate_json(
         }
     };
 
-    let result = h.db.borrow().transaction(0, |txn| txn.aggregate(&agg.clone()));
+    let result =
+        h.db.borrow()
+            .transaction(0, |txn| txn.aggregate(&agg.clone()));
     let rows = match result {
         Ok(r) => r,
         Err(e) => return set_error(&e).as_return(),
@@ -176,7 +183,8 @@ pub unsafe extern "C" fn mongreldb_kit_query_insert_json(
         Err(code) => return code.as_return(),
     };
     if out_json.is_null() {
-        return set_error_msg(KitErrorCode::InvalidArgument, "out_json must not be null").as_return();
+        return set_error_msg(KitErrorCode::InvalidArgument, "out_json must not be null")
+            .as_return();
     }
     let ins: Insert = match serde_json::from_str(qstr) {
         Ok(s) => s,
@@ -189,10 +197,9 @@ pub unsafe extern "C" fn mongreldb_kit_query_insert_json(
         }
     };
 
-    let result = h
-        .db
-        .borrow()
-        .transaction(0, |txn| txn.execute(&Query::Insert(ins.clone())));
+    let result =
+        h.db.borrow()
+            .transaction(0, |txn| txn.execute(&Query::Insert(ins.clone())));
     let vals = match result {
         Ok(v) => v,
         Err(e) => return set_error(&e).as_return(),
@@ -217,7 +224,8 @@ pub unsafe extern "C" fn mongreldb_kit_query_update_json(
         Err(code) => return code.as_return(),
     };
     if out_json.is_null() {
-        return set_error_msg(KitErrorCode::InvalidArgument, "out_json must not be null").as_return();
+        return set_error_msg(KitErrorCode::InvalidArgument, "out_json must not be null")
+            .as_return();
     }
     let upd: Update = match serde_json::from_str(qstr) {
         Ok(s) => s,
@@ -230,10 +238,9 @@ pub unsafe extern "C" fn mongreldb_kit_query_update_json(
         }
     };
 
-    let result = h
-        .db
-        .borrow()
-        .transaction(0, |txn| txn.execute(&Query::Update(upd.clone())));
+    let result =
+        h.db.borrow()
+            .transaction(0, |txn| txn.execute(&Query::Update(upd.clone())));
     let vals = match result {
         Ok(v) => v,
         Err(e) => return set_error(&e).as_return(),
@@ -258,7 +265,8 @@ pub unsafe extern "C" fn mongreldb_kit_query_upsert_json(
         Err(code) => return code.as_return(),
     };
     if out_json.is_null() {
-        return set_error_msg(KitErrorCode::InvalidArgument, "out_json must not be null").as_return();
+        return set_error_msg(KitErrorCode::InvalidArgument, "out_json must not be null")
+            .as_return();
     }
     let ups: Upsert = match serde_json::from_str(qstr) {
         Ok(s) => s,
@@ -271,10 +279,9 @@ pub unsafe extern "C" fn mongreldb_kit_query_upsert_json(
         }
     };
 
-    let result = h
-        .db
-        .borrow()
-        .transaction(0, |txn| txn.execute(&Query::Upsert(ups.clone())));
+    let result =
+        h.db.borrow()
+            .transaction(0, |txn| txn.execute(&Query::Upsert(ups.clone())));
     let vals = match result {
         Ok(v) => v,
         Err(e) => return set_error(&e).as_return(),
@@ -299,7 +306,8 @@ pub unsafe extern "C" fn mongreldb_kit_query_delete_json(
         Err(code) => return code.as_return(),
     };
     if out_json.is_null() {
-        return set_error_msg(KitErrorCode::InvalidArgument, "out_json must not be null").as_return();
+        return set_error_msg(KitErrorCode::InvalidArgument, "out_json must not be null")
+            .as_return();
     }
     let del: Delete = match serde_json::from_str(qstr) {
         Ok(s) => s,
@@ -312,10 +320,9 @@ pub unsafe extern "C" fn mongreldb_kit_query_delete_json(
         }
     };
 
-    let result = h
-        .db
-        .borrow()
-        .transaction(0, |txn| txn.execute(&Query::Delete(del.clone())));
+    let result =
+        h.db.borrow()
+            .transaction(0, |txn| txn.execute(&Query::Delete(del.clone())));
     let vals = match result {
         Ok(v) => v,
         Err(e) => return set_error(&e).as_return(),

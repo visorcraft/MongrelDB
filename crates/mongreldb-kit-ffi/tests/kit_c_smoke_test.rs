@@ -12,7 +12,11 @@ fn kit_c_smoke_test() {
     let lib_path = crate_root.join("target/release");
 
     assert!(header.exists(), "mongreldb_kit.h not found at {:?}", header);
-    assert!(c_source.exists(), "kit_c_test.c not found at {:?}", c_source);
+    assert!(
+        c_source.exists(),
+        "kit_c_test.c not found at {:?}",
+        c_source
+    );
 
     // Compile the C test, linking against the shared library.
     let output = Command::new("cc")

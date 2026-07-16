@@ -10,10 +10,11 @@ use std::time::{Duration, Instant};
 
 const DEFAULT_MAX_ACTIVE: usize = 1_024;
 const DEFAULT_MAX_FINISHED: usize = 2_048;
-const DEFAULT_MAX_FINISHED_BYTES: usize = 2 * 1024 * 1024;
+const DEFAULT_MAX_FINISHED_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_MAX_COMPACT: usize = 100_000;
+const DEFAULT_MAX_COMPACT_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_FINISHED_TTL: Duration = Duration::from_secs(60);
 const MAX_METADATA_BYTES: usize = 256;
-const APPROXIMATE_RESERVED_ID_BYTES: usize = 128 + 2 * MAX_METADATA_BYTES;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct QueryId([u8; 16]);
@@ -413,37 +414,100 @@ struct FinishedQuery {
     approximate_bytes: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ReservedQueryId {
-    query_id: QueryId,
+#[derive(Debug, Clone)]
+pub struct CompactFinishedQuery {
+    pub query_id: QueryId,
+    pub owner: Option<String>,
+    pub session_id: Option<String>,
+    pub phase: SqlQueryPhase,
+    pub terminal_state: QueryTerminalState,
+    pub cancellation_reason: CancellationReason,
+    pub durable_outcome: DurableOutcome,
+    pub serialization_outcome: SerializationOutcome,
+    pub terminal_error: Option<QueryTerminalError>,
+    pub completed_statements: usize,
+    pub statement_index: usize,
     finished_at: Instant,
+    approximate_bytes: usize,
+}
+
+impl CompactFinishedQuery {
+    fn from_status(status: QueryStatus, finished_at: Instant) -> Self {
+        let terminal_state = status
+            .terminal_state()
+            .unwrap_or(QueryTerminalState::OutcomeUnknown);
+        let approximate_bytes = std::mem::size_of::<Self>()
+            + status.owner.as_ref().map_or(0, String::len)
+            + status.session_id.as_ref().map_or(0, String::len)
+            + status
+                .terminal_error
+                .as_ref()
+                .map_or(0, |error| error.code.len());
+        Self {
+            query_id: status.query_id,
+            owner: status.owner,
+            session_id: status.session_id,
+            phase: status.phase,
+            terminal_state,
+            cancellation_reason: status.cancellation_reason,
+            durable_outcome: status.durable_outcome,
+            serialization_outcome: status.serialization_outcome,
+            terminal_error: status.terminal_error,
+            completed_statements: status.completed_statements,
+            statement_index: status.statement_index,
+            finished_at,
+            approximate_bytes,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
 struct RegistryState {
     active: HashMap<QueryId, Arc<RegisteredQuery>>,
-    finished: VecDeque<FinishedQuery>,
-    finished_bytes: usize,
-    reserved_ids: HashMap<QueryId, (Option<String>, Option<String>)>,
-    reservations: VecDeque<ReservedQueryId>,
+    detailed: HashMap<QueryId, FinishedQuery>,
+    detailed_lru: VecDeque<QueryId>,
+    detailed_bytes: usize,
+    compact: HashMap<QueryId, CompactFinishedQuery>,
+    compact_lru: VecDeque<QueryId>,
+    compact_bytes: usize,
+    demotions: u64,
+    compact_evictions: u64,
+    active_rejections: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueryRegistryStats {
+    pub active: usize,
+    pub queued: usize,
+    pub detailed: usize,
+    pub compact: usize,
+    pub detailed_bytes: usize,
+    pub compact_bytes: usize,
+    pub demotions: u64,
+    pub compact_evictions: u64,
+    pub active_rejections: u64,
+    pub oldest_compact_age: Duration,
 }
 
 #[derive(Debug)]
 pub struct SqlQueryRegistry {
     state: Mutex<RegistryState>,
     max_active: usize,
-    max_finished: usize,
-    max_finished_bytes: usize,
-    max_tracked_ids: usize,
+    max_detailed: usize,
+    max_detailed_bytes: usize,
+    max_compact: usize,
+    max_compact_bytes: usize,
     finished_ttl: Duration,
 }
 
 impl Default for SqlQueryRegistry {
     fn default() -> Self {
-        Self::new(
+        Self::new_with_limits(
             DEFAULT_MAX_ACTIVE,
             DEFAULT_MAX_FINISHED,
             DEFAULT_MAX_FINISHED_BYTES,
+            DEFAULT_MAX_COMPACT,
+            DEFAULT_MAX_COMPACT_BYTES,
             DEFAULT_FINISHED_TTL,
         )
     }
@@ -456,15 +520,31 @@ impl SqlQueryRegistry {
         max_finished_bytes: usize,
         finished_ttl: Duration,
     ) -> Self {
-        let compact_reservations = max_finished
-            .max(max_finished_bytes / APPROXIMATE_RESERVED_ID_BYTES)
-            .max(1);
+        Self::new_with_limits(
+            max_active,
+            max_finished,
+            max_finished_bytes,
+            DEFAULT_MAX_COMPACT,
+            DEFAULT_MAX_COMPACT_BYTES,
+            finished_ttl,
+        )
+    }
+
+    pub fn new_with_limits(
+        max_active: usize,
+        max_detailed: usize,
+        max_detailed_bytes: usize,
+        max_compact: usize,
+        max_compact_bytes: usize,
+        finished_ttl: Duration,
+    ) -> Self {
         Self {
             state: Mutex::new(RegistryState::default()),
             max_active: max_active.max(1),
-            max_finished,
-            max_finished_bytes,
-            max_tracked_ids: max_active.max(1).saturating_add(compact_reservations),
+            max_detailed,
+            max_detailed_bytes,
+            max_compact,
+            max_compact_bytes,
             finished_ttl,
         }
     }
@@ -510,12 +590,14 @@ impl SqlQueryRegistry {
         });
         let mut state = self.state.lock();
         self.prune_locked(&mut state);
-        if state.active.contains_key(&id) || state.reserved_ids.contains_key(&id) {
+        if state.active.contains_key(&id)
+            || state.detailed.contains_key(&id)
+            || state.compact.contains_key(&id)
+        {
             return Err(MongrelQueryError::QueryIdConflict { query_id: id });
         }
-        if state.active.len() >= self.max_active
-            || state.active.len().saturating_add(state.reserved_ids.len()) >= self.max_tracked_ids
-        {
+        if state.active.len() >= self.max_active {
+            state.active_rejections = state.active_rejections.saturating_add(1);
             return Err(MongrelQueryError::QueryRegistryFull);
         }
         state.active.insert(id, Arc::clone(&query));
@@ -531,7 +613,9 @@ impl SqlQueryRegistry {
             self.prune_locked(&mut state);
             if let Some(query) = state.active.get(&query_id) {
                 Some(Arc::clone(query))
-            } else if state.reserved_ids.contains_key(&query_id) {
+            } else if state.detailed.contains_key(&query_id)
+                || state.compact.contains_key(&query_id)
+            {
                 return CancelOutcome::AlreadyFinished;
             } else {
                 return CancelOutcome::NotFound;
@@ -552,22 +636,16 @@ impl SqlQueryRegistry {
             .map(|query| query.status())
             .or_else(|| {
                 state
-                    .finished
-                    .iter()
-                    .rev()
-                    .find(|finished| finished.status.query_id == query_id)
+                    .detailed
+                    .get(&query_id)
                     .map(|finished| finished.status.clone())
             })
     }
 
-    /// Return bounded owner/session metadata after the detailed status was evicted.
-    pub fn compact_finished_identity(
-        &self,
-        query_id: QueryId,
-    ) -> Option<(Option<String>, Option<String>)> {
+    pub fn compact_finished_status(&self, query_id: QueryId) -> Option<CompactFinishedQuery> {
         let mut state = self.state.lock();
         self.prune_locked(&mut state);
-        state.reserved_ids.get(&query_id).cloned()
+        state.compact.get(&query_id).cloned()
     }
 
     pub fn cancel_session(&self, session_id: &str, reason: CancellationReason) -> usize {
@@ -640,27 +718,52 @@ impl SqlQueryRegistry {
     pub fn entry_count(&self) -> usize {
         let mut state = self.state.lock();
         self.prune_locked(&mut state);
-        state.active.len() + state.finished.len()
+        state.active.len() + state.detailed.len() + state.compact.len()
     }
 
     pub fn approximate_bytes(&self) -> usize {
         let mut state = self.state.lock();
         self.prune_locked(&mut state);
-        state.finished_bytes
+        state.detailed_bytes
+            + state.compact_bytes
             + state
                 .active
                 .len()
                 .saturating_mul(std::mem::size_of::<RegisteredQuery>())
-            + state
-                .reserved_ids
-                .len()
-                .saturating_mul(APPROXIMATE_RESERVED_ID_BYTES)
     }
 
     pub fn finished_count(&self) -> usize {
         let mut state = self.state.lock();
         self.prune_locked(&mut state);
-        state.finished.len()
+        state.detailed.len() + state.compact.len()
+    }
+
+    pub fn stats(&self) -> QueryRegistryStats {
+        let mut state = self.state.lock();
+        self.prune_locked(&mut state);
+        let now = Instant::now();
+        QueryRegistryStats {
+            active: state.active.len(),
+            queued: state
+                .active
+                .values()
+                .filter(|query| query.phase() == SqlQueryPhase::Queued)
+                .count(),
+            detailed: state.detailed.len(),
+            compact: state.compact.len(),
+            detailed_bytes: state.detailed_bytes,
+            compact_bytes: state.compact_bytes,
+            demotions: state.demotions,
+            compact_evictions: state.compact_evictions,
+            active_rejections: state.active_rejections,
+            oldest_compact_age: state
+                .compact_lru
+                .front()
+                .and_then(|id| state.compact.get(id))
+                .map_or(Duration::ZERO, |entry| {
+                    now.saturating_duration_since(entry.finished_at)
+                }),
+        }
     }
 
     fn finish(&self, query: &Arc<RegisteredQuery>) {
@@ -679,42 +782,80 @@ impl SqlQueryRegistry {
             return;
         }
         let finished_at = Instant::now();
-        state
-            .reserved_ids
-            .insert(query.id, (status.owner.clone(), status.session_id.clone()));
-        state.reservations.push_back(ReservedQueryId {
-            query_id: query.id,
-            finished_at,
-        });
-        if self.max_finished > 0 && self.max_finished_bytes > 0 {
-            state.finished_bytes = state.finished_bytes.saturating_add(approximate_bytes);
-            state.finished.push_back(FinishedQuery {
-                status,
-                finished_at,
-                approximate_bytes,
-            });
+        if self.max_detailed > 0 && self.max_detailed_bytes > 0 {
+            state.detailed_bytes = state.detailed_bytes.saturating_add(approximate_bytes);
+            state.detailed_lru.push_back(query.id);
+            state.detailed.insert(
+                query.id,
+                FinishedQuery {
+                    status,
+                    finished_at,
+                    approximate_bytes,
+                },
+            );
+        } else {
+            self.insert_compact_locked(
+                &mut state,
+                CompactFinishedQuery::from_status(status, finished_at),
+            );
         }
         self.prune_locked(&mut state);
     }
 
     fn prune_locked(&self, state: &mut RegistryState) {
         let now = Instant::now();
-        while state.reservations.front().is_some_and(|entry| {
-            now.saturating_duration_since(entry.finished_at) >= self.finished_ttl
-        }) {
-            if let Some(entry) = state.reservations.pop_front() {
-                state.reserved_ids.remove(&entry.query_id);
+        while let Some(query_id) = state.detailed_lru.front().copied() {
+            let Some(entry) = state.detailed.get(&query_id) else {
+                state.detailed_lru.pop_front();
+                continue;
+            };
+            let expired = now.saturating_duration_since(entry.finished_at) >= self.finished_ttl;
+            let over_limit = state.detailed.len() > self.max_detailed
+                || state.detailed_bytes > self.max_detailed_bytes;
+            if !expired && !over_limit {
+                break;
+            }
+            state.detailed_lru.pop_front();
+            if let Some(entry) = state.detailed.remove(&query_id) {
+                state.detailed_bytes = state.detailed_bytes.saturating_sub(entry.approximate_bytes);
+                if !expired {
+                    state.demotions = state.demotions.saturating_add(1);
+                    self.insert_compact_locked(
+                        state,
+                        CompactFinishedQuery::from_status(entry.status, entry.finished_at),
+                    );
+                }
             }
         }
-        while state.finished.front().is_some_and(|entry| {
-            now.saturating_duration_since(entry.finished_at) >= self.finished_ttl
-                || state.finished.len() > self.max_finished
-                || state.finished_bytes > self.max_finished_bytes
-        }) {
-            if let Some(entry) = state.finished.pop_front() {
-                state.finished_bytes = state.finished_bytes.saturating_sub(entry.approximate_bytes);
+        while let Some(query_id) = state.compact_lru.front().copied() {
+            let Some(entry) = state.compact.get(&query_id) else {
+                state.compact_lru.pop_front();
+                continue;
+            };
+            let expired = now.saturating_duration_since(entry.finished_at) >= self.finished_ttl;
+            let over_limit = state.compact.len() > self.max_compact
+                || state.compact_bytes > self.max_compact_bytes;
+            if !expired && !over_limit {
+                break;
+            }
+            state.compact_lru.pop_front();
+            if let Some(entry) = state.compact.remove(&query_id) {
+                state.compact_bytes = state.compact_bytes.saturating_sub(entry.approximate_bytes);
+                if !expired {
+                    state.compact_evictions = state.compact_evictions.saturating_add(1);
+                }
             }
         }
+    }
+
+    fn insert_compact_locked(&self, state: &mut RegistryState, entry: CompactFinishedQuery) {
+        if self.max_compact == 0 || self.max_compact_bytes == 0 {
+            state.compact_evictions = state.compact_evictions.saturating_add(1);
+            return;
+        }
+        state.compact_bytes = state.compact_bytes.saturating_add(entry.approximate_bytes);
+        state.compact_lru.push_back(entry.query_id);
+        state.compact.insert(entry.query_id, entry);
     }
 }
 
@@ -1477,10 +1618,9 @@ mod tests {
                 .unwrap();
 
             assert!(registry.status(first_id).is_none());
-            assert_eq!(
-                registry.compact_finished_identity(first_id),
-                Some((Some(owner), Some(session_id)))
-            );
+            let compact = registry.compact_finished_status(first_id).unwrap();
+            assert_eq!(compact.owner, Some(owner));
+            assert_eq!(compact.session_id, Some(session_id));
             assert_eq!(registry.cancel(first_id), CancelOutcome::AlreadyFinished);
             assert!(matches!(
                 registry.register(SqlQueryOptions {
@@ -1493,8 +1633,15 @@ mod tests {
     }
 
     #[test]
-    fn compact_id_reservations_fail_closed_at_bounded_capacity() {
-        let registry = Arc::new(SqlQueryRegistry::new(1, 0, 0, Duration::from_secs(60)));
+    fn compact_overflow_evicts_instead_of_rejecting_new_work() {
+        let registry = Arc::new(SqlQueryRegistry::new_with_limits(
+            1,
+            0,
+            0,
+            1,
+            usize::MAX,
+            Duration::from_secs(60),
+        ));
         let first_id = QueryId::random().unwrap();
         registry
             .register(SqlQueryOptions {
@@ -1510,13 +1657,16 @@ mod tests {
             .complete()
             .unwrap();
 
-        assert_eq!(registry.finished_count(), 0);
-        assert_eq!(registry.cancel(first_id), CancelOutcome::AlreadyFinished);
-        assert!(matches!(
-            registry.register(SqlQueryOptions::default()),
-            Err(MongrelQueryError::QueryRegistryFull)
-        ));
-        assert!(registry.approximate_bytes() <= 2 * APPROXIMATE_RESERVED_ID_BYTES);
+        assert_eq!(registry.finished_count(), 1);
+        assert_eq!(registry.cancel(first_id), CancelOutcome::NotFound);
+        let replacement = registry
+            .register(SqlQueryOptions {
+                query_id: Some(first_id),
+                ..SqlQueryOptions::default()
+            })
+            .unwrap();
+        replacement.complete().unwrap();
+        assert_eq!(registry.stats().compact_evictions, 2);
     }
 
     #[test]
@@ -1536,11 +1686,85 @@ mod tests {
             .complete()
             .unwrap();
 
-        assert_eq!(
-            registry.compact_finished_identity(query_id),
-            Some((Some(owner), Some(session_id)))
-        );
-        assert!(registry.approximate_bytes() <= APPROXIMATE_RESERVED_ID_BYTES);
+        let compact = registry.compact_finished_status(query_id).unwrap();
+        assert_eq!(compact.owner, Some(owner));
+        assert_eq!(compact.session_id, Some(session_id));
+        assert_eq!(registry.approximate_bytes(), registry.stats().compact_bytes);
+    }
+
+    #[test]
+    fn ten_thousand_completed_queries_never_consume_active_capacity() {
+        let registry = Arc::new(SqlQueryRegistry::new_with_limits(
+            1,
+            2,
+            4096,
+            10_000,
+            8 * 1024 * 1024,
+            Duration::from_secs(60),
+        ));
+        for _ in 0..10_000 {
+            registry
+                .register(SqlQueryOptions::default())
+                .unwrap()
+                .complete()
+                .unwrap();
+        }
+        let stats = registry.stats();
+        assert_eq!(stats.active, 0);
+        assert_eq!(stats.detailed, 2);
+        assert_eq!(stats.compact, 9_998);
+        assert_eq!(stats.active_rejections, 0);
+        assert!(stats.detailed_bytes <= 4096);
+        assert!(stats.compact_bytes <= 8 * 1024 * 1024);
+    }
+
+    #[test]
+    #[ignore = "release qualification characterization; set MONGRELDB_REGISTRY_CHARACTERIZATION_SECONDS"]
+    fn registry_high_qps_characterization() {
+        let seconds = std::env::var("MONGRELDB_REGISTRY_CHARACTERIZATION_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(300);
+        for rate in [100_u64, 500, 1_000] {
+            let registry = Arc::new(SqlQueryRegistry::new_with_limits(
+                1_024,
+                2_048,
+                8 * 1024 * 1024,
+                100_000,
+                32 * 1024 * 1024,
+                Duration::from_secs(60),
+            ));
+            let started = Instant::now();
+            for second in 0..seconds {
+                let deadline = started + Duration::from_secs(second + 1);
+                for _ in 0..rate {
+                    registry
+                        .register(SqlQueryOptions::default())
+                        .unwrap()
+                        .complete()
+                        .unwrap();
+                }
+                std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+            }
+            let stats = registry.stats();
+            assert_eq!(stats.active, 0);
+            assert_eq!(stats.active_rejections, 0);
+            assert!(stats.detailed <= 2_048);
+            assert!(stats.detailed_bytes <= 8 * 1024 * 1024);
+            assert!(stats.compact <= 100_000);
+            assert!(stats.compact_bytes <= 32 * 1024 * 1024);
+            eprintln!(
+                "registry characterization: rate={rate} qps seconds={seconds} operations={} detailed={} compact={} detailed_bytes={} compact_bytes={} demotions={} compact_evictions={} active_rejections={}",
+                rate * seconds,
+                stats.detailed,
+                stats.compact,
+                stats.detailed_bytes,
+                stats.compact_bytes,
+                stats.demotions,
+                stats.compact_evictions,
+                stats.active_rejections,
+            );
+        }
     }
 
     #[test]

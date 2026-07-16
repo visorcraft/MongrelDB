@@ -70,22 +70,49 @@ async fn sql_returns_supplied_and_generated_query_ids() {
 }
 
 #[tokio::test]
-async fn cancel_reports_finished_after_detailed_status_eviction() {
+async fn compact_status_preserves_durable_outcome_after_detailed_eviction() {
     let dir = tempdir().unwrap();
-    let app = build_app(Arc::new(Database::create(dir.path()).unwrap()));
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    db.create_table(
+        "items",
+        Schema {
+            columns: vec![ColumnDef {
+                id: 1,
+                name: "id".into(),
+                ty: TypeId::Int64,
+                flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
+            }],
+            ..Schema::default()
+        },
+    )
+    .unwrap();
+    let app = build_app(db);
     let finished_id = "ffffffffffffffffffffffffffffffff";
     assert_eq!(
         app.clone()
             .oneshot(request(
                 "POST",
                 "/sql",
-                json!({ "sql": "SELECT 1", "query_id": finished_id }),
+                json!({ "sql": "INSERT INTO items (id) VALUES (1)", "query_id": finished_id }),
             ))
             .await
             .unwrap()
             .status(),
         StatusCode::OK
     );
+    let detailed = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            &format!("/queries/{finished_id}"),
+            Value::Null,
+        ))
+        .await
+        .unwrap();
+    let detailed = json_body(detailed).await;
+    let commit_epoch = detailed["last_commit_epoch_text"].clone();
+    assert_eq!(detailed["committed"], true);
 
     for value in 1..=2_048_u64 {
         let query_id = format!("{value:032x}");
@@ -114,9 +141,11 @@ async fn cancel_reports_finished_after_detailed_status_eviction() {
         .unwrap();
     assert_eq!(compact_status.status(), StatusCode::OK);
     let compact_status = json_body(compact_status).await;
-    assert_eq!(compact_status["state"], "finished");
+    assert_eq!(compact_status["detail"], "compact");
+    assert_eq!(compact_status["state"], "completed");
     assert_eq!(compact_status["cancel_outcome"], "already_finished");
-    assert!(compact_status["committed"].is_null());
+    assert_eq!(compact_status["committed"], true);
+    assert_eq!(compact_status["last_commit_epoch_text"], commit_epoch);
     let cancel = app
         .oneshot(request(
             "POST",
@@ -129,7 +158,8 @@ async fn cancel_reports_finished_after_detailed_status_eviction() {
     let cancel = json_body(cancel).await;
     assert_eq!(cancel["cancel_outcome"], "already_finished");
     assert_eq!(cancel["code"], "QUERY_ALREADY_FINISHED");
-    assert!(cancel["committed"].is_null());
+    assert_eq!(cancel["committed"], true);
+    assert_eq!(cancel["last_commit_epoch_text"], commit_epoch);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

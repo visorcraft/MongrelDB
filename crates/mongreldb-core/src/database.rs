@@ -52,25 +52,33 @@ fn advance_security_version(catalog: &mut Catalog) -> Result<()> {
     Ok(())
 }
 
-fn process_locked_paths() -> &'static Mutex<HashSet<PathBuf>> {
-    static LOCKED_PATHS: std::sync::OnceLock<Mutex<HashSet<PathBuf>>> = std::sync::OnceLock::new();
-    LOCKED_PATHS.get_or_init(|| Mutex::new(HashSet::new()))
+fn process_database_locks() -> &'static Mutex<HashMap<PathBuf, std::sync::Weak<SharedDatabaseLock>>>
+{
+    static LOCKS: std::sync::OnceLock<
+        Mutex<HashMap<PathBuf, std::sync::Weak<SharedDatabaseLock>>>,
+    > = std::sync::OnceLock::new();
+    LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+struct SharedDatabaseLock {
+    bootstrap_file: std::fs::File,
+    legacy_file: Mutex<Option<std::fs::File>>,
+    canonical_path: PathBuf,
 }
 
 struct DatabaseFileLock {
-    bootstrap_file: std::fs::File,
-    legacy_file: Option<std::fs::File>,
+    shared: Arc<SharedDatabaseLock>,
     canonical_path: PathBuf,
     durable_root: Option<Arc<crate::durable_file::DurableRoot>>,
 }
 
-impl Drop for DatabaseFileLock {
+impl Drop for SharedDatabaseLock {
     fn drop(&mut self) {
-        if let Some(file) = &self.legacy_file {
-            let _ = fs2::FileExt::unlock(file);
+        if let Some(file) = self.legacy_file.get_mut().take() {
+            let _ = fs2::FileExt::unlock(&file);
         }
         let _ = fs2::FileExt::unlock(&self.bootstrap_file);
-        process_locked_paths().lock().remove(&self.canonical_path);
+        process_database_locks().lock().remove(&self.canonical_path);
     }
 }
 
@@ -1485,41 +1493,40 @@ impl Database {
         use std::hash::{Hash, Hasher};
 
         let (canonical_path, lock_dir) = Self::canonical_lock_target(root)?;
+        let mut process_locks = process_database_locks().lock();
+        if let Some(shared) = process_locks
+            .get(&canonical_path)
+            .and_then(std::sync::Weak::upgrade)
         {
-            let mut locked = process_locked_paths().lock();
-            if !locked.insert(canonical_path.clone()) {
-                return Err(MongrelError::DatabaseLocked {
-                    path: root.to_path_buf(),
-                    message: "already open in this process".into(),
-                });
-            }
+            return Ok(DatabaseFileLock {
+                shared,
+                canonical_path,
+                durable_root: None,
+            });
         }
 
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         canonical_path.hash(&mut hasher);
         let lock_path = lock_dir.join(format!(".mongreldb-{:016x}.lock", hasher.finish()));
-        let file = match std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
-            .open(lock_path)
-        {
-            Ok(file) => file,
-            Err(error) => {
-                process_locked_paths().lock().remove(&canonical_path);
-                return Err(error.into());
-            }
-        };
+            .open(lock_path)?;
         if let Err(error) = Self::fs_lock_exclusive(&file, timeout_ms) {
-            process_locked_paths().lock().remove(&canonical_path);
             return Err(MongrelError::DatabaseLocked {
                 path: root.to_path_buf(),
                 message: error.to_string(),
             });
         }
-        Ok(DatabaseFileLock {
+        let shared = Arc::new(SharedDatabaseLock {
             bootstrap_file: file,
-            legacy_file: None,
+            legacy_file: Mutex::new(None),
+            canonical_path: canonical_path.clone(),
+        });
+        process_locks.insert(canonical_path.clone(), Arc::downgrade(&shared));
+        Ok(DatabaseFileLock {
+            shared,
             canonical_path,
             durable_root: None,
         })
@@ -1534,6 +1541,10 @@ impl Database {
             .durable_root
             .as_ref()
             .ok_or_else(|| MongrelError::Other("database root descriptor was not pinned".into()))?;
+        let mut legacy_file = lock.shared.legacy_file.lock();
+        if legacy_file.is_some() {
+            return Ok(());
+        }
         let file = durable_root.open_lock_file(Path::new(META_DIR).join(".lock"))?;
         if let Err(error) = Self::fs_lock_exclusive(&file, timeout_ms) {
             return Err(MongrelError::DatabaseLocked {
@@ -1541,7 +1552,7 @@ impl Database {
                 message: error.to_string(),
             });
         }
-        lock.legacy_file = Some(file);
+        *legacy_file = Some(file);
         Ok(())
     }
 
@@ -3894,6 +3905,81 @@ impl Database {
                     });
                 }
                 self.secure_rows_for(table_name, rows, principal)
+            },
+        )
+    }
+
+    /// Execute a secured native read with cooperative cancellation across
+    /// authorization, candidate generation, materialization, masking, and
+    /// projection.
+    pub fn query_for_current_principal_controlled(
+        &self,
+        table_name: &str,
+        query: &crate::query::Query,
+        projection: Option<&[u16]>,
+        control: &crate::ExecutionControl,
+    ) -> Result<Vec<crate::memtable::Row>> {
+        self.query_for_principal_controlled(table_name, query, projection, None, true, control)
+    }
+
+    fn query_for_principal_controlled(
+        &self,
+        table_name: &str,
+        query: &crate::query::Query,
+        projection: Option<&[u16]>,
+        principal: Option<&crate::auth::Principal>,
+        catalog_bound: bool,
+        control: &crate::ExecutionControl,
+    ) -> Result<Vec<crate::memtable::Row>> {
+        control.checkpoint()?;
+        let context = crate::query::AiExecutionContext::with_control(
+            control.clone(),
+            usize::MAX,
+            crate::query::MAX_FUSED_CANDIDATES,
+        );
+        let condition_columns = crate::query::condition_columns(&query.conditions);
+        self.with_authorized_read_context(
+            table_name,
+            principal,
+            catalog_bound,
+            None,
+            Some(&context),
+            None,
+            |table, snapshot, allowed, principal| {
+                control.checkpoint()?;
+                let allowed_columns = self.select_column_ids_for(table_name, principal)?;
+                self.require_columns_for(
+                    table_name,
+                    crate::auth::ColumnOperation::Select,
+                    &condition_columns,
+                    principal,
+                )?;
+                if let Some(projection) = projection {
+                    self.require_columns_for(
+                        table_name,
+                        crate::auth::ColumnOperation::Select,
+                        projection,
+                        principal,
+                    )?;
+                }
+                let rows =
+                    table.query_at_with_allowed_controlled(query, snapshot, allowed, control)?;
+                let projection =
+                    projection.map(|columns| columns.iter().copied().collect::<HashSet<_>>());
+                let mut projected = Vec::with_capacity(rows.len());
+                for (index, mut row) in rows.into_iter().enumerate() {
+                    if index & 255 == 0 {
+                        control.checkpoint()?;
+                    }
+                    row.columns.retain(|column, _| {
+                        allowed_columns.contains(column)
+                            && projection
+                                .as_ref()
+                                .is_none_or(|projection| projection.contains(column))
+                    });
+                    projected.push(row);
+                }
+                self.secure_rows_for_with_context(table_name, projected, principal, Some(&context))
             },
         )
     }
@@ -7034,13 +7120,19 @@ impl Database {
                 for condition in conditions {
                     q = q.and(eval_condition(condition, args, outputs)?);
                 }
-                let handle = self.table(table)?;
-                let rows = handle.lock().query(&q)?;
-                let mut rows = self.secure_rows_for(table, rows, principal)?;
+                let fallback_control = crate::ExecutionControl::new(None);
+                let query_control = control.unwrap_or(&fallback_control);
+                let mut rows = self.query_for_principal_controlled(
+                    table,
+                    &q,
+                    projection.as_deref(),
+                    principal,
+                    false,
+                    query_control,
+                )?;
                 if let Some(limit) = limit {
                     rows.truncate(*limit);
                 }
-                let projection = projection.as_ref();
                 let mut output = Vec::with_capacity(rows.len());
                 for (row_index, row) in rows.into_iter().enumerate() {
                     if row_index % 256 == 0 {
@@ -7050,14 +7142,7 @@ impl Database {
                     }
                     output.push(ProcedureCallRow {
                         row_id: Some(row.row_id),
-                        columns: match projection {
-                            Some(ids) => row
-                                .columns
-                                .into_iter()
-                                .filter(|(id, _)| ids.contains(id))
-                                .collect(),
-                            None => row.columns,
-                        },
+                        columns: row.columns,
                     });
                 }
                 Ok(ProcedureCallOutput::Rows(output))

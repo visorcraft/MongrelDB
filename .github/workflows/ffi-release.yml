@@ -22,9 +22,6 @@
 name: FFI Release
 
 on:
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
     inputs:
       tag:
@@ -36,7 +33,33 @@ permissions:
   contents: write
 
 jobs:
+  verify-components:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.tag }}
+      - uses: actions/checkout@v7
+        with:
+          repository: visorcraft/MongrelDB-Kit
+          ref: ${{ github.event.inputs.tag }}
+          path: .release-kit
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+      - name: Verify aggregate dependency train
+        shell: bash
+        run: |
+          version="${{ github.event.inputs.tag }}"
+          version="${version#v}"
+          mkdir -p target
+          cargo metadata --manifest-path crates/mongreldb-jni/Cargo.toml --locked --format-version 1 > target/jni-metadata.json
+          cargo metadata --manifest-path crates/mongreldb-kit-ffi/Cargo.toml --locked --format-version 1 > target/kit-ffi-metadata.json
+          scripts/verify-release-component-versions.py --expected "$version" target/jni-metadata.json target/kit-ffi-metadata.json
+          test "$(git -C .release-kit describe --tags --exact-match)" = "${{ github.event.inputs.tag }}"
+
   build-native:
+    needs: verify-components
     strategy:
       fail-fast: false
       matrix:
@@ -89,6 +112,8 @@ jobs:
         working-directory: crates/mongreldb-ffi
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.tag }}
 
       - uses: dtolnay/rust-toolchain@v1
         with:
@@ -155,6 +180,7 @@ jobs:
   # Build the Kit FFI (libmongreldb_kit) for the same 6 platform targets.
   # This is the Kit layer (schema model, migrations, query builder, validation).
   build-kit-native:
+    needs: verify-components
     strategy:
       fail-fast: false
       matrix:
@@ -195,6 +221,20 @@ jobs:
         working-directory: crates/mongreldb-kit-ffi
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.tag }}
+
+      - uses: actions/checkout@v7
+        with:
+          repository: visorcraft/MongrelDB-Kit
+          ref: ${{ github.event.inputs.tag }}
+          path: .release-kit
+
+      - name: Record exact build identities
+        shell: bash
+        run: |
+          echo "MONGRELDB_GIT_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "MONGRELDB_KIT_GIT_SHA=$(git -C .release-kit rev-parse HEAD)" >> "$GITHUB_ENV"
 
       - uses: dtolnay/rust-toolchain@v1
         with:
@@ -249,9 +289,12 @@ jobs:
   # Also publish a standalone headers archive (both mongreldb.h and
   # mongreldb_kit.h) so downstream build systems can fetch just headers.
   release-headers:
+    needs: verify-components
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.tag }}
 
       - run: |
           mkdir -p dist/mongreldb-headers/include
@@ -268,6 +311,7 @@ jobs:
   # Scala). Produces a fat JAR with all platform natives bundled, plus
   # per-platform JARs.
   build-jni:
+    needs: verify-components
     strategy:
       fail-fast: false
       matrix:
@@ -300,6 +344,20 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.tag }}
+
+      - uses: actions/checkout@v7
+        with:
+          repository: visorcraft/MongrelDB-Kit
+          ref: ${{ github.event.inputs.tag }}
+          path: .release-kit
+
+      - name: Record exact build identities
+        shell: bash
+        run: |
+          echo "MONGRELDB_GIT_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "MONGRELDB_KIT_GIT_SHA=$(git -C .release-kit rev-parse HEAD)" >> "$GITHUB_ENV"
 
       - uses: dtolnay/rust-toolchain@v1
         with:
@@ -357,7 +415,7 @@ jobs:
           mvn -B -ntp package
           # Rename to include platform in the filename.
           mkdir -p ../../../dist
-          cp target/mongreldb-jni-0.57.0.jar ../../../dist/mongreldb-jni-0.57.0-${{ matrix.os }}-${{ matrix.arch }}.jar
+          cp target/mongreldb-jni-0.58.0.jar ../../../dist/mongreldb-jni-0.58.0-${{ matrix.os }}-${{ matrix.arch }}.jar
 
       - uses: actions/upload-artifact@v7
         with:
@@ -376,6 +434,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.tag }}
 
       - uses: actions/setup-java@v5
         with:
@@ -395,12 +455,12 @@ jobs:
           cp -r ../../../staging/native/* src/main/resources/native/
           mvn -B -ntp package
           mkdir -p ../../../dist
-          cp target/mongreldb-jni-0.57.0.jar ../../../dist/mongreldb-jni-0.57.0.jar
+          cp target/mongreldb-jni-0.58.0.jar ../../../dist/mongreldb-jni-0.58.0.jar
 
       - uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
-          files: dist/mongreldb-jni-0.57.0.jar
+          files: dist/mongreldb-jni-0.58.0.jar
 
   # Publish the fat JAR (with all bundled native libraries) to Maven Central.
   # Runs after build-jni-fat assembles the fat JAR; re-uses its checkout and
@@ -411,6 +471,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.tag }}
 
       - uses: actions/setup-java@v5
         with:

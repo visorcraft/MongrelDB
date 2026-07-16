@@ -162,3 +162,5 @@ int32_t mongreldb_kit_query_delete_json(
 #endif
 
 #endif /* MONGRELDB_KIT_H */
+/** Runtime build identity JSON. Free with mongreldb_kit_free_json(). */
+char *mongreldb_kit_build_info(void);

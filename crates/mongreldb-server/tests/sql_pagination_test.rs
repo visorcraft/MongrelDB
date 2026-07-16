@@ -98,13 +98,57 @@ async fn pages_are_projected_stable_and_retryable() {
     let cursor = first["next_cursor"].as_str().unwrap().to_owned();
 
     sql(app.clone(), "INSERT INTO items (id) VALUES (6)").await;
-    let second_request = || post("/sql/continue", json!({ "cursor": cursor.clone() }), None);
-    let second = app.clone().oneshot(second_request()).await.unwrap();
+    let cancelled_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let cancel = app
+        .clone()
+        .oneshot(post(
+            &format!("/queries/{cancelled_id}/cancel"),
+            json!({}),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(cancel.status(), StatusCode::ACCEPTED);
+    let cancelled = app
+        .clone()
+        .oneshot(post(
+            "/sql/continue",
+            json!({ "cursor": cursor.clone(), "operation_id": cancelled_id }),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(cancelled.status(), StatusCode::from_u16(499).unwrap());
+    assert_eq!(cancelled.headers()["x-mongreldb-query-id"], cancelled_id);
+    let cancelled = json_body(cancelled).await;
+    assert_eq!(cancelled["query_id"], cancelled_id);
+    assert_eq!(cancelled["committed"], false);
+
+    let second_request = |operation_id| {
+        post(
+            "/sql/continue",
+            json!({ "cursor": cursor.clone(), "operation_id": operation_id }),
+            None,
+        )
+    };
+    let second_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let second = app
+        .clone()
+        .oneshot(second_request(second_id))
+        .await
+        .unwrap();
     assert_eq!(second.status(), StatusCode::OK);
+    assert_eq!(second.headers()["x-mongreldb-query-id"], second_id);
     let second = json_body(second).await;
     assert_eq!(second["rows"], json!([{ "id": 3 }, { "id": 4 }]));
     assert_eq!(second["page"]["total_rows"], 5);
-    let retry = json_body(app.clone().oneshot(second_request()).await.unwrap()).await;
+    let retry = json_body(
+        app.clone()
+            .oneshot(second_request("cccccccccccccccccccccccccccccccc"))
+            .await
+            .unwrap(),
+    )
+    .await;
     assert_eq!(retry, second);
 
     let final_cursor = second["next_cursor"].as_str().unwrap().to_owned();
@@ -112,7 +156,10 @@ async fn pages_are_projected_stable_and_retryable() {
         .clone()
         .oneshot(post(
             "/sql/continue",
-            json!({ "cursor": final_cursor.clone() }),
+            json!({
+                "cursor": final_cursor.clone(),
+                "operation_id": "dddddddddddddddddddddddddddddddd"
+            }),
             None,
         ))
         .await
@@ -125,7 +172,10 @@ async fn pages_are_projected_stable_and_retryable() {
         app.clone()
             .oneshot(post(
                 "/sql/continue",
-                json!({ "cursor": final_cursor }),
+                json!({
+                    "cursor": final_cursor,
+                    "operation_id": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                }),
                 None,
             ))
             .await

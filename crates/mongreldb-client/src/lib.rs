@@ -689,6 +689,8 @@ pub struct SqlClientOptions {
     pub timeout: Option<std::time::Duration>,
 }
 
+pub type RemoteSqlControlOptions = SqlClientOptions;
+
 #[derive(Debug, Clone)]
 pub struct SqlPageOptions {
     pub query_id: Option<mongreldb_query::QueryId>,
@@ -1262,6 +1264,8 @@ pub struct ServerCapabilities {
 pub struct RemoteQueryStatus {
     pub query_id: String,
     #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
     pub status: String,
     #[serde(default)]
     pub state: String,
@@ -1423,6 +1427,13 @@ fn validate_remote_query_status(
     ];
     if status.query_id != expected_query_id.to_string() {
         return Err("query status query_id does not match the request".into());
+    }
+    if status
+        .detail
+        .as_deref()
+        .is_some_and(|detail| detail != "compact")
+    {
+        return Err("query status detail is invalid".into());
     }
     if !STATUSES.contains(&status.status.as_str())
         || status.state.is_empty()
@@ -4634,24 +4645,52 @@ impl MongrelClient {
         page.map_err(|error| self.recover_after_transport_loss(query_id, error))
     }
 
-    pub fn continue_sql_page(&self, cursor: &str) -> ClientResult<RemoteSqlPage> {
+    pub fn continue_sql_page(
+        &self,
+        cursor: &str,
+        mut options: RemoteSqlControlOptions,
+    ) -> ClientResult<RemoteSqlPage> {
         if cursor.is_empty() || cursor.len() > 2_048 {
             return Err(ClientError::Decode(
                 "SQL continuation cursor must contain 1 to 2048 bytes".into(),
             ));
         }
         self.sql_pagination_capabilities()?;
-        let response = self
+        let query_id = match options.query_id.take() {
+            Some(query_id) => query_id,
+            None => mongreldb_query::QueryId::random()
+                .map_err(|error| ClientError::Transport(error.to_string()))?,
+        };
+        if options.timeout == Some(std::time::Duration::ZERO) {
+            return Err(ClientError::Decode("timeout must be positive".into()));
+        }
+        let timeout_ms = options
+            .timeout
+            .map(|timeout| timeout.as_millis().min(u128::from(u64::MAX)) as u64);
+        let response = match self
             .client
             .post(self.url("/sql/continue"))
-            .json(&serde_json::json!({ "cursor": cursor }))
-            .send()?;
-        bounded_blocking_bytes(self.check(response)?, MAX_SQL_RESPONSE_BYTES)
+            .json(&serde_json::json!({
+                "cursor": cursor,
+                "operation_id": query_id,
+                "timeout_ms": timeout_ms,
+            }))
+            .send()
+        {
+            Ok(response) => response,
+            Err(error) => {
+                return Err(self.recover_after_transport_loss(query_id, error.to_string()))
+            }
+        };
+        let response = self.check_sql_response(response, query_id)?;
+        validate_sql_query_id_header(response.headers(), query_id)
+            .map_err(|error| client_serialization_error(Some(query_id), error))?;
+        bounded_blocking_bytes(response, MAX_SQL_RESPONSE_BYTES)
             .and_then(|bytes| {
                 strict_json::<RemoteSqlPage>(&bytes, "SQL page").map_err(|error| error.to_string())
             })
             .and_then(|page| validate_remote_sql_page(page, None))
-            .map_err(|error| client_serialization_error(None, error))
+            .map_err(|error| client_serialization_error(Some(query_id), error))
     }
 
     pub fn start_sql(
@@ -5749,26 +5788,49 @@ impl AsyncMongrelClient {
         }
     }
 
-    pub async fn continue_sql_page(&self, cursor: &str) -> ClientResult<RemoteSqlPage> {
+    pub async fn continue_sql_page(
+        &self,
+        cursor: &str,
+        mut options: RemoteSqlControlOptions,
+    ) -> ClientResult<RemoteSqlPage> {
         if cursor.is_empty() || cursor.len() > 2_048 {
             return Err(ClientError::Decode(
                 "SQL continuation cursor must contain 1 to 2048 bytes".into(),
             ));
         }
         self.sql_pagination_capabilities().await?;
+        let query_id = match options.query_id.take() {
+            Some(query_id) => query_id,
+            None => mongreldb_query::QueryId::random()
+                .map_err(|error| ClientError::Transport(error.to_string()))?,
+        };
+        if options.timeout == Some(std::time::Duration::ZERO) {
+            return Err(ClientError::Decode("timeout must be positive".into()));
+        }
+        let timeout_ms = options
+            .timeout
+            .map(|timeout| timeout.as_millis().min(u128::from(u64::MAX)) as u64);
         let response = self
             .client
             .post(self.url("/sql/continue"))
-            .json(&serde_json::json!({ "cursor": cursor }))
+            .json(&serde_json::json!({
+                "cursor": cursor,
+                "operation_id": query_id,
+                "timeout_ms": timeout_ms,
+            }))
             .send()
-            .await?;
-        bounded_async_bytes(self.check(response).await?, MAX_SQL_RESPONSE_BYTES)
+            .await
+            .map_err(|error| ClientError::Transport(error.to_string()))?;
+        let response = self.check_sql_response(response, query_id).await?;
+        validate_sql_query_id_header(response.headers(), query_id)
+            .map_err(|error| client_serialization_error(Some(query_id), error))?;
+        bounded_async_bytes(response, MAX_SQL_RESPONSE_BYTES)
             .await
             .and_then(|bytes| {
                 strict_json::<RemoteSqlPage>(&bytes, "SQL page").map_err(|error| error.to_string())
             })
             .and_then(|page| validate_remote_sql_page(page, None))
-            .map_err(|error| client_serialization_error(None, error))
+            .map_err(|error| client_serialization_error(Some(query_id), error))
     }
 
     pub async fn cancel_sql(

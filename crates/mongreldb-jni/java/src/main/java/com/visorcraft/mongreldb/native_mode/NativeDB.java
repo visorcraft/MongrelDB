@@ -82,6 +82,12 @@ public class NativeDB implements AutoCloseable {
         }
     }
 
+    /** Returns exact runtime artifact, engine, query, Kit, and Git identities as JSON. */
+    public static String buildInfo() {
+        ensureNative();
+        return nativeBuildInfo();
+    }
+
     // ── Instance methods (delegate to static JNI with the handle) ──────────
 
     /** Runs SQL, returns a JSON array of row objects. DDL/DML returns "[]". */
@@ -174,6 +180,7 @@ public class NativeDB implements AutoCloseable {
     // ── Static native methods (the actual JNI bridge) ──────────────────────
 
     private static native long nativeOpen(String path);
+    private static native String nativeBuildInfo();
     private static native long nativeCreate(String path, String schemaJson);
     private static native void nativeClose(long handle);
     private static native String nativeSqlRows(long handle, String sql);

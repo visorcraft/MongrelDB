@@ -450,15 +450,19 @@ async fn autocommit_cancel_after_commit_finishes_external_session_sync() {
     reached.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(session.cancel_query(query_id), CancelOutcome::Accepted);
     barrier.wait();
-    assert!(matches!(
-        worker.await.unwrap(),
-        Err(MongrelQueryError::QueryCancelled {
-            query_id: id,
-            committed: true,
-            last_commit_epoch: Some(_),
-            ..
-        }) if id == query_id
-    ));
+    let result = worker.await.unwrap();
+    assert!(
+        matches!(
+            &result,
+            Err(MongrelQueryError::QueryCancelled {
+                query_id: id,
+                committed: true,
+                last_commit_epoch: Some(_),
+                ..
+            }) if *id == query_id
+        ),
+        "{result:?}"
+    );
     session.set_test_hook(None);
 
     assert_eq!(

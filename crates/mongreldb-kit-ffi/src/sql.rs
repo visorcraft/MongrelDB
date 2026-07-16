@@ -29,7 +29,8 @@ pub unsafe extern "C" fn mongreldb_kit_sql_rows(
         Err(code) => return code.as_return(),
     };
     if out_json.is_null() {
-        return set_error_msg(KitErrorCode::InvalidArgument, "out_json must not be null").as_return();
+        return set_error_msg(KitErrorCode::InvalidArgument, "out_json must not be null")
+            .as_return();
     }
 
     let rows = match h.db.borrow().sql_rows(sql_str) {

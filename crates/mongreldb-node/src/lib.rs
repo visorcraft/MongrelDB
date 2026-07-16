@@ -279,6 +279,25 @@ fn bigint_to_u64(b: &BigInt) -> napi::Result<u64> {
 
 // ── schema ────────────────────────────────────────────────────────────────
 
+#[napi(object)]
+pub struct NativeBuildInfo {
+    pub artifact_version: String,
+    pub engine_version: String,
+    pub query_version: String,
+    pub mongreldb_git_sha: String,
+}
+
+#[napi(js_name = "buildInfo")]
+pub fn build_info() -> NativeBuildInfo {
+    let info = mongreldb_query::build_info();
+    NativeBuildInfo {
+        artifact_version: env!("CARGO_PKG_VERSION").into(),
+        engine_version: info.engine_version.into(),
+        query_version: info.query_version.into(),
+        mongreldb_git_sha: info.mongreldb_git_sha.into(),
+    }
+}
+
 #[napi(js_name = "minhashMemberHashV1")]
 pub fn minhash_member_hash_v1_json(member_json: String) -> napi::Result<String> {
     let member: serde_json::Value = serde_json::from_str(&member_json)
@@ -2765,7 +2784,7 @@ impl ToNapiValue for ControlledRowsOutput {
             for batch in output.batches() {
                 let schema = batch.schema();
                 for row_index in 0..batch.num_rows() {
-                    if output_index % 256 == 0 {
+                    if output_index.is_multiple_of(256) {
                         output
                             .query()
                             .checkpoint()
@@ -5886,7 +5905,7 @@ fn validate_remote_query_envelope(
     }
     match committed {
         Some(true) => {
-            if committed_statements.map_or(true, |count| count == 0)
+            if committed_statements.is_none_or(|count| count == 0)
                 || last_commit_epoch.is_none()
                 || body["last_commit_epoch_text"].as_str().is_none()
                 || outcome["last_commit_epoch_text"].as_str().is_none()
@@ -6730,7 +6749,7 @@ fn validate_remote_sql_error_response(
 
     match committed {
         Some(true) => {
-            if committed_statements.map_or(true, |count| count == 0)
+            if committed_statements.is_none_or(|count| count == 0)
                 || last_commit_epoch.is_none()
                 || last_commit_epoch_text.is_none()
                 || first_commit_statement_index.is_none()

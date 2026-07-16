@@ -99,6 +99,21 @@ pub use procedure::{
     ProcedureBody, ProcedureCallOutput, ProcedureCallResult, ProcedureCallRow, ProcedureCondition,
     ProcedureEntry, ProcedureMode, ProcedureParam, ProcedureStep, ProcedureValue, StoredProcedure,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct BuildInfo {
+    pub artifact_version: &'static str,
+    pub engine_version: &'static str,
+    pub mongreldb_git_sha: &'static str,
+}
+
+pub fn build_info() -> BuildInfo {
+    BuildInfo {
+        artifact_version: env!("CARGO_PKG_VERSION"),
+        engine_version: env!("CARGO_PKG_VERSION"),
+        mongreldb_git_sha: env!("MONGRELDB_GIT_SHA"),
+    }
+}
 pub use query::{Condition, Query};
 pub use replication::{
     is_replica, replica_epoch, replica_source_id, write_replica_epoch, ReplicationBatch,

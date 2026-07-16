@@ -91,17 +91,35 @@ fn kit_ffi_sql_rows() {
             cstr("INSERT INTO users (id, name) VALUES (1, 'alice')"),
             &mut out,
         );
-        assert_eq!(ret, 0, "INSERT failed: {}", rust_str(mongreldb_kit_last_error()));
+        assert_eq!(
+            ret,
+            0,
+            "INSERT failed: {}",
+            rust_str(mongreldb_kit_last_error())
+        );
         mongreldb_kit_free_json(out as *mut _);
 
         // SELECT via sql_rows → JSON array of row objects.
         let ret = mongreldb_kit_sql_rows(db, cstr("SELECT id, name FROM users"), &mut out);
-        assert_eq!(ret, 0, "SELECT failed: {}", rust_str(mongreldb_kit_last_error()));
+        assert_eq!(
+            ret,
+            0,
+            "SELECT failed: {}",
+            rust_str(mongreldb_kit_last_error())
+        );
         let json = rust_str(out);
         mongreldb_kit_free_json(out as *mut _);
 
-        assert!(json.contains("alice"), "JSON should contain 'alice': {}", json);
-        assert!(json.contains("\"id\""), "JSON should contain id column: {}", json);
+        assert!(
+            json.contains("alice"),
+            "JSON should contain 'alice': {}",
+            json
+        );
+        assert!(
+            json.contains("\"id\""),
+            "JSON should contain id column: {}",
+            json
+        );
     }
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -128,7 +146,12 @@ fn kit_ffi_sql_arrow() {
         let mut buf: *mut u8 = std::ptr::null_mut();
         let mut len: usize = 0;
         let ret = mongreldb_kit_sql_arrow(db, cstr("SELECT id FROM users"), &mut buf, &mut len);
-        assert_eq!(ret, 0, "sql_arrow failed: {}", rust_str(mongreldb_kit_last_error()));
+        assert_eq!(
+            ret,
+            0,
+            "sql_arrow failed: {}",
+            rust_str(mongreldb_kit_last_error())
+        );
         assert!(len >= 6, "Arrow IPC should be at least 6 bytes");
 
         // Verify ARROW1 magic.
@@ -160,11 +183,20 @@ fn kit_ffi_query_select() {
         // Query via Kit query builder: SELECT * FROM users
         let select_json = r#"{"table":"users","columns":[],"filter":null,"order_by":[],"limit":null,"offset":null}"#;
         let ret = mongreldb_kit_query_select_json(db, cstr(select_json), &mut out);
-        assert_eq!(ret, 0, "select failed: {}", rust_str(mongreldb_kit_last_error()));
+        assert_eq!(
+            ret,
+            0,
+            "select failed: {}",
+            rust_str(mongreldb_kit_last_error())
+        );
         let json = rust_str(out);
         mongreldb_kit_free_json(out as *mut _);
 
-        assert!(json.contains("carol"), "result should contain 'carol': {}", json);
+        assert!(
+            json.contains("carol"),
+            "result should contain 'carol': {}",
+            json
+        );
     }
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -185,7 +217,12 @@ fn kit_ffi_migrate() {
             "ops": [{"raw_sql": "CREATE TABLE orders (id INT64 PRIMARY KEY, total FLOAT64)"}]
         }]"#;
         let ret = mongreldb_kit_migrate_json(db, cstr(migrations_json));
-        assert_eq!(ret, 0, "migrate failed: {}", rust_str(mongreldb_kit_last_error()));
+        assert_eq!(
+            ret,
+            0,
+            "migrate failed: {}",
+            rust_str(mongreldb_kit_last_error())
+        );
 
         // Verify the table was created by inserting into it.
         let mut out: *const c_char = std::ptr::null();
@@ -194,15 +231,29 @@ fn kit_ffi_migrate() {
             cstr("INSERT INTO orders (id, total) VALUES (1, 99.99)"),
             &mut out,
         );
-        assert_eq!(ret, 0, "INSERT into migrated table failed: {}", rust_str(mongreldb_kit_last_error()));
+        assert_eq!(
+            ret,
+            0,
+            "INSERT into migrated table failed: {}",
+            rust_str(mongreldb_kit_last_error())
+        );
         mongreldb_kit_free_json(out as *mut _);
 
         // Read back applied migrations.
         let ret = mongreldb_kit_applied_migrations_json(db, &mut out);
-        assert_eq!(ret, 0, "applied_migrations failed: {}", rust_str(mongreldb_kit_last_error()));
+        assert_eq!(
+            ret,
+            0,
+            "applied_migrations failed: {}",
+            rust_str(mongreldb_kit_last_error())
+        );
         let json = rust_str(out);
         mongreldb_kit_free_json(out as *mut _);
-        assert!(json.contains("add_orders"), "applied migrations should contain 'add_orders': {}", json);
+        assert!(
+            json.contains("add_orders"),
+            "applied migrations should contain 'add_orders': {}",
+            json
+        );
     }
 
     let _ = std::fs::remove_dir_all(&dir);

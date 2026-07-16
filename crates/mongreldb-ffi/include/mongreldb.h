@@ -359,6 +359,9 @@ int32_t mongreldb_last_error_details_v1(
 void mongreldb_free_error_string(char *ptr);
 void mongreldb_free_string(char *ptr);
 
+/** Runtime build identity JSON. Free with mongreldb_free_string(). */
+char *mongreldb_build_info(void);
+
 /* ── Database lifecycle ─────────────────────────────────────────────────── */
 
 mongreldb_database_t *mongreldb_create(const char *path);

@@ -897,9 +897,14 @@ pub(crate) async fn try_run_command(
                         }
                     ) {
                         *session.transaction.lock() = Default::default();
-                        if let Err(refresh_error) =
-                            sync_committed_statement(session, db, &external_tables, changes, None)
-                        {
+                        if let Err(refresh_error) = sync_committed_statement(
+                            session,
+                            db,
+                            &external_tables,
+                            changes,
+                            None,
+                            query,
+                        ) {
                             if matches!(
                                 &refresh_error,
                                 MongrelQueryError::QueryCancelled { .. }
@@ -927,7 +932,7 @@ pub(crate) async fn try_run_command(
             }
             *session.transaction.lock() = Default::default();
             if let Err(error) =
-                sync_committed_statement(session, db, &external_tables, changes, None)
+                sync_committed_statement(session, db, &external_tables, changes, None, query)
             {
                 if !committed {
                     return Err(error);
@@ -2822,7 +2827,7 @@ fn create_virtual_table_named(
     // catalog write. A rejected module definition must not survive a reopen.
     let provider = session
         .external_modules
-        .external_table_provider(db, &entry)?;
+        .external_table_provider(db, &entry, Some(query))?;
     let entry = run_controlled_durable_with_epoch(session, query, |before_publish| {
         let entry = db.create_external_table_controlled(entry, before_publish)?;
         let epoch = entry.created_epoch;
@@ -2864,7 +2869,9 @@ fn drop_table(
         })?;
         post_commit_result(
             query,
-            session.external_modules.destroy_external_table(db, &entry),
+            session
+                .external_modules
+                .destroy_external_table(db, &entry, query),
         )?;
         let _ = session.ctx.deregister_table(name);
         session.clear_cache();
@@ -2972,11 +2979,12 @@ fn refresh_external_table_provider(
     session: &MongrelSession,
     db: &Arc<Database>,
     entry: &ExternalTableEntry,
+    query: Option<&RegisteredSqlQuery>,
 ) -> Result<()> {
-    let _ = session.ctx.deregister_table(&entry.name);
     let provider = session
         .external_modules
-        .external_table_provider(db, entry)?;
+        .external_table_provider(db, entry, query)?;
+    let _ = session.ctx.deregister_table(&entry.name);
     session
         .ctx
         .register_table(&entry.name, provider)
@@ -2995,12 +3003,14 @@ fn current_external_rows(
     if let Some(state) = staged_external_state(session, &entry.name, query)? {
         let rows = session
             .external_modules
-            .external_table_rows_from_state(entry, &state)?;
+            .external_table_rows_from_state(db, entry, &state, query)?;
         crate::external_modules::enforce_external_rows_limit(&rows, Some(query))?;
         query.checkpoint()?;
         return Ok(rows);
     }
-    let rows = session.external_modules.external_table_rows(db, entry)?;
+    let rows = session
+        .external_modules
+        .external_table_rows(db, entry, query)?;
     crate::external_modules::enforce_external_rows_limit(&rows, Some(query))?;
     query.checkpoint()?;
     Ok(rows)
@@ -3062,7 +3072,7 @@ fn stage_external_write(
     query.checkpoint()?;
     let (state, result, base_writes) = session
         .external_modules
-        .external_table_write(db, entry, base_state, op)?;
+        .external_table_write(db, entry, base_state, op, query)?;
     crate::external_modules::enforce_external_state_limit(&state)?;
     query.checkpoint()?;
     let mut ops = base_writes
@@ -6495,6 +6505,7 @@ fn stage_or_apply_spooled(
                     &external_tables,
                     changes,
                     last_insert_rowid,
+                    &query,
                 ) {
                     if matches!(
                         &refresh_error,
@@ -6516,9 +6527,14 @@ fn stage_or_apply_spooled(
         return Err(query.commit_outcome_error(error.to_string()));
     }
     session.fire_test_hook(SqlTestHookPoint::AfterDurableCommit);
-    if let Err(error) =
-        sync_committed_statement(session, db, &external_tables, changes, last_insert_rowid)
-    {
+    if let Err(error) = sync_committed_statement(
+        session,
+        db,
+        &external_tables,
+        changes,
+        last_insert_rowid,
+        &query,
+    ) {
         if matches!(
             &error,
             MongrelQueryError::QueryCancelled { .. } | MongrelQueryError::DeadlineExceeded { .. }
@@ -6638,10 +6654,28 @@ fn refresh_external_tables(
     session: &MongrelSession,
     db: &Arc<Database>,
     names: &[String],
+    query: &RegisteredSqlQuery,
 ) -> Result<()> {
     for name in names {
         if let Some(entry) = db.external_table(name) {
-            refresh_external_table_provider(session, db, &entry)?;
+            match refresh_external_table_provider(session, db, &entry, Some(query)) {
+                Ok(()) => {}
+                Err(error)
+                    if query.status().committed
+                        && matches!(
+                            error,
+                            MongrelQueryError::QueryCancelled { .. }
+                                | MongrelQueryError::DeadlineExceeded { .. }
+                        ) =>
+                {
+                    // The durable publication already won. Finish required
+                    // session repair without the cancelled control, then
+                    // return the original typed cancellation outcome.
+                    refresh_external_table_provider(session, db, &entry, None)?;
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            }
         }
     }
     Ok(())
@@ -6653,8 +6687,9 @@ fn sync_committed_statement(
     external_tables: &[String],
     changes: u64,
     last_insert_rowid: Option<u64>,
+    query: &RegisteredSqlQuery,
 ) -> Result<()> {
-    let refresh = refresh_external_tables(session, db, external_tables);
+    let refresh = refresh_external_tables(session, db, external_tables, query);
     session
         .sql_fn_state
         .record_changes(changes, last_insert_rowid);
@@ -6706,7 +6741,7 @@ impl ExternalTriggerBridge for QueryExternalTriggerBridge {
                 self.query.checkpoint().map_err(query_error_to_core)?;
                 let mut rows = self
                     .modules
-                    .external_table_rows_from_state(entry, &base_state)
+                    .external_table_rows_from_state(&self.db, entry, &base_state, &self.query)
                     .map_err(query_error_to_core)?;
                 self.query.checkpoint().map_err(query_error_to_core)?;
                 let pk_col = entry.declared_schema.primary_key().ok_or_else(|| {
@@ -6746,7 +6781,7 @@ impl ExternalTriggerBridge for QueryExternalTriggerBridge {
                 self.query.checkpoint().map_err(query_error_to_core)?;
                 let rows = self
                     .modules
-                    .external_table_rows_from_state(entry, &base_state)
+                    .external_table_rows_from_state(&self.db, entry, &base_state, &self.query)
                     .map_err(query_error_to_core)?;
                 self.query.checkpoint().map_err(query_error_to_core)?;
                 let pk_col = entry.declared_schema.primary_key().ok_or_else(|| {
@@ -6783,7 +6818,7 @@ impl ExternalTriggerBridge for QueryExternalTriggerBridge {
         self.query.checkpoint().map_err(query_error_to_core)?;
         let (state, _result, base_writes) = self
             .modules
-            .external_table_write(&self.db, entry, base_state, external_op)
+            .external_table_write(&self.db, entry, base_state, external_op, &self.query)
             .map_err(query_error_to_core)?;
         self.query.checkpoint().map_err(query_error_to_core)?;
         Ok(ExternalTriggerWriteResult {
@@ -8811,11 +8846,24 @@ fn run_pragma(
         "table_info" => pragma_table_info(db, required_pragma_arg(&name, arg.as_deref())?),
         "table_xinfo" => pragma_table_xinfo(db, required_pragma_arg(&name, arg.as_deref())?),
         "table_list" => pragma_table_list(session, db, arg.as_deref()),
-        "index_list" => pragma_index_list(session, db, required_pragma_arg(&name, arg.as_deref())?),
-        "index_info" => pragma_index_info(session, db, required_pragma_arg(&name, arg.as_deref())?),
-        "index_xinfo" => {
-            pragma_index_xinfo(session, db, required_pragma_arg(&name, arg.as_deref())?)
-        }
+        "index_list" => pragma_index_list(
+            session,
+            db,
+            required_pragma_arg(&name, arg.as_deref())?,
+            query,
+        ),
+        "index_info" => pragma_index_info(
+            session,
+            db,
+            required_pragma_arg(&name, arg.as_deref())?,
+            query,
+        ),
+        "index_xinfo" => pragma_index_xinfo(
+            session,
+            db,
+            required_pragma_arg(&name, arg.as_deref())?,
+            query,
+        ),
         "foreign_key_list" => {
             pragma_foreign_key_list(db, required_pragma_arg(&name, arg.as_deref())?)
         }
@@ -9214,9 +9262,12 @@ fn pragma_index_list(
     session: &MongrelSession,
     db: &Arc<Database>,
     table: &str,
+    query: &RegisteredSqlQuery,
 ) -> Result<RecordBatch> {
     if let Some(entry) = db.external_table(table) {
-        let indexes = session.external_modules.external_table_indexes(&entry)?;
+        let indexes = session
+            .external_modules
+            .external_table_indexes(db, &entry, query)?;
         let seq: Vec<i64> = (0..indexes.len()).map(|i| i as i64).collect();
         let names: Vec<String> = indexes.iter().map(|i| i.name.clone()).collect();
         let unique: Vec<i64> = indexes.iter().map(|i| i64::from(i.unique)).collect();
@@ -9267,8 +9318,9 @@ fn pragma_index_xinfo(
     session: &MongrelSession,
     db: &Arc<Database>,
     index: &str,
+    query: &RegisteredSqlQuery,
 ) -> Result<RecordBatch> {
-    if let Some((entry, def)) = find_external_module_index(session, db, index)? {
+    if let Some((entry, def)) = find_external_module_index(session, db, index, query)? {
         return pragma_external_index_xinfo(&entry, &def);
     }
     let table = find_index_table(db, index)?.ok_or_else(|| {
@@ -9310,8 +9362,9 @@ fn pragma_index_info(
     session: &MongrelSession,
     db: &Arc<Database>,
     index: &str,
+    query: &RegisteredSqlQuery,
 ) -> Result<RecordBatch> {
-    if let Some((entry, def)) = find_external_module_index(session, db, index)? {
+    if let Some((entry, def)) = find_external_module_index(session, db, index, query)? {
         return pragma_external_index_info(&entry, &def);
     }
     let table = find_index_table(db, index)?.ok_or_else(|| {
@@ -9351,11 +9404,12 @@ fn find_external_module_index(
     session: &MongrelSession,
     db: &Arc<Database>,
     index: &str,
+    query: &RegisteredSqlQuery,
 ) -> Result<Option<(ExternalTableEntry, ExternalModuleIndex)>> {
     for entry in db.external_tables() {
         if let Some(def) = session
             .external_modules
-            .external_table_indexes(&entry)?
+            .external_table_indexes(db, &entry, query)?
             .into_iter()
             .find(|def| def.name == index)
         {

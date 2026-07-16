@@ -1,7 +1,8 @@
 use std::sync::{Arc, Mutex};
 
 use mongreldb_client::{
-    ClientError, MongrelClient, RemoteQueryErrorCode, SqlClientOptions, SqlPageOptions,
+    ClientError, MongrelClient, RemoteQueryErrorCode, RemoteSqlControlOptions, SqlClientOptions,
+    SqlPageOptions,
 };
 use wiremock::matchers::{body_json, method, path, path_regex};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -114,6 +115,15 @@ fn queryless_sql_error(code: &str) -> serde_json::Value {
             "retryable": false
         }
     })
+}
+
+fn identified_sql_error(code: &str, query_id: &str) -> serde_json::Value {
+    let mut error = queryless_sql_error(code);
+    error["query_id"] = serde_json::json!(query_id);
+    error["error"]["query_id"] = serde_json::json!(query_id);
+    error["cancel_outcome"] = serde_json::json!("already_finished");
+    error["cancellation_reason"] = serde_json::json!("none");
+    error
 }
 
 fn exact_query_not_found(request: &Request) -> ResponseTemplate {
@@ -450,8 +460,12 @@ async fn mount_malformed_protocol_mocks(server: &MockServer) {
         .await;
     Mock::given(method("POST"))
         .and(path("/sql/continue"))
-        .and(body_json(serde_json::json!({"cursor": "bad-page-cursor"})))
-        .respond_with(ResponseTemplate::new(200).set_body_json(malformed_page()))
+        .and(body_json(serde_json::json!({
+            "cursor": "bad-page-cursor",
+            "operation_id": QUERY_ID,
+            "timeout_ms": null
+        })))
+        .respond_with(sql_response(200).set_body_json(malformed_page()))
         .expect(1)
         .mount(server)
         .await;
@@ -596,7 +610,7 @@ fn protocol_bounds_are_rejected_before_network_io() {
         Err(ClientError::Decode(_))
     ));
     assert!(matches!(
-        client.continue_sql_page(""),
+        client.continue_sql_page("", RemoteSqlControlOptions::default()),
         Err(ClientError::Decode(_))
     ));
     assert!(matches!(
@@ -906,7 +920,7 @@ async fn malformed_receipt_preserves_proven_commit_in_both_clients() {
     .await
     .unwrap();
     assert!(matches!(
-        blocking,
+        &blocking,
         ClientError::Query {
             code: RemoteQueryErrorCode::CommitOutcome,
             response,
@@ -973,8 +987,16 @@ async fn blocking_client_rejects_malformed_receipts_and_pages() {
             Some(QUERY_ID),
         );
         assert_serialization_error(
-            client.continue_sql_page("bad-page-cursor").unwrap_err(),
-            None,
+            client
+                .continue_sql_page(
+                    "bad-page-cursor",
+                    RemoteSqlControlOptions {
+                        query_id: Some(QUERY_ID.parse().unwrap()),
+                        timeout: None,
+                    },
+                )
+                .unwrap_err(),
+            Some(QUERY_ID),
         );
     })
     .await
@@ -1020,15 +1042,21 @@ async fn async_client_rejects_malformed_receipts_and_pages() {
     );
     assert_serialization_error(
         client
-            .continue_sql_page("bad-page-cursor")
+            .continue_sql_page(
+                "bad-page-cursor",
+                RemoteSqlControlOptions {
+                    query_id: Some(QUERY_ID.parse().unwrap()),
+                    timeout: None,
+                },
+            )
             .await
             .unwrap_err(),
-        None,
+        Some(QUERY_ID),
     );
 }
 
 #[tokio::test]
-async fn queryless_cursor_errors_remain_typed_in_both_clients() {
+async fn identified_cursor_errors_remain_typed_in_both_clients() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/capabilities"))
@@ -1036,10 +1064,15 @@ async fn queryless_cursor_errors_remain_typed_in_both_clients() {
         .expect(2)
         .mount(&server)
         .await;
-    let body = queryless_sql_error("SQL_CURSOR_NOT_FOUND");
+    let body = identified_sql_error("SQL_CURSOR_NOT_FOUND", QUERY_ID);
     Mock::given(method("POST"))
         .and(path("/sql/continue"))
-        .respond_with(ResponseTemplate::new(404).set_body_json(body))
+        .and(body_json(serde_json::json!({
+            "cursor": "missing-cursor",
+            "operation_id": QUERY_ID,
+            "timeout_ms": null
+        })))
+        .respond_with(sql_response(404).set_body_json(body))
         .expect(2)
         .mount(&server)
         .await;
@@ -1049,23 +1082,38 @@ async fn queryless_cursor_errors_remain_typed_in_both_clients() {
     let blocking = tokio::task::spawn_blocking(move || {
         MongrelClient::new(&blocking_uri)
             .unwrap()
-            .continue_sql_page("missing-cursor")
+            .continue_sql_page(
+                "missing-cursor",
+                RemoteSqlControlOptions {
+                    query_id: Some(QUERY_ID.parse().unwrap()),
+                    timeout: None,
+                },
+            )
             .unwrap_err()
     })
     .await
     .unwrap();
-    assert!(matches!(
-        blocking,
-        ClientError::Query {
-            code: RemoteQueryErrorCode::SqlCursorNotFound,
-            response,
-            ..
-        } if response.query_id.is_none() && response.committed == Some(false)
-    ));
+    assert!(
+        matches!(
+            &blocking,
+            ClientError::Query {
+                code: RemoteQueryErrorCode::SqlCursorNotFound,
+                response,
+                ..
+            } if response.query_id.as_deref() == Some(QUERY_ID) && response.committed == Some(false)
+        ),
+        "{blocking:?}"
+    );
 
     let asynchronous = mongreldb_client::AsyncMongrelClient::new(&uri)
         .unwrap()
-        .continue_sql_page("missing-cursor")
+        .continue_sql_page(
+            "missing-cursor",
+            RemoteSqlControlOptions {
+                query_id: Some(QUERY_ID.parse().unwrap()),
+                timeout: None,
+            },
+        )
         .await
         .unwrap_err();
     assert!(matches!(
@@ -1074,7 +1122,7 @@ async fn queryless_cursor_errors_remain_typed_in_both_clients() {
             code: RemoteQueryErrorCode::SqlCursorNotFound,
             response,
             ..
-        } if response.query_id.is_none() && response.committed == Some(false)
+        } if response.query_id.as_deref() == Some(QUERY_ID) && response.committed == Some(false)
     ));
 }
 
@@ -1101,19 +1149,22 @@ async fn queryless_non_cursor_codes_fail_closed_in_both_clients() {
     let blocking = tokio::task::spawn_blocking(move || {
         MongrelClient::new(&blocking_uri)
             .unwrap()
-            .continue_sql_page("missing-cursor")
+            .continue_sql_page("missing-cursor", RemoteSqlControlOptions::default())
             .unwrap_err()
     })
     .await
     .unwrap();
-    assert!(matches!(blocking, ClientError::Decode(_)));
+    assert!(matches!(blocking, ClientError::QueryOutcomeUnknown { .. }));
 
     let asynchronous = mongreldb_client::AsyncMongrelClient::new(&uri)
         .unwrap()
-        .continue_sql_page("missing-cursor")
+        .continue_sql_page("missing-cursor", RemoteSqlControlOptions::default())
         .await
         .unwrap_err();
-    assert!(matches!(asynchronous, ClientError::Decode(_)));
+    assert!(matches!(
+        asynchronous,
+        ClientError::QueryOutcomeUnknown { .. }
+    ));
 }
 
 #[tokio::test]
@@ -1330,8 +1381,12 @@ async fn async_client_sends_projection_and_continues_cursor() {
         .await;
     Mock::given(method("POST"))
         .and(path("/sql/continue"))
-        .and(body_json(serde_json::json!({"cursor": "cursor-2"})))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        .and(body_json(serde_json::json!({
+            "cursor": "cursor-2",
+            "operation_id": QUERY_ID,
+            "timeout_ms": null
+        })))
+        .respond_with(sql_response(200).set_body_json(serde_json::json!({
             "status": "completed",
             "rows": [{"id": 2}],
             "next_cursor": null,
@@ -1365,7 +1420,13 @@ async fn async_client_sends_projection_and_continues_cursor() {
         .unwrap();
     assert_eq!(first.rows, vec![serde_json::json!({"id": 1})]);
     let second = client
-        .continue_sql_page(first.next_cursor.as_deref().unwrap())
+        .continue_sql_page(
+            first.next_cursor.as_deref().unwrap(),
+            RemoteSqlControlOptions {
+                query_id: Some(QUERY_ID.parse().unwrap()),
+                timeout: None,
+            },
+        )
         .await
         .unwrap();
     assert_eq!(second.rows, vec![serde_json::json!({"id": 2})]);

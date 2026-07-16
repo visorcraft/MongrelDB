@@ -13,9 +13,9 @@ use mongreldb_core::{
     TriggerValue, Value,
 };
 use mongreldb_query::{
-    ExternalModuleDescriptor, ExternalModuleIndex, ExternalPlan, ExternalPlanRequest, ExternalScan,
-    ExternalTable, ExternalTableModule, ExternalTxn, ExternalWriteOp, ExternalWriteResult,
-    ModuleConnectCtx, MongrelQueryError, MongrelSession,
+    ExternalExecutionContext, ExternalModuleDescriptor, ExternalModuleIndex, ExternalPlan,
+    ExternalPlanRequest, ExternalScan, ExternalTable, ExternalTableModule, ExternalTxn,
+    ExternalWriteOp, ExternalWriteResult, MongrelQueryError, MongrelSession,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::{
@@ -63,19 +63,21 @@ impl ExternalTableModule for AppRowsModule {
         }
     }
 
-    fn indexes(
+    fn indexes_with_control(
         &self,
+        context: &ExternalExecutionContext<'_>,
         entry: &mongreldb_core::ExternalTableEntry,
     ) -> mongreldb_query::Result<Vec<ExternalModuleIndex>> {
+        context.control.checkpoint()?;
         Ok(vec![ExternalModuleIndex::new(
             format!("{}_label_lookup", entry.name),
             vec![2],
         )])
     }
 
-    fn connect(
+    fn connect_with_control(
         &self,
-        _ctx: &ModuleConnectCtx<'_>,
+        _ctx: &ExternalExecutionContext<'_>,
         _entry: &mongreldb_core::ExternalTableEntry,
     ) -> mongreldb_query::Result<Arc<dyn ExternalTable>> {
         Ok(Arc::new(AppRowsTable {
@@ -87,9 +89,9 @@ impl ExternalTableModule for AppRowsModule {
         }))
     }
 
-    fn destroy(
+    fn destroy_with_control(
         &self,
-        _ctx: &ModuleConnectCtx<'_>,
+        _ctx: &ExternalExecutionContext<'_>,
         _entry: &mongreldb_core::ExternalTableEntry,
     ) -> mongreldb_query::Result<()> {
         self.destroyed.store(true, Ordering::SeqCst);
@@ -108,7 +110,14 @@ impl ExternalTable for AppRowsTable {
         self.schema.clone()
     }
 
-    fn plan(&self, request: &ExternalPlanRequest<'_>) -> DFResult<ExternalPlan> {
+    fn plan_with_control(
+        &self,
+        request: &ExternalPlanRequest<'_>,
+        control: &mongreldb_core::ExecutionControl,
+    ) -> DFResult<ExternalPlan> {
+        control
+            .checkpoint()
+            .map_err(|error| DataFusionError::Execution(error.to_string()))?;
         self.plan_calls.fetch_add(1, Ordering::SeqCst);
         Ok(ExternalPlan::new(
             request
@@ -203,9 +212,9 @@ impl ExternalTableModule for AppTxnModule {
         }
     }
 
-    fn connect(
+    fn connect_with_control(
         &self,
-        ctx: &ModuleConnectCtx<'_>,
+        ctx: &ExternalExecutionContext<'_>,
         entry: &mongreldb_core::ExternalTableEntry,
     ) -> mongreldb_query::Result<Arc<dyn ExternalTable>> {
         Ok(Arc::new(AppTxnTable {
@@ -217,25 +226,27 @@ impl ExternalTableModule for AppTxnModule {
         }))
     }
 
-    fn read_rows(
+    fn read_rows_with_control(
         &self,
-        ctx: &ModuleConnectCtx<'_>,
+        ctx: &ExternalExecutionContext<'_>,
         entry: &mongreldb_core::ExternalTableEntry,
     ) -> mongreldb_query::Result<Vec<std::collections::HashMap<u16, Value>>> {
         app_txn_rows_from_value(ctx.read_state(entry, b"rows")?.as_deref())
     }
 
-    fn rows_from_state(
+    fn rows_from_state_with_control(
         &self,
+        context: &ExternalExecutionContext<'_>,
         state: &[u8],
     ) -> mongreldb_query::Result<Vec<std::collections::HashMap<u16, Value>>> {
+        context.control.checkpoint()?;
         let txn = ExternalTxn::new(state.to_vec());
         app_txn_rows_from_value(txn.read_state(b"rows")?.as_deref())
     }
 
-    fn write(
+    fn write_with_control(
         &self,
-        _ctx: &ModuleConnectCtx<'_>,
+        _ctx: &ExternalExecutionContext<'_>,
         _entry: &mongreldb_core::ExternalTableEntry,
         op: ExternalWriteOp,
         txn: &mut ExternalTxn,
@@ -265,7 +276,14 @@ impl ExternalTable for AppTxnTable {
         self.schema.clone()
     }
 
-    fn plan(&self, request: &ExternalPlanRequest<'_>) -> DFResult<ExternalPlan> {
+    fn plan_with_control(
+        &self,
+        request: &ExternalPlanRequest<'_>,
+        control: &mongreldb_core::ExecutionControl,
+    ) -> DFResult<ExternalPlan> {
+        control
+            .checkpoint()
+            .map_err(|error| DataFusionError::Execution(error.to_string()))?;
         Ok(ExternalPlan::new(
             request
                 .filters

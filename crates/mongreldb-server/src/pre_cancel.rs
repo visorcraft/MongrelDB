@@ -51,8 +51,16 @@ struct OwnerRate {
 #[derive(Debug, Default)]
 struct StoreState {
     entries: HashMap<PreCancelKey, Entry>,
+    by_query_id: HashMap<QueryId, usize>,
     owner_rates: HashMap<String, OwnerRate>,
     approximate_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RegistrationLookup {
+    NoReservation,
+    Matching(CancellationReason),
+    ReservedByAnotherIdentity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +137,12 @@ impl PreCancelStore {
             return Err(InsertError::Full);
         }
         state.approximate_bytes = state.approximate_bytes.saturating_add(approximate_bytes);
+        if !state.by_query_id.contains_key(&query_id) {
+            state.approximate_bytes = state
+                .approximate_bytes
+                .saturating_add(std::mem::size_of::<(QueryId, usize)>());
+        }
+        *state.by_query_id.entry(query_id).or_default() += 1;
         state.entries.insert(
             key,
             Entry {
@@ -155,6 +169,7 @@ impl PreCancelStore {
             state.approximate_bytes = state
                 .approximate_bytes
                 .saturating_sub(entry.approximate_bytes);
+            remove_query_id(&mut state, query_id);
             Some(entry.reason)
         } else {
             None
@@ -182,6 +197,26 @@ impl PreCancelStore {
             .entries
             .iter()
             .find_map(|(key, entry)| (key.query_id == query_id).then_some(entry.reason))
+    }
+
+    pub(crate) fn lookup_for_registration(
+        &self,
+        query_id: QueryId,
+        owner: &str,
+        session_id: Option<&str>,
+    ) -> RegistrationLookup {
+        let Ok(key) = PreCancelKey::new(query_id, owner, session_id) else {
+            return RegistrationLookup::NoReservation;
+        };
+        let mut state = self.lock();
+        self.prune_locked(&mut state);
+        if let Some(entry) = state.entries.get(&key) {
+            RegistrationLookup::Matching(entry.reason)
+        } else if state.by_query_id.contains_key(&query_id) {
+            RegistrationLookup::ReservedByAnotherIdentity
+        } else {
+            RegistrationLookup::NoReservation
+        }
     }
 
     pub(crate) fn reason_for_query_in_session(
@@ -244,15 +279,19 @@ impl PreCancelStore {
 
     fn prune_locked(&self, state: &mut StoreState) {
         let now = Instant::now();
-        state.entries.retain(|_, entry| {
-            let keep = entry.expires_at > now;
-            if !keep {
+        let expired = state
+            .entries
+            .iter()
+            .filter_map(|(key, entry)| (entry.expires_at <= now).then_some(key.clone()))
+            .collect::<Vec<_>>();
+        for key in expired {
+            if let Some(entry) = state.entries.remove(&key) {
                 state.approximate_bytes = state
                     .approximate_bytes
                     .saturating_sub(entry.approximate_bytes);
+                remove_query_id(state, key.query_id);
             }
-            keep
-        });
+        }
         state.owner_rates.retain(|_, rate| {
             let keep = now.saturating_duration_since(rate.window_started) < self.rate_window;
             if !keep {
@@ -262,6 +301,18 @@ impl PreCancelStore {
             }
             keep
         });
+    }
+}
+
+fn remove_query_id(state: &mut StoreState, query_id: QueryId) {
+    if let Some(count) = state.by_query_id.get_mut(&query_id) {
+        *count -= 1;
+        if *count == 0 {
+            state.by_query_id.remove(&query_id);
+            state.approximate_bytes = state
+                .approximate_bytes
+                .saturating_sub(std::mem::size_of::<(QueryId, usize)>());
+        }
     }
 }
 
@@ -304,6 +355,54 @@ mod tests {
         std::thread::sleep(Duration::from_millis(75));
         assert_eq!(store.take(id(1), "alice", Some("one")), None);
         assert_eq!(store.len(), 0);
+        assert_eq!(store.approximate_bytes(), 0);
+    }
+
+    #[test]
+    fn registration_lookup_tracks_all_identities_and_expiry() {
+        let store = PreCancelStore::new(
+            Duration::from_millis(25),
+            8,
+            4096,
+            8,
+            Duration::from_secs(1),
+            8,
+        );
+        store
+            .insert(id(1), "alice", Some("a"), CancellationReason::ClientRequest)
+            .unwrap();
+        store
+            .insert(id(1), "alice", Some("a"), CancellationReason::ClientRequest)
+            .unwrap();
+        store
+            .insert(id(1), "bob", Some("b"), CancellationReason::Deadline)
+            .unwrap();
+
+        assert_eq!(
+            store.lookup_for_registration(id(1), "alice", Some("a")),
+            RegistrationLookup::Matching(CancellationReason::ClientRequest)
+        );
+        assert_eq!(
+            store.lookup_for_registration(id(1), "alice", Some("b")),
+            RegistrationLookup::ReservedByAnotherIdentity
+        );
+        assert_eq!(
+            store.lookup_for_registration(id(2), "alice", Some("a")),
+            RegistrationLookup::NoReservation
+        );
+        assert_eq!(
+            store.take(id(1), "alice", Some("a")),
+            Some(CancellationReason::ClientRequest)
+        );
+        assert_eq!(
+            store.lookup_for_registration(id(1), "alice", Some("a")),
+            RegistrationLookup::ReservedByAnotherIdentity
+        );
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(
+            store.lookup_for_registration(id(1), "bob", Some("b")),
+            RegistrationLookup::NoReservation
+        );
         assert_eq!(store.approximate_bytes(), 0);
     }
 

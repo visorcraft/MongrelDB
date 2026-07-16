@@ -55,9 +55,7 @@ pub fn set_error(e: &kit::KitError) -> KitErrorCode {
     let msg = format!("{e}");
     let code = match e {
         kit::KitError::Validation(_) => KitErrorCode::Schema,
-        kit::KitError::Storage(_) | kit::KitError::Integrity(_) => {
-            KitErrorCode::Io
-        }
+        kit::KitError::Storage(_) | kit::KitError::Integrity(_) => KitErrorCode::Io,
         _ => KitErrorCode::Unknown,
     };
     set_error_msg(code, &msg);
@@ -145,8 +143,11 @@ pub(crate) unsafe fn write_json_out(
             *out = cstr.into_raw() as *const c_char;
             0
         }
-        Err(e) => set_error_msg(KitErrorCode::Unknown, format!("JSON serialization failed: {e}"))
-            .as_return(),
+        Err(e) => set_error_msg(
+            KitErrorCode::Unknown,
+            format!("JSON serialization failed: {e}"),
+        )
+        .as_return(),
     }
 }
 

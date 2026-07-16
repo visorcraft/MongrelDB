@@ -9,8 +9,8 @@ use datafusion::logical_expr::TableProviderFilterPushDown;
 use mongreldb_core::schema::{ColumnDef, ColumnFlags, Schema, TypeId};
 use mongreldb_core::{Database, ModuleCapabilities};
 use mongreldb_query::{
-    ExternalModuleDescriptor, ExternalPlan, ExternalPlanRequest, ExternalScan, ExternalTable,
-    ExternalTableModule, ModuleConnectCtx,
+    ExternalExecutionContext, ExternalModuleDescriptor, ExternalPlan, ExternalPlanRequest,
+    ExternalScan, ExternalTable, ExternalTableModule,
 };
 use mongreldb_server::{build_app, build_app_with_external_modules};
 use std::io::Cursor;
@@ -60,11 +60,12 @@ impl ExternalTableModule for ServerRowsModule {
         }
     }
 
-    fn connect(
+    fn connect_with_control(
         &self,
-        _ctx: &ModuleConnectCtx<'_>,
+        ctx: &ExternalExecutionContext<'_>,
         _entry: &mongreldb_core::ExternalTableEntry,
     ) -> mongreldb_query::Result<Arc<dyn ExternalTable>> {
+        ctx.control.checkpoint()?;
         Ok(Arc::new(ServerRowsTable {
             schema: Arc::new(ArrowSchema::new(vec![
                 Field::new("id", ArrowDataType::Int64, false),
@@ -84,7 +85,14 @@ impl ExternalTable for ServerRowsTable {
         self.schema.clone()
     }
 
-    fn plan(&self, request: &ExternalPlanRequest<'_>) -> DFResult<ExternalPlan> {
+    fn plan_with_control(
+        &self,
+        request: &ExternalPlanRequest<'_>,
+        control: &mongreldb_core::ExecutionControl,
+    ) -> DFResult<ExternalPlan> {
+        control
+            .checkpoint()
+            .map_err(|error| DataFusionError::Execution(error.to_string()))?;
         Ok(ExternalPlan::new(
             request
                 .filters

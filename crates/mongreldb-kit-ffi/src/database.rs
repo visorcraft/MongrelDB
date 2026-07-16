@@ -253,8 +253,12 @@ pub unsafe extern "C" fn mongreldb_kit_create_with_credentials(
             return std::ptr::null_mut();
         }
     };
-    match KitDatabase::create_with_credentials(Path::new(path_str), schema, admin_user, admin_password)
-    {
+    match KitDatabase::create_with_credentials(
+        Path::new(path_str),
+        schema,
+        admin_user,
+        admin_password,
+    ) {
         Ok(db) => FFIKitDatabase {
             db: Rc::new(RefCell::new(db)),
         }
@@ -272,9 +276,7 @@ pub unsafe extern "C" fn mongreldb_kit_create_with_credentials(
 /// # Safety
 /// `db` must be a valid handle.
 #[no_mangle]
-pub unsafe extern "C" fn mongreldb_kit_refresh_sql_session(
-    db: mongreldb_kit_database_t,
-) -> i32 {
+pub unsafe extern "C" fn mongreldb_kit_refresh_sql_session(db: mongreldb_kit_database_t) -> i32 {
     clear();
     let Some(h) = as_kit_db(db) else {
         return KitErrorCode::InvalidArgument.as_return();

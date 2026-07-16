@@ -78,7 +78,8 @@ pub unsafe extern "C" fn mongreldb_kit_applied_migrations_json(
         return KitErrorCode::InvalidArgument.as_return();
     };
     if out_json.is_null() {
-        return set_error_msg(KitErrorCode::InvalidArgument, "out_json must not be null").as_return();
+        return set_error_msg(KitErrorCode::InvalidArgument, "out_json must not be null")
+            .as_return();
     }
 
     let migrations = match h.db.borrow().applied_migrations() {

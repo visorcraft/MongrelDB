@@ -16,6 +16,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::extract::{Path, State};
 use axum::http::header;
@@ -26,9 +27,9 @@ use axum::Json;
 use mongreldb_core::schema::{Schema, TypeId};
 use mongreldb_core::{CancellationReason, Database, Value};
 use mongreldb_query::{
-    CancelOutcome, ExternalTableModule, ManagedQueryBatches, MongrelSession, QueryId,
-    RegisteredQueryGuard, RegisteredSqlQuery, SqlQueryOptions, SqlQueryPhase, SqlQueryRegistry,
-    SqlStreamCompletion,
+    CancelOutcome, CompactFinishedQuery, ExternalTableModule, ManagedQueryBatches, MongrelSession,
+    QueryId, RegisteredQueryGuard, RegisteredSqlQuery, SqlQueryOptions, SqlQueryPhase,
+    SqlQueryRegistry, SqlStreamCompletion,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -156,6 +157,10 @@ struct AppState {
     sql_pages: sql_pages::SqlPageStore,
     /// Admission control for ordinary SQL, separate from AI workers.
     sql_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Admission control for retained-page work. Never competes with SQL.
+    sql_page_semaphore: Arc<tokio::sync::Semaphore>,
+    sql_page_default_timeout: std::time::Duration,
+    sql_page_max_timeout: std::time::Duration,
     sql_default_timeout: std::time::Duration,
     sql_max_timeout: std::time::Duration,
     sql_cancel_grace: std::time::Duration,
@@ -307,10 +312,12 @@ pub fn build_app_with_sessions_and_control(
         eprintln!("[history] failed to configure retention: {error}");
     }
     let max_active_queries = default_sql_max_active_queries();
-    let query_registry = Arc::new(SqlQueryRegistry::new(
+    let query_registry = Arc::new(SqlQueryRegistry::new_with_limits(
         max_active_queries,
-        max_active_queries.saturating_mul(2),
-        2 * 1024 * 1024,
+        default_sql_finished_detail_max_entries(),
+        default_sql_finished_detail_max_bytes(),
+        default_sql_finished_compact_max_entries(),
+        default_sql_finished_compact_max_bytes(),
         default_sql_finished_query_ttl(),
     ));
     let accepting_sql = Arc::new(AtomicBool::new(true));
@@ -373,6 +380,12 @@ pub fn build_app_with_sessions_and_control(
             default_sql_page_max_entries_per_owner(),
         ),
         sql_semaphore: Arc::new(tokio::sync::Semaphore::new(default_sql_max_concurrent())),
+        sql_page_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            default_sql_page_max_concurrent(),
+        )),
+        sql_page_default_timeout: default_sql_page_default_timeout()
+            .min(default_sql_page_max_timeout()),
+        sql_page_max_timeout: default_sql_page_max_timeout(),
         sql_default_timeout,
         sql_max_timeout,
         sql_cancel_grace,
@@ -383,6 +396,7 @@ pub fn build_app_with_sessions_and_control(
     });
     let router = axum::Router::new()
         .route("/health", get(health))
+        .route("/build-info", get(build_info))
         .route("/capabilities", get(capabilities))
         .route(
             "/history/retention",
@@ -1045,6 +1059,10 @@ async fn capabilities() -> Json<CapabilitiesResponse> {
     })
 }
 
+async fn build_info() -> Json<mongreldb_query::BuildInfo> {
+    Json(mongreldb_query::build_info())
+}
+
 #[derive(Debug, Deserialize)]
 struct HistoryRetentionRequest {
     #[serde(default)]
@@ -1203,11 +1221,45 @@ fn default_sql_max_active_queries() -> usize {
     positive_env_usize("MONGRELDB_SQL_MAX_ACTIVE_QUERIES", 1_024)
 }
 
+fn default_sql_page_max_concurrent() -> usize {
+    positive_env_usize("MONGRELDB_SQL_PAGE_MAX_CONCURRENT", 16)
+}
+
+fn default_sql_page_default_timeout() -> std::time::Duration {
+    std::time::Duration::from_millis(positive_env_u64(
+        "MONGRELDB_SQL_PAGE_DEFAULT_TIMEOUT_MS",
+        5_000,
+    ))
+}
+
+fn default_sql_page_max_timeout() -> std::time::Duration {
+    std::time::Duration::from_millis(positive_env_u64(
+        "MONGRELDB_SQL_PAGE_MAX_TIMEOUT_MS",
+        30_000,
+    ))
+}
+
 fn default_sql_finished_query_ttl() -> std::time::Duration {
     std::time::Duration::from_secs(positive_env_u64(
         "MONGRELDB_SQL_FINISHED_QUERY_TTL_SECS",
         60,
     ))
+}
+
+fn default_sql_finished_detail_max_entries() -> usize {
+    positive_env_usize("MONGRELDB_SQL_FINISHED_DETAIL_MAX_ENTRIES", 2_048)
+}
+
+fn default_sql_finished_detail_max_bytes() -> usize {
+    positive_env_usize("MONGRELDB_SQL_FINISHED_DETAIL_MAX_BYTES", 8 * 1024 * 1024)
+}
+
+fn default_sql_finished_compact_max_entries() -> usize {
+    positive_env_usize("MONGRELDB_SQL_FINISHED_COMPACT_MAX_ENTRIES", 100_000)
+}
+
+fn default_sql_finished_compact_max_bytes() -> usize {
+    positive_env_usize("MONGRELDB_SQL_FINISHED_COMPACT_MAX_BYTES", 32 * 1024 * 1024)
 }
 
 fn default_sql_pre_cancel_ttl() -> std::time::Duration {
@@ -1841,10 +1893,14 @@ async fn dispatch_paginated_sql(
             "SQL_CURSOR_EXPIRED",
             mongreldb_query::QueryTerminalErrorCategory::Execution,
         );
-        return sql_cursor_error_response(
-            StatusCode::CONFLICT,
-            "SQL_CURSOR_EXPIRED",
-            "authorization or schema changed while retaining the SQL result",
+        return with_query_id(
+            sql_cursor_error_response(
+                StatusCode::CONFLICT,
+                "SQL_CURSOR_EXPIRED",
+                "authorization or schema changed while retaining the SQL result",
+                query_id,
+            ),
+            query_id,
         );
     }
     let retained = match state.sql_pages.insert(
@@ -1932,6 +1988,7 @@ async fn dispatch_paginated_sql(
                 "failed to create the first SQL result page",
             );
         }
+        Err(sql_pages::PageError::Cancelled) => unreachable!("first-page rendering has no control"),
     };
     let discard_after_response = page.next_cursor.is_none();
     let page_byte_count = page.byte_count;
@@ -2138,6 +2195,73 @@ fn serialize_sql_page(page: sql_pages::SqlPage) -> Result<Vec<u8>, serde_json::E
             "token_estimate": "ceil(projected_json_bytes/4)",
         }
     }))
+}
+
+enum ControlledPageSerializationError {
+    Query(mongreldb_query::MongrelQueryError),
+    Encoding,
+}
+
+struct ControlledPageWriter<'a> {
+    bytes: Vec<u8>,
+    query: &'a RegisteredSqlQuery,
+}
+
+impl std::io::Write for ControlledPageWriter<'_> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.query
+            .checkpoint()
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialize_sql_page_controlled(
+    page: sql_pages::SqlPage,
+    query: &RegisteredSqlQuery,
+) -> Result<Vec<u8>, ControlledPageSerializationError> {
+    query
+        .checkpoint()
+        .map_err(ControlledPageSerializationError::Query)?;
+    let value = json!({
+        "status": "completed",
+        "rows": page.rows,
+        "next_cursor": page.next_cursor,
+        "page": {
+            "offset": page.offset,
+            "row_count": page.row_count,
+            "total_rows": page.total_rows,
+            "byte_count": page.byte_count,
+            "estimated_tokens": page.estimated_tokens,
+            "limits": page.limits,
+            "projection": page.projection,
+            "expires_at_ms": page.expires_at_ms,
+            "snapshot": "retained_result",
+            "token_estimate": "ceil(projected_json_bytes/4)",
+        }
+    });
+    let mut writer = ControlledPageWriter {
+        bytes: Vec::new(),
+        query,
+    };
+    if let Err(error) = serde_json::to_writer(&mut writer, &value) {
+        return match query.checkpoint() {
+            Err(error) => Err(ControlledPageSerializationError::Query(error)),
+            Ok(()) => {
+                let _ = error;
+                Err(ControlledPageSerializationError::Encoding)
+            }
+        };
+    }
+    query
+        .checkpoint()
+        .map_err(ControlledPageSerializationError::Query)?;
+    Ok(writer.bytes)
 }
 
 fn sql_page_response(body: Vec<u8>) -> Response {
@@ -2547,10 +2671,7 @@ async fn metrics_handler(
     }
     let body = state.metrics.prometheus_text(
         state.db.table_names().len(),
-        state.query_registry.active_count(),
-        state.query_registry.queued_count(),
-        state.query_registry.entry_count(),
-        state.query_registry.approximate_bytes(),
+        state.query_registry.stats(),
         (
             state.pre_cancellations.len(),
             state.pre_cancellations.approximate_bytes(),
@@ -4183,12 +4304,17 @@ fn register_controlled_query(
         .query_lifecycle
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    let pre_cancel_reason = state
-        .pre_cancellations
-        .reason(query_id, &owner, session_id.as_deref());
-    if pre_cancel_reason.is_none() && state.pre_cancellations.reason_for_query(query_id).is_some() {
-        return Err(mongreldb_query::MongrelQueryError::QueryIdConflict { query_id });
-    }
+    let pre_cancel_reason = match state.pre_cancellations.lookup_for_registration(
+        query_id,
+        &owner,
+        session_id.as_deref(),
+    ) {
+        pre_cancel::RegistrationLookup::NoReservation => None,
+        pre_cancel::RegistrationLookup::Matching(reason) => Some(reason),
+        pre_cancel::RegistrationLookup::ReservedByAnotherIdentity => {
+            return Err(mongreldb_query::MongrelQueryError::QueryIdConflict { query_id });
+        }
+    };
     let query = session.register_query(options)?;
     let Some(reason) = pre_cancel_reason else {
         return Ok(query);
@@ -4627,38 +4753,49 @@ fn pre_cancelled_query_response(
     )
 }
 
-fn compact_finished_query_response(query_id: QueryId) -> Response {
+fn compact_finished_query_response(status: &CompactFinishedQuery) -> Response {
+    let query_id = status.query_id;
+    let durable = &status.durable_outcome;
+    let outcome_unknown =
+        status.terminal_state == mongreldb_query::QueryTerminalState::OutcomeUnknown;
+    let terminal_error = status.terminal_error.as_ref().map(|error| {
+        json!({
+            "code": error.code,
+            "category": terminal_error_category_name(error.category),
+        })
+    });
     with_query_id(
         Json(json!({
+            "detail": "compact",
             "query_id": query_id.to_string(),
-            "status": "finished",
-            "terminal_state": null,
-            "state": "finished",
-            "server_state": "finished",
+            "status": terminal_state_name(status.terminal_state),
+            "terminal_state": terminal_state_name(status.terminal_state),
+            "state": query_phase_name(status.phase),
+            "server_state": query_phase_name(status.phase),
             "cancel_outcome": "already_finished",
             "code": "QUERY_ALREADY_FINISHED",
-            "committed": null,
-            "committed_statements": null,
-            "last_commit_epoch": null,
-            "last_commit_epoch_text": null,
-            "first_commit_statement_index": null,
-            "last_commit_statement_index": null,
-            "completed_statements": null,
-            "statement_index": null,
-            "cancellation_reason": "none",
+            "committed": (!outcome_unknown).then_some(durable.committed),
+            "committed_statements": (!outcome_unknown).then_some(durable.committed_statements),
+            "last_commit_epoch": (!outcome_unknown).then_some(durable.last_commit_epoch).flatten(),
+            "last_commit_epoch_text": (!outcome_unknown).then_some(epoch_text(durable.last_commit_epoch)).flatten(),
+            "first_commit_statement_index": (!outcome_unknown).then_some(durable.first_commit_statement_index).flatten(),
+            "last_commit_statement_index": (!outcome_unknown).then_some(durable.last_commit_statement_index).flatten(),
+            "completed_statements": (!outcome_unknown).then_some(status.completed_statements),
+            "statement_index": (!outcome_unknown).then_some(status.statement_index),
+            "cancellation_reason": cancellation_reason_name(status.cancellation_reason),
             "outcome": {
-                "committed": null,
-                "committed_statements": null,
-                "last_commit_epoch": null,
-                "last_commit_epoch_text": null,
-                "first_commit_statement_index": null,
-                "last_commit_statement_index": null,
-                "completed_statements": null,
-                "statement_index": null,
-                "serialization": "unknown",
+                "committed": (!outcome_unknown).then_some(durable.committed),
+                "committed_statements": (!outcome_unknown).then_some(durable.committed_statements),
+                "last_commit_epoch": (!outcome_unknown).then_some(durable.last_commit_epoch).flatten(),
+                "last_commit_epoch_text": (!outcome_unknown).then_some(epoch_text(durable.last_commit_epoch)).flatten(),
+                "first_commit_statement_index": (!outcome_unknown).then_some(durable.first_commit_statement_index).flatten(),
+                "last_commit_statement_index": (!outcome_unknown).then_some(durable.last_commit_statement_index).flatten(),
+                "completed_statements": (!outcome_unknown).then_some(status.completed_statements),
+                "statement_index": (!outcome_unknown).then_some(status.statement_index),
+                "serialization": serialization_outcome_name(status.serialization_outcome),
             },
-            "terminal_error": null,
-            "retryable": false,
+            "terminal_error": terminal_error,
+            "retryable": terminal_error_retryable(status.terminal_error.as_ref()),
         }))
         .into_response(),
         query_id,
@@ -4689,17 +4826,15 @@ async fn query_status(
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     let Some(status) = state.query_registry.status(query_id) else {
-        if let Some((finished_owner, finished_session)) =
-            state.query_registry.compact_finished_identity(query_id)
-        {
-            if !caller_may_manage_query(&state, &principal, finished_owner.as_deref())
+        if let Some(finished) = state.query_registry.compact_finished_status(query_id) {
+            if !caller_may_manage_query(&state, &principal, finished.owner.as_deref())
                 || requested_session
                     .as_deref()
-                    .is_some_and(|session| finished_session.as_deref() != Some(session))
+                    .is_some_and(|session| finished.session_id.as_deref() != Some(session))
             {
                 return query_not_found_response(Some(query_id));
             }
-            return compact_finished_query_response(query_id);
+            return compact_finished_query_response(&finished);
         }
         let reason = state
             .pre_cancellations
@@ -4800,17 +4935,15 @@ async fn cancel_query(
         .unwrap_or_else(|error| error.into_inner());
     state.metrics.inc_sql_cancel_requests();
     let Some(status) = state.query_registry.status(query_id) else {
-        if let Some((finished_owner, finished_session)) =
-            state.query_registry.compact_finished_identity(query_id)
-        {
-            if !caller_may_manage_query(&state, &principal, finished_owner.as_deref())
+        if let Some(finished) = state.query_registry.compact_finished_status(query_id) {
+            if !caller_may_manage_query(&state, &principal, finished.owner.as_deref())
                 || requested_session
                     .as_deref()
-                    .is_some_and(|session| finished_session.as_deref() != Some(session))
+                    .is_some_and(|session| finished.session_id.as_deref() != Some(session))
             {
                 return query_not_found_response(Some(query_id));
             }
-            return compact_finished_query_response(query_id);
+            return compact_finished_query_response(&finished);
         }
         return match state.pre_cancellations.insert(
             query_id,
@@ -5006,51 +5139,160 @@ async fn cancel_query(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SqlContinuationRequest {
     cursor: String,
+    #[serde(default)]
+    operation_id: Option<QueryId>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+fn register_page_operation(
+    state: &AppState,
+    options: SqlQueryOptions,
+) -> mongreldb_query::Result<RegisteredSqlQuery> {
+    let query_id = options.query_id.ok_or_else(|| {
+        mongreldb_query::MongrelQueryError::InvalidQueryState(
+            "page operation registration requires an operation id".into(),
+        )
+    })?;
+    let owner = options.owner.clone().unwrap_or_default();
+    let session_id = options.session_id.clone();
+    let _lifecycle = state
+        .query_lifecycle
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let reason = match state.pre_cancellations.lookup_for_registration(
+        query_id,
+        &owner,
+        session_id.as_deref(),
+    ) {
+        pre_cancel::RegistrationLookup::NoReservation => None,
+        pre_cancel::RegistrationLookup::Matching(reason) => Some(reason),
+        pre_cancel::RegistrationLookup::ReservedByAnotherIdentity => {
+            return Err(mongreldb_query::MongrelQueryError::QueryIdConflict { query_id });
+        }
+    };
+    let query = state.query_registry.register(options)?;
+    if let Some(reason) = reason {
+        state
+            .pre_cancellations
+            .take(query_id, &owner, session_id.as_deref());
+        query.request_cancel(reason);
+        let error = cancellation_checkpoint_error(&query);
+        query.fail();
+        return Err(error);
+    }
+    Ok(query)
 }
 
 async fn continue_sql_page(
     State(state): State<Arc<AppState>>,
     OptionalPrincipal(principal): OptionalPrincipal,
+    headers: axum::http::HeaderMap,
     Json(request): Json<SqlContinuationRequest>,
 ) -> Response {
-    if request.cursor.len() > 2_048 {
-        return sql_cursor_error_response(
+    let query_id = match request.operation_id {
+        Some(query_id) => query_id,
+        None => match QueryId::random() {
+            Ok(query_id) => query_id,
+            Err(error) => return query_error_response(&error, None),
+        },
+    };
+    if !request_identity_is_current(&state, &principal) {
+        return with_query_id(
+            sql_cursor_error_response(
+                StatusCode::NOT_FOUND,
+                "SQL_CURSOR_NOT_FOUND",
+                "SQL continuation result is unavailable",
+                query_id,
+            ),
+            query_id,
+        );
+    }
+    let owner = request_owner(&state, &principal);
+    let session_id = match query_session_header(&headers, Some(query_id)) {
+        Ok(session_id) => session_id,
+        Err(response) => return *response,
+    };
+    let timeout_ms = request.timeout_ms.unwrap_or_else(|| {
+        state
+            .sql_page_default_timeout
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64
+    });
+    if timeout_ms == 0 || Duration::from_millis(timeout_ms) > state.sql_page_max_timeout {
+        return bad_query_control_request(
+            format!(
+                "timeout_ms must be positive and no greater than {}",
+                state.sql_page_max_timeout.as_millis()
+            ),
+            Some(query_id),
+        );
+    }
+    let query = match register_page_operation(
+        &state,
+        SqlQueryOptions {
+            query_id: Some(query_id),
+            timeout: Some(Duration::from_millis(timeout_ms)),
+            owner: Some(owner.clone()),
+            session_id,
+            parent_control: None,
+        },
+    ) {
+        Ok(query) => query,
+        Err(error) => return tracked_query_error_response(&state, &error, Some(query_id)),
+    };
+    query.set_sql_metadata("CONTINUE SQL PAGE");
+    let _permit = match tokio::select! {
+        permit = Arc::clone(&state.sql_page_semaphore).acquire_owned() => permit.map_err(|_| {
+            mongreldb_query::MongrelQueryError::InvalidQueryState(
+                "SQL page admission semaphore closed".into(),
+            )
+        }),
+        _ = query.control().cancelled() => Err(cancellation_checkpoint_error(&query)),
+    } {
+        Ok(permit) => permit,
+        Err(error) => {
+            query.fail();
+            return tracked_query_error_response(&state, &error, Some(query_id));
+        }
+    };
+    if let Err(error) = query.transition(SqlQueryPhase::Queued, SqlQueryPhase::Executing) {
+        query.fail();
+        return tracked_query_error_response(&state, &error, Some(query_id));
+    }
+    let fail = |status, code, message| {
+        query.record_terminal_error(code, mongreldb_query::QueryTerminalErrorCategory::Execution);
+        query.fail();
+        with_query_id(
+            sql_cursor_error_response(status, code, message, query_id),
+            query_id,
+        )
+    };
+    if request.cursor.is_empty() || request.cursor.len() > 2_048 {
+        return fail(
             StatusCode::BAD_REQUEST,
             "INVALID_SQL_CURSOR",
             "invalid SQL continuation cursor",
         );
     }
-    if !request_identity_is_current(&state, &principal) {
-        return sql_cursor_error_response(
-            StatusCode::NOT_FOUND,
-            "SQL_CURSOR_NOT_FOUND",
-            "SQL continuation result is unavailable",
-        );
+    if let Err(error) = query.checkpoint() {
+        query.fail();
+        return tracked_query_error_response(&state, &error, Some(query_id));
     }
-    let owner = request_owner(&state, &principal);
-    let _permit = match state.sql_semaphore.acquire().await {
-        Ok(permit) => permit,
-        Err(_) => {
-            return sql_cursor_error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "SQL_ADMISSION_CLOSED",
-                "SQL continuation admission is closed",
-            );
-        }
-    };
     let cursor_mac_key = match state.cursor_mac_key.get() {
         Ok(key) => key,
         Err(_) => {
-            return sql_cursor_error_response(
+            return fail(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "ENTROPY_UNAVAILABLE",
                 "OS CSPRNG unavailable",
             );
         }
     };
-    match state.sql_pages.continue_page(
+    match state.sql_pages.continue_page_with_control(
         &request.cursor,
         &owner,
         &cursor_mac_key,
@@ -5058,42 +5300,64 @@ async fn continue_sql_page(
             security_version: state.db.security_version(),
             catalog_epoch: state.db.catalog_snapshot().db_epoch,
         },
+        &query,
     ) {
         Ok(page) => {
             let page_byte_count = page.byte_count;
-            match tokio::task::spawn_blocking(move || serialize_sql_page(page)).await {
+            if let Err(error) = query.begin_serialization() {
+                query.fail();
+                return tracked_query_error_response(&state, &error, Some(query_id));
+            }
+            let serialization_query = query.clone();
+            match tokio::task::spawn_blocking(move || {
+                serialize_sql_page_controlled(page, &serialization_query)
+            })
+            .await
+            {
                 Ok(Ok(body)) => {
+                    if let Err(error) = query.try_complete() {
+                        return tracked_query_error_response(&state, &error, Some(query_id));
+                    }
                     state.metrics.add_sql_output_bytes(page_byte_count);
-                    sql_page_response(body)
+                    with_query_id(sql_page_response(body), query_id)
                 }
-                Ok(Err(_)) => sql_cursor_error_response(
+                Ok(Err(ControlledPageSerializationError::Query(error))) => {
+                    query.fail();
+                    tracked_query_error_response(&state, &error, Some(query_id))
+                }
+                Ok(Err(ControlledPageSerializationError::Encoding)) => fail(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "SERIALIZATION_FAILED",
                     "failed to serialize SQL continuation page",
                 ),
-                Err(_) => sql_cursor_error_response(
+                Err(_) => fail(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "SERIALIZATION_WORKER_FAILED",
                     "SQL continuation serialization worker failed",
                 ),
             }
         }
-        Err(sql_pages::CursorError::Invalid) => sql_cursor_error_response(
+        Err(sql_pages::CursorError::Cancelled) => {
+            let error = cancellation_checkpoint_error(&query);
+            query.fail();
+            tracked_query_error_response(&state, &error, Some(query_id))
+        }
+        Err(sql_pages::CursorError::Invalid) => fail(
             StatusCode::BAD_REQUEST,
             "INVALID_SQL_CURSOR",
             "invalid SQL continuation cursor",
         ),
-        Err(sql_pages::CursorError::Expired) => sql_cursor_error_response(
+        Err(sql_pages::CursorError::Expired) => fail(
             StatusCode::GONE,
             "SQL_CURSOR_EXPIRED",
             "SQL continuation cursor expired",
         ),
-        Err(sql_pages::CursorError::NotFound) => sql_cursor_error_response(
+        Err(sql_pages::CursorError::NotFound) => fail(
             StatusCode::NOT_FOUND,
             "SQL_CURSOR_NOT_FOUND",
             "SQL continuation result is unavailable",
         ),
-        Err(sql_pages::CursorError::PageLimit) => sql_cursor_error_response(
+        Err(sql_pages::CursorError::PageLimit) => fail(
             StatusCode::PAYLOAD_TOO_LARGE,
             "RESULT_LIMIT_EXCEEDED",
             "one projected row exceeds the page byte or token limit",
@@ -5105,10 +5369,12 @@ fn sql_cursor_error_response(
     status: StatusCode,
     code: &'static str,
     message: &'static str,
+    query_id: QueryId,
 ) -> Response {
     (
         status,
         Json(json!({
+            "query_id": query_id.to_string(),
             "status": "failed_before_commit",
             "terminal_state": "failed_before_commit",
             "server_state": "failed",
@@ -5120,8 +5386,8 @@ fn sql_cursor_error_response(
             "last_commit_statement_index": null,
             "completed_statements": 0,
             "statement_index": 0,
-            "cancel_outcome": null,
-            "cancellation_reason": null,
+            "cancel_outcome": "already_finished",
+            "cancellation_reason": "none",
             "retryable": false,
             "outcome": {
                 "committed": false,
@@ -5137,6 +5403,7 @@ fn sql_cursor_error_response(
             "error": {
                 "code": code,
                 "message": message,
+                "query_id": query_id.to_string(),
                 "committed": false,
                 "retryable": false,
             }

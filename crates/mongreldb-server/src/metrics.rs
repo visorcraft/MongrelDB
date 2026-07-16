@@ -127,10 +127,7 @@ impl Metrics {
     pub fn prometheus_text(
         &self,
         table_count: usize,
-        active_queries: usize,
-        queued_queries: usize,
-        registry_entries: usize,
-        registry_bytes: usize,
+        registry: mongreldb_query::QueryRegistryStats,
         pre_cancel: (usize, usize),
     ) -> String {
         let (pre_cancel_entries, pre_cancel_bytes) = pre_cancel;
@@ -161,11 +158,13 @@ impl Metrics {
         out.push_str(&format!("mongreldb_sql_queries_total {sql_queries}\n\n"));
         out.push_str("# TYPE mongreldb_sql_active_queries gauge\n");
         out.push_str(&format!(
-            "mongreldb_sql_active_queries {active_queries}\n\n"
+            "mongreldb_sql_active_queries {}\n\n",
+            registry.active
         ));
         out.push_str("# TYPE mongreldb_sql_queued_queries gauge\n");
         out.push_str(&format!(
-            "mongreldb_sql_queued_queries {queued_queries}\n\n"
+            "mongreldb_sql_queued_queries {}\n\n",
+            registry.queued
         ));
         out.push_str("# TYPE mongreldb_sql_cancel_requests_total counter\n");
         out.push_str(&format!(
@@ -211,11 +210,63 @@ impl Metrics {
         ));
         out.push_str("# TYPE mongreldb_sql_registry_entries gauge\n");
         out.push_str(&format!(
-            "mongreldb_sql_registry_entries {registry_entries}\n\n"
+            "mongreldb_sql_registry_entries {}\n\n",
+            registry.active + registry.detailed + registry.compact
         ));
         out.push_str("# TYPE mongreldb_sql_registry_bytes gauge\n");
         out.push_str(&format!(
-            "mongreldb_sql_registry_bytes {registry_bytes}\n\n"
+            "mongreldb_sql_registry_bytes {}\n\n",
+            registry.detailed_bytes + registry.compact_bytes
+        ));
+        out.push_str("# TYPE mongreldb_sql_registry_active gauge\n");
+        out.push_str(&format!(
+            "mongreldb_sql_registry_active {}\n",
+            registry.active
+        ));
+        out.push_str("# TYPE mongreldb_sql_registry_queued gauge\n");
+        out.push_str(&format!(
+            "mongreldb_sql_registry_queued {}\n",
+            registry.queued
+        ));
+        out.push_str("# TYPE mongreldb_sql_registry_detailed gauge\n");
+        out.push_str(&format!(
+            "mongreldb_sql_registry_detailed {}\n",
+            registry.detailed
+        ));
+        out.push_str("# TYPE mongreldb_sql_registry_compact gauge\n");
+        out.push_str(&format!(
+            "mongreldb_sql_registry_compact {}\n",
+            registry.compact
+        ));
+        out.push_str("# TYPE mongreldb_sql_registry_detailed_bytes gauge\n");
+        out.push_str(&format!(
+            "mongreldb_sql_registry_detailed_bytes {}\n",
+            registry.detailed_bytes
+        ));
+        out.push_str("# TYPE mongreldb_sql_registry_compact_bytes gauge\n");
+        out.push_str(&format!(
+            "mongreldb_sql_registry_compact_bytes {}\n",
+            registry.compact_bytes
+        ));
+        out.push_str("# TYPE mongreldb_sql_registry_demotions_total counter\n");
+        out.push_str(&format!(
+            "mongreldb_sql_registry_demotions_total {}\n",
+            registry.demotions
+        ));
+        out.push_str("# TYPE mongreldb_sql_registry_compact_evictions_total counter\n");
+        out.push_str(&format!(
+            "mongreldb_sql_registry_compact_evictions_total {}\n",
+            registry.compact_evictions
+        ));
+        out.push_str("# TYPE mongreldb_sql_registry_rejections_total counter\n");
+        out.push_str(&format!(
+            "mongreldb_sql_registry_rejections_total{{reason=\"active_limit\"}} {}\n",
+            registry.active_rejections
+        ));
+        out.push_str("# TYPE mongreldb_sql_registry_oldest_compact_age_seconds gauge\n");
+        out.push_str(&format!(
+            "mongreldb_sql_registry_oldest_compact_age_seconds {}\n\n",
+            registry.oldest_compact_age.as_secs_f64()
         ));
         out.push_str("# TYPE mongreldb_sql_pre_cancel_entries gauge\n");
         out.push_str(&format!(
@@ -286,7 +337,17 @@ mod tests {
         m.inc_puts();
         m.inc_commits();
         m.inc_txns();
-        let body = m.prometheus_text(3, 1, 1, 2, 512, (1, 128));
+        let body = m.prometheus_text(
+            3,
+            mongreldb_query::QueryRegistryStats {
+                active: 1,
+                queued: 1,
+                detailed: 1,
+                detailed_bytes: 512,
+                ..Default::default()
+            },
+            (1, 128),
+        );
         // HELP/TYPE lines present for every series.
         assert!(body.contains("# TYPE mongreldb_sql_queries_total counter"));
         assert!(body.contains("# TYPE mongreldb_sql_errors_total counter"));

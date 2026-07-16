@@ -268,7 +268,7 @@ fn bytes_encode(values: &[Value]) -> Result<Vec<u8>> {
     let mut off = 0u64;
     offsets.extend_from_slice(&off.to_be_bytes()); // offsets[0] = 0
     for v in values {
-        if let Value::Bytes(b) = v {
+        if let Value::Bytes(b) | Value::Json(b) = v {
             data.extend_from_slice(b);
             off = off
                 .checked_add(b.len() as u64)
@@ -406,8 +406,6 @@ fn lz4_compress(data: &[u8]) -> Vec<u8> {
 /// (`n` rows of `ty` under `algo`) — never from any on-disk length field. A
 /// corrupt or maliciously-edited plaintext page (the no-`encryption` default)
 /// can't drive a multi-GiB allocation before decompression is validated.
-const MAX_VAR_BYTES_PER_ROW: usize = 1 << 14; // 16 KiB / value — generous; real data is far smaller
-
 fn max_decompressed_bytes(ty: TypeId, n: usize, algo: u8) -> usize {
     // The validity section is a 4-byte big-endian length prefix + ceil(n/8) bits.
     let validity = 4 + n.div_ceil(8);
@@ -417,17 +415,13 @@ fn max_decompressed_bytes(ty: TypeId, n: usize, algo: u8) -> usize {
             .min(MAX_PAGE_DECOMPRESSED_BYTES);
     }
     if matches!(algo, ALGO_ZSTD_DICT | ALGO_LZ4_DICT) {
-        // index_count + table_count (8) + n× u32 indices + table: ≤ n unique
-        // entries, each a 4-byte length + its bytes.
-        return validity
-            .saturating_add(8)
-            .saturating_add(n.saturating_mul(4))
-            .saturating_add(n.saturating_mul(4 + MAX_VAR_BYTES_PER_ROW))
-            .min(MAX_PAGE_DECOMPRESSED_BYTES);
+        return MAX_PAGE_DECOMPRESSED_BYTES;
     }
     let payload = match ty {
-        TypeId::Bytes | TypeId::Enum { .. } => {
-            (n + 1).saturating_mul(8) + n.saturating_mul(MAX_VAR_BYTES_PER_ROW)
+        // The encoder permits variable values up to the global page cap. A
+        // smaller guessed per-row limit makes valid pages unreadable.
+        TypeId::Bytes | TypeId::Json | TypeId::Enum { .. } => {
+            return MAX_PAGE_DECOMPRESSED_BYTES;
         }
         TypeId::Embedding { dim } => (dim as usize).saturating_mul(8).saturating_mul(n),
         _ => n.saturating_mul(ty.fixed_size().unwrap_or(8)),
@@ -690,6 +684,18 @@ mod compressed_tests {
         );
         let back = decode_page(TypeId::Bytes, &page, vals.len()).unwrap();
         assert_eq!(back, vals);
+    }
+
+    #[test]
+    fn variable_page_larger_than_16_kib_round_trips() {
+        for (ty, value) in [
+            (TypeId::Bytes, Value::Bytes(vec![b'x'; 16_385])),
+            (TypeId::Json, Value::Json(vec![b' '; 16_385])),
+        ] {
+            let values = vec![value];
+            let page = encode_page(ty.clone(), &values, Encoding::Zstd).unwrap();
+            assert_eq!(decode_page(ty, &page, 1).unwrap(), values);
+        }
     }
 
     #[test]

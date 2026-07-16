@@ -21,7 +21,9 @@ use mongreldb_core::database::{TABLES_DIR, VTAB_DIR};
 use mongreldb_core::schema::{
     ColumnDef as CoreColumnDef, ColumnFlags, Schema as CoreSchema, TypeId,
 };
-use mongreldb_core::{Database, ExternalTableEntry, ModuleArg, ModuleCapabilities, Value};
+use mongreldb_core::{
+    Database, ExecutionControl, ExternalTableEntry, ModuleArg, ModuleCapabilities, Value,
+};
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -47,6 +49,25 @@ fn external_resource_limit(
         requested,
         limit,
     })
+}
+
+fn external_df_checkpoint(control: &ExecutionControl) -> DFResult<()> {
+    control
+        .checkpoint()
+        .map_err(|error| DataFusionError::Execution(error.to_string()))
+}
+
+fn controlled_module_result<T>(query: Option<&RegisteredSqlQuery>, result: Result<T>) -> Result<T> {
+    match result {
+        Ok(value) => {
+            query.map(RegisteredSqlQuery::checkpoint).transpose()?;
+            Ok(value)
+        }
+        Err(error) => match query.and_then(|query| query.checkpoint().err()) {
+            Some(cancellation) => Err(cancellation),
+            None => Err(error),
+        },
+    }
 }
 
 fn external_value_bytes(value: &Value) -> usize {
@@ -113,51 +134,64 @@ pub(crate) fn enforce_external_state_limit(state: &[u8]) -> Result<()> {
 pub trait ExternalTableModule: Send + Sync {
     fn name(&self) -> &str;
     fn descriptor(&self) -> ExternalModuleDescriptor;
-    fn indexes(&self, _entry: &ExternalTableEntry) -> Result<Vec<ExternalModuleIndex>> {
+    fn indexes_with_control(
+        &self,
+        context: &ExternalExecutionContext<'_>,
+        _entry: &ExternalTableEntry,
+    ) -> Result<Vec<ExternalModuleIndex>> {
+        context.control.checkpoint()?;
         Ok(Vec::new())
     }
-    fn connect(
+    fn connect_with_control(
         &self,
-        ctx: &ModuleConnectCtx<'_>,
+        context: &ExternalExecutionContext<'_>,
         entry: &ExternalTableEntry,
     ) -> Result<Arc<dyn ExternalTable>>;
-    fn read_rows(
+    fn read_rows_with_control(
         &self,
-        _ctx: &ModuleConnectCtx<'_>,
+        context: &ExternalExecutionContext<'_>,
         entry: &ExternalTableEntry,
     ) -> Result<Vec<HashMap<u16, Value>>> {
+        context.control.checkpoint()?;
         Err(MongrelQueryError::Schema(format!(
             "external table {:?} using module {:?} is not row-writable",
             entry.name,
             self.name()
         )))
     }
-    fn prepare_rows(
+    fn prepare_rows_with_control(
         &self,
-        _ctx: &ModuleConnectCtx<'_>,
+        context: &ExternalExecutionContext<'_>,
         entry: &ExternalTableEntry,
         _rows: Vec<HashMap<u16, Value>>,
     ) -> Result<Vec<u8>> {
+        context.control.checkpoint()?;
         Err(MongrelQueryError::Schema(format!(
             "external table {:?} using module {:?} is not row-writable",
             entry.name,
             self.name()
         )))
     }
-    fn rows_from_state(&self, state: &[u8]) -> Result<Vec<HashMap<u16, Value>>> {
+    fn rows_from_state_with_control(
+        &self,
+        context: &ExternalExecutionContext<'_>,
+        state: &[u8],
+    ) -> Result<Vec<HashMap<u16, Value>>> {
+        context.control.checkpoint()?;
         if state.is_empty() {
             Ok(Vec::new())
         } else {
             decode_state_rows(state)
         }
     }
-    fn write(
+    fn write_with_control(
         &self,
-        ctx: &ModuleConnectCtx<'_>,
+        context: &ExternalExecutionContext<'_>,
         entry: &ExternalTableEntry,
         op: ExternalWriteOp,
         txn: &mut ExternalTxn,
     ) -> Result<ExternalWriteResult> {
+        context.control.checkpoint()?;
         let (rows, changes) = match op {
             ExternalWriteOp::Insert { rows: inserted } => {
                 let changes = inserted.len() as u64;
@@ -167,17 +201,27 @@ pub trait ExternalTableModule: Send + Sync {
             }
             ExternalWriteOp::ReplaceRows { rows, changes } => (rows, changes),
         };
-        txn.replace_state(self.prepare_rows(ctx, entry, rows)?);
+        txn.replace_state(self.prepare_rows_with_control(context, entry, rows)?);
+        context.control.checkpoint()?;
         Ok(ExternalWriteResult { changes })
     }
-    fn destroy(&self, _ctx: &ModuleConnectCtx<'_>, _entry: &ExternalTableEntry) -> Result<()> {
+    fn destroy_with_control(
+        &self,
+        context: &ExternalExecutionContext<'_>,
+        _entry: &ExternalTableEntry,
+    ) -> Result<()> {
+        context.control.checkpoint()?;
         Ok(())
     }
 }
 
 pub trait ExternalTable: std::fmt::Debug + Send + Sync {
     fn schema(&self) -> SchemaRef;
-    fn plan(&self, request: &ExternalPlanRequest<'_>) -> DFResult<ExternalPlan>;
+    fn plan_with_control(
+        &self,
+        request: &ExternalPlanRequest<'_>,
+        control: &ExecutionControl,
+    ) -> DFResult<ExternalPlan>;
     fn scan_with_control(
         &self,
         request: &ExternalPlanRequest<'_>,
@@ -211,13 +255,18 @@ impl ExternalModuleIndex {
     }
 }
 
-pub struct ModuleConnectCtx<'a> {
-    pub db: &'a Arc<Database>,
+pub struct ExternalExecutionContext<'a> {
+    pub database: &'a Arc<Database>,
+    pub control: &'a ExecutionControl,
+    pub query_id: Option<crate::QueryId>,
 }
 
-impl ModuleConnectCtx<'_> {
+impl ExternalExecutionContext<'_> {
     pub fn raw_state(&self, entry: &ExternalTableEntry) -> Result<Vec<u8>> {
-        external_table_state_bytes(self.db, entry)
+        self.control.checkpoint()?;
+        let state = external_table_state_bytes(self.database, entry)?;
+        self.control.checkpoint()?;
+        Ok(state)
     }
 
     pub fn read_state(&self, entry: &ExternalTableEntry, key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -591,9 +640,17 @@ impl ExternalModuleRegistry {
         &self,
         db: &Arc<Database>,
         entry: &ExternalTableEntry,
+        query: Option<&RegisteredSqlQuery>,
     ) -> Result<Arc<dyn TableProvider>> {
         let module = self.module(&entry.module)?;
-        let table = module.connect(&ModuleConnectCtx { db }, entry)?;
+        let fallback = ExecutionControl::new(None);
+        let context = ExternalExecutionContext {
+            database: db,
+            control: query.map_or(&fallback, RegisteredSqlQuery::control),
+            query_id: query.map(RegisteredSqlQuery::id),
+        };
+        query.map(RegisteredSqlQuery::checkpoint).transpose()?;
+        let table = controlled_module_result(query, module.connect_with_control(&context, entry))?;
         Ok(Arc::new(ExternalTableProvider::new(
             Arc::clone(db),
             table,
@@ -603,32 +660,63 @@ impl ExternalModuleRegistry {
 
     pub(crate) fn external_table_indexes(
         &self,
+        db: &Arc<Database>,
         entry: &ExternalTableEntry,
+        query: &RegisteredSqlQuery,
     ) -> Result<Vec<ExternalModuleIndex>> {
         let module = self.module(&entry.module)?;
-        module.indexes(entry)
+        let context = ExternalExecutionContext {
+            database: db,
+            control: query.control(),
+            query_id: Some(query.id()),
+        };
+        query.checkpoint()?;
+        let indexes =
+            controlled_module_result(Some(query), module.indexes_with_control(&context, entry))?;
+        Ok(indexes)
     }
 
     pub(crate) fn external_table_rows(
         &self,
         db: &Arc<Database>,
         entry: &ExternalTableEntry,
+        query: &RegisteredSqlQuery,
     ) -> Result<Vec<HashMap<u16, Value>>> {
         let module = self.module(&entry.module)?;
-        let rows = module.read_rows(&ModuleConnectCtx { db }, entry)?;
-        enforce_external_rows_limit(&rows, None)?;
+        let context = ExternalExecutionContext {
+            database: db,
+            control: query.control(),
+            query_id: Some(query.id()),
+        };
+        query.checkpoint()?;
+        let rows =
+            controlled_module_result(Some(query), module.read_rows_with_control(&context, entry))?;
+        enforce_external_rows_limit(&rows, Some(query))?;
+        query.checkpoint()?;
         Ok(rows)
     }
 
     pub(crate) fn external_table_rows_from_state(
         &self,
+        db: &Arc<Database>,
         entry: &ExternalTableEntry,
         state: &[u8],
+        query: &RegisteredSqlQuery,
     ) -> Result<Vec<HashMap<u16, Value>>> {
         enforce_external_state_limit(state)?;
         let module = self.module(&entry.module)?;
-        let rows = module.rows_from_state(state)?;
-        enforce_external_rows_limit(&rows, None)?;
+        let context = ExternalExecutionContext {
+            database: db,
+            control: query.control(),
+            query_id: Some(query.id()),
+        };
+        query.checkpoint()?;
+        let rows = controlled_module_result(
+            Some(query),
+            module.rows_from_state_with_control(&context, state),
+        )?;
+        enforce_external_rows_limit(&rows, Some(query))?;
+        query.checkpoint()?;
         Ok(rows)
     }
 
@@ -638,6 +726,7 @@ impl ExternalModuleRegistry {
         entry: &ExternalTableEntry,
         base_state: Vec<u8>,
         op: ExternalWriteOp,
+        query: &RegisteredSqlQuery,
     ) -> Result<(Vec<u8>, ExternalWriteResult, Vec<ExternalBaseWrite>)> {
         enforce_external_state_limit(&base_state)?;
         match &op {
@@ -647,7 +736,16 @@ impl ExternalModuleRegistry {
         }
         let module = self.module(&entry.module)?;
         let mut txn = ExternalTxn::new(base_state);
-        let result = module.write(&ModuleConnectCtx { db }, entry, op, &mut txn)?;
+        let context = ExternalExecutionContext {
+            database: db,
+            control: query.control(),
+            query_id: Some(query.id()),
+        };
+        query.checkpoint()?;
+        let result = controlled_module_result(
+            Some(query),
+            module.write_with_control(&context, entry, op, &mut txn),
+        )?;
         let (state, base_writes) = txn.into_parts();
         enforce_external_state_limit(&state)?;
         Ok((state, result, base_writes))
@@ -657,9 +755,17 @@ impl ExternalModuleRegistry {
         &self,
         db: &Arc<Database>,
         entry: &ExternalTableEntry,
+        query: &RegisteredSqlQuery,
     ) -> Result<()> {
         let module = self.module(&entry.module)?;
-        module.destroy(&ModuleConnectCtx { db }, entry)
+        let context = ExternalExecutionContext {
+            database: db,
+            control: query.control(),
+            query_id: Some(query.id()),
+        };
+        query.checkpoint()?;
+        controlled_module_result(Some(query), module.destroy_with_control(&context, entry))?;
+        Ok(())
     }
 
     fn module(&self, name: &str) -> Result<Arc<dyn ExternalTableModule>> {
@@ -902,15 +1008,22 @@ impl ExternalTableProvider {
         }
     }
 
-    fn plan(&self, request: &ExternalPlanRequest<'_>) -> DFResult<ExternalPlan> {
+    fn plan_with_control(
+        &self,
+        request: &ExternalPlanRequest<'_>,
+        control: &ExecutionControl,
+    ) -> DFResult<ExternalPlan> {
+        external_df_checkpoint(control)?;
         if !self.cache_plans {
-            return self.table.plan(request);
+            return self.table.plan_with_control(request, control);
         }
         let key = ExternalPlanCacheKey::from_request(request);
         if let Some(plan) = self.plan_cache.lock().get(&key).cloned() {
+            external_df_checkpoint(control)?;
             return Ok(plan);
         }
-        let plan = self.table.plan(request)?;
+        let plan = self.table.plan_with_control(request, control)?;
+        external_df_checkpoint(control)?;
         self.plan_cache.lock().insert(key, plan.clone());
         Ok(plan)
     }
@@ -950,16 +1063,12 @@ impl TableProvider for ExternalTableProvider {
             limit: None,
             offset: None,
         };
-        let ExternalPlan {
-            filter_pushdown,
-            accepted_filters: _accepted_filters,
-            residual_filters_required: _residual_filters_required,
-            estimated_rows: _estimated_rows,
-            estimated_cost: _estimated_cost,
-            order_satisfied: _order_satisfied,
-            opaque: _opaque,
-        } = self.plan(&request)?;
-        Ok(filter_pushdown)
+        let query = crate::CURRENT_SQL_QUERY.try_with(Clone::clone).ok();
+        let fallback = ExecutionControl::new(None);
+        let control = query
+            .as_ref()
+            .map_or(&fallback, RegisteredSqlQuery::control);
+        Ok(self.plan_with_control(&request, control)?.filter_pushdown)
     }
 
     async fn scan(
@@ -984,7 +1093,12 @@ impl TableProvider for ExternalTableProvider {
             limit,
             offset: None,
         };
-        let _plan = self.plan(&request)?;
+        let query = crate::CURRENT_SQL_QUERY.try_with(Clone::clone).ok();
+        let fallback = ExecutionControl::new(None);
+        let control = query
+            .as_ref()
+            .map_or(&fallback, RegisteredSqlQuery::control);
+        let _plan = self.plan_with_control(&request, control)?;
         let output_schema = match projection {
             Some(projection) => Arc::new(schema.project(projection)?),
             None => schema,
@@ -1021,11 +1135,12 @@ impl ExternalTableModule for JsonModule {
         json_descriptor()
     }
 
-    fn connect(
+    fn connect_with_control(
         &self,
-        _ctx: &ModuleConnectCtx<'_>,
+        ctx: &ExternalExecutionContext<'_>,
         entry: &ExternalTableEntry,
     ) -> Result<Arc<dyn ExternalTable>> {
+        ctx.control.checkpoint()?;
         let (json, root) = json_args(entry, self.name)?;
         let (schema, batches) =
             json_table_batches_from_text(self.name, &json, root.as_deref(), self.mode)
@@ -1059,7 +1174,12 @@ impl ExternalTable for JsonExternalTable {
         self.schema.clone()
     }
 
-    fn plan(&self, request: &ExternalPlanRequest<'_>) -> DFResult<ExternalPlan> {
+    fn plan_with_control(
+        &self,
+        request: &ExternalPlanRequest<'_>,
+        control: &ExecutionControl,
+    ) -> DFResult<ExternalPlan> {
+        external_df_checkpoint(control)?;
         Ok(ExternalPlan::new(
             request
                 .filters
@@ -1180,14 +1300,15 @@ impl ExternalTableModule for SchemaTablesModule {
         }
     }
 
-    fn connect(
+    fn connect_with_control(
         &self,
-        ctx: &ModuleConnectCtx<'_>,
+        ctx: &ExternalExecutionContext<'_>,
         entry: &ExternalTableEntry,
     ) -> Result<Arc<dyn ExternalTable>> {
+        ctx.control.checkpoint()?;
         ensure_no_args(entry, self.name())?;
         Ok(Arc::new(SchemaTablesExternalTable {
-            db: Arc::clone(ctx.db),
+            db: Arc::clone(ctx.database),
             schema: schema_tables_arrow_schema(),
         }))
     }
@@ -1212,7 +1333,12 @@ impl ExternalTable for SchemaTablesExternalTable {
         self.schema.clone()
     }
 
-    fn plan(&self, request: &ExternalPlanRequest<'_>) -> DFResult<ExternalPlan> {
+    fn plan_with_control(
+        &self,
+        request: &ExternalPlanRequest<'_>,
+        control: &ExecutionControl,
+    ) -> DFResult<ExternalPlan> {
+        external_df_checkpoint(control)?;
         unsupported_plan(request)
     }
 
@@ -1263,14 +1389,15 @@ impl ExternalTableModule for DbStatModule {
         }
     }
 
-    fn connect(
+    fn connect_with_control(
         &self,
-        ctx: &ModuleConnectCtx<'_>,
+        ctx: &ExternalExecutionContext<'_>,
         entry: &ExternalTableEntry,
     ) -> Result<Arc<dyn ExternalTable>> {
+        ctx.control.checkpoint()?;
         ensure_no_args(entry, self.name())?;
         Ok(Arc::new(DbStatExternalTable {
-            db: Arc::clone(ctx.db),
+            db: Arc::clone(ctx.database),
             schema: dbstat_arrow_schema(),
         }))
     }
@@ -1295,7 +1422,12 @@ impl ExternalTable for DbStatExternalTable {
         self.schema.clone()
     }
 
-    fn plan(&self, request: &ExternalPlanRequest<'_>) -> DFResult<ExternalPlan> {
+    fn plan_with_control(
+        &self,
+        request: &ExternalPlanRequest<'_>,
+        control: &ExecutionControl,
+    ) -> DFResult<ExternalPlan> {
+        external_df_checkpoint(control)?;
         unsupported_plan(request)
     }
 
@@ -1651,6 +1783,241 @@ fn external_checkpoint(
 mod tests {
     use super::*;
 
+    #[derive(Debug)]
+    struct BlockingExternalModule {
+        entered: Arc<std::sync::Barrier>,
+    }
+
+    impl BlockingExternalModule {
+        fn block(&self, control: &ExecutionControl) -> Result<()> {
+            self.entered.wait();
+            loop {
+                control.checkpoint()?;
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    impl ExternalTableModule for BlockingExternalModule {
+        fn name(&self) -> &str {
+            "blocking"
+        }
+
+        fn descriptor(&self) -> ExternalModuleDescriptor {
+            ExternalModuleDescriptor {
+                schema: CoreSchema::default(),
+                hidden_columns: Vec::new(),
+                capabilities: ModuleCapabilities::default(),
+            }
+        }
+
+        fn indexes_with_control(
+            &self,
+            context: &ExternalExecutionContext<'_>,
+            _entry: &ExternalTableEntry,
+        ) -> Result<Vec<ExternalModuleIndex>> {
+            self.block(context.control)?;
+            unreachable!()
+        }
+
+        fn connect_with_control(
+            &self,
+            context: &ExternalExecutionContext<'_>,
+            _entry: &ExternalTableEntry,
+        ) -> Result<Arc<dyn ExternalTable>> {
+            self.block(context.control)?;
+            unreachable!()
+        }
+
+        fn read_rows_with_control(
+            &self,
+            context: &ExternalExecutionContext<'_>,
+            _entry: &ExternalTableEntry,
+        ) -> Result<Vec<HashMap<u16, Value>>> {
+            self.block(context.control)?;
+            unreachable!()
+        }
+
+        fn prepare_rows_with_control(
+            &self,
+            context: &ExternalExecutionContext<'_>,
+            _entry: &ExternalTableEntry,
+            _rows: Vec<HashMap<u16, Value>>,
+        ) -> Result<Vec<u8>> {
+            self.block(context.control)?;
+            unreachable!()
+        }
+
+        fn rows_from_state_with_control(
+            &self,
+            context: &ExternalExecutionContext<'_>,
+            _state: &[u8],
+        ) -> Result<Vec<HashMap<u16, Value>>> {
+            self.block(context.control)?;
+            unreachable!()
+        }
+
+        fn write_with_control(
+            &self,
+            context: &ExternalExecutionContext<'_>,
+            _entry: &ExternalTableEntry,
+            _op: ExternalWriteOp,
+            _txn: &mut ExternalTxn,
+        ) -> Result<ExternalWriteResult> {
+            self.block(context.control)?;
+            unreachable!()
+        }
+
+        fn destroy_with_control(
+            &self,
+            context: &ExternalExecutionContext<'_>,
+            _entry: &ExternalTableEntry,
+        ) -> Result<()> {
+            self.block(context.control)
+        }
+    }
+
+    impl ExternalTable for BlockingExternalModule {
+        fn schema(&self) -> SchemaRef {
+            Arc::new(ArrowSchema::empty())
+        }
+
+        fn plan_with_control(
+            &self,
+            _request: &ExternalPlanRequest<'_>,
+            control: &ExecutionControl,
+        ) -> DFResult<ExternalPlan> {
+            self.block(control)
+                .map_err(|error| DataFusionError::Execution(error.to_string()))?;
+            unreachable!()
+        }
+
+        fn scan_with_control(
+            &self,
+            _request: &ExternalPlanRequest<'_>,
+            control: &ExecutionControl,
+        ) -> DFResult<ExternalScan> {
+            self.block(control)
+                .map_err(|error| DataFusionError::Execution(error.to_string()))?;
+            unreachable!()
+        }
+    }
+
+    fn cancel_blocking_callback<R>(
+        database: &Arc<Database>,
+        entry: &ExternalTableEntry,
+        callback: impl FnOnce(
+            &BlockingExternalModule,
+            &ExternalExecutionContext<'_>,
+            &ExternalTableEntry,
+        ) -> R,
+    ) -> R {
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let module = BlockingExternalModule {
+            entered: Arc::clone(&entered),
+        };
+        let control = ExecutionControl::new(None);
+        let cancel_control = control.clone();
+        let canceller = std::thread::spawn(move || {
+            entered.wait();
+            cancel_control.cancel(mongreldb_core::CancellationReason::ClientRequest);
+        });
+        let context = ExternalExecutionContext {
+            database,
+            control: &control,
+            query_id: None,
+        };
+        let result = callback(&module, &context, entry);
+        canceller.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn every_external_callback_can_observe_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = Arc::new(Database::create(dir.path()).unwrap());
+        let entry = ExternalTableEntry {
+            name: "blocked".into(),
+            module: "blocking".into(),
+            args: Vec::new(),
+            declared_schema: CoreSchema::default(),
+            hidden_columns: Vec::new(),
+            options: BTreeMap::new(),
+            capabilities: ModuleCapabilities::default(),
+            created_epoch: 0,
+        };
+
+        let cancelled = |error: &MongrelQueryError| {
+            matches!(
+                error,
+                MongrelQueryError::Core(mongreldb_core::MongrelError::Cancelled)
+            )
+        };
+        assert!(cancelled(
+            &cancel_blocking_callback(&database, &entry, |module, context, entry| {
+                module.indexes_with_control(context, entry)
+            })
+            .unwrap_err()
+        ));
+        assert!(cancelled(
+            &cancel_blocking_callback(&database, &entry, |module, context, entry| {
+                module.connect_with_control(context, entry)
+            })
+            .unwrap_err()
+        ));
+        assert!(cancelled(
+            &cancel_blocking_callback(&database, &entry, |module, context, entry| {
+                module.read_rows_with_control(context, entry)
+            })
+            .unwrap_err()
+        ));
+        assert!(cancelled(
+            &cancel_blocking_callback(&database, &entry, |module, context, entry| {
+                module.prepare_rows_with_control(context, entry, Vec::new())
+            })
+            .unwrap_err()
+        ));
+        assert!(cancelled(
+            &cancel_blocking_callback(&database, &entry, |module, context, _| {
+                module.rows_from_state_with_control(context, &[])
+            })
+            .unwrap_err()
+        ));
+        assert!(cancelled(
+            &cancel_blocking_callback(&database, &entry, |module, context, entry| {
+                module.write_with_control(
+                    context,
+                    entry,
+                    ExternalWriteOp::Insert { rows: Vec::new() },
+                    &mut ExternalTxn::new(Vec::new()),
+                )
+            })
+            .unwrap_err()
+        ));
+        assert!(cancelled(
+            &cancel_blocking_callback(&database, &entry, |module, context, entry| {
+                module.destroy_with_control(context, entry)
+            })
+            .unwrap_err()
+        ));
+
+        let request = ExternalPlanRequest {
+            projection: None,
+            filters: Vec::new(),
+            raw_filters: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        };
+        let plan_result = cancel_blocking_callback(&database, &entry, |module, context, _| {
+            module.plan_with_control(&request, context.control)
+        });
+        assert!(matches!(
+            plan_result,
+            Err(error) if error.to_string().contains("cancelled")
+        ));
+    }
+
     #[test]
     fn project_scan_applies_limit_after_projection() {
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -1763,33 +2130,36 @@ impl ExternalTableModule for KvStoreModule {
         }
     }
 
-    fn connect(
+    fn connect_with_control(
         &self,
-        ctx: &ModuleConnectCtx<'_>,
+        ctx: &ExternalExecutionContext<'_>,
         entry: &ExternalTableEntry,
     ) -> Result<Arc<dyn ExternalTable>> {
+        ctx.control.checkpoint()?;
         ensure_no_args(entry, self.name())?;
-        let rows = read_state_rows(ctx.db, entry)?;
+        let rows = read_state_rows(ctx.database, entry)?;
         let schema = arrow_conv::arrow_schema(&entry.declared_schema)?;
         let batches = core_rows_to_batches(&entry.declared_schema, rows)?;
         Ok(Arc::new(KvStoreExternalTable { schema, batches }))
     }
 
-    fn read_rows(
+    fn read_rows_with_control(
         &self,
-        ctx: &ModuleConnectCtx<'_>,
+        ctx: &ExternalExecutionContext<'_>,
         entry: &ExternalTableEntry,
     ) -> Result<Vec<HashMap<u16, Value>>> {
+        ctx.control.checkpoint()?;
         ensure_no_args(entry, self.name())?;
-        read_state_rows(ctx.db, entry)
+        read_state_rows(ctx.database, entry)
     }
 
-    fn prepare_rows(
+    fn prepare_rows_with_control(
         &self,
-        _ctx: &ModuleConnectCtx<'_>,
+        ctx: &ExternalExecutionContext<'_>,
         entry: &ExternalTableEntry,
         rows: Vec<HashMap<u16, Value>>,
     ) -> Result<Vec<u8>> {
+        ctx.control.checkpoint()?;
         ensure_no_args(entry, self.name())?;
         validate_external_rows(&entry.declared_schema, &rows)?;
         encode_state_rows(&rows)
@@ -1815,7 +2185,12 @@ impl ExternalTable for KvStoreExternalTable {
         self.schema.clone()
     }
 
-    fn plan(&self, request: &ExternalPlanRequest<'_>) -> DFResult<ExternalPlan> {
+    fn plan_with_control(
+        &self,
+        request: &ExternalPlanRequest<'_>,
+        control: &ExecutionControl,
+    ) -> DFResult<ExternalPlan> {
+        external_df_checkpoint(control)?;
         unsupported_plan(request)
     }
 
@@ -2128,20 +2503,26 @@ impl ExternalTableModule for FtsDocsModule {
         }
     }
 
-    fn indexes(&self, entry: &ExternalTableEntry) -> Result<Vec<ExternalModuleIndex>> {
+    fn indexes_with_control(
+        &self,
+        context: &ExternalExecutionContext<'_>,
+        entry: &ExternalTableEntry,
+    ) -> Result<Vec<ExternalModuleIndex>> {
+        context.control.checkpoint()?;
         Ok(vec![ExternalModuleIndex::new(
             format!("{}_fts_inverted", entry.name),
             vec![2],
         )])
     }
 
-    fn connect(
+    fn connect_with_control(
         &self,
-        ctx: &ModuleConnectCtx<'_>,
+        ctx: &ExternalExecutionContext<'_>,
         entry: &ExternalTableEntry,
     ) -> Result<Arc<dyn ExternalTable>> {
+        ctx.control.checkpoint()?;
         let options = fts_options(entry)?;
-        let rows = read_state_rows(ctx.db, entry)?;
+        let rows = read_state_rows(ctx.database, entry)?;
         let index = FtsInvertedIndex::build(&rows, &options);
         Ok(Arc::new(FtsDocsExternalTable {
             schema: arrow_conv::arrow_schema(&entry.declared_schema)?,
@@ -2152,21 +2533,23 @@ impl ExternalTableModule for FtsDocsModule {
         }))
     }
 
-    fn read_rows(
+    fn read_rows_with_control(
         &self,
-        ctx: &ModuleConnectCtx<'_>,
+        ctx: &ExternalExecutionContext<'_>,
         entry: &ExternalTableEntry,
     ) -> Result<Vec<HashMap<u16, Value>>> {
+        ctx.control.checkpoint()?;
         let _ = fts_options(entry)?;
-        read_state_rows(ctx.db, entry)
+        read_state_rows(ctx.database, entry)
     }
 
-    fn prepare_rows(
+    fn prepare_rows_with_control(
         &self,
-        _ctx: &ModuleConnectCtx<'_>,
+        ctx: &ExternalExecutionContext<'_>,
         entry: &ExternalTableEntry,
         rows: Vec<HashMap<u16, Value>>,
     ) -> Result<Vec<u8>> {
+        ctx.control.checkpoint()?;
         let _ = fts_options(entry)?;
         let rows = rows
             .into_iter()
@@ -2205,7 +2588,12 @@ impl ExternalTable for FtsDocsExternalTable {
         self.schema.clone()
     }
 
-    fn plan(&self, request: &ExternalPlanRequest<'_>) -> DFResult<ExternalPlan> {
+    fn plan_with_control(
+        &self,
+        request: &ExternalPlanRequest<'_>,
+        control: &ExecutionControl,
+    ) -> DFResult<ExternalPlan> {
+        external_df_checkpoint(control)?;
         Ok(ExternalPlan::new(
             request
                 .raw_filters
@@ -2914,20 +3302,26 @@ impl ExternalTableModule for RTreeRectsModule {
         }
     }
 
-    fn indexes(&self, entry: &ExternalTableEntry) -> Result<Vec<ExternalModuleIndex>> {
+    fn indexes_with_control(
+        &self,
+        context: &ExternalExecutionContext<'_>,
+        entry: &ExternalTableEntry,
+    ) -> Result<Vec<ExternalModuleIndex>> {
+        context.control.checkpoint()?;
         Ok(vec![ExternalModuleIndex::new(
             format!("{}_rtree_spatial", entry.name),
             vec![2, 3, 4, 5],
         )])
     }
 
-    fn connect(
+    fn connect_with_control(
         &self,
-        ctx: &ModuleConnectCtx<'_>,
+        ctx: &ExternalExecutionContext<'_>,
         entry: &ExternalTableEntry,
     ) -> Result<Arc<dyn ExternalTable>> {
+        ctx.control.checkpoint()?;
         ensure_no_args(entry, self.name())?;
-        let rows = read_state_rows(ctx.db, entry)?;
+        let rows = read_state_rows(ctx.database, entry)?;
         let index = RTreeSpatialIndex::build(&rows);
         Ok(Arc::new(RTreeRectsExternalTable {
             schema: arrow_conv::arrow_schema(&entry.declared_schema)?,
@@ -2937,21 +3331,23 @@ impl ExternalTableModule for RTreeRectsModule {
         }))
     }
 
-    fn read_rows(
+    fn read_rows_with_control(
         &self,
-        ctx: &ModuleConnectCtx<'_>,
+        ctx: &ExternalExecutionContext<'_>,
         entry: &ExternalTableEntry,
     ) -> Result<Vec<HashMap<u16, Value>>> {
+        ctx.control.checkpoint()?;
         ensure_no_args(entry, self.name())?;
-        read_state_rows(ctx.db, entry)
+        read_state_rows(ctx.database, entry)
     }
 
-    fn prepare_rows(
+    fn prepare_rows_with_control(
         &self,
-        _ctx: &ModuleConnectCtx<'_>,
+        ctx: &ExternalExecutionContext<'_>,
         entry: &ExternalTableEntry,
         rows: Vec<HashMap<u16, Value>>,
     ) -> Result<Vec<u8>> {
+        ctx.control.checkpoint()?;
         ensure_no_args(entry, self.name())?;
         let rows = rows
             .into_iter()
@@ -2988,7 +3384,12 @@ impl ExternalTable for RTreeRectsExternalTable {
         self.schema.clone()
     }
 
-    fn plan(&self, request: &ExternalPlanRequest<'_>) -> DFResult<ExternalPlan> {
+    fn plan_with_control(
+        &self,
+        request: &ExternalPlanRequest<'_>,
+        control: &ExecutionControl,
+    ) -> DFResult<ExternalPlan> {
+        external_df_checkpoint(control)?;
         Ok(ExternalPlan::new(
             request
                 .raw_filters
@@ -3374,11 +3775,12 @@ impl ExternalTableModule for SeriesModule {
         }
     }
 
-    fn connect(
+    fn connect_with_control(
         &self,
-        _ctx: &ModuleConnectCtx<'_>,
+        ctx: &ExternalExecutionContext<'_>,
         entry: &ExternalTableEntry,
     ) -> Result<Arc<dyn ExternalTable>> {
+        ctx.control.checkpoint()?;
         let (start, stop, step) = series_args(entry)?;
         let table = SeriesExternalTable::new(start, stop, step)?;
         Ok(Arc::new(table))
@@ -3469,7 +3871,12 @@ impl ExternalTable for SeriesExternalTable {
         self.schema.clone()
     }
 
-    fn plan(&self, request: &ExternalPlanRequest<'_>) -> DFResult<ExternalPlan> {
+    fn plan_with_control(
+        &self,
+        request: &ExternalPlanRequest<'_>,
+        control: &ExecutionControl,
+    ) -> DFResult<ExternalPlan> {
+        external_df_checkpoint(control)?;
         Ok(ExternalPlan::new(
             request
                 .filters

@@ -146,6 +146,25 @@ fn encrypted_create_refuses_existing_database_without_rewriting_keys() {
 
 #[cfg(feature = "encryption")]
 #[test]
+fn encrypted_large_schema_catalog_reopens() {
+    let dir = tempdir().unwrap();
+    {
+        let db = Database::create_encrypted(dir.path(), "right").unwrap();
+        for index in 0..128 {
+            db.create_table(
+                &format!("table_{index:03}_{}", "catalog".repeat(12)),
+                orders_schema(),
+            )
+            .unwrap();
+        }
+    }
+
+    let reopened = Database::open_encrypted(dir.path(), "right").unwrap();
+    assert_eq!(reopened.table_names().len(), 128);
+}
+
+#[cfg(feature = "encryption")]
+#[test]
 fn encrypted_credentialed_create_refuses_existing_database_without_rewriting_keys() {
     let dir = tempdir().unwrap();
     {

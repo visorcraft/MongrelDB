@@ -1,6 +1,6 @@
 [package]
 name = "mongreldb-kit-ffi"
-version = "0.57.0"
+version = "0.58.0"
 edition = "2021"
 publish = false
 license = "MIT OR Apache-2.0"
@@ -23,8 +23,8 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 # lib name (`mongreldb_kit`). Without the rename, integration tests
 # `use mongreldb_kit::*` would be ambiguous between our FFI crate and the
 # upstream Kit crate.
-kit = { package = "mongreldb-kit", version = "0.50" }
-mongreldb-kit-core = "0.50"
+kit = { package = "mongreldb-kit", version = "=0.57.0" }
+mongreldb-kit-core = "=0.57.0"
 parking_lot = "0.12"
 serde_json = { version = "1", features = ["preserve_order"] }
 

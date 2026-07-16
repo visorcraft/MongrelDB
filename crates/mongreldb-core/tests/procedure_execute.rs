@@ -1,9 +1,11 @@
+use mongreldb_core::columnar::NativeColumn;
 use mongreldb_core::procedure::{
     ProcedureBody, ProcedureCallOutput, ProcedureMode, ProcedureParam, ProcedureStep,
     ProcedureValue, StoredProcedure,
 };
 use mongreldb_core::{
-    ColumnDef, ColumnFlags, Database, IndexDef, IndexKind, Schema, TypeId, Value,
+    CancellationReason, ColumnDef, ColumnFlags, Database, ExecutionControl, IndexDef, IndexKind,
+    MongrelError, Schema, TypeId, Value,
 };
 use std::collections::HashMap;
 use tempfile::tempdir;
@@ -47,6 +49,61 @@ fn read_write_procedure_commits_put_once() {
     };
     assert_eq!(row.columns.get(&1), Some(&Value::Int64(7)));
     assert_eq!(db.table("users").unwrap().lock().count(), 1);
+}
+
+#[test]
+fn native_query_cancellation_rolls_back_procedure_and_database_remains_usable() {
+    const ROWS: usize = 1_000_000;
+    let dir = tempdir().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.create_table("users", users_schema()).unwrap();
+    db.table("users")
+        .unwrap()
+        .lock()
+        .bulk_load_columns(vec![
+            (
+                1,
+                NativeColumn::Int64 {
+                    data: (0..ROWS).map(|value| value as i64).collect(),
+                    validity: vec![u8::MAX; ROWS.div_ceil(8)],
+                },
+            ),
+            (
+                2,
+                NativeColumn::Bytes {
+                    offsets: (0..=ROWS).map(|index| (index * 6) as u32).collect(),
+                    values: b"active".repeat(ROWS),
+                    validity: vec![u8::MAX; ROWS.div_ceil(8)],
+                },
+            ),
+        ])
+        .unwrap();
+    db.create_procedure(scan_then_insert_procedure("scan_then_insert", ROWS as i64))
+        .unwrap();
+
+    let control = ExecutionControl::new(None);
+    let cancel_control = control.clone();
+    let canceller = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        cancel_control.cancel(CancellationReason::ClientRequest);
+    });
+    let error = db
+        .call_procedure_as_controlled("scan_then_insert", HashMap::new(), None, &control, || true)
+        .unwrap_err();
+    canceller.join().unwrap();
+
+    assert!(matches!(error, MongrelError::Cancelled));
+    assert_eq!(db.table("users").unwrap().lock().count(), ROWS as u64);
+    assert_eq!(
+        db.query_for_current_principal(
+            "users",
+            &mongreldb_core::Query::new().with_limit(1),
+            Some(&[1]),
+        )
+        .unwrap()
+        .len(),
+        1
+    );
 }
 
 fn seeded_db() -> (tempfile::TempDir, Database) {
@@ -161,6 +218,43 @@ fn insert_user_procedure(name: &str) -> StoredProcedure {
                 returning: true,
             }],
             return_value: ProcedureValue::StepRow("put".into()),
+        },
+        0,
+    )
+    .unwrap()
+}
+
+fn scan_then_insert_procedure(name: &str, id: i64) -> StoredProcedure {
+    StoredProcedure::new(
+        name,
+        ProcedureMode::ReadWrite,
+        Vec::new(),
+        ProcedureBody {
+            steps: vec![
+                ProcedureStep::NativeQuery {
+                    id: "scan".into(),
+                    table: "users".into(),
+                    conditions: Vec::new(),
+                    projection: Some(vec![1]),
+                    limit: Some(1),
+                },
+                ProcedureStep::Put {
+                    id: "put".into(),
+                    table: "users".into(),
+                    cells: vec![
+                        mongreldb_core::procedure::ProcedureCell {
+                            column_id: 1,
+                            value: ProcedureValue::Literal(Value::Int64(id)),
+                        },
+                        mongreldb_core::procedure::ProcedureCell {
+                            column_id: 2,
+                            value: ProcedureValue::Literal(Value::Bytes(b"new".to_vec())),
+                        },
+                    ],
+                    returning: false,
+                },
+            ],
+            return_value: ProcedureValue::StepRows("scan".into()),
         },
         0,
     )

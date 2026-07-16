@@ -46,6 +46,7 @@
 #![allow(clippy::missing_safety_doc)]
 
 pub mod auth;
+pub mod build_info;
 pub mod cstr;
 pub mod database;
 pub mod error;
@@ -69,6 +70,7 @@ pub use error::{
 };
 
 // String free.
+pub use build_info::mongreldb_build_info;
 pub use database::mongreldb_free_string;
 
 // Database lifecycle.

@@ -4548,6 +4548,16 @@ impl Table {
         self.query_at_with_allowed(q, self.snapshot(), None)
     }
 
+    /// Run a native conjunctive query with cooperative cancellation through
+    /// index resolution, scans, filtering, and row materialization.
+    pub fn query_controlled(
+        &mut self,
+        q: &crate::query::Query,
+        control: &crate::ExecutionControl,
+    ) -> Result<Vec<Row>> {
+        self.query_at_with_allowed_controlled(q, self.snapshot(), None, control)
+    }
+
     /// Execute a conjunctive query at one snapshot, applying authorization
     /// before ranked ANN, Sparse, and MinHash top-k selection.
     pub fn query_at_with_allowed(
@@ -4557,6 +4567,29 @@ impl Table {
         allowed: Option<&std::collections::HashSet<RowId>>,
     ) -> Result<Vec<Row>> {
         self.query_at_with_allowed_after(q, snapshot, allowed, None)
+    }
+
+    #[doc(hidden)]
+    pub fn query_at_with_allowed_controlled(
+        &mut self,
+        q: &crate::query::Query,
+        snapshot: Snapshot,
+        allowed: Option<&std::collections::HashSet<RowId>>,
+        control: &crate::ExecutionControl,
+    ) -> Result<Vec<Row>> {
+        self.require_select()?;
+        self.ensure_indexes_complete_controlled(control, || true)?;
+        self.validate_native_query(q)?;
+        self.query_conditions_at(
+            &q.conditions,
+            snapshot,
+            allowed,
+            q.limit,
+            q.offset,
+            None,
+            unix_nanos_now(),
+            Some(control),
+        )
     }
 
     #[doc(hidden)]
@@ -4587,6 +4620,20 @@ impl Table {
     ) -> Result<Vec<Row>> {
         self.require_select()?;
         self.ensure_indexes_complete()?;
+        self.validate_native_query(q)?;
+        self.query_conditions_at(
+            &q.conditions,
+            snapshot,
+            allowed,
+            q.limit,
+            q.offset,
+            after_row_id,
+            query_time_nanos,
+            None,
+        )
+    }
+
+    fn validate_native_query(&self, q: &crate::query::Query) -> Result<()> {
         if q.conditions.len() > crate::query::MAX_HARD_CONDITIONS {
             return Err(MongrelError::InvalidArgument(format!(
                 "query exceeds {} conditions",
@@ -4607,15 +4654,7 @@ impl Table {
                 crate::query::MAX_QUERY_OFFSET
             )));
         }
-        self.query_conditions_at(
-            &q.conditions,
-            snapshot,
-            allowed,
-            q.limit,
-            q.offset,
-            after_row_id,
-            query_time_nanos,
-        )
+        Ok(())
     }
 
     /// Unbounded internal SQL join helper. Public request surfaces must use
@@ -4634,7 +4673,16 @@ impl Table {
                 crate::query::MAX_HARD_CONDITIONS
             )));
         }
-        self.query_conditions_at(conditions, snapshot, None, None, 0, None, unix_nanos_now())
+        self.query_conditions_at(
+            conditions,
+            snapshot,
+            None,
+            None,
+            0,
+            None,
+            unix_nanos_now(),
+            None,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4647,7 +4695,11 @@ impl Table {
         offset: usize,
         after_row_id: Option<RowId>,
         query_time_nanos: i64,
+        control: Option<&crate::ExecutionControl>,
     ) -> Result<Vec<Row>> {
+        control
+            .map(crate::ExecutionControl::checkpoint)
+            .transpose()?;
         crate::trace::QueryTrace::record(|t| {
             t.run_count = self.run_refs.len();
             t.memtable_rows = self.memtable.len();
@@ -4661,9 +4713,23 @@ impl Table {
                 t.scan_mode = crate::trace::ScanMode::Materialized;
                 t.row_materialized = true;
             });
-            let mut rows = self.visible_rows_at_time(snapshot, query_time_nanos)?;
+            let mut rows = match control {
+                Some(control) => self.visible_rows_controlled(snapshot, control)?,
+                None => self.visible_rows_at_time(snapshot, query_time_nanos)?,
+            };
             if let Some(allowed) = allowed {
-                rows.retain(|row| allowed.contains(&row.row_id));
+                let mut filtered = Vec::with_capacity(rows.len());
+                for (index, row) in rows.into_iter().enumerate() {
+                    if index & 255 == 0 {
+                        control
+                            .map(crate::ExecutionControl::checkpoint)
+                            .transpose()?;
+                    }
+                    if allowed.contains(&row.row_id) {
+                        filtered.push(row);
+                    }
+                }
+                rows = filtered;
             }
             if let Some(after_row_id) = after_row_id {
                 rows.retain(|row| row.row_id > after_row_id);
@@ -4689,6 +4755,9 @@ impl Table {
         ordered.sort_by_key(|c| condition_cost_rank(c));
         let mut sets: Vec<RowIdSet> = Vec::with_capacity(ordered.len());
         for c in &ordered {
+            control
+                .map(crate::ExecutionControl::checkpoint)
+                .transpose()?;
             let s = self.resolve_condition_with_allowed(c, snapshot, allowed)?;
             let empty = s.is_empty();
             sets.push(s);
@@ -4708,7 +4777,10 @@ impl Table {
         if let Some(limit) = limit {
             rids.truncate(limit);
         }
-        self.rows_for_rids_at_time(&rids, snapshot, query_time_nanos)
+        control
+            .map(crate::ExecutionControl::checkpoint)
+            .transpose()?;
+        self.rows_for_rids_at_time(&rids, snapshot, query_time_nanos, control)
     }
 
     /// Return an index's ordered candidates without discarding scores.
@@ -6567,7 +6639,7 @@ impl Table {
     /// tombstone, or that no longer exist, are omitted. Shared by index-served
     /// [`query`] and the Phase 8.1 FK-join path.
     pub fn rows_for_rids(&self, rids: &[u64], snapshot: Snapshot) -> Result<Vec<Row>> {
-        self.rows_for_rids_at_time(rids, snapshot, unix_nanos_now())
+        self.rows_for_rids_at_time(rids, snapshot, unix_nanos_now(), None)
     }
 
     pub fn rows_for_rids_with_context(
@@ -6577,7 +6649,7 @@ impl Table {
         context: &crate::query::AiExecutionContext,
     ) -> Result<Vec<Row>> {
         context.consume(rids.len().saturating_mul(self.schema.columns.len()))?;
-        self.rows_for_rids_at_time(rids, snapshot, context.query_time_nanos())
+        self.rows_for_rids_at_time(rids, snapshot, context.query_time_nanos(), None)
     }
 
     fn rows_for_rids_at_time(
@@ -6585,6 +6657,7 @@ impl Table {
         rids: &[u64],
         snapshot: Snapshot,
         ttl_now: i64,
+        control: Option<&crate::ExecutionControl>,
     ) -> Result<Vec<Row>> {
         use std::collections::HashMap;
         let mut rows = Vec::with_capacity(rids.len());
@@ -6608,6 +6681,11 @@ impl Table {
         let mut overlay: HashMap<u64, Row> = HashMap::with_capacity(rids.len());
         if rids.len().saturating_mul(24) < tier_size {
             for &rid in rids {
+                if overlay.len() & 255 == 0 {
+                    control
+                        .map(crate::ExecutionControl::checkpoint)
+                        .transpose()?;
+                }
                 let mem = self.memtable.get_version(RowId(rid), snapshot.epoch);
                 let mrun = self.mutable_run.get_version(RowId(rid), snapshot.epoch);
                 let newest = match (mem, mrun) {
@@ -6631,10 +6709,30 @@ impl Table {
                     })
                     .or_insert(row);
             };
-            for row in self.memtable.visible_versions(snapshot.epoch) {
+            for (index, row) in self
+                .memtable
+                .visible_versions(snapshot.epoch)
+                .into_iter()
+                .enumerate()
+            {
+                if index & 255 == 0 {
+                    control
+                        .map(crate::ExecutionControl::checkpoint)
+                        .transpose()?;
+                }
                 fold_newest(row, &mut overlay);
             }
-            for row in self.mutable_run.visible_versions(snapshot.epoch) {
+            for (index, row) in self
+                .mutable_run
+                .visible_versions(snapshot.epoch)
+                .into_iter()
+                .enumerate()
+            {
+                if index & 255 == 0 {
+                    control
+                        .map(crate::ExecutionControl::checkpoint)
+                        .transpose()?;
+                }
                 fold_newest(row, &mut overlay);
             }
         }
@@ -6648,7 +6746,12 @@ impl Table {
             // (`SYS_ROW_ID` pages carry exact row-id bounds) resolves each rid
             // by decoding only its page, no whole-column decode.
             if rids.len().saturating_mul(24) < reader.row_count() {
-                for &rid in rids {
+                for (index, &rid) in rids.iter().enumerate() {
+                    if index & 255 == 0 {
+                        control
+                            .map(crate::ExecutionControl::checkpoint)
+                            .transpose()?;
+                    }
                     if let Some(r) = overlay.get(&rid) {
                         if !r.deleted {
                             rows.push(r.clone());
@@ -6681,7 +6784,12 @@ impl Table {
             }
             let mut plan: Vec<Src> = Vec::with_capacity(rids.len());
             let mut fetch: Vec<usize> = Vec::with_capacity(rids.len());
-            for rid in rids {
+            for (index, rid) in rids.iter().enumerate() {
+                if index & 255 == 0 {
+                    control
+                        .map(crate::ExecutionControl::checkpoint)
+                        .transpose()?;
+                }
                 if overlay.contains_key(rid) {
                     plan.push(Src::Overlay);
                     continue;
@@ -6696,7 +6804,12 @@ impl Table {
             }
             let fetched = reader.materialize_batch(&fetch)?;
             let mut fetched_iter = fetched.into_iter();
-            for (rid, src) in rids.iter().zip(plan) {
+            for (index, (rid, src)) in rids.iter().zip(plan).enumerate() {
+                if index & 255 == 0 {
+                    control
+                        .map(crate::ExecutionControl::checkpoint)
+                        .transpose()?;
+                }
                 match src {
                     Src::Overlay => {
                         if let Some(r) = overlay.get(rid) {
@@ -6725,7 +6838,12 @@ impl Table {
             .iter()
             .map(|rr| self.open_reader(rr.run_id))
             .collect::<Result<Vec<_>>>()?;
-        for rid in rids {
+        for (index, rid) in rids.iter().enumerate() {
+            if index & 255 == 0 {
+                control
+                    .map(crate::ExecutionControl::checkpoint)
+                    .transpose()?;
+            }
             if let Some(r) = overlay.get(rid) {
                 if !r.deleted {
                     rows.push(r.clone());

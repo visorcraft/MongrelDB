@@ -61,12 +61,14 @@ pub(crate) enum CursorError {
     Expired,
     NotFound,
     PageLimit,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PageError {
     RowExceedsLimits,
     OffsetInvalid,
+    Cancelled,
 }
 
 #[derive(Default)]
@@ -156,6 +158,7 @@ impl SqlPageStore {
         Ok(result)
     }
 
+    #[cfg(test)]
     pub(crate) fn continue_page(
         &self,
         cursor: &str,
@@ -163,7 +166,31 @@ impl SqlPageStore {
         key: &[u8; 32],
         binding: SqlPageBinding,
     ) -> Result<SqlPage, CursorError> {
+        self.continue_page_inner(cursor, owner, key, binding, None)
+    }
+
+    pub(crate) fn continue_page_with_control(
+        &self,
+        cursor: &str,
+        owner: &str,
+        key: &[u8; 32],
+        binding: SqlPageBinding,
+        query: &mongreldb_query::RegisteredSqlQuery,
+    ) -> Result<SqlPage, CursorError> {
+        self.continue_page_inner(cursor, owner, key, binding, Some(query))
+    }
+
+    fn continue_page_inner(
+        &self,
+        cursor: &str,
+        owner: &str,
+        key: &[u8; 32],
+        binding: SqlPageBinding,
+        query: Option<&mongreldb_query::RegisteredSqlQuery>,
+    ) -> Result<SqlPage, CursorError> {
+        checkpoint(query)?;
         let cursor = parse_cursor(cursor, owner, key)?;
+        checkpoint(query)?;
         let mut state = self.lock();
         if let Some(expired) = state.entries.get(&cursor.result_id).cloned() {
             if expired.expires_at <= Instant::now() {
@@ -193,9 +220,11 @@ impl SqlPageStore {
             return Err(CursorError::Expired);
         }
         drop(state);
-        match render_page(&result, cursor.offset, key) {
+        checkpoint(query)?;
+        match render_page(&result, cursor.offset, key, query) {
             Ok(page) => Ok(page),
             Err(PageError::OffsetInvalid) => Err(CursorError::Invalid),
+            Err(PageError::Cancelled) => Err(CursorError::Cancelled),
             Err(PageError::RowExceedsLimits) => {
                 self.discard(&result);
                 Err(CursorError::PageLimit)
@@ -207,7 +236,7 @@ impl SqlPageStore {
         result: &RetainedSqlResult,
         key: &[u8; 32],
     ) -> Result<SqlPage, PageError> {
-        render_page(result, 0, key)
+        render_page(result, 0, key, None)
     }
 
     pub(crate) fn discard(&self, result: &RetainedSqlResult) {
@@ -232,6 +261,7 @@ fn render_page(
     result: &RetainedSqlResult,
     offset: usize,
     key: &[u8; 32],
+    query: Option<&mongreldb_query::RegisteredSqlQuery>,
 ) -> Result<SqlPage, PageError> {
     if offset > result.rows.len() {
         return Err(PageError::OffsetInvalid);
@@ -239,6 +269,9 @@ fn render_page(
     let mut rows = Vec::new();
     let mut byte_count = 2usize;
     for row in result.rows.iter().skip(offset).take(result.limits.rows) {
+        if query.is_some_and(|query| query.checkpoint().is_err()) {
+            return Err(PageError::Cancelled);
+        }
         let row_bytes = serde_json::to_vec(row).map_err(|_| PageError::RowExceedsLimits)?;
         let next_bytes = byte_count
             .saturating_add(usize::from(!rows.is_empty()))
@@ -268,6 +301,14 @@ fn render_page(
         projection: result.projection.as_ref().clone(),
         expires_at_ms: result.expires_at_ms,
     })
+}
+
+fn checkpoint(query: Option<&mongreldb_query::RegisteredSqlQuery>) -> Result<(), CursorError> {
+    query
+        .map(mongreldb_query::RegisteredSqlQuery::checkpoint)
+        .transpose()
+        .map(|_| ())
+        .map_err(|_| CursorError::Cancelled)
 }
 
 #[derive(Debug)]

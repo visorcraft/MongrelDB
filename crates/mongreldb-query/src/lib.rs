@@ -37,15 +37,34 @@ mod udf;
 
 pub use error::{MongrelQueryError, Result};
 pub use external_modules::{
-    ExternalBaseWrite, ExternalModuleDescriptor, ExternalModuleIndex, ExternalModuleRegistry,
-    ExternalPlan, ExternalPlanRequest, ExternalScan, ExternalTable, ExternalTableModule,
-    ExternalTxn, ExternalWriteOp, ExternalWriteResult, ModuleConnectCtx,
+    ExternalBaseWrite, ExternalExecutionContext, ExternalModuleDescriptor, ExternalModuleIndex,
+    ExternalModuleRegistry, ExternalPlan, ExternalPlanRequest, ExternalScan, ExternalTable,
+    ExternalTableModule, ExternalTxn, ExternalWriteOp, ExternalWriteResult,
 };
 pub use query_registry::{
-    CancelOutcome, CommitFenceOutcome, DurableOutcome, QueryId, QueryStatus, QueryTerminalError,
-    QueryTerminalErrorCategory, QueryTerminalState, RegisteredQueryGuard, RegisteredSqlQuery,
-    SerializationOutcome, SqlQueryOptions, SqlQueryPhase, SqlQueryRegistry,
+    CancelOutcome, CommitFenceOutcome, CompactFinishedQuery, DurableOutcome, QueryId,
+    QueryRegistryStats, QueryStatus, QueryTerminalError, QueryTerminalErrorCategory,
+    QueryTerminalState, RegisteredQueryGuard, RegisteredSqlQuery, SerializationOutcome,
+    SqlQueryOptions, SqlQueryPhase, SqlQueryRegistry,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct BuildInfo {
+    pub artifact_version: &'static str,
+    pub engine_version: &'static str,
+    pub query_version: &'static str,
+    pub mongreldb_git_sha: &'static str,
+}
+
+pub fn build_info() -> BuildInfo {
+    let engine = mongreldb_core::build_info();
+    BuildInfo {
+        artifact_version: env!("CARGO_PKG_VERSION"),
+        engine_version: engine.engine_version,
+        query_version: env!("CARGO_PKG_VERSION"),
+        mongreldb_git_sha: engine.mongreldb_git_sha,
+    }
+}
 
 /// True when SQL calls a ranked Boolean AI UDF. Remote servers use this to
 /// require the bounded scored table functions while embedded sessions retain
@@ -168,7 +187,7 @@ pub type SqlTestHook = Arc<dyn Fn(SqlTestHookPoint) + Send + Sync>;
 tokio::task_local! {
     // Carries one registered query through command helpers that recursively
     // execute SQL. DataFusion operators receive control through TaskContext.
-    static CURRENT_SQL_QUERY: RegisteredSqlQuery;
+    pub(crate) static CURRENT_SQL_QUERY: RegisteredSqlQuery;
     static CURRENT_COLLECTION_LIMITS: SqlCollectionLimits;
 }
 
@@ -2518,7 +2537,7 @@ impl MongrelSession {
             tables.insert(name, handle);
         }
         for entry in database.external_tables() {
-            let provider = external_modules.external_table_provider(&database, &entry)?;
+            let provider = external_modules.external_table_provider(&database, &entry, None)?;
             ctx.register_table(&entry.name, provider)
                 .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
         }

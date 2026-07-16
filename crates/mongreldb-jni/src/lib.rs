@@ -78,6 +78,25 @@ fn db_to_handle(db: JniDatabase) -> jlong {
 // All follow the signature: extern "system" fn(JNIEnv, JClass, ...) -> ret
 // The `system` calling convention matches the JNI ABI on each platform.
 
+#[no_mangle]
+pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeBuildInfo(
+    env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    let json = serde_json::json!({
+        "artifact_version": env!("CARGO_PKG_VERSION"),
+        "engine_version": env!("CARGO_PKG_VERSION"),
+        "query_version": env!("CARGO_PKG_VERSION"),
+        "kit_version": env!("CARGO_PKG_VERSION"),
+        "mongreldb_git_sha": env!("MONGRELDB_GIT_SHA"),
+        "kit_git_sha": env!("MONGRELDB_KIT_GIT_SHA"),
+    })
+    .to_string();
+    env.new_string(json)
+        .map(|value| value.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
 /// Opens an existing Kit database. Java: `native long open(String path)`.
 #[no_mangle]
 pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeOpen(
