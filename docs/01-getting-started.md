@@ -45,14 +45,14 @@ Add MongrelDB to your `Cargo.toml` (both crates are published to crates.io):
 
 ```toml
 [dependencies]
-mongreldb-core = "0.58.3"   # storage engine
-mongreldb-query = "0.58.3"  # SQL frontend
+mongreldb-core = "0.58.4"   # storage engine
+mongreldb-query = "0.58.4"  # SQL frontend
 ```
 
 For encryption support, add the `encryption` feature:
 
 ```toml
-mongreldb-core = { version = "0.58.3", features = ["encryption"] }
+mongreldb-core = { version = "0.58.4", features = ["encryption"] }
 ```
 
 To build against a local checkout of the engine instead, use path dependencies
