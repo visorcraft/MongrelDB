@@ -1,7 +1,7 @@
 //! P1.4 — multi-table `Database` shares one epoch clock, caches, and snapshot
 //! registry across tables; reopen sees every table.
 
-use mongreldb_core::{schema::*, Database, Epoch, MongrelError, Value};
+use mongreldb_core::{schema::*, Condition, Database, Epoch, MongrelError, Query, Value};
 use std::sync::Arc;
 use std::thread;
 use tempfile::tempdir;
@@ -96,6 +96,59 @@ fn close_flushes_and_reopens_committed_rows() {
 
     let reopened = Database::open(dir.path()).unwrap();
     assert_eq!(reopened.table("items").unwrap().lock().count(), 1);
+}
+
+#[test]
+fn reopened_enum_table_supports_integer_predicate() {
+    let dir = tempdir().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.create_table(
+        "users",
+        Schema {
+            columns: vec![
+                ColumnDef {
+                    id: 1,
+                    name: "id".into(),
+                    ty: TypeId::Int64,
+                    flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                    default_value: None,
+                },
+                ColumnDef {
+                    id: 2,
+                    name: "role".into(),
+                    ty: TypeId::Enum {
+                        variants: vec!["admin".into(), "user".into()].into(),
+                    },
+                    flags: ColumnFlags::empty(),
+                    default_value: None,
+                },
+            ],
+            ..Schema::default()
+        },
+    )
+    .unwrap();
+    db.transaction(|transaction| {
+        transaction.put(
+            "users",
+            vec![(1, Value::Int64(1)), (2, Value::Bytes(b"admin".to_vec()))],
+        )
+    })
+    .unwrap();
+    db.close().unwrap();
+    drop(db);
+
+    let reopened = Database::open(dir.path()).unwrap();
+    let rows = reopened
+        .table("users")
+        .unwrap()
+        .lock()
+        .query(&Query::new().and(Condition::Range {
+            column_id: 1,
+            lo: 1,
+            hi: 1,
+        }))
+        .unwrap();
+    assert_eq!(rows.len(), 1);
 }
 
 #[test]

@@ -1,13 +1,17 @@
-//! Database file locking shares one process lock and rejects other processes.
+//! Database file locking rejects independent handles in every process.
 
 use mongreldb_core::Database;
 use tempfile::tempdir;
 
 #[test]
-fn same_process_second_live_open_shares_the_process_lock() {
+fn same_process_second_live_open_is_rejected() {
     let dir = tempdir().unwrap();
     let _db = Database::create(dir.path()).unwrap();
-    let _second = Database::open(dir.path()).unwrap();
+    let error = match Database::open(dir.path()) {
+        Ok(_) => panic!("second live open unexpectedly succeeded"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("already open in this process"));
 }
 
 #[test]

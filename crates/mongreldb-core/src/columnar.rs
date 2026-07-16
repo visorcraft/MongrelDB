@@ -1740,11 +1740,11 @@ pub fn decode_page_native(ty: TypeId, page: &[u8], n: usize) -> Result<NativeCol
     // Step 2: dictionary-encoded Bytes (only valid family for dict algos). Dict
     // payloads are never written LE, so `le` is ignored here.
     if dict_algo {
-        return if matches!(ty, TypeId::Bytes) {
+        return if matches!(ty, TypeId::Bytes | TypeId::Json | TypeId::Enum { .. }) {
             dict_decode_bytes_native(&raw, n)
         } else {
             Err(MongrelError::InvalidArgument(format!(
-                "decode_page_native: dict algo {algo} only valid for Bytes, got {ty:?}"
+                "decode_page_native: dict algo {algo} only valid for variable bytes, got {ty:?}"
             )))
         };
     }
@@ -1801,7 +1801,9 @@ pub fn decode_page_native(ty: TypeId, page: &[u8], n: usize) -> Result<NativeCol
                 validity,
             })
         }
-        TypeId::Bytes => decode_bytes_plain_payload(&raw, n, le),
+        TypeId::Bytes | TypeId::Json | TypeId::Enum { .. } => {
+            decode_bytes_plain_payload(&raw, n, le)
+        }
         _ => Err(MongrelError::InvalidArgument(format!(
             "decode_page_native: unsupported ty {ty:?}"
         ))),

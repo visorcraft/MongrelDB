@@ -52,33 +52,25 @@ fn advance_security_version(catalog: &mut Catalog) -> Result<()> {
     Ok(())
 }
 
-fn process_database_locks() -> &'static Mutex<HashMap<PathBuf, std::sync::Weak<SharedDatabaseLock>>>
-{
-    static LOCKS: std::sync::OnceLock<
-        Mutex<HashMap<PathBuf, std::sync::Weak<SharedDatabaseLock>>>,
-    > = std::sync::OnceLock::new();
-    LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-struct SharedDatabaseLock {
-    bootstrap_file: std::fs::File,
-    legacy_file: Mutex<Option<std::fs::File>>,
-    canonical_path: PathBuf,
+fn process_locked_paths() -> &'static Mutex<HashSet<PathBuf>> {
+    static LOCKED_PATHS: std::sync::OnceLock<Mutex<HashSet<PathBuf>>> = std::sync::OnceLock::new();
+    LOCKED_PATHS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
 struct DatabaseFileLock {
-    shared: Arc<SharedDatabaseLock>,
+    bootstrap_file: std::fs::File,
+    legacy_file: Option<std::fs::File>,
     canonical_path: PathBuf,
     durable_root: Option<Arc<crate::durable_file::DurableRoot>>,
 }
 
-impl Drop for SharedDatabaseLock {
+impl Drop for DatabaseFileLock {
     fn drop(&mut self) {
-        if let Some(file) = self.legacy_file.get_mut().take() {
-            let _ = fs2::FileExt::unlock(&file);
+        if let Some(file) = &self.legacy_file {
+            let _ = fs2::FileExt::unlock(file);
         }
         let _ = fs2::FileExt::unlock(&self.bootstrap_file);
-        process_database_locks().lock().remove(&self.canonical_path);
+        process_locked_paths().lock().remove(&self.canonical_path);
     }
 }
 
@@ -1493,40 +1485,41 @@ impl Database {
         use std::hash::{Hash, Hasher};
 
         let (canonical_path, lock_dir) = Self::canonical_lock_target(root)?;
-        let mut process_locks = process_database_locks().lock();
-        if let Some(shared) = process_locks
-            .get(&canonical_path)
-            .and_then(std::sync::Weak::upgrade)
         {
-            return Ok(DatabaseFileLock {
-                shared,
-                canonical_path,
-                durable_root: None,
-            });
+            let mut locked = process_locked_paths().lock();
+            if !locked.insert(canonical_path.clone()) {
+                return Err(MongrelError::DatabaseLocked {
+                    path: root.to_path_buf(),
+                    message: "already open in this process".into(),
+                });
+            }
         }
 
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         canonical_path.hash(&mut hasher);
         let lock_path = lock_dir.join(format!(".mongreldb-{:016x}.lock", hasher.finish()));
-        let file = std::fs::OpenOptions::new()
+        let file = match std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
-            .open(lock_path)?;
+            .open(lock_path)
+        {
+            Ok(file) => file,
+            Err(error) => {
+                process_locked_paths().lock().remove(&canonical_path);
+                return Err(error.into());
+            }
+        };
         if let Err(error) = Self::fs_lock_exclusive(&file, timeout_ms) {
+            process_locked_paths().lock().remove(&canonical_path);
             return Err(MongrelError::DatabaseLocked {
                 path: root.to_path_buf(),
                 message: error.to_string(),
             });
         }
-        let shared = Arc::new(SharedDatabaseLock {
-            bootstrap_file: file,
-            legacy_file: Mutex::new(None),
-            canonical_path: canonical_path.clone(),
-        });
-        process_locks.insert(canonical_path.clone(), Arc::downgrade(&shared));
         Ok(DatabaseFileLock {
-            shared,
+            bootstrap_file: file,
+            legacy_file: None,
             canonical_path,
             durable_root: None,
         })
@@ -1541,10 +1534,6 @@ impl Database {
             .durable_root
             .as_ref()
             .ok_or_else(|| MongrelError::Other("database root descriptor was not pinned".into()))?;
-        let mut legacy_file = lock.shared.legacy_file.lock();
-        if legacy_file.is_some() {
-            return Ok(());
-        }
         let file = durable_root.open_lock_file(Path::new(META_DIR).join(".lock"))?;
         if let Err(error) = Self::fs_lock_exclusive(&file, timeout_ms) {
             return Err(MongrelError::DatabaseLocked {
@@ -1552,7 +1541,7 @@ impl Database {
                 message: error.to_string(),
             });
         }
-        *legacy_file = Some(file);
+        lock.legacy_file = Some(file);
         Ok(())
     }
 
