@@ -6322,11 +6322,7 @@ where
         view.sql
     );
     let sql = crate::rewrite_compat_function_calls(&session.resolve_view_sql(&sql));
-    let df = session
-        .ctx
-        .sql(&sql)
-        .await
-        .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
+    let df = session.dataframe_with_query(&sql, query).await?;
     let mut stream = session.execute_dataframe_stream(df, query).await?;
 
     let mut converted = 0_usize;

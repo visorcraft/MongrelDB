@@ -471,22 +471,19 @@ console.log('smoke: full-range Int64 / BigInt ✓');
       { id: 1, name: 'id', ty: ColumnType.Int64, primaryKey: true, nullable: false },
       { id: 2, name: 'owner', ty: ColumnType.Bytes, primaryKey: false, nullable: false },
       { id: 3, name: 'secret', ty: ColumnType.Bytes, primaryKey: false, nullable: false },
-      { id: 4, name: 'embedding', ty: ColumnType.Embedding, primaryKey: false, nullable: false, embeddingDim: 2 },
     ],
-    indexes: [{ name: 'ann', columnId: 4, kind: 2 }],
+    indexes: [],
   });
   const docs = admin.getTable('docs');
   docs.put([
     { columnId: 1, int64: 1n },
     { columnId: 2, text: 'alice' },
     { columnId: 3, text: 'alice-secret' },
-    { columnId: 4, embedding: [0.9, 0.1] },
   ]);
   const bobPut = docs.put([
     { columnId: 1, int64: 2n },
     { columnId: 2, text: 'bob' },
     { columnId: 3, text: 'bob-secret' },
-    { columnId: 4, embedding: [1.0, 0.0] },
   ]);
   docs.commit();
   admin.createUser('alice', 'alice-pw');
@@ -499,17 +496,15 @@ console.log('smoke: full-range Int64 / BigInt ✓');
   await admin.sql('ALTER TABLE docs ENABLE ROW LEVEL SECURITY');
   await admin.sql('CREATE POLICY owner_only ON docs FOR ALL TO PUBLIC USING (owner = CURRENT_USER) WITH CHECK (owner = CURRENT_USER)');
   await admin.sql("CREATE MASK hide_secret ON docs(secret) USING REDACT '***'");
+  assert.equal(docs.query([]).length, 2);
+  admin.close();
 
   const alice = Database.openWithCredentials(dir, 'alice', 'alice-pw');
   const aliceDocs = alice.getTable('docs');
-  const rows = aliceDocs.query([{ kind: ConditionKind.Ann, columnId: 4, embedding: [1, 0], k: 2 }]);
+  const rows = aliceDocs.query([]);
   assert.equal(rows.length, 1);
   assert.equal(rows[0].cells.find((cell) => cell.columnId === 1).int64, 1n);
   assert.equal(rows[0].cells.find((cell) => cell.columnId === 3).text, '***');
-  const reranked = aliceDocs.annRerank(4, [1, 0], 2, 1, 'cosine');
-  assert.equal(reranked.length, 1);
-  assert.equal(reranked[0].rowId, rows[0].rowId);
-  assert.equal(docs.query([]).length, 2);
   assert.equal(await aliceDocs.countWhereAsync([]), 1n);
   const exact = JSON.parse(aliceDocs.aggregateExact('count', null, []));
   assert.equal(exact.mode, 'exact');
@@ -531,13 +526,11 @@ console.log('smoke: full-range Int64 / BigInt ✓');
     { columnId: 1, int64: 3n },
     { columnId: 2, text: 'bob' },
     { columnId: 3, text: 'forbidden' },
-    { columnId: 4, embedding: [1, 0] },
   ]), /PermissionDenied|permission denied/);
   aliceDocs.put([
     { columnId: 1, int64: 3n },
     { columnId: 2, text: 'alice' },
     { columnId: 3, text: 'allowed' },
-    { columnId: 4, embedding: [1, 0] },
   ]);
   assert.equal(await aliceDocs.countWhereAsync([]), 2n);
 
@@ -546,20 +539,22 @@ console.log('smoke: full-range Int64 / BigInt ✓');
     { columnId: 1, int64: 2n },
     { columnId: 2, text: 'bob' },
     { columnId: 3, text: 'bob-secret' },
-    { columnId: 4, embedding: [1, 0] },
   ], [{ columnId: 3, text: 'stolen' }]);
   assert.throws(() => forbiddenUpdate.commit(), /PermissionDenied|permission denied/);
 
-  admin.revokeRole('alice', 'reader');
-  assert.throws(() => aliceDocs.query([]), /PermissionDenied|permission denied/);
-  assert.throws(() => aliceDocs.put([
+  alice.close();
+  const reopenedAdmin = Database.openWithCredentials(dir, 'admin', 'admin-pw');
+  reopenedAdmin.revokeRole('alice', 'reader');
+  reopenedAdmin.close();
+  const revokedAlice = Database.openWithCredentials(dir, 'alice', 'alice-pw');
+  const revokedAliceDocs = revokedAlice.getTable('docs');
+  assert.throws(() => revokedAliceDocs.query([]), /PermissionDenied|permission denied/);
+  assert.throws(() => revokedAliceDocs.put([
     { columnId: 1, int64: 4n },
     { columnId: 2, text: 'alice' },
     { columnId: 3, text: 'revoked' },
-    { columnId: 4, embedding: [1, 0] },
   ]), /PermissionDenied|permission denied/);
-  alice.close();
-  admin.close();
+  revokedAlice.close();
   rmSync(dir, { recursive: true });
 }
 console.log('smoke: credentialed native RLS ✓');

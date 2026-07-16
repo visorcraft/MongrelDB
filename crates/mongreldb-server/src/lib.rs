@@ -4186,6 +4186,9 @@ fn register_controlled_query(
     let pre_cancel_reason = state
         .pre_cancellations
         .reason(query_id, &owner, session_id.as_deref());
+    if pre_cancel_reason.is_none() && state.pre_cancellations.reason_for_query(query_id).is_some() {
+        return Err(mongreldb_query::MongrelQueryError::QueryIdConflict { query_id });
+    }
     let query = session.register_query(options)?;
     let Some(reason) = pre_cancel_reason else {
         return Ok(query);

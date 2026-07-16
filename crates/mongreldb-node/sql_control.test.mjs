@@ -76,6 +76,42 @@ test('NativeSqlQuery cancels during Arrow IPC encoding', async () => {
   }
 });
 
+test('NativeSqlQuery preserves commit outcome when cancelled during Arrow IPC encoding', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'mongreldb-napi-ipc-commit-cancel-'));
+  const database = Database.withPath(directory);
+  try {
+    await database.sql('CREATE TABLE items (id BIGINT PRIMARY KEY)');
+    const query = database.startSql(
+      'INSERT INTO items VALUES (1); SELECT * FROM generate_series(1, 2000000)',
+      {
+        queryId: 'fedcba0987654321fedcba0987654321',
+        timeoutMs: 30_000,
+        maxOutputRows: 3_000_000,
+        maxOutputBytes: 256 * 1024 * 1024,
+      },
+    );
+    const poll = setInterval(() => {
+      if (query.status().phase === 'serializing') {
+        query.cancel();
+        clearInterval(poll);
+      }
+    }, 1);
+
+    const error = await query.resultArrow().then(
+      () => assert.fail('expected cancellation'),
+      (error) => error,
+    );
+    clearInterval(poll);
+    assert.equal(error.code, 'QUERY_CANCELLED_AFTER_COMMIT');
+    assert.equal(error.committed, true);
+    assert.equal(error.committedStatements, 1);
+    assert.equal(error.lastCommitEpochText, String(error.lastCommitEpoch));
+  } finally {
+    database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('NativeSqlQuery rejects with structured terminal fields', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'mongreldb-napi-error-fields-'));
   const database = Database.withPath(directory);

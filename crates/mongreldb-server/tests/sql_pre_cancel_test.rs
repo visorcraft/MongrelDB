@@ -69,6 +69,7 @@ async fn cancel_before_registration_stops_before_sql_parsing() {
     assert_eq!(sql["outcome"]["committed"], false);
 
     let status = app
+        .clone()
         .oneshot(request("GET", &format!("/queries/{query_id}"), Value::Null))
         .await
         .unwrap();
@@ -76,6 +77,20 @@ async fn cancel_before_registration_stops_before_sql_parsing() {
     let status = json_body(status).await;
     assert_eq!(status["state"], "cancelled");
     assert_eq!(status["status"], "cancelled_before_commit");
+
+    let reused = app
+        .oneshot(request(
+            "POST",
+            "/sql",
+            json!({ "query_id": query_id, "sql": "SELECT 1" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(reused.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(reused).await["error"]["code"],
+        "QUERY_ID_CONFLICT"
+    );
 }
 
 #[tokio::test]
@@ -128,7 +143,8 @@ async fn pre_cancel_is_bound_to_authenticated_owner() {
     sql.headers_mut()
         .insert("authorization", "Basic Ym9iOnB3".parse().unwrap());
     let sql = app.oneshot(sql).await.unwrap();
-    assert_eq!(sql.status(), StatusCode::OK);
+    assert_eq!(sql.status(), StatusCode::CONFLICT);
+    assert_eq!(json_body(sql).await["error"]["code"], "QUERY_ID_CONFLICT");
 }
 
 #[tokio::test]
@@ -199,5 +215,7 @@ async fn pre_cancel_is_bound_to_session_when_header_is_supplied() {
     );
     sql.headers_mut()
         .insert("x-session-id", second.parse().unwrap());
-    assert_eq!(app.oneshot(sql).await.unwrap().status(), StatusCode::OK);
+    let sql = app.oneshot(sql).await.unwrap();
+    assert_eq!(sql.status(), StatusCode::CONFLICT);
+    assert_eq!(json_body(sql).await["error"]["code"], "QUERY_ID_CONFLICT");
 }

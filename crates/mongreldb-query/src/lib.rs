@@ -3361,11 +3361,7 @@ impl MongrelSession {
         let AsOfQuery { sql, registration } = query;
         let _registration = registration;
         let plan_start = std::time::Instant::now();
-        let dataframe = self
-            .ctx
-            .sql(&sql)
-            .await
-            .map_err(|error| MongrelQueryError::DataFusion(error.to_string()))?;
+        let dataframe = self.dataframe_with_query(&sql, sql_query).await?;
         mongreldb_core::trace::QueryTrace::record(|trace| {
             trace.planning_nanos = plan_start.elapsed().as_nanos() as u64;
         });
@@ -3380,11 +3376,7 @@ impl MongrelSession {
         use futures::StreamExt;
 
         let AsOfQuery { sql, registration } = query;
-        let dataframe = self
-            .ctx
-            .sql(&sql)
-            .await
-            .map_err(|error| MongrelQueryError::DataFusion(error.to_string()))?;
+        let dataframe = self.dataframe_with_query(&sql, sql_query).await?;
         let stream = self.execute_dataframe_stream(dataframe, sql_query).await?;
         let schema = stream.schema();
         let guarded = futures::stream::unfold(
@@ -3618,7 +3610,7 @@ impl MongrelSession {
 
         let plan_start = std::time::Instant::now();
         let external_module_scan = self.query_references_external_module(sql);
-        let df = self.dataframe(sql).await?;
+        let df = self.dataframe_with_query(sql, query).await?;
         self.track_prepared_name(sql);
         mongreldb_core::trace::QueryTrace::record(|trace| {
             trace.planning_nanos = plan_start.elapsed().as_nanos() as u64;
@@ -3822,7 +3814,7 @@ impl MongrelSession {
     ) -> Result<Vec<RecordBatch>> {
         query.checkpoint()?;
         if let Some(inner) = strip_explain_query_plan(sql) {
-            return self.explain_query_plan(inner).await;
+            return self.explain_query_plan(inner, query).await;
         }
 
         // Multi-statement support: if the SQL contains semicolons, first try
@@ -3906,7 +3898,7 @@ impl MongrelSession {
                     .register_table(&name, Arc::new(provider))
                     .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
                 self.tables.lock().insert(name, handle);
-                self.invalidate_prepared_statements().await;
+                self.invalidate_prepared_statements(query).await;
                 self.clear_cache();
                 return Ok(Vec::new());
             }
@@ -3928,7 +3920,7 @@ impl MongrelSession {
                         .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
                     self.tables.lock().remove(&name);
                 }
-                self.invalidate_prepared_statements().await;
+                self.invalidate_prepared_statements(query).await;
                 self.clear_cache();
                 return Ok(Vec::new());
             }
@@ -3993,7 +3985,7 @@ impl MongrelSession {
                         self.refresh_registered_table(db, &table_name)?;
                     }
                 }
-                self.invalidate_prepared_statements().await;
+                self.invalidate_prepared_statements(query).await;
                 self.clear_cache();
                 return Ok(Vec::new());
             }
@@ -4055,7 +4047,7 @@ impl MongrelSession {
         // Phase 16.5: check the logical-plan cache before re-parsing.
         let plan_start = std::time::Instant::now();
         let external_module_scan = self.query_references_external_module(sql);
-        let df = self.dataframe(sql).await?;
+        let df = self.dataframe_with_query(sql, query).await?;
         // Track prepared-statement names so DDL can DEALLOCATE them (prevents a
         // prepared plan from querying a detached/old table after DROP+recreate).
         self.track_prepared_name(sql);
@@ -4149,29 +4141,27 @@ impl MongrelSession {
     /// and would retain a plan bound to the old table provider). Errors from an
     /// unknown name are ignored (the plan was never stored, e.g. a failed
     /// PREPARE whose name was optimistically tracked).
-    pub async fn invalidate_prepared_statements(&self) {
+    async fn invalidate_prepared_statements(&self, query: &RegisteredSqlQuery) {
         let names: Vec<String> = self.prepared_names.lock().drain().collect();
         for name in names {
             // `DEALLOCATE <name>` — no params, safe (name was validated at
             // PREPARE time on the server path; here it came from our own
             // tracking so it is a bare identifier).
             let sql = format!("DEALLOCATE {name}");
-            if self.ctx.sql(&sql).await.is_err() {
+            if self.dataframe_with_query(&sql, query).await.is_err() {
                 // Unknown/stale name — ignore; the goal is just to drop it.
             }
         }
     }
 
-    async fn explain_query_plan(&self, sql: &str) -> Result<Vec<RecordBatch>> {
+    async fn explain_query_plan(
+        &self,
+        sql: &str,
+        query: &RegisteredSqlQuery,
+    ) -> Result<Vec<RecordBatch>> {
         let explain_sql = format!("EXPLAIN {}", sql.trim().trim_end_matches(';'));
-        let batches = self
-            .ctx
-            .sql(&explain_sql)
-            .await
-            .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?
-            .collect()
-            .await
-            .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
+        let dataframe = self.dataframe_with_query(&explain_sql, query).await?;
+        let batches = self.collect_dataframe(dataframe, query).await?;
         let mut detail = self.mongrel_query_plan_details(sql);
         for batch in &batches {
             if batch.num_columns() < 2 {
