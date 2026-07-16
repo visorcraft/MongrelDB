@@ -16,6 +16,8 @@ permissions:
 jobs:
   rust:
     runs-on: ubuntu-latest
+    env:
+      CARGO_BUILD_JOBS: 2
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@v1
@@ -149,6 +151,7 @@ jobs:
       contents: write
     env:
       QUAL_DIR: /tmp/mongreldb-qualification
+      CARGO_TARGET_DIR: /tmp/mongreldb-qualification-target
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@v1
