@@ -54,24 +54,20 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2.9.1
 
-      - run: cargo publish -p mongreldb-core
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
-      # mongreldb-query depends on mongreldb-core (published above) and is in
-      # turn a dependency of mongreldb-kit's SQL surface. Must follow core.
-      - run: cargo publish -p mongreldb-query
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
-      # mongreldb-server (the HTTP daemon) publishes last — it depends on
-      # mongreldb-core, mongreldb-query, and mongreldb-client. All are
-      # standalone crates (own [workspace]), so we cd into each.
-      - run: cd crates/mongreldb-client && cargo publish
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
-      - run: cd crates/mongreldb-server && cargo publish
+      # Local release preparation may publish these first to unblock Kit.
+      # Treat an existing immutable crate version as success.
+      - name: Publish Rust crates
+        run: |
+          publish_crate() {
+            local output
+            output="$(cargo publish "$@" 2>&1)" && { echo "$output"; return 0; }
+            echo "$output"
+            echo "$output" | grep -qE 'already exists|already published'
+          }
+          publish_crate -p mongreldb-core
+          publish_crate -p mongreldb-query
+          publish_crate --manifest-path crates/mongreldb-client/Cargo.toml
+          publish_crate --manifest-path crates/mongreldb-server/Cargo.toml
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
