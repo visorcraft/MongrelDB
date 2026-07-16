@@ -1,6 +1,8 @@
 use mongreldb_core::{
-    AlterColumn, ColumnDef, ColumnFlags, Database, DefaultExpr, Schema, TypeId, Value,
+    AlterColumn, CancellationReason, ColumnDef, ColumnFlags, Database, DefaultExpr, Epoch,
+    ExecutionControl, MongrelError, Schema, TypeId, Value,
 };
+use std::cell::{Cell, RefCell};
 use tempfile::tempdir;
 
 fn schema() -> Schema {
@@ -101,4 +103,72 @@ fn set_not_null_without_default_still_rejects_existing_nulls() {
     assert!(db
         .alter_column("items", "score", AlterColumn::set_flags(flags))
         .is_err());
+}
+
+#[test]
+fn controlled_alter_can_cancel_between_backfill_and_schema_commit() {
+    let dir = tempdir().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.create_table("items", schema()).unwrap();
+    db.transaction(|transaction| {
+        transaction.put("items", vec![(1, Value::Int64(1))])?;
+        Ok(())
+    })
+    .unwrap();
+    db.alter_column(
+        "items",
+        "score",
+        AlterColumn::set_default(DefaultExpr::Static(Value::Int64(7))),
+    )
+    .unwrap();
+    let flags = db
+        .table("items")
+        .unwrap()
+        .lock()
+        .schema()
+        .column("score")
+        .unwrap()
+        .flags
+        .without(ColumnFlags::NULLABLE);
+    let control = ExecutionControl::new(None);
+    let before_calls = Cell::new(0_usize);
+    let after_epochs = RefCell::new(Vec::new());
+
+    let error = db
+        .alter_column_with_epoch_controlled(
+            "items",
+            "score",
+            AlterColumn::set_flags(flags),
+            &control,
+            || {
+                before_calls.set(before_calls.get() + 1);
+                Ok(())
+            },
+            |epoch| {
+                after_epochs.borrow_mut().push(epoch);
+                control.cancel(CancellationReason::ClientRequest);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+    let committed_epoch = match error {
+        MongrelError::DurableCommit { epoch, .. } => epoch,
+        other => panic!("expected exact partial commit, got {other:?}"),
+    };
+    assert_eq!(before_calls.get(), 1);
+    assert_eq!(
+        after_epochs.borrow().as_slice(),
+        &[Some(Epoch(committed_epoch))]
+    );
+    let table = db.table("items").unwrap();
+    let table = table.lock();
+    assert!(table
+        .schema()
+        .column("score")
+        .unwrap()
+        .flags
+        .contains(ColumnFlags::NULLABLE));
+    let rows = table.visible_rows(db.snapshot().0).unwrap();
+    assert_eq!(rows[0].columns.get(&2), Some(&Value::Int64(7)));
 }

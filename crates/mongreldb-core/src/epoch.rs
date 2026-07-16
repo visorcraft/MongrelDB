@@ -22,6 +22,14 @@ impl Epoch {
     }
 }
 
+/// Exact database epoch captured for maintenance that does not create a data
+/// commit. This lets callers report the snapshot a maintenance operation used
+/// without inventing a commit epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaintenanceReceipt {
+    pub epoch: Epoch,
+}
+
 /// A point-in-time read view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Snapshot {
@@ -103,6 +111,9 @@ impl EpochClock {
 pub struct EpochAuthority {
     assigned: AtomicU64,
     visible: AtomicU64,
+    /// Highest epoch backed by a successfully published durable commit.
+    /// Unlike `visible`, this never advances for an abandoned ticket.
+    committed: AtomicU64,
     /// Epochs that have finished publishing but cannot yet be absorbed into the
     /// `visible` watermark because an earlier assigned epoch is still in flight.
     /// Shared across every commit path (cross-table transactions, single-table
@@ -115,11 +126,43 @@ pub struct EpochAuthority {
     abandoned: Mutex<BTreeSet<u64>>,
 }
 
+/// Resolves an assigned epoch on every exit path. Successful publishers call
+/// [`Self::disarm`] after [`EpochAuthority::publish_in_order`]; failed paths
+/// abandon the ticket so later commits cannot stall behind an epoch hole.
+pub(crate) struct EpochGuard<'a> {
+    authority: &'a EpochAuthority,
+    epoch: Epoch,
+    armed: bool,
+}
+
+impl<'a> EpochGuard<'a> {
+    pub(crate) fn new(authority: &'a EpochAuthority, epoch: Epoch) -> Self {
+        Self {
+            authority,
+            epoch,
+            armed: true,
+        }
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for EpochGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.authority.abandon(self.epoch);
+        }
+    }
+}
+
 impl EpochAuthority {
     pub fn new(start: u64) -> Self {
         Self {
             assigned: AtomicU64::new(start),
             visible: AtomicU64::new(start),
+            committed: AtomicU64::new(start),
             pending: Mutex::new(BTreeSet::new()),
             abandoned: Mutex::new(BTreeSet::new()),
         }
@@ -160,6 +203,7 @@ impl EpochAuthority {
     /// applied. Each assigned epoch must call either this or [`Self::abandon`]
     /// exactly once.
     pub fn publish_in_order(&self, e: Epoch) {
+        raise_to(&self.committed, e.0);
         let mut pending = self.pending.lock();
         let mut abandoned = self.abandoned.lock();
         pending.insert(e.0);
@@ -210,6 +254,7 @@ impl EpochAuthority {
     pub fn set_recovered(&self, e: Epoch) {
         self.assigned.store(e.0, Ordering::Release);
         self.visible.store(e.0, Ordering::Release);
+        self.committed.store(e.0, Ordering::Release);
     }
 
     /// Monotonically raise both counters to at least `e` (used while opening
@@ -218,12 +263,19 @@ impl EpochAuthority {
     pub fn advance_recovered(&self, e: Epoch) {
         raise_to(&self.assigned, e.0);
         raise_to(&self.visible, e.0);
+        raise_to(&self.committed, e.0);
     }
 
     /// The current `assigned` counter (test/diagnostic use).
     #[inline]
     pub fn assigned(&self) -> Epoch {
         Epoch(self.assigned.load(Ordering::Acquire))
+    }
+
+    /// Highest durable commit epoch. Abandoned assignment tickets are absent.
+    #[inline]
+    pub fn committed(&self) -> Epoch {
+        Epoch(self.committed.load(Ordering::Acquire))
     }
 }
 
@@ -305,6 +357,16 @@ mod tests {
         // and drain e3.
         a.abandon(e2);
         assert_eq!(a.visible(), Epoch(3), "abandoning e2 drains e3");
+        assert_eq!(a.committed(), Epoch(3));
+    }
+
+    #[test]
+    fn abandoned_latest_ticket_does_not_advance_commit_watermark() {
+        let a = EpochAuthority::new(4);
+        let abandoned = a.bump_assigned();
+        a.abandon(abandoned);
+        assert_eq!(a.visible(), Epoch(5));
+        assert_eq!(a.committed(), Epoch(4));
     }
 
     #[test]

@@ -7,7 +7,7 @@
 //!
 //! On Unix, `Child::kill` is documented to send `SIGKILL`, i.e. `kill -9`.
 
-use mongreldb_core::{Table, Value};
+use mongreldb_core::{Database, Table, Value};
 use std::io::BufRead;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -152,4 +152,15 @@ fn flushed_run_survives_real_kill9() {
         "flushed (run + rotated WAL) row must survive kill -9"
     );
     assert_eq!(db.count(), 1);
+}
+
+#[test]
+fn unpublished_ctas_build_is_reclaimed_after_real_kill9() {
+    let dir = TempDir::new().unwrap();
+    spawn_and_kill("ctas-building", "CTAS_BUILDING_READY", dir.path());
+
+    let db = Database::open(dir.path()).expect("reopen database after kill -9");
+    assert!(db.table_names().is_empty());
+    assert!(db.table("target").is_err());
+    assert!(db.table("__mongreldb_ctas_build_crash-query").is_err());
 }

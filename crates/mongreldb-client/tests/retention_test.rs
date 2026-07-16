@@ -22,7 +22,7 @@ async fn history_retention_epochs_sends_get_and_parses_response() {
 
     let uri = server.uri();
     let epochs = tokio::task::spawn_blocking(move || {
-        let client = MongrelClient::new(&uri);
+        let client = MongrelClient::new(&uri).unwrap();
         client.history_retention_epochs().unwrap()
     })
     .await
@@ -45,7 +45,7 @@ async fn earliest_retained_epoch_sends_get_and_parses_response() {
 
     let uri = server.uri();
     let earliest = tokio::task::spawn_blocking(move || {
-        let client = MongrelClient::new(&uri);
+        let client = MongrelClient::new(&uri).unwrap();
         client.earliest_retained_epoch().unwrap()
     })
     .await
@@ -72,7 +72,7 @@ async fn set_history_retention_sends_exact_request_and_parses_response() {
 
     let uri = server.uri();
     let resp = tokio::task::spawn_blocking(move || {
-        let client = MongrelClient::new(&uri);
+        let client = MongrelClient::new(&uri).unwrap();
         client.set_history_retention_epochs(42).unwrap()
     })
     .await
@@ -93,7 +93,7 @@ async fn get_propagates_non_2xx_as_http_error() {
 
     let uri = server.uri();
     let err = tokio::task::spawn_blocking(move || {
-        let client = MongrelClient::new(&uri);
+        let client = MongrelClient::new(&uri).unwrap();
         client.history_retention_epochs().unwrap_err()
     })
     .await
@@ -120,7 +120,7 @@ async fn put_propagates_non_2xx_as_http_error() {
 
     let uri = server.uri();
     let err = tokio::task::spawn_blocking(move || {
-        let client = MongrelClient::new(&uri);
+        let client = MongrelClient::new(&uri).unwrap();
         client.set_history_retention_epochs(42).unwrap_err()
     })
     .await
@@ -150,7 +150,7 @@ async fn kit_set_similarity_sends_every_golden_member_shape() {
         serde_json::from_str(include_str!("../../../docs/ai/minhash-v1-golden.json")).unwrap();
     let uri = server.uri();
     tokio::task::spawn_blocking(move || {
-        let client = MongrelClient::new(&uri);
+        let client = MongrelClient::new(&uri).unwrap();
         for fixture in fixtures {
             client
                 .kit_set_similarity(&KitSetSimilarityRequest {

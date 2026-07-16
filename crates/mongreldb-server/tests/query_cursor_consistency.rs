@@ -202,7 +202,7 @@ async fn query_cursor_survives_or_fails_typed_after_flush_checkpoint_and_compact
             _ => unreachable!(),
         }
         let (status, body) = continue_query(app, &cursor, None).await;
-        if operation == "checkpoint" {
+        if operation == "flush" || operation == "checkpoint" {
             assert_eq!(status, 200, "{operation}: {body}");
             assert_eq!(body["rows"], before_body["rows"]);
             assert_eq!(body["truncated"], before_body["truncated"]);

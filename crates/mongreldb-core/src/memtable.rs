@@ -74,6 +74,18 @@ impl Value {
             Value::Json(b) => b.clone(),
         }
     }
+
+    pub(crate) fn estimated_bytes(&self) -> u64 {
+        match self {
+            Value::Null => 1,
+            Value::Bool(_) => 1,
+            Value::Int64(_) | Value::Float64(_) => 8,
+            Value::Bytes(bytes) | Value::Json(bytes) => 16 + bytes.len() as u64,
+            Value::Embedding(values) => 16 + (values.len() as u64) * 4,
+            Value::Decimal(_) | Value::Uuid(_) => 16,
+            Value::Interval { .. } => 20,
+        }
+    }
 }
 
 /// One logical row held in the memtable. A `deleted` row is a tombstone.
@@ -102,22 +114,9 @@ impl Row {
 
     /// Rough byte estimate for flush-threshold decisions.
     pub fn estimated_bytes(&self) -> u64 {
-        let mut n = 32; // header overhead
-        for v in self.columns.values() {
-            n += match v {
-                Value::Null => 1,
-                Value::Bool(_) => 1,
-                Value::Int64(_) => 8,
-                Value::Float64(_) => 8,
-                Value::Bytes(b) => 16 + b.len() as u64,
-                Value::Embedding(v) => 16 + (v.len() as u64) * 4,
-                Value::Decimal(_) => 16,
-                Value::Interval { .. } => 20,
-                Value::Uuid(_) => 16,
-                Value::Json(b) => 16 + b.len() as u64,
-            };
-        }
-        n
+        self.columns
+            .values()
+            .fold(32, |bytes, value| bytes + value.estimated_bytes())
     }
 }
 

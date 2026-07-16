@@ -19,6 +19,7 @@ pub mod compaction;
 pub mod constraint;
 pub mod cursor;
 pub mod database;
+pub mod durable_file;
 pub mod encryption;
 pub mod engine;
 pub mod epoch;
@@ -76,7 +77,7 @@ pub use engine::{
     AggState, ApproxAgg, ApproxResult, CachedAgg, ColumnStat, IncrementalAggResult,
     IndexBuildPolicy, NativeAgg, NativeAggResult, Table,
 };
-pub use epoch::{Epoch, EpochAuthority, EpochClock, Snapshot};
+pub use epoch::{Epoch, EpochAuthority, EpochClock, MaintenanceReceipt, Snapshot};
 pub use error::{MongrelError, Result};
 pub use execution::{CancellationReason, ExecutionControl};
 pub use external_table::{
@@ -100,7 +101,8 @@ pub use procedure::{
 };
 pub use query::{Condition, Query};
 pub use replication::{
-    is_replica, replica_epoch, write_replica_epoch, ReplicationBatch, ReplicationSnapshot,
+    is_replica, replica_epoch, replica_source_id, write_replica_epoch, ReplicationBatch,
+    ReplicationSnapshot,
 };
 pub use reservoir::Reservoir;
 pub use retention::{OwnedSnapshotGuard, SnapshotGuard, SnapshotRegistry};

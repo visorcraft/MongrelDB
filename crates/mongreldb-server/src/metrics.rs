@@ -131,7 +131,9 @@ impl Metrics {
         queued_queries: usize,
         registry_entries: usize,
         registry_bytes: usize,
+        pre_cancel: (usize, usize),
     ) -> String {
+        let (pre_cancel_entries, pre_cancel_bytes) = pre_cancel;
         let sql_queries = self.sql_queries.load(Ordering::Relaxed);
         let sql_errors = self.sql_errors.load(Ordering::Relaxed);
         let slow_queries = self.slow_queries.load(Ordering::Relaxed);
@@ -215,6 +217,14 @@ impl Metrics {
         out.push_str(&format!(
             "mongreldb_sql_registry_bytes {registry_bytes}\n\n"
         ));
+        out.push_str("# TYPE mongreldb_sql_pre_cancel_entries gauge\n");
+        out.push_str(&format!(
+            "mongreldb_sql_pre_cancel_entries {pre_cancel_entries}\n\n"
+        ));
+        out.push_str("# TYPE mongreldb_sql_pre_cancel_bytes gauge\n");
+        out.push_str(&format!(
+            "mongreldb_sql_pre_cancel_bytes {pre_cancel_bytes}\n\n"
+        ));
         out.push_str("# TYPE mongreldb_sql_stuck_after_cancel_total counter\n");
         out.push_str(&format!(
             "mongreldb_sql_stuck_after_cancel_total {stuck}\n\n"
@@ -276,7 +286,7 @@ mod tests {
         m.inc_puts();
         m.inc_commits();
         m.inc_txns();
-        let body = m.prometheus_text(3, 1, 1, 2, 512);
+        let body = m.prometheus_text(3, 1, 1, 2, 512, (1, 128));
         // HELP/TYPE lines present for every series.
         assert!(body.contains("# TYPE mongreldb_sql_queries_total counter"));
         assert!(body.contains("# TYPE mongreldb_sql_errors_total counter"));
@@ -285,6 +295,8 @@ mod tests {
         assert!(body.contains("# TYPE mongreldb_commits_total counter"));
         assert!(body.contains("# TYPE mongreldb_txns_total counter"));
         assert!(body.contains("# TYPE mongreldb_tables gauge"));
+        assert!(body.contains("mongreldb_sql_pre_cancel_entries 1"));
+        assert!(body.contains("mongreldb_sql_pre_cancel_bytes 128"));
         // Counter values reflect the bumps.
         assert!(body.contains("mongreldb_sql_queries_total 2"));
         assert!(body.contains("mongreldb_sql_errors_total 1"));

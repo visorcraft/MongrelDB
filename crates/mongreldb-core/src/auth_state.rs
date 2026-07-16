@@ -200,6 +200,8 @@ mod tests {
     #[test]
     fn enabled_state_denies_without_permission() {
         let principal = Principal {
+            user_id: 0,
+            created_epoch: 0,
             username: "alice".into(),
             is_admin: false,
             roles: vec![],
@@ -220,6 +222,8 @@ mod tests {
     #[test]
     fn enabled_state_admin_bypasses() {
         let principal = Principal {
+            user_id: 0,
+            created_epoch: 0,
             username: "admin".into(),
             is_admin: true,
             roles: vec![],
@@ -243,6 +247,8 @@ mod tests {
     #[test]
     fn default_checker_delegates_to_state() {
         let principal = Principal {
+            user_id: 0,
+            created_epoch: 0,
             username: "alice".into(),
             is_admin: false,
             roles: vec![],

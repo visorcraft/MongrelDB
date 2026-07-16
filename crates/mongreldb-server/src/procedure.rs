@@ -7,7 +7,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use mongreldb_core::procedure::{ProcedureCallOutput, ProcedureCallRow, StoredProcedure};
 use mongreldb_core::Value;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::{request_principal, AppState, OptionalPrincipal};
@@ -17,13 +17,28 @@ pub struct ProcedureRequest {
     procedure: StoredProcedure,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 pub struct CallRequest {
     #[serde(default)]
     args: serde_json::Map<String, serde_json::Value>,
-    #[allow(dead_code)]
     #[serde(default)]
     idempotency_key: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ProcedureCallIdempotencyPayload<'a> {
+    args: &'a serde_json::Map<String, serde_json::Value>,
+    procedure: ProcedureRevision<'a>,
+    security_version: u64,
+}
+
+#[derive(Serialize)]
+struct ProcedureRevision<'a> {
+    name: &'a str,
+    created_epoch: u64,
+    updated_epoch: u64,
+    version: u64,
+    checksum: &'a str,
 }
 
 pub async fn list(
@@ -31,7 +46,7 @@ pub async fn list(
     OptionalPrincipal(principal): OptionalPrincipal,
 ) -> Response {
     if let Err(response) = require_ddl(&state, &principal) {
-        return response;
+        return *response;
     }
     Json(json!({ "procedures": state.db.procedures() })).into_response()
 }
@@ -42,7 +57,7 @@ pub async fn describe(
     Path(name): Path<String>,
 ) -> Response {
     if let Err(response) = require_ddl(&state, &principal) {
-        return response;
+        return *response;
     }
     match state.db.procedure(&name) {
         Some(procedure) => Json(json!({ "procedure": procedure })).into_response(),
@@ -60,15 +75,17 @@ pub async fn create(
     Json(req): Json<ProcedureRequest>,
 ) -> Response {
     if let Err(response) = require_ddl(&state, &principal) {
-        return response;
+        return *response;
     }
     match normalized(req.procedure).and_then(|procedure| state.db.create_procedure(procedure)) {
         Ok(procedure) => Json(json!({ "status": "ok", "procedure": procedure })).into_response(),
-        Err(e) => error(
-            StatusCode::BAD_REQUEST,
-            "PROCEDURE_VALIDATION",
-            &e.to_string(),
-        ),
+        Err(failure) => crate::kit::durable_core_error_response(&failure).unwrap_or_else(|| {
+            error(
+                StatusCode::BAD_REQUEST,
+                "PROCEDURE_VALIDATION",
+                &failure.to_string(),
+            )
+        }),
     }
 }
 
@@ -79,7 +96,7 @@ pub async fn replace(
     Json(req): Json<ProcedureRequest>,
 ) -> Response {
     if let Err(response) = require_ddl(&state, &principal) {
-        return response;
+        return *response;
     }
     let mut procedure = req.procedure;
     procedure.name = name;
@@ -87,11 +104,13 @@ pub async fn replace(
         .and_then(|procedure| state.db.create_or_replace_procedure(procedure))
     {
         Ok(procedure) => Json(json!({ "status": "ok", "procedure": procedure })).into_response(),
-        Err(e) => error(
-            StatusCode::BAD_REQUEST,
-            "PROCEDURE_VALIDATION",
-            &e.to_string(),
-        ),
+        Err(failure) => crate::kit::durable_core_error_response(&failure).unwrap_or_else(|| {
+            error(
+                StatusCode::BAD_REQUEST,
+                "PROCEDURE_VALIDATION",
+                &failure.to_string(),
+            )
+        }),
     }
 }
 
@@ -101,11 +120,22 @@ pub async fn drop_procedure(
     Path(name): Path<String>,
 ) -> Response {
     if let Err(response) = require_ddl(&state, &principal) {
-        return response;
+        return *response;
     }
-    match state.db.drop_procedure(&name) {
-        Ok(()) => Json(json!({ "status": "ok" })).into_response(),
-        Err(e) => error(StatusCode::NOT_FOUND, "PROCEDURE_NOT_FOUND", &e.to_string()),
+    match state.db.drop_procedure_with_epoch(&name) {
+        Ok(epoch) => Json(json!({
+            "status": "committed",
+            "epoch": epoch.0,
+            "epoch_text": epoch.0.to_string()
+        }))
+        .into_response(),
+        Err(failure) => crate::kit::durable_core_error_response(&failure).unwrap_or_else(|| {
+            error(
+                StatusCode::NOT_FOUND,
+                "PROCEDURE_NOT_FOUND",
+                &failure.to_string(),
+            )
+        }),
     }
 }
 
@@ -115,12 +145,7 @@ pub async fn call(
     Path(name): Path<String>,
     Json(req): Json<CallRequest>,
 ) -> Response {
-    call_inner(
-        state.clone(),
-        name,
-        req,
-        request_principal(&state, &principal),
-    )
+    call_inner(state.clone(), name, req, principal).await
 }
 
 pub async fn kit_call(
@@ -129,59 +154,133 @@ pub async fn kit_call(
     Path(name): Path<String>,
     Json(req): Json<CallRequest>,
 ) -> Response {
-    call_inner(
-        state.clone(),
-        name,
-        req,
-        request_principal(&state, &principal),
-    )
+    call_inner(state.clone(), name, req, principal).await
 }
 
-fn call_inner(
+async fn call_inner(
     state: Arc<AppState>,
     name: String,
     req: CallRequest,
-    principal: Option<mongreldb_core::Principal>,
+    authenticated_user: Option<mongreldb_core::Principal>,
 ) -> Response {
-    let args = match req
-        .args
-        .iter()
-        .map(|(key, value)| Ok((key.clone(), json_value_to_core(value)?)))
-        .collect::<Result<HashMap<_, _>, String>>()
-    {
-        Ok(args) => args,
-        Err(e) => return error(StatusCode::BAD_REQUEST, "PROCEDURE_VALIDATION", &e),
+    let principal = request_principal(&state, &authenticated_user);
+    let (procedure, security_version) =
+        match authorized_procedure_revision(&state, &name, principal.as_ref()) {
+            Ok(preflight) => preflight,
+            Err(response) => return *response,
+        };
+    let owner = match crate::kit::idempotency_owner(&state, authenticated_user.as_ref()) {
+        Ok(owner) => owner,
+        Err(response) => return *response,
     };
-    match state.db.call_procedure_as(&name, args, principal.as_ref()) {
-        Ok(result) => Json(json!({
-            "status": "ok",
-            "epoch": result.epoch,
-            "result": output_json(&result.output),
-        }))
-        .into_response(),
-        Err(mongreldb_core::MongrelError::NotFound(e)) => {
-            error(StatusCode::NOT_FOUND, "PROCEDURE_NOT_FOUND", &e)
-        }
-        Err(e) => error(
-            StatusCode::BAD_REQUEST,
-            "PROCEDURE_EXECUTION",
-            &e.to_string(),
-        ),
-    }
+    let operation = format!("procedure:call:{name}");
+    let payload = ProcedureCallIdempotencyPayload {
+        args: &req.args,
+        procedure: ProcedureRevision {
+            name: &procedure.name,
+            created_epoch: procedure.created_epoch,
+            updated_epoch: procedure.updated_epoch,
+            version: procedure.version,
+            checksum: &procedure.checksum,
+        },
+        security_version,
+    };
+    crate::kit::idempotent_json(
+        &state,
+        &owner,
+        &operation,
+        req.idempotency_key.as_deref(),
+        &payload,
+        || {
+            let args = req
+                .args
+                .iter()
+                .map(|(key, value)| Ok((key.clone(), json_value_to_core(value)?)))
+                .collect::<Result<HashMap<_, _>, String>>()
+                .map_err(|message| {
+                    crate::kit::IdempotentJsonFailure::safe(error(
+                        StatusCode::BAD_REQUEST,
+                        "PROCEDURE_VALIDATION",
+                        &message,
+                    ))
+                })?;
+            match state
+                .db
+                .call_procedure_as_bound(&procedure, args, principal.as_ref())
+            {
+                Ok(result) => Ok(json!({
+                    "status": "ok",
+                    "committed": result.epoch.is_some(),
+                    "epoch": result.epoch,
+                    "epoch_text": result.epoch.map(|epoch| epoch.to_string()),
+                    "result": output_json(&result.output),
+                })),
+                Err(error @ mongreldb_core::MongrelError::NotFound(_)) => {
+                    Err(crate::kit::idempotent_core_failure(
+                        error,
+                        StatusCode::NOT_FOUND,
+                        "PROCEDURE_NOT_FOUND",
+                    ))
+                }
+                Err(error) => Err(crate::kit::idempotent_core_failure(
+                    error,
+                    StatusCode::BAD_REQUEST,
+                    "PROCEDURE_EXECUTION",
+                )),
+            }
+        },
+    )
+    .await
 }
 
-#[allow(clippy::result_large_err)]
+fn authorized_procedure_revision(
+    state: &AppState,
+    name: &str,
+    principal: Option<&mongreldb_core::Principal>,
+) -> Result<(StoredProcedure, u64), Box<Response>> {
+    for _ in 0..3 {
+        let security_version = state.db.security_version();
+        if let Err(failure) = state
+            .db
+            .require_for(principal, &mongreldb_core::Permission::All)
+        {
+            return Err(Box::new(error(
+                crate::status_for_error(&failure),
+                "PROCEDURE_EXECUTION",
+                &failure.to_string(),
+            )));
+        }
+        let Some(procedure) = state.db.procedure(name) else {
+            return Err(Box::new(error(
+                StatusCode::NOT_FOUND,
+                "PROCEDURE_NOT_FOUND",
+                "procedure not found",
+            )));
+        };
+        if state.db.security_version() == security_version {
+            return Ok((procedure, security_version));
+        }
+    }
+    Err(Box::new(error(
+        StatusCode::CONFLICT,
+        "PROCEDURE_EXECUTION",
+        "authorization changed during procedure preflight",
+    )))
+}
+
 fn require_ddl(
     state: &AppState,
     principal: &Option<mongreldb_core::Principal>,
-) -> Result<(), Response> {
+) -> Result<(), Box<Response>> {
     state
         .db
         .require_for(
             request_principal(state, principal).as_ref(),
             &mongreldb_core::Permission::Ddl,
         )
-        .map_err(|error| (crate::status_for_error(&error), error.to_string()).into_response())
+        .map_err(|error| {
+            Box::new((crate::status_for_error(&error), error.to_string()).into_response())
+        })
 }
 
 fn normalized(procedure: StoredProcedure) -> mongreldb_core::Result<StoredProcedure> {

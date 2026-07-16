@@ -116,9 +116,59 @@ fn wait_for_line_with<F: Fn(&str) -> bool>(
     }
 }
 
-/// Default behavior (timeout=0) must fail fast with the existing
-/// `locked by another process` error so every caller that doesn't opt
-/// in keeps working unchanged.
+#[test]
+fn losing_concurrent_creator_never_touches_database_directory() {
+    let parent = TempDir::new().unwrap();
+    let root = parent.path().join("new-database");
+    let (mut creator, creator_rx) = spawn_sub("delayed_creator", &root);
+    assert!(
+        wait_for_line(&creator_rx, "READY", Duration::from_secs(5)),
+        "creator never reserved the database lock"
+    );
+
+    let error = Database::create(&root).unwrap_err();
+    assert!(
+        matches!(&error, mongreldb_core::MongrelError::DatabaseLocked { .. }),
+        "unexpected creator error: {error}"
+    );
+    assert!(
+        !root.exists(),
+        "losing creator wrote the database directory before acquiring its lock"
+    );
+
+    assert!(
+        wait_for_line(&creator_rx, "CREATED", Duration::from_secs(5)),
+        "winning creator never completed"
+    );
+    assert!(creator.wait().unwrap().success());
+    let _db = Database::open(&root).unwrap();
+}
+
+#[test]
+fn waiting_open_reads_catalog_and_auth_after_lock_acquisition() {
+    let dir = TempDir::new().unwrap();
+    pre_create(dir.path());
+    let (mut enabler, enabler_rx) = spawn_sub("auth_enabler", dir.path());
+    assert!(
+        wait_for_line(&enabler_rx, "READY", Duration::from_secs(5)),
+        "auth enabler never opened database"
+    );
+
+    let options = OpenOptions::default().with_lock_timeout_ms(5_000);
+    let error = Database::open_with_options(dir.path(), options).unwrap_err();
+    assert!(
+        matches!(error, mongreldb_core::MongrelError::AuthRequired),
+        "waiting open used stale pre-lock catalog: {error}"
+    );
+    assert!(
+        wait_for_line(&enabler_rx, "DONE", Duration::from_secs(5)),
+        "auth enabler never completed"
+    );
+    assert!(enabler.wait().unwrap().success());
+    let _db = Database::open_with_credentials(dir.path(), "admin", "admin-password").unwrap();
+}
+
+/// Default behavior (timeout=0) must fail fast with a typed lock error.
 #[test]
 fn fail_fast_default_rejects_concurrent_open() {
     let dir = TempDir::new().unwrap();
@@ -138,10 +188,12 @@ fn fail_fast_default_rejects_concurrent_open() {
         result.is_err(),
         "default open should fail while another process holds the lock"
     );
-    let err = format!("{}", result.unwrap_err());
     assert!(
-        err.contains("locked by another process"),
-        "expected 'locked by another process' error, got: {err}"
+        matches!(
+            result.unwrap_err(),
+            mongreldb_core::MongrelError::DatabaseLocked { .. }
+        ),
+        "expected DatabaseLocked"
     );
     assert!(
         elapsed < Duration::from_secs(2),
@@ -192,7 +244,7 @@ fn lock_timeout_waits_and_acquires() {
 }
 
 /// `lock_timeout_ms` that elapses without the lock becoming available
-/// returns the timeout-shaped error mapped through `MongrelError::Io`.
+/// returns the timeout-shaped typed lock error.
 #[test]
 fn lock_timeout_expires_with_error() {
     let dir = TempDir::new().unwrap();
@@ -225,7 +277,7 @@ fn lock_timeout_expires_with_error() {
     waiter.join().expect("waiter thread panic");
     assert!(msg.starts_with("ERR"), "got: {msg}");
     assert!(
-        msg.contains("locked by another process") && msg.contains("250ms"),
+        msg.contains("is locked") && msg.contains("250ms"),
         "expected timeout-shaped error, got: {msg}"
     );
 
@@ -253,10 +305,12 @@ fn engine_holder_blocks_in_process_open() {
         result.is_err(),
         "default open should fail while subprocess holds the lock"
     );
-    let err = format!("{}", result.unwrap_err());
     assert!(
-        err.contains("locked by another process"),
-        "expected 'locked by another process' error, got: {err}"
+        matches!(
+            result.unwrap_err(),
+            mongreldb_core::MongrelError::DatabaseLocked { .. }
+        ),
+        "expected DatabaseLocked"
     );
 
     holder.kill().expect("kill holder");

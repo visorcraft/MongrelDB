@@ -22,6 +22,8 @@ use arrow::ipc::reader::FileReader;
 use arrow::ipc::writer::FileWriter;
 use arrow::record_batch::RecordBatch;
 
+const SHADOW_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Manages Arrow IPC shadow files (`<table_dir>/_shadow/r-<run_id>.arrow`).
 pub struct ArrowShadow {
     dir: PathBuf,
@@ -42,6 +44,9 @@ impl ArrowShadow {
     /// (the normal decode path is the fallback).
     pub fn try_read(&self, run_id: u128) -> Option<RecordBatch> {
         let path = self.shadow_path(run_id);
+        if std::fs::metadata(&path).ok()?.len() > SHADOW_MAX_BYTES {
+            return None;
+        }
         let file = std::fs::File::open(&path).ok()?;
         let reader = FileReader::try_new(file, None).ok()?;
         let batches: Vec<RecordBatch> = reader

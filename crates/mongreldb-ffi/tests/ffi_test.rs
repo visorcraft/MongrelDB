@@ -53,7 +53,7 @@ unsafe fn make_test_db(path: &str) -> mongreldb_database_t {
     db
 }
 
-unsafe fn make_simple_table(db: mongreldb_database_t, name: &str) {
+unsafe fn make_simple_table(db: mongreldb_database_t, name: &str) -> u64 {
     let builder = mongreldb_schema_begin();
     assert!(!builder.is_null());
     let col1 = mongreldb_column_def {
@@ -95,6 +95,7 @@ unsafe fn make_simple_table(db: mongreldb_database_t, name: &str) {
         "create_table failed: {}",
         rust_str(mongreldb_last_error())
     );
+    table_id
 }
 
 unsafe fn make_cell_input_array(cells: &mut [mongreldb_cell_input]) -> mongreldb_cell_input_array {
@@ -164,7 +165,8 @@ fn ffi_specialized_column_rejects_wrong_value_before_write() {
         ];
         let cells = make_cell_input_array(&mut cells);
         assert_eq!(mongreldb_table_put(table, &cells, std::ptr::null_mut()), -1);
-        assert!(rust_str(mongreldb_last_error()).contains("requires bytes or NULL"));
+        let error = rust_str(mongreldb_last_error());
+        assert!(error.contains("does not match type Bytes"), "{error}");
         let mut count = 99;
         assert_eq!(mongreldb_table_count(table, &mut count), 0);
         assert_eq!(count, 0);
@@ -438,6 +440,23 @@ fn ffi_transaction_put_commit() {
             "commit failed: {}",
             rust_str(mongreldb_last_error())
         );
+        let committed_epoch = epoch;
+
+        epoch = 0;
+        assert_eq!(mongreldb_txn_commit(txn, &mut epoch), 0);
+        assert_eq!(epoch, committed_epoch);
+        let mut late_cells = [mongreldb_cell_input {
+            column_id: 1,
+            value: CValue::int64(4),
+        }];
+        let late_cell_arr = make_cell_input_array(&mut late_cells);
+        assert_eq!(mongreldb_txn_put(txn, cstr("txn_test"), &late_cell_arr), -1);
+        let mut details: mongreldb_error_details_v1 = std::mem::zeroed();
+        assert_eq!(mongreldb_last_error_details_v1(&mut details), 0);
+        assert_eq!(details.outcome_known, 1);
+        assert_eq!(details.committed, 1);
+        assert_eq!(details.last_commit_epoch, committed_epoch);
+        assert_eq!(mongreldb_txn_rollback(txn), -1);
 
         let table = mongreldb_database_table(db, cstr("txn_test"));
         let mut count: u64 = 0;
@@ -445,7 +464,125 @@ fn ffi_transaction_put_commit() {
         assert_eq!(count, 3);
 
         mongreldb_table_free(table);
+        mongreldb_txn_free(txn);
         mongreldb_database_free(db);
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ffi_transaction_rollback_is_terminal() {
+    let dir = make_tempdir();
+
+    unsafe {
+        let db = make_test_db(dir.to_str().unwrap());
+        make_simple_table(db, "txn_rollback");
+
+        let txn = mongreldb_begin(db);
+        let mut cells = [mongreldb_cell_input {
+            column_id: 1,
+            value: CValue::int64(1),
+        }];
+        let cell_arr = make_cell_input_array(&mut cells);
+        assert_eq!(mongreldb_txn_put(txn, cstr("txn_rollback"), &cell_arr), 0);
+        assert_eq!(mongreldb_txn_rollback(txn), 0);
+        assert_eq!(mongreldb_txn_rollback(txn), 0);
+
+        assert_eq!(mongreldb_txn_put(txn, cstr("txn_rollback"), &cell_arr), -1);
+        let mut details: mongreldb_error_details_v1 = std::mem::zeroed();
+        assert_eq!(mongreldb_last_error_details_v1(&mut details), 0);
+        assert_eq!(details.outcome_known, 1);
+        assert_eq!(details.committed, 0);
+
+        let mut epoch = 0;
+        assert_eq!(mongreldb_txn_commit(txn, &mut epoch), -1);
+        assert_eq!(epoch, 0);
+
+        let table = mongreldb_database_table(db, cstr("txn_rollback"));
+        let mut count = 99;
+        assert_eq!(mongreldb_table_count(table, &mut count), 0);
+        assert_eq!(count, 0);
+
+        mongreldb_table_free(table);
+        mongreldb_txn_free(txn);
+        mongreldb_database_free(db);
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ffi_transaction_durable_error_is_terminal_and_structured() {
+    let dir = make_tempdir();
+    let path = dir.to_str().unwrap();
+
+    unsafe {
+        let db = make_test_db(path);
+        let table_id = make_simple_table(db, "txn_durable");
+        let manifest = dir.join("tables").join(table_id.to_string()).join("_mf");
+        let original_manifest = std::fs::read(&manifest).unwrap();
+        std::fs::remove_file(&manifest).unwrap();
+        std::fs::create_dir(&manifest).unwrap();
+
+        let txn = mongreldb_begin(db);
+        let mut cells = [mongreldb_cell_input {
+            column_id: 1,
+            value: CValue::int64(1),
+        }];
+        let cell_arr = make_cell_input_array(&mut cells);
+        assert_eq!(mongreldb_txn_put(txn, cstr("txn_durable"), &cell_arr), 0);
+
+        let mut epoch = 0;
+        assert_eq!(
+            mongreldb_txn_commit(txn, &mut epoch),
+            -15,
+            "expected durable outcome: {}",
+            rust_str(mongreldb_last_error())
+        );
+        assert!(epoch > 0);
+
+        let mut details: mongreldb_error_details_v1 = std::mem::zeroed();
+        assert_eq!(mongreldb_last_error_details_v1(&mut details), 0);
+        assert_eq!(details.struct_size, std::mem::size_of_val(&details));
+        assert_eq!(details.version, 1);
+        assert_eq!(details.code, -15);
+        assert_eq!(details.outcome_known, 1);
+        assert_eq!(details.committed, 1);
+        assert_eq!(details.has_last_commit_epoch, 1);
+        assert_eq!(details.last_commit_epoch, epoch);
+        assert_eq!(details.retryable, 0);
+
+        epoch = 0;
+        for operation in 0..3 {
+            let repeated = match operation {
+                0 => mongreldb_txn_commit(txn, &mut epoch),
+                1 => mongreldb_txn_put(txn, cstr("txn_durable"), &cell_arr),
+                _ => mongreldb_txn_rollback(txn),
+            };
+            assert_eq!(repeated, -15);
+            let mut repeated_details: mongreldb_error_details_v1 = std::mem::zeroed();
+            assert_eq!(mongreldb_last_error_details_v1(&mut repeated_details), 0);
+            assert_eq!(repeated_details.outcome_known, 1);
+            assert_eq!(repeated_details.committed, 1);
+            assert_eq!(repeated_details.has_last_commit_epoch, 1);
+            assert_eq!(repeated_details.last_commit_epoch, epoch);
+            assert_eq!(repeated_details.retryable, 0);
+        }
+
+        mongreldb_txn_free(txn);
+        mongreldb_database_free(db);
+        std::fs::remove_dir(&manifest).unwrap();
+        std::fs::write(&manifest, original_manifest).unwrap();
+
+        let reopened = mongreldb_open(cstr(path));
+        assert!(!reopened.is_null());
+        let table = mongreldb_database_table(reopened, cstr("txn_durable"));
+        let mut count = 0;
+        assert_eq!(mongreldb_table_count(table, &mut count), 0);
+        assert_eq!(count, 1, "terminal commit must not replay staged writes");
+        mongreldb_table_free(table);
+        mongreldb_database_free(reopened);
     }
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -747,13 +884,67 @@ fn ffi_sql_query_handle_wait_cancel_and_reuse() {
         };
         let query = mongreldb_sql_query_start(db, cstr("SELECT 1"), &options);
         assert!(!query.is_null());
+        let duplicate = mongreldb_sql_query_start(db, cstr("SELECT 2"), &options);
+        assert!(duplicate.is_null());
+        assert_eq!(mongreldb_last_error_code(), -11);
+        assert!(rust_str(mongreldb_last_error()).contains("already active or retained"));
         let mut result = mongreldb_sql_result_t {
             data: std::ptr::null_mut(),
             len: 0,
         };
         assert_eq!(mongreldb_sql_query_wait(query, &mut result), 0);
         assert!(result.len > 0);
+        let mut status: mongreldb_sql_query_status_v1 = std::mem::zeroed();
+        assert_eq!(mongreldb_sql_query_get_status(query, &mut status), 0);
+        assert_eq!(status.phase, 8);
+        assert_eq!(status.terminal_state, 1);
+        assert_eq!(status.committed, 0);
+        let mut status_v2: mongreldb_sql_query_status_v2 = std::mem::zeroed();
+        assert_eq!(mongreldb_sql_query_get_status_v2(query, &mut status_v2), 0);
+        assert_eq!(status_v2.outcome_known, 1);
+        assert_eq!(status_v2.v1.terminal_state, status.terminal_state);
+        assert_eq!(
+            rust_str(status.query_id.as_ptr()),
+            query_id.to_str().unwrap()
+        );
+        assert_eq!(mongreldb_sql_query_cancel(query), 4);
         mongreldb_free_sql_result(result.data, result.len);
+        mongreldb_sql_query_free(query);
+
+        let limit_id = CString::new("102132435465768798a9bacbdcedfe0f").unwrap();
+        let limit_options = mongreldb_sql_options_v2 {
+            query_id: limit_id.as_ptr(),
+            timeout_ms: 5_000,
+            max_output_rows: 1,
+            max_output_bytes: 1_024 * 1_024,
+        };
+        let query = mongreldb_sql_query_start_v2(
+            db,
+            cstr("SELECT 1 AS id UNION ALL SELECT 2 AS id"),
+            &limit_options,
+        );
+        assert!(!query.is_null());
+        let mut limited = mongreldb_sql_result_t {
+            data: std::ptr::null_mut(),
+            len: 0,
+        };
+        assert!(mongreldb_sql_query_wait(query, &mut limited) < 0);
+        let mut error_details: mongreldb_error_details_v1 = std::mem::zeroed();
+        assert_eq!(mongreldb_last_error_details_v1(&mut error_details), 0);
+        assert_eq!(error_details.code, -17);
+        assert_eq!(error_details.outcome_known, 1);
+        assert_eq!(error_details.committed, 0);
+        assert_eq!(
+            rust_str(error_details.query_id.as_ptr()),
+            limit_id.to_str().unwrap()
+        );
+        let mut status: mongreldb_sql_query_status_v1 = std::mem::zeroed();
+        assert_eq!(mongreldb_sql_query_get_status(query, &mut status), 0);
+        assert_eq!(status.terminal_error_category, 3);
+        assert_eq!(
+            rust_str(status.terminal_error_code.as_ptr()),
+            "RESULT_LIMIT_EXCEEDED"
+        );
         mongreldb_sql_query_free(query);
 
         let cancel_id = CString::new("ffeeddccbbaa99887766554433221100").unwrap();
@@ -773,6 +964,16 @@ fn ffi_sql_query_handle_wait_cancel_and_reuse() {
             len: 0,
         };
         assert!(mongreldb_sql_query_wait(query, &mut cancelled) < 0);
+        let mut error_details: mongreldb_error_details_v1 = std::mem::zeroed();
+        assert_eq!(mongreldb_last_error_details_v1(&mut error_details), 0);
+        assert_eq!(error_details.code, -9);
+        assert_eq!(error_details.outcome_known, 1);
+        assert_eq!(error_details.committed, 0);
+        assert_eq!(error_details.cancellation_reason, 1);
+        assert_eq!(
+            rust_str(error_details.query_id.as_ptr()),
+            cancel_id.to_str().unwrap()
+        );
         mongreldb_sql_query_free(query);
 
         let mut data = std::ptr::null_mut();
@@ -784,5 +985,60 @@ fn ffi_sql_query_handle_wait_cancel_and_reuse() {
         mongreldb_free_sql_result(data, len);
         mongreldb_database_free(db);
         std::fs::remove_dir_all(path).ok();
+    }
+}
+
+#[test]
+fn ffi_sql_query_cancel_during_arrow_ipc_encoding() {
+    unsafe {
+        let path = make_tempdir();
+        let db = mongreldb_create(cstr(path.to_str().unwrap()));
+        assert!(!db.is_null());
+        let query_id = CString::new("11223344556677889900aabbccddeeff").unwrap();
+        let options = mongreldb_sql_options_v2 {
+            query_id: query_id.as_ptr(),
+            timeout_ms: 30_000,
+            max_output_rows: 3_000_000,
+            max_output_bytes: 256 * 1024 * 1024,
+        };
+        let query = mongreldb_sql_query_start_v2(
+            db,
+            cstr("SELECT * FROM generate_series(1, 2000000)"),
+            &options,
+        );
+        assert!(!query.is_null());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let mut status: mongreldb_sql_query_status_v1 = std::mem::zeroed();
+            assert_eq!(mongreldb_sql_query_get_status(query, &mut status), 0);
+            if status.phase == 5 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "query never entered SQL serialization; phase={}",
+                status.phase
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        assert!(matches!(mongreldb_sql_query_cancel(query), 1 | 2));
+        let mut result = mongreldb_sql_result_t {
+            data: std::ptr::null_mut(),
+            len: 0,
+        };
+        assert!(mongreldb_sql_query_wait(query, &mut result) < 0);
+        assert!(result.data.is_null());
+        assert_eq!(result.len, 0);
+        let mut status: mongreldb_sql_query_status_v1 = std::mem::zeroed();
+        assert_eq!(mongreldb_sql_query_get_status(query, &mut status), 0);
+        assert_eq!(status.phase, 10);
+        assert_eq!(status.terminal_state, 3);
+        assert_eq!(status.cancellation_reason, 1);
+
+        mongreldb_sql_query_free(query);
+        mongreldb_database_free(db);
+        let _ = std::fs::remove_dir_all(path);
     }
 }

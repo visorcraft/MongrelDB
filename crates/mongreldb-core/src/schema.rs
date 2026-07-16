@@ -512,6 +512,12 @@ impl Schema {
             let Some(column) = self.columns.iter().find(|column| column.id == *column_id) else {
                 return Err(MongrelError::ColumnNotFound(column_id.to_string()));
             };
+            if !value_matches_type(value, column.ty.clone()) {
+                return Err(MongrelError::InvalidArgument(format!(
+                    "column '{}' ({}) value {value:?} does not match type {:?}",
+                    column.name, column.id, column.ty
+                )));
+            }
             let representation = self
                 .indexes
                 .iter()
@@ -625,6 +631,49 @@ impl Schema {
         Ok(())
     }
 
+    /// Validate a durable row against the current schema while honoring a
+    /// later schema generation's declared default for a previously omitted or
+    /// nullable cell. This is validation-only: dynamic defaults use a
+    /// type-correct sentinel and are never written back during recovery.
+    pub(crate) fn validate_persisted_values(&self, columns: &[(u16, Value)]) -> Result<()> {
+        let mut resolved = columns.to_vec();
+        for column in &self.columns {
+            if column.flags.contains(ColumnFlags::NULLABLE)
+                || column.flags.contains(ColumnFlags::AUTO_INCREMENT)
+            {
+                continue;
+            }
+            let position = resolved.iter().position(|(id, _)| *id == column.id);
+            let missing = position
+                .map(|index| matches!(resolved[index].1, Value::Null))
+                .unwrap_or(true);
+            if !missing {
+                continue;
+            }
+            let Some(default) = &column.default_value else {
+                continue;
+            };
+            let value = match default {
+                DefaultExpr::Static(value) => value.clone(),
+                DefaultExpr::Now => match column.ty {
+                    TypeId::Bytes => Value::Bytes(Vec::new()),
+                    TypeId::TimestampNanos | TypeId::Date64 => Value::Int64(0),
+                    _ => unreachable!("validated NOW() default has a temporal/bytes type"),
+                },
+                DefaultExpr::Uuid => match column.ty {
+                    TypeId::Uuid => Value::Uuid([0; 16]),
+                    TypeId::Bytes => Value::Bytes(vec![0; 16]),
+                    _ => unreachable!("validated UUID() default has a uuid/bytes type"),
+                },
+            };
+            match position {
+                Some(index) => resolved[index].1 = value,
+                None => resolved.push((column.id, value)),
+            }
+        }
+        self.validate_values(&resolved)
+    }
+
     /// Validate row-level type constraints owned directly by the schema.
     /// Non-null columns must be present, and enum values must belong to their
     /// declared variant set. AUTO_INCREMENT columns may be omitted because the
@@ -691,8 +740,37 @@ impl Schema {
     /// and it must be a non-nullable `Int64` primary key. Called at table
     /// creation time so an invalid schema never reaches the insert path.
     pub fn validate_auto_increment(&self) -> Result<()> {
+        const ALLOWED_FLAGS: u32 = ColumnFlags::NULLABLE
+            | ColumnFlags::PRIMARY_KEY
+            | ColumnFlags::ENCRYPTED
+            | ColumnFlags::ENCRYPTED_INDEXABLE
+            | ColumnFlags::EMBEDDING_BINARY_QUANTIZED
+            | ColumnFlags::AUTO_INCREMENT;
+        const FIRST_RESERVED_COLUMN_ID: u16 = 0xFFFC;
+        let mut ids = std::collections::HashSet::new();
+        let mut names = std::collections::HashSet::new();
+        let mut primary_keys = 0_u8;
         let mut seen: Option<&ColumnDef> = None;
         for col in &self.columns {
+            if col.id >= FIRST_RESERVED_COLUMN_ID
+                || col.name.is_empty()
+                || col.flags.bits() & !ALLOWED_FLAGS != 0
+                || !ids.insert(col.id)
+                || !names.insert(col.name.as_str())
+            {
+                return Err(MongrelError::Schema(format!(
+                    "column {:?} has a reserved/duplicate identity or unknown flags",
+                    col.name
+                )));
+            }
+            if col.flags.contains(ColumnFlags::PRIMARY_KEY) {
+                primary_keys = primary_keys.saturating_add(1);
+                if primary_keys > 1 {
+                    return Err(MongrelError::Schema(
+                        "schema may contain at most one primary key column".into(),
+                    ));
+                }
+            }
             if !col.flags.contains(ColumnFlags::AUTO_INCREMENT) {
                 continue;
             }

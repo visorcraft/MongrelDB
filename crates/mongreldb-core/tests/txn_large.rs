@@ -1,7 +1,7 @@
 //! P3.4 — unbounded transactions via quarantined uniform-epoch spill runs.
 
 use mongreldb_core::query::{Condition, Query};
-use mongreldb_core::{schema::*, Database, Value};
+use mongreldb_core::{schema::*, Database, MongrelError, Value};
 use tempfile::tempdir;
 
 fn pk_schema() -> Schema {
@@ -19,6 +19,18 @@ fn pk_schema() -> Schema {
         constraints: Default::default(),
         clustered: false,
     }
+}
+
+fn payload_schema() -> Schema {
+    let mut schema = pk_schema();
+    schema.columns.push(ColumnDef {
+        id: 2,
+        name: "payload".into(),
+        ty: TypeId::Bytes,
+        flags: ColumnFlags::empty(),
+        default_value: None,
+    });
+    schema
 }
 
 #[test]
@@ -153,6 +165,28 @@ fn spilled_txn_does_not_materialize_rows_in_memtable() {
 }
 
 #[test]
+fn spill_threshold_counts_value_payload_bytes() {
+    let dir = tempdir().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.create_table("t", payload_schema()).unwrap();
+    db.set_spill_threshold(1024);
+
+    db.transaction(|transaction| {
+        transaction.put(
+            "t",
+            vec![(1, Value::Int64(1)), (2, Value::Bytes(vec![7; 4096]))],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    let table = db.table("t").unwrap();
+    let guard = table.lock();
+    assert_eq!(guard.count(), 1);
+    assert_eq!(guard.memtable_len(), 0, "large payload must use spill run");
+}
+
+#[test]
 fn spilled_run_respects_snapshot_isolation() {
     // A snapshot pinned before a spilled txn commits must NOT see its rows; a
     // current reader after commit must. Guards the uniform-epoch overlay (the run
@@ -250,4 +284,42 @@ fn spilled_txn_recovers_run_from_wal_after_crash() {
         50,
         "spilled run data must survive reopen"
     );
+}
+
+#[test]
+fn spilled_manifest_failure_keeps_live_and_recovered_state_coherent() {
+    let dir = tempdir().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    let table_id = db.create_table("t", pk_schema()).unwrap();
+    db.set_spill_threshold(1);
+    let manifest = dir
+        .path()
+        .join("tables")
+        .join(table_id.to_string())
+        .join("_mf");
+    let saved_manifest = manifest.with_extension("saved");
+    std::fs::rename(&manifest, &saved_manifest).unwrap();
+    std::fs::create_dir(&manifest).unwrap();
+
+    let error = db
+        .transaction(|t| {
+            for i in 0..50i64 {
+                t.put("t", vec![(1, Value::Int64(i))])?;
+            }
+            Ok(())
+        })
+        .unwrap_err();
+    let epoch = match error {
+        MongrelError::DurableCommit { epoch, .. } => epoch,
+        other => panic!("expected durable commit error, got {other:?}"),
+    };
+    assert_eq!(db.visible_epoch().0, epoch);
+    assert_eq!(db.table("t").unwrap().lock().count(), 50);
+
+    drop(db);
+    std::fs::remove_dir(&manifest).unwrap();
+    std::fs::rename(&saved_manifest, &manifest).unwrap();
+    let reopened = Database::open(dir.path()).unwrap();
+    assert_eq!(reopened.visible_epoch().0, epoch);
+    assert_eq!(reopened.table("t").unwrap().lock().count(), 50);
 }

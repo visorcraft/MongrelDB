@@ -266,7 +266,7 @@ async fn search_cursor_survives_or_fails_typed_after_flush_checkpoint_and_compac
             _ => unreachable!(),
         }
         let (status, body) = continue_search(app, &first["next_cursor"]).await;
-        if operation == "checkpoint" {
+        if operation == "flush" || operation == "checkpoint" {
             assert_eq!(status, 200, "{operation}: {body}");
             assert_eq!(body["hits"], before_body["hits"]);
             assert_eq!(body["truncated"], before_body["truncated"]);
@@ -278,16 +278,19 @@ async fn search_cursor_survives_or_fails_typed_after_flush_checkpoint_and_compac
 }
 
 #[tokio::test]
-async fn search_cursor_fails_stale_after_checkpoint_and_rejects_mac_or_server_change() {
+async fn search_cursor_survives_noop_maintenance_and_rejects_mac_or_server_change() {
     let (_dir, db, app) = setup().await;
     let first = first_page(app.clone()).await;
+    let (before_status, before_body) = continue_search(app.clone(), &first["next_cursor"]).await;
+    assert_eq!(before_status, 200, "{before_body}");
     db.checkpoint().unwrap();
-    let _ = db.compact_table("docs").unwrap();
+    assert!(!db.compact_table("docs").unwrap());
     let mut request = search(2);
     request["cursor"] = first["next_cursor"].clone();
     let (status, page) = post(app.clone(), "/kit/search", request.clone()).await;
-    assert_eq!(status, 409, "{page}");
-    assert_eq!(page["error"]["code"], "CURSOR_STALE");
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(page["hits"], before_body["hits"]);
+    assert_eq!(page["truncated"], before_body["truncated"]);
 
     let mut tampered = first["next_cursor"].as_str().unwrap().as_bytes().to_vec();
     let index = tampered.len() / 4;

@@ -30,7 +30,15 @@ atomically.
 - `POST /kit/procedures/{name}/call`
 
 The Kit call route accepts `{ "args": { ... }, "idempotency_key": "..." }` and returns
-`{ "status": "ok", "epoch": <optional>, "result": ... }`.
+`{ "status": "ok", "committed": <bool>, "epoch": <optional>, "epoch_text": <optional>, "result": ... }`.
+`committed` is true exactly when both exact epoch fields are present. A keyed call uses
+the daemon's durable owner/operation/payload-bound idempotency store. A retry
+replays the exact prior HTTP status and body. An uncertain commit retains its
+intent and returns `QUERY_OUTCOME_UNKNOWN` without calling the procedure again.
+Before receipt lookup, the daemon rechecks current `ALL` permission. The key
+also binds the security version and exact procedure creation epoch, update
+epoch, version, and checksum. Permission revocation or procedure replacement
+cannot reveal or replay a stale result.
 
 ## NAPI
 

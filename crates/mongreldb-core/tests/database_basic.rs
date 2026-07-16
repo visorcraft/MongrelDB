@@ -84,6 +84,21 @@ fn database_creates_tables_and_shares_one_clock() {
 }
 
 #[test]
+fn close_flushes_and_reopens_committed_rows() {
+    let dir = tempdir().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.create_table("items", items_schema()).unwrap();
+    db.transaction(|transaction| transaction.put("items", vec![(1, Value::Int64(7))]))
+        .unwrap();
+
+    db.close().unwrap();
+    drop(db);
+
+    let reopened = Database::open(dir.path()).unwrap();
+    assert_eq!(reopened.table("items").unwrap().lock().count(), 1);
+}
+
+#[test]
 fn create_refuses_existing_database_without_replacing_catalog() {
     let dir = tempdir().unwrap();
     {
@@ -141,6 +156,45 @@ fn encrypted_credentialed_create_refuses_existing_database_without_rewriting_key
     let db =
         Database::open_encrypted_with_credentials(dir.path(), "right", "admin", "s3cret").unwrap();
     assert!(db.table_names().iter().any(|name| name == "orders"));
+}
+
+#[cfg(feature = "encryption")]
+#[test]
+fn database_encrypted_opens_reject_malformed_salt_without_panicking() {
+    for credentialed in [false, true] {
+        for malformed in [
+            Vec::new(),
+            vec![0; mongreldb_core::encryption::SALT_LEN + 1],
+        ] {
+            let dir = tempdir().unwrap();
+            if credentialed {
+                drop(
+                    Database::create_encrypted_with_credentials(
+                        dir.path(),
+                        "passphrase",
+                        "admin",
+                        "password",
+                    )
+                    .unwrap(),
+                );
+            } else {
+                drop(Database::create_encrypted(dir.path(), "passphrase").unwrap());
+            }
+            std::fs::write(dir.path().join("_meta/keys"), malformed).unwrap();
+            let error = if credentialed {
+                Database::open_encrypted_with_credentials(
+                    dir.path(),
+                    "passphrase",
+                    "admin",
+                    "password",
+                )
+                .unwrap_err()
+            } else {
+                Database::open_encrypted(dir.path(), "passphrase").unwrap_err()
+            };
+            assert!(matches!(error, MongrelError::Encryption(_)));
+        }
+    }
 }
 
 #[test]

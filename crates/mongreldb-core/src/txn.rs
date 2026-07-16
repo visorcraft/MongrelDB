@@ -8,13 +8,29 @@
 //! per-table manifests, and publishes the visible watermark. Rollback (or a
 //! dropped transaction) discards the staging and appends nothing durable.
 
-use crate::database::{Database, ExternalTriggerBridge};
+use crate::database::{Database, ExternalTriggerBridge, TableHandle};
 use crate::epoch::{Epoch, Snapshot};
 use crate::error::{MongrelError, Result};
 use crate::memtable::Value;
 use crate::rowid::RowId;
 use crate::wal::SharedWal;
 use parking_lot::{Condvar, Mutex as PlMutex};
+
+pub(crate) fn allocate_txn_id(allocator: &PlMutex<u64>) -> Result<u64> {
+    let mut next = allocator.lock();
+    let id = *next;
+    if id == crate::wal::SYSTEM_TXN_ID || id & u32::MAX as u64 == 0 {
+        return Err(MongrelError::Full(
+            "per-open transaction id namespace exhausted; reopen the database".into(),
+        ));
+    }
+    *next = id.checked_add(1).ok_or_else(|| {
+        MongrelError::Full(
+            "per-open transaction id namespace exhausted; reopen the database".into(),
+        )
+    })?;
+    Ok(id)
+}
 
 /// One staged mutation against a named table.
 pub(crate) enum Staged {
@@ -67,6 +83,7 @@ pub struct UpsertResult {
 pub struct Transaction<'db> {
     db: &'db Database,
     txn_id: u64,
+    allocation_error: Option<String>,
     read: Snapshot,
     staging: Vec<(u64 /*table_id*/, Staged)>,
     external_states: Vec<(String, Vec<u8>)>,
@@ -78,11 +95,17 @@ pub struct Transaction<'db> {
 }
 
 impl<'db> Transaction<'db> {
-    pub(crate) fn new(db: &'db Database, txn_id: u64, read: Snapshot) -> Self {
+    pub(crate) fn new(db: &'db Database, txn_id: Result<u64>, read: Snapshot) -> Self {
         let guard = db.register_active(read.epoch);
+        let (txn_id, allocation_error) = match txn_id {
+            Ok(txn_id) => (txn_id, None),
+            Err(MongrelError::Full(message)) => (crate::wal::SYSTEM_TXN_ID, Some(message)),
+            Err(error) => (crate::wal::SYSTEM_TXN_ID, Some(error.to_string())),
+        };
         Self {
             db,
             txn_id,
+            allocation_error,
             read,
             staging: Vec::new(),
             external_states: Vec::new(),
@@ -140,6 +163,81 @@ impl<'db> Transaction<'db> {
         Ok(assigned)
     }
 
+    /// Stage a row in a hidden CTAS build table.
+    #[doc(hidden)]
+    pub fn put_building(
+        &mut self,
+        table: &str,
+        mut cells: Vec<(u16, Value)>,
+    ) -> Result<Option<i64>> {
+        self.db
+            .require_for(self.principal.as_ref(), &crate::auth::Permission::Ddl)?;
+        let id = self.db.building_table_id(table)?;
+        let handle = self.db.table_by_id(id)?;
+        let mut target = handle.lock();
+        let assigned = target.fill_auto_inc(&mut cells)?;
+        target.apply_defaults(&mut cells)?;
+        let primary_key_column = target
+            .schema()
+            .primary_key()
+            .map(|column| column.id)
+            .ok_or_else(|| MongrelError::Schema("CTAS build table has no primary key".into()))?;
+        let primary_key = cells
+            .iter()
+            .find(|(column, _)| *column == primary_key_column)
+            .map(|(_, value)| value)
+            .ok_or_else(|| MongrelError::InvalidArgument("CTAS primary key is missing".into()))?;
+        if matches!(primary_key, Value::Null) {
+            return Err(MongrelError::InvalidArgument(
+                "CTAS primary key cannot be NULL".into(),
+            ));
+        }
+        let primary_key = primary_key.encode_key();
+        let replacing = self
+            .staging
+            .iter()
+            .any(|(table_id, staged)| *table_id == id && matches!(staged, Staged::Truncate));
+        if !replacing && target.lookup_pk(&primary_key).is_some() {
+            return Err(MongrelError::InvalidArgument(
+                "duplicate CTAS primary key".into(),
+            ));
+        }
+        drop(target);
+        if self.staging.iter().any(|(staged_table, staged)| {
+            if *staged_table != id {
+                return false;
+            }
+            let Staged::Put(staged_cells) = staged else {
+                return false;
+            };
+            staged_cells
+                .iter()
+                .find(|(column, _)| *column == primary_key_column)
+                .is_some_and(|(_, value)| value.encode_key() == primary_key)
+        }) {
+            return Err(MongrelError::InvalidArgument(
+                "duplicate CTAS primary key".into(),
+            ));
+        }
+        self.staging.push((id, Staged::Put(cells)));
+        Ok(assigned)
+    }
+
+    /// Stage a truncate against an unpublished building table.
+    #[doc(hidden)]
+    pub fn truncate_building(&mut self, table: &str) -> Result<()> {
+        self.db
+            .require_for(self.principal.as_ref(), &crate::auth::Permission::Ddl)?;
+        let id = self.db.building_table_id(table)?;
+        if self.staging.iter().any(|(table_id, _)| *table_id == id) {
+            return Err(MongrelError::InvalidArgument(
+                "building-table truncate must be staged before replacement rows".into(),
+            ));
+        }
+        self.staging.push((id, Staged::Truncate));
+        Ok(())
+    }
+
     pub fn put_returning(
         &mut self,
         table: &str,
@@ -154,6 +252,30 @@ impl<'db> Transaction<'db> {
         drop(t);
         let row = owned_row_from_cells(&cells);
         self.staging.push((id, Staged::Put(cells)));
+        Ok(PutResult {
+            auto_inc: assigned,
+            row,
+        })
+    }
+
+    /// Stage a returning put only if `table` still names the exact catalog
+    /// resource checked by the caller.
+    #[doc(hidden)]
+    pub fn put_returning_bound(
+        &mut self,
+        table: &str,
+        expected_table_id: u64,
+        expected_schema_id: u64,
+        mut cells: Vec<(u16, Value)>,
+    ) -> Result<PutResult> {
+        self.require_columns(table, crate::auth::ColumnOperation::Insert, &cells)?;
+        let handle = self.bound_table(table, expected_table_id, expected_schema_id)?;
+        let mut target = handle.lock();
+        let assigned = target.fill_auto_inc(&mut cells)?;
+        target.apply_defaults(&mut cells)?;
+        drop(target);
+        let row = owned_row_from_cells(&cells);
+        self.staging.push((expected_table_id, Staged::Put(cells)));
         Ok(PutResult {
             auto_inc: assigned,
             row,
@@ -201,6 +323,50 @@ impl<'db> Transaction<'db> {
     /// Stage a delete of `row_id` on `table`.
     pub fn delete(&mut self, table: &str, row_id: RowId) -> Result<()> {
         self.delete_batch(table, vec![row_id])
+    }
+
+    /// Stage a delete only against the exact table generation checked by the
+    /// caller.
+    #[doc(hidden)]
+    pub fn delete_bound(
+        &mut self,
+        table: &str,
+        expected_table_id: u64,
+        expected_schema_id: u64,
+        row_id: RowId,
+    ) -> Result<()> {
+        self.require_delete(table)?;
+        self.bound_table(table, expected_table_id, expected_schema_id)?;
+        self.reject_after_truncate(expected_table_id)?;
+        self.staging
+            .push((expected_table_id, Staged::Delete(row_id)));
+        Ok(())
+    }
+
+    /// Resolve and delete a primary key only on the exact table generation
+    /// checked by the caller. Returns `false` when the key is absent.
+    #[doc(hidden)]
+    pub fn delete_by_pk_bound(
+        &mut self,
+        table: &str,
+        expected_table_id: u64,
+        expected_schema_id: u64,
+        key: &Value,
+    ) -> Result<bool> {
+        self.require_delete(table)?;
+        let handle = self.bound_table(table, expected_table_id, expected_schema_id)?;
+        self.reject_after_truncate(expected_table_id)?;
+        let row_id = {
+            let mut target = handle.lock();
+            target.ensure_indexes_complete()?;
+            target.lookup_pk(&key.encode_key())
+        };
+        let Some(row_id) = row_id else {
+            return Ok(false);
+        };
+        self.staging
+            .push((expected_table_id, Staged::Delete(row_id)));
+        Ok(true)
     }
 
     /// Stage deletes without materializing pre-images.
@@ -378,6 +544,69 @@ impl<'db> Transaction<'db> {
         }
     }
 
+    /// Stage an upsert only if `table` still names the exact catalog resource
+    /// checked by the caller.
+    #[doc(hidden)]
+    pub fn upsert_bound(
+        &mut self,
+        table: &str,
+        expected_table_id: u64,
+        expected_schema_id: u64,
+        mut insert_cells: Vec<(u16, Value)>,
+        action: UpsertAction,
+    ) -> Result<UpsertResult> {
+        self.require_columns(table, crate::auth::ColumnOperation::Insert, &insert_cells)?;
+        let handle = self.bound_table(table, expected_table_id, expected_schema_id)?;
+        self.reject_after_truncate(expected_table_id)?;
+        match (self.existing_pk_row_in(&handle, &insert_cells)?, action) {
+            (None, _) => {
+                let mut target = handle.lock();
+                let assigned = target.fill_auto_inc(&mut insert_cells)?;
+                target.apply_defaults(&mut insert_cells)?;
+                drop(target);
+                let row = owned_row_from_cells(&insert_cells);
+                self.staging
+                    .push((expected_table_id, Staged::Put(insert_cells)));
+                Ok(UpsertResult {
+                    action: UpsertActionKind::Inserted,
+                    row,
+                    auto_inc: assigned,
+                })
+            }
+            (Some((_old_id, old_row)), UpsertAction::DoNothing) => Ok(UpsertResult {
+                action: UpsertActionKind::Unchanged,
+                row: old_row,
+                auto_inc: None,
+            }),
+            (Some((old_id, old_row)), UpsertAction::DoUpdate(update_cells)) => {
+                self.require_columns(table, crate::auth::ColumnOperation::Update, &update_cells)?;
+                let changed_columns = changed_columns(&update_cells);
+                let merged = merge_cells(old_row.columns.clone(), update_cells);
+                if columns_equal(&old_row.columns, &merged) {
+                    return Ok(UpsertResult {
+                        action: UpsertActionKind::Unchanged,
+                        row: old_row,
+                        auto_inc: None,
+                    });
+                }
+                let row = owned_row_from_cells(&merged);
+                self.staging.push((
+                    expected_table_id,
+                    Staged::Update {
+                        row_id: old_id,
+                        new_row: merged,
+                        changed_columns,
+                    },
+                ));
+                Ok(UpsertResult {
+                    action: UpsertActionKind::Updated,
+                    row,
+                    auto_inc: None,
+                })
+            }
+        }
+    }
+
     pub fn truncate(&mut self, table: &str) -> Result<()> {
         self.db
             .require_for(self.principal.as_ref(), &crate::auth::Permission::Admin)?;
@@ -426,14 +655,37 @@ impl<'db> Transaction<'db> {
         )
     }
 
+    fn bound_table(
+        &self,
+        table: &str,
+        expected_table_id: u64,
+        expected_schema_id: u64,
+    ) -> Result<TableHandle> {
+        let current = self.db.table_identity(table)?;
+        if current != (expected_table_id, expected_schema_id) {
+            return Err(MongrelError::Conflict(format!(
+                "table {table:?} changed after request authorization"
+            )));
+        }
+        self.db.table_by_id(expected_table_id)
+    }
+
     fn existing_pk_row(
         &self,
         table: &str,
         cells: &[(u16, Value)],
     ) -> Result<Option<(RowId, OwnedRow)>> {
         let handle = self.db.table(table)?;
-        let t = handle.lock();
-        let Some(pk_col) = t.schema().primary_key() else {
+        self.existing_pk_row_in(&handle, cells)
+    }
+
+    fn existing_pk_row_in(
+        &self,
+        handle: &TableHandle,
+        cells: &[(u16, Value)],
+    ) -> Result<Option<(RowId, OwnedRow)>> {
+        let target = handle.lock();
+        let Some(pk_col) = target.schema().primary_key() else {
             return Ok(None);
         };
         let Some((_, pk_value)) = cells.iter().find(|(id, _)| *id == pk_col.id) else {
@@ -442,15 +694,19 @@ impl<'db> Transaction<'db> {
         if matches!(pk_value, Value::Null) {
             return Ok(None);
         }
-        let Some(row_id) = t.lookup_pk(&pk_value.encode_key()) else {
+        let Some(row_id) = target.lookup_pk(&pk_value.encode_key()) else {
             return Ok(None);
         };
-        Ok(t.get(row_id, self.read)
+        Ok(target
+            .get(row_id, self.read)
             .map(|row| (row_id, owned_row_from_map(row.columns))))
     }
 
     /// Commit: durably seal the staging under one epoch and publish it.
     pub fn commit(self) -> Result<Epoch> {
+        if let Some(message) = self.allocation_error {
+            return Err(MongrelError::Full(message));
+        }
         self.db
             .commit_transaction_with_external_states(
                 self.txn_id,
@@ -466,6 +722,9 @@ impl<'db> Transaction<'db> {
     }
 
     pub fn commit_with_row_ids(self) -> Result<(Epoch, Vec<RowId>)> {
+        if let Some(message) = self.allocation_error {
+            return Err(MongrelError::Full(message));
+        }
         self.db.commit_transaction_with_external_states(
             self.txn_id,
             self.read.epoch,
@@ -475,6 +734,61 @@ impl<'db> Transaction<'db> {
             self.principal,
             self.principal_catalog_bound,
             self.external_trigger_bridge,
+        )
+    }
+
+    /// Cooperatively prepare this transaction, then invoke `before_commit`
+    /// immediately before the first WAL append can occur. If cancellation or
+    /// the callback wins, no commit epoch or WAL record is produced.
+    pub fn commit_controlled<F>(
+        self,
+        control: &crate::ExecutionControl,
+        mut before_commit: F,
+    ) -> Result<Epoch>
+    where
+        F: FnMut() -> Result<()>,
+    {
+        if let Some(message) = self.allocation_error {
+            return Err(MongrelError::Full(message));
+        }
+        self.db
+            .commit_transaction_with_external_states_controlled(
+                self.txn_id,
+                self.read.epoch,
+                self.staging,
+                self.external_states,
+                self.materialized_view_updates,
+                self.principal,
+                self.principal_catalog_bound,
+                self.external_trigger_bridge,
+                control,
+                &mut before_commit,
+            )
+            .map(|(epoch, _)| epoch)
+    }
+
+    pub fn commit_controlled_with_row_ids<F>(
+        self,
+        control: &crate::ExecutionControl,
+        mut before_commit: F,
+    ) -> Result<(Epoch, Vec<RowId>)>
+    where
+        F: FnMut() -> Result<()>,
+    {
+        if let Some(message) = self.allocation_error {
+            return Err(MongrelError::Full(message));
+        }
+        self.db.commit_transaction_with_external_states_controlled(
+            self.txn_id,
+            self.read.epoch,
+            self.staging,
+            self.external_states,
+            self.materialized_view_updates,
+            self.principal,
+            self.principal_catalog_bound,
+            self.external_trigger_bridge,
+            control,
+            &mut before_commit,
         )
     }
 
@@ -869,6 +1183,19 @@ impl Drop for ActiveTxnGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_transaction_allocator_never_crosses_open_generation() {
+        let allocator = PlMutex::new((7_u64 << 32) | u32::MAX as u64);
+        assert_eq!(
+            allocate_txn_id(&allocator).unwrap(),
+            (7_u64 << 32) | u32::MAX as u64
+        );
+        assert!(matches!(
+            allocate_txn_id(&allocator),
+            Err(MongrelError::Full(_))
+        ));
+    }
 
     #[test]
     fn conflict_index_first_committer_wins_and_prunes_safely() {

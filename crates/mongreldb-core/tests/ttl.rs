@@ -133,7 +133,7 @@ fn ttl_ddl_replicates_incrementally() {
     assert!(!batch.requires_snapshot);
 
     let follower = Database::open(&follower_path).unwrap();
-    follower.append_replication_batch(&batch.records).unwrap();
+    follower.append_replication_batch(&batch).unwrap();
     drop(follower);
     let follower = Database::open(&follower_path).unwrap();
     let policy = follower.table("events").unwrap().lock().ttl().unwrap();

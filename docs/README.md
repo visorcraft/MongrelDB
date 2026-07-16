@@ -46,6 +46,9 @@ vector similarity, range queries, and more.
     and offline recovery
 16. **[Client Conformance](16-client-conformance.md)** - required behavior
     shared by Rust, TypeScript, Python, and CLI surfaces
+17. **[Point-in-Time Recovery](17-point-in-time-recovery.md)** - online PITR
+    archives, encrypted format v2, restore targets, validation, and legacy
+    archive policy
 
 ## Quick Reference
 

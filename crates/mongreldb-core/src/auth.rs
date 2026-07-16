@@ -151,6 +151,10 @@ impl std::fmt::Display for Permission {
 /// auth middleware into request extensions.
 #[derive(Debug, Clone)]
 pub struct Principal {
+    /// Immutable catalog identity. Username reuse must not revive a principal.
+    pub user_id: u64,
+    /// User generation paired with `user_id`.
+    pub created_epoch: u64,
     pub username: String,
     pub is_admin: bool,
     pub roles: Vec<String>,
@@ -321,6 +325,8 @@ mod tests {
     #[test]
     fn principal_admin_bypasses_checks() {
         let principal = Principal {
+            user_id: 0,
+            created_epoch: 0,
             username: "admin".into(),
             is_admin: true,
             roles: vec![],

@@ -65,6 +65,13 @@ static void expect_invalid(int32_t rc, const char *message) {
     assert(rc == MDB_ERR_INVALID_ARGUMENT);
     assert(mongreldb_last_error_code() == MDB_ERR_INVALID_ARGUMENT);
     assert(strcmp(mongreldb_last_error(), message) == 0);
+    mongreldb_error_details_v1 details = {0};
+    assert(mongreldb_last_error_details_v1(&details) == MDB_OK);
+    assert(details.struct_size == sizeof(details));
+    assert(details.version == 1);
+    assert(details.code == MDB_ERR_INVALID_ARGUMENT);
+    assert(details.outcome_known == 1);
+    assert(details.committed == 0);
 }
 
 static void test_invalid_discriminants(mongreldb_database_t *db) {
@@ -216,6 +223,8 @@ static void test_authenticated_native_reads(void) {
         "CREATE MASK hide_secret ON docs(secret) USING REDACT '***'",
         &sql_buf, &sql_len));
     mongreldb_free_sql_result(sql_buf, sql_len);
+    mongreldb_table_free(admin_table);
+    mongreldb_database_free(admin);
 
     mongreldb_database_t *alice =
         mongreldb_open_with_credentials(dir, "alice", "alice-pw");
@@ -297,12 +306,25 @@ static void test_authenticated_native_reads(void) {
     assert(put_secure_row(alice_table, 3, "bob", "forbidden", bob_embedding, NULL) ==
         MDB_ERR_UNAUTHORIZED);
     CHECK(put_secure_row(alice_table, 3, "alice", "allowed", alice_embedding, NULL));
+    mongreldb_table_free(alice_table);
+    mongreldb_database_free(alice);
 
+    admin = mongreldb_open_with_credentials(dir, "admin", "admin-pw");
+    assert(admin);
+    admin_table = mongreldb_database_table(admin, "docs");
+    assert(admin_table);
     result = ann_query(admin_table, bob_embedding);
     assert(result && mongreldb_result_count(result) == 2);
     mongreldb_result_free(result);
 
     CHECK(mongreldb_revoke_role(admin, "alice", "reader"));
+    mongreldb_table_free(admin_table);
+    mongreldb_database_free(admin);
+
+    alice = mongreldb_open_with_credentials(dir, "alice", "alice-pw");
+    assert(alice);
+    alice_table = mongreldb_database_table(alice, "docs");
+    assert(alice_table);
     result = ann_query(alice_table, bob_embedding);
     assert(result == NULL);
     assert(mongreldb_last_error_code() == MDB_ERR_UNAUTHORIZED);
@@ -311,8 +333,6 @@ static void test_authenticated_native_reads(void) {
 
     mongreldb_table_free(alice_table);
     mongreldb_database_free(alice);
-    mongreldb_table_free(admin_table);
-    mongreldb_database_free(admin);
 }
 
 int main(void) {
@@ -407,6 +427,7 @@ int main(void) {
 
     uint64_t epoch;
     CHECK(mongreldb_txn_commit(txn, &epoch));
+    mongreldb_txn_free(txn);
     printf("7. transaction committed 3 rows (epoch=%llu)\n", (unsigned long long)epoch);
 
     /* Verify count */

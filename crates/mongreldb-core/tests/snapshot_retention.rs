@@ -1,6 +1,7 @@
 //! P3.6 — retention-gated GC for dropped tables and pending runs.
 
-use mongreldb_core::{schema::*, Database, Value};
+use mongreldb_core::{schema::*, Database, ExecutionControl, MongrelError, Value};
+use std::cell::Cell;
 use std::sync::{Arc, Barrier};
 use tempfile::tempdir;
 
@@ -49,6 +50,93 @@ fn dropped_table_dir_is_reclaimed_by_gc() {
 
     // Table is gone.
     assert!(db.table("doomed").is_err());
+}
+
+#[test]
+fn controlled_gc_cancel_before_publish_preserves_candidates() {
+    let dir = tempdir().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.create_table("doomed", pk_schema()).unwrap();
+    let table_id = db.table_id("doomed").unwrap();
+    let table_dir = dir.path().join("tables").join(table_id.to_string());
+    db.drop_table("doomed").unwrap();
+
+    let called = Cell::new(false);
+    let control = ExecutionControl::new(None);
+    let error = db
+        .gc_controlled(&control, || {
+            called.set(true);
+            false
+        })
+        .unwrap_err();
+    assert!(matches!(error, MongrelError::Cancelled));
+    assert!(called.get());
+    assert!(table_dir.exists());
+
+    assert!(db.gc().unwrap() >= 1);
+    assert!(!table_dir.exists());
+}
+
+#[test]
+fn gc_receipt_is_scan_epoch_not_posthoc_visible_epoch() {
+    let dir = tempdir().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.create_table("live", pk_schema()).unwrap();
+    db.create_table("doomed", pk_schema()).unwrap();
+    db.drop_table("doomed").unwrap();
+    let scan_epoch = db.visible_epoch();
+
+    let (reclaimed, receipt) = db
+        .gc_controlled_with_receipt(&ExecutionControl::new(None), || {
+            db.transaction(|transaction| {
+                transaction.put("live", vec![(1, Value::Int64(7))])?;
+                Ok(())
+            })
+            .unwrap();
+            true
+        })
+        .unwrap();
+
+    assert!(reclaimed >= 1);
+    assert_eq!(receipt.unwrap().epoch, scan_epoch);
+    assert!(db.visible_epoch() > scan_epoch);
+}
+
+#[test]
+fn compaction_receipt_is_table_snapshot_not_posthoc_visible_epoch() {
+    let dir = tempdir().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.create_table("compact", pk_schema()).unwrap();
+    db.create_table("other", pk_schema()).unwrap();
+    db.table("compact")
+        .unwrap()
+        .lock()
+        .set_mutable_run_spill_bytes(1);
+    for value in [1, 2] {
+        db.transaction(|transaction| {
+            transaction.put("compact", vec![(1, Value::Int64(value))])?;
+            Ok(())
+        })
+        .unwrap();
+        db.table("compact").unwrap().lock().flush().unwrap();
+    }
+    let table_epoch = db.visible_epoch();
+    let handle = db.table("compact").unwrap();
+    let (changed, receipt) = handle
+        .lock()
+        .compact_controlled_with_receipt(&ExecutionControl::new(None), || {
+            db.transaction(|transaction| {
+                transaction.put("other", vec![(1, Value::Int64(9))])?;
+                Ok(())
+            })
+            .unwrap();
+            true
+        })
+        .unwrap();
+
+    assert!(changed);
+    assert_eq!(receipt.unwrap().epoch, table_epoch);
+    assert!(db.visible_epoch() > table_epoch);
 }
 
 #[test]

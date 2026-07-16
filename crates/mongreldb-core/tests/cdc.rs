@@ -154,6 +154,8 @@ fn spilled_transaction_cdc_includes_rows() {
         Ok(())
     })
     .unwrap();
+    db.drop_table("items").unwrap();
+    db.gc().unwrap();
 
     let batch = db.change_events_since(None).unwrap();
     assert!(!batch.gap);

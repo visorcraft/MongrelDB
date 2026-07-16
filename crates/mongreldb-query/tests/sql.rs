@@ -3,7 +3,7 @@
 use arrow::array::Array;
 use mongreldb_core::schema::{ColumnDef, ColumnFlags, Schema, TypeId};
 use mongreldb_core::{Table, Value};
-use mongreldb_query::MongrelSession;
+use mongreldb_query::{MongrelQueryError, MongrelSession};
 use tempfile::tempdir;
 
 fn schema() -> Schema {
@@ -1461,17 +1461,14 @@ async fn attach_database_enables_cross_db_query() {
 }
 
 #[tokio::test]
-async fn savepoint_syntax_is_accepted() {
+async fn savepoints_require_an_explicit_transaction() {
     let (_tmp, session) = setup().await;
-    // SAVEPOINT/RELEASE/ROLLBACK TO are session-level SQL staging operations.
-    // With a single-table session (no Database), they should be accepted as
-    // no-ops on an empty txn (no BEGIN). The point is that the syntax parses
-    // and doesn't error — the actual staging behavior is tested at the engine
-    // level via the SQL BEGIN/COMMIT path.
-    session.run("SAVEPOINT sp1").await.unwrap();
-    session.run("RELEASE sp1").await.unwrap();
-    session.run("SAVEPOINT sp2").await.unwrap();
-    session.run("ROLLBACK TO sp2").await.unwrap();
+    for sql in ["SAVEPOINT sp", "RELEASE sp", "ROLLBACK TO sp"] {
+        assert!(matches!(
+            session.run(sql).await,
+            Err(MongrelQueryError::NoSqlTransaction)
+        ));
+    }
 }
 
 #[tokio::test]

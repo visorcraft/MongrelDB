@@ -11,7 +11,7 @@ use crate::columnar;
 use crate::cursor::NativePageCursor;
 use crate::encryption::Kek;
 use crate::encryption::DEK_LEN;
-use crate::epoch::{Epoch, EpochAuthority, Snapshot};
+use crate::epoch::{Epoch, EpochAuthority, EpochGuard, MaintenanceReceipt, Snapshot};
 use crate::global_idx;
 use crate::index::{
     AnnIndex, BitmapIndex, ColumnLearnedRange, FmIndex, HotIndex, MinHashIndex, SparseIndex,
@@ -22,11 +22,12 @@ use crate::mutable_run::MutableRun;
 use crate::row_id_set::RowIdSet;
 use crate::rowid::{RowId, RowIdAllocator};
 use crate::schema::{AlterColumn, ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
-use crate::sorted_run::{RunReader, RunWriter};
+use crate::sorted_run::{RunReader, RunVisibleVersion, RunVisibleVersionCursor, RunWriter};
 use crate::txn::{GroupCommit, OwnedRow};
 use crate::wal::{Op, SharedWal, Wal};
 use crate::{MongrelError, Result};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -39,6 +40,279 @@ pub const META_DIR: &str = "_meta";
 pub const RCACHE_DIR: &str = "_rcache";
 pub const KEYS_FILENAME: &str = "keys";
 pub const SCHEMA_FILENAME: &str = "schema.json";
+
+fn derive_next_run_id(
+    dir: &Path,
+    runs_root: Option<&crate::durable_file::DurableRoot>,
+    active: &[RunRef],
+    retiring: &[crate::manifest::RetiredRun],
+) -> Result<u64> {
+    let mut maximum = 0_u64;
+    for run_id in active
+        .iter()
+        .map(|run| run.run_id)
+        .chain(retiring.iter().map(|run| run.run_id))
+    {
+        let run_id = u64::try_from(run_id)
+            .map_err(|_| MongrelError::Full("run-id namespace exhausted".into()))?;
+        maximum = maximum.max(run_id);
+    }
+    let names = match runs_root {
+        Some(root) => root.list_regular_files(".")?,
+        None => std::fs::read_dir(dir.join(RUNS_DIR))?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<std::io::Result<Vec<_>>>()?,
+    };
+    for name in names {
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(digits) = name
+            .strip_prefix("r-")
+            .and_then(|name| name.strip_suffix(".sr"))
+        else {
+            continue;
+        };
+        let Ok(run_id) = digits.parse::<u64>() else {
+            continue;
+        };
+        if name == format!("r-{run_id}.sr") {
+            maximum = maximum.max(run_id);
+        }
+    }
+    maximum
+        .checked_add(1)
+        .map(|next| next.max(1))
+        .ok_or_else(|| MongrelError::Full("run-id namespace exhausted".into()))
+}
+
+enum ControlledVisibleCandidate {
+    Memory(Row),
+    Run(RunVisibleVersion),
+}
+
+impl ControlledVisibleCandidate {
+    fn row_id(&self) -> RowId {
+        match self {
+            Self::Memory(row) => row.row_id,
+            Self::Run(version) => version.row_id,
+        }
+    }
+
+    fn committed_epoch(&self) -> Epoch {
+        match self {
+            Self::Memory(row) => row.committed_epoch,
+            Self::Run(version) => version.committed_epoch,
+        }
+    }
+
+    fn deleted(&self) -> bool {
+        match self {
+            Self::Memory(row) => row.deleted,
+            Self::Run(version) => version.deleted,
+        }
+    }
+}
+
+enum ControlledVisibleCursor {
+    Memory(std::vec::IntoIter<Row>),
+    Run(Box<RunVisibleVersionCursor>),
+    #[cfg(test)]
+    Synthetic {
+        next: u64,
+        end: u64,
+    },
+}
+
+struct ControlledVisibleSource {
+    cursor: ControlledVisibleCursor,
+    current: Option<ControlledVisibleCandidate>,
+}
+
+impl ControlledVisibleSource {
+    fn memory(rows: Vec<Row>) -> Self {
+        Self {
+            cursor: ControlledVisibleCursor::Memory(rows.into_iter()),
+            current: None,
+        }
+    }
+
+    fn run(cursor: RunVisibleVersionCursor) -> Self {
+        Self {
+            cursor: ControlledVisibleCursor::Run(Box::new(cursor)),
+            current: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn synthetic(end: u64) -> Self {
+        Self {
+            cursor: ControlledVisibleCursor::Synthetic { next: 1, end },
+            current: None,
+        }
+    }
+
+    fn advance(&mut self, control: &crate::ExecutionControl) -> Result<()> {
+        self.current = match &mut self.cursor {
+            ControlledVisibleCursor::Memory(rows) => {
+                rows.next().map(ControlledVisibleCandidate::Memory)
+            }
+            ControlledVisibleCursor::Run(cursor) => cursor
+                .next_visible_version(control)?
+                .map(ControlledVisibleCandidate::Run),
+            #[cfg(test)]
+            ControlledVisibleCursor::Synthetic { next, end } => {
+                if *next > *end {
+                    None
+                } else {
+                    let row = Row::new(RowId(*next), Epoch(1));
+                    *next += 1;
+                    Some(ControlledVisibleCandidate::Memory(row))
+                }
+            }
+        };
+        Ok(())
+    }
+
+    fn pop(&mut self, control: &crate::ExecutionControl) -> Result<ControlledVisibleCandidate> {
+        let current = self.current.take().ok_or_else(|| {
+            MongrelError::Other("controlled visible source was not primed".into())
+        })?;
+        self.advance(control)?;
+        Ok(current)
+    }
+
+    fn materialize(
+        &mut self,
+        candidate: ControlledVisibleCandidate,
+        control: &crate::ExecutionControl,
+    ) -> Result<Row> {
+        match candidate {
+            ControlledVisibleCandidate::Memory(row) => Ok(row),
+            ControlledVisibleCandidate::Run(version) => match &mut self.cursor {
+                ControlledVisibleCursor::Run(cursor) => cursor.materialize(version, control),
+                _ => Err(MongrelError::Other(
+                    "run candidate escaped its controlled cursor".into(),
+                )),
+            },
+        }
+    }
+}
+
+fn merge_controlled_visible_sources(
+    sources: &mut [ControlledVisibleSource],
+    control: &crate::ExecutionControl,
+    mut expired: impl FnMut(&Row) -> bool,
+    mut visit: impl FnMut(Row) -> Result<()>,
+) -> Result<()> {
+    let mut heap = BinaryHeap::new();
+    for (source_index, source) in sources.iter_mut().enumerate() {
+        source.advance(control)?;
+        if let Some(candidate) = &source.current {
+            heap.push(Reverse((candidate.row_id(), source_index)));
+        }
+    }
+    let mut merged = 0_usize;
+    while let Some(Reverse((row_id, source_index))) = heap.pop() {
+        if merged % 256 == 0 {
+            control.checkpoint()?;
+        }
+        merged += 1;
+        let mut best_source = source_index;
+        let mut best = sources[source_index].pop(control)?;
+        if let Some(next) = &sources[source_index].current {
+            heap.push(Reverse((next.row_id(), source_index)));
+        }
+        while heap
+            .peek()
+            .is_some_and(|Reverse((candidate, _))| *candidate == row_id)
+        {
+            let Some(Reverse((_, source_index))) = heap.pop() else {
+                break;
+            };
+            let candidate = sources[source_index].pop(control)?;
+            if candidate.committed_epoch() > best.committed_epoch() {
+                best = candidate;
+                best_source = source_index;
+            }
+            if let Some(next) = &sources[source_index].current {
+                heap.push(Reverse((next.row_id(), source_index)));
+            }
+        }
+        if best.deleted() {
+            continue;
+        }
+        let row = sources[best_source].materialize(best, control)?;
+        if !expired(&row) {
+            visit(row)?;
+        }
+    }
+    control.checkpoint()
+}
+
+#[cfg(test)]
+mod controlled_visible_cursor_tests {
+    use super::*;
+
+    #[test]
+    fn streams_more_than_one_million_rows_without_a_source_cap() {
+        let control = crate::ExecutionControl::new(None);
+        let mut sources = vec![ControlledVisibleSource::synthetic(1_000_001)];
+        let mut count = 0_u64;
+        let mut last = 0_u64;
+        merge_controlled_visible_sources(
+            &mut sources,
+            &control,
+            |_| false,
+            |row| {
+                count += 1;
+                assert!(row.row_id.0 > last);
+                last = row.row_id.0;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(count, 1_000_001);
+        assert_eq!(last, 1_000_001);
+    }
+
+    #[test]
+    fn merge_orders_rows_and_honors_newest_tombstones() {
+        let control = crate::ExecutionControl::new(None);
+        let older = vec![
+            Row::new(RowId(1), Epoch(1)),
+            Row::new(RowId(2), Epoch(1)).with_column(1, Value::Int64(20)),
+            Row::new(RowId(4), Epoch(1)),
+        ];
+        let mut deleted = Row::new(RowId(1), Epoch(2));
+        deleted.deleted = true;
+        let newer = vec![
+            deleted,
+            Row::new(RowId(2), Epoch(2)).with_column(1, Value::Int64(22)),
+            Row::new(RowId(3), Epoch(2)),
+        ];
+        let mut sources = vec![
+            ControlledVisibleSource::memory(older),
+            ControlledVisibleSource::memory(newer),
+        ];
+        let mut rows = Vec::new();
+        merge_controlled_visible_sources(
+            &mut sources,
+            &control,
+            |_| false,
+            |row| {
+                rows.push(row);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.row_id.0).collect::<Vec<_>>(),
+            vec![2, 3, 4]
+        );
+        assert_eq!(rows[0].columns.get(&1), Some(&Value::Int64(22)));
+    }
+}
 
 /// Current UTC time as an ISO-8601 string in bytes (e.g. `b"2024-07-07T14:30:00Z"`).
 /// Used by `DefaultExpr::Now` at stage time.
@@ -132,6 +406,12 @@ struct AutoIncState {
     column_id: u16,
     next: i64,
     seeded: bool,
+}
+
+pub(crate) struct RecoveryMetadataPlan {
+    live_count: u64,
+    auto_inc: Option<AutoIncState>,
+    changed: bool,
 }
 
 type FilledAutoIncRow = (Vec<(u16, Value)>, Option<i64>);
@@ -276,6 +556,9 @@ impl ReversePkMap {
 #[derive(Clone)]
 pub struct Table {
     dir: PathBuf,
+    _root_guard: Option<Arc<crate::durable_file::DurableRoot>>,
+    runs_root: Option<Arc<crate::durable_file::DurableRoot>>,
+    idx_root: Option<Arc<crate::durable_file::DurableRoot>>,
     table_id: u64,
     /// The table's catalog name, set at mount time. Used by the auth
     /// enforcement layer to check `Select`/`Insert`/`Update`/`Delete`
@@ -289,6 +572,10 @@ pub struct Table {
     /// Logical writes are forbidden when this table belongs to a replication
     /// follower. Replication itself appends through the database WAL API.
     read_only: bool,
+    /// A WAL commit reached durable storage but its live publication failed.
+    /// Reads may continue for diagnostics, but writes require a clean reopen so
+    /// recovery can rebuild one coherent runtime state from the durable WAL.
+    durable_commit_failed: bool,
     wal: WalSink,
     memtable: Memtable,
     /// PMA-backed mutable-run LSM tier (Phase 11.1). A flush drains the
@@ -303,9 +590,6 @@ pub struct Table {
     compaction_zstd_level: i32,
     allocator: RowIdAllocator,
     epoch: Arc<EpochAuthority>,
-    /// Manifest-endorsed epoch at open; used to seed the (shared) epoch
-    /// authority on a fresh open. Updated whenever the manifest is persisted.
-    persisted_epoch: u64,
     /// Table-local content generation used by authorization caches. Unlike the
     /// shared MVCC epoch, unrelated table commits do not change this value.
     data_generation: u64,
@@ -329,6 +613,10 @@ pub struct Table {
     /// The Database transaction layer (P2.5) assigns these globally; the
     /// single-table path uses this local counter.
     current_txn_id: u64,
+    /// True after a standalone table appends a private-WAL mutation and until
+    /// `commit_private` has durably sealed and published that transaction.
+    /// Mounted tables use `pending_rows` / `pending_dels` instead.
+    pending_private_mutations: bool,
     bitmap: HashMap<u16, BitmapIndex>,
     ann: HashMap<u16, AnnIndex>,
     fm: HashMap<u16, FmIndex>,
@@ -651,7 +939,7 @@ impl ResultCache {
         use crate::encryption::Cipher;
         let cipher = crate::encryption::AesCipher::new(&dek[..]).ok()?;
         let mut nonce = [0u8; 12];
-        crate::encryption::fill_random(&mut nonce);
+        crate::encryption::fill_random(&mut nonce).ok()?;
         let ct = cipher.encrypt_page(&nonce, plaintext).ok()?;
         let mut out = Vec::with_capacity(12 + ct.len());
         out.extend_from_slice(&nonce);
@@ -920,6 +1208,27 @@ fn derive_subkeys(kek: Option<&Kek>, _table_id: u64) -> (DekaOpt, DekaOpt) {
     (None, None)
 }
 
+#[cfg(feature = "encryption")]
+fn read_table_encryption_salt_root(
+    root: &crate::durable_file::DurableRoot,
+) -> Result<[u8; crate::encryption::SALT_LEN]> {
+    use std::io::Read;
+
+    let mut file = root
+        .open_regular(Path::new(META_DIR).join(KEYS_FILENAME))
+        .map_err(|error| MongrelError::NotFound(format!("encryption salt file: {error}")))?;
+    let length = file.metadata()?.len();
+    if length != crate::encryption::SALT_LEN as u64 {
+        return Err(MongrelError::InvalidArgument(format!(
+            "salt file is {length} bytes, expected {}",
+            crate::encryption::SALT_LEN
+        )));
+    }
+    let mut salt = [0_u8; crate::encryption::SALT_LEN];
+    file.read_exact(&mut salt)?;
+    Ok(salt)
+}
+
 /// Create a boxed cipher from a DEK (encryption feature only).
 #[cfg(feature = "encryption")]
 fn make_cipher(dek: &Zeroizing<[u8; DEK_LEN]>) -> Box<dyn crate::encryption::Cipher> {
@@ -969,6 +1278,7 @@ fn build_column_keys(kek: Option<&Kek>, schema: &Schema) -> HashMap<u16, ([u8; 3
 /// one snapshot-retention registry, and the DB-wide KEK. A directly-opened
 /// single table builds a private `SharedCtx` of its own.
 pub(crate) struct SharedCtx {
+    pub root_guard: Option<Arc<crate::durable_file::DurableRoot>>,
     pub epoch: Arc<EpochAuthority>,
     pub page_cache: Arc<crate::cache::Sharded<crate::cache::PageCache>>,
     pub decoded_cache: Arc<crate::cache::Sharded<crate::cache::DecodedPageCache>>,
@@ -1054,6 +1364,7 @@ impl SharedCtx {
             || crate::cache::DecodedPageCache::new(decoded_per_shard),
         ));
         Self {
+            root_guard: None,
             epoch: Arc::new(EpochAuthority::new(0)),
             page_cache,
             decoded_cache,
@@ -1096,8 +1407,12 @@ fn condition_cost_rank(c: &crate::query::Condition) -> u8 {
 impl Table {
     pub fn create(dir: impl AsRef<Path>, schema: Schema, table_id: u64) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
-        let ctx = SharedCtx::new(None, Some(dir.join(CACHE_DIR)));
-        Self::create_in(&dir, schema, table_id, ctx)
+        crate::durable_file::create_directory_all(&dir)?;
+        let root = Arc::new(crate::durable_file::DurableRoot::open(&dir)?);
+        let pinned = root.io_path()?;
+        let mut ctx = SharedCtx::new(None, Some(pinned.join(CACHE_DIR)));
+        ctx.root_guard = Some(root);
+        Self::create_in(&pinned, schema, table_id, ctx)
     }
 
     /// Create a new encrypted table, deriving the table Key-Encryption Key
@@ -1117,13 +1432,17 @@ impl Table {
         table_id: u64,
         passphrase: &str,
     ) -> Result<Self> {
-        let dir = dir.as_ref();
-        std::fs::create_dir_all(dir.join(META_DIR))?;
-        let salt = crate::encryption::random_salt();
-        std::fs::write(dir.join(META_DIR).join(KEYS_FILENAME), salt)?;
+        let dir = dir.as_ref().to_path_buf();
+        crate::durable_file::create_directory_all(&dir)?;
+        let root = Arc::new(crate::durable_file::DurableRoot::open(&dir)?);
+        root.create_directory_all(META_DIR)?;
+        let salt = crate::encryption::random_salt()?;
+        root.write_atomic(Path::new(META_DIR).join(KEYS_FILENAME), &salt)?;
         let kek: Arc<Kek> = Arc::new(Kek::derive(passphrase, &salt)?);
-        let ctx = SharedCtx::new(Some(kek), Some(dir.to_path_buf().join(CACHE_DIR)));
-        Self::create_in(dir, schema, table_id, ctx)
+        let pinned = root.io_path()?;
+        let mut ctx = SharedCtx::new(Some(kek), Some(pinned.join(CACHE_DIR)));
+        ctx.root_guard = Some(root);
+        Self::create_in(&pinned, schema, table_id, ctx)
     }
 
     /// Create a new encrypted table using a raw key (e.g. from a key file)
@@ -1137,38 +1456,29 @@ impl Table {
         table_id: u64,
         key: &[u8],
     ) -> Result<Self> {
-        let dir = dir.as_ref();
-        std::fs::create_dir_all(dir.join(META_DIR))?;
-        let salt = crate::encryption::random_salt();
-        std::fs::write(dir.join(META_DIR).join(KEYS_FILENAME), salt)?;
+        let dir = dir.as_ref().to_path_buf();
+        crate::durable_file::create_directory_all(&dir)?;
+        let root = Arc::new(crate::durable_file::DurableRoot::open(&dir)?);
+        root.create_directory_all(META_DIR)?;
+        let salt = crate::encryption::random_salt()?;
+        root.write_atomic(Path::new(META_DIR).join(KEYS_FILENAME), &salt)?;
         let kek: Arc<Kek> = Arc::new(Kek::from_raw_key(key, &salt)?);
-        let ctx = SharedCtx::new(Some(kek), Some(dir.to_path_buf().join(CACHE_DIR)));
-        Self::create_in(dir, schema, table_id, ctx)
+        let pinned = root.io_path()?;
+        let mut ctx = SharedCtx::new(Some(kek), Some(pinned.join(CACHE_DIR)));
+        ctx.root_guard = Some(root);
+        Self::create_in(&pinned, schema, table_id, ctx)
     }
 
     /// Open an existing encrypted table using a raw key.
     #[cfg(feature = "encryption")]
     pub fn open_with_key(dir: impl AsRef<Path>, key: &[u8]) -> Result<Self> {
-        let dir = dir.as_ref();
-        let salt_path = dir.join(META_DIR).join(KEYS_FILENAME);
-        let salt_bytes = std::fs::read(&salt_path).map_err(|e| {
-            MongrelError::NotFound(format!(
-                "encryption salt file {:?}: {e} (table not encrypted, or corrupted)",
-                salt_path
-            ))
-        })?;
-        if salt_bytes.len() != crate::encryption::SALT_LEN {
-            return Err(MongrelError::InvalidArgument(format!(
-                "salt file is {} bytes, expected {}",
-                salt_bytes.len(),
-                crate::encryption::SALT_LEN
-            )));
-        }
-        let mut salt = [0u8; crate::encryption::SALT_LEN];
-        salt.copy_from_slice(&salt_bytes);
+        let root = Arc::new(crate::durable_file::DurableRoot::open(dir.as_ref())?);
+        let salt = read_table_encryption_salt_root(&root)?;
         let kek = Arc::new(Kek::from_raw_key(key, &salt)?);
-        let ctx = SharedCtx::new(Some(kek), Some(dir.to_path_buf().join(CACHE_DIR)));
-        Self::open_in(dir, ctx)
+        let pinned = root.io_path()?;
+        let mut ctx = SharedCtx::new(Some(kek), Some(pinned.join(CACHE_DIR)));
+        ctx.root_guard = Some(root);
+        Self::open_in(&pinned, ctx)
     }
 
     pub(crate) fn create_in(
@@ -1184,24 +1494,44 @@ impl Table {
             index.validate_options()?;
         }
         let dir = dir.as_ref().to_path_buf();
-        std::fs::create_dir_all(dir.join(RUNS_DIR))?;
-        write_schema(&dir, &schema)?;
+        let runs_root = match ctx.root_guard.as_ref() {
+            Some(root) => Some(Arc::new(root.create_directory_all_pinned(RUNS_DIR)?)),
+            None => {
+                crate::durable_file::create_directory_all(&dir)?;
+                crate::durable_file::create_directory_all(&dir.join(RUNS_DIR))?;
+                None
+            }
+        };
+        match ctx.root_guard.as_deref() {
+            Some(root) => write_schema_durable(root, &schema)?,
+            None => write_schema(&dir, &schema)?,
+        }
         let (wal_dek, cache_dek) = derive_subkeys(ctx.kek.as_deref(), table_id);
         // B1: a mounted table routes writes through the shared WAL and never
         // creates its own `_wal/` dir. A standalone table owns a private WAL.
         let (wal, current_txn_id) = match ctx.shared.clone() {
             Some(s) => (WalSink::Shared(s), 0),
             None => {
-                std::fs::create_dir_all(dir.join(WAL_DIR))?;
+                let pinned_wal_root = match ctx.root_guard.as_deref() {
+                    Some(root) => Some(root.create_directory_all_pinned(WAL_DIR)?),
+                    None => None,
+                };
+                let wal_dir = if let Some(root) = pinned_wal_root.as_ref() {
+                    root.io_path()?
+                } else {
+                    let wal_dir = dir.join(WAL_DIR);
+                    crate::durable_file::create_directory_all(&wal_dir)?;
+                    wal_dir
+                };
                 let mut w = if let Some(ref dk) = wal_dek {
                     Wal::create_with_cipher(
-                        dir.join(WAL_DIR).join("seg-000000.wal"),
+                        wal_dir.join("seg-000000.wal"),
                         Epoch(0),
                         Some(make_cipher(dk)),
                         0,
                     )?
                 } else {
-                    Wal::create(dir.join(WAL_DIR).join("seg-000000.wal"), Epoch(0))?
+                    Wal::create(wal_dir.join("seg-000000.wal"), Epoch(0))?
                 };
                 w.set_sync_byte_threshold(DEFAULT_SYNC_BYTE_THRESHOLD);
                 (WalSink::Private(w), 1)
@@ -1213,17 +1543,24 @@ impl Table {
         // reopen's encrypted manifest read fails to authenticate a plaintext
         // blob — see `manifest_meta_dek`).
         let manifest_meta_dek = crate::encryption::meta_dek_for(ctx.kek.as_deref());
-        manifest::write_atomic(&dir, &mut manifest, manifest_meta_dek.as_ref())?;
+        match ctx.root_guard.as_deref() {
+            Some(root) => manifest::write_durable(root, &mut manifest, manifest_meta_dek.as_ref())?,
+            None => manifest::write_atomic(&dir, &mut manifest, manifest_meta_dek.as_ref())?,
+        }
         let (bitmap, ann, fm, sparse, minhash) = empty_indexes(&schema);
         let column_keys = build_column_keys(ctx.kek.as_deref(), &schema);
         let auto_inc = resolve_auto_inc(&schema);
         let rcache_dir = dir.join(RCACHE_DIR);
         Ok(Self {
             dir,
+            _root_guard: ctx.root_guard,
+            runs_root,
+            idx_root: None,
             table_id,
             name: ctx.table_name.unwrap_or_default(),
             auth: ctx.auth,
             read_only: ctx.read_only,
+            durable_commit_failed: false,
             wal,
             memtable: Memtable::new(),
             mutable_run: MutableRun::new(),
@@ -1231,7 +1568,6 @@ impl Table {
             compaction_zstd_level: 3,
             allocator: RowIdAllocator::new(0),
             epoch: ctx.epoch,
-            persisted_epoch: 0,
             data_generation: 0,
             schema,
             hot: HotIndex::new(),
@@ -1242,6 +1578,7 @@ impl Table {
             next_run_id: 1,
             sync_byte_threshold: DEFAULT_SYNC_BYTE_THRESHOLD,
             current_txn_id,
+            pending_private_mutations: false,
             bitmap,
             ann,
             fm,
@@ -1286,80 +1623,135 @@ impl Table {
     /// into the memtable, and rebuild the HOT + secondary indexes from the runs
     /// and replayed rows.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
-        let dir = dir.as_ref();
-        let ctx = SharedCtx::new(None, Some(dir.to_path_buf().join(CACHE_DIR)));
-        Self::open_in(dir, ctx)
+        let root = Arc::new(crate::durable_file::DurableRoot::open(dir.as_ref())?);
+        let pinned = root.io_path()?;
+        let mut ctx = SharedCtx::new(None, Some(pinned.join(CACHE_DIR)));
+        ctx.root_guard = Some(root);
+        Self::open_in(&pinned, ctx)
     }
 
     /// Open an existing encrypted table. `passphrase` must match the one used at
     /// create time (combined with the persisted salt to re-derive the KEK).
     #[cfg(feature = "encryption")]
     pub fn open_encrypted(dir: impl AsRef<Path>, passphrase: &str) -> Result<Self> {
-        let dir = dir.as_ref();
-        let salt_path = dir.join(META_DIR).join(KEYS_FILENAME);
-        let salt_bytes = std::fs::read(&salt_path).map_err(|e| {
-            MongrelError::NotFound(format!(
-                "encryption salt file {:?}: {e} (table not encrypted, or corrupted)",
-                salt_path
-            ))
-        })?;
-        let salt_len = crate::encryption::SALT_LEN;
-        if salt_bytes.len() != salt_len {
-            return Err(MongrelError::InvalidArgument(format!(
-                "encryption salt is {} bytes, expected {salt_len}",
-                salt_bytes.len()
-            )));
-        }
-        let mut salt = [0u8; 16];
-        salt.copy_from_slice(&salt_bytes);
+        let root = Arc::new(crate::durable_file::DurableRoot::open(dir.as_ref())?);
+        let salt = read_table_encryption_salt_root(&root)?;
         let kek: Arc<Kek> = Arc::new(Kek::derive(passphrase, &salt)?);
-        let ctx = SharedCtx::new(Some(kek), Some(dir.to_path_buf().join(CACHE_DIR)));
-        let t = Self::open_in(dir, ctx)?;
+        let pinned = root.io_path()?;
+        let mut ctx = SharedCtx::new(Some(kek), Some(pinned.join(CACHE_DIR)));
+        ctx.root_guard = Some(root);
+        let t = Self::open_in(&pinned, ctx)?;
         Ok(t)
     }
 
     pub(crate) fn open_in(dir: impl AsRef<Path>, ctx: SharedCtx) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         let manifest_meta_dek = crate::encryption::meta_dek_for(ctx.kek.as_deref());
-        let manifest = manifest::read(&dir, manifest_meta_dek.as_ref())?;
-        let schema: Schema = read_schema(&dir)?;
+        let mut manifest = match ctx.root_guard.as_ref() {
+            Some(root) => manifest::read_durable(root, "", manifest_meta_dek.as_ref())?,
+            None => manifest::read(&dir, manifest_meta_dek.as_ref())?,
+        };
+        let schema: Schema = match ctx.root_guard.as_ref() {
+            Some(root) => read_schema_file(root.open_regular(SCHEMA_FILENAME)?)?,
+            None => read_schema(&dir)?,
+        };
+        // A standalone schema change publishes the schema before its matching
+        // manifest. If the process dies in that narrow window, the newer,
+        // fully validated schema is authoritative and the manifest identity is
+        // repaired only after the rest of open has passed preflight. A manifest
+        // claiming a schema newer than the durable schema remains corruption.
+        let schema_manifest_repair = manifest.schema_id < schema.schema_id;
+        let runs_root = match ctx.root_guard.as_ref() {
+            Some(root) => Some(Arc::new(root.open_directory(RUNS_DIR)?)),
+            None => None,
+        };
+        let idx_root = match ctx.root_guard.as_ref() {
+            Some(root) => match root.open_directory(global_idx::IDX_DIR) {
+                Ok(root) => Some(Arc::new(root)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            },
+            None => None,
+        };
+        schema.validate_auto_increment()?;
+        schema.validate_defaults()?;
         schema.validate_ai()?;
         for index in &schema.indexes {
             index.validate_options()?;
         }
         let replay_epoch = Epoch(manifest.current_epoch);
         let (wal_dek, cache_dek) = derive_subkeys(ctx.kek.as_deref(), manifest.table_id);
+        let private_replayed = if ctx.shared.is_none() {
+            match latest_wal_segment(&dir.join(WAL_DIR))? {
+                Some(path) => {
+                    let cipher = wal_dek.as_ref().map(|dk| make_cipher(dk));
+                    crate::wal::replay_with_cipher(path, cipher)?
+                }
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        if ctx.shared.is_none() {
+            preflight_standalone_open(
+                &dir,
+                runs_root.as_deref(),
+                idx_root.as_deref(),
+                &manifest,
+                &schema,
+                &private_replayed,
+                ctx.kek.clone(),
+            )?;
+        }
+        let next_run_id = derive_next_run_id(
+            &dir,
+            runs_root.as_deref(),
+            &manifest.runs,
+            &manifest.retiring,
+        )?;
         // B1: a mounted table has no private WAL — its committed records live in
         // the shared WAL and are replayed by `Database::recover_shared_wal`. A
         // standalone table replays + reopens its own `_wal/` segment here.
         let (wal, replayed, current_txn_id) = match ctx.shared.clone() {
             Some(s) => (WalSink::Shared(s), Vec::new(), 0),
             None => {
-                let active = latest_wal_segment(&dir.join(WAL_DIR))?;
-                // Replay BEFORE truncating: `Wal::create` would erase the segment.
-                let replayed = match &active {
-                    Some(path) => {
-                        let cipher = wal_dek.as_ref().map(|dk| make_cipher(dk));
-                        crate::wal::replay_with_cipher(path, cipher)?
-                    }
-                    None => Vec::new(),
-                };
-                let mut w = match &active {
-                    Some(path) => Wal::create_with_cipher(
-                        path,
-                        replay_epoch,
-                        wal_dek.as_ref().map(|dk| make_cipher(dk)),
-                        0,
-                    )?,
-                    None => Wal::create_with_cipher(
-                        dir.join(WAL_DIR).join("seg-000000.wal"),
-                        replay_epoch,
-                        wal_dek.as_ref().map(|dk| make_cipher(dk)),
-                        0,
-                    )?,
-                };
+                let replayed = private_replayed;
+                // Never truncate the only durable recovery source. Re-encode
+                // every valid frame into a synced staging segment, then publish
+                // it atomically under the next segment number. A crash before
+                // publication leaves the old segment authoritative; a crash
+                // afterward finds the complete replacement as the latest WAL.
+                let wal_dir = dir.join(WAL_DIR);
+                crate::durable_file::create_directory_all(&wal_dir)?;
+                let segment = next_wal_segment(&wal_dir)?;
+                let segment_no = wal_segment_number(&segment).unwrap_or(0);
+                let temporary = wal_dir.join(format!(
+                    ".recovery-{}-{}-{segment_no:06}.tmp",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos()
+                ));
+                let mut w = Wal::create_with_cipher(
+                    &temporary,
+                    replay_epoch,
+                    wal_dek.as_ref().map(|dk| make_cipher(dk)),
+                    segment_no,
+                )?;
+                for record in &replayed {
+                    w.append_txn(record.txn_id, record.op.clone())?;
+                }
+                let mut w = w.publish_as(segment)?;
                 w.set_sync_byte_threshold(DEFAULT_SYNC_BYTE_THRESHOLD);
-                (WalSink::Private(w), replayed, 1)
+                let next_txn_id = replayed
+                    .iter()
+                    .map(|record| record.txn_id)
+                    .filter(|txn_id| *txn_id != crate::wal::SYSTEM_TXN_ID)
+                    .max()
+                    .map(|txn_id| txn_id.checked_add(1).unwrap_or(0))
+                    .unwrap_or(1);
+                (WalSink::Private(w), replayed, next_txn_id)
             }
         };
 
@@ -1386,9 +1778,12 @@ impl Table {
         //    overwrite the older run versions in the HOT index.
         let mut staged_puts: HashMap<u64, Vec<Row>> = HashMap::new();
         let mut staged_deletes: HashMap<u64, Vec<RowId>> = HashMap::new();
+        let mut staged_truncates: std::collections::HashSet<u64> = std::collections::HashSet::new();
         let mut replayed_puts: std::collections::BTreeMap<Epoch, Vec<Row>> =
             std::collections::BTreeMap::new();
         let mut replayed_deletes: Vec<(RowId, Epoch)> = Vec::new();
+        let mut recovered_epoch = manifest.current_epoch;
+        let mut recovered_manifest_dirty = schema_manifest_repair;
         let mut saw_delete = false;
         for record in replayed {
             let txn_id = record.txn_id;
@@ -1396,11 +1791,14 @@ impl Table {
                 Op::Put { rows, .. } => {
                     let rows: Vec<Row> = bincode::deserialize(&rows)?;
                     for row in &rows {
-                        allocator.advance_to(row.row_id);
+                        allocator.advance_to(row.row_id)?;
                         if let Some(ai) = auto_inc.as_mut() {
                             if let Some(Value::Int64(n)) = row.columns.get(&ai.column_id) {
-                                if *n + 1 > ai.next {
-                                    ai.next = *n + 1;
+                                let next = n.checked_add(1).ok_or_else(|| {
+                                    MongrelError::Full("AUTO_INCREMENT namespace exhausted".into())
+                                })?;
+                                if next > ai.next {
+                                    ai.next = next;
                                 }
                             }
                         }
@@ -1412,6 +1810,19 @@ impl Table {
                 }
                 Op::TxnCommit { epoch, .. } => {
                     let commit_epoch = Epoch(epoch);
+                    recovered_epoch = recovered_epoch.max(epoch);
+                    if staged_truncates.remove(&txn_id) && commit_epoch.0 > manifest.flushed_epoch {
+                        memtable = Memtable::new();
+                        replayed_puts.clear();
+                        replayed_deletes.clear();
+                        manifest.runs.clear();
+                        manifest.retiring.clear();
+                        manifest.live_count = 0;
+                        manifest.global_idx_epoch = 0;
+                        manifest.current_epoch = manifest.current_epoch.max(epoch);
+                        recovered_manifest_dirty = true;
+                        saw_delete = true;
+                    }
                     if let Some(puts) = staged_puts.remove(&txn_id) {
                         if commit_epoch.0 > manifest.flushed_epoch {
                             for row in &puts {
@@ -1433,13 +1844,19 @@ impl Table {
                 Op::TxnAbort => {
                     staged_puts.remove(&txn_id);
                     staged_deletes.remove(&txn_id);
+                    staged_truncates.remove(&txn_id);
                 }
-                Op::TruncateTable { .. }
-                | Op::ExternalTableState { .. }
+                Op::TruncateTable { .. } => {
+                    staged_puts.remove(&txn_id);
+                    staged_deletes.remove(&txn_id);
+                    staged_truncates.insert(txn_id);
+                }
+                Op::ExternalTableState { .. }
                 | Op::Flush { .. }
                 | Op::Ddl(_)
                 | Op::BeforeImage { .. }
-                | Op::CommitTimestamp { .. } => {}
+                | Op::CommitTimestamp { .. }
+                | Op::SpilledRows { .. } => {}
             }
         }
 
@@ -1447,10 +1864,14 @@ impl Table {
         let column_keys = build_column_keys(ctx.kek.as_deref(), &schema);
         let mut db = Self {
             dir,
+            _root_guard: ctx.root_guard,
+            runs_root,
+            idx_root,
             table_id: manifest.table_id,
             name: ctx.table_name.unwrap_or_default(),
             auth: ctx.auth,
             read_only: ctx.read_only,
+            durable_commit_failed: false,
             wal,
             memtable,
             mutable_run: MutableRun::new(),
@@ -1458,7 +1879,6 @@ impl Table {
             compaction_zstd_level: 3,
             allocator,
             epoch: ctx.epoch,
-            persisted_epoch,
             data_generation: persisted_epoch,
             schema,
             hot: HotIndex::new(),
@@ -1466,14 +1886,10 @@ impl Table {
             column_keys,
             run_refs: manifest.runs.clone(),
             retiring: manifest.retiring.clone(),
-            next_run_id: manifest
-                .runs
-                .iter()
-                .map(|r| r.run_id as u64 + 1)
-                .max()
-                .unwrap_or(1),
+            next_run_id,
             sync_byte_threshold: DEFAULT_SYNC_BYTE_THRESHOLD,
             current_txn_id,
+            pending_private_mutations: false,
             bitmap: HashMap::new(),
             ann: HashMap::new(),
             fm: HashMap::new(),
@@ -1517,13 +1933,18 @@ impl Table {
 
         // Advance the (possibly shared) epoch authority to this table's manifest
         // epoch so rebuild/index reads below observe the recovered watermark.
-        db.epoch.advance_recovered(Epoch(db.persisted_epoch));
+        db.epoch.advance_recovered(Epoch(recovered_epoch));
 
         // 2. Fast path: load the persisted global-index checkpoint (Phase 9.1).
         //    Valid only when its embedded epoch matches the manifest-endorsed
         //    `global_idx_epoch` and every run was created at or before it, so the
         //    checkpoint covers all run data. Otherwise rebuild from the runs.
-        let checkpoint = global_idx::read(&db.dir, db.idx_dek().as_deref())?;
+        let checkpoint = match db.idx_root.as_deref() {
+            Some(root) => {
+                global_idx::read_root(root, db.table_id, &db.schema, db.idx_dek().as_deref())?
+            }
+            None => global_idx::read(&db.dir, db.table_id, &db.schema, db.idx_dek().as_deref())?,
+        };
         let checkpoint_valid = checkpoint.as_ref().is_some_and(|c| {
             c.epoch_built == manifest.global_idx_epoch
                 && manifest.global_idx_epoch > 0
@@ -1593,6 +2014,12 @@ impl Table {
             db.remove_hot_for_row(*rid, *epoch);
         }
 
+        if recovered_manifest_dirty {
+            let rows = db.visible_rows(Snapshot::at(Epoch(u64::MAX)))?;
+            db.live_count = rows.len() as u64;
+            db.persist_manifest(Epoch(recovered_epoch))?;
+        }
+
         // The reservoir stays lazy (`reservoir_complete == false`, set above):
         // rebuilding it means materializing every visible row, which no plain
         // open/insert/update/delete needs. `ensure_reservoir_complete` pays
@@ -1630,6 +2057,13 @@ impl Table {
     }
 
     pub(crate) fn rebuild_indexes_from_runs(&mut self) -> Result<()> {
+        self.rebuild_indexes_from_runs_inner(None)
+    }
+
+    fn rebuild_indexes_from_runs_inner(
+        &mut self,
+        control: Option<&crate::ExecutionControl>,
+    ) -> Result<()> {
         self.hot = HotIndex::new();
         self.pk_by_row.clear();
         let (bitmap, ann, fm, sparse, minhash) = empty_indexes(&self.schema);
@@ -1640,9 +2074,19 @@ impl Table {
         self.minhash = minhash;
         let snapshot = Epoch(u64::MAX);
         let ttl_now = unix_nanos_now();
+        let mut scanned = 0_usize;
         for rr in self.run_refs.clone() {
+            if let Some(control) = control {
+                control.checkpoint()?;
+            }
             let mut reader = self.open_reader(rr.run_id)?;
             for row in reader.visible_rows(snapshot)? {
+                if scanned % 256 == 0 {
+                    if let Some(control) = control {
+                        control.checkpoint()?;
+                    }
+                }
+                scanned += 1;
                 if self.row_expired_at(&row, ttl_now) {
                     continue;
                 }
@@ -1660,6 +2104,12 @@ impl Table {
             }
         }
         for row in self.mutable_run.visible_versions(snapshot) {
+            if scanned % 256 == 0 {
+                if let Some(control) = control {
+                    control.checkpoint()?;
+                }
+            }
+            scanned += 1;
             if row.deleted {
                 self.remove_hot_for_row(row.row_id, snapshot);
             } else if !self.row_expired_at(&row, ttl_now) {
@@ -1667,6 +2117,12 @@ impl Table {
             }
         }
         for row in self.memtable.visible_versions(snapshot) {
+            if scanned % 256 == 0 {
+                if let Some(control) = control {
+                    control.checkpoint()?;
+                }
+            }
+            scanned += 1;
             if row.deleted {
                 self.remove_hot_for_row(row.row_id, snapshot);
             } else if !self.row_expired_at(&row, ttl_now) {
@@ -1707,6 +2163,13 @@ impl Table {
     /// columns from the single sorted run. Serves `Condition::Range` sub-linearly
     /// on the fast path; no-op when there isn't exactly one run.
     pub(crate) fn build_learned_ranges(&mut self) -> Result<()> {
+        self.build_learned_ranges_inner(None)
+    }
+
+    fn build_learned_ranges_inner(
+        &mut self,
+        control: Option<&crate::ExecutionControl>,
+    ) -> Result<()> {
         self.learned_range = Arc::new(HashMap::new());
         if self.run_refs.len() != 1 {
             return Ok(());
@@ -1735,7 +2198,12 @@ impl Table {
             columnar::NativeColumn::Int64 { data, .. } => data.iter().map(|x| *x as u64).collect(),
             _ => return Ok(()),
         };
-        for (cid, epsilon) in cols {
+        for (column_index, (cid, epsilon)) in cols.into_iter().enumerate() {
+            if column_index % 256 == 0 {
+                if let Some(control) = control {
+                    control.checkpoint()?;
+                }
+            }
             let ty = self
                 .schema
                 .columns
@@ -1802,6 +2270,59 @@ impl Table {
         Ok(())
     }
 
+    /// Rebuild derived indexes cooperatively, publishing their checkpoint only
+    /// after `before_publish` succeeds.
+    #[doc(hidden)]
+    pub fn ensure_indexes_complete_controlled<F>(
+        &mut self,
+        control: &crate::ExecutionControl,
+        before_publish: F,
+    ) -> Result<bool>
+    where
+        F: FnOnce() -> bool,
+    {
+        self.ensure_indexes_complete_controlled_with_receipt(control, before_publish)
+            .map(|(changed, _)| changed)
+    }
+
+    /// Rebuild derived indexes cooperatively and return the exact table
+    /// snapshot used by the rebuild. No receipt is returned for a no-op.
+    #[doc(hidden)]
+    pub fn ensure_indexes_complete_controlled_with_receipt<F>(
+        &mut self,
+        control: &crate::ExecutionControl,
+        before_publish: F,
+    ) -> Result<(bool, Option<MaintenanceReceipt>)>
+    where
+        F: FnOnce() -> bool,
+    {
+        if self.indexes_complete {
+            crate::trace::QueryTrace::record(|trace| {
+                trace.index_rebuild = crate::trace::IndexRebuild::AlreadyComplete;
+            });
+            return Ok((false, None));
+        }
+        crate::trace::QueryTrace::record(|trace| {
+            trace.index_rebuild = crate::trace::IndexRebuild::Rebuilt;
+        });
+        control.checkpoint()?;
+        let maintenance_epoch = self.current_epoch();
+        self.rebuild_indexes_from_runs_inner(Some(control))?;
+        self.build_learned_ranges_inner(Some(control))?;
+        control.checkpoint()?;
+        if !before_publish() {
+            return Err(MongrelError::Cancelled);
+        }
+        self.indexes_complete = true;
+        self.checkpoint_indexes(maintenance_epoch);
+        Ok((
+            true,
+            Some(MaintenanceReceipt {
+                epoch: maintenance_epoch,
+            }),
+        ))
+    }
+
     fn pending_epoch(&self) -> Epoch {
         Epoch(self.epoch.visible().0 + 1)
     }
@@ -1815,32 +2336,32 @@ impl Table {
     /// Return the current auto-commit txn id, allocating a fresh one from the
     /// shared allocator on a mounted table when a new span starts (sentinel 0).
     /// A standalone table uses its private monotonic counter (never 0).
-    fn ensure_txn_id(&mut self) -> u64 {
+    fn ensure_txn_id(&mut self) -> Result<u64> {
         if self.current_txn_id == 0 {
             let id = match &self.wal {
-                WalSink::Shared(s) => {
-                    let mut g = s.txn_ids.lock();
-                    let v = *g;
-                    *g = g.wrapping_add(1);
-                    v
+                WalSink::Shared(s) => crate::txn::allocate_txn_id(&s.txn_ids)?,
+                WalSink::Private(_) => {
+                    return Err(MongrelError::Full(
+                        "standalone transaction id namespace exhausted".into(),
+                    ))
                 }
-                WalSink::Private(_) => 1,
-                WalSink::ReadOnly => 1,
+                WalSink::ReadOnly => return Err(MongrelError::ReadOnlyReplica),
             };
             self.current_txn_id = id;
         }
-        self.current_txn_id
+        Ok(self.current_txn_id)
     }
 
     /// Append a data record (`Put`/`Delete`) for the current auto-commit txn to
     /// whichever WAL backs this table.
     fn wal_append_data(&mut self, op: Op) -> Result<()> {
         self.ensure_writable()?;
-        let txn_id = self.ensure_txn_id();
+        let txn_id = self.ensure_txn_id()?;
         let table_id = self.table_id;
         match &mut self.wal {
             WalSink::Private(w) => {
                 w.append_txn(txn_id, op)?;
+                self.pending_private_mutations = true;
             }
             WalSink::Shared(s) => {
                 s.wal.lock().append(txn_id, table_id, op)?;
@@ -1852,10 +2373,14 @@ impl Table {
 
     fn ensure_writable(&self) -> Result<()> {
         if self.read_only || matches!(self.wal, WalSink::ReadOnly) {
-            Err(MongrelError::ReadOnlyReplica)
-        } else {
-            Ok(())
+            return Err(MongrelError::ReadOnlyReplica);
         }
+        if self.durable_commit_failed {
+            return Err(MongrelError::Other(
+                "table poisoned by post-commit failure; reopen required".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Upsert a row. Allocates a [`RowId`], appends a (non-fsynced) WAL record,
@@ -1921,7 +2446,7 @@ impl Table {
         let row_id = if self.schema.clustered {
             self.derive_clustered_row_id(&columns)?
         } else {
-            self.allocator.alloc()
+            self.allocator.alloc()?
         };
         let epoch = self.pending_epoch();
         let mut row = Row::new(row_id, epoch);
@@ -1961,11 +2486,17 @@ impl Table {
         let epoch = self.pending_epoch();
         let mut rows = Vec::with_capacity(filled.len());
         let mut ids = Vec::with_capacity(filled.len());
-        for (cols, assigned) in filled {
-            let row_id = if self.schema.clustered {
-                self.derive_clustered_row_id(&cols)?
-            } else {
-                self.allocator.alloc()
+        let first_row_id = if self.schema.clustered {
+            None
+        } else {
+            let count = u64::try_from(filled.len())
+                .map_err(|_| MongrelError::Full("row-id allocation request is too large".into()))?;
+            Some(self.allocator.alloc_range(count)?.0)
+        };
+        for (row_index, (cols, assigned)) in filled.into_iter().enumerate() {
+            let row_id = match first_row_id {
+                Some(first) => RowId(first + row_index as u64),
+                None => self.derive_clustered_row_id(&cols)?,
             };
             let mut row = Row::new(row_id, epoch);
             for (c, v) in cols {
@@ -2063,7 +2594,10 @@ impl Table {
         // Borrow checker: re-read after the mutable `ensure` call returns.
         let ai = self.auto_inc.as_mut().expect("auto-inc column present");
         let v = ai.next;
-        ai.next = ai.next.saturating_add(1);
+        ai.next = ai
+            .next
+            .checked_add(1)
+            .ok_or_else(|| MongrelError::Full("AUTO_INCREMENT namespace exhausted".into()))?;
         Ok(v)
     }
 
@@ -2072,7 +2606,10 @@ impl Table {
     fn advance_auto_inc_past(&mut self, used: i64) -> Result<()> {
         self.ensure_auto_inc_seeded()?;
         let ai = self.auto_inc.as_mut().expect("auto-inc column present");
-        let floor = used.saturating_add(1).max(1);
+        let floor = used
+            .checked_add(1)
+            .ok_or_else(|| MongrelError::Full("AUTO_INCREMENT namespace exhausted".into()))?
+            .max(1);
         if ai.next < floor {
             ai.next = floor;
         }
@@ -2101,7 +2638,10 @@ impl Table {
             .column_id;
         let max = self.scan_max_int64(cid)?;
         let ai = self.auto_inc.as_mut().expect("auto-inc column present");
-        let floor = max.saturating_add(1).max(1);
+        let floor = max
+            .checked_add(1)
+            .ok_or_else(|| MongrelError::Full("AUTO_INCREMENT namespace exhausted".into()))?
+            .max(1);
         if ai.next < floor {
             ai.next = floor;
         }
@@ -2116,7 +2656,12 @@ impl Table {
         self.ensure_auto_inc_seeded()?;
         let ai = self.auto_inc.as_mut().expect("auto-inc column present");
         let start = ai.next;
-        ai.next = ai.next.saturating_add(n as i64);
+        let count = i64::try_from(n)
+            .map_err(|_| MongrelError::Full("AUTO_INCREMENT range is too large".into()))?;
+        ai.next = ai
+            .next
+            .checked_add(count)
+            .ok_or_else(|| MongrelError::Full("AUTO_INCREMENT namespace exhausted".into()))?;
         Ok(Some(start))
     }
 
@@ -2213,7 +2758,10 @@ impl Table {
                 .max()
         };
         if let Some(max) = max {
-            let floor = max.saturating_add(1).max(1);
+            let floor = max
+                .checked_add(1)
+                .ok_or_else(|| MongrelError::Full("AUTO_INCREMENT namespace exhausted".into()))?
+                .max(1);
             if ai.next < floor {
                 ai.next = floor;
             }
@@ -2323,24 +2871,43 @@ impl Table {
         Ok(())
     }
 
-    /// Apply already-durable put rows to the memtable + indexes + allocator +
-    /// live count WITHOUT appending to the per-table WAL (the WAL — shared or
-    /// per-table — is the caller's responsibility). Used by the cross-table
-    /// `Transaction` commit path (P2.5) after it has written the shared WAL.
-    pub(crate) fn apply_put_rows(&mut self, rows: Vec<Row>) -> Result<()> {
-        self.apply_put_rows_inner(rows, true)
+    /// Complete every fallible read/index preparation before a WAL commit can
+    /// become durable. After this succeeds, row application is in-memory only.
+    pub(crate) fn prepare_durable_publish(&mut self) -> Result<()> {
+        self.ensure_indexes_complete()
+    }
+
+    pub(crate) fn prepare_durable_publish_controlled(
+        &mut self,
+        control: &crate::ExecutionControl,
+    ) -> Result<()> {
+        self.ensure_indexes_complete_controlled(control, || true)?;
+        Ok(())
+    }
+
+    pub(crate) fn apply_put_rows_prepared(&mut self, rows: Vec<Row>) {
+        self.apply_put_rows_inner_prepared(rows, true);
     }
 
     fn apply_put_rows_inner(&mut self, rows: Vec<Row>, check_existing_pk: bool) -> Result<()> {
         if check_existing_pk {
             self.ensure_indexes_complete()?;
         }
+        self.apply_put_rows_inner_prepared(rows, check_existing_pk);
+        Ok(())
+    }
+
+    /// Apply rows after [`Self::ensure_indexes_complete`] has succeeded. Every
+    /// operation below is in-memory and infallible, so durable publication can
+    /// never stop halfway through a batch on an I/O error.
+    fn apply_put_rows_inner_prepared(&mut self, rows: Vec<Row>, check_existing_pk: bool) {
         // Single-row puts — the hot operational path — cannot contain an
         // intra-batch duplicate, so the winner/loser partition maps are pure
         // overhead. Same semantics as the batch path below with `losers = ∅`.
         if rows.len() == 1 {
             let row = rows.into_iter().next().expect("len checked");
-            return self.apply_put_row_single(row, check_existing_pk);
+            self.apply_put_row_single(row, check_existing_pk);
+            return;
         }
         // One pass per row: track mutated columns, tombstone the previous
         // owner of the row's PK, index (which places the HOT entry), sample,
@@ -2402,13 +2969,12 @@ impl Table {
             self.live_count = self.live_count.saturating_add(1);
         }
         self.data_generation = self.data_generation.wrapping_add(1);
-        Ok(())
     }
 
     /// One-row specialization of [`Table::apply_put_rows_inner`]: identical
     /// upsert semantics (tombstone the previous PK owner, insert into HOT,
     /// index, sample, materialize) without the per-batch winner/loser maps.
-    fn apply_put_row_single(&mut self, row: Row, check_existing_pk: bool) -> Result<()> {
+    fn apply_put_row_single(&mut self, row: Row, check_existing_pk: bool) {
         for &cid in row.columns.keys() {
             self.pending_put_cols.insert(cid);
         }
@@ -2443,12 +3009,11 @@ impl Table {
         self.memtable.upsert(row);
         self.live_count = self.live_count.saturating_add(1);
         self.data_generation = self.data_generation.wrapping_add(1);
-        Ok(())
     }
 
     /// Allocate a fresh row id (advancing the table's allocator). Used by the
     /// cross-table `Transaction` to assign ids before sealing a row.
-    pub(crate) fn alloc_row_id(&mut self) -> RowId {
+    pub(crate) fn alloc_row_id(&mut self) -> Result<RowId> {
         self.allocator.alloc()
     }
 
@@ -2490,8 +3055,10 @@ impl Table {
     /// scan/merge path reads at the run's commit epoch), so materializing them in
     /// the memtable too would defeat the point of spilling (peak memory stays
     /// bounded). Caller must have linked the run before reads can resolve indexes.
-    pub(crate) fn apply_run_metadata(&mut self, rows: &[Row]) -> Result<()> {
-        self.ensure_indexes_complete()?;
+    pub(crate) fn apply_run_metadata_prepared(&mut self, rows: &[Row]) -> Result<()> {
+        if rows.iter().any(|row| row.row_id.0 >= u64::MAX - 1) {
+            return Err(MongrelError::Full("row-id namespace exhausted".into()));
+        }
         let n = rows.len();
         for r in rows {
             for &cid in r.columns.keys() {
@@ -2523,7 +3090,7 @@ impl Table {
             }
         }
         for r in rows {
-            self.allocator.advance_to(r.row_id);
+            self.allocator.advance_to(r.row_id)?;
             if !losers.contains(&r.row_id) {
                 self.index_row(r);
             }
@@ -2553,15 +3120,21 @@ impl Table {
         let mut by_epoch: std::collections::BTreeMap<Epoch, Vec<Row>> =
             std::collections::BTreeMap::new();
         for row in rows {
-            self.allocator.advance_to(row.row_id);
+            if row.row_id.0 >= u64::MAX - 1 {
+                return Err(MongrelError::Full("row-id namespace exhausted".into()));
+            }
+            self.allocator.advance_to(row.row_id)?;
             // Mirror the row-id advance for the AUTO_INCREMENT counter: WAL
             // replay must not hand out an id a recovered row already claimed.
             // `seeded` is intentionally left untouched so a still-unseeded
             // counter still scans `max(PK)` to cover already-flushed rows.
             if let Some(ai) = self.auto_inc.as_mut() {
                 if let Some(Value::Int64(n)) = row.columns.get(&ai.column_id) {
-                    if *n + 1 > ai.next {
-                        ai.next = *n + 1;
+                    let next = n.checked_add(1).ok_or_else(|| {
+                        MongrelError::Full("AUTO_INCREMENT namespace exhausted".into())
+                    })?;
+                    if next > ai.next {
+                        ai.next = next;
                     }
                 }
             }
@@ -2751,13 +3324,13 @@ impl Table {
     }
 
     /// Apply an already-durable truncate without appending to the WAL.
-    pub(crate) fn apply_truncate(&mut self, _epoch: Epoch) -> Result<()> {
-        for rr in std::mem::take(&mut self.run_refs) {
-            let _ = std::fs::remove_file(self.run_path(rr.run_id as u64));
-        }
-        for r in std::mem::take(&mut self.retiring) {
-            let _ = std::fs::remove_file(self.run_path(r.run_id as u64));
-        }
+    pub(crate) fn apply_truncate(&mut self, _epoch: Epoch) {
+        // Unlink active topology in the next manifest before removing any run
+        // file. A crash before that manifest is durable must still be able to
+        // open the old manifest and replay the durable truncate from WAL.
+        // Unreferenced files are safe orphans and `gc()` removes them later.
+        self.run_refs.clear();
+        self.retiring.clear();
         self.memtable = Memtable::new();
         self.mutable_run = MutableRun::new();
         self.hot = HotIndex::new();
@@ -2785,7 +3358,6 @@ impl Table {
         self.clear_result_cache();
         self.invalidate_index_checkpoint();
         self.data_generation = self.data_generation.wrapping_add(1);
-        Ok(())
     }
 
     /// Apply a tombstone (already-durable on the WAL) at `epoch` without
@@ -3040,51 +3612,122 @@ impl Table {
     /// standalone table fsyncs its private WAL; a mounted table seals into the
     /// shared WAL and defers the fsync to the group-commit coordinator (B1).
     pub fn commit(&mut self) -> Result<Epoch> {
+        self.commit_inner(None)
+    }
+
+    /// Prepare a pending commit cooperatively, then invoke `before_commit`
+    /// immediately before the durable transaction marker is appended.
+    #[doc(hidden)]
+    pub fn commit_controlled<F>(
+        &mut self,
+        control: &crate::ExecutionControl,
+        mut before_commit: F,
+    ) -> Result<Epoch>
+    where
+        F: FnMut() -> Result<()>,
+    {
+        self.commit_inner(Some((control, &mut before_commit)))
+    }
+
+    fn commit_inner(
+        &mut self,
+        controlled: Option<(&crate::ExecutionControl, &mut dyn FnMut() -> Result<()>)>,
+    ) -> Result<Epoch> {
+        self.ensure_writable()?;
+        if !self.has_pending_mutations() {
+            if self.current_txn_id == 0 && matches!(&self.wal, WalSink::Private(_)) {
+                return Err(MongrelError::Full(
+                    "standalone transaction id namespace exhausted".into(),
+                ));
+            }
+            return Ok(self.epoch.visible());
+        }
+        self.commit_new_epoch_inner(controlled)
+    }
+
+    /// Seal a real logical write at a fresh epoch. Bulk-load paths publish
+    /// their run directly rather than staging rows in the WAL, so they call
+    /// this after proving the input is non-empty.
+    fn commit_new_epoch(&mut self) -> Result<Epoch> {
+        self.commit_new_epoch_inner(None)
+    }
+
+    fn commit_new_epoch_inner(
+        &mut self,
+        controlled: Option<(&crate::ExecutionControl, &mut dyn FnMut() -> Result<()>)>,
+    ) -> Result<Epoch> {
         self.ensure_writable()?;
         if self.is_shared() {
-            self.commit_shared()
+            self.commit_shared(controlled)
         } else {
-            self.commit_private()
+            self.commit_private(controlled)
         }
     }
 
     /// Standalone commit: fsync the private WAL under the commit lock.
-    fn commit_private(&mut self) -> Result<Epoch> {
+    fn commit_private(
+        &mut self,
+        controlled: Option<(&crate::ExecutionControl, &mut dyn FnMut() -> Result<()>)>,
+    ) -> Result<Epoch> {
         // Serialize the assign→fsync→publish critical section across all tables
         // sharing the epoch authority so `visible` is published strictly in
         // assigned order (the dual-counter invariant).
         let commit_lock = Arc::clone(&self.commit_lock);
         let _g = commit_lock.lock();
+        // Validate the private transaction namespace before allocating an
+        // epoch or appending any terminal WAL record.
+        let txn_id = self.ensure_txn_id()?;
+        if let Some((control, before_commit)) = controlled {
+            control.checkpoint()?;
+            before_commit()?;
+        }
         let new_epoch = self.epoch.bump_assigned();
-        let txn_id = self.current_txn_id;
+        let epoch_authority = Arc::clone(&self.epoch);
+        let mut epoch_guard = EpochGuard::new(epoch_authority.as_ref(), new_epoch);
         // Seal the staged records under a TxnCommit marker carrying the commit
         // epoch, then a single group fsync. Recovery applies only records whose
         // txn has a durable TxnCommit (uncommitted/torn tails are discarded).
-        match &mut self.wal {
-            WalSink::Private(w) => {
-                w.append_txn(
+        let wal_result = match &mut self.wal {
+            WalSink::Private(w) => w
+                .append_txn(
                     txn_id,
                     Op::TxnCommit {
                         epoch: new_epoch.0,
                         added_runs: Vec::new(),
                     },
-                )?;
-                w.sync()?;
-            }
+                )
+                .and_then(|_| w.sync()),
             WalSink::Shared(_) => unreachable!("commit_private on a shared sink"),
-            WalSink::ReadOnly => return Err(MongrelError::ReadOnlyReplica),
+            WalSink::ReadOnly => Err(MongrelError::ReadOnlyReplica),
+        };
+        if let Err(error) = wal_result {
+            self.durable_commit_failed = true;
+            return Err(MongrelError::CommitOutcomeUnknown {
+                epoch: new_epoch.0,
+                message: error.to_string(),
+            });
         }
-        // The truncate record is now durable; apply the physical clear.
+        // The commit marker is durable. Resolve the assigned epoch even when a
+        // live publish/checkpoint step fails, and report the exact outcome.
         if let Some(epoch) = self.pending_truncate.take() {
-            self.apply_truncate(epoch)?;
+            self.apply_truncate(epoch);
         }
         self.invalidate_pending_cache();
-        self.persist_manifest(new_epoch)?;
+        let publish_result = self.persist_manifest(new_epoch);
         // Publish through the shared in-order gate so a `Table::commit` can never
         // advance the watermark past an in-flight cross-table transaction's
         // lower assigned epoch whose writes are not yet applied (spec §9.3e).
         self.epoch.publish_in_order(new_epoch);
-        self.current_txn_id += 1;
+        epoch_guard.disarm();
+        if let Err(error) = publish_result {
+            self.durable_commit_failed = true;
+            return Err(MongrelError::DurableCommit {
+                epoch: new_epoch.0,
+                message: error.to_string(),
+            });
+        }
+        self.current_txn_id = txn_id.checked_add(1).unwrap_or(0);
+        self.pending_private_mutations = false;
         self.data_generation = self.data_generation.wrapping_add(1);
         Ok(new_epoch)
     }
@@ -3094,7 +3737,10 @@ impl Table {
     /// WAL-append order), make it durable via the group-commit coordinator (one
     /// leader fsync for the whole batch), then apply the staged rows at the
     /// assigned epoch and publish in order. Honors the shared poison flag.
-    fn commit_shared(&mut self) -> Result<Epoch> {
+    fn commit_shared(
+        &mut self,
+        controlled: Option<(&crate::ExecutionControl, &mut dyn FnMut() -> Result<()>)>,
+    ) -> Result<Epoch> {
         use std::sync::atomic::Ordering;
         let s = match &self.wal {
             WalSink::Shared(s) => s.clone(),
@@ -3114,23 +3760,46 @@ impl Table {
         // held commit with concurrent cross-table `transaction()` committers.
         let commit_lock = Arc::clone(&self.commit_lock);
         let _g = commit_lock.lock();
+        if !self.pending_rows.is_empty() {
+            match controlled.as_ref() {
+                Some((control, _)) => self.prepare_durable_publish_controlled(control)?,
+                None => self.prepare_durable_publish()?,
+            }
+        }
         // Always seal a txn (allocating an id if this span had no writes) so the
         // epoch advances monotonically like the standalone path.
-        let txn_id = self.ensure_txn_id();
-        let (new_epoch, commit_seq) = {
-            let mut wal = s.wal.lock();
-            let new_epoch = self.epoch.bump_assigned();
-            let seq = wal.append_commit(txn_id, new_epoch, &[])?;
-            (new_epoch, seq)
+        let txn_id = self.ensure_txn_id()?;
+        let mut wal = s.wal.lock();
+        if let Some((control, before_commit)) = controlled {
+            control.checkpoint()?;
+            before_commit()?;
+        }
+        let new_epoch = self.epoch.bump_assigned();
+        let epoch_authority = Arc::clone(&self.epoch);
+        let mut epoch_guard = EpochGuard::new(epoch_authority.as_ref(), new_epoch);
+        let commit_seq = match wal.append_commit(txn_id, new_epoch, &[]) {
+            Ok(commit_seq) => commit_seq,
+            Err(error) => {
+                s.poisoned.store(true, Ordering::Relaxed);
+                return Err(MongrelError::CommitOutcomeUnknown {
+                    epoch: new_epoch.0,
+                    message: error.to_string(),
+                });
+            }
         };
-        s.group
-            .await_durable(&s.wal, commit_seq)
-            .inspect_err(|_| s.poisoned.store(true, Ordering::Relaxed))?;
+        drop(wal);
+        if let Err(error) = s.group.await_durable(&s.wal, commit_seq) {
+            s.poisoned.store(true, Ordering::Relaxed);
+            return Err(MongrelError::CommitOutcomeUnknown {
+                epoch: new_epoch.0,
+                message: error.to_string(),
+            });
+        }
 
-        // Apply staged truncate/rows/tombstones at the real assigned epoch (B2): nothing
-        // was stamped speculatively, and nothing is visible until publish below.
+        // Apply staged state after durability, but never lose the durable
+        // outcome if a live apply or manifest checkpoint fails.
         if self.pending_truncate.take().is_some() {
-            self.apply_truncate(new_epoch)?;
+            self.apply_truncate(new_epoch);
         }
         let mut rows = std::mem::take(&mut self.pending_rows);
         if !rows.is_empty() {
@@ -3140,7 +3809,7 @@ impl Table {
             let auto_inc_flags = std::mem::take(&mut self.pending_rows_auto_inc);
             let all_auto_generated =
                 auto_inc_flags.len() == rows.len() && auto_inc_flags.iter().all(|b| *b);
-            self.apply_put_rows_inner(rows, !all_auto_generated)?;
+            self.apply_put_rows_inner_prepared(rows, !all_auto_generated);
         } else {
             self.pending_rows_auto_inc.clear();
         }
@@ -3150,9 +3819,18 @@ impl Table {
         }
 
         self.invalidate_pending_cache();
-        self.persist_manifest(new_epoch)?;
+        let publish_result = self.persist_manifest(new_epoch);
         self.epoch.publish_in_order(new_epoch);
+        epoch_guard.disarm();
         let _ = s.change_wake.send(());
+        if let Err(error) = publish_result {
+            self.durable_commit_failed = true;
+            s.poisoned.store(true, Ordering::Relaxed);
+            return Err(MongrelError::DurableCommit {
+                epoch: new_epoch.0,
+                message: error.to_string(),
+            });
+        }
         // Next auto-commit span allocates a fresh shared txn id.
         self.current_txn_id = 0;
         self.data_generation = self.data_generation.wrapping_add(1);
@@ -3167,27 +3845,79 @@ impl Table {
     /// deferred until the data is durably in a run, so crash recovery replays
     /// those rows back into the memtable (the tier rebuilds from replay).
     pub fn flush(&mut self) -> Result<Epoch> {
-        self.ensure_indexes_complete()?;
-        let epoch = self.commit()?;
-        let rows = self.memtable.drain_sorted();
-        if !rows.is_empty() {
-            self.mutable_run.insert_many(rows);
+        self.flush_with_outcome().map(|(epoch, _)| epoch)
+    }
+
+    /// Flush and report whether this call published pending logical mutations.
+    pub fn flush_with_outcome(&mut self) -> Result<(Epoch, bool)> {
+        self.flush_with_outcome_inner(None)
+    }
+
+    /// Cooperatively prepare a flush, entering the commit fence immediately
+    /// before its transaction marker can become durable.
+    #[doc(hidden)]
+    pub fn flush_with_outcome_controlled<F>(
+        &mut self,
+        control: &crate::ExecutionControl,
+        mut before_commit: F,
+    ) -> Result<(Epoch, bool)>
+    where
+        F: FnMut() -> Result<()>,
+    {
+        self.flush_with_outcome_inner(Some((control, &mut before_commit)))
+    }
+
+    fn flush_with_outcome_inner(
+        &mut self,
+        controlled: Option<(&crate::ExecutionControl, &mut dyn FnMut() -> Result<()>)>,
+    ) -> Result<(Epoch, bool)> {
+        match controlled.as_ref() {
+            Some((control, _)) => {
+                self.ensure_indexes_complete_controlled(control, || true)?;
+            }
+            None => self.ensure_indexes_complete()?,
         }
-        if self.mutable_run.approx_bytes() >= self.mutable_run_spill_bytes {
-            self.spill_mutable_run(epoch)?;
-            // The tier is now empty and its data is durably in a run → safe to
-            // mark the WAL flushed (and, for a private WAL, rotate to a fresh
-            // segment so the flushed records aren't replayed).
-            self.mark_flushed(epoch)?;
-            self.persist_manifest(epoch)?;
-            self.build_learned_ranges()?;
-            // Memtable is drained and runs are stable → checkpoint the indexes so
-            // the next open skips the full run scan (Phase 9.1).
-            self.checkpoint_indexes(epoch);
+        let committed = self.has_pending_mutations();
+        let epoch = self.commit_inner(controlled)?;
+        let finish: Result<(Epoch, bool)> = (|| {
+            let rows = self.memtable.drain_sorted();
+            if !rows.is_empty() {
+                self.mutable_run.insert_many(rows);
+            }
+            if self.mutable_run.approx_bytes() >= self.mutable_run_spill_bytes {
+                self.spill_mutable_run(epoch)?;
+                // The tier is now empty and its data is durably in a run → safe to
+                // mark the WAL flushed (and, for a private WAL, rotate to a fresh
+                // segment so the flushed records aren't replayed).
+                self.mark_flushed(epoch)?;
+                self.persist_manifest(epoch)?;
+                self.build_learned_ranges()?;
+                // Memtable is drained and runs are stable → checkpoint the indexes so
+                // the next open skips the full run scan (Phase 9.1).
+                self.checkpoint_indexes(epoch);
+            }
+            // else: data coalesced in the in-memory tier; the WAL still covers it
+            // and the manifest epoch was already persisted by `commit`.
+            Ok((epoch, committed))
+        })();
+        match finish {
+            Err(error) if committed => Err(MongrelError::DurableCommit {
+                epoch: epoch.0,
+                message: error.to_string(),
+            }),
+            result => result,
         }
-        // else: data coalesced in the in-memory tier; the WAL still covers it
-        // and the manifest epoch was already persisted by `commit`.
-        Ok(epoch)
+    }
+
+    fn has_pending_mutations(&self) -> bool {
+        self.pending_private_mutations
+            || !self.pending_rows.is_empty()
+            || !self.pending_dels.is_empty()
+            || self.pending_truncate.is_some()
+    }
+
+    pub fn has_pending_writes(&self) -> bool {
+        self.has_pending_mutations()
     }
 
     /// Force a full flush to a `.sr` sorted run regardless of the spill
@@ -3255,18 +3985,23 @@ impl Table {
     /// caller owns the Flush-marker / WAL-rotation / manifest steps (only valid
     /// once all in-flight data is in runs). No-op when the tier is empty.
     fn spill_mutable_run(&mut self, epoch: Epoch) -> Result<()> {
+        if self.mutable_run.is_empty() {
+            return Ok(());
+        }
+        let run_id = self.alloc_run_id()?;
         let rows = self.mutable_run.drain_sorted();
         if rows.is_empty() {
             return Ok(());
         }
-        let run_id = self.next_run_id;
-        self.next_run_id += 1;
         let path = self.run_path(run_id);
         let mut writer = RunWriter::new(&self.schema, run_id as u128, epoch, 0);
         if let Some(kek) = &self.kek {
             writer = writer.with_encryption(kek.as_ref(), self.indexable_column_specs());
         }
-        let header = writer.write(&path, &rows)?;
+        let header = match self.create_run_file(run_id)? {
+            Some(file) => writer.write_file(file, &rows)?,
+            None => writer.write(&path, &rows)?,
+        };
         self.run_refs.push(RunRef {
             run_id: run_id as u128,
             level: 0,
@@ -3315,19 +4050,26 @@ impl Table {
         self.mutable_run.drain_sorted()
     }
 
+    /// Snapshot the mutable-run tier without changing live table state.
+    pub(crate) fn snapshot_mutable_run(&self) -> Vec<Row> {
+        let mut snapshot = self.mutable_run.clone();
+        snapshot.drain_sorted()
+    }
+
     /// Bulk-load: write `batch` directly to a new sorted run, bypassing the WAL
     /// and the memtable entirely (no per-row bincode, no skip-list inserts). The
     /// run + a rotated WAL + the manifest are fsynced once — the fast ingest
     /// path for large analytical loads. Indexes are still maintained.
     pub fn bulk_load(&mut self, batch: Vec<Vec<(u16, Value)>>) -> Result<Epoch> {
-        let epoch = self.commit()?;
+        self.ensure_writable()?;
         let n = batch.len();
         if n == 0 {
-            return Ok(epoch);
+            return Ok(self.current_epoch());
         }
         for row in &batch {
             self.schema.validate_values(row)?;
         }
+        let epoch = self.commit_new_epoch()?;
         let live_before = self.live_count;
         // Spill any pending mutable-run data first: bulk_load writes a Flush
         // marker + rotates the WAL below, which is only safe once all in-flight
@@ -3378,12 +4120,11 @@ impl Table {
                 None => (std::mem::take(&mut user_columns), n),
             };
         self.advance_auto_inc_from_native_columns(&write_columns, write_n, live_before)?;
-        let first = self.allocator.alloc_range(write_n as u64).0;
+        let first = self.allocator.alloc_range(write_n as u64)?.0;
         for rid in first..first + write_n as u64 {
             self.reservoir.offer(rid);
         }
-        let run_id = self.next_run_id;
-        self.next_run_id += 1;
+        let run_id = self.alloc_run_id()?;
         let path = self.run_path(run_id);
         let mut writer = RunWriter::new(&self.schema, run_id as u128, epoch, 0)
             .clean(true)
@@ -3392,7 +4133,10 @@ impl Table {
         if let Some(kek) = &self.kek {
             writer = writer.with_encryption(kek.as_ref(), self.indexable_column_specs());
         }
-        let header = writer.write_native(&path, &write_columns, write_n, first)?;
+        let header = match self.create_run_file(run_id)? {
+            Some(file) => writer.write_native_file(file, &write_columns, write_n, first)?,
+            None => writer.write_native(&path, &write_columns, write_n, first)?,
+        };
         self.run_refs.push(RunRef {
             run_id: run_id as u128,
             level: 0,
@@ -3467,8 +4211,55 @@ impl Table {
         };
         m.ttl = self.ttl;
         let meta_dek = self.manifest_meta_dek();
-        manifest::write_atomic(&self.dir, &mut m, meta_dek.as_ref())?;
+        match self._root_guard.as_deref() {
+            Some(root) => manifest::write_durable(root, &mut m, meta_dek.as_ref())?,
+            None => manifest::write_atomic(&self.dir, &mut m, meta_dek.as_ref())?,
+        }
         Ok(())
+    }
+
+    pub(crate) fn plan_recovered_metadata(&mut self) -> Result<RecoveryMetadataPlan> {
+        // `live_count` tracks logical tombstones, not wall-clock TTL expiry.
+        // Use a time before every representable timestamp so TTL cannot hide a
+        // row while rebuilding authoritative manifest metadata.
+        let rows = self.visible_rows_at_time(Snapshot::at(Epoch(u64::MAX)), i64::MIN)?;
+        let live_count = u64::try_from(rows.len())
+            .map_err(|_| MongrelError::Full("table live-row count exceeds u64".into()))?;
+        let auto_inc = match self.auto_inc {
+            Some(mut state) => {
+                let maximum = self.scan_max_int64(state.column_id)?;
+                let after_maximum = maximum.checked_add(1).ok_or_else(|| {
+                    MongrelError::Full("AUTO_INCREMENT namespace exhausted".into())
+                })?;
+                state.next = state.next.max(after_maximum).max(1);
+                state.seeded = true;
+                Some(state)
+            }
+            None => None,
+        };
+        Ok(RecoveryMetadataPlan {
+            live_count,
+            auto_inc,
+            changed: live_count != self.live_count
+                || auto_inc.is_some_and(|planned| {
+                    self.auto_inc.is_none_or(|current| {
+                        current.next != planned.next || current.seeded != planned.seeded
+                    })
+                }),
+        })
+    }
+
+    pub(crate) fn apply_recovered_metadata(
+        &mut self,
+        plan: RecoveryMetadataPlan,
+        epoch: Epoch,
+    ) -> Result<()> {
+        if !plan.changed {
+            return Ok(());
+        }
+        self.live_count = plan.live_count;
+        self.auto_inc = plan.auto_inc;
+        self.persist_manifest(epoch)
     }
 
     /// Checkpoint the in-memory secondary indexes to `_idx/global.idx` and stamp
@@ -3482,6 +4273,14 @@ impl Table {
         if !self.indexes_complete {
             return;
         }
+        if self.idx_root.is_none() {
+            if let Some(root) = self._root_guard.as_ref() {
+                let Ok(idx_root) = root.create_directory_all_pinned(global_idx::IDX_DIR) else {
+                    return;
+                };
+                self.idx_root = Some(Arc::new(idx_root));
+            }
+        }
         let snap = global_idx::IndexSnapshot {
             hot: &self.hot,
             bitmap: &self.bitmap,
@@ -3493,9 +4292,23 @@ impl Table {
         };
         // Best-effort: a failed checkpoint just means the next open rebuilds.
         let idx_dek = self.idx_dek();
-        if global_idx::write_atomic(&self.dir, self.table_id, epoch.0, snap, idx_dek.as_deref())
-            .is_ok()
-        {
+        let written = match self.idx_root.as_deref() {
+            Some(root) => global_idx::write_atomic_root(
+                root,
+                self.table_id,
+                epoch.0,
+                snap,
+                idx_dek.as_deref(),
+            ),
+            None => global_idx::write_atomic(
+                &self.dir,
+                self.table_id,
+                epoch.0,
+                snap,
+                idx_dek.as_deref(),
+            ),
+        };
+        if written.is_ok() {
             self.global_idx_epoch = epoch.0;
             let _ = self.persist_manifest(epoch);
         }
@@ -3505,13 +4318,51 @@ impl Table {
     /// (used when the live indexes are known stale, e.g. compaction to empty).
     pub(crate) fn invalidate_index_checkpoint(&mut self) {
         self.global_idx_epoch = 0;
-        global_idx::remove(&self.dir);
+        if let Some(root) = self.idx_root.as_deref() {
+            let _ = root.remove_file(global_idx::IDX_FILENAME);
+        } else {
+            global_idx::remove(&self.dir);
+        }
         let _ = self.persist_manifest(self.epoch.visible());
     }
 
-    pub(crate) fn mark_indexes_incomplete(&mut self) {
+    /// Prepare for replacing every run without publishing a second manifest.
+    /// The caller persists the replacement topology after this returns.  An
+    /// older checkpoint may remain on disk if deletion fails, but a manifest
+    /// with `global_idx_epoch = 0` will never endorse it on reopen.
+    pub(crate) fn prepare_indexes_for_run_replacement(&mut self) {
         self.indexes_complete = false;
-        self.invalidate_index_checkpoint();
+        self.global_idx_epoch = 0;
+        if let Some(root) = self.idx_root.as_deref() {
+            let _ = root.remove_file(global_idx::IDX_FILENAME);
+        } else {
+            global_idx::remove(&self.dir);
+        }
+    }
+
+    pub(crate) fn finish_indexes_for_run_replacement(&mut self) {
+        self.indexes_complete = true;
+    }
+
+    /// A maintenance operation changed live run topology and could not prove
+    /// the matching manifest publication.  Fail closed until recovery rebuilds
+    /// one coherent view from durable state.  Mounted tables also poison their
+    /// owning database so GC, DDL, and transactions cannot continue around the
+    /// uncertain topology.
+    pub(crate) fn poison_after_maintenance_publish_failure(&mut self) {
+        self.durable_commit_failed = true;
+        if let WalSink::Shared(shared) = &self.wal {
+            shared
+                .poisoned
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Invalidate a stale handle after DOCTOR has durably dropped its catalog
+    /// entry. Other tables remain usable, but this handle must never append new
+    /// writes for the quarantined table id.
+    pub(crate) fn mark_unavailable_after_quarantine(&mut self) {
+        self.durable_commit_failed = true;
     }
 
     /// Read the row at `row_id` visible to `snapshot`, merging the newest
@@ -3547,6 +4398,61 @@ impl Table {
     /// runs. Ascending `RowId`.
     pub fn visible_rows(&self, snapshot: Snapshot) -> Result<Vec<Row>> {
         self.visible_rows_at_time(snapshot, unix_nanos_now())
+    }
+
+    /// Materialize visible rows with cooperative checkpoints while merging
+    /// page-bounded, already ordered tier cursors.
+    #[doc(hidden)]
+    pub fn visible_rows_controlled(
+        &self,
+        snapshot: Snapshot,
+        control: &crate::ExecutionControl,
+    ) -> Result<Vec<Row>> {
+        let mut out = Vec::new();
+        self.for_each_visible_row_controlled(snapshot, control, |row| {
+            out.push(row);
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Visit visible rows in row-id order with a k-way merge over ordered tier
+    /// cursors. No full-table merge map or row-id sort is constructed.
+    #[doc(hidden)]
+    pub fn for_each_visible_row_controlled<F>(
+        &self,
+        snapshot: Snapshot,
+        control: &crate::ExecutionControl,
+        visit: F,
+    ) -> Result<()>
+    where
+        F: FnMut(Row) -> Result<()>,
+    {
+        let mut sources = Vec::with_capacity(self.run_refs.len() + 2);
+        control.checkpoint()?;
+        let memtable = self.memtable.visible_versions(snapshot.epoch);
+        if !memtable.is_empty() {
+            sources.push(ControlledVisibleSource::memory(memtable));
+        }
+        control.checkpoint()?;
+        let mutable = self.mutable_run.visible_versions(snapshot.epoch);
+        if !mutable.is_empty() {
+            sources.push(ControlledVisibleSource::memory(mutable));
+        }
+        for run in &self.run_refs {
+            control.checkpoint()?;
+            let reader = self.open_reader(run.run_id)?;
+            sources.push(ControlledVisibleSource::run(
+                reader.into_visible_version_cursor(snapshot.epoch)?,
+            ));
+        }
+        let now_nanos = unix_nanos_now();
+        merge_controlled_visible_sources(
+            &mut sources,
+            control,
+            |row| self.row_expired_at(row, now_nanos),
+            visit,
+        )
     }
 
     #[doc(hidden)]
@@ -6738,11 +7644,12 @@ impl Table {
         force_plain: bool,
         lz4: bool,
     ) -> Result<Epoch> {
-        let epoch = self.commit()?;
+        self.ensure_writable()?;
         let n = user_columns.first().map(|(_, c)| c.len()).unwrap_or(0);
         if n == 0 {
-            return Ok(epoch);
+            return Ok(self.current_epoch());
         }
+        let epoch = self.commit_new_epoch()?;
         let live_before = self.live_count;
         // Spill pending mutable-run data before the Flush marker + WAL rotation.
         self.spill_mutable_run(epoch)?;
@@ -6770,12 +7677,11 @@ impl Table {
                 None => (user_columns, n),
             };
         self.advance_auto_inc_from_native_columns(&write_columns, write_n, live_before)?;
-        let first = self.allocator.alloc_range(write_n as u64).0;
+        let first = self.allocator.alloc_range(write_n as u64)?.0;
         for rid in first..first + write_n as u64 {
             self.reservoir.offer(rid);
         }
-        let run_id = self.next_run_id;
-        self.next_run_id += 1;
+        let run_id = self.alloc_run_id()?;
         let path = self.run_path(run_id);
         let mut writer =
             RunWriter::new(&self.schema, run_id as u128, epoch, 0).with_native_endian();
@@ -6791,7 +7697,10 @@ impl Table {
         if let Some(kek) = &self.kek {
             writer = writer.with_encryption(kek.as_ref(), self.indexable_column_specs());
         }
-        let header = writer.write_native(&path, &write_columns, write_n, first)?;
+        let header = match self.create_run_file(run_id)? {
+            Some(file) => writer.write_native_file(file, &write_columns, write_n, first)?,
+            None => writer.write_native(&path, &write_columns, write_n, first)?,
+        };
         self.run_refs.push(RunRef {
             run_id: run_id as u128,
             level: 0,
@@ -8908,7 +9817,7 @@ impl Table {
         &mut self,
         column_name: &str,
         change: &AlterColumn,
-    ) -> Result<ColumnDef> {
+    ) -> Result<(ColumnDef, Option<Schema>)> {
         if !self.pending_rows.is_empty() || !self.pending_dels.is_empty() {
             return Err(MongrelError::InvalidArgument(
                 "ALTER COLUMN requires committing staged writes first".into(),
@@ -8960,36 +9869,45 @@ impl Table {
                 old.name
             )));
         }
-        Ok(next)
-    }
-
-    pub(crate) fn apply_altered_column(&mut self, column: ColumnDef) -> Result<()> {
-        let idx = self
-            .schema
+        if next == old {
+            return Ok((next, None));
+        }
+        let mut schema = self.schema.clone();
+        let index = schema
             .columns
             .iter()
-            .position(|c| c.id == column.id)
-            .ok_or_else(|| MongrelError::Schema(format!("unknown column {}", column.id)))?;
-        if self.schema.columns[idx] == column {
-            return Ok(());
-        }
-        self.schema.columns[idx] = column;
-        self.schema.schema_id = self.schema.schema_id.saturating_add(1);
-        self.schema.validate_auto_increment()?;
-        self.schema.validate_defaults()?;
+            .position(|column| column.id == next.id)
+            .ok_or_else(|| MongrelError::Schema(format!("unknown column {}", next.id)))?;
+        schema.columns[index] = next.clone();
+        schema.schema_id = schema
+            .schema_id
+            .checked_add(1)
+            .ok_or_else(|| MongrelError::Schema("schema id space exhausted".into()))?;
+        schema.validate_auto_increment()?;
+        schema.validate_defaults()?;
+        Ok((next, Some(schema)))
+    }
+
+    pub(crate) fn apply_altered_schema_prepared(&mut self, schema: Schema) {
+        self.schema = schema;
         self.auto_inc = resolve_auto_inc(&self.schema);
         self.column_keys = build_column_keys(self.kek.as_deref(), &self.schema);
-        write_schema(&self.dir, &self.schema)?;
         self.clear_result_cache();
         let _ = std::fs::remove_dir_all(self.dir.join("_shadow"));
-        self.persist_manifest(self.current_epoch())?;
-        Ok(())
+    }
+
+    pub(crate) fn checkpoint_altered_schema(&mut self) -> Result<()> {
+        checkpoint_current_schema(self)
     }
 
     pub fn alter_column(&mut self, column_name: &str, change: AlterColumn) -> Result<ColumnDef> {
         self.ensure_writable()?;
-        let column = self.prepare_alter_column(column_name, &change)?;
-        self.apply_altered_column(column.clone())?;
+        let previous_schema = self.schema.clone();
+        let (column, schema) = self.prepare_alter_column(column_name, &change)?;
+        if let Some(schema) = schema {
+            self.apply_altered_schema_prepared(schema);
+            self.checkpoint_standalone_schema_change(previous_schema)?;
+        }
         Ok(column)
     }
 
@@ -9057,24 +9975,23 @@ impl Table {
                 .checked_add(1)
                 .ok_or_else(|| MongrelError::Schema("column id space exhausted".into()))?
         };
-        self.schema.columns.push(ColumnDef {
+        let previous_schema = self.schema.clone();
+        let mut next_schema = previous_schema.clone();
+        next_schema.columns.push(ColumnDef {
             id,
             name: name.to_string(),
             ty,
             flags,
             default_value,
         });
-        self.schema.schema_id = self.schema.schema_id.saturating_add(1);
-        self.schema.validate_auto_increment()?;
-        self.schema.validate_defaults()?;
-        if flags.contains(ColumnFlags::AUTO_INCREMENT) {
-            self.auto_inc = resolve_auto_inc(&self.schema);
-        }
-        write_schema(&self.dir, &self.schema)?;
-        self.clear_result_cache();
-        // Phase 15.5: invalidate Arrow IPC shadows (schema changed).
-        let _ = std::fs::remove_dir_all(self.dir.join("_shadow"));
-        self.persist_manifest(self.current_epoch())?;
+        next_schema.schema_id = next_schema
+            .schema_id
+            .checked_add(1)
+            .ok_or_else(|| MongrelError::Schema("schema id space exhausted".into()))?;
+        next_schema.validate_auto_increment()?;
+        next_schema.validate_defaults()?;
+        self.apply_altered_schema_prepared(next_schema);
+        self.checkpoint_standalone_schema_change(previous_schema)?;
         Ok(id)
     }
 
@@ -9118,17 +10035,75 @@ impl Table {
         {
             return Ok(()); // already declared
         }
-        self.schema.indexes.push(IndexDef {
+        let previous_schema = self.schema.clone();
+        let previous_learned_range = Arc::clone(&self.learned_range);
+        let mut next_schema = previous_schema.clone();
+        next_schema.indexes.push(IndexDef {
             name: format!("{}_learned_range", column_name),
             column_id: cid,
             kind: IndexKind::LearnedRange,
             predicate: None,
             options: Default::default(),
         });
-        self.schema.schema_id = self.schema.schema_id.saturating_add(1);
-        write_schema(&self.dir, &self.schema)?;
-        self.build_learned_ranges()?;
+        next_schema.schema_id = next_schema
+            .schema_id
+            .checked_add(1)
+            .ok_or_else(|| MongrelError::Schema("schema id space exhausted".into()))?;
+        self.apply_altered_schema_prepared(next_schema);
+        if let Err(error) = self.build_learned_ranges() {
+            self.apply_altered_schema_prepared(previous_schema);
+            self.learned_range = previous_learned_range;
+            return Err(error);
+        }
+        if let Err(error) = self.checkpoint_standalone_schema_change(previous_schema) {
+            if !matches!(
+                &error,
+                MongrelError::DurableCommit { .. } | MongrelError::CommitOutcomeUnknown { .. }
+            ) {
+                self.learned_range = previous_learned_range;
+            }
+            return Err(error);
+        }
         Ok(())
+    }
+
+    fn checkpoint_standalone_schema_change(&mut self, previous_schema: Schema) -> Result<()> {
+        let mut schema_published = false;
+        let schema_result = match self._root_guard.as_deref() {
+            Some(root) => write_schema_durable_with_after(root, &self.schema, || {
+                schema_published = true;
+            }),
+            None => write_schema_with_after(&self.dir, &self.schema, || {
+                schema_published = true;
+            }),
+        };
+        if schema_result.is_err() && !schema_published {
+            self.apply_altered_schema_prepared(previous_schema);
+            return schema_result;
+        }
+
+        let manifest_result = self.persist_manifest(self.current_epoch());
+        match (schema_result, manifest_result) {
+            (_, Ok(())) => Ok(()),
+            (Ok(()), Err(error)) => {
+                self.poison_after_maintenance_publish_failure();
+                Err(MongrelError::DurableCommit {
+                    epoch: self.current_epoch().0,
+                    message: format!(
+                        "schema is durable but matching manifest publication failed: {error}"
+                    ),
+                })
+            }
+            (Err(schema_error), Err(manifest_error)) => {
+                self.poison_after_maintenance_publish_failure();
+                Err(MongrelError::CommitOutcomeUnknown {
+                    epoch: self.current_epoch().0,
+                    message: format!(
+                        "schema publication sync failed ({schema_error}); matching manifest publication also failed ({manifest_error})"
+                    ),
+                })
+            }
+        }
     }
 
     /// Tuning knob for the WAL auto-sync threshold. A no-op on a mounted table
@@ -9165,7 +10140,49 @@ impl Table {
     }
 
     pub(crate) fn run_path(&self, run_id: u64) -> PathBuf {
-        self.dir.join(RUNS_DIR).join(format!("r-{run_id}.sr"))
+        self.runs_dir().join(format!("r-{run_id}.sr"))
+    }
+
+    pub(crate) fn create_run_file(&self, run_id: u64) -> Result<Option<std::fs::File>> {
+        match self.runs_root.as_deref() {
+            Some(root) => Ok(Some(root.create_regular_new(format!("r-{run_id}.sr"))?)),
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) fn create_run_entry(&self, name: &Path) -> Result<Option<std::fs::File>> {
+        match self.runs_root.as_deref() {
+            Some(root) => Ok(Some(root.create_regular_new(name)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) fn remove_run_entry(&self, name: &Path) -> Result<()> {
+        match self.runs_root.as_deref() {
+            Some(root) => match root.remove_file(name) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error.into()),
+            },
+            None => match std::fs::remove_file(self.runs_dir().join(name)) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error.into()),
+            },
+        }
+    }
+
+    pub(crate) fn publish_run_entry(&self, source: &Path, destination: &Path) -> Result<()> {
+        match self.runs_root.as_deref() {
+            Some(root) => root
+                .rename_file_new(source, destination)
+                .map_err(Into::into),
+            None => crate::durable_file::rename(
+                &self.runs_dir().join(source),
+                &self.runs_dir().join(destination),
+            )
+            .map_err(Into::into),
+        }
     }
 
     pub(crate) fn active_run_ids(&self) -> impl Iterator<Item = u128> + '_ {
@@ -9180,10 +10197,13 @@ impl Table {
         &self.schema
     }
 
-    pub(crate) fn alloc_run_id(&mut self) -> u64 {
+    pub(crate) fn alloc_run_id(&mut self) -> Result<u64> {
         let id = self.next_run_id;
-        self.next_run_id += 1;
-        id
+        self.next_run_id = self
+            .next_run_id
+            .checked_add(1)
+            .ok_or_else(|| MongrelError::Full("run-id namespace exhausted".into()))?;
+        Ok(id)
     }
 
     pub(crate) fn link_run(&mut self, run_ref: crate::manifest::RunRef) {
@@ -9226,7 +10246,7 @@ impl Table {
         // detection, so the lingering entries are harmless until then.
         for r in std::mem::take(&mut self.retiring) {
             if min_active.0 >= r.retire_epoch && !backup_pinned.contains(&r.run_id) {
-                let _ = std::fs::remove_file(self.run_path(r.run_id as u64));
+                let _ = self.remove_run_entry(Path::new(&format!("r-{}.sr", r.run_id)));
                 reaped += 1;
             } else {
                 kept.push(r);
@@ -9237,6 +10257,16 @@ impl Table {
             self.persist_manifest(self.current_epoch())?;
         }
         Ok(reaped)
+    }
+
+    pub(crate) fn has_reapable_retiring(
+        &self,
+        min_active: Epoch,
+        backup_pinned: &std::collections::HashSet<u128>,
+    ) -> bool {
+        self.retiring
+            .iter()
+            .any(|run| min_active.0 >= run.retire_epoch && !backup_pinned.contains(&run.run_id))
     }
 
     pub(crate) fn recover_spilled_run(&mut self, run_ref: crate::manifest::RunRef) -> bool {
@@ -9254,15 +10284,27 @@ impl Table {
     }
 
     pub(crate) fn open_reader(&self, run_id: u128) -> Result<RunReader> {
-        let mut reader = RunReader::open_with_cache(
-            self.dir.join(RUNS_DIR).join(format!("r-{run_id}.sr")),
-            self.schema.clone(),
-            self.kek.clone(),
-            Some(self.page_cache.clone()),
-            Some(self.decoded_cache.clone()),
-            self.table_id,
-            Some(&self.verified_runs),
-        )?;
+        let mut reader = match self.runs_root.as_deref() {
+            Some(root) => RunReader::open_file_with_cache(
+                root.open_regular(format!("r-{run_id}.sr"))?,
+                self.schema.clone(),
+                self.kek.clone(),
+                Some(self.page_cache.clone()),
+                Some(self.decoded_cache.clone()),
+                self.table_id,
+                Some(&self.verified_runs),
+                None,
+            )?,
+            None => RunReader::open_with_cache(
+                self.dir.join(RUNS_DIR).join(format!("r-{run_id}.sr")),
+                self.schema.clone(),
+                self.kek.clone(),
+                Some(self.page_cache.clone()),
+                Some(self.decoded_cache.clone()),
+                self.table_id,
+                Some(&self.verified_runs),
+            )?,
+        };
         // Overlay the real commit epoch for uniform-epoch (large-txn spill) runs:
         // their stored `_epoch` is a placeholder; the manifest RunRef carries the
         // assigned epoch. A no-op for ordinary runs.
@@ -9281,7 +10323,10 @@ impl Table {
     }
 
     pub(crate) fn runs_dir(&self) -> PathBuf {
-        self.dir.join(RUNS_DIR)
+        self.runs_root
+            .as_deref()
+            .and_then(|root| root.io_path().ok())
+            .unwrap_or_else(|| self.dir.join(RUNS_DIR))
     }
 
     pub(crate) fn wal_dir(&self) -> PathBuf {
@@ -9292,16 +10337,8 @@ impl Table {
         self.run_refs = refs;
     }
 
-    pub(crate) fn next_run_id(&self) -> u64 {
-        self.next_run_id
-    }
-
     pub(crate) fn compaction_zstd_level(&self) -> i32 {
         self.compaction_zstd_level
-    }
-
-    pub(crate) fn bump_next_run_id(&mut self) {
-        self.next_run_id += 1;
     }
 
     pub(crate) fn kek(&self) -> Option<Arc<Kek>> {
@@ -10250,19 +11287,275 @@ fn bulk_index_key(
 }
 
 pub(crate) fn write_schema(dir: &Path, schema: &Schema) -> Result<()> {
+    write_schema_with_after(dir, schema, || {})
+}
+
+pub(crate) fn write_schema_durable(
+    root: &crate::durable_file::DurableRoot,
+    schema: &Schema,
+) -> Result<()> {
+    write_schema_durable_with_after(root, schema, || {})
+}
+
+fn write_schema_with_after<F>(dir: &Path, schema: &Schema, after_publish: F) -> Result<()>
+where
+    F: FnOnce(),
+{
     let json = serde_json::to_string_pretty(schema)
         .map_err(|e| MongrelError::Schema(format!("encode schema: {e}")))?;
-    std::fs::write(dir.join(SCHEMA_FILENAME), json)?;
+    crate::durable_file::write_atomic_with_after(
+        &dir.join(SCHEMA_FILENAME),
+        json.as_bytes(),
+        after_publish,
+    )?;
     Ok(())
 }
 
+fn write_schema_durable_with_after<F>(
+    root: &crate::durable_file::DurableRoot,
+    schema: &Schema,
+    after_publish: F,
+) -> Result<()>
+where
+    F: FnOnce(),
+{
+    let json = serde_json::to_string_pretty(schema)
+        .map_err(|error| MongrelError::Schema(format!("encode schema: {error}")))?;
+    root.write_atomic_with_after(SCHEMA_FILENAME, json.as_bytes(), after_publish)?;
+    Ok(())
+}
+
+fn checkpoint_current_schema(table: &mut Table) -> Result<()> {
+    let mut schema_published = false;
+    let schema_result = match table._root_guard.as_deref() {
+        Some(root) => write_schema_durable_with_after(root, &table.schema, || {
+            schema_published = true;
+        }),
+        None => write_schema_with_after(&table.dir, &table.schema, || {
+            schema_published = true;
+        }),
+    };
+    if schema_result.is_err() && !schema_published {
+        return schema_result;
+    }
+    match table.persist_manifest(table.current_epoch()) {
+        Ok(()) => Ok(()),
+        Err(manifest_error) => Err(match schema_result {
+            Ok(()) => manifest_error,
+            Err(schema_error) => MongrelError::Other(format!(
+                "schema publication sync failed ({schema_error}); matching manifest publication also failed ({manifest_error})"
+            )),
+        }),
+    }
+}
+
 fn read_schema(dir: &Path) -> Result<Schema> {
-    serde_json::from_str(&std::fs::read_to_string(dir.join(SCHEMA_FILENAME))?)
-        .map_err(|e| MongrelError::Schema(format!("decode schema: {e}")))
+    let file = crate::durable_file::open_regular_nofollow(&dir.join(SCHEMA_FILENAME))?;
+    read_schema_file(file)
+}
+
+fn read_schema_file(file: std::fs::File) -> Result<Schema> {
+    const MAX_SCHEMA_BYTES: u64 = 16 * 1024 * 1024;
+    use std::io::Read;
+
+    let length = file.metadata()?.len();
+    if length > MAX_SCHEMA_BYTES {
+        return Err(MongrelError::ResourceLimitExceeded {
+            resource: "schema bytes",
+            requested: usize::try_from(length).unwrap_or(usize::MAX),
+            limit: MAX_SCHEMA_BYTES as usize,
+        });
+    }
+    let mut bytes = Vec::with_capacity(length as usize);
+    file.take(MAX_SCHEMA_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != length {
+        return Err(MongrelError::Schema(
+            "schema length changed while reading".into(),
+        ));
+    }
+    serde_json::from_slice(&bytes).map_err(|e| MongrelError::Schema(format!("decode schema: {e}")))
+}
+
+fn preflight_standalone_open(
+    dir: &Path,
+    runs_root: Option<&crate::durable_file::DurableRoot>,
+    idx_root: Option<&crate::durable_file::DurableRoot>,
+    manifest: &Manifest,
+    schema: &Schema,
+    records: &[crate::wal::Record],
+    kek: Option<Arc<Kek>>,
+) -> Result<()> {
+    crate::wal::validate_shared_transaction_framing(records)?;
+    if manifest.schema_id > schema.schema_id
+        || manifest.flushed_epoch > manifest.current_epoch
+        || manifest.global_idx_epoch > manifest.current_epoch
+        || manifest.next_row_id == u64::MAX
+        || manifest.auto_inc_next < 0
+        || manifest.auto_inc_next == i64::MAX
+        || (schema.auto_increment_column().is_none() && manifest.auto_inc_next != 0)
+    {
+        return Err(MongrelError::InvalidArgument(
+            "manifest counters or schema identity are invalid".into(),
+        ));
+    }
+    let mut run_ids = HashSet::new();
+    let mut maximum_row_id = None::<u64>;
+    for run in &manifest.runs {
+        if run.run_id >= u64::MAX as u128
+            || !run_ids.insert(run.run_id)
+            || run.epoch_created > manifest.current_epoch
+        {
+            return Err(MongrelError::InvalidArgument(
+                "manifest contains an invalid or duplicate active run".into(),
+            ));
+        }
+        let mut reader = match runs_root {
+            Some(root) => RunReader::open_file(
+                root.open_regular(format!("r-{}.sr", run.run_id as u64))?,
+                schema.clone(),
+                kek.clone(),
+            )?,
+            None => RunReader::open(
+                dir.join(RUNS_DIR)
+                    .join(format!("r-{}.sr", run.run_id as u64)),
+                schema.clone(),
+                kek.clone(),
+            )?,
+        };
+        let header = reader.header();
+        if header.run_id != run.run_id
+            || header.level != run.level
+            || header.row_count != run.row_count
+            || !header.is_uniform_epoch() && header.epoch_created != run.epoch_created
+            || header.is_uniform_epoch() && header.epoch_created != 0
+            || header.schema_id > schema.schema_id
+        {
+            return Err(MongrelError::InvalidArgument(format!(
+                "run {} differs from its manifest",
+                run.run_id
+            )));
+        }
+        if header.row_count != 0 {
+            maximum_row_id = Some(
+                maximum_row_id.map_or(header.max_row_id, |value| value.max(header.max_row_id)),
+            );
+        }
+        reader.validate_all_pages()?;
+    }
+    if maximum_row_id.is_some_and(|maximum| manifest.next_row_id <= maximum) {
+        return Err(MongrelError::InvalidArgument(
+            "manifest next_row_id does not advance beyond persisted rows".into(),
+        ));
+    }
+    for run in &manifest.retiring {
+        if run.run_id >= u64::MAX as u128
+            || run.retire_epoch > manifest.current_epoch
+            || !run_ids.insert(run.run_id)
+        {
+            return Err(MongrelError::InvalidArgument(
+                "manifest contains an invalid or duplicate retired run".into(),
+            ));
+        }
+    }
+    #[cfg(feature = "encryption")]
+    let idx_dek = kek.as_ref().map(|key| key.derive_idx_key());
+    #[cfg(not(feature = "encryption"))]
+    let idx_dek: Option<Zeroizing<[u8; DEK_LEN]>> = None;
+    match idx_root {
+        Some(root) => {
+            global_idx::read_root(root, manifest.table_id, schema, idx_dek.as_deref())?;
+        }
+        None => {
+            global_idx::read(dir, manifest.table_id, schema, idx_dek.as_deref())?;
+        }
+    }
+
+    let committed = records
+        .iter()
+        .filter_map(|record| match record.op {
+            Op::TxnCommit { epoch, .. } => Some((record.txn_id, epoch)),
+            _ => None,
+        })
+        .collect::<HashMap<_, _>>();
+    for record in records {
+        let Some(&_commit_epoch) = committed.get(&record.txn_id) else {
+            continue;
+        };
+        match &record.op {
+            Op::Put { table_id, rows } => {
+                if *table_id != manifest.table_id {
+                    return Err(MongrelError::CorruptWal {
+                        offset: record.seq.0,
+                        reason: format!(
+                            "private WAL record references table {table_id}, expected {}",
+                            manifest.table_id
+                        ),
+                    });
+                }
+                let rows: Vec<Row> =
+                    bincode::deserialize(rows).map_err(|error| MongrelError::CorruptWal {
+                        offset: record.seq.0,
+                        reason: format!("committed Put payload could not be decoded: {error}"),
+                    })?;
+                for row in rows {
+                    if row.deleted || row.row_id.0 == u64::MAX {
+                        return Err(MongrelError::CorruptWal {
+                            offset: record.seq.0,
+                            reason: "committed Put contains an invalid row identity".into(),
+                        });
+                    }
+                    let cells = row.columns.into_iter().collect::<Vec<_>>();
+                    schema
+                        .validate_values(&cells)
+                        .map_err(|error| MongrelError::CorruptWal {
+                            offset: record.seq.0,
+                            reason: format!("committed Put violates table schema: {error}"),
+                        })?;
+                    if schema.auto_increment_column().is_some_and(|column| {
+                        matches!(
+                            cells.iter().find(|(id, _)| *id == column.id),
+                            Some((_, Value::Int64(value))) if *value == i64::MAX
+                        )
+                    }) {
+                        return Err(MongrelError::CorruptWal {
+                            offset: record.seq.0,
+                            reason: "committed Put exhausts AUTO_INCREMENT".into(),
+                        });
+                    }
+                }
+            }
+            Op::Delete { table_id, .. } | Op::TruncateTable { table_id }
+                if *table_id != manifest.table_id =>
+            {
+                return Err(MongrelError::CorruptWal {
+                    offset: record.seq.0,
+                    reason: format!(
+                        "private WAL record references table {table_id}, expected {}",
+                        manifest.table_id
+                    ),
+                });
+            }
+            Op::TxnCommit { added_runs, .. } if !added_runs.is_empty() => {
+                return Err(MongrelError::CorruptWal {
+                    offset: record.seq.0,
+                    reason: "private WAL contains shared spilled-run metadata".into(),
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn next_wal_segment(wal_dir: &Path) -> Result<PathBuf> {
     Ok(wal_dir.join(format!("seg-{:06}.wal", next_wal_number(wal_dir)?)))
+}
+
+fn wal_segment_number(path: &Path) -> Option<u64> {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| stem.strip_prefix("seg-"))
+        .and_then(|number| number.parse().ok())
 }
 
 fn latest_wal_segment(wal_dir: &Path) -> Result<Option<PathBuf>> {
@@ -10271,13 +11564,23 @@ fn latest_wal_segment(wal_dir: &Path) -> Result<Option<PathBuf>> {
 }
 
 fn next_wal_number(wal_dir: &Path) -> Result<u32> {
-    Ok(list_wal_numbers(wal_dir)?.map(|m| m + 1).unwrap_or(0))
+    list_wal_numbers(wal_dir)?
+        .map(|maximum| {
+            maximum
+                .checked_add(1)
+                .ok_or_else(|| MongrelError::Full("WAL segment namespace exhausted".into()))
+        })
+        .unwrap_or(Ok(0))
 }
 
 fn list_wal_numbers(wal_dir: &Path) -> Result<Option<u32>> {
-    let _ = std::fs::create_dir_all(wal_dir);
     let mut max_n = None;
-    for entry in std::fs::read_dir(wal_dir)? {
+    let entries = match std::fs::read_dir(wal_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
         let entry = entry?;
         let fname = entry.file_name();
         let Some(s) = fname.to_str() else {
@@ -10286,12 +11589,25 @@ fn list_wal_numbers(wal_dir: &Path) -> Result<Option<u32>> {
         let Some(stripped) = s.strip_prefix("seg-") else {
             continue;
         };
-        let Some(stripped) = stripped.strip_suffix(".wal") else {
-            continue;
+        let Some(number) = stripped.strip_suffix(".wal") else {
+            return Err(MongrelError::CorruptWal {
+                offset: 0,
+                reason: format!("malformed WAL segment name {s:?}"),
+            });
         };
-        if let Ok(n) = stripped.parse::<u32>() {
-            max_n = Some(max_n.map(|m: u32| m.max(n)).unwrap_or(n));
+        let n = number
+            .parse::<u32>()
+            .map_err(|_| MongrelError::CorruptWal {
+                offset: 0,
+                reason: format!("malformed WAL segment name {s:?}"),
+            })?;
+        if s != format!("seg-{n:06}.wal") || !entry.file_type()?.is_file() {
+            return Err(MongrelError::CorruptWal {
+                offset: n as u64,
+                reason: format!("noncanonical or nonregular WAL segment {s:?}"),
+            });
         }
+        max_n = Some(max_n.map(|m: u32| m.max(n)).unwrap_or(n));
     }
     Ok(max_n)
 }

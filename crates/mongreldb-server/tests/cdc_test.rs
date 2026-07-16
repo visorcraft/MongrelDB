@@ -82,11 +82,28 @@ async fn events_is_resumable_sse() {
 async fn events_rejects_malformed_resume_id() {
     let dir = tempdir().unwrap();
     let db = Arc::new(Database::create(dir.path()).unwrap());
-    let response = build_app(db)
+    let app = build_app(db);
+    let response = app
+        .clone()
         .oneshot(
             axum::http::Request::builder()
                 .uri("/events")
                 .header("last-event-id", "broken")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/events")
+                .header(
+                    "last-event-id",
+                    axum::http::HeaderValue::from_bytes(&[0xff]).unwrap(),
+                )
                 .body(axum::body::Body::empty())
                 .unwrap(),
         )

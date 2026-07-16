@@ -16,58 +16,239 @@
 
 #![deny(clippy::all)]
 
+use base64::Engine as _;
 use mongreldb_core::query::{AnnRerankRequest, Condition, Query, VectorMetric};
 use mongreldb_core::schema::{
     AlterColumn, ColumnDef, ColumnFlags, DefaultExpr, IndexDef, IndexKind, Schema, TypeId,
 };
 use mongreldb_core::{RowId, Value};
-use napi::bindgen_prelude::{BigInt, Buffer};
+use napi::bindgen_prelude::{AsyncTask, BigInt, Buffer, ToNapiValue, TypeName, ValueType};
+use napi::{Env, JsObject, NapiRaw};
 use napi_derive::napi;
 use std::io::Read;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use zeroize::{Zeroize, Zeroizing};
 
-/// Map core errors to NAPI with stable category prefixes so the JS wrapper can
-/// recognize retryable conflicts (`__CONFLICT__:`) and missing entities
-/// (`__NOT_FOUND__:`).
+/// Map general core errors to NAPI. Transaction commits use
+/// [`throw_core_commit_error`] so retry control flow has a stable error code.
 fn to_napi(e: mongreldb_core::MongrelError) -> napi::Error {
-    let msg = match &e {
-        mongreldb_core::MongrelError::Conflict(msg) => format!("__CONFLICT__:{msg}"),
-        mongreldb_core::MongrelError::NotFound(msg) => format!("__NOT_FOUND__:{msg}"),
-        _ => format!("{e:?}"),
-    };
+    let msg = legacy_core_error_message(&e);
     napi::Error::new(napi::Status::GenericFailure, msg)
 }
 
-fn query_to_napi(error: mongreldb_query::MongrelQueryError) -> napi::Error {
-    let message = match &error {
-        mongreldb_query::MongrelQueryError::QueryCancelled {
-            query_id, reason, ..
-        } => {
-            format!("__QUERY_CANCELLED__:{query_id}:{reason:?}")
-        }
-        mongreldb_query::MongrelQueryError::DeadlineExceeded {
-            query_id,
-            timeout_ms,
-            ..
-        } => {
-            format!("__DEADLINE_EXCEEDED__:{query_id}:{timeout_ms:?}")
-        }
-        mongreldb_query::MongrelQueryError::QueryIdConflict { query_id } => {
-            format!("__QUERY_ID_CONFLICT__:{query_id}")
-        }
-        mongreldb_query::MongrelQueryError::TransactionAborted => {
-            "__TRANSACTION_ABORTED__:transaction is aborted".into()
-        }
-        _ => error.to_string(),
+fn legacy_core_error_message(error: &mongreldb_core::MongrelError) -> String {
+    match error {
+        mongreldb_core::MongrelError::Conflict(msg) => format!("__CONFLICT__:{msg}"),
+        mongreldb_core::MongrelError::NotFound(msg) => format!("__NOT_FOUND__:{msg}"),
+        _ => format!("{error:?}"),
+    }
+}
+
+const CORE_CONFLICT_CODE: &str = "MONGRELDB_CONFLICT";
+const CORE_ERROR_CODE: &str = "MONGRELDB_ERROR";
+const CORE_AUTH_REQUIRED_CODE: &str = "MONGRELDB_AUTH_REQUIRED";
+const CORE_DATABASE_LOCKED_CODE: &str = "MONGRELDB_DATABASE_LOCKED";
+const CORE_DATABASE_CLOSED_CODE: &str = "MONGRELDB_DATABASE_CLOSED";
+const CORE_NOT_FOUND_CODE: &str = "MONGRELDB_NOT_FOUND";
+const CORE_COMMIT_OUTCOME_CODE: &str = "COMMIT_OUTCOME";
+const CORE_COMMIT_OUTCOME_UNKNOWN_CODE: &str = "COMMIT_OUTCOME_UNKNOWN";
+
+fn core_open_error_code(error: &mongreldb_core::MongrelError) -> &'static str {
+    match error {
+        mongreldb_core::MongrelError::AuthRequired => CORE_AUTH_REQUIRED_CODE,
+        mongreldb_core::MongrelError::DatabaseLocked { .. } => CORE_DATABASE_LOCKED_CODE,
+        mongreldb_core::MongrelError::NotFound(_) => CORE_NOT_FOUND_CODE,
+        _ => CORE_ERROR_CODE,
+    }
+}
+
+fn open_to_coded_napi(error: mongreldb_core::MongrelError) -> napi::Error<String> {
+    napi::Error::new(core_open_error_code(&error).to_owned(), error.to_string())
+}
+
+fn trigger_to_coded_napi(error: mongreldb_core::MongrelError) -> napi::Error<String> {
+    let code = if matches!(error, mongreldb_core::MongrelError::TriggerValidation(_)) {
+        "TRIGGER_VALIDATION"
+    } else {
+        napi::Status::GenericFailure.as_ref()
     };
-    napi::Error::new(napi::Status::GenericFailure, message)
+    napi::Error::new(code.to_owned(), legacy_core_error_message(&error))
+}
+
+#[cfg(test)]
+mod core_open_error_tests {
+    use super::*;
+
+    #[test]
+    fn auth_and_lock_codes_are_stable() {
+        assert_eq!(
+            core_open_error_code(&mongreldb_core::MongrelError::AuthRequired),
+            "MONGRELDB_AUTH_REQUIRED"
+        );
+        assert_eq!(
+            core_open_error_code(&mongreldb_core::MongrelError::DatabaseLocked {
+                path: "/tmp/db".into(),
+                message: "busy".into(),
+            }),
+            "MONGRELDB_DATABASE_LOCKED"
+        );
+        assert_eq!(
+            core_open_error_code(&mongreldb_core::MongrelError::NotFound("missing".into())),
+            "MONGRELDB_NOT_FOUND"
+        );
+        let trigger = trigger_to_coded_napi(mongreldb_core::MongrelError::TriggerValidation(
+            "bad reference".into(),
+        ));
+        assert_eq!(trigger.status, "TRIGGER_VALIDATION");
+        let conflict = trigger_to_coded_napi(mongreldb_core::MongrelError::Conflict(
+            "trigger race".into(),
+        ));
+        assert_eq!(conflict.reason, "__CONFLICT__:trigger race");
+    }
+
+    #[test]
+    fn transaction_conflict_restores_stage_but_unknown_outcomes_poison() {
+        let state = Arc::new(parking_lot::Mutex::new(NodeTransactionState {
+            phase: NodeTransactionPhase::Active,
+            staging: vec![("items".into(), TxnOp::Truncate)],
+        }));
+        let mut stage = state.lock().begin_commit().unwrap();
+        let conflict = Err(mongreldb_core::MongrelError::Conflict("retry".into()));
+        finish_node_transaction_commit(&state, &conflict, &mut stage);
+        assert_eq!(state.lock().phase, NodeTransactionPhase::Active);
+        assert_eq!(state.lock().staging.len(), 1);
+
+        let mut stage = state.lock().begin_commit().unwrap();
+        let durable = Err(mongreldb_core::MongrelError::DurableCommit {
+            epoch: 7,
+            message: "published".into(),
+        });
+        finish_node_transaction_commit(&state, &durable, &mut stage);
+        assert_eq!(state.lock().phase, NodeTransactionPhase::Poisoned);
+
+        let unknown_state = Arc::new(parking_lot::Mutex::new(NodeTransactionState {
+            phase: NodeTransactionPhase::InFlight,
+            staging: Vec::new(),
+        }));
+        let mut unknown_stage = vec![("items".into(), TxnOp::Truncate)];
+        let unknown = Err(mongreldb_core::MongrelError::CommitOutcomeUnknown {
+            epoch: 9,
+            message: "fsync".into(),
+        });
+        finish_node_transaction_commit(&unknown_state, &unknown, &mut unknown_stage);
+        assert_eq!(unknown_state.lock().phase, NodeTransactionPhase::Poisoned);
+    }
+
+    #[test]
+    fn commit_error_details_preserve_durable_outcomes() {
+        let durable = core_commit_error_details(&mongreldb_core::MongrelError::DurableCommit {
+            epoch: 7,
+            message: "published".into(),
+        });
+        assert_eq!(durable.code, "COMMIT_OUTCOME");
+        assert!(durable.outcome_known);
+        assert_eq!(durable.committed, Some(true));
+        assert_eq!(durable.epoch, Some(7));
+        assert!(!durable.retryable);
+
+        let unknown =
+            core_commit_error_details(&mongreldb_core::MongrelError::CommitOutcomeUnknown {
+                epoch: 9,
+                message: "fsync".into(),
+            });
+        assert_eq!(unknown.code, "COMMIT_OUTCOME_UNKNOWN");
+        assert!(!unknown.outcome_known);
+        assert_eq!(unknown.committed, None);
+        assert_eq!(unknown.epoch, Some(9));
+        assert!(!unknown.retryable);
+    }
+}
+
+struct CoreCommitErrorDetails {
+    code: &'static str,
+    retryable: bool,
+    category: &'static str,
+    outcome_known: bool,
+    committed: Option<bool>,
+    epoch: Option<u64>,
+}
+
+fn core_commit_error_details(error: &mongreldb_core::MongrelError) -> CoreCommitErrorDetails {
+    match error {
+        mongreldb_core::MongrelError::Conflict(_) => CoreCommitErrorDetails {
+            code: CORE_CONFLICT_CODE,
+            retryable: true,
+            category: "conflict",
+            outcome_known: true,
+            committed: Some(false),
+            epoch: None,
+        },
+        mongreldb_core::MongrelError::DurableCommit { epoch, .. } => CoreCommitErrorDetails {
+            code: CORE_COMMIT_OUTCOME_CODE,
+            retryable: false,
+            category: "commit",
+            outcome_known: true,
+            committed: Some(true),
+            epoch: Some(*epoch),
+        },
+        mongreldb_core::MongrelError::CommitOutcomeUnknown { epoch, .. } => {
+            CoreCommitErrorDetails {
+                code: CORE_COMMIT_OUTCOME_UNKNOWN_CODE,
+                retryable: false,
+                category: "outcome_unknown",
+                outcome_known: false,
+                committed: None,
+                epoch: Some(*epoch),
+            }
+        }
+        _ => CoreCommitErrorDetails {
+            code: CORE_ERROR_CODE,
+            retryable: false,
+            category: "core",
+            outcome_known: true,
+            committed: Some(false),
+            epoch: None,
+        },
+    }
+}
+
+fn throw_core_commit_error<T>(env: &Env, error: mongreldb_core::MongrelError) -> napi::Result<T> {
+    let details = core_commit_error_details(&error);
+    let mut js_error = env.create_error(napi::Error::new(
+        napi::Status::GenericFailure,
+        error.to_string(),
+    ))?;
+    js_error.set_named_property("code", details.code)?;
+    js_error.set_named_property("retryable", details.retryable)?;
+    js_error.set_named_property("category", details.category)?;
+    js_error.set_named_property("outcomeKnown", details.outcome_known)?;
+    js_error.set_named_property("committed", details.committed)?;
+    js_error.set_named_property("epoch", details.epoch.map(BigInt::from))?;
+    js_error.set_named_property("epochText", details.epoch.map(|epoch| epoch.to_string()))?;
+    Err(napi::Error::from(js_error.into_unknown()))
+}
+
+fn query_to_napi(error: mongreldb_query::MongrelQueryError) -> napi::Error {
+    napi::Error::new(napi::Status::GenericFailure, error.to_string())
+}
+
+fn query_to_coded_napi(error: mongreldb_query::MongrelQueryError) -> napi::Error<String> {
+    napi::Error::new(error.code().to_owned(), error.to_string())
+}
+
+fn erase_napi_code(error: napi::Error<String>) -> napi::Error {
+    napi::Error::new(napi::Status::GenericFailure, error.reason)
 }
 
 /// Map a transaction-commit result to JS, preserving conflict categories.
 fn commit_result_to_napi(
+    env: &Env,
     result: mongreldb_core::Result<mongreldb_core::Epoch>,
 ) -> napi::Result<BigInt> {
-    result.map(|epoch| BigInt::from(epoch.0)).map_err(to_napi)
+    match result {
+        Ok(epoch) => Ok(BigInt::from(epoch.0)),
+        Err(error) => throw_core_commit_error(env, error),
+    }
 }
 
 /// Convert a JS `BigInt` to `i64`, rejecting out-of-range values instead of
@@ -974,7 +1155,7 @@ use mongreldb_core::Database as CoreDatabase;
 /// `table(name)`; SQL queries via `sql()`.
 #[napi]
 pub struct Database {
-    inner: Arc<CoreDatabase>,
+    inner: Option<Arc<CoreDatabase>>,
     path: String,
     /// Lazily-initialized long-lived SQL session. Views, prepared statements,
     /// and the result cache are session-scoped (the engine does not persist
@@ -988,34 +1169,226 @@ pub struct Database {
 pub struct NativeSqlOptions {
     pub query_id: Option<String>,
     pub timeout_ms: Option<u32>,
+    pub max_output_rows: Option<u32>,
+    pub max_output_bytes: Option<u32>,
+    pub idempotency_key: Option<String>,
+}
+
+#[napi(string_enum)]
+#[derive(PartialEq, Eq)]
+pub enum NativeCancelOutcome {
+    Accepted,
+    AlreadyCancelling,
+    TooLate,
+    AlreadyFinished,
+    NotFound,
+    PreCancelled,
+}
+
+fn native_cancel_outcome(outcome: mongreldb_query::CancelOutcome) -> NativeCancelOutcome {
+    match outcome {
+        mongreldb_query::CancelOutcome::Accepted => NativeCancelOutcome::Accepted,
+        mongreldb_query::CancelOutcome::AlreadyCancelling => NativeCancelOutcome::AlreadyCancelling,
+        mongreldb_query::CancelOutcome::TooLate => NativeCancelOutcome::TooLate,
+        mongreldb_query::CancelOutcome::AlreadyFinished => NativeCancelOutcome::AlreadyFinished,
+        mongreldb_query::CancelOutcome::NotFound => NativeCancelOutcome::NotFound,
+    }
+}
+
+fn query_phase_name(phase: mongreldb_query::SqlQueryPhase) -> &'static str {
+    use mongreldb_query::SqlQueryPhase;
+    match phase {
+        SqlQueryPhase::Queued => "queued",
+        SqlQueryPhase::Planning => "planning",
+        SqlQueryPhase::Executing => "executing",
+        SqlQueryPhase::Streaming => "streaming",
+        SqlQueryPhase::Serializing => "serializing",
+        SqlQueryPhase::CommitCritical => "commit_critical",
+        SqlQueryPhase::Cancelling => "cancelling",
+        SqlQueryPhase::Completed => "completed",
+        SqlQueryPhase::Failed => "failed",
+        SqlQueryPhase::Cancelled => "cancelled",
+    }
+}
+
+fn query_terminal_state_name(state: mongreldb_query::QueryTerminalState) -> &'static str {
+    use mongreldb_query::QueryTerminalState;
+    match state {
+        QueryTerminalState::OutcomeUnknown => "outcome_unknown",
+        QueryTerminalState::Completed => "completed",
+        QueryTerminalState::FailedBeforeCommit => "failed_before_commit",
+        QueryTerminalState::CancelledBeforeCommit => "cancelled_before_commit",
+        QueryTerminalState::DeadlineBeforeCommit => "deadline_before_commit",
+        QueryTerminalState::Committed => "committed",
+        QueryTerminalState::CommittedWithError => "committed_with_error",
+        QueryTerminalState::PartiallyCommitted => "partially_committed",
+        QueryTerminalState::CancelledAfterCommit => "cancelled_after_commit",
+        QueryTerminalState::DeadlineAfterCommit => "deadline_after_commit",
+    }
+}
+
+#[napi(object)]
+pub struct NativeDurableOutcome {
+    pub outcome_known: bool,
+    pub committed: Option<bool>,
+    pub committed_statements: Option<u32>,
+    pub last_commit_epoch: Option<BigInt>,
+    pub first_commit_statement_index: Option<u32>,
+    pub last_commit_statement_index: Option<u32>,
+}
+
+#[napi(object)]
+pub struct NativeQueryStatus {
+    pub query_id: String,
+    pub phase: String,
+    pub server_state: String,
+    pub terminal_state: Option<String>,
+    pub operation: String,
+    pub outcome_known: bool,
+    pub committed: Option<bool>,
+    pub durable_outcome: NativeDurableOutcome,
+    pub terminal_error_code: Option<String>,
+    pub terminal_error_category: Option<String>,
+    pub completed_statements: Option<u32>,
+    pub statement_index: Option<u32>,
+    pub cancel_outcome: Option<NativeCancelOutcome>,
+    pub cancellation_reason: String,
+    pub retryable: bool,
+}
+
+fn native_query_status(status: mongreldb_query::QueryStatus) -> NativeQueryStatus {
+    let durable = status.durable_outcome.clone();
+    let outcome_known = !status.outcome_unknown;
+    let terminal_state = status
+        .terminal_state()
+        .map(|state| query_terminal_state_name(state).to_owned());
+    let terminal_error_category = status.terminal_error.as_ref().map(|error| {
+        use mongreldb_query::QueryTerminalErrorCategory;
+        match error.category {
+            QueryTerminalErrorCategory::Cancellation => "cancellation",
+            QueryTerminalErrorCategory::Deadline => "deadline",
+            QueryTerminalErrorCategory::ResultLimit => "result_limit",
+            QueryTerminalErrorCategory::Serialization => "serialization",
+            QueryTerminalErrorCategory::Execution => "execution",
+        }
+        .to_owned()
+    });
+    let terminal_error_code = status
+        .terminal_error
+        .as_ref()
+        .map(|error| error.code.clone());
+    let retryable = status.terminal_error.as_ref().is_some_and(|error| {
+        matches!(
+            error.code.as_str(),
+            "IDEMPOTENCY_STORE_FULL" | "IDEMPOTENCY_STORE_UNAVAILABLE"
+        )
+    });
+    let cancel_outcome = match status.phase {
+        mongreldb_query::SqlQueryPhase::CommitCritical => Some(NativeCancelOutcome::TooLate),
+        mongreldb_query::SqlQueryPhase::Completed
+        | mongreldb_query::SqlQueryPhase::Failed
+        | mongreldb_query::SqlQueryPhase::Cancelled => Some(NativeCancelOutcome::AlreadyFinished),
+        mongreldb_query::SqlQueryPhase::Cancelling => Some(NativeCancelOutcome::Accepted),
+        _ => None,
+    };
+    let phase = query_phase_name(status.phase).to_owned();
+    NativeQueryStatus {
+        query_id: status.query_id.to_string(),
+        server_state: phase.clone(),
+        phase,
+        terminal_state,
+        operation: status.operation,
+        outcome_known,
+        committed: outcome_known.then_some(status.committed),
+        durable_outcome: NativeDurableOutcome {
+            outcome_known,
+            committed: outcome_known.then_some(durable.committed),
+            committed_statements: outcome_known
+                .then_some(durable.committed_statements.min(u32::MAX as usize) as u32),
+            last_commit_epoch: outcome_known
+                .then_some(durable.last_commit_epoch.map(BigInt::from))
+                .flatten(),
+            first_commit_statement_index: outcome_known
+                .then_some(
+                    durable
+                        .first_commit_statement_index
+                        .map(|index| index.min(u32::MAX as usize) as u32),
+                )
+                .flatten(),
+            last_commit_statement_index: outcome_known
+                .then_some(
+                    durable
+                        .last_commit_statement_index
+                        .map(|index| index.min(u32::MAX as usize) as u32),
+                )
+                .flatten(),
+        },
+        terminal_error_code,
+        terminal_error_category,
+        completed_statements: outcome_known
+            .then_some(status.completed_statements.min(u32::MAX as usize) as u32),
+        statement_index: outcome_known
+            .then_some(status.statement_index.min(u32::MAX as usize) as u32),
+        cancel_outcome,
+        cancellation_reason: status.cancellation_reason.as_str().to_owned(),
+        retryable,
+    }
 }
 
 #[napi]
 pub struct NativeSqlQuery {
     id: mongreldb_query::QueryId,
-    session: Arc<mongreldb_query::MongrelSession>,
+    query: mongreldb_query::RegisteredSqlQuery,
+    session: std::sync::Weak<mongreldb_query::MongrelSession>,
     sql: String,
+    max_output_rows: usize,
+    max_output_bytes: usize,
     registration: parking_lot::Mutex<Option<mongreldb_query::RegisteredQueryGuard>>,
 }
 
 impl Drop for NativeSqlQuery {
     fn drop(&mut self) {
         if self.registration.get_mut().is_some() {
-            let _ = self.id;
-            let _ = self.session.cancel_query(self.id);
+            let _ = self
+                .query
+                .request_cancel(mongreldb_core::CancellationReason::ClientDisconnected);
         }
     }
 }
 
+impl NativeSqlQuery {
+    fn session(&self) -> napi::Result<Arc<mongreldb_query::MongrelSession>, String> {
+        self.session.upgrade().ok_or_else(|| {
+            napi::Error::new(
+                CORE_DATABASE_CLOSED_CODE.to_owned(),
+                format!("{CORE_DATABASE_CLOSED_CODE}: database was closed before SQL execution"),
+            )
+        })
+    }
+}
+
 impl Database {
+    fn core(&self) -> napi::Result<Arc<CoreDatabase>> {
+        self.inner.as_ref().cloned().ok_or_else(|| {
+            napi::Error::new(
+                napi::Status::GenericFailure,
+                format!("{CORE_DATABASE_CLOSED_CODE}: database is closed"),
+            )
+        })
+    }
+
+    fn core_coded(&self) -> napi::Result<Arc<CoreDatabase>, String> {
+        self.core()
+            .map_err(|error| napi::Error::new(CORE_DATABASE_CLOSED_CODE.to_owned(), error.reason))
+    }
+
     fn sql_session(&self) -> napi::Result<Arc<mongreldb_query::MongrelSession>> {
         if let Some(session) = self.session.get() {
             return Ok(Arc::clone(session));
         }
-        let session = Arc::new(
-            mongreldb_query::MongrelSession::open(Arc::clone(&self.inner))
-                .map_err(query_to_napi)?,
-        );
+        let database = self.core()?;
+        let session =
+            Arc::new(mongreldb_query::MongrelSession::open(database).map_err(query_to_napi)?);
         let _ = self.session.set(Arc::clone(&session));
         Ok(self.session.get().cloned().unwrap_or(session))
     }
@@ -1024,20 +1397,37 @@ impl Database {
         &self,
         sql: String,
         options: Option<NativeSqlOptions>,
-    ) -> napi::Result<NativeSqlQuery> {
-        let session = self.sql_session()?;
+    ) -> napi::Result<NativeSqlQuery, String> {
+        let session = self
+            .sql_session()
+            .map_err(|error| napi::Error::new(error.status.as_ref().to_owned(), error.reason))?;
         let options = options.unwrap_or(NativeSqlOptions {
             query_id: None,
             timeout_ms: None,
+            max_output_rows: None,
+            max_output_bytes: None,
+            idempotency_key: None,
         });
         let query_id = options
             .query_id
-            .map(|query_id| query_id.parse().map_err(query_to_napi))
+            .map(|query_id| query_id.parse().map_err(query_to_coded_napi))
             .transpose()?;
         if options.timeout_ms == Some(0) {
             return Err(napi::Error::new(
-                napi::Status::InvalidArg,
+                "INVALID_ARGUMENT".to_owned(),
                 "timeoutMs must be positive",
+            ));
+        }
+        if options.max_output_rows == Some(0) || options.max_output_bytes == Some(0) {
+            return Err(napi::Error::new(
+                "INVALID_ARGUMENT".to_owned(),
+                "maxOutputRows and maxOutputBytes must be positive",
+            ));
+        }
+        if options.idempotency_key.is_some() {
+            return Err(napi::Error::new(
+                "CAPABILITY_UNSUPPORTED".to_owned(),
+                "idempotencyKey is supported by RemoteDatabase.sqlWriteIdempotent only",
             ));
         }
         let query = session
@@ -1048,12 +1438,16 @@ impl Database {
                     .map(|timeout| std::time::Duration::from_millis(u64::from(timeout))),
                 ..mongreldb_query::SqlQueryOptions::default()
             })
-            .map_err(query_to_napi)?;
+            .map_err(query_to_coded_napi)?;
         let id = query.id();
+        let retained_query = query.clone();
         Ok(NativeSqlQuery {
             id,
-            session,
+            query: retained_query,
+            session: Arc::downgrade(&session),
             sql,
+            max_output_rows: options.max_output_rows.unwrap_or(1_000_000) as usize,
+            max_output_bytes: options.max_output_bytes.unwrap_or(64 * 1024 * 1024) as usize,
             registration: parking_lot::Mutex::new(Some(
                 mongreldb_query::RegisteredQueryGuard::new(query),
             )),
@@ -1069,33 +1463,106 @@ impl NativeSqlQuery {
     }
 
     #[napi]
-    pub fn cancel(&self) -> bool {
-        matches!(
-            self.session.cancel_query(self.id),
-            mongreldb_query::CancelOutcome::Accepted
-                | mongreldb_query::CancelOutcome::AlreadyCancelling
+    pub fn cancel(&self) -> NativeCancelOutcome {
+        native_cancel_outcome(
+            self.query
+                .request_cancel(mongreldb_core::CancellationReason::ClientRequest),
         )
     }
 
     #[napi]
-    pub async fn result(&self) -> napi::Result<Buffer> {
+    pub fn status(&self) -> napi::Result<NativeQueryStatus, String> {
+        Ok(native_query_status(self.query.status()))
+    }
+
+    async fn take_output(
+        &self,
+        session: &mongreldb_query::MongrelSession,
+    ) -> napi::Result<mongreldb_query::ManagedQueryBatches, String> {
         let registration = self.registration.lock().take().ok_or_else(|| {
-            napi::Error::new(napi::Status::GenericFailure, "SQL result already consumed")
+            napi::Error::new(
+                "QUERY_ALREADY_FINISHED".into(),
+                "SQL result already consumed",
+            )
         })?;
-        let batches = self
-            .session
-            .run_with_query(&self.sql, registration.into_query())
+        session
+            .run_with_query_for_serialization_with_limits(
+                &self.sql,
+                registration.into_query(),
+                mongreldb_query::SqlCollectionLimits::new(
+                    self.max_output_rows,
+                    self.max_output_bytes,
+                ),
+            )
             .await
-            .map_err(query_to_napi)?;
-        native_cols_to_ipc_from_batches(&batches)
+            .map_err(query_to_coded_napi)
+    }
+
+    async fn result_arrow_inner(&self) -> napi::Result<Buffer, String> {
+        let session = self.session()?;
+        let output = self.take_output(&session).await?;
+        session.fire_test_hook(mongreldb_query::SqlTestHookPoint::BeforeSerializationBatch);
+        match native_cols_to_ipc_from_batches_controlled(
+            output.batches(),
+            output.query(),
+            self.max_output_rows,
+            self.max_output_bytes,
+        ) {
+            Ok(bytes) => {
+                session.fire_test_hook(mongreldb_query::SqlTestHookPoint::AfterSerialization);
+                output.try_complete().map_err(query_to_coded_napi)?;
+                Ok(bytes)
+            }
+            Err(error) => Err(finish_native_output_failure(output, error)),
+        }
+    }
+
+    #[napi]
+    pub async fn result(&self) -> napi::Result<Buffer> {
+        self.result_arrow_inner().await.map_err(erase_napi_code)
+    }
+
+    #[napi]
+    pub async fn result_arrow(&self) -> napi::Result<Buffer> {
+        self.result_arrow_inner().await.map_err(erase_napi_code)
+    }
+
+    #[napi(ts_return_type = "Promise<Array<Record<string, unknown>>>")]
+    pub async fn result_rows(&self) -> napi::Result<ControlledRowsOutput> {
+        let session = self.session().map_err(erase_napi_code)?;
+        let output = self.take_output(&session).await.map_err(erase_napi_code)?;
+        session.fire_test_hook(mongreldb_query::SqlTestHookPoint::BeforeSerializationBatch);
+        match validate_native_rows_controlled(
+            output.batches(),
+            output.query(),
+            self.max_output_rows,
+            self.max_output_bytes,
+        ) {
+            Ok(()) => Ok(ControlledRowsOutput {
+                output: Some(output),
+                session,
+            }),
+            Err(error) => Err(erase_napi_code(finish_native_output_failure(output, error))),
+        }
     }
 }
 
 /// A handle to one table inside a [`Database`].
 #[napi]
 pub struct TableHandle {
-    db: Arc<CoreDatabase>,
+    db: std::sync::Weak<CoreDatabase>,
     name: String,
+}
+
+impl TableHandle {
+    fn core(&self) -> napi::Result<Arc<CoreDatabase>> {
+        self.db.upgrade().ok_or_else(|| {
+            napi::Error::new(
+                napi::Status::GenericFailure,
+                format!("{CORE_DATABASE_CLOSED_CODE}: database is closed"),
+            )
+        })
+    }
 }
 
 /// Cursor over a packed bulk-write buffer (see `Transaction::put_packed`).
@@ -1278,24 +1745,6 @@ fn row_to_js_table(t: &mongreldb_core::Table, row: &mongreldb_core::memtable::Ro
     }
 }
 
-fn owned_row_to_js_table(t: &mongreldb_core::Table, row: &mongreldb_core::OwnedRow) -> OwnedRowJs {
-    let schema = t.schema();
-    let cells = schema
-        .columns
-        .iter()
-        .map(|cd| {
-            let v = row
-                .columns
-                .iter()
-                .find(|(id, _)| *id == cd.id)
-                .map(|(_, value)| value.clone())
-                .unwrap_or(Value::Null);
-            from_value(&v, cd.id)
-        })
-        .collect();
-    OwnedRowJs { cells }
-}
-
 fn upsert_action_to_js(action: mongreldb_core::UpsertActionKind) -> String {
     match action {
         mongreldb_core::UpsertActionKind::Inserted => "inserted",
@@ -1309,10 +1758,10 @@ fn upsert_action_to_js(action: mongreldb_core::UpsertActionKind) -> String {
 impl Database {
     /// Create a fresh database at `path`.
     #[napi(factory)]
-    pub fn with_path(path: String) -> napi::Result<Database> {
-        let db = CoreDatabase::create(&path).map_err(to_napi)?;
+    pub fn with_path(path: String) -> napi::Result<Database, String> {
+        let db = CoreDatabase::create(&path).map_err(open_to_coded_napi)?;
         Ok(Database {
-            inner: Arc::new(db),
+            inner: Some(Arc::new(db)),
             path,
             session: std::sync::OnceLock::new(),
         })
@@ -1320,10 +1769,10 @@ impl Database {
 
     /// Open an existing database from disk.
     #[napi]
-    pub fn open(path: String) -> napi::Result<Database> {
-        let db = CoreDatabase::open(&path).map_err(to_napi)?;
+    pub fn open(path: String) -> napi::Result<Database, String> {
+        let db = CoreDatabase::open(&path).map_err(open_to_coded_napi)?;
         Ok(Database {
-            inner: Arc::new(db),
+            inner: Some(Arc::new(db)),
             path,
             session: std::sync::OnceLock::new(),
         })
@@ -1339,11 +1788,11 @@ impl Database {
         path: String,
         username: String,
         password: String,
-    ) -> napi::Result<Database> {
-        let db =
-            CoreDatabase::open_with_credentials(&path, &username, &password).map_err(to_napi)?;
+    ) -> napi::Result<Database, String> {
+        let db = CoreDatabase::open_with_credentials(&path, &username, &password)
+            .map_err(open_to_coded_napi)?;
         Ok(Database {
-            inner: Arc::new(db),
+            inner: Some(Arc::new(db)),
             path,
             session: std::sync::OnceLock::new(),
         })
@@ -1356,11 +1805,11 @@ impl Database {
         path: String,
         admin_username: String,
         admin_password: String,
-    ) -> napi::Result<Database> {
+    ) -> napi::Result<Database, String> {
         let db = CoreDatabase::create_with_credentials(&path, &admin_username, &admin_password)
-            .map_err(to_napi)?;
+            .map_err(open_to_coded_napi)?;
         Ok(Database {
-            inner: Arc::new(db),
+            inner: Some(Arc::new(db)),
             path,
             session: std::sync::OnceLock::new(),
         })
@@ -1372,7 +1821,7 @@ impl Database {
     /// only be reopened via `openWithCredentials`.
     #[napi]
     pub fn enable_auth(&self, admin_username: String, admin_password: String) -> napi::Result<()> {
-        self.inner
+        self.core()?
             .enable_auth(&admin_username, &admin_password)
             .map_err(to_napi)
     }
@@ -1380,13 +1829,13 @@ impl Database {
     /// Disable `require_auth`, reverting to credentialless mode (recovery).
     #[napi]
     pub fn disable_auth(&self) -> napi::Result<()> {
-        self.inner.disable_auth().map_err(to_napi)
+        self.core()?.disable_auth().map_err(to_napi)
     }
 
     /// Returns `true` if this database has `require_auth = true`.
     #[napi]
-    pub fn require_auth_enabled(&self) -> bool {
-        self.inner.require_auth_enabled()
+    pub fn require_auth_enabled(&self) -> napi::Result<bool> {
+        Ok(self.core()?.require_auth_enabled())
     }
 
     /// Re-resolve the cached principal from the on-disk catalog, picking up
@@ -1394,37 +1843,38 @@ impl Database {
     /// databases.
     #[napi]
     pub fn refresh_principal(&self) -> napi::Result<()> {
-        self.inner.refresh_principal().map_err(to_napi)
+        self.core()?.refresh_principal().map_err(to_napi)
     }
 
     /// Create a new table with the given schema.
     #[napi]
     pub fn create_table(&self, name: String, schema: SchemaSpec) -> napi::Result<BigInt> {
         let s = build_schema(schema)?;
-        let id = self.inner.create_table(&name, s).map_err(to_napi)?;
+        let id = self.core()?.create_table(&name, s).map_err(to_napi)?;
         Ok(BigInt::from(id))
     }
 
     /// Drop a table by name.
     #[napi]
     pub fn drop_table(&self, name: String) -> napi::Result<()> {
-        self.inner.drop_table(&name).map_err(to_napi)
+        self.core()?.drop_table(&name).map_err(to_napi)
     }
 
     /// Rename a live table. Fails if `name` does not exist, if `new_name` is
     /// empty, or if `new_name` is already in use. A no-op when `name == new_name`.
     #[napi]
     pub fn rename_table(&self, name: String, new_name: String) -> napi::Result<()> {
-        self.inner.rename_table(&name, &new_name).map_err(to_napi)
+        self.core()?.rename_table(&name, &new_name).map_err(to_napi)
     }
 
     /// Get a handle to a table by name for typed put/get/query operations.
     #[napi]
     pub fn get_table(&self, name: String) -> napi::Result<TableHandle> {
         // Validate the table exists now; per-op calls re-resolve it by name.
-        self.inner.table_id(&name).map_err(to_napi)?;
+        self.core()?.table_id(&name).map_err(to_napi)?;
+        let database = self.core()?;
         Ok(TableHandle {
-            db: Arc::clone(&self.inner),
+            db: Arc::downgrade(&database),
             name,
         })
     }
@@ -1437,17 +1887,18 @@ impl Database {
 
     /// Begin a cross-table transaction (stage puts/deletes, then `commit`).
     #[napi]
-    pub fn begin(&self) -> Transaction {
-        Transaction {
-            db: Arc::clone(&self.inner),
-            staging: Arc::new(parking_lot::Mutex::new(Vec::new())),
-        }
+    pub fn begin(&self) -> napi::Result<Transaction> {
+        let database = self.core()?;
+        Ok(Transaction {
+            db: Arc::downgrade(&database),
+            state: Arc::new(parking_lot::Mutex::new(NodeTransactionState::default())),
+        })
     }
 
     /// The current reader-visible epoch — the database-wide snapshot point.
     #[napi]
-    pub fn snapshot_epoch(&self) -> BigInt {
-        BigInt::from(self.inner.visible_epoch().0)
+    pub fn snapshot_epoch(&self) -> napi::Result<BigInt> {
+        Ok(BigInt::from(self.core()?.visible_epoch().0))
     }
 
     /// Set how many committed epochs of history to retain for MVCC time-travel
@@ -1456,7 +1907,7 @@ impl Database {
     /// cannot restore history that was already pruned.
     #[napi]
     pub fn set_history_retention_epochs(&self, epochs: i64) -> napi::Result<()> {
-        self.inner
+        self.core()?
             .set_history_retention_epochs(epochs.max(0) as u64)
             .map_err(to_napi)
     }
@@ -1464,26 +1915,26 @@ impl Database {
     /// The configured history-retention depth — how many committed epochs are
     /// kept for time-travel reads.
     #[napi]
-    pub fn history_retention_epochs(&self) -> BigInt {
-        BigInt::from(self.inner.history_retention_epochs())
+    pub fn history_retention_epochs(&self) -> napi::Result<BigInt> {
+        Ok(BigInt::from(self.core()?.history_retention_epochs()))
     }
 
     /// The oldest epoch still retained for time-travel reads (`rowsAtEpoch`).
     #[napi]
-    pub fn earliest_retained_epoch(&self) -> BigInt {
-        BigInt::from(self.inner.earliest_retained_epoch().0)
+    pub fn earliest_retained_epoch(&self) -> napi::Result<BigInt> {
+        Ok(BigInt::from(self.core()?.earliest_retained_epoch().0))
     }
 
     /// List all live table names.
     #[napi]
-    pub fn table_names(&self) -> Vec<String> {
-        self.inner.table_names()
+    pub fn table_names(&self) -> napi::Result<Vec<String>> {
+        Ok(self.core()?.table_names())
     }
 
     #[napi]
     pub fn create_procedure(&self, spec: ProcedureSpec) -> napi::Result<BigInt> {
         let procedure = procedure_from_spec(spec)?;
-        let created = self.inner.create_procedure(procedure).map_err(to_napi)?;
+        let created = self.core()?.create_procedure(procedure).map_err(to_napi)?;
         Ok(BigInt::from(created.version))
     }
 
@@ -1491,7 +1942,7 @@ impl Database {
     pub fn create_or_replace_procedure(&self, spec: ProcedureSpec) -> napi::Result<BigInt> {
         let procedure = procedure_from_spec(spec)?;
         let created = self
-            .inner
+            .core()?
             .create_or_replace_procedure(procedure)
             .map_err(to_napi)?;
         Ok(BigInt::from(created.version))
@@ -1499,17 +1950,21 @@ impl Database {
 
     #[napi]
     pub fn drop_procedure(&self, name: String) -> napi::Result<()> {
-        self.inner.drop_procedure(&name).map_err(to_napi)
+        self.core()?.drop_procedure(&name).map_err(to_napi)
     }
 
     #[napi]
     pub fn procedures(&self) -> napi::Result<Vec<ProcedureInfo>> {
-        self.inner.procedures().iter().map(procedure_info).collect()
+        self.core()?
+            .procedures()
+            .iter()
+            .map(procedure_info)
+            .collect()
     }
 
     #[napi]
     pub fn procedure(&self, name: String) -> napi::Result<Option<ProcedureInfo>> {
-        self.inner
+        self.core()?
             .procedure(&name)
             .as_ref()
             .map(procedure_info)
@@ -1517,35 +1972,40 @@ impl Database {
     }
 
     #[napi]
-    pub fn create_trigger(&self, spec: TriggerSpec) -> napi::Result<BigInt> {
-        let trigger = trigger_from_spec(spec)?;
-        let created = self.inner.create_trigger(trigger).map_err(to_napi)?;
+    pub fn create_trigger(&self, spec: TriggerSpec) -> napi::Result<BigInt, String> {
+        let trigger = trigger_from_spec(spec)
+            .map_err(|error| napi::Error::new(error.status.as_ref().to_owned(), error.reason))?;
+        let created = self
+            .core_coded()?
+            .create_trigger(trigger)
+            .map_err(trigger_to_coded_napi)?;
         Ok(BigInt::from(created.version))
     }
 
     #[napi]
-    pub fn create_or_replace_trigger(&self, spec: TriggerSpec) -> napi::Result<BigInt> {
-        let trigger = trigger_from_spec(spec)?;
+    pub fn create_or_replace_trigger(&self, spec: TriggerSpec) -> napi::Result<BigInt, String> {
+        let trigger = trigger_from_spec(spec)
+            .map_err(|error| napi::Error::new(error.status.as_ref().to_owned(), error.reason))?;
         let created = self
-            .inner
+            .core_coded()?
             .create_or_replace_trigger(trigger)
-            .map_err(to_napi)?;
+            .map_err(trigger_to_coded_napi)?;
         Ok(BigInt::from(created.version))
     }
 
     #[napi]
     pub fn drop_trigger(&self, name: String) -> napi::Result<()> {
-        self.inner.drop_trigger(&name).map_err(to_napi)
+        self.core()?.drop_trigger(&name).map_err(to_napi)
     }
 
     #[napi]
     pub fn triggers(&self) -> napi::Result<Vec<TriggerInfo>> {
-        self.inner.triggers().iter().map(trigger_info).collect()
+        self.core()?.triggers().iter().map(trigger_info).collect()
     }
 
     #[napi]
     pub fn trigger(&self, name: String) -> napi::Result<Option<TriggerInfo>> {
-        self.inner
+        self.core()?
             .trigger(&name)
             .as_ref()
             .map(trigger_info)
@@ -1559,7 +2019,7 @@ impl Database {
         opts: Option<ProcedureCallOptions>,
     ) -> napi::Result<ProcedureCallResult> {
         let args = procedure_args(opts)?;
-        let result = self.inner.call_procedure(&name, args).map_err(to_napi)?;
+        let result = self.core()?.call_procedure(&name, args).map_err(to_napi)?;
         Ok(ProcedureCallResult {
             epoch: result.epoch.map(BigInt::from),
             result_json: serde_json::to_string(&result.output).map_err(|e| {
@@ -1577,7 +2037,7 @@ impl Database {
         name: String,
         opts: Option<ProcedureCallOptions>,
     ) -> napi::Result<ProcedureCallResult> {
-        let db = Arc::clone(&self.inner);
+        let db = self.core()?;
         let args = procedure_args(opts)?;
         napi::bindgen_prelude::spawn_blocking(move || {
             let result = db.call_procedure(&name, args).map_err(to_napi)?;
@@ -1600,7 +2060,7 @@ impl Database {
     /// is already present before calling `add_column`.
     #[napi]
     pub fn table_columns(&self, name: String) -> napi::Result<Vec<String>> {
-        let handle = self.inner.table(&name).map_err(to_napi)?;
+        let handle = self.core()?.table(&name).map_err(to_napi)?;
         let g = handle.lock();
         Ok(g.schema().columns.iter().map(|c| c.name.clone()).collect())
     }
@@ -1609,7 +2069,7 @@ impl Database {
     /// database. Column `id`/`name` are authoritative for schema mappers.
     #[napi]
     pub fn table_column_specs(&self, name: String) -> napi::Result<Vec<ColumnSpec>> {
-        let handle = self.inner.table(&name).map_err(to_napi)?;
+        let handle = self.core()?.table(&name).map_err(to_napi)?;
         let g = handle.lock();
         Ok(g.schema().columns.iter().map(from_column_def).collect())
     }
@@ -1624,7 +2084,7 @@ impl Database {
                 "non-null column added without default",
             ));
         }
-        let handle = self.inner.table(&table).map_err(to_napi)?;
+        let handle = self.core()?.table(&table).map_err(to_napi)?;
         let mut g = handle.lock();
         let ty = to_type_id(
             &column.ty,
@@ -1667,7 +2127,7 @@ impl Database {
         let flags = to_column_flags(&column);
         let default_value = build_default_expr(&column, &ty)?;
         let altered = self
-            .inner
+            .core()?
             .alter_column(
                 &table,
                 &column_name,
@@ -1685,7 +2145,7 @@ impl Database {
     /// Verify database integrity. Returns a JSON-string summary.
     #[napi]
     pub fn check(&self) -> napi::Result<String> {
-        let issues = self.inner.check();
+        let issues = self.core()?.check();
         let mut tables: std::collections::HashMap<u64, serde_json::Value> =
             std::collections::HashMap::new();
         for issue in &issues {
@@ -1717,7 +2177,7 @@ impl Database {
     /// Repair/quarantine corrupt tables. Returns a JSON-string summary.
     #[napi]
     pub fn doctor(&self) -> napi::Result<String> {
-        let quarantined = self.inner.doctor().map_err(to_napi)?;
+        let quarantined = self.core()?.doctor().map_err(to_napi)?;
         let summary = serde_json::json!({
             "ok": quarantined.is_empty(),
             "quarantined": quarantined,
@@ -1729,7 +2189,7 @@ impl Database {
     /// query latency stays flat. Tables with fewer than two runs are skipped.
     #[napi]
     pub fn compact_all(&self) -> napi::Result<CompactStats> {
-        let (compacted, skipped) = self.inner.compact().map_err(to_napi)?;
+        let (compacted, skipped) = self.core()?.compact().map_err(to_napi)?;
         Ok(CompactStats {
             compacted: compacted as u32,
             skipped: skipped as u32,
@@ -1740,7 +2200,7 @@ impl Database {
     /// if skipped (fewer than two runs).
     #[napi]
     pub fn compact_table(&self, name: String) -> napi::Result<bool> {
-        self.inner.compact_table(&name).map_err(to_napi)
+        self.core()?.compact_table(&name).map_err(to_napi)
     }
 
     /// Return the path passed to `withPath` / `open`.
@@ -1763,7 +2223,10 @@ impl Database {
         sql: String,
         options: Option<NativeSqlOptions>,
     ) -> napi::Result<Buffer> {
-        self.register_sql(sql, options)?.result().await
+        self.register_sql(sql, options)
+            .map_err(erase_napi_code)?
+            .result()
+            .await
     }
 
     #[napi]
@@ -1771,23 +2234,42 @@ impl Database {
         &self,
         sql: String,
         options: Option<NativeSqlOptions>,
-    ) -> napi::Result<NativeSqlQuery> {
+    ) -> napi::Result<NativeSqlQuery, String> {
         self.register_sql(sql, options)
     }
 
     #[napi]
-    pub fn cancel_sql(&self, query_id: String) -> napi::Result<bool> {
-        let query_id = query_id.parse().map_err(query_to_napi)?;
-        Ok(matches!(
-            self.sql_session()?.cancel_query(query_id),
-            mongreldb_query::CancelOutcome::Accepted
-                | mongreldb_query::CancelOutcome::AlreadyCancelling
-        ))
+    pub fn cancel_sql(&self, query_id: String) -> napi::Result<NativeCancelOutcome, String> {
+        let query_id = query_id.parse().map_err(query_to_coded_napi)?;
+        let session = self
+            .sql_session()
+            .map_err(|error| napi::Error::new(error.status.as_ref().to_owned(), error.reason))?;
+        Ok(native_cancel_outcome(session.cancel_query(query_id)))
+    }
+
+    #[napi]
+    pub fn sql_query_status(&self, query_id: String) -> napi::Result<NativeQueryStatus, String> {
+        let query_id = query_id.parse().map_err(query_to_coded_napi)?;
+        self.sql_session()
+            .map_err(|error| napi::Error::new(error.status.as_ref().to_owned(), error.reason))?
+            .query_registry()
+            .status(query_id)
+            .map(native_query_status)
+            .ok_or_else(|| napi::Error::new("QUERY_NOT_FOUND".into(), "SQL query not found"))
     }
 
     /// Flush + release. Optional — the `Database` also drops on GC.
     #[napi]
-    pub fn close(&self) -> napi::Result<()> {
+    pub fn close(&mut self) -> napi::Result<()> {
+        if let Some(session) = self.session.take() {
+            session
+                .query_registry()
+                .cancel_all(mongreldb_core::CancellationReason::SessionClosed);
+        }
+        if let Some(database) = self.inner.as_ref() {
+            database.close().map_err(to_napi)?;
+        }
+        self.inner.take();
         Ok(())
     }
 
@@ -1798,21 +2280,21 @@ impl Database {
     /// pending run instead of streamed Put records.
     #[napi]
     pub fn set_spill_threshold(&self, bytes: i64) -> napi::Result<()> {
-        self.inner.set_spill_threshold(bytes.max(0) as u64);
+        self.core()?.set_spill_threshold(bytes.max(0) as u64);
         Ok(())
     }
 
     /// Enable or disable recursive trigger execution (database-wide).
     #[napi]
     pub fn set_recursive_triggers(&self, enabled: bool) -> napi::Result<()> {
-        self.inner.set_recursive_triggers(enabled);
+        self.core()?.set_recursive_triggers(enabled);
         Ok(())
     }
 
     /// Read the current trigger execution policy.
     #[napi]
     pub fn trigger_config(&self) -> napi::Result<TriggerConfigJs> {
-        let c = self.inner.trigger_config();
+        let c = self.core()?.trigger_config();
         Ok(TriggerConfigJs {
             recursive_triggers: c.recursive_triggers,
             max_depth: c.max_depth,
@@ -1823,7 +2305,7 @@ impl Database {
     /// Set the trigger execution policy. `max_depth` must be > 0.
     #[napi]
     pub fn set_trigger_config(&self, config: TriggerConfigJs) -> napi::Result<()> {
-        self.inner
+        self.core()?
             .set_trigger_config(mongreldb_core::trigger::TriggerConfig {
                 recursive_triggers: config.recursive_triggers,
                 max_depth: config.max_depth,
@@ -1835,7 +2317,7 @@ impl Database {
     /// Set a table's compaction zstd level (-1 = default, 0 = none, 1..22).
     #[napi]
     pub fn set_table_compaction_zstd_level(&self, name: String, level: i32) -> napi::Result<()> {
-        let handle = self.inner.table(&name).map_err(to_napi)?;
+        let handle = self.core()?.table(&name).map_err(to_napi)?;
         handle.lock().set_compaction_zstd_level(level);
         Ok(())
     }
@@ -1847,7 +2329,7 @@ impl Database {
         name: String,
         max_bytes: i64,
     ) -> napi::Result<()> {
-        let handle = self.inner.table(&name).map_err(to_napi)?;
+        let handle = self.core()?.table(&name).map_err(to_napi)?;
         handle
             .lock()
             .set_result_cache_max_bytes(max_bytes.max(0) as u64);
@@ -1857,7 +2339,7 @@ impl Database {
     /// Set a table's mutable-run spill threshold (bytes).
     #[napi]
     pub fn set_table_mutable_run_spill_bytes(&self, name: String, bytes: i64) -> napi::Result<()> {
-        let handle = self.inner.table(&name).map_err(to_napi)?;
+        let handle = self.core()?.table(&name).map_err(to_napi)?;
         handle
             .lock()
             .set_mutable_run_spill_bytes(bytes.max(0) as u64);
@@ -1867,7 +2349,7 @@ impl Database {
     /// Set a table's WAL sync byte threshold (bytes between group-syncs).
     #[napi]
     pub fn set_table_sync_byte_threshold(&self, name: String, threshold: i64) -> napi::Result<()> {
-        let handle = self.inner.table(&name).map_err(to_napi)?;
+        let handle = self.core()?.table(&name).map_err(to_napi)?;
         handle
             .lock()
             .set_sync_byte_threshold(threshold.max(0) as u64);
@@ -1882,7 +2364,7 @@ impl Database {
         name: String,
         policy: IndexBuildPolicyJs,
     ) -> napi::Result<()> {
-        let handle = self.inner.table(&name).map_err(to_napi)?;
+        let handle = self.core()?.table(&name).map_err(to_napi)?;
         let p = match policy {
             IndexBuildPolicyJs::Deferred => mongreldb_core::IndexBuildPolicy::Deferred,
             IndexBuildPolicyJs::Eager => mongreldb_core::IndexBuildPolicy::Eager,
@@ -1894,7 +2376,7 @@ impl Database {
     /// Page-cache statistics for a table.
     #[napi]
     pub fn table_page_cache_stats(&self, name: String) -> napi::Result<CacheStatsJs> {
-        let handle = self.inner.table(&name).map_err(to_napi)?;
+        let handle = self.core()?.table(&name).map_err(to_napi)?;
         let s = handle.lock().page_cache_stats();
         Ok(CacheStatsJs {
             hits: s.hits as i64,
@@ -1907,7 +2389,7 @@ impl Database {
     /// Number of sorted runs a table currently has (compaction target: 1).
     #[napi]
     pub fn table_run_count(&self, name: String) -> napi::Result<u32> {
-        let handle = self.inner.table(&name).map_err(to_napi)?;
+        let handle = self.core()?.table(&name).map_err(to_napi)?;
         let n = handle.lock().run_count();
         Ok(n as u32)
     }
@@ -1915,7 +2397,7 @@ impl Database {
     /// Memtable length (uncommitted staged rows) for a table.
     #[napi]
     pub fn table_memtable_len(&self, name: String) -> napi::Result<u32> {
-        let handle = self.inner.table(&name).map_err(to_napi)?;
+        let handle = self.core()?.table(&name).map_err(to_napi)?;
         let n = handle.lock().memtable_len();
         Ok(n as u32)
     }
@@ -1923,7 +2405,7 @@ impl Database {
     /// Mutable-run length for a table.
     #[napi]
     pub fn table_mutable_run_len(&self, name: String) -> napi::Result<u32> {
-        let handle = self.inner.table(&name).map_err(to_napi)?;
+        let handle = self.core()?.table(&name).map_err(to_napi)?;
         let n = handle.lock().mutable_run_len();
         Ok(n as u32)
     }
@@ -1931,7 +2413,7 @@ impl Database {
     /// Page-cache entry count for a table.
     #[napi]
     pub fn table_page_cache_len(&self, name: String) -> napi::Result<u32> {
-        let handle = self.inner.table(&name).map_err(to_napi)?;
+        let handle = self.core()?.table(&name).map_err(to_napi)?;
         let n = handle.lock().page_cache_len();
         Ok(n as u32)
     }
@@ -1939,7 +2421,7 @@ impl Database {
     /// Decoded-page-cache entry count for a table.
     #[napi]
     pub fn table_decoded_cache_len(&self, name: String) -> napi::Result<u32> {
-        let handle = self.inner.table(&name).map_err(to_napi)?;
+        let handle = self.core()?.table(&name).map_err(to_napi)?;
         let n = handle.lock().decoded_cache_len();
         Ok(n as u32)
     }
@@ -1949,7 +2431,7 @@ impl Database {
     /// Create a catalog user with an Argon2id-hashed password.
     #[napi]
     pub fn create_user(&self, username: String, password: String) -> napi::Result<()> {
-        self.inner
+        self.core()?
             .create_user(&username, &password)
             .map_err(to_napi)?;
         Ok(())
@@ -1958,13 +2440,13 @@ impl Database {
     /// Drop a user by username.
     #[napi]
     pub fn drop_user(&self, username: String) -> napi::Result<()> {
-        self.inner.drop_user(&username).map_err(to_napi)
+        self.core()?.drop_user(&username).map_err(to_napi)
     }
 
     /// Change a user's password.
     #[napi]
     pub fn alter_user_password(&self, username: String, new_password: String) -> napi::Result<()> {
-        self.inner
+        self.core()?
             .alter_user_password(&username, &new_password)
             .map_err(to_napi)
     }
@@ -1973,7 +2455,7 @@ impl Database {
     #[napi]
     pub fn verify_user(&self, username: String, password: String) -> napi::Result<bool> {
         let result = self
-            .inner
+            .core()?
             .verify_user(&username, &password)
             .map_err(to_napi)?;
         Ok(result.is_some())
@@ -1982,7 +2464,7 @@ impl Database {
     /// Grant or revoke admin privileges on a user.
     #[napi]
     pub fn set_user_admin(&self, username: String, is_admin: bool) -> napi::Result<()> {
-        self.inner
+        self.core()?
             .set_user_admin(&username, is_admin)
             .map_err(to_napi)
     }
@@ -1990,32 +2472,37 @@ impl Database {
     /// List all usernames.
     #[napi]
     pub fn users(&self) -> napi::Result<Vec<String>> {
-        Ok(self.inner.users().into_iter().map(|u| u.username).collect())
+        Ok(self
+            .core()?
+            .users()
+            .into_iter()
+            .map(|u| u.username)
+            .collect())
     }
 
     /// Create a role.
     #[napi]
     pub fn create_role(&self, name: String) -> napi::Result<()> {
-        self.inner.create_role(&name).map_err(to_napi)?;
+        self.core()?.create_role(&name).map_err(to_napi)?;
         Ok(())
     }
 
     /// Drop a role.
     #[napi]
     pub fn drop_role(&self, name: String) -> napi::Result<()> {
-        self.inner.drop_role(&name).map_err(to_napi)
+        self.core()?.drop_role(&name).map_err(to_napi)
     }
 
     /// List all role names.
     #[napi]
     pub fn roles(&self) -> napi::Result<Vec<String>> {
-        Ok(self.inner.roles().into_iter().map(|r| r.name).collect())
+        Ok(self.core()?.roles().into_iter().map(|r| r.name).collect())
     }
 
     /// Grant a role to a user.
     #[napi]
     pub fn grant_role(&self, username: String, role_name: String) -> napi::Result<()> {
-        self.inner
+        self.core()?
             .grant_role(&username, &role_name)
             .map_err(to_napi)
     }
@@ -2023,7 +2510,7 @@ impl Database {
     /// Revoke a role from a user.
     #[napi]
     pub fn revoke_role(&self, username: String, role_name: String) -> napi::Result<()> {
-        self.inner
+        self.core()?
             .revoke_role(&username, &role_name)
             .map_err(to_napi)
     }
@@ -2033,7 +2520,7 @@ impl Database {
     #[napi]
     pub fn grant_permission(&self, role_name: String, permission: String) -> napi::Result<()> {
         let perm = parse_permission(&permission)?;
-        self.inner
+        self.core()?
             .grant_permission(&role_name, perm)
             .map_err(to_napi)
     }
@@ -2042,7 +2529,7 @@ impl Database {
     #[napi]
     pub fn revoke_permission(&self, role_name: String, permission: String) -> napi::Result<()> {
         let perm = parse_permission(&permission)?;
-        self.inner
+        self.core()?
             .revoke_permission(&role_name, perm)
             .map_err(to_napi)
     }
@@ -2085,10 +2572,10 @@ impl Database {
     /// Create a fresh encrypted database (page-level AES-256-GCM; the database
     /// KEK is derived from `passphrase` via Argon2id + HKDF).
     #[napi(factory)]
-    pub fn create_encrypted(path: String, passphrase: String) -> napi::Result<Database> {
-        let db = CoreDatabase::create_encrypted(&path, &passphrase).map_err(to_napi)?;
+    pub fn create_encrypted(path: String, passphrase: String) -> napi::Result<Database, String> {
+        let db = CoreDatabase::create_encrypted(&path, &passphrase).map_err(open_to_coded_napi)?;
         Ok(Database {
-            inner: Arc::new(db),
+            inner: Some(Arc::new(db)),
             path,
             session: std::sync::OnceLock::new(),
         })
@@ -2096,10 +2583,10 @@ impl Database {
 
     /// Open an existing encrypted database with its passphrase.
     #[napi]
-    pub fn open_encrypted(path: String, passphrase: String) -> napi::Result<Database> {
-        let db = CoreDatabase::open_encrypted(&path, &passphrase).map_err(to_napi)?;
+    pub fn open_encrypted(path: String, passphrase: String) -> napi::Result<Database, String> {
+        let db = CoreDatabase::open_encrypted(&path, &passphrase).map_err(open_to_coded_napi)?;
         Ok(Database {
-            inner: Arc::new(db),
+            inner: Some(Arc::new(db)),
             path,
             session: std::sync::OnceLock::new(),
         })
@@ -2113,12 +2600,12 @@ impl Database {
         passphrase: String,
         username: String,
         password: String,
-    ) -> napi::Result<Database> {
+    ) -> napi::Result<Database, String> {
         let db =
             CoreDatabase::open_encrypted_with_credentials(&path, &passphrase, &username, &password)
-                .map_err(to_napi)?;
+                .map_err(open_to_coded_napi)?;
         Ok(Database {
-            inner: Arc::new(db),
+            inner: Some(Arc::new(db)),
             path,
             session: std::sync::OnceLock::new(),
         })
@@ -2133,42 +2620,557 @@ impl Database {
         passphrase: String,
         admin_username: String,
         admin_password: String,
-    ) -> napi::Result<Database> {
+    ) -> napi::Result<Database, String> {
         let db = CoreDatabase::create_encrypted_with_credentials(
             &path,
             &passphrase,
             &admin_username,
             &admin_password,
         )
-        .map_err(to_napi)?;
+        .map_err(open_to_coded_napi)?;
         Ok(Database {
-            inner: Arc::new(db),
+            inner: Some(Arc::new(db)),
             path,
             session: std::sync::OnceLock::new(),
         })
     }
 }
 
-fn native_cols_to_ipc_from_batches(
+enum NativeOutputFailure {
+    Query(mongreldb_query::MongrelQueryError),
+    ResultLimit(String),
+    Serialization(String),
+}
+
+fn finish_native_output_failure(
+    output: mongreldb_query::ManagedQueryBatches,
+    failure: NativeOutputFailure,
+) -> napi::Error<String> {
+    let query = output.query().clone();
+    match failure {
+        NativeOutputFailure::Query(error) => {
+            output.fail();
+            query_to_coded_napi(error)
+        }
+        NativeOutputFailure::ResultLimit(message) => {
+            output.fail_result_limit();
+            let code = query
+                .status()
+                .terminal_error
+                .map(|error| error.code)
+                .unwrap_or_else(|| "RESULT_LIMIT_EXCEEDED".into());
+            napi::Error::new(code, message)
+        }
+        NativeOutputFailure::Serialization(message) => {
+            output.fail_serialization();
+            let code = query
+                .status()
+                .terminal_error
+                .map(|error| error.code)
+                .unwrap_or_else(|| "SERIALIZATION_FAILED".into());
+            napi::Error::new(code, message)
+        }
+    }
+}
+
+unsafe fn throw_coded_napi(env: napi::sys::napi_env, error: napi::Error<String>) -> napi::Error {
+    unsafe { napi::JsError::from(error).throw_into(env) };
+    napi::Error::from_status(napi::Status::PendingException)
+}
+
+fn native_cols_to_ipc_from_batches_controlled(
     batches: &[arrow::record_batch::RecordBatch],
-) -> napi::Result<Buffer> {
+    query: &mongreldb_query::RegisteredSqlQuery,
+    max_rows: usize,
+    max_bytes: usize,
+) -> Result<Buffer, NativeOutputFailure> {
     if batches.is_empty() {
         return Ok(Buffer::from(Vec::new()));
     }
     let schema = batches[0].schema();
-    let mut buf = Vec::new();
-    let mut writer = arrow::ipc::writer::FileWriter::try_new(&mut buf, schema.as_ref())
-        .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e:?}")))?;
-    for b in batches {
+    let mut output = LimitedIpcOutput::new(max_bytes);
+    let mut rows = 0usize;
+    let serialized = (|| -> Result<(), NativeOutputFailure> {
+        let mut writer = arrow::ipc::writer::FileWriter::try_new(&mut output, schema.as_ref())
+            .map_err(|error| NativeOutputFailure::Serialization(error.to_string()))?;
+        for batch in batches {
+            for offset in (0..batch.num_rows()).step_by(256) {
+                query.checkpoint().map_err(NativeOutputFailure::Query)?;
+                let length = 256.min(batch.num_rows() - offset);
+                rows = rows.saturating_add(length);
+                if rows > max_rows {
+                    return Err(NativeOutputFailure::ResultLimit(format!(
+                        "SQL result exceeds {max_rows} rows or {max_bytes} bytes"
+                    )));
+                }
+                writer
+                    .write(&batch.slice(offset, length))
+                    .map_err(|error| NativeOutputFailure::Serialization(error.to_string()))?;
+            }
+        }
         writer
-            .write(b)
-            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e:?}")))?;
+            .finish()
+            .map_err(|error| NativeOutputFailure::Serialization(error.to_string()))
+    })();
+    if output.exceeded {
+        return Err(NativeOutputFailure::ResultLimit(format!(
+            "SQL result exceeds {max_rows} rows or {max_bytes} bytes"
+        )));
     }
-    writer
-        .finish()
-        .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e:?}")))?;
-    drop(writer);
-    Ok(Buffer::from(buf))
+    serialized?;
+    query.checkpoint().map_err(NativeOutputFailure::Query)?;
+    Ok(Buffer::from(output.bytes))
+}
+
+struct LimitedIpcOutput {
+    bytes: Vec<u8>,
+    max_bytes: usize,
+    exceeded: bool,
+}
+
+pub struct ControlledRowsOutput {
+    output: Option<mongreldb_query::ManagedQueryBatches>,
+    session: Arc<mongreldb_query::MongrelSession>,
+}
+
+impl TypeName for ControlledRowsOutput {
+    fn type_name() -> &'static str {
+        "Array"
+    }
+
+    fn value_type() -> ValueType {
+        ValueType::Object
+    }
+}
+
+impl ToNapiValue for ControlledRowsOutput {
+    unsafe fn to_napi_value(
+        env: napi::sys::napi_env,
+        mut value: Self,
+    ) -> napi::Result<napi::sys::napi_value> {
+        let output = value.output.take().ok_or_else(|| {
+            napi::Error::new(napi::Status::GenericFailure, "SQL output already consumed")
+        })?;
+        let result = (|| -> Result<napi::sys::napi_value, NativeOutputFailure> {
+            let env = unsafe { Env::from_raw(env) };
+            let row_count = output
+                .batches()
+                .iter()
+                .map(arrow::record_batch::RecordBatch::num_rows)
+                .sum();
+            let mut array = env
+                .create_array_with_length(row_count)
+                .map_err(|error| NativeOutputFailure::Serialization(error.reason))?;
+            let mut output_index = 0usize;
+            for batch in output.batches() {
+                let schema = batch.schema();
+                for row_index in 0..batch.num_rows() {
+                    if output_index % 256 == 0 {
+                        output
+                            .query()
+                            .checkpoint()
+                            .map_err(NativeOutputFailure::Query)?;
+                    }
+                    let mut row = env
+                        .create_object()
+                        .map_err(|error| NativeOutputFailure::Serialization(error.reason))?;
+                    for (column_index, field) in schema.fields().iter().enumerate() {
+                        set_arrow_cell(
+                            &mut row,
+                            field.name(),
+                            batch.column(column_index).as_ref(),
+                            row_index,
+                        )
+                        .map_err(|error| NativeOutputFailure::Serialization(error.reason))?;
+                    }
+                    array
+                        .set_element(output_index as u32, row)
+                        .map_err(|error| NativeOutputFailure::Serialization(error.reason))?;
+                    output_index += 1;
+                }
+            }
+            Ok(array.raw())
+        })();
+        match result {
+            Ok(array) => {
+                value
+                    .session
+                    .fire_test_hook(mongreldb_query::SqlTestHookPoint::AfterSerialization);
+                output
+                    .try_complete()
+                    .map_err(query_to_coded_napi)
+                    .map_err(|error| unsafe { throw_coded_napi(env, error) })?;
+                Ok(array)
+            }
+            Err(error) => {
+                Err(unsafe { throw_coded_napi(env, finish_native_output_failure(output, error)) })
+            }
+        }
+    }
+}
+
+fn validate_native_rows_controlled(
+    batches: &[arrow::record_batch::RecordBatch],
+    query: &mongreldb_query::RegisteredSqlQuery,
+    max_rows: usize,
+    max_bytes: usize,
+) -> Result<(), NativeOutputFailure> {
+    let mut output = LimitedIpcOutput::new(max_bytes);
+    let mut rows = 0usize;
+    let encoded = (|| -> Result<(), NativeOutputFailure> {
+        let mut writer = arrow::json::writer::ArrayWriter::new(&mut output);
+        for batch in batches {
+            for offset in (0..batch.num_rows()).step_by(256) {
+                query.checkpoint().map_err(NativeOutputFailure::Query)?;
+                let length = 256.min(batch.num_rows() - offset);
+                rows = rows.saturating_add(length);
+                if rows > max_rows {
+                    return Err(NativeOutputFailure::ResultLimit(format!(
+                        "SQL result exceeds {max_rows} rows or {max_bytes} bytes"
+                    )));
+                }
+                let slice = batch.slice(offset, length);
+                writer
+                    .write_batches(&[&slice])
+                    .map_err(|error| NativeOutputFailure::Serialization(error.to_string()))?;
+            }
+        }
+        writer
+            .finish()
+            .map_err(|error| NativeOutputFailure::Serialization(error.to_string()))
+    })();
+    if output.exceeded {
+        return Err(NativeOutputFailure::ResultLimit(format!(
+            "SQL result exceeds {max_rows} rows or {max_bytes} bytes"
+        )));
+    }
+    encoded?;
+    query.checkpoint().map_err(NativeOutputFailure::Query)?;
+    Ok(())
+}
+
+fn set_arrow_cell(
+    object: &mut JsObject,
+    name: &str,
+    array: &dyn arrow::array::Array,
+    row: usize,
+) -> napi::Result<()> {
+    use arrow::array::{
+        BinaryArray, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
+        Int8Array, LargeBinaryArray, LargeStringArray, StringArray, UInt16Array, UInt32Array,
+        UInt64Array, UInt8Array,
+    };
+    if array.is_null(row) {
+        return object.set_named_property(name, napi::bindgen_prelude::Null);
+    }
+    macro_rules! number {
+        ($ty:ty) => {
+            if let Some(array) = array.as_any().downcast_ref::<$ty>() {
+                return object.set_named_property(name, array.value(row));
+            }
+        };
+    }
+    number!(Int8Array);
+    number!(Int16Array);
+    number!(Int32Array);
+    number!(UInt8Array);
+    number!(UInt16Array);
+    number!(UInt32Array);
+    number!(Float32Array);
+    number!(Float64Array);
+    if let Some(array) = array.as_any().downcast_ref::<Int64Array>() {
+        return object.set_named_property(name, BigInt::from(array.value(row)));
+    }
+    if let Some(array) = array.as_any().downcast_ref::<UInt64Array>() {
+        return object.set_named_property(name, BigInt::from(array.value(row)));
+    }
+    if let Some(array) = array.as_any().downcast_ref::<BooleanArray>() {
+        return object.set_named_property(name, array.value(row));
+    }
+    if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
+        return object.set_named_property(name, array.value(row));
+    }
+    if let Some(array) = array.as_any().downcast_ref::<LargeStringArray>() {
+        return object.set_named_property(name, array.value(row));
+    }
+    if let Some(array) = array.as_any().downcast_ref::<BinaryArray>() {
+        return object.set_named_property(name, Buffer::from(array.value(row).to_vec()));
+    }
+    if let Some(array) = array.as_any().downcast_ref::<LargeBinaryArray>() {
+        return object.set_named_property(name, Buffer::from(array.value(row).to_vec()));
+    }
+    let value = arrow::util::display::array_value_to_string(array, row)
+        .map_err(|error| napi::Error::new(napi::Status::GenericFailure, error.to_string()))?;
+    object.set_named_property(name, value)
+}
+
+impl LimitedIpcOutput {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            max_bytes,
+            exceeded: false,
+        }
+    }
+}
+
+impl std::io::Write for LimitedIpcOutput {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.bytes.len().saturating_add(bytes.len()) > self.max_bytes {
+            self.exceeded = true;
+            return Err(std::io::Error::other("SQL result byte limit exceeded"));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod native_ipc_tests {
+    use super::{
+        native_cols_to_ipc_from_batches_controlled, native_query_status, query_phase_name,
+        query_terminal_state_name, Database, TableHandle, CORE_DATABASE_CLOSED_CODE,
+        CORE_DATABASE_LOCKED_CODE,
+    };
+    use arrow::array::Int64Array;
+    use arrow::record_batch::RecordBatch;
+    use mongreldb_query::{QueryTerminalErrorCategory, SqlQueryOptions, SqlQueryRegistry};
+    use std::sync::Arc;
+
+    fn assert_locked(path: &str) {
+        let error = match Database::open(path.to_owned()) {
+            Ok(mut database) => {
+                database.close().unwrap();
+                panic!("database reopened while a dependent handle was alive")
+            }
+            Err(error) => error,
+        };
+        assert_eq!(error.status, CORE_DATABASE_LOCKED_CODE);
+    }
+
+    fn assert_reopens(path: &str) {
+        let mut database = Database::open(path.to_owned()).unwrap();
+        database.close().unwrap();
+    }
+
+    fn close_test_path(label: &str) -> String {
+        std::env::temp_dir()
+            .join(format!(
+                "mongreldb-node-close-{label}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn native_close_releases_owner_and_is_idempotent() {
+        let path = close_test_path("owner");
+        let mut database = Database::with_path(path.clone()).unwrap();
+
+        database.close().unwrap();
+        database.close().unwrap();
+        let error = database.table_names().unwrap_err();
+        assert!(error.reason.contains(CORE_DATABASE_CLOSED_CODE));
+        assert_reopens(&path);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn native_close_defers_unlock_for_dependent_handles() {
+        let path = close_test_path("dependents");
+
+        let mut database = Database::with_path(path.clone()).unwrap();
+        let table = TableHandle {
+            db: Arc::downgrade(&database.core().unwrap()),
+            name: "unused".into(),
+        };
+        database.close().unwrap();
+        assert_locked(&path);
+        drop(table);
+        assert_reopens(&path);
+
+        let mut database = Database::open(path.clone()).unwrap();
+        let transaction = database.begin().unwrap();
+        database.close().unwrap();
+        assert_locked(&path);
+        drop(transaction);
+        assert_reopens(&path);
+
+        let mut database = Database::open(path.clone()).unwrap();
+        let query = database.start_sql("SELECT 1".into(), None).unwrap();
+        database.close().unwrap();
+        assert_locked(&path);
+        drop(query);
+        assert_reopens(&path);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn status_protocol_names_are_stable_snake_case() {
+        assert_eq!(
+            query_phase_name(mongreldb_query::SqlQueryPhase::CommitCritical),
+            "commit_critical"
+        );
+        assert_eq!(
+            query_terminal_state_name(mongreldb_query::QueryTerminalState::CancelledAfterCommit),
+            "cancelled_after_commit"
+        );
+        assert_eq!(
+            mongreldb_core::CancellationReason::ClientDisconnected.as_str(),
+            "client_disconnected"
+        );
+    }
+
+    #[test]
+    fn native_status_preserves_unknown_durable_outcome() {
+        let registry = Arc::new(SqlQueryRegistry::default());
+        let query = registry.register(SqlQueryOptions::default()).unwrap();
+        query.mark_outcome_unknown();
+        query.fail();
+
+        let status = native_query_status(query.status());
+        assert_eq!(status.terminal_state.as_deref(), Some("outcome_unknown"));
+        assert!(!status.outcome_known);
+        assert!(status.committed.is_none());
+        assert!(!status.durable_outcome.outcome_known);
+        assert!(status.durable_outcome.committed.is_none());
+        assert!(status.durable_outcome.committed_statements.is_none());
+        assert!(status.completed_statements.is_none());
+        assert!(status.statement_index.is_none());
+        assert_eq!(
+            status.terminal_error_code.as_deref(),
+            Some("QUERY_OUTCOME_UNKNOWN")
+        );
+    }
+
+    #[test]
+    fn native_handle_status_survives_registry_tombstone_eviction() {
+        let registry = Arc::new(SqlQueryRegistry::new(
+            4,
+            1,
+            16 * 1024,
+            std::time::Duration::from_secs(60),
+        ));
+        let query = registry.register(SqlQueryOptions::default()).unwrap();
+        let id = query.id();
+        let path = std::env::temp_dir().join(format!("mongreldb-node-{id}"));
+        let database = Arc::new(mongreldb_core::Database::create(&path).unwrap());
+        let session = Arc::new(
+            mongreldb_query::MongrelSession::open(database)
+                .unwrap()
+                .with_query_registry(Arc::clone(&registry)),
+        );
+        query.try_complete().unwrap();
+        let handle = super::NativeSqlQuery {
+            id,
+            query: query.clone(),
+            session: Arc::downgrade(&session),
+            sql: "SELECT 1".into(),
+            max_output_rows: 1,
+            max_output_bytes: 1024,
+            registration: parking_lot::Mutex::new(None),
+        };
+        let evictor = registry.register(SqlQueryOptions::default()).unwrap();
+        evictor.try_complete().unwrap();
+        assert!(registry.status(id).is_none());
+        assert_eq!(handle.status().unwrap().phase, "completed");
+        drop(handle);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn controlled_ipc_records_row_and_byte_limits() {
+        let batch = RecordBatch::try_from_iter([(
+            "value",
+            Arc::new(Int64Array::from(vec![1, 2])) as arrow::array::ArrayRef,
+        )])
+        .unwrap();
+
+        for (max_rows, max_bytes) in [(1, 1_024), (10, 1)] {
+            let registry = Arc::new(SqlQueryRegistry::default());
+            let query = registry.register(SqlQueryOptions::default()).unwrap();
+            let id = query.id();
+            let error = match native_cols_to_ipc_from_batches_controlled(
+                std::slice::from_ref(&batch),
+                &query,
+                max_rows,
+                max_bytes,
+            ) {
+                Ok(_) => panic!("expected output limit failure"),
+                Err(error) => error,
+            };
+            let reason = match error {
+                super::NativeOutputFailure::Query(error) => error.to_string(),
+                super::NativeOutputFailure::ResultLimit(reason)
+                | super::NativeOutputFailure::Serialization(reason) => reason,
+            };
+            assert!(reason.contains("SQL result exceeds"));
+            query.fail();
+            assert_eq!(
+                registry
+                    .status(id)
+                    .unwrap()
+                    .terminal_error
+                    .unwrap()
+                    .category,
+                QueryTerminalErrorCategory::ResultLimit
+            );
+        }
+    }
+
+    #[test]
+    fn controlled_ipc_observes_cancel_and_deadline() {
+        let batch = RecordBatch::try_from_iter([(
+            "value",
+            Arc::new(Int64Array::from(vec![1, 2])) as arrow::array::ArrayRef,
+        )])
+        .unwrap();
+        for deadline in [false, true] {
+            let registry = Arc::new(SqlQueryRegistry::default());
+            let query = registry
+                .register(SqlQueryOptions {
+                    timeout: deadline.then(|| std::time::Duration::from_millis(1)),
+                    ..SqlQueryOptions::default()
+                })
+                .unwrap();
+            if deadline {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            } else {
+                assert_eq!(
+                    query.request_cancel(mongreldb_core::CancellationReason::ClientRequest),
+                    mongreldb_query::CancelOutcome::Accepted
+                );
+            }
+            let error = match native_cols_to_ipc_from_batches_controlled(
+                std::slice::from_ref(&batch),
+                &query,
+                10,
+                1_024,
+            ) {
+                Ok(_) => panic!("expected cancellation failure"),
+                Err(error) => error,
+            };
+            let reason = match error {
+                super::NativeOutputFailure::Query(error) => error.to_string(),
+                super::NativeOutputFailure::ResultLimit(reason)
+                | super::NativeOutputFailure::Serialization(reason) => reason,
+            };
+            assert!(
+                reason.contains("cancelled") || reason.contains("deadline exceeded"),
+                "{reason}"
+            );
+            query.fail();
+        }
+    }
 }
 
 /// Result of an insert: the physical row id plus, when the engine allocated
@@ -2189,12 +3191,12 @@ impl TableHandle {
     #[napi]
     pub fn put(&self, cells: Vec<Cell>) -> napi::Result<PutResult> {
         let cols = {
-            let handle = self.db.table(&self.name).map_err(to_napi)?;
+            let handle = self.core()?.table(&self.name).map_err(to_napi)?;
             let g = handle.lock();
             cell_pairs_table(&g, cells)?
         };
         let (result, row_ids) = self
-            .db
+            .core()?
             .transaction_with_row_ids_for_current_principal(|transaction| {
                 transaction.put_returning(&self.name, cols)
             })
@@ -2211,16 +3213,16 @@ impl TableHandle {
     /// Group-commit this table's pending writes.
     #[napi]
     pub fn commit(&self) -> napi::Result<BigInt> {
-        Ok(BigInt::from(self.db.visible_epoch().0))
+        Ok(BigInt::from(self.core()?.visible_epoch().0))
     }
 
     /// Flush: commit + drain memtable to a sorted run.
     #[napi]
     pub fn flush(&self) -> napi::Result<BigInt> {
-        self.db
+        self.core()?
             .require(&mongreldb_core::Permission::Admin)
             .map_err(to_napi)?;
-        let handle = self.db.table(&self.name).map_err(to_napi)?;
+        let handle = self.core()?.table(&self.name).map_err(to_napi)?;
         let mut g = handle.lock();
         g.flush().map(|e| BigInt::from(e.0)).map_err(to_napi)
     }
@@ -2228,7 +3230,7 @@ impl TableHandle {
     /// Live row count (O(1)).
     #[napi]
     pub fn count(&self) -> napi::Result<BigInt> {
-        self.db
+        self.core()?
             .count_for(&self.name, None)
             .map(BigInt::from)
             .map_err(to_napi)
@@ -2240,7 +3242,7 @@ impl TableHandle {
         let core_conditions = build_conditions(&conditions)?;
         let q = build_query_from_conditions(core_conditions);
         let rows = self
-            .db
+            .core()?
             .query_for_current_principal(&self.name, &q, None)
             .map_err(to_napi)?;
         Ok(BigInt::from(rows.len() as u64))
@@ -2251,10 +3253,10 @@ impl TableHandle {
     pub fn get(&self, row_id: BigInt) -> napi::Result<Option<RowJs>> {
         let rid = RowId(bigint_to_u64(&row_id)?);
         let row = self
-            .db
+            .core()?
             .get_for_current_principal(&self.name, rid)
             .map_err(to_napi)?;
-        let handle = self.db.table(&self.name).map_err(to_napi)?;
+        let handle = self.core()?.table(&self.name).map_err(to_napi)?;
         let g = handle.lock();
         Ok(row.as_ref().map(|r| row_to_js_table(&g, r)))
     }
@@ -2264,10 +3266,10 @@ impl TableHandle {
     pub fn get_by_pk_text(&self, text: String) -> napi::Result<Option<RowJs>> {
         let q = Query::pk(text.into_bytes());
         let rows = self
-            .db
+            .core()?
             .query_for_current_principal(&self.name, &q, None)
             .map_err(to_napi)?;
-        let handle = self.db.table(&self.name).map_err(to_napi)?;
+        let handle = self.core()?.table(&self.name).map_err(to_napi)?;
         let g = handle.lock();
         Ok(rows.first().map(|r| row_to_js_table(&g, r)))
     }
@@ -2281,12 +3283,12 @@ impl TableHandle {
     /// commit.
     #[napi]
     pub fn reserve_auto_inc(&self) -> napi::Result<Option<BigInt>> {
-        self.db
+        self.core()?
             .require(&mongreldb_core::Permission::Insert {
                 table: self.name.clone(),
             })
             .map_err(to_napi)?;
-        let handle = self.db.table(&self.name).map_err(to_napi)?;
+        let handle = self.core()?.table(&self.name).map_err(to_napi)?;
         let mut g = handle.lock();
         let v = g.reserve_auto_inc().map_err(to_napi)?;
         Ok(v.map(BigInt::from))
@@ -2297,10 +3299,10 @@ impl TableHandle {
     pub fn get_by_pk_int64(&self, value: BigInt) -> napi::Result<Option<RowJs>> {
         let q = Query::pk(bigint_to_i64(&value)?.to_be_bytes().to_vec());
         let rows = self
-            .db
+            .core()?
             .query_for_current_principal(&self.name, &q, None)
             .map_err(to_napi)?;
-        let handle = self.db.table(&self.name).map_err(to_napi)?;
+        let handle = self.core()?.table(&self.name).map_err(to_napi)?;
         let g = handle.lock();
         Ok(rows.first().map(|r| row_to_js_table(&g, r)))
     }
@@ -2309,7 +3311,7 @@ impl TableHandle {
     #[napi]
     pub fn delete(&self, row_id: BigInt) -> napi::Result<()> {
         let row_id = RowId(bigint_to_u64(&row_id)?);
-        self.db
+        self.core()?
             .transaction_for_current_principal(|transaction| transaction.delete(&self.name, row_id))
             .map_err(to_napi)
     }
@@ -2317,7 +3319,7 @@ impl TableHandle {
     /// Durably truncate all rows. RLS-secured tables reject truncate.
     #[napi]
     pub fn truncate(&self) -> napi::Result<()> {
-        self.db
+        self.core()?
             .transaction_for_current_principal(|transaction| transaction.truncate(&self.name))
             .map_err(to_napi)
     }
@@ -2327,11 +3329,11 @@ impl TableHandle {
     pub fn delete_by_pk_text(&self, text: String) -> napi::Result<()> {
         let q = Query::pk(text.into_bytes());
         let rows = self
-            .db
+            .core()?
             .query_for_current_principal(&self.name, &q, None)
             .map_err(to_napi)?;
         if let Some(r) = rows.first() {
-            self.db
+            self.core()?
                 .transaction_for_current_principal(|transaction| {
                     transaction.delete(&self.name, r.row_id)
                 })
@@ -2345,11 +3347,11 @@ impl TableHandle {
     pub fn delete_by_pk_int64(&self, value: BigInt) -> napi::Result<()> {
         let q = Query::pk(bigint_to_i64(&value)?.to_be_bytes().to_vec());
         let rows = self
-            .db
+            .core()?
             .query_for_current_principal(&self.name, &q, None)
             .map_err(to_napi)?;
         if let Some(r) = rows.first() {
-            self.db
+            self.core()?
                 .transaction_for_current_principal(|transaction| {
                     transaction.delete(&self.name, r.row_id)
                 })
@@ -2363,7 +3365,7 @@ impl TableHandle {
     pub fn query(&self, conditions: Vec<ConditionSpec>) -> napi::Result<Vec<RowJs>> {
         let q = build_query_from_conditions(build_conditions(&conditions)?);
         let rows = self
-            .db
+            .core()?
             .query_for_current_principal(&self.name, &q, None)
             .map_err(to_napi)?;
         if rows.len() > mongreldb_core::query::MAX_FINAL_LIMIT {
@@ -2375,7 +3377,7 @@ impl TableHandle {
                 ),
             ));
         }
-        let handle = self.db.table(&self.name).map_err(to_napi)?;
+        let handle = self.core()?.table(&self.name).map_err(to_napi)?;
         let g = handle.lock();
         Ok(rows.iter().map(|r| row_to_js_table(&g, r)).collect())
     }
@@ -2414,10 +3416,10 @@ impl TableHandle {
             .with_limit(limit)
             .with_offset(offset as usize);
         let rows = self
-            .db
+            .core()?
             .query_for_current_principal(&self.name, &q, None)
             .map_err(to_napi)?;
-        let handle = self.db.table(&self.name).map_err(to_napi)?;
+        let handle = self.core()?.table(&self.name).map_err(to_napi)?;
         let g = handle.lock();
         Ok(rows.iter().map(|r| row_to_js_table(&g, r)).collect())
     }
@@ -2452,7 +3454,7 @@ impl TableHandle {
                 })
             })
             .collect::<napi::Result<Vec<_>>>()?;
-        self.db
+        self.core()?
             .ann_rerank_for_current_principal(
                 &self.name,
                 &AnnRerankRequest {
@@ -2482,14 +3484,14 @@ impl TableHandle {
     pub fn rows_at_epoch(&self, epoch: BigInt) -> napi::Result<Vec<RowJs>> {
         let epoch = epoch.get_u64().1;
         let (snap, _retention) = self
-            .db
+            .core()?
             .snapshot_at_owned(mongreldb_core::Epoch(epoch))
             .map_err(to_napi)?;
         let rows = self
-            .db
+            .core()?
             .rows_at_epoch_for_current_principal(&self.name, snap)
             .map_err(to_napi)?;
-        let handle = self.db.table(&self.name).map_err(to_napi)?;
+        let handle = self.core()?.table(&self.name).map_err(to_napi)?;
         let g = handle.lock();
         Ok(rows.iter().map(|r| row_to_js_table(&g, r)).collect())
     }
@@ -2515,7 +3517,7 @@ impl TableHandle {
         let query = build_query_from_conditions(build_conditions(&conditions)?);
         let projection = cid.map(|column| vec![column]);
         let rows = self
-            .db
+            .core()?
             .query_for_current_principal(&self.name, &query, projection.as_deref())
             .map_err(to_napi)?;
         let value = aggregate_rows_json(&rows, cid, &agg)?;
@@ -2551,7 +3553,7 @@ impl TableHandle {
             "avg" => mongreldb_core::ApproxAgg::Avg,
             _ => unreachable!(),
         };
-        self.db
+        self.core()?
             .approx_aggregate_for_current_principal(&self.name, &[], cid, agg, z)
             .map_err(to_napi)
             .map(|result| {
@@ -2599,7 +3601,7 @@ impl TableHandle {
             _ => unreachable!(),
         };
         let result = self
-            .db
+            .core()?
             .incremental_aggregate_for_current_principal(&self.name, &conds, cid, agg)
             .map_err(to_napi)?;
         Ok(serde_json::json!({
@@ -2615,7 +3617,7 @@ impl TableHandle {
     /// engine allocated it, its `AUTO_INCREMENT` value, in order.
     #[napi]
     pub fn put_batch(&self, rows: Vec<Vec<Cell>>) -> napi::Result<Vec<PutResult>> {
-        let handle = self.db.table(&self.name).map_err(to_napi)?;
+        let handle = self.core()?.table(&self.name).map_err(to_napi)?;
         let g = handle.lock();
         let mut batch = Vec::with_capacity(rows.len());
         for cells in rows {
@@ -2624,7 +3626,7 @@ impl TableHandle {
         drop(g);
         let row_count = batch.len();
         let (assigned, row_ids) = self
-            .db
+            .core()?
             .transaction_with_row_ids_for_current_principal(|transaction| {
                 transaction.put_batch(&self.name, batch)
             })
@@ -2650,14 +3652,14 @@ impl TableHandle {
     /// Bytes/Embedding columns are not supported here — use `putBatch`.
     #[napi]
     pub fn bulk_load_typed(&self, columns: Vec<TypedColumn>) -> napi::Result<BigInt> {
-        self.db
+        self.core()?
             .require(&mongreldb_core::Permission::Admin)
             .map_err(to_napi)?;
         let native = columns
             .into_iter()
             .map(|c| c.into_native())
             .collect::<napi::Result<Vec<_>>>()?;
-        let handle = self.db.table(&self.name).map_err(to_napi)?;
+        let handle = self.core()?.table(&self.name).map_err(to_napi)?;
         let mut g = handle.lock();
         g.bulk_load_columns(native)
             .map(|e| BigInt::from(e.0))
@@ -2669,14 +3671,15 @@ impl TableHandle {
     /// use `Database.sql` for full scans.
     #[napi]
     pub fn query_arrow(&self, conditions: Vec<ConditionSpec>) -> napi::Result<Buffer> {
-        query_arrow_inner(&self.db, &self.name, &conditions)
+        let database = self.core()?;
+        query_arrow_inner(&database, &self.name, &conditions)
     }
 
     // ── async variants ──
 
     #[napi]
     pub async fn put_async(&self, cells: Vec<Cell>) -> napi::Result<PutResult> {
-        let db = Arc::clone(&self.db);
+        let db = self.core()?;
         let name = self.name.clone();
         let (rid, auto) =
             napi::bindgen_prelude::spawn_blocking(move || -> napi::Result<(u64, Option<i64>)> {
@@ -2705,7 +3708,7 @@ impl TableHandle {
 
     #[napi]
     pub async fn commit_async(&self) -> napi::Result<BigInt> {
-        let db = Arc::clone(&self.db);
+        let db = self.core()?;
         napi::bindgen_prelude::spawn_blocking(move || Ok(BigInt::from(db.visible_epoch().0)))
             .await
             .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e:?}")))?
@@ -2713,7 +3716,7 @@ impl TableHandle {
 
     #[napi]
     pub async fn count_async(&self) -> napi::Result<BigInt> {
-        let db = Arc::clone(&self.db);
+        let db = self.core()?;
         let name = self.name.clone();
         napi::bindgen_prelude::spawn_blocking(move || {
             db.count_for(&name, None).map(BigInt::from).map_err(to_napi)
@@ -2724,7 +3727,7 @@ impl TableHandle {
 
     #[napi]
     pub async fn count_where_async(&self, conditions: Vec<ConditionSpec>) -> napi::Result<BigInt> {
-        let db = Arc::clone(&self.db);
+        let db = self.core()?;
         let name = self.name.clone();
         napi::bindgen_prelude::spawn_blocking(move || {
             let core_conditions = build_conditions(&conditions)?;
@@ -2740,7 +3743,7 @@ impl TableHandle {
 
     #[napi]
     pub async fn get_async(&self, row_id: BigInt) -> napi::Result<Option<RowJs>> {
-        let db = Arc::clone(&self.db);
+        let db = self.core()?;
         let name = self.name.clone();
         let row_id_u64 = bigint_to_u64(&row_id)?;
         napi::bindgen_prelude::spawn_blocking(move || -> napi::Result<Option<RowJs>> {
@@ -2757,7 +3760,7 @@ impl TableHandle {
 
     #[napi]
     pub async fn query_async(&self, conditions: Vec<ConditionSpec>) -> napi::Result<Vec<RowJs>> {
-        let db = Arc::clone(&self.db);
+        let db = self.core()?;
         let name = self.name.clone();
         napi::bindgen_prelude::spawn_blocking(move || -> napi::Result<Vec<RowJs>> {
             let q = build_query_from_conditions(build_conditions(&conditions)?);
@@ -2774,7 +3777,7 @@ impl TableHandle {
 
     #[napi]
     pub async fn flush_async(&self) -> napi::Result<BigInt> {
-        let db = Arc::clone(&self.db);
+        let db = self.core()?;
         let name = self.name.clone();
         napi::bindgen_prelude::spawn_blocking(move || {
             db.require(&mongreldb_core::Permission::Admin)
@@ -2789,7 +3792,7 @@ impl TableHandle {
 
     #[napi]
     pub async fn query_arrow_async(&self, conditions: Vec<ConditionSpec>) -> napi::Result<Buffer> {
-        let db = Arc::clone(&self.db);
+        let db = self.core()?;
         let name = self.name.clone();
         napi::bindgen_prelude::spawn_blocking(move || -> napi::Result<Buffer> {
             query_arrow_inner(&db, &name, &conditions)
@@ -2842,11 +3845,87 @@ fn query_arrow_inner(
 /// atomically. On conflict, `commit` throws a `ConflictError`.
 #[napi]
 pub struct Transaction {
-    db: Arc<CoreDatabase>,
-    // Interior mutability so every method takes `&self` (NAPI async can't take
-    // `&mut self`); `Arc` so a `TxnTable` sub-handle can stage into the same
-    // buffer, and the handle itself is cheap to share.
-    staging: Arc<parking_lot::Mutex<Vec<(String, TxnOp)>>>,
+    db: std::sync::Weak<CoreDatabase>,
+    state: Arc<parking_lot::Mutex<NodeTransactionState>>,
+}
+
+impl Transaction {
+    fn core(&self) -> napi::Result<Arc<CoreDatabase>> {
+        self.db.upgrade().ok_or_else(|| {
+            napi::Error::new(
+                napi::Status::GenericFailure,
+                format!("{CORE_DATABASE_CLOSED_CODE}: database is closed"),
+            )
+        })
+    }
+
+    fn active_state(&self) -> napi::Result<parking_lot::MutexGuard<'_, NodeTransactionState>> {
+        let state = self.state.lock();
+        state.ensure_active()?;
+        Ok(state)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum NodeTransactionPhase {
+    #[default]
+    Active,
+    InFlight,
+    Committed,
+    RolledBack,
+    Poisoned,
+}
+
+#[derive(Default)]
+struct NodeTransactionState {
+    phase: NodeTransactionPhase,
+    staging: Vec<(String, TxnOp)>,
+}
+
+impl NodeTransactionState {
+    fn ensure_active(&self) -> napi::Result<()> {
+        match self.phase {
+            NodeTransactionPhase::Active => Ok(()),
+            NodeTransactionPhase::InFlight => Err(napi::Error::new(
+                napi::Status::GenericFailure,
+                "transaction commit is in flight",
+            )),
+            NodeTransactionPhase::Committed => Err(napi::Error::new(
+                napi::Status::GenericFailure,
+                "transaction is already committed",
+            )),
+            NodeTransactionPhase::RolledBack => Err(napi::Error::new(
+                napi::Status::GenericFailure,
+                "transaction is rolled back",
+            )),
+            NodeTransactionPhase::Poisoned => Err(napi::Error::new(
+                napi::Status::GenericFailure,
+                "transaction commit outcome is not safely retryable",
+            )),
+        }
+    }
+
+    fn begin_commit(&mut self) -> napi::Result<Vec<(String, TxnOp)>> {
+        self.ensure_active()?;
+        self.phase = NodeTransactionPhase::InFlight;
+        Ok(std::mem::take(&mut self.staging))
+    }
+}
+
+fn finish_node_transaction_commit(
+    state: &Arc<parking_lot::Mutex<NodeTransactionState>>,
+    result: &mongreldb_core::Result<(mongreldb_core::Epoch, Vec<OpResult>)>,
+    stage: &mut Vec<(String, TxnOp)>,
+) {
+    let mut state = state.lock();
+    match result {
+        Ok(_) => state.phase = NodeTransactionPhase::Committed,
+        Err(mongreldb_core::MongrelError::Conflict(_)) => {
+            state.staging = std::mem::take(stage);
+            state.phase = NodeTransactionPhase::Active;
+        }
+        Err(_) => state.phase = NodeTransactionPhase::Poisoned,
+    }
 }
 
 enum TxnOp {
@@ -2874,14 +3953,83 @@ enum TxnOp {
     },
 }
 
+pub struct TransactionCommitTask {
+    db: Arc<CoreDatabase>,
+    stage: Vec<(String, TxnOp)>,
+    state: Arc<parking_lot::Mutex<NodeTransactionState>>,
+}
+
+pub enum TransactionCommitTaskOutput {
+    Success(mongreldb_core::Epoch),
+    Failure(mongreldb_core::MongrelError),
+}
+
+impl napi::Task for TransactionCommitTask {
+    type Output = TransactionCommitTaskOutput;
+    type JsValue = BigInt;
+
+    fn compute(&mut self) -> napi::Result<Self::Output> {
+        let result = apply_txn(&self.db, &self.stage);
+        finish_node_transaction_commit(&self.state, &result, &mut self.stage);
+        Ok(match result {
+            Ok((epoch, _)) => TransactionCommitTaskOutput::Success(epoch),
+            Err(error) => TransactionCommitTaskOutput::Failure(error),
+        })
+    }
+
+    fn resolve(&mut self, env: Env, output: Self::Output) -> napi::Result<Self::JsValue> {
+        match output {
+            TransactionCommitTaskOutput::Success(epoch) => Ok(BigInt::from(epoch.0)),
+            TransactionCommitTaskOutput::Failure(error) => throw_core_commit_error(&env, error),
+        }
+    }
+}
+
+pub struct TransactionCommitReturningTask {
+    db: Arc<CoreDatabase>,
+    stage: Vec<(String, TxnOp)>,
+    state: Arc<parking_lot::Mutex<NodeTransactionState>>,
+}
+
+pub enum TransactionCommitReturningTaskOutput {
+    Success(mongreldb_core::Epoch, Vec<OpResult>),
+    Failure(mongreldb_core::MongrelError),
+}
+
+impl napi::Task for TransactionCommitReturningTask {
+    type Output = TransactionCommitReturningTaskOutput;
+    type JsValue = CommitResultJs;
+
+    fn compute(&mut self) -> napi::Result<Self::Output> {
+        let result = apply_txn(&self.db, &self.stage);
+        finish_node_transaction_commit(&self.state, &result, &mut self.stage);
+        Ok(match result {
+            Ok((epoch, results)) => TransactionCommitReturningTaskOutput::Success(epoch, results),
+            Err(error) => TransactionCommitReturningTaskOutput::Failure(error),
+        })
+    }
+
+    fn resolve(&mut self, env: Env, output: Self::Output) -> napi::Result<Self::JsValue> {
+        match output {
+            TransactionCommitReturningTaskOutput::Success(epoch, results) => {
+                commit_returning_to_napi(&env, Ok((epoch, results)))
+            }
+            TransactionCommitReturningTaskOutput::Failure(error) => {
+                throw_core_commit_error(&env, error)
+            }
+        }
+    }
+}
+
 #[napi]
 impl Transaction {
     #[napi(constructor)]
-    pub fn new(db: &Database) -> Self {
-        Self {
-            db: Arc::clone(&db.inner),
-            staging: Arc::new(parking_lot::Mutex::new(Vec::new())),
-        }
+    pub fn new(db: &Database) -> napi::Result<Self> {
+        let database = db.core()?;
+        Ok(Self {
+            db: Arc::downgrade(&database),
+            state: Arc::new(parking_lot::Mutex::new(NodeTransactionState::default())),
+        })
     }
 
     /// Stage a put on `table`. Returns the engine-assigned `AUTO_INCREMENT`
@@ -2890,12 +4038,13 @@ impl Transaction {
     /// column). The returned value is the id that will be written on commit.
     #[napi]
     pub fn put(&self, table: String, cells: Vec<Cell>) -> napi::Result<Option<BigInt>> {
-        let handle = self.db.table(&table).map_err(to_napi)?;
+        let mut state = self.active_state()?;
+        let handle = self.core()?.table(&table).map_err(to_napi)?;
         let mut g = handle.lock();
         let mut cols = cell_pairs_table(&g, cells)?;
         let assigned = g.fill_auto_inc(&mut cols).map_err(to_napi)?;
         drop(g);
-        self.staging.lock().push((
+        state.staging.push((
             table,
             TxnOp::Put {
                 cells: cols,
@@ -2908,15 +4057,15 @@ impl Transaction {
     /// Stage a delete of `row_id` on `table`.
     #[napi]
     pub fn delete(&self, table: String, row_id: BigInt) -> napi::Result<()> {
-        self.staging
-            .lock()
+        self.active_state()?
+            .staging
             .push((table, TxnOp::Delete(RowId(bigint_to_u64(&row_id)?))));
         Ok(())
     }
 
     #[napi]
     pub fn truncate(&self, table: String) -> napi::Result<()> {
-        self.staging.lock().push((table, TxnOp::Truncate));
+        self.active_state()?.staging.push((table, TxnOp::Truncate));
         Ok(())
     }
 
@@ -2927,7 +4076,8 @@ impl Transaction {
         insert_cells: Vec<Cell>,
         update_cells: Option<Vec<Cell>>,
     ) -> napi::Result<()> {
-        let handle = self.db.table(&table).map_err(to_napi)?;
+        let mut state = self.active_state()?;
+        let handle = self.core()?.table(&table).map_err(to_napi)?;
         let g = handle.lock();
         let insert_cells = cell_pairs_table(&g, insert_cells)?;
         let action = match update_cells {
@@ -2935,7 +4085,7 @@ impl Transaction {
             None => mongreldb_core::UpsertAction::DoNothing,
         };
         drop(g);
-        self.staging.lock().push((
+        state.staging.push((
             table,
             TxnOp::Upsert {
                 insert_cells,
@@ -2947,7 +4097,8 @@ impl Transaction {
 
     #[napi]
     pub fn update_many(&self, table: String, updates: Vec<RowUpdateJs>) -> napi::Result<()> {
-        let handle = self.db.table(&table).map_err(to_napi)?;
+        let mut state = self.active_state()?;
+        let handle = self.core()?.table(&table).map_err(to_napi)?;
         let g = handle.lock();
         let updates = updates
             .into_iter()
@@ -2959,21 +4110,18 @@ impl Transaction {
             })
             .collect::<napi::Result<Vec<_>>>()?;
         drop(g);
-        self.staging
-            .lock()
-            .push((table, TxnOp::UpdateMany { updates }));
+        state.staging.push((table, TxnOp::UpdateMany { updates }));
         Ok(())
     }
 
     #[napi]
     pub fn delete_many(&self, table: String, row_ids: Vec<BigInt>) -> napi::Result<()> {
+        let mut state = self.active_state()?;
         let row_ids = row_ids
             .iter()
             .map(|row_id| bigint_to_u64(row_id).map(RowId))
             .collect::<napi::Result<Vec<_>>>()?;
-        self.staging
-            .lock()
-            .push((table, TxnOp::DeleteMany { row_ids }));
+        state.staging.push((table, TxnOp::DeleteMany { row_ids }));
         Ok(())
     }
 
@@ -2986,9 +4134,10 @@ impl Transaction {
     /// `commitReturning` emits one `none` result for the whole packed batch.
     #[napi]
     pub fn put_packed(&self, table: String, payload: Buffer) -> napi::Result<()> {
+        let mut state = self.active_state()?;
         let rows = decode_packed_puts(&payload)?;
         if !rows.is_empty() {
-            self.staging.lock().push((table, TxnOp::PutBatch { rows }));
+            state.staging.push((table, TxnOp::PutBatch { rows }));
         }
         Ok(())
     }
@@ -2998,14 +4147,13 @@ impl Transaction {
     /// of one per row. `commitReturning` emits one `none` result for the batch.
     #[napi]
     pub fn delete_packed(&self, table: String, payload: Buffer) -> napi::Result<()> {
+        let mut state = self.active_state()?;
         let row_ids = decode_packed_row_ids(&payload)?
             .into_iter()
             .map(RowId)
             .collect::<Vec<_>>();
         if !row_ids.is_empty() {
-            self.staging
-                .lock()
-                .push((table, TxnOp::DeleteBatch { row_ids }));
+            state.staging.push((table, TxnOp::DeleteBatch { row_ids }));
         }
         Ok(())
     }
@@ -3013,48 +4161,72 @@ impl Transaction {
     /// Commit all staged ops atomically. Returns the commit epoch.
     /// Throws `ConflictError` on write-write conflict (retryable).
     #[napi]
-    pub fn commit(&self) -> napi::Result<BigInt> {
-        let stage = std::mem::take(&mut *self.staging.lock());
-        commit_result_to_napi(apply_txn(&self.db, &stage).map(|(epoch, _)| epoch))
+    pub fn commit(&self, env: Env) -> napi::Result<BigInt> {
+        let database = self.core()?;
+        let mut stage = self.state.lock().begin_commit()?;
+        let result = apply_txn(&database, &stage);
+        finish_node_transaction_commit(&self.state, &result, &mut stage);
+        commit_result_to_napi(&env, result.map(|(epoch, _)| epoch))
     }
 
     #[napi]
-    pub fn commit_returning(&self) -> napi::Result<CommitResultJs> {
-        let stage = std::mem::take(&mut *self.staging.lock());
-        commit_returning_to_napi(&self.db, apply_txn(&self.db, &stage))
+    pub fn commit_returning(&self, env: Env) -> napi::Result<CommitResultJs> {
+        let database = self.core()?;
+        let mut stage = self.state.lock().begin_commit()?;
+        let result = apply_txn(&database, &stage);
+        finish_node_transaction_commit(&self.state, &result, &mut stage);
+        commit_returning_to_napi(&env, result)
     }
 
     /// Commit off the JS event loop (the durability fsync runs on the NAPI
     /// blocking pool). Throws `ConflictError` on write-write conflict.
-    #[napi]
-    pub async fn commit_async(&self) -> napi::Result<BigInt> {
-        let db = Arc::clone(&self.db);
-        let stage = std::mem::take(&mut *self.staging.lock());
-        napi::bindgen_prelude::spawn_blocking(move || {
-            commit_result_to_napi(apply_txn(&db, &stage).map(|(epoch, _)| epoch))
-        })
-        .await
-        .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e:?}")))?
+    #[napi(ts_return_type = "Promise<bigint>")]
+    pub fn commit_async(&self) -> napi::Result<AsyncTask<TransactionCommitTask>> {
+        let database = self.core()?;
+        let stage = self.state.lock().begin_commit()?;
+        Ok(AsyncTask::new(TransactionCommitTask {
+            db: database,
+            stage,
+            state: Arc::clone(&self.state),
+        }))
     }
 
     /// Async commit that returns both the committed epoch and the affected row
     /// identities, off the JS event loop. Throws `ConflictError` on write-write
     /// conflict.
-    #[napi]
-    pub async fn commit_async_returning(&self) -> napi::Result<CommitResultJs> {
-        let db = Arc::clone(&self.db);
-        let stage = std::mem::take(&mut *self.staging.lock());
-        napi::bindgen_prelude::spawn_blocking(move || {
-            commit_returning_to_napi(&db, apply_txn(&db, &stage))
-        })
-        .await
-        .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e:?}")))?
+    #[napi(ts_return_type = "Promise<CommitResultJs>")]
+    pub fn commit_async_returning(
+        &self,
+    ) -> napi::Result<AsyncTask<TransactionCommitReturningTask>> {
+        let database = self.core()?;
+        let stage = self.state.lock().begin_commit()?;
+        Ok(AsyncTask::new(TransactionCommitReturningTask {
+            db: database,
+            stage,
+            state: Arc::clone(&self.state),
+        }))
     }
 
     /// Discard all staged ops.
     #[napi]
-    pub fn rollback(&self) {
-        self.staging.lock().clear();
+    pub fn rollback(&self) -> napi::Result<()> {
+        let mut state = self.state.lock();
+        match state.phase {
+            NodeTransactionPhase::InFlight => Err(napi::Error::new(
+                napi::Status::GenericFailure,
+                "transaction commit is in flight",
+            )),
+            NodeTransactionPhase::Committed => Err(napi::Error::new(
+                napi::Status::GenericFailure,
+                "transaction is already committed",
+            )),
+            NodeTransactionPhase::RolledBack => Ok(()),
+            NodeTransactionPhase::Active | NodeTransactionPhase::Poisoned => {
+                state.staging.clear();
+                state.phase = NodeTransactionPhase::RolledBack;
+                Ok(())
+            }
+        }
     }
 
     /// Scope subsequent ops to `table` via a `TxnTable`, so the table name
@@ -3065,10 +4237,11 @@ impl Transaction {
     #[napi]
     pub fn table(&self, name: String) -> napi::Result<TxnTable> {
         // Validate the table exists up front (matches Database::get_table).
-        self.db.table(&name).map_err(to_napi)?;
+        self.core()?.table(&name).map_err(to_napi)?;
+        let database = self.core()?;
         Ok(TxnTable {
-            db: Arc::clone(&self.db),
-            staging: Arc::clone(&self.staging),
+            db: Arc::downgrade(&database),
+            state: Arc::clone(&self.state),
             table: name,
         })
     }
@@ -3079,9 +4252,26 @@ impl Transaction {
 /// parent's `commit`/`rollback` still apply.
 #[napi]
 pub struct TxnTable {
-    db: Arc<CoreDatabase>,
-    staging: Arc<parking_lot::Mutex<Vec<(String, TxnOp)>>>,
+    db: std::sync::Weak<CoreDatabase>,
+    state: Arc<parking_lot::Mutex<NodeTransactionState>>,
     table: String,
+}
+
+impl TxnTable {
+    fn core(&self) -> napi::Result<Arc<CoreDatabase>> {
+        self.db.upgrade().ok_or_else(|| {
+            napi::Error::new(
+                napi::Status::GenericFailure,
+                format!("{CORE_DATABASE_CLOSED_CODE}: database is closed"),
+            )
+        })
+    }
+
+    fn active_state(&self) -> napi::Result<parking_lot::MutexGuard<'_, NodeTransactionState>> {
+        let state = self.state.lock();
+        state.ensure_active()?;
+        Ok(state)
+    }
 }
 
 #[napi]
@@ -3090,14 +4280,15 @@ impl TxnTable {
     /// value when applicable, or `null` otherwise.
     #[napi]
     pub fn put(&self, cells: Vec<Cell>) -> napi::Result<Option<BigInt>> {
+        let mut state = self.active_state()?;
         let (cols, assigned) = {
-            let handle = self.db.table(&self.table).map_err(to_napi)?;
+            let handle = self.core()?.table(&self.table).map_err(to_napi)?;
             let mut g = handle.lock();
             let mut cols = cell_pairs_table(&g, cells)?;
             let assigned = g.fill_auto_inc(&mut cols).map_err(to_napi)?;
             (cols, assigned)
         };
-        self.staging.lock().push((
+        state.staging.push((
             self.table.clone(),
             TxnOp::Put {
                 cells: cols,
@@ -3110,16 +4301,16 @@ impl TxnTable {
     /// Stage a batch of puts on this table.
     #[napi]
     pub fn put_batch(&self, rows: Vec<Vec<Cell>>) -> napi::Result<()> {
+        let mut state = self.active_state()?;
         let staged = {
-            let handle = self.db.table(&self.table).map_err(to_napi)?;
+            let handle = self.core()?.table(&self.table).map_err(to_napi)?;
             let g = handle.lock();
             rows.into_iter()
                 .map(|cells| cell_pairs_table(&g, cells))
                 .collect::<napi::Result<Vec<_>>>()?
         };
-        let mut buf = self.staging.lock();
         for cols in staged {
-            buf.push((
+            state.staging.push((
                 self.table.clone(),
                 TxnOp::Put {
                     cells: cols,
@@ -3133,7 +4324,7 @@ impl TxnTable {
     /// Stage a delete of `row_id` on this table.
     #[napi]
     pub fn delete(&self, row_id: BigInt) -> napi::Result<()> {
-        self.staging.lock().push((
+        self.active_state()?.staging.push((
             self.table.clone(),
             TxnOp::Delete(RowId(bigint_to_u64(&row_id)?)),
         ));
@@ -3142,8 +4333,8 @@ impl TxnTable {
 
     #[napi]
     pub fn truncate(&self) -> napi::Result<()> {
-        self.staging
-            .lock()
+        self.active_state()?
+            .staging
             .push((self.table.clone(), TxnOp::Truncate));
         Ok(())
     }
@@ -3154,7 +4345,8 @@ impl TxnTable {
         insert_cells: Vec<Cell>,
         update_cells: Option<Vec<Cell>>,
     ) -> napi::Result<()> {
-        let handle = self.db.table(&self.table).map_err(to_napi)?;
+        let mut state = self.active_state()?;
+        let handle = self.core()?.table(&self.table).map_err(to_napi)?;
         let g = handle.lock();
         let insert_cells = cell_pairs_table(&g, insert_cells)?;
         let action = match update_cells {
@@ -3162,7 +4354,7 @@ impl TxnTable {
             None => mongreldb_core::UpsertAction::DoNothing,
         };
         drop(g);
-        self.staging.lock().push((
+        state.staging.push((
             self.table.clone(),
             TxnOp::Upsert {
                 insert_cells,
@@ -3174,7 +4366,8 @@ impl TxnTable {
 
     #[napi]
     pub fn update_many(&self, updates: Vec<RowUpdateJs>) -> napi::Result<()> {
-        let handle = self.db.table(&self.table).map_err(to_napi)?;
+        let mut state = self.active_state()?;
+        let handle = self.core()?.table(&self.table).map_err(to_napi)?;
         let g = handle.lock();
         let updates = updates
             .into_iter()
@@ -3186,106 +4379,122 @@ impl TxnTable {
             })
             .collect::<napi::Result<Vec<_>>>()?;
         drop(g);
-        self.staging
-            .lock()
+        state
+            .staging
             .push((self.table.clone(), TxnOp::UpdateMany { updates }));
         Ok(())
     }
 
     #[napi]
     pub fn delete_many(&self, row_ids: Vec<BigInt>) -> napi::Result<()> {
+        let mut state = self.active_state()?;
         let row_ids = row_ids
             .iter()
             .map(|row_id| bigint_to_u64(row_id).map(RowId))
             .collect::<napi::Result<Vec<_>>>()?;
-        self.staging
-            .lock()
+        state
+            .staging
             .push((self.table.clone(), TxnOp::DeleteMany { row_ids }));
         Ok(())
     }
 }
 
-enum OpResult {
+pub enum OpResult {
     None,
     Put {
-        table: String,
+        column_ids: Vec<u16>,
         result: mongreldb_core::PutResult,
     },
     Upsert {
-        table: String,
+        column_ids: Vec<u16>,
         result: mongreldb_core::UpsertResult,
     },
     Rows {
-        table: String,
+        column_ids: Vec<u16>,
         rows: Vec<mongreldb_core::OwnedRow>,
     },
 }
 
 fn commit_returning_to_napi(
-    db: &CoreDatabase,
+    env: &Env,
     result: mongreldb_core::Result<(mongreldb_core::Epoch, Vec<OpResult>)>,
 ) -> napi::Result<CommitResultJs> {
-    let (epoch, results) = result.map_err(to_napi)?;
-    let results = results
-        .into_iter()
-        .map(|result| op_result_to_js(db, result))
-        .collect::<napi::Result<Vec<_>>>()?;
+    let (epoch, results) = match result {
+        Ok(result) => result,
+        Err(error) => return throw_core_commit_error(env, error),
+    };
+    let results = results.into_iter().map(op_result_to_js).collect();
     Ok(CommitResultJs {
         epoch: BigInt::from(epoch.0),
         results,
     })
 }
 
-fn op_result_to_js(db: &CoreDatabase, result: OpResult) -> napi::Result<TxnOpResultJs> {
+fn owned_row_to_js_columns(column_ids: &[u16], row: &mongreldb_core::OwnedRow) -> OwnedRowJs {
+    let cells = column_ids
+        .iter()
+        .map(|column_id| {
+            let value = row
+                .columns
+                .iter()
+                .find(|(id, _)| id == column_id)
+                .map(|(_, value)| value.clone())
+                .unwrap_or(Value::Null);
+            from_value(&value, *column_id)
+        })
+        .collect();
+    OwnedRowJs { cells }
+}
+
+fn result_column_ids(db: &CoreDatabase, table: &str) -> mongreldb_core::Result<Vec<u16>> {
+    let handle = db.table(table)?;
+    let table = handle.lock();
+    Ok(table
+        .schema()
+        .columns
+        .iter()
+        .map(|column| column.id)
+        .collect())
+}
+
+fn op_result_to_js(result: OpResult) -> TxnOpResultJs {
     match result {
-        OpResult::None => Ok(TxnOpResultJs {
+        OpResult::None => TxnOpResultJs {
             kind: "none".to_string(),
             auto_inc: None,
             row: None,
             rows: None,
             upsert: None,
-        }),
-        OpResult::Put { table, result } => {
-            let handle = db.table(&table).map_err(to_napi)?;
-            let g = handle.lock();
-            Ok(TxnOpResultJs {
-                kind: "put".to_string(),
+        },
+        OpResult::Put { column_ids, result } => TxnOpResultJs {
+            kind: "put".to_string(),
+            auto_inc: result.auto_inc.map(BigInt::from),
+            row: Some(owned_row_to_js_columns(&column_ids, &result.row)),
+            rows: None,
+            upsert: None,
+        },
+        OpResult::Upsert { column_ids, result } => TxnOpResultJs {
+            kind: "upsert".to_string(),
+            auto_inc: result.auto_inc.map(BigInt::from),
+            row: None,
+            rows: None,
+            upsert: Some(UpsertResultJs {
+                action: upsert_action_to_js(result.action),
+                row: owned_row_to_js_columns(&column_ids, &result.row),
                 auto_inc: result.auto_inc.map(BigInt::from),
-                row: Some(owned_row_to_js_table(&g, &result.row)),
-                rows: None,
-                upsert: None,
-            })
-        }
-        OpResult::Upsert { table, result } => {
-            let handle = db.table(&table).map_err(to_napi)?;
-            let g = handle.lock();
-            Ok(TxnOpResultJs {
-                kind: "upsert".to_string(),
-                auto_inc: result.auto_inc.map(BigInt::from),
-                row: None,
-                rows: None,
-                upsert: Some(UpsertResultJs {
-                    action: upsert_action_to_js(result.action),
-                    row: owned_row_to_js_table(&g, &result.row),
-                    auto_inc: result.auto_inc.map(BigInt::from),
-                }),
-            })
-        }
-        OpResult::Rows { table, rows } => {
-            let handle = db.table(&table).map_err(to_napi)?;
-            let g = handle.lock();
-            Ok(TxnOpResultJs {
-                kind: "rows".to_string(),
-                auto_inc: None,
-                row: None,
-                rows: Some(
-                    rows.iter()
-                        .map(|row| owned_row_to_js_table(&g, row))
-                        .collect(),
-                ),
-                upsert: None,
-            })
-        }
+            }),
+        },
+        OpResult::Rows { column_ids, rows } => TxnOpResultJs {
+            kind: "rows".to_string(),
+            auto_inc: None,
+            row: None,
+            rows: Some(
+                rows.iter()
+                    .map(|row| owned_row_to_js_columns(&column_ids, row))
+                    .collect(),
+            ),
+            upsert: None,
+        },
     }
 }
 
@@ -3303,10 +4512,8 @@ fn apply_txn(
                     if result.auto_inc.is_none() {
                         result.auto_inc = *auto_inc;
                     }
-                    out.push(OpResult::Put {
-                        table: table.clone(),
-                        result,
-                    });
+                    let column_ids = result_column_ids(db, table)?;
+                    out.push(OpResult::Put { column_ids, result });
                 }
                 TxnOp::PutBatch { rows } => {
                     tx.put_batch(table, rows.clone())?;
@@ -3329,24 +4536,18 @@ fn apply_txn(
                     action,
                 } => {
                     let result = tx.upsert(table, insert_cells.clone(), action.clone())?;
-                    out.push(OpResult::Upsert {
-                        table: table.clone(),
-                        result,
-                    });
+                    let column_ids = result_column_ids(db, table)?;
+                    out.push(OpResult::Upsert { column_ids, result });
                 }
                 TxnOp::UpdateMany { updates } => {
                     let rows = tx.update_many(table, updates.clone())?;
-                    out.push(OpResult::Rows {
-                        table: table.clone(),
-                        rows,
-                    });
+                    let column_ids = result_column_ids(db, table)?;
+                    out.push(OpResult::Rows { column_ids, rows });
                 }
                 TxnOp::DeleteMany { row_ids } => {
                     let rows = tx.delete_many(table, row_ids.clone())?;
-                    out.push(OpResult::Rows {
-                        table: table.clone(),
-                        rows,
-                    });
+                    let column_ids = result_column_ids(db, table)?;
+                    out.push(OpResult::Rows { column_ids, rows });
                 }
             }
         }
@@ -3416,10 +4617,21 @@ impl TypedColumn {
 /// flush** — the contract is the opposite of `put()`.
 #[napi]
 pub struct WriteBuffer {
-    db: Arc<CoreDatabase>,
+    db: std::sync::Weak<CoreDatabase>,
     table_name: String,
     buffer: Vec<Vec<(u16, Value)>>,
     threshold: usize,
+}
+
+impl WriteBuffer {
+    fn core(&self) -> napi::Result<Arc<CoreDatabase>> {
+        self.db.upgrade().ok_or_else(|| {
+            napi::Error::new(
+                napi::Status::GenericFailure,
+                format!("{CORE_DATABASE_CLOSED_CODE}: database is closed"),
+            )
+        })
+    }
 }
 
 #[napi]
@@ -3428,7 +4640,7 @@ impl WriteBuffer {
     #[napi(constructor)]
     pub fn new(table: &TableHandle, threshold: Option<u32>) -> Self {
         Self {
-            db: Arc::clone(&table.db),
+            db: table.db.clone(),
             table_name: table.name.clone(),
             buffer: Vec::new(),
             threshold: threshold.unwrap_or(1000) as usize,
@@ -3440,7 +4652,7 @@ impl WriteBuffer {
     #[napi]
     pub fn put(&mut self, cells: Vec<Cell>) -> napi::Result<Option<BigInt>> {
         let pair = {
-            let handle = self.db.table(&self.table_name).map_err(to_napi)?;
+            let handle = self.core()?.table(&self.table_name).map_err(to_napi)?;
             let g = handle.lock();
             cell_pairs_table(&g, cells)?
         };
@@ -3457,12 +4669,12 @@ impl WriteBuffer {
     #[napi]
     pub fn flush(&mut self) -> napi::Result<BigInt> {
         if self.buffer.is_empty() {
-            let handle = self.db.table(&self.table_name).map_err(to_napi)?;
+            let handle = self.core()?.table(&self.table_name).map_err(to_napi)?;
             return Ok(BigInt::from(handle.lock().current_epoch().0));
         }
         let batch = std::mem::take(&mut self.buffer);
         let (epoch, _) = self
-            .db
+            .core()?
             .transaction_for_current_principal_with_epoch(|transaction| {
                 transaction.put_batch(&self.table_name, batch)
             })
@@ -3547,107 +4759,2688 @@ fn validity_to_nulls(validity: &[u8], n: usize) -> Option<arrow::buffer::NullBuf
 /// processes can share one warm cache this way.
 #[napi]
 pub struct RemoteDatabase {
+    inner: Arc<RemoteDatabaseShared>,
+}
+
+struct RemoteDatabaseShared {
     url: String,
     agent: ureq::Agent,
+    authorization: Option<String>,
+}
+
+const MAX_REMOTE_CONTROL_JSON_BYTES: u64 = 1024 * 1024;
+const MAX_REMOTE_TEXT_RESPONSE_BYTES: u64 = 1024 * 1024;
+const DEFAULT_REMOTE_SQL_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_REMOTE_SQL_RESPONSE_BYTES: u64 = 256 * 1024 * 1024;
+const REMOTE_ARROW_FRAMING_ALLOWANCE_BYTES: u64 = 1024 * 1024;
+
+struct StrictJsonValue(serde_json::Value);
+
+impl<'de> serde::Deserialize<'de> for StrictJsonValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = StrictJsonValue;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON value without duplicate object keys")
+            }
+
+            fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(StrictJsonValue(serde_json::Value::Bool(value)))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+                Ok(StrictJsonValue(value.into()))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(StrictJsonValue(value.into()))
+            }
+
+            fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                serde_json::Number::from_f64(value)
+                    .map(serde_json::Value::Number)
+                    .map(StrictJsonValue)
+                    .ok_or_else(|| E::custom("non-finite JSON number"))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(StrictJsonValue(value.into()))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+                Ok(StrictJsonValue(value.into()))
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(StrictJsonValue(serde_json::Value::Null))
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(StrictJsonValue(serde_json::Value::Null))
+            }
+
+            fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                <StrictJsonValue as serde::Deserialize>::deserialize(deserializer)
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
+                while let Some(value) = sequence.next_element::<StrictJsonValue>()? {
+                    values.push(value.0);
+                }
+                Ok(StrictJsonValue(serde_json::Value::Array(values)))
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut values = serde_json::Map::with_capacity(map.size_hint().unwrap_or(0));
+                while let Some(key) = map.next_key::<String>()? {
+                    if values.contains_key(&key) {
+                        return Err(serde::de::Error::custom(format!(
+                            "duplicate JSON object key {key:?}"
+                        )));
+                    }
+                    let value = map.next_value::<StrictJsonValue>()?;
+                    values.insert(key, value.0);
+                }
+                Ok(StrictJsonValue(serde_json::Value::Object(values)))
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+fn strict_json_from_slice(bytes: &[u8]) -> Result<serde_json::Value, String> {
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let value = <StrictJsonValue as serde::Deserialize>::deserialize(&mut deserializer)
+        .map_err(|error| error.to_string())?;
+    deserializer.end().map_err(|error| error.to_string())?;
+    Ok(value.0)
+}
+
+fn bounded_response_bytes(response: ureq::Response, limit: u64) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    response
+        .into_reader()
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > limit {
+        return Err(format!("remote response exceeds {limit} bytes"));
+    }
+    Ok(bytes)
+}
+
+fn bounded_response_text(response: ureq::Response, limit: u64) -> Result<String, String> {
+    String::from_utf8(bounded_response_bytes(response, limit)?)
+        .map_err(|_| "remote response is not valid UTF-8".to_owned())
+}
+
+fn remote_sql_response_limit(body: &serde_json::Value) -> u64 {
+    if body.get("idempotency_key").is_some() {
+        return MAX_REMOTE_CONTROL_JSON_BYTES;
+    }
+    body.get("max_output_bytes")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(DEFAULT_REMOTE_SQL_RESPONSE_BYTES)
+        .min(MAX_REMOTE_SQL_RESPONSE_BYTES)
+        .saturating_add(REMOTE_ARROW_FRAMING_ALLOWANCE_BYTES)
+}
+
+fn strict_json_response(response: ureq::Response) -> Result<serde_json::Value, String> {
+    let bytes = bounded_response_bytes(response, MAX_REMOTE_CONTROL_JSON_BYTES)?;
+    strict_json_from_slice(&bytes)
+}
+
+fn strict_json_response_as<T: serde::de::DeserializeOwned>(
+    response: ureq::Response,
+) -> Result<T, String> {
+    serde_json::from_value(strict_json_response(response)?).map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod strict_remote_json_tests {
+    use super::*;
+
+    fn sql_error_body(query_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "query_id": query_id,
+            "status": "failed_before_commit",
+            "terminal_state": "failed_before_commit",
+            "committed": false,
+            "committed_statements": 0,
+            "last_commit_epoch": null,
+            "last_commit_epoch_text": null,
+            "first_commit_statement_index": null,
+            "last_commit_statement_index": null,
+            "completed_statements": 0,
+            "statement_index": 0,
+            "cancel_outcome": null,
+            "cancellation_reason": null,
+            "retryable": false,
+            "server_state": "failed",
+            "outcome": {
+                "committed": false,
+                "committed_statements": 0,
+                "last_commit_epoch": null,
+                "last_commit_epoch_text": null,
+                "first_commit_statement_index": null,
+                "last_commit_statement_index": null,
+                "completed_statements": 0,
+                "statement_index": 0,
+                "serialization": "unknown"
+            },
+            "error": {
+                "code": "QUERY_FAILED",
+                "message": "rejected",
+                "query_id": query_id,
+                "committed": false,
+                "retryable": false
+            }
+        })
+    }
+
+    #[test]
+    fn rejects_duplicate_keys_at_every_depth() {
+        for json in [
+            br#"{"query_id":"a","query_id":"b"}"#.as_slice(),
+            br#"{"outcome":{"committed":true,"committed":false}}"#.as_slice(),
+        ] {
+            assert!(strict_json_from_slice(json)
+                .unwrap_err()
+                .contains("duplicate JSON object key"));
+        }
+    }
+
+    #[test]
+    fn accepts_normal_json_and_rejects_trailing_data() {
+        assert_eq!(
+            strict_json_from_slice(br#"{"ok":true,"rows":[1,null,"x"]}"#).unwrap()["ok"],
+            true
+        );
+        assert!(strict_json_from_slice(br#"{"ok":true} false"#).is_err());
+    }
+
+    #[test]
+    fn sql_error_requires_exact_query_and_durable_fields() {
+        let query_id: mongreldb_query::QueryId =
+            "00112233445566778899aabbccddeeff".parse().unwrap();
+        let body = sql_error_body(&query_id.to_string());
+        let details = validate_remote_sql_error_response(&body, query_id, 400, "fallback").unwrap();
+        assert_eq!(details.committed, Some(false));
+        assert!(details.outcome_known);
+
+        let mut conflict = body.clone();
+        conflict["outcome"]["committed"] = serde_json::Value::Bool(true);
+        assert!(validate_remote_sql_error_response(&conflict, query_id, 400, "fallback").is_err());
+
+        let mut mismatched = body.clone();
+        mismatched["error"]["query_id"] =
+            serde_json::Value::String("ffeeddccbbaa99887766554433221100".into());
+        assert!(
+            validate_remote_sql_error_response(&mismatched, query_id, 400, "fallback").is_err()
+        );
+
+        let mut oversized = body.clone();
+        oversized["completed_statements"] = serde_json::json!(u64::from(u32::MAX) + 1);
+        oversized["outcome"]["completed_statements"] = serde_json::json!(u64::from(u32::MAX) + 1);
+        assert!(validate_remote_sql_error_response(&oversized, query_id, 400, "fallback").is_err());
+
+        let mut unknown = body;
+        unknown["unexpected"] = serde_json::Value::Bool(true);
+        assert!(validate_remote_sql_error_response(&unknown, query_id, 400, "fallback").is_err());
+
+        for (field, value) in [
+            ("error.code", serde_json::json!("COMMIT_OUTCOME")),
+            ("error.code", serde_json::json!("QUERY_CANCELLED")),
+            ("retryable", serde_json::json!(true)),
+            ("cancel_outcome", serde_json::json!("accepted")),
+        ] {
+            let mut invalid = sql_error_body(&query_id.to_string());
+            match field {
+                "error.code" => invalid["error"]["code"] = value,
+                field => invalid[field] = value,
+            }
+            if field == "retryable" {
+                invalid["error"]["retryable"] = serde_json::json!(true);
+            }
+            assert!(
+                validate_remote_sql_error_response(&invalid, query_id, 400, "fallback").is_err(),
+                "accepted invalid {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn sql_response_limit_is_bounded() {
+        assert_eq!(
+            remote_sql_response_limit(&serde_json::json!({"idempotency_key": "k"})),
+            MAX_REMOTE_CONTROL_JSON_BYTES
+        );
+        assert_eq!(
+            remote_sql_response_limit(
+                &serde_json::json!({"max_output_bytes": u64::MAX, "format": "arrow"})
+            ),
+            MAX_REMOTE_SQL_RESPONSE_BYTES + REMOTE_ARROW_FRAMING_ALLOWANCE_BYTES
+        );
+    }
+
+    #[test]
+    fn write_errors_require_exact_durable_envelopes() {
+        let committed = serde_json::json!({
+            "status": "committed",
+            "committed": true,
+            "epoch": 42,
+            "epoch_text": "42",
+            "retryable": false,
+            "error": {"code": "COMMIT_OUTCOME", "message": "published"}
+        });
+        let details =
+            validate_remote_write_error_response(&committed, 409, "trigger creation").unwrap();
+        assert_eq!(details.committed, Some(true));
+        assert_eq!(details.epoch_text.as_deref(), Some("42"));
+
+        let mut false_claim = committed.clone();
+        false_claim["committed"] = serde_json::Value::Bool(false);
+        assert!(validate_remote_write_error_response(&false_claim, 409, "write").is_err());
+
+        let mut unknown_field = committed;
+        unknown_field["outcome"] = serde_json::json!({"committed": true});
+        assert!(validate_remote_write_error_response(&unknown_field, 409, "write").is_err());
+    }
+
+    #[test]
+    fn table_commit_requires_exact_epoch_fields() {
+        assert_eq!(
+            remote_commit_epoch(&serde_json::json!({"epoch": 42, "epoch_text": "42"})).unwrap(),
+            42
+        );
+        assert!(
+            remote_commit_epoch(&serde_json::json!({"epoch": 42, "epoch_text": "43"})).is_err()
+        );
+        assert!(remote_commit_epoch(
+            &serde_json::json!({"epoch": 42, "epoch_text": "42", "extra": true})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn query_not_found_requires_the_exact_server_envelope() {
+        let query_id: mongreldb_query::QueryId =
+            "00112233445566778899aabbccddeeff".parse().unwrap();
+        let query_id_text = query_id.to_string();
+        let body = serde_json::json!({
+            "query_id": query_id_text.clone(),
+            "status": "unknown",
+            "terminal_state": null,
+            "committed": null,
+            "committed_statements": null,
+            "last_commit_epoch": null,
+            "last_commit_epoch_text": null,
+            "first_commit_statement_index": null,
+            "last_commit_statement_index": null,
+            "completed_statements": null,
+            "statement_index": null,
+            "cancel_outcome": "not_found",
+            "cancellation_reason": null,
+            "retryable": false,
+            "server_state": "not_found",
+            "outcome": {
+                "committed": null,
+                "committed_statements": null,
+                "last_commit_epoch": null,
+                "last_commit_epoch_text": null,
+                "first_commit_statement_index": null,
+                "last_commit_statement_index": null,
+                "completed_statements": null,
+                "statement_index": null,
+                "serialization": "unknown"
+            },
+            "error": {
+                "code": "QUERY_NOT_FOUND",
+                "message": "query not found",
+                "query_id": query_id_text,
+                "committed": null,
+                "retryable": false
+            }
+        });
+        let details = validate_remote_query_not_found_response(&body, query_id).unwrap();
+        assert_eq!(details.code, "QUERY_NOT_FOUND");
+        assert!(!details.outcome_known);
+
+        let mut conflicting = body.clone();
+        conflicting["error"]["committed"] = serde_json::Value::Bool(false);
+        assert!(validate_remote_query_not_found_response(&conflicting, query_id).is_err());
+
+        let mut unknown = body;
+        unknown["result"] = serde_json::Value::Null;
+        assert!(validate_remote_query_not_found_response(&unknown, query_id).is_err());
+    }
+}
+
+struct PendingRemoteSql {
+    sql: String,
+    options: NativeSqlOptions,
+}
+
+pub struct RemoteSqlTask {
+    query_id: mongreldb_query::QueryId,
+    remote: Arc<RemoteDatabaseShared>,
+    pending: PendingRemoteSql,
+}
+
+pub enum RemoteSqlTaskOutput {
+    Success(Vec<u8>),
+    Failure(Box<NativeRemoteQueryErrorDetails>),
+}
+
+impl napi::Task for RemoteSqlTask {
+    type Output = RemoteSqlTaskOutput;
+    type JsValue = Buffer;
+
+    fn compute(&mut self) -> napi::Result<Self::Output> {
+        let options = &self.pending.options;
+        let body = serde_json::json!({
+            "sql": self.pending.sql,
+            "format": "arrow",
+            "query_id": self.query_id.to_string(),
+            "timeout_ms": options.timeout_ms,
+            "max_output_rows": options.max_output_rows,
+            "max_output_bytes": options.max_output_bytes,
+        });
+        Ok(match self.remote.execute_remote_sql(self.query_id, body) {
+            Ok(bytes) => RemoteSqlTaskOutput::Success(bytes),
+            Err(details) => RemoteSqlTaskOutput::Failure(details),
+        })
+    }
+
+    fn resolve(&mut self, env: Env, output: Self::Output) -> napi::Result<Self::JsValue> {
+        match output {
+            RemoteSqlTaskOutput::Success(bytes) => Ok(Buffer::from(bytes)),
+            RemoteSqlTaskOutput::Failure(details) => {
+                let error = create_remote_query_error(&env, *details)?;
+                Err(napi::Error::from(error.into_unknown()))
+            }
+        }
+    }
+}
+
+pub struct RemoteIdempotentSqlTask {
+    query_id: mongreldb_query::QueryId,
+    remote: Arc<RemoteDatabaseShared>,
+    body: serde_json::Value,
+}
+
+pub enum RemoteIdempotentSqlTaskOutput {
+    Success(Box<NativeRemoteSqlReceipt>),
+    Failure(Box<NativeRemoteQueryErrorDetails>),
+}
+
+impl napi::Task for RemoteIdempotentSqlTask {
+    type Output = RemoteIdempotentSqlTaskOutput;
+    type JsValue = NativeRemoteSqlReceipt;
+
+    fn compute(&mut self) -> napi::Result<Self::Output> {
+        Ok(
+            match self
+                .remote
+                .execute_remote_sql(self.query_id, self.body.take())
+            {
+                Ok(bytes) => match strict_json_from_slice(&bytes)
+                    .map_err(|_| ())
+                    .and_then(|body| native_remote_sql_receipt(body, self.query_id).map_err(|_| ()))
+                {
+                    Ok(receipt) => RemoteIdempotentSqlTaskOutput::Success(Box::new(receipt)),
+                    Err(()) => RemoteIdempotentSqlTaskOutput::Failure(Box::new(
+                        self.remote.recover_remote_query_details(
+                            self.query_id,
+                            "invalid idempotent SQL receipt".into(),
+                        ),
+                    )),
+                },
+                Err(details) => RemoteIdempotentSqlTaskOutput::Failure(details),
+            },
+        )
+    }
+
+    fn resolve(&mut self, env: Env, output: Self::Output) -> napi::Result<Self::JsValue> {
+        match output {
+            RemoteIdempotentSqlTaskOutput::Success(receipt) => Ok(*receipt),
+            RemoteIdempotentSqlTaskOutput::Failure(details) => {
+                let error = create_remote_query_error(&env, *details)?;
+                Err(napi::Error::from(error.into_unknown()))
+            }
+        }
+    }
+}
+
+#[napi]
+pub struct NativeRemoteSqlQuery {
+    query_id: mongreldb_query::QueryId,
+    remote: Arc<RemoteDatabaseShared>,
+    pending: Mutex<Option<PendingRemoteSql>>,
+}
+
+#[napi(object)]
+pub struct NativeRemoteOptions {
+    pub bearer_token: Option<String>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub transport_timeout_ms: Option<u32>,
+}
+
+impl RemoteDatabase {
+    fn request(&self, method: &str, path: &str) -> ureq::Request {
+        self.inner.request(method, path)
+    }
+
+    fn checked_write_response(
+        &self,
+        env: &Env,
+        operation: &str,
+        response: Result<ureq::Response, ureq::Error>,
+    ) -> napi::Result<ureq::Response> {
+        match response {
+            Ok(response) => Ok(response),
+            Err(ureq::Error::Status(status, response)) => {
+                let fallback = format!("remote {operation} request failed with HTTP {status}");
+                let details = match strict_json_response(response)
+                    .and_then(|body| validate_remote_write_error_response(&body, status, operation))
+                {
+                    Ok(details) => details,
+                    Err(error) => {
+                        let mut details = unknown_remote_write_outcome(format!(
+                            "{fallback}: invalid error response: {error}"
+                        ));
+                        details.http_status = Some(u32::from(status));
+                        details.server_state = Some("invalid_response".into());
+                        details
+                    }
+                };
+                throw_remote_query_error(env, details)
+            }
+            Err(ureq::Error::Transport(_)) => throw_remote_query_error(
+                env,
+                unknown_remote_write_outcome(format!(
+                    "remote {operation} request ended before a response"
+                )),
+            ),
+        }
+    }
+
+    fn write_json<T: serde::de::DeserializeOwned>(
+        &self,
+        env: &Env,
+        operation: &str,
+        response: Result<ureq::Response, ureq::Error>,
+    ) -> napi::Result<T> {
+        let response = self.checked_write_response(env, operation, response)?;
+        match strict_json_response(response)
+            .and_then(|body| serde_json::from_value(body).map_err(|error| error.to_string()))
+        {
+            Ok(body) => Ok(body),
+            Err(_) => throw_remote_query_error(
+                env,
+                unknown_remote_write_outcome(format!(
+                    "remote {operation} response was not valid JSON"
+                )),
+            ),
+        }
+    }
+
+    fn write_text(
+        &self,
+        env: &Env,
+        operation: &str,
+        response: Result<ureq::Response, ureq::Error>,
+    ) -> napi::Result<String> {
+        let response = self.checked_write_response(env, operation, response)?;
+        match bounded_response_text(response, MAX_REMOTE_TEXT_RESPONSE_BYTES) {
+            Ok(body) => Ok(body),
+            Err(error) => throw_remote_query_error(
+                env,
+                unknown_remote_write_outcome(format!(
+                    "remote {operation} response could not be read: {error}"
+                )),
+            ),
+        }
+    }
+}
+
+impl RemoteDatabaseShared {
+    fn request(&self, method: &str, path: &str) -> ureq::Request {
+        let request = self.agent.request(method, &format!("{}{}", self.url, path));
+        match self.authorization.as_ref() {
+            Some(authorization) => request.set("Authorization", authorization),
+            None => request,
+        }
+    }
+
+    fn recovery_status(&self, query_id: mongreldb_query::QueryId) -> Option<serde_json::Value> {
+        let response = self
+            .request("GET", &format!("/queries/{query_id}"))
+            .timeout(std::time::Duration::from_millis(250))
+            .call()
+            .ok()?;
+        strict_json_response(response).ok()
+    }
+
+    fn recovery_cancel(&self, query_id: mongreldb_query::QueryId) -> Option<String> {
+        let response = match self
+            .request("POST", &format!("/queries/{query_id}/cancel"))
+            .timeout(std::time::Duration::from_millis(250))
+            .call()
+        {
+            Ok(response) | Err(ureq::Error::Status(_, response)) => response,
+            Err(ureq::Error::Transport(_)) => return None,
+        };
+        let body = strict_json_response(response).ok()?;
+        validate_remote_cancel_response(&body, query_id)
+            .ok()
+            .map(native_cancel_outcome_name)
+            .map(str::to_owned)
+    }
+
+    fn recover_remote_query_details(
+        &self,
+        query_id: mongreldb_query::QueryId,
+        message: String,
+    ) -> NativeRemoteQueryErrorDetails {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut status = self.recovery_status(query_id);
+        if let Some(details) = status
+            .as_ref()
+            .and_then(|status| recovered_remote_error(status, query_id, &message))
+        {
+            return details;
+        }
+        let cancel_outcome = self.recovery_cancel(query_id);
+        while !status.as_ref().is_some_and(|status| {
+            validate_remote_query_envelope(status, query_id, RemoteEnvelopeKind::Status)
+                .is_ok_and(|status| remote_status_is_terminal(&status))
+        }) && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            status = self.recovery_status(query_id).or(status);
+        }
+        if let Some(details) = status
+            .as_ref()
+            .and_then(|status| recovered_remote_error(status, query_id, &message))
+        {
+            return details;
+        }
+        let validated_status = status.as_ref().and_then(|status| {
+            validate_remote_query_envelope(status, query_id, RemoteEnvelopeKind::Status).ok()
+        });
+        unknown_remote_outcome(
+            query_id,
+            message,
+            validated_status.as_ref(),
+            cancel_outcome.as_deref(),
+        )
+    }
+
+    fn execute_remote_sql(
+        &self,
+        query_id: mongreldb_query::QueryId,
+        body: serde_json::Value,
+    ) -> Result<Vec<u8>, Box<NativeRemoteQueryErrorDetails>> {
+        let response_limit = remote_sql_response_limit(&body);
+        let response = match self.request("POST", "/sql").send_json(body) {
+            Ok(response) => response,
+            Err(ureq::Error::Status(status, response)) => {
+                let fallback = format!("remote SQL request failed with HTTP {status}");
+                return Err(Box::new(
+                    match strict_json_response(response).and_then(|body| {
+                        validate_remote_sql_error_response(&body, query_id, status, &fallback)
+                    }) {
+                        Ok(details) => details,
+                        Err(error) => self.recover_remote_query_details(
+                            query_id,
+                            format!("{fallback}: invalid error response: {error}"),
+                        ),
+                    },
+                ));
+            }
+            Err(ureq::Error::Transport(error)) => {
+                return Err(Box::new(
+                    self.recover_remote_query_details(query_id, error.to_string()),
+                ));
+            }
+        };
+        bounded_response_bytes(response, response_limit)
+            .map_err(|error| Box::new(self.recover_remote_query_details(query_id, error)))
+    }
+}
+
+fn prepare_remote_sql(
+    sql: String,
+    options: Option<NativeSqlOptions>,
+    idempotent: bool,
+) -> napi::Result<(mongreldb_query::QueryId, serde_json::Value)> {
+    let NativeSqlOptions {
+        query_id,
+        timeout_ms,
+        max_output_rows,
+        max_output_bytes,
+        idempotency_key,
+    } = options.unwrap_or(NativeSqlOptions {
+        query_id: None,
+        timeout_ms: None,
+        max_output_rows: None,
+        max_output_bytes: None,
+        idempotency_key: None,
+    });
+    if timeout_ms == Some(0) {
+        return Err(napi::Error::new(
+            napi::Status::InvalidArg,
+            "timeoutMs must be positive",
+        ));
+    }
+    if max_output_rows == Some(0) || max_output_bytes == Some(0) {
+        return Err(napi::Error::new(
+            napi::Status::InvalidArg,
+            "maxOutputRows and maxOutputBytes must be positive",
+        ));
+    }
+    if idempotency_key
+        .as_ref()
+        .is_some_and(|key| key.is_empty() || key.len() > 256)
+    {
+        return Err(napi::Error::new(
+            napi::Status::InvalidArg,
+            "idempotencyKey must contain 1 to 256 bytes",
+        ));
+    }
+    if idempotent != idempotency_key.is_some() {
+        return Err(napi::Error::new(
+            napi::Status::InvalidArg,
+            if idempotent {
+                "sqlWriteIdempotent requires options.idempotencyKey"
+            } else {
+                "use sqlWriteIdempotent for options.idempotencyKey"
+            },
+        ));
+    }
+    let query_id = match query_id {
+        Some(query_id) => query_id
+            .parse::<mongreldb_query::QueryId>()
+            .map_err(query_to_napi)?,
+        None => mongreldb_query::QueryId::random().map_err(query_to_napi)?,
+    };
+    let mut body = serde_json::json!({
+        "sql": sql,
+        "query_id": query_id.to_string(),
+        "timeout_ms": timeout_ms,
+        "max_output_rows": max_output_rows,
+        "max_output_bytes": max_output_bytes,
+    });
+    if let Some(idempotency_key) = idempotency_key {
+        body["idempotency_key"] = serde_json::Value::String(idempotency_key);
+    } else {
+        body["format"] = serde_json::Value::String("arrow".into());
+    }
+    Ok((query_id, body))
+}
+
+#[derive(Clone, Copy)]
+enum RemoteEnvelopeKind {
+    Receipt,
+    Status,
+}
+
+struct ValidatedRemoteEnvelope {
+    query_id: String,
+    status: String,
+    state: String,
+    terminal_state: Option<String>,
+    operation: String,
+    outcome_known: bool,
+    committed: Option<bool>,
+    committed_statements: Option<u32>,
+    last_commit_epoch: Option<u64>,
+    last_commit_epoch_text: Option<String>,
+    first_commit_statement_index: Option<u32>,
+    last_commit_statement_index: Option<u32>,
+    completed_statements: Option<u32>,
+    statement_index: Option<u32>,
+    cancel_outcome: Option<NativeCancelOutcome>,
+    cancellation_reason: String,
+    retryable: bool,
+    terminal_error_code: Option<String>,
+    terminal_error_category: Option<String>,
+}
+
+fn optional_json_bool(value: Option<&serde_json::Value>) -> Result<Option<bool>, String> {
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => value
+            .as_bool()
+            .map(Some)
+            .ok_or_else(|| "boolean field has invalid type".to_owned()),
+    }
+}
+
+fn optional_json_u32(value: Option<&serde_json::Value>) -> Result<Option<u32>, String> {
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => u32::try_from(
+            value
+                .as_u64()
+                .ok_or_else(|| "integer field has invalid type".to_owned())?,
+        )
+        .map(Some)
+        .map_err(|_| "integer field exceeds u32".to_owned()),
+    }
+}
+
+fn paired_json_bool(
+    body: &serde_json::Value,
+    outcome: &serde_json::Value,
+    name: &str,
+) -> Result<Option<bool>, String> {
+    let top = optional_json_bool(body.get(name))?;
+    let nested = optional_json_bool(outcome.get(name))?;
+    if top != nested {
+        return Err(format!("{name} disagrees with outcome.{name}"));
+    }
+    Ok(top)
+}
+
+fn paired_json_u32(
+    body: &serde_json::Value,
+    outcome: &serde_json::Value,
+    name: &str,
+) -> Result<Option<u32>, String> {
+    let top = optional_json_u32(body.get(name))?;
+    let nested = optional_json_u32(outcome.get(name))?;
+    if top != nested {
+        return Err(format!("{name} disagrees with outcome.{name}"));
+    }
+    Ok(top)
+}
+
+fn exact_json_epoch(value: &serde_json::Value) -> Result<(Option<u64>, Option<String>), String> {
+    exact_epoch_fields(
+        &[value.get("last_commit_epoch")],
+        &[value.get("last_commit_epoch_text")],
+    )
+    .map_err(|()| "commit epoch fields are invalid".to_owned())
+}
+
+fn optional_cancel_outcome(
+    value: Option<&serde_json::Value>,
+) -> Result<Option<NativeCancelOutcome>, String> {
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => remote_cancel_outcome(value.as_str())
+            .map(Some)
+            .ok_or_else(|| "cancel_outcome is invalid".to_owned()),
+    }
+}
+
+const REMOTE_OUTCOME_FIELDS: &[&str] = &[
+    "committed",
+    "committed_statements",
+    "last_commit_epoch",
+    "last_commit_epoch_text",
+    "first_commit_statement_index",
+    "last_commit_statement_index",
+    "completed_statements",
+    "statement_index",
+    "serialization",
+];
+
+fn require_json_object_fields<'a>(
+    value: &'a serde_json::Value,
+    allowed: &[&str],
+    required: &[&str],
+    name: &str,
+) -> Result<&'a serde_json::Map<String, serde_json::Value>, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("{name} must be an object"))?;
+    if let Some(field) = object
+        .keys()
+        .find(|field| !allowed.contains(&field.as_str()))
+    {
+        return Err(format!("{name} contains unknown field {field:?}"));
+    }
+    if let Some(field) = required.iter().find(|field| !object.contains_key(**field)) {
+        return Err(format!("{name} lacks required field {field:?}"));
+    }
+    Ok(object)
+}
+
+fn validate_remote_outcome_object(value: &serde_json::Value) -> Result<(), String> {
+    let outcome = require_json_object_fields(
+        value,
+        REMOTE_OUTCOME_FIELDS,
+        REMOTE_OUTCOME_FIELDS,
+        "query outcome",
+    )?;
+    match outcome["serialization"].as_str() {
+        Some("not_started" | "in_progress" | "succeeded" | "failed" | "unknown") => Ok(()),
+        _ => Err("query outcome serialization is invalid".into()),
+    }
+}
+
+fn validate_remote_terminal_error_object(value: &serde_json::Value) -> Result<(), String> {
+    if value.is_null() {
+        return Ok(());
+    }
+    require_json_object_fields(
+        value,
+        &["code", "category"],
+        &["code", "category"],
+        "terminal error",
+    )?;
+    Ok(())
+}
+
+fn validate_remote_query_envelope(
+    body: &serde_json::Value,
+    expected_query_id: mongreldb_query::QueryId,
+    kind: RemoteEnvelopeKind,
+) -> Result<ValidatedRemoteEnvelope, String> {
+    const STATES: &[&str] = &[
+        "queued",
+        "planning",
+        "executing",
+        "streaming",
+        "serializing",
+        "commit_critical",
+        "cancelling",
+        "completed",
+        "failed",
+        "cancelled",
+        "pre_cancelled",
+        "finished",
+    ];
+    const STATUSES: &[&str] = &[
+        "running",
+        "outcome_unknown",
+        "completed",
+        "failed_before_commit",
+        "cancelled_before_commit",
+        "deadline_before_commit",
+        "cancelled_before_start",
+        "committed",
+        "committed_with_error",
+        "partially_committed",
+        "cancelled_after_commit",
+        "deadline_after_commit",
+        "finished",
+    ];
+
+    const STATUS_FIELDS: &[&str] = &[
+        "query_id",
+        "status",
+        "terminal_state",
+        "state",
+        "server_state",
+        "started_ms_ago",
+        "deadline_ms_remaining",
+        "session_id",
+        "operation",
+        "committed",
+        "committed_statements",
+        "last_commit_epoch",
+        "last_commit_epoch_text",
+        "first_commit_statement_index",
+        "last_commit_statement_index",
+        "cancellation_reason",
+        "completed_statements",
+        "statement_index",
+        "cancel_outcome",
+        "retryable",
+        "outcome",
+        "terminal_error",
+        "trace",
+        "code",
+    ];
+    const RECEIPT_FIELDS: &[&str] = &[
+        "query_id",
+        "original_query_id",
+        "status",
+        "terminal_state",
+        "server_state",
+        "cancel_outcome",
+        "cancellation_reason",
+        "committed",
+        "committed_statements",
+        "last_commit_epoch",
+        "last_commit_epoch_text",
+        "first_commit_statement_index",
+        "last_commit_statement_index",
+        "completed_statements",
+        "statement_index",
+        "retryable",
+        "idempotency_replayed",
+        "idempotency_persisted",
+        "idempotency_expires_at_ms",
+        "outcome",
+        "terminal_error",
+    ];
+
+    require_json_object_fields(
+        body,
+        match kind {
+            RemoteEnvelopeKind::Receipt => RECEIPT_FIELDS,
+            RemoteEnvelopeKind::Status => STATUS_FIELDS,
+        },
+        &["query_id", "status", "server_state", "outcome", "retryable"],
+        "query response",
+    )?;
+
+    let outcome = body
+        .get("outcome")
+        .and_then(serde_json::Value::as_object)
+        .map(|_| &body["outcome"])
+        .ok_or_else(|| "query response lacks outcome object".to_owned())?;
+    validate_remote_outcome_object(outcome)?;
+    if let Some(terminal_error) = body.get("terminal_error") {
+        validate_remote_terminal_error_object(terminal_error)?;
+    }
+    if let Some(trace) = body.get("trace") {
+        require_json_object_fields(
+            trace,
+            &[
+                "queue_duration_us",
+                "planning_duration_us",
+                "execution_duration_us",
+                "serialization_duration_us",
+                "cancel_requested_phase",
+                "cancel_observed_phase",
+                "commit_fence_outcome",
+            ],
+            &[],
+            "query trace",
+        )?;
+    }
+    let query_id = body["query_id"]
+        .as_str()
+        .ok_or_else(|| "query response lacks query_id".to_owned())?;
+    if query_id != expected_query_id.to_string() {
+        return Err("query response query_id does not match request".into());
+    }
+    let status = body["status"]
+        .as_str()
+        .ok_or_else(|| "query response lacks status".to_owned())?;
+    if !STATUSES.contains(&status) {
+        return Err("query response status is invalid".into());
+    }
+    let state = match kind {
+        RemoteEnvelopeKind::Receipt => body["server_state"].as_str(),
+        RemoteEnvelopeKind::Status => body["state"].as_str(),
+    }
+    .ok_or_else(|| "query response lacks state".to_owned())?;
+    let server_state = body["server_state"]
+        .as_str()
+        .ok_or_else(|| "query response lacks server_state".to_owned())?;
+    if !STATES.contains(&state)
+        || !STATES.contains(&server_state)
+        || state != server_state
+        || body["state"]
+            .as_str()
+            .is_some_and(|top_state| top_state != server_state)
+    {
+        return Err("query response state fields disagree".into());
+    }
+    let terminal_state = match body.get("terminal_state") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .ok_or_else(|| "terminal_state has invalid type".to_owned())?
+                .to_owned(),
+        ),
+    };
+    if terminal_state
+        .as_deref()
+        .is_some_and(|terminal| terminal != status)
+        || matches!(kind, RemoteEnvelopeKind::Receipt) && terminal_state.as_deref() != Some(status)
+        || status == "running" && terminal_state.is_some()
+    {
+        return Err("query response terminal_state disagrees with status".into());
+    }
+    let state_matches_status = match status {
+        "running" => matches!(
+            state,
+            "queued"
+                | "planning"
+                | "executing"
+                | "streaming"
+                | "serializing"
+                | "commit_critical"
+                | "cancelling"
+        ),
+        "committed" => !matches!(state, "failed" | "cancelled" | "pre_cancelled" | "finished"),
+        "completed" => state == "completed",
+        "failed_before_commit"
+        | "committed_with_error"
+        | "partially_committed"
+        | "outcome_unknown" => state == "failed",
+        "cancelled_before_commit"
+        | "deadline_before_commit"
+        | "cancelled_after_commit"
+        | "deadline_after_commit" => state == "cancelled",
+        "cancelled_before_start" => state == "pre_cancelled",
+        "finished" => state == "finished",
+        _ => false,
+    };
+    if !state_matches_status {
+        return Err("query response state and status disagree".into());
+    }
+    if matches!(kind, RemoteEnvelopeKind::Receipt)
+        && !matches!(
+            status,
+            "completed"
+                | "committed"
+                | "committed_with_error"
+                | "partially_committed"
+                | "cancelled_after_commit"
+                | "deadline_after_commit"
+        )
+    {
+        return Err("idempotent receipt status is not durable".into());
+    }
+
+    let committed = paired_json_bool(body, outcome, "committed")?;
+    let committed_statements = paired_json_u32(body, outcome, "committed_statements")?;
+    let first_commit_statement_index =
+        paired_json_u32(body, outcome, "first_commit_statement_index")?;
+    let last_commit_statement_index =
+        paired_json_u32(body, outcome, "last_commit_statement_index")?;
+    let completed_statements = paired_json_u32(body, outcome, "completed_statements")?;
+    let statement_index = paired_json_u32(body, outcome, "statement_index")?;
+    let top_epoch = exact_json_epoch(body)?;
+    let nested_epoch = exact_json_epoch(outcome)?;
+    if top_epoch != nested_epoch {
+        return Err("commit epoch disagrees with outcome commit epoch".into());
+    }
+    let (last_commit_epoch, last_commit_epoch_text) = top_epoch;
+    let derived_outcome_known = committed.is_some() && status != "outcome_unknown";
+    if optional_json_bool(body.get("outcome_known"))?
+        .is_some_and(|explicit| explicit != derived_outcome_known)
+    {
+        return Err("outcome_known disagrees with durable metadata".into());
+    }
+    match committed {
+        Some(true) => {
+            if committed_statements.map_or(true, |count| count == 0)
+                || last_commit_epoch.is_none()
+                || body["last_commit_epoch_text"].as_str().is_none()
+                || outcome["last_commit_epoch_text"].as_str().is_none()
+                || first_commit_statement_index.is_none()
+                || last_commit_statement_index.is_none()
+                || completed_statements.is_none()
+                || statement_index.is_none()
+                || !matches!(
+                    status,
+                    "committed"
+                        | "committed_with_error"
+                        | "partially_committed"
+                        | "cancelled_after_commit"
+                        | "deadline_after_commit"
+                )
+            {
+                return Err("committed response lacks durable metadata".into());
+            }
+        }
+        Some(false) => {
+            if committed_statements != Some(0)
+                || last_commit_epoch.is_some()
+                || first_commit_statement_index.is_some()
+                || last_commit_statement_index.is_some()
+                || completed_statements.is_none()
+                || statement_index.is_none()
+                || matches!(
+                    status,
+                    "committed"
+                        | "committed_with_error"
+                        | "partially_committed"
+                        | "cancelled_after_commit"
+                        | "deadline_after_commit"
+                        | "outcome_unknown"
+                        | "finished"
+                )
+            {
+                return Err("non-committed response has invalid durable metadata".into());
+            }
+        }
+        None => {
+            if committed_statements.is_some()
+                || last_commit_epoch.is_some()
+                || first_commit_statement_index.is_some()
+                || last_commit_statement_index.is_some()
+                || completed_statements.is_some()
+                || statement_index.is_some()
+                || !matches!(status, "outcome_unknown" | "finished")
+            {
+                return Err("unknown response contains durable metadata".into());
+            }
+        }
+    }
+    if let (Some(first), Some(last), Some(count)) = (
+        first_commit_statement_index,
+        last_commit_statement_index,
+        committed_statements,
+    ) {
+        if first > last
+            || count > last.saturating_sub(first).saturating_add(1)
+            || statement_index.is_some_and(|statement| last > statement)
+        {
+            return Err("commit statement indexes are invalid".into());
+        }
+    }
+    if let (Some(completed), Some(statement)) = (completed_statements, statement_index) {
+        if statement > completed || completed > statement.saturating_add(1) {
+            return Err("statement index and completed count disagree".into());
+        }
+    }
+    let (terminal_error_code, terminal_error_category) = match body.get("terminal_error") {
+        None | Some(serde_json::Value::Null) => (None, None),
+        Some(value) => {
+            let code = value["code"]
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| "terminal error code is invalid".to_owned())?;
+            let category = value["category"]
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| "terminal error category is invalid".to_owned())?;
+            (Some(code.to_owned()), Some(category.to_owned()))
+        }
+    };
+    let cancellation_reason = match body.get("cancellation_reason") {
+        None | Some(serde_json::Value::Null) => "none".to_owned(),
+        Some(value) => value
+            .as_str()
+            .ok_or_else(|| "cancellation_reason has invalid type".to_owned())?
+            .to_owned(),
+    };
+    let retryable = body["retryable"]
+        .as_bool()
+        .ok_or_else(|| "query response lacks retryable".to_owned())?;
+    let cancel_outcome = optional_cancel_outcome(body.get("cancel_outcome"))?;
+    let operation = body["operation"].as_str().unwrap_or_default().to_owned();
+    validate_remote_terminal_contract(
+        status,
+        state,
+        terminal_state.as_deref(),
+        terminal_error_code.as_deref(),
+        terminal_error_category.as_deref(),
+        cancel_outcome,
+        &cancellation_reason,
+        retryable,
+        &operation,
+        kind,
+    )?;
+    Ok(ValidatedRemoteEnvelope {
+        query_id: query_id.to_owned(),
+        status: status.to_owned(),
+        state: state.to_owned(),
+        terminal_state,
+        operation,
+        outcome_known: derived_outcome_known,
+        committed,
+        committed_statements,
+        last_commit_epoch,
+        last_commit_epoch_text,
+        first_commit_statement_index,
+        last_commit_statement_index,
+        completed_statements,
+        statement_index,
+        cancel_outcome,
+        cancellation_reason,
+        retryable,
+        terminal_error_code,
+        terminal_error_category,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_remote_terminal_contract(
+    status: &str,
+    state: &str,
+    terminal_state: Option<&str>,
+    error_code: Option<&str>,
+    error_category: Option<&str>,
+    cancel_outcome: Option<NativeCancelOutcome>,
+    cancellation_reason: &str,
+    retryable: bool,
+    operation: &str,
+    kind: RemoteEnvelopeKind,
+) -> Result<(), String> {
+    if error_category.is_some_and(|category| {
+        !matches!(
+            category,
+            "cancellation" | "deadline" | "result_limit" | "serialization" | "execution"
+        )
+    }) {
+        return Err("terminal error category is invalid".into());
+    }
+    let terminal_error_matches = match status {
+        "running" | "completed" | "committed" | "finished" => error_code.is_none(),
+        "outcome_unknown" => {
+            error_code == Some("QUERY_OUTCOME_UNKNOWN") && error_category == Some("execution")
+        }
+        "cancelled_before_start" | "cancelled_before_commit" => {
+            error_code == Some("QUERY_CANCELLED") && error_category == Some("cancellation")
+        }
+        "cancelled_after_commit" => {
+            error_code == Some("QUERY_CANCELLED_AFTER_COMMIT")
+                && error_category == Some("cancellation")
+        }
+        "deadline_before_commit" => {
+            error_code == Some("DEADLINE_EXCEEDED") && error_category == Some("deadline")
+        }
+        "deadline_after_commit" => {
+            error_code == Some("DEADLINE_AFTER_COMMIT") && error_category == Some("deadline")
+        }
+        "failed_before_commit" | "committed_with_error" | "partially_committed" => {
+            error_code.is_some() && error_category.is_some()
+        }
+        _ => false,
+    };
+    if !terminal_error_matches {
+        return Err("terminal error disagrees with query status".into());
+    }
+    if error_code.is_some_and(|code| {
+        (error_category == Some("cancellation"))
+            != matches!(code, "QUERY_CANCELLED" | "QUERY_CANCELLED_AFTER_COMMIT")
+            || (error_category == Some("deadline"))
+                != matches!(code, "DEADLINE_EXCEEDED" | "DEADLINE_AFTER_COMMIT")
+    }) {
+        return Err("terminal error code and category disagree".into());
+    }
+    let expected_retryable = error_code.is_some_and(|code| {
+        matches!(
+            code,
+            "IDEMPOTENCY_STORE_FULL" | "IDEMPOTENCY_STORE_UNAVAILABLE"
+        )
+    });
+    if retryable != expected_retryable {
+        return Err("retryable disagrees with terminal error".into());
+    }
+    let expected_cancel = match state {
+        "commit_critical" => Some(NativeCancelOutcome::TooLate),
+        "cancelling" => Some(NativeCancelOutcome::Accepted),
+        "completed" | "failed" | "cancelled" | "finished" => {
+            Some(NativeCancelOutcome::AlreadyFinished)
+        }
+        "pre_cancelled" => Some(NativeCancelOutcome::PreCancelled),
+        _ => None,
+    };
+    if cancel_outcome != expected_cancel {
+        return Err("cancel_outcome disagrees with query state".into());
+    }
+    const REASONS: &[&str] = &[
+        "none",
+        "client_request",
+        "client_disconnected",
+        "session_closed",
+        "server_shutdown",
+        "deadline",
+    ];
+    let valid_reason = match status {
+        "finished" => cancellation_reason == "none",
+        "cancelled_before_start" | "cancelled_before_commit" | "cancelled_after_commit" => {
+            REASONS.contains(&cancellation_reason)
+                && !matches!(cancellation_reason, "none" | "deadline")
+        }
+        "deadline_before_commit" | "deadline_after_commit" => cancellation_reason == "deadline",
+        "running" | "committed" if state == "cancelling" => {
+            REASONS.contains(&cancellation_reason) && cancellation_reason != "none"
+        }
+        _ => cancellation_reason == "none",
+    };
+    if !valid_reason {
+        return Err("cancellation_reason disagrees with query status".into());
+    }
+    let valid_terminal_state = match status {
+        "running" | "finished" => terminal_state.is_none(),
+        "committed" if state != "completed" => terminal_state.is_none(),
+        _ => terminal_state == Some(status),
+    };
+    if !valid_terminal_state {
+        return Err("terminal_state disagrees with query status".into());
+    }
+    if matches!(kind, RemoteEnvelopeKind::Status) {
+        if matches!(state, "pre_cancelled" | "finished") {
+            if !operation.is_empty() {
+                return Err("synthetic query status unexpectedly names an operation".into());
+            }
+        } else if operation.is_empty() {
+            return Err("live query status lacks operation".into());
+        }
+    }
+    Ok(())
+}
+
+fn remote_status_is_terminal(status: &ValidatedRemoteEnvelope) -> bool {
+    status.status != "running"
+}
+
+fn recovered_remote_error(
+    status: &serde_json::Value,
+    expected_query_id: mongreldb_query::QueryId,
+    message: &str,
+) -> Option<NativeRemoteQueryErrorDetails> {
+    let status =
+        validate_remote_query_envelope(status, expected_query_id, RemoteEnvelopeKind::Status)
+            .ok()?;
+    if !remote_status_is_terminal(&status) {
+        return None;
+    }
+    let terminal_code = status.terminal_error_code.as_deref();
+    if status.committed != Some(true) && terminal_code.is_none() {
+        return None;
+    }
+    Some(NativeRemoteQueryErrorDetails {
+        code: terminal_code.unwrap_or("COMMIT_OUTCOME").to_owned(),
+        message: message.to_owned(),
+        query_id: Some(status.query_id),
+        status: Some(status.status.clone()),
+        http_status: None,
+        outcome_known: status.outcome_known,
+        committed: status.committed,
+        epoch: status.last_commit_epoch.map(BigInt::from),
+        epoch_text: status.last_commit_epoch_text.clone(),
+        committed_statements: status.committed_statements,
+        last_commit_epoch: status.last_commit_epoch.map(BigInt::from),
+        last_commit_epoch_text: status.last_commit_epoch_text,
+        first_commit_statement_index: status.first_commit_statement_index,
+        last_commit_statement_index: status.last_commit_statement_index,
+        completed_statements: status.completed_statements,
+        statement_index: status.statement_index,
+        cancel_outcome: status
+            .cancel_outcome
+            .map(|outcome| native_cancel_outcome_name(outcome).to_owned()),
+        cancellation_reason: Some(status.cancellation_reason),
+        retryable: status.retryable,
+        server_state: Some(status.state),
+        terminal_state: status.terminal_state,
+    })
+}
+
+fn validate_remote_url(url: &str) -> napi::Result<&str> {
+    let url = url.trim_end_matches('/');
+    let (scheme, remainder) = url.split_once("://").ok_or_else(|| {
+        napi::Error::new(
+            napi::Status::InvalidArg,
+            "remote URL must use http:// or https://",
+        )
+    })?;
+    if !matches!(scheme, "http" | "https") {
+        return Err(napi::Error::new(
+            napi::Status::InvalidArg,
+            "remote URL must use http:// or https://",
+        ));
+    }
+    let authority = remainder.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() {
+        return Err(napi::Error::new(
+            napi::Status::InvalidArg,
+            "remote URL must include a host",
+        ));
+    }
+    if authority.contains('@') {
+        return Err(napi::Error::new(
+            napi::Status::InvalidArg,
+            "credentials must use remote auth options, not the URL",
+        ));
+    }
+    if remainder.contains(['?', '#']) {
+        return Err(napi::Error::new(
+            napi::Status::InvalidArg,
+            "remote URL must not include a query or fragment",
+        ));
+    }
+    Ok(url)
+}
+
+fn contains_http_header_control(value: &str) -> bool {
+    value.chars().any(char::is_control)
+}
+
+fn remote_cancel_outcome(value: Option<&str>) -> Option<NativeCancelOutcome> {
+    match value {
+        Some("accepted") => Some(NativeCancelOutcome::Accepted),
+        Some("already_cancelling") => Some(NativeCancelOutcome::AlreadyCancelling),
+        Some("too_late") => Some(NativeCancelOutcome::TooLate),
+        Some("already_finished") => Some(NativeCancelOutcome::AlreadyFinished),
+        Some("not_found") => Some(NativeCancelOutcome::NotFound),
+        Some("pre_cancelled") => Some(NativeCancelOutcome::PreCancelled),
+        _ => None,
+    }
+}
+
+fn native_cancel_outcome_name(outcome: NativeCancelOutcome) -> &'static str {
+    match outcome {
+        NativeCancelOutcome::Accepted => "accepted",
+        NativeCancelOutcome::AlreadyCancelling => "already_cancelling",
+        NativeCancelOutcome::TooLate => "too_late",
+        NativeCancelOutcome::AlreadyFinished => "already_finished",
+        NativeCancelOutcome::NotFound => "not_found",
+        NativeCancelOutcome::PreCancelled => "pre_cancelled",
+    }
+}
+
+fn cancel_state_outcome(value: &str) -> Option<NativeCancelOutcome> {
+    match value {
+        "accepted" | "cancellation_requested" => Some(NativeCancelOutcome::Accepted),
+        "already_cancelling" | "cancelling" => Some(NativeCancelOutcome::AlreadyCancelling),
+        "too_late" | "commit_critical" => Some(NativeCancelOutcome::TooLate),
+        "already_finished" | "finished" => Some(NativeCancelOutcome::AlreadyFinished),
+        "not_found" => Some(NativeCancelOutcome::NotFound),
+        "pre_cancelled" => Some(NativeCancelOutcome::PreCancelled),
+        _ => None,
+    }
+}
+
+fn validate_remote_cancel_response(
+    body: &serde_json::Value,
+    expected_query_id: mongreldb_query::QueryId,
+) -> Result<NativeCancelOutcome, String> {
+    require_json_object_fields(
+        body,
+        &[
+            "query_id",
+            "state",
+            "cancel_outcome",
+            "status",
+            "terminal_state",
+            "code",
+            "committed",
+            "committed_statements",
+            "last_commit_epoch",
+            "last_commit_epoch_text",
+            "first_commit_statement_index",
+            "last_commit_statement_index",
+            "completed_statements",
+            "statement_index",
+            "cancellation_reason",
+            "retryable",
+            "server_state",
+            "outcome",
+            "error",
+            "terminal_error",
+        ],
+        &["query_id"],
+        "cancel response",
+    )?;
+    if let Some(outcome) = body.get("outcome") {
+        validate_remote_outcome_object(outcome)?;
+    }
+    if let Some(error) = body.get("error") {
+        require_json_object_fields(
+            error,
+            &["code", "message", "query_id", "committed", "retryable"],
+            &[],
+            "cancel error",
+        )?;
+    }
+    if let Some(terminal_error) = body.get("terminal_error") {
+        validate_remote_terminal_error_object(terminal_error)?;
+    }
+    if body["query_id"].as_str() != Some(expected_query_id.to_string().as_str()) {
+        return Err("cancel response query_id does not match request".into());
+    }
+    let explicit = match body.get("cancel_outcome") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .and_then(cancel_state_outcome)
+                .ok_or_else(|| "cancel response has invalid cancel_outcome".to_owned())?,
+        ),
+    };
+    let state = match body.get("state") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .and_then(cancel_state_outcome)
+                .ok_or_else(|| "cancel response has invalid state".to_owned())?,
+        ),
+    };
+    if explicit.is_some() && state.is_some() && explicit != state {
+        return Err("cancel response state and cancel_outcome disagree".into());
+    }
+    explicit
+        .or(state)
+        .ok_or_else(|| "cancel response lacks an outcome".to_owned())
+}
+
+fn required_remote_u64(body: &serde_json::Value, field: &str) -> napi::Result<u64> {
+    body.get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            napi::Error::new(
+                napi::Status::GenericFailure,
+                format!("remote response lacks valid {field}"),
+            )
+        })
+}
+
+fn remote_commit_epoch(body: &serde_json::Value) -> Result<u64, String> {
+    require_json_object_fields(
+        body,
+        &["epoch", "epoch_text"],
+        &["epoch", "epoch_text"],
+        "table commit response",
+    )?;
+    let (epoch, epoch_text) = exact_epoch_fields(&[body.get("epoch")], &[body.get("epoch_text")])
+        .map_err(|()| "table commit epoch fields are invalid".to_owned())?;
+    match (epoch, epoch_text) {
+        (Some(epoch), Some(_)) => Ok(epoch),
+        _ => Err("table commit response lacks an exact epoch".into()),
+    }
+}
+
+#[napi(object)]
+pub struct NativeRemoteSqlReceipt {
+    pub query_id: String,
+    pub original_query_id: String,
+    pub status: String,
+    pub server_state: String,
+    pub cancel_outcome: Option<NativeCancelOutcome>,
+    pub cancellation_reason: String,
+    pub committed: bool,
+    pub durable_outcome: NativeDurableOutcome,
+    pub completed_statements: u32,
+    pub statement_index: u32,
+    pub retryable: bool,
+    pub idempotency_replayed: bool,
+    pub idempotency_persisted: bool,
+    pub idempotency_expires_at_ms: BigInt,
+}
+
+fn native_remote_sql_receipt(
+    body: serde_json::Value,
+    expected_query_id: mongreldb_query::QueryId,
+) -> Result<NativeRemoteSqlReceipt, String> {
+    let status =
+        validate_remote_query_envelope(&body, expected_query_id, RemoteEnvelopeKind::Receipt)?;
+    let original_query_id = body["original_query_id"]
+        .as_str()
+        .ok_or_else(|| "idempotent receipt lacks original_query_id".to_owned())?;
+    if original_query_id
+        .parse::<mongreldb_query::QueryId>()
+        .is_err()
+    {
+        return Err("idempotent receipt original_query_id is invalid".into());
+    }
+    let idempotency_replayed = body["idempotency_replayed"]
+        .as_bool()
+        .ok_or_else(|| "idempotent receipt lacks replay flag".to_owned())?;
+    let idempotency_persisted = body["idempotency_persisted"]
+        .as_bool()
+        .ok_or_else(|| "idempotent receipt lacks persistence flag".to_owned())?;
+    let idempotency_expires_at_ms = body["idempotency_expires_at_ms"]
+        .as_u64()
+        .ok_or_else(|| "idempotent receipt lacks expiration".to_owned())?;
+    if !idempotency_persisted
+        || idempotency_expires_at_ms == 0
+        || status.retryable
+        || (!idempotency_replayed && original_query_id != expected_query_id.to_string())
+    {
+        return Err("idempotent receipt metadata is invalid".into());
+    }
+    let committed = status
+        .committed
+        .ok_or_else(|| "idempotent receipt outcome is unknown".to_owned())?;
+    Ok(NativeRemoteSqlReceipt {
+        query_id: status.query_id,
+        original_query_id: original_query_id.to_owned(),
+        status: status.status,
+        server_state: status.state,
+        cancel_outcome: status.cancel_outcome,
+        cancellation_reason: status.cancellation_reason,
+        committed,
+        durable_outcome: NativeDurableOutcome {
+            outcome_known: status.outcome_known,
+            committed: status.committed,
+            committed_statements: status.committed_statements,
+            last_commit_epoch: status.last_commit_epoch.map(BigInt::from),
+            first_commit_statement_index: status.first_commit_statement_index,
+            last_commit_statement_index: status.last_commit_statement_index,
+        },
+        completed_statements: status
+            .completed_statements
+            .ok_or_else(|| "idempotent receipt lacks completed_statements".to_owned())?,
+        statement_index: status
+            .statement_index
+            .ok_or_else(|| "idempotent receipt lacks statement_index".to_owned())?,
+        retryable: status.retryable,
+        idempotency_replayed,
+        idempotency_persisted,
+        idempotency_expires_at_ms: BigInt::from(idempotency_expires_at_ms),
+    })
+}
+
+fn remote_query_status(
+    body: serde_json::Value,
+    expected_query_id: mongreldb_query::QueryId,
+) -> napi::Result<NativeQueryStatus, String> {
+    let status =
+        validate_remote_query_envelope(&body, expected_query_id, RemoteEnvelopeKind::Status)
+            .map_err(|message| napi::Error::new("INVALID_RESPONSE".to_owned(), message))?;
+    Ok(NativeQueryStatus {
+        query_id: status.query_id,
+        phase: status.state.clone(),
+        server_state: status.state,
+        terminal_state: status.terminal_state,
+        operation: status.operation,
+        outcome_known: status.outcome_known,
+        committed: status.committed,
+        durable_outcome: NativeDurableOutcome {
+            outcome_known: status.outcome_known,
+            committed: status.committed,
+            committed_statements: status.committed_statements,
+            last_commit_epoch: status.last_commit_epoch.map(BigInt::from),
+            first_commit_statement_index: status.first_commit_statement_index,
+            last_commit_statement_index: status.last_commit_statement_index,
+        },
+        terminal_error_code: status.terminal_error_code,
+        terminal_error_category: status.terminal_error_category,
+        completed_statements: status.completed_statements,
+        statement_index: status.statement_index,
+        cancel_outcome: status.cancel_outcome,
+        cancellation_reason: status.cancellation_reason,
+        retryable: status.retryable,
+    })
+}
+
+fn validate_remote_query_not_found_response(
+    body: &serde_json::Value,
+    expected_query_id: mongreldb_query::QueryId,
+) -> Result<NativeRemoteQueryErrorDetails, String> {
+    const FIELDS: &[&str] = &[
+        "query_id",
+        "status",
+        "terminal_state",
+        "committed",
+        "committed_statements",
+        "last_commit_epoch",
+        "last_commit_epoch_text",
+        "first_commit_statement_index",
+        "last_commit_statement_index",
+        "completed_statements",
+        "statement_index",
+        "cancel_outcome",
+        "cancellation_reason",
+        "retryable",
+        "server_state",
+        "outcome",
+        "error",
+    ];
+    require_json_object_fields(body, FIELDS, FIELDS, "query-not-found response")?;
+    let expected_query_id = expected_query_id.to_string();
+    if body["query_id"].as_str() != Some(expected_query_id.as_str())
+        || body["status"].as_str() != Some("unknown")
+        || body["cancel_outcome"].as_str() != Some("not_found")
+        || body["server_state"].as_str() != Some("not_found")
+        || body["retryable"].as_bool() != Some(false)
+    {
+        return Err("query-not-found response metadata is invalid".into());
+    }
+    for field in [
+        "terminal_state",
+        "committed",
+        "committed_statements",
+        "last_commit_epoch",
+        "last_commit_epoch_text",
+        "first_commit_statement_index",
+        "last_commit_statement_index",
+        "completed_statements",
+        "statement_index",
+        "cancellation_reason",
+    ] {
+        if !body[field].is_null() {
+            return Err(format!(
+                "query-not-found response field {field} must be null"
+            ));
+        }
+    }
+    validate_remote_outcome_object(&body["outcome"])?;
+    let outcome = &body["outcome"];
+    if outcome["serialization"].as_str() != Some("unknown")
+        || REMOTE_OUTCOME_FIELDS
+            .iter()
+            .filter(|field| **field != "serialization")
+            .any(|field| !outcome[*field].is_null())
+    {
+        return Err("query-not-found outcome is invalid".into());
+    }
+    let error = require_json_object_fields(
+        &body["error"],
+        &["code", "message", "query_id", "committed", "retryable"],
+        &["code", "message", "query_id", "committed", "retryable"],
+        "query-not-found error",
+    )?;
+    if error["code"].as_str() != Some("QUERY_NOT_FOUND")
+        || error["query_id"].as_str() != Some(expected_query_id.as_str())
+        || !error["committed"].is_null()
+        || error["retryable"].as_bool() != Some(false)
+    {
+        return Err("query-not-found error fields are invalid".into());
+    }
+    let message = error["message"]
+        .as_str()
+        .ok_or_else(|| "query-not-found error message is invalid".to_owned())?;
+    Ok(NativeRemoteQueryErrorDetails {
+        code: "QUERY_NOT_FOUND".into(),
+        message: message.to_owned(),
+        query_id: Some(expected_query_id),
+        status: Some("unknown".into()),
+        http_status: Some(404),
+        outcome_known: false,
+        committed: None,
+        epoch: None,
+        epoch_text: None,
+        committed_statements: None,
+        last_commit_epoch: None,
+        last_commit_epoch_text: None,
+        first_commit_statement_index: None,
+        last_commit_statement_index: None,
+        completed_statements: None,
+        statement_index: None,
+        cancel_outcome: Some("not_found".into()),
+        cancellation_reason: None,
+        retryable: false,
+        server_state: Some("not_found".into()),
+        terminal_state: None,
+    })
+}
+
+#[napi(object)]
+#[derive(Clone)]
+pub struct NativeRemoteQueryErrorDetails {
+    pub code: String,
+    pub message: String,
+    pub query_id: Option<String>,
+    pub status: Option<String>,
+    pub http_status: Option<u32>,
+    pub outcome_known: bool,
+    pub committed: Option<bool>,
+    pub epoch: Option<BigInt>,
+    pub epoch_text: Option<String>,
+    pub committed_statements: Option<u32>,
+    pub last_commit_epoch: Option<BigInt>,
+    pub last_commit_epoch_text: Option<String>,
+    pub first_commit_statement_index: Option<u32>,
+    pub last_commit_statement_index: Option<u32>,
+    pub completed_statements: Option<u32>,
+    pub statement_index: Option<u32>,
+    pub cancel_outcome: Option<String>,
+    pub cancellation_reason: Option<String>,
+    pub retryable: bool,
+    pub server_state: Option<String>,
+    pub terminal_state: Option<String>,
+}
+
+fn exact_epoch_fields(
+    numbers: &[Option<&serde_json::Value>],
+    texts: &[Option<&serde_json::Value>],
+) -> Result<(Option<u64>, Option<String>), ()> {
+    let mut exact = None;
+    for value in numbers.iter().flatten() {
+        if value.is_null() {
+            continue;
+        }
+        let value = value.as_u64().ok_or(())?;
+        if exact.is_some_and(|exact| exact != value) {
+            return Err(());
+        }
+        exact = Some(value);
+    }
+    let mut exact_text = None;
+    for value in texts.iter().flatten() {
+        if value.is_null() {
+            continue;
+        }
+        let text = value.as_str().ok_or(())?;
+        if text != "0"
+            && (text.starts_with('0')
+                || text.is_empty()
+                || !text.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            return Err(());
+        }
+        let value = text.parse::<u64>().map_err(|_| ())?;
+        if exact.is_some_and(|exact| exact != value) {
+            return Err(());
+        }
+        if exact_text.as_deref().is_some_and(|exact| exact != text) {
+            return Err(());
+        }
+        exact = Some(value);
+        exact_text = Some(text.to_owned());
+    }
+    Ok((
+        exact,
+        exact_text.or_else(|| exact.map(|value| value.to_string())),
+    ))
+}
+
+fn validate_remote_sql_error_response(
+    body: &serde_json::Value,
+    expected_query_id: mongreldb_query::QueryId,
+    http_status: u16,
+    fallback_message: &str,
+) -> Result<NativeRemoteQueryErrorDetails, String> {
+    const ERROR_FIELDS: &[&str] = &[
+        "query_id",
+        "status",
+        "terminal_state",
+        "committed",
+        "committed_statements",
+        "last_commit_epoch",
+        "last_commit_epoch_text",
+        "first_commit_statement_index",
+        "last_commit_statement_index",
+        "completed_statements",
+        "statement_index",
+        "cancel_outcome",
+        "cancellation_reason",
+        "retryable",
+        "server_state",
+        "outcome",
+        "error",
+    ];
+    require_json_object_fields(body, ERROR_FIELDS, ERROR_FIELDS, "SQL error response")?;
+    let outcome = &body["outcome"];
+    validate_remote_outcome_object(outcome)?;
+    let error = &body["error"];
+    require_json_object_fields(
+        error,
+        &["code", "message", "query_id", "committed", "retryable"],
+        &["code", "message", "query_id", "committed", "retryable"],
+        "SQL error",
+    )?;
+
+    let expected_query_id = expected_query_id.to_string();
+    let top_query_id = body["query_id"]
+        .as_str()
+        .ok_or_else(|| "SQL error response query_id is invalid".to_owned())?;
+    let nested_query_id = error["query_id"]
+        .as_str()
+        .ok_or_else(|| "SQL error query_id is invalid".to_owned())?;
+    if top_query_id != expected_query_id || nested_query_id != expected_query_id {
+        return Err("SQL error query_id does not match request".into());
+    }
+    let status = body["status"]
+        .as_str()
+        .ok_or_else(|| "SQL error status is invalid".to_owned())?;
+    if body["terminal_state"].as_str() != Some(status) {
+        return Err("SQL error terminal_state disagrees with status".into());
+    }
+    let code = error["code"]
+        .as_str()
+        .filter(|code| !code.trim().is_empty())
+        .ok_or_else(|| "SQL error code is invalid".to_owned())?;
+    let message = error["message"]
+        .as_str()
+        .filter(|message| !message.trim().is_empty())
+        .ok_or_else(|| format!("SQL error message is invalid: {fallback_message}"))?;
+    let committed = paired_json_bool(body, outcome, "committed")?;
+    if optional_json_bool(error.get("committed"))? != committed {
+        return Err("SQL error committed fields disagree".into());
+    }
+    let committed_statements = paired_json_u32(body, outcome, "committed_statements")?;
+    let first_commit_statement_index =
+        paired_json_u32(body, outcome, "first_commit_statement_index")?;
+    let last_commit_statement_index =
+        paired_json_u32(body, outcome, "last_commit_statement_index")?;
+    let completed_statements = paired_json_u32(body, outcome, "completed_statements")?;
+    let statement_index = paired_json_u32(body, outcome, "statement_index")?;
+    let top_epoch = exact_json_epoch(body)?;
+    let nested_epoch = exact_json_epoch(outcome)?;
+    if top_epoch != nested_epoch {
+        return Err("SQL error commit epoch fields disagree".into());
+    }
+    let (last_commit_epoch, last_commit_epoch_text) = top_epoch;
+    let retryable = body["retryable"]
+        .as_bool()
+        .ok_or_else(|| "SQL error retryable is invalid".to_owned())?;
+    if error["retryable"].as_bool() != Some(retryable) {
+        return Err("SQL error retryable fields disagree".into());
+    }
+
+    match committed {
+        Some(true) => {
+            if committed_statements.map_or(true, |count| count == 0)
+                || last_commit_epoch.is_none()
+                || last_commit_epoch_text.is_none()
+                || first_commit_statement_index.is_none()
+                || last_commit_statement_index.is_none()
+                || completed_statements.is_none()
+                || statement_index.is_none()
+                || !matches!(
+                    status,
+                    "committed_with_error"
+                        | "partially_committed"
+                        | "cancelled_after_commit"
+                        | "deadline_after_commit"
+                )
+            {
+                return Err("committed SQL error lacks exact durable metadata".into());
+            }
+        }
+        Some(false) => {
+            if committed_statements != Some(0)
+                || last_commit_epoch.is_some()
+                || first_commit_statement_index.is_some()
+                || last_commit_statement_index.is_some()
+                || completed_statements.is_none()
+                || statement_index.is_none()
+                || !matches!(
+                    status,
+                    "failed_before_commit"
+                        | "cancelled_before_commit"
+                        | "deadline_before_commit"
+                        | "cancelled_before_start"
+                )
+            {
+                return Err("non-committed SQL error has invalid durable metadata".into());
+            }
+        }
+        None => {
+            if status != "outcome_unknown"
+                || code != "QUERY_OUTCOME_UNKNOWN"
+                || committed_statements.is_some()
+                || last_commit_epoch.is_some()
+                || first_commit_statement_index.is_some()
+                || last_commit_statement_index.is_some()
+                || completed_statements.is_some()
+                || statement_index.is_some()
+            {
+                return Err("unknown SQL error contains durable metadata".into());
+            }
+        }
+    }
+    if let (Some(first), Some(last), Some(count)) = (
+        first_commit_statement_index,
+        last_commit_statement_index,
+        committed_statements,
+    ) {
+        if first > last
+            || count > last.saturating_sub(first).saturating_add(1)
+            || statement_index.is_some_and(|statement| last > statement)
+        {
+            return Err("SQL error commit statement indexes are invalid".into());
+        }
+    }
+    if let (Some(completed), Some(statement)) = (completed_statements, statement_index) {
+        if statement > completed || completed > statement.saturating_add(1) {
+            return Err("SQL error statement progress is invalid".into());
+        }
+    }
+
+    let cancel_outcome = match body.get("cancel_outcome") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(
+            remote_cancel_outcome(value.as_str())
+                .ok_or_else(|| "SQL error cancel_outcome is invalid".to_owned())?,
+        ),
+    };
+    let cancellation_reason = match body.get("cancellation_reason") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .ok_or_else(|| "SQL error cancellation_reason is invalid".to_owned())?
+                .to_owned(),
+        ),
+    };
+    let server_state = match body.get("server_state") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .filter(|state| {
+                    matches!(
+                        *state,
+                        "queued"
+                            | "planning"
+                            | "executing"
+                            | "streaming"
+                            | "serializing"
+                            | "commit_critical"
+                            | "cancelling"
+                            | "completed"
+                            | "failed"
+                            | "cancelled"
+                            | "pre_cancelled"
+                            | "finished"
+                    )
+                })
+                .ok_or_else(|| "SQL error server_state is invalid".to_owned())?
+                .to_owned(),
+        ),
+    };
+    let expected_retryable = matches!(
+        code,
+        "QUERY_REGISTRY_FULL" | "IDEMPOTENCY_STORE_FULL" | "IDEMPOTENCY_STORE_UNAVAILABLE"
+    );
+    if retryable != expected_retryable {
+        return Err("SQL error retryable disagrees with code".into());
+    }
+    let code_matches_status = match code {
+        "QUERY_OUTCOME_UNKNOWN" => status == "outcome_unknown" && committed.is_none(),
+        "QUERY_CANCELLED_AFTER_COMMIT" => {
+            status == "cancelled_after_commit" && committed == Some(true)
+        }
+        "DEADLINE_AFTER_COMMIT" => status == "deadline_after_commit" && committed == Some(true),
+        "QUERY_CANCELLED" => {
+            matches!(status, "cancelled_before_commit" | "cancelled_before_start")
+                && committed == Some(false)
+        }
+        "DEADLINE_EXCEEDED" => status == "deadline_before_commit" && committed == Some(false),
+        "COMMIT_OUTCOME" | "SERIALIZATION_FAILED_AFTER_COMMIT" => committed == Some(true),
+        "SERIALIZATION_FAILED" => committed == Some(false),
+        _ => true,
+    };
+    let status_matches_code = match status {
+        "outcome_unknown" => code == "QUERY_OUTCOME_UNKNOWN",
+        "cancelled_after_commit" => code == "QUERY_CANCELLED_AFTER_COMMIT",
+        "deadline_after_commit" => code == "DEADLINE_AFTER_COMMIT",
+        "cancelled_before_commit" | "cancelled_before_start" => code == "QUERY_CANCELLED",
+        "deadline_before_commit" => code == "DEADLINE_EXCEEDED",
+        _ => true,
+    };
+    if !code_matches_status || !status_matches_code {
+        return Err("SQL error code and status disagree".into());
+    }
+    let cancellation_matches = match status {
+        "cancelled_before_commit" | "cancelled_before_start" | "cancelled_after_commit" => {
+            cancel_outcome == Some(NativeCancelOutcome::Accepted)
+                && cancellation_reason
+                    .as_deref()
+                    .is_some_and(|reason| !matches!(reason, "none" | "deadline"))
+        }
+        "deadline_before_commit" | "deadline_after_commit" => {
+            cancel_outcome == Some(NativeCancelOutcome::Accepted)
+                && cancellation_reason.as_deref() == Some("deadline")
+        }
+        _ => {
+            matches!(
+                cancel_outcome,
+                None | Some(NativeCancelOutcome::AlreadyFinished)
+            ) && matches!(cancellation_reason.as_deref(), None | Some("none"))
+        }
+    };
+    if !cancellation_matches {
+        return Err("SQL error cancellation metadata disagrees with status".into());
+    }
+    if let Some(server_state) = server_state.as_deref() {
+        let expected_state = match status {
+            "cancelled_before_start" => "pre_cancelled",
+            "cancelled_before_commit"
+            | "deadline_before_commit"
+            | "cancelled_after_commit"
+            | "deadline_after_commit" => "cancelled",
+            _ => "failed",
+        };
+        if server_state != expected_state {
+            return Err("SQL error server_state disagrees with status".into());
+        }
+    }
+    let outcome_known = committed.is_some();
+    Ok(NativeRemoteQueryErrorDetails {
+        code: code.to_owned(),
+        message: message.to_owned(),
+        query_id: Some(expected_query_id),
+        status: Some(status.to_owned()),
+        http_status: Some(u32::from(http_status)),
+        outcome_known,
+        committed,
+        epoch: last_commit_epoch.map(BigInt::from),
+        epoch_text: last_commit_epoch_text.clone(),
+        committed_statements,
+        last_commit_epoch: last_commit_epoch.map(BigInt::from),
+        last_commit_epoch_text,
+        first_commit_statement_index,
+        last_commit_statement_index,
+        completed_statements,
+        statement_index,
+        cancel_outcome: cancel_outcome
+            .map(native_cancel_outcome_name)
+            .map(str::to_owned),
+        cancellation_reason,
+        retryable,
+        server_state,
+        terminal_state: Some(status.to_owned()),
+    })
+}
+
+fn validate_remote_write_error_response(
+    body: &serde_json::Value,
+    http_status: u16,
+    _operation: &str,
+) -> Result<NativeRemoteQueryErrorDetails, String> {
+    let status = body["status"]
+        .as_str()
+        .ok_or_else(|| "write error response lacks status".to_owned())?;
+    let error = &body["error"];
+    require_json_object_fields(
+        error,
+        &["code", "message", "op_index"],
+        &["code", "message"],
+        "write error",
+    )?;
+    let code = error["code"]
+        .as_str()
+        .filter(|code| !code.trim().is_empty())
+        .ok_or_else(|| "write error code is invalid".to_owned())?;
+    let message = error["message"]
+        .as_str()
+        .ok_or_else(|| "write error message is invalid".to_owned())?;
+    if error
+        .get("op_index")
+        .is_some_and(|index| index.as_u64().is_none())
+    {
+        return Err("write error op_index is invalid".into());
+    }
+
+    let (outcome_known, committed, epoch, epoch_text, retryable) = match status {
+        "aborted" if body.get("committed").is_none() => {
+            require_json_object_fields(
+                body,
+                &["status", "error"],
+                &["status", "error"],
+                "write error response",
+            )?;
+            (true, Some(false), None, None, false)
+        }
+        "aborted" => {
+            require_json_object_fields(
+                body,
+                &["status", "committed", "retryable", "error"],
+                &["status", "committed", "retryable", "error"],
+                "write error response",
+            )?;
+            if body["committed"].as_bool() != Some(false) {
+                return Err("aborted write claims a commit".into());
+            }
+            let retryable = body["retryable"]
+                .as_bool()
+                .ok_or_else(|| "aborted write retryable is invalid".to_owned())?;
+            (true, Some(false), None, None, retryable)
+        }
+        "committed" => {
+            require_json_object_fields(
+                body,
+                &[
+                    "status",
+                    "committed",
+                    "epoch",
+                    "epoch_text",
+                    "retryable",
+                    "error",
+                ],
+                &[
+                    "status",
+                    "committed",
+                    "epoch",
+                    "epoch_text",
+                    "retryable",
+                    "error",
+                ],
+                "write error response",
+            )?;
+            let (epoch, epoch_text) =
+                exact_epoch_fields(&[body.get("epoch")], &[body.get("epoch_text")])
+                    .map_err(|()| "write commit epoch is invalid".to_owned())?;
+            if body["committed"].as_bool() != Some(true)
+                || body["retryable"].as_bool() != Some(false)
+                || code != "COMMIT_OUTCOME"
+                || epoch.is_none()
+                || epoch_text.is_none()
+            {
+                return Err("committed write metadata is invalid".into());
+            }
+            (true, Some(true), epoch, epoch_text, false)
+        }
+        "outcome_unknown" => {
+            require_json_object_fields(
+                body,
+                &[
+                    "status",
+                    "committed",
+                    "epoch",
+                    "epoch_text",
+                    "retryable",
+                    "error",
+                ],
+                &[
+                    "status",
+                    "committed",
+                    "epoch",
+                    "epoch_text",
+                    "retryable",
+                    "error",
+                ],
+                "write error response",
+            )?;
+            let (epoch, epoch_text) =
+                exact_epoch_fields(&[body.get("epoch")], &[body.get("epoch_text")])
+                    .map_err(|()| "unknown write epoch is invalid".to_owned())?;
+            if !body["committed"].is_null()
+                || body["retryable"].as_bool() != Some(false)
+                || code != "QUERY_OUTCOME_UNKNOWN"
+            {
+                return Err("unknown write metadata is invalid".into());
+            }
+            (false, None, epoch, epoch_text, false)
+        }
+        _ => return Err("write error status is invalid".into()),
+    };
+    Ok(NativeRemoteQueryErrorDetails {
+        code: code.to_owned(),
+        message: message.to_owned(),
+        query_id: Some("unknown".into()),
+        status: Some(status.to_owned()),
+        http_status: Some(u32::from(http_status)),
+        outcome_known,
+        committed,
+        epoch: epoch.map(BigInt::from),
+        epoch_text: epoch_text.clone(),
+        committed_statements: None,
+        last_commit_epoch: outcome_known.then(|| epoch.map(BigInt::from)).flatten(),
+        last_commit_epoch_text: outcome_known.then_some(epoch_text).flatten(),
+        first_commit_statement_index: None,
+        last_commit_statement_index: None,
+        completed_statements: None,
+        statement_index: None,
+        cancel_outcome: None,
+        cancellation_reason: None,
+        retryable,
+        server_state: Some(status.to_owned()),
+        terminal_state: Some(status.to_owned()),
+    })
+}
+
+fn unknown_remote_write_outcome(message: String) -> NativeRemoteQueryErrorDetails {
+    NativeRemoteQueryErrorDetails {
+        code: "QUERY_OUTCOME_UNKNOWN".into(),
+        message,
+        query_id: Some("unknown".into()),
+        status: Some("outcome_unknown".into()),
+        http_status: None,
+        outcome_known: false,
+        committed: None,
+        epoch: None,
+        epoch_text: None,
+        committed_statements: None,
+        last_commit_epoch: None,
+        last_commit_epoch_text: None,
+        first_commit_statement_index: None,
+        last_commit_statement_index: None,
+        completed_statements: None,
+        statement_index: None,
+        cancel_outcome: None,
+        cancellation_reason: None,
+        retryable: false,
+        server_state: Some("transport_error".into()),
+        terminal_state: Some("outcome_unknown".into()),
+    }
+}
+
+fn unknown_remote_outcome(
+    query_id: mongreldb_query::QueryId,
+    message: String,
+    status: Option<&ValidatedRemoteEnvelope>,
+    cancel_outcome: Option<&str>,
+) -> NativeRemoteQueryErrorDetails {
+    NativeRemoteQueryErrorDetails {
+        code: "QUERY_OUTCOME_UNKNOWN".into(),
+        message,
+        query_id: Some(query_id.to_string()),
+        status: Some("outcome_unknown".into()),
+        http_status: None,
+        outcome_known: false,
+        committed: None,
+        epoch: None,
+        epoch_text: None,
+        committed_statements: None,
+        last_commit_epoch: None,
+        last_commit_epoch_text: None,
+        first_commit_statement_index: None,
+        last_commit_statement_index: None,
+        completed_statements: None,
+        statement_index: None,
+        cancel_outcome: cancel_outcome.map(str::to_owned),
+        cancellation_reason: status.map(|status| status.cancellation_reason.clone()),
+        retryable: false,
+        server_state: status.map(|status| status.state.clone()),
+        terminal_state: Some("outcome_unknown".into()),
+    }
+}
+
+fn throw_remote_query_error<T>(
+    env: &napi::Env,
+    details: NativeRemoteQueryErrorDetails,
+) -> napi::Result<T> {
+    let error = create_remote_query_error(env, details)?;
+    env.throw(error)?;
+    Err(napi::Error::from_status(napi::Status::PendingException))
+}
+
+fn create_remote_query_error(
+    env: &napi::Env,
+    details: NativeRemoteQueryErrorDetails,
+) -> napi::Result<JsObject> {
+    let mut error = env.create_error(napi::Error::new(
+        napi::Status::GenericFailure,
+        details.message.clone(),
+    ))?;
+    error.set_named_property("code", details.code.clone())?;
+    error.set_named_property("queryId", details.query_id.clone())?;
+    error.set_named_property("status", details.status.clone())?;
+    error.set_named_property("httpStatus", details.http_status)?;
+    error.set_named_property("outcomeKnown", details.outcome_known)?;
+    error.set_named_property("committed", details.committed)?;
+    error.set_named_property("epoch", details.epoch.clone())?;
+    error.set_named_property("epochText", details.epoch_text.clone())?;
+    error.set_named_property("committedStatements", details.committed_statements)?;
+    error.set_named_property("lastCommitEpoch", details.last_commit_epoch.clone())?;
+    error.set_named_property(
+        "lastCommitEpochText",
+        details.last_commit_epoch_text.clone(),
+    )?;
+    error.set_named_property(
+        "firstCommitStatementIndex",
+        details.first_commit_statement_index,
+    )?;
+    error.set_named_property(
+        "lastCommitStatementIndex",
+        details.last_commit_statement_index,
+    )?;
+    error.set_named_property("completedStatements", details.completed_statements)?;
+    error.set_named_property("statementIndex", details.statement_index)?;
+    error.set_named_property("cancelOutcome", details.cancel_outcome.clone())?;
+    error.set_named_property("cancellationReason", details.cancellation_reason.clone())?;
+    error.set_named_property("retryable", details.retryable)?;
+    error.set_named_property("serverState", details.server_state.clone())?;
+    error.set_named_property("terminalState", details.terminal_state.clone())?;
+    error.set_named_property("remoteQueryError", details)?;
+    Ok(error)
+}
+
+#[cfg(test)]
+mod remote_url_tests {
+    use super::validate_remote_url;
+
+    #[test]
+    fn remote_url_rejects_embedded_credentials_and_invalid_schemes() {
+        assert!(validate_remote_url("http://user:secret@example.test").is_err());
+        assert!(validate_remote_url("https://example.test?token=secret").is_err());
+        assert!(validate_remote_url("https://example.test/#secret").is_err());
+        assert!(validate_remote_url("file:///tmp/mongreldb").is_err());
+        assert!(validate_remote_url("http://").is_err());
+        assert_eq!(
+            validate_remote_url("https://example.test/").unwrap(),
+            "https://example.test"
+        );
+    }
+}
+
+impl Drop for RemoteDatabaseShared {
+    fn drop(&mut self) {
+        if let Some(authorization) = self.authorization.as_mut() {
+            authorization.zeroize();
+        }
+    }
+}
+
+#[napi]
+impl NativeRemoteSqlQuery {
+    #[napi(getter)]
+    pub fn id(&self) -> String {
+        self.query_id.to_string()
+    }
+
+    #[napi(ts_return_type = "Promise<Buffer>")]
+    pub fn result(&self) -> napi::Result<AsyncTask<RemoteSqlTask>> {
+        let pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+            .ok_or_else(|| {
+                napi::Error::new(
+                    napi::Status::GenericFailure,
+                    "remote SQL result already consumed",
+                )
+            })?;
+        Ok(AsyncTask::new(RemoteSqlTask {
+            query_id: self.query_id,
+            remote: Arc::clone(&self.remote),
+            pending,
+        }))
+    }
+
+    #[napi]
+    pub fn cancel(&self) -> napi::Result<NativeCancelOutcome, String> {
+        RemoteDatabase {
+            inner: Arc::clone(&self.remote),
+        }
+        .cancel_sql(self.query_id.to_string())
+    }
+
+    #[napi]
+    pub fn status(&self, env: Env) -> napi::Result<NativeQueryStatus> {
+        RemoteDatabase {
+            inner: Arc::clone(&self.remote),
+        }
+        .query_status(env, self.query_id.to_string())
+    }
 }
 
 #[napi]
 impl RemoteDatabase {
     /// Connect to a `mongreldb-server` at `url` (e.g. `http://127.0.0.1:8453`).
     #[napi(constructor)]
-    pub fn connect(url: String) -> napi::Result<RemoteDatabase> {
+    pub fn connect(
+        url: String,
+        options: Option<NativeRemoteOptions>,
+    ) -> napi::Result<RemoteDatabase> {
+        let url = validate_remote_url(&url)?.to_owned();
+        let (authorization, transport_timeout_ms) = match options {
+            None => (None, None),
+            Some(options) => {
+                let NativeRemoteOptions {
+                    bearer_token,
+                    username,
+                    password,
+                    transport_timeout_ms,
+                } = options;
+                let bearer_token = bearer_token.map(Zeroizing::new);
+                let password = password.map(Zeroizing::new);
+                let authorization = match (
+                    bearer_token.as_deref(),
+                    username.as_deref(),
+                    password.as_deref(),
+                ) {
+                    (None, None, None) => None,
+                    (Some(token), None, None)
+                        if !token.trim().is_empty() && !contains_http_header_control(token) =>
+                    {
+                        Some(format!("Bearer {token}"))
+                    }
+                    (None, Some(username), Some(password))
+                        if !username.is_empty()
+                            && !username.contains(':')
+                            && !contains_http_header_control(username)
+                            && !contains_http_header_control(password) =>
+                    {
+                        let credentials = Zeroizing::new(format!("{username}:{password}"));
+                        let encoded = Zeroizing::new(
+                            base64::engine::general_purpose::STANDARD
+                                .encode(credentials.as_bytes()),
+                        );
+                        Some(format!("Basic {}", encoded.as_str()))
+                    }
+                    _ => {
+                        return Err(napi::Error::new(
+                            napi::Status::InvalidArg,
+                            "remote auth credentials are invalid or ambiguous",
+                        ))
+                    }
+                };
+                (authorization, transport_timeout_ms)
+            }
+        };
+        if transport_timeout_ms == Some(0) {
+            return Err(napi::Error::new(
+                napi::Status::InvalidArg,
+                "transportTimeoutMs must be positive",
+            ));
+        }
+        let agent = match transport_timeout_ms {
+            Some(timeout_ms) => ureq::AgentBuilder::new()
+                .timeout(std::time::Duration::from_millis(u64::from(timeout_ms)))
+                .build(),
+            None => ureq::Agent::new(),
+        };
         Ok(RemoteDatabase {
-            url: url.trim_end_matches('/').to_string(),
-            agent: ureq::Agent::new(),
+            inner: Arc::new(RemoteDatabaseShared {
+                url,
+                agent,
+                authorization,
+            }),
         })
     }
 
     #[napi]
     pub fn health(&self) -> napi::Result<String> {
-        self.agent
-            .get(&format!("{}/health", self.url))
+        let response = self
+            .request("GET", "/health")
             .call()
-            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?
-            .into_string()
-            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
+        bounded_response_text(response, MAX_REMOTE_TEXT_RESPONSE_BYTES)
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e))
     }
 
     #[napi]
     pub fn table_names(&self) -> napi::Result<Vec<String>> {
-        self.agent
-            .get(&format!("{}/tables", self.url))
+        let response = self
+            .request("GET", "/tables")
             .call()
-            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?
-            .into_json()
-            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
+        strict_json_response_as(response)
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e))
     }
 
     #[napi]
-    pub fn set_history_retention_epochs(&self, epochs: BigInt) -> napi::Result<()> {
+    pub fn set_history_retention_epochs(&self, env: Env, epochs: BigInt) -> napi::Result<()> {
         let epochs = bigint_to_u64(&epochs)?;
-        self.agent
-            .put(&format!("{}/history/retention", self.url))
-            .send_json(serde_json::json!({"history_retention_epochs": epochs}))
-            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?
-            .into_json::<serde_json::Value>()
-            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
+        let response: serde_json::Value = self.write_json(
+            &env,
+            "history retention update",
+            self.request("PUT", "/history/retention")
+                .send_json(serde_json::json!({"history_retention_epochs": epochs})),
+        )?;
+        let valid = response["history_retention_epochs"].as_u64() == Some(epochs)
+            && response["earliest_retained_epoch"].as_u64().is_some();
+        if !valid {
+            return throw_remote_query_error(
+                &env,
+                unknown_remote_write_outcome(
+                    "remote history retention response was invalid".into(),
+                ),
+            );
+        }
         Ok(())
     }
 
     #[napi]
     pub fn history_retention_epochs(&self) -> napi::Result<BigInt> {
-        let response: serde_json::Value = self
-            .agent
-            .get(&format!("{}/history/retention", self.url))
+        let response = self
+            .request("GET", "/history/retention")
             .call()
-            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?
-            .into_json()
             .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
-        Ok(BigInt::from(
-            response["history_retention_epochs"].as_u64().unwrap_or(0),
-        ))
+        let response = strict_json_response(response)
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e))?;
+        Ok(BigInt::from(required_remote_u64(
+            &response,
+            "history_retention_epochs",
+        )?))
     }
 
     #[napi]
     pub fn earliest_retained_epoch(&self) -> napi::Result<BigInt> {
-        let response: serde_json::Value = self
-            .agent
-            .get(&format!("{}/history/retention", self.url))
+        let response = self
+            .request("GET", "/history/retention")
             .call()
-            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?
-            .into_json()
             .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
-        Ok(BigInt::from(
-            response["earliest_retained_epoch"].as_u64().unwrap_or(0),
-        ))
+        let response = strict_json_response(response)
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e))?;
+        Ok(BigInt::from(required_remote_u64(
+            &response,
+            "earliest_retained_epoch",
+        )?))
     }
 
     #[napi]
     pub fn count(&self, table: String) -> napi::Result<BigInt> {
-        let resp: serde_json::Value = self
-            .agent
-            .get(&format!("{}/tables/{table}/count", self.url))
+        let response = self
+            .request("GET", &format!("/tables/{table}/count"))
             .call()
-            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?
-            .into_json()
             .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
-        Ok(BigInt::from(resp["count"].as_u64().unwrap_or(0)))
+        let resp = strict_json_response(response)
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e))?;
+        Ok(BigInt::from(required_remote_u64(&resp, "count")?))
     }
 
-    #[napi]
-    pub fn sql(&self, sql: String) -> napi::Result<Buffer> {
-        self.sql_with_options(sql, None)
+    #[napi(ts_return_type = "Promise<Buffer>")]
+    pub fn sql(&self, sql: String) -> napi::Result<AsyncTask<RemoteSqlTask>> {
+        self.start_sql(sql, None)?.result()
     }
 
-    #[napi]
+    #[napi(ts_return_type = "Promise<Buffer>")]
     pub fn sql_with_options(
         &self,
         sql: String,
         options: Option<NativeSqlOptions>,
-    ) -> napi::Result<Buffer> {
-        let options = options.unwrap_or(NativeSqlOptions {
+    ) -> napi::Result<AsyncTask<RemoteSqlTask>> {
+        self.start_sql(sql, options)?.result()
+    }
+
+    #[napi]
+    pub fn start_sql(
+        &self,
+        sql: String,
+        options: Option<NativeSqlOptions>,
+    ) -> napi::Result<NativeRemoteSqlQuery> {
+        let mut options = options.unwrap_or(NativeSqlOptions {
             query_id: None,
             timeout_ms: None,
+            max_output_rows: None,
+            max_output_bytes: None,
+            idempotency_key: None,
         });
         if options.timeout_ms == Some(0) {
             return Err(napi::Error::new(
@@ -3655,173 +7448,282 @@ impl RemoteDatabase {
                 "timeoutMs must be positive",
             ));
         }
-        let query_id = match options.query_id {
+        if options.max_output_rows == Some(0) || options.max_output_bytes == Some(0) {
+            return Err(napi::Error::new(
+                napi::Status::InvalidArg,
+                "maxOutputRows and maxOutputBytes must be positive",
+            ));
+        }
+        if options.idempotency_key.is_some() {
+            return Err(napi::Error::new(
+                napi::Status::InvalidArg,
+                "use sqlWriteIdempotent for options.idempotencyKey",
+            ));
+        }
+        let query_id = match options.query_id.as_deref() {
             Some(query_id) => query_id
                 .parse::<mongreldb_query::QueryId>()
                 .map_err(query_to_napi)?,
             None => mongreldb_query::QueryId::random().map_err(query_to_napi)?,
         };
-        let resp = self
-            .agent
-            .post(&format!("{}/sql", self.url))
-            .send_json(serde_json::json!({
-                "sql": sql,
-                "format": "arrow",
-                "query_id": query_id.to_string(),
-                "timeout_ms": options.timeout_ms,
-            }))
-            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
-        let mut bytes = Vec::new();
-        resp.into_reader()
-            .read_to_end(&mut bytes)
-            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
-        Ok(Buffer::from(bytes))
+        options.query_id = Some(query_id.to_string());
+        Ok(NativeRemoteSqlQuery {
+            query_id,
+            remote: Arc::clone(&self.inner),
+            pending: Mutex::new(Some(PendingRemoteSql { sql, options })),
+        })
+    }
+
+    #[napi(ts_return_type = "Promise<NativeRemoteSqlReceipt>")]
+    pub fn sql_write_idempotent(
+        &self,
+        sql: String,
+        options: NativeSqlOptions,
+    ) -> napi::Result<AsyncTask<RemoteIdempotentSqlTask>> {
+        let (query_id, body) = prepare_remote_sql(sql, Some(options), true)?;
+        Ok(AsyncTask::new(RemoteIdempotentSqlTask {
+            query_id,
+            remote: Arc::clone(&self.inner),
+            body,
+        }))
     }
 
     #[napi]
-    pub fn cancel_sql(&self, query_id: String) -> napi::Result<bool> {
+    pub fn cancel_sql(&self, query_id: String) -> napi::Result<NativeCancelOutcome, String> {
+        let query_id = query_id
+            .parse::<mongreldb_query::QueryId>()
+            .map_err(|error| napi::Error::new(error.code().to_owned(), error.to_string()))?;
+        let response = match self
+            .request("POST", &format!("/queries/{query_id}/cancel"))
+            .call()
+        {
+            Ok(response) | Err(ureq::Error::Status(404 | 409, response)) => response,
+            Err(ureq::Error::Status(status, _)) => {
+                return Err(napi::Error::new(
+                    format!("HTTP_{status}"),
+                    format!("cancel request failed with HTTP {status}"),
+                ))
+            }
+            Err(ureq::Error::Transport(error)) => {
+                return Err(napi::Error::new(
+                    "REMOTE_TRANSPORT".into(),
+                    error.to_string(),
+                ))
+            }
+        };
+        let body = strict_json_response(response).map_err(|error| {
+            napi::Error::new(
+                "INVALID_RESPONSE".into(),
+                format!("invalid cancel JSON: {error}"),
+            )
+        })?;
+        validate_remote_cancel_response(&body, query_id)
+            .map_err(|error| napi::Error::new("INVALID_RESPONSE".into(), error))
+    }
+
+    #[napi]
+    pub fn query_status(&self, env: Env, query_id: String) -> napi::Result<NativeQueryStatus> {
         let query_id = query_id
             .parse::<mongreldb_query::QueryId>()
             .map_err(query_to_napi)?;
-        match self
-            .agent
-            .post(&format!("{}/queries/{query_id}/cancel", self.url))
-            .call()
-        {
-            Ok(response) => Ok(matches!(response.status(), 200 | 202)),
-            Err(ureq::Error::Status(409, _)) => Ok(false),
-            Err(error) => Err(napi::Error::new(
-                napi::Status::GenericFailure,
-                error.to_string(),
-            )),
+        let (response, not_found) =
+            match self.request("GET", &format!("/queries/{query_id}")).call() {
+                Ok(response) => (response, false),
+                Err(ureq::Error::Status(404, response)) => (response, true),
+                Err(ureq::Error::Status(status, _)) => {
+                    let mut details = unknown_remote_outcome(
+                        query_id,
+                        format!("query status request failed with HTTP {status}"),
+                        None,
+                        None,
+                    );
+                    details.http_status = Some(u32::from(status));
+                    return throw_remote_query_error(&env, details);
+                }
+                Err(ureq::Error::Transport(error)) => {
+                    return throw_remote_query_error(
+                        &env,
+                        unknown_remote_outcome(query_id, error.to_string(), None, None),
+                    );
+                }
+            };
+        let body = match strict_json_response(response) {
+            Ok(body) => body,
+            Err(error) => {
+                return throw_remote_query_error(
+                    &env,
+                    unknown_remote_outcome(query_id, error.to_string(), None, None),
+                )
+            }
+        };
+        if not_found {
+            return match validate_remote_query_not_found_response(&body, query_id) {
+                Ok(details) => throw_remote_query_error(&env, details),
+                Err(error) => throw_remote_query_error(
+                    &env,
+                    unknown_remote_outcome(query_id, error, None, Some("not_found")),
+                ),
+            };
+        }
+        match remote_query_status(body, query_id) {
+            Ok(status) => Ok(status),
+            Err(error) => throw_remote_query_error(
+                &env,
+                unknown_remote_outcome(query_id, error.reason, None, None),
+            ),
         }
     }
 
     #[napi]
-    pub fn commit(&self, table: String) -> napi::Result<BigInt> {
-        let resp: serde_json::Value = self
-            .agent
-            .post(&format!("{}/tables/{table}/commit", self.url))
-            .call()
-            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?
-            .into_json()
-            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
-        Ok(BigInt::from(resp["epoch"].as_u64().unwrap_or(0)))
+    pub fn commit(&self, env: Env, table: String) -> napi::Result<BigInt> {
+        let resp: serde_json::Value = self.write_json(
+            &env,
+            "table commit",
+            self.request("POST", &format!("/tables/{table}/commit"))
+                .call(),
+        )?;
+        match remote_commit_epoch(&resp) {
+            Ok(epoch) => Ok(BigInt::from(epoch)),
+            Err(_) => throw_remote_query_error(
+                &env,
+                unknown_remote_write_outcome("remote table commit response was invalid".into()),
+            ),
+        }
     }
 
     #[napi]
-    pub fn create_procedure(&self, spec: ProcedureSpec) -> napi::Result<String> {
+    pub fn create_procedure(&self, env: Env, spec: ProcedureSpec) -> napi::Result<String> {
         let procedure: serde_json::Value = serde_json::from_str(&spec.json)
             .map_err(|e| napi::Error::new(napi::Status::InvalidArg, e.to_string()))?;
-        self.agent
-            .post(&format!("{}/procedures", self.url))
-            .send_json(serde_json::json!({ "procedure": procedure }))
-            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?
-            .into_string()
-            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))
+        self.write_text(
+            &env,
+            "procedure creation",
+            self.request("POST", "/procedures")
+                .send_json(serde_json::json!({ "procedure": procedure })),
+        )
     }
 
     #[napi]
-    pub fn drop_procedure(&self, name: String) -> napi::Result<()> {
-        self.agent
-            .delete(&format!("{}/procedures/{name}", self.url))
-            .call()
-            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
+    pub fn drop_procedure(&self, env: Env, name: String) -> napi::Result<()> {
+        self.checked_write_response(
+            &env,
+            "procedure deletion",
+            self.request("DELETE", &format!("/procedures/{name}"))
+                .call(),
+        )?;
         Ok(())
     }
 
     #[napi]
-    pub fn create_trigger(&self, spec: TriggerSpec) -> napi::Result<String> {
+    pub fn create_trigger(&self, env: Env, spec: TriggerSpec) -> napi::Result<String> {
         let trigger: serde_json::Value = serde_json::from_str(&spec.json)
             .map_err(|e| napi::Error::new(napi::Status::InvalidArg, e.to_string()))?;
         let mut body = serde_json::json!({ "trigger": trigger });
         if let Some(idempotency_key) = spec.idempotency_key {
             body["idempotency_key"] = serde_json::Value::String(idempotency_key);
         }
-        self.agent
-            .post(&format!("{}/triggers", self.url))
-            .send_json(body)
-            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?
-            .into_string()
-            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))
+        self.write_text(
+            &env,
+            "trigger creation",
+            self.request("POST", "/triggers").send_json(body),
+        )
     }
 
     #[napi]
-    pub fn replace_trigger(&self, name: String, spec: TriggerSpec) -> napi::Result<String> {
+    pub fn replace_trigger(
+        &self,
+        env: Env,
+        name: String,
+        spec: TriggerSpec,
+    ) -> napi::Result<String> {
         let trigger: serde_json::Value = serde_json::from_str(&spec.json)
             .map_err(|e| napi::Error::new(napi::Status::InvalidArg, e.to_string()))?;
         let mut body = serde_json::json!({ "trigger": trigger });
         if let Some(idempotency_key) = spec.idempotency_key {
             body["idempotency_key"] = serde_json::Value::String(idempotency_key);
         }
-        self.agent
-            .put(&format!("{}/triggers/{name}", self.url))
-            .send_json(body)
-            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?
-            .into_string()
-            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))
+        self.write_text(
+            &env,
+            "trigger replacement",
+            self.request("PUT", &format!("/triggers/{name}"))
+                .send_json(body),
+        )
     }
 
     #[napi]
-    pub fn drop_trigger(&self, name: String) -> napi::Result<()> {
-        self.agent
-            .delete(&format!("{}/triggers/{name}", self.url))
-            .call()
-            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
+    pub fn drop_trigger(
+        &self,
+        env: Env,
+        name: String,
+        idempotency_key: Option<String>,
+    ) -> napi::Result<()> {
+        let request = self.request("DELETE", &format!("/triggers/{name}"));
+        let request = match idempotency_key {
+            Some(key) => request.set("Idempotency-Key", &key),
+            None => request,
+        };
+        self.checked_write_response(&env, "trigger deletion", request.call())?;
         Ok(())
     }
 
     #[napi]
     pub fn triggers(&self) -> napi::Result<String> {
-        self.agent
-            .get(&format!("{}/triggers", self.url))
+        let response = self
+            .request("GET", "/triggers")
             .call()
-            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?
-            .into_string()
-            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
+        bounded_response_text(response, MAX_REMOTE_TEXT_RESPONSE_BYTES)
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e))
     }
 
     #[napi]
     pub fn trigger(&self, name: String) -> napi::Result<String> {
-        self.agent
-            .get(&format!("{}/triggers/{name}", self.url))
+        let response = self
+            .request("GET", &format!("/triggers/{name}"))
             .call()
-            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?
-            .into_string()
-            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
+        bounded_response_text(response, MAX_REMOTE_TEXT_RESPONSE_BYTES)
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e))
     }
 
     #[napi]
     pub fn call_procedure(
         &self,
+        env: Env,
         name: String,
         opts: Option<ProcedureCallOptions>,
     ) -> napi::Result<String> {
+        let opts = opts.unwrap_or(ProcedureCallOptions {
+            args_json: None,
+            idempotency_key: None,
+        });
         let args = opts
-            .and_then(|opts| opts.args_json)
+            .args_json
             .map(|json| serde_json::from_str::<serde_json::Value>(&json))
             .transpose()
             .map_err(|e| napi::Error::new(napi::Status::InvalidArg, e.to_string()))?
             .unwrap_or_else(|| serde_json::json!({}));
-        self.agent
-            .post(&format!("{}/kit/procedures/{name}/call", self.url))
-            .send_json(serde_json::json!({ "args": args }))
-            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?
-            .into_string()
-            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))
+        self.write_text(
+            &env,
+            "procedure call",
+            self.request("POST", &format!("/kit/procedures/{name}/call"))
+                .send_json(serde_json::json!({
+                    "args": args,
+                    "idempotency_key": opts.idempotency_key,
+                })),
+        )
     }
 
     /// Compact every table on the daemon (POST /compact). Returns
     /// `{ compacted, skipped }`.
     #[napi]
     pub fn compact(&self) -> napi::Result<CompactStats> {
-        let resp: serde_json::Value = self
-            .agent
-            .post(&format!("{}/compact", self.url))
+        let response = self
+            .request("POST", "/compact")
             .call()
-            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?
-            .into_json()
             .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
+        let resp = strict_json_response(response)
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e))?;
         Ok(CompactStats {
             compacted: resp["compacted"].as_u64().unwrap_or(0) as u32,
             skipped: resp["skipped"].as_u64().unwrap_or(0) as u32,
@@ -3832,13 +7734,12 @@ impl RemoteDatabase {
     /// Returns `true` if compacted, `false` if skipped (fewer than 2 runs).
     #[napi]
     pub fn compact_table(&self, name: String) -> napi::Result<bool> {
-        let resp: serde_json::Value = self
-            .agent
-            .post(&format!("{}/tables/{name}/compact", self.url))
+        let response = self
+            .request("POST", &format!("/tables/{name}/compact"))
             .call()
-            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?
-            .into_json()
             .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
+        let resp = strict_json_response(response)
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e))?;
         Ok(resp["status"].as_str() == Some("compacted"))
     }
 }

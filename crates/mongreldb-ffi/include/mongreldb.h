@@ -56,6 +56,24 @@ typedef struct mongreldb_ann_rerank_result mongreldb_ann_rerank_result_t;
 #define MDB_ERR_UNAUTHORIZED     -6
 #define MDB_ERR_FULL             -7
 #define MDB_ERR_IO               -8
+#define MDB_ERR_QUERY_CANCELLED  -9
+#define MDB_ERR_DEADLINE_EXCEEDED -10
+#define MDB_ERR_QUERY_ID_CONFLICT -11
+#define MDB_ERR_QUERY_REGISTRY_FULL -12
+#define MDB_ERR_TRANSACTION_STATE -13
+#define MDB_ERR_INVALID_QUERY_STATE -14
+#define MDB_ERR_COMMIT_OUTCOME   -15
+#define MDB_ERR_OUTCOME_UNKNOWN  -16
+#define MDB_ERR_RESULT_LIMIT     -17
+#define MDB_ERR_SERIALIZATION    -18
+#define MDB_ERR_SQL_EXECUTION    -19
+#define MDB_ERR_QUERY_CANCELLED_AFTER_COMMIT -20
+#define MDB_ERR_DEADLINE_AFTER_COMMIT -21
+#define MDB_ERR_SERIALIZATION_AFTER_COMMIT -22
+#define MDB_ERR_TRANSACTION_ABORTED -23
+/* Reserved for remote clients layered on this ABI. Embedded SQL does not
+ * negotiate daemon capabilities. */
+#define MDB_ERR_CAPABILITY_UNSUPPORTED -24
 #define MDB_ERR_UNKNOWN          -99
 
 /* ── Column flags (bitmask) ─────────────────────────────────────────────── */
@@ -309,6 +327,35 @@ typedef struct {
 
 const char *mongreldb_last_error(void);
 int32_t mongreldb_last_error_code(void);
+
+/* Structured error metadata. Text fields are always NUL-terminated. Check
+ * outcome_known before treating committed=0 as proof that no write occurred.
+ * The struct is copied from thread-local storage and remains owned by caller. */
+typedef struct mongreldb_error_details_v1 {
+    size_t struct_size;
+    uint32_t version;
+    int32_t code;
+    uint8_t outcome_known;
+    uint8_t committed;
+    uint8_t retryable;
+    uint8_t has_last_commit_epoch;
+    uint64_t last_commit_epoch;
+    size_t committed_statements;
+    uint8_t has_first_commit_statement_index;
+    size_t first_commit_statement_index;
+    uint8_t has_last_commit_statement_index;
+    size_t last_commit_statement_index;
+    size_t completed_statements;
+    uint8_t has_statement_index;
+    size_t statement_index;
+    int32_t cancel_outcome;
+    int32_t cancellation_reason;
+    char query_id[33];
+    char server_state[32];
+} mongreldb_error_details_v1;
+
+int32_t mongreldb_last_error_details_v1(
+    mongreldb_error_details_v1 *out_details);
 void mongreldb_free_error_string(char *ptr);
 void mongreldb_free_string(char *ptr);
 
@@ -363,6 +410,13 @@ typedef struct mongreldb_sql_options {
     uint64_t timeout_ms;
 } mongreldb_sql_options;
 
+typedef struct mongreldb_sql_options_v2 {
+    const char *query_id;
+    uint64_t timeout_ms;
+    size_t max_output_rows;
+    size_t max_output_bytes;
+} mongreldb_sql_options_v2;
+
 typedef struct mongreldb_sql_result_t {
     uint8_t *data;
     size_t len;
@@ -373,10 +427,118 @@ mongreldb_sql_query_t *mongreldb_sql_query_start(
     const char *sql,
     const mongreldb_sql_options *options);
 
-/* Returns 1 when cancellation is accepted/already active, 0 when durable
- * commit or completion already won, and a negative error code on bad input. */
+/* Versioned start API. Zero limits select the defaults: 1,000,000 rows and
+ * 64 MiB. */
+mongreldb_sql_query_t *mongreldb_sql_query_start_v2(
+    mongreldb_database_t *db,
+    const char *sql,
+    const mongreldb_sql_options_v2 *options);
+
+typedef enum mongreldb_cancel_outcome {
+    MDB_CANCEL_ACCEPTED = 1,
+    MDB_CANCEL_ALREADY_CANCELLING = 2,
+    MDB_CANCEL_TOO_LATE = 3,
+    MDB_CANCEL_ALREADY_FINISHED = 4,
+    MDB_CANCEL_NOT_FOUND = 5
+} mongreldb_cancel_outcome;
+
+typedef enum mongreldb_sql_query_phase {
+    MDB_SQL_PHASE_NONE = 0,
+    MDB_SQL_PHASE_QUEUED = 1,
+    MDB_SQL_PHASE_PLANNING = 2,
+    MDB_SQL_PHASE_EXECUTING = 3,
+    MDB_SQL_PHASE_STREAMING = 4,
+    MDB_SQL_PHASE_SERIALIZING = 5,
+    MDB_SQL_PHASE_COMMIT_CRITICAL = 6,
+    MDB_SQL_PHASE_CANCELLING = 7,
+    MDB_SQL_PHASE_COMPLETED = 8,
+    MDB_SQL_PHASE_FAILED = 9,
+    MDB_SQL_PHASE_CANCELLED = 10
+} mongreldb_sql_query_phase;
+
+typedef enum mongreldb_sql_terminal_state {
+    MDB_SQL_TERMINAL_NONE = 0,
+    MDB_SQL_TERMINAL_COMPLETED = 1,
+    MDB_SQL_TERMINAL_FAILED_BEFORE_COMMIT = 2,
+    MDB_SQL_TERMINAL_CANCELLED_BEFORE_COMMIT = 3,
+    MDB_SQL_TERMINAL_DEADLINE_BEFORE_COMMIT = 4,
+    MDB_SQL_TERMINAL_COMMITTED = 5,
+    MDB_SQL_TERMINAL_COMMITTED_WITH_ERROR = 6,
+    MDB_SQL_TERMINAL_PARTIALLY_COMMITTED = 7,
+    MDB_SQL_TERMINAL_CANCELLED_AFTER_COMMIT = 8,
+    MDB_SQL_TERMINAL_DEADLINE_AFTER_COMMIT = 9,
+    MDB_SQL_TERMINAL_OUTCOME_UNKNOWN = 10
+} mongreldb_sql_terminal_state;
+
+typedef enum mongreldb_cancellation_reason {
+    MDB_CANCEL_REASON_NONE = 0,
+    MDB_CANCEL_REASON_CLIENT_REQUEST = 1,
+    MDB_CANCEL_REASON_DEADLINE = 2,
+    MDB_CANCEL_REASON_CLIENT_DISCONNECTED = 3,
+    MDB_CANCEL_REASON_SESSION_CLOSED = 4,
+    MDB_CANCEL_REASON_SERVER_SHUTDOWN = 5
+} mongreldb_cancellation_reason;
+
+typedef enum mongreldb_sql_terminal_error_category {
+    MDB_SQL_ERROR_CATEGORY_NONE = 0,
+    MDB_SQL_ERROR_CATEGORY_CANCELLATION = 1,
+    MDB_SQL_ERROR_CATEGORY_DEADLINE = 2,
+    MDB_SQL_ERROR_CATEGORY_RESULT_LIMIT = 3,
+    MDB_SQL_ERROR_CATEGORY_SERIALIZATION = 4,
+    MDB_SQL_ERROR_CATEGORY_EXECUTION = 5
+} mongreldb_sql_terminal_error_category;
+
+typedef struct mongreldb_sql_query_status_v1 {
+    char query_id[33];
+    int32_t phase;
+    int32_t terminal_state;
+    uint8_t committed;
+    size_t committed_statements;
+    uint8_t has_last_commit_epoch;
+    uint64_t last_commit_epoch;
+    uint8_t has_first_commit_statement_index;
+    size_t first_commit_statement_index;
+    uint8_t has_last_commit_statement_index;
+    size_t last_commit_statement_index;
+    size_t completed_statements;
+    size_t statement_index;
+    int32_t cancel_outcome;
+    int32_t cancellation_reason;
+    uint8_t retryable;
+    int32_t terminal_error_category;
+    char terminal_error_code[64];
+} mongreldb_sql_query_status_v1;
+
+/* V1 ABI remains supported. If terminal_state is
+ * MDB_SQL_TERMINAL_OUTCOME_UNKNOWN, its commit/progress fields are legacy
+ * zero placeholders and do not prove that no commit occurred. */
+
+typedef struct mongreldb_sql_query_status_v2 {
+    mongreldb_sql_query_status_v1 v1;
+    /* 1 when v1 commit/progress fields are known; 0 means ignore them. */
+    uint8_t outcome_known;
+} mongreldb_sql_query_status_v2;
+
+/* Returns one mongreldb_cancel_outcome value, or a negative error code on bad
+ * input. MDB_CANCEL_TOO_LATE means durable commit already won. */
 int32_t mongreldb_sql_query_cancel(mongreldb_sql_query_t *query);
 
+/* Structured query state. Text fields are always NUL-terminated. */
+int32_t mongreldb_sql_query_get_status(
+    mongreldb_sql_query_t *query,
+    mongreldb_sql_query_status_v1 *out_status);
+
+/* Preferred structured status API. Check outcome_known before reading any
+ * v1 commit/progress field. */
+int32_t mongreldb_sql_query_get_status_v2(
+    mongreldb_sql_query_t *query,
+    mongreldb_sql_query_status_v2 *out_status);
+
+/* Wait returns stable SQL-specific error codes. In particular,
+ * MDB_ERR_QUERY_CANCELLED_AFTER_COMMIT,
+ * MDB_ERR_DEADLINE_AFTER_COMMIT, and
+ * MDB_ERR_SERIALIZATION_AFTER_COMMIT preserve durable-outcome semantics.
+ * Call mongreldb_sql_query_get_status_v2 for the full receipt fields. */
 int32_t mongreldb_sql_query_wait(
     mongreldb_sql_query_t *query,
     mongreldb_sql_result_t *out_result);

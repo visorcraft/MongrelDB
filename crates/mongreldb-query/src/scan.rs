@@ -15,7 +15,7 @@
 //! never pays for the rest.
 
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
@@ -34,6 +34,7 @@ use mongreldb_core::columnar::NativeColumn;
 use mongreldb_core::schema::TypeId;
 use mongreldb_core::Cursor;
 use mongreldb_core::{ColumnStat, Value};
+use parking_lot::Mutex;
 
 use crate::arrow_conv::native_to_array_owned_with_query;
 use crate::error::MongrelQueryError;
@@ -42,6 +43,54 @@ use crate::query_registry::{RegisteredSqlQuery, SqlTaskContext};
 /// Rows per streamed `RecordBatch`. Matches the encoded 65 536-row page size so
 /// a single batch typically corresponds to exactly one on-disk page.
 pub(crate) const PAGE_BATCH_ROWS: usize = 65_536;
+const SCAN_BATCH_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+fn native_column_range_bytes(column: &NativeColumn, start: usize, end: usize) -> usize {
+    let rows = end.saturating_sub(start);
+    let validity = rows.div_ceil(8);
+    match column {
+        NativeColumn::Int64 { .. } | NativeColumn::Float64 { .. } => {
+            rows.saturating_mul(8).saturating_add(validity)
+        }
+        NativeColumn::Bool { .. } => rows.saturating_add(validity),
+        NativeColumn::Bytes {
+            offsets, values, ..
+        } => {
+            let value_start = offsets.get(start).copied().unwrap_or(0) as usize;
+            let value_end = offsets.get(end).copied().unwrap_or(values.len() as u32) as usize;
+            value_end
+                .saturating_sub(value_start)
+                .saturating_add(rows.saturating_add(1).saturating_mul(4))
+                .saturating_add(validity)
+        }
+    }
+}
+
+fn enforce_native_batch_limit(
+    columns: &[NativeColumn],
+    start: usize,
+    end: usize,
+    query: Option<&RegisteredSqlQuery>,
+) -> datafusion::common::Result<()> {
+    let bytes = columns.iter().fold(0_usize, |total, column| {
+        total.saturating_add(native_column_range_bytes(column, start, end))
+    });
+    if bytes > SCAN_BATCH_MAX_BYTES {
+        let message = format!(
+            "SQL scan batch memory limit exceeded ({} > {} bytes)",
+            bytes, SCAN_BATCH_MAX_BYTES
+        );
+        return Err(df_err(match query {
+            Some(query) => query.result_limit_error(message),
+            None => MongrelQueryError::Core(mongreldb_core::MongrelError::ResourceLimitExceeded {
+                resource: "SQL scan batch bytes",
+                requested: bytes,
+                limit: SCAN_BATCH_MAX_BYTES,
+            }),
+        }));
+    }
+    Ok(())
+}
 
 /// Backing data for a [`MongrelScanExec`].
 enum Source {
@@ -317,7 +366,16 @@ impl ExecutionPlan for MongrelScanExec {
                 let columns = Arc::clone(columns);
                 let types = Arc::clone(&self.types);
                 let schema = self.schema.clone();
-                let num_chunks = total.div_ceil(PAGE_BATCH_ROWS);
+                let approximate_bytes = columns.iter().fold(0_u64, |sum, column| {
+                    sum.saturating_add(column.approx_bytes())
+                });
+                let bytes_per_row = usize::try_from(approximate_bytes)
+                    .unwrap_or(usize::MAX)
+                    .div_ceil(total.max(1));
+                let batch_rows = PAGE_BATCH_ROWS
+                    .min(SCAN_BATCH_MAX_BYTES / bytes_per_row.max(1))
+                    .max(1);
+                let num_chunks = total.div_ceil(batch_rows);
                 let batch_schema = schema.clone();
                 let query = query.clone();
                 let test_hook = test_hook.clone();
@@ -329,8 +387,8 @@ impl ExecutionPlan for MongrelScanExec {
                         hook(crate::SqlTestHookPoint::BeforeScanBatch);
                     }
                     checkpoint(query.as_ref())?;
-                    let start = i * PAGE_BATCH_ROWS;
-                    let end = (start + PAGE_BATCH_ROWS).min(total);
+                    let start = i * batch_rows;
+                    let end = (start + batch_rows).min(total);
                     let batch = if columns.is_empty() {
                         build_row_count_batch(&batch_schema, end - start)
                     } else {
@@ -357,13 +415,9 @@ impl ExecutionPlan for MongrelScanExec {
             }
             Source::Cursor(mtx) => {
                 // Single-partition ⇒ execute is called once. Extract the cursor.
-                let cursor = mtx
-                    .lock()
-                    .expect("cursor mutex poisoned")
-                    .take()
-                    .ok_or_else(|| {
-                        DataFusionError::Internal("MongrelScanExec cursor already consumed".into())
-                    })?;
+                let cursor = mtx.lock().take().ok_or_else(|| {
+                    DataFusionError::Internal("MongrelScanExec cursor already consumed".into())
+                })?;
                 let batches = CursorBatches {
                     cursor: Some(cursor),
                     types: Arc::clone(&self.types),
@@ -383,7 +437,28 @@ impl ExecutionPlan for MongrelScanExec {
                 if let Some(hook) = &test_hook {
                     hook(crate::SqlTestHookPoint::BeforeScanBatch);
                 }
-                let item = checkpoint(query.as_ref()).map(|()| batch);
+                let item = checkpoint(query.as_ref()).and_then(|()| {
+                    let bytes = batch.columns().iter().fold(0_usize, |total, column| {
+                        total.saturating_add(column.get_array_memory_size())
+                    });
+                    if bytes > SCAN_BATCH_MAX_BYTES {
+                        let message = format!(
+                            "SQL scan batch memory limit exceeded ({} > {} bytes)",
+                            bytes, SCAN_BATCH_MAX_BYTES
+                        );
+                        return Err(df_err(match query.as_ref() {
+                            Some(query) => query.result_limit_error(message),
+                            None => MongrelQueryError::Core(
+                                mongreldb_core::MongrelError::ResourceLimitExceeded {
+                                    resource: "SQL scan batch bytes",
+                                    requested: bytes,
+                                    limit: SCAN_BATCH_MAX_BYTES,
+                                },
+                            ),
+                        }));
+                    }
+                    Ok(batch)
+                });
                 if item.is_ok() {
                     if let Some(hook) = &test_hook {
                         hook(crate::SqlTestHookPoint::AfterScanBatch);
@@ -553,6 +628,7 @@ fn build_chunk_batch(
     end: usize,
     query: Option<&RegisteredSqlQuery>,
 ) -> datafusion::common::Result<RecordBatch> {
+    enforce_native_batch_limit(columns, start, end, query)?;
     let mut arrays = Vec::with_capacity(columns.len());
     for (col, ty) in columns.iter().zip(types.iter()) {
         let slice = col.slice_range(start, end);
@@ -572,6 +648,8 @@ fn build_cursor_batch(
     schema: &SchemaRef,
     query: Option<&RegisteredSqlQuery>,
 ) -> datafusion::common::Result<RecordBatch> {
+    let rows = cols.first().map(NativeColumn::len).unwrap_or(0);
+    enforce_native_batch_limit(&cols, 0, rows, query)?;
     let mut arrays = Vec::with_capacity(cols.len());
     for (col, ty) in cols.into_iter().zip(types.iter()) {
         checkpoint(query)?;

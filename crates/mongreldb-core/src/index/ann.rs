@@ -8,6 +8,7 @@
 use crate::index::hnsw::Hnsw;
 use crate::rowid::RowId;
 use crate::{MongrelError, Result};
+use bincode::Options;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -181,8 +182,24 @@ impl AnnIndex {
     /// Rehydrate from bytes produced by [`AnnIndex::freeze`].
     pub fn thaw(bytes: &[u8]) -> std::result::Result<Self, bincode::Error> {
         let checkpoint: AnnCheckpoint = bincode::deserialize(bytes)?;
+        Ok(Self::from_checkpoint(checkpoint))
+    }
+
+    pub(crate) fn thaw_bounded(
+        bytes: &[u8],
+        limit: u64,
+    ) -> std::result::Result<Self, bincode::Error> {
+        let checkpoint: AnnCheckpoint = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .reject_trailing_bytes()
+            .with_limit(limit)
+            .deserialize(bytes)?;
+        Ok(Self::from_checkpoint(checkpoint))
+    }
+
+    fn from_checkpoint(checkpoint: AnnCheckpoint) -> Self {
         let (m, ef_construction) = checkpoint.graph.options();
-        Ok(Self {
+        Self {
             dim: checkpoint.dim,
             bytes_per_vec: checkpoint.bytes_per_vec,
             m,
@@ -190,7 +207,7 @@ impl AnnIndex {
             ef_search: checkpoint.ef_search,
             frozen: Arc::new(vec![Arc::new(checkpoint.graph)]),
             active: Hnsw::new(checkpoint.bytes_per_vec, m, ef_construction),
-        })
+        }
     }
 
     pub(crate) fn seal(&mut self) {

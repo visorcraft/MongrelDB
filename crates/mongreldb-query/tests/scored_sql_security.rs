@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 fn admin() -> Principal {
     Principal {
+        user_id: 0,
+        created_epoch: 0,
         username: "admin".into(),
         is_admin: true,
         roles: Vec::new(),

@@ -2220,11 +2220,13 @@ dependencies = [
  "rayon",
  "regex",
  "roaring",
+ "rustix",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "thiserror 1.0.69",
  "tokio",
+ "windows-sys 0.61.2",
  "xxhash-rust",
  "zeroize",
  "zstd",
@@ -2235,6 +2237,7 @@ name = "mongreldb-node"
 version = "0.55.0"
 dependencies = [
  "arrow",
+ "base64",
  "bincode",
  "bytemuck",
  "mongreldb-core",
@@ -2246,14 +2249,17 @@ dependencies = [
  "serde",
  "serde_json",
  "ureq",
+ "zeroize",
 ]
 
 [[package]]
 name = "mongreldb-query"
 version = "0.55.0"
 dependencies = [
+ "aes-gcm",
  "arrow",
  "async-trait",
+ "bincode",
  "chrono",
  "datafusion",
  "datafusion-datasource",
@@ -2266,6 +2272,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sqlparser",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
 ]

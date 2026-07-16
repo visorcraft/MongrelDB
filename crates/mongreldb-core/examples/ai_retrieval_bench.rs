@@ -576,6 +576,8 @@ fn main() {
     let mut rls_profiles = Vec::new();
     for (username, selectivity) in [("tenant_1", 0.01), ("tenant_10", 0.10), ("tenant_50", 0.50)] {
         let principal = Principal {
+            user_id: 0,
+            created_epoch: 0,
             username: username.into(),
             is_admin: false,
             roles: Vec::new(),

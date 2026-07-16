@@ -7,6 +7,11 @@ pub type Result<T> = std::result::Result<T, MongrelError>;
 pub enum MongrelError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("database at {path} is locked: {message}")]
+    DatabaseLocked {
+        path: std::path::PathBuf,
+        message: String,
+    },
     #[error("serialization error: {0}")]
     Serialization(#[from] bincode::Error),
     #[error("corrupt wal record at offset {offset}: {reason}")]
@@ -35,6 +40,8 @@ pub enum MongrelError {
     Encryption(String),
     #[error("decryption error: {0}")]
     Decryption(String),
+    #[error("OS CSPRNG unavailable: {0}")]
+    EntropyUnavailable(String),
     #[error("not found: {0}")]
     NotFound(String),
     #[error("invalid argument: {0}")]
@@ -43,6 +50,8 @@ pub enum MongrelError {
     Full(String),
     #[error("transaction conflict: {0}")]
     Conflict(String),
+    #[error("trigger validation failed: {0}")]
+    TriggerValidation(String),
     #[error("read-only replica: writes must be applied by ReplicationFollower")]
     ReadOnlyReplica,
     #[error("authentication required: this database has require_auth enabled; reopen with open_with_credentials / open_encrypted_with_credentials")]
@@ -60,8 +69,20 @@ pub enum MongrelError {
     DeadlineExceeded,
     #[error("AI query work budget exceeded")]
     WorkBudgetExceeded,
+    #[error(
+        "execution resource limit exceeded for {resource}: requested {requested}, limit {limit}"
+    )]
+    ResourceLimitExceeded {
+        resource: &'static str,
+        requested: usize,
+        limit: usize,
+    },
     #[error("execution cancelled")]
     Cancelled,
+    #[error("commit {epoch} is durable: {message}")]
+    DurableCommit { epoch: u64, message: String },
+    #[error("commit outcome at epoch {epoch} is unknown: {message}")]
+    CommitOutcomeUnknown { epoch: u64, message: String },
     #[error("cursor stale: {0}")]
     CursorStale(String),
     #[error("cursor expired")]

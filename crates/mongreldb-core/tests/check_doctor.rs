@@ -1,6 +1,6 @@
 //! P7.1 — check/doctor for multi-table integrity.
 
-use mongreldb_core::{schema::*, Database, Value};
+use mongreldb_core::{schema::*, Database, ExecutionControl, MongrelError, Value};
 use tempfile::tempdir;
 
 fn pk_schema() -> Schema {
@@ -25,6 +25,7 @@ fn check_reports_missing_run_file() {
     let dir = tempdir().unwrap();
     let db = Database::create(dir.path()).unwrap();
     db.create_table("t", pk_schema()).unwrap();
+    db.create_table("other", pk_schema()).unwrap();
     db.transaction(|t| {
         t.put("t", vec![(1, Value::Int64(1))])?;
         Ok(())
@@ -63,9 +64,45 @@ fn check_reports_missing_run_file() {
         issues
     );
 
-    // doctor quarantines the bad table.
-    let quarantined = db.doctor().unwrap();
+    let error = db
+        .doctor_controlled(&ExecutionControl::new(None), || false)
+        .unwrap_err();
+    assert!(matches!(error, MongrelError::Cancelled));
+    assert!(db.table("t").is_ok());
+    assert!(!dir
+        .path()
+        .join("_quarantine")
+        .join(table_id.to_string())
+        .exists());
+
+    // An unrelated writer may advance the visible epoch after doctor publishes.
+    // The receipt must remain the exact catalog epoch doctor used.
+    let publication_epoch = db.visible_epoch();
+    let (start_tx, start_rx) = std::sync::mpsc::sync_channel(0);
+    let (attempt_tx, attempt_rx) = std::sync::mpsc::sync_channel(0);
+    let (quarantined, receipt) = std::thread::scope(|scope| {
+        let writer_db = &db;
+        let writer = scope.spawn(move || {
+            start_rx.recv().unwrap();
+            attempt_tx.send(()).unwrap();
+            writer_db.transaction(|transaction| {
+                transaction.put("other", vec![(1, Value::Int64(99))])?;
+                Ok(())
+            })
+        });
+        let result = db.doctor_controlled_with_receipt(&ExecutionControl::new(None), || {
+            start_tx.send(()).unwrap();
+            attempt_rx.recv().unwrap();
+            true
+        });
+        writer.join().unwrap().unwrap();
+        result
+    })
+    .unwrap();
     assert!(quarantined.contains(&table_id), "table quarantined");
+    let doctor_epoch = receipt.unwrap().epoch;
+    assert!(doctor_epoch > publication_epoch);
+    assert!(db.visible_epoch() > doctor_epoch);
 
     // The quarantine dir exists.
     assert!(
@@ -131,6 +168,66 @@ fn check_detects_run_footer_checksum_corruption() {
         "check must flag payload/footer checksum corruption, got: {:?}",
         issues
     );
+}
+
+#[test]
+fn doctor_catalog_checkpoint_failure_reports_durable_commit_and_recovers() {
+    let dir = tempdir().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.create_table("t", pk_schema()).unwrap();
+    seed_run(&db, "t");
+    let table_id = db.table_id("t").unwrap();
+    std::fs::remove_file(first_run_path(dir.path(), table_id)).unwrap();
+    let catalog = dir.path().join("CATALOG");
+    let saved_catalog = dir.path().join("CATALOG.saved");
+    std::fs::rename(&catalog, &saved_catalog).unwrap();
+    std::fs::create_dir(&catalog).unwrap();
+
+    let error = db.doctor().unwrap_err();
+    assert!(matches!(error, MongrelError::DurableCommit { .. }));
+    assert!(db.table("t").is_err());
+    assert!(dir
+        .path()
+        .join("tables")
+        .join(table_id.to_string())
+        .is_dir());
+    assert!(!dir
+        .path()
+        .join("_quarantine")
+        .join(table_id.to_string())
+        .exists());
+    assert!(db.create_table("later", pk_schema()).is_err());
+
+    drop(db);
+    std::fs::remove_dir(&catalog).unwrap();
+    std::fs::rename(&saved_catalog, &catalog).unwrap();
+    let reopened = Database::open(dir.path()).unwrap();
+    assert!(reopened.table("t").is_err());
+}
+
+#[test]
+fn doctor_move_failure_leaves_durable_dropped_catalog_reopenable() {
+    let dir = tempdir().unwrap();
+    let db = Database::create(dir.path()).unwrap();
+    db.create_table("t", pk_schema()).unwrap();
+    seed_run(&db, "t");
+    let table_id = db.table_id("t").unwrap();
+    std::fs::remove_file(first_run_path(dir.path(), table_id)).unwrap();
+    let quarantine_target = dir.path().join("_quarantine").join(table_id.to_string());
+    std::fs::create_dir_all(&quarantine_target).unwrap();
+
+    let error = db.doctor().unwrap_err();
+    assert!(matches!(error, MongrelError::DurableCommit { .. }));
+    assert!(db.table("t").is_err());
+    assert!(dir
+        .path()
+        .join("tables")
+        .join(table_id.to_string())
+        .is_dir());
+
+    drop(db);
+    let reopened = Database::open(dir.path()).unwrap();
+    assert!(reopened.table("t").is_err());
 }
 
 #[test]

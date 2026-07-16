@@ -2610,6 +2610,46 @@ async fn kv_store_external_module_supports_durable_sql_writes() {
 }
 
 #[tokio::test]
+async fn external_publish_failure_blocks_stale_reads_until_reopen() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    let session = MongrelSession::open(Arc::clone(&db)).unwrap();
+    session
+        .run("CREATE VIRTUAL TABLE kv USING kv_store")
+        .await
+        .unwrap();
+    session
+        .run("INSERT INTO kv (key, value) VALUES ('one', '1')")
+        .await
+        .unwrap();
+    let state_path = db.root().join("_vtab").join("kv").join("state.json");
+    let state = std::fs::read(&state_path).unwrap();
+    std::fs::remove_file(&state_path).unwrap();
+    std::fs::create_dir(&state_path).unwrap();
+
+    let mut txn = db.begin();
+    txn.put_external_state("kv", state).unwrap();
+    assert!(matches!(
+        txn.commit(),
+        Err(mongreldb_core::MongrelError::DurableCommit { .. })
+    ));
+    assert!(db.ensure_consistent_read().is_err());
+    let read_error = session.run("SELECT * FROM kv").await.unwrap_err();
+    assert!(read_error.to_string().contains("reopen required"));
+
+    drop(session);
+    drop(db);
+    std::fs::remove_dir(&state_path).unwrap();
+    let reopened = Arc::new(Database::open(dir.path()).unwrap());
+    let reopened_session = MongrelSession::open(reopened).unwrap();
+    let batches = reopened_session
+        .run("SELECT key FROM kv ORDER BY key")
+        .await
+        .unwrap();
+    assert_eq!(string_values(&batches, 0), vec!["one".to_string()]);
+}
+
+#[tokio::test]
 async fn triggers_can_write_transaction_safe_external_tables() {
     let dir = tempdir().unwrap();
     let db = Arc::new(Database::create(dir.path()).unwrap());
@@ -3227,6 +3267,15 @@ async fn external_module_errors_are_typed_schema_errors() {
         matches!(err, MongrelQueryError::Schema(ref message) if message.contains("at most three arguments")),
         "{err}"
     );
+    assert!(db.external_table("missing").is_none());
+    assert!(db.external_table("bad_series").is_none());
+
+    drop(session);
+    drop(db);
+    let reopened = Arc::new(Database::open(dir.path()).unwrap());
+    assert!(reopened.external_table("missing").is_none());
+    assert!(reopened.external_table("bad_series").is_none());
+    MongrelSession::open(reopened).unwrap();
 }
 
 #[tokio::test]

@@ -1,5 +1,6 @@
 //! `FFITransaction` — the staging-buffer transaction pattern (matching the
-//! NAPI addon). A transaction holds `Arc<Database>` + `Mutex<Vec<StagedOp>>`.
+//! NAPI addon). A transaction holds `Arc<Database>` plus one mutex-protected
+//! state value.
 //! Each staging call (`mongreldb_txn_put`, `…_upsert`, `…_delete`,
 //! `…_delete_by_pk`) appends to the buffer; `mongreldb_txn_commit` replays the
 //! buffer into a fresh core `Transaction` and commits atomically; `_rollback`
@@ -11,7 +12,10 @@
 
 use crate::cstr::cstr_to_string;
 use crate::database::{as_db, mongreldb_database_t};
-use crate::error::{clear, set_error, set_error_msg, ErrorCode};
+use crate::error::{
+    clear, copy_c_text, mongreldb_error_details_v1, set_error, set_error_msg,
+    set_error_with_details, ErrorCode,
+};
 use crate::table::{cell_inputs_to_pairs, mongreldb_cell_input_array};
 use crate::value::{c_to_value, ByteSlice};
 use mongreldb_core::query::Query;
@@ -48,20 +52,117 @@ enum StagedOp {
 /// a mutex-protected staging buffer.
 pub struct FFITransaction {
     pub db: Arc<CoreDatabase>,
-    staging: Mutex<Vec<StagedOp>>,
+    state: Mutex<FFITransactionState>,
+}
+
+#[derive(Default)]
+struct FFITransactionState {
+    staging: Vec<StagedOp>,
+    committed_epoch: Option<u64>,
+    rolled_back: bool,
+    terminal_error: Option<TerminalCommitError>,
+}
+
+struct TerminalCommitError {
+    code: ErrorCode,
+    epoch: u64,
+    outcome_known: bool,
+    message: String,
 }
 
 impl FFITransaction {
     pub fn new(db: Arc<CoreDatabase>) -> Self {
         Self {
             db,
-            staging: Mutex::new(Vec::new()),
+            state: Mutex::new(FFITransactionState::default()),
         }
     }
 
     pub fn into_handle(self) -> mongreldb_transaction_t {
         Box::into_raw(Box::new(self)) as mongreldb_transaction_t
     }
+}
+
+fn stage_op(transaction: &FFITransaction, operation: StagedOp) -> i32 {
+    let mut state = match transaction.state.lock() {
+        Ok(state) => state,
+        Err(_) => {
+            return set_error_msg(ErrorCode::Unknown, "transaction buffer poisoned").as_return()
+        }
+    };
+    if let Some(epoch) = state.committed_epoch {
+        return set_committed_transaction_error(epoch);
+    }
+    if state.rolled_back {
+        return set_rolled_back_transaction_error();
+    }
+    if let Some(error) = state.terminal_error.as_ref() {
+        return set_terminal_commit_error(error);
+    }
+    state.staging.push(operation);
+    0
+}
+
+fn ensure_active(transaction: &FFITransaction) -> Result<(), i32> {
+    let state = transaction.state.lock().map_err(|_| {
+        set_error_msg(ErrorCode::Unknown, "transaction buffer poisoned").as_return()
+    })?;
+    if let Some(epoch) = state.committed_epoch {
+        return Err(set_committed_transaction_error(epoch));
+    }
+    if state.rolled_back {
+        return Err(set_rolled_back_transaction_error());
+    }
+    match state.terminal_error.as_ref() {
+        Some(error) => Err(set_terminal_commit_error(error)),
+        None => Ok(()),
+    }
+}
+
+fn set_committed_transaction_error(epoch: u64) -> i32 {
+    let message = format!("transaction already committed at epoch {epoch}");
+    let mut details = mongreldb_error_details_v1 {
+        code: ErrorCode::InvalidArgument.as_return(),
+        outcome_known: 1,
+        committed: 1,
+        has_last_commit_epoch: 1,
+        last_commit_epoch: epoch,
+        retryable: 0,
+        ..Default::default()
+    };
+    copy_c_text(&mut details.server_state, "completed");
+    set_error_with_details(ErrorCode::InvalidArgument, &message, details).as_return()
+}
+
+fn set_rolled_back_transaction_error() -> i32 {
+    let mut details = mongreldb_error_details_v1 {
+        code: ErrorCode::InvalidArgument.as_return(),
+        outcome_known: 1,
+        committed: 0,
+        retryable: 0,
+        ..Default::default()
+    };
+    copy_c_text(&mut details.server_state, "rolled_back");
+    set_error_with_details(
+        ErrorCode::InvalidArgument,
+        "transaction already rolled back",
+        details,
+    )
+    .as_return()
+}
+
+fn set_terminal_commit_error(error: &TerminalCommitError) -> i32 {
+    let mut details = mongreldb_error_details_v1 {
+        code: error.code.as_return(),
+        outcome_known: u8::from(error.outcome_known),
+        committed: u8::from(error.outcome_known),
+        has_last_commit_epoch: 1,
+        last_commit_epoch: error.epoch,
+        retryable: 0,
+        ..Default::default()
+    };
+    copy_c_text(&mut details.server_state, "failed");
+    set_error_with_details(error.code, &error.message, details).as_return()
 }
 
 /// SAFETY helper: borrow a transaction handle.
@@ -125,9 +226,23 @@ pub unsafe extern "C" fn mongreldb_txn_rollback(txn: mongreldb_transaction_t) ->
     let Some(t) = as_txn(txn) else {
         return ErrorCode::InvalidArgument.as_return();
     };
-    if let Ok(mut staging) = t.staging.lock() {
-        staging.clear();
+    let mut state = match t.state.lock() {
+        Ok(state) => state,
+        Err(_) => {
+            return set_error_msg(ErrorCode::Unknown, "transaction buffer poisoned").as_return()
+        }
+    };
+    if let Some(epoch) = state.committed_epoch {
+        return set_committed_transaction_error(epoch);
     }
+    if state.rolled_back {
+        return 0;
+    }
+    if let Some(error) = state.terminal_error.as_ref() {
+        return set_terminal_commit_error(error);
+    }
+    state.staging.clear();
+    state.rolled_back = true;
     0
 }
 
@@ -148,6 +263,9 @@ pub unsafe extern "C" fn mongreldb_txn_put(
     let Some(t) = as_txn(txn) else {
         return ErrorCode::InvalidArgument.as_return();
     };
+    if let Err(code) = ensure_active(t) {
+        return code;
+    }
     if table.is_null() {
         return set_error_msg(ErrorCode::InvalidArgument, "table is null").as_return();
     }
@@ -163,13 +281,13 @@ pub unsafe extern "C" fn mongreldb_txn_put(
         Ok(p) => p,
         Err(code) => return code.as_return(),
     };
-    if let Ok(mut staging) = t.staging.lock() {
-        staging.push(StagedOp::Put {
+    stage_op(
+        t,
+        StagedOp::Put {
             table: table_name,
             cells: cols,
-        });
-    }
-    0
+        },
+    )
 }
 
 /// Stage an upsert on `table` with separate insert and update cell sets.
@@ -189,6 +307,9 @@ pub unsafe extern "C" fn mongreldb_txn_upsert(
     let Some(t) = as_txn(txn) else {
         return ErrorCode::InvalidArgument.as_return();
     };
+    if let Err(code) = ensure_active(t) {
+        return code;
+    }
     if table.is_null() {
         return set_error_msg(ErrorCode::InvalidArgument, "table is null").as_return();
     }
@@ -212,14 +333,14 @@ pub unsafe extern "C" fn mongreldb_txn_upsert(
             Err(code) => return code.as_return(),
         }
     };
-    if let Ok(mut staging) = t.staging.lock() {
-        staging.push(StagedOp::Upsert {
+    stage_op(
+        t,
+        StagedOp::Upsert {
             table: table_name,
             cells: insert_cols,
             update_cells: update_cols,
-        });
-    }
-    0
+        },
+    )
 }
 
 /// Stage a delete of `row_id` on `table`. Returns 0 on success.
@@ -236,6 +357,9 @@ pub unsafe extern "C" fn mongreldb_txn_delete(
     let Some(t) = as_txn(txn) else {
         return ErrorCode::InvalidArgument.as_return();
     };
+    if let Err(code) = ensure_active(t) {
+        return code;
+    }
     if table.is_null() {
         return set_error_msg(ErrorCode::InvalidArgument, "table is null").as_return();
     }
@@ -244,13 +368,13 @@ pub unsafe extern "C" fn mongreldb_txn_delete(
     if let Err(e) = t.db.table(&table_name) {
         return set_error(&e).as_return();
     }
-    if let Ok(mut staging) = t.staging.lock() {
-        staging.push(StagedOp::Delete {
+    stage_op(
+        t,
+        StagedOp::Delete {
             table: table_name,
             row_id: RowId(row_id),
-        });
-    }
-    0
+        },
+    )
 }
 
 /// Stage a delete of the first row matching a primary key on `table`. The PK
@@ -269,6 +393,9 @@ pub unsafe extern "C" fn mongreldb_txn_delete_by_pk(
     let Some(t) = as_txn(txn) else {
         return ErrorCode::InvalidArgument.as_return();
     };
+    if let Err(code) = ensure_active(t) {
+        return code;
+    }
     if table.is_null() {
         return set_error_msg(ErrorCode::InvalidArgument, "table is null").as_return();
     }
@@ -277,22 +404,23 @@ pub unsafe extern "C" fn mongreldb_txn_delete_by_pk(
         return set_error(&e).as_return();
     }
     let pk_bytes = pk.to_vec();
-    if let Ok(mut staging) = t.staging.lock() {
-        staging.push(StagedOp::DeleteByPk {
+    stage_op(
+        t,
+        StagedOp::DeleteByPk {
             table: table_name,
             pk: pk_bytes,
-        });
-    }
-    0
+        },
+    )
 }
 
 // ── commit ────────────────────────────────────────────────────────────────
 
 /// Replay all staged ops into a fresh core transaction and commit atomically.
 /// Returns 0 on success and writes the commit epoch into `out_epoch` (if
-/// non-null). On conflict, returns a negative [`ErrorCode::Conflict`] and the
-/// staged buffer is *not* cleared (the caller may adjust and retry, or
-/// rollback).
+/// non-null). Repeating commit on the same successfully committed handle is
+/// idempotent and returns the same epoch. On conflict, returns a negative
+/// [`ErrorCode::Conflict`] and the staged buffer is *not* cleared (the caller
+/// may adjust and retry, or rollback).
 ///
 /// # Safety
 /// `txn` must be a valid transaction handle; `out_epoch` if non-null must be a
@@ -307,34 +435,70 @@ pub unsafe extern "C" fn mongreldb_txn_commit(
         return ErrorCode::InvalidArgument.as_return();
     };
 
-    // Take the staged ops out of the buffer. On commit failure we'll put them
-    // back so the caller can retry.
-    let stage = match t.staging.lock() {
-        Ok(mut g) => std::mem::take(&mut *g),
+    // Take the staged ops out of the buffer. Only a known pre-commit failure
+    // may restore them. A durable or unknown outcome must never be retryable.
+    let mut state = match t.state.lock() {
+        Ok(state) => state,
         Err(_) => {
             return set_error_msg(ErrorCode::Unknown, "transaction buffer poisoned").as_return()
         }
     };
+    if let Some(error) = state.terminal_error.as_ref() {
+        if !out_epoch.is_null() {
+            *out_epoch = error.epoch;
+        }
+        return set_terminal_commit_error(error);
+    }
+    if let Some(epoch) = state.committed_epoch {
+        if !out_epoch.is_null() {
+            *out_epoch = epoch;
+        }
+        return 0;
+    }
+    if state.rolled_back {
+        return set_rolled_back_transaction_error();
+    }
+    let stage = std::mem::take(&mut state.staging);
 
     match apply_txn(&t.db, &stage) {
         Ok(epoch) => {
+            state.committed_epoch = Some(epoch.0);
             if !out_epoch.is_null() {
                 *out_epoch = epoch.0;
             }
             0
         }
-        Err(code) => {
-            // Put the ops back so the caller can retry after fixing the issue.
-            if let Ok(mut g) = t.staging.lock() {
-                *g = stage;
+        Err(error) => {
+            let terminal = match &error {
+                mongreldb_core::MongrelError::DurableCommit { epoch, .. } => {
+                    Some((ErrorCode::CommitOutcome, *epoch))
+                }
+                mongreldb_core::MongrelError::CommitOutcomeUnknown { epoch, .. } => {
+                    Some((ErrorCode::OutcomeUnknown, *epoch))
+                }
+                _ => None,
+            };
+            if let Some((code, epoch)) = terminal {
+                if !out_epoch.is_null() {
+                    *out_epoch = epoch;
+                }
+                state.terminal_error = Some(TerminalCommitError {
+                    code,
+                    epoch,
+                    outcome_known: code == ErrorCode::CommitOutcome,
+                    message: error.to_string(),
+                });
+            } else {
+                // A known pre-commit failure is safe to correct and retry.
+                state.staging = stage;
             }
-            code.as_return()
+            set_error(&error).as_return()
         }
     }
 }
 
 /// Replay the staged buffer into a fresh core transaction.
-fn apply_txn(db: &CoreDatabase, stage: &[StagedOp]) -> Result<Epoch, ErrorCode> {
+fn apply_txn(db: &CoreDatabase, stage: &[StagedOp]) -> mongreldb_core::Result<Epoch> {
     db.transaction_for_current_principal_with_epoch(|tx| {
         for op in stage {
             match op {
@@ -368,7 +532,6 @@ fn apply_txn(db: &CoreDatabase, stage: &[StagedOp]) -> Result<Epoch, ErrorCode> 
         Ok(())
     })
     .map(|(epoch, ())| epoch)
-    .map_err(|error| set_error(&error))
 }
 
 // Keep the `c_to_value` import reachable for symmetry with the table module

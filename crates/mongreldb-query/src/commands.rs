@@ -1,8 +1,10 @@
 use crate::{
     ExternalBaseWrite, ExternalModuleIndex, ExternalModuleRegistry, ExternalWriteOp,
-    MongrelProvider, MongrelQueryError, MongrelSession, RegisteredSqlQuery, Result,
-    SqlTestHookPoint,
+    MongrelProvider, MongrelQueryError, MongrelRecordBatchStream, MongrelSession,
+    RegisteredSqlQuery, Result, SqlQueryPhase, SqlTestHookPoint,
 };
+use aes_gcm::aead::{Aead, KeyInit, Payload};
+use aes_gcm::{Aes256Gcm, Nonce};
 use arrow::array::{ArrayRef, BooleanArray, Int64Array, StringArray};
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 use arrow::record_batch::RecordBatch;
@@ -34,12 +36,14 @@ use sqlparser::ast::{
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
+use sqlparser::tokenizer::{Token, Tokenizer};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-#[derive(Clone)]
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
 pub(crate) enum PendingSqlOp {
     Put {
         table: String,
@@ -49,6 +53,10 @@ pub(crate) enum PendingSqlOp {
         table: String,
         row_id: RowId,
     },
+    Truncate {
+        table: String,
+        changes: u64,
+    },
     ExternalState {
         table: String,
         state: Vec<u8>,
@@ -56,21 +64,583 @@ pub(crate) enum PendingSqlOp {
     },
 }
 
-const MAX_STAGED_SQL_OPS: usize = 10_000;
+const PENDING_SQL_OPS_MEMORY_LIMIT: usize = 1_024;
+const PENDING_SQL_OPS_MEMORY_BYTES_LIMIT: usize = 8 * 1024 * 1024;
+const PENDING_SQL_OP_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+const PENDING_SQL_OPS_TOTAL_BYTES_LIMIT: usize = 512 * 1024 * 1024;
+const PENDING_SQL_SPILL_AAD_DOMAIN: &[u8] = b"mongreldb-pending-sql-spill-v1";
+const ORDERED_DML_MAX_MATCHED_ROWS: usize = 100_000;
+const ORDERED_DML_MATCHED_ROW_BYTES_LIMIT: usize = 256 * 1024 * 1024;
+const ORDERED_DML_SORT_KEY_BYTES_LIMIT: usize = 64 * 1024 * 1024;
+const ORDERED_DML_SORT_RUN_ROWS: usize = 1_024;
+const FOREIGN_KEY_CHECK_MAX_ROW_VISITS: usize = 10_000_000;
+const FOREIGN_KEY_CHECK_KEY_BYTES_LIMIT: usize = 64 * 1024 * 1024;
+const FOREIGN_KEY_CHECK_TOTAL_KEY_BYTES_LIMIT: usize = 512 * 1024 * 1024;
+const FOREIGN_KEY_CHECK_PARENT_KEY_BYTES_LIMIT: usize = 64 * 1024 * 1024;
+const FOREIGN_KEY_CHECK_MAX_VIOLATIONS: usize = 100_000;
+const FOREIGN_KEY_CHECK_OUTPUT_BYTES_LIMIT: usize = 64 * 1024 * 1024;
+const CTAS_INPUT_BATCH_BYTES_LIMIT: usize = 256 * 1024 * 1024;
+const CTAS_STAGING_ROWS_LIMIT: usize = 256;
+const CTAS_STAGING_BYTES_LIMIT: usize = 64 * 1024 * 1024;
+const REBUILD_STAGING_BYTES_LIMIT: usize = 64 * 1024 * 1024;
+const INCREMENTAL_AGGREGATE_MAX_GROUPS: usize = 100_000;
+const INCREMENTAL_AGGREGATE_STATE_BYTES_LIMIT: usize = 256 * 1024 * 1024;
+const COMMAND_CHECKPOINT_ROWS: usize = 256;
 
-fn ensure_staging_capacity(current: usize, additional: usize) -> Result<()> {
-    if additional > MAX_STAGED_SQL_OPS.saturating_sub(current) {
-        return Err(MongrelQueryError::Schema(format!(
-            "SQL transaction exceeds limit of {MAX_STAGED_SQL_OPS} staged operations"
-        )));
+async fn next_command_batch(
+    stream: &mut MongrelRecordBatchStream,
+    query: &RegisteredSqlQuery,
+) -> Result<Option<RecordBatch>> {
+    use futures::StreamExt;
+
+    let item = tokio::select! {
+        biased;
+        _ = query.control().cancelled() => return match query.checkpoint() {
+            Err(error) => Err(error),
+            Ok(()) => Err(MongrelQueryError::InvalidQueryState(
+                "query cancellation signal resolved without cancellation".into(),
+            )),
+        },
+        item = stream.next() => item,
+    };
+    item.transpose()
+        .map_err(|error| MongrelQueryError::DataFusion(error.to_string()))
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PendingSqlOpsCheckpoint {
+    len: usize,
+    spill_len: Option<u64>,
+    memory_bytes: usize,
+    total_bytes: usize,
+}
+
+#[derive(Default)]
+pub(crate) struct PendingSqlOps {
+    memory: Vec<PendingSqlOp>,
+    spill: Option<PendingSqlSpill>,
+    len: usize,
+    memory_bytes: usize,
+    total_bytes: usize,
+}
+
+struct PendingSqlSpill {
+    file: std::fs::File,
+    cipher: Aes256Gcm,
+    nonce_prefix: [u8; 4],
+    next_nonce: u64,
+    frame_count: u64,
+}
+
+impl PendingSqlSpill {
+    fn new() -> Result<Self> {
+        let mut key = [0_u8; 32];
+        getrandom::getrandom(&mut key)
+            .map_err(|error| MongrelQueryError::InvalidQueryState(error.to_string()))?;
+        let cipher = Aes256Gcm::new_from_slice(&key)
+            .map_err(|error| MongrelQueryError::InvalidQueryState(error.to_string()))?;
+        key.fill(0);
+        let mut nonce_prefix = [0_u8; 4];
+        getrandom::getrandom(&mut nonce_prefix)
+            .map_err(|error| MongrelQueryError::InvalidQueryState(error.to_string()))?;
+        Ok(Self {
+            file: tempfile::tempfile().map_err(mongreldb_core::MongrelError::from)?,
+            cipher,
+            nonce_prefix,
+            next_nonce: 0,
+            frame_count: 0,
+        })
     }
-    Ok(())
+
+    fn append(&mut self, op: &PendingSqlOp) -> Result<()> {
+        let plaintext = bincode::serialize(op).map_err(mongreldb_core::MongrelError::from)?;
+        self.append_serialized(&plaintext)
+    }
+
+    fn append_serialized(&mut self, plaintext: &[u8]) -> Result<()> {
+        if plaintext.len() > PENDING_SQL_OP_MAX_FRAME_BYTES {
+            return Err(MongrelQueryError::Core(
+                mongreldb_core::MongrelError::ResourceLimitExceeded {
+                    resource: "staged SQL operation bytes",
+                    requested: plaintext.len(),
+                    limit: PENDING_SQL_OP_MAX_FRAME_BYTES,
+                },
+            ));
+        }
+        let nonce_counter = self.next_nonce;
+        let mut nonce = [0_u8; 12];
+        nonce[..4].copy_from_slice(&self.nonce_prefix);
+        nonce[4..].copy_from_slice(&nonce_counter.to_be_bytes());
+        self.next_nonce = self.next_nonce.checked_add(1).ok_or_else(|| {
+            MongrelQueryError::InvalidQueryState("SQL transaction spill nonce exhausted".into())
+        })?;
+        let ciphertext_len = plaintext.len().checked_add(16).ok_or_else(|| {
+            MongrelQueryError::InvalidQueryState("SQL transaction spill frame too large".into())
+        })?;
+        let frame_len = u32::try_from(ciphertext_len).map_err(|_| {
+            MongrelQueryError::InvalidQueryState("SQL transaction spill frame too large".into())
+        })?;
+        let aad = pending_sql_spill_aad(self.frame_count, frame_len, nonce_counter);
+        let ciphertext = self
+            .cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: plaintext,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| {
+                MongrelQueryError::InvalidQueryState(
+                    "failed to encrypt SQL transaction spill".into(),
+                )
+            })?;
+        debug_assert_eq!(ciphertext.len(), ciphertext_len);
+        self.file
+            .seek(SeekFrom::End(0))
+            .map_err(mongreldb_core::MongrelError::from)?;
+        self.file
+            .write_all(&frame_len.to_le_bytes())
+            .and_then(|_| self.file.write_all(&nonce))
+            .and_then(|_| self.file.write_all(&ciphertext))
+            .map_err(mongreldb_core::MongrelError::from)?;
+        self.frame_count = self.frame_count.checked_add(1).ok_or_else(|| {
+            MongrelQueryError::InvalidQueryState(
+                "SQL transaction spill frame count overflow".into(),
+            )
+        })?;
+        Ok(())
+    }
+}
+
+fn pending_sql_spill_aad(frame_index: u64, frame_len: u32, nonce_counter: u64) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(PENDING_SQL_SPILL_AAD_DOMAIN.len() + 20);
+    aad.extend_from_slice(PENDING_SQL_SPILL_AAD_DOMAIN);
+    aad.extend_from_slice(&frame_index.to_be_bytes());
+    aad.extend_from_slice(&frame_len.to_be_bytes());
+    aad.extend_from_slice(&nonce_counter.to_be_bytes());
+    aad
+}
+
+impl PendingSqlOps {
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub(crate) fn push(&mut self, op: PendingSqlOp) -> Result<()> {
+        let encoded = bincode::serialize(&op).map_err(mongreldb_core::MongrelError::from)?;
+        if encoded.len() > PENDING_SQL_OP_MAX_FRAME_BYTES {
+            return Err(MongrelQueryError::Core(
+                mongreldb_core::MongrelError::ResourceLimitExceeded {
+                    resource: "staged SQL operation bytes",
+                    requested: encoded.len(),
+                    limit: PENDING_SQL_OP_MAX_FRAME_BYTES,
+                },
+            ));
+        }
+        let total_bytes = self.total_bytes.checked_add(encoded.len()).ok_or_else(|| {
+            MongrelQueryError::InvalidQueryState(
+                "SQL transaction staged byte count overflow".into(),
+            )
+        })?;
+        if total_bytes > PENDING_SQL_OPS_TOTAL_BYTES_LIMIT {
+            return Err(MongrelQueryError::Core(
+                mongreldb_core::MongrelError::ResourceLimitExceeded {
+                    resource: "staged SQL transaction bytes",
+                    requested: total_bytes,
+                    limit: PENDING_SQL_OPS_TOTAL_BYTES_LIMIT,
+                },
+            ));
+        }
+        if let Some(spill) = self.spill.as_mut() {
+            spill.append_serialized(&encoded)?;
+        } else if self.memory.len() < PENDING_SQL_OPS_MEMORY_LIMIT
+            && self.memory_bytes.saturating_add(encoded.len()) <= PENDING_SQL_OPS_MEMORY_BYTES_LIMIT
+        {
+            self.memory_bytes = self.memory_bytes.saturating_add(encoded.len());
+            self.memory.push(op);
+        } else {
+            let mut spill = PendingSqlSpill::new()?;
+            for staged in &self.memory {
+                spill.append(staged)?;
+            }
+            spill.append_serialized(&encoded)?;
+            self.memory.clear();
+            self.memory_bytes = 0;
+            self.spill = Some(spill);
+        }
+        self.len = self.len.saturating_add(1);
+        self.total_bytes = total_bytes;
+        Ok(())
+    }
+
+    pub(crate) fn extend(&mut self, ops: impl IntoIterator<Item = PendingSqlOp>) -> Result<()> {
+        for op in ops {
+            self.push(op)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn from_vec(ops: Vec<PendingSqlOp>) -> Result<Self> {
+        let mut staged = Self::default();
+        staged.extend(ops)?;
+        Ok(staged)
+    }
+
+    pub(crate) fn append_from(
+        &mut self,
+        other: &mut Self,
+        query: &RegisteredSqlQuery,
+    ) -> Result<()> {
+        query.checkpoint()?;
+        for (index, op) in other.reader()?.enumerate() {
+            if index & 63 == 0 {
+                query.checkpoint()?;
+            }
+            self.push(op?)?;
+        }
+        query.checkpoint()?;
+        Ok(())
+    }
+
+    pub(crate) fn checkpoint(&mut self) -> Result<PendingSqlOpsCheckpoint> {
+        let spill_len = if let Some(spill) = self.spill.as_mut() {
+            let file = &mut spill.file;
+            file.flush().map_err(mongreldb_core::MongrelError::from)?;
+            Some(
+                file.seek(SeekFrom::End(0))
+                    .map_err(mongreldb_core::MongrelError::from)?,
+            )
+        } else {
+            None
+        };
+        Ok(PendingSqlOpsCheckpoint {
+            len: self.len,
+            spill_len,
+            memory_bytes: self.memory_bytes,
+            total_bytes: self.total_bytes,
+        })
+    }
+
+    pub(crate) fn truncate(&mut self, checkpoint: PendingSqlOpsCheckpoint) -> Result<()> {
+        if let Some(spill_len) = checkpoint.spill_len {
+            let spill = self.spill.as_mut().ok_or_else(|| {
+                MongrelQueryError::InvalidQueryState(
+                    "SQL transaction spill disappeared before rollback".into(),
+                )
+            })?;
+            spill
+                .file
+                .set_len(spill_len)
+                .map_err(mongreldb_core::MongrelError::from)?;
+            spill
+                .file
+                .seek(SeekFrom::End(0))
+                .map_err(mongreldb_core::MongrelError::from)?;
+            spill.frame_count = u64::try_from(checkpoint.len).map_err(|_| {
+                MongrelQueryError::InvalidQueryState(
+                    "SQL transaction spill frame count overflow".into(),
+                )
+            })?;
+            self.memory.clear();
+            self.memory_bytes = 0;
+        } else if self.spill.is_some() {
+            let mut kept = Vec::with_capacity(checkpoint.len);
+            let mut reader = self.reader()?;
+            for _ in 0..checkpoint.len {
+                kept.push(reader.next().ok_or_else(|| {
+                    MongrelQueryError::InvalidQueryState(
+                        "SQL transaction spill ended before rollback checkpoint".into(),
+                    )
+                })??);
+            }
+            self.spill = None;
+            self.memory_bytes = kept
+                .iter()
+                .map(|op| bincode::serialized_size(op).unwrap_or(u64::MAX))
+                .try_fold(0_usize, |total, size| {
+                    usize::try_from(size)
+                        .ok()
+                        .and_then(|size| total.checked_add(size))
+                })
+                .ok_or_else(|| {
+                    MongrelQueryError::InvalidQueryState(
+                        "SQL transaction spill rollback size overflow".into(),
+                    )
+                })?;
+            self.memory = kept;
+        } else {
+            self.memory.truncate(checkpoint.len);
+            self.memory_bytes = checkpoint.memory_bytes;
+        }
+        self.len = checkpoint.len;
+        self.total_bytes = checkpoint.total_bytes;
+        Ok(())
+    }
+
+    pub(crate) fn reader(&mut self) -> Result<PendingSqlOpReader> {
+        if let Some(spill) = self.spill.as_mut() {
+            spill
+                .file
+                .flush()
+                .map_err(mongreldb_core::MongrelError::from)?;
+            let mut file = spill
+                .file
+                .try_clone()
+                .map_err(mongreldb_core::MongrelError::from)?;
+            file.seek(SeekFrom::Start(0))
+                .map_err(mongreldb_core::MongrelError::from)?;
+            Ok(PendingSqlOpReader::Spill {
+                reader: Box::new(BufReader::new(file)),
+                cipher: Box::new(spill.cipher.clone()),
+                nonce_prefix: spill.nonce_prefix,
+                frame_index: 0,
+                previous_nonce: None,
+                remaining: self.len,
+            })
+        } else {
+            Ok(PendingSqlOpReader::Memory(self.memory.clone().into_iter()))
+        }
+    }
+}
+
+pub(crate) enum PendingSqlOpReader {
+    Memory(std::vec::IntoIter<PendingSqlOp>),
+    Spill {
+        reader: Box<BufReader<std::fs::File>>,
+        cipher: Box<Aes256Gcm>,
+        nonce_prefix: [u8; 4],
+        frame_index: u64,
+        previous_nonce: Option<u64>,
+        remaining: usize,
+    },
+}
+
+impl Iterator for PendingSqlOpReader {
+    type Item = Result<PendingSqlOp>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Memory(iter) => iter.next().map(Ok),
+            Self::Spill {
+                reader,
+                cipher,
+                nonce_prefix,
+                frame_index,
+                previous_nonce,
+                remaining,
+            } => {
+                if *remaining == 0 {
+                    return None;
+                }
+                *remaining -= 1;
+                let result = (|| {
+                    let mut frame_len = [0_u8; 4];
+                    reader
+                        .read_exact(&mut frame_len)
+                        .map_err(mongreldb_core::MongrelError::from)?;
+                    let frame_len = u32::from_le_bytes(frame_len) as usize;
+                    if frame_len > PENDING_SQL_OP_MAX_FRAME_BYTES + 16 {
+                        return Err(MongrelQueryError::InvalidQueryState(
+                            "SQL transaction spill frame exceeds limit".into(),
+                        ));
+                    }
+                    let mut nonce = [0_u8; 12];
+                    reader
+                        .read_exact(&mut nonce)
+                        .map_err(mongreldb_core::MongrelError::from)?;
+                    if nonce[..4] != *nonce_prefix {
+                        return Err(MongrelQueryError::InvalidQueryState(
+                            "SQL transaction spill nonce prefix mismatch".into(),
+                        ));
+                    }
+                    let nonce_counter = u64::from_be_bytes(nonce[4..].try_into().unwrap());
+                    if previous_nonce.is_some_and(|previous| nonce_counter <= previous) {
+                        return Err(MongrelQueryError::InvalidQueryState(
+                            "SQL transaction spill nonce order invalid".into(),
+                        ));
+                    }
+                    let mut ciphertext = vec![0_u8; frame_len];
+                    reader
+                        .read_exact(&mut ciphertext)
+                        .map_err(mongreldb_core::MongrelError::from)?;
+                    let aad = pending_sql_spill_aad(*frame_index, frame_len as u32, nonce_counter);
+                    let plaintext = cipher
+                        .decrypt(
+                            Nonce::from_slice(&nonce),
+                            Payload {
+                                msg: &ciphertext,
+                                aad: &aad,
+                            },
+                        )
+                        .map_err(|_| {
+                            MongrelQueryError::InvalidQueryState(
+                                "SQL transaction spill authentication failed".into(),
+                            )
+                        })?;
+                    *previous_nonce = Some(nonce_counter);
+                    *frame_index = frame_index.checked_add(1).ok_or_else(|| {
+                        MongrelQueryError::InvalidQueryState(
+                            "SQL transaction spill frame count overflow".into(),
+                        )
+                    })?;
+                    bincode::deserialize(&plaintext)
+                        .map_err(mongreldb_core::MongrelError::from)
+                        .map_err(Into::into)
+                })();
+                Some(result)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RollbackKind {
+    Full,
+    Savepoint,
 }
 
 fn enter_commit_fence(session: &MongrelSession, query: &RegisteredSqlQuery) -> Result<()> {
     session.fire_test_hook(SqlTestHookPoint::BeforeCommitFence);
     query.enter_commit_critical()?;
     session.fire_test_hook(SqlTestHookPoint::InsideCommitCritical);
+    Ok(())
+}
+
+fn restore_failed_commit(session: &MongrelSession, ops: PendingSqlOps, transaction_open: bool) {
+    if transaction_open {
+        let mut transaction = session.transaction.lock();
+        transaction.staged_ops = Some(ops);
+        transaction.aborted = true;
+    }
+}
+
+fn post_commit_result<T>(query: &RegisteredSqlQuery, result: Result<T>) -> Result<T> {
+    result.map_err(|error| {
+        if matches!(
+            error,
+            MongrelQueryError::CommitOutcome { .. } | MongrelQueryError::OutcomeUnknown { .. }
+        ) {
+            return error;
+        }
+        let status = query.status();
+        if status.durable_outcome.last_commit_statement_index == Some(status.statement_index) {
+            query.commit_outcome_error(error.to_string())
+        } else {
+            error
+        }
+    })
+}
+
+fn uncertain_fenced_error(
+    session: &MongrelSession,
+    query: &RegisteredSqlQuery,
+    error: mongreldb_core::MongrelError,
+) -> MongrelQueryError {
+    match error {
+        mongreldb_core::MongrelError::DurableCommit { epoch, message } => {
+            query.record_commit(query.status().statement_index, epoch);
+            let exit_error = query.exit_commit_critical().err();
+            session.fire_test_hook(SqlTestHookPoint::AfterDurableCommit);
+            query.commit_outcome_error(match exit_error {
+                Some(error) => format!("{message}; {error}"),
+                None => message,
+            })
+        }
+        error => {
+            let exit_error = query.exit_commit_critical().err();
+            query.outcome_unknown_error(exit_error.map_or_else(
+                || error.to_string(),
+                |exit_error| format!("{error}; {exit_error}"),
+            ))
+        }
+    }
+}
+
+fn run_controlled_durable_with_optional_epoch<T>(
+    session: &MongrelSession,
+    query: &RegisteredSqlQuery,
+    action: impl FnOnce(
+        &mut dyn FnMut() -> mongreldb_core::Result<()>,
+    ) -> mongreldb_core::Result<(T, Option<u64>)>,
+) -> Result<T> {
+    query.checkpoint()?;
+    let fenced = std::cell::Cell::new(false);
+    let mut before_publish = || {
+        enter_commit_fence(session, query).map_err(query_error_to_core)?;
+        fenced.set(true);
+        Ok(())
+    };
+    let result = action(&mut before_publish);
+
+    match result {
+        Ok((value, None)) if !fenced.get() => {
+            query.checkpoint()?;
+            Ok(value)
+        }
+        Ok((value, Some(epoch))) if fenced.get() => {
+            query.record_commit(query.status().statement_index, epoch);
+            if let Err(error) = query.exit_commit_critical() {
+                return Err(query.commit_outcome_error(error.to_string()));
+            }
+            session.fire_test_hook(SqlTestHookPoint::AfterDurableCommit);
+            Ok(value)
+        }
+        Ok((_value, epoch)) => {
+            if query.status().phase == SqlQueryPhase::CommitCritical {
+                let _ = query.exit_commit_critical();
+            }
+            Err(query.outcome_unknown_error(format!(
+                "controlled durable write returned inconsistent fence/epoch state (fenced={}, epoch={epoch:?})",
+                fenced.get()
+            )))
+        }
+        Err(mongreldb_core::MongrelError::DurableCommit { epoch, message }) => {
+            query.record_commit(query.status().statement_index, epoch);
+            if query.status().phase == SqlQueryPhase::CommitCritical {
+                if let Err(error) = query.exit_commit_critical() {
+                    return Err(query.commit_outcome_error(format!("{message}; {error}")));
+                }
+            }
+            session.fire_test_hook(SqlTestHookPoint::AfterDurableCommit);
+            query.checkpoint()?;
+            Err(query.commit_outcome_error(message))
+        }
+        Err(error) if fenced.get() || query.status().phase == SqlQueryPhase::CommitCritical => {
+            Err(uncertain_fenced_error(session, query, error))
+        }
+        Err(error) => {
+            query.checkpoint()?;
+            Err(error.into())
+        }
+    }
+}
+
+fn run_controlled_durable_with_epoch<T>(
+    session: &MongrelSession,
+    query: &RegisteredSqlQuery,
+    action: impl FnOnce(
+        &mut dyn FnMut() -> mongreldb_core::Result<()>,
+    ) -> mongreldb_core::Result<(T, u64)>,
+) -> Result<T> {
+    run_controlled_durable_with_optional_epoch(session, query, |before_publish| {
+        action(before_publish).map(|(value, epoch)| (value, Some(epoch)))
+    })
+}
+
+fn command_checkpoint(
+    session: &MongrelSession,
+    query: &RegisteredSqlQuery,
+    index: usize,
+) -> Result<()> {
+    if index % COMMAND_CHECKPOINT_ROWS == 0 {
+        session.fire_test_hook(SqlTestHookPoint::BeforeScanBatch);
+        query.checkpoint()?;
+    }
     Ok(())
 }
 
@@ -90,7 +660,7 @@ pub(crate) async fn try_run_command(
     // (it mis-handles column aliases on the base case). Intercept and evaluate
     // iteratively using the standard naive recursive-evaluation algorithm.
     if lower.starts_with("with recursive ") {
-        return try_recursive_cte(session, trimmed).await;
+        return try_recursive_cte(session, trimmed, query).await;
     }
 
     if lower.starts_with("refresh materialized view ") {
@@ -100,14 +670,14 @@ pub(crate) async fn try_run_command(
                 "REFRESH MATERIALIZED VIEW requires one unqualified name".into(),
             ));
         }
-        refresh_materialized_view(session, name).await?;
+        refresh_materialized_view(session, name, query).await?;
         return Ok(Some(Vec::new()));
     }
 
     if let Some(batch) = try_manual_command(session, trimmed, &lower, query)? {
         return Ok(Some(batch));
     }
-    if !should_parse(&lower) {
+    if !should_parse(trimmed) {
         return Ok(None);
     }
 
@@ -124,41 +694,30 @@ pub(crate) async fn try_run_command(
         ));
     }
 
+    let statement = statements.into_iter().next().ok_or_else(|| {
+        MongrelQueryError::InvalidQueryState("SQL parser returned no statement".into())
+    })?;
+    if session.database.is_none()
+        && matches!(
+            &statement,
+            Statement::Savepoint { .. }
+                | Statement::ReleaseSavepoint { .. }
+                | Statement::Rollback {
+                    savepoint: Some(_),
+                    ..
+                }
+        )
+    {
+        return Err(MongrelQueryError::NoSqlTransaction);
+    }
     let Some(db) = session.database.as_ref() else {
         return Ok(None);
     };
 
-    let statement = statements.into_iter().next().unwrap();
-    let ddl_fence = matches!(
-        &statement,
-        Statement::CreateTable(_)
-            | Statement::CreateVirtualTable { .. }
-            | Statement::CreateTrigger(_)
-            | Statement::DropTrigger(_)
-            | Statement::CreatePolicy(_)
-            | Statement::DropPolicy(_)
-            | Statement::AlterTable(_)
-            | Statement::CreateIndex(_)
-            | Statement::CreateView(_)
-            | Statement::Analyze(_)
-            | Statement::Vacuum(_)
-    ) || matches!(
-        &statement,
-        Statement::Drop {
-            object_type: ObjectType::Table
-                | ObjectType::View
-                | ObjectType::MaterializedView
-                | ObjectType::Index,
-            ..
-        }
-    );
-    if ddl_fence {
-        enter_commit_fence(session, query)?;
-    }
     let out = match statement {
         Statement::CreateTable(create) => {
             require_ddl(session, db)?;
-            create_table(session, db, &create, ttl_clause.as_ref()).await?;
+            create_table(session, db, &create, ttl_clause.as_ref(), query).await?;
             Vec::new()
         }
         Statement::CreateVirtualTable {
@@ -175,27 +734,28 @@ pub(crate) async fn try_run_command(
                 if_not_exists,
                 module_name.value,
                 module_args.into_iter().map(|arg| arg.value).collect(),
+                query,
             )?;
             Vec::new()
         }
         Statement::CreateTrigger(trigger) => {
             require_ddl(session, db)?;
-            create_trigger(session, db, trigger)?;
+            create_trigger(session, db, trigger, query)?;
             session.clear_cache();
             Vec::new()
         }
         Statement::DropTrigger(drop) => {
             require_ddl(session, db)?;
-            drop_trigger(db, drop)?;
+            drop_trigger(session, db, drop, query)?;
             session.clear_cache();
             Vec::new()
         }
         Statement::CreatePolicy(policy) => {
-            create_policy(session, db, policy)?;
+            create_policy(session, db, policy, query)?;
             Vec::new()
         }
         Statement::DropPolicy(policy) => {
-            drop_policy(session, db, policy)?;
+            drop_policy(session, db, policy, query)?;
             Vec::new()
         }
         Statement::Drop {
@@ -209,24 +769,30 @@ pub(crate) async fn try_run_command(
             match object_type {
                 ObjectType::Table => {
                     for name in names {
-                        drop_table(session, db, &object_name(&name)?, if_exists)?;
+                        drop_table(session, db, &object_name(&name)?, if_exists, query)?;
                     }
                     Vec::new()
                 }
                 ObjectType::View => {
                     for name in names {
-                        drop_view(session, db, &object_name(&name)?, if_exists)?;
+                        drop_view(session, db, &object_name(&name)?, if_exists, query)?;
                     }
                     Vec::new()
                 }
                 ObjectType::MaterializedView => {
                     for name in names {
-                        drop_materialized_view(session, db, &object_name(&name)?, if_exists)?;
+                        drop_materialized_view(
+                            session,
+                            db,
+                            &object_name(&name)?,
+                            if_exists,
+                            query,
+                        )?;
                     }
                     Vec::new()
                 }
                 ObjectType::Index => {
-                    drop_index(session, db, names, table, if_exists)?;
+                    drop_index(session, db, names, table, if_exists, query)?;
                     Vec::new()
                 }
                 _ => return Ok(None),
@@ -234,102 +800,217 @@ pub(crate) async fn try_run_command(
         }
         Statement::AlterTable(alter) => {
             require_ddl(session, db)?;
-            alter_table(session, db, alter)?;
+            alter_table(session, db, alter, query)?;
             Vec::new()
         }
         Statement::CreateIndex(index) => {
             require_ddl(session, db)?;
-            create_index(session, db, index)?;
+            create_index(session, db, index, query)?;
             Vec::new()
         }
         Statement::CreateView(view) => {
             require_ddl(session, db)?;
-            create_view(session, view).await?;
+            create_view(session, view, query).await?;
             Vec::new()
         }
         Statement::Insert(insert) => {
-            insert_rows(session, db, insert)?;
+            insert_rows(session, db, insert, query)?;
             Vec::new()
         }
         Statement::Update(update) => {
-            update_rows(session, db, update).await?;
+            update_rows(session, db, update, query).await?;
             Vec::new()
         }
         Statement::Delete(delete) => {
-            delete_rows(session, db, delete).await?;
+            delete_rows(session, db, delete, query).await?;
             Vec::new()
         }
         Statement::Truncate(truncate) => {
-            truncate_tables(session, db, truncate)?;
+            truncate_tables(session, db, truncate, query)?;
             Vec::new()
         }
         Statement::StartTransaction { .. } => {
-            let mut staged = session.sql_txn.lock();
-            if staged.is_some() {
+            let mut transaction = session.transaction.lock();
+            if transaction.staged_ops.is_some() {
                 return Err(MongrelQueryError::Schema(
                     "a SQL transaction is already open".into(),
                 ));
             }
-            *staged = Some(Vec::new());
-            *session.sql_txn_aborted.lock() = false;
-            session.savepoints.lock().clear();
+            transaction.staged_ops = Some(PendingSqlOps::default());
+            transaction.aborted = false;
+            transaction.savepoints.clear();
             Vec::new()
         }
-        Statement::Commit { .. } => {
-            if *session.sql_txn_aborted.lock() {
-                return Err(MongrelQueryError::TransactionAborted);
+        Statement::Commit { chain, .. } => {
+            if chain {
+                return Err(MongrelQueryError::Schema(
+                    "COMMIT AND CHAIN is not supported".into(),
+                ));
             }
-            enter_commit_fence(session, query)?;
-            let ops = session.sql_txn.lock().take().unwrap_or_default();
-            let changes = logical_changes(&ops);
-            let external_tables = external_tables_to_refresh(db, &ops);
-            if let Err(error) = apply_ops(session, db, ops.clone()) {
-                *session.sql_txn.lock() = Some(ops);
-                *session.sql_txn_aborted.lock() = true;
-                query.exit_commit_critical()?;
-                return Err(error);
+            let mut empty_ops = PendingSqlOps::default();
+            let (mut ops, transaction_open, changes, external_tables) = {
+                let mut transaction = session.transaction.lock();
+                if transaction.aborted {
+                    return Err(MongrelQueryError::TransactionAborted);
+                }
+                let transaction_open = transaction.staged_ops.is_some();
+                let preparation = {
+                    let ops = transaction.staged_ops.as_mut().unwrap_or(&mut empty_ops);
+                    session.fire_test_hook(SqlTestHookPoint::BeforeScanBatch);
+                    (|| {
+                        let changes = logical_changes_spooled(ops, query)?;
+                        let external_tables = external_tables_to_refresh_spooled(db, ops, query)?;
+                        Ok((changes, external_tables))
+                    })()
+                };
+                let (changes, external_tables) = match preparation {
+                    Ok(preparation) => preparation,
+                    Err(error) => {
+                        transaction.aborted = transaction_open;
+                        return Err(error);
+                    }
+                };
+                (
+                    transaction.staged_ops.take().unwrap_or_default(),
+                    transaction_open,
+                    changes,
+                    external_tables,
+                )
+            };
+            let epoch = match apply_ops(session, db, &mut ops, query) {
+                Ok(epoch) => epoch,
+                Err(error) => {
+                    if matches!(&error, MongrelQueryError::OutcomeUnknown { .. }) {
+                        // The commit fence was crossed, so replaying these
+                        // staged operations could duplicate a commit whose
+                        // acknowledgement was lost. Discard every savepoint
+                        // and let the statement guard leave the transaction
+                        // aborted until a full ROLLBACK.
+                        *session.transaction.lock() = Default::default();
+                        return Err(error);
+                    }
+                    if matches!(
+                        &error,
+                        MongrelQueryError::CommitOutcome {
+                            committed: true,
+                            ..
+                        }
+                    ) {
+                        *session.transaction.lock() = Default::default();
+                        if let Err(refresh_error) =
+                            sync_committed_statement(session, db, &external_tables, changes, None)
+                        {
+                            if matches!(
+                                &refresh_error,
+                                MongrelQueryError::QueryCancelled { .. }
+                                    | MongrelQueryError::DeadlineExceeded { .. }
+                            ) {
+                                return Err(refresh_error);
+                            }
+                            return Err(query.commit_outcome_error(format!(
+                                "{error}; external table refresh failed: {refresh_error}"
+                            )));
+                        }
+                        return Err(error);
+                    }
+                    restore_failed_commit(session, ops, transaction_open);
+                    return Err(error);
+                }
+            };
+            let committed = epoch.is_some();
+            if let Some(epoch) = epoch {
+                query.record_commit(query.status().statement_index, epoch.0);
+                if let Err(error) = query.exit_commit_critical() {
+                    return Err(query.commit_outcome_error(error.to_string()));
+                }
+                session.fire_test_hook(SqlTestHookPoint::AfterDurableCommit);
             }
-            query.mark_committed();
-            if let Err(error) = refresh_external_tables(session, db, &external_tables) {
-                *session.sql_txn_aborted.lock() = false;
-                session.savepoints.lock().clear();
-                return Err(MongrelQueryError::CommitOutcome {
-                    query_id: query.id(),
-                    committed: true,
-                    message: error.to_string(),
-                });
+            *session.transaction.lock() = Default::default();
+            if let Err(error) =
+                sync_committed_statement(session, db, &external_tables, changes, None)
+            {
+                if !committed {
+                    return Err(error);
+                }
+                if matches!(
+                    &error,
+                    MongrelQueryError::QueryCancelled { .. }
+                        | MongrelQueryError::DeadlineExceeded { .. }
+                ) {
+                    return Err(error);
+                }
+                return Err(query.commit_outcome_error(error.to_string()));
             }
-            *session.sql_txn_aborted.lock() = false;
-            session.savepoints.lock().clear();
-            session.sql_fn_state.record_changes(changes, None);
-            session.clear_cache();
+            query.checkpoint()?;
             Vec::new()
         }
-        Statement::Rollback { .. } => {
-            session.sql_txn.lock().take();
-            *session.sql_txn_aborted.lock() = false;
-            session.savepoints.lock().clear();
+        Statement::Rollback { chain, savepoint } => {
+            if chain {
+                return Err(MongrelQueryError::Schema(
+                    "ROLLBACK AND CHAIN is not supported".into(),
+                ));
+            }
+            if let Some(name) = savepoint {
+                let name = savepoint_name(&name);
+                let mut transaction = session.transaction.lock();
+                if transaction.staged_ops.is_none() {
+                    return Err(MongrelQueryError::NoSqlTransaction);
+                }
+                let pos = transaction
+                    .savepoints
+                    .iter()
+                    .rposition(|(candidate, _)| candidate == &name)
+                    .ok_or_else(|| MongrelQueryError::SavepointNotFound { name: name.clone() })?;
+                let checkpoint = transaction.savepoints[pos].1;
+                if let Some(ops) = transaction.staged_ops.as_mut() {
+                    ops.truncate(checkpoint)?;
+                }
+                transaction.savepoints.truncate(pos + 1);
+                transaction.aborted = false;
+            } else {
+                *session.transaction.lock() = Default::default();
+            }
+            Vec::new()
+        }
+        Statement::Savepoint { name } => {
+            let name = savepoint_name(&name);
+            let mut transaction = session.transaction.lock();
+            let checkpoint = transaction
+                .staged_ops
+                .as_mut()
+                .ok_or(MongrelQueryError::NoSqlTransaction)?
+                .checkpoint()?;
+            transaction.savepoints.push((name, checkpoint));
+            Vec::new()
+        }
+        Statement::ReleaseSavepoint { name } => {
+            let name = savepoint_name(&name);
+            let mut transaction = session.transaction.lock();
+            if transaction.staged_ops.is_none() {
+                return Err(MongrelQueryError::NoSqlTransaction);
+            }
+            let pos = transaction
+                .savepoints
+                .iter()
+                .rposition(|(candidate, _)| candidate == &name)
+                .ok_or_else(|| MongrelQueryError::SavepointNotFound { name: name.clone() })?;
+            transaction.savepoints.truncate(pos);
             Vec::new()
         }
         Statement::Analyze(_) => {
             require_ddl(session, db)?;
-            analyze_all(db)?;
+            analyze_all(session, db, query)?;
             session.clear_cache();
             Vec::new()
         }
         Statement::Vacuum(_) => {
             require_ddl(session, db)?;
-            compact_all(db)?;
+            compact_all(session, db, query)?;
             session.clear_cache();
             Vec::new()
         }
         _ => return Ok(None),
     };
-
-    if ddl_fence {
-        query.mark_committed();
-        query.exit_commit_critical()?;
-    }
 
     Ok(Some(out))
 }
@@ -425,37 +1106,59 @@ fn parse_ttl_duration(input: &str) -> Result<u64> {
         .ok_or_else(|| MongrelQueryError::Schema("TTL duration is too large".into()))
 }
 
-fn should_parse(lower: &str) -> bool {
-    [
-        "create table",
-        "create virtual table",
-        "create trigger",
-        "create or replace trigger",
-        "drop table",
-        "drop trigger",
-        "alter table",
-        "create index",
-        "drop index",
-        "create view",
-        "drop view",
-        "create materialized view",
-        "drop materialized view",
-        "create policy",
-        "drop policy",
-        "insert",
-        "replace",
-        "update",
-        "delete",
-        "truncate",
-        "begin",
-        "start transaction",
-        "commit",
-        "rollback",
-        "analyze",
-        "vacuum",
-    ]
-    .iter()
-    .any(|prefix| lower.starts_with(prefix))
+fn should_parse(sql: &str) -> bool {
+    let Ok(tokens) = Tokenizer::new(&GenericDialect {}, sql).tokenize() else {
+        return false;
+    };
+    let Some(Token::Word(word)) = tokens
+        .iter()
+        .find(|token| !matches!(token, Token::Whitespace(_)))
+    else {
+        return false;
+    };
+    matches!(
+        word.value.to_ascii_lowercase().as_str(),
+        "create"
+            | "drop"
+            | "alter"
+            | "insert"
+            | "replace"
+            | "update"
+            | "delete"
+            | "truncate"
+            | "begin"
+            | "start"
+            | "commit"
+            | "rollback"
+            | "savepoint"
+            | "release"
+            | "analyze"
+            | "vacuum"
+    )
+}
+
+pub(crate) fn rollback_kind(sql: &str) -> Option<RollbackKind> {
+    let statements = Parser::parse_sql(&GenericDialect {}, sql).ok()?;
+    if statements.len() != 1 {
+        return None;
+    }
+    match &statements[0] {
+        Statement::Rollback {
+            savepoint: Some(_), ..
+        } => Some(RollbackKind::Savepoint),
+        Statement::Rollback {
+            savepoint: None, ..
+        } => Some(RollbackKind::Full),
+        _ => None,
+    }
+}
+
+fn savepoint_name(name: &Ident) -> String {
+    if name.quote_style.is_some() {
+        name.value.clone()
+    } else {
+        name.value.to_ascii_lowercase()
+    }
 }
 
 fn require_ddl(session: &MongrelSession, db: &Arc<Database>) -> Result<()> {
@@ -472,48 +1175,7 @@ fn try_manual_command(
     lower: &str,
     query: &RegisteredSqlQuery,
 ) -> Result<Option<Vec<RecordBatch>>> {
-    if !manual_command_is_durable(lower) {
-        return try_manual_command_body(session, sql, lower, query);
-    }
-    enter_commit_fence(session, query)?;
-    let result = try_manual_command_body(session, sql, lower, query);
-    if result.is_ok() {
-        query.mark_committed();
-    }
-    query.exit_commit_critical()?;
-    result
-}
-
-fn manual_command_is_durable(lower: &str) -> bool {
-    [
-        "create user ",
-        "alter user ",
-        "drop user ",
-        "create role ",
-        "drop role ",
-        "grant ",
-        "revoke ",
-        "create mask ",
-        "drop mask ",
-        "create virtual table ",
-        "create trigger if not exists ",
-        "create procedure ",
-        "create or replace procedure ",
-        "drop procedure ",
-        "call ",
-        "doctor",
-        "vacuum into ",
-        "compact",
-        "vacuum",
-        "analyze",
-        "reindex",
-    ]
-    .iter()
-    .any(|prefix| lower.starts_with(prefix))
-        || (lower.starts_with("pragma ")
-            && (lower.contains('=')
-                || lower.starts_with("pragma optimize")
-                || lower.starts_with("pragma wal_checkpoint")))
+    try_manual_command_body(session, sql, lower, query)
 }
 
 fn try_manual_command_body(
@@ -579,11 +1241,11 @@ fn try_manual_command_body(
     }
 
     if lower.starts_with("create mask ") {
-        create_mask(session, sql)?;
+        create_mask(session, sql, query)?;
         return Ok(Some(Vec::new()));
     }
     if lower.starts_with("drop mask ") {
-        drop_mask(session, sql)?;
+        drop_mask(session, sql, query)?;
         return Ok(Some(Vec::new()));
     }
 
@@ -614,7 +1276,13 @@ fn try_manual_command_body(
         let Some(db) = &session.database else {
             return Ok(Some(Vec::new()));
         };
-        db.create_user(&name, &password)?;
+        let hash =
+            mongreldb_core::auth::hash_password(&password).map_err(MongrelQueryError::Schema)?;
+        run_controlled_durable_with_epoch(session, query, |before_publish| {
+            let user = db.create_user_with_password_hash_controlled(&name, hash, before_publish)?;
+            let epoch = user.created_epoch;
+            Ok(((), epoch))
+        })?;
         return Ok(Some(Vec::new()));
     }
     if let Some(_rest) = lower.strip_prefix("alter user ") {
@@ -634,7 +1302,13 @@ fn try_manual_command_body(
                 .trim()
                 .trim_matches('\'')
                 .to_string();
-            db.alter_user_password(&name, &pw)?;
+            let hash =
+                mongreldb_core::auth::hash_password(&pw).map_err(MongrelQueryError::Schema)?;
+            run_controlled_durable_with_epoch(session, query, |before_publish| {
+                let epoch =
+                    db.alter_user_password_hash_with_epoch_controlled(&name, hash, before_publish)?;
+                Ok(((), epoch.0))
+            })?;
             return Ok(Some(Vec::new()));
         }
         // ALTER USER <name> NOT ADMIN
@@ -643,7 +1317,11 @@ fn try_manual_command_body(
                 .trim()
                 .trim_matches(|c| c == '"' || c == '\'')
                 .to_string();
-            db.set_user_admin(&name, false)?;
+            run_controlled_durable_with_optional_epoch(session, query, |before_publish| {
+                let epoch =
+                    db.set_user_admin_with_epoch_controlled(&name, false, before_publish)?;
+                Ok(((), epoch.map(|epoch| epoch.0)))
+            })?;
             return Ok(Some(Vec::new()));
         }
         // ALTER USER <name> ADMIN
@@ -652,7 +1330,10 @@ fn try_manual_command_body(
                 .trim()
                 .trim_matches(|c| c == '"' || c == '\'')
                 .to_string();
-            db.set_user_admin(&name, true)?;
+            run_controlled_durable_with_optional_epoch(session, query, |before_publish| {
+                let epoch = db.set_user_admin_with_epoch_controlled(&name, true, before_publish)?;
+                Ok(((), epoch.map(|epoch| epoch.0)))
+            })?;
             return Ok(Some(Vec::new()));
         }
         return Err(MongrelQueryError::Schema(
@@ -662,21 +1343,31 @@ fn try_manual_command_body(
     if let Some(rest) = lower.strip_prefix("drop user ") {
         let name = rest.trim().trim_end_matches(';').trim().to_string();
         if let Some(db) = &session.database {
-            db.drop_user(&name)?;
+            run_controlled_durable_with_epoch(session, query, |before_publish| {
+                let epoch = db.drop_user_with_epoch_controlled(&name, before_publish)?;
+                Ok(((), epoch.0))
+            })?;
         }
         return Ok(Some(Vec::new()));
     }
     if let Some(rest) = lower.strip_prefix("create role ") {
         let name = rest.trim().trim_end_matches(';').trim().to_string();
         if let Some(db) = &session.database {
-            db.create_role(&name)?;
+            run_controlled_durable_with_epoch(session, query, |before_publish| {
+                let role = db.create_role_controlled(&name, before_publish)?;
+                let epoch = role.created_epoch;
+                Ok(((), epoch))
+            })?;
         }
         return Ok(Some(Vec::new()));
     }
     if let Some(rest) = lower.strip_prefix("drop role ") {
         let name = rest.trim().trim_end_matches(';').trim().to_string();
         if let Some(db) = &session.database {
-            db.drop_role(&name)?;
+            run_controlled_durable_with_epoch(session, query, |before_publish| {
+                let epoch = db.drop_role_with_epoch_controlled(&name, before_publish)?;
+                Ok(((), epoch.0))
+            })?;
         }
         return Ok(Some(Vec::new()));
     }
@@ -704,7 +1395,11 @@ fn try_manual_command_body(
         };
         if left.to_ascii_lowercase().contains(" on ") {
             // GRANT SELECT ON table TO role
-            let on_idx = left.to_ascii_lowercase().find(" on ").unwrap();
+            let on_idx = left.to_ascii_lowercase().find(" on ").ok_or_else(|| {
+                MongrelQueryError::InvalidQueryState(
+                    "GRANT/REVOKE permission separator disappeared".into(),
+                )
+            })?;
             let perm_text = left[..on_idx].trim();
             let table = &original_rest[..sep_idx][on_idx + 4..]
                 .trim()
@@ -712,16 +1407,38 @@ fn try_manual_command_body(
             let table = table.trim_end_matches(';').trim();
             let permission = parse_grant_permission(db, perm_text, table)?;
             if is_grant {
-                db.grant_permission(target, permission)?;
+                run_controlled_durable_with_optional_epoch(session, query, |before_publish| {
+                    let epoch = db.grant_permission_with_epoch_controlled(
+                        target,
+                        permission,
+                        before_publish,
+                    )?;
+                    Ok(((), epoch.map(|epoch| epoch.0)))
+                })?;
             } else {
-                db.revoke_permission(target, permission)?;
+                run_controlled_durable_with_optional_epoch(session, query, |before_publish| {
+                    let epoch = db.revoke_permission_with_epoch_controlled(
+                        target,
+                        permission,
+                        before_publish,
+                    )?;
+                    Ok(((), epoch.map(|epoch| epoch.0)))
+                })?;
             }
         } else {
             // GRANT role TO user
             if is_grant {
-                db.grant_role(target, left.trim())?;
+                run_controlled_durable_with_optional_epoch(session, query, |before_publish| {
+                    let epoch =
+                        db.grant_role_with_epoch_controlled(target, left.trim(), before_publish)?;
+                    Ok(((), epoch.map(|epoch| epoch.0)))
+                })?;
             } else {
-                db.revoke_role(target, left.trim())?;
+                run_controlled_durable_with_optional_epoch(session, query, |before_publish| {
+                    let epoch =
+                        db.revoke_role_with_epoch_controlled(target, left.trim(), before_publish)?;
+                    Ok(((), epoch.map(|epoch| epoch.0)))
+                })?;
             }
         }
         return Ok(Some(Vec::new()));
@@ -741,58 +1458,6 @@ fn try_manual_command_body(
         return Ok(Some(Vec::new()));
     }
 
-    // SAVEPOINT / RELEASE / ROLLBACK TO — operate on the session's SQL staging.
-    if let Some(rest) = lower.strip_prefix("savepoint ") {
-        let name = rest.trim().trim_end_matches(';').trim().to_string();
-        let staged = session.sql_txn.lock();
-        let mut sp = session.savepoints.lock();
-        let len = staged.as_ref().map_or(0, |v| v.len());
-        sp.push((name, len));
-        return Ok(Some(Vec::new()));
-    }
-    if let Some(rest) = lower.strip_prefix("release ") {
-        let name = rest
-            .trim()
-            .strip_prefix("savepoint ")
-            .unwrap_or(rest.trim())
-            .trim_end_matches(';')
-            .trim()
-            .to_string();
-        let mut sp = session.savepoints.lock();
-        if name.is_empty() {
-            sp.pop();
-        } else if let Some(pos) = sp.iter().rposition(|(n, _)| n == &name) {
-            sp.truncate(pos);
-        }
-        return Ok(Some(Vec::new()));
-    }
-    if let Some(rest) = lower.strip_prefix("rollback to ") {
-        let name = rest
-            .trim()
-            .strip_prefix("savepoint ")
-            .unwrap_or(rest.trim())
-            .trim_end_matches(';')
-            .trim()
-            .to_string();
-        let mut sp = session.savepoints.lock();
-        let staged = session.sql_txn.lock();
-        let target_len = sp
-            .iter()
-            .rposition(|(n, _)| n == &name)
-            .map(|pos| {
-                let len = sp[pos].1;
-                sp.truncate(pos);
-                len
-            })
-            .ok_or_else(|| MongrelQueryError::Schema(format!("no savepoint named '{name}'")))?;
-        if let Some(ops) = staged.as_ref() {
-            let mut ops = ops.clone();
-            ops.truncate(target_len);
-            *session.sql_txn.lock() = Some(ops);
-        }
-        return Ok(Some(Vec::new()));
-    }
-
     let Some(db) = session.database.as_ref() else {
         return Ok(None);
     };
@@ -804,12 +1469,12 @@ fn try_manual_command_body(
     }
 
     if lower.starts_with("create virtual table ") {
-        create_virtual_table_manual(session, db, sql)?;
+        create_virtual_table_manual(session, db, sql, query)?;
         return Ok(Some(Vec::new()));
     }
 
     if lower.starts_with("create trigger if not exists ") {
-        create_trigger_if_not_exists_manual(session, db, sql)?;
+        create_trigger_if_not_exists_manual(session, db, sql, query)?;
         return Ok(Some(Vec::new()));
     }
 
@@ -837,30 +1502,90 @@ fn try_manual_command_body(
     if lower.starts_with("create or replace procedure ") {
         let (name, json) = parse_procedure_json(sql, lower, "create or replace procedure ")?;
         let procedure = procedure_from_json(name, json)?;
-        db.create_or_replace_procedure(procedure)?;
+        run_controlled_durable_with_epoch(session, query, |before_publish| {
+            let procedure = db.create_or_replace_procedure_controlled(procedure, before_publish)?;
+            let epoch = procedure.updated_epoch;
+            Ok(((), epoch))
+        })?;
         return Ok(Some(Vec::new()));
     }
 
     if lower.starts_with("create procedure ") {
         let (name, json) = parse_procedure_json(sql, lower, "create procedure ")?;
         let procedure = procedure_from_json(name, json)?;
-        db.create_procedure(procedure)?;
+        run_controlled_durable_with_epoch(session, query, |before_publish| {
+            let procedure = db.create_procedure_controlled(procedure, before_publish)?;
+            let epoch = procedure.updated_epoch;
+            Ok(((), epoch))
+        })?;
         return Ok(Some(Vec::new()));
     }
 
     if let Some(name) = lower.strip_prefix("drop procedure ") {
         let name = strip_identifier(name)?;
-        db.drop_procedure(name)?;
+        run_controlled_durable_with_epoch(session, query, |before_publish| {
+            let epoch = db.drop_procedure_with_epoch_controlled(name, before_publish)?;
+            Ok(((), epoch.0))
+        })?;
         return Ok(Some(Vec::new()));
     }
 
     if lower.starts_with("call ") {
         let (name, args) = parse_call_json(sql, lower)?;
-        let result = db.call_procedure(name, args)?;
-        let json = serde_json::to_string(&procedure_output_json(&result.output))
-            .map_err(|e| MongrelQueryError::Schema(e.to_string()))?;
+        let mut fence_error = None;
+        let mut fenced = false;
+        let result = db.call_procedure_as_controlled(
+            name,
+            args,
+            session.principal().as_ref(),
+            query.control(),
+            || match enter_commit_fence(session, query) {
+                Ok(()) => {
+                    fenced = true;
+                    true
+                }
+                Err(error) => {
+                    fence_error = Some(error);
+                    false
+                }
+            },
+        );
+        if let Some(error) = fence_error {
+            return Err(error);
+        }
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                if fenced {
+                    return Err(uncertain_fenced_error(session, query, error));
+                } else {
+                    query.checkpoint()?;
+                }
+                return Err(error.into());
+            }
+        };
+        if let Some(epoch) = result.epoch {
+            query.record_commit(query.status().statement_index, epoch);
+            if let Err(error) = query.exit_commit_critical() {
+                return Err(query.commit_outcome_error(error.to_string()));
+            }
+            session.fire_test_hook(SqlTestHookPoint::AfterDurableCommit);
+        } else if fenced {
+            query.exit_commit_critical()?;
+        }
+        let response: Result<Vec<RecordBatch>> = (|| {
+            let json = serde_json::to_string(&procedure_output_json(&result.output))
+                .map_err(|e| MongrelQueryError::Schema(e.to_string()))?;
+            Ok(vec![json_batch("result_json", vec![json])?])
+        })();
         session.clear_cache();
-        return Ok(Some(vec![json_batch("result_json", vec![json])?]));
+        return response.map(Some).map_err(|error| {
+            if result.epoch.is_some() {
+                query.commit_outcome_error(error.to_string())
+            } else {
+                error
+            }
+        });
     }
 
     if let Some(table) = lower
@@ -872,15 +1597,58 @@ fn try_manual_command_body(
     }
 
     if lower.starts_with("pragma ") {
-        return Ok(Some(vec![run_pragma(session, db, sql, lower)?]));
+        return Ok(Some(vec![run_pragma(session, db, sql, lower, query)?]));
     }
 
     if lower == "check" || lower == "check database" {
-        return Ok(Some(vec![check_batch(db)?]));
+        return Ok(Some(vec![check_batch(db, query)?]));
     }
 
     if lower == "doctor" || lower == "doctor database" {
-        let quarantined = db.doctor()?;
+        let mut fence_error = None;
+        let mut fenced = false;
+        let quarantined = db.doctor_controlled_with_receipt(query.control(), || {
+            match enter_commit_fence(session, query) {
+                Ok(()) => {
+                    fenced = true;
+                    true
+                }
+                Err(error) => {
+                    fence_error = Some(error);
+                    false
+                }
+            }
+        });
+        if let Some(error) = fence_error {
+            return Err(error);
+        }
+        let (quarantined, receipt) = match quarantined {
+            Ok(result) => result,
+            Err(error) => {
+                if fenced {
+                    return Err(uncertain_fenced_error(session, query, error));
+                } else {
+                    query.checkpoint()?;
+                }
+                return Err(error.into());
+            }
+        };
+        if fenced {
+            let Some(receipt) = receipt else {
+                return Err(uncertain_fenced_error(
+                    session,
+                    query,
+                    mongreldb_core::MongrelError::Other(
+                        "DOCTOR published without a maintenance receipt".into(),
+                    ),
+                ));
+            };
+            query.record_commit(query.status().statement_index, receipt.epoch.0);
+            if let Err(error) = query.exit_commit_critical() {
+                return Err(query.commit_outcome_error(error.to_string()));
+            }
+            session.fire_test_hook(SqlTestHookPoint::AfterDurableCommit);
+        }
         let values: Vec<String> = quarantined.into_iter().map(|id| id.to_string()).collect();
         session.clear_cache();
         return Ok(Some(vec![strings_batch("quarantined_table_id", values)?]));
@@ -888,19 +1656,54 @@ fn try_manual_command_body(
 
     if lower.starts_with("vacuum into ") {
         let target = parse_vacuum_into(sql, lower)?;
-        db.hot_backup(Path::new(target))?;
+        let mut fence_error = None;
+        let mut fenced = false;
+        let report =
+            db.hot_backup_controlled(
+                Path::new(target),
+                query.control(),
+                || match enter_commit_fence(session, query) {
+                    Ok(()) => {
+                        fenced = true;
+                        true
+                    }
+                    Err(error) => {
+                        fence_error = Some(error);
+                        false
+                    }
+                },
+            );
+        if let Some(error) = fence_error {
+            return Err(error);
+        }
+        let report = match report {
+            Ok(report) => report,
+            Err(error) => {
+                if fenced {
+                    return Err(uncertain_fenced_error(session, query, error));
+                } else {
+                    query.checkpoint()?;
+                }
+                return Err(error.into());
+            }
+        };
+        query.record_commit(query.status().statement_index, report.epoch);
+        if let Err(error) = query.exit_commit_critical() {
+            return Err(query.commit_outcome_error(error.to_string()));
+        }
+        session.fire_test_hook(SqlTestHookPoint::AfterDurableCommit);
         session.clear_cache();
         return Ok(Some(Vec::new()));
     }
 
     if lower == "compact" || lower == "compact database" || lower == "vacuum" {
-        compact_all(db)?;
+        compact_all(session, db, query)?;
         session.clear_cache();
         return Ok(Some(Vec::new()));
     }
 
     if lower == "analyze" || lower.starts_with("analyze ") {
-        analyze_all(db)?;
+        analyze_all(session, db, query)?;
         session.clear_cache();
         return Ok(Some(Vec::new()));
     }
@@ -915,7 +1718,7 @@ fn try_manual_command_body(
         } else {
             Some(strip_identifier(target)?)
         };
-        reindex(db, target)?;
+        reindex(session, db, target, query)?;
         session.clear_cache();
         return Ok(Some(Vec::new()));
     }
@@ -1009,7 +1812,7 @@ fn parse_grant_permission(
     }
 }
 
-fn create_mask(session: &MongrelSession, sql: &str) -> Result<()> {
+fn create_mask(session: &MongrelSession, sql: &str, query: &RegisteredSqlQuery) -> Result<()> {
     let Some(db) = &session.database else {
         return Ok(());
     };
@@ -1091,8 +1894,15 @@ fn create_mask(session: &MongrelSession, sql: &str) -> Result<()> {
         strategy,
         exempt_subjects,
     });
-    db.set_security_catalog_as(security, session.principal().as_ref())?;
-    session.refresh_registered_table(db, &table)?;
+    run_controlled_durable_with_epoch(session, query, |before_publish| {
+        let epoch = db.set_security_catalog_as_with_epoch_controlled(
+            security,
+            session.principal().as_ref(),
+            before_publish,
+        )?;
+        Ok(((), epoch.0))
+    })?;
+    post_commit_result(query, session.refresh_registered_table(db, &table))?;
     session.clear_cache();
     Ok(())
 }
@@ -1116,7 +1926,7 @@ fn parse_mask_subjects(input: &str) -> Result<Vec<String>> {
     Ok(subjects)
 }
 
-fn drop_mask(session: &MongrelSession, sql: &str) -> Result<()> {
+fn drop_mask(session: &MongrelSession, sql: &str, query: &RegisteredSqlQuery) -> Result<()> {
     let Some(db) = &session.database else {
         return Ok(());
     };
@@ -1147,8 +1957,15 @@ fn drop_mask(session: &MongrelSession, sql: &str) -> Result<()> {
             "mask {name} does not exist on {table}"
         )));
     }
-    db.set_security_catalog_as(security, session.principal().as_ref())?;
-    session.refresh_registered_table(db, table)?;
+    run_controlled_durable_with_epoch(session, query, |before_publish| {
+        let epoch = db.set_security_catalog_as_with_epoch_controlled(
+            security,
+            session.principal().as_ref(),
+            before_publish,
+        )?;
+        Ok(((), epoch.0))
+    })?;
+    post_commit_result(query, session.refresh_registered_table(db, table))?;
     session.clear_cache();
     Ok(())
 }
@@ -1301,6 +2118,7 @@ async fn create_table(
     db: &Arc<Database>,
     create: &CreateTable,
     ttl: Option<&ParsedTtlClause>,
+    registered_query: &RegisteredSqlQuery,
 ) -> Result<()> {
     let name = object_name(&create.name)?;
     if create.if_not_exists && db.table_id(&name).is_ok() {
@@ -1309,13 +2127,14 @@ async fn create_table(
 
     // CREATE TABLE AS SELECT — execute the query, infer the schema from the
     // result, create the table, and bulk-insert the rows.
-    if let Some(query) = create.query.as_deref() {
+    if let Some(source_query) = create.query.as_deref() {
         if ttl.is_some() {
             return Err(MongrelQueryError::Schema(
                 "CREATE TABLE AS SELECT does not support TTL_COLUMN".into(),
             ));
         }
-        return create_table_as_select(session, db, &name, query).await;
+        return create_table_as_select(session, db, &name, source_query, registered_query, false)
+            .await;
     }
 
     let schema = schema_from_create_table(create)?;
@@ -1334,11 +2153,57 @@ async fn create_table(
             )));
         }
     }
-    db.create_table(&name, schema)?;
+    let temp_table = format!("__mongreldb_ctas_build_{}", registered_query.id());
+    db.create_building_table(
+        &temp_table,
+        &name,
+        &registered_query.id().to_string(),
+        schema,
+    )?;
     if let Some(ttl) = ttl {
-        db.set_table_ttl(&name, &ttl.column, ttl.duration_nanos)?;
+        if let Err(error) = db.set_building_table_ttl(&temp_table, &ttl.column, ttl.duration_nanos)
+        {
+            let _ = db.discard_building_table(&temp_table);
+            return Err(error.into());
+        }
     }
-    register_table(session, db, &name)?;
+    let publish_epoch =
+        match run_controlled_durable_with_epoch(session, registered_query, |before_commit| {
+            let epoch = db.publish_building_table_controlled(&temp_table, &name, before_commit)?;
+            Ok((epoch, epoch.0))
+        }) {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                let may_be_published = matches!(
+                    &error,
+                    MongrelQueryError::CommitOutcome {
+                        committed: true,
+                        ..
+                    } | MongrelQueryError::OutcomeUnknown { .. }
+                );
+                if may_be_published && db.table_id(&name).is_ok() {
+                    if let Err(register_error) = register_table(session, db, &name) {
+                        let message =
+                            format!("{error}; table registration failed: {register_error}");
+                        return Err(
+                            if matches!(&error, MongrelQueryError::OutcomeUnknown { .. }) {
+                                registered_query.outcome_unknown_error(message)
+                            } else {
+                                registered_query.commit_outcome_error(message)
+                            },
+                        );
+                    }
+                    session.clear_cache();
+                    return Err(error);
+                }
+                let _ = db.discard_building_table(&temp_table);
+                return Err(error);
+            }
+        };
+    let _ = publish_epoch;
+    if let Err(error) = register_table(session, db, &name) {
+        return Err(registered_query.commit_outcome_error(error.to_string()));
+    }
     session.clear_cache();
     Ok(())
 }
@@ -1349,23 +2214,27 @@ fn create_table_as_select<'a>(
     session: &'a MongrelSession,
     db: &'a Arc<Database>,
     table_name: &'a str,
-    query: &'a sqlparser::ast::Query,
+    source_query: &'a sqlparser::ast::Query,
+    query: &'a RegisteredSqlQuery,
+    materialized: bool,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
-    let select_sql = format!("SELECT * FROM ({}) AS ctas_source", query);
+    let select_sql = format!("SELECT * FROM ({source_query}) AS ctas_source");
     Box::pin(async move {
-        let batches = Box::pin(session.run(&select_sql)).await?;
+        query.checkpoint()?;
+        let mut stream = session
+            .execute_command_source_stream(&select_sql, query)
+            .await?;
+        let arrow_schema = stream.schema();
 
-        if batches.is_empty() {
-            return Err(MongrelQueryError::Schema(
-                "CREATE TABLE AS SELECT produced no result (cannot infer schema)".into(),
-            ));
-        }
-        let arrow_schema = batches[0].schema();
-
-        // Build a MongrelDB Schema from the Arrow fields.
+        query.checkpoint()?;
         use mongreldb_core::schema::{
             ColumnDef as CoreColumnDef, ColumnFlags, Schema as CoreSchema,
         };
+        if arrow_schema.fields().is_empty() {
+            return Err(MongrelQueryError::Schema(
+                "CREATE TABLE AS SELECT requires at least one result column".into(),
+            ));
+        }
         let mut columns = Vec::new();
         for (i, field) in arrow_schema.fields().iter().enumerate() {
             let ty = arrow_data_type_to_type_id(field.data_type())?;
@@ -1390,25 +2259,244 @@ fn create_table_as_select<'a>(
             constraints: Default::default(),
             clustered: false,
         };
+        let target_schema = schema.clone();
 
-        db.create_table(table_name, schema)?;
-        register_table(session, db, table_name)?;
-
-        // Bulk-insert all rows from the result batches.
-        let _handle = db.table(table_name)?;
-        let mut txn = db.begin_as(session.principal());
-        for batch in &batches {
-            let col_count = batch.num_columns();
-            for row_idx in 0..batch.num_rows() {
-                let mut cells = Vec::with_capacity(col_count);
-                for (col_idx, col) in batch.columns().iter().enumerate() {
-                    let value = arrow_cell_to_value(col, row_idx)?;
-                    cells.push(((col_idx + 1) as u16, value));
+        // Stream into a durable hidden table one batch at a time. Hidden batch
+        // commits are reclaimable implementation state, not user-visible SQL
+        // commits. Only the final catalog publish is fenced and recorded.
+        let temp_table = format!("__mongreldb_ctas_build_{}", query.id());
+        db.create_building_table(&temp_table, table_name, &query.id().to_string(), schema)?;
+        let mut saw_batch = false;
+        let mut converted = 0_usize;
+        loop {
+            let batch = match next_command_batch(&mut stream, query).await {
+                Ok(Some(batch)) => batch,
+                Ok(None) => break,
+                Err(error) => {
+                    let _ = db.discard_building_table(&temp_table);
+                    return Err(error);
                 }
-                txn.put(table_name, cells)?;
+            };
+            saw_batch = true;
+            let batch_bytes = batch
+                .columns()
+                .iter()
+                .map(|column| column.get_array_memory_size())
+                .fold(0_usize, usize::saturating_add);
+            if batch_bytes > CTAS_INPUT_BATCH_BYTES_LIMIT {
+                let _ = db.discard_building_table(&temp_table);
+                return Err(mongreldb_core::MongrelError::ResourceLimitExceeded {
+                    resource: "CREATE TABLE AS SELECT input batch bytes",
+                    requested: batch_bytes,
+                    limit: CTAS_INPUT_BATCH_BYTES_LIMIT,
+                }
+                .into());
+            }
+            let mut row_idx = 0_usize;
+            while row_idx < batch.num_rows() {
+                let mut txn = db.begin_as(session.principal());
+                let mut staged_rows = 0_usize;
+                let mut staged_bytes = 0_usize;
+                while row_idx < batch.num_rows() && staged_rows < CTAS_STAGING_ROWS_LIMIT {
+                    if let Err(error) = command_checkpoint(session, query, converted) {
+                        drop(txn);
+                        let _ = db.discard_building_table(&temp_table);
+                        return Err(error);
+                    }
+                    let mut cells = Vec::with_capacity(batch.num_columns());
+                    for (col_idx, col) in batch.columns().iter().enumerate() {
+                        let value = match arrow_cell_to_value(col, row_idx) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                drop(txn);
+                                let _ = db.discard_building_table(&temp_table);
+                                return Err(error);
+                            }
+                        };
+                        cells.push(((col_idx + 1) as u16, value));
+                    }
+                    if matches!(cells.first(), Some((_, Value::Null))) {
+                        drop(txn);
+                        let _ = db.discard_building_table(&temp_table);
+                        return Err(MongrelQueryError::Schema(
+                            "CREATE TABLE AS SELECT inferred a NULL primary key".into(),
+                        ));
+                    }
+                    let row_bytes = cells_deep_bytes(&cells);
+                    if row_bytes > CTAS_STAGING_BYTES_LIMIT {
+                        drop(txn);
+                        let _ = db.discard_building_table(&temp_table);
+                        return Err(mongreldb_core::MongrelError::ResourceLimitExceeded {
+                            resource: "CREATE TABLE AS SELECT staged row bytes",
+                            requested: row_bytes,
+                            limit: CTAS_STAGING_BYTES_LIMIT,
+                        }
+                        .into());
+                    }
+                    if staged_rows > 0
+                        && staged_bytes.saturating_add(row_bytes) > CTAS_STAGING_BYTES_LIMIT
+                    {
+                        break;
+                    }
+                    if let Err(error) = txn.put_building(&temp_table, cells) {
+                        drop(txn);
+                        let _ = db.discard_building_table(&temp_table);
+                        return Err(error.into());
+                    }
+                    staged_rows += 1;
+                    staged_bytes = staged_bytes.saturating_add(row_bytes);
+                    row_idx += 1;
+                    converted += 1;
+                }
+                if staged_rows > 0 {
+                    if let Err(error) = txn.commit_controlled(query.control(), || Ok(())) {
+                        let _ = db.discard_building_table(&temp_table);
+                        return Err(error.into());
+                    }
+                }
             }
         }
-        txn.commit()?;
+        if !saw_batch {
+            let _ = db.discard_building_table(&temp_table);
+            return Err(MongrelQueryError::Schema(
+                "CREATE TABLE AS SELECT produced no result (cannot infer schema)".into(),
+            ));
+        }
+        let materialized_definition = if materialized {
+            let mut incremental = match infer_incremental_aggregate_with_schema(
+                db,
+                table_name,
+                source_query,
+                &target_schema,
+            ) {
+                Ok(incremental) => incremental,
+                Err(error) => {
+                    let _ = db.discard_building_table(&temp_table);
+                    return Err(error);
+                }
+            };
+            if let Some(plan) = incremental.as_mut() {
+                let (groups, snapshot) =
+                    match collect_incremental_aggregate_groups(session, db, plan, query) {
+                        Ok(result) => result,
+                        Err(error) => {
+                            let _ = db.discard_building_table(&temp_table);
+                            return Err(error);
+                        }
+                    };
+                plan.checkpoint_event_id = format!("{}:{}", snapshot.epoch.0, u32::MAX);
+                let mut transaction = db.begin_as(session.principal());
+                if let Err(error) = transaction.truncate_building(&temp_table) {
+                    let _ = db.discard_building_table(&temp_table);
+                    return Err(error.into());
+                }
+                if let Err(error) = transaction.commit_controlled(query.control(), || Ok(())) {
+                    let _ = db.discard_building_table(&temp_table);
+                    return Err(error.into());
+                }
+                let mut chunk = Vec::new();
+                let mut chunk_bytes = 0_usize;
+                for (index, state) in groups.into_values().enumerate() {
+                    if let Err(error) = command_checkpoint(session, query, index) {
+                        let _ = db.discard_building_table(&temp_table);
+                        return Err(error);
+                    }
+                    let cells = match aggregate_cells(plan, state.group, state.count, &state.sums) {
+                        Ok(cells) => cells,
+                        Err(error) => {
+                            let _ = db.discard_building_table(&temp_table);
+                            return Err(error);
+                        }
+                    };
+                    let row_bytes = cells_deep_bytes(&cells);
+                    if row_bytes > CTAS_STAGING_BYTES_LIMIT {
+                        let _ = db.discard_building_table(&temp_table);
+                        return Err(mongreldb_core::MongrelError::ResourceLimitExceeded {
+                            resource: "incremental materialized-view staged row bytes",
+                            requested: row_bytes,
+                            limit: CTAS_STAGING_BYTES_LIMIT,
+                        }
+                        .into());
+                    }
+                    if !chunk.is_empty()
+                        && (chunk.len() >= CTAS_STAGING_ROWS_LIMIT
+                            || chunk_bytes.saturating_add(row_bytes) > CTAS_STAGING_BYTES_LIMIT)
+                    {
+                        if let Err(error) = commit_rebuild_chunk(
+                            session,
+                            db,
+                            &temp_table,
+                            std::mem::take(&mut chunk),
+                            query,
+                        ) {
+                            let _ = db.discard_building_table(&temp_table);
+                            return Err(error);
+                        }
+                        chunk_bytes = 0;
+                    }
+                    chunk_bytes = chunk_bytes.saturating_add(row_bytes);
+                    chunk.push(cells);
+                }
+                if let Err(error) = commit_rebuild_chunk(session, db, &temp_table, chunk, query) {
+                    let _ = db.discard_building_table(&temp_table);
+                    return Err(error);
+                }
+            }
+            Some(mongreldb_core::MaterializedViewEntry {
+                name: table_name.to_string(),
+                query: source_query.to_string(),
+                last_refresh_epoch: 0,
+                incremental,
+            })
+        } else {
+            None
+        };
+        let publish_epoch =
+            match run_controlled_durable_with_epoch(session, query, |before_commit| {
+                let epoch = if let Some(definition) = materialized_definition {
+                    db.publish_materialized_building_table_controlled(
+                        &temp_table,
+                        table_name,
+                        definition,
+                        before_commit,
+                    )?
+                } else {
+                    db.publish_building_table_controlled(&temp_table, table_name, before_commit)?
+                };
+                Ok((epoch, epoch.0))
+            }) {
+                Ok(epoch) => epoch,
+                Err(error) => {
+                    let may_be_published = matches!(
+                        &error,
+                        MongrelQueryError::CommitOutcome {
+                            committed: true,
+                            ..
+                        } | MongrelQueryError::OutcomeUnknown { .. }
+                    );
+                    if may_be_published && db.table_id(table_name).is_ok() {
+                        if let Err(register_error) = register_table(session, db, table_name) {
+                            let message =
+                                format!("{error}; table registration failed: {register_error}");
+                            return Err(
+                                if matches!(&error, MongrelQueryError::OutcomeUnknown { .. }) {
+                                    query.outcome_unknown_error(message)
+                                } else {
+                                    query.commit_outcome_error(message)
+                                },
+                            );
+                        }
+                        session.clear_cache();
+                        return Err(error);
+                    }
+                    let _ = db.discard_building_table(&temp_table);
+                    return Err(error);
+                }
+            };
+        let _ = publish_epoch;
+        if let Err(error) = register_table(session, db, table_name) {
+            return Err(query.commit_outcome_error(error.to_string()));
+        }
         session.clear_cache();
         Ok(())
     })
@@ -1443,124 +2531,128 @@ fn arrow_data_type_to_type_id(dt: &arrow::datatypes::DataType) -> Result<TypeId>
 }
 
 /// Extract a MongrelDB `Value` from an Arrow array cell at `row_idx`.
+fn typed_arrow_array<'a, T: 'static>(
+    array: &'a std::sync::Arc<dyn arrow::array::Array>,
+    expected: &str,
+) -> Result<&'a T> {
+    array
+        .as_any()
+        .downcast_ref::<T>()
+        .ok_or_else(|| MongrelQueryError::Arrow(format!("expected {expected}")))
+}
+
 fn arrow_cell_to_value(
     array: &std::sync::Arc<dyn arrow::array::Array>,
     row_idx: usize,
 ) -> Result<Value> {
     use arrow::array::*;
+    if row_idx >= array.len() {
+        return Err(MongrelQueryError::Arrow(format!(
+            "Arrow row index {row_idx} exceeds array length {}",
+            array.len()
+        )));
+    }
     if array.is_null(row_idx) {
         return Ok(Value::Null);
     }
     Ok(match array.data_type() {
-        arrow::datatypes::DataType::Boolean => Value::Bool(
-            array
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .unwrap()
-                .value(row_idx),
-        ),
-        arrow::datatypes::DataType::Int8 => Value::Int64(
-            array
-                .as_any()
-                .downcast_ref::<Int8Array>()
-                .unwrap()
-                .value(row_idx) as i64,
-        ),
+        arrow::datatypes::DataType::Boolean => {
+            Value::Bool(typed_arrow_array::<BooleanArray>(array, "BooleanArray")?.value(row_idx))
+        }
+        arrow::datatypes::DataType::Int8 => {
+            Value::Int64(typed_arrow_array::<Int8Array>(array, "Int8Array")?.value(row_idx) as i64)
+        }
         arrow::datatypes::DataType::Int16 => Value::Int64(
-            array
-                .as_any()
-                .downcast_ref::<Int16Array>()
-                .unwrap()
-                .value(row_idx) as i64,
+            typed_arrow_array::<Int16Array>(array, "Int16Array")?.value(row_idx) as i64,
         ),
         arrow::datatypes::DataType::Int32 => Value::Int64(
-            array
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .unwrap()
-                .value(row_idx) as i64,
+            typed_arrow_array::<Int32Array>(array, "Int32Array")?.value(row_idx) as i64,
         ),
-        arrow::datatypes::DataType::Int64 => Value::Int64(
-            array
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-                .value(row_idx),
-        ),
+        arrow::datatypes::DataType::Int64 => {
+            Value::Int64(typed_arrow_array::<Int64Array>(array, "Int64Array")?.value(row_idx))
+        }
         arrow::datatypes::DataType::UInt8 => Value::Int64(
-            array
-                .as_any()
-                .downcast_ref::<UInt8Array>()
-                .unwrap()
-                .value(row_idx) as i64,
+            typed_arrow_array::<UInt8Array>(array, "UInt8Array")?.value(row_idx) as i64,
         ),
         arrow::datatypes::DataType::UInt16 => Value::Int64(
-            array
-                .as_any()
-                .downcast_ref::<UInt16Array>()
-                .unwrap()
-                .value(row_idx) as i64,
+            typed_arrow_array::<UInt16Array>(array, "UInt16Array")?.value(row_idx) as i64,
         ),
         arrow::datatypes::DataType::UInt32 => Value::Int64(
-            array
-                .as_any()
-                .downcast_ref::<UInt32Array>()
-                .unwrap()
-                .value(row_idx) as i64,
+            typed_arrow_array::<UInt32Array>(array, "UInt32Array")?.value(row_idx) as i64,
         ),
         arrow::datatypes::DataType::UInt64 => Value::Int64(
-            array
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .unwrap()
-                .value(row_idx) as i64,
+            typed_arrow_array::<UInt64Array>(array, "UInt64Array")?.value(row_idx) as i64,
         ),
         arrow::datatypes::DataType::Float32 => Value::Float64(
-            array
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .unwrap()
-                .value(row_idx) as f64,
+            typed_arrow_array::<Float32Array>(array, "Float32Array")?.value(row_idx) as f64,
         ),
-        arrow::datatypes::DataType::Float64 => Value::Float64(
-            array
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .unwrap()
-                .value(row_idx),
+        arrow::datatypes::DataType::Float64 => {
+            Value::Float64(typed_arrow_array::<Float64Array>(array, "Float64Array")?.value(row_idx))
+        }
+        arrow::datatypes::DataType::Utf8 => Value::Bytes(
+            typed_arrow_array::<StringArray>(array, "StringArray")?
+                .value(row_idx)
+                .as_bytes()
+                .to_vec(),
         ),
-        arrow::datatypes::DataType::Utf8 | arrow::datatypes::DataType::LargeUtf8 => Value::Bytes(
-            array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .or_else(|| {
-                    array
-                        .as_any()
-                        .downcast_ref::<LargeStringArray>()
-                        .map(|a| a as &dyn std::any::Any)
-                        .and_then(|a| a.downcast_ref::<StringArray>())
-                })
-                .ok_or_else(|| MongrelQueryError::Arrow("expected StringArray".into()))?
+        arrow::datatypes::DataType::LargeUtf8 => Value::Bytes(
+            typed_arrow_array::<LargeStringArray>(array, "LargeStringArray")?
                 .value(row_idx)
                 .as_bytes()
                 .to_vec(),
         ),
         arrow::datatypes::DataType::Binary => Value::Bytes(
-            array
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .unwrap()
+            typed_arrow_array::<BinaryArray>(array, "BinaryArray")?
                 .value(row_idx)
                 .to_vec(),
         ),
         arrow::datatypes::DataType::LargeBinary => Value::Bytes(
-            array
-                .as_any()
-                .downcast_ref::<LargeBinaryArray>()
-                .unwrap()
+            typed_arrow_array::<LargeBinaryArray>(array, "LargeBinaryArray")?
                 .value(row_idx)
                 .to_vec(),
         ),
+        arrow::datatypes::DataType::Date32 => Value::Int64(
+            typed_arrow_array::<Date32Array>(array, "Date32Array")?.value(row_idx) as i64,
+        ),
+        arrow::datatypes::DataType::Date64 => {
+            Value::Int64(typed_arrow_array::<Date64Array>(array, "Date64Array")?.value(row_idx))
+        }
+        arrow::datatypes::DataType::Timestamp(unit, _) => {
+            let (value, multiplier) = match unit {
+                arrow::datatypes::TimeUnit::Second => (
+                    typed_arrow_array::<TimestampSecondArray>(array, "TimestampSecondArray")?
+                        .value(row_idx),
+                    1_000_000_000,
+                ),
+                arrow::datatypes::TimeUnit::Millisecond => (
+                    typed_arrow_array::<TimestampMillisecondArray>(
+                        array,
+                        "TimestampMillisecondArray",
+                    )?
+                    .value(row_idx),
+                    1_000_000,
+                ),
+                arrow::datatypes::TimeUnit::Microsecond => (
+                    typed_arrow_array::<TimestampMicrosecondArray>(
+                        array,
+                        "TimestampMicrosecondArray",
+                    )?
+                    .value(row_idx),
+                    1_000,
+                ),
+                arrow::datatypes::TimeUnit::Nanosecond => (
+                    typed_arrow_array::<TimestampNanosecondArray>(
+                        array,
+                        "TimestampNanosecondArray",
+                    )?
+                    .value(row_idx),
+                    1,
+                ),
+            };
+            Value::Int64(value.checked_mul(multiplier).ok_or_else(|| {
+                MongrelQueryError::Arrow("timestamp overflows nanosecond storage".into())
+            })?)
+        }
         other => {
             return Err(MongrelQueryError::Schema(format!(
                 "CTAS does not support value extraction from Arrow type {other:?}"
@@ -1573,6 +2665,7 @@ fn create_virtual_table_manual(
     session: &MongrelSession,
     db: &Arc<Database>,
     sql: &str,
+    query: &RegisteredSqlQuery,
 ) -> Result<()> {
     let sql = sql.trim().trim_end_matches(';').trim();
     let lower = sql.to_ascii_lowercase();
@@ -1604,7 +2697,7 @@ fn create_virtual_table_manual(
     } else {
         (strip_identifier(after_using)?.to_string(), Vec::new())
     };
-    create_virtual_table_named(session, db, name, if_not_exists, module, args)
+    create_virtual_table_named(session, db, name, if_not_exists, module, args, query)
 }
 
 fn split_module_args(raw: &str) -> Result<Vec<String>> {
@@ -1675,9 +2768,18 @@ fn create_virtual_table(
     if_not_exists: bool,
     module_name: String,
     module_args: Vec<String>,
+    query: &RegisteredSqlQuery,
 ) -> Result<()> {
     let name = object_name(&name)?;
-    create_virtual_table_named(session, db, name, if_not_exists, module_name, module_args)
+    create_virtual_table_named(
+        session,
+        db,
+        name,
+        if_not_exists,
+        module_name,
+        module_args,
+        query,
+    )
 }
 
 fn create_virtual_table_named(
@@ -1687,6 +2789,7 @@ fn create_virtual_table_named(
     if_not_exists: bool,
     module_name: String,
     module_args: Vec<String>,
+    query: &RegisteredSqlQuery,
 ) -> Result<()> {
     if db.table_id(&name).is_ok() || db.external_table(&name).is_some() {
         if if_not_exists {
@@ -1715,14 +2818,24 @@ fn create_virtual_table_named(
         0,
     )
     .map_err(MongrelQueryError::Core)?;
-    let entry = db.create_external_table(entry)?;
+    // Validate module arguments and construct the provider before the durable
+    // catalog write. A rejected module definition must not survive a reopen.
     let provider = session
         .external_modules
         .external_table_provider(db, &entry)?;
-    session
-        .ctx
-        .register_table(&entry.name, provider)
-        .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
+    let entry = run_controlled_durable_with_epoch(session, query, |before_publish| {
+        let entry = db.create_external_table_controlled(entry, before_publish)?;
+        let epoch = entry.created_epoch;
+        Ok((entry, epoch))
+    })?;
+    post_commit_result(
+        query,
+        session
+            .ctx
+            .register_table(&entry.name, provider)
+            .map(|_| ())
+            .map_err(|e| MongrelQueryError::DataFusion(e.to_string())),
+    )?;
     session.clear_cache();
     Ok(())
 }
@@ -1732,31 +2845,37 @@ fn drop_table(
     db: &Arc<Database>,
     name: &str,
     if_exists: bool,
+    query: &RegisteredSqlQuery,
 ) -> Result<()> {
-    match db.drop_table(name) {
-        Ok(()) => {
-            let _ = session.ctx.deregister_table(name);
-            session.tables.lock().remove(name);
-            session.clear_cache();
-            Ok(())
-        }
-        Err(e)
-            if matches!(e, mongreldb_core::MongrelError::NotFound(_))
-                && db.external_table(name).is_some() =>
-        {
-            let entry = db
-                .external_table(name)
-                .ok_or_else(|| MongrelQueryError::Schema(format!("table {name:?} not found")))?;
-            session
-                .external_modules
-                .destroy_external_table(db, &entry)?;
-            db.drop_external_table(name)?;
-            let _ = session.ctx.deregister_table(name);
-            session.clear_cache();
-            Ok(())
-        }
-        Err(e) if if_exists && matches!(e, mongreldb_core::MongrelError::NotFound(_)) => Ok(()),
-        Err(e) => Err(e.into()),
+    if db.table_id(name).is_ok() {
+        run_controlled_durable_with_epoch(session, query, |before_commit| {
+            let epoch = db.drop_table_with_epoch_controlled(name, before_commit)?;
+            Ok(((), epoch.0))
+        })?;
+        let _ = session.ctx.deregister_table(name);
+        session.tables.lock().remove(name);
+        session.clear_cache();
+        return Ok(());
+    }
+    if let Some(entry) = db.external_table(name) {
+        run_controlled_durable_with_epoch(session, query, |before_publish| {
+            let epoch = db.drop_external_table_with_epoch_controlled(name, before_publish)?;
+            Ok(((), epoch.0))
+        })?;
+        post_commit_result(
+            query,
+            session.external_modules.destroy_external_table(db, &entry),
+        )?;
+        let _ = session.ctx.deregister_table(name);
+        session.clear_cache();
+        return Ok(());
+    }
+    if if_exists {
+        Ok(())
+    } else {
+        Err(MongrelQueryError::Schema(format!(
+            "table {name:?} not found"
+        )))
     }
 }
 
@@ -1765,6 +2884,7 @@ fn drop_view(
     db: &Arc<Database>,
     name: &str,
     if_exists: bool,
+    query: &RegisteredSqlQuery,
 ) -> Result<()> {
     if session.view_definition(name).is_none() {
         if if_exists {
@@ -1774,16 +2894,19 @@ fn drop_view(
             "view {name:?} does not exist"
         )));
     }
-    session.drop_view(name);
     let trigger_names = db
         .triggers()
         .into_iter()
         .filter(|trigger| matches!(&trigger.target, TriggerTarget::View(target) if target == name))
         .map(|trigger| trigger.name)
         .collect::<Vec<_>>();
-    for trigger in trigger_names {
-        db.drop_trigger(&trigger)?;
+    if !trigger_names.is_empty() {
+        run_controlled_durable_with_epoch(session, query, |before_publish| {
+            let epoch = db.drop_triggers_with_epoch_controlled(&trigger_names, before_publish)?;
+            Ok(((), epoch.0))
+        })?;
     }
+    session.drop_view(name);
     session.clear_cache();
     Ok(())
 }
@@ -1793,6 +2916,7 @@ fn drop_materialized_view(
     db: &Arc<Database>,
     name: &str,
     if_exists: bool,
+    query: &RegisteredSqlQuery,
 ) -> Result<()> {
     if db.materialized_view(name).is_none() {
         if if_exists {
@@ -1802,7 +2926,10 @@ fn drop_materialized_view(
             "materialized view {name:?} does not exist"
         )));
     }
-    db.drop_table(name)?;
+    run_controlled_durable_with_epoch(session, query, |before_commit| {
+        let epoch = db.drop_table_with_epoch_controlled(name, before_commit)?;
+        Ok(((), epoch.0))
+    })?;
     let _ = session.ctx.deregister_table(name);
     session.tables.lock().remove(name);
     session.clear_cache();
@@ -1862,36 +2989,66 @@ fn current_external_rows(
     session: &MongrelSession,
     db: &Arc<Database>,
     entry: &ExternalTableEntry,
+    query: &RegisteredSqlQuery,
 ) -> Result<Vec<HashMap<u16, Value>>> {
-    if let Some(staged) = session.sql_txn.lock().as_ref() {
-        for op in staged.iter().rev() {
-            if let PendingSqlOp::ExternalState { table, state, .. } = op {
-                if table == &entry.name {
-                    return session
-                        .external_modules
-                        .external_table_rows_from_state(entry, state);
-                }
-            }
-        }
+    query.checkpoint()?;
+    if let Some(state) = staged_external_state(session, &entry.name, query)? {
+        let rows = session
+            .external_modules
+            .external_table_rows_from_state(entry, &state)?;
+        crate::external_modules::enforce_external_rows_limit(&rows, Some(query))?;
+        query.checkpoint()?;
+        return Ok(rows);
     }
-    session.external_modules.external_table_rows(db, entry)
+    let rows = session.external_modules.external_table_rows(db, entry)?;
+    crate::external_modules::enforce_external_rows_limit(&rows, Some(query))?;
+    query.checkpoint()?;
+    Ok(rows)
 }
 
 fn current_external_state(
     session: &MongrelSession,
     db: &Arc<Database>,
     entry: &ExternalTableEntry,
+    query: &RegisteredSqlQuery,
 ) -> Result<Vec<u8>> {
-    if let Some(staged) = session.sql_txn.lock().as_ref() {
-        for op in staged.iter().rev() {
-            if let PendingSqlOp::ExternalState { table, state, .. } = op {
-                if table == &entry.name {
-                    return Ok(state.clone());
-                }
+    query.checkpoint()?;
+    if let Some(state) = staged_external_state(session, &entry.name, query)? {
+        crate::external_modules::enforce_external_state_limit(&state)?;
+        return Ok(state);
+    }
+    let state = crate::external_modules::external_table_state_bytes(db, entry)?;
+    crate::external_modules::enforce_external_state_limit(&state)?;
+    query.checkpoint()?;
+    Ok(state)
+}
+
+fn staged_external_state(
+    session: &MongrelSession,
+    table_name: &str,
+    query: &RegisteredSqlQuery,
+) -> Result<Option<Vec<u8>>> {
+    let mut transaction = session.transaction.lock();
+    let Some(staged) = transaction.staged_ops.as_mut() else {
+        return Ok(None);
+    };
+    let mut state = None;
+    for (op_index, op) in staged.reader()?.enumerate() {
+        if op_index % COMMAND_CHECKPOINT_ROWS == 0 {
+            query.checkpoint()?;
+        }
+        if let PendingSqlOp::ExternalState {
+            table,
+            state: candidate,
+            ..
+        } = op?
+        {
+            if table == table_name {
+                state = Some(candidate);
             }
         }
     }
-    crate::external_modules::external_table_state_bytes(db, entry)
+    Ok(state)
 }
 
 fn stage_external_write(
@@ -1899,11 +3056,15 @@ fn stage_external_write(
     db: &Arc<Database>,
     entry: &ExternalTableEntry,
     op: ExternalWriteOp,
+    query: &RegisteredSqlQuery,
 ) -> Result<()> {
-    let base_state = current_external_state(session, db, entry)?;
+    let base_state = current_external_state(session, db, entry, query)?;
+    query.checkpoint()?;
     let (state, result, base_writes) = session
         .external_modules
         .external_table_write(db, entry, base_state, op)?;
+    crate::external_modules::enforce_external_state_limit(&state)?;
+    query.checkpoint()?;
     let mut ops = base_writes
         .into_iter()
         .map(pending_op_from_external_base_write)
@@ -1932,6 +3093,7 @@ fn insert_external_rows(
     db: &Arc<Database>,
     entry: &ExternalTableEntry,
     insert: Insert,
+    query: &RegisteredSqlQuery,
 ) -> Result<()> {
     ensure_external_write_allowed("INSERT", entry)?;
     if insert.on.is_some() {
@@ -1944,7 +3106,8 @@ fn insert_external_rows(
     let value_rows = values_rows(insert.source.as_deref())?;
     let mut rows = Vec::with_capacity(value_rows.len());
     let mut inserted = 0_u64;
-    for value_row in value_rows {
+    for (index, value_row) in value_rows.into_iter().enumerate() {
+        command_checkpoint(session, query, index)?;
         if value_row.len() != columns.len() {
             return Err(MongrelQueryError::Schema(format!(
                 "INSERT has {} values for {} columns",
@@ -1960,7 +3123,7 @@ fn insert_external_rows(
         inserted = inserted.saturating_add(1);
     }
     let _ = inserted;
-    stage_external_write(session, db, entry, ExternalWriteOp::Insert { rows })
+    stage_external_write(session, db, entry, ExternalWriteOp::Insert { rows }, query)
 }
 
 fn update_external_rows(
@@ -1968,19 +3131,21 @@ fn update_external_rows(
     db: &Arc<Database>,
     entry: &ExternalTableEntry,
     update: sqlparser::ast::Update,
+    query: &RegisteredSqlQuery,
 ) -> Result<()> {
     ensure_external_write_allowed("UPDATE", entry)?;
     let schema = &entry.declared_schema;
-    let mut rows = current_external_rows(session, db, entry)?;
+    let mut rows = current_external_rows(session, db, entry, query)?;
     let mut changed = 0_u64;
-    for row in &mut rows {
+    for (index, row) in rows.iter_mut().enumerate() {
+        command_checkpoint(session, query, index)?;
         let matches = match update.selection.as_ref() {
-            Some(selection) => eval_bool_expr(selection, schema, row)?,
+            Some(selection) => eval_bool_expr(selection, schema, row, query)?,
             None => true,
         };
         if matches {
             for assignment in &update.assignments {
-                apply_assignment(schema, row, assignment, None)?;
+                apply_assignment(session, schema, row, assignment, None, query)?;
             }
             changed = changed.saturating_add(1);
         }
@@ -1993,6 +3158,7 @@ fn update_external_rows(
             rows,
             changes: changed,
         },
+        query,
     )
 }
 
@@ -2001,14 +3167,16 @@ fn delete_external_rows(
     db: &Arc<Database>,
     entry: &ExternalTableEntry,
     delete: Delete,
+    query: &RegisteredSqlQuery,
 ) -> Result<()> {
     ensure_external_write_allowed("DELETE", entry)?;
     let schema = &entry.declared_schema;
-    let rows = current_external_rows(session, db, entry)?;
+    let rows = current_external_rows(session, db, entry, query)?;
     let mut kept = Vec::with_capacity(rows.len());
     let mut deleted = 0_u64;
-    for row in rows {
-        if view_row_matches(delete.selection.as_ref(), schema, &row)? {
+    for (index, row) in rows.into_iter().enumerate() {
+        command_checkpoint(session, query, index)?;
+        if view_row_matches(delete.selection.as_ref(), schema, &row, query)? {
             deleted = deleted.saturating_add(1);
         } else {
             kept.push(row);
@@ -2022,6 +3190,7 @@ fn delete_external_rows(
             rows: kept,
             changes: deleted,
         },
+        query,
     )
 }
 
@@ -2029,21 +3198,26 @@ fn create_trigger(
     session: &MongrelSession,
     db: &Arc<Database>,
     create: CreateTrigger,
+    query: &RegisteredSqlQuery,
 ) -> Result<()> {
     let or_replace = create.or_replace || create.or_alter;
-    let trigger = trigger_from_sql(session, db, create)?;
-    if or_replace {
-        db.create_or_replace_trigger(trigger)?;
-    } else {
-        db.create_trigger(trigger)?;
-    }
-    Ok(())
+    let trigger = trigger_from_sql(session, db, create, query)?;
+    run_controlled_durable_with_epoch(session, query, |before_publish| {
+        let trigger = if or_replace {
+            db.create_or_replace_trigger_controlled(trigger, before_publish)?
+        } else {
+            db.create_trigger_controlled(trigger, before_publish)?
+        };
+        let epoch = trigger.updated_epoch;
+        Ok(((), epoch))
+    })
 }
 
 fn create_trigger_if_not_exists_manual(
     session: &MongrelSession,
     db: &Arc<Database>,
     sql: &str,
+    query: &RegisteredSqlQuery,
 ) -> Result<()> {
     let sql = sql.trim().trim_end_matches(';').trim();
     let rest = &sql["create trigger if not exists ".len()..];
@@ -2055,7 +3229,12 @@ fn create_trigger_if_not_exists_manual(
             "only one statement may be executed at a time".into(),
         ));
     }
-    let Statement::CreateTrigger(trigger) = statements.into_iter().next().unwrap() else {
+    let Some(statement) = statements.into_iter().next() else {
+        return Err(MongrelQueryError::InvalidQueryState(
+            "trigger parser returned no statement".into(),
+        ));
+    };
+    let Statement::CreateTrigger(trigger) = statement else {
         return Err(MongrelQueryError::Schema(
             "expected CREATE TRIGGER IF NOT EXISTS".into(),
         ));
@@ -2064,31 +3243,43 @@ fn create_trigger_if_not_exists_manual(
     if db.trigger(&name).is_some() {
         return Ok(());
     }
-    create_trigger(session, db, trigger)?;
+    create_trigger(session, db, trigger, query)?;
     session.clear_cache();
     Ok(())
 }
 
-fn drop_trigger(db: &Arc<Database>, drop: DropTrigger) -> Result<()> {
+fn drop_trigger(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    drop: DropTrigger,
+    query: &RegisteredSqlQuery,
+) -> Result<()> {
     if drop.table_name.is_some() {
         return Err(MongrelQueryError::Schema(
             "DROP TRIGGER ON <table> is not required; trigger names are database-scoped".into(),
         ));
     }
     let name = object_name(&drop.trigger_name)?;
-    match db.drop_trigger(&name) {
-        Ok(()) => Ok(()),
-        Err(e) if drop.if_exists && matches!(e, mongreldb_core::MongrelError::NotFound(_)) => {
-            Ok(())
+    if db.trigger(&name).is_none() {
+        if drop.if_exists {
+            return Ok(());
         }
-        Err(e) => Err(e.into()),
+        return Err(MongrelQueryError::Core(
+            mongreldb_core::MongrelError::NotFound(name),
+        ));
     }
+    run_controlled_durable_with_epoch(session, query, |before_publish| {
+        let names = [name.clone()];
+        let epoch = db.drop_triggers_with_epoch_controlled(&names, before_publish)?;
+        Ok(((), epoch.0))
+    })
 }
 
 fn trigger_from_sql(
     session: &MongrelSession,
     db: &Arc<Database>,
     create: CreateTrigger,
+    query: &RegisteredSqlQuery,
 ) -> Result<StoredTrigger> {
     if create.temporary || create.is_constraint || create.referenced_table_name.is_some() {
         return Err(MongrelQueryError::Schema(
@@ -2184,12 +3375,18 @@ fn trigger_from_sql(
         MongrelQueryError::Schema("trigger body must contain BEGIN ... END statements".into())
     })?;
     let mut steps = Vec::new();
-    for statement in trigger_statement_list(&statements) {
+    for (index, statement) in trigger_statement_list(&statements).iter().enumerate() {
+        if index % COMMAND_CHECKPOINT_ROWS == 0 {
+            session.fire_test_hook(SqlTestHookPoint::DuringTriggerExpansion);
+            query.checkpoint()?;
+        }
         steps.extend(trigger_steps_from_statement(
+            session,
             db,
             statement,
             &target_schema,
             event,
+            query,
         )?);
     }
     let trigger = StoredTrigger::new(
@@ -2217,13 +3414,17 @@ fn trigger_statement_list(statements: &ConditionalStatements) -> &[Statement] {
 }
 
 fn trigger_steps_from_statement(
+    session: &MongrelSession,
     db: &Arc<Database>,
     statement: &Statement,
     trigger_schema: &CoreSchema,
     event: TriggerEvent,
+    query: &RegisteredSqlQuery,
 ) -> Result<Vec<TriggerStep>> {
     match statement {
-        Statement::Insert(insert) => trigger_insert_steps(db, insert, trigger_schema, event),
+        Statement::Insert(insert) => {
+            trigger_insert_steps(session, db, insert, trigger_schema, event, query)
+        }
         Statement::Update(update) => trigger_update_step(db, update, trigger_schema, event),
         Statement::Delete(delete) => trigger_delete_step(db, delete, trigger_schema, event),
         Statement::Query(query) => trigger_query_step(query, trigger_schema, event),
@@ -2234,10 +3435,12 @@ fn trigger_steps_from_statement(
 }
 
 fn trigger_insert_steps(
+    session: &MongrelSession,
     db: &Arc<Database>,
     insert: &Insert,
     trigger_schema: &CoreSchema,
     event: TriggerEvent,
+    query: &RegisteredSqlQuery,
 ) -> Result<Vec<TriggerStep>> {
     if insert.returning.is_some() || insert.on.is_some() {
         return Err(MongrelQueryError::Schema(
@@ -2256,7 +3459,12 @@ fn trigger_insert_steps(
     let columns = insert_columns(&schema, &insert.columns)?;
     let rows = values_rows(insert.source.as_deref())?;
     let mut steps = Vec::with_capacity(rows.len());
+    let mut expanded_values = 0_usize;
     for row in rows {
+        if expanded_values % COMMAND_CHECKPOINT_ROWS == 0 {
+            session.fire_test_hook(SqlTestHookPoint::DuringTriggerExpansion);
+            query.checkpoint()?;
+        }
         if row.len() != columns.len() {
             return Err(MongrelQueryError::Schema(format!(
                 "trigger INSERT has {} values for {} columns",
@@ -2266,10 +3474,15 @@ fn trigger_insert_steps(
         }
         let mut cells = Vec::with_capacity(row.len());
         for (col, expr) in columns.iter().zip(row.iter()) {
+            if expanded_values % COMMAND_CHECKPOINT_ROWS == 0 {
+                session.fire_test_hook(SqlTestHookPoint::DuringTriggerExpansion);
+                query.checkpoint()?;
+            }
             cells.push(TriggerCell {
                 column_id: col.id,
                 value: trigger_value_from_sql(expr, trigger_schema, event, Some(col.ty.clone()))?,
             });
+            expanded_values = expanded_values.saturating_add(1);
         }
         steps.push(TriggerStep::Insert {
             table: table.clone(),
@@ -2602,7 +3815,11 @@ fn trigger_value_from_sql(
     }
 }
 
-async fn create_view(session: &MongrelSession, view: CreateView) -> Result<()> {
+async fn create_view(
+    session: &MongrelSession,
+    view: CreateView,
+    query: &RegisteredSqlQuery,
+) -> Result<()> {
     let name = object_name(&view.name)?;
 
     if view.materialized {
@@ -2619,26 +3836,7 @@ async fn create_view(session: &MongrelSession, view: CreateView) -> Result<()> {
                 "table or materialized view {name:?} already exists"
             )));
         }
-        let query = view.query.to_string();
-        create_table_as_select(session, db, &name, &view.query).await?;
-        let incremental = infer_incremental_aggregate(db, &name, &view.query)?;
-        let mut definition = mongreldb_core::MaterializedViewEntry {
-            name: name.clone(),
-            query,
-            last_refresh_epoch: db.visible_epoch().0,
-            incremental,
-        };
-        let definition_result = if definition.incremental.is_some() {
-            rebuild_incremental_aggregate(db, &mut definition).map(|_| ())
-        } else {
-            db.set_materialized_view(definition).map_err(Into::into)
-        };
-        if let Err(error) = definition_result {
-            let _ = db.drop_table(&name);
-            let _ = session.ctx.deregister_table(&name);
-            session.tables.lock().remove(&name);
-            return Err(error);
-        }
+        create_table_as_select(session, db, &name, &view.query, query, true).await?;
         return Ok(());
     }
 
@@ -2647,11 +3845,15 @@ async fn create_view(session: &MongrelSession, view: CreateView) -> Result<()> {
     Ok(())
 }
 
-async fn refresh_materialized_view(session: &MongrelSession, name: &str) -> Result<()> {
+async fn refresh_materialized_view(
+    session: &MongrelSession,
+    name: &str,
+    query: &RegisteredSqlQuery,
+) -> Result<()> {
     let db = session.database.as_ref().ok_or_else(|| {
         MongrelQueryError::Schema("REFRESH MATERIALIZED VIEW requires a Database".into())
     })?;
-    if session.sql_txn.lock().is_some() {
+    if session.transaction.lock().staged_ops.is_some() {
         return Err(MongrelQueryError::Schema(
             "REFRESH MATERIALIZED VIEW is not allowed inside an explicit transaction".into(),
         ));
@@ -2659,41 +3861,175 @@ async fn refresh_materialized_view(session: &MongrelSession, name: &str) -> Resu
     let mut definition = db.materialized_view(name).ok_or_else(|| {
         MongrelQueryError::Schema(format!("materialized view {name:?} does not exist"))
     })?;
+    if definition.incremental.is_none() {
+        let definition_query = Parser::parse_sql(&GenericDialect {}, &definition.query)
+            .map_err(|error| MongrelQueryError::Schema(error.to_string()))?
+            .into_iter()
+            .next()
+            .and_then(|statement| match statement {
+                Statement::Query(query) => Some(query),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                MongrelQueryError::Schema("materialized view definition is not a query".into())
+            })?;
+        definition.incremental = infer_incremental_aggregate(db, name, &definition_query)?;
+        if definition.incremental.is_some() {
+            rebuild_incremental_aggregate(session, db, &mut definition, query)?;
+            session.clear_cache();
+            return Ok(());
+        }
+    }
     if definition.incremental.is_some() {
-        if refresh_incremental_aggregate(db, &mut definition)?.is_none() {
-            rebuild_incremental_aggregate(db, &mut definition)?;
+        if refresh_incremental_aggregate(session, db, &mut definition, query)?.is_none() {
+            rebuild_incremental_aggregate(session, db, &mut definition, query)?;
         }
         session.clear_cache();
         return Ok(());
     }
     let schema = table_schema(db, name)?;
-    let batches = Box::pin(session.run(&definition.query)).await?;
-    for batch in &batches {
-        if batch.num_columns() != schema.columns.len() {
-            return Err(MongrelQueryError::Schema(format!(
-                "materialized view {name:?} query now returns {} columns; expected {}",
-                batch.num_columns(),
-                schema.columns.len()
-            )));
-        }
+    query.checkpoint()?;
+    let mut stream = session
+        .execute_command_source_stream(&definition.query, query)
+        .await?;
+    if stream.schema().fields().len() != schema.columns.len() {
+        return Err(MongrelQueryError::Schema(format!(
+            "materialized view {name:?} query now returns {} columns; expected {}",
+            stream.schema().fields().len(),
+            schema.columns.len()
+        )));
     }
 
-    let mut transaction = db.begin_as(session.principal());
-    transaction.truncate(name)?;
-    for batch in &batches {
-        for row_index in 0..batch.num_rows() {
-            let mut cells = Vec::with_capacity(batch.num_columns());
-            for (column_index, column) in batch.columns().iter().enumerate() {
-                cells.push((
-                    schema.columns[column_index].id,
-                    arrow_cell_to_value(column, row_index)?,
-                ));
+    let temp_table = format!("__mongreldb_ctas_build_{}_mv_refresh", query.id());
+    db.create_rebuilding_table(&temp_table, name, &query.id().to_string(), schema.clone())?;
+    let mut converted = 0_usize;
+    loop {
+        let batch = match next_command_batch(&mut stream, query).await {
+            Ok(Some(batch)) => batch,
+            Ok(None) => break,
+            Err(error) => {
+                let _ = db.discard_building_table(&temp_table);
+                return Err(error);
             }
-            transaction.put(name, cells)?;
+        };
+        let batch_bytes = batch
+            .columns()
+            .iter()
+            .map(|column| column.get_array_memory_size())
+            .fold(0_usize, usize::saturating_add);
+        if batch_bytes > CTAS_INPUT_BATCH_BYTES_LIMIT {
+            let _ = db.discard_building_table(&temp_table);
+            return Err(mongreldb_core::MongrelError::ResourceLimitExceeded {
+                resource: "materialized-view refresh input batch bytes",
+                requested: batch_bytes,
+                limit: CTAS_INPUT_BATCH_BYTES_LIMIT,
+            }
+            .into());
+        }
+
+        let mut row_index = 0_usize;
+        while row_index < batch.num_rows() {
+            let mut transaction = db.begin_as(session.principal());
+            let mut staged_rows = 0_usize;
+            let mut staged_bytes = 0_usize;
+            while row_index < batch.num_rows() && staged_rows < CTAS_STAGING_ROWS_LIMIT {
+                if let Err(error) = command_checkpoint(session, query, converted) {
+                    drop(transaction);
+                    let _ = db.discard_building_table(&temp_table);
+                    return Err(error);
+                }
+                let mut cells = Vec::with_capacity(batch.num_columns());
+                for (column_index, column) in batch.columns().iter().enumerate() {
+                    let value = match arrow_cell_to_value(column, row_index) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            drop(transaction);
+                            let _ = db.discard_building_table(&temp_table);
+                            return Err(error);
+                        }
+                    };
+                    cells.push((schema.columns[column_index].id, value));
+                }
+                let row_bytes = cells_deep_bytes(&cells);
+                if row_bytes > CTAS_STAGING_BYTES_LIMIT {
+                    drop(transaction);
+                    let _ = db.discard_building_table(&temp_table);
+                    return Err(mongreldb_core::MongrelError::ResourceLimitExceeded {
+                        resource: "materialized-view refresh staged row bytes",
+                        requested: row_bytes,
+                        limit: CTAS_STAGING_BYTES_LIMIT,
+                    }
+                    .into());
+                }
+                if staged_rows > 0
+                    && staged_bytes.saturating_add(row_bytes) > CTAS_STAGING_BYTES_LIMIT
+                {
+                    break;
+                }
+                if let Err(error) = transaction.put_building(&temp_table, cells) {
+                    drop(transaction);
+                    let _ = db.discard_building_table(&temp_table);
+                    return Err(error.into());
+                }
+                staged_rows += 1;
+                staged_bytes = staged_bytes.saturating_add(row_bytes);
+                row_index += 1;
+                converted += 1;
+            }
+            if staged_rows > 0 {
+                if let Err(error) = transaction.commit_controlled(query.control(), || Ok(())) {
+                    let _ = db.discard_building_table(&temp_table);
+                    return Err(error.into());
+                }
+            }
         }
     }
-    transaction.set_materialized_view_definition(definition)?;
-    transaction.commit()?;
+    if let Err(error) = query.checkpoint() {
+        let _ = db.discard_building_table(&temp_table);
+        return Err(error);
+    }
+    let publish = run_controlled_durable_with_epoch(session, query, |before_commit| {
+        let epoch = db.publish_materialized_rebuilding_table_controlled(
+            &temp_table,
+            name,
+            definition,
+            before_commit,
+        )?;
+        Ok(((), epoch.0))
+    });
+    if let Err(error) = publish {
+        let may_be_published = matches!(
+            &error,
+            MongrelQueryError::CommitOutcome {
+                committed: true,
+                ..
+            } | MongrelQueryError::OutcomeUnknown { .. }
+        );
+        if may_be_published {
+            let _ = session.ctx.deregister_table(name);
+            session.tables.lock().remove(name);
+            if let Err(register_error) = register_table(session, db, name) {
+                let message = format!("{error}; table registration failed: {register_error}");
+                return Err(
+                    if matches!(&error, MongrelQueryError::OutcomeUnknown { .. }) {
+                        query.outcome_unknown_error(message)
+                    } else {
+                        query.commit_outcome_error(message)
+                    },
+                );
+            }
+            session.clear_cache();
+            let _ = db.discard_building_table(&temp_table);
+            return Err(error);
+        }
+        let _ = db.discard_building_table(&temp_table);
+        return Err(error);
+    }
+    let _ = session.ctx.deregister_table(name);
+    session.tables.lock().remove(name);
+    if let Err(error) = register_table(session, db, name) {
+        return Err(query.commit_outcome_error(error.to_string()));
+    }
     session.clear_cache();
     Ok(())
 }
@@ -2710,10 +4046,31 @@ struct AggregateDelta {
     sums: HashMap<u16, i64>,
 }
 
+fn aggregate_group_entry_bytes(key: &[u8], group: &Value, output_count: usize) -> usize {
+    std::mem::size_of::<Vec<u8>>()
+        .saturating_add(key.len())
+        .saturating_add(std::mem::size_of::<AggregateState>())
+        .saturating_add(value_encoded_key_len(group))
+        .saturating_add(output_count.saturating_mul(
+            std::mem::size_of::<(u16, i64)>().saturating_add(2 * std::mem::size_of::<usize>()),
+        ))
+        .saturating_add(4 * std::mem::size_of::<usize>())
+}
+
 fn infer_incremental_aggregate(
     db: &Arc<Database>,
     target: &str,
     query: &Query,
+) -> Result<Option<mongreldb_core::IncrementalAggregateView>> {
+    let target_schema = table_schema(db, target)?;
+    infer_incremental_aggregate_with_schema(db, target, query, &target_schema)
+}
+
+fn infer_incremental_aggregate_with_schema(
+    db: &Arc<Database>,
+    target: &str,
+    query: &Query,
+    target_schema: &CoreSchema,
 ) -> Result<Option<mongreldb_core::IncrementalAggregateView>> {
     if query.with.is_some()
         || query.limit_clause.is_some()
@@ -2775,7 +4132,6 @@ fn infer_incremental_aggregate(
         return Ok(None);
     }
     let source_schema = table_schema(db, &source_table)?;
-    let target_schema = table_schema(db, target)?;
     let sqlparser::ast::GroupByExpr::Expressions(group_by, modifiers) = &select.group_by else {
         return Ok(None);
     };
@@ -2897,91 +4253,146 @@ fn check_expr_column_name(expr: &Expr) -> Option<&str> {
     }
 }
 
-fn rebuild_incremental_aggregate(
+fn collect_incremental_aggregate_groups(
+    session: &MongrelSession,
     db: &Arc<Database>,
-    definition: &mut mongreldb_core::MaterializedViewEntry,
-) -> Result<mongreldb_core::Epoch> {
-    let mut plan = definition.incremental.clone().ok_or_else(|| {
-        MongrelQueryError::Schema("materialized view has no incremental plan".into())
-    })?;
+    plan: &mongreldb_core::IncrementalAggregateView,
+    query: &RegisteredSqlQuery,
+) -> Result<(
+    std::collections::BTreeMap<Vec<u8>, AggregateState>,
+    mongreldb_core::Snapshot,
+)> {
+    query.checkpoint()?;
     let (snapshot, _retention) = db.snapshot_owned();
-    let source_rows = db
-        .table(&plan.source_table)?
-        .lock()
-        .visible_rows(snapshot)?;
     let mut groups = std::collections::BTreeMap::<Vec<u8>, AggregateState>::new();
-    for row in &source_rows {
-        let group = row
-            .columns
-            .get(&plan.group_column)
-            .cloned()
-            .ok_or_else(|| {
-                MongrelQueryError::Schema("incremental group column is missing".into())
-            })?;
-        if matches!(group, Value::Null) {
-            return Err(MongrelQueryError::Schema(
-                "incremental group column cannot be NULL".into(),
-            ));
-        }
-        let state = groups
-            .entry(group.encode_key())
-            .or_insert_with(|| AggregateState {
+    let mut group_state_bytes = 0_usize;
+    for_each_visible_row_at_snapshot_controlled(
+        session,
+        db,
+        &plan.source_table,
+        Some(snapshot),
+        query,
+        |_schema, row| {
+            let group = row
+                .columns
+                .get(&plan.group_column)
+                .cloned()
+                .ok_or_else(|| {
+                    MongrelQueryError::Schema("incremental group column is missing".into())
+                })?;
+            if matches!(group, Value::Null) {
+                return Err(MongrelQueryError::Schema(
+                    "incremental group column cannot be NULL".into(),
+                ));
+            }
+            let group_key = group.encode_key();
+            if !groups.contains_key(&group_key) && groups.len() >= INCREMENTAL_AGGREGATE_MAX_GROUPS
+            {
+                return Err(MongrelQueryError::Schema(format!(
+                    "incremental materialized view exceeds limit of {INCREMENTAL_AGGREGATE_MAX_GROUPS} groups"
+                )));
+            }
+            if !groups.contains_key(&group_key) {
+                let requested = group_state_bytes.saturating_add(aggregate_group_entry_bytes(
+                    &group_key,
+                    &group,
+                    plan.outputs.len(),
+                ));
+                if requested > INCREMENTAL_AGGREGATE_STATE_BYTES_LIMIT {
+                    return Err(mongreldb_core::MongrelError::ResourceLimitExceeded {
+                        resource: "incremental materialized view group state bytes",
+                        requested,
+                        limit: INCREMENTAL_AGGREGATE_STATE_BYTES_LIMIT,
+                    }
+                    .into());
+                }
+                group_state_bytes = requested;
+            }
+            let state = groups.entry(group_key).or_insert_with(|| AggregateState {
                 group,
                 count: 0,
                 sums: HashMap::new(),
             });
-        state.count = state
-            .count
-            .checked_add(1)
-            .ok_or_else(|| MongrelQueryError::Schema("COUNT overflow".into()))?;
-        for output in &plan.outputs {
-            if let mongreldb_core::IncrementalAggregateKind::Sum { source_column } = output.kind {
-                let Some(Value::Int64(value)) = row.columns.get(&source_column) else {
-                    return Err(MongrelQueryError::Schema(
-                        "incremental SUM column must be non-null BIGINT".into(),
-                    ));
-                };
-                let sum = state.sums.entry(source_column).or_insert(0);
-                *sum = sum
-                    .checked_add(*value)
-                    .ok_or_else(|| MongrelQueryError::Schema("SUM overflow".into()))?;
+            state.count = state
+                .count
+                .checked_add(1)
+                .ok_or_else(|| MongrelQueryError::Schema("COUNT overflow".into()))?;
+            for output in &plan.outputs {
+                if let mongreldb_core::IncrementalAggregateKind::Sum { source_column } = output.kind
+                {
+                    let Some(Value::Int64(value)) = row.columns.get(&source_column) else {
+                        return Err(MongrelQueryError::Schema(
+                            "incremental SUM column must be non-null BIGINT".into(),
+                        ));
+                    };
+                    let sum = state.sums.entry(source_column).or_insert(0);
+                    *sum = sum
+                        .checked_add(*value)
+                        .ok_or_else(|| MongrelQueryError::Schema("SUM overflow".into()))?;
+                }
             }
-        }
-    }
+            Ok(())
+        },
+    )?;
+    Ok((groups, snapshot))
+}
+
+fn rebuild_incremental_aggregate(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    definition: &mut mongreldb_core::MaterializedViewEntry,
+    query: &RegisteredSqlQuery,
+) -> Result<mongreldb_core::Epoch> {
+    let mut plan = definition.incremental.clone().ok_or_else(|| {
+        MongrelQueryError::Schema("materialized view has no incremental plan".into())
+    })?;
+    let (groups, snapshot) = collect_incremental_aggregate_groups(session, db, &plan, query)?;
 
     plan.checkpoint_event_id = format!("{}:{}", snapshot.epoch.0, u32::MAX);
     definition.incremental = Some(plan.clone());
-    let mut transaction = db.begin();
+    let mut transaction = db.begin_as(session.principal());
     transaction.truncate(&definition.name)?;
-    for state in groups.into_values() {
+    for (index, state) in groups.into_values().enumerate() {
+        command_checkpoint(session, query, index)?;
         transaction.put(
             &definition.name,
             aggregate_cells(&plan, state.group, state.count, &state.sums)?,
         )?;
     }
     transaction.set_materialized_view_definition(definition.clone())?;
-    let epoch = transaction.commit()?;
+    let epoch = run_controlled_durable_with_epoch(session, query, |before_commit| {
+        let epoch = transaction.commit_controlled(query.control(), before_commit)?;
+        Ok((epoch, epoch.0))
+    })?;
     definition.last_refresh_epoch = epoch.0;
     Ok(epoch)
 }
 
 fn refresh_incremental_aggregate(
+    session: &MongrelSession,
     db: &Arc<Database>,
     definition: &mut mongreldb_core::MaterializedViewEntry,
+    query: &RegisteredSqlQuery,
 ) -> Result<Option<mongreldb_core::Epoch>> {
     let mut plan = definition.incremental.clone().ok_or_else(|| {
         MongrelQueryError::Schema("materialized view has no incremental plan".into())
     })?;
-    let changes = db.change_events_since(Some(&plan.checkpoint_event_id))?;
+    query.checkpoint()?;
+    let changes =
+        db.change_events_since_controlled(Some(&plan.checkpoint_event_id), query.control())?;
+    query.checkpoint()?;
     if changes.gap {
         return Ok(None);
     }
     let mut deltas = std::collections::BTreeMap::<Vec<u8>, AggregateDelta>::new();
-    for event in changes
+    let mut delta_state_bytes = 0_usize;
+    for (event_index, event) in changes
         .events
         .iter()
         .filter(|event| event.table_id == Some(plan.source_table_id))
+        .enumerate()
     {
+        command_checkpoint(session, query, event_index)?;
         let rows = match event.op.as_str() {
             "put" => event
                 .data
@@ -3018,31 +4429,49 @@ fn refresh_incremental_aggregate(
             return Ok(None);
         };
         let sign = if event.op == "delete" { -1 } else { 1 };
-        for row in &rows {
-            if !apply_aggregate_delta(&mut deltas, &plan, row, sign) {
+        for (row_index, row) in rows.iter().enumerate() {
+            command_checkpoint(session, query, row_index)?;
+            if !apply_aggregate_delta(&mut deltas, &mut delta_state_bytes, &plan, row, sign)? {
                 return Ok(None);
             }
         }
     }
 
-    let view_rows = db
-        .table(&definition.name)?
-        .lock()
-        .visible_rows(db.snapshot().0)?;
-    let existing: HashMap<Vec<u8>, Row> = view_rows
-        .into_iter()
-        .filter_map(|row| {
-            let key = row
-                .columns
-                .get(&plan.group_output_column)
-                .map(Value::encode_key);
-            key.map(|key| (key, row))
-        })
-        .collect();
+    let mut existing = HashMap::with_capacity(deltas.len());
+    let mut existing_bytes = 0_usize;
+    for_each_visible_row_controlled(session, db, &definition.name, query, |_schema, row| {
+        if let Some(key) = row
+            .columns
+            .get(&plan.group_output_column)
+            .map(Value::encode_key)
+        {
+            if deltas.contains_key(&key) {
+                if !existing.contains_key(&key) {
+                    let requested = existing_bytes
+                        .saturating_add(std::mem::size_of::<Vec<u8>>())
+                        .saturating_add(key.len())
+                        .saturating_add(row_deep_bytes(&row));
+                    if requested > INCREMENTAL_AGGREGATE_STATE_BYTES_LIMIT {
+                        return Err(mongreldb_core::MongrelError::ResourceLimitExceeded {
+                            resource: "incremental materialized view existing state bytes",
+                            requested,
+                            limit: INCREMENTAL_AGGREGATE_STATE_BYTES_LIMIT,
+                        }
+                        .into());
+                    }
+                    existing_bytes = requested;
+                }
+                existing.insert(key, row);
+            }
+        }
+        Ok(())
+    })?;
     let mut deletes = Vec::new();
     let mut updates = Vec::new();
     let mut inserts = Vec::new();
-    for (key, delta) in deltas {
+    let mut mutation_bytes = 0_usize;
+    for (index, (key, delta)) in deltas.into_iter().enumerate() {
+        command_checkpoint(session, query, index)?;
         let current = existing.get(&key);
         let current_count = match current.and_then(|row| row.columns.get(&plan.count_output_column))
         {
@@ -3081,6 +4510,16 @@ fn refresh_incremental_aggregate(
             sums.insert(source_column, next_sum);
         }
         let cells = aggregate_cells(&plan, delta.group, next_count, &sums)?;
+        let requested = mutation_bytes.saturating_add(cells_deep_bytes(&cells));
+        if requested > INCREMENTAL_AGGREGATE_STATE_BYTES_LIMIT {
+            return Err(mongreldb_core::MongrelError::ResourceLimitExceeded {
+                resource: "incremental materialized view mutation bytes",
+                requested,
+                limit: INCREMENTAL_AGGREGATE_STATE_BYTES_LIMIT,
+            }
+            .into());
+        }
+        mutation_bytes = requested;
         if let Some(row) = current {
             updates.push((row.row_id, cells));
         } else {
@@ -3090,43 +4529,69 @@ fn refresh_incremental_aggregate(
 
     plan.checkpoint_event_id = format!("{}:{}", changes.current_epoch, u32::MAX);
     definition.incremental = Some(plan);
-    let mut transaction = db.begin();
-    for row_id in deletes {
+    let mut transaction = db.begin_as(session.principal());
+    for (index, row_id) in deletes.into_iter().enumerate() {
+        command_checkpoint(session, query, index)?;
         transaction.delete(&definition.name, row_id)?;
     }
     if !updates.is_empty() {
+        query.checkpoint()?;
         transaction.update_many(&definition.name, updates)?;
+        query.checkpoint()?;
     }
-    for cells in inserts {
+    for (index, cells) in inserts.into_iter().enumerate() {
+        command_checkpoint(session, query, index)?;
         transaction.put(&definition.name, cells)?;
     }
     transaction.set_materialized_view_definition(definition.clone())?;
-    let epoch = transaction.commit()?;
+    let epoch = run_controlled_durable_with_epoch(session, query, |before_commit| {
+        let epoch = transaction.commit_controlled(query.control(), before_commit)?;
+        Ok((epoch, epoch.0))
+    })?;
     definition.last_refresh_epoch = epoch.0;
     Ok(Some(epoch))
 }
 
 fn apply_aggregate_delta(
     deltas: &mut std::collections::BTreeMap<Vec<u8>, AggregateDelta>,
+    delta_state_bytes: &mut usize,
     plan: &mongreldb_core::IncrementalAggregateView,
     row: &Row,
     sign: i64,
-) -> bool {
+) -> Result<bool> {
     let Some(group) = row.columns.get(&plan.group_column).cloned() else {
-        return false;
+        return Ok(false);
     };
     if matches!(group, Value::Null) {
-        return false;
+        return Ok(false);
     }
-    let delta = deltas
-        .entry(group.encode_key())
-        .or_insert_with(|| AggregateDelta {
-            group,
-            count: 0,
-            sums: HashMap::new(),
-        });
+    let group_key = group.encode_key();
+    if !deltas.contains_key(&group_key) && deltas.len() >= INCREMENTAL_AGGREGATE_MAX_GROUPS {
+        return Ok(false);
+    }
+    if !deltas.contains_key(&group_key) {
+        let requested = delta_state_bytes.saturating_add(aggregate_group_entry_bytes(
+            &group_key,
+            &group,
+            plan.outputs.len(),
+        ));
+        if requested > INCREMENTAL_AGGREGATE_STATE_BYTES_LIMIT {
+            return Err(mongreldb_core::MongrelError::ResourceLimitExceeded {
+                resource: "incremental materialized view delta state bytes",
+                requested,
+                limit: INCREMENTAL_AGGREGATE_STATE_BYTES_LIMIT,
+            }
+            .into());
+        }
+        *delta_state_bytes = requested;
+    }
+    let delta = deltas.entry(group_key).or_insert_with(|| AggregateDelta {
+        group,
+        count: 0,
+        sums: HashMap::new(),
+    });
     let Some(count) = delta.count.checked_add(sign) else {
-        return false;
+        return Ok(false);
     };
     delta.count = count;
     for output in &plan.outputs {
@@ -3134,18 +4599,18 @@ fn apply_aggregate_delta(
             continue;
         };
         let Some(Value::Int64(value)) = row.columns.get(&source_column) else {
-            return false;
+            return Ok(false);
         };
         let Some(signed) = value.checked_mul(sign) else {
-            return false;
+            return Ok(false);
         };
         let sum = delta.sums.entry(source_column).or_insert(0);
         let Some(next) = sum.checked_add(signed) else {
-            return false;
+            return Ok(false);
         };
         *sum = next;
     }
-    true
+    Ok(true)
 }
 
 fn aggregate_cells(
@@ -3214,7 +4679,12 @@ fn view_schema_from_columns(
     ))
 }
 
-fn create_policy(session: &MongrelSession, db: &Arc<Database>, policy: CreatePolicy) -> Result<()> {
+fn create_policy(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    policy: CreatePolicy,
+    query: &RegisteredSqlQuery,
+) -> Result<()> {
     db.require_for(
         session.principal().as_ref(),
         &mongreldb_core::Permission::Admin,
@@ -3265,13 +4735,25 @@ fn create_policy(session: &MongrelSession, db: &Arc<Database>, policy: CreatePol
         using,
         with_check,
     });
-    db.set_security_catalog_as(security, session.principal().as_ref())?;
-    session.refresh_registered_table(db, &table)?;
+    run_controlled_durable_with_epoch(session, query, |before_publish| {
+        let epoch = db.set_security_catalog_as_with_epoch_controlled(
+            security,
+            session.principal().as_ref(),
+            before_publish,
+        )?;
+        Ok(((), epoch.0))
+    })?;
+    post_commit_result(query, session.refresh_registered_table(db, &table))?;
     session.clear_cache();
     Ok(())
 }
 
-fn drop_policy(session: &MongrelSession, db: &Arc<Database>, policy: DropPolicy) -> Result<()> {
+fn drop_policy(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    policy: DropPolicy,
+    query: &RegisteredSqlQuery,
+) -> Result<()> {
     db.require_for(
         session.principal().as_ref(),
         &mongreldb_core::Permission::Admin,
@@ -3291,8 +4773,15 @@ fn drop_policy(session: &MongrelSession, db: &Arc<Database>, policy: DropPolicy)
             policy.name.value
         )));
     }
-    db.set_security_catalog_as(security, session.principal().as_ref())?;
-    session.refresh_registered_table(db, &table)?;
+    run_controlled_durable_with_epoch(session, query, |before_publish| {
+        let epoch = db.set_security_catalog_as_with_epoch_controlled(
+            security,
+            session.principal().as_ref(),
+            before_publish,
+        )?;
+        Ok(((), epoch.0))
+    })?;
+    post_commit_result(query, session.refresh_registered_table(db, &table))?;
     session.clear_cache();
     Ok(())
 }
@@ -3328,11 +4817,11 @@ fn lower_security_expr(expr: &Expr, schema: &CoreSchema) -> Result<mongreldb_cor
         {
             let left = Box::new(lower_security_expr(left, schema)?);
             let right = Box::new(lower_security_expr(right, schema)?);
-            Ok(match op {
-                BinaryOperator::And => SecurityExpr::And { left, right },
-                BinaryOperator::Or => SecurityExpr::Or { left, right },
-                _ => unreachable!(),
-            })
+            if matches!(op, BinaryOperator::And) {
+                Ok(SecurityExpr::And { left, right })
+            } else {
+                Ok(SecurityExpr::Or { left, right })
+            }
         }
         Expr::BinaryOp { left, op, right }
             if matches!(op, BinaryOperator::Eq | BinaryOperator::NotEq) =>
@@ -3413,38 +4902,56 @@ fn is_current_user_expr(expr: &Expr) -> bool {
     )
 }
 
-fn alter_table(session: &MongrelSession, db: &Arc<Database>, alter: AlterTable) -> Result<()> {
+fn alter_table(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    alter: AlterTable,
+    query: &RegisteredSqlQuery,
+) -> Result<()> {
     let table_name = object_name(&alter.name)?;
     if alter.operations.len() != 1 {
         return Err(MongrelQueryError::Schema(
             "ALTER TABLE currently supports one operation per statement".into(),
         ));
     }
-    match alter.operations.into_iter().next().unwrap() {
+    let operation = alter.operations.into_iter().next().ok_or_else(|| {
+        MongrelQueryError::InvalidQueryState("ALTER TABLE parser returned no operation".into())
+    })?;
+    match operation {
         AlterTableOperation::RenameTable {
             table_name: new_name,
         } => {
             let new_name = match new_name {
                 RenameTableNameKind::As(n) | RenameTableNameKind::To(n) => object_name(&n)?,
             };
-            db.rename_table(&table_name, &new_name)?;
+            if new_name == table_name {
+                return Ok(());
+            }
+            run_controlled_durable_with_epoch(session, query, |before_commit| {
+                let epoch =
+                    db.rename_table_with_epoch_controlled(&table_name, &new_name, before_commit)?;
+                Ok(((), epoch.0))
+            })?;
             let _ = session.ctx.deregister_table(&table_name);
             session.tables.lock().remove(&table_name);
-            register_table(session, db, &new_name)?;
+            post_commit_result(query, register_table(session, db, &new_name))?;
         }
         AlterTableOperation::RenameColumn {
             old_column_name,
             new_column_name,
         } => {
-            db.alter_column(
+            alter_column_controlled(
+                session,
+                db,
                 &table_name,
                 &old_column_name.value,
                 AlterColumn::rename(new_column_name.value),
+                query,
             )?;
-            session.refresh_registered_table(db, &table_name)?;
+            post_commit_result(query, session.refresh_registered_table(db, &table_name))?;
         }
         AlterTableOperation::AlterColumn { column_name, op } => {
-            alter_column(session, db, &table_name, column_name, op)?;
+            alter_column(session, db, &table_name, column_name, op, query)?;
         }
         AlterTableOperation::AddColumn {
             if_not_exists,
@@ -3465,7 +4972,7 @@ fn alter_table(session: &MongrelSession, db: &Arc<Database>, alter: AlterTable) 
             let col = core_column_from_sql(next_id, &column_def, false)?;
             schema.columns.push(col);
             schema.validate_auto_increment()?;
-            rebuild_table(session, db, &table_name, schema)?;
+            rebuild_table(session, db, &table_name, schema, query)?;
         }
         AlterTableOperation::DropColumn {
             column_names,
@@ -3486,15 +4993,15 @@ fn alter_table(session: &MongrelSession, db: &Arc<Database>, alter: AlterTable) 
                     .indexes
                     .retain(|idx| schema.columns.iter().any(|col| col.id == idx.column_id));
             }
-            rebuild_table(session, db, &table_name, schema)?;
+            rebuild_table(session, db, &table_name, schema, query)?;
         }
         AlterTableOperation::DropIndex { name } => {
             let mut schema = table_schema(db, &table_name)?;
             remove_index_defs(&mut schema, &name.value);
-            rebuild_table(session, db, &table_name, schema)?;
+            rebuild_table(session, db, &table_name, schema, query)?;
         }
         AlterTableOperation::AddConstraint { constraint, .. } => {
-            add_table_constraint(session, db, &table_name, constraint)?;
+            add_table_constraint(session, db, &table_name, constraint, query)?;
         }
         AlterTableOperation::DropConstraint {
             name, if_exists, ..
@@ -3508,21 +5015,39 @@ fn alter_table(session: &MongrelSession, db: &Arc<Database>, alter: AlterTable) 
                     name.value
                 )));
             }
-            rebuild_table(session, db, &table_name, schema)?;
+            rebuild_table(session, db, &table_name, schema, query)?;
         }
         AlterTableOperation::EnableRowLevelSecurity => {
             let mut security = db.security_catalog();
-            if !security.rls_tables.contains(&table_name) {
-                security.rls_tables.push(table_name.clone());
+            if security.rls_tables.contains(&table_name) {
+                return Ok(());
             }
-            db.set_security_catalog_as(security, session.principal().as_ref())?;
-            session.refresh_registered_table(db, &table_name)?;
+            security.rls_tables.push(table_name.clone());
+            run_controlled_durable_with_epoch(session, query, |before_publish| {
+                let epoch = db.set_security_catalog_as_with_epoch_controlled(
+                    security,
+                    session.principal().as_ref(),
+                    before_publish,
+                )?;
+                Ok(((), epoch.0))
+            })?;
+            post_commit_result(query, session.refresh_registered_table(db, &table_name))?;
         }
         AlterTableOperation::DisableRowLevelSecurity => {
             let mut security = db.security_catalog();
+            if !security.rls_tables.contains(&table_name) {
+                return Ok(());
+            }
             security.rls_tables.retain(|table| table != &table_name);
-            db.set_security_catalog_as(security, session.principal().as_ref())?;
-            session.refresh_registered_table(db, &table_name)?;
+            run_controlled_durable_with_epoch(session, query, |before_publish| {
+                let epoch = db.set_security_catalog_as_with_epoch_controlled(
+                    security,
+                    session.principal().as_ref(),
+                    before_publish,
+                )?;
+                Ok(((), epoch.0))
+            })?;
+            post_commit_result(query, session.refresh_registered_table(db, &table_name))?;
         }
         other => {
             return Err(MongrelQueryError::Schema(format!(
@@ -3540,42 +5065,89 @@ fn alter_column(
     table: &str,
     column: Ident,
     op: AlterColumnOperation,
+    query: &RegisteredSqlQuery,
 ) -> Result<()> {
-    match op {
+    let change = match op {
         AlterColumnOperation::SetNotNull => {
             let flags =
                 current_column_flags(db, table, &column.value)?.without(ColumnFlags::NULLABLE);
-            db.alter_column(table, &column.value, AlterColumn::set_flags(flags))?;
+            AlterColumn::set_flags(flags)
         }
         AlterColumnOperation::DropNotNull => {
             let flags = current_column_flags(db, table, &column.value)?.with(ColumnFlags::NULLABLE);
-            db.alter_column(table, &column.value, AlterColumn::set_flags(flags))?;
+            AlterColumn::set_flags(flags)
         }
         AlterColumnOperation::SetDataType { data_type, .. } => {
-            db.alter_column(
-                table,
-                &column.value,
-                AlterColumn::set_type(sql_type_to_core(&data_type)?),
-            )?;
+            AlterColumn::set_type(sql_type_to_core(&data_type)?)
         }
         AlterColumnOperation::SetDefault { value, .. } => {
-            db.alter_column(
-                table,
-                &column.value,
-                AlterColumn::set_default(sql_expr_to_default(&value)?),
-            )?;
+            AlterColumn::set_default(sql_expr_to_default(&value)?)
         }
-        AlterColumnOperation::DropDefault => {
-            db.alter_column(table, &column.value, AlterColumn::drop_default())?;
-        }
+        AlterColumnOperation::DropDefault => AlterColumn::drop_default(),
         other => {
             return Err(MongrelQueryError::Schema(format!(
                 "unsupported ALTER COLUMN operation: {other}"
             )));
         }
-    }
-    session.refresh_registered_table(db, table)?;
+    };
+    alter_column_controlled(session, db, table, &column.value, change, query)?;
+    post_commit_result(query, session.refresh_registered_table(db, table))?;
     Ok(())
+}
+
+fn alter_column_controlled(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    table: &str,
+    column: &str,
+    change: AlterColumn,
+    query: &RegisteredSqlQuery,
+) -> Result<Option<mongreldb_core::Epoch>> {
+    let outcome_unknown = std::cell::Cell::new(false);
+    let result = db.alter_column_with_epoch_controlled(
+        table,
+        column,
+        change,
+        query.control(),
+        || enter_commit_fence(session, query).map_err(query_error_to_core),
+        |epoch| match epoch {
+            Some(epoch) => {
+                query.record_commit(query.status().statement_index, epoch.0);
+                let exit = query.exit_commit_critical().map_err(query_error_to_core);
+                session.fire_test_hook(SqlTestHookPoint::AfterDurableCommit);
+                exit
+            }
+            None => {
+                outcome_unknown.set(true);
+                query.mark_outcome_unknown();
+                query.exit_commit_critical().map_err(query_error_to_core)
+            }
+        },
+    );
+    match result {
+        Ok((_, epoch)) => Ok(epoch),
+        Err(mongreldb_core::MongrelError::DurableCommit { epoch, message }) => {
+            if query.status().durable_outcome.last_commit_epoch != Some(epoch) {
+                query.record_commit(query.status().statement_index, epoch);
+            }
+            if query.status().phase == SqlQueryPhase::CommitCritical {
+                let exit = query.exit_commit_critical();
+                session.fire_test_hook(SqlTestHookPoint::AfterDurableCommit);
+                if let Err(error) = exit {
+                    return Err(query.commit_outcome_error(format!("{message}; {error}")));
+                }
+            }
+            query.checkpoint()?;
+            Err(query.commit_outcome_error(message))
+        }
+        Err(error) if outcome_unknown.get() || query.status().outcome_unknown => {
+            Err(query.outcome_unknown_error(error.to_string()))
+        }
+        Err(error) => {
+            query.checkpoint()?;
+            Err(error.into())
+        }
+    }
 }
 
 fn add_table_constraint(
@@ -3583,6 +5155,7 @@ fn add_table_constraint(
     db: &Arc<Database>,
     table: &str,
     constraint: TableConstraint,
+    query: &RegisteredSqlQuery,
 ) -> Result<()> {
     match constraint {
         TableConstraint::Index(idx) => {
@@ -3599,7 +5172,7 @@ fn add_table_constraint(
                 idx.columns,
                 index_kind_from_sql(idx.index_type.as_ref())?,
             )?;
-            rebuild_table(session, db, table, schema)
+            rebuild_table(session, db, table, schema, query)
         }
         TableConstraint::FulltextOrSpatial(idx) => {
             if !idx.fulltext {
@@ -3613,7 +5186,7 @@ fn add_table_constraint(
                 .map(|n| n.value)
                 .unwrap_or_else(|| "fulltext_idx".to_string());
             add_index_defs(&mut schema, &name, idx.columns, IndexKind::FmIndex)?;
-            rebuild_table(session, db, table, schema)
+            rebuild_table(session, db, table, schema, query)
         }
         TableConstraint::PrimaryKey(pk) => Err(MongrelQueryError::Schema(format!(
             "adding primary keys after table creation is not supported: {pk}"
@@ -3636,7 +5209,7 @@ fn add_table_constraint(
                     .unwrap_or_else(|| format!("check_{id}")),
                 expr,
             });
-            rebuild_table(session, db, table, schema)
+            rebuild_table(session, db, table, schema, query)
         }
         TableConstraint::Unique(_)
         | TableConstraint::ForeignKey(_)
@@ -3648,7 +5221,12 @@ fn add_table_constraint(
     }
 }
 
-fn create_index(session: &MongrelSession, db: &Arc<Database>, index: CreateIndex) -> Result<()> {
+fn create_index(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    index: CreateIndex,
+    query: &RegisteredSqlQuery,
+) -> Result<()> {
     if index.unique {
         return Err(MongrelQueryError::Schema(
             "CREATE UNIQUE INDEX is not supported by core SQL; use MongrelDB Kit unique constraints".into(),
@@ -3695,7 +5273,7 @@ fn create_index(session: &MongrelSession, db: &Arc<Database>, index: CreateIndex
             idx.validate_options()?;
         }
     }
-    rebuild_table(session, db, &table, schema)?;
+    rebuild_table(session, db, &table, schema, query)?;
     session.clear_cache();
     Ok(())
 }
@@ -3706,6 +5284,7 @@ fn drop_index(
     names: Vec<ObjectName>,
     table: Option<ObjectName>,
     if_exists: bool,
+    query: &RegisteredSqlQuery,
 ) -> Result<()> {
     for name in names {
         let index_name = object_name(&name)?;
@@ -3728,13 +5307,18 @@ fn drop_index(
                 "index {index_name} does not exist on {table_name}"
             )));
         }
-        rebuild_table(session, db, &table_name, schema)?;
+        rebuild_table(session, db, &table_name, schema, query)?;
     }
     session.clear_cache();
     Ok(())
 }
 
-fn insert_rows(session: &MongrelSession, db: &Arc<Database>, insert: Insert) -> Result<()> {
+fn insert_rows(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    insert: Insert,
+    query: &RegisteredSqlQuery,
+) -> Result<()> {
     let table = match &insert.table {
         TableObject::TableName(name) => object_name(name)?,
         _ => {
@@ -3754,16 +5338,17 @@ fn insert_rows(session: &MongrelSession, db: &Arc<Database>, insert: Insert) -> 
         ));
     }
     if session.view_definition(&table).is_some() {
-        return insert_view_rows(session, db, &table, insert);
+        return insert_view_rows(session, db, &table, insert, query);
     }
     if let Some(entry) = db.external_table(&table) {
-        return insert_external_rows(session, db, &entry, insert);
+        return insert_external_rows(session, db, &entry, insert, query);
     }
     let schema = table_schema(db, &table)?;
     let columns = insert_columns(&schema, &insert.columns)?;
     let rows = values_rows(insert.source.as_deref())?;
-    let mut ops = Vec::new();
-    for row in rows {
+    let mut ops = PendingSqlOps::default();
+    for (index, row) in rows.into_iter().enumerate() {
+        command_checkpoint(session, query, index)?;
         if row.len() != columns.len() {
             return Err(MongrelQueryError::Schema(format!(
                 "INSERT has {} values for {} columns",
@@ -3785,28 +5370,35 @@ fn insert_rows(session: &MongrelSession, db: &Arc<Database>, insert: Insert) -> 
                     ops.push(PendingSqlOp::Put {
                         table: table.clone(),
                         cells,
-                    });
+                    })?;
                 }
                 OnConflictAction::DoUpdate(update) => {
                     if let Some(existing) = pk_conflict_row(db, &table, &schema, &cells)? {
                         let excluded = cells_to_map(&cells);
                         let mut merged = existing.columns.clone();
                         for assignment in &update.assignments {
-                            apply_assignment(&schema, &mut merged, assignment, Some(&excluded))?;
+                            apply_assignment(
+                                session,
+                                &schema,
+                                &mut merged,
+                                assignment,
+                                Some(&excluded),
+                                query,
+                            )?;
                         }
                         ops.push(PendingSqlOp::Delete {
                             table: table.clone(),
                             row_id: existing.row_id,
-                        });
+                        })?;
                         ops.push(PendingSqlOp::Put {
                             table: table.clone(),
                             cells: map_to_cells(&merged),
-                        });
+                        })?;
                     } else {
                         ops.push(PendingSqlOp::Put {
                             table: table.clone(),
                             cells,
-                        });
+                        })?;
                     }
                 }
             },
@@ -3815,27 +5407,36 @@ fn insert_rows(session: &MongrelSession, db: &Arc<Database>, insert: Insert) -> 
                     let excluded = cells_to_map(&cells);
                     let mut merged = existing.columns.clone();
                     for assignment in assignments {
-                        apply_assignment(&schema, &mut merged, assignment, Some(&excluded))?;
+                        apply_assignment(
+                            session,
+                            &schema,
+                            &mut merged,
+                            assignment,
+                            Some(&excluded),
+                            query,
+                        )?;
                     }
                     ops.push(PendingSqlOp::Delete {
                         table: table.clone(),
                         row_id: existing.row_id,
-                    });
+                    })?;
                     ops.push(PendingSqlOp::Put {
                         table: table.clone(),
                         cells: map_to_cells(&merged),
-                    });
+                    })?;
                 } else {
                     ops.push(PendingSqlOp::Put {
                         table: table.clone(),
                         cells,
-                    });
+                    })?;
                 }
             }
-            None => ops.push(PendingSqlOp::Put {
-                table: table.clone(),
-                cells,
-            }),
+            None => {
+                ops.push(PendingSqlOp::Put {
+                    table: table.clone(),
+                    cells,
+                })?;
+            }
             Some(_) => {
                 return Err(MongrelQueryError::Schema(
                     "this INSERT conflict action is not supported".into(),
@@ -3843,9 +5444,9 @@ fn insert_rows(session: &MongrelSession, db: &Arc<Database>, insert: Insert) -> 
             }
         }
     }
-    let changes = logical_changes(&ops);
-    let last_insert_rowid = last_insert_pk(&ops, &schema);
-    stage_or_apply(session, db, ops, changes, last_insert_rowid)
+    let changes = logical_changes_spooled(&mut ops, query)?;
+    let last_insert_rowid = last_insert_pk_spooled(&mut ops, &schema, query)?;
+    stage_or_apply_spooled(session, db, ops, changes, last_insert_rowid)
 }
 
 #[derive(Clone)]
@@ -3860,6 +5461,7 @@ fn insert_view_rows(
     db: &Arc<Database>,
     view: &str,
     insert: Insert,
+    query: &RegisteredSqlQuery,
 ) -> Result<()> {
     if insert.on.is_some() {
         return Err(MongrelQueryError::Schema(
@@ -3883,8 +5485,9 @@ fn insert_view_rows(
 
     let columns = insert_columns(&view_def.schema, &insert.columns)?;
     let rows = values_rows(insert.source.as_deref())?;
-    let mut ops = Vec::new();
-    for row in rows {
+    let mut ops = PendingSqlOps::default();
+    for (index, row) in rows.into_iter().enumerate() {
+        command_checkpoint(session, query, index)?;
         if row.len() != columns.len() {
             return Err(MongrelQueryError::Schema(format!(
                 "INSERT has {} values for {} columns",
@@ -3906,15 +5509,15 @@ fn insert_view_rows(
             new: Some(new),
         };
         for trigger in &triggers {
-            if execute_instead_of_trigger_program(db, trigger, &event, &mut ops)?
+            if execute_instead_of_trigger_program(session, db, trigger, &event, &mut ops, query)?
                 == SqlTriggerProgramOutcome::Ignore
             {
                 break;
             }
         }
     }
-    let changes = logical_changes(&ops);
-    stage_or_apply(session, db, ops, changes, None)
+    let changes = logical_changes_spooled(&mut ops, query)?;
+    stage_or_apply_spooled(session, db, ops, changes, None)
 }
 
 fn instead_of_triggers(
@@ -3957,17 +5560,20 @@ enum SqlTriggerProgramOutcome {
 }
 
 fn execute_instead_of_trigger_program(
+    session: &MongrelSession,
     db: &Arc<Database>,
     trigger: &StoredTrigger,
     event: &SqlTriggerEventImage,
-    ops: &mut Vec<PendingSqlOp>,
+    ops: &mut PendingSqlOps,
+    query: &RegisteredSqlQuery,
 ) -> Result<SqlTriggerProgramOutcome> {
     if let Some(when) = &trigger.when {
         if !eval_instead_of_trigger_expr(when, event)? {
             return Ok(SqlTriggerProgramOutcome::Continue);
         }
     }
-    for step in &trigger.program.steps {
+    for (index, step) in trigger.program.steps.iter().enumerate() {
+        command_checkpoint(session, query, index)?;
         match step {
             TriggerStep::SetNew { .. } => {
                 return Err(MongrelQueryError::Schema(
@@ -3978,7 +5584,7 @@ fn execute_instead_of_trigger_program(
                 ops.push(PendingSqlOp::Put {
                     table: table.clone(),
                     cells: eval_instead_of_trigger_cells(cells, event)?,
-                });
+                })?;
             }
             TriggerStep::UpdateByPk { table, pk, cells } => {
                 let pk = eval_instead_of_trigger_value(pk, event)?;
@@ -4005,11 +5611,11 @@ fn execute_instead_of_trigger_program(
                 ops.push(PendingSqlOp::Delete {
                     table: table.clone(),
                     row_id,
-                });
+                })?;
                 ops.push(PendingSqlOp::Put {
                     table: table.clone(),
                     cells: map_to_cells(&merged),
-                });
+                })?;
             }
             TriggerStep::DeleteByPk { table, pk } => {
                 let pk = eval_instead_of_trigger_value(pk, event)?;
@@ -4026,7 +5632,7 @@ fn execute_instead_of_trigger_program(
                 ops.push(PendingSqlOp::Delete {
                     table: table.clone(),
                     row_id,
-                });
+                })?;
             }
             TriggerStep::Select { .. } => {}
             TriggerStep::Foreach { .. }
@@ -4176,44 +5782,153 @@ fn expr_to_usize(expr: &sqlparser::ast::Expr) -> Option<usize> {
 /// name; we resolve the name to a column id via the schema, then compare
 /// the encoded key bytes for ordering.
 fn apply_order_by(
-    rows: &mut [mongreldb_core::memtable::Row],
+    session: &MongrelSession,
+    query: &RegisteredSqlQuery,
+    rows: &mut [Row],
     order_by: &[sqlparser::ast::OrderByExpr],
-    schema: &mongreldb_core::schema::Schema,
+    schema: &CoreSchema,
 ) -> Result<()> {
-    // Build a name → column_id lookup from the schema.
     let name_to_id: HashMap<String, u16> = schema
         .columns
         .iter()
         .map(|c| (c.name.clone(), c.id))
         .collect();
-    rows.sort_by(|a, b| {
-        for expr in order_by {
-            let col_name = match &expr.expr {
-                sqlparser::ast::Expr::Identifier(ident) => &ident.value,
-                sqlparser::ast::Expr::CompoundIdentifier(idents) => &idents.last().unwrap().value,
-                _ => continue,
-            };
-            let col_id = match name_to_id.get(col_name) {
-                Some(id) => *id,
-                None => continue,
-            };
-            let va = a.columns.get(&col_id);
-            let vb = b.columns.get(&col_id);
-            let ord = match (va, vb) {
-                (Some(va), Some(vb)) => va.encode_key().cmp(&vb.encode_key()),
-                _ => std::cmp::Ordering::Equal,
-            };
-            let ord = if expr.options.asc == Some(false) {
-                ord.reverse()
+    let sort_specs = order_by
+        .iter()
+        .filter_map(|expr| {
+            let column_name = match &expr.expr {
+                Expr::Identifier(ident) => Some(ident.value.as_str()),
+                Expr::CompoundIdentifier(idents) => idents.last().map(|ident| ident.value.as_str()),
+                _ => None,
+            }?;
+            name_to_id
+                .get(column_name)
+                .copied()
+                .map(|column_id| (column_id, expr.options.asc == Some(false)))
+        })
+        .collect::<Vec<_>>();
+    if rows.len() < 2 || sort_specs.is_empty() {
+        return Ok(());
+    }
+
+    query.checkpoint()?;
+    let key_entry_bytes = std::mem::size_of::<Vec<u8>>();
+    let per_row_bytes = std::mem::size_of::<Vec<Vec<u8>>>()
+        .saturating_add(sort_specs.len().saturating_mul(key_entry_bytes));
+    let mut accounted_key_bytes = rows.len().saturating_mul(per_row_bytes);
+    if accounted_key_bytes > ORDERED_DML_SORT_KEY_BYTES_LIMIT {
+        return Err(mongreldb_core::MongrelError::ResourceLimitExceeded {
+            resource: "ordered DML sort key bytes",
+            requested: accounted_key_bytes,
+            limit: ORDERED_DML_SORT_KEY_BYTES_LIMIT,
+        }
+        .into());
+    }
+
+    let mut keys = Vec::with_capacity(rows.len());
+    for (row_index, row) in rows.iter().enumerate() {
+        command_checkpoint(session, query, row_index)?;
+        let mut row_keys = Vec::with_capacity(sort_specs.len());
+        for (column_id, _) in &sort_specs {
+            // Older sparse rows can omit a declared column. Treat absence as
+            // SQL NULL so comparison remains total and deterministic.
+            let key = row
+                .columns
+                .get(column_id)
+                .map_or_else(Vec::new, Value::encode_key);
+            accounted_key_bytes = accounted_key_bytes.saturating_add(key.len());
+            if accounted_key_bytes > ORDERED_DML_SORT_KEY_BYTES_LIMIT {
+                return Err(mongreldb_core::MongrelError::ResourceLimitExceeded {
+                    resource: "ordered DML sort key bytes",
+                    requested: accounted_key_bytes,
+                    limit: ORDERED_DML_SORT_KEY_BYTES_LIMIT,
+                }
+                .into());
+            }
+            row_keys.push(key);
+        }
+        keys.push(row_keys);
+    }
+
+    let compare = |left_index: usize, right_index: usize| {
+        for (sort_index, (_, descending)) in sort_specs.iter().enumerate() {
+            let ordering = keys[left_index][sort_index].cmp(&keys[right_index][sort_index]);
+            let ordering = if *descending {
+                ordering.reverse()
             } else {
-                ord
+                ordering
             };
-            if ord != std::cmp::Ordering::Equal {
-                return ord;
+            if !ordering.is_eq() {
+                return ordering;
             }
         }
         std::cmp::Ordering::Equal
-    });
+    };
+
+    let mut order = (0..rows.len()).collect::<Vec<_>>();
+    for (run_index, run) in order.chunks_mut(ORDERED_DML_SORT_RUN_ROWS).enumerate() {
+        command_checkpoint(
+            session,
+            query,
+            run_index.saturating_mul(ORDERED_DML_SORT_RUN_ROWS),
+        )?;
+        run.sort_by(|left, right| compare(*left, *right));
+    }
+
+    let mut scratch = Vec::with_capacity(order.len());
+    let mut run_width = ORDERED_DML_SORT_RUN_ROWS;
+    while run_width < order.len() {
+        scratch.clear();
+        let mut run_start = 0_usize;
+        while run_start < order.len() {
+            let middle = run_start.saturating_add(run_width).min(order.len());
+            let end = middle.saturating_add(run_width).min(order.len());
+            let mut left = run_start;
+            let mut right = middle;
+            while left < middle || right < end {
+                command_checkpoint(session, query, scratch.len())?;
+                if right >= end || (left < middle && !compare(order[left], order[right]).is_gt()) {
+                    scratch.push(order[left]);
+                    left += 1;
+                } else {
+                    scratch.push(order[right]);
+                    right += 1;
+                }
+            }
+            run_start = end;
+        }
+        std::mem::swap(&mut order, &mut scratch);
+        run_width = run_width.saturating_mul(2);
+    }
+
+    query.checkpoint()?;
+    let mut destination = vec![0_usize; order.len()];
+    for (new_index, old_index) in order.into_iter().enumerate() {
+        if new_index % COMMAND_CHECKPOINT_ROWS == 0 {
+            session.fire_test_hook(SqlTestHookPoint::DuringOrderedDmlPermutation);
+            query.checkpoint()?;
+        }
+        destination[old_index] = new_index;
+    }
+    drop(keys);
+    let mut permutation_steps = 0_usize;
+    for index in 0..rows.len() {
+        if permutation_steps % COMMAND_CHECKPOINT_ROWS == 0 {
+            session.fire_test_hook(SqlTestHookPoint::DuringOrderedDmlPermutation);
+            query.checkpoint()?;
+        }
+        permutation_steps = permutation_steps.saturating_add(1);
+        while destination[index] != index {
+            if permutation_steps % COMMAND_CHECKPOINT_ROWS == 0 {
+                session.fire_test_hook(SqlTestHookPoint::DuringOrderedDmlPermutation);
+                query.checkpoint()?;
+            }
+            let target = destination[index];
+            rows.swap(index, target);
+            destination.swap(index, target);
+            permutation_steps = permutation_steps.saturating_add(1);
+        }
+    }
     Ok(())
 }
 
@@ -4221,6 +5936,7 @@ async fn update_rows(
     session: &MongrelSession,
     db: &Arc<Database>,
     update: sqlparser::ast::Update,
+    query: &RegisteredSqlQuery,
 ) -> Result<()> {
     if update.returning.is_some() || update.output.is_some() || update.from.is_some() {
         return Err(MongrelQueryError::Schema(
@@ -4244,45 +5960,98 @@ async fn update_rows(
         mongreldb_core::auth_state::RequiredPermission::Select,
     )?;
     if session.view_definition(&table).is_some() {
-        return update_view_rows(session, db, &table, update).await;
+        return update_view_rows(session, db, &table, update, query).await;
     }
     if let Some(entry) = db.external_table(&table) {
-        return update_external_rows(session, db, &entry, update);
+        return update_external_rows(session, db, &entry, update, query);
     }
-    let (schema, rows) = visible_rows(db, &table)?;
-    let mut matched: Vec<_> = rows
-        .into_iter()
-        .filter(|row| predicate_matches(update.selection.as_ref(), &schema, row).unwrap_or(false))
-        .collect();
+    let limit = update.limit.as_ref().and_then(expr_to_usize);
+    if update.order_by.is_empty() {
+        let mut ops = PendingSqlOps::default();
+        let mut changes = 0_u64;
+        for_each_visible_row_controlled(session, db, &table, query, |schema, row| {
+            if limit.is_some_and(|limit| changes >= limit as u64) {
+                return Ok(());
+            }
+            if predicate_matches(update.selection.as_ref(), schema, &row, query)? {
+                let mut merged = row.columns.clone();
+                for assignment in &update.assignments {
+                    apply_assignment(session, schema, &mut merged, assignment, None, query)?;
+                }
+                ops.push(PendingSqlOp::Delete {
+                    table: table.clone(),
+                    row_id: row.row_id,
+                })?;
+                ops.push(PendingSqlOp::Put {
+                    table: table.clone(),
+                    cells: map_to_cells(&merged),
+                })?;
+                changes = changes.saturating_add(1);
+            }
+            Ok(())
+        })?;
+        return stage_or_apply_spooled(session, db, ops, changes, None);
+    }
+    let mut matched = Vec::new();
+    let mut matched_bytes = 0_usize;
+    let schema = for_each_visible_row_controlled(session, db, &table, query, |schema, row| {
+        if predicate_matches(update.selection.as_ref(), schema, &row, query)? {
+            if matched.len() >= ORDERED_DML_MAX_MATCHED_ROWS {
+                return Err(mongreldb_core::MongrelError::ResourceLimitExceeded {
+                    resource: "ordered UPDATE matched rows",
+                    requested: matched.len().saturating_add(1),
+                    limit: ORDERED_DML_MAX_MATCHED_ROWS,
+                }
+                .into());
+            }
+            let requested_bytes = matched_bytes.saturating_add(row_deep_bytes(&row));
+            if requested_bytes > ORDERED_DML_MATCHED_ROW_BYTES_LIMIT {
+                return Err(mongreldb_core::MongrelError::ResourceLimitExceeded {
+                    resource: "ordered UPDATE matched row bytes",
+                    requested: requested_bytes,
+                    limit: ORDERED_DML_MATCHED_ROW_BYTES_LIMIT,
+                }
+                .into());
+            }
+            matched_bytes = requested_bytes;
+            matched.push(row);
+        }
+        Ok(())
+    })?;
     // Apply ORDER BY + LIMIT if present.
     if !update.order_by.is_empty() {
-        apply_order_by(&mut matched, &update.order_by, &schema)?;
+        query.checkpoint()?;
+        apply_order_by(session, query, &mut matched, &update.order_by, &schema)?;
+        query.checkpoint()?;
     }
-    if let Some(limit_expr) = &update.limit {
-        if let Some(n) = expr_to_usize(limit_expr) {
-            matched.truncate(n);
-        }
+    if let Some(limit) = limit {
+        matched.truncate(limit);
     }
-    let mut ops = Vec::new();
-    for row in &matched {
+    let mut ops = PendingSqlOps::default();
+    for (index, row) in matched.iter().enumerate() {
+        command_checkpoint(session, query, index)?;
         let mut merged = row.columns.clone();
         for assignment in &update.assignments {
-            apply_assignment(&schema, &mut merged, assignment, None)?;
+            apply_assignment(session, &schema, &mut merged, assignment, None, query)?;
         }
         ops.push(PendingSqlOp::Delete {
             table: table.clone(),
             row_id: row.row_id,
-        });
+        })?;
         ops.push(PendingSqlOp::Put {
             table: table.clone(),
             cells: map_to_cells(&merged),
-        });
+        })?;
     }
-    let changes = logical_changes(&ops);
-    stage_or_apply(session, db, ops, changes, None)
+    stage_or_apply_spooled(session, db, ops, matched.len() as u64, None)
 }
 
-async fn delete_rows(session: &MongrelSession, db: &Arc<Database>, delete: Delete) -> Result<()> {
+async fn delete_rows(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    delete: Delete,
+    query: &RegisteredSqlQuery,
+) -> Result<()> {
     if delete.returning.is_some()
         || delete.output.is_some()
         || delete.using.is_some()
@@ -4304,34 +6073,75 @@ async fn delete_rows(session: &MongrelSession, db: &Arc<Database>, delete: Delet
         mongreldb_core::auth_state::RequiredPermission::Select,
     )?;
     if session.view_definition(&table).is_some() {
-        return delete_view_rows(session, db, &table, delete).await;
+        return delete_view_rows(session, db, &table, delete, query).await;
     }
     if let Some(entry) = db.external_table(&table) {
-        return delete_external_rows(session, db, &entry, delete);
+        return delete_external_rows(session, db, &entry, delete, query);
     }
-    let (schema, rows) = visible_rows(db, &table)?;
-    let mut matched: Vec<_> = rows
-        .into_iter()
-        .filter(|row| predicate_matches(delete.selection.as_ref(), &schema, row).unwrap_or(false))
-        .collect();
+    let limit = delete.limit.as_ref().and_then(expr_to_usize);
+    if delete.order_by.is_empty() {
+        let mut ops = PendingSqlOps::default();
+        let mut changes = 0_u64;
+        for_each_visible_row_controlled(session, db, &table, query, |schema, row| {
+            if limit.is_some_and(|limit| changes >= limit as u64) {
+                return Ok(());
+            }
+            if predicate_matches(delete.selection.as_ref(), schema, &row, query)? {
+                ops.push(PendingSqlOp::Delete {
+                    table: table.clone(),
+                    row_id: row.row_id,
+                })?;
+                changes = changes.saturating_add(1);
+            }
+            Ok(())
+        })?;
+        return stage_or_apply_spooled(session, db, ops, changes, None);
+    }
+    let mut matched = Vec::new();
+    let mut matched_bytes = 0_usize;
+    let schema = for_each_visible_row_controlled(session, db, &table, query, |schema, row| {
+        if predicate_matches(delete.selection.as_ref(), schema, &row, query)? {
+            if matched.len() >= ORDERED_DML_MAX_MATCHED_ROWS {
+                return Err(mongreldb_core::MongrelError::ResourceLimitExceeded {
+                    resource: "ordered DELETE matched rows",
+                    requested: matched.len().saturating_add(1),
+                    limit: ORDERED_DML_MAX_MATCHED_ROWS,
+                }
+                .into());
+            }
+            let requested_bytes = matched_bytes.saturating_add(row_deep_bytes(&row));
+            if requested_bytes > ORDERED_DML_MATCHED_ROW_BYTES_LIMIT {
+                return Err(mongreldb_core::MongrelError::ResourceLimitExceeded {
+                    resource: "ordered DELETE matched row bytes",
+                    requested: requested_bytes,
+                    limit: ORDERED_DML_MATCHED_ROW_BYTES_LIMIT,
+                }
+                .into());
+            }
+            matched_bytes = requested_bytes;
+            matched.push(row);
+        }
+        Ok(())
+    })?;
     // Apply ORDER BY + LIMIT if present.
     if !delete.order_by.is_empty() {
-        apply_order_by(&mut matched, &delete.order_by, &schema)?;
+        query.checkpoint()?;
+        apply_order_by(session, query, &mut matched, &delete.order_by, &schema)?;
+        query.checkpoint()?;
     }
-    if let Some(limit_expr) = &delete.limit {
-        if let Some(n) = expr_to_usize(limit_expr) {
-            matched.truncate(n);
-        }
+    if let Some(limit) = limit {
+        matched.truncate(limit);
     }
-    let ops = matched
-        .into_iter()
-        .map(|row| PendingSqlOp::Delete {
+    let changes = matched.len() as u64;
+    let mut ops = PendingSqlOps::default();
+    for (index, row) in matched.into_iter().enumerate() {
+        command_checkpoint(session, query, index)?;
+        ops.push(PendingSqlOp::Delete {
             table: table.clone(),
             row_id: row.row_id,
-        })
-        .collect::<Vec<_>>();
-    let changes = logical_changes(&ops);
-    stage_or_apply(session, db, ops, changes, None)
+        })?;
+    }
+    stage_or_apply_spooled(session, db, ops, changes, None)
 }
 
 async fn update_view_rows(
@@ -4339,11 +6149,12 @@ async fn update_view_rows(
     db: &Arc<Database>,
     view: &str,
     update: sqlparser::ast::Update,
+    query: &RegisteredSqlQuery,
 ) -> Result<()> {
     let view_def = session
         .view_definition(view)
         .ok_or_else(|| MongrelQueryError::Schema(format!("view {view:?} does not exist")))?;
-    let changed_columns = view_assignment_targets(&view_def.schema, &update.assignments)?;
+    let changed_columns = view_assignment_targets(&view_def.schema, &update.assignments, query)?;
     let triggers = instead_of_triggers(db, view, TriggerEvent::Update, Some(&changed_columns));
     if triggers.is_empty() {
         return Err(MongrelQueryError::Schema(format!(
@@ -4351,36 +6162,39 @@ async fn update_view_rows(
         )));
     }
 
-    let rows = materialize_view_rows(session, &view_def).await?;
-    let mut ops = Vec::new();
-    for old in rows {
-        if !view_row_matches(update.selection.as_ref(), &view_def.schema, &old)? {
-            continue;
-        }
-        let mut new = old.clone();
-        for assignment in &update.assignments {
-            apply_view_assignment(
-                &view_def.schema,
-                &view_def.input_types,
-                &mut new,
-                assignment,
-            )?;
-        }
-        let event = SqlTriggerEventImage {
-            kind: TriggerEvent::Update,
-            old: Some(old),
-            new: Some(new),
-        };
-        for trigger in &triggers {
-            if execute_instead_of_trigger_program(db, trigger, &event, &mut ops)?
-                == SqlTriggerProgramOutcome::Ignore
-            {
-                break;
+    let mut ops = PendingSqlOps::default();
+    for_each_materialized_view_row(session, &view_def, query, |old| {
+        if view_row_matches(update.selection.as_ref(), &view_def.schema, &old, query)? {
+            let mut new = old.clone();
+            for assignment in &update.assignments {
+                apply_view_assignment(
+                    session,
+                    &view_def.schema,
+                    &view_def.input_types,
+                    &mut new,
+                    assignment,
+                    query,
+                )?;
+            }
+            let event = SqlTriggerEventImage {
+                kind: TriggerEvent::Update,
+                old: Some(old),
+                new: Some(new),
+            };
+            for trigger in &triggers {
+                if execute_instead_of_trigger_program(
+                    session, db, trigger, &event, &mut ops, query,
+                )? == SqlTriggerProgramOutcome::Ignore
+                {
+                    break;
+                }
             }
         }
-    }
-    let changes = logical_changes(&ops);
-    stage_or_apply(session, db, ops, changes, None)
+        Ok(())
+    })
+    .await?;
+    let changes = logical_changes_spooled(&mut ops, query)?;
+    stage_or_apply_spooled(session, db, ops, changes, None)
 }
 
 async fn delete_view_rows(
@@ -4388,6 +6202,7 @@ async fn delete_view_rows(
     db: &Arc<Database>,
     view: &str,
     delete: Delete,
+    query: &RegisteredSqlQuery,
 ) -> Result<()> {
     let view_def = session
         .view_definition(view)
@@ -4399,32 +6214,38 @@ async fn delete_view_rows(
         )));
     }
 
-    let rows = materialize_view_rows(session, &view_def).await?;
-    let mut ops = Vec::new();
-    for old in rows {
-        if !view_row_matches(delete.selection.as_ref(), &view_def.schema, &old)? {
-            continue;
-        }
-        let event = SqlTriggerEventImage {
-            kind: TriggerEvent::Delete,
-            old: Some(old),
-            new: None,
-        };
-        for trigger in &triggers {
-            if execute_instead_of_trigger_program(db, trigger, &event, &mut ops)?
-                == SqlTriggerProgramOutcome::Ignore
-            {
-                break;
+    let mut ops = PendingSqlOps::default();
+    for_each_materialized_view_row(session, &view_def, query, |old| {
+        if view_row_matches(delete.selection.as_ref(), &view_def.schema, &old, query)? {
+            let event = SqlTriggerEventImage {
+                kind: TriggerEvent::Delete,
+                old: Some(old),
+                new: None,
+            };
+            for trigger in &triggers {
+                if execute_instead_of_trigger_program(
+                    session, db, trigger, &event, &mut ops, query,
+                )? == SqlTriggerProgramOutcome::Ignore
+                {
+                    break;
+                }
             }
         }
-    }
-    let changes = logical_changes(&ops);
-    stage_or_apply(session, db, ops, changes, None)
+        Ok(())
+    })
+    .await?;
+    let changes = logical_changes_spooled(&mut ops, query)?;
+    stage_or_apply_spooled(session, db, ops, changes, None)
 }
 
-fn view_assignment_targets(schema: &CoreSchema, assignments: &[Assignment]) -> Result<Vec<u16>> {
+fn view_assignment_targets(
+    schema: &CoreSchema,
+    assignments: &[Assignment],
+    query: &RegisteredSqlQuery,
+) -> Result<Vec<u16>> {
     let mut out = Vec::with_capacity(assignments.len());
     for assignment in assignments {
+        query.checkpoint()?;
         let column_name = match &assignment.target {
             AssignmentTarget::ColumnName(name) => object_name(name)?,
             AssignmentTarget::Tuple(_) => {
@@ -4442,11 +6263,15 @@ fn view_assignment_targets(schema: &CoreSchema, assignments: &[Assignment]) -> R
 }
 
 fn apply_view_assignment(
+    session: &MongrelSession,
     schema: &CoreSchema,
     input_types: &HashMap<u16, Option<TypeId>>,
     row: &mut HashMap<u16, Value>,
     assignment: &Assignment,
+    query: &RegisteredSqlQuery,
 ) -> Result<()> {
+    session.fire_test_hook(SqlTestHookPoint::BeforeAssignmentEvaluation);
+    query.checkpoint()?;
     let column_name = match &assignment.target {
         AssignmentTarget::ColumnName(name) => object_name(name)?,
         AssignmentTarget::Tuple(_) => {
@@ -4458,7 +6283,7 @@ fn apply_view_assignment(
     let column = schema
         .column(&column_name)
         .ok_or_else(|| MongrelQueryError::Schema(format!("unknown column {column_name}")))?;
-    let mut value = eval_value_expr(&assignment.value, schema, row, None)?;
+    let mut value = eval_value_expr(&assignment.value, schema, row, None, query)?;
     if let Some(ty) = input_types.get(&column.id).and_then(|ty| ty.clone()) {
         value = coerce_value(value, ty)?;
     }
@@ -4470,17 +6295,23 @@ fn view_row_matches(
     selection: Option<&Expr>,
     schema: &CoreSchema,
     row: &HashMap<u16, Value>,
+    query: &RegisteredSqlQuery,
 ) -> Result<bool> {
     match selection {
-        Some(expr) => eval_bool_expr(expr, schema, row),
+        Some(expr) => eval_bool_expr(expr, schema, row, query),
         None => Ok(true),
     }
 }
 
-async fn materialize_view_rows(
+async fn for_each_materialized_view_row<F>(
     session: &MongrelSession,
     view: &crate::ViewDef,
-) -> Result<Vec<HashMap<u16, Value>>> {
+    query: &RegisteredSqlQuery,
+    mut consume: F,
+) -> Result<()>
+where
+    F: FnMut(HashMap<u16, Value>) -> Result<()> + Send,
+{
     if view.schema.columns.is_empty() {
         return Err(MongrelQueryError::Schema(
             "view write routing requires CREATE VIEW column names".into(),
@@ -4496,13 +6327,10 @@ async fn materialize_view_rows(
         .sql(&sql)
         .await
         .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
-    let batches = df
-        .collect()
-        .await
-        .map_err(|e| MongrelQueryError::DataFusion(e.to_string()))?;
+    let mut stream = session.execute_dataframe_stream(df, query).await?;
 
-    let mut out = Vec::new();
-    for batch in batches {
+    let mut converted = 0_usize;
+    while let Some(batch) = next_command_batch(&mut stream, query).await? {
         if batch.num_columns() != view.schema.columns.len() {
             return Err(MongrelQueryError::Schema(format!(
                 "view query returned {} columns for {} declared view columns",
@@ -4511,6 +6339,7 @@ async fn materialize_view_rows(
             )));
         }
         for row_idx in 0..batch.num_rows() {
+            command_checkpoint(session, query, converted)?;
             let mut view_row = HashMap::new();
             for (col_idx, view_col) in view.schema.columns.iter().enumerate() {
                 let scalar = datafusion::common::ScalarValue::try_from_array(
@@ -4524,10 +6353,11 @@ async fn materialize_view_rows(
                 }
                 view_row.insert(view_col.id, value);
             }
-            out.push(view_row);
+            consume(view_row)?;
+            converted += 1;
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 fn scalar_to_core_value(value: datafusion::common::ScalarValue) -> Result<Value> {
@@ -4581,9 +6411,15 @@ fn scalar_to_core_value(value: datafusion::common::ScalarValue) -> Result<Value>
     }
 }
 
-fn truncate_tables(session: &MongrelSession, db: &Arc<Database>, truncate: Truncate) -> Result<()> {
+fn truncate_tables(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    truncate: Truncate,
+    query: &RegisteredSqlQuery,
+) -> Result<()> {
     let mut ops = Vec::new();
-    for target in truncate.table_names {
+    for (table_index, target) in truncate.table_names.into_iter().enumerate() {
+        command_checkpoint(session, query, table_index)?;
         let table = object_name(&target.name)?;
         // SQL TRUNCATE → require Delete permission on each target table.
         db.require_table(
@@ -4593,20 +6429,13 @@ fn truncate_tables(session: &MongrelSession, db: &Arc<Database>, truncate: Trunc
         if let Some(entry) = db.external_table(&table) {
             return Err(external_table_write_error("TRUNCATE", &entry));
         }
-        match visible_rows(db, &table) {
-            Ok((_, rows)) => {
-                ops.extend(rows.into_iter().map(|row| PendingSqlOp::Delete {
-                    table: table.clone(),
-                    row_id: row.row_id,
-                }));
-            }
-            Err(e)
-                if truncate.if_exists
-                    && matches!(
-                        e,
-                        MongrelQueryError::Core(mongreldb_core::MongrelError::NotFound(_))
-                    ) => {}
-            Err(e) => return Err(e),
+        if let Ok(handle) = db.table(&table) {
+            let changes = handle.lock().count();
+            ops.push(PendingSqlOp::Truncate { table, changes });
+        } else if !truncate.if_exists {
+            return Err(MongrelQueryError::Core(
+                mongreldb_core::MongrelError::NotFound(format!("table {table:?} not found")),
+            ));
         }
     }
     let changes = logical_changes(&ops);
@@ -4620,13 +6449,26 @@ fn stage_or_apply(
     changes: u64,
     last_insert_rowid: Option<u64>,
 ) -> Result<()> {
+    let ops = PendingSqlOps::from_vec(ops)?;
+    stage_or_apply_spooled(session, db, ops, changes, last_insert_rowid)
+}
+
+fn stage_or_apply_spooled(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    mut ops: PendingSqlOps,
+    changes: u64,
+    last_insert_rowid: Option<u64>,
+) -> Result<()> {
     if ops.is_empty() {
         session.sql_fn_state.record_changes(0, None);
         return Ok(());
     }
-    if let Some(staged) = session.sql_txn.lock().as_mut() {
-        ensure_staging_capacity(staged.len(), ops.len())?;
-        staged.extend(ops);
+    let query = session.current_query()?;
+    let mut transaction = session.transaction.lock();
+    if let Some(staged) = transaction.staged_ops.as_mut() {
+        staged.append_from(&mut ops, &query)?;
+        drop(transaction);
         session.fire_test_hook(SqlTestHookPoint::AfterStatementStaging);
         session.current_query()?.checkpoint()?;
         session
@@ -4634,57 +6476,166 @@ fn stage_or_apply(
             .record_changes(changes, last_insert_rowid);
         return Ok(());
     }
-    let query = session.current_query()?;
-    enter_commit_fence(session, &query)?;
-    let external_tables = external_tables_to_refresh(db, &ops);
-    if let Err(error) = apply_ops(session, db, ops) {
-        query.exit_commit_critical()?;
-        return Err(error);
+    drop(transaction);
+    let external_tables = external_tables_to_refresh_spooled(db, &mut ops, &query)?;
+    let epoch = match apply_ops(session, db, &mut ops, &query) {
+        Ok(Some(epoch)) => epoch,
+        Ok(None) => {
+            return Err(MongrelQueryError::InvalidQueryState(
+                "non-empty SQL write produced no commit epoch".into(),
+            ));
+        }
+        Err(error) => {
+            if matches!(
+                &error,
+                MongrelQueryError::CommitOutcome {
+                    committed: true,
+                    ..
+                }
+            ) {
+                if let Err(refresh_error) = sync_committed_statement(
+                    session,
+                    db,
+                    &external_tables,
+                    changes,
+                    last_insert_rowid,
+                ) {
+                    if matches!(
+                        &refresh_error,
+                        MongrelQueryError::QueryCancelled { .. }
+                            | MongrelQueryError::DeadlineExceeded { .. }
+                    ) {
+                        return Err(refresh_error);
+                    }
+                    return Err(query.commit_outcome_error(format!(
+                        "{error}; external table refresh failed: {refresh_error}"
+                    )));
+                }
+            }
+            return Err(error);
+        }
+    };
+    query.record_commit(query.status().statement_index, epoch.0);
+    if let Err(error) = query.exit_commit_critical() {
+        return Err(query.commit_outcome_error(error.to_string()));
     }
-    query.mark_committed();
-    if let Err(error) = refresh_external_tables(session, db, &external_tables) {
-        query.exit_commit_critical()?;
-        return Err(MongrelQueryError::CommitOutcome {
-            query_id: query.id(),
-            committed: true,
-            message: error.to_string(),
-        });
+    session.fire_test_hook(SqlTestHookPoint::AfterDurableCommit);
+    if let Err(error) =
+        sync_committed_statement(session, db, &external_tables, changes, last_insert_rowid)
+    {
+        if matches!(
+            &error,
+            MongrelQueryError::QueryCancelled { .. } | MongrelQueryError::DeadlineExceeded { .. }
+        ) {
+            return Err(error);
+        }
+        return Err(query.commit_outcome_error(error.to_string()));
     }
-    session
-        .sql_fn_state
-        .record_changes(changes, last_insert_rowid);
-    session.clear_cache();
-    query.exit_commit_critical()?;
+    query.checkpoint()?;
     Ok(())
 }
 
-fn external_tables_in_ops(ops: &[PendingSqlOp]) -> Vec<String> {
+fn external_tables_in_spooled_ops(
+    ops: &mut PendingSqlOps,
+    query: &RegisteredSqlQuery,
+) -> Result<Vec<String>> {
     let mut seen = HashSet::new();
     let mut names = Vec::new();
-    for op in ops {
-        if let PendingSqlOp::ExternalState { table, .. } = op {
+    query.checkpoint()?;
+    for (index, op) in ops.reader()?.enumerate() {
+        if index & 63 == 0 {
+            query.checkpoint()?;
+        }
+        if let PendingSqlOp::ExternalState { table, .. } = op? {
             if seen.insert(table.clone()) {
-                names.push(table.clone());
+                names.push(table);
             }
         }
     }
-    names
+    query.checkpoint()?;
+    Ok(names)
 }
 
-fn external_tables_to_refresh(db: &Arc<Database>, ops: &[PendingSqlOp]) -> Vec<String> {
+fn external_tables_to_refresh_spooled(
+    db: &Arc<Database>,
+    ops: &mut PendingSqlOps,
+    query: &RegisteredSqlQuery,
+) -> Result<Vec<String>> {
     let mut seen = HashSet::new();
     let mut names = Vec::new();
-    for name in external_tables_in_ops(ops) {
+    for name in external_tables_in_spooled_ops(ops, query)? {
         if seen.insert(name.clone()) {
             names.push(name);
         }
     }
-    for entry in db.external_tables() {
+    for (index, entry) in db.external_tables().into_iter().enumerate() {
+        if index & 63 == 0 {
+            query.checkpoint()?;
+        }
         if seen.insert(entry.name.clone()) {
             names.push(entry.name);
         }
     }
-    names
+    query.checkpoint()?;
+    Ok(names)
+}
+
+fn logical_changes_spooled(ops: &mut PendingSqlOps, query: &RegisteredSqlQuery) -> Result<u64> {
+    let mut explicit = 0_u64;
+    let mut puts = 0_u64;
+    let mut deletes = 0_u64;
+    query.checkpoint()?;
+    for (index, op) in ops.reader()?.enumerate() {
+        if index & 63 == 0 {
+            query.checkpoint()?;
+        }
+        match op? {
+            PendingSqlOp::ExternalState { changes, .. }
+            | PendingSqlOp::Truncate { changes, .. } => {
+                explicit = explicit.saturating_add(changes);
+            }
+            PendingSqlOp::Put { .. } => puts = puts.saturating_add(1),
+            PendingSqlOp::Delete { .. } => deletes = deletes.saturating_add(1),
+        }
+    }
+    query.checkpoint()?;
+    Ok(explicit.saturating_add(if puts > 0 { puts } else { deletes }))
+}
+
+fn last_insert_pk_spooled(
+    ops: &mut PendingSqlOps,
+    schema: &CoreSchema,
+    query: &RegisteredSqlQuery,
+) -> Result<Option<u64>> {
+    let Some(pk) = schema.primary_key() else {
+        return Ok(None);
+    };
+    let mut last = None;
+    let mut visited_cells = 0_usize;
+    query.checkpoint()?;
+    for (index, op) in ops.reader()?.enumerate() {
+        if index & 63 == 0 {
+            query.checkpoint()?;
+        }
+        if let PendingSqlOp::Put { cells, .. } = op? {
+            for (column_id, value) in cells {
+                if visited_cells & 255 == 0 {
+                    query.checkpoint()?;
+                }
+                visited_cells = visited_cells.saturating_add(1);
+                if column_id == pk.id {
+                    if let Value::Int64(value) = value {
+                        if value >= 0 {
+                            last = Some(value as u64);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    query.checkpoint()?;
+    Ok(last)
 }
 
 fn refresh_external_tables(
@@ -4700,11 +6651,27 @@ fn refresh_external_tables(
     Ok(())
 }
 
+fn sync_committed_statement(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    external_tables: &[String],
+    changes: u64,
+    last_insert_rowid: Option<u64>,
+) -> Result<()> {
+    let refresh = refresh_external_tables(session, db, external_tables);
+    session
+        .sql_fn_state
+        .record_changes(changes, last_insert_rowid);
+    session.clear_cache();
+    refresh
+}
+
 fn logical_changes(ops: &[PendingSqlOp]) -> u64 {
-    let external = ops
+    let explicit = ops
         .iter()
         .filter_map(|op| match op {
             PendingSqlOp::ExternalState { changes, .. } => Some(*changes),
+            PendingSqlOp::Truncate { changes, .. } => Some(*changes),
             _ => None,
         })
         .sum::<u64>();
@@ -4719,30 +6686,13 @@ fn logical_changes(ops: &[PendingSqlOp]) -> u64 {
             .filter(|op| matches!(op, PendingSqlOp::Delete { .. }))
             .count() as u64
     };
-    external + row_changes
-}
-
-fn last_insert_pk(ops: &[PendingSqlOp], schema: &CoreSchema) -> Option<u64> {
-    let pk = schema.primary_key()?;
-    ops.iter().rev().find_map(|op| match op {
-        PendingSqlOp::Put { cells, .. } => cells.iter().find_map(|(id, value)| {
-            if *id == pk.id {
-                match value {
-                    Value::Int64(value) if *value >= 0 => Some(*value as u64),
-                    _ => None,
-                }
-            } else {
-                None
-            }
-        }),
-        PendingSqlOp::Delete { .. } => None,
-        PendingSqlOp::ExternalState { .. } => None,
-    })
+    explicit + row_changes
 }
 
 struct QueryExternalTriggerBridge {
     db: Arc<Database>,
     modules: Arc<ExternalModuleRegistry>,
+    query: RegisteredSqlQuery,
 }
 
 impl ExternalTriggerBridge for QueryExternalTriggerBridge {
@@ -4757,10 +6707,12 @@ impl ExternalTriggerBridge for QueryExternalTriggerBridge {
                 rows: vec![cells.into_iter().collect()],
             },
             ExternalTriggerWrite::UpdateByPk { pk, cells, .. } => {
+                self.query.checkpoint().map_err(query_error_to_core)?;
                 let mut rows = self
                     .modules
                     .external_table_rows_from_state(entry, &base_state)
                     .map_err(query_error_to_core)?;
+                self.query.checkpoint().map_err(query_error_to_core)?;
                 let pk_col = entry.declared_schema.primary_key().ok_or_else(|| {
                     mongreldb_core::MongrelError::InvalidArgument(format!(
                         "external trigger update target {:?} has no primary key",
@@ -4769,7 +6721,10 @@ impl ExternalTriggerBridge for QueryExternalTriggerBridge {
                 })?;
                 let pk_key = pk.encode_key();
                 let mut changed = 0_u64;
-                for row in &mut rows {
+                for (row_index, row) in rows.iter_mut().enumerate() {
+                    if row_index % COMMAND_CHECKPOINT_ROWS == 0 {
+                        self.query.checkpoint().map_err(query_error_to_core)?;
+                    }
                     if row
                         .get(&pk_col.id)
                         .is_some_and(|value| value.encode_key() == pk_key)
@@ -4792,10 +6747,12 @@ impl ExternalTriggerBridge for QueryExternalTriggerBridge {
                 }
             }
             ExternalTriggerWrite::DeleteByPk { pk, .. } => {
+                self.query.checkpoint().map_err(query_error_to_core)?;
                 let rows = self
                     .modules
                     .external_table_rows_from_state(entry, &base_state)
                     .map_err(query_error_to_core)?;
+                self.query.checkpoint().map_err(query_error_to_core)?;
                 let pk_col = entry.declared_schema.primary_key().ok_or_else(|| {
                     mongreldb_core::MongrelError::InvalidArgument(format!(
                         "external trigger delete target {:?} has no primary key",
@@ -4804,13 +6761,19 @@ impl ExternalTriggerBridge for QueryExternalTriggerBridge {
                 })?;
                 let pk_key = pk.encode_key();
                 let before = rows.len();
-                let rows = rows
-                    .into_iter()
-                    .filter(|row| {
-                        !row.get(&pk_col.id)
-                            .is_some_and(|value| value.encode_key() == pk_key)
-                    })
-                    .collect::<Vec<_>>();
+                let mut kept = Vec::with_capacity(rows.len());
+                for (row_index, row) in rows.into_iter().enumerate() {
+                    if row_index % COMMAND_CHECKPOINT_ROWS == 0 {
+                        self.query.checkpoint().map_err(query_error_to_core)?;
+                    }
+                    if !row
+                        .get(&pk_col.id)
+                        .is_some_and(|value| value.encode_key() == pk_key)
+                    {
+                        kept.push(row);
+                    }
+                }
+                let rows = kept;
                 let changes = before.saturating_sub(rows.len()) as u64;
                 if changes == 0 {
                     return Err(mongreldb_core::MongrelError::NotFound(format!(
@@ -4821,10 +6784,12 @@ impl ExternalTriggerBridge for QueryExternalTriggerBridge {
                 ExternalWriteOp::ReplaceRows { rows, changes }
             }
         };
+        self.query.checkpoint().map_err(query_error_to_core)?;
         let (state, _result, base_writes) = self
             .modules
             .external_table_write(&self.db, entry, base_state, external_op)
             .map_err(query_error_to_core)?;
+        self.query.checkpoint().map_err(query_error_to_core)?;
         Ok(ExternalTriggerWriteResult {
             state,
             base_writes: base_writes
@@ -4860,43 +6825,89 @@ fn query_error_to_core(err: MongrelQueryError) -> mongreldb_core::MongrelError {
     }
 }
 
-fn apply_ops(session: &MongrelSession, db: &Arc<Database>, ops: Vec<PendingSqlOp>) -> Result<()> {
+fn apply_ops(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    ops: &mut PendingSqlOps,
+    query: &RegisteredSqlQuery,
+) -> Result<Option<mongreldb_core::Epoch>> {
     if ops.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let bridge = QueryExternalTriggerBridge {
         db: Arc::clone(db),
         modules: Arc::clone(&session.external_modules),
+        query: query.clone(),
     };
-    db.transaction_with_external_trigger_bridge_as(&bridge, session.principal(), |tx| {
-        let mut ops = ops.into_iter().peekable();
-        while let Some(op) = ops.next() {
-            match op {
-                PendingSqlOp::Put { table, cells } => {
-                    tx.put(&table, cells)?;
-                }
-                PendingSqlOp::Delete { table, row_id } => {
-                    let paired_update = matches!(
-                        ops.peek(),
-                        Some(PendingSqlOp::Put { table: put_table, .. }) if put_table == &table
-                    );
-                    if paired_update {
-                        let Some(PendingSqlOp::Put { cells, .. }) = ops.next() else {
-                            unreachable!("peeked update put")
-                        };
-                        tx.update_many(&table, vec![(row_id, cells)])?;
-                    } else {
-                        tx.delete(&table, row_id)?;
-                    }
-                }
-                PendingSqlOp::ExternalState { table, state, .. } => {
-                    tx.put_external_state(&table, state)?;
+    let mut tx = db.begin_with_external_trigger_bridge_as(&bridge, session.principal());
+    let mut ops = ops.reader()?.peekable();
+    let mut op_index = 0_usize;
+    while let Some(op) = ops.next() {
+        command_checkpoint(session, query, op_index)?;
+        op_index += 1;
+        match op? {
+            PendingSqlOp::Put { table, cells } => {
+                tx.put(&table, cells)?;
+            }
+            PendingSqlOp::Delete { table, row_id } => {
+                let paired_update = matches!(
+                    ops.peek(),
+                    Some(Ok(PendingSqlOp::Put { table: put_table, .. })) if put_table == &table
+                );
+                if paired_update {
+                    let next = ops.next().ok_or_else(|| {
+                        MongrelQueryError::InvalidQueryState(
+                            "spooled update lost its paired put".into(),
+                        )
+                    })??;
+                    let PendingSqlOp::Put { cells, .. } = next else {
+                        return Err(MongrelQueryError::InvalidQueryState(
+                            "spooled update pair changed after inspection".into(),
+                        ));
+                    };
+                    tx.update_many(&table, vec![(row_id, cells)])?;
+                } else {
+                    tx.delete(&table, row_id)?;
                 }
             }
+            PendingSqlOp::ExternalState { table, state, .. } => {
+                tx.put_external_state(&table, state)?;
+            }
+            PendingSqlOp::Truncate { table, .. } => {
+                tx.truncate(&table)?;
+            }
         }
+    }
+    query.checkpoint()?;
+    let mut fenced = false;
+    let result = tx.commit_controlled(query.control(), || {
+        enter_commit_fence(session, query).map_err(query_error_to_core)?;
+        fenced = true;
         Ok(())
-    })?;
-    Ok(())
+    });
+    match result {
+        Ok(epoch) => Ok(Some(epoch)),
+        Err(mongreldb_core::MongrelError::DurableCommit { epoch, message }) => {
+            query.record_commit(query.status().statement_index, epoch);
+            if let Err(error) = query.exit_commit_critical() {
+                return Err(query.commit_outcome_error(error.to_string()));
+            }
+            session.fire_test_hook(SqlTestHookPoint::AfterDurableCommit);
+            Err(query.commit_outcome_error(message))
+        }
+        Err(error) => {
+            if fenced {
+                let message = match query.exit_commit_critical() {
+                    Ok(()) => error.to_string(),
+                    Err(exit_error) => format!("{error}; {exit_error}"),
+                };
+                Err(query.outcome_unknown_error(message))
+            } else {
+                query.checkpoint()?;
+                Err(error.into())
+            }
+        }
+    }
 }
 
 fn schema_from_create_table(create: &CreateTable) -> Result<CoreSchema> {
@@ -5343,11 +7354,15 @@ fn values_rows(source: Option<&Query>) -> Result<Vec<Vec<Expr>>> {
 }
 
 fn apply_assignment(
+    session: &MongrelSession,
     schema: &CoreSchema,
     row: &mut HashMap<u16, Value>,
     assignment: &Assignment,
     excluded: Option<&HashMap<u16, Value>>,
+    query: &RegisteredSqlQuery,
 ) -> Result<()> {
+    session.fire_test_hook(SqlTestHookPoint::BeforeAssignmentEvaluation);
+    query.checkpoint()?;
     let column_name = match &assignment.target {
         AssignmentTarget::ColumnName(name) => object_name(name)?,
         AssignmentTarget::Tuple(_) => {
@@ -5359,40 +7374,48 @@ fn apply_assignment(
     let column = schema
         .column(&column_name)
         .ok_or_else(|| MongrelQueryError::Schema(format!("unknown column {column_name}")))?;
-    let value = eval_value_expr(&assignment.value, schema, row, excluded)?;
+    let value = eval_value_expr(&assignment.value, schema, row, excluded, query)?;
     row.insert(column.id, coerce_value(value, column.ty.clone())?);
     Ok(())
 }
 
-fn predicate_matches(selection: Option<&Expr>, schema: &CoreSchema, row: &Row) -> Result<bool> {
+fn predicate_matches(
+    selection: Option<&Expr>,
+    schema: &CoreSchema,
+    row: &Row,
+    query: &RegisteredSqlQuery,
+) -> Result<bool> {
     match selection {
-        Some(expr) => eval_bool_expr(expr, schema, &row.columns),
+        Some(expr) => eval_bool_expr(expr, schema, &row.columns, query),
         None => Ok(true),
     }
 }
 
-fn eval_bool_expr(expr: &Expr, schema: &CoreSchema, row: &HashMap<u16, Value>) -> Result<bool> {
+fn eval_bool_expr(
+    expr: &Expr,
+    schema: &CoreSchema,
+    row: &HashMap<u16, Value>,
+    query: &RegisteredSqlQuery,
+) -> Result<bool> {
     match expr {
-        Expr::Nested(e) => eval_bool_expr(e, schema, row),
+        Expr::Nested(e) => eval_bool_expr(e, schema, row, query),
         Expr::UnaryOp {
             op: UnaryOperator::Not,
             expr,
-        } => Ok(!eval_bool_expr(expr, schema, row)?),
+        } => Ok(!eval_bool_expr(expr, schema, row, query)?),
         Expr::BinaryOp { left, op, right } => match op {
-            BinaryOperator::And => {
-                Ok(eval_bool_expr(left, schema, row)? && eval_bool_expr(right, schema, row)?)
-            }
-            BinaryOperator::Or => {
-                Ok(eval_bool_expr(left, schema, row)? || eval_bool_expr(right, schema, row)?)
-            }
+            BinaryOperator::And => Ok(eval_bool_expr(left, schema, row, query)?
+                && eval_bool_expr(right, schema, row, query)?),
+            BinaryOperator::Or => Ok(eval_bool_expr(left, schema, row, query)?
+                || eval_bool_expr(right, schema, row, query)?),
             BinaryOperator::Eq
             | BinaryOperator::NotEq
             | BinaryOperator::Gt
             | BinaryOperator::GtEq
             | BinaryOperator::Lt
             | BinaryOperator::LtEq => {
-                let l = eval_value_expr(left, schema, row, None)?;
-                let r = eval_value_expr(right, schema, row, None)?;
+                let l = eval_value_expr(left, schema, row, None, query)?;
+                let r = eval_value_expr(right, schema, row, None, query)?;
                 compare_values(&l, op, &r)
             }
             _ => Err(MongrelQueryError::Schema(format!(
@@ -5400,11 +7423,11 @@ fn eval_bool_expr(expr: &Expr, schema: &CoreSchema, row: &HashMap<u16, Value>) -
             ))),
         },
         Expr::IsNull(e) => Ok(matches!(
-            eval_value_expr(e, schema, row, None)?,
+            eval_value_expr(e, schema, row, None, query)?,
             Value::Null
         )),
         Expr::IsNotNull(e) => Ok(!matches!(
-            eval_value_expr(e, schema, row, None)?,
+            eval_value_expr(e, schema, row, None, query)?,
             Value::Null
         )),
         Expr::Between {
@@ -5413,9 +7436,9 @@ fn eval_bool_expr(expr: &Expr, schema: &CoreSchema, row: &HashMap<u16, Value>) -
             low,
             high,
         } => {
-            let value = eval_value_expr(expr, schema, row, None)?;
-            let lo = eval_value_expr(low, schema, row, None)?;
-            let hi = eval_value_expr(high, schema, row, None)?;
+            let value = eval_value_expr(expr, schema, row, None, query)?;
+            let lo = eval_value_expr(low, schema, row, None, query)?;
+            let hi = eval_value_expr(high, schema, row, None, query)?;
             let result = compare_values(&value, &BinaryOperator::GtEq, &lo)?
                 && compare_values(&value, &BinaryOperator::LtEq, &hi)?;
             Ok(if *negated { !result } else { result })
@@ -5425,13 +7448,16 @@ fn eval_bool_expr(expr: &Expr, schema: &CoreSchema, row: &HashMap<u16, Value>) -
             list,
             negated,
         } => {
-            let value = eval_value_expr(expr, schema, row, None)?;
+            let value = eval_value_expr(expr, schema, row, None, query)?;
             let mut found = false;
-            for candidate in list {
+            for (candidate_index, candidate) in list.iter().enumerate() {
+                if candidate_index % COMMAND_CHECKPOINT_ROWS == 0 {
+                    query.checkpoint()?;
+                }
                 if compare_values(
                     &value,
                     &BinaryOperator::Eq,
-                    &eval_value_expr(candidate, schema, row, None)?,
+                    &eval_value_expr(candidate, schema, row, None, query)?,
                 )? {
                     found = true;
                     break;
@@ -5445,14 +7471,14 @@ fn eval_bool_expr(expr: &Expr, schema: &CoreSchema, row: &HashMap<u16, Value>) -
             pattern,
             ..
         } => {
-            let value = eval_value_expr(expr, schema, row, None)?;
-            let pattern = eval_value_expr(pattern, schema, row, None)?;
+            let value = eval_value_expr(expr, schema, row, None, query)?;
+            let pattern = eval_value_expr(pattern, schema, row, None, query)?;
             let (Value::Bytes(value), Value::Bytes(pattern)) = (value, pattern) else {
                 return Ok(false);
             };
             let value = String::from_utf8_lossy(&value);
             let pattern = String::from_utf8_lossy(&pattern);
-            let result = like_match(&value, &pattern);
+            let result = like_match(&value, &pattern, query)?;
             Ok(if *negated { !result } else { result })
         }
         Expr::Value(v) => match &v.value {
@@ -5472,9 +7498,11 @@ fn eval_value_expr(
     schema: &CoreSchema,
     row: &HashMap<u16, Value>,
     excluded: Option<&HashMap<u16, Value>>,
+    query: &RegisteredSqlQuery,
 ) -> Result<Value> {
+    query.checkpoint()?;
     match expr {
-        Expr::Nested(e) => eval_value_expr(e, schema, row, excluded),
+        Expr::Nested(e) => eval_value_expr(e, schema, row, excluded, query),
         Expr::Value(v) => sql_value_to_value(&v.value, None),
         Expr::Function(function) => ai_constructor_value(function),
         Expr::Identifier(ident) => {
@@ -5496,7 +7524,7 @@ fn eval_value_expr(
         Expr::UnaryOp {
             op: UnaryOperator::Minus,
             expr,
-        } => match eval_value_expr(expr, schema, row, excluded)? {
+        } => match eval_value_expr(expr, schema, row, excluded, query)? {
             Value::Int64(v) => Ok(Value::Int64(v.saturating_neg())),
             Value::Float64(v) => Ok(Value::Float64(-v)),
             _ => Err(MongrelQueryError::Schema(
@@ -5767,32 +7795,110 @@ fn compare_values(left: &Value, op: &BinaryOperator, right: &Value) -> Result<bo
         BinaryOperator::GtEq => ordering.is_gt() || ordering.is_eq(),
         BinaryOperator::Lt => ordering.is_lt(),
         BinaryOperator::LtEq => ordering.is_lt() || ordering.is_eq(),
-        _ => unreachable!(),
+        _ => {
+            return Err(MongrelQueryError::Schema(format!(
+                "unsupported comparison operator {op}"
+            )))
+        }
     })
 }
 
-fn like_match(value: &str, pattern: &str) -> bool {
-    fn rec(v: &[char], p: &[char]) -> bool {
-        match p.split_first() {
-            None => v.is_empty(),
-            Some(('%', rest)) => rec(v, rest) || (!v.is_empty() && rec(&v[1..], p)),
-            Some(('_', rest)) => !v.is_empty() && rec(&v[1..], rest),
-            Some((ch, rest)) => v.first() == Some(ch) && rec(&v[1..], rest),
+fn like_match(value: &str, pattern: &str, query: &RegisteredSqlQuery) -> Result<bool> {
+    const MAX_LIKE_MATCH_STEPS: usize = 10_000_000;
+
+    let value = value.chars().collect::<Vec<_>>();
+    let pattern = pattern.chars().collect::<Vec<_>>();
+    let mut value_index = 0_usize;
+    let mut pattern_index = 0_usize;
+    let mut star_index = None;
+    let mut retry_value_index = 0_usize;
+    let mut steps = 0_usize;
+
+    while value_index < value.len() {
+        if steps % COMMAND_CHECKPOINT_ROWS == 0 {
+            query.checkpoint()?;
+        }
+        steps = steps.saturating_add(1);
+        if steps > MAX_LIKE_MATCH_STEPS {
+            return Err(mongreldb_core::MongrelError::ResourceLimitExceeded {
+                resource: "SQL LIKE matcher steps",
+                requested: steps,
+                limit: MAX_LIKE_MATCH_STEPS,
+            }
+            .into());
+        }
+        if pattern_index < pattern.len()
+            && (pattern[pattern_index] == '_' || pattern[pattern_index] == value[value_index])
+        {
+            value_index += 1;
+            pattern_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == '%' {
+            star_index = Some(pattern_index);
+            pattern_index += 1;
+            retry_value_index = value_index;
+        } else if let Some(star) = star_index {
+            retry_value_index += 1;
+            value_index = retry_value_index;
+            pattern_index = star + 1;
+        } else {
+            return Ok(false);
         }
     }
-    rec(
-        &value.chars().collect::<Vec<_>>(),
-        &pattern.chars().collect::<Vec<_>>(),
-    )
+    while pattern_index < pattern.len() && pattern[pattern_index] == '%' {
+        pattern_index += 1;
+    }
+    Ok(pattern_index == pattern.len())
 }
 
-fn visible_rows(db: &Arc<Database>, table: &str) -> Result<(CoreSchema, Vec<Row>)> {
+fn for_each_visible_row_controlled(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    table: &str,
+    query: &RegisteredSqlQuery,
+    consume: impl FnMut(&CoreSchema, Row) -> Result<()>,
+) -> Result<CoreSchema> {
+    for_each_visible_row_at_snapshot_controlled(session, db, table, None, query, consume)
+}
+
+fn for_each_visible_row_at_snapshot_controlled(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    table: &str,
+    snapshot: Option<mongreldb_core::Snapshot>,
+    query: &RegisteredSqlQuery,
+    mut consume: impl FnMut(&CoreSchema, Row) -> Result<()>,
+) -> Result<CoreSchema> {
     let handle = db.table(table)?;
     let guard = handle.lock();
     let schema = guard.schema().clone();
-    let snapshot = guard.snapshot();
-    let rows = guard.visible_rows(snapshot)?;
-    Ok((schema, rows))
+    let snapshot = snapshot.unwrap_or_else(|| guard.snapshot());
+    let mut consumed = 0_usize;
+    let mut callback_error = None;
+    let result = guard.for_each_visible_row_controlled(snapshot, query.control(), |row| {
+        if let Err(error) = command_checkpoint(session, query, consumed) {
+            callback_error = Some(error);
+            return Err(mongreldb_core::MongrelError::Cancelled);
+        }
+        consumed += 1;
+        match consume(&schema, row) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                callback_error = Some(error);
+                Err(mongreldb_core::MongrelError::Other(
+                    "visible-row callback failed".into(),
+                ))
+            }
+        }
+    });
+    drop(guard);
+    if let Some(error) = callback_error {
+        return Err(error);
+    }
+    if let Err(error) = result {
+        query.checkpoint()?;
+        return Err(error.into());
+    }
+    Ok(schema)
 }
 
 fn table_schema(db: &Arc<Database>, table: &str) -> Result<CoreSchema> {
@@ -5817,27 +7923,22 @@ fn rebuild_table(
     db: &Arc<Database>,
     table: &str,
     new_schema: CoreSchema,
+    query: &RegisteredSqlQuery,
 ) -> Result<()> {
+    query.checkpoint()?;
     let saved_security = db.security_catalog();
-    let saved_permissions = db
+    let has_saved_permissions = db
         .roles()
         .into_iter()
-        .flat_map(|role| {
-            let role_name = role.name;
-            role.permissions
-                .into_iter()
-                .filter(|permission| permission_targets_table(permission, table))
-                .map(move |permission| (role_name.clone(), permission))
-        })
-        .collect::<Vec<_>>();
-    if saved_security.table_has_objects(table) || !saved_permissions.is_empty() {
+        .flat_map(|role| role.permissions)
+        .any(|permission| permission_targets_table(&permission, table));
+    if saved_security.table_has_objects(table) || has_saved_permissions {
         db.require_for(
             session.principal().as_ref(),
             &mongreldb_core::Permission::Admin,
         )?;
         validate_rebuilt_security(table, &new_schema, &saved_security)?;
     }
-    let (_, rows) = visible_rows(db, table)?;
     let ttl = {
         let handle = db.table(table)?;
         let guard = handle.lock();
@@ -5850,59 +7951,121 @@ fn rebuild_table(
         })
     };
     let temp = format!(
-        "__mongrel_tmp_rebuild_{}_{}",
-        table,
+        "__mongreldb_ctas_build_rebuild_{}_{}",
+        query.id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     );
-    db.create_table(&temp, new_schema.clone())?;
+    db.create_rebuilding_table(&temp, table, &query.id().to_string(), new_schema.clone())?;
     if let Some((column, duration_nanos)) = &ttl {
-        db.set_table_ttl(&temp, column, *duration_nanos)?;
-    }
-    let temp_result = apply_ops(
-        session,
-        db,
-        rows.iter()
-            .map(|row| PendingSqlOp::Put {
-                table: temp.clone(),
-                cells: row_to_schema_cells(row, &new_schema),
-            })
-            .collect(),
-    );
-    if let Err(e) = temp_result {
-        let _ = db.drop_table(&temp);
-        return Err(e);
-    }
-
-    db.drop_table(table)?;
-    db.create_table(table, new_schema.clone())?;
-    if let Some((column, duration_nanos)) = &ttl {
-        db.set_table_ttl(table, column, *duration_nanos)?;
-    }
-    if saved_security.table_has_objects(table) {
-        db.set_security_catalog_as(saved_security, session.principal().as_ref())?;
-    }
-    for (role, permission) in saved_permissions {
-        if let Some(permission) = permission_for_rebuilt_schema(permission, &new_schema) {
-            db.grant_permission(&role, permission)?;
+        if let Err(error) = db.set_building_table_ttl(&temp, column, *duration_nanos) {
+            let _ = db.discard_building_table(&temp);
+            return Err(error.into());
         }
     }
-    apply_ops(
-        session,
-        db,
-        rows.iter()
-            .map(|row| PendingSqlOp::Put {
-                table: table.to_string(),
-                cells: row_to_schema_cells(row, &new_schema),
-            })
-            .collect(),
-    )?;
-    let _ = db.drop_table(&temp);
+    let mut chunk = Vec::with_capacity(COMMAND_CHECKPOINT_ROWS);
+    let mut chunk_bytes = 0_usize;
+    let copy_result = for_each_visible_row_controlled(session, db, table, query, |_schema, row| {
+        let cells = row_to_schema_cells(&row, &new_schema);
+        let row_bytes = cells_deep_bytes(&cells);
+        if row_bytes > REBUILD_STAGING_BYTES_LIMIT {
+            return Err(mongreldb_core::MongrelError::ResourceLimitExceeded {
+                resource: "table rebuild staged row bytes",
+                requested: row_bytes,
+                limit: REBUILD_STAGING_BYTES_LIMIT,
+            }
+            .into());
+        }
+        if !chunk.is_empty() && chunk_bytes.saturating_add(row_bytes) > REBUILD_STAGING_BYTES_LIMIT
+        {
+            commit_rebuild_chunk(session, db, &temp, std::mem::take(&mut chunk), query)?;
+            chunk_bytes = 0;
+        }
+        chunk.push(cells);
+        chunk_bytes = chunk_bytes.saturating_add(row_bytes);
+        if chunk.len() == COMMAND_CHECKPOINT_ROWS {
+            commit_rebuild_chunk(session, db, &temp, std::mem::take(&mut chunk), query)?;
+            chunk_bytes = 0;
+        }
+        Ok(())
+    })
+    .and_then(|_| commit_rebuild_chunk(session, db, &temp, chunk, query));
+    if let Err(error) = copy_result {
+        let _ = db.discard_building_table(&temp);
+        return Err(error);
+    }
+    if let Err(error) = query.checkpoint() {
+        let _ = db.discard_building_table(&temp);
+        return Err(error);
+    }
+    let fenced = std::cell::Cell::new(false);
+    let publish = db.publish_rebuilding_table_controlled(&temp, table, || {
+        enter_commit_fence(session, query).map_err(query_error_to_core)?;
+        fenced.set(true);
+        Ok(())
+    });
+    let (publish_epoch, publish_error) = match publish {
+        Ok(epoch) => (epoch, None),
+        Err(mongreldb_core::MongrelError::DurableCommit { epoch, message }) => {
+            (mongreldb_core::Epoch(epoch), Some(message))
+        }
+        Err(error) if fenced.get() => {
+            let _ = session.ctx.deregister_table(table);
+            session.tables.lock().remove(table);
+            let error = match register_table(session, db, table) {
+                Ok(()) => error,
+                Err(register_error) => mongreldb_core::MongrelError::Other(format!(
+                    "{error}; table registration failed: {register_error}"
+                )),
+            };
+            return Err(uncertain_fenced_error(session, query, error));
+        }
+        Err(error) => {
+            query.checkpoint()?;
+            let _ = db.discard_building_table(&temp);
+            return Err(error.into());
+        }
+    };
+    query.record_commit(query.status().statement_index, publish_epoch.0);
     let _ = session.ctx.deregister_table(table);
     session.tables.lock().remove(table);
-    register_table(session, db, table)?;
+    if let Err(error) = register_table(session, db, table) {
+        if let Err(exit_error) = query.exit_commit_critical() {
+            return Err(query.commit_outcome_error(format!("{error}; {exit_error}")));
+        }
+        session.fire_test_hook(SqlTestHookPoint::AfterDurableCommit);
+        return Err(query.commit_outcome_error(error.to_string()));
+    }
+    if let Err(error) = query.exit_commit_critical() {
+        return Err(query.commit_outcome_error(error.to_string()));
+    }
+    session.fire_test_hook(SqlTestHookPoint::AfterDurableCommit);
+    if let Some(error) = publish_error {
+        return Err(query.commit_outcome_error(error));
+    }
+    Ok(())
+}
+
+fn commit_rebuild_chunk(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    temp: &str,
+    rows: Vec<Vec<(u16, Value)>>,
+    query: &RegisteredSqlQuery,
+) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut transaction = db.begin_as(session.principal());
+    for cells in rows {
+        if let Err(error) = transaction.put_building(temp, cells) {
+            transaction.rollback();
+            return Err(error.into());
+        }
+    }
+    transaction.commit_controlled(query.control(), || Ok(()))?;
     Ok(())
 }
 
@@ -5919,29 +8082,6 @@ fn permission_targets_table(permission: &mongreldb_core::Permission, table: &str
             | Permission::UpdateColumns { table: target, .. }
             if target == table
     )
-}
-
-fn permission_for_rebuilt_schema(
-    permission: mongreldb_core::Permission,
-    schema: &CoreSchema,
-) -> Option<mongreldb_core::Permission> {
-    use mongreldb_core::Permission;
-    let retain_columns = |mut columns: Vec<String>| {
-        columns.retain(|column| schema.column(column).is_some());
-        (!columns.is_empty()).then_some(columns)
-    };
-    match permission {
-        Permission::SelectColumns { table, columns } => {
-            retain_columns(columns).map(|columns| Permission::SelectColumns { table, columns })
-        }
-        Permission::InsertColumns { table, columns } => {
-            retain_columns(columns).map(|columns| Permission::InsertColumns { table, columns })
-        }
-        Permission::UpdateColumns { table, columns } => {
-            retain_columns(columns).map(|columns| Permission::UpdateColumns { table, columns })
-        }
-        permission => Some(permission),
-    }
 }
 
 fn validate_rebuilt_security(
@@ -6453,52 +8593,184 @@ fn core_value_json(value: &Value) -> serde_json::Value {
     }
 }
 
-fn compact_all(db: &Arc<Database>) -> Result<()> {
-    for table in db.table_names() {
-        db.table(&table)?.lock().compact()?;
-    }
-    let _ = db.gc()?;
-    Ok(())
+#[derive(Clone, Copy)]
+enum TableMaintenance {
+    Analyze,
+    Compact,
 }
 
-fn analyze_all(db: &Arc<Database>) -> Result<()> {
-    for table in db.table_names() {
-        let handle = db.table(&table)?;
-        handle.lock().ensure_indexes_complete()?;
+fn run_table_maintenance(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    table: &str,
+    query: &RegisteredSqlQuery,
+    operation: TableMaintenance,
+) -> Result<bool> {
+    query.checkpoint()?;
+    let handle = db.table(table)?;
+    let mut guard = handle.lock();
+    let mut fence_error = None;
+    let mut fenced = false;
+    let result = match operation {
+        TableMaintenance::Analyze => {
+            guard.ensure_indexes_complete_controlled_with_receipt(query.control(), || {
+                match enter_commit_fence(session, query) {
+                    Ok(()) => {
+                        fenced = true;
+                        true
+                    }
+                    Err(error) => {
+                        fence_error = Some(error);
+                        false
+                    }
+                }
+            })
+        }
+        TableMaintenance::Compact => guard.compact_controlled_with_receipt(query.control(), || {
+            match enter_commit_fence(session, query) {
+                Ok(()) => {
+                    fenced = true;
+                    true
+                }
+                Err(error) => {
+                    fence_error = Some(error);
+                    false
+                }
+            }
+        }),
+    };
+    drop(guard);
+    if let Some(error) = fence_error {
+        return Err(error);
     }
-    Ok(())
+    let (changed, receipt) = match result {
+        Ok(result) => result,
+        Err(error) => {
+            if fenced {
+                return Err(uncertain_fenced_error(session, query, error));
+            } else {
+                query.checkpoint()?;
+            }
+            return Err(error.into());
+        }
+    };
+    if fenced {
+        let Some(receipt) = receipt else {
+            return Err(uncertain_fenced_error(
+                session,
+                query,
+                mongreldb_core::MongrelError::Other(
+                    "table maintenance published without a receipt".into(),
+                ),
+            ));
+        };
+        query.record_commit(query.status().statement_index, receipt.epoch.0);
+        if let Err(error) = query.exit_commit_critical() {
+            return Err(query.commit_outcome_error(error.to_string()));
+        }
+        session.fire_test_hook(SqlTestHookPoint::AfterDurableCommit);
+    }
+    Ok(changed)
 }
 
-fn reindex(db: &Arc<Database>, target: Option<&str>) -> Result<()> {
-    match target {
-        None => {
-            for table in db.table_names() {
-                let handle = db.table(&table)?;
-                let mut guard = handle.lock();
-                guard.ensure_indexes_complete()?;
-                guard.compact()?;
+fn run_gc(session: &MongrelSession, db: &Arc<Database>, query: &RegisteredSqlQuery) -> Result<()> {
+    query.checkpoint()?;
+    let mut fence_error = None;
+    let mut fenced = false;
+    let result = db.gc_controlled_with_receipt(query.control(), || {
+        match enter_commit_fence(session, query) {
+            Ok(()) => {
+                fenced = true;
+                true
+            }
+            Err(error) => {
+                fence_error = Some(error);
+                false
             }
         }
-        Some(name) => {
-            if db.table_id(name).is_ok() {
-                let handle = db.table(name)?;
-                let mut guard = handle.lock();
-                guard.ensure_indexes_complete()?;
-                guard.compact()?;
-            } else if let Some(table) = find_index_table(db, name)? {
-                let handle = db.table(&table)?;
-                let mut guard = handle.lock();
-                guard.ensure_indexes_complete()?;
-                guard.compact()?;
+    });
+    if let Some(error) = fence_error {
+        return Err(error);
+    }
+    let (reclaimed, receipt) = match result {
+        Ok(result) => result,
+        Err(error) => {
+            if fenced {
+                return Err(uncertain_fenced_error(session, query, error));
             } else {
+                query.checkpoint()?;
+            }
+            return Err(error.into());
+        }
+    };
+    if fenced {
+        let Some(receipt) = receipt else {
+            return Err(uncertain_fenced_error(
+                session,
+                query,
+                mongreldb_core::MongrelError::Other(
+                    "garbage collection published without a maintenance receipt".into(),
+                ),
+            ));
+        };
+        query.record_commit(query.status().statement_index, receipt.epoch.0);
+        if let Err(error) = query.exit_commit_critical() {
+            return Err(query.commit_outcome_error(error.to_string()));
+        }
+        session.fire_test_hook(SqlTestHookPoint::AfterDurableCommit);
+    }
+    let _ = reclaimed;
+    Ok(())
+}
+
+fn compact_all(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    query: &RegisteredSqlQuery,
+) -> Result<()> {
+    for (table_index, table) in db.table_names().into_iter().enumerate() {
+        command_checkpoint(session, query, table_index)?;
+        run_table_maintenance(session, db, &table, query, TableMaintenance::Compact)?;
+    }
+    run_gc(session, db, query)
+}
+
+fn analyze_all(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    query: &RegisteredSqlQuery,
+) -> Result<()> {
+    for (table_index, table) in db.table_names().into_iter().enumerate() {
+        command_checkpoint(session, query, table_index)?;
+        run_table_maintenance(session, db, &table, query, TableMaintenance::Analyze)?;
+    }
+    Ok(())
+}
+
+fn reindex(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    target: Option<&str>,
+    query: &RegisteredSqlQuery,
+) -> Result<()> {
+    let tables = match target {
+        None => db.table_names(),
+        Some(name) if db.table_id(name).is_ok() => vec![name.to_string()],
+        Some(name) => match find_index_table(db, name)? {
+            Some(table) => vec![table],
+            None => {
                 return Err(MongrelQueryError::Schema(format!(
                     "REINDEX target {name:?} is not a table or index"
-                )));
+                )))
             }
-        }
+        },
+    };
+    for (table_index, table) in tables.into_iter().enumerate() {
+        command_checkpoint(session, query, table_index)?;
+        run_table_maintenance(session, db, &table, query, TableMaintenance::Analyze)?;
+        run_table_maintenance(session, db, &table, query, TableMaintenance::Compact)?;
     }
-    let _ = db.gc()?;
-    Ok(())
+    run_gc(session, db, query)
 }
 
 fn parse_vacuum_into<'a>(sql: &'a str, lower: &str) -> Result<&'a str> {
@@ -6522,6 +8794,7 @@ fn run_pragma(
     db: &Arc<Database>,
     sql: &str,
     lower: &str,
+    query: &RegisteredSqlQuery,
 ) -> Result<RecordBatch> {
     let body = sql
         .trim()
@@ -6550,25 +8823,43 @@ fn run_pragma(
         "foreign_key_list" => {
             pragma_foreign_key_list(db, required_pragma_arg(&name, arg.as_deref())?)
         }
-        "foreign_key_check" => pragma_foreign_key_check(db, arg.as_deref()),
+        "foreign_key_check" => pragma_foreign_key_check(session, db, arg.as_deref(), query),
         "database_list" => pragma_database_list(db),
         "function_list" => pragma_function_list(),
         "module_list" => pragma_module_list(session),
         "trigger_list" => pragma_trigger_list(db),
         "collation_list" => pragma_collation_list(),
         "compile_options" => pragma_compile_options(),
-        "integrity_check" => pragma_check_batch(db, "integrity_check"),
-        "quick_check" => pragma_check_batch(db, "quick_check"),
+        "integrity_check" => pragma_check_batch(db, query, "integrity_check"),
+        "quick_check" => pragma_check_batch(db, query, "quick_check"),
         "schema_version" => int_batch("schema_version", schema_version(db)),
         "user_version" => {
             if let Some(value) = parse_optional_i64(arg.as_deref())? {
-                set_db_pragma_i64(db, "user_version", value)?;
+                if db.sql_pragma_i64("user_version")? != Some(value) {
+                    run_controlled_durable_with_optional_epoch(session, query, |before_commit| {
+                        let epoch = db.set_sql_pragma_i64_with_epoch_controlled(
+                            "user_version",
+                            value,
+                            before_commit,
+                        )?;
+                        Ok(((), epoch.map(|epoch| epoch.0)))
+                    })?;
+                }
             }
             int_batch("user_version", get_db_pragma_i64(db, "user_version")?)
         }
         "application_id" => {
             if let Some(value) = parse_optional_i64(arg.as_deref())? {
-                set_db_pragma_i64(db, "application_id", value)?;
+                if db.sql_pragma_i64("application_id")? != Some(value) {
+                    run_controlled_durable_with_optional_epoch(session, query, |before_commit| {
+                        let epoch = db.set_sql_pragma_i64_with_epoch_controlled(
+                            "application_id",
+                            value,
+                            before_commit,
+                        )?;
+                        Ok(((), epoch.map(|epoch| epoch.0)))
+                    })?;
+                }
             }
             int_batch("application_id", get_db_pragma_i64(db, "application_id")?)
         }
@@ -6579,7 +8870,7 @@ fn run_pragma(
         "synchronous" => int_batch("synchronous", 1),
         "encoding" => strings_batch("encoding", vec!["UTF-8".to_string()]),
         "page_size" => int_batch("page_size", 4096),
-        "page_count" => int_batch("page_count", db_page_count(db)?),
+        "page_count" => int_batch("page_count", db_page_count(db, query)?),
         "freelist_count" => int_batch("freelist_count", 0),
         "cache_size" => int_batch("cache_size", -2000),
         "automatic_index" => int_batch("automatic_index", 1),
@@ -6594,9 +8885,9 @@ fn run_pragma(
             )
         }
         "trusted_schema" => int_batch("trusted_schema", 0),
-        "wal_checkpoint" => pragma_wal_checkpoint(db),
+        "wal_checkpoint" => pragma_wal_checkpoint(session, db, query),
         "optimize" => {
-            analyze_all(db)?;
+            analyze_all(session, db, query)?;
             session.clear_cache();
             strings_batch("optimize", vec!["ok".to_string()])
         }
@@ -6665,6 +8956,9 @@ fn db_pragma_file(db: &Arc<Database>) -> std::path::PathBuf {
 }
 
 fn get_db_pragma_i64(db: &Arc<Database>, key: &str) -> Result<i64> {
+    if let Some(value) = db.sql_pragma_i64(key)? {
+        return Ok(value);
+    }
     let path = db_pragma_file(db);
     let Ok(bytes) = fs::read(&path) else {
         return Ok(0);
@@ -6674,39 +8968,28 @@ fn get_db_pragma_i64(db: &Arc<Database>, key: &str) -> Result<i64> {
     Ok(value.get(key).and_then(|v| v.as_i64()).unwrap_or(0))
 }
 
-fn set_db_pragma_i64(db: &Arc<Database>, key: &str, value: i64) -> Result<()> {
-    let path = db_pragma_file(db);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| MongrelQueryError::Schema(e.to_string()))?;
-    }
-    let mut object = fs::read(&path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-        .and_then(|value| value.as_object().cloned())
-        .unwrap_or_default();
-    object.insert(key.to_string(), serde_json::Value::from(value));
-    let bytes = serde_json::to_vec_pretty(&serde_json::Value::Object(object))
-        .map_err(|e| MongrelQueryError::Schema(e.to_string()))?;
-    fs::write(path, bytes).map_err(|e| MongrelQueryError::Schema(e.to_string()))
-}
-
-fn db_page_count(db: &Arc<Database>) -> Result<i64> {
-    let bytes = dir_size(db.root())?;
+fn db_page_count(db: &Arc<Database>, query: &RegisteredSqlQuery) -> Result<i64> {
+    let mut scanned = 0_usize;
+    let bytes = dir_size(db.root(), query, &mut scanned)?;
     Ok(bytes.div_ceil(4096) as i64)
 }
 
-fn dir_size(path: &Path) -> Result<u64> {
+fn dir_size(path: &Path, query: &RegisteredSqlQuery, scanned: &mut usize) -> Result<u64> {
     let mut total = 0_u64;
     let Ok(entries) = fs::read_dir(path) else {
         return Ok(0);
     };
     for entry in entries {
+        if *scanned % COMMAND_CHECKPOINT_ROWS == 0 {
+            query.checkpoint()?;
+        }
+        *scanned += 1;
         let entry = entry.map_err(|e| MongrelQueryError::Schema(e.to_string()))?;
         let metadata = entry
             .metadata()
             .map_err(|e| MongrelQueryError::Schema(e.to_string()))?;
         if metadata.is_dir() {
-            total = total.saturating_add(dir_size(&entry.path())?);
+            total = total.saturating_add(dir_size(&entry.path(), query, scanned)?);
         } else {
             total = total.saturating_add(metadata.len());
         }
@@ -7213,7 +9496,12 @@ fn pragma_foreign_key_list(db: &Arc<Database>, table: &str) -> Result<RecordBatc
     .map_err(|e| MongrelQueryError::Arrow(e.to_string()))
 }
 
-fn pragma_foreign_key_check(db: &Arc<Database>, table: Option<&str>) -> Result<RecordBatch> {
+fn pragma_foreign_key_check(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    table: Option<&str>,
+    query: &RegisteredSqlQuery,
+) -> Result<RecordBatch> {
     let mut child_table = Vec::new();
     let mut rowid = Vec::new();
     let mut parent_table = Vec::new();
@@ -7223,44 +9511,107 @@ fn pragma_foreign_key_check(db: &Arc<Database>, table: Option<&str>) -> Result<R
         None => db.table_names(),
     };
 
+    let mut row_visits = 0_usize;
+    let mut total_key_bytes = 0_usize;
+    let mut output_bytes = 0_usize;
     for table_name in tables {
-        let (schema, rows) = visible_rows(db, &table_name)?;
+        query.checkpoint()?;
+        let schema = table_schema(db, &table_name)?;
         for fk in &schema.constraints.foreign_keys {
-            let Ok((_parent_schema, parent_rows)) = visible_rows(db, &fk.ref_table) else {
-                for row in &rows {
-                    if fk_row_is_checkable(row, &fk.columns) {
-                        child_table.push(table_name.clone());
-                        rowid.push(row.row_id.0 as i64);
-                        parent_table.push(fk.ref_table.clone());
-                        fkid.push(fk.id as i64);
-                    }
+            query.checkpoint()?;
+            let mut parent_keys = HashSet::new();
+            let mut parent_key_bytes = 0_usize;
+            let parent_available = match db.table(&fk.ref_table) {
+                Ok(_) => {
+                    for_each_visible_row_controlled(
+                        session,
+                        db,
+                        &fk.ref_table,
+                        query,
+                        |_schema, row| {
+                            charge_foreign_key_check_work(
+                                &mut row_visits,
+                                1,
+                                FOREIGN_KEY_CHECK_MAX_ROW_VISITS,
+                                "foreign key check row visits",
+                            )?;
+                            let Some(key) = foreign_key_composite_key(&row, &fk.ref_columns)?
+                            else {
+                                return Ok(());
+                            };
+                            charge_foreign_key_check_work(
+                                &mut total_key_bytes,
+                                key.len(),
+                                FOREIGN_KEY_CHECK_TOTAL_KEY_BYTES_LIMIT,
+                                "foreign key check total key bytes",
+                            )?;
+                            if !parent_keys.contains(&key) {
+                                let allocation_bytes = key
+                                    .len()
+                                    .saturating_add(std::mem::size_of::<Vec<u8>>())
+                                    .saturating_add(2 * std::mem::size_of::<usize>());
+                                charge_foreign_key_check_work(
+                                    &mut parent_key_bytes,
+                                    allocation_bytes,
+                                    FOREIGN_KEY_CHECK_PARENT_KEY_BYTES_LIMIT,
+                                    "foreign key check parent key bytes",
+                                )?;
+                                parent_keys.insert(key);
+                            }
+                            Ok(())
+                        },
+                    )?;
+                    true
                 }
-                continue;
+                Err(mongreldb_core::MongrelError::NotFound(_)) => false,
+                Err(error) => return Err(error.into()),
             };
-            for row in &rows {
-                let values = fk
-                    .columns
-                    .iter()
-                    .map(|column| row.columns.get(column).cloned().unwrap_or(Value::Null))
-                    .collect::<Vec<_>>();
-                if values.iter().any(|value| matches!(value, Value::Null)) {
-                    continue;
+
+            for_each_visible_row_controlled(session, db, &table_name, query, |_schema, row| {
+                charge_foreign_key_check_work(
+                    &mut row_visits,
+                    1,
+                    FOREIGN_KEY_CHECK_MAX_ROW_VISITS,
+                    "foreign key check row visits",
+                )?;
+                let Some(key) = foreign_key_composite_key(&row, &fk.columns)? else {
+                    return Ok(());
+                };
+                charge_foreign_key_check_work(
+                    &mut total_key_bytes,
+                    key.len(),
+                    FOREIGN_KEY_CHECK_TOTAL_KEY_BYTES_LIMIT,
+                    "foreign key check total key bytes",
+                )?;
+                if parent_available && parent_keys.contains(&key) {
+                    return Ok(());
                 }
-                let parent_exists = parent_rows.iter().any(|parent| {
-                    fk.ref_columns
-                        .iter()
-                        .zip(values.iter())
-                        .all(|(column, value)| {
-                            parent.columns.get(column).unwrap_or(&Value::Null) == value
-                        })
-                });
-                if !parent_exists {
-                    child_table.push(table_name.clone());
-                    rowid.push(row.row_id.0 as i64);
-                    parent_table.push(fk.ref_table.clone());
-                    fkid.push(fk.id as i64);
+                let requested_violations = child_table.len().saturating_add(1);
+                if requested_violations > FOREIGN_KEY_CHECK_MAX_VIOLATIONS {
+                    return Err(mongreldb_core::MongrelError::ResourceLimitExceeded {
+                        resource: "foreign key check violations",
+                        requested: requested_violations,
+                        limit: FOREIGN_KEY_CHECK_MAX_VIOLATIONS,
+                    }
+                    .into());
                 }
-            }
+                let output_row_bytes = (2 * std::mem::size_of::<String>())
+                    .saturating_add(2 * std::mem::size_of::<i64>())
+                    .saturating_add(table_name.len())
+                    .saturating_add(fk.ref_table.len())
+                    .saturating_mul(2);
+                charge_foreign_key_check_work(
+                    &mut output_bytes,
+                    output_row_bytes,
+                    FOREIGN_KEY_CHECK_OUTPUT_BYTES_LIMIT,
+                    "foreign key check output bytes",
+                )?;
+                child_table.push(table_name.clone());
+                rowid.push(row.row_id.0 as i64);
+                parent_table.push(fk.ref_table.clone());
+                fkid.push(fk.id as i64);
+                Ok(())
+            })?;
         }
     }
 
@@ -7281,10 +9632,103 @@ fn pragma_foreign_key_check(db: &Arc<Database>, table: Option<&str>) -> Result<R
     .map_err(|e| MongrelQueryError::Arrow(e.to_string()))
 }
 
-fn fk_row_is_checkable(row: &Row, columns: &[u16]) -> bool {
-    columns
-        .iter()
-        .all(|column| !matches!(row.columns.get(column), None | Some(Value::Null)))
+fn charge_foreign_key_check_work(
+    used: &mut usize,
+    amount: usize,
+    limit: usize,
+    resource: &'static str,
+) -> Result<()> {
+    let requested = used.saturating_add(amount);
+    if requested > limit {
+        return Err(mongreldb_core::MongrelError::ResourceLimitExceeded {
+            resource,
+            requested,
+            limit,
+        }
+        .into());
+    }
+    *used = requested;
+    Ok(())
+}
+
+fn foreign_key_composite_key(row: &Row, columns: &[u16]) -> Result<Option<Vec<u8>>> {
+    let mut encoded_bytes = 0_usize;
+    for column in columns {
+        let Some(value) = row.columns.get(column) else {
+            return Ok(None);
+        };
+        if matches!(value, Value::Null) {
+            return Ok(None);
+        }
+        encoded_bytes = encoded_bytes
+            .saturating_add(std::mem::size_of::<u32>())
+            .saturating_add(value_encoded_key_len(value));
+        if encoded_bytes > FOREIGN_KEY_CHECK_KEY_BYTES_LIMIT {
+            return Err(mongreldb_core::MongrelError::ResourceLimitExceeded {
+                resource: "foreign key check composite key bytes",
+                requested: encoded_bytes,
+                limit: FOREIGN_KEY_CHECK_KEY_BYTES_LIMIT,
+            }
+            .into());
+        }
+    }
+    let mut key = Vec::with_capacity(encoded_bytes);
+    for column in columns {
+        let value = match row.columns.get(column) {
+            Some(value) => value,
+            None => return Ok(None),
+        };
+        let encoded = value.encode_key();
+        let encoded_len = u32::try_from(encoded.len()).map_err(|_| {
+            mongreldb_core::MongrelError::ResourceLimitExceeded {
+                resource: "foreign key check composite key bytes",
+                requested: encoded.len(),
+                limit: FOREIGN_KEY_CHECK_KEY_BYTES_LIMIT,
+            }
+        })?;
+        key.extend_from_slice(&encoded_len.to_be_bytes());
+        key.extend_from_slice(&encoded);
+    }
+    Ok(Some(key))
+}
+
+fn value_encoded_key_len(value: &Value) -> usize {
+    match value {
+        Value::Null => 0,
+        Value::Bool(_) => 1,
+        Value::Int64(_) | Value::Float64(_) => 8,
+        Value::Bytes(value) | Value::Json(value) => value.len(),
+        Value::Embedding(value) => value.len().saturating_mul(std::mem::size_of::<f32>()),
+        Value::Decimal(_) | Value::Uuid(_) => 16,
+        Value::Interval { .. } => 20,
+    }
+}
+
+fn row_deep_bytes(row: &Row) -> usize {
+    let bucket_bytes =
+        std::mem::size_of::<(u16, Value)>().saturating_add(2 * std::mem::size_of::<usize>());
+    row.columns
+        .capacity()
+        .saturating_mul(bucket_bytes)
+        .saturating_add(std::mem::size_of::<Row>())
+        .saturating_add(
+            row.columns
+                .values()
+                .map(value_encoded_key_len)
+                .fold(0_usize, usize::saturating_add),
+        )
+}
+
+fn cells_deep_bytes(cells: &[(u16, Value)]) -> usize {
+    cells
+        .len()
+        .saturating_mul(std::mem::size_of::<(u16, Value)>())
+        .saturating_add(
+            cells
+                .iter()
+                .map(|(_, value)| value_encoded_key_len(value))
+                .fold(0_usize, usize::saturating_add),
+        )
 }
 
 fn column_name(schema: &CoreSchema, id: u16) -> String {
@@ -7499,12 +9943,22 @@ fn pragma_compile_options() -> Result<RecordBatch> {
     )
 }
 
-fn pragma_wal_checkpoint(db: &Arc<Database>) -> Result<RecordBatch> {
-    for table in db.table_names() {
+fn pragma_wal_checkpoint(
+    session: &MongrelSession,
+    db: &Arc<Database>,
+    query: &RegisteredSqlQuery,
+) -> Result<RecordBatch> {
+    for (table_index, table) in db.table_names().into_iter().enumerate() {
+        command_checkpoint(session, query, table_index)?;
         let handle = db.table(&table)?;
-        handle.lock().flush()?;
+        let mut table = handle.lock();
+        run_controlled_durable_with_optional_epoch(session, query, |before_commit| {
+            let (epoch, changed) =
+                table.flush_with_outcome_controlled(query.control(), before_commit)?;
+            Ok(((), changed.then_some(epoch.0)))
+        })?;
     }
-    let _ = db.gc()?;
+    run_gc(session, db, query)?;
     RecordBatch::try_new(
         Arc::new(ArrowSchema::new(vec![
             Field::new("busy", ArrowDataType::Int64, false),
@@ -7520,8 +9974,8 @@ fn pragma_wal_checkpoint(db: &Arc<Database>) -> Result<RecordBatch> {
     .map_err(|e| MongrelQueryError::Arrow(e.to_string()))
 }
 
-fn check_batch(db: &Arc<Database>) -> Result<RecordBatch> {
-    let issues = db.check();
+fn check_batch(db: &Arc<Database>, query: &RegisteredSqlQuery) -> Result<RecordBatch> {
+    let issues = controlled_check(db, query)?;
     let severity: Vec<String> = issues.iter().map(|i| i.severity.clone()).collect();
     let table: Vec<String> = issues.iter().map(|i| i.table_name.clone()).collect();
     let description: Vec<String> = issues.iter().map(|i| i.description.clone()).collect();
@@ -7540,8 +9994,12 @@ fn check_batch(db: &Arc<Database>) -> Result<RecordBatch> {
     .map_err(|e| MongrelQueryError::Arrow(e.to_string()))
 }
 
-fn pragma_check_batch(db: &Arc<Database>, column_name: &str) -> Result<RecordBatch> {
-    let issues = db.check();
+fn pragma_check_batch(
+    db: &Arc<Database>,
+    query: &RegisteredSqlQuery,
+    column_name: &str,
+) -> Result<RecordBatch> {
+    let issues = controlled_check(db, query)?;
     let values = if issues.is_empty() {
         vec!["ok".to_string()]
     } else {
@@ -7556,6 +10014,19 @@ fn pragma_check_batch(db: &Arc<Database>, column_name: &str) -> Result<RecordBat
             .collect()
     };
     strings_batch(column_name, values)
+}
+
+fn controlled_check(
+    db: &Arc<Database>,
+    query: &RegisteredSqlQuery,
+) -> Result<Vec<mongreldb_core::CheckIssue>> {
+    match db.check_controlled(query.control()) {
+        Ok(issues) => Ok(issues),
+        Err(error) => {
+            query.checkpoint()?;
+            Err(error.into())
+        }
+    }
 }
 
 fn int_batch(name: &str, value: i64) -> Result<RecordBatch> {
@@ -7605,6 +10076,7 @@ fn json_batch(name: &str, values: Vec<String>) -> Result<RecordBatch> {
 async fn try_recursive_cte(
     session: &MongrelSession,
     sql: &str,
+    query: &RegisteredSqlQuery,
 ) -> Result<Option<Vec<RecordBatch>>> {
     use sqlparser::ast::{SetExpr, Statement};
     use sqlparser::dialect::PostgreSqlDialect;
@@ -7618,11 +10090,16 @@ async fn try_recursive_cte(
         ));
     }
 
-    let Statement::Query(query) = statements.into_iter().next().unwrap() else {
+    let Some(statement) = statements.into_iter().next() else {
+        return Err(MongrelQueryError::InvalidQueryState(
+            "recursive CTE parser returned no statement".into(),
+        ));
+    };
+    let Statement::Query(parsed_query) = statement else {
         return Ok(None);
     };
 
-    let with = query
+    let with = parsed_query
         .with
         .as_ref()
         .ok_or_else(|| MongrelQueryError::Schema("expected WITH RECURSIVE".into()))?;
@@ -7676,6 +10153,7 @@ async fn try_recursive_cte(
     };
 
     // 1. Execute the base query.
+    query.checkpoint()?;
     let base_batches = Box::pin(session.run(&base_sql)).await?;
     if base_batches.is_empty() {
         return Ok(Some(Vec::new()));
@@ -7749,7 +10227,8 @@ async fn try_recursive_cte(
     //    UNION ALL and is the standard evaluation strategy.
     let max_iterations = 10_000;
     let mut delta_merged = merged.clone();
-    for _ in 0..max_iterations {
+    for iteration in 0..max_iterations {
+        command_checkpoint(session, query, iteration)?;
         // Register ONLY the delta (new rows) as the CTE name, so the recursive
         // arm sees only the rows added in the previous iteration.
         let _ = session.ctx.deregister_table(&cte_name);
@@ -7758,6 +10237,7 @@ async fn try_recursive_cte(
         session.plan_cache.lock().clear();
 
         let new_batches = Box::pin(session.run(&recursive_sql)).await?;
+        query.checkpoint()?;
         let new_rows: usize = new_batches.iter().map(|b| b.num_rows()).sum();
         if new_rows == 0 {
             break;
@@ -7827,6 +10307,7 @@ async fn try_recursive_cte(
     // Register the full accumulated result as the CTE name for the outer query.
     let full_merged = arrow::compute::concat_batches(&renamed_schema, &all_batches)
         .map_err(|e| MongrelQueryError::Arrow(e.to_string()))?;
+    query.checkpoint()?;
     let _ = session.ctx.deregister_table(&cte_name);
     let _ = session.ctx.register_batch(&cte_name, full_merged);
 
@@ -7837,6 +10318,7 @@ async fn try_recursive_cte(
     // 3. Execute the outer query (after the CTE definition).
     let outer_select = extract_outer_query(sql)?;
     let result = Box::pin(session.run(&outer_select)).await?;
+    query.checkpoint()?;
     Ok(Some(result))
 }
 
@@ -7879,10 +10361,366 @@ mod tests {
     use super::*;
 
     #[test]
-    fn staged_sql_operations_are_capped() {
-        assert!(ensure_staging_capacity(MAX_STAGED_SQL_OPS - 1, 1).is_ok());
-        let error = ensure_staging_capacity(MAX_STAGED_SQL_OPS, 1).unwrap_err();
-        assert!(error.to_string().contains("10000 staged operations"));
+    fn ctas_arrow_values_are_typed_and_timestamp_safe() {
+        use arrow::array::{Array, Date32Array, LargeStringArray, TimestampSecondArray};
+
+        let large: Arc<dyn Array> = Arc::new(LargeStringArray::from(vec![Some("large text")]));
+        assert_eq!(
+            arrow_cell_to_value(&large, 0).unwrap(),
+            Value::Bytes(b"large text".to_vec())
+        );
+
+        let date: Arc<dyn Array> = Arc::new(Date32Array::from(vec![Some(42)]));
+        assert_eq!(arrow_cell_to_value(&date, 0).unwrap(), Value::Int64(42));
+
+        let timestamp: Arc<dyn Array> = Arc::new(TimestampSecondArray::from(vec![Some(2)]));
+        assert_eq!(
+            arrow_cell_to_value(&timestamp, 0).unwrap(),
+            Value::Int64(2_000_000_000)
+        );
+
+        let overflow: Arc<dyn Array> = Arc::new(TimestampSecondArray::from(vec![Some(i64::MAX)]));
+        assert!(matches!(
+            arrow_cell_to_value(&overflow, 0),
+            Err(MongrelQueryError::Arrow(message))
+                if message == "timestamp overflows nanosecond storage"
+        ));
+    }
+
+    #[test]
+    fn spilled_operation_rewalks_honor_cancellation() {
+        let registry = Arc::new(crate::SqlQueryRegistry::new(
+            1,
+            1,
+            1024,
+            std::time::Duration::from_secs(60),
+        ));
+        let query = registry
+            .register(crate::SqlQueryOptions::default())
+            .unwrap();
+        let mut ops = PendingSqlOps::default();
+        for row_id in 0..1_100 {
+            ops.push(PendingSqlOp::Delete {
+                table: "items".into(),
+                row_id: mongreldb_core::RowId(row_id),
+            })
+            .unwrap();
+        }
+        query.request_cancel(mongreldb_core::CancellationReason::ClientRequest);
+
+        assert!(matches!(
+            logical_changes_spooled(&mut ops, &query),
+            Err(MongrelQueryError::QueryCancelled { .. })
+        ));
+
+        let mut staged = PendingSqlOps::default();
+        assert!(matches!(
+            staged.append_from(&mut ops, &query),
+            Err(MongrelQueryError::QueryCancelled { .. })
+        ));
+        assert!(staged.is_empty());
+    }
+
+    #[tokio::test]
+    async fn command_batch_wait_is_cancel_wakeable() {
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+
+        let registry = Arc::new(crate::SqlQueryRegistry::new(
+            1,
+            1,
+            1024,
+            std::time::Duration::from_secs(60),
+        ));
+        let query = registry
+            .register(crate::SqlQueryOptions::default())
+            .unwrap();
+        let cancel_query = query.clone();
+        let schema = Arc::new(ArrowSchema::empty());
+        let pending = futures::stream::pending::<datafusion::error::Result<RecordBatch>>();
+        let mut stream: MongrelRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(schema, pending));
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            cancel_query.request_cancel(mongreldb_core::CancellationReason::ClientRequest);
+        });
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            next_command_batch(&mut stream, &query),
+        )
+        .await
+        .expect("blocked stream must wake on cancellation")
+        .unwrap_err();
+        assert!(matches!(error, MongrelQueryError::QueryCancelled { .. }));
+    }
+
+    fn spill_bytes(ops: &mut PendingSqlOps) -> Vec<u8> {
+        let spill = ops.spill.as_mut().expect("operations must spill");
+        spill.file.flush().unwrap();
+        let mut file = spill.file.try_clone().unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let mut raw = Vec::new();
+        file.read_to_end(&mut raw).unwrap();
+        raw
+    }
+
+    fn spill_nonces(raw: &[u8]) -> Vec<[u8; 12]> {
+        let mut nonces = Vec::new();
+        let mut offset = 0;
+        while offset < raw.len() {
+            let frame_len =
+                u32::from_le_bytes(raw[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += 4;
+            nonces.push(raw[offset..offset + 12].try_into().unwrap());
+            offset += 12 + frame_len;
+        }
+        nonces
+    }
+
+    fn spill_frame_ranges(raw: &[u8]) -> Vec<std::ops::Range<usize>> {
+        let mut frames = Vec::new();
+        let mut offset = 0;
+        while offset < raw.len() {
+            let start = offset;
+            let frame_len =
+                u32::from_le_bytes(raw[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += 4 + 12 + frame_len;
+            frames.push(start..offset);
+        }
+        frames
+    }
+
+    fn replace_spill_bytes(ops: &mut PendingSqlOps, raw: &[u8]) {
+        let spill = ops.spill.as_mut().unwrap();
+        spill.file.set_len(0).unwrap();
+        spill.file.seek(SeekFrom::Start(0)).unwrap();
+        spill.file.write_all(raw).unwrap();
+        spill.file.flush().unwrap();
+    }
+
+    #[test]
+    fn staged_sql_operations_spill_and_rollback_without_a_count_cap() {
+        let mut ops = PendingSqlOps::default();
+        for index in 0..10_001 {
+            ops.push(PendingSqlOp::Truncate {
+                table: format!("t{index}"),
+                changes: index as u64,
+            })
+            .unwrap();
+        }
+        assert!(ops.spill.is_some());
+        assert_eq!(ops.reader().unwrap().count(), 10_001);
+
+        let checkpoint = ops.checkpoint().unwrap();
+        ops.push(PendingSqlOp::Truncate {
+            table: "rolled_back".into(),
+            changes: 0,
+        })
+        .unwrap();
+        ops.truncate(checkpoint).unwrap();
+        assert_eq!(ops.reader().unwrap().count(), 10_001);
+    }
+
+    #[test]
+    fn staged_sql_spill_is_encrypted_and_bounded_by_memory_bytes() {
+        let secret = "super_secret_staged_table";
+        let mut ops = PendingSqlOps::default();
+        for index in 0..9 {
+            ops.push(PendingSqlOp::ExternalState {
+                table: if index == 0 {
+                    secret.into()
+                } else {
+                    format!("table_{index}")
+                },
+                state: vec![index as u8; 1024 * 1024],
+                changes: 1,
+            })
+            .unwrap();
+        }
+        let spill = ops.spill.as_mut().expect("byte bound must spill");
+        spill.file.flush().unwrap();
+        let mut file = spill.file.try_clone().unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let mut raw = Vec::new();
+        file.read_to_end(&mut raw).unwrap();
+        assert!(!raw
+            .windows(secret.len())
+            .any(|window| window == secret.as_bytes()));
+        assert_eq!(ops.reader().unwrap().count(), 9);
+    }
+
+    #[test]
+    fn staged_sql_spill_never_reuses_nonce_after_rollback() {
+        let mut ops = PendingSqlOps::default();
+        for index in 0..9 {
+            ops.push(PendingSqlOp::ExternalState {
+                table: format!("table_{index}"),
+                state: vec![index as u8; 1024 * 1024],
+                changes: 1,
+            })
+            .unwrap();
+        }
+        let checkpoint = ops.checkpoint().unwrap();
+        ops.push(PendingSqlOp::Truncate {
+            table: "first_tail".into(),
+            changes: 1,
+        })
+        .unwrap();
+        let first_tail_nonce = *spill_nonces(&spill_bytes(&mut ops)).last().unwrap();
+
+        ops.truncate(checkpoint).unwrap();
+        ops.push(PendingSqlOp::Truncate {
+            table: "replacement_tail".into(),
+            changes: 1,
+        })
+        .unwrap();
+        let replacement_nonce = *spill_nonces(&spill_bytes(&mut ops)).last().unwrap();
+
+        assert_ne!(first_tail_nonce, replacement_nonce);
+        assert_eq!(ops.reader().unwrap().count(), 10);
+    }
+
+    #[test]
+    fn staged_sql_spill_rejects_ciphertext_tampering() {
+        let mut ops = PendingSqlOps::default();
+        for index in 0..9 {
+            ops.push(PendingSqlOp::ExternalState {
+                table: format!("table_{index}"),
+                state: vec![index as u8; 1024 * 1024],
+                changes: 1,
+            })
+            .unwrap();
+        }
+        let spill = ops.spill.as_mut().unwrap();
+        spill.file.seek(SeekFrom::Start(16)).unwrap();
+        let mut byte = [0_u8; 1];
+        spill.file.read_exact(&mut byte).unwrap();
+        byte[0] ^= 0x80;
+        spill.file.seek(SeekFrom::Start(16)).unwrap();
+        spill.file.write_all(&byte).unwrap();
+        spill.file.flush().unwrap();
+
+        assert!(matches!(
+            ops.reader().unwrap().next().unwrap(),
+            Err(MongrelQueryError::InvalidQueryState(message))
+                if message.contains("authentication failed")
+        ));
+    }
+
+    #[test]
+    fn staged_sql_spill_rejects_frame_reordering_and_replay() {
+        let mut ops = PendingSqlOps::default();
+        for index in 0..9 {
+            ops.push(PendingSqlOp::ExternalState {
+                table: format!("table_{index}"),
+                state: vec![index as u8; 1024 * 1024],
+                changes: 1,
+            })
+            .unwrap();
+        }
+        let original = spill_bytes(&mut ops);
+        let frames = spill_frame_ranges(&original);
+
+        let mut reordered = Vec::with_capacity(original.len());
+        reordered.extend_from_slice(&original[frames[1].clone()]);
+        reordered.extend_from_slice(&original[frames[0].clone()]);
+        reordered.extend_from_slice(&original[frames[2].start..]);
+        replace_spill_bytes(&mut ops, &reordered);
+        assert!(matches!(
+            ops.reader().unwrap().next().unwrap(),
+            Err(MongrelQueryError::InvalidQueryState(_))
+        ));
+
+        let mut replayed = Vec::with_capacity(original.len());
+        replayed.extend_from_slice(&original[frames[0].clone()]);
+        replayed.extend_from_slice(&original[frames[0].clone()]);
+        replayed.extend_from_slice(&original[frames[2].start..]);
+        replace_spill_bytes(&mut ops, &replayed);
+        let mut reader = ops.reader().unwrap();
+        assert!(reader.next().unwrap().is_ok());
+        assert!(matches!(
+            reader.next().unwrap(),
+            Err(MongrelQueryError::InvalidQueryState(message))
+                if message.contains("nonce order")
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_statement_cleanup_keeps_transaction_poisoned_until_rollback() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Arc::new(Database::create(directory.path()).unwrap());
+        let session = crate::MongrelSession::open(database).unwrap();
+        session
+            .run("CREATE TABLE items (id BIGINT PRIMARY KEY)")
+            .await
+            .unwrap();
+        session.run("BEGIN").await.unwrap();
+        session.run("INSERT INTO items VALUES (1)").await.unwrap();
+        session.run("SAVEPOINT before_failure").await.unwrap();
+        let query = session
+            .register_query(crate::SqlQueryOptions::default())
+            .unwrap();
+        let guard = crate::TransactionStatementGuard::new(&session, &query, true).unwrap();
+        {
+            let mut transaction = session.transaction.lock();
+            let ops = transaction.staged_ops.as_mut().unwrap();
+            for index in 0..1_025 {
+                ops.push(PendingSqlOp::Truncate {
+                    table: format!("staged_{index}"),
+                    changes: 0,
+                })
+                .unwrap();
+            }
+            let spill = ops.spill.as_mut().unwrap();
+            spill.file.seek(SeekFrom::Start(16)).unwrap();
+            let mut byte = [0_u8; 1];
+            spill.file.read_exact(&mut byte).unwrap();
+            byte[0] ^= 0x80;
+            spill.file.seek(SeekFrom::Start(16)).unwrap();
+            spill.file.write_all(&byte).unwrap();
+            spill.file.flush().unwrap();
+        }
+        drop(guard);
+
+        {
+            let transaction = session.transaction.lock();
+            assert!(transaction.staged_ops.is_some());
+            assert!(transaction.aborted);
+            assert!(transaction.savepoints.is_empty());
+        }
+        assert!(matches!(
+            session.run("INSERT INTO items VALUES (2)").await,
+            Err(MongrelQueryError::TransactionAborted)
+        ));
+        assert!(matches!(
+            session.run("COMMIT").await,
+            Err(MongrelQueryError::TransactionAborted)
+        ));
+        session.run("ROLLBACK").await.unwrap();
+        let transaction = session.transaction.lock();
+        assert!(transaction.staged_ops.is_none());
+        assert!(!transaction.aborted);
+    }
+
+    #[test]
+    fn staged_sql_transaction_has_a_total_spill_bound() {
+        let mut ops = PendingSqlOps {
+            total_bytes: PENDING_SQL_OPS_TOTAL_BYTES_LIMIT,
+            ..PendingSqlOps::default()
+        };
+        assert!(matches!(
+            ops.push(PendingSqlOp::Truncate {
+                table: "over_limit".into(),
+                changes: 1,
+            }),
+            Err(MongrelQueryError::Core(
+                mongreldb_core::MongrelError::ResourceLimitExceeded {
+                    resource: "staged SQL transaction bytes",
+                    limit: PENDING_SQL_OPS_TOTAL_BYTES_LIMIT,
+                    ..
+                }
+            ))
+        ));
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! chained materialized views, Unicode/CJK FTS, auth edge cases,
 //! string concatenation in recursive CTEs, stale matviews, etc.
 
-use mongreldb_core::{auth::Permission, schema::*, Database, MongrelError, Value};
+use mongreldb_core::{auth::Permission, schema::*, Database, Value};
 use mongreldb_query::MongrelSession;
 use std::sync::Arc;
 use tempfile::tempdir;
@@ -237,19 +237,57 @@ fn fts_rank_unicode_text() {
 #[test]
 fn auth_refresh_after_user_dropped() {
     let dir = tempdir().unwrap();
-    let path = dir.path();
-    {
-        let db = Database::create_with_credentials(path, "admin", "pw").unwrap();
-        db.create_user("temp", "tpw").unwrap();
+    let db = Arc::new(Database::create_with_credentials(dir.path(), "admin", "pw").unwrap());
+    db.create_table(
+        "items",
+        Schema {
+            schema_id: 1,
+            columns: vec![ColumnDef {
+                id: 1,
+                name: "id".into(),
+                ty: TypeId::Int64,
+                flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
+            }],
+            indexes: vec![],
+            colocation: vec![],
+            constraints: Default::default(),
+            clustered: false,
+        },
+    )
+    .unwrap();
+    db.create_user("temp", "tpw").unwrap();
+    db.create_role("reader").unwrap();
+    db.grant_permission(
+        "reader",
+        Permission::Select {
+            table: "items".into(),
+        },
+    )
+    .unwrap();
+    db.grant_permission(
+        "reader",
+        Permission::Insert {
+            table: "items".into(),
+        },
+    )
+    .unwrap();
+    db.grant_role("temp", "reader").unwrap();
+    let original = db.resolve_principal("temp").unwrap();
+    let session = MongrelSession::open_as(Arc::clone(&db), original.clone()).unwrap();
+    db.drop_user("temp").unwrap();
+
+    let stale = session.principal().unwrap();
+    assert_eq!(stale.username, "temp");
+    assert_eq!(stale.user_id, original.user_id);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    for sql in ["SELECT * FROM items", "INSERT INTO items VALUES (1)"] {
+        let error = runtime.block_on(session.run(sql)).unwrap_err();
+        assert!(
+            error.to_string().contains("authentication required"),
+            "{error}"
+        );
     }
-    let db = Database::open_with_credentials(path, "temp", "tpw").unwrap();
-    // Admin drops the temp user from another handle.
-    let admin = Database::open_with_credentials(path, "admin", "pw").unwrap();
-    admin.drop_user("temp").unwrap();
-    drop(admin);
-    // Now refresh — the user is gone.
-    let err = db.refresh_principal().unwrap_err();
-    assert!(matches!(err, MongrelError::InvalidCredentials { .. }));
 }
 
 // 10. Window function with empty OVER()

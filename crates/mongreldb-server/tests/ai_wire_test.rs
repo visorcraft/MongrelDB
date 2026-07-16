@@ -3,7 +3,7 @@ use mongreldb_core::{
     schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId},
     Database, Value,
 };
-use mongreldb_server::build_app;
+use mongreldb_server::{build_app, build_app_full};
 use std::sync::Arc;
 use tempfile::tempdir;
 use tower::ServiceExt;
@@ -14,7 +14,20 @@ async fn request(
     uri: &str,
     body: Option<serde_json::Value>,
 ) -> (u16, serde_json::Value) {
+    request_with_authorization(app, method, uri, body, None).await
+}
+
+async fn request_with_authorization(
+    app: axum::Router,
+    method: &str,
+    uri: &str,
+    body: Option<serde_json::Value>,
+    authorization: Option<&str>,
+) -> (u16, serde_json::Value) {
     let mut builder = axum::http::Request::builder().method(method).uri(uri);
+    if let Some(authorization) = authorization {
+        builder = builder.header("authorization", authorization);
+    }
     let body = match body {
         Some(body) => {
             builder = builder.header("content-type", "application/json");
@@ -491,9 +504,15 @@ async fn kit_ai_routes_require_every_used_column() {
             db.grant_permission("reader", permission.clone()).unwrap();
             previous = Some(permission);
         }
-        let principal = db.resolve_principal("alice").unwrap();
-        let app = build_app(Arc::clone(&db)).layer(axum::Extension(principal));
-        let (status, response) = request(app, "POST", path, Some(body)).await;
+        let app = build_app_full(Arc::clone(&db), std::iter::empty(), None, None, true);
+        let (status, response) = request_with_authorization(
+            app,
+            "POST",
+            path,
+            Some(body),
+            Some("Basic YWxpY2U6YWxpY2UtcHc="),
+        )
+        .await;
         assert_eq!(status, 403, "{path}: {response}");
         assert_eq!(
             response["error"]["code"], "PERMISSION_DENIED",

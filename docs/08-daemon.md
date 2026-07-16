@@ -36,6 +36,11 @@ mongreldb-server ./my_database 8453 --auth-token my-secret-token
 
 # With connection limit (max 100 concurrent requests)
 mongreldb-server ./my_database 8453 --auth-token my-secret-token --max-connections 100
+
+# Open a credential-enforced database and require HTTP Basic authentication.
+MONGRELDB_DB_USERNAME=admin \
+MONGRELDB_DB_PASSWORD='database-password' \
+mongreldb-server ./my_database 8453 --auth-users
 ```
 
 The daemon opens the database, builds indexes (if needed), and starts
@@ -253,17 +258,41 @@ curl -X POST http://127.0.0.1:8453/sql \
 ### require_auth databases
 
 When a database has `require_auth = true` (see
-[Credential Enforcement](15-credential-enforcement.md)), the daemon **must**
-run with `--auth-users` (or `--auth-users` plus `--auth-token`). Token-only
-mode (`--auth-token` without `--auth-users`) is insufficient because it does
-not resolve a catalog `Principal` - the storage layer needs a real user to
-check per-operation permissions.
+[Credential Enforcement](15-credential-enforcement.md)), database-open
+authentication and HTTP authentication are separate layers.
 
-With `--auth-users`, each request's HTTP Basic credentials are verified against
-the catalog and the resolved `Principal` is checked at the storage layer too
-(defense in depth). A request that passes the HTTP gate but maps to an
-under-privileged principal will be rejected by the storage layer with `403
-Forbidden`.
+Set the database-handle credentials as a pair in the process environment:
+
+```sh
+MONGRELDB_DB_USERNAME=admin \
+MONGRELDB_DB_PASSWORD='database-password' \
+mongreldb-server ./my_database 8453 --auth-users
+```
+
+The daemon reads both variables once, removes both from its environment before
+daemonization or worker-thread startup, opens the database, and zeroizes its
+password buffer immediately after the open returns. There is deliberately no
+database-password command-line flag because process arguments are commonly
+visible to other local users and process monitors. Inject the variables from a
+restricted service-manager secret or environment file. Setting only one,
+either to an empty value, or using invalid UTF-8 is a startup error.
+
+For an existing `require_auth` database, the variables authenticate the
+daemon's database handle. For a database with no catalog yet, they atomically
+create a credential-enforced database with that user as the first admin. They
+also compose with `--passphrase` for encrypted databases.
+
+The HTTP boundary must independently configure `--auth-users`,
+`--auth-token`, or both. The binary refuses to start a `require_auth` database
+without either mode, and the library router rejects every route if constructed
+that way. Token-only HTTP mode is valid when the database handle was opened
+with the current admin credentials above: bearer requests execute as that
+exact admin principal. With `--auth-users`, every request's HTTP Basic
+credentials are atomically verified and resolved against the current catalog,
+then that exact principal is checked at the storage layer. Dropping and
+recreating a username does not let the new identity inherit the old identity's
+queries, sessions, cursors, or idempotency receipts. An under-privileged
+principal receives `403 Forbidden`.
 
 ## Connection Pooling
 
@@ -307,14 +336,161 @@ curl -X POST http://127.0.0.1:8453/sql \
     "sql": "SELECT count(*) FROM events WHERE amount > 500",
     "format": "arrow",
     "query_id": "00112233445566778899aabbccddeeff",
-    "timeout_ms": 30000
+    "timeout_ms": 30000,
+    "max_output_rows": 10000,
+    "max_output_bytes": 8388608
   }'
 # Response includes X-MongrelDB-Query-ID.
 ```
 
-Clients should generate the 32-hex-character query ID before sending a
-buffered request. Body `query_id` and `timeout_ms` values take precedence over
-`X-MongrelDB-Query-ID` and `X-MongrelDB-Timeout-Ms` headers.
+Clients should generate the 32-hex-character query ID with a cryptographically
+secure random generator before sending a buffered request. Predictable IDs are
+not safe cancellation capabilities. Body `query_id` and `timeout_ms` values
+take precedence over `X-MongrelDB-Query-ID` and `X-MongrelDB-Timeout-Ms`
+headers.
+
+`max_output_rows` and `max_output_bytes` must be positive. They apply to JSON,
+buffered Arrow, and Arrow streams and are clamped to the daemon-configured
+maxima.
+
+#### Retried SQL writes
+
+Buffered JSON writes accept `idempotency_key` in the body or
+`Idempotency-Key` in the header. If both are supplied, they must match. Keyed
+reads are rejected. Keyed requests must contain exactly one supported durable
+write:
+`INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, or the supported table, view, index,
+trigger, and policy DDL forms. Here, view DDL means durable materialized views;
+ordinary `CREATE VIEW` and `DROP VIEW` are session-scoped and therefore
+rejected for idempotent daemon writes. Multi-statement SQL, transaction controls, and
+transient/session commands such as `NOTIFY`, `LISTEN`, `ATTACH`, `DETACH`,
+`SHOW`, `EXPLAIN`, and `PRAGMA` are rejected before an intent is persisted.
+
+```sh
+curl -X POST http://127.0.0.1:8453/sql \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: create-event-42" \
+  -d '{"sql":"INSERT INTO events (id) VALUES (42)"}'
+```
+
+The key is owner-bound and also binds the normalized, literal-aware SQL
+fingerprint, the parameter-list hash (currently the empty list because `/sql`
+has no separate bind array), effective output options, and pooled-session
+identity, plus the server-enforced receipt expiry policy. Reuse with different
+semantics or a different expiry policy returns
+`IDEMPOTENCY_KEY_REUSE_MISMATCH`. Every successful keyed write, including a
+write that matches no rows, returns a durable receipt instead of result rows.
+Retrying returns that receipt without parsing or executing the SQL. A receipt
+is HTTP 200 even when post-commit cancellation or serialization failed;
+inspect `status`, `outcome`, and `terminal_error` rather than treating HTTP
+success as clean response completion. Receipt and intent files contain
+HMAC-authenticated hashes and outcome metadata, never the raw key, owner, SQL,
+parameters, or result rows. Encrypted databases derive the HMAC key from the
+database KEK. Plain databases create a random, database-local key at
+`_meta/server-idempotency.key`; it is not derived from an auth token, username,
+or password.
+
+Before execution the daemon durably publishes an intent. It durably publishes
+the receipt after a known successful terminal outcome, including a commit or a
+no-op. Unix uses a file fsync, atomic rename, and parent-directory fsync;
+Windows uses a file flush and write-through atomic replacement.
+These cannot be one atomic filesystem/database operation. If a process or
+power failure occurs between commit and receipt persistence, the intent
+remains and the same key returns non-retryable
+`QUERY_OUTCOME_UNKNOWN`; the daemon never re-executes that write. Verify the
+database outcome before operator recovery. Completed receipts expire after
+`MONGRELDB_SQL_IDEMPOTENCY_TTL_SECS`; indeterminate intents do not expire into
+unsafe re-execution. `MONGRELDB_SQL_IDEMPOTENCY_MAX_ENTRIES` bounds all unique
+persisted scopes, including receipts, live executions, crash-left intents, and
+corrupt entries. Each owner is limited to one quarter of that capacity, with a
+minimum of one slot, so one tenant cannot consume the whole store. The daemon
+fails closed with a capacity error when either limit is reached. Crash-left
+intents remain durable outcome-unknown tombstones and continue consuming
+capacity until an operator verifies the database outcome and performs recovery.
+They cannot safely auto-expire into key reuse: without an atomic database
+receipt, expiry would risk repeating a write that committed before the crash.
+
+SQL idempotency format v5 and Kit idempotency format v3 replaced older
+unkeyed checksums. Existing older entries fail closed as outcome-unknown; they
+are never accepted as replays. The stores use descriptor-relative, no-follow
+filesystem operations for directories, entries, and capacity locks. A
+symlink, non-regular entry, forged JSON document, failed authentication tag,
+or unavailable integrity key blocks execution. Atomic receipt publication uses
+a fresh collision-resistant temporary name, so an old fixed `.tmp` path cannot
+redirect or replace a receipt.
+
+Filesystem permissions remain the trust boundary. The plain-database integrity
+key is created as an owner-only file on Unix, but a process running as the
+database owner that can read that key can authenticate its own replacement
+entries. Encrypted databases do not persist this server key; they derive it
+from the in-memory database KEK. Run the daemon under a dedicated OS account
+and do not grant other processes write access to the database root.
+
+`QUERY_OUTCOME_UNKNOWN` responses and retained statuses encode `committed` and
+all commit/statement counters as JSON `null`. Clients must preserve that
+tri-state value. Only explicit `false` proves no commit.
+
+#### Retained SQL pagination
+
+JSON reads can opt into a process-local retained snapshot. The request must be
+exactly one query and must name every output column that may be returned.
+
+```sh
+curl -X POST http://127.0.0.1:8453/sql \
+  -H "Content-Type: application/json" \
+  -d '{
+    "sql":"SELECT id, created_at, large_payload FROM events ORDER BY id",
+    "max_output_rows":100000,
+    "max_output_bytes":67108864,
+    "pagination":{
+      "page_size_rows":100,
+      "projection":["id","created_at"],
+      "max_page_bytes":262144,
+      "max_page_tokens":65536
+    }
+  }'
+
+curl -X POST http://127.0.0.1:8453/sql/continue \
+  -H "Content-Type: application/json" \
+  -d '{"cursor":"sp1:..."}'
+```
+
+`max_output_rows` and `max_output_bytes` cap the complete retained projected
+result. Page limits cap each response. Each response reports exact projected
+JSON bytes and `estimated_tokens = ceil(bytes / 4)`; this is a transport hint,
+not a model tokenizer. The global retained-memory limit also charges a
+conservative per-row/per-column allocation overhead, not only JSON text bytes.
+Cursors are signed, owner-bound, server-instance-bound,
+and expire with the retained result. Repeating a cursor returns the same page.
+Writes cannot create cursors. The SQL engine may compute unprojected columns,
+but only the named projection is serialized, retained, and returned. A daemon
+restart invalidates all cursors.
+
+The Rust remote client exposes both protocols directly:
+
+```rust,no_run
+use mongreldb_client::{MongrelClient, SqlPageOptions};
+
+let client = MongrelClient::new("http://127.0.0.1:8453")?;
+let receipt = client.sql_write_idempotent(
+    "INSERT INTO events (id) VALUES (42)",
+    "create-event-42",
+)?;
+
+let first = client.sql_page(
+    "SELECT id, created_at FROM events ORDER BY id",
+    SqlPageOptions::new(100, vec!["id".into(), "created_at".into()]),
+)?;
+if let Some(cursor) = first.next_cursor.as_deref() {
+    let second = client.continue_sql_page(cursor)?;
+    // consume second.rows
+}
+# Ok::<(), mongreldb_client::ClientError>(())
+```
+
+`AsyncMongrelClient` provides async methods with the same names. Client-side
+validation rejects empty or oversized keys, cursors, projections, and zero
+limits before network I/O.
 
 ```sh
 # Request cancellation from another connection.
@@ -328,15 +504,27 @@ curl http://127.0.0.1:8453/queries/00112233445566778899aabbccddeeff
 curl http://127.0.0.1:8453/capabilities
 ```
 
+Cancellation capability version 2 accepts an owner-bound cancellation before
+the matching SQL request registers. The later request is cancelled before SQL
+admission or parsing. Send the same `X-Session-ID` on the cancel request when
+the SQL belongs to a pooled session. Pre-registration cancellations are
+process-local, bounded, and short-lived; a daemon restart clears them. Admin
+metrics expose only their current entry and byte counts, never IDs or SQL.
+Unknown cancel requests also use a bounded per-owner fixed-window rate limit,
+including repeated requests for the same query ID. Rate-limit exhaustion
+returns HTTP 429.
+
 Status includes safe timing trace fields for queueing, planning, execution,
 and serialization, the cancel-requested and cancel-observed phases, and the
 commit-fence outcome. It never includes raw SQL or parameters.
 
-Query status and cancellation are owner-or-admin operations. Unknown and
-not-owned IDs both return 404. Cancellation after the durable commit fence
-returns 409 with `CANCEL_TOO_LATE`. A client transport timeout or disconnected
-socket does not by itself prove that a buffered server query stopped. Official
-clients send a separate best-effort cancellation request.
+Query status and cancellation are owner-or-admin operations. Unknown status
+lookups and not-owned IDs return 404 with `QUERY_NOT_FOUND`; a valid unknown
+cancel request creates the owner/session-bound pre-cancellation above.
+Cancellation after the durable commit fence returns 409 with
+`CANCEL_TOO_LATE`. A client transport timeout or disconnected socket does not
+by itself prove that a buffered server query stopped. Official clients send a
+separate cancellation request.
 
 SQL execution limits use these environment variables:
 
@@ -346,15 +534,31 @@ MONGRELDB_SQL_MAX_TIMEOUT_MS
 MONGRELDB_SQL_MAX_CONCURRENT
 MONGRELDB_SQL_MAX_ACTIVE_QUERIES
 MONGRELDB_SQL_FINISHED_QUERY_TTL_SECS
+MONGRELDB_SQL_PRE_CANCEL_TTL_MS
+MONGRELDB_SQL_PRE_CANCEL_MAX_ENTRIES
+MONGRELDB_SQL_PRE_CANCEL_MAX_BYTES
+MONGRELDB_SQL_PRE_CANCEL_MAX_PER_OWNER
+MONGRELDB_SQL_PRE_CANCEL_RATE_WINDOW_MS
+MONGRELDB_SQL_PRE_CANCEL_RATE_PER_OWNER
 MONGRELDB_SQL_CANCEL_GRACE_MS
 MONGRELDB_SQL_MAX_OUTPUT_BYTES
 MONGRELDB_SQL_MAX_OUTPUT_ROWS
+MONGRELDB_SQL_IDEMPOTENCY_TTL_SECS
+MONGRELDB_SQL_IDEMPOTENCY_MAX_ENTRIES
+MONGRELDB_SQL_PAGE_TTL_SECS
+MONGRELDB_SQL_PAGE_MAX_ENTRIES
+MONGRELDB_SQL_PAGE_MAX_RETAINED_BYTES
+MONGRELDB_SQL_PAGE_MAX_PER_OWNER
 ```
 
 The query deadline starts before the SQL semaphore. Closing a session cancels
 its queued and active queries. Graceful server shutdown rejects new SQL,
 cancels queued and running work, lets commit-critical writes finish, and
 records tasks that exceed cancellation grace.
+
+Prepared-statement `DELETE /sessions/{id}/statements/{name}` accepts the same
+`X-MongrelDB-Query-ID` and `X-MongrelDB-Timeout-Ms` controls as `/sql` and
+returns `X-MongrelDB-Query-ID`.
 
 ### Typed Kit API
 
@@ -380,13 +584,39 @@ curl -X POST http://127.0.0.1:8453/kit/query \
   -d '{"table": "events", "conditions": [...], "limit": 1000, "offset": 10000}'
 ```
 
+Keyed `/kit/txn`, trigger DDL, and procedure-call writes use a shared durable
+idempotency store. Keys must contain 1 to 256 bytes. Before execution the
+daemon fsyncs an intent bound to the authenticated owner, operation, and exact
+payload. After execution it fsyncs the exact HTTP status and JSON response.
+Reusing a key with different input returns `IDEMPOTENCY_KEY_REUSE_MISMATCH`.
+If the commit outcome or receipt publication is uncertain, the intent remains
+and every retry returns `QUERY_OUTCOME_UNKNOWN` without re-executing the write.
+
+Basic-auth ownership uses the user's immutable catalog ID and creation epoch,
+not the username. Dropping and recreating the same username creates a different
+owner that cannot access old sessions, query statuses, continuation cursors, or
+idempotency receipts. Bearer ownership uses a domain-separated SHA-256 digest;
+the token itself is never stored. `/kit/txn` checks current permissions before
+receipt lookup and binds the current security version plus every target table's
+table and schema IDs. Permission changes or drop-and-recreate table changes
+therefore cannot replay an old response.
+
+The store uses `MONGRELDB_SQL_IDEMPOTENCY_TTL_SECS` (24 hours by default) for
+completed receipts and `MONGRELDB_SQL_IDEMPOTENCY_MAX_ENTRIES` (4096 by
+default) for the global capacity; one owner may use at most one quarter of the
+global capacity. Indeterminate intents do not expire automatically. Full or
+unavailable stores reject a keyed write before execution. Legacy unverified
+Kit v2 and `_idem/*.json` cache files, and SQL v4 entries, fail closed after
+upgrade; archive or remove them only after all retry windows from the older
+daemon have safely expired.
+
 ### Row-Level Operations
 
 ```sh
 # Put a row
 curl -X POST http://127.0.0.1:8453/tables/events/put \
   -H "Content-Type: application/json" \
-  -d '{"row": [[1, 42], [2, "alice@test.com"], [3, 95.5]]}'
+  -d '{"row": [1, 42, 2, "alice@test.com", 3, 95.5]}'
 
 # Count rows
 curl http://127.0.0.1:8453/tables/events/count
@@ -394,6 +624,19 @@ curl http://127.0.0.1:8453/tables/events/count
 # Commit pending writes
 curl -X POST http://127.0.0.1:8453/tables/events/commit
 ```
+
+The legacy Rust client's `put` method uses exact tagged JSON for values JSON
+cannot represent safely: binary bytes and UUID/JSON payloads use lowercase
+hex, decimals use a canonical unscaled integer string, and intervals use
+canonical component strings. Embeddings and floats must be finite. Invalid
+UTF-8/JSON, non-finite numbers, malformed tags, and wrong embedding dimensions
+are rejected instead of being converted to `NULL` or lossy text.
+
+Successful legacy transactions and table, procedure, and trigger drops return
+`status: "committed"` with matching numeric `epoch` and canonical
+`epoch_text`. A client that loses or cannot validate a write response reports
+`QUERY_OUTCOME_UNKNOWN`; it never reports a plain transport/decode error as a
+known abort.
 
 ### Procedures and Triggers
 
@@ -445,7 +688,7 @@ polls this endpoint and applies records to a local database copy:
 ```rust
 use mongreldb_client::ReplicationFollower;
 
-let mut follower = ReplicationFollower::new("http://leader:8453", "/local/copy");
+let mut follower = ReplicationFollower::new("http://leader:8453", "/local/copy")?;
 let n = follower.sync()?;  // fetch + count new records
 println!("applied {n} records, up to seq {}", follower.last_seq());
 ```

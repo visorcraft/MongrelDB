@@ -11,8 +11,10 @@ use mongreldb_core::Database;
 use mongreldb_server::{
     build_app_with_sessions_and_control, spawn_auto_compactor, spawn_session_reaper, SessionStore,
 };
+use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use zeroize::Zeroizing;
 
 /// Parsed command-line arguments.
 struct Args {
@@ -51,7 +53,108 @@ OPTIONS:
     --daemon                    Fork into the background (daemonize)
     --pidfile <path>            PID file path (default: <db_dir>/mongreldb.pid)
     -h, --help                  Print this help message
+
+ENVIRONMENT:
+    MONGRELDB_DB_USERNAME       Database-handle username (set with DB_PASSWORD)
+    MONGRELDB_DB_PASSWORD       Database-handle password (set with DB_USERNAME)
 ";
+
+struct DatabaseCredentials {
+    username: String,
+    password: Zeroizing<String>,
+}
+
+fn database_credentials_from_values(
+    username: Option<OsString>,
+    password: Option<OsString>,
+) -> Result<Option<DatabaseCredentials>, String> {
+    let (username, password) = match (username, password) {
+        (None, None) => return Ok(None),
+        (Some(username), Some(password)) => (username, password),
+        _ => {
+            return Err(
+                "MONGRELDB_DB_USERNAME and MONGRELDB_DB_PASSWORD must be set together".into(),
+            )
+        }
+    };
+    let username = username
+        .into_string()
+        .map_err(|_| "MONGRELDB_DB_USERNAME must be valid UTF-8".to_string())?;
+    let password = Zeroizing::new(
+        password
+            .into_string()
+            .map_err(|_| "MONGRELDB_DB_PASSWORD must be valid UTF-8".to_string())?,
+    );
+    if username.is_empty() {
+        return Err("MONGRELDB_DB_USERNAME must not be empty".into());
+    }
+    if password.is_empty() {
+        return Err("MONGRELDB_DB_PASSWORD must not be empty".into());
+    }
+    Ok(Some(DatabaseCredentials { username, password }))
+}
+
+/// Read database-open credentials once, then remove them before daemonization
+/// or worker threads can inherit the environment. The password remains in a
+/// `Zeroizing<String>` only until the database open/create call returns.
+fn take_database_credentials_from_env() -> Result<Option<DatabaseCredentials>, String> {
+    let username = std::env::var_os("MONGRELDB_DB_USERNAME");
+    let password = std::env::var_os("MONGRELDB_DB_PASSWORD");
+    std::env::remove_var("MONGRELDB_DB_USERNAME");
+    std::env::remove_var("MONGRELDB_DB_PASSWORD");
+    database_credentials_from_values(username, password)
+}
+
+fn open_or_create_database(
+    db_dir: &str,
+    passphrase: Option<&str>,
+    credentials: Option<DatabaseCredentials>,
+) -> mongreldb_core::Result<Database> {
+    let catalog_exists = std::path::Path::new(db_dir).join("CATALOG").exists();
+    match (catalog_exists, passphrase, credentials.as_ref()) {
+        (true, Some(passphrase), Some(credentials)) => Database::open_encrypted_with_credentials(
+            db_dir,
+            passphrase,
+            &credentials.username,
+            credentials.password.as_str(),
+        ),
+        (false, Some(passphrase), Some(credentials)) => {
+            Database::create_encrypted_with_credentials(
+                db_dir,
+                passphrase,
+                &credentials.username,
+                credentials.password.as_str(),
+            )
+        }
+        (true, None, Some(credentials)) => Database::open_with_credentials(
+            db_dir,
+            &credentials.username,
+            credentials.password.as_str(),
+        ),
+        (false, None, Some(credentials)) => Database::create_with_credentials(
+            db_dir,
+            &credentials.username,
+            credentials.password.as_str(),
+        ),
+        (true, Some(passphrase), None) => Database::open_encrypted(db_dir, passphrase),
+        (false, Some(passphrase), None) => Database::create_encrypted(db_dir, passphrase),
+        (true, None, None) => Database::open(db_dir),
+        (false, None, None) => Database::create(db_dir),
+    }
+}
+
+fn validate_http_auth_configuration(
+    db: &Database,
+    auth_token: Option<&str>,
+    user_auth: bool,
+) -> Result<(), String> {
+    if db.require_auth_enabled() && auth_token.is_none() && !user_auth {
+        return Err(
+            "this database requires authentication; configure --auth-users or --auth-token".into(),
+        );
+    }
+    Ok(())
+}
 
 /// Parse command-line arguments. Returns `Err(message)` on failure.
 fn parse_args() -> Result<Args, String> {
@@ -227,8 +330,7 @@ fn daemonize(pidfile: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     // ── Subcommand dispatch ─────────────────────────────────────────────────
     //
     // `snapshot` and `restore` are one-shot maintenance subcommands that
@@ -265,6 +367,13 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    let database_credentials = match take_database_credentials_from_env() {
+        Ok(credentials) => credentials,
+        Err(error) => {
+            eprintln!("database credentials: {error}");
+            std::process::exit(1);
+        }
+    };
 
     let pidfile = resolve_pidfile(&args);
 
@@ -275,31 +384,40 @@ async fn main() {
         }
     }
 
-    // Open the database (optionally encrypted), or create it if the catalog
-    // is absent. CATALOG existence is now also enforced by `create` itself,
-    // but we branch here so the error path on a populated dir is `open`'s
-    // (more specific) error, not the generic "database already exists" from
-    // `create`.
-    let catalog_exists = std::path::Path::new(&args.db_dir).join("CATALOG").exists();
-    let db = if let Some(ref pw) = args.passphrase {
-        Arc::new(
-            Database::open_encrypted(&args.db_dir, pw).unwrap_or_else(|e| {
-                eprintln!("failed to open {}: {e}", args.db_dir);
-                std::process::exit(1);
-            }),
+    // Credential ownership is moved into this call. Its password is zeroized
+    // immediately after open/create returns, before any worker thread starts.
+    let db = Arc::new(
+        open_or_create_database(
+            &args.db_dir,
+            args.passphrase.as_deref(),
+            database_credentials,
         )
-    } else if catalog_exists {
-        Arc::new(Database::open(&args.db_dir).unwrap_or_else(|e| {
-            eprintln!("failed to open {}: {e}", args.db_dir);
+        .unwrap_or_else(|e| {
+            eprintln!("failed to open or create {}: {e}", args.db_dir);
             std::process::exit(1);
-        }))
-    } else {
-        Arc::new(Database::create(&args.db_dir).unwrap_or_else(|e| {
-            eprintln!("failed to create {}: {e}", args.db_dir);
-            std::process::exit(1);
-        }))
-    };
+        }),
+    );
+    if let Err(error) =
+        validate_http_auth_configuration(&db, args.auth_token.as_deref(), args.user_auth)
+    {
+        eprintln!("failed to start: {error}");
+        std::process::exit(1);
+    }
 
+    // Build Tokio only after the credential environment is cleared and the
+    // password-owning `Zeroizing<String>` has been dropped by database open.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|error| {
+            eprintln!("failed to start async runtime: {error}");
+            let _ = db.close();
+            std::process::exit(1);
+        });
+    runtime.block_on(run_server(args, pidfile, db));
+}
+
+async fn run_server(args: Args, pidfile: String, db: Arc<Database>) {
     // §5.9: background cost-aware compaction (run-count trigger).
     spawn_auto_compactor(Arc::clone(&db));
 
@@ -471,5 +589,103 @@ fn cmd_restore(db_dir: &str) {
             eprintln!("error: checkpoint failed: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENVIRONMENT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn credentials(username: &str, password: &str) -> DatabaseCredentials {
+        database_credentials_from_values(
+            Some(OsString::from(username)),
+            Some(OsString::from(password)),
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    #[test]
+    fn database_credentials_must_be_paired_nonempty_utf8() {
+        assert!(database_credentials_from_values(Some(OsString::from("admin")), None).is_err());
+        assert!(database_credentials_from_values(None, Some(OsString::from("password"))).is_err());
+        assert!(database_credentials_from_values(
+            Some(OsString::from("")),
+            Some(OsString::from("password"))
+        )
+        .is_err());
+        assert!(database_credentials_from_values(
+            Some(OsString::from("admin")),
+            Some(OsString::from(""))
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn database_credentials_are_removed_from_the_environment() {
+        let _guard = ENVIRONMENT_TEST_LOCK.lock().unwrap();
+        std::env::set_var("MONGRELDB_DB_USERNAME", "admin");
+        std::env::set_var("MONGRELDB_DB_PASSWORD", "database-password");
+
+        let credentials = take_database_credentials_from_env().unwrap().unwrap();
+
+        assert_eq!(credentials.username, "admin");
+        assert_eq!(credentials.password.as_str(), "database-password");
+        assert!(std::env::var_os("MONGRELDB_DB_USERNAME").is_none());
+        assert!(std::env::var_os("MONGRELDB_DB_PASSWORD").is_none());
+    }
+
+    #[test]
+    fn credentialed_plain_database_create_reopen_and_http_auth_validation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().to_str().unwrap();
+        let database =
+            open_or_create_database(path, None, Some(credentials("admin", "database-password")))
+                .unwrap();
+        assert!(database.require_auth_enabled());
+        assert_eq!(
+            database.principal_snapshot().unwrap().username,
+            "admin".to_string()
+        );
+        assert!(validate_http_auth_configuration(&database, None, false).is_err());
+        assert!(validate_http_auth_configuration(&database, Some("token"), false).is_ok());
+        assert!(validate_http_auth_configuration(&database, None, true).is_ok());
+        drop(database);
+
+        let reopened =
+            open_or_create_database(path, None, Some(credentials("admin", "database-password")))
+                .unwrap();
+        assert_eq!(reopened.principal_snapshot().unwrap().username, "admin");
+        drop(reopened);
+
+        assert!(
+            open_or_create_database(path, None, Some(credentials("admin", "wrong-password")),)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn credentialed_encrypted_database_create_and_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().to_str().unwrap();
+        let database = open_or_create_database(
+            path,
+            Some("encryption-passphrase"),
+            Some(credentials("admin", "database-password")),
+        )
+        .unwrap();
+        assert!(database.require_auth_enabled());
+        drop(database);
+
+        let reopened = open_or_create_database(
+            path,
+            Some("encryption-passphrase"),
+            Some(credentials("admin", "database-password")),
+        )
+        .unwrap();
+        assert_eq!(reopened.principal_snapshot().unwrap().username, "admin");
     }
 }

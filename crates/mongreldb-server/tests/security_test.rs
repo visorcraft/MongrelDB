@@ -159,6 +159,8 @@ async fn user_principal_secures_sql_native_kit_and_sessions() {
             }],
         },
         Some(&Principal {
+            user_id: 0,
+            created_epoch: 0,
             username: "admin".into(),
             is_admin: true,
             roles: Vec::new(),
@@ -401,4 +403,101 @@ async fn admin_principal_allows_history_retention() {
     assert_eq!(body.as_object().unwrap().len(), 2);
     assert_eq!(body["history_retention_epochs"], 7);
     assert!(body["earliest_retained_epoch"].is_u64());
+}
+
+#[tokio::test]
+async fn bearer_token_uses_current_admin_when_database_requires_auth() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(
+        Database::create_with_credentials(dir.path(), "admin", "database-password").unwrap(),
+    );
+    db.create_table("docs", schema()).unwrap();
+    let app = build_app_full(
+        db,
+        std::iter::empty::<Arc<dyn ExternalTableModule>>(),
+        Some("server-token".into()),
+        None,
+        false,
+    );
+    let bearer_request = |method: &str, uri: &str, body: JsonValue| {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", "Bearer server-token")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+
+    let response = app
+        .clone()
+        .oneshot(bearer_request(
+            "POST",
+            "/sql",
+            json!({ "sql": "SELECT COUNT(*) AS n FROM docs" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json_body(response).await, json!([{ "n": 0 }]));
+
+    let response = app
+        .oneshot(bearer_request("POST", "/sessions", json!({})))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn require_auth_without_http_auth_fails_closed_for_all_route_groups() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(
+        Database::create_with_credentials(dir.path(), "admin", "database-password").unwrap(),
+    );
+    let app = build_app_full(
+        db,
+        std::iter::empty::<Arc<dyn ExternalTableModule>>(),
+        None,
+        None,
+        false,
+    );
+    for (method, uri) in [
+        ("GET", "/health"),
+        ("GET", "/capabilities"),
+        ("GET", "/metrics"),
+        ("GET", "/audit"),
+        ("GET", "/tables"),
+        ("POST", "/sql"),
+        ("POST", "/txn"),
+        ("POST", "/sessions"),
+        ("GET", "/procedures"),
+        ("GET", "/triggers"),
+        ("GET", "/kit/schema"),
+        ("POST", "/compact"),
+        ("GET", "/wal/stream"),
+        ("GET", "/replication/snapshot"),
+        ("GET", "/events"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "{method} {uri}"
+        );
+    }
+}
+
+async fn json_body(response: axum::response::Response) -> JsonValue {
+    serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap()
 }

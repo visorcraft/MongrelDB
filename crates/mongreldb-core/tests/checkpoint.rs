@@ -8,6 +8,7 @@
 //!   - Reopening yields the same data
 
 use mongreldb_core::{schema::*, Database, Value};
+use std::sync::{mpsc, Arc};
 use tempfile::tempdir;
 
 fn make_schema() -> Schema {
@@ -148,6 +149,123 @@ fn checkpoint_preserves_data_after_reopen() {
     q = q.and(Condition::Pk(key));
     let rows = g.query(&q).unwrap();
     assert_eq!(rows.len(), 1, "PK query should find the row");
+}
+
+#[test]
+fn commit_after_checkpoint_uses_the_new_durable_wal() {
+    let dir = tempdir().unwrap();
+    {
+        let db = Database::create(dir.path()).unwrap();
+        db.create_table("data", make_schema()).unwrap();
+        db.transaction(|transaction| {
+            transaction.put(
+                "data",
+                vec![(1, Value::Int64(1)), (2, Value::Bytes(b"before".to_vec()))],
+            )
+        })
+        .unwrap();
+        db.checkpoint().unwrap();
+        db.transaction(|transaction| {
+            transaction.put(
+                "data",
+                vec![(1, Value::Int64(2)), (2, Value::Bytes(b"after".to_vec()))],
+            )
+        })
+        .unwrap();
+    }
+
+    let db = Database::open(dir.path()).unwrap();
+    assert_eq!(db.table("data").unwrap().lock().count(), 2);
+}
+
+#[test]
+fn checkpoint_blocks_commit_until_wal_reset_finishes() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    db.create_table("data", make_schema()).unwrap();
+    db.transaction(|transaction| {
+        transaction.put(
+            "data",
+            vec![(1, Value::Int64(1)), (2, Value::Bytes(b"before".to_vec()))],
+        )
+    })
+    .unwrap();
+
+    let (at_reset_tx, at_reset_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let checkpoint_db = Arc::clone(&db);
+    let checkpoint = std::thread::spawn(move || {
+        checkpoint_db.checkpoint_controlled(|| {
+            at_reset_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok(())
+        })
+    });
+    at_reset_rx.recv().unwrap();
+
+    let (commit_started_tx, commit_started_rx) = mpsc::channel();
+    let (commit_done_tx, commit_done_rx) = mpsc::channel();
+    let commit_db = Arc::clone(&db);
+    let commit = std::thread::spawn(move || {
+        commit_started_tx.send(()).unwrap();
+        let result = commit_db.transaction(|transaction| {
+            transaction.put(
+                "data",
+                vec![(1, Value::Int64(2)), (2, Value::Bytes(b"after".to_vec()))],
+            )
+        });
+        commit_done_tx.send(result).unwrap();
+    });
+    commit_started_rx.recv().unwrap();
+    assert!(commit_done_rx
+        .recv_timeout(std::time::Duration::from_millis(50))
+        .is_err());
+
+    release_tx.send(()).unwrap();
+    checkpoint.join().unwrap().unwrap();
+    commit_done_rx.recv().unwrap().unwrap();
+    commit.join().unwrap();
+    drop(db);
+
+    let reopened = Database::open(dir.path()).unwrap();
+    assert_eq!(reopened.table("data").unwrap().lock().count(), 2);
+}
+
+#[test]
+fn failed_strict_flush_keeps_old_wal_for_recovery() {
+    let dir = tempdir().unwrap();
+    let table_id;
+    {
+        let db = Database::create(dir.path()).unwrap();
+        table_id = db.create_table("data", make_schema()).unwrap();
+        db.transaction(|transaction| {
+            transaction.put(
+                "data",
+                vec![(1, Value::Int64(1)), (2, Value::Bytes(b"value".to_vec()))],
+            )
+        })
+        .unwrap();
+        let manifest = dir
+            .path()
+            .join("tables")
+            .join(table_id.to_string())
+            .join("_mf");
+        let saved_manifest = manifest.with_extension("saved");
+        std::fs::rename(&manifest, &saved_manifest).unwrap();
+        std::fs::create_dir(&manifest).unwrap();
+        assert!(db.checkpoint().is_err());
+        let wal_files = std::fs::read_dir(dir.path().join("_wal"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "wal"))
+            .count();
+        assert!(wal_files >= 1);
+        std::fs::remove_dir(&manifest).unwrap();
+        std::fs::rename(&saved_manifest, &manifest).unwrap();
+    }
+
+    let reopened = Database::open(dir.path()).unwrap();
+    assert_eq!(reopened.table("data").unwrap().lock().count(), 1);
 }
 
 #[test]

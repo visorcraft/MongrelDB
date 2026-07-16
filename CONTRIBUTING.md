@@ -84,7 +84,7 @@ cargo run -p mongreldb-perf --release --bin compare mongrel  # cross-engine matr
 
 ### Rust
 
-- **Edition / toolchain.** Rust 2021, MSRV 1.80. Don't bump the MSRV
+- **Edition / toolchain.** Rust 2021, MSRV 1.88. Don't bump the MSRV
   casually.
 - **Formatting.** `cargo fmt --all`. No custom `rustfmt.toml` - the
   default style is canonical.

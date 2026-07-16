@@ -231,52 +231,50 @@ fn recursive_cte_integer_division() {
 #[test]
 fn auth_role_revocation_via_refresh() {
     let dir = tempdir().unwrap();
-    let path = dir.path();
-    {
-        let db = Database::create_with_credentials(path, "admin", "pw").unwrap();
-        db.create_table(
-            "data",
-            Schema {
-                schema_id: 1,
-                columns: vec![ColumnDef {
-                    id: 1,
-                    name: "id".into(),
-                    ty: TypeId::Int64,
-                    flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
-                    default_value: None,
-                }],
-                indexes: vec![],
-                colocation: vec![],
-                constraints: Default::default(),
-                clustered: false,
-            },
-        )
-        .unwrap();
-        let t = db.table("data").unwrap();
-        t.lock().put(vec![(1, Value::Int64(1))]).unwrap();
-        t.lock().commit().unwrap();
-        db.create_user("alice", "apw").unwrap();
-        db.create_role("r").unwrap();
-        db.grant_permission(
-            "r",
-            Permission::Select {
-                table: "data".into(),
-            },
-        )
-        .unwrap();
-        db.grant_role("alice", "r").unwrap();
-    }
-    let db = Arc::new(Database::open_with_credentials(path, "alice", "apw").unwrap());
+    let db = Arc::new(Database::create_with_credentials(dir.path(), "admin", "pw").unwrap());
+    db.create_table(
+        "data",
+        Schema {
+            schema_id: 1,
+            columns: vec![ColumnDef {
+                id: 1,
+                name: "id".into(),
+                ty: TypeId::Int64,
+                flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
+            }],
+            indexes: vec![],
+            colocation: vec![],
+            constraints: Default::default(),
+            clustered: false,
+        },
+    )
+    .unwrap();
+    let t = db.table("data").unwrap();
+    t.lock().put(vec![(1, Value::Int64(1))]).unwrap();
+    t.lock().commit().unwrap();
+    db.create_user("alice", "apw").unwrap();
+    db.create_role("r").unwrap();
+    db.grant_permission(
+        "r",
+        Permission::Select {
+            table: "data".into(),
+        },
+    )
+    .unwrap();
+    db.grant_role("alice", "r").unwrap();
+    let session =
+        MongrelSession::open_as(Arc::clone(&db), db.resolve_principal("alice").unwrap()).unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
     // Alice can SELECT.
-    run(&db, "SELECT id FROM data").unwrap();
-    // Admin revokes alice's role.
-    let admin = Database::open_with_credentials(path, "admin", "pw").unwrap();
-    admin.revoke_role("alice", "r").unwrap();
-    drop(admin);
-    // Alice refreshes — role is gone.
-    db.refresh_principal().unwrap();
+    rt.block_on(session.run("SELECT id FROM data")).unwrap();
+    // The catalog-bound session re-resolves Alice after the admin revokes her role.
+    db.revoke_role("alice", "r").unwrap();
     // Alice should now be denied SELECT.
-    let err = run(&db, "SELECT id FROM data").unwrap_err();
+    let err = rt
+        .block_on(session.run("SELECT id FROM data"))
+        .unwrap_err()
+        .to_string();
     assert!(
         err.contains("PermissionDenied") || err.contains("permission denied"),
         "revoked role should block SELECT after refresh: {err}"

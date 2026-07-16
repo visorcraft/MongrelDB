@@ -123,21 +123,42 @@ fn database_wrapper_invalidates_on_security_change_and_rejects_rls() {
         )
         .unwrap();
     admin.grant_role("alice", "reader").unwrap();
-    let alice = Database::open_with_credentials(dir.path(), "alice", "pw").unwrap();
+    let alice = admin.resolve_principal("alice").unwrap();
 
-    let cold = alice
-        .incremental_aggregate_for_current_principal("items", &[], None, NativeAgg::Count)
+    let cold = admin
+        .incremental_aggregate_for_principal(
+            "items",
+            &[],
+            None,
+            NativeAgg::Count,
+            Some(&alice),
+            true,
+        )
         .unwrap();
     assert!(!cold.incremental);
-    let warm = alice
-        .incremental_aggregate_for_current_principal("items", &[], None, NativeAgg::Count)
+    let warm = admin
+        .incremental_aggregate_for_principal(
+            "items",
+            &[],
+            None,
+            NativeAgg::Count,
+            Some(&alice),
+            true,
+        )
         .unwrap();
     assert!(warm.incremental);
 
     admin.create_role("extra").unwrap();
     admin.grant_role("alice", "extra").unwrap();
-    let invalidated = alice
-        .incremental_aggregate_for_current_principal("items", &[], None, NativeAgg::Count)
+    let invalidated = admin
+        .incremental_aggregate_for_principal(
+            "items",
+            &[],
+            None,
+            NativeAgg::Count,
+            Some(&alice),
+            true,
+        )
         .unwrap();
     assert!(!invalidated.incremental);
 
@@ -157,7 +178,14 @@ fn database_wrapper_invalidates_on_security_change_and_rejects_rls() {
         })
         .unwrap();
     assert!(matches!(
-        alice.incremental_aggregate_for_current_principal("items", &[], None, NativeAgg::Count),
+        admin.incremental_aggregate_for_principal(
+            "items",
+            &[],
+            None,
+            NativeAgg::Count,
+            Some(&alice),
+            true,
+        ),
         Err(mongreldb_core::MongrelError::InvalidArgument(message))
             if message.contains("unsupported while RLS or column masks are active")
     ));

@@ -225,6 +225,42 @@ export interface CommitResultJs {
 export interface NativeSqlOptions {
   queryId?: string
   timeoutMs?: number
+  maxOutputRows?: number
+  maxOutputBytes?: number
+  idempotencyKey?: string
+}
+export const enum NativeCancelOutcome {
+  Accepted = 'Accepted',
+  AlreadyCancelling = 'AlreadyCancelling',
+  TooLate = 'TooLate',
+  AlreadyFinished = 'AlreadyFinished',
+  NotFound = 'NotFound',
+  PreCancelled = 'PreCancelled'
+}
+export interface NativeDurableOutcome {
+  outcomeKnown: boolean
+  committed?: boolean
+  committedStatements?: number
+  lastCommitEpoch?: bigint
+  firstCommitStatementIndex?: number
+  lastCommitStatementIndex?: number
+}
+export interface NativeQueryStatus {
+  queryId: string
+  phase: string
+  serverState: string
+  terminalState?: string
+  operation: string
+  outcomeKnown: boolean
+  committed?: boolean
+  durableOutcome: NativeDurableOutcome
+  terminalErrorCode?: string
+  terminalErrorCategory?: string
+  completedStatements?: number
+  statementIndex?: number
+  cancelOutcome?: NativeCancelOutcome
+  cancellationReason: string
+  retryable: boolean
 }
 /**
  * Result of an insert: the physical row id plus, when the engine allocated
@@ -248,6 +284,51 @@ export interface TypedColumn {
   data: Buffer
   /** Optional validity bitmap (1 byte per row, 1=non-null). */
   validity?: Buffer
+}
+export interface NativeRemoteOptions {
+  bearerToken?: string
+  username?: string
+  password?: string
+  transportTimeoutMs?: number
+}
+export interface NativeRemoteSqlReceipt {
+  queryId: string
+  originalQueryId: string
+  status: string
+  serverState: string
+  cancelOutcome?: NativeCancelOutcome
+  cancellationReason: string
+  committed: boolean
+  durableOutcome: NativeDurableOutcome
+  completedStatements: number
+  statementIndex: number
+  retryable: boolean
+  idempotencyReplayed: boolean
+  idempotencyPersisted: boolean
+  idempotencyExpiresAtMs: bigint
+}
+export interface NativeRemoteQueryErrorDetails {
+  code: string
+  message: string
+  queryId?: string
+  status?: string
+  httpStatus?: number
+  outcomeKnown: boolean
+  committed?: boolean
+  epoch?: bigint
+  epochText?: string
+  committedStatements?: number
+  lastCommitEpoch?: bigint
+  lastCommitEpochText?: string
+  firstCommitStatementIndex?: number
+  lastCommitStatementIndex?: number
+  completedStatements?: number
+  statementIndex?: number
+  cancelOutcome?: string
+  cancellationReason?: string
+  retryable: boolean
+  serverState?: string
+  terminalState?: string
 }
 /**
  * An open MongrelDB multi-table database. Each table is accessible via
@@ -379,7 +460,8 @@ export declare class Database {
   sql(sql: string): Promise<Buffer>
   sqlWithOptions(sql: string, options?: NativeSqlOptions | undefined | null): Promise<Buffer>
   startSql(sql: string, options?: NativeSqlOptions | undefined | null): NativeSqlQuery
-  cancelSql(queryId: string): boolean
+  cancelSql(queryId: string): NativeCancelOutcome
+  sqlQueryStatus(queryId: string): NativeQueryStatus
   /** Flush + release. Optional — the `Database` also drops on GC. */
   close(): void
   /**
@@ -469,8 +551,11 @@ export declare class Database {
 }
 export declare class NativeSqlQuery {
   get id(): string
-  cancel(): boolean
+  cancel(): NativeCancelOutcome
+  status(): NativeQueryStatus
   result(): Promise<Buffer>
+  resultArrow(): Promise<Buffer>
+  resultRows(): Promise<Array<Record<string, unknown>>>
 }
 /** A handle to one table inside a [`Database`]. */
 export declare class TableHandle {
@@ -669,22 +754,25 @@ export declare class WriteBuffer {
  */
 export declare class RemoteDatabase {
   /** Connect to a `mongreldb-server` at `url` (e.g. `http://127.0.0.1:8453`). */
-  constructor(url: string)
+  constructor(url: string, options?: NativeRemoteOptions | undefined | null)
   health(): string
   tableNames(): Array<string>
   setHistoryRetentionEpochs(epochs: bigint): void
   historyRetentionEpochs(): bigint
   earliestRetainedEpoch(): bigint
   count(table: string): bigint
-  sql(sql: string): Buffer
-  sqlWithOptions(sql: string, options?: NativeSqlOptions | undefined | null): Buffer
-  cancelSql(queryId: string): boolean
+  sql(sql: string): Promise<Buffer>
+  sqlWithOptions(sql: string, options?: NativeSqlOptions | undefined | null): Promise<Buffer>
+  startSql(sql: string, options?: NativeSqlOptions | undefined | null): NativeRemoteSqlQuery
+  sqlWriteIdempotent(sql: string, options: NativeSqlOptions): Promise<NativeRemoteSqlReceipt>
+  cancelSql(queryId: string): NativeCancelOutcome
+  queryStatus(queryId: string): NativeQueryStatus
   commit(table: string): bigint
   createProcedure(spec: ProcedureSpec): string
   dropProcedure(name: string): void
   createTrigger(spec: TriggerSpec): string
   replaceTrigger(name: string, spec: TriggerSpec): string
-  dropTrigger(name: string): void
+  dropTrigger(name: string, idempotencyKey?: string | undefined | null): void
   triggers(): string
   trigger(name: string): string
   callProcedure(name: string, opts?: ProcedureCallOptions | undefined | null): string
@@ -698,4 +786,10 @@ export declare class RemoteDatabase {
    * Returns `true` if compacted, `false` if skipped (fewer than 2 runs).
    */
   compactTable(name: string): boolean
+}
+export declare class NativeRemoteSqlQuery {
+  get id(): string
+  result(): Promise<Buffer>
+  cancel(): NativeCancelOutcome
+  status(): NativeQueryStatus
 }

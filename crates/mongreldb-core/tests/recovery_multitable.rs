@@ -1,6 +1,10 @@
 //! P2.6 — two-pass, epoch-gated, no-truncate multi-table recovery.
 
-use mongreldb_core::{schema::*, Database, Value};
+use mongreldb_core::{
+    schema::*,
+    wal::{AddedRun, Op, SharedWal},
+    Database, Epoch, MongrelError, Row, RowId, Value,
+};
 use tempfile::tempdir;
 
 fn one_int_schema() -> Schema {
@@ -18,6 +22,112 @@ fn one_int_schema() -> Schema {
         constraints: Default::default(),
         clustered: false,
     }
+}
+
+#[test]
+fn committed_put_decode_failure_is_wal_corruption() {
+    let dir = tempdir().unwrap();
+    let epoch = {
+        let db = Database::create(dir.path()).unwrap();
+        db.create_table("items", one_int_schema()).unwrap();
+        db.visible_epoch().0 + 1
+    };
+    let mut wal = SharedWal::open(dir.path(), Epoch(epoch - 1), None).unwrap();
+    wal.append(
+        999,
+        0,
+        Op::Put {
+            table_id: 0,
+            rows: vec![0xff, 0x00, 0xff],
+        },
+    )
+    .unwrap();
+    wal.append_commit(999, Epoch(epoch), &[]).unwrap();
+    wal.group_sync().unwrap();
+    drop(wal);
+
+    assert!(matches!(
+        Database::open(dir.path()),
+        Err(MongrelError::CorruptWal { .. })
+    ));
+}
+
+#[test]
+fn committed_write_to_unknown_table_is_wal_corruption() {
+    let dir = tempdir().unwrap();
+    drop(Database::create(dir.path()).unwrap());
+    let mut wal = SharedWal::open(dir.path(), Epoch(0), None).unwrap();
+    let rows = bincode::serialize(&vec![Row::new(RowId(1), Epoch(1))]).unwrap();
+    wal.append(
+        91,
+        999,
+        Op::Put {
+            table_id: 999,
+            rows,
+        },
+    )
+    .unwrap();
+    wal.append_commit(91, Epoch(1), &[]).unwrap();
+    wal.group_sync().unwrap();
+    drop(wal);
+
+    assert!(matches!(
+        Database::open(dir.path()),
+        Err(MongrelError::CorruptWal { .. })
+    ));
+}
+
+#[test]
+fn committed_write_at_or_after_drop_epoch_is_wal_corruption() {
+    let dir = tempdir().unwrap();
+    let drop_epoch = {
+        let db = Database::create(dir.path()).unwrap();
+        db.create_table("items", one_int_schema()).unwrap();
+        db.drop_table_with_epoch("items").unwrap().0
+    };
+    let mut wal = SharedWal::open(dir.path(), Epoch(drop_epoch), None).unwrap();
+    let rows = bincode::serialize(&vec![Row::new(RowId(1), Epoch(drop_epoch + 1))]).unwrap();
+    wal.append(92, 0, Op::Put { table_id: 0, rows }).unwrap();
+    wal.append_commit(92, Epoch(drop_epoch + 1), &[]).unwrap();
+    wal.group_sync().unwrap();
+    drop(wal);
+
+    assert!(matches!(
+        Database::open(dir.path()),
+        Err(MongrelError::CorruptWal { .. })
+    ));
+}
+
+#[test]
+fn committed_spilled_run_missing_from_pending_and_final_is_corruption() {
+    let dir = tempdir().unwrap();
+    let epoch = {
+        let db = Database::create(dir.path()).unwrap();
+        db.create_table("items", one_int_schema()).unwrap();
+        db.visible_epoch().0 + 1
+    };
+    let mut wal = SharedWal::open(dir.path(), Epoch(epoch - 1), None).unwrap();
+    wal.append_commit(
+        1000,
+        Epoch(epoch),
+        &[AddedRun {
+            table_id: 0,
+            run_id: 4242,
+            row_count: 1,
+            level: 0,
+            min_row_id: 1,
+            max_row_id: 1,
+            content_hash: [0; 32],
+        }],
+    )
+    .unwrap();
+    wal.group_sync().unwrap();
+    drop(wal);
+
+    assert!(matches!(
+        Database::open(dir.path()),
+        Err(MongrelError::CorruptWal { .. })
+    ));
 }
 
 #[test]
@@ -157,6 +267,110 @@ fn txn_ids_do_not_alias_across_reopen() {
 }
 
 #[test]
+fn malformed_generation_sidecar_fails_closed() {
+    let dir = tempdir().unwrap();
+    drop(Database::create(dir.path()).unwrap());
+    std::fs::write(dir.path().join("_meta/generation"), [1_u8, 2, 3]).unwrap();
+    assert!(Database::open(dir.path()).is_err());
+}
+
+#[test]
+fn generation_sidecar_cannot_move_behind_retained_wal() {
+    let dir = tempdir().unwrap();
+    {
+        let db = Database::create(dir.path()).unwrap();
+        db.create_table("a", one_int_schema()).unwrap();
+    }
+    {
+        let db = Database::open(dir.path()).unwrap();
+        db.transaction(|transaction| {
+            transaction.put("a", vec![(1, Value::Int64(1))])?;
+            Ok(())
+        })
+        .unwrap();
+    }
+    std::fs::write(dir.path().join("_meta/generation"), 0_u64.to_le_bytes()).unwrap();
+    assert!(Database::open(dir.path()).is_err());
+}
+
+#[test]
+fn missing_generation_migrates_above_retained_wal() {
+    let dir = tempdir().unwrap();
+    let prior = {
+        let db = Database::create(dir.path()).unwrap();
+        db.create_table("a", one_int_schema()).unwrap();
+        let txn_id = db.begin().txn_id();
+        txn_id
+    };
+    std::fs::remove_file(dir.path().join("_meta/generation")).unwrap();
+    let reopened = Database::open(dir.path()).unwrap();
+    let next = reopened.begin().txn_id();
+    assert!(next >> 32 > prior >> 32);
+    assert_ne!(next, prior);
+}
+
+#[cfg(unix)]
+#[test]
+fn generation_symlinks_never_redirect_reads_or_atomic_writes() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempdir().unwrap();
+    drop(Database::create(dir.path()).unwrap());
+    let outside = dir.path().join("outside");
+    std::fs::write(&outside, b"outside").unwrap();
+    let generation = dir.path().join("_meta/generation");
+    std::fs::remove_file(&generation).unwrap();
+    symlink(&outside, &generation).unwrap();
+    assert!(Database::open(dir.path()).is_err());
+    assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+
+    std::fs::remove_file(&generation).unwrap();
+    std::fs::write(&generation, 0_u64.to_le_bytes()).unwrap();
+    let obsolete_temp = dir.path().join("_meta/.generation.tmp");
+    symlink(&outside, &obsolete_temp).unwrap();
+    drop(Database::open(dir.path()).unwrap());
+    assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+    assert!(obsolete_temp
+        .symlink_metadata()
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+#[cfg(unix)]
+#[test]
+fn generation_write_stays_on_pinned_root_after_root_rename() {
+    let parent = tempdir().unwrap();
+    let original = parent.path().join("database");
+    drop(Database::create(&original).unwrap());
+    let durable = mongreldb_core::durable_file::DurableRoot::open(&original).unwrap();
+    let moved = parent.path().join("moved");
+    std::fs::rename(&original, &moved).unwrap();
+    std::fs::create_dir_all(original.join("_meta")).unwrap();
+    std::fs::write(original.join("_meta/generation"), 9_u64.to_le_bytes()).unwrap();
+
+    mongreldb_core::catalog::write_generation(&durable, 42).unwrap();
+    assert_eq!(
+        u64::from_le_bytes(
+            std::fs::read(moved.join("_meta/generation"))
+                .unwrap()
+                .try_into()
+                .unwrap()
+        ),
+        42
+    );
+    assert_eq!(
+        u64::from_le_bytes(
+            std::fs::read(original.join("_meta/generation"))
+                .unwrap()
+                .try_into()
+                .unwrap()
+        ),
+        9
+    );
+}
+
+#[test]
 fn ddl_is_durable_via_wal_before_catalog_checkpoint() {
     use mongreldb_core::{DdlOp, Op, SharedWal};
 
@@ -219,6 +433,29 @@ fn ddl_recovered_from_wal_when_catalog_checkpoint_is_stale() {
         "table must be recovered from WAL DDL replay"
     );
     assert_eq!(db.table("recovered").unwrap().lock().count(), 1);
+}
+
+#[test]
+fn ddl_recovery_completes_a_partial_table_directory() {
+    use mongreldb_core::{catalog, manifest};
+
+    let dir = tempdir().unwrap();
+    let table_id = {
+        let db = Database::create(dir.path()).unwrap();
+        let table_id = db.create_table("recovered", one_int_schema()).unwrap();
+        drop(db);
+        table_id
+    };
+
+    catalog::write_atomic(dir.path(), &catalog::Catalog::empty(), None).unwrap();
+    let table_dir = dir.path().join("tables").join(table_id.to_string());
+    std::fs::remove_file(table_dir.join(manifest::MANIFEST_FILENAME)).unwrap();
+    std::fs::remove_file(table_dir.join("schema.json")).unwrap();
+
+    let db = Database::open(dir.path()).unwrap();
+    assert!(db.table_names().iter().any(|name| name == "recovered"));
+    assert!(table_dir.join(manifest::MANIFEST_FILENAME).is_file());
+    assert!(table_dir.join("schema.json").is_file());
 }
 
 #[cfg(feature = "encryption")]

@@ -28,7 +28,7 @@
 use crate::arrow_conv::{arrow_data_type, build_array};
 use crate::error::{MongrelQueryError, Result};
 use crate::query_registry::RegisteredSqlQuery;
-use crate::{translate_ann_search, translate_filter};
+use crate::{translate_ann_search, translate_filter, SqlCollectionLimits};
 use arrow::array::{new_empty_array, ArrayRef};
 use arrow::datatypes::Field;
 use arrow::record_batch::RecordBatch;
@@ -56,6 +56,7 @@ pub(crate) fn try_fk_join(
     tables: &HashMap<String, TableHandle>,
     plan: &LogicalPlan,
     query: Option<&RegisteredSqlQuery>,
+    limits: SqlCollectionLimits,
 ) -> Result<Option<Vec<RecordBatch>>> {
     checkpoint(query, 0)?;
     // 1. Peel outer Sort / Limit (captured), Projection (captured), optional
@@ -102,6 +103,12 @@ pub(crate) fn try_fk_join(
     }
     if tables.get(&left.table).is_none() || tables.get(&right.table).is_none() {
         return Ok(None);
+    }
+    for table in [&left.table, &right.table] {
+        let db = lock_db(table, tables);
+        if db.ttl().is_some() || db.count() > limits.max_rows as u64 {
+            return Ok(None);
+        }
     }
 
     // Route any top-level conjuncts to the side(s) they belong to. A conjunct
@@ -1408,7 +1415,13 @@ mod tests {
             .sql("select u.uid, u.country from users u join countries c on u.country = c.cid")
             .await
             .unwrap();
-        let out = try_fk_join(&tables, plan.logical_plan(), None).unwrap();
+        let out = try_fk_join(
+            &tables,
+            plan.logical_plan(),
+            None,
+            SqlCollectionLimits::default(),
+        )
+        .unwrap();
         assert!(out.is_some(), "FK-join intercept should fire");
         let batches = out.unwrap();
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -1425,9 +1438,14 @@ mod tests {
             .sql("select u.uid from users u join countries c on u.country = c.cid where c.cid <= 1 order by u.uid")
             .await
             .unwrap();
-        let out = try_fk_join(&tables, plan.logical_plan(), None)
-            .unwrap()
-            .unwrap();
+        let out = try_fk_join(
+            &tables,
+            plan.logical_plan(),
+            None,
+            SqlCollectionLimits::default(),
+        )
+        .unwrap()
+        .unwrap();
         let batch = &out[0];
         assert_eq!(batch.num_rows(), 4, "uids 0,1,5,6 reference countries 0,1");
         // Ordered ascending ⇒ first uid is 0.
@@ -1450,7 +1468,13 @@ mod tests {
             .sql("select c.cid from countries c join users u on c.cid = u.country")
             .await
             .unwrap();
-        let out = try_fk_join(&tables, plan.logical_plan(), None).unwrap();
+        let out = try_fk_join(
+            &tables,
+            plan.logical_plan(),
+            None,
+            SqlCollectionLimits::default(),
+        )
+        .unwrap();
         // Still fires: users.country HAS a bitmap, so users is the FK side
         // regardless of SQL order. Expect it to fire.
         assert!(out.is_some(), "intercept fires regardless of join order");
@@ -1464,7 +1488,13 @@ mod tests {
             .sql("select count(*) from users u join countries c on u.country = c.cid")
             .await
             .unwrap();
-        let out = try_fk_join(&tables, plan.logical_plan(), None).unwrap();
+        let out = try_fk_join(
+            &tables,
+            plan.logical_plan(),
+            None,
+            SqlCollectionLimits::default(),
+        )
+        .unwrap();
         assert!(out.is_some(), "aggregate FK-join should fire");
         let batch = &out.unwrap()[0];
         assert_eq!(batch.num_rows(), 1);
@@ -1486,7 +1516,13 @@ mod tests {
             .sql("select count(*) from users u join countries c on u.country = c.cid where c.cid <= 1")
             .await
             .unwrap();
-        let out = try_fk_join(&tables, plan.logical_plan(), None).unwrap();
+        let out = try_fk_join(
+            &tables,
+            plan.logical_plan(),
+            None,
+            SqlCollectionLimits::default(),
+        )
+        .unwrap();
         assert!(out.is_some(), "filtered aggregate FK-join should fire");
         let val = out.unwrap()[0]
             .column(0)
@@ -1506,7 +1542,13 @@ mod tests {
             .sql("select sum(u.uid) from users u join countries c on u.country = c.cid")
             .await
             .unwrap();
-        let out = try_fk_join(&tables, plan.logical_plan(), None).unwrap();
+        let out = try_fk_join(
+            &tables,
+            plan.logical_plan(),
+            None,
+            SqlCollectionLimits::default(),
+        )
+        .unwrap();
         assert!(out.is_some(), "SUM FK-join aggregate should fire");
         let val = out.unwrap()[0]
             .column(0)

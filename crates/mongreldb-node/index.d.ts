@@ -5,9 +5,36 @@
 
 export * from './native';
 
+import type { NativeRemoteQueryErrorDetails } from './native';
+
 /** Retryable write-write conflict. */
 export declare class ConflictError extends Error {
   constructor(message: string);
+}
+
+/** Structured rejection from NativeSqlQuery result methods. */
+export interface NativeQueryError extends Error {
+  code: string;
+  queryId: string;
+  outcomeKnown: boolean;
+  committed: boolean | null;
+  committedStatements: number | null;
+  lastCommitEpoch: bigint | null;
+  lastCommitEpochText: string | null;
+  firstCommitStatementIndex: number | null;
+  lastCommitStatementIndex: number | null;
+  completedStatements: number | null;
+  statementIndex: number | null;
+  cancelOutcome: import('./native').NativeCancelOutcome | null;
+  cancellationReason: string;
+  retryable: boolean;
+  serverState: string;
+  terminalState: string | null;
+}
+
+/** Structured rejection from daemon-backed operations. */
+export interface RemoteQueryError extends Error, NativeRemoteQueryErrorDetails {
+  remoteQueryError: NativeRemoteQueryErrorDetails;
 }
 
 /** Callback used by `Database.prototype.transaction`. */
@@ -29,3 +56,6 @@ export declare class Database extends import('./native').Database {
    */
   transaction(fn: TransactionCallback, opts?: TransactionOptions): Promise<bigint>;
 }
+
+/** Remote wrapper that preserves structured server errors. */
+export declare class RemoteDatabase extends import('./native').RemoteDatabase {}

@@ -42,8 +42,9 @@ pub use external_modules::{
     ExternalTxn, ExternalWriteOp, ExternalWriteResult, ModuleConnectCtx,
 };
 pub use query_registry::{
-    CancelOutcome, CommitFenceOutcome, QueryId, QueryStatus, RegisteredQueryGuard,
-    RegisteredSqlQuery, SqlQueryOptions, SqlQueryPhase, SqlQueryRegistry,
+    CancelOutcome, CommitFenceOutcome, DurableOutcome, QueryId, QueryStatus, QueryTerminalError,
+    QueryTerminalErrorCategory, QueryTerminalState, RegisteredQueryGuard, RegisteredSqlQuery,
+    SerializationOutcome, SqlQueryOptions, SqlQueryPhase, SqlQueryRegistry,
 };
 
 /// True when SQL calls a ranked Boolean AI UDF. Remote servers use this to
@@ -70,6 +71,71 @@ pub fn contains_boolean_ai_predicate(sql: &str) -> bool {
     })
 }
 
+/// SHA-256 of SQL normalized with the same literal- and comment-aware rules
+/// used by the query-plan cache. Safe for protocol request binding without
+/// retaining raw SQL.
+pub fn normalized_sql_fingerprint(sql: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+
+    Sha256::digest(normalize_sql(sql).as_bytes()).into()
+}
+
+/// True only for one parsed query statement. Protocols that retain paged
+/// results use this conservative gate so no write or session-control command
+/// can execute through a cursor-producing endpoint.
+pub fn is_single_read_only_query(sql: &str) -> bool {
+    use sqlparser::ast::Statement;
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
+    Parser::parse_sql(&GenericDialect {}, sql)
+        .is_ok_and(|statements| matches!(statements.as_slice(), [Statement::Query(_)]))
+}
+
+/// Conservative protocol classification for optional write idempotency.
+/// Daemon protocols reject keyed reads. Only statement kinds whose MongrelDB
+/// implementation reaches one durable commit are eligible. Transient,
+/// session-control, administrative, and unrecognized commands are rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqlIdempotencyClass {
+    ReadOnly,
+    SingleWrite,
+    Unsupported,
+}
+
+pub fn classify_sql_idempotency(sql: &str) -> SqlIdempotencyClass {
+    use sqlparser::ast::{ObjectType, Statement};
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
+    let Ok(statements) = Parser::parse_sql(&GenericDialect {}, sql) else {
+        return SqlIdempotencyClass::Unsupported;
+    };
+    match statements.as_slice() {
+        [Statement::Query(_)] => SqlIdempotencyClass::ReadOnly,
+        [Statement::CreateView(view)] if view.materialized => SqlIdempotencyClass::SingleWrite,
+        [Statement::Insert(_)
+        | Statement::Update(_)
+        | Statement::Delete(_)
+        | Statement::Truncate(_)
+        | Statement::CreateTable(_)
+        | Statement::CreateVirtualTable { .. }
+        | Statement::AlterTable(_)
+        | Statement::CreateIndex(_)
+        | Statement::CreateTrigger(_)
+        | Statement::DropTrigger(_)
+        | Statement::CreatePolicy(_)
+        | Statement::DropPolicy(_)] => SqlIdempotencyClass::SingleWrite,
+        [Statement::Drop {
+            object_type: ObjectType::Table | ObjectType::MaterializedView | ObjectType::Index,
+            names,
+            ..
+        }] if names.len() == 1 => SqlIdempotencyClass::SingleWrite,
+        [_] => SqlIdempotencyClass::Unsupported,
+        _ => SqlIdempotencyClass::Unsupported,
+    }
+}
+
 pub type MongrelRecordBatchStream = datafusion::physical_plan::SendableRecordBatchStream;
 
 #[doc(hidden)]
@@ -78,13 +144,22 @@ pub enum SqlTestHookPoint {
     AfterRegistration,
     WaitingForSqlPermit,
     WaitingForSessionPermit,
+    BeforeServerIdempotencyCheck,
     Planning,
     BeforeScanBatch,
     AfterScanBatch,
     BeforeCommitFence,
     InsideCommitCritical,
+    AfterDurableCommit,
     AfterStatementStaging,
+    BeforeStatementExecution,
+    BeforeAssignmentEvaluation,
+    DuringOrderedDmlPermutation,
+    DuringTriggerExpansion,
     BeforeSerializationBatch,
+    DuringPaginationDeserialization,
+    AfterSerialization,
+    AfterPageResponseSerialization,
 }
 
 #[doc(hidden)]
@@ -94,6 +169,7 @@ tokio::task_local! {
     // Carries one registered query through command helpers that recursively
     // execute SQL. DataFusion operators receive control through TaskContext.
     static CURRENT_SQL_QUERY: RegisteredSqlQuery;
+    static CURRENT_COLLECTION_LIMITS: SqlCollectionLimits;
 }
 
 use arrow::array::{Array, ArrayRef, Int64Array, StringArray};
@@ -103,7 +179,7 @@ use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::{AggregateUDF, Expr, ScalarUDF, TableType, WindowUDF};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{execute_stream, ExecutionPlan};
+use datafusion::physical_plan::{execute_stream, ExecutionPlan, RecordBatchStream};
 use datafusion::prelude::SessionContext;
 use mongreldb_core::{
     AlterColumn, ColumnFlags, Cursor, Database, OwnedSnapshotGuard, Schema as CoreSchema, Snapshot,
@@ -136,6 +212,10 @@ struct ProviderSecurity {
     principal_catalog_bound: bool,
 }
 
+fn principal_is_catalog_bound(database: &Database, principal: &mongreldb_core::Principal) -> bool {
+    database.require_auth_enabled() || principal.user_id != 0
+}
+
 impl ProviderSecurity {
     fn principal(&self) -> mongreldb_core::Result<Option<mongreldb_core::Principal>> {
         let Some(principal) = &self.principal else {
@@ -143,7 +223,7 @@ impl ProviderSecurity {
         };
         if self.principal_catalog_bound {
             self.database
-                .resolve_principal(&principal.username)
+                .resolve_current_principal(principal)
                 .map(Some)
                 .ok_or(mongreldb_core::MongrelError::AuthRequired)
         } else {
@@ -194,9 +274,9 @@ impl MongrelProvider {
             snapshot: None,
             _retention: None,
             security: Some(ProviderSecurity {
-                principal_catalog_bound: principal.as_ref().is_some_and(|principal| {
-                    database.resolve_principal(&principal.username).is_some()
-                }),
+                principal_catalog_bound: principal
+                    .as_ref()
+                    .is_some_and(|principal| principal_is_catalog_bound(&database, principal)),
                 database,
                 table,
                 principal,
@@ -321,6 +401,7 @@ impl TableProvider for MongrelProvider {
         let core_err = |e: mongreldb_core::MongrelError| {
             DataFusionError::External(Box::new(MongrelQueryError::Core(e)))
         };
+        let registered_query = CURRENT_SQL_QUERY.try_with(Clone::clone).ok();
         if let Some(security) = &self.security {
             let principal = security.principal().map_err(core_err)?;
             let allowed = security
@@ -410,6 +491,7 @@ impl TableProvider for MongrelProvider {
                     )
                     .map_err(core_err)?
             };
+            enforce_source_rows_limit(&rows, registered_query.as_ref())?;
             if projection.is_some_and(Vec::is_empty) {
                 return Ok(Arc::new(scan::MongrelScanExec::new_row_count(rows.len())));
             }
@@ -603,7 +685,7 @@ impl TableProvider for MongrelProvider {
 
         // Pushdown returns exactly `col_ids` when it accepts; the full-scan
         // fallback returns all columns, of which we keep `col_ids`.
-        let cols = if !translated.is_empty() {
+        let mut cols = if !translated.is_empty() {
             match db
                 .query_columns_native_cached(&translated, Some(&col_ids), snap)
                 .map_err(core_err)?
@@ -622,15 +704,12 @@ impl TableProvider for MongrelProvider {
         let mut ordered: Vec<mongreldb_core::columnar::NativeColumn> =
             Vec::with_capacity(col_ids.len());
         for cid in &col_ids {
-            let col = cols
-                .iter()
-                .find(|(id, _)| id == cid)
-                .map(|(_, c)| c.clone())
-                .ok_or_else(|| {
-                    DataFusionError::External(Box::new(MongrelQueryError::Arrow(format!(
-                        "missing column {cid}"
-                    ))))
-                })?;
+            let position = cols.iter().position(|(id, _)| id == cid).ok_or_else(|| {
+                DataFusionError::External(Box::new(MongrelQueryError::Arrow(format!(
+                    "missing column {cid}"
+                ))))
+            })?;
+            let (_, col) = cols.swap_remove(position);
             ordered.push(col);
         }
         let num_rows = ordered.first().map(|c| c.len()).unwrap_or(0);
@@ -973,10 +1052,13 @@ pub(crate) fn translate_filter(
                     column_id: cdef.id,
                     pattern: seg,
                 }),
-                1 => Some(Condition::FmContains {
-                    column_id: cdef.id,
-                    pattern: segments.into_iter().next().unwrap(),
-                }),
+                1 => segments
+                    .into_iter()
+                    .next()
+                    .map(|pattern| Condition::FmContains {
+                        column_id: cdef.id,
+                        pattern,
+                    }),
                 _ => Some(Condition::FmContainsAll {
                     column_id: cdef.id,
                     patterns: segments,
@@ -1632,15 +1714,9 @@ pub struct MongrelSession {
     /// session's lifetime so their tables remain registered on the DataFusion
     /// context. Keyed by alias.
     attached_databases: parking_lot::Mutex<HashMap<String, Arc<Database>>>,
-    /// SQL `BEGIN`/`COMMIT` staging for DML statements. Reads remain
-    /// snapshot-at-scan; this batches SQL writes atomically when a client sends
-    /// an explicit transaction block.
-    sql_txn: parking_lot::Mutex<Option<Vec<commands::PendingSqlOp>>>,
-    /// Failed/cancelled explicit transactions accept only a full `ROLLBACK`.
-    sql_txn_aborted: parking_lot::Mutex<bool>,
-    /// SAVEPOINT stack: `(name, staged-ops-length-at-savepoint)`. Truncated on
-    /// `ROLLBACK TO name` and removed on `RELEASE name`.
-    savepoints: parking_lot::Mutex<Vec<(String, usize)>>,
+    /// SQL `BEGIN`/`COMMIT` staging, abort state, and savepoints. One mutex keeps
+    /// every transaction-state transition atomic.
+    transaction: Arc<parking_lot::Mutex<SqlTransactionState>>,
     /// Per-session state for SQL compatibility functions such as changes().
     sql_fn_state: Arc<extended_sql_functions::ExtendedSqlState>,
     /// Built-in plus app-provided external table modules available to this
@@ -1657,11 +1733,254 @@ pub struct MongrelSession {
     test_hook: parking_lot::Mutex<Option<SqlTestHook>>,
 }
 
+#[derive(Default)]
+struct SqlTransactionState {
+    staged_ops: Option<commands::PendingSqlOps>,
+    aborted: bool,
+    savepoints: Vec<(String, commands::PendingSqlOpsCheckpoint)>,
+}
+
 /// `(sql, snapshot_epoch) → cached result batches`.
 type CacheKey = (String, u64);
-type ResultCache = parking_lot::Mutex<BoundedLru<CacheKey, Arc<Vec<RecordBatch>>>>;
+type ResultCache = parking_lot::Mutex<ResultCacheStore>;
 
 const SESSION_CACHE_MAX_ENTRIES: usize = 1024;
+const SESSION_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_COLLECTION_MAX_ROWS: usize = 1_000_000;
+const DEFAULT_COLLECTION_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+fn core_value_memory_bytes(value: &mongreldb_core::Value) -> usize {
+    use mongreldb_core::Value;
+    match value {
+        Value::Null => 0,
+        Value::Bool(_) => 1,
+        Value::Int64(_) | Value::Float64(_) => 8,
+        Value::Bytes(value) | Value::Json(value) => value.len(),
+        Value::Embedding(value) => value.len().saturating_mul(std::mem::size_of::<f32>()),
+        Value::Decimal(_) | Value::Uuid(_) => 16,
+        Value::Interval { .. } => 20,
+    }
+}
+
+fn core_row_memory_bytes(row: &mongreldb_core::Row) -> usize {
+    let bucket_bytes = std::mem::size_of::<(u16, mongreldb_core::Value)>()
+        .saturating_add(2 * std::mem::size_of::<usize>());
+    row.columns
+        .capacity()
+        .saturating_mul(bucket_bytes)
+        .saturating_add(
+            row.columns
+                .values()
+                .map(core_value_memory_bytes)
+                .fold(0_usize, usize::saturating_add),
+        )
+}
+
+fn enforce_source_rows_limit(
+    rows: &[mongreldb_core::Row],
+    query: Option<&RegisteredSqlQuery>,
+) -> DFResult<()> {
+    let limits = current_collection_limits();
+    if rows.len() > limits.max_rows {
+        let message = format!(
+            "SQL source row limit exceeded ({} > {})",
+            rows.len(),
+            limits.max_rows
+        );
+        return Err(DataFusionError::External(Box::new(match query {
+            Some(query) => query.result_limit_error(message),
+            None => MongrelQueryError::Core(mongreldb_core::MongrelError::ResourceLimitExceeded {
+                resource: "SQL source rows",
+                requested: rows.len(),
+                limit: limits.max_rows,
+            }),
+        })));
+    }
+    let mut bytes = 0_usize;
+    for (index, row) in rows.iter().enumerate() {
+        if index % 256 == 0 {
+            query
+                .map(RegisteredSqlQuery::checkpoint)
+                .transpose()
+                .map_err(|error| DataFusionError::External(Box::new(error)))?;
+        }
+        bytes = bytes.saturating_add(core_row_memory_bytes(row));
+        if bytes > limits.max_bytes {
+            let message = format!(
+                "SQL source row memory limit exceeded ({} > {} bytes)",
+                bytes, limits.max_bytes
+            );
+            return Err(DataFusionError::External(Box::new(match query {
+                Some(query) => query.result_limit_error(message),
+                None => {
+                    MongrelQueryError::Core(mongreldb_core::MongrelError::ResourceLimitExceeded {
+                        resource: "SQL source row bytes",
+                        requested: bytes,
+                        limit: limits.max_bytes,
+                    })
+                }
+            })));
+        }
+    }
+    Ok(())
+}
+
+/// Bounds for SQL paths that must materialize batches before conversion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SqlCollectionLimits {
+    pub max_rows: usize,
+    pub max_bytes: usize,
+}
+
+impl SqlCollectionLimits {
+    pub fn new(max_rows: usize, max_bytes: usize) -> Self {
+        Self {
+            max_rows: max_rows.max(1),
+            max_bytes: max_bytes.max(1),
+        }
+    }
+}
+
+impl Default for SqlCollectionLimits {
+    fn default() -> Self {
+        Self::new(DEFAULT_COLLECTION_MAX_ROWS, DEFAULT_COLLECTION_MAX_BYTES)
+    }
+}
+
+fn current_collection_limits() -> SqlCollectionLimits {
+    CURRENT_COLLECTION_LIMITS
+        .try_with(|limits| *limits)
+        .unwrap_or_default()
+}
+
+fn record_batch_memory_bytes(batch: &RecordBatch) -> usize {
+    batch.columns().iter().fold(0_usize, |total, column| {
+        total.saturating_add(column.get_array_memory_size())
+    })
+}
+
+fn take_mongrel_query_error(error: DataFusionError) -> Option<MongrelQueryError> {
+    match error {
+        DataFusionError::External(error) => error
+            .downcast::<MongrelQueryError>()
+            .ok()
+            .map(|error| *error),
+        DataFusionError::Context(_, error) | DataFusionError::Diagnostic(_, error) => {
+            take_mongrel_query_error(*error)
+        }
+        DataFusionError::Collection(errors) => {
+            errors.into_iter().find_map(take_mongrel_query_error)
+        }
+        DataFusionError::Shared(error) => Arc::try_unwrap(error)
+            .ok()
+            .and_then(take_mongrel_query_error),
+        _ => None,
+    }
+}
+
+fn map_datafusion_error(error: DataFusionError) -> MongrelQueryError {
+    let message = error.to_string();
+    take_mongrel_query_error(error).unwrap_or(MongrelQueryError::DataFusion(message))
+}
+
+fn enforce_collected_limits(
+    batches: &[RecordBatch],
+    query: &RegisteredSqlQuery,
+    limits: SqlCollectionLimits,
+) -> Result<()> {
+    let mut rows = 0_usize;
+    let mut bytes = 0_usize;
+    for batch in batches {
+        query.checkpoint()?;
+        rows = rows.saturating_add(batch.num_rows());
+        bytes = bytes.saturating_add(record_batch_memory_bytes(batch));
+        if rows > limits.max_rows {
+            return Err(query.result_limit_error(format!(
+                "SQL collected row limit exceeded ({} > {})",
+                rows, limits.max_rows
+            )));
+        }
+        if bytes > limits.max_bytes {
+            return Err(query.result_limit_error(format!(
+                "SQL collected Arrow memory limit exceeded ({} > {} bytes)",
+                bytes, limits.max_bytes
+            )));
+        }
+    }
+    Ok(())
+}
+
+struct ResultCacheStore {
+    entries: BoundedLru<CacheKey, CachedResult>,
+    bytes: usize,
+    max_bytes: usize,
+}
+
+struct CachedResult {
+    batches: Arc<Vec<RecordBatch>>,
+    bytes: usize,
+}
+
+impl ResultCacheStore {
+    fn new(capacity: usize, max_bytes: usize) -> Self {
+        Self {
+            entries: BoundedLru::new(capacity),
+            bytes: 0,
+            max_bytes: max_bytes.max(1),
+        }
+    }
+
+    fn get(&mut self, key: &CacheKey) -> Option<&Arc<Vec<RecordBatch>>> {
+        self.entries.get(key).map(|entry| &entry.batches)
+    }
+
+    fn insert(&mut self, key: CacheKey, value: Arc<Vec<RecordBatch>>) {
+        let bytes = value.iter().fold(0_usize, |total, batch| {
+            total.saturating_add(record_batch_memory_bytes(batch))
+        });
+        if bytes > self.max_bytes {
+            return;
+        }
+        if let Some((old, _)) = self.entries.entries.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(old.bytes);
+        }
+        while !self.entries.entries.is_empty()
+            && (self.bytes.saturating_add(bytes) > self.max_bytes
+                || self.entries.entries.len() >= self.entries.capacity)
+        {
+            let Some(oldest) = self
+                .entries
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, last_used))| *last_used)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            if let Some((old, _)) = self.entries.entries.remove(&oldest) {
+                self.bytes = self.bytes.saturating_sub(old.bytes);
+            }
+        }
+        self.entries.insert(
+            key,
+            CachedResult {
+                batches: value,
+                bytes,
+            },
+        );
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.bytes = 0;
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.entries.entries.is_empty()
+    }
+}
 
 struct BoundedLru<K, V> {
     entries: HashMap<K, (V, u64)>,
@@ -1742,9 +2061,41 @@ impl ManagedQueryBatches {
         &self.query
     }
 
-    pub fn complete(mut self) {
+    pub fn complete(self) -> Result<()> {
+        self.try_complete()
+    }
+
+    pub fn try_complete(mut self) -> Result<()> {
+        let result = if let Some(guard) = self.guard.take() {
+            guard.try_complete()
+        } else {
+            Ok(())
+        };
+        self.permit.take();
+        result
+    }
+
+    pub fn fail_result_limit(mut self) {
         if let Some(guard) = self.guard.take() {
-            guard.complete();
+            guard.fail_result_limit();
+        }
+        self.permit.take();
+    }
+
+    pub fn fail_with_error(
+        mut self,
+        code: impl Into<String>,
+        category: QueryTerminalErrorCategory,
+    ) {
+        if let Some(guard) = self.guard.take() {
+            guard.fail_with_error(code, category);
+        }
+        self.permit.take();
+    }
+
+    pub fn fail_serialization(mut self) {
+        if let Some(guard) = self.guard.take() {
+            guard.fail_serialization();
         }
         self.permit.take();
     }
@@ -1776,37 +2127,123 @@ struct ManagedQueryStream {
     query: RegisteredSqlQuery,
     guard: Option<RegisteredQueryGuard>,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
-    deferred_completion: Option<Arc<std::sync::atomic::AtomicBool>>,
+    deferred_completion: Option<Arc<std::sync::atomic::AtomicU8>>,
 }
+
+const STREAM_COMPLETION_PENDING: u8 = 0;
+const STREAM_COMPLETION_SUCCEEDED: u8 = 1;
+const STREAM_COMPLETION_FAILED: u8 = 2;
+const STREAM_COMPLETION_FAILING: u8 = 3;
+const STREAM_COMPLETION_COMPLETING: u8 = 4;
 
 #[derive(Clone)]
 pub struct SqlStreamCompletion {
-    completed: Arc<std::sync::atomic::AtomicBool>,
+    state: Arc<std::sync::atomic::AtomicU8>,
+    query: RegisteredSqlQuery,
 }
 
 impl SqlStreamCompletion {
-    pub fn complete(&self) {
-        self.completed
-            .store(true, std::sync::atomic::Ordering::Release);
+    pub fn complete(&self) -> Result<()> {
+        self.try_complete()
+    }
+
+    pub fn try_complete(&self) -> Result<()> {
+        if self
+            .state
+            .compare_exchange(
+                STREAM_COMPLETION_PENDING,
+                STREAM_COMPLETION_COMPLETING,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return match self.state.load(std::sync::atomic::Ordering::Acquire) {
+                STREAM_COMPLETION_SUCCEEDED => Ok(()),
+                STREAM_COMPLETION_FAILED => Err(MongrelQueryError::InvalidQueryState(
+                    "SQL stream serialization already failed".into(),
+                )),
+                _ => Err(MongrelQueryError::InvalidQueryState(
+                    "SQL stream completion is already in progress".into(),
+                )),
+            };
+        }
+        let result = self.query.try_complete();
+        self.state.store(
+            if result.is_ok() {
+                STREAM_COMPLETION_SUCCEEDED
+            } else {
+                STREAM_COMPLETION_FAILED
+            },
+            std::sync::atomic::Ordering::Release,
+        );
+        result
+    }
+
+    pub fn fail_result_limit(&self) {
+        if self
+            .state
+            .compare_exchange(
+                STREAM_COMPLETION_PENDING,
+                STREAM_COMPLETION_FAILING,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.query.fail_result_limit();
+            self.state.store(
+                STREAM_COMPLETION_FAILED,
+                std::sync::atomic::Ordering::Release,
+            );
+        }
+    }
+
+    pub fn fail_serialization(&self) {
+        if self
+            .state
+            .compare_exchange(
+                STREAM_COMPLETION_PENDING,
+                STREAM_COMPLETION_FAILING,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.query.fail_serialization();
+            self.state.store(
+                STREAM_COMPLETION_FAILED,
+                std::sync::atomic::Ordering::Release,
+            );
+        }
     }
 }
 
-struct TransactionStatementGuard<'a> {
-    session: &'a MongrelSession,
-    savepoint: Option<usize>,
+struct TransactionStatementGuard {
+    transaction: Arc<parking_lot::Mutex<SqlTransactionState>>,
+    query: RegisteredSqlQuery,
+    checkpoint: Option<(commands::PendingSqlOpsCheckpoint, usize)>,
     completed: bool,
 }
 
-impl<'a> TransactionStatementGuard<'a> {
-    fn new(session: &'a MongrelSession, enabled: bool) -> Self {
-        let savepoint = enabled
-            .then(|| session.sql_txn.lock().as_ref().map(Vec::len))
-            .flatten();
-        Self {
-            session,
-            savepoint,
+impl TransactionStatementGuard {
+    fn new(session: &MongrelSession, query: &RegisteredSqlQuery, enabled: bool) -> Result<Self> {
+        let checkpoint = if enabled {
+            let mut transaction = session.transaction.lock();
+            let savepoint_len = transaction.savepoints.len();
+            match transaction.staged_ops.as_mut() {
+                Some(ops) => Some((ops.checkpoint()?, savepoint_len)),
+                None => None,
+            }
+        } else {
+            None
+        };
+        Ok(Self {
+            transaction: Arc::clone(&session.transaction),
+            query: query.clone(),
+            checkpoint,
             completed: false,
-        }
+        })
     }
 
     fn complete(mut self) {
@@ -1814,17 +2251,63 @@ impl<'a> TransactionStatementGuard<'a> {
     }
 }
 
-impl Drop for TransactionStatementGuard<'_> {
+impl Drop for TransactionStatementGuard {
     fn drop(&mut self) {
         if self.completed {
             return;
         }
-        if let Some(savepoint) = self.savepoint {
-            if let Some(ops) = self.session.sql_txn.lock().as_mut() {
-                ops.truncate(savepoint);
-                *self.session.sql_txn_aborted.lock() = true;
-            }
+        if self.query.status().durable_outcome.committed {
+            return;
         }
+        if let Some((checkpoint, savepoint_len)) = self.checkpoint {
+            let mut transaction = self.transaction.lock();
+            let restored = transaction
+                .staged_ops
+                .as_mut()
+                .is_some_and(|ops| ops.truncate(checkpoint).is_ok());
+            if restored {
+                transaction.savepoints.truncate(savepoint_len);
+            } else {
+                transaction.staged_ops = Some(commands::PendingSqlOps::default());
+                transaction.savepoints.clear();
+            }
+            transaction.aborted = true;
+        }
+    }
+}
+
+struct TransactionGuardedStream {
+    inner: MongrelRecordBatchStream,
+    schema: SchemaRef,
+    statement: Option<TransactionStatementGuard>,
+}
+
+impl futures::Stream for TransactionGuardedStream {
+    type Item = datafusion::common::Result<RecordBatch>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        match self.inner.as_mut().poll_next(context) {
+            std::task::Poll::Ready(None) => {
+                if let Some(statement) = self.statement.take() {
+                    statement.complete();
+                }
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Ready(Some(Err(error))) => {
+                self.statement.take();
+                std::task::Poll::Ready(Some(Err(error)))
+            }
+            poll => poll,
+        }
+    }
+}
+
+impl RecordBatchStream for TransactionGuardedStream {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
     }
 }
 
@@ -1840,6 +2323,7 @@ impl futures::Stream for ManagedQueryStream {
                 guard.fail();
             }
             self.permit.take();
+            self.inner = buffered_stream(Vec::new());
             return std::task::Poll::Ready(Some(Err(DataFusionError::External(Box::new(error)))));
         }
         match self.inner.as_mut().poll_next(context) {
@@ -1847,7 +2331,12 @@ impl futures::Stream for ManagedQueryStream {
                 self.query.complete_current_statement();
                 if self.deferred_completion.is_none() {
                     if let Some(guard) = self.guard.take() {
-                        guard.complete();
+                        if let Err(error) = guard.try_complete() {
+                            self.permit.take();
+                            return std::task::Poll::Ready(Some(Err(DataFusionError::External(
+                                Box::new(error),
+                            ))));
+                        }
                     }
                     self.permit.take();
                 }
@@ -1874,20 +2363,39 @@ impl datafusion::physical_plan::RecordBatchStream for ManagedQueryStream {
 impl Drop for ManagedQueryStream {
     fn drop(&mut self) {
         if self.guard.is_some() {
-            let completed = self
+            let mut completion_state = self
                 .deferred_completion
                 .as_ref()
-                .is_some_and(|completion| completion.load(std::sync::atomic::Ordering::Acquire));
-            if completed {
-                if let Some(guard) = self.guard.take() {
-                    guard.complete();
+                .map(|completion| completion.load(std::sync::atomic::Ordering::Acquire));
+            while matches!(
+                completion_state,
+                Some(STREAM_COMPLETION_FAILING | STREAM_COMPLETION_COMPLETING)
+            ) {
+                std::hint::spin_loop();
+                completion_state = self
+                    .deferred_completion
+                    .as_ref()
+                    .map(|completion| completion.load(std::sync::atomic::Ordering::Acquire));
+            }
+            match completion_state {
+                Some(STREAM_COMPLETION_SUCCEEDED) => {
+                    if let Some(guard) = self.guard.take() {
+                        let result = guard.complete();
+                        debug_assert!(result.is_ok());
+                    }
                 }
-            } else {
-                let _ = self
-                    .query
-                    .request_cancel(mongreldb_core::CancellationReason::ClientDisconnected);
-                if let Some(guard) = self.guard.take() {
-                    guard.fail();
+                Some(STREAM_COMPLETION_FAILED) => {
+                    if let Some(guard) = self.guard.take() {
+                        guard.fail();
+                    }
+                }
+                _ => {
+                    let _ = self
+                        .query
+                        .request_cancel(mongreldb_core::CancellationReason::ClientDisconnected);
+                    if let Some(guard) = self.guard.take() {
+                        guard.fail();
+                    }
                 }
             }
         }
@@ -1921,14 +2429,15 @@ impl MongrelSession {
             database: None,
             principal: None,
             principal_catalog_bound: false,
-            cache: parking_lot::Mutex::new(BoundedLru::new(SESSION_CACHE_MAX_ENTRIES)),
+            cache: parking_lot::Mutex::new(ResultCacheStore::new(
+                SESSION_CACHE_MAX_ENTRIES,
+                SESSION_CACHE_MAX_BYTES,
+            )),
             plan_cache: parking_lot::Mutex::new(BoundedLru::new(SESSION_CACHE_MAX_ENTRIES)),
             tables,
             views: parking_lot::Mutex::new(HashMap::new()),
             attached_databases: parking_lot::Mutex::new(HashMap::new()),
-            savepoints: parking_lot::Mutex::new(Vec::new()),
-            sql_txn: parking_lot::Mutex::new(None),
-            sql_txn_aborted: parking_lot::Mutex::new(false),
+            transaction: Arc::new(parking_lot::Mutex::new(SqlTransactionState::default())),
             sql_fn_state,
             external_modules,
             scored_runtime,
@@ -1967,7 +2476,8 @@ impl MongrelSession {
         database: Arc<Database>,
         modules: impl IntoIterator<Item = Arc<dyn ExternalTableModule>>,
     ) -> Result<Self> {
-        Self::open_with_external_modules_as(database, modules, None)
+        let principal = database.principal_snapshot();
+        Self::open_with_external_modules_as(database, modules, principal)
     }
 
     pub fn open_with_external_modules_as(
@@ -1981,7 +2491,15 @@ impl MongrelSession {
         let external_modules = Arc::new(ExternalModuleRegistry::default());
         let principal_catalog_bound = principal
             .as_ref()
-            .is_some_and(|principal| database.resolve_principal(&principal.username).is_some());
+            .is_some_and(|principal| principal_is_catalog_bound(&database, principal));
+        let principal = match principal {
+            Some(principal) if principal_catalog_bound => Some(
+                database
+                    .resolve_current_principal(&principal)
+                    .ok_or(mongreldb_core::MongrelError::AuthRequired)?,
+            ),
+            principal => principal,
+        };
         for module in modules {
             external_modules.register(module)?;
         }
@@ -2029,14 +2547,15 @@ impl MongrelSession {
             database: Some(database),
             principal,
             principal_catalog_bound,
-            cache: parking_lot::Mutex::new(BoundedLru::new(SESSION_CACHE_MAX_ENTRIES)),
+            cache: parking_lot::Mutex::new(ResultCacheStore::new(
+                SESSION_CACHE_MAX_ENTRIES,
+                SESSION_CACHE_MAX_BYTES,
+            )),
             plan_cache: parking_lot::Mutex::new(BoundedLru::new(SESSION_CACHE_MAX_ENTRIES)),
             tables,
             views: parking_lot::Mutex::new(HashMap::new()),
             attached_databases: parking_lot::Mutex::new(HashMap::new()),
-            savepoints: parking_lot::Mutex::new(Vec::new()),
-            sql_txn: parking_lot::Mutex::new(None),
-            sql_txn_aborted: parking_lot::Mutex::new(false),
+            transaction: Arc::new(parking_lot::Mutex::new(SqlTransactionState::default())),
             sql_fn_state,
             external_modules,
             scored_runtime,
@@ -2093,7 +2612,11 @@ impl MongrelSession {
 
     #[doc(hidden)]
     pub fn staged_sql_operation_count(&self) -> Option<usize> {
-        self.sql_txn.lock().as_ref().map(Vec::len)
+        self.transaction
+            .lock()
+            .staged_ops
+            .as_ref()
+            .map(|ops| ops.len())
     }
 
     pub fn fire_test_hook(&self, point: SqlTestHookPoint) {
@@ -2110,15 +2633,7 @@ impl MongrelSession {
     }
 
     pub fn principal(&self) -> Option<mongreldb_core::Principal> {
-        self.principal.as_ref().and_then(|principal| {
-            if self.principal_catalog_bound {
-                self.database
-                    .as_ref()
-                    .and_then(|database| database.resolve_principal(&principal.username))
-            } else {
-                Some(principal.clone())
-            }
-        })
+        self.principal.clone()
     }
 
     /// Set timeout, work, and fused-union limits for scored SQL functions.
@@ -2350,7 +2865,10 @@ impl MongrelSession {
         if stmts.len() != 1 {
             return Ok(None);
         }
-        let Statement::Query(ast_query) = stmts.into_iter().next().unwrap() else {
+        let Some(statement) = stmts.into_iter().next() else {
+            return Ok(None);
+        };
+        let Statement::Query(ast_query) = statement else {
             return Ok(None);
         };
         let Query { body, .. } = *ast_query;
@@ -2441,6 +2959,16 @@ impl MongrelSession {
             return Ok(None);
         }
         let snap = db.snapshot();
+        if db.ttl().is_some()
+            || db
+                .count_conditions(&conditions, snap)
+                .map_err(MongrelQueryError::Core)?
+                .map_or(true, |rows| {
+                    rows > current_collection_limits().max_rows as u64
+                })
+        {
+            return Ok(None);
+        }
 
         // Resolve projected column ids + Arrow field list (in projection order).
         let mut col_ids: Vec<u16> = Vec::new();
@@ -2476,7 +3004,7 @@ impl MongrelSession {
         }
 
         // Execute via the same native column path MongrelProvider::scan uses.
-        let cols = if !conditions.is_empty() {
+        let mut cols = if !conditions.is_empty() {
             match db.query_columns_native_cached_with_control(
                 &conditions,
                 Some(&col_ids),
@@ -2494,17 +3022,22 @@ impl MongrelSession {
                 .map_err(MongrelQueryError::Core)?
         };
         query.checkpoint()?;
+        let native_bytes = cols.iter().fold(0_u64, |total, (_, column)| {
+            total.saturating_add(column.approx_bytes())
+        });
+        if native_bytes > current_collection_limits().max_bytes as u64 {
+            return Ok(None);
+        }
         drop(db);
 
         // Order decoded columns into projection order, then build one batch.
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(col_ids.len());
         for cid in &col_ids {
             query.checkpoint()?;
-            let col = cols
-                .iter()
-                .find(|(id, _)| id == cid)
-                .map(|(_, c)| c.clone());
-            let Some(col) = col else { return Ok(None) };
+            let Some(position) = cols.iter().position(|(id, _)| id == cid) else {
+                return Ok(None);
+            };
+            let (_, col) = cols.swap_remove(position);
             let ty = schema
                 .columns
                 .iter()
@@ -2555,15 +3088,40 @@ impl MongrelSession {
         Ok(df)
     }
 
+    async fn dataframe_with_query(
+        &self,
+        sql: &str,
+        query: &RegisteredSqlQuery,
+    ) -> Result<datafusion::dataframe::DataFrame> {
+        query.checkpoint()?;
+        tokio::select! {
+            biased;
+            dataframe = self.dataframe(sql) => dataframe,
+            _ = query.control().cancelled() => match query.checkpoint() {
+                Err(error) => Err(error),
+                Ok(()) => Err(MongrelQueryError::InvalidQueryState(
+                    "query cancellation signal resolved without cancellation".into(),
+                )),
+            },
+        }
+    }
+
     fn prepare_as_of_query(&self, sql: &str) -> Result<Option<AsOfQuery>> {
-        static AS_OF_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        static AS_OF_RE: std::sync::OnceLock<std::result::Result<regex::Regex, regex::Error>> =
+            std::sync::OnceLock::new();
         static NEXT_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        let re = AS_OF_RE.get_or_init(|| {
-            regex::Regex::new(
+        let re = AS_OF_RE
+            .get_or_init(|| {
+                regex::Regex::new(
                 r#"(?i)\b(FROM|JOIN)\s+("[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s+AS\s+OF\s+EPOCH\s+([0-9]+)\b"#,
             )
-            .expect("valid AS OF regex")
-        });
+            })
+            .as_ref()
+            .map_err(|error| {
+                MongrelQueryError::InvalidQueryState(format!(
+                    "failed to initialize AS OF parser: {error}"
+                ))
+            })?;
         let mut captures = re.captures_iter(sql);
         let Some(capture) = captures.next() else {
             return Ok(None);
@@ -2576,13 +3134,27 @@ impl MongrelSession {
         let database = self.database.as_ref().ok_or_else(|| {
             MongrelQueryError::Schema("AS OF EPOCH requires a Database-backed session".into())
         })?;
-        let whole = capture.get(0).expect("whole AS OF match");
-        let keyword = capture.get(1).expect("FROM/JOIN capture").as_str();
-        let table_token = capture.get(2).expect("table capture").as_str();
+        let whole = capture.get(0).ok_or_else(|| {
+            MongrelQueryError::InvalidQueryState("AS OF parser omitted the whole match".into())
+        })?;
+        let keyword = capture
+            .get(1)
+            .ok_or_else(|| {
+                MongrelQueryError::InvalidQueryState("AS OF parser omitted FROM/JOIN".into())
+            })?
+            .as_str();
+        let table_token = capture
+            .get(2)
+            .ok_or_else(|| {
+                MongrelQueryError::InvalidQueryState("AS OF parser omitted the table".into())
+            })?
+            .as_str();
         let table_name = table_token.trim_matches('"');
         let epoch = capture
             .get(3)
-            .expect("epoch capture")
+            .ok_or_else(|| {
+                MongrelQueryError::InvalidQueryState("AS OF parser omitted the epoch".into())
+            })?
             .as_str()
             .parse::<u64>()
             .map_err(|error| MongrelQueryError::Schema(format!("AS OF epoch: {error}")))?;
@@ -2700,12 +3272,45 @@ impl MongrelSession {
         let physical_plan = tokio::select! {
             biased;
             plan = dataframe.create_physical_plan() => plan
-                .map_err(|error| MongrelQueryError::DataFusion(error.to_string()))?,
+                .map_err(map_datafusion_error)?,
             _ = query.control().cancelled() => return Err(query.checkpoint().unwrap_err()),
         };
         query.checkpoint()?;
-        execute_stream(physical_plan, task_context)
-            .map_err(|error| MongrelQueryError::DataFusion(error.to_string()))
+        execute_stream(physical_plan, task_context).map_err(map_datafusion_error)
+    }
+
+    /// Plan and execute a SELECT used by a mutating command under the command's
+    /// existing registered-query control. This avoids a nested registry entry
+    /// while retaining view, AS OF, external-module, and catalog handling.
+    pub(crate) async fn execute_command_source_stream(
+        &self,
+        sql: &str,
+        query: &RegisteredSqlQuery,
+    ) -> Result<MongrelRecordBatchStream> {
+        query.checkpoint()?;
+        if let Some(as_of_query) = self.prepare_as_of_query(sql)? {
+            return self.run_as_of_stream(as_of_query, query).await;
+        }
+
+        let resolved = self.resolve_view_sql(sql);
+        let resolved = self.rewrite_external_module_compat_sql(&resolved);
+        let resolved = rewrite_compat_function_calls(&resolved);
+        let effective_sql = normalize_sql(&resolved);
+        let sql = effective_sql.as_str();
+
+        if let Some(batches) = self.try_catalog_introspection(sql)? {
+            return Ok(buffered_stream(batches));
+        }
+
+        let external_module_scan = self.query_references_external_module(sql);
+        let dataframe = self.dataframe_with_query(sql, query).await?;
+        let stream = self.execute_dataframe_stream(dataframe, query).await?;
+        if external_module_scan {
+            mongreldb_core::trace::QueryTrace::record(|trace| {
+                trace.scan_mode = mongreldb_core::trace::ScanMode::ExternalModule;
+            });
+        }
+        Ok(stream)
     }
 
     async fn collect_dataframe(
@@ -2717,6 +3322,9 @@ impl MongrelSession {
 
         let mut stream = self.execute_dataframe_stream(dataframe, query).await?;
         let mut batches = Vec::new();
+        let limits = current_collection_limits();
+        let mut rows = 0_usize;
+        let mut bytes = 0_usize;
         loop {
             let item = tokio::select! {
                 biased;
@@ -2726,7 +3334,22 @@ impl MongrelSession {
             let Some(batch) = item else {
                 break;
             };
-            batches.push(batch.map_err(|error| MongrelQueryError::DataFusion(error.to_string()))?);
+            let batch = batch.map_err(map_datafusion_error)?;
+            rows = rows.saturating_add(batch.num_rows());
+            bytes = bytes.saturating_add(record_batch_memory_bytes(&batch));
+            if rows > limits.max_rows {
+                return Err(query.result_limit_error(format!(
+                    "SQL collected row limit exceeded ({} > {})",
+                    rows, limits.max_rows
+                )));
+            }
+            if bytes > limits.max_bytes {
+                return Err(query.result_limit_error(format!(
+                    "SQL collected Arrow memory limit exceeded ({} > {} bytes)",
+                    bytes, limits.max_bytes
+                )));
+            }
+            batches.push(batch);
             query.checkpoint()?;
         }
         Ok(batches)
@@ -2803,10 +3426,12 @@ impl MongrelSession {
         query: RegisteredSqlQuery,
     ) -> Result<(MongrelRecordBatchStream, SqlStreamCompletion)> {
         let (stream, completion) = self.run_stream_with_query_mode(sql, query, true).await?;
-        Ok((
-            stream,
-            completion.expect("deferred stream completion is present"),
-        ))
+        let completion = completion.ok_or_else(|| {
+            MongrelQueryError::InvalidQueryState(
+                "deferred stream completion was not created".into(),
+            )
+        })?;
+        Ok((stream, completion))
     }
 
     async fn run_stream_with_query_mode(
@@ -2848,17 +3473,26 @@ impl MongrelSession {
                 return Err(error);
             }
         };
-        query.transition(SqlQueryPhase::Executing, SqlQueryPhase::Streaming)?;
-        let deferred_completion =
-            defer_completion.then(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        if query.phase() == SqlQueryPhase::Executing {
+            query.transition(SqlQueryPhase::Executing, SqlQueryPhase::Streaming)?;
+        } else if query.phase() != SqlQueryPhase::CommitCritical {
+            return Err(MongrelQueryError::InvalidQueryState(format!(
+                "query {} cannot stream from {:?}",
+                query.id(),
+                query.phase()
+            )));
+        }
+        let deferred_completion = defer_completion
+            .then(|| Arc::new(std::sync::atomic::AtomicU8::new(STREAM_COMPLETION_PENDING)));
         if defer_completion {
             query.begin_serialization()?;
         }
         let schema = stream.schema();
         let completion = deferred_completion
             .as_ref()
-            .map(|completed| SqlStreamCompletion {
-                completed: Arc::clone(completed),
+            .map(|state| SqlStreamCompletion {
+                state: Arc::clone(state),
+                query: query.clone(),
             });
         let stream = Box::pin(ManagedQueryStream {
             inner: stream,
@@ -2887,9 +3521,54 @@ impl MongrelSession {
         sql: &str,
         query: &RegisteredSqlQuery,
     ) -> Result<MongrelRecordBatchStream> {
+        let trimmed = sql.trim();
+        let multiple_statements = trimmed.contains(';')
+            && !is_trigger_body(trimmed)
+            && split_sql_statements(trimmed)
+                .iter()
+                .filter(|statement| !statement.trim().is_empty())
+                .count()
+                > 1;
+        let rollback = commands::rollback_kind(sql);
+        let (transaction_open, transaction_aborted) = {
+            let transaction = self.transaction.lock();
+            (transaction.staged_ops.is_some(), transaction.aborted)
+        };
+        if !multiple_statements && transaction_open && transaction_aborted && rollback.is_none() {
+            return Err(MongrelQueryError::TransactionAborted);
+        }
+        let statement = TransactionStatementGuard::new(
+            self,
+            query,
+            !multiple_statements
+                && transaction_open
+                && rollback != Some(commands::RollbackKind::Full),
+        )?;
+        self.fire_test_hook(SqlTestHookPoint::BeforeStatementExecution);
+        let (inner, buffered) = self.run_stream_internal_body(sql, query).await?;
+        if buffered {
+            statement.complete();
+            return Ok(inner);
+        }
+        let schema = inner.schema();
+        Ok(Box::pin(TransactionGuardedStream {
+            inner,
+            schema,
+            statement: Some(statement),
+        }))
+    }
+
+    async fn run_stream_internal_body(
+        &self,
+        sql: &str,
+        query: &RegisteredSqlQuery,
+    ) -> Result<(MongrelRecordBatchStream, bool)> {
         query.checkpoint()?;
         if strip_explain_query_plan(sql).is_some() {
-            return self.run_internal(sql, query).await.map(buffered_stream);
+            return self
+                .run_internal(sql, query)
+                .await
+                .map(|batches| (buffered_stream(batches), true));
         }
 
         let trimmed = sql.trim();
@@ -2901,28 +3580,32 @@ impl MongrelSession {
                 .filter(|stmt| !stmt.trim().is_empty() && stmt.trim() != ";")
                 .collect();
             if non_empty.is_empty() {
-                return Ok(buffered_stream(Vec::new()));
+                return Ok((buffered_stream(Vec::new()), true));
             }
             if stmts.len() > 1 {
                 for (index, stmt) in non_empty[..non_empty.len() - 1].iter().enumerate() {
                     query.begin_statement(index);
-                    query.checkpoint()?;
                     Box::pin(self.run_internal(stmt, query)).await?;
                     query.complete_statement(index);
                 }
                 query.begin_statement(non_empty.len() - 1);
-                return Box::pin(self.run_stream_internal(non_empty[non_empty.len() - 1], query))
-                    .await;
+                let stream =
+                    Box::pin(self.run_stream_internal(non_empty[non_empty.len() - 1], query))
+                        .await?;
+                return Ok((stream, true));
             }
         }
 
         query.checkpoint()?;
         if let Some(batches) = commands::try_run_command(self, sql, query).await? {
-            return Ok(buffered_stream(batches));
+            return Ok((buffered_stream(batches), true));
         }
 
         if let Some(as_of_query) = self.prepare_as_of_query(sql)? {
-            return self.run_as_of_stream(as_of_query, query).await;
+            return self
+                .run_as_of_stream(as_of_query, query)
+                .await
+                .map(|stream| (stream, false));
         }
 
         let resolved = self.resolve_view_sql(sql);
@@ -2932,7 +3615,7 @@ impl MongrelSession {
         let sql = effective_sql.as_str();
 
         if let Some(batches) = self.try_catalog_introspection(sql)? {
-            return Ok(buffered_stream(batches));
+            return Ok((buffered_stream(batches), true));
         }
 
         let plan_start = std::time::Instant::now();
@@ -2948,7 +3631,7 @@ impl MongrelSession {
                 trace.scan_mode = mongreldb_core::trace::ScanMode::ExternalModule;
             });
         }
-        Ok(stream)
+        Ok((stream, false))
     }
 
     pub async fn run_with_options(
@@ -2982,23 +3665,30 @@ impl MongrelSession {
         self.fire_test_hook(SqlTestHookPoint::Planning);
         query.transition(SqlQueryPhase::Planning, SqlQueryPhase::Executing)?;
         query.begin_statement(0);
-        let result = CURRENT_SQL_QUERY
-            .scope(query.clone(), async {
-                tokio::select! {
-                    biased;
-                    result = self.run_internal(sql, &query) => result,
-                    _ = query.control().cancelled() => Err(query.checkpoint().unwrap_err()),
-                }
-            })
+        let result = CURRENT_COLLECTION_LIMITS
+            .scope(
+                SqlCollectionLimits::default(),
+                CURRENT_SQL_QUERY.scope(query.clone(), async {
+                    tokio::select! {
+                        biased;
+                        result = self.run_internal(sql, &query) => result,
+                        _ = query.control().cancelled() => Err(query.checkpoint().unwrap_err()),
+                    }
+                }),
+            )
             .await;
         match result {
             Ok(batches) => {
                 query.complete_current_statement();
-                guard.complete();
+                guard.try_complete()?;
                 Ok(batches)
             }
             Err(error) => {
-                guard.fail();
+                if matches!(error, MongrelQueryError::ResultLimitExceeded { .. }) {
+                    guard.fail_result_limit();
+                } else {
+                    guard.fail();
+                }
                 Err(error)
             }
         }
@@ -3010,6 +3700,21 @@ impl MongrelSession {
         &self,
         sql: &str,
         query: RegisteredSqlQuery,
+    ) -> Result<ManagedQueryBatches> {
+        self.run_with_query_for_serialization_with_limits(
+            sql,
+            query,
+            SqlCollectionLimits::default(),
+        )
+        .await
+    }
+
+    /// Execute and collect SQL with caller-provided pre-serialization limits.
+    pub async fn run_with_query_for_serialization_with_limits(
+        &self,
+        sql: &str,
+        query: RegisteredSqlQuery,
+        limits: SqlCollectionLimits,
     ) -> Result<ManagedQueryBatches> {
         query.set_sql_metadata(sql);
         let guard = RegisteredQueryGuard::new(query.clone());
@@ -3028,14 +3733,17 @@ impl MongrelSession {
         self.fire_test_hook(SqlTestHookPoint::Planning);
         query.transition(SqlQueryPhase::Planning, SqlQueryPhase::Executing)?;
         query.begin_statement(0);
-        let result = CURRENT_SQL_QUERY
-            .scope(query.clone(), async {
-                tokio::select! {
-                    biased;
-                    result = self.run_internal(sql, &query) => result,
-                    _ = query.control().cancelled() => Err(query.checkpoint().unwrap_err()),
-                }
-            })
+        let result = CURRENT_COLLECTION_LIMITS
+            .scope(
+                limits,
+                CURRENT_SQL_QUERY.scope(query.clone(), async {
+                    tokio::select! {
+                        biased;
+                        result = self.run_internal(sql, &query) => result,
+                        _ = query.control().cancelled() => Err(query.checkpoint().unwrap_err()),
+                    }
+                }),
+            )
             .await;
         match result {
             Ok(batches) => {
@@ -3049,7 +3757,11 @@ impl MongrelSession {
                 })
             }
             Err(error) => {
-                guard.fail();
+                if matches!(error, MongrelQueryError::ResultLimitExceeded { .. }) {
+                    guard.fail_result_limit();
+                } else {
+                    guard.fail();
+                }
                 Err(error)
             }
         }
@@ -3071,14 +3783,34 @@ impl MongrelSession {
         sql: &str,
         query: &RegisteredSqlQuery,
     ) -> Result<Vec<RecordBatch>> {
-        let normalized = sql.trim().trim_end_matches(';').trim().to_ascii_lowercase();
-        let full_rollback = matches!(normalized.as_str(), "rollback" | "rollback transaction");
-        let transaction_open = self.sql_txn.lock().is_some();
-        if transaction_open && *self.sql_txn_aborted.lock() && !full_rollback {
+        let trimmed = sql.trim();
+        let multiple_statements = trimmed.contains(';')
+            && !is_trigger_body(trimmed)
+            && split_sql_statements(trimmed)
+                .iter()
+                .filter(|statement| !statement.trim().is_empty())
+                .count()
+                > 1;
+        let rollback = commands::rollback_kind(sql);
+        let (transaction_open, transaction_aborted) = {
+            let transaction = self.transaction.lock();
+            (transaction.staged_ops.is_some(), transaction.aborted)
+        };
+        if !multiple_statements && transaction_open && transaction_aborted && rollback.is_none() {
             return Err(MongrelQueryError::TransactionAborted);
         }
-        let statement = TransactionStatementGuard::new(self, transaction_open && !full_rollback);
+        let statement = TransactionStatementGuard::new(
+            self,
+            query,
+            !multiple_statements
+                && transaction_open
+                && rollback != Some(commands::RollbackKind::Full),
+        )?;
+        self.fire_test_hook(SqlTestHookPoint::BeforeStatementExecution);
         let result = Box::pin(self.run_internal_body(sql, query)).await;
+        if let Ok(batches) = result.as_ref() {
+            enforce_collected_limits(batches, query, current_collection_limits())?;
+        }
         if result.is_ok() {
             statement.complete();
         }
@@ -3120,7 +3852,6 @@ impl MongrelSession {
                         continue;
                     }
                     query.begin_statement(statement_index);
-                    query.checkpoint()?;
                     last = Box::pin(self.run_internal(stmt, query)).await?;
                     query.complete_statement(statement_index);
                     statement_index += 1;
@@ -3152,7 +3883,6 @@ impl MongrelSession {
                         continue;
                     }
                     query.begin_statement(statement_index);
-                    query.checkpoint()?;
                     last = Box::pin(self.run_internal(stmt, query)).await?;
                     query.complete_statement(statement_index);
                     statement_index += 1;
@@ -3701,7 +4431,9 @@ impl MongrelSession {
     }
 
     fn combined_epoch(&self) -> u64 {
-        let primary = self.db.as_ref().expect("no primary table");
+        let Some(primary) = self.db.as_ref() else {
+            return 0;
+        };
         let mut combined = primary.lock().snapshot().epoch.0;
         let tables = self.tables.lock();
         for arc in tables.values() {
@@ -3746,7 +4478,7 @@ impl MongrelSession {
             return Ok(None);
         }
         let tables = self.tables.lock();
-        fk_join::try_fk_join(&tables, plan, Some(query))
+        fk_join::try_fk_join(&tables, plan, Some(query), current_collection_limits())
     }
 
     pub fn context(&self) -> &SessionContext {
@@ -4126,14 +4858,12 @@ fn fts_match_bindings(
         }
         let mut table_name = table.normalized.clone();
         let mut table_ref = table.raw.clone();
-        if tokens
-            .get(table_idx + 1)
-            .is_some_and(|token| token.kind == SqlCompatTokenKind::Dot)
-            && tokens
-                .get(table_idx + 2)
-                .is_some_and(|token| token.kind == SqlCompatTokenKind::Ident)
-        {
-            let qualified = tokens.get(table_idx + 2).unwrap();
+        if let Some(qualified) = tokens.get(table_idx + 2).filter(|qualified| {
+            tokens
+                .get(table_idx + 1)
+                .is_some_and(|token| token.kind == SqlCompatTokenKind::Dot)
+                && qualified.kind == SqlCompatTokenKind::Ident
+        }) {
             table_name = qualified.normalized.clone();
             table_ref = sql[table.start..qualified.end].to_string();
             table_idx += 2;
@@ -4696,10 +5426,11 @@ fn is_ident_byte(b: u8) -> bool {
 
 /// Canonicalize a SQL string for caching/parsing: collapse runs of ASCII
 /// whitespace outside of literals/comments to a single space and trim. String
-/// literals (`'...'`, with `''` escapes), quoted identifiers (`"..."`), escape
-/// strings (`E'...'`), line comments (`--`), block comments (`/* */`), and
-/// dollar-quoting (`$tag$...$tag$`) are passed through verbatim so their
-/// internal whitespace (which IS semantically significant) is never altered.
+/// literals (`'...'`, with `''` escapes), quoted identifiers (`"..."`,
+/// `` `...` ``, and `[...]`), escape strings (`E'...'`), line comments (`--`),
+/// block comments (`/* */`), and dollar-quoting (`$tag$...$tag$`) are passed
+/// through verbatim so their internal whitespace (which IS semantically
+/// significant) is never altered.
 /// SQL parsing is whitespace-insensitive outside literals, so the normalized
 /// form parses identically while making `SELECT  *  FROM t`, `SELECT * FROM t`,
 /// and `\n  SELECT * FROM t  \n` share one cache key.
@@ -4733,6 +5464,7 @@ fn normalize_sql(sql: &str) -> String {
         if c == b'/' && i + 1 < n && b[i + 1] == b'*' {
             // Block comment: skip to the matching close `*/`, honoring nesting
             // (Postgres/DataFusion allow `/* /* */ */`).
+            let comment_start = i;
             i += 2;
             let mut depth = 1usize;
             while i + 1 < n && depth > 0 {
@@ -4745,6 +5477,16 @@ fn normalize_sql(sql: &str) -> String {
                 } else {
                     i += 1;
                 }
+            }
+            if depth != 0 {
+                // Preserve malformed input. Dropping an unterminated comment
+                // could turn a parser error into different valid SQL and make
+                // the normalized cache key unsafe.
+                if want_space && !out.is_empty() {
+                    out.push(b' ');
+                }
+                out.extend_from_slice(&b[comment_start..]);
+                break;
             }
             want_space = !out.is_empty();
             continue;
@@ -4759,17 +5501,27 @@ fn normalize_sql(sql: &str) -> String {
             b'E' | b'e' if i + 1 < n && b[i + 1] == b'\'' => {
                 out.push(c);
                 i += 1;
-                i = copy_quoted(&mut out, b, i, n, b'\'');
+                i = copy_quoted(&mut out, b, i, n, b'\'', true);
                 continue;
             }
             // Single-quoted string literal ('...' with '' escape).
             b'\'' => {
-                i = copy_quoted(&mut out, b, i, n, b'\'');
+                i = copy_quoted(&mut out, b, i, n, b'\'', false);
                 continue;
             }
             // Double-quoted identifier ("..." with "" escape).
             b'"' => {
-                i = copy_quoted(&mut out, b, i, n, b'"');
+                i = copy_quoted(&mut out, b, i, n, b'"', false);
+                continue;
+            }
+            // MySQL-style quoted identifier (`...` with `` escape).
+            b'`' => {
+                i = copy_quoted(&mut out, b, i, n, b'`', false);
+                continue;
+            }
+            // SQL Server-style quoted identifier ([...] with ]] escape).
+            b'[' => {
+                i = copy_quoted(&mut out, b, i, n, b']', false);
                 continue;
             }
             // Dollar-quoting: $tag$ ... $tag$ (tag optional/empty).
@@ -4792,15 +5544,28 @@ fn normalize_sql(sql: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|_| sql.to_string())
 }
 
-/// Copy a quote-delimited span starting at `start` (the opening quote byte is
-/// `delim`), including the opening and closing delimiters and any doubled
-/// escapes, verbatim into `out`. Returns the index past the closing quote.
-fn copy_quoted(out: &mut Vec<u8>, b: &[u8], start: usize, n: usize, delim: u8) -> usize {
+/// Copy a quote-delimited span starting at `start`, including the opening and
+/// closing delimiters and any doubled escapes, verbatim into `out`. `delim` is
+/// the closing byte, which differs from the opening byte for `[name]`.
+/// Returns the index past the closing quote.
+fn copy_quoted(
+    out: &mut Vec<u8>,
+    b: &[u8],
+    start: usize,
+    n: usize,
+    delim: u8,
+    backslash_escapes: bool,
+) -> usize {
     out.push(b[start]);
     let mut i = start + 1;
     while i < n {
         let c = b[i];
         out.push(c);
+        if backslash_escapes && c == b'\\' && i + 1 < n {
+            out.push(b[i + 1]);
+            i += 2;
+            continue;
+        }
         if c == delim {
             // Doubled delimiter (e.g. '' or "") is an escape, not the end.
             if i + 1 < n && b[i + 1] == delim {
@@ -4847,8 +5612,9 @@ fn copy_dollar_quoted(out: &mut Vec<u8>, b: &[u8], start: usize, n: usize) -> (u
         out.push(b[k]);
         k += 1;
     }
-    // Unterminated: copy the remainder verbatim (don't corrupt).
-    out.extend_from_slice(&b[close_end..n]);
+    // Unterminated: copy only the unscanned tail. Earlier bytes were appended
+    // while searching for the delimiter.
+    out.extend_from_slice(&b[k..n]);
     (n, true)
 }
 
@@ -5196,6 +5962,83 @@ mod tests {
         assert_eq!(cache.get("c"), Some(&3));
     }
 
+    #[test]
+    fn result_cache_skips_entry_over_byte_budget() {
+        let batch = RecordBatch::try_from_iter(vec![(
+            "value",
+            Arc::new(Int64Array::from(vec![1_i64])) as ArrayRef,
+        )])
+        .unwrap();
+        let mut cache = ResultCacheStore::new(2, 1);
+        cache.insert(("SELECT 1".into(), 0), Arc::new(vec![batch]));
+        assert!(cache.is_empty());
+        assert_eq!(cache.bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn collection_limit_records_typed_terminal_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = Arc::new(Database::create(dir.path()).unwrap());
+        let session = MongrelSession::open(database).unwrap();
+        let query = session.register_query(SqlQueryOptions::default()).unwrap();
+        let query_id = query.id();
+        let error = match session
+            .run_with_query_for_serialization_with_limits(
+                "SELECT 1 UNION ALL SELECT 2",
+                query,
+                SqlCollectionLimits::new(1, 1024),
+            )
+            .await
+        {
+            Ok(_) => panic!("expected result limit failure"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            MongrelQueryError::ResultLimitExceeded {
+                committed: false,
+                ..
+            }
+        ));
+        let status = session.query_registry().status(query_id).unwrap();
+        assert_eq!(
+            status.terminal_error.unwrap().category,
+            QueryTerminalErrorCategory::ResultLimit
+        );
+    }
+
+    #[tokio::test]
+    async fn collection_limit_error_keeps_prior_statement_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = Arc::new(Database::create(dir.path()).unwrap());
+        let session = MongrelSession::open(database).unwrap();
+        let query = session.register_query(SqlQueryOptions::default()).unwrap();
+        let error = match session
+            .run_with_query_for_serialization_with_limits(
+                "CREATE TABLE committed_first (id BIGINT PRIMARY KEY); \
+                 SELECT 1 UNION ALL SELECT 2",
+                query,
+                SqlCollectionLimits::new(1, 1024),
+            )
+            .await
+        {
+            Ok(_) => panic!("expected result limit failure"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            MongrelQueryError::ResultLimitExceeded {
+                committed: true,
+                committed_statements: 1,
+                last_commit_epoch: Some(_),
+                first_commit_statement_index: Some(0),
+                last_commit_statement_index: Some(0),
+                statement_index: 1,
+                ..
+            }
+        ));
+    }
+
     #[tokio::test]
     async fn streaming_query_bypasses_result_cache() {
         use futures::StreamExt;
@@ -5207,7 +6050,7 @@ mod tests {
         let batch = stream.next().await.unwrap().unwrap();
         assert_eq!(batch.num_rows(), 1);
         assert!(stream.next().await.is_none());
-        assert!(session.cache.lock().entries.is_empty());
+        assert!(session.cache.lock().is_empty());
     }
 
     #[tokio::test]
@@ -5223,7 +6066,7 @@ mod tests {
             .await
             .unwrap();
         session.run("SELECT * FROM events").await.unwrap();
-        assert!(session.cache.lock().entries.is_empty());
+        assert!(session.cache.lock().is_empty());
     }
 
     #[test]
@@ -5305,6 +6148,73 @@ mod tests {
             normalize_sql("SELECT /* outer /* inner */ still outer */ 1 FROM t"),
             "SELECT 1 FROM t"
         );
+        assert_eq!(
+            normalize_sql("SELECT  1  /* unterminated"),
+            "SELECT 1 /* unterminated"
+        );
+        assert_eq!(normalize_sql("SELECT 1/*"), "SELECT 1/*");
+    }
+
+    #[test]
+    fn protocol_sql_fingerprint_is_literal_aware() {
+        assert_eq!(
+            normalized_sql_fingerprint(" INSERT  INTO t VALUES (1) -- retry\n"),
+            normalized_sql_fingerprint("INSERT INTO t VALUES (1)")
+        );
+        assert_ne!(
+            normalized_sql_fingerprint("INSERT INTO t VALUES ('a  b')"),
+            normalized_sql_fingerprint("INSERT INTO t VALUES ('a b')")
+        );
+    }
+
+    #[test]
+    fn idempotency_class_only_allows_durable_single_writes() {
+        assert_eq!(
+            classify_sql_idempotency("SELECT 1"),
+            SqlIdempotencyClass::ReadOnly
+        );
+        for sql in [
+            "INSERT INTO t VALUES (1)",
+            "UPDATE t SET value = 2",
+            "DELETE FROM t",
+            "TRUNCATE TABLE t",
+            "CREATE TABLE t (id BIGINT)",
+            "ALTER TABLE t ADD COLUMN value BIGINT",
+            "CREATE INDEX t_id ON t (id)",
+            "CREATE MATERIALIZED VIEW visible_t AS SELECT * FROM t",
+            "DROP TABLE t",
+            "DROP MATERIALIZED VIEW visible_t",
+        ] {
+            assert_eq!(
+                classify_sql_idempotency(sql),
+                SqlIdempotencyClass::SingleWrite,
+                "{sql}"
+            );
+        }
+        assert_eq!(
+            classify_sql_idempotency("INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)"),
+            SqlIdempotencyClass::Unsupported
+        );
+        for sql in [
+            "BEGIN",
+            "NOTIFY jobs, 'ready'",
+            "LISTEN jobs",
+            "ATTACH DATABASE 'other.db' AS other",
+            "DETACH DATABASE other",
+            "SHOW TABLES",
+            "EXPLAIN SELECT 1",
+            "PRAGMA table_info(t)",
+            "CREATE VIEW visible_t AS SELECT * FROM t",
+            "DROP VIEW visible_t",
+            "DROP TABLE one, two",
+            "DROP INDEX one, two",
+        ] {
+            assert_eq!(
+                classify_sql_idempotency(sql),
+                SqlIdempotencyClass::Unsupported,
+                "{sql}"
+            );
+        }
     }
 
     #[test]
@@ -5312,6 +6222,26 @@ mod tests {
         assert_eq!(
             normalize_sql("SELECT E'line\\nbreak' FROM t"),
             "SELECT E'line\\nbreak' FROM t"
+        );
+        assert_eq!(
+            normalize_sql("SELECT E'it\\\'s /* data */' FROM t"),
+            "SELECT E'it\\\'s /* data */' FROM t"
+        );
+    }
+
+    #[test]
+    fn normalize_quoted_identifiers_preserves_comment_markers() {
+        for sql in [
+            "SELECT `a/* data */b` FROM t",
+            "SELECT [a-- data b] FROM t",
+            "SELECT `a``b` FROM t",
+            "SELECT [a]]b] FROM t",
+        ] {
+            assert_eq!(normalize_sql(sql), sql);
+        }
+        assert_eq!(
+            normalize_sql("SELECT $tag$unterminated"),
+            "SELECT $tag$unterminated"
         );
     }
 

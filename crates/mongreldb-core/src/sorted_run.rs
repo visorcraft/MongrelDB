@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub const RUN_MAGIC: [u8; 8] = *b"MONGRRUN";
@@ -33,6 +33,7 @@ pub const RUN_FORMAT_VERSION: u16 = 1;
 /// shorter v1 header serialization) — recreate them; no released data exists.
 pub const RUN_HEADER_VERSION: u16 = 2;
 pub const RUN_HEADER_PAD: usize = 256;
+const MAX_RUN_PAGE_BYTES: u64 = 64 * 1024 * 1024 + 32;
 
 /// Reserved `(column_id, page_seq)` nonce coordinates for the encrypted
 /// page-stats envelope (see [`RunHeader::encrypted_stats_offset`]). Pages per
@@ -262,6 +263,31 @@ pub fn write_run_with(
     }
 }
 
+fn write_run_with_file(
+    mut file: File,
+    spec: &RunSpec,
+    kek: Option<&Kek>,
+    indexable_columns: &[(u16, u8)],
+    index_trailer: Option<&[u8]>,
+) -> Result<RunHeader> {
+    let enc = match kek {
+        Some(key) => Some(setup_run_encryption(key, indexable_columns)?),
+        None => None,
+    };
+    match write_run_mmap_file(&file, spec, enc.as_ref(), index_trailer) {
+        Ok(header) => Ok(header),
+        Err(error) if is_mmap_unavailable(&error) => {
+            file.set_len(0)?;
+            file.seek(SeekFrom::Start(0))?;
+            let (bytes, header) = encode_run_vec(spec, enc, index_trailer)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            Ok(header)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// `true` when `write_run_mmap` could not create the mapping (the only case
 /// where we fall back to the in-buffer writer). Any other error — encryption,
 /// serialization, a genuine write failure — must surface.
@@ -295,19 +321,29 @@ fn write_run_mmap(
     enc: Option<&RunEncryption>,
     index_trailer: Option<&[u8]>,
 ) -> Result<RunHeader> {
+    let file = OpenOptions::new().create_new(true).write(true).open(path)?;
+    let result = write_run_mmap_file(&file, spec, enc, index_trailer);
+    if result.as_ref().is_err_and(is_mmap_unavailable) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+    }
+    result
+}
+
+fn write_run_mmap_file(
+    file: &File,
+    spec: &RunSpec,
+    enc: Option<&RunEncryption>,
+    index_trailer: Option<&[u8]>,
+) -> Result<RunHeader> {
     let plan = plan_run(spec, enc, index_trailer)?;
-    let file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(path)?;
     file.set_len(plan.total as u64)?;
-    let mut mmap = match unsafe { memmap2::MmapMut::map_mut(&file) } {
+    let mut mmap = match unsafe { memmap2::MmapMut::map_mut(file) } {
         Ok(m) => m,
         Err(e) => {
             return Err(MongrelError::InvalidArgument(format!(
                 "__mmap_unavailable__: {e}"
-            )))
+            )));
         }
     };
     let header = place_run(spec, enc, index_trailer, &plan, &mut mmap[..])?;
@@ -621,6 +657,18 @@ fn write_run_vec(
     enc: Option<RunEncryption>,
     index_trailer: Option<&[u8]>,
 ) -> Result<RunHeader> {
+    let (buf, header) = encode_run_vec(spec, enc, index_trailer)?;
+    let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
+    file.write_all(&buf)?;
+    file.sync_all()?;
+    Ok(header)
+}
+
+fn encode_run_vec(
+    spec: &RunSpec,
+    enc: Option<RunEncryption>,
+    index_trailer: Option<&[u8]>,
+) -> Result<(Vec<u8>, RunHeader)> {
     let mut buf: Vec<u8> = vec![0; RUN_HEADER_PAD]; // reserve header region
     let mut content_hasher = Sha256::new();
     let mut dir: Vec<ColumnPageHeader> = Vec::with_capacity(spec.columns.len());
@@ -780,14 +828,7 @@ fn write_run_vec(
         buf.write_all(&tag)?;
     }
 
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(path)?;
-    file.write_all(&buf)?;
-    file.sync_all()?;
-    Ok(header)
+    Ok((buf, header))
 }
 
 fn page_nonce(nonce_prefix: [u8; 12], column_id: u16, page_seq: u32) -> [u8; 12] {
@@ -804,14 +845,20 @@ fn page_nonce(nonce_prefix: [u8; 12], column_id: u16, page_seq: u32) -> [u8; 12]
 /// envelope itself is AES-256-GCM-authenticated, so tampering fails loudly —
 /// the same posture as a tampered page payload.
 fn overlay_encrypted_stats(
-    path: &Path,
+    file: &mut File,
     header: &RunHeader,
     cipher: &dyn Cipher,
     nonce_prefix: [u8; 12],
     dir: &mut [ColumnPageHeader],
 ) -> Result<()> {
-    let mut file = File::open(path)?;
     file.seek(SeekFrom::Start(header.encrypted_stats_offset))?;
+    const MAX_ENCRYPTED_STATS_BYTES: u64 = 64 * 1024 * 1024;
+    if header.encrypted_stats_len > MAX_ENCRYPTED_STATS_BYTES {
+        return Err(MongrelError::InvalidArgument(format!(
+            "encrypted run stats length {} exceeds {MAX_ENCRYPTED_STATS_BYTES}",
+            header.encrypted_stats_len
+        )));
+    }
     let mut ct = vec![0u8; header.encrypted_stats_len as usize];
     file.read_exact(&mut ct)?;
     let nonce = page_nonce(nonce_prefix, ENC_STATS_NONCE_COLUMN, ENC_STATS_NONCE_SEQ);
@@ -887,19 +934,14 @@ fn decrypt_or_passthrough(
 /// regress later in the same process lifetime. Still catches gross
 /// corruption (truncation, garbled header) via the magic checks and the
 /// bincode deserialize.
-fn read_header_fast(path: impl AsRef<Path>) -> Result<RunHeader> {
-    let mut file = File::open(path)?;
-    let mut header_buf = vec![0u8; RUN_HEADER_PAD];
+fn read_header_fast_from_file(file: &mut File) -> Result<RunHeader> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut header_buf = [0u8; RUN_HEADER_PAD];
     file.read_exact(&mut header_buf)?;
     let header: RunHeader = bincode::deserialize(&header_buf)
         .map_err(|e| MongrelError::InvalidArgument(format!("bad run header: {e}")))?;
-    if header.magic != RUN_MAGIC {
-        return Err(MongrelError::MagicMismatch {
-            what: "sorted run",
-            expected: RUN_MAGIC,
-            got: header.magic,
-        });
-    }
+    validate_run_header_bytes(&header, &header_buf)?;
+    validate_run_layout(&header, file.metadata()?.len())?;
     file.seek(SeekFrom::Start(header.footer_offset))?;
     let mut footer_magic = [0u8; 8];
     file.read_exact(&mut footer_magic)?;
@@ -913,35 +955,52 @@ fn read_header_fast(path: impl AsRef<Path>) -> Result<RunHeader> {
     Ok(header)
 }
 
-/// [`read_header`], but skips the whole-body SHA-256 verification once
-/// `verified_runs` already recorded this `run_id` as checked in this
-/// process. First open of a given run still pays the full check (and
-/// records it); every later `RunReader` construction for the same run_id in
-/// the same process — the common case for a warm/long-lived handle that
-/// re-opens a reader per query, e.g. NAPI or an in-process `compare` run —
-/// reuses that result instead of re-reading and re-hashing the whole file
-/// every time. A fresh run_id (new file, e.g. after a flush/compaction) is
-/// never in the cache, so it always gets the full check on its first read.
-fn read_header_cached(
-    path: impl AsRef<Path>,
-    verified_runs: &parking_lot::Mutex<std::collections::HashSet<u128>>,
-) -> Result<RunHeader> {
-    let header = read_header_fast(path.as_ref())?;
-    if verified_runs.lock().contains(&header.run_id) {
-        return Ok(header);
-    }
-    let verified = read_header(path)?;
-    verified_runs.lock().insert(verified.run_id);
-    Ok(verified)
-}
-
 /// Read and validate a run header (magic + footer checksum).
 pub fn read_header(path: impl AsRef<Path>) -> Result<RunHeader> {
-    let mut file = File::open(path)?;
-    let mut header_buf = vec![0u8; RUN_HEADER_PAD];
-    file.read_exact(&mut header_buf)?;
-    let header: RunHeader = bincode::deserialize(&header_buf)
-        .map_err(|e| MongrelError::InvalidArgument(format!("bad run header: {e}")))?;
+    let mut file = crate::durable_file::open_regular_nofollow(path.as_ref())?;
+    read_header_from_file(&mut file)
+}
+
+fn validate_run_layout(header: &RunHeader, file_len: u64) -> Result<()> {
+    let footer_len = 8u64
+        + 8
+        + 32
+        + if header.is_encrypted() {
+            RUN_MAC_LEN as u64
+        } else {
+            0
+        };
+    let expected_len = header
+        .footer_offset
+        .checked_add(footer_len)
+        .ok_or_else(|| MongrelError::InvalidArgument("sorted run length overflow".into()))?;
+    if header.footer_offset < RUN_HEADER_PAD as u64 || expected_len != file_len {
+        return Err(MongrelError::InvalidArgument(format!(
+            "invalid sorted run layout: footer={} file={file_len}",
+            header.footer_offset
+        )));
+    }
+    let in_body = |offset: u64| {
+        offset == 0 || (offset >= RUN_HEADER_PAD as u64 && offset <= header.footer_offset)
+    };
+    if header.column_dir_offset < RUN_HEADER_PAD as u64
+        || header.column_dir_offset > header.footer_offset
+        || !in_body(header.index_trailer_offset)
+        || !in_body(header.encryption_descriptor_offset)
+        || !in_body(header.encrypted_stats_offset)
+        || header
+            .encrypted_stats_offset
+            .checked_add(header.encrypted_stats_len)
+            .is_none_or(|end| end > header.footer_offset)
+    {
+        return Err(MongrelError::InvalidArgument(
+            "sorted run metadata offsets are outside the file".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_run_header_bytes(header: &RunHeader, bytes: &[u8; RUN_HEADER_PAD]) -> Result<()> {
     if header.magic != RUN_MAGIC {
         return Err(MongrelError::MagicMismatch {
             what: "sorted run",
@@ -949,7 +1008,39 @@ pub fn read_header(path: impl AsRef<Path>) -> Result<RunHeader> {
             got: header.magic,
         });
     }
+    const KNOWN_FLAGS: u8 =
+        RUN_FLAG_ENCRYPTED | RUN_FLAG_TOMBSTONE_ONLY | RUN_FLAG_CLEAN | RUN_FLAG_UNIFORM_EPOCH;
+    if header.format_version != RUN_FORMAT_VERSION
+        || header.header_layout_version != RUN_HEADER_VERSION
+        || header.flags & !KNOWN_FLAGS != 0
+        || (header.row_count == 0 && (header.min_row_id != 0 || header.max_row_id != 0))
+        || (header.row_count != 0 && header.min_row_id > header.max_row_id)
+    {
+        return Err(MongrelError::InvalidArgument(
+            "unsupported or invalid sorted run header".into(),
+        ));
+    }
+    let canonical = bincode::serialize(header)?;
+    if canonical.len() > RUN_HEADER_PAD
+        || bytes[..canonical.len()] != canonical
+        || bytes[canonical.len()..].iter().any(|byte| *byte != 0)
+    {
+        return Err(MongrelError::InvalidArgument(
+            "sorted run header has noncanonical bytes or nonzero padding".into(),
+        ));
+    }
+    Ok(())
+}
 
+fn read_header_from_file(file: &mut File) -> Result<RunHeader> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut header_buf = [0u8; RUN_HEADER_PAD];
+    file.read_exact(&mut header_buf)?;
+    let header: RunHeader = bincode::deserialize(&header_buf)
+        .map_err(|e| MongrelError::InvalidArgument(format!("bad run header: {e}")))?;
+    validate_run_header_bytes(&header, &header_buf)?;
+
+    validate_run_layout(&header, file.metadata()?.len())?;
     file.seek(SeekFrom::Start(header.footer_offset))?;
     let mut footer = [0u8; 8 + 8 + 32];
     file.read_exact(&mut footer)?;
@@ -961,12 +1052,15 @@ pub fn read_header(path: impl AsRef<Path>) -> Result<RunHeader> {
         });
     }
     let mut hasher = Sha256::new();
-    hasher.update(&header_buf);
-    let body_len = header.footer_offset.saturating_sub(RUN_HEADER_PAD as u64);
-    file.seek(SeekFrom::Start(RUN_HEADER_PAD as u64))?;
-    let mut body = vec![0u8; body_len as usize];
-    file.read_exact(&mut body)?;
-    hasher.update(&body);
+    file.seek(SeekFrom::Start(0))?;
+    let mut remaining = header.footer_offset;
+    let mut buffer = [0u8; 64 * 1024];
+    while remaining != 0 {
+        let length = usize::try_from(remaining.min(buffer.len() as u64)).unwrap();
+        file.read_exact(&mut buffer[..length])?;
+        hasher.update(&buffer[..length]);
+        remaining -= length as u64;
+    }
     let computed: [u8; 32] = hasher.finalize().into();
     let stored: [u8; 32] = footer[16..].try_into().unwrap();
     if computed != stored {
@@ -974,6 +1068,23 @@ pub fn read_header(path: impl AsRef<Path>) -> Result<RunHeader> {
             expected: u64::from_be_bytes(stored[..8].try_into().unwrap()),
             actual: u64::from_be_bytes(computed[..8].try_into().unwrap()),
             context: "sorted run footer".into(),
+        });
+    }
+    file.seek(SeekFrom::Start(RUN_HEADER_PAD as u64))?;
+    let mut remaining = header.column_dir_offset - RUN_HEADER_PAD as u64;
+    let mut content = Sha256::new();
+    while remaining != 0 {
+        let length = usize::try_from(remaining.min(buffer.len() as u64)).unwrap();
+        file.read_exact(&mut buffer[..length])?;
+        content.update(&buffer[..length]);
+        remaining -= length as u64;
+    }
+    let content_hash: [u8; 32] = content.finalize().into();
+    if content_hash != header.content_hash {
+        return Err(MongrelError::ChecksumMismatch {
+            expected: u64::from_be_bytes(header.content_hash[..8].try_into().unwrap()),
+            actual: u64::from_be_bytes(content_hash[..8].try_into().unwrap()),
+            context: "sorted run content hash".into(),
         });
     }
     Ok(header)
@@ -984,14 +1095,33 @@ pub fn read_column_dir(
     path: impl AsRef<Path>,
     header: &RunHeader,
 ) -> Result<Vec<ColumnPageHeader>> {
-    let mut file = File::open(path)?;
+    let mut file = crate::durable_file::open_regular_nofollow(path.as_ref())?;
+    read_column_dir_from_file(&mut file, header)
+}
+
+fn read_column_dir_from_file(file: &mut File, header: &RunHeader) -> Result<Vec<ColumnPageHeader>> {
     file.seek(SeekFrom::Start(header.column_dir_offset))?;
-    let end = if header.index_trailer_offset != 0 {
-        header.index_trailer_offset
-    } else {
-        header.footer_offset
-    };
-    let len = end.saturating_sub(header.column_dir_offset);
+    let end = [
+        header.index_trailer_offset,
+        header.encryption_descriptor_offset,
+        header.encrypted_stats_offset,
+        header.footer_offset,
+    ]
+    .into_iter()
+    .filter(|offset| *offset > header.column_dir_offset)
+    .min()
+    .ok_or_else(|| {
+        MongrelError::InvalidArgument("sorted run column directory has no end".into())
+    })?;
+    let len = end.checked_sub(header.column_dir_offset).ok_or_else(|| {
+        MongrelError::InvalidArgument("sorted run column directory offsets are reversed".into())
+    })?;
+    const MAX_COLUMN_DIR_BYTES: u64 = 64 * 1024 * 1024;
+    if len > MAX_COLUMN_DIR_BYTES {
+        return Err(MongrelError::InvalidArgument(format!(
+            "sorted run column directory length {len} exceeds {MAX_COLUMN_DIR_BYTES}"
+        )));
+    }
     let mut buf = vec![0u8; len as usize];
     file.read_exact(&mut buf)?;
     let dir: Vec<ColumnPageHeader> = bincode::deserialize(&buf)
@@ -999,13 +1129,78 @@ pub fn read_column_dir(
     Ok(dir)
 }
 
-/// Read the raw (bincode) Encryption Descriptor body stored at
-/// `header.encryption_descriptor_offset` (a 4-byte length prefix precedes it).
-pub(crate) fn read_encryption_descriptor_bytes(
-    path: impl AsRef<Path>,
+fn validate_column_directory_layout(header: &RunHeader, dir: &[ColumnPageHeader]) -> Result<()> {
+    if header.column_count != dir.len() as u64 || dir.len() > u16::MAX as usize {
+        return Err(MongrelError::InvalidArgument(
+            "sorted run column count is invalid".into(),
+        ));
+    }
+    let mut regions = Vec::with_capacity(dir.len());
+    let mut ids = std::collections::HashSet::new();
+    for column in dir {
+        if !ids.insert(column.column_id)
+            || column.flags & !ColumnPageHeader::PAGE_ENCRYPTED != 0
+            || column.page_count as usize != column.page_stats.len()
+        {
+            return Err(MongrelError::InvalidArgument(
+                "sorted run column directory identity is invalid".into(),
+            ));
+        }
+        let region_end = column
+            .page_region_offset
+            .checked_add(column.page_region_len)
+            .ok_or_else(|| MongrelError::InvalidArgument("run page region overflows".into()))?;
+        if column.page_region_offset < RUN_HEADER_PAD as u64
+            || region_end > header.column_dir_offset
+        {
+            return Err(MongrelError::InvalidArgument(
+                "sorted run page region is outside its body".into(),
+            ));
+        }
+        let mut cursor = column.page_region_offset;
+        let mut rows = 0_u64;
+        for stat in &column.page_stats {
+            let length = stat.compressed_len as u64;
+            let end = stat
+                .offset
+                .checked_add(length)
+                .ok_or_else(|| MongrelError::InvalidArgument("run page offset overflows".into()))?;
+            if stat.offset != cursor
+                || length == 0
+                || length > MAX_RUN_PAGE_BYTES
+                || stat.uncompressed_len as u64 > MAX_RUN_PAGE_BYTES
+                || stat.row_count as usize > PAGE_ROWS
+                || end > region_end
+            {
+                return Err(MongrelError::InvalidArgument(
+                    "sorted run page metadata is outside its region".into(),
+                ));
+            }
+            rows = rows.checked_add(stat.row_count as u64).ok_or_else(|| {
+                MongrelError::InvalidArgument("sorted run row count overflows".into())
+            })?;
+            cursor = end;
+        }
+        if cursor != region_end || rows != header.row_count {
+            return Err(MongrelError::InvalidArgument(
+                "sorted run page region length or row count is inconsistent".into(),
+            ));
+        }
+        regions.push((column.page_region_offset, region_end));
+    }
+    regions.sort_unstable();
+    if regions.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+        return Err(MongrelError::InvalidArgument(
+            "sorted run page regions overlap".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn read_encryption_descriptor_bytes_from_file(
+    file: &mut File,
     header: &RunHeader,
 ) -> Result<Vec<u8>> {
-    let mut file = File::open(path)?;
     file.seek(SeekFrom::Start(header.encryption_descriptor_offset))?;
     let mut len_buf = [0u8; 4];
     file.read_exact(&mut len_buf)?;
@@ -1033,7 +1228,7 @@ pub(crate) fn read_encryption_descriptor_bytes(
 /// authenticated separately, so they are not covered here.
 #[cfg(feature = "encryption")]
 fn verify_run_mac(
-    path: &Path,
+    file: &mut File,
     header: &RunHeader,
     dir: &[ColumnPageHeader],
     kek: &Kek,
@@ -1044,7 +1239,6 @@ fn verify_run_mac(
     let mac_key = kek.derive_run_mac_key();
     let expected =
         crate::encryption::run_metadata_mac(&mac_key, &header_bytes, &dir_bytes, desc_bytes);
-    let mut file = File::open(path)?;
     file.seek(SeekFrom::Start(header.footer_offset + 8 + 8 + 32))?;
     let mut tag = [0u8; RUN_MAC_LEN];
     file.read_exact(&mut tag).map_err(|_| {
@@ -1069,7 +1263,7 @@ fn verify_run_mac(
 
 #[cfg(not(feature = "encryption"))]
 fn verify_run_mac(
-    _path: &Path,
+    _file: &mut File,
     _header: &RunHeader,
     _dir: &[ColumnPageHeader],
     _kek: &Kek,
@@ -1209,6 +1403,27 @@ impl<'a> RunWriter<'a> {
         n: usize,
         first_row_id: u64,
     ) -> Result<RunHeader> {
+        self.write_native_target(Some(path.as_ref()), None, user_columns, n, first_row_id)
+    }
+
+    pub(crate) fn write_native_file(
+        self,
+        file: File,
+        user_columns: &[(u16, columnar::NativeColumn)],
+        n: usize,
+        first_row_id: u64,
+    ) -> Result<RunHeader> {
+        self.write_native_target(None, Some(file), user_columns, n, first_row_id)
+    }
+
+    fn write_native_target(
+        self,
+        path: Option<&Path>,
+        file: Option<File>,
+        user_columns: &[(u16, columnar::NativeColumn)],
+        n: usize,
+        first_row_id: u64,
+    ) -> Result<RunHeader> {
         use columnar::NativeColumn;
         let row_id_col = NativeColumn::int64_sequence(first_row_id as i64, n);
         let epoch_col = NativeColumn::int64_constant(self.epoch_created.0 as i64, n);
@@ -1331,16 +1546,40 @@ impl<'a> RunWriter<'a> {
             max_row_id: first_row_id + n as u64 - 1,
             columns: &columns,
         };
-        write_run_with(
-            path,
-            &spec,
-            self.kek,
-            &self.indexable_columns,
-            Some(&learned_trailer),
-        )
+        match file {
+            Some(file) => write_run_with_file(
+                file,
+                &spec,
+                self.kek,
+                &self.indexable_columns,
+                Some(&learned_trailer),
+            ),
+            None => write_run_with(
+                path.ok_or_else(|| {
+                    MongrelError::InvalidArgument("sorted run output is missing".into())
+                })?,
+                &spec,
+                self.kek,
+                &self.indexable_columns,
+                Some(&learned_trailer),
+            ),
+        }
     }
 
     pub fn write(self, path: impl AsRef<Path>, rows: &[Row]) -> Result<RunHeader> {
+        self.write_target(Some(path.as_ref()), None, rows)
+    }
+
+    pub(crate) fn write_file(self, file: File, rows: &[Row]) -> Result<RunHeader> {
+        self.write_target(None, Some(file), rows)
+    }
+
+    fn write_target(
+        self,
+        path: Option<&Path>,
+        file: Option<File>,
+        rows: &[Row],
+    ) -> Result<RunHeader> {
         let n = rows.len();
         // System columns.
         let mut row_ids = Vec::with_capacity(n);
@@ -1415,13 +1654,24 @@ impl<'a> RunWriter<'a> {
             max_row_id: max_rid,
             columns: &columns,
         };
-        write_run_with(
-            path,
-            &spec,
-            self.kek,
-            &self.indexable_columns,
-            Some(&learned_trailer),
-        )
+        match file {
+            Some(file) => write_run_with_file(
+                file,
+                &spec,
+                self.kek,
+                &self.indexable_columns,
+                Some(&learned_trailer),
+            ),
+            None => write_run_with(
+                path.ok_or_else(|| {
+                    MongrelError::InvalidArgument("sorted run output is missing".into())
+                })?,
+                &spec,
+                self.kek,
+                &self.indexable_columns,
+                Some(&learned_trailer),
+            ),
+        }
     }
 }
 
@@ -1630,9 +1880,204 @@ pub struct RunReader {
     epoch_override: Option<Epoch>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RunVisibleVersion {
+    pub(crate) row_id: RowId,
+    pub(crate) committed_epoch: Epoch,
+    pub(crate) deleted: bool,
+    page_seq: usize,
+    within_page: usize,
+}
+
+/// Page-bounded cursor over one run's newest snapshot-visible version per row.
+/// Only the three compact system columns and one user-data page are decoded at
+/// a time. Full `Vec<Row>` materialization is deliberately avoided.
+pub(crate) struct RunVisibleVersionCursor {
+    reader: RunReader,
+    snapshot: Epoch,
+    page_row_counts: Vec<usize>,
+    page_seq: usize,
+    within_page: usize,
+    row_ids: Vec<i64>,
+    epochs: Vec<i64>,
+    deleted: Vec<u8>,
+    lookahead: Option<RunVisibleVersion>,
+    materialized_page: Option<usize>,
+    materialized_columns: Vec<(u16, columnar::NativeColumn)>,
+}
+
+impl RunVisibleVersionCursor {
+    fn new(reader: RunReader, snapshot: Epoch) -> Result<Self> {
+        let page_row_counts = reader.page_row_counts(SYS_ROW_ID)?;
+        Ok(Self {
+            reader,
+            snapshot,
+            page_row_counts,
+            page_seq: 0,
+            within_page: 0,
+            row_ids: Vec::new(),
+            epochs: Vec::new(),
+            deleted: Vec::new(),
+            lookahead: None,
+            materialized_page: None,
+            materialized_columns: Vec::new(),
+        })
+    }
+
+    fn load_system_page(&mut self, control: &crate::ExecutionControl) -> Result<bool> {
+        while self.page_seq < self.page_row_counts.len() {
+            control.checkpoint()?;
+            let rows = self.page_row_counts[self.page_seq];
+            if rows == 0 {
+                self.page_seq += 1;
+                continue;
+            }
+            self.row_ids = match columnar::decode_page_native(
+                TypeId::Int64,
+                &self.reader.read_page(SYS_ROW_ID, self.page_seq)?,
+                rows,
+            )? {
+                columnar::NativeColumn::Int64 { data, .. } => data,
+                _ => return Err(MongrelError::InvalidArgument("sys row_id not int64".into())),
+            };
+            self.epochs = if let Some(epoch) = self.reader.epoch_override {
+                vec![epoch.0 as i64; rows]
+            } else {
+                match columnar::decode_page_native(
+                    TypeId::Int64,
+                    &self.reader.read_page(SYS_EPOCH, self.page_seq)?,
+                    rows,
+                )? {
+                    columnar::NativeColumn::Int64 { data, .. } => data,
+                    _ => return Err(MongrelError::InvalidArgument("sys epoch not int64".into())),
+                }
+            };
+            self.deleted = match columnar::decode_page_native(
+                TypeId::Bool,
+                &self.reader.read_page(SYS_DELETED, self.page_seq)?,
+                rows,
+            )? {
+                columnar::NativeColumn::Bool { data, .. } => data,
+                _ => return Err(MongrelError::InvalidArgument("sys deleted not bool".into())),
+            };
+            self.within_page = 0;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn next_raw(&mut self, control: &crate::ExecutionControl) -> Result<Option<RunVisibleVersion>> {
+        if self.within_page >= self.row_ids.len() {
+            if !self.row_ids.is_empty() {
+                self.page_seq += 1;
+                self.row_ids.clear();
+                self.epochs.clear();
+                self.deleted.clear();
+            }
+            if !self.load_system_page(control)? {
+                return Ok(None);
+            }
+        }
+        if self.within_page % 256 == 0 {
+            control.checkpoint()?;
+        }
+        let position = self.within_page;
+        self.within_page += 1;
+        Ok(Some(RunVisibleVersion {
+            row_id: RowId(self.row_ids[position] as u64),
+            committed_epoch: Epoch(self.epochs[position] as u64),
+            deleted: self.deleted[position] != 0,
+            page_seq: self.page_seq,
+            within_page: position,
+        }))
+    }
+
+    pub(crate) fn next_visible_version(
+        &mut self,
+        control: &crate::ExecutionControl,
+    ) -> Result<Option<RunVisibleVersion>> {
+        loop {
+            let first = match self.lookahead.take() {
+                Some(version) => version,
+                None => match self.next_raw(control)? {
+                    Some(version) => version,
+                    None => return Ok(None),
+                },
+            };
+            let row_id = first.row_id;
+            let mut best = (first.committed_epoch <= self.snapshot).then_some(first);
+            while let Some(candidate) = self.next_raw(control)? {
+                if candidate.row_id != row_id {
+                    self.lookahead = Some(candidate);
+                    break;
+                }
+                if candidate.committed_epoch <= self.snapshot
+                    && best.map_or(true, |current| {
+                        candidate.committed_epoch > current.committed_epoch
+                    })
+                {
+                    best = Some(candidate);
+                }
+            }
+            if best.is_some() {
+                return Ok(best);
+            }
+        }
+    }
+
+    pub(crate) fn materialize(
+        &mut self,
+        version: RunVisibleVersion,
+        control: &crate::ExecutionControl,
+    ) -> Result<Row> {
+        if self.materialized_page != Some(version.page_seq) {
+            let rows = self.page_row_counts[version.page_seq];
+            let columns = self.reader.schema.columns.clone();
+            let mut materialized = Vec::with_capacity(columns.len());
+            for (index, column) in columns.into_iter().enumerate() {
+                if index % 16 == 0 {
+                    control.checkpoint()?;
+                }
+                let native = if self.reader.has_column(column.id) {
+                    columnar::decode_page_native(
+                        column.ty,
+                        &self.reader.read_page(column.id, version.page_seq)?,
+                        rows,
+                    )?
+                } else {
+                    columnar::null_native(column.ty, rows)
+                };
+                materialized.push((column.id, native));
+            }
+            self.materialized_columns = materialized;
+            self.materialized_page = Some(version.page_seq);
+        }
+        let columns = self
+            .materialized_columns
+            .iter()
+            .map(|(column_id, column)| {
+                (
+                    *column_id,
+                    column.value_at(version.within_page).unwrap_or(Value::Null),
+                )
+            })
+            .collect();
+        Ok(Row {
+            row_id: version.row_id,
+            committed_epoch: version.committed_epoch,
+            columns,
+            deleted: version.deleted,
+        })
+    }
+}
+
 impl RunReader {
     pub fn open(path: impl AsRef<Path>, schema: Schema, kek: Option<Arc<Kek>>) -> Result<Self> {
         Self::open_with_cache(path, schema, kek, None, None, 0, None)
+    }
+
+    pub(crate) fn open_file(file: File, schema: Schema, kek: Option<Arc<Kek>>) -> Result<Self> {
+        Self::open_file_with_cache(file, schema, kek, None, None, 0, None, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1646,11 +2091,50 @@ impl RunReader {
         verified_runs: Option<&parking_lot::Mutex<std::collections::HashSet<u128>>>,
     ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
+        let file = crate::durable_file::open_regular_nofollow(&path)?;
+        Self::open_file_with_cache(
+            file,
+            schema,
+            kek,
+            page_cache,
+            decoded_cache,
+            table_id,
+            verified_runs,
+            Some(path),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn open_file_with_cache(
+        mut file: File,
+        schema: Schema,
+        kek: Option<Arc<Kek>>,
+        page_cache: Option<Arc<crate::cache::Sharded<crate::cache::PageCache>>>,
+        decoded_cache: Option<Arc<crate::cache::Sharded<crate::cache::DecodedPageCache>>>,
+        table_id: u64,
+        verified_runs: Option<&parking_lot::Mutex<std::collections::HashSet<u128>>>,
+        path: Option<PathBuf>,
+    ) -> Result<Self> {
         let header = match verified_runs {
-            Some(cache) => read_header_cached(&path, cache)?,
-            None => read_header(&path)?,
+            Some(cache) => {
+                let header = read_header_fast_from_file(&mut file)?;
+                if cache.lock().contains(&header.run_id) {
+                    header
+                } else {
+                    let verified = read_header_from_file(&mut file)?;
+                    cache.lock().insert(verified.run_id);
+                    verified
+                }
+            }
+            None => read_header_from_file(&mut file)?,
         };
-        let mut dir = read_column_dir(&path, &header)?;
+        let mut dir = read_column_dir_from_file(&mut file, &header)?;
+        validate_column_directory_layout(&header, &dir)?;
+        if header.is_encrypted() != kek.is_some() {
+            return Err(MongrelError::Encryption(
+                "sorted-run encryption mode differs from the database".into(),
+            ));
+        }
         // Unwrap this run's per-file DEK (stored wrapped in its Encryption
         // Descriptor) using the table KEK, then build the page cipher.
         let (cipher, nonce_prefix): (Option<Box<dyn Cipher>>, [u8; 12]) = if header.is_encrypted() {
@@ -1664,20 +2148,20 @@ impl RunReader {
                     "encrypted run has no encryption descriptor".into(),
                 ));
             }
-            let desc_bytes = read_encryption_descriptor_bytes(&path, &header)?;
+            let desc_bytes = read_encryption_descriptor_bytes_from_file(&mut file, &header)?;
             // Authenticate the cleartext metadata (header‖dir‖descriptor) under
             // the KEK-derived MAC key BEFORE trusting any offset/stat to drive a
             // read. Required for every encrypted run (no downgrade path: an
             // attacker can neither strip the encryption — pages stay ciphertext —
             // nor forge the tag without the key).
-            verify_run_mac(&path, &header, &dir, kek, &desc_bytes)?;
+            verify_run_mac(&mut file, &header, &dir, kek, &desc_bytes)?;
             let enc = crate::encryption::build_run_cipher(kek, &desc_bytes)?;
             // With the metadata authenticated, decrypt the per-page min/max
             // envelope (v2 runs) and overlay it so zone-map pruning works on
             // encrypted columns exactly as it does on plaintext ones.
             if header.encrypted_stats_offset != 0 {
                 overlay_encrypted_stats(
-                    &path,
+                    &mut file,
                     &header,
                     enc.cipher.as_ref(),
                     enc.nonce_prefix,
@@ -1688,9 +2172,6 @@ impl RunReader {
         } else {
             (None, [0u8; 12])
         };
-        // Keep one open handle for all subsequent page reads (avoids a
-        // File::open syscall per column).
-        let file = File::open(&path)?;
         // Best-effort memory map: lets the OS page cache manage I/O and removes
         // per-page seek+read syscalls. Falls back to read() on empty/unmappable
         // files. The `file` handle is kept for the lifetime of the mapping.
@@ -1719,6 +2200,223 @@ impl RunReader {
         &self.header
     }
 
+    pub(crate) fn validate_all_pages(&mut self) -> Result<()> {
+        let mut columns = std::collections::HashSet::new();
+        let row_header = self.find_header(SYS_ROW_ID)?.clone();
+        let expected_rows = row_header
+            .page_stats
+            .iter()
+            .map(|stat| stat.row_count)
+            .collect::<Vec<_>>();
+        let mut row_bounds = Vec::with_capacity(row_header.page_stats.len());
+        let mut previous = None::<u64>;
+        let mut first = None::<u64>;
+        let mut last = None::<u64>;
+        let mut counted = 0_u64;
+        for (page, stat) in row_header.page_stats.iter().enumerate() {
+            let bytes = self.read_page(SYS_ROW_ID, page)?;
+            let native =
+                columnar::decode_page_native(TypeId::Int64, &bytes, stat.row_count as usize)?;
+            if columnar::page_stat_for(TypeId::Int64, &native, 0, 0).null_count != 0 {
+                return Err(MongrelError::InvalidArgument(
+                    "sorted run row-id page contains nulls".into(),
+                ));
+            }
+            let columnar::NativeColumn::Int64 { data, validity } = native else {
+                return Err(MongrelError::InvalidArgument(
+                    "sorted run row-id page has the wrong type".into(),
+                ));
+            };
+            let _ = validity;
+            if data.is_empty() {
+                if self.header.row_count != 0 || stat.row_count != 0 {
+                    return Err(MongrelError::InvalidArgument(
+                        "sorted run row-id page is unexpectedly empty".into(),
+                    ));
+                }
+                row_bounds.push((0, 0));
+                continue;
+            }
+            if data.iter().any(|value| *value < 0) {
+                return Err(MongrelError::InvalidArgument(
+                    "sorted run contains a negative row id".into(),
+                ));
+            }
+            let page_first = data[0] as u64;
+            let page_last = data[data.len() - 1] as u64;
+            for value in data {
+                let value = value as u64;
+                if previous.is_some_and(|prior| {
+                    value < prior || (self.header.is_clean() && value == prior)
+                }) {
+                    return Err(MongrelError::InvalidArgument(
+                        "sorted run row ids are not ordered".into(),
+                    ));
+                }
+                first.get_or_insert(value);
+                previous = Some(value);
+                last = Some(value);
+                counted += 1;
+            }
+            if stat.first_row_id != page_first || stat.last_row_id != page_last {
+                return Err(MongrelError::InvalidArgument(
+                    "sorted run row-id page bounds are stale".into(),
+                ));
+            }
+            row_bounds.push((page_first, page_last));
+        }
+        if counted != self.header.row_count
+            || first.unwrap_or(0) != self.header.min_row_id
+            || last.unwrap_or(0) != self.header.max_row_id
+        {
+            return Err(MongrelError::InvalidArgument(
+                "sorted run header row bounds differ from its pages".into(),
+            ));
+        }
+        for column in self.dir.clone() {
+            if !columns.insert(column.column_id) {
+                return Err(MongrelError::InvalidArgument(format!(
+                    "sorted run contains duplicate column {}",
+                    column.column_id
+                )));
+            }
+            let rows = column
+                .page_stats
+                .iter()
+                .map(|stat| stat.row_count)
+                .collect::<Vec<_>>();
+            if rows != expected_rows {
+                return Err(MongrelError::InvalidArgument(
+                    "sorted run columns have inconsistent page row counts".into(),
+                ));
+            }
+            let ty = self.resolve_type(column.column_id);
+            if column.type_id_tag != type_tag(&ty)
+                || column.encoding > Encoding::Zstd as u8
+                || (!matches!(column.column_id, SYS_ROW_ID | SYS_EPOCH | SYS_DELETED)
+                    && self
+                        .schema
+                        .columns
+                        .iter()
+                        .all(|item| item.id != column.column_id))
+            {
+                return Err(MongrelError::InvalidArgument(
+                    "sorted run column type or encoding is invalid".into(),
+                ));
+            }
+            for (page, stat) in column.page_stats.iter().enumerate() {
+                let bytes = self.read_page(column.column_id, page)?;
+                if bytes.len() != stat.uncompressed_len as usize {
+                    return Err(MongrelError::InvalidArgument(
+                        "sorted run page length differs from its metadata".into(),
+                    ));
+                }
+                let native =
+                    match columnar::decode_page_native(ty.clone(), &bytes, stat.row_count as usize)
+                    {
+                        Ok(native) => native,
+                        Err(MongrelError::InvalidArgument(message))
+                            if message.starts_with("decode_page_native: unsupported ty") =>
+                        {
+                            let values =
+                                columnar::decode_page(ty.clone(), &bytes, stat.row_count as usize)?;
+                            columnar::values_to_native(ty.clone(), &values)
+                        }
+                        Err(error) => return Err(error),
+                    };
+                let (first_row_id, last_row_id) =
+                    row_bounds.get(page).copied().ok_or_else(|| {
+                        MongrelError::InvalidArgument(
+                            "sorted run column has more pages than its row-id column".into(),
+                        )
+                    })?;
+                let expected =
+                    columnar::page_stat_for(ty.clone(), &native, first_row_id, last_row_id);
+                if stat.first_row_id != expected.first_row_id
+                    || stat.last_row_id != expected.last_row_id
+                    || stat.null_count != expected.null_count
+                    || stat.min != expected.min
+                    || stat.max != expected.max
+                {
+                    return Err(MongrelError::InvalidArgument(
+                        "sorted run page statistics differ from decoded values".into(),
+                    ));
+                }
+            }
+        }
+        if !columns.contains(&SYS_ROW_ID)
+            || !columns.contains(&SYS_EPOCH)
+            || !columns.contains(&SYS_DELETED)
+            || expected_rows.into_iter().map(u64::from).sum::<u64>() != self.header.row_count
+        {
+            return Err(MongrelError::InvalidArgument(
+                "sorted run system columns or row count are invalid".into(),
+            ));
+        }
+        if self.header.schema_id == self.schema.schema_id
+            && self
+                .schema
+                .columns
+                .iter()
+                .any(|column| !columns.contains(&column.id))
+        {
+            return Err(MongrelError::InvalidArgument(
+                "sorted run is missing a column from its declared schema".into(),
+            ));
+        }
+
+        // Page encodings and statistics are not enough to establish semantic
+        // validity.  Reconstruct every materialized row and apply the schema's
+        // row-level rules before the run can participate in recovery.
+        for row_index in 0..usize::try_from(self.header.row_count).map_err(|_| {
+            MongrelError::InvalidArgument("sorted run row count exceeds this platform".into())
+        })? {
+            let epoch = match self.column(SYS_EPOCH)?.get(row_index) {
+                Some(Value::Int64(value)) if *value >= 0 => *value as u64,
+                _ => {
+                    return Err(MongrelError::InvalidArgument(
+                        "sorted run contains an invalid commit epoch".into(),
+                    ))
+                }
+            };
+            if epoch > self.header.epoch_created || (self.header.is_uniform_epoch() && epoch != 0) {
+                return Err(MongrelError::InvalidArgument(
+                    "sorted run commit epoch exceeds its creation epoch".into(),
+                ));
+            }
+            let deleted = match self.column(SYS_DELETED)?.get(row_index) {
+                Some(Value::Bool(value)) => *value,
+                _ => {
+                    return Err(MongrelError::InvalidArgument(
+                        "sorted run contains an invalid tombstone marker".into(),
+                    ))
+                }
+            };
+            let mut values = Vec::with_capacity(self.schema.columns.len());
+            for column in self.schema.columns.clone() {
+                let value = if columns.contains(&column.id) {
+                    self.column(column.id)?
+                        .get(row_index)
+                        .cloned()
+                        .unwrap_or(Value::Null)
+                } else {
+                    Value::Null
+                };
+                values.push((column.id, value));
+            }
+            if !deleted {
+                self.schema
+                    .validate_persisted_values(&values)
+                    .map_err(|error| {
+                        MongrelError::InvalidArgument(format!(
+                            "sorted run row violates its schema: {error}"
+                        ))
+                    })?;
+            }
+        }
+        Ok(())
+    }
+
     /// Overlay the real commit epoch for a uniform-epoch run (see
     /// [`RUN_FLAG_UNIFORM_EPOCH`]). No-op unless the run carries that flag, so it
     /// is always safe for the engine to call with the `RunRef.epoch_created`.
@@ -1728,6 +2426,13 @@ impl RunReader {
             // Drop any cached placeholder epoch column so the overlay takes hold.
             self.col_cache.remove(&SYS_EPOCH);
         }
+    }
+
+    pub(crate) fn into_visible_version_cursor(
+        self,
+        snapshot: Epoch,
+    ) -> Result<RunVisibleVersionCursor> {
+        RunVisibleVersionCursor::new(self, snapshot)
     }
 
     /// Whether this run is "clean" (one version per RowId, no tombstones,
@@ -1825,6 +2530,13 @@ impl RunReader {
                 ch.flags & ColumnPageHeader::PAGE_ENCRYPTED != 0,
             )
         };
+        let end = offset
+            .checked_add(compressed_len as u64)
+            .ok_or_else(|| MongrelError::InvalidArgument("run page offset overflows".into()))?;
+        let start = usize::try_from(offset)
+            .map_err(|_| MongrelError::InvalidArgument("run page offset is too large".into()))?;
+        let end = usize::try_from(end)
+            .map_err(|_| MongrelError::InvalidArgument("run page end is too large".into()))?;
         // Shared cache: serve the raw (on-disk / ciphertext) page bytes if
         // present, so concurrent readers never re-read or re-decrypt a page.
         let key = page_cache_key(self.table_id, self.header.run_id, column_id, page_seq);
@@ -1846,7 +2558,12 @@ impl RunReader {
         let buf = match &self.mmap {
             // Slice the mapping — no seek/read syscalls; the OS page cache fills
             // the pages on first touch.
-            Some(m) => m[offset as usize..(offset + compressed_len as u64) as usize].to_vec(),
+            Some(m) => m
+                .get(start..end)
+                .ok_or_else(|| {
+                    MongrelError::InvalidArgument("run page is outside the mapped file".into())
+                })?
+                .to_vec(),
             None => {
                 self.file.seek(SeekFrom::Start(offset))?;
                 let mut buf = vec![0u8; compressed_len as usize];
@@ -1906,9 +2623,20 @@ impl RunReader {
         let mmap = self.mmap.as_ref().ok_or_else(|| {
             MongrelError::InvalidArgument("parallel page decode requires an mmap-backed run".into())
         })?;
-        let start = stat.offset as usize;
-        let end = (stat.offset + stat.compressed_len as u64) as usize;
-        let buf = mmap[start..end].to_vec();
+        let end = stat
+            .offset
+            .checked_add(stat.compressed_len as u64)
+            .ok_or_else(|| MongrelError::InvalidArgument("run page offset overflows".into()))?;
+        let start = usize::try_from(stat.offset)
+            .map_err(|_| MongrelError::InvalidArgument("run page offset is too large".into()))?;
+        let end = usize::try_from(end)
+            .map_err(|_| MongrelError::InvalidArgument("run page end is too large".into()))?;
+        let buf = mmap
+            .get(start..end)
+            .ok_or_else(|| {
+                MongrelError::InvalidArgument("run page is outside the mapped file".into())
+            })?
+            .to_vec();
         // Opportunistic, non-blocking insert: populate the shared cache so later
         // readers (and encrypted re-reads) skip the mmap slice + decrypt. Never
         // block the rayon pool — if the lock is contended, just skip the insert.
@@ -2207,6 +2935,31 @@ impl RunReader {
         for i in 0..n {
             out.push(self.materialize(i)?);
         }
+        Ok(out)
+    }
+
+    /// Every version with cooperative cancellation and a hard row bound.
+    pub fn all_rows_controlled(
+        &mut self,
+        control: &crate::ExecutionControl,
+        max_rows: usize,
+    ) -> Result<Vec<Row>> {
+        let n = self.row_count();
+        if n > max_rows {
+            return Err(MongrelError::ResourceLimitExceeded {
+                resource: "controlled run row materialization",
+                requested: n,
+                limit: max_rows,
+            });
+        }
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            if i % 256 == 0 {
+                control.checkpoint()?;
+            }
+            out.push(self.materialize(i)?);
+        }
+        control.checkpoint()?;
         Ok(out)
     }
 
@@ -3228,6 +3981,41 @@ mod tests {
         // Scan.
         let all = r.visible_rows(Epoch(20)).unwrap();
         assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn visible_version_cursor_preserves_order_snapshot_and_tombstones() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("r-cursor.sr");
+        let mut tombstone = Row::new(RowId(2), Epoch(2));
+        tombstone.deleted = true;
+        let versions = vec![
+            Row::new(RowId(1), Epoch(4)).with_column(1, Value::Int64(10)),
+            Row::new(RowId(2), Epoch(1)).with_column(1, Value::Int64(2)),
+            tombstone,
+            Row::new(RowId(3), Epoch(1)).with_column(1, Value::Int64(20)),
+            Row::new(RowId(3), Epoch(3)).with_column(1, Value::Int64(23)),
+            Row::new(RowId(4), Epoch(4)).with_column(1, Value::Int64(30)),
+        ];
+        RunWriter::new(&schema(), 7, Epoch(4), 0)
+            .write(&path, &versions)
+            .unwrap();
+
+        let control = crate::ExecutionControl::new(None);
+        let mut cursor = RunReader::open(&path, schema(), None)
+            .unwrap()
+            .into_visible_version_cursor(Epoch(2))
+            .unwrap();
+        let first = cursor.next_visible_version(&control).unwrap().unwrap();
+        assert_eq!(first.row_id, RowId(2));
+        assert!(first.deleted);
+        assert_eq!(first.committed_epoch, Epoch(2));
+        let second = cursor.next_visible_version(&control).unwrap().unwrap();
+        assert_eq!(second.row_id, RowId(3));
+        assert_eq!(second.committed_epoch, Epoch(1));
+        let row = cursor.materialize(second, &control).unwrap();
+        assert_eq!(row.columns.get(&1), Some(&Value::Int64(20)));
+        assert!(cursor.next_visible_version(&control).unwrap().is_none());
     }
 
     #[test]

@@ -148,6 +148,7 @@ fn aborting_trigger(name: &str) -> StoredTrigger {
 /// and return a connected typed client.
 struct Server {
     _dir: TempDir,
+    db: Arc<Database>,
     base_url: String,
     _join: thread::JoinHandle<()>,
 }
@@ -156,10 +157,10 @@ impl Server {
     fn start() -> Self {
         let dir = TempDir::new().unwrap();
         let dir_path = dir.path().to_path_buf();
-        let db = Database::create(&dir_path).unwrap();
+        let db = Arc::new(Database::create(&dir_path).unwrap());
         db.create_table("users", mk_schema()).unwrap();
         db.create_table("audit", audit_schema()).unwrap();
-        let app = build_app(Arc::new(db));
+        let app = build_app(Arc::clone(&db));
 
         // Bind an ephemeral port, then serve in a background thread with its
         // own multi-thread runtime.
@@ -180,22 +181,23 @@ impl Server {
         });
         Server {
             _dir: dir,
+            db,
             base_url: format!("http://{addr}"),
             _join: join,
         }
     }
 
     fn client(&self) -> MongrelClient {
-        MongrelClient::new(&self.base_url)
+        MongrelClient::new(&self.base_url).unwrap()
     }
 
     fn start_with_auth() -> Self {
         let dir = TempDir::new().unwrap();
         let dir_path = dir.path().to_path_buf();
-        let db = Database::create(&dir_path).unwrap();
+        let db = Arc::new(Database::create(&dir_path).unwrap());
         db.create_table("users", mk_schema()).unwrap();
         db.create_user("alice", "pw").unwrap();
-        let app = build_app_full(Arc::new(db), std::iter::empty(), None, None, true);
+        let app = build_app_full(Arc::clone(&db), std::iter::empty(), None, None, true);
 
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -214,6 +216,7 @@ impl Server {
         });
         Server {
             _dir: dir,
+            db,
             base_url: format!("http://{addr}"),
             _join: join,
         }
@@ -437,6 +440,106 @@ fn client_legacy_endpoints_still_checked() {
     // count on a missing table → typed HTTP error (404 path, plain Http).
     let err = c.count("nope").unwrap_err();
     assert!(matches!(err, ClientError::Http { .. }), "got {err:?}");
+}
+
+#[test]
+fn client_legacy_put_preserves_typed_values() {
+    let srv = Server::start();
+    srv.db
+        .create_table(
+            "typed",
+            Schema {
+                columns: vec![
+                    col(
+                        0,
+                        "id",
+                        TypeId::Int64,
+                        ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                    ),
+                    col(1, "bytes", TypeId::Bytes, ColumnFlags::empty()),
+                    col(
+                        2,
+                        "embedding",
+                        TypeId::Embedding { dim: 2 },
+                        ColumnFlags::empty(),
+                    ),
+                    col(
+                        3,
+                        "decimal",
+                        TypeId::Decimal128 {
+                            precision: 38,
+                            scale: 4,
+                        },
+                        ColumnFlags::empty(),
+                    ),
+                    col(4, "uuid", TypeId::Uuid, ColumnFlags::empty()),
+                    col(5, "json", TypeId::Json, ColumnFlags::empty()),
+                    col(6, "interval", TypeId::Interval, ColumnFlags::empty()),
+                    col(7, "float", TypeId::Float64, ColumnFlags::empty()),
+                ],
+                ..Schema::default()
+            },
+        )
+        .unwrap();
+    let client = srv.client();
+
+    for error in [
+        client
+            .put("typed", vec![(7, Value::Float64(f64::NAN))])
+            .unwrap_err(),
+        client
+            .put(
+                "typed",
+                vec![(2, Value::Embedding(vec![f32::INFINITY, 1.0]))],
+            )
+            .unwrap_err(),
+        client
+            .put("typed", vec![(5, Value::Json(vec![0xff]))])
+            .unwrap_err(),
+        client
+            .put("typed", vec![(5, Value::Json(b"{".to_vec()))])
+            .unwrap_err(),
+    ] {
+        assert!(matches!(error, ClientError::Decode(_)), "{error:?}");
+    }
+    assert_eq!(client.count("typed").unwrap(), 0);
+
+    let uuid = [
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+        0xff,
+    ];
+    let json = br#"{ "x": [1, true], "s": "ok" }"#.to_vec();
+    let values = vec![
+        (0, Value::Int64(1)),
+        (1, Value::Bytes(vec![0, 0xff, b'a'])),
+        (2, Value::Embedding(vec![1.25, -2.5])),
+        (3, Value::Decimal(-123_456_789_012_345_678_901_i128)),
+        (4, Value::Uuid(uuid)),
+        (5, Value::Json(json.clone())),
+        (
+            6,
+            Value::Interval {
+                months: -14,
+                days: 31,
+                nanos: 9_876_543_210,
+            },
+        ),
+        (7, Value::Float64(-0.25)),
+    ];
+    client.put("typed", values.clone()).unwrap();
+    client.commit("typed").unwrap();
+
+    let rows = srv
+        .db
+        .table("typed")
+        .unwrap()
+        .lock()
+        .visible_rows(srv.db.snapshot().0)
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    for (column_id, expected) in values {
+        assert_eq!(rows[0].columns.get(&column_id), Some(&expected));
+    }
 }
 
 #[test]

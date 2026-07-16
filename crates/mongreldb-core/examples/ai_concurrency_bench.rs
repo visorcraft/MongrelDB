@@ -137,6 +137,8 @@ fn main() {
         })
         .unwrap();
     let principal = Principal {
+        user_id: 0,
+        created_epoch: 0,
         username: "tenant".into(),
         is_admin: false,
         roles: Vec::new(),

@@ -29,7 +29,86 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::query_registry::SqlTaskContext;
+use crate::query_registry::{RegisteredSqlQuery, SqlTaskContext};
+
+const EXTERNAL_STATE_BYTES_LIMIT: usize = 64 * 1024 * 1024;
+const EXTERNAL_ROWS_LIMIT: usize = 1_000_000;
+const EXTERNAL_ROWS_BYTES_LIMIT: usize = 64 * 1024 * 1024;
+const EXTERNAL_BASE_WRITES_LIMIT: usize = 1_000_000;
+const EXTERNAL_BASE_WRITE_BYTES_LIMIT: usize = 64 * 1024 * 1024;
+
+fn external_resource_limit(
+    resource: &'static str,
+    requested: usize,
+    limit: usize,
+) -> MongrelQueryError {
+    MongrelQueryError::Core(mongreldb_core::MongrelError::ResourceLimitExceeded {
+        resource,
+        requested,
+        limit,
+    })
+}
+
+fn external_value_bytes(value: &Value) -> usize {
+    match value {
+        Value::Null => 0,
+        Value::Bool(_) => 1,
+        Value::Int64(_) | Value::Float64(_) => 8,
+        Value::Bytes(value) | Value::Json(value) => value.len(),
+        Value::Embedding(value) => value.len().saturating_mul(std::mem::size_of::<f32>()),
+        Value::Decimal(_) | Value::Uuid(_) => 16,
+        Value::Interval { .. } => 20,
+    }
+}
+
+fn external_row_bytes(row: &HashMap<u16, Value>) -> usize {
+    let bucket_bytes =
+        std::mem::size_of::<(u16, Value)>().saturating_add(2 * std::mem::size_of::<usize>());
+    row.capacity().saturating_mul(bucket_bytes).saturating_add(
+        row.values()
+            .map(external_value_bytes)
+            .fold(0_usize, usize::saturating_add),
+    )
+}
+
+pub(crate) fn enforce_external_rows_limit(
+    rows: &[HashMap<u16, Value>],
+    query: Option<&RegisteredSqlQuery>,
+) -> Result<()> {
+    if rows.len() > EXTERNAL_ROWS_LIMIT {
+        return Err(external_resource_limit(
+            "external table rows",
+            rows.len(),
+            EXTERNAL_ROWS_LIMIT,
+        ));
+    }
+    let mut bytes = 0_usize;
+    for (index, row) in rows.iter().enumerate() {
+        if index % 256 == 0 {
+            query.map(RegisteredSqlQuery::checkpoint).transpose()?;
+        }
+        bytes = bytes.saturating_add(external_row_bytes(row));
+        if bytes > EXTERNAL_ROWS_BYTES_LIMIT {
+            return Err(external_resource_limit(
+                "external table row bytes",
+                bytes,
+                EXTERNAL_ROWS_BYTES_LIMIT,
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn enforce_external_state_limit(state: &[u8]) -> Result<()> {
+    if state.len() > EXTERNAL_STATE_BYTES_LIMIT {
+        return Err(external_resource_limit(
+            "external table state bytes",
+            state.len(),
+            EXTERNAL_STATE_BYTES_LIMIT,
+        ));
+    }
+    Ok(())
+}
 
 pub trait ExternalTableModule: Send + Sync {
     fn name(&self) -> &str;
@@ -344,6 +423,22 @@ pub enum ExternalBaseWrite {
     },
 }
 
+fn external_base_write_bytes(op: &ExternalBaseWrite) -> usize {
+    match op {
+        ExternalBaseWrite::Put { table, cells } => table.len().saturating_add(
+            cells
+                .iter()
+                .map(|(_, value)| {
+                    std::mem::size_of::<(u16, Value)>().saturating_add(external_value_bytes(value))
+                })
+                .fold(0_usize, usize::saturating_add),
+        ),
+        ExternalBaseWrite::Delete { table, .. } => {
+            table.len().saturating_add(std::mem::size_of::<u64>())
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ExternalWriteResult {
     pub changes: u64,
@@ -358,6 +453,7 @@ impl ExternalWriteResult {
 pub struct ExternalTxn {
     state: Vec<u8>,
     base_writes: Vec<ExternalBaseWrite>,
+    base_write_bytes: usize,
 }
 
 impl ExternalTxn {
@@ -365,10 +461,12 @@ impl ExternalTxn {
         Self {
             state,
             base_writes: Vec::new(),
+            base_write_bytes: 0,
         }
     }
 
     pub fn read_state_from_bytes(state: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>> {
+        enforce_external_state_limit(state)?;
         Ok(decode_kv_state(state)?.remove(key))
     }
 
@@ -377,6 +475,14 @@ impl ExternalTxn {
     }
 
     pub fn put_state(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        enforce_external_state_limit(&self.state)?;
+        if key.len().saturating_add(value.len()) > EXTERNAL_STATE_BYTES_LIMIT {
+            return Err(external_resource_limit(
+                "external transaction key/value bytes",
+                key.len().saturating_add(value.len()),
+                EXTERNAL_STATE_BYTES_LIMIT,
+            ));
+        }
         let mut state = decode_kv_state(&self.state)?;
         state.insert(key.to_vec(), value.to_vec());
         self.state = encode_kv_state(&state)?;
@@ -384,6 +490,7 @@ impl ExternalTxn {
     }
 
     pub fn delete_state(&mut self, key: &[u8]) -> Result<()> {
+        enforce_external_state_limit(&self.state)?;
         let mut state = decode_kv_state(&self.state)?;
         state.remove(key);
         self.state = encode_kv_state(&state)?;
@@ -395,6 +502,7 @@ impl ExternalTxn {
     }
 
     pub fn read_rows(&self) -> Result<Vec<HashMap<u16, Value>>> {
+        enforce_external_state_limit(&self.state)?;
         if self.state.is_empty() {
             Ok(Vec::new())
         } else {
@@ -407,12 +515,30 @@ impl ExternalTxn {
         schema: &CoreSchema,
         rows: Vec<HashMap<u16, Value>>,
     ) -> Result<()> {
+        enforce_external_rows_limit(&rows, None)?;
         validate_external_rows(schema, &rows)?;
         self.state = encode_state_rows(&rows)?;
         Ok(())
     }
 
     pub fn emit_base_write(&mut self, op: ExternalBaseWrite) -> Result<()> {
+        if self.base_writes.len() >= EXTERNAL_BASE_WRITES_LIMIT {
+            return Err(external_resource_limit(
+                "external base write count",
+                self.base_writes.len().saturating_add(1),
+                EXTERNAL_BASE_WRITES_LIMIT,
+            ));
+        }
+        let bytes = external_base_write_bytes(&op);
+        let requested = self.base_write_bytes.saturating_add(bytes);
+        if requested > EXTERNAL_BASE_WRITE_BYTES_LIMIT {
+            return Err(external_resource_limit(
+                "external base write bytes",
+                requested,
+                EXTERNAL_BASE_WRITE_BYTES_LIMIT,
+            ));
+        }
+        self.base_write_bytes = requested;
         self.base_writes.push(op);
         Ok(())
     }
@@ -469,6 +595,7 @@ impl ExternalModuleRegistry {
         let module = self.module(&entry.module)?;
         let table = module.connect(&ModuleConnectCtx { db }, entry)?;
         Ok(Arc::new(ExternalTableProvider::new(
+            Arc::clone(db),
             table,
             entry.capabilities,
         )))
@@ -488,7 +615,9 @@ impl ExternalModuleRegistry {
         entry: &ExternalTableEntry,
     ) -> Result<Vec<HashMap<u16, Value>>> {
         let module = self.module(&entry.module)?;
-        module.read_rows(&ModuleConnectCtx { db }, entry)
+        let rows = module.read_rows(&ModuleConnectCtx { db }, entry)?;
+        enforce_external_rows_limit(&rows, None)?;
+        Ok(rows)
     }
 
     pub(crate) fn external_table_rows_from_state(
@@ -496,8 +625,11 @@ impl ExternalModuleRegistry {
         entry: &ExternalTableEntry,
         state: &[u8],
     ) -> Result<Vec<HashMap<u16, Value>>> {
+        enforce_external_state_limit(state)?;
         let module = self.module(&entry.module)?;
-        module.rows_from_state(state)
+        let rows = module.rows_from_state(state)?;
+        enforce_external_rows_limit(&rows, None)?;
+        Ok(rows)
     }
 
     pub(crate) fn external_table_write(
@@ -507,10 +639,17 @@ impl ExternalModuleRegistry {
         base_state: Vec<u8>,
         op: ExternalWriteOp,
     ) -> Result<(Vec<u8>, ExternalWriteResult, Vec<ExternalBaseWrite>)> {
+        enforce_external_state_limit(&base_state)?;
+        match &op {
+            ExternalWriteOp::Insert { rows } | ExternalWriteOp::ReplaceRows { rows, .. } => {
+                enforce_external_rows_limit(rows, None)?;
+            }
+        }
         let module = self.module(&entry.module)?;
         let mut txn = ExternalTxn::new(base_state);
         let result = module.write(&ModuleConnectCtx { db }, entry, op, &mut txn)?;
         let (state, base_writes) = txn.into_parts();
+        enforce_external_state_limit(&state)?;
         Ok((state, result, base_writes))
     }
 
@@ -569,6 +708,7 @@ fn builtin_modules() -> Vec<Arc<dyn ExternalTableModule>> {
 }
 
 struct ExternalTableProvider {
+    db: Arc<Database>,
     table: Arc<dyn ExternalTable>,
     cache_plans: bool,
     plan_cache: parking_lot::Mutex<HashMap<ExternalPlanCacheKey, ExternalPlan>>,
@@ -577,6 +717,7 @@ struct ExternalTableProvider {
 struct ExternalTableExec {
     props: Arc<PlanProperties>,
     schema: SchemaRef,
+    db: Arc<Database>,
     table: Arc<dyn ExternalTable>,
     projection: Option<Vec<usize>>,
     filters: Vec<Expr>,
@@ -632,6 +773,9 @@ impl ExecutionPlan for ExternalTableExec {
     ) -> DFResult<SendableRecordBatchStream> {
         use futures::TryStreamExt;
 
+        self.db
+            .ensure_consistent_read()
+            .map_err(|error| DataFusionError::Execution(error.to_string()))?;
         if partition != 0 {
             return Err(DataFusionError::Internal(format!(
                 "ExternalTableExec is single-partition; invalid partition {partition}"
@@ -745,8 +889,13 @@ impl ExternalPlanCacheKey {
 }
 
 impl ExternalTableProvider {
-    fn new(table: Arc<dyn ExternalTable>, capabilities: ModuleCapabilities) -> Self {
+    fn new(
+        db: Arc<Database>,
+        table: Arc<dyn ExternalTable>,
+        capabilities: ModuleCapabilities,
+    ) -> Self {
         Self {
+            db,
             table,
             cache_plans: capabilities.read_only && capabilities.deterministic,
             plan_cache: parking_lot::Mutex::new(HashMap::new()),
@@ -849,6 +998,7 @@ impl TableProvider for ExternalTableProvider {
         Ok(Arc::new(ExternalTableExec {
             props,
             schema: output_schema,
+            db: Arc::clone(&self.db),
             table: Arc::clone(&self.table),
             projection: projection.cloned(),
             filters: filters.to_vec(),
@@ -1563,6 +1713,33 @@ mod tests {
         assert_eq!(plan.estimated_cost, 3.5);
         assert!(plan.order_satisfied);
     }
+
+    #[test]
+    fn external_state_writer_stops_before_over_budget_allocation() {
+        use std::io::Write as _;
+
+        let mut writer = LimitedStateWriter::new(&[]);
+        writer.requested = EXTERNAL_STATE_BYTES_LIMIT;
+        assert!(writer.write_all(b"x").is_err());
+        assert!(writer.bytes.is_empty());
+    }
+
+    #[test]
+    fn external_base_write_budget_rejects_before_push() {
+        let mut txn = ExternalTxn::new(Vec::new());
+        txn.base_write_bytes = EXTERNAL_BASE_WRITE_BYTES_LIMIT;
+        let error = txn
+            .emit_base_write(ExternalBaseWrite::Delete {
+                table: "t".into(),
+                row_id: 1,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            MongrelQueryError::Core(mongreldb_core::MongrelError::ResourceLimitExceeded { .. })
+        ));
+        assert!(txn.base_writes.is_empty());
+    }
 }
 
 struct KvStoreModule;
@@ -1706,12 +1883,24 @@ pub(crate) fn external_table_state_bytes(
     db: &Arc<Database>,
     entry: &ExternalTableEntry,
 ) -> Result<Vec<u8>> {
+    db.ensure_consistent_read()?;
     let path = state_file(db, entry);
     if !path.exists() {
         return Ok(Vec::new());
     }
-    fs::read(&path)
-        .map_err(|e| MongrelQueryError::Schema(format!("read external state {:?}: {e}", path)))
+    let metadata = fs::metadata(&path)
+        .map_err(|e| MongrelQueryError::Schema(format!("stat external state {:?}: {e}", path)))?;
+    if metadata.len() > EXTERNAL_STATE_BYTES_LIMIT as u64 {
+        return Err(external_resource_limit(
+            "external table state file bytes",
+            usize::try_from(metadata.len()).unwrap_or(usize::MAX),
+            EXTERNAL_STATE_BYTES_LIMIT,
+        ));
+    }
+    let state = fs::read(&path)
+        .map_err(|e| MongrelQueryError::Schema(format!("read external state {:?}: {e}", path)))?;
+    enforce_external_state_limit(&state)?;
+    Ok(state)
 }
 
 fn read_state_rows(
@@ -1725,7 +1914,54 @@ fn read_state_rows(
     decode_state_rows(&bytes)
 }
 
+struct LimitedStateWriter {
+    bytes: Vec<u8>,
+    requested: usize,
+}
+
+impl LimitedStateWriter {
+    fn new(prefix: &[u8]) -> Self {
+        Self {
+            bytes: prefix.to_vec(),
+            requested: prefix.len(),
+        }
+    }
+}
+
+impl std::io::Write for LimitedStateWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.requested = self.requested.saturating_add(buf.len());
+        if self.requested > EXTERNAL_STATE_BYTES_LIMIT {
+            return Err(std::io::Error::other("external state byte limit exceeded"));
+        }
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn encode_external_json<T: Serialize + ?Sized>(value: &T, prefix: &[u8]) -> Result<Vec<u8>> {
+    let mut writer = LimitedStateWriter::new(prefix);
+    if let Err(error) = serde_json::to_writer(&mut writer, value) {
+        if writer.requested > EXTERNAL_STATE_BYTES_LIMIT {
+            return Err(external_resource_limit(
+                "external table encoded state bytes",
+                writer.requested,
+                EXTERNAL_STATE_BYTES_LIMIT,
+            ));
+        }
+        return Err(MongrelQueryError::Schema(format!(
+            "encode external state: {error}"
+        )));
+    }
+    Ok(writer.bytes)
+}
+
 fn encode_state_rows(rows: &[HashMap<u16, Value>]) -> Result<Vec<u8>> {
+    enforce_external_rows_limit(rows, None)?;
     let state = rows
         .iter()
         .map(|row| {
@@ -1737,20 +1973,23 @@ fn encode_state_rows(rows: &[HashMap<u16, Value>]) -> Result<Vec<u8>> {
             ExternalRowState { cells }
         })
         .collect::<Vec<_>>();
-    serde_json::to_vec(&state)
-        .map_err(|e| MongrelQueryError::Schema(format!("encode external state: {e}")))
+    encode_external_json(&state, &[])
 }
 
 fn decode_state_rows(state: &[u8]) -> Result<Vec<HashMap<u16, Value>>> {
+    enforce_external_state_limit(state)?;
     let rows: Vec<ExternalRowState> = serde_json::from_slice(state)
         .map_err(|e| MongrelQueryError::Schema(format!("decode external state: {e}")))?;
-    Ok(rows
+    let rows = rows
         .into_iter()
         .map(|row| row.cells.into_iter().collect())
-        .collect())
+        .collect::<Vec<_>>();
+    enforce_external_rows_limit(&rows, None)?;
+    Ok(rows)
 }
 
 fn decode_kv_state(state: &[u8]) -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
+    enforce_external_state_limit(state)?;
     if state.is_empty() {
         return Ok(BTreeMap::new());
     }
@@ -1761,25 +2000,55 @@ fn decode_kv_state(state: &[u8]) -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
     })?;
     let decoded: ExternalKvState = serde_json::from_slice(json)
         .map_err(|e| MongrelQueryError::Schema(format!("decode external kv state: {e}")))?;
+    if decoded.entries.len() > EXTERNAL_ROWS_LIMIT {
+        return Err(external_resource_limit(
+            "external transaction key/value count",
+            decoded.entries.len(),
+            EXTERNAL_ROWS_LIMIT,
+        ));
+    }
+    let bytes = decoded.entries.iter().fold(0_usize, |total, (key, value)| {
+        total.saturating_add(key.len()).saturating_add(value.len())
+    });
+    if bytes > EXTERNAL_STATE_BYTES_LIMIT {
+        return Err(external_resource_limit(
+            "external transaction key/value bytes",
+            bytes,
+            EXTERNAL_STATE_BYTES_LIMIT,
+        ));
+    }
     Ok(decoded.entries.into_iter().collect())
 }
 
 fn encode_kv_state(state: &BTreeMap<Vec<u8>, Vec<u8>>) -> Result<Vec<u8>> {
+    if state.len() > EXTERNAL_ROWS_LIMIT {
+        return Err(external_resource_limit(
+            "external transaction key/value count",
+            state.len(),
+            EXTERNAL_ROWS_LIMIT,
+        ));
+    }
+    let bytes = state.iter().fold(0_usize, |total, (key, value)| {
+        total.saturating_add(key.len()).saturating_add(value.len())
+    });
+    if bytes > EXTERNAL_STATE_BYTES_LIMIT {
+        return Err(external_resource_limit(
+            "external transaction key/value bytes",
+            bytes,
+            EXTERNAL_STATE_BYTES_LIMIT,
+        ));
+    }
     let encoded = ExternalKvState {
         entries: state
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect(),
     };
-    let mut out = KV_STATE_MAGIC.to_vec();
-    out.extend(
-        serde_json::to_vec(&encoded)
-            .map_err(|e| MongrelQueryError::Schema(format!("encode external kv state: {e}")))?,
-    );
-    Ok(out)
+    encode_external_json(&encoded, KV_STATE_MAGIC)
 }
 
 fn validate_external_rows(schema: &CoreSchema, rows: &[HashMap<u16, Value>]) -> Result<()> {
+    enforce_external_rows_limit(rows, None)?;
     let mut known = HashSet::new();
     let mut pk_cols = Vec::new();
     for column in &schema.columns {

@@ -63,7 +63,10 @@ pub mod value;
 // surface (and lets a future header generator walk `mongreldb_ffi::*`).
 //
 // Error accessors.
-pub use error::{mongreldb_free_error_string, mongreldb_last_error, mongreldb_last_error_code};
+pub use error::{
+    mongreldb_error_details_v1, mongreldb_free_error_string, mongreldb_last_error,
+    mongreldb_last_error_code, mongreldb_last_error_details_v1,
+};
 
 // String free.
 pub use database::mongreldb_free_string;
@@ -79,8 +82,10 @@ pub use database::{
 // SQL execution (DataFusion via MongrelSession; returns Arrow IPC file bytes).
 pub use sql::{
     mongreldb_database_sql, mongreldb_database_sql_refresh, mongreldb_free_sql_result,
-    mongreldb_sql_options, mongreldb_sql_query_cancel, mongreldb_sql_query_free,
-    mongreldb_sql_query_start, mongreldb_sql_query_t, mongreldb_sql_query_wait,
+    mongreldb_sql_options, mongreldb_sql_options_v2, mongreldb_sql_query_cancel,
+    mongreldb_sql_query_free, mongreldb_sql_query_get_status, mongreldb_sql_query_get_status_v2,
+    mongreldb_sql_query_start, mongreldb_sql_query_start_v2, mongreldb_sql_query_status_v1,
+    mongreldb_sql_query_status_v2, mongreldb_sql_query_t, mongreldb_sql_query_wait,
     mongreldb_sql_result_t,
 };
 

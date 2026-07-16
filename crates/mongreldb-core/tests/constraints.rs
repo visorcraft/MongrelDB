@@ -199,6 +199,8 @@ fn fk_on_update_cascade_rewrites_child_key() {
 fn fk_on_update_cascade_authorizes_changed_child_columns() {
     let (_dir, db, user, _order) = setup_update_fk(FkAction::Cascade);
     let principal = Principal {
+        user_id: 0,
+        created_epoch: 0,
         username: "writer".into(),
         is_admin: false,
         roles: Vec::new(),

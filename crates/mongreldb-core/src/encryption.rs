@@ -10,10 +10,7 @@
 //! (2)` — so no per-page nonce material is persisted. Decrypting a page
 //! requires unwrapping its run's DEK with the table KEK.
 
-use crate::error::Result;
-// `MongrelError` is only constructed by the feature-gated AES / key submodules.
-#[cfg(feature = "encryption")]
-use crate::error::MongrelError;
+use crate::error::{MongrelError, Result};
 #[cfg(feature = "encryption")]
 use zeroize::Zeroizing;
 
@@ -21,8 +18,8 @@ use zeroize::Zeroizing;
 pub const DEK_LEN: usize = 32;
 
 /// Fill a buffer with OS CSPRNG bytes. Always available.
-pub fn fill_random(buf: &mut [u8]) {
-    getrandom::getrandom(buf).expect("getrandom: OS CSPRNG unavailable");
+pub fn fill_random(buf: &mut [u8]) -> Result<()> {
+    getrandom::getrandom(buf).map_err(|error| MongrelError::EntropyUnavailable(error.to_string()))
 }
 
 /// Symmetric page cipher.
@@ -32,6 +29,36 @@ pub trait Cipher: Send + Sync {
 
     /// Decrypt a page payload.
     fn decrypt_page(&self, nonce: &[u8; 12], ciphertext: &[u8]) -> Result<Vec<u8>>;
+
+    fn encrypt_page_with_aad(
+        &self,
+        nonce: &[u8; 12],
+        plaintext: &[u8],
+        aad: &[u8],
+    ) -> Result<Vec<u8>> {
+        if aad.is_empty() {
+            self.encrypt_page(nonce, plaintext)
+        } else {
+            Err(MongrelError::Encryption(
+                "cipher does not support associated data".into(),
+            ))
+        }
+    }
+
+    fn decrypt_page_with_aad(
+        &self,
+        nonce: &[u8; 12],
+        ciphertext: &[u8],
+        aad: &[u8],
+    ) -> Result<Vec<u8>> {
+        if aad.is_empty() {
+            self.decrypt_page(nonce, ciphertext)
+        } else {
+            Err(MongrelError::Decryption(
+                "cipher does not support associated data".into(),
+            ))
+        }
+    }
 }
 
 /// No-op cipher for unencrypted tables. Used by default.
@@ -51,7 +78,7 @@ impl Cipher for PlaintextCipher {
 #[cfg(feature = "encryption")]
 mod aes {
     use super::{Cipher, MongrelError, Result};
-    use aes_gcm::aead::Aead;
+    use aes_gcm::aead::{Aead, Payload};
     use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 
     /// AES-256-GCM page cipher over an (unwrapped) per-run DEK. Per-page nonces
@@ -88,6 +115,40 @@ mod aes {
             let nonce = Nonce::from_slice(nonce);
             self.cipher
                 .decrypt(nonce, ciphertext)
+                .map_err(|e| MongrelError::Decryption(format!("aes decrypt: {e}")))
+        }
+
+        fn encrypt_page_with_aad(
+            &self,
+            nonce: &[u8; 12],
+            plaintext: &[u8],
+            aad: &[u8],
+        ) -> Result<Vec<u8>> {
+            self.cipher
+                .encrypt(
+                    Nonce::from_slice(nonce),
+                    Payload {
+                        msg: plaintext,
+                        aad,
+                    },
+                )
+                .map_err(|e| MongrelError::Encryption(format!("aes encrypt: {e}")))
+        }
+
+        fn decrypt_page_with_aad(
+            &self,
+            nonce: &[u8; 12],
+            ciphertext: &[u8],
+            aad: &[u8],
+        ) -> Result<Vec<u8>> {
+            self.cipher
+                .decrypt(
+                    Nonce::from_slice(nonce),
+                    Payload {
+                        msg: ciphertext,
+                        aad,
+                    },
+                )
                 .map_err(|e| MongrelError::Decryption(format!("aes decrypt: {e}")))
         }
     }
@@ -386,7 +447,7 @@ mod key {
     pub fn encrypt_blob(dek: &[u8; DEK_LEN], plaintext: &[u8]) -> Result<Vec<u8>> {
         let cipher = crate::encryption::AesCipher::new(&dek[..])?;
         let mut nonce = [0u8; 12];
-        fill_random(&mut nonce);
+        fill_random(&mut nonce)?;
         let ct = cipher.encrypt_page(&nonce, plaintext)?;
         let mut out = Vec::with_capacity(12 + ct.len());
         out.extend_from_slice(&nonce);
@@ -477,25 +538,25 @@ mod key {
     }
 
     /// Generate a fresh random 32-byte DEK from the OS CSPRNG.
-    pub fn generate_dek() -> Zeroizing<[u8; DEK_LEN]> {
+    pub fn generate_dek() -> Result<Zeroizing<[u8; DEK_LEN]>> {
         let mut k = Zeroizing::new([0u8; DEK_LEN]);
-        fill_random(k.as_mut());
-        k
+        fill_random(k.as_mut())?;
+        Ok(k)
     }
 
     /// Generate a fresh random 16-byte Argon2id salt from the OS CSPRNG.
-    pub fn random_salt() -> [u8; SALT_LEN] {
+    pub fn random_salt() -> Result<[u8; SALT_LEN]> {
         let mut s = [0u8; SALT_LEN];
-        fill_random(&mut s);
-        s
+        fill_random(&mut s)?;
+        Ok(s)
     }
 
     /// Generate a per-run nonce prefix: 8 random bytes + 4 zero bytes (the low
     /// 4 bytes are overlaid per page by [`build_page_nonce`]).
-    pub fn random_nonce_prefix() -> [u8; 12] {
+    pub fn random_nonce_prefix() -> Result<[u8; 12]> {
         let mut n = [0u8; 12];
-        fill_random(&mut n[..8]);
-        n
+        fill_random(&mut n[..8])?;
+        Ok(n)
     }
 
     /// Construct the deterministic 12-byte nonce for a page:
@@ -520,8 +581,8 @@ mod key {
         kek: &Kek,
         indexable_columns: &[(u16, u8)],
     ) -> Result<crate::encryption::RunEncryption> {
-        let dek = generate_dek();
-        let nonce_prefix = random_nonce_prefix();
+        let dek = generate_dek()?;
+        let nonce_prefix = random_nonce_prefix()?;
         let cipher: Box<dyn Cipher> = Box::new(crate::encryption::AesCipher::new(&dek[..])?);
         let dek_nonce = wrap_nonce(nonce_prefix, WRAP_KIND_DEK, 0);
         let wrapped = kek.wrap_dek(&dek, &dek_nonce)?;
@@ -677,11 +738,11 @@ mod tests {
     #[cfg(feature = "encryption")]
     #[test]
     fn kek_derive_is_deterministic_for_same_passphrase_and_salt() {
-        let salt = random_salt();
+        let salt = random_salt().unwrap();
         let k1 = Kek::derive("correct horse battery staple", &salt).unwrap();
         let k2 = Kek::derive("correct horse battery staple", &salt).unwrap();
-        let dek = generate_dek();
-        let np = random_nonce_prefix();
+        let dek = generate_dek().unwrap();
+        let np = random_nonce_prefix().unwrap();
         let w1 = k1.wrap_dek(&dek, &np).unwrap();
         let w2 = k2.wrap_dek(&dek, &np).unwrap();
         assert_eq!(w1, w2, "same passphrase+salt must yield same KEK");
@@ -690,12 +751,12 @@ mod tests {
     #[cfg(feature = "encryption")]
     #[test]
     fn kek_differs_for_different_salt() {
-        let s1 = random_salt();
-        let s2 = random_salt();
+        let s1 = random_salt().unwrap();
+        let s2 = random_salt().unwrap();
         let k1 = Kek::derive("passphrase", &s1).unwrap();
         let k2 = Kek::derive("passphrase", &s2).unwrap();
-        let dek = generate_dek();
-        let np = random_nonce_prefix();
+        let dek = generate_dek().unwrap();
+        let np = random_nonce_prefix().unwrap();
         let w1 = k1.wrap_dek(&dek, &np).unwrap();
         let w2 = k2.wrap_dek(&dek, &np).unwrap();
         assert_ne!(w1, w2, "different salts must yield different KEKs");
@@ -704,10 +765,10 @@ mod tests {
     #[cfg(feature = "encryption")]
     #[test]
     fn dek_wrap_unwrap_round_trip() {
-        let salt = random_salt();
+        let salt = random_salt().unwrap();
         let kek = Kek::derive("hunter2", &salt).unwrap();
-        let dek = generate_dek();
-        let np = random_nonce_prefix();
+        let dek = generate_dek().unwrap();
+        let np = random_nonce_prefix().unwrap();
         let wrapped = kek.wrap_dek(&dek, &np).unwrap();
         assert_eq!(wrapped.len(), DEK_LEN + 16);
         let unwrapped = kek.unwrap_dek(&wrapped, &np).unwrap();
@@ -717,11 +778,11 @@ mod tests {
     #[cfg(feature = "encryption")]
     #[test]
     fn unwrap_rejects_wrong_passphrase() {
-        let salt = random_salt();
+        let salt = random_salt().unwrap();
         let enc_kek = Kek::derive("right-pass", &salt).unwrap();
         let dec_kek = Kek::derive("wrong-pass", &salt).unwrap();
-        let dek = generate_dek();
-        let np = random_nonce_prefix();
+        let dek = generate_dek().unwrap();
+        let np = random_nonce_prefix().unwrap();
         let wrapped = enc_kek.wrap_dek(&dek, &np).unwrap();
         assert!(dec_kek.unwrap_dek(&wrapped, &np).is_err());
     }
@@ -729,7 +790,7 @@ mod tests {
     #[cfg(feature = "encryption")]
     #[test]
     fn page_nonce_overlays_column_and_page() {
-        let np = random_nonce_prefix();
+        let np = random_nonce_prefix().unwrap();
         let n = build_page_nonce(np, 0x0304, 0x0506);
         // high 8 bytes preserved (random), low 4 = column_id (LE) + page_seq (LE).
         assert_eq!(&n[..8], &np[..8]);
@@ -740,7 +801,7 @@ mod tests {
     #[cfg(feature = "encryption")]
     #[test]
     fn page_nonce_unique_per_column_and_page() {
-        let np = random_nonce_prefix();
+        let np = random_nonce_prefix().unwrap();
         let a = build_page_nonce(np, 1, 0);
         let b = build_page_nonce(np, 1, 1);
         let c = build_page_nonce(np, 2, 0);
@@ -752,7 +813,7 @@ mod tests {
     #[cfg(feature = "encryption")]
     #[test]
     fn column_key_is_deterministic_from_kek() {
-        let salt = random_salt();
+        let salt = random_salt().unwrap();
         let k1 = Kek::derive("pass", &salt).unwrap();
         let k2 = Kek::derive("pass", &salt).unwrap();
         let c1 = k1.derive_column_key(7);
@@ -766,7 +827,7 @@ mod tests {
     #[cfg(feature = "encryption")]
     #[test]
     fn hmac_token_collides_only_for_equal_values() {
-        let salt = random_salt();
+        let salt = random_salt().unwrap();
         let k = Kek::derive("pass", &salt).unwrap();
         let ck = k.derive_column_key(1);
         let a = hmac_token(&ck, b"hello");
@@ -782,7 +843,7 @@ mod tests {
     #[cfg(feature = "encryption")]
     #[test]
     fn ope_token_i64_preserves_order() {
-        let salt = random_salt();
+        let salt = random_salt().unwrap();
         let k = Kek::derive("pass", &salt).unwrap();
         let ck = k.derive_column_key(3);
         let vals = [i64::MIN, -1_000_000, -1, 0, 1, 42, 1_000_000, i64::MAX];
@@ -802,7 +863,7 @@ mod tests {
     #[cfg(feature = "encryption")]
     #[test]
     fn ope_token_is_non_linear() {
-        let salt = random_salt();
+        let salt = random_salt().unwrap();
         let k = Kek::derive("pass", &salt).unwrap();
         let ck = k.derive_column_key(9);
         let t = |x: i64| u128::from_be_bytes(ope_token_i64(&ck, x));
@@ -822,7 +883,7 @@ mod tests {
     #[cfg(feature = "encryption")]
     #[test]
     fn ope_token_f64_preserves_order() {
-        let salt = random_salt();
+        let salt = random_salt().unwrap();
         let k = Kek::derive("pass", &salt).unwrap();
         let ck = k.derive_column_key(4);
         let vals = [
@@ -848,9 +909,9 @@ mod tests {
     #[test]
     fn wrap_nonces_are_distinct_within_a_run() {
         use super::key::{wrap_nonce, WRAP_KIND_COLUMN, WRAP_KIND_DEK};
-        let salt = random_salt();
+        let salt = random_salt().unwrap();
         let kek = Kek::derive("pass", &salt).unwrap();
-        let np = random_nonce_prefix();
+        let np = random_nonce_prefix().unwrap();
 
         // Distinct nonces for the DEK and each column.
         let dek_n = wrap_nonce(np, WRAP_KIND_DEK, 0);
@@ -862,7 +923,7 @@ mod tests {
 
         // Wrapping the SAME key material under the DEK vs a column nonce yields
         // distinct ciphertext — the (KEK, nonce) pair is never reused.
-        let k = generate_dek();
+        let k = generate_dek().unwrap();
         let w_dek = kek.wrap_dek(&k, &dek_n).unwrap();
         let w_col = kek.wrap_column_key(&k, &col1).unwrap();
         assert_ne!(
@@ -884,7 +945,7 @@ mod tests {
     #[cfg(feature = "encryption")]
     #[test]
     fn wal_deks_are_domain_separated() {
-        let salt = random_salt();
+        let salt = random_salt().unwrap();
         let k = Kek::derive("pass", &salt).unwrap();
         let shared = k.derive_shared_wal_key();
         let tbl1 = k.derive_table_wal_key(1);

@@ -262,6 +262,14 @@ async fn multi_table_server_endpoints() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let receipt: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(receipt.as_object().unwrap().len(), 3);
+    assert_eq!(receipt["status"], "committed");
+    let epoch = receipt["epoch"].as_u64().unwrap();
+    assert_eq!(receipt["epoch_text"], epoch.to_string());
 
     // Verify the txn row is visible.
     let resp = app
@@ -402,6 +410,105 @@ async fn post_json(
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
     (status, v)
+}
+
+async fn delete_json(app: axum::Router, uri: &str) -> (u16, serde_json::Value) {
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("DELETE")
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let bytes = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024)
+        .await
+        .unwrap();
+    let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, value)
+}
+
+fn assert_durable_commit_response(status: u16, body: &serde_json::Value) {
+    assert_eq!(status, 409, "body: {body}");
+    assert_eq!(body["status"], "committed");
+    assert_eq!(body["committed"], true);
+    assert_eq!(body["retryable"], false);
+    assert_eq!(body["error"]["code"], "COMMIT_OUTCOME");
+    let epoch = body["epoch"].as_u64().unwrap();
+    assert_eq!(body["epoch_text"], epoch.to_string());
+}
+
+#[tokio::test]
+async fn legacy_and_kit_table_ddl_preserve_durable_commit_outcomes() {
+    let create_body = serde_json::json!({
+        "name": "users",
+        "columns": [{"id": 1, "name": "id", "ty": "int64", "primary_key": true}]
+    });
+    for uri in ["/tables", "/kit/create_table"] {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(Database::create(dir.path()).unwrap());
+        let app = build_app(Arc::clone(&db));
+        std::fs::rename(dir.path().join("CATALOG"), dir.path().join("CATALOG.saved")).unwrap();
+        std::fs::create_dir(dir.path().join("CATALOG")).unwrap();
+        let (status, body) = post_json(app, uri, create_body.clone()).await;
+        assert_durable_commit_response(status, &body);
+        assert!(db.table("users").is_ok());
+    }
+}
+
+#[tokio::test]
+async fn legacy_drop_table_preserves_durable_commit_outcome() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    db.create_table(
+        "users",
+        Schema {
+            columns: vec![ColumnDef {
+                id: 1,
+                name: "id".into(),
+                ty: TypeId::Int64,
+                flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
+            }],
+            ..Schema::default()
+        },
+    )
+    .unwrap();
+    let app = build_app(Arc::clone(&db));
+    std::fs::rename(dir.path().join("CATALOG"), dir.path().join("CATALOG.saved")).unwrap();
+    std::fs::create_dir(dir.path().join("CATALOG")).unwrap();
+    let (status, body) = delete_json(app, "/tables/users").await;
+    assert_durable_commit_response(status, &body);
+    assert!(db.table("users").is_err());
+}
+
+#[tokio::test]
+async fn legacy_drop_table_returns_exact_commit_receipt() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    db.create_table(
+        "users",
+        Schema {
+            columns: vec![ColumnDef {
+                id: 1,
+                name: "id".into(),
+                ty: TypeId::Int64,
+                flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
+            }],
+            ..Schema::default()
+        },
+    )
+    .unwrap();
+    let (status, body) = delete_json(build_app(db), "/tables/users").await;
+    assert_eq!(status, 200);
+    assert_eq!(body.as_object().unwrap().len(), 3);
+    assert_eq!(body["status"], "committed");
+    let epoch = body["epoch"].as_u64().unwrap();
+    assert_eq!(body["epoch_text"], epoch.to_string());
 }
 
 #[tokio::test]

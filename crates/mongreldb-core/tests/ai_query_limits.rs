@@ -630,6 +630,8 @@ fn ann_cap_returns_sub_percent_rls_hits_and_exactly_reranks_them() {
         masks: Vec::new(),
     };
     let principal = Principal {
+        user_id: 0,
+        created_epoch: 0,
         username: "tenant".into(),
         is_admin: false,
         roles: Vec::new(),

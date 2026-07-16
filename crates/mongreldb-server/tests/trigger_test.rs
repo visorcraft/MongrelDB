@@ -1,9 +1,9 @@
 use mongreldb_core::{
-    ColumnDef, ColumnFlags, Database, IndexDef, IndexKind, Schema, StoredTrigger, TriggerCell,
-    TriggerCondition, TriggerDefinition, TriggerEvent, TriggerExpr, TriggerProgram,
+    ColumnDef, ColumnFlags, Database, IndexDef, IndexKind, Permission, Schema, StoredTrigger,
+    TriggerCell, TriggerCondition, TriggerDefinition, TriggerEvent, TriggerExpr, TriggerProgram,
     TriggerRaiseAction, TriggerStep, TriggerTarget, TriggerTiming, TriggerValue, TypeId, Value,
 };
-use mongreldb_server::build_app;
+use mongreldb_server::{build_app, build_app_full};
 use std::sync::Arc;
 use tempfile::tempdir;
 use tower::ServiceExt;
@@ -12,7 +12,7 @@ use tower::ServiceExt;
 async fn trigger_endpoints_create_execute_describe_replace_and_drop() {
     let dir = tempdir().unwrap();
     let db = Arc::new(Database::create(dir.path()).unwrap());
-    let app = build_app(db);
+    let app = build_app(Arc::clone(&db));
 
     request(
         &app,
@@ -110,10 +110,67 @@ async fn trigger_endpoint_errors_are_enveloped() {
 }
 
 #[tokio::test]
+async fn trigger_ddl_preserves_durable_commit_outcome() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    create_table_with_bitmap_indexes(
+        &db,
+        "users",
+        vec![ColumnDef {
+            id: 1,
+            name: "id".into(),
+            ty: TypeId::Int64,
+            flags: pk_flags(),
+            default_value: None,
+        }],
+        Vec::new(),
+    );
+    create_table_with_bitmap_indexes(
+        &db,
+        "audit",
+        vec![
+            ColumnDef {
+                id: 1,
+                name: "id".into(),
+                ty: TypeId::Int64,
+                flags: pk_flags(),
+                default_value: None,
+            },
+            ColumnDef {
+                id: 2,
+                name: "user_id".into(),
+                ty: TypeId::Int64,
+                flags: ColumnFlags::empty(),
+                default_value: None,
+            },
+        ],
+        Vec::new(),
+    );
+    let app = build_app(Arc::clone(&db));
+    std::fs::rename(dir.path().join("CATALOG"), dir.path().join("CATALOG.saved")).unwrap();
+    std::fs::create_dir(dir.path().join("CATALOG")).unwrap();
+    let body = request(
+        &app,
+        "POST",
+        "/triggers",
+        Some(serde_json::json!({ "trigger": audit_trigger("users_ai", "users") })),
+        409,
+    )
+    .await;
+    assert_eq!(body["status"], "committed");
+    assert_eq!(body["committed"], true);
+    assert_eq!(body["retryable"], false);
+    assert_eq!(body["error"]["code"], "COMMIT_OUTCOME");
+    let epoch = body["epoch"].as_u64().unwrap();
+    assert_eq!(body["epoch_text"], epoch.to_string());
+    assert!(db.trigger("users_ai").is_some());
+}
+
+#[tokio::test]
 async fn trigger_endpoint_ddl_is_idempotent_by_key() {
     let dir = tempdir().unwrap();
     let db = Arc::new(Database::create(dir.path()).unwrap());
-    let app = build_app(db);
+    let app = build_app(Arc::clone(&db));
 
     request(
         &app,
@@ -148,8 +205,24 @@ async fn trigger_endpoint_ddl_is_idempotent_by_key() {
         "trigger": audit_trigger("users_ai", "users")
     });
     let created = request(&app, "POST", "/triggers", Some(body.clone()), 200).await;
-    let replayed = request(&app, "POST", "/triggers", Some(body), 200).await;
+    let replayed = request(&app, "POST", "/triggers", Some(body.clone()), 200).await;
     assert_eq!(created, replayed);
+    let restarted = build_app(db);
+    let replayed_after_restart = request(&restarted, "POST", "/triggers", Some(body), 200).await;
+    assert_eq!(created, replayed_after_restart);
+
+    let mismatch = request(
+        &app,
+        "POST",
+        "/triggers",
+        Some(serde_json::json!({
+            "idempotency_key": "trigger-create-k",
+            "trigger": audit_trigger("other_ai", "users")
+        })),
+        409,
+    )
+    .await;
+    assert_eq!(mismatch["error"]["code"], "IDEMPOTENCY_KEY_REUSE_MISMATCH");
 
     let replace_body = serde_json::json!({
         "idempotency_key": "trigger-replace-k",
@@ -186,6 +259,110 @@ async fn trigger_endpoint_ddl_is_idempotent_by_key() {
     )
     .await;
     assert_eq!(dropped, replayed);
+}
+
+#[tokio::test]
+async fn trigger_endpoint_rejects_invalid_idempotency_keys_before_mutation() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    let app = build_app(db);
+    let body = serde_json::json!({
+        "idempotency_key": "body-key",
+        "trigger": audit_trigger("users_ai", "users")
+    });
+
+    let mismatch = request_with_idempotency_key(
+        &app,
+        "POST",
+        "/triggers",
+        Some(body.clone()),
+        "header-key",
+        400,
+    )
+    .await;
+    assert_eq!(mismatch["error"]["code"], "INVALID_IDEMPOTENCY_KEY");
+
+    let invalid_header = axum::http::HeaderValue::from_bytes(&[0xff]).unwrap();
+    let invalid = request_inner(
+        &app,
+        "POST",
+        "/triggers",
+        Some(body),
+        Some(invalid_header),
+        400,
+    )
+    .await;
+    assert_eq!(invalid["error"]["code"], "INVALID_IDEMPOTENCY_KEY");
+
+    let listed = request(&app, "GET", "/triggers", None, 200).await;
+    assert_eq!(listed["triggers"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn trigger_replay_reauthorizes_and_user_recreation_cannot_inherit_receipt() {
+    let directory = tempdir().unwrap();
+    let db = Arc::new(Database::create_with_credentials(directory.path(), "admin", "pw").unwrap());
+    create_table_with_bitmap_indexes(
+        &db,
+        "users",
+        vec![col_def(1, "id", TypeId::Int64, pk_flags())],
+        Vec::new(),
+    );
+    create_table_with_bitmap_indexes(
+        &db,
+        "audit",
+        vec![
+            col_def(1, "id", TypeId::Int64, pk_flags()),
+            col_def(2, "user_id", TypeId::Int64, ColumnFlags::empty()),
+        ],
+        Vec::new(),
+    );
+    db.create_user("alice", "pw").unwrap();
+    db.create_role("ddl_writer").unwrap();
+    db.grant_permission("ddl_writer", Permission::Ddl).unwrap();
+    db.grant_role("alice", "ddl_writer").unwrap();
+    let app = build_app_full(Arc::clone(&db), std::iter::empty(), None, None, true);
+    let body = serde_json::json!({
+        "idempotency_key": "trigger-auth-key",
+        "trigger": audit_trigger("users_ai", "users")
+    });
+    let first = request_auth(
+        &app,
+        "POST",
+        "/triggers",
+        Some(body.clone()),
+        "Basic YWxpY2U6cHc=",
+        200,
+    )
+    .await;
+    assert_eq!(first["trigger"]["version"], 1);
+
+    db.revoke_role("alice", "ddl_writer").unwrap();
+    let revoked = request_auth(
+        &app,
+        "POST",
+        "/triggers",
+        Some(body.clone()),
+        "Basic YWxpY2U6cHc=",
+        403,
+    )
+    .await;
+    assert!(revoked.get("trigger").is_none());
+
+    db.drop_user("alice").unwrap();
+    db.create_user("alice", "pw2").unwrap();
+    let recreated = request_auth(
+        &app,
+        "POST",
+        "/triggers",
+        Some(body),
+        "Basic YWxpY2U6cHcy",
+        403,
+    )
+    .await;
+    assert!(recreated.get("trigger").is_none());
+    assert_eq!(db.triggers().len(), 1);
+    assert_eq!(db.trigger("users_ai").unwrap().version, 1);
 }
 
 fn audit_trigger(name: &str, source_table: &str) -> StoredTrigger {
@@ -283,7 +460,7 @@ async fn request_with_idempotency_key(
         method,
         uri,
         body,
-        Some(idempotency_key),
+        Some(axum::http::HeaderValue::from_str(idempotency_key).unwrap()),
         expected_status,
     )
     .await
@@ -294,7 +471,7 @@ async fn request_inner(
     method: &str,
     uri: &str,
     body: Option<serde_json::Value>,
-    idempotency_key: Option<&str>,
+    idempotency_key: Option<axum::http::HeaderValue>,
     expected_status: u16,
 ) -> serde_json::Value {
     let mut builder = axum::http::Request::builder().method(method).uri(uri);
@@ -320,7 +497,42 @@ async fn request_inner(
     if body.is_empty() {
         serde_json::Value::Null
     } else {
-        serde_json::from_slice(&body).unwrap()
+        serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null)
+    }
+}
+
+async fn request_auth(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    body: Option<serde_json::Value>,
+    authorization: &str,
+    expected_status: u16,
+) -> serde_json::Value {
+    let mut builder = axum::http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("authorization", authorization);
+    if body.is_some() {
+        builder = builder.header("content-type", "application/json");
+    }
+    let body = body
+        .map(|value| axum::body::Body::from(value.to_string()))
+        .unwrap_or_else(axum::body::Body::empty);
+    let response = app
+        .clone()
+        .oneshot(builder.body(body).unwrap())
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(status, expected_status);
+    if body.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null)
     }
 }
 

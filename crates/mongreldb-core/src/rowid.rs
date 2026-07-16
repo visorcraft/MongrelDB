@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::{MongrelError, Result};
+
 /// A stable, dense row identifier shared by *every* index in a table.
 ///
 /// Row IDs are allocated monotonically and **never reused**. Deletes record a
@@ -15,8 +17,8 @@ impl RowId {
     pub const NULL_SORT_KEY: u16 = 0xFFFF;
 
     #[inline]
-    pub fn next(self) -> RowId {
-        RowId(self.0.wrapping_add(1))
+    pub fn next(self) -> Option<RowId> {
+        self.0.checked_add(1).map(RowId)
     }
 }
 
@@ -45,17 +47,27 @@ impl RowIdAllocator {
 
     /// Allocate a single new row id.
     #[inline]
-    pub fn alloc(&mut self) -> RowId {
+    pub fn alloc(&mut self) -> Result<RowId> {
         let id = self.next;
-        self.next += 1;
-        RowId(id)
+        self.next = self
+            .next
+            .checked_add(1)
+            .filter(|next| *next < u64::MAX)
+            .ok_or_else(row_id_exhausted)?;
+        Ok(RowId(id))
     }
 
     /// Allocate a contiguous range of `n` row ids, returning the inclusive start.
-    pub fn alloc_range(&mut self, n: u64) -> RowId {
+    pub fn alloc_range(&mut self, n: u64) -> Result<RowId> {
         let start = self.next;
-        self.next = self.next.saturating_add(n);
-        RowId(start)
+        if n != 0 {
+            self.next = self
+                .next
+                .checked_add(n)
+                .filter(|next| *next < u64::MAX)
+                .ok_or_else(row_id_exhausted)?;
+        }
+        Ok(RowId(start))
     }
 
     #[inline]
@@ -64,11 +76,19 @@ impl RowIdAllocator {
     }
 
     /// Advance the allocator past `id` if it is ahead. Used during recovery.
-    pub fn advance_to(&mut self, id: RowId) {
+    pub fn advance_to(&mut self, id: RowId) -> Result<()> {
         if id.0 >= self.next {
-            self.next = id.0 + 1;
+            self.next =
+                id.0.checked_add(1)
+                    .filter(|next| *next < u64::MAX)
+                    .ok_or_else(row_id_exhausted)?;
         }
+        Ok(())
     }
+}
+
+fn row_id_exhausted() -> MongrelError {
+    MongrelError::Full("row-id namespace exhausted".into())
 }
 
 #[cfg(test)]
@@ -78,18 +98,33 @@ mod tests {
     #[test]
     fn allocates_monotonically() {
         let mut a = RowIdAllocator::default();
-        assert_eq!(a.alloc(), RowId(0));
-        assert_eq!(a.alloc(), RowId(1));
-        let start = a.alloc_range(3);
+        assert_eq!(a.alloc().unwrap(), RowId(0));
+        assert_eq!(a.alloc().unwrap(), RowId(1));
+        let start = a.alloc_range(3).unwrap();
         assert_eq!(start, RowId(2));
         assert_eq!(a.current(), RowId(5));
-        assert_eq!(a.alloc(), RowId(5));
+        assert_eq!(a.alloc().unwrap(), RowId(5));
     }
 
     #[test]
     fn advance_to_moves_head() {
         let mut a = RowIdAllocator::default();
-        a.advance_to(RowId(100));
-        assert_eq!(a.alloc(), RowId(101));
+        a.advance_to(RowId(100)).unwrap();
+        assert_eq!(a.alloc().unwrap(), RowId(101));
+    }
+
+    #[test]
+    fn exhaustion_never_wraps_or_partially_allocates() {
+        let mut a = RowIdAllocator::new(u64::MAX - 2);
+        assert_eq!(a.alloc().unwrap(), RowId(u64::MAX - 2));
+        assert!(matches!(a.alloc(), Err(MongrelError::Full(_))));
+        assert_eq!(a.current(), RowId(u64::MAX - 1));
+        assert!(matches!(a.alloc_range(2), Err(MongrelError::Full(_))));
+        assert_eq!(a.current(), RowId(u64::MAX - 1));
+        assert!(matches!(
+            a.advance_to(RowId(u64::MAX)),
+            Err(MongrelError::Full(_))
+        ));
+        assert_eq!(a.current(), RowId(u64::MAX - 1));
     }
 }

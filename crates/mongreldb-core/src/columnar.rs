@@ -17,6 +17,9 @@ use crate::memtable::Value;
 use crate::page::Encoding;
 use crate::schema::TypeId;
 use serde::{Deserialize, Serialize};
+use std::io::Read;
+
+const MAX_PAGE_DECOMPRESSED_BYTES: usize = 64 * 1024 * 1024;
 
 /// Encode a column's values into a single page.
 pub fn encode_column(ty: TypeId, values: &[Value]) -> Result<Vec<u8>> {
@@ -379,6 +382,13 @@ fn zstd_compress(data: &[u8]) -> Result<Vec<u8>> {
 /// to level 3. `level < 0` is the sentinel for "no compression" (raw `Plain`
 /// pages) used by [`Table::bulk_load_fast`].
 fn zstd_compress_level(data: &[u8], level: i32) -> Result<Vec<u8>> {
+    if data.len() > MAX_PAGE_DECOMPRESSED_BYTES {
+        return Err(MongrelError::ResourceLimitExceeded {
+            resource: "column page bytes",
+            requested: data.len(),
+            limit: MAX_PAGE_DECOMPRESSED_BYTES,
+        });
+    }
     zstd::encode_all(data, level)
         .map_err(|e| MongrelError::InvalidArgument(format!("zstd compress: {e}")))
 }
@@ -402,12 +412,18 @@ fn max_decompressed_bytes(ty: TypeId, n: usize, algo: u8) -> usize {
     // The validity section is a 4-byte big-endian length prefix + ceil(n/8) bits.
     let validity = 4 + n.div_ceil(8);
     if matches!(algo, ALGO_ZSTD_DELTA | ALGO_LZ4_DELTA) {
-        return validity + n.saturating_mul(8);
+        return validity
+            .saturating_add(n.saturating_mul(8))
+            .min(MAX_PAGE_DECOMPRESSED_BYTES);
     }
     if matches!(algo, ALGO_ZSTD_DICT | ALGO_LZ4_DICT) {
         // index_count + table_count (8) + n× u32 indices + table: ≤ n unique
         // entries, each a 4-byte length + its bytes.
-        return validity + 8 + n.saturating_mul(4) + n.saturating_mul(4 + MAX_VAR_BYTES_PER_ROW);
+        return validity
+            .saturating_add(8)
+            .saturating_add(n.saturating_mul(4))
+            .saturating_add(n.saturating_mul(4 + MAX_VAR_BYTES_PER_ROW))
+            .min(MAX_PAGE_DECOMPRESSED_BYTES);
     }
     let payload = match ty {
         TypeId::Bytes | TypeId::Enum { .. } => {
@@ -416,7 +432,9 @@ fn max_decompressed_bytes(ty: TypeId, n: usize, algo: u8) -> usize {
         TypeId::Embedding { dim } => (dim as usize).saturating_mul(8).saturating_mul(n),
         _ => n.saturating_mul(ty.fixed_size().unwrap_or(8)),
     };
-    validity + payload
+    validity
+        .saturating_add(payload)
+        .min(MAX_PAGE_DECOMPRESSED_BYTES)
 }
 
 fn lz4_decompress(data: &[u8], max_bytes: usize) -> Result<Vec<u8>> {
@@ -440,7 +458,12 @@ fn lz4_decompress(data: &[u8], max_bytes: usize) -> Result<Vec<u8>> {
 fn zstd_decompress(data: &[u8], max_bytes: usize) -> Result<Vec<u8>> {
     // zstd streams (grows incrementally), but a bomb can still expand far past
     // any sane page; reject anything beyond the page-shape bound.
-    let out = zstd::decode_all(data)
+    let decoder = zstd::stream::read::Decoder::new(data)
+        .map_err(|e| MongrelError::InvalidArgument(format!("zstd decompress: {e}")))?;
+    let mut out = Vec::with_capacity(max_bytes.min(1024 * 1024));
+    decoder
+        .take(max_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut out)
         .map_err(|e| MongrelError::InvalidArgument(format!("zstd decompress: {e}")))?;
     if out.len() > max_bytes {
         return Err(MongrelError::InvalidArgument(format!(

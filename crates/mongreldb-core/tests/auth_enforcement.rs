@@ -6,6 +6,7 @@
 //! fail-closed semantics. Table/Transaction/SQL enforcement lands in Phase 2.
 
 use mongreldb_core::auth::Permission;
+use mongreldb_core::catalog;
 use mongreldb_core::{
     query::{AnnRerankRequest, Condition, Query, VectorMetric},
     schema::*,
@@ -84,6 +85,158 @@ fn three_column_schema() -> Schema {
         ],
         ..Schema::default()
     }
+}
+
+fn query_as(
+    db: &Database,
+    principal: &mongreldb_core::Principal,
+    table_name: &str,
+    query: &Query,
+    projection: Option<&[u16]>,
+) -> mongreldb_core::Result<Vec<mongreldb_core::Row>> {
+    let condition_columns = mongreldb_core::query::condition_columns(&query.conditions);
+    db.with_authorized_read(
+        table_name,
+        Some(principal),
+        true,
+        |table, snapshot, allowed, effective_principal| {
+            let allowed_columns = db.select_column_ids_for(table_name, effective_principal)?;
+            db.require_columns_for(
+                table_name,
+                ColumnOperation::Select,
+                &condition_columns,
+                effective_principal,
+            )?;
+            if let Some(projection) = projection {
+                db.require_columns_for(
+                    table_name,
+                    ColumnOperation::Select,
+                    projection,
+                    effective_principal,
+                )?;
+            }
+            let mut rows = table.query_at_with_allowed(query, snapshot, allowed)?;
+            let projection = projection.map(|columns| {
+                columns
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::HashSet<_>>()
+            });
+            for row in &mut rows {
+                row.columns.retain(|column, _| {
+                    allowed_columns.contains(column)
+                        && projection
+                            .as_ref()
+                            .map_or(true, |projection| projection.contains(column))
+                });
+            }
+            db.secure_rows_for(table_name, rows, effective_principal)
+        },
+    )
+}
+
+fn ann_rerank_as(
+    db: &Database,
+    principal: &mongreldb_core::Principal,
+    table_name: &str,
+    request: &AnnRerankRequest,
+) -> mongreldb_core::Result<Vec<mongreldb_core::query::AnnRerankHit>> {
+    let authorization = ReadAuthorization {
+        operation: ColumnOperation::Select,
+        columns: vec![request.column_id],
+        permissions: Vec::new(),
+    };
+    db.with_authorized_scored_read_context(
+        table_name,
+        Some(principal),
+        true,
+        Some(&authorization),
+        None,
+        |table, snapshot, candidate_authorization, effective_principal| {
+            db.require_columns_for(
+                table_name,
+                ColumnOperation::Select,
+                &[request.column_id],
+                effective_principal,
+            )?;
+            table.ann_rerank_at_with_candidate_authorization_on_generation(
+                request,
+                snapshot,
+                candidate_authorization,
+                None,
+            )
+        },
+    )
+}
+
+fn approx_aggregate_as(
+    db: &Database,
+    principal: &mongreldb_core::Principal,
+    table_name: &str,
+    conditions: &[Condition],
+    column: Option<u16>,
+    agg: ApproxAgg,
+    z: f64,
+) -> mongreldb_core::Result<Option<mongreldb_core::ApproxResult>> {
+    let mut columns = mongreldb_core::query::condition_columns(conditions);
+    columns.extend(column);
+    columns.sort_unstable();
+    columns.dedup();
+    let authorization = ReadAuthorization {
+        operation: ColumnOperation::Select,
+        columns,
+        permissions: Vec::new(),
+    };
+    db.with_authorized_scored_read_context(
+        table_name,
+        Some(principal),
+        true,
+        Some(&authorization),
+        None,
+        |table, _, candidate_authorization, _| {
+            table.approx_aggregate_with_candidate_authorization(
+                conditions,
+                column,
+                agg,
+                z,
+                candidate_authorization,
+            )
+        },
+    )
+}
+
+fn incremental_aggregate_as(
+    db: &Database,
+    principal: &mongreldb_core::Principal,
+    table_name: &str,
+    conditions: &[Condition],
+    column: Option<u16>,
+    _agg: NativeAgg,
+) -> mongreldb_core::Result<()> {
+    let mut columns = mongreldb_core::query::condition_columns(conditions);
+    columns.extend(column);
+    columns.sort_unstable();
+    columns.dedup();
+    db.with_authorized_read(
+        table_name,
+        Some(principal),
+        true,
+        |_, _, _, effective_principal| {
+            db.require_columns_for(
+                table_name,
+                ColumnOperation::Select,
+                &columns,
+                effective_principal,
+            )?;
+            if db.security_active_for(table_name) {
+                return Err(MongrelError::InvalidArgument(
+                    "incremental aggregate is unsupported while RLS or column masks are active"
+                        .into(),
+                ));
+            }
+            Ok(())
+        },
+    )
 }
 
 #[test]
@@ -231,31 +384,32 @@ fn secure_native_wrappers_apply_rls_masks_and_live_revocation() {
         })
         .unwrap();
 
-    let alice = Database::open_with_credentials(path, "alice", "alice-pw").unwrap();
-    let rows = alice
-        .query_for_current_principal("docs", &Query::new(), None)
-        .unwrap();
+    let alice = admin.resolve_principal("alice").unwrap();
+    let rows = query_as(&admin, &alice, "docs", &Query::new(), None).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].columns.get(&1), Some(&Value::Int64(1)));
     assert_eq!(
         rows[0].columns.get(&3),
         Some(&Value::Bytes(b"***".to_vec()))
     );
-    let ann_rows = alice
-        .query_for_current_principal(
-            "docs",
-            &Query::new().and(Condition::Ann {
-                column_id: 4,
-                query: vec![1.0, 0.0],
-                k: 10,
-            }),
-            None,
-        )
-        .unwrap();
+    let ann_rows = query_as(
+        &admin,
+        &alice,
+        "docs",
+        &Query::new().and(Condition::Ann {
+            column_id: 4,
+            query: vec![1.0, 0.0],
+            k: 10,
+        }),
+        None,
+    )
+    .unwrap();
     assert_eq!(ann_rows.len(), 1);
     assert_eq!(ann_rows[0].columns.get(&1), Some(&Value::Int64(1)));
     let (reranked, trace) = mongreldb_core::trace::QueryTrace::capture(|| {
-        alice.ann_rerank_for_current_principal(
+        ann_rerank_as(
+            &admin,
+            &alice,
             "docs",
             &AnnRerankRequest {
                 column_id: 4,
@@ -271,26 +425,21 @@ fn secure_native_wrappers_apply_rls_masks_and_live_revocation() {
     assert_eq!(reranked[0].row_id, rows[0].row_id);
     assert!(trace.rls_rows_evaluated < 10, "{trace:?}");
     assert_eq!(trace.rls_policy_columns_decoded, trace.rls_rows_evaluated);
-    let approximate = alice
-        .approx_aggregate_for_current_principal("docs", &[], None, ApproxAgg::Count, 1.96)
-        .unwrap()
-        .unwrap();
+    let approximate =
+        approx_aggregate_as(&admin, &alice, "docs", &[], None, ApproxAgg::Count, 1.96)
+            .unwrap()
+            .unwrap();
     assert_eq!(approximate.point, 1.0);
     assert_eq!(approximate.n_population, 10);
     assert_eq!(approximate.n_sample_live, 10);
-    let masked_sum = alice
-        .approx_aggregate_for_current_principal("docs", &[], Some(5), ApproxAgg::Sum, 1.96)
-        .unwrap()
-        .unwrap();
+    let masked_sum =
+        approx_aggregate_as(&admin, &alice, "docs", &[], Some(5), ApproxAgg::Sum, 1.96)
+            .unwrap()
+            .unwrap();
     assert_eq!(masked_sum.point, 0.0);
     assert_eq!(masked_sum.n_passing, 0);
     assert!(matches!(
-        alice.incremental_aggregate_for_current_principal(
-            "docs",
-            &[],
-            None,
-            NativeAgg::Count
-        ),
+        incremental_aggregate_as(&admin, &alice, "docs", &[], None, NativeAgg::Count),
         Err(MongrelError::InvalidArgument(message))
             if message.contains("unsupported while RLS or column masks are active")
     ));
@@ -317,7 +466,7 @@ fn secure_native_wrappers_apply_rls_masks_and_live_revocation() {
         )
         .unwrap();
     assert!(matches!(
-        alice.approx_aggregate_for_current_principal("docs", &[], Some(5), ApproxAgg::Sum, 1.96),
+        approx_aggregate_as(&admin, &alice, "docs", &[], Some(5), ApproxAgg::Sum, 1.96,),
         Err(MongrelError::PermissionDenied { .. })
     ));
     assert_eq!(
@@ -330,11 +479,11 @@ fn secure_native_wrappers_apply_rls_masks_and_live_revocation() {
 
     admin.revoke_role("alice", "reader").unwrap();
     assert!(matches!(
-        alice.query_for_current_principal("docs", &Query::new(), None),
+        query_as(&admin, &alice, "docs", &Query::new(), None),
         Err(MongrelError::PermissionDenied { .. })
     ));
     assert!(matches!(
-        alice.approx_aggregate_for_current_principal("docs", &[], None, ApproxAgg::Count, 1.96),
+        approx_aggregate_as(&admin, &alice, "docs", &[], None, ApproxAgg::Count, 1.96,),
         Err(MongrelError::PermissionDenied { .. })
     ));
 }
@@ -878,37 +1027,29 @@ fn disable_auth_refuses_if_already_disabled() {
     );
 }
 
-/// `refresh_principal` picks up a newly granted permission without
-/// re-verifying the password (spec §9 decision 3).
+/// Resolving a catalog principal picks up a newly granted permission without
+/// opening a second engine for the same database.
 #[test]
-fn refresh_principal_picks_up_new_grant() {
+fn resolved_principal_picks_up_new_grant() {
     let dir = tempdir().unwrap();
     let path = dir.path().to_path_buf();
-    {
-        let db = Database::create_with_credentials(&path, "admin", "admin-pw").unwrap();
-        db.create_table("orders", int_pk_schema()).unwrap();
-        db.create_user("alice", "alice-pw").unwrap();
-        // alice has no permissions yet.
-    }
-    let db = Database::open_with_credentials(&path, "alice", "alice-pw").unwrap();
+    let db = Database::create_with_credentials(&path, "admin", "admin-pw").unwrap();
+    db.create_table("orders", int_pk_schema()).unwrap();
+    db.create_user("alice", "alice-pw").unwrap();
+    let alice = db.resolve_principal("alice").unwrap();
 
     // alice cannot do DDL yet.
-    match db.create_table("more", int_pk_schema()) {
+    match db.require_for(Some(&alice), &Permission::Ddl) {
         Err(MongrelError::PermissionDenied { .. }) => {}
         other => panic!("expected PermissionDenied pre-grant, got {other:?}"),
     }
 
-    // Admin (separate handle) grants alice the Ddl permission.
-    let admin_db = Database::open_with_credentials(&path, "admin", "admin-pw").unwrap();
-    admin_db.create_role("ddl_role").unwrap();
-    admin_db
-        .grant_permission("ddl_role", Permission::Ddl)
-        .unwrap();
-    admin_db.grant_role("alice", "ddl_role").unwrap();
-    drop(admin_db);
+    db.create_role("ddl_role").unwrap();
+    db.grant_permission("ddl_role", Permission::Ddl).unwrap();
+    db.grant_role("alice", "ddl_role").unwrap();
 
-    // Existing handles refresh before enforcement and pick up the grant.
-    db.create_table("now_yes", int_pk_schema()).unwrap();
+    let refreshed = db.resolve_principal("alice").unwrap();
+    db.require_for(Some(&refreshed), &Permission::Ddl).unwrap();
 }
 
 /// Backward compatibility: a catalog serialized without `require_auth`
@@ -1140,7 +1281,7 @@ fn update_authorization_uses_changed_columns_not_full_post_image() {
         )
         .unwrap();
     admin.grant_role("writer", "limited_writer").unwrap();
-    let writer = Database::open_with_credentials(dir.path(), "writer", "writer-pw").unwrap();
+    let writer = admin.resolve_principal("writer").unwrap();
 
     let row_id = admin
         .table("docs")
@@ -1149,23 +1290,22 @@ fn update_authorization_uses_changed_columns_not_full_post_image() {
         .visible_rows(admin.snapshot().0)
         .unwrap()[0]
         .row_id;
-    let reads_before = writer.security_catalog_disk_read_count();
-    writer
-        .transaction(|transaction| {
-            transaction.update_many(
-                "docs",
-                vec![(row_id, vec![(2, Value::Bytes(b"changed".to_vec()))])],
-            )?;
-            Ok(())
-        })
+    let reads_before = admin.security_catalog_disk_read_count();
+    let mut transaction = admin.begin_as(Some(writer.clone()));
+    transaction
+        .update_many(
+            "docs",
+            vec![(row_id, vec![(2, Value::Bytes(b"changed".to_vec()))])],
+        )
         .unwrap();
-    assert_eq!(writer.security_catalog_disk_read_count(), reads_before);
+    transaction.commit().unwrap();
+    assert_eq!(admin.security_catalog_disk_read_count(), reads_before);
 
-    let current = writer
+    let current = admin
         .table("docs")
         .unwrap()
         .lock()
-        .visible_rows(writer.snapshot().0)
+        .visible_rows(admin.snapshot().0)
         .unwrap()
         .into_iter()
         .next()
@@ -1173,7 +1313,7 @@ fn update_authorization_uses_changed_columns_not_full_post_image() {
     assert_eq!(current.columns[&2], Value::Bytes(b"changed".to_vec()));
     assert_eq!(current.columns[&3], Value::Bytes(b"restricted".to_vec()));
 
-    let mut denied = writer.begin();
+    let mut denied = admin.begin_as(Some(writer.clone()));
     assert!(matches!(
         denied.update_many(
             "docs",
@@ -1186,34 +1326,30 @@ fn update_authorization_uses_changed_columns_not_full_post_image() {
     ));
     denied.rollback();
 
-    writer
-        .transaction(|transaction| {
-            transaction.upsert(
-                "docs",
-                vec![
-                    (1, Value::Int64(1)),
-                    (2, Value::Bytes(b"ignored".to_vec())),
-                    (3, Value::Bytes(b"ignored".to_vec())),
-                ],
-                mongreldb_core::UpsertAction::DoUpdate(vec![(
-                    2,
-                    Value::Bytes(b"upserted".to_vec()),
-                )]),
-            )?;
-            Ok(())
-        })
+    let mut transaction = admin.begin_as(Some(writer.clone()));
+    transaction
+        .upsert(
+            "docs",
+            vec![
+                (1, Value::Int64(1)),
+                (2, Value::Bytes(b"ignored".to_vec())),
+                (3, Value::Bytes(b"ignored".to_vec())),
+            ],
+            mongreldb_core::UpsertAction::DoUpdate(vec![(2, Value::Bytes(b"upserted".to_vec()))]),
+        )
         .unwrap();
+    transaction.commit().unwrap();
 
-    let current = writer
+    let current = admin
         .table("docs")
         .unwrap()
         .lock()
-        .visible_rows(writer.snapshot().0)
+        .visible_rows(admin.snapshot().0)
         .unwrap()
         .into_iter()
         .next()
         .unwrap();
-    let mut revoked = writer.begin();
+    let mut revoked = admin.begin_as(Some(writer));
     revoked
         .update_many(
             "docs",
@@ -1228,7 +1364,7 @@ fn update_authorization_uses_changed_columns_not_full_post_image() {
 }
 
 #[test]
-fn security_catalog_reload_is_version_gated_and_fails_closed() {
+fn shared_security_catalog_is_version_gated_and_fails_closed() {
     let dir = tempdir().unwrap();
     let admin = Database::create_with_credentials(dir.path(), "admin", "admin-pw").unwrap();
     admin.create_table("docs", int_pk_schema()).unwrap();
@@ -1243,46 +1379,80 @@ fn security_catalog_reload_is_version_gated_and_fails_closed() {
         )
         .unwrap();
     admin.grant_role("writer", "writer_role").unwrap();
-    let writer = Database::open_with_credentials(dir.path(), "writer", "writer-pw").unwrap();
+    let writer = admin.resolve_principal("writer").unwrap();
 
-    let before = writer.security_catalog_disk_read_count();
-    writer
-        .transaction(|transaction| {
-            transaction.put("docs", vec![(1, Value::Int64(1))])?;
-            Ok(())
-        })
-        .unwrap();
-    assert_eq!(writer.security_catalog_disk_read_count(), before);
+    let before = admin.security_catalog_disk_read_count();
+    let mut transaction = admin.begin_as(Some(writer.clone()));
+    transaction.put("docs", vec![(1, Value::Int64(1))]).unwrap();
+    transaction.commit().unwrap();
+    assert_eq!(admin.security_catalog_disk_read_count(), before);
 
     admin.create_role("unrelated").unwrap();
-    writer
-        .transaction(|transaction| {
-            transaction.put("docs", vec![(1, Value::Int64(2))])?;
-            Ok(())
-        })
-        .unwrap();
-    assert_eq!(writer.security_catalog_disk_read_count(), before + 1);
+    let mut transaction = admin.begin_as(Some(writer.clone()));
+    transaction.put("docs", vec![(1, Value::Int64(2))]).unwrap();
+    transaction.commit().unwrap();
+    assert_eq!(admin.security_catalog_disk_read_count(), before);
 
-    admin.create_role("reload_must_fail").unwrap();
-    std::fs::remove_file(dir.path().join("CATALOG")).unwrap();
-    let mut transaction = writer.begin();
+    let mut transaction = admin.begin_as(Some(writer));
     transaction.put("docs", vec![(1, Value::Int64(3))]).unwrap();
-    assert!(transaction.commit().is_err());
-    assert_eq!(writer.table("docs").unwrap().lock().count(), 2);
+    admin.revoke_role("writer", "writer_role").unwrap();
+    assert!(matches!(
+        transaction.commit(),
+        Err(MongrelError::PermissionDenied { .. })
+    ));
+    assert_eq!(admin.table("docs").unwrap().lock().count(), 2);
 }
 
 #[test]
-fn failed_security_catalog_persist_does_not_publish_mutation() {
+fn failed_security_catalog_checkpoint_reports_durable_commit_and_recovers() {
     let dir = tempdir().unwrap();
     let db = Database::create_with_credentials(dir.path(), "admin", "admin-pw").unwrap();
     let before = db.catalog_snapshot();
-    let moved = dir.path().with_extension("temporarily-unavailable");
+    let catalog = dir.path().join("CATALOG");
+    let saved_catalog = dir.path().join("CATALOG.saved");
 
-    std::fs::rename(dir.path(), &moved).unwrap();
+    std::fs::rename(&catalog, &saved_catalog).unwrap();
+    std::fs::create_dir(&catalog).unwrap();
     let result = db.create_role("must_not_publish");
-    std::fs::rename(&moved, dir.path()).unwrap();
+    std::fs::remove_dir(&catalog).unwrap();
+    std::fs::rename(&saved_catalog, &catalog).unwrap();
 
-    assert!(result.is_err());
+    assert!(matches!(result, Err(MongrelError::DurableCommit { .. })));
+    let after = db.catalog_snapshot();
+    assert_eq!(after.security_version, before.security_version + 1);
+    assert!(after
+        .roles
+        .iter()
+        .any(|role| role.name == "must_not_publish"));
+
+    assert!(db.create_role("after_restore").is_err());
+    drop(db);
+    let reopened = Database::open_with_credentials(dir.path(), "admin", "admin-pw").unwrap();
+    assert!(reopened
+        .roles()
+        .iter()
+        .any(|role| role.name == "must_not_publish"));
+    assert!(reopened
+        .roles()
+        .iter()
+        .all(|role| role.name != "after_restore"));
+}
+
+#[test]
+fn controlled_security_catalog_rejection_does_not_publish_mutation() {
+    let dir = tempdir().unwrap();
+    let db = Database::create_with_credentials(dir.path(), "admin", "admin-pw").unwrap();
+    let before = db.catalog_snapshot();
+    let mut callbacks = 0;
+
+    let error = db
+        .create_role_controlled("must_not_publish", || {
+            callbacks += 1;
+            Err(MongrelError::Other("cancelled before publish".into()))
+        })
+        .unwrap_err();
+    assert_eq!(callbacks, 1);
+    assert!(error.to_string().contains("cancelled before publish"));
     let after = db.catalog_snapshot();
     assert_eq!(after.security_version, before.security_version);
     assert!(after
@@ -1290,17 +1460,12 @@ fn failed_security_catalog_persist_does_not_publish_mutation() {
         .iter()
         .all(|role| role.name != "must_not_publish"));
 
-    db.create_role("after_restore").unwrap();
     drop(db);
     let reopened = Database::open_with_credentials(dir.path(), "admin", "admin-pw").unwrap();
     assert!(reopened
         .roles()
         .iter()
         .all(|role| role.name != "must_not_publish"));
-    assert!(reopened
-        .roles()
-        .iter()
-        .any(|role| role.name == "after_restore"));
 }
 
 #[test]
@@ -1358,7 +1523,7 @@ fn trigger_added_update_column_is_finally_authorized() {
         )
         .unwrap();
     admin.grant_role("writer", "limited_writer").unwrap();
-    let writer = Database::open_with_credentials(dir.path(), "writer", "writer-pw").unwrap();
+    let writer = admin.resolve_principal("writer").unwrap();
     let row_id = admin
         .table("docs")
         .unwrap()
@@ -1366,7 +1531,7 @@ fn trigger_added_update_column_is_finally_authorized() {
         .visible_rows(admin.snapshot().0)
         .unwrap()[0]
         .row_id;
-    let mut transaction = writer.begin();
+    let mut transaction = admin.begin_as(Some(writer));
     transaction
         .update_many(
             "docs",
@@ -1435,9 +1600,9 @@ fn commit_rechecks_revoked_batch_permission() {
         )
         .unwrap();
     admin.grant_role("writer", "writer_role").unwrap();
-    let writer = Database::open_with_credentials(dir.path(), "writer", "writer-pw").unwrap();
+    let writer = admin.resolve_principal("writer").unwrap();
 
-    let mut txn = writer.begin();
+    let mut txn = admin.begin_as(Some(writer.clone()));
     txn.put_batch("docs", vec![vec![(1, Value::Int64(1))]])
         .unwrap();
     admin.revoke_role("writer", "writer_role").unwrap();
@@ -1462,15 +1627,202 @@ fn commit_fails_auth_required_when_catalog_bound_user_was_dropped() {
         )
         .unwrap();
     admin.grant_role("writer", "writer_role").unwrap();
-    let writer = Database::open_with_credentials(dir.path(), "writer", "writer-pw").unwrap();
-    let mut transaction = writer.begin();
+    let writer = admin.resolve_principal("writer").unwrap();
+    let mut transaction = admin.begin_as(Some(writer.clone()));
     transaction.put("docs", vec![(1, Value::Int64(1))]).unwrap();
     admin.drop_user("writer").unwrap();
     assert!(matches!(
         transaction.commit(),
         Err(MongrelError::AuthRequired)
     ));
-    assert_eq!(writer.table("docs").unwrap().lock().count(), 0);
+    assert_eq!(admin.table("docs").unwrap().lock().count(), 0);
+}
+
+#[test]
+fn dropped_and_recreated_user_cannot_revive_preexisting_transaction() {
+    let dir = tempdir().unwrap();
+    let admin = Database::create_with_credentials(dir.path(), "admin", "admin-pw").unwrap();
+    admin.create_table("docs", int_pk_schema()).unwrap();
+    admin.create_user("writer", "old-pw").unwrap();
+    admin.create_role("writer_role").unwrap();
+    admin
+        .grant_permission(
+            "writer_role",
+            Permission::Insert {
+                table: "docs".into(),
+            },
+        )
+        .unwrap();
+    admin.grant_role("writer", "writer_role").unwrap();
+    let old = admin.resolve_principal("writer").unwrap();
+    let mut transaction = admin.begin_as(Some(old));
+    transaction.put("docs", vec![(1, Value::Int64(1))]).unwrap();
+
+    admin.drop_user("writer").unwrap();
+    admin.create_user("writer", "new-pw").unwrap();
+    admin.grant_role("writer", "writer_role").unwrap();
+
+    assert!(matches!(
+        transaction.commit(),
+        Err(MongrelError::AuthRequired)
+    ));
+    assert_eq!(admin.table("docs").unwrap().lock().count(), 0);
+}
+
+#[test]
+fn dropped_user_cached_principal_cannot_start_writes() {
+    let dir = tempdir().unwrap();
+    let admin = Database::create_with_credentials(dir.path(), "admin", "admin-pw").unwrap();
+    admin.create_table("docs", int_pk_schema()).unwrap();
+    admin.create_user("writer", "writer-pw").unwrap();
+    admin.create_role("writer_role").unwrap();
+    admin
+        .grant_permission(
+            "writer_role",
+            Permission::Insert {
+                table: "docs".into(),
+            },
+        )
+        .unwrap();
+    admin.grant_role("writer", "writer_role").unwrap();
+    let stale = admin.resolve_principal("writer").unwrap();
+    admin.drop_user("writer").unwrap();
+
+    let mut transaction = admin.begin_as(Some(stale));
+    assert!(matches!(
+        transaction.put("docs", vec![(1, Value::Int64(1))]),
+        Err(MongrelError::AuthRequired)
+    ));
+    assert!(matches!(
+        transaction.commit(),
+        Err(MongrelError::AuthRequired)
+    ));
+    assert_eq!(admin.table("docs").unwrap().lock().count(), 0);
+}
+
+#[test]
+fn dropped_user_cached_principal_cannot_read_when_not_prebound() {
+    let dir = tempdir().unwrap();
+    let admin = Database::create_with_credentials(dir.path(), "admin", "admin-pw").unwrap();
+    admin.create_table("docs", int_pk_schema()).unwrap();
+    admin.create_user("reader", "reader-pw").unwrap();
+    admin.create_role("reader_role").unwrap();
+    admin
+        .grant_permission(
+            "reader_role",
+            Permission::Select {
+                table: "docs".into(),
+            },
+        )
+        .unwrap();
+    admin.grant_role("reader", "reader_role").unwrap();
+    let stale = admin.resolve_principal("reader").unwrap();
+    admin.drop_user("reader").unwrap();
+
+    let result = admin.with_authorized_read(
+        "docs",
+        Some(&stale),
+        false,
+        |_table, _snapshot, _allowed, _principal| Ok(()),
+    );
+    assert!(matches!(result, Err(MongrelError::AuthRequired)));
+}
+
+#[test]
+fn dropped_and_recreated_user_cannot_revive_preexisting_read_principal() {
+    let dir = tempdir().unwrap();
+    let admin = Database::create_with_credentials(dir.path(), "admin", "admin-pw").unwrap();
+    admin.create_table("docs", int_pk_schema()).unwrap();
+    admin.create_user("reader", "old-pw").unwrap();
+    admin.create_role("reader_role").unwrap();
+    admin
+        .grant_permission(
+            "reader_role",
+            Permission::Select {
+                table: "docs".into(),
+            },
+        )
+        .unwrap();
+    admin.grant_role("reader", "reader_role").unwrap();
+    let old = admin.resolve_principal("reader").unwrap();
+    admin.drop_user("reader").unwrap();
+    admin.create_user("reader", "new-pw").unwrap();
+    admin.grant_role("reader", "reader_role").unwrap();
+
+    let result = admin.with_authorized_read(
+        "docs",
+        Some(&old),
+        false,
+        |_table, _snapshot, _allowed, _principal| Ok(()),
+    );
+    assert!(matches!(result, Err(MongrelError::AuthRequired)));
+    assert!(matches!(
+        admin.select_column_ids_for("docs", Some(&old)),
+        Err(MongrelError::AuthRequired)
+    ));
+    assert!(matches!(
+        admin.rows_for("docs", Some(&old)),
+        Err(MongrelError::AuthRequired)
+    ));
+    assert!(matches!(
+        admin.count_for("docs", Some(&old)),
+        Err(MongrelError::AuthRequired)
+    ));
+    assert!(matches!(
+        admin.secure_rows_for("docs", Vec::new(), Some(&old)),
+        Err(MongrelError::AuthRequired)
+    ));
+}
+
+#[test]
+fn trigger_ddl_rejects_recreated_request_principal() {
+    let dir = tempdir().unwrap();
+    let admin = Database::create_with_credentials(dir.path(), "admin", "admin-pw").unwrap();
+    admin.create_table("docs", int_pk_schema()).unwrap();
+    admin.create_user("designer", "old-pw").unwrap();
+    admin.create_role("ddl_role").unwrap();
+    admin.grant_permission("ddl_role", Permission::Ddl).unwrap();
+    admin.grant_role("designer", "ddl_role").unwrap();
+    let old = admin.resolve_principal("designer").unwrap();
+    admin.drop_user("designer").unwrap();
+    admin.create_user("designer", "new-pw").unwrap();
+    admin.grant_role("designer", "ddl_role").unwrap();
+    let trigger = StoredTrigger::new(
+        "docs_ai",
+        TriggerDefinition {
+            target: TriggerTarget::Table("docs".into()),
+            timing: TriggerTiming::After,
+            event: TriggerEvent::Insert,
+            update_of: Vec::new(),
+            target_columns: Vec::new(),
+            when: None,
+            program: TriggerProgram { steps: Vec::new() },
+        },
+        0,
+    )
+    .unwrap();
+
+    assert!(matches!(
+        admin.create_trigger_as_controlled(trigger, Some(&old), || Ok(())),
+        Err(MongrelError::AuthRequired)
+    ));
+    assert!(admin.trigger("docs_ai").is_none());
+}
+
+#[test]
+fn credentialed_open_authenticates_recovered_wal_catalog() {
+    let dir = tempdir().unwrap();
+    let db = Database::create_with_credentials(dir.path(), "admin", "old-pw").unwrap();
+    let stale = db.catalog_snapshot();
+    db.alter_user_password("admin", "new-pw").unwrap();
+    drop(db);
+
+    catalog::write_atomic(dir.path(), &stale, None).unwrap();
+    assert!(matches!(
+        Database::open_with_credentials(dir.path(), "admin", "old-pw"),
+        Err(MongrelError::InvalidCredentials { .. })
+    ));
+    Database::open_with_credentials(dir.path(), "admin", "new-pw").unwrap();
 }
 
 #[test]
@@ -1495,22 +1847,22 @@ fn commit_rechecks_revoked_delete_batch_permission() {
         )
         .unwrap();
     admin.grant_role("writer", "delete_role").unwrap();
-    let writer = Database::open_with_credentials(dir.path(), "writer", "writer-pw").unwrap();
-    let row_id = writer
+    let writer = admin.resolve_principal("writer").unwrap();
+    let row_id = admin
         .table("docs")
         .unwrap()
         .lock()
-        .visible_rows(writer.snapshot().0)
+        .visible_rows(admin.snapshot().0)
         .unwrap()[0]
         .row_id;
 
-    let mut transaction = writer.begin();
+    let mut transaction = admin.begin_as(Some(writer.clone()));
     transaction.delete_batch("docs", vec![row_id]).unwrap();
     admin.revoke_role("writer", "delete_role").unwrap();
 
     let error = transaction.commit().unwrap_err();
     assert!(matches!(error, MongrelError::PermissionDenied { .. }));
-    assert_eq!(writer.table("docs").unwrap().lock().count(), 1);
+    assert_eq!(admin.table("docs").unwrap().lock().count(), 1);
 }
 
 #[test]
@@ -1529,43 +1881,43 @@ fn revocation_during_commit_preparation_fails_before_publish() {
         )
         .unwrap();
     admin.grant_role("writer", "writer_role").unwrap();
-    let writer = Database::open_with_credentials(dir.path(), "writer", "writer-pw").unwrap();
-    writer.set_spill_threshold(1);
+    let writer = admin.resolve_principal("writer").unwrap();
+    admin.set_spill_threshold(1);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
     let hook_resume = resume.clone();
-    writer.__set_spill_hook(move || {
+    admin.__set_spill_hook(move || {
         ready_tx.send(()).unwrap();
         hook_resume.wait();
     });
-    let mut transaction = writer.begin();
+    let mut transaction = admin.begin_as(Some(writer.clone()));
     transaction.put("docs", vec![(1, Value::Int64(1))]).unwrap();
 
+    let admin_ref = &admin;
     std::thread::scope(|scope| {
         scope.spawn(move || {
             ready_rx.recv().unwrap();
-            admin.revoke_role("writer", "writer_role").unwrap();
+            admin_ref.revoke_role("writer", "writer_role").unwrap();
             resume.wait();
         });
         let error = transaction.commit().unwrap_err();
         assert!(matches!(error, MongrelError::Conflict(_)));
     });
-    assert_eq!(writer.table("docs").unwrap().lock().count(), 0);
+    assert_eq!(admin.table("docs").unwrap().lock().count(), 0);
 }
 
 #[test]
-fn stale_credentialless_handle_observes_auth_enable_before_commit() {
+fn stale_credentialless_transaction_observes_auth_enable_before_commit() {
     let dir = tempdir().unwrap();
-    let bootstrap = Database::create(dir.path()).unwrap();
-    bootstrap.create_table("docs", int_pk_schema()).unwrap();
-    let stale = Database::open(dir.path()).unwrap();
-    bootstrap.enable_auth("admin", "admin-password").unwrap();
-
-    let mut transaction = stale.begin();
+    let db = Database::create(dir.path()).unwrap();
+    db.create_table("docs", int_pk_schema()).unwrap();
+    let mut transaction = db.begin();
     transaction.put("docs", vec![(1, Value::Int64(1))]).unwrap();
+    db.enable_auth("admin", "admin-password").unwrap();
+
     let error = transaction.commit().unwrap_err();
     assert!(matches!(error, MongrelError::AuthRequired));
-    assert_eq!(stale.table("docs").unwrap().lock().count(), 0);
+    assert_eq!(db.table("docs").unwrap().lock().count(), 0);
 }
 
 #[test]
@@ -1584,8 +1936,8 @@ fn revocation_waits_for_commit_already_inside_security_gate() {
         )
         .unwrap();
     admin.grant_role("writer", "writer_role").unwrap();
-    let writer = Database::open_with_credentials(dir.path(), "writer", "writer-pw").unwrap();
-    writer.set_spill_threshold(1);
+    let writer = admin.resolve_principal("writer").unwrap();
+    admin.set_spill_threshold(1);
 
     let entered = std::sync::Arc::new(std::sync::Barrier::new(2));
     let attempted = std::sync::Arc::new(std::sync::Barrier::new(2));
@@ -1593,25 +1945,26 @@ fn revocation_waits_for_commit_already_inside_security_gate() {
     let hook_entered = entered.clone();
     let hook_attempted = attempted.clone();
     let hook_done = done.clone();
-    writer.__set_security_commit_hook(move || {
+    admin.__set_security_commit_hook(move || {
         hook_entered.wait();
         hook_attempted.wait();
         std::thread::sleep(std::time::Duration::from_millis(100));
         assert!(!hook_done.load(std::sync::atomic::Ordering::Acquire));
     });
-    let mut transaction = writer.begin();
+    let mut transaction = admin.begin_as(Some(writer.clone()));
     transaction.put("docs", vec![(1, Value::Int64(1))]).unwrap();
 
+    let admin_ref = &admin;
     std::thread::scope(|scope| {
         scope.spawn(move || {
             entered.wait();
             attempted.wait();
-            admin.revoke_role("writer", "writer_role").unwrap();
+            admin_ref.revoke_role("writer", "writer_role").unwrap();
             done.store(true, std::sync::atomic::Ordering::Release);
         });
         transaction.commit().unwrap();
     });
-    assert_eq!(writer.table("docs").unwrap().lock().count(), 1);
+    assert_eq!(admin.table("docs").unwrap().lock().count(), 1);
 }
 
 #[test]
@@ -1657,14 +2010,14 @@ fn trigger_generated_batch_write_is_finally_authorized() {
         )
         .unwrap();
     admin.grant_role("writer", "base_writer").unwrap();
-    let writer = Database::open_with_credentials(dir.path(), "writer", "writer-pw").unwrap();
+    let writer = admin.resolve_principal("writer").unwrap();
 
-    let mut txn = writer.begin();
+    let mut txn = admin.begin_as(Some(writer));
     txn.put("base", vec![(1, Value::Int64(1))]).unwrap();
     let error = txn.commit().unwrap_err();
     assert!(matches!(error, MongrelError::PermissionDenied { .. }));
-    assert_eq!(writer.table("base").unwrap().lock().count(), 0);
-    assert_eq!(writer.table("audit").unwrap().lock().count(), 0);
+    assert_eq!(admin.table("base").unwrap().lock().count(), 0);
+    assert_eq!(admin.table("audit").unwrap().lock().count(), 0);
 }
 
 /// Table::put_batch and Table::delete are enforced (direct table access path,

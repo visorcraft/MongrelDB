@@ -14,7 +14,7 @@
 //! located at `$CARGO_BIN_EXE_crash_writer`.
 
 use mongreldb_core::schema::{ColumnDef, ColumnFlags, Schema, TypeId};
-use mongreldb_core::{Table, Value};
+use mongreldb_core::{Database, Table, Value};
 use std::io::Write;
 use std::process::exit;
 use std::time::{Duration, Instant};
@@ -91,6 +91,20 @@ fn main() {
             db.put(vec![(1, Value::Int64(7777))]).expect("put");
             db.flush().expect("flush");
             signal("FLUSH_READY");
+            spin();
+        }
+        // A fully loaded but unpublished CTAS build. It is durable, hidden,
+        // and must be reclaimed when the database reopens after the kill.
+        "ctas-building" => {
+            let db = Database::create(&dir).expect("create database");
+            let build = "__mongreldb_ctas_build_crash-query";
+            db.create_building_table(build, "target", "crash-query", schema())
+                .expect("create building table");
+            let mut txn = db.begin();
+            txn.put_building(build, vec![(1, Value::Int64(4242))])
+                .expect("put building row");
+            txn.commit().expect("commit building row");
+            signal("CTAS_BUILDING_READY");
             spin();
         }
         other => {

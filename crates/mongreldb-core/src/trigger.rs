@@ -875,6 +875,16 @@ impl StoredTrigger {
     }
 
     pub fn validate(&self) -> Result<()> {
+        self.validate_inner().map_err(|error| match error {
+            MongrelError::TriggerValidation(_) => error,
+            MongrelError::InvalidArgument(message)
+            | MongrelError::Conflict(message)
+            | MongrelError::NotFound(message) => MongrelError::TriggerValidation(message),
+            error => error,
+        })
+    }
+
+    fn validate_inner(&self) -> Result<()> {
         validate_name("trigger", &self.name)?;
         match &self.target {
             TriggerTarget::Table(name) => validate_name("trigger table target", name)?,

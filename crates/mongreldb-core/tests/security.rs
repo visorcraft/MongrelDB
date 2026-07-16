@@ -42,6 +42,8 @@ fn schema() -> Schema {
 
 fn admin() -> Principal {
     Principal {
+        user_id: 0,
+        created_epoch: 0,
         username: "admin".into(),
         is_admin: true,
         roles: Vec::new(),
@@ -51,6 +53,8 @@ fn admin() -> Principal {
 
 fn user(name: &str) -> Principal {
     Principal {
+        user_id: 0,
+        created_epoch: 0,
         username: name.into(),
         is_admin: false,
         roles: Vec::new(),

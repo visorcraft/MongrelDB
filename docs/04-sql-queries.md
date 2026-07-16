@@ -71,21 +71,35 @@ generation.
 
 Cancellation is cooperative. MongrelDB scans, cursors, residual filters,
 native aggregates, joins, scored search, Arrow conversion, and cooperating
-external modules checkpoint the shared execution control. A non-cooperating
+external modules checkpoint the shared execution control. Command-side row
+loops for `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, CTAS, materialized-view
+refresh, recursive CTE compatibility, and view-trigger routing also checkpoint
+at fixed row intervals. View writes execute their internal scan with the same
+query ID and DataFusion task context as the outer statement. A non-cooperating
 external module can exceed the configured cancellation grace and is reported
 as stuck. Shutdown logs only its query ID and phase. The query remains in the
 bounded active registry for administrative inspection until its worker exits.
+
+Controlled command scans merge ordered storage tiers without a full-table
+row map or row-ID sort. Their source materialization has a hard limit of
+1,000,000 stored row versions. Above that bound, the core returns
+`ResourceLimitExceeded`; split large `UPDATE`, `DELETE`, foreign-key checks,
+or schema rebuilds into smaller operations, or compact the table first.
 
 For autocommit writes, cancellation and the durable commit fence have one
 winner. Cancellation before the fence writes nothing. Once commit owns the
 fence, cancellation returns `TooLate` and the real committed outcome is
 preserved. A failed or cancelled statement inside an explicit transaction
-restores its statement savepoint and aborts the transaction. Only `ROLLBACK`
-is then accepted.
+restores its statement checkpoint and aborts the transaction. `ROLLBACK TO`
+an existing SQL savepoint discards later staged writes, clears the aborted
+state, and lets the transaction continue. A full `ROLLBACK` discards the
+transaction.
 
 In a multi-statement request without an explicit transaction, earlier
 autocommit statements remain committed. Cancellation errors report the number
-of completed statements and the cancelled statement index.
+of completed statements and the cancelled statement index. Inside an explicit
+transaction, each statement has its own rollback checkpoint, so a later
+failure does not silently discard earlier successful statements.
 
 ### Multi-statement execution
 
@@ -268,8 +282,12 @@ SELECT * FROM daily_totals WHERE day > '2026-01-01';
 ```
 
 Materialized views are physically stored tables and support indexes. They do
-not refresh automatically. Drop and recreate one when its source data changes.
-Use `DROP TABLE` or `DROP MATERIALIZED VIEW` to remove it.
+not refresh automatically. Use `REFRESH MATERIALIZED VIEW name` after source
+data changes, or `DROP MATERIALIZED VIEW` to remove one. Full and incremental
+refreshes prepare with cooperative cancellation, then atomically commit the
+view rows and refresh watermark under the SQL commit fence. Cancellation
+before that fence leaves the prior view unchanged; cancellation after the
+fence returns `TooLate` and query status records a committed write.
 
 **Views vs. Materialized Views:** regular `CREATE VIEW` stores only the SQL
 definition and recomputes on every read (session-scoped); `CREATE MATERIALIZED
@@ -291,6 +309,12 @@ SELECT count(*) FROM high_value_orders;
 The first column of the query becomes the primary key of the new table; all
 other columns are nullable. To customize the schema, create the table
 explicitly and `INSERT INTO ... SELECT`.
+
+The source query and Arrow conversion remain cancellable. MongrelDB validates
+the inferred rows and builds the table under an internal name before entering
+the commit fence for one catalog publish. Any failure or accepted cancellation
+before publication leaves the requested target name absent. Duplicate or NULL
+values in the inferred primary-key column fail validation before publication.
 
 ## Column Statistics
 

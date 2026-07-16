@@ -14,8 +14,8 @@ use crate::{MongrelError, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::io::Read;
+use std::path::Path;
 
 pub const MANIFEST_MAGIC: [u8; 8] = *b"MONGRMFT";
 /// Bumped to 4 when the per-table TTL policy was added. NOTE: the
@@ -252,21 +252,24 @@ pub fn write_atomic(
     meta_dek: Option<&[u8; META_DEK_LEN]>,
 ) -> Result<()> {
     let dir = dir.as_ref();
-    let final_path: PathBuf = dir.join(MANIFEST_FILENAME);
-    let tmp_path: PathBuf = dir.join(format!("{MANIFEST_FILENAME}.tmp"));
+    let final_path = dir.join(MANIFEST_FILENAME);
 
     manifest.compute_checksum();
     let bytes = bincode::serialize(manifest)?;
     let payload = seal(&bytes, meta_dek)?;
-    {
-        let mut file = fs::File::create(&tmp_path)?;
-        file.write_all(&payload)?;
-        file.sync_all()?;
-    }
-    fs::rename(&tmp_path, &final_path)?;
-    if let Ok(d) = fs::File::open(dir) {
-        let _ = d.sync_all();
-    }
+    crate::durable_file::write_atomic(&final_path, &payload)?;
+    Ok(())
+}
+
+pub(crate) fn write_durable(
+    root: &crate::durable_file::DurableRoot,
+    manifest: &mut Manifest,
+    meta_dek: Option<&[u8; META_DEK_LEN]>,
+) -> Result<()> {
+    manifest.compute_checksum();
+    let bytes = bincode::serialize(manifest)?;
+    let payload = seal(&bytes, meta_dek)?;
+    root.write_atomic(MANIFEST_FILENAME, &payload)?;
     Ok(())
 }
 
@@ -278,7 +281,36 @@ pub fn write_atomic(
 /// versions 2 and 3 synthesize no TTL policy.
 pub fn read(dir: impl AsRef<Path>, meta_dek: Option<&[u8; META_DEK_LEN]>) -> Result<Manifest> {
     let path = dir.as_ref().join(MANIFEST_FILENAME);
-    let bytes = fs::read(&path)?;
+    let file = crate::durable_file::open_regular_nofollow(&path)?;
+    read_file(file, meta_dek)
+}
+
+pub(crate) fn read_durable(
+    root: &crate::durable_file::DurableRoot,
+    relative_dir: impl AsRef<Path>,
+    meta_dek: Option<&[u8; META_DEK_LEN]>,
+) -> Result<Manifest> {
+    let file = root.open_regular(relative_dir.as_ref().join(MANIFEST_FILENAME))?;
+    read_file(file, meta_dek)
+}
+
+fn read_file(file: fs::File, meta_dek: Option<&[u8; META_DEK_LEN]>) -> Result<Manifest> {
+    const MAX_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
+    let length = file.metadata()?.len();
+    if length > MAX_MANIFEST_BYTES {
+        return Err(MongrelError::ResourceLimitExceeded {
+            resource: "manifest bytes",
+            requested: usize::try_from(length).unwrap_or(usize::MAX),
+            limit: MAX_MANIFEST_BYTES as usize,
+        });
+    }
+    let mut bytes = Vec::with_capacity(length as usize);
+    file.take(MAX_MANIFEST_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != length {
+        return Err(MongrelError::InvalidArgument(
+            "manifest length changed while reading".into(),
+        ));
+    }
     let plaintext = open_payload(&bytes, meta_dek)?;
     // The checksum is the trailing 32 bytes; verify it before trusting the body
     // (works for any manifest version since `checksum` is always last).

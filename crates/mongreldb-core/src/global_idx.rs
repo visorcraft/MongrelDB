@@ -19,16 +19,22 @@
 
 use crate::index::{ColumnLearnedRange, ColumnLearnedRangeSnapshot};
 use crate::rowid::RowId;
+use crate::schema::{IndexKind, Schema};
 use crate::{MongrelError, Result};
+use bincode::Options;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 pub const IDX_MAGIC: [u8; 8] = *b"MONGRIDX";
 pub const IDX_VERSION: u16 = 3;
 pub const IDX_DIR: &str = "_idx";
 pub const IDX_FILENAME: &str = "global.idx";
+const MAX_GLOBAL_INDEX_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_INDEX_RECORDS: usize = 65_536;
+const MAX_INDEX_PAYLOAD_BYTES: usize = MAX_GLOBAL_INDEX_BYTES as usize;
 
 // Record kind bytes for framed index payloads.
 const K_HOT: u8 = 1;
@@ -67,6 +73,7 @@ struct GlobalIdxBody {
     format_version: u16,
     table_id: u64,
     epoch_built: u64,
+    #[serde(deserialize_with = "deserialize_records")]
     records: Vec<Record>,
 }
 
@@ -74,7 +81,82 @@ struct GlobalIdxBody {
 struct Record {
     kind: u8,
     column_id: u16,
+    #[serde(deserialize_with = "deserialize_payload")]
     payload: Vec<u8>,
+}
+
+fn deserialize_records<'de, D>(deserializer: D) -> std::result::Result<Vec<Record>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Visitor;
+
+    impl<'de> serde::de::Visitor<'de> for Visitor {
+        type Value = Vec<Record>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a bounded global-index record list")
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let capacity = sequence.size_hint().unwrap_or(0);
+            if capacity > MAX_INDEX_RECORDS {
+                return Err(serde::de::Error::custom("too many global-index records"));
+            }
+            let mut records = Vec::with_capacity(capacity);
+            while let Some(record) = sequence.next_element()? {
+                if records.len() == MAX_INDEX_RECORDS {
+                    return Err(serde::de::Error::custom("too many global-index records"));
+                }
+                records.push(record);
+            }
+            Ok(records)
+        }
+    }
+
+    deserializer.deserialize_seq(Visitor)
+}
+
+fn deserialize_payload<'de, D>(deserializer: D) -> std::result::Result<Vec<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Visitor;
+
+    impl<'de> serde::de::Visitor<'de> for Visitor {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a bounded global-index payload")
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let capacity = sequence.size_hint().unwrap_or(0);
+            if capacity > MAX_INDEX_PAYLOAD_BYTES {
+                return Err(serde::de::Error::custom(
+                    "global-index payload is too large",
+                ));
+            }
+            let mut payload = Vec::with_capacity(capacity);
+            while let Some(byte) = sequence.next_element()? {
+                if payload.len() == MAX_INDEX_PAYLOAD_BYTES {
+                    return Err(serde::de::Error::custom(
+                        "global-index payload is too large",
+                    ));
+                }
+                payload.push(byte);
+            }
+            Ok(payload)
+        }
+    }
+
+    deserializer.deserialize_seq(Visitor)
 }
 
 /// Path of the checkpoint file under `dir`.
@@ -122,6 +204,18 @@ fn decode_file(raw: Vec<u8>, dek: Option<&[u8; 32]>) -> Option<Vec<u8>> {
 
 pub fn write_atomic(
     dir: &Path,
+    table_id: u64,
+    epoch_built: u64,
+    snap: IndexSnapshot<'_>,
+    dek: Option<&[u8; 32]>,
+) -> Result<()> {
+    let table_root = crate::durable_file::DurableRoot::open(dir)?;
+    let idx_root = table_root.create_directory_all_pinned(IDX_DIR)?;
+    write_atomic_root(&idx_root, table_id, epoch_built, snap, dek)
+}
+
+pub(crate) fn write_atomic_root(
+    idx_root: &crate::durable_file::DurableRoot,
     table_id: u64,
     epoch_built: u64,
     snap: IndexSnapshot<'_>,
@@ -204,11 +298,6 @@ pub fn write_atomic(
     };
     let body_bytes = bincode::serialize(&body)?;
 
-    let idx_dir = dir.join(IDX_DIR);
-    std::fs::create_dir_all(&idx_dir)?;
-    let final_path = idx_dir.join(IDX_FILENAME);
-    let tmp_path = idx_dir.join(format!("{IDX_FILENAME}.tmp"));
-
     // MAGIC || body || MAGIC || checksum
     let mut out = Vec::with_capacity(8 + body_bytes.len() + 8 + 32);
     out.extend_from_slice(&IDX_MAGIC);
@@ -222,24 +311,75 @@ pub fn write_atomic(
     // uniformity with the plaintext path).
     let out = encode_file(out, dek)?;
 
-    {
-        let mut file = std::fs::File::create(&tmp_path)?;
-        use std::io::Write;
-        file.write_all(&out)?;
-        file.sync_all()?;
-    }
-    std::fs::rename(&tmp_path, &final_path)?;
+    idx_root.write_atomic(IDX_FILENAME, &out)?;
     Ok(())
 }
 
 /// Read and validate the checkpoint. Verifies both MAGIC sentinels and the
 /// trailing SHA-256 before deserializing records.
-pub fn read(dir: &Path, dek: Option<&[u8; 32]>) -> Result<Option<LoadedIndexes>> {
+pub fn read(
+    dir: &Path,
+    expected_table_id: u64,
+    schema: &Schema,
+    dek: Option<&[u8; 32]>,
+) -> Result<Option<LoadedIndexes>> {
     let path = path(dir);
-    let raw = match std::fs::read(&path) {
-        Ok(b) => b,
-        Err(_) => return Ok(None),
+    let file = match crate::durable_file::open_regular_nofollow(&path) {
+        Ok(file) => file,
+        Err(MongrelError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None)
+        }
+        Err(error) => return Err(error),
     };
+    read_file(file, expected_table_id, schema, dek)
+}
+
+pub(crate) fn read_durable_for(
+    root: &crate::durable_file::DurableRoot,
+    relative_dir: impl AsRef<Path>,
+    expected_table_id: u64,
+    schema: &Schema,
+    dek: Option<&[u8; 32]>,
+) -> Result<Option<LoadedIndexes>> {
+    let relative = relative_dir.as_ref().join(IDX_DIR).join(IDX_FILENAME);
+    let file = match root.open_regular(relative) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    read_file(file, expected_table_id, schema, dek)
+}
+
+pub(crate) fn read_root(
+    idx_root: &crate::durable_file::DurableRoot,
+    expected_table_id: u64,
+    schema: &Schema,
+    dek: Option<&[u8; 32]>,
+) -> Result<Option<LoadedIndexes>> {
+    let file = match idx_root.open_regular(IDX_FILENAME) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    read_file(file, expected_table_id, schema, dek)
+}
+
+fn read_file(
+    file: std::fs::File,
+    expected_table_id: u64,
+    schema: &Schema,
+    dek: Option<&[u8; 32]>,
+) -> Result<Option<LoadedIndexes>> {
+    let length = file.metadata()?.len();
+    if length > MAX_GLOBAL_INDEX_BYTES {
+        return Ok(None);
+    }
+    let mut raw = Vec::with_capacity(length as usize);
+    file.take(MAX_GLOBAL_INDEX_BYTES + 1)
+        .read_to_end(&mut raw)?;
+    if raw.len() as u64 != length {
+        return Ok(None);
+    }
     // Decrypt first for encrypted tables; a decryption failure (wrong key, tamper,
     // or a pre-encryption checkpoint) → rebuild from runs.
     let bytes = match decode_file(raw, dek) {
@@ -252,33 +392,27 @@ pub fn read(dir: &Path, dek: Option<&[u8; 32]>) -> Result<Option<LoadedIndexes>>
 
     let header_magic = &bytes[..8];
     if header_magic != IDX_MAGIC {
-        return Err(MongrelError::MagicMismatch {
-            what: "global index",
-            expected: IDX_MAGIC,
-            got: header_magic.try_into().unwrap_or([0; 8]),
-        });
+        return Ok(None);
     }
     let footer_start = bytes.len() - 32 - 8;
     let footer_magic = &bytes[footer_start..footer_start + 8];
     if footer_magic != IDX_MAGIC {
-        return Err(MongrelError::MagicMismatch {
-            what: "global index footer",
-            expected: IDX_MAGIC,
-            got: footer_magic.try_into().unwrap_or([0; 8]),
-        });
+        return Ok(None);
     }
     let stored_hash = &bytes[bytes.len() - 32..];
     let recomputed: [u8; 32] = Sha256::digest(&bytes[..bytes.len() - 32]).into();
     if stored_hash != recomputed {
-        return Err(MongrelError::ChecksumMismatch {
-            expected: u64::from_be_bytes(stored_hash[..8].try_into().unwrap()),
-            actual: u64::from_be_bytes(recomputed[..8].try_into().unwrap()),
-            context: "global index".into(),
-        });
+        return Ok(None);
     }
 
-    let body: GlobalIdxBody = bincode::deserialize(&bytes[8..footer_start])?;
+    let body: GlobalIdxBody = match decode_bounded(&bytes[8..footer_start]) {
+        Some(body) => body,
+        None => return Ok(None),
+    };
     if body.format_version != IDX_VERSION {
+        return Ok(None);
+    }
+    if body.table_id != expected_table_id {
         return Ok(None);
     }
 
@@ -289,49 +423,70 @@ pub fn read(dir: &Path, dek: Option<&[u8; 32]>) -> Result<Option<LoadedIndexes>>
     let mut sparse = HashMap::new();
     let mut minhash = HashMap::new();
     let mut learned_range = HashMap::new();
+    let mut identities = HashSet::new();
 
     for rec in body.records {
+        if !identities.insert((rec.kind, rec.column_id)) || !record_matches_schema(&rec, schema) {
+            return Ok(None);
+        }
         match rec.kind {
             K_HOT => {
-                let entries: Vec<(Vec<u8>, RowId)> = bincode::deserialize(&rec.payload)?;
+                let Some(entries) = decode_bounded::<Vec<(Vec<u8>, RowId)>>(&rec.payload) else {
+                    return Ok(None);
+                };
                 hot = crate::index::HotIndex::from_entries(entries);
             }
             K_BITMAP => {
-                let entries: Vec<(Vec<u8>, Vec<u8>)> = bincode::deserialize(&rec.payload)?;
-                bitmap.insert(
-                    rec.column_id,
-                    crate::index::BitmapIndex::from_entries(entries)
-                        .map_err(|e| MongrelError::Other(e.into()))?,
-                );
+                let Some(entries) = decode_bounded::<Vec<(Vec<u8>, Vec<u8>)>>(&rec.payload) else {
+                    return Ok(None);
+                };
+                let Ok(index) = crate::index::BitmapIndex::from_entries(entries) else {
+                    return Ok(None);
+                };
+                bitmap.insert(rec.column_id, index);
             }
             K_FM => {
-                let docs: Vec<(Vec<u8>, RowId)> = bincode::deserialize(&rec.payload)?;
+                let Some(docs) = decode_bounded::<Vec<(Vec<u8>, RowId)>>(&rec.payload) else {
+                    return Ok(None);
+                };
                 fm.insert(rec.column_id, crate::index::FmIndex::from_docs(docs));
             }
             K_ANN => {
-                let idx = crate::index::AnnIndex::thaw(&rec.payload)?;
+                let Ok(idx) =
+                    crate::index::AnnIndex::thaw_bounded(&rec.payload, MAX_GLOBAL_INDEX_BYTES)
+                else {
+                    return Ok(None);
+                };
                 ann.insert(rec.column_id, idx);
             }
             K_SPARSE => {
-                let entries: Vec<(u32, Vec<(RowId, f32)>)> = bincode::deserialize(&rec.payload)?;
+                let Some(entries) = decode_bounded::<Vec<(u32, Vec<(RowId, f32)>)>>(&rec.payload)
+                else {
+                    return Ok(None);
+                };
                 sparse.insert(
                     rec.column_id,
                     crate::index::SparseIndex::from_entries(entries),
                 );
             }
             K_MINHASH => {
-                let snapshot: crate::index::minhash::MinHashSnapshot =
-                    bincode::deserialize(&rec.payload)?;
+                let Some(snapshot) =
+                    decode_bounded::<crate::index::minhash::MinHashSnapshot>(&rec.payload)
+                else {
+                    return Ok(None);
+                };
                 minhash.insert(
                     rec.column_id,
                     crate::index::MinHashIndex::from_snapshot(snapshot),
                 );
             }
             K_LEARNED => {
-                let snap: ColumnLearnedRangeSnapshot = bincode::deserialize(&rec.payload)?;
+                let Some(snap) = decode_bounded::<ColumnLearnedRangeSnapshot>(&rec.payload) else {
+                    return Ok(None);
+                };
                 learned_range.insert(rec.column_id, ColumnLearnedRange::from_snapshot(snap));
             }
-            _ => { /* unknown kind: ignore (forward-compatible) */ }
+            _ => return Ok(None),
         }
     }
 
@@ -345,6 +500,35 @@ pub fn read(dir: &Path, dek: Option<&[u8; 32]>) -> Result<Option<LoadedIndexes>>
         minhash,
         learned_range,
     }))
+}
+
+fn decode_bounded<T>(bytes: &[u8]) -> Option<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+        .with_limit(MAX_GLOBAL_INDEX_BYTES)
+        .deserialize(bytes)
+        .ok()
+}
+
+fn record_matches_schema(record: &Record, schema: &Schema) -> bool {
+    let expected_kind = match record.kind {
+        K_HOT => return record.column_id == 0,
+        K_BITMAP => IndexKind::Bitmap,
+        K_FM => IndexKind::FmIndex,
+        K_ANN => IndexKind::Ann,
+        K_SPARSE => IndexKind::Sparse,
+        K_LEARNED => IndexKind::LearnedRange,
+        K_MINHASH => IndexKind::MinHash,
+        _ => return false,
+    };
+    schema
+        .indexes
+        .iter()
+        .any(|index| index.column_id == record.column_id && index.kind == expected_kind)
 }
 
 /// Remove the checkpoint (e.g. when the manifest no longer endorses it).
@@ -400,7 +584,40 @@ mod tests {
     use super::*;
     use crate::index::{AnnIndex, BitmapIndex, FmIndex, HotIndex, SparseIndex};
     use crate::rowid::RowId;
+    use crate::schema::{IndexDef, IndexOptions};
     use tempfile::tempdir;
+
+    fn indexed_schema() -> Schema {
+        Schema {
+            indexes: [
+                (7, IndexKind::Bitmap),
+                (9, IndexKind::FmIndex),
+                (11, IndexKind::Ann),
+                (13, IndexKind::Sparse),
+                (15, IndexKind::MinHash),
+            ]
+            .into_iter()
+            .map(|(column_id, kind)| IndexDef {
+                name: format!("idx_{column_id}"),
+                column_id,
+                kind,
+                predicate: None,
+                options: IndexOptions::default(),
+            })
+            .collect(),
+            ..Schema::default()
+        }
+    }
+
+    fn write_body(dir: &Path, body: &GlobalIdxBody) {
+        std::fs::create_dir_all(dir.join(IDX_DIR)).unwrap();
+        let mut bytes = IDX_MAGIC.to_vec();
+        bytes.extend(bincode::serialize(body).unwrap());
+        bytes.extend(IDX_MAGIC);
+        let hash: [u8; 32] = Sha256::digest(&bytes).into();
+        bytes.extend(hash);
+        std::fs::write(path(dir), bytes).unwrap();
+    }
 
     #[test]
     fn roundtrip_all_index_kinds() {
@@ -461,7 +678,9 @@ mod tests {
         };
         write_atomic(dir.path(), 42, 7, snap, None).unwrap();
 
-        let loaded = read(dir.path(), None).unwrap().expect("checkpoint present");
+        let loaded = read(dir.path(), 42, &indexed_schema(), None)
+            .unwrap()
+            .expect("checkpoint present");
         assert_eq!(loaded.epoch_built, 7);
         assert_eq!(loaded.hot.get(b"alice"), Some(RowId(1)));
         assert_eq!(loaded.hot.get(b"bob"), Some(RowId(2)));
@@ -484,26 +703,24 @@ mod tests {
     #[test]
     fn read_returns_none_when_absent() {
         let dir = tempdir().unwrap();
-        assert!(read(dir.path(), None).unwrap().is_none());
+        assert!(read(dir.path(), 1, &Schema::default(), None)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
     fn old_checkpoint_version_is_rejected_for_rebuild() {
         let dir = tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(IDX_DIR)).unwrap();
         let body = GlobalIdxBody {
             format_version: IDX_VERSION - 1,
             table_id: 1,
             epoch_built: 1,
             records: vec![],
         };
-        let mut bytes = IDX_MAGIC.to_vec();
-        bytes.extend(bincode::serialize(&body).unwrap());
-        bytes.extend(IDX_MAGIC);
-        let hash: [u8; 32] = Sha256::digest(&bytes).into();
-        bytes.extend(hash);
-        std::fs::write(path(dir.path()), bytes).unwrap();
-        assert!(read(dir.path(), None).unwrap().is_none());
+        write_body(dir.path(), &body);
+        assert!(read(dir.path(), 1, &Schema::default(), None)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -537,10 +754,78 @@ mod tests {
         let mut bytes = std::fs::read(&p).unwrap();
         bytes[12] ^= 0xFF;
         std::fs::write(&p, bytes).unwrap();
-        let res = read(dir.path(), None);
-        assert!(
-            matches!(res, Err(MongrelError::ChecksumMismatch { .. })),
-            "expected checksum mismatch"
-        );
+        assert!(read(dir.path(), 1, &Schema::default(), None)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn checkpoint_is_bound_to_table_and_schema() {
+        let dir = tempdir().unwrap();
+        let hot = HotIndex::new();
+        let mut bitmap = HashMap::new();
+        let mut index = BitmapIndex::new();
+        index.insert(b"value".to_vec(), RowId(1));
+        bitmap.insert(7, index);
+        write_atomic(
+            dir.path(),
+            42,
+            1,
+            IndexSnapshot {
+                hot: &hot,
+                bitmap: &bitmap,
+                ann: &HashMap::new(),
+                fm: &HashMap::new(),
+                sparse: &HashMap::new(),
+                minhash: &HashMap::new(),
+                learned_range: &HashMap::new(),
+            },
+            None,
+        )
+        .unwrap();
+
+        assert!(read(dir.path(), 41, &indexed_schema(), None)
+            .unwrap()
+            .is_none());
+        assert!(read(dir.path(), 42, &Schema::default(), None)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn duplicate_and_unknown_records_trigger_rebuild() {
+        let dir = tempdir().unwrap();
+        let bitmap_payload = bincode::serialize(&Vec::<(Vec<u8>, Vec<u8>)>::new()).unwrap();
+        let mut body = GlobalIdxBody {
+            format_version: IDX_VERSION,
+            table_id: 1,
+            epoch_built: 1,
+            records: vec![
+                Record {
+                    kind: K_BITMAP,
+                    column_id: 7,
+                    payload: bitmap_payload.clone(),
+                },
+                Record {
+                    kind: K_BITMAP,
+                    column_id: 7,
+                    payload: bitmap_payload,
+                },
+            ],
+        };
+        write_body(dir.path(), &body);
+        assert!(read(dir.path(), 1, &indexed_schema(), None)
+            .unwrap()
+            .is_none());
+
+        body.records = vec![Record {
+            kind: 255,
+            column_id: 7,
+            payload: Vec::new(),
+        }];
+        write_body(dir.path(), &body);
+        assert!(read(dir.path(), 1, &indexed_schema(), None)
+            .unwrap()
+            .is_none());
     }
 }

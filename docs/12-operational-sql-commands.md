@@ -90,7 +90,11 @@ session (e.g. `SELECT * FROM other_users JOIN local_orders`).
 `SAVEPOINT name` / `RELEASE name` / `ROLLBACK TO name` provide nested
 sub-transaction control within a SQL `BEGIN`/`COMMIT` block. Savepoints mark a
 position in the staged-ops vector; `ROLLBACK TO` discards ops back to that
-position without aborting the outer transaction.
+position, retains the named savepoint, removes later savepoints, and clears a
+failed or cancelled transaction's aborted state. `RELEASE` removes the named
+savepoint and its nested savepoints without changing staged writes. Using a
+savepoint command outside a transaction, or naming an unknown savepoint,
+returns a typed error.
 
 `SELECT * FROM information_schema.tables` returns a catalog listing all tables,
 views, and triggers in the session. Columns: `type`, `name`, `tbl_name`,

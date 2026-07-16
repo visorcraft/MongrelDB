@@ -6,6 +6,8 @@ use std::sync::Arc;
 
 fn admin() -> Principal {
     Principal {
+        user_id: 0,
+        created_epoch: 0,
         username: "admin".into(),
         is_admin: true,
         roles: Vec::new(),
@@ -20,6 +22,10 @@ async fn sql_rls_column_grants_masks_and_fast_paths() {
     let admin = MongrelSession::open_as(Arc::clone(&db), admin()).unwrap();
     admin
         .run("CREATE TABLE docs (id BIGINT PRIMARY KEY, owner TEXT, secret TEXT, value BIGINT)")
+        .await
+        .unwrap();
+    admin
+        .run("CREATE TABLE plain_docs (id BIGINT PRIMARY KEY)")
         .await
         .unwrap();
     admin
@@ -38,6 +44,8 @@ async fn sql_rls_column_grants_masks_and_fast_paths() {
         "GRANT INSERT (id, owner, secret, value) ON docs TO tenant",
         "GRANT UPDATE (value) ON docs TO tenant",
         "GRANT DELETE ON docs TO tenant",
+        "GRANT SELECT ON plain_docs TO tenant",
+        "GRANT INSERT ON plain_docs TO tenant",
         "GRANT tenant TO alice",
         "GRANT tenant TO bob",
         "ALTER TABLE docs ENABLE ROW LEVEL SECURITY",
@@ -206,4 +214,42 @@ async fn sql_rls_column_grants_masks_and_fast_paths() {
         .unwrap_err()
         .to_string()
         .contains("authentication required"));
+    assert!(alice
+        .run("SELECT id FROM plain_docs")
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("authentication required"));
+    assert!(alice
+        .run("INSERT INTO plain_docs VALUES (1)")
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("authentication required"));
+
+    admin
+        .run("CREATE USER alice WITH PASSWORD 'new-pw'")
+        .await
+        .unwrap();
+    admin.run("GRANT tenant TO alice").await.unwrap();
+    assert!(alice
+        .run("SELECT id FROM docs")
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("authentication required"));
+    assert!(alice
+        .run("INSERT INTO plain_docs VALUES (2)")
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("authentication required"));
+    let error = alice
+        .run("INSERT INTO docs VALUES (5, 'alice', 'revived', 50, NULL)")
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("authentication required"),
+        "{error}"
+    );
 }

@@ -66,7 +66,15 @@ PRAGMA trigger_list;
 Rust exposes `create_trigger`, `drop_trigger`, `triggers`, and trigger
 configuration on `Database`. The daemon, Rust HTTP client, and local or remote
 NAPI bindings expose the same catalog operations. Trigger DDL supports
-idempotency keys on remote paths.
+idempotency keys on remote paths. Keys are durably bound to the authenticated
+owner, operation, and complete trigger definition or dropped trigger name.
+Retries replay the exact response; mismatched input or an uncertain prior
+commit fails closed without executing trigger DDL again.
+The daemon checks current DDL permission before receipt lookup and binds the
+security version plus referenced table and schema IDs. Publication also fences
+the catalog epoch and existing trigger revision; replay verifies the exact
+stored trigger. Permission changes, trigger replacement, or table recreation
+cannot replay an old trigger response.
 
 ## External Table Modules
 

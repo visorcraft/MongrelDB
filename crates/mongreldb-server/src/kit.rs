@@ -14,7 +14,9 @@
 //! commit, and a violating batch is rejected atomically (no partial commit).
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -209,146 +211,863 @@ where
     )
 }
 
-/// Per-server idempotency store: idempotency key → committed response, backed
-/// by an on-disk `<root>/_idem/` directory so retry-after-restart (not just
-/// retry-after-timeout) still returns the original committed response exactly
-/// once. The in-memory map is a hot cache; a miss falls through to disk. Per-key
-/// locks serialize truly-concurrent identical retries.
+// v3 replaces the forgeable v2 checksum with a keyed MAC. Older entries are
+// deliberately unreadable and remain fail-closed outcome-unknown markers.
+const IDEMPOTENCY_ENTRY_VERSION: u8 = 3;
+const KIT_INTENT_MAC_DOMAIN: &[u8] = b"mongreldb/server/kit-idempotency/intent/v3\0";
+const KIT_RECEIPT_MAC_DOMAIN: &[u8] = b"mongreldb/server/kit-idempotency/receipt/v3\0";
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct IdempotencyResponse {
+    status: u16,
+    body: Jval,
+}
+
+impl IdempotencyResponse {
+    fn new(status: StatusCode, body: Jval) -> Self {
+        Self {
+            status: status.as_u16(),
+            body,
+        }
+    }
+
+    fn into_response(self) -> Response {
+        (
+            StatusCode::from_u16(self.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            Json(self.body),
+        )
+            .into_response()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct IdempotencyBinding {
+    owner_hash: [u8; 32],
+    key_hash: [u8; 32],
+    operation_hash: [u8; 32],
+    payload_hash: [u8; 32],
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedIntent {
+    version: u8,
+    scope_hash: [u8; 32],
+    created_at_ms: u64,
+    binding: IdempotencyBinding,
+    authentication: [u8; 32],
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedReceipt {
+    version: u8,
+    scope_hash: [u8; 32],
+    expires_at_ms: u64,
+    binding: IdempotencyBinding,
+    response: IdempotencyResponse,
+    authentication: [u8; 32],
+}
+
+enum ExistingIdempotencyEntry {
+    Replay(IdempotencyResponse),
+    Intent,
+    Expired,
+    Mismatch,
+    Corrupt,
+    None,
+}
+
+enum IdempotencyBegin<'a> {
+    Replay(IdempotencyResponse),
+    Execute(IdempotencyExecution<'a>),
+    Mismatch,
+    Indeterminate,
+    Full,
+    Unavailable,
+}
+
+struct IdempotencyExecution<'a> {
+    store: &'a IdempotencyStore,
+    scope: String,
+    scope_hash: [u8; 32],
+    binding: IdempotencyBinding,
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+/// Durable non-SQL write idempotency. The intent is synced before execution;
+/// the exact response is synced after commit. A surviving or corrupt intent
+/// fails closed because the earlier write may have committed.
 pub struct IdempotencyStore {
-    dir: std::path::PathBuf,
-    committed: Mutex<HashMap<String, KitTxnResponse>>,
-    json_committed: Mutex<HashMap<String, Jval>>,
-    in_flight: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    files: crate::sql_idempotency::StoreFiles,
+    integrity: Option<Arc<crate::sql_idempotency::IdempotencyIntegrity>>,
+    synchronization: Arc<crate::sql_idempotency::StoreSynchronization>,
+    available: AtomicBool,
+    ttl: std::time::Duration,
+    max_entries: usize,
+    max_entries_per_owner: usize,
 }
 
 impl IdempotencyStore {
-    /// Open (or create) the store rooted at `<root>/_idem/`. Best-effort: a
-    /// failure to create the directory is not fatal — the store simply behaves
-    /// as in-memory-only (disk reads/writes become no-ops on error).
+    #[cfg(test)]
     pub fn new(root: &std::path::Path) -> Self {
-        let dir = root.join("_idem");
-        let _ = std::fs::create_dir_all(&dir);
+        let root = Arc::new(
+            mongreldb_core::durable_file::DurableRoot::open(root)
+                .expect("temporary test root must open"),
+        );
+        let integrity = crate::sql_idempotency::IdempotencyIntegrity::for_test_root(&root);
+        Self::new_with_integrity(
+            root,
+            integrity,
+            crate::default_sql_idempotency_ttl(),
+            crate::default_sql_idempotency_max_entries(),
+        )
+    }
+
+    pub(crate) fn new_with_integrity(
+        root: Arc<mongreldb_core::durable_file::DurableRoot>,
+        integrity: Option<Arc<crate::sql_idempotency::IdempotencyIntegrity>>,
+        ttl: std::time::Duration,
+        max_entries: usize,
+    ) -> Self {
+        Self::from_parts(root, integrity, ttl, max_entries)
+    }
+
+    #[cfg(test)]
+    fn new_with_limits(
+        root: &std::path::Path,
+        ttl: std::time::Duration,
+        max_entries: usize,
+    ) -> Self {
+        let root = Arc::new(
+            mongreldb_core::durable_file::DurableRoot::open(root)
+                .expect("temporary test root must open"),
+        );
+        let integrity = crate::sql_idempotency::IdempotencyIntegrity::for_test_root(&root);
+        Self::from_parts(root, integrity, ttl, max_entries)
+    }
+
+    fn from_parts(
+        root: Arc<mongreldb_core::durable_file::DurableRoot>,
+        integrity: Option<Arc<crate::sql_idempotency::IdempotencyIntegrity>>,
+        ttl: std::time::Duration,
+        max_entries: usize,
+    ) -> Self {
+        let files = crate::sql_idempotency::StoreFiles::new(root, "_idem");
+        let available = integrity.is_some() && files.ensure_directory().is_ok();
+        let synchronization = crate::sql_idempotency::synchronization_for(&files.path());
+        let max_entries = max_entries.max(1);
         Self {
-            dir,
-            committed: Mutex::new(HashMap::new()),
-            json_committed: Mutex::new(HashMap::new()),
-            in_flight: Mutex::new(HashMap::new()),
+            files,
+            integrity,
+            synchronization,
+            available: AtomicBool::new(available),
+            ttl,
+            max_entries,
+            max_entries_per_owner: (max_entries / 4).max(1),
         }
     }
 
-    pub(crate) fn key_lock(&self, key: &str) -> Arc<Mutex<()>> {
-        self.in_flight
-            .lock()
-            .unwrap()
-            .entry(key.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
-    }
-
-    fn path_for(&self, key: &str) -> std::path::PathBuf {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut h = DefaultHasher::new();
-        key.hash(&mut h);
-        self.dir.join(format!("{:016x}.json", h.finish()))
-    }
-
-    fn get(&self, key: &str) -> Option<KitTxnResponse> {
-        if let Some(v) = self.committed.lock().unwrap().get(key).cloned() {
-            return Some(v);
+    async fn begin(
+        &self,
+        owner: &str,
+        key: &str,
+        operation: &str,
+        payload: &[u8],
+    ) -> IdempotencyBegin<'_> {
+        if !self.available.load(Ordering::Acquire) {
+            if self.integrity.is_none() || self.files.ensure_directory().is_err() {
+                return IdempotencyBegin::Unavailable;
+            }
+            self.available.store(true, Ordering::Release);
         }
-        // Disk fallback (persisted across daemon restarts).
-        let path = self.path_for(key);
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(_) => return None,
+        let scope_hash = idempotency_scope_hash(owner, key);
+        let scope = crate::sql_idempotency::hex(&scope_hash);
+        let binding = IdempotencyBinding {
+            owner_hash: crate::sql_idempotency::hash(owner.as_bytes()),
+            key_hash: crate::sql_idempotency::hash(key.as_bytes()),
+            operation_hash: crate::sql_idempotency::hash(operation.as_bytes()),
+            payload_hash: crate::sql_idempotency::hash(payload),
         };
-        match serde_json::from_slice::<KitTxnResponse>(&bytes) {
-            Ok(v) => {
-                self.committed
-                    .lock()
-                    .unwrap()
-                    .insert(key.to_string(), v.clone());
-                Some(v)
+        let guard = self.synchronization.lock_scope(scope_hash).await;
+        match self.read_entry(&scope, scope_hash, &binding) {
+            ExistingIdempotencyEntry::Replay(response) => {
+                return IdempotencyBegin::Replay(response)
             }
-            Err(_) => None,
-        }
-    }
-
-    fn store(&self, key: String, resp: KitTxnResponse) {
-        // Atomic write: tmp file in the same dir, then rename.
-        let path = self.path_for(&key);
-        if let Ok(bytes) = serde_json::to_vec(&resp) {
-            let tmp = path.with_extension("json.tmp");
-            if std::fs::write(&tmp, &bytes).is_ok() {
-                let _ = std::fs::rename(&tmp, &path);
+            ExistingIdempotencyEntry::Intent | ExistingIdempotencyEntry::Corrupt => {
+                return IdempotencyBegin::Indeterminate
             }
+            ExistingIdempotencyEntry::Mismatch => return IdempotencyBegin::Mismatch,
+            ExistingIdempotencyEntry::Expired | ExistingIdempotencyEntry::None => {}
         }
-        self.committed.lock().unwrap().insert(key, resp);
-    }
-
-    /// Invalidate all cached idempotency entries. Called when a table is
-    /// dropped, because any cached transaction may reference the dropped
-    /// table. Replaying such a cached response would silently report success
-    /// without applying the transaction to the new (empty) table.
-    pub(crate) fn clear(&self) {
-        self.committed.lock().unwrap().clear();
-        self.json_committed.lock().unwrap().clear();
-        // Best-effort disk cleanup.
-        if let Ok(entries) = std::fs::read_dir(&self.dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().is_some_and(|ext| ext == "json") {
-                    let _ = std::fs::remove_file(&path);
+        let _capacity_guard = self.synchronization.lock_capacity().await;
+        let Ok(_capacity_file_guard) =
+            crate::sql_idempotency::CapacityFileGuard::acquire(&self.files).await
+        else {
+            return IdempotencyBegin::Unavailable;
+        };
+        self.prune_expired_receipts();
+        match self.read_entry(&scope, scope_hash, &binding) {
+            ExistingIdempotencyEntry::Replay(response) => {
+                return IdempotencyBegin::Replay(response)
+            }
+            ExistingIdempotencyEntry::Mismatch => return IdempotencyBegin::Mismatch,
+            ExistingIdempotencyEntry::Intent
+            | ExistingIdempotencyEntry::Expired
+            | ExistingIdempotencyEntry::Corrupt => return IdempotencyBegin::Indeterminate,
+            ExistingIdempotencyEntry::None => {}
+        }
+        if self.legacy_entry_exists() {
+            return IdempotencyBegin::Indeterminate;
+        }
+        let Some(usage) = self.capacity_usage(binding.owner_hash) else {
+            return IdempotencyBegin::Full;
+        };
+        if usage.total >= self.max_entries || usage.owner >= self.max_entries_per_owner {
+            return IdempotencyBegin::Full;
+        }
+        let mut intent = PersistedIntent {
+            version: IDEMPOTENCY_ENTRY_VERSION,
+            scope_hash,
+            created_at_ms: crate::sql_idempotency::now_ms(),
+            binding: binding.clone(),
+            authentication: [0; 32],
+        };
+        let Some(integrity) = self.integrity.as_deref() else {
+            return IdempotencyBegin::Unavailable;
+        };
+        let Ok(authentication) = intent_authentication(integrity, &intent) else {
+            return IdempotencyBegin::Unavailable;
+        };
+        intent.authentication = authentication;
+        match crate::sql_idempotency::persist_claim(&self.files, self.intent_name(&scope), &intent)
+        {
+            Ok(()) => IdempotencyBegin::Execute(IdempotencyExecution {
+                store: self,
+                scope,
+                scope_hash,
+                binding,
+                _guard: guard,
+            }),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                match self.read_entry(&scope, scope_hash, &binding) {
+                    ExistingIdempotencyEntry::Replay(response) => {
+                        IdempotencyBegin::Replay(response)
+                    }
+                    ExistingIdempotencyEntry::Mismatch => IdempotencyBegin::Mismatch,
+                    ExistingIdempotencyEntry::Intent
+                    | ExistingIdempotencyEntry::Expired
+                    | ExistingIdempotencyEntry::Corrupt
+                    | ExistingIdempotencyEntry::None => IdempotencyBegin::Indeterminate,
                 }
             }
+            Err(_) => IdempotencyBegin::Unavailable,
         }
     }
 
-    pub(crate) fn get_json(&self, key: &str) -> Option<Jval> {
-        if let Some(v) = self.json_committed.lock().unwrap().get(key).cloned() {
-            return Some(v);
+    fn read_entry(
+        &self,
+        scope: &str,
+        expected_scope: [u8; 32],
+        expected_binding: &IdempotencyBinding,
+    ) -> ExistingIdempotencyEntry {
+        let receipt_name = self.receipt_name(scope);
+        match self.files.read(&receipt_name) {
+            Ok(bytes) => {
+                let Ok(receipt) = serde_json::from_slice::<PersistedReceipt>(&bytes) else {
+                    return ExistingIdempotencyEntry::Corrupt;
+                };
+                if receipt.version != IDEMPOTENCY_ENTRY_VERSION
+                    || receipt.scope_hash != expected_scope
+                    || StatusCode::from_u16(receipt.response.status).is_err()
+                    || !self.receipt_authentication_matches(&receipt)
+                {
+                    return ExistingIdempotencyEntry::Corrupt;
+                }
+                if receipt.expires_at_ms <= crate::sql_idempotency::now_ms() {
+                    return ExistingIdempotencyEntry::Expired;
+                }
+                return if receipt.binding == *expected_binding {
+                    ExistingIdempotencyEntry::Replay(receipt.response)
+                } else {
+                    ExistingIdempotencyEntry::Mismatch
+                };
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return ExistingIdempotencyEntry::Corrupt,
         }
-        let path = self.path_for(key);
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(_) => return None,
+        let intent_name = self.intent_name(scope);
+        let bytes = match self.files.read(&intent_name) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return ExistingIdempotencyEntry::None
+            }
+            Err(_) => return ExistingIdempotencyEntry::Corrupt,
         };
-        match serde_json::from_slice::<Jval>(&bytes) {
-            Ok(v) => {
-                self.json_committed
-                    .lock()
-                    .unwrap()
-                    .insert(key.to_string(), v.clone());
-                Some(v)
-            }
-            Err(_) => None,
+        let Ok(intent) = serde_json::from_slice::<PersistedIntent>(&bytes) else {
+            return ExistingIdempotencyEntry::Corrupt;
+        };
+        if intent.version != IDEMPOTENCY_ENTRY_VERSION
+            || intent.scope_hash != expected_scope
+            || !self.intent_authentication_matches(&intent)
+        {
+            return ExistingIdempotencyEntry::Corrupt;
+        }
+        if intent.binding == *expected_binding {
+            ExistingIdempotencyEntry::Intent
+        } else {
+            ExistingIdempotencyEntry::Mismatch
         }
     }
 
-    pub(crate) fn store_json(&self, key: String, resp: Jval) {
-        let path = self.path_for(&key);
-        if let Ok(bytes) = serde_json::to_vec(&resp) {
-            let tmp = path.with_extension("json.tmp");
-            if std::fs::write(&tmp, &bytes).is_ok() {
-                let _ = std::fs::rename(&tmp, &path);
+    fn prune_expired_receipts(&self) {
+        let Ok(entries) = self.files.list() else {
+            return;
+        };
+        for name in entries {
+            let path = std::path::Path::new(&name);
+            if crate::sql_idempotency::scope_from_path(path, ".receipt.json").is_none() {
+                continue;
+            }
+            let expired = self
+                .files
+                .read(path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<PersistedReceipt>(&bytes).ok())
+                .is_some_and(|receipt| {
+                    receipt.version == IDEMPOTENCY_ENTRY_VERSION
+                        && self.receipt_authentication_matches(&receipt)
+                        && receipt.expires_at_ms <= crate::sql_idempotency::now_ms()
+                });
+            if expired {
+                let _ = crate::sql_idempotency::remove_durable(&self.files, path);
             }
         }
-        self.json_committed.lock().unwrap().insert(key, resp);
+    }
+
+    fn capacity_usage(&self, requested_owner: [u8; 32]) -> Option<IdempotencyCapacityUsage> {
+        let entries = self.files.list().ok()?;
+        let mut scopes = HashMap::<String, Option<[u8; 32]>>::new();
+        let mut unknown_entries = 0_usize;
+        for name in entries {
+            let path = std::path::Path::new(&name);
+            if path
+                .file_name()
+                .is_some_and(|name| name == crate::sql_idempotency::CAPACITY_LOCK_FILE)
+            {
+                continue;
+            }
+            let (scope, owner) = if let Some(scope) =
+                crate::sql_idempotency::scope_from_path(path, ".intent.json")
+            {
+                let owner = self
+                    .files
+                    .read(path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<PersistedIntent>(&bytes).ok())
+                    .and_then(|intent| {
+                        (intent.version == IDEMPOTENCY_ENTRY_VERSION
+                            && crate::sql_idempotency::hex(&intent.scope_hash) == scope
+                            && self.intent_authentication_matches(&intent))
+                        .then_some(intent.binding.owner_hash)
+                    });
+                (scope, owner)
+            } else if let Some(scope) =
+                crate::sql_idempotency::scope_from_path(path, ".receipt.json")
+            {
+                let owner = self
+                    .files
+                    .read(path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<PersistedReceipt>(&bytes).ok())
+                    .and_then(|receipt| {
+                        (receipt.version == IDEMPOTENCY_ENTRY_VERSION
+                            && crate::sql_idempotency::hex(&receipt.scope_hash) == scope
+                            && self.receipt_authentication_matches(&receipt))
+                        .then_some(receipt.binding.owner_hash)
+                    });
+                (scope, owner)
+            } else {
+                unknown_entries = unknown_entries.saturating_add(1);
+                continue;
+            };
+            scopes
+                .entry(scope.to_owned())
+                .and_modify(|current| {
+                    if *current != owner {
+                        *current = None;
+                    }
+                })
+                .or_insert(owner);
+        }
+        Some(IdempotencyCapacityUsage {
+            total: scopes.len().saturating_add(unknown_entries),
+            owner: scopes
+                .values()
+                .filter(|owner| **owner == Some(requested_owner))
+                .count(),
+        })
+    }
+
+    fn intent_name(&self, scope: &str) -> String {
+        format!("{scope}.intent.json")
+    }
+
+    fn receipt_name(&self, scope: &str) -> String {
+        format!("{scope}.receipt.json")
+    }
+
+    #[cfg(test)]
+    fn intent_path(&self, scope: &str) -> std::path::PathBuf {
+        self.files.absolute(self.intent_name(scope))
+    }
+
+    #[cfg(test)]
+    fn receipt_path(&self, scope: &str) -> std::path::PathBuf {
+        self.files.absolute(self.receipt_name(scope))
+    }
+
+    fn intent_authentication_matches(&self, intent: &PersistedIntent) -> bool {
+        self.integrity.as_deref().is_some_and(|integrity| {
+            intent_authentication_bytes(intent).is_ok_and(|bytes| {
+                integrity.verify(KIT_INTENT_MAC_DOMAIN, &bytes, &intent.authentication)
+            })
+        })
+    }
+
+    fn receipt_authentication_matches(&self, receipt: &PersistedReceipt) -> bool {
+        self.integrity.as_deref().is_some_and(|integrity| {
+            receipt_authentication_bytes(receipt).is_ok_and(|bytes| {
+                integrity.verify(KIT_RECEIPT_MAC_DOMAIN, &bytes, &receipt.authentication)
+            })
+        })
+    }
+
+    fn legacy_entry_exists(&self) -> bool {
+        // The former DefaultHasher filenames carried no key or binding, and
+        // DefaultHasher is not stable across toolchains. Any surviving legacy
+        // receipt therefore blocks new keyed writes until an operator removes
+        // it after the old retry window.
+        let Ok(entries) = self.files.list() else {
+            return true;
+        };
+        for entry in entries {
+            let Some(name) = entry.to_str() else {
+                continue;
+            };
+            let legacy_hash = name
+                .strip_suffix(".json")
+                .or_else(|| name.strip_suffix(".json.tmp"));
+            if legacy_hash.is_some_and(|value| {
+                value.len() == 16 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            }) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+struct IdempotencyCapacityUsage {
+    total: usize,
+    owner: usize,
+}
+
+impl IdempotencyExecution<'_> {
+    fn commit(self, response: IdempotencyResponse) -> bool {
+        let mut receipt = PersistedReceipt {
+            version: IDEMPOTENCY_ENTRY_VERSION,
+            scope_hash: self.scope_hash,
+            expires_at_ms: crate::sql_idempotency::now_ms()
+                .saturating_add(crate::sql_idempotency::duration_ms(self.store.ttl)),
+            binding: self.binding,
+            response,
+            authentication: [0; 32],
+        };
+        let Some(integrity) = self.store.integrity.as_deref() else {
+            return false;
+        };
+        let Ok(authentication) = receipt_authentication(integrity, &receipt) else {
+            return false;
+        };
+        receipt.authentication = authentication;
+        let persisted = crate::sql_idempotency::persist_new(
+            &self.store.files,
+            self.store.receipt_name(&self.scope),
+            &receipt,
+        )
+        .is_ok();
+        if persisted {
+            let _ = crate::sql_idempotency::remove_durable(
+                &self.store.files,
+                self.store.intent_name(&self.scope),
+            );
+        }
+        persisted
+    }
+
+    fn abort(self) {
+        let _ = crate::sql_idempotency::remove_durable(
+            &self.store.files,
+            self.store.intent_name(&self.scope),
+        );
+    }
+}
+
+#[derive(Serialize)]
+struct IntentAuthentication<'a> {
+    version: u8,
+    scope_hash: &'a [u8; 32],
+    created_at_ms: u64,
+    binding: &'a IdempotencyBinding,
+}
+
+#[derive(Serialize)]
+struct ReceiptAuthentication<'a> {
+    version: u8,
+    scope_hash: &'a [u8; 32],
+    expires_at_ms: u64,
+    binding: &'a IdempotencyBinding,
+    response: &'a IdempotencyResponse,
+}
+
+fn intent_authentication_bytes(intent: &PersistedIntent) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec(&IntentAuthentication {
+        version: intent.version,
+        scope_hash: &intent.scope_hash,
+        created_at_ms: intent.created_at_ms,
+        binding: &intent.binding,
+    })
+}
+
+fn receipt_authentication_bytes(receipt: &PersistedReceipt) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec(&ReceiptAuthentication {
+        version: receipt.version,
+        scope_hash: &receipt.scope_hash,
+        expires_at_ms: receipt.expires_at_ms,
+        binding: &receipt.binding,
+        response: &receipt.response,
+    })
+}
+
+fn intent_authentication(
+    integrity: &crate::sql_idempotency::IdempotencyIntegrity,
+    intent: &PersistedIntent,
+) -> Result<[u8; 32], serde_json::Error> {
+    intent_authentication_bytes(intent)
+        .map(|bytes| integrity.authenticate(KIT_INTENT_MAC_DOMAIN, &bytes))
+}
+
+fn receipt_authentication(
+    integrity: &crate::sql_idempotency::IdempotencyIntegrity,
+    receipt: &PersistedReceipt,
+) -> Result<[u8; 32], serde_json::Error> {
+    receipt_authentication_bytes(receipt)
+        .map(|bytes| integrity.authenticate(KIT_RECEIPT_MAC_DOMAIN, &bytes))
+}
+
+fn idempotency_scope_hash(owner: &str, key: &str) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"mongreldb-server-idempotency-v2\0");
+    digest.update((owner.len() as u64).to_le_bytes());
+    digest.update(owner.as_bytes());
+    digest.update((key.len() as u64).to_le_bytes());
+    digest.update(key.as_bytes());
+    digest.finalize().into()
+}
+
+pub(crate) fn idempotency_owner(
+    state: &AppState,
+    authenticated_user: Option<&mongreldb_core::Principal>,
+) -> std::result::Result<String, Box<Response>> {
+    if let Some(principal) = authenticated_user {
+        state
+            .db
+            .resolve_current_principal(principal)
+            .ok_or_else(|| Box::new(kit_core_error(&MongrelError::AuthRequired)))?;
+        return Ok(format!(
+            "user:{}:{}",
+            principal.user_id, principal.created_epoch
+        ));
+    }
+    if let Some(token) = state.auth_token.as_deref() {
+        if state.db.require_auth_enabled()
+            && !state
+                .db
+                .principal_snapshot()
+                .and_then(|principal| state.db.resolve_current_principal(&principal))
+                .is_some_and(|principal| principal.is_admin)
+        {
+            return Err(Box::new(kit_core_error(&MongrelError::AuthRequired)));
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"mongreldb-server-bearer-owner-v1\0");
+        digest.update((token.len() as u64).to_le_bytes());
+        digest.update(token.as_bytes());
+        return Ok(format!(
+            "bearer:{}",
+            crate::sql_idempotency::hex(&digest.finalize())
+        ));
+    }
+    if state.user_auth || state.db.require_auth_enabled() {
+        return Err(Box::new(kit_core_error(&MongrelError::AuthRequired)));
+    }
+    Ok("anonymous".into())
+}
+
+pub(crate) enum IdempotentJsonFailure {
+    Safe(Box<Response>),
+    Committed(IdempotencyResponse),
+    OutcomeUnknown { epoch: Option<u64>, message: String },
+}
+
+impl IdempotentJsonFailure {
+    pub(crate) fn safe(response: Response) -> Self {
+        Self::Safe(Box::new(response))
+    }
+
+    fn into_response(self) -> Response {
+        match self {
+            Self::Safe(response) => *response,
+            Self::Committed(response) => response.into_response(),
+            Self::OutcomeUnknown { epoch, message } => idempotency_outcome_unknown(epoch, &message),
+        }
+    }
+}
+
+pub(crate) fn idempotent_core_failure(
+    error: MongrelError,
+    status: StatusCode,
+    code: &str,
+) -> IdempotentJsonFailure {
+    match error {
+        MongrelError::DurableCommit { epoch, message } => {
+            IdempotentJsonFailure::Committed(IdempotencyResponse::new(
+                StatusCode::CONFLICT,
+                json!({
+                    "status": "committed",
+                    "committed": true,
+                    "epoch": epoch,
+                    "epoch_text": epoch.to_string(),
+                    "retryable": false,
+                    "error": { "code": "COMMIT_OUTCOME", "message": message }
+                }),
+            ))
+        }
+        MongrelError::CommitOutcomeUnknown { epoch, message } => {
+            IdempotentJsonFailure::OutcomeUnknown {
+                epoch: Some(epoch),
+                message,
+            }
+        }
+        error => IdempotentJsonFailure::safe(
+            (
+                status,
+                Json(json!({
+                    "status": "aborted",
+                    "committed": false,
+                    "retryable": false,
+                    "error": { "code": code, "message": error.to_string() }
+                })),
+            )
+                .into_response(),
+        ),
+    }
+}
+
+pub(crate) async fn idempotent_json<T, F>(
+    state: &Arc<AppState>,
+    owner: &str,
+    operation: &str,
+    key: Option<&str>,
+    payload: &T,
+    execute: F,
+) -> Response
+where
+    T: Serialize + ?Sized,
+    F: FnOnce() -> Result<Jval, IdempotentJsonFailure>,
+{
+    idempotent_json_validated(state, owner, operation, key, payload, execute, |_| Ok(())).await
+}
+
+pub(crate) async fn idempotent_json_validated<T, F, V>(
+    state: &Arc<AppState>,
+    owner: &str,
+    operation: &str,
+    key: Option<&str>,
+    payload: &T,
+    execute: F,
+    validate_replay: V,
+) -> Response
+where
+    T: Serialize + ?Sized,
+    F: FnOnce() -> Result<Jval, IdempotentJsonFailure>,
+    V: FnOnce(&Jval) -> Result<(), Box<Response>>,
+{
+    let Some(key) = key else {
+        return match execute() {
+            Ok(value) => Json(value).into_response(),
+            Err(failure) => failure.into_response(),
+        };
+    };
+    if let Err(message) = crate::sql_idempotency::SqlIdempotencyStore::validate_key(key) {
+        return idempotency_error(StatusCode::BAD_REQUEST, "INVALID_IDEMPOTENCY_KEY", message);
+    }
+    let payload = match serde_json::to_vec(payload) {
+        Ok(payload) => payload,
+        Err(_) => {
+            return idempotency_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "IDEMPOTENCY_STORE_UNAVAILABLE",
+                "failed to serialize idempotency request binding",
+            )
+        }
+    };
+    match state.idem.begin(owner, key, operation, &payload).await {
+        IdempotencyBegin::Replay(response) => match validate_replay(&response.body) {
+            Ok(()) => response.into_response(),
+            Err(response) => *response,
+        },
+        IdempotencyBegin::Execute(execution) => finish_idempotent_execution(execution, execute()),
+        IdempotencyBegin::Mismatch => idempotency_error(
+            StatusCode::CONFLICT,
+            "IDEMPOTENCY_KEY_REUSE_MISMATCH",
+            "idempotency key was already used with a different operation or payload",
+        ),
+        IdempotencyBegin::Indeterminate => idempotency_outcome_unknown(
+            None,
+            "a durable write intent exists without a durable receipt; the operation was not re-executed",
+        ),
+        IdempotencyBegin::Full => idempotency_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "IDEMPOTENCY_STORE_FULL",
+            "idempotency receipt store is full",
+        ),
+        IdempotencyBegin::Unavailable => idempotency_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "IDEMPOTENCY_STORE_UNAVAILABLE",
+            "could not durably reserve the idempotency key",
+        ),
+    }
+}
+
+fn finish_idempotent_execution(
+    execution: IdempotencyExecution<'_>,
+    result: Result<Jval, IdempotentJsonFailure>,
+) -> Response {
+    match result {
+        Ok(body) => {
+            let response = IdempotencyResponse::new(StatusCode::OK, body);
+            if execution.commit(response.clone()) {
+                response.into_response()
+            } else {
+                idempotency_outcome_unknown(
+                    None,
+                    "the operation completed but its durable idempotency receipt could not be published; it will not be re-executed",
+                )
+            }
+        }
+        Err(IdempotentJsonFailure::Safe(response)) => {
+            execution.abort();
+            *response
+        }
+        Err(IdempotentJsonFailure::Committed(response)) => {
+            if execution.commit(response.clone()) {
+                response.into_response()
+            } else {
+                idempotency_outcome_unknown(
+                    None,
+                    "the operation committed but its durable idempotency receipt could not be published; it will not be re-executed",
+                )
+            }
+        }
+        Err(IdempotentJsonFailure::OutcomeUnknown { epoch, message }) => {
+            drop(execution);
+            idempotency_outcome_unknown(epoch, &message)
+        }
+    }
+}
+
+fn idempotency_error(status: StatusCode, code: &str, message: &str) -> Response {
+    (
+        status,
+        Json(json!({
+            "status": "aborted",
+            "committed": false,
+            "retryable": matches!(code, "IDEMPOTENCY_STORE_FULL" | "IDEMPOTENCY_STORE_UNAVAILABLE"),
+            "error": { "code": code, "message": message }
+        })),
+    )
+        .into_response()
+}
+
+fn idempotency_outcome_unknown(epoch: Option<u64>, message: &str) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "status": "outcome_unknown",
+            "committed": Jval::Null,
+            "epoch": epoch,
+            "epoch_text": epoch.map(|epoch| epoch.to_string()),
+            "retryable": false,
+            "error": { "code": "QUERY_OUTCOME_UNKNOWN", "message": message }
+        })),
+    )
+        .into_response()
+}
+
+/// Preserve durable-write outcome information for non-idempotent HTTP routes.
+/// Safe pre-commit errors stay with each route's existing response contract.
+pub(crate) fn durable_core_error_response(error: &MongrelError) -> Option<Response> {
+    match error {
+        MongrelError::DurableCommit { epoch, message } => Some(
+            (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "status": "committed",
+                    "committed": true,
+                    "epoch": epoch,
+                    "epoch_text": epoch.to_string(),
+                    "retryable": false,
+                    "error": { "code": "COMMIT_OUTCOME", "message": message }
+                })),
+            )
+                .into_response(),
+        ),
+        MongrelError::CommitOutcomeUnknown { epoch, message } => {
+            Some(idempotency_outcome_unknown(Some(*epoch), message))
+        }
+        _ => None,
     }
 }
 
 // ── Request models ──────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct KitTxnRequest {
     #[serde(default)]
     pub idempotency_key: Option<String>,
     pub ops: Vec<KitOp>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct KitTxnTableBinding {
+    table_id: u64,
+    schema_id: u64,
+}
+
+struct KitTxnPreflight {
+    tables: Vec<KitTxnTableBinding>,
+    security_version: u64,
+}
+
+#[derive(Serialize)]
+struct KitTxnIdempotencyPayload<'a> {
+    ops: &'a [KitOp],
+    tables: &'a [KitTxnTableBinding],
+    security_version: u64,
+}
+
 /// One typed operation in a `/kit/txn` batch (externally tagged: `{"put": …}`).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum KitOp {
     Put {
@@ -382,6 +1101,7 @@ pub enum KitOp {
 pub struct KitTxnResponse {
     pub status: String,
     pub epoch: u64,
+    pub epoch_text: String,
     pub results: Vec<KitOpResult>,
 }
 
@@ -439,11 +1159,10 @@ impl KitError {
 /// Map an engine error from the commit path to a typed error code.
 pub fn error_code(e: &MongrelError) -> &'static str {
     match e {
+        MongrelError::TriggerValidation(_) => "TRIGGER_VALIDATION",
         MongrelError::Conflict(_) => {
             let m = format!("{e}");
-            if is_trigger_error(&m) {
-                "TRIGGER_VALIDATION"
-            } else if m.contains("UNIQUE") {
+            if m.contains("UNIQUE") {
                 "UNIQUE_VIOLATION"
             } else if m.contains("FOREIGN KEY") {
                 "FK_VIOLATION"
@@ -453,9 +1172,7 @@ pub fn error_code(e: &MongrelError) -> &'static str {
         }
         MongrelError::InvalidArgument(_) => {
             let m = format!("{e}");
-            if is_trigger_error(&m) {
-                "TRIGGER_VALIDATION"
-            } else if m.contains("CHECK constraint") {
+            if m.contains("CHECK constraint") {
                 "CHECK_VIOLATION"
             } else {
                 "BAD_REQUEST"
@@ -466,12 +1183,6 @@ pub fn error_code(e: &MongrelError) -> &'static str {
         MongrelError::CursorExpired => "CURSOR_EXPIRED",
         _ => "INTERNAL",
     }
-}
-
-fn is_trigger_error(message: &str) -> bool {
-    message.contains("trigger ")
-        || message.contains("Trigger ")
-        || message.contains("external trigger bridge")
 }
 
 // ── Metadata handlers ───────────────────────────────────────────────────────
@@ -775,26 +1486,27 @@ impl<'de> Deserialize<'de> for KitStaticDefault {
 }
 
 /// Convert a KitColumnDef's default fields into an engine DefaultExpr.
-#[allow(clippy::result_large_err)]
 fn kit_default_expr(
     c: &KitColumnDef,
     ty: &TypeId,
-) -> std::result::Result<Option<DefaultExpr>, axum::response::Response> {
+) -> std::result::Result<Option<DefaultExpr>, Box<Response>> {
     if let Some(expr) = c.default_expr.as_deref() {
         return match expr {
             "now" => Ok(Some(DefaultExpr::Now)),
             "uuid" => Ok(Some(DefaultExpr::Uuid)),
-            other => Err((
-                StatusCode::BAD_REQUEST,
-                Json(KitErrorEnvelope {
-                    status: "aborted".into(),
-                    error: KitError::new(
-                        "BAD_REQUEST",
-                        format!("unknown default_expr \"{other}\""),
-                    ),
-                }),
-            )
-                .into_response()),
+            other => Err(Box::new(
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(KitErrorEnvelope {
+                        status: "aborted".into(),
+                        error: KitError::new(
+                            "BAD_REQUEST",
+                            format!("unknown default_expr \"{other}\""),
+                        ),
+                    }),
+                )
+                    .into_response(),
+            )),
         };
     }
     let Some(value) = c.default_value.0.as_ref() else {
@@ -802,17 +1514,19 @@ fn kit_default_expr(
     };
     if let (Jval::String(value), TypeId::Enum { variants }) = (value, ty) {
         if !variants.iter().any(|variant| variant == value) {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(KitErrorEnvelope {
-                    status: "aborted".into(),
-                    error: KitError::new(
-                        "BAD_REQUEST",
-                        format!("default enum value \"{value}\" is not declared"),
-                    ),
-                }),
-            )
-                .into_response());
+            return Err(Box::new(
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(KitErrorEnvelope {
+                        status: "aborted".into(),
+                        error: KitError::new(
+                            "BAD_REQUEST",
+                            format!("default enum value \"{value}\" is not declared"),
+                        ),
+                    }),
+                )
+                    .into_response(),
+            ));
         }
     }
     Ok(Some(DefaultExpr::Static(json_to_value(value, ty))))
@@ -897,7 +1611,7 @@ pub async fn kit_create_table(
             flags,
             default_value: match kit_default_expr(c, &ty) {
                 Ok(v) => v,
-                Err(resp) => return resp,
+                Err(resp) => return *resp,
             },
         });
     }
@@ -943,15 +1657,21 @@ pub async fn kit_create_table(
         clustered: false,
     };
     match state.db.create_table(&req.name, schema) {
-        Ok(id) => Json(json!({ "table_id": id })).into_response(),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(KitErrorEnvelope {
-                status: "aborted".into(),
-                error: KitError::new("BAD_REQUEST", format!("{e}")),
-            }),
-        )
-            .into_response(),
+        Ok(id) => Json(json!({
+            "table_id": id,
+            "table_id_text": id.to_string()
+        }))
+        .into_response(),
+        Err(error) => durable_core_error_response(&error).unwrap_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(KitErrorEnvelope {
+                    status: "aborted".into(),
+                    error: KitError::new("BAD_REQUEST", format!("{error}")),
+                }),
+            )
+                .into_response()
+        }),
     }
 }
 
@@ -967,6 +1687,9 @@ fn kit_bad_request(message: String) -> Response {
 }
 
 fn kit_core_error(error: &MongrelError) -> Response {
+    if let Some(response) = durable_core_error_response(error) {
+        return response;
+    }
     let (status, code) = match error {
         MongrelError::InvalidArgument(_)
         | MongrelError::Schema(_)
@@ -981,10 +1704,7 @@ fn kit_core_error(error: &MongrelError) -> Response {
         MongrelError::CursorExpired => (StatusCode::GONE, "CURSOR_EXPIRED"),
         MongrelError::DeadlineExceeded => (StatusCode::GATEWAY_TIMEOUT, "DEADLINE_EXCEEDED"),
         MongrelError::WorkBudgetExceeded => (StatusCode::TOO_MANY_REQUESTS, "WORK_BUDGET_EXCEEDED"),
-        MongrelError::Cancelled => (
-            StatusCode::from_u16(499).expect("499 is valid"),
-            "CANCELLED",
-        ),
+        MongrelError::Cancelled => (super::client_closed_request_status(), "CANCELLED"),
         _ => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL"),
     };
     (
@@ -1004,42 +1724,38 @@ pub async fn kit_txn(
     OptionalPrincipal(principal): OptionalPrincipal,
     Json(req): Json<KitTxnRequest>,
 ) -> Response {
-    let principal = request_principal(&state, &principal);
-    // Idempotency: if a key is present, serialize same-key requests and return
-    // any previously-committed response verbatim.
-    if let Some(key) = req.idempotency_key.clone().map(|key| {
-        format!(
-            "{}:{key}",
-            principal
-                .as_ref()
-                .map(|principal| principal.username.as_str())
-                .unwrap_or("anonymous")
-        )
-    }) {
-        if let Some(cached) = state.idem.get(&key) {
-            return Json(cached).into_response();
-        }
-        let lock = state.idem.key_lock(&key);
-        let _g = lock.lock().unwrap();
-        if let Some(cached) = state.idem.get(&key) {
-            return Json(cached).into_response();
-        }
-        let resp = execute_kit_txn(&state, &req, principal.clone());
-        if let Ok(out) = &resp {
-            state.idem.store(key.clone(), out.clone());
-        }
-        return txn_response(resp);
-    }
-    txn_response(execute_kit_txn(&state, &req, principal))
-}
-
-/// Convert a `Result<KitTxnResponse, Response>` (Ok = committed batch, Err =
-/// pre-built error Response) into a single axum `Response`.
-fn txn_response(r: Result<KitTxnResponse, Response>) -> Response {
-    match r {
-        Ok(resp) => Json(resp).into_response(),
-        Err(resp) => resp,
-    }
+    let effective_principal = request_principal(&state, &principal);
+    let preflight = match preflight_kit_txn(&state, &req, effective_principal.as_ref()) {
+        Ok(preflight) => preflight,
+        Err(response) => return *response,
+    };
+    let owner = match idempotency_owner(&state, principal.as_ref()) {
+        Ok(owner) => owner,
+        Err(response) => return *response,
+    };
+    let payload = KitTxnIdempotencyPayload {
+        ops: &req.ops,
+        tables: &preflight.tables,
+        security_version: preflight.security_version,
+    };
+    idempotent_json(
+        &state,
+        &owner,
+        "kit:txn",
+        req.idempotency_key.as_deref(),
+        &payload,
+        || match execute_kit_txn(&state, &req, effective_principal, &preflight.tables) {
+            Ok(response) => {
+                serde_json::to_value(response).map_err(|_| IdempotentJsonFailure::OutcomeUnknown {
+                    epoch: None,
+                    message: "the transaction committed but its response could not be serialized"
+                        .into(),
+                })
+            }
+            Err(failure) => Err(failure),
+        },
+    )
+    .await
 }
 
 // ── Native typed query endpoint (/kit/query) ────────────────────────────────
@@ -1765,6 +2481,7 @@ fn execute_kit_search(
     req: &KitSearchRequest,
     context: &mongreldb_core::query::AiExecutionContext,
 ) -> Result<Jval, MongrelError> {
+    let cursor_mac_key = state.cursor_mac_key.get()?;
     let handle = state.db.table(&req.table)?;
     let schema = mongreldb_core::lock_table_with_context(&handle, Some(context))?
         .schema()
@@ -1896,7 +2613,7 @@ fn execute_kit_search(
     let cursor = req
         .cursor
         .as_deref()
-        .map(|value| parse_kit_search_cursor(value, &state.cursor_mac_key))
+        .map(|value| parse_kit_search_cursor(value, &cursor_mac_key))
         .transpose()?;
     if let Some(cursor) = cursor {
         validate_cursor_identity(cursor.binding, principal, request_hash)?;
@@ -1976,7 +2693,7 @@ fn execute_kit_search(
                     row_id: hit.row_id.0,
                     binding,
                 },
-                &state.cursor_mac_key,
+                &cursor_mac_key,
             )
         })
     } else {
@@ -2159,6 +2876,10 @@ pub async fn kit_query(
             mongreldb_core::query::MAX_QUERY_OFFSET
         ));
     }
+    let cursor_mac_key = match state.cursor_mac_key.get() {
+        Ok(key) => key,
+        Err(error) => return kit_core_error(&error),
+    };
     let principal = request_principal(&state, &principal);
     let handle = match state.db.table(&req.table) {
         Ok(h) => h,
@@ -2244,7 +2965,7 @@ pub async fn kit_query(
     let cursor = match req
         .cursor
         .as_deref()
-        .map(|value| parse_kit_query_cursor(value, &state.cursor_mac_key))
+        .map(|value| parse_kit_query_cursor(value, &cursor_mac_key))
         .transpose()
     {
         Ok(cursor) => cursor,
@@ -2359,7 +3080,7 @@ pub async fn kit_query(
                     row_id: row_id.0,
                     binding,
                 },
-                &state.cursor_mac_key,
+                &cursor_mac_key,
             )
         })
     } else {
@@ -2486,12 +3207,193 @@ fn col_type(
         .ok_or_else(|| format!("unknown column id {column_id}"))
 }
 
-#[allow(clippy::result_large_err)]
+fn preflight_kit_txn(
+    state: &AppState,
+    req: &KitTxnRequest,
+    principal: Option<&mongreldb_core::Principal>,
+) -> Result<KitTxnPreflight, Box<Response>> {
+    for _ in 0..3 {
+        let security_version = state.db.security_version();
+        let tables = preflight_kit_txn_once(state, req, principal)?;
+        if state.db.security_version() == security_version {
+            return Ok(KitTxnPreflight {
+                tables,
+                security_version,
+            });
+        }
+    }
+    Err(Box::new(kit_core_error(&MongrelError::Conflict(
+        "authorization changed during transaction preflight".into(),
+    ))))
+}
+
+fn preflight_kit_txn_once(
+    state: &AppState,
+    req: &KitTxnRequest,
+    principal: Option<&mongreldb_core::Principal>,
+) -> Result<Vec<KitTxnTableBinding>, Box<Response>> {
+    let mut bindings = Vec::with_capacity(req.ops.len());
+    for (index, op) in req.ops.iter().enumerate() {
+        let table = match op {
+            KitOp::Put { table, .. }
+            | KitOp::Upsert { table, .. }
+            | KitOp::Delete { table, .. }
+            | KitOp::DeleteByPk { table, .. } => table,
+        };
+        let mut stable = None;
+        for _ in 0..3 {
+            let (binding, schema) = current_kit_table(state, table)
+                .map_err(|error| Box::new(kit_core_error(&error)))?;
+            match op {
+                KitOp::Put {
+                    cells, returning, ..
+                } => {
+                    let cells = parse_cells(cells, &schema)
+                        .map_err(|message| Box::new(op_error_msg(index, "BAD_REQUEST", message)))?;
+                    let columns = cells.iter().map(|(column, _)| *column).collect::<Vec<_>>();
+                    state
+                        .db
+                        .require_columns_for(
+                            table,
+                            mongreldb_core::ColumnOperation::Insert,
+                            &columns,
+                            principal,
+                        )
+                        .map_err(|error| Box::new(kit_core_error(&error)))?;
+                    if *returning {
+                        require_returning_columns(state, table, &schema, principal)?;
+                    }
+                }
+                KitOp::Upsert {
+                    cells,
+                    update_cells,
+                    returning,
+                    ..
+                } => {
+                    let cells = parse_cells(cells, &schema)
+                        .map_err(|message| Box::new(op_error_msg(index, "BAD_REQUEST", message)))?;
+                    let columns = cells.iter().map(|(column, _)| *column).collect::<Vec<_>>();
+                    state
+                        .db
+                        .require_columns_for(
+                            table,
+                            mongreldb_core::ColumnOperation::Insert,
+                            &columns,
+                            principal,
+                        )
+                        .map_err(|error| Box::new(kit_core_error(&error)))?;
+                    if let Some(update_cells) = update_cells {
+                        let update_cells =
+                            parse_cells(update_cells, &schema).map_err(|message| {
+                                Box::new(op_error_msg(index, "BAD_REQUEST", message))
+                            })?;
+                        let columns = update_cells
+                            .iter()
+                            .map(|(column, _)| *column)
+                            .collect::<Vec<_>>();
+                        state
+                            .db
+                            .require_columns_for(
+                                table,
+                                mongreldb_core::ColumnOperation::Update,
+                                &columns,
+                                principal,
+                            )
+                            .map_err(|error| Box::new(kit_core_error(&error)))?;
+                    }
+                    if *returning {
+                        require_returning_columns(state, table, &schema, principal)?;
+                    }
+                }
+                KitOp::Delete { .. } => state
+                    .db
+                    .require_for(
+                        principal,
+                        &mongreldb_core::Permission::Delete {
+                            table: table.clone(),
+                        },
+                    )
+                    .map_err(|error| Box::new(kit_core_error(&error)))?,
+                KitOp::DeleteByPk { pk, .. } => {
+                    pk_value(pk, &schema)
+                        .map_err(|message| Box::new(op_error_msg(index, "BAD_REQUEST", message)))?;
+                    state
+                        .db
+                        .require_for(
+                            principal,
+                            &mongreldb_core::Permission::Delete {
+                                table: table.clone(),
+                            },
+                        )
+                        .map_err(|error| Box::new(kit_core_error(&error)))?;
+                }
+            }
+            if state.db.table_identity(table).ok() == Some((binding.table_id, binding.schema_id)) {
+                stable = Some(binding);
+                break;
+            }
+        }
+        bindings.push(stable.ok_or_else(|| {
+            Box::new(kit_core_error(&MongrelError::Conflict(format!(
+                "table {table:?} changed during request authorization"
+            ))))
+        })?);
+    }
+    Ok(bindings)
+}
+
+fn require_returning_columns(
+    state: &AppState,
+    table: &str,
+    schema: &Schema,
+    principal: Option<&mongreldb_core::Principal>,
+) -> Result<(), Box<Response>> {
+    let columns = schema
+        .columns
+        .iter()
+        .map(|column| column.id)
+        .collect::<Vec<_>>();
+    state
+        .db
+        .require_columns_for(
+            table,
+            mongreldb_core::ColumnOperation::Select,
+            &columns,
+            principal,
+        )
+        .map_err(|error| Box::new(kit_core_error(&error)))
+}
+
+fn current_kit_table(
+    state: &AppState,
+    table: &str,
+) -> mongreldb_core::Result<(KitTxnTableBinding, Schema)> {
+    for _ in 0..3 {
+        let (table_id, schema_id) = state.db.table_identity(table)?;
+        let schema = state.db.table(table)?.lock().schema().clone();
+        if schema.schema_id == schema_id
+            && state.db.table_identity(table).ok() == Some((table_id, schema_id))
+        {
+            return Ok((
+                KitTxnTableBinding {
+                    table_id,
+                    schema_id,
+                },
+                schema,
+            ));
+        }
+    }
+    Err(MongrelError::Conflict(format!(
+        "table {table:?} changed during request authorization"
+    )))
+}
+
 fn execute_kit_txn(
     state: &AppState,
     req: &KitTxnRequest,
     principal: Option<mongreldb_core::Principal>,
-) -> Result<KitTxnResponse, Response> {
+    bindings: &[KitTxnTableBinding],
+) -> Result<KitTxnResponse, IdempotentJsonFailure> {
     // 1. Structural pre-validation: resolve each op against the live schemas and
     //    parse cells into typed Values. This gives per-op error attribution
     //    (op_index) for malformed input BEFORE consuming an epoch.
@@ -2516,22 +3418,32 @@ fn execute_kit_txn(
     }
     struct Parsed {
         returning: bool,
+        binding: KitTxnTableBinding,
         action: Action,
     }
 
+    if bindings.len() != req.ops.len() {
+        return Err(IdempotentJsonFailure::OutcomeUnknown {
+            epoch: None,
+            message: "transaction resource binding was incomplete".into(),
+        });
+    }
     let mut parsed: Vec<Parsed> = Vec::with_capacity(req.ops.len());
     for (i, op) in req.ops.iter().enumerate() {
+        let binding = &bindings[i];
         match op {
             KitOp::Put {
                 table,
                 cells,
                 returning,
             } => {
-                let schema = lookup_schema(state, table).map_err(|e| op_error(i, e))?;
-                let cells =
-                    parse_cells(cells, &schema).map_err(|m| op_error_msg(i, "BAD_REQUEST", m))?;
+                let schema = lookup_bound_schema(state, table, binding)
+                    .map_err(|e| idempotent_op_failure(i, e))?;
+                let cells = parse_cells(cells, &schema)
+                    .map_err(|m| IdempotentJsonFailure::safe(op_error_msg(i, "BAD_REQUEST", m)))?;
                 parsed.push(Parsed {
                     returning: *returning,
+                    binding: binding.clone(),
                     action: Action::Put {
                         table: table.clone(),
                         cells,
@@ -2544,17 +3456,19 @@ fn execute_kit_txn(
                 update_cells,
                 returning,
             } => {
-                let schema = lookup_schema(state, table).map_err(|e| op_error(i, e))?;
-                let cells =
-                    parse_cells(cells, &schema).map_err(|m| op_error_msg(i, "BAD_REQUEST", m))?;
+                let schema = lookup_bound_schema(state, table, binding)
+                    .map_err(|e| idempotent_op_failure(i, e))?;
+                let cells = parse_cells(cells, &schema)
+                    .map_err(|m| IdempotentJsonFailure::safe(op_error_msg(i, "BAD_REQUEST", m)))?;
                 let upd = match update_cells {
-                    Some(uc) => Some(
-                        parse_cells(uc, &schema).map_err(|m| op_error_msg(i, "BAD_REQUEST", m))?,
-                    ),
+                    Some(uc) => Some(parse_cells(uc, &schema).map_err(|m| {
+                        IdempotentJsonFailure::safe(op_error_msg(i, "BAD_REQUEST", m))
+                    })?),
                     None => None,
                 };
                 parsed.push(Parsed {
                     returning: *returning,
+                    binding: binding.clone(),
                     action: Action::Upsert {
                         table: table.clone(),
                         cells,
@@ -2563,9 +3477,11 @@ fn execute_kit_txn(
                 });
             }
             KitOp::Delete { table, row_id } => {
-                lookup_schema(state, table).map_err(|e| op_error(i, e))?;
+                lookup_bound_schema(state, table, binding)
+                    .map_err(|e| idempotent_op_failure(i, e))?;
                 parsed.push(Parsed {
                     returning: false,
+                    binding: binding.clone(),
                     action: Action::Delete {
                         table: table.clone(),
                         row_id: RowId(*row_id),
@@ -2573,10 +3489,13 @@ fn execute_kit_txn(
                 });
             }
             KitOp::DeleteByPk { table, pk } => {
-                let schema = lookup_schema(state, table).map_err(|e| op_error(i, e))?;
-                let key = pk_value(pk, &schema).map_err(|m| op_error_msg(i, "BAD_REQUEST", m))?;
+                let schema = lookup_bound_schema(state, table, binding)
+                    .map_err(|e| idempotent_op_failure(i, e))?;
+                let key = pk_value(pk, &schema)
+                    .map_err(|m| IdempotentJsonFailure::safe(op_error_msg(i, "BAD_REQUEST", m)))?;
                 parsed.push(Parsed {
                     returning: false,
+                    binding: binding.clone(),
                     action: Action::DeleteByPk {
                         table: table.clone(),
                         key,
@@ -2596,7 +3515,12 @@ fn execute_kit_txn(
         for p in &parsed {
             match &p.action {
                 Action::Put { table, cells } => {
-                    let pr = transaction.put_returning(table, cells.clone())?;
+                    let pr = transaction.put_returning_bound(
+                        table,
+                        p.binding.table_id,
+                        p.binding.schema_id,
+                        cells.clone(),
+                    )?;
                     results.push(KitOpResult::Put {
                         row_id: None,
                         auto_inc: pr.auto_inc,
@@ -2616,7 +3540,13 @@ fn execute_kit_txn(
                         Some(uc) => UpsertAction::DoUpdate(uc.clone()),
                         None => UpsertAction::DoNothing,
                     };
-                    let ur = transaction.upsert(table, cells.clone(), action)?;
+                    let ur = transaction.upsert_bound(
+                        table,
+                        p.binding.table_id,
+                        p.binding.schema_id,
+                        cells.clone(),
+                        action,
+                    )?;
                     let action_str = match ur.action {
                         UpsertActionKind::Inserted => "inserted",
                         UpsertActionKind::Updated => "updated",
@@ -2633,60 +3563,118 @@ fn execute_kit_txn(
                     });
                 }
                 Action::Delete { table, row_id } => {
-                    transaction.delete(table, *row_id)?;
+                    transaction.delete_bound(
+                        table,
+                        p.binding.table_id,
+                        p.binding.schema_id,
+                        *row_id,
+                    )?;
                     results.push(KitOpResult::Deleted);
                 }
                 Action::DeleteByPk { table, key } => {
-                    let handle = db.table(table)?;
-                    let rid = {
-                        let mut guard = handle.lock();
-                        // A deferred bulk load leaves HOT unbuilt; complete it
-                        // before the point lookup (Phase 14.7 lazy contract).
-                        guard.ensure_indexes_complete()?;
-                        guard.lookup_pk(&key.encode_key())
-                    };
-                    match rid {
-                        Some(r) => {
-                            transaction.delete(table, r)?;
-                            results.push(KitOpResult::Deleted);
-                        }
-                        None => results.push(KitOpResult::NotFound),
+                    if transaction.delete_by_pk_bound(
+                        table,
+                        p.binding.table_id,
+                        p.binding.schema_id,
+                        key,
+                    )? {
+                        results.push(KitOpResult::Deleted);
+                    } else {
+                        results.push(KitOpResult::NotFound);
                     }
                 }
             }
         }
-        transaction.commit()?;
         Ok(results)
     })();
 
     let results = match outcome {
         Ok(r) => r,
-        Err(e) => {
-            let code = error_code(&e);
-            let status = match crate::status_for_error(&e) {
-                StatusCode::INTERNAL_SERVER_ERROR => StatusCode::CONFLICT,
-                status => status,
-            };
-            return Err((
-                status,
-                Json(KitErrorEnvelope {
-                    status: "aborted".into(),
-                    error: KitError::new(code, format!("{e}")),
-                }),
-            )
-                .into_response());
-        }
+        Err(error) => return Err(idempotent_txn_failure(error)),
     };
 
-    let epoch = state.db.visible_epoch().0;
-    Ok(KitTxnResponse {
-        status: "committed".into(),
-        epoch,
-        results,
-    })
+    for (operation, binding) in req.ops.iter().zip(bindings) {
+        let table = match operation {
+            KitOp::Put { table, .. }
+            | KitOp::Upsert { table, .. }
+            | KitOp::Delete { table, .. }
+            | KitOp::DeleteByPk { table, .. } => table,
+        };
+        if state.db.table_identity(table).ok() != Some((binding.table_id, binding.schema_id)) {
+            return Err(idempotent_txn_failure(MongrelError::Conflict(format!(
+                "table {table:?} changed before transaction commit"
+            ))));
+        }
+    }
+
+    match transaction.commit() {
+        Ok(epoch) => Ok(KitTxnResponse {
+            status: "committed".into(),
+            epoch: epoch.0,
+            epoch_text: epoch.0.to_string(),
+            results,
+        }),
+        Err(MongrelError::DurableCommit { epoch, message }) => {
+            Err(IdempotentJsonFailure::Committed(IdempotencyResponse::new(
+                StatusCode::CONFLICT,
+                json!({
+                    "status": "committed",
+                    "committed": true,
+                    "epoch": epoch,
+                    "epoch_text": epoch.to_string(),
+                    "results": results,
+                    "retryable": false,
+                    "error": { "code": "COMMIT_OUTCOME", "message": message }
+                }),
+            )))
+        }
+        Err(MongrelError::CommitOutcomeUnknown { epoch, message }) => {
+            Err(IdempotentJsonFailure::OutcomeUnknown {
+                epoch: Some(epoch),
+                message,
+            })
+        }
+        Err(error) => Err(idempotent_txn_failure(error)),
+    }
 }
 
 // Helpers ---------------------------------------------------------------------
+
+fn idempotent_txn_failure(error: MongrelError) -> IdempotentJsonFailure {
+    match error {
+        error
+        @ (MongrelError::DurableCommit { .. } | MongrelError::CommitOutcomeUnknown { .. }) => {
+            idempotent_core_failure(error, StatusCode::CONFLICT, "COMMIT_OUTCOME")
+        }
+        error => {
+            let code = error_code(&error);
+            let status = match crate::status_for_error(&error) {
+                StatusCode::INTERNAL_SERVER_ERROR => StatusCode::CONFLICT,
+                status => status,
+            };
+            IdempotentJsonFailure::safe(
+                (
+                    status,
+                    Json(KitErrorEnvelope {
+                        status: "aborted".into(),
+                        error: KitError::new(code, error.to_string()),
+                    }),
+                )
+                    .into_response(),
+            )
+        }
+    }
+}
+
+fn idempotent_op_failure(index: usize, error: MongrelError) -> IdempotentJsonFailure {
+    match error {
+        error
+        @ (MongrelError::DurableCommit { .. } | MongrelError::CommitOutcomeUnknown { .. }) => {
+            idempotent_core_failure(error, StatusCode::CONFLICT, "COMMIT_OUTCOME")
+        }
+        error => IdempotentJsonFailure::safe(op_error(index, error)),
+    }
+}
 
 fn op_error(i: usize, e: MongrelError) -> Response {
     let code = error_code(&e);
@@ -2711,10 +3699,18 @@ fn op_error_msg(i: usize, code: &str, msg: String) -> Response {
         .into_response()
 }
 
-fn lookup_schema(state: &AppState, table: &str) -> std::result::Result<Schema, MongrelError> {
-    let h = state.db.table(table)?;
-    let g = h.lock();
-    Ok(g.schema().clone())
+fn lookup_bound_schema(
+    state: &AppState,
+    table: &str,
+    expected: &KitTxnTableBinding,
+) -> std::result::Result<Schema, MongrelError> {
+    let (binding, schema) = current_kit_table(state, table)?;
+    if &binding != expected {
+        return Err(MongrelError::Conflict(format!(
+            "table {table:?} changed after request authorization"
+        )));
+    }
+    Ok(schema)
 }
 
 /// Parse a flat `[col_id, val, …]` cell array against a schema.
@@ -2868,6 +3864,431 @@ pub(crate) fn value_to_json(v: &Value) -> Jval {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trigger_error_code_uses_typed_variant_only() {
+        assert_eq!(
+            error_code(&MongrelError::TriggerValidation("invalid".into())),
+            "TRIGGER_VALIDATION"
+        );
+        assert_eq!(
+            error_code(&MongrelError::Conflict(
+                "ordinary conflict mentioning trigger text".into()
+            )),
+            "CONFLICT"
+        );
+        assert_eq!(
+            error_code(&MongrelError::InvalidArgument(
+                "external trigger bridge is unrelated text".into()
+            )),
+            "BAD_REQUEST"
+        );
+    }
+
+    async fn response_json(response: Response) -> (StatusCode, Jval) {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn idempotency_intent_survives_panic_and_fails_closed_after_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = IdempotencyStore::new(directory.path());
+        let execution = match store
+            .begin("owner", "key", "operation", br#"{"value":1}"#)
+            .await
+        {
+            IdempotencyBegin::Execute(execution) => execution,
+            _ => panic!("expected fresh execution"),
+        };
+        std::fs::write(directory.path().join("committed-side-effect"), b"once").unwrap();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _execution = execution;
+            panic!("process stopped after commit and before receipt publication");
+        }))
+        .is_err());
+
+        let restarted = IdempotencyStore::new(directory.path());
+        assert!(matches!(
+            restarted
+                .begin("owner", "key", "operation", br#"{"value":1}"#)
+                .await,
+            IdempotencyBegin::Indeterminate
+        ));
+        assert_eq!(
+            std::fs::read(directory.path().join("committed-side-effect")).unwrap(),
+            b"once"
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotency_receipt_binding_and_checksum_survive_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = IdempotencyStore::new(directory.path());
+        let execution = match store.begin("owner", "key", "operation", b"payload").await {
+            IdempotencyBegin::Execute(execution) => execution,
+            _ => panic!("expected fresh execution"),
+        };
+        assert!(execution.commit(IdempotencyResponse::new(
+            StatusCode::CREATED,
+            json!({ "status": "ok", "epoch": 7 }),
+        )));
+
+        let restarted = IdempotencyStore::new(directory.path());
+        assert!(matches!(
+            restarted.begin("owner", "key", "operation", b"payload").await,
+            IdempotencyBegin::Replay(response)
+                if response.status == StatusCode::CREATED.as_u16()
+                    && response.body["epoch"] == 7
+        ));
+        assert!(matches!(
+            restarted.begin("owner", "key", "other", b"payload").await,
+            IdempotencyBegin::Mismatch
+        ));
+        assert!(matches!(
+            restarted
+                .begin("other", "key", "operation", b"payload")
+                .await,
+            IdempotencyBegin::Execute(_)
+        ));
+
+        let scope = crate::sql_idempotency::hex(&idempotency_scope_hash("owner", "key"));
+        let receipt_path = restarted.receipt_path(&scope);
+        let mut receipt: Jval =
+            serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
+        receipt["response"]["body"]["epoch"] = json!(8);
+        std::fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        let restarted = IdempotencyStore::new(directory.path());
+        assert!(matches!(
+            restarted
+                .begin("owner", "key", "operation", b"payload")
+                .await,
+            IdempotencyBegin::Indeterminate
+        ));
+    }
+
+    #[tokio::test]
+    async fn forged_valid_json_intent_fails_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = IdempotencyStore::new(directory.path());
+        let execution = match store.begin("owner", "key", "operation", b"payload").await {
+            IdempotencyBegin::Execute(execution) => execution,
+            _ => panic!("expected fresh execution"),
+        };
+        drop(execution);
+        let scope = crate::sql_idempotency::hex(&idempotency_scope_hash("owner", "key"));
+        let intent_path = store.intent_path(&scope);
+        let mut forged: Jval =
+            serde_json::from_slice(&std::fs::read(&intent_path).unwrap()).unwrap();
+        forged["created_at_ms"] = json!(0);
+        std::fs::write(&intent_path, serde_json::to_vec(&forged).unwrap()).unwrap();
+
+        assert!(matches!(
+            store.begin("owner", "key", "operation", b"payload").await,
+            IdempotencyBegin::Indeterminate
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_entries_and_capacity_lock_fail_closed() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let store = IdempotencyStore::new(directory.path());
+        let execution = match store
+            .begin("owner", "receipt", "operation", b"payload")
+            .await
+        {
+            IdempotencyBegin::Execute(execution) => execution,
+            _ => panic!("expected fresh execution"),
+        };
+        assert!(execution.commit(IdempotencyResponse::new(
+            StatusCode::OK,
+            json!({ "status": "ok" }),
+        )));
+        let scope = crate::sql_idempotency::hex(&idempotency_scope_hash("owner", "receipt"));
+        let receipt_path = store.receipt_path(&scope);
+        let outside_receipt = outside.path().join("receipt.json");
+        std::fs::rename(&receipt_path, &outside_receipt).unwrap();
+        symlink(&outside_receipt, &receipt_path).unwrap();
+        assert!(matches!(
+            store
+                .begin("owner", "receipt", "operation", b"payload")
+                .await,
+            IdempotencyBegin::Indeterminate
+        ));
+
+        let intent_root = tempfile::tempdir().unwrap();
+        let intent_store = IdempotencyStore::new(intent_root.path());
+        let execution = match intent_store
+            .begin("owner", "intent", "operation", b"payload")
+            .await
+        {
+            IdempotencyBegin::Execute(execution) => execution,
+            _ => panic!("expected fresh execution"),
+        };
+        drop(execution);
+        let scope = crate::sql_idempotency::hex(&idempotency_scope_hash("owner", "intent"));
+        let intent_path = intent_store.intent_path(&scope);
+        let outside_intent = outside.path().join("intent.json");
+        std::fs::rename(&intent_path, &outside_intent).unwrap();
+        symlink(&outside_intent, &intent_path).unwrap();
+        assert!(matches!(
+            intent_store
+                .begin("owner", "intent", "operation", b"payload")
+                .await,
+            IdempotencyBegin::Indeterminate
+        ));
+
+        let lock_root = tempfile::tempdir().unwrap();
+        let lock_outside = tempfile::tempdir().unwrap();
+        let lock_store = IdempotencyStore::new(lock_root.path());
+        let outside_lock = lock_outside.path().join("capacity.lock");
+        std::fs::write(&outside_lock, b"outside").unwrap();
+        symlink(
+            &outside_lock,
+            lock_store
+                .files
+                .absolute(crate::sql_idempotency::CAPACITY_LOCK_FILE),
+        )
+        .unwrap();
+        assert!(matches!(
+            lock_store
+                .begin("owner", "key", "operation", b"payload")
+                .await,
+            IdempotencyBegin::Unavailable
+        ));
+    }
+
+    #[tokio::test]
+    async fn legacy_fixed_temp_cannot_block_or_replace_receipt() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = IdempotencyStore::new(directory.path());
+        let execution = match store.begin("owner", "key", "operation", b"payload").await {
+            IdempotencyBegin::Execute(execution) => execution,
+            _ => panic!("expected fresh execution"),
+        };
+        let scope = crate::sql_idempotency::hex(&idempotency_scope_hash("owner", "key"));
+        let old_fixed_temp = store.files.absolute(format!("{scope}.receipt.json.tmp"));
+        std::fs::write(&old_fixed_temp, b"attacker-controlled").unwrap();
+        assert!(execution.commit(IdempotencyResponse::new(
+            StatusCode::CREATED,
+            json!({ "status": "ok", "epoch": 7 }),
+        )));
+        assert_eq!(
+            std::fs::read(old_fixed_temp).unwrap(),
+            b"attacker-controlled"
+        );
+
+        let restarted = IdempotencyStore::new(directory.path());
+        assert!(matches!(
+            restarted.begin("owner", "key", "operation", b"payload").await,
+            IdempotencyBegin::Replay(response)
+                if response.status == StatusCode::CREATED.as_u16()
+                    && response.body["epoch"] == 7
+        ));
+    }
+
+    #[tokio::test]
+    async fn renamed_root_stays_descriptor_pinned() {
+        let parent = tempfile::tempdir().unwrap();
+        let original = parent.path().join("database");
+        let moved = parent.path().join("moved-database");
+        std::fs::create_dir(&original).unwrap();
+        let store = IdempotencyStore::new(&original);
+        std::fs::rename(&original, &moved).unwrap();
+        std::fs::create_dir(&original).unwrap();
+
+        assert!(matches!(
+            store.begin("owner", "key", "operation", b"payload").await,
+            IdempotencyBegin::Execute(_)
+        ));
+        let scope = crate::sql_idempotency::hex(&idempotency_scope_hash("owner", "key"));
+        assert!(moved
+            .join("_idem")
+            .join(store.intent_name(&scope))
+            .is_file());
+        assert!(!original.join("_idem").exists());
+    }
+
+    #[tokio::test]
+    async fn durable_commit_failure_is_published_and_replayed_exactly_after_restart() {
+        const EXACT_EPOCH: u64 = 9_007_199_254_740_993;
+        let directory = tempfile::tempdir().unwrap();
+        let store = IdempotencyStore::new(directory.path());
+        let execution = match store.begin("owner", "key", "operation", b"payload").await {
+            IdempotencyBegin::Execute(execution) => execution,
+            _ => panic!("expected fresh execution"),
+        };
+        let side_effect = directory.path().join("committed-side-effect");
+        std::fs::write(&side_effect, b"once").unwrap();
+
+        let response = finish_idempotent_execution(
+            execution,
+            Err(idempotent_core_failure(
+                MongrelError::DurableCommit {
+                    epoch: EXACT_EPOCH,
+                    message: "post-commit publication failed".into(),
+                },
+                StatusCode::BAD_REQUEST,
+                "IGNORED_PRECOMMIT_CODE",
+            )),
+        );
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["status"], "committed");
+        assert_eq!(body["committed"], true);
+        assert_eq!(body["epoch"], EXACT_EPOCH);
+        assert_eq!(body["epoch_text"], EXACT_EPOCH.to_string());
+        assert_eq!(body["error"]["code"], "COMMIT_OUTCOME");
+
+        let restarted = IdempotencyStore::new(directory.path());
+        let replay = match restarted
+            .begin("owner", "key", "operation", b"payload")
+            .await
+        {
+            IdempotencyBegin::Replay(response) => response.into_response(),
+            _ => panic!("committed error must replay instead of execute"),
+        };
+        let (replay_status, replay_body) = response_json(replay).await;
+        assert_eq!(replay_status, status);
+        assert_eq!(replay_body, body);
+        assert_eq!(std::fs::read(side_effect).unwrap(), b"once");
+    }
+
+    #[tokio::test]
+    async fn unknown_commit_outcome_retains_intent_and_never_reexecutes_after_restart() {
+        const EXACT_EPOCH: u64 = 9_007_199_254_740_993;
+        let directory = tempfile::tempdir().unwrap();
+        let store = IdempotencyStore::new(directory.path());
+        let execution = match store.begin("owner", "key", "operation", b"payload").await {
+            IdempotencyBegin::Execute(execution) => execution,
+            _ => panic!("expected fresh execution"),
+        };
+        let side_effect = directory.path().join("possible-side-effect");
+        std::fs::write(&side_effect, b"once").unwrap();
+
+        let response = finish_idempotent_execution(
+            execution,
+            Err(idempotent_core_failure(
+                MongrelError::CommitOutcomeUnknown {
+                    epoch: EXACT_EPOCH,
+                    message: "commit publication outcome is unknown".into(),
+                },
+                StatusCode::BAD_REQUEST,
+                "IGNORED_PRECOMMIT_CODE",
+            )),
+        );
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["status"], "outcome_unknown");
+        assert_eq!(body["committed"], Jval::Null);
+        assert_eq!(body["epoch"], EXACT_EPOCH);
+        assert_eq!(body["epoch_text"], EXACT_EPOCH.to_string());
+
+        let restarted = IdempotencyStore::new(directory.path());
+        assert!(matches!(
+            restarted
+                .begin("owner", "key", "operation", b"payload")
+                .await,
+            IdempotencyBegin::Indeterminate
+        ));
+        assert_eq!(std::fs::read(side_effect).unwrap(), b"once");
+    }
+
+    #[tokio::test]
+    async fn idempotency_receipt_publish_failure_retains_intent() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = IdempotencyStore::new(directory.path());
+        let execution = match store.begin("owner", "key", "operation", b"payload").await {
+            IdempotencyBegin::Execute(execution) => execution,
+            _ => panic!("expected fresh execution"),
+        };
+        std::fs::create_dir(store.receipt_path(&execution.scope)).unwrap();
+        assert!(!execution.commit(IdempotencyResponse::new(
+            StatusCode::OK,
+            json!({ "status": "ok" }),
+        )));
+        let restarted = IdempotencyStore::new(directory.path());
+        assert!(matches!(
+            restarted
+                .begin("owner", "key", "operation", b"payload")
+                .await,
+            IdempotencyBegin::Indeterminate
+        ));
+    }
+
+    #[tokio::test]
+    async fn idempotency_capacity_is_bounded_and_intents_never_expire() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = IdempotencyStore::new_with_limits(
+            directory.path(),
+            std::time::Duration::from_millis(1),
+            2,
+        );
+        assert!(matches!(
+            store.begin("owner", "key-1", "operation", b"one").await,
+            IdempotencyBegin::Execute(_)
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        assert!(matches!(
+            store.begin("owner", "key-2", "operation", b"two").await,
+            IdempotencyBegin::Full
+        ));
+        assert!(matches!(
+            store.begin("other", "key-2", "operation", b"two").await,
+            IdempotencyBegin::Execute(_)
+        ));
+        assert!(matches!(
+            store.begin("third", "key-3", "operation", b"three").await,
+            IdempotencyBegin::Full
+        ));
+    }
+
+    #[tokio::test]
+    async fn expired_receipts_are_pruned_under_capacity_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = IdempotencyStore::new_with_limits(
+            directory.path(),
+            std::time::Duration::from_millis(1),
+            1,
+        );
+        let execution = match store.begin("owner", "old", "operation", b"old").await {
+            IdempotencyBegin::Execute(execution) => execution,
+            _ => panic!("expected fresh execution"),
+        };
+        assert!(execution.commit(IdempotencyResponse::new(
+            StatusCode::OK,
+            json!({ "status": "ok" }),
+        )));
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        assert!(matches!(
+            store.begin("owner", "new", "operation", b"new").await,
+            IdempotencyBegin::Execute(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn legacy_unbound_receipts_fail_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = IdempotencyStore::new(directory.path());
+        std::fs::write(
+            store.files.absolute("0123456789abcdef.json"),
+            br#"{"status":"ok"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            store
+                .begin("unrelated-owner", "new-key", "operation", b"payload")
+                .await,
+            IdempotencyBegin::Indeterminate
+        ));
+    }
 
     fn column(id: u16, ty: TypeId) -> ColumnDef {
         ColumnDef {

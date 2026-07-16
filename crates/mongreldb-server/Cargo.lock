@@ -2448,9 +2448,12 @@ dependencies = [
  "mongreldb-core",
  "mongreldb-query",
  "reqwest",
+ "secrecy",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+ "tokio",
+ "zeroize",
 ]
 
 [[package]]
@@ -2474,11 +2477,13 @@ dependencies = [
  "rayon",
  "regex",
  "roaring",
+ "rustix",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "thiserror 1.0.69",
  "tokio",
+ "windows-sys 0.61.2",
  "xxhash-rust",
  "zeroize",
  "zstd",
@@ -2488,8 +2493,10 @@ dependencies = [
 name = "mongreldb-query"
 version = "0.55.0"
 dependencies = [
+ "aes-gcm",
  "arrow",
  "async-trait",
+ "bincode",
  "chrono",
  "datafusion",
  "datafusion-datasource",
@@ -2502,6 +2509,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sqlparser",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
 ]
@@ -2514,6 +2522,7 @@ dependencies = [
  "axum",
  "bincode",
  "datafusion",
+ "fs2",
  "futures",
  "hmac",
  "libc",
@@ -2527,6 +2536,8 @@ dependencies = [
  "tempfile",
  "tokio",
  "tower",
+ "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]
@@ -3169,6 +3180,15 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "secrecy"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e891af845473308773346dc847b2c23ee78fe442e0472ac50e22a18a93d3ae5a"
+dependencies = [
+ "zeroize",
+]
 
 [[package]]
 name = "security-framework"
