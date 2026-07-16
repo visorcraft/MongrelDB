@@ -6,7 +6,7 @@
 
   <groupId>com.visorcraft</groupId>
   <artifactId>mongreldb-jni</artifactId>
-  <version>0.55.0</version>
+  <version>0.56.0</version>
   <packaging>jar</packaging>
 
   <name>MongrelDB JNI</name>

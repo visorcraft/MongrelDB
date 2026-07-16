@@ -14,7 +14,7 @@ indexes and caches warm in memory, and serves queries over HTTP.
 cargo install mongreldb-server
 
 # Or install a release binary
-VERSION=v0.55.0
+VERSION=v0.56.0
 ASSET=mongreldb-server-linux-x64 # use mongreldb-server-linux-arm64 on ARM64 Linux
 curl -L -o /usr/local/bin/mongreldb-server \
   "https://github.com/visorcraft/MongrelDB/releases/download/${VERSION}/${ASSET}"
@@ -140,7 +140,7 @@ crashes, and automatically starts it on boot.
 
 ```sh
 # Pull the multi-arch release image
-docker pull ghcr.io/visorcraft/mongreldb-server:v0.55.0
+docker pull ghcr.io/visorcraft/mongreldb-server:v0.56.0
 
 # Run with auto-restart
 docker run -d \
@@ -148,7 +148,7 @@ docker run -d \
   --restart=always \
   -p 8453:8453 \
   -v ./my_database:/data \
-  ghcr.io/visorcraft/mongreldb-server:v0.55.0 \
+  ghcr.io/visorcraft/mongreldb-server:v0.56.0 \
   /data --port 8453 --auth-token my-secret
 ```
 
