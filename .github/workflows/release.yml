@@ -1,12 +1,5 @@
-# Builds the native addon and publishes @visorcraft/mongreldb to npm, and
-# publishes the mongreldb-core and mongreldb-query Rust crates to crates.io,
-# on a tag.
-#
-# Bundles linux-x64-gnu and linux-arm64-gnu .node files so low-power ARM64
-# Linux hosts can install from npm without compiling the addon locally.
-#
-# Publish this BEFORE @visorcraft/mongreldb-kit — the kit's release installs
-# this package from npm to satisfy its peer dependency.
+# Publishes Rust crates, server images, and server binaries on a tag.
+# npm ships independently through npm-release.yml.
 #
 # Release flow: bump "version" in crates/mongreldb-node/package.json and
 # workspace.package.version in Cargo.toml, commit, then tag and push the
@@ -21,9 +14,8 @@
 # mongreldb-query depends on it and crates.io strips path deps at publish time.
 #
 # Job graph (max parallelism, native arch runners — no QEMU):
-#   wave 1 (parallel): publish-crate · build-addon[x64|arm64] · image-amd64 · image-arm64
-#   wave 2 (parallel): publish-npm (needs build-addon) · image-manifest (needs image-amd64+arm64)
-#   wave 3:            release-linux/darwin-binaries (needs publish-npm + publish-crate)
+#   wave 1 (parallel): publish-crate · image-amd64 · image-arm64
+#   wave 2 (parallel): server binaries · image-manifest
 # The arm64 addon .node and arm64 server image build on ubuntu-24.04-arm
 # (native, free for public repos), avoiding hours of QEMU emulation.
 #
@@ -39,7 +31,6 @@ on:
 
 permissions:
   contents: write
-  id-token: write  # npm provenance
   packages: write
 
 jobs:
@@ -70,98 +61,6 @@ jobs:
           publish_crate --manifest-path crates/mongreldb-server/Cargo.toml
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
-  # Build each platform's .node on its native arch runner (x64 on ubuntu-latest,
-  # arm64 on ubuntu-24.04-arm), in parallel. The x64 job also emits the shared
-  # native.js/native.d.ts wrappers. Artifacts are reassembled by publish-npm.
-  build-addon:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            node-file: mongreldb.linux-x64-gnu.node
-          - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            node-file: mongreldb.linux-arm64-gnu.node
-    runs-on: ${{ matrix.runner }}
-    defaults:
-      run:
-        working-directory: crates/mongreldb-node
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: stable
-
-      - uses: Swatinem/rust-cache@v2.9.1
-        with:
-          workspaces: crates/mongreldb-node
-
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 24
-
-      - run: npm ci
-
-      # x64 build also generates the JS/DTS wrappers consumed by every arch.
-      - run: npx napi build --release --platform --strip --target ${{ matrix.target }} --js native.js --dts native.d.ts
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-      - run: npx napi build --release --platform --strip --target ${{ matrix.target }} --js false
-        if: matrix.target != 'x86_64-unknown-linux-gnu'
-
-      - run: test -f ${{ matrix.node-file }}
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: ${{ matrix.node-file }}
-          path: crates/mongreldb-node/${{ matrix.node-file }}
-          if-no-files-found: error
-
-      - uses: actions/upload-artifact@v7
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        with:
-          name: mongreldb.addon-js
-          path: |
-            crates/mongreldb-node/native.js
-            crates/mongreldb-node/native.d.ts
-          if-no-files-found: error
-
-  publish-npm:
-    needs: [build-addon]
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: crates/mongreldb-node
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 24
-          registry-url: https://registry.npmjs.org
-          scope: '@visorcraft'
-
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: 'mongreldb.*'
-          path: crates/mongreldb-node
-          merge-multiple: true
-
-      - run: |
-          test -f mongreldb.linux-x64-gnu.node
-          test -f mongreldb.linux-arm64-gnu.node
-          test -f native.js
-          test -f native.d.ts
-
-      # Sanity gate: the freshly built addon must load before we publish.
-      - run: node -e "require('./index.js'); console.log('addon loads OK')"
-
-      - run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   # Each arch's server image builds natively (no QEMU), pushed under an
   # arch-suffixed tag; image-manifest merges them into the version + latest tags.
@@ -227,7 +126,7 @@ jobs:
             ghcr.io/visorcraft/mongreldb-server:${{ github.ref_name }}-arm64
 
   release-linux-binaries:
-    needs: [publish-npm, publish-crate]
+    needs: publish-crate
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -279,7 +178,7 @@ jobs:
           files: dist/${{ matrix.asset }}
 
   release-darwin-binaries:
-    needs: [publish-npm, publish-crate]
+    needs: publish-crate
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v7

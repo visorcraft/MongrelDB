@@ -1,0 +1,110 @@
+name: NPM Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      published: ${{ steps.version.outputs.published }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - id: version
+        working-directory: crates/mongreldb-node
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          if npm view "@visorcraft/mongreldb@$version" version >/dev/null 2>&1; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-addon:
+    needs: check
+    if: needs.check.outputs.published != 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            node-file: mongreldb.linux-x64-gnu.node
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            node-file: mongreldb.linux-arm64-gnu.node
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        working-directory: crates/mongreldb-node
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: crates/mongreldb-node
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - run: npm ci
+      - run: npx napi build --release --platform --strip --target ${{ matrix.target }} --js native.js --dts native.d.ts
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+      - run: npx napi build --release --platform --strip --target ${{ matrix.target }} --js false
+        if: matrix.target != 'x86_64-unknown-linux-gnu'
+      - run: test -f ${{ matrix.node-file }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.node-file }}
+          path: crates/mongreldb-node/${{ matrix.node-file }}
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        with:
+          name: mongreldb.addon-js
+          path: |
+            crates/mongreldb-node/native.js
+            crates/mongreldb-node/native.d.ts
+          if-no-files-found: error
+
+  publish:
+    needs: [check, build-addon]
+    if: needs.check.outputs.published != 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/mongreldb-node
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          scope: '@visorcraft'
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: 'mongreldb.*'
+          path: crates/mongreldb-node
+          merge-multiple: true
+      - run: |
+          test -f mongreldb.linux-x64-gnu.node
+          test -f mongreldb.linux-arm64-gnu.node
+          test -f native.js
+          test -f native.d.ts
+          node -e "require('./index.js'); console.log('addon loads OK')"
+      - name: Publish npm package
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          npm view "@visorcraft/mongreldb@$version" version >/dev/null 2>&1 || npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
