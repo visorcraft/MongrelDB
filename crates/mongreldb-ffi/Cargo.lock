@@ -2198,9 +2198,9 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-kit-core"
-version = "0.58.1"
+version = "0.58.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e7ad2ee7c474978ebaf5cbb50be3ccdd13054d899de5085e4c59fc57c129f1f7"
+checksum = "6c2144dbb681d35854d86fc61b0819439bd1e6079635bb6689f56dbdf1a6e456"
 dependencies = [
  "hex",
  "regex",

@@ -18,8 +18,8 @@ crate-type = ["cdylib"]
 [dependencies]
 # The Kit crate wraps the engine with schema model, migrations, and query
 # builder execution. Resolved from crates.io (same as mongreldb-kit-ffi).
-mongreldb-kit = "=0.58.1"
-mongreldb-kit-core = "=0.58.1"
+mongreldb-kit = "=0.58.2"
+mongreldb-kit-core = "=0.58.2"
 # The jni crate provides Rust bindings to the JNI API.
 jni = { version = "0.21", features = ["invocation"] }
 serde_json = { version = "1", features = ["preserve_order"] }
