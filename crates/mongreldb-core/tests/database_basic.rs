@@ -99,9 +99,9 @@ fn close_flushes_and_reopens_committed_rows() {
 }
 
 #[test]
-fn reopened_enum_table_supports_integer_predicate() {
+fn reopened_encrypted_enum_table_supports_integer_predicate() {
     let dir = tempdir().unwrap();
-    let db = Database::create(dir.path()).unwrap();
+    let db = Database::create_encrypted(dir.path(), "secret").unwrap();
     db.create_table(
         "users",
         Schema {
@@ -137,7 +137,7 @@ fn reopened_enum_table_supports_integer_predicate() {
     db.close().unwrap();
     drop(db);
 
-    let reopened = Database::open(dir.path()).unwrap();
+    let reopened = Database::open_encrypted(dir.path(), "secret").unwrap();
     let rows = reopened
         .table("users")
         .unwrap()
