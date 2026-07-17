@@ -65,7 +65,7 @@ async fn query_control_is_owner_or_admin_only_and_never_exposes_sql() {
     let fired = Arc::new(AtomicBool::new(false));
     let hook_fired = Arc::clone(&fired);
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-    entry.session.set_test_hook(Some(Arc::new(move |point| {
+    entry.session().set_test_hook(Some(Arc::new(move |point| {
         if point == SqlTestHookPoint::Planning && !hook_fired.swap(true, Ordering::AcqRel) {
             entered_tx.send(()).unwrap();
             hook_barrier.wait();

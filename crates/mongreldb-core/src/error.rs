@@ -60,6 +60,12 @@ pub enum MongrelError {
     Full(String),
     #[error("transaction conflict: {0}")]
     Conflict(String),
+    #[error(
+        "deadlock: transaction {victim} was chosen as the deadlock victim (wait-for cycle {cycle}); retry the whole transaction"
+    )]
+    Deadlock { victim: u64, cycle: String },
+    #[error("serialization failure: {message}")]
+    SerializationFailure { message: String },
     #[error("trigger validation failed: {0}")]
     TriggerValidation(String),
     #[error("read-only replica: writes must be applied by ReplicationFollower")]
@@ -164,6 +170,13 @@ impl MongrelError {
             MongrelError::InvalidArgument(_) => ErrorCategory::ClusterVersionMismatch,
             MongrelError::Full(_) => ErrorCategory::ResourceExhausted,
             MongrelError::Conflict(_) => ErrorCategory::TransactionConflict,
+            // The deterministic deadlock victim and the SSI certification
+            // abort share Conflict's retry-the-whole-transaction discipline
+            // (spec section 9.7, `ErrorCategory::retry_class`), but the
+            // taxonomy reserves precise categories for both so bindings can
+            // tell them apart from a plain write-write conflict.
+            MongrelError::Deadlock { .. } => ErrorCategory::Deadlock,
+            MongrelError::SerializationFailure { .. } => ErrorCategory::SerializationFailure,
             // Triggers are schema objects; the write violates constraints
             // declared in the current schema. Re-issuing the identical write
             // re-fails unless the schema changed.
@@ -323,6 +336,19 @@ mod tests {
                 ErrorCategory::TransactionConflict,
             ),
             (
+                MongrelError::Deadlock {
+                    victim: 3,
+                    cycle: "3 → 1 → 3".into(),
+                },
+                ErrorCategory::Deadlock,
+            ),
+            (
+                MongrelError::SerializationFailure {
+                    message: "a concurrent commit invalidated this transaction's reads".into(),
+                },
+                ErrorCategory::SerializationFailure,
+            ),
+            (
                 MongrelError::TriggerValidation("ck".into()),
                 ErrorCategory::SchemaVersionMismatch,
             ),
@@ -388,7 +414,7 @@ mod tests {
         ];
         assert_eq!(
             cases.len(),
-            35,
+            37,
             "every MongrelError variant must appear in the mapping table"
         );
         for (error, expected) in cases {
@@ -422,6 +448,52 @@ mod tests {
         assert_eq!(
             MongrelError::ReadOnlyReplica.category(),
             ErrorCategory::NotLeader
+        );
+        assert_eq!(
+            MongrelError::Deadlock {
+                victim: 2,
+                cycle: "2 → 1 → 2".into(),
+            }
+            .category(),
+            ErrorCategory::Deadlock
+        );
+        assert_eq!(
+            MongrelError::SerializationFailure {
+                message: "m".into(),
+            }
+            .category(),
+            ErrorCategory::SerializationFailure
+        );
+    }
+
+    #[test]
+    fn deadlock_display_names_victim_and_cycle() {
+        let error = MongrelError::Deadlock {
+            victim: 7,
+            cycle: "7 → 4 → 7".into(),
+        };
+        let display = error.to_string();
+        assert!(
+            display.starts_with("deadlock: transaction 7"),
+            "display names the victim: {display}"
+        );
+        assert!(
+            display.contains("7 → 4 → 7"),
+            "display carries the wait-for cycle: {display}"
+        );
+    }
+
+    #[test]
+    fn serialization_failure_display_keeps_the_stable_marker() {
+        // The query layer bridges core commit aborts onto this variant by
+        // matching the "serialization failure" marker (see the MongrelQueryError
+        // conversion); the display must keep that marker stable.
+        let error = MongrelError::SerializationFailure {
+            message: "a concurrent commit invalidated this transaction's reads".into(),
+        };
+        assert!(
+            error.to_string().starts_with("serialization failure: "),
+            "display keeps the marker prefix: {error}"
         );
     }
 }

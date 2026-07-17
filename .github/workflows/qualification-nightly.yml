@@ -1,0 +1,70 @@
+name: Qualification nightly
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Stage 1 gate (spec §10): one-million-row overlapping read/write with
+  # bounded RSS and commit p99, plus the warm embedded point-query baseline.
+  core-qualification-1m:
+    name: Core qualification, one million rows
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2.9.1
+      - name: Stage 1 gate qualification (1M rows)
+        env:
+          MONGRELDB_QUAL_ROWS: "1000000"
+        run: cargo test -p mongreldb-core --test qualification --release -- --nocapture
+
+  # Stage 1 gate (spec §10): 1,000 concurrent client sessions remain stable,
+  # no crash/OOM under load, loopback point-query p95 baseline.
+  server-scale:
+    name: Server scale test (1,000 sessions, loopback p95)
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    defaults:
+      run:
+        working-directory: crates/mongreldb-server
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: crates/mongreldb-server
+      - name: Server scale test
+        run: cargo test --release --test scale_test -- --nocapture
+
+  # FND-005 (spec §9.5): every scenario must be seed-deterministic; failed
+  # seeds persist as CI artifacts for exact repro.
+  sim-determinism:
+    name: Sim determinism suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      MONGRELDB_SIM_FAILURES: ${{ github.workspace }}/target/sim-failures
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2.9.1
+      - name: Sim determinism suite
+        run: cargo test -p mongreldb-sim
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: sim-failed-seeds-${{ github.run_id }}
+          path: target/sim-failures/
+          if-no-files-found: ignore

@@ -40,6 +40,7 @@ mod audit;
 mod kit;
 mod metrics;
 mod pre_cancel;
+mod prepared;
 mod procedure;
 mod sessions;
 mod sql_idempotency;
@@ -61,9 +62,12 @@ fn cancellation_checkpoint_error(query: &RegisteredSqlQuery) -> mongreldb_query:
 }
 
 /// Map an engine error to the appropriate HTTP status code for defense-in-depth.
-/// Auth errors get 401/403; everything else stays 500. This ensures that even
-/// after the HTTP auth middleware lets a request through, the storage layer's
-/// permission checks surface as the right status (not a generic 500).
+/// Auth errors get 401/403; conflicts (including the retryable transaction
+/// conflicts `Deadlock`/`SerializationFailure`) get 409; deadline, budget,
+/// cancellation, and cursor errors get their own codes; everything else stays
+/// 500. This ensures that even after the HTTP auth middleware lets a request
+/// through, the storage layer's permission checks surface as the right status
+/// (not a generic 500).
 fn status_for_error(e: &mongreldb_core::MongrelError) -> StatusCode {
     use mongreldb_core::MongrelError;
     match e {
@@ -74,6 +78,11 @@ fn status_for_error(e: &mongreldb_core::MongrelError) -> StatusCode {
         MongrelError::PermissionDenied { .. } => StatusCode::FORBIDDEN,
         MongrelError::InvalidArgument(_) => StatusCode::CONFLICT,
         MongrelError::Conflict(_) => StatusCode::CONFLICT,
+        // Retryable transaction conflicts (spec 11.7): same 409 family as
+        // `Conflict`; the taxonomy category stays precise via `category()`.
+        MongrelError::Deadlock { .. } | MongrelError::SerializationFailure { .. } => {
+            StatusCode::CONFLICT
+        }
         MongrelError::ReadOnlyReplica => StatusCode::CONFLICT,
         MongrelError::NotFound(_) => StatusCode::NOT_FOUND,
         MongrelError::DeadlineExceeded => StatusCode::GATEWAY_TIMEOUT,
@@ -103,6 +112,60 @@ fn status_for_query_error(e: &mongreldb_query::MongrelQueryError) -> StatusCode 
         MongrelQueryError::CommitOutcome { .. } => StatusCode::CONFLICT,
         MongrelQueryError::OutcomeUnknown { .. } => StatusCode::CONFLICT,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+#[cfg(test)]
+mod error_status_tests {
+    use super::*;
+
+    /// Handler-level mapping (spec 9.7): the retryable transaction-conflict
+    /// family surfaces as 409 Conflict with the precise taxonomy category —
+    /// `Deadlock` keeps category code 9, `SerializationFailure` code 8 — the
+    /// same status `Conflict` already had, never a generic 500.
+    #[tokio::test]
+    async fn deadlock_and_serialization_failure_are_409_with_precise_taxonomy() {
+        use mongreldb_core::MongrelError;
+        use mongreldb_query::MongrelQueryError;
+
+        let cases = [
+            (
+                MongrelError::Deadlock {
+                    victim: 7,
+                    cycle: "7 → 3 → 7".into(),
+                },
+                "deadlock",
+                9,
+            ),
+            (
+                MongrelError::SerializationFailure {
+                    message: "ssi certification failed".into(),
+                },
+                "serialization failure",
+                8,
+            ),
+        ];
+        for (core, category, category_code) in cases {
+            assert_eq!(status_for_error(&core), StatusCode::CONFLICT, "{core}");
+            let error = MongrelQueryError::Core(core);
+            assert_eq!(
+                status_for_query_error(&error),
+                StatusCode::CONFLICT,
+                "{error}"
+            );
+            let response = query_error_response(&error, None);
+            assert_eq!(response.status(), StatusCode::CONFLICT, "{error}");
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body.pointer("/error/category").unwrap(), category, "{body}");
+            assert_eq!(
+                body.pointer("/error/category_code").unwrap(),
+                category_code,
+                "{body}"
+            );
+        }
     }
 }
 
@@ -136,8 +199,6 @@ struct AppState {
     user_auth: bool,
     /// Daemon-wide Prometheus-style counters, shared by all handlers.
     metrics: Arc<metrics::Metrics>,
-    /// `/sql` requests slower than this are logged as slow queries.
-    slow_query_threshold: std::time::Duration,
     /// Bounded security audit log (auth + DDL/privilege events).
     audit: Arc<audit::AuditLog>,
     /// Token-keyed pool of live sessions for cross-request interactive
@@ -161,14 +222,248 @@ struct AppState {
     sql_page_semaphore: Arc<tokio::sync::Semaphore>,
     sql_page_default_timeout: std::time::Duration,
     sql_page_max_timeout: std::time::Duration,
-    sql_default_timeout: std::time::Duration,
-    sql_max_timeout: std::time::Duration,
-    sql_cancel_grace: std::time::Duration,
-    sql_max_output_bytes: usize,
-    sql_max_output_rows: usize,
+    /// Maximum HTTP request body bytes (S1D-007); enforced by an explicit
+    /// content-length check (structured 413) plus axum's body limit as the
+    /// hard cap for chunked bodies.
+    max_request_bytes: usize,
     accepting_sql: Arc<AtomicBool>,
     /// Lazily generated process-local HMAC key. Restart invalidates cursors.
     cursor_mac_key: CursorMacKey,
+    /// The reloadable mutable subset of server configuration (§10.7).
+    reloadable: Arc<ReloadableConfig>,
+    /// Graceful-drain coordination and last-outcome record (§10.7).
+    drain: Arc<DrainControl>,
+}
+
+/// A `Duration` config value (millisecond granularity) that
+/// `POST /admin/reload` / SIGHUP may update live (§10.7 configuration
+/// reload). Reads are lock-free.
+struct ReloadableDuration(std::sync::atomic::AtomicU64);
+
+impl ReloadableDuration {
+    fn new(value: std::time::Duration) -> Self {
+        Self(std::sync::atomic::AtomicU64::new(
+            value.as_millis().min(u128::from(u64::MAX)) as u64,
+        ))
+    }
+
+    fn get(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.0.load(Ordering::Relaxed))
+    }
+
+    fn set(&self, value: std::time::Duration) {
+        self.0.store(
+            value.as_millis().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
+    }
+
+    fn as_millis(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// A `usize` config value that `POST /admin/reload` / SIGHUP may update live.
+struct ReloadableUsize(std::sync::atomic::AtomicU64);
+
+impl ReloadableUsize {
+    fn new(value: usize) -> Self {
+        Self(std::sync::atomic::AtomicU64::new(
+            u64::try_from(value).unwrap_or(u64::MAX),
+        ))
+    }
+
+    fn get(&self) -> usize {
+        usize::try_from(self.0.load(Ordering::Relaxed)).unwrap_or(usize::MAX)
+    }
+
+    fn set(&self, value: usize) {
+        self.0
+            .store(u64::try_from(value).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+}
+
+/// The mutable subset of server configuration (§10.7 configuration reload,
+/// §16.1 static node configuration). These values are re-read from the
+/// environment — with optional `POST /admin/reload` body overrides — and
+/// applied live. Everything NOT listed here is static node configuration and
+/// takes effect only at restart: listen address/port, data directory,
+/// authentication token/mode, connection and session capacity, session idle
+/// timeout, SQL/AI/retained-page admission semaphore capacities, the
+/// request-bytes bound, SQL idempotency TTL and capacity (the receipt binding
+/// includes the expiry policy, so changing it live would split key domains),
+/// pre-cancellation bounds, and retained-page bounds.
+struct ReloadableConfig {
+    /// `MONGRELBL_SLOW_QUERY_MS` — slow-query log/metrics threshold.
+    slow_query_threshold: ReloadableDuration,
+    /// `MONGRELDB_SQL_DEFAULT_TIMEOUT_MS` — default per-query timeout
+    /// (clamped to the maximum).
+    sql_default_timeout: ReloadableDuration,
+    /// `MONGRELDB_SQL_MAX_TIMEOUT_MS` — maximum per-query timeout.
+    sql_max_timeout: ReloadableDuration,
+    /// `MONGRELDB_SQL_CANCEL_GRACE_MS` — cancellation grace on session close
+    /// and admin drain.
+    sql_cancel_grace: ReloadableDuration,
+    /// `MONGRELDB_SQL_MAX_OUTPUT_ROWS` — per-request output row ceiling.
+    sql_max_output_rows: ReloadableUsize,
+    /// `MONGRELDB_SQL_MAX_OUTPUT_BYTES` — per-request output byte ceiling.
+    sql_max_output_bytes: ReloadableUsize,
+}
+
+/// One full set of mutable-config values to apply. Built from the
+/// environment, then any request-body overrides win field-by-field.
+#[derive(Clone, Debug)]
+struct MutableConfigValues {
+    slow_query_threshold: std::time::Duration,
+    sql_default_timeout: std::time::Duration,
+    sql_max_timeout: std::time::Duration,
+    sql_cancel_grace: std::time::Duration,
+    sql_max_output_rows: usize,
+    sql_max_output_bytes: usize,
+    history_retention_epochs: u64,
+}
+
+/// Optional `POST /admin/reload` body: every field defaults to "re-read from
+/// the environment"; a present field overrides the environment value. Values
+/// must be positive (they are limits/timeouts).
+#[derive(Clone, Debug, Default, Deserialize)]
+struct MutableConfigOverrides {
+    #[serde(default)]
+    slow_query_ms: Option<u64>,
+    #[serde(default)]
+    sql_default_timeout_ms: Option<u64>,
+    #[serde(default)]
+    sql_max_timeout_ms: Option<u64>,
+    #[serde(default)]
+    sql_cancel_grace_ms: Option<u64>,
+    #[serde(default)]
+    sql_max_output_rows: Option<u64>,
+    #[serde(default)]
+    sql_max_output_bytes: Option<u64>,
+    #[serde(default)]
+    history_retention_epochs: Option<u64>,
+}
+
+/// The values one reload pass applied (the `POST /admin/reload` response body
+/// and the SIGHUP log line). Field names are the audit detail — never values
+/// from a request body beyond these plain numbers.
+#[derive(Clone, Debug, Serialize)]
+pub struct ReloadReport {
+    pub slow_query_ms: u64,
+    pub sql_default_timeout_ms: u64,
+    pub sql_max_timeout_ms: u64,
+    pub sql_cancel_grace_ms: u64,
+    pub sql_max_output_rows: u64,
+    pub sql_max_output_bytes: u64,
+    pub history_retention_epochs: u64,
+}
+
+/// Read the environment-driven mutable configuration (same readers startup
+/// uses, so a reload never changes defaults resolution).
+fn mutable_config_from_env() -> MutableConfigValues {
+    let sql_max_timeout = default_sql_max_timeout();
+    MutableConfigValues {
+        slow_query_threshold: metrics::slow_query_threshold(),
+        sql_default_timeout: default_sql_default_timeout().min(sql_max_timeout),
+        sql_max_timeout,
+        sql_cancel_grace: default_sql_cancel_grace(),
+        sql_max_output_rows: default_sql_max_output_rows(),
+        sql_max_output_bytes: default_sql_max_output_bytes(),
+        history_retention_epochs: default_history_retention_epochs(),
+    }
+}
+
+impl MutableConfigValues {
+    /// Apply validated request-body overrides. Zero values are rejected: they
+    /// are never valid for these limits (the environment readers filter them
+    /// the same way).
+    fn apply_overrides(&mut self, overrides: &MutableConfigOverrides) -> Result<(), &'static str> {
+        fn positive(value: Option<u64>) -> Result<Option<u64>, &'static str> {
+            match value {
+                Some(0) => Err("reload override values must be positive"),
+                other => Ok(other),
+            }
+        }
+        if let Some(value) = positive(overrides.slow_query_ms)? {
+            self.slow_query_threshold = std::time::Duration::from_millis(value);
+        }
+        if let Some(value) = positive(overrides.sql_max_timeout_ms)? {
+            self.sql_max_timeout = std::time::Duration::from_millis(value);
+        }
+        if let Some(value) = positive(overrides.sql_default_timeout_ms)? {
+            self.sql_default_timeout = std::time::Duration::from_millis(value);
+        }
+        if let Some(value) = positive(overrides.sql_cancel_grace_ms)? {
+            self.sql_cancel_grace = std::time::Duration::from_millis(value);
+        }
+        if let Some(value) = positive(overrides.sql_max_output_rows)? {
+            self.sql_max_output_rows = usize::try_from(value).unwrap_or(usize::MAX);
+        }
+        if let Some(value) = positive(overrides.sql_max_output_bytes)? {
+            self.sql_max_output_bytes = usize::try_from(value).unwrap_or(usize::MAX);
+        }
+        if let Some(value) = positive(overrides.history_retention_epochs)? {
+            self.history_retention_epochs = value;
+        }
+        Ok(())
+    }
+}
+
+/// Apply one mutable-config set live (§10.7): store the runtime tunables and
+/// re-apply history retention to the core (its setter is idempotent). The
+/// default timeout is clamped to the maximum exactly like startup does.
+fn apply_mutable_config(
+    reloadable: &ReloadableConfig,
+    db: &mongreldb_core::Database,
+    values: &MutableConfigValues,
+) -> mongreldb_core::Result<ReloadReport> {
+    reloadable.sql_max_timeout.set(values.sql_max_timeout);
+    reloadable
+        .sql_default_timeout
+        .set(values.sql_default_timeout.min(values.sql_max_timeout));
+    reloadable.sql_cancel_grace.set(values.sql_cancel_grace);
+    reloadable
+        .sql_max_output_rows
+        .set(values.sql_max_output_rows);
+    reloadable
+        .sql_max_output_bytes
+        .set(values.sql_max_output_bytes);
+    reloadable
+        .slow_query_threshold
+        .set(values.slow_query_threshold);
+    db.set_history_retention_epochs(values.history_retention_epochs)?;
+    Ok(ReloadReport {
+        slow_query_ms: reloadable.slow_query_threshold.as_millis(),
+        sql_default_timeout_ms: reloadable.sql_default_timeout.as_millis(),
+        sql_max_timeout_ms: reloadable.sql_max_timeout.as_millis(),
+        sql_cancel_grace_ms: reloadable.sql_cancel_grace.as_millis(),
+        sql_max_output_rows: reloadable.sql_max_output_rows.get() as u64,
+        sql_max_output_bytes: reloadable.sql_max_output_bytes.get() as u64,
+        history_retention_epochs: values.history_retention_epochs,
+    })
+}
+
+/// Graceful-drain coordination (§10.7 graceful drain): one drain in flight at
+/// a time, plus the last outcome record served by `GET /admin/drain`.
+#[derive(Default)]
+struct DrainControl {
+    /// Serializes drain initiation; held across the (bounded) drain.
+    lock: tokio::sync::Mutex<()>,
+    record: std::sync::Mutex<DrainRecord>,
+}
+
+#[derive(Clone, Default, Serialize)]
+struct DrainRecord {
+    /// A drain was initiated at least once.
+    initiated: bool,
+    /// The last initiation ran the core to `Closed` within its deadline.
+    completed: bool,
+    /// The deadline the last initiation ran with.
+    deadline_ms: u64,
+    /// Lifecycle state at the end of the last initiation.
+    lifecycle: String,
+    /// Human-readable outcome detail (no request data).
+    detail: String,
 }
 
 #[derive(Default)]
@@ -201,6 +496,9 @@ pub struct ServerControl {
     accepting_sql: Arc<AtomicBool>,
     cancel_grace: std::time::Duration,
     metrics: Arc<metrics::Metrics>,
+    reloadable: Arc<ReloadableConfig>,
+    db: Arc<Database>,
+    audit: Arc<audit::AuditLog>,
 }
 
 impl ServerControl {
@@ -224,6 +522,23 @@ impl ServerControl {
         let stuck = stuck_queries.len();
         self.metrics.add_sql_stuck_after_cancel(stuck);
         stuck
+    }
+
+    /// Re-read the environment-driven mutable subset of server configuration
+    /// and apply it live (§10.7 configuration reload). Invoked on SIGHUP;
+    /// `POST /admin/reload` runs the same apply path (and also accepts
+    /// request-body overrides). Static node configuration (§16.1) is
+    /// untouched and stays restart-only.
+    pub fn reload_config(&self) -> Result<ReloadReport, String> {
+        let values = mutable_config_from_env();
+        let report = apply_mutable_config(&self.reloadable, &self.db, &values)
+            .map_err(|error| error.to_string())?;
+        self.audit.record(
+            "system",
+            "admin.reload.ok",
+            "configuration reload applied (source: SIGHUP)",
+        );
+        Ok(report)
     }
 }
 
@@ -325,6 +640,15 @@ pub fn build_app_with_sessions_and_control(
     let sql_max_timeout = default_sql_max_timeout();
     let sql_default_timeout = default_sql_default_timeout().min(sql_max_timeout);
     let metrics = Arc::new(metrics::Metrics::default());
+    let audit = Arc::new(audit::AuditLog::new(8192));
+    let reloadable = Arc::new(ReloadableConfig {
+        slow_query_threshold: ReloadableDuration::new(metrics::slow_query_threshold()),
+        sql_default_timeout: ReloadableDuration::new(sql_default_timeout),
+        sql_max_timeout: ReloadableDuration::new(sql_max_timeout),
+        sql_cancel_grace: ReloadableDuration::new(sql_cancel_grace),
+        sql_max_output_rows: ReloadableUsize::new(default_sql_max_output_rows()),
+        sql_max_output_bytes: ReloadableUsize::new(default_sql_max_output_bytes()),
+    });
     let (idempotency_root, idempotency_integrity) =
         match sql_idempotency::IdempotencyIntegrity::for_database(&db) {
             Ok((root, integrity)) => (root, Some(integrity)),
@@ -345,6 +669,9 @@ pub fn build_app_with_sessions_and_control(
         accepting_sql: Arc::clone(&accepting_sql),
         cancel_grace: sql_cancel_grace,
         metrics: Arc::clone(&metrics),
+        reloadable: Arc::clone(&reloadable),
+        db: Arc::clone(&db),
+        audit: Arc::clone(&audit),
     };
     let state = Arc::new(AppState {
         idem: kit::IdempotencyStore::new_with_integrity(
@@ -358,8 +685,7 @@ pub fn build_app_with_sessions_and_control(
         auth_token,
         user_auth,
         metrics,
-        slow_query_threshold: metrics::slow_query_threshold(),
-        audit: Arc::new(audit::AuditLog::new(8192)),
+        audit,
         sessions,
         ai_semaphore: Arc::new(tokio::sync::Semaphore::new(default_ai_max_concurrent())),
         query_registry,
@@ -386,13 +712,11 @@ pub fn build_app_with_sessions_and_control(
         sql_page_default_timeout: default_sql_page_default_timeout()
             .min(default_sql_page_max_timeout()),
         sql_page_max_timeout: default_sql_page_max_timeout(),
-        sql_default_timeout,
-        sql_max_timeout,
-        sql_cancel_grace,
-        sql_max_output_bytes: default_sql_max_output_bytes(),
-        sql_max_output_rows: default_sql_max_output_rows(),
+        max_request_bytes: default_max_request_bytes(),
         accepting_sql,
         cursor_mac_key: CursorMacKey::default(),
+        reloadable,
+        drain: Arc::new(DrainControl::default()),
     });
     let router = axum::Router::new()
         .route("/health", get(health))
@@ -404,6 +728,8 @@ pub fn build_app_with_sessions_and_control(
         )
         .route("/metrics", get(metrics_handler))
         .route("/audit", get(audit_handler))
+        .route("/admin/drain", get(drain_status).post(admin_drain))
+        .route("/admin/reload", post(admin_reload))
         .route("/tables", get(list_tables).post(create_table))
         .route("/tables/{name}", axum::routing::delete(drop_table))
         .route("/tables/{name}/put", post(put_row))
@@ -468,6 +794,18 @@ pub fn build_app_with_sessions_and_control(
     } else {
         router
     };
+
+    // S1D-007 request-bytes bound: reject over-limit bodies with a
+    // structured 413 (content-length fast path) and cap extraction buffers
+    // at the same limit for chunked bodies (`DefaultBodyLimit`).
+    let router = router
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            request_body_limit_middleware,
+        ))
+        .layer(axum::extract::DefaultBodyLimit::max(
+            state.max_request_bytes,
+        ));
 
     // Apply connection limit if configured.
     let router = if let Some(max) = max_connections {
@@ -579,6 +917,62 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, ()> {
         }
     }
     Ok(out)
+}
+
+/// Structured error envelope carrying the stable error taxonomy (spec
+/// section 9.7): `category` + `category_code` are the programmatic contract,
+/// `code` and `message` are diagnostic. Used by bounds rejections and the
+/// S1D-005 prepared-statement surface; the `/sql` query-error envelope adds
+/// the same fields additively (see `query_error_response_with_status`).
+fn structured_category_error_response(
+    http_status: StatusCode,
+    code: &'static str,
+    message: impl Into<String>,
+    category: mongreldb_types::errors::ErrorCategory,
+) -> Response {
+    (
+        http_status,
+        Json(json!({
+            "error": {
+                "code": code,
+                "message": message.into(),
+                "category": category.to_string(),
+                "category_code": category.code(),
+                "retryable": category.is_retryable(),
+            }
+        })),
+    )
+        .into_response()
+}
+
+/// S1D-007 request-bytes bound: reject requests whose declared
+/// `content-length` exceeds the configured maximum with a structured 413
+/// before any body bytes are read. Bodies without a `content-length`
+/// (chunked) are still hard-capped by `DefaultBodyLimit` at extraction.
+async fn request_body_limit_middleware(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let declared = req
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    if let Some(declared) = declared {
+        if declared > state.max_request_bytes as u64 {
+            return structured_category_error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "REQUEST_BODY_TOO_LARGE",
+                format!(
+                    "request body of {declared} bytes exceeds the server limit of {} bytes",
+                    state.max_request_bytes
+                ),
+                mongreldb_types::errors::ErrorCategory::ResourceExhausted,
+            );
+        }
+    }
+    next.run(req).await
 }
 
 /// `GET /wal/stream?since=<epoch>` — return complete committed WAL
@@ -1139,6 +1533,233 @@ async fn audit_handler(
     Json(recent).into_response()
 }
 
+/// Admin authorization shared by the `/admin/*` endpoints (same
+/// `Permission::Admin` check the other operator routes use). Authorization
+/// failures are audited with the principal and outcome, then mapped onto the
+/// standard error status.
+fn require_admin(
+    state: &AppState,
+    principal: &Option<mongreldb_core::Principal>,
+    action: &str,
+) -> Result<String, Box<Response>> {
+    let owner = request_owner(state, principal);
+    if let Err(error) = state.db.require_for(
+        request_principal(state, principal).as_ref(),
+        &mongreldb_core::Permission::Admin,
+    ) {
+        state
+            .audit
+            .record(owner, format!("{action}.fail"), "authorization failed");
+        return Err(Box::new(
+            (status_for_error(&error), error.to_string()).into_response(),
+        ));
+    }
+    Ok(owner)
+}
+
+/// Reject new writes while the server is draining or the storage core has
+/// left `Open` (§10.7 graceful drain): every mutating HTTP surface — `/sql`
+/// and `/sessions/*` gate on `accepting_sql` directly — checks this before
+/// staging work, so a drain turns the whole write plane read-only before the
+/// core closes. Returns the 503 response to emit, or `None` when writes are
+/// admitted.
+fn require_writes_open(state: &AppState) -> Option<Response> {
+    if state.accepting_sql.load(Ordering::Acquire)
+        && state.db.lifecycle_state() == mongreldb_core::LifecycleState::Open
+    {
+        return None;
+    }
+    Some(
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server is draining; writes are closed",
+        )
+            .into_response(),
+    )
+}
+
+/// Drain status JSON shared by `GET /admin/drain` and the `POST` response.
+fn drain_status_json(state: &AppState) -> serde_json::Value {
+    let record = state
+        .drain
+        .record
+        .lock()
+        .map(|record| record.clone())
+        .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
+    json!({
+        "lifecycle": state.db.lifecycle_state().to_string(),
+        "accepting_sql": state.accepting_sql.load(Ordering::Acquire),
+        "active_queries": state.query_registry.active_count(),
+        "live_sessions": state.sessions.len(),
+        "drain": record,
+    })
+}
+
+/// `GET /admin/drain` — lifecycle and graceful-drain status (§10.7):
+/// the core lifecycle state, whether new SQL is admitted, in-flight query and
+/// session counts, and the last drain initiation's outcome record.
+async fn drain_status(
+    State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
+) -> Response {
+    if let Err(response) = require_admin(&state, &principal, "admin.drain_status") {
+        return *response;
+    }
+    Json(drain_status_json(&state)).into_response()
+}
+
+/// `POST /admin/drain` — initiate a graceful drain (§10.7): stop admitting
+/// new SQL and sessions, cancel in-flight queries (`ServerShutdown`), close
+/// sessions, then drive `DatabaseCore::shutdown` with the requested deadline
+/// so in-flight commit-critical work finishes and durable state is synced
+/// before the file lock is released. The deadline is configurable via the
+/// optional `drain_deadline_ms` body field (default
+/// `MONGRELDB_DRAIN_DEADLINE_MS`, else 30 s). A deadline overrun leaves the
+/// core `Draining` (new operations stay rejected) and answers 409 — a later
+/// call with a larger deadline resumes the shutdown. Draining is terminal:
+/// there is no un-drain; restart the process to serve this database again.
+async fn admin_drain(
+    State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
+    body: Option<Json<DrainRequest>>,
+) -> Response {
+    let owner = match require_admin(&state, &principal, "admin.drain") {
+        Ok(owner) => owner,
+        Err(response) => return *response,
+    };
+    let deadline_ms = body
+        .and_then(|Json(request)| request.drain_deadline_ms)
+        .unwrap_or_else(default_drain_deadline_ms);
+    if deadline_ms == 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "drain_deadline_ms must be positive"})),
+        )
+            .into_response();
+    }
+    let _serialization = state.drain.lock.lock().await;
+    if matches!(
+        state.db.lifecycle_state(),
+        mongreldb_core::LifecycleState::Closed
+    ) {
+        // Idempotent: a completed drain reports the current status again.
+        return Json(drain_status_json(&state)).into_response();
+    }
+    state.audit.record(
+        owner.clone(),
+        "admin.drain",
+        format!("initiated deadline_ms={deadline_ms}"),
+    );
+    let deadline = std::time::Duration::from_millis(deadline_ms);
+    let started = std::time::Instant::now();
+    // 1. Stop admitting new SQL/sessions (same gate the signal path uses).
+    state.accepting_sql.store(false, Ordering::Release);
+    // 2. Cancel non-commit-critical queries and wait out the cancel grace.
+    state
+        .query_registry
+        .cancel_all(CancellationReason::ServerShutdown);
+    let grace = state.reloadable.sql_cancel_grace.get().min(deadline);
+    let grace_deadline = tokio::time::Instant::now() + grace;
+    while state.query_registry.active_count() > 0 && tokio::time::Instant::now() < grace_deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    // 3. Close sessions (staged transactions roll back).
+    state.sessions.close_all();
+    // 4. Drain the storage core with the remaining deadline.
+    let remaining = deadline.saturating_sub(started.elapsed());
+    let core = state.db.core();
+    let result = tokio::task::spawn_blocking(move || core.shutdown(remaining)).await;
+    let lifecycle = state.db.lifecycle_state().to_string();
+    let (completed, detail) = match &result {
+        Ok(Ok(())) => (true, format!("drain completed; core {lifecycle}")),
+        Ok(Err(error)) => (false, format!("drain incomplete: {error}")),
+        Err(error) => (false, format!("drain task failed: {error}")),
+    };
+    if completed {
+        state.audit.record(
+            owner,
+            "admin.drain.ok",
+            format!("deadline_ms={deadline_ms} lifecycle={lifecycle}"),
+        );
+    } else {
+        state.audit.record(
+            owner,
+            "admin.drain.fail",
+            format!("deadline_ms={deadline_ms} {detail}"),
+        );
+    }
+    if let Ok(mut record) = state.drain.record.lock() {
+        record.initiated = true;
+        record.completed = completed;
+        record.deadline_ms = deadline_ms;
+        record.lifecycle = lifecycle;
+        record.detail = detail;
+    }
+    let status = drain_status_json(&state);
+    if completed {
+        Json(status).into_response()
+    } else {
+        // 409: the core remains Draining; a later call may resume.
+        (StatusCode::CONFLICT, Json(status)).into_response()
+    }
+}
+
+#[derive(Deserialize)]
+struct DrainRequest {
+    #[serde(default)]
+    drain_deadline_ms: Option<u64>,
+}
+
+/// Default drain deadline: `MONGRELDB_DRAIN_DEADLINE_MS`, else 30 s (the same
+/// default the embedded `Database::shutdown` uses).
+fn default_drain_deadline_ms() -> u64 {
+    positive_env_u64("MONGRELDB_DRAIN_DEADLINE_MS", 30_000)
+}
+
+/// `POST /admin/reload` — re-read the mutable subset of server configuration
+/// and apply it live (§10.7 configuration reload). With an empty/absent body
+/// every value is re-read from the environment; present body fields override
+/// the environment field-by-field. Reloadable: slow-query threshold
+/// (`MONGRELBL_SLOW_QUERY_MS`), SQL default/max timeout
+/// (`MONGRELDB_SQL_DEFAULT_TIMEOUT_MS` / `MONGRELDB_SQL_MAX_TIMEOUT_MS`), SQL
+/// cancel grace (`MONGRELDB_SQL_CANCEL_GRACE_MS`), SQL output ceilings
+/// (`MONGRELDB_SQL_MAX_OUTPUT_ROWS` / `MONGRELDB_SQL_MAX_OUTPUT_BYTES`), and
+/// history retention (`MONGRELDB_HISTORY_RETENTION_EPOCHS`, re-applied to the
+/// core). All other configuration is static node configuration (§16.1) and
+/// stays restart-only. SIGHUP triggers the same apply path.
+async fn admin_reload(
+    State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
+    body: Option<Json<MutableConfigOverrides>>,
+) -> Response {
+    let owner = match require_admin(&state, &principal, "admin.reload") {
+        Ok(owner) => owner,
+        Err(response) => return *response,
+    };
+    let mut values = mutable_config_from_env();
+    if let Some(Json(overrides)) = body {
+        if let Err(message) = values.apply_overrides(&overrides) {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response();
+        }
+    }
+    match apply_mutable_config(&state.reloadable, &state.db, &values) {
+        Ok(report) => {
+            state.audit.record(
+                owner,
+                "admin.reload.ok",
+                "slow_query_ms sql_default_timeout_ms sql_max_timeout_ms sql_cancel_grace_ms sql_max_output_rows sql_max_output_bytes history_retention_epochs",
+            );
+            Json(json!({ "reloaded": true, "applied": report })).into_response()
+        }
+        Err(error) => {
+            state
+                .audit
+                .record(owner, "admin.reload.fail", error.to_string());
+            (status_for_error(&error), error.to_string()).into_response()
+        }
+    }
+}
+
 /// Default max live sessions when `--max-sessions` is not given.
 fn default_max_sessions() -> usize {
     std::env::var("MONGRELBL_MAX_SESSIONS")
@@ -1328,6 +1949,13 @@ fn default_sql_max_output_rows() -> usize {
     positive_env_usize("MONGRELDB_SQL_MAX_OUTPUT_ROWS", 1_000_000)
 }
 
+/// Maximum accepted HTTP request body in bytes (S1D-007 request-bytes
+/// bound). Defaults to 2 MiB, matching axum's built-in `DefaultBodyLimit`
+/// that previously applied implicitly.
+fn default_max_request_bytes() -> usize {
+    positive_env_usize("MONGRELDB_MAX_REQUEST_BYTES", 2 * 1024 * 1024)
+}
+
 /// Stable request ownership. Usernames and the literal bearer token are never
 /// ownership keys, so replacement credentials cannot inherit live resources.
 fn request_owner(state: &AppState, principal: &Option<mongreldb_core::Principal>) -> String {
@@ -1396,6 +2024,25 @@ fn request_identity_is_current(
     !state.user_auth && !state.db.require_auth_enabled()
 }
 
+/// Map the request's authentication onto the canonical
+/// [`mongreldb_protocol::request::AuthenticatedIdentity`] carried by the
+/// S1D-004 session record. Only catalog-authenticated users (HTTP Basic) pin
+/// a `CatalogUser` identity; bearer-token and credentialless requests carry
+/// no catalog identity. `ServicePrincipal` is never minted for external
+/// requests.
+fn protocol_identity(
+    principal: &Option<mongreldb_core::Principal>,
+) -> mongreldb_protocol::request::AuthenticatedIdentity {
+    match principal {
+        Some(principal) => mongreldb_protocol::request::AuthenticatedIdentity::CatalogUser {
+            username: principal.username.clone(),
+            user_id: principal.user_id,
+            created_version: principal.created_epoch,
+        },
+        None => mongreldb_protocol::request::AuthenticatedIdentity::Credentialless,
+    }
+}
+
 /// `POST /sessions` — open a long-lived session for cross-request interactive
 /// transactions. Returns `{"session_id": "..."}`; send `X-Session-ID: <token>`
 /// on subsequent `/sql` requests to route to it. The session is owned by the
@@ -1419,7 +2066,10 @@ async fn create_session(
         Ok(session) => session.with_query_registry(Arc::clone(&state.query_registry)),
         Err(e) => return (status_for_query_error(&e), e.to_string()).into_response(),
     };
-    match state.sessions.create(session, owner.clone()) {
+    match state
+        .sessions
+        .create_with_identity(session, owner.clone(), protocol_identity(&principal))
+    {
         Some(token) => {
             state.audit.record(owner, "session.open", "session created");
             Json(json!({ "session_id": token })).into_response()
@@ -1445,11 +2095,11 @@ async fn close_session(
     let owner = request_owner(&state, &principal);
     if let Some(entry) = state.sessions.take_for_close(&id, &owner) {
         entry
-            .session
+            .session()
             .query_registry()
             .cancel_session(&id, CancellationReason::SessionClosed);
-        let deadline = tokio::time::Instant::now() + state.sql_cancel_grace;
-        while entry.session.query_registry().active_for_session(&id) > 0
+        let deadline = tokio::time::Instant::now() + state.reloadable.sql_cancel_grace.get();
+        while entry.session().query_registry().active_for_session(&id) > 0
             && tokio::time::Instant::now() < deadline
         {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -1992,10 +2642,22 @@ async fn dispatch_paginated_sql(
     };
     let discard_after_response = page.next_cursor.is_none();
     let page_byte_count = page.byte_count;
-    let encoded_page = tokio::task::spawn_blocking(move || serialize_sql_page(page)).await;
+    // The first-page encode counts toward the request deadline (S1D-006):
+    // the controlled writer checkpoints the query's `ExecutionControl`.
+    let serialization_query = output.query().clone();
+    let encoded_page = tokio::task::spawn_blocking(move || {
+        serialize_sql_page_controlled(page, &serialization_query)
+    })
+    .await;
     let encoded_page = match encoded_page {
         Ok(Ok(encoded_page)) => encoded_page,
-        Ok(Err(error)) => {
+        Ok(Err(ControlledPageSerializationError::Query(error))) => {
+            state.sql_pages.discard(&retained);
+            output.fail();
+            state.metrics.inc_sql_errors();
+            return tracked_query_error_response(state, &error, Some(query_id));
+        }
+        Ok(Err(ControlledPageSerializationError::Encoding)) => {
             state.sql_pages.discard(&retained);
             output.fail_serialization();
             state.metrics.inc_sql_errors();
@@ -2004,7 +2666,7 @@ async fn dispatch_paginated_sql(
                 query_id,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "SERIALIZATION_FAILED",
-                error.to_string(),
+                "failed to serialize the first SQL result page",
             );
         }
         Err(_) => {
@@ -2177,26 +2839,6 @@ fn serialize_paginated_rows(
     })
 }
 
-fn serialize_sql_page(page: sql_pages::SqlPage) -> Result<Vec<u8>, serde_json::Error> {
-    serde_json::to_vec(&json!({
-        "status": "completed",
-        "rows": page.rows,
-        "next_cursor": page.next_cursor,
-        "page": {
-            "offset": page.offset,
-            "row_count": page.row_count,
-            "total_rows": page.total_rows,
-            "byte_count": page.byte_count,
-            "estimated_tokens": page.estimated_tokens,
-            "limits": page.limits,
-            "projection": page.projection,
-            "expires_at_ms": page.expires_at_ms,
-            "snapshot": "retained_result",
-            "token_estimate": "ceil(projected_json_bytes/4)",
-        }
-    }))
-}
-
 enum ControlledPageSerializationError {
     Query(mongreldb_query::MongrelQueryError),
     Encoding,
@@ -2317,10 +2959,47 @@ fn render_sql_literal(v: &serde_json::Value) -> Result<String, String> {
     }
 }
 
+/// S1D-005 parameter check: execution with a mismatched parameter list fails
+/// rather than coercing silently. A binding whose types were not declared at
+/// prepare time pins the canonical type names of its first execution;
+/// subsequent executions must match exactly.
+fn validate_prepared_params(
+    entry: &sessions::SessionEntry,
+    name: &str,
+    binding: &mut mongreldb_protocol::prepared::PreparedStatementBinding,
+    params: &[serde_json::Value],
+) -> Result<(), Box<Response>> {
+    let provided = prepared::parameter_type_names(params);
+    if binding.parameter_types.is_empty() {
+        if !provided.is_empty() {
+            binding.parameter_types = provided;
+            entry.insert_prepared_binding(name.to_owned(), binding.clone());
+        }
+        return Ok(());
+    }
+    if binding.parameter_types != provided {
+        return Err(Box::new(structured_category_error_response(
+            StatusCode::BAD_REQUEST,
+            "PREPARED_PARAMETER_MISMATCH",
+            format!(
+                "prepared statement {name:?} expects parameters of types {:?}, got {provided:?}",
+                binding.parameter_types
+            ),
+            mongreldb_types::errors::ErrorCategory::ClusterVersionMismatch,
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Deserialize)]
 struct PrepareRequest {
     name: String,
     sql: String,
+    /// Optional declared canonical parameter types (S1D-005). When given,
+    /// the binding pins them and `execute` rejects mismatched parameter
+    /// lists instead of coercing silently.
+    #[serde(default)]
+    param_types: Option<Vec<String>>,
     #[serde(default)]
     query_id: Option<QueryId>,
     #[serde(default)]
@@ -2330,6 +3009,11 @@ struct PrepareRequest {
 /// `POST /sessions/{id}/prepare` — parse+plan `sql` once and store it under
 /// `name` on the session. Subsequent `EXECUTE name(...)` calls (via this
 /// endpoint or `EXECUTE` SQL) reuse the cached plan, skipping re-planning.
+///
+/// S1D-005: on success the statement is bound to the current catalog state
+/// (catalog version + per-table schema versions) in the session's canonical
+/// record; `execute` revalidates the binding and replans on incompatible
+/// schema change — a stale plan never executes silently.
 async fn prepare_statement(
     State(state): State<Arc<AppState>>,
     OptionalPrincipal(principal): OptionalPrincipal,
@@ -2345,6 +3029,11 @@ async fn prepare_statement(
     }
     if let Err(msg) = validate_stmt_name(&req.name) {
         return (StatusCode::BAD_REQUEST, msg).into_response();
+    }
+    if let Some(param_types) = req.param_types.as_deref() {
+        if let Err(msg) = prepared::validate_parameter_type_names(param_types) {
+            return (StatusCode::BAD_REQUEST, msg).into_response();
+        }
     }
     let owner = request_owner(&state, &principal);
     let Some(entry) = state.sessions.get(&id, &owner) else {
@@ -2365,7 +3054,7 @@ async fn prepare_statement(
         Ok(options) => options,
         Err(response) => return *response,
     };
-    let query = match register_controlled_query(&state, &entry.session, options) {
+    let query = match register_controlled_query(&state, &entry.session(), options) {
         Ok(query) => query,
         Err(error) => return tracked_query_error_response(&state, &error, Some(query_id)),
     };
@@ -2374,7 +3063,8 @@ async fn prepare_statement(
         registration.fail();
         return with_query_id(remote_boolean_ai_error(), query_id);
     }
-    let _sql_permit = match acquire_sql_permit(&state, &entry.session, registration.query()).await {
+    let _sql_permit = match acquire_sql_permit(&state, &entry.session(), registration.query()).await
+    {
         Ok(permit) => permit,
         Err(error) => return tracked_query_error_response(&state, &error, Some(query_id)),
     };
@@ -2397,11 +3087,26 @@ async fn prepare_statement(
     entry.touch();
     let sql = format!("PREPARE {} AS {}", req.name, req.sql);
     let query = registration.into_query();
-    match entry.session.run_with_query(&sql, query).await {
-        Ok(_) => with_query_id(
-            Json(json!({ "prepared": req.name })).into_response(),
-            query_id,
-        ),
+    match entry.session().run_with_query(&sql, query).await {
+        Ok(_) => {
+            // Bind the plan to the catalog state it was planned against.
+            let catalog_state = prepared::CatalogState::capture(&state.db);
+            let statement_id = entry.allocate_statement_id();
+            entry.insert_prepared_binding(
+                req.name.clone(),
+                prepared::build_binding(
+                    statement_id,
+                    req.sql.clone(),
+                    req.param_types.clone().unwrap_or_default(),
+                    &catalog_state,
+                ),
+            );
+            with_query_id(
+                Json(json!({ "prepared": req.name, "statement_id": statement_id.get() }))
+                    .into_response(),
+                query_id,
+            )
+        }
         Err(error) => tracked_query_error_response(&state, &error, Some(query_id)),
     }
 }
@@ -2456,12 +3161,13 @@ async fn execute_statement(
         Ok(options) => options,
         Err(response) => return *response,
     };
-    let query = match register_controlled_query(&state, &entry.session, options) {
+    let query = match register_controlled_query(&state, &entry.session(), options) {
         Ok(query) => query,
         Err(error) => return tracked_query_error_response(&state, &error, Some(query_id)),
     };
     let registration = RegisteredQueryGuard::new(query);
-    let sql_permit = match acquire_sql_permit(&state, &entry.session, registration.query()).await {
+    let sql_permit = match acquire_sql_permit(&state, &entry.session(), registration.query()).await
+    {
         Ok(permit) => permit,
         Err(error) => return tracked_query_error_response(&state, &error, Some(query_id)),
     };
@@ -2482,6 +3188,114 @@ async fn execute_statement(
         );
     }
     entry.touch();
+    // S1D-005: when the statement was prepared through the registry-tracked
+    // prepare endpoint, validate its binding before executing the cached
+    // plan — a stale plan never executes silently.
+    if let Some((statement_id, mut binding)) = entry.prepared_binding(&req.name) {
+        if let Err(response) =
+            validate_prepared_params(&entry, &req.name, &mut binding, &req.params)
+        {
+            registration.fail();
+            state.metrics.inc_sql_errors();
+            return with_query_id(*response, query_id);
+        }
+        let catalog_state = prepared::CatalogState::capture(&state.db);
+        if !catalog_state.is_compatible(&binding) {
+            // Incompatible catalog/schema change: invalidate and replan
+            // (S1D-005) — a stale plan never executes silently. The old plan
+            // is dropped first. Audited with the statement name only: the SQL
+            // text (and any literals in it) never reaches the audit log.
+            state.audit.record(
+                request_owner(&state, &principal),
+                "prepared.invalidate",
+                format!(
+                    "statement {:?} invalidated by a catalog/schema change",
+                    req.name
+                ),
+            );
+            let deallocate = format!("DEALLOCATE {}", req.name);
+            let _ = entry.session().run(&deallocate).await;
+            let replan_error: Option<String> = 'replan: {
+                // A staged transaction pins the session's catalog view, so
+                // the plan cannot be rebuilt against the new catalog here.
+                if entry.session().staged_sql_operation_count().is_some() {
+                    Some(
+                        "the session has an open transaction; COMMIT or ROLLBACK, then re-prepare"
+                            .to_owned(),
+                    )
+                } else {
+                    // The pooled session's DataFusion table registrations
+                    // snapshot the catalog at session open and advance only
+                    // on same-session DDL, so replanning after a
+                    // cross-session change requires a session built against
+                    // the CURRENT catalog (fresh secured providers:
+                    // authorization is preserved).
+                    let fresh = match MongrelSession::open_with_external_modules_as(
+                        Arc::clone(&state.db),
+                        state.external_modules.iter().cloned(),
+                        request_principal(&state, &principal),
+                    ) {
+                        Ok(session) => {
+                            session.with_query_registry(Arc::clone(&state.query_registry))
+                        }
+                        Err(error) => break 'replan Some(error.to_string()),
+                    };
+                    // Preserve the session's test hook across the swap.
+                    fresh.set_test_hook(entry.session().sql_test_hook());
+                    let replan = format!("PREPARE {} AS {}", req.name, binding.sql);
+                    match fresh.run(&replan).await {
+                        Ok(_) => {
+                            entry.replace_session(fresh);
+                            let rebound = prepared::build_binding(
+                                statement_id,
+                                binding.sql.clone(),
+                                binding.parameter_types.clone(),
+                                &prepared::CatalogState::capture(&state.db),
+                            );
+                            entry.insert_prepared_binding(req.name.clone(), rebound);
+                            None
+                        }
+                        Err(error) => Some(error.to_string()),
+                    }
+                }
+            };
+            match &replan_error {
+                Some(_) => state.audit.record(
+                    request_owner(&state, &principal),
+                    "prepared.replan.fail",
+                    format!(
+                        "statement {:?} could not be replanned; re-prepare required",
+                        req.name
+                    ),
+                ),
+                None => state.audit.record(
+                    request_owner(&state, &principal),
+                    "prepared.replan.ok",
+                    format!(
+                        "statement {:?} replanned against the current catalog",
+                        req.name
+                    ),
+                ),
+            }
+            if let Some(error) = replan_error {
+                entry.remove_prepared_binding(&req.name);
+                registration.fail();
+                state.metrics.inc_sql_errors();
+                return with_query_id(
+                    structured_category_error_response(
+                        StatusCode::CONFLICT,
+                        "SCHEMA_VERSION_MISMATCH",
+                        format!(
+                            "prepared statement {:?} was invalidated by a catalog/schema change and could not be replanned: {error}; re-prepare the statement",
+                            req.name
+                        ),
+                        mongreldb_types::errors::ErrorCategory::SchemaVersionMismatch,
+                    ),
+                    query_id,
+                );
+            }
+        }
+    }
     state.metrics.inc_sql_queries();
     let literals: Vec<String> = match req
         .params
@@ -2500,7 +3314,7 @@ async fn execute_statement(
     let result = if req.format.as_deref() == Some("arrow-stream") {
         let query = registration.into_query();
         match entry
-            .session
+            .session()
             .run_stream_with_query_for_serialization(&sql, query)
             .await
         {
@@ -2508,23 +3322,26 @@ async fn execute_statement(
                 stream,
                 completion,
                 sql_permit,
-                (state.sql_max_output_rows, state.sql_max_output_bytes),
+                (
+                    state.reloadable.sql_max_output_rows.get(),
+                    state.reloadable.sql_max_output_bytes.get(),
+                ),
                 &state,
                 query_id,
-                entry.session.sql_test_hook(),
+                entry.session().sql_test_hook(),
             )),
             Err(error) => Err(error),
         }
     } else {
         let query = registration.into_query();
         match entry
-            .session
+            .session()
             .run_with_query_for_serialization_with_limits(
                 &sql,
                 query,
                 mongreldb_query::SqlCollectionLimits::new(
-                    state.sql_max_output_rows,
-                    state.sql_max_output_bytes,
+                    state.reloadable.sql_max_output_rows.get(),
+                    state.reloadable.sql_max_output_bytes.get(),
                 ),
             )
             .await
@@ -2534,15 +3351,18 @@ async fn execute_statement(
                 req.format.as_deref(),
                 output,
                 query_id,
-                entry.session.sql_test_hook(),
-                (state.sql_max_output_rows, state.sql_max_output_bytes),
+                entry.session().sql_test_hook(),
+                (
+                    state.reloadable.sql_max_output_rows.get(),
+                    state.reloadable.sql_max_output_bytes.get(),
+                ),
             )
             .await),
             Err(error) => Err(error),
         }
     };
     let elapsed = start.elapsed();
-    if elapsed >= state.slow_query_threshold {
+    if elapsed >= state.reloadable.slow_query_threshold.get() {
         state.metrics.inc_slow_queries();
         eprintln!(
             "[slow-query] {}\u{00b5}s \u{2014} EXECUTE {}",
@@ -2603,12 +3423,13 @@ async fn deallocate_statement(
             Ok(options) => options,
             Err(response) => return *response,
         };
-    let query = match register_controlled_query(&state, &entry.session, options) {
+    let query = match register_controlled_query(&state, &entry.session(), options) {
         Ok(query) => query,
         Err(error) => return tracked_query_error_response(&state, &error, Some(query_id)),
     };
     let registration = RegisteredQueryGuard::new(query);
-    let _sql_permit = match acquire_sql_permit(&state, &entry.session, registration.query()).await {
+    let _sql_permit = match acquire_sql_permit(&state, &entry.session(), registration.query()).await
+    {
         Ok(permit) => permit,
         Err(error) => return tracked_query_error_response(&state, &error, Some(query_id)),
     };
@@ -2633,11 +3454,11 @@ async fn deallocate_statement(
     let sql = format!("DEALLOCATE {name}");
     let start = std::time::Instant::now();
     let result = entry
-        .session
+        .session()
         .run_with_query(&sql, registration.into_query())
         .await;
     let elapsed = start.elapsed();
-    if elapsed >= state.slow_query_threshold {
+    if elapsed >= state.reloadable.slow_query_threshold.get() {
         state.metrics.inc_slow_queries();
         eprintln!(
             "[slow-query] {}\u{00b5}s query_id={} operation=DEALLOCATE",
@@ -2646,10 +3467,13 @@ async fn deallocate_statement(
         );
     }
     match result {
-        Ok(_) => with_query_id(
-            Json(json!({ "deallocated": name })).into_response(),
-            query_id,
-        ),
+        Ok(_) => {
+            entry.remove_prepared_binding(&name);
+            with_query_id(
+                Json(json!({ "deallocated": name })).into_response(),
+                query_id,
+            )
+        }
         Err(error) => {
             state.metrics.inc_sql_errors();
             tracked_query_error_response(&state, &error, Some(query_id))
@@ -2769,6 +3593,9 @@ async fn create_table(
     OptionalPrincipal(principal): OptionalPrincipal,
     Json(req): Json<CreateTableRequest>,
 ) -> Response {
+    if let Some(response) = require_writes_open(&state) {
+        return response;
+    }
     if let Err(error) = state.db.require_for(
         request_principal(&state, &principal).as_ref(),
         &mongreldb_core::Permission::Ddl,
@@ -2848,6 +3675,9 @@ async fn drop_table(
     OptionalPrincipal(principal): OptionalPrincipal,
     Path(name): Path<String>,
 ) -> Response {
+    if let Some(response) = require_writes_open(&state) {
+        return response;
+    }
     if let Err(error) = state.db.require_for(
         request_principal(&state, &principal).as_ref(),
         &mongreldb_core::Permission::Ddl,
@@ -3173,6 +4003,9 @@ async fn put_row(
     Path(name): Path<String>,
     Json(req): Json<PutRequest>,
 ) -> Response {
+    if let Some(response) = require_writes_open(&state) {
+        return response;
+    }
     let handle = match state.db.table(&name) {
         Ok(h) => h,
         Err(e) => return (StatusCode::NOT_FOUND, e.to_string()).into_response(),
@@ -3207,6 +4040,9 @@ async fn commit(
     OptionalPrincipal(principal): OptionalPrincipal,
     Path(name): Path<String>,
 ) -> Response {
+    if let Some(response) = require_writes_open(&state) {
+        return response;
+    }
     if let Err(error) = state.db.require_for(
         request_principal(&state, &principal).as_ref(),
         &mongreldb_core::Permission::Update {
@@ -3282,6 +4118,53 @@ fn query_error_response(
     query_id: Option<QueryId>,
 ) -> Response {
     query_error_response_with_status(error, query_id, None)
+}
+
+/// Map a query-layer error onto the stable error taxonomy (spec section 9.7).
+/// The taxonomy is deliberately coarser than `MongrelQueryError`; non-obvious
+/// choices follow the `MongrelError::category()` precedents and are
+/// documented at the arm.
+fn query_error_category(
+    error: &mongreldb_query::MongrelQueryError,
+) -> mongreldb_types::errors::ErrorCategory {
+    use mongreldb_query::MongrelQueryError;
+    use mongreldb_types::errors::ErrorCategory;
+    match error {
+        MongrelQueryError::Core(error) => error.category(),
+        MongrelQueryError::QueryCancelled { .. } => ErrorCategory::Cancelled,
+        MongrelQueryError::DeadlineExceeded { .. } => ErrorCategory::DeadlineExceeded,
+        // A known-aborted commit may be retried as a fresh transaction; a
+        // committed-with-error one must never be blindly replayed (the core
+        // `DurableCommit` precedent).
+        MongrelQueryError::CommitOutcome { committed, .. } => {
+            if *committed {
+                ErrorCategory::CommitOutcomeUnknown
+            } else {
+                ErrorCategory::TransactionAborted
+            }
+        }
+        MongrelQueryError::OutcomeUnknown { .. } => ErrorCategory::CommitOutcomeUnknown,
+        MongrelQueryError::TransactionAborted => ErrorCategory::TransactionAborted,
+        // The session has no usable transaction; begin a fresh one.
+        MongrelQueryError::NoSqlTransaction => ErrorCategory::TransactionAborted,
+        // The caller's view of session state is stale (the core `NotFound`
+        // precedent).
+        MongrelQueryError::SavepointNotFound { .. } => ErrorCategory::StaleMetadata,
+        MongrelQueryError::QueryRegistryFull | MongrelQueryError::ResultLimitExceeded { .. } => {
+            ErrorCategory::ResourceExhausted
+        }
+        // The taxonomy has no invalid-request category: id reuse, invalid
+        // query state, and SQL parse/plan failures are client/server contract
+        // disagreements (the core `InvalidArgument` precedent).
+        MongrelQueryError::QueryIdConflict { .. }
+        | MongrelQueryError::InvalidQueryState(_)
+        | MongrelQueryError::Arrow(_)
+        | MongrelQueryError::DataFusion(_) => ErrorCategory::ClusterVersionMismatch,
+        MongrelQueryError::Schema(_) => ErrorCategory::SchemaVersionMismatch,
+        // Uncategorized query-layer failures: the serving replica failed to
+        // complete the request (the core `Other` precedent).
+        _ => ErrorCategory::ReplicaUnavailable,
+    }
 }
 
 fn query_error_response_with_status(
@@ -3484,6 +4367,10 @@ fn query_error_response_with_status(
         "DEADLINE_EXCEEDED" => StatusCode::GATEWAY_TIMEOUT,
         _ => status_for_query_error(error),
     };
+    // The stable error taxonomy (spec 9.7) rides additively on the existing
+    // error object: programmatic handling keys off `category` /
+    // `category_code`, never the message.
+    let category = query_error_category(error);
     let mut response = (
         http_status,
         Json(json!({
@@ -3506,6 +4393,8 @@ fn query_error_response_with_status(
             "error": {
                 "code": code,
                 "message": error.to_string(),
+                "category": category.to_string(),
+                "category_code": category.code(),
                 "query_id": id.map(|value| value.to_string()),
                 "committed": (!outcome_unknown).then_some(committed),
                 "retryable": matches!(error, MongrelQueryError::QueryRegistryFull),
@@ -3670,10 +4559,7 @@ fn resolve_query_options(
                         Some(query_id),
                     ))
                 })?,
-            None => state
-                .sql_default_timeout
-                .as_millis()
-                .min(u128::from(u64::MAX)) as u64,
+            None => state.reloadable.sql_default_timeout.as_millis(),
         },
     };
     if timeout_ms == 0 {
@@ -3683,11 +4569,11 @@ fn resolve_query_options(
         )));
     }
     let timeout = std::time::Duration::from_millis(timeout_ms);
-    if timeout > state.sql_max_timeout {
+    if timeout > state.reloadable.sql_max_timeout.get() {
         return Err(Box::new(bad_query_control_request(
             format!(
                 "timeout_ms exceeds server maximum of {}",
-                state.sql_max_timeout.as_millis()
+                state.reloadable.sql_max_timeout.as_millis()
             ),
             Some(query_id),
         )));
@@ -3730,13 +4616,13 @@ fn resolve_sql_output_limits(
     Ok((
         resolve(
             request.max_output_rows,
-            state.sql_max_output_rows,
+            state.reloadable.sql_max_output_rows.get(),
             "max_output_rows",
             query_id,
         )?,
         resolve(
             request.max_output_bytes,
-            state.sql_max_output_bytes,
+            state.reloadable.sql_max_output_bytes.get(),
             "max_output_bytes",
             query_id,
         )?,
@@ -4166,6 +5052,13 @@ fn restore_idempotency_replay(
             last_commit_epoch: receipt.outcome.last_commit_epoch,
             first_commit_statement_index: receipt.outcome.first_commit_statement_index,
             last_commit_statement_index: receipt.outcome.last_commit_statement_index,
+            // The replayed outcome carries the same literal commit lineage as
+            // the original write: the core ledger receipt rides the durable
+            // HTTP receipt (S1B-005).
+            commit_ts: receipt
+                .commit_receipt
+                .as_ref()
+                .map(sql_idempotency::SqlCommitReceipt::commit_ts),
         },
         receipt.outcome.completed_statements,
         receipt.outcome.statement_index,
@@ -4534,6 +5427,7 @@ fn sql_terminal_idempotency_receipt(
                 category: terminal_error_category_name(error.category).to_owned(),
             }
         }),
+        commit_receipt: None,
     })
 }
 
@@ -4544,7 +5438,7 @@ fn sql_idempotency_receipt_response(
     expires_at_ms: u64,
     persisted: bool,
 ) -> Response {
-    let mut response = Json(json!({
+    let mut body = json!({
         "query_id": query_id.to_string(),
         "original_query_id": receipt.original_query_id,
         "status": receipt.status,
@@ -4566,8 +5460,15 @@ fn sql_idempotency_receipt_response(
         "idempotency_expires_at_ms": expires_at_ms,
         "outcome": receipt.outcome,
         "terminal_error": receipt.terminal_error,
-    }))
-    .into_response();
+    });
+    // S1B-005 additive: the core commit log's receipt for the committed
+    // write, when the durable `TXN_IDEMPOTENCY` ledger recorded one. Absent
+    // (not null) for receipts predating the unification and for no-op writes
+    // that never committed.
+    if let Some(commit_receipt) = &receipt.commit_receipt {
+        body["commit_receipt"] = json!(commit_receipt);
+    }
+    let mut response = Json(body).into_response();
     response.headers_mut().insert(
         "idempotency-replayed",
         axum::http::HeaderValue::from_static(if replayed { "true" } else { "false" }),
@@ -4599,6 +5500,24 @@ fn terminal_server_error_response(
         "SERIALIZATION_FAILED_AFTER_COMMIT"
     } else {
         base_code
+    };
+    // Stable taxonomy category for this terminal code (spec 9.7); mappings
+    // follow the `MongrelError::category()` precedents.
+    let category = {
+        use mongreldb_types::errors::ErrorCategory;
+        match code {
+            "RESULT_LIMIT_EXCEEDED" | "SQL_PAGE_STORE_FULL" | "ENTROPY_UNAVAILABLE" => {
+                ErrorCategory::ResourceExhausted
+            }
+            // Client/supplied-shape disagreements and codec failures are
+            // contract disagreements (the core `InvalidArgument` /
+            // `Serialization` precedents).
+            "INVALID_SQL_PROJECTION" | "INVALID_PAGE_OFFSET" => {
+                ErrorCategory::ClusterVersionMismatch
+            }
+            _ if code.starts_with("SERIALIZATION_") => ErrorCategory::ClusterVersionMismatch,
+            _ => ErrorCategory::ReplicaUnavailable,
+        }
     };
     let response_status = status
         .as_ref()
@@ -4633,6 +5552,8 @@ fn terminal_server_error_response(
                 "error": {
                     "code": code,
                     "message": message.into(),
+                    "category": category.to_string(),
+                    "category_code": category.code(),
                     "query_id": query_id.to_string(),
                     "committed": committed,
                     "retryable": false,
@@ -5371,6 +6292,18 @@ fn sql_cursor_error_response(
     message: &'static str,
     query_id: QueryId,
 ) -> Response {
+    // Stable taxonomy category for this cursor code (spec 9.7); mappings
+    // follow the `MongrelError::category()` precedents.
+    let category = {
+        use mongreldb_types::errors::ErrorCategory;
+        match code {
+            // Cursor staleness/expiry is stale server-side state (the core
+            // `CursorStale` / `CursorExpired` precedent).
+            "SQL_CURSOR_NOT_FOUND" | "SQL_CURSOR_EXPIRED" => ErrorCategory::StaleMetadata,
+            "RESULT_LIMIT_EXCEEDED" | "ENTROPY_UNAVAILABLE" => ErrorCategory::ResourceExhausted,
+            _ => ErrorCategory::ClusterVersionMismatch,
+        }
+    };
     (
         status,
         Json(json!({
@@ -5403,6 +6336,8 @@ fn sql_cursor_error_response(
             "error": {
                 "code": code,
                 "message": message,
+                "category": category.to_string(),
+                "category_code": category.code(),
                 "query_id": query_id.to_string(),
                 "committed": false,
                 "retryable": false,
@@ -5453,7 +6388,7 @@ async fn sql(
             Ok(options) => options,
             Err(response) => return *response,
         };
-        let query = match register_controlled_query(&state, &entry.session, options) {
+        let query = match register_controlled_query(&state, &entry.session(), options) {
             Ok(query) => query,
             Err(error) => return tracked_query_error_response(&state, &error, Some(query_id)),
         };
@@ -5475,7 +6410,7 @@ async fn sql(
                 Err(response) => return *response,
             };
         let sql_permit =
-            match acquire_sql_permit(&state, &entry.session, registration.query()).await {
+            match acquire_sql_permit(&state, &entry.session(), registration.query()).await {
                 Ok(permit) => permit,
                 Err(error) => {
                     return tracked_query_error_response(&state, &error, Some(query_id));
@@ -5499,7 +6434,7 @@ async fn sql(
         }
         if req.idempotency_key.is_some() || headers.contains_key("idempotency-key") {
             entry
-                .session
+                .session()
                 .fire_test_hook(mongreldb_query::SqlTestHookPoint::BeforeServerIdempotencyCheck);
         }
         let (registration, idempotency) = match begin_sql_idempotency(
@@ -5510,7 +6445,7 @@ async fn sql(
                 output_limits,
                 owner: &owner,
                 session_id: Some(&sid),
-                session_in_transaction: entry.session.staged_sql_operation_count().is_some(),
+                session_in_transaction: entry.session().staged_sql_operation_count().is_some(),
                 query_id,
             },
             registration,
@@ -5522,10 +6457,10 @@ async fn sql(
         };
         entry.touch();
         let query = registration.into_query();
-        execute_sql(
+        let (response, idempotent_commit_ts) = execute_sql(
             &state,
             &principal,
-            &entry.session,
+            &entry.session(),
             ResolvedSqlRequest {
                 request: req,
                 output_limits,
@@ -5536,7 +6471,36 @@ async fn sql(
             query_id,
             sql_permit,
         )
-        .await
+        .await;
+        // Keep the canonical S1D-004 record (transaction state,
+        // read-your-writes token, last activity) in step with the session.
+        // The token carries the write's literal commit-timestamp lineage when
+        // one is known: the core commit log's receipt recorded for an
+        // idempotent commit (S1B-005), else the exact commit timestamp the
+        // query layer sourced from core into the durable outcome, else the
+        // per-open epoch→commit-ts ledger (`Database::commit_ts_for_epoch`).
+        // Only when none of those resolve does it fall back to the node's HLC
+        // timestamp captured after the commit became visible, which the
+        // single HLC authority orders after the write's commit timestamp
+        // (spec §8.2).
+        let durable = state
+            .query_registry
+            .status(query_id)
+            .map(|status| status.durable_outcome);
+        entry.sync_record_after_request(match durable {
+            Some(outcome) if outcome.committed => Some(
+                idempotent_commit_ts
+                    .or(outcome.commit_ts)
+                    .or_else(|| {
+                        outcome.last_commit_epoch.and_then(|epoch| {
+                            state.db.commit_ts_for_epoch(mongreldb_core::Epoch(epoch))
+                        })
+                    })
+                    .unwrap_or_else(|| ryw_commit_timestamp(&state.db)),
+            ),
+            _ => None,
+        });
+        response
     } else {
         let session = match MongrelSession::open_with_external_modules_as(
             Arc::clone(&state.db),
@@ -5621,6 +6585,26 @@ async fn sql(
             sql_permit,
         )
         .await
+        .0
+    }
+}
+
+/// The read-your-writes fallback token for a just-committed request whose
+/// literal commit timestamp did not resolve (no idempotency receipt, no
+/// query-layer `commit_ts`, no per-open ledger entry): the node's HLC
+/// timestamp captured at a fresh `begin` after the commit became visible. The
+/// single HLC authority (spec §8.2) orders it after every commit timestamp it
+/// has already issued — including the commit this request observed — so a
+/// later read presenting the token sees the session's own write. Falls back
+/// to wall-clock micros when clock allocation is rejected (skew gate).
+fn ryw_commit_timestamp(db: &mongreldb_core::Database) -> mongreldb_types::hlc::HlcTimestamp {
+    if let Some(ts) = db.begin().read_ts() {
+        return ts;
+    }
+    mongreldb_types::hlc::HlcTimestamp {
+        physical_micros: sessions::now_unix_micros(),
+        logical: 0,
+        node_tiebreaker: 0,
     }
 }
 
@@ -5628,6 +6612,10 @@ async fn sql(
 /// (after execution, with redaction), log slow queries on both success and
 /// failure, and dispatch the response format. Shared by the pooled-session and
 /// fresh-session paths.
+///
+/// The second tuple element is the HLC commit timestamp of the core receipt
+/// recorded for an idempotent committed write (S1B-005), when one exists —
+/// the pooled-session path folds it into the session's read-your-writes token.
 async fn execute_sql(
     state: &AppState,
     principal: &Option<mongreldb_core::Principal>,
@@ -5636,7 +6624,7 @@ async fn execute_sql(
     query: RegisteredSqlQuery,
     query_id: QueryId,
     sql_permit: tokio::sync::OwnedSemaphorePermit,
-) -> Response {
+) -> (Response, Option<mongreldb_types::hlc::HlcTimestamp>) {
     let ResolvedSqlRequest {
         request: req,
         output_limits,
@@ -5721,7 +6709,7 @@ async fn execute_sql(
     let elapsed = start.elapsed();
     // Slow-query logging covers BOTH success and failure (the slowest errors
     // matter most for diagnosis), checked before branching on the outcome.
-    if elapsed >= state.slow_query_threshold {
+    if elapsed >= state.reloadable.slow_query_threshold.get() {
         state.metrics.inc_slow_queries();
         eprintln!(
             "[slow-query] {}\u{00b5}s query_id={} operation={}",
@@ -5744,23 +6732,46 @@ async fn execute_sql(
         }
     };
     let Some(idempotency) = idempotency else {
-        return response;
+        return (response, None);
     };
     let status = idempotency_query.map(|query| query.status());
     if let Some(receipt) = status.as_ref().and_then(sql_terminal_idempotency_receipt) {
+        let mut receipt = receipt;
+        // S1B-005: a write that durably committed also records its key in the
+        // core's durable TXN_IDEMPOTENCY ledger, so the key → original-receipt
+        // binding survives restart under the commit log's authority (identical
+        // replay → original receipt; different fingerprint → Conflict). The
+        // ledger's receipt rides the durable HTTP receipt additively; the HTTP
+        // store remains the wire authority if the bookkeeping fails.
+        if receipt.outcome.committed {
+            let db = Arc::clone(&state.db);
+            let owner = idempotency.owner().to_owned();
+            let key = idempotency.key().to_owned();
+            let binding = idempotency.binding().clone();
+            let ttl = idempotency.ttl();
+            receipt.commit_receipt = tokio::task::spawn_blocking(move || {
+                sql_idempotency::record_core_idempotency_commit(&db, &owner, &key, &binding, ttl)
+            })
+            .await
+            .unwrap_or_else(|error| {
+                eprintln!("[idempotency] core ledger record task failed: {error}");
+                None
+            });
+        }
+        let commit_ts = receipt
+            .commit_receipt
+            .as_ref()
+            .map(sql_idempotency::SqlCommitReceipt::commit_ts);
         let (expires_at_ms, persisted) = idempotency.commit(receipt.clone());
-        return sql_idempotency_receipt_response(
-            query_id,
-            &receipt,
-            false,
-            expires_at_ms,
-            persisted,
+        return (
+            sql_idempotency_receipt_response(query_id, &receipt, false, expires_at_ms, persisted),
+            commit_ts,
         );
     }
     if status.as_ref().is_some_and(can_abort_idempotency_intent) {
         idempotency.abort();
     }
-    response
+    (response, None)
 }
 
 fn can_abort_idempotency_intent(status: &mongreldb_query::QueryStatus) -> bool {
@@ -6173,6 +7184,9 @@ async fn txn(
     OptionalPrincipal(principal): OptionalPrincipal,
     Json(req): Json<TxnRequest>,
 ) -> Response {
+    if let Some(response) = require_writes_open(&state) {
+        return response;
+    }
     // Pre-validate every op against the live schemas before entering the
     // transaction, so malformed input returns 400 without consuming an epoch
     // or poisoning a txn.
@@ -6604,6 +7618,7 @@ mod query_response_tests {
                 code: "SERIALIZATION_FAILED_AFTER_COMMIT".into(),
                 category: "serialization".into(),
             }),
+            commit_receipt: None,
         };
         let response = sql_idempotency_receipt_response(query_id, &receipt, false, 99, true);
         assert_eq!(response.status(), StatusCode::OK);
@@ -6652,6 +7667,7 @@ mod query_response_tests {
                 code: "QUERY_CANCELLED_AFTER_COMMIT".into(),
                 category: "cancellation".into(),
             }),
+            commit_receipt: None,
         };
         restore_idempotency_replay(RegisteredQueryGuard::new(query), &receipt).unwrap();
         let status = registry.status(query_id).unwrap();
@@ -6693,6 +7709,7 @@ mod query_response_tests {
                 serialization: "succeeded".into(),
             },
             terminal_error: None,
+            commit_receipt: None,
         };
         let error =
             restore_idempotency_replay(RegisteredQueryGuard::new(query), &receipt).unwrap_err();
@@ -6730,6 +7747,7 @@ mod query_response_tests {
                 serialization: "succeeded".into(),
             },
             terminal_error: None,
+            commit_receipt: None,
         };
         let error = restore_idempotency_replay(RegisteredQueryGuard::new(query), &receipt)
             .expect_err("accepted cancellation must suppress replay success");

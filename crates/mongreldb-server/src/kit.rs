@@ -1179,6 +1179,8 @@ pub fn error_code(e: &MongrelError) -> &'static str {
             }
         }
         MongrelError::NotFound(_) => "NOT_FOUND",
+        MongrelError::Deadlock { .. } => "DEADLOCK",
+        MongrelError::SerializationFailure { .. } => "SERIALIZATION_FAILURE",
         MongrelError::CursorStale(_) => "CURSOR_STALE",
         MongrelError::CursorExpired => "CURSOR_EXPIRED",
         _ => "INTERNAL",
@@ -1537,6 +1539,9 @@ pub async fn kit_create_table(
     OptionalPrincipal(principal): OptionalPrincipal,
     Json(req): Json<KitCreateTableRequest>,
 ) -> Response {
+    if let Some(response) = crate::require_writes_open(&state) {
+        return response;
+    }
     if let Err(error) = state.db.require_for(
         request_principal(&state, &principal).as_ref(),
         &mongreldb_core::Permission::Ddl,
@@ -1700,6 +1705,10 @@ fn kit_core_error(error: &MongrelError) -> Response {
         MongrelError::PermissionDenied { .. } => (StatusCode::FORBIDDEN, "PERMISSION_DENIED"),
         MongrelError::NotFound(_) => (StatusCode::NOT_FOUND, "NOT_FOUND"),
         MongrelError::Conflict(_) => (StatusCode::CONFLICT, "CONFLICT"),
+        MongrelError::Deadlock { .. } => (StatusCode::CONFLICT, "DEADLOCK"),
+        MongrelError::SerializationFailure { .. } => {
+            (StatusCode::CONFLICT, "SERIALIZATION_FAILURE")
+        }
         MongrelError::CursorStale(_) => (StatusCode::CONFLICT, "CURSOR_STALE"),
         MongrelError::CursorExpired => (StatusCode::GONE, "CURSOR_EXPIRED"),
         MongrelError::DeadlineExceeded => (StatusCode::GATEWAY_TIMEOUT, "DEADLINE_EXCEEDED"),
@@ -1724,6 +1733,9 @@ pub async fn kit_txn(
     OptionalPrincipal(principal): OptionalPrincipal,
     Json(req): Json<KitTxnRequest>,
 ) -> Response {
+    if let Some(response) = crate::require_writes_open(&state) {
+        return response;
+    }
     let effective_principal = request_principal(&state, &principal);
     let preflight = match preflight_kit_txn(&state, &req, effective_principal.as_ref()) {
         Ok(preflight) => preflight,
@@ -3883,6 +3895,31 @@ mod tests {
             )),
             "BAD_REQUEST"
         );
+    }
+
+    #[tokio::test]
+    async fn deadlock_and_serialization_failure_are_409_with_typed_codes() {
+        for (error, code) in [
+            (
+                MongrelError::Deadlock {
+                    victim: 7,
+                    cycle: "7 → 3 → 7".into(),
+                },
+                "DEADLOCK",
+            ),
+            (
+                MongrelError::SerializationFailure {
+                    message: "ssi certification failed".into(),
+                },
+                "SERIALIZATION_FAILURE",
+            ),
+        ] {
+            assert_eq!(error_code(&error), code);
+            let (status, body) = response_json(kit_core_error(&error)).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{error}");
+            assert_eq!(body["status"], "aborted", "{body}");
+            assert_eq!(body["error"]["code"], code, "{body}");
+        }
     }
 
     async fn response_json(response: Response) -> (StatusCode, Jval) {

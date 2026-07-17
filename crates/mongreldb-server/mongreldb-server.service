@@ -5,6 +5,10 @@ After=network.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/mongreldb-server /var/lib/mongreldb 8453
+# systemctl reload sends SIGHUP: the daemon re-reads the mutable
+# configuration subset live (see "Operations: drain and configuration
+# reload" in docs/08-daemon.md).
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=3
 User=mongreldb

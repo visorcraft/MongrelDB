@@ -22,6 +22,21 @@
 //! [`DdlOp::Command`] records carrying one encoded
 //! [`mongreldb_log::CommandEnvelope`]; [`CommitLog::read_committed`] replays
 //! them with the existing WAL reader.
+//!
+//! ## Dual timestamp model (ADR-0003)
+//!
+//! Stage 1B wires the node's real [`HlcClock`] (spec section 8.2) through this
+//! adapter: every commit receipt's `commit_ts` is allocated from the one core
+//! clock — the transaction commit path assigns it under the sequencer lock
+//! strictly after the transaction's read timestamp (spec section 8.2's
+//! commit-timestamp rule) — and the durable `Op::CommitTimestamp` WAL ledger
+//! records the same timestamp's physical component (byte format unchanged).
+//! During the migration, however, **`Epoch(u64)` remains the reader-visibility
+//! counter**: snapshots pin epochs, row versions carry epochs, and the WAL
+//! `TxnCommit` marker orders by epoch. HLC timestamps are the commit/identity
+//! timestamp of record (receipts, PITR's epoch↔nanos ledger); the epoch↔HLC
+//! row-version cut-over arrives with the section 8.4 migration work, never
+//! inferring format from byte length.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -30,7 +45,7 @@ use mongreldb_log::{
     CommandEnvelope, CommitLog, CommitReceipt, CommittedEntry, DurabilityLevel, LogError,
     LogPosition, LogSnapshot,
 };
-use mongreldb_types::hlc::HlcTimestamp;
+use mongreldb_types::hlc::{HlcClock, HlcTimestamp};
 use mongreldb_types::ids::TransactionId;
 use parking_lot::Mutex;
 use zeroize::Zeroizing;
@@ -72,41 +87,19 @@ pub(crate) fn fault_as_io(fault: mongreldb_fault::Fault) -> MongrelError {
 /// Maps a per-open WAL transaction id onto a [`TransactionId`]. The mapping is
 /// injective within one open generation; the full 128-bit transaction
 /// identifier lands with the cluster id work (spec section 7).
-fn transaction_id_from_txn(txn_id: u64) -> TransactionId {
+pub(crate) fn transaction_id_from_txn(txn_id: u64) -> TransactionId {
     let mut bytes = [0u8; 16];
     bytes[..8].copy_from_slice(&txn_id.to_le_bytes());
     TransactionId::from_bytes(bytes)
 }
 
-/// Interim HLC source for standalone commit receipts (spec section 8.1):
-/// system-clock microseconds with a Mutex-guarded last value so timestamps
-/// never regress, with the logical counter absorbing same-microsecond commits.
-/// The full `HlcClock` (send/receive causal rules, drift bounds, node ids)
-/// lands with the types crate's clock work; on a single node, physical time
-/// plus this tiebreak is sufficient for a monotonic commit timestamp.
-#[derive(Debug, Default)]
-struct SystemHlcClock {
-    last: Mutex<(u64, u32)>,
-}
-
-impl SystemHlcClock {
-    fn now(&self) -> HlcTimestamp {
-        let micros = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_micros() as u64)
-            .unwrap_or(0);
-        let mut last = self.last.lock();
-        if micros > last.0 {
-            *last = (micros, 0);
-        } else {
-            last.1 = last.1.saturating_add(1);
-        }
-        HlcTimestamp {
-            physical_micros: last.0,
-            logical: last.1,
-            node_tiebreaker: 0,
-        }
-    }
+/// The physical component of an HLC commit timestamp as WAL-ledger nanos
+/// (spec section 8.1: `physical_micros` × 1_000). The `Op::CommitTimestamp`
+/// byte format is unchanged; only the source (the node's HLC clock instead of
+/// a raw wall-clock read) changed, keeping PITR's epoch↔nanos mapping
+/// consistent with receipt timestamps.
+pub(crate) fn commit_nanos(commit_ts: HlcTimestamp) -> u64 {
+    commit_ts.physical_micros.saturating_mul(1_000)
 }
 
 /// The standalone commit log (spec section 9.4): one shared WAL + one
@@ -126,10 +119,17 @@ pub struct StandaloneCommitLog {
     root: PathBuf,
     /// WAL DEK for replaying encrypted segments; `None` for plaintext.
     wal_dek: Option<Zeroizing<[u8; 32]>>,
-    clock: SystemHlcClock,
+    /// The node's single HLC timestamp authority (spec sections 4.1, 8.2),
+    /// shared with the owning `DatabaseCore`. Receipt commit timestamps are
+    /// allocated here; the transaction commit path assigns them under the
+    /// sequencer lock (strictly after the transaction's read timestamp) and
+    /// passes them in, so the receipt and the durable WAL ledger record the
+    /// same timestamp.
+    clock: Arc<HlcClock>,
 }
 
 impl StandaloneCommitLog {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         wal: Arc<Mutex<SharedWal>>,
         group: Arc<GroupCommit>,
@@ -138,6 +138,7 @@ impl StandaloneCommitLog {
         txn_ids: Arc<Mutex<u64>>,
         root: PathBuf,
         wal_dek: Option<Zeroizing<[u8; 32]>>,
+        clock: Arc<HlcClock>,
     ) -> Self {
         Self {
             wal,
@@ -147,7 +148,7 @@ impl StandaloneCommitLog {
             txn_ids,
             root,
             wal_dek,
-            clock: SystemHlcClock::default(),
+            clock,
         }
     }
 
@@ -155,11 +156,16 @@ impl StandaloneCommitLog {
     /// writes the transaction command's records followed by its commit marker
     /// and returns the commit record's WAL sequence. The caller holds the
     /// database commit lock and the WAL lock; no fsync happens here.
+    ///
+    /// `commit_ts` is the timestamp the sequencer assigned (S1B-004 step 5);
+    /// its physical component is recorded in the durable
+    /// `Op::CommitTimestamp` ledger record ahead of the commit marker.
     pub(crate) fn append_transaction(
         &self,
         wal: &mut SharedWal,
         txn_id: u64,
         epoch: Epoch,
+        commit_ts: HlcTimestamp,
         records: Vec<(u64, Op)>,
         added_runs: &[AddedRun],
     ) -> Result<u64, LogError> {
@@ -167,25 +173,32 @@ impl StandaloneCommitLog {
             wal.append(txn_id, table_id, op)
                 .map_err(|error| LogError::Internal(error.to_string()))?;
         }
-        wal.append_commit(txn_id, epoch, added_runs)
+        wal.append_commit_at(txn_id, epoch, added_runs, commit_nanos(commit_ts))
             .map_err(|error| LogError::Internal(error.to_string()))
     }
 
     /// Owns the group-commit durability step of the commit sequencer: blocks
     /// until `commit_seq` is durable (one leader fsync serves the batch) and
     /// issues the irrevocable receipt that gates visibility publication.
+    ///
+    /// `commit_ts` is `Some` when the caller already assigned the timestamp
+    /// (the transaction sequencer, S1B-004 step 5); `None` asks the clock
+    /// for a fresh one (DDL/maintenance commits and [`CommitLog::propose`]).
     pub(crate) fn seal_transaction(
         &self,
         txn_id: u64,
         epoch: Epoch,
         commit_seq: u64,
+        commit_ts: Option<HlcTimestamp>,
     ) -> Result<CommitReceipt, LogError> {
         self.group
             .await_durable(&self.wal, commit_seq)
             .map_err(|error| LogError::Internal(error.to_string()))?;
+        let commit_ts =
+            commit_ts.unwrap_or_else(|| self.clock.commit_timestamp(std::iter::empty()));
         Ok(CommitReceipt {
             transaction_id: transaction_id_from_txn(txn_id),
-            commit_ts: self.clock.now(),
+            commit_ts,
             log_position: LogPosition {
                 term: 0,
                 index: epoch.0,
@@ -213,16 +226,19 @@ impl CommitLog for StandaloneCommitLog {
         let result = (|| {
             let txn_id = crate::txn::allocate_txn_id(&self.txn_ids)
                 .map_err(|error| LogError::Internal(error.to_string()))?;
+            // Assign the commit timestamp before the append (S1B-004 step 5)
+            // so the receipt and the durable WAL ledger record agree.
+            let commit_ts = self.clock.commit_timestamp(std::iter::empty());
             let record = Op::Ddl(DdlOp::Command {
                 payload: command.encode(),
             });
             let commit_seq = {
                 let mut wal = self.wal.lock();
                 wal.append(txn_id, crate::database::WAL_TABLE_ID, record)
-                    .and_then(|_| wal.append_commit(txn_id, epoch, &[]))
+                    .and_then(|_| wal.append_commit_at(txn_id, epoch, &[], commit_nanos(commit_ts)))
                     .map_err(|error| LogError::Internal(error.to_string()))?
             };
-            let receipt = self.seal_transaction(txn_id, epoch, commit_seq)?;
+            let receipt = self.seal_transaction(txn_id, epoch, commit_seq, Some(commit_ts))?;
             mongreldb_fault::inject("commit.publish.before")
                 .map_err(|fault| LogError::Internal(fault.to_string()))?;
             self.epoch.publish_in_order(epoch);
@@ -243,6 +259,13 @@ impl CommitLog for StandaloneCommitLog {
     /// by a durable `TxnCommit` marker are returned, and replay is constrained
     /// to the authenticated durable WAL head, so unacknowledged appends never
     /// surface. `after.term` is ignored: the standalone log has a single term.
+    ///
+    /// Reconstructed `commit_ts` values carry only the physical component: the
+    /// WAL ledger stores `physical_micros` as nanos, not the HLC logical
+    /// counter or node tiebreaker (byte format unchanged from the Stage 0
+    /// gate). Within one open, receipts issued by [`Self::seal_transaction`]
+    /// remain the exact commit timestamps; replayed values order identically
+    /// at microsecond granularity.
     fn read_committed(
         &self,
         after: LogPosition,
@@ -334,14 +357,43 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn system_hlc_clock_is_monotonic() {
-        let clock = SystemHlcClock::default();
-        let mut previous = clock.now();
+    fn core_hlc_clock_is_monotonic_across_commit_allocations() {
+        let clock = HlcClock::new(0, Duration::from_secs(60));
+        let mut previous = clock.commit_timestamp(std::iter::empty());
         for _ in 0..1_000 {
-            let next = clock.now();
+            let next = clock.commit_timestamp(std::iter::empty());
             assert!(next > previous, "{next} must exceed {previous}");
             previous = next;
         }
+    }
+
+    #[test]
+    fn commit_timestamp_exceeds_every_participant_timestamp() {
+        let clock = HlcClock::new(0, Duration::from_secs(60));
+        let read_ts = clock.now().unwrap();
+        let commit_ts = clock.commit_timestamp([read_ts]);
+        assert!(
+            commit_ts > read_ts,
+            "§8.2: commit ts {commit_ts} must exceed read ts {read_ts}"
+        );
+        let later = clock.commit_timestamp([read_ts, commit_ts]);
+        assert!(later > commit_ts);
+    }
+
+    #[test]
+    fn commit_nanos_carries_the_physical_component() {
+        let ts = HlcTimestamp {
+            physical_micros: 1_700_000_000_123_456,
+            logical: 7,
+            node_tiebreaker: 2,
+        };
+        assert_eq!(commit_nanos(ts), 1_700_000_000_123_456_000);
+        let saturated = HlcTimestamp {
+            physical_micros: u64::MAX,
+            logical: 0,
+            node_tiebreaker: 0,
+        };
+        assert_eq!(commit_nanos(saturated), u64::MAX);
     }
 
     #[test]

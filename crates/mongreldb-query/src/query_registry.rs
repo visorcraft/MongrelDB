@@ -159,10 +159,21 @@ pub struct DurableOutcome {
     pub last_commit_epoch: Option<u64>,
     pub first_commit_statement_index: Option<usize>,
     pub last_commit_statement_index: Option<usize>,
+    /// The literal commit timestamp of the last committed statement, sourced
+    /// from core's commit receipt when the committing call site has one
+    /// (`None` when only the epoch is known — resolve it lazily through
+    /// `Database::commit_ts_for_epoch`). The server's read-your-writes token
+    /// prefers this exact receipt over a fresh-begin HLC.
+    pub commit_ts: Option<mongreldb_types::hlc::HlcTimestamp>,
 }
 
 impl DurableOutcome {
-    fn record_commit(&mut self, statement_index: usize, epoch: Option<u64>) {
+    fn record_commit(
+        &mut self,
+        statement_index: usize,
+        epoch: Option<u64>,
+        commit_ts: Option<mongreldb_types::hlc::HlcTimestamp>,
+    ) {
         self.committed = true;
         if self.last_commit_statement_index != Some(statement_index) {
             self.committed_statements = self.committed_statements.saturating_add(1);
@@ -172,6 +183,9 @@ impl DurableOutcome {
         self.last_commit_statement_index = Some(statement_index);
         if epoch.is_some() {
             self.last_commit_epoch = epoch;
+        }
+        if commit_ts.is_some() {
+            self.commit_ts = commit_ts;
         }
     }
 }
@@ -1028,7 +1042,24 @@ impl RegisteredSqlQuery {
             .outcome
             .lock()
             .durable
-            .record_commit(statement_index, Some(epoch));
+            .record_commit(statement_index, Some(epoch), None);
+    }
+
+    /// [`Self::record_commit`] carrying the literal commit timestamp sourced
+    /// from core (a commit receipt, or `Database::commit_ts_for_epoch`), so
+    /// read-your-writes consumers can pin the exact write lineage instead of
+    /// a fresh-begin HLC. `None` behaves exactly like [`Self::record_commit`].
+    pub fn record_commit_with_ts(
+        &self,
+        statement_index: usize,
+        epoch: u64,
+        commit_ts: Option<mongreldb_types::hlc::HlcTimestamp>,
+    ) {
+        self.query
+            .outcome
+            .lock()
+            .durable
+            .record_commit(statement_index, Some(epoch), commit_ts);
     }
 
     pub fn durable_outcome(&self) -> DurableOutcome {
@@ -1986,6 +2017,33 @@ mod tests {
     }
 
     #[test]
+    fn record_commit_with_ts_surfaces_the_literal_commit_timestamp() {
+        let registry = Arc::new(SqlQueryRegistry::default());
+        let query = registry.register(SqlQueryOptions::default()).unwrap();
+        query
+            .transition(SqlQueryPhase::Queued, SqlQueryPhase::Executing)
+            .unwrap();
+        let commit_ts = mongreldb_types::hlc::HlcTimestamp {
+            physical_micros: 1_234_567,
+            logical: 3,
+            node_tiebreaker: 9,
+        };
+        query.begin_statement(0);
+        query.record_commit_with_ts(0, 41, Some(commit_ts));
+        let outcome = query.durable_outcome();
+        assert!(outcome.committed);
+        assert_eq!(outcome.last_commit_epoch, Some(41));
+        assert_eq!(outcome.commit_ts, Some(commit_ts));
+        // A later epoch-only record (the convenience path) keeps the literal
+        // timestamp of the last ts-carrying commit.
+        query.begin_statement(1);
+        query.record_commit(1, 42);
+        let outcome = query.durable_outcome();
+        assert_eq!(outcome.last_commit_epoch, Some(42));
+        assert_eq!(outcome.commit_ts, Some(commit_ts));
+    }
+
+    #[test]
     fn guard_cleans_up_dropped_execution_without_raw_sql() {
         let registry = Arc::new(SqlQueryRegistry::default());
         let query = registry
@@ -2048,6 +2106,7 @@ mod tests {
                 last_commit_epoch: Some(41),
                 first_commit_statement_index: Some(0),
                 last_commit_statement_index: Some(0),
+                commit_ts: None,
             }
         );
         assert_eq!(status.serialization_outcome, SerializationOutcome::Failed);

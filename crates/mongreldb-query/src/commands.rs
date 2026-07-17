@@ -30,9 +30,10 @@ use sqlparser::ast::{
     CreatePolicyCommand, CreatePolicyType, CreateTable, CreateTrigger, CreateView, DataType,
     Delete, DropPolicy, DropTrigger, Expr, FromTable, FunctionArg, FunctionArgExpr,
     FunctionArguments, Ident, IndexColumn, Insert, ObjectName, ObjectType, OnConflictAction,
-    OnInsert, Owner, Query, RenameTableNameKind, SetExpr, Statement, TableConstraint, TableFactor,
-    TableObject, TableWithJoins, TriggerEvent as SqlTriggerEvent, TriggerObject, TriggerObjectKind,
-    TriggerPeriod, Truncate, UnaryOperator, Value as SqlValue,
+    OnInsert, Owner, Query, RenameTableNameKind, Set, SetExpr, Statement, TableConstraint,
+    TableFactor, TableObject, TableWithJoins, TransactionIsolationLevel, TransactionMode,
+    TriggerEvent as SqlTriggerEvent, TriggerObject, TriggerObjectKind, TriggerPeriod, Truncate,
+    UnaryOperator, Value as SqlValue,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -677,6 +678,13 @@ pub(crate) async fn try_run_command(
     if let Some(batch) = try_manual_command(session, trimmed, &lower, query)? {
         return Ok(Some(batch));
     }
+    // SET TRANSACTION / SET SESSION CHARACTERISTICS drive the SQL transaction
+    // isolation level (S1B-002). Intercept them here: `should_parse` does not
+    // gate "set", and every other SET form must keep falling through to
+    // DataFusion untouched.
+    if lower.starts_with("set transaction ") || lower.starts_with("set session characteristics ") {
+        return run_set_transaction(session, trimmed);
+    }
     if !should_parse(trimmed) {
         return Ok(None);
     }
@@ -829,7 +837,8 @@ pub(crate) async fn try_run_command(
             truncate_tables(session, db, truncate, query)?;
             Vec::new()
         }
-        Statement::StartTransaction { .. } => {
+        Statement::StartTransaction { modes, .. } => {
+            let requested = sql_isolation_from_modes(&modes)?;
             let mut transaction = session.transaction.lock();
             if transaction.staged_ops.is_some() {
                 return Err(MongrelQueryError::Schema(
@@ -839,6 +848,16 @@ pub(crate) async fn try_run_command(
             transaction.staged_ops = Some(PendingSqlOps::default());
             transaction.aborted = false;
             transaction.savepoints.clear();
+            transaction.predicate_reads.clear();
+            // Explicit mode > pending SET TRANSACTION > session default. The
+            // resolved level stays recorded so a mid-transaction SET
+            // TRANSACTION can replace it and COMMIT can read it back.
+            let inherited = transaction.isolation.take();
+            transaction.isolation = Some(
+                requested
+                    .or(inherited)
+                    .unwrap_or_else(|| *session.session_isolation.read()),
+            );
             Vec::new()
         }
         Statement::Commit { chain, .. } => {
@@ -924,7 +943,11 @@ pub(crate) async fn try_run_command(
             };
             let committed = epoch.is_some();
             if let Some(epoch) = epoch {
-                query.record_commit(query.status().statement_index, epoch.0);
+                query.record_commit_with_ts(
+                    query.status().statement_index,
+                    epoch.0,
+                    db.commit_ts_for_epoch(epoch),
+                );
                 if let Err(error) = query.exit_commit_critical() {
                     return Err(query.commit_outcome_error(error.to_string()));
                 }
@@ -1018,6 +1041,101 @@ pub(crate) async fn try_run_command(
     };
 
     Ok(Some(out))
+}
+
+/// `SET TRANSACTION ...` / `SET SESSION CHARACTERISTICS AS TRANSACTION ...`:
+/// drive the SQL transaction isolation level (S1B-002). SET TRANSACTION
+/// applies to the open transaction (or pends for the next `BEGIN`); SET
+/// SESSION CHARACTERISTICS sets the session default for later transactions.
+/// Every other SET form falls through to DataFusion untouched.
+fn run_set_transaction(session: &MongrelSession, sql: &str) -> Result<Option<Vec<RecordBatch>>> {
+    let statements = Parser::parse_sql(&GenericDialect {}, sql)
+        .map_err(|e| MongrelQueryError::Schema(format!("SQL parse error: {e}")))?;
+    if statements.len() != 1 {
+        return Err(MongrelQueryError::Schema(
+            "expected exactly one statement".into(),
+        ));
+    }
+    let Some(Statement::Set(Set::SetTransaction {
+        modes,
+        snapshot,
+        session: session_wide,
+    })) = statements.first()
+    else {
+        return Err(MongrelQueryError::Schema(
+            "expected SET TRANSACTION or SET SESSION CHARACTERISTICS AS TRANSACTION".into(),
+        ));
+    };
+    if snapshot.is_some() {
+        return Err(MongrelQueryError::Schema(
+            "SET TRANSACTION SNAPSHOT is not supported".into(),
+        ));
+    }
+    if let Some(level) = sql_isolation_from_modes(modes)? {
+        session.set_sql_isolation(level, *session_wide);
+    }
+    Ok(Some(Vec::new()))
+}
+
+/// Map sqlparser transaction modes onto a core isolation level. Access
+/// modes and levels core does not implement are rejected rather than silently
+/// ignored (fail closed): `READ UNCOMMITTED` has no core counterpart, and a
+/// `READ ONLY` request would not be enforced by the staged-commit model.
+fn sql_isolation_from_modes(
+    modes: &[TransactionMode],
+) -> Result<Option<mongreldb_core::IsolationLevel>> {
+    let mut level = None;
+    for mode in modes {
+        match mode {
+            TransactionMode::IsolationLevel(isolation) => {
+                if level.is_some() {
+                    return Err(MongrelQueryError::Schema(
+                        "a transaction statement carries at most one isolation level".into(),
+                    ));
+                }
+                level = Some(match isolation {
+                    TransactionIsolationLevel::ReadCommitted => {
+                        mongreldb_core::IsolationLevel::ReadCommitted
+                    }
+                    TransactionIsolationLevel::RepeatableRead
+                    | TransactionIsolationLevel::Snapshot => {
+                        // Core's historical `Snapshot` name is a deprecated
+                        // RepeatableRead alias (`IsolationLevel::canonical`).
+                        mongreldb_core::IsolationLevel::RepeatableRead
+                    }
+                    TransactionIsolationLevel::Serializable => {
+                        mongreldb_core::IsolationLevel::Serializable
+                    }
+                    TransactionIsolationLevel::ReadUncommitted => {
+                        return Err(MongrelQueryError::Schema(
+                            "READ UNCOMMITTED is not supported; core implements READ COMMITTED, REPEATABLE READ, and SERIALIZABLE".into(),
+                        ));
+                    }
+                });
+            }
+            TransactionMode::AccessMode(_) => {
+                return Err(MongrelQueryError::Schema(
+                    "transaction access modes (READ ONLY / READ WRITE) are not supported".into(),
+                ));
+            }
+        }
+    }
+    Ok(level)
+}
+
+/// Whether the session's principal is the database's own stored principal,
+/// compared by catalog identity. The serializable commit path begins its core
+/// transaction with `Database::begin_with_isolation`, which takes the
+/// database principal; it must not silently commit under a different
+/// identity than the session's.
+fn session_principal_matches_database(session: &MongrelSession, db: &Database) -> bool {
+    match (session.principal(), db.principal_snapshot()) {
+        (None, None) => true,
+        (Some(session), Some(database)) => {
+            session.user_id == database.user_id && session.created_epoch == database.created_epoch
+        }
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -5975,6 +6093,9 @@ async fn update_rows(
     if let Some(entry) = db.external_table(&table) {
         return update_external_rows(session, db, &entry, update, query);
     }
+    // The matched-row scan below is a predicate read of the target table;
+    // feed it into SSI certification when running serializable (S1B-002).
+    session.record_serializable_table_read(&table);
     let limit = update.limit.as_ref().and_then(expr_to_usize);
     if update.order_by.is_empty() {
         let mut ops = PendingSqlOps::default();
@@ -6088,6 +6209,9 @@ async fn delete_rows(
     if let Some(entry) = db.external_table(&table) {
         return delete_external_rows(session, db, &entry, delete, query);
     }
+    // The matched-row scan below is a predicate read of the target table;
+    // feed it into SSI certification when running serializable (S1B-002).
+    session.record_serializable_table_read(&table);
     let limit = delete.limit.as_ref().and_then(expr_to_usize);
     if delete.order_by.is_empty() {
         let mut ops = PendingSqlOps::default();
@@ -6522,7 +6646,11 @@ fn stage_or_apply_spooled(
             return Err(error);
         }
     };
-    query.record_commit(query.status().statement_index, epoch.0);
+    query.record_commit_with_ts(
+        query.status().statement_index,
+        epoch.0,
+        db.commit_ts_for_epoch(epoch),
+    );
     if let Err(error) = query.exit_commit_critical() {
         return Err(query.commit_outcome_error(error.to_string()));
     }
@@ -6865,12 +6993,37 @@ fn apply_ops(
     if ops.is_empty() {
         return Ok(None);
     }
+    let (isolation, predicate_reads) = session.commit_isolation_and_predicate_reads();
     let bridge = QueryExternalTriggerBridge {
         db: Arc::clone(db),
         modules: Arc::clone(&session.external_modules),
         query: query.clone(),
     };
-    let mut tx = db.begin_with_external_trigger_bridge_as(&bridge, session.principal());
+    let mut tx = match isolation.canonical() {
+        mongreldb_core::IsolationLevel::Serializable => {
+            // SSI certification only runs when the commit carries
+            // `Serializable`, but core's bridged constructors begin at the
+            // default level, so a serializable SQL commit begins with
+            // `begin_with_isolation` instead. That forgoes the external
+            // trigger bridge — a trigger program writing an external table
+            // then fails closed with TriggerValidation — and the session
+            // principal override, so refuse to commit under a different
+            // identity than the session's.
+            if !session_principal_matches_database(session, db) {
+                return Err(MongrelQueryError::InvalidQueryState(
+                    "SERIALIZABLE SQL transactions require the session principal to be the database principal".into(),
+                ));
+            }
+            db.begin_with_isolation(mongreldb_core::IsolationLevel::Serializable)
+        }
+        _ => db.begin_with_external_trigger_bridge_as(&bridge, session.principal()),
+    };
+    // S1B-002 SSI feed: register the tables this SQL transaction scanned so
+    // core certification aborts on a phantom invalidation (table granularity,
+    // matching core).
+    for table in &predicate_reads {
+        tx.track_predicate_read(table)?;
+    }
     let mut ops = ops.reader()?.peekable();
     let mut op_index = 0_usize;
     while let Some(op) = ops.next() {
@@ -6910,6 +7063,7 @@ fn apply_ops(
         }
     }
     query.checkpoint()?;
+    session.fire_test_hook(SqlTestHookPoint::BeforeTransactionCommit);
     let mut fenced = false;
     let result = tx.commit_controlled(query.control(), || {
         enter_commit_fence(session, query).map_err(query_error_to_core)?;
@@ -10822,5 +10976,343 @@ mod tests {
             .unwrap();
         assert_eq!((ann.m, ann.ef_construction, ann.ef_search), (8, 32, 17));
         assert_eq!(ann.quantization, AnnQuantization::BinarySign);
+    }
+}
+
+#[cfg(test)]
+mod ssi_sql_tests {
+    //! Stage 1B follow-up: SQL-layer SSI integration. SQL transactions stage
+    //! their writes and commit them in one core transaction; at `Serializable`
+    //! the tables a transaction scanned are replayed into the commit
+    //! transaction's `track_predicate_read`, so core certification aborts a
+    //! commit whose read set a concurrent commit invalidated (write skew).
+
+    use super::*;
+    use crate::MongrelSession;
+
+    fn test_database() -> (tempfile::TempDir, Arc<Database>) {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Arc::new(Database::create(directory.path()).unwrap());
+        (directory, database)
+    }
+
+    async fn create_tables(database: &Arc<Database>) {
+        let bootstrap = MongrelSession::open(Arc::clone(database)).unwrap();
+        bootstrap
+            .run("CREATE TABLE t1 (id BIGINT PRIMARY KEY, v BIGINT)")
+            .await
+            .unwrap();
+        bootstrap
+            .run("CREATE TABLE t2 (id BIGINT PRIMARY KEY, v BIGINT)")
+            .await
+            .unwrap();
+    }
+
+    fn open_session(database: &Arc<Database>) -> MongrelSession {
+        MongrelSession::open(Arc::clone(database)).unwrap()
+    }
+
+    async fn begin_serializable(session: &MongrelSession) {
+        session.run("BEGIN").await.unwrap();
+        session
+            .run("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+            .await
+            .unwrap();
+    }
+
+    /// Classic write skew through SQL: each transaction reads the table the
+    /// other writes. The later commit must abort with
+    /// `MongrelError::SerializationFailure` — raised natively by core's
+    /// certification and carried through the query error boundary with the
+    /// precise taxonomy category 8.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serializable_write_skew_aborts_with_serialization_failure() {
+        let (_directory, database) = test_database();
+        create_tables(&database).await;
+        let session_one = open_session(&database);
+        let session_two = Arc::new(open_session(&database));
+
+        begin_serializable(&session_one).await;
+        begin_serializable(&session_two).await;
+        session_one.run("SELECT * FROM t2").await.unwrap();
+        session_one
+            .run("INSERT INTO t1 VALUES (1, 10)")
+            .await
+            .unwrap();
+        session_two.run("SELECT * FROM t1").await.unwrap();
+        session_two
+            .run("INSERT INTO t2 VALUES (2, 20)")
+            .await
+            .unwrap();
+
+        // Pause session_two's commit after its core transaction is built (the
+        // read epoch is pinned) but before certification, so session_one's
+        // commit lands deterministically inside the certification window.
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = parking_lot::Mutex::new(release_rx);
+        session_two.set_test_hook(Some(Arc::new(move |point| {
+            if point == SqlTestHookPoint::BeforeTransactionCommit {
+                paused_tx.send(()).expect("test listens");
+                release_rx.lock().recv().expect("test releases");
+            }
+        })));
+        let commit = tokio::spawn({
+            let session_two = Arc::clone(&session_two);
+            async move { session_two.run("COMMIT").await }
+        });
+        paused_rx.recv().unwrap();
+
+        session_one.run("COMMIT").await.unwrap();
+        release_tx.send(()).unwrap();
+
+        let outcome = commit.await.unwrap();
+        session_two.set_test_hook(None);
+        match outcome {
+            Err(MongrelQueryError::Core(mongreldb_core::MongrelError::SerializationFailure {
+                message,
+            })) => {
+                assert!(
+                    message.contains("invalidated this transaction's reads"),
+                    "core certification detail survives: {message}"
+                );
+                // The precise taxonomy category reaches the SQL caller: 8
+                // (SerializationFailure), not the generic conflict category.
+                assert_eq!(
+                    mongreldb_core::MongrelError::SerializationFailure { message }
+                        .category()
+                        .code(),
+                    8
+                );
+            }
+            other => panic!("expected SerializationFailure, got {other:?}"),
+        }
+
+        // The aborted transaction must roll back before the session is usable;
+        // a retried transaction with no concurrent writer commits.
+        session_two.run("ROLLBACK").await.unwrap();
+        begin_serializable(&session_two).await;
+        session_two.run("SELECT * FROM t1").await.unwrap();
+        session_two
+            .run("INSERT INTO t2 VALUES (2, 20)")
+            .await
+            .unwrap();
+        session_two.run("COMMIT").await.unwrap();
+        let batches = session_two.run("SELECT * FROM t2").await.unwrap();
+        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, 1);
+    }
+
+    /// The same interleave at the default RepeatableRead commits both sides:
+    /// the write sets are disjoint, so neither first-committer-wins nor any
+    /// read certification fires.
+    #[tokio::test]
+    async fn repeatable_read_write_skew_commits_both_sides() {
+        let (_directory, database) = test_database();
+        create_tables(&database).await;
+        let session_one = open_session(&database);
+        let session_two = open_session(&database);
+
+        for session in [&session_one, &session_two] {
+            session.run("BEGIN").await.unwrap();
+        }
+        session_one.run("SELECT * FROM t2").await.unwrap();
+        session_one
+            .run("INSERT INTO t1 VALUES (1, 10)")
+            .await
+            .unwrap();
+        session_two.run("SELECT * FROM t1").await.unwrap();
+        session_two
+            .run("INSERT INTO t2 VALUES (2, 20)")
+            .await
+            .unwrap();
+
+        session_one.run("COMMIT").await.unwrap();
+        session_two.run("COMMIT").await.unwrap();
+
+        let batches = session_one.run("SELECT * FROM t1").await.unwrap();
+        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, 1);
+        let batches = session_two.run("SELECT * FROM t2").await.unwrap();
+        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, 1);
+    }
+
+    /// `SET TRANSACTION` / `SET SESSION CHARACTERISTICS` / `START
+    /// TRANSACTION` drive the isolation level the commit path reads back.
+    #[tokio::test]
+    async fn sql_isolation_surface_drives_the_commit_isolation() {
+        let (_directory, database) = test_database();
+        create_tables(&database).await;
+        let session = open_session(&database);
+
+        // Default is RepeatableRead, core's default.
+        assert_eq!(
+            session.commit_isolation_and_predicate_reads().0,
+            mongreldb_core::IsolationLevel::RepeatableRead
+        );
+
+        // SET TRANSACTION pends for the next BEGIN.
+        session
+            .run("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+            .await
+            .unwrap();
+        assert_eq!(
+            session.commit_isolation_and_predicate_reads().0,
+            mongreldb_core::IsolationLevel::Serializable
+        );
+        session.run("BEGIN").await.unwrap();
+        assert_eq!(
+            session.commit_isolation_and_predicate_reads().0,
+            mongreldb_core::IsolationLevel::Serializable
+        );
+        session.run("INSERT INTO t1 VALUES (1, 10)").await.unwrap();
+        session.run("COMMIT").await.unwrap();
+        // COMMIT consumed the pending override; the session default returns.
+        assert_eq!(
+            session.commit_isolation_and_predicate_reads().0,
+            mongreldb_core::IsolationLevel::RepeatableRead
+        );
+
+        // START TRANSACTION carries the mode inline; ROLLBACK clears it.
+        session
+            .run("START TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+            .await
+            .unwrap();
+        assert_eq!(
+            session.commit_isolation_and_predicate_reads().0,
+            mongreldb_core::IsolationLevel::Serializable
+        );
+        session.run("ROLLBACK").await.unwrap();
+        assert_eq!(
+            session.commit_isolation_and_predicate_reads().0,
+            mongreldb_core::IsolationLevel::RepeatableRead
+        );
+
+        // SET SESSION CHARACTERISTICS sets the default for later
+        // transactions; an explicit mode overrides it for one transaction.
+        session
+            .run("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            .await
+            .unwrap();
+        session.run("BEGIN").await.unwrap();
+        assert_eq!(
+            session.commit_isolation_and_predicate_reads().0,
+            mongreldb_core::IsolationLevel::ReadCommitted
+        );
+        session.run("ROLLBACK").await.unwrap();
+        session
+            .run("START TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .await
+            .unwrap();
+        assert_eq!(
+            session.commit_isolation_and_predicate_reads().0,
+            mongreldb_core::IsolationLevel::RepeatableRead
+        );
+        session.run("ROLLBACK").await.unwrap();
+
+        // Unsupported modes fail closed and leave the session state untouched.
+        assert!(session
+            .run("SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED")
+            .await
+            .is_err());
+        assert!(session.run("START TRANSACTION READ ONLY").await.is_err());
+        assert_eq!(
+            session.commit_isolation_and_predicate_reads().0,
+            mongreldb_core::IsolationLevel::ReadCommitted
+        );
+    }
+
+    /// Serializable transactions record table scans (DataFusion path) and
+    /// UPDATE/DELETE matched-row scans; weaker levels record nothing, and
+    /// `EXPLAIN` (which never executes its scan) records nothing.
+    #[tokio::test]
+    async fn serializable_transaction_records_scans_and_dml_read_sides() {
+        let (_directory, database) = test_database();
+        create_tables(&database).await;
+        let session = open_session(&database);
+        session.run("INSERT INTO t1 VALUES (1, 10)").await.unwrap();
+
+        // RepeatableRead records nothing.
+        session.run("BEGIN").await.unwrap();
+        session.run("SELECT * FROM t1").await.unwrap();
+        session
+            .run("UPDATE t1 SET v = 99 WHERE id >= 1")
+            .await
+            .unwrap();
+        assert!(session.commit_isolation_and_predicate_reads().1.is_empty());
+        session.run("ROLLBACK").await.unwrap();
+
+        // EXPLAIN never executes its scan: nothing to certify.
+        begin_serializable(&session).await;
+        session.run("EXPLAIN SELECT * FROM t1").await.unwrap();
+        assert!(session.commit_isolation_and_predicate_reads().1.is_empty());
+        session.run("ROLLBACK").await.unwrap();
+
+        // Serializable records the SELECT scan and the UPDATE matched-row scan.
+        begin_serializable(&session).await;
+        session.run("SELECT * FROM t1").await.unwrap();
+        session
+            .run("UPDATE t1 SET v = 99 WHERE id >= 1")
+            .await
+            .unwrap();
+        let (level, reads) = session.commit_isolation_and_predicate_reads();
+        assert_eq!(level, mongreldb_core::IsolationLevel::Serializable);
+        assert_eq!(reads, vec!["t1".to_string()]);
+        session.run("COMMIT").await.unwrap();
+        // COMMIT consumed the recorded set.
+        assert!(session.commit_isolation_and_predicate_reads().1.is_empty());
+    }
+
+    /// Two writers interleaved on a LockManager deadlock; the deterministic
+    /// victim's `LockError::Deadlock` surfaces at the SQL error boundary as
+    /// `MongrelError::Deadlock` (taxonomy category 9). SQL `FOR UPDATE` is
+    /// not wired to the lock manager this wave, so the interleave is driven
+    /// directly.
+    #[test]
+    fn lock_manager_deadlock_surfaces_as_deadlock_at_the_sql_boundary() {
+        use mongreldb_core::locks::{LockKey, LockManager, LockMode, LockRequest};
+        use mongreldb_core::{ExecutionControl, RowId};
+
+        fn request(txn_id: u64) -> LockRequest {
+            LockRequest::new(txn_id, LockMode::Exclusive, ExecutionControl::new(None))
+        }
+
+        let manager = Arc::new(LockManager::new());
+        let key_a = LockKey::row(1, RowId(1));
+        let key_b = LockKey::row(1, RowId(2));
+        manager.acquire(key_a.clone(), request(1)).unwrap();
+        manager.acquire(key_b.clone(), request(2)).unwrap();
+
+        // t1 blocks on B; t2's request for A closes the cycle. Victim
+        // selection (youngest) dooms t2 regardless of which request lands
+        // first, so no sequencing is needed.
+        let waiter = std::thread::spawn({
+            let manager = Arc::clone(&manager);
+            let key_b = key_b.clone();
+            move || manager.acquire(key_b, request(1))
+        });
+        let error = manager.acquire(key_a, request(2)).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                mongreldb_core::locks::LockError::Deadlock { victim: 2, .. }
+            ),
+            "youngest transaction is the deterministic victim: {error:?}"
+        );
+
+        let query_error = MongrelQueryError::from(mongreldb_core::MongrelError::from(error));
+        assert!(
+            matches!(
+                query_error,
+                MongrelQueryError::Core(mongreldb_core::MongrelError::Deadlock { victim: 2, .. })
+            ),
+            "the SQL boundary surfaces the precise deadlock variant: {query_error:?}"
+        );
+
+        // The victim aborts; the survivor's wait completes.
+        manager.release_all(2);
+        assert_eq!(waiter.join().unwrap(), Ok(()));
+        manager.release_all(1);
     }
 }

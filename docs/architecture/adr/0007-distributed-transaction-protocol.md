@@ -1,6 +1,6 @@
 # ADR-0007: Distributed Transaction Protocol
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-07-17
 - Spec references: §8 (MVCC timestamp model), §12.8 (Stage 3H distributed transaction protocol), §10.2 (Stage 1B single-node transaction model)
 

@@ -1,6 +1,6 @@
 # ADR-0006: Tablet Partitioning Model
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-07-17
 - Spec references: §12.1 (Stage 3A meta control plane), §12.2 (Stage 3B partitioning), §12.5/§12.6 (tablet split/merge)
 

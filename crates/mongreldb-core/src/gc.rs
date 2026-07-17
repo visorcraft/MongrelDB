@@ -17,6 +17,20 @@ pub struct GcReport {
     pub bytes_freed: u64,
 }
 
+/// Outcome of a [`Table::gc_versions`] pass (S1C-004).
+#[derive(Debug, Clone)]
+pub struct GcVersionsReport {
+    /// The unified version-retention floor the pass consulted: the oldest
+    /// epoch still held by ANY pin source (oldest active transaction
+    /// snapshot, configured history retention, and every registered
+    /// backup/PITR, replication, cursor/read-generation, and
+    /// online-index-build pin).
+    pub floor: crate::epoch::Epoch,
+    /// Retiring runs physically reaped because their `retire_epoch` was at or
+    /// below `floor`.
+    pub runs_reaped: usize,
+}
+
 /// Outcome of a [`Table::check`] pass.
 #[derive(Debug, Default, Clone)]
 pub struct CheckReport {
@@ -98,6 +112,25 @@ impl Table {
             }
         }
         Ok(report)
+    }
+
+    /// Reclaim retiring runs gated on the unified version-retention floor
+    /// (S1C-004). The floor — [`Table::version_gc_floor`] — is the oldest
+    /// epoch held by ANY pin source: the oldest active transaction snapshot,
+    /// the configured history-retention window, and every pin registered in
+    /// the table's [`crate::retention::PinRegistry`] (backup/PITR,
+    /// replication, cursor/read-generation, online-index-build). A retiring
+    /// run is reaped only when its `retire_epoch` is at or below that floor,
+    /// so no pin source can lose versions it still reads.
+    ///
+    /// The `Database`-level backup run-file pins (`backup_pins`) are still
+    /// consulted by the `Database` GC/checkpoint paths; merging that
+    /// mechanism into the [`crate::retention::PinRegistry`] is a documented
+    /// follow-up.
+    pub fn gc_versions(&mut self) -> Result<GcVersionsReport> {
+        let floor = self.version_gc_floor();
+        let runs_reaped = self.reap_retiring(floor, &std::collections::HashSet::new())?;
+        Ok(GcVersionsReport { floor, runs_reaped })
     }
 
     /// Verify every manifest-referenced run's footer checksum.
@@ -201,5 +234,76 @@ mod tests {
         let check = db.check().unwrap();
         assert_eq!(check.runs_checked, 1);
         assert!(!check.issues.is_empty(), "corruption must be flagged");
+    }
+
+    /// S1C-004: every pin source blocks version GC while held; reclamation
+    /// proceeds once the pin is released.
+    #[test]
+    fn gc_versions_blocked_by_each_pin_source_and_reclaims_after_release() {
+        use crate::epoch::Epoch;
+        use crate::retention::PinSource;
+
+        let dir = tempdir().unwrap();
+        let mut db = Table::create(dir.path(), schema(), 1).unwrap();
+        db.set_mutable_run_spill_bytes(1);
+        db.put(vec![(1, Value::Int64(1))]).unwrap();
+        db.flush().unwrap(); // run 1
+        db.put(vec![(1, Value::Int64(2))]).unwrap();
+        db.flush().unwrap(); // run 2
+        db.compact().unwrap(); // merged run 3; runs 1+2 retiring at epoch 2
+        assert_eq!(db.run_count(), 1);
+        assert_eq!(db.current_epoch(), Epoch(2));
+
+        for source in PinSource::ALL {
+            let guard = db.pin_registry().pin(source, Epoch(1));
+            assert_eq!(
+                db.version_gc_floor(),
+                Epoch(1),
+                "{source:?} pin must lower the reclamation floor"
+            );
+            let report = db.gc_versions().unwrap();
+            assert_eq!(report.floor, Epoch(1));
+            assert_eq!(
+                report.runs_reaped, 0,
+                "{source:?} pin must block retiring-run reclamation"
+            );
+            drop(guard);
+        }
+
+        // No pins left: the floor returns to the visible epoch (2), which is
+        // at the retire epoch — both superseded runs are reclaimed.
+        assert_eq!(db.version_gc_floor(), Epoch(2));
+        let report = db.gc_versions().unwrap();
+        assert_eq!(report.runs_reaped, 2, "all retiring runs reaped");
+    }
+
+    /// S1C-004 diagnostics: local snapshot pins project as the transaction
+    /// source; registered pins appear with their own source and epoch.
+    #[test]
+    fn version_pins_report_lists_registered_and_projected_sources() {
+        use crate::epoch::Epoch;
+        use crate::retention::PinSource;
+
+        let dir = tempdir().unwrap();
+        let mut db = Table::create(dir.path(), schema(), 1).unwrap();
+        db.put(vec![(1, Value::Int64(1))]).unwrap();
+        db.commit().unwrap();
+        assert!(db.version_pins_report().is_empty());
+
+        let snapshot = db.pin_snapshot();
+        let backup = db.pin_registry().pin(PinSource::BackupPitr, Epoch(0));
+        let report = db.version_pins_report();
+        assert_eq!(report.len(), 2);
+        let transaction = report.get(PinSource::TransactionSnapshot).unwrap();
+        assert_eq!(transaction.oldest_epoch, snapshot.epoch);
+        assert_eq!(transaction.pin_count, 0, "projection carries no guard");
+        let backup_info = report.get(PinSource::BackupPitr).unwrap();
+        assert_eq!(backup_info.oldest_epoch, Epoch(0));
+        assert_eq!(backup_info.pin_count, 1);
+        assert_eq!(report.oldest_epoch(), Some(Epoch(0)));
+
+        drop(backup);
+        db.unpin_snapshot(snapshot);
+        assert!(db.version_pins_report().is_empty());
     }
 }

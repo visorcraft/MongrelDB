@@ -2,8 +2,8 @@
 
 MongrelDB point-in-time recovery (PITR) combines a consistent online base
 backup with transaction-complete logical WAL chunks. Applications can restore
-the latest archived state, a committed epoch, or the last commit at or before a
-timestamp.
+the latest archived state, a committed epoch, the last commit at or before a
+timestamp, an exact transaction ID, or a WAL log position.
 
 ## Create and update an archive
 
@@ -53,6 +53,19 @@ let restored_epoch = restore_pitr(
     "./pitr",
     "./restored-at-time",
     PitrTarget::TimestampNanos(1_750_000_000_000_000_000),
+)?;
+
+let restored_epoch = restore_pitr(
+    "./pitr",
+    "./restored-at-txn",
+    PitrTarget::TransactionId(4294967300),
+    PitrCredentials::None,
+)?;
+
+let restored_epoch = restore_pitr(
+    "./pitr",
+    "./restored-at-position",
+    PitrTarget::LogPosition(1_048_576),
     PitrCredentials::None,
 )?;
 # Ok::<(), mongreldb_core::MongrelError>(())
@@ -60,7 +73,16 @@ let restored_epoch = restore_pitr(
 
 An epoch target that falls between committed epochs resolves to the preceding
 commit. A timestamp target resolves to the last commit whose stored timestamp
-is not later than the requested timestamp.
+is not later than the requested timestamp. A transaction-id target resolves to
+the exact commit of that transaction through the archive's commit ledger
+(transaction IDs are scoped by the source database's open generation). A
+log-position target resolves to the newest commit whose WAL record sequence is
+at or below the position; positions inside the base backup resolve to the base
+boundary. Both ledger targets fail closed on archives written before the
+ledger existed. `mongreldb_core::pitr::restore_pitr_validated` additionally
+returns a `RestoreReport` summarizing the post-restore validation pass (run
+checksums, catalog load, manifest consistency); the same pass runs inside
+every restore and aborts publication on corruption.
 
 For an encrypted database, supply the original database passphrase:
 
@@ -92,6 +114,12 @@ New archives use PITR format version 2.
   files, including injected WAL files, fail closed.
 - Chunk references form a SHA-256 chain rooted at the base backup boundary and
   base-backup manifest checksum.
+- Each chunk reference carries a commit ledger parallel to its commit list:
+  the committing transaction ID and the WAL record sequence (log position) of
+  every commit. Restore cross-checks recorded ledger entries against the chunk
+  bodies. The ledger lives only in the JSON manifest; chunk binary layouts are
+  unchanged, and archives without it remain restorable at epoch, timestamp,
+  and latest targets.
 - Restore validates paths, ordering, ranges, counts, checksums, chain links,
   commit markers, transaction completeness, timestamps, and chunk bodies.
 - Missing, duplicated, reordered, substituted, truncated, or rewritten chunks
@@ -135,7 +163,10 @@ backup, manifest, requested target, chunk chain, chunk bodies, replay result,
 and optional final credentials before atomically publishing the destination.
 On a normal validation or authentication failure, the requested destination is
 not created. A restore destination inside the archive is rejected so staging
-cannot recursively copy or modify its own source.
+cannot recursively copy or modify its own source. A restore never happens in
+place over a running database: a destination whose `_meta/.lock` is held by a
+live database handle is refused with `DatabaseLocked` before any staging work
+begins, and an existing destination of any kind conflicts.
 
 Archive, restore, and staging roots are descriptor-pinned. Manifest, chunk,
 lock, copy, cleanup, and publication operations are root-relative and refuse
@@ -152,3 +183,4 @@ pinning and no-follow traversal prevent path redirection, but they cannot make
 a directory safe from an arbitrary process running as the same OS user with
 permission to rename and rewrite every entry. Do not allow concurrent writers
 other than the archiving daemon.
+

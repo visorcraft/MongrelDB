@@ -13,8 +13,8 @@ use crate::error::{MongrelError, Result};
 use crate::external_table::ExternalTableEntry;
 use crate::memtable::Value;
 use crate::procedure::{
-    ProcedureCallOutput, ProcedureCallResult, ProcedureCallRow, ProcedureCondition, ProcedureEntry,
-    ProcedureStep, ProcedureValue, StoredProcedure,
+    ProcedureCallOutput, ProcedureCallResult, ProcedureCallRow, ProcedureCondition, ProcedureStep,
+    ProcedureValue, StoredProcedure,
 };
 use crate::retention::{OwnedSnapshotGuard, SnapshotGuard, SnapshotRegistry};
 use crate::rowid::RowId;
@@ -1416,6 +1416,16 @@ pub struct OpenOptions {
     /// same process always returns `DatabaseLocked` immediately; share the
     /// existing `Arc<Database>` instead.
     pub lock_timeout_ms: u32,
+    /// Total bytes the storage core's [`crate::memory::MemoryGovernor`] may
+    /// hand out across every memory class (S1E-003). `None` (the default)
+    /// uses [`DEFAULT_MEMORY_BUDGET_BYTES`]. The governor is a reservation
+    /// accounting layer, not an allocation: this is a cap, not a preallocation.
+    pub memory_budget_bytes: Option<u64>,
+    /// Total bytes of live spill files the core's
+    /// [`crate::spill::SpillManager`] allows across every query (S1E-004).
+    /// `None` (the default) uses [`DEFAULT_TEMP_DISK_BUDGET_BYTES`]. Again a
+    /// cap, not a preallocation.
+    pub temp_disk_budget_bytes: Option<u64>,
 }
 
 impl OpenOptions {
@@ -1425,13 +1435,105 @@ impl OpenOptions {
         self.lock_timeout_ms = ms;
         self
     }
+
+    /// Set [`OpenOptions::memory_budget_bytes`].
+    pub fn with_memory_budget_bytes(mut self, bytes: u64) -> Self {
+        self.memory_budget_bytes = Some(bytes);
+        self
+    }
+
+    /// Set [`OpenOptions::temp_disk_budget_bytes`].
+    pub fn with_temp_disk_budget_bytes(mut self, bytes: u64) -> Self {
+        self.temp_disk_budget_bytes = Some(bytes);
+        self
+    }
 }
 
-/// A multi-table database: one catalog, one epoch clock, shared caches, a
-/// shared WAL, and a live map of name → `Arc<Table>`.
-pub struct Database {
+/// Default node-level memory budget (S1E-003): 1 GiB. Comfortably covers the
+/// two 64 MiB caches with headroom for query execution, result buffering, and
+/// maintenance reservations.
+pub const DEFAULT_MEMORY_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Default node-level temporary-disk (spill) budget (S1E-004): 4 GiB of live
+/// spill files across every query on the core.
+pub const DEFAULT_TEMP_DISK_BUDGET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Resolved node-level resource budgets for one storage core
+/// (S1E-003/S1E-004), threaded from [`OpenOptions`] through the open chain
+/// into [`Database::finish_open`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CoreResourceConfig {
+    pub memory_budget_bytes: u64,
+    pub temp_disk_budget_bytes: u64,
+}
+
+impl Default for CoreResourceConfig {
+    fn default() -> Self {
+        Self {
+            memory_budget_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
+            temp_disk_budget_bytes: DEFAULT_TEMP_DISK_BUDGET_BYTES,
+        }
+    }
+}
+
+impl CoreResourceConfig {
+    fn from_options(options: &OpenOptions) -> Result<Self> {
+        let config = Self {
+            memory_budget_bytes: options
+                .memory_budget_bytes
+                .unwrap_or(DEFAULT_MEMORY_BUDGET_BYTES),
+            temp_disk_budget_bytes: options
+                .temp_disk_budget_bytes
+                .unwrap_or(DEFAULT_TEMP_DISK_BUDGET_BYTES),
+        };
+        if config.memory_budget_bytes == 0 {
+            return Err(MongrelError::InvalidArgument(
+                "memory_budget_bytes must be nonzero".into(),
+            ));
+        }
+        if config.temp_disk_budget_bytes == 0 {
+            return Err(MongrelError::InvalidArgument(
+                "temp_disk_budget_bytes must be nonzero".into(),
+            ));
+        }
+        Ok(config)
+    }
+}
+
+/// Per-table version-retention pin diagnostics (S1C-004): one mounted table's
+/// active pin sources as reported by [`crate::engine::Table::version_pins_report`].
+#[derive(Debug, Clone)]
+pub struct TablePinsReport {
+    /// The mounted table's id.
+    pub table_id: u64,
+    /// The mounted table's catalog name.
+    pub table: String,
+    /// Every active version-retention pin source on the table.
+    pub pins: crate::retention::PinsReport,
+}
+
+/// The shared storage core (spec §10.1, S1A-001): one catalog, one epoch
+/// clock, shared caches, a shared WAL, and a live map of name → `Arc<Table>`.
+///
+/// `DatabaseCore` owns every storage resource — the durable root, the
+/// exclusive lease, the catalog, the commit log, the epoch authority, the
+/// transaction state, the mounted tables, and the page caches — plus the
+/// lifecycle state machine (S1A-004). It is shared through an `Arc`: the
+/// exclusive [`Database`] owner holds one reference, and every
+/// [`crate::handle::DatabaseHandle`] issued by
+/// [`crate::manager::DatabaseManager`] holds another. The core deliberately
+/// does **not** store one mutable "current principal" (spec §4.6): per-caller
+/// identity lives on the handle types, not inside shared storage state.
+pub struct DatabaseCore {
     root: PathBuf,
     durable_root: Arc<crate::durable_file::DurableRoot>,
+    /// Lifecycle state machine (spec §10.1, S1A-004). Shared through an `Arc`
+    /// so [`crate::core::OperationGuard`]s are `'static` and thread-safe.
+    lifecycle: Arc<crate::core::LifecycleController>,
+    /// Set by [`crate::manager::DatabaseManager`] when this core backs shared
+    /// handles: lets `shutdown()` transition the registry entry through
+    /// `Closing` to removal. `None` for exclusively-owned cores.
+    registry: std::sync::OnceLock<crate::manager::CoreRegistration>,
     /// Set by `_meta/replica`; user writes are rejected on follower copies.
     read_only: bool,
     catalog: RwLock<Catalog>,
@@ -1440,8 +1542,20 @@ pub struct Database {
     rls_cache: Mutex<RlsCache>,
     epoch: Arc<EpochAuthority>,
     snapshots: Arc<SnapshotRegistry>,
+    /// S1E-003: the node-level memory governor for this core. Exactly one per
+    /// core; both caches below hold reservations under it and are registered
+    /// as reclaimable subsystems it can evict under pressure (escalation
+    /// step 2).
+    memory_governor: crate::memory::MemoryGovernor,
     page_cache: Arc<crate::cache::Sharded<crate::cache::PageCache>>,
     decoded_cache: Arc<crate::cache::Sharded<crate::cache::DecodedPageCache>>,
+    /// S1E-004: the node-level spill manager, rooted at `<db-root>/temp/spill`
+    /// and sealed with the database meta DEK when encryption is enabled. Its
+    /// startup sweep ran during open; per-query sessions draw from it.
+    spill_manager: crate::spill::SpillManager,
+    /// S1F-002: the durable job registry (sibling `JOBS` file). Exactly one
+    /// per core; jobs recovered mid-`Running` by a crash come back `Paused`.
+    job_registry: Arc<crate::jobs::JobRegistry>,
     commit_lock: Arc<Mutex<()>>,
     /// One shared WAL multiplexing every table's records (spec §7.2). Owned
     /// behind a `Mutex` so the transaction layer can append + group-sync. Shared
@@ -1467,6 +1581,12 @@ pub struct Database {
     /// P3.1: min read_epoch of all in-flight txns, drives conflict-index
     /// pruning (spec §9.2, review fix #12).
     active_txns: crate::txn::ActiveTxns,
+    /// S1B-003: the core's key/predicate lock manager. One per core; commits
+    /// acquire unique-constraint key claims, FK parent-protection holds,
+    /// sequence-allocation barriers, and the DML Shared hold on the schema
+    /// barrier (DDL takes it Exclusive), all released when the transaction
+    /// ends.
+    lock_manager: Arc<crate::locks::LockManager>,
     /// P3.2: set on fsync error — all subsequent writes fail fast (spec §9.3e).
     /// Shared with mounted tables so a single-table commit also honors poison.
     poisoned: Arc<std::sync::atomic::AtomicBool>,
@@ -1479,6 +1599,23 @@ pub struct Database {
     /// group-commit durability through it, and reader-visibility publication
     /// (`publish_in_order`) is gated on its commit receipts.
     commit_log: Arc<crate::commit_log::StandaloneCommitLog>,
+    /// The node's single HLC timestamp authority (spec §4.1, §8.2; ADR-0003).
+    /// Transaction read timestamps are captured at `begin`, and commit
+    /// timestamps are allocated here under the sequencer lock (strictly after
+    /// every participant read/write timestamp). `Epoch` remains the
+    /// reader-visibility counter during the dual-model migration.
+    hlc: Arc<mongreldb_types::hlc::HlcClock>,
+    /// S1B-005: durable idempotency ledger for keyed remote writes, persisted
+    /// in the sibling `TXN_IDEMPOTENCY` file (mirroring `jobs.rs`'s `JOBS`).
+    idempotency: crate::txn::IdempotencyLedger,
+    /// Per-open epoch → commit-timestamp ledger backing
+    /// [`Database::commit_ts_for_epoch`]. Commits sealed within this open
+    /// record the exact receipt `HlcTimestamp`; commits recovered from the
+    /// durable `Op::CommitTimestamp` WAL ledger at open reconstruct the
+    /// physical component only (`logical`/`node_tiebreaker` are 0 — the
+    /// ledger byte format stores micros). Bounded to the newest
+    /// [`COMMIT_TS_LEDGER_CAP`] epochs.
+    commit_ts_ledger: Mutex<std::collections::BTreeMap<u64, mongreldb_types::hlc::HlcTimestamp>>,
     /// P3.6: txn ids currently spilling into `_txn/<id>/`. GC never deletes a
     /// live spill's pending dir (review fix #14, spec §6.4).
     active_spills: Arc<crate::retention::ActiveSpills>,
@@ -1506,6 +1643,13 @@ pub struct Database {
     /// copied. Lets tests compact+GC the source at the worst possible moment.
     #[doc(hidden)]
     backup_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// Test seam invoked after each successful FK parent-protection lock
+    /// acquisition inside constraint validation, so tests can rendezvous two
+    /// committing transactions into a deterministic wait-for cycle. Behind an
+    /// `Arc` so firing never holds the slot's mutex — concurrent commits (and
+    /// a hook that itself parks) must not serialize on it.
+    #[doc(hidden)]
+    fk_lock_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     replication_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     trigger_recursive: AtomicBool,
     trigger_max_depth: AtomicU32,
@@ -1516,7 +1660,24 @@ pub struct Database {
     /// Commit-time wake-up for durable CDC consumers. Payloads are reconstructed
     /// from the WAL, so lagged receivers lose only a wake-up, never data.
     change_wake: tokio::sync::broadcast::Sender<()>,
-    /// The authenticated principal for this handle. `None` on databases
+    /// Final field so every storage resource drops before the exclusive lease.
+    /// Behind a `Mutex<Option<_>>` so `shutdown()` can release the file lock
+    /// (spec §10.1, S1A-004 step 7) while handles still reference the core.
+    _lock: Mutex<Option<ExclusiveDatabaseLease>>,
+}
+
+/// The exclusive public owner of one [`DatabaseCore`] (spec §10.1, S1A-001).
+///
+/// `Database::open`/`create*` build exactly one core for a root and reject any
+/// other core — exclusive or shared — for the same root (spec §2.6). All
+/// storage state lives on the core; this type adds the owner-bound identity
+/// context (the cached principal and the shared auth state used by the
+/// embedded enforcement path). Method calls and field reads transparently
+/// reach the core through `Deref`, so existing `Database` call sites are
+/// unchanged.
+pub struct Database {
+    core: Arc<DatabaseCore>,
+    /// The authenticated principal for this owner. `None` on databases
     /// opened without credentials (the default — `require_auth = false`),
     /// `Some` on credentialed opens. Consulted by every enforcement point
     /// when the catalog's `require_auth` flag is set. Behind an `RwLock`
@@ -1532,13 +1693,41 @@ pub struct Database {
     /// to `Database` (which would create a cycle). `AuthState` is already
     /// cheaply cloneable (inner `Arc`), so no outer `Arc` is needed.
     auth_state: crate::auth_state::AuthState,
-    /// Final field so every storage resource drops before the exclusive lease.
-    _lock: Option<ExclusiveDatabaseLease>,
+    /// `true` when this value is a manager-issued facade over a shared core
+    /// (Stage 1A): dropping it has no storage side effects, `shutdown()`
+    /// rejects, and auth-mode transitions are refused so one handle cannot
+    /// flip the shared core into an enforcement mode other handles cannot
+    /// observe (fail closed; per-handle enforcement lands with Stage 1D
+    /// sessions).
+    shared: bool,
+}
+
+impl std::ops::Deref for Database {
+    type Target = DatabaseCore;
+
+    fn deref(&self) -> &DatabaseCore {
+        &self.core
+    }
 }
 
 struct RunPins {
     pins: Arc<Mutex<HashMap<(u64, u128), usize>>>,
     runs: Vec<(u64, u128)>,
+}
+
+/// RAII proof that one transaction's lock holds release when the scope that
+/// acquired them exits (S1B-004 step 12). Used by the commit path (covers
+/// success, validation failure, and poison alike) and by DDL entry points
+/// holding the Exclusive schema barrier.
+struct TxnLockGuard<'a> {
+    locks: &'a crate::locks::LockManager,
+    txn_id: u64,
+}
+
+impl Drop for TxnLockGuard<'_> {
+    fn drop(&mut self) {
+        self.locks.release_all(self.txn_id);
+    }
 }
 
 struct BackupFilePins {
@@ -1638,18 +1827,29 @@ impl std::fmt::Debug for Database {
     }
 }
 
-impl Database {
-    pub fn open_metrics() -> DatabaseOpenMetrics {
-        DatabaseOpenMetrics {
-            lock_waits: DATABASE_OPEN_WAIT_COUNT.load(Ordering::Relaxed),
-            failures: DATABASE_OPEN_FAILURE_COUNT.load(Ordering::Relaxed),
-        }
+/// Manual `Debug` for `DatabaseCore`, mirroring `Database`'s (see above). The
+/// core has no cached principal by design (spec §4.6).
+impl std::fmt::Debug for DatabaseCore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let cat = self.catalog.read();
+        f.debug_struct("DatabaseCore")
+            .field("root", &self.root)
+            .field("lifecycle", &self.lifecycle.state())
+            .field("db_epoch", &cat.db_epoch)
+            .field("tables", &cat.tables.len())
+            .field("visible_epoch", &self.epoch.visible().0)
+            .field("encrypted", &self.kek.is_some())
+            .field("require_auth", &cat.require_auth)
+            .finish()
     }
+}
 
+impl DatabaseCore {
     fn ensure_owner_process(&self) -> Result<()> {
         let current_pid = std::process::id();
         let owner_pid = self
             ._lock
+            .lock()
             .as_ref()
             .map(|lease| lease.owner_pid)
             .unwrap_or(current_pid);
@@ -1663,11 +1863,186 @@ impl Database {
         }
     }
 
+    /// The canonical filesystem root this core was opened at.
+    pub fn root(&self) -> &Path {
+        self.durable_root.canonical_path()
+    }
+
+    /// The stable directory-handle identity of this core's root (S1A-003).
+    pub fn file_identity(&self) -> Result<crate::core::DatabaseFileIdentity> {
+        crate::core::DatabaseFileIdentity::from_durable_root(&self.durable_root)
+    }
+
+    /// The current lifecycle state (S1A-004).
+    pub fn lifecycle_state(&self) -> crate::core::LifecycleState {
+        self.lifecycle.state()
+    }
+
+    /// Whether this core currently admits new operations.
+    pub fn is_open(&self) -> bool {
+        self.lifecycle.is_open()
+    }
+
+    /// Admit one operation against this core (S1A-004: "every operation holds
+    /// an `OperationGuard`"). Rejected unless the core is
+    /// [`crate::core::LifecycleState::Open`].
+    pub fn operation_guard(self: &Arc<Self>) -> Result<crate::core::OperationGuard> {
+        self.lifecycle.begin_operation()
+    }
+
+    /// Register this core with the [`crate::manager::DatabaseManager`] that
+    /// initialized it (S1A-002). Called once, before the first handle is
+    /// handed out.
+    pub(crate) fn set_registry(
+        &self,
+        registration: crate::manager::CoreRegistration,
+    ) -> Result<()> {
+        self.registry
+            .set(registration)
+            .map_err(|_| MongrelError::Conflict("database core is already registry-bound".into()))
+    }
+
+    /// Ordered core shutdown (spec §10.1, S1A-004):
+    ///
+    /// 1. Transition `Open` → `Draining`.
+    /// 2. Reject new sessions and writes (new [`Self::operation_guard`]s fail
+    ///    from this point).
+    /// 3. Cancel non-commit-critical queries — a no-op in Stage 1A: the
+    ///    embedded core has no central query registry yet (Stage 1D adds one),
+    ///    and every in-flight operation is treated as commit-critical and
+    ///    drained rather than cancelled.
+    /// 4. Wait for in-flight operations, up to `drain_deadline`. On timeout
+    ///    the core stays `Draining` and a later call may resume the shutdown.
+    /// 5. Sync required durable state (group-sync the shared WAL).
+    /// 6. Stop workers — the Stage 1A core runs no background worker set.
+    /// 7. Release the file lock (and the process open-registry entries).
+    /// 8. Mark `Closed`.
+    ///
+    /// Repeated calls after `Closed` return `Ok(())`. Dropping one handle has
+    /// no storage side effects; only this method (or the last `Arc` drop)
+    /// closes storage.
+    pub fn shutdown(self: &Arc<Self>, drain_deadline: std::time::Duration) -> Result<()> {
+        self.ensure_owner_process()?;
+        let initiated = self.lifecycle.begin_shutdown();
+        if !initiated {
+            match self.lifecycle.state() {
+                crate::core::LifecycleState::Closed => return Ok(()),
+                // A concurrent or timed-out shutdown left the core draining;
+                // join it and drive the remaining steps.
+                crate::core::LifecycleState::Draining => {}
+                state => {
+                    return Err(MongrelError::Conflict(format!(
+                        "database core cannot shut down from lifecycle state {state}"
+                    )))
+                }
+            }
+        }
+        if let Some(registration) = self.registry.get() {
+            registration
+                .manager
+                .mark_closing(&registration.identity, self);
+        }
+        self.lifecycle.wait_drained(drain_deadline)?;
+        let sync = self.shared_wal.lock().group_sync().map(|_| ());
+        self.lifecycle.mark_closing();
+        let lease = self._lock.lock().take();
+        drop(lease);
+        if let Some(registration) = self.registry.get() {
+            registration
+                .manager
+                .entry_closed(&registration.identity, self);
+        }
+        self.lifecycle.mark_closed();
+        sync
+    }
+}
+
+impl Database {
+    pub fn open_metrics() -> DatabaseOpenMetrics {
+        DatabaseOpenMetrics {
+            lock_waits: DATABASE_OPEN_WAIT_COUNT.load(Ordering::Relaxed),
+            failures: DATABASE_OPEN_FAILURE_COUNT.load(Ordering::Relaxed),
+        }
+    }
+
+    /// The storage core this owner references (spec §10.1, S1A-001).
+    pub fn core(&self) -> Arc<DatabaseCore> {
+        Arc::clone(&self.core)
+    }
+
+    /// The identity bound to this owner (spec §10.1, S1A-001): a catalog user
+    /// for credentialed opens, `Credentialless` otherwise.
+    pub fn identity(&self) -> crate::handle::HandleIdentity {
+        match self.principal.read().as_ref() {
+            Some(principal) => crate::handle::HandleIdentity::CatalogUser {
+                username: principal.username.clone(),
+                user_id: principal.user_id,
+                created_version: principal.created_epoch,
+            },
+            None => crate::handle::HandleIdentity::Credentialless,
+        }
+    }
+
+    /// The current lifecycle state of the underlying storage core (S1A-004).
+    pub fn lifecycle_state(&self) -> crate::core::LifecycleState {
+        self.core.lifecycle_state()
+    }
+
+    /// Admit one operation against the storage core (S1A-004). The returned
+    /// RAII guard releases the operation slot on drop; new operations are
+    /// rejected once the core leaves [`crate::core::LifecycleState::Open`].
+    pub fn operation_guard(&self) -> Result<crate::core::OperationGuard> {
+        self.core.operation_guard()
+    }
+
+    /// Build an owner facade over an existing shared core. Used by
+    /// [`crate::manager::DatabaseManager`] to back [`crate::handle::DatabaseHandle`]s;
+    /// exclusive `Database::open*` constructors build their own core instead.
+    pub(crate) fn from_core(
+        core: Arc<DatabaseCore>,
+        principal: Option<crate::auth::Principal>,
+        shared: bool,
+    ) -> Self {
+        let require_auth = core.catalog.read().require_auth;
+        Self {
+            core,
+            principal: RwLock::new(principal.clone()),
+            auth_state: crate::auth_state::AuthState::new(require_auth, principal),
+            shared,
+        }
+    }
+
+    /// Consume this owner and yield the shared core (keeps the core alive).
+    pub(crate) fn into_core(self) -> Arc<DatabaseCore> {
+        self.core
+    }
+
+    /// Open an existing plaintext database as the one core backing shared
+    /// handles (spec §10.1, S1A-002). Recovery, WAL opening, open-generation
+    /// advancement, and table mounting all happen inside this call — exactly
+    /// once per core.
+    pub(crate) fn open_for_shared_core(root: impl AsRef<Path>) -> Result<Self> {
+        Self::open_inner_with_lock_timeout(root, None, None, 0, CoreResourceConfig::default())
+    }
+
     /// Explicitly close the final shared database owner.
+    ///
+    /// On a manager-issued facade (`shared`) this rejects: dropping one handle
+    /// never closes storage while another handle exists, and shared cores are
+    /// shut down explicitly via [`crate::handle::DatabaseHandle::shutdown`].
     pub fn shutdown(self: Arc<Self>) -> Result<()> {
+        if self.shared {
+            return Err(MongrelError::Conflict(
+                "shared-core facades do not own storage; use DatabaseHandle::shutdown".into(),
+            ));
+        }
         match Arc::try_unwrap(self) {
             Ok(database) => {
                 database.ensure_owner_process()?;
+                // Drain + close the exclusively-owned core (S1A-004 steps:
+                // reject new operations, wait for the drain, sync durable
+                // state, release the file lock, mark Closed), then drop it.
+                database.core.shutdown(std::time::Duration::from_secs(30))?;
                 drop(database);
                 Ok(())
             }
@@ -1890,7 +2265,18 @@ impl Database {
         let meta_dek = crate::encryption::meta_dek_for(kek.as_deref());
         let cat = Catalog::empty();
         catalog::write_atomic(&root, &cat, meta_dek.as_ref())?;
-        Self::finish_open(root, cat, kek, meta_dek, false, None, None, None, lock)
+        Self::finish_open(
+            root,
+            cat,
+            kek,
+            meta_dek,
+            false,
+            None,
+            None,
+            None,
+            lock,
+            CoreResourceConfig::default(),
+        )
     }
 
     /// Open an existing plaintext database.
@@ -1906,7 +2292,7 @@ impl Database {
             MongrelError::Other("database root descriptor was not pinned".into())
         })?)?;
         let kek = Arc::new(crate::encryption::Kek::derive(passphrase, &salt)?);
-        Self::open_inner_locked(root, Some(kek), lock)
+        Self::open_inner_locked(root, Some(kek), lock, CoreResourceConfig::default())
     }
 
     /// Open an existing encrypted database with a configurable cross-process
@@ -1922,7 +2308,12 @@ impl Database {
             MongrelError::Other("database root descriptor was not pinned".into())
         })?)?;
         let kek = Arc::new(crate::encryption::Kek::derive(passphrase, &salt)?);
-        Self::open_inner_locked(root, Some(kek), lock)
+        Self::open_inner_locked(
+            root,
+            Some(kek),
+            lock,
+            CoreResourceConfig::from_options(&options)?,
+        )
     }
 
     /// Open an existing encrypted database using a raw high-entropy key.
@@ -1933,7 +2324,7 @@ impl Database {
             MongrelError::Other("database root descriptor was not pinned".into())
         })?)?;
         let kek = Arc::new(crate::encryption::Kek::from_raw_key(key, &salt)?);
-        Self::open_inner_locked(root, Some(kek), lock)
+        Self::open_inner_locked(root, Some(kek), lock, CoreResourceConfig::default())
     }
 
     /// Open an existing plaintext database that has `require_auth = true`,
@@ -1970,6 +2361,7 @@ impl Database {
             username,
             password,
             options.lock_timeout_ms,
+            CoreResourceConfig::from_options(&options)?,
         )
     }
 
@@ -1987,7 +2379,14 @@ impl Database {
             MongrelError::Other("database root descriptor was not pinned".into())
         })?)?;
         let kek = Arc::new(crate::encryption::Kek::derive(passphrase, &salt)?);
-        Self::open_inner_with_credentials_locked(root, Some(kek), username, password, lock)
+        Self::open_inner_with_credentials_locked(
+            root,
+            Some(kek),
+            username,
+            password,
+            lock,
+            CoreResourceConfig::default(),
+        )
     }
 
     /// Open an encrypted + credentialed database with a configurable
@@ -2006,7 +2405,14 @@ impl Database {
             MongrelError::Other("database root descriptor was not pinned".into())
         })?)?;
         let kek = Arc::new(crate::encryption::Kek::derive(passphrase, &salt)?);
-        Self::open_inner_with_credentials_locked(root, Some(kek), username, password, lock)
+        Self::open_inner_with_credentials_locked(
+            root,
+            Some(kek),
+            username,
+            password,
+            lock,
+            CoreResourceConfig::from_options(&options)?,
+        )
     }
 
     /// Open an existing database with non-default [`OpenOptions`].
@@ -2018,7 +2424,13 @@ impl Database {
     pub fn open_with_options(root: impl AsRef<Path>, options: OpenOptions) -> Result<Self> {
         // No encryption, no auth; encrypted and credentialed paths have their
         // own `*_with_options` constructors.
-        Self::open_inner_with_lock_timeout(root, None, None, options.lock_timeout_ms)
+        Self::open_inner_with_lock_timeout(
+            root,
+            None,
+            None,
+            options.lock_timeout_ms,
+            CoreResourceConfig::from_options(&options)?,
+        )
     }
 
     fn open_inner_with_lock_timeout(
@@ -2026,15 +2438,17 @@ impl Database {
         kek: Option<Arc<crate::encryption::Kek>>,
         _meta_dek_override: Option<[u8; META_DEK_LEN]>,
         lock_timeout_ms: u32,
+        resources: CoreResourceConfig,
     ) -> Result<Self> {
         let (root, lock) = Self::begin_open(root, lock_timeout_ms)?;
-        Self::open_inner_locked(root, kek, lock)
+        Self::open_inner_locked(root, kek, lock, resources)
     }
 
     fn open_inner_locked(
         root: PathBuf,
         kek: Option<Arc<crate::encryption::Kek>>,
         lock: ExclusiveDatabaseLease,
+        resources: CoreResourceConfig,
     ) -> Result<Self> {
         let meta_dek = crate::encryption::meta_dek_for(kek.as_deref());
         let mut cat = catalog::read_durable(
@@ -2076,6 +2490,7 @@ impl Database {
             Some(recovery_records),
             None,
             lock,
+            resources,
         )
     }
 
@@ -2091,7 +2506,14 @@ impl Database {
         username: &str,
         password: &str,
     ) -> Result<Self> {
-        Self::open_inner_with_credentials_and_lock_timeout(root, kek, username, password, 0)
+        Self::open_inner_with_credentials_and_lock_timeout(
+            root,
+            kek,
+            username,
+            password,
+            0,
+            CoreResourceConfig::default(),
+        )
     }
 
     /// Credentialed-open with an explicit cross-process lock timeout. The
@@ -2103,9 +2525,10 @@ impl Database {
         username: &str,
         password: &str,
         lock_timeout_ms: u32,
+        resources: CoreResourceConfig,
     ) -> Result<Self> {
         let (root, lock) = Self::begin_open(root, lock_timeout_ms)?;
-        Self::open_inner_with_credentials_locked(root, kek, username, password, lock)
+        Self::open_inner_with_credentials_locked(root, kek, username, password, lock, resources)
     }
 
     fn open_inner_with_credentials_locked(
@@ -2114,6 +2537,7 @@ impl Database {
         username: &str,
         password: &str,
         lock: ExclusiveDatabaseLease,
+        resources: CoreResourceConfig,
     ) -> Result<Self> {
         let meta_dek = crate::encryption::meta_dek_for(kek.as_deref());
         let mut cat = catalog::read_durable(
@@ -2190,6 +2614,7 @@ impl Database {
             Some(recovery_records),
             Some(principal),
             lock,
+            resources,
         )
     }
 
@@ -2274,6 +2699,7 @@ impl Database {
             None,
             Some(admin_principal),
             lock,
+            CoreResourceConfig::default(),
         )
     }
 
@@ -2295,7 +2721,7 @@ impl Database {
         kek: Option<Arc<crate::encryption::Kek>>,
         _meta_dek_override: Option<[u8; META_DEK_LEN]>,
     ) -> Result<Self> {
-        Self::open_inner_with_lock_timeout(root, kek, None, 0)
+        Self::open_inner_with_lock_timeout(root, kek, None, 0, CoreResourceConfig::default())
     }
 
     /// Internal recovery open for a staging directory explicitly marked as a
@@ -2380,6 +2806,7 @@ impl Database {
             Some(recovery_records),
             principal,
             lock,
+            CoreResourceConfig::default(),
         )
     }
 
@@ -2444,6 +2871,7 @@ impl Database {
         recovery_records: Option<Vec<crate::wal::Record>>,
         principal: Option<crate::auth::Principal>,
         lock: ExclusiveDatabaseLease,
+        resources: CoreResourceConfig,
     ) -> Result<Self> {
         let durable_root = Arc::clone(lock.durable_root.as_ref().ok_or_else(|| {
             MongrelError::Other("database root descriptor was not pinned".into())
@@ -2638,22 +3066,52 @@ impl Database {
         let epoch = Arc::new(EpochAuthority::new(cat.db_epoch));
         let snapshots = Arc::new(SnapshotRegistry::new());
         snapshots.configure_history(history_epochs, history_start);
+        // S1E-003: exactly one node-level memory governor per storage core.
+        // Both caches reserve under it (their live bytes always show up in
+        // the governor's accounting) and register as reclaimable subsystems
+        // the governor drives under escalation step 2.
+        let memory_governor = crate::memory::MemoryGovernor::new(
+            crate::memory::GovernorConfig::new(resources.memory_budget_bytes),
+        )
+        .map_err(|error| MongrelError::InvalidArgument(format!("memory governor: {error}")))?;
+        // S1E-004: exactly one spill manager per core, rooted at
+        // `<db-root>/temp/spill`; opening it runs the startup sweep that
+        // deletes every stale spill file a prior process run left behind.
+        let spill_manager = crate::spill::SpillManager::open(
+            &durable_root,
+            crate::spill::SpillConfig::new(resources.temp_disk_budget_bytes),
+            meta_dek,
+        )?;
+        // S1F-002: exactly one durable job registry per core (sibling `JOBS`
+        // file). Crash recovery inside `open` parks mid-`Running` jobs as
+        // `Paused` for an operator-driven resume.
+        let job_registry = Arc::new(crate::jobs::JobRegistry::open(&root, meta_dek.as_ref())?);
         let page_cache = Arc::new(crate::cache::Sharded::new(
             crate::cache::CACHE_SHARDS,
             || {
                 crate::cache::PageCache::new(
                     crate::engine::PAGE_CACHE_CAPACITY / crate::cache::CACHE_SHARDS as u64,
                 )
+                .with_governor(
+                    memory_governor.clone(),
+                    crate::memory::MemoryClass::PageCache,
+                )
             },
         ));
+        memory_governor.register_reclaimable(&page_cache);
         let decoded_cache = Arc::new(crate::cache::Sharded::new(
             crate::cache::CACHE_SHARDS,
             || {
                 crate::cache::DecodedPageCache::new(
                     crate::engine::DECODED_CACHE_CAPACITY / crate::cache::CACHE_SHARDS as u64,
                 )
+                .with_governor(
+                    memory_governor.clone(),
+                    crate::memory::MemoryClass::DecodedCache,
+                )
             },
         ));
+        memory_governor.register_reclaimable(&decoded_cache);
         let commit_lock = Arc::new(Mutex::new(()));
         let shared_wal = Arc::new(Mutex::new(if existing {
             crate::wal::SharedWal::open_durable_root_validated(
@@ -2673,9 +3131,15 @@ impl Database {
         // `put`/`commit` writes route through the one shared WAL, the one group-
         // commit coordinator, and the one poison flag (B1).
         let poisoned = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let group = Arc::new(crate::txn::GroupCommit::new(
-            shared_wal.lock().durable_seq(),
-        ));
+        // S1A-004: the lifecycle is created before the write-path plumbing so
+        // the group-commit coordinator and every mounted table can poison it on
+        // an unrecoverable fsync error; `mark_open` happens only once every
+        // initialization step below has completed.
+        let lifecycle = Arc::new(crate::core::LifecycleController::new());
+        let group = Arc::new(
+            crate::txn::GroupCommit::new(shared_wal.lock().durable_seq())
+                .with_lifecycle(Arc::clone(&lifecycle)),
+        );
         let (change_wake, _change_rx) = tokio::sync::broadcast::channel(256);
         // Final base value is set after the open-generation bump below; tables
         // only draw ids once the user issues a write (post-open), so the
@@ -2684,7 +3148,17 @@ impl Database {
         let _ = abandoned;
         // FND-004 (spec §9.4): the commit-log authority for this database. The
         // transaction-id allocator Arc is stable; its base value is re-seeded
-        // below once the open generation is final.
+        // below once the open generation is final. The HLC clock is the node's
+        // single timestamp authority (spec §4.1, §8.2; ADR-0003): standalone
+        // mode uses node tiebreaker 0, and the skew bound only engages once
+        // remote timestamps are observed (Stage 2 replication).
+        let hlc = Arc::new(mongreldb_types::hlc::HlcClock::new(
+            0,
+            std::time::Duration::from_millis(500),
+        ));
+        // S1B-005: durable idempotency ledger (sibling `TXN_IDEMPOTENCY` file
+        // via `DurableRoot::write_atomic`, mirroring `jobs.rs`'s `JOBS`).
+        let idempotency = crate::txn::IdempotencyLedger::open(Arc::clone(&durable_root), meta_dek)?;
         let commit_log = Arc::new(crate::commit_log::StandaloneCommitLog::new(
             Arc::clone(&shared_wal),
             Arc::clone(&group),
@@ -2693,6 +3167,7 @@ impl Database {
             Arc::clone(&txn_ids),
             root.clone(),
             wal_dek.clone(),
+            Arc::clone(&hlc),
         ));
 
         // Build the shared auth state early — it's cloned into every mounted
@@ -2737,6 +3212,7 @@ impl Database {
                     poisoned: Arc::clone(&poisoned),
                     txn_ids: Arc::clone(&txn_ids),
                     change_wake: change_wake.clone(),
+                    lifecycle: Arc::clone(&lifecycle),
                 }),
                 table_name: Some(entry.name.clone()),
                 auth: auth_checker.clone(),
@@ -2775,9 +3251,15 @@ impl Database {
         let mut lock = lock;
         lock.mark_open()?;
 
-        Ok(Self {
+        // Initialization is complete: recovery, WAL opening, open-generation
+        // advancement, and table mounting all happened above, exactly once for
+        // this core (spec §10.1, S1A-002). The core starts life `Open`.
+        lifecycle.mark_open();
+        let core = DatabaseCore {
             root,
             durable_root,
+            lifecycle,
+            registry: std::sync::OnceLock::new(),
             read_only,
             catalog: RwLock::new(cat),
             security_coordinator,
@@ -2785,8 +3267,11 @@ impl Database {
             rls_cache: Mutex::new(RlsCache::default()),
             epoch,
             snapshots,
+            memory_governor,
             page_cache,
             decoded_cache,
+            spill_manager,
+            job_registry,
             commit_lock,
             shared_wal,
             next_txn_id: txn_ids,
@@ -2796,9 +3281,13 @@ impl Database {
             meta_dek,
             conflicts: crate::txn::ConflictIndex::new(),
             active_txns: crate::txn::ActiveTxns::new(),
+            lock_manager: Arc::new(crate::locks::LockManager::new()),
             poisoned,
             group,
             commit_log,
+            hlc,
+            idempotency,
+            commit_ts_ledger: Mutex::new(commit_ts_ledger_from_recovery(&recovery_records)),
             spill_threshold: std::sync::atomic::AtomicU64::new(64 * 1024 * 1024),
             active_spills: Arc::new(crate::retention::ActiveSpills::new()),
             replication_barrier: parking_lot::RwLock::new(()),
@@ -2808,6 +3297,7 @@ impl Database {
             security_commit_hook: Mutex::new(None),
             catalog_commit_hook: Mutex::new(None),
             backup_hook: Mutex::new(None),
+            fk_lock_hook: Mutex::new(None),
             replication_hook: Mutex::new(None),
             trigger_recursive: AtomicBool::new(TriggerConfig::default().recursive_triggers),
             trigger_max_depth: AtomicU32::new(TriggerConfig::default().max_depth),
@@ -2819,9 +3309,13 @@ impl Database {
                 tx
             },
             change_wake,
+            _lock: Mutex::new(Some(lock)),
+        };
+        Ok(Self {
+            core: Arc::new(core),
             principal: RwLock::new(principal),
             auth_state,
-            _lock: Some(lock),
+            shared: false,
         })
     }
 
@@ -2830,12 +3324,127 @@ impl Database {
         self.epoch.visible()
     }
 
+    /// The core's node-level memory governor (S1E-003). Exactly one per core;
+    /// the page caches reserve under it and register as reclaimable.
+    pub fn memory_governor(&self) -> &crate::memory::MemoryGovernor {
+        &self.memory_governor
+    }
+
+    /// The core's node-level spill manager (S1E-004), rooted at
+    /// `<db-root>/temp/spill`. Query engines open per-query spill sessions
+    /// from it.
+    pub fn spill_manager(&self) -> &crate::spill::SpillManager {
+        &self.spill_manager
+    }
+
+    /// The core's durable job registry (S1F-002, sibling `JOBS` file).
+    pub fn job_registry(&self) -> &Arc<crate::jobs::JobRegistry> {
+        &self.job_registry
+    }
+
+    /// S1C-004 diagnostics: every mounted table's active version-retention
+    /// pin sources, aggregated from [`crate::engine::Table::version_pins_report`].
+    /// A version may be reclaimed only when it is older than the oldest pin of
+    /// every source; this report exposes each of them per table.
+    pub fn version_pins_report(&self) -> Vec<TablePinsReport> {
+        let names: HashMap<u64, String> = self
+            .catalog
+            .read()
+            .tables
+            .iter()
+            .map(|entry| (entry.table_id, entry.name.clone()))
+            .collect();
+        let handles: Vec<_> = self
+            .tables
+            .read()
+            .iter()
+            .map(|(table_id, handle)| (*table_id, handle.clone()))
+            .collect();
+        handles
+            .into_iter()
+            .map(|(table_id, handle)| {
+                let pins = handle.lock().version_pins_report();
+                TablePinsReport {
+                    table_id,
+                    table: names.get(&table_id).cloned().unwrap_or_default(),
+                    pins,
+                }
+            })
+            .collect()
+    }
+
+    /// The core's key/predicate lock manager (S1B-003).
+    pub fn lock_manager(&self) -> &Arc<crate::locks::LockManager> {
+        &self.lock_manager
+    }
+
+    /// S1B-004 step 12: release every lock `txn_id` holds (commit, abort, and
+    /// rollback all funnel here). Idempotent — releasing a transaction with
+    /// no holds is a no-op.
+    pub(crate) fn release_txn_locks(&self, txn_id: u64) {
+        self.lock_manager.release_all(txn_id);
+    }
+
+    /// Build a lock request for `txn_id`, inheriting the commit's
+    /// cancellation control (or a plain one when the commit is uncontrolled).
+    fn txn_lock_request(
+        txn_id: u64,
+        mode: crate::locks::LockMode,
+        control: Option<&crate::ExecutionControl>,
+    ) -> crate::locks::LockRequest {
+        let control = control
+            .cloned()
+            .unwrap_or_else(|| crate::ExecutionControl::new(None));
+        crate::locks::LockRequest::new(txn_id, mode, control)
+    }
+
+    /// Acquire one lock for `txn_id`, bridging the typed [`crate::locks::LockError`]
+    /// onto the engine error (deadlock victims surface as
+    /// [`MongrelError::Deadlock`] with [`mongreldb_types::error::ErrorCategory::Deadlock`]).
+    pub(crate) fn acquire_txn_lock(
+        &self,
+        txn_id: u64,
+        key: crate::locks::LockKey,
+        mode: crate::locks::LockMode,
+        control: Option<&crate::ExecutionControl>,
+    ) -> Result<()> {
+        self.lock_manager
+            .acquire(key, Self::txn_lock_request(txn_id, mode, control))
+            .map_err(MongrelError::from)
+    }
+
+    /// S1B-003: acquire the schema barrier Exclusive for one DDL operation.
+    /// The hold releases when the returned guard drops (end of the DDL entry
+    /// point). DML transactions hold the barrier Shared for their whole
+    /// commit, so schema changes exclude concurrent DML and one another.
+    fn acquire_schema_barrier_exclusive(&self) -> Result<TxnLockGuard<'_>> {
+        let txn_id = self.alloc_txn_id()?;
+        self.acquire_txn_lock(
+            txn_id,
+            crate::locks::LockKey::schema_barrier(),
+            crate::locks::LockMode::Exclusive,
+            None,
+        )?;
+        Ok(TxnLockGuard {
+            locks: &self.lock_manager,
+            txn_id,
+        })
+    }
+
     /// The commit-log authority for this database (spec §9.4, FND-004). Every
     /// commit path proposes through it and visibility publication is gated on
     /// its receipts; Stage 2 swaps this standalone adapter for the replicated
     /// implementation behind the same `CommitLog` trait.
     pub fn commit_log(&self) -> Arc<crate::commit_log::StandaloneCommitLog> {
         Arc::clone(&self.commit_log)
+    }
+
+    /// The node's HLC timestamp authority (spec §8.2, ADR-0003). Transaction
+    /// `begin` captures read timestamps here; the commit sequencer allocates
+    /// commit timestamps from the same clock so commit ts > every participant
+    /// read/write timestamp of the transaction.
+    pub(crate) fn hlc_clock(&self) -> &mongreldb_types::hlc::HlcClock {
+        &self.hlc
     }
 
     /// Clone the in-memory catalog (for diagnostics / tests).
@@ -2992,6 +3601,47 @@ impl Database {
     /// Commit an exact catalog image through the shared WAL, then checkpoint it.
     /// The WAL image is the authoritative PITR and replication delta; CATALOG is
     /// only its restart checkpoint.
+    /// S1A-004: admit one operation against the core (rejects once the core
+    /// leaves [`crate::core::LifecycleState::Open`] — draining, closing,
+    /// closed, or poisoned). The returned guard holds the operation slot
+    /// until dropped, so `shutdown()` drains exactly the covered operations.
+    ///
+    /// Covered set (the mutating/durable paths; the legacy fsync-poison error
+    /// still wins where a body already checks `self.poisoned`, because the
+    /// guard is taken after that check):
+    ///
+    /// - the cross-table commit funnel
+    ///   (`commit_transaction_with_external_states_inner`), covering every
+    ///   user and internal transaction commit;
+    /// - the catalog publish funnel (`publish_catalog_candidate_with_prelude`),
+    ///   covering the user/role/grant, trigger, and procedure families;
+    /// - the inline-WAL DDL bodies: table create/drop/rename/alter, CTAS
+    ///   rebuilding publish, security-catalog and materialized-view
+    ///   replacement, external-table create/drop/reset;
+    /// - storage maintenance: `gc`, `checkpoint`, `compact`, `hot_backup`;
+    /// - replication bootstrap, batch extraction, and follow-apply.
+    ///
+    /// Read-only entry points (snapshots, queries, stats) and the infallible
+    /// `begin*` constructors are intentionally not covered: reads never block
+    /// shutdown, and a transaction's durable act is its commit.
+    pub(crate) fn admit_operation(&self) -> Result<crate::core::OperationGuard> {
+        self.core.operation_guard()
+    }
+
+    /// S1F-001: wrap `command` in its versioned record and apply it to the
+    /// catalog candidate (validate → mutate → bump `catalog_version` → append
+    /// the bounded command history). Security-catalog changes advance the
+    /// security version inside `CatalogDelta::apply_to`, exactly where the
+    /// legacy mutation bodies called `advance_security_version` themselves.
+    fn apply_catalog_command_to(
+        &self,
+        next_catalog: &mut Catalog,
+        command: crate::catalog_cmds::CatalogCommand,
+    ) -> Result<crate::catalog_cmds::CatalogDelta> {
+        let record = crate::catalog_cmds::CatalogCommandRecord::next(next_catalog, command);
+        next_catalog.apply_command(&record)
+    }
+
     fn publish_catalog_candidate(
         &self,
         catalog: Catalog,
@@ -3026,6 +3676,8 @@ impl Database {
                 "database poisoned by fsync error".into(),
             ));
         }
+        // S1A-004: admit the catalog publish as one core operation.
+        let _operation = self.admit_operation()?;
         if let Some(before_publish) = before_publish.as_mut() {
             (**before_publish)()?;
         }
@@ -3100,6 +3752,7 @@ impl Database {
             // watermark skips it), and the live handle poisons exactly like any
             // other post-durable failure.
             self.poisoned.store(true, Ordering::Relaxed);
+            self.lifecycle.poison();
             return Err(MongrelError::DurableCommit {
                 epoch: epoch.0,
                 message: error.to_string(),
@@ -3110,6 +3763,7 @@ impl Database {
             Ok(()) => Ok(()),
             Err(error) => {
                 self.poisoned.store(true, Ordering::Relaxed);
+                self.lifecycle.poison();
                 Err(MongrelError::DurableCommit {
                     epoch: epoch.0,
                     message: error.to_string(),
@@ -3142,16 +3796,27 @@ impl Database {
     /// log's irrevocable receipt (spec §9.4, FND-004). A failed append/fsync
     /// acknowledgement is ambiguous, so poison the live handle and preserve
     /// the assigned epoch in a structured unknown-outcome error.
+    ///
+    /// Used by the DDL/maintenance commit paths, which do not pre-assign a
+    /// commit timestamp: the receipt's `commit_ts` is allocated from the
+    /// node's HLC clock at seal time.
     fn await_durable_commit(
         &self,
         txn_id: u64,
         commit_seq: u64,
         epoch: Epoch,
     ) -> Result<mongreldb_log::CommitReceipt> {
-        match self.commit_log.seal_transaction(txn_id, epoch, commit_seq) {
-            Ok(receipt) => Ok(receipt),
+        match self
+            .commit_log
+            .seal_transaction(txn_id, epoch, commit_seq, None)
+        {
+            Ok(receipt) => {
+                self.record_commit_ts(epoch, receipt.commit_ts);
+                Ok(receipt)
+            }
             Err(error) => {
                 self.poisoned.store(true, Ordering::Relaxed);
+                self.lifecycle.poison();
                 Err(MongrelError::CommitOutcomeUnknown {
                     epoch: epoch.0,
                     message: error.to_string(),
@@ -3160,8 +3825,68 @@ impl Database {
         }
     }
 
+    /// [`Self::await_durable_commit`] for the transaction commit sequencer,
+    /// which assigned `commit_ts` under the sequencer lock (S1B-004 step 5,
+    /// spec §8.2). The receipt carries that exact timestamp, matching the
+    /// durable `Op::CommitTimestamp` ledger record written at append.
+    fn await_durable_commit_with_ts(
+        &self,
+        txn_id: u64,
+        commit_seq: u64,
+        epoch: Epoch,
+        commit_ts: mongreldb_types::hlc::HlcTimestamp,
+    ) -> Result<mongreldb_log::CommitReceipt> {
+        match self
+            .commit_log
+            .seal_transaction(txn_id, epoch, commit_seq, Some(commit_ts))
+        {
+            Ok(receipt) => {
+                self.record_commit_ts(epoch, receipt.commit_ts);
+                Ok(receipt)
+            }
+            Err(error) => {
+                self.poisoned.store(true, Ordering::Relaxed);
+                self.lifecycle.poison();
+                Err(MongrelError::CommitOutcomeUnknown {
+                    epoch: epoch.0,
+                    message: error.to_string(),
+                })
+            }
+        }
+    }
+
+    /// Record one durable commit's receipt timestamp in the per-open ledger
+    /// (bounded to the newest [`COMMIT_TS_LEDGER_CAP`] epochs). Called by the
+    /// durability funnels once the commit log has issued the irrevocable
+    /// receipt.
+    fn record_commit_ts(&self, epoch: Epoch, commit_ts: mongreldb_types::hlc::HlcTimestamp) {
+        let mut ledger = self.commit_ts_ledger.lock();
+        ledger.insert(epoch.0, commit_ts);
+        while ledger.len() > COMMIT_TS_LEDGER_CAP {
+            ledger.pop_first();
+        }
+    }
+
+    /// The commit timestamp of a durable commit, by epoch — the literal
+    /// write receipt behind the server's read-your-writes token (spec §8.2).
+    ///
+    /// Returns `Some` for commits sealed within this open (the exact receipt
+    /// `HlcTimestamp`) and for commits recovered from the durable
+    /// `Op::CommitTimestamp` WAL ledger at open; the latter reconstruct the
+    /// physical component only, with `logical` and `node_tiebreaker` as 0 per
+    /// the ledger byte format. Only the newest [`COMMIT_TS_LEDGER_CAP`]
+    /// epochs are retained, and epochs sealed through `CommitLog::propose`
+    /// (catalog-command proposals) are not recorded here within a live open;
+    /// both miss shapes return `None`, and callers fall back to a fresh-begin
+    /// HLC, which the single clock authority orders after every commit it has
+    /// already issued.
+    pub fn commit_ts_for_epoch(&self, epoch: Epoch) -> Option<mongreldb_types::hlc::HlcTimestamp> {
+        self.commit_ts_ledger.lock().get(&epoch.0).copied()
+    }
+
     fn commit_outcome_unknown(&self, epoch: Epoch, error: impl std::fmt::Display) -> MongrelError {
         self.poisoned.store(true, Ordering::Relaxed);
+        self.lifecycle.poison();
         MongrelError::CommitOutcomeUnknown {
             epoch: epoch.0,
             message: error.to_string(),
@@ -3216,17 +3941,32 @@ impl Database {
         use crate::wal::DdlOp;
         use std::sync::atomic::Ordering;
 
-        self.require_for(principal, &crate::auth::Permission::Admin)?;
+        // S1F-001: the mutation is a versioned catalog command; its required
+        // permission is checked against the caller principal first (identical
+        // to the legacy hardcoded Admin gate).
+        let command = crate::catalog_cmds::CatalogCommand::SetSecurityCatalog {
+            security: security.clone(),
+        };
+        self.require_for(
+            principal,
+            &crate::catalog_cmds::required_permission(&command),
+        )?;
         if self.poisoned.load(Ordering::Relaxed) {
             return Err(MongrelError::Other(
                 "database poisoned by fsync error".into(),
             ));
         }
+        // S1A-004: admit the security-catalog replacement as one core
+        // operation.
+        let _operation = self.admit_operation()?;
         let _ddl = self.ddl_lock.lock();
         // DDL serializes first; write-path order after that is security gate ->
         // commit lock -> shared WAL.
         let _security_write = self.security_write()?;
-        self.require_for(principal, &crate::auth::Permission::Admin)?;
+        self.require_for(
+            principal,
+            &crate::catalog_cmds::required_permission(&command),
+        )?;
         let mut next_catalog = self.catalog.read().clone();
         validate_security_catalog(&next_catalog, &security)?;
         let payload = DdlOp::encode_security(&security)?;
@@ -3234,8 +3974,7 @@ impl Database {
         let epoch = self.epoch.bump_assigned();
         let mut epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
         let txn_id = self.alloc_txn_id()?;
-        next_catalog.security = security;
-        advance_security_version(&mut next_catalog)?;
+        self.apply_catalog_command_to(&mut next_catalog, command)?;
         next_catalog.db_epoch = next_catalog.db_epoch.max(epoch.0);
         let commit_seq = {
             let mut wal = self.shared_wal.lock();
@@ -4626,7 +5365,10 @@ impl Database {
         use crate::wal::DdlOp;
         use std::sync::atomic::Ordering;
 
-        self.require(&crate::auth::Permission::Ddl)?;
+        let command = crate::catalog_cmds::CatalogCommand::CreateMaterializedView {
+            definition: definition.clone(),
+        };
+        self.require(&crate::catalog_cmds::required_permission(&command))?;
         if self.poisoned.load(Ordering::Relaxed) {
             return Err(MongrelError::Other(
                 "database poisoned by fsync error".into(),
@@ -4637,10 +5379,16 @@ impl Database {
                 "materialized view name and query must not be empty".into(),
             ));
         }
-
+        // S1A-004: admit the materialized-view replacement as one core
+        // operation.
+        let _operation = self.admit_operation()?;
         let _ddl = self.ddl_lock.lock();
         let _security_write = self.security_write()?;
-        self.require(&crate::auth::Permission::Ddl)?;
+        self.require(&crate::catalog_cmds::required_permission(&command))?;
+        // S1F-001: the backing-table check validates pure against the current
+        // catalog first so it surfaces before an epoch is consumed, exactly
+        // like the legacy pre-bump lookup.
+        crate::catalog_cmds::apply(&self.catalog.read(), &command)?;
         let table_id = self
             .catalog
             .read()
@@ -4658,15 +5406,7 @@ impl Database {
         let mut epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
         let txn_id = self.alloc_txn_id()?;
         let mut next_catalog = self.catalog.read().clone();
-        if let Some(existing) = next_catalog
-            .materialized_views
-            .iter_mut()
-            .find(|existing| existing.name == definition.name)
-        {
-            *existing = definition.clone();
-        } else {
-            next_catalog.materialized_views.push(definition.clone());
-        }
+        self.apply_catalog_command_to(&mut next_catalog, command)?;
         next_catalog.db_epoch = next_catalog.db_epoch.max(epoch.0);
         let commit_seq = {
             let mut wal = self.shared_wal.lock();
@@ -4746,6 +5486,8 @@ impl Database {
     pub fn replication_snapshot(&self) -> Result<crate::replication::ReplicationSnapshot> {
         let admin = crate::auth::Permission::Admin;
         self.require(&admin)?;
+        // S1A-004: admit the bootstrap capture as one core operation.
+        let _operation = self.admit_operation()?;
         let operation_principal = self.principal_snapshot();
         let _barrier = self.replication_barrier.write();
         let _ddl = self.ddl_lock.lock();
@@ -4841,6 +5583,9 @@ impl Database {
     {
         let admin = crate::auth::Permission::Admin;
         self.require(&admin)?;
+        // S1A-004: admit the backup as one core operation; `shutdown()` waits
+        // for it to drain instead of closing the core mid-copy.
+        let _operation = self.admit_operation()?;
         let operation_principal = self.principal_snapshot();
         control.checkpoint()?;
         let destination = prepared.destination_path.clone();
@@ -4913,6 +5658,20 @@ impl Database {
                 pins: Arc::clone(&self.backup_pins),
                 runs: run_keys,
             };
+            // S1C-004: mirror the backup boundary into every table's unified
+            // pin registry (PinSource::BackupPitr covers PITR base captures,
+            // which route through this same path). Version GC must not
+            // reclaim the boundary versions while their runs stream into the
+            // stage, and diagnostics must expose the pin. The guards drop
+            // with `_run_pins` when the backup finishes or fails.
+            let _registry_pins: Vec<crate::retention::PinGuard> = table_guards
+                .iter()
+                .map(|table| {
+                    table
+                        .pin_registry()
+                        .pin(crate::retention::PinSource::BackupPitr, Epoch(epoch))
+                })
+                .collect();
             let deferred: HashSet<_> = run_files
                 .iter()
                 .map(|(_, _, relative)| relative.clone())
@@ -5023,6 +5782,8 @@ impl Database {
 
         let admin = crate::auth::Permission::Admin;
         self.require(&admin)?;
+        // S1A-004: admit the batch extraction as one core operation.
+        let _operation = self.admit_operation()?;
         let operation_principal = self.principal_snapshot();
 
         let mut wal = self.shared_wal.lock();
@@ -5095,6 +5856,8 @@ impl Database {
                 "replication batches may only target a marked replica".into(),
             ));
         }
+        // S1A-004: admit the follow-apply as one core operation.
+        let _operation = self.admit_operation()?;
         let current = crate::replication::replica_epoch(&self.root)?;
         if batch.is_source_bound() {
             let source_id = crate::replication::replica_source_id_durable(&self.durable_root)?;
@@ -5375,35 +6138,30 @@ impl Database {
         mut procedure: StoredProcedure,
         before_publish: Option<&mut dyn FnMut() -> Result<()>>,
     ) -> Result<StoredProcedure> {
-        self.require(&crate::auth::Permission::Ddl)?;
+        let command = crate::catalog_cmds::CatalogCommand::CreateProcedure {
+            procedure: procedure.clone(),
+        };
+        self.require(&crate::catalog_cmds::required_permission(&command))?;
         let _g = self.ddl_lock.lock();
         let _security_write = self.security_write()?;
-        self.require(&crate::auth::Permission::Ddl)?;
+        self.require(&crate::catalog_cmds::required_permission(&command))?;
         procedure.validate()?;
         self.validate_procedure_references(&procedure)?;
-        {
-            let cat = self.catalog.read();
-            if cat
-                .procedures
-                .iter()
-                .any(|p| p.procedure.name == procedure.name)
-            {
-                return Err(MongrelError::InvalidArgument(format!(
-                    "procedure {:?} already exists",
-                    procedure.name
-                )));
-            }
-        }
+        // S1F-001: validation runs pure against the current catalog first so
+        // failures (duplicate name, unknown table) surface before an epoch is
+        // consumed, exactly like the legacy pre-bump checks.
+        crate::catalog_cmds::apply(&self.catalog.read(), &command)?;
         let commit_lock = Arc::clone(&self.commit_lock);
         let _c = commit_lock.lock();
         let epoch = self.epoch.bump_assigned();
         let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
         procedure.created_epoch = epoch.0;
         procedure.updated_epoch = epoch.0;
+        let command = crate::catalog_cmds::CatalogCommand::CreateProcedure {
+            procedure: procedure.clone(),
+        };
         let mut next_catalog = self.catalog.read().clone();
-        next_catalog
-            .procedures
-            .push(ProcedureEntry::from(procedure.clone()));
+        self.apply_catalog_command_to(&mut next_catalog, command)?;
         next_catalog.db_epoch = epoch.0;
         self.publish_catalog_candidate(next_catalog, epoch, &mut _epoch_guard, before_publish)?;
         Ok(procedure)
@@ -5432,43 +6190,48 @@ impl Database {
         procedure: StoredProcedure,
         before_publish: Option<&mut dyn FnMut() -> Result<()>>,
     ) -> Result<StoredProcedure> {
-        self.require(&crate::auth::Permission::Ddl)?;
+        let command = crate::catalog_cmds::CatalogCommand::ReplaceProcedure {
+            procedure: procedure.clone(),
+        };
+        self.require(&crate::catalog_cmds::required_permission(&command))?;
         let _g = self.ddl_lock.lock();
         let _security_write = self.security_write()?;
-        self.require(&crate::auth::Permission::Ddl)?;
+        self.require(&crate::catalog_cmds::required_permission(&command))?;
         procedure.validate()?;
         self.validate_procedure_references(&procedure)?;
+        // S1F-001: validation runs pure against the current catalog first so
+        // structural failures surface before an epoch is consumed, exactly
+        // like the legacy pre-bump checks.
+        crate::catalog_cmds::apply(&self.catalog.read(), &command)?;
         let commit_lock = Arc::clone(&self.commit_lock);
         let _c = commit_lock.lock();
         let epoch = self.epoch.bump_assigned();
         let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
         let mut next_catalog = self.catalog.read().clone();
-        let replaced = {
-            let next = match next_catalog
-                .procedures
-                .iter()
-                .position(|p| p.procedure.name == procedure.name)
-            {
-                Some(idx) => {
-                    let next = next_catalog.procedures[idx]
-                        .procedure
-                        .replaced(procedure.clone(), epoch.0)?;
-                    next_catalog.procedures[idx] = ProcedureEntry::from(next.clone());
-                    next
-                }
-                None => {
-                    let mut next = procedure;
-                    next.created_epoch = epoch.0;
-                    next.updated_epoch = epoch.0;
-                    next_catalog
-                        .procedures
-                        .push(ProcedureEntry::from(next.clone()));
-                    next
-                }
-            };
-            next_catalog.db_epoch = epoch.0;
-            next
+        // Resolve the replacement image against the candidate catalog: the
+        // engine stamps version/epochs from the commit epoch (preserving the
+        // original created_epoch on replacement), then the command record
+        // carries that resolved image.
+        let replaced = match next_catalog
+            .procedures
+            .iter()
+            .position(|p| p.procedure.name == procedure.name)
+        {
+            Some(idx) => next_catalog.procedures[idx]
+                .procedure
+                .replaced(procedure.clone(), epoch.0)?,
+            None => {
+                let mut next = procedure;
+                next.created_epoch = epoch.0;
+                next.updated_epoch = epoch.0;
+                next
+            }
         };
+        let command = crate::catalog_cmds::CatalogCommand::ReplaceProcedure {
+            procedure: replaced.clone(),
+        };
+        self.apply_catalog_command_to(&mut next_catalog, command)?;
+        next_catalog.db_epoch = epoch.0;
         self.publish_catalog_candidate(next_catalog, epoch, &mut _epoch_guard, before_publish)?;
         Ok(replaced)
     }
@@ -5497,22 +6260,19 @@ impl Database {
         name: &str,
         before_publish: Option<&mut dyn FnMut() -> Result<()>>,
     ) -> Result<Epoch> {
-        self.require(&crate::auth::Permission::Ddl)?;
+        let command = crate::catalog_cmds::CatalogCommand::DropProcedure {
+            name: name.to_string(),
+        };
+        self.require(&crate::catalog_cmds::required_permission(&command))?;
         let _g = self.ddl_lock.lock();
         let _security_write = self.security_write()?;
-        self.require(&crate::auth::Permission::Ddl)?;
+        self.require(&crate::catalog_cmds::required_permission(&command))?;
         let commit_lock = Arc::clone(&self.commit_lock);
         let _c = commit_lock.lock();
         let epoch = self.epoch.bump_assigned();
         let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
         let mut next_catalog = self.catalog.read().clone();
-        let before = next_catalog.procedures.len();
-        next_catalog.procedures.retain(|p| p.procedure.name != name);
-        if next_catalog.procedures.len() == before {
-            return Err(MongrelError::NotFound(format!(
-                "procedure {name:?} not found"
-            )));
-        }
+        self.apply_catalog_command_to(&mut next_catalog, command)?;
         next_catalog.db_epoch = epoch.0;
         self.publish_catalog_candidate(next_catalog, epoch, &mut _epoch_guard, before_publish)?;
         Ok(epoch)
@@ -5582,34 +6342,35 @@ impl Database {
         hash: String,
         before_publish: Option<&mut dyn FnMut() -> Result<()>>,
     ) -> Result<crate::auth::UserEntry> {
-        self.require(&crate::auth::Permission::Admin)?;
+        // S1F-001: the mutation is a versioned catalog command; its required
+        // permission is checked against the caller principal first (identical
+        // to the legacy hardcoded Admin gate).
+        let command = crate::catalog_cmds::CatalogCommand::CreateUser {
+            username: username.to_string(),
+            password_hash: hash.clone(),
+            is_admin: false,
+            created_epoch: 0, // stamped after the commit epoch is assigned
+        };
+        self.require(&crate::catalog_cmds::required_permission(&command))?;
         let _ddl = self.ddl_lock.lock();
         let _security_write = self.security_write()?;
-        self.require(&crate::auth::Permission::Admin)?;
+        self.require(&crate::catalog_cmds::required_permission(&command))?;
         let _commit = self.commit_lock.lock();
         let epoch = self.epoch.bump_assigned();
         let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
-        let mut next_catalog = self.catalog.read().clone();
-        if next_catalog.users.iter().any(|u| u.username == username) {
-            return Err(MongrelError::InvalidArgument(format!(
-                "user {username:?} already exists"
-            )));
-        }
-        next_catalog.next_user_id = next_catalog.next_user_id.max(1);
-        let id = next_catalog.next_user_id;
-        next_catalog.next_user_id = id
-            .checked_add(1)
-            .ok_or_else(|| MongrelError::Full("user-id namespace exhausted".into()))?;
-        let entry = crate::auth::UserEntry {
-            id,
-            username: username.into(),
+        let command = crate::catalog_cmds::CatalogCommand::CreateUser {
+            username: username.to_string(),
             password_hash: hash,
-            roles: Vec::new(),
             is_admin: false,
             created_epoch: epoch.0,
         };
-        next_catalog.users.push(entry.clone());
-        advance_security_version(&mut next_catalog)?;
+        let mut next_catalog = self.catalog.read().clone();
+        let delta = self.apply_catalog_command_to(&mut next_catalog, command)?;
+        let crate::catalog_cmds::CatalogDelta::UserUpserted(entry) = delta else {
+            return Err(MongrelError::Other(
+                "CreateUser resolved to an unexpected catalog delta".into(),
+            ));
+        };
         next_catalog.db_epoch = epoch.0;
         self.publish_catalog_candidate(next_catalog, epoch, &mut _epoch_guard, before_publish)?;
         Ok(entry)
@@ -5640,22 +6401,18 @@ impl Database {
         username: &str,
         before_publish: Option<&mut dyn FnMut() -> Result<()>>,
     ) -> Result<Epoch> {
-        self.require(&crate::auth::Permission::Admin)?;
+        let command = crate::catalog_cmds::CatalogCommand::DropUser {
+            username: username.to_string(),
+        };
+        self.require(&crate::catalog_cmds::required_permission(&command))?;
         let _ddl = self.ddl_lock.lock();
         let _security_write = self.security_write()?;
-        self.require(&crate::auth::Permission::Admin)?;
+        self.require(&crate::catalog_cmds::required_permission(&command))?;
         let _commit = self.commit_lock.lock();
         let epoch = self.epoch.bump_assigned();
         let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
         let mut next_catalog = self.catalog.read().clone();
-        let before = next_catalog.users.len();
-        next_catalog.users.retain(|u| u.username != username);
-        if next_catalog.users.len() == before {
-            return Err(MongrelError::NotFound(format!(
-                "user {username:?} not found"
-            )));
-        }
-        advance_security_version(&mut next_catalog)?;
+        self.apply_catalog_command_to(&mut next_catalog, command)?;
         next_catalog.db_epoch = epoch.0;
         self.publish_catalog_candidate(next_catalog, epoch, &mut _epoch_guard, before_publish)?;
         Ok(epoch)
@@ -5703,21 +6460,19 @@ impl Database {
         hash: String,
         before_publish: Option<&mut dyn FnMut() -> Result<()>>,
     ) -> Result<Epoch> {
-        self.require(&crate::auth::Permission::Admin)?;
+        let command = crate::catalog_cmds::CatalogCommand::AlterUserPassword {
+            username: username.to_string(),
+            password_hash: hash,
+        };
+        self.require(&crate::catalog_cmds::required_permission(&command))?;
         let _ddl = self.ddl_lock.lock();
         let _security_write = self.security_write()?;
-        self.require(&crate::auth::Permission::Admin)?;
+        self.require(&crate::catalog_cmds::required_permission(&command))?;
         let _commit = self.commit_lock.lock();
         let epoch = self.epoch.bump_assigned();
         let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
         let mut next_catalog = self.catalog.read().clone();
-        let user = next_catalog
-            .users
-            .iter_mut()
-            .find(|u| u.username == username)
-            .ok_or_else(|| MongrelError::NotFound(format!("user {username:?} not found")))?;
-        user.password_hash = hash;
-        advance_security_version(&mut next_catalog)?;
+        self.apply_catalog_command_to(&mut next_catalog, command)?;
         next_catalog.db_epoch = epoch.0;
         self.publish_catalog_candidate(next_catalog, epoch, &mut _epoch_guard, before_publish)?;
         Ok(epoch)
@@ -5812,24 +6567,26 @@ impl Database {
         is_admin: bool,
         before_publish: Option<&mut dyn FnMut() -> Result<()>>,
     ) -> Result<Option<Epoch>> {
-        self.require(&crate::auth::Permission::Admin)?;
+        let command = crate::catalog_cmds::CatalogCommand::SetUserAdmin {
+            username: username.to_string(),
+            is_admin,
+        };
+        self.require(&crate::catalog_cmds::required_permission(&command))?;
         let _ddl = self.ddl_lock.lock();
         let _security_write = self.security_write()?;
-        self.require(&crate::auth::Permission::Admin)?;
+        self.require(&crate::catalog_cmds::required_permission(&command))?;
         let _commit = self.commit_lock.lock();
-        let mut next_catalog = self.catalog.read().clone();
-        let user = next_catalog
-            .users
-            .iter_mut()
-            .find(|u| u.username == username)
-            .ok_or_else(|| MongrelError::NotFound(format!("user {username:?} not found")))?;
-        if user.is_admin == is_admin {
+        // Idempotent no-ops publish nothing and consume no epoch (the legacy
+        // short-circuit), so validation runs pure first and only real changes
+        // are applied and recorded.
+        let delta = crate::catalog_cmds::apply(&self.catalog.read(), &command)?;
+        if matches!(delta, crate::catalog_cmds::CatalogDelta::NoOp) {
             return Ok(None);
         }
-        user.is_admin = is_admin;
         let epoch = self.epoch.bump_assigned();
         let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
-        advance_security_version(&mut next_catalog)?;
+        let mut next_catalog = self.catalog.read().clone();
+        self.apply_catalog_command_to(&mut next_catalog, command)?;
         next_catalog.db_epoch = epoch.0;
         self.publish_catalog_candidate(next_catalog, epoch, &mut _epoch_guard, before_publish)?;
         Ok(Some(epoch))
@@ -5856,26 +6613,28 @@ impl Database {
         name: &str,
         before_publish: Option<&mut dyn FnMut() -> Result<()>>,
     ) -> Result<crate::auth::RoleEntry> {
-        self.require(&crate::auth::Permission::Admin)?;
+        let command = crate::catalog_cmds::CatalogCommand::CreateRole {
+            name: name.to_string(),
+            created_epoch: 0, // stamped after the commit epoch is assigned
+        };
+        self.require(&crate::catalog_cmds::required_permission(&command))?;
         let _ddl = self.ddl_lock.lock();
         let _security_write = self.security_write()?;
-        self.require(&crate::auth::Permission::Admin)?;
+        self.require(&crate::catalog_cmds::required_permission(&command))?;
         let _commit = self.commit_lock.lock();
         let epoch = self.epoch.bump_assigned();
         let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
-        let mut next_catalog = self.catalog.read().clone();
-        if next_catalog.roles.iter().any(|r| r.name == name) {
-            return Err(MongrelError::InvalidArgument(format!(
-                "role {name:?} already exists"
-            )));
-        }
-        let entry = crate::auth::RoleEntry {
-            name: name.into(),
-            permissions: Vec::new(),
+        let command = crate::catalog_cmds::CatalogCommand::CreateRole {
+            name: name.to_string(),
             created_epoch: epoch.0,
         };
-        next_catalog.roles.push(entry.clone());
-        advance_security_version(&mut next_catalog)?;
+        let mut next_catalog = self.catalog.read().clone();
+        let delta = self.apply_catalog_command_to(&mut next_catalog, command)?;
+        let crate::catalog_cmds::CatalogDelta::RoleUpserted(entry) = delta else {
+            return Err(MongrelError::Other(
+                "CreateRole resolved to an unexpected catalog delta".into(),
+            ));
+        };
         next_catalog.db_epoch = epoch.0;
         self.publish_catalog_candidate(next_catalog, epoch, &mut _epoch_guard, before_publish)?;
         Ok(entry)
@@ -5906,23 +6665,18 @@ impl Database {
         name: &str,
         before_publish: Option<&mut dyn FnMut() -> Result<()>>,
     ) -> Result<Epoch> {
-        self.require(&crate::auth::Permission::Admin)?;
+        let command = crate::catalog_cmds::CatalogCommand::DropRole {
+            name: name.to_string(),
+        };
+        self.require(&crate::catalog_cmds::required_permission(&command))?;
         let _ddl = self.ddl_lock.lock();
         let _security_write = self.security_write()?;
-        self.require(&crate::auth::Permission::Admin)?;
+        self.require(&crate::catalog_cmds::required_permission(&command))?;
         let _commit = self.commit_lock.lock();
         let epoch = self.epoch.bump_assigned();
         let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
         let mut next_catalog = self.catalog.read().clone();
-        let before = next_catalog.roles.len();
-        next_catalog.roles.retain(|r| r.name != name);
-        if next_catalog.roles.len() == before {
-            return Err(MongrelError::NotFound(format!("role {name:?} not found")));
-        }
-        for user in &mut next_catalog.users {
-            user.roles.retain(|r| r != name);
-        }
-        advance_security_version(&mut next_catalog)?;
+        self.apply_catalog_command_to(&mut next_catalog, command)?;
         next_catalog.db_epoch = epoch.0;
         self.publish_catalog_candidate(next_catalog, epoch, &mut _epoch_guard, before_publish)?;
         Ok(epoch)
@@ -5955,29 +6709,26 @@ impl Database {
         role_name: &str,
         before_publish: Option<&mut dyn FnMut() -> Result<()>>,
     ) -> Result<Option<Epoch>> {
-        self.require(&crate::auth::Permission::Admin)?;
+        let command = crate::catalog_cmds::CatalogCommand::GrantRole {
+            username: username.to_string(),
+            role: role_name.to_string(),
+        };
+        self.require(&crate::catalog_cmds::required_permission(&command))?;
         let _ddl = self.ddl_lock.lock();
         let _security_write = self.security_write()?;
-        self.require(&crate::auth::Permission::Admin)?;
+        self.require(&crate::catalog_cmds::required_permission(&command))?;
         let _commit = self.commit_lock.lock();
-        let mut next_catalog = self.catalog.read().clone();
-        if !next_catalog.roles.iter().any(|r| r.name == role_name) {
-            return Err(MongrelError::NotFound(format!(
-                "role {role_name:?} not found"
-            )));
-        }
-        let user = next_catalog
-            .users
-            .iter_mut()
-            .find(|u| u.username == username)
-            .ok_or_else(|| MongrelError::NotFound(format!("user {username:?} not found")))?;
-        if user.roles.iter().any(|role| role == role_name) {
+        // Idempotent no-ops publish nothing and consume no epoch (the legacy
+        // short-circuit), so validation runs pure first and only real changes
+        // are applied and recorded.
+        let delta = crate::catalog_cmds::apply(&self.catalog.read(), &command)?;
+        if matches!(delta, crate::catalog_cmds::CatalogDelta::NoOp) {
             return Ok(None);
         }
-        user.roles.push(role_name.into());
         let epoch = self.epoch.bump_assigned();
         let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
-        advance_security_version(&mut next_catalog)?;
+        let mut next_catalog = self.catalog.read().clone();
+        self.apply_catalog_command_to(&mut next_catalog, command)?;
         next_catalog.db_epoch = epoch.0;
         self.publish_catalog_candidate(next_catalog, epoch, &mut _epoch_guard, before_publish)?;
         Ok(Some(epoch))
@@ -6010,25 +6761,26 @@ impl Database {
         role_name: &str,
         before_publish: Option<&mut dyn FnMut() -> Result<()>>,
     ) -> Result<Option<Epoch>> {
-        self.require(&crate::auth::Permission::Admin)?;
+        let command = crate::catalog_cmds::CatalogCommand::RevokeRole {
+            username: username.to_string(),
+            role: role_name.to_string(),
+        };
+        self.require(&crate::catalog_cmds::required_permission(&command))?;
         let _ddl = self.ddl_lock.lock();
         let _security_write = self.security_write()?;
-        self.require(&crate::auth::Permission::Admin)?;
+        self.require(&crate::catalog_cmds::required_permission(&command))?;
         let _commit = self.commit_lock.lock();
-        let mut next_catalog = self.catalog.read().clone();
-        let user = next_catalog
-            .users
-            .iter_mut()
-            .find(|u| u.username == username)
-            .ok_or_else(|| MongrelError::NotFound(format!("user {username:?} not found")))?;
-        let before = user.roles.len();
-        user.roles.retain(|r| r != role_name);
-        if user.roles.len() == before {
+        // Idempotent no-ops publish nothing and consume no epoch (the legacy
+        // short-circuit), so validation runs pure first and only real changes
+        // are applied and recorded.
+        let delta = crate::catalog_cmds::apply(&self.catalog.read(), &command)?;
+        if matches!(delta, crate::catalog_cmds::CatalogDelta::NoOp) {
             return Ok(None);
         }
         let epoch = self.epoch.bump_assigned();
         let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
-        advance_security_version(&mut next_catalog)?;
+        let mut next_catalog = self.catalog.read().clone();
+        self.apply_catalog_command_to(&mut next_catalog, command)?;
         next_catalog.db_epoch = epoch.0;
         self.publish_catalog_candidate(next_catalog, epoch, &mut _epoch_guard, before_publish)?;
         Ok(Some(epoch))
@@ -6070,25 +6822,26 @@ impl Database {
         permission: crate::auth::Permission,
         before_publish: Option<&mut dyn FnMut() -> Result<()>>,
     ) -> Result<Option<Epoch>> {
-        self.require(&crate::auth::Permission::Admin)?;
+        let command = crate::catalog_cmds::CatalogCommand::GrantPermission {
+            role: role_name.to_string(),
+            permission,
+        };
+        self.require(&crate::catalog_cmds::required_permission(&command))?;
         let _ddl = self.ddl_lock.lock();
         let _security_write = self.security_write()?;
-        self.require(&crate::auth::Permission::Admin)?;
+        self.require(&crate::catalog_cmds::required_permission(&command))?;
         let _commit = self.commit_lock.lock();
-        let mut next_catalog = self.catalog.read().clone();
-        let role = next_catalog
-            .roles
-            .iter_mut()
-            .find(|r| r.name == role_name)
-            .ok_or_else(|| MongrelError::NotFound(format!("role {role_name:?} not found")))?;
-        let before = role.permissions.clone();
-        merge_permission(&mut role.permissions, permission);
-        if role.permissions == before {
+        // Idempotent no-ops publish nothing and consume no epoch (the legacy
+        // short-circuit), so validation runs pure first and only real changes
+        // are applied and recorded.
+        let delta = crate::catalog_cmds::apply(&self.catalog.read(), &command)?;
+        if matches!(delta, crate::catalog_cmds::CatalogDelta::NoOp) {
             return Ok(None);
         }
         let epoch = self.epoch.bump_assigned();
         let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
-        advance_security_version(&mut next_catalog)?;
+        let mut next_catalog = self.catalog.read().clone();
+        self.apply_catalog_command_to(&mut next_catalog, command)?;
         next_catalog.db_epoch = epoch.0;
         self.publish_catalog_candidate(next_catalog, epoch, &mut _epoch_guard, before_publish)?;
         Ok(Some(epoch))
@@ -6130,25 +6883,26 @@ impl Database {
         permission: crate::auth::Permission,
         before_publish: Option<&mut dyn FnMut() -> Result<()>>,
     ) -> Result<Option<Epoch>> {
-        self.require(&crate::auth::Permission::Admin)?;
+        let command = crate::catalog_cmds::CatalogCommand::RevokePermission {
+            role: role_name.to_string(),
+            permission,
+        };
+        self.require(&crate::catalog_cmds::required_permission(&command))?;
         let _ddl = self.ddl_lock.lock();
         let _security_write = self.security_write()?;
-        self.require(&crate::auth::Permission::Admin)?;
+        self.require(&crate::catalog_cmds::required_permission(&command))?;
         let _commit = self.commit_lock.lock();
-        let mut next_catalog = self.catalog.read().clone();
-        let role = next_catalog
-            .roles
-            .iter_mut()
-            .find(|r| r.name == role_name)
-            .ok_or_else(|| MongrelError::NotFound(format!("role {role_name:?} not found")))?;
-        let before = role.permissions.clone();
-        revoke_permission_from(&mut role.permissions, &permission);
-        if role.permissions == before {
+        // Idempotent no-ops publish nothing and consume no epoch (the legacy
+        // short-circuit), so validation runs pure first and only real changes
+        // are applied and recorded.
+        let delta = crate::catalog_cmds::apply(&self.catalog.read(), &command)?;
+        if matches!(delta, crate::catalog_cmds::CatalogDelta::NoOp) {
             return Ok(None);
         }
         let epoch = self.epoch.bump_assigned();
         let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
-        advance_security_version(&mut next_catalog)?;
+        let mut next_catalog = self.catalog.read().clone();
+        self.apply_catalog_command_to(&mut next_catalog, command)?;
         next_catalog.db_epoch = epoch.0;
         self.publish_catalog_candidate(next_catalog, epoch, &mut _epoch_guard, before_publish)?;
         Ok(Some(epoch))
@@ -6301,6 +7055,18 @@ impl Database {
     ///
     /// See `docs/15-credential-enforcement.md`.
     pub fn enable_auth(&self, admin_username: &str, admin_password: &str) -> Result<()> {
+        if self.shared {
+            // Fail closed (spec §4.6): one shared handle must not flip the
+            // core into an enforcement mode the other handles cannot observe.
+            // Stage 1A shared cores stay credentialless; auth-mode transitions
+            // require an exclusive `Database` owner. Per-handle principals
+            // land with Stage 1D sessions.
+            return Err(MongrelError::Conflict(
+                "enable_auth requires an exclusive Database owner; shared cores reject \
+                 auth-mode transitions"
+                    .into(),
+            ));
+        }
         let password_hash =
             crate::auth::hash_password(admin_password).map_err(MongrelError::Other)?;
         let _ddl = self.ddl_lock.lock();
@@ -6492,32 +7258,37 @@ impl Database {
         principal: Option<&crate::auth::Principal>,
         before_publish: Option<&mut dyn FnMut() -> Result<()>>,
     ) -> Result<StoredTrigger> {
-        self.require_for(principal, &crate::auth::Permission::Ddl)?;
+        let command = crate::catalog_cmds::CatalogCommand::CreateTrigger {
+            trigger: trigger.clone(),
+        };
+        self.require_for(
+            principal,
+            &crate::catalog_cmds::required_permission(&command),
+        )?;
         let _g = self.ddl_lock.lock();
         let _security_write = self.security_write()?;
-        self.require_for(principal, &crate::auth::Permission::Ddl)?;
+        self.require_for(
+            principal,
+            &crate::catalog_cmds::required_permission(&command),
+        )?;
         trigger.validate()?;
         self.validate_trigger_references(&trigger)
             .map_err(trigger_validation_error)?;
-        {
-            let cat = self.catalog.read();
-            if cat.triggers.iter().any(|t| t.trigger.name == trigger.name) {
-                return Err(MongrelError::TriggerValidation(format!(
-                    "trigger {:?} already exists",
-                    trigger.name
-                )));
-            }
-        }
+        // S1F-001: validation runs pure against the current catalog first so
+        // failures (duplicate name, unknown target) surface before an epoch is
+        // consumed, exactly like the legacy pre-bump checks.
+        crate::catalog_cmds::apply(&self.catalog.read(), &command)?;
         let commit_lock = Arc::clone(&self.commit_lock);
         let _c = commit_lock.lock();
         let epoch = self.epoch.bump_assigned();
         let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
         trigger.created_epoch = epoch.0;
         trigger.updated_epoch = epoch.0;
+        let command = crate::catalog_cmds::CatalogCommand::CreateTrigger {
+            trigger: trigger.clone(),
+        };
         let mut next_catalog = self.catalog.read().clone();
-        next_catalog
-            .triggers
-            .push(TriggerEntry::from(trigger.clone()));
+        self.apply_catalog_command_to(&mut next_catalog, command)?;
         next_catalog.db_epoch = epoch.0;
         self.publish_catalog_candidate(next_catalog, epoch, &mut _epoch_guard, before_publish)?;
         Ok(trigger)
@@ -6556,42 +7327,55 @@ impl Database {
         principal: Option<&crate::auth::Principal>,
         before_publish: Option<&mut dyn FnMut() -> Result<()>>,
     ) -> Result<StoredTrigger> {
-        self.require_for(principal, &crate::auth::Permission::Ddl)?;
+        let command = crate::catalog_cmds::CatalogCommand::ReplaceTrigger {
+            trigger: trigger.clone(),
+        };
+        self.require_for(
+            principal,
+            &crate::catalog_cmds::required_permission(&command),
+        )?;
         let _g = self.ddl_lock.lock();
         let _security_write = self.security_write()?;
-        self.require_for(principal, &crate::auth::Permission::Ddl)?;
+        self.require_for(
+            principal,
+            &crate::catalog_cmds::required_permission(&command),
+        )?;
         trigger.validate()?;
         self.validate_trigger_references(&trigger)
             .map_err(trigger_validation_error)?;
+        // S1F-001: validation runs pure against the current catalog first so
+        // structural failures surface before an epoch is consumed, exactly
+        // like the legacy pre-bump checks.
+        crate::catalog_cmds::apply(&self.catalog.read(), &command)?;
         let commit_lock = Arc::clone(&self.commit_lock);
         let _c = commit_lock.lock();
         let epoch = self.epoch.bump_assigned();
         let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
         let mut next_catalog = self.catalog.read().clone();
-        let replaced = {
-            let next = match next_catalog
-                .triggers
-                .iter()
-                .position(|t| t.trigger.name == trigger.name)
-            {
-                Some(idx) => {
-                    let next = next_catalog.triggers[idx]
-                        .trigger
-                        .replaced(trigger.clone(), epoch.0)?;
-                    next_catalog.triggers[idx] = TriggerEntry::from(next.clone());
-                    next
-                }
-                None => {
-                    let mut next = trigger;
-                    next.created_epoch = epoch.0;
-                    next.updated_epoch = epoch.0;
-                    next_catalog.triggers.push(TriggerEntry::from(next.clone()));
-                    next
-                }
-            };
-            next_catalog.db_epoch = epoch.0;
-            next
+        // Resolve the replacement image against the candidate catalog: the
+        // engine stamps version/epochs from the commit epoch (preserving the
+        // original created_epoch on replacement), then the command record
+        // carries that resolved image.
+        let replaced = match next_catalog
+            .triggers
+            .iter()
+            .position(|t| t.trigger.name == trigger.name)
+        {
+            Some(idx) => next_catalog.triggers[idx]
+                .trigger
+                .replaced(trigger.clone(), epoch.0)?,
+            None => {
+                let mut next = trigger;
+                next.created_epoch = epoch.0;
+                next.updated_epoch = epoch.0;
+                next
+            }
         };
+        let command = crate::catalog_cmds::CatalogCommand::ReplaceTrigger {
+            trigger: replaced.clone(),
+        };
+        self.apply_catalog_command_to(&mut next_catalog, command)?;
+        next_catalog.db_epoch = epoch.0;
         self.publish_catalog_candidate(next_catalog, epoch, &mut _epoch_guard, before_publish)?;
         Ok(replaced)
     }
@@ -6650,23 +7434,37 @@ impl Database {
         principal: Option<&crate::auth::Principal>,
         before_publish: Option<&mut dyn FnMut() -> Result<()>>,
     ) -> Result<Epoch> {
-        self.require_for(principal, &crate::auth::Permission::Ddl)?;
         if names.is_empty() {
             return Err(MongrelError::InvalidArgument(
                 "at least one trigger name is required".into(),
             ));
         }
+        let commands: Vec<crate::catalog_cmds::CatalogCommand> = names
+            .iter()
+            .map(|name| crate::catalog_cmds::CatalogCommand::DropTrigger { name: name.clone() })
+            .collect();
+        for command in &commands {
+            self.require_for(
+                principal,
+                &crate::catalog_cmds::required_permission(command),
+            )?;
+        }
         let _g = self.ddl_lock.lock();
         let _security_write = self.security_write()?;
-        self.require_for(principal, &crate::auth::Permission::Ddl)?;
+        for command in &commands {
+            self.require_for(
+                principal,
+                &crate::catalog_cmds::required_permission(command),
+            )?;
+        }
+        // S1F-001: every name's command validates pure against the current
+        // catalog first so a missing trigger surfaces before an epoch is
+        // consumed, exactly like the legacy pre-bump check. A batch drop then
+        // records one command per name (the emitting-layer expansion rule).
         {
             let cat = self.catalog.read();
-            for name in names {
-                if !cat.triggers.iter().any(|t| t.trigger.name == *name) {
-                    return Err(MongrelError::NotFound(format!(
-                        "trigger {name:?} not found"
-                    )));
-                }
+            for command in &commands {
+                crate::catalog_cmds::apply(&cat, command)?;
             }
         }
         let commit_lock = Arc::clone(&self.commit_lock);
@@ -6674,9 +7472,9 @@ impl Database {
         let epoch = self.epoch.bump_assigned();
         let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
         let mut next_catalog = self.catalog.read().clone();
-        next_catalog
-            .triggers
-            .retain(|trigger| !names.contains(&trigger.trigger.name));
+        for command in commands {
+            self.apply_catalog_command_to(&mut next_catalog, command)?;
+        }
         next_catalog.db_epoch = epoch.0;
         self.publish_catalog_candidate(next_catalog, epoch, &mut _epoch_guard, before_publish)?;
         Ok(epoch)
@@ -6839,6 +7637,7 @@ impl Database {
             principal,
             catalog_bound,
             None,
+            crate::txn::TxnCommitContext::internal(),
         )
         .map(|(epoch, _)| epoch)
     }
@@ -7633,7 +8432,8 @@ impl Database {
         });
         let txn_id = self.alloc_txn_id();
         let read = Snapshot::at(self.epoch.visible());
-        crate::txn::Transaction::new(self, txn_id, read).with_principal(principal, catalog_bound)
+        crate::txn::Transaction::new(self, txn_id, read, crate::txn::IsolationLevel::default())
+            .with_principal(principal, catalog_bound)
     }
 
     /// Begin a transaction with a specific isolation level.
@@ -7642,13 +8442,12 @@ impl Database {
         level: crate::txn::IsolationLevel,
     ) -> crate::txn::Transaction<'_> {
         let txn_id = self.alloc_txn_id();
-        let epoch = match level {
-            crate::txn::IsolationLevel::ReadCommitted => self.epoch.visible(),
-            _ => self.epoch.visible(),
-        };
-        let read = Snapshot::at(epoch);
+        // Every level pins the current visible epoch at begin; ReadCommitted
+        // re-pins per statement inside the transaction (S1B-002).
+        let read = Snapshot::at(self.epoch.visible());
         let (principal, catalog_bound) = self.transaction_principal_snapshot();
-        crate::txn::Transaction::new(self, txn_id, read).with_principal(principal, catalog_bound)
+        crate::txn::Transaction::new(self, txn_id, read, level)
+            .with_principal(principal, catalog_bound)
     }
 
     /// Begin a transaction whose trigger programs may route external-table DML
@@ -7660,7 +8459,7 @@ impl Database {
         let txn_id = self.alloc_txn_id();
         let read = Snapshot::at(self.epoch.visible());
         let (principal, catalog_bound) = self.transaction_principal_snapshot();
-        crate::txn::Transaction::new(self, txn_id, read)
+        crate::txn::Transaction::new(self, txn_id, read, crate::txn::IsolationLevel::default())
             .with_external_trigger_bridge(bridge)
             .with_principal(principal, catalog_bound)
     }
@@ -7676,7 +8475,7 @@ impl Database {
         });
         let txn_id = self.alloc_txn_id();
         let read = Snapshot::at(self.epoch.visible());
-        crate::txn::Transaction::new(self, txn_id, read)
+        crate::txn::Transaction::new(self, txn_id, read, crate::txn::IsolationLevel::default())
             .with_external_trigger_bridge(bridge)
             .with_principal(principal, catalog_bound)
     }
@@ -7823,6 +8622,7 @@ impl Database {
 
     fn fill_auto_increment_for_staging(
         &self,
+        txn_id: u64,
         staging: &mut [(u64, crate::txn::Staged)],
         control: Option<&crate::ExecutionControl>,
     ) -> Result<()> {
@@ -7831,6 +8631,37 @@ impl Database {
             commit_prepare_checkpoint(control, index)?;
             if matches!(staged, crate::txn::Staged::Put(_)) {
                 puts_by_table.entry(*table_id).or_default().push(index);
+            }
+        }
+
+        // S1B-003: sequence allocation serializes on one Exclusive barrier per
+        // staged table whose puts actually ALLOCATE an auto-increment value
+        // (absent/Null column — explicit values only advance the counter and
+        // must not serialize), held until the transaction ends so allocated
+        // values map monotonically onto commit order. The barrier is acquired
+        // before the table lock (never the reverse).
+        {
+            let mut barrier_tables: Vec<u64> = puts_by_table
+                .iter()
+                .filter(|(table_id, indexes)| {
+                    indexes.iter().any(|index| {
+                        matches!(
+                            &staging[*index].1,
+                            crate::txn::Staged::Put(cells)
+                                if self.table_auto_inc_would_allocate(**table_id, cells)
+                        )
+                    })
+                })
+                .map(|(table_id, _)| *table_id)
+                .collect();
+            barrier_tables.sort_unstable();
+            for table_id in barrier_tables {
+                self.acquire_txn_lock(
+                    txn_id,
+                    crate::locks::LockKey::sequence_barrier(&format!("auto_inc:{table_id}")),
+                    crate::locks::LockMode::Exclusive,
+                    control,
+                )?;
             }
         }
 
@@ -7854,6 +8685,7 @@ impl Database {
 
     fn expand_table_triggers(
         &self,
+        txn_id: u64,
         staging: &mut Vec<(u64, crate::txn::Staged)>,
         read_epoch: Epoch,
         external_trigger_bridge: Option<&dyn ExternalTriggerBridge>,
@@ -7867,6 +8699,7 @@ impl Database {
             let chunk = std::mem::take(staging);
             let stacks = vec![Vec::new(); chunk.len()];
             *staging = self.expand_trigger_chunk(
+                txn_id,
                 chunk,
                 stacks,
                 read_epoch,
@@ -7914,6 +8747,7 @@ impl Database {
     #[allow(clippy::too_many_arguments)]
     fn expand_trigger_chunk(
         &self,
+        txn_id: u64,
         mut chunk: Vec<(u64, crate::txn::Staged)>,
         stacks: Vec<Vec<String>>,
         read_epoch: Epoch,
@@ -7927,7 +8761,7 @@ impl Database {
             return Ok(Vec::new());
         }
         commit_prepare_checkpoint(control, 0)?;
-        self.fill_auto_increment_for_staging(&mut chunk, control)?;
+        self.fill_auto_increment_for_staging(txn_id, &mut chunk, control)?;
         let expansion = self.expand_table_triggers_once(
             &mut chunk,
             read_epoch,
@@ -7951,6 +8785,7 @@ impl Database {
         let mut out = Vec::new();
         external_writes.extend(expansion.before_external);
         out.extend(self.expand_trigger_chunk(
+            txn_id,
             expansion.before,
             expansion.before_stacks,
             read_epoch,
@@ -7963,6 +8798,7 @@ impl Database {
         out.extend(filter_ignored_staging(chunk, &expansion.ignored_indices));
         external_writes.extend(expansion.after_external);
         out.extend(self.expand_trigger_chunk(
+            txn_id,
             expansion.after,
             expansion.after_stacks,
             read_epoch,
@@ -8788,8 +9624,119 @@ impl Database {
     /// {RESTRICT, CASCADE, SET NULL}. CASCADE appends child deletes (transitive
     /// fixpoint); SET NULL appends child updates (FK columns nulled). Truncate is
     /// RESTRICT-only (cascade-truncate is unsupported).
+    /// S1B-003: acquire Exclusive key claims for every primary key and declared
+    /// UNIQUE key a transaction's staged puts/updates insert, in ascending key
+    /// order (ordered acquisition cannot cycle on its own). A concurrent
+    /// transaction claiming the same key blocks until this one ends, turning
+    /// the optimistic write-write conflict into a serialization point. Claims
+    /// release with the transaction's [`TxnLockGuard`].
+    fn acquire_unique_key_claims(
+        &self,
+        txn_id: u64,
+        staging: &[(u64, crate::txn::Staged)],
+        control: Option<&crate::ExecutionControl>,
+    ) -> Result<()> {
+        let catalog = self.catalog.read();
+        let has_uniques = staging.iter().any(|(table_id, staged)| {
+            matches!(
+                staged,
+                crate::txn::Staged::Put(_) | crate::txn::Staged::Update { .. }
+            ) && catalog.tables.iter().any(|entry| {
+                entry.table_id == *table_id
+                    && (entry.schema.primary_key().is_some()
+                        || !entry.schema.constraints.uniques.is_empty())
+            })
+        });
+        if !has_uniques {
+            return Ok(());
+        }
+        let mut claims: Vec<(u64, Vec<u8>)> = Vec::new();
+        for (staged_index, (table_id, staged)) in staging.iter().enumerate() {
+            commit_prepare_checkpoint(control, staged_index)?;
+            let cells = match staged {
+                crate::txn::Staged::Put(cells) => cells,
+                crate::txn::Staged::Update { new_row, .. } => new_row,
+                _ => continue,
+            };
+            let Some(entry) = catalog
+                .tables
+                .iter()
+                .find(|entry| entry.table_id == *table_id)
+            else {
+                continue;
+            };
+            for column in &entry.schema.columns {
+                if !column
+                    .flags
+                    .contains(crate::schema::ColumnFlags::PRIMARY_KEY)
+                {
+                    continue;
+                }
+                if let Some((_, value)) = cells.iter().find(|(id, _)| *id == column.id) {
+                    let mut key = b"pk:".to_vec();
+                    key.extend_from_slice(&value.encode_key());
+                    claims.push((*table_id, key));
+                }
+            }
+            // Declared non-PK unique constraints claim their own namespace
+            // (folding the constraint id into the key, per LockKey::Key's
+            // multi-key-space rule). NULL components skip the constraint —
+            // and the claim — per SQL semantics.
+            let cells_map: HashMap<u16, Value> = cells.iter().cloned().collect();
+            for uc in &entry.schema.constraints.uniques {
+                if let Some(composite) =
+                    crate::constraint::encode_composite_key(&uc.columns, &cells_map)
+                {
+                    let mut key = format!("uq{}:", uc.id).into_bytes();
+                    key.extend_from_slice(&composite);
+                    claims.push((*table_id, key));
+                }
+            }
+        }
+        claims.sort();
+        claims.dedup();
+        for (table_id, key) in claims {
+            self.acquire_txn_lock(
+                txn_id,
+                crate::locks::LockKey::key(table_id, key),
+                crate::locks::LockMode::Exclusive,
+                control,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// S1B-003: one FK parent-protection acquisition. `Err` propagates the
+    /// deadlock/deadline/cancellation outcome; the test seam fires after each
+    /// successful acquisition.
+    fn acquire_fk_lock(
+        &self,
+        txn_id: u64,
+        table_id: u64,
+        key: &[u8],
+        mode: crate::locks::LockMode,
+        control: Option<&crate::ExecutionControl>,
+    ) -> Result<()> {
+        let mut namespaced = b"fk:".to_vec();
+        namespaced.extend_from_slice(key);
+        self.acquire_txn_lock(
+            txn_id,
+            crate::locks::LockKey::key(table_id, namespaced),
+            mode,
+            control,
+        )?;
+        // The hook is cloned out before firing: holding the slot's mutex while
+        // a parked hook waits would block every other commit's hook call.
+        let hook = self.fk_lock_hook.lock().clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+        Ok(())
+    }
+
     fn validate_constraints(
         &self,
+        txn_id: u64,
         staging: &mut Vec<(u64, crate::txn::Staged)>,
         read_epoch: Epoch,
         control: Option<&crate::ExecutionControl>,
@@ -8893,6 +9840,17 @@ impl Database {
                         if fk.on_update == FkAction::Restrict {
                             continue;
                         }
+                        // S1B-003: the referenced key is being changed, so this
+                        // update removes it for any action — hold an Exclusive
+                        // parent-protection lock against concurrent child
+                        // inserts referencing the old key.
+                        self.acquire_fk_lock(
+                            txn_id,
+                            table_id,
+                            &old_key,
+                            crate::locks::LockMode::Exclusive,
+                            control,
+                        )?;
                         let child_rows = load_rows(*child_id)?;
                         for (child_index, child) in child_rows.into_iter().enumerate() {
                             commit_prepare_checkpoint(control, child_index)?;
@@ -9031,6 +9989,19 @@ impl Database {
                         if key_preserved {
                             continue;
                         }
+                        // S1B-003: the referenced parent key is genuinely being
+                        // removed (delete, or the delete half of a key-changing
+                        // update), for every FK action — hold an Exclusive
+                        // parent-protection lock against concurrent child
+                        // inserts referencing it. RESTRICT fks are enforced in
+                        // Phase B; the claim covers them too.
+                        self.acquire_fk_lock(
+                            txn_id,
+                            table_id,
+                            &parent_key,
+                            crate::locks::LockMode::Exclusive,
+                            control,
+                        )?;
                         match fk.on_delete {
                             FkAction::Restrict => continue,
                             FkAction::Cascade => {
@@ -9163,6 +10134,17 @@ impl Database {
                                 fk.name, fk.ref_table
                             )));
                         };
+                        // S1B-003: hold a Shared parent-protection lock on the
+                        // referenced key while checking existence, so a
+                        // concurrent parent delete or key-changing update
+                        // serializes against this insert.
+                        self.acquire_fk_lock(
+                            txn_id,
+                            parent_id,
+                            &child_key,
+                            crate::locks::LockMode::Shared,
+                            control,
+                        )?;
                         let parent_rows = load_rows(parent_id)?;
                         let mut found = false;
                         for (row_index, r) in parent_rows.iter().enumerate() {
@@ -9238,6 +10220,17 @@ impl Database {
                                 {
                                     continue;
                                 }
+                                // S1B-003: the referenced key is being changed —
+                                // hold an Exclusive parent-protection lock
+                                // against concurrent child inserts referencing
+                                // the old key.
+                                self.acquire_fk_lock(
+                                    txn_id,
+                                    *table_id,
+                                    &old_key,
+                                    crate::locks::LockMode::Exclusive,
+                                    control,
+                                )?;
                                 for (child_index, child) in
                                     load_rows(*child_id)?.into_iter().enumerate()
                                 {
@@ -9529,6 +10522,7 @@ impl Database {
         security_principal: Option<crate::auth::Principal>,
         principal_catalog_bound: bool,
         external_trigger_bridge: Option<&dyn ExternalTriggerBridge>,
+        context: crate::txn::TxnCommitContext,
     ) -> Result<(Epoch, Vec<RowId>)> {
         self.commit_transaction_with_external_states_inner(
             txn_id,
@@ -9539,6 +10533,7 @@ impl Database {
             security_principal,
             principal_catalog_bound,
             external_trigger_bridge,
+            context,
             None,
             None,
         )
@@ -9555,6 +10550,7 @@ impl Database {
         security_principal: Option<crate::auth::Principal>,
         principal_catalog_bound: bool,
         external_trigger_bridge: Option<&dyn ExternalTriggerBridge>,
+        context: crate::txn::TxnCommitContext,
         control: &crate::ExecutionControl,
         before_commit: &mut dyn FnMut() -> Result<()>,
     ) -> Result<(Epoch, Vec<RowId>)> {
@@ -9567,6 +10563,7 @@ impl Database {
             security_principal,
             principal_catalog_bound,
             external_trigger_bridge,
+            context,
             Some(control),
             Some(before_commit),
         )
@@ -9583,6 +10580,7 @@ impl Database {
         mut security_principal: Option<crate::auth::Principal>,
         principal_catalog_bound: bool,
         external_trigger_bridge: Option<&dyn ExternalTriggerBridge>,
+        context: crate::txn::TxnCommitContext,
         control: Option<&crate::ExecutionControl>,
         mut before_commit: Option<&mut dyn FnMut() -> Result<()>>,
     ) -> Result<(Epoch, Vec<RowId>)> {
@@ -9632,6 +10630,54 @@ impl Database {
                 "database poisoned by fsync error".into(),
             ));
         }
+        // S1A-004: admit the commit as one core operation (rejects once the
+        // core is draining, closing, closed, or lifecycle-poisoned; the legacy
+        // fsync-poison error above still wins for a WAL-poisoned core).
+        let _operation = self.admit_operation()?;
+
+        // ── S1B-003: user transactions hold the schema barrier Shared for the
+        // whole commit so DDL (Exclusive) excludes concurrent DML. Internal
+        // commits (catalog backfills, external-table state — `context.state`
+        // is `None`) skip it: they run under their DDL operation's own
+        // Exclusive hold, and acquiring a second, differently-keyed hold here
+        // would self-deadlock. The guard releases every lock this commit
+        // acquired — schema barrier, unique claims, sequence barriers, FK
+        // holds — on every exit path (S1B-004 step 12).
+        if context.state.is_some() {
+            self.acquire_txn_lock(
+                txn_id,
+                crate::locks::LockKey::schema_barrier(),
+                crate::locks::LockMode::Shared,
+                control,
+            )?;
+        }
+        let _txn_lock_guard = TxnLockGuard {
+            locks: &self.lock_manager,
+            txn_id,
+        };
+
+        // ── S1B-005: idempotency check BEFORE the proposal. A repeated key
+        // with an identical request replays the original receipt without
+        // re-executing; a different request under the same key conflicts; a
+        // new key is reserved durably before any WAL record can become
+        // durable, so a crash mid-commit fails closed on retry.
+        let idempotency_request = match &context.idempotency {
+            Some(request) => match self.idempotency.check_and_reserve(request)? {
+                crate::txn::IdempotencyCheck::Replay(receipt) => {
+                    let epoch = Epoch(receipt.log_position.index);
+                    if let Some(state) = &context.state {
+                        state.committed(receipt);
+                    }
+                    return Ok((epoch, Vec::new()));
+                }
+                crate::txn::IdempotencyCheck::Reserved => Some(request.clone()),
+            },
+            None => None,
+        };
+        // Release the reservation on every pre-receipt failure path.
+        let mut idempotency_guard = idempotency_request.as_ref().map(|request| {
+            crate::txn::IdempotencyReservationGuard::new(&self.idempotency, request.clone())
+        });
         let mut external_states = dedup_external_states(external_states);
         if !external_states.is_empty() {
             let cat = self.catalog.read();
@@ -9676,15 +10722,16 @@ impl Database {
 
         // ── 1. Prepare: fill generated values, expand triggers, validate, then
         // derive write keys from the final atomic write set.
-        self.fill_auto_increment_for_staging(&mut staging, control)?;
+        self.fill_auto_increment_for_staging(txn_id, &mut staging, control)?;
         self.expand_table_triggers(
+            txn_id,
             &mut staging,
             read_epoch,
             external_trigger_bridge,
             &mut external_states,
             control,
         )?;
-        self.fill_auto_increment_for_staging(&mut staging, control)?;
+        self.fill_auto_increment_for_staging(txn_id, &mut staging, control)?;
         external_states = dedup_external_states(external_states);
         let expected_external_generations = {
             let catalog = self.catalog.read();
@@ -9702,11 +10749,17 @@ impl Database {
             generations
         };
 
+        // S1B-003: claim every unique key this transaction inserts (primary
+        // keys and declared UNIQUE constraints) in Exclusive mode BEFORE
+        // validation reads. Concurrent inserts of the same key serialize on
+        // the claim instead of racing to a write-write conflict; the
+        // first-committer-wins index below remains the safety net.
+        self.acquire_unique_key_claims(txn_id, &staging, control)?;
         // Validate declarative constraints (unique / FK / check) under the read
         // snapshot, outside the WAL mutex. Trigger-produced writes are included
         // here, so the batch either satisfies every declared constraint or is
         // rejected atomically.
-        self.validate_constraints(&mut staging, read_epoch, control)?;
+        self.validate_constraints(txn_id, &mut staging, read_epoch, control)?;
         self.validate_write_permissions(&staging, security_principal.as_ref(), control)?;
         self.validate_security_writes(&staging, read_epoch, security_principal.as_ref(), control)?;
         let mut normalized = Vec::with_capacity(staging.len() * 2);
@@ -9811,6 +10864,19 @@ impl Database {
             self.conflicts.prune_below(Epoch(min_active));
         }
 
+        // S1B-002 (Serializable): SSI certification keys — every tracked point
+        // read as a row key, every tracked predicate/range read as a table
+        // key. A concurrent commit covering any of them after this
+        // transaction's read epoch is an rw-antidependency dangerous
+        // structure; certification aborts rather than allowing a
+        // non-serializable interleaving.
+        let ssi_keys = match context.isolation.canonical() {
+            crate::txn::IsolationLevel::Serializable => {
+                crate::txn::ssi_validation_keys(&context.read_set, &context.predicate_set)
+            }
+            _ => Vec::new(),
+        };
+
         // ── 1a. Pre-validate the full write-set OUTSIDE the sequencer (spec
         // §8.5, review fix #17). Snapshot the conflict-index version so the
         // sequencer only re-checks if new commits arrived in the interim.
@@ -9818,6 +10884,12 @@ impl Database {
             return Err(MongrelError::Conflict(
                 "write-write conflict (pre-validate, first-committer-wins)".into(),
             ));
+        }
+        if !ssi_keys.is_empty() && self.conflicts.conflicts(&ssi_keys, read_epoch) {
+            return Err(MongrelError::SerializationFailure {
+                message: "a concurrent commit invalidated this transaction's reads (pre-validate)"
+                    .into(),
+            });
         }
         let pre_validate_version = self.conflicts.version();
 
@@ -10048,6 +11120,18 @@ impl Database {
         }
 
         // ── 2. Sequencer: validate-first → assign → append → sync → record ──
+        //
+        // The schema barrier's Shared hold covered the prepare/validate phases
+        // above (every catalog, constraint, and claim read ran under a stable
+        // schema); the publish below is guarded by the catalog-generation
+        // check, exactly as before S1B-003. Release the barrier here — before
+        // the sequencer — so a DDL waiting on its Exclusive hold may proceed
+        // while this commit publishes (the generation check resolves that
+        // race). Unique/sequence/FK claims stay held until the commit ends.
+        if context.state.is_some() {
+            self.lock_manager
+                .release(txn_id, &crate::locks::LockKey::schema_barrier());
+        }
         let added_runs: Vec<crate::wal::AddedRun> = spilled
             .iter()
             .map(|s| crate::wal::AddedRun {
@@ -10174,25 +11258,46 @@ impl Database {
             }
             return Err(error);
         }
-        let (new_epoch, mut _epoch_guard, applies, committed_materialized_views, commit_seq) = {
+        let (
+            new_epoch,
+            mut _epoch_guard,
+            applies,
+            committed_materialized_views,
+            commit_seq,
+            commit_ts,
+        ) = {
             let mut wal = self.shared_wal.lock();
 
             // Re-check only if the conflict index advanced since pre-validation
             // (bounded delta — spec §8.5, review fix #17). If the version is
             // unchanged, the pre-check result is still valid and the sequencer
             // does O(1) work regardless of write-set size.
-            if self.conflicts.version() != pre_validate_version
-                && self.conflicts.conflicts(&write_keys, read_epoch)
-            {
-                // Abort: this txn assigned no epoch yet. The prepared-run guard
-                // restores final run names to their pending paths on return.
-                drop(wal);
-                for (_, _, pending) in &prepared_external {
-                    let _ = std::fs::remove_file(pending);
+            if self.conflicts.version() != pre_validate_version {
+                if self.conflicts.conflicts(&write_keys, read_epoch) {
+                    // Abort: this txn assigned no epoch yet. The prepared-run guard
+                    // restores final run names to their pending paths on return.
+                    drop(wal);
+                    for (_, _, pending) in &prepared_external {
+                        let _ = std::fs::remove_file(pending);
+                    }
+                    return Err(MongrelError::Conflict(
+                        "write-write conflict (sequencer delta re-check)".into(),
+                    ));
                 }
-                return Err(MongrelError::Conflict(
-                    "write-write conflict (sequencer delta re-check)".into(),
-                ));
+                if !ssi_keys.is_empty() && self.conflicts.conflicts(&ssi_keys, read_epoch) {
+                    // S1B-002 dangerous structure: a commit that landed between
+                    // the pre-check and the sequencer invalidated a tracked
+                    // read. Abort before assigning any epoch.
+                    drop(wal);
+                    for (_, _, pending) in &prepared_external {
+                        let _ = std::fs::remove_file(pending);
+                    }
+                    return Err(MongrelError::SerializationFailure {
+                        message:
+                            "a concurrent commit invalidated this transaction's reads (sequencer re-check)"
+                                .into(),
+                    });
+                }
             }
 
             if let Some(control) = control {
@@ -10388,6 +11493,25 @@ impl Database {
                 ));
             }
 
+            // S1B-004 steps 5–6: assign the commit timestamp (spec §8.2:
+            // strictly greater than every participant read/write timestamp of
+            // this transaction — the transaction's HLC read timestamp captured
+            // at `begin` is threaded through the commit context) and enter
+            // commit-critical state before the proposal can become durable.
+            // Internal commits with no transaction timestamp allocate from the
+            // fail-closed clock gate instead.
+            let commit_ts = match context.read_ts {
+                Some(read_ts) => self.hlc.commit_timestamp([read_ts]),
+                None => self.hlc.now().map_err(|skew| {
+                    MongrelError::Other(format!(
+                        "clock skew rejected commit timestamp allocation: {skew}"
+                    ))
+                })?,
+            };
+            if let Some(state) = &context.state {
+                state.enter_commit_critical();
+            }
+
             // From this point the outcome can become ambiguous. Keep prepared
             // spill files at the final names referenced by a possibly durable
             // commit marker; orphan cleanup is safe when the append did fail.
@@ -10398,7 +11522,14 @@ impl Database {
             // proposes through it; durability and the receipt follow below.
             let commit_seq = self
                 .commit_log
-                .append_transaction(&mut wal, txn_id, new_epoch, wal_records, &added_runs)
+                .append_transaction(
+                    &mut wal,
+                    txn_id,
+                    new_epoch,
+                    commit_ts,
+                    wal_records,
+                    &added_runs,
+                )
                 .map_err(|error| self.commit_outcome_unknown(new_epoch, error))?;
 
             // Record the conflict + assign the epoch under the WAL lock so commit
@@ -10412,13 +11543,33 @@ impl Database {
                 applies,
                 committed_materialized_views,
                 commit_seq,
+                commit_ts,
             )
         };
         drop(commit_guard);
 
         // ── 2b. Durability: one leader fsync serves this whole batch (P3.2). ──
-        let receipt = self.await_durable_commit(txn_id, commit_seq, new_epoch)?;
+        let receipt =
+            self.await_durable_commit_with_ts(txn_id, commit_seq, new_epoch, commit_ts)?;
         drop(security_guard);
+
+        // ── S1B-005: record the receipt against the reserved idempotency key
+        // (durable before the caller can observe success), so a repeated key
+        // with an identical request replays this receipt.
+        if let Some(request) = &idempotency_request {
+            if let Err(error) =
+                self.idempotency
+                    .complete(request, txn_id, new_epoch, receipt.commit_ts)
+            {
+                return Err(MongrelError::DurableCommit {
+                    epoch: new_epoch.0,
+                    message: format!("idempotency record was not durable: {error}"),
+                });
+            }
+            if let Some(guard) = idempotency_guard.as_mut() {
+                guard.disarm();
+            }
+        }
 
         // ── 3. Publish: apply non-spilled ops + link spilled runs ──
         let publish_result: Result<()> = {
@@ -10511,6 +11662,12 @@ impl Database {
             let _ = self.change_wake.send(());
         }
         self.finish_durable_publish(new_epoch, &mut _epoch_guard, &receipt, publish_result)?;
+        // S1B-001: the commit is durable and published — record the receipt on
+        // the formal state. (Post-publish errors above return `DurableCommit`
+        // and deliberately leave the state `CommitCritical`.)
+        if let Some(state) = &context.state {
+            state.committed(receipt.clone());
+        }
         Ok((new_epoch, committed_row_ids))
     }
 
@@ -10627,6 +11784,8 @@ impl Database {
     /// honored by `Table::compact`. Returns `(tables_compacted, tables_skipped)`.
     pub fn compact(&self) -> Result<(usize, usize)> {
         self.require(&crate::auth::Permission::Ddl)?;
+        // S1A-004: admit the compaction pass as one core operation.
+        let _operation = self.admit_operation()?;
         let mut compacted = 0;
         let mut skipped = 0;
         for name in self.table_names() {
@@ -10703,6 +11862,33 @@ impl Database {
             .get(&id)
             .cloned()
             .ok_or_else(|| MongrelError::NotFound(format!("table id {id} not mounted")))
+    }
+
+    /// S1B-003: whether staging `cells` on `table_id` would ALLOCATE an
+    /// auto-increment value — the auto-inc column absent or `Null`, mirroring
+    /// `Table::fill_auto_inc`. The sequence barrier is held only for actual
+    /// allocation; explicit values merely advance the counter (an
+    /// order-insensitive `max` under the table lock) and must not serialize.
+    pub(crate) fn table_auto_inc_would_allocate(
+        &self,
+        table_id: u64,
+        cells: &[(u16, Value)],
+    ) -> bool {
+        let catalog = self.catalog.read();
+        let Some(entry) = catalog
+            .tables
+            .iter()
+            .find(|entry| entry.table_id == table_id)
+        else {
+            return false;
+        };
+        let Some(column) = entry.schema.auto_increment_column() else {
+            return false;
+        };
+        matches!(
+            cells.iter().find(|(id, _)| *id == column.id),
+            None | Some((_, Value::Null))
+        )
     }
 
     /// Create a new table. The DDL is first logged to the shared WAL
@@ -10801,7 +11987,9 @@ impl Database {
                 "database poisoned by fsync error".into(),
             ));
         }
-
+        // S1A-004: admit the DDL as one core operation.
+        let _operation = self.admit_operation()?;
+        let _schema_barrier = self.acquire_schema_barrier_exclusive()?;
         let _g = self.ddl_lock.lock();
         let _security_write = self.security_write()?;
         self.require(&crate::auth::Permission::Ddl)?;
@@ -10846,41 +12034,81 @@ impl Database {
         }
 
         // Allocate id + epoch + txn id under the commit lock so the DDL commit
-        // is serialized with data commits (in-order publish).
+        // is serialized with data commits (in-order publish). Live creates
+        // draw their table id from the routed catalog command below (S1F-001);
+        // CTAS building-table creates keep the legacy direct allocation.
         let commit_lock = Arc::clone(&self.commit_lock);
         let _c = commit_lock.lock();
-        let table_id = {
+        let live_create = matches!(state, TableState::Live);
+        let legacy_table_id = if live_create {
+            None
+        } else {
             let mut cat = self.catalog.write();
             let id = cat.next_table_id;
             cat.next_table_id = id
                 .checked_add(1)
                 .ok_or_else(|| MongrelError::InvalidArgument("table id space exhausted".into()))?;
-            Result::<u64>::Ok(id)
-        }?;
+            Some(id)
+        };
         let epoch = self.epoch.bump_assigned();
         let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
         let txn_id = self.alloc_txn_id()?;
 
-        // Stamp the schema_id with the unique table_id so every table in the
-        // database has a distinct schema_id (caller-provided values are
-        // ignored to prevent collisions).
         let mut schema = schema;
-        schema.schema_id = table_id;
-        // Defense in depth: reject an invalid schema BEFORE any durable
-        // side-effect. `Table::create_in` re-validates, but by then the DDL has
-        // already been appended to the shared WAL; a failing create_in would
-        // leave a dangling entry that `recover_ddl_from_wal` replays without
-        // re-validating, corrupting the catalog on reopen. Validating here
-        // keeps the WAL free of schemas that can never be opened.
-        schema.validate_auto_increment()?;
-        schema.validate_defaults()?;
-        schema.validate_ai()?;
-        for index in &schema.indexes {
-            index.validate_options()?;
+        if let Some(table_id) = legacy_table_id {
+            // Stamp the schema_id with the unique table_id so every table in
+            // the database has a distinct schema_id (caller-provided values
+            // are ignored to prevent collisions).
+            schema.schema_id = table_id;
+            // Defense in depth: reject an invalid schema BEFORE any durable
+            // side-effect. `Table::create_in` re-validates, but by then the
+            // DDL has already been appended to the shared WAL; a failing
+            // create_in would leave a dangling entry that `recover_ddl_from_wal`
+            // replays without re-validating, corrupting the catalog on reopen.
+            // Validating here keeps the WAL free of schemas that can never be
+            // opened.
+            schema.validate_auto_increment()?;
+            schema.validate_defaults()?;
+            schema.validate_ai()?;
+            for index in &schema.indexes {
+                index.validate_options()?;
+            }
+            for constraint in &schema.constraints.checks {
+                constraint.expr.validate()?;
+            }
         }
-        for constraint in &schema.constraints.checks {
-            constraint.expr.validate()?;
-        }
+
+        let mut next_catalog = self.catalog.read().clone();
+        let (table_id, schema) = match legacy_table_id {
+            Some(table_id) => {
+                next_catalog.tables.push(CatalogEntry {
+                    table_id,
+                    name: name.to_string(),
+                    schema: schema.clone(),
+                    state: state.clone(),
+                    created_epoch: epoch.0,
+                });
+                (table_id, schema)
+            }
+            None => {
+                // S1F-001: the mutation is a versioned catalog command —
+                // schema validation (the same five validators), table-id
+                // allocation, and schema_id stamping all resolve inside it.
+                let command = crate::catalog_cmds::CatalogCommand::CreateTable {
+                    name: name.to_string(),
+                    schema,
+                    created_epoch: epoch.0,
+                };
+                let delta = self.apply_catalog_command_to(&mut next_catalog, command)?;
+                let crate::catalog_cmds::CatalogDelta::TableCreated { entry } = delta else {
+                    return Err(MongrelError::Other(
+                        "CreateTable resolved to an unexpected catalog delta".into(),
+                    ));
+                };
+                (entry.table_id, entry.schema)
+            }
+        };
+        next_catalog.db_epoch = next_catalog.db_epoch.max(epoch.0);
 
         // Build the complete mounted table before its DDL can become durable.
         // Any failure removes the unpublished directory and abandons the epoch.
@@ -10906,6 +12134,7 @@ impl Database {
                 poisoned: Arc::clone(&self.poisoned),
                 txn_ids: Arc::clone(&self.next_txn_id),
                 change_wake: self.change_wake.clone(),
+                lifecycle: Arc::clone(&self.lifecycle),
             }),
             table_name: Some(name.to_string()),
             auth: self.table_auth_checker(),
@@ -10952,15 +12181,6 @@ impl Database {
                 ));
             }
         };
-        let mut next_catalog = self.catalog.read().clone();
-        next_catalog.tables.push(CatalogEntry {
-            table_id,
-            name: name.to_string(),
-            schema: schema.clone(),
-            state: state.clone(),
-            created_epoch: epoch.0,
-        });
-        next_catalog.db_epoch = next_catalog.db_epoch.max(epoch.0);
         let commit_seq = {
             let mut wal = self.shared_wal.lock();
             let append: Result<u64> = (|| {
@@ -11030,7 +12250,9 @@ impl Database {
                 "database poisoned by fsync error".into(),
             ));
         }
-
+        // S1A-004: admit the DDL as one core operation.
+        let _operation = self.admit_operation()?;
+        let _schema_barrier = self.acquire_schema_barrier_exclusive()?;
         let _g = self.ddl_lock.lock();
         let _security_write = self.security_write()?;
         self.require(&crate::auth::Permission::Ddl)?;
@@ -11051,38 +12273,51 @@ impl Database {
         let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
         let txn_id = self.alloc_txn_id()?;
         let mut next_catalog = self.catalog.read().clone();
-        let entry = next_catalog
-            .tables
-            .iter_mut()
-            .find(|t| t.table_id == table_id)
-            .ok_or_else(|| MongrelError::NotFound(format!("table {name:?} not found")))?;
-        entry.state = TableState::Dropped { at_epoch: epoch.0 };
-        next_catalog.triggers.retain(|trigger| {
-            !matches!(
-                &trigger.trigger.target,
-                TriggerTarget::Table(target) if target == name
-            )
-        });
-        next_catalog
-            .materialized_views
-            .retain(|definition| definition.name != name);
-        next_catalog
-            .security
-            .rls_tables
-            .retain(|table| table != name);
-        next_catalog
-            .security
-            .policies
-            .retain(|policy| policy.table != name);
-        next_catalog
-            .security
-            .masks
-            .retain(|mask| mask.table != name);
-        for role in &mut next_catalog.roles {
-            role.permissions
-                .retain(|permission| permission_table(permission) != Some(name));
+        if building {
+            // CTAS building-table discards stay on the legacy mutation: the
+            // command model's `DropTable` resolves live tables only.
+            let entry = next_catalog
+                .tables
+                .iter_mut()
+                .find(|t| t.table_id == table_id)
+                .ok_or_else(|| MongrelError::NotFound(format!("table {name:?} not found")))?;
+            entry.state = TableState::Dropped { at_epoch: epoch.0 };
+            next_catalog.triggers.retain(|trigger| {
+                !matches!(
+                    &trigger.trigger.target,
+                    TriggerTarget::Table(target) if target == name
+                )
+            });
+            next_catalog
+                .materialized_views
+                .retain(|definition| definition.name != name);
+            next_catalog
+                .security
+                .rls_tables
+                .retain(|table| table != name);
+            next_catalog
+                .security
+                .policies
+                .retain(|policy| policy.table != name);
+            next_catalog
+                .security
+                .masks
+                .retain(|mask| mask.table != name);
+            for role in &mut next_catalog.roles {
+                role.permissions
+                    .retain(|permission| permission_table(permission) != Some(name));
+            }
+            advance_security_version(&mut next_catalog)?;
+        } else {
+            // S1F-001: a plain live-table drop is a versioned catalog command
+            // (the delta mirrors the legacy mutation above, cascading
+            // triggers, materialized views, and table-scoped security state).
+            let command = crate::catalog_cmds::CatalogCommand::DropTable {
+                name: name.to_string(),
+                at_epoch: epoch.0,
+            };
+            self.apply_catalog_command_to(&mut next_catalog, command)?;
         }
-        advance_security_version(&mut next_catalog)?;
         next_catalog.db_epoch = next_catalog.db_epoch.max(epoch.0);
         let commit_seq = {
             let mut wal = self.shared_wal.lock();
@@ -11302,7 +12537,9 @@ impl Database {
                 "database poisoned by fsync error".into(),
             ));
         }
-
+        // S1A-004: admit the DDL as one core operation.
+        let _operation = self.admit_operation()?;
+        let _schema_barrier = self.acquire_schema_barrier_exclusive()?;
         let _ddl = self.ddl_lock.lock();
         let _security_write = self.security_write()?;
         let (table_id, replaced_table_id) = {
@@ -11439,7 +12676,9 @@ impl Database {
                 "rename_table: new name must not be empty".into(),
             ));
         }
-
+        // S1A-004: admit the DDL as one core operation.
+        let _operation = self.admit_operation()?;
+        let _schema_barrier = self.acquire_schema_barrier_exclusive()?;
         let _g = self.ddl_lock.lock();
         let _security_write = self.security_write()?;
         self.require(&crate::auth::Permission::Ddl)?;
@@ -11485,55 +12724,67 @@ impl Database {
             .map(DdlOp::encode_materialized_view)
             .transpose()?;
         let mut next_catalog = self.catalog.read().clone();
-        let entry = next_catalog
-            .tables
-            .iter_mut()
-            .find(|t| t.table_id == table_id)
-            .ok_or_else(|| MongrelError::NotFound(format!("table {name:?} not found")))?;
-        entry.name = new_name.to_string();
         if building {
+            // CTAS building-table publishes stay on the legacy mutation: the
+            // command model's `RenameTable` resolves live tables only.
+            let entry = next_catalog
+                .tables
+                .iter_mut()
+                .find(|t| t.table_id == table_id)
+                .ok_or_else(|| MongrelError::NotFound(format!("table {name:?} not found")))?;
+            entry.name = new_name.to_string();
             entry.state = TableState::Live;
-        }
-        for trigger in &mut next_catalog.triggers {
-            if matches!(
-                &trigger.trigger.target,
-                TriggerTarget::Table(target) if target == name
-            ) {
-                trigger.trigger = trigger.trigger.retarget_table(new_name, epoch.0)?;
+            for trigger in &mut next_catalog.triggers {
+                if matches!(
+                    &trigger.trigger.target,
+                    TriggerTarget::Table(target) if target == name
+                ) {
+                    trigger.trigger = trigger.trigger.retarget_table(new_name, epoch.0)?;
+                }
             }
-        }
-        if let Some(definition) = next_catalog
-            .materialized_views
-            .iter_mut()
-            .find(|definition| definition.name == name)
-        {
-            definition.name = new_name.to_string();
-        }
-        if let Some(definition) = materialized_view.take() {
-            next_catalog.materialized_views.push(definition);
+            if let Some(definition) = next_catalog
+                .materialized_views
+                .iter_mut()
+                .find(|definition| definition.name == name)
+            {
+                definition.name = new_name.to_string();
+            }
+            if let Some(definition) = materialized_view.take() {
+                next_catalog.materialized_views.push(definition);
+            }
+            for table in &mut next_catalog.security.rls_tables {
+                if table == name {
+                    *table = new_name.to_string();
+                }
+            }
+            for policy in &mut next_catalog.security.policies {
+                if policy.table == name {
+                    policy.table = new_name.to_string();
+                }
+            }
+            for mask in &mut next_catalog.security.masks {
+                if mask.table == name {
+                    mask.table = new_name.to_string();
+                }
+            }
+            for role in &mut next_catalog.roles {
+                for permission in &mut role.permissions {
+                    rename_permission_table(permission, name, new_name);
+                }
+            }
+            advance_security_version(&mut next_catalog)?;
+        } else {
+            // S1F-001: a plain live-table rename is a versioned catalog
+            // command (the delta mirrors the legacy mutation above, including
+            // trigger retargets and table-scoped security state).
+            let command = crate::catalog_cmds::CatalogCommand::RenameTable {
+                name: name.to_string(),
+                new_name: new_name.to_string(),
+                at_epoch: epoch.0,
+            };
+            self.apply_catalog_command_to(&mut next_catalog, command)?;
         }
         next_catalog.db_epoch = next_catalog.db_epoch.max(epoch.0);
-        for table in &mut next_catalog.security.rls_tables {
-            if table == name {
-                *table = new_name.to_string();
-            }
-        }
-        for policy in &mut next_catalog.security.policies {
-            if policy.table == name {
-                policy.table = new_name.to_string();
-            }
-        }
-        for mask in &mut next_catalog.security.masks {
-            if mask.table == name {
-                mask.table = new_name.to_string();
-            }
-        }
-        for role in &mut next_catalog.roles {
-            for permission in &mut role.permissions {
-                rename_permission_table(permission, name, new_name);
-            }
-        }
-        advance_security_version(&mut next_catalog)?;
         let ddl = if building {
             DdlOp::PublishBuildingTable {
                 table_id,
@@ -11645,7 +12896,9 @@ impl Database {
                 "database poisoned by fsync error".into(),
             ));
         }
-
+        // S1A-004: admit the DDL as one core operation.
+        let _operation = self.admit_operation()?;
+        let _schema_barrier = self.acquire_schema_barrier_exclusive()?;
         let _g = self.ddl_lock.lock();
         let table_id = {
             let cat = self.catalog.read();
@@ -11724,6 +12977,7 @@ impl Database {
                         principal.clone(),
                         catalog_bound,
                         None,
+                        crate::txn::TxnCommitContext::internal(),
                         control,
                         &mut || {
                             before_commit()?;
@@ -11742,6 +12996,7 @@ impl Database {
                         principal,
                         catalog_bound,
                         None,
+                        crate::txn::TxnCommitContext::internal(),
                     )
                     .map(|(epoch, _)| epoch),
             };
@@ -11778,6 +13033,15 @@ impl Database {
             let Some(prepared_schema) = prepared_schema else {
                 return Ok((column, backfill_epoch));
             };
+            // S1F-001: the schema mutation is a versioned catalog command. It
+            // validates pure against the current catalog before an epoch is
+            // consumed; the engine's post-apply schema (schema_id bump
+            // included) is the resolved delta the wrapper publishes.
+            let command = crate::catalog_cmds::CatalogCommand::AlterColumn {
+                table: table_name.to_string(),
+                column: column.clone(),
+            };
+            crate::catalog_cmds::apply(&self.catalog.read(), &command)?;
 
             let commit_lock = Arc::clone(&self.commit_lock);
             let _c = commit_lock.lock();
@@ -11819,6 +13083,12 @@ impl Database {
                 }
                 advance_security_version(&mut next_catalog)?;
             }
+            // Record the versioned command (validating again against the
+            // candidate), then install the engine-resolved schema image:
+            // identical to the command's delta when the mounted table and the
+            // catalog are in sync, and byte-for-byte what the legacy inline
+            // mutation published either way.
+            self.apply_catalog_command_to(&mut next_catalog, command)?;
             next_catalog.tables[catalog_entry_index].schema = prepared_schema.clone();
             next_catalog.db_epoch = next_catalog.db_epoch.max(epoch.0);
             commit_prepare_checkpoint(control, 0)?;
@@ -11866,6 +13136,7 @@ impl Database {
                 _epoch_guard.disarm();
                 if let Err(error) = table_checkpoint.and(catalog_result) {
                     self.poisoned.store(true, Ordering::Relaxed);
+                    self.lifecycle.poison();
                     return Err(MongrelError::DurableCommit {
                         epoch: epoch.0,
                         message: error.to_string(),
@@ -12057,6 +13328,8 @@ impl Database {
         }
 
         self.require(&crate::auth::Permission::Ddl)?;
+        // S1A-004: admit the maintenance pass as one core operation.
+        let _operation = self.admit_operation()?;
         let _ddl = self.ddl_lock.lock();
         self.require(&crate::auth::Permission::Ddl)?;
         control.checkpoint()?;
@@ -12265,6 +13538,8 @@ impl Database {
         F: FnOnce() -> Result<()>,
     {
         self.require(&crate::auth::Permission::Ddl)?;
+        // S1A-004: admit the checkpoint as one core operation.
+        let _operation = self.admit_operation()?;
         // Block cross-table commits and DDL for the full operation. Locking all
         // mounted handles also excludes direct `Table` commits, which do not
         // enter the database replication barrier.
@@ -12427,6 +13702,14 @@ impl Database {
     #[doc(hidden)]
     pub fn __set_backup_hook(&self, f: impl Fn() + Send + Sync + 'static) {
         *self.backup_hook.lock() = Some(Box::new(f));
+    }
+
+    /// Test-only: invoked after each successful FK parent-protection lock
+    /// acquisition during constraint validation, so tests can rendezvous two
+    /// committing transactions into a deterministic wait-for cycle.
+    #[doc(hidden)]
+    pub fn __set_fk_lock_hook(&self, f: impl Fn() + Send + Sync + 'static) {
+        *self.fk_lock_hook.lock() = Some(Arc::new(f));
     }
 
     /// Test-only: pause WAL extraction before its final principal recheck.
@@ -14595,6 +15878,56 @@ fn validate_trigger_value(
     }
 }
 
+/// Bound on the retained tail of the per-open commit-timestamp ledger
+/// ([`Database::commit_ts_for_epoch`]): the read-your-writes lookup only ever
+/// needs recent epochs, so the map keeps the newest commits and drops the
+/// rest (a miss falls back to a fresh-begin HLC at the caller).
+const COMMIT_TS_LEDGER_CAP: usize = 10_000;
+
+/// Rebuild the per-open epoch → commit-timestamp ledger from the validated
+/// WAL recovery plan: `Op::TxnCommit` maps a transaction to its commit epoch
+/// and the `Op::CommitTimestamp` record written ahead of it carries the
+/// physical HLC component as nanos (spec §8.1). Reconstructed timestamps
+/// carry `logical`/`node_tiebreaker` as 0 — the ledger byte format stores
+/// micros only (same constraint [`crate::commit_log`] documents for replayed
+/// receipts). Only the newest [`COMMIT_TS_LEDGER_CAP`] epochs are retained.
+fn commit_ts_ledger_from_recovery(
+    records: &[crate::wal::Record],
+) -> std::collections::BTreeMap<u64, mongreldb_types::hlc::HlcTimestamp> {
+    use crate::wal::Op;
+    let mut commits = HashMap::new();
+    let mut timestamps = HashMap::new();
+    for record in records {
+        match &record.op {
+            Op::TxnCommit { epoch, .. } => {
+                commits.insert(record.txn_id, *epoch);
+            }
+            Op::CommitTimestamp { unix_nanos } => {
+                timestamps.insert(record.txn_id, *unix_nanos);
+            }
+            _ => {}
+        }
+    }
+    let mut ledger = std::collections::BTreeMap::new();
+    for (txn_id, epoch) in commits {
+        let Some(unix_nanos) = timestamps.get(&txn_id) else {
+            continue;
+        };
+        ledger.insert(
+            epoch,
+            mongreldb_types::hlc::HlcTimestamp {
+                physical_micros: unix_nanos / 1_000,
+                logical: 0,
+                node_tiebreaker: 0,
+            },
+        );
+    }
+    while ledger.len() > COMMIT_TS_LEDGER_CAP {
+        ledger.pop_first();
+    }
+    ledger
+}
+
 /// Replay committed `Op::Ddl` records from the shared WAL into the catalog
 /// (spec §15, review fix #16). A crash between WAL group-sync and the catalog
 /// checkpoint leaves DDL durable in the WAL but absent from the on-disk
@@ -16143,100 +17476,7 @@ fn rename_permission_column(
     }
 }
 
-fn merge_permission(
-    permissions: &mut Vec<crate::auth::Permission>,
-    permission: crate::auth::Permission,
-) {
-    use crate::auth::Permission;
-    let (kind, table, mut columns) = match permission {
-        Permission::SelectColumns { table, columns } => (0, table, columns),
-        Permission::InsertColumns { table, columns } => (1, table, columns),
-        Permission::UpdateColumns { table, columns } => (2, table, columns),
-        permission if !permissions.contains(&permission) => {
-            permissions.push(permission);
-            return;
-        }
-        _ => return,
-    };
-    for permission in permissions.iter_mut() {
-        let existing = match permission {
-            Permission::SelectColumns {
-                table: existing_table,
-                columns,
-            } if kind == 0 && existing_table == &table => Some(columns),
-            Permission::InsertColumns {
-                table: existing_table,
-                columns,
-            } if kind == 1 && existing_table == &table => Some(columns),
-            Permission::UpdateColumns {
-                table: existing_table,
-                columns,
-            } if kind == 2 && existing_table == &table => Some(columns),
-            _ => None,
-        };
-        if let Some(existing) = existing {
-            existing.append(&mut columns);
-            existing.sort();
-            existing.dedup();
-            return;
-        }
-    }
-    columns.sort();
-    columns.dedup();
-    let permission = if kind == 0 {
-        Permission::SelectColumns { table, columns }
-    } else if kind == 1 {
-        Permission::InsertColumns { table, columns }
-    } else {
-        Permission::UpdateColumns { table, columns }
-    };
-    permissions.push(permission);
-}
-
-fn revoke_permission_from(
-    permissions: &mut Vec<crate::auth::Permission>,
-    revoked: &crate::auth::Permission,
-) {
-    use crate::auth::Permission;
-    let revoked_columns = match revoked {
-        Permission::SelectColumns { table, columns } => Some((0, table, columns)),
-        Permission::InsertColumns { table, columns } => Some((1, table, columns)),
-        Permission::UpdateColumns { table, columns } => Some((2, table, columns)),
-        _ => None,
-    };
-    let Some((kind, table, columns)) = revoked_columns else {
-        permissions.retain(|permission| permission != revoked);
-        return;
-    };
-    for permission in permissions.iter_mut() {
-        let current = match permission {
-            Permission::SelectColumns {
-                table: current_table,
-                columns,
-            } if kind == 0 && current_table == table => Some(columns),
-            Permission::InsertColumns {
-                table: current_table,
-                columns,
-            } if kind == 1 && current_table == table => Some(columns),
-            Permission::UpdateColumns {
-                table: current_table,
-                columns,
-            } if kind == 2 && current_table == table => Some(columns),
-            _ => None,
-        };
-        if let Some(current) = current {
-            current.retain(|column| !columns.contains(column));
-        }
-    }
-    permissions.retain(|permission| match permission {
-        Permission::SelectColumns { columns, .. }
-        | Permission::InsertColumns { columns, .. }
-        | Permission::UpdateColumns { columns, .. } => !columns.is_empty(),
-        _ => true,
-    });
-}
-
-fn validate_security_catalog(
+pub(crate) fn validate_security_catalog(
     catalog: &Catalog,
     security: &crate::security::SecurityCatalog,
 ) -> Result<()> {
@@ -16947,5 +18187,913 @@ mod trigger_engine_tests {
             &event_insert(&[])
         )
         .unwrap());
+    }
+}
+
+#[cfg(test)]
+mod core_resource_tests {
+    use super::*;
+
+    fn int_pk_schema() -> Schema {
+        Schema {
+            columns: vec![ColumnDef {
+                id: 1,
+                name: "id".into(),
+                ty: TypeId::Int64,
+                flags: crate::schema::ColumnFlags::empty()
+                    .with(crate::schema::ColumnFlags::PRIMARY_KEY),
+                default_value: None,
+            }],
+            ..Schema::default()
+        }
+    }
+
+    #[test]
+    fn open_constructs_governor_spill_and_jobs_with_documented_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::create(dir.path()).unwrap();
+        assert_eq!(
+            db.memory_governor().max_bytes(),
+            DEFAULT_MEMORY_BUDGET_BYTES
+        );
+        assert_eq!(
+            db.spill_manager().config().global_bytes,
+            DEFAULT_TEMP_DISK_BUDGET_BYTES
+        );
+        assert!(db.job_registry().list().is_empty());
+    }
+
+    #[test]
+    fn open_with_options_sizes_the_core_budgets() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::create(dir.path()).unwrap();
+        drop(db);
+        let db = Database::open_with_options(
+            dir.path(),
+            OpenOptions::default()
+                .with_memory_budget_bytes(256 * 1024 * 1024)
+                .with_temp_disk_budget_bytes(16 * 1024 * 1024),
+        )
+        .unwrap();
+        assert_eq!(db.memory_governor().max_bytes(), 256 * 1024 * 1024);
+        assert_eq!(db.spill_manager().config().global_bytes, 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn zero_budgets_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::create(dir.path()).unwrap();
+        drop(db);
+        let result = Database::open_with_options(
+            dir.path(),
+            OpenOptions::default().with_memory_budget_bytes(0),
+        );
+        assert!(matches!(result, Err(MongrelError::InvalidArgument(_))));
+        let result = Database::open_with_options(
+            dir.path(),
+            OpenOptions::default().with_temp_disk_budget_bytes(0),
+        );
+        assert!(matches!(result, Err(MongrelError::InvalidArgument(_))));
+    }
+
+    #[test]
+    fn page_caches_reserve_under_the_governor() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::create(dir.path()).unwrap();
+        db.create_table("t", int_pk_schema()).unwrap();
+        let mut txn = db.begin();
+        txn.put("t", vec![(1, Value::Int64(7))]).unwrap();
+        txn.commit().unwrap();
+        // S1E-003: both caches hold reservations under the core's governor, so
+        // the governor's per-class accounting mirrors their live bytes, and
+        // both are registered as reclaimable subsystems it can evict.
+        let stats = db.memory_governor().stats();
+        assert_eq!(
+            stats.usage_for(crate::memory::MemoryClass::PageCache),
+            db.page_cache.used_bytes()
+        );
+        assert_eq!(
+            stats.usage_for(crate::memory::MemoryClass::DecodedCache),
+            db.decoded_cache.used_bytes()
+        );
+        assert_eq!(
+            db.memory_governor().reclaimable_bytes(),
+            db.page_cache.used_bytes() + db.decoded_cache.used_bytes()
+        );
+        // Driving an eviction through the governor is safe at any level.
+        let _ = db.memory_governor().evict_reclaimable(1024 * 1024);
+    }
+
+    #[test]
+    fn job_registry_persists_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::create(dir.path()).unwrap();
+        db.create_table("t", int_pk_schema()).unwrap();
+        let job_id = db
+            .job_registry()
+            .submit(
+                crate::jobs::JobKind::IndexBuild,
+                crate::jobs::JobTarget {
+                    table: "t".to_string(),
+                    index: Some("idx".to_string()),
+                },
+            )
+            .unwrap();
+        drop(db);
+        let db = Database::open(dir.path()).unwrap();
+        let record = db.job_registry().get(job_id).expect("job survives reopen");
+        assert_eq!(record.state, crate::jobs::JobState::Pending);
+    }
+
+    #[test]
+    fn spill_manager_open_sweeps_stale_temp_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::create(dir.path()).unwrap();
+        let stale = dir.path().join("temp").join("spill").join("q-deadbeef");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("chunk-0"), b"stale").unwrap();
+        drop(db);
+        let db = Database::open(dir.path()).unwrap();
+        assert!(
+            !stale.exists(),
+            "the startup sweep removes stale spill files (S1E-004)"
+        );
+        // A fresh session can start against the swept manager.
+        let session = db
+            .spill_manager()
+            .begin_query(
+                mongreldb_types::ids::QueryId::from_bytes([7u8; 16]),
+                1024 * 1024,
+            )
+            .unwrap();
+        assert_eq!(session.used(), 0);
+    }
+}
+
+#[cfg(test)]
+mod version_pin_tests {
+    use super::*;
+
+    fn int_pk_schema() -> Schema {
+        Schema {
+            columns: vec![ColumnDef {
+                id: 1,
+                name: "id".into(),
+                ty: TypeId::Int64,
+                flags: crate::schema::ColumnFlags::empty()
+                    .with(crate::schema::ColumnFlags::PRIMARY_KEY),
+                default_value: None,
+            }],
+            ..Schema::default()
+        }
+    }
+
+    fn pins_for(
+        report: &[TablePinsReport],
+        table: &str,
+        source: crate::retention::PinSource,
+    ) -> Option<crate::retention::PinInfo> {
+        report
+            .iter()
+            .find(|entry| entry.table == table)
+            .and_then(|entry| entry.pins.get(source).cloned())
+    }
+
+    #[test]
+    fn backup_boundary_registers_backup_pitr_pin() {
+        let source = tempfile::tempdir().unwrap();
+        let destination_parent = tempfile::tempdir().unwrap();
+        let destination = destination_parent.path().join("backup");
+        let db = Arc::new(Database::create(source.path()).unwrap());
+        db.create_table("t", int_pk_schema()).unwrap();
+        let mut txn = db.begin();
+        txn.put("t", vec![(1, Value::Int64(1))]).unwrap();
+        let boundary_epoch = txn.commit().unwrap();
+
+        let hold = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        db.__set_backup_hook({
+            let hold = Arc::clone(&hold);
+            let resume = Arc::clone(&resume);
+            move || {
+                hold.wait();
+                resume.wait();
+            }
+        });
+
+        let backup = {
+            let db = Arc::clone(&db);
+            let destination = destination.clone();
+            std::thread::spawn(move || db.hot_backup(destination))
+        };
+        hold.wait();
+        // The hook fires while the backup's pins are held: the boundary must
+        // show up as a BackupPitr pin on the table's unified registry.
+        let report = db.version_pins_report();
+        let pin = pins_for(&report, "t", crate::retention::PinSource::BackupPitr)
+            .expect("backup boundary must register a BackupPitr pin");
+        assert_eq!(pin.oldest_epoch, boundary_epoch);
+        assert!(pin.pin_count >= 1);
+        resume.wait();
+        backup.join().unwrap().unwrap();
+
+        let report = db.version_pins_report();
+        assert!(
+            pins_for(&report, "t", crate::retention::PinSource::BackupPitr).is_none(),
+            "the BackupPitr pin releases when the backup finishes"
+        );
+    }
+
+    #[test]
+    fn snapshot_and_read_generation_pins_surface_in_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::create(dir.path()).unwrap();
+        db.create_table("t", int_pk_schema()).unwrap();
+        let mut txn = db.begin();
+        txn.put("t", vec![(1, Value::Int64(7))]).unwrap();
+        txn.commit().unwrap();
+
+        let (_snapshot, guard) = db.snapshot();
+        let report = db.version_pins_report();
+        assert!(
+            pins_for(
+                &report,
+                "t",
+                crate::retention::PinSource::TransactionSnapshot
+            )
+            .is_some(),
+            "a database snapshot projects the TransactionSnapshot source"
+        );
+        drop(guard);
+
+        let handle = db.table("t").unwrap();
+        let (generation, _snapshot) = handle.read_generation_with_context(None).unwrap();
+        let report = db.version_pins_report();
+        assert!(
+            pins_for(&report, "t", crate::retention::PinSource::ReadGeneration).is_some(),
+            "a cloned read generation registers a ReadGeneration pin"
+        );
+        drop(generation);
+
+        let report = db.version_pins_report();
+        let entry = report.iter().find(|entry| entry.table == "t").unwrap();
+        assert!(
+            entry
+                .pins
+                .get(crate::retention::PinSource::BackupPitr)
+                .is_none()
+                && entry
+                    .pins
+                    .get(crate::retention::PinSource::Replication)
+                    .is_none()
+                && entry
+                    .pins
+                    .get(crate::retention::PinSource::OnlineIndexBuild)
+                    .is_none(),
+            "untaken sources stay absent from the report"
+        );
+    }
+}
+
+#[cfg(test)]
+mod lock_manager_tests {
+    use super::*;
+    use crate::locks::LockKey;
+
+    fn col(id: u16, name: &str, ty: TypeId, flags: crate::schema::ColumnFlags) -> ColumnDef {
+        ColumnDef {
+            id,
+            name: name.into(),
+            ty,
+            flags,
+            default_value: None,
+        }
+    }
+
+    fn unique_schema() -> Schema {
+        let mut constraints = crate::constraint::TableConstraints::default();
+        constraints
+            .uniques
+            .push(crate::constraint::UniqueConstraint {
+                id: 1,
+                name: "users_email_unique".into(),
+                columns: vec![1],
+            });
+        Schema {
+            columns: vec![
+                col(
+                    0,
+                    "id",
+                    TypeId::Int64,
+                    crate::schema::ColumnFlags::empty()
+                        .with(crate::schema::ColumnFlags::PRIMARY_KEY),
+                ),
+                col(
+                    1,
+                    "email",
+                    TypeId::Bytes,
+                    crate::schema::ColumnFlags::empty().with(crate::schema::ColumnFlags::NULLABLE),
+                ),
+            ],
+            constraints,
+            ..Schema::default()
+        }
+    }
+
+    fn parent_schema() -> Schema {
+        Schema {
+            columns: vec![col(
+                0,
+                "id",
+                TypeId::Int64,
+                crate::schema::ColumnFlags::empty().with(crate::schema::ColumnFlags::PRIMARY_KEY),
+            )],
+            ..Schema::default()
+        }
+    }
+
+    fn child_schema() -> Schema {
+        let mut constraints = crate::constraint::TableConstraints::default();
+        constraints
+            .foreign_keys
+            .push(crate::constraint::ForeignKey {
+                id: 1,
+                name: "child_parent_fk".into(),
+                columns: vec![1],
+                ref_table: "parent".into(),
+                ref_columns: vec![0],
+                on_delete: crate::constraint::FkAction::Restrict,
+                on_update: crate::constraint::FkAction::Restrict,
+            });
+        Schema {
+            columns: vec![
+                col(
+                    0,
+                    "id",
+                    TypeId::Int64,
+                    crate::schema::ColumnFlags::empty()
+                        .with(crate::schema::ColumnFlags::PRIMARY_KEY),
+                ),
+                col(
+                    1,
+                    "pid",
+                    TypeId::Int64,
+                    crate::schema::ColumnFlags::empty().with(crate::schema::ColumnFlags::NULLABLE),
+                ),
+            ],
+            constraints,
+            ..Schema::default()
+        }
+    }
+
+    fn auto_inc_schema() -> Schema {
+        Schema {
+            columns: vec![col(
+                0,
+                "id",
+                TypeId::Int64,
+                crate::schema::ColumnFlags::empty()
+                    .with(crate::schema::ColumnFlags::PRIMARY_KEY)
+                    .with(crate::schema::ColumnFlags::AUTO_INCREMENT),
+            )],
+            ..Schema::default()
+        }
+    }
+
+    fn pk_lock_key(table_id: u64, value: i64) -> LockKey {
+        let mut key = b"pk:".to_vec();
+        key.extend_from_slice(&Value::Int64(value).encode_key());
+        LockKey::key(table_id, key)
+    }
+
+    #[test]
+    fn unique_claims_serialize_concurrent_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::create(dir.path()).unwrap());
+        let table_id = db.create_table("users", unique_schema()).unwrap();
+        let pk_key = pk_lock_key(table_id, 1);
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        let parked = Arc::new(AtomicBool::new(false));
+        db.__set_catalog_commit_hook({
+            let entered = Arc::clone(&entered);
+            let resume = Arc::clone(&resume);
+            let parked = Arc::clone(&parked);
+            move || {
+                // Park only the first commit to reach the sequencer; later
+                // commits pass straight through.
+                if !parked.swap(true, Ordering::SeqCst) {
+                    entered.wait();
+                    resume.wait();
+                }
+            }
+        });
+
+        let mut txn_a = db.begin();
+        txn_a
+            .put(
+                "users",
+                vec![(0, Value::Int64(1)), (1, Value::Bytes(b"a@x".to_vec()))],
+            )
+            .unwrap();
+        let a_id = txn_a.txn_id();
+        let (a_tx, a_rx) = std::sync::mpsc::channel();
+        let (b_tx, b_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                a_tx.send(txn_a.commit()).unwrap();
+            });
+            entered.wait();
+            // A is parked in the sequencer holding its unique claims.
+            assert!(
+                db.lock_manager().holds(a_id, &pk_key),
+                "primary-key claim must be held until the commit ends"
+            );
+            let mut uq_key = format!("uq{}:", 1).into_bytes();
+            let cells_map: HashMap<u16, Value> = [(1u16, Value::Bytes(b"a@x".to_vec()))]
+                .into_iter()
+                .collect();
+            uq_key.extend_from_slice(
+                &crate::constraint::encode_composite_key(&[1], &cells_map).unwrap(),
+            );
+            assert!(
+                db.lock_manager()
+                    .holds(a_id, &LockKey::key(table_id, uq_key)),
+                "declared-unique claim must be held until the commit ends"
+            );
+
+            let mut txn_b = db.begin();
+            txn_b
+                .put(
+                    "users",
+                    vec![(0, Value::Int64(1)), (1, Value::Bytes(b"b@x".to_vec()))],
+                )
+                .unwrap();
+            scope.spawn(|| {
+                b_tx.send(txn_b.commit()).unwrap();
+            });
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(
+                b_rx.try_recv().is_err(),
+                "the concurrent claim must block until A ends its transaction"
+            );
+            resume.wait();
+            assert!(a_rx.recv().unwrap().is_ok());
+            let b_result = b_rx.recv().unwrap();
+            assert!(
+                matches!(b_result, Err(MongrelError::Conflict(_))),
+                "the loser surfaces a conflict after serializing: {b_result:?}"
+            );
+        });
+        assert!(
+            !db.lock_manager().holds(a_id, &pk_key),
+            "no phantom holds remain after the commit"
+        );
+    }
+
+    #[test]
+    fn ddl_waits_for_inflight_dml_commit_on_schema_barrier() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::create(dir.path()).unwrap());
+        db.create_table("parent", parent_schema()).unwrap();
+        db.create_table("child", child_schema()).unwrap();
+        let mut seed = db.begin();
+        seed.put("parent", vec![(0, Value::Int64(1))]).unwrap();
+        seed.commit().unwrap();
+
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        db.__set_fk_lock_hook({
+            let entered = Arc::clone(&entered);
+            let resume = Arc::clone(&resume);
+            move || {
+                entered.wait();
+                resume.wait();
+            }
+        });
+
+        let mut txn_a = db.begin();
+        txn_a
+            .put("child", vec![(0, Value::Int64(100)), (1, Value::Int64(1))])
+            .unwrap();
+        let a_id = txn_a.txn_id();
+        let (a_tx, a_rx) = std::sync::mpsc::channel();
+        let (ddl_tx, ddl_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                a_tx.send(txn_a.commit()).unwrap();
+            });
+            entered.wait();
+            // A is parked mid-validation: schema barrier held Shared.
+            assert!(
+                db.lock_manager().holds(a_id, &LockKey::schema_barrier()),
+                "DML holds the schema barrier Shared for its commit"
+            );
+            let db = Arc::clone(&db);
+            scope.spawn(move || {
+                ddl_tx.send(db.drop_table("parent")).unwrap();
+            });
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(
+                ddl_rx.try_recv().is_err(),
+                "DDL must wait on the Exclusive schema barrier while DML is in flight"
+            );
+            resume.wait();
+            // A now finishes and the waiting DDL proceeds. A's commit may
+            // legitimately lose the publish race against the DDL's security
+            // version advance — the designed "security policy changed during
+            // write" outcome — or win it; the barrier guarantees only that the
+            // DDL could not proceed before A released it.
+            let a_result = a_rx.recv().unwrap();
+            match &a_result {
+                Ok(_) => {}
+                Err(MongrelError::Conflict(message)) => {
+                    assert!(
+                        message.contains("security policy changed during write"),
+                        "unexpected commit conflict: {message}"
+                    );
+                }
+                other => panic!("unexpected commit outcome: {other:?}"),
+            }
+            assert!(ddl_rx.recv().unwrap().is_ok());
+        });
+        assert!(!db.lock_manager().holds(a_id, &LockKey::schema_barrier()));
+    }
+
+    #[test]
+    fn auto_increment_sequence_barrier_held_until_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::create(dir.path()).unwrap();
+        let table_id = db.create_table("seq_t", auto_inc_schema()).unwrap();
+        let barrier_key = LockKey::sequence_barrier(format!("auto_inc:{table_id}").as_str());
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        let parked = Arc::new(AtomicBool::new(false));
+        db.__set_catalog_commit_hook({
+            let entered = Arc::clone(&entered);
+            let resume = Arc::clone(&resume);
+            let parked = Arc::clone(&parked);
+            move || {
+                if !parked.swap(true, Ordering::SeqCst) {
+                    entered.wait();
+                    resume.wait();
+                }
+            }
+        });
+
+        let mut txn_a = db.begin();
+        txn_a.put("seq_t", vec![(0, Value::Null)]).unwrap();
+        let a_id = txn_a.txn_id();
+        // The stage-time allocation already holds the barrier.
+        assert!(
+            db.lock_manager().holds(a_id, &barrier_key),
+            "sequence allocation takes the barrier at stage time"
+        );
+        let (a_tx, a_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                a_tx.send(txn_a.commit()).unwrap();
+            });
+            entered.wait();
+            assert!(
+                db.lock_manager().holds(a_id, &barrier_key),
+                "the barrier is held through the commit"
+            );
+            resume.wait();
+            assert!(a_rx.recv().unwrap().is_ok());
+        });
+        assert!(
+            !db.lock_manager().holds(a_id, &barrier_key),
+            "the barrier releases when the commit ends"
+        );
+    }
+
+    #[test]
+    fn fk_wait_for_cycle_surfaces_deadlock_victim() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::create(dir.path()).unwrap();
+        db.create_table("parent", parent_schema()).unwrap();
+        db.create_table("child", child_schema()).unwrap();
+        let mut seed = db.begin();
+        seed.put("parent", vec![(0, Value::Int64(1))]).unwrap();
+        seed.put("parent", vec![(0, Value::Int64(2))]).unwrap();
+        seed.commit().unwrap();
+        let (rid1, rid2) = {
+            let handle = db.table("parent").unwrap();
+            let table = handle.lock();
+            let rid = |pk: i64| {
+                table
+                    .lookup_pk(&Value::Int64(pk).encode_key())
+                    .expect("seeded parent row")
+            };
+            (rid(1), rid(2))
+        };
+
+        // The hook fires after every successful FK lock acquisition; park the
+        // first two (A's and B's Exclusive delete-side claims) so both are
+        // held before either transaction attempts its Shared insert-side
+        // claim — a deterministic wait-for cycle.
+        let rendezvous = Arc::new(std::sync::Barrier::new(2));
+        let calls = Arc::new(AtomicUsize::new(0));
+        db.__set_fk_lock_hook({
+            let rendezvous = Arc::clone(&rendezvous);
+            let calls = Arc::clone(&calls);
+            move || {
+                if calls.fetch_add(1, Ordering::SeqCst) < 2 {
+                    rendezvous.wait();
+                }
+            }
+        });
+
+        // A: delete parent 1 (X fk:1), insert child → parent 2 (S fk:2).
+        // B: delete parent 2 (X fk:2), insert child → parent 1 (S fk:1).
+        let mut txn_a = db.begin();
+        txn_a.delete("parent", rid1).unwrap();
+        txn_a
+            .put("child", vec![(0, Value::Int64(100)), (1, Value::Int64(2))])
+            .unwrap();
+        let mut txn_b = db.begin();
+        txn_b.delete("parent", rid2).unwrap();
+        txn_b
+            .put("child", vec![(0, Value::Int64(101)), (1, Value::Int64(1))])
+            .unwrap();
+        let b_id = txn_b.txn_id();
+
+        let (a_tx, a_rx) = std::sync::mpsc::channel();
+        let (b_tx, b_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                a_tx.send(txn_a.commit()).unwrap();
+            });
+            scope.spawn(|| {
+                b_tx.send(txn_b.commit()).unwrap();
+            });
+            let a_result = a_rx.recv().unwrap();
+            let b_result = b_rx.recv().unwrap();
+            assert!(
+                a_result.is_ok(),
+                "the survivor commits once the victim releases: {a_result:?}"
+            );
+            match b_result {
+                Err(MongrelError::Deadlock { victim, .. }) => {
+                    assert_eq!(victim, b_id, "the youngest transaction is the victim");
+                }
+                other => panic!("the victim must surface a deadlock, got {other:?}"),
+            }
+        });
+        // No phantom holds survive the victim's release.
+        let fk_key = |table: &str, pk: i64| {
+            let table_id = db.table_id(table).unwrap();
+            let mut key = b"fk:".to_vec();
+            key.extend_from_slice(&Value::Int64(pk).encode_key());
+            LockKey::key(table_id, key)
+        };
+        assert!(!db.lock_manager().holds(b_id, &fk_key("parent", 2)));
+        assert!(!db.lock_manager().holds(b_id, &fk_key("parent", 1)));
+    }
+
+    #[test]
+    fn locks_release_after_commit_rollback_and_failed_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::create(dir.path()).unwrap();
+        let table_id = db.create_table("seq_t", auto_inc_schema()).unwrap();
+        let barrier_key = LockKey::sequence_barrier(format!("auto_inc:{table_id}").as_str());
+
+        // Successful commit: the stage-time barrier releases with the commit.
+        let mut txn = db.begin();
+        txn.put("seq_t", vec![(0, Value::Null)]).unwrap();
+        let committed_id = txn.txn_id();
+        txn.commit().unwrap();
+        assert!(!db.lock_manager().holds(committed_id, &barrier_key));
+
+        // Rollback: the stage-time barrier releases with the drop.
+        let mut txn = db.begin();
+        txn.put("seq_t", vec![(0, Value::Null)]).unwrap();
+        let rolled_back_id = txn.txn_id();
+        assert!(db.lock_manager().holds(rolled_back_id, &barrier_key));
+        txn.rollback();
+        assert!(
+            !db.lock_manager().holds(rolled_back_id, &barrier_key),
+            "rollback must not leave phantom holds"
+        );
+
+        // Failed commit (declared-unique violation): the claims release with
+        // the error.
+        db.create_table("users", unique_schema()).unwrap();
+        let users_id = db.table_id("users").unwrap();
+        let mut seed = db.begin();
+        seed.put(
+            "users",
+            vec![(0, Value::Int64(1)), (1, Value::Bytes(b"a@x".to_vec()))],
+        )
+        .unwrap();
+        seed.commit().unwrap();
+        let mut txn = db.begin();
+        // A different primary key but the same declared-unique email: the
+        // Phase B unique check rejects this commit.
+        txn.put(
+            "users",
+            vec![(0, Value::Int64(2)), (1, Value::Bytes(b"a@x".to_vec()))],
+        )
+        .unwrap();
+        let failed_id = txn.txn_id();
+        let result = txn.commit();
+        assert!(matches!(result, Err(MongrelError::Conflict(_))));
+        assert!(
+            !db.lock_manager()
+                .holds(failed_id, &pk_lock_key(users_id, 2)),
+            "a failed commit must not leave phantom holds"
+        );
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    fn int_pk_schema() -> Schema {
+        Schema {
+            columns: vec![ColumnDef {
+                id: 1,
+                name: "id".into(),
+                ty: TypeId::Int64,
+                flags: crate::schema::ColumnFlags::empty()
+                    .with(crate::schema::ColumnFlags::PRIMARY_KEY),
+                default_value: None,
+            }],
+            ..Schema::default()
+        }
+    }
+
+    #[test]
+    fn poisoned_core_rejects_operations_with_typed_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::create(dir.path()).unwrap();
+        db.create_table("t", int_pk_schema()).unwrap();
+        assert_eq!(db.lifecycle_state(), crate::core::LifecycleState::Open);
+
+        // Drive the exact two-state poison the fsync-error sites set
+        // (write-path flag + lifecycle transition), without process-global
+        // fault injection, which would leak into parallel tests. The fsync
+        // site itself is covered end-to-end in tests/lifecycle_poison.rs.
+        db.poisoned.store(true, Ordering::Relaxed);
+        db.lifecycle.poison();
+        assert_eq!(db.lifecycle_state(), crate::core::LifecycleState::Poisoned);
+
+        // Guarded operations without their own write-path poison check reject
+        // at admission with the lifecycle Conflict...
+        let error = db.gc().unwrap_err();
+        assert!(
+            matches!(error, MongrelError::Conflict(_)),
+            "gc must reject on a poisoned core: {error:?}"
+        );
+        let error = db.compact().unwrap_err();
+        assert!(
+            matches!(error, MongrelError::Conflict(_)),
+            "compact must reject on a poisoned core: {error:?}"
+        );
+        assert!(db.operation_guard().is_err());
+        // ...while paths that already checked the write-path flag keep their
+        // legacy error.
+        let error = db.create_table("t2", int_pk_schema()).unwrap_err();
+        assert!(
+            error.to_string().contains("database poisoned"),
+            "the legacy poison error still wins where it existed: {error:?}"
+        );
+        let mut txn = db.begin();
+        txn.put("t", vec![(1, Value::Int64(2))]).unwrap();
+        assert!(txn
+            .commit()
+            .unwrap_err()
+            .to_string()
+            .contains("database poisoned"));
+    }
+
+    #[test]
+    fn shutdown_waits_for_operation_guards_to_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::create(dir.path()).unwrap());
+        db.create_table("t", int_pk_schema()).unwrap();
+        // The guard holds the lifecycle's Arc, not the database's, so the
+        // exclusive-owner shutdown can proceed to its drain step below.
+        let guard = db.operation_guard().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let shutdown_thread = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = db.shutdown();
+            let _ = done_tx.send(result);
+        });
+        started_rx.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            done_rx.try_recv().is_err(),
+            "shutdown must wait for the outstanding guard to drain"
+        );
+        drop(guard);
+        shutdown_thread.join().unwrap();
+        assert!(
+            done_rx.recv().unwrap().is_ok(),
+            "shutdown completes once the guard drops"
+        );
+    }
+}
+
+#[cfg(test)]
+mod commit_ts_ledger_tests {
+    use super::*;
+
+    fn int_pk_schema() -> Schema {
+        Schema {
+            columns: vec![ColumnDef {
+                id: 1,
+                name: "id".into(),
+                ty: TypeId::Int64,
+                flags: crate::schema::ColumnFlags::empty()
+                    .with(crate::schema::ColumnFlags::PRIMARY_KEY),
+                default_value: None,
+            }],
+            ..Schema::default()
+        }
+    }
+
+    fn commit_one(db: &Database) -> (Epoch, mongreldb_types::hlc::HlcTimestamp) {
+        let mut txn = db.begin();
+        let handle = txn.state_handle();
+        txn.put("t", vec![(1, Value::Int64(1))]).unwrap();
+        let epoch = txn.commit().unwrap();
+        let crate::txn::TransactionState::Committed(receipt) = handle.state() else {
+            panic!("expected Committed, got {:?}", handle.state());
+        };
+        (epoch, receipt.commit_ts)
+    }
+
+    #[test]
+    fn commit_ts_for_epoch_returns_the_exact_receipt_within_one_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::create(dir.path()).unwrap();
+        db.create_table("t", int_pk_schema()).unwrap();
+
+        let (epoch, commit_ts) = commit_one(&db);
+        assert_eq!(db.commit_ts_for_epoch(epoch), Some(commit_ts));
+        // An epoch no commit sealed misses (callers fall back).
+        assert_eq!(db.commit_ts_for_epoch(Epoch(epoch.0 + 100)), None);
+    }
+
+    #[test]
+    fn commit_ts_for_epoch_survives_reopen_with_the_physical_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let (epoch, commit_ts) = {
+            let db = Database::create(dir.path()).unwrap();
+            db.create_table("t", int_pk_schema()).unwrap();
+            commit_one(&db)
+        };
+
+        let db = Database::open(dir.path()).unwrap();
+        let reconstructed = db
+            .commit_ts_for_epoch(epoch)
+            .expect("the durable WAL CommitTimestamp ledger reconstructs the epoch");
+        assert_eq!(reconstructed.physical_micros, commit_ts.physical_micros);
+        // The ledger byte format stores micros only (spec §8.1): the logical
+        // counter and tiebreaker reconstruct as 0.
+        assert_eq!(reconstructed.logical, 0);
+        assert_eq!(reconstructed.node_tiebreaker, 0);
+    }
+
+    #[test]
+    fn recovery_ledger_keeps_only_newest_epochs_and_ignores_aborted_txns() {
+        use crate::wal::Op;
+        let records = vec![
+            crate::wal::Record::new(Epoch(1), 7, Op::CommitTimestamp { unix_nanos: 1_000 }),
+            crate::wal::Record::new(
+                Epoch(2),
+                7,
+                Op::TxnCommit {
+                    epoch: 41,
+                    added_runs: vec![],
+                },
+            ),
+            // No CommitTimestamp for txn 8: not reconstructible.
+            crate::wal::Record::new(
+                Epoch(3),
+                8,
+                Op::TxnCommit {
+                    epoch: 42,
+                    added_runs: vec![],
+                },
+            ),
+            // Timestamp without a commit marker: aborted, not reconstructible.
+            crate::wal::Record::new(Epoch(4), 9, Op::CommitTimestamp { unix_nanos: 9_000 }),
+        ];
+        let ledger = commit_ts_ledger_from_recovery(&records);
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(
+            ledger.get(&41),
+            Some(&mongreldb_types::hlc::HlcTimestamp {
+                physical_micros: 1,
+                logical: 0,
+                node_tiebreaker: 0,
+            })
+        );
     }
 }

@@ -65,6 +65,76 @@ Both responses contain `history_retention_epochs` and
 authentication is enabled. Increasing the window cannot restore history that
 was already pruned.
 
+## Operations: drain and configuration reload
+
+Graceful drain and configuration reload (the operations surface) are admin
+routes; like `/audit` and `/history/retention`, they require `ADMIN`
+permission when catalog authentication is enabled.
+
+```http
+POST /admin/drain
+Content-Type: application/json
+
+{"drain_deadline_ms": 30000}
+```
+
+`POST /admin/drain` initiates a graceful drain: the server stops admitting new
+SQL and sessions, cancels in-flight queries (`server_shutdown`), closes
+sessions (rolling back staged transactions), then shuts the storage core down
+with the given deadline — in-flight commit-critical work finishes, durable
+state is synced, and the file lock is released. The body is optional;
+`drain_deadline_ms` defaults to `MONGRELDB_DRAIN_DEADLINE_MS`, else 30000. A
+deadline overrun answers 409 and leaves the core `draining` (new operations
+stay rejected); a later call with a larger deadline resumes the shutdown.
+Draining is terminal: restart the process to serve the database again. Every
+mutating HTTP surface (`/sql`, `/sessions/*`, `/tables/*` writes, `/txn`,
+`/kit/txn`, `/kit/create_table`, procedure and trigger mutations) answers 503
+once a drain starts.
+
+```http
+GET /admin/drain
+```
+
+Reports the core lifecycle state (`open`, `draining`, `closing`, `closed`;
+also `opening` during startup and `poisoned` after an unrecoverable internal
+error), whether SQL is still admitted, in-flight query and live session
+counts, and the last drain's outcome record (`initiated`, `completed`,
+`deadline_ms`, `lifecycle`, `detail`).
+
+```http
+POST /admin/reload
+Content-Type: application/json
+
+{"sql_max_output_rows": 100000}
+```
+
+`POST /admin/reload` re-reads the mutable subset of server configuration and
+applies it live; `SIGHUP` triggers the same reload from the environment.
+Reloadable fields (environment variable → live effect):
+
+- `MONGRELBL_SLOW_QUERY_MS` — slow-query log/metrics threshold.
+- `MONGRELDB_SQL_DEFAULT_TIMEOUT_MS` — default per-query timeout (clamped to
+  the maximum).
+- `MONGRELDB_SQL_MAX_TIMEOUT_MS` — maximum per-query timeout.
+- `MONGRELDB_SQL_CANCEL_GRACE_MS` — cancellation grace on session close and
+  admin drain.
+- `MONGRELDB_SQL_MAX_OUTPUT_ROWS` / `MONGRELDB_SQL_MAX_OUTPUT_BYTES` —
+  per-request output ceilings.
+- `MONGRELDB_HISTORY_RETENTION_EPOCHS` — re-applied to the core (equivalent
+  to `PUT /history/retention`).
+
+An absent/empty body re-reads everything from the environment; present body
+fields (the `_ms`/row/byte names above, plus `history_retention_epochs`)
+override the environment field-by-field and must be positive. The response
+echoes the applied values. Everything else is static node configuration and
+stays restart-only: listen address/port, data directory, authentication
+token/mode, connection and session capacity, session idle timeout, SQL/AI/
+retained-page admission concurrency, the request-bytes bound, SQL idempotency
+TTL and capacity (the receipt binding includes the expiry policy), and the
+pre-cancellation and retained-page bounds. Drain, reload, and authorization
+failures on these routes are recorded in the security audit log with the
+calling principal and outcome.
+
 ## Running as a daemon (--daemon mode)
 
 The `--daemon` flag forks the server into the background, detaches from the
@@ -83,6 +153,8 @@ mongreldb-server ./my_database --daemon --port 8453 --auth-token my-secret --pas
 
 The server handles `SIGINT` (Ctrl+C) and `SIGTERM` gracefully - it flushes all
 tables, writes pending data to disk, removes the PID file, and exits with code 0.
+`SIGHUP` reloads the mutable configuration subset live (see "Operations: drain
+and configuration reload"); it never interrupts serving.
 
 ## Keeping the daemon running (auto-restart)
 
@@ -300,6 +372,35 @@ When `--max-connections N` is set, the daemon caps concurrent in-flight
 requests via a `ConcurrencyLimitLayer`. Requests beyond the limit wait in a
 queue. Default: unlimited (all requests handled immediately).
 
+## Request bounds
+
+Every request is bounded (connections, sessions, in-flight requests, request
+bytes, result bytes, idle time); the daemon is asynchronous and never
+allocates an OS thread per connection:
+
+- **Connections / in-flight requests**: `--max-connections N` (above).
+- **Sessions**: `--max-sessions N` (default 256); at capacity, session
+  creation returns 503.
+- **In-flight SQL executions**: `MONGRELDB_SQL_MAX_CONCURRENT` (default: CPU
+  count); excess requests queue, and queue wait counts toward the query
+  deadline.
+- **Request bytes**: `MONGRELDB_MAX_REQUEST_BYTES` (default 2 MiB). Requests
+  whose declared `Content-Length` exceeds the limit are rejected before the
+  body is read with a structured 413 (`REQUEST_BODY_TOO_LARGE`, category
+  `resource exhausted`); chunked bodies are hard-capped at the same limit.
+- **Result bytes/rows**: `MONGRELDB_SQL_MAX_OUTPUT_BYTES` (default 64 MiB)
+  and `MONGRELDB_SQL_MAX_OUTPUT_ROWS` (default 1 000 000).
+- **Idle time**: `--session-idle-timeout <s>` (default 300) reaps idle
+  sessions, discarding any staged transaction.
+
+## Structured errors
+
+Structured error responses carry the stable error taxonomy (spec 9.7) on the
+`error` object: `category` (one of twenty stable names) and `category_code`
+(its stable numeric code, never reused) are the programmatic contract;
+`code` and `message` are diagnostic detail. Clients must handle categories,
+never messages.
+
 ## API Endpoints
 
 All requests use JSON for parameters. Query results come back as Arrow IPC
@@ -383,7 +484,17 @@ write that matches no rows, returns a durable receipt instead of result rows.
 Retrying returns that receipt without parsing or executing the SQL. A receipt
 is HTTP 200 even when post-commit cancellation or serialization failed;
 inspect `status`, `outcome`, and `terminal_error` rather than treating HTTP
-success as clean response completion. Receipt and intent files contain
+success as clean response completion. For a write that durably committed, the
+receipt response additively carries `commit_receipt` — the core commit log's
+irrevocable receipt for the idempotency record (`transaction_id`,
+`commit_ts_physical_micros`/`commit_ts_logical`/`commit_ts_node_tiebreaker`,
+`log_term`/`log_index`, `durability`) — anchored in the durable
+`TXN_IDEMPOTENCY` ledger so the key → original-receipt binding survives
+restart under the commit log's authority (spec §10.2 S1B-005): an identical
+retry returns the same receipt, a changed request conflicts. The field is
+absent for no-op writes (nothing committed) and for receipts recorded before
+this unification.
+Receipt and intent files contain
 HMAC-authenticated hashes and outcome metadata, never the raw key, owner, SQL,
 parameters, or result rows. Encrypted databases derive the HMAC key from the
 database KEK. Plain databases create a random, database-local key at
@@ -551,10 +662,25 @@ MONGRELDB_SQL_PAGE_MAX_RETAINED_BYTES
 MONGRELDB_SQL_PAGE_MAX_PER_OWNER
 ```
 
-The query deadline starts before the SQL semaphore. Closing a session cancels
+The query deadline starts before the SQL semaphore: queue wait, planning,
+execution, response serialization, and stream backpressure all count toward
+it. Closing a session cancels
 its queued and active queries. Graceful server shutdown rejects new SQL,
 cancels queued and running work, lets commit-critical writes finish, and
 records tasks that exceed cancellation grace.
+
+Prepared statements are bound per session to the SQL text, the declared or
+first-observed parameter types, the catalog version, and the schema versions
+they were planned against. `POST /sessions/{id}/prepare` returns the
+session-scoped `statement_id` alongside the statement name and accepts an
+optional `param_types` array of canonical type names (`NULL`, `BOOL`,
+`INT64`, `FLOAT64`, `TEXT`, `BYTES`). Execution with a mismatched parameter
+list fails with `PREPARED_PARAMETER_MISMATCH` rather than coercing silently.
+On an incompatible catalog/schema change the next execute invalidates the
+statement and replans it from the bound SQL; a stale plan never executes
+silently. If the statement can no longer be planned (for example its table
+was dropped), execute fails with 409 `SCHEMA_VERSION_MISMATCH` (category
+`schema version mismatch`, code 16) and the statement must be re-prepared.
 
 Prepared-statement `DELETE /sessions/{id}/statements/{name}` accepts the same
 `X-MongrelDB-Query-ID` and `X-MongrelDB-Timeout-Ms` controls as `/sql` and

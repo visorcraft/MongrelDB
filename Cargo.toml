@@ -1,5 +1,7 @@
 [workspace]
 members = [
+    "crates/mongreldb-cluster",
+    "crates/mongreldb-consensus",
     "crates/mongreldb-core",
     "crates/mongreldb-fault",
     "crates/mongreldb-log",

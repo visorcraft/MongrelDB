@@ -1,7 +1,8 @@
 //! mongreldb-server entry point.
 //!
 //! Supports `--daemon` mode (fork into background), graceful signal handling
-//! (SIGINT/SIGTERM flush all tables then exit), a proper flag parser, and
+//! (SIGINT/SIGTERM flush all tables then exit; SIGHUP reloads the mutable
+//! configuration subset live, spec §10.7), a proper flag parser, and
 //! subcommands for deterministic-stable snapshots:
 //!
 //!   mongreldb-server snapshot <db_dir>   — checkpoint to a stable byte image
@@ -463,12 +464,28 @@ async fn run_server(args: Args, pidfile: String, db: Arc<Database>) {
 
     // Graceful shutdown via tokio::select!. Race the server against SIGINT
     // (ctrl_c) and SIGTERM (unix). Whichever fires first wins; we then flush
-    // all tables via `db.close()` before exiting.
+    // all tables via `db.close()` before exiting. SIGHUP instead triggers a
+    // live reload of the mutable configuration subset (§10.7) via a dedicated
+    // task so the signal never terminates the serve loop.
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
 
         let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+        let mut sighup = signal(SignalKind::hangup()).expect("install SIGHUP handler");
+        let reload_control = server_control.clone();
+        tokio::spawn(async move {
+            while sighup.recv().await.is_some() {
+                match reload_control.reload_config() {
+                    Ok(report) => eprintln!(
+                        "[config] SIGHUP: mutable configuration reloaded: {}",
+                        serde_json::to_string(&report)
+                            .unwrap_or_else(|_| "<serialize error>".to_string())
+                    ),
+                    Err(error) => eprintln!("[config] SIGHUP reload failed: {error}"),
+                }
+            }
+        });
         tokio::select! {
             result = axum::serve(listener, app) => {
                 if let Err(e) = result {

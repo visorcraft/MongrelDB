@@ -10,6 +10,26 @@
 //!   encrypts and authenticates, plus
 //! - a directory `sync_all` after the atomic rename (review fix #19), so a crash
 //!   never leaves a half-linked catalog entry.
+//!
+//! # Versioned catalog commands (spec §10.6, S1F-001)
+//!
+//! CATALOG is demoted from sole authority to a checkpoint of the versioned
+//! catalog command state machine (see [`crate::catalog_cmds`]). `Catalog`
+//! carries `catalog_version` plus a bounded retained tail of applied
+//! [`crate::catalog_cmds::CatalogCommandRecord`]s (`command_log`), so the
+//! records ride inside the existing persistence mechanics with no on-disk
+//! format change: both this checkpoint and the `DdlOp::CatalogSnapshot` WAL
+//! payload (`DdlOp::encode_catalog`) serialize the whole `Catalog`, command
+//! history included. All four state-machine fields default to empty on decode
+//! and are omitted from serialization while empty, so pre-S1F-001 databases
+//! open byte-identically unchanged.
+//!
+//! New code mutates the catalog through [`Catalog::apply_command`], which
+//! validates the record, applies it deterministically, bumps
+//! `catalog_version`, and appends it to the bounded history;
+//! [`Catalog::apply_command_and_checkpoint`] additionally rewrites this
+//! checkpoint. The legacy `Database` mutation paths still write the catalog
+//! directly this wave; they route through commands in a later wave.
 
 use crate::error::{MongrelError, Result};
 use crate::external_table::ExternalTableEntry;
@@ -149,6 +169,29 @@ pub struct Catalog {
     pub user_version: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub application_id: Option<i64>,
+    /// Monotonic version of the catalog command state machine (S1F-001).
+    /// `0` = no commands applied (legacy catalog); each applied
+    /// [`crate::catalog_cmds::CatalogCommandRecord`] bumps it by one.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub catalog_version: u64,
+    /// Bounded retained tail of applied command records, oldest first.
+    /// Rides inside this checkpoint and every `DdlOp::CatalogSnapshot` WAL
+    /// payload with no on-disk format change. Compacted from the front past
+    /// [`crate::catalog_cmds::COMMAND_HISTORY_LIMIT`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command_log: Vec<crate::catalog_cmds::CatalogCommandRecord>,
+    /// Resource-group definitions (S1E-001 forward reference; see
+    /// [`crate::catalog_cmds::ResourceGroupDef`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resource_groups: Vec<crate::catalog_cmds::ResourceGroupDef>,
+    /// Persistent online-job definitions (S1F-002 forward reference; see
+    /// [`crate::catalog_cmds::JobDefinition`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub job_definitions: Vec<crate::catalog_cmds::JobDefinition>,
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Deserialize)]
@@ -182,6 +225,14 @@ struct CatalogWire {
     user_version: Option<i64>,
     #[serde(default)]
     application_id: Option<i64>,
+    #[serde(default)]
+    catalog_version: u64,
+    #[serde(default)]
+    command_log: Vec<crate::catalog_cmds::CatalogCommandRecord>,
+    #[serde(default)]
+    resource_groups: Vec<crate::catalog_cmds::ResourceGroupDef>,
+    #[serde(default)]
+    job_definitions: Vec<crate::catalog_cmds::JobDefinition>,
     // Known pre-sidecar field. It is intentionally ignored during migration;
     // every other unknown top-level field remains rejected.
     #[serde(default)]
@@ -212,6 +263,10 @@ impl<'de> Deserialize<'de> for Catalog {
             require_auth: wire.require_auth,
             user_version: wire.user_version,
             application_id: wire.application_id,
+            catalog_version: wire.catalog_version,
+            command_log: wire.command_log,
+            resource_groups: wire.resource_groups,
+            job_definitions: wire.job_definitions,
         })
     }
 }
@@ -296,6 +351,111 @@ impl Catalog {
                 } if candidate == intended_name
             )
         })
+    }
+
+    /// Current catalog command state-machine version (S1F-001). `0` means no
+    /// versioned commands have been applied (legacy catalog).
+    pub fn catalog_version(&self) -> u64 {
+        self.catalog_version
+    }
+
+    /// Retained command records with `catalog_version > version`, oldest
+    /// first. History is bounded by
+    /// [`crate::catalog_cmds::COMMAND_HISTORY_LIMIT`]: when the requested
+    /// version predates the retained tail, the result is a strict suffix and
+    /// the caller detects compaction via the first record's `catalog_version`.
+    pub fn commands_since(&self, version: u64) -> Vec<crate::catalog_cmds::CatalogCommandRecord> {
+        self.command_log
+            .iter()
+            .filter(|record| record.catalog_version > version)
+            .cloned()
+            .collect()
+    }
+
+    /// Validate and apply one versioned command record (spec §10.6, S1F-001).
+    ///
+    /// Ordering is fail-closed:
+    ///
+    /// - an unsupported encoding `version` is rejected (§4.10);
+    /// - a record at the current version + 1 is validated, applied
+    ///   deterministically, and appended to the bounded `command_log`;
+    /// - re-applying the identical record at an already-applied version is an
+    ///   idempotent no-op ([`CatalogDelta::NoOp`]); a *different* command
+    ///   claiming an already-applied retained version is a conflict;
+    /// - a record older than the retained window is treated as already
+    ///   applied (compaction makes byte-comparison impossible);
+    /// - any other version (a gap) is a conflict.
+    ///
+    /// This mutates only in-memory state; durability rides the existing
+    /// checkpoint/snapshot mechanics (see the module docs), or use
+    /// [`Catalog::apply_command_and_checkpoint`].
+    pub fn apply_command(
+        &mut self,
+        record: &crate::catalog_cmds::CatalogCommandRecord,
+    ) -> Result<crate::catalog_cmds::CatalogDelta> {
+        use crate::catalog_cmds::{
+            apply, encode_command, CatalogDelta, CATALOG_COMMAND_FORMAT_VERSION,
+            COMMAND_HISTORY_LIMIT,
+        };
+
+        if record.version != CATALOG_COMMAND_FORMAT_VERSION {
+            return Err(MongrelError::UnsupportedStorageVersion {
+                component: "catalog command",
+                found: record.version,
+                supported: CATALOG_COMMAND_FORMAT_VERSION,
+            });
+        }
+        if record.catalog_version <= self.catalog_version {
+            return match self
+                .command_log
+                .iter()
+                .find(|existing| existing.catalog_version == record.catalog_version)
+            {
+                Some(existing) if encode_command(existing)? == encode_command(record)? => {
+                    Ok(CatalogDelta::NoOp)
+                }
+                Some(_) => Err(MongrelError::Conflict(format!(
+                    "a different catalog command is already recorded at version {}",
+                    record.catalog_version
+                ))),
+                // Compacted out of the retained window: treated as applied.
+                None => Ok(CatalogDelta::NoOp),
+            };
+        }
+        let expected = self
+            .catalog_version
+            .checked_add(1)
+            .ok_or_else(|| MongrelError::Full("catalog version space exhausted".into()))?;
+        if record.catalog_version != expected {
+            return Err(MongrelError::Conflict(format!(
+                "catalog command version gap: got {}, expected {expected}",
+                record.catalog_version
+            )));
+        }
+        let delta = apply(self, &record.command)?;
+        delta.apply_to(self)?;
+        self.catalog_version = record.catalog_version;
+        self.command_log.push(record.clone());
+        if self.command_log.len() > COMMAND_HISTORY_LIMIT {
+            let overflow = self.command_log.len() - COMMAND_HISTORY_LIMIT;
+            self.command_log.drain(..overflow);
+        }
+        Ok(delta)
+    }
+
+    /// Apply a versioned command record, then checkpoint the catalog to
+    /// `<dir>/CATALOG` through the existing atomic write path (magic +
+    /// checksum/encryption, rename + directory fsync, `catalog.publish.*`
+    /// fault hooks preserved).
+    pub fn apply_command_and_checkpoint(
+        &mut self,
+        dir: &Path,
+        meta_dek: Option<&[u8; META_DEK_LEN]>,
+        record: &crate::catalog_cmds::CatalogCommandRecord,
+    ) -> Result<crate::catalog_cmds::CatalogDelta> {
+        let delta = self.apply_command(record)?;
+        write_atomic(dir, self, meta_dek)?;
+        Ok(delta)
     }
 }
 

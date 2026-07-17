@@ -63,6 +63,10 @@ fn sample_catalog() -> Catalog {
         require_auth: false,
         user_version: None,
         application_id: None,
+        catalog_version: 0,
+        command_log: Vec::new(),
+        resource_groups: Vec::new(),
+        job_definitions: Vec::new(),
     }
 }
 

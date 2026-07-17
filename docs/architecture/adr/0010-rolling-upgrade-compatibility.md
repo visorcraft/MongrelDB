@@ -1,6 +1,6 @@
 # ADR-0010: Rolling Upgrade Compatibility
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-07-17
 - Spec references: §9.1 (FND-001), §11.8 (Stage 2H rolling upgrades), §17
   (upgrade and compatibility policy), §4.10 (versioning invariant), §9.3

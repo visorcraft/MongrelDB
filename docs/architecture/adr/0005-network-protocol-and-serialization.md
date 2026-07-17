@@ -1,6 +1,6 @@
 # ADR-0005: Network Protocol and Serialization
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-07-17
 - Spec references: §6.7 (`mongreldb-protocol`), §9.3 (FND-003 versioned command envelope), §10.4 (Stage 1D server protocol and sessions)
 

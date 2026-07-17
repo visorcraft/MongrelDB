@@ -1,0 +1,28 @@
+[package]
+name = "mongreldb-consensus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "MongrelDB consensus adapter over openraft (Stage 2; see docs/architecture/adr/0004)."
+
+[dependencies]
+# storage-v2: split RaftLogStorage/RaftStateMachine traits are implementable
+# by downstream crates only with this feature. serde: serde derives on openraft
+# wire/durable types (Vote, LogId, Entry, Membership) which our checksummed
+# on-disk frames serialize.
+openraft = { version = "0.9", features = ["storage-v2", "serde"] }
+tokio = { version = "1.52.3", features = ["sync", "rt", "time", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+sha2 = "0.10"
+thiserror = "1"
+mongreldb-types = { path = "../mongreldb-types", version = "0.59.0" }
+mongreldb-log = { path = "../mongreldb-log", version = "0.59.0" }
+mongreldb-fault = { path = "../mongreldb-fault", version = "0.59.0" }
+
+[dev-dependencies]
+mongreldb-sim = { path = "../mongreldb-sim", version = "0.59.0" }
+tempfile = "3"

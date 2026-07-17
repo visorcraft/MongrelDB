@@ -1,6 +1,6 @@
 # ADR-0008: Catalog/Control-Plane Ownership
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-07-17
 - Spec references: §9.1 (FND-001), §12.1 (Stage 3A meta control plane), §10.6
   (Stage 1F catalog and online jobs), §4.6 (security invariant), §4.2/§4.4

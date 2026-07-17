@@ -33,6 +33,19 @@ pub enum PitrTarget {
     Latest,
     Epoch(u64),
     TimestampNanos(u64),
+    /// Restore through the commit of this exact transaction id, resolved
+    /// against the archive's commit-point ledger ([`PitrCommitPoint`]).
+    /// Transaction ids are scoped by the source database's open generation;
+    /// an id the ledger does not record (including archives written before
+    /// Stage 1G, whose ledger predates the field) fails closed.
+    TransactionId(u64),
+    /// Restore through the newest commit whose WAL record sequence (log
+    /// position) is at or below this position. Positions before the first
+    /// archived commit resolve to the base backup boundary; a position
+    /// above every archived commit resolves to [`PitrTarget::Latest`]'s
+    /// epoch. An archive whose ledger records no sequences at all (written
+    /// before Stage 1G) fails closed.
+    LogPosition(u64),
 }
 
 #[derive(Clone, Copy)]
@@ -61,6 +74,17 @@ pub struct PitrCommitPoint {
     pub unix_nanos: u64,
 }
 
+/// Stage 1G commit-ledger entry: the committing transaction id and the WAL
+/// record sequence (log position) of one commit. Stored parallel to
+/// [`PitrChunkRef::commits`] in the JSON manifest only — never inside the
+/// bincode chunk bodies, whose byte layout is unchanged.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PitrCommitLedgerEntry {
+    pub txn_id: u64,
+    pub sequence: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PitrChunkRef {
@@ -71,6 +95,11 @@ pub struct PitrChunkRef {
     pub bytes: u64,
     pub sha256: String,
     pub commits: Vec<PitrCommitPoint>,
+    /// Stage 1G commit ledger, parallel to `commits`: transaction id and log
+    /// position per commit. Empty means "not recorded" (archives written
+    /// before Stage 1G); when present it has exactly `commits.len()` entries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commit_ledger: Vec<PitrCommitLedgerEntry>,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub first_sequence: u64,
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -324,22 +353,26 @@ impl Database {
                 Op::CommitTimestamp { unix_nanos } => {
                     timestamps.insert(record.txn_id, unix_nanos);
                 }
-                Op::TxnCommit { epoch, .. } => commit_epochs.push((record.txn_id, epoch)),
+                Op::TxnCommit { epoch, .. } => {
+                    commit_epochs.push((record.txn_id, epoch, record.seq.0));
+                }
                 _ => {}
             }
         }
-        commit_epochs.sort_by_key(|(_, epoch)| *epoch);
+        commit_epochs.sort_by_key(|(_, epoch, _)| *epoch);
         let archive_time = unix_nanos();
         let mut last_timestamp = manifest.last_commit_unix_nanos;
+        let mut commit_ledger = Vec::new();
         let commits = commit_epochs
             .into_iter()
-            .map(|(txn_id, epoch)| {
+            .map(|(txn_id, epoch, sequence)| {
                 let timestamp = timestamps
                     .get(&txn_id)
                     .copied()
                     .unwrap_or(archive_time)
                     .max(last_timestamp);
                 last_timestamp = timestamp;
+                commit_ledger.push(PitrCommitLedgerEntry { txn_id, sequence });
                 PitrCommitPoint {
                     epoch,
                     unix_nanos: timestamp,
@@ -389,6 +422,7 @@ impl Database {
                 bytes: bytes.len() as u64,
                 sha256: chunk_sha256,
                 commits,
+                commit_ledger,
                 first_sequence,
                 last_sequence,
                 previous_chain_sha256,
@@ -444,6 +478,10 @@ fn read_pitr_manifest_from_root(archive: &DurableRoot) -> Result<PitrArchiveMani
 }
 
 /// Restore an archive to a new directory at an epoch or timestamp cutoff.
+///
+/// Restores never happen in place: the destination must not exist, and a
+/// destination whose `_meta/.lock` is held by a running database is refused
+/// before any staging work begins (spec 10.7).
 pub fn restore_pitr(
     archive: impl AsRef<Path>,
     destination: impl AsRef<Path>,
@@ -457,6 +495,49 @@ pub fn restore_pitr(
         credentials,
         |_| Ok(()),
     )
+    .map(|(epoch, _)| epoch)
+}
+
+/// [`restore_pitr`] plus the post-restore validation report (Stage 1G).
+pub fn restore_pitr_validated(
+    archive: impl AsRef<Path>,
+    destination: impl AsRef<Path>,
+    target: PitrTarget,
+    credentials: PitrCredentials<'_>,
+) -> Result<(u64, crate::backup::RestoreReport)> {
+    restore_pitr_inner(
+        archive.as_ref(),
+        destination.as_ref(),
+        target,
+        credentials,
+        |_| Ok(()),
+    )
+}
+
+/// Refuse a restore destination held by a running database. The destination
+/// must not exist at all (enforced by `prepare_destination` and the
+/// no-replace publish rename); this guard turns the "exists" case into a
+/// precise error when the existing root is locked by a live handle.
+fn refuse_locked_destination(destination: &Path) -> Result<()> {
+    use fs2::FileExt as _;
+
+    let lock_path = destination.join("_meta").join(".lock");
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(()),
+        Err(error) => Err(MongrelError::DatabaseLocked {
+            path: destination.to_path_buf(),
+            message: format!("PITR never restores in place over a running database: {error}"),
+        }),
+    }
 }
 
 fn restore_pitr_inner<F>(
@@ -465,10 +546,11 @@ fn restore_pitr_inner<F>(
     target: PitrTarget,
     credentials: PitrCredentials<'_>,
     after_stage_created: F,
-) -> Result<u64>
+) -> Result<(u64, crate::backup::RestoreReport)>
 where
     F: FnOnce(&Path) -> Result<()>,
 {
+    refuse_locked_destination(destination)?;
     let archive = DurableRoot::open(archive)?;
     let manifest = read_pitr_manifest_from_root(&archive)?;
     let base = archive.open_directory("base")?;
@@ -548,6 +630,8 @@ where
         }
         validate_target_user_credentials(&recovered, credentials)?;
         drop(recovered);
+        let restore_report =
+            validate_staged_restore(&stage, &staged_backup_manifest, archive_kek.as_ref())?;
         meta.remove_file("replica")?;
         meta.remove_file("repl_epoch")?;
         drop(meta);
@@ -580,12 +664,71 @@ where
         // FND-006: the restore is published; the caller still sees a hook
         // failure as an error even though the destination is complete.
         crate::catalog::inject_hook("snapshot.install.after")?;
-        Ok(target_epoch)
+        Ok((target_epoch, restore_report))
     })();
     if outcome.is_err() {
         let _ = prepared.parent.remove_directory_all(&prepared.stage_name);
     }
     outcome
+}
+
+/// Post-restore validation pass over the recovered staging tree (Stage 1G).
+/// WAL replay never rewrites immutable `.sr` payloads, so every base-manifest
+/// run still present must match its recorded size and SHA-256 (a mismatch is
+/// staging corruption and fails the restore); runs removed by replayed DDL
+/// are reported as issues. The replayed catalog must still decode.
+fn validate_staged_restore(
+    stage: &DurableRoot,
+    backup_manifest: &crate::backup::BackupManifest,
+    kek: Option<&crate::encryption::Kek>,
+) -> Result<crate::backup::RestoreReport> {
+    let mut report = crate::backup::RestoreReport {
+        manifest_consistent: true,
+        ..crate::backup::RestoreReport::default()
+    };
+    for file in &backup_manifest.files {
+        if file
+            .path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("sr")
+        {
+            continue;
+        }
+        let mut source = match stage.open_regular(&file.path) {
+            Ok(source) => source,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                report.issues.push(format!(
+                    "run {} was removed by replayed DDL",
+                    file.path.display()
+                ));
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if source.metadata()?.len() != file.bytes {
+            return invalid_pitr(format!(
+                "restored run {} size mismatch",
+                file.path.display()
+            ));
+        }
+        let actual = crate::backup::sha256_open_file_inner(&mut source, None)?;
+        if actual != file.sha256 {
+            return invalid_pitr(format!(
+                "restored run {} checksum mismatch",
+                file.path.display()
+            ));
+        }
+        report.files_checked += 1;
+        report.files_ok += 1;
+        report.bytes_checked += file.bytes;
+    }
+    let meta_dek = crate::encryption::meta_dek_for(kek);
+    match crate::catalog::read_durable(stage, meta_dek.as_ref())? {
+        Some(_) => report.catalog_loaded = true,
+        None => return invalid_pitr("restored catalog does not decode after replay"),
+    }
+    Ok(report)
 }
 
 fn validate_manifest_structure(manifest: &PitrArchiveManifest) -> Result<()> {
@@ -673,6 +816,14 @@ fn validate_manifest_structure(manifest: &PitrArchiveManifest) -> Result<()> {
                 reference.file
             ));
         }
+        if !reference.commit_ledger.is_empty()
+            && reference.commit_ledger.len() != reference.commits.len()
+        {
+            return invalid_pitr(format!(
+                "PITR chunk {} commit ledger does not match its commit points",
+                reference.file
+            ));
+        }
         for commit in &reference.commits {
             if commit.epoch <= previous_commit_epoch
                 || commit.epoch <= reference.from_epoch
@@ -741,6 +892,7 @@ fn validate_manifest_structure(manifest: &PitrArchiveManifest) -> Result<()> {
             || !reference.chain_sha256.is_empty()
             || reference.first_sequence != 0
             || reference.last_sequence != 0
+            || !reference.commit_ledger.is_empty()
         {
             return invalid_pitr(format!(
                 "legacy PITR chunk {} contains version 2 chain fields",
@@ -1051,6 +1203,7 @@ fn validate_chunk(
     let mut committed = HashSet::new();
     let mut commit_epochs = Vec::new();
     let mut commit_txns = Vec::new();
+    let mut commit_sequences = Vec::new();
     let mut commit_timestamps = HashMap::new();
     let mut previous_sequence = preceding_sequence.map(Epoch);
     for record in &chunk.records {
@@ -1101,6 +1254,7 @@ fn validate_chunk(
             }
             commit_epochs.push(epoch);
             commit_txns.push(record.txn_id);
+            commit_sequences.push(record.seq.0);
         }
     }
     if seen != committed {
@@ -1129,6 +1283,22 @@ fn validate_chunk(
                 "PITR chunk {} commit timestamp does not match its body",
                 reference.file
             ));
+        }
+        // The Stage 1G ledger is cross-checked only where recorded; an empty
+        // ledger (pre-1G archive) skips the check entirely.
+        if let Some(entry) = reference.commit_ledger.get(index) {
+            if entry.txn_id != txn_id {
+                return invalid_pitr(format!(
+                    "PITR chunk {} commit transaction id does not match its body",
+                    reference.file
+                ));
+            }
+            if entry.sequence != commit_sequences[index] {
+                return invalid_pitr(format!(
+                    "PITR chunk {} commit log position does not match its body",
+                    reference.file
+                ));
+            }
         }
     }
     if format_version == FORMAT_VERSION
@@ -1510,6 +1680,37 @@ fn resolve_target_epoch(manifest: &PitrArchiveManifest, target: PitrTarget) -> R
             }
             Ok(epoch)
         }
+        PitrTarget::TransactionId(txn_id) => manifest
+            .chunks
+            .iter()
+            .flat_map(|chunk| chunk.commit_ledger.iter().zip(&chunk.commits))
+            .find(|(entry, _)| entry.txn_id == txn_id)
+            .map(|(_, commit)| commit.epoch)
+            .ok_or_else(|| {
+                MongrelError::InvalidArgument(format!(
+                    "PITR transaction id {txn_id} is not in the archive commit ledger"
+                ))
+            }),
+        PitrTarget::LogPosition(position) => {
+            let mut epoch = None;
+            let mut ledger_has_positions = false;
+            for chunk in &manifest.chunks {
+                for (entry, commit) in chunk.commit_ledger.iter().zip(&chunk.commits) {
+                    ledger_has_positions = true;
+                    if entry.sequence <= position {
+                        epoch = Some(commit.epoch);
+                    }
+                }
+            }
+            if !ledger_has_positions {
+                return Err(MongrelError::InvalidArgument(
+                    "PITR archive commit ledger records no log positions".into(),
+                ));
+            }
+            // A position below the first archived commit lies inside the base
+            // backup; commits are atomic, so the base boundary is the answer.
+            Ok(epoch.unwrap_or(manifest.base_epoch))
+        }
     }
 }
 
@@ -1869,6 +2070,7 @@ mod tests {
                             unix_nanos: 120,
                         },
                     ],
+                    commit_ledger: Vec::new(),
                     first_sequence: 20,
                     last_sequence: 23,
                     previous_chain_sha256: genesis,
@@ -1885,6 +2087,7 @@ mod tests {
                         epoch: 13,
                         unix_nanos: 130,
                     }],
+                    commit_ledger: Vec::new(),
                     first_sequence: 30,
                     last_sequence: 31,
                     previous_chain_sha256: first_chain,
@@ -2461,6 +2664,7 @@ mod tests {
         reference.last_sequence = 0;
         reference.previous_chain_sha256.clear();
         reference.chain_sha256.clear();
+        reference.commit_ledger.clear();
         manifest.format_version = LEGACY_FORMAT_VERSION;
         manifest.base_backup_sha256.clear();
         manifest.chain_sha256.clear();
@@ -2563,5 +2767,143 @@ mod tests {
             Err(MongrelError::Conflict(_))
         ));
         assert!(!destination.exists());
+    }
+
+    fn ledger_manifest() -> PitrArchiveManifest {
+        let mut manifest = sample_manifest();
+        manifest.chunks[0].commit_ledger = vec![
+            PitrCommitLedgerEntry {
+                txn_id: 5,
+                sequence: 21,
+            },
+            PitrCommitLedgerEntry {
+                txn_id: 7,
+                sequence: 23,
+            },
+        ];
+        manifest.chunks[1].commit_ledger = vec![PitrCommitLedgerEntry {
+            txn_id: 9,
+            sequence: 31,
+        }];
+        manifest
+    }
+
+    #[test]
+    fn pre_1g_chunk_reference_json_decodes_without_a_ledger() {
+        let json = r#"{
+            "file": "wal-00000000000000000010-00000000000000000012.bin",
+            "from_epoch": 10,
+            "through_epoch": 12,
+            "records": 4,
+            "bytes": 100,
+            "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+            "commits": [{"epoch": 11, "unix_nanos": 110}]
+        }"#;
+        let reference: PitrChunkRef = serde_json::from_str(json).unwrap();
+        assert!(reference.commit_ledger.is_empty());
+        // Serializing an empty ledger keeps the pre-1G JSON shape.
+        assert!(!serde_json::to_string(&reference)
+            .unwrap()
+            .contains("commit_ledger"));
+    }
+
+    #[test]
+    fn transaction_id_target_lands_on_the_exact_commit() {
+        let manifest = ledger_manifest();
+        assert_eq!(
+            resolve_target_epoch(&manifest, PitrTarget::TransactionId(5)).unwrap(),
+            11
+        );
+        assert_eq!(
+            resolve_target_epoch(&manifest, PitrTarget::TransactionId(9)).unwrap(),
+            13
+        );
+        // Unknown ids fail closed, as does a legacy ledger without entries.
+        assert!(resolve_target_epoch(&manifest, PitrTarget::TransactionId(8)).is_err());
+        assert!(resolve_target_epoch(&sample_manifest(), PitrTarget::TransactionId(5)).is_err());
+    }
+
+    #[test]
+    fn log_position_target_resolves_through_the_commit_ledger() {
+        let manifest = ledger_manifest();
+        assert_eq!(
+            resolve_target_epoch(&manifest, PitrTarget::LogPosition(23)).unwrap(),
+            12
+        );
+        // A position between commits resolves to the earlier commit.
+        assert_eq!(
+            resolve_target_epoch(&manifest, PitrTarget::LogPosition(30)).unwrap(),
+            12
+        );
+        // A position inside the base backup resolves to the base boundary.
+        assert_eq!(
+            resolve_target_epoch(&manifest, PitrTarget::LogPosition(20)).unwrap(),
+            10
+        );
+        // A position above every commit resolves to the archive watermark.
+        assert_eq!(
+            resolve_target_epoch(&manifest, PitrTarget::LogPosition(u64::MAX)).unwrap(),
+            13
+        );
+        // A legacy ledger without recorded positions fails closed.
+        assert!(resolve_target_epoch(&sample_manifest(), PitrTarget::LogPosition(23)).is_err());
+    }
+
+    #[test]
+    fn manifest_structure_rejects_a_ledger_length_mismatch() {
+        let mut manifest = ledger_manifest();
+        validate_manifest_structure(&manifest).unwrap();
+        manifest.chunks[0].commit_ledger.pop();
+        assert!(validate_manifest_structure(&manifest).is_err());
+
+        let mut legacy = ledger_manifest();
+        legacy.format_version = LEGACY_FORMAT_VERSION;
+        legacy.base_backup_sha256.clear();
+        legacy.chain_sha256.clear();
+        for chunk in &mut legacy.chunks {
+            chunk.first_sequence = 0;
+            chunk.last_sequence = 0;
+            chunk.previous_chain_sha256.clear();
+            chunk.chain_sha256.clear();
+        }
+        assert!(validate_manifest_structure(&legacy).is_err());
+    }
+
+    #[test]
+    fn chunk_body_rejects_commit_ledger_mismatches() {
+        let manifest = sample_manifest();
+        let mut reference = manifest.chunks[1].clone();
+        reference.commit_ledger = vec![PitrCommitLedgerEntry {
+            txn_id: 7,
+            sequence: 31,
+        }];
+        let chunk = DecodedPitrChunk {
+            from_epoch: 12,
+            through_epoch: 13,
+            records: vec![
+                Record::new(Epoch(30), 7, Op::CommitTimestamp { unix_nanos: 130 }),
+                Record::new(
+                    Epoch(31),
+                    7,
+                    Op::TxnCommit {
+                        epoch: 13,
+                        added_runs: Vec::new(),
+                    },
+                ),
+            ],
+            commits: reference.commits.clone(),
+            first_sequence: Some(30),
+            last_sequence: Some(31),
+            previous_chain_sha256: Some(reference.previous_chain_sha256.clone()),
+        };
+        validate_chunk(&reference, &chunk, FORMAT_VERSION, None).unwrap();
+
+        let mut wrong_txn = reference.clone();
+        wrong_txn.commit_ledger[0].txn_id = 8;
+        assert!(validate_chunk(&wrong_txn, &chunk, FORMAT_VERSION, None).is_err());
+
+        let mut wrong_sequence = reference.clone();
+        wrong_sequence.commit_ledger[0].sequence = 30;
+        assert!(validate_chunk(&wrong_sequence, &chunk, FORMAT_VERSION, None).is_err());
     }
 }

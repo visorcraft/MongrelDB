@@ -793,3 +793,179 @@ fn doctor_drop_is_replayed_by_pitr() {
         .table("broken")
         .is_err());
 }
+
+#[test]
+fn pitr_restores_transaction_id_and_log_position_targets() {
+    let source = tempdir().unwrap();
+    let archive_parent = tempdir().unwrap();
+    let restore_parent = tempdir().unwrap();
+    let archive = archive_parent.path().join("archive");
+    let db = Database::create(source.path()).unwrap();
+    db.create_table("items", schema()).unwrap();
+    put(&db, 1);
+    let base = db.create_pitr_archive(&archive).unwrap();
+    let second_epoch = put(&db, 2);
+    let third_epoch = put(&db, 3);
+    db.archive_pitr(&archive).unwrap();
+
+    let manifest = read_pitr_manifest(&archive).unwrap();
+    let commit = |epoch| {
+        manifest
+            .chunks
+            .iter()
+            .flat_map(|chunk| chunk.commit_ledger.iter().zip(&chunk.commits))
+            .find(|(_, commit)| commit.epoch == epoch)
+            .map(|(entry, commit)| (*entry, commit.clone()))
+            .unwrap()
+    };
+    let (second_ledger, second) = commit(second_epoch);
+    let (third_ledger, third) = commit(third_epoch);
+    assert!(second_ledger.txn_id != 0 && second_ledger.sequence != 0);
+    assert!(third_ledger.txn_id != 0 && third_ledger.sequence != 0);
+
+    // Transaction-id targets land on the exact commit.
+    let at_txn = restore_parent.path().join("at-txn");
+    assert_eq!(
+        restore_pitr(
+            &archive,
+            &at_txn,
+            PitrTarget::TransactionId(second_ledger.txn_id),
+            PitrCredentials::None,
+        )
+        .unwrap(),
+        second.epoch
+    );
+    assert_eq!(ids(&Database::open(&at_txn).unwrap()), vec![1, 2]);
+
+    // Log-position targets land on the commit at or below the position.
+    let at_position = restore_parent.path().join("at-position");
+    assert_eq!(
+        restore_pitr(
+            &archive,
+            &at_position,
+            PitrTarget::LogPosition(third_ledger.sequence),
+            PitrCredentials::None,
+        )
+        .unwrap(),
+        third.epoch
+    );
+    assert_eq!(ids(&Database::open(&at_position).unwrap()), vec![1, 2, 3]);
+
+    // A position between two commits resolves to the earlier commit.
+    let between = restore_parent.path().join("between");
+    assert!(third_ledger.sequence > second_ledger.sequence + 1);
+    assert_eq!(
+        restore_pitr(
+            &archive,
+            &between,
+            PitrTarget::LogPosition(third_ledger.sequence - 1),
+            PitrCredentials::None,
+        )
+        .unwrap(),
+        second.epoch
+    );
+
+    // A position inside the base backup resolves to the base boundary.
+    let at_base = restore_parent.path().join("at-base");
+    assert_eq!(
+        restore_pitr(
+            &archive,
+            &at_base,
+            PitrTarget::LogPosition(1),
+            PitrCredentials::None,
+        )
+        .unwrap(),
+        base.through_epoch
+    );
+    assert_eq!(ids(&Database::open(&at_base).unwrap()), vec![1]);
+
+    // An unknown transaction id fails closed.
+    assert!(matches!(
+        restore_pitr(
+            &archive,
+            restore_parent.path().join("unknown"),
+            PitrTarget::TransactionId(u64::MAX),
+            PitrCredentials::None,
+        ),
+        Err(MongrelError::InvalidArgument(_))
+    ));
+}
+
+#[test]
+fn pitr_restore_refuses_a_running_destination() {
+    let source = tempdir().unwrap();
+    let archive_parent = tempdir().unwrap();
+    let restore_parent = tempdir().unwrap();
+    let archive = archive_parent.path().join("archive");
+    let destination = restore_parent.path().join("restored");
+    let db = Database::create(source.path()).unwrap();
+    db.create_table("items", schema()).unwrap();
+    put(&db, 1);
+    db.create_pitr_archive(&archive).unwrap();
+
+    // Never restore in place over a running database (spec 10.7).
+    let running = Database::create(&destination).unwrap();
+    let error = restore_pitr(
+        &archive,
+        &destination,
+        PitrTarget::Latest,
+        PitrCredentials::None,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, MongrelError::DatabaseLocked { .. }),
+        "unexpected error: {error:?}"
+    );
+    // The running database is untouched and still usable.
+    running.create_table("mine", schema()).unwrap();
+    drop(running);
+
+    // An existing but closed destination is still refused, as a plain
+    // conflict rather than a lock violation.
+    let error = restore_pitr(
+        &archive,
+        &destination,
+        PitrTarget::Latest,
+        PitrCredentials::None,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, MongrelError::Conflict(_)),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
+fn validated_restore_reports_post_restore_checks() {
+    let source = tempdir().unwrap();
+    let archive_parent = tempdir().unwrap();
+    let restore_parent = tempdir().unwrap();
+    let archive = archive_parent.path().join("archive");
+    let destination = restore_parent.path().join("restored");
+    let db = Database::create(source.path()).unwrap();
+    db.create_table("items", schema()).unwrap();
+    db.table("items")
+        .unwrap()
+        .lock()
+        .set_mutable_run_spill_bytes(1);
+    put(&db, 1);
+    db.table("items").unwrap().lock().flush().unwrap();
+    db.create_pitr_archive(&archive).unwrap();
+    put(&db, 2);
+    db.archive_pitr(&archive).unwrap();
+
+    let (epoch, report) = mongreldb_core::pitr::restore_pitr_validated(
+        &archive,
+        &destination,
+        PitrTarget::Latest,
+        PitrCredentials::None,
+    )
+    .unwrap();
+    assert_eq!(epoch, db.visible_epoch().0);
+    assert!(report.manifest_consistent);
+    assert!(report.catalog_loaded);
+    assert!(report.files_checked > 0, "base run checksums re-verified");
+    assert_eq!(report.files_checked, report.files_ok);
+    assert!(report.issues.is_empty());
+    assert_eq!(ids(&Database::open(&destination).unwrap()), vec![1, 2]);
+}

@@ -8,6 +8,7 @@
 pub mod ann;
 pub mod bitmap;
 pub mod fm_index;
+pub mod generation;
 pub mod hnsw;
 pub mod hot;
 pub mod learned_range;
@@ -18,6 +19,7 @@ pub mod sparse;
 pub use ann::AnnIndex;
 pub use bitmap::BitmapIndex;
 pub use fm_index::FmIndex;
+pub use generation::{IndexFamilyGeneration, IndexGeneration};
 pub use hot::HotIndex;
 pub use learned_range::{ColumnLearnedRange, ColumnLearnedRangeSnapshot};
 pub use minhash::{

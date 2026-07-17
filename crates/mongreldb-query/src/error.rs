@@ -6,7 +6,7 @@ pub type Result<T> = std::result::Result<T, MongrelQueryError>;
 #[derive(Debug, Error)]
 pub enum MongrelQueryError {
     #[error("mongreldb error: {0}")]
-    Core(#[from] mongreldb_core::MongrelError),
+    Core(mongreldb_core::MongrelError),
     #[error("arrow error: {0}")]
     Arrow(String),
     #[error("datafusion error: {0}")]
@@ -82,6 +82,17 @@ pub enum MongrelQueryError {
     InvalidQueryState(String),
 }
 
+impl From<mongreldb_core::MongrelError> for MongrelQueryError {
+    /// Core errors arrive on their precise taxonomy variants — the commit
+    /// path raises SSI certification aborts as
+    /// `MongrelError::SerializationFailure` (category 8) natively and
+    /// `From<LockError>` bridges deadlock victims onto `MongrelError::Deadlock`
+    /// (category 9) — so the SQL boundary is a straight passthrough.
+    fn from(error: mongreldb_core::MongrelError) -> Self {
+        Self::Core(error)
+    }
+}
+
 impl MongrelQueryError {
     /// Stable machine-readable category for language bindings and protocols.
     pub fn code(&self) -> &'static str {
@@ -107,5 +118,106 @@ impl MongrelQueryError {
             Self::OutcomeUnknown { .. } => "QUERY_OUTCOME_UNKNOWN",
             Self::InvalidQueryState(_) => "INVALID_QUERY_STATE",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mongreldb_core::MongrelError;
+
+    #[test]
+    fn serialization_failure_passes_through_precise_with_category_8() {
+        // The exact message core's commit path constructs (database.rs); the
+        // variant now arrives native from core, so the boundary must preserve
+        // it — and with it the precise taxonomy category 8.
+        let core = MongrelError::SerializationFailure {
+            message: "a concurrent commit invalidated this transaction's reads (pre-validate)"
+                .into(),
+        };
+        let error = MongrelQueryError::from(core);
+        match error {
+            MongrelQueryError::Core(MongrelError::SerializationFailure { message }) => {
+                assert_eq!(
+                    message,
+                    "a concurrent commit invalidated this transaction's reads (pre-validate)"
+                );
+                let precise = MongrelError::SerializationFailure { message };
+                assert_eq!(precise.category().code(), 8);
+                assert_eq!(
+                    precise.to_string(),
+                    "serialization failure: a concurrent commit invalidated this transaction's reads (pre-validate)"
+                );
+            }
+            other => panic!("expected SerializationFailure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn marker_prefixed_conflict_stays_a_plain_conflict() {
+        // No string-marker reinterpretation survives at the boundary: even a
+        // `Conflict` whose message begins with the legacy prefix keeps its
+        // variant (and the generic transaction-conflict category).
+        let core = MongrelError::Conflict("serialization failure: hand-built".into());
+        let error = MongrelQueryError::from(core);
+        assert!(
+            matches!(
+                &error,
+                MongrelQueryError::Core(MongrelError::Conflict(message))
+                    if message == "serialization failure: hand-built"
+            ),
+            "a marker-prefixed Conflict is never re-homed: {error:?}"
+        );
+    }
+
+    #[test]
+    fn non_marker_conflict_passes_through_untouched() {
+        let core = MongrelError::Conflict(
+            "write-write conflict (pre-validate, first-committer-wins)".into(),
+        );
+        let error = MongrelQueryError::from(core);
+        assert!(
+            matches!(
+                &error,
+                MongrelQueryError::Core(MongrelError::Conflict(message))
+                    if message == "write-write conflict (pre-validate, first-committer-wins)"
+            ),
+            "plain conflicts keep their variant: {error:?}"
+        );
+    }
+
+    #[test]
+    fn deadlock_passes_through_precise() {
+        // LockError::Deadlock bridges onto MongrelError::Deadlock in core;
+        // the SQL boundary must preserve the dedicated variant.
+        let core = MongrelError::from(mongreldb_core::locks::LockError::Deadlock {
+            victim: 5,
+            cycle: "5 → 2 → 5".into(),
+        });
+        let error = MongrelQueryError::from(core);
+        assert!(
+            matches!(
+                &error,
+                MongrelQueryError::Core(MongrelError::Deadlock { victim: 5, cycle })
+                    if cycle == "5 → 2 → 5"
+            ),
+            "deadlock keeps victim and cycle: {error:?}"
+        );
+    }
+
+    #[test]
+    fn already_precise_variants_pass_through() {
+        let error = MongrelQueryError::from(MongrelError::SerializationFailure {
+            message: "native".into(),
+        });
+        assert!(matches!(
+            error,
+            MongrelQueryError::Core(MongrelError::SerializationFailure { .. })
+        ));
+        let error = MongrelQueryError::from(MongrelError::Cancelled);
+        assert!(matches!(
+            error,
+            MongrelQueryError::Core(MongrelError::Cancelled)
+        ));
     }
 }

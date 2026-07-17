@@ -19,6 +19,7 @@ pub mod columnar;
 pub mod commit_log;
 pub mod compaction;
 pub mod constraint;
+pub mod core;
 pub mod cursor;
 pub mod database;
 pub mod durable_file;
@@ -53,6 +54,7 @@ pub mod rowid;
 pub mod schema;
 pub mod security;
 pub mod sorted_run;
+pub mod spill;
 pub mod trace;
 pub mod trigger;
 pub mod tsv;
@@ -61,6 +63,7 @@ pub mod wal;
 
 pub(crate) const MAX_READ_GENERATION_LAYERS: usize = 8;
 
+pub use crate::core::{DatabaseFileIdentity, LifecycleController, LifecycleState, OperationGuard};
 pub use auth::{
     hash_password, verify_password, ColumnAccess, ColumnOperation, Permission, Principal,
     RoleEntry, UserEntry,
@@ -72,18 +75,20 @@ pub use catalog::{
     IncrementalAggregateKind, IncrementalAggregateOutput, IncrementalAggregateView,
     MaterializedViewEntry,
 };
+pub use catalog_cmds::{required_permission, CatalogCommand, CatalogCommandRecord, CatalogDelta};
 pub use columnar::{decode_column, encode_column};
 pub use cursor::{drain_cursor_to_columns, Cursor, MultiRunCursor, NativePageCursor};
 pub use database::{
     lock_table_with_context, AuthorizedReadSnapshot, AuthorizedReadStamp, CdcBatch, ChangeEvent,
-    CheckIssue, Database, DatabaseOpenMetrics, ExternalTriggerBaseWrite, ExternalTriggerBridge,
-    ExternalTriggerWrite, ExternalTriggerWriteResult, OpenOptions, ReadAuthorization,
-    TableGenerationStats, TableGuard, TableHandle, TableReadGeneration,
+    CheckIssue, Database, DatabaseCore, DatabaseOpenMetrics, ExternalTriggerBaseWrite,
+    ExternalTriggerBridge, ExternalTriggerWrite, ExternalTriggerWriteResult, OpenOptions,
+    ReadAuthorization, TableGenerationStats, TableGuard, TableHandle, TablePinsReport,
+    TableReadGeneration, DEFAULT_MEMORY_BUDGET_BYTES, DEFAULT_TEMP_DISK_BUDGET_BYTES,
 };
 pub use encryption::{Cipher, PlaintextCipher};
 pub use engine::{
     AggState, ApproxAgg, ApproxResult, CachedAgg, ColumnStat, IncrementalAggResult,
-    IndexBuildPolicy, NativeAgg, NativeAggResult, Table,
+    IndexBuildPolicy, NativeAgg, NativeAggResult, ReadGeneration, Table, TableDeltas,
 };
 pub use epoch::{Epoch, EpochAuthority, EpochClock, MaintenanceReceipt, Snapshot};
 pub use error::{MongrelError, Result};
@@ -91,11 +96,23 @@ pub use execution::{CancellationReason, ExecutionControl};
 pub use external_table::{
     ExternalTableDefinition, ExternalTableEntry, ModuleArg, ModuleCapabilities,
 };
-pub use gc::{CheckReport, DoctorReport, GcReport};
+pub use gc::{CheckReport, DoctorReport, GcReport, GcVersionsReport};
+pub use handle::{DatabaseHandle, HandleAccess, HandleIdentity, OpenIdentity};
 pub use index::{
-    AnnIndex, BitmapIndex, ColumnLearnedRange, FmIndex, HotIndex, LearnedIndex, SparseIndex,
+    AnnIndex, BitmapIndex, ColumnLearnedRange, FmIndex, HotIndex, IndexFamilyGeneration,
+    IndexGeneration, LearnedIndex, SparseIndex,
 };
+pub use jobs::{
+    CancellationToken, JobError, JobKind, JobProgress, JobRecord, JobRegistry, JobState, JobTarget,
+    JOBS_FILENAME,
+};
+pub use locks::{LockError, LockKey, LockManager, LockMode, LockRequest};
+pub use manager::DatabaseManager;
 pub use manifest::TtlPolicy;
+pub use memory::{
+    EscalationLevel, EscalationThresholds, GovernorConfig, GovernorStats, MemoryClass, MemoryError,
+    MemoryGovernor, Reclaimable, Reservation, SpillGrant,
+};
 pub use memtable::{Memtable, Row, Value};
 pub use mutable_run::MutableRun;
 pub use page::{CachedPage, Encoding, PageStat};
@@ -132,7 +149,11 @@ pub use replication::{
     ReplicationSnapshot,
 };
 pub use reservoir::Reservoir;
-pub use retention::{OwnedSnapshotGuard, SnapshotGuard, SnapshotRegistry};
+pub use resource::{ResourceError, ResourceGroup, ResourceGroupRegistry, WorkloadClass};
+pub use retention::{
+    OwnedSnapshotGuard, PinGuard, PinInfo, PinRegistry, PinSource, PinsReport, SnapshotGuard,
+    SnapshotRegistry,
+};
 pub use rowid::{RowId, RowIdAllocator};
 pub use schema::{
     AlterColumn, ColumnDef, ColumnFlags, DefaultExpr, IndexDef, IndexKind, Schema, TypeId,
@@ -143,6 +164,10 @@ pub use security::{
 pub use sorted_run::{
     read_column_dir, read_header, write_run, write_run_with, ColumnPayload, RunHeader, RunReader,
     RunSpec, RunWriter,
+};
+pub use spill::{
+    SpillConfig, SpillError, SpillHandle, SpillManager, SpillReader, SpillSession, SpillStats,
+    SpillWriter,
 };
 pub use trace::{IndexRebuild, QueryTrace, ScanMode};
 pub use trigger::{

@@ -1,0 +1,24 @@
+[package]
+name = "mongreldb-cluster"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "MongrelDB cluster runtime: node identity, meta group, tablets, placement (Stages 2-3)."
+
+[dependencies]
+tokio = { version = "1.52.3", features = ["sync", "rt", "time", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+sha2 = "0.10"
+getrandom = "0.2"
+mongreldb-types = { path = "../mongreldb-types", version = "0.59.0" }
+mongreldb-log = { path = "../mongreldb-log", version = "0.59.0" }
+mongreldb-consensus = { path = "../mongreldb-consensus", version = "0.59.0" }
+mongreldb-fault = { path = "../mongreldb-fault", version = "0.59.0" }
+
+[dev-dependencies]
+mongreldb-sim = { path = "../mongreldb-sim", version = "0.59.0" }
+tempfile = "3"

@@ -289,8 +289,12 @@ pub enum Op {
         row_id: RowId,
         row: Vec<u8>,
     },
-    /// Wall-clock UTC nanoseconds recorded immediately before TxnCommit. PITR
-    /// uses this durable ledger to map timestamp cutoffs to commit epochs.
+    /// Commit-timestamp ledger record written immediately before TxnCommit.
+    /// Carries the physical component of the commit's HLC timestamp (spec
+    /// §8.1, micros × 1_000) for transactions sequenced through the commit
+    /// log, and wall-clock UTC nanoseconds on the legacy single-table/DDL
+    /// append paths. PITR uses this durable ledger to map timestamp cutoffs
+    /// to commit epochs.
     CommitTimestamp {
         unix_nanos: u64,
     },

@@ -1,6 +1,14 @@
 //! Online backup manifest and verification.
+//!
+//! The manifest audit fields (Stage 1G, spec section 10.7) are additive and
+//! every one of them defaults, so backups written before Stage 1G still
+//! deserialize and validate unchanged: `database_id`/`encryption` decode as
+//! `None`, and `catalog_version`, `snapshot_unix_micros`, and
+//! `open_generation` decode as `0` ("unknown"). Conversely, pre-1G binaries
+//! ignore the new keys because the manifest never denied unknown fields.
 
 use crate::{MongrelError, Result};
+use mongreldb_types::ids::DatabaseId;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -10,6 +18,11 @@ use std::path::{Component, Path, PathBuf};
 pub const BACKUP_FORMAT_VERSION: u16 = 1;
 pub const BACKUP_MANIFEST_PATH: &str = "_meta/backup.json";
 const MAX_BACKUP_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+/// Persisted replication identity marker reused as the backup database ID.
+const REPLICATION_ID_PATH: &str = "_meta/replication_id";
+const REPLICATION_ID_LEN: usize = 32;
+/// KEK salt marker whose presence identifies an encrypted database.
+const KEYS_PATH: &str = "_meta/keys";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackupFile {
@@ -18,11 +31,55 @@ pub struct BackupFile {
     pub sha256: String,
 }
 
+/// Encryption metadata recorded in a backup manifest (Stage 1G). The KEK
+/// salt itself travels inside the backup as the `_meta/keys` file, so only
+/// the scheme identifiers live here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupEncryptionMetadata {
+    /// KEK derivation scheme for the database passphrase.
+    pub kdf: String,
+    /// Page/record cipher guarding the backup files.
+    pub cipher: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackupManifest {
     pub format_version: u16,
     pub epoch: u64,
     pub created_unix_nanos: u64,
+    /// Database identity (spec 10.7). Derived from the persisted replication
+    /// identity (`_meta/replication_id`, 32 CSPRNG bytes created on first
+    /// open): the `DatabaseId` is its first 16 bytes. The derivation is
+    /// deterministic, stable across backups of one database, and travels
+    /// with the backup because the marker file is part of the copied file
+    /// set. `None` only when the source directory lacks the marker (a
+    /// database never opened by a replication-aware binary); backup never
+    /// invents or persists a fresh identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_id: Option<DatabaseId>,
+    /// Catalog command state-machine version at the backup boundary
+    /// (S1F). `0` means "unknown": pre-1G manifests, legacy catalogs, and
+    /// encrypted catalogs whose bytes cannot be decoded here without the
+    /// database passphrase.
+    #[serde(default)]
+    pub catalog_version: u64,
+    /// Snapshot wall clock in HLC physical units (microseconds since the
+    /// UNIX epoch), captured at manifest creation right after the commit
+    /// boundary was copied. `0` means "unknown" (pre-1G manifests). The
+    /// exact boundary nanoseconds remain available to the caller through
+    /// [`BackupReport::boundary_unix_nanos`].
+    #[serde(default)]
+    pub snapshot_unix_micros: u64,
+    /// WAL open generation scoping `epoch`, read from `_meta/generation`.
+    /// Together `(epoch, open_generation)` is the log continuation position:
+    /// the durable commit watermark plus the generation that scopes the WAL
+    /// record sequence it refers to. `0` means "unknown" (pre-1G manifests
+    /// or a missing sidecar).
+    #[serde(default)]
+    pub open_generation: u64,
+    /// Encryption metadata; `None` identifies a plaintext backup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption: Option<BackupEncryptionMetadata>,
     pub files: Vec<BackupFile>,
 }
 
@@ -34,6 +91,57 @@ pub struct BackupReport {
     pub boundary_unix_nanos: u64,
     pub files: usize,
     pub bytes: u64,
+}
+
+/// Outcome of a post-restore validation pass (Stage 1G, spec 10.7), in the
+/// idiom of [`crate::gc::CheckReport`]/[`crate::gc::DoctorReport`]: soft
+/// findings collect in `issues`, hard corruption returns `Err`.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RestoreReport {
+    /// Manifest-listed files whose size and SHA-256 were re-verified.
+    pub files_checked: usize,
+    /// Files whose checksum matched the manifest.
+    pub files_ok: usize,
+    /// Total bytes re-hashed.
+    pub bytes_checked: u64,
+    /// The catalog decoded. `false` for encrypted trees validated without
+    /// the database passphrase (recorded as an issue, not a failure).
+    pub catalog_loaded: bool,
+    /// Manifest structure, file hashes, and the manifest/file-set equality
+    /// all held.
+    pub manifest_consistent: bool,
+    /// Non-fatal findings.
+    pub issues: Vec<String>,
+}
+
+/// Post-restore validation pass over a backup or restored database tree:
+/// re-verifies the manifest, every listed file size/hash, and the manifest/
+/// file-set equality, then loads the catalog. Row counts are intentionally
+/// out of scope: opening the tree as a database would take its lock and
+/// bump its open generation.
+pub fn validate_restore(root: impl AsRef<Path>) -> Result<RestoreReport> {
+    let root = crate::durable_file::DurableRoot::open(root)?;
+    validate_restore_durable(&root)
+}
+
+pub(crate) fn validate_restore_durable(
+    root: &crate::durable_file::DurableRoot,
+) -> Result<RestoreReport> {
+    let (manifest, _) = verify_backup_durable_with_manifest_sha256(root)?;
+    let mut report = RestoreReport {
+        files_checked: manifest.files.len(),
+        files_ok: manifest.files.len(),
+        bytes_checked: manifest.total_bytes(),
+        manifest_consistent: true,
+        ..RestoreReport::default()
+    };
+    match crate::catalog::read_durable(root, None)? {
+        Some(_) => report.catalog_loaded = true,
+        None => report
+            .issues
+            .push("catalog did not decode without a passphrase (encrypted)".into()),
+    }
+    Ok(report)
 }
 
 impl BackupManifest {
@@ -60,13 +168,18 @@ impl BackupManifest {
                 sha256: sha256_open_file_inner(&mut source, Some(control))?,
             });
         }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
         Ok(Self {
             format_version: BACKUP_FORMAT_VERSION,
             epoch,
-            created_unix_nanos: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64,
+            created_unix_nanos: now.as_nanos() as u64,
+            database_id: backup_database_id(root)?,
+            catalog_version: backup_catalog_version(root)?,
+            snapshot_unix_micros: now.as_micros() as u64,
+            open_generation: crate::catalog::read_generation(root)?.unwrap_or(0),
+            encryption: backup_encryption_metadata(root)?,
             files,
         })
     }
@@ -81,6 +194,53 @@ impl BackupManifest {
 
     pub fn total_bytes(&self) -> u64 {
         self.files.iter().map(|file| file.bytes).sum()
+    }
+}
+
+/// Derive the backup-scoped database ID from the persisted replication
+/// identity marker. Read-only: a missing marker degrades to `None` rather
+/// than inventing an identity (database identity lifecycle belongs to
+/// `database.rs`), while a malformed marker fails closed because the marker
+/// is immutable once created.
+fn backup_database_id(root: &crate::durable_file::DurableRoot) -> Result<Option<DatabaseId>> {
+    let file = match root.open_regular(REPLICATION_ID_PATH) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mut bytes = Vec::with_capacity(REPLICATION_ID_LEN);
+    file.take(REPLICATION_ID_LEN as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() != REPLICATION_ID_LEN || bytes.iter().all(|byte| *byte == 0) {
+        return Err(MongrelError::Other(format!(
+            "invalid database replication identity length: got {}, expected {REPLICATION_ID_LEN} nonzero bytes",
+            bytes.len()
+        )));
+    }
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&bytes[..16]);
+    Ok(Some(DatabaseId::from_bytes(id)))
+}
+
+/// Catalog version at the backup boundary. Encrypted catalogs cannot be
+/// decoded without the database passphrase, which the manifest builder does
+/// not hold; those record `0` ("unknown", see [`BackupManifest`]).
+fn backup_catalog_version(root: &crate::durable_file::DurableRoot) -> Result<u64> {
+    Ok(crate::catalog::read_durable(root, None)?
+        .map(|catalog| catalog.catalog_version())
+        .unwrap_or(0))
+}
+
+fn backup_encryption_metadata(
+    root: &crate::durable_file::DurableRoot,
+) -> Result<Option<BackupEncryptionMetadata>> {
+    match root.open_regular(KEYS_PATH) {
+        Ok(_) => Ok(Some(BackupEncryptionMetadata {
+            kdf: "argon2id-hkdf-sha256".into(),
+            cipher: "aes-256-gcm".into(),
+        })),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -201,7 +361,7 @@ pub(crate) fn copy_open_file_synced(source: &mut std::fs::File, destination: &Pa
     Ok(bytes)
 }
 
-fn sha256_open_file_inner(
+pub(crate) fn sha256_open_file_inner(
     file: &mut std::fs::File,
     control: Option<&crate::ExecutionControl>,
 ) -> Result<String> {
@@ -240,4 +400,79 @@ fn validate_relative_path(path: &Path) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pre_1g_manifest_json_decodes_with_unknown_audit_fields() {
+        let json = r#"{"format_version":1,"epoch":7,"created_unix_nanos":42,"files":[]}"#;
+        let manifest: BackupManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(manifest.format_version, 1);
+        assert_eq!(manifest.epoch, 7);
+        assert_eq!(manifest.database_id, None);
+        assert_eq!(manifest.catalog_version, 0);
+        assert_eq!(manifest.snapshot_unix_micros, 0);
+        assert_eq!(manifest.open_generation, 0);
+        assert_eq!(manifest.encryption, None);
+    }
+
+    #[test]
+    fn manifest_serde_round_trip_preserves_audit_fields() {
+        let manifest = BackupManifest {
+            format_version: BACKUP_FORMAT_VERSION,
+            epoch: 9,
+            created_unix_nanos: 1_000,
+            database_id: Some(DatabaseId::from_bytes([7; 16])),
+            catalog_version: 3,
+            snapshot_unix_micros: 1,
+            open_generation: 2,
+            encryption: Some(BackupEncryptionMetadata {
+                kdf: "argon2id-hkdf-sha256".into(),
+                cipher: "aes-256-gcm".into(),
+            }),
+            files: vec![BackupFile {
+                path: PathBuf::from("CATALOG"),
+                bytes: 10,
+                sha256: "ab".repeat(32),
+            }],
+        };
+        let bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+        let decoded: BackupManifest = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(decoded, manifest);
+    }
+
+    #[test]
+    fn database_id_follows_the_replication_identity_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::durable_file::DurableRoot::open(directory.path()).unwrap();
+        assert_eq!(backup_database_id(&root).unwrap(), None);
+
+        root.create_directory_all("_meta").unwrap();
+        let identity = [7u8; REPLICATION_ID_LEN];
+        root.write_new(REPLICATION_ID_PATH, &identity).unwrap();
+        let id = backup_database_id(&root).unwrap().unwrap();
+        assert_eq!(id.as_bytes(), &[7u8; 16]);
+        // Stable: a second read derives the same identity.
+        assert_eq!(backup_database_id(&root).unwrap(), Some(id));
+    }
+
+    #[test]
+    fn database_id_fails_closed_on_a_malformed_identity_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::durable_file::DurableRoot::open(directory.path()).unwrap();
+        root.create_directory_all("_meta").unwrap();
+        root.write_new(REPLICATION_ID_PATH, &[1, 2, 3]).unwrap();
+        assert!(backup_database_id(&root).is_err());
+
+        let zeroed = tempfile::tempdir().unwrap();
+        let zeroed = crate::durable_file::DurableRoot::open(zeroed.path()).unwrap();
+        zeroed.create_directory_all("_meta").unwrap();
+        zeroed
+            .write_new(REPLICATION_ID_PATH, &[0u8; REPLICATION_ID_LEN])
+            .unwrap();
+        assert!(backup_database_id(&zeroed).is_err());
+    }
 }

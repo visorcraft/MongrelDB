@@ -46,3 +46,14 @@ languages:
 | 1 | `id` | `int64` | yes | no |
 | 2 | `name` / `label` / `customer` | `varchar` | no | no |
 | 3 | `amount` / `score` | `float64` | no | no |
+
+## Error contract
+
+The cross-language error contract is the stable `ErrorCategory` taxonomy from
+`mongreldb-types`: `MongrelError::category()` maps every engine error onto one
+of twenty categories, each with a numeric code (`code()`, 1-20) that is never
+reused and a retry class (`retry_class()`). Clients must key error handling
+off the category or its code, never the message text - messages are diagnostic
+and may change between releases. See
+[Architecture Foundations](18-architecture-foundations.md#stable-error-taxonomy)
+for the full contract.

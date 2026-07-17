@@ -53,6 +53,52 @@ pub(crate) struct SqlReceiptTerminalError {
     pub(crate) category: String,
 }
 
+/// The core commit log's irrevocable receipt for one committed idempotent
+/// write (spec §10.2 S1B-005), recorded through the durable `TXN_IDEMPOTENCY`
+/// ledger and echoed back additively in receipt responses. Contains no secret
+/// material: ids, the HLC commit timestamp, the log position, and the
+/// durability level only.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SqlCommitReceipt {
+    /// 128-bit transaction id, canonical lowercase hex.
+    pub(crate) transaction_id: String,
+    pub(crate) commit_ts_physical_micros: u64,
+    pub(crate) commit_ts_logical: u32,
+    pub(crate) commit_ts_node_tiebreaker: u32,
+    pub(crate) log_term: u64,
+    pub(crate) log_index: u64,
+    pub(crate) durability: String,
+}
+
+impl SqlCommitReceipt {
+    pub(crate) fn from_core(receipt: &mongreldb_log::CommitReceipt) -> Self {
+        let durability = match receipt.durability {
+            mongreldb_log::DurabilityLevel::GroupCommit => "group_commit",
+            mongreldb_log::DurabilityLevel::LeaderDisk => "leader_disk",
+            mongreldb_log::DurabilityLevel::Quorum => "quorum",
+        };
+        Self {
+            transaction_id: receipt.transaction_id.to_hex(),
+            commit_ts_physical_micros: receipt.commit_ts.physical_micros,
+            commit_ts_logical: receipt.commit_ts.logical,
+            commit_ts_node_tiebreaker: receipt.commit_ts.node_tiebreaker,
+            log_term: receipt.log_position.term,
+            log_index: receipt.log_position.index,
+            durability: durability.to_owned(),
+        }
+    }
+
+    /// The receipt's HLC commit timestamp (the read-your-writes token type of
+    /// the canonical session record, S1D-004).
+    pub(crate) fn commit_ts(&self) -> mongreldb_types::hlc::HlcTimestamp {
+        mongreldb_types::hlc::HlcTimestamp {
+            physical_micros: self.commit_ts_physical_micros,
+            logical: self.commit_ts_logical,
+            node_tiebreaker: self.commit_ts_node_tiebreaker,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SqlDurableReceipt {
     pub(crate) original_query_id: String,
@@ -61,6 +107,12 @@ pub(crate) struct SqlDurableReceipt {
     pub(crate) cancellation_reason: String,
     pub(crate) outcome: SqlReceiptOutcome,
     pub(crate) terminal_error: Option<SqlReceiptTerminalError>,
+    /// Additive (format-v5 compatible): present for receipts recorded after
+    /// the core-ledger unification landed. `skip_serializing_if` keeps the
+    /// byte form of pre-unification receipts identical so their
+    /// authentication tags still verify.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) commit_receipt: Option<SqlCommitReceipt>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -469,6 +521,8 @@ impl SqlIdempotencyStore {
             scope,
             scope_hash,
             owner_hash,
+            owner: owner.to_owned(),
+            key: key.to_owned(),
             binding,
             _guard: guard,
         })
@@ -666,11 +720,29 @@ pub(crate) struct SqlIdempotencyExecution {
     scope: String,
     scope_hash: [u8; 32],
     owner_hash: [u8; 32],
+    owner: String,
+    key: String,
     binding: SqlIdempotencyBinding,
     _guard: OwnedMutexGuard<()>,
 }
 
 impl SqlIdempotencyExecution {
+    pub(crate) fn owner(&self) -> &str {
+        &self.owner
+    }
+
+    pub(crate) fn key(&self) -> &str {
+        &self.key
+    }
+
+    pub(crate) fn binding(&self) -> &SqlIdempotencyBinding {
+        &self.binding
+    }
+
+    pub(crate) fn ttl(&self) -> Duration {
+        Duration::from_millis(self.store.expires_after_ms())
+    }
+
     pub(crate) fn commit(self, receipt: SqlDurableReceipt) -> (u64, bool) {
         let expires_at_ms = now_ms().saturating_add(duration_ms(self.store.ttl));
         let mut entry = PersistedReceipt {
@@ -896,6 +968,75 @@ pub(crate) fn now_ms() -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
+/// Namespace separating `/sql` idempotency keys from any other user of the
+/// core `TXN_IDEMPOTENCY` ledger (Kit/native paths use their own).
+const SQL_LEDGER_KEY_NAMESPACE: &str = "sql:";
+const SQL_LEDGER_FINGERPRINT_DOMAIN: &[u8] =
+    b"mongreldb/server/sql-idempotency/ledger-fingerprint/v1\0";
+
+/// The S1B-005 request fingerprint the core ledger binds an idempotency key
+/// to: a domain-separated fold of the full `/sql` request binding (SQL
+/// fingerprint, parameters, request and session semantics, expiry policy).
+fn ledger_fingerprint(binding: &SqlIdempotencyBinding) -> u64 {
+    let mut digest = Sha256::new();
+    digest.update(SQL_LEDGER_FINGERPRINT_DOMAIN);
+    digest.update(binding.sql_fingerprint);
+    digest.update(binding.parameter_hash);
+    digest.update(binding.request_semantics_hash);
+    digest.update(binding.session_semantics_hash);
+    digest.update(binding.expires_after_ms.to_le_bytes());
+    let output: [u8; 32] = digest.finalize().into();
+    u64::from_le_bytes(output[..8].try_into().expect("8 of 32 digest bytes"))
+}
+
+/// Record one committed idempotent `/sql` write in the core's durable
+/// `TXN_IDEMPOTENCY` ledger (spec §10.2 S1B-005), making the
+/// key → original-`CommitReceipt` binding survive restart under the commit
+/// log's authority — the same record an embedded
+/// `Transaction::commit_idempotent` caller gets. Returns the ledger's receipt
+/// (the original one on an identical replay) for additive surfacing in the
+/// HTTP receipt, or `None` when the ledger record could not be completed; the
+/// HTTP store remains the wire authority in that case (a warning is logged —
+/// it never silently changes the response contract).
+///
+/// The binding's expiry policy is passed as the ledger TTL so both stores
+/// retire the key together. A same-fingerprint replay (possible only when the
+/// HTTP store lost state the ledger kept) still yields the original receipt,
+/// which is exactly the ledger's truth; a fingerprint conflict is logged and
+/// yields `None` — the durable write's known-committed outcome is never
+/// reclassified by the bookkeeping path.
+pub(crate) fn record_core_idempotency_commit(
+    db: &Arc<mongreldb_core::Database>,
+    owner: &str,
+    key: &str,
+    binding: &SqlIdempotencyBinding,
+    ttl: Duration,
+) -> Option<SqlCommitReceipt> {
+    let request = mongreldb_core::txn::IdempotencyRequest {
+        key: format!("{SQL_LEDGER_KEY_NAMESPACE}{key}"),
+        owner: owner.to_owned(),
+        fingerprint: ledger_fingerprint(binding),
+        ttl: Some(ttl),
+    };
+    let transaction = db.begin();
+    let state = transaction.state_handle();
+    match transaction.commit_idempotent(request) {
+        Ok(_epoch) => match state.state() {
+            mongreldb_core::txn::TransactionState::Committed(receipt) => {
+                Some(SqlCommitReceipt::from_core(&receipt))
+            }
+            other => {
+                eprintln!("[idempotency] core ledger commit ended in unexpected state {other:?}");
+                None
+            }
+        },
+        Err(error) => {
+            eprintln!("[idempotency] core ledger record for /sql write failed: {error}");
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -939,6 +1080,7 @@ mod tests {
                 serialization: "succeeded".into(),
             },
             terminal_error: None,
+            commit_receipt: None,
         }
     }
 

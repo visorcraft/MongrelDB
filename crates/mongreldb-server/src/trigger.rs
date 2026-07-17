@@ -77,6 +77,9 @@ pub async fn create(
     OptionalPrincipal(principal): OptionalPrincipal,
     Json(req): Json<TriggerRequest>,
 ) -> Response {
+    if let Some(response) = crate::require_writes_open(&state) {
+        return response;
+    }
     let key = match request_idempotency_key(&headers, req.idempotency_key.as_deref()) {
         Ok(key) => key,
         Err(response) => return *response,
@@ -157,6 +160,9 @@ pub async fn replace(
     Path(name): Path<String>,
     Json(req): Json<TriggerRequest>,
 ) -> Response {
+    if let Some(response) = crate::require_writes_open(&state) {
+        return response;
+    }
     let key = match request_idempotency_key(&headers, req.idempotency_key.as_deref()) {
         Ok(key) => key,
         Err(response) => return *response,
@@ -242,6 +248,9 @@ pub async fn drop_trigger(
     OptionalPrincipal(principal): OptionalPrincipal,
     Path(name): Path<String>,
 ) -> Response {
+    if let Some(response) = crate::require_writes_open(&state) {
+        return response;
+    }
     let key = match request_idempotency_key(&headers, None) {
         Ok(key) => key,
         Err(response) => return *response,

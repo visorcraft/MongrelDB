@@ -477,7 +477,7 @@ async fn idempotency_transaction_check_waits_for_the_session_lock() {
     let (planning_tx, planning_rx) = std::sync::mpsc::channel();
     let check_fired = Arc::new(AtomicBool::new(false));
     let hook_check_fired = Arc::clone(&check_fired);
-    entry.session.set_test_hook(Some(Arc::new(move |point| {
+    entry.session().set_test_hook(Some(Arc::new(move |point| {
         if point == SqlTestHookPoint::Planning && !hook_planning_fired.swap(true, Ordering::AcqRel)
         {
             planning_tx.send(()).unwrap();

@@ -114,6 +114,68 @@ INSERT INTO temp (id, amount) VALUES (999, 500.0);
 SELECT count(*) FROM temp;
 ```
 
+## Transactions and Isolation Levels
+
+Statements run in autocommit mode by default. `BEGIN` or `START TRANSACTION`
+opens an explicit transaction that stages `INSERT`, `UPDATE`, `DELETE`, and
+`TRUNCATE` writes; `COMMIT` replays the staged writes into one core
+transaction, and `ROLLBACK` discards them. Savepoints nest inside the block -
+see [Operational SQL Commands](12-operational-sql-commands.md).
+
+Three isolation levels are available, matching the core MVCC levels:
+
+```sql
+-- Applies to the open transaction; pends for the next BEGIN when none is open.
+SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+
+-- Sets the session default for later transactions.
+SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED;
+
+-- Carries the level inline for this one transaction.
+START TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+```
+
+The level for one transaction resolves in order: an inline `START
+TRANSACTION` mode, then a pending `SET TRANSACTION`, then the session
+default. The default is `REPEATABLE READ` until `SET SESSION
+CHARACTERISTICS` changes it. `COMMIT` or `ROLLBACK` clears the
+per-transaction override; the session default survives. Unsupported forms
+fail closed and leave session state untouched: `READ UNCOMMITTED` has no
+core counterpart, `READ ONLY` / `READ WRITE` access modes would not be
+enforced by the staged-commit model, and `SET TRANSACTION SNAPSHOT` and
+`COMMIT AND CHAIN` are rejected.
+
+What each level guarantees:
+
+- **READ COMMITTED** - every statement re-pins its read snapshot at the
+  latest visible epoch, so a statement observes commits that landed since
+  the previous statement. Write-write validation at commit stays
+  conservative: first-committer-wins against the begin epoch.
+- **REPEATABLE READ** (default) - the transaction reads the fixed snapshot
+  pinned at begin. Concurrent transactions with disjoint write sets both
+  commit even when each read what the other wrote: write skew is allowed.
+  The historical core name `Snapshot` is a deprecated alias with identical
+  semantics.
+- **SERIALIZABLE** - the repeatable-read snapshot plus SSI-style
+  certification at commit. The commit validates the transaction's point
+  reads and predicate reads (table granularity: every base table a scan
+  touched, plus the matched-row read sides of `UPDATE`/`DELETE`) against
+  the conflict index. When a concurrent commit invalidated anything the
+  transaction read - the classic write-skew interleaving - the commit
+  aborts with `SerializationFailure` (error-taxonomy category 8, retry class
+  `RetryTransaction`). The failed commit leaves the
+  transaction aborted: issue `ROLLBACK`, then retry from the beginning.
+
+Two limitations follow from the staged-commit model. The core transaction
+is built at `COMMIT` from the staged operations, so the certification
+window pins at commit time rather than at `BEGIN`: scans during the
+transaction record their tables, and that read set is replayed into the
+commit transaction and certified there. And because certification begins
+the core transaction directly (without the trigger bridge or a principal
+override), a serializable SQL commit requires the session principal to be
+the database principal, and trigger programs that write external tables
+fail closed under it.
+
 ### SELECT
 
 ```sql

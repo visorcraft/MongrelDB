@@ -14,7 +14,8 @@ use crate::encryption::DEK_LEN;
 use crate::epoch::{Epoch, EpochAuthority, EpochGuard, MaintenanceReceipt, Snapshot};
 use crate::global_idx;
 use crate::index::{
-    AnnIndex, BitmapIndex, ColumnLearnedRange, FmIndex, HotIndex, MinHashIndex, SparseIndex,
+    AnnIndex, BitmapIndex, ColumnLearnedRange, FmIndex, HotIndex, IndexGeneration, MinHashIndex,
+    SparseIndex,
 };
 use crate::manifest::{self, Manifest, RunRef, TtlPolicy};
 use crate::memtable::{Memtable, Row, Value};
@@ -26,6 +27,7 @@ use crate::sorted_run::{RunReader, RunVisibleVersion, RunVisibleVersionCursor, R
 use crate::txn::{GroupCommit, OwnedRow};
 use crate::wal::{Op, SharedWal, Wal};
 use crate::{MongrelError, Result};
+use arc_swap::ArcSwap;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -552,6 +554,116 @@ impl ReversePkMap {
     }
 }
 
+/// S1C-001: an immutable, atomically-published table read view — the
+/// engine-layer counterpart of `database::TableReadGeneration`. Readers pin
+/// an `Arc<ReadGeneration>`; writers publish a replacement with a single
+/// `ArcSwap` store ([`Table::publish_read_generation`]) after sealing their
+/// active deltas, so no write ever clones the complete table/index set
+/// merely because readers exist: every captured piece is either an `Arc`
+/// share of immutable frozen layers or a small metadata copy.
+///
+/// `visible_through` is the engine's commit-epoch watermark (the spec's
+/// `HlcTimestamp` maps onto it at the commit-log layer): the view reflects
+/// every commit whose epoch is `<= visible_through`, and later writes are
+/// invisible through it even though they mutate the publishing [`Table`].
+#[derive(Clone)]
+pub struct ReadGeneration {
+    schema: Arc<Schema>,
+    base_runs: Arc<Vec<RunRef>>,
+    deltas: TableDeltas,
+    indexes: Arc<IndexGeneration>,
+    visible_through: Epoch,
+}
+
+/// The sealed in-memory deltas captured with a [`ReadGeneration`]: memtable,
+/// mutable-run tier, HOT primary-key index, and the reverse primary-key map.
+/// Each is a post-seal clone — frozen layers are `Arc`-shared with the
+/// writer, the active delta is empty — so capturing copies no row data, and
+/// pinning the view keeps exactly the frozen layers it captured alive.
+#[derive(Clone)]
+pub struct TableDeltas {
+    memtable: Memtable,
+    mutable_run: MutableRun,
+    hot: HotIndex,
+    pk_by_row: ReversePkMap,
+}
+
+impl ReadGeneration {
+    /// An empty view over `schema`, used to seed the published cell before
+    /// the first [`Table::publish_read_generation`].
+    fn empty(schema: &Schema) -> Self {
+        Self {
+            schema: Arc::new(schema.clone()),
+            base_runs: Arc::new(Vec::new()),
+            deltas: TableDeltas {
+                memtable: Memtable::new(),
+                mutable_run: MutableRun::new(),
+                hot: HotIndex::new(),
+                pk_by_row: ReversePkMap::new(),
+            },
+            indexes: Arc::new(IndexGeneration::default()),
+            visible_through: Epoch(0),
+        }
+    }
+
+    /// Table schema as of this generation.
+    pub fn schema(&self) -> &Arc<Schema> {
+        &self.schema
+    }
+
+    /// Immutable base sorted runs (`r-*.sr`) visible in this generation.
+    pub fn base_runs(&self) -> &[RunRef] {
+        &self.base_runs
+    }
+
+    /// The published index generation (all six families).
+    pub fn indexes(&self) -> &Arc<IndexGeneration> {
+        &self.indexes
+    }
+
+    /// Highest commit epoch reflected in this view.
+    pub fn visible_through(&self) -> Epoch {
+        self.visible_through
+    }
+
+    /// The sealed in-memory deltas captured with this view. The view owns an
+    /// `Arc` share of every frozen layer, so the layers stay alive (and
+    /// unchanged) for as long as the view is pinned.
+    pub fn deltas(&self) -> &TableDeltas {
+        &self.deltas
+    }
+}
+
+impl TableDeltas {
+    /// Approximate heap bytes held by the captured memtable and mutable-run
+    /// frozen deltas (diagnostics).
+    pub fn approx_bytes(&self) -> u64 {
+        self.memtable
+            .approx_bytes()
+            .saturating_add(self.mutable_run.approx_bytes())
+    }
+
+    /// Row versions held in the captured memtable layers.
+    pub fn memtable_len(&self) -> usize {
+        self.memtable.len()
+    }
+
+    /// Row versions held in the captured mutable-run layers.
+    pub fn mutable_run_len(&self) -> usize {
+        self.mutable_run.len()
+    }
+
+    /// Primary-key entries held in the captured HOT index layers.
+    pub fn hot_len(&self) -> usize {
+        self.hot.len()
+    }
+
+    /// Reverse primary-key entries captured for HOT cleanup on deletes.
+    pub fn reverse_pk_len(&self) -> usize {
+        self.pk_by_row.entries().len()
+    }
+}
+
 /// An open MongrelDB table.
 #[derive(Clone)]
 pub struct Table {
@@ -731,6 +843,23 @@ pub struct Table {
     /// Manifest-backed timestamp retention policy. Its wall-clock cutoff is
     /// evaluated once per read/compaction operation, never cached by epoch.
     ttl: Option<TtlPolicy>,
+    /// Unified version-retention pin registry (S1C-004). Read generations
+    /// register [`crate::retention::PinSource::ReadGeneration`] pins here;
+    /// backup/PITR, replication, and online-index-build wiring from the
+    /// `Database` layer is a follow-up (they can share this registry via
+    /// [`Table::pin_registry`]). Compaction and version GC consult it through
+    /// [`Table::min_active_snapshot`].
+    pins: Arc<crate::retention::PinRegistry>,
+    /// The atomically-published immutable read view (S1C-001). Writers store
+    /// a replacement after sealing their active deltas; readers pin the
+    /// loaded `Arc`. Read-generation clones get their own frozen cell so a
+    /// later writer publish can never mutate a pinned generation's view.
+    published: Arc<ArcSwap<ReadGeneration>>,
+    /// The [`crate::retention::PinGuard`] keeping this generation's epoch
+    /// retained. `None` on writer tables; `Some` on clones produced by
+    /// [`Table::clone_read_generation`], released when the generation drops.
+    /// Shared behind an `Arc` so cloning a generation shares one pin.
+    read_generation_pin: Option<Arc<crate::retention::PinGuard>>,
 }
 
 // `Table` is `Sync`: every field is either plain data, an `Arc`, a `Vec`/`HashMap`
@@ -1316,6 +1445,9 @@ pub(crate) struct SharedWalCtx {
     pub poisoned: Arc<AtomicBool>,
     pub txn_ids: Arc<parking_lot::Mutex<u64>>,
     pub change_wake: tokio::sync::broadcast::Sender<()>,
+    /// S1A-004: the owning core's lifecycle, poisoned at every fsync-error
+    /// site so the whole core rejects later operations.
+    pub lifecycle: Arc<crate::core::LifecycleController>,
 }
 
 /// Where a table's WAL records go. A standalone table owns a `Private` WAL; a
@@ -1551,6 +1683,7 @@ impl Table {
         let column_keys = build_column_keys(ctx.kek.as_deref(), &schema);
         let auto_inc = resolve_auto_inc(&schema);
         let rcache_dir = dir.join(RCACHE_DIR);
+        let initial_view = ReadGeneration::empty(&schema);
         Ok(Self {
             dir,
             _root_guard: ctx.root_guard,
@@ -1616,6 +1749,9 @@ impl Table {
             wal_dek,
             auto_inc,
             ttl: None,
+            pins: Arc::new(crate::retention::PinRegistry::new()),
+            published: Arc::new(ArcSwap::from_pointee(initial_view)),
+            read_generation_pin: None,
         })
     }
 
@@ -1862,6 +1998,7 @@ impl Table {
 
         let rcache_dir = dir.join(RCACHE_DIR);
         let column_keys = build_column_keys(ctx.kek.as_deref(), &schema);
+        let initial_view = ReadGeneration::empty(&schema);
         let mut db = Self {
             dir,
             _root_guard: ctx.root_guard,
@@ -1929,6 +2066,9 @@ impl Table {
             wal_dek,
             auto_inc,
             ttl: manifest.ttl,
+            pins: Arc::new(crate::retention::PinRegistry::new()),
+            published: Arc::new(ArcSwap::from_pointee(initial_view)),
+            read_generation_pin: None,
         };
 
         // Advance the (possibly shared) epoch authority to this table's manifest
@@ -3781,6 +3921,7 @@ impl Table {
             Ok(commit_seq) => commit_seq,
             Err(error) => {
                 s.poisoned.store(true, Ordering::Relaxed);
+                s.lifecycle.poison();
                 return Err(MongrelError::CommitOutcomeUnknown {
                     epoch: new_epoch.0,
                     message: error.to_string(),
@@ -3790,6 +3931,7 @@ impl Table {
         drop(wal);
         if let Err(error) = s.group.await_durable(&s.wal, commit_seq) {
             s.poisoned.store(true, Ordering::Relaxed);
+            s.lifecycle.poison();
             return Err(MongrelError::CommitOutcomeUnknown {
                 epoch: new_epoch.0,
                 message: error.to_string(),
@@ -3826,6 +3968,7 @@ impl Table {
         if let Err(error) = publish_result {
             self.durable_commit_failed = true;
             s.poisoned.store(true, Ordering::Relaxed);
+            s.lifecycle.poison();
             return Err(MongrelError::DurableCommit {
                 epoch: new_epoch.0,
                 message: error.to_string(),
@@ -3900,13 +4043,22 @@ impl Table {
             // and the manifest epoch was already persisted by `commit`.
             Ok((epoch, committed))
         })();
-        match finish {
+        let outcome = match finish {
             Err(error) if committed => Err(MongrelError::DurableCommit {
                 epoch: epoch.0,
                 message: error.to_string(),
             }),
             result => result,
+        };
+        if outcome.is_ok() {
+            // S1C-001: the base changed (the memtable drained into the
+            // mutable-run tier and may have spilled to a new run) — publish a
+            // fresh immutable view for generation readers. Indexes were
+            // ensured complete above, so publishing cannot fail; if it ever
+            // did, the previous (still valid) view stays published.
+            let _ = self.publish_read_generation();
         }
+        outcome
     }
 
     fn has_pending_mutations(&self) -> bool {
@@ -7441,8 +7593,12 @@ impl Table {
         self.table_id
     }
 
-    pub(crate) fn clone_read_generation(&mut self) -> Result<Self> {
-        self.ensure_indexes_complete()?;
+    /// Seal every active delta (memtable, mutable-run tier, HOT, reverse-PK
+    /// map, and every secondary index) so the current state can be captured
+    /// as an immutable generation. Sealing moves the active delta behind the
+    /// shared frozen `Arc` without copying row data; the writer keeps
+    /// appending to a fresh, empty active delta (S1C-001).
+    fn seal_generations(&mut self) {
         self.memtable.seal();
         self.mutable_run.seal();
         self.hot.seal();
@@ -7462,6 +7618,97 @@ impl Table {
             index.seal();
         }
         self.pk_by_row.seal();
+    }
+
+    /// Capture the current (freshly sealed) state as an immutable
+    /// [`ReadGeneration`]. Cheap by construction: frozen layers are
+    /// `Arc`-shared, schema/run-refs are small metadata copies, and every
+    /// active delta is empty post-seal.
+    fn capture_read_generation(&self) -> ReadGeneration {
+        let visible_through = self.current_epoch();
+        ReadGeneration {
+            schema: Arc::new(self.schema.clone()),
+            base_runs: Arc::new(self.run_refs.clone()),
+            deltas: TableDeltas {
+                memtable: self.memtable.clone(),
+                mutable_run: self.mutable_run.clone(),
+                hot: self.hot.clone(),
+                pk_by_row: self.pk_by_row.clone(),
+            },
+            indexes: Arc::new(IndexGeneration::capture(
+                &self.bitmap,
+                &self.learned_range,
+                &self.fm,
+                &self.ann,
+                &self.sparse,
+                &self.minhash,
+                visible_through,
+            )),
+            visible_through,
+        }
+    }
+
+    /// Seal the active deltas and atomically publish a replacement
+    /// [`ReadGeneration`] (S1C-001/S1C-002). The publish is a single
+    /// `ArcSwap` store: readers that pinned the previous `Arc` keep their
+    /// stable view, new readers see this one. Returns the published view.
+    pub fn publish_read_generation(&mut self) -> Result<Arc<ReadGeneration>> {
+        self.ensure_indexes_complete()?;
+        self.seal_generations();
+        let view = Arc::new(self.capture_read_generation());
+        self.published.store(Arc::clone(&view));
+        Ok(view)
+    }
+
+    /// The most recently published immutable read view. Pinning the returned
+    /// `Arc` keeps its structurally-shared frozen layers alive. The view is
+    /// seeded empty at open/create and refreshed by
+    /// [`Table::publish_read_generation`], [`Table::flush`], and read-
+    /// generation creation.
+    pub fn published_read_generation(&self) -> Arc<ReadGeneration> {
+        self.published.load_full()
+    }
+
+    /// The table's unified version-retention pin registry (S1C-004).
+    pub fn pin_registry(&self) -> &Arc<crate::retention::PinRegistry> {
+        &self.pins
+    }
+
+    /// S1C-004: the epoch floor for version reclamation — a version may be
+    /// reclaimed only when older than every pin source. Equals
+    /// [`Table::min_active_snapshot`], or the current visible epoch when
+    /// nothing is pinned (nothing older than the floor can still be needed).
+    pub fn version_gc_floor(&self) -> Epoch {
+        self.min_active_snapshot()
+            .unwrap_or_else(|| self.current_epoch())
+    }
+
+    /// S1C-004 diagnostics: every active version-retention pin source.
+    /// Registered pins (read generations, and later backup/PITR, replication,
+    /// online index builds) come from the [`crate::retention::PinRegistry`];
+    /// the oldest transaction snapshot (local pins plus the shared
+    /// [`crate::retention::SnapshotRegistry`]) and the configured history
+    /// window are projected into the report so all six sources are visible.
+    pub fn version_pins_report(&self) -> crate::retention::PinsReport {
+        let mut report = self.pins.report();
+        let transaction_floor = [
+            self.pinned.keys().next().copied(),
+            self.snapshots.min_pinned(),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        if let Some(epoch) = transaction_floor {
+            report.record_projection(crate::retention::PinSource::TransactionSnapshot, epoch);
+        }
+        if let Some(floor) = self.snapshots.history_floor(self.current_epoch()) {
+            report.record_projection(crate::retention::PinSource::HistoryRetention, floor);
+        }
+        report
+    }
+
+    pub(crate) fn clone_read_generation(&mut self) -> Result<Self> {
+        self.publish_read_generation()?;
         let mut generation = self.clone();
         generation.read_only = true;
         generation.wal = WalSink::ReadOnly;
@@ -7472,6 +7719,15 @@ impl Table {
         generation.pending_dels.clear();
         generation.pending_truncate = None;
         generation.agg_cache = Arc::new(HashMap::new());
+        // The pinned generation keeps the view published at its birth, not
+        // the writer's live cell: later publishes must not mutate it.
+        generation.published = Arc::new(ArcSwap::new(self.published.load_full()));
+        // S1C-004: the generation pins its birth epoch until it drops, so
+        // version GC can never reclaim versions it still reads.
+        generation.read_generation_pin = Some(Arc::new(self.pins.pin(
+            crate::retention::PinSource::ReadGeneration,
+            self.current_epoch(),
+        )));
         Ok(generation)
     }
 
@@ -7508,12 +7764,15 @@ impl Table {
     /// otherwise a multi-table reader's version could be dropped by a compaction
     /// triggered on its table (the registry-gated reaper would then keep the
     /// old run *files*, but readers only scan the merged run, so the version
-    /// would still be lost).
+    /// would still be lost). Also folds in the unified [`crate::retention::PinRegistry`]
+    /// (S1C-004): backup/PITR, replication, cursor/read-generation, and
+    /// online-index-build pins all gate version reclamation here.
     pub(crate) fn min_active_snapshot(&self) -> Option<Epoch> {
         let local = self.pinned.keys().next().copied();
         let global = self.snapshots.min_pinned();
         let history = self.snapshots.history_floor(self.current_epoch());
-        [local, global, history].into_iter().flatten().min()
+        let pinned = self.pins.oldest_pinned();
+        [local, global, history, pinned].into_iter().flatten().min()
     }
 
     /// Configure timestamp-column retention on a standalone table. Mounted

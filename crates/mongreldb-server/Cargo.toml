@@ -17,6 +17,15 @@ path = "src/lib.rs"
 [dependencies]
 mongreldb-core = { path = "../mongreldb-core", version = "0.59.0", features = ["encryption"] }
 mongreldb-query = { path = "../mongreldb-query", version = "0.59.0" }
+mongreldb-protocol = { path = "../mongreldb-protocol", version = "0.59.0" }
+# The protocol crate's public API is parameterized over these shared ids/HLC
+# types (DatabaseId, TransactionId, HlcTimestamp, MetadataVersion, ...); the
+# server must name them to build protocol records.
+mongreldb-types = { path = "../mongreldb-types", version = "0.59.0" }
+# Commit receipts surfaced by the core's idempotent-commit path are typed over
+# the commit log's `CommitReceipt`/`DurabilityLevel`; the server names them
+# when echoing receipt fields back in idempotent-write responses (S1B-005).
+mongreldb-log = { path = "../mongreldb-log", version = "0.59.0" }
 axum = "0.8"
 tower = { version = "0.5", features = ["limit"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }

@@ -155,8 +155,10 @@ Latest local release-build measurements are in
 - **Multi-table:** a `Database` hosts many named tables under a shared WAL;
   distinct tables register on one DataFusion context for joins.
 - **Exclusive open:** one process owns one storage core per durable root.
-  Share `Arc<Database>` across workers and sessions; a second independent
-  open, including path aliases, returns `DatabaseLocked` immediately.
+  Share `Arc<Database>` across workers and sessions, or attach per-identity
+  `DatabaseHandle`s to one shared core via `DatabaseManager::open_shared`
+  (Stage 1A); a second independent open, including path aliases, returns
+  `DatabaseLocked` immediately.
 - **SQL surface:** DataFusion 54 with `WITH RECURSIVE` CTEs, window functions
   (`OVER`/`PARTITION BY`), `CREATE TABLE AS SELECT`, session-scoped
   `CREATE VIEW` plus `CREATE MATERIALIZED VIEW`, multi-statement execution in a
@@ -447,6 +449,15 @@ crates/mongreldb-core/    WAL, memtable, Bε-tree, sorted runs (mmap'd), vectori
 crates/mongreldb-query/   DataFusion 54 SQL + Arrow frontend (predicate/projection
                           pushdown, multi-table joins, ann_search/sparse_match UDF,
                           result cache, Arrow IPC shadow, materialized views)
+crates/mongreldb-types/   shared durable/network types: cluster-wide identifiers,
+                          HLC timestamps, stable cross-language error taxonomy
+crates/mongreldb-log/     CommitLog commit authority + versioned CommandEnvelope
+                          (InMemoryCommitLog for tests)
+crates/mongreldb-fault/   named fault-injection hooks with barrier coordination
+crates/mongreldb-sim/     deterministic simulator (seeded RNG, virtual clock,
+                          network, disk) for distributed-behavior tests
+crates/mongreldb-protocol/ versioned Stage 1D protocol: canonical request model,
+                          wire envelope, service traits, and session model
 crates/mongreldb-node/    NAPI addon (typed object API; built via `napi`)
 crates/mongreldb-server/  HTTP daemon (axum/tokio; SQL + native query + typed Kit API)
 crates/mongreldb-client/  typed HTTP client for the daemon (SQL/native + Kit API)
@@ -456,8 +467,28 @@ crates/mongreldb-jni/     JNI shim for the JVM (Java, Kotlin, Scala)
 crates/mongreldb-perf/    cross-engine benchmark vs SQLite/DuckDB (standalone)
 crates/mongreldb-core/examples/hybrid_query.rs
                           runnable ann ∩ fm ∩ bitmap hybrid-query demo
+docs/architecture/adr/    Architecture Decision Records (10 ADRs + index) for the
+                          "Best Practical Architecture" program
 BENCHMARKS.md             latest local performance measurements and commands
 ```
+
+The Stage 0 foundation wave of that program is already in the tree: commits in
+`mongreldb-core` reach durability through the `CommitLog` interface, where a
+`StandaloneCommitLog` wrapping the shared-WAL group commit is the single commit
+authority and reader visibility is gated on the returned `CommitReceipt`. Named
+fault-injection hooks (disabled by default, one atomic load when disarmed)
+guard the WAL append/fsync, commit-publish, catalog-publish, snapshot-install,
+and index-publish boundaries. The ADRs define the target modes — embedded
+shared-handle, single-node server, replicated and sharded clusters — but they
+are **decisions, not shipped behavior**: Raft consensus, tablet sharding, and
+distributed transactions are not implemented, and MongrelDB today remains an
+embedded single-node engine with an optional HTTP daemon. Stage 1 single-node
+machinery — shared cores behind per-identity handles, a memory governor,
+persistent online jobs, versioned catalog commands, and a lock manager — has
+begun landing on top. See
+[Architecture Foundations](docs/18-architecture-foundations.md) and
+[Single-Node Subsystems](docs/19-single-node-subsystems.md) for the
+user-facing contracts.
 
 ## License
 

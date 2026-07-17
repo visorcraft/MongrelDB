@@ -75,6 +75,106 @@ committing 100 writes against a one-million-row table.
 Criterion reported no statistically significant regression for these four
 cancellation measurements.
 
+## Stage 1 qualification
+
+Qualification evidence for the Stage 1 gate (spec §10 "Stage 1 gate"), in the
+sense of §21: these are starting qualification targets from one machine, not
+marketing promises. Collected 2026-07-17 from release builds on the machine
+described above (Linux 7.2.0-rc3-1-cachyos-rc, database tempdirs on
+/dev/nvme2n1p2 NVMe), branch `architecture_expansion`, working tree (not a
+tagged commit). The one-million-row overlapping read/write gate, the
+1,000-concurrent-session gate, and the warm loopback point-query p95 baseline
+are covered; the remaining gate items are covered by the correctness suites
+(crash/restart survival, isolation anomalies, cancellation, backup/restore,
+PITR, AI qualification).
+
+Overlapping read/write, 4 writers + 4 readers on one `Database` (100-row
+commit batches; readers point-read a never-updated seeded half; zero errors
+in both runs):
+
+| Measurement | CI default (100,000 rows) | Gate scale (1,000,000 rows) |
+|---|---:|---:|
+| Commits | 500 | 5,000 |
+| Commit p50 | 21.417 ms | 33.012 ms |
+| Commit p99 | 141.078 ms | 176.885 ms |
+| Commit p99 bound asserted | 500 ms | 500 ms |
+| Overlapping point reads | 1,279,152 | 15,810,096 |
+| Peak RSS (VmHWM) | 58,482,688 B | 506,540,032 B |
+| Peak RSS bound asserted | 741,670,912 B | 2,584,870,912 B |
+| Wall time (workload phase) | 4.459 s | 59.915 s |
+
+The RSS bound is 512 MiB process base + 2 KiB/row, calibrated from the
+one-million-row `read_generation` overlap peak (1,168,683,008 B, above) with
+~1.8x per-row headroom; both runs finish far under it. Commit latency here is
+group-commit fsync latency under four concurrent committers with readers
+pinning snapshots, so it is not comparable to the single-committer "Commit
+with fsync" figure above; the asserted 500 ms p99 bound (env-tunable, see
+below) exists to catch stalls, not to state an SLO.
+
+Warm embedded point query (deterministic 100,000-row dataset, warm cache,
+10,000 queries, each a full begin/get/rollback round trip):
+
+| Measurement | Result |
+|---|---:|
+| Point-query p50 | 1.037 µs |
+| Point-query p95 | 1.434 µs |
+| Point-query p99 | 1.933 µs |
+
+Warm loopback HTTP point query (deterministic 10,000-row dataset seeded over
+the HTTP API, warm read path, 1,000 sequential
+`SELECT id FROM items WHERE id = ?` queries on one session, client-observed
+full-round-trip latency; release mode on the Intel Core Ultra 9 386H
+described above):
+
+| Measurement | Result |
+|---|---:|
+| Point-query p50 | 1.287 ms |
+| Point-query p95 | 2.070 ms |
+| Point-query p99 | 2.396 ms |
+| p95 tripwire asserted | 250 ms |
+
+1,000 concurrent HTTP sessions against the daemon router on loopback (one
+durable `BEGIN`/`INSERT`/`COMMIT` write plus three `SELECT 1` reads per
+session; 6,000 statements; in-flight requests bounded at 256):
+
+| Measurement | Result |
+|---|---:|
+| Sessions live at peak | 1,000 (store cap enforced: 1,001st open → 503) |
+| Failed requests | 0 |
+| Sessions after close | 0 |
+| Wall time | 5.557 s |
+| Peak RSS (VmHWM) | 259,309,568 B |
+| RSS no-OOM tripwire asserted | 4,294,967,296 B |
+
+Warm loopback HTTP point query against the daemon router (deterministic
+10,000-row dataset seeded over the HTTP API, untimed warm pass, then 1,000
+sequential `SELECT id FROM items WHERE id = ?` point queries on one session;
+client-observed latency spans the full 127.0.0.1 round trip including the
+response body; same release-mode 2026-07-17 machine as above):
+
+| Measurement | Result |
+|---|---:|
+| Point-query p50 | 1.892 ms |
+| Point-query p95 | 2.472 ms |
+| Point-query p99 | 3.008 ms |
+| p95 tripwire asserted | 250 ms |
+
+Unlike the embedded figure above (in-process begin/get/rollback), this number
+includes HTTP request handling, session lookup, SQL planning, and JSON
+serialization on every query — it is the gate's "point query over a warm
+local network" baseline.
+
+Qualification runs are tests (not Criterion benches), release mode, with
+scale knobs documented in the test headers:
+
+```bash
+cargo test -p mongreldb-core --test qualification --release -- --nocapture
+MONGRELDB_QUAL_ROWS=1000000 \
+  cargo test -p mongreldb-core --test qualification --release -- --nocapture
+(cd crates/mongreldb-server && \
+  cargo test --release --test scale_test -- --nocapture)
+```
+
 ## Commands
 
 ```bash

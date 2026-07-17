@@ -74,6 +74,9 @@ pub async fn create(
     OptionalPrincipal(principal): OptionalPrincipal,
     Json(req): Json<ProcedureRequest>,
 ) -> Response {
+    if let Some(response) = crate::require_writes_open(&state) {
+        return response;
+    }
     if let Err(response) = require_ddl(&state, &principal) {
         return *response;
     }
@@ -95,6 +98,9 @@ pub async fn replace(
     Path(name): Path<String>,
     Json(req): Json<ProcedureRequest>,
 ) -> Response {
+    if let Some(response) = crate::require_writes_open(&state) {
+        return response;
+    }
     if let Err(response) = require_ddl(&state, &principal) {
         return *response;
     }
@@ -119,6 +125,9 @@ pub async fn drop_procedure(
     OptionalPrincipal(principal): OptionalPrincipal,
     Path(name): Path<String>,
 ) -> Response {
+    if let Some(response) = crate::require_writes_open(&state) {
+        return response;
+    }
     if let Err(response) = require_ddl(&state, &principal) {
         return *response;
     }
@@ -163,6 +172,9 @@ async fn call_inner(
     req: CallRequest,
     authenticated_user: Option<mongreldb_core::Principal>,
 ) -> Response {
+    if let Some(response) = crate::require_writes_open(&state) {
+        return response;
+    }
     let principal = request_principal(&state, &authenticated_user);
     let (procedure, security_version) =
         match authorized_procedure_revision(&state, &name, principal.as_ref()) {

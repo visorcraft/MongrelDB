@@ -2473,6 +2473,9 @@ dependencies = [
  "hmac",
  "lz4_flex 0.11.6",
  "memmap2",
+ "mongreldb-fault",
+ "mongreldb-log",
+ "mongreldb-types",
  "parking_lot",
  "rayon",
  "regex",
@@ -2490,6 +2493,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "mongreldb-fault"
+version = "0.59.0"
+dependencies = [
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "mongreldb-log"
+version = "0.59.0"
+dependencies = [
+ "mongreldb-types",
+ "serde",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "mongreldb-protocol"
+version = "0.59.0"
+dependencies = [
+ "mongreldb-types",
+ "serde",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "mongreldb-query"
 version = "0.59.0"
 dependencies = [
@@ -2503,6 +2532,7 @@ dependencies = [
  "futures",
  "getrandom 0.2.17",
  "mongreldb-core",
+ "mongreldb-types",
  "parking_lot",
  "regex",
  "serde",
@@ -2528,7 +2558,10 @@ dependencies = [
  "libc",
  "mongreldb-client",
  "mongreldb-core",
+ "mongreldb-log",
+ "mongreldb-protocol",
  "mongreldb-query",
+ "mongreldb-types",
  "reqwest",
  "serde",
  "serde_json",
@@ -2538,6 +2571,15 @@ dependencies = [
  "tower",
  "windows-sys 0.61.2",
  "zeroize",
+]
+
+[[package]]
+name = "mongreldb-types"
+version = "0.59.0"
+dependencies = [
+ "getrandom 0.2.17",
+ "serde",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

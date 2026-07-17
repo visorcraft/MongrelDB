@@ -169,6 +169,10 @@ pub enum SqlTestHookPoint {
     AfterScanBatch,
     BeforeCommitFence,
     InsideCommitCritical,
+    /// Fired after a staged SQL commit has built its core transaction and
+    /// replayed the staged operations into it, immediately before the core
+    /// commit certifies and seals it.
+    BeforeTransactionCommit,
     AfterDurableCommit,
     AfterStatementStaging,
     BeforeStatementExecution,
@@ -1736,6 +1740,10 @@ pub struct MongrelSession {
     /// SQL `BEGIN`/`COMMIT` staging, abort state, and savepoints. One mutex keeps
     /// every transaction-state transition atomic.
     transaction: Arc<parking_lot::Mutex<SqlTransactionState>>,
+    /// Session default isolation level for transactions that never stated one
+    /// (`SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL ...`).
+    /// Defaults to `RepeatableRead`, core's default.
+    session_isolation: parking_lot::RwLock<mongreldb_core::IsolationLevel>,
     /// Per-session state for SQL compatibility functions such as changes().
     sql_fn_state: Arc<extended_sql_functions::ExtendedSqlState>,
     /// Built-in plus app-provided external table modules available to this
@@ -1757,6 +1765,16 @@ struct SqlTransactionState {
     staged_ops: Option<commands::PendingSqlOps>,
     aborted: bool,
     savepoints: Vec<(String, commands::PendingSqlOpsCheckpoint)>,
+    /// Isolation override for the open transaction, or a pending `SET
+    /// TRANSACTION` waiting for the next `BEGIN` when no transaction is open.
+    /// `None` inherits the session default
+    /// (`MongrelSession::session_isolation`).
+    isolation: Option<mongreldb_core::IsolationLevel>,
+    /// Base tables scanned while the open transaction runs at `Serializable`
+    /// (S1B-002 SSI feed, table granularity). Replayed into the commit
+    /// transaction's `track_predicate_read` at `COMMIT` so core certification
+    /// treats a concurrent write on any of them as a phantom invalidation.
+    predicate_reads: std::collections::BTreeSet<String>,
 }
 
 /// `(sql, snapshot_epoch) → cached result batches`.
@@ -2457,6 +2475,7 @@ impl MongrelSession {
             views: parking_lot::Mutex::new(HashMap::new()),
             attached_databases: parking_lot::Mutex::new(HashMap::new()),
             transaction: Arc::new(parking_lot::Mutex::new(SqlTransactionState::default())),
+            session_isolation: parking_lot::RwLock::new(mongreldb_core::IsolationLevel::default()),
             sql_fn_state,
             external_modules,
             scored_runtime,
@@ -2575,6 +2594,7 @@ impl MongrelSession {
             views: parking_lot::Mutex::new(HashMap::new()),
             attached_databases: parking_lot::Mutex::new(HashMap::new()),
             transaction: Arc::new(parking_lot::Mutex::new(SqlTransactionState::default())),
+            session_isolation: parking_lot::RwLock::new(mongreldb_core::IsolationLevel::default()),
             sql_fn_state,
             external_modules,
             scored_runtime,
@@ -2636,6 +2656,93 @@ impl MongrelSession {
             .staged_ops
             .as_ref()
             .map(|ops| ops.len())
+    }
+
+    /// `SET TRANSACTION` (`session_wide = false`) applies to the open
+    /// transaction, or is held pending for the next `BEGIN` when none is
+    /// open. `SET SESSION CHARACTERISTICS AS TRANSACTION` (`session_wide =
+    /// true`) sets the session default for future transactions.
+    pub(crate) fn set_sql_isolation(
+        &self,
+        level: mongreldb_core::IsolationLevel,
+        session_wide: bool,
+    ) {
+        if session_wide {
+            *self.session_isolation.write() = level;
+        } else {
+            self.transaction.lock().isolation = Some(level);
+        }
+    }
+
+    /// S1B-002 SSI feed: record a base-table scan performed by a statement
+    /// inside an open serializable SQL transaction (table granularity,
+    /// matching core). No-op outside a transaction or at weaker levels.
+    pub(crate) fn record_serializable_table_read(&self, table: &str) {
+        let mut transaction = self.transaction.lock();
+        if transaction.staged_ops.is_none() {
+            return;
+        }
+        if transaction
+            .isolation
+            .unwrap_or_else(|| *self.session_isolation.read())
+            .canonical()
+            != mongreldb_core::IsolationLevel::Serializable
+        {
+            return;
+        }
+        transaction.predicate_reads.insert(table.to_string());
+    }
+
+    /// The commit-path view of the transaction's isolation state: the
+    /// effective level plus the tables recorded through
+    /// [`Self::record_serializable_table_read`].
+    pub(crate) fn commit_isolation_and_predicate_reads(
+        &self,
+    ) -> (mongreldb_core::IsolationLevel, Vec<String>) {
+        let transaction = self.transaction.lock();
+        let isolation = transaction
+            .isolation
+            .unwrap_or_else(|| *self.session_isolation.read());
+        let reads = transaction.predicate_reads.iter().cloned().collect();
+        (isolation, reads)
+    }
+
+    /// Feed every base table a DataFusion plan scans into the SSI predicate
+    /// set when a serializable SQL transaction is open (S1B-002). `EXPLAIN`
+    /// never executes its wrapped scan and is skipped; `EXPLAIN ANALYZE`
+    /// (`LogicalPlan::Analyze`) executes and is walked like any other plan.
+    fn record_serializable_plan_reads(&self, plan: &datafusion::logical_expr::LogicalPlan) {
+        use datafusion::logical_expr::LogicalPlan;
+
+        let serializable_open = {
+            let transaction = self.transaction.lock();
+            transaction.staged_ops.is_some()
+                && transaction
+                    .isolation
+                    .unwrap_or_else(|| *self.session_isolation.read())
+                    .canonical()
+                    == mongreldb_core::IsolationLevel::Serializable
+        };
+        if !serializable_open {
+            return;
+        }
+        let mut stack: Vec<&LogicalPlan> = vec![plan];
+        while let Some(plan) = stack.pop() {
+            match plan {
+                LogicalPlan::TableScan(scan) => {
+                    let name = scan.table_name.table();
+                    // Only this database's base tables can be tracked: views
+                    // resolve to their bases before planning, and external or
+                    // attached tables have no core table id to certify.
+                    let is_base_table = self.tables.lock().contains_key(name);
+                    if is_base_table {
+                        self.record_serializable_table_read(name);
+                    }
+                }
+                LogicalPlan::Explain(_) => {}
+                _ => stack.extend(plan.inputs()),
+            }
+        }
     }
 
     pub fn fire_test_hook(&self, point: SqlTestHookPoint) {
@@ -3277,6 +3384,7 @@ impl MongrelSession {
         query: &RegisteredSqlQuery,
     ) -> Result<MongrelRecordBatchStream> {
         query.checkpoint()?;
+        self.record_serializable_plan_reads(dataframe.logical_plan());
         let task_context = dataframe.task_ctx();
         let session_config = task_context
             .session_config()

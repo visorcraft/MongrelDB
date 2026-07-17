@@ -1,3 +1,4 @@
+use mongreldb_core::backup::validate_restore;
 use mongreldb_core::{
     verify_backup, ColumnDef, ColumnFlags, Database, ExecutionControl, MongrelError, Schema,
     TypeId, Value,
@@ -257,4 +258,132 @@ fn encrypted_hot_backup_reopens_with_same_passphrase() {
     assert!(Database::open_encrypted(&destination, "wrong").is_err());
     let restored = Database::open_encrypted(&destination, "correct horse").unwrap();
     assert_eq!(row_count(&restored), 1);
+}
+
+#[test]
+fn backup_manifest_carries_spec_10_7_audit_fields() {
+    let source = tempdir().unwrap();
+    let destination_parent = tempdir().unwrap();
+    let destination = destination_parent.path().join("backup");
+    let db = Database::create(source.path()).unwrap();
+    db.create_table("items", schema()).unwrap();
+    insert(&db, 1, "one");
+    // Reopen so the open generation advances past its initial value.
+    drop(db);
+    let db = Database::open(source.path()).unwrap();
+
+    db.hot_backup(&destination).unwrap();
+    let manifest = verify_backup(&destination).unwrap();
+
+    // Database ID: derived from the persisted replication identity, stable
+    // across backups of one database.
+    let database_id = manifest.database_id.expect("database id is recorded");
+    let second = destination_parent.path().join("second");
+    db.hot_backup(&second).unwrap();
+    assert_eq!(
+        verify_backup(&second).unwrap().database_id,
+        Some(database_id)
+    );
+
+    // Catalog version, snapshot timestamp (HLC physical micros), and the log
+    // continuation position (epoch + WAL open generation).
+    assert_eq!(
+        manifest.catalog_version,
+        db.catalog_snapshot().catalog_version()
+    );
+    assert!(manifest.snapshot_unix_micros > 0);
+    let source_generation = {
+        let bytes = std::fs::read(source.path().join("_meta/generation")).unwrap();
+        u64::from_le_bytes(bytes.try_into().unwrap())
+    };
+    assert!(source_generation > 0, "reopen bumps the open generation");
+    assert_eq!(manifest.open_generation, source_generation);
+    assert!(manifest.encryption.is_none());
+
+    // The serialized manifest names every spec field; `encryption` is
+    // skipped for plaintext backups.
+    let raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(destination.join("_meta/backup.json")).unwrap())
+            .unwrap();
+    for key in [
+        "format_version",
+        "database_id",
+        "catalog_version",
+        "snapshot_unix_micros",
+        "open_generation",
+        "epoch",
+        "files",
+    ] {
+        assert!(raw.get(key).is_some(), "manifest is missing {key}");
+    }
+    assert!(raw.get("encryption").is_none());
+
+    // Manifest completeness round-trips through serde without loss.
+    let bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+    let decoded: mongreldb_core::BackupManifest = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(decoded, manifest);
+}
+
+#[test]
+fn validate_restore_passes_on_sound_backup_and_catches_corruption() {
+    let source = tempdir().unwrap();
+    let destination_parent = tempdir().unwrap();
+    let destination = destination_parent.path().join("backup");
+    let db = Database::create(source.path()).unwrap();
+    db.create_table("items", schema()).unwrap();
+    db.table("items")
+        .unwrap()
+        .lock()
+        .set_mutable_run_spill_bytes(1);
+    insert(&db, 1, "one");
+    db.table("items").unwrap().lock().flush().unwrap();
+    db.hot_backup(&destination).unwrap();
+
+    let report = validate_restore(&destination).unwrap();
+    assert!(report.manifest_consistent);
+    assert!(report.catalog_loaded);
+    assert!(report.files_checked > 0);
+    assert_eq!(report.files_checked, report.files_ok);
+    assert!(report.bytes_checked > 0);
+    assert!(report.issues.is_empty());
+
+    // Corruption of a manifest-listed file fails the pass closed.
+    let schema_path = destination.join("tables/0/schema.json");
+    std::fs::write(&schema_path, b"corrupt").unwrap();
+    assert!(validate_restore(&destination).is_err());
+}
+
+#[cfg(feature = "encryption")]
+#[test]
+fn encrypted_backup_manifest_carries_encryption_metadata() {
+    let source = tempdir().unwrap();
+    let destination_parent = tempdir().unwrap();
+    let destination = destination_parent.path().join("backup");
+    let db = Database::create_encrypted(source.path(), "correct horse").unwrap();
+    db.create_table("items", schema()).unwrap();
+    insert(&db, 1, "secret");
+    db.hot_backup(&destination).unwrap();
+
+    let manifest = verify_backup(&destination).unwrap();
+    let encryption = manifest
+        .encryption
+        .expect("encryption metadata is recorded");
+    assert_eq!(encryption.cipher, "aes-256-gcm");
+    assert!(manifest.database_id.is_some());
+    assert!(manifest.snapshot_unix_micros > 0);
+    // Documented limitation: the catalog is encrypted, so its version
+    // records as 0 ("unknown") without the passphrase.
+    assert_eq!(manifest.catalog_version, 0);
+
+    let raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(destination.join("_meta/backup.json")).unwrap())
+            .unwrap();
+    assert!(raw.get("encryption").is_some());
+
+    // Without the passphrase the catalog cannot be loaded; the pass reports
+    // it as an issue rather than failing the encrypted backup.
+    let report = validate_restore(&destination).unwrap();
+    assert!(report.manifest_consistent);
+    assert!(!report.catalog_loaded);
+    assert_eq!(report.issues.len(), 1);
 }

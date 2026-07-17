@@ -1,6 +1,6 @@
 # ADR-0009: AI Index Replication and Rebuild Policy
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-07-17
 - Spec references: §9.1 (FND-001), §4.8 (derived-index invariant), §13.3
   (Stage 4C AI index generations), §10.3 (Stage 1C immutable read/index

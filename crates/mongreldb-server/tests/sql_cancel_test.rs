@@ -189,7 +189,7 @@ async fn active_query_can_be_inspected_cancelled_and_duplicate_id_is_rejected() 
     let barrier = Arc::new(Barrier::new(2));
     let hook_barrier = Arc::clone(&barrier);
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-    entry.session.set_test_hook(Some(Arc::new(move |point| {
+    entry.session().set_test_hook(Some(Arc::new(move |point| {
         if point == SqlTestHookPoint::Planning {
             let _ = entered_tx.send(());
             hook_barrier.wait();
@@ -522,7 +522,7 @@ async fn buffered_serialization_is_cancellable() {
     let barrier = Arc::new(Barrier::new(2));
     let hook_barrier = Arc::clone(&barrier);
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-    entry.session.set_test_hook(Some(Arc::new(move |point| {
+    entry.session().set_test_hook(Some(Arc::new(move |point| {
         if point == SqlTestHookPoint::BeforeSerializationBatch {
             let _ = entered_tx.send(());
             hook_barrier.wait();
@@ -593,7 +593,7 @@ async fn paginated_json_deserialization_is_cancellable() {
     let barrier = Arc::new(Barrier::new(2));
     let hook_barrier = Arc::clone(&barrier);
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-    entry.session.set_test_hook(Some(Arc::new(move |point| {
+    entry.session().set_test_hook(Some(Arc::new(move |point| {
         if point == SqlTestHookPoint::DuringPaginationDeserialization {
             let _ = entered_tx.send(());
             hook_barrier.wait();
@@ -694,7 +694,7 @@ async fn cancel_at_final_serialization_boundary_never_returns_clean_success() {
         let barrier = Arc::new(Barrier::new(2));
         let hook_barrier = Arc::clone(&barrier);
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        entry.session.set_test_hook(Some(Arc::new(move |point| {
+        entry.session().set_test_hook(Some(Arc::new(move |point| {
             if point == hook_point {
                 entered_tx.send(()).unwrap();
                 hook_barrier.wait();
@@ -736,7 +736,7 @@ async fn cancel_at_final_serialization_boundary_never_returns_clean_success() {
         assert_ne!(status["state"], "completed");
     }
 
-    entry.session.set_test_hook(Some(Arc::new(|point| {
+    entry.session().set_test_hook(Some(Arc::new(|point| {
         if point == SqlTestHookPoint::AfterPageResponseSerialization {
             std::thread::sleep(Duration::from_millis(25));
         }
@@ -765,7 +765,7 @@ async fn cancel_at_final_serialization_boundary_never_returns_clean_success() {
     let barrier = Arc::new(Barrier::new(2));
     let hook_barrier = Arc::clone(&barrier);
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-    entry.session.set_test_hook(Some(Arc::new(move |point| {
+    entry.session().set_test_hook(Some(Arc::new(move |point| {
         if point == SqlTestHookPoint::AfterSerialization {
             entered_tx.send(()).unwrap();
             hook_barrier.wait();
@@ -852,7 +852,7 @@ async fn buffered_cancel_after_earlier_commit_reports_durable_outcome() {
     let barrier = Arc::new(Barrier::new(2));
     let hook_barrier = Arc::clone(&barrier);
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-    entry.session.set_test_hook(Some(Arc::new(move |point| {
+    entry.session().set_test_hook(Some(Arc::new(move |point| {
         if point == SqlTestHookPoint::BeforeSerializationBatch {
             let _ = entered_tx.send(());
             hook_barrier.wait();
@@ -935,7 +935,7 @@ async fn buffered_cancel_after_earlier_commit_reports_durable_outcome() {
     assert_eq!(status["cancellation_reason"], "client_request");
     assert_eq!(status["outcome"], body["outcome"]);
 
-    entry.session.set_test_hook(None);
+    entry.session().set_test_hook(None);
     let mut count = request(
         "POST",
         "/sql",
@@ -1062,7 +1062,7 @@ async fn closing_session_cancels_active_query_without_session_lock() {
     let barrier = Arc::new(Barrier::new(2));
     let hook_barrier = Arc::clone(&barrier);
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-    entry.session.set_test_hook(Some(Arc::new(move |point| {
+    entry.session().set_test_hook(Some(Arc::new(move |point| {
         if point == SqlTestHookPoint::Planning {
             entered_tx.send(()).unwrap();
             hook_barrier.wait();
@@ -1141,7 +1141,7 @@ async fn prepared_planning_and_execution_are_cancellable() {
     let barrier = Arc::new(Barrier::new(2));
     let hook_barrier = Arc::clone(&barrier);
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-    entry.session.set_test_hook(Some(Arc::new(move |point| {
+    entry.session().set_test_hook(Some(Arc::new(move |point| {
         if point == SqlTestHookPoint::Planning {
             entered_tx.send(()).unwrap();
             hook_barrier.wait();
@@ -1171,7 +1171,7 @@ async fn prepared_planning_and_execution_are_cancellable() {
     barrier.wait();
     assert_eq!(prepare_task.await.unwrap().unwrap().status().as_u16(), 499);
 
-    entry.session.set_test_hook(None);
+    entry.session().set_test_hook(None);
     assert_eq!(
         app.clone()
             .oneshot(request(
@@ -1188,7 +1188,7 @@ async fn prepared_planning_and_execution_are_cancellable() {
     let barrier = Arc::new(Barrier::new(2));
     let hook_barrier = Arc::clone(&barrier);
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-    entry.session.set_test_hook(Some(Arc::new(move |point| {
+    entry.session().set_test_hook(Some(Arc::new(move |point| {
         if point == SqlTestHookPoint::BeforeSerializationBatch {
             entered_tx.send(()).unwrap();
             hook_barrier.wait();
@@ -1244,7 +1244,7 @@ async fn shutdown_cancels_reads_and_rejects_new_sql() {
     let barrier = Arc::new(Barrier::new(2));
     let hook_barrier = Arc::clone(&barrier);
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-    entry.session.set_test_hook(Some(Arc::new(move |point| {
+    entry.session().set_test_hook(Some(Arc::new(move |point| {
         if point == SqlTestHookPoint::Planning {
             entered_tx.send(()).unwrap();
             hook_barrier.wait();
@@ -1330,7 +1330,7 @@ async fn commit_fence_returns_too_late_and_preserves_commit_after_response_drop(
     let barrier = Arc::new(Barrier::new(2));
     let hook_barrier = Arc::clone(&barrier);
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-    entry.session.set_test_hook(Some(Arc::new(move |point| {
+    entry.session().set_test_hook(Some(Arc::new(move |point| {
         if point == SqlTestHookPoint::InsideCommitCritical {
             entered_tx.send(()).unwrap();
             hook_barrier.wait();
@@ -1380,7 +1380,7 @@ async fn commit_fence_returns_too_late_and_preserves_commit_after_response_drop(
     assert_eq!(status["outcome"]["committed_statements"], 1);
     assert_eq!(status["trace"]["commit_fence_outcome"], "commit_won");
 
-    entry.session.set_test_hook(None);
+    entry.session().set_test_hook(None);
     let mut count = request(
         "POST",
         "/sql",
@@ -1435,7 +1435,7 @@ async fn cancel_after_autocommit_reports_committed_outcome() {
     let barrier = Arc::new(Barrier::new(2));
     let hook_barrier = Arc::clone(&barrier);
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-    entry.session.set_test_hook(Some(Arc::new(move |point| {
+    entry.session().set_test_hook(Some(Arc::new(move |point| {
         if point == SqlTestHookPoint::AfterDurableCommit {
             entered_tx.send(()).unwrap();
             hook_barrier.wait();
@@ -1486,7 +1486,7 @@ async fn cancel_after_autocommit_reports_committed_outcome() {
     assert_eq!(response["outcome"]["committed"], true);
     assert_eq!(response["outcome"]["committed_statements"], 1);
 
-    entry.session.set_test_hook(None);
+    entry.session().set_test_hook(None);
     let mut count = request(
         "POST",
         "/sql",
@@ -1541,7 +1541,7 @@ async fn deadline_after_autocommit_reports_committed_outcome() {
     let barrier = Arc::new(Barrier::new(2));
     let hook_barrier = Arc::clone(&barrier);
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-    entry.session.set_test_hook(Some(Arc::new(move |point| {
+    entry.session().set_test_hook(Some(Arc::new(move |point| {
         if point == SqlTestHookPoint::AfterDurableCommit {
             entered_tx.send(()).unwrap();
             hook_barrier.wait();
@@ -1585,7 +1585,7 @@ async fn deadline_after_autocommit_reports_committed_outcome() {
     assert_eq!(status["status"], "deadline_after_commit");
     assert_eq!(status["outcome"], body["outcome"]);
 
-    entry.session.set_test_hook(None);
+    entry.session().set_test_hook(None);
     let mut count = request(
         "POST",
         "/sql",

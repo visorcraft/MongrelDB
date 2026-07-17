@@ -49,6 +49,12 @@ vector similarity, range queries, and more.
 17. **[Point-in-Time Recovery](17-point-in-time-recovery.md)** - online PITR
     archives, encrypted format v2, restore targets, validation, and legacy
     archive policy
+18. **[Architecture Foundations](18-architecture-foundations.md)** - Stage 0
+    contracts: commit-log commit authority, the stable error taxonomy,
+    `build_info()`, component version checks, and the ADR index
+19. **[Single-Node Subsystems](19-single-node-subsystems.md)** - Stage 1
+    machinery: resource groups + memory governor, persistent online jobs,
+    versioned catalog commands, and the lock manager
 
 ## Quick Reference
 
