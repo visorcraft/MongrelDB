@@ -59,6 +59,9 @@ vector similarity, range queries, and more.
     machinery: one Raft group per database, quorum durability, read
     consistency levels, snapshots/catch-up, membership, and measured
     failover
+21. **[Sharded Cluster](21-sharded-cluster.md)** - Stage 3 machinery: the
+    meta control plane, tablet model and partitioning, placement and
+    rebalancing, the mTLS transport, and cluster operations
 
 ## Quick Reference
 

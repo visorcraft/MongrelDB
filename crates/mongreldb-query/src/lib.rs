@@ -23,6 +23,7 @@
 
 pub mod arrow_conv;
 mod commands;
+pub mod distributed;
 mod error;
 pub mod extended_sql_functions;
 mod external_modules;

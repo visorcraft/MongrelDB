@@ -31,9 +31,23 @@
 //! - `index.publish.before` / `index.publish.after` — secondary-index
 //!   checkpoint/generation publication.
 //!
+//! Tablet split and merge (instrumented in `mongreldb-cluster`):
+//!
+//! - `tablet.split.before` / `tablet.split.after` — the atomic routing
+//!   publication of a split (children `Active` + source `Retiring` in one
+//!   meta command; spec section 12.5 step 8).
+//! - `tablet.split.phase.1` … `tablet.split.phase.7` — fired after each
+//!   split phase's progress record is durable (`split.json`), in
+//!   `SplitPhase` declaration order; crash-resume tests arm these.
+//! - `tablet.merge.before` / `tablet.merge.after` — the atomic routing
+//!   publication of a merge (replacement `Active` + sources `Retiring`;
+//!   spec section 12.6).
+//! - `tablet.merge.phase.1` … `tablet.merge.phase.7` — fired after each
+//!   merge phase's progress record is durable (`merge.json`), in
+//!   `MergePhase` declaration order.
+//!
 //! Reserved for later waves (do not instrument yet):
 //!
-//! - `tablet.split.before` / `tablet.split.after`
 //! - `txn.prepare.before` / `txn.prepare.after`
 //! - `txn.decision.before` / `txn.decision.after`
 //!

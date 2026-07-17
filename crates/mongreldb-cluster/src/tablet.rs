@@ -35,6 +35,18 @@
 //! the typed [`RoutingError`] the gateway maps onto `TabletMoved`,
 //! `TabletSplitting`, or `StaleMetadata` before refreshing and retrying
 //! through [`crate::routing`].
+//!
+//! Stages 3E/3F (spec sections 12.5-12.6) live in [`crate::split`] and
+//! [`crate::merge`]; this file carries their descriptor-side helpers —
+//! [`PartitionBounds::split_at`], [`PartitionBounds::meets_start_of`],
+//! [`PartitionBounds::union_adjacent`],
+//! [`TabletDescriptor::published_transition`] (the one-publication/one-tick
+//! generation rules are documented on [`TabletDescriptor`]), and
+//! [`TabletLayout::teardown`] for source-replica removal. The enforced
+//! [`TabletState`] graph needs no new edges: child publication rides
+//! `Creating -> Active`, source retirement `Splitting`/`Merging ->
+//! `Retiring -> Retired`, and abort paths ride the existing
+//! `Splitting`/`Merging -> Active` and `Creating -> Retired` edges.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -318,6 +330,44 @@ impl PartitionBounds {
     pub fn is_adjacent_to(&self, other: &Self) -> bool {
         meets(&self.high, &other.low) || meets(&other.high, &self.low)
     }
+
+    /// Whether `self` ends exactly where `other` begins — the lower half of
+    /// an adjacent pair (spec section 12.6 merge ordering).
+    pub fn meets_start_of(&self, other: &Self) -> bool {
+        meets(&self.high, &other.low)
+    }
+
+    /// Splits the range at `key` into the lower half `[low, key)` and the
+    /// upper half `[key, high)` (spec section 12.5 step 2). The halves meet at
+    /// `key` ([`Self::meets_start_of`]), so they partition the original range
+    /// with no gap and no overlap.
+    ///
+    /// Returns `None` — never a partial split — when `key` is not contained
+    /// in the range or would leave either half empty (for example a split at
+    /// an included `low` endpoint).
+    pub fn split_at(&self, key: &Key) -> Option<(Self, Self)> {
+        if !self.contains(key) {
+            return None;
+        }
+        let lower = Self::new(self.low.clone(), Bound::Excluded(key.clone())).ok()?;
+        let upper = Self::new(Bound::Included(key.clone()), self.high.clone()).ok()?;
+        Some((lower, upper))
+    }
+
+    /// The combined bounds of two adjacent ranges: the lower range's `low`
+    /// and the upper range's `high` (spec section 12.6). Returns `None` when
+    /// the ranges are not adjacent (overlapping or disjoint) — adjacent valid
+    /// ranges always combine into a valid range.
+    pub fn union_adjacent(&self, other: &Self) -> Option<Self> {
+        let (lower, upper) = if self.meets_start_of(other) {
+            (self, other)
+        } else if other.meets_start_of(self) {
+            (other, self)
+        } else {
+            return None;
+        };
+        Self::new(lower.low.clone(), upper.high.clone()).ok()
+    }
 }
 
 /// The endpoint key of a bound, if bounded.
@@ -478,6 +528,26 @@ pub struct ReplicaDescriptor {
 /// `generation` advances at every atomic descriptor publication (split,
 /// merge, move); every request carries the generation it was routed with,
 /// and a mismatch is classified by [`check_generation`].
+///
+/// Publication generation rules (spec sections 12.5-12.6; the protocols live
+/// in [`crate::split`] and [`crate::merge`]):
+///
+/// - Split: the source is marked [`TabletState::Splitting`] at `g + 1` (`g` =
+///   the pre-split generation); the children are created `Creating` at
+///   `g + 1` and are never routed to; the atomic routing publication assigns
+///   one new generation `p = (source generation at publication) + 1`, taking
+///   the children `Creating -> Active` and the source `Splitting -> Retiring`
+///   together. A request holding `g` against the splitting source is
+///   classified [`RoutingError::TabletSplit`]; after publication any
+///   generation below `p` against the retiring source is
+///   [`RoutingError::TabletMoved`].
+/// - Merge: each source is marked [`TabletState::Merging`] at its own
+///   `g + 1`; the publication generation is
+///   `p = max(sources' generations at publication) + 1`, assigned to the
+///   replacement (`Creating -> Active`) and to both sources
+///   (`Merging -> Retiring`) in one atomic command.
+/// - Source removal publishes `Retiring -> Retired` at `p + 1` before the
+///   descriptor is deleted.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TabletDescriptor {
@@ -596,6 +666,24 @@ impl TabletDescriptor {
         }
         self.state = next;
         Ok(())
+    }
+
+    /// A copy of the descriptor transitioned to `next` with the generation
+    /// bumped by one: the shape of one atomic descriptor publication (see the
+    /// publication generation rules on [`TabletDescriptor`]). The descriptor
+    /// itself is unchanged, so the caller stages the published form and the
+    /// meta plane applies it last-writer-wins.
+    pub fn published_transition(&self, next: TabletState) -> Result<Self, TabletError> {
+        let mut published = self.clone();
+        published.try_transition(next)?;
+        published.generation =
+            published
+                .generation
+                .checked_add(1)
+                .ok_or(TabletError::InvalidDescriptor(
+                    "descriptor generation overflows u64".to_owned(),
+                ))?;
+        Ok(published)
     }
 }
 
@@ -1523,6 +1611,11 @@ impl TabletLayout {
         self.raft_group_id
     }
 
+    /// The node data root the layout lives under.
+    pub fn node_data(&self) -> &Path {
+        &self.node_data
+    }
+
     /// `node-data/tablets/<tablet-id>`.
     pub fn tablet_dir(&self) -> PathBuf {
         self.node_data
@@ -1684,6 +1777,27 @@ impl TabletLayout {
                 expected_group: self.raft_group_id,
                 found_group: descriptor.raft_group_id,
             });
+        }
+        Ok(())
+    }
+
+    /// Removes the local replica: the tablet directory and the Raft-group
+    /// directory (spec section 12.5 step 11; the consensus membership removal
+    /// is the runtime's half). Idempotent — a partially torn-down or absent
+    /// directory is fine — but never destructive across identity: a
+    /// `tablet.json` that names a different tablet or group fails closed with
+    /// [`TabletError::TabletMismatch`] instead of deleting foreign state.
+    pub fn teardown(&self) -> Result<(), TabletError> {
+        if self.tablet_dir().is_dir() {
+            match self.load_metadata() {
+                Ok(_) | Err(TabletError::MissingMetadata(_)) => {}
+                // Corrupt or foreign metadata blocks automatic teardown.
+                Err(error) => return Err(error),
+            }
+            fs::remove_dir_all(self.tablet_dir()).map_err(ClusterError::Io)?;
+        }
+        if self.group_dir().is_dir() {
+            fs::remove_dir_all(self.group_dir()).map_err(ClusterError::Io)?;
         }
         Ok(())
     }
@@ -2019,6 +2133,24 @@ mod tests {
     }
 
     #[test]
+    fn published_transition_stages_an_atomic_publication() {
+        let tablet = descriptor(TabletState::Active);
+        let splitting = tablet.published_transition(TabletState::Splitting).unwrap();
+        // The staged copy advanced; the original is untouched.
+        assert_eq!(splitting.state, TabletState::Splitting);
+        assert_eq!(splitting.generation, 8);
+        assert_eq!(tablet.state, TabletState::Active);
+        assert_eq!(tablet.generation, 7);
+        splitting.validate().unwrap();
+
+        // The graph still applies: Active -> Creating is not an edge.
+        assert!(matches!(
+            tablet.published_transition(TabletState::Creating),
+            Err(TabletError::InvalidStateTransition { .. })
+        ));
+    }
+
+    #[test]
     fn routability_matches_the_split_merge_protocol() {
         assert!(TabletState::Active.is_routable());
         assert!(TabletState::Splitting.is_routable());
@@ -2098,6 +2230,85 @@ mod tests {
         let point = bounds(Bound::Included(key(b"k")), Bound::Included(key(b"k")));
         assert!(point.contains(&key(b"k")));
         assert!(!point.contains(&key(b"j")));
+    }
+
+    #[test]
+    fn split_at_partitions_the_range_with_no_gap_or_overlap() {
+        let range = bounds(Bound::Included(key(b"b")), Bound::Excluded(key(b"f")));
+        let (lower, upper) = range.split_at(&key(b"d")).unwrap();
+        assert_eq!(
+            lower,
+            bounds(Bound::Included(key(b"b")), Bound::Excluded(key(b"d")))
+        );
+        assert_eq!(
+            upper,
+            bounds(Bound::Included(key(b"d")), Bound::Excluded(key(b"f")))
+        );
+        // The halves meet at the split key: adjacent, never overlapping.
+        assert!(lower.meets_start_of(&upper));
+        assert!(lower.is_adjacent_to(&upper));
+        assert!(!lower.overlaps(&upper));
+        for candidate in [b"a", b"b", b"c", b"d", b"e", b"f", b"g"] {
+            let candidate = key(candidate);
+            assert_eq!(
+                range.contains(&candidate),
+                lower.contains(&candidate) || upper.contains(&candidate),
+                "coverage mismatch at {candidate}"
+            );
+            assert!(
+                !(lower.contains(&candidate) && upper.contains(&candidate)),
+                "double coverage at {candidate}"
+            );
+        }
+
+        // Unbounded sides split fine; the split key itself lands in the upper half.
+        let whole = PartitionBounds::unbounded();
+        let (low_half, high_half) = whole.split_at(&key(b"k")).unwrap();
+        assert!(matches!(low_half.low, Bound::Unbounded));
+        assert!(matches!(high_half.high, Bound::Unbounded));
+        assert!(!low_half.contains(&key(b"k")));
+        assert!(high_half.contains(&key(b"k")));
+
+        // Keys outside the range, or at the very edge, never split.
+        assert!(range.split_at(&key(b"a")).is_none());
+        assert!(range.split_at(&key(b"f")).is_none());
+        assert!(range.split_at(&key(b"b")).is_none()); // would empty the lower half
+                                                       // A single-point range cannot split.
+        let point = bounds(Bound::Included(key(b"b")), Bound::Included(key(b"b")));
+        assert!(point.split_at(&key(b"b")).is_none());
+        // An included high endpoint may split: the upper half is the point.
+        let closed = bounds(Bound::Included(key(b"b")), Bound::Included(key(b"f")));
+        let (_, upper) = closed.split_at(&key(b"f")).unwrap();
+        assert_eq!(
+            upper,
+            bounds(Bound::Included(key(b"f")), Bound::Included(key(b"f")))
+        );
+    }
+
+    #[test]
+    fn union_adjacent_combines_only_adjacent_ranges() {
+        let lower = bounds(Bound::Included(key(b"a")), Bound::Excluded(key(b"c")));
+        let upper = bounds(Bound::Included(key(b"c")), Bound::Excluded(key(b"e")));
+        let combined = bounds(Bound::Included(key(b"a")), Bound::Excluded(key(b"e")));
+        // Order-independent.
+        assert_eq!(lower.union_adjacent(&upper).unwrap(), combined);
+        assert_eq!(upper.union_adjacent(&lower).unwrap(), combined);
+
+        // Overlap, gaps, and unbounded meets never combine.
+        let overlapping = bounds(Bound::Included(key(b"a")), Bound::Included(key(b"c")));
+        assert!(lower.union_adjacent(&overlapping).is_none());
+        let gapped = bounds(Bound::Excluded(key(b"c")), Bound::Excluded(key(b"e")));
+        assert!(lower.union_adjacent(&gapped).is_none());
+        assert!(PartitionBounds::unbounded()
+            .union_adjacent(&lower)
+            .is_none());
+
+        // The merged chain covers exactly the union.
+        let left = bounds(Bound::Unbounded, Bound::Excluded(key(b"c")));
+        assert_eq!(
+            left.union_adjacent(&upper).unwrap(),
+            bounds(Bound::Unbounded, Bound::Excluded(key(b"e")))
+        );
     }
 
     // -- row key encoder -----------------------------------------------------
@@ -2685,6 +2896,39 @@ mod tests {
             layout.validate(),
             Err(TabletError::Metadata(ClusterError::CorruptMetadata { .. }))
         ));
+    }
+
+    #[test]
+    fn teardown_removes_the_replica_idempotently_but_never_foreign_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let (layout, descriptor) = layout_fixture(dir.path());
+        layout.create(&descriptor).unwrap();
+        assert!(layout.tablet_dir().is_dir() && layout.group_dir().is_dir());
+
+        layout.teardown().unwrap();
+        assert!(!layout.tablet_dir().exists());
+        assert!(!layout.group_dir().exists());
+        // Tearing down an absent replica is fine (crash-resumed removal).
+        layout.teardown().unwrap();
+
+        // A directory holding foreign metadata is never deleted.
+        let other_dir = tempfile::tempdir().unwrap();
+        let mut foreign = descriptor.clone();
+        foreign.tablet_id = tablet_id(8);
+        let foreign_layout =
+            TabletLayout::new(other_dir.path(), foreign.tablet_id, foreign.raft_group_id);
+        foreign_layout.create(&foreign).unwrap();
+        layout.create(&descriptor).unwrap();
+        std::fs::write(
+            layout.metadata_path(),
+            std::fs::read(foreign_layout.metadata_path()).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            layout.teardown(),
+            Err(TabletError::TabletMismatch { .. })
+        ));
+        assert!(layout.tablet_dir().is_dir(), "foreign state was deleted");
     }
 
     // -- process-local ownership (spec 4.1 / 12.3) -------------------------------

@@ -5,9 +5,13 @@
 //! backup, and rolling-upgrade coordination.
 
 pub mod bootstrap;
+pub mod dist_txn;
+pub mod merge;
 pub mod meta;
 pub mod network;
 pub mod node;
 pub mod placement;
 pub mod routing;
+pub mod runtime;
+pub mod split;
 pub mod tablet;

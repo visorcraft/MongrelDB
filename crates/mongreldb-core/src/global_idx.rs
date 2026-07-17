@@ -32,9 +32,13 @@ pub const IDX_MAGIC: [u8; 8] = *b"MONGRIDX";
 pub const IDX_VERSION: u16 = 3;
 pub const IDX_DIR: &str = "_idx";
 pub const IDX_FILENAME: &str = "global.idx";
-const MAX_GLOBAL_INDEX_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_INDEX_RECORDS: usize = 65_536;
-const MAX_INDEX_PAYLOAD_BYTES: usize = MAX_GLOBAL_INDEX_BYTES as usize;
+/// Up-front allocation ceiling for a single payload while decoding. The
+/// serialized length prefix is attacker-controllable, so it is never
+/// preallocated wholesale; the true payload bound is enforced by the input
+/// itself (bincode fails at EOF on an over-claimed length), which keeps a
+/// corrupt prefix from forcing an allocation beyond the actual file size.
+const MAX_PAYLOAD_PREALLOC_BYTES: usize = 16 * 1024 * 1024;
 
 // Record kind bytes for framed index payloads.
 const K_HOT: u8 = 1;
@@ -137,19 +141,13 @@ where
         where
             A: serde::de::SeqAccess<'de>,
         {
+            // A legitimate payload can far exceed any fixed byte cap (the 1M-row
+            // qualification writes minhash payloads > 500 MiB), so there is no
+            // fixed payload limit: the preallocation is capped and the input's
+            // end enforces the true length (bincode errors on EOF).
             let capacity = sequence.size_hint().unwrap_or(0);
-            if capacity > MAX_INDEX_PAYLOAD_BYTES {
-                return Err(serde::de::Error::custom(
-                    "global-index payload is too large",
-                ));
-            }
-            let mut payload = Vec::with_capacity(capacity);
+            let mut payload = Vec::with_capacity(capacity.min(MAX_PAYLOAD_PREALLOC_BYTES));
             while let Some(byte) = sequence.next_element()? {
-                if payload.len() == MAX_INDEX_PAYLOAD_BYTES {
-                    return Err(serde::de::Error::custom(
-                        "global-index payload is too large",
-                    ));
-                }
                 payload.push(byte);
             }
             Ok(payload)
@@ -371,12 +369,12 @@ fn read_file(
     dek: Option<&[u8; 32]>,
 ) -> Result<Option<LoadedIndexes>> {
     let length = file.metadata()?.len();
-    if length > MAX_GLOBAL_INDEX_BYTES {
-        return Ok(None);
-    }
+    // No fixed file-size cap: checkpoints grow with table size (the 1M-row
+    // qualification checkpoint approaches 1 GiB). The read is bounded by the
+    // actual file length, and the SHA-256 footer below authenticates the
+    // content before any payload is decoded.
     let mut raw = Vec::with_capacity(length as usize);
-    file.take(MAX_GLOBAL_INDEX_BYTES + 1)
-        .read_to_end(&mut raw)?;
+    file.take(length + 1).read_to_end(&mut raw)?;
     if raw.len() as u64 != length {
         return Ok(None);
     }
@@ -453,7 +451,7 @@ fn read_file(
             }
             K_ANN => {
                 let Ok(idx) =
-                    crate::index::AnnIndex::thaw_bounded(&rec.payload, MAX_GLOBAL_INDEX_BYTES)
+                    crate::index::AnnIndex::thaw_bounded(&rec.payload, rec.payload.len() as u64)
                 else {
                     return Ok(None);
                 };
@@ -506,10 +504,12 @@ fn decode_bounded<T>(bytes: &[u8]) -> Option<T>
 where
     T: serde::de::DeserializeOwned,
 {
+    // Deserialization is bounded by the input slice itself: over-reading past
+    // the slice errors at EOF, and trailing bytes are rejected. No fixed byte
+    // cap — legitimate payloads exceed any small constant at scale.
     bincode::DefaultOptions::new()
         .with_fixint_encoding()
         .reject_trailing_bytes()
-        .with_limit(MAX_GLOBAL_INDEX_BYTES)
         .deserialize(bytes)
         .ok()
 }
@@ -824,6 +824,92 @@ mod tests {
             payload: Vec::new(),
         }];
         write_body(dir.path(), &body);
+        assert!(read(dir.path(), 1, &indexed_schema(), None)
+            .unwrap()
+            .is_none());
+    }
+
+    /// Regression test for the chronic AI 1M qualification failure: legitimate
+    /// checkpoints at scale far exceed 64 MiB (at 1M rows the minhash payload
+    /// is ~528 MiB and the ann payload ~305 MiB). A fixed 64 MiB cap on the
+    /// checkpoint read path made every large table discard its index
+    /// checkpoint on open and failed the qualification's checkpoint
+    /// inspection. Payload bounds are input-derived, never fixed.
+    #[test]
+    fn large_checkpoint_over_64_mib_roundtrips() {
+        let dir = tempdir().unwrap();
+        // ~68 MiB hot payload: 1.7M entries x ~40 serialized bytes.
+        let entries: Vec<(Vec<u8>, RowId)> = (0u64..1_700_000)
+            .map(|i| {
+                let mut key = b"large-key-".to_vec();
+                key.extend_from_slice(&i.to_le_bytes());
+                key.extend_from_slice(&[0u8; 6]); // 24-byte keys
+                (key, RowId(i))
+            })
+            .collect();
+        let payload = bincode::serialize(&entries).unwrap();
+        assert!(payload.len() as u64 > 64 * 1024 * 1024);
+        let body = GlobalIdxBody {
+            format_version: IDX_VERSION,
+            table_id: 7,
+            epoch_built: 3,
+            records: vec![Record {
+                kind: K_HOT,
+                column_id: 0,
+                payload,
+            }],
+        };
+        write_body(dir.path(), &body);
+        let file_len = std::fs::metadata(path(dir.path())).unwrap().len();
+        assert!(file_len > 64 * 1024 * 1024);
+
+        let loaded = read(dir.path(), 7, &indexed_schema(), None)
+            .unwrap()
+            .expect("large checkpoint loads");
+        assert_eq!(loaded.epoch_built, 3);
+        let mut probe = b"large-key-".to_vec();
+        probe.extend_from_slice(&1_699_999u64.to_le_bytes());
+        probe.extend_from_slice(&[0u8; 6]);
+        assert_eq!(loaded.hot.get(&probe), Some(RowId(1_699_999)));
+
+        // The benchmark inspection helper lists large payloads too.
+        let sizes = plaintext_record_sizes(dir.path()).unwrap();
+        assert_eq!(sizes.len(), 1);
+        assert_eq!(sizes[0].kind, "hot_primary");
+        assert!(sizes[0].payload_bytes > 64 * 1024 * 1024);
+    }
+
+    /// A corrupt payload length prefix that over-claims must fail closed at
+    /// EOF without attempting the claimed allocation (no abort, no OOM).
+    #[test]
+    fn over_claimed_payload_length_fails_closed() {
+        let dir = tempdir().unwrap();
+        let body = GlobalIdxBody {
+            format_version: IDX_VERSION,
+            table_id: 1,
+            epoch_built: 1,
+            records: vec![Record {
+                kind: K_HOT,
+                column_id: 0,
+                payload: vec![1, 2, 3],
+            }],
+        };
+        let mut bytes = IDX_MAGIC.to_vec();
+        bytes.extend(bincode::serialize(&body).unwrap());
+        // bincode (fixint) layout up to the first record's payload length:
+        // format_version u16 | table_id u64 | epoch_built u64 | records len
+        // u64 | kind u8 | column_id u16 | payload len u64  =>  2+8+8+8+1+2 = 29.
+        let payload_len_offset = 2 + 8 + 8 + 8 + 1 + 2;
+        bytes[payload_len_offset..payload_len_offset + 8]
+            .copy_from_slice(&(1u64 << 40).to_le_bytes());
+        bytes.extend(IDX_MAGIC);
+        let hash: [u8; 32] = Sha256::digest(&bytes).into();
+        bytes.extend(hash);
+        std::fs::create_dir_all(dir.path().join(IDX_DIR)).unwrap();
+        std::fs::write(path(dir.path()), bytes).unwrap();
+
+        // The hash verifies, but decoding must fail at EOF — returning None
+        // for a rebuild, never panicking or allocating the claimed 1 TiB.
         assert!(read(dir.path(), 1, &indexed_schema(), None)
             .unwrap()
             .is_none());

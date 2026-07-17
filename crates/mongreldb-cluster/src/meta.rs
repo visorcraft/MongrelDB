@@ -16,14 +16,16 @@
 //! state to `mongreldb-consensus`'s apply path; and [`MetaGroup`] is the
 //! bootstrap/membership/propose helper the node runtime drives.
 //!
-//! # Reconciliation notes (later waves)
+//! # Reconciliation notes
 //!
-//! - [`TabletDescriptor`], [`ReplicaDescriptor`], [`ReplicaRole`],
-//!   [`PartitionBounds`], and [`TabletState`] are meta-local minimal mirrors
-//!   of the `crate::tablet` descriptors owned by the Stage 3B wave (spec
-//!   section 12.1 freezes the descriptor shape here so the replicated state
-//!   format is stable). When `crate::tablet` lands its owning types, these
-//!   reconcile to it.
+//! - The descriptor family ([`TabletDescriptor`], [`ReplicaDescriptor`],
+//!   [`ReplicaRole`], [`PartitionBounds`], [`TabletState`]) and the placement
+//!   contract ([`PlacementPolicy`], [`LocalityConstraint`]) are the canonical
+//!   `crate::tablet` / `crate::placement` types, re-exported here so
+//!   `crate::meta::*` paths keep resolving. Meta records wrap them with the
+//!   meta state's [`MetadataVersion`] ([`TabletRecord`], [`ReplicaPlacement`],
+//!   [`PlacementPolicyRecord`]); a descriptor's own `generation` remains the
+//!   last-writer-wins guard.
 //! - [`SchemaJobKind`]/[`SchemaJobState`] minimally mirror the core job
 //!   registry's concepts (`mongreldb-core` `jobs.rs`), which the cluster
 //!   crate deliberately does not depend on. Distributed DDL (spec section
@@ -31,6 +33,31 @@
 //! - [`DefaultConsistency`] is a payload-free mirror of
 //!   `mongreldb_consensus::read::ReadConsistency` suitable as a cluster-wide
 //!   default (request-scoped token/timestamp variants carry no payload here).
+//!
+//! # Format v1 migration (spec sections 4.10, 17)
+//!
+//! The first meta control-plane build (format v1) replicated meta-local
+//! minimal mirrors of the `crate::tablet` / `crate::placement` types. The
+//! type reconciliation adopted the canonical types as format v2. v1 command
+//! records and v1 state checkpoints remain decodable: every decode probes the
+//! `format_version` field and routes v1 payloads through the [`v1`]
+//! compatibility module, migrating them to the canonical shapes before apply:
+//!
+//! - partition bounds `{start, end}` map onto `{low, high}` with the v1
+//!   semantics (start inclusive, end exclusive);
+//! - tablet states map `Online -> Active`, `Offline -> Retiring` (`Creating`
+//!   is unchanged);
+//! - v1 replicas carried no per-group raft id; they gain
+//!   `raft_node_id = raft_node_id(node_id)`, the projection the v1 group
+//!   actually used;
+//! - v1 voter constraints were hard requirements (`required = true`) and v1
+//!   leader preferences soft ones (`required = false`);
+//! - records keep their v1 `metadata_version`.
+//!
+//! New writes are stamped v2; v1 is accepted forever (the minimum supported
+//! version constants stay at 1) so checkpoints at
+//! `raft/state/meta-state.json` and log entries written by a v1 binary load
+//! and replay after upgrade.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
@@ -52,6 +79,7 @@ use mongreldb_types::ids::{
 use serde::{Deserialize, Serialize};
 
 use crate::node::{Incompatibility, NodeDescriptor, NodeState, VersionInfo};
+use crate::tablet::{Bound, Key};
 
 /// Cluster-wide feature level (spec section 17: separate from binary
 /// version; ADR-0010 decision 3).
@@ -445,11 +473,16 @@ pub fn assess_rollback(activations: &[FeatureActivation]) -> RollbackAssessment 
 // feature activation (ADR-0010).
 
 /// Format version of [`MetaCommandRecord`] payloads this build writes.
-pub const META_COMMAND_FORMAT_VERSION: u32 = 1;
+///
+/// v2 reconciles the tablet/placement payload types onto the canonical
+/// `crate::tablet` / `crate::placement` shapes; v1 payloads (meta-local
+/// mirrors) remain decodable and migrate on read (see the module docs).
+pub const META_COMMAND_FORMAT_VERSION: u32 = 2;
 /// Oldest [`MetaCommandRecord`] format version this build accepts.
 pub const MIN_SUPPORTED_META_COMMAND_FORMAT_VERSION: u32 = 1;
-/// Format version of [`MetaState`] snapshots this build writes.
-pub const META_STATE_FORMAT_VERSION: u32 = 1;
+/// Format version of [`MetaState`] snapshots this build writes (see
+/// [`META_COMMAND_FORMAT_VERSION`] for the v1 reconciliation).
+pub const META_STATE_FORMAT_VERSION: u32 = 2;
 /// Oldest [`MetaState`] snapshot format version this build accepts.
 pub const MIN_SUPPORTED_META_STATE_FORMAT_VERSION: u32 = 1;
 /// `CommandEnvelope::command_type` of meta control-plane commands.
@@ -605,77 +638,28 @@ pub struct TableSchemaRecord {
     pub metadata_version: MetadataVersion,
 }
 
-/// Raft role of one replica. Meta-local minimal mirror of the Stage 3B
-/// `crate::tablet` role type (see module reconciliation notes).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ReplicaRole {
-    /// Voting member of the raft group.
-    Voter,
-    /// Non-voting replica catching up before promotion.
-    Learner,
-}
+// ---------------------------------------------------------------------------
+// Canonical descriptor types (reconciled with crate::tablet / crate::placement)
+// ---------------------------------------------------------------------------
 
-/// One replica of a tablet or placement. Meta-local minimal mirror of the
-/// Stage 3B `crate::tablet` replica descriptor.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReplicaDescriptor {
-    /// Node hosting the replica.
-    pub node_id: NodeId,
-    /// Raft role of the replica.
-    pub role: ReplicaRole,
-}
+/// The canonical locality constraint (`crate::placement`), re-exported.
+pub use crate::placement::LocalityConstraint;
+/// The canonical placement policy (`crate::placement`), re-exported.
+pub use crate::placement::PlacementPolicy;
+/// The canonical partition bounds (`crate::tablet`), re-exported.
+pub use crate::tablet::PartitionBounds;
+/// The canonical replica descriptor (`crate::tablet`), re-exported.
+pub use crate::tablet::ReplicaDescriptor;
+/// The canonical replica role (`crate::tablet`), re-exported.
+pub use crate::tablet::ReplicaRole;
+/// The canonical tablet descriptor (`crate::tablet`), re-exported.
+pub use crate::tablet::TabletDescriptor;
+/// The canonical tablet lifecycle state (`crate::tablet`), re-exported.
+pub use crate::tablet::TabletState;
 
-/// Key-range bounds of one tablet (`None` = unbounded; start inclusive, end
-/// exclusive). Meta-local minimal mirror of the Stage 3B `crate::tablet`
-/// partition bounds; hash/tenant partitioning (spec section 12.2) refines
-/// the bound semantics there.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PartitionBounds {
-    /// Inclusive start key; `None` from the beginning of the key space.
-    pub start: Option<Vec<u8>>,
-    /// Exclusive end key; `None` to the end of the key space.
-    pub end: Option<Vec<u8>>,
-}
-
-/// Lifecycle state of one tablet. Meta-local minimal mirror of the Stage 3B
-/// `crate::tablet` state type.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TabletState {
-    /// Replicas are being built; not yet serving.
-    Creating,
-    /// Serving traffic.
-    Online,
-    /// Being removed; drained before the descriptor is deleted.
-    Offline,
-}
-
-/// One independently replicated data partition (spec section 12.1).
-/// Meta-local minimal mirror of the Stage 3B `crate::tablet` descriptor;
-/// `generation` is the last-writer-wins version.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TabletDescriptor {
-    /// The tablet's durable identifier.
-    pub tablet_id: TabletId,
-    /// Table the tablet partitions.
-    pub table_id: TableId,
-    /// Consensus group replicating the tablet.
-    pub raft_group_id: RaftGroupId,
-    /// Key-range bounds of the partition.
-    pub partition: PartitionBounds,
-    /// Replicas and their roles.
-    pub replicas: Vec<ReplicaDescriptor>,
-    /// Preferred leader, when placement has one.
-    pub leader_hint: Option<NodeId>,
-    /// Descriptor generation; updates apply only at a higher generation.
-    pub generation: u64,
-    /// Lifecycle state.
-    pub state: TabletState,
-    /// Meta state's [`MetadataVersion`] of the last modification.
-    #[serde(default = "zero_metadata_version")]
-    pub metadata_version: MetadataVersion,
-}
-
-/// Replica set of one raft group (spec section 12.1 "replica placement").
+/// Replica set of one raft group (spec section 12.1 "replica placement"): the
+/// canonical `crate::tablet` replica descriptors wrapped with the meta state's
+/// modification version.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplicaPlacement {
     /// The group whose replicas are placed.
@@ -687,27 +671,25 @@ pub struct ReplicaPlacement {
     pub metadata_version: MetadataVersion,
 }
 
-/// One locality requirement of a placement policy (spec section 12.7): the
-/// node's [`crate::node::Locality`] tier `key` must equal `value`.
+/// Replicated tablet record: the canonical `crate::tablet` descriptor wrapped
+/// with the meta state's modification version (observability and the
+/// optimistic-concurrency token of other records; the descriptor's own
+/// `generation` remains the last-writer-wins guard).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LocalityConstraint {
-    /// Locality tier key (for example `region` or `zone`).
-    pub key: String,
-    /// Required tier value.
-    pub value: String,
+pub struct TabletRecord {
+    /// The tablet descriptor.
+    pub descriptor: TabletDescriptor,
+    /// Meta state's [`MetadataVersion`] of the last modification.
+    #[serde(default = "zero_metadata_version")]
+    pub metadata_version: MetadataVersion,
 }
 
-/// Placement policy (spec section 12.7, exact shape).
+/// Replicated placement-policy record: the canonical `crate::placement`
+/// policy wrapped with the meta state's modification version.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PlacementPolicy {
-    /// Number of replicas.
-    pub replicas: u8,
-    /// Locality constraints every voter must satisfy.
-    pub voter_constraints: Vec<LocalityConstraint>,
-    /// Locality preferences for the leader, in priority order.
-    pub leader_preferences: Vec<LocalityConstraint>,
-    /// Nodes that must never hold a replica.
-    pub prohibited_nodes: Vec<NodeId>,
+pub struct PlacementPolicyRecord {
+    /// The placement policy.
+    pub policy: PlacementPolicy,
     /// Meta state's [`MetadataVersion`] of the last modification.
     #[serde(default = "zero_metadata_version")]
     pub metadata_version: MetadataVersion,
@@ -1250,20 +1232,35 @@ impl MetaCommandRecord {
     }
 
     /// Parses and verifies a record produced by [`MetaCommandRecord::encode`];
-    /// unknown versions and malformed payloads fail closed.
+    /// v1 records migrate to the canonical shapes (see the module docs).
+    /// Unknown versions and malformed payloads fail closed.
     pub fn decode(payload: &[u8]) -> Result<Self, MetaDecodeError> {
-        let record: Self = serde_json::from_slice(payload)
+        let probe: FormatVersionProbe = serde_json::from_slice(payload)
             .map_err(|error| MetaDecodeError::Malformed(error.to_string()))?;
-        if record.format_version < MIN_SUPPORTED_META_COMMAND_FORMAT_VERSION
-            || record.format_version > META_COMMAND_FORMAT_VERSION
+        if probe.format_version < MIN_SUPPORTED_META_COMMAND_FORMAT_VERSION
+            || probe.format_version > META_COMMAND_FORMAT_VERSION
         {
             return Err(MetaDecodeError::UnsupportedVersion {
-                found: record.format_version,
+                found: probe.format_version,
                 min: MIN_SUPPORTED_META_COMMAND_FORMAT_VERSION,
                 max: META_COMMAND_FORMAT_VERSION,
             });
         }
-        Ok(record)
+        if probe.format_version == 1 {
+            let record: v1::MetaCommandRecord = serde_json::from_slice(payload)
+                .map_err(|error| MetaDecodeError::Malformed(error.to_string()))?;
+            if record.format_version != probe.format_version {
+                return Err(MetaDecodeError::Malformed(
+                    "inconsistent format version".to_owned(),
+                ));
+            }
+            return Ok(Self {
+                format_version: META_COMMAND_FORMAT_VERSION,
+                command: migrate_command(record.command),
+            });
+        }
+        serde_json::from_slice(payload)
+            .map_err(|error| MetaDecodeError::Malformed(error.to_string()))
     }
 }
 
@@ -1303,12 +1300,12 @@ pub struct MetaState {
     pub databases: BTreeMap<DatabaseId, DatabaseDescriptor>,
     /// Replicated table schemas.
     pub tables: BTreeMap<TableId, TableSchemaRecord>,
-    /// Tablet descriptors.
-    pub tablets: BTreeMap<TabletId, TabletDescriptor>,
+    /// Tablet records (canonical descriptor + modification version).
+    pub tablets: BTreeMap<TabletId, TabletRecord>,
     /// Replica placements by raft group.
     pub placements: BTreeMap<RaftGroupId, ReplicaPlacement>,
-    /// Named placement policies (spec section 12.7).
-    pub placement_policies: BTreeMap<String, PlacementPolicy>,
+    /// Named placement policy records (spec section 12.7).
+    pub placement_policies: BTreeMap<String, PlacementPolicyRecord>,
     /// Schema/index jobs.
     pub schema_jobs: BTreeMap<u64, SchemaJobRecord>,
     /// Transaction status partitions (spec section 12.8).
@@ -1444,9 +1441,13 @@ impl MetaState {
                     .placements
                     .values()
                     .any(|placement| placement.replicas.iter().any(|r| r.node_id == *node_id));
-                let referenced_by_tablet = self.tablets.values().any(|tablet| {
-                    tablet.replicas.iter().any(|r| r.node_id == *node_id)
-                        || tablet.leader_hint == Some(*node_id)
+                let referenced_by_tablet = self.tablets.values().any(|record| {
+                    record
+                        .descriptor
+                        .replicas
+                        .iter()
+                        .any(|r| r.node_id == *node_id)
+                        || record.descriptor.leader_hint == Some(*node_id)
                 });
                 if referenced_by_placement || referenced_by_tablet {
                     return Err(MetaRejectionReason::Conflict {
@@ -1567,15 +1568,17 @@ impl MetaState {
                 }
                 match self.tablets.get(&descriptor.tablet_id) {
                     Some(existing) => {
-                        if descriptor.generation > existing.generation {
-                            let mut descriptor = descriptor.clone();
-                            descriptor.metadata_version = version;
-                            self.tablets.insert(descriptor.tablet_id, descriptor);
+                        if descriptor.generation > existing.descriptor.generation {
+                            self.tablets.insert(
+                                descriptor.tablet_id,
+                                TabletRecord {
+                                    descriptor: descriptor.clone(),
+                                    metadata_version: version,
+                                },
+                            );
                             Ok(())
-                        } else if descriptor.generation == existing.generation {
-                            let mut comparable = existing.clone();
-                            comparable.metadata_version = descriptor.metadata_version;
-                            if comparable == *descriptor {
+                        } else if descriptor.generation == existing.descriptor.generation {
+                            if existing.descriptor == *descriptor {
                                 Ok(())
                             } else {
                                 Err(MetaRejectionReason::Conflict {
@@ -1587,15 +1590,19 @@ impl MetaState {
                         } else {
                             Err(MetaRejectionReason::StaleWrite {
                                 resource: format!("tablet {}", descriptor.tablet_id),
-                                current: MetadataVersion(existing.generation),
+                                current: MetadataVersion(existing.descriptor.generation),
                                 attempted: MetadataVersion(descriptor.generation),
                             })
                         }
                     }
                     None => {
-                        let mut descriptor = descriptor.clone();
-                        descriptor.metadata_version = version;
-                        self.tablets.insert(descriptor.tablet_id, descriptor);
+                        self.tablets.insert(
+                            descriptor.tablet_id,
+                            TabletRecord {
+                                descriptor: descriptor.clone(),
+                                metadata_version: version,
+                            },
+                        );
                         Ok(())
                     }
                 }
@@ -1606,13 +1613,13 @@ impl MetaState {
             } => match self.tablets.get(tablet_id) {
                 None => Ok(()),
                 Some(existing) => {
-                    if *generation >= existing.generation {
+                    if *generation >= existing.descriptor.generation {
                         self.tablets.remove(tablet_id);
                         Ok(())
                     } else {
                         Err(MetaRejectionReason::StaleWrite {
                             resource: format!("tablet {tablet_id}"),
-                            current: MetadataVersion(existing.generation),
+                            current: MetadataVersion(existing.descriptor.generation),
                             attempted: MetadataVersion(*generation),
                         })
                     }
@@ -1662,18 +1669,15 @@ impl MetaState {
                     });
                 }
                 match self.placement_policies.get(name) {
-                    Some(existing)
-                        if existing.replicas == policy.replicas
-                            && existing.voter_constraints == policy.voter_constraints
-                            && existing.leader_preferences == policy.leader_preferences
-                            && existing.prohibited_nodes == policy.prohibited_nodes =>
-                    {
-                        Ok(())
-                    }
+                    Some(existing) if existing.policy == *policy => Ok(()),
                     _ => {
-                        let mut policy = policy.clone();
-                        policy.metadata_version = version;
-                        self.placement_policies.insert(name.clone(), policy);
+                        self.placement_policies.insert(
+                            name.clone(),
+                            PlacementPolicyRecord {
+                                policy: policy.clone(),
+                                metadata_version: version,
+                            },
+                        );
                         Ok(())
                     }
                 }
@@ -1840,8 +1844,15 @@ impl MetaState {
         self.tables.get(&table_id)
     }
 
-    /// One tablet descriptor.
+    /// One tablet descriptor (the canonical `crate::tablet` shape).
     pub fn tablet(&self, tablet_id: TabletId) -> Option<&TabletDescriptor> {
+        self.tablets
+            .get(&tablet_id)
+            .map(|record| &record.descriptor)
+    }
+
+    /// One tablet record (descriptor + modification version).
+    pub fn tablet_record(&self, tablet_id: TabletId) -> Option<&TabletRecord> {
         self.tablets.get(&tablet_id)
     }
 
@@ -1850,8 +1861,15 @@ impl MetaState {
         self.placements.get(&raft_group_id)
     }
 
-    /// One named placement policy.
+    /// One named placement policy (the canonical `crate::placement` shape).
     pub fn placement_policy(&self, name: &str) -> Option<&PlacementPolicy> {
+        self.placement_policies
+            .get(name)
+            .map(|record| &record.policy)
+    }
+
+    /// One named placement policy record (policy + modification version).
+    pub fn placement_policy_record(&self, name: &str) -> Option<&PlacementPolicyRecord> {
         self.placement_policies.get(name)
     }
 
@@ -1892,13 +1910,442 @@ impl MetaState {
 }
 
 // ---------------------------------------------------------------------------
+// Format v1 compatibility (spec sections 4.10, 17; module docs)
+// ---------------------------------------------------------------------------
+//
+// The serde shapes the first meta control-plane build (format v1) persisted
+// and replicated, kept verbatim so v1 command records and v1 state
+// checkpoints decode forever. Every field is read by the migration functions
+// below, which map the v1 meta-local mirrors onto the canonical
+// `crate::tablet` / `crate::placement` types (see the module docs for the
+// mapping decisions).
+mod v1 {
+    use super::*;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum ReplicaRole {
+        Voter,
+        Learner,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ReplicaDescriptor {
+        pub node_id: NodeId,
+        pub role: ReplicaRole,
+    }
+
+    #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct PartitionBounds {
+        pub start: Option<Vec<u8>>,
+        pub end: Option<Vec<u8>>,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum TabletState {
+        Creating,
+        Online,
+        Offline,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct TabletDescriptor {
+        pub tablet_id: TabletId,
+        pub table_id: TableId,
+        pub raft_group_id: RaftGroupId,
+        pub partition: PartitionBounds,
+        pub replicas: Vec<ReplicaDescriptor>,
+        pub leader_hint: Option<NodeId>,
+        pub generation: u64,
+        pub state: TabletState,
+        #[serde(default = "zero_metadata_version")]
+        pub metadata_version: MetadataVersion,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ReplicaPlacement {
+        pub raft_group_id: RaftGroupId,
+        pub replicas: Vec<ReplicaDescriptor>,
+        #[serde(default = "zero_metadata_version")]
+        pub metadata_version: MetadataVersion,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct LocalityConstraint {
+        pub key: String,
+        pub value: String,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct PlacementPolicy {
+        pub replicas: u8,
+        pub voter_constraints: Vec<LocalityConstraint>,
+        pub leader_preferences: Vec<LocalityConstraint>,
+        pub prohibited_nodes: Vec<NodeId>,
+        #[serde(default = "zero_metadata_version")]
+        pub metadata_version: MetadataVersion,
+    }
+
+    /// The v1 command enum: identical variant set; only the tablet/placement
+    /// payloads differ from the current (v2) shapes.
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    pub enum MetaCommand {
+        RegisterNode {
+            descriptor: NodeDescriptor,
+        },
+        UpdateNodeState {
+            node_id: NodeId,
+            state: NodeState,
+            expected_version: Option<MetadataVersion>,
+        },
+        RemoveNode {
+            node_id: NodeId,
+        },
+        CreateDatabase {
+            descriptor: DatabaseDescriptor,
+        },
+        DropDatabase {
+            database_id: DatabaseId,
+        },
+        SetTableSchema {
+            record: TableSchemaRecord,
+        },
+        SetTabletDescriptor {
+            descriptor: TabletDescriptor,
+        },
+        RemoveTabletDescriptor {
+            tablet_id: TabletId,
+            generation: u64,
+        },
+        SetReplicaPlacement {
+            placement: ReplicaPlacement,
+        },
+        SetPlacementPolicy {
+            name: String,
+            policy: PlacementPolicy,
+        },
+        SubmitSchemaJob {
+            job: SchemaJobRecord,
+        },
+        UpdateSchemaJob {
+            job_id: u64,
+            state: SchemaJobState,
+            updated_at: HlcTimestamp,
+            error: Option<String>,
+            expected_version: Option<MetadataVersion>,
+        },
+        SetClusterSetting {
+            key: String,
+            value: serde_json::Value,
+        },
+        ActivateFeature {
+            activation: FeatureActivation,
+        },
+        SetTxnStatusPartition {
+            partition: TxnStatusPartition,
+        },
+    }
+
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    pub struct MetaCommandRecord {
+        pub format_version: u32,
+        pub command: MetaCommand,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    #[serde(default)]
+    pub struct MetaState {
+        pub format_version: u32,
+        pub metadata_version: MetadataVersion,
+        pub nodes: BTreeMap<NodeId, NodeRecord>,
+        pub databases: BTreeMap<DatabaseId, DatabaseDescriptor>,
+        pub tables: BTreeMap<TableId, TableSchemaRecord>,
+        pub tablets: BTreeMap<TabletId, TabletDescriptor>,
+        pub placements: BTreeMap<RaftGroupId, ReplicaPlacement>,
+        pub placement_policies: BTreeMap<String, PlacementPolicy>,
+        pub schema_jobs: BTreeMap<u64, SchemaJobRecord>,
+        pub txn_status_partitions: BTreeMap<u32, TxnStatusPartition>,
+        pub settings: ClusterSettings,
+        pub feature_level: ClusterFeatureLevel,
+        pub feature_activations: Vec<FeatureActivation>,
+        pub rejections: VecDeque<MetaRejection>,
+    }
+
+    impl Default for MetaState {
+        fn default() -> Self {
+            Self {
+                format_version: 1,
+                metadata_version: MetadataVersion::ZERO,
+                nodes: BTreeMap::new(),
+                databases: BTreeMap::new(),
+                tables: BTreeMap::new(),
+                tablets: BTreeMap::new(),
+                placements: BTreeMap::new(),
+                placement_policies: BTreeMap::new(),
+                schema_jobs: BTreeMap::new(),
+                txn_status_partitions: BTreeMap::new(),
+                settings: ClusterSettings::default(),
+                feature_level: ClusterFeatureLevel::ZERO,
+                feature_activations: Vec::new(),
+                rejections: VecDeque::new(),
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    pub struct MetaStateCheckpoint {
+        pub format_version: u32,
+        pub position: LogPosition,
+        pub command_id: Option<[u8; 16]>,
+        pub state: MetaState,
+    }
+}
+
+impl From<v1::ReplicaRole> for ReplicaRole {
+    fn from(role: v1::ReplicaRole) -> Self {
+        match role {
+            v1::ReplicaRole::Voter => Self::Voter,
+            v1::ReplicaRole::Learner => Self::Learner,
+        }
+    }
+}
+
+/// v1 replicas carried no per-group raft id; the projection of the node id is
+/// the id the v1 raft group actually used for the replica.
+fn migrate_replica(replica: v1::ReplicaDescriptor) -> ReplicaDescriptor {
+    ReplicaDescriptor {
+        node_id: replica.node_id,
+        role: replica.role.into(),
+        raft_node_id: raft_node_id(&replica.node_id),
+    }
+}
+
+/// v1 bounds were `Option` endpoints (start inclusive, end exclusive); the
+/// canonical bounds carry the same semantics as `Bound` endpoints.
+fn migrate_bounds(bounds: v1::PartitionBounds) -> PartitionBounds {
+    PartitionBounds {
+        low: match bounds.start {
+            None => Bound::Unbounded,
+            Some(start) => Bound::Included(Key::from_bytes(start)),
+        },
+        high: match bounds.end {
+            None => Bound::Unbounded,
+            Some(end) => Bound::Excluded(Key::from_bytes(end)),
+        },
+    }
+}
+
+fn migrate_tablet_state(state: v1::TabletState) -> TabletState {
+    match state {
+        v1::TabletState::Creating => TabletState::Creating,
+        v1::TabletState::Online => TabletState::Active,
+        // v1 "being removed; drained before the descriptor is deleted" is the
+        // canonical "retired from routing, retained until no pins remain".
+        v1::TabletState::Offline => TabletState::Retiring,
+    }
+}
+
+fn migrate_tablet(tablet: v1::TabletDescriptor) -> TabletRecord {
+    TabletRecord {
+        descriptor: TabletDescriptor {
+            tablet_id: tablet.tablet_id,
+            table_id: tablet.table_id,
+            raft_group_id: tablet.raft_group_id,
+            partition: migrate_bounds(tablet.partition),
+            replicas: tablet.replicas.into_iter().map(migrate_replica).collect(),
+            leader_hint: tablet.leader_hint,
+            generation: tablet.generation,
+            state: migrate_tablet_state(tablet.state),
+        },
+        metadata_version: tablet.metadata_version,
+    }
+}
+
+fn migrate_placement(placement: v1::ReplicaPlacement) -> ReplicaPlacement {
+    ReplicaPlacement {
+        raft_group_id: placement.raft_group_id,
+        replicas: placement
+            .replicas
+            .into_iter()
+            .map(migrate_replica)
+            .collect(),
+        metadata_version: placement.metadata_version,
+    }
+}
+
+/// v1 voter constraints were hard requirements ("every voter must satisfy");
+/// v1 leader preferences were soft ("preferences, in priority order").
+fn migrate_policy(policy: v1::PlacementPolicy) -> PlacementPolicyRecord {
+    PlacementPolicyRecord {
+        policy: PlacementPolicy {
+            replicas: policy.replicas,
+            voter_constraints: policy
+                .voter_constraints
+                .into_iter()
+                .map(|constraint| LocalityConstraint {
+                    key: constraint.key,
+                    value: constraint.value,
+                    required: true,
+                })
+                .collect(),
+            leader_preferences: policy
+                .leader_preferences
+                .into_iter()
+                .map(|constraint| LocalityConstraint {
+                    key: constraint.key,
+                    value: constraint.value,
+                    required: false,
+                })
+                .collect(),
+            prohibited_nodes: policy.prohibited_nodes,
+        },
+        metadata_version: policy.metadata_version,
+    }
+}
+
+fn migrate_command(command: v1::MetaCommand) -> MetaCommand {
+    match command {
+        v1::MetaCommand::RegisterNode { descriptor } => MetaCommand::RegisterNode { descriptor },
+        v1::MetaCommand::UpdateNodeState {
+            node_id,
+            state,
+            expected_version,
+        } => MetaCommand::UpdateNodeState {
+            node_id,
+            state,
+            expected_version,
+        },
+        v1::MetaCommand::RemoveNode { node_id } => MetaCommand::RemoveNode { node_id },
+        v1::MetaCommand::CreateDatabase { descriptor } => {
+            MetaCommand::CreateDatabase { descriptor }
+        }
+        v1::MetaCommand::DropDatabase { database_id } => MetaCommand::DropDatabase { database_id },
+        v1::MetaCommand::SetTableSchema { record } => MetaCommand::SetTableSchema { record },
+        v1::MetaCommand::SetTabletDescriptor { descriptor } => MetaCommand::SetTabletDescriptor {
+            descriptor: migrate_tablet(descriptor).descriptor,
+        },
+        v1::MetaCommand::RemoveTabletDescriptor {
+            tablet_id,
+            generation,
+        } => MetaCommand::RemoveTabletDescriptor {
+            tablet_id,
+            generation,
+        },
+        v1::MetaCommand::SetReplicaPlacement { placement } => MetaCommand::SetReplicaPlacement {
+            placement: migrate_placement(placement),
+        },
+        v1::MetaCommand::SetPlacementPolicy { name, policy } => MetaCommand::SetPlacementPolicy {
+            name,
+            policy: migrate_policy(policy).policy,
+        },
+        v1::MetaCommand::SubmitSchemaJob { job } => MetaCommand::SubmitSchemaJob { job },
+        v1::MetaCommand::UpdateSchemaJob {
+            job_id,
+            state,
+            updated_at,
+            error,
+            expected_version,
+        } => MetaCommand::UpdateSchemaJob {
+            job_id,
+            state,
+            updated_at,
+            error,
+            expected_version,
+        },
+        v1::MetaCommand::SetClusterSetting { key, value } => {
+            MetaCommand::SetClusterSetting { key, value }
+        }
+        v1::MetaCommand::ActivateFeature { activation } => {
+            MetaCommand::ActivateFeature { activation }
+        }
+        v1::MetaCommand::SetTxnStatusPartition { partition } => {
+            MetaCommand::SetTxnStatusPartition { partition }
+        }
+    }
+}
+
+fn migrate_state(state: v1::MetaState) -> MetaState {
+    MetaState {
+        format_version: META_STATE_FORMAT_VERSION,
+        metadata_version: state.metadata_version,
+        nodes: state.nodes,
+        databases: state.databases,
+        tables: state.tables,
+        tablets: state
+            .tablets
+            .into_iter()
+            .map(|(tablet_id, tablet)| (tablet_id, migrate_tablet(tablet)))
+            .collect(),
+        placements: state
+            .placements
+            .into_iter()
+            .map(|(group_id, placement)| (group_id, migrate_placement(placement)))
+            .collect(),
+        placement_policies: state
+            .placement_policies
+            .into_iter()
+            .map(|(name, policy)| (name, migrate_policy(policy)))
+            .collect(),
+        schema_jobs: state.schema_jobs,
+        txn_status_partitions: state.txn_status_partitions,
+        settings: state.settings,
+        feature_level: state.feature_level,
+        feature_activations: state.feature_activations,
+        rejections: state.rejections,
+    }
+}
+
+fn migrate_checkpoint(checkpoint: v1::MetaStateCheckpoint) -> MetaStateCheckpoint {
+    MetaStateCheckpoint {
+        format_version: META_STATE_CHECKPOINT_FORMAT_VERSION,
+        position: checkpoint.position,
+        command_id: checkpoint.command_id,
+        state: migrate_state(checkpoint.state),
+    }
+}
+
+/// Decode-time probe of the `format_version` field every versioned meta
+/// payload (command records, state checkpoints) carries as its first field.
+#[derive(Deserialize)]
+struct FormatVersionProbe {
+    format_version: u32,
+}
+
+/// Parses and verifies a checkpoint produced by [`MetaStateCheckpoint`]
+/// serialization; v1 checkpoints migrate (see the module docs). Unknown
+/// versions and malformed payloads fail closed.
+fn decode_meta_checkpoint(bytes: &[u8]) -> Result<MetaStateCheckpoint, String> {
+    let probe: FormatVersionProbe =
+        serde_json::from_slice(bytes).map_err(|error| format!("decode: {error}"))?;
+    if probe.format_version < MIN_SUPPORTED_META_STATE_CHECKPOINT_FORMAT_VERSION
+        || probe.format_version > META_STATE_CHECKPOINT_FORMAT_VERSION
+    {
+        return Err(format!(
+            "unsupported format version {} (supported \
+             {MIN_SUPPORTED_META_STATE_CHECKPOINT_FORMAT_VERSION}..=\
+             {META_STATE_CHECKPOINT_FORMAT_VERSION})",
+            probe.format_version
+        ));
+    }
+    if probe.format_version == 1 {
+        let checkpoint: v1::MetaStateCheckpoint =
+            serde_json::from_slice(bytes).map_err(|error| format!("decode v1: {error}"))?;
+        if checkpoint.format_version != probe.format_version {
+            return Err("inconsistent format version".to_owned());
+        }
+        return Ok(migrate_checkpoint(checkpoint));
+    }
+    serde_json::from_slice(bytes).map_err(|error| format!("decode: {error}"))
+}
+
+// ---------------------------------------------------------------------------
 // MetaApplySink
 // ---------------------------------------------------------------------------
 
 /// Name of the sink's durable checkpoint file inside `<group dir>/raft/state/`.
 pub const META_STATE_CHECKPOINT_FILENAME: &str = "meta-state.json";
-/// Format version of the checkpoint file this build writes.
-pub const META_STATE_CHECKPOINT_FORMAT_VERSION: u32 = 1;
+/// Format version of the checkpoint file this build writes (v2 carries the
+/// reconciled canonical tablet/placement types; see the module docs).
+pub const META_STATE_CHECKPOINT_FORMAT_VERSION: u32 = 2;
 /// Oldest checkpoint format version this build accepts.
 pub const MIN_SUPPORTED_META_STATE_CHECKPOINT_FORMAT_VERSION: u32 = 1;
 
@@ -1979,16 +2426,14 @@ impl MetaApplySink {
                 state_dir,
             });
         };
-        let checkpoint: MetaStateCheckpoint = serde_json::from_slice(&bytes)
-            .map_err(|error| MetaError::CorruptCheckpoint(format!("decode: {error}")))?;
-        if checkpoint.format_version < MIN_SUPPORTED_META_STATE_CHECKPOINT_FORMAT_VERSION
-            || checkpoint.format_version > META_STATE_CHECKPOINT_FORMAT_VERSION
+        let checkpoint = decode_meta_checkpoint(&bytes).map_err(MetaError::CorruptCheckpoint)?;
+        if checkpoint.state.format_version < MIN_SUPPORTED_META_STATE_FORMAT_VERSION
+            || checkpoint.state.format_version > META_STATE_FORMAT_VERSION
         {
             return Err(MetaError::CorruptCheckpoint(format!(
-                "unsupported format version {} (supported \
-                 {MIN_SUPPORTED_META_STATE_CHECKPOINT_FORMAT_VERSION}..=\
-                 {META_STATE_CHECKPOINT_FORMAT_VERSION})",
-                checkpoint.format_version
+                "unsupported meta state format version {} (supported \
+                 {MIN_SUPPORTED_META_STATE_FORMAT_VERSION}..={META_STATE_FORMAT_VERSION})",
+                checkpoint.state.format_version
             )));
         }
         Ok(MetaApplySink {
@@ -2088,19 +2533,8 @@ impl ApplySink for MetaApplySink {
     }
 
     fn install(&mut self, data: &[u8]) -> Result<(), StateMachineError> {
-        let checkpoint: MetaStateCheckpoint = serde_json::from_slice(data).map_err(|error| {
-            StateMachineError::Corrupt(format!("meta snapshot decode: {error}"))
-        })?;
-        if checkpoint.format_version < MIN_SUPPORTED_META_STATE_CHECKPOINT_FORMAT_VERSION
-            || checkpoint.format_version > META_STATE_CHECKPOINT_FORMAT_VERSION
-        {
-            return Err(StateMachineError::Corrupt(format!(
-                "unsupported meta checkpoint format version {} (supported \
-                 {MIN_SUPPORTED_META_STATE_CHECKPOINT_FORMAT_VERSION}..=\
-                 {META_STATE_CHECKPOINT_FORMAT_VERSION})",
-                checkpoint.format_version
-            )));
-        }
+        let checkpoint = decode_meta_checkpoint(data)
+            .map_err(|error| StateMachineError::Corrupt(format!("meta snapshot {error}")))?;
         if checkpoint.state.format_version < MIN_SUPPORTED_META_STATE_FORMAT_VERSION
             || checkpoint.state.format_version > META_STATE_FORMAT_VERSION
         {
@@ -2237,7 +2671,7 @@ where
 }
 
 /// Mints a command id for the workflow's internal proposals.
-fn new_command_id() -> Result<[u8; 16], MetaError> {
+pub(crate) fn new_command_id() -> Result<[u8; 16], MetaError> {
     let mut id = [0u8; 16];
     getrandom::getrandom(&mut id).map_err(|error| MetaError::Rng(error.to_string()))?;
     Ok(id)
@@ -2793,17 +3227,17 @@ mod stage3a_tests {
             table_id: TableId(table),
             raft_group_id: group_id(9),
             partition: PartitionBounds {
-                start: None,
-                end: Some(b"m".to_vec()),
+                low: Bound::Unbounded,
+                high: Bound::Excluded(Key::from_bytes(b"m".to_vec())),
             },
             replicas: vec![ReplicaDescriptor {
                 node_id: node_id(1),
                 role: ReplicaRole::Voter,
+                raft_node_id: raft_id(1),
             }],
             leader_hint: None,
             generation,
-            state: TabletState::Online,
-            metadata_version: MetadataVersion::ZERO,
+            state: TabletState::Active,
         }
     }
 
@@ -2815,6 +3249,7 @@ mod stage3a_tests {
                 .map(|(node, role)| ReplicaDescriptor {
                     node_id: node_id(*node),
                     role: *role,
+                    raft_node_id: raft_id(*node),
                 })
                 .collect(),
             metadata_version: MetadataVersion::ZERO,
@@ -2827,10 +3262,10 @@ mod stage3a_tests {
             voter_constraints: vec![LocalityConstraint {
                 key: "region".to_owned(),
                 value: "us-central".to_owned(),
+                required: true,
             }],
             leader_preferences: Vec::new(),
             prohibited_nodes: Vec::new(),
-            metadata_version: MetadataVersion::ZERO,
         }
     }
 
@@ -4580,5 +5015,515 @@ mod stage3a_tests {
         assert_eq!(fresh.state().feature_level(), ClusterFeatureLevel(7));
         meta.shutdown().await.unwrap();
         fresh.shutdown().await.unwrap();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Type reconciliation tests: v1 payloads decode and migrate (module docs)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod reconciliation_tests {
+    use super::*;
+    use crate::node::{BuildVersion, Locality, NodeCapacity};
+    use mongreldb_log::commit_log::LogPosition;
+
+    fn node_id(byte: u8) -> NodeId {
+        NodeId::from_bytes([byte; 16])
+    }
+
+    fn group_id(byte: u8) -> RaftGroupId {
+        RaftGroupId::from_bytes([byte; 16])
+    }
+
+    fn tablet_id(byte: u8) -> TabletId {
+        TabletId::from_bytes([byte; 16])
+    }
+
+    fn ts(micros: u64) -> HlcTimestamp {
+        HlcTimestamp {
+            physical_micros: micros,
+            logical: 0,
+            node_tiebreaker: 0,
+        }
+    }
+
+    fn descriptor(byte: u8) -> NodeDescriptor {
+        NodeDescriptor {
+            node_id: node_id(byte),
+            rpc_address: format!("127.0.0.1:{}", 7200 + u16::from(byte)),
+            locality: Locality::default(),
+            capacity: NodeCapacity::default(),
+            state: NodeState::Up,
+            version: BuildVersion::current(),
+            version_info: VersionInfo::current(),
+        }
+    }
+
+    fn v1_tablet(byte: u8, state: v1::TabletState) -> v1::TabletDescriptor {
+        v1::TabletDescriptor {
+            tablet_id: tablet_id(byte),
+            table_id: TableId(3),
+            raft_group_id: group_id(9),
+            partition: v1::PartitionBounds {
+                start: Some(b"a".to_vec()),
+                end: Some(b"m".to_vec()),
+            },
+            replicas: vec![
+                v1::ReplicaDescriptor {
+                    node_id: node_id(1),
+                    role: v1::ReplicaRole::Voter,
+                },
+                v1::ReplicaDescriptor {
+                    node_id: node_id(2),
+                    role: v1::ReplicaRole::Learner,
+                },
+            ],
+            leader_hint: Some(node_id(1)),
+            generation: 4,
+            state,
+            metadata_version: MetadataVersion(11),
+        }
+    }
+
+    fn v1_policy() -> v1::PlacementPolicy {
+        v1::PlacementPolicy {
+            replicas: 3,
+            voter_constraints: vec![v1::LocalityConstraint {
+                key: "region".to_owned(),
+                value: "us-central".to_owned(),
+            }],
+            leader_preferences: vec![v1::LocalityConstraint {
+                key: "zone".to_owned(),
+                value: "a".to_owned(),
+            }],
+            prohibited_nodes: vec![node_id(9)],
+            metadata_version: MetadataVersion(12),
+        }
+    }
+
+    /// Encodes a v1 command record exactly as the v1 build did.
+    fn v1_encode(command: v1::MetaCommand) -> Vec<u8> {
+        serde_json::to_vec(&v1::MetaCommandRecord {
+            format_version: 1,
+            command,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn v1_tablet_command_decodes_and_migrates_to_the_canonical_shapes() {
+        let decoded = MetaCommandRecord::decode(&v1_encode(v1::MetaCommand::SetTabletDescriptor {
+            descriptor: v1_tablet(1, v1::TabletState::Online),
+        }))
+        .unwrap();
+        assert_eq!(decoded.format_version, META_COMMAND_FORMAT_VERSION);
+        let MetaCommand::SetTabletDescriptor { descriptor } = decoded.command else {
+            panic!("unexpected command variant: {:?}", decoded.command);
+        };
+        // start/end map onto low/high with v1 semantics (inclusive/exclusive).
+        assert_eq!(
+            descriptor.partition,
+            PartitionBounds {
+                low: Bound::Included(Key::from_bytes(b"a".to_vec())),
+                high: Bound::Excluded(Key::from_bytes(b"m".to_vec())),
+            }
+        );
+        // Online maps onto Active; roles and the leader hint carry over.
+        assert_eq!(descriptor.state, TabletState::Active);
+        assert_eq!(descriptor.leader_hint, Some(node_id(1)));
+        assert_eq!(descriptor.generation, 4);
+        assert_eq!(descriptor.replicas.len(), 2);
+        assert_eq!(descriptor.replicas[0].role, ReplicaRole::Voter);
+        assert_eq!(descriptor.replicas[1].role, ReplicaRole::Learner);
+        // v1 replicas carried no raft id: they gain the node-id projection
+        // the v1 group actually used.
+        assert_eq!(
+            descriptor.replicas[0].raft_node_id,
+            raft_node_id(&node_id(1))
+        );
+        assert_eq!(
+            descriptor.replicas[1].raft_node_id,
+            raft_node_id(&node_id(2))
+        );
+        // The command-level descriptor carries no meta modification version.
+    }
+
+    #[test]
+    fn v1_placement_and_policy_commands_decode_and_migrate() {
+        let decoded = MetaCommandRecord::decode(&v1_encode(v1::MetaCommand::SetReplicaPlacement {
+            placement: v1::ReplicaPlacement {
+                raft_group_id: group_id(9),
+                replicas: vec![v1::ReplicaDescriptor {
+                    node_id: node_id(3),
+                    role: v1::ReplicaRole::Voter,
+                }],
+                metadata_version: MetadataVersion(5),
+            },
+        }))
+        .unwrap();
+        let MetaCommand::SetReplicaPlacement { placement } = decoded.command else {
+            panic!("unexpected command variant: {:?}", decoded.command);
+        };
+        assert_eq!(
+            placement.replicas[0].raft_node_id,
+            raft_node_id(&node_id(3))
+        );
+        assert_eq!(placement.metadata_version, MetadataVersion(5));
+
+        let decoded = MetaCommandRecord::decode(&v1_encode(v1::MetaCommand::SetPlacementPolicy {
+            name: "default".to_owned(),
+            policy: v1_policy(),
+        }))
+        .unwrap();
+        let MetaCommand::SetPlacementPolicy { name, policy } = decoded.command else {
+            panic!("unexpected command variant: {:?}", decoded.command);
+        };
+        assert_eq!(name, "default");
+        assert_eq!(policy.replicas, 3);
+        // Voter constraints were hard requirements; leader preferences soft.
+        assert_eq!(
+            policy.voter_constraints,
+            vec![LocalityConstraint {
+                key: "region".to_owned(),
+                value: "us-central".to_owned(),
+                required: true,
+            }]
+        );
+        assert_eq!(
+            policy.leader_preferences,
+            vec![LocalityConstraint {
+                key: "zone".to_owned(),
+                value: "a".to_owned(),
+                required: false,
+            }]
+        );
+        assert_eq!(policy.prohibited_nodes, vec![node_id(9)]);
+    }
+
+    #[test]
+    fn v1_unaffected_command_variants_pass_through() {
+        let decoded = MetaCommandRecord::decode(&v1_encode(v1::MetaCommand::RegisterNode {
+            descriptor: descriptor(1),
+        }))
+        .unwrap();
+        assert_eq!(
+            decoded.command,
+            MetaCommand::RegisterNode {
+                descriptor: descriptor(1)
+            }
+        );
+        let decoded =
+            MetaCommandRecord::decode(&v1_encode(v1::MetaCommand::RemoveTabletDescriptor {
+                tablet_id: tablet_id(1),
+                generation: 9,
+            }))
+            .unwrap();
+        assert_eq!(
+            decoded.command,
+            MetaCommand::RemoveTabletDescriptor {
+                tablet_id: tablet_id(1),
+                generation: 9,
+            }
+        );
+    }
+
+    #[test]
+    fn v1_checkpoint_loads_and_migrates_meta_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().join("raft").join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let mut state = v1::MetaState {
+            metadata_version: MetadataVersion(20),
+            ..v1::MetaState::default()
+        };
+        state
+            .tablets
+            .insert(tablet_id(1), v1_tablet(1, v1::TabletState::Offline));
+        state.placements.insert(
+            group_id(9),
+            v1::ReplicaPlacement {
+                raft_group_id: group_id(9),
+                replicas: vec![v1::ReplicaDescriptor {
+                    node_id: node_id(1),
+                    role: v1::ReplicaRole::Voter,
+                }],
+                metadata_version: MetadataVersion(6),
+            },
+        );
+        state
+            .placement_policies
+            .insert("default".to_owned(), v1_policy());
+        let checkpoint = v1::MetaStateCheckpoint {
+            format_version: 1,
+            position: LogPosition { term: 2, index: 20 },
+            command_id: Some([7; 16]),
+            state,
+        };
+        std::fs::write(
+            state_dir.join(META_STATE_CHECKPOINT_FILENAME),
+            serde_json::to_vec(&checkpoint).unwrap(),
+        )
+        .unwrap();
+
+        let sink = MetaApplySink::open(tmp.path(), FeatureRegistry::current()).unwrap();
+        assert_eq!(sink.applied_position(), LogPosition { term: 2, index: 20 });
+        assert_eq!(sink.metadata_version(), MetadataVersion(20));
+        let state = sink.state().clone();
+        assert_eq!(state.format_version, META_STATE_FORMAT_VERSION);
+        // Offline maps onto Retiring; the record version is preserved.
+        let record = state.tablet_record(tablet_id(1)).unwrap();
+        assert_eq!(record.descriptor.state, TabletState::Retiring);
+        assert_eq!(record.metadata_version, MetadataVersion(11));
+        let placement = state.placement(group_id(9)).unwrap();
+        assert_eq!(
+            placement.replicas[0].raft_node_id,
+            raft_node_id(&node_id(1))
+        );
+        assert_eq!(placement.metadata_version, MetadataVersion(6));
+        let policy = state.placement_policy_record("default").unwrap();
+        assert!(policy.policy.voter_constraints[0].required);
+        assert!(!policy.policy.leader_preferences[0].required);
+        assert_eq!(policy.metadata_version, MetadataVersion(12));
+
+        // The migrated sink checkpoints v2: after an apply forces a persist,
+        // a reopen reads its own format and the on-disk bytes are v2.
+        drop(sink);
+        let mut reopened = MetaApplySink::open(tmp.path(), FeatureRegistry::current()).unwrap();
+        assert_eq!(reopened.state(), &state);
+        ApplySink::apply(
+            &mut reopened,
+            &AppliedCommand {
+                position: LogPosition { term: 2, index: 21 },
+                command: ReplicatedCommand::Noop,
+            },
+        )
+        .unwrap();
+        let on_disk = std::fs::read(state_dir.join(META_STATE_CHECKPOINT_FILENAME)).unwrap();
+        let checkpoint: MetaStateCheckpoint = serde_json::from_slice(&on_disk).unwrap();
+        assert_eq!(
+            checkpoint.format_version,
+            META_STATE_CHECKPOINT_FORMAT_VERSION
+        );
+        assert_eq!(checkpoint.state, *reopened.state());
+    }
+
+    #[test]
+    fn literal_v1_checkpoint_json_loads_through_serde_defaults() {
+        // The exact byte shape a v1 build wrote (sparse state fields ride the
+        // serde defaults): guards the v1 compatibility module against drift.
+        let tablet_hex = tablet_id(2).to_hex();
+        let group_hex = group_id(9).to_hex();
+        let node_hex = node_id(1).to_hex();
+        let json = serde_json::json!({
+            "format_version": 1,
+            "position": {"term": 1, "index": 9},
+            "command_id": null,
+            "state": {
+                "format_version": 1,
+                "metadata_version": 9,
+                "tablets": {
+                    tablet_hex.as_str(): {
+                        "tablet_id": tablet_hex.as_str(),
+                        "table_id": 3,
+                        "raft_group_id": group_hex.as_str(),
+                        "partition": {"start": null, "end": [109]},
+                        "replicas": [{"node_id": node_hex.as_str(), "role": "Voter"}],
+                        "leader_hint": null,
+                        "generation": 4,
+                        "state": "Online",
+                        "metadata_version": 7
+                    }
+                },
+                "placement_policies": {
+                    "default": {
+                        "replicas": 3,
+                        "voter_constraints": [{"key": "region", "value": "us-central"}],
+                        "leader_preferences": [],
+                        "prohibited_nodes": [],
+                        "metadata_version": 8
+                    }
+                }
+            }
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().join("raft").join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(
+            state_dir.join(META_STATE_CHECKPOINT_FILENAME),
+            serde_json::to_vec(&json).unwrap(),
+        )
+        .unwrap();
+
+        let sink = MetaApplySink::open(tmp.path(), FeatureRegistry::current()).unwrap();
+        let record = sink.state().tablet_record(tablet_id(2)).unwrap();
+        assert_eq!(
+            record.descriptor.partition,
+            PartitionBounds {
+                low: Bound::Unbounded,
+                high: Bound::Excluded(Key::from_bytes(b"m".to_vec())),
+            }
+        );
+        assert_eq!(record.descriptor.state, TabletState::Active);
+        assert_eq!(record.metadata_version, MetadataVersion(7));
+        let policy = sink.state().placement_policy_record("default").unwrap();
+        assert_eq!(policy.metadata_version, MetadataVersion(8));
+        assert_eq!(sink.metadata_version(), MetadataVersion(9));
+    }
+
+    #[test]
+    fn unsupported_future_versions_fail_closed() {
+        let future = serde_json::json!({
+            "format_version": META_COMMAND_FORMAT_VERSION + 1,
+            "command": {"RemoveNode": {"node_id": node_id(1)}},
+        });
+        assert_eq!(
+            MetaCommandRecord::decode(&serde_json::to_vec(&future).unwrap()).unwrap_err(),
+            MetaDecodeError::UnsupportedVersion {
+                found: META_COMMAND_FORMAT_VERSION + 1,
+                min: MIN_SUPPORTED_META_COMMAND_FORMAT_VERSION,
+                max: META_COMMAND_FORMAT_VERSION,
+            }
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().join("raft").join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let future = serde_json::json!({
+            "format_version": META_STATE_CHECKPOINT_FORMAT_VERSION + 1,
+            "position": {"term": 1, "index": 1},
+            "command_id": null,
+            "state": {"format_version": 1},
+        });
+        std::fs::write(
+            state_dir.join(META_STATE_CHECKPOINT_FILENAME),
+            serde_json::to_vec(&future).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            MetaApplySink::open(tmp.path(), FeatureRegistry::current()),
+            Err(MetaError::CorruptCheckpoint(_))
+        ));
+    }
+
+    #[test]
+    fn v1_command_replays_through_the_sink_apply_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut sink = MetaApplySink::open(tmp.path(), FeatureRegistry::current()).unwrap();
+        // Register the table the tablet references, then the v1 tablet write.
+        let register = MetaCommandRecord::new(MetaCommand::SetTableSchema {
+            record: TableSchemaRecord {
+                table_id: TableId(3),
+                database_id: DatabaseId::from_bytes([4; 16]),
+                schema_version: SchemaVersion(1),
+                schema: serde_json::json!({"columns": []}),
+                metadata_version: MetadataVersion::ZERO,
+            },
+        });
+        let database = MetaCommandRecord::new(MetaCommand::CreateDatabase {
+            descriptor: DatabaseDescriptor {
+                database_id: DatabaseId::from_bytes([4; 16]),
+                name: "app".to_owned(),
+                created_at: ts(1_000),
+                state: DatabaseState::Online,
+                metadata_version: MetadataVersion::ZERO,
+            },
+        });
+        let envelopes = [
+            (1_u64, database.encode().unwrap()),
+            (2, register.encode().unwrap()),
+            (
+                3,
+                v1_encode(v1::MetaCommand::SetTabletDescriptor {
+                    descriptor: v1_tablet(1, v1::TabletState::Online),
+                }),
+            ),
+        ];
+        for (index, payload) in envelopes {
+            let command = ReplicatedCommand::new(
+                CommandKind::Catalog,
+                CommandEnvelope::new(COMMAND_TYPE_META_COMMAND, [index as u8; 16], payload),
+                ts(1_000),
+            );
+            ApplySink::apply(
+                &mut sink,
+                &AppliedCommand {
+                    position: LogPosition { term: 1, index },
+                    command,
+                },
+            )
+            .unwrap();
+        }
+        // The v1 payload applied as the migrated canonical descriptor.
+        let record = sink.state().tablet_record(tablet_id(1)).unwrap();
+        assert_eq!(record.descriptor.state, TabletState::Active);
+        assert_eq!(
+            record.descriptor.replicas[0].raft_node_id,
+            raft_node_id(&node_id(1))
+        );
+        assert_eq!(record.metadata_version, MetadataVersion(3));
+        // And a v2 write at a higher generation wins over the migrated record.
+        let mut descriptor = record.descriptor.clone();
+        descriptor.generation = 5;
+        let record_v2 = MetaCommandRecord::new(MetaCommand::SetTabletDescriptor {
+            descriptor: descriptor.clone(),
+        });
+        let command = ReplicatedCommand::new(
+            CommandKind::Catalog,
+            CommandEnvelope::new(
+                COMMAND_TYPE_META_COMMAND,
+                [9; 16],
+                record_v2.encode().unwrap(),
+            ),
+            ts(1_000),
+        );
+        ApplySink::apply(
+            &mut sink,
+            &AppliedCommand {
+                position: LogPosition { term: 1, index: 4 },
+                command,
+            },
+        )
+        .unwrap();
+        assert_eq!(sink.state().tablet(tablet_id(1)).unwrap(), &descriptor);
+        assert!(sink.state().rejections().is_empty());
+    }
+
+    #[test]
+    fn reconciled_records_round_trip_serde() {
+        let record = TabletRecord {
+            descriptor: migrate_tablet(v1_tablet(1, v1::TabletState::Online)).descriptor,
+            metadata_version: MetadataVersion(3),
+        };
+        let json = serde_json::to_vec(&record).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<TabletRecord>(&json).unwrap(),
+            record
+        );
+
+        let policy = PlacementPolicyRecord {
+            policy: migrate_policy(v1_policy()).policy,
+            metadata_version: MetadataVersion(4),
+        };
+        let json = serde_json::to_vec(&policy).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<PlacementPolicyRecord>(&json).unwrap(),
+            policy
+        );
+
+        let placement = ReplicaPlacement {
+            raft_group_id: group_id(9),
+            replicas: vec![ReplicaDescriptor {
+                node_id: node_id(1),
+                role: ReplicaRole::Voter,
+                raft_node_id: raft_node_id(&node_id(1)),
+            }],
+            metadata_version: MetadataVersion(5),
+        };
+        let json = serde_json::to_vec(&placement).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<ReplicaPlacement>(&json).unwrap(),
+            placement
+        );
     }
 }

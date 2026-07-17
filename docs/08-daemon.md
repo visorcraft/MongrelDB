@@ -135,6 +135,116 @@ pre-cancellation and retained-page bounds. Drain, reload, and authorization
 failures on these routes are recorded in the security audit log with the
 calling principal and outcome.
 
+## Cluster administration
+
+The `/admin/cluster/*` endpoints and the `cluster` / `node` CLI subcommands
+expose the cluster bootstrap and membership workflows (Stage 2/3, spec
+§11.1). The node data directory is the database directory itself: cluster
+records live under `<db-dir>/cluster-meta/`. A server whose database
+directory carries no cluster identity keeps working exactly as before — the
+status endpoint reports `"standalone"` and the mutating endpoints answer
+409. See [Sharded Cluster](21-sharded-cluster.md) for the machinery behind
+these surfaces.
+
+All three endpoints are admin routes: like `/admin/drain`, they require
+`ADMIN` permission when catalog authentication is enabled.
+
+### Cluster status
+
+```sh
+curl http://127.0.0.1:8453/admin/cluster/status
+```
+
+Reports one JSON view: `"mode": "cluster"` with the persisted `identity`
+(cluster id + node id), `membership` (node descriptors with locality,
+capacity, lifecycle state, build version, and version advertisement),
+`member_endpoints`, the `database_group` descriptor, a key-free `trust`
+summary (`ca_cert_pem`, `node_cert_pem`, `allowed_node_ids`,
+`has_node_key` — the node private key is never served), and this binary's
+`version_info`; or `"mode": "standalone"` with a hint when no identity
+exists. Corrupt or unsupported metadata answers 500 and is audited as
+`admin.cluster.status.fail`.
+
+### Drain a member
+
+```sh
+curl -X POST http://127.0.0.1:8453/admin/cluster/node/drain \
+  -H "Content-Type: application/json" \
+  -d '{"node_id": "<32 hex digits>"}'
+```
+
+Moves a member from `Up` to `Draining` in the persisted membership record.
+The body is optional; `node_id` defaults to this node's own identity.
+Replies `{"member": <updated descriptor>}`. Errors: 400 for an unparsable
+`node_id`, 404 for an unknown member, 409 on a standalone node or an
+illegal state transition (only `Up` drains). The initiation, outcome, and
+failure are audited (`admin.cluster.drain`, `.ok`, `.fail`).
+
+### Remove a member
+
+```sh
+curl -X POST http://127.0.0.1:8453/admin/cluster/node/remove \
+  -H "Content-Type: application/json" \
+  -d '{"node_id": "<32 hex>", "confirm_token": "<64 hex>"}'
+```
+
+Moves a member to `Decommissioned` (permanent). `confirm_token` is
+**required** and is obtained out of band from the CLI (see below) — it is
+never served over HTTP, never written to the audit log, and never echoed in
+a response. `node_id` defaults to this node's own identity. Replies
+`{"member": <updated descriptor>}`. Errors: 400 when `confirm_token` is
+absent, 403 for a wrong token, 404 for an unknown member, 409 on a
+standalone node or an illegal transition (removal is permitted from `Up`,
+`Draining`, or `Down`). Audited like drain (`admin.cluster.remove`, `.ok`,
+`.fail`).
+
+### Cluster CLI
+
+One-shot subcommands; they operate on the data directory and exit without
+starting the daemon:
+
+```sh
+# Create the cluster on this node (id, initial membership, database raft
+# group descriptor, trust configuration). Prints cluster_id and node_id.
+mongreldb-server cluster init --data-dir <dir> \
+  --endpoints 10.0.0.1:8453,10.0.0.2:8453 \
+  --locality region=us-central,zone=a
+
+# Provision this node into an existing cluster from an invite.
+mongreldb-server cluster join --data-dir <dir> \
+  --cluster-id <32 hex> --endpoints 10.0.0.1:8453 \
+  --allowed-node-ids <hex,hex,...>
+
+# Print the status report (cluster or standalone view).
+mongreldb-server cluster status --data-dir <dir>
+
+# Membership transitions (default target: this node's own identity).
+mongreldb-server node drain  --data-dir <dir> [--node-id <hex>]
+mongreldb-server node remove --data-dir <dir> [--node-id <hex>] [--confirm-token <hex>]
+```
+
+Flags: `--data-dir` (required everywhere); `--endpoints` (comma-separated
+`host:port`; `init` advertises the first as its RPC address unless
+`--rpc-address` is given); `--locality` (`key=value` tiers); `--cluster-id`
+(join); `--trust-dir` (directory holding `ca-cert.pem`, `node-cert.pem`,
+`node-key.pem`; default `<data-dir>/trust`); `--allowed-node-ids`
+(comma-separated admitted node ids; default: this node — required on a
+first join, which mints its node id during join); `--node-id` and
+`--confirm-token` (membership transitions).
+
+Safety rules, all fail-closed: a node is bound to one cluster for the
+lifetime of its data directory (re-init or re-join is rejected; joining a
+different cluster requires an explicit wipe); trust material must be
+readable and PEM-armored; and `node remove` is a two-step confirmation —
+run without `--confirm-token` it prints the token and changes nothing,
+run with it the removal proceeds. Mutating workflows serialize on a
+`bootstrap.lock` file under `cluster-meta/`; a crash mid-workflow can leave
+it behind (the file records the pid and time — delete it to unblock).
+Joined nodes keep only the validated invite until the meta group wires
+membership through (Stage 2F/3A), so their `cluster status` shows an empty
+`membership`, and `node drain`/`node remove` — which edit the bootstrap
+`cluster.json` — answer "not initialized" there.
+
 ## Running as a daemon (--daemon mode)
 
 The `--daemon` flag forks the server into the background, detaches from the
