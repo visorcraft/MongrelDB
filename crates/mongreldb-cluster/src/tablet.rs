@@ -2114,7 +2114,7 @@ mod tests {
         assert_eq!(shuffled, ints);
 
         // Text is bytewise, prefix-free: "a" < "a\0" < "aa" < "b".
-        let mut texts = vec![
+        let mut texts = [
             text_key("aa"),
             text_key("a"),
             RowKeyEncoder::encode_key(&[KeyValue::Text("a\0".to_owned())]),
@@ -2135,7 +2135,7 @@ mod tests {
         ];
         let mut cross: Vec<Key> = values
             .iter()
-            .map(|v| RowKeyEncoder::encode_key(&[v.clone()]))
+            .map(|value| RowKeyEncoder::encode_key(std::slice::from_ref(value)))
             .collect();
         let sorted = cross.clone();
         cross.reverse();
@@ -2719,7 +2719,7 @@ mod tests {
         // Dropping the guard releases the reservation.
         drop(guard);
         assert_eq!(registry.len(), 1);
-        registry.try_reserve(&layout).unwrap();
+        let _reacquired = registry.try_reserve(&layout).unwrap();
         assert_eq!(registry.len(), 2);
     }
 

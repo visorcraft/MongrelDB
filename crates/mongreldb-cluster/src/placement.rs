@@ -858,9 +858,11 @@ mod tests {
     #[test]
     fn choose_replicas_never_picks_prohibited_nodes() {
         let nodes = zoned_nodes();
-        let mut policy = PlacementPolicy::default();
         // Prohibit the deterministic winners: node 1 and node 3.
-        policy.prohibited_nodes = vec![node_id(1), node_id(3)];
+        let policy = PlacementPolicy {
+            prohibited_nodes: vec![node_id(1), node_id(3)],
+            ..PlacementPolicy::default()
+        };
         let chosen = choose_replicas(&policy, &nodes, &[]);
         assert_eq!(chosen.len(), 3);
         assert!(!chosen.contains(&node_id(1)));
@@ -931,8 +933,10 @@ mod tests {
             Err(PlacementError::ZeroReplicas)
         );
 
-        let mut too_many = PlacementPolicy::default();
-        too_many.replicas = 7;
+        let too_many = PlacementPolicy {
+            replicas: 7,
+            ..PlacementPolicy::default()
+        };
         assert!(matches!(
             validate_policy(&too_many, &nodes),
             Err(PlacementError::Infeasible(_))
@@ -1207,7 +1211,7 @@ mod tests {
     fn rebalancer_leaves_a_balanced_cluster_alone() {
         let nodes = vec![node(1, ""), node(2, ""), node(3, "")];
         let tablets = vec![tablet(1, &[1, 2, 3], Some(1))];
-        let loads = vec![load(1, 10, 1, 1), load(2, 10, 1, 0), load(3, 10, 1, 0)];
+        let loads = vec![load(1, 10, 1, 0), load(2, 10, 1, 0), load(3, 10, 1, 0)];
         let plan = plan_rebalance(
             &tablets,
             &nodes,

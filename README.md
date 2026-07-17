@@ -458,6 +458,11 @@ crates/mongreldb-sim/     deterministic simulator (seeded RNG, virtual clock,
                           network, disk) for distributed-behavior tests
 crates/mongreldb-protocol/ versioned Stage 1D protocol: canonical request model,
                           wire envelope, service traits, and session model
+crates/mongreldb-consensus/ openraft adapter (Stage 2): ConsensusGroup,
+                          RaftCommitLog, durable checksummed storage, engine
+                          sink to a ClusterReplica core
+crates/mongreldb-cluster/ node identity/bootstrap, routing cache + retry
+                          policy, feature levels, rolling-upgrade planning
 crates/mongreldb-node/    NAPI addon (typed object API; built via `napi`)
 crates/mongreldb-server/  HTTP daemon (axum/tokio; SQL + native query + typed Kit API)
 crates/mongreldb-client/  typed HTTP client for the daemon (SQL/native + Kit API)
@@ -478,14 +483,18 @@ The Stage 0 foundation wave of that program is already in the tree: commits in
 authority and reader visibility is gated on the returned `CommitReceipt`. Named
 fault-injection hooks (disabled by default, one atomic load when disarmed)
 guard the WAL append/fsync, commit-publish, catalog-publish, snapshot-install,
-and index-publish boundaries. The ADRs define the target modes — embedded
-shared-handle, single-node server, replicated and sharded clusters — but they
-are **decisions, not shipped behavior**: Raft consensus, tablet sharding, and
-distributed transactions are not implemented, and MongrelDB today remains an
-embedded single-node engine with an optional HTTP daemon. Stage 1 single-node
-machinery — shared cores behind per-identity handles, a memory governor,
-persistent online jobs, versioned catalog commands, and a lock manager — has
-begun landing on top. See
+and index-publish boundaries. Stage 1 single-node machinery — shared cores
+behind per-identity handles, a memory governor, persistent online jobs,
+versioned catalog commands, and a lock manager — has landed on top, and the
+Stage 2 consensus core is in the tree: `mongreldb-consensus` replicates one
+database as a Raft group (`RaftCommitLog` with Quorum/LeaderDisk durability,
+failover p95 under one second in the qualification suite) and
+`mongreldb-cluster` carries node identity, routing, and upgrade planning — see
+[Replicated High Availability](docs/20-replicated-ha.md). The ADRs' remaining
+target modes are still **decisions, not shipped behavior**: tablet sharding
+and distributed transactions are not implemented, and production deployments
+today remain the embedded single-node engine with the optional HTTP daemon
+(whose `GET /wal/stream` follower replication still serves read replicas). See
 [Architecture Foundations](docs/18-architecture-foundations.md) and
 [Single-Node Subsystems](docs/19-single-node-subsystems.md) for the
 user-facing contracts.

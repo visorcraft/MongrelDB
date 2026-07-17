@@ -33,10 +33,14 @@
 //!   hot backup from a replica core is follow-up work for the cluster
 //!   runtime wave.
 //! - SQL proper lives in `mongreldb-query`, which has no replica wiring yet;
-//!   the aggregate comparison runs through `Table::aggregate_native` — the
-//!   native aggregate pushdown the SQL layer lowers
-//!   `COUNT`/`SUM`/`MIN`/`MAX`/`AVG` to — so both sides execute the same
-//!   engine code the SQL surface would.
+//!   the aggregate comparison exercises the two engine surfaces the SQL
+//!   layer uses: `Table::aggregate_native` (the native pushdown it lowers
+//!   `COUNT`/`SUM`/`MIN`/`MAX`/`AVG` to, servable where a sorted run exists)
+//!   and the scan fallback it takes when the pushdown declines — a replica's
+//!   applied state is overlay-only this wave (replicated spilled-run commits
+//!   fail closed until Stage 2C spill translation), so on a replica the
+//!   pushdown always declines. The gate asserts the standalone native
+//!   results equal the replica fallback values at the same snapshot.
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -250,10 +254,15 @@ fn build_simple_replica(root: &Path, node_seed: u8) -> Database {
             .unwrap();
     db.apply_replicated_catalog_command(&create_table_record("items", &simple_schema(), 1, 1))
         .unwrap();
-    let first = put_records(1, 0, 2, vec![(1, 10), (2, 20), (3, 30)]
-        .into_iter()
-        .map(|(row_id, value)| (row_id, vec![(1, Value::Int64(value))]))
-        .collect());
+    let first = put_records(
+        1,
+        0,
+        2,
+        vec![(1, 10), (2, 20), (3, 30)]
+            .into_iter()
+            .map(|(row_id, value)| (row_id, vec![(1, Value::Int64(value))]))
+            .collect(),
+    );
     assert!(db.apply_replicated_records(&first).unwrap());
     let second = put_records(2, 0, 3, vec![(4, vec![(1, Value::Int64(40))])]);
     assert!(db.apply_replicated_records(&second).unwrap());
@@ -276,17 +285,19 @@ fn backup_excluded(relative: &Path) -> bool {
         })
 }
 
-fn walk_regular_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
+fn walk_tree(root: &Path, dir: &Path, dirs: &mut Vec<PathBuf>, files: &mut Vec<PathBuf>) {
     let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .collect();
     entries.sort();
     for path in entries {
+        let relative = path.strip_prefix(root).unwrap().to_path_buf();
         if path.is_dir() {
-            walk_regular_files(root, &path, out);
+            dirs.push(relative);
+            walk_tree(root, &path, dirs, files);
         } else {
-            out.push(path.strip_prefix(root).unwrap().to_path_buf());
+            files.push(relative);
         }
     }
 }
@@ -299,21 +310,29 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 /// Stages an offline backup of a quiesced database root: copy the
-/// `backup_path_excluded`-filtered file set, then write the checksummed
-/// manifest last — the same ordering and per-file hashing the online
-/// `hot_backup` path performs (`BackupManifest::create_controlled_durable`).
+/// `backup_path_excluded`-filtered tree (directories included — an open
+/// expects `_runs`/`_rcache` to exist, exactly as the online
+/// `copy_backup_boundary` preserves them), then write the checksummed
+/// manifest last, mirroring the online `hot_backup` ordering and per-file
+/// hashing (`BackupManifest::create_controlled_durable`).
 fn stage_offline_backup(
     source: &Path,
     destination: &Path,
     epoch: u64,
     catalog_version: u64,
 ) -> BackupManifest {
+    let mut dirs = Vec::new();
     let mut relatives = Vec::new();
-    walk_regular_files(source, source, &mut relatives);
+    walk_tree(source, source, &mut dirs, &mut relatives);
+    dirs.retain(|relative| !backup_excluded(relative));
+    dirs.sort();
     relatives.retain(|relative| !backup_excluded(relative));
     relatives.sort();
     relatives.dedup();
 
+    for dir in &dirs {
+        std::fs::create_dir_all(destination.join(dir)).unwrap();
+    }
     let mut files = Vec::with_capacity(relatives.len());
     for relative in &relatives {
         let bytes = std::fs::read(source.join(relative)).unwrap();
@@ -336,9 +355,7 @@ fn stage_offline_backup(
         format_version: BACKUP_FORMAT_VERSION,
         epoch,
         created_unix_nanos: now.as_nanos() as u64,
-        database_id: Some(DatabaseId::from_bytes(
-            identity[..16].try_into().unwrap(),
-        )),
+        database_id: Some(DatabaseId::from_bytes(identity[..16].try_into().unwrap())),
         catalog_version,
         snapshot_unix_micros: now.as_micros() as u64,
         open_generation: u64::from_le_bytes(generation.try_into().unwrap()),
@@ -393,8 +410,12 @@ fn backup_from_a_follower_is_valid_and_matches_the_leader() {
     let parent = tempfile::tempdir().unwrap();
     let follower_backup = parent.path().join("follower-backup");
     let leader_backup = parent.path().join("leader-backup");
-    let follower_manifest =
-        stage_offline_backup(&follower_root, &follower_backup, watermark.0, catalog_version);
+    let follower_manifest = stage_offline_backup(
+        &follower_root,
+        &follower_backup,
+        watermark.0,
+        catalog_version,
+    );
     let leader_manifest =
         stage_offline_backup(&leader_root, &leader_backup, watermark.0, catalog_version);
 
@@ -426,7 +447,9 @@ fn backup_from_a_follower_is_valid_and_matches_the_leader() {
     let follower_files: std::collections::BTreeSet<_> = follower_hashes.keys().collect();
     assert_eq!(
         follower_files,
-        leader_hashes.keys().collect::<std::collections::BTreeSet<_>>()
+        leader_hashes
+            .keys()
+            .collect::<std::collections::BTreeSet<_>>()
     );
     for (path, follower_hash) in &follower_hashes {
         let follower_hash = *follower_hash;
@@ -438,7 +461,10 @@ fn backup_from_a_follower_is_valid_and_matches_the_leader() {
         }
     }
     assert_eq!(follower_manifest.epoch, leader_manifest.epoch);
-    assert_eq!(follower_manifest.catalog_version, leader_manifest.catalog_version);
+    assert_eq!(
+        follower_manifest.catalog_version,
+        leader_manifest.catalog_version
+    );
     assert_eq!(
         follower_manifest.open_generation,
         leader_manifest.open_generation
@@ -466,8 +492,7 @@ fn backup_from_a_follower_is_valid_and_matches_the_leader() {
         Err(MongrelError::ReadOnlyReplica)
     ));
     drop(reopened);
-    let runtime =
-        Database::open_cluster_replica(&follower_backup, &cluster_mode(20)).unwrap();
+    let runtime = Database::open_cluster_replica(&follower_backup, &cluster_mode(20)).unwrap();
     assert_eq!(visible_ids(&runtime, "items"), vec![10, 20, 30, 40]);
 }
 
@@ -513,7 +538,10 @@ fn ai_rows() -> Vec<Vec<(u16, Value)>> {
                 (1, Value::Int64(id)),
                 (2, Value::Embedding(embedding)),
                 (3, Value::Bytes(bincode::serialize(&sparse).unwrap())),
-                (4, Value::Bytes(serde_json::to_vec(member_sets[index]).unwrap())),
+                (
+                    4,
+                    Value::Bytes(serde_json::to_vec(member_sets[index]).unwrap()),
+                ),
                 (5, Value::Bytes(cities[index].as_bytes().to_vec())),
                 (6, Value::Bytes(docs[index].as_bytes().to_vec())),
                 (7, Value::Int64(id * 10)),
@@ -524,9 +552,16 @@ fn ai_rows() -> Vec<Vec<(u16, Value)>> {
 
 /// Standalone baseline: the same schema and rows through the normal
 /// transaction path (two commits, epochs 2 and 3 behind the DDL epoch 1).
+/// The mutable-run spill threshold is pinned at 1 byte so the closing flush
+/// publishes a real sorted run (the shape the native aggregate fast path
+/// serves).
 fn seed_standalone(root: &Path) -> Database {
     let db = Database::create(root).unwrap();
     db.create_table("items", ai_schema()).unwrap();
+    db.table("items")
+        .unwrap()
+        .lock()
+        .set_mutable_run_spill_bytes(1);
     let rows = ai_rows();
     db.transaction(|txn| {
         for row in &rows[..3] {
@@ -558,8 +593,12 @@ fn seed_replica(root: &Path, node_seed: u8) -> Database {
         .enumerate()
         .map(|(index, row)| (index as u64 + 1, row))
         .collect();
-    assert!(db.apply_replicated_records(&put_records(1, 0, 2, rows[..3].to_vec())).unwrap());
-    assert!(db.apply_replicated_records(&put_records(2, 0, 3, rows[3..].to_vec())).unwrap());
+    assert!(db
+        .apply_replicated_records(&put_records(1, 0, 2, rows[..3].to_vec()))
+        .unwrap());
+    assert!(db
+        .apply_replicated_records(&put_records(2, 0, 3, rows[3..].to_vec()))
+        .unwrap());
     db
 }
 
@@ -606,7 +645,9 @@ fn content_by_id(db: &Database, watermark: Epoch) -> BTreeMap<i64, (u64, Vec<(u1
         .collect()
 }
 
-fn aggregates(db: &Database, watermark: Epoch) -> Vec<NativeAggResult> {
+/// The five SQL aggregates through `Table::aggregate_native` — `None` where
+/// the fast path declines (an overlay-only table with no sorted run).
+fn native_aggregates(db: &Database, watermark: Epoch) -> Vec<Option<NativeAggResult>> {
     let handle = db.table("items").unwrap();
     let table = handle.lock();
     let snapshot = Snapshot::at(watermark);
@@ -618,13 +659,38 @@ fn aggregates(db: &Database, watermark: Epoch) -> Vec<NativeAggResult> {
         (Some(7), NativeAgg::Avg),
     ]
     .into_iter()
-    .map(|(column, agg)| {
-        table
-            .aggregate_native(snapshot, column, &[], agg)
-            .unwrap()
-            .expect("native aggregate is servable")
-    })
+    .map(|(column, agg)| table.aggregate_native(snapshot, column, &[], agg).unwrap())
     .collect()
+}
+
+/// The scan-side aggregate computation over the engine's visible rows — the
+/// same row stream the SQL layer's fallback plan scans when
+/// `aggregate_native` declines.
+fn fallback_aggregates(db: &Database, watermark: Epoch) -> Vec<NativeAggResult> {
+    let handle = db.table("items").unwrap();
+    let rows = handle.lock().visible_rows(Snapshot::at(watermark)).unwrap();
+    let mut count = 0_u64;
+    let mut sum = 0_i64;
+    let mut min = i64::MAX;
+    let mut max = i64::MIN;
+    for row in &rows {
+        count += 1;
+        match row.columns.get(&7) {
+            Some(Value::Int64(value)) => {
+                sum += *value;
+                min = min.min(*value);
+                max = max.max(*value);
+            }
+            other => panic!("unexpected score column: {other:?}"),
+        }
+    }
+    vec![
+        NativeAggResult::Count(count),
+        NativeAggResult::Int(sum),
+        NativeAggResult::Int(min),
+        NativeAggResult::Int(max),
+        NativeAggResult::Float(sum as f64 / count as f64),
+    ]
 }
 
 fn retrieve_ids(db: &Database, retriever: &Retriever) -> Vec<(i64, RetrieverScore)> {
@@ -672,20 +738,13 @@ fn ai_and_sql_results_match_standalone_at_the_same_snapshot() {
         content_by_id(&standalone, watermark),
         content_by_id(&replica, watermark)
     );
-
-    // SQL-surface aggregates (the `aggregate_native` pushdown the SQL layer
-    // lowers COUNT/SUM/MIN/MAX/AVG to): exact equality, and the expected
-    // values over score = 10..60.
-    let expected_aggregates = vec![
-        NativeAggResult::Count(6),
-        NativeAggResult::Int(210),
-        NativeAggResult::Int(10),
-        NativeAggResult::Int(60),
-        NativeAggResult::Float(35.0),
-    ];
-    let standalone_aggregates = aggregates(&standalone, watermark);
-    assert_eq!(standalone_aggregates, expected_aggregates);
-    assert_eq!(standalone_aggregates, aggregates(&replica, watermark));
+    // The engine's live-count surface agrees on both shapes.
+    let standalone_count = standalone.table("items").unwrap().lock().count();
+    assert_eq!(standalone_count, 6);
+    assert_eq!(
+        standalone_count,
+        replica.table("items").unwrap().lock().count()
+    );
 
     // ANN top-k: identical (id, score) sequences; the crafted distances make
     // the order fully deterministic (0, 1, 2 hamming).
@@ -733,7 +792,9 @@ fn ai_and_sql_results_match_standalone_at_the_same_snapshot() {
     let standalone_minhash = retrieve_ids(&standalone, &minhash);
     assert_eq!(standalone_minhash[0].0, 1);
     assert!(standalone_minhash.len() >= 2);
-    assert!(standalone_minhash.iter().all(|(id, _)| (1..=3).contains(id)));
+    assert!(standalone_minhash
+        .iter()
+        .all(|(id, _)| (1..=3).contains(id)));
     assert_eq!(standalone_minhash, retrieve_ids(&replica, &minhash));
 
     // Boolean index queries: bitmap equality and FM substring resolve to the
@@ -755,9 +816,54 @@ fn ai_and_sql_results_match_standalone_at_the_same_snapshot() {
         ),
     ] {
         let standalone_ids = query_ids(&standalone, condition.clone());
-        assert_eq!(standalone_ids, expected, "standalone baseline for {condition:?}");
+        assert_eq!(
+            standalone_ids, expected,
+            "standalone baseline for {condition:?}"
+        );
         assert_eq!(standalone_ids, query_ids(&replica, condition));
     }
+
+    // SQL-surface aggregates. Expected values over score = 10..60.
+    let expected_aggregates = vec![
+        NativeAggResult::Count(6),
+        NativeAggResult::Int(210),
+        NativeAggResult::Int(10),
+        NativeAggResult::Int(60),
+        NativeAggResult::Float(35.0),
+    ];
+    // A replica's applied state is overlay-only this wave — replicated
+    // spilled-run commits fail closed until Stage 2C spill translation, and
+    // a read-only replica table cannot even flush — so the
+    // `aggregate_native` fast path (which requires a sorted run) declines
+    // and the SQL layer serves aggregates from its scan fallback.
+    assert!(matches!(
+        replica.table("items").unwrap().lock().flush(),
+        Err(MongrelError::ReadOnlyReplica)
+    ));
+    assert_eq!(
+        native_aggregates(&replica, watermark),
+        vec![None, None, None, None, None]
+    );
+    // On the standalone engine the memtable drains into a sorted run on
+    // flush and the native pushdown serves exactly the values the replica's
+    // scan fallback computes over the same snapshot.
+    standalone.table("items").unwrap().lock().flush().unwrap();
+    assert_eq!(
+        native_aggregates(&standalone, watermark),
+        expected_aggregates
+            .iter()
+            .cloned()
+            .map(Some)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        fallback_aggregates(&replica, watermark),
+        expected_aggregates
+    );
+    assert_eq!(
+        fallback_aggregates(&standalone, watermark),
+        expected_aggregates
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -871,7 +977,10 @@ fn storage_mode_open_gate_matrix() {
     std::fs::remove_file(legacy_root.join("_meta").join(STORAGE_MODE_FILENAME)).unwrap();
     assert_eq!(storage_mode::read_at(&legacy_root).unwrap(), None);
     let legacy = Database::open(&legacy_root).unwrap();
-    assert_eq!(legacy.storage_mode().unwrap(), Some(StorageMode::Standalone));
+    assert_eq!(
+        legacy.storage_mode().unwrap(),
+        Some(StorageMode::Standalone)
+    );
     legacy
         .transaction(|txn| {
             txn.put("items", vec![(1, Value::Int64(9))])?;

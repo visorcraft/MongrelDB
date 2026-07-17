@@ -309,9 +309,9 @@ impl TlsConfig {
         let ca_certs = parse_pem_certificates("ca_cert_pem", ca_cert_pem)?;
         let mut roots = rustls::RootCertStore::empty();
         for cert in ca_certs {
-            roots
-                .add(cert)
-                .map_err(|e| TransportError::Tls(format!("cluster CA certificate rejected: {e}")))?;
+            roots.add(cert).map_err(|e| {
+                TransportError::Tls(format!("cluster CA certificate rejected: {e}"))
+            })?;
         }
         let roots = Arc::new(roots);
         let node_certs = parse_pem_certificates("node_cert_pem", node_cert_pem)?;
@@ -465,7 +465,10 @@ fn verify_peer_identity(
     let identities = der::certificate_identities(leaf.as_ref()).map_err(|e| {
         TransportError::PeerAuthentication(format!("peer certificate identity unreadable: {e}"))
     })?;
-    if identities.iter().any(|identity| tls.allows_identity(identity)) {
+    if identities
+        .iter()
+        .any(|identity| tls.allows_identity(identity))
+    {
         Ok(())
     } else {
         Err(TransportError::PeerAuthentication(format!(
@@ -865,12 +868,24 @@ impl TcpTransport {
         };
         match &mut stream {
             ClientStream::Plain(stream) => {
-                self.round_trip_on(stream, request_type, expected_response_type, payload, timeout)
-                    .await
+                self.round_trip_on(
+                    stream,
+                    request_type,
+                    expected_response_type,
+                    payload,
+                    timeout,
+                )
+                .await
             }
             ClientStream::Tls(stream) => {
-                self.round_trip_on(stream, request_type, expected_response_type, payload, timeout)
-                    .await
+                self.round_trip_on(
+                    stream,
+                    request_type,
+                    expected_response_type,
+                    payload,
+                    timeout,
+                )
+                .await
             }
         }
     }
@@ -929,7 +944,7 @@ impl TcpTransport {
                 )
                 .await
                 {
-                    Ok(Ok(stream)) => Ok(ClientStream::Tls(stream)),
+                    Ok(Ok(stream)) => Ok(ClientStream::Tls(Box::new(stream))),
                     Ok(Err(error)) => Err(TransportError::Tls(format!(
                         "TLS handshake with {} failed: {error}",
                         peer.address
@@ -940,7 +955,10 @@ impl TcpTransport {
         }
     }
 
-    fn encode_payload<T: Serialize>(target: RaftNodeId, rpc: &T) -> Result<Vec<u8>, TransportError> {
+    fn encode_payload<T: Serialize>(
+        target: RaftNodeId,
+        rpc: &T,
+    ) -> Result<Vec<u8>, TransportError> {
         serde_json::to_vec(&RpcPayload { target, rpc })
             .map_err(|e| TransportError::ProtocolViolation(format!("unencodable request: {e}")))
     }
@@ -953,9 +971,9 @@ impl TcpTransport {
                 target,
                 timeout,
             }),
-            error @ (TransportError::NoRoute(_) | TransportError::Io(_) | TransportError::Tls(_)) => {
-                RPCError::Unreachable(Unreachable::new(&error))
-            }
+            error @ (TransportError::NoRoute(_)
+            | TransportError::Io(_)
+            | TransportError::Tls(_)) => RPCError::Unreachable(Unreachable::new(&error)),
             error => RPCError::Network(NetworkError::new(&error)),
         }
     }
@@ -968,9 +986,9 @@ impl TcpTransport {
                 target,
                 timeout,
             }),
-            error @ (TransportError::NoRoute(_) | TransportError::Io(_) | TransportError::Tls(_)) => {
-                RPCError::Unreachable(Unreachable::new(&error))
-            }
+            error @ (TransportError::NoRoute(_)
+            | TransportError::Io(_)
+            | TransportError::Tls(_)) => RPCError::Unreachable(Unreachable::new(&error)),
             error => RPCError::Network(NetworkError::new(&error)),
         }
     }
@@ -987,18 +1005,19 @@ impl TcpTransport {
                 target,
                 timeout,
             }),
-            error @ (TransportError::NoRoute(_) | TransportError::Io(_) | TransportError::Tls(_)) => {
-                RPCError::Unreachable(Unreachable::new(&error))
-            }
+            error @ (TransportError::NoRoute(_)
+            | TransportError::Io(_)
+            | TransportError::Tls(_)) => RPCError::Unreachable(Unreachable::new(&error)),
             error => RPCError::Network(NetworkError::new(&error)),
         }
     }
 }
 
-/// One established client connection.
+/// One established client connection. The TLS variant is boxed: a rustls
+/// connection state dwarfs the plain variant.
 enum ClientStream {
     Plain(TcpStream),
-    Tls(tokio_rustls::client::TlsStream<TcpStream>),
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
 }
 
 impl RaftTransport for TcpTransport {
@@ -1110,16 +1129,14 @@ impl RaftTransport for TcpTransport {
         )
         .await
         .map(|_| ())
-        .map_err(
-            |error| match error {
-                TransportError::NoRoute(node) => {
-                    mongreldb_consensus::network::TransportError::NoRoute(node)
-                }
-                // The consensus error taxonomy has no transport-failure
-                // variant; `Fault` carries the typed message.
-                other => mongreldb_consensus::network::TransportError::Fault(other.to_string()),
-            },
-        )
+        .map_err(|error| match error {
+            TransportError::NoRoute(node) => {
+                mongreldb_consensus::network::TransportError::NoRoute(node)
+            }
+            // The consensus error taxonomy has no transport-failure
+            // variant; `Fault` carries the typed message.
+            other => mongreldb_consensus::network::TransportError::Fault(other.to_string()),
+        })
     }
 }
 
@@ -1300,7 +1317,13 @@ impl TransportServer {
             };
         let (response_type, response_payload) =
             Self::dispatch(registry, frame.message_type, &frame.payload).await;
-        let _ = write_frame(&mut stream, response_type, response_payload, config.rpc_timeout).await;
+        let _ = write_frame(
+            &mut stream,
+            response_type,
+            response_payload,
+            config.rpc_timeout,
+        )
+        .await;
     }
 
     /// Routes one request frame to the attached raft node it targets. Every
@@ -1342,7 +1365,9 @@ impl TransportServer {
             RAFT_MSG_TRIGGER_ELECTION_REQUEST => {
                 let request = serde_json::from_slice::<RpcPayload<()>>(payload);
                 match request {
-                    Err(error) => Self::error_frame(format!("undecodable request payload: {error}")),
+                    Err(error) => {
+                        Self::error_frame(format!("undecodable request payload: {error}"))
+                    }
                     Ok(request) => match registry.get(request.target) {
                         None => Self::error_frame(format!(
                             "node {} is not attached to this transport",
@@ -1350,9 +1375,7 @@ impl TransportServer {
                         )),
                         Some(raft) => match raft.trigger().elect().await {
                             Ok(()) => (RAFT_MSG_TRIGGER_ELECTION_RESPONSE, Vec::new()),
-                            Err(error) => {
-                                Self::error_frame(format!("raft core error: {error}"))
-                            }
+                            Err(error) => Self::error_frame(format!("raft core error: {error}")),
                         },
                     },
                 }
@@ -1390,9 +1413,7 @@ impl TransportServer {
                 Some(raft) => match call(raft, request.rpc).await {
                     Ok(response) => match serde_json::to_vec(&response) {
                         Ok(bytes) => (response_type, bytes),
-                        Err(error) => {
-                            Self::error_frame(format!("unencodable response: {error}"))
-                        }
+                        Err(error) => Self::error_frame(format!("unencodable response: {error}")),
                     },
                     Err(error) => Self::error_frame(format!("raft core error: {error}")),
                 },
@@ -1482,9 +1503,21 @@ mod tests {
     fn tls_config_rejects_unparsable_material() {
         let allowed = vec![node_id(1)];
         for (ca, cert, key) in [
-            ("not pem", fixture("node1.crt.pem").as_str(), fixture("node1.key.pem").as_str()),
-            (fixture("ca.crt.pem").as_str(), "not pem", fixture("node1.key.pem").as_str()),
-            (fixture("ca.crt.pem").as_str(), fixture("node1.crt.pem").as_str(), "not pem"),
+            (
+                "not pem",
+                fixture("node1.crt.pem").as_str(),
+                fixture("node1.key.pem").as_str(),
+            ),
+            (
+                fixture("ca.crt.pem").as_str(),
+                "not pem",
+                fixture("node1.key.pem").as_str(),
+            ),
+            (
+                fixture("ca.crt.pem").as_str(),
+                fixture("node1.crt.pem").as_str(),
+                "not pem",
+            ),
         ] {
             assert!(
                 TlsConfig::from_pems(ca, cert, key, &allowed).is_err(),
@@ -1518,11 +1551,14 @@ mod tests {
 
     fn pem_cert_der(name: &str) -> Vec<u8> {
         let pem = fixture_bytes(name);
-        rustls_pemfile::certs(&mut io::BufReader::new(pem.as_slice()))
+        let mut reader = io::BufReader::new(pem.as_slice());
+        let certificates: Vec<_> = rustls_pemfile::certs(&mut reader)
+            .collect::<Result<_, _>>()
+            .expect("parsable certificate");
+        certificates
+            .into_iter()
             .next()
             .expect("one certificate")
-            .expect("parsable certificate")
-            .into_owned()
             .to_vec()
     }
 
@@ -1661,7 +1697,9 @@ mod tests {
             "unexpected error: {error}"
         );
         // EOF mid-header is truncated too.
-        let error = write_and_read(&bytes[..4], TEST_MAX_FRAME).await.unwrap_err();
+        let error = write_and_read(&bytes[..4], TEST_MAX_FRAME)
+            .await
+            .unwrap_err();
         assert!(
             matches!(error, TransportError::Io(ref e) if e.kind() == io::ErrorKind::UnexpectedEof),
             "unexpected error: {error}"

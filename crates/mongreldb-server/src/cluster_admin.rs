@@ -118,27 +118,32 @@ fn cluster_error_response(error: &ClusterError) -> Response {
 
 /// Resolve the member a drain/remove targets: the explicit `node_id` request
 /// field, else this node's own persisted identity. A standalone node has no
-/// identity to default to, so the operation conflicts.
-fn resolve_target_node(state: &AppState, requested: Option<&str>) -> Result<NodeId, Response> {
+/// identity to default to, so the operation conflicts. The error response is
+/// boxed (same shape as `require_admin`).
+fn resolve_target_node(state: &AppState, requested: Option<&str>) -> Result<NodeId, Box<Response>> {
     match requested {
         Some(text) => text.parse::<NodeId>().map_err(|error| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": format!("invalid node_id `{text}`: {error}") })),
+            Box::new(
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": format!("invalid node_id `{text}`: {error}") })),
+                )
+                    .into_response(),
             )
-                .into_response()
         }),
         None => match NodeIdentity::load(state.db.root()) {
             Ok(Some(identity)) => Ok(identity.node_id),
-            Ok(None) => Err((
-                StatusCode::CONFLICT,
-                Json(json!({
-                    "error": "node is standalone; no cluster identity exists \
-                              (run `mongreldb-server cluster init` or `cluster join` first)",
-                })),
-            )
-                .into_response()),
-            Err(error) => Err(cluster_error_response(&error)),
+            Ok(None) => Err(Box::new(
+                (
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "error": "node is standalone; no cluster identity exists \
+                                  (run `mongreldb-server cluster init` or `cluster join` first)",
+                    })),
+                )
+                    .into_response(),
+            )),
+            Err(error) => Err(Box::new(cluster_error_response(&error))),
         },
     }
 }
@@ -197,7 +202,7 @@ pub(crate) async fn drain(
     let requested = body.and_then(|Json(request)| request.node_id);
     let node_id = match resolve_target_node(&state, requested.as_deref()) {
         Ok(node_id) => node_id,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     state.audit.record(
         owner.clone(),
@@ -253,7 +258,7 @@ pub(crate) async fn remove(
     };
     let node_id = match resolve_target_node(&state, requested.as_deref()) {
         Ok(node_id) => node_id,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     state.audit.record(
         owner.clone(),

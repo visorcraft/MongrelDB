@@ -14,11 +14,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use mongreldb_cluster::network::{
-    node_cert_name, PeerEndpoint, TcpTransport, TransportConfig, TransportError, TransportSecurity,
-    TransportServer, TlsConfig, RAFT_MSG_ERROR,
+    node_cert_name, PeerEndpoint, TcpTransport, TlsConfig, TransportConfig, TransportSecurity,
+    TransportServer, RAFT_MSG_ERROR,
 };
 use mongreldb_consensus::group::{ConsensusGroup, GroupConfig};
 use mongreldb_consensus::identity::{raft_node_id, CommandKind, RaftNodeId};
+use mongreldb_consensus::network::RaftTransport;
 use mongreldb_consensus::state_machine::{ApplySink, InMemoryApplySink};
 use mongreldb_log::commit_log::ExecutionControl;
 use mongreldb_log::envelope::CommandEnvelope;
@@ -141,13 +142,10 @@ impl Cluster {
         let sink = Arc::new(Mutex::new(InMemoryApplySink::new()));
         let dyn_sink: Arc<Mutex<dyn ApplySink>> = sink.clone();
         let dir = self.tmp.path().join(format!("node-{raft_id}"));
-        let group = ConsensusGroup::create(
-            group_config(raft_id, &dir),
-            transport.clone(),
-            dyn_sink,
-        )
-        .await
-        .unwrap();
+        let group =
+            ConsensusGroup::create(group_config(raft_id, &dir), transport.clone(), dyn_sink)
+                .await
+                .unwrap();
         self.identities.insert(raft_id, node_id);
         self.nodes.insert(
             raft_id,
@@ -183,14 +181,23 @@ impl Cluster {
         let members: BTreeMap<RaftNodeId, BasicNode> = self
             .nodes
             .iter()
-            .map(|(raft_id, node)| (*raft_id, BasicNode::new(node.server.local_addr().to_string())))
+            .map(|(raft_id, node)| {
+                (
+                    *raft_id,
+                    BasicNode::new(node.server.local_addr().to_string()),
+                )
+            })
             .collect();
         let first = self.nodes.keys().next().unwrap();
         self.group(first).bootstrap(members).await.unwrap();
     }
 
     fn group(&self, raft_id: &RaftNodeId) -> Arc<ConsensusGroup<TcpTransport>> {
-        self.nodes[raft_id].group.as_ref().expect("node is up").clone()
+        self.nodes[raft_id]
+            .group
+            .as_ref()
+            .expect("node is up")
+            .clone()
     }
 
     /// The current leader as seen from `from`, waiting through elections.
@@ -247,11 +254,7 @@ impl Cluster {
         let mut iter = streams.values();
         let first = iter.next().unwrap();
         for (raft_id, other) in streams.iter().skip(1) {
-            assert_eq!(
-                first,
-                other,
-                "committed streams diverged at node {raft_id}"
-            );
+            assert_eq!(first, other, "committed streams diverged at node {raft_id}");
         }
     }
 
@@ -324,10 +327,10 @@ async fn plaintext_three_node_cluster_survives_one_restart() {
     // Crash node three: the raft task stops without the graceful storage
     // close; its server keeps running with an empty dispatch table.
     let crashed = cluster.nodes.get_mut(&three).unwrap().group.take().unwrap();
-    Arc::try_unwrap(crashed)
-        .expect("the crashed group has no other owners")
-        .crash()
-        .await;
+    match Arc::try_unwrap(crashed) {
+        Ok(group) => group.crash().await,
+        Err(_) => panic!("the crashed group has no other owners"),
+    }
 
     // The remaining quorum keeps electing and committing.
     for seq in 4..=5 {
@@ -399,7 +402,10 @@ async fn mtls_authenticated_client_reaches_dispatch() {
         TransportSecurity::Mtls(node_tls("node2", &[node1()])),
     );
     let target = raft_node_id(&node1());
-    client.upsert_peer(target, PeerEndpoint::mtls(server.local_addr().to_string(), node1()));
+    client.upsert_peer(
+        target,
+        PeerEndpoint::mtls(server.local_addr().to_string(), node1()),
+    );
     let error = client.trigger_election(target).await.unwrap_err();
     assert!(
         matches!(
@@ -440,27 +446,19 @@ async fn mtls_rejects_client_without_certificate() {
     .with_root_certificates(roots)
     .with_no_client_auth();
     let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-    let server_name =
-        rustls::pki_types::ServerName::try_from(node_cert_name(&node1())).unwrap();
+    let server_name = rustls::pki_types::ServerName::try_from(node_cert_name(&node1())).unwrap();
     let tcp = TcpStream::connect(server.local_addr()).await.unwrap();
-    let handshake = tokio::time::timeout(
-        Duration::from_secs(2),
-        connector.connect(server_name, tcp),
-    )
-    .await;
-    match handshake {
-        // TLS 1.3 lets the client finish its flight before the server's
-        // certificate_required alert arrives; the connection must still be
-        // dead at first use.
-        Ok(Ok(mut stream)) => {
-            let mut buf = [0u8; 16];
-            let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await;
-            match read {
-                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => {}
-                Ok(Ok(n)) => panic!("an unauthenticated client read {n} bytes from the server"),
-            }
+    let handshake =
+        tokio::time::timeout(Duration::from_secs(2), connector.connect(server_name, tcp)).await;
+    // TLS 1.3 lets the client finish its flight before the server's
+    // certificate_required alert arrives; the connection must still be dead
+    // at first use. A failed or timed-out handshake is a pass too.
+    if let Ok(Ok(mut stream)) = handshake {
+        let mut buf = [0u8; 16];
+        let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await;
+        if let Ok(Ok(n)) = read {
+            assert_eq!(n, 0, "an unauthenticated client must not read data");
         }
-        Ok(Err(_)) | Err(_) => {}
     }
     server.shutdown().await;
 }
@@ -490,7 +488,10 @@ async fn mtls_rejects_certificate_from_wrong_ca() {
     .unwrap();
     let client = TcpTransport::new(test_transport_config(), TransportSecurity::Mtls(rogue_tls));
     let target = raft_node_id(&node1());
-    client.upsert_peer(target, PeerEndpoint::mtls(server.local_addr().to_string(), node1()));
+    client.upsert_peer(
+        target,
+        PeerEndpoint::mtls(server.local_addr().to_string(), node1()),
+    );
     let error = client.trigger_election(target).await.unwrap_err();
     assert!(
         matches!(
@@ -524,7 +525,10 @@ async fn mtls_rejects_unadmitted_node_identity() {
         TransportSecurity::Mtls(node_tls("node1", &[node3()])),
     );
     let target = raft_node_id(&node3());
-    client.upsert_peer(target, PeerEndpoint::mtls(server.local_addr().to_string(), node3()));
+    client.upsert_peer(
+        target,
+        PeerEndpoint::mtls(server.local_addr().to_string(), node3()),
+    );
     let error = client.trigger_election(target).await.unwrap_err();
     assert!(
         matches!(
@@ -557,7 +561,10 @@ async fn mtls_client_rejects_mismatched_server_identity() {
     );
     // The directory claims this address is node three; it is node one.
     let target = raft_node_id(&node3());
-    client.upsert_peer(target, PeerEndpoint::mtls(server.local_addr().to_string(), node3()));
+    client.upsert_peer(
+        target,
+        PeerEndpoint::mtls(server.local_addr().to_string(), node3()),
+    );
     let error = client.trigger_election(target).await.unwrap_err();
     assert!(
         matches!(
@@ -587,7 +594,9 @@ async fn read_raw_frame(stream: &mut TcpStream) -> io::Result<Option<ProtocolEnv
     frame.extend_from_slice(&header);
     frame.resize(HEADER_LEN + payload_len + CHECKSUM_LEN, 0);
     stream.read_exact(&mut frame[HEADER_LEN..]).await?;
-    Ok(Some(ProtocolEnvelope::decode(&frame).expect("well-formed frame")))
+    Ok(Some(
+        ProtocolEnvelope::decode(&frame).expect("well-formed frame"),
+    ))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

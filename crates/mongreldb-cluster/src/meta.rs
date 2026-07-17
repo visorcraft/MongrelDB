@@ -34,7 +34,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use mongreldb_consensus::error::ConsensusError;
@@ -43,7 +43,7 @@ use mongreldb_consensus::identity::{raft_node_id, CommandKind, RaftNodeId, Repli
 use mongreldb_consensus::network::RaftTransport;
 use mongreldb_consensus::state_machine::{AppliedCommand, ApplySink, StateMachineError};
 use mongreldb_consensus::storage::StorageConfig;
-use mongreldb_log::commit_log::ExecutionControl;
+use mongreldb_log::commit_log::{ExecutionControl, LogPosition};
 use mongreldb_log::envelope::CommandEnvelope;
 use mongreldb_types::hlc::HlcTimestamp;
 use mongreldb_types::ids::{
@@ -533,6 +533,10 @@ pub enum MetaError {
     /// The caller-supplied operating-system CSPRNG failed.
     #[error("operating-system CSPRNG failed: {0}")]
     Rng(String),
+    /// The sink's durable checkpoint failed verification (fails closed, spec
+    /// section 4.10).
+    #[error("corrupt meta state checkpoint: {0}")]
+    CorruptCheckpoint(String),
 }
 
 /// Why a [`MetaCommandRecord`] payload could not be decoded. Decode failures
@@ -1891,14 +1895,48 @@ impl MetaState {
 // MetaApplySink
 // ---------------------------------------------------------------------------
 
+/// Name of the sink's durable checkpoint file inside `<group dir>/raft/state/`.
+pub const META_STATE_CHECKPOINT_FILENAME: &str = "meta-state.json";
+/// Format version of the checkpoint file this build writes.
+pub const META_STATE_CHECKPOINT_FORMAT_VERSION: u32 = 1;
+/// Oldest checkpoint format version this build accepts.
+pub const MIN_SUPPORTED_META_STATE_CHECKPOINT_FORMAT_VERSION: u32 = 1;
+
+/// The sink's durable checkpoint: the applied state plus the log watermark
+/// it reflects. The same record is the sink's snapshot payload, so snapshot
+/// install and restart recovery restore byte-identical state.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MetaStateCheckpoint {
+    /// Checkpoint format version; see [`META_STATE_CHECKPOINT_FORMAT_VERSION`].
+    pub format_version: u32,
+    /// Log position the state reflects (the replay watermark).
+    pub position: LogPosition,
+    /// Last applied command id (informational; the state machine owns the
+    /// idempotent-replay set).
+    pub command_id: Option<[u8; 16]>,
+    /// The applied meta state.
+    pub state: MetaState,
+}
+
 /// The [`ApplySink`] binding the meta group's committed commands to
 /// [`MetaState`] (spec section 12.1).
 ///
-/// Persistence rides the consensus state machine's contract: the state is
-/// rebuilt by log replay after a restart and checkpointed through
-/// [`ApplySink::snapshot`]/[`ApplySink::install`]; the sink keeps no side
-/// files, so its durable view can never diverge from the state machine's
-/// checkpoint.
+/// # Persistence
+///
+/// The sink checkpoints [`MetaStateCheckpoint`] to
+/// `<group dir>/raft/state/meta-state.json` after every dispatched entry
+/// (atomic temp-write + rename + directory fsync, the crate's metadata
+/// idiom). This is required, not decorative: the consensus state machine
+/// persists its apply checkpoint per batch, so after a restart openraft
+/// replays only entries *after* that checkpoint — an in-memory-only sink
+/// would come back empty while the log says it applied everything (the
+/// engine sink's applied database root is its equivalent durable state).
+///
+/// The dispatch order is sink-first, checkpoint-second (see the consensus
+/// state machine docs): a crash in that window can redeliver an entry the
+/// sink already applied and persisted. The checkpoint's `position` is the
+/// durable watermark — redelivered entries at or below it are skipped, so
+/// `metadata_version` and the records never double-apply.
 ///
 /// Apply is deterministic and total. Refused commands are journaled in
 /// state, never returned as state-machine errors; genuine faults fail
@@ -1908,18 +1946,58 @@ impl MetaState {
 /// group.
 pub struct MetaApplySink {
     state: MetaState,
+    position: LogPosition,
+    command_id: Option<[u8; 16]>,
     registry: FeatureRegistry,
+    /// `<group dir>/raft/state`.
+    state_dir: PathBuf,
 }
 
 impl MetaApplySink {
-    /// Creates a sink over fresh state. `registry` is the binary's feature
-    /// registry (identical on every replica of one deployment);
-    /// [`FeatureRegistry::current`] in production.
-    pub fn new(registry: FeatureRegistry) -> Self {
-        MetaApplySink {
-            state: MetaState::default(),
-            registry,
+    /// Opens (creating if needed) the sink under `group_dir`, loading the
+    /// persisted checkpoint when present. A present but undecodable or
+    /// unsupported-version checkpoint fails closed (spec section 4.10).
+    ///
+    /// `registry` is the binary's feature registry (identical on every
+    /// replica of one deployment); [`FeatureRegistry::current`] in
+    /// production.
+    pub fn open(group_dir: &Path, registry: FeatureRegistry) -> Result<Self, MetaError> {
+        let state_dir = group_dir.join("raft").join("state");
+        std::fs::create_dir_all(&state_dir).map_err(MetaError::Io)?;
+        let checkpoint_path = state_dir.join(META_STATE_CHECKPOINT_FILENAME);
+        let Some(bytes) =
+            crate::node::read_meta_file(&checkpoint_path).map_err(|error| match error {
+                crate::node::ClusterError::Io(error) => MetaError::Io(error),
+                other => MetaError::CorruptCheckpoint(other.to_string()),
+            })?
+        else {
+            return Ok(MetaApplySink {
+                state: MetaState::default(),
+                position: LogPosition::ZERO,
+                command_id: None,
+                registry,
+                state_dir,
+            });
+        };
+        let checkpoint: MetaStateCheckpoint = serde_json::from_slice(&bytes)
+            .map_err(|error| MetaError::CorruptCheckpoint(format!("decode: {error}")))?;
+        if checkpoint.format_version < MIN_SUPPORTED_META_STATE_CHECKPOINT_FORMAT_VERSION
+            || checkpoint.format_version > META_STATE_CHECKPOINT_FORMAT_VERSION
+        {
+            return Err(MetaError::CorruptCheckpoint(format!(
+                "unsupported format version {} (supported \
+                 {MIN_SUPPORTED_META_STATE_CHECKPOINT_FORMAT_VERSION}..=\
+                 {META_STATE_CHECKPOINT_FORMAT_VERSION})",
+                checkpoint.format_version
+            )));
         }
+        Ok(MetaApplySink {
+            state: checkpoint.state,
+            position: checkpoint.position,
+            command_id: checkpoint.command_id,
+            registry,
+            state_dir,
+        })
     }
 
     /// The current replicated state.
@@ -1931,10 +2009,37 @@ impl MetaApplySink {
     pub fn metadata_version(&self) -> MetadataVersion {
         self.state.metadata_version
     }
+
+    /// The log position the state reflects (the crash-window replay
+    /// watermark).
+    pub fn applied_position(&self) -> LogPosition {
+        self.position
+    }
+
+    fn checkpoint(&self) -> MetaStateCheckpoint {
+        MetaStateCheckpoint {
+            format_version: META_STATE_CHECKPOINT_FORMAT_VERSION,
+            position: self.position,
+            command_id: self.command_id,
+            state: self.state.clone(),
+        }
+    }
+
+    fn persist(&self) -> Result<(), StateMachineError> {
+        let bytes = serde_json::to_vec(&self.checkpoint())
+            .map_err(|error| StateMachineError::Sink(format!("meta checkpoint encode: {error}")))?;
+        crate::node::write_meta_atomic(&self.state_dir, META_STATE_CHECKPOINT_FILENAME, &bytes)
+            .map_err(|error| StateMachineError::Sink(format!("meta checkpoint write: {error}")))
+    }
 }
 
 impl ApplySink for MetaApplySink {
     fn apply(&mut self, command: &AppliedCommand) -> Result<(), StateMachineError> {
+        // Crash-window replay: the sink persisted this entry (or a later
+        // one) already; skip it so versions and records never double-apply.
+        if command.position.index <= self.position.index {
+            return Ok(());
+        }
         match &command.command {
             ReplicatedCommand::Catalog(catalog) => {
                 catalog.envelope.verify().map_err(|error| {
@@ -1956,41 +2061,59 @@ impl ApplySink for MetaApplySink {
                     commit_ts,
                     &self.registry,
                 );
-                Ok(())
             }
             // Maintenance commands are node-runtime directives and Noop
             // advances the commit index; neither touches meta state.
-            ReplicatedCommand::Maintenance(_) | ReplicatedCommand::Noop => Ok(()),
+            ReplicatedCommand::Maintenance(_) | ReplicatedCommand::Noop => {}
             // The meta group owns control-plane state only (spec section
             // 12.1): a transaction command here is misrouted — fail closed.
-            ReplicatedCommand::Transaction(_) => Err(StateMachineError::Corrupt(
-                "transaction command on the meta group: the meta group owns \
-                 control-plane state only (spec section 12.1)"
-                    .to_owned(),
-            )),
+            ReplicatedCommand::Transaction(_) => {
+                return Err(StateMachineError::Corrupt(
+                    "transaction command on the meta group: the meta group owns \
+                     control-plane state only (spec section 12.1)"
+                        .to_owned(),
+                ));
+            }
         }
+        self.position = command.position;
+        if let Some(command_id) = command.command_id() {
+            self.command_id = Some(command_id);
+        }
+        self.persist()
     }
 
     fn snapshot(&self) -> Result<Vec<u8>, StateMachineError> {
-        serde_json::to_vec(&self.state)
+        serde_json::to_vec(&self.checkpoint())
             .map_err(|error| StateMachineError::Sink(format!("meta snapshot encode: {error}")))
     }
 
     fn install(&mut self, data: &[u8]) -> Result<(), StateMachineError> {
-        let state: MetaState = serde_json::from_slice(data).map_err(|error| {
+        let checkpoint: MetaStateCheckpoint = serde_json::from_slice(data).map_err(|error| {
             StateMachineError::Corrupt(format!("meta snapshot decode: {error}"))
         })?;
-        if state.format_version < MIN_SUPPORTED_META_STATE_FORMAT_VERSION
-            || state.format_version > META_STATE_FORMAT_VERSION
+        if checkpoint.format_version < MIN_SUPPORTED_META_STATE_CHECKPOINT_FORMAT_VERSION
+            || checkpoint.format_version > META_STATE_CHECKPOINT_FORMAT_VERSION
+        {
+            return Err(StateMachineError::Corrupt(format!(
+                "unsupported meta checkpoint format version {} (supported \
+                 {MIN_SUPPORTED_META_STATE_CHECKPOINT_FORMAT_VERSION}..=\
+                 {META_STATE_CHECKPOINT_FORMAT_VERSION})",
+                checkpoint.format_version
+            )));
+        }
+        if checkpoint.state.format_version < MIN_SUPPORTED_META_STATE_FORMAT_VERSION
+            || checkpoint.state.format_version > META_STATE_FORMAT_VERSION
         {
             return Err(StateMachineError::Corrupt(format!(
                 "unsupported meta state format version {} (supported \
                  {MIN_SUPPORTED_META_STATE_FORMAT_VERSION}..={META_STATE_FORMAT_VERSION})",
-                state.format_version
+                checkpoint.state.format_version
             )));
         }
-        self.state = state;
-        Ok(())
+        self.state = checkpoint.state;
+        self.position = checkpoint.position;
+        self.command_id = checkpoint.command_id;
+        self.persist()
     }
 }
 
@@ -2015,10 +2138,11 @@ impl fmt::Debug for MetaApplySink {
 ///   groups/
 ///     <meta-group-id>/
 ///       raft/        log segments, vote, state machine checkpoint + snapshots
+///       raft/state/meta-state.json   the sink's durable MetaState checkpoint
 /// ```
 ///
-/// The applied meta state lives inside the raft snapshot frames; there is no
-/// separate applied-state directory (see [`MetaApplySink`]).
+/// The applied meta state is durable in the sink's checkpoint file (see
+/// [`MetaApplySink`]) and travels inside raft snapshots for catch-up.
 #[derive(Debug, Clone)]
 pub struct MetaGroupConfig {
     /// The node's local data root (`node-data`).
@@ -2143,7 +2267,10 @@ impl<T: RaftTransport> MetaGroup<T> {
                 config.group_dir()
             )));
         }
-        let sink = Arc::new(Mutex::new(MetaApplySink::new(config.registry.clone())));
+        let sink = Arc::new(Mutex::new(MetaApplySink::open(
+            &config.group_dir(),
+            config.registry.clone(),
+        )?));
         let group = ConsensusGroup::create(
             group_config,
             transport,
@@ -2241,10 +2368,13 @@ impl<T: RaftTransport> MetaGroup<T> {
         .await
     }
 
-    /// Removes one member: joint-consensus removal first, then the
-    /// replicated [`MetaCommand::RemoveNode`] (refused while the node still
-    /// hosts replicas). Leadership must be transferred off the node first
-    /// (spec section 11.6); removing the current leader fails closed.
+    /// Removes one member: the replicated [`MetaCommand::RemoveNode`] first
+    /// (validating the node hosts no remaining replicas), then the
+    /// joint-consensus removal. Validate-then-act keeps the two membership
+    /// views from diverging on a refusal, and a retry after a mid-workflow
+    /// failure is idempotent (`RemoveNode` of an absent node is a no-op).
+    /// Leadership must be transferred off the node first (spec section
+    /// 11.6); removing the current leader fails closed.
     pub async fn remove_member(
         &self,
         node_id: NodeId,
@@ -2257,13 +2387,15 @@ impl<T: RaftTransport> MetaGroup<T> {
                 "transfer leadership off the node before removing it".to_owned(),
             ));
         }
+        let receipt = self
+            .propose(
+                new_command_id()?,
+                MetaCommand::RemoveNode { node_id },
+                control,
+            )
+            .await?;
         self.group.remove(raft_id).await?;
-        self.propose(
-            new_command_id()?,
-            MetaCommand::RemoveNode { node_id },
-            control,
-        )
-        .await
+        Ok(receipt)
     }
 
     /// Proposes one meta command (quorum durability; spec section 11.3) and
@@ -2749,7 +2881,15 @@ mod stage3a_tests {
         config
     }
 
+    /// Waits until every group in `among` agrees on one leader **that is one
+    /// of `among`** — a stopped leader's id lingers in the survivors' metrics
+    /// until the next election, so a bare consensus check can otherwise
+    /// return a node outside the live set.
     async fn wait_consensus_leader(among: &[&MetaGroup<InMemoryTransport>]) -> RaftNodeId {
+        let allowed: BTreeSet<RaftNodeId> = among
+            .iter()
+            .map(|group| raft_node_id(&group.node_id()))
+            .collect();
         let deadline = Instant::now() + LEADER_TIMEOUT;
         loop {
             let mut leaders = BTreeSet::new();
@@ -2761,7 +2901,10 @@ mod stage3a_tests {
                 }
             }
             if seen == among.len() && leaders.len() == 1 {
-                return *leaders.iter().next().expect("one leader");
+                let leader = *leaders.iter().next().expect("one leader");
+                if allowed.contains(&leader) {
+                    return leader;
+                }
             }
             assert!(
                 Instant::now() < deadline,
@@ -2969,7 +3112,7 @@ mod stage3a_tests {
             &registry,
             1,
             MetaCommand::RegisterNode {
-                descriptor: descriptor(1, &[]),
+                descriptor: descriptor(1, &["ann-v2"]),
             },
         )
         .unwrap();
@@ -2978,7 +3121,7 @@ mod stage3a_tests {
             &registry,
             2,
             MetaCommand::RegisterNode {
-                descriptor: descriptor(1, &[]),
+                descriptor: descriptor(1, &["ann-v2"]),
             },
         )
         .unwrap();
@@ -3818,8 +3961,8 @@ mod stage3a_tests {
 
     #[test]
     fn sink_rejects_non_meta_payloads_and_transactions() {
-        let registry = FeatureRegistry::current();
-        let mut sink = MetaApplySink::new(registry);
+        let tmp = tempfile::tempdir().unwrap();
+        let mut sink = MetaApplySink::open(tmp.path(), FeatureRegistry::current()).unwrap();
         // A catalog envelope with a foreign command type fails closed.
         let foreign = ReplicatedCommand::new(
             CommandKind::Catalog,
@@ -3847,8 +3990,10 @@ mod stage3a_tests {
 
     #[test]
     fn sink_snapshot_install_preserves_state() {
+        let tmp_a = tempfile::tempdir().unwrap();
+        let tmp_b = tempfile::tempdir().unwrap();
         let registry = registry_with("ann-v2", 7);
-        let mut sink = MetaApplySink::new(registry.clone());
+        let mut sink = MetaApplySink::open(tmp_a.path(), registry.clone()).unwrap();
         for (id, command) in every_command_sequence().into_iter().enumerate() {
             let id = u8::try_from(id + 1).unwrap();
             ApplySink::apply(&mut sink, &applied(id, meta_envelope(id, command))).unwrap();
@@ -3870,20 +4015,85 @@ mod stage3a_tests {
         .unwrap();
         let bytes = sink.snapshot().unwrap();
 
-        let mut restored = MetaApplySink::new(registry);
+        let mut restored = MetaApplySink::open(tmp_b.path(), registry).unwrap();
         restored.install(&bytes).unwrap();
         assert_eq!(restored.state(), sink.state());
         assert_eq!(restored.metadata_version(), sink.metadata_version());
+        assert_eq!(restored.applied_position(), sink.applied_position());
         assert_eq!(restored.state().rejections().len(), 1);
 
         // Corrupt payloads and unsupported versions fail closed.
         assert!(restored.install(b"junk").is_err());
-        let mut future = MetaState::default();
-        future.format_version = META_STATE_FORMAT_VERSION + 1;
-        let future_bytes = serde_json::to_vec(&future).unwrap();
-        assert!(restored.install(&future_bytes).is_err());
+        let mut future = restored.snapshot().unwrap();
+        let mut checkpoint: MetaStateCheckpoint = serde_json::from_slice(&future).unwrap();
+        checkpoint.format_version = META_STATE_CHECKPOINT_FORMAT_VERSION + 1;
+        future = serde_json::to_vec(&checkpoint).unwrap();
+        assert!(restored.install(&future).is_err());
+        let mut checkpoint: MetaStateCheckpoint =
+            serde_json::from_slice(&restored.snapshot().unwrap()).unwrap();
+        checkpoint.state.format_version = META_STATE_FORMAT_VERSION + 1;
+        assert!(restored
+            .install(&serde_json::to_vec(&checkpoint).unwrap())
+            .is_err());
         // The failed installs left the state untouched.
         assert_eq!(restored.state(), sink.state());
+    }
+
+    #[test]
+    fn sink_restart_recovers_from_its_checkpoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = registry_with("ann-v2", 7);
+        let mut sink = MetaApplySink::open(tmp.path(), registry.clone()).unwrap();
+        for (id, command) in every_command_sequence().into_iter().enumerate() {
+            let id = u8::try_from(id + 1).unwrap();
+            ApplySink::apply(&mut sink, &applied(id, meta_envelope(id, command))).unwrap();
+        }
+        let before = sink.state().clone();
+        let position = sink.applied_position();
+        drop(sink);
+
+        // Reopen: the state is recovered from the durable checkpoint without
+        // replaying the log.
+        let mut reopened = MetaApplySink::open(tmp.path(), registry).unwrap();
+        assert_eq!(reopened.state(), &before);
+        assert_eq!(reopened.metadata_version(), MetadataVersion(15));
+        assert_eq!(reopened.applied_position(), position);
+
+        // Crash-window replay: redelivering an entry at or below the
+        // checkpoint watermark is skipped without double-applying.
+        let replay = meta_envelope(
+            15,
+            MetaCommand::DropDatabase {
+                database_id: DatabaseId::from_bytes([0xEE; 16]),
+            },
+        );
+        ApplySink::apply(&mut reopened, &applied(15, replay)).unwrap();
+        assert_eq!(reopened.state(), &before);
+        // A new entry above the watermark applies and checkpoints.
+        let next = meta_envelope(
+            16,
+            MetaCommand::SetClusterSetting {
+                key: "jobs.max_concurrent".to_owned(),
+                value: serde_json::json!(8),
+            },
+        );
+        ApplySink::apply(&mut reopened, &applied(16, next)).unwrap();
+        assert_eq!(reopened.metadata_version(), MetadataVersion(16));
+        assert_eq!(reopened.state().settings().max_concurrent_jobs, 8);
+
+        // A present-but-corrupt checkpoint fails closed.
+        std::fs::write(
+            tmp.path()
+                .join("raft")
+                .join("state")
+                .join(META_STATE_CHECKPOINT_FILENAME),
+            b"junk",
+        )
+        .unwrap();
+        assert!(matches!(
+            MetaApplySink::open(tmp.path(), FeatureRegistry::current()),
+            Err(MetaError::CorruptCheckpoint(_))
+        ));
     }
 
     // -- group integration ----------------------------------------------------
@@ -4038,6 +4248,100 @@ mod stage3a_tests {
         assert_eq!(meta.metadata_version(), MetadataVersion(3));
         assert_eq!(meta.state().rejections().len(), 2);
         meta.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn add_and_remove_member_workflow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transport = Arc::new(InMemoryTransport::new());
+        let meta1 = single_node_group(
+            &tmp.path().join("node-1"),
+            1,
+            FeatureRegistry::current(),
+            transport.clone(),
+        )
+        .await;
+        // Node 2 runs a pristine (never initialized) meta group member.
+        let config2 = meta_config(&tmp.path().join("node-2"), 2, FeatureRegistry::current());
+        let group_config2 = fast_group_config(&config2);
+        let meta2 = MetaGroup::create(config2, group_config2, transport.clone())
+            .await
+            .unwrap();
+        let control = ExecutionControl::default();
+
+        // The bootstrap member registers its descriptor (initial-membership
+        // registration is part of the bootstrap workflow).
+        meta1
+            .propose(
+                cmd_id(1),
+                MetaCommand::RegisterNode {
+                    descriptor: descriptor(1, &[]),
+                },
+                &control,
+            )
+            .await
+            .unwrap();
+
+        // add_member: learner, catch-up, promote, then the descriptor lands
+        // in replicated state.
+        let descriptor2 = descriptor(2, &[]);
+        let receipt = meta1.add_member(&descriptor2, &control).await.unwrap();
+        let (voters, _) = meta1.group().members();
+        assert!(voters.contains(&raft_id(2)));
+        meta2
+            .group()
+            .wait_applied_index(receipt.receipt.position.index, LEADER_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(
+            meta2.state().node(node_id(2)).unwrap().rpc_address,
+            descriptor2.rpc_address
+        );
+
+        // A placement referencing node 2 blocks its removal.
+        meta1
+            .propose(
+                cmd_id(10),
+                MetaCommand::SetReplicaPlacement {
+                    placement: placement(9, &[(2, ReplicaRole::Voter)]),
+                },
+                &control,
+            )
+            .await
+            .unwrap();
+        let error = meta1.remove_member(node_id(2), &control).await.unwrap_err();
+        assert!(matches!(
+            error,
+            MetaError::Rejected(MetaRejectionReason::Conflict { .. })
+        ));
+        let (voters, _) = meta1.group().members();
+        assert!(
+            voters.contains(&raft_id(2)),
+            "a refused removal leaves raft membership untouched"
+        );
+
+        // Move the placement off, then remove: meta state first, raft second.
+        meta1
+            .propose(
+                cmd_id(11),
+                MetaCommand::SetReplicaPlacement {
+                    placement: placement(9, &[(1, ReplicaRole::Voter)]),
+                },
+                &control,
+            )
+            .await
+            .unwrap();
+        meta1.remove_member(node_id(2), &control).await.unwrap();
+        let (voters, _) = meta1.group().members();
+        assert!(!voters.contains(&raft_id(2)));
+        assert!(meta1.state().node(node_id(2)).is_none());
+
+        // Removing the current leader fails closed.
+        let error = meta1.remove_member(node_id(1), &control).await.unwrap_err();
+        assert!(matches!(error, MetaError::InvalidRequest(_)));
+
+        meta2.shutdown().await.unwrap();
+        meta1.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -4239,7 +4543,7 @@ mod stage3a_tests {
             rejoined.metadata_version(),
             groups[&survivors[0]].metadata_version()
         );
-        for (_, group) in groups {
+        for group in groups.values() {
             group.shutdown().await.unwrap();
         }
         rejoined.shutdown().await.unwrap();
