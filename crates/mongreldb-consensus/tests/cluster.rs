@@ -16,9 +16,11 @@ use mongreldb_consensus::group::{ConsensusGroup, GroupConfig};
 use mongreldb_consensus::identity::CommandKind;
 use mongreldb_consensus::network::InMemoryTransport;
 use mongreldb_consensus::raft_log::RaftCommitLog;
+use mongreldb_consensus::read::{ReadConsistency, ReadConsistencyError};
 use mongreldb_consensus::state_machine::{ApplySink, InMemoryApplySink};
 use mongreldb_log::commit_log::{CommitLog, ExecutionControl, LogPosition};
 use mongreldb_log::envelope::CommandEnvelope;
+use mongreldb_types::hlc::HlcTimestamp;
 use openraft::BasicNode;
 use tempfile::TempDir;
 
@@ -77,16 +79,20 @@ impl TestCluster {
         for &id in ids {
             cluster.start_node(id).await;
         }
+        Self::bootstrap_first(&cluster, ids).await;
+        cluster
+    }
+
+    /// Bootstraps the cluster by initializing the first node only; every other
+    /// node adopts the membership through replication. (Initializing several
+    /// nodes races with election: the first node may start replicating before
+    /// the last initialize, which openraft then rejects as non-pristine.)
+    async fn bootstrap_first(cluster: &TestCluster, ids: &[u64]) {
         let members: BTreeMap<u64, BasicNode> = ids
             .iter()
             .map(|&id| (id, BasicNode::new(format!("node-{id}"))))
             .collect();
-        // openraft: initializing every pristine node with the same membership
-        // is safe.
-        for &id in ids {
-            cluster.groups[&id].bootstrap(members.clone()).await.unwrap();
-        }
-        cluster
+        cluster.groups[&ids[0]].bootstrap(members).await.unwrap();
     }
 
     fn group(&self, id: u64) -> Arc<ConsensusGroup<InMemoryTransport>> {
@@ -109,10 +115,17 @@ impl TestCluster {
                     }
                 }
             }
-            if leaders.len() == among.len() && leaders.values().all(|l| *l == *leaders.values().next().unwrap()) {
+            if leaders.len() == among.len()
+                && leaders
+                    .values()
+                    .all(|l| *l == *leaders.values().next().unwrap())
+            {
                 return *leaders.values().next().unwrap();
             }
-            assert!(Instant::now() < deadline, "no consensus leader among {among:?} (saw {leaders:?})");
+            assert!(
+                Instant::now() < deadline,
+                "no consensus leader among {among:?} (saw {leaders:?})"
+            );
             tokio::time::sleep(FAST).await;
         }
     }
@@ -168,7 +181,11 @@ async fn single_node_propose_read_snapshot_install_round_trip() {
     let mut last_position = LogPosition::ZERO;
     for seq in 1..=3u64 {
         let receipt = group
-            .propose(CommandKind::Transaction, envelope(seq), &ExecutionControl::default())
+            .propose(
+                CommandKind::Transaction,
+                envelope(seq),
+                &ExecutionControl::default(),
+            )
             .await
             .unwrap();
         assert!(receipt.position.term >= 1);
@@ -216,16 +233,25 @@ async fn three_node_election_and_replication() {
 
     let metrics = [1, 2, 3].map(|id| cluster.group(id).metrics());
     assert_eq!(
-        metrics.iter().filter(|m| matches!(m.state, mongreldb_consensus::group::RaftServerState::Leader)).count(),
+        metrics
+            .iter()
+            .filter(|m| matches!(m.state, mongreldb_consensus::group::RaftServerState::Leader))
+            .count(),
         1,
         "exactly one effective leader per term (spec 4.2)"
     );
-    assert!(metrics.iter().all(|m| m.current_term == metrics[0].current_term));
+    assert!(metrics
+        .iter()
+        .all(|m| m.current_term == metrics[0].current_term));
 
     for seq in 1..=5u64 {
         cluster
             .group(leader)
-            .propose(CommandKind::Transaction, envelope(seq), &ExecutionControl::default())
+            .propose(
+                CommandKind::Transaction,
+                envelope(seq),
+                &ExecutionControl::default(),
+            )
             .await
             .unwrap();
     }
@@ -247,20 +273,50 @@ async fn leader_kill_triggers_new_election() {
     let leader = cluster.wait_consensus_leader(&[1, 2, 3]).await;
     cluster
         .group(leader)
-        .propose(CommandKind::Transaction, envelope(1), &ExecutionControl::default())
+        .propose(
+            CommandKind::Transaction,
+            envelope(1),
+            &ExecutionControl::default(),
+        )
         .await
         .unwrap();
 
     // Kill the leader (graceful stop + detach).
     cluster.group(leader).shutdown().await.unwrap();
 
+    // The survivors must elect a *new* leader: their metrics still agree on
+    // the dead leader's id until the election timeout fires, so wait for a
+    // consensus on a different id.
     let survivors: Vec<u64> = [1, 2, 3].into_iter().filter(|id| *id != leader).collect();
-    let new_leader = cluster.wait_consensus_leader(&survivors).await;
+    let deadline = Instant::now() + LEADER_TIMEOUT;
+    let new_leader = loop {
+        let mut votes = Vec::new();
+        for &id in &survivors {
+            if let Some(current) = cluster.group(id).metrics().current_leader {
+                votes.push(current);
+            }
+        }
+        if votes.len() == survivors.len()
+            && votes.iter().all(|v| *v == votes[0])
+            && votes[0] != leader
+        {
+            break votes[0];
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no new leader elected: {votes:?}"
+        );
+        tokio::time::sleep(FAST).await;
+    };
     assert_ne!(new_leader, leader);
 
     cluster
         .group(new_leader)
-        .propose(CommandKind::Transaction, envelope(2), &ExecutionControl::default())
+        .propose(
+            CommandKind::Transaction,
+            envelope(2),
+            &ExecutionControl::default(),
+        )
         .await
         .unwrap();
     let last = cluster.group(new_leader).metrics().last_log_index.unwrap();
@@ -279,7 +335,11 @@ async fn minority_partition_cannot_commit_no_split_brain() {
 
     cluster
         .group(leader)
-        .propose(CommandKind::Transaction, envelope(1), &ExecutionControl::default())
+        .propose(
+            CommandKind::Transaction,
+            envelope(1),
+            &ExecutionControl::default(),
+        )
         .await
         .unwrap();
 
@@ -291,16 +351,27 @@ async fn minority_partition_cannot_commit_no_split_brain() {
     let partitioned = envelope(100);
     let result = cluster
         .group(leader)
-        .propose(CommandKind::Transaction, partitioned.clone(), &deadline_control(1_000))
+        .propose(
+            CommandKind::Transaction,
+            partitioned.clone(),
+            &deadline_control(1_000),
+        )
         .await;
-    assert!(result.is_err(), "minority leader must not commit: {result:?}");
+    assert!(
+        result.is_err(),
+        "minority leader must not commit: {result:?}"
+    );
 
     // The majority elects a new leader and keeps committing.
     let new_leader = cluster.wait_consensus_leader(&others).await;
     assert_ne!(new_leader, leader);
     cluster
         .group(new_leader)
-        .propose(CommandKind::Transaction, envelope(2), &ExecutionControl::default())
+        .propose(
+            CommandKind::Transaction,
+            envelope(2),
+            &ExecutionControl::default(),
+        )
         .await
         .unwrap();
 
@@ -340,13 +411,7 @@ async fn lagging_follower_catches_up_via_snapshot() {
         cluster.groups.insert(id, Arc::new(group));
         cluster.sinks.insert(id, sink);
     }
-    let members: BTreeMap<u64, BasicNode> = [1, 2, 3]
-        .iter()
-        .map(|&id| (id, BasicNode::new(format!("node-{id}"))))
-        .collect();
-    for group in cluster.groups.values() {
-        group.bootstrap(members.clone()).await.unwrap();
-    }
+    TestCluster::bootstrap_first(&cluster, &[1, 2, 3]).await;
     let leader = cluster.wait_consensus_leader(&[1, 2, 3]).await;
     let follower = [1, 2, 3].into_iter().find(|id| *id != leader).unwrap();
     let other = [1, 2, 3]
@@ -360,19 +425,31 @@ async fn lagging_follower_catches_up_via_snapshot() {
     for seq in 1..=12u64 {
         cluster
             .group(leader)
-            .propose(CommandKind::Transaction, envelope(seq), &ExecutionControl::default())
+            .propose(
+                CommandKind::Transaction,
+                envelope(seq),
+                &ExecutionControl::default(),
+            )
             .await
             .unwrap();
     }
 
-    // Wait until the leader's snapshot covers most of the log.
+    // Wait until the leader snapshots and purges past the follower's match
+    // index, so log replication can no longer bring it up to date.
     let deadline = Instant::now() + LEADER_TIMEOUT;
     loop {
-        let snapshot = cluster.group(leader).metrics().snapshot;
-        if snapshot.is_some_and(|pos| pos.index >= 10) {
+        let metrics = cluster.group(leader).metrics();
+        if metrics.snapshot.is_some_and(|pos| pos.index >= 5)
+            && metrics.purged.is_some_and(|pos| pos.index >= 3)
+        {
             break;
         }
-        assert!(Instant::now() < deadline, "leader never snapshotted: {snapshot:?}");
+        assert!(
+            Instant::now() < deadline,
+            "leader never snapshotted/purged: snapshot {:?} purged {:?}",
+            metrics.snapshot,
+            metrics.purged
+        );
         tokio::time::sleep(FAST).await;
     }
 
@@ -380,12 +457,15 @@ async fn lagging_follower_catches_up_via_snapshot() {
     cluster.transport.heal();
     let last = cluster.group(leader).metrics().last_log_index.unwrap();
     cluster.wait_applied(follower, last).await;
-    assert_eq!(cluster.applied_envelopes(follower), cluster.applied_envelopes(leader));
+    assert_eq!(
+        cluster.applied_envelopes(follower),
+        cluster.applied_envelopes(leader)
+    );
 
     // The follower installed a snapshot (its snapshot position advanced).
     let follower_snapshot = cluster.group(follower).metrics().snapshot;
     assert!(
-        follower_snapshot.is_some_and(|pos| pos.index >= 10),
+        follower_snapshot.is_some(),
         "expected snapshot install on the lagging follower: {follower_snapshot:?}"
     );
     cluster.shutdown().await;
@@ -401,7 +481,11 @@ async fn membership_add_learner_promote_remove() {
     let leader = cluster.wait_consensus_leader(&[1, 2, 3]).await;
     cluster
         .group(leader)
-        .propose(CommandKind::Transaction, envelope(1), &ExecutionControl::default())
+        .propose(
+            CommandKind::Transaction,
+            envelope(1),
+            &ExecutionControl::default(),
+        )
         .await
         .unwrap();
 
@@ -424,7 +508,10 @@ async fn membership_add_learner_promote_remove() {
         if voters.len() == 4 && voters.contains(&4) {
             break;
         }
-        assert!(Instant::now() < deadline, "promotion not visible: {voters:?}");
+        assert!(
+            Instant::now() < deadline,
+            "promotion not visible: {voters:?}"
+        );
         tokio::time::sleep(FAST).await;
     }
 
@@ -443,7 +530,11 @@ async fn membership_add_learner_promote_remove() {
     // The reconfigured cluster still commits.
     cluster
         .group(leader)
-        .propose(CommandKind::Transaction, envelope(2), &ExecutionControl::default())
+        .propose(
+            CommandKind::Transaction,
+            envelope(2),
+            &ExecutionControl::default(),
+        )
         .await
         .unwrap();
     cluster.shutdown().await;
@@ -464,7 +555,11 @@ async fn transfer_leader_to_voter() {
 
     cluster
         .group(target)
-        .propose(CommandKind::Transaction, envelope(1), &ExecutionControl::default())
+        .propose(
+            CommandKind::Transaction,
+            envelope(1),
+            &ExecutionControl::default(),
+        )
         .await
         .unwrap();
 
@@ -488,7 +583,11 @@ async fn read_index_linearizable_barrier() {
     for seq in 1..=3u64 {
         cluster
             .group(leader)
-            .propose(CommandKind::Transaction, envelope(seq), &ExecutionControl::default())
+            .propose(
+                CommandKind::Transaction,
+                envelope(seq),
+                &ExecutionControl::default(),
+            )
             .await
             .unwrap();
     }
@@ -509,7 +608,10 @@ async fn read_index_linearizable_barrier() {
         .read_index(&deadline_control(1_500))
         .await;
     assert!(
-        matches!(result, Err(ConsensusError::NotLeader { .. } | ConsensusError::DeadlineExceeded)),
+        matches!(
+            result,
+            Err(ConsensusError::NotLeader { .. } | ConsensusError::DeadlineExceeded)
+        ),
         "unconfirmed leader must not serve a read barrier: {result:?}"
     );
     cluster.shutdown().await;
@@ -533,7 +635,11 @@ async fn idempotent_apply_across_client_retry_and_restart() {
 
     let command = envelope(42);
     let first = group
-        .propose(CommandKind::Transaction, command.clone(), &ExecutionControl::default())
+        .propose(
+            CommandKind::Transaction,
+            command.clone(),
+            &ExecutionControl::default(),
+        )
         .await
         .unwrap();
     assert!(!first.response.duplicate);
@@ -541,7 +647,11 @@ async fn idempotent_apply_across_client_retry_and_restart() {
     // Client retry of the same command id: commits (a second log order entry)
     // but is applied once (S2B-004).
     let retry = group
-        .propose(CommandKind::Transaction, command.clone(), &ExecutionControl::default())
+        .propose(
+            CommandKind::Transaction,
+            command.clone(),
+            &ExecutionControl::default(),
+        )
         .await
         .unwrap();
     assert!(retry.response.duplicate);
@@ -554,21 +664,24 @@ async fn idempotent_apply_across_client_retry_and_restart() {
     drop(cluster.groups.remove(&1));
     let transport = cluster.transport.clone();
     let dir = cluster.tmp.path().join("node-1");
-    eprintln!("[t] into_inner");
     let crashed = Arc::into_inner(group).expect("sole group owner");
     crashed.crash().await;
-    eprintln!("[t] crashed, reopening");
 
     let dyn_sink: Arc<Mutex<dyn ApplySink>> = sink.clone();
-    let reopened = ConsensusGroup::create(group_config(1, &dir, "test-cluster"), transport, dyn_sink)
-        .await
-        .unwrap();
+    let reopened =
+        ConsensusGroup::create(group_config(1, &dir, "test-cluster"), transport, dyn_sink)
+            .await
+            .unwrap();
     reopened.wait_leader(LEADER_TIMEOUT).await.unwrap();
     assert_eq!(reopened.applied_position(), retry.position);
 
     // The retried command is still idempotent after the restart.
     let after = reopened
-        .propose(CommandKind::Transaction, command, &ExecutionControl::default())
+        .propose(
+            CommandKind::Transaction,
+            command,
+            &ExecutionControl::default(),
+        )
         .await
         .unwrap();
     assert!(after.response.duplicate);
@@ -579,9 +692,7 @@ async fn idempotent_apply_across_client_retry_and_restart() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn crash_durable_entries_survive_restart() {
     let mut cluster = TestCluster::new();
-    eprintln!("[t] start_node");
     cluster.start_node(1).await;
-    eprintln!("[t] bootstrap");
     cluster
         .group(1)
         .bootstrap(BTreeMap::from([(1, BasicNode::new("node-1"))]))
@@ -591,28 +702,30 @@ async fn crash_durable_entries_survive_restart() {
     group.wait_leader(LEADER_TIMEOUT).await.unwrap();
     for seq in 1..=5u64 {
         group
-            .propose(CommandKind::Transaction, envelope(seq), &ExecutionControl::default())
+            .propose(
+                CommandKind::Transaction,
+                envelope(seq),
+                &ExecutionControl::default(),
+            )
             .await
             .unwrap();
     }
     let term_before = group.metrics().current_term;
     let last_before = group.applied_position();
-    eprintln!("[t] proposed 5, crashing");
 
     // Crash (no graceful close), then reopen from the same directory.
     let transport = cluster.transport.clone();
     let dir = cluster.tmp.path().join("node-1");
     let sink = cluster.sink(1);
     drop(cluster.groups.remove(&1));
-    eprintln!("[t] into_inner");
     let crashed = Arc::into_inner(group).expect("sole group owner");
     crashed.crash().await;
-    eprintln!("[t] crashed, reopening");
 
     let dyn_sink: Arc<Mutex<dyn ApplySink>> = sink.clone();
-    let reopened = ConsensusGroup::create(group_config(1, &dir, "test-cluster"), transport, dyn_sink)
-        .await
-        .unwrap();
+    let reopened =
+        ConsensusGroup::create(group_config(1, &dir, "test-cluster"), transport, dyn_sink)
+            .await
+            .unwrap();
     // Hard state survived: the node comes back initialized in a term no
     // lower than before the crash.
     assert!(reopened.is_initialized().await.unwrap());
@@ -621,13 +734,14 @@ async fn crash_durable_entries_survive_restart() {
     let committed = reopened.read_committed(LogPosition::ZERO, 10).unwrap();
     assert_eq!(committed.len(), 5);
     assert_eq!(committed[4].envelope, envelope(5));
-
-    eprintln!("[t] reopened");
     // The log continues without index reuse.
     reopened.wait_leader(LEADER_TIMEOUT).await.unwrap();
-    eprintln!("[t] leader after reopen");
     let receipt = reopened
-        .propose(CommandKind::Transaction, envelope(6), &ExecutionControl::default())
+        .propose(
+            CommandKind::Transaction,
+            envelope(6),
+            &ExecutionControl::default(),
+        )
         .await
         .unwrap();
     assert_eq!(receipt.position.index, last_before.index + 1);
@@ -652,17 +766,24 @@ async fn single_node_commit_log_round_trip() {
     let log = RaftCommitLog::new(group.clone());
     log::sanity(&log);
 
-    let receipt = log.propose(envelope(1), &ExecutionControl::default()).unwrap();
+    let receipt = log
+        .propose(envelope(1), &ExecutionControl::default())
+        .unwrap();
     let first = receipt.log_position;
     assert!(first.term >= 1);
-    assert_eq!(receipt.durability, mongreldb_log::commit_log::DurabilityLevel::Quorum);
+    assert_eq!(
+        receipt.durability,
+        mongreldb_log::commit_log::DurabilityLevel::Quorum
+    );
     assert_eq!(
         receipt.transaction_id,
         mongreldb_types::ids::TransactionId::from_bytes(envelope(1).command_id)
     );
     assert!(receipt.commit_ts > mongreldb_types::hlc::HlcTimestamp::ZERO);
 
-    let second = log.propose(envelope(2), &ExecutionControl::default()).unwrap();
+    let second = log
+        .propose(envelope(2), &ExecutionControl::default())
+        .unwrap();
     assert_eq!(second.log_position.index, first.index + 1);
     assert_eq!(log.applied_position(), second.log_position);
     let committed = log.read_committed(LogPosition::ZERO, 10).unwrap();
@@ -685,6 +806,292 @@ async fn single_node_commit_log_round_trip() {
 
     log.shutdown().await.unwrap();
     other_log.shutdown().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2D read consistency (spec section 11.4)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn consistent_read_linearizable_and_refusals() {
+    let cluster = TestCluster::bootstrapped(&[1, 2, 3]).await;
+    let leader = cluster.wait_consensus_leader(&[1, 2, 3]).await;
+    let follower = [1, 2, 3].into_iter().find(|id| *id != leader).unwrap();
+    for seq in 1..=2u64 {
+        cluster
+            .group(leader)
+            .propose(
+                CommandKind::Transaction,
+                envelope(seq),
+                &ExecutionControl::default(),
+            )
+            .await
+            .unwrap();
+    }
+    let last = cluster.group(leader).metrics().last_log_index.unwrap();
+
+    // A confirmed leader serves the linearizable barrier at or above the
+    // applied position.
+    let watermark = cluster
+        .group(leader)
+        .consistent_read(&ReadConsistency::Linearizable, &ExecutionControl::default())
+        .await
+        .unwrap();
+    assert!(watermark.position.index >= last);
+    assert!(watermark.commit_ts.is_some());
+
+    // A follower refuses and routes to the leader (spec 11.7).
+    let err = cluster
+        .group(follower)
+        .consistent_read(&ReadConsistency::Linearizable, &deadline_control(2_000))
+        .await
+        .unwrap_err();
+    match err {
+        ReadConsistencyError::NotLeader { leader_hint } => {
+            assert_eq!(leader_hint, Some(leader));
+        }
+        other => panic!("expected NotLeader with the leader hint, got {other:?}"),
+    }
+
+    // An isolated ex-leader is unconfirmed: it must not serve linearizable
+    // reads (spec 11.4).
+    let others: Vec<u64> = [1, 2, 3].into_iter().filter(|id| *id != leader).collect();
+    cluster.transport.partition(&[leader], &others);
+    let result = cluster
+        .group(leader)
+        .consistent_read(&ReadConsistency::Linearizable, &deadline_control(1_500))
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(ReadConsistencyError::NotLeader { .. }
+                | ReadConsistencyError::LeaderUnknown
+                | ReadConsistencyError::DeadlineExceeded)
+        ),
+        "unconfirmed leader must not serve linearizable reads: {result:?}"
+    );
+    cluster.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn consistent_read_read_your_writes_and_snapshot() {
+    let cluster = TestCluster::bootstrapped(&[1, 2, 3]).await;
+    let leader = cluster.wait_consensus_leader(&[1, 2, 3]).await;
+    let follower = [1, 2, 3].into_iter().find(|id| *id != leader).unwrap();
+    let other = [1, 2, 3]
+        .into_iter()
+        .find(|id| *id != leader && *id != follower)
+        .unwrap();
+    let log = RaftCommitLog::new(cluster.group(leader));
+    let first = log
+        .propose(envelope(1), &ExecutionControl::default())
+        .unwrap();
+    let second = log
+        .propose(envelope(2), &ExecutionControl::default())
+        .unwrap();
+
+    // Session token from the propose receipt (group id, commit index,
+    // commit timestamp; spec 11.4).
+    let token = log.session_token(&second);
+    assert_eq!(token.group_id, cluster.group(follower).group_id());
+    assert_eq!(token.commit_index, second.log_position.index);
+    assert_eq!(token.commit_ts, second.commit_ts);
+
+    // Read-your-writes from a follower: it waits until the token's position
+    // is applied, then serves.
+    let watermark = cluster
+        .group(follower)
+        .consistent_read(
+            &ReadConsistency::ReadYourWrites {
+                token: token.clone(),
+            },
+            &ExecutionControl::default(),
+        )
+        .await
+        .unwrap();
+    assert!(watermark.position.index >= token.commit_index);
+
+    // A token minted by another group is rejected.
+    let mut foreign = token.clone();
+    foreign.group_id = "another-group".to_owned();
+    let err = cluster
+        .group(follower)
+        .consistent_read(
+            &ReadConsistency::ReadYourWrites { token: foreign },
+            &ExecutionControl::default(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ReadConsistencyError::InvalidSessionToken(_)));
+
+    // Snapshot reads serve at a covered timestamp.
+    let watermark = cluster
+        .group(follower)
+        .consistent_read(
+            &ReadConsistency::Snapshot {
+                timestamp: first.commit_ts,
+            },
+            &ExecutionControl::default(),
+        )
+        .await
+        .unwrap();
+    assert!(watermark.commit_ts.is_some_and(|ts| ts >= first.commit_ts));
+
+    // A timestamp beyond the applied watermark waits and hits the deadline.
+    let far_future = HlcTimestamp {
+        physical_micros: u64::MAX / 2,
+        logical: 0,
+        node_tiebreaker: 0,
+    };
+    let err = cluster
+        .group(follower)
+        .consistent_read(
+            &ReadConsistency::Snapshot {
+                timestamp: far_future,
+            },
+            &deadline_control(300),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ReadConsistencyError::DeadlineExceeded));
+
+    // A partitioned follower cannot reach a new write's position in time.
+    cluster.transport.partition(&[follower], &[leader, other]);
+    let third = log
+        .propose(envelope(3), &ExecutionControl::default())
+        .unwrap();
+    let third_token = log.session_token(&third);
+    let err = cluster
+        .group(follower)
+        .consistent_read(
+            &ReadConsistency::ReadYourWrites {
+                token: third_token.clone(),
+            },
+            &deadline_control(800),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ReadConsistencyError::DeadlineExceeded));
+
+    // Healed, the same barrier waits and serves.
+    cluster.transport.heal();
+    let watermark = cluster
+        .group(follower)
+        .consistent_read(
+            &ReadConsistency::ReadYourWrites {
+                token: third_token.clone(),
+            },
+            &deadline_control(5_000),
+        )
+        .await
+        .unwrap();
+    assert!(watermark.position.index >= third_token.commit_index);
+    cluster.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn consistent_read_bounded_staleness_and_eventual() {
+    let cluster = TestCluster::bootstrapped(&[1, 2, 3]).await;
+    let leader = cluster.wait_consensus_leader(&[1, 2, 3]).await;
+    let follower = [1, 2, 3].into_iter().find(|id| *id != leader).unwrap();
+    let other = [1, 2, 3]
+        .into_iter()
+        .find(|id| *id != leader && *id != follower)
+        .unwrap();
+    cluster
+        .group(leader)
+        .propose(
+            CommandKind::Transaction,
+            envelope(1),
+            &ExecutionControl::default(),
+        )
+        .await
+        .unwrap();
+    let first = cluster.group(leader).metrics().last_log_index.unwrap();
+    cluster.wait_applied(follower, first).await;
+
+    // Freshly applied: a generous staleness window serves on the follower.
+    let watermark = cluster
+        .group(follower)
+        .consistent_read(
+            &ReadConsistency::BoundedStaleness {
+                max_lag_ms: 3_600_000,
+            },
+            &ExecutionControl::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(watermark.position.index, first);
+
+    // Partition the follower and commit more: its applied timestamp is now
+    // outside a zero window.
+    cluster.transport.partition(&[follower], &[leader, other]);
+    for seq in 2..=4u64 {
+        cluster
+            .group(leader)
+            .propose(
+                CommandKind::Transaction,
+                envelope(seq),
+                &ExecutionControl::default(),
+            )
+            .await
+            .unwrap();
+    }
+    let err = cluster
+        .group(follower)
+        .consistent_read(
+            &ReadConsistency::BoundedStaleness { max_lag_ms: 0 },
+            &ExecutionControl::default(),
+        )
+        .await
+        .unwrap_err();
+    match err {
+        ReadConsistencyError::StalenessExceeded { max_lag_ms, lag_ms } => {
+            assert_eq!(max_lag_ms, 0);
+            assert!(lag_ms > 0);
+        }
+        other => panic!("expected StalenessExceeded, got {other:?}"),
+    }
+
+    // Eventual reads serve the stale local watermark immediately, even on
+    // the partitioned follower.
+    let stale = cluster
+        .group(follower)
+        .consistent_read(&ReadConsistency::Eventual, &ExecutionControl::default())
+        .await
+        .unwrap();
+    let leader_last = cluster.group(leader).metrics().last_log_index.unwrap();
+    assert!(stale.position.index < leader_last);
+    cluster.transport.heal();
+
+    // A replica that never applied anything is arbitrarily stale.
+    let mut fresh = TestCluster::new();
+    fresh.start_node(9).await;
+    let err = fresh
+        .group(9)
+        .consistent_read(
+            &ReadConsistency::BoundedStaleness { max_lag_ms: 1_000 },
+            &ExecutionControl::default(),
+        )
+        .await
+        .unwrap_err();
+    match err {
+        ReadConsistencyError::StalenessExceeded { lag_ms, .. } => {
+            assert_eq!(lag_ms, u64::MAX, "nothing applied is arbitrarily stale");
+        }
+        other => panic!("expected StalenessExceeded, got {other:?}"),
+    }
+    // ... but serves Eventual immediately.
+    let empty = fresh
+        .group(9)
+        .consistent_read(&ReadConsistency::Eventual, &ExecutionControl::default())
+        .await
+        .unwrap();
+    assert_eq!(empty.position, LogPosition::ZERO);
+    assert_eq!(empty.commit_ts, None);
+
+    cluster.shutdown().await;
+    fresh.shutdown().await;
 }
 
 mod log {

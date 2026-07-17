@@ -15,6 +15,7 @@ pub mod be_tree;
 pub mod cache;
 pub mod catalog;
 pub mod catalog_cmds;
+pub mod cluster_import;
 pub mod columnar;
 pub mod commit_log;
 pub mod compaction;
@@ -45,6 +46,7 @@ pub mod pitr;
 pub mod pma;
 pub mod procedure;
 pub mod query;
+pub mod replicated_apply;
 pub mod replication;
 pub mod reservoir;
 pub mod resource;
@@ -55,6 +57,7 @@ pub mod schema;
 pub mod security;
 pub mod sorted_run;
 pub mod spill;
+pub mod storage_mode;
 pub mod trace;
 pub mod trigger;
 pub mod tsv;
@@ -76,6 +79,9 @@ pub use catalog::{
     MaterializedViewEntry,
 };
 pub use catalog_cmds::{required_permission, CatalogCommand, CatalogCommandRecord, CatalogDelta};
+pub use cluster_import::{
+    cluster_import_prepare, hash_rows_canonical, ImportPlan, ImportTablePlan,
+};
 pub use columnar::{decode_column, encode_column};
 pub use cursor::{drain_cursor_to_columns, Cursor, MultiRunCursor, NativePageCursor};
 pub use database::{
@@ -144,6 +150,11 @@ pub fn build_info() -> BuildInfo {
     }
 }
 pub use query::{Condition, Query};
+pub use replicated_apply::{
+    EngineSnapshot, EngineSnapshotFile, EngineSnapshotTable, ReplicatedTxnPayload,
+    COMMAND_TYPE_CATALOG_COMMAND, COMMAND_TYPE_MAINTENANCE, ENGINE_SNAPSHOT_FORMAT_VERSION,
+    REPLICATED_TXN_FORMAT_VERSION,
+};
 pub use replication::{
     is_replica, replica_epoch, replica_source_id, write_replica_epoch, ReplicationBatch,
     ReplicationSnapshot,
@@ -169,6 +180,7 @@ pub use spill::{
     SpillConfig, SpillError, SpillHandle, SpillManager, SpillReader, SpillSession, SpillStats,
     SpillWriter,
 };
+pub use storage_mode::{StorageMode, StorageModeError, STORAGE_MODE_FILENAME};
 pub use trace::{IndexRebuild, QueryTrace, ScanMode};
 pub use trigger::{
     StoredTrigger, TriggerCell, TriggerCondition, TriggerConfig, TriggerDefinition, TriggerEntry,

@@ -19,8 +19,8 @@ const REPLICATION_ID_LEN: usize = 32;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ReplicationFile {
-    path: PathBuf,
-    data: Vec<u8>,
+    pub(crate) path: PathBuf,
+    pub(crate) data: Vec<u8>,
 }
 
 impl ReplicationFile {
@@ -785,7 +785,7 @@ fn write_meta_u64(root: &Path, name: &str, value: u64, label: &str) -> Result<()
     Ok(())
 }
 
-fn validate_relative_path(path: &Path) -> Result<()> {
+pub(crate) fn validate_relative_path(path: &Path) -> Result<()> {
     if path.as_os_str().is_empty()
         || path
             .components()
@@ -809,7 +809,7 @@ fn write_new_synced(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn remove_directory(path: &Path) -> io::Result<()> {
+pub(crate) fn remove_directory(path: &Path) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::remove_dir_all(path)?;
     crate::durable_file::sync_directory(parent)
@@ -822,12 +822,15 @@ fn remove_file(path: &Path) -> io::Result<()> {
 }
 
 #[derive(Debug)]
-struct RenameFailure {
-    error: io::Error,
-    published: bool,
+pub(crate) struct RenameFailure {
+    pub(crate) error: io::Error,
+    pub(crate) published: bool,
 }
 
-fn rename_entry(source: &Path, destination: &Path) -> std::result::Result<(), RenameFailure> {
+pub(crate) fn rename_entry(
+    source: &Path,
+    destination: &Path,
+) -> std::result::Result<(), RenameFailure> {
     let published = Cell::new(false);
     match crate::durable_file::rename_with_after(source, destination, || published.set(true)) {
         Ok(()) => Ok(()),
@@ -858,7 +861,11 @@ fn sync_rename_directories(source: &Path, destination: &Path) -> io::Result<()> 
     Ok(())
 }
 
-fn uncertain_install_error(epoch: u64, error: &io::Error, rollback: &io::Error) -> MongrelError {
+pub(crate) fn uncertain_install_error(
+    epoch: u64,
+    error: &io::Error,
+    rollback: &io::Error,
+) -> MongrelError {
     MongrelError::Other(format!(
         "replication snapshot install outcome at epoch {epoch} is unknown: {error}; rollback failed: {rollback}"
     ))

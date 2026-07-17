@@ -100,9 +100,18 @@ impl ReplicatedCommand {
     /// with `commit_ts`.
     pub fn new(kind: CommandKind, envelope: CommandEnvelope, commit_ts: HlcTimestamp) -> Self {
         match kind {
-            CommandKind::Transaction => Self::Transaction(TransactionCommand { envelope, commit_ts }),
-            CommandKind::Catalog => Self::Catalog(CatalogCommand { envelope, commit_ts }),
-            CommandKind::Maintenance => Self::Maintenance(MaintenanceCommand { envelope, commit_ts }),
+            CommandKind::Transaction => Self::Transaction(TransactionCommand {
+                envelope,
+                commit_ts,
+            }),
+            CommandKind::Catalog => Self::Catalog(CatalogCommand {
+                envelope,
+                commit_ts,
+            }),
+            CommandKind::Maintenance => Self::Maintenance(MaintenanceCommand {
+                envelope,
+                commit_ts,
+            }),
         }
     }
 
@@ -206,10 +215,11 @@ mod tests {
 
     #[test]
     fn raft_node_id_projection_is_deterministic() {
-        let id = NodeId::from_bytes([
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
-        ]);
-        assert_eq!(raft_node_id(&id), u64::from_le_bytes([1, 2, 3, 4, 5, 6, 7, 8]));
+        let id = NodeId::from_bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+        assert_eq!(
+            raft_node_id(&id),
+            u64::from_le_bytes([1, 2, 3, 4, 5, 6, 7, 8])
+        );
         assert_eq!(raft_node_id(&id), raft_node_id(&id));
         assert_ne!(raft_node_id(&NodeId::ZERO), raft_node_id(&id));
     }
@@ -248,7 +258,10 @@ mod tests {
             },
         );
         let bytes = bincode::serialize(&command).unwrap();
-        assert_eq!(bincode::deserialize::<ReplicatedCommand>(&bytes).unwrap(), command);
+        assert_eq!(
+            bincode::deserialize::<ReplicatedCommand>(&bytes).unwrap(),
+            command
+        );
         let json = serde_json::to_string(&command).unwrap();
         assert_eq!(
             serde_json::from_str::<ReplicatedCommand>(&json).unwrap(),

@@ -316,6 +316,7 @@ pub fn cluster_init(
         capacity: request.capacity,
         state: NodeState::Up,
         version: BuildVersion::current(),
+        version_info: crate::node::VersionInfo::current(),
     };
     let record = ClusterRecord {
         format_version: CLUSTER_RECORD_FORMAT_VERSION,

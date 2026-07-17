@@ -39,7 +39,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 use openraft::{ErrorSubject, ErrorVerb, Snapshot, StorageIOError};
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::identity::{
     log_position_of, MongrelRaftConfig, RaftLogEntry, RaftLogId, RaftNodeId, RaftSnapshotMeta,
@@ -276,12 +276,18 @@ impl SharedStateMachine {
 
     /// The applied position (`LogPosition::ZERO` before any apply).
     pub(crate) fn applied_position(&self) -> LogPosition {
-        self.lock().map_or(LogPosition::ZERO, |inner| inner.record.position())
+        self.lock()
+            .map_or(LogPosition::ZERO, |inner| inner.record.position())
     }
 
     fn persist_record(&self, record: &AppliedRecord) -> Result<(), StateMachineError> {
         let body = encode_versioned(record)?;
-        write_frame_file(&self.raft_dir.join("state"), "applied", APPLIED_MAGIC, &body)?;
+        write_frame_file(
+            &self.raft_dir.join("state"),
+            "applied",
+            APPLIED_MAGIC,
+            &body,
+        )?;
         Ok(())
     }
 
@@ -314,11 +320,7 @@ impl SharedStateMachine {
         let (record, membership, sink_payload) = {
             let inner = self.lock()?;
             let payload = self.sink_lock()?.snapshot()?;
-            (
-                inner.record.clone(),
-                inner.membership.clone(),
-                payload,
-            )
+            (inner.record.clone(), inner.membership.clone(), payload)
         };
         let snapshot = SmSnapshot {
             record: record.clone(),
@@ -335,12 +337,17 @@ impl SharedStateMachine {
             &body,
         )?;
         let meta = RaftSnapshotMeta {
-            last_log_id: record.last_applied.clone(),
+            last_log_id: record.last_applied,
             last_membership: membership,
             snapshot_id: snapshot_id.clone(),
         };
         let meta_body = encode_versioned(&meta)?;
-        write_frame_file(&self.snapshot_dir(), "CURRENT", SNAP_CURRENT_MAGIC, &meta_body)?;
+        write_frame_file(
+            &self.snapshot_dir(),
+            "CURRENT",
+            SNAP_CURRENT_MAGIC,
+            &meta_body,
+        )?;
         self.remove_stale_snapshots(&snapshot_id)?;
         Ok((meta, framed_bytes(SNAP_MAGIC, &body)))
     }
@@ -354,7 +361,9 @@ impl SharedStateMachine {
             return Ok(None);
         };
         let meta: RaftSnapshotMeta = decode_versioned(&current_path, &meta_body)?;
-        let snap_path = self.snapshot_dir().join(format!("snap-{}.snap", meta.snapshot_id));
+        let snap_path = self
+            .snapshot_dir()
+            .join(format!("snap-{}.snap", meta.snapshot_id));
         let framed = std::fs::read(&snap_path).map_err(StoreError::io(&snap_path, "read"))?;
         // Verify the data frame before handing it out (fail closed).
         parse_framed(SNAP_MAGIC, &framed).map_err(|e| match e {
@@ -416,12 +425,17 @@ impl SharedStateMachine {
             inner.membership = snapshot.membership.clone();
         }
         let meta = RaftSnapshotMeta {
-            last_log_id: snapshot.record.last_applied.clone(),
+            last_log_id: snapshot.record.last_applied,
             last_membership: snapshot.membership,
             snapshot_id: snapshot_id.to_owned(),
         };
         let meta_body = encode_versioned(&meta)?;
-        write_frame_file(&self.snapshot_dir(), "CURRENT", SNAP_CURRENT_MAGIC, &meta_body)?;
+        write_frame_file(
+            &self.snapshot_dir(),
+            "CURRENT",
+            SNAP_CURRENT_MAGIC,
+            &meta_body,
+        )?;
         self.remove_stale_snapshots(snapshot_id)?;
         mongreldb_fault::inject("raft.snapshot.install.after")
             .map_err(|f| StateMachineError::Sink(f.to_string()))?;
@@ -436,7 +450,8 @@ impl SharedStateMachine {
             let entry = entry.map_err(StoreError::io(&self.snapshot_dir(), "read dir"))?;
             let name = entry.file_name().to_string_lossy().into_owned();
             if name.starts_with("snap-") && name.ends_with(".snap") && name != keep {
-                std::fs::remove_file(entry.path()).map_err(StoreError::io(&entry.path(), "delete"))?;
+                std::fs::remove_file(entry.path())
+                    .map_err(StoreError::io(&entry.path(), "delete"))?;
             }
         }
         Ok(())
@@ -457,7 +472,10 @@ fn snapshot_id_of(record: &AppliedRecord, body: &[u8]) -> String {
         .map_or((0, 0), |log_id| (log_id.leader_id.term, log_id.index));
     format!(
         "{term}-{index}-{}",
-        hash.iter().take(4).map(|b| format!("{b:02x}")).collect::<String>()
+        hash.iter()
+            .take(4)
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
     )
 }
 
@@ -509,11 +527,11 @@ impl MongrelStateMachine {
         std::fs::create_dir_all(&snapshot_dir)
             .map_err(StoreError::io(&snapshot_dir, "create dirs"))?;
 
-        let record: AppliedRecord = match read_frame_file(&state_dir.join("applied"), APPLIED_MAGIC)?
-        {
-            None => AppliedRecord::default(),
-            Some(body) => decode_versioned(&state_dir.join("applied"), &body)?,
-        };
+        let record: AppliedRecord =
+            match read_frame_file(&state_dir.join("applied"), APPLIED_MAGIC)? {
+                None => AppliedRecord::default(),
+                Some(body) => decode_versioned(&state_dir.join("applied"), &body)?,
+            };
         let membership: RaftStoredMembership =
             match read_frame_file(&raft_dir.join("membership"), MEMBERSHIP_MAGIC)? {
                 None => RaftStoredMembership::default(),
@@ -564,14 +582,15 @@ impl MongrelStateMachine {
             openraft::EntryPayload::Blank => {}
             openraft::EntryPayload::Membership(membership) => {
                 inner.membership =
-                    RaftStoredMembership::new(Some(entry.log_id.clone()), membership.clone());
+                    RaftStoredMembership::new(Some(entry.log_id), membership.clone());
                 self.shared.persist_membership(&inner.membership)?;
             }
             openraft::EntryPayload::Normal(command) => {
                 response.command_id = command.command_id();
                 response.commit_ts = command.commit_ts();
                 let duplicate = command.command_id().is_some_and(|id| {
-                    inner.record.last_applied_command_id == Some(id) || inner.recent_set.contains(&id)
+                    inner.record.last_applied_command_id == Some(id)
+                        || inner.recent_set.contains(&id)
                 });
                 if duplicate {
                     response.duplicate = true;
@@ -590,7 +609,7 @@ impl MongrelStateMachine {
                 }
             }
         }
-        inner.record.last_applied = Some(entry.log_id.clone());
+        inner.record.last_applied = Some(entry.log_id);
         Ok(response)
     }
 }
@@ -605,10 +624,13 @@ impl RaftStateMachine<MongrelRaftConfig> for MongrelStateMachine {
             .shared
             .lock()
             .map_err(|e| raft_sm_error(ErrorSubject::StateMachine, ErrorVerb::Read, e))?;
-        Ok((inner.record.last_applied.clone(), inner.membership.clone()))
+        Ok((inner.record.last_applied, inner.membership.clone()))
     }
 
-    async fn apply<I>(&mut self, entries: I) -> Result<Vec<crate::identity::ApplyResponse>, RaftStorageError>
+    async fn apply<I>(
+        &mut self,
+        entries: I,
+    ) -> Result<Vec<crate::identity::ApplyResponse>, RaftStorageError>
     where
         I: IntoIterator<Item = RaftLogEntry> + Send,
         I::IntoIter: Send,
@@ -620,7 +642,6 @@ impl RaftStateMachine<MongrelRaftConfig> for MongrelStateMachine {
         mongreldb_fault::inject("raft.sm.apply.before")
             .map_err(|f| StateMachineError::Sink(f.to_string()))
             .map_err(|e| raft_sm_error(ErrorSubject::StateMachine, ErrorVerb::Write, e))?;
-        eprintln!("[dbg] sm apply: {} entries", entries.len());
         let mut responses = Vec::with_capacity(entries.len());
         for entry in &entries {
             responses.push(
@@ -648,9 +669,7 @@ impl RaftStateMachine<MongrelRaftConfig> for MongrelStateMachine {
         }
     }
 
-    async fn begin_receiving_snapshot(
-        &mut self,
-    ) -> Result<Box<Cursor<Vec<u8>>>, RaftStorageError> {
+    async fn begin_receiving_snapshot(&mut self) -> Result<Box<Cursor<Vec<u8>>>, RaftStorageError> {
         Ok(Box::new(Cursor::new(Vec::new())))
     }
 
@@ -659,18 +678,24 @@ impl RaftStateMachine<MongrelRaftConfig> for MongrelStateMachine {
         meta: &RaftSnapshotMeta,
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), RaftStorageError> {
+        // The received cursor is positioned at the end after the chunk
+        // writes; rewind before reading.
         let mut bytes = snapshot;
+        bytes.seek(std::io::SeekFrom::Start(0)).await.map_err(|e| {
+            raft_sm_error(
+                ErrorSubject::StateMachine,
+                ErrorVerb::Seek,
+                StateMachineError::Corrupt(format!("seeking snapshot: {e}")),
+            )
+        })?;
         let mut framed = Vec::new();
-        bytes
-            .read_to_end(&mut framed)
-            .await
-            .map_err(|e| {
-                raft_sm_error(
-                    ErrorSubject::StateMachine,
-                    ErrorVerb::Read,
-                    StateMachineError::Corrupt(format!("reading snapshot: {e}")),
-                )
-            })?;
+        bytes.read_to_end(&mut framed).await.map_err(|e| {
+            raft_sm_error(
+                ErrorSubject::StateMachine,
+                ErrorVerb::Read,
+                StateMachineError::Corrupt(format!("reading snapshot: {e}")),
+            )
+        })?;
         let record = self
             .shared
             .install_framed_snapshot(&meta.snapshot_id, &framed)
@@ -820,16 +845,23 @@ mod tests {
         let sink_a = Arc::new(Mutex::new(InMemoryApplySink::new()));
         let sink_b = Arc::new(Mutex::new(InMemoryApplySink::new()));
         let mut sm_a = machine(tmp_a.path(), sink_a.clone());
-        sm_a.apply(vec![command(1, 1), command(2, 2)]).await.unwrap();
+        sm_a.apply(vec![command(1, 1), command(2, 2)])
+            .await
+            .unwrap();
         let (meta, framed) = sm_a.shared.build_snapshot_now().unwrap();
 
         let mut sm_b = machine(tmp_b.path(), sink_b.clone());
-        sm_b
-            .install_snapshot(&meta, Box::new(Cursor::new(framed)))
+        sm_b.install_snapshot(&meta, Box::new(Cursor::new(framed)))
             .await
             .unwrap();
-        assert_eq!(sm_b.shared.applied_position(), LogPosition { term: 1, index: 2 });
-        assert_eq!(sink_a.lock().unwrap().applied(), sink_b.lock().unwrap().applied());
+        assert_eq!(
+            sm_b.shared.applied_position(),
+            LogPosition { term: 1, index: 2 }
+        );
+        assert_eq!(
+            sink_a.lock().unwrap().applied(),
+            sink_b.lock().unwrap().applied()
+        );
 
         // Idempotency traveled with the snapshot: re-applying command 2 is a
         // duplicate on the fresh machine too.

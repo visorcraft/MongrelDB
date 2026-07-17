@@ -6,6 +6,7 @@
 
 pub mod bootstrap;
 pub mod meta;
+pub mod network;
 pub mod node;
 pub mod placement;
 pub mod routing;

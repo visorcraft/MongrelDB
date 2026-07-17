@@ -71,13 +71,21 @@ async fn injected_faults_surface_and_recover() {
     // before the hook is armed (the firing below is then deterministically
     // the proposal's own append).
     group
-        .propose(CommandKind::Transaction, envelope(0), &ExecutionControl::default())
+        .propose(
+            CommandKind::Transaction,
+            envelope(0),
+            &ExecutionControl::default(),
+        )
         .await
         .unwrap();
     {
         let _guard = ScopedGuard::limited("raft.log.append.before", Action::Fail, 1);
         let result = group
-            .propose(CommandKind::Transaction, envelope(1), &ExecutionControl::default())
+            .propose(
+                CommandKind::Transaction,
+                envelope(1),
+                &ExecutionControl::default(),
+            )
             .await;
         assert!(result.is_err(), "injected storage fault must surface");
         assert!(mongreldb_fault::hits("raft.log.append.before") >= 1);
@@ -89,10 +97,7 @@ async fn injected_faults_surface_and_recover() {
     // passes through.
     let (n1, _s1) = start(&tmp, transport.clone(), 2).await;
     let (n2, _s2) = start(&tmp, transport.clone(), 3).await;
-    let members = BTreeMap::from([
-        (2, BasicNode::new("node-2")),
-        (3, BasicNode::new("node-3")),
-    ]);
+    let members = BTreeMap::from([(2, BasicNode::new("node-2")), (3, BasicNode::new("node-3"))]);
     {
         let _guard = ScopedGuard::limited("raft.net.vote.before", Action::Fail, 2);
         n1.bootstrap(members.clone()).await.unwrap();
@@ -102,7 +107,13 @@ async fn injected_faults_surface_and_recover() {
         // Two firings consumed the budget; later evaluations pass through and
         // still count as hits, so assert the floor only.
         assert!(mongreldb_fault::hits("raft.net.vote.before") >= 2);
-        n1.propose(CommandKind::Transaction, envelope(7), &ExecutionControl::default())
+        let leader_group = if leader == 2 { &n1 } else { &n2 };
+        leader_group
+            .propose(
+                CommandKind::Transaction,
+                envelope(7),
+                &ExecutionControl::default(),
+            )
             .await
             .unwrap();
     }

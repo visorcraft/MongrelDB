@@ -153,7 +153,9 @@ impl<T: RaftTransport> RaftNetwork<MongrelRaftConfig> for TransportNetwork<T> {
         rpc: AppendEntriesRequest<MongrelRaftConfig>,
         _option: openraft::network::RPCOption,
     ) -> Result<AppendEntriesResponse<RaftNodeId>, AppendRpcError> {
-        self.transport.append_entries(self.from, self.target, rpc).await
+        self.transport
+            .append_entries(self.from, self.target, rpc)
+            .await
     }
 
     async fn install_snapshot(
@@ -161,7 +163,9 @@ impl<T: RaftTransport> RaftNetwork<MongrelRaftConfig> for TransportNetwork<T> {
         rpc: InstallSnapshotRequest<MongrelRaftConfig>,
         _option: openraft::network::RPCOption,
     ) -> Result<InstallSnapshotResponse<RaftNodeId>, SnapshotRpcError> {
-        self.transport.install_snapshot(self.from, self.target, rpc).await
+        self.transport
+            .install_snapshot(self.from, self.target, rpc)
+            .await
     }
 
     async fn vote(
@@ -212,7 +216,11 @@ impl InMemoryTransport {
     }
 
     fn policy(&self, from: RaftNodeId, to: RaftNodeId) -> LinkPolicy {
-        self.lock().links.get(&(from, to)).cloned().unwrap_or_default()
+        self.lock()
+            .links
+            .get(&(from, to))
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Sets the policy for one directed link.

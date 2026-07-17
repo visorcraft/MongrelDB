@@ -55,6 +55,10 @@ vector similarity, range queries, and more.
 19. **[Single-Node Subsystems](19-single-node-subsystems.md)** - Stage 1
     machinery: resource groups + memory governor, persistent online jobs,
     versioned catalog commands, and the lock manager
+20. **[Replicated High Availability](20-replicated-ha.md)** - Stage 2
+    machinery: one Raft group per database, quorum durability, read
+    consistency levels, snapshots/catch-up, membership, and measured
+    failover
 
 ## Quick Reference
 

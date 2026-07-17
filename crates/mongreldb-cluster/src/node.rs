@@ -20,6 +20,7 @@
 //! corrupt payloads, and reserved all-zero identifiers all fail closed (spec
 //! section 4.10).
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -471,6 +472,169 @@ impl BuildVersion {
     }
 }
 
+/// Oldest wire-protocol version this build accepts (spec section 11.8).
+///
+/// Mirrors `MIN_SUPPORTED_PROTOCOL_VERSION` in
+/// `crates/mongreldb-protocol/src/envelope.rs`; the cluster crate
+/// deliberately does not depend on the protocol crate, so the value is
+/// declared here and must track it (join-time overlap checks fail closed on
+/// drift).
+pub const PROTOCOL_VERSION_MIN: u32 = 1;
+/// Newest wire-protocol version this build speaks.
+///
+/// Mirrors `PROTOCOL_VERSION` in
+/// `crates/mongreldb-protocol/src/envelope.rs`; see [`PROTOCOL_VERSION_MIN`].
+pub const PROTOCOL_VERSION_MAX: u32 = 1;
+/// Oldest committed-command log format this build reads: the FND-003
+/// `CommandEnvelope` minimum in `mongreldb-log`.
+pub const LOG_FORMAT_VERSION_MIN: u32 = mongreldb_log::envelope::MIN_SUPPORTED_FORMAT_VERSION;
+/// Newest committed-command log format this build writes: the FND-003
+/// `CommandEnvelope` version in `mongreldb-log`.
+pub const LOG_FORMAT_VERSION_MAX: u32 = mongreldb_log::envelope::COMMAND_ENVELOPE_FORMAT_VERSION;
+/// Oldest replicated snapshot format this build reads.
+///
+/// Mirrors the private log-store `FORMAT_VERSION` in
+/// `crates/mongreldb-consensus/src/storage.rs`, which frames the snapshot
+/// records this build exchanges; the authoritative minimum lands in
+/// `mongreldb-consensus` when snapshot envelopes are versioned per
+/// ADR-0010.
+pub const SNAPSHOT_FORMAT_VERSION_MIN: u32 = 1;
+/// Newest replicated snapshot format this build writes.
+///
+/// Mirrors the private log-store `FORMAT_VERSION` in
+/// `crates/mongreldb-consensus/src/storage.rs`; the authoritative maximum
+/// lands in `mongreldb-consensus` alongside snapshot envelope versioning
+/// (ADR-0010 migration step 3).
+pub const SNAPSHOT_FORMAT_VERSION_MAX: u32 = 1;
+
+/// Version and format compatibility envelope every node advertises (spec
+/// section 11.8; ADR-0010 decision 5).
+///
+/// Ranges are inclusive. The derived [`Default`] describes a descriptor
+/// written before Stage 2H that never carried an advertisement: its zeroed
+/// ranges overlap only other zeroed ranges, so a missing advertisement fails
+/// closed against any real one (spec section 4.10).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VersionInfo {
+    /// Engine package version of the running binary (`CARGO_PKG_VERSION`).
+    pub binary_version: String,
+    /// Oldest wire-protocol version accepted.
+    pub protocol_min: u32,
+    /// Newest wire-protocol version spoken.
+    pub protocol_max: u32,
+    /// Oldest committed-command log format read.
+    pub log_format_min: u32,
+    /// Newest committed-command log format written.
+    pub log_format_max: u32,
+    /// Oldest replicated snapshot format read.
+    pub snapshot_format_min: u32,
+    /// Newest replicated snapshot format written.
+    pub snapshot_format_max: u32,
+    /// Names of cluster features this build can activate; the advertised set
+    /// gates feature activation (spec section 11.8 step 5).
+    pub feature_set: BTreeSet<String>,
+}
+
+impl VersionInfo {
+    /// The advertisement of the running binary, sourced from the build
+    /// environment and this crate's declared format ranges.
+    pub fn current() -> Self {
+        Self {
+            binary_version: env!("CARGO_PKG_VERSION").to_owned(),
+            protocol_min: PROTOCOL_VERSION_MIN,
+            protocol_max: PROTOCOL_VERSION_MAX,
+            log_format_min: LOG_FORMAT_VERSION_MIN,
+            log_format_max: LOG_FORMAT_VERSION_MAX,
+            snapshot_format_min: SNAPSHOT_FORMAT_VERSION_MIN,
+            snapshot_format_max: SNAPSHOT_FORMAT_VERSION_MAX,
+            feature_set: crate::meta::FeatureRegistry::current().feature_names(),
+        }
+    }
+
+    /// Verify that this node and `other` can interoperate in one cluster.
+    ///
+    /// Compatibility requires every advertised range pair to overlap: with
+    /// the N/N-1 support window (spec section 17) an N binary accepts
+    /// `[N-1, N]` and an N-1 binary accepts `[N-1, N-1]`, which overlap, while
+    /// a two-version skew does not. Failures fail closed with a typed
+    /// [`Incompatibility`] naming the first non-overlapping range.
+    pub fn is_compatible_with(&self, other: &Self) -> Result<(), Incompatibility> {
+        if !ranges_overlap(
+            self.protocol_min,
+            self.protocol_max,
+            other.protocol_min,
+            other.protocol_max,
+        ) {
+            return Err(Incompatibility::ProtocolVersion {
+                ours: (self.protocol_min, self.protocol_max),
+                theirs: (other.protocol_min, other.protocol_max),
+            });
+        }
+        if !ranges_overlap(
+            self.log_format_min,
+            self.log_format_max,
+            other.log_format_min,
+            other.log_format_max,
+        ) {
+            return Err(Incompatibility::LogFormat {
+                ours: (self.log_format_min, self.log_format_max),
+                theirs: (other.log_format_min, other.log_format_max),
+            });
+        }
+        if !ranges_overlap(
+            self.snapshot_format_min,
+            self.snapshot_format_max,
+            other.snapshot_format_min,
+            other.snapshot_format_max,
+        ) {
+            return Err(Incompatibility::SnapshotFormat {
+                ours: (self.snapshot_format_min, self.snapshot_format_max),
+                theirs: (other.snapshot_format_min, other.snapshot_format_max),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Inclusive ranges `[a_min, a_max]` and `[b_min, b_max]` overlap. Malformed
+/// ranges (`min > max`) never overlap, so they fail closed.
+fn ranges_overlap(a_min: u32, a_max: u32, b_min: u32, b_max: u32) -> bool {
+    a_min <= a_max && b_min <= b_max && a_min <= b_max && b_min <= a_max
+}
+
+/// One advertised range pair does not overlap; compatibility checks fail
+/// closed with the first mismatch found (ADR-0010: never silently degrade).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum Incompatibility {
+    /// Wire-protocol ranges do not overlap.
+    #[error(
+        "wire-protocol version ranges do not overlap: {ours:?} vs {theirs:?} (min, max inclusive)"
+    )]
+    ProtocolVersion {
+        /// This node's `(min, max)` protocol range.
+        ours: (u32, u32),
+        /// The other node's `(min, max)` protocol range.
+        theirs: (u32, u32),
+    },
+    /// Committed-command log format ranges do not overlap.
+    #[error("log format ranges do not overlap: {ours:?} vs {theirs:?} (min, max inclusive)")]
+    LogFormat {
+        /// This node's `(min, max)` log format range.
+        ours: (u32, u32),
+        /// The other node's `(min, max)` log format range.
+        theirs: (u32, u32),
+    },
+    /// Replicated snapshot format ranges do not overlap.
+    #[error("snapshot format ranges do not overlap: {ours:?} vs {theirs:?} (min, max inclusive)")]
+    SnapshotFormat {
+        /// This node's `(min, max)` snapshot format range.
+        ours: (u32, u32),
+        /// The other node's `(min, max)` snapshot format range.
+        theirs: (u32, u32),
+    },
+}
+
 /// One cluster member as advertised by the meta control plane (spec section
 /// 12.1). Defined with the Stage 2A bootstrap workflows; the meta group takes
 /// ownership of the replicated copy in Stage 3A.
@@ -489,6 +653,13 @@ pub struct NodeDescriptor {
     pub state: NodeState,
     /// Advertised build version.
     pub version: BuildVersion,
+    /// Advertised version/format compatibility envelope (spec section 11.8).
+    ///
+    /// Deserialized with [`VersionInfo::default`] when absent so descriptors
+    /// written before Stage 2H still decode; the default's zeroed ranges
+    /// fail closed against any real advertisement (spec section 4.10).
+    #[serde(default)]
+    pub version_info: VersionInfo,
 }
 
 /// `<node-data>/cluster-meta`.
@@ -913,5 +1084,133 @@ mod tests {
                 assert_eq!(identity.as_ref().unwrap(), &first);
             }
         });
+    }
+
+    fn version_info(protocol: (u32, u32), log: (u32, u32), snapshot: (u32, u32)) -> VersionInfo {
+        VersionInfo {
+            binary_version: "test".to_owned(),
+            protocol_min: protocol.0,
+            protocol_max: protocol.1,
+            log_format_min: log.0,
+            log_format_max: log.1,
+            snapshot_format_min: snapshot.0,
+            snapshot_format_max: snapshot.1,
+            feature_set: BTreeSet::new(),
+        }
+    }
+
+    fn sample_descriptor() -> NodeDescriptor {
+        NodeDescriptor {
+            node_id: NodeId::new_random(),
+            rpc_address: "127.0.0.1:7100".to_owned(),
+            locality: "region=us-central,zone=a".parse().unwrap(),
+            capacity: NodeCapacity::default(),
+            state: NodeState::Up,
+            version: BuildVersion::current(),
+            version_info: VersionInfo::current(),
+        }
+    }
+
+    #[test]
+    fn current_version_info_advertises_a_self_compatible_window() {
+        let current = VersionInfo::current();
+        assert_eq!(current.binary_version, env!("CARGO_PKG_VERSION"));
+        assert!(current.protocol_min <= current.protocol_max);
+        assert!(current.log_format_min <= current.log_format_max);
+        assert!(current.snapshot_format_min <= current.snapshot_format_max);
+        // The declared ranges mirror the format authorities of record.
+        assert_eq!(
+            current.log_format_min,
+            mongreldb_log::envelope::MIN_SUPPORTED_FORMAT_VERSION
+        );
+        assert_eq!(
+            current.log_format_max,
+            mongreldb_log::envelope::COMMAND_ENVELOPE_FORMAT_VERSION
+        );
+        current.is_compatible_with(&current).unwrap();
+    }
+
+    #[test]
+    fn compatibility_is_range_overlap_in_every_dimension() {
+        let base = version_info((1, 2), (1, 2), (1, 2));
+        // Identical and nested ranges overlap.
+        base.is_compatible_with(&base.clone()).unwrap();
+        base.is_compatible_with(&version_info((2, 2), (1, 1), (1, 2)))
+            .unwrap();
+        // Each dimension is checked; the first mismatch names the range.
+        let error = base
+            .is_compatible_with(&version_info((3, 4), (1, 2), (1, 2)))
+            .unwrap_err();
+        assert!(matches!(error, Incompatibility::ProtocolVersion { .. }));
+        let error = base
+            .is_compatible_with(&version_info((1, 2), (3, 4), (1, 2)))
+            .unwrap_err();
+        assert!(matches!(error, Incompatibility::LogFormat { .. }));
+        let error = base
+            .is_compatible_with(&version_info((1, 2), (1, 2), (3, 4)))
+            .unwrap_err();
+        assert!(matches!(error, Incompatibility::SnapshotFormat { .. }));
+        // Malformed ranges (min > max) fail closed.
+        let error = base
+            .is_compatible_with(&version_info((2, 1), (1, 2), (1, 2)))
+            .unwrap_err();
+        assert!(matches!(error, Incompatibility::ProtocolVersion { .. }));
+    }
+
+    #[test]
+    fn n_and_n_minus_1_interoperate_but_n_plus_1_skew_does_not() {
+        // Section 17 window: the N binary accepts [N-1, N], the N-1 binary
+        // accepts [N-1, N-1]; both directions overlap.
+        let n_minus_1 = version_info((1, 1), (1, 1), (1, 1));
+        let n = version_info((1, 2), (1, 2), (1, 2));
+        n.is_compatible_with(&n_minus_1).unwrap();
+        n_minus_1.is_compatible_with(&n).unwrap();
+        // A two-version skew does not overlap and fails closed.
+        let n_plus_1 = version_info((2, 3), (2, 3), (2, 3));
+        assert!(matches!(
+            n_minus_1.is_compatible_with(&n_plus_1).unwrap_err(),
+            Incompatibility::ProtocolVersion { .. }
+        ));
+    }
+
+    #[test]
+    fn missing_advertisement_fails_closed_against_a_real_one() {
+        // A descriptor written before Stage 2H decodes with zeroed ranges,
+        // which overlap no real advertisement (section 4.10).
+        let legacy = VersionInfo::default();
+        let error = legacy
+            .is_compatible_with(&VersionInfo::current())
+            .unwrap_err();
+        assert!(matches!(error, Incompatibility::ProtocolVersion { .. }));
+        // Two legacy descriptors are mutually compatible: range overlap is
+        // symmetric and says nothing about unsent fields.
+        legacy.is_compatible_with(&VersionInfo::default()).unwrap();
+    }
+
+    #[test]
+    fn descriptor_without_version_info_decodes_with_a_default() {
+        let descriptor = sample_descriptor();
+        let mut value = serde_json::to_value(&descriptor).unwrap();
+        // A Stage 2A descriptor carried no version advertisement.
+        value.as_object_mut().unwrap().remove("version_info");
+        let decoded: NodeDescriptor = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.version_info, VersionInfo::default());
+        assert_eq!(decoded.node_id, descriptor.node_id);
+    }
+
+    #[test]
+    fn descriptor_with_version_info_round_trips() {
+        let descriptor = sample_descriptor();
+        let json = serde_json::to_vec(&descriptor).unwrap();
+        let decoded: NodeDescriptor = serde_json::from_slice(&json).unwrap();
+        assert_eq!(decoded, descriptor);
+    }
+
+    #[test]
+    fn descriptor_still_fails_closed_on_unknown_fields() {
+        let descriptor = sample_descriptor();
+        let mut value = serde_json::to_value(&descriptor).unwrap();
+        value["unexpected"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<NodeDescriptor>(value).is_err());
     }
 }

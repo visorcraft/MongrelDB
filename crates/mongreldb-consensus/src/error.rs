@@ -2,8 +2,8 @@
 //!
 //! [`ConsensusError`] is the error surface of [`crate::group::ConsensusGroup`].
 //! `RaftCommitLog` (ADR-0002) maps it onto `mongreldb_log`'s `LogError` at the
-//! `CommitLog` boundary; richer leader routing lands with the Stage 2C write
-//! protocol.
+//! `CommitLog` boundary, including the routed `NotLeader` variant carrying the
+//! leader hint (S2C, spec section 11.7).
 
 use mongreldb_log::envelope::EnvelopeError;
 

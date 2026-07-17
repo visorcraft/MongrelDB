@@ -11,14 +11,23 @@
 //!
 //! # Durability levels (spec section 11.3)
 //!
-//! [`DurabilityLevel::Quorum`] is the default and the only level this wave
-//! acknowledges: a quorum-acknowledged write has RPO 0 below quorum loss.
-//! [`DurabilityLevel::LeaderDisk`] is an *optional* lower guarantee owned by
-//! the Stage 2C write protocol (openraft's public API has no
-//! "appended-to-leader-log" mid-point callback, so an honest implementation
-//! lands with S2C); selecting it here reports
-//! [`LogError::Unsupported`]. Memory-only acknowledged writes are never
-//! implemented (spec section 11.3).
+//! [`DurabilityLevel::Quorum`] is the default: a quorum-acknowledged write
+//! has RPO 0 below quorum loss. [`DurabilityLevel::LeaderDisk`] (S2C) is the
+//! optional lower guarantee: the receipt is issued once the entry is fsynced
+//! on the leader's local log, **before** quorum commit. Honesty rules:
+//!
+//! - the receipt is issued strictly after the segment fsync covering the
+//!   entry (a crash before that fsync never acknowledges);
+//! - the receipt is NOT a commit declaration — visibility still gates on
+//!   quorum commit + apply (spec section 4.4), and a LeaderDisk-acknowledged
+//!   entry can be truncated on leader loss (RPO > 0, the documented
+//!   trade-off). The entry still commits normally in the background;
+//! - leadership is enforced by the raft propose path; waiters are keyed
+//!   only to commands proposed in the current term.
+//!
+//! Memory-only acknowledged writes are never implemented (spec section
+//! 11.3). [`DurabilityLevel::GroupCommit`] is the standalone-mode level and
+//! is rejected here.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -34,6 +43,7 @@ use crate::error::ConsensusError;
 use crate::group::{ConsensusGroup, ConsensusSnapshot};
 use crate::identity::CommandKind;
 use crate::network::RaftTransport;
+use crate::read::SessionToken;
 
 /// The replicated [`CommitLog`] over one [`ConsensusGroup`].
 pub struct RaftCommitLog<T: RaftTransport> {
@@ -49,9 +59,10 @@ impl<T: RaftTransport> RaftCommitLog<T> {
         Self::with_durability(group, DurabilityLevel::Quorum)
     }
 
-    /// Creates the commit log with an explicit durability preference. Note
-    /// [`DurabilityLevel::LeaderDisk`] is not acknowledged by this wave (see
-    /// module docs).
+    /// Creates the commit log with an explicit durability preference. The
+    /// replicated default is [`DurabilityLevel::Quorum`];
+    /// [`DurabilityLevel::LeaderDisk`] acknowledges at leader-local fsync
+    /// (see module docs for the honesty contract).
     pub fn with_durability(group: Arc<ConsensusGroup<T>>, durability: DurabilityLevel) -> Self {
         RaftCommitLog {
             group,
@@ -63,6 +74,17 @@ impl<T: RaftTransport> RaftCommitLog<T> {
     /// The underlying group (membership, snapshots, read barrier, metrics).
     pub fn group(&self) -> &Arc<ConsensusGroup<T>> {
         &self.group
+    }
+
+    /// Builds the Stage 2D session token for a receipt this log issued
+    /// (read-your-writes consistency, spec section 11.4): the group id, the
+    /// committed log index, and the receipt's commit timestamp.
+    pub fn session_token(&self, receipt: &CommitReceipt) -> SessionToken {
+        SessionToken {
+            group_id: self.group.group_id().to_owned(),
+            commit_index: receipt.log_position.index,
+            commit_ts: receipt.commit_ts,
+        }
     }
 
     /// Shuts the log and the group down gracefully.
@@ -79,15 +101,23 @@ fn map_error(err: ConsensusError) -> LogError {
         ConsensusError::Closed => LogError::Closed,
         ConsensusError::Envelope(e) => LogError::Envelope(e),
         ConsensusError::Unsupported(op) => LogError::Unsupported(op),
-        // The leader hint rides in the message until the Stage 2C write
-        // protocol extends the taxonomy with a routed variant.
+        // Routed NotLeader (S2C): the hint rides along for the gateway's
+        // retry (spec section 11.7).
+        ConsensusError::NotLeader { leader } => LogError::NotLeader {
+            leader_hint: leader.map(|id| id.to_string()),
+        },
         other => LogError::Internal(other.to_string()),
     }
 }
 
 impl<T: RaftTransport> CommitLog for RaftCommitLog<T> {
-    /// Proposes the command as a transaction command and waits for quorum
-    /// commit + local apply. The receipt is irrevocable (spec section 4.7).
+    /// Proposes the command as a transaction command. With
+    /// [`DurabilityLevel::Quorum`] (default) this waits for quorum commit +
+    /// local apply and the receipt is irrevocable (spec section 4.7). With
+    /// [`DurabilityLevel::LeaderDisk`] the receipt is issued once the entry
+    /// is fsynced on the leader's local log — before quorum commit (see the
+    /// module docs for the honesty contract; it is NOT a commit
+    /// declaration).
     fn propose(
         &self,
         command: CommandEnvelope,
@@ -96,24 +126,48 @@ impl<T: RaftTransport> CommitLog for RaftCommitLog<T> {
         if self.closed.load(Ordering::Acquire) {
             return Err(LogError::Closed);
         }
-        if self.durability == DurabilityLevel::LeaderDisk {
-            return Err(LogError::Unsupported(
-                "LeaderDisk durability lands with the Stage 2C write protocol (spec 11.3)",
-            ));
-        }
         let command_id = command.command_id;
-        // The CommitLog trait is synchronous; the group API is async. Drive
-        // the future on the caller's runtime context.
-        let receipt = block_on_group(self.group.clone(), |group| async move {
-            group.propose(CommandKind::Transaction, command, control).await
-        })
-        .map_err(map_error)?;
-        Ok(CommitReceipt {
-            transaction_id: TransactionId::from_bytes(command_id),
-            commit_ts: receipt.commit_ts,
-            log_position: receipt.position,
-            durability: DurabilityLevel::Quorum,
-        })
+        match self.durability {
+            DurabilityLevel::Quorum => {
+                // The CommitLog trait is synchronous; the group API is async.
+                // Drive the future on the caller's runtime context.
+                let receipt = block_on_group(self.group.clone(), |group| async move {
+                    group
+                        .propose(CommandKind::Transaction, command, control)
+                        .await
+                })
+                .map_err(map_error)?;
+                Ok(CommitReceipt {
+                    transaction_id: TransactionId::from_bytes(command_id),
+                    commit_ts: receipt.commit_ts,
+                    log_position: receipt.position,
+                    durability: DurabilityLevel::Quorum,
+                })
+            }
+            DurabilityLevel::LeaderDisk => {
+                let receipt = block_on_group(self.group.clone(), |group| async move {
+                    group
+                        .propose_leader_durable(CommandKind::Transaction, command, control)
+                        .await
+                })
+                .map_err(map_error)?;
+                Ok(CommitReceipt {
+                    transaction_id: TransactionId::from_bytes(command_id),
+                    commit_ts: receipt.commit_ts,
+                    log_position: receipt.position,
+                    // Quorum commit landing before the fsync signal upgrades
+                    // the receipt (never weaker than asked).
+                    durability: if receipt.quorum_committed {
+                        DurabilityLevel::Quorum
+                    } else {
+                        DurabilityLevel::LeaderDisk
+                    },
+                })
+            }
+            DurabilityLevel::GroupCommit => Err(LogError::Unsupported(
+                "GroupCommit is the standalone-mode durability level (spec 11.3)",
+            )),
+        }
     }
 
     fn read_committed(
@@ -129,10 +183,12 @@ impl<T: RaftTransport> CommitLog for RaftCommitLog<T> {
     }
 
     fn create_snapshot(&self) -> Result<LogSnapshot, LogError> {
-        let snapshot: ConsensusSnapshot = block_on_group(self.group.clone(), |group| async move {
-            group.snapshot().await
-        })
-        .map_err(map_error)?;
+        let snapshot: ConsensusSnapshot =
+            block_on_group(
+                self.group.clone(),
+                |group| async move { group.snapshot().await },
+            )
+            .map_err(map_error)?;
         Ok(LogSnapshot {
             position: snapshot.position,
             commit_ts: snapshot.commit_ts,
@@ -171,10 +227,4 @@ where
             runtime.block_on(f(group))
         }
     }
-}
-
-#[cfg(test)]
-mod tests {
-    // Group-level coverage of RaftCommitLog lives in tests/cluster.rs (it
-    // needs a running raft group); see single_node_commit_log_round_trip.
 }

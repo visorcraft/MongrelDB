@@ -31,7 +31,7 @@ fn unix_nanos_now() -> u64 {
 pub const WAL_MAGIC: [u8; 8] = *b"MONGRWAL";
 /// The only WAL format this engine reads or writes. Older segments (v3 and
 /// below) are rejected with [`MongrelError::UnsupportedStorageVersion`].
-const WAL_VERSION: u16 = 4;
+pub(crate) const WAL_VERSION: u16 = 4;
 const HEADER_LEN: u64 = 8 + 2 + 4 + 8 + 8 + 32;
 const WAL_FRAME_AAD_DOMAIN: &[u8] = b"mongreldb/wal-frame/v4";
 const WAL_HEAD_MAGIC: [u8; 8] = *b"MONGWHED";

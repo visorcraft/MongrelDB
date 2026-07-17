@@ -1426,6 +1426,13 @@ pub struct OpenOptions {
     /// `None` (the default) uses [`DEFAULT_TEMP_DISK_BUDGET_BYTES`]. Again a
     /// cap, not a preallocation.
     pub temp_disk_budget_bytes: Option<u64>,
+    /// Open the database through the special offline-validation API (spec
+    /// section 5.3): any [`crate::storage_mode::StorageMode`] — including
+    /// `ClusterReplica`, which every normal open path rejects — is opened
+    /// **read-only** so a backup validator can inspect it. The opened core
+    /// rejects every write with [`MongrelError::ReadOnlyReplica`]. This is the
+    /// only way to open a cluster replica outside the cluster node runtime.
+    pub offline_validation: bool,
 }
 
 impl OpenOptions {
@@ -1447,6 +1454,38 @@ impl OpenOptions {
         self.temp_disk_budget_bytes = Some(bytes);
         self
     }
+
+    /// Set [`OpenOptions::offline_validation`]. `true` opens any storage mode
+    /// read-only (the offline backup-validator API of spec section 5.3).
+    pub fn with_offline_validation(mut self, offline_validation: bool) -> Self {
+        self.offline_validation = offline_validation;
+        self
+    }
+}
+
+/// How an open/create path treats the durable storage-mode marker (spec
+/// section 5.3, Stage 2E). Threaded from the public constructors through the
+/// open chain into [`Database::finish_open`].
+#[derive(Debug, Clone)]
+pub(crate) enum OpenModeGate {
+    /// Normal embedded/server open: `ClusterReplica` markers are rejected with
+    /// [`crate::storage_mode::StorageModeError::ClusterReplicaRequiresClusterRuntime`].
+    Normal,
+    /// Offline backup validator: any mode opens, forced read-only.
+    OfflineValidation,
+    /// Cluster node runtime: the marker must exist and equal this
+    /// `ClusterReplica` identity; the core opens read-only for user paths (all
+    /// writes arrive through the replicated apply path).
+    ClusterRuntime {
+        /// Expected owning cluster.
+        cluster_id: mongreldb_types::ids::ClusterId,
+        /// Expected owning node.
+        node_id: mongreldb_types::ids::NodeId,
+        /// Expected replicated database.
+        database_id: mongreldb_types::ids::DatabaseId,
+    },
+    /// Fresh create: no marker may exist yet; this mode is written.
+    Create(crate::storage_mode::StorageMode),
 }
 
 /// Default node-level memory budget (S1E-003): 1 GiB. Comfortably covers the
@@ -2022,7 +2061,14 @@ impl Database {
     /// advancement, and table mounting all happen inside this call — exactly
     /// once per core.
     pub(crate) fn open_for_shared_core(root: impl AsRef<Path>) -> Result<Self> {
-        Self::open_inner_with_lock_timeout(root, None, None, 0, CoreResourceConfig::default())
+        Self::open_inner_with_lock_timeout(
+            root,
+            None,
+            None,
+            0,
+            CoreResourceConfig::default(),
+            OpenModeGate::Normal,
+        )
     }
 
     /// Explicitly close the final shared database owner.
@@ -2231,7 +2277,12 @@ impl Database {
     /// Create a fresh plaintext database at `root`.
     pub fn create(root: impl AsRef<Path>) -> Result<Self> {
         let (root, lock) = Self::begin_create(root)?;
-        Self::create_inner(root, None, lock)
+        Self::create_inner(
+            root,
+            None,
+            lock,
+            crate::storage_mode::StorageMode::Standalone,
+        )
     }
 
     /// Create a fresh encrypted database, deriving the DB-wide KEK from a
@@ -2242,7 +2293,12 @@ impl Database {
         let salt = crate::encryption::random_salt()?;
         crate::durable_file::write_atomic(&root.join(META_DIR).join(KEYS_FILENAME), &salt)?;
         let kek = Arc::new(crate::encryption::Kek::derive(passphrase, &salt)?);
-        Self::create_inner(root, Some(kek), lock)
+        Self::create_inner(
+            root,
+            Some(kek),
+            lock,
+            crate::storage_mode::StorageMode::Standalone,
+        )
     }
 
     /// Create a fresh encrypted database, deriving the DB-wide KEK from a raw
@@ -2253,13 +2309,74 @@ impl Database {
         let salt = crate::encryption::random_salt()?;
         crate::durable_file::write_atomic(&root.join(META_DIR).join(KEYS_FILENAME), &salt)?;
         let kek = Arc::new(crate::encryption::Kek::from_raw_key(key, &salt)?);
-        Self::create_inner(root, Some(kek), lock)
+        Self::create_inner(
+            root,
+            Some(kek),
+            lock,
+            crate::storage_mode::StorageMode::Standalone,
+        )
+    }
+
+    /// Create a fresh plaintext database owned by the cluster node runtime
+    /// (spec section 5.3): the durable marker records
+    /// [`crate::storage_mode::StorageMode::ClusterReplica`], so normal
+    /// `Database::open*` paths reject the directory and only
+    /// [`Database::open_cluster_replica`] (or the read-only offline validator)
+    /// can open it afterwards. The returned core rejects user writes: every
+    /// mutation arrives through the replicated apply path (Stage 2E).
+    pub fn create_cluster_replica(
+        root: impl AsRef<Path>,
+        cluster_id: mongreldb_types::ids::ClusterId,
+        node_id: mongreldb_types::ids::NodeId,
+        database_id: mongreldb_types::ids::DatabaseId,
+    ) -> Result<Self> {
+        let (root, lock) = Self::begin_create(root)?;
+        Self::create_inner(
+            root,
+            None,
+            lock,
+            crate::storage_mode::StorageMode::ClusterReplica {
+                cluster_id,
+                node_id,
+                database_id,
+            },
+        )
+    }
+
+    /// Open a cluster-replica database as the cluster node runtime (spec
+    /// section 5.3). Fails closed unless the durable marker exists and exactly
+    /// matches `expected` (a `ClusterReplica` identity): opening a replica of
+    /// the wrong cluster or database would corrupt both. The opened core
+    /// rejects user writes with [`MongrelError::ReadOnlyReplica`]; mutations
+    /// arrive through the replicated apply path (Stage 2E).
+    pub fn open_cluster_replica(
+        root: impl AsRef<Path>,
+        expected: &crate::storage_mode::StorageMode,
+    ) -> Result<Self> {
+        let Some((cluster_id, node_id, database_id)) = expected.cluster_identity() else {
+            return Err(MongrelError::InvalidArgument(format!(
+                "open_cluster_replica requires a ClusterReplica identity, got {expected:?}"
+            )));
+        };
+        let (root, lock) = Self::begin_open(root, 0)?;
+        Self::open_inner_locked(
+            root,
+            None,
+            lock,
+            CoreResourceConfig::default(),
+            OpenModeGate::ClusterRuntime {
+                cluster_id,
+                node_id,
+                database_id,
+            },
+        )
     }
 
     fn create_inner(
         root: PathBuf,
         kek: Option<Arc<crate::encryption::Kek>>,
         lock: ExclusiveDatabaseLease,
+        storage_mode: crate::storage_mode::StorageMode,
     ) -> Result<Self> {
         crate::durable_file::create_directory_all(&root.join(TABLES_DIR))?;
         let meta_dek = crate::encryption::meta_dek_for(kek.as_deref());
@@ -2276,6 +2393,7 @@ impl Database {
             None,
             lock,
             CoreResourceConfig::default(),
+            OpenModeGate::Create(storage_mode),
         )
     }
 
@@ -2292,7 +2410,13 @@ impl Database {
             MongrelError::Other("database root descriptor was not pinned".into())
         })?)?;
         let kek = Arc::new(crate::encryption::Kek::derive(passphrase, &salt)?);
-        Self::open_inner_locked(root, Some(kek), lock, CoreResourceConfig::default())
+        Self::open_inner_locked(
+            root,
+            Some(kek),
+            lock,
+            CoreResourceConfig::default(),
+            OpenModeGate::Normal,
+        )
     }
 
     /// Open an existing encrypted database with a configurable cross-process
@@ -2308,11 +2432,17 @@ impl Database {
             MongrelError::Other("database root descriptor was not pinned".into())
         })?)?;
         let kek = Arc::new(crate::encryption::Kek::derive(passphrase, &salt)?);
+        let gate = if options.offline_validation {
+            OpenModeGate::OfflineValidation
+        } else {
+            OpenModeGate::Normal
+        };
         Self::open_inner_locked(
             root,
             Some(kek),
             lock,
             CoreResourceConfig::from_options(&options)?,
+            gate,
         )
     }
 
@@ -2324,7 +2454,13 @@ impl Database {
             MongrelError::Other("database root descriptor was not pinned".into())
         })?)?;
         let kek = Arc::new(crate::encryption::Kek::from_raw_key(key, &salt)?);
-        Self::open_inner_locked(root, Some(kek), lock, CoreResourceConfig::default())
+        Self::open_inner_locked(
+            root,
+            Some(kek),
+            lock,
+            CoreResourceConfig::default(),
+            OpenModeGate::Normal,
+        )
     }
 
     /// Open an existing plaintext database that has `require_auth = true`,
@@ -2355,6 +2491,11 @@ impl Database {
         password: &str,
         options: OpenOptions,
     ) -> Result<Self> {
+        let gate = if options.offline_validation {
+            OpenModeGate::OfflineValidation
+        } else {
+            OpenModeGate::Normal
+        };
         Self::open_inner_with_credentials_and_lock_timeout(
             root,
             None,
@@ -2362,6 +2503,7 @@ impl Database {
             password,
             options.lock_timeout_ms,
             CoreResourceConfig::from_options(&options)?,
+            gate,
         )
     }
 
@@ -2386,6 +2528,7 @@ impl Database {
             password,
             lock,
             CoreResourceConfig::default(),
+            OpenModeGate::Normal,
         )
     }
 
@@ -2405,6 +2548,11 @@ impl Database {
             MongrelError::Other("database root descriptor was not pinned".into())
         })?)?;
         let kek = Arc::new(crate::encryption::Kek::derive(passphrase, &salt)?);
+        let gate = if options.offline_validation {
+            OpenModeGate::OfflineValidation
+        } else {
+            OpenModeGate::Normal
+        };
         Self::open_inner_with_credentials_locked(
             root,
             Some(kek),
@@ -2412,6 +2560,7 @@ impl Database {
             password,
             lock,
             CoreResourceConfig::from_options(&options)?,
+            gate,
         )
     }
 
@@ -2424,12 +2573,18 @@ impl Database {
     pub fn open_with_options(root: impl AsRef<Path>, options: OpenOptions) -> Result<Self> {
         // No encryption, no auth; encrypted and credentialed paths have their
         // own `*_with_options` constructors.
+        let gate = if options.offline_validation {
+            OpenModeGate::OfflineValidation
+        } else {
+            OpenModeGate::Normal
+        };
         Self::open_inner_with_lock_timeout(
             root,
             None,
             None,
             options.lock_timeout_ms,
             CoreResourceConfig::from_options(&options)?,
+            gate,
         )
     }
 
@@ -2439,9 +2594,10 @@ impl Database {
         _meta_dek_override: Option<[u8; META_DEK_LEN]>,
         lock_timeout_ms: u32,
         resources: CoreResourceConfig,
+        mode_gate: OpenModeGate,
     ) -> Result<Self> {
         let (root, lock) = Self::begin_open(root, lock_timeout_ms)?;
-        Self::open_inner_locked(root, kek, lock, resources)
+        Self::open_inner_locked(root, kek, lock, resources, mode_gate)
     }
 
     fn open_inner_locked(
@@ -2449,6 +2605,7 @@ impl Database {
         kek: Option<Arc<crate::encryption::Kek>>,
         lock: ExclusiveDatabaseLease,
         resources: CoreResourceConfig,
+        mode_gate: OpenModeGate,
     ) -> Result<Self> {
         let meta_dek = crate::encryption::meta_dek_for(kek.as_deref());
         let mut cat = catalog::read_durable(
@@ -2491,6 +2648,7 @@ impl Database {
             None,
             lock,
             resources,
+            mode_gate,
         )
     }
 
@@ -2513,12 +2671,14 @@ impl Database {
             password,
             0,
             CoreResourceConfig::default(),
+            OpenModeGate::Normal,
         )
     }
 
     /// Credentialed-open with an explicit cross-process lock timeout. The
     /// timeout is opt-in: callers that don't pass `OpenOptions` keep the
     /// historical fail-fast behavior via the wrapper above.
+    #[allow(clippy::too_many_arguments)]
     fn open_inner_with_credentials_and_lock_timeout(
         root: impl AsRef<Path>,
         kek: Option<Arc<crate::encryption::Kek>>,
@@ -2526,11 +2686,15 @@ impl Database {
         password: &str,
         lock_timeout_ms: u32,
         resources: CoreResourceConfig,
+        mode_gate: OpenModeGate,
     ) -> Result<Self> {
         let (root, lock) = Self::begin_open(root, lock_timeout_ms)?;
-        Self::open_inner_with_credentials_locked(root, kek, username, password, lock, resources)
+        Self::open_inner_with_credentials_locked(
+            root, kek, username, password, lock, resources, mode_gate,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn open_inner_with_credentials_locked(
         root: PathBuf,
         kek: Option<Arc<crate::encryption::Kek>>,
@@ -2538,6 +2702,7 @@ impl Database {
         password: &str,
         lock: ExclusiveDatabaseLease,
         resources: CoreResourceConfig,
+        mode_gate: OpenModeGate,
     ) -> Result<Self> {
         let meta_dek = crate::encryption::meta_dek_for(kek.as_deref());
         let mut cat = catalog::read_durable(
@@ -2615,6 +2780,7 @@ impl Database {
             Some(principal),
             lock,
             resources,
+            mode_gate,
         )
     }
 
@@ -2700,6 +2866,7 @@ impl Database {
             Some(admin_principal),
             lock,
             CoreResourceConfig::default(),
+            OpenModeGate::Create(crate::storage_mode::StorageMode::Standalone),
         )
     }
 
@@ -2721,7 +2888,27 @@ impl Database {
         kek: Option<Arc<crate::encryption::Kek>>,
         _meta_dek_override: Option<[u8; META_DEK_LEN]>,
     ) -> Result<Self> {
-        Self::open_inner_with_lock_timeout(root, kek, None, 0, CoreResourceConfig::default())
+        Self::open_inner_with_lock_timeout(
+            root,
+            kek,
+            None,
+            0,
+            CoreResourceConfig::default(),
+            OpenModeGate::Normal,
+        )
+    }
+
+    /// Open an existing plaintext database through the special
+    /// offline-validation API (spec section 5.3): any storage mode, read-only.
+    pub(crate) fn open_offline_validation(root: impl AsRef<Path>) -> Result<Self> {
+        Self::open_inner_with_lock_timeout(
+            root,
+            None,
+            None,
+            0,
+            CoreResourceConfig::default(),
+            OpenModeGate::OfflineValidation,
+        )
     }
 
     /// Internal recovery open for a staging directory explicitly marked as a
@@ -2807,6 +2994,7 @@ impl Database {
             principal,
             lock,
             CoreResourceConfig::default(),
+            OpenModeGate::Normal,
         )
     }
 
@@ -2872,11 +3060,62 @@ impl Database {
         principal: Option<crate::auth::Principal>,
         lock: ExclusiveDatabaseLease,
         resources: CoreResourceConfig,
+        mode_gate: OpenModeGate,
     ) -> Result<Self> {
         let durable_root = Arc::clone(lock.durable_root.as_ref().ok_or_else(|| {
             MongrelError::Other("database root descriptor was not pinned".into())
         })?);
-        let read_only = if existing {
+        // Storage-mode gate (spec section 5.3, Stage 2E): read the durable
+        // marker before any recovery side effect and fail closed on corrupt
+        // or forbidden modes. Legacy databases have no marker and are treated
+        // as Standalone (backfilled below, after recovery succeeds).
+        let storage_mode = if existing {
+            crate::storage_mode::read(&durable_root)?
+        } else {
+            None
+        };
+        match (&mode_gate, &storage_mode) {
+            (OpenModeGate::Create(_), _) => {}
+            (OpenModeGate::Normal, mode) => crate::storage_mode::check_open(mode.as_ref(), false)?,
+            (OpenModeGate::OfflineValidation, mode) => {
+                crate::storage_mode::check_open(mode.as_ref(), true)?
+            }
+            (
+                OpenModeGate::ClusterRuntime {
+                    cluster_id,
+                    node_id,
+                    database_id,
+                },
+                Some(actual),
+            ) => {
+                let expected = crate::storage_mode::StorageMode::ClusterReplica {
+                    cluster_id: *cluster_id,
+                    node_id: *node_id,
+                    database_id: *database_id,
+                };
+                if *actual != expected {
+                    return Err(
+                        crate::storage_mode::StorageModeError::IdentityMismatch(format!(
+                            "expected {expected:?}, marker holds {actual:?}"
+                        ))
+                        .into(),
+                    );
+                }
+            }
+            (OpenModeGate::ClusterRuntime { .. }, None) => {
+                return Err(crate::storage_mode::StorageModeError::IdentityMismatch(
+                    "expected a ClusterReplica marker; directory has none".into(),
+                )
+                .into());
+            }
+        }
+        let read_only = match &mode_gate {
+            OpenModeGate::OfflineValidation | OpenModeGate::ClusterRuntime { .. } => true,
+            // A freshly created cluster replica rejects user writes from the
+            // start: mutations arrive through the replicated apply path only.
+            OpenModeGate::Create(mode) => mode.cluster_identity().is_some(),
+            OpenModeGate::Normal => false,
+        } || if existing {
             match durable_root.open_regular(Path::new(META_DIR).join("replica")) {
                 Ok(_) => true,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
@@ -3243,6 +3482,20 @@ impl Database {
 
         // Persist only after all semantic recovery and table mounting succeeds.
         catalog::write_generation(&durable_root, open_generation)?;
+        // Storage-mode marker (spec section 5.3): fresh creates record their
+        // mode; legacy databases (no marker file) are backfilled as Standalone
+        // on first open. Like the open-generation write above, this is durable
+        // open bookkeeping, so it also runs for read-only opens.
+        match &mode_gate {
+            OpenModeGate::Create(mode) => crate::storage_mode::write(&durable_root, mode)?,
+            _ if existing && storage_mode.is_none() => {
+                crate::storage_mode::write(
+                    &durable_root,
+                    &crate::storage_mode::StorageMode::Standalone,
+                )?;
+            }
+            _ => {}
+        }
         shared_wal.lock().seal_open_generation(open_generation)?;
         crate::replication::replication_identity_durable(&durable_root)?;
         let next_txn_id = (open_generation << 32) | 1;
@@ -3322,6 +3575,18 @@ impl Database {
     /// The current reader-visible epoch.
     pub fn visible_epoch(&self) -> Epoch {
         self.epoch.visible()
+    }
+
+    /// The catalog's monotonic command version (S1F-001).
+    pub fn catalog_version(&self) -> u64 {
+        self.catalog.read().catalog_version
+    }
+
+    /// The durable storage mode recorded for this database (spec section 5.3).
+    /// `None` only while a legacy pre-marker database is mid-open (the marker
+    /// is backfilled before open completes).
+    pub fn storage_mode(&self) -> Result<Option<crate::storage_mode::StorageMode>> {
+        Ok(crate::storage_mode::read(&self.durable_root)?)
     }
 
     /// The core's node-level memory governor (S1E-003). Exactly one per core;
@@ -3640,6 +3905,191 @@ impl Database {
     ) -> Result<crate::catalog_cmds::CatalogDelta> {
         let record = crate::catalog_cmds::CatalogCommandRecord::next(next_catalog, command);
         next_catalog.apply_command(&record)
+    }
+
+    /// Stage 2E (spec section 11.5): apply one committed replicated
+    /// transaction's staged records through the **same** logic the WAL
+    /// recovery path uses ([`recover_shared_wal`]).
+    ///
+    /// The payload is a complete record sequence of one committed transaction
+    /// (data ops, `Op::CommitTimestamp`, and exactly one trailing
+    /// `Op::TxnCommit`), carrying the leader-assigned commit epoch so every
+    /// replica applies byte-identical records deterministically.
+    ///
+    /// Application is durable before it returns: the records are appended
+    /// verbatim to the core's shared WAL and group-synced, so the raft state
+    /// machine's post-apply checkpoint never acknowledges rows a crash would
+    /// lose. Application is idempotent: a payload whose commit epoch is at or
+    /// below the core's visible watermark is a replay (the state machine
+    /// dispatches sink-first, checkpoints second — a crash in that window
+    /// redelivers) and is skipped without side effects. Returns `Ok(true)`
+    /// when the payload was applied, `Ok(false)` for a recognized replay.
+    pub fn apply_replicated_records(&self, records: &[crate::wal::Record]) -> Result<bool> {
+        use crate::wal::Op;
+        use std::sync::atomic::Ordering;
+
+        let _operation = self.admit_operation()?;
+        if self.poisoned.load(Ordering::Relaxed) {
+            return Err(MongrelError::Other(
+                "database poisoned by fsync error".into(),
+            ));
+        }
+        // Structural validation (fail closed): one transaction, exactly one
+        // commit marker, at the tail.
+        let txn_id = records.first().map(|record| record.txn_id).ok_or_else(|| {
+            MongrelError::InvalidArgument("replicated transaction payload is empty".into())
+        })?;
+        if records.iter().any(|record| record.txn_id != txn_id) {
+            return Err(MongrelError::InvalidArgument(
+                "replicated transaction payload mixes transaction ids".into(),
+            ));
+        }
+        let commits = records
+            .iter()
+            .filter(|record| matches!(record.op, Op::TxnCommit { .. }))
+            .count();
+        if commits != 1 || !matches!(records.last().map(|r| &r.op), Some(Op::TxnCommit { .. })) {
+            return Err(MongrelError::InvalidArgument(
+                "replicated transaction payload must end in exactly one commit marker".into(),
+            ));
+        }
+        let commit_epoch = match records.last().map(|r| &r.op) {
+            Some(Op::TxnCommit { epoch, .. }) => *epoch,
+            _ => unreachable!("validated above"),
+        };
+        // Fail closed on spilled-run linking: an `added_runs` commit links
+        // run files that exist only on the leader. Replicated spill
+        // translation (staging logical row records instead of run
+        // references, spec section 8.5) lands with the Stage 2C write
+        // protocol; this wave applies row-level records only.
+        if let Some(Op::TxnCommit { added_runs, .. }) = records.last().map(|r| &r.op) {
+            if !added_runs.is_empty() {
+                return Err(MongrelError::InvalidArgument(
+                    "replicated spilled-run commits are not supported this wave: the leader \
+                     must stage logical row records (spill translation lands with Stage 2C)"
+                        .into(),
+                ));
+            }
+        }
+        // Replay guard: the leader assigns one monotonically increasing epoch
+        // per committed transaction in log order, so anything at or below the
+        // core's watermark is already applied.
+        if commit_epoch <= self.epoch.visible().0 {
+            return Ok(false);
+        }
+        // Stage durable first: verbatim WAL append + fsync. The raft log is
+        // the commit authority; the local WAL is this replica's durable
+        // staging of already-committed commands (restart recovery replays it
+        // through the identical path, gated by flushed epochs).
+        {
+            let mut wal = self.shared_wal.lock();
+            for record in records {
+                wal.append(record.txn_id, 0, record.op.clone())?;
+            }
+            if let Err(error) = wal.group_sync() {
+                self.poisoned.store(true, Ordering::Relaxed);
+                return Err(error);
+            }
+        }
+        let tables = self.tables.read().clone();
+        let catalog = self.catalog.read().clone();
+        recover_shared_wal(&self.durable_root, &tables, &catalog, &self.epoch, records)?;
+        Ok(true)
+    }
+
+    /// Stage 2E (spec sections 10.6, 11.5): apply one committed replicated
+    /// catalog command and checkpoint the catalog. The record travels as the
+    /// payload of a replicated `Catalog` command envelope and routes through
+    /// [`Catalog::apply_command`] — the S1F-001 versioned, idempotent command
+    /// path (replaying an already-applied `catalog_version` is a no-op).
+    /// Structural deltas are mirrored into the mounted table set: a created
+    /// table is mounted, a dropped table unmounted. Deterministic: the record
+    /// carries every resolved value (ids, epochs, complete images).
+    pub fn apply_replicated_catalog_command(
+        &self,
+        record: &crate::catalog_cmds::CatalogCommandRecord,
+    ) -> Result<crate::catalog_cmds::CatalogDelta> {
+        let _operation = self.admit_operation()?;
+        let _g = self.ddl_lock.lock();
+        let mut next_catalog = self.catalog.read().clone();
+        let delta = next_catalog.apply_command(record)?;
+        if matches!(delta, crate::catalog_cmds::CatalogDelta::NoOp) {
+            return Ok(delta);
+        }
+        // The leader references epochs in structural commands (a table's
+        // creation/drop epoch). The replica's epoch stream must cover them:
+        // epochs stay the commit sequencer's authority, so commands never
+        // allocate one, but the watermark advances to every referenced epoch
+        // (mirroring how `create_table_with_state` bumps `db_epoch`).
+        let referenced_epoch = match &delta {
+            crate::catalog_cmds::CatalogDelta::TableCreated { entry } => Some(entry.created_epoch),
+            crate::catalog_cmds::CatalogDelta::TableDropped { at_epoch, .. }
+            | crate::catalog_cmds::CatalogDelta::TableRenamed { at_epoch, .. } => Some(*at_epoch),
+            _ => None,
+        };
+        if let Some(referenced) = referenced_epoch {
+            self.epoch.advance_recovered(Epoch(referenced));
+            next_catalog.db_epoch = next_catalog.db_epoch.max(referenced);
+        }
+        match &delta {
+            crate::catalog_cmds::CatalogDelta::TableCreated { entry } => {
+                // Guard against a repeated mount within one open (the state
+                // machine's crash-window redispatch is filtered by the NoOp
+                // arm above; this covers a catalog checkpoint that never
+                // became durable before a crash).
+                if !self.tables.read().contains_key(&entry.table_id) {
+                    self.mount_catalog_entry(entry)?;
+                }
+            }
+            crate::catalog_cmds::CatalogDelta::TableDropped { table_id, .. } => {
+                self.tables.write().remove(table_id);
+            }
+            _ => {}
+        }
+        // Durable BEFORE return: the catalog checkpoint is the only local
+        // durable record of the command (replicated catalog commands do not
+        // ride the local WAL), and the state machine checkpoints right after.
+        catalog::write_atomic(&self.root, &next_catalog, self.meta_dek.as_ref())?;
+        *self.catalog.write() = next_catalog;
+        Ok(delta)
+    }
+
+    /// Mount a table that a replicated catalog command created (Stage 2E):
+    /// create the table directory and build the mounted table exactly like
+    /// the create-table path does, minus the standalone WAL/commit side
+    /// effects (the command itself is already durable in the raft log).
+    fn mount_catalog_entry(&self, entry: &crate::catalog::CatalogEntry) -> Result<()> {
+        let table_relative = Path::new(TABLES_DIR).join(entry.table_id.to_string());
+        let table_root = Arc::new(
+            self.durable_root
+                .create_directory_all_pinned(&table_relative)?,
+        );
+        let tdir = table_root.io_path()?;
+        let ctx = SharedCtx {
+            root_guard: Some(table_root),
+            epoch: Arc::clone(&self.epoch),
+            page_cache: Arc::clone(&self.page_cache),
+            decoded_cache: Arc::clone(&self.decoded_cache),
+            snapshots: Arc::clone(&self.snapshots),
+            kek: self.kek.clone(),
+            commit_lock: Arc::clone(&self.commit_lock),
+            shared: Some(crate::engine::SharedWalCtx {
+                wal: Arc::clone(&self.shared_wal),
+                group: Arc::clone(&self.group),
+                poisoned: Arc::clone(&self.poisoned),
+                txn_ids: Arc::clone(&self.next_txn_id),
+                change_wake: self.change_wake.clone(),
+                lifecycle: Arc::clone(&self.lifecycle),
+            }),
+            table_name: Some(entry.name.clone()),
+            auth: self.table_auth_checker(),
+            read_only: self.read_only,
+        };
+        let table = Table::create_in(&tdir, entry.schema.clone(), entry.table_id, ctx)?;
+        self.tables
+            .write()
+            .insert(entry.table_id, TableHandle::new(table));
+        Ok(())
     }
 
     fn publish_catalog_candidate(
@@ -19095,5 +19545,390 @@ mod commit_ts_ledger_tests {
                 node_tiebreaker: 0,
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod stage2e_storage_mode_tests {
+    use super::*;
+    use crate::schema::{ColumnDef, ColumnFlags, Schema, TypeId};
+    use crate::storage_mode::{StorageMode, STORAGE_MODE_FILENAME};
+    use mongreldb_types::ids::{ClusterId, DatabaseId, NodeId};
+
+    fn identity(seed: u8) -> (ClusterId, NodeId, DatabaseId) {
+        (
+            ClusterId::from_bytes([seed; 16]),
+            NodeId::from_bytes([seed + 1; 16]),
+            DatabaseId::from_bytes([seed + 2; 16]),
+        )
+    }
+
+    fn marker(root: &Path) -> Option<StorageMode> {
+        let durable = crate::durable_file::DurableRoot::open(root).unwrap();
+        crate::storage_mode::read(&durable).unwrap()
+    }
+
+    fn simple_schema() -> Schema {
+        Schema {
+            columns: vec![ColumnDef {
+                id: 1,
+                name: "id".into(),
+                ty: TypeId::Int64,
+                flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
+            }],
+            ..Schema::default()
+        }
+    }
+
+    #[test]
+    fn standalone_create_writes_marker_and_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let db = Database::create(&root).unwrap();
+        assert_eq!(marker(&root), Some(StorageMode::Standalone));
+        assert_eq!(db.storage_mode().unwrap(), Some(StorageMode::Standalone));
+        drop(db);
+        let db = Database::open(&root).unwrap();
+        assert_eq!(marker(&root), Some(StorageMode::Standalone));
+        drop(db);
+    }
+
+    #[test]
+    fn legacy_database_without_marker_opens_and_gains_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let db = Database::create(&root).unwrap();
+        drop(db);
+        // Simulate a pre-marker database.
+        std::fs::remove_file(root.join(META_DIR).join(STORAGE_MODE_FILENAME)).unwrap();
+        assert_eq!(marker(&root), None);
+        let db = Database::open(&root).unwrap();
+        assert_eq!(marker(&root), Some(StorageMode::Standalone));
+        drop(db);
+    }
+
+    #[test]
+    fn server_owned_standalone_opens_embedded() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let db = Database::create(&root).unwrap();
+        drop(db);
+        let durable = crate::durable_file::DurableRoot::open(&root).unwrap();
+        crate::storage_mode::rewrite(&durable, &StorageMode::ServerOwnedStandalone).unwrap();
+        let db = Database::open(&root).unwrap();
+        assert_eq!(marker(&root), Some(StorageMode::ServerOwnedStandalone));
+        drop(db);
+    }
+
+    #[test]
+    fn cluster_replica_is_rejected_by_normal_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let (cluster_id, node_id, database_id) = identity(10);
+        let db = Database::create_cluster_replica(&root, cluster_id, node_id, database_id).unwrap();
+        assert_eq!(
+            marker(&root),
+            Some(StorageMode::ClusterReplica {
+                cluster_id,
+                node_id,
+                database_id,
+            })
+        );
+        drop(db);
+
+        let error = Database::open(&root).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            matches!(error, MongrelError::InvalidArgument(_)),
+            "unexpected error: {message}"
+        );
+        assert!(message.contains("cluster node runtime"), "{message}");
+        assert!(message.contains(&cluster_id.to_hex()), "{message}");
+        assert!(message.contains(&node_id.to_hex()), "{message}");
+        assert!(message.contains(&database_id.to_hex()), "{message}");
+
+        let error = Database::open_with_options(&root, OpenOptions::default()).unwrap_err();
+        assert!(error.to_string().contains("cluster node runtime"));
+        // The rejected opens never disturbed the marker.
+        assert_eq!(
+            marker(&root),
+            Some(StorageMode::ClusterReplica {
+                cluster_id,
+                node_id,
+                database_id,
+            })
+        );
+    }
+
+    #[test]
+    fn offline_validation_opens_cluster_replica_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let (cluster_id, node_id, database_id) = identity(20);
+        let db = Database::create_cluster_replica(&root, cluster_id, node_id, database_id).unwrap();
+        drop(db);
+
+        let options = OpenOptions::default().with_offline_validation(true);
+        let db = Database::open_with_options(&root, options).unwrap();
+        assert!(db.is_read_only_replica());
+        let error = db.create_table("t", simple_schema()).unwrap_err();
+        assert!(matches!(error, MongrelError::ReadOnlyReplica));
+        drop(db);
+        // Offline validation leaves the marker exactly as found.
+        assert_eq!(
+            marker(&root),
+            Some(StorageMode::ClusterReplica {
+                cluster_id,
+                node_id,
+                database_id,
+            })
+        );
+    }
+
+    #[test]
+    fn cluster_runtime_open_requires_exact_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("db");
+        let (cluster_id, node_id, database_id) = identity(30);
+        let db = Database::create_cluster_replica(&root, cluster_id, node_id, database_id).unwrap();
+        drop(db);
+
+        // A non-ClusterReplica expectation is a caller error.
+        let error = Database::open_cluster_replica(&root, &StorageMode::Standalone).unwrap_err();
+        assert!(matches!(error, MongrelError::InvalidArgument(_)));
+        // Wrong database identity fails closed.
+        let wrong = StorageMode::ClusterReplica {
+            cluster_id,
+            node_id,
+            database_id: DatabaseId::from_bytes([99; 16]),
+        };
+        let error = Database::open_cluster_replica(&root, &wrong).unwrap_err();
+        assert!(error.to_string().contains("identity mismatch"), "{error}");
+        // A legacy database without a marker is not a cluster replica.
+        let legacy = dir.path().join("legacy");
+        let legacy_db = Database::create(&legacy).unwrap();
+        drop(legacy_db);
+        let expected = StorageMode::ClusterReplica {
+            cluster_id,
+            node_id,
+            database_id,
+        };
+        let error = Database::open_cluster_replica(&legacy, &expected).unwrap_err();
+        assert!(error.to_string().contains("identity mismatch"), "{error}");
+
+        // The matching identity opens; user writes are rejected (writes
+        // arrive through the replicated apply path only).
+        let db = Database::open_cluster_replica(&root, &expected).unwrap();
+        assert!(db.is_read_only_replica());
+        let error = db.create_table("t", simple_schema()).unwrap_err();
+        assert!(matches!(error, MongrelError::ReadOnlyReplica));
+        drop(db);
+    }
+}
+
+#[cfg(test)]
+mod stage2e_replicated_apply_tests {
+    use super::*;
+    use crate::catalog_cmds::{CatalogCommand, CatalogCommandRecord, CatalogDelta};
+    use crate::memtable::{Row, Value};
+    use crate::schema::{ColumnDef, ColumnFlags, Schema, TypeId};
+    use crate::wal::{Op, Record};
+    use mongreldb_types::ids::{ClusterId, DatabaseId, NodeId};
+    use std::sync::Arc;
+
+    fn ids() -> (ClusterId, NodeId, DatabaseId) {
+        (
+            ClusterId::from_bytes([1; 16]),
+            NodeId::from_bytes([2; 16]),
+            DatabaseId::from_bytes([3; 16]),
+        )
+    }
+
+    fn expected_mode() -> crate::storage_mode::StorageMode {
+        let (cluster_id, node_id, database_id) = ids();
+        crate::storage_mode::StorageMode::ClusterReplica {
+            cluster_id,
+            node_id,
+            database_id,
+        }
+    }
+
+    fn simple_schema() -> Schema {
+        Schema {
+            columns: vec![ColumnDef {
+                id: 1,
+                name: "id".into(),
+                ty: TypeId::Int64,
+                flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
+            }],
+            ..Schema::default()
+        }
+    }
+
+    fn create_table_record(name: &str, catalog_version: u64) -> CatalogCommandRecord {
+        CatalogCommandRecord {
+            version: crate::catalog_cmds::CATALOG_COMMAND_FORMAT_VERSION,
+            catalog_version,
+            command: CatalogCommand::CreateTable {
+                name: name.to_string(),
+                schema: simple_schema(),
+                created_epoch: 1,
+            },
+        }
+    }
+
+    fn put_records(txn_id: u64, table_id: u64, epoch: u64, values: &[i64]) -> Vec<Record> {
+        let rows: Vec<Row> = values
+            .iter()
+            .map(|value| {
+                // Distinct row ids per value so batches never overwrite each
+                // other's MVCC versions.
+                Row::new(crate::RowId(*value as u64), Epoch(epoch))
+                    .with_column(1, Value::Int64(*value))
+            })
+            .collect();
+        vec![
+            Record::new(
+                Epoch(0),
+                txn_id,
+                Op::Put {
+                    table_id,
+                    rows: bincode::serialize(&rows).unwrap(),
+                },
+            ),
+            Record::new(Epoch(0), txn_id, Op::CommitTimestamp { unix_nanos: 1_000 }),
+            Record::new(
+                Epoch(0),
+                txn_id,
+                Op::TxnCommit {
+                    epoch,
+                    added_runs: Vec::new(),
+                },
+            ),
+        ]
+    }
+
+    fn visible_ids(db: &Database, table: &str) -> Vec<i64> {
+        let handle = db.table(table).unwrap();
+        let rows = handle
+            .lock()
+            .visible_rows(crate::epoch::Snapshot::at(Epoch(u64::MAX)))
+            .unwrap();
+        let mut values: Vec<i64> = rows
+            .iter()
+            .map(|row| match row.columns.get(&1) {
+                Some(Value::Int64(value)) => *value,
+                other => panic!("unexpected column: {other:?}"),
+            })
+            .collect();
+        values.sort_unstable();
+        values
+    }
+
+    #[test]
+    fn catalog_command_mounts_table_and_replays_as_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cluster_id, node_id, database_id) = ids();
+        let db =
+            Database::create_cluster_replica(dir.path(), cluster_id, node_id, database_id).unwrap();
+
+        let record = create_table_record("items", 1);
+        let delta = db.apply_replicated_catalog_command(&record).unwrap();
+        assert!(matches!(delta, CatalogDelta::TableCreated { .. }));
+        assert_eq!(db.table_names(), vec!["items".to_string()]);
+        assert_eq!(db.catalog_version(), 1);
+
+        // Idempotent replay of the same record.
+        let delta = db.apply_replicated_catalog_command(&record).unwrap();
+        assert!(matches!(delta, CatalogDelta::NoOp));
+        assert_eq!(db.table_names().len(), 1);
+        drop(db);
+
+        // The command was checkpointed: the table survives reopen.
+        let db = Database::open_cluster_replica(dir.path(), &expected_mode()).unwrap();
+        assert_eq!(db.table_names(), vec!["items".to_string()]);
+        assert_eq!(db.catalog_version(), 1);
+    }
+
+    #[test]
+    fn records_apply_rows_and_skip_replays_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cluster_id, node_id, database_id) = ids();
+        let db =
+            Database::create_cluster_replica(dir.path(), cluster_id, node_id, database_id).unwrap();
+        db.apply_replicated_catalog_command(&create_table_record("items", 1))
+            .unwrap();
+
+        let records = put_records(1, 0, 2, &[10, 20, 30]);
+        assert!(db.apply_replicated_records(&records).unwrap());
+        assert_eq!(visible_ids(&db, "items"), vec![10, 20, 30]);
+        assert_eq!(db.visible_epoch(), Epoch(2));
+
+        // Crash-window redelivery of the same committed transaction is a
+        // side-effect-free replay.
+        assert!(!db.apply_replicated_records(&records).unwrap());
+        assert_eq!(visible_ids(&db, "items"), vec![10, 20, 30]);
+
+        // A later transaction at a higher epoch still applies.
+        let later = put_records(2, 0, 3, &[40]);
+        assert!(db.apply_replicated_records(&later).unwrap());
+        assert_eq!(visible_ids(&db, "items"), vec![10, 20, 30, 40]);
+        let db = Arc::new(db);
+        db.shutdown().unwrap();
+
+        // Restart: the local WAL replays the applied rows, and the state
+        // machine's redelivery is recognized as a replay — no double-apply.
+        let db = Database::open_cluster_replica(dir.path(), &expected_mode()).unwrap();
+        assert_eq!(visible_ids(&db, "items"), vec![10, 20, 30, 40]);
+        assert!(!db.apply_replicated_records(&later).unwrap());
+        assert!(!db.apply_replicated_records(&records).unwrap());
+        assert_eq!(visible_ids(&db, "items"), vec![10, 20, 30, 40]);
+    }
+
+    #[test]
+    fn spilled_run_commits_fail_closed_this_wave() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cluster_id, node_id, database_id) = ids();
+        let db =
+            Database::create_cluster_replica(dir.path(), cluster_id, node_id, database_id).unwrap();
+        db.apply_replicated_catalog_command(&create_table_record("items", 1))
+            .unwrap();
+        let mut records = put_records(1, 0, 2, &[10]);
+        let Some(Op::TxnCommit { added_runs, .. }) = records.last_mut().map(|r| &mut r.op) else {
+            panic!("put_records ends in TxnCommit");
+        };
+        added_runs.push(crate::wal::AddedRun {
+            table_id: 0,
+            run_id: 7,
+            row_count: 1,
+            level: 0,
+            min_row_id: 1,
+            max_row_id: 1,
+            content_hash: [0; 32],
+        });
+        let error = db.apply_replicated_records(&records).unwrap_err();
+        assert!(
+            error.to_string().contains("spilled-run"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(visible_ids(&db, "items"), Vec::<i64>::new());
+    }
+
+    #[test]
+    fn records_without_commit_marker_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cluster_id, node_id, database_id) = ids();
+        let db =
+            Database::create_cluster_replica(dir.path(), cluster_id, node_id, database_id).unwrap();
+        db.apply_replicated_catalog_command(&create_table_record("items", 1))
+            .unwrap();
+        let mut records = put_records(1, 0, 2, &[10]);
+        records.pop(); // strip the TxnCommit
+        let error = db.apply_replicated_records(&records).unwrap_err();
+        assert!(matches!(error, MongrelError::InvalidArgument(_)));
+        assert!(db.apply_replicated_records(&[]).is_err());
+        assert_eq!(visible_ids(&db, "items"), Vec::<i64>::new());
     }
 }

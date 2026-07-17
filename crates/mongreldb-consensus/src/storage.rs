@@ -32,13 +32,27 @@
 //!   segment to the last good frame; a checksum failure anywhere else fails
 //!   closed with [`StoreError::Corrupt`].
 //!
+//! # LeaderDisk completion registry (Stage 2C, spec section 11.3)
+//!
+//! A `LeaderDisk` proposal registers a waiter keyed by its command id. The
+//! waiter is bound when the leader appends the entry carrying that command
+//! (blank and membership entries never bind) and is signaled **only after
+//! the segment fsync covering the entry completes** — [`FsyncPolicy::PerAppend`]
+//! signals immediately after the append's fsync, [`FsyncPolicy::Deferred`]
+//! signals from the background flusher after the batch fsync, riding the
+//! same durability boundary as the flush callbacks. A crash before the
+//! fsync therefore never produces an acknowledgment. Waiters whose entries
+//! are truncated before their fsync (leadership lost; the entry was only
+//! leader-local) are failed with [`LeaderDiskDrop::Truncated`]: they can
+//! never become durable under that command.
+//!
 //! # Fault hooks (FND-006)
 //!
 //! `raft.hard_state.write.before` / `raft.hard_state.write.after`,
 //! `raft.log.append.before` / `raft.log.append.after`,
 //! `raft.log.fsync.before` / `raft.log.fsync.after`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::ops::RangeBounds;
@@ -48,8 +62,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use openraft::storage::{LogFlushed, LogState, RaftLogReader, RaftLogStorage};
-use openraft::{ErrorSubject, ErrorVerb, StorageIOError};
+use openraft::{EntryPayload, ErrorSubject, ErrorVerb, StorageIOError};
 use sha2::{Digest, Sha256};
+use tokio::sync::oneshot;
 
 use crate::identity::{
     MongrelRaftConfig, RaftLogEntry, RaftLogId, RaftNodeId, RaftStorageError, RaftVote,
@@ -87,7 +102,10 @@ pub enum StoreError {
 }
 
 impl StoreError {
-    pub(crate) fn io<'a>(path: &'a Path, verb: &'static str) -> impl FnOnce(io::Error) -> Self + 'a {
+    pub(crate) fn io<'a>(
+        path: &'a Path,
+        verb: &'static str,
+    ) -> impl FnOnce(io::Error) -> Self + 'a {
         move |source| StoreError::Io {
             path: path.to_path_buf(),
             verb,
@@ -106,7 +124,7 @@ impl StoreError {
         StoreError::Io {
             path: path.to_path_buf(),
             verb,
-            source: io::Error::new(io::ErrorKind::Other, fault),
+            source: io::Error::other(fault),
         }
     }
 }
@@ -123,9 +141,10 @@ pub(crate) fn raft_storage_error(
 }
 
 /// Log-append fsync policy (S2B-002). The default is durable.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum FsyncPolicy {
     /// Fsync the active segment before the append's flush callback fires.
+    #[default]
     PerAppend,
     /// Batch fsyncs on a fixed interval; flush callbacks fire only after the
     /// batch fsync completes, so acknowledged entries are always durable.
@@ -134,12 +153,6 @@ pub enum FsyncPolicy {
         /// How often the background flusher fsyncs and releases callbacks.
         interval: Duration,
     },
-}
-
-impl Default for FsyncPolicy {
-    fn default() -> Self {
-        FsyncPolicy::PerAppend
-    }
 }
 
 /// Configuration for consensus storage.
@@ -180,7 +193,10 @@ pub(crate) fn decode_versioned<T: for<'de> serde::Deserialize<'de>>(
     body: &[u8],
 ) -> Result<T, StoreError> {
     if body.len() < 4 {
-        return Err(StoreError::corrupt(path, "body shorter than format version"));
+        return Err(StoreError::corrupt(
+            path,
+            "body shorter than format version",
+        ));
     }
     let version = u32::from_le_bytes(body[..4].try_into().expect("slice len"));
     if version != FORMAT_VERSION {
@@ -210,7 +226,8 @@ pub(crate) fn write_frame_file(
             .and_then(|()| file.write_all(&hash))
             .and_then(|()| file.write_all(body))
             .map_err(StoreError::io(&tmp_path, "write"))?;
-        file.sync_all().map_err(StoreError::io(&tmp_path, "fsync"))?;
+        file.sync_all()
+            .map_err(StoreError::io(&tmp_path, "fsync"))?;
     }
     std::fs::rename(&tmp_path, &final_path).map_err(StoreError::io(&final_path, "rename"))?;
     fsync_dir(dir)?;
@@ -222,7 +239,8 @@ pub(crate) fn read_frame_file(path: &Path, magic: &[u8; 8]) -> Result<Option<Vec
     let mut bytes = Vec::new();
     match File::open(path) {
         Ok(mut file) => {
-            file.read_to_end(&mut bytes).map_err(StoreError::io(path, "read"))?;
+            file.read_to_end(&mut bytes)
+                .map_err(StoreError::io(path, "read"))?;
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(StoreError::io(path, "open")(e)),
@@ -321,6 +339,8 @@ struct LogInner {
     active_entry_count: u64,
     /// Flush callbacks waiting for the next Deferred fsync.
     pending: Vec<LogFlushed<MongrelRaftConfig>>,
+    /// LeaderDisk waiters (command id → post-fsync signal), S2C.
+    leader_disk: HashMap<[u8; 16], LeaderDiskWaiter>,
     flusher_spawned: bool,
     stop: Arc<AtomicBool>,
     config: StorageConfig,
@@ -335,8 +355,8 @@ impl LogInner {
         self.index
             .values()
             .next_back()
-            .map(|(log_id, _)| log_id.clone())
-            .or_else(|| self.last_purged.clone())
+            .map(|(log_id, _)| *log_id)
+            .or(self.last_purged)
     }
 
     /// Recounts entries located in the active segment (after truncate/purge).
@@ -346,8 +366,11 @@ impl LogInner {
             return;
         }
         let ordinal = self.active_segment_ordinal();
-        self.active_entry_count =
-            self.index.values().filter(|(_, loc)| loc.segment == ordinal).count() as u64;
+        self.active_entry_count = self
+            .index
+            .values()
+            .filter(|(_, loc)| loc.segment == ordinal)
+            .count() as u64;
     }
 }
 
@@ -357,12 +380,15 @@ fn read_frame_at(path: &Path, offset: u64) -> Result<(Vec<u8>, u64), StoreError>
     file.seek(SeekFrom::Start(offset))
         .map_err(StoreError::io(path, "seek"))?;
     let mut len_buf = [0u8; 4];
-    file.read_exact(&mut len_buf).map_err(StoreError::io(path, "read"))?;
+    file.read_exact(&mut len_buf)
+        .map_err(StoreError::io(path, "read"))?;
     let body_len = u32::from_le_bytes(len_buf) as usize;
     let mut body = vec![0u8; body_len];
-    file.read_exact(&mut body).map_err(StoreError::io(path, "read"))?;
+    file.read_exact(&mut body)
+        .map_err(StoreError::io(path, "read"))?;
     let mut hash = [0u8; 32];
-    file.read_exact(&mut hash).map_err(StoreError::io(path, "read"))?;
+    file.read_exact(&mut hash)
+        .map_err(StoreError::io(path, "read"))?;
     let calc = Sha256::digest(&body);
     if hash != calc.as_slice() {
         return Err(StoreError::corrupt(path, "frame checksum mismatch"));
@@ -381,6 +407,51 @@ fn encode_frame(body: &[u8]) -> Vec<u8> {
 
 fn segment_name(first_index: u64) -> String {
     format!("seg-{first_index:020}.seg")
+}
+
+// ---------------------------------------------------------------------------
+// LeaderDisk completion registry (S2C)
+// ---------------------------------------------------------------------------
+
+/// Why a LeaderDisk waiter resolved without a durability signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaderDiskDrop {
+    /// The entry was truncated (leadership lost) before the fsync covering
+    /// it completed, so the command can never become leader-local durable
+    /// here. Only ever sent for entries proposed in the node's current
+    /// term; conflicting old-term entries are exactly what raft truncates.
+    Truncated,
+    /// The log store was closed before the fsync covering the entry.
+    Closed,
+}
+
+/// One in-flight LeaderDisk waiter (command id → post-fsync signal).
+struct LeaderDiskWaiter {
+    /// The appended entry's log id; `None` until the leader appends the
+    /// entry carrying this command id (same-term proposals only).
+    log_id: Option<RaftLogId>,
+    /// Signaled strictly after the segment fsync covering `log_id`.
+    signal: oneshot::Sender<Result<RaftLogId, LeaderDiskDrop>>,
+}
+
+/// Removes from `inner` every waiter whose bound entry index is at or below
+/// `watermark` (the highest appended index when an fsync began). Must only
+/// be called after that fsync completed successfully.
+fn covered_signals(inner: &mut LogInner, watermark: u64) -> Vec<LeaderDiskWaiter> {
+    let covered: Vec<[u8; 16]> = inner
+        .leader_disk
+        .iter()
+        .filter_map(|(command_id, waiter)| {
+            waiter
+                .log_id
+                .filter(|log_id| log_id.index <= watermark)
+                .map(|_| *command_id)
+        })
+        .collect();
+    covered
+        .into_iter()
+        .filter_map(|command_id| inner.leader_disk.remove(&command_id))
+        .collect()
 }
 
 /// Shared read access to the log, used by the log reader and by
@@ -406,7 +477,72 @@ impl SharedLog {
     /// The last purged log id, if any.
     #[allow(dead_code)] // exercised through RaftLogStorage::get_log_state
     pub(crate) fn last_purged_log_id(&self) -> Result<Option<RaftLogId>, StoreError> {
-        Ok(self.lock()?.last_purged.clone())
+        Ok(self.lock()?.last_purged)
+    }
+
+    /// Registers a LeaderDisk completion waiter for `command_id` (S2C). The
+    /// returned receiver resolves strictly after the segment fsync covering
+    /// the entry that carries this command (never before), or with a
+    /// [`LeaderDiskDrop`] reason when the entry can never become
+    /// leader-local durable here.
+    ///
+    /// Registration must precede the proposal's append so the bind in
+    /// `write_frames` cannot be missed. A second in-flight waiter for the
+    /// same command id fails fast.
+    pub(crate) fn register_leader_disk_waiter(
+        &self,
+        command_id: [u8; 16],
+    ) -> Result<oneshot::Receiver<Result<RaftLogId, LeaderDiskDrop>>, StoreError> {
+        let mut inner = self.lock()?;
+        // Reap waiters whose proposer already went away (deadline,
+        // cancellation) without an explicit deregister.
+        inner
+            .leader_disk
+            .retain(|_, waiter| !waiter.signal.is_closed());
+        if inner.leader_disk.contains_key(&command_id) {
+            return Err(StoreError::corrupt(
+                Path::new("<leader-disk>"),
+                "a LeaderDisk waiter for this command id is already in flight",
+            ));
+        }
+        let (signal, receiver) = oneshot::channel();
+        inner.leader_disk.insert(
+            command_id,
+            LeaderDiskWaiter {
+                log_id: None,
+                signal,
+            },
+        );
+        Ok(receiver)
+    }
+
+    /// Removes a LeaderDisk waiter without signaling (the proposal aborted
+    /// before its entry was appended or its waiter was superseded).
+    pub(crate) fn deregister_leader_disk_waiter(&self, command_id: [u8; 16]) {
+        if let Ok(mut inner) = self.lock() {
+            inner.leader_disk.remove(&command_id);
+        }
+    }
+
+    /// Drains every LeaderDisk waiter whose bound entry is covered by an
+    /// fsync taken at `watermark` (the highest appended index when the
+    /// fsync began). Callers invoke this strictly AFTER a successful fsync
+    /// and send the returned signals; sending consumes the waiter.
+    fn take_durable_signals(&self, watermark: u64) -> Vec<LeaderDiskWaiter> {
+        match self.lock() {
+            Ok(mut inner) => covered_signals(&mut inner, watermark),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Signals every waiter covered by a completed fsync at `watermark`.
+    /// Sends happen outside the lock; a closed receiver is simply dropped.
+    fn signal_durable(&self, watermark: u64) {
+        for waiter in self.take_durable_signals(watermark) {
+            if let Some(log_id) = waiter.log_id {
+                let _ = waiter.signal.send(Ok(log_id));
+            }
+        }
     }
 
     /// Reads entries in `[start, end)`, at most `limit`, in log order.
@@ -440,13 +576,33 @@ impl SharedLog {
     pub(crate) fn close(&self) {
         if let Ok(mut inner) = self.inner.lock() {
             inner.stop.store(true, Ordering::Release);
-            if let Some(active) = &inner.active {
-                let _ = active.sync_data();
-            }
+            // Only a successful fsync makes appended entries durable; a
+            // failed one must not release LeaderDisk signals (honesty).
+            let watermark = match &inner.active {
+                Some(active) if active.sync_data().is_ok() => {
+                    inner.last_indexed().map_or(0, |log_id| log_id.index)
+                }
+                _ => 0,
+            };
             let pending = std::mem::take(&mut inner.pending);
+            // The fsync above covers every appended entry: release covered
+            // LeaderDisk waiters honestly, then fail the rest (never
+            // appended, or the fsync failed) so no proposer hangs across
+            // shutdown.
+            let signaled = covered_signals(&mut inner, watermark);
+            let dropped: Vec<LeaderDiskWaiter> =
+                inner.leader_disk.drain().map(|(_, w)| w).collect();
             drop(inner);
             for callback in pending {
                 callback.log_io_completed(Ok(()));
+            }
+            for waiter in signaled {
+                if let Some(log_id) = waiter.log_id {
+                    let _ = waiter.signal.send(Ok(log_id));
+                }
+            }
+            for waiter in dropped {
+                let _ = waiter.signal.send(Err(LeaderDiskDrop::Closed));
             }
         }
     }
@@ -458,6 +614,7 @@ pub struct MongrelLogReader {
 }
 
 /// Shared range-read used by both log-reader implementations.
+#[allow(clippy::result_large_err)] // openraft's trait fixes this error type
 fn read_entries_range<RB: RangeBounds<u64> + Clone + std::fmt::Debug + Send>(
     shared: &SharedLog,
     range: RB,
@@ -517,7 +674,10 @@ impl MongrelLogStore {
         for entry in std::fs::read_dir(&log_dir).map_err(StoreError::io(&log_dir, "read dir"))? {
             let entry = entry.map_err(StoreError::io(&log_dir, "read dir"))?;
             let name = entry.file_name().to_string_lossy().into_owned();
-            if let Some(rest) = name.strip_prefix("seg-").and_then(|n| n.strip_suffix(".seg")) {
+            if let Some(rest) = name
+                .strip_prefix("seg-")
+                .and_then(|n| n.strip_suffix(".seg"))
+            {
                 if let Ok(first_index) = rest.parse::<u64>() {
                     segment_files.push((first_index, entry.path()));
                 }
@@ -529,11 +689,12 @@ impl MongrelLogStore {
             dir: log_dir.clone(),
             segments: Vec::new(),
             index: BTreeMap::new(),
-            last_purged: last_purged.clone(),
+            last_purged,
             active: None,
             active_len: 0,
             active_entry_count: 0,
             pending: Vec::new(),
+            leader_disk: HashMap::new(),
             flusher_spawned: false,
             stop: Arc::new(AtomicBool::new(false)),
             config,
@@ -574,7 +735,9 @@ impl MongrelLogStore {
         let ordinal = inner.segments.len();
         let mut offset = 0u64;
         let mut frame_no = 0u64;
-        let file_len = std::fs::metadata(path).map_err(StoreError::io(path, "metadata"))?.len();
+        let file_len = std::fs::metadata(path)
+            .map_err(StoreError::io(path, "metadata"))?
+            .len();
 
         loop {
             if offset == file_len {
@@ -631,7 +794,7 @@ impl MongrelLogStore {
                     inner.index.insert(
                         index,
                         (
-                            entry.log_id.clone(),
+                            entry.log_id,
                             FrameLoc {
                                 segment: ordinal,
                                 offset,
@@ -650,7 +813,8 @@ impl MongrelLogStore {
             .write(true)
             .open(path)
             .map_err(StoreError::io(path, "open truncate"))?;
-        file.set_len(good_len).map_err(StoreError::io(path, "truncate"))?;
+        file.set_len(good_len)
+            .map_err(StoreError::io(path, "truncate"))?;
         file.sync_data().map_err(StoreError::io(path, "fsync"))?;
         Ok(good_len)
     }
@@ -661,6 +825,7 @@ impl MongrelLogStore {
         self.shared.clone()
     }
 
+    #[allow(clippy::result_large_err)] // openraft's trait fixes this error type
     fn save_hard_state(
         &self,
         vote: Option<RaftVote>,
@@ -690,7 +855,8 @@ impl MongrelLogStore {
         header.extend_from_slice(&first_index.to_le_bytes());
         header.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
         let frame = encode_frame(&header);
-        file.write_all(&frame).map_err(StoreError::io(&path, "write"))?;
+        file.write_all(&frame)
+            .map_err(StoreError::io(&path, "write"))?;
         file.sync_data().map_err(StoreError::io(&path, "fsync"))?;
         inner.segments.push(SegmentMeta {
             first_index,
@@ -739,18 +905,52 @@ impl MongrelLogStore {
             };
             inner.active_len += frame.len() as u64;
             inner.active_entry_count += 1;
-            inner.index.insert(index, (entry.log_id.clone(), loc));
+            // A conflicting overwrite (same index, different log id) voids
+            // the old entry: its waiter can never become durable here. The
+            // real path always truncates first, so this is defensive.
+            if let Some((old_log_id, _)) = inner.index.get(&index) {
+                if *old_log_id != entry.log_id {
+                    let voided: Vec<[u8; 16]> = inner
+                        .leader_disk
+                        .iter()
+                        .filter_map(|(command_id, waiter)| {
+                            (waiter.log_id == Some(*old_log_id)).then_some(*command_id)
+                        })
+                        .collect();
+                    for command_id in voided {
+                        if let Some(waiter) = inner.leader_disk.remove(&command_id) {
+                            let _ = waiter.signal.send(Err(LeaderDiskDrop::Truncated));
+                        }
+                    }
+                }
+            }
+            inner.index.insert(index, (entry.log_id, loc));
+            // Bind a LeaderDisk waiter to the entry carrying its command.
+            // Blank and membership payloads carry no command and never bind.
+            if let EntryPayload::Normal(command) = &entry.payload {
+                if let Some(command_id) = command.command_id() {
+                    if let Some(waiter) = inner.leader_disk.get_mut(&command_id) {
+                        if waiter.log_id.is_none() {
+                            waiter.log_id = Some(entry.log_id);
+                        }
+                    }
+                }
+            }
             wrote = true;
         }
         Ok(wrote)
     }
 
-    /// Fsyncs the active segment (with fault hooks at the boundary).
-    fn fsync_active(&self) -> Result<(), StoreError> {
+    /// Fsyncs the active segment (with fault hooks at the boundary) and
+    /// returns the durability watermark: the highest appended log index
+    /// when the fsync began. Every frame at or below it is durable once
+    /// this returns `Ok`.
+    fn fsync_active(&self) -> Result<u64, StoreError> {
         let mut inner = self.shared.lock()?;
         if inner.active.is_none() {
-            return Ok(());
+            return Ok(0);
         }
+        let watermark = inner.last_indexed().map_or(0, |log_id| log_id.index);
         let path = inner.segments[inner.active_segment_ordinal()].path.clone();
         mongreldb_fault::inject("raft.log.fsync.before")
             .map_err(|f| StoreError::fault(&path, "fsync", f))?;
@@ -758,7 +958,7 @@ impl MongrelLogStore {
         active.sync_data().map_err(StoreError::io(&path, "fsync"))?;
         mongreldb_fault::inject("raft.log.fsync.after")
             .map_err(|f| StoreError::fault(&path, "fsync", f))?;
-        Ok(())
+        Ok(watermark)
     }
 
     /// Queues a flush callback for the Deferred policy, spawning the
@@ -768,10 +968,7 @@ impl MongrelLogStore {
             let mut inner = match self.shared.lock() {
                 Ok(inner) => inner,
                 Err(_) => {
-                    callback.log_io_completed(Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "log lock poisoned",
-                    )));
+                    callback.log_io_completed(Err(io::Error::other("log lock poisoned")));
                     return;
                 }
             };
@@ -820,6 +1017,25 @@ impl MongrelLogStore {
             fsync_dir(&inner.dir)?;
         }
         inner.index.retain(|index, _| *index < log_id.index);
+        // LeaderDisk waiters bound to truncated entries can never become
+        // leader-local durable here (the entry is gone): fail them honestly.
+        // These are exactly the old-term conflicting entries raft removes on
+        // leadership change, which scopes waiters to their proposal's term.
+        let voided: Vec<[u8; 16]> = inner
+            .leader_disk
+            .iter()
+            .filter_map(|(command_id, waiter)| {
+                waiter
+                    .log_id
+                    .filter(|bound| bound.index >= log_id.index)
+                    .map(|_| *command_id)
+            })
+            .collect();
+        for command_id in voided {
+            if let Some(waiter) = inner.leader_disk.remove(&command_id) {
+                let _ = waiter.signal.send(Err(LeaderDiskDrop::Truncated));
+            }
+        }
         inner.recount_active_entries();
         Ok(())
     }
@@ -827,7 +1043,7 @@ impl MongrelLogStore {
     fn purge_log(&self, log_id: RaftLogId) -> Result<(), StoreError> {
         let mut inner = self.shared.lock()?;
         inner.index.retain(|index, _| *index > log_id.index);
-        inner.last_purged = Some(log_id.clone());
+        inner.last_purged = Some(log_id);
 
         // Persist the purge point atomically before deleting anything.
         let body = encode_versioned(&log_id)?;
@@ -869,7 +1085,9 @@ impl MongrelLogStore {
 
 /// Background flusher for [`FsyncPolicy::Deferred`]: fsyncs the active
 /// segment on `interval` and releases the queued flush callbacks only after
-/// the fsync, preserving the "durable when acknowledged" contract.
+/// the fsync, preserving the "durable when acknowledged" contract. LeaderDisk
+/// waiters ride the same boundary: they are signaled from the drained batch,
+/// strictly after the batch fsync (never on the error path).
 async fn deferred_flush_loop(
     inner: Arc<Mutex<LogInner>>,
     stop: Arc<AtomicBool>,
@@ -880,7 +1098,7 @@ async fn deferred_flush_loop(
         if stop.load(Ordering::Acquire) {
             return;
         }
-        let drained: Vec<LogFlushed<MongrelRaftConfig>> = {
+        let (drained, signaled): (Vec<LogFlushed<MongrelRaftConfig>>, Vec<LeaderDiskWaiter>) = {
             let mut guard = match inner.lock() {
                 Ok(guard) => guard,
                 Err(_) => return,
@@ -893,7 +1111,13 @@ async fn deferred_flush_loop(
                 None => Ok(()),
             };
             match result {
-                Ok(()) => std::mem::take(&mut guard.pending),
+                Ok(()) => {
+                    let watermark = guard.last_indexed().map_or(0, |log_id| log_id.index);
+                    (
+                        std::mem::take(&mut guard.pending),
+                        covered_signals(&mut guard, watermark),
+                    )
+                }
                 Err(error) => {
                     let pending = std::mem::take(&mut guard.pending);
                     drop(guard);
@@ -909,6 +1133,11 @@ async fn deferred_flush_loop(
         };
         for callback in drained {
             callback.log_io_completed(Ok(()));
+        }
+        for waiter in signaled {
+            if let Some(log_id) = waiter.log_id {
+                let _ = waiter.signal.send(Ok(log_id));
+            }
         }
     }
 }
@@ -931,7 +1160,7 @@ impl RaftLogStorage<MongrelRaftConfig> for MongrelLogStore {
                 .shared
                 .lock()
                 .map_err(|e| raft_storage_error(ErrorSubject::Logs, ErrorVerb::Read, e))?;
-            (inner.last_purged.clone(), inner.last_indexed())
+            (inner.last_purged, inner.last_indexed())
         };
         Ok(LogState {
             last_purged_log_id: last_purged,
@@ -947,7 +1176,7 @@ impl RaftLogStorage<MongrelRaftConfig> for MongrelLogStore {
 
     /// Persists the vote and fsyncs **before returning** (S2B-002).
     async fn save_vote(&mut self, vote: &RaftVote) -> Result<(), RaftStorageError> {
-        self.save_hard_state(Some(vote.clone()), None)
+        self.save_hard_state(Some(*vote), None)
     }
 
     async fn read_vote(&mut self) -> Result<Option<RaftVote>, RaftStorageError> {
@@ -958,7 +1187,10 @@ impl RaftLogStorage<MongrelRaftConfig> for MongrelLogStore {
             .vote)
     }
 
-    async fn save_committed(&mut self, committed: Option<RaftLogId>) -> Result<(), RaftStorageError> {
+    async fn save_committed(
+        &mut self,
+        committed: Option<RaftLogId>,
+    ) -> Result<(), RaftStorageError> {
         self.save_hard_state(None, committed)
     }
 
@@ -979,7 +1211,11 @@ impl RaftLogStorage<MongrelRaftConfig> for MongrelLogStore {
         I: IntoIterator<Item = RaftLogEntry> + Send,
         I::IntoIter: Send,
     {
-        let path = self.shared.lock().map(|i| i.dir.clone()).unwrap_or_default();
+        let path = self
+            .shared
+            .lock()
+            .map(|i| i.dir.clone())
+            .unwrap_or_default();
         self.append_inner(entries.into_iter().collect(), callback, &path)
     }
 
@@ -995,6 +1231,7 @@ impl RaftLogStorage<MongrelRaftConfig> for MongrelLogStore {
 }
 
 impl MongrelLogStore {
+    #[allow(clippy::result_large_err)] // openraft's trait fixes this error type
     fn append_inner(
         &self,
         entries: Vec<RaftLogEntry>,
@@ -1004,13 +1241,19 @@ impl MongrelLogStore {
         let result: Result<Option<Duration>, StoreError> = (|| {
             mongreldb_fault::inject("raft.log.append.before")
                 .map_err(|f| StoreError::fault(path, "write", f))?;
-            eprintln!("[dbg] append_inner: write_frames");
             let wrote = self.write_frames(entries)?;
-            eprintln!("[dbg] append_inner: wrote={wrote}");
             let mut deferred_interval = None;
             if wrote {
-                match &self.shared.lock()?.config.fsync_policy {
-                    FsyncPolicy::PerAppend => self.fsync_active()?,
+                // Clone the policy out of the guard: holding the mutex guard
+                // across the fsync call below would self-deadlock.
+                let policy = self.shared.lock()?.config.fsync_policy.clone();
+                match &policy {
+                    FsyncPolicy::PerAppend => {
+                        // The fsync covers every frame appended so far:
+                        // signal the LeaderDisk waiters it made durable.
+                        let watermark = self.fsync_active()?;
+                        self.shared.signal_durable(watermark);
+                    }
                     FsyncPolicy::Deferred { interval } => deferred_interval = Some(*interval),
                 }
             }
@@ -1022,9 +1265,13 @@ impl MongrelLogStore {
             Ok(Some(interval)) => self.defer_callback(callback, interval),
             Ok(None) => callback.log_io_completed(Ok(())),
             Err(err) => {
-                let io_err = io::Error::new(io::ErrorKind::Other, err.to_string());
+                let io_err = io::Error::other(err.to_string());
                 callback.log_io_completed(Err(io_err));
-                return Err(raft_storage_error(ErrorSubject::Logs, ErrorVerb::Write, err));
+                return Err(raft_storage_error(
+                    ErrorSubject::Logs,
+                    ErrorVerb::Write,
+                    err,
+                ));
             }
         }
         Ok(())
@@ -1252,14 +1499,24 @@ mod tests {
         append_and_sync(&store, vec![entry(2, 3, 30), entry(2, 4, 31)]);
         assert_eq!(
             shared.read_entries(1, 10, 10).unwrap(),
-            vec![entry(1, 1, 1), entry(1, 2, 2), entry(2, 3, 30), entry(2, 4, 31)]
+            vec![
+                entry(1, 1, 1),
+                entry(1, 2, 2),
+                entry(2, 3, 30),
+                entry(2, 4, 31)
+            ]
         );
         // Physical state matches after reopen (no resurrected frames).
         drop(store);
         let store = MongrelLogStore::open(tmp.path(), StorageConfig::default()).unwrap();
         assert_eq!(
             store.shared_log().read_entries(1, 10, 10).unwrap(),
-            vec![entry(1, 1, 1), entry(1, 2, 2), entry(2, 3, 30), entry(2, 4, 31)]
+            vec![
+                entry(1, 1, 1),
+                entry(1, 2, 2),
+                entry(2, 3, 30),
+                entry(2, 4, 31)
+            ]
         );
     }
 
@@ -1307,5 +1564,120 @@ mod tests {
         drop(store);
         let store = MongrelLogStore::open(tmp.path(), StorageConfig::default()).unwrap();
         assert_eq!(store.shared_log().read_entries(1, 2, 1).unwrap().len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // LeaderDisk completion registry (S2C)
+    // -----------------------------------------------------------------------
+
+    fn command_id_of(seq: u8) -> [u8; 16] {
+        [seq; 16]
+    }
+
+    #[tokio::test]
+    async fn leader_disk_waiter_signals_only_after_fsync() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = MongrelLogStore::open(tmp.path(), StorageConfig::default()).unwrap();
+        let shared = store.shared_log();
+
+        let mut receiver = shared
+            .register_leader_disk_waiter(command_id_of(10))
+            .unwrap();
+        // Not yet appended: no signal can fire.
+        store.write_frames(vec![entry(1, 1, 11)]).unwrap();
+        assert!(receiver.try_recv().is_err());
+
+        // The append binds the waiter to the entry carrying its command.
+        store.write_frames(vec![entry(1, 2, 10)]).unwrap();
+        assert!(receiver.try_recv().is_err(), "no signal before fsync");
+
+        // The fsync covering index 2 releases the signal with that log id.
+        let watermark = store.fsync_active().unwrap();
+        assert_eq!(watermark, 2);
+        shared.signal_durable(watermark);
+        let signaled = receiver.try_recv().unwrap().unwrap();
+        assert_eq!(signaled, LogId::new(CommittedLeaderId::new(1, 1), 2));
+    }
+
+    #[tokio::test]
+    async fn leader_disk_waiter_skips_blank_and_membership() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = MongrelLogStore::open(tmp.path(), StorageConfig::default()).unwrap();
+        let shared = store.shared_log();
+        let mut receiver = shared
+            .register_leader_disk_waiter(command_id_of(10))
+            .unwrap();
+        // Blank frames carry no command: they never bind the waiter.
+        store.write_frames(vec![blank_entry(1, 1)]).unwrap();
+        let watermark = store.fsync_active().unwrap();
+        shared.signal_durable(watermark);
+        assert!(receiver.try_recv().is_err());
+        // The command entry binds and signals normally afterwards.
+        store.write_frames(vec![entry(1, 2, 10)]).unwrap();
+        let watermark = store.fsync_active().unwrap();
+        shared.signal_durable(watermark);
+        assert_eq!(
+            receiver.try_recv().unwrap().unwrap(),
+            LogId::new(CommittedLeaderId::new(1, 1), 2)
+        );
+    }
+
+    #[tokio::test]
+    async fn leader_disk_truncate_fails_bound_waiter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = MongrelLogStore::open(tmp.path(), StorageConfig::default()).unwrap();
+        let shared = store.shared_log();
+        let mut survives = shared
+            .register_leader_disk_waiter(command_id_of(10))
+            .unwrap();
+        let mut truncated = shared
+            .register_leader_disk_waiter(command_id_of(11))
+            .unwrap();
+        store
+            .write_frames(vec![entry(1, 1, 10), entry(1, 2, 11)])
+            .unwrap();
+        // Truncate away index 2 before any fsync: its waiter fails with
+        // Truncated; the index-1 waiter stays pending.
+        store
+            .truncate_log(LogId::new(CommittedLeaderId::new(1, 1), 2))
+            .unwrap();
+        assert_eq!(
+            truncated.try_recv().unwrap(),
+            Err(LeaderDiskDrop::Truncated)
+        );
+        assert!(survives.try_recv().is_err());
+        let watermark = store.fsync_active().unwrap();
+        assert_eq!(watermark, 1);
+        shared.signal_durable(watermark);
+        assert_eq!(
+            survives.try_recv().unwrap().unwrap(),
+            LogId::new(CommittedLeaderId::new(1, 1), 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn leader_disk_unbound_waiter_reports_closed_on_close() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = MongrelLogStore::open(tmp.path(), StorageConfig::default()).unwrap();
+        let shared = store.shared_log();
+        let mut receiver = shared
+            .register_leader_disk_waiter(command_id_of(10))
+            .unwrap();
+        // The command was never appended: shutdown resolves the waiter.
+        shared.close();
+        assert_eq!(receiver.try_recv().unwrap(), Err(LeaderDiskDrop::Closed));
+    }
+
+    #[test]
+    fn leader_disk_duplicate_registration_fails_fast() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = MongrelLogStore::open(tmp.path(), StorageConfig::default()).unwrap();
+        let shared = store.shared_log();
+        let _first = shared
+            .register_leader_disk_waiter(command_id_of(10))
+            .unwrap();
+        assert!(shared
+            .register_leader_disk_waiter(command_id_of(10))
+            .is_err());
     }
 }

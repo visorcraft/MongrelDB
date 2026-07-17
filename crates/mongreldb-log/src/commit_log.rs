@@ -125,6 +125,21 @@ pub enum LogError {
     /// The log is closed and rejects new proposals.
     #[error("commit log is closed")]
     Closed,
+    /// The receiving replica is not the leader for the consensus group
+    /// (spec section 11.7). Retryable with the returned leader hint.
+    ///
+    /// Category mapping: this variant carries
+    /// `mongreldb_types::errors::ErrorCategory::NotLeader` semantics.
+    /// No `LogError` → `ErrorCategory` bridge exists yet (the engine
+    /// commit path does not convert `LogError` today); the bridge lands
+    /// with the Stage 2G gateway/routing wave, which consumes the hint.
+    #[error("not the leader (current leader: {leader_hint:?})")]
+    NotLeader {
+        /// The group's current leader hint when known (text form of the
+        /// leader identity, e.g. its raft node id); `None` when the group
+        /// has no known leader.
+        leader_hint: Option<String>,
+    },
     /// The implementation does not provide this operation.
     #[error("unsupported operation: {0}")]
     Unsupported(&'static str),
