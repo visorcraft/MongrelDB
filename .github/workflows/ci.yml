@@ -27,6 +27,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.1
         with:
           cache-targets: false
+      - run: python3 scripts/verify-component-versions
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-features

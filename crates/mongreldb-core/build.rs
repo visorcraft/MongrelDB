@@ -10,6 +10,10 @@ fn main() {
         .or_else(package_sha)
         .unwrap_or_else(|| "unknown".into());
     println!("cargo:rustc-env=MONGRELDB_GIT_SHA={sha}");
+    let target = std::env::var("TARGET").unwrap_or_else(|_| "unknown".into());
+    println!("cargo:rustc-env=MONGRELDB_TARGET_TRIPLE={target}");
+    let profile = std::env::var("PROFILE").unwrap_or_else(|_| "unknown".into());
+    println!("cargo:rustc-env=MONGRELDB_BUILD_PROFILE={profile}");
 }
 
 fn valid_sha(sha: &str) -> bool {

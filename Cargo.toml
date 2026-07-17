@@ -1,7 +1,12 @@
 [workspace]
 members = [
     "crates/mongreldb-core",
+    "crates/mongreldb-fault",
+    "crates/mongreldb-log",
+    "crates/mongreldb-protocol",
     "crates/mongreldb-query",
+    "crates/mongreldb-sim",
+    "crates/mongreldb-types",
 ]
 resolver = "2"
 

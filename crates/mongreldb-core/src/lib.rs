@@ -14,7 +14,9 @@ pub mod backup;
 pub mod be_tree;
 pub mod cache;
 pub mod catalog;
+pub mod catalog_cmds;
 pub mod columnar;
+pub mod commit_log;
 pub mod compaction;
 pub mod constraint;
 pub mod cursor;
@@ -28,8 +30,13 @@ pub mod execution;
 pub mod external_table;
 pub mod gc;
 pub mod global_idx;
+pub mod handle;
 pub mod index;
+pub mod jobs;
+pub mod locks;
+pub mod manager;
 pub mod manifest;
+pub mod memory;
 pub mod memtable;
 pub mod mutable_run;
 pub mod page;
@@ -39,6 +46,7 @@ pub mod procedure;
 pub mod query;
 pub mod replication;
 pub mod reservoir;
+pub mod resource;
 pub mod retention;
 pub(crate) mod row_id_set;
 pub mod rowid;
@@ -105,6 +113,8 @@ pub struct BuildInfo {
     pub artifact_version: &'static str,
     pub engine_version: &'static str,
     pub mongreldb_git_sha: &'static str,
+    pub target_triple: &'static str,
+    pub build_profile: &'static str,
 }
 
 pub fn build_info() -> BuildInfo {
@@ -112,6 +122,8 @@ pub fn build_info() -> BuildInfo {
         artifact_version: env!("CARGO_PKG_VERSION"),
         engine_version: env!("CARGO_PKG_VERSION"),
         mongreldb_git_sha: env!("MONGRELDB_GIT_SHA"),
+        target_triple: env!("MONGRELDB_TARGET_TRIPLE"),
+        build_profile: env!("MONGRELDB_BUILD_PROFILE"),
     }
 }
 pub use query::{Condition, Query};

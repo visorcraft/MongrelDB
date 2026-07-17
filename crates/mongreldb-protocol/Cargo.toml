@@ -1,0 +1,13 @@
+[package]
+name = "mongreldb-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "MongrelDB versioned protocol messages and service definitions (S1D)."
+
+[dependencies]
+mongreldb-types = { path = "../mongreldb-types", version = "0.59.0" }
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"

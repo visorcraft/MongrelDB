@@ -1,0 +1,13 @@
+[package]
+name = "mongreldb-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "MongrelDB shared identifiers, HLC timestamps, and the stable cross-language error taxonomy."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+getrandom = "0.2"

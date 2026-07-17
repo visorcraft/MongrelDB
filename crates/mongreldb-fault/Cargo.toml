@@ -1,0 +1,11 @@
+[package]
+name = "mongreldb-fault"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "MongrelDB named fault-injection hooks (FND-006). Disabled unless activated."
+
+[dependencies]
+thiserror = "1"

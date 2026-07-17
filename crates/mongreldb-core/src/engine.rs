@@ -4273,6 +4273,11 @@ impl Table {
         if !self.indexes_complete {
             return;
         }
+        // FND-006: a fired fault behaves like a failed checkpoint — the write
+        // is best-effort and the next open simply rebuilds from the runs.
+        if crate::catalog::inject_hook("index.publish.before").is_err() {
+            return;
+        }
         if self.idx_root.is_none() {
             if let Some(root) = self._root_guard.as_ref() {
                 let Ok(idx_root) = root.create_directory_all_pinned(global_idx::IDX_DIR) else {
@@ -4311,6 +4316,8 @@ impl Table {
         if written.is_ok() {
             self.global_idx_epoch = epoch.0;
             let _ = self.persist_manifest(epoch);
+            // FND-006: the index generation is published.
+            let _ = crate::catalog::inject_hook("index.publish.after");
         }
     }
 

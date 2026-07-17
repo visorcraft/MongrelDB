@@ -419,6 +419,19 @@ impl ReplicationSnapshot {
             return Err(error.into());
         }
 
+        // FND-006: the snapshot is staged and validated; fire before the
+        // rename sequence publishes it. The staging tree is removed so a
+        // fired fault leaves the destination untouched and the install
+        // retriable.
+        if let Err(error) = crate::catalog::inject_hook("snapshot.install.before") {
+            if let Err(cleanup) = remove_directory(&stage) {
+                return Err(MongrelError::Other(format!(
+                    "{error}; failed to remove replication staging directory: {cleanup}"
+                )));
+            }
+            return Err(error);
+        }
+
         let had_destination = destination.exists();
         if had_destination {
             if let Err(failure) = rename_entry(destination, &backup) {
@@ -486,6 +499,8 @@ impl ReplicationSnapshot {
                 )));
             }
         }
+        // FND-006: the snapshot is installed and the old tree is gone.
+        crate::catalog::inject_hook("snapshot.install.after")?;
         Ok(())
     }
 

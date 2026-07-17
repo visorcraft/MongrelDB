@@ -178,6 +178,13 @@ pub enum DdlOp {
         name: String,
         generation_epoch: u64,
     },
+    /// One encoded [`mongreldb_log::CommandEnvelope`] proposed through the
+    /// standalone commit log (spec §9.4, FND-004). Opaque to the engine:
+    /// recovery, PITR, and CDC ignore it (every replay path wildcards unknown
+    /// DDL operations). Appended last to preserve prior bincode discriminants.
+    Command {
+        payload: Vec<u8>,
+    },
 }
 
 impl DdlOp {
@@ -1851,8 +1858,13 @@ impl SharedWal {
     }
 
     /// Append a record for `(txn_id, table_id)`. Does not fsync.
+    /// `wal.append.before`/`wal.append.after` fault hooks bracket the append
+    /// (spec §9.6, FND-006).
     pub fn append(&mut self, txn_id: u64, _table_id: u64, op: Op) -> Result<u64> {
-        Ok(self.active.append_txn(txn_id, op)?.0)
+        mongreldb_fault::inject("wal.append.before").map_err(crate::commit_log::fault_as_io)?;
+        let seq = self.active.append_txn(txn_id, op)?.0;
+        mongreldb_fault::inject("wal.append.after").map_err(crate::commit_log::fault_as_io)?;
+        Ok(seq)
     }
 
     /// Append a `TxnCommit` marker sealing `txn_id` at `epoch`.
@@ -1894,9 +1906,12 @@ impl SharedWal {
 
     /// Flush + fsync the active segment and return the highest durable sequence
     /// number. This is the single durability point for every concurrent
-    /// appender since the last `group_sync`.
+    /// appender since the last `group_sync`. `wal.fsync.before`/`wal.fsync.after`
+    /// fault hooks bracket the fsync (spec §9.6, FND-006).
     pub fn group_sync(&mut self) -> Result<u64> {
+        mongreldb_fault::inject("wal.fsync.before").map_err(crate::commit_log::fault_as_io)?;
         self.active.sync()?;
+        mongreldb_fault::inject("wal.fsync.after").map_err(crate::commit_log::fault_as_io)?;
         write_wal_head(
             &self.root,
             &self.wal_root,
@@ -2752,6 +2767,7 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    #[cfg(feature = "encryption")]
     fn frame_ranges(bytes: &[u8]) -> Vec<std::ops::Range<usize>> {
         let mut ranges = Vec::new();
         let mut offset = HEADER_LEN as usize;

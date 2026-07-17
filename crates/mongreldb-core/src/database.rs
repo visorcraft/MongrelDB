@@ -1474,6 +1474,11 @@ pub struct Database {
     /// but defers the fsync to one leader here, so concurrent commits share a
     /// single fsync (spec §9.3). Shared with mounted tables.
     group: Arc<crate::txn::GroupCommit>,
+    /// FND-004 (spec §9.4): the standalone commit-log authority wrapping
+    /// `shared_wal` + `group`. The commit sequencer routes WAL appends and
+    /// group-commit durability through it, and reader-visibility publication
+    /// (`publish_in_order`) is gated on its commit receipts.
+    commit_log: Arc<crate::commit_log::StandaloneCommitLog>,
     /// P3.6: txn ids currently spilling into `_txn/<id>/`. GC never deletes a
     /// live spill's pending dir (review fix #14, spec §6.4).
     active_spills: Arc<crate::retention::ActiveSpills>,
@@ -2677,6 +2682,18 @@ impl Database {
         // placeholder is never observed.
         let txn_ids = Arc::new(Mutex::new(1u64));
         let _ = abandoned;
+        // FND-004 (spec §9.4): the commit-log authority for this database. The
+        // transaction-id allocator Arc is stable; its base value is re-seeded
+        // below once the open generation is final.
+        let commit_log = Arc::new(crate::commit_log::StandaloneCommitLog::new(
+            Arc::clone(&shared_wal),
+            Arc::clone(&group),
+            Arc::clone(&epoch),
+            Arc::clone(&commit_lock),
+            Arc::clone(&txn_ids),
+            root.clone(),
+            wal_dek.clone(),
+        ));
 
         // Build the shared auth state early — it's cloned into every mounted
         // Table's SharedCtx so the Table layer can enforce permissions without
@@ -2781,6 +2798,7 @@ impl Database {
             active_txns: crate::txn::ActiveTxns::new(),
             poisoned,
             group,
+            commit_log,
             spill_threshold: std::sync::atomic::AtomicU64::new(64 * 1024 * 1024),
             active_spills: Arc::new(crate::retention::ActiveSpills::new()),
             replication_barrier: parking_lot::RwLock::new(()),
@@ -2810,6 +2828,14 @@ impl Database {
     /// The current reader-visible epoch.
     pub fn visible_epoch(&self) -> Epoch {
         self.epoch.visible()
+    }
+
+    /// The commit-log authority for this database (spec §9.4, FND-004). Every
+    /// commit path proposes through it and visibility publication is gated on
+    /// its receipts; Stage 2 swaps this standalone adapter for the replicated
+    /// implementation behind the same `CommitLog` trait.
+    pub fn commit_log(&self) -> Arc<crate::commit_log::StandaloneCommitLog> {
+        Arc::clone(&self.commit_log)
     }
 
     /// Clone the in-memory catalog (for diagnostics / tests).
@@ -2906,9 +2932,9 @@ impl Database {
             })();
             append.map_err(|error| self.commit_outcome_unknown(epoch, error))?
         };
-        self.await_durable_commit(commit_seq, epoch)?;
+        let receipt = self.await_durable_commit(txn_id, commit_seq, epoch)?;
         let checkpoint = self.checkpoint_catalog_after_durable(next_catalog);
-        self.finish_durable_publish(epoch, &mut epoch_guard, checkpoint)?;
+        self.finish_durable_publish(epoch, &mut epoch_guard, &receipt, checkpoint)?;
         Ok(Some(epoch))
     }
 
@@ -3031,9 +3057,9 @@ impl Database {
             })();
             append.map_err(|error| self.commit_outcome_unknown(epoch, error))?
         };
-        self.await_durable_commit(commit_seq, epoch)?;
+        let receipt = self.await_durable_commit(txn_id, commit_seq, epoch)?;
         let checkpoint = self.checkpoint_catalog_after_durable(catalog);
-        self.finish_durable_publish(epoch, epoch_guard, checkpoint)
+        self.finish_durable_publish(epoch, epoch_guard, &receipt, checkpoint)
     }
 
     /// A WAL commit is already durable. Publish the matching catalog in memory
@@ -3065,9 +3091,20 @@ impl Database {
         &self,
         epoch: Epoch,
         epoch_guard: &mut EpochGuard<'_>,
+        receipt: &mongreldb_log::CommitReceipt,
         post_step: Result<()>,
     ) -> Result<()> {
-        self.epoch.publish_in_order(epoch);
+        if let Err(error) = self.publish_committed(receipt, epoch) {
+            // The commit marker is durable but runtime publication failed. The
+            // epoch guard stays armed so the assigned ticket is abandoned (the
+            // watermark skips it), and the live handle poisons exactly like any
+            // other post-durable failure.
+            self.poisoned.store(true, Ordering::Relaxed);
+            return Err(MongrelError::DurableCommit {
+                epoch: epoch.0,
+                message: error.to_string(),
+            });
+        }
         epoch_guard.disarm();
         match post_step {
             Ok(()) => Ok(()),
@@ -3081,12 +3118,38 @@ impl Database {
         }
     }
 
-    /// Wait for a commit marker to reach stable storage. A failed append/fsync
+    /// Advance reader visibility for a committed epoch. Publication is gated on
+    /// the commit log's receipt (spec §9.4, FND-004): visibility only ever
+    /// covers commands the commit log acknowledged durable. The
+    /// `commit.publish.before`/`commit.publish.after` fault hooks bracket the
+    /// watermark advance (spec §9.6, FND-006).
+    fn publish_committed(
+        &self,
+        receipt: &mongreldb_log::CommitReceipt,
+        epoch: Epoch,
+    ) -> Result<()> {
+        debug_assert_eq!(
+            receipt.log_position.index, epoch.0,
+            "commit receipt position must match the published epoch"
+        );
+        mongreldb_fault::inject("commit.publish.before").map_err(crate::commit_log::fault_as_io)?;
+        self.epoch.publish_in_order(epoch);
+        mongreldb_fault::inject("commit.publish.after").map_err(crate::commit_log::fault_as_io)?;
+        Ok(())
+    }
+
+    /// Wait for a commit marker to reach stable storage and return the commit
+    /// log's irrevocable receipt (spec §9.4, FND-004). A failed append/fsync
     /// acknowledgement is ambiguous, so poison the live handle and preserve
     /// the assigned epoch in a structured unknown-outcome error.
-    fn await_durable_commit(&self, commit_seq: u64, epoch: Epoch) -> Result<()> {
-        match self.group.await_durable(&self.shared_wal, commit_seq) {
-            Ok(()) => Ok(()),
+    fn await_durable_commit(
+        &self,
+        txn_id: u64,
+        commit_seq: u64,
+        epoch: Epoch,
+    ) -> Result<mongreldb_log::CommitReceipt> {
+        match self.commit_log.seal_transaction(txn_id, epoch, commit_seq) {
+            Ok(receipt) => Ok(receipt),
             Err(error) => {
                 self.poisoned.store(true, Ordering::Relaxed);
                 Err(MongrelError::CommitOutcomeUnknown {
@@ -3192,9 +3255,9 @@ impl Database {
             })();
             append.map_err(|error| self.commit_outcome_unknown(epoch, error))?
         };
-        self.await_durable_commit(commit_seq, epoch)?;
+        let receipt = self.await_durable_commit(txn_id, commit_seq, epoch)?;
         let checkpoint = self.checkpoint_catalog_after_durable(next_catalog);
-        self.finish_durable_publish(epoch, &mut epoch_guard, checkpoint)?;
+        self.finish_durable_publish(epoch, &mut epoch_guard, &receipt, checkpoint)?;
         Ok(epoch)
     }
 
@@ -4621,10 +4684,10 @@ impl Database {
             })();
             append.map_err(|error| self.commit_outcome_unknown(epoch, error))?
         };
-        self.await_durable_commit(commit_seq, epoch)?;
+        let receipt = self.await_durable_commit(txn_id, commit_seq, epoch)?;
 
         let checkpoint = self.checkpoint_catalog_after_durable(next_catalog);
-        self.finish_durable_publish(epoch, &mut epoch_guard, checkpoint)?;
+        self.finish_durable_publish(epoch, &mut epoch_guard, &receipt, checkpoint)?;
         Ok(epoch)
     }
 
@@ -10330,14 +10393,13 @@ impl Database {
             // commit marker; orphan cleanup is safe when the append did fail.
             prepared_run_links.disarm();
 
-            let append: Result<u64> = (|| {
-                for (table_id, op) in wal_records {
-                    wal.append(txn_id, table_id, op)?;
-                }
-                wal.append_commit(txn_id, new_epoch, &added_runs)
-            })();
-            let commit_seq =
-                append.map_err(|error| self.commit_outcome_unknown(new_epoch, error))?;
+            // FND-004 (spec §9.4): the commit log owns the append step for the
+            // transaction command (records + commit marker). The commit path
+            // proposes through it; durability and the receipt follow below.
+            let commit_seq = self
+                .commit_log
+                .append_transaction(&mut wal, txn_id, new_epoch, wal_records, &added_runs)
+                .map_err(|error| self.commit_outcome_unknown(new_epoch, error))?;
 
             // Record the conflict + assign the epoch under the WAL lock so commit
             // order == WAL append order, but DO NOT fsync here (P3.2): the fsync
@@ -10355,7 +10417,7 @@ impl Database {
         drop(commit_guard);
 
         // ── 2b. Durability: one leader fsync serves this whole batch (P3.2). ──
-        self.await_durable_commit(commit_seq, new_epoch)?;
+        let receipt = self.await_durable_commit(txn_id, commit_seq, new_epoch)?;
         drop(security_guard);
 
         // ── 3. Publish: apply non-spilled ops + link spilled runs ──
@@ -10448,7 +10510,7 @@ impl Database {
         if has_changes {
             let _ = self.change_wake.send(());
         }
-        self.finish_durable_publish(new_epoch, &mut _epoch_guard, publish_result)?;
+        self.finish_durable_publish(new_epoch, &mut _epoch_guard, &receipt, publish_result)?;
         Ok((new_epoch, committed_row_ids))
     }
 
@@ -10908,7 +10970,7 @@ impl Database {
             })();
             append.map_err(|error| self.commit_outcome_unknown(epoch, error))?
         };
-        self.await_durable_commit(commit_seq, epoch)?;
+        let receipt = self.await_durable_commit(txn_id, commit_seq, epoch)?;
         pending_table_dir.disarm();
 
         // Publish the mounted table and catalog in memory even if the catalog
@@ -10917,7 +10979,7 @@ impl Database {
             .write()
             .insert(table_id, TableHandle::new(table));
         let checkpoint = self.checkpoint_catalog_after_durable(next_catalog);
-        self.finish_durable_publish(epoch, &mut _epoch_guard, checkpoint)?;
+        self.finish_durable_publish(epoch, &mut _epoch_guard, &receipt, checkpoint)?;
         Ok(table_id)
     }
 
@@ -11038,11 +11100,11 @@ impl Database {
             })();
             append.map_err(|error| self.commit_outcome_unknown(epoch, error))?
         };
-        self.await_durable_commit(commit_seq, epoch)?;
+        let receipt = self.await_durable_commit(txn_id, commit_seq, epoch)?;
 
         let checkpoint = self.checkpoint_catalog_after_durable(next_catalog);
         self.tables.write().remove(&table_id);
-        self.finish_durable_publish(epoch, &mut _epoch_guard, checkpoint)?;
+        self.finish_durable_publish(epoch, &mut _epoch_guard, &receipt, checkpoint)?;
         Ok(epoch)
     }
 
@@ -11338,14 +11400,14 @@ impl Database {
             })();
             append.map_err(|error| self.commit_outcome_unknown(epoch, error))?
         };
-        self.await_durable_commit(commit_seq, epoch)?;
+        let receipt = self.await_durable_commit(txn_id, commit_seq, epoch)?;
 
         let checkpoint = self.checkpoint_catalog_after_durable(next_catalog);
         self.tables.write().remove(&replaced_table_id);
         if let Some(table) = self.tables.read().get(&table_id) {
             table.lock().set_catalog_name(new_name.to_string());
         }
-        self.finish_durable_publish(epoch, &mut epoch_guard, checkpoint)?;
+        self.finish_durable_publish(epoch, &mut epoch_guard, &receipt, checkpoint)?;
         Ok(epoch)
     }
 
@@ -11505,7 +11567,7 @@ impl Database {
             })();
             append.map_err(|error| self.commit_outcome_unknown(epoch, error))?
         };
-        self.await_durable_commit(commit_seq, epoch)?;
+        let receipt = self.await_durable_commit(txn_id, commit_seq, epoch)?;
 
         let checkpoint = self.checkpoint_catalog_after_durable(next_catalog);
         // The in-memory table object is keyed by table_id, not name, so it does
@@ -11513,7 +11575,7 @@ impl Database {
         if let Some(table) = self.tables.read().get(&table_id) {
             table.lock().set_catalog_name(new_name.to_string());
         }
-        self.finish_durable_publish(epoch, &mut _epoch_guard, checkpoint)?;
+        self.finish_durable_publish(epoch, &mut _epoch_guard, &receipt, checkpoint)?;
         Ok(epoch)
     }
 
@@ -11782,7 +11844,7 @@ impl Database {
                     })();
                     append.map_err(|error| self.commit_outcome_unknown(epoch, error))?
                 };
-                self.await_durable_commit(commit_seq, epoch)?;
+                let receipt = self.await_durable_commit(txn_id, commit_seq, epoch)?;
                 durable_epoch.set(Some(epoch));
 
                 table.apply_altered_schema_prepared(prepared_schema);
@@ -11800,7 +11862,7 @@ impl Database {
                         .version
                         .store(security_version, Ordering::Release);
                 }
-                self.epoch.publish_in_order(epoch);
+                self.publish_committed(&receipt, epoch)?;
                 _epoch_guard.disarm();
                 if let Err(error) = table_checkpoint.and(catalog_result) {
                     self.poisoned.store(true, Ordering::Relaxed);
@@ -11937,14 +11999,19 @@ impl Database {
             })();
             append.map_err(|error| self.commit_outcome_unknown(epoch, error))?
         };
-        self.await_durable_commit(commit_seq, epoch)?;
+        let receipt = self.await_durable_commit(txn_id, commit_seq, epoch)?;
 
         let mut publish_error = table.apply_ttl_policy_at(policy, epoch).err();
         drop(table);
         if let Err(error) = self.checkpoint_catalog_after_durable(next_catalog) {
             publish_error.get_or_insert(error);
         }
-        self.finish_durable_publish(epoch, &mut _epoch_guard, publish_error.map_or(Ok(()), Err))?;
+        self.finish_durable_publish(
+            epoch,
+            &mut _epoch_guard,
+            &receipt,
+            publish_error.map_or(Ok(()), Err),
+        )?;
         Ok(policy)
     }
 
@@ -12696,7 +12763,7 @@ impl Database {
             })();
             append.map_err(|error| self.commit_outcome_unknown(maintenance_epoch, error))?
         };
-        self.await_durable_commit(commit_seq, maintenance_epoch)?;
+        let receipt = self.await_durable_commit(txn_id, commit_seq, maintenance_epoch)?;
         for (_, table) in &mut table_guards {
             table.mark_unavailable_after_quarantine();
         }
@@ -12707,7 +12774,7 @@ impl Database {
             }
         }
         let checkpoint = self.checkpoint_catalog_after_durable(next_catalog);
-        self.finish_durable_publish(maintenance_epoch, &mut epoch_guard, checkpoint)?;
+        self.finish_durable_publish(maintenance_epoch, &mut epoch_guard, &receipt, checkpoint)?;
 
         // The catalog drop is durable. Directory placement is secondary but
         // still uses a write-through rename. A failure reports the known

@@ -552,6 +552,10 @@ where
         meta.remove_file("repl_epoch")?;
         drop(meta);
         drop(stage);
+        // FND-006: the staged restore is fully recovered; fire before the
+        // rename publishes it. The outer error path removes the staging
+        // tree, so a fired fault leaves the destination untouched.
+        crate::catalog::inject_hook("snapshot.install.before")?;
         let published = std::cell::Cell::new(false);
         if let Err(error) = prepared.parent.rename_directory_new_with_after(
             &prepared.stage_name,
@@ -573,6 +577,9 @@ where
             }
             return Err(error.into());
         }
+        // FND-006: the restore is published; the caller still sees a hook
+        // failure as an error even though the destination is complete.
+        crate::catalog::inject_hook("snapshot.install.after")?;
         Ok(target_epoch)
     })();
     if outcome.is_err() {

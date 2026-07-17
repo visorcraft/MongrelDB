@@ -27,6 +27,14 @@ const CATALOG_FORMAT_VERSION: u16 = 1;
 /// 32-byte meta DEK length (matches [`crate::encryption::DEK_LEN`]).
 pub const META_DEK_LEN: usize = 32;
 
+/// Evaluate a durable-boundary fault-injection hook (spec §9.6, FND-006).
+/// `MongrelError::Other` is the closest existing variant for an injected
+/// fault; a dedicated category arrives with the FND-007 error taxonomy.
+/// Shared by the catalog, snapshot-install, and index-publish hook sites.
+pub(crate) fn inject_hook(name: &'static str) -> Result<()> {
+    mongreldb_fault::inject(name).map_err(|fault| MongrelError::Other(fault.to_string()))
+}
+
 /// Lifecycle state of a catalog table entry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TableState {
@@ -357,6 +365,8 @@ where
     let body = encode(cat)?;
     let payload = seal(&body, meta_dek)?;
 
+    // FND-006: fire before the replacement becomes durable.
+    inject_hook("catalog.publish.before")?;
     let root = crate::durable_file::DurableRoot::open(dir)?;
     root.write_atomic_controlled_with_after(
         CATALOG_FILENAME,
@@ -364,6 +374,9 @@ where
         before_publish,
         after_publish,
     )?;
+    // FND-006: the replacement is durable; the caller still sees a hook
+    // failure as an unknown-outcome error.
+    inject_hook("catalog.publish.after")?;
     Ok(())
 }
 
@@ -398,7 +411,9 @@ pub(crate) fn write_durable(
 ) -> Result<()> {
     let body = encode(catalog)?;
     let payload = seal(&body, meta_dek)?;
+    inject_hook("catalog.publish.before")?;
     root.write_atomic(CATALOG_FILENAME, &payload)?;
+    inject_hook("catalog.publish.after")?;
     Ok(())
 }
 

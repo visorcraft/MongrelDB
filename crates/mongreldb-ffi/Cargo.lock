@@ -2166,6 +2166,9 @@ dependencies = [
  "getrandom 0.2.17",
  "lz4_flex 0.11.6",
  "memmap2",
+ "mongreldb-fault",
+ "mongreldb-log",
+ "mongreldb-types",
  "parking_lot",
  "rayon",
  "regex",
@@ -2180,6 +2183,13 @@ dependencies = [
  "xxhash-rust",
  "zeroize",
  "zstd",
+]
+
+[[package]]
+name = "mongreldb-fault"
+version = "0.59.0"
+dependencies = [
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -2212,6 +2222,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mongreldb-log"
+version = "0.59.0"
+dependencies = [
+ "mongreldb-types",
+ "serde",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "mongreldb-query"
 version = "0.59.0"
 dependencies = [
@@ -2234,6 +2254,15 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+]
+
+[[package]]
+name = "mongreldb-types"
+version = "0.59.0"
+dependencies = [
+ "getrandom 0.2.17",
+ "serde",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

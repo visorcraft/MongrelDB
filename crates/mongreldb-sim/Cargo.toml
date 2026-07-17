@@ -1,0 +1,13 @@
+[package]
+name = "mongreldb-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "MongrelDB deterministic test simulator (FND-005): virtual clock, scheduling, network, and disk with seeded faults."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"

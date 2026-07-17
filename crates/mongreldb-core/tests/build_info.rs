@@ -8,4 +8,6 @@ fn build_info_reports_exact_engine_identity() {
         .mongreldb_git_sha
         .bytes()
         .all(|byte| byte.is_ascii_hexdigit()));
+    assert!(!info.target_triple.is_empty());
+    assert!(!info.build_profile.is_empty());
 }

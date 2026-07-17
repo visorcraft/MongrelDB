@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""Fail when first-party MongrelDB components drift from the workspace train.
+
+Checks, in order:
+
+1. Every crates/*/Cargo.toml package version equals the root workspace
+   version, literally or through `version.workspace = true` inheritance.
+2. `cargo metadata --locked` for the root workspace and every standalone
+   crate workspace: every first-party package built from this repository
+   (source == null) reports the workspace version.
+3. Standalone workspaces that resolve the published mongreldb-kit train agree
+   on one kit version; agreement of the resolved core/query/kit/kit-core
+   components is delegated to verify-release-component-versions.py.
+"""
+
+import json
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+CRATES = ROOT / "crates"
+TRAIN_CHECK = ROOT / "scripts" / "verify-release-component-versions.py"
+
+FIRST_PARTY = re.compile(r"^mongreldb")
+VERSION_LINE = re.compile(r'^version\s*=\s*"([^"]+)"')
+INHERITED_LINE = re.compile(r"^version\.workspace\s*=\s*true")
+
+
+def manifest_lines(path):
+    section = None
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip()
+            continue
+        yield section, line
+
+
+def workspace_version():
+    for section, line in manifest_lines(ROOT / "Cargo.toml"):
+        if section == "workspace.package":
+            match = VERSION_LINE.match(line)
+            if match:
+                return match.group(1)
+    raise SystemExit("Cargo.toml: [workspace.package] version not found")
+
+
+def is_standalone(manifest):
+    return any(line == "[workspace]" for _, line in manifest_lines(manifest))
+
+
+def check_crate_manifests(expected):
+    failed = False
+    for manifest in sorted(CRATES.glob("*/Cargo.toml")):
+        resolved = None
+        for section, line in manifest_lines(manifest):
+            if section != "package":
+                continue
+            match = VERSION_LINE.match(line)
+            if match:
+                resolved = match.group(1)
+                break
+            if INHERITED_LINE.match(line):
+                resolved = expected
+                break
+        if resolved is None:
+            print(f"{manifest}: [package] version not found")
+            failed = True
+        elif resolved != expected:
+            print(f"{manifest}: version {resolved!r}, expected {expected!r}")
+            failed = True
+    return failed
+
+
+def cargo_metadata(manifest, directory):
+    output = subprocess.run(
+        [
+            "cargo",
+            "metadata",
+            "--locked",
+            "--format-version",
+            "1",
+            "--manifest-path",
+            str(manifest),
+        ],
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+    )
+    if output.returncode != 0:
+        print(f"{manifest}: cargo metadata --locked failed:\n{output.stderr.strip()}")
+        raise SystemExit(1)
+    path = directory / f"{manifest.parent.name}.json"
+    path.write_text(output.stdout, encoding="utf-8")
+    return path, json.loads(output.stdout)
+
+
+def check_repo_train(metadata_path, metadata, expected):
+    failed = False
+    versions = {}
+    for package in metadata["packages"]:
+        if package["source"] is None and FIRST_PARTY.match(package["name"]):
+            versions.setdefault(package["name"], set()).add(package["version"])
+    for name, resolved in sorted(versions.items()):
+        if sorted(resolved) != [expected]:
+            print(
+                f"{metadata_path}: {name} resolved {sorted(resolved)},"
+                f" expected [{expected!r}]"
+            )
+            failed = True
+    return failed
+
+
+def delegate_kit_train(kit_files, expected):
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(TRAIN_CHECK),
+            "--expected",
+            expected,
+            *[str(path) for path in kit_files],
+        ],
+        cwd=ROOT,
+    )
+    return result.returncode != 0
+
+
+def main() -> None:
+    expected = workspace_version()
+    failed = check_crate_manifests(expected)
+    manifests = [ROOT / "Cargo.toml"] + [
+        manifest
+        for manifest in sorted(CRATES.glob("*/Cargo.toml"))
+        if is_standalone(manifest)
+    ]
+    with tempfile.TemporaryDirectory(prefix="mongreldb-component-versions-") as tmp:
+        kit_files = []
+        kit_versions = set()
+        for manifest in manifests:
+            path, metadata = cargo_metadata(manifest, Path(tmp))
+            if check_repo_train(path, metadata, expected):
+                failed = True
+            resolved_kit = {
+                package["version"]
+                for package in metadata["packages"]
+                if package["name"] == "mongreldb-kit"
+            }
+            if resolved_kit:
+                kit_files.append(path)
+                kit_versions |= resolved_kit
+        if len(kit_versions) > 1:
+            print(
+                "mongreldb-kit train disagrees across standalone workspaces:"
+                f" {sorted(kit_versions)}"
+            )
+            failed = True
+        elif kit_versions and delegate_kit_train(kit_files, kit_versions.pop()):
+            failed = True
+    if failed:
+        raise SystemExit(1)
+    print(f"all first-party components agree on {expected}")
+
+
+if __name__ == "__main__":
+    main()
