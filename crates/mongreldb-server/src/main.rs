@@ -8,12 +8,22 @@
 //!   mongreldb-server snapshot <db_dir>   — checkpoint to a stable byte image
 //!   mongreldb-server restore  <db_dir>   — open + verify + checkpoint
 
+use mongreldb_cluster::bootstrap::{
+    cluster_init, cluster_join, node_drain, node_remove, removal_confirmation_token, InitRequest,
+    JoinInvite, TrustConfig,
+};
+use mongreldb_cluster::node::{Locality, NodeCapacity, NodeIdentity};
 use mongreldb_core::Database;
 use mongreldb_server::{
-    build_app_with_sessions_and_control, spawn_auto_compactor, spawn_session_reaper, SessionStore,
+    build_app_with_sessions_and_control, cluster_admin, spawn_auto_compactor, spawn_session_reaper,
+    SessionStore,
 };
+use mongreldb_types::ids::{ClusterId, NodeId};
+use serde_json::json;
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use zeroize::Zeroizing;
 
@@ -54,6 +64,12 @@ OPTIONS:
     --daemon                    Fork into the background (daemonize)
     --pidfile <path>            PID file path (default: <db_dir>/mongreldb.pid)
     -h, --help                  Print this help message
+
+SUBCOMMANDS (one-shot; they do not start the daemon):
+    snapshot <db_dir>           Checkpoint to a stable byte image
+    restore <db_dir>            Open + verify + checkpoint
+    cluster init|join|status    Cluster bootstrap (spec section 11.1, S2A-002)
+    node drain|remove           Cluster membership transitions
 
 ENVIRONMENT:
     MONGRELDB_DB_USERNAME       Database-handle username (set with DB_PASSWORD)
@@ -356,6 +372,15 @@ fn main() {
                 cmd_restore(&db_dir);
                 return;
             }
+            // Cluster bootstrap + membership subcommands (spec §11.1, S2A-002).
+            "cluster" => {
+                cmd_cluster(&raw[2..]);
+                return;
+            }
+            "node" => {
+                cmd_node(&raw[2..]);
+                return;
+            }
             _ => {}
         }
     }
@@ -609,6 +634,425 @@ fn cmd_restore(db_dir: &str) {
     }
 }
 
+// ── Cluster/node subcommands (spec §11.1, S2A-002) ───────────────────────────
+//
+// One-shot operator commands mapping 1:1 onto the cluster crate's bootstrap
+// workflows; they operate on the node data (database) directory and exit
+// without starting the HTTP daemon. Trust material is operator-supplied PEM
+// (CA generation lands with the mTLS stage), and the node private key is
+// never printed: status output uses the cluster crate's key-free
+// `TrustSummary`, and `TrustConfig`'s `Debug` redacts the key.
+
+/// PEM filenames inside a `--trust-dir` (default `<data-dir>/trust`).
+const TRUST_CA_CERT_FILENAME: &str = "ca-cert.pem";
+const TRUST_NODE_CERT_FILENAME: &str = "node-cert.pem";
+const TRUST_NODE_KEY_FILENAME: &str = "node-key.pem";
+
+const CLUSTER_USAGE: &str = "\
+mongreldb-server cluster — cluster bootstrap workflows (spec section 11.1, S2A-002)
+
+USAGE:
+    mongreldb-server cluster init --data-dir <dir> [options]
+    mongreldb-server cluster join --data-dir <dir> --cluster-id <hex> --endpoints <csv> [options]
+    mongreldb-server cluster status --data-dir <dir>
+
+OPTIONS:
+    --data-dir <dir>          Node data (database) directory (required)
+    --endpoints <csv>         Comma-separated member endpoints (host:port); init
+                              advertises the first one as its RPC address
+    --rpc-address <addr>      init: advertised RPC address (default: first
+                              endpoint, else 127.0.0.1:8453)
+    --locality <k=v,...>      init: locality tiers (e.g. region=us-central,zone=a)
+    --cluster-id <hex>        join: cluster to join (32 hex digits)
+    --trust-dir <dir>         Directory holding ca-cert.pem, node-cert.pem, and
+                              node-key.pem (default: <data-dir>/trust); CA
+                              generation lands with the mTLS stage
+    --allowed-node-ids <csv>  Admitted node ids (default: this node; required on
+                              first join, which mints the node id during join)
+";
+
+const NODE_USAGE: &str = "\
+mongreldb-server node — cluster membership transitions (spec section 11.1, S2A-002)
+
+USAGE:
+    mongreldb-server node drain --data-dir <dir> [--node-id <hex>]
+    mongreldb-server node remove --data-dir <dir> [--node-id <hex>] [--confirm-token <hex>]
+
+OPTIONS:
+    --data-dir <dir>        Node data (database) directory (required)
+    --node-id <hex>         Target member (default: this node's own identity)
+    --confirm-token <hex>   Removal confirmation token; run without it to print
+                            the token and change nothing
+";
+
+/// `mongreldb-server cluster ...` — print the report or fail non-zero.
+fn cmd_cluster(args: &[String]) {
+    match cluster_command(args) {
+        Ok(report) => println!("{report}"),
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `mongreldb-server node ...` — print the report or fail non-zero.
+fn cmd_node(args: &[String]) {
+    match node_command(args) {
+        Ok(report) => println!("{report}"),
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `cluster init|join|status` as a fallible report string (the testable form
+/// of [`cmd_cluster`]).
+fn cluster_command(args: &[String]) -> Result<String, String> {
+    let Some(subcommand) = args.first() else {
+        return Err(format!(
+            "a cluster subcommand is required\n\n{CLUSTER_USAGE}"
+        ));
+    };
+    let rest = &args[1..];
+    match subcommand.as_str() {
+        "init" => cluster_init_command(&parse_subcommand_flags(
+            rest,
+            CLUSTER_USAGE,
+            &[
+                "data-dir",
+                "endpoints",
+                "rpc-address",
+                "locality",
+                "trust-dir",
+                "allowed-node-ids",
+            ],
+        )?),
+        "join" => cluster_join_command(&parse_subcommand_flags(
+            rest,
+            CLUSTER_USAGE,
+            &[
+                "data-dir",
+                "cluster-id",
+                "endpoints",
+                "trust-dir",
+                "allowed-node-ids",
+            ],
+        )?),
+        "status" => {
+            cluster_status_command(&parse_subcommand_flags(rest, CLUSTER_USAGE, &["data-dir"])?)
+        }
+        other => Err(format!(
+            "unknown cluster subcommand `{other}`\n\n{CLUSTER_USAGE}"
+        )),
+    }
+}
+
+/// `node drain|remove` as a fallible report string (the testable form of
+/// [`cmd_node`]).
+fn node_command(args: &[String]) -> Result<String, String> {
+    let Some(subcommand) = args.first() else {
+        return Err(format!("a node subcommand is required\n\n{NODE_USAGE}"));
+    };
+    let rest = &args[1..];
+    match subcommand.as_str() {
+        "drain" => node_drain_command(&parse_subcommand_flags(
+            rest,
+            NODE_USAGE,
+            &["data-dir", "node-id"],
+        )?),
+        "remove" => node_remove_command(&parse_subcommand_flags(
+            rest,
+            NODE_USAGE,
+            &["data-dir", "node-id", "confirm-token"],
+        )?),
+        other => Err(format!("unknown node subcommand `{other}`\n\n{NODE_USAGE}")),
+    }
+}
+
+/// Parsed `--flag value` pairs of one cluster/node subcommand.
+type SubcommandFlags = BTreeMap<String, String>;
+
+/// Parse subcommand arguments as `--flag value` pairs, rejecting positionals,
+/// unknown flags, and missing values with the subcommand's usage text.
+fn parse_subcommand_flags(
+    args: &[String],
+    usage: &str,
+    allowed: &[&'static str],
+) -> Result<SubcommandFlags, String> {
+    let mut values = SubcommandFlags::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        let Some(name) = arg.strip_prefix("--") else {
+            return Err(format!("unexpected argument `{arg}`\n\n{usage}"));
+        };
+        if !allowed.contains(&name) {
+            return Err(format!("unknown flag `--{name}`\n\n{usage}"));
+        }
+        let value = args
+            .get(i + 1)
+            .ok_or_else(|| format!("--{name} requires a value"))?;
+        values.insert(name.to_owned(), value.clone());
+        i += 2;
+    }
+    Ok(values)
+}
+
+fn required_flag<'a>(
+    flags: &'a SubcommandFlags,
+    name: &str,
+    usage: &str,
+) -> Result<&'a str, String> {
+    flags
+        .get(name)
+        .map(String::as_str)
+        .ok_or_else(|| format!("--{name} is required\n\n{usage}"))
+}
+
+fn optional_flag<'a>(flags: &'a SubcommandFlags, name: &str) -> Option<&'a str> {
+    flags.get(name).map(String::as_str)
+}
+
+/// Load operator-supplied PEM trust material from a trust directory,
+/// validating it through the cluster crate (fails closed).
+fn load_trust_config(
+    trust_dir: &Path,
+    allowed_node_ids: Vec<NodeId>,
+) -> Result<TrustConfig, String> {
+    let read_pem = |filename: &str| -> Result<String, String> {
+        let path = trust_dir.join(filename);
+        std::fs::read_to_string(&path).map_err(|error| {
+            format!(
+                "cannot read cluster trust material {}: {error}",
+                path.display()
+            )
+        })
+    };
+    TrustConfig::from_pems(
+        read_pem(TRUST_CA_CERT_FILENAME)?,
+        read_pem(TRUST_NODE_CERT_FILENAME)?,
+        read_pem(TRUST_NODE_KEY_FILENAME)?,
+        allowed_node_ids,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn trust_dir_for(flags: &SubcommandFlags, data_path: &Path) -> PathBuf {
+    optional_flag(flags, "trust-dir")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| data_path.join("trust"))
+}
+
+/// Parse a comma-separated node-id list (`--allowed-node-ids`).
+fn parse_node_id_list(text: Option<&str>) -> Result<Option<Vec<NodeId>>, String> {
+    let Some(text) = text else {
+        return Ok(None);
+    };
+    let mut ids = Vec::new();
+    for part in text
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        ids.push(
+            part.parse::<NodeId>()
+                .map_err(|error| format!("invalid node id `{part}`: {error}"))?,
+        );
+    }
+    Ok(Some(ids))
+}
+
+/// Parse a comma-separated endpoint list (`--endpoints`), rejecting an
+/// effectively empty list before the cluster crate sees it.
+fn parse_endpoints(text: &str) -> Result<Vec<String>, String> {
+    let endpoints: Vec<String> = text
+        .split(',')
+        .map(str::trim)
+        .filter(|endpoint| !endpoint.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if endpoints.is_empty() {
+        return Err("--endpoints names no usable endpoint".to_owned());
+    }
+    Ok(endpoints)
+}
+
+/// Resolve the member `node drain`/`node remove` targets: the explicit
+/// `--node-id`, else this node's own persisted identity.
+fn resolve_cli_node_id(data_path: &Path, requested: Option<&str>) -> Result<NodeId, String> {
+    match requested {
+        Some(text) => text
+            .parse::<NodeId>()
+            .map_err(|error| format!("invalid --node-id `{text}`: {error}")),
+        None => NodeIdentity::load(data_path)
+            .map_err(|error| error.to_string())?
+            .map(|identity| identity.node_id)
+            .ok_or_else(|| {
+                "node has no cluster identity; pass --node-id explicitly or run \
+                 `mongreldb-server cluster init` first"
+                    .to_owned()
+            }),
+    }
+}
+
+/// Pretty-print one JSON report value.
+fn json_report(value: serde_json::Value) -> String {
+    serde_json::to_string_pretty(&value).expect("cluster report serialization")
+}
+
+/// `cluster init`: create the cluster on this node — cluster ID, initial
+/// membership, the single database Raft group, and the trust configuration.
+fn cluster_init_command(flags: &SubcommandFlags) -> Result<String, String> {
+    let data_dir = required_flag(flags, "data-dir", CLUSTER_USAGE)?;
+    let data_path = Path::new(data_dir);
+    // OS-CSPRNG block source for identifier minting, drawn through the shared
+    // id type's `new_random` so the server needs no direct `getrandom`
+    // dependency; `new_random` panics if the OS CSPRNG is unavailable, which
+    // matches the bootstrap code's fail-closed posture.
+    let mut csprng = |buf: &mut [u8]| {
+        for chunk in buf.chunks_mut(16) {
+            let block = NodeId::new_random();
+            chunk.copy_from_slice(&block.as_bytes()[..chunk.len()]);
+        }
+        Ok(())
+    };
+    // Pre-provision the identity so the default admitted-node list can name
+    // this node; `cluster_init` adopts a persisted identity unchanged.
+    let identity =
+        NodeIdentity::load_or_create(data_path, &mut csprng).map_err(|error| error.to_string())?;
+    let allowed_node_ids = parse_node_id_list(optional_flag(flags, "allowed-node-ids"))?
+        .unwrap_or_else(|| vec![identity.node_id]);
+    let trust = load_trust_config(&trust_dir_for(flags, data_path), allowed_node_ids)?;
+    let endpoints = match optional_flag(flags, "endpoints") {
+        Some(text) => parse_endpoints(text)?,
+        None => Vec::new(),
+    };
+    let rpc_address = optional_flag(flags, "rpc-address")
+        .map(str::to_owned)
+        .or_else(|| endpoints.first().cloned())
+        .unwrap_or_else(|| format!("127.0.0.1:{DEFAULT_PORT}"));
+    let locality = match optional_flag(flags, "locality") {
+        Some(text) => text
+            .parse::<Locality>()
+            .map_err(|error| format!("invalid --locality `{text}`: {error}"))?,
+        None => Locality::default(),
+    };
+    let request = InitRequest {
+        rpc_address,
+        locality,
+        capacity: NodeCapacity::default(),
+        trust,
+    };
+    let report =
+        cluster_init(data_path, &request, &mut csprng).map_err(|error| error.to_string())?;
+    Ok(json_report(json!({
+        "cluster_id": report.record.cluster_id,
+        "node_id": report.identity.node_id,
+        "rpc_address": report.record.members[0].rpc_address,
+        "database_group": report.record.database_group,
+        "members": report.record.members.len(),
+    })))
+}
+
+/// `cluster join`: validate an invite (cluster ID, member endpoints, trust
+/// material) and provision this node for the invited cluster.
+fn cluster_join_command(flags: &SubcommandFlags) -> Result<String, String> {
+    let data_dir = required_flag(flags, "data-dir", CLUSTER_USAGE)?;
+    let data_path = Path::new(data_dir);
+    let cluster_id = required_flag(flags, "cluster-id", CLUSTER_USAGE)?
+        .parse::<ClusterId>()
+        .map_err(|error| format!("invalid --cluster-id: {error}"))?;
+    let member_endpoints = parse_endpoints(required_flag(flags, "endpoints", CLUSTER_USAGE)?)?;
+    let allowed_node_ids = match parse_node_id_list(optional_flag(flags, "allowed-node-ids"))? {
+        Some(ids) => ids,
+        None => match NodeIdentity::load(data_path).map_err(|error| error.to_string())? {
+            Some(identity) => vec![identity.node_id],
+            None => {
+                return Err(
+                    "--allowed-node-ids is required on first join: the node id is minted \
+                     during join, so the admitted node list must come from the inviting \
+                     operator"
+                        .to_owned(),
+                )
+            }
+        },
+    };
+    let trust = load_trust_config(&trust_dir_for(flags, data_path), allowed_node_ids)?;
+    let invite = JoinInvite {
+        cluster_id,
+        member_endpoints,
+        trust,
+    };
+    let mut csprng = |buf: &mut [u8]| {
+        for chunk in buf.chunks_mut(16) {
+            let block = NodeId::new_random();
+            chunk.copy_from_slice(&block.as_bytes()[..chunk.len()]);
+        }
+        Ok(())
+    };
+    let report =
+        cluster_join(data_path, &invite, &mut csprng).map_err(|error| error.to_string())?;
+    Ok(json_report(json!({
+        "cluster_id": report.record.cluster_id,
+        "node_id": report.identity.node_id,
+        "member_endpoints": report.record.member_endpoints,
+    })))
+}
+
+/// `cluster status`: identity, membership, and group descriptors; a directory
+/// without a cluster identity reports `standalone`.
+fn cluster_status_command(flags: &SubcommandFlags) -> Result<String, String> {
+    let data_dir = required_flag(flags, "data-dir", CLUSTER_USAGE)?;
+    let report =
+        cluster_admin::status_report(Path::new(data_dir)).map_err(|error| error.to_string())?;
+    Ok(json_report(report))
+}
+
+/// `node drain`: move a member from `Up` to `Draining` in the persisted
+/// membership record.
+fn node_drain_command(flags: &SubcommandFlags) -> Result<String, String> {
+    let data_dir = required_flag(flags, "data-dir", NODE_USAGE)?;
+    let data_path = Path::new(data_dir);
+    let node_id = resolve_cli_node_id(data_path, optional_flag(flags, "node-id"))?;
+    let updated = node_drain(data_path, node_id).map_err(|error| error.to_string())?;
+    Ok(json_report(json!({ "member": updated })))
+}
+
+/// `node remove`: move a member to `Decommissioned`. Without
+/// `--confirm-token` this prints the out-of-band confirmation token and
+/// changes nothing.
+fn node_remove_command(flags: &SubcommandFlags) -> Result<String, String> {
+    let data_dir = required_flag(flags, "data-dir", NODE_USAGE)?;
+    let data_path = Path::new(data_dir);
+    let node_id = resolve_cli_node_id(data_path, optional_flag(flags, "node-id"))?;
+    match optional_flag(flags, "confirm-token") {
+        Some(token) => {
+            let updated =
+                node_remove(data_path, node_id, token).map_err(|error| error.to_string())?;
+            Ok(json_report(json!({ "removed": true, "member": updated })))
+        }
+        None => {
+            let identity = NodeIdentity::load(data_path)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
+                    "node has no cluster identity; run `mongreldb-server cluster init` or \
+                     `cluster join` first"
+                        .to_owned()
+                })?;
+            let token = removal_confirmation_token(identity.cluster_id, node_id);
+            Ok(json_report(json!({
+                "removed": false,
+                "detail": "confirmation required; re-run with --confirm-token to remove the node",
+                "cluster_id": identity.cluster_id,
+                "node_id": node_id,
+                "confirm_token": token,
+            })))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -704,5 +1148,423 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reopened.principal_snapshot().unwrap().username, "admin");
+    }
+
+    // ── Cluster/node subcommand tests (spec §11.1, S2A-002) ─────────────────
+
+    const CA_PEM: &str = "-----BEGIN CERTIFICATE-----\nY2E=\n-----END CERTIFICATE-----\n";
+    const CERT_PEM: &str = "-----BEGIN CERTIFICATE-----\nbm9kZQ==\n-----END CERTIFICATE-----\n";
+    const KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nc2VjcmV0\n-----END PRIVATE KEY-----\n";
+
+    /// Write operator-style PEM trust material under `<data>/trust` (the
+    /// default `--trust-dir`).
+    fn write_trust_dir(data_path: &Path) {
+        let trust = data_path.join("trust");
+        std::fs::create_dir_all(&trust).unwrap();
+        std::fs::write(trust.join(TRUST_CA_CERT_FILENAME), CA_PEM).unwrap();
+        std::fs::write(trust.join(TRUST_NODE_CERT_FILENAME), CERT_PEM).unwrap();
+        std::fs::write(trust.join(TRUST_NODE_KEY_FILENAME), KEY_PEM).unwrap();
+    }
+
+    fn cli_args(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    fn json_stdout(output: &str) -> serde_json::Value {
+        serde_json::from_str(output)
+            .unwrap_or_else(|error| panic!("stdout is not JSON: {error}\n{output}"))
+    }
+
+    /// `cluster init` on a fresh directory; returns `(cluster_id, node_id)`.
+    fn init_cluster(data_path: &Path) -> (String, String) {
+        let data_dir = data_path.to_str().unwrap();
+        let output = cluster_command(&cli_args(&[
+            "init",
+            "--data-dir",
+            data_dir,
+            "--endpoints",
+            "10.0.0.1:8453,10.0.0.2:8453",
+        ]))
+        .unwrap();
+        let report = json_stdout(&output);
+        (
+            report["cluster_id"].as_str().unwrap().to_owned(),
+            report["node_id"].as_str().unwrap().to_owned(),
+        )
+    }
+
+    #[test]
+    fn cluster_init_creates_identity_record_group_and_never_prints_key_material() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        write_trust_dir(&data);
+
+        let output = cluster_command(&cli_args(&[
+            "init",
+            "--data-dir",
+            data.to_str().unwrap(),
+            "--endpoints",
+            "10.0.0.1:8453,10.0.0.2:8453",
+            "--locality",
+            "region=test,zone=a",
+        ]))
+        .unwrap();
+        let report = json_stdout(&output);
+        let cluster_id = report["cluster_id"].as_str().unwrap();
+        let node_id = report["node_id"].as_str().unwrap();
+        assert_eq!(cluster_id.len(), 32, "{report}");
+        assert_eq!(node_id.len(), 32, "{report}");
+        assert_eq!(report["rpc_address"], "10.0.0.1:8453");
+        assert_eq!(report["members"], 1);
+        assert_eq!(
+            report["database_group"]["voter_ids"],
+            serde_json::json!([node_id])
+        );
+
+        let meta = data.join("cluster-meta");
+        assert!(meta.join("identity.json").is_file());
+        assert!(meta.join("cluster.json").is_file());
+        assert!(meta.join("trust.json").is_file());
+
+        // Status reports the bootstrapped cluster and never leaks the node key.
+        let status =
+            cluster_command(&cli_args(&["status", "--data-dir", data.to_str().unwrap()])).unwrap();
+        assert!(
+            !status.contains("c2VjcmV0"),
+            "key material leaked: {status}"
+        );
+        let status = json_stdout(&status);
+        assert_eq!(status["mode"], "cluster");
+        assert_eq!(status["identity"]["cluster_id"], cluster_id);
+        assert_eq!(status["identity"]["node_id"], node_id);
+        assert_eq!(status["membership"].as_array().unwrap().len(), 1);
+        assert_eq!(status["membership"][0]["state"], "Up");
+        assert_eq!(status["membership"][0]["locality"], "region=test,zone=a");
+        assert_eq!(
+            status["database_group"]["raft_group_id"]
+                .as_str()
+                .unwrap()
+                .len(),
+            32
+        );
+        assert_eq!(status["trust"]["has_node_key"], true);
+        assert_eq!(
+            status["version_info"]["binary_version"],
+            env!("CARGO_PKG_VERSION")
+        );
+    }
+
+    #[test]
+    fn cluster_init_twice_and_bad_flags_fail_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        write_trust_dir(&data);
+        let data_dir = data.to_str().unwrap();
+
+        cluster_command(&cli_args(&["init", "--data-dir", data_dir])).unwrap();
+        let error = cluster_command(&cli_args(&["init", "--data-dir", data_dir])).unwrap_err();
+        assert!(error.contains("already bootstrapped"), "{error}");
+
+        let error = cluster_command(&cli_args(&["init"])).unwrap_err();
+        assert!(error.contains("--data-dir is required"), "{error}");
+        let error = cluster_command(&cli_args(&["init", "--data-dir", data_dir, "--wat", "1"]))
+            .unwrap_err();
+        assert!(error.contains("unknown flag `--wat`"), "{error}");
+        let error = cluster_command(&cli_args(&["frobnicate"])).unwrap_err();
+        assert!(error.contains("unknown cluster subcommand"), "{error}");
+        let error = cluster_command(&cli_args(&[])).unwrap_err();
+        assert!(error.contains("subcommand is required"), "{error}");
+    }
+
+    #[test]
+    fn cluster_init_requires_readable_trust_material() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        let error = cluster_command(&cli_args(&["init", "--data-dir", data.to_str().unwrap()]))
+            .unwrap_err();
+        assert!(
+            error.contains("cannot read cluster trust material"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn cluster_join_provisions_and_reports() {
+        let directory = tempfile::tempdir().unwrap();
+        let data_a = directory.path().join("a");
+        let data_b = directory.path().join("b");
+        write_trust_dir(&data_a);
+        write_trust_dir(&data_b);
+        let (cluster_id, node_id_a) = init_cluster(&data_a);
+
+        let output = cluster_command(&cli_args(&[
+            "join",
+            "--data-dir",
+            data_b.to_str().unwrap(),
+            "--cluster-id",
+            &cluster_id,
+            "--endpoints",
+            "10.0.0.1:8453",
+            "--allowed-node-ids",
+            &node_id_a,
+        ]))
+        .unwrap();
+        let report = json_stdout(&output);
+        assert_eq!(report["cluster_id"], cluster_id);
+        let node_id_b = report["node_id"].as_str().unwrap();
+        assert_eq!(node_id_b.len(), 32);
+        assert_ne!(node_id_b, node_id_a);
+        assert_eq!(
+            report["member_endpoints"],
+            serde_json::json!(["10.0.0.1:8453"])
+        );
+
+        // A joined node reports the validated invite: no local membership or
+        // database group until the meta group lands (Stage 2F/3A).
+        let status = cluster_command(&cli_args(&[
+            "status",
+            "--data-dir",
+            data_b.to_str().unwrap(),
+        ]))
+        .unwrap();
+        let status = json_stdout(&status);
+        assert_eq!(status["mode"], "cluster");
+        assert_eq!(status["identity"]["cluster_id"], cluster_id);
+        assert_eq!(status["identity"]["node_id"], node_id_b);
+        assert!(status["membership"].as_array().unwrap().is_empty());
+        assert_eq!(
+            status["member_endpoints"],
+            serde_json::json!(["10.0.0.1:8453"])
+        );
+        assert!(status["database_group"].is_null());
+
+        // Joining twice fails closed.
+        let error = cluster_command(&cli_args(&[
+            "join",
+            "--data-dir",
+            data_b.to_str().unwrap(),
+            "--cluster-id",
+            &cluster_id,
+            "--endpoints",
+            "10.0.0.1:8453",
+            "--allowed-node-ids",
+            &node_id_a,
+        ]))
+        .unwrap_err();
+        assert!(error.contains("already bootstrapped"), "{error}");
+    }
+
+    #[test]
+    fn cluster_join_rejects_bad_invites_and_mismatched_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        write_trust_dir(&data);
+        let data_dir = data.to_str().unwrap();
+        let some_node = NodeId::new_random().to_hex();
+
+        // The reserved all-zero cluster id is rejected.
+        let error = cluster_command(&cli_args(&[
+            "join",
+            "--data-dir",
+            data_dir,
+            "--cluster-id",
+            "00000000000000000000000000000000",
+            "--endpoints",
+            "10.0.0.1:8453",
+            "--allowed-node-ids",
+            &some_node,
+        ]))
+        .unwrap_err();
+        assert!(error.contains("reserved zero"), "{error}");
+        // Required flags are required.
+        let error = cluster_command(&cli_args(&[
+            "join",
+            "--data-dir",
+            data_dir,
+            "--endpoints",
+            "10.0.0.1:8453",
+        ]))
+        .unwrap_err();
+        assert!(error.contains("--cluster-id is required"), "{error}");
+        let error = cluster_command(&cli_args(&[
+            "join",
+            "--data-dir",
+            data_dir,
+            "--cluster-id",
+            &ClusterId::new_random().to_hex(),
+        ]))
+        .unwrap_err();
+        assert!(error.contains("--endpoints is required"), "{error}");
+        // First join without --allowed-node-ids cannot default the trust list.
+        let error = cluster_command(&cli_args(&[
+            "join",
+            "--data-dir",
+            data_dir,
+            "--cluster-id",
+            &ClusterId::new_random().to_hex(),
+            "--endpoints",
+            "10.0.0.1:8453",
+        ]))
+        .unwrap_err();
+        assert!(error.contains("--allowed-node-ids is required"), "{error}");
+
+        // A persisted identity binds the node to its cluster (S2A-001).
+        let mut csprng = |buf: &mut [u8]| {
+            for chunk in buf.chunks_mut(16) {
+                let block = NodeId::new_random();
+                chunk.copy_from_slice(&block.as_bytes()[..chunk.len()]);
+            }
+            Ok(())
+        };
+        let persisted = NodeIdentity::load_or_create(&data, &mut csprng).unwrap();
+        let mut other = ClusterId::new_random();
+        while other == persisted.cluster_id {
+            other = ClusterId::new_random();
+        }
+        let error = cluster_command(&cli_args(&[
+            "join",
+            "--data-dir",
+            data_dir,
+            "--cluster-id",
+            &other.to_hex(),
+            "--endpoints",
+            "10.0.0.1:8453",
+        ]))
+        .unwrap_err();
+        assert!(error.contains("cluster identity mismatch"), "{error}");
+    }
+
+    #[test]
+    fn cluster_status_on_uninitialized_directory_reports_standalone() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = cluster_command(&cli_args(&[
+            "status",
+            "--data-dir",
+            directory.path().to_str().unwrap(),
+        ]))
+        .unwrap();
+        let status = json_stdout(&output);
+        assert_eq!(status["mode"], "standalone");
+        assert_eq!(
+            status["version_info"]["binary_version"],
+            env!("CARGO_PKG_VERSION")
+        );
+    }
+
+    #[test]
+    fn node_drain_and_remove_transition_membership_with_token_enforcement() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        write_trust_dir(&data);
+        let data_dir = data.to_str().unwrap();
+        let (_cluster_id, node_id) = init_cluster(&data);
+
+        // Drain defaults to this node's own identity.
+        let output = node_command(&cli_args(&["drain", "--data-dir", data_dir])).unwrap();
+        let report = json_stdout(&output);
+        assert_eq!(report["member"]["node_id"], node_id);
+        assert_eq!(report["member"]["state"], "Draining");
+        // Draining again is not a legal transition.
+        let error = node_command(&cli_args(&["drain", "--data-dir", data_dir])).unwrap_err();
+        assert!(error.contains("invalid node state transition"), "{error}");
+
+        // Remove without the token prints it and changes nothing.
+        let output = node_command(&cli_args(&["remove", "--data-dir", data_dir])).unwrap();
+        let report = json_stdout(&output);
+        assert_eq!(report["removed"], false);
+        assert_eq!(report["node_id"], node_id);
+        let token = report["confirm_token"].as_str().unwrap().to_owned();
+        assert_eq!(token.len(), 64);
+        let status = mongreldb_cluster::bootstrap::cluster_status(&data).unwrap();
+        assert_eq!(
+            status.membership[0].state,
+            mongreldb_cluster::node::NodeState::Draining,
+            "token printing must not change membership"
+        );
+
+        // A wrong token fails closed; the right token decommissions.
+        let error = node_command(&cli_args(&[
+            "remove",
+            "--data-dir",
+            data_dir,
+            "--confirm-token",
+            "not-the-token",
+        ]))
+        .unwrap_err();
+        assert!(error.contains("confirmation token"), "{error}");
+        let output = node_command(&cli_args(&[
+            "remove",
+            "--data-dir",
+            data_dir,
+            "--confirm-token",
+            &token,
+        ]))
+        .unwrap();
+        let report = json_stdout(&output);
+        assert_eq!(report["removed"], true);
+        assert_eq!(report["member"]["state"], "Decommissioned");
+        let status = mongreldb_cluster::bootstrap::cluster_status(&data).unwrap();
+        assert_eq!(
+            status.membership[0].state,
+            mongreldb_cluster::node::NodeState::Decommissioned
+        );
+        // Removing twice is not a legal transition.
+        let error = node_command(&cli_args(&[
+            "remove",
+            "--data-dir",
+            data_dir,
+            "--confirm-token",
+            &token,
+        ]))
+        .unwrap_err();
+        assert!(error.contains("invalid node state transition"), "{error}");
+    }
+
+    #[test]
+    fn node_commands_require_bootstrap() {
+        let directory = tempfile::tempdir().unwrap();
+        let data_dir = directory.path().to_str().unwrap();
+
+        // Without an identity the target member cannot be defaulted.
+        let error = node_command(&cli_args(&["drain", "--data-dir", data_dir])).unwrap_err();
+        assert!(error.contains("no cluster identity"), "{error}");
+        let error = node_command(&cli_args(&["remove", "--data-dir", data_dir])).unwrap_err();
+        assert!(error.contains("no cluster identity"), "{error}");
+        // An explicit target on an unbootstrapped directory is NotInitialized.
+        let some_node = NodeId::new_random().to_hex();
+        let error = node_command(&cli_args(&[
+            "drain",
+            "--data-dir",
+            data_dir,
+            "--node-id",
+            &some_node,
+        ]))
+        .unwrap_err();
+        assert!(error.contains("not initialized"), "{error}");
+        let error = node_command(&cli_args(&[
+            "remove",
+            "--data-dir",
+            data_dir,
+            "--node-id",
+            &some_node,
+            "--confirm-token",
+            "token",
+        ]))
+        .unwrap_err();
+        assert!(error.contains("not initialized"), "{error}");
+    }
+
+    #[test]
+    fn trust_config_debug_redacts_the_node_key() {
+        let trust = TrustConfig::from_pems(
+            CA_PEM.to_owned(),
+            CERT_PEM.to_owned(),
+            KEY_PEM.to_owned(),
+            vec![NodeId::new_random()],
+        )
+        .unwrap();
+        let debug = format!("{trust:?}");
+        assert!(!debug.contains("c2VjcmV0"), "key material leaked: {debug}");
+        assert!(debug.contains("<redacted>"), "{debug}");
     }
 }

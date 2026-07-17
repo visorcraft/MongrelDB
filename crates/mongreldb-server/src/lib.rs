@@ -37,6 +37,7 @@ use sha2::Digest;
 use zeroize::Zeroizing;
 
 mod audit;
+pub mod cluster_admin;
 mod kit;
 mod metrics;
 mod pre_cancel;
@@ -730,6 +731,10 @@ pub fn build_app_with_sessions_and_control(
         .route("/audit", get(audit_handler))
         .route("/admin/drain", get(drain_status).post(admin_drain))
         .route("/admin/reload", post(admin_reload))
+        // Cluster bootstrap + membership workflows (spec §11.1, S2A-002).
+        .route("/admin/cluster/status", get(cluster_admin::status))
+        .route("/admin/cluster/node/drain", post(cluster_admin::drain))
+        .route("/admin/cluster/node/remove", post(cluster_admin::remove))
         .route("/tables", get(list_tables).post(create_table))
         .route("/tables/{name}", axum::routing::delete(drop_table))
         .route("/tables/{name}/put", post(put_row))

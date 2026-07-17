@@ -213,6 +213,43 @@ run-file pins (`backup_pins`) are still consulted separately by the
 GC/checkpoint paths; merging them into the `PinRegistry` is documented
 follow-up work.
 
+## Storage-mode marker (`_meta/storage-mode`)
+
+Every database root carries a durable, versioned, checksummed marker at
+`_meta/storage-mode` (spec section 5.3, Stage 2 groundwork) declaring which
+runtime owns the directory: `Standalone`, `ServerOwnedStandalone`, or
+`ClusterReplica { cluster_id, node_id, database_id }`. The marker is written
+atomically (temp + rename + fsync) and is never rewritten in place — spec
+section 5.2 forbids in-place conversion, so the write fails closed when the
+existing marker disagrees. Databases created before the marker existed have
+no file: they open as `Standalone` and the marker is backfilled on first
+open, purely additively.
+
+**Cluster replica open rules.** A `ClusterReplica` directory is owned by the
+cluster node runtime:
+
+- every normal open path (`Database::open`, `open_with_options` with default
+  options, and the encrypted/credentialed variants) rejects it with a typed
+  error naming the cluster, node, and database ids;
+- the cluster node runtime opens it with `Database::open_cluster_replica`,
+  which fails closed unless the marker exists and exactly matches the
+  offered identity (opening the wrong replica would corrupt two clusters);
+- a backup validator may open any mode — including `ClusterReplica` —
+  read-only through `OpenOptions::offline_validation`, the only way to open
+  a cluster replica outside the cluster runtime.
+
+Every replica open (cluster runtime or offline validation) is read-only:
+user writes fail with `MongrelError::ReadOnlyReplica` because mutations
+arrive through the replicated apply path
+(`Database::apply_replicated_records` /
+`apply_replicated_catalog_command`, driven by the consensus engine sink).
+Read-only also means admin-level maintenance such as `hot_backup` is
+rejected on a live replica core this wave; replica backups stage offline
+from the quiesced root (see
+[Replicated High Availability](20-replicated-ha.md#stage-2-gate-status)).
+The open gate matrix is integration-tested in
+`crates/mongreldb-core/tests/stage2_gate.rs::storage_mode_open_gate_matrix`.
+
 ## Still to land
 
 - `ResourceGroupRegistry` construction inside `Database::open` and

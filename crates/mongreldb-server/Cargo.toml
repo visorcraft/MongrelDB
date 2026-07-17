@@ -26,6 +26,10 @@ mongreldb-types = { path = "../mongreldb-types", version = "0.59.0" }
 # the commit log's `CommitReceipt`/`DurabilityLevel`; the server names them
 # when echoing receipt fields back in idempotent-write responses (S1B-005).
 mongreldb-log = { path = "../mongreldb-log", version = "0.59.0" }
+# Cluster bootstrap workflows (spec section 11.1, S2A-002): the `cluster`/`node`
+# CLI subcommands and the `/admin/cluster/*` endpoints map onto this crate's
+# node-identity and membership functions.
+mongreldb-cluster = { path = "../mongreldb-cluster", version = "0.59.0" }
 axum = "0.8"
 tower = { version = "0.5", features = ["limit"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }

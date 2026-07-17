@@ -220,17 +220,22 @@ durable idempotency key.
 - **A real RPC transport.** Today the only transport is the in-memory one
   used by tests and deterministic simulation; the networked transport
   (with TLS from the cluster trust configuration) is a later Stage 2 wave.
-- **The engine `ApplySink` binding.** The apply state machine dispatches
-  to an `ApplySink`; tests use the in-memory sink. Binding dispatch to the
-  storage engine (and switching the engine from `StandaloneCommitLog` to
-  `RaftCommitLog`) is in progress.
+- **Live engine integration.** The engine `ApplySink` binding has landed
+  (`engine_sink.rs`): committed `ReplicatedCommand`s apply to a
+  `ClusterReplica`-marked core through the same WAL-recovery apply path the
+  engine already used. Still open: the server wiring that runs one group
+  per database in production, switching those cores from the default
+  `StandaloneCommitLog` to `RaftCommitLog`, and an online `hot_backup`
+  against a live replica core — every replica open is read-only and
+  `hot_backup` requires `Admin`, so replica backups currently stage offline
+  from a quiesced root (see the gate table).
 - **Cluster CLI.** The bootstrap records and join flow exist in
   `mongreldb-cluster`; the `mongreldb cluster init/join/status`,
   `node drain`, and `node remove` commands are not wired yet.
-- **Rolling upgrades.** Version advertising and the upgrade/rollback
-  choreography (ADR-0010) are designed but not executed by code yet.
-- **Backup from a follower** and **replicated-mode AI/SQL equivalence**
-  both wait on the engine binding.
+- **Rolling upgrades.** Version advertising, feature levels, and the
+  upgrade-planning/rollback-assessment machinery (ADR-0010) have landed in
+  `mongreldb-cluster::meta` with unit tests; the executed N→N+1 upgrade
+  choreography waits on the real transport.
 
 ## Stage 2 gate status
 
@@ -245,6 +250,6 @@ From the spec section 11 gate list:
 | Leader transfer preserves availability | **Pass** — transfer rounds in the chaos matrix keep the client committing; best-effort orchestration with retries |
 | Linearizable read tests pass | **Pass** — read-index barrier on a confirmed leader; unconfirmed leaders and followers never serve it |
 | Read-your-writes tests pass | **Pass** — receipt-position wait and the `SessionToken`-carried `ReadConsistency::ReadYourWrites` barrier |
-| Rolling upgrade N→N+1 and rollback-before-feature-activation | **Deferred** — needs the real transport and version advertising (ADR-0010) |
-| Backup from a follower is valid | **Deferred** — waits on the engine `ApplySink` binding |
-| Current AI and SQL results match standalone behavior at the same snapshot | **Deferred** — waits on the engine `ApplySink` binding |
+| Rolling upgrade N→N+1 and rollback-before-feature-activation | **Deferred (execution)** — planning is landed and unit-tested (`mongreldb-cluster/src/meta.rs`: followers-first/leader-last ordering, compatibility verification, binary rollback until first feature activation); the executed upgrade still needs the networked transport (ADR-0010) |
+| Backup from a follower is valid | **Pass** — `mongreldb-core/tests/stage2_gate.rs::backup_from_a_follower_is_valid_and_matches_the_leader`: a quiesced follower's applied root stages into a backup that `verify_backup` + `validate_restore` accept, whose manifest file hashes equal the leader's backup at the same applied watermark (except the node-local `_meta/replication_id` and `_meta/storage-mode` markers), and which reopens under the replica open rules with the exact applied rows. Live `hot_backup` on a replica core is read-only-rejected this wave (see above) |
+| Current AI and SQL results match standalone behavior at the same snapshot | **Pass** — `mongreldb-core/tests/stage2_gate.rs::ai_and_sql_results_match_standalone_at_the_same_snapshot`: standalone and `ClusterReplica` engines seeded with identical data agree at the same committed watermark on full row content, `aggregate_native` COUNT/SUM/MIN/MAX/AVG (the SQL aggregate pushdown), ANN/Sparse/MinHash top-k `(id, score)` sequences, and bitmap/FM query id sets |

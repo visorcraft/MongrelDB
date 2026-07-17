@@ -1,22 +1,57 @@
 //! Cluster meta (spec sections 11-12, Stages 2-3).
 //!
-//! Stage 2H (spec section 11.8, ADR-0010) lands the rolling-upgrade control
+//! Stage 2H (spec section 11.8, ADR-0010) landed the rolling-upgrade control
 //! surface: the cluster feature level and feature registry, the
-//! [`FeatureActivation`] record destined to become a replicated catalog
-//! command on the meta group, rolling-upgrade planning
+//! [`FeatureActivation`] record, rolling-upgrade planning
 //! ([`plan_rolling_upgrade`]), and rollback assessment ([`assess_rollback`]).
-//! The full meta control plane — replicated membership, database/tablet
-//! descriptors, placement ownership — lands with Stage 3A (spec section
-//! 12.1); until then these are library types the node runtime drives.
+//!
+//! Stage 3A (spec section 12.1) lands the meta control plane itself: a
+//! dedicated Raft group owning the cluster's control-plane state — never user
+//! row data. [`MetaState`] is the deterministic, serde-versioned state
+//! machine (membership and node descriptors, databases, table schemas,
+//! tablet descriptors, replica placement and policies, schema/index jobs,
+//! transaction status partitions, cluster settings, and the feature flags
+//! above); [`MetaCommand`] is the versioned command enum riding
+//! [`ReplicatedCommand::Catalog`] envelopes; [`MetaApplySink`] binds the
+//! state to `mongreldb-consensus`'s apply path; and [`MetaGroup`] is the
+//! bootstrap/membership/propose helper the node runtime drives.
+//!
+//! # Reconciliation notes (later waves)
+//!
+//! - [`TabletDescriptor`], [`ReplicaDescriptor`], [`ReplicaRole`],
+//!   [`PartitionBounds`], and [`TabletState`] are meta-local minimal mirrors
+//!   of the `crate::tablet` descriptors owned by the Stage 3B wave (spec
+//!   section 12.1 freezes the descriptor shape here so the replicated state
+//!   format is stable). When `crate::tablet` lands its owning types, these
+//!   reconcile to it.
+//! - [`SchemaJobKind`]/[`SchemaJobState`] minimally mirror the core job
+//!   registry's concepts (`mongreldb-core` `jobs.rs`), which the cluster
+//!   crate deliberately does not depend on. Distributed DDL (spec section
+//!   12.11) reconciles the two registries.
+//! - [`DefaultConsistency`] is a payload-free mirror of
+//!   `mongreldb_consensus::read::ReadConsistency` suitable as a cluster-wide
+//!   default (request-scoped token/timestamp variants carry no payload here).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
+use mongreldb_consensus::error::ConsensusError;
+use mongreldb_consensus::group::{ConsensusGroup, GroupCommitReceipt, GroupConfig};
+use mongreldb_consensus::identity::{raft_node_id, CommandKind, RaftNodeId, ReplicatedCommand};
+use mongreldb_consensus::network::RaftTransport;
+use mongreldb_consensus::state_machine::{AppliedCommand, ApplySink, StateMachineError};
+use mongreldb_consensus::storage::StorageConfig;
+use mongreldb_log::commit_log::ExecutionControl;
+use mongreldb_log::envelope::CommandEnvelope;
 use mongreldb_types::hlc::HlcTimestamp;
-use mongreldb_types::ids::NodeId;
+use mongreldb_types::ids::{
+    DatabaseId, MetadataVersion, NodeId, RaftGroupId, SchemaVersion, TableId, TabletId,
+};
 use serde::{Deserialize, Serialize};
 
-use crate::node::{Incompatibility, NodeDescriptor, VersionInfo};
+use crate::node::{Incompatibility, NodeDescriptor, NodeState, VersionInfo};
 
 /// Cluster-wide feature level (spec section 17: separate from binary
 /// version; ADR-0010 decision 3).
@@ -109,7 +144,10 @@ pub struct FeatureActivation {
 
 /// Why a [`FeatureActivation`] may not be applied. Activation failures fail
 /// closed (ADR-0010).
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+///
+/// Serde derives exist so the meta group's rejection journal
+/// ([`MetaRejection`]) can record the typed reason inside replicated state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum FeatureActivationError {
     /// The feature is not declared in this binary's registry.
     #[error("feature `{feature}` is not declared in the feature registry")]
@@ -383,6 +421,1922 @@ pub fn assess_rollback(activations: &[FeatureActivation]) -> RollbackAssessment 
     }
 }
 
+// ---------------------------------------------------------------------------
+// Stage 3A — meta control plane (spec section 12.1)
+// ---------------------------------------------------------------------------
+//
+// The meta group is a dedicated Raft group owning control-plane state only;
+// user row data never enters it (spec section 12.1). Commands ride
+// `ReplicatedCommand::Catalog` envelopes stamped with
+// [`COMMAND_TYPE_META_COMMAND`]; the apply path is deterministic and total:
+// a refused command never faults the raft state machine — it is recorded in
+// the bounded rejection journal ([`MetaState::rejections`]) and surfaced to
+// the proposer by [`MetaGroup::propose`].
+//
+// # Serde versioning (spec sections 4.10, 17)
+//
+// [`MetaState`] and [`MetaCommandRecord`] carry explicit `format_version`
+// fields checked on decode (fail closed outside the supported range). Unlike
+// the crate's static metadata files, these types deliberately omit
+// `deny_unknown_fields`: they travel in log entries and snapshots, where
+// spec section 17 requires an N-1 node to ignore optional N fields during
+// the rolling-upgrade window. Additive evolution lands as new optional
+// fields with serde defaults; new required command variants ship dark behind
+// feature activation (ADR-0010).
+
+/// Format version of [`MetaCommandRecord`] payloads this build writes.
+pub const META_COMMAND_FORMAT_VERSION: u32 = 1;
+/// Oldest [`MetaCommandRecord`] format version this build accepts.
+pub const MIN_SUPPORTED_META_COMMAND_FORMAT_VERSION: u32 = 1;
+/// Format version of [`MetaState`] snapshots this build writes.
+pub const META_STATE_FORMAT_VERSION: u32 = 1;
+/// Oldest [`MetaState`] snapshot format version this build accepts.
+pub const MIN_SUPPORTED_META_STATE_FORMAT_VERSION: u32 = 1;
+/// `CommandEnvelope::command_type` of meta control-plane commands.
+///
+/// Envelope discriminants are never reused (spec section 4.10): `1` is the
+/// transaction command (`mongreldb-core` `commit_log`), `2` the engine
+/// catalog command, and `3` the maintenance command (`mongreldb-core`
+/// `replicated_apply`); `4` is the meta control-plane command.
+pub const COMMAND_TYPE_META_COMMAND: u32 = 4;
+/// Bound on [`MetaState::rejections`] (mirrors the engine catalog's
+/// `COMMAND_HISTORY_LIMIT`).
+pub const META_REJECTION_LIMIT: usize = 256;
+/// Substrings (matched case-insensitively) that bar a key from the cluster
+/// settings: secrets are never stored as plaintext cluster settings (spec
+/// section 16.2). TLS private keys, backup credentials, and encryption-key
+/// material live in static node configuration or the engine's key hierarchy,
+/// never in replicated meta state. The match is deliberately conservative —
+/// a legitimate key containing one of these substrings must be renamed.
+pub const SECRET_SETTING_KEY_DENYLIST: &[&str] = &[
+    "secret",
+    "password",
+    "passwd",
+    "private_key",
+    "api_key",
+    "token",
+    "credential",
+];
+
+/// The fixed cluster-setting keys ([`MetaCommand::SetClusterSetting`]).
+/// `resource_groups.<name>` is the one dynamic key shape; everything else is
+/// listed here.
+pub const KNOWN_SETTING_KEYS: &[&str] = &[
+    "history_retention_epochs",
+    "backup.enabled",
+    "backup.interval_seconds",
+    "backup.retention_count",
+    "default_consistency",
+    "ai.max_concurrent_requests",
+    "ai.max_memory_bytes",
+    "jobs.max_concurrent",
+];
+
+/// Default for [`ClusterSettings::max_concurrent_jobs`] (mirrors the core job
+/// registry's `DEFAULT_MAX_CONCURRENT_JOBS`).
+pub const DEFAULT_MAX_CONCURRENT_JOBS: u32 = 2;
+/// Default for [`BackupPolicy::interval_seconds`] (daily).
+pub const DEFAULT_BACKUP_INTERVAL_SECONDS: u64 = 86_400;
+/// Default for [`BackupPolicy::retention_count`].
+pub const DEFAULT_BACKUP_RETENTION_COUNT: u32 = 7;
+/// Default for [`AiLimits::max_concurrent_requests`].
+pub const DEFAULT_AI_MAX_CONCURRENT_REQUESTS: u32 = 16;
+/// Default for [`AiLimits::max_memory_bytes`] (512 MiB).
+pub const DEFAULT_AI_MAX_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
+
+fn zero_metadata_version() -> MetadataVersion {
+    MetadataVersion::ZERO
+}
+
+/// Errors of the meta control-plane surface (group factory, membership
+/// workflow, proposals).
+#[derive(Debug, thiserror::Error)]
+pub enum MetaError {
+    /// Consensus group failure (including the routed
+    /// [`ConsensusError::NotLeader`] leader hint, spec section 11.7).
+    #[error(transparent)]
+    Consensus(#[from] ConsensusError),
+    /// Encoding a [`MetaCommandRecord`] failed.
+    #[error("meta command encoding failed: {0}")]
+    Encode(String),
+    /// The command committed but the apply path refused it; the typed reason
+    /// is also journaled in [`MetaState::rejections`].
+    #[error("meta command refused at apply: {0}")]
+    Rejected(MetaRejectionReason),
+    /// The caller's request was malformed for this group (raft-id projection
+    /// collision, mismatched group config, invalid workflow order).
+    #[error("invalid meta group request: {0}")]
+    InvalidRequest(String),
+    /// Meta group I/O failure.
+    #[error("meta group I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    /// The caller-supplied operating-system CSPRNG failed.
+    #[error("operating-system CSPRNG failed: {0}")]
+    Rng(String),
+}
+
+/// Why a [`MetaCommandRecord`] payload could not be decoded. Decode failures
+/// fail closed (spec section 4.10).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MetaDecodeError {
+    /// The payload is not a well-formed record.
+    #[error("meta command decode failed: {0}")]
+    Malformed(String),
+    /// The record's format version is outside the supported range.
+    #[error("unsupported meta command format version {found} (supported {min}..={max})")]
+    UnsupportedVersion {
+        /// Version found in the payload.
+        found: u32,
+        /// Oldest version this build accepts.
+        min: u32,
+        /// Newest version this build accepts.
+        max: u32,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Ownership records (spec section 12.1)
+// ---------------------------------------------------------------------------
+
+/// Lifecycle state of a logical database.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DatabaseState {
+    /// Serving traffic.
+    Online,
+    /// Being dropped; drained of tablets before removal.
+    Dropping,
+}
+
+/// One logical database owned by the meta group (spec section 12.1).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatabaseDescriptor {
+    /// The database's durable identifier.
+    pub database_id: DatabaseId,
+    /// Unique database name.
+    pub name: String,
+    /// Creation timestamp stamped by the proposer.
+    pub created_at: HlcTimestamp,
+    /// Lifecycle state.
+    pub state: DatabaseState,
+    /// Meta state's [`MetadataVersion`] of the last modification.
+    #[serde(default = "zero_metadata_version")]
+    pub metadata_version: MetadataVersion,
+}
+
+/// Replicated schema of one table: the opaque schema document (JSON) plus
+/// its monotonic version. Last-writer-wins by `schema_version`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TableSchemaRecord {
+    /// The table's durable identifier.
+    pub table_id: TableId,
+    /// Database owning the table.
+    pub database_id: DatabaseId,
+    /// Monotonic schema version (never reused, never lowered).
+    pub schema_version: SchemaVersion,
+    /// The schema document (opaque to the meta group; the engine interprets
+    /// it at DDL apply time).
+    pub schema: serde_json::Value,
+    /// Meta state's [`MetadataVersion`] of the last modification.
+    #[serde(default = "zero_metadata_version")]
+    pub metadata_version: MetadataVersion,
+}
+
+/// Raft role of one replica. Meta-local minimal mirror of the Stage 3B
+/// `crate::tablet` role type (see module reconciliation notes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReplicaRole {
+    /// Voting member of the raft group.
+    Voter,
+    /// Non-voting replica catching up before promotion.
+    Learner,
+}
+
+/// One replica of a tablet or placement. Meta-local minimal mirror of the
+/// Stage 3B `crate::tablet` replica descriptor.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicaDescriptor {
+    /// Node hosting the replica.
+    pub node_id: NodeId,
+    /// Raft role of the replica.
+    pub role: ReplicaRole,
+}
+
+/// Key-range bounds of one tablet (`None` = unbounded; start inclusive, end
+/// exclusive). Meta-local minimal mirror of the Stage 3B `crate::tablet`
+/// partition bounds; hash/tenant partitioning (spec section 12.2) refines
+/// the bound semantics there.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartitionBounds {
+    /// Inclusive start key; `None` from the beginning of the key space.
+    pub start: Option<Vec<u8>>,
+    /// Exclusive end key; `None` to the end of the key space.
+    pub end: Option<Vec<u8>>,
+}
+
+/// Lifecycle state of one tablet. Meta-local minimal mirror of the Stage 3B
+/// `crate::tablet` state type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TabletState {
+    /// Replicas are being built; not yet serving.
+    Creating,
+    /// Serving traffic.
+    Online,
+    /// Being removed; drained before the descriptor is deleted.
+    Offline,
+}
+
+/// One independently replicated data partition (spec section 12.1).
+/// Meta-local minimal mirror of the Stage 3B `crate::tablet` descriptor;
+/// `generation` is the last-writer-wins version.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TabletDescriptor {
+    /// The tablet's durable identifier.
+    pub tablet_id: TabletId,
+    /// Table the tablet partitions.
+    pub table_id: TableId,
+    /// Consensus group replicating the tablet.
+    pub raft_group_id: RaftGroupId,
+    /// Key-range bounds of the partition.
+    pub partition: PartitionBounds,
+    /// Replicas and their roles.
+    pub replicas: Vec<ReplicaDescriptor>,
+    /// Preferred leader, when placement has one.
+    pub leader_hint: Option<NodeId>,
+    /// Descriptor generation; updates apply only at a higher generation.
+    pub generation: u64,
+    /// Lifecycle state.
+    pub state: TabletState,
+    /// Meta state's [`MetadataVersion`] of the last modification.
+    #[serde(default = "zero_metadata_version")]
+    pub metadata_version: MetadataVersion,
+}
+
+/// Replica set of one raft group (spec section 12.1 "replica placement").
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicaPlacement {
+    /// The group whose replicas are placed.
+    pub raft_group_id: RaftGroupId,
+    /// Placed replicas and their roles.
+    pub replicas: Vec<ReplicaDescriptor>,
+    /// Meta state's [`MetadataVersion`] of the last modification.
+    #[serde(default = "zero_metadata_version")]
+    pub metadata_version: MetadataVersion,
+}
+
+/// One locality requirement of a placement policy (spec section 12.7): the
+/// node's [`crate::node::Locality`] tier `key` must equal `value`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalityConstraint {
+    /// Locality tier key (for example `region` or `zone`).
+    pub key: String,
+    /// Required tier value.
+    pub value: String,
+}
+
+/// Placement policy (spec section 12.7, exact shape).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlacementPolicy {
+    /// Number of replicas.
+    pub replicas: u8,
+    /// Locality constraints every voter must satisfy.
+    pub voter_constraints: Vec<LocalityConstraint>,
+    /// Locality preferences for the leader, in priority order.
+    pub leader_preferences: Vec<LocalityConstraint>,
+    /// Nodes that must never hold a replica.
+    pub prohibited_nodes: Vec<NodeId>,
+    /// Meta state's [`MetadataVersion`] of the last modification.
+    #[serde(default = "zero_metadata_version")]
+    pub metadata_version: MetadataVersion,
+}
+
+/// Schema/index job kinds owned by the meta group. Minimal mirror of the
+/// core registry's DDL-relevant `JobKind`s (see module reconciliation notes;
+/// spec section 12.11 wires these to distributed DDL).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SchemaJobKind {
+    /// Online secondary-index build.
+    IndexBuild,
+    /// Backfill of a newly added or altered column.
+    ColumnBackfill,
+    /// Validation of existing rows against a new schema constraint.
+    SchemaValidation,
+}
+
+/// Schema job lifecycle. Minimal mirror of the core registry's `JobState`
+/// (see module reconciliation notes); the transition graph is identical.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SchemaJobState {
+    /// Submitted, waiting for admission.
+    Pending,
+    /// Admitted; a worker is actively driving it.
+    Running,
+    /// Parked; resumes from the last durable checkpoint.
+    Paused,
+    /// Cancellation requested; rollback has not finished.
+    Cancelling,
+    /// Terminal: every phase completed and published.
+    Succeeded,
+    /// Terminal: failed or cancelled.
+    Failed,
+    /// A phase failed or a cancel was observed; rollback is in progress.
+    RollingBack,
+}
+
+impl SchemaJobState {
+    /// Terminal states have no outgoing edges.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed)
+    }
+
+    /// Whether the `self -> next` edge exists in the job graph (mirrors the
+    /// core registry's `JobState::can_transition`).
+    pub fn can_transition(self, next: Self) -> bool {
+        use SchemaJobState::{
+            Cancelling, Failed, Paused, Pending, RollingBack, Running, Succeeded,
+        };
+        matches!(
+            (self, next),
+            (Pending, Running)
+                | (Pending, Cancelling)
+                | (Running, Paused)
+                | (Running, Cancelling)
+                | (Running, RollingBack)
+                | (Running, Succeeded)
+                | (Paused, Pending)
+                | (Paused, Cancelling)
+                | (Cancelling, RollingBack)
+                | (Cancelling, Failed)
+                | (RollingBack, Failed)
+        )
+    }
+}
+
+/// One replicated schema/index job record (spec section 12.1 "schema/index
+/// jobs").
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchemaJobRecord {
+    /// Job identifier (allocated by the proposer; never reused).
+    pub job_id: u64,
+    /// Database owning the job's target.
+    pub database_id: DatabaseId,
+    /// Table the job operates on.
+    pub table_id: TableId,
+    /// Job kind.
+    pub kind: SchemaJobKind,
+    /// Lifecycle state; submissions start [`SchemaJobState::Pending`].
+    pub state: SchemaJobState,
+    /// Submission timestamp stamped by the proposer.
+    pub submitted_at: HlcTimestamp,
+    /// Timestamp of the last state update.
+    pub updated_at: HlcTimestamp,
+    /// Failure detail for terminal/rolling-back states.
+    pub error: Option<String>,
+    /// Meta state's [`MetadataVersion`] of the last modification.
+    #[serde(default = "zero_metadata_version")]
+    pub metadata_version: MetadataVersion,
+}
+
+/// One transaction status partition and its home group (spec sections 12.1,
+/// 12.8): the coordinator record of a distributed transaction lives on the
+/// partition's home raft group.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TxnStatusPartition {
+    /// Partition identifier (derived from the transaction id, spec section
+    /// 12.8).
+    pub partition_id: u32,
+    /// Raft group owning the partition's transaction status records.
+    pub home_raft_group: RaftGroupId,
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic cluster settings (spec section 16.2)
+// ---------------------------------------------------------------------------
+
+/// Per-resource-group limits stored as cluster settings. A zero field means
+/// "no group-specific cap" (the node's static limits still apply).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ResourceGroupSetting {
+    /// Memory cap in bytes.
+    pub max_memory_bytes: u64,
+    /// Concurrent query cap.
+    pub max_concurrent_queries: u32,
+    /// Temporary-disk (spill) budget in bytes.
+    pub temp_disk_budget_bytes: u64,
+}
+
+/// Cluster-wide backup policy setting (spec section 16.2). Backup
+/// destinations and their credentials are static node configuration — never
+/// cluster settings (see [`SECRET_SETTING_KEY_DENYLIST`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BackupPolicy {
+    /// Whether scheduled backups run.
+    pub enabled: bool,
+    /// Interval between scheduled backups.
+    pub interval_seconds: u64,
+    /// How many completed backups are retained.
+    pub retention_count: u32,
+}
+
+impl Default for BackupPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_seconds: DEFAULT_BACKUP_INTERVAL_SECONDS,
+            retention_count: DEFAULT_BACKUP_RETENTION_COUNT,
+        }
+    }
+}
+
+/// Cluster-wide AI limits (spec section 16.2; AI limits are a security
+/// boundary — the engine fails closed at or below these).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AiLimits {
+    /// Concurrent AI request cap.
+    pub max_concurrent_requests: u32,
+    /// Total AI memory budget in bytes.
+    pub max_memory_bytes: u64,
+}
+
+impl Default for AiLimits {
+    fn default() -> Self {
+        Self {
+            max_concurrent_requests: DEFAULT_AI_MAX_CONCURRENT_REQUESTS,
+            max_memory_bytes: DEFAULT_AI_MAX_MEMORY_BYTES,
+        }
+    }
+}
+
+/// Cluster-wide default read consistency (spec sections 11.4, 16.2).
+/// Payload-free mirror of `mongreldb_consensus::read::ReadConsistency` (the
+/// request-scoped token/timestamp variants carry no payload here).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DefaultConsistency {
+    /// Leader read-index + wait applied (the default; strongest).
+    #[default]
+    Linearizable,
+    /// Wait until the replica applied the session's last write.
+    ReadYourWrites,
+    /// Serve at a requested snapshot timestamp.
+    Snapshot,
+    /// Serve if the applied watermark lags by at most `max_lag_ms`.
+    BoundedStaleness {
+        /// Maximum tolerated lag in milliseconds.
+        max_lag_ms: u64,
+    },
+    /// Serve the local applied watermark immediately.
+    Eventual,
+}
+
+/// The replicated dynamic cluster settings (spec section 16.2). Placement
+/// policies are first-class records ([`MetaState::placement_policies`], set
+/// by [`MetaCommand::SetPlacementPolicy`]) rather than scalar settings, and
+/// feature activation rides [`MetaCommand::ActivateFeature`]; the remaining
+/// section 16.2 categories live here. Secrets are never stored as plaintext
+/// settings (enforced by [`SECRET_SETTING_KEY_DENYLIST`]).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClusterSettings {
+    /// Resource-group limits by group name.
+    pub resource_groups: BTreeMap<String, ResourceGroupSetting>,
+    /// MVCC history retention in epochs (0 = disabled; mirrors the core's
+    /// `history_retention_epochs`).
+    pub history_retention_epochs: u64,
+    /// Cluster-wide backup policy.
+    pub backup: BackupPolicy,
+    /// Default read consistency for sessions that do not request one.
+    pub default_consistency: DefaultConsistency,
+    /// Cluster-wide AI limits.
+    pub ai: AiLimits,
+    /// Bound on concurrently active jobs.
+    pub max_concurrent_jobs: u32,
+}
+
+impl ClusterSettings {
+    /// Applies one key/value setting; see [`KNOWN_SETTING_KEYS`] and
+    /// `resource_groups.<name>` (a `null` value removes the group). The
+    /// denylist runs first, so a denied key is refused even when unknown.
+    fn apply(&mut self, key: &str, value: &serde_json::Value) -> Result<(), MetaRejectionReason> {
+        let lowered = key.to_ascii_lowercase();
+        if SECRET_SETTING_KEY_DENYLIST
+            .iter()
+            .any(|needle| lowered.contains(needle))
+        {
+            return Err(MetaRejectionReason::SecretSettingKey {
+                key: key.to_owned(),
+            });
+        }
+        fn invalid(key: &str, reason: impl Into<String>) -> MetaRejectionReason {
+            MetaRejectionReason::InvalidSettingValue {
+                key: key.to_owned(),
+                reason: reason.into(),
+            }
+        }
+        match key {
+            "history_retention_epochs" => {
+                self.history_retention_epochs = value
+                    .as_u64()
+                    .ok_or_else(|| invalid(key, "expected an unsigned integer"))?;
+            }
+            "backup.enabled" => {
+                self.backup.enabled = value
+                    .as_bool()
+                    .ok_or_else(|| invalid(key, "expected a boolean"))?;
+            }
+            "backup.interval_seconds" => {
+                let interval = value
+                    .as_u64()
+                    .ok_or_else(|| invalid(key, "expected an unsigned integer"))?;
+                if interval == 0 {
+                    return Err(invalid(key, "interval must be positive"));
+                }
+                self.backup.interval_seconds = interval;
+            }
+            "backup.retention_count" => {
+                let retention = value
+                    .as_u64()
+                    .ok_or_else(|| invalid(key, "expected an unsigned integer"))?;
+                self.backup.retention_count = u32::try_from(retention)
+                    .map_err(|_| invalid(key, "retention count exceeds u32"))?;
+            }
+            "default_consistency" => {
+                self.default_consistency =
+                    serde_json::from_value(value.clone()).map_err(|error| {
+                        invalid(
+                            key,
+                            format!(
+                                "expected one of \"Linearizable\", \"ReadYourWrites\", \
+                                 \"Snapshot\", \"Eventual\", or \
+                                 {{\"BoundedStaleness\": {{\"max_lag_ms\": ..}}}}: {error}"
+                            ),
+                        )
+                    })?;
+            }
+            "ai.max_concurrent_requests" => {
+                let cap = value
+                    .as_u64()
+                    .ok_or_else(|| invalid(key, "expected an unsigned integer"))?;
+                self.ai.max_concurrent_requests =
+                    u32::try_from(cap).map_err(|_| invalid(key, "cap exceeds u32"))?;
+            }
+            "ai.max_memory_bytes" => {
+                self.ai.max_memory_bytes = value
+                    .as_u64()
+                    .ok_or_else(|| invalid(key, "expected an unsigned integer"))?;
+            }
+            "jobs.max_concurrent" => {
+                let cap = value
+                    .as_u64()
+                    .ok_or_else(|| invalid(key, "expected an unsigned integer"))?;
+                if cap == 0 {
+                    return Err(invalid(key, "job concurrency must be positive"));
+                }
+                self.max_concurrent_jobs =
+                    u32::try_from(cap).map_err(|_| invalid(key, "cap exceeds u32"))?;
+            }
+            _ => {
+                let Some(name) = key.strip_prefix("resource_groups.") else {
+                    return Err(MetaRejectionReason::UnknownSettingKey {
+                        key: key.to_owned(),
+                    });
+                };
+                if name.is_empty() {
+                    return Err(MetaRejectionReason::UnknownSettingKey {
+                        key: key.to_owned(),
+                    });
+                }
+                if value.is_null() {
+                    self.resource_groups.remove(name);
+                } else {
+                    let group: ResourceGroupSetting = serde_json::from_value(value.clone())
+                        .map_err(|error| {
+                            invalid(key, format!("expected a resource-group object: {error}"))
+                        })?;
+                    self.resource_groups.insert(name.to_owned(), group);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Apply outcomes
+// ---------------------------------------------------------------------------
+
+/// Why a [`MetaCommand`] was refused at apply. Refusals are deterministic
+/// (every replica reaches the same conclusion from the same state) and never
+/// fault the raft state machine: they are journaled in
+/// [`MetaState::rejections`] and reported to the proposer by
+/// [`MetaGroup::propose`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+pub enum MetaRejectionReason {
+    /// Feature activation failed validation (spec section 11.8 step 5;
+    /// re-validated at apply, ADR-0010 decision 4).
+    #[error(transparent)]
+    FeatureActivation(#[from] FeatureActivationError),
+    /// The setting key is on the secrets denylist (spec section 16.2).
+    #[error(
+        "cluster setting key `{key}` is denied: secrets are never stored as \
+         plaintext cluster settings"
+    )]
+    SecretSettingKey {
+        /// The denied key.
+        key: String,
+    },
+    /// The setting key maps to no typed setting.
+    #[error("unknown cluster setting key `{key}`")]
+    UnknownSettingKey {
+        /// The unknown key.
+        key: String,
+    },
+    /// The setting value failed typed parsing or validation.
+    #[error("invalid value for cluster setting `{key}`: {reason}")]
+    InvalidSettingValue {
+        /// The setting key.
+        key: String,
+        /// Why the value failed.
+        reason: String,
+    },
+    /// A last-writer-wins guard rejected an out-of-date write.
+    #[error("stale write to {resource}: current version {current}, attempted {attempted}")]
+    StaleWrite {
+        /// What was being written.
+        resource: String,
+        /// Version currently stored.
+        current: MetadataVersion,
+        /// Version the command carried.
+        attempted: MetadataVersion,
+    },
+    /// The command conflicts with existing state.
+    #[error("conflicting {resource}: {reason}")]
+    Conflict {
+        /// What conflicted.
+        resource: String,
+        /// Why it conflicted.
+        reason: String,
+    },
+    /// A referenced record does not exist.
+    #[error("{resource} not found")]
+    NotFound {
+        /// What was looked up.
+        resource: String,
+    },
+    /// The command itself is malformed.
+    #[error("invalid meta command: {reason}")]
+    Invalid {
+        /// Why the command is invalid.
+        reason: String,
+    },
+}
+
+/// One journaled refusal: the refused command's id and the typed reason.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetaRejection {
+    /// Leader-assigned id of the refused command (`None` when the command
+    /// carried no id; always `Some` through [`MetaGroup::propose`]).
+    pub command_id: Option<[u8; 16]>,
+    /// Why the command was refused.
+    pub reason: MetaRejectionReason,
+}
+
+// ---------------------------------------------------------------------------
+// MetaCommand
+// ---------------------------------------------------------------------------
+
+/// One replicated meta control-plane command (spec section 12.1).
+///
+/// Every variant is deterministic and idempotent at apply: records are
+/// versioned ([`MetadataVersion`], `schema_version`, or `generation` per
+/// record) and last-writer-wins guards reject stale or conflicting writes
+/// with a typed [`MetaRejectionReason`] instead of faulting the state
+/// machine.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum MetaCommand {
+    /// Registers (or re-registers) a cluster node's descriptor. Identical
+    /// re-registration is a no-op.
+    RegisterNode {
+        /// The node's advertised descriptor.
+        descriptor: NodeDescriptor,
+    },
+    /// Updates a node's lifecycle state; `Decommissioned` is terminal.
+    UpdateNodeState {
+        /// The node to update.
+        node_id: NodeId,
+        /// Requested lifecycle state.
+        state: NodeState,
+        /// Optimistic-concurrency guard: when `Some`, the write applies only
+        /// if the record's current [`MetadataVersion`] equals it.
+        expected_version: Option<MetadataVersion>,
+    },
+    /// Removes a node from membership. Refused while any tablet or placement
+    /// still references the node; absent nodes are a no-op.
+    RemoveNode {
+        /// The node to remove.
+        node_id: NodeId,
+    },
+    /// Creates a logical database. Name and id must both be free.
+    CreateDatabase {
+        /// The new database's descriptor.
+        descriptor: DatabaseDescriptor,
+    },
+    /// Drops a database. Refused while tables reference it; absent databases
+    /// are a no-op.
+    DropDatabase {
+        /// The database to drop.
+        database_id: DatabaseId,
+    },
+    /// Publishes a table schema (last-writer-wins by `schema_version`).
+    SetTableSchema {
+        /// The schema record to publish.
+        record: TableSchemaRecord,
+    },
+    /// Publishes a tablet descriptor (last-writer-wins by `generation`).
+    SetTabletDescriptor {
+        /// The tablet descriptor to publish.
+        descriptor: TabletDescriptor,
+    },
+    /// Removes a tablet descriptor at or above its stored `generation`.
+    RemoveTabletDescriptor {
+        /// The tablet to remove.
+        tablet_id: TabletId,
+        /// Removal generation; below the stored generation the command is
+        /// stale.
+        generation: u64,
+    },
+    /// Publishes the replica placement of one raft group.
+    SetReplicaPlacement {
+        /// The placement to publish.
+        placement: ReplicaPlacement,
+    },
+    /// Publishes (or replaces) a named placement policy (spec section 12.7).
+    SetPlacementPolicy {
+        /// Policy name.
+        name: String,
+        /// The policy.
+        policy: PlacementPolicy,
+    },
+    /// Submits a schema/index job (starts [`SchemaJobState::Pending`]).
+    SubmitSchemaJob {
+        /// The job record.
+        job: SchemaJobRecord,
+    },
+    /// Transitions a schema job along the legal state graph.
+    UpdateSchemaJob {
+        /// The job to transition.
+        job_id: u64,
+        /// Requested state.
+        state: SchemaJobState,
+        /// Timestamp of the update.
+        updated_at: HlcTimestamp,
+        /// Failure detail to record (cleared with `None`).
+        error: Option<String>,
+        /// Optimistic-concurrency guard; see
+        /// [`MetaCommand::UpdateNodeState::expected_version`].
+        expected_version: Option<MetadataVersion>,
+    },
+    /// Sets one dynamic cluster setting (spec section 16.2; see
+    /// [`KNOWN_SETTING_KEYS`] and [`SECRET_SETTING_KEY_DENYLIST`]).
+    SetClusterSetting {
+        /// Setting key.
+        key: String,
+        /// Setting value (typed per key).
+        value: serde_json::Value,
+    },
+    /// Activates a cluster feature (spec section 11.8 step 5): refused at
+    /// apply unless every non-decommissioned registered node supports the
+    /// feature and the level satisfies the registry.
+    ActivateFeature {
+        /// The activation record.
+        activation: FeatureActivation,
+    },
+    /// Publishes one transaction status partition's home group.
+    SetTxnStatusPartition {
+        /// The partition record.
+        partition: TxnStatusPartition,
+    },
+}
+
+/// The versioned envelope payload carrying one [`MetaCommand`] (spec section
+/// 4.10). Serialized as JSON into a [`CommandEnvelope`] stamped with
+/// [`COMMAND_TYPE_META_COMMAND`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MetaCommandRecord {
+    /// Format version; see [`META_COMMAND_FORMAT_VERSION`].
+    pub format_version: u32,
+    /// The command.
+    pub command: MetaCommand,
+}
+
+impl MetaCommandRecord {
+    /// Wraps `command` at the current format version.
+    pub fn new(command: MetaCommand) -> Self {
+        Self {
+            format_version: META_COMMAND_FORMAT_VERSION,
+            command,
+        }
+    }
+
+    /// Serializes the record (JSON; human-readable so 128-bit ids take their
+    /// canonical hex form).
+    pub fn encode(&self) -> Result<Vec<u8>, MetaError> {
+        serde_json::to_vec(self).map_err(|error| MetaError::Encode(error.to_string()))
+    }
+
+    /// Parses and verifies a record produced by [`MetaCommandRecord::encode`];
+    /// unknown versions and malformed payloads fail closed.
+    pub fn decode(payload: &[u8]) -> Result<Self, MetaDecodeError> {
+        let record: Self = serde_json::from_slice(payload)
+            .map_err(|error| MetaDecodeError::Malformed(error.to_string()))?;
+        if record.format_version < MIN_SUPPORTED_META_COMMAND_FORMAT_VERSION
+            || record.format_version > META_COMMAND_FORMAT_VERSION
+        {
+            return Err(MetaDecodeError::UnsupportedVersion {
+                found: record.format_version,
+                min: MIN_SUPPORTED_META_COMMAND_FORMAT_VERSION,
+                max: META_COMMAND_FORMAT_VERSION,
+            });
+        }
+        Ok(record)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MetaState
+// ---------------------------------------------------------------------------
+
+/// A registered node: the advertised descriptor plus the meta state's
+/// modification version (the optimistic-concurrency token for
+/// [`MetaCommand::UpdateNodeState`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeRecord {
+    /// The node's advertised descriptor.
+    pub descriptor: NodeDescriptor,
+    /// Meta state's [`MetadataVersion`] of the last modification.
+    #[serde(default = "zero_metadata_version")]
+    pub metadata_version: MetadataVersion,
+}
+
+/// The replicated control-plane state of the meta group (spec section 12.1).
+///
+/// Deterministic: every replica applies the same commands in the same order
+/// and reaches byte-identical state. Versioned: `format_version` gates the
+/// snapshot format and `metadata_version` ticks once per applied command
+/// (accepted or refused — a refusal appends to the rejection journal, which
+/// is itself state), giving readers a monotonic watermark.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MetaState {
+    /// Snapshot format version; see [`META_STATE_FORMAT_VERSION`].
+    pub format_version: u32,
+    /// Monotonic per-applied-command version.
+    pub metadata_version: MetadataVersion,
+    /// Cluster membership: registered node descriptors and locality.
+    pub nodes: BTreeMap<NodeId, NodeRecord>,
+    /// Logical databases.
+    pub databases: BTreeMap<DatabaseId, DatabaseDescriptor>,
+    /// Replicated table schemas.
+    pub tables: BTreeMap<TableId, TableSchemaRecord>,
+    /// Tablet descriptors.
+    pub tablets: BTreeMap<TabletId, TabletDescriptor>,
+    /// Replica placements by raft group.
+    pub placements: BTreeMap<RaftGroupId, ReplicaPlacement>,
+    /// Named placement policies (spec section 12.7).
+    pub placement_policies: BTreeMap<String, PlacementPolicy>,
+    /// Schema/index jobs.
+    pub schema_jobs: BTreeMap<u64, SchemaJobRecord>,
+    /// Transaction status partitions (spec section 12.8).
+    pub txn_status_partitions: BTreeMap<u32, TxnStatusPartition>,
+    /// Dynamic cluster settings (spec section 16.2).
+    pub settings: ClusterSettings,
+    /// Cluster feature level (never lowers; ADR-0010).
+    pub feature_level: ClusterFeatureLevel,
+    /// Applied feature activations, oldest first.
+    pub feature_activations: Vec<FeatureActivation>,
+    /// Bounded journal of refused commands, oldest first
+    /// ([`META_REJECTION_LIMIT`]).
+    pub rejections: VecDeque<MetaRejection>,
+}
+
+impl Default for MetaState {
+    fn default() -> Self {
+        Self {
+            format_version: META_STATE_FORMAT_VERSION,
+            metadata_version: MetadataVersion::ZERO,
+            nodes: BTreeMap::new(),
+            databases: BTreeMap::new(),
+            tables: BTreeMap::new(),
+            tablets: BTreeMap::new(),
+            placements: BTreeMap::new(),
+            placement_policies: BTreeMap::new(),
+            schema_jobs: BTreeMap::new(),
+            txn_status_partitions: BTreeMap::new(),
+            settings: ClusterSettings::default(),
+            feature_level: ClusterFeatureLevel::ZERO,
+            feature_activations: Vec::new(),
+            rejections: VecDeque::new(),
+        }
+    }
+}
+
+impl MetaState {
+    /// Applies one committed command. `metadata_version` ticks first (every
+    /// applied command moves the watermark); a refusal journals the reason
+    /// and leaves the records untouched.
+    ///
+    /// `commit_ts` is the leader-assigned commit timestamp of the command's
+    /// log entry: an [`FeatureActivation::activated_at`] left as
+    /// [`HlcTimestamp::ZERO`] by the proposer is stamped with it here, so
+    /// every replica records the identical timestamp.
+    pub fn apply(
+        &mut self,
+        command: &MetaCommand,
+        command_id: Option<[u8; 16]>,
+        commit_ts: HlcTimestamp,
+        registry: &FeatureRegistry,
+    ) -> Result<(), MetaRejectionReason> {
+        self.metadata_version = MetadataVersion(self.metadata_version.get() + 1);
+        let version = self.metadata_version;
+        let result = self.dispatch(command, commit_ts, registry, version);
+        if let Err(reason) = &result {
+            self.rejections.push_back(MetaRejection {
+                command_id,
+                reason: reason.clone(),
+            });
+            while self.rejections.len() > META_REJECTION_LIMIT {
+                self.rejections.pop_front();
+            }
+        }
+        result
+    }
+
+    fn dispatch(
+        &mut self,
+        command: &MetaCommand,
+        commit_ts: HlcTimestamp,
+        registry: &FeatureRegistry,
+        version: MetadataVersion,
+    ) -> Result<(), MetaRejectionReason> {
+        match command {
+            MetaCommand::RegisterNode { descriptor } => {
+                if descriptor.node_id == NodeId::ZERO {
+                    return Err(MetaRejectionReason::Invalid {
+                        reason: "reserved all-zero node id".to_owned(),
+                    });
+                }
+                match self.nodes.get(&descriptor.node_id) {
+                    Some(existing) if existing.descriptor == *descriptor => Ok(()),
+                    _ => {
+                        self.nodes.insert(
+                            descriptor.node_id,
+                            NodeRecord {
+                                descriptor: descriptor.clone(),
+                                metadata_version: version,
+                            },
+                        );
+                        Ok(())
+                    }
+                }
+            }
+            MetaCommand::UpdateNodeState {
+                node_id,
+                state,
+                expected_version,
+            } => {
+                let Some(record) = self.nodes.get_mut(node_id) else {
+                    return Err(MetaRejectionReason::NotFound {
+                        resource: format!("node {node_id}"),
+                    });
+                };
+                if let Some(expected) = expected_version {
+                    if *expected != record.metadata_version {
+                        return Err(MetaRejectionReason::StaleWrite {
+                            resource: format!("node {node_id}"),
+                            current: record.metadata_version,
+                            attempted: *expected,
+                        });
+                    }
+                }
+                if record.descriptor.state == NodeState::Decommissioned {
+                    return Err(MetaRejectionReason::Conflict {
+                        resource: format!("node {node_id}"),
+                        reason: "decommissioned is terminal".to_owned(),
+                    });
+                }
+                if record.descriptor.state == *state {
+                    return Ok(());
+                }
+                record.descriptor.state = *state;
+                record.metadata_version = version;
+                Ok(())
+            }
+            MetaCommand::RemoveNode { node_id } => {
+                if !self.nodes.contains_key(node_id) {
+                    return Ok(());
+                }
+                let referenced_by_placement = self
+                    .placements
+                    .values()
+                    .any(|placement| placement.replicas.iter().any(|r| r.node_id == *node_id));
+                let referenced_by_tablet = self.tablets.values().any(|tablet| {
+                    tablet.replicas.iter().any(|r| r.node_id == *node_id)
+                        || tablet.leader_hint == Some(*node_id)
+                });
+                if referenced_by_placement || referenced_by_tablet {
+                    return Err(MetaRejectionReason::Conflict {
+                        resource: format!("node {node_id}"),
+                        reason: "node still hosts a tablet or placement replica".to_owned(),
+                    });
+                }
+                self.nodes.remove(node_id);
+                Ok(())
+            }
+            MetaCommand::CreateDatabase { descriptor } => {
+                if descriptor.database_id == DatabaseId::ZERO {
+                    return Err(MetaRejectionReason::Invalid {
+                        reason: "reserved all-zero database id".to_owned(),
+                    });
+                }
+                if descriptor.name.trim().is_empty() {
+                    return Err(MetaRejectionReason::Invalid {
+                        reason: "database name is empty".to_owned(),
+                    });
+                }
+                if let Some(existing) = self.databases.get(&descriptor.database_id) {
+                    return if existing.name == descriptor.name
+                        && existing.state == descriptor.state
+                        && existing.created_at == descriptor.created_at
+                    {
+                        Ok(())
+                    } else {
+                        Err(MetaRejectionReason::Conflict {
+                            resource: format!("database {}", descriptor.database_id),
+                            reason: "database id already exists with different content".to_owned(),
+                        })
+                    };
+                }
+                if self
+                    .databases
+                    .values()
+                    .any(|database| database.name == descriptor.name)
+                {
+                    return Err(MetaRejectionReason::Conflict {
+                        resource: format!("database `{}`", descriptor.name),
+                        reason: "database name already taken".to_owned(),
+                    });
+                }
+                let mut descriptor = descriptor.clone();
+                descriptor.metadata_version = version;
+                self.databases.insert(descriptor.database_id, descriptor);
+                Ok(())
+            }
+            MetaCommand::DropDatabase { database_id } => {
+                if !self.databases.contains_key(database_id) {
+                    return Ok(());
+                }
+                if self
+                    .tables
+                    .values()
+                    .any(|table| table.database_id == *database_id)
+                {
+                    return Err(MetaRejectionReason::Conflict {
+                        resource: format!("database {database_id}"),
+                        reason: "database still has tables".to_owned(),
+                    });
+                }
+                self.databases.remove(database_id);
+                Ok(())
+            }
+            MetaCommand::SetTableSchema { record } => {
+                if !self.databases.contains_key(&record.database_id) {
+                    return Err(MetaRejectionReason::NotFound {
+                        resource: format!("database {}", record.database_id),
+                    });
+                }
+                if record.schema_version == SchemaVersion::ZERO {
+                    return Err(MetaRejectionReason::Invalid {
+                        reason: "reserved zero schema version".to_owned(),
+                    });
+                }
+                match self.tables.get(&record.table_id) {
+                    Some(existing) => {
+                        if record.schema_version > existing.schema_version {
+                            let mut record = record.clone();
+                            record.metadata_version = version;
+                            self.tables.insert(record.table_id, record);
+                            Ok(())
+                        } else if record.schema_version == existing.schema_version {
+                            if existing.database_id == record.database_id
+                                && existing.schema == record.schema
+                            {
+                                Ok(())
+                            } else {
+                                Err(MetaRejectionReason::Conflict {
+                                    resource: format!("table {}", record.table_id),
+                                    reason: "schema version already used for different content"
+                                        .to_owned(),
+                                })
+                            }
+                        } else {
+                            Err(MetaRejectionReason::StaleWrite {
+                                resource: format!("table {}", record.table_id),
+                                current: MetadataVersion(existing.schema_version.get()),
+                                attempted: MetadataVersion(record.schema_version.get()),
+                            })
+                        }
+                    }
+                    None => {
+                        let mut record = record.clone();
+                        record.metadata_version = version;
+                        self.tables.insert(record.table_id, record);
+                        Ok(())
+                    }
+                }
+            }
+            MetaCommand::SetTabletDescriptor { descriptor } => {
+                if !self.tables.contains_key(&descriptor.table_id) {
+                    return Err(MetaRejectionReason::NotFound {
+                        resource: format!("table {}", descriptor.table_id),
+                    });
+                }
+                match self.tablets.get(&descriptor.tablet_id) {
+                    Some(existing) => {
+                        if descriptor.generation > existing.generation {
+                            let mut descriptor = descriptor.clone();
+                            descriptor.metadata_version = version;
+                            self.tablets.insert(descriptor.tablet_id, descriptor);
+                            Ok(())
+                        } else if descriptor.generation == existing.generation {
+                            let mut comparable = existing.clone();
+                            comparable.metadata_version = descriptor.metadata_version;
+                            if comparable == *descriptor {
+                                Ok(())
+                            } else {
+                                Err(MetaRejectionReason::Conflict {
+                                    resource: format!("tablet {}", descriptor.tablet_id),
+                                    reason: "generation already used for different content"
+                                        .to_owned(),
+                                })
+                            }
+                        } else {
+                            Err(MetaRejectionReason::StaleWrite {
+                                resource: format!("tablet {}", descriptor.tablet_id),
+                                current: MetadataVersion(existing.generation),
+                                attempted: MetadataVersion(descriptor.generation),
+                            })
+                        }
+                    }
+                    None => {
+                        let mut descriptor = descriptor.clone();
+                        descriptor.metadata_version = version;
+                        self.tablets.insert(descriptor.tablet_id, descriptor);
+                        Ok(())
+                    }
+                }
+            }
+            MetaCommand::RemoveTabletDescriptor {
+                tablet_id,
+                generation,
+            } => match self.tablets.get(tablet_id) {
+                None => Ok(()),
+                Some(existing) => {
+                    if *generation >= existing.generation {
+                        self.tablets.remove(tablet_id);
+                        Ok(())
+                    } else {
+                        Err(MetaRejectionReason::StaleWrite {
+                            resource: format!("tablet {tablet_id}"),
+                            current: MetadataVersion(existing.generation),
+                            attempted: MetadataVersion(*generation),
+                        })
+                    }
+                }
+            },
+            MetaCommand::SetReplicaPlacement { placement } => {
+                if placement.replicas.is_empty() {
+                    return Err(MetaRejectionReason::Invalid {
+                        reason: "placement has no replicas".to_owned(),
+                    });
+                }
+                for (index, replica) in placement.replicas.iter().enumerate() {
+                    if !self.nodes.contains_key(&replica.node_id) {
+                        return Err(MetaRejectionReason::NotFound {
+                            resource: format!("node {}", replica.node_id),
+                        });
+                    }
+                    if placement.replicas[..index]
+                        .iter()
+                        .any(|prior| prior.node_id == replica.node_id)
+                    {
+                        return Err(MetaRejectionReason::Conflict {
+                            resource: format!("raft group {}", placement.raft_group_id),
+                            reason: format!("node {} appears twice", replica.node_id),
+                        });
+                    }
+                }
+                match self.placements.get(&placement.raft_group_id) {
+                    Some(existing) if existing.replicas == placement.replicas => Ok(()),
+                    _ => {
+                        let mut placement = placement.clone();
+                        placement.metadata_version = version;
+                        self.placements.insert(placement.raft_group_id, placement);
+                        Ok(())
+                    }
+                }
+            }
+            MetaCommand::SetPlacementPolicy { name, policy } => {
+                if name.trim().is_empty() {
+                    return Err(MetaRejectionReason::Invalid {
+                        reason: "placement policy name is empty".to_owned(),
+                    });
+                }
+                if policy.replicas == 0 {
+                    return Err(MetaRejectionReason::Invalid {
+                        reason: format!("placement policy `{name}` requests zero replicas"),
+                    });
+                }
+                match self.placement_policies.get(name) {
+                    Some(existing)
+                        if existing.replicas == policy.replicas
+                            && existing.voter_constraints == policy.voter_constraints
+                            && existing.leader_preferences == policy.leader_preferences
+                            && existing.prohibited_nodes == policy.prohibited_nodes =>
+                    {
+                        Ok(())
+                    }
+                    _ => {
+                        let mut policy = policy.clone();
+                        policy.metadata_version = version;
+                        self.placement_policies.insert(name.clone(), policy);
+                        Ok(())
+                    }
+                }
+            }
+            MetaCommand::SubmitSchemaJob { job } => {
+                if job.job_id == 0 {
+                    return Err(MetaRejectionReason::Invalid {
+                        reason: "reserved zero job id".to_owned(),
+                    });
+                }
+                if !self.databases.contains_key(&job.database_id) {
+                    return Err(MetaRejectionReason::NotFound {
+                        resource: format!("database {}", job.database_id),
+                    });
+                }
+                if !self.tables.contains_key(&job.table_id) {
+                    return Err(MetaRejectionReason::NotFound {
+                        resource: format!("table {}", job.table_id),
+                    });
+                }
+                if job.state != SchemaJobState::Pending {
+                    return Err(MetaRejectionReason::Invalid {
+                        reason: "submitted jobs start Pending".to_owned(),
+                    });
+                }
+                match self.schema_jobs.get(&job.job_id) {
+                    Some(existing) => {
+                        let mut comparable = existing.clone();
+                        comparable.metadata_version = job.metadata_version;
+                        if comparable == *job {
+                            Ok(())
+                        } else {
+                            Err(MetaRejectionReason::Conflict {
+                                resource: format!("schema job {}", job.job_id),
+                                reason: "job id already exists with different content".to_owned(),
+                            })
+                        }
+                    }
+                    None => {
+                        let mut job = job.clone();
+                        job.metadata_version = version;
+                        self.schema_jobs.insert(job.job_id, job);
+                        Ok(())
+                    }
+                }
+            }
+            MetaCommand::UpdateSchemaJob {
+                job_id,
+                state,
+                updated_at,
+                error,
+                expected_version,
+            } => {
+                let Some(record) = self.schema_jobs.get_mut(job_id) else {
+                    return Err(MetaRejectionReason::NotFound {
+                        resource: format!("schema job {job_id}"),
+                    });
+                };
+                if let Some(expected) = expected_version {
+                    if *expected != record.metadata_version {
+                        return Err(MetaRejectionReason::StaleWrite {
+                            resource: format!("schema job {job_id}"),
+                            current: record.metadata_version,
+                            attempted: *expected,
+                        });
+                    }
+                }
+                if record.state.is_terminal() {
+                    return Err(MetaRejectionReason::Conflict {
+                        resource: format!("schema job {job_id}"),
+                        reason: format!("terminal state {:?}", record.state),
+                    });
+                }
+                if record.state != *state && !record.state.can_transition(*state) {
+                    return Err(MetaRejectionReason::Conflict {
+                        resource: format!("schema job {job_id}"),
+                        reason: format!("illegal transition {:?} -> {:?}", record.state, state),
+                    });
+                }
+                if record.state == *state && record.error == *error {
+                    return Ok(());
+                }
+                record.state = *state;
+                record.updated_at = *updated_at;
+                record.error = error.clone();
+                record.metadata_version = version;
+                Ok(())
+            }
+            MetaCommand::SetClusterSetting { key, value } => self.settings.apply(key, value),
+            MetaCommand::ActivateFeature { activation } => {
+                // Re-validate at quorum (ADR-0010 decision 4): the voter set
+                // is every registered, non-decommissioned node's advertised
+                // descriptor — the meta group owns cluster membership, so its
+                // registry is the authoritative voter view (spec section 12.1
+                // "cluster membership").
+                let voters: Vec<NodeDescriptor> = self
+                    .nodes
+                    .values()
+                    .filter(|record| record.descriptor.state != NodeState::Decommissioned)
+                    .map(|record| record.descriptor.clone())
+                    .collect();
+                activation.validate(registry, self.feature_level, &voters)?;
+                let already = self.feature_activations.iter().any(|applied| {
+                    applied.feature == activation.feature && applied.level == activation.level
+                });
+                if already {
+                    return Ok(());
+                }
+                if activation.level > self.feature_level {
+                    self.feature_level = activation.level;
+                }
+                let mut applied = activation.clone();
+                if applied.activated_at == HlcTimestamp::ZERO {
+                    applied.activated_at = commit_ts;
+                }
+                self.feature_activations.push(applied);
+                Ok(())
+            }
+            MetaCommand::SetTxnStatusPartition { partition } => {
+                match self.txn_status_partitions.get(&partition.partition_id) {
+                    Some(existing) if existing == partition => Ok(()),
+                    _ => {
+                        self.txn_status_partitions
+                            .insert(partition.partition_id, partition.clone());
+                        Ok(())
+                    }
+                }
+            }
+        }
+    }
+
+    /// One registered node's descriptor.
+    pub fn node(&self, node_id: NodeId) -> Option<&NodeDescriptor> {
+        self.nodes.get(&node_id).map(|record| &record.descriptor)
+    }
+
+    /// One registered node's record (descriptor + modification version).
+    pub fn node_record(&self, node_id: NodeId) -> Option<&NodeRecord> {
+        self.nodes.get(&node_id)
+    }
+
+    /// Every registered node descriptor, in node-id order.
+    pub fn node_descriptors(&self) -> Vec<NodeDescriptor> {
+        self.nodes
+            .values()
+            .map(|record| record.descriptor.clone())
+            .collect()
+    }
+
+    /// One database descriptor by id.
+    pub fn database(&self, database_id: DatabaseId) -> Option<&DatabaseDescriptor> {
+        self.databases.get(&database_id)
+    }
+
+    /// One database descriptor by name.
+    pub fn database_by_name(&self, name: &str) -> Option<&DatabaseDescriptor> {
+        self.databases
+            .values()
+            .find(|database| database.name == name)
+    }
+
+    /// One table's schema record.
+    pub fn table(&self, table_id: TableId) -> Option<&TableSchemaRecord> {
+        self.tables.get(&table_id)
+    }
+
+    /// One tablet descriptor.
+    pub fn tablet(&self, tablet_id: TabletId) -> Option<&TabletDescriptor> {
+        self.tablets.get(&tablet_id)
+    }
+
+    /// One raft group's replica placement.
+    pub fn placement(&self, raft_group_id: RaftGroupId) -> Option<&ReplicaPlacement> {
+        self.placements.get(&raft_group_id)
+    }
+
+    /// One named placement policy.
+    pub fn placement_policy(&self, name: &str) -> Option<&PlacementPolicy> {
+        self.placement_policies.get(name)
+    }
+
+    /// One schema job record.
+    pub fn schema_job(&self, job_id: u64) -> Option<&SchemaJobRecord> {
+        self.schema_jobs.get(&job_id)
+    }
+
+    /// One transaction status partition.
+    pub fn txn_status_partition(&self, partition_id: u32) -> Option<&TxnStatusPartition> {
+        self.txn_status_partitions.get(&partition_id)
+    }
+
+    /// The dynamic cluster settings.
+    pub fn settings(&self) -> &ClusterSettings {
+        &self.settings
+    }
+
+    /// The cluster feature level.
+    pub fn feature_level(&self) -> ClusterFeatureLevel {
+        self.feature_level
+    }
+
+    /// Whether `feature` is active at the state's current feature level.
+    pub fn feature_active(&self, registry: &FeatureRegistry, feature: &str) -> bool {
+        registry.feature_supported(self.feature_level, feature)
+    }
+
+    /// The applied feature activations, oldest first.
+    pub fn feature_activations(&self) -> &[FeatureActivation] {
+        &self.feature_activations
+    }
+
+    /// The bounded refusal journal, oldest first.
+    pub fn rejections(&self) -> &VecDeque<MetaRejection> {
+        &self.rejections
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MetaApplySink
+// ---------------------------------------------------------------------------
+
+/// The [`ApplySink`] binding the meta group's committed commands to
+/// [`MetaState`] (spec section 12.1).
+///
+/// Persistence rides the consensus state machine's contract: the state is
+/// rebuilt by log replay after a restart and checkpointed through
+/// [`ApplySink::snapshot`]/[`ApplySink::install`]; the sink keeps no side
+/// files, so its durable view can never diverge from the state machine's
+/// checkpoint.
+///
+/// Apply is deterministic and total. Refused commands are journaled in
+/// state, never returned as state-machine errors; genuine faults fail
+/// closed: an undecodable payload, an envelope that is not a
+/// [`COMMAND_TYPE_META_COMMAND`] catalog command, or — per spec section
+/// 12.1's "no user row data" — a transaction command misrouted to the meta
+/// group.
+pub struct MetaApplySink {
+    state: MetaState,
+    registry: FeatureRegistry,
+}
+
+impl MetaApplySink {
+    /// Creates a sink over fresh state. `registry` is the binary's feature
+    /// registry (identical on every replica of one deployment);
+    /// [`FeatureRegistry::current`] in production.
+    pub fn new(registry: FeatureRegistry) -> Self {
+        MetaApplySink {
+            state: MetaState::default(),
+            registry,
+        }
+    }
+
+    /// The current replicated state.
+    pub fn state(&self) -> &MetaState {
+        &self.state
+    }
+
+    /// The monotonic per-applied-command version.
+    pub fn metadata_version(&self) -> MetadataVersion {
+        self.state.metadata_version
+    }
+}
+
+impl ApplySink for MetaApplySink {
+    fn apply(&mut self, command: &AppliedCommand) -> Result<(), StateMachineError> {
+        match &command.command {
+            ReplicatedCommand::Catalog(catalog) => {
+                catalog.envelope.verify().map_err(|error| {
+                    StateMachineError::Corrupt(format!("meta envelope: {error}"))
+                })?;
+                if catalog.envelope.command_type != COMMAND_TYPE_META_COMMAND {
+                    return Err(StateMachineError::Corrupt(format!(
+                        "meta command_type {} is not COMMAND_TYPE_META_COMMAND",
+                        catalog.envelope.command_type
+                    )));
+                }
+                let record = MetaCommandRecord::decode(&catalog.envelope.payload)
+                    .map_err(|error| StateMachineError::Corrupt(error.to_string()))?;
+                let commit_ts = command.commit_ts().unwrap_or(HlcTimestamp::ZERO);
+                // A refusal is journaled state, not a state-machine error.
+                let _ = self.state.apply(
+                    &record.command,
+                    command.command_id(),
+                    commit_ts,
+                    &self.registry,
+                );
+                Ok(())
+            }
+            // Maintenance commands are node-runtime directives and Noop
+            // advances the commit index; neither touches meta state.
+            ReplicatedCommand::Maintenance(_) | ReplicatedCommand::Noop => Ok(()),
+            // The meta group owns control-plane state only (spec section
+            // 12.1): a transaction command here is misrouted — fail closed.
+            ReplicatedCommand::Transaction(_) => Err(StateMachineError::Corrupt(
+                "transaction command on the meta group: the meta group owns \
+                 control-plane state only (spec section 12.1)"
+                    .to_owned(),
+            )),
+        }
+    }
+
+    fn snapshot(&self) -> Result<Vec<u8>, StateMachineError> {
+        serde_json::to_vec(&self.state)
+            .map_err(|error| StateMachineError::Sink(format!("meta snapshot encode: {error}")))
+    }
+
+    fn install(&mut self, data: &[u8]) -> Result<(), StateMachineError> {
+        let state: MetaState = serde_json::from_slice(data).map_err(|error| {
+            StateMachineError::Corrupt(format!("meta snapshot decode: {error}"))
+        })?;
+        if state.format_version < MIN_SUPPORTED_META_STATE_FORMAT_VERSION
+            || state.format_version > META_STATE_FORMAT_VERSION
+        {
+            return Err(StateMachineError::Corrupt(format!(
+                "unsupported meta state format version {} (supported \
+                 {MIN_SUPPORTED_META_STATE_FORMAT_VERSION}..={META_STATE_FORMAT_VERSION})",
+                state.format_version
+            )));
+        }
+        self.state = state;
+        Ok(())
+    }
+}
+
+impl fmt::Debug for MetaApplySink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MetaApplySink")
+            .field("metadata_version", &self.state.metadata_version)
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MetaGroup: bootstrap and membership workflow (spec sections 12.1, 12.7)
+// ---------------------------------------------------------------------------
+
+/// Static layout and identity of one meta-group member.
+///
+/// # Directory layout (mirrors the engine sink's single-group layout)
+///
+/// ```text
+/// node-data/
+///   groups/
+///     <meta-group-id>/
+///       raft/        log segments, vote, state machine checkpoint + snapshots
+/// ```
+///
+/// The applied meta state lives inside the raft snapshot frames; there is no
+/// separate applied-state directory (see [`MetaApplySink`]).
+#[derive(Debug, Clone)]
+pub struct MetaGroupConfig {
+    /// The node's local data root (`node-data`).
+    pub node_data: PathBuf,
+    /// The dedicated meta group's durable identifier (minted at cluster
+    /// bootstrap; never a tablet group).
+    pub meta_group_id: RaftGroupId,
+    /// This node's durable id.
+    pub node_id: NodeId,
+    /// The binary's feature registry gating [`MetaCommand::ActivateFeature`]
+    /// at apply (identical on every replica of one deployment).
+    pub registry: FeatureRegistry,
+    /// Durable log storage configuration.
+    pub storage: StorageConfig,
+    /// Bound on the apply idempotency set (S2B-004).
+    pub idempotency_retention: usize,
+}
+
+impl MetaGroupConfig {
+    /// Required identities; registry, storage, and retention default to
+    /// production values.
+    pub fn new(node_data: PathBuf, meta_group_id: RaftGroupId, node_id: NodeId) -> Self {
+        MetaGroupConfig {
+            node_data,
+            meta_group_id,
+            node_id,
+            registry: FeatureRegistry::current(),
+            storage: StorageConfig::default(),
+            idempotency_retention:
+                mongreldb_consensus::state_machine::DEFAULT_IDEMPOTENCY_RETENTION,
+        }
+    }
+
+    /// `<node-data>/groups/<meta-group-id>` — the group directory handed to
+    /// [`ConsensusGroup`].
+    pub fn group_dir(&self) -> PathBuf {
+        self.node_data
+            .join("groups")
+            .join(self.meta_group_id.to_hex())
+    }
+
+    /// The group's text identifier (`meta-<hex>`).
+    pub fn cluster_name(&self) -> String {
+        format!("meta-{}", self.meta_group_id.to_hex())
+    }
+
+    /// The default [`GroupConfig`] for this member (production timings;
+    /// callers may tune it before passing it to [`MetaGroup::create`]).
+    pub fn group_config(&self) -> GroupConfig {
+        let mut config = GroupConfig::new(
+            self.cluster_name(),
+            raft_node_id(&self.node_id),
+            self.group_dir(),
+        );
+        config.storage = self.storage.clone();
+        config.idempotency_retention = self.idempotency_retention;
+        config
+    }
+}
+
+/// Proof that a meta command was committed and applied (and not refused).
+#[derive(Debug, Clone)]
+pub struct MetaCommandReceipt {
+    /// The consensus commit receipt (position, commit timestamp, command id,
+    /// idempotent-replay flag).
+    pub receipt: GroupCommitReceipt,
+    /// The meta state's watermark after applying the command.
+    pub metadata_version: MetadataVersion,
+}
+
+/// One member of the dedicated meta control-plane group (spec section 12.1):
+/// a [`ConsensusGroup`] whose apply sink is a [`MetaApplySink`], plus the
+/// bootstrap/membership/propose workflow the node runtime drives.
+pub struct MetaGroup<T: RaftTransport> {
+    group: ConsensusGroup<T>,
+    sink: Arc<Mutex<MetaApplySink>>,
+    config: MetaGroupConfig,
+}
+
+/// Builds one openraft node value for the membership calls without naming
+/// the openraft type: the cluster crate deliberately has no openraft
+/// dependency (ADR-0004 confines it to `mongreldb-consensus`), so the
+/// concrete node type is inferred from the consuming [`ConsensusGroup`] call
+/// and constructed through its serde shape (`{"addr": ..}`), which
+/// `mongreldb-consensus` enables via openraft's `serde` feature.
+fn basic_node<N>(address: &str) -> Result<N, MetaError>
+where
+    N: for<'de> Deserialize<'de>,
+{
+    serde_json::from_value(serde_json::json!({ "addr": address }))
+        .map_err(|error| MetaError::InvalidRequest(format!("member address `{address}`: {error}")))
+}
+
+/// Mints a command id for the workflow's internal proposals.
+fn new_command_id() -> Result<[u8; 16], MetaError> {
+    let mut id = [0u8; 16];
+    getrandom::getrandom(&mut id).map_err(|error| MetaError::Rng(error.to_string()))?;
+    Ok(id)
+}
+
+impl<T: RaftTransport> MetaGroup<T> {
+    /// Opens the group's durable state and starts the raft task with a
+    /// [`MetaApplySink`] installed. `group_config` must match
+    /// [`MetaGroupConfig::group_config`] (tuned timings are fine; identity
+    /// and directory are not — mismatches fail closed).
+    pub async fn create(
+        config: MetaGroupConfig,
+        group_config: GroupConfig,
+        transport: Arc<T>,
+    ) -> Result<Self, MetaError> {
+        if group_config.node_id != raft_node_id(&config.node_id) {
+            return Err(MetaError::InvalidRequest(format!(
+                "group config raft id {} does not match the node id projection {}",
+                group_config.node_id,
+                raft_node_id(&config.node_id)
+            )));
+        }
+        if group_config.dir != config.group_dir() {
+            return Err(MetaError::InvalidRequest(format!(
+                "group config dir {:?} is not the meta group dir {:?}",
+                group_config.dir,
+                config.group_dir()
+            )));
+        }
+        let sink = Arc::new(Mutex::new(MetaApplySink::new(config.registry.clone())));
+        let group = ConsensusGroup::create(
+            group_config,
+            transport,
+            sink.clone() as Arc<Mutex<dyn ApplySink>>,
+        )
+        .await?;
+        Ok(MetaGroup {
+            group,
+            sink,
+            config,
+        })
+    }
+
+    /// The underlying consensus group (snapshots, membership, transfer,
+    /// read barriers, shutdown).
+    pub fn group(&self) -> &ConsensusGroup<T> {
+        &self.group
+    }
+
+    /// This node's durable id.
+    pub fn node_id(&self) -> NodeId {
+        self.config.node_id
+    }
+
+    /// The meta group's durable id.
+    pub fn meta_group_id(&self) -> RaftGroupId {
+        self.config.meta_group_id
+    }
+
+    /// Bootstraps a pristine meta group with the given voter set of
+    /// `(node_id, rpc_address)` pairs (call on one pristine member; check
+    /// [`MetaGroup::is_initialized`] on reopen). The 64-bit raft-id
+    /// projection of distinct node ids must not collide (ADR: collisions are
+    /// rejected at cluster bootstrap by this layer — the consensus adapter
+    /// treats raft ids as opaque).
+    pub async fn bootstrap(&self, members: &[(NodeId, String)]) -> Result<(), MetaError> {
+        let mut projected: BTreeMap<RaftNodeId, NodeId> = BTreeMap::new();
+        let mut map = BTreeMap::new();
+        for (node_id, address) in members {
+            let raft_id = raft_node_id(node_id);
+            if let Some(prior) = projected.insert(raft_id, *node_id) {
+                if prior != *node_id {
+                    return Err(MetaError::InvalidRequest(format!(
+                        "node id projection collision: {prior} and {node_id} both project to \
+                         raft id {raft_id}; re-mint one of the node ids"
+                    )));
+                }
+            }
+            map.insert(raft_id, basic_node(address)?);
+        }
+        self.group
+            .bootstrap(map)
+            .await
+            .map_err(MetaError::Consensus)
+    }
+
+    /// Whether this node already holds an initialized membership.
+    pub async fn is_initialized(&self) -> Result<bool, MetaError> {
+        self.group
+            .is_initialized()
+            .await
+            .map_err(MetaError::Consensus)
+    }
+
+    /// Adds one member to the meta group (spec section 12.7's movement
+    /// protocol, meta-group form): add learner and wait until it is
+    /// line-rate, promote it to voter through joint consensus, then register
+    /// its descriptor in replicated meta state. Registration comes last so
+    /// the feature-activation voter view (registered, non-decommissioned
+    /// descriptors) reflects only nodes that actually vote.
+    pub async fn add_member(
+        &self,
+        descriptor: &NodeDescriptor,
+        control: &ExecutionControl,
+    ) -> Result<MetaCommandReceipt, MetaError> {
+        let raft_id = raft_node_id(&descriptor.node_id);
+        let (voters, learners) = self.group.members();
+        if voters.contains(&raft_id) || learners.contains(&raft_id) {
+            return Err(MetaError::InvalidRequest(format!(
+                "node {} is already a meta group member",
+                descriptor.node_id
+            )));
+        }
+        self.group
+            .add_learner(raft_id, basic_node(&descriptor.rpc_address)?)
+            .await?;
+        self.group.promote(raft_id).await?;
+        self.propose(
+            new_command_id()?,
+            MetaCommand::RegisterNode {
+                descriptor: descriptor.clone(),
+            },
+            control,
+        )
+        .await
+    }
+
+    /// Removes one member: joint-consensus removal first, then the
+    /// replicated [`MetaCommand::RemoveNode`] (refused while the node still
+    /// hosts replicas). Leadership must be transferred off the node first
+    /// (spec section 11.6); removing the current leader fails closed.
+    pub async fn remove_member(
+        &self,
+        node_id: NodeId,
+        control: &ExecutionControl,
+    ) -> Result<MetaCommandReceipt, MetaError> {
+        let raft_id = raft_node_id(&node_id);
+        let metrics = self.group.metrics();
+        if metrics.current_leader == Some(raft_id) {
+            return Err(MetaError::InvalidRequest(
+                "transfer leadership off the node before removing it".to_owned(),
+            ));
+        }
+        self.group.remove(raft_id).await?;
+        self.propose(
+            new_command_id()?,
+            MetaCommand::RemoveNode { node_id },
+            control,
+        )
+        .await
+    }
+
+    /// Proposes one meta command (quorum durability; spec section 11.3) and
+    /// waits for commit + apply. `command_id` is the caller's idempotency
+    /// token: a retry with the same id and payload replays the original
+    /// apply without re-dispatching (S2B-004).
+    ///
+    /// The command rides a [`COMMAND_TYPE_META_COMMAND`] catalog envelope.
+    /// When the apply path refused the command, the typed
+    /// [`MetaRejectionReason`] is returned (and journaled in state); the
+    /// raft entry itself committed normally.
+    pub async fn propose(
+        &self,
+        command_id: [u8; 16],
+        command: MetaCommand,
+        control: &ExecutionControl,
+    ) -> Result<MetaCommandReceipt, MetaError> {
+        let payload = MetaCommandRecord::new(command).encode()?;
+        let envelope = CommandEnvelope::new(COMMAND_TYPE_META_COMMAND, command_id, payload);
+        let receipt = self
+            .group
+            .propose(CommandKind::Catalog, envelope, control)
+            .await?;
+        // client_write returns after local apply, so the local sink's view
+        // already includes this command (or its refusal).
+        let (metadata_version, rejection) = {
+            let sink = self
+                .sink
+                .lock()
+                .map_err(|_| MetaError::InvalidRequest("meta sink lock poisoned".to_owned()))?;
+            let rejection = sink
+                .state()
+                .rejections()
+                .iter()
+                .rev()
+                .find(|entry| entry.command_id == Some(command_id))
+                .map(|entry| entry.reason.clone());
+            (sink.metadata_version(), rejection)
+        };
+        if let Some(reason) = rejection {
+            return Err(MetaError::Rejected(reason));
+        }
+        Ok(MetaCommandReceipt {
+            receipt,
+            metadata_version,
+        })
+    }
+
+    /// A point-in-time clone of the replicated meta state at this node's
+    /// applied watermark. For a linearizable view, run
+    /// [`ConsensusGroup::read_index`] (via [`MetaGroup::group`]) first.
+    pub fn state(&self) -> MetaState {
+        self.sink
+            .lock()
+            .expect("meta sink lock poisoned")
+            .state()
+            .clone()
+    }
+
+    /// The local applied watermark (monotonic per applied command).
+    pub fn metadata_version(&self) -> MetadataVersion {
+        self.sink
+            .lock()
+            .expect("meta sink lock poisoned")
+            .metadata_version()
+    }
+
+    /// Graceful shutdown of the underlying group.
+    pub async fn shutdown(&self) -> Result<(), MetaError> {
+        self.group.shutdown().await.map_err(MetaError::Consensus)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -618,5 +2572,1709 @@ mod tests {
             after_activation.activated_features,
             vec!["ann-v2".to_owned()]
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 3A tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod stage3a_tests {
+    use super::*;
+    use crate::node::{BuildVersion, Locality, NodeCapacity};
+    use mongreldb_consensus::network::InMemoryTransport;
+    use mongreldb_log::commit_log::LogPosition;
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    const LEADER_TIMEOUT: Duration = Duration::from_secs(10);
+    const META_GID: RaftGroupId = RaftGroupId::from_bytes([0xAA; 16]);
+
+    fn node_id(byte: u8) -> NodeId {
+        NodeId::from_bytes([byte; 16])
+    }
+
+    fn raft_id(byte: u8) -> RaftNodeId {
+        raft_node_id(&node_id(byte))
+    }
+
+    fn group_id(byte: u8) -> RaftGroupId {
+        RaftGroupId::from_bytes([byte; 16])
+    }
+
+    fn ts(micros: u64) -> HlcTimestamp {
+        HlcTimestamp {
+            physical_micros: micros,
+            logical: 0,
+            node_tiebreaker: 0,
+        }
+    }
+
+    fn cmd_id(byte: u8) -> [u8; 16] {
+        [byte; 16]
+    }
+
+    fn descriptor(byte: u8, features: &[&str]) -> NodeDescriptor {
+        let mut version_info = VersionInfo::current();
+        version_info.feature_set = features.iter().map(|feature| feature.to_string()).collect();
+        NodeDescriptor {
+            node_id: node_id(byte),
+            rpc_address: format!("127.0.0.1:{}", 7100 + u16::from(byte)),
+            locality: Locality::default(),
+            capacity: NodeCapacity::default(),
+            state: NodeState::Up,
+            version: BuildVersion::current(),
+            version_info,
+        }
+    }
+
+    fn registry_with(feature: &str, level: u64) -> FeatureRegistry {
+        let mut registry = FeatureRegistry::current();
+        registry.declare(feature, ClusterFeatureLevel(level));
+        registry
+    }
+
+    fn database(byte: u8, name: &str) -> DatabaseDescriptor {
+        DatabaseDescriptor {
+            database_id: DatabaseId::from_bytes([byte; 16]),
+            name: name.to_owned(),
+            created_at: ts(1_000),
+            state: DatabaseState::Online,
+            metadata_version: MetadataVersion::ZERO,
+        }
+    }
+
+    fn schema_record(table: u64, database_byte: u8, version: u64) -> TableSchemaRecord {
+        TableSchemaRecord {
+            table_id: TableId(table),
+            database_id: DatabaseId::from_bytes([database_byte; 16]),
+            schema_version: SchemaVersion(version),
+            schema: serde_json::json!({"columns": [{"name": "pk", "type": "u64"}]}),
+            metadata_version: MetadataVersion::ZERO,
+        }
+    }
+
+    fn tablet(byte: u8, table: u64, generation: u64) -> TabletDescriptor {
+        TabletDescriptor {
+            tablet_id: TabletId::from_bytes([byte; 16]),
+            table_id: TableId(table),
+            raft_group_id: group_id(9),
+            partition: PartitionBounds {
+                start: None,
+                end: Some(b"m".to_vec()),
+            },
+            replicas: vec![ReplicaDescriptor {
+                node_id: node_id(1),
+                role: ReplicaRole::Voter,
+            }],
+            leader_hint: None,
+            generation,
+            state: TabletState::Online,
+            metadata_version: MetadataVersion::ZERO,
+        }
+    }
+
+    fn placement(byte: u8, members: &[(u8, ReplicaRole)]) -> ReplicaPlacement {
+        ReplicaPlacement {
+            raft_group_id: group_id(byte),
+            replicas: members
+                .iter()
+                .map(|(node, role)| ReplicaDescriptor {
+                    node_id: node_id(*node),
+                    role: *role,
+                })
+                .collect(),
+            metadata_version: MetadataVersion::ZERO,
+        }
+    }
+
+    fn policy(replicas: u8) -> PlacementPolicy {
+        PlacementPolicy {
+            replicas,
+            voter_constraints: vec![LocalityConstraint {
+                key: "region".to_owned(),
+                value: "us-central".to_owned(),
+            }],
+            leader_preferences: Vec::new(),
+            prohibited_nodes: Vec::new(),
+            metadata_version: MetadataVersion::ZERO,
+        }
+    }
+
+    fn schema_job(job_id: u64, table: u64, database_byte: u8) -> SchemaJobRecord {
+        SchemaJobRecord {
+            job_id,
+            database_id: DatabaseId::from_bytes([database_byte; 16]),
+            table_id: TableId(table),
+            kind: SchemaJobKind::IndexBuild,
+            state: SchemaJobState::Pending,
+            submitted_at: ts(1_000),
+            updated_at: ts(1_000),
+            error: None,
+            metadata_version: MetadataVersion::ZERO,
+        }
+    }
+
+    fn activation(feature: &str, level: u64) -> FeatureActivation {
+        FeatureActivation {
+            feature: feature.to_owned(),
+            level: ClusterFeatureLevel(level),
+            activated_at: HlcTimestamp::ZERO,
+            activated_by: node_id(1),
+        }
+    }
+
+    fn apply(
+        state: &mut MetaState,
+        registry: &FeatureRegistry,
+        id: u8,
+        command: MetaCommand,
+    ) -> Result<(), MetaRejectionReason> {
+        state.apply(&command, Some(cmd_id(id)), ts(1_000), registry)
+    }
+
+    fn fast_group_config(config: &MetaGroupConfig) -> GroupConfig {
+        let mut group = config.group_config();
+        group.heartbeat_interval = Duration::from_millis(50);
+        group.election_timeout_min = Duration::from_millis(150);
+        group.election_timeout_max = Duration::from_millis(300);
+        group.install_snapshot_timeout = Duration::from_millis(1_000);
+        group
+    }
+
+    fn meta_config(dir: &Path, node: u8, registry: FeatureRegistry) -> MetaGroupConfig {
+        let mut config = MetaGroupConfig::new(dir.to_path_buf(), META_GID, node_id(node));
+        config.registry = registry;
+        config
+    }
+
+    async fn wait_consensus_leader(among: &[&MetaGroup<InMemoryTransport>]) -> RaftNodeId {
+        let deadline = Instant::now() + LEADER_TIMEOUT;
+        loop {
+            let mut leaders = BTreeSet::new();
+            let mut seen = 0_usize;
+            for group in among {
+                if let Some(leader) = group.group().metrics().current_leader {
+                    leaders.insert(leader);
+                    seen += 1;
+                }
+            }
+            if seen == among.len() && leaders.len() == 1 {
+                return *leaders.iter().next().expect("one leader");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no consensus leader (saw {leaders:?})"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    // -- serde + record plumbing -------------------------------------------
+
+    #[test]
+    fn meta_command_record_round_trips_every_variant() {
+        let commands = vec![
+            MetaCommand::RegisterNode {
+                descriptor: descriptor(1, &["ann-v2"]),
+            },
+            MetaCommand::UpdateNodeState {
+                node_id: node_id(1),
+                state: NodeState::Draining,
+                expected_version: Some(MetadataVersion(3)),
+            },
+            MetaCommand::RemoveNode {
+                node_id: node_id(1),
+            },
+            MetaCommand::CreateDatabase {
+                descriptor: database(1, "app"),
+            },
+            MetaCommand::DropDatabase {
+                database_id: DatabaseId::from_bytes([1; 16]),
+            },
+            MetaCommand::SetTableSchema {
+                record: schema_record(1, 1, 1),
+            },
+            MetaCommand::SetTabletDescriptor {
+                descriptor: tablet(1, 1, 1),
+            },
+            MetaCommand::RemoveTabletDescriptor {
+                tablet_id: TabletId::from_bytes([1; 16]),
+                generation: 1,
+            },
+            MetaCommand::SetReplicaPlacement {
+                placement: placement(9, &[(1, ReplicaRole::Voter)]),
+            },
+            MetaCommand::SetPlacementPolicy {
+                name: "default".to_owned(),
+                policy: policy(3),
+            },
+            MetaCommand::SubmitSchemaJob {
+                job: schema_job(7, 1, 1),
+            },
+            MetaCommand::UpdateSchemaJob {
+                job_id: 7,
+                state: SchemaJobState::Running,
+                updated_at: ts(2_000),
+                error: None,
+                expected_version: None,
+            },
+            MetaCommand::SetClusterSetting {
+                key: "jobs.max_concurrent".to_owned(),
+                value: serde_json::json!(4),
+            },
+            MetaCommand::ActivateFeature {
+                activation: activation("ann-v2", 7),
+            },
+            MetaCommand::SetTxnStatusPartition {
+                partition: TxnStatusPartition {
+                    partition_id: 0,
+                    home_raft_group: group_id(9),
+                },
+            },
+        ];
+        for command in commands {
+            let record = MetaCommandRecord::new(command);
+            let bytes = record.encode().unwrap();
+            assert_eq!(MetaCommandRecord::decode(&bytes).unwrap(), record);
+        }
+        // Malformed payloads and unsupported versions fail closed.
+        assert!(matches!(
+            MetaCommandRecord::decode(b"not json"),
+            Err(MetaDecodeError::Malformed(_))
+        ));
+        let future = MetaCommandRecord {
+            format_version: META_COMMAND_FORMAT_VERSION + 1,
+            command: MetaCommand::RemoveNode {
+                node_id: node_id(1),
+            },
+        };
+        assert_eq!(
+            MetaCommandRecord::decode(&future.encode().unwrap()).unwrap_err(),
+            MetaDecodeError::UnsupportedVersion {
+                found: META_COMMAND_FORMAT_VERSION + 1,
+                min: MIN_SUPPORTED_META_COMMAND_FORMAT_VERSION,
+                max: META_COMMAND_FORMAT_VERSION,
+            }
+        );
+    }
+
+    // -- single-node apply round-trips (every command) ----------------------
+
+    fn every_command_sequence() -> Vec<MetaCommand> {
+        vec![
+            MetaCommand::RegisterNode {
+                descriptor: descriptor(1, &["ann-v2"]),
+            },
+            MetaCommand::UpdateNodeState {
+                node_id: node_id(1),
+                state: NodeState::Draining,
+                expected_version: None,
+            },
+            MetaCommand::CreateDatabase {
+                descriptor: database(1, "app"),
+            },
+            MetaCommand::SetTableSchema {
+                record: schema_record(1, 1, 1),
+            },
+            MetaCommand::SetTabletDescriptor {
+                descriptor: tablet(1, 1, 1),
+            },
+            MetaCommand::RemoveTabletDescriptor {
+                tablet_id: TabletId::from_bytes([1; 16]),
+                generation: 1,
+            },
+            MetaCommand::SetReplicaPlacement {
+                placement: placement(9, &[(1, ReplicaRole::Voter)]),
+            },
+            MetaCommand::SetPlacementPolicy {
+                name: "default".to_owned(),
+                policy: policy(3),
+            },
+            MetaCommand::SubmitSchemaJob {
+                job: schema_job(7, 1, 1),
+            },
+            MetaCommand::UpdateSchemaJob {
+                job_id: 7,
+                state: SchemaJobState::Running,
+                updated_at: ts(2_000),
+                error: None,
+                expected_version: None,
+            },
+            MetaCommand::SetClusterSetting {
+                key: "jobs.max_concurrent".to_owned(),
+                value: serde_json::json!(4),
+            },
+            MetaCommand::ActivateFeature {
+                activation: activation("ann-v2", 7),
+            },
+            MetaCommand::SetTxnStatusPartition {
+                partition: TxnStatusPartition {
+                    partition_id: 0,
+                    home_raft_group: group_id(9),
+                },
+            },
+            MetaCommand::RemoveNode {
+                node_id: node_id(99),
+            },
+            MetaCommand::DropDatabase {
+                database_id: DatabaseId::from_bytes([0xEE; 16]),
+            },
+        ]
+    }
+
+    #[test]
+    fn apply_round_trips_every_command() {
+        let registry = registry_with("ann-v2", 7);
+        let mut state = MetaState::default();
+        for (index, command) in every_command_sequence().into_iter().enumerate() {
+            let id = u8::try_from(index + 1).unwrap();
+            apply(&mut state, &registry, id, command).unwrap();
+        }
+        assert_eq!(state.metadata_version, MetadataVersion(15));
+        assert!(state.rejections().is_empty());
+
+        let node = state.node_record(node_id(1)).unwrap();
+        assert_eq!(node.descriptor.state, NodeState::Draining);
+        assert_eq!(node.metadata_version, MetadataVersion(2));
+        assert_eq!(state.database_by_name("app").unwrap().name, "app");
+        assert_eq!(
+            state.table(TableId(1)).unwrap().schema_version,
+            SchemaVersion(1)
+        );
+        assert!(state.tablets.is_empty());
+        assert_eq!(state.placement(group_id(9)).unwrap().replicas.len(), 1);
+        assert_eq!(state.placement_policy("default").unwrap().replicas, 3);
+        assert_eq!(state.schema_job(7).unwrap().state, SchemaJobState::Running);
+        assert_eq!(state.settings().max_concurrent_jobs, 4);
+        assert_eq!(state.feature_level(), ClusterFeatureLevel(7));
+        assert!(state.feature_active(&registry, "ann-v2"));
+        // A ZERO activated_at is stamped with the entry's commit timestamp.
+        assert_eq!(state.feature_activations()[0].activated_at, ts(1_000));
+        assert_eq!(
+            state.txn_status_partition(0).unwrap().home_raft_group,
+            group_id(9)
+        );
+    }
+
+    // -- idempotent, deterministic apply ------------------------------------
+
+    #[test]
+    fn apply_is_idempotent_for_record_replays() {
+        let registry = registry_with("ann-v2", 7);
+        let mut state = MetaState::default();
+        apply(
+            &mut state,
+            &registry,
+            1,
+            MetaCommand::RegisterNode {
+                descriptor: descriptor(1, &[]),
+            },
+        )
+        .unwrap();
+        apply(
+            &mut state,
+            &registry,
+            2,
+            MetaCommand::RegisterNode {
+                descriptor: descriptor(1, &[]),
+            },
+        )
+        .unwrap();
+        assert_eq!(state.nodes.len(), 1);
+        // The replay was a record-level no-op: the record keeps the version
+        // of the first write while the state watermark ticks per command.
+        assert_eq!(
+            state.node_record(node_id(1)).unwrap().metadata_version,
+            MetadataVersion(1)
+        );
+        assert_eq!(state.metadata_version, MetadataVersion(2));
+
+        apply(
+            &mut state,
+            &registry,
+            3,
+            MetaCommand::ActivateFeature {
+                activation: activation("ann-v2", 7),
+            },
+        )
+        .unwrap();
+        apply(
+            &mut state,
+            &registry,
+            4,
+            MetaCommand::ActivateFeature {
+                activation: activation("ann-v2", 7),
+            },
+        )
+        .unwrap();
+        assert_eq!(state.feature_activations().len(), 1);
+        assert_eq!(state.feature_level(), ClusterFeatureLevel(7));
+    }
+
+    #[test]
+    fn apply_is_deterministic_across_states() {
+        let registry = registry_with("ann-v2", 7);
+        let commands = every_command_sequence();
+        let mut a = MetaState::default();
+        let mut b = MetaState::default();
+        for (index, command) in commands.iter().enumerate() {
+            let id = u8::try_from(index + 1).unwrap();
+            a.apply(command, Some(cmd_id(id)), ts(1_000), &registry)
+                .unwrap();
+            b.apply(command, Some(cmd_id(id)), ts(1_000), &registry)
+                .unwrap();
+        }
+        assert_eq!(a, b);
+        // Snapshots of identical states are byte-identical.
+        assert_eq!(
+            serde_json::to_vec(&a).unwrap(),
+            serde_json::to_vec(&b).unwrap()
+        );
+    }
+
+    // -- feature activation gating at apply ----------------------------------
+
+    #[test]
+    fn activation_refused_at_apply_until_every_voter_supports_it() {
+        let registry = registry_with("ann-v2", 7);
+        let mut state = MetaState::default();
+        for (id, byte, features) in [
+            (1_u8, 1_u8, vec!["ann-v2"]),
+            (2, 2, vec![]),
+            (3, 3, vec!["ann-v2"]),
+        ] {
+            apply(
+                &mut state,
+                &registry,
+                id,
+                MetaCommand::RegisterNode {
+                    descriptor: descriptor(byte, &features),
+                },
+            )
+            .unwrap();
+        }
+        let error = apply(
+            &mut state,
+            &registry,
+            4,
+            MetaCommand::ActivateFeature {
+                activation: activation("ann-v2", 7),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            MetaRejectionReason::FeatureActivation(FeatureActivationError::UnsupportedByVoter {
+                feature: "ann-v2".to_owned(),
+                node: node_id(2),
+            })
+        );
+        // The refusal is journaled with the command id; the level is unmoved.
+        assert_eq!(state.feature_level(), ClusterFeatureLevel::ZERO);
+        assert_eq!(state.rejections().len(), 1);
+        assert_eq!(state.rejections()[0].command_id, Some(cmd_id(4)));
+        assert_eq!(state.rejections()[0].reason, error);
+
+        // Node 2 re-registers with support; activation now applies.
+        apply(
+            &mut state,
+            &registry,
+            5,
+            MetaCommand::RegisterNode {
+                descriptor: descriptor(2, &["ann-v2"]),
+            },
+        )
+        .unwrap();
+        apply(
+            &mut state,
+            &registry,
+            6,
+            MetaCommand::ActivateFeature {
+                activation: activation("ann-v2", 7),
+            },
+        )
+        .unwrap();
+        assert_eq!(state.feature_level(), ClusterFeatureLevel(7));
+    }
+
+    #[test]
+    fn activation_apply_rechecks_registry_level_and_voters() {
+        let mut registry = registry_with("ann-v2", 7);
+        registry.declare("ai-hybrid", ClusterFeatureLevel(5));
+        let mut state = MetaState::default();
+        // No registered nodes at all: fail closed.
+        let error = apply(
+            &mut state,
+            &registry,
+            1,
+            MetaCommand::ActivateFeature {
+                activation: activation("ann-v2", 7),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            MetaRejectionReason::FeatureActivation(FeatureActivationError::NoVoters)
+        );
+        apply(
+            &mut state,
+            &registry,
+            2,
+            MetaCommand::RegisterNode {
+                descriptor: descriptor(1, &["ann-v2", "ai-hybrid"]),
+            },
+        )
+        .unwrap();
+        // Below the registry minimum.
+        let error = apply(
+            &mut state,
+            &registry,
+            3,
+            MetaCommand::ActivateFeature {
+                activation: activation("ann-v2", 6),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            MetaRejectionReason::FeatureActivation(
+                FeatureActivationError::LevelBelowRequirement { .. }
+            )
+        ));
+        // Undeclared feature.
+        let error = apply(
+            &mut state,
+            &registry,
+            4,
+            MetaCommand::ActivateFeature {
+                activation: activation("nope", 1),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            MetaRejectionReason::FeatureActivation(FeatureActivationError::UnknownFeature { .. })
+        ));
+        // Activate, then attempt to lower the level.
+        apply(
+            &mut state,
+            &registry,
+            5,
+            MetaCommand::ActivateFeature {
+                activation: activation("ann-v2", 7),
+            },
+        )
+        .unwrap();
+        let error = apply(
+            &mut state,
+            &registry,
+            6,
+            MetaCommand::ActivateFeature {
+                activation: activation("ai-hybrid", 5),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            MetaRejectionReason::FeatureActivation(FeatureActivationError::LevelRegression { .. })
+        ));
+        assert_eq!(state.rejections().len(), 4);
+    }
+
+    // -- cluster settings ----------------------------------------------------
+
+    #[test]
+    fn settings_denylist_rejects_plaintext_secrets() {
+        let registry = FeatureRegistry::current();
+        let mut state = MetaState::default();
+        for (id, key) in [
+            (1_u8, "backup.private_key_pem"),
+            (2, "ai.api_key"),
+            (3, "admin.password"),
+            (4, "tls.secret"),
+            (5, "auth.token_endpoint"),
+            (6, "service.credential"),
+            // The denylist runs before the known-key check (fail closed).
+            (7, "secret.unknown"),
+        ] {
+            let error = apply(
+                &mut state,
+                &registry,
+                id,
+                MetaCommand::SetClusterSetting {
+                    key: key.to_owned(),
+                    value: serde_json::json!("x"),
+                },
+            )
+            .unwrap_err();
+            assert_eq!(
+                error,
+                MetaRejectionReason::SecretSettingKey {
+                    key: key.to_owned()
+                }
+            );
+        }
+        assert!(state.rejections().len() == 7);
+        // Nothing was written.
+        assert_eq!(state.settings(), &ClusterSettings::default());
+    }
+
+    #[test]
+    fn settings_unknown_keys_and_bad_values_are_refused() {
+        let registry = FeatureRegistry::current();
+        let mut state = MetaState::default();
+        let error = apply(
+            &mut state,
+            &registry,
+            1,
+            MetaCommand::SetClusterSetting {
+                key: "no.such.key".to_owned(),
+                value: serde_json::json!(1),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            MetaRejectionReason::UnknownSettingKey {
+                key: "no.such.key".to_owned()
+            }
+        );
+        for (id, key, value) in [
+            (2_u8, "jobs.max_concurrent", serde_json::json!("four")),
+            (3, "jobs.max_concurrent", serde_json::json!(0)),
+            (4, "backup.enabled", serde_json::json!(1)),
+            (
+                5,
+                "default_consistency",
+                serde_json::json!("EventuallyConsistent"),
+            ),
+        ] {
+            let error = apply(
+                &mut state,
+                &registry,
+                id,
+                MetaCommand::SetClusterSetting {
+                    key: key.to_owned(),
+                    value,
+                },
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                MetaRejectionReason::InvalidSettingValue { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn settings_apply_typed_values() {
+        let registry = FeatureRegistry::current();
+        let mut state = MetaState::default();
+        for (id, key, value) in [
+            (1_u8, "history_retention_epochs", serde_json::json!(12)),
+            (2, "backup.enabled", serde_json::json!(true)),
+            (3, "backup.interval_seconds", serde_json::json!(3_600)),
+            (4, "backup.retention_count", serde_json::json!(3)),
+            (
+                5,
+                "default_consistency",
+                serde_json::json!({"BoundedStaleness": {"max_lag_ms": 250}}),
+            ),
+            (6, "ai.max_concurrent_requests", serde_json::json!(8)),
+            (7, "ai.max_memory_bytes", serde_json::json!(1 << 20)),
+            (8, "jobs.max_concurrent", serde_json::json!(4)),
+            (
+                9,
+                "resource_groups.etl",
+                serde_json::json!({"max_memory_bytes": 1024, "max_concurrent_queries": 2, "temp_disk_budget_bytes": 4096}),
+            ),
+        ] {
+            apply(
+                &mut state,
+                &registry,
+                id,
+                MetaCommand::SetClusterSetting {
+                    key: key.to_owned(),
+                    value,
+                },
+            )
+            .unwrap();
+        }
+        let settings = state.settings();
+        assert_eq!(settings.history_retention_epochs, 12);
+        assert!(settings.backup.enabled);
+        assert_eq!(settings.backup.interval_seconds, 3_600);
+        assert_eq!(settings.backup.retention_count, 3);
+        assert_eq!(
+            settings.default_consistency,
+            DefaultConsistency::BoundedStaleness { max_lag_ms: 250 }
+        );
+        assert_eq!(settings.ai.max_concurrent_requests, 8);
+        assert_eq!(settings.ai.max_memory_bytes, 1 << 20);
+        assert_eq!(settings.max_concurrent_jobs, 4);
+        assert_eq!(settings.resource_groups["etl"].max_memory_bytes, 1_024);
+        // A null value removes the group.
+        apply(
+            &mut state,
+            &registry,
+            10,
+            MetaCommand::SetClusterSetting {
+                key: "resource_groups.etl".to_owned(),
+                value: serde_json::Value::Null,
+            },
+        )
+        .unwrap();
+        assert!(state.settings().resource_groups.is_empty());
+    }
+
+    // -- versioning, LWW guards, integrity -----------------------------------
+
+    #[test]
+    fn metadata_version_ticks_once_per_applied_command() {
+        let registry = FeatureRegistry::current();
+        let mut state = MetaState::default();
+        assert_eq!(state.metadata_version, MetadataVersion::ZERO);
+        apply(
+            &mut state,
+            &registry,
+            1,
+            MetaCommand::RegisterNode {
+                descriptor: descriptor(1, &[]),
+            },
+        )
+        .unwrap();
+        assert_eq!(state.metadata_version, MetadataVersion(1));
+        // A refused command still ticks: the refusal itself is journaled state.
+        apply(
+            &mut state,
+            &registry,
+            2,
+            MetaCommand::UpdateNodeState {
+                node_id: node_id(42),
+                state: NodeState::Down,
+                expected_version: None,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(state.metadata_version, MetadataVersion(2));
+        apply(
+            &mut state,
+            &registry,
+            3,
+            MetaCommand::RemoveNode {
+                node_id: node_id(1),
+            },
+        )
+        .unwrap();
+        assert_eq!(state.metadata_version, MetadataVersion(3));
+    }
+
+    #[test]
+    fn stale_and_conflicting_writes_are_refused() {
+        let registry = FeatureRegistry::current();
+        let mut state = MetaState::default();
+        apply(
+            &mut state,
+            &registry,
+            1,
+            MetaCommand::RegisterNode {
+                descriptor: descriptor(1, &[]),
+            },
+        )
+        .unwrap();
+        apply(
+            &mut state,
+            &registry,
+            2,
+            MetaCommand::CreateDatabase {
+                descriptor: database(1, "app"),
+            },
+        )
+        .unwrap();
+        // Optimistic-concurrency guard on node state.
+        let node_version = state.node_record(node_id(1)).unwrap().metadata_version;
+        let error = apply(
+            &mut state,
+            &registry,
+            3,
+            MetaCommand::UpdateNodeState {
+                node_id: node_id(1),
+                state: NodeState::Down,
+                expected_version: Some(MetadataVersion(node_version.get() + 9)),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, MetaRejectionReason::StaleWrite { .. }));
+        apply(
+            &mut state,
+            &registry,
+            4,
+            MetaCommand::UpdateNodeState {
+                node_id: node_id(1),
+                state: NodeState::Down,
+                expected_version: Some(node_version),
+            },
+        )
+        .unwrap();
+
+        // Schema versions move forward only.
+        apply(
+            &mut state,
+            &registry,
+            5,
+            MetaCommand::SetTableSchema {
+                record: schema_record(1, 1, 2),
+            },
+        )
+        .unwrap();
+        let error = apply(
+            &mut state,
+            &registry,
+            6,
+            MetaCommand::SetTableSchema {
+                record: schema_record(1, 1, 1),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, MetaRejectionReason::StaleWrite { .. }));
+        let mut conflicting = schema_record(1, 1, 2);
+        conflicting.schema = serde_json::json!({"columns": []});
+        let error = apply(
+            &mut state,
+            &registry,
+            7,
+            MetaCommand::SetTableSchema {
+                record: conflicting,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, MetaRejectionReason::Conflict { .. }));
+        // Identical replay is a no-op.
+        apply(
+            &mut state,
+            &registry,
+            8,
+            MetaCommand::SetTableSchema {
+                record: schema_record(1, 1, 2),
+            },
+        )
+        .unwrap();
+
+        // Tablet generations move forward only.
+        apply(
+            &mut state,
+            &registry,
+            9,
+            MetaCommand::SetTabletDescriptor {
+                descriptor: tablet(1, 1, 5),
+            },
+        )
+        .unwrap();
+        let mut conflicted = tablet(1, 1, 5);
+        conflicted.leader_hint = Some(node_id(1));
+        let error = apply(
+            &mut state,
+            &registry,
+            10,
+            MetaCommand::SetTabletDescriptor {
+                descriptor: conflicted,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, MetaRejectionReason::Conflict { .. }));
+        let error = apply(
+            &mut state,
+            &registry,
+            11,
+            MetaCommand::SetTabletDescriptor {
+                descriptor: tablet(1, 1, 4),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, MetaRejectionReason::StaleWrite { .. }));
+        let error = apply(
+            &mut state,
+            &registry,
+            12,
+            MetaCommand::RemoveTabletDescriptor {
+                tablet_id: TabletId::from_bytes([1; 16]),
+                generation: 4,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, MetaRejectionReason::StaleWrite { .. }));
+        apply(
+            &mut state,
+            &registry,
+            13,
+            MetaCommand::SetTabletDescriptor {
+                descriptor: tablet(1, 1, 6),
+            },
+        )
+        .unwrap();
+
+        // Database id/name uniqueness.
+        let error = apply(
+            &mut state,
+            &registry,
+            14,
+            MetaCommand::CreateDatabase {
+                descriptor: database(2, "app"),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, MetaRejectionReason::Conflict { .. }));
+        let error = apply(
+            &mut state,
+            &registry,
+            15,
+            MetaCommand::CreateDatabase {
+                descriptor: database(1, "other"),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, MetaRejectionReason::Conflict { .. }));
+        apply(
+            &mut state,
+            &registry,
+            16,
+            MetaCommand::CreateDatabase {
+                descriptor: database(1, "app"),
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn referential_integrity_is_enforced() {
+        let registry = FeatureRegistry::current();
+        let mut state = MetaState::default();
+        apply(
+            &mut state,
+            &registry,
+            1,
+            MetaCommand::RegisterNode {
+                descriptor: descriptor(1, &[]),
+            },
+        )
+        .unwrap();
+        apply(
+            &mut state,
+            &registry,
+            2,
+            MetaCommand::CreateDatabase {
+                descriptor: database(1, "app"),
+            },
+        )
+        .unwrap();
+        apply(
+            &mut state,
+            &registry,
+            3,
+            MetaCommand::SetTableSchema {
+                record: schema_record(1, 1, 1),
+            },
+        )
+        .unwrap();
+        apply(
+            &mut state,
+            &registry,
+            4,
+            MetaCommand::SetReplicaPlacement {
+                placement: placement(9, &[(1, ReplicaRole::Voter)]),
+            },
+        )
+        .unwrap();
+        // Node removal is refused while a placement references it.
+        let error = apply(
+            &mut state,
+            &registry,
+            5,
+            MetaCommand::RemoveNode {
+                node_id: node_id(1),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, MetaRejectionReason::Conflict { .. }));
+        // Database drop is refused while tables reference it.
+        let error = apply(
+            &mut state,
+            &registry,
+            6,
+            MetaCommand::DropDatabase {
+                database_id: DatabaseId::from_bytes([1; 16]),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, MetaRejectionReason::Conflict { .. }));
+        // A placement may not reference an unregistered node.
+        let error = apply(
+            &mut state,
+            &registry,
+            7,
+            MetaCommand::SetReplicaPlacement {
+                placement: placement(8, &[(7, ReplicaRole::Voter)]),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, MetaRejectionReason::NotFound { .. }));
+        // Duplicate replica nodes are refused.
+        let error = apply(
+            &mut state,
+            &registry,
+            8,
+            MetaCommand::SetReplicaPlacement {
+                placement: placement(8, &[(1, ReplicaRole::Voter), (1, ReplicaRole::Learner)]),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, MetaRejectionReason::Conflict { .. }));
+        // A tablet's table must exist.
+        let error = apply(
+            &mut state,
+            &registry,
+            9,
+            MetaCommand::SetTabletDescriptor {
+                descriptor: tablet(2, 999, 1),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, MetaRejectionReason::NotFound { .. }));
+        // A schema's database must exist.
+        let error = apply(
+            &mut state,
+            &registry,
+            10,
+            MetaCommand::SetTableSchema {
+                record: schema_record(2, 42, 1),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, MetaRejectionReason::NotFound { .. }));
+        // Once the placement moves off, removal succeeds.
+        apply(
+            &mut state,
+            &registry,
+            11,
+            MetaCommand::SetReplicaPlacement {
+                placement: placement(9, &[(1, ReplicaRole::Learner)]),
+            },
+        )
+        .unwrap();
+        let error = apply(
+            &mut state,
+            &registry,
+            12,
+            MetaCommand::RemoveNode {
+                node_id: node_id(1),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, MetaRejectionReason::Conflict { .. }),
+            "learner replicas still reference the node"
+        );
+    }
+
+    #[test]
+    fn schema_job_graph_is_enforced() {
+        let registry = FeatureRegistry::current();
+        let mut state = MetaState::default();
+        apply(
+            &mut state,
+            &registry,
+            1,
+            MetaCommand::RegisterNode {
+                descriptor: descriptor(1, &[]),
+            },
+        )
+        .unwrap();
+        apply(
+            &mut state,
+            &registry,
+            2,
+            MetaCommand::CreateDatabase {
+                descriptor: database(1, "app"),
+            },
+        )
+        .unwrap();
+        apply(
+            &mut state,
+            &registry,
+            3,
+            MetaCommand::SetTableSchema {
+                record: schema_record(1, 1, 1),
+            },
+        )
+        .unwrap();
+        // Submissions must start Pending.
+        let mut running = schema_job(7, 1, 1);
+        running.state = SchemaJobState::Running;
+        let error = apply(
+            &mut state,
+            &registry,
+            4,
+            MetaCommand::SubmitSchemaJob { job: running },
+        )
+        .unwrap_err();
+        assert!(matches!(error, MetaRejectionReason::Invalid { .. }));
+        apply(
+            &mut state,
+            &registry,
+            5,
+            MetaCommand::SubmitSchemaJob {
+                job: schema_job(7, 1, 1),
+            },
+        )
+        .unwrap();
+        // Pending -> Succeeded is not an edge.
+        let error = apply(
+            &mut state,
+            &registry,
+            6,
+            MetaCommand::UpdateSchemaJob {
+                job_id: 7,
+                state: SchemaJobState::Succeeded,
+                updated_at: ts(2_000),
+                error: None,
+                expected_version: None,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, MetaRejectionReason::Conflict { .. }));
+        // Legal walk: Pending -> Running -> Succeeded.
+        for (id, job_state) in [
+            (7_u8, SchemaJobState::Running),
+            (8, SchemaJobState::Succeeded),
+        ] {
+            apply(
+                &mut state,
+                &registry,
+                id,
+                MetaCommand::UpdateSchemaJob {
+                    job_id: 7,
+                    state: job_state,
+                    updated_at: ts(2_000),
+                    error: None,
+                    expected_version: None,
+                },
+            )
+            .unwrap();
+        }
+        // Terminal states have no outgoing edges.
+        let error = apply(
+            &mut state,
+            &registry,
+            9,
+            MetaCommand::UpdateSchemaJob {
+                job_id: 7,
+                state: SchemaJobState::Running,
+                updated_at: ts(3_000),
+                error: None,
+                expected_version: None,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, MetaRejectionReason::Conflict { .. }));
+        // Stale optimistic-concurrency guard.
+        let error = apply(
+            &mut state,
+            &registry,
+            10,
+            MetaCommand::UpdateSchemaJob {
+                job_id: 7,
+                state: SchemaJobState::Failed,
+                updated_at: ts(3_000),
+                error: None,
+                expected_version: Some(MetadataVersion(1)),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, MetaRejectionReason::StaleWrite { .. }));
+    }
+
+    // -- sink: envelope discipline + snapshots -------------------------------
+
+    fn applied(byte: u8, command: ReplicatedCommand) -> AppliedCommand {
+        AppliedCommand {
+            position: LogPosition {
+                term: 1,
+                index: u64::from(byte),
+            },
+            command,
+        }
+    }
+
+    fn meta_envelope(id: u8, command: MetaCommand) -> ReplicatedCommand {
+        let payload = MetaCommandRecord::new(command).encode().unwrap();
+        ReplicatedCommand::new(
+            CommandKind::Catalog,
+            CommandEnvelope::new(COMMAND_TYPE_META_COMMAND, cmd_id(id), payload),
+            ts(1_000),
+        )
+    }
+
+    #[test]
+    fn sink_rejects_non_meta_payloads_and_transactions() {
+        let registry = FeatureRegistry::current();
+        let mut sink = MetaApplySink::new(registry);
+        // A catalog envelope with a foreign command type fails closed.
+        let foreign = ReplicatedCommand::new(
+            CommandKind::Catalog,
+            CommandEnvelope::new(999, cmd_id(1), b"payload".to_vec()),
+            ts(1_000),
+        );
+        assert!(ApplySink::apply(&mut sink, &applied(1, foreign)).is_err());
+        // A transaction command is misrouted to the meta group: fail closed.
+        let transaction = ReplicatedCommand::new(
+            CommandKind::Transaction,
+            CommandEnvelope::new(1, cmd_id(2), b"rows".to_vec()),
+            ts(1_000),
+        );
+        assert!(ApplySink::apply(&mut sink, &applied(2, transaction)).is_err());
+        // Maintenance and Noop are documented no-ops.
+        let maintenance = ReplicatedCommand::new(
+            CommandKind::Maintenance,
+            CommandEnvelope::new(3, cmd_id(3), b"directive".to_vec()),
+            ts(1_000),
+        );
+        ApplySink::apply(&mut sink, &applied(3, maintenance)).unwrap();
+        ApplySink::apply(&mut sink, &applied(4, ReplicatedCommand::Noop)).unwrap();
+        assert_eq!(sink.metadata_version(), MetadataVersion::ZERO);
+    }
+
+    #[test]
+    fn sink_snapshot_install_preserves_state() {
+        let registry = registry_with("ann-v2", 7);
+        let mut sink = MetaApplySink::new(registry.clone());
+        for (id, command) in every_command_sequence().into_iter().enumerate() {
+            let id = u8::try_from(id + 1).unwrap();
+            ApplySink::apply(&mut sink, &applied(id, meta_envelope(id, command))).unwrap();
+        }
+        // Plus one journaled refusal, so the journal round-trips too.
+        ApplySink::apply(
+            &mut sink,
+            &applied(
+                42,
+                meta_envelope(
+                    42,
+                    MetaCommand::SetClusterSetting {
+                        key: "ai.api_key".to_owned(),
+                        value: serde_json::json!("x"),
+                    },
+                ),
+            ),
+        )
+        .unwrap();
+        let bytes = sink.snapshot().unwrap();
+
+        let mut restored = MetaApplySink::new(registry);
+        restored.install(&bytes).unwrap();
+        assert_eq!(restored.state(), sink.state());
+        assert_eq!(restored.metadata_version(), sink.metadata_version());
+        assert_eq!(restored.state().rejections().len(), 1);
+
+        // Corrupt payloads and unsupported versions fail closed.
+        assert!(restored.install(b"junk").is_err());
+        let mut future = MetaState::default();
+        future.format_version = META_STATE_FORMAT_VERSION + 1;
+        let future_bytes = serde_json::to_vec(&future).unwrap();
+        assert!(restored.install(&future_bytes).is_err());
+        // The failed installs left the state untouched.
+        assert_eq!(restored.state(), sink.state());
+    }
+
+    // -- group integration ----------------------------------------------------
+
+    async fn single_node_group(
+        dir: &Path,
+        node: u8,
+        registry: FeatureRegistry,
+        transport: Arc<InMemoryTransport>,
+    ) -> MetaGroup<InMemoryTransport> {
+        let config = meta_config(dir, node, registry);
+        let group_config = fast_group_config(&config);
+        let meta = MetaGroup::create(config, group_config, transport)
+            .await
+            .unwrap();
+        meta.bootstrap(&[(
+            node_id(node),
+            format!("127.0.0.1:{}", 7100 + u16::from(node)),
+        )])
+        .await
+        .unwrap();
+        meta.group().wait_leader(LEADER_TIMEOUT).await.unwrap();
+        meta
+    }
+
+    #[tokio::test]
+    async fn single_node_meta_group_round_trips_every_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transport = Arc::new(InMemoryTransport::new());
+        let meta = single_node_group(
+            &tmp.path().join("node-1"),
+            1,
+            registry_with("ann-v2", 7),
+            transport,
+        )
+        .await;
+        // Directory layout: node-data/groups/<meta-group-id>/raft.
+        assert!(tmp
+            .path()
+            .join("node-1/groups")
+            .join(META_GID.to_hex())
+            .join("raft")
+            .is_dir());
+
+        let control = ExecutionControl::default();
+        let mut last_version = MetadataVersion::ZERO;
+        for (index, command) in every_command_sequence().into_iter().enumerate() {
+            let id = u8::try_from(index + 1).unwrap();
+            let receipt = meta.propose(cmd_id(id), command, &control).await.unwrap();
+            assert!(receipt.metadata_version > last_version);
+            last_version = receipt.metadata_version;
+        }
+        assert_eq!(last_version, MetadataVersion(15));
+        assert_eq!(meta.metadata_version(), MetadataVersion(15));
+        let state = meta.state();
+        assert_eq!(state.feature_level(), ClusterFeatureLevel(7));
+        assert_eq!(state.settings().max_concurrent_jobs, 4);
+        assert_eq!(state.schema_job(7).unwrap().state, SchemaJobState::Running);
+        assert!(state.rejections().is_empty());
+        meta.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn idempotent_replay_through_the_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transport = Arc::new(InMemoryTransport::new());
+        let meta = single_node_group(
+            &tmp.path().join("node-1"),
+            1,
+            FeatureRegistry::current(),
+            transport,
+        )
+        .await;
+        let control = ExecutionControl::default();
+        let command = MetaCommand::RegisterNode {
+            descriptor: descriptor(1, &[]),
+        };
+        let first = meta
+            .propose(cmd_id(1), command.clone(), &control)
+            .await
+            .unwrap();
+        assert_eq!(first.metadata_version, MetadataVersion(1));
+        assert!(!first.receipt.response.duplicate);
+        // A client retry with the same command id and payload commits a new
+        // entry but is recognized as a replay at apply (S2B-004).
+        let retry = meta.propose(cmd_id(1), command, &control).await.unwrap();
+        assert!(retry.receipt.response.duplicate);
+        assert_eq!(retry.metadata_version, MetadataVersion(1));
+        assert_eq!(meta.state().nodes.len(), 1);
+        meta.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn refused_commands_surface_typed_errors_through_the_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transport = Arc::new(InMemoryTransport::new());
+        let meta = single_node_group(
+            &tmp.path().join("node-1"),
+            1,
+            registry_with("ann-v2", 7),
+            transport,
+        )
+        .await;
+        let control = ExecutionControl::default();
+        meta.propose(
+            cmd_id(1),
+            MetaCommand::RegisterNode {
+                descriptor: descriptor(1, &[]),
+            },
+            &control,
+        )
+        .await
+        .unwrap();
+        // The single voter lacks the feature: refused at apply, typed error.
+        let error = meta
+            .propose(
+                cmd_id(2),
+                MetaCommand::ActivateFeature {
+                    activation: activation("ann-v2", 7),
+                },
+                &control,
+            )
+            .await
+            .unwrap_err();
+        let MetaError::Rejected(reason) = error else {
+            panic!("expected a typed rejection, got {error}");
+        };
+        assert_eq!(
+            reason,
+            MetaRejectionReason::FeatureActivation(FeatureActivationError::UnsupportedByVoter {
+                feature: "ann-v2".to_owned(),
+                node: node_id(1),
+            })
+        );
+        // Denied settings key, same path.
+        let error = meta
+            .propose(
+                cmd_id(3),
+                MetaCommand::SetClusterSetting {
+                    key: "backup.private_key_pem".to_owned(),
+                    value: serde_json::json!("pem"),
+                },
+                &control,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            MetaError::Rejected(MetaRejectionReason::SecretSettingKey { .. })
+        ));
+        // Both refusals are journaled; the watermark still moved.
+        assert_eq!(meta.metadata_version(), MetadataVersion(3));
+        assert_eq!(meta.state().rejections().len(), 2);
+        meta.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bootstrap_rejects_raft_id_projection_collisions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transport = Arc::new(InMemoryTransport::new());
+        let config = meta_config(&tmp.path().join("node-1"), 1, FeatureRegistry::current());
+        let group_config = fast_group_config(&config);
+        let meta = MetaGroup::create(config, group_config, transport)
+            .await
+            .unwrap();
+        // Distinct node ids sharing the first eight bytes project to the
+        // same raft id: rejected at bootstrap by this layer.
+        let colliding = NodeId::from_bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 9, 9, 9, 9, 9]);
+        let first = NodeId::from_bytes([1, 2, 3, 4, 5, 6, 7, 8, 8, 8, 8, 8, 8, 8, 8, 8]);
+        let error = meta
+            .bootstrap(&[
+                (first, "127.0.0.1:7101".to_owned()),
+                (colliding, "127.0.0.1:7102".to_owned()),
+            ])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, MetaError::InvalidRequest(_)));
+        meta.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_rejects_a_mismatched_group_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transport = Arc::new(InMemoryTransport::new());
+        let config = meta_config(&tmp.path().join("node-1"), 1, FeatureRegistry::current());
+        let mut group_config = fast_group_config(&config);
+        group_config.dir = tmp.path().join("elsewhere");
+        let result = MetaGroup::<InMemoryTransport>::create(config, group_config, transport).await;
+        match result {
+            Err(error) => assert!(matches!(error, MetaError::InvalidRequest(_))),
+            Ok(meta) => {
+                meta.shutdown().await.unwrap();
+                panic!("expected create to reject a mismatched group config");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn three_node_meta_group_converges_after_leader_failover() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transport = Arc::new(InMemoryTransport::new());
+        let registry = || registry_with("ann-v2", 7);
+        let mut groups: BTreeMap<u8, MetaGroup<InMemoryTransport>> = BTreeMap::new();
+        for byte in [1_u8, 2, 3] {
+            let config = meta_config(&tmp.path().join(format!("node-{byte}")), byte, registry());
+            let group_config = fast_group_config(&config);
+            groups.insert(
+                byte,
+                MetaGroup::create(config, group_config, transport.clone())
+                    .await
+                    .unwrap(),
+            );
+        }
+        let members: Vec<(NodeId, String)> = [1_u8, 2, 3]
+            .iter()
+            .map(|byte| (node_id(*byte), format!("127.0.0.1:710{byte}")))
+            .collect();
+        groups[&1].bootstrap(&members).await.unwrap();
+        let leader_byte = {
+            let leader = wait_consensus_leader(&[&groups[&1], &groups[&2], &groups[&3]]).await;
+            [1_u8, 2, 3]
+                .into_iter()
+                .find(|byte| raft_id(*byte) == leader)
+                .unwrap()
+        };
+
+        let control = ExecutionControl::default();
+        let mut proposals: Vec<MetaCommand> = [1_u8, 2, 3]
+            .iter()
+            .map(|byte| MetaCommand::RegisterNode {
+                descriptor: descriptor(*byte, &["ann-v2"]),
+            })
+            .collect();
+        proposals.extend([
+            MetaCommand::CreateDatabase {
+                descriptor: database(1, "app"),
+            },
+            MetaCommand::SetTableSchema {
+                record: schema_record(1, 1, 1),
+            },
+            MetaCommand::SetReplicaPlacement {
+                placement: placement(
+                    9,
+                    &[
+                        (1, ReplicaRole::Voter),
+                        (2, ReplicaRole::Voter),
+                        (3, ReplicaRole::Voter),
+                    ],
+                ),
+            },
+            MetaCommand::SetPlacementPolicy {
+                name: "default".to_owned(),
+                policy: policy(3),
+            },
+            MetaCommand::ActivateFeature {
+                activation: activation("ann-v2", 7),
+            },
+            MetaCommand::SetClusterSetting {
+                key: "jobs.max_concurrent".to_owned(),
+                value: serde_json::json!(4),
+            },
+            MetaCommand::SetTxnStatusPartition {
+                partition: TxnStatusPartition {
+                    partition_id: 0,
+                    home_raft_group: group_id(9),
+                },
+            },
+        ]);
+        let mut last_index = 0_u64;
+        for (seq, command) in proposals.into_iter().enumerate() {
+            let id = u8::try_from(seq + 1).unwrap();
+            let receipt = groups[&leader_byte]
+                .propose(cmd_id(id), command, &control)
+                .await
+                .unwrap();
+            last_index = receipt.receipt.position.index;
+        }
+        for byte in [1_u8, 2, 3] {
+            groups[&byte]
+                .group()
+                .wait_applied_index(last_index, LEADER_TIMEOUT)
+                .await
+                .unwrap();
+        }
+        assert_eq!(groups[&1].state(), groups[&2].state());
+        assert_eq!(groups[&2].state(), groups[&3].state());
+
+        // Fail over: stop the leader; the survivors elect a new one and keep
+        // accepting commands.
+        groups[&leader_byte].shutdown().await.unwrap();
+        let survivors: Vec<u8> = [1_u8, 2, 3]
+            .into_iter()
+            .filter(|byte| *byte != leader_byte)
+            .collect();
+        let new_leader_byte = {
+            let leader =
+                wait_consensus_leader(&[&groups[&survivors[0]], &groups[&survivors[1]]]).await;
+            survivors
+                .iter()
+                .copied()
+                .find(|byte| raft_id(*byte) == leader)
+                .unwrap()
+        };
+        let mut new_index = last_index;
+        for (seq, command) in [
+            MetaCommand::SubmitSchemaJob {
+                job: schema_job(7, 1, 1),
+            },
+            MetaCommand::UpdateSchemaJob {
+                job_id: 7,
+                state: SchemaJobState::Running,
+                updated_at: ts(9_000),
+                error: None,
+                expected_version: None,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = u8::try_from(seq + 100).unwrap();
+            let receipt = groups[&new_leader_byte]
+                .propose(cmd_id(id), command, &control)
+                .await
+                .unwrap();
+            new_index = receipt.receipt.position.index;
+        }
+        for byte in &survivors {
+            groups[byte]
+                .group()
+                .wait_applied_index(new_index, LEADER_TIMEOUT)
+                .await
+                .unwrap();
+        }
+        assert_eq!(groups[&survivors[0]].state(), groups[&survivors[1]].state());
+
+        // The failed node rejoins from its durable state and converges.
+        let config = meta_config(
+            &tmp.path().join(format!("node-{leader_byte}")),
+            leader_byte,
+            registry(),
+        );
+        let group_config = fast_group_config(&config);
+        let rejoined = MetaGroup::create(config, group_config, transport.clone())
+            .await
+            .unwrap();
+        rejoined
+            .group()
+            .wait_applied_index(new_index, LEADER_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(rejoined.state(), groups[&survivors[0]].state());
+        assert_eq!(
+            rejoined.metadata_version(),
+            groups[&survivors[0]].metadata_version()
+        );
+        for (_, group) in groups {
+            group.shutdown().await.unwrap();
+        }
+        rejoined.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_install_preserves_group_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transport = Arc::new(InMemoryTransport::new());
+        let meta = single_node_group(
+            &tmp.path().join("node-1"),
+            1,
+            registry_with("ann-v2", 7),
+            transport.clone(),
+        )
+        .await;
+        let control = ExecutionControl::default();
+        for (index, command) in every_command_sequence().into_iter().enumerate() {
+            let id = u8::try_from(index + 1).unwrap();
+            meta.propose(cmd_id(id), command, &control).await.unwrap();
+        }
+        let snapshot = meta.group().snapshot().await.unwrap();
+
+        // A fresh member installs the image: identical state, watermark, and
+        // feature level without replaying the log.
+        let config = meta_config(&tmp.path().join("node-2"), 2, registry_with("ann-v2", 7));
+        let group_config = fast_group_config(&config);
+        let fresh = MetaGroup::create(config, group_config, transport)
+            .await
+            .unwrap();
+        fresh.group().install_snapshot(&snapshot).unwrap();
+        assert_eq!(fresh.state(), meta.state());
+        assert_eq!(fresh.metadata_version(), meta.metadata_version());
+        assert_eq!(fresh.state().feature_level(), ClusterFeatureLevel(7));
+        meta.shutdown().await.unwrap();
+        fresh.shutdown().await.unwrap();
     }
 }
