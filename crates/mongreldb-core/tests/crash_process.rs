@@ -34,9 +34,14 @@ fn writer_exe() -> PathBuf {
 /// readiness line does not arrive within the timeout. `dir` (the tempdir) is
 /// owned by the caller so the on-disk state outlives the kill for reopening.
 fn spawn_and_kill(mode: &str, ready: &str, db_dir: &std::path::Path) {
+    spawn_and_kill_args(&[mode.to_string()], ready, db_dir);
+}
+
+/// `spawn_and_kill` with extra arguments forwarded to `crash_writer`.
+fn spawn_and_kill_args(args: &[String], ready: &str, db_dir: &std::path::Path) {
     let mut child = Command::new(writer_exe())
         .arg(db_dir)
-        .arg(mode)
+        .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
@@ -163,4 +168,71 @@ fn unpublished_ctas_build_is_reclaimed_after_real_kill9() {
     assert!(db.table_names().is_empty());
     assert!(db.table("target").is_err());
     assert!(db.table("__mongreldb_ctas_build_crash-query").is_err());
+}
+
+/// Repeated unclean sessions against the shared (mounted-table) WAL — the
+/// configuration multi-table databases run in production, where every process
+/// stop is an unclean shutdown. Each cycle commits one row in a fresh child,
+/// delivers SIGKILL, then reopens: every acknowledged row must be present,
+/// the database must pass integrity checks, and the next write must succeed.
+/// Finally the retained WAL history must keep one globally contiguous record
+/// sequence across all of those crashed sessions.
+#[test]
+fn repeated_kill9_cycles_preserve_rows_and_wal_sequence() {
+    use mongreldb_core::SharedWal;
+
+    let dir = TempDir::new().unwrap();
+    const CYCLES: i64 = 20;
+    for cycle in 1..=CYCLES {
+        spawn_and_kill_args(
+            &["shared-commit".into(), cycle.to_string()],
+            "SHARED_READY",
+            dir.path(),
+        );
+
+        let db = Database::open(dir.path()).expect("reopen after kill -9");
+        assert_eq!(
+            db.table("t").unwrap().lock().count() as i64,
+            cycle,
+            "every committed row survives cycle {cycle}"
+        );
+        assert!(
+            db.check().is_empty(),
+            "integrity check passes after cycle {cycle}"
+        );
+        drop(db);
+    }
+
+    let records = SharedWal::replay(dir.path()).expect("replay shared WAL");
+    let sequences: Vec<u64> = records.iter().map(|record| record.seq.0).collect();
+    assert!(
+        sequences.windows(2).all(|pair| pair[1] == pair[0] + 1),
+        "WAL sequence stays globally contiguous across crashed sessions"
+    );
+    assert!(
+        sequences.len() >= CYCLES as usize * 2,
+        "every cycle's commit records are retained or checkpointed"
+    );
+}
+
+/// The encrypted matrix of the restart cycle: encryption must not change
+/// unclean-shutdown recovery semantics.
+#[cfg(feature = "encryption")]
+#[test]
+fn repeated_kill9_cycles_preserve_rows_and_wal_sequence_encrypted() {
+    let dir = TempDir::new().unwrap();
+    const CYCLES: i64 = 3;
+    for cycle in 1..=CYCLES {
+        spawn_and_kill_args(
+            &["shared-commit-encrypted".into(), cycle.to_string()],
+            "SHARED_READY",
+            dir.path(),
+        );
+
+        let db = Database::open_encrypted(dir.path(), "crash-harness-test-passphrase")
+            .expect("reopen encrypted database after kill -9");
+        assert_eq!(db.table("t").unwrap().lock().count() as i64, cycle);
+        assert!(db.check().is_empty());
+        drop(db);
+    }
 }

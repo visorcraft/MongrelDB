@@ -1455,12 +1455,13 @@ fn validate_v4_sequence_continuity(segments: &[ReplayedSegment]) -> Result<()> {
     for segment in segments {
         for record in &segment.records {
             if let Some((previous_seq, previous_segment)) = previous {
-                let expected = previous_seq
-                    .checked_add(1)
-                    .ok_or_else(|| MongrelError::CorruptWal {
-                        offset: record.seq.0,
-                        reason: "WAL sequence overflows after u64::MAX".into(),
-                    })?;
+                let expected =
+                    previous_seq
+                        .checked_add(1)
+                        .ok_or_else(|| MongrelError::CorruptWal {
+                            offset: record.seq.0,
+                            reason: "WAL sequence overflows after u64::MAX".into(),
+                        })?;
                 if record.seq.0 != expected {
                     let reason = if segment.segment_no == previous_segment {
                         format!(
@@ -1536,7 +1537,10 @@ fn replay_wal_layout(
         // segment must parse completely: no torn tail is admissible.
         let records = reader.replay_bounded(remaining, false)?;
         total_records += records.len();
-        segments.push(ReplayedSegment { segment_no, records });
+        segments.push(ReplayedSegment {
+            segment_no,
+            records,
+        });
     }
     validate_v4_sequence_continuity(&segments)?;
     let records: Vec<Record> = segments
@@ -2317,7 +2321,9 @@ mod shared_wal_tests {
         let dir = tempdir().unwrap();
         std::fs::create_dir(dir.path().join("_wal")).unwrap();
         write_v3_segment(&dir.path().join("_wal/seg-000000.wal"));
-        let error = SharedWal::open(dir.path(), Epoch(1), None).unwrap_err();
+        let error = SharedWal::open(dir.path(), Epoch(1), None)
+            .err()
+            .expect("v3 WAL must be rejected");
         assert!(matches!(
             error,
             MongrelError::UnsupportedStorageVersion {
@@ -2547,9 +2553,8 @@ mod shared_wal_tests {
     fn multiple_sessions_continue_one_global_sequence() {
         let dir = tempdir().unwrap();
         for session in 0..3_u64 {
-            let mut wal = SharedWal::open(dir.path(), Epoch(session * 2), None).unwrap_or_else(
-                |_| SharedWal::create(dir.path(), Epoch(session * 2)).unwrap(),
-            );
+            let mut wal = SharedWal::open(dir.path(), Epoch(session * 2), None)
+                .unwrap_or_else(|_| SharedWal::create(dir.path(), Epoch(session * 2)).unwrap());
             assert_eq!(wal.active_segment_no(), session);
             for i in 0..2_u64 {
                 let txn = session * 2 + i + 1;
@@ -2561,13 +2566,25 @@ mod shared_wal_tests {
 
         let records = SharedWal::replay(dir.path()).unwrap();
         let sequences: Vec<u64> = records.iter().map(|record| record.seq.0).collect();
-        assert_eq!(sequences, (1..=6).collect::<Vec<u64>>());
+        // Every commit writes a timestamp and a commit record: 3 sessions x 2
+        // commits x 2 records, one contiguous namespace.
+        assert_eq!(sequences, (1..=12).collect::<Vec<u64>>());
 
-        // A fourth session must start at highest durable sequence + 1.
+        // A fourth session must continue the same namespace (recovery may
+        // append its own system records first — contiguity is the invariant).
         let mut wal = SharedWal::open(dir.path(), Epoch(6), None).unwrap();
         assert_eq!(wal.active_segment_no(), 3);
-        let seq = wal.append_commit(7, Epoch(7), &[]).unwrap();
-        assert_eq!(seq.0, 7);
+        wal.append_commit(7, Epoch(7), &[]).unwrap();
+        wal.group_sync().unwrap();
+        drop(wal);
+
+        let records = SharedWal::replay(dir.path()).unwrap();
+        let sequences: Vec<u64> = records.iter().map(|record| record.seq.0).collect();
+        assert_eq!(
+            sequences,
+            (1..=sequences.len() as u64).collect::<Vec<u64>>(),
+            "records stay globally contiguous across sessions"
+        );
     }
 
     #[test]
@@ -2618,6 +2635,115 @@ mod shared_wal_tests {
         assert!(!wal.verify_segments().is_empty());
         assert!(wal.gc_segments(u64::MAX).is_err());
         assert!(old.exists());
+    }
+
+    #[test]
+    fn rotation_within_session_keeps_sequence_contiguous() {
+        let dir = tempdir().unwrap();
+        let mut wal = SharedWal::create(dir.path(), Epoch(0)).unwrap();
+        wal.append_commit(1, Epoch(1), &[]).unwrap();
+        wal.rotate(1).unwrap();
+        wal.append_commit(2, Epoch(2), &[]).unwrap();
+        wal.rotate(2).unwrap();
+        wal.append_commit(3, Epoch(3), &[]).unwrap();
+        wal.group_sync().unwrap();
+        drop(wal);
+
+        let records = SharedWal::replay(dir.path()).unwrap();
+        let sequences: Vec<u64> = records.iter().map(|record| record.seq.0).collect();
+        assert_eq!(
+            sequences,
+            (1..=sequences.len() as u64).collect::<Vec<u64>>()
+        );
+        assert_eq!(sequences.len(), 6, "two records per commit");
+    }
+
+    #[test]
+    fn open_truncates_garbage_beyond_the_authenticated_durable_prefix() {
+        let dir = tempdir().unwrap();
+        let mut wal = SharedWal::create(dir.path(), Epoch(0)).unwrap();
+        wal.append_commit(1, Epoch(1), &[]).unwrap();
+        wal.group_sync().unwrap();
+        drop(wal);
+
+        let seg = dir.path().join("_wal/seg-000000.wal");
+        let published_len = std::fs::metadata(&seg).unwrap().len();
+        let mut file = OpenOptions::new().append(true).open(&seg).unwrap();
+        file.write_all(&[0xde, 0xad, 0xbe, 0xef, 1, 2, 3, 4, 5])
+            .unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        // Bytes past the durable head were never published: open discards
+        // them and keeps every durable record.
+        let wal = SharedWal::open(dir.path(), Epoch(1), None).unwrap();
+        drop(wal);
+        assert_eq!(std::fs::metadata(&seg).unwrap().len(), published_len);
+        let records = SharedWal::replay(dir.path()).unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|record| record.seq.0 <= 2));
+    }
+
+    #[test]
+    fn open_rejects_damage_inside_the_authenticated_prefix() {
+        let dir = tempdir().unwrap();
+        let mut wal = SharedWal::create(dir.path(), Epoch(0)).unwrap();
+        wal.append_commit(1, Epoch(1), &[]).unwrap();
+        wal.group_sync().unwrap();
+        wal.rotate(1).unwrap();
+        wal.append_commit(2, Epoch(2), &[]).unwrap();
+        wal.group_sync().unwrap();
+        drop(wal);
+
+        // Corrupt one byte inside segment 0's record payload; segment 1's
+        // previous-segment hash must fail to authenticate it.
+        let seg = dir.path().join("_wal/seg-000000.wal");
+        let mut bytes = std::fs::read(&seg).unwrap();
+        bytes[(HEADER_LEN + 12) as usize] ^= 0x01;
+        std::fs::write(&seg, bytes).unwrap();
+
+        assert!(matches!(
+            SharedWal::replay(dir.path()),
+            Err(MongrelError::CorruptWal { .. })
+        ));
+        assert!(SharedWal::open(dir.path(), Epoch(2), None).is_err());
+    }
+
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn encrypted_sessions_continue_one_global_sequence() {
+        let dek = || Zeroizing::new([7_u8; 32]);
+        let dir = tempdir().unwrap();
+        for session in 0..3_u64 {
+            let mut wal = SharedWal::open(dir.path(), Epoch(session * 2), Some(dek()))
+                .unwrap_or_else(|_| {
+                    SharedWal::create_with_dek(dir.path(), Epoch(session * 2), Some(dek())).unwrap()
+                });
+            for i in 0..2_u64 {
+                let txn = session * 2 + i + 1;
+                wal.append_commit(txn, Epoch(txn), &[]).unwrap();
+            }
+            wal.group_sync().unwrap();
+            drop(wal);
+        }
+
+        let records = SharedWal::replay_with_dek(dir.path(), Some(&dek())).unwrap();
+        let sequences: Vec<u64> = records.iter().map(|record| record.seq.0).collect();
+        assert_eq!(
+            sequences,
+            (1..=sequences.len() as u64).collect::<Vec<u64>>()
+        );
+
+        // Unpublished bytes are discarded for encrypted segments as well.
+        let seg = dir.path().join("_wal/seg-000002.wal");
+        let published_len = std::fs::metadata(&seg).unwrap().len();
+        let mut file = OpenOptions::new().append(true).open(&seg).unwrap();
+        file.write_all(&[9, 9, 9, 9, 9, 9, 9]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let wal = SharedWal::open(dir.path(), Epoch(6), Some(dek())).unwrap();
+        drop(wal);
+        assert_eq!(std::fs::metadata(&seg).unwrap().len(), published_len);
     }
 }
 

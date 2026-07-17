@@ -107,6 +107,51 @@ fn main() {
             signal("CTAS_BUILDING_READY");
             spin();
         }
+        // Shared-WAL (mounted-table) path: open or create a database, create
+        // the table on first use, commit one row carrying this session's
+        // value, then spin. The parent kills with SIGKILL after SHARED_READY
+        // and reopens — exercising the multi-table shared WAL recovery path
+        // where every process stop is an unclean shutdown.
+        "shared-commit" => {
+            let value: i64 = args.next().and_then(|v| v.parse().ok()).unwrap_or(1);
+            let db = match Database::open(&dir) {
+                Ok(db) => db,
+                Err(_) => Database::create(&dir).expect("create database"),
+            };
+            if db.table("t").is_err() {
+                db.create_table("t", schema()).expect("create table");
+            }
+            let t = db.table("t").expect("table");
+            {
+                let mut g = t.lock();
+                g.put(vec![(1, Value::Int64(value))]).expect("put");
+                g.commit().expect("commit");
+            }
+            signal("SHARED_READY");
+            spin();
+        }
+        // Encrypted variant of "shared-commit": same restart semantics must
+        // hold with page-level AES-256-GCM. Fixed test-only passphrase.
+        #[cfg(feature = "encryption")]
+        "shared-commit-encrypted" => {
+            const PASSPHRASE: &str = "crash-harness-test-passphrase";
+            let value: i64 = args.next().and_then(|v| v.parse().ok()).unwrap_or(1);
+            let db = match Database::open_encrypted(&dir, PASSPHRASE) {
+                Ok(db) => db,
+                Err(_) => Database::create_encrypted(&dir, PASSPHRASE).expect("create database"),
+            };
+            if db.table("t").is_err() {
+                db.create_table("t", schema()).expect("create table");
+            }
+            let t = db.table("t").expect("table");
+            {
+                let mut g = t.lock();
+                g.put(vec![(1, Value::Int64(value))]).expect("put");
+                g.commit().expect("commit");
+            }
+            signal("SHARED_READY");
+            spin();
+        }
         other => {
             eprintln!("unknown mode: {other}");
             exit(2);
