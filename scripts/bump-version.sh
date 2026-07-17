@@ -62,6 +62,11 @@ sed -i "s|<version>$OLD</version>|<version>$NEW</version>|g" \
 sed -i "s/mongreldb-jni-$OLD/mongreldb-jni-$NEW/g" \
   README.md .github/workflows/ffi-release.yml
 
+# C FFI smoke test build-info assertions (engine_version/query_version).
+sed -i "s/\\\\\"engine_version\\\\\":\\\\\"$OLD\\\\\"/\\\\\"engine_version\\\\\":\\\\\"$NEW\\\\\"/; \
+        s/\\\\\"query_version\\\\\":\\\\\"$OLD\\\\\"/\\\\\"query_version\\\\\":\\\\\"$NEW\\\\\"/" \
+  crates/mongreldb-ffi/tests/c_test.c
+
 echo "Regenerating lockfiles (this compiles each crate; can take a while)..."
 cargo check --workspace --all-features >/dev/null
 for d in mongreldb-client mongreldb-server mongreldb-perf mongreldb-node \
