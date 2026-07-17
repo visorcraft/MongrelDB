@@ -34,6 +34,12 @@ pub enum MongrelError {
         expected: [u8; 8],
         got: [u8; 8],
     },
+    #[error("unsupported {component} storage version {found}: this build supports version {supported} only; recreate the database or export data using the engine version that created it")]
+    UnsupportedStorageVersion {
+        component: &'static str,
+        found: u16,
+        supported: u16,
+    },
     #[error("schema error: {0}")]
     Schema(String),
     #[error("column not found: {0}")]

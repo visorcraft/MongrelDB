@@ -160,18 +160,21 @@ impl DurableRoot {
 
         #[cfg(windows)]
         {
-            use std::os::windows::fs::MetadataExt;
-            let metadata = self.directory.metadata()?;
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Storage::FileSystem::{
+                GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+            };
+
+            let mut metadata = BY_HANDLE_FILE_INFORMATION::default();
+            if unsafe { GetFileInformationByHandle(self.directory.as_raw_handle(), &mut metadata) }
+                == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
             return Ok(DurableFileIdentity::Windows {
-                volume_serial: metadata.volume_serial_number().ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "directory has no volume identity",
-                    )
-                })?,
-                file_index: metadata.file_index().ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::Unsupported, "directory has no file identity")
-                })?,
+                volume_serial: metadata.dwVolumeSerialNumber,
+                file_index: (u64::from(metadata.nFileIndexHigh) << 32)
+                    | u64::from(metadata.nFileIndexLow),
             });
         }
 
@@ -1942,6 +1945,23 @@ where
             io::ErrorKind::Unsupported,
             "durable atomic replacement is unsupported on this platform",
         ))
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn durable_root_identity_is_stable() {
+        let root = tempfile::tempdir().unwrap();
+        let first = DurableRoot::open(root.path()).unwrap();
+        let second = DurableRoot::open(root.path()).unwrap();
+
+        assert_eq!(
+            first.file_identity().unwrap(),
+            second.file_identity().unwrap()
+        );
     }
 }
 

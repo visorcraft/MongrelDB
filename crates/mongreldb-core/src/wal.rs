@@ -29,10 +29,10 @@ fn unix_nanos_now() -> u64 {
 }
 
 pub const WAL_MAGIC: [u8; 8] = *b"MONGRWAL";
-const LEGACY_WAL_VERSION: u16 = 3;
+/// The only WAL format this engine reads or writes. Older segments (v3 and
+/// below) are rejected with [`MongrelError::UnsupportedStorageVersion`].
 const WAL_VERSION: u16 = 4;
-const LEGACY_HEADER_LEN: u64 = 8 + 2 + 4 + 8;
-const HEADER_LEN: u64 = LEGACY_HEADER_LEN + 8 + 32;
+const HEADER_LEN: u64 = 8 + 2 + 4 + 8 + 8 + 32;
 const WAL_FRAME_AAD_DOMAIN: &[u8] = b"mongreldb/wal-frame/v4";
 const WAL_HEAD_MAGIC: [u8; 8] = *b"MONGWHED";
 const WAL_HEAD_VERSION: u16 = 1;
@@ -885,10 +885,12 @@ impl WalReader {
         let mut version_buf = [0u8; 2];
         file.read_exact(&mut version_buf)?;
         let version = u16::from_le_bytes(version_buf);
-        if version != LEGACY_WAL_VERSION && version != WAL_VERSION {
-            return Err(MongrelError::InvalidArgument(format!(
-                "unsupported wal version {version}"
-            )));
+        if version != WAL_VERSION {
+            return Err(MongrelError::UnsupportedStorageVersion {
+                component: "wal",
+                found: version,
+                supported: WAL_VERSION,
+            });
         }
         let mut reserved = [0u8; 4];
         file.read_exact(&mut reserved)?;
@@ -903,13 +905,11 @@ impl WalReader {
         file.read_exact(&mut epoch_buf)?;
         let _epoch_created = Epoch(u64::from_le_bytes(epoch_buf));
         let mut previous_segment_hash = [0_u8; 32];
-        let segment_no = if version == WAL_VERSION {
+        let segment_no = {
             let mut segment = [0_u8; 8];
             file.read_exact(&mut segment)?;
             file.read_exact(&mut previous_segment_hash)?;
             u64::from_le_bytes(segment)
-        } else {
-            expected_segment_no.unwrap_or(0)
         };
         if expected_segment_no.is_some_and(|expected| expected != segment_no) {
             return Err(MongrelError::CorruptWal {
@@ -920,22 +920,14 @@ impl WalReader {
                 ),
             });
         }
-        let pos = if version == WAL_VERSION {
-            HEADER_LEN
-        } else {
-            LEGACY_HEADER_LEN
-        };
-        let header_binding = if version == WAL_VERSION {
-            Sha256::digest(encode_wal_header(
-                reserved[0],
-                _epoch_created.0,
-                segment_no,
-                &previous_segment_hash,
-            ))
-            .into()
-        } else {
-            [0; 32]
-        };
+        let pos = HEADER_LEN;
+        let header_binding = Sha256::digest(encode_wal_header(
+            reserved[0],
+            _epoch_created.0,
+            segment_no,
+            &previous_segment_hash,
+        ))
+        .into();
         if encrypted && cipher.is_none() {
             return Err(MongrelError::Decryption(
                 "WAL is encrypted but no passphrase or key was provided. \
@@ -1029,11 +1021,7 @@ impl WalReader {
                     "WAL is encrypted but no cipher was provided".into(),
                 ));
             };
-            let minimum = if self.version == LEGACY_WAL_VERSION {
-                28
-            } else {
-                16
-            };
+            let minimum = 16;
             if payload.len() < minimum {
                 return Err(MongrelError::CorruptWal {
                     offset: record_start,
@@ -1047,29 +1035,16 @@ impl WalReader {
                 });
             }
             let expected_nonce = frame_nonce_for(self.segment_no, self.frame_seq as u32);
-            let (ciphertext, aad) = if self.version == LEGACY_WAL_VERSION {
-                if payload[..12] != expected_nonce {
-                    return Err(MongrelError::CorruptWal {
-                        offset: record_start,
-                        reason: "encrypted WAL nonce does not match frame position".into(),
-                    });
-                }
-                (&payload[12..], Vec::new())
-            } else {
-                (
-                    payload,
-                    wal_frame_aad(
-                        &self.header_binding,
-                        self.segment_no,
-                        self.frame_seq as u32,
-                        seq,
-                        txn_id,
-                        payload.len() as u64,
-                    ),
-                )
-            };
+            let aad = wal_frame_aad(
+                &self.header_binding,
+                self.segment_no,
+                self.frame_seq as u32,
+                seq,
+                txn_id,
+                payload.len() as u64,
+            );
             cipher
-                .decrypt_page_with_aad(&expected_nonce, ciphertext, &aad)
+                .decrypt_page_with_aad(&expected_nonce, payload, &aad)
                 .map_err(|e| {
                     MongrelError::Decryption(format!(
                         "WAL frame decryption failed — wrong passphrase or key? ({e})"
@@ -1360,7 +1335,6 @@ fn inspect_wal_layout(
 ) -> Result<WalLayout> {
     let segments = list_segment_numbers(wal_root)?;
     let head = read_wal_head(root, wal_dek)?;
-    let mut saw_v4 = false;
     for (index, segment_no) in segments.iter().copied().enumerate() {
         let reader = reader_for_segment(wal_root, segment_no, wal_dek)?;
         if reader.encrypted != wal_dek.is_some() {
@@ -1371,38 +1345,30 @@ fn inspect_wal_layout(
                 ),
             });
         }
-        if reader.version == WAL_VERSION {
-            if index != 0 {
-                let previous_no = segments[index - 1];
-                let expected = hash_segment(wal_root, previous_no)?;
-                if reader.previous_segment_hash != expected {
-                    return Err(MongrelError::CorruptWal {
-                        offset: 30,
-                        reason: format!(
-                            "WAL segment {segment_no} does not authenticate segment {previous_no}"
-                        ),
-                    });
-                }
+        if index != 0 {
+            let previous_no = segments[index - 1];
+            let expected = hash_segment(wal_root, previous_no)?;
+            if reader.previous_segment_hash != expected {
+                return Err(MongrelError::CorruptWal {
+                    offset: 30,
+                    reason: format!(
+                        "WAL segment {segment_no} does not authenticate segment {previous_no}"
+                    ),
+                });
             }
-            saw_v4 = true;
-        } else if saw_v4 {
-            return Err(MongrelError::CorruptWal {
-                offset: 8,
-                reason: format!("legacy WAL segment {segment_no} follows a v4 segment"),
-            });
         }
     }
 
-    if saw_v4 && head.is_none() {
+    if !segments.is_empty() && head.is_none() {
         return Err(MongrelError::CorruptWal {
             offset: 0,
-            reason: "v4 WAL segments require a durable WAL head".into(),
+            reason: "WAL segments exist without a durable WAL head".into(),
         });
     }
-    if !saw_v4 && head.is_some() {
+    if segments.is_empty() && head.is_some() {
         return Err(MongrelError::CorruptWal {
             offset: 0,
-            reason: "a durable WAL head exists without any v4 segment".into(),
+            reason: "a durable WAL head exists without any WAL segment".into(),
         });
     }
     if let Some(head) = head {
@@ -1472,6 +1438,53 @@ fn remove_unpublished_header_only_segment(
     Ok(true)
 }
 
+/// One WAL segment's records as replayed from disk. Provenance is kept
+/// through sequence validation so errors can name the offending segment;
+/// records are flattened for recovery only after validation.
+struct ReplayedSegment {
+    segment_no: u64,
+    records: Vec<Record>,
+}
+
+/// Validate the v4 writer invariant: record sequence numbers are globally
+/// contiguous across every retained segment and every session. A new session
+/// continues at `highest durable sequence + 1`, so any gap, reset, or
+/// duplicate is corruption.
+fn validate_v4_sequence_continuity(segments: &[ReplayedSegment]) -> Result<()> {
+    let mut previous: Option<(u64, u64)> = None;
+    for segment in segments {
+        for record in &segment.records {
+            if let Some((previous_seq, previous_segment)) = previous {
+                let expected = previous_seq
+                    .checked_add(1)
+                    .ok_or_else(|| MongrelError::CorruptWal {
+                        offset: record.seq.0,
+                        reason: "WAL sequence overflows after u64::MAX".into(),
+                    })?;
+                if record.seq.0 != expected {
+                    let reason = if segment.segment_no == previous_segment {
+                        format!(
+                            "WAL segment {} sequence {} does not follow {previous_seq}",
+                            segment.segment_no, record.seq.0
+                        )
+                    } else {
+                        format!(
+                            "WAL segment {} begins with sequence {}, expected {expected} after segment {previous_segment}",
+                            segment.segment_no, record.seq.0
+                        )
+                    };
+                    return Err(MongrelError::CorruptWal {
+                        offset: record.seq.0,
+                        reason,
+                    });
+                }
+            }
+            previous = Some((record.seq.0, segment.segment_no));
+        }
+    }
+    Ok(())
+}
+
 fn replay_wal_layout(
     wal_root: &crate::durable_file::DurableRoot,
     layout: &WalLayout,
@@ -1507,8 +1520,8 @@ fn replay_wal_layout(
             limit: MAX_RECOVERY_WAL_BYTES as usize,
         });
     }
-    let mut records = Vec::new();
-    let final_segment = layout.segments.last().copied();
+    let mut segments = Vec::with_capacity(layout.segments.len());
+    let mut total_records = 0_usize;
     for segment_no in layout.segments.iter().copied() {
         let mut reader = reader_for_segment(wal_root, segment_no, wal_dek)?;
         if layout
@@ -1517,38 +1530,32 @@ fn replay_wal_layout(
         {
             reader.constrain_to_durable_len(layout.head.unwrap().durable_len)?;
         }
-        let remaining = MAX_RECOVERY_WAL_RECORDS.saturating_sub(records.len());
-        let segment_records = reader.replay_bounded(
-            remaining,
-            Some(segment_no) == final_segment && layout.head.is_none(),
-        )?;
-        records.extend(segment_records);
+        let remaining = MAX_RECOVERY_WAL_RECORDS.saturating_sub(total_records);
+        // Layout validation guarantees a durable WAL head, so the head
+        // segment is constrained to its authenticated prefix and every other
+        // segment must parse completely: no torn tail is admissible.
+        let records = reader.replay_bounded(remaining, false)?;
+        total_records += records.len();
+        segments.push(ReplayedSegment { segment_no, records });
     }
+    validate_v4_sequence_continuity(&segments)?;
+    let records: Vec<Record> = segments
+        .into_iter()
+        .flat_map(|segment| segment.records)
+        .collect();
     validate_shared_transaction_framing(&records)?;
     Ok(records)
 }
 
+/// Validate transaction semantics over the flattened replay order: system
+/// transaction usage, terminal markers, commit timestamps, and commit-epoch
+/// uniqueness and advancement. Record sequence continuity is validated
+/// separately with segment provenance (see `validate_v4_sequence_continuity`).
 pub(crate) fn validate_shared_transaction_framing(records: &[Record]) -> Result<()> {
     let mut transactions = std::collections::HashMap::<u64, ReplayTxnState>::new();
     let mut commit_epochs = std::collections::HashMap::<u64, u64>::new();
-    let mut previous_sequence: Option<u64> = None;
     let mut previous_commit_epoch: Option<u64> = None;
     for record in records {
-        if let Some(previous) = previous_sequence {
-            let expected = previous
-                .checked_add(1)
-                .ok_or_else(|| MongrelError::CorruptWal {
-                    offset: record.seq.0,
-                    reason: "WAL sequence overflows after u64::MAX".into(),
-                })?;
-            if record.seq.0 != expected {
-                return Err(MongrelError::CorruptWal {
-                    offset: record.seq.0,
-                    reason: format!("WAL sequence {} does not follow {previous}", record.seq.0),
-                });
-            }
-        }
-        previous_sequence = Some(record.seq.0);
         if record.txn_id == SYSTEM_TXN_ID {
             if !matches!(record.op, Op::Flush { .. }) {
                 return Err(MongrelError::CorruptWal {
@@ -1763,15 +1770,15 @@ impl SharedWal {
             });
 
         // Bytes beyond the authenticated head were never published durable.
-        // A legacy final segment may likewise end in a true short torn frame.
-        // Remove that suffix before the file becomes an immutable chain link.
-        let durable_len = if let Some(head) = layout.head {
-            head.durable_len
-        } else {
-            let mut reader = reader_for_segment(&wal_root, final_segment, wal_dek.as_ref())?;
-            reader.replay()?;
-            reader.current_offset()
-        };
+        // Truncate that suffix before the file becomes an immutable chain
+        // link. Layout validation guarantees a durable head exists.
+        let durable_len = layout
+            .head
+            .ok_or_else(|| MongrelError::CorruptWal {
+                offset: 0,
+                reason: "validated WAL layout has no durable WAL head".into(),
+            })?
+            .durable_len;
         let final_name = segment_filename(final_segment);
         let final_file = wal_root.open_regular_read_write(&final_name)?;
         if final_file.metadata()?.len() != durable_len {
@@ -1782,11 +1789,12 @@ impl SharedWal {
         let next_segment_no = final_segment
             .checked_add(1)
             .ok_or_else(|| MongrelError::Full("WAL segment namespace exhausted".into()))?;
+        // The new session continues the globally contiguous v4 sequence. Only
+        // a freshly created (record-less) WAL seeds from the creation epoch.
         let durable_seq = records
             .last()
             .map(|record| record.seq.0)
-            .unwrap_or(epoch_created.0)
-            .max(epoch_created.0);
+            .unwrap_or(epoch_created.0);
         let cipher = match &wal_dek {
             #[cfg(feature = "encryption")]
             Some(dk) => Some(Self::cipher_from_dek(dk)?),
@@ -2179,22 +2187,30 @@ impl SharedWal {
                 limit: max_bytes,
             });
         }
-        let mut out = Vec::new();
-        let final_segment = layout.segments.last().copied();
+        let mut segments = Vec::with_capacity(layout.segments.len());
+        let mut total_records = 0_usize;
         for n in layout.segments.iter().copied() {
             control.checkpoint()?;
-            let remaining = max_records.saturating_sub(out.len());
+            let remaining = max_records.saturating_sub(total_records);
             let mut reader = reader_for_segment(&wal_root, n, wal_dek)?;
             if layout.head.is_some_and(|head| head.segment_no == n) {
                 reader.constrain_to_durable_len(layout.head.unwrap().durable_len)?;
             }
-            let records = if Some(n) == final_segment && layout.head.is_none() {
-                reader.replay_controlled(control, remaining)?
-            } else {
-                reader.replay_controlled_strict(control, remaining)?
-            };
-            out.extend(records);
+            // Layout validation guarantees a durable WAL head, so every
+            // segment parses strictly: the head segment is constrained to
+            // its authenticated prefix and no torn tail is admissible.
+            let records = reader.replay_controlled_strict(control, remaining)?;
+            total_records += records.len();
+            segments.push(ReplayedSegment {
+                segment_no: n,
+                records,
+            });
         }
+        validate_v4_sequence_continuity(&segments)?;
+        let out: Vec<Record> = segments
+            .into_iter()
+            .flat_map(|segment| segment.records)
+            .collect();
         validate_shared_transaction_framing(&out)?;
         Ok(out)
     }
@@ -2268,25 +2284,48 @@ mod shared_wal_tests {
     use super::*;
     use tempfile::tempdir;
 
-    fn write_legacy_segment(path: &Path, records: &[Record]) {
+    /// Write a file with a v3 WAL header (and no records) so tests can assert
+    /// the format boundary: v3 is rejected as unsupported, never parsed.
+    fn write_v3_segment(path: &Path) {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&WAL_MAGIC);
-        bytes.extend_from_slice(&LEGACY_WAL_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&3_u16.to_le_bytes());
         bytes.extend_from_slice(&[ENC_PLAINTEXT, 0, 0, 0]);
         bytes.extend_from_slice(&0_u64.to_le_bytes());
-        for record in records {
-            let payload = bincode::serialize(record).unwrap();
-            let mut digest = CRC32C.digest();
-            digest.update(&record.seq.0.to_le_bytes());
-            digest.update(&record.txn_id.to_le_bytes());
-            digest.update(&payload);
-            bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-            bytes.extend_from_slice(&digest.finalize().to_le_bytes());
-            bytes.extend_from_slice(&record.seq.0.to_le_bytes());
-            bytes.extend_from_slice(&record.txn_id.to_le_bytes());
-            bytes.extend_from_slice(&payload);
-        }
         std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn v3_segments_are_rejected_as_unsupported_not_corrupt() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("_wal")).unwrap();
+        write_v3_segment(&dir.path().join("_wal/seg-000000.wal"));
+
+        let error = SharedWal::replay(dir.path()).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MongrelError::UnsupportedStorageVersion {
+                    component: "wal",
+                    found: 3,
+                    supported: 4,
+                }
+            ),
+            "expected UnsupportedStorageVersion, got {error:?}"
+        );
+
+        let dir = tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("_wal")).unwrap();
+        write_v3_segment(&dir.path().join("_wal/seg-000000.wal"));
+        let error = SharedWal::open(dir.path(), Epoch(1), None).unwrap_err();
+        assert!(matches!(
+            error,
+            MongrelError::UnsupportedStorageVersion {
+                component: "wal",
+                found: 3,
+                supported: 4,
+            }
+        ));
     }
 
     #[test]
@@ -2469,92 +2508,66 @@ mod shared_wal_tests {
     }
 
     #[test]
-    fn replay_rejects_duplicate_sequence_and_backward_commit_epoch() {
-        let duplicate = tempdir().unwrap();
-        std::fs::create_dir(duplicate.path().join("_wal")).unwrap();
-        write_legacy_segment(
-            &duplicate.path().join("_wal/seg-000000.wal"),
-            &[Record::new(
-                Epoch(7),
-                SYSTEM_TXN_ID,
-                Op::Flush {
-                    table_id: 1,
-                    flushed_epoch: 1,
-                },
-            )],
-        );
-        write_legacy_segment(
-            &duplicate.path().join("_wal/seg-000001.wal"),
-            &[Record::new(
-                Epoch(7),
-                SYSTEM_TXN_ID,
-                Op::Flush {
-                    table_id: 1,
-                    flushed_epoch: 2,
-                },
-            )],
-        );
-        assert!(matches!(
-            SharedWal::replay(duplicate.path()),
-            Err(MongrelError::CorruptWal { .. })
-        ));
+    fn replay_rejects_sequence_reset_across_segments() {
+        let dir = tempdir().unwrap();
+        let mut wal = SharedWal::create(dir.path(), Epoch(0)).unwrap();
+        wal.append_commit(1, Epoch(1), &[]).unwrap();
+        wal.group_sync().unwrap();
+        wal.rotate(1).unwrap();
+        // A session must never restart the sequence; simulate a writer bug
+        // that does and prove replay still rejects it.
+        wal.active.next_seq = 1;
+        wal.append_commit(2, Epoch(2), &[]).unwrap();
+        wal.group_sync().unwrap();
+        drop(wal);
 
-        let epochs = tempdir().unwrap();
-        std::fs::create_dir(epochs.path().join("_wal")).unwrap();
-        write_legacy_segment(
-            &epochs.path().join("_wal/seg-000000.wal"),
-            &[
-                Record::new(Epoch(1), 1, Op::CommitTimestamp { unix_nanos: 1 }),
-                Record::new(
-                    Epoch(2),
-                    1,
-                    Op::TxnCommit {
-                        epoch: 2,
-                        added_runs: Vec::new(),
-                    },
-                ),
-                Record::new(Epoch(3), 2, Op::CommitTimestamp { unix_nanos: 2 }),
-                Record::new(
-                    Epoch(4),
-                    2,
-                    Op::TxnCommit {
-                        epoch: 1,
-                        added_runs: Vec::new(),
-                    },
-                ),
-            ],
+        let error = SharedWal::replay(dir.path()).unwrap_err();
+        assert!(
+            matches!(error, MongrelError::CorruptWal { .. }),
+            "expected CorruptWal, got {error:?}"
         );
+    }
+
+    #[test]
+    fn replay_rejects_backward_commit_epoch() {
+        let dir = tempdir().unwrap();
+        let mut wal = SharedWal::create(dir.path(), Epoch(0)).unwrap();
+        wal.append_commit(1, Epoch(2), &[]).unwrap();
+        wal.append_commit(2, Epoch(1), &[]).unwrap();
+        wal.group_sync().unwrap();
+        drop(wal);
+
         assert!(matches!(
-            SharedWal::replay(epochs.path()),
+            SharedWal::replay(dir.path()),
             Err(MongrelError::CorruptWal { .. })
         ));
     }
 
     #[test]
-    fn legacy_v3_replays_then_migrates_to_chained_v4() {
+    fn multiple_sessions_continue_one_global_sequence() {
         let dir = tempdir().unwrap();
-        std::fs::create_dir(dir.path().join("_wal")).unwrap();
-        write_legacy_segment(
-            &dir.path().join("_wal/seg-000000.wal"),
-            &[
-                Record::new(Epoch(1), 1, Op::CommitTimestamp { unix_nanos: 1 }),
-                Record::new(
-                    Epoch(2),
-                    1,
-                    Op::TxnCommit {
-                        epoch: 1,
-                        added_runs: Vec::new(),
-                    },
-                ),
-            ],
-        );
-        assert_eq!(SharedWal::replay(dir.path()).unwrap().len(), 2);
-        let wal = SharedWal::open(dir.path(), Epoch(1), None).unwrap();
-        assert_eq!(wal.active_segment_no(), 1);
-        drop(wal);
-        assert_eq!(SharedWal::replay(dir.path()).unwrap().len(), 2);
-        let root = crate::durable_file::DurableRoot::open(dir.path()).unwrap();
-        assert_eq!(read_wal_head(&root, None).unwrap().unwrap().segment_no, 1);
+        for session in 0..3_u64 {
+            let mut wal = SharedWal::open(dir.path(), Epoch(session * 2), None).unwrap_or_else(
+                |_| SharedWal::create(dir.path(), Epoch(session * 2)).unwrap(),
+            );
+            assert_eq!(wal.active_segment_no(), session);
+            for i in 0..2_u64 {
+                let txn = session * 2 + i + 1;
+                wal.append_commit(txn, Epoch(txn), &[]).unwrap();
+            }
+            wal.group_sync().unwrap();
+            drop(wal);
+        }
+
+        let records = SharedWal::replay(dir.path()).unwrap();
+        let sequences: Vec<u64> = records.iter().map(|record| record.seq.0).collect();
+        assert_eq!(sequences, (1..=6).collect::<Vec<u64>>());
+
+        // A fourth session must start at highest durable sequence + 1.
+        let mut wal = SharedWal::open(dir.path(), Epoch(6), None).unwrap();
+        assert_eq!(wal.active_segment_no(), 3);
+        let seq = wal.append_commit(7, Epoch(7), &[]).unwrap();
+        assert_eq!(seq.0, 7);
     }
 
     #[test]
