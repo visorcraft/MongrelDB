@@ -1258,10 +1258,19 @@ impl RegisteredSqlQuery {
         match phase {
             SqlQueryPhase::Completed => Ok(()),
             SqlQueryPhase::Cancelled => Err(self.cancellation_error()),
-            other => Err(MongrelQueryError::InvalidQueryState(format!(
-                "query {} completed from terminal phase {other:?}",
-                self.id()
-            ))),
+            other => {
+                // A concurrent fail/serialization path may have terminalized the
+                // query while the control reason is already deadline/cancel.
+                // Prefer the structured control error over opaque InvalidQueryState
+                // (which the server maps to HTTP 500).
+                if self.query.control.is_cancelled() {
+                    return Err(self.cancellation_error());
+                }
+                Err(MongrelQueryError::InvalidQueryState(format!(
+                    "query {} completed from terminal phase {other:?}",
+                    self.id()
+                )))
+            }
         }
     }
 

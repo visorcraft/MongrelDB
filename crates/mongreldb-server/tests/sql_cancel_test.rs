@@ -739,9 +739,13 @@ async fn cancel_at_final_serialization_boundary_never_returns_clean_success() {
         assert_ne!(status["state"], "completed");
     }
 
+    // Hold the final page-serialization boundary past a modest deadline so the
+    // timeout is observed *at* that boundary. A 1ms budget is too racy under
+    // shared CI load (admission/planning alone can swallow the whole window and
+    // surface an unrelated 500).
     entry.session().set_test_hook(Some(Arc::new(|point| {
         if point == SqlTestHookPoint::AfterPageResponseSerialization {
-            std::thread::sleep(Duration::from_millis(25));
+            std::thread::sleep(Duration::from_millis(150));
         }
     })));
     let timeout_query_id = "25252525252525252525252525252525";
@@ -751,7 +755,7 @@ async fn cancel_at_final_serialization_boundary_never_returns_clean_success() {
         json!({
             "sql": "SELECT 1 AS value",
             "query_id": timeout_query_id,
-            "timeout_ms": 1,
+            "timeout_ms": 40,
             "pagination": { "page_size_rows": 1, "projection": ["value"] }
         }),
     );
@@ -759,10 +763,16 @@ async fn cancel_at_final_serialization_boundary_never_returns_clean_success() {
         .headers_mut()
         .insert("x-session-id", session_id.parse().unwrap());
     let timeout_response = app.clone().oneshot(timeout_request).await.unwrap();
-    assert_eq!(timeout_response.status(), StatusCode::GATEWAY_TIMEOUT);
+    let timeout_status = timeout_response.status();
+    let timeout_body = json_body(timeout_response).await;
     assert_eq!(
-        json_body(timeout_response).await["error"]["code"],
-        "DEADLINE_EXCEEDED"
+        timeout_status,
+        StatusCode::GATEWAY_TIMEOUT,
+        "expected deadline at page serialization boundary, body={timeout_body}"
+    );
+    assert_eq!(
+        timeout_body["error"]["code"], "DEADLINE_EXCEEDED",
+        "body={timeout_body}"
     );
 
     let barrier = Arc::new(Barrier::new(2));

@@ -2694,6 +2694,15 @@ async fn dispatch_paginated_sql(
             return tracked_query_error_response(state, &error, Some(query_id));
         }
         Ok(Err(ControlledPageSerializationError::Encoding)) => {
+            // Prefer sticky deadline/cancel over a generic 500 encoding fault.
+            // Under load, write failures can surface as encoding errors after
+            // the control has already expired.
+            if let Err(error) = output.query().checkpoint() {
+                state.sql_pages.discard(&retained);
+                output.fail();
+                state.metrics.inc_sql_errors();
+                return tracked_query_error_response(state, &error, Some(query_id));
+            }
             state.sql_pages.discard(&retained);
             output.fail_serialization();
             state.metrics.inc_sql_errors();
@@ -2706,6 +2715,12 @@ async fn dispatch_paginated_sql(
             );
         }
         Err(_) => {
+            if let Err(error) = output.query().checkpoint() {
+                state.sql_pages.discard(&retained);
+                output.fail();
+                state.metrics.inc_sql_errors();
+                return tracked_query_error_response(state, &error, Some(query_id));
+            }
             state.sql_pages.discard(&retained);
             output.fail_serialization();
             state.metrics.inc_sql_errors();
@@ -2723,6 +2738,9 @@ async fn dispatch_paginated_sql(
     }
     if let Err(error) = output.query().checkpoint() {
         state.sql_pages.discard(&retained);
+        // Terminalize so registry status matches the structured error (deadline
+        // finishes as Cancelled via fail() when the control is already cancelled).
+        output.fail();
         state.metrics.inc_sql_errors();
         return tracked_query_error_response(state, &error, Some(query_id));
     }
@@ -2928,13 +2946,13 @@ fn serialize_sql_page_controlled(
         query,
     };
     if let Err(error) = serde_json::to_writer(&mut writer, &value) {
-        return match query.checkpoint() {
-            Err(error) => Err(ControlledPageSerializationError::Query(error)),
-            Ok(()) => {
-                let _ = error;
-                Err(ControlledPageSerializationError::Encoding)
-            }
-        };
+        // Always re-check control: deadline/cancel during Write must not be
+        // collapsed into a generic encoding 500.
+        if let Err(query_error) = query.checkpoint() {
+            return Err(ControlledPageSerializationError::Query(query_error));
+        }
+        let _ = error;
+        return Err(ControlledPageSerializationError::Encoding);
     }
     query
         .checkpoint()
@@ -6283,16 +6301,28 @@ async fn continue_sql_page(
                     query.fail();
                     tracked_query_error_response(&state, &error, Some(query_id))
                 }
-                Ok(Err(ControlledPageSerializationError::Encoding)) => fail(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "SERIALIZATION_FAILED",
-                    "failed to serialize SQL continuation page",
-                ),
-                Err(_) => fail(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "SERIALIZATION_WORKER_FAILED",
-                    "SQL continuation serialization worker failed",
-                ),
+                Ok(Err(ControlledPageSerializationError::Encoding)) => {
+                    if let Err(error) = query.checkpoint() {
+                        query.fail();
+                        return tracked_query_error_response(&state, &error, Some(query_id));
+                    }
+                    fail(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "SERIALIZATION_FAILED",
+                        "failed to serialize SQL continuation page",
+                    )
+                }
+                Err(_) => {
+                    if let Err(error) = query.checkpoint() {
+                        query.fail();
+                        return tracked_query_error_response(&state, &error, Some(query_id));
+                    }
+                    fail(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "SERIALIZATION_WORKER_FAILED",
+                        "SQL continuation serialization worker failed",
+                    )
+                }
             }
         }
         Err(sql_pages::CursorError::Cancelled) => {
