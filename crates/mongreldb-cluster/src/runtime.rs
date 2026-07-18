@@ -30,11 +30,11 @@
 //! # Engine binding of tablet groups
 //!
 //! The consensus engine sink binds each group to a `ClusterReplica` storage
-//! core keyed by `(cluster_id, node_id, database_id)`. Resolution order
-//! ([`resolve_tablet_database_id`]): descriptor-carried `database_id` (meta
-//! publish), live meta `table_id → database_id` when this node is a meta
-//! member, else a deterministic raft-group-derived id for legacy pre-metadata
-//! tablets (stable across restarts and identical on every replica).
+//! core keyed by `(cluster_id, node_id, database_id)`. Resolution
+//! ([`resolve_tablet_database_id`]): non-zero descriptor-carried
+//! `database_id` when stamped into tablet metadata, else a deterministic
+//! raft-group-derived id — stable across restarts and identical on every
+//! replica without consulting meta (non-meta nodes must not diverge).
 //!
 //! # Split/merge integration (spec sections 12.5-12.6)
 //!
@@ -264,27 +264,17 @@ pub struct RuntimeStatus {
     pub tablets: Vec<TabletGroupStatus>,
 }
 
-/// Resolve the engine sink's database binding for a tablet.
+/// Engine-sink database id for a tablet group.
 ///
-/// Order: (1) descriptor-carried `database_id` when non-zero (meta-published),
-/// (2) live meta table→database lookup when this node hosts meta, (3)
-/// deterministic raft-group-derived id only for legacy descriptors that predate
-/// the field (stable across restarts and identical on every replica).
-fn resolve_tablet_database_id(
-    descriptor: &crate::tablet::TabletDescriptor,
-    meta_state: Option<&crate::meta::MetaState>,
-) -> DatabaseId {
+/// Order: (1) non-zero `descriptor.database_id` when the publisher stamped it
+/// into tablet metadata (identical on every replica), (2) deterministic
+/// derivation from the raft group id — stable across restarts and **identical
+/// on every replica without consulting meta** (meta is not available on all
+/// nodes; live table→database lookup would diverge engine identities).
+fn resolve_tablet_database_id(descriptor: &crate::tablet::TabletDescriptor) -> DatabaseId {
     if descriptor.database_id != DatabaseId::ZERO {
         return descriptor.database_id;
     }
-    if let Some(state) = meta_state {
-        if let Some(table) = state.table(descriptor.table_id) {
-            if table.database_id != DatabaseId::ZERO {
-                return table.database_id;
-            }
-        }
-    }
-    // Legacy fallback: raft-group-derived id (pre-metadata tablets).
     DatabaseId::from_bytes(*descriptor.raft_group_id.as_bytes())
 }
 
@@ -851,8 +841,6 @@ struct TabletOpenContext<'a> {
     timing: Option<GroupTiming>,
     identity: &'a NodeIdentity,
     peers: &'a BTreeMap<NodeId, String>,
-    /// Snapshot of meta state when available (table→database resolution).
-    meta_state: Option<crate::meta::MetaState>,
 }
 
 /// A running cluster node: identity, transport, meta group, and tablet
@@ -972,7 +960,6 @@ impl NodeRuntime {
             timing: config.timing,
             identity,
             peers,
-            meta_state: None,
         };
         for (tablet_id, raft_group_id) in scan_tablet_layouts(&config.node_data)? {
             let layout = TabletLayout::new(config.node_data.clone(), tablet_id, raft_group_id);
@@ -1023,7 +1010,7 @@ impl NodeRuntime {
             );
         }
         let ownership = TabletOwnershipRegistry::global().try_reserve(layout)?;
-        let database_id = resolve_tablet_database_id(descriptor, context.meta_state.as_ref());
+        let database_id = resolve_tablet_database_id(descriptor);
         let engine_config = EngineGroupConfig::new(
             context.node_data.to_path_buf(),
             descriptor.raft_group_id,
@@ -1205,7 +1192,6 @@ impl NodeRuntime {
             timing: self.timing,
             identity: &self.identity,
             peers: &self.peers,
-            meta_state: self.meta.as_ref().map(|m| m.state()),
         };
         let group =
             Self::open_tablet_group(&context, self.transport.clone(), &layout, descriptor).await?;

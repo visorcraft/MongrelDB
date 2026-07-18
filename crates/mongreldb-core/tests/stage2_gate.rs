@@ -832,30 +832,24 @@ fn ai_and_sql_results_match_standalone_at_the_same_snapshot() {
         NativeAggResult::Int(60),
         NativeAggResult::Float(35.0),
     ];
-    // A replica's applied state is overlay-only this wave — replicated
-    // spilled-run commits fail closed until Stage 2C spill translation, and
-    // a read-only replica table cannot even flush — so the
-    // `aggregate_native` fast path (which requires a sorted run) declines
-    // and the SQL layer serves aggregates from its scan fallback.
+    // Replicas remain read-only (no local flush); applied rows live in the
+    // overlay. `aggregate_native` still answers via the visible-row fallback
+    // when there is no sorted run — same results as the scan-side plan.
     assert!(matches!(
         replica.table("items").unwrap().lock().flush(),
         Err(MongrelError::ReadOnlyReplica)
     ));
-    assert_eq!(
-        native_aggregates(&replica, watermark),
-        vec![None, None, None, None, None]
-    );
-    // On the standalone engine the memtable drains into a sorted run on
-    // flush and the native pushdown serves exactly the values the replica's
-    // scan fallback computes over the same snapshot.
+    let expected_native: Vec<Option<NativeAggResult>> = expected_aggregates
+        .iter()
+        .cloned()
+        .map(Some)
+        .collect();
+    assert_eq!(native_aggregates(&replica, watermark), expected_native);
+    // Standalone after flush uses the sorted-run pushdown path.
     standalone.table("items").unwrap().lock().flush().unwrap();
     assert_eq!(
         native_aggregates(&standalone, watermark),
-        expected_aggregates
-            .iter()
-            .cloned()
-            .map(Some)
-            .collect::<Vec<_>>()
+        expected_native
     );
     assert_eq!(
         fallback_aggregates(&replica, watermark),

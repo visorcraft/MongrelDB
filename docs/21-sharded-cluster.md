@@ -289,10 +289,10 @@ occupies). Shutdown drains the listener first, then stops every group
 (fsync, raft stop), then releases the tablet ownership guards.
 
 Each tablet group binds a `ClusterReplica` core. Database id resolution
-order (`resolve_tablet_database_id`): non-zero `TabletDescriptor.database_id`
-from meta publish, else live meta `table_id → database_id`, else a
-deterministic raft-group-derived id for legacy pre-metadata tablets
-(stable across restarts and identical on every replica).
+(`resolve_tablet_database_id`): non-zero `TabletDescriptor.database_id` when
+the publisher stamped it into tablet metadata, else a deterministic
+raft-group-derived id (stable across restarts and identical on every
+replica without consulting meta — non-meta nodes would otherwise diverge).
 
 ## Tablet split and merge (spec §12.5/§12.6)
 
