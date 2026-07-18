@@ -338,8 +338,8 @@ static void test_authenticated_native_reads(void) {
 int main(void) {
     char *build_info = mongreldb_build_info();
     assert(build_info != NULL);
-    assert(strstr(build_info, "\"engine_version\":\"0.60.2\"") != NULL);
-    assert(strstr(build_info, "\"query_version\":\"0.60.2\"") != NULL);
+    assert(strstr(build_info, "\"engine_version\":\"0.60.3\"") != NULL);
+    assert(strstr(build_info, "\"query_version\":\"0.60.3\"") != NULL);
     mongreldb_free_string(build_info);
 
     /* ── Database lifecycle ──────────────────────────────────────────── */

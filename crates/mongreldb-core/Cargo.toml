@@ -29,9 +29,9 @@ regex = "1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 # First-party Stage 0 foundation crates (see docs/architecture/adr/).
-mongreldb-types = { path = "../mongreldb-types", version = "0.60.2" }
-mongreldb-log = { path = "../mongreldb-log", version = "0.60.2" }
-mongreldb-fault = { path = "../mongreldb-fault", version = "0.60.2" }
+mongreldb-types = { path = "../mongreldb-types", version = "0.60.3" }
+mongreldb-log = { path = "../mongreldb-log", version = "0.60.3" }
+mongreldb-fault = { path = "../mongreldb-fault", version = "0.60.3" }
 
 # Page-level AES-256-GCM encryption and the key hierarchy
 # (Argon2id + HKDF KEK -> wrapped per-file DEK). Always required.
@@ -47,6 +47,14 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 
 [target.'cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple", target_os = "redox"))'.dependencies]
 rustix = { version = "1.1", features = ["fs"] }
+
+[features]
+default = []
+# No-op compatibility shim. Crypto (aes-gcm/hkdf/hmac) is always linked; this
+# exists only so published dependents that still request
+# `features = ["encryption"]` keep resolving after the feature stopped gating
+# optional deps.
+encryption = []
 
 [dev-dependencies]
 tempfile = "3"
