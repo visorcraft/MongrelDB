@@ -4345,6 +4345,72 @@ impl Database {
         )
     }
 
+    /// Run a hybrid scored search over only rows authorized for this database
+    /// handle. Applies retriever column grants, RLS, and masks to the returned
+    /// hits.
+    pub fn search_for_current_principal(
+        &self,
+        table_name: &str,
+        request: &crate::query::SearchRequest,
+    ) -> Result<Vec<crate::query::SearchHit>> {
+        let mut columns = crate::query::condition_columns(&request.must);
+        for named in &request.retrievers {
+            columns.push(named.retriever.column_id());
+        }
+        if let Some(crate::query::Rerank::ExactVector { embedding_column, .. }) = &request.rerank {
+            columns.push(*embedding_column);
+        }
+        if let Some(proj) = &request.projection {
+            columns.extend(proj);
+        }
+        columns.sort_unstable();
+        columns.dedup();
+        self.with_authorized_scored_read_context_at(
+            table_name,
+            None,
+            true,
+            Some(&ReadAuthorization {
+                operation: crate::auth::ColumnOperation::Select,
+                columns: columns.clone(),
+                permissions: Vec::new(),
+            }),
+            None,
+            None,
+            |table, snapshot, authorization, principal| {
+                self.require_columns_for(
+                    table_name,
+                    crate::auth::ColumnOperation::Select,
+                    &columns,
+                    principal,
+                )?;
+                let hits = table.search_at_with_candidate_authorization_on_generation(
+                    request,
+                    snapshot,
+                    authorization,
+                    None,
+                )?;
+                let allowed_columns = self.select_column_ids_for(table_name, principal)?;
+                let mut secured: Vec<crate::query::SearchHit> = Vec::with_capacity(hits.len());
+                for mut hit in hits {
+                    let row = crate::memtable::Row {
+                        row_id: hit.row_id,
+                        committed_epoch: crate::Epoch(0),
+                        columns: hit.cells.iter().cloned().collect::<std::collections::HashMap<u16, crate::Value>>(),
+                        deleted: false,
+                    };
+                    let mut rows = self.secure_rows_for(table_name, vec![row], principal)?;
+                    if let Some(mut row) = rows.pop() {
+                        row.columns.retain(|column, _| allowed_columns.contains(column));
+                        hit.cells = row.columns.into_iter().collect::<Vec<_>>();
+                        hit.cells.sort_by_key(|(column, _)| *column);
+                        secured.push(hit);
+                    }
+                }
+                Ok(secured)
+            },
+        )
+    }
+
     /// Capture one table snapshot and the security version used to authorize it.
     /// The caller must validate the returned version before publishing results.
     pub fn authorized_read_snapshot(

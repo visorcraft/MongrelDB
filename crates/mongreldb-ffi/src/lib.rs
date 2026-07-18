@@ -53,6 +53,7 @@ pub mod error;
 pub mod migrate;
 pub mod query;
 pub mod schema;
+pub mod search;
 pub mod sql;
 pub mod table;
 pub mod transaction;
@@ -123,6 +124,11 @@ pub use table::{
     mongreldb_table_free, mongreldb_table_put, mongreldb_table_put_batch, mongreldb_table_query,
 };
 
+// Hybrid search request.
+pub use search::{
+    mongreldb_search_request_begin, mongreldb_search_request_free, mongreldb_table_search,
+};
+
 // Transaction (staging buffer).
 pub use transaction::{
     mongreldb_begin, mongreldb_txn_commit, mongreldb_txn_delete, mongreldb_txn_delete_by_pk,
@@ -151,6 +157,11 @@ pub use table::{
     mongreldb_ann_rerank_hit, mongreldb_ann_rerank_result_t, mongreldb_cell, mongreldb_cell_input,
     mongreldb_cell_input_array, mongreldb_cell_slice, mongreldb_result_t, mongreldb_row,
     mongreldb_row_input_array, mongreldb_table_t, mongreldb_vector_metric,
+};
+pub use search::{
+    mongreldb_fusion, mongreldb_fusion_kind, mongreldb_projection, mongreldb_retriever,
+    mongreldb_retriever_array, mongreldb_retriever_kind, mongreldb_rerank, mongreldb_search_metric,
+    mongreldb_search_request, mongreldb_search_request_t,
 };
 pub use transaction::mongreldb_transaction_t;
 pub use value::{
