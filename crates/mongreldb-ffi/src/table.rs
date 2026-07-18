@@ -101,7 +101,7 @@ impl FFITable {
 ///
 /// # Safety
 /// `handle` must be null or a valid table handle.
-unsafe fn as_table(handle: mongreldb_table_t) -> Option<&'static FFITable> {
+pub(crate) unsafe fn as_table(handle: mongreldb_table_t) -> Option<&'static FFITable> {
     if handle.is_null() {
         set_error_msg(ErrorCode::InvalidArgument, "table handle is null");
         return None;
@@ -161,7 +161,7 @@ unsafe fn as_ann_rerank_result(
 
 /// Marshal a core row into a `Vec<(u16, Value)>` in schema column order,
 /// filling absent cells with `Value::Null`. Mirrors the NAPI `row_to_js_table`.
-fn row_to_cells(
+pub(crate) fn row_to_cells(
     schema: &Schema,
     columns: &std::collections::HashMap<u16, Value>,
 ) -> Vec<(u16, Value)> {
