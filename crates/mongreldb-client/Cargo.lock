@@ -2423,7 +2423,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-client"
-version = "0.59.1"
+version = "0.60.0"
 dependencies = [
  "arrow",
  "base64",
@@ -2441,7 +2441,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-core"
-version = "0.59.1"
+version = "0.60.0"
 dependencies = [
  "aes-gcm",
  "arc-swap",
@@ -2456,6 +2456,9 @@ dependencies = [
  "hmac",
  "lz4_flex 0.11.6",
  "memmap2",
+ "mongreldb-fault",
+ "mongreldb-log",
+ "mongreldb-types",
  "parking_lot",
  "rayon",
  "regex",
@@ -2473,8 +2476,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "mongreldb-fault"
+version = "0.60.0"
+dependencies = [
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "mongreldb-log"
+version = "0.60.0"
+dependencies = [
+ "mongreldb-types",
+ "serde",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "mongreldb-query"
-version = "0.59.1"
+version = "0.60.0"
 dependencies = [
  "aes-gcm",
  "arrow",
@@ -2486,6 +2506,7 @@ dependencies = [
  "futures",
  "getrandom 0.2.17",
  "mongreldb-core",
+ "mongreldb-types",
  "parking_lot",
  "regex",
  "serde",
@@ -2495,6 +2516,15 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+]
+
+[[package]]
+name = "mongreldb-types"
+version = "0.60.0"
+dependencies = [
+ "getrandom 0.2.17",
+ "serde",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
