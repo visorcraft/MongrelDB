@@ -1115,6 +1115,13 @@ fn load_progress(lower_layout: &TabletLayout) -> Result<Option<MergeProgress>, M
     Ok(Some(progress))
 }
 
+/// Reads the persisted merge progress of the *lower* source tablet, if any
+/// (the node runtime's resume probe). Same fail-closed verification as
+/// [`MergeExecutor::resume`].
+pub fn merge_progress(lower_layout: &TabletLayout) -> Result<Option<MergeProgress>, MergeError> {
+    load_progress(lower_layout)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

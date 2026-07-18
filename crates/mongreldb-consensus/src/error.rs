@@ -31,6 +31,11 @@ pub enum ConsensusError {
     /// The operation's deadline expired.
     #[error("deadline exceeded")]
     DeadlineExceeded,
+    /// Another membership change is still in flight (openraft serializes
+    /// membership changes). Transient: retry once the in-flight change has
+    /// committed and finalized.
+    #[error("another membership change is still in flight")]
+    MembershipInProgress,
     /// The leader's HLC clock could not stamp a commit timestamp.
     #[error("commit timestamp clock failure: {0}")]
     Clock(String),

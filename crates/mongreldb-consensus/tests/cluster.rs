@@ -1023,8 +1023,13 @@ async fn consistent_read_bounded_staleness_and_eventual() {
         .unwrap();
     assert_eq!(watermark.position.index, first);
 
-    // Partition the follower and commit more: its applied timestamp is now
-    // outside a zero window.
+    // Partition the follower and commit more. Bounded staleness measures
+    // *known missing data*, not wall-clock age (review m9): the partitioned
+    // follower applied every entry its local log holds, so it reads as fresh
+    // — without leader contact it cannot know its log is stale. This is the
+    // documented best-effort caveat; Linearizable and ReadYourWrites carry
+    // the hard guarantees. (The StalenessExceeded decision itself is covered
+    // by focused unit tests in `read.rs` and the pristine-node case below.)
     cluster.transport.partition(&[follower], &[leader, other]);
     for seq in 2..=4u64 {
         cluster
@@ -1037,21 +1042,26 @@ async fn consistent_read_bounded_staleness_and_eventual() {
             .await
             .unwrap();
     }
-    let err = cluster
+    let watermark = cluster
         .group(follower)
         .consistent_read(
             &ReadConsistency::BoundedStaleness { max_lag_ms: 0 },
             &ExecutionControl::default(),
         )
         .await
-        .unwrap_err();
-    match err {
-        ReadConsistencyError::StalenessExceeded { max_lag_ms, lag_ms } => {
-            assert_eq!(max_lag_ms, 0);
-            assert!(lag_ms > 0);
-        }
-        other => panic!("expected StalenessExceeded, got {other:?}"),
-    }
+        .unwrap();
+    assert_eq!(watermark.position.index, first);
+    // The connected replica is fresh too (it applied the new entries).
+    let other_last = cluster.group(leader).metrics().last_log_index.unwrap();
+    cluster.wait_applied(other, other_last).await;
+    cluster
+        .group(other)
+        .consistent_read(
+            &ReadConsistency::BoundedStaleness { max_lag_ms: 0 },
+            &ExecutionControl::default(),
+        )
+        .await
+        .unwrap();
 
     // Eventual reads serve the stale local watermark immediately, even on
     // the partitioned follower.

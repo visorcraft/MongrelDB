@@ -18,6 +18,19 @@
 //! used only for planned failover and rolling upgrade (ADR-0010), never
 //! required for correctness.
 
+//! # Commit-timestamp monotonicity (spec section 8.2)
+//!
+//! The leader stamps every proposal's `commit_ts` from the group HLC clock
+//! as `next_after(max(local now, commit floor))`. The floor is the persisted
+//! last-applied commit timestamp (surviving restarts) raised by any command
+//! timestamp in the unapplied local log tail (covering entries a previous
+//! leader committed that this node applies *before* its own proposals), and
+//! the state machine observes every applied or snapshot-installed commit
+//! timestamp into the same clock. Commit timestamps therefore never regress
+//! in log order across leader failover, clock steps backward, or restarts,
+//! and timestamp-based read barriers (`ReadConsistency::Snapshot`) stay
+//! satisfiable on the new leader.
+
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -35,16 +48,28 @@ use crate::identity::{
 };
 use crate::network::{RaftTransport, TransportNetworkFactory};
 use crate::read::{ReadConsistency, ReadConsistencyError, ReadWatermark};
-use crate::state_machine::{ApplySink, MongrelStateMachine, SharedStateMachine};
+use crate::state_machine::{ApplySink, CommitTsObserver, MongrelStateMachine, SharedStateMachine};
 use crate::storage::{LeaderDiskDrop, MongrelLogStore, SharedLog, StorageConfig};
 use mongreldb_log::commit_log::{ExecutionControl, LogPosition};
 use mongreldb_log::envelope::CommandEnvelope;
-use mongreldb_types::hlc::{HlcClock, HlcTimestamp};
+use mongreldb_types::hlc::{HlcClock, HlcTimestamp, WallClockSource};
 
 pub use openraft::ServerState as RaftServerState;
 
+/// Wall clock in microseconds since the Unix epoch (the group HLC clock's
+/// default time source; mirrors `HlcClock::new`'s).
+fn system_time_micros() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros())
+            .unwrap_or(0),
+    )
+    .unwrap_or(u64::MAX)
+}
+
 /// Static configuration of one consensus group member.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GroupConfig {
     /// Cluster name carried by openraft metrics/logging (the raft group id
     /// text form for MongrelDB groups).
@@ -74,6 +99,36 @@ pub struct GroupConfig {
     pub idempotency_retention: usize,
     /// Maximum tolerated HLC clock skew for commit-timestamp stamping.
     pub hlc_max_skew: Duration,
+    /// Wall-clock source for the group HLC clock; `None` reads the system
+    /// clock. Tests inject controlled time to exercise clock regressions.
+    pub hlc_time_source: Option<WallClockSource>,
+}
+
+impl std::fmt::Debug for GroupConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GroupConfig")
+            .field("cluster_name", &self.cluster_name)
+            .field("node_id", &self.node_id)
+            .field("dir", &self.dir)
+            .field("heartbeat_interval", &self.heartbeat_interval)
+            .field("election_timeout_min", &self.election_timeout_min)
+            .field("election_timeout_max", &self.election_timeout_max)
+            .field("install_snapshot_timeout", &self.install_snapshot_timeout)
+            .field("snapshot_policy_logs", &self.snapshot_policy_logs)
+            .field(
+                "max_in_snapshot_log_to_keep",
+                &self.max_in_snapshot_log_to_keep,
+            )
+            .field("replication_lag_threshold", &self.replication_lag_threshold)
+            .field("storage", &self.storage)
+            .field("idempotency_retention", &self.idempotency_retention)
+            .field("hlc_max_skew", &self.hlc_max_skew)
+            .field(
+                "hlc_time_source",
+                &self.hlc_time_source.as_ref().map(|_| "<injected>"),
+            )
+            .finish()
+    }
 }
 
 impl GroupConfig {
@@ -93,6 +148,7 @@ impl GroupConfig {
             storage: StorageConfig::default(),
             idempotency_retention: crate::state_machine::DEFAULT_IDEMPOTENCY_RETENTION,
             hlc_max_skew: Duration::from_millis(500),
+            hlc_time_source: None,
         }
     }
 
@@ -201,7 +257,9 @@ pub struct ConsensusGroup<T: RaftTransport> {
     transport: Arc<T>,
     shared_log: SharedLog,
     sm: SharedStateMachine,
-    hlc: HlcClock,
+    /// The group commit-timestamp clock; shared with the state machine so
+    /// every applied commit timestamp advances it (spec section 8.2).
+    hlc: Arc<HlcClock>,
     closed: AtomicBool,
 }
 
@@ -214,10 +272,40 @@ impl<T: RaftTransport> ConsensusGroup<T> {
         transport: Arc<T>,
         sink: Arc<std::sync::Mutex<dyn ApplySink>>,
     ) -> Result<Self, ConsensusError> {
+        let wall: WallClockSource = match &config.hlc_time_source {
+            Some(source) => source.clone(),
+            None => Arc::new(system_time_micros),
+        };
+        let hlc = Arc::new(HlcClock::with_time_source(
+            config.node_id as u32,
+            config.hlc_max_skew,
+            wall.clone(),
+        ));
+        // The apply path advances the group clock past every applied commit
+        // timestamp (spec section 8.2; review M1). Only timestamps ahead of
+        // the local wall are observed: a stale replicated entry reflects
+        // replication latency, not clock skew, and any future stamp exceeds
+        // it already — feeding it to `observe` would only poison the skew
+        // high-water with ordinary apply lag (the skew guard stays reserved
+        // for genuinely future-dated stamps). A rejected observation still
+        // folds into the clock's high-water skew, keeping allocation
+        // fail-closed; the apply stream itself never fails on observation.
+        let commit_ts_observer: CommitTsObserver = {
+            let hlc = hlc.clone();
+            Arc::new(move |commit_ts: HlcTimestamp| {
+                if commit_ts.physical_micros > wall() {
+                    let _ = hlc.observe(commit_ts);
+                }
+            })
+        };
         let log_store = MongrelLogStore::open(&config.dir, config.storage.clone())?;
         let shared_log = log_store.shared_log();
-        let state_machine =
-            MongrelStateMachine::open(&config.dir, sink, config.idempotency_retention)?;
+        let state_machine = MongrelStateMachine::open_with_clock(
+            &config.dir,
+            sink,
+            config.idempotency_retention,
+            Some(commit_ts_observer),
+        )?;
         let sm = state_machine.shared();
         let raft_config = config.openraft_config()?;
         let factory = TransportNetworkFactory::new(transport.clone(), config.node_id);
@@ -232,7 +320,7 @@ impl<T: RaftTransport> ConsensusGroup<T> {
         .map_err(|e| ConsensusError::Raft(e.to_string()))?;
         transport.attach(config.node_id, raft.clone());
         Ok(ConsensusGroup {
-            hlc: HlcClock::new(config.node_id as u32, config.hlc_max_skew),
+            hlc,
             config,
             raft,
             transport,
@@ -319,10 +407,63 @@ impl<T: RaftTransport> ConsensusGroup<T> {
         })
     }
 
+    /// Stamps the commit timestamp for a new proposal (spec section 8.2):
+    /// `next_after(max(local now, commit floor))`, so the leader never stamps
+    /// at or below a commit timestamp it already knows — across failovers,
+    /// backward clock steps, and restarts. The skew guard (`HlcClock::now`)
+    /// still gates allocation; the floor only ever raises the result.
+    fn stamp_commit_ts(&self) -> Result<HlcTimestamp, ConsensusError> {
+        let floor = self.commit_ts_floor()?;
+        let now = self
+            .hlc
+            .now()
+            .map_err(|e| ConsensusError::Clock(e.to_string()))?;
+        Ok(match floor {
+            Some(floor) if floor >= now => self.hlc.next_after(floor),
+            _ => now,
+        })
+    }
+
+    /// The highest commit timestamp a new stamp must exceed: the persisted
+    /// last-applied commit timestamp (the durable floor, surviving restarts),
+    /// raised by any command timestamp in the local log above the applied
+    /// index. The tail covers entries a previous leader replicated (and
+    /// possibly quorum-committed) that this node applies *before* its own
+    /// proposals: without it, a freshly elected leader whose apply lags
+    /// could stamp below such an entry and regress the applied watermark in
+    /// log order (review M1). Keeping every stamp above the whole local log
+    /// is also the inductive step that keeps log-order commit timestamps
+    /// monotonic cluster-wide.
+    fn commit_ts_floor(&self) -> Result<Option<HlcTimestamp>, ConsensusError> {
+        let record = self.sm.applied_record()?;
+        let mut floor = record.last_applied_commit_ts;
+        let applied_index = record
+            .last_applied
+            .as_ref()
+            .map_or(0, |log_id| log_id.index);
+        let last_log_index = self.raft.metrics().borrow().last_log_index.unwrap_or(0);
+        if last_log_index > applied_index {
+            let span = usize::try_from(last_log_index - applied_index).unwrap_or(usize::MAX);
+            let tail = self
+                .shared_log
+                .read_entries(applied_index + 1, last_log_index + 1, span)?;
+            for entry in &tail {
+                if let openraft::EntryPayload::Normal(command) = &entry.payload {
+                    if let Some(commit_ts) = command.commit_ts() {
+                        floor = Some(floor.map_or(commit_ts, |known| known.max(commit_ts)));
+                    }
+                }
+            }
+        }
+        Ok(floor)
+    }
+
     /// Proposes one command and waits until it is committed and applied
     /// (quorum durability; spec section 11.3). The leader stamps the commit
     /// timestamp from the group HLC clock before replication so every replica
-    /// applies the identical value.
+    /// applies the identical value; the stamp is never below the commit
+    /// floor (see [`Self::commit_ts_floor`]), keeping commit timestamps
+    /// monotonic across leader failover (spec section 8.2).
     pub async fn propose(
         &self,
         kind: CommandKind,
@@ -332,10 +473,7 @@ impl<T: RaftTransport> ConsensusGroup<T> {
         self.ensure_open()?;
         self.check_control(control)?;
         envelope.verify()?;
-        let commit_ts = self
-            .hlc
-            .now()
-            .map_err(|e| ConsensusError::Clock(e.to_string()))?;
+        let commit_ts = self.stamp_commit_ts()?;
         let command_id = envelope.command_id;
         let command = ReplicatedCommand::new(kind, envelope, commit_ts);
 
@@ -401,10 +539,7 @@ impl<T: RaftTransport> ConsensusGroup<T> {
         self.ensure_open()?;
         self.check_control(control)?;
         envelope.verify()?;
-        let commit_ts = self
-            .hlc
-            .now()
-            .map_err(|e| ConsensusError::Clock(e.to_string()))?;
+        let commit_ts = self.stamp_commit_ts()?;
         let command_id = envelope.command_id;
         let command = ReplicatedCommand::new(kind, envelope, commit_ts);
 
@@ -567,7 +702,15 @@ impl<T: RaftTransport> ConsensusGroup<T> {
                 .await
             }
             // Serve at the requested timestamp once the applied watermark
-            // covers it, waiting bounded by the caller's control.
+            // covers it. The watermark is monotonic in apply order (leaders
+            // stamp above the commit floor and the state machine observes
+            // every applied commit timestamp into the group clock — review
+            // M1), so a satisfiable barrier stays satisfiable across leader
+            // failover. The wait is caller-bounded: `control` firing maps to
+            // `ReadConsistencyError::DeadlineExceeded`/`Cancelled`, which is
+            // also the answer for a timestamp no committed entry will ever
+            // cover (e.g. one from a truncated LeaderDisk write) — callers
+            // must always set a deadline.
             ReadConsistency::Snapshot { timestamp } => loop {
                 let watermark = self.read_watermark()?;
                 if watermark
@@ -580,26 +723,25 @@ impl<T: RaftTransport> ConsensusGroup<T> {
                     .map_err(ReadConsistencyError::from)?;
                 tokio::time::sleep(BARRIER_POLL_INTERVAL).await;
             },
-            // Serve only if the applied commit timestamp is within the
-            // requested lag of the node's HLC now; the caller picks another
-            // replica on StalenessExceeded.
+            // Serve only if the replica is fresh (review m9; see
+            // `read::evaluate_bounded_staleness` for the exact rule and the
+            // best-effort caveat). The clock is only consulted when the
+            // replica is behind, so skew fail-closed cannot refuse a
+            // caught-up read.
             ReadConsistency::BoundedStaleness { max_lag_ms } => {
                 let watermark = self.read_watermark()?;
-                let now = self
-                    .hlc
-                    .now()
-                    .map_err(|e| ReadConsistencyError::Clock(e.to_string()))?;
-                let lag_ms = watermark.commit_ts.map_or(u64::MAX, |applied| {
-                    now.physical_micros.saturating_sub(applied.physical_micros) / 1_000
-                });
-                if lag_ms <= *max_lag_ms {
-                    Ok(watermark)
-                } else {
-                    Err(ReadConsistencyError::StalenessExceeded {
-                        max_lag_ms: *max_lag_ms,
-                        lag_ms,
-                    })
-                }
+                let last_known_index = self.raft.metrics().borrow().last_log_index;
+                crate::read::evaluate_bounded_staleness(
+                    &watermark,
+                    last_known_index,
+                    || {
+                        self.hlc
+                            .now()
+                            .map_err(|e| ReadConsistencyError::Clock(e.to_string()))
+                    },
+                    *max_lag_ms,
+                )?;
+                Ok(watermark)
             }
             ReadConsistency::Eventual => self.read_watermark(),
         }
@@ -763,6 +905,49 @@ impl<T: RaftTransport> ConsensusGroup<T> {
         )
     }
 
+    /// Whether the group's committed membership is a joint (in-transition)
+    /// config.
+    pub fn is_joint_membership(&self) -> bool {
+        let metrics_rx = self.raft.metrics();
+        let metrics = metrics_rx.borrow();
+        metrics
+            .membership_config
+            .membership()
+            .get_joint_config()
+            .len()
+            > 1
+    }
+
+    /// Waits until a committed membership exists and is uniform (no in-flight
+    /// membership change). Membership changes are serialized — openraft
+    /// rejects a second one while another is in flight, including the initial
+    /// bootstrap change before it commits — so a caller racing an in-flight
+    /// change must wait it out rather than retry immediately.
+    pub async fn wait_uniform_membership(&self, timeout: Duration) -> Result<(), ConsensusError> {
+        self.ensure_open()?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            {
+                let metrics_rx = self.raft.metrics();
+                let metrics = metrics_rx.borrow();
+                let settled = metrics.membership_config.log_id().is_some()
+                    && metrics
+                        .membership_config
+                        .membership()
+                        .get_joint_config()
+                        .len()
+                        == 1;
+                if settled {
+                    return Ok(());
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(ConsensusError::DeadlineExceeded);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     /// Best-effort leadership transfer to `target` (see module docs).
     pub async fn transfer_leader(
         &self,
@@ -891,7 +1076,12 @@ fn map_client_write_api_error(err: ClientWriteError<RaftNodeId, BasicNode>) -> C
         ClientWriteError::ForwardToLeader(forward) => ConsensusError::NotLeader {
             leader: forward.leader_id,
         },
-        ClientWriteError::ChangeMembershipError(e) => ConsensusError::InvalidRequest(e.to_string()),
+        ClientWriteError::ChangeMembershipError(e) => match e {
+            openraft::error::ChangeMembershipError::InProgress(_) => {
+                ConsensusError::MembershipInProgress
+            }
+            other => ConsensusError::InvalidRequest(other.to_string()),
+        },
     }
 }
 

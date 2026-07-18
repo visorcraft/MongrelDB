@@ -29,6 +29,16 @@
 //! continues from the persisted phase; completing (or aborting) the split
 //! removes the record with the source directory's teardown.
 //!
+//! # Abort
+//!
+//! [`abort_split`] unwinds a split that has not yet published: the
+//! never-routable children are removed from the meta plane and torn down,
+//! the source is republished `Active` through the state graph's documented
+//! `Splitting -> Active` rollback edge, and the progress record is cleared.
+//! Every step is idempotent, so a crash mid-abort re-enters safely. Once the
+//! atomic publication has landed the split cannot abort — rolling back
+//! would double-serve the keyspace — and the driver fails closed.
+//!
 //! Fault hooks (registered in the `mongreldb-fault` catalog):
 //!
 //! - `tablet.split.before` / `tablet.split.after` bracket the atomic routing
@@ -135,6 +145,16 @@ pub enum SplitError {
         tablet: TabletId,
         /// Old-generation pins still outstanding.
         pins: usize,
+    },
+    /// The split already published its routing change (spec section 12.5
+    /// step 8); rolling it back would double-serve the keyspace. Only a
+    /// split that has not reached [`SplitPhase::Published`] can abort.
+    #[error("cannot abort the split of tablet {tablet}: it already reached phase {phase}")]
+    CannotAbort {
+        /// The source tablet.
+        tablet: TabletId,
+        /// The phase the split had durably reached.
+        phase: SplitPhase,
     },
 }
 
@@ -1625,6 +1645,114 @@ fn route_child(plan: &SplitPlan, key: &Key) -> Result<usize, SplitError> {
     Err(SplitError::KeyOutsideSource(key.clone()))
 }
 
+// ---------------------------------------------------------------------------
+// Split abort (the Splitting -> Active rollback edge of the state graph)
+// ---------------------------------------------------------------------------
+
+/// The outcome of one [`abort_split`] drive.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SplitAbortReport {
+    /// The split's source tablet.
+    pub source: TabletId,
+    /// The phase the split had durably reached when the abort began (`None`
+    /// when no split was in progress — the abort is then a no-op).
+    pub phase: Option<SplitPhase>,
+    /// The child tablets removed from the meta plane, lower half first.
+    pub children_removed: Vec<TabletId>,
+    /// The descriptor the source holds after the abort (`Active`; one
+    /// generation above the `Splitting` mark when the abort itself
+    /// republished it), `None` when no split was in progress.
+    pub source_after: Option<TabletDescriptor>,
+}
+
+/// Aborts one in-progress split, unwinding it safely to the pre-split
+/// routing: the never-routable children are removed from the meta plane and
+/// their local layouts torn down, the source is published back to `Active`,
+/// and the persisted progress record is removed.
+///
+/// Only a split that has not reached [`SplitPhase::Published`] can abort:
+/// once the atomic routing publication landed, the children own their
+/// halves and rolling back would double-serve the keyspace, so the driver
+/// fails closed with [`SplitError::CannotAbort`].
+///
+/// Every step is idempotent and ordered meta-first, local-second, record
+/// last, so a crash mid-abort simply re-enters: meta removals are no-ops
+/// for absent descriptors, the source restore is a no-op once the source is
+/// `Active` again, child layout teardown is idempotent, and the progress
+/// record disappears only once the unwind is complete. The local replica
+/// metadata (`tablet.json`) follows the restored descriptor.
+pub fn abort_split<M: TabletMetaPlane>(
+    source_layout: &TabletLayout,
+    meta: &mut M,
+) -> Result<SplitAbortReport, SplitError> {
+    let Some(progress) = load_progress(source_layout)? else {
+        return Ok(SplitAbortReport {
+            source: source_layout.tablet_id(),
+            phase: None,
+            children_removed: Vec::new(),
+            source_after: None,
+        });
+    };
+    if progress.phase >= SplitPhase::Published {
+        return Err(SplitError::CannotAbort {
+            tablet: progress.source.tablet_id,
+            phase: progress.phase,
+        });
+    }
+    // 1. Remove the children from the meta plane. They were created
+    //    `Creating` and never routed to, so removing them cannot strand a
+    //    key range; absent children (a not-yet-run or already-aborted step
+    //    2 of the executor) are no-ops.
+    let mut children_removed = Vec::new();
+    for child in &progress.children {
+        if let Some(current) = meta.tablet(child.tablet_id) {
+            meta.remove_tablet(child.tablet_id, current.generation)?;
+            children_removed.push(child.tablet_id);
+        }
+    }
+    // 2. Restore the source to `Active`. The `Splitting -> Active` edge is
+    //    the state graph's documented abort rollback; an already-`Active`
+    //    source (a crash after this step) is carried through unchanged, and
+    //    any other state means the publication already landed and the abort
+    //    raced it — `published_transition` fails closed on the illegal edge.
+    let current = meta.tablet(progress.source.tablet_id).ok_or_else(|| {
+        SplitError::InvalidPlan(format!(
+            "source tablet {} is missing from the meta plane mid-abort",
+            progress.source.tablet_id
+        ))
+    })?;
+    let restored = if current.state == TabletState::Active {
+        current
+    } else {
+        let restored = current.published_transition(TabletState::Active)?;
+        meta.set_tablet(&restored)?;
+        restored
+    };
+    // 3. The local replica metadata follows the restored descriptor.
+    source_layout.store_metadata(&restored)?;
+    // 4. Tear down the child layouts (idempotent; never destructive across
+    //    identity).
+    for child in &progress.children {
+        child.plan().layout.teardown()?;
+    }
+    // 5. Last: drop the persisted progress record. A crash before this
+    //    re-enters the abort; every step above is idempotent.
+    let record = source_layout.tablet_dir().join(SPLIT_PROGRESS_FILENAME);
+    match std::fs::remove_file(&record) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(meta_io(ClusterError::Io(error)));
+        }
+    }
+    Ok(SplitAbortReport {
+        source: progress.source.tablet_id,
+        phase: Some(progress.phase),
+        children_removed,
+        source_after: Some(restored),
+    })
+}
+
 /// Loads and verifies the persisted progress record (`None` when absent).
 /// Corrupt, unknown-version, or foreign records fail closed.
 fn load_progress(source_layout: &TabletLayout) -> Result<Option<SplitProgress>, SplitError> {
@@ -1664,6 +1792,13 @@ fn load_progress(source_layout: &TabletLayout) -> Result<Option<SplitProgress>, 
         .into());
     }
     Ok(Some(progress))
+}
+
+/// Reads the persisted split progress of a source tablet, if any (the node
+/// runtime's resume probe). Same fail-closed verification as
+/// [`SplitExecutor::resume`].
+pub fn split_progress(source_layout: &TabletLayout) -> Result<Option<SplitProgress>, SplitError> {
+    load_progress(source_layout)
 }
 
 // ---------------------------------------------------------------------------
@@ -2513,5 +2648,164 @@ mod tests {
             ),
             Err(SplitError::Tablet(TabletError::MissingMetadata(_)))
         ));
+    }
+
+    // -- abort driver -----------------------------------------------------------
+
+    #[test]
+    fn abort_before_publish_restores_the_source_and_removes_the_children() {
+        let _lock = EXECUTOR_TEST_LOCK.lock().unwrap();
+        let fixture = split_fixture();
+        let mut executor = begin_executor(&fixture);
+        executor.run_until(SplitPhase::SnapshotPinned).unwrap();
+        drop(executor);
+        // Pre-abort state: the source is Splitting at g + 1, the children
+        // exist as Creating learners, and the progress record is durable.
+        let marked = fixture.meta.tablet(fixture.source.tablet_id).unwrap();
+        assert_eq!(marked.state, TabletState::Splitting);
+        assert_eq!(marked.generation, 6);
+        for id in [tablet_id(2), tablet_id(3)] {
+            assert!(fixture.meta.tablet(id).is_some());
+        }
+        assert!(fixture
+            .source_layout
+            .tablet_dir()
+            .join(SPLIT_PROGRESS_FILENAME)
+            .is_file());
+
+        let mut meta = fixture.meta.clone();
+        let report = abort_split(&fixture.source_layout, &mut meta).unwrap();
+        assert_eq!(report.source, fixture.source.tablet_id);
+        assert_eq!(report.phase, Some(SplitPhase::SnapshotPinned));
+        assert_eq!(report.children_removed, vec![tablet_id(2), tablet_id(3)]);
+        // The source is Active again at one generation above the mark; the
+        // local replica metadata follows.
+        let restored = report.source_after.unwrap();
+        assert_eq!(restored.state, TabletState::Active);
+        assert_eq!(restored.generation, 7);
+        assert_eq!(
+            meta.tablet(fixture.source.tablet_id),
+            Some(restored.clone())
+        );
+        assert_eq!(fixture.source_layout.load_metadata().unwrap(), restored);
+        // The children are gone from the meta plane and their layouts are
+        // torn down; the progress record is removed.
+        for (index, id) in [tablet_id(2), tablet_id(3)].into_iter().enumerate() {
+            assert!(meta.tablet(id).is_none());
+            assert!(!fixture.plan.children[index].layout.tablet_dir().exists());
+        }
+        assert!(!fixture
+            .source_layout
+            .tablet_dir()
+            .join(SPLIT_PROGRESS_FILENAME)
+            .exists());
+        // The source keyspace was never touched by the abort.
+        assert_eq!(fixture.keyspace.rows_at(ts(u64::MAX)).len(), 14);
+    }
+
+    #[test]
+    fn abort_is_idempotent_across_a_mid_abort_crash() {
+        let _lock = EXECUTOR_TEST_LOCK.lock().unwrap();
+        let fixture = split_fixture();
+        let mut executor = begin_executor(&fixture);
+        executor.run_until(SplitPhase::ChildrenCreated).unwrap();
+        drop(executor);
+
+        let mut meta = fixture.meta.clone();
+        let first = abort_split(&fixture.source_layout, &mut meta).unwrap();
+        assert_eq!(first.phase, Some(SplitPhase::ChildrenCreated));
+        // A second drive finds no progress record and does nothing.
+        let second = abort_split(&fixture.source_layout, &mut meta).unwrap();
+        assert_eq!(second.phase, None);
+        assert!(second.children_removed.is_empty());
+        assert!(second.source_after.is_none());
+        // The meta plane still holds exactly the restored source.
+        let restored = meta.tablet(fixture.source.tablet_id).unwrap();
+        assert_eq!(restored.state, TabletState::Active);
+        assert_eq!(restored.generation, 7);
+    }
+
+    #[test]
+    fn abort_at_started_unwinds_before_any_meta_write() {
+        let _lock = EXECUTOR_TEST_LOCK.lock().unwrap();
+        let fixture = split_fixture();
+        let executor = begin_executor(&fixture);
+        drop(executor); // phase == Started: no meta-plane change yet
+
+        let mut meta = fixture.meta.clone();
+        let report = abort_split(&fixture.source_layout, &mut meta).unwrap();
+        assert_eq!(report.phase, Some(SplitPhase::Started));
+        assert!(report.children_removed.is_empty());
+        // The source is still at its initiation descriptor (untouched).
+        let restored = report.source_after.unwrap();
+        assert_eq!(restored, fixture.source);
+        assert!(!fixture
+            .source_layout
+            .tablet_dir()
+            .join(SPLIT_PROGRESS_FILENAME)
+            .exists());
+    }
+
+    #[test]
+    fn abort_after_publish_fails_closed() {
+        let _lock = EXECUTOR_TEST_LOCK.lock().unwrap();
+        let fixture = split_fixture();
+        let mut executor = begin_executor(&fixture);
+        executor.run_until(SplitPhase::Published).unwrap();
+        drop(executor);
+
+        let mut meta = fixture.meta.clone();
+        let error = abort_split(&fixture.source_layout, &mut meta).unwrap_err();
+        assert!(matches!(
+            error,
+            SplitError::CannotAbort { tablet, phase }
+                if tablet == fixture.source.tablet_id && phase == SplitPhase::Published
+        ));
+        // The published routing is untouched: children Active, source Retiring.
+        assert_eq!(
+            meta.tablet(fixture.source.tablet_id).unwrap().state,
+            TabletState::Retiring
+        );
+        for id in [tablet_id(2), tablet_id(3)] {
+            assert_eq!(meta.tablet(id).unwrap().state, TabletState::Active);
+        }
+    }
+
+    #[test]
+    fn the_source_can_split_again_after_an_abort() {
+        let _lock = EXECUTOR_TEST_LOCK.lock().unwrap();
+        let fixture = split_fixture();
+        let mut executor = begin_executor(&fixture);
+        executor.run_until(SplitPhase::ChildrenCreated).unwrap();
+        drop(executor);
+        let mut meta = fixture.meta.clone();
+        abort_split(&fixture.source_layout, &mut meta).unwrap();
+
+        // A fresh split of the restored source plans and runs to completion
+        // from the post-abort generation.
+        let restored = meta.tablet(fixture.source.tablet_id).unwrap();
+        let planner = TabletSplitPlanner::new(fixture._dir.path());
+        let plan = planner
+            .plan(
+                &restored,
+                SplitKeySelection::Explicit(text_key("n")),
+                ts(300),
+                [allocation(4, 4, 41), allocation(5, 5, 51)],
+            )
+            .unwrap();
+        let sinks = [MapChildSink::new(), MapChildSink::new()];
+        let mut executor = SplitExecutor::begin(
+            plan,
+            fixture.source_layout.clone(),
+            meta.clone(),
+            fixture.keyspace.clone(),
+            sinks.clone(),
+        )
+        .unwrap();
+        executor.run().unwrap();
+        assert!(meta.tablet(fixture.source.tablet_id).is_none());
+        let mut union = sinks[0].rows();
+        union.extend(sinks[1].rows());
+        assert_eq!(union, fixture.keyspace.rows_at(ts(u64::MAX)));
     }
 }

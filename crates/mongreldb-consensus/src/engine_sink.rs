@@ -54,6 +54,7 @@ use mongreldb_core::replicated_apply::{
 use mongreldb_core::storage_mode::StorageMode;
 use mongreldb_core::MongrelError;
 use mongreldb_log::commit_log::LogPosition;
+use mongreldb_log::envelope::CommandEnvelope;
 use mongreldb_types::hlc::HlcTimestamp;
 use mongreldb_types::ids::{ClusterId, DatabaseId, NodeId, RaftGroupId};
 
@@ -342,6 +343,142 @@ pub fn open_engine_sink(
         config.database_id,
     )?;
     Ok(Arc::new(Mutex::new(sink)))
+}
+
+// ---------------------------------------------------------------------------
+// Leader-side command construction (spec section 11.3 step 3)
+// ---------------------------------------------------------------------------
+
+/// Builds the replicated transaction command envelope for one committed
+/// transaction's staged WAL records — the leader side of the apply contract
+/// (spec section 11.3 step 3, "leader constructs transaction command";
+/// review finding M2). The caller proposes the envelope through its group
+/// (which stamps the commit timestamp), e.g.
+/// [`crate::group::ConsensusGroup::propose`].
+///
+/// A commit that spilled staged its rows as logical `Op::SpilledRows`
+/// records plus leader-local run links (`added_runs`) in its commit marker
+/// (spec section 8.5). Run files exist only on the leader, so the payload
+/// proposed to the group must carry the spilled rows as logical row records
+/// instead: the records pass through
+/// [`mongreldb_core::database::translate_records_for_replication`], which
+/// re-tags the spill payloads as ordinary `Op::Put`s and strips the run
+/// links, so no `added_runs` ever reaches a replica apply. The standalone
+/// commit path is untouched — the leader's own WAL keeps the original
+/// sequence byte-identical.
+///
+/// A sequence that cannot be represented self-contained (malformed, or a
+/// linked run whose rows are missing from the logical records) is rejected
+/// here, at proposal construction — a quorum-committed entry that no replica
+/// can apply would otherwise wedge the group's apply stream.
+pub fn build_transaction_envelope(
+    command_id: [u8; 16],
+    records: &[mongreldb_core::wal::Record],
+) -> Result<CommandEnvelope, EngineSinkError> {
+    let translated = mongreldb_core::database::translate_records_for_replication(records)?;
+    let payload = ReplicatedTxnPayload::new(translated).encode()?;
+    Ok(CommandEnvelope::new(
+        mongreldb_core::commit_log::COMMAND_TYPE_TRANSACTION,
+        command_id,
+        payload,
+    ))
+}
+
+/// Test-support helpers for downstream integration tests
+/// (`mongreldb-cluster`'s distributed-transaction engine binding drives
+/// two-phase commit across engine-backed tablet groups, and the cluster
+/// crate has no `mongreldb-core` edge to build row payloads with). These
+/// mirror this module's own fixtures; they are not a public API.
+#[doc(hidden)]
+pub mod testing {
+    use super::*;
+    use mongreldb_core::catalog_cmds::{
+        CatalogCommand, CatalogCommandRecord, CATALOG_COMMAND_FORMAT_VERSION,
+    };
+    use mongreldb_core::memtable::{Row, Value};
+    use mongreldb_core::schema::{ColumnDef, ColumnFlags, Schema, TypeId};
+    use mongreldb_core::{Epoch, RowId};
+
+    /// The single-column i64 primary-key schema the fixtures use.
+    pub fn i64_schema() -> Schema {
+        Schema {
+            columns: vec![ColumnDef {
+                id: 1,
+                name: "id".into(),
+                ty: TypeId::Int64,
+                flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
+            }],
+            ..Schema::default()
+        }
+    }
+
+    /// A catalog command envelope creating `name` with the i64 schema.
+    pub fn create_i64_table_envelope(
+        seq: u64,
+        name: &str,
+        catalog_version: u64,
+    ) -> CommandEnvelope {
+        let record = CatalogCommandRecord {
+            version: CATALOG_COMMAND_FORMAT_VERSION,
+            catalog_version,
+            command: CatalogCommand::CreateTable {
+                name: name.to_string(),
+                schema: i64_schema(),
+                created_epoch: 1,
+            },
+        };
+        let payload = mongreldb_core::catalog_cmds::encode_command(&record).unwrap();
+        let mut id = [0u8; 16];
+        id[..8].copy_from_slice(&seq.to_le_bytes());
+        CommandEnvelope::new(COMMAND_TYPE_CATALOG_COMMAND, id, payload)
+    }
+
+    /// Encodes staged i64 puts (one row per value, row id = value as u64,
+    /// column 1) as one `StagedTxnWrite::Put` payload for a distributed
+    /// transaction write intent.
+    pub fn staged_put_i64(table_id: u64, values: &[i64]) -> Vec<u8> {
+        let rows: Vec<Row> = values
+            .iter()
+            .map(|value| {
+                Row::new(RowId(*value as u64), Epoch(0)).with_column(1, Value::Int64(*value))
+            })
+            .collect();
+        mongreldb_core::database::StagedTxnWrite::Put {
+            table_id,
+            rows: bincode::serialize(&rows).unwrap(),
+        }
+        .encode()
+        .unwrap()
+    }
+
+    /// Encodes a staged i64 delete as one `StagedTxnWrite::Delete` payload.
+    pub fn staged_delete_i64(table_id: u64, row_ids: &[u64]) -> Vec<u8> {
+        mongreldb_core::database::StagedTxnWrite::Delete {
+            table_id,
+            row_ids: row_ids.to_vec(),
+        }
+        .encode()
+        .unwrap()
+    }
+
+    /// The sorted visible i64 values of `table` (column 1) on `db`.
+    pub fn visible_i64s(db: &mongreldb_core::Database, table: &str) -> Vec<i64> {
+        let handle = db.table(table).unwrap();
+        let rows = handle
+            .lock()
+            .visible_rows(mongreldb_core::Snapshot::at(Epoch(u64::MAX)))
+            .unwrap();
+        let mut values: Vec<i64> = rows
+            .iter()
+            .map(|row| match row.columns.get(&1) {
+                Some(Value::Int64(value)) => *value,
+                other => panic!("unexpected column: {other:?}"),
+            })
+            .collect();
+        values.sort_unstable();
+        values
+    }
 }
 
 /// Constructs the durable storage parts of one single-group replicated
@@ -817,5 +954,179 @@ mod tests {
         let db_a = sink_a.lock().unwrap().database().unwrap();
         assert_eq!(rows_hash(&db_a, "items"), rows_hash(&db_b, "items"));
         group_a.shutdown().await.unwrap();
+    }
+
+    // -- M2: leader-side spill translation -----------------------------------
+
+    /// A real standalone commit that spills, captured from the leader's WAL:
+    /// `SpilledRows` records plus an `added_runs` commit marker.
+    fn standalone_spilled_commit() -> (tempfile::TempDir, Vec<Record>, u64) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = mongreldb_core::Database::create(dir.path()).unwrap();
+        db.create_table("t", simple_schema()).unwrap();
+        db.set_spill_threshold(1);
+        let table_id = db.table_id("t").unwrap();
+        db.transaction(|txn| {
+            for value in 0..40_i64 {
+                txn.put("t", vec![(1, Value::Int64(value))])?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        let wal_records =
+            mongreldb_core::wal::SharedWal::replay_with_dek(dir.path(), None).unwrap();
+        let txn_id = wal_records
+            .iter()
+            .find_map(|record| match &record.op {
+                Op::TxnCommit { added_runs, .. } if !added_runs.is_empty() => Some(record.txn_id),
+                _ => None,
+            })
+            .expect("a spilled commit is present in the WAL");
+        let records: Vec<Record> = wal_records
+            .into_iter()
+            .filter(|record| record.txn_id == txn_id)
+            .collect();
+        (dir, records, table_id)
+    }
+
+    #[test]
+    fn build_transaction_envelope_translates_spills_and_rejects_untranslatable() {
+        let (_dir, records, table_id) = standalone_spilled_commit();
+        assert!(records
+            .iter()
+            .any(|record| matches!(record.op, Op::SpilledRows { .. })));
+
+        let envelope = build_transaction_envelope([9u8; 16], &records).unwrap();
+        envelope.verify().unwrap();
+        let payload = ReplicatedTxnPayload::decode(&envelope.payload).unwrap();
+        // No run links and no spill payloads ever reach a replica apply.
+        assert!(payload
+            .records
+            .iter()
+            .all(|record| !matches!(record.op, Op::SpilledRows { .. })));
+        let Some(Op::TxnCommit { added_runs, .. }) = payload.records.last().map(|r| &r.op) else {
+            panic!("a commit sequence ends in TxnCommit");
+        };
+        assert!(added_runs.is_empty());
+        assert!(payload
+            .records
+            .iter()
+            .any(|record| matches!(&record.op, Op::Put { table_id: id, .. } if *id == table_id)));
+        // The leader's own record sequence is untouched (standalone behavior
+        // stays byte-identical).
+        assert!(records
+            .iter()
+            .any(|record| matches!(record.op, Op::SpilledRows { .. })));
+        let Some(Op::TxnCommit { added_runs, .. }) = records.last().map(|r| &r.op) else {
+            panic!("a commit sequence ends in TxnCommit");
+        };
+        assert!(!added_runs.is_empty());
+
+        // A commit whose linked run rows are missing from the logical
+        // records is rejected at proposal construction (fail closed).
+        let mut broken = put_envelope(1, 1, 0, 2, &[10]);
+        let decoded = ReplicatedTxnPayload::decode(&broken.payload).unwrap();
+        let mut records = decoded.records;
+        let Some(Op::TxnCommit { added_runs, .. }) = records.last_mut().map(|r| &mut r.op) else {
+            panic!("a commit sequence ends in TxnCommit");
+        };
+        added_runs.push(mongreldb_core::wal::AddedRun {
+            table_id: 0,
+            run_id: 7,
+            row_count: 1,
+            level: 0,
+            min_row_id: 10,
+            max_row_id: 10,
+            content_hash: [0; 32],
+        });
+        let error = build_transaction_envelope([1u8; 16], &records).unwrap_err();
+        assert!(
+            error.to_string().contains("no logical row records"),
+            "unexpected error: {error}"
+        );
+        // A non-spilled commit passes through byte-identical.
+        broken = put_envelope(1, 1, 0, 2, &[10]);
+        let decoded = ReplicatedTxnPayload::decode(&broken.payload).unwrap();
+        let envelope = build_transaction_envelope([1u8; 16], &decoded.records).unwrap();
+        let round = ReplicatedTxnPayload::decode(&envelope.payload).unwrap();
+        assert_eq!(
+            bincode::serialize(&round.records).unwrap(),
+            bincode::serialize(&decoded.records).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn spilled_commit_proposal_applies_identical_rows_on_replica() {
+        // Two members of one raft group over one shared transport.
+        let tmp = tempfile::tempdir().unwrap();
+        let transport = Arc::new(InMemoryTransport::new());
+        let config_a = engine_config(&tmp.path().join("node-a"), 80);
+        let config_b = engine_config(&tmp.path().join("node-b"), 90);
+        let sink_a = open_engine_sink(&config_a).unwrap();
+        let sink_b = open_engine_sink(&config_b).unwrap();
+        let group_a = ConsensusGroup::create(
+            group_config(1, &config_a.group_dir()),
+            transport.clone(),
+            sink_a.clone() as Arc<Mutex<dyn ApplySink>>,
+        )
+        .await
+        .unwrap();
+        let group_b = ConsensusGroup::create(
+            group_config(2, &config_b.group_dir()),
+            transport,
+            sink_b.clone() as Arc<Mutex<dyn ApplySink>>,
+        )
+        .await
+        .unwrap();
+        group_a
+            .bootstrap(BTreeMap::from([
+                (1, BasicNode::new("node-1")),
+                (2, BasicNode::new("node-2")),
+            ]))
+            .await
+            .unwrap();
+        group_a.wait_leader(LEADER_TIMEOUT).await.unwrap();
+        group_b.wait_leader(LEADER_TIMEOUT).await.unwrap();
+
+        // The table exists on both replicas through the catalog command.
+        let receipt = group_a
+            .propose(
+                CommandKind::Catalog,
+                create_table_envelope(1, "t", 1),
+                &ExecutionControl::default(),
+            )
+            .await
+            .unwrap();
+        group_b
+            .wait_applied_index(receipt.position.index, LEADER_TIMEOUT)
+            .await
+            .unwrap();
+
+        // A real spilled commit, translated at proposal construction.
+        let (_dir, records, table_id) = standalone_spilled_commit();
+        let envelope = build_transaction_envelope([7u8; 16], &records).unwrap();
+        let receipt = group_a
+            .propose(
+                CommandKind::Transaction,
+                envelope,
+                &ExecutionControl::default(),
+            )
+            .await
+            .unwrap();
+        group_b
+            .wait_applied_index(receipt.position.index, LEADER_TIMEOUT)
+            .await
+            .unwrap();
+
+        // Both replicas apply the spilled rows identically (count + content).
+        let db_a = sink_a.lock().unwrap().database().unwrap();
+        let db_b = sink_b.lock().unwrap().database().unwrap();
+        let expected: Vec<i64> = (0..40).collect();
+        assert_eq!(visible_ids(&db_a, "t"), expected);
+        assert_eq!(visible_ids(&db_b, "t"), expected);
+        assert_eq!(rows_hash(&db_a, "t"), rows_hash(&db_b, "t"));
+        assert_eq!(db_a.table_id("t").unwrap(), table_id);
+        group_a.shutdown().await.unwrap();
+        group_b.shutdown().await.unwrap();
     }
 }

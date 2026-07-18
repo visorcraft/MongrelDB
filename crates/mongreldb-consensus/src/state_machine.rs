@@ -26,6 +26,19 @@
 //! idempotency ledger (`TXN_IDEMPOTENCY`, ADR-0003) is the backstop for that
 //! window; the adapter set covers client-retry duplicates.
 //!
+//! # HLC observation (spec section 8.2)
+//!
+//! A received timestamp advances the local clock: when the state machine is
+//! opened with a [`CommitTsObserver`] ([`MongrelStateMachine::open_with_clock`],
+//! the [`crate::group::ConsensusGroup`] path), every applied command's
+//! leader-assigned commit timestamp — and the checkpoint timestamp of every
+//! installed snapshot — is handed to it so the group's HLC clock never
+//! trails the commit timestamps that flowed past it, and a new leader cannot
+//! stamp below an already-committed value after a failover. Observation is
+//! best-effort and never blocks or fails apply: the replicated apply stream
+//! keeps its order, and timestamp *allocation* remains the fail-closed path
+//! (spec section 8.2).
+//!
 //! # Fault hooks (FND-006)
 //!
 //! `raft.sm.apply.before` / `raft.sm.apply.after`,
@@ -51,6 +64,14 @@ use crate::storage::{
 use mongreldb_log::commit_log::LogPosition;
 use mongreldb_log::envelope::CommandEnvelope;
 use mongreldb_types::hlc::HlcTimestamp;
+
+/// Sink receiving every applied or snapshot-installed commit timestamp so
+/// the group's HLC clock can advance past it (spec section 8.2). The
+/// implementation must never fail, panic, or block: observation is
+/// best-effort so the apply stream keeps the replicated order (a rejected
+/// observation must still leave the clock's skew high-water intact so later
+/// timestamp *allocation* fails closed).
+pub type CommitTsObserver = Arc<dyn Fn(HlcTimestamp) + Send + Sync>;
 
 const MEMBERSHIP_MAGIC: &[u8; 8] = b"MRFT-MB1";
 const APPLIED_MAGIC: &[u8; 8] = b"MRFT-AP1";
@@ -251,6 +272,9 @@ pub(crate) struct SharedStateMachine {
     raft_dir: PathBuf,
     sink: Arc<Mutex<dyn ApplySink>>,
     retention: usize,
+    /// Receives every applied/installed commit timestamp (spec section 8.2);
+    /// `None` when opened without one.
+    commit_ts_observer: Option<CommitTsObserver>,
 }
 
 impl SharedStateMachine {
@@ -278,6 +302,16 @@ impl SharedStateMachine {
     pub(crate) fn applied_position(&self) -> LogPosition {
         self.lock()
             .map_or(LogPosition::ZERO, |inner| inner.record.position())
+    }
+
+    /// Hands a replicated commit timestamp to the group's observer so the
+    /// group clock can advance past it (spec section 8.2: a received
+    /// timestamp advances the local clock). Best-effort: the observer never
+    /// fails the apply path.
+    fn observe_commit_ts(&self, commit_ts: HlcTimestamp) {
+        if let Some(observer) = &self.commit_ts_observer {
+            observer(commit_ts);
+        }
     }
 
     fn persist_record(&self, record: &AppliedRecord) -> Result<(), StateMachineError> {
@@ -424,6 +458,11 @@ impl SharedStateMachine {
             inner.record = snapshot.record.clone();
             inner.membership = snapshot.membership.clone();
         }
+        // The restored checkpoint timestamp is a received timestamp too:
+        // advance the group clock past it (spec section 8.2).
+        if let Some(commit_ts) = snapshot.record.last_applied_commit_ts {
+            self.observe_commit_ts(commit_ts);
+        }
         let meta = RaftSnapshotMeta {
             last_log_id: snapshot.record.last_applied,
             last_membership: snapshot.membership,
@@ -520,6 +559,19 @@ impl MongrelStateMachine {
         sink: Arc<Mutex<dyn ApplySink>>,
         idempotency_retention: usize,
     ) -> Result<Self, StateMachineError> {
+        Self::open_with_clock(group_dir, sink, idempotency_retention, None)
+    }
+
+    /// Opens the state machine with a [`CommitTsObserver`] that every
+    /// applied or snapshot-installed commit timestamp is handed to (spec
+    /// section 8.2; [`ConsensusGroup`](crate::group::ConsensusGroup) passes
+    /// an observer advancing its stamping clock here).
+    pub fn open_with_clock(
+        group_dir: &Path,
+        sink: Arc<Mutex<dyn ApplySink>>,
+        idempotency_retention: usize,
+        commit_ts_observer: Option<CommitTsObserver>,
+    ) -> Result<Self, StateMachineError> {
         let raft_dir = group_dir.join("raft");
         let state_dir = raft_dir.join("state");
         let snapshot_dir = raft_dir.join("snapshot");
@@ -548,6 +600,7 @@ impl MongrelStateMachine {
                 raft_dir,
                 sink,
                 retention: idempotency_retention,
+                commit_ts_observer,
             },
         })
     }
@@ -605,6 +658,11 @@ impl MongrelStateMachine {
                     }
                     if let Some(ts) = command.commit_ts() {
                         inner.record.last_applied_commit_ts = Some(ts);
+                        // A received timestamp advances the local clock
+                        // (spec section 8.2): the group clock learns every
+                        // commit timestamp it applies, so a future leader on
+                        // this node never stamps below them.
+                        self.shared.observe_commit_ts(ts);
                     }
                 }
             }
@@ -755,6 +813,16 @@ impl RaftSnapshotBuilder<MongrelRaftConfig> for MongrelSnapshotBuilder {
 mod tests {
     use super::*;
     use crate::identity::CommandKind;
+    use mongreldb_types::hlc::HlcClock;
+
+    /// An observer advancing `clock` with every handed-out timestamp (the
+    /// production observer in `group.rs` additionally filters stale stamps).
+    fn observing(clock: &Arc<HlcClock>) -> CommitTsObserver {
+        let clock = clock.clone();
+        Arc::new(move |commit_ts| {
+            let _ = clock.observe(commit_ts);
+        })
+    }
 
     fn command(index: u64, id: u8) -> RaftLogEntry {
         let envelope = CommandEnvelope::new(1, [id; 16], vec![id; 4]);
@@ -882,5 +950,117 @@ mod tests {
             .install_snapshot(&meta, Box::new(Cursor::new(framed)))
             .await
             .is_err());
+    }
+
+    fn wall_plus(offset: std::time::Duration) -> u64 {
+        u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_micros()
+                + offset.as_micros(),
+        )
+        .unwrap()
+    }
+
+    fn command_at(index: u64, id: u8, commit_ts: HlcTimestamp) -> RaftLogEntry {
+        let envelope = CommandEnvelope::new(1, [id; 16], vec![id; 4]);
+        RaftLogEntry {
+            log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 1), index),
+            payload: openraft::EntryPayload::Normal(ReplicatedCommand::new(
+                CommandKind::Transaction,
+                envelope,
+                commit_ts,
+            )),
+        }
+    }
+
+    #[tokio::test]
+    async fn applied_commit_ts_advances_the_group_clock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sink = Arc::new(Mutex::new(InMemoryApplySink::new()));
+        let clock = Arc::new(HlcClock::new(1, std::time::Duration::from_secs(7_200)));
+        let mut sm = MongrelStateMachine::open_with_clock(
+            tmp.path(),
+            sink,
+            DEFAULT_IDEMPOTENCY_RETENTION,
+            Some(observing(&clock)),
+        )
+        .unwrap();
+
+        // A commit timestamp an hour ahead of the wall clock: observing it
+        // advances the group clock past it (spec section 8.2).
+        let ahead = HlcTimestamp {
+            physical_micros: wall_plus(std::time::Duration::from_secs(3_600)),
+            logical: 0,
+            node_tiebreaker: 9,
+        };
+        sm.apply(vec![command_at(1, 7, ahead)]).await.unwrap();
+        let stamped = clock.now().unwrap();
+        assert!(
+            stamped > ahead,
+            "the group clock must pass the applied commit timestamp: {stamped:?} <= {ahead:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn skewed_observation_never_wedges_apply() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sink = Arc::new(Mutex::new(InMemoryApplySink::new()));
+        // A tight skew bound: observing a far-ahead commit timestamp is a
+        // skew event, which must not fail the apply stream...
+        let clock = Arc::new(HlcClock::new(1, std::time::Duration::from_millis(500)));
+        let mut sm = MongrelStateMachine::open_with_clock(
+            tmp.path(),
+            sink.clone(),
+            DEFAULT_IDEMPOTENCY_RETENTION,
+            Some(observing(&clock)),
+        )
+        .unwrap();
+        let far_ahead = HlcTimestamp {
+            physical_micros: wall_plus(std::time::Duration::from_secs(3_600)),
+            logical: 0,
+            node_tiebreaker: 9,
+        };
+        sm.apply(vec![command_at(1, 7, far_ahead)]).await.unwrap();
+        assert_eq!(sink.lock().unwrap().len(), 1);
+        // ...but allocation through that clock now fails closed (spec
+        // section 8.2: excessive skew rejects timestamp allocation).
+        assert!(clock.now().is_err());
+    }
+
+    #[tokio::test]
+    async fn installed_snapshot_commit_ts_advances_the_group_clock() {
+        let tmp_a = tempfile::tempdir().unwrap();
+        let tmp_b = tempfile::tempdir().unwrap();
+        let sink_a = Arc::new(Mutex::new(InMemoryApplySink::new()));
+        let sink_b = Arc::new(Mutex::new(InMemoryApplySink::new()));
+        let clock_b = Arc::new(HlcClock::new(2, std::time::Duration::from_secs(7_200)));
+
+        let ahead = HlcTimestamp {
+            physical_micros: wall_plus(std::time::Duration::from_secs(3_600)),
+            logical: 3,
+            node_tiebreaker: 1,
+        };
+        let mut sm_a = machine(tmp_a.path(), sink_a);
+        sm_a.apply(vec![command_at(1, 1, ahead)]).await.unwrap();
+        let (meta, framed) = sm_a.shared.build_snapshot_now().unwrap();
+
+        let mut sm_b = MongrelStateMachine::open_with_clock(
+            tmp_b.path(),
+            sink_b,
+            DEFAULT_IDEMPOTENCY_RETENTION,
+            Some(observing(&clock_b)),
+        )
+        .unwrap();
+        sm_b.install_snapshot(&meta, Box::new(Cursor::new(framed)))
+            .await
+            .unwrap();
+        let stamped = clock_b.now().unwrap();
+        assert!(
+            stamped > ahead,
+            "snapshot install must advance the group clock past the \
+             checkpoint timestamp: {stamped:?} <= {ahead:?}"
+        );
     }
 }

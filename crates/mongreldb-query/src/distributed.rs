@@ -3349,9 +3349,11 @@ impl Coordinator {
                     let batches = current.flatten();
                     current = RootData::Batches(limit_batches(&batches, *limit));
                 }
-                other => return Err(DistributedError::Unsupported(format!(
+                other => {
+                    return Err(DistributedError::Unsupported(format!(
                     "root fragment operator {other:?} is not coordinator-executable in this wave"
-                ))),
+                )))
+                }
             }
         }
         Ok(current.flatten())

@@ -14,11 +14,27 @@
 //! - [`ReadConsistency::ReadYourWrites`]: waits until the replica applied at
 //!   least the session token's commit index.
 //! - [`ReadConsistency::Snapshot`]: waits until the applied watermark's
-//!   commit timestamp covers the requested timestamp.
-//! - [`ReadConsistency::BoundedStaleness`]: serves only if the applied
-//!   commit timestamp is within `max_lag_ms` of the node's HLC now; the
-//!   caller picks another replica on
-//!   [`ReadConsistencyError::StalenessExceeded`].
+//!   commit timestamp covers the requested timestamp. The watermark is
+//!   monotonic in apply order — leaders stamp proposals above the commit
+//!   floor and the state machine observes every applied/snapshot-installed
+//!   commit timestamp into the group clock (spec section 8.2) — so a
+//!   satisfiable barrier stays satisfiable across leader failover. The wait
+//!   is caller-bounded: a timestamp no committed entry will ever cover
+//!   (for example one from a truncated LeaderDisk write) waits until the
+//!   caller's [`ExecutionControl`](mongreldb_log::commit_log::ExecutionControl)
+//!   fires and surfaces [`ReadConsistencyError::DeadlineExceeded`] or
+//!   [`ReadConsistencyError::Cancelled`]; always set a deadline.
+//! - [`ReadConsistency::BoundedStaleness`]: serves if the replica is fresh.
+//!   Freshness is *known missing data*, not wall-clock age: a replica that
+//!   applied every entry its local log holds serves immediately, however
+//!   long ago the last write landed (an idle cluster is not stale). A
+//!   replica that has seen nothing at all (an empty log) fails closed as
+//!   arbitrarily stale. Only while behind does the applied commit timestamp
+//!   bound the lag against the node's HLC now by `max_lag_ms`; the caller
+//!   picks another replica on [`ReadConsistencyError::StalenessExceeded`].
+//!   Best-effort: a partitioned replica can hold a stale log and still read
+//!   as fresh — use [`ReadConsistency::Linearizable`] or
+//!   [`ReadConsistency::ReadYourWrites`] for hard guarantees.
 //! - [`ReadConsistency::Eventual`]: serves the current local applied
 //!   watermark immediately.
 
@@ -39,13 +55,16 @@ pub enum ReadConsistency {
         /// Proof of an earlier committed write by this session.
         token: SessionToken,
     },
-    /// Serve at `timestamp` once the applied watermark covers it.
+    /// Serve at `timestamp` once the applied watermark covers it (waits,
+    /// caller-bounded by the `ExecutionControl`; see the module docs).
     Snapshot {
         /// The requested snapshot timestamp.
         timestamp: HlcTimestamp,
     },
-    /// Serve only if the applied commit timestamp lags the node's HLC now
-    /// by at most `max_lag_ms`.
+    /// Serve if the replica is fresh: caught up with every entry its local
+    /// log holds, or — while behind — with the applied commit timestamp
+    /// lagging the node's HLC now by at most `max_lag_ms` (see the module
+    /// docs for the exact semantics).
     BoundedStaleness {
         /// Maximum tolerated lag in milliseconds.
         max_lag_ms: u64,
@@ -76,6 +95,41 @@ pub struct ReadWatermark {
     /// Commit timestamp of the last applied command (`None` before any
     /// command was applied).
     pub commit_ts: Option<HlcTimestamp>,
+}
+
+/// Bounded-staleness freshness (spec section 11.4, review m9; see the module
+/// docs for the level's contract). A replica is fresh when it has applied
+/// every entry its local log holds — it is then missing no known data,
+/// however long ago the last write landed, so an idle cluster never reads
+/// as stale. `last_known_index` of `None` (a completely empty log) proves
+/// the replica never saw a leader and fails closed as arbitrarily stale.
+/// While behind, the lag is the applied commit timestamp's age against the
+/// node's HLC now; `now` is only consulted on that path so a caught-up
+/// replica's read never fails on clock skew.
+pub(crate) fn evaluate_bounded_staleness(
+    watermark: &ReadWatermark,
+    last_known_index: Option<u64>,
+    now: impl FnOnce() -> Result<HlcTimestamp, ReadConsistencyError>,
+    max_lag_ms: u64,
+) -> Result<(), ReadConsistencyError> {
+    if last_known_index.is_some_and(|last| watermark.position.index >= last) {
+        return Ok(());
+    }
+    let Some(applied) = watermark.commit_ts else {
+        return Err(ReadConsistencyError::StalenessExceeded {
+            max_lag_ms,
+            lag_ms: u64::MAX,
+        });
+    };
+    let lag_ms = now()?
+        .physical_micros
+        .saturating_sub(applied.physical_micros)
+        / 1_000;
+    if lag_ms <= max_lag_ms {
+        Ok(())
+    } else {
+        Err(ReadConsistencyError::StalenessExceeded { max_lag_ms, lag_ms })
+    }
 }
 
 /// Errors produced by read barriers (spec sections 11.4 and 11.7).
@@ -208,6 +262,87 @@ mod tests {
         assert!(matches!(
             ReadConsistencyError::from(ConsensusError::Closed),
             ReadConsistencyError::Closed
+        ));
+    }
+
+    fn watermark(index: u64, commit_micros: Option<u64>) -> ReadWatermark {
+        ReadWatermark {
+            position: LogPosition { term: 1, index },
+            commit_ts: commit_micros.map(|physical_micros| HlcTimestamp {
+                physical_micros,
+                logical: 0,
+                node_tiebreaker: 0,
+            }),
+        }
+    }
+
+    #[test]
+    fn caught_up_replica_is_fresh_regardless_of_write_age() {
+        // The last write landed an hour ago, but the replica applied every
+        // entry its log holds: nothing known is missing (review m9). The
+        // clock must not even be consulted on this path.
+        let panic_clock = || panic!("caught-up reads never consult the clock");
+        for max_lag_ms in [0, 1, 3_600_000] {
+            assert!(
+                evaluate_bounded_staleness(
+                    &watermark(42, Some(1_000_000)),
+                    Some(42),
+                    panic_clock,
+                    max_lag_ms
+                )
+                .is_ok(),
+                "caught-up replica must be fresh for any bound"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_log_fails_closed_as_arbitrarily_stale() {
+        let panic_clock = || panic!("an unapplied replica never consults the clock");
+        let err =
+            evaluate_bounded_staleness(&watermark(0, None), None, panic_clock, 60_000).unwrap_err();
+        assert!(matches!(
+            err,
+            ReadConsistencyError::StalenessExceeded {
+                lag_ms: u64::MAX,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn behind_replica_measures_applied_ts_age() {
+        let now = || {
+            Ok(HlcTimestamp {
+                physical_micros: 1_000_000_000,
+                logical: 0,
+                node_tiebreaker: 0,
+            })
+        };
+        // Behind (applied 10 < known 12), watermark 5 ms old, bound 10 ms.
+        assert!(
+            evaluate_bounded_staleness(&watermark(10, Some(999_995_000)), Some(12), now, 10)
+                .is_ok()
+        );
+        // Same age, bound 1 ms: stale, with the measured lag reported.
+        let err = evaluate_bounded_staleness(&watermark(10, Some(999_995_000)), Some(12), now, 1)
+            .unwrap_err();
+        match err {
+            ReadConsistencyError::StalenessExceeded { max_lag_ms, lag_ms } => {
+                assert_eq!(max_lag_ms, 1);
+                assert_eq!(lag_ms, 5);
+            }
+            other => panic!("expected StalenessExceeded, got {other:?}"),
+        }
+        // Behind with nothing applied yet: arbitrarily stale.
+        let err =
+            evaluate_bounded_staleness(&watermark(0, None), Some(12), now, 60_000).unwrap_err();
+        assert!(matches!(
+            err,
+            ReadConsistencyError::StalenessExceeded {
+                lag_ms: u64::MAX,
+                ..
+            }
         ));
     }
 }

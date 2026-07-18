@@ -60,11 +60,23 @@
 //!
 //! # Scope of this wave
 //!
-//! Intent records and coordinator records are durable, replicated, and
-//! queryable here; the engine binding that materializes committed intents
-//! into MVCC row versions lands with the tablet server wave. The intent
-//! sink's `committed_writes` view is the resolution contract that binding
-//! consumes.
+//! The engine binding is landed for the participant side: an
+//! [`IntentApplySink`] bound to an [`EngineApplySink`] (a
+//! [`TabletTxnGroup`]) applies a committed resolution's staged writes into
+//! the tablet's engine core through `Database::apply_staged_txn_writes` —
+//! the same `apply_replicated_records` path the engine sink uses — stamped
+//! at the decision's `commit_ts`. Staged-write payloads are the
+//! engine-defined `mongreldb_core::database::StagedTxnWrite` encoding; they
+//! are validated at prepare (a malformed payload is refused deterministically,
+//! never after the decision commits) and applied at most once (the intent
+//! record tracks `applied`; a replayed or redelivered resolve never
+//! double-applies). Aborted resolutions drop intents with zero MVCC effect.
+//! Resolved intent tombstones are bounded by a replicated sweep
+//! ([`IntentCommand::SweepResolved`]) driven with a configurable retention
+//! ([`DistTxnDriver::sweep_resolved`]). Prepares fan out concurrently under
+//! the caller's deadline; `commit_ts` derives from the greatest prepare
+//! timestamp, so the decision is independent of completion order.
+//! Coordinator records remain engine-free (they carry no row data).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
@@ -76,6 +88,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use mongreldb_consensus::engine_sink::EngineApplySink;
 use mongreldb_consensus::error::ConsensusError;
 use mongreldb_consensus::group::{ConsensusGroup, GroupCommitReceipt, GroupConfig};
 use mongreldb_consensus::identity::{CommandKind, RaftNodeId, ReplicatedCommand};
@@ -125,6 +138,20 @@ pub const DIST_TXN_REJECTION_LIMIT: usize = 256;
 /// Default heartbeat-expiry window for the pending/push rules.
 pub const DEFAULT_PENDING_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Default retention of resolved intent tombstones before they are swept
+/// (spec section 12.8; see [`DistTxnDriver::sweep_resolved`]). The retention
+/// must exceed the longest possible prepare→resolve gap: the coordinator
+/// record's heartbeat expiry bounds a live transaction's prepare window, so
+/// the default dwarfs [`DEFAULT_PENDING_TIMEOUT`]. After a tombstone is
+/// swept, a late prepare of the same transaction is no longer refused on
+/// sight — the driver API never re-prepares a terminal transaction (a retry
+/// short-circuits on the durable coordinator record), so the gap is only
+/// reachable by callers driving `prepare_participant` directly.
+pub const DEFAULT_RESOLVED_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Default bound on tombstones removed by one sweep command.
+pub const DEFAULT_SWEEP_LIMIT: u32 = 1024;
+
 /// Deterministic command-id tags (sha256 domain separation). The command id
 /// of every protocol step is a pure function of the transaction id and the
 /// step, so a client retry re-proposes the identical id and the state
@@ -136,6 +163,7 @@ const TAG_COMMIT: &str = "dist-txn/commit";
 const TAG_ABORT: &str = "dist-txn/abort";
 const TAG_PREPARE: &str = "dist-txn/intents";
 const TAG_RESOLVE: &str = "dist-txn/resolve";
+const TAG_SWEEP: &str = "dist-txn/sweep-resolved";
 
 /// Derives the deterministic command id of one protocol step.
 fn command_id_for(tag: &str, txn_id: &TransactionId, extra: &[u8]) -> [u8; 16] {
@@ -359,9 +387,11 @@ pub struct WriteIntent {
     pub txn_id: TransactionId,
     /// The tablet-local row key.
     pub key: Vec<u8>,
-    /// Opaque reference to the staged value (engine-defined: an inline row
-    /// payload or a reference to staged storage; interpreted by the engine
-    /// binding, never by this layer).
+    /// The staged value: opaque to this layer, interpreted only by the
+    /// engine binding. The contract is the engine-defined
+    /// `mongreldb_core::database::StagedTxnWrite` encoding (a staged row put
+    /// or delete); an engine-backed participant validates it at prepare and
+    /// applies it at a committed resolution.
     pub value_ref: Vec<u8>,
     /// Prepare timestamp stamped by the coordinator driver that proposed
     /// the intent (identical on every replica).
@@ -431,6 +461,19 @@ pub struct ParticipantTxn {
     /// a tombstone: it bars any later prepare of the same transaction
     /// (resolution always wins a resolve/prepare race).
     pub resolution: Option<TxnDecision>,
+    /// Whether the resolution is fully materialized: a committed decision's
+    /// staged writes were applied to the engine core (or there was nothing
+    /// to apply); an aborted decision's intents were dropped. A replayed or
+    /// redelivered resolve never applies twice (idempotency across retries
+    /// and restarts). Defaults to `false` when decoding pre-binding
+    /// checkpoints so an upgraded sink re-materializes on the next resolve
+    /// replay.
+    #[serde(default)]
+    pub applied: bool,
+    /// When the resolution applied (the resolve command's leader-assigned
+    /// timestamp), feeding the resolved-tombstone sweep.
+    #[serde(default)]
+    pub resolved_at: Option<HlcTimestamp>,
 }
 
 /// One write made visible by a committed resolution (the resolution
@@ -607,6 +650,17 @@ pub enum IntentCommand {
         /// The durable decision.
         decision: TxnDecision,
     },
+    /// Sweeps resolved intent tombstones (and their `committed_writes`
+    /// entries) whose `resolved_at` is older than `older_than`, at most
+    /// `limit` per command, keeping the participant state bounded
+    /// (spec section 12.8's orphan machinery plus retention). Deterministic:
+    /// every replica sweeps the identical prefix in transaction-id order.
+    SweepResolved {
+        /// Sweep tombstones resolved before this timestamp.
+        older_than: HlcTimestamp,
+        /// Maximum tombstones to remove.
+        limit: u32,
+    },
 }
 
 /// The versioned envelope payload carrying one [`CoordinatorCommand`]
@@ -780,6 +834,16 @@ pub enum PrepareRejectionReason {
         expected: u64,
         /// The tablet's current version.
         found: u64,
+    },
+    /// A staged-write payload failed the engine binding's prepare-time
+    /// validation (engine-backed participants only): it does not decode as
+    /// the engine's staged-write contract, targets an unmounted table, or
+    /// carries a row the apply path would reject. Refused at prepare so an
+    /// un-appliable payload can never reach a committed resolution.
+    #[error("staged write is not appliable: {detail}")]
+    MalformedStagedWrite {
+        /// The validation failure.
+        detail: String,
     },
 }
 
@@ -1188,6 +1252,19 @@ struct IntentCheckpoint {
     state: IntentState,
 }
 
+/// The composite snapshot of an engine-backed participant sink: the engine
+/// image plus the intent checkpoint. Written and read only by sinks with a
+/// bound engine; unbound sinks keep the plain intent-checkpoint shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CompositeSnapshot {
+    format_version: u32,
+    engine: Vec<u8>,
+    intent: Vec<u8>,
+}
+
+/// Format version of the [`CompositeSnapshot`] envelope.
+pub const COMPOSITE_SNAPSHOT_FORMAT_VERSION: u32 = 1;
+
 /// Apply sink of a participant tablet group: applies [`IntentCommand`]s to
 /// [`IntentState`], checkpointed under `<group dir>/raft/state`.
 ///
@@ -1195,12 +1272,40 @@ struct IntentCheckpoint {
 /// refusals journaled, genuine faults (undecodable payload, wrong envelope
 /// type, conflicting decision on an already-resolved transaction) fail
 /// closed.
+///
+/// # Engine binding (Stage 3H MVCC)
+///
+/// With an [`EngineApplySink`] bound ([`IntentApplySink::open_with_engine`])
+/// the sink is the apply half of an engine-backed tablet group:
+///
+/// - `Transaction` envelopes of type `COMMAND_TYPE_DIST_TXN_INTENT` run the
+///   intent protocol below; every other command (engine transactions,
+///   catalog commands) is forwarded to the engine sink — one raft stream
+///   orders both.
+/// - `PersistIntents` validates every staged-write payload through the
+///   engine ([`mongreldb_core::database::Database::validate_staged_txn_writes`])
+///   before persisting: a payload the resolution apply could not apply is
+///   refused at prepare with [`PrepareRejectionReason::MalformedStagedWrite`],
+///   journaled, never wedging a committed stream later.
+/// - `Resolve` with a committed decision applies the staged writes into the
+///   tablet core ([`mongreldb_core::database::Database::apply_staged_txn_writes`])
+///   at the decision's `commit_ts` **before** the intent state transition is
+///   persisted, then marks the record `applied`. A crash between the engine
+///   apply and the checkpoint re-delivers the resolve; the re-apply restamps
+///   the identical row ids at a fresh synthetic epoch (visible state is
+///   unchanged — the same benign redelivery class the engine watermark
+///   absorbs for ordinary replicated commits). A replayed resolve under an
+///   already-`applied` record never re-applies.
+/// - Snapshots compose both halves ([`CompositeSnapshot`]); install restores
+///   the engine first, then the intent checkpoint.
 pub struct IntentApplySink {
     state: IntentState,
     position: LogPosition,
     command_id: Option<[u8; 16]>,
     /// `<group dir>/raft/state`.
     state_dir: std::path::PathBuf,
+    /// The bound engine apply sink (engine-backed tablet groups only).
+    engine: Option<Arc<Mutex<EngineApplySink>>>,
 }
 
 /// Whether two write sets carry the same keys and value references (the
@@ -1215,8 +1320,26 @@ fn same_write_set(a: &[WriteIntent], b: &[WriteIntent]) -> bool {
 
 impl IntentApplySink {
     /// Opens (creating if needed) the sink under `group_dir`; see
-    /// [`TxnStatusApplySink::open`] for the fail-closed contract.
+    /// [`TxnStatusApplySink::open`] for the fail-closed contract. The sink
+    /// has no engine binding (protocol-only participant).
     pub fn open(group_dir: &Path) -> Result<Self, DistTxnError> {
+        Self::open_with_binding(group_dir, None)
+    }
+
+    /// Opens the sink with an [`EngineApplySink`] bound: engine transaction
+    /// and catalog commands forward to it, prepares validate staged writes
+    /// against the core, and committed resolutions apply into it.
+    pub fn open_with_engine(
+        group_dir: &Path,
+        engine: Arc<Mutex<EngineApplySink>>,
+    ) -> Result<Self, DistTxnError> {
+        Self::open_with_binding(group_dir, Some(engine))
+    }
+
+    fn open_with_binding(
+        group_dir: &Path,
+        engine: Option<Arc<Mutex<EngineApplySink>>>,
+    ) -> Result<Self, DistTxnError> {
         let state_dir = group_dir.join("raft").join("state");
         std::fs::create_dir_all(&state_dir).map_err(DistTxnError::Io)?;
         let checkpoint_path = state_dir.join(INTENT_CHECKPOINT_FILENAME);
@@ -1231,6 +1354,7 @@ impl IntentApplySink {
                 position: LogPosition::ZERO,
                 command_id: None,
                 state_dir,
+                engine,
             });
         };
         let checkpoint: IntentCheckpoint = serde_json::from_slice(&bytes)
@@ -1250,6 +1374,7 @@ impl IntentApplySink {
             position: checkpoint.position,
             command_id: checkpoint.command_id,
             state_dir,
+            engine,
         })
     }
 
@@ -1277,6 +1402,11 @@ impl IntentApplySink {
             .filter(|txn| txn.resolution.is_none())
             .map(|txn| txn.txn_id)
             .collect()
+    }
+
+    /// The bound engine sink, when this is an engine-backed tablet sink.
+    pub fn engine(&self) -> Option<&Arc<Mutex<EngineApplySink>>> {
+        self.engine.as_ref()
     }
 
     fn checkpoint(&self) -> IntentCheckpoint {
@@ -1311,6 +1441,34 @@ impl IntentApplySink {
         while self.state.rejections.len() > DIST_TXN_REJECTION_LIMIT {
             self.state.rejections.pop_front();
         }
+    }
+
+    /// Applies one committed resolution's staged writes into the bound
+    /// engine core at the decision's commit timestamp. The synthetic WAL
+    /// transaction tag is a pure function of the transaction id, identical
+    /// on every replica.
+    fn apply_committed_to_engine(
+        engine: &Arc<Mutex<EngineApplySink>>,
+        txn_id: &TransactionId,
+        staged: &[Vec<u8>],
+        commit_ts: HlcTimestamp,
+    ) -> Result<(), StateMachineError> {
+        if staged.is_empty() {
+            return Ok(());
+        }
+        let db = engine
+            .lock()
+            .map_err(|_| StateMachineError::Sink("engine sink lock poisoned".to_owned()))?
+            .database()
+            .ok_or_else(|| {
+                StateMachineError::Sink("engine sink has no open database".to_owned())
+            })?;
+        let txn_tag = fnv1a_64(txn_id.as_bytes());
+        db.apply_staged_txn_writes(txn_tag, staged, commit_ts)
+            .map_err(|error| {
+                StateMachineError::Sink(format!("engine apply of committed resolution: {error}"))
+            })?;
+        Ok(())
     }
 
     /// The first unresolved intent of another transaction on `key`, if any
@@ -1395,6 +1553,33 @@ impl IntentApplySink {
                 return Ok(());
             }
         }
+        // Engine binding: every staged payload must be appliable at
+        // resolution. A malformed payload is refused at prepare — a decision
+        // committing over it would otherwise meet an un-appliable payload on
+        // every replica.
+        if let Some(engine) = &self.engine {
+            let staged: Vec<Vec<u8>> = intents
+                .iter()
+                .map(|intent| intent.value_ref.clone())
+                .collect();
+            let db = engine
+                .lock()
+                .map_err(|_| StateMachineError::Sink("engine sink lock poisoned".to_owned()))?
+                .database()
+                .ok_or_else(|| {
+                    StateMachineError::Sink("engine sink has no open database".to_owned())
+                })?;
+            if let Err(error) = db.validate_staged_txn_writes(&staged) {
+                self.journal(
+                    command,
+                    txn_id,
+                    PrepareRejectionReason::MalformedStagedWrite {
+                        detail: error.to_string(),
+                    },
+                );
+                return Ok(());
+            }
+        }
         // Prepare step 3: persist the intents (durable before the response).
         self.state.txns.insert(
             txn_id,
@@ -1404,6 +1589,8 @@ impl IntentApplySink {
                 command_id: command.command_id().unwrap_or([0u8; 16]),
                 intents: intents.to_vec(),
                 resolution: None,
+                applied: false,
+                resolved_at: None,
             },
         );
         Ok(())
@@ -1411,14 +1598,18 @@ impl IntentApplySink {
 
     fn apply_resolve(
         &mut self,
+        command: &AppliedCommand,
         txn_id: TransactionId,
         decision: &TxnDecision,
     ) -> Result<(), StateMachineError> {
+        let engine = self.engine.clone();
+        let resolved_at = command.commit_ts();
         match self.state.txns.get_mut(&txn_id) {
             None => {
                 // Resolution of a transaction this participant never
                 // prepared: record a tombstone so a late prepare loses the
-                // race against the decision (resolution always wins).
+                // race against the decision (resolution always wins). Nothing
+                // was staged here, so there is nothing to apply.
                 self.state.txns.insert(
                     txn_id,
                     ParticipantTxn {
@@ -1427,18 +1618,56 @@ impl IntentApplySink {
                         command_id: [0u8; 16],
                         intents: Vec::new(),
                         resolution: Some(decision.clone()),
+                        applied: true,
+                        resolved_at,
                     },
                 );
                 Ok(())
             }
             Some(existing) => match (&existing.resolution, decision) {
-                (Some(prior), new) if *prior == *new => Ok(()),
+                (Some(prior), new) if *prior == *new => {
+                    // Idempotent replay of the same decision: never re-apply.
+                    // The one exception is a record whose resolution was
+                    // never materialized (a checkpoint written before the
+                    // engine binding landed) — materialize it now from the
+                    // recorded committed writes.
+                    if !existing.applied {
+                        if let (Some(engine), TxnDecision::Committed { commit_ts }) =
+                            (&engine, prior)
+                        {
+                            let staged: Vec<Vec<u8>> = self
+                                .state
+                                .committed_writes
+                                .iter()
+                                .filter(|write| write.txn_id == txn_id)
+                                .map(|write| write.value_ref.clone())
+                                .collect();
+                            Self::apply_committed_to_engine(engine, &txn_id, &staged, *commit_ts)?;
+                        }
+                        if let Some(existing) = self.state.txns.get_mut(&txn_id) {
+                            existing.applied = true;
+                        }
+                    }
+                    Ok(())
+                }
                 (Some(prior), new) => Err(StateMachineError::Corrupt(format!(
                     "conflicting resolve decisions for transaction {txn_id}: \
                      applied {prior:?}, got {new:?}"
                 ))),
                 (None, TxnDecision::Committed { commit_ts }) => {
                     let commit_ts = *commit_ts;
+                    // Engine first, state transition second: the engine apply
+                    // is durable before this sink's checkpoint persists
+                    // (a crash in between re-delivers and re-applies the
+                    // identical rows benignly; never skips them).
+                    if let Some(engine) = &engine {
+                        let staged: Vec<Vec<u8>> = existing
+                            .intents
+                            .iter()
+                            .map(|intent| intent.value_ref.clone())
+                            .collect();
+                        Self::apply_committed_to_engine(engine, &txn_id, &staged, commit_ts)?;
+                    }
                     let intents = std::mem::take(&mut existing.intents);
                     let writes = intents.into_iter().map(|intent| CommittedWrite {
                         key: intent.key,
@@ -1447,16 +1676,41 @@ impl IntentApplySink {
                         txn_id,
                     });
                     existing.resolution = Some(decision.clone());
+                    existing.applied = true;
+                    existing.resolved_at = resolved_at;
                     self.state.committed_writes.extend(writes);
                     Ok(())
                 }
                 (None, TxnDecision::Aborted { .. }) => {
+                    // Abort: intents are dropped with zero MVCC effect.
                     existing.intents.clear();
                     existing.resolution = Some(decision.clone());
+                    existing.applied = true;
+                    existing.resolved_at = resolved_at;
                     Ok(())
                 }
             },
         }
+    }
+
+    /// Sweeps resolved tombstones older than `older_than`, at most `limit`,
+    /// in transaction-id order (deterministic on every replica).
+    fn apply_sweep(&mut self, older_than: HlcTimestamp, limit: u32) {
+        let mut swept = Vec::new();
+        for (txn_id, txn) in &self.state.txns {
+            if swept.len() >= limit as usize {
+                break;
+            }
+            if txn.resolution.is_some() && txn.resolved_at.is_some_and(|at| at < older_than) {
+                swept.push(*txn_id);
+            }
+        }
+        for txn_id in &swept {
+            self.state.txns.remove(txn_id);
+        }
+        self.state
+            .committed_writes
+            .retain(|write| !swept.contains(&write.txn_id));
     }
 }
 
@@ -1471,48 +1725,77 @@ impl ApplySink for IntentApplySink {
                 transaction.envelope.verify().map_err(|error| {
                     StateMachineError::Corrupt(format!("intent envelope: {error}"))
                 })?;
-                if transaction.envelope.command_type != COMMAND_TYPE_DIST_TXN_INTENT {
+                if transaction.envelope.command_type == COMMAND_TYPE_DIST_TXN_INTENT {
+                    let record = IntentCommandRecord::decode(&transaction.envelope.payload)
+                        .map_err(|error| StateMachineError::Corrupt(error.to_string()))?;
+                    match record.command {
+                        IntentCommand::SetTabletVersions {
+                            schema_version,
+                            authz_version,
+                        } => {
+                            self.state.schema_version = schema_version;
+                            self.state.authz_version = authz_version;
+                        }
+                        IntentCommand::PersistIntents {
+                            txn_id,
+                            expected_schema_version,
+                            expected_authz_version,
+                            prepare_ts,
+                            intents,
+                        } => {
+                            self.apply_persist(
+                                command,
+                                txn_id,
+                                expected_schema_version,
+                                expected_authz_version,
+                                prepare_ts,
+                                &intents,
+                            )?;
+                        }
+                        IntentCommand::Resolve { txn_id, decision } => {
+                            self.apply_resolve(command, txn_id, &decision)?;
+                        }
+                        IntentCommand::SweepResolved { older_than, limit } => {
+                            self.apply_sweep(older_than, limit);
+                        }
+                    }
+                } else if let Some(engine) = &self.engine {
+                    // One raft stream orders both: engine transaction
+                    // commands forward to the bound engine sink (which
+                    // re-validates the envelope type itself).
+                    engine
+                        .lock()
+                        .map_err(|_| StateMachineError::Sink("engine sink lock poisoned".into()))?
+                        .apply(command)?;
+                } else {
                     return Err(StateMachineError::Corrupt(format!(
                         "intent command_type {} is not COMMAND_TYPE_DIST_TXN_INTENT",
                         transaction.envelope.command_type
                     )));
                 }
-                let record = IntentCommandRecord::decode(&transaction.envelope.payload)
-                    .map_err(|error| StateMachineError::Corrupt(error.to_string()))?;
-                match record.command {
-                    IntentCommand::SetTabletVersions {
-                        schema_version,
-                        authz_version,
-                    } => {
-                        self.state.schema_version = schema_version;
-                        self.state.authz_version = authz_version;
-                    }
-                    IntentCommand::PersistIntents {
-                        txn_id,
-                        expected_schema_version,
-                        expected_authz_version,
-                        prepare_ts,
-                        intents,
-                    } => {
-                        self.apply_persist(
-                            command,
-                            txn_id,
-                            expected_schema_version,
-                            expected_authz_version,
-                            prepare_ts,
-                            &intents,
-                        )?;
-                    }
-                    IntentCommand::Resolve { txn_id, decision } => {
-                        self.apply_resolve(txn_id, &decision)?;
-                    }
+            }
+            ReplicatedCommand::Catalog(_) => {
+                if let Some(engine) = &self.engine {
+                    engine
+                        .lock()
+                        .map_err(|_| StateMachineError::Sink("engine sink lock poisoned".into()))?
+                        .apply(command)?;
+                } else {
+                    return Err(StateMachineError::Corrupt(
+                        "catalog command on a participant intent group".to_owned(),
+                    ));
                 }
             }
-            ReplicatedCommand::Maintenance(_) | ReplicatedCommand::Noop => {}
-            ReplicatedCommand::Catalog(_) => {
-                return Err(StateMachineError::Corrupt(
-                    "catalog command on a participant intent group".to_owned(),
-                ));
+            // Maintenance commands are node-runtime directives and Noop
+            // advances the commit index; the engine half tracks them for its
+            // snapshot watermark, the intent state ignores them.
+            ReplicatedCommand::Maintenance(_) | ReplicatedCommand::Noop => {
+                if let Some(engine) = &self.engine {
+                    engine
+                        .lock()
+                        .map_err(|_| StateMachineError::Sink("engine sink lock poisoned".into()))?
+                        .apply(command)?;
+                }
             }
         }
         self.position = command.position;
@@ -1523,14 +1806,55 @@ impl ApplySink for IntentApplySink {
     }
 
     fn snapshot(&self) -> Result<Vec<u8>, StateMachineError> {
-        serde_json::to_vec(&self.checkpoint())
-            .map_err(|error| StateMachineError::Sink(format!("intent snapshot encode: {error}")))
+        let intent = serde_json::to_vec(&self.checkpoint())
+            .map_err(|error| StateMachineError::Sink(format!("intent snapshot encode: {error}")))?;
+        match &self.engine {
+            None => Ok(intent),
+            Some(engine) => {
+                let engine_image = engine
+                    .lock()
+                    .map_err(|_| StateMachineError::Sink("engine sink lock poisoned".into()))?
+                    .snapshot()?;
+                serde_json::to_vec(&CompositeSnapshot {
+                    format_version: COMPOSITE_SNAPSHOT_FORMAT_VERSION,
+                    engine: engine_image,
+                    intent,
+                })
+                .map_err(|error| {
+                    StateMachineError::Sink(format!("composite snapshot encode: {error}"))
+                })
+            }
+        }
     }
 
     fn install(&mut self, data: &[u8]) -> Result<(), StateMachineError> {
-        let checkpoint: IntentCheckpoint = serde_json::from_slice(data).map_err(|error| {
-            StateMachineError::Corrupt(format!("intent snapshot decode: {error}"))
-        })?;
+        // An engine-backed sink restores the engine image first (the
+        // fallible half: it refuses over live state), then the intent
+        // checkpoint. An unbound sink keeps the plain checkpoint shape.
+        let intent_bytes;
+        if let Some(engine) = &self.engine {
+            let composite: CompositeSnapshot = serde_json::from_slice(data).map_err(|error| {
+                StateMachineError::Corrupt(format!("composite snapshot decode: {error}"))
+            })?;
+            if composite.format_version != COMPOSITE_SNAPSHOT_FORMAT_VERSION {
+                return Err(StateMachineError::Corrupt(format!(
+                    "unsupported composite snapshot format version {} (supported \
+                     {COMPOSITE_SNAPSHOT_FORMAT_VERSION})",
+                    composite.format_version
+                )));
+            }
+            engine
+                .lock()
+                .map_err(|_| StateMachineError::Sink("engine sink lock poisoned".into()))?
+                .install(&composite.engine)?;
+            intent_bytes = composite.intent;
+        } else {
+            intent_bytes = data.to_vec();
+        }
+        let checkpoint: IntentCheckpoint =
+            serde_json::from_slice(&intent_bytes).map_err(|error| {
+                StateMachineError::Corrupt(format!("intent snapshot decode: {error}"))
+            })?;
         if !(MIN_SUPPORTED_DIST_TXN_CHECKPOINT_FORMAT_VERSION..=DIST_TXN_CHECKPOINT_FORMAT_VERSION)
             .contains(&checkpoint.format_version)
         {
@@ -1573,8 +1897,10 @@ where
 }
 
 /// Shared member view for the leader-retry loop.
-trait GroupMember {
+pub trait GroupMember {
+    /// This member's raft node id.
     fn node_id(&self) -> RaftNodeId;
+    /// The group's current leader as this member sees it, if any.
     fn current_leader(&self) -> Option<RaftNodeId>;
 }
 
@@ -1881,6 +2207,261 @@ impl<T: RaftTransport> GroupMember for IntentGroup<T> {
     }
 }
 
+/// The participant-group surface the protocol driver drives (spec section
+/// 12.8): propose intent commands, read intent records at the applied
+/// watermark. Implemented by the protocol-only [`IntentGroup`] and by
+/// [`TabletTxnGroup`], whose engine binding materializes committed
+/// resolutions into the tablet core.
+pub trait IntentGroupMember<T: RaftTransport>: GroupMember {
+    /// The group's durable id.
+    fn raft_group_id(&self) -> RaftGroupId;
+    /// The underlying consensus group (applied watermark, metrics,
+    /// membership, shutdown).
+    fn group(&self) -> &ConsensusGroup<T>;
+    /// Proposes one intent command (quorum durability) and waits for
+    /// commit + apply; see [`IntentGroup::propose`]. A refused prepare
+    /// returns its journaled [`PrepareRejectionReason`].
+    fn propose(
+        &self,
+        command_id: [u8; 16],
+        command: IntentCommand,
+        control: &ExecutionControl,
+    ) -> impl Future<
+        Output = Result<(GroupCommitReceipt, Option<PrepareRejectionReason>), DistTxnError>,
+    > + Send;
+    /// One transaction's intent record at this member's applied watermark.
+    fn txn(&self, txn_id: &TransactionId) -> Option<ParticipantTxn>;
+    /// Transaction ids holding unresolved intents at this member's applied
+    /// watermark.
+    fn unresolved_txn_ids(&self) -> Vec<TransactionId>;
+    /// The full replicated intent state at this member's applied watermark.
+    fn state(&self) -> IntentState;
+}
+
+impl<T: RaftTransport> IntentGroupMember<T> for IntentGroup<T> {
+    fn raft_group_id(&self) -> RaftGroupId {
+        self.raft_group_id
+    }
+
+    fn group(&self) -> &ConsensusGroup<T> {
+        &self.group
+    }
+
+    fn propose(
+        &self,
+        command_id: [u8; 16],
+        command: IntentCommand,
+        control: &ExecutionControl,
+    ) -> impl Future<
+        Output = Result<(GroupCommitReceipt, Option<PrepareRejectionReason>), DistTxnError>,
+    > + Send {
+        self.propose(command_id, command, control)
+    }
+
+    fn txn(&self, txn_id: &TransactionId) -> Option<ParticipantTxn> {
+        self.txn(txn_id)
+    }
+
+    fn unresolved_txn_ids(&self) -> Vec<TransactionId> {
+        self.unresolved_txn_ids()
+    }
+
+    fn state(&self) -> IntentState {
+        self.state()
+    }
+}
+
+/// One member of an engine-backed tablet group: a [`ConsensusGroup`] whose
+/// apply sink is an [`IntentApplySink`] bound to an [`EngineApplySink`]
+/// (Stage 3H MVCC binding). One raft stream orders the two-phase-commit
+/// intent protocol and the tablet's engine transaction/catalog commands; a
+/// committed resolution applies its staged writes into the tablet core
+/// through the same replicated apply path the engine sink uses.
+pub struct TabletTxnGroup<T: RaftTransport> {
+    group: ConsensusGroup<T>,
+    sink: Arc<Mutex<IntentApplySink>>,
+    engine: Arc<Mutex<EngineApplySink>>,
+    raft_group_id: RaftGroupId,
+}
+
+impl<T: RaftTransport> TabletTxnGroup<T> {
+    /// Starts the raft task over an [`IntentApplySink`] bound to `engine`
+    /// (opened by the caller, e.g. through
+    /// [`mongreldb_consensus::engine_sink::open_engine_sink`], so the node
+    /// runtime owns the engine's directory layout). The engine must be the
+    /// apply sink of THIS group's engine commands: the sink forwards them.
+    pub async fn create(
+        mut group_config: GroupConfig,
+        raft_group_id: RaftGroupId,
+        transport: Arc<T>,
+        engine: Arc<Mutex<EngineApplySink>>,
+    ) -> Result<Self, DistTxnError> {
+        group_config.cluster_name = raft_group_id.to_hex();
+        let sink = Arc::new(Mutex::new(IntentApplySink::open_with_engine(
+            &group_config.dir,
+            engine.clone(),
+        )?));
+        let group = ConsensusGroup::create(
+            group_config,
+            transport,
+            sink.clone() as Arc<Mutex<dyn ApplySink>>,
+        )
+        .await?;
+        Ok(TabletTxnGroup {
+            group,
+            sink,
+            engine,
+            raft_group_id,
+        })
+    }
+
+    /// The underlying consensus group.
+    pub fn group(&self) -> &ConsensusGroup<T> {
+        &self.group
+    }
+
+    /// The group's durable id.
+    pub fn raft_group_id(&self) -> RaftGroupId {
+        self.raft_group_id
+    }
+
+    /// The bound engine sink (read-path inspection, tests).
+    pub fn engine(&self) -> &Arc<Mutex<EngineApplySink>> {
+        &self.engine
+    }
+
+    /// Bootstraps a pristine group; see [`TxnStatusGroup::bootstrap`].
+    pub async fn bootstrap(&self, members: &[(RaftNodeId, String)]) -> Result<(), DistTxnError> {
+        let mut map = BTreeMap::new();
+        for (raft_id, address) in members {
+            map.insert(*raft_id, basic_node(address)?);
+        }
+        self.group
+            .bootstrap(map)
+            .await
+            .map_err(DistTxnError::Consensus)
+    }
+
+    /// Proposes one intent command (quorum durability) and waits for
+    /// commit + apply; see [`IntentGroup::propose`].
+    pub async fn propose(
+        &self,
+        command_id: [u8; 16],
+        command: IntentCommand,
+        control: &ExecutionControl,
+    ) -> Result<(GroupCommitReceipt, Option<PrepareRejectionReason>), DistTxnError> {
+        let payload = IntentCommandRecord::new(command).encode()?;
+        let envelope = CommandEnvelope::new(COMMAND_TYPE_DIST_TXN_INTENT, command_id, payload);
+        let receipt = self
+            .group
+            .propose(CommandKind::Transaction, envelope, control)
+            .await?;
+        let rejection = {
+            let sink = self.sink.lock().map_err(|_| {
+                DistTxnError::InvalidRequest("intent sink lock poisoned".to_owned())
+            })?;
+            sink.state()
+                .rejections
+                .iter()
+                .rev()
+                .find(|entry| entry.command_id == Some(command_id))
+                .map(|entry| entry.reason.clone())
+        };
+        Ok((receipt, rejection))
+    }
+
+    /// One transaction's intent record at this node's applied watermark.
+    pub fn txn(&self, txn_id: &TransactionId) -> Option<ParticipantTxn> {
+        self.sink
+            .lock()
+            .expect("intent sink lock poisoned")
+            .txn(txn_id)
+            .cloned()
+    }
+
+    /// Transaction ids holding unresolved intents at this node's applied
+    /// watermark (the orphan-sweep input).
+    pub fn unresolved_txn_ids(&self) -> Vec<TransactionId> {
+        self.sink
+            .lock()
+            .expect("intent sink lock poisoned")
+            .unresolved_txn_ids()
+    }
+
+    /// The writes made visible by committed resolutions at this node's
+    /// applied watermark.
+    pub fn committed_writes(&self) -> Vec<CommittedWrite> {
+        self.sink
+            .lock()
+            .expect("intent sink lock poisoned")
+            .state()
+            .committed_writes
+            .clone()
+    }
+
+    /// The full replicated intent state at this node's applied watermark.
+    pub fn state(&self) -> IntentState {
+        self.sink
+            .lock()
+            .expect("intent sink lock poisoned")
+            .state()
+            .clone()
+    }
+
+    /// Graceful shutdown of the underlying group.
+    pub async fn shutdown(&self) -> Result<(), DistTxnError> {
+        self.group.shutdown().await.map_err(DistTxnError::Consensus)
+    }
+
+    /// Process-free crash simulation; see [`TxnStatusGroup::crash`].
+    pub async fn crash(self) {
+        self.group.crash().await;
+    }
+}
+
+impl<T: RaftTransport> GroupMember for TabletTxnGroup<T> {
+    fn node_id(&self) -> RaftNodeId {
+        self.group.node_id()
+    }
+
+    fn current_leader(&self) -> Option<RaftNodeId> {
+        self.group.metrics().current_leader
+    }
+}
+
+impl<T: RaftTransport> IntentGroupMember<T> for TabletTxnGroup<T> {
+    fn raft_group_id(&self) -> RaftGroupId {
+        self.raft_group_id
+    }
+
+    fn group(&self) -> &ConsensusGroup<T> {
+        &self.group
+    }
+
+    fn propose(
+        &self,
+        command_id: [u8; 16],
+        command: IntentCommand,
+        control: &ExecutionControl,
+    ) -> impl Future<
+        Output = Result<(GroupCommitReceipt, Option<PrepareRejectionReason>), DistTxnError>,
+    > + Send {
+        self.propose(command_id, command, control)
+    }
+
+    fn txn(&self, txn_id: &TransactionId) -> Option<ParticipantTxn> {
+        self.txn(txn_id)
+    }
+
+    fn unresolved_txn_ids(&self) -> Vec<TransactionId> {
+        self.unresolved_txn_ids()
+    }
+
+    fn state(&self) -> IntentState {
+        self.state()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Protocol driver (coordinator logic; spec section 12.8 flows)
 // ---------------------------------------------------------------------------
@@ -1897,6 +2478,13 @@ pub struct DistTxnConfig {
     /// Heartbeat-expiry window: a non-terminal record whose heartbeat is
     /// older than this may be pushed to `Aborted` by any node.
     pub pending_timeout: Duration,
+    /// How long resolved intent tombstones are retained before
+    /// [`DistTxnDriver::sweep_resolved`] may remove them
+    /// ([`DEFAULT_RESOLVED_RETENTION`]; see its documentation for the
+    /// retention-window rule).
+    pub resolved_retention: Duration,
+    /// Bound on tombstones one sweep command removes.
+    pub sweep_limit: u32,
     /// HLC skew bound of the driver's clock.
     pub hlc_max_skew: Duration,
     /// HLC node tiebreaker of the driver's clock.
@@ -1914,6 +2502,8 @@ impl Default for DistTxnConfig {
             selection: CoordinatorSelection::TxnIdDerived,
             status_partitions: BTreeMap::new(),
             pending_timeout: DEFAULT_PENDING_TIMEOUT,
+            resolved_retention: DEFAULT_RESOLVED_RETENTION,
+            sweep_limit: DEFAULT_SWEEP_LIMIT,
             hlc_max_skew: Duration::from_millis(500),
             node_tiebreaker: 0,
             propose_retry_interval: Duration::from_millis(50),
@@ -2032,6 +2622,17 @@ pub struct SweepReport {
     pub in_flight: usize,
     /// Intent sets with no coordinator record (left untouched).
     pub unknown: usize,
+}
+
+/// Tallies of one resolved-tombstone sweep
+/// ([`DistTxnDriver::sweep_resolved`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SweepResolvedReport {
+    /// Tombstones removed by this sweep.
+    pub swept: usize,
+    /// Resolved tombstones older than the retention cutoff that remain
+    /// (the sweep is bounded; call again to continue).
+    pub remaining: usize,
 }
 
 /// Broadcast tally of one decision fan-out.
@@ -2357,9 +2958,9 @@ impl DistTxnDriver {
     /// timestamp + durability proof). A refusal (conflict, stale versions,
     /// lost resolution race) is [`DistTxnError::PrepareRejected`]; an
     /// idempotent replay returns the original stored prepare timestamp.
-    pub async fn prepare_participant<T: RaftTransport>(
+    pub async fn prepare_participant<T: RaftTransport, G: IntentGroupMember<T>>(
         &self,
-        intents: &[IntentGroup<T>],
+        intents: &[G],
         txn_id: &TransactionId,
         writes: &ParticipantWrites,
         control: &ExecutionControl,
@@ -2485,10 +3086,10 @@ impl DistTxnDriver {
     /// answers only after the decision is durable. The durable record is
     /// authoritative: if a race already decided the transaction, the
     /// recorded decision is returned (commit) or surfaced (abort).
-    pub async fn decide_commit<T: RaftTransport>(
+    pub async fn decide_commit<T: RaftTransport, G: IntentGroupMember<T>>(
         &self,
         status: &[TxnStatusGroup<T>],
-        participants: &BTreeMap<RaftGroupId, Vec<IntentGroup<T>>>,
+        participants: &BTreeMap<RaftGroupId, Vec<G>>,
         txn_id: &TransactionId,
         prepared: &[PrepareToken],
         observed: &[HlcTimestamp],
@@ -2537,10 +3138,10 @@ impl DistTxnDriver {
     /// broadcasts it to the participants. The record — never the proposal's
     /// local success — decides the returned outcome, so retries and races
     /// converge to the original durable decision.
-    async fn finalize_decision<T: RaftTransport>(
+    async fn finalize_decision<T: RaftTransport, G: IntentGroupMember<T>>(
         &self,
         status: &[TxnStatusGroup<T>],
-        participants: &BTreeMap<RaftGroupId, Vec<IntentGroup<T>>>,
+        participants: &BTreeMap<RaftGroupId, Vec<G>>,
         txn_id: &TransactionId,
         control: &ExecutionControl,
     ) -> Result<TxnOutcome, DistTxnError> {
@@ -2597,10 +3198,10 @@ impl DistTxnDriver {
     /// durable final state; the caller maps `Aborted` to
     /// [`DistTxnError::Aborted`] and a raced `Committed` to the commit
     /// outcome.
-    async fn finalize_abort<T: RaftTransport>(
+    async fn finalize_abort<T: RaftTransport, G: IntentGroupMember<T>>(
         &self,
         status: &[TxnStatusGroup<T>],
-        participants: &BTreeMap<RaftGroupId, Vec<IntentGroup<T>>>,
+        participants: &BTreeMap<RaftGroupId, Vec<G>>,
         txn_id: &TransactionId,
         reason: AbortReason,
         control: &ExecutionControl,
@@ -2683,10 +3284,17 @@ impl DistTxnDriver {
     /// post-fence failure is [`DistTxnError::OutcomeAmbiguous`] (never a
     /// false abort). Re-running with the same transaction id and
     /// idempotency key converges to the original outcome.
-    pub async fn commit<T: RaftTransport>(
+    ///
+    /// Phase 1 fans out: every participant's prepare runs concurrently
+    /// under the caller's deadline rather than serially. `commit_ts` derives
+    /// from the greatest durably observed timestamp (a max over the whole
+    /// prepare set), so the decision is identical regardless of completion
+    /// order, and the first prepare failure in request order aborts —
+    /// deterministically the same outcome as the serial rule.
+    pub async fn commit<T: RaftTransport, G: IntentGroupMember<T>>(
         &self,
         status: &[TxnStatusGroup<T>],
-        participants: &BTreeMap<RaftGroupId, Vec<IntentGroup<T>>>,
+        participants: &BTreeMap<RaftGroupId, Vec<G>>,
         request: CommitRequest,
         control: &ExecutionControl,
     ) -> Result<TxnOutcome, DistTxnError> {
@@ -2728,8 +3336,7 @@ impl DistTxnDriver {
         // Single-participant fast path: no MarkPreparing progress write
         // (see the module docs).
         let general_path = request.writes.len() > 1;
-        let mut prepared = Vec::with_capacity(request.writes.len());
-        let mut observed = request.observed.clone();
+        let mut prepare_futures = Vec::with_capacity(request.writes.len());
         for writes in &request.writes {
             let intent_members = participants
                 .get(&writes.participant.raft_group_id)
@@ -2739,11 +3346,19 @@ impl DistTxnDriver {
                         writes.participant.raft_group_id
                     ))
                 })?;
-            let token = match self
-                .prepare_participant(intent_members, &request.txn_id, writes, control)
-                .await
-            {
-                Ok(token) => token,
+            prepare_futures.push(self.prepare_participant(
+                intent_members,
+                &request.txn_id,
+                writes,
+                control,
+            ));
+        }
+        let results = run_all(prepare_futures).await;
+        // The first failure in request order aborts (the serial rule).
+        let mut prepared = Vec::with_capacity(results.len());
+        for result in results {
+            match result {
+                Ok(token) => prepared.push(token),
                 Err(error) => {
                     let reason = abort_reason_of(&error);
                     return match self
@@ -2767,12 +3382,15 @@ impl DistTxnDriver {
                         }),
                     };
                 }
-            };
-            if general_path {
-                observed.push(token.prepare_ts);
-                let max_observed = observed.iter().copied().max().unwrap_or(HlcTimestamp::ZERO);
+            }
+        }
+        let mut observed = request.observed.clone();
+        if general_path {
+            observed.extend(prepared.iter().map(|token| token.prepare_ts));
+            let max_observed = observed.iter().copied().max().unwrap_or(HlcTimestamp::ZERO);
+            for token in &prepared {
                 if let Err(error) = self
-                    .mark_prepared(status, &request.txn_id, &token, max_observed, control)
+                    .mark_prepared(status, &request.txn_id, token, max_observed, control)
                     .await
                 {
                     let reason = match error {
@@ -2805,7 +3423,6 @@ impl DistTxnDriver {
                     }
                 }
             }
-            prepared.push(token);
         }
         self.decide_commit(
             status,
@@ -2822,10 +3439,10 @@ impl DistTxnDriver {
     /// raft group and removes intents at every participant. A transaction
     /// that already committed cannot abort — the durable commit outcome is
     /// returned instead.
-    pub async fn abort<T: RaftTransport>(
+    pub async fn abort<T: RaftTransport, G: IntentGroupMember<T>>(
         &self,
         status: &[TxnStatusGroup<T>],
-        participants: &BTreeMap<RaftGroupId, Vec<IntentGroup<T>>>,
+        participants: &BTreeMap<RaftGroupId, Vec<G>>,
         txn_id: &TransactionId,
         reason: AbortReason,
         control: &ExecutionControl,
@@ -2837,9 +3454,9 @@ impl DistTxnDriver {
     /// Broadcasts the durable decision to every participant (best effort:
     /// groups that do not answer are left to lazy recovery — the sweep and
     /// drive-by resolution re-deliver the same deterministic command).
-    pub async fn broadcast_resolve<T: RaftTransport>(
+    pub async fn broadcast_resolve<T: RaftTransport, G: IntentGroupMember<T>>(
         &self,
-        participants: &BTreeMap<RaftGroupId, Vec<IntentGroup<T>>>,
+        participants: &BTreeMap<RaftGroupId, Vec<G>>,
         txn_id: &TransactionId,
         txn_participants: &[TxnParticipant],
         decision: TxnDecision,
@@ -2908,8 +3525,8 @@ impl DistTxnDriver {
     /// (any member's applied view proves durability — an intent record only
     /// appears after its raft entry committed; absence is treated
     /// conservatively, never as abort evidence).
-    fn probe_participant<T: RaftTransport>(
-        participants: &BTreeMap<RaftGroupId, Vec<IntentGroup<T>>>,
+    fn probe_participant<T: RaftTransport, G: IntentGroupMember<T>>(
+        participants: &BTreeMap<RaftGroupId, Vec<G>>,
         participant: &TxnParticipant,
         txn_id: &TransactionId,
     ) -> Option<ParticipantTxn> {
@@ -2924,10 +3541,10 @@ impl DistTxnDriver {
     /// greater than every durably observed timestamp; one with missing
     /// intents is pushed to `Aborted` only when its heartbeat expiry has
     /// passed — otherwise it is left to its (possibly live) coordinator.
-    pub async fn recover<T: RaftTransport>(
+    pub async fn recover<T: RaftTransport, G: IntentGroupMember<T>>(
         &self,
         status: &[TxnStatusGroup<T>],
-        participants: &BTreeMap<RaftGroupId, Vec<IntentGroup<T>>>,
+        participants: &BTreeMap<RaftGroupId, Vec<G>>,
         txn_id: &TransactionId,
         now: HlcTimestamp,
         control: &ExecutionControl,
@@ -3057,10 +3674,10 @@ impl DistTxnDriver {
     /// transaction"): forces `Aborted` on a heartbeat-expired non-terminal
     /// record — and only there. A terminal record is re-broadcast; an
     /// unexpired one is left alone (never aborted on suspicion).
-    pub async fn push_expired<T: RaftTransport>(
+    pub async fn push_expired<T: RaftTransport, G: IntentGroupMember<T>>(
         &self,
         status: &[TxnStatusGroup<T>],
-        participants: &BTreeMap<RaftGroupId, Vec<IntentGroup<T>>>,
+        participants: &BTreeMap<RaftGroupId, Vec<G>>,
         txn_id: &TransactionId,
         now: HlcTimestamp,
         control: &ExecutionControl,
@@ -3118,10 +3735,10 @@ impl DistTxnDriver {
     /// rules — a durable decision resolves the intents in that direction; a
     /// heartbeat-expired non-terminal record is pushed first, then
     /// resolved; anything else is left untouched.
-    pub async fn resolve_orphan<T: RaftTransport>(
+    pub async fn resolve_orphan<T: RaftTransport, G: IntentGroupMember<T>>(
         &self,
         status: &[TxnStatusGroup<T>],
-        intent_members: &[IntentGroup<T>],
+        intent_members: &[G],
         txn_id: &TransactionId,
         now: HlcTimestamp,
         control: &ExecutionControl,
@@ -3205,10 +3822,10 @@ impl DistTxnDriver {
     /// orphan (the resolve broadcast reaches the record's other
     /// participants only when they are supplied; here the local group is
     /// resolved directly and deterministically).
-    async fn finalize_abort_for_one<T: RaftTransport>(
+    async fn finalize_abort_for_one<T: RaftTransport, G: IntentGroupMember<T>>(
         &self,
         status: &[TxnStatusGroup<T>],
-        intent_members: &[IntentGroup<T>],
+        intent_members: &[G],
         record: &TxnRecord,
         reason: AbortReason,
         control: &ExecutionControl,
@@ -3291,10 +3908,10 @@ impl DistTxnDriver {
     /// ([`DistTxnDriver::resolve_orphan`]). Live, unexpired transactions
     /// are left untouched — the timeout rules are honored, never
     /// suspicion.
-    pub async fn sweep_orphans<T: RaftTransport>(
+    pub async fn sweep_orphans<T: RaftTransport, G: IntentGroupMember<T>>(
         &self,
         status: &[TxnStatusGroup<T>],
-        intent_members: &[IntentGroup<T>],
+        intent_members: &[G],
         now: HlcTimestamp,
         control: &ExecutionControl,
     ) -> Result<SweepReport, DistTxnError> {
@@ -3309,7 +3926,7 @@ impl DistTxnDriver {
         let orphans = intent_members
             .iter()
             .max_by_key(|member| member.group().applied_position().index)
-            .map(IntentGroup::unresolved_txn_ids)
+            .map(|member| member.unresolved_txn_ids())
             .unwrap_or_default();
         for txn_id in orphans {
             match self
@@ -3328,6 +3945,132 @@ impl DistTxnDriver {
         }
         Ok(report)
     }
+
+    /// Sweeps resolved intent tombstones from one participant group
+    /// (spec section 12.8): tombstones whose `resolved_at` is older than
+    /// `now - resolved_retention` are removed, at most
+    /// [`DistTxnConfig::sweep_limit`] per call, keeping the participant
+    /// state bounded. The sweep is itself a replicated command, so every
+    /// replica removes the identical set deterministically. Unresolved
+    /// intents are never touched. Engine state is untouched: sweeping a
+    /// tombstone only drops the protocol record (the rows a committed
+    /// resolution applied stay applied).
+    ///
+    /// Retention rule: the retention must exceed the longest possible
+    /// prepare→resolve gap (bounded by the heartbeat-expiry push rules).
+    /// The driver API never re-prepares a terminal transaction — a commit
+    /// retry short-circuits on the durable coordinator record — so a
+    /// prepare landing after its tombstone was swept is unreachable through
+    /// [`DistTxnDriver::commit`]; only a caller driving
+    /// [`DistTxnDriver::prepare_participant`] directly for an aged-out
+    /// transaction could stage one, and the orphan machinery would then
+    /// resolve it against the durable record.
+    pub async fn sweep_resolved<T: RaftTransport, G: IntentGroupMember<T>>(
+        &self,
+        intent_members: &[G],
+        now: HlcTimestamp,
+        control: &ExecutionControl,
+    ) -> Result<SweepResolvedReport, DistTxnError> {
+        if intent_members.is_empty() {
+            return Err(DistTxnError::InvalidRequest(
+                "no intent members supplied for the resolved sweep".to_owned(),
+            ));
+        }
+        let older_than = HlcTimestamp {
+            physical_micros: now.physical_micros.saturating_sub(
+                u64::try_from(self.config.resolved_retention.as_micros()).unwrap_or(u64::MAX),
+            ),
+            logical: 0,
+            node_tiebreaker: 0,
+        };
+        let eligible = |state: &IntentState| {
+            state
+                .txns
+                .values()
+                .filter(|txn| {
+                    txn.resolution.is_some() && txn.resolved_at.is_some_and(|at| at < older_than)
+                })
+                .count()
+        };
+        let before = intent_members
+            .iter()
+            .map(|member| eligible(&member.state()))
+            .max()
+            .unwrap_or(0);
+        let mut extra = Vec::with_capacity(24);
+        extra.extend_from_slice(&older_than.physical_micros.to_le_bytes());
+        extra.extend_from_slice(&self.config.sweep_limit.to_le_bytes());
+        let command_id = command_id_for(TAG_SWEEP, &TransactionId::ZERO, &extra);
+        let (member, _) = retry_across_members(
+            intent_members,
+            "participant resolved sweep",
+            &self.config,
+            control,
+            |member| {
+                let control = control.clone();
+                async move {
+                    member
+                        .propose(
+                            command_id,
+                            IntentCommand::SweepResolved {
+                                older_than,
+                                limit: self.config.sweep_limit,
+                            },
+                            &control,
+                        )
+                        .await
+                }
+            },
+        )
+        .await?;
+        let after = eligible(&member.state());
+        Ok(SweepResolvedReport {
+            swept: before.saturating_sub(after),
+            remaining: after,
+        })
+    }
+}
+
+/// Drives every future to completion concurrently on the current task and
+/// returns the outputs in input order. Used for the phase-1 prepare fan-out:
+/// the caller derives the outcome from the whole result set (greatest
+/// prepare timestamp; first failure in request order), never from
+/// completion order, so concurrency changes nothing observable.
+async fn run_all<F, T>(futures: Vec<F>) -> Vec<T>
+where
+    F: Future<Output = T>,
+{
+    let mut pending: Vec<Option<std::pin::Pin<Box<F>>>> = futures
+        .into_iter()
+        .map(|future| Some(Box::pin(future)))
+        .collect();
+    let mut outputs: Vec<Option<T>> = std::iter::repeat_with(|| None)
+        .take(pending.len())
+        .collect();
+    let mut remaining = pending.len();
+    std::future::poll_fn(|cx| {
+        for (index, slot) in pending.iter_mut().enumerate() {
+            let Some(future) = slot else { continue };
+            match future.as_mut().poll(cx) {
+                std::task::Poll::Ready(output) => {
+                    *slot = None;
+                    outputs[index] = Some(output);
+                    remaining -= 1;
+                }
+                std::task::Poll::Pending => {}
+            }
+        }
+        if remaining == 0 {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    })
+    .await;
+    outputs
+        .into_iter()
+        .map(|output| output.expect("every future completed"))
+        .collect()
 }
 
 /// Maps a prepare-phase failure onto the abort reason persisted with the
@@ -4870,7 +5613,7 @@ mod tests {
         let outcome_c = live_driver
             .decide_commit(
                 &cell.status,
-                &BTreeMap::new(),
+                &BTreeMap::<RaftGroupId, Vec<IntentGroup<InMemoryTransport>>>::new(),
                 &request_c.txn_id,
                 &[token_c],
                 &[],
@@ -5014,5 +5757,600 @@ mod tests {
             _ => assert!(result.is_err()),
         }
         cell.shutdown().await;
+    }
+
+    // -- engine-backed tablet groups (Stage 3H MVCC binding) ------------------
+
+    use mongreldb_consensus::engine_sink::{
+        open_engine_sink, testing as engine_testing, EngineGroupConfig,
+    };
+    use mongreldb_types::ids::{ClusterId, DatabaseId, NodeId};
+
+    const T1_GROUP: u8 = 81;
+    const T2_GROUP: u8 = 82;
+
+    struct EngineCell {
+        tmp: tempfile::TempDir,
+        transport: Arc<InMemoryTransport>,
+        status: Vec<TxnStatusGroup<InMemoryTransport>>,
+        tablets: BTreeMap<RaftGroupId, Vec<TabletTxnGroup<InMemoryTransport>>>,
+    }
+
+    impl EngineCell {
+        fn t1(&self) -> &[TabletTxnGroup<InMemoryTransport>] {
+            &self.tablets[&gid(T1_GROUP)]
+        }
+
+        fn t2(&self) -> &[TabletTxnGroup<InMemoryTransport>] {
+            &self.tablets[&gid(T2_GROUP)]
+        }
+
+        async fn shutdown(self) {
+            for member in &self.status {
+                let _ = member.shutdown().await;
+            }
+            for members in self.tablets.values() {
+                for member in members {
+                    let _ = member.shutdown().await;
+                }
+            }
+        }
+    }
+
+    async fn boot_tablet_member(
+        cell_dir: &Path,
+        group: u8,
+        member: u8,
+        transport: &Arc<InMemoryTransport>,
+        bootstrap: bool,
+    ) -> TabletTxnGroup<InMemoryTransport> {
+        let node_data = cell_dir.join(format!("tablet-{group}-{member}"));
+        let engine_config = EngineGroupConfig::new(
+            node_data,
+            gid(group),
+            ClusterId::from_bytes([1; 16]),
+            NodeId::from_bytes([group.wrapping_add(0x40); 16]),
+            DatabaseId::from_bytes([group; 16]),
+        );
+        let engine = open_engine_sink(&engine_config).unwrap();
+        let tablet = TabletTxnGroup::create(
+            fast_group_config(&engine_config.group_dir(), group, member),
+            gid(group),
+            transport.clone(),
+            engine,
+        )
+        .await
+        .unwrap();
+        if bootstrap {
+            tablet
+                .bootstrap(&[(
+                    raft_id(group, member),
+                    format!(
+                        "127.0.0.1:{}",
+                        7_000 + u16::from(group) * 10 + u16::from(member)
+                    ),
+                )])
+                .await
+                .unwrap();
+            tablet.group().wait_leader(LEADER_TIMEOUT).await.unwrap();
+        }
+        tablet
+    }
+
+    /// Creates the i64 test table on the tablet through a catalog command
+    /// (the same raft stream that later carries the intent protocol).
+    async fn create_table(tablet: &TabletTxnGroup<InMemoryTransport>) {
+        tablet
+            .group()
+            .propose(
+                CommandKind::Catalog,
+                engine_testing::create_i64_table_envelope(1, "t", 1),
+                &ExecutionControl::default(),
+            )
+            .await
+            .unwrap();
+        let db = tablet.engine().lock().unwrap().database().unwrap();
+        assert_eq!(db.table_id("t").unwrap(), 0);
+    }
+
+    fn engine_writes(group: u8, tablet: u8, values: &[i64]) -> ParticipantWrites {
+        ParticipantWrites {
+            participant: participant(group, tablet),
+            expected_schema_version: SchemaVersion::ZERO,
+            expected_authz_version: 0,
+            intents: values
+                .iter()
+                .map(|value| WriteIntent {
+                    txn_id: TransactionId::ZERO,
+                    key: value.to_le_bytes().to_vec(),
+                    value_ref: engine_testing::staged_put_i64(0, &[*value]),
+                    prepare_ts: HlcTimestamp::ZERO,
+                })
+                .collect(),
+        }
+    }
+
+    fn visible(tablet: &TabletTxnGroup<InMemoryTransport>) -> Vec<i64> {
+        let db = tablet.engine().lock().unwrap().database().unwrap();
+        engine_testing::visible_i64s(&db, "t")
+    }
+
+    async fn boot_engine_cell() -> EngineCell {
+        let tmp = tempfile::tempdir().unwrap();
+        let transport = Arc::new(InMemoryTransport::new());
+        let mut status = Vec::new();
+        for member in 1..=3_u8 {
+            status.push(boot_status_member(tmp.path(), member, &transport).await);
+        }
+        status[0]
+            .bootstrap(&member_addresses(STATUS_GROUP))
+            .await
+            .unwrap();
+        let mut tablets: BTreeMap<RaftGroupId, Vec<TabletTxnGroup<InMemoryTransport>>> =
+            BTreeMap::new();
+        for group in [T1_GROUP, T2_GROUP] {
+            let member = boot_tablet_member(tmp.path(), group, 1, &transport, true).await;
+            create_table(&member).await;
+            tablets.insert(gid(group), vec![member]);
+        }
+        wait_leader_among(&status.iter().collect::<Vec<_>>()).await;
+        EngineCell {
+            tmp,
+            transport,
+            status,
+            tablets,
+        }
+    }
+
+    #[tokio::test]
+    async fn engine_backed_commit_applies_rows_on_both_tablets_after_decision() {
+        let cell = boot_engine_cell().await;
+        let driver = DistTxnDriver::new(driver_config(TEN_MINUTES));
+        let control = ExecutionControl::default();
+        let request = commit_request(
+            101,
+            101,
+            vec![
+                engine_writes(T1_GROUP, 1, &[10, 20]),
+                engine_writes(T2_GROUP, 2, &[30, 40]),
+            ],
+        );
+        driver
+            .begin(&cell.status, &request, &control)
+            .await
+            .unwrap();
+        let token1 = driver
+            .prepare_participant(cell.t1(), &request.txn_id, &request.writes[0], &control)
+            .await
+            .unwrap();
+        let token2 = driver
+            .prepare_participant(cell.t2(), &request.txn_id, &request.writes[1], &control)
+            .await
+            .unwrap();
+        // Prepared but undecided: intents are durable, nothing is visible.
+        assert_eq!(visible(&cell.t1()[0]), Vec::<i64>::new());
+        assert_eq!(visible(&cell.t2()[0]), Vec::<i64>::new());
+        let outcome = driver
+            .decide_commit(
+                &cell.status,
+                &cell.tablets,
+                &request.txn_id,
+                &[token1, token2],
+                &request.observed,
+                &control,
+            )
+            .await
+            .unwrap();
+        // The decision materializes the staged writes on both tablets.
+        assert_eq!(visible(&cell.t1()[0]), vec![10, 20]);
+        assert_eq!(visible(&cell.t2()[0]), vec![30, 40]);
+        for (group, keys) in [(T1_GROUP, 2_usize), (T2_GROUP, 2)] {
+            let member = &cell.tablets[&gid(group)][0];
+            let txn = member.txn(&xid(101)).unwrap();
+            assert_eq!(
+                txn.resolution,
+                Some(TxnDecision::Committed {
+                    commit_ts: outcome.commit_ts
+                })
+            );
+            assert!(txn.applied);
+            assert!(txn.resolved_at.is_some());
+            assert!(txn.intents.is_empty());
+            assert_eq!(
+                member
+                    .committed_writes()
+                    .iter()
+                    .filter(|write| write.txn_id == xid(101))
+                    .count(),
+                keys
+            );
+        }
+        cell.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn engine_backed_abort_leaves_zero_rows() {
+        let cell = boot_engine_cell().await;
+        let driver = DistTxnDriver::new(driver_config(TEN_MINUTES));
+        let control = ExecutionControl::default();
+        let request = commit_request(
+            102,
+            102,
+            vec![
+                engine_writes(T1_GROUP, 1, &[10, 20]),
+                engine_writes(T2_GROUP, 2, &[30, 40]),
+            ],
+        );
+        driver
+            .begin(&cell.status, &request, &control)
+            .await
+            .unwrap();
+        driver
+            .prepare_participant(cell.t1(), &request.txn_id, &request.writes[0], &control)
+            .await
+            .unwrap();
+        driver
+            .prepare_participant(cell.t2(), &request.txn_id, &request.writes[1], &control)
+            .await
+            .unwrap();
+        let state = driver
+            .abort(
+                &cell.status,
+                &cell.tablets,
+                &request.txn_id,
+                AbortReason::RolledBack,
+                &control,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(state, DistributedTxnState::Aborted { .. }));
+        // Zero MVCC effect on both tablets; intents dropped.
+        assert_eq!(visible(&cell.t1()[0]), Vec::<i64>::new());
+        assert_eq!(visible(&cell.t2()[0]), Vec::<i64>::new());
+        for group in [T1_GROUP, T2_GROUP] {
+            let member = &cell.tablets[&gid(group)][0];
+            let txn = member.txn(&xid(102)).unwrap();
+            assert!(matches!(txn.resolution, Some(TxnDecision::Aborted { .. })));
+            assert!(txn.applied);
+            assert!(txn.intents.is_empty());
+            assert!(member.committed_writes().is_empty());
+        }
+        cell.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn coordinator_kill_recovers_and_applies_identically() {
+        let mut cell = boot_engine_cell().await;
+        let driver = DistTxnDriver::new(driver_config(TEN_MINUTES));
+        let control = ExecutionControl::default();
+        let request = commit_request(
+            103,
+            103,
+            vec![
+                engine_writes(T1_GROUP, 1, &[10, 20]),
+                engine_writes(T2_GROUP, 2, &[30, 40]),
+            ],
+        );
+        driver
+            .begin(&cell.status, &request, &control)
+            .await
+            .unwrap();
+        let token1 = driver
+            .prepare_participant(cell.t1(), &request.txn_id, &request.writes[0], &control)
+            .await
+            .unwrap();
+        let token2 = driver
+            .prepare_participant(cell.t2(), &request.txn_id, &request.writes[1], &control)
+            .await
+            .unwrap();
+        // Kill the coordinator-group leader between prepare and decision.
+        let leader = leader_index(&cell.status);
+        let victim = cell.status.remove(leader);
+        victim.crash().await;
+        let survivor_refs: Vec<&TxnStatusGroup<InMemoryTransport>> = cell.status.iter().collect();
+        wait_leader_among(&survivor_refs).await;
+        let recovery = DistTxnDriver::new(DistTxnConfig {
+            node_tiebreaker: 99,
+            ..driver_config(TEN_MINUTES)
+        });
+        let now = recovery.now().unwrap();
+        let outcome = recovery
+            .recover(&cell.status, &cell.tablets, &request.txn_id, now, &control)
+            .await
+            .unwrap();
+        let commit_ts = match outcome {
+            RecoveryOutcome::Decided(DistributedTxnState::Committed { commit_ts }) => commit_ts,
+            other => panic!("expected a committed recovery, got {other:?}"),
+        };
+        assert!(commit_ts > token1.prepare_ts);
+        assert!(commit_ts > token2.prepare_ts);
+        // Recovery applies identically on both tablets.
+        assert_eq!(visible(&cell.t1()[0]), vec![10, 20]);
+        assert_eq!(visible(&cell.t2()[0]), vec![30, 40]);
+        cell.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn duplicate_resolve_never_double_applies() {
+        let cell = boot_engine_cell().await;
+        let driver = DistTxnDriver::new(driver_config(TEN_MINUTES));
+        let control = ExecutionControl::default();
+        let request = commit_request(
+            104,
+            104,
+            vec![
+                engine_writes(T1_GROUP, 1, &[10, 20]),
+                engine_writes(T2_GROUP, 2, &[30, 40]),
+            ],
+        );
+        let first = driver
+            .commit(&cell.status, &cell.tablets, request.clone(), &control)
+            .await
+            .unwrap();
+        // Client retry after an ambiguous failure: the same transaction id
+        // and idempotency key replays the original outcome and re-broadcasts
+        // the resolve.
+        let second = driver
+            .commit(&cell.status, &cell.tablets, request, &control)
+            .await
+            .unwrap();
+        assert_eq!(first, second);
+        // Explicit duplicate resolve broadcast on top: still no re-apply.
+        driver
+            .broadcast_resolve(
+                &cell.tablets,
+                &xid(104),
+                &second.participants,
+                TxnDecision::Committed {
+                    commit_ts: second.commit_ts,
+                },
+                &control,
+            )
+            .await;
+        assert_eq!(visible(&cell.t1()[0]), vec![10, 20]);
+        assert_eq!(visible(&cell.t2()[0]), vec![30, 40]);
+        for group in [T1_GROUP, T2_GROUP] {
+            let member = &cell.tablets[&gid(group)][0];
+            assert_eq!(member.state().txns.len(), 1);
+            assert_eq!(
+                member
+                    .committed_writes()
+                    .iter()
+                    .filter(|write| write.txn_id == xid(104))
+                    .count(),
+                2
+            );
+        }
+        cell.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn tablet_restart_after_resolve_replays_without_double_apply() {
+        let mut cell = boot_engine_cell().await;
+        let driver = DistTxnDriver::new(driver_config(TEN_MINUTES));
+        let control = ExecutionControl::default();
+        let request = commit_request(
+            105,
+            105,
+            vec![
+                engine_writes(T1_GROUP, 1, &[10, 20]),
+                engine_writes(T2_GROUP, 2, &[30, 40]),
+            ],
+        );
+        let outcome = driver
+            .commit(&cell.status, &cell.tablets, request, &control)
+            .await
+            .unwrap();
+        assert_eq!(visible(&cell.t1()[0]), vec![10, 20]);
+        // Crash T1's only member and reboot it over the same directories:
+        // the engine core recovers the applied rows from its WAL, the intent
+        // checkpoint recovers the applied resolution.
+        let victim = cell.tablets.get_mut(&gid(T1_GROUP)).unwrap().remove(0);
+        victim.crash().await;
+        let healed = boot_tablet_member(cell.tmp.path(), T1_GROUP, 1, &cell.transport, false).await;
+        healed.group().wait_leader(LEADER_TIMEOUT).await.unwrap();
+        let txn = healed.txn(&xid(105)).unwrap();
+        assert!(txn.applied);
+        assert_eq!(
+            txn.resolution,
+            Some(TxnDecision::Committed {
+                commit_ts: outcome.commit_ts
+            })
+        );
+        assert_eq!(visible(&healed), vec![10, 20]);
+        // A redriven resolve reaches the healed member and is a no-op for
+        // the engine (the record is already applied).
+        cell.tablets.get_mut(&gid(T1_GROUP)).unwrap().push(healed);
+        driver
+            .broadcast_resolve(
+                &cell.tablets,
+                &xid(105),
+                &outcome.participants,
+                TxnDecision::Committed {
+                    commit_ts: outcome.commit_ts,
+                },
+                &control,
+            )
+            .await;
+        assert_eq!(visible(&cell.t1()[0]), vec![10, 20]);
+        cell.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn resolved_sweep_bounds_tombstones_and_keeps_engine_rows() {
+        let cell = boot_engine_cell().await;
+        let config = DistTxnConfig {
+            resolved_retention: Duration::ZERO,
+            sweep_limit: 2,
+            ..driver_config(TEN_MINUTES)
+        };
+        let driver = DistTxnDriver::new(config);
+        let control = ExecutionControl::default();
+        // Three committed single-participant transactions plus one aborted:
+        // four tombstones on T1.
+        for (index, values) in [[10_i64, 20], [30, 40], [50, 60]].iter().enumerate() {
+            let txn = 110 + index as u8;
+            let request = commit_request(txn, txn, vec![engine_writes(T1_GROUP, 1, values)]);
+            driver
+                .commit(&cell.status, &cell.tablets, request, &control)
+                .await
+                .unwrap();
+        }
+        let aborted = commit_request(113, 113, vec![engine_writes(T1_GROUP, 1, &[70])]);
+        driver
+            .begin(&cell.status, &aborted, &control)
+            .await
+            .unwrap();
+        driver
+            .prepare_participant(cell.t1(), &aborted.txn_id, &aborted.writes[0], &control)
+            .await
+            .unwrap();
+        driver
+            .abort(
+                &cell.status,
+                &cell.tablets,
+                &aborted.txn_id,
+                AbortReason::RolledBack,
+                &control,
+            )
+            .await
+            .unwrap();
+        assert_eq!(cell.t1()[0].state().txns.len(), 4);
+        assert_eq!(visible(&cell.t1()[0]), vec![10, 20, 30, 40, 50, 60]);
+
+        // Bounded sweep: at most `sweep_limit` tombstones per command.
+        let now = later(driver.now().unwrap(), Duration::from_secs(3_600));
+        let report = driver
+            .sweep_resolved(cell.t1(), now, &control)
+            .await
+            .unwrap();
+        assert_eq!(
+            report,
+            SweepResolvedReport {
+                swept: 2,
+                remaining: 2
+            }
+        );
+        assert_eq!(cell.t1()[0].state().txns.len(), 2);
+        // A follow-up sweep carries a newer cutoff (sweeps are
+        // time-parameterized housekeeping; an identical command id would be
+        // an idempotent replay).
+        let later_now = later(now, Duration::from_secs(1));
+        let report = driver
+            .sweep_resolved(cell.t1(), later_now, &control)
+            .await
+            .unwrap();
+        assert_eq!(
+            report,
+            SweepResolvedReport {
+                swept: 2,
+                remaining: 0
+            }
+        );
+        assert!(cell.t1()[0].state().txns.is_empty());
+        assert!(cell.t1()[0].committed_writes().is_empty());
+        // The sweep only drops protocol records: the applied rows stay.
+        assert_eq!(visible(&cell.t1()[0]), vec![10, 20, 30, 40, 50, 60]);
+        cell.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn parallel_prepare_respects_the_deadline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transport = Arc::new(InMemoryTransport::new());
+        let mut status = Vec::new();
+        for member in 1..=3_u8 {
+            status.push(boot_status_member(tmp.path(), member, &transport).await);
+        }
+        status[0]
+            .bootstrap(&member_addresses(STATUS_GROUP))
+            .await
+            .unwrap();
+        // T1: one healthy engine tablet. T2: three members, two of which
+        // will be killed so the group has no quorum and every prepare must
+        // wait out the deadline.
+        let t1 = boot_tablet_member(tmp.path(), T1_GROUP, 1, &transport, true).await;
+        create_table(&t1).await;
+        let mut t2_members = Vec::new();
+        for member in 1..=3_u8 {
+            t2_members
+                .push(boot_tablet_member(tmp.path(), T2_GROUP, member, &transport, false).await);
+        }
+        t2_members[0]
+            .bootstrap(&member_addresses(T2_GROUP))
+            .await
+            .unwrap();
+        t2_members.pop().unwrap().crash().await;
+        t2_members.pop().unwrap().crash().await;
+        let mut tablets: BTreeMap<RaftGroupId, Vec<TabletTxnGroup<InMemoryTransport>>> =
+            BTreeMap::new();
+        tablets.insert(gid(T1_GROUP), vec![t1]);
+        tablets.insert(gid(T2_GROUP), t2_members);
+        wait_leader_among(&status.iter().collect::<Vec<_>>()).await;
+
+        let driver = DistTxnDriver::new(driver_config(Duration::from_millis(1)));
+        let control = ExecutionControl {
+            deadline: Some(std::time::Instant::now() + Duration::from_millis(1_000)),
+            cancellation: None,
+        };
+        // The dead participant comes first in request order: serially, T1's
+        // prepare would never run; concurrently, it lands while T2's waits
+        // out the deadline.
+        let request = commit_request(
+            120,
+            120,
+            vec![
+                engine_writes(T2_GROUP, 2, &[30]),
+                engine_writes(T1_GROUP, 1, &[10, 20]),
+            ],
+        );
+        let error = driver
+            .commit(&status, &tablets, request.clone(), &control)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, DistTxnError::OutcomeAmbiguous { .. }),
+            "expected an ambiguous outcome after the deadline, got {error:?}"
+        );
+        // T1 prepared (the concurrency proof) but shows zero rows: no
+        // decision was durable, so nothing is visible.
+        {
+            let t1 = &tablets[&gid(T1_GROUP)][0];
+            assert_eq!(t1.unresolved_txn_ids(), vec![xid(120)]);
+            assert_eq!(visible(t1), Vec::<i64>::new());
+        }
+        // Recovery with a fresh control and an expired lease resolves the
+        // transaction deterministically: pushed to abort, intents dropped,
+        // still zero rows. The last T2 member is gone now, so its resolve
+        // broadcast defers immediately (empty member list) and T1 resolves.
+        let last_t2 = tablets.get_mut(&gid(T2_GROUP)).unwrap().remove(0);
+        last_t2.crash().await;
+        let pusher = DistTxnDriver::new(driver_config(Duration::from_millis(1)));
+        let now = later(pusher.now().unwrap(), Duration::from_secs(3_600));
+        let fresh = ExecutionControl::default();
+        let outcome = pusher
+            .push_expired(&status, &tablets, &request.txn_id, now, &fresh)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, PushOutcome::Pushed(_)));
+        let t1 = &tablets[&gid(T1_GROUP)][0];
+        wait_until("t1 abort resolution", || async {
+            t1.txn(&xid(120))
+                .is_some_and(|txn| txn.resolution.is_some())
+        })
+        .await;
+        let txn = t1.txn(&xid(120)).unwrap();
+        assert!(matches!(txn.resolution, Some(TxnDecision::Aborted { .. })));
+        assert!(txn.applied);
+        assert!(txn.intents.is_empty());
+        assert_eq!(visible(t1), Vec::<i64>::new());
+        for member in &status {
+            let _ = member.shutdown().await;
+        }
+        for members in tablets.values() {
+            for member in members {
+                let _ = member.shutdown().await;
+            }
+        }
     }
 }

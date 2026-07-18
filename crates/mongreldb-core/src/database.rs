@@ -3958,15 +3958,18 @@ impl Database {
             _ => unreachable!("validated above"),
         };
         // Fail closed on spilled-run linking: an `added_runs` commit links
-        // run files that exist only on the leader. Replicated spill
-        // translation (staging logical row records instead of run
-        // references, spec section 8.5) lands with the Stage 2C write
-        // protocol; this wave applies row-level records only.
+        // run files that exist only on the leader. Leaders never emit such a
+        // payload — the Stage 2C envelope builder passes every commit through
+        // [`translate_records_for_replication`], which stages the spilled rows
+        // as logical `Op::Put` records and strips the run links (spec section
+        // 11.3 step 3). This check is the defense-in-depth gate behind that
+        // contract: a payload carrying run references is un-appliable here
+        // and is rejected deterministically rather than diverging.
         if let Some(Op::TxnCommit { added_runs, .. }) = records.last().map(|r| &r.op) {
             if !added_runs.is_empty() {
                 return Err(MongrelError::InvalidArgument(
-                    "replicated spilled-run commits are not supported this wave: the leader \
-                     must stage logical row records (spill translation lands with Stage 2C)"
+                    "replicated spilled-run commits are not appliable: the leader must translate \
+                     the commit through translate_records_for_replication before proposal"
                         .into(),
                 ));
             }
@@ -3995,6 +3998,127 @@ impl Database {
         let catalog = self.catalog.read().clone();
         recover_shared_wal(&self.durable_root, &tables, &catalog, &self.epoch, records)?;
         Ok(true)
+    }
+
+    /// Stage 3H engine binding (spec section 12.8): validate staged
+    /// write-intent payloads at prepare time. A participant that durably
+    /// prepares these payloads must be able to apply them at resolution, so
+    /// every check the resolution apply performs runs here first: each
+    /// payload decodes as a [`StagedTxnWrite`], its table is mounted, and
+    /// every staged row satisfies the same persisted-row validation the WAL
+    /// recovery path applies. A malformed payload is rejected deterministically
+    /// at prepare — never after a decision commits, where a rejection would
+    /// wedge the replicated apply stream.
+    pub fn validate_staged_txn_writes(&self, staged: &[Vec<u8>]) -> Result<()> {
+        let tables = self.tables.read();
+        for payload in staged {
+            match StagedTxnWrite::decode(payload)? {
+                StagedTxnWrite::Put { table_id, rows } => {
+                    let handle = tables.get(&table_id).ok_or_else(|| {
+                        MongrelError::InvalidArgument(format!(
+                            "staged write targets unmounted table {table_id}"
+                        ))
+                    })?;
+                    let rows: Vec<crate::memtable::Row> =
+                        bincode::deserialize(&rows).map_err(|error| {
+                            MongrelError::InvalidArgument(format!(
+                                "staged put payload for table {table_id} cannot decode: {error}"
+                            ))
+                        })?;
+                    let schema = handle.lock().schema().clone();
+                    for row in &rows {
+                        validate_recovered_row(&schema, row).map_err(|error| {
+                            MongrelError::InvalidArgument(format!(
+                                "staged row for table {table_id} is not appliable: {error}"
+                            ))
+                        })?;
+                    }
+                }
+                StagedTxnWrite::Delete { table_id, row_ids } => {
+                    if !tables.contains_key(&table_id) {
+                        return Err(MongrelError::InvalidArgument(format!(
+                            "staged delete targets unmounted table {table_id}"
+                        )));
+                    }
+                    if row_ids.contains(&u64::MAX) {
+                        return Err(MongrelError::InvalidArgument(format!(
+                            "staged delete for table {table_id} names an exhausted row id"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Stage 3H engine binding (spec section 12.8): apply one committed
+    /// resolution's staged writes through the replicated apply path
+    /// ([`Database::apply_replicated_records`]) at the decision's commit
+    /// timestamp. `txn_tag` is the caller's deterministic per-transaction
+    /// tag (e.g. a hash of the distributed transaction id); it must be
+    /// identical on every replica. The synthetic WAL transaction id is
+    /// derived from it inside the current open-generation namespace with the
+    /// allocator-avoidance bit set, so resolution records pass the
+    /// open-generation durability check on reopen and never alias
+    /// leader-allocated transaction ids.
+    ///
+    /// The commit epoch stamped into the synthetic commit marker is one past
+    /// the core's visible watermark: the replicated apply stream is
+    /// deterministic, so every replica computes the identical epoch at the
+    /// identical apply point, and the core's own restart recovery replays the
+    /// stamped sequence verbatim. Rows are restamped at that epoch by the
+    /// recovery logic, becoming visible exactly as an ordinary committed
+    /// transaction's rows.
+    pub fn apply_staged_txn_writes(
+        &self,
+        txn_tag: u64,
+        staged: &[Vec<u8>],
+        commit_ts: mongreldb_types::hlc::HlcTimestamp,
+    ) -> Result<bool> {
+        use crate::wal::Op;
+
+        // Decode every payload before any mutation (fail closed).
+        let mut writes = Vec::with_capacity(staged.len());
+        for payload in staged {
+            writes.push(StagedTxnWrite::decode(payload)?);
+        }
+        // Generation-namespace the synthetic transaction id: the high 32 bits
+        // are the current open generation (the reopen path rejects retained
+        // records from a generation beyond the durable WAL head); the low 32
+        // bits carry the caller's tag with the top bit set, outside the
+        // ascending leader-allocated counter space.
+        let generation = *self.next_txn_id.lock() >> 32;
+        let txn_id = (generation << 32) | (txn_tag & 0x7FFF_FFFF) | 0x8000_0000;
+        let mut records = Vec::with_capacity(writes.len() + 2);
+        for write in writes {
+            let op = match write {
+                StagedTxnWrite::Put { table_id, rows } => Op::Put { table_id, rows },
+                StagedTxnWrite::Delete { table_id, row_ids } => Op::Delete {
+                    table_id,
+                    row_ids: row_ids.into_iter().map(crate::RowId).collect(),
+                },
+            };
+            records.push(crate::wal::Record::new(Epoch(0), txn_id, op));
+        }
+        let epoch = self.epoch.visible().0 + 1;
+        // The physical component of the decision's commit timestamp goes into
+        // the durable timestamp ledger, mirroring the ordinary commit path
+        // (`commit_log::commit_nanos`).
+        let unix_nanos = commit_ts.physical_micros.saturating_mul(1_000);
+        records.push(crate::wal::Record::new(
+            Epoch(0),
+            txn_id,
+            Op::CommitTimestamp { unix_nanos },
+        ));
+        records.push(crate::wal::Record::new(
+            Epoch(0),
+            txn_id,
+            Op::TxnCommit {
+                epoch,
+                added_runs: Vec::new(),
+            },
+        ));
+        self.apply_replicated_records(&records)
     }
 
     /// Stage 2E (spec sections 10.6, 11.5): apply one committed replicated
@@ -15115,6 +15239,176 @@ fn validate_planned_spilled_run(
 /// epoch, skipping records whose `commit_epoch <= table.flushed_epoch` (already
 /// durable in a sorted run). Finally the shared epoch authority is raised to the
 /// max committed epoch so the next commit continues monotonically.
+/// The staged-write payload contract of a distributed-transaction write
+/// intent (spec section 12.8). A participant in two-phase commit stages its
+/// writes as opaque intent payloads (`WriteIntent::value_ref` in
+/// `mongreldb-cluster::dist_txn`); the intent layer never interprets them —
+/// this engine-defined encoding is the whole contract. At prepare time the
+/// payloads are validated ([`Database::validate_staged_txn_writes`]); at a
+/// committed resolution they are applied through
+/// [`Database::apply_staged_txn_writes`].
+///
+/// The encoding is bincode over this enum (the same codec the WAL frame
+/// payloads use); discriminants are never reused.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum StagedTxnWrite {
+    /// Staged row puts: bincode-serialized `Vec<crate::memtable::Row>` (the
+    /// identical payload shape an `Op::Put` WAL record carries). Row commit
+    /// epochs are placeholders — the resolution apply restamps every row at
+    /// the synthetic commit epoch.
+    Put {
+        /// The mounted table the rows target.
+        table_id: u64,
+        /// Bincode `Vec<crate::memtable::Row>`.
+        rows: Vec<u8>,
+    },
+    /// Staged row deletes by row id.
+    Delete {
+        /// The mounted table the deletes target.
+        table_id: u64,
+        /// Row ids (`crate::RowId` values) to delete.
+        row_ids: Vec<u64>,
+    },
+}
+
+impl StagedTxnWrite {
+    /// Serializes deterministically (bincode over the enum).
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        Ok(bincode::serialize(self)?)
+    }
+
+    /// Decodes one staged-write payload, failing closed on malformed input.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        Ok(bincode::deserialize(bytes)?)
+    }
+}
+
+/// Leader-side spill translation for the replicated write path (spec section
+/// 11.3 step 3, "leader constructs transaction command"; review finding M2).
+///
+/// A transaction whose staged puts exceed the spill threshold commits with
+/// its rows in a leader-local sorted run: the commit marker's `added_runs`
+/// links the run file and the rows also ride the WAL as logical
+/// `Op::SpilledRows` records (spec section 8.5). Run files exist only on the
+/// leader, so a commit carrying `added_runs` is un-appliable on a replica —
+/// and because the raft entry is already quorum-committed, an apply-time
+/// rejection wedges the whole group's apply stream. The leader therefore
+/// translates the staged record sequence **before proposal**:
+///
+/// - every `Op::SpilledRows` payload is re-tagged as an ordinary `Op::Put`
+///   (identical row bytes; recovery restamps the rows at the commit epoch),
+/// - the trailing `Op::TxnCommit` loses its `added_runs` (no run links ever
+///   reach a replica),
+/// - every other record passes through byte-identical.
+///
+/// The standalone commit path is untouched: the leader's own WAL keeps the
+/// original sequence (`SpilledRows` + `added_runs`) so its recovery still
+/// links the run; this function reads but never mutates its input.
+///
+/// Translation is total for any sequence the commit sequencer actually
+/// produced. As a fail-closed guard against malformed or truncated captures,
+/// the sequence is structurally validated (one transaction, exactly one
+/// trailing commit marker), every spill payload must decode, and every linked
+/// run's rows must be provably present as logical records (the row-id range
+/// covers `row_count` rows); a violation rejects the proposal with
+/// [`MongrelError::InvalidArgument`] — deterministic, at propose time, never
+/// post-commit. (Taxonomy: `InvalidArgument` maps to
+/// `ErrorCategory::ClusterVersionMismatch`, a request/binary contract
+/// disagreement that is never retried unchanged. The normative spec category
+/// for "the commit was not applied; only a fresh transaction may succeed" is
+/// `CommitTooLate`; surfacing it needs a dedicated `MongrelError` variant in
+/// `error.rs`, which is outside this change's file scope — tracked as a
+/// follow-up.)
+pub fn translate_records_for_replication(
+    records: &[crate::wal::Record],
+) -> Result<Vec<crate::wal::Record>> {
+    use crate::wal::Op;
+
+    // Structural validation mirrors `apply_replicated_records`: one
+    // transaction, exactly one commit marker, at the tail.
+    let txn_id = records.first().map(|record| record.txn_id).ok_or_else(|| {
+        MongrelError::InvalidArgument("replicated transaction payload is empty".into())
+    })?;
+    if records.iter().any(|record| record.txn_id != txn_id) {
+        return Err(MongrelError::InvalidArgument(
+            "replicated transaction payload mixes transaction ids".into(),
+        ));
+    }
+    let commits = records
+        .iter()
+        .filter(|record| matches!(record.op, Op::TxnCommit { .. }))
+        .count();
+    if commits != 1 || !matches!(records.last().map(|r| &r.op), Some(Op::TxnCommit { .. })) {
+        return Err(MongrelError::InvalidArgument(
+            "replicated transaction payload must end in exactly one commit marker".into(),
+        ));
+    }
+
+    // Decode every logical spill payload now: a payload that cannot decode
+    // here would fail every replica's apply identically — reject at propose
+    // time instead.
+    let mut spilled_rows: HashMap<u64, Vec<crate::memtable::Row>> = HashMap::new();
+    for record in records {
+        if let Op::SpilledRows { table_id, rows } = &record.op {
+            let chunk: Vec<crate::memtable::Row> = bincode::deserialize(rows).map_err(|error| {
+                MongrelError::InvalidArgument(format!(
+                    "spilled row payload for table {table_id} cannot decode for replication: \
+                         {error}"
+                ))
+            })?;
+            spilled_rows.entry(*table_id).or_default().extend(chunk);
+        }
+    }
+
+    // Coverage proof: every run the commit marker links must have its full
+    // row content present as logical records, or replicas would silently
+    // lose those rows.
+    let Some(Op::TxnCommit { added_runs, .. }) = records.last().map(|r| &r.op) else {
+        unreachable!("one trailing commit marker validated above");
+    };
+    for run in added_runs {
+        let rows = spilled_rows.get(&run.table_id).ok_or_else(|| {
+            MongrelError::InvalidArgument(format!(
+                "commit links spilled run {} for table {} but carries no logical row records \
+                 for it",
+                run.run_id, run.table_id
+            ))
+        })?;
+        let covered = rows
+            .iter()
+            .filter(|row| row.row_id.0 >= run.min_row_id && row.row_id.0 <= run.max_row_id)
+            .count() as u64;
+        if covered != run.row_count {
+            return Err(MongrelError::InvalidArgument(format!(
+                "commit links spilled run {} for table {} ({} rows in [{}, {}]) but the logical \
+                 row records cover {} rows",
+                run.run_id, run.table_id, run.row_count, run.min_row_id, run.max_row_id, covered
+            )));
+        }
+    }
+
+    // Translate: spill payloads become ordinary puts; the commit marker no
+    // longer references leader-local run files.
+    let translated = records
+        .iter()
+        .map(|record| {
+            let op = match &record.op {
+                Op::SpilledRows { table_id, rows } => Op::Put {
+                    table_id: *table_id,
+                    rows: rows.clone(),
+                },
+                Op::TxnCommit { epoch, .. } => Op::TxnCommit {
+                    epoch: *epoch,
+                    added_runs: Vec::new(),
+                },
+                op => op.clone(),
+            };
+            crate::wal::Record::new(record.seq, record.txn_id, op)
+        })
+        .collect();
+    Ok(translated)
+}
+
 fn recover_shared_wal(
     durable_root: &crate::durable_file::DurableRoot,
     tables: &HashMap<u64, TableHandle>,
@@ -19930,5 +20224,353 @@ mod stage2e_replicated_apply_tests {
         assert!(matches!(error, MongrelError::InvalidArgument(_)));
         assert!(db.apply_replicated_records(&[]).is_err());
         assert_eq!(visible_ids(&db, "items"), Vec::<i64>::new());
+    }
+}
+
+#[cfg(test)]
+mod stage2c_spill_translation_tests {
+    use super::*;
+    use crate::catalog_cmds::{CatalogCommand, CatalogCommandRecord};
+    use crate::memtable::{Row, Value};
+    use crate::schema::{ColumnDef, ColumnFlags, Schema, TypeId};
+    use crate::wal::{Op, Record};
+    use mongreldb_types::ids::{ClusterId, DatabaseId, NodeId};
+
+    fn simple_schema() -> Schema {
+        Schema {
+            columns: vec![ColumnDef {
+                id: 1,
+                name: "id".into(),
+                ty: TypeId::Int64,
+                flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
+            }],
+            ..Schema::default()
+        }
+    }
+
+    fn create_table_record(name: &str, catalog_version: u64) -> CatalogCommandRecord {
+        CatalogCommandRecord {
+            version: crate::catalog_cmds::CATALOG_COMMAND_FORMAT_VERSION,
+            catalog_version,
+            command: CatalogCommand::CreateTable {
+                name: name.to_string(),
+                schema: simple_schema(),
+                created_epoch: 1,
+            },
+        }
+    }
+
+    fn visible_ids(db: &Database, table: &str) -> Vec<i64> {
+        let handle = db.table(table).unwrap();
+        let rows = handle
+            .lock()
+            .visible_rows(crate::epoch::Snapshot::at(Epoch(u64::MAX)))
+            .unwrap();
+        let mut values: Vec<i64> = rows
+            .iter()
+            .map(|row| match row.columns.get(&1) {
+                Some(Value::Int64(value)) => *value,
+                other => panic!("unexpected column: {other:?}"),
+            })
+            .collect();
+        values.sort_unstable();
+        values
+    }
+
+    fn put_records(txn_id: u64, table_id: u64, epoch: u64, values: &[i64]) -> Vec<Record> {
+        let rows: Vec<Row> = values
+            .iter()
+            .map(|value| {
+                Row::new(crate::RowId(*value as u64), Epoch(epoch))
+                    .with_column(1, Value::Int64(*value))
+            })
+            .collect();
+        vec![
+            Record::new(
+                Epoch(0),
+                txn_id,
+                Op::Put {
+                    table_id,
+                    rows: bincode::serialize(&rows).unwrap(),
+                },
+            ),
+            Record::new(Epoch(0), txn_id, Op::CommitTimestamp { unix_nanos: 1_000 }),
+            Record::new(
+                Epoch(0),
+                txn_id,
+                Op::TxnCommit {
+                    epoch,
+                    added_runs: Vec::new(),
+                },
+            ),
+        ]
+    }
+
+    fn added_run(
+        table_id: u64,
+        row_count: u64,
+        min_row_id: u64,
+        max_row_id: u64,
+    ) -> crate::wal::AddedRun {
+        crate::wal::AddedRun {
+            table_id,
+            run_id: 7,
+            row_count,
+            level: 0,
+            min_row_id,
+            max_row_id,
+            content_hash: [0; 32],
+        }
+    }
+
+    /// Replays the shared WAL of `db` and returns every record of the one
+    /// transaction whose commit marker links spilled runs.
+    fn spilled_commit_records(db: &Database) -> Vec<Record> {
+        let records = crate::wal::SharedWal::replay_with_dek(&db.root, None).unwrap();
+        let txn_id = records
+            .iter()
+            .find_map(|record| match &record.op {
+                Op::TxnCommit { added_runs, .. } if !added_runs.is_empty() => Some(record.txn_id),
+                _ => None,
+            })
+            .expect("a spilled commit is present in the WAL");
+        records
+            .into_iter()
+            .filter(|record| record.txn_id == txn_id)
+            .collect()
+    }
+
+    #[test]
+    fn non_spilled_records_translate_byte_identical() {
+        let records = put_records(1, 0, 2, &[10, 20, 30]);
+        let translated = translate_records_for_replication(&records).unwrap();
+        assert_eq!(
+            bincode::serialize(&translated).unwrap(),
+            bincode::serialize(&records).unwrap(),
+            "a commit without spill links must pass through byte-identical"
+        );
+    }
+
+    #[test]
+    fn translation_rejects_uncovered_or_malformed_spills() {
+        // added_runs with no logical spill records at all: rejected.
+        let mut records = put_records(1, 0, 2, &[10]);
+        let Some(Op::TxnCommit { added_runs, .. }) = records.last_mut().map(|r| &mut r.op) else {
+            panic!("put_records ends in TxnCommit");
+        };
+        added_runs.push(added_run(0, 1, 10, 10));
+        let error = translate_records_for_replication(&records).unwrap_err();
+        assert!(
+            error.to_string().contains("no logical row records"),
+            "unexpected error: {error}"
+        );
+
+        // Coverage present but short of the linked row count: rejected.
+        let mut records = put_records(1, 0, 2, &[10]);
+        let spilled: Vec<Row> = (0..3_u64)
+            .map(|value| {
+                Row::new(crate::RowId(value), Epoch(2)).with_column(1, Value::Int64(value as i64))
+            })
+            .collect();
+        records.insert(
+            0,
+            Record::new(
+                Epoch(0),
+                1,
+                Op::SpilledRows {
+                    table_id: 0,
+                    rows: bincode::serialize(&spilled).unwrap(),
+                },
+            ),
+        );
+        let Some(Op::TxnCommit { added_runs, .. }) = records.last_mut().map(|r| &mut r.op) else {
+            panic!("put_records ends in TxnCommit");
+        };
+        added_runs.push(added_run(0, 4, 0, 3));
+        let error = translate_records_for_replication(&records).unwrap_err();
+        assert!(
+            error.to_string().contains("cover 3 rows"),
+            "unexpected error: {error}"
+        );
+
+        // An undecodable spill payload: rejected at propose time, never at apply.
+        let mut records = put_records(1, 0, 2, &[10]);
+        records.insert(
+            0,
+            Record::new(
+                Epoch(0),
+                1,
+                Op::SpilledRows {
+                    table_id: 0,
+                    rows: vec![0xFF, 0x01, 0x02],
+                },
+            ),
+        );
+        let Some(Op::TxnCommit { added_runs, .. }) = records.last_mut().map(|r| &mut r.op) else {
+            panic!("put_records ends in TxnCommit");
+        };
+        added_runs.push(added_run(0, 1, 0, 0));
+        assert!(translate_records_for_replication(&records).is_err());
+
+        // Structural violations mirror the apply-side contract.
+        assert!(translate_records_for_replication(&[]).is_err());
+        let mut mixed = put_records(1, 0, 2, &[10]);
+        mixed[0].txn_id = 99;
+        assert!(translate_records_for_replication(&mixed).is_err());
+        let mut no_commit = put_records(1, 0, 2, &[10]);
+        no_commit.pop();
+        assert!(translate_records_for_replication(&no_commit).is_err());
+    }
+
+    #[test]
+    fn spilled_commit_translates_to_logical_rows_and_applies_on_replica() {
+        // A real standalone commit that spills (spec section 8.5).
+        let leader_dir = tempfile::tempdir().unwrap();
+        let leader = Database::create(leader_dir.path()).unwrap();
+        leader.create_table("t", simple_schema()).unwrap();
+        leader.set_spill_threshold(1);
+        let table_id = leader.table_id("t").unwrap();
+        let values: Vec<i64> = (0..60).collect();
+        leader
+            .transaction(|txn| {
+                for value in &values {
+                    txn.put("t", vec![(1, Value::Int64(*value))])?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(visible_ids(&leader, "t"), values);
+
+        // The leader's own WAL keeps the spill shape: SpilledRows records
+        // plus an added_runs commit marker.
+        let records = spilled_commit_records(&leader);
+        assert!(records
+            .iter()
+            .any(|record| matches!(record.op, Op::SpilledRows { .. })));
+        let Some(Op::TxnCommit { added_runs, epoch }) = records.last().map(|r| &r.op) else {
+            panic!("a commit sequence ends in TxnCommit");
+        };
+        assert!(!added_runs.is_empty());
+        let commit_epoch = *epoch;
+
+        // Translation strips every run reference and keeps the rows as
+        // logical puts; the input sequence is untouched.
+        let translated = translate_records_for_replication(&records).unwrap();
+        assert!(records
+            .iter()
+            .any(|record| matches!(record.op, Op::SpilledRows { .. })));
+        let Some(Op::TxnCommit { added_runs, .. }) = records.last().map(|r| &r.op) else {
+            panic!("a commit sequence ends in TxnCommit");
+        };
+        assert!(!added_runs.is_empty(), "input records must be unchanged");
+        assert_eq!(translated.len(), records.len());
+        assert!(translated
+            .iter()
+            .all(|record| !matches!(record.op, Op::SpilledRows { .. })));
+        assert!(translated
+            .iter()
+            .any(|record| matches!(record.op, Op::Put { .. })));
+        let Some(Op::TxnCommit { added_runs, epoch }) = translated.last().map(|r| &r.op) else {
+            panic!("a commit sequence ends in TxnCommit");
+        };
+        assert!(added_runs.is_empty(), "no added_runs may reach a replica");
+        assert_eq!(*epoch, commit_epoch);
+
+        // The translated payload applies on a replica with identical rows.
+        let replica_dir = tempfile::tempdir().unwrap();
+        let replica = Database::create_cluster_replica(
+            replica_dir.path(),
+            ClusterId::from_bytes([1; 16]),
+            NodeId::from_bytes([2; 16]),
+            DatabaseId::from_bytes([3; 16]),
+        )
+        .unwrap();
+        replica
+            .apply_replicated_catalog_command(&create_table_record("t", 1))
+            .unwrap();
+        assert_eq!(replica.table_id("t").unwrap(), table_id);
+        assert!(replica.apply_replicated_records(&translated).unwrap());
+        assert_eq!(visible_ids(&replica, "t"), values);
+        assert_eq!(visible_ids(&replica, "t"), visible_ids(&leader, "t"));
+
+        // Standalone behavior is unchanged: the leader still recovers its
+        // spilled commit by linking the run file.
+        drop(leader);
+        let leader = Database::open(leader_dir.path()).unwrap();
+        assert_eq!(visible_ids(&leader, "t"), values);
+    }
+
+    #[test]
+    fn staged_txn_writes_validate_and_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::create_cluster_replica(
+            dir.path(),
+            ClusterId::from_bytes([1; 16]),
+            NodeId::from_bytes([2; 16]),
+            DatabaseId::from_bytes([3; 16]),
+        )
+        .unwrap();
+        db.apply_replicated_catalog_command(&create_table_record("t", 1))
+            .unwrap();
+        let table_id = db.table_id("t").unwrap();
+
+        // Malformed payloads and unmounted tables are rejected at prepare.
+        assert!(db.validate_staged_txn_writes(&[vec![0xFF]]).is_err());
+        let unknown_table = StagedTxnWrite::Put {
+            table_id: 99,
+            rows: bincode::serialize(&Vec::<Row>::new()).unwrap(),
+        }
+        .encode()
+        .unwrap();
+        assert!(db.validate_staged_txn_writes(&[unknown_table]).is_err());
+        let good: Vec<Vec<u8>> = [10_i64, 20, 30]
+            .iter()
+            .map(|value| {
+                let rows = vec![Row::new(crate::RowId(*value as u64), Epoch(0))
+                    .with_column(1, Value::Int64(*value))];
+                StagedTxnWrite::Put {
+                    table_id,
+                    rows: bincode::serialize(&rows).unwrap(),
+                }
+                .encode()
+                .unwrap()
+            })
+            .collect();
+        db.validate_staged_txn_writes(&good).unwrap();
+
+        // A committed resolution applies the staged writes; a delete
+        // resolution removes them; both are replay-safe.
+        let commit_ts = mongreldb_types::hlc::HlcTimestamp {
+            physical_micros: 5_000,
+            logical: 0,
+            node_tiebreaker: 0,
+        };
+        assert!(db
+            .apply_staged_txn_writes(1 << 63, &good, commit_ts)
+            .unwrap());
+        assert_eq!(visible_ids(&db, "t"), vec![10, 20, 30]);
+        let delete = StagedTxnWrite::Delete {
+            table_id,
+            row_ids: vec![20],
+        }
+        .encode()
+        .unwrap();
+        assert!(db
+            .apply_staged_txn_writes((1 << 63) + 1, &[delete], commit_ts)
+            .unwrap());
+        assert_eq!(visible_ids(&db, "t"), vec![10, 30]);
+
+        // Restart: the synthetic WAL transactions replay through the same
+        // recovery path; the rows are durable.
+        let db = Arc::new(db);
+        db.shutdown().unwrap();
+        let expected = crate::storage_mode::StorageMode::ClusterReplica {
+            cluster_id: ClusterId::from_bytes([1; 16]),
+            node_id: NodeId::from_bytes([2; 16]),
+            database_id: DatabaseId::from_bytes([3; 16]),
+        };
+        let db = Database::open_cluster_replica(dir.path(), &expected).unwrap();
+        assert_eq!(visible_ids(&db, "t"), vec![10, 30]);
     }
 }

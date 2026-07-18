@@ -5,7 +5,9 @@
 //! backup, and rolling-upgrade coordination.
 
 pub mod bootstrap;
+pub mod ddl;
 pub mod dist_txn;
+pub mod global_constraints;
 pub mod merge;
 pub mod meta;
 pub mod network;

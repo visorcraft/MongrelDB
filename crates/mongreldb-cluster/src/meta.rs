@@ -78,7 +78,9 @@ use mongreldb_types::ids::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::merge::MergePublishCommand;
 use crate::node::{Incompatibility, NodeDescriptor, NodeState, VersionInfo};
+use crate::split::SplitPublishCommand;
 use crate::tablet::{Bound, Key};
 
 /// Cluster-wide feature level (spec section 17: separate from binary
@@ -495,6 +497,22 @@ pub const COMMAND_TYPE_META_COMMAND: u32 = 4;
 /// Bound on [`MetaState::rejections`] (mirrors the engine catalog's
 /// `COMMAND_HISTORY_LIMIT`).
 pub const META_REJECTION_LIMIT: usize = 256;
+/// First per-group raft node id the meta-owned allocator hands out (spec
+/// section 12.1: the meta control plane owns the node-id ↔ raft-id mapping
+/// for tablet groups). Id 0 is never allocated; the meta group itself uses
+/// the `raft_node_id` projection of the member node ids, which the
+/// allocator skips over (and [`MetaCommand::RegisterNode`] refuses a node
+/// whose projection collides with an id already assigned to a replica).
+pub const FIRST_RAFT_NODE_ID: u64 = 1;
+/// Largest single [`MetaCommand::AllocateRaftNodeIds`] request.
+pub const MAX_RAFT_NODE_ID_ALLOCATION: u32 = 4096;
+/// Bound on [`MetaState::raft_id_allocations`] (the idempotent-replay
+/// record of recent allocations).
+pub const RAFT_ID_ALLOCATION_RECORD_LIMIT: usize = 1024;
+/// Bound on the collision-skip scan of one allocation: the allocator
+/// advances past at most this many already-used ids before refusing
+/// (fail closed; in practice ids collide negligibly often).
+pub const RAFT_ID_ALLOCATION_SCAN_LIMIT: u64 = 1 << 20;
 /// Substrings (matched case-insensitively) that bar a key from the cluster
 /// settings: secrets are never stored as plaintext cluster settings (spec
 /// section 16.2). TLS private keys, backup credentials, and encryption-key
@@ -539,6 +557,18 @@ pub const DEFAULT_AI_MAX_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
 
 fn zero_metadata_version() -> MetadataVersion {
     MetadataVersion::ZERO
+}
+
+/// Lowercase hex of a byte string (command-id map keys; JSON map keys must
+/// be strings).
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 /// Errors of the meta control-plane surface (group factory, membership
@@ -1076,6 +1106,28 @@ pub enum MetaRejectionReason {
         /// Why the command is invalid.
         reason: String,
     },
+    /// A meta-plane binding's proposal transport failed (leader loss,
+    /// timeout, shutdown) before the command's outcome was known. Never
+    /// journaled from apply — apply-time refusals are deterministic; this
+    /// surfaces only through the
+    /// [`crate::split::TabletMetaPlane`]/[`crate::merge::MergeMetaPlane`]
+    /// seams the node runtime drives. Every split/merge descriptor write is
+    /// idempotent, so retrying the failed step is safe.
+    #[error("meta proposal failed: {reason}")]
+    ProposalFailed {
+        /// What failed.
+        reason: String,
+    },
+    /// The node receiving the proposal is not the meta leader (spec section
+    /// 11.7): the caller re-resolves the leader and retries there. Carried
+    /// structured (never stringified) so gateways and split/merge drivers can
+    /// pattern-match it; split/merge descriptor writes are idempotent, so the
+    /// retry is safe.
+    #[error("not the meta leader (current leader: {leader:?})")]
+    NotLeader {
+        /// The node's current belief about the meta leader's raft id, if any.
+        leader: Option<u64>,
+    },
 }
 
 /// One journaled refusal: the refused command's id and the typed reason.
@@ -1203,6 +1255,47 @@ pub enum MetaCommand {
         /// The partition record.
         partition: TxnStatusPartition,
     },
+    /// Publishes the atomic routing change of one tablet split (spec section
+    /// 12.5 step 8): the children become `Active` and the source `Retiring`
+    /// in ONE command. Refused unless the stored source is the command's
+    /// `Splitting` precursor and the stored children its `Creating`
+    /// precursors at exactly one generation below the publication
+    /// generation, the child bounds partition the source at the split key,
+    /// and no other routable tablet of the table overlaps a child. An exact
+    /// re-application (the stored descriptors already carry the command's
+    /// content) is a no-op, so a split resumed after a crash in the
+    /// publication barrier may re-publish.
+    PublishSplit {
+        /// The publication (see [`crate::split::SplitPublishCommand`]).
+        command: SplitPublishCommand,
+    },
+    /// Publishes the atomic routing change of one tablet merge (spec section
+    /// 12.6): the hidden replacement becomes `Active` and both sources
+    /// `Retiring` in ONE command. Refused unless the stored sources are the
+    /// command's `Merging` precursors and the stored replacement its
+    /// `Creating` precursor, with the command-wide generation one above the
+    /// highest stored generation (a lagging source jumps to it), the
+    /// replacement bounds covering exactly the source union, and no other
+    /// routable tablet of the table overlapping the replacement. Exact
+    /// re-application is a no-op (see [`Self::PublishSplit`]).
+    PublishMerge {
+        /// The publication (see [`crate::merge::MergePublishCommand`]).
+        command: MergePublishCommand,
+    },
+    /// Allocates `count` fresh per-group raft node ids from the meta-owned
+    /// allocator (spec section 12.1: the meta control plane owns the
+    /// node-id ↔ raft-id mapping; tablet replica raft ids come from this
+    /// allocator, never the ad-hoc node-id projection the meta group itself
+    /// uses). Ids are drawn from a monotonic counter that skips ids already
+    /// in use (registered-node projections, tablet and placement replicas).
+    /// The allocation is recorded under the command id, so a replayed
+    /// command never double-allocates; the proposer reads the base back
+    /// through [`MetaGroup::allocate_raft_node_ids`].
+    AllocateRaftNodeIds {
+        /// Number of ids to allocate
+        /// (`1..=MAX_RAFT_NODE_ID_ALLOCATION`).
+        count: u32,
+    },
 }
 
 /// The versioned envelope payload carrying one [`MetaCommand`] (spec section
@@ -1319,6 +1412,18 @@ pub struct MetaState {
     /// Bounded journal of refused commands, oldest first
     /// ([`META_REJECTION_LIMIT`]).
     pub rejections: VecDeque<MetaRejection>,
+    /// Next per-group raft node id the meta-owned allocator hands out
+    /// ([`MetaCommand::AllocateRaftNodeIds`]); monotonic and never reused.
+    /// Starts at [`FIRST_RAFT_NODE_ID`].
+    pub next_raft_node_id: u64,
+    /// Recent raft-node-id allocations by command id (hex-encoded, base of
+    /// each allocated range), the idempotent-replay record of
+    /// [`MetaCommand::AllocateRaftNodeIds`]; bounded by
+    /// [`RAFT_ID_ALLOCATION_RECORD_LIMIT`]. (Hex keys: JSON map keys must be
+    /// strings.)
+    pub raft_id_allocations: BTreeMap<String, u64>,
+    /// Eviction order of [`Self::raft_id_allocations`], oldest first.
+    pub raft_id_allocation_order: VecDeque<String>,
 }
 
 impl Default for MetaState {
@@ -1338,6 +1443,9 @@ impl Default for MetaState {
             feature_level: ClusterFeatureLevel::ZERO,
             feature_activations: Vec::new(),
             rejections: VecDeque::new(),
+            next_raft_node_id: FIRST_RAFT_NODE_ID,
+            raft_id_allocations: BTreeMap::new(),
+            raft_id_allocation_order: VecDeque::new(),
         }
     }
 }
@@ -1360,7 +1468,7 @@ impl MetaState {
     ) -> Result<(), MetaRejectionReason> {
         self.metadata_version = MetadataVersion(self.metadata_version.get() + 1);
         let version = self.metadata_version;
-        let result = self.dispatch(command, commit_ts, registry, version);
+        let result = self.dispatch(command, command_id, commit_ts, registry, version);
         if let Err(reason) = &result {
             self.rejections.push_back(MetaRejection {
                 command_id,
@@ -1376,6 +1484,7 @@ impl MetaState {
     fn dispatch(
         &mut self,
         command: &MetaCommand,
+        command_id: Option<[u8; 16]>,
         commit_ts: HlcTimestamp,
         registry: &FeatureRegistry,
         version: MetadataVersion,
@@ -1390,6 +1499,34 @@ impl MetaState {
                 match self.nodes.get(&descriptor.node_id) {
                     Some(existing) if existing.descriptor == *descriptor => Ok(()),
                     _ => {
+                        // The meta group addresses its members by the
+                        // `raft_node_id` projection of their node ids; tablet
+                        // groups must never reuse a projection (the runtime
+                        // attaches one raft node per id to its transport
+                        // registry). Fail closed when the projection is
+                        // already assigned to a tablet/placement replica.
+                        let projected = raft_node_id(&descriptor.node_id);
+                        let assigned_to_replica = self.tablets.values().any(|record| {
+                            record
+                                .descriptor
+                                .replicas
+                                .iter()
+                                .any(|replica| replica.raft_node_id == projected)
+                        }) || self.placements.values().any(|placement| {
+                            placement
+                                .replicas
+                                .iter()
+                                .any(|replica| replica.raft_node_id == projected)
+                        });
+                        if assigned_to_replica {
+                            return Err(MetaRejectionReason::Conflict {
+                                resource: format!("node {}", descriptor.node_id),
+                                reason: format!(
+                                    "raft id projection {projected} is already assigned to a \
+                                     tablet or placement replica; re-mint the node id"
+                                ),
+                            });
+                        }
                         self.nodes.insert(
                             descriptor.node_id,
                             NodeRecord {
@@ -1561,6 +1698,11 @@ impl MetaState {
                 }
             }
             MetaCommand::SetTabletDescriptor { descriptor } => {
+                if let Err(error) = descriptor.validate() {
+                    return Err(MetaRejectionReason::Invalid {
+                        reason: error.to_string(),
+                    });
+                }
                 if !self.tables.contains_key(&descriptor.table_id) {
                     return Err(MetaRejectionReason::NotFound {
                         resource: format!("table {}", descriptor.table_id),
@@ -1806,7 +1948,344 @@ impl MetaState {
                     }
                 }
             }
+            MetaCommand::PublishSplit { command } => self.apply_split_publish(command, version),
+            MetaCommand::PublishMerge { command } => self.apply_merge_publish(command, version),
+            MetaCommand::AllocateRaftNodeIds { count } => {
+                self.apply_allocate_raft_node_ids(*count, command_id)
+            }
         }
+    }
+
+    /// Validates and applies the atomic split publication (spec section 12.5
+    /// step 8): one command flips the children to `Active` and the source to
+    /// `Retiring` at one shared generation. See [`MetaCommand::PublishSplit`]
+    /// for the acceptance contract.
+    fn apply_split_publish(
+        &mut self,
+        command: &SplitPublishCommand,
+        version: MetadataVersion,
+    ) -> Result<(), MetaRejectionReason> {
+        command
+            .validate()
+            .map_err(|error| MetaRejectionReason::Invalid {
+                reason: error.to_string(),
+            })?;
+        if !self.tables.contains_key(&command.source.table_id) {
+            return Err(MetaRejectionReason::NotFound {
+                resource: format!("table {}", command.source.table_id),
+            });
+        }
+        let publish = command.publish_generation();
+        // Idempotent replay: a split resumed after a crash in the
+        // publication barrier re-publishes the identical command.
+        let replay = self.tablet(command.source.tablet_id) == Some(&command.source)
+            && command
+                .children
+                .iter()
+                .all(|child| self.tablet(child.tablet_id) == Some(child));
+        if replay {
+            return Ok(());
+        }
+        let precursor_generation =
+            publish
+                .checked_sub(1)
+                .ok_or_else(|| MetaRejectionReason::Invalid {
+                    reason: "publication generation is zero".to_owned(),
+                })?;
+        // The stored source must be the command's `Splitting` precursor at
+        // exactly `publish - 1` (it was marked at `g + 1`; the publication
+        // assigns `g + 2`).
+        self.require_stored_precursor(
+            &command.source,
+            TabletState::Splitting,
+            precursor_generation,
+            false,
+        )?;
+        // Each stored child must be the command's `Creating` precursor (same
+        // content with learner replicas) at exactly `publish - 1`.
+        for child in &command.children {
+            self.require_stored_precursor(
+                child,
+                TabletState::Creating,
+                precursor_generation,
+                true,
+            )?;
+        }
+        // No other routable tablet of the table may overlap a child (the
+        // participants are excluded; `Creating`/`Retiring` tablets are not
+        // serving, so they cannot double-serve a key).
+        let participants: BTreeSet<TabletId> = command
+            .children
+            .iter()
+            .map(|child| child.tablet_id)
+            .chain([command.source.tablet_id])
+            .collect();
+        for child in &command.children {
+            self.require_no_routable_overlap(child, &participants)?;
+        }
+        for child in &command.children {
+            self.tablets.insert(
+                child.tablet_id,
+                TabletRecord {
+                    descriptor: child.clone(),
+                    metadata_version: version,
+                },
+            );
+        }
+        self.tablets.insert(
+            command.source.tablet_id,
+            TabletRecord {
+                descriptor: command.source.clone(),
+                metadata_version: version,
+            },
+        );
+        Ok(())
+    }
+
+    /// Validates and applies the atomic merge publication (spec section
+    /// 12.6): one command flips the hidden replacement to `Active` and both
+    /// sources to `Retiring` at one command-wide generation. See
+    /// [`MetaCommand::PublishMerge`] for the acceptance contract.
+    fn apply_merge_publish(
+        &mut self,
+        command: &MergePublishCommand,
+        version: MetadataVersion,
+    ) -> Result<(), MetaRejectionReason> {
+        command
+            .validate()
+            .map_err(|error| MetaRejectionReason::Invalid {
+                reason: error.to_string(),
+            })?;
+        if !self.tables.contains_key(&command.replacement.table_id) {
+            return Err(MetaRejectionReason::NotFound {
+                resource: format!("table {}", command.replacement.table_id),
+            });
+        }
+        let publish = command.publish_generation();
+        let replay = self.tablet(command.replacement.tablet_id) == Some(&command.replacement)
+            && command
+                .sources
+                .iter()
+                .all(|source| self.tablet(source.tablet_id) == Some(source));
+        if replay {
+            return Ok(());
+        }
+        let precursor_generation =
+            publish
+                .checked_sub(1)
+                .ok_or_else(|| MetaRejectionReason::Invalid {
+                    reason: "publication generation is zero".to_owned(),
+                })?;
+        // The stored replacement must be the command's `Creating` precursor
+        // at exactly `publish - 1` (it was created at `max(g1, g2) + 1`);
+        // that anchors the command-wide generation: both sources were marked
+        // at their own `g + 1`, at or below `publish - 1`.
+        self.require_stored_precursor(
+            &command.replacement,
+            TabletState::Creating,
+            precursor_generation,
+            true,
+        )?;
+        // Each stored source must be the command's `Merging` precursor below
+        // the publication generation (a source whose generation lags jumps
+        // to the command-wide generation at publish).
+        for source in &command.sources {
+            let stored = self.tablet(source.tablet_id).cloned().ok_or_else(|| {
+                MetaRejectionReason::NotFound {
+                    resource: format!("tablet {}", source.tablet_id),
+                }
+            })?;
+            let mut precursor = stored.clone();
+            precursor.state = TabletState::Retiring;
+            precursor.generation = publish;
+            if stored.state != TabletState::Merging
+                || stored.generation >= publish
+                || precursor != *source
+            {
+                return Err(MetaRejectionReason::Conflict {
+                    resource: format!("tablet {}", source.tablet_id),
+                    reason: format!(
+                        "stored descriptor (state {}, generation {}) is not the Merging \
+                         precursor of the publication (generation {publish})",
+                        stored.state, stored.generation
+                    ),
+                });
+            }
+        }
+        let participants: BTreeSet<TabletId> = command
+            .sources
+            .iter()
+            .map(|source| source.tablet_id)
+            .chain([command.replacement.tablet_id])
+            .collect();
+        self.require_no_routable_overlap(&command.replacement, &participants)?;
+        self.tablets.insert(
+            command.replacement.tablet_id,
+            TabletRecord {
+                descriptor: command.replacement.clone(),
+                metadata_version: version,
+            },
+        );
+        for source in &command.sources {
+            self.tablets.insert(
+                source.tablet_id,
+                TabletRecord {
+                    descriptor: source.clone(),
+                    metadata_version: version,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// The stored descriptor of `published.tablet_id`, verified as the
+    /// publication's precursor: in `precursor_state` at `precursor_generation`
+    /// with otherwise identical content (a published child's learner replicas
+    /// promote to voters, so those compare with roles normalized).
+    fn require_stored_precursor(
+        &self,
+        published: &TabletDescriptor,
+        precursor_state: TabletState,
+        precursor_generation: u64,
+        learners_promoted: bool,
+    ) -> Result<TabletDescriptor, MetaRejectionReason> {
+        let stored = self.tablet(published.tablet_id).cloned().ok_or_else(|| {
+            MetaRejectionReason::NotFound {
+                resource: format!("tablet {}", published.tablet_id),
+            }
+        })?;
+        let mut precursor = stored.clone();
+        precursor.state = published.state;
+        precursor.generation = published.generation;
+        if learners_promoted {
+            for replica in &mut precursor.replicas {
+                replica.role = ReplicaRole::Voter;
+            }
+        }
+        if stored.state != precursor_state
+            || stored.generation != precursor_generation
+            || precursor != *published
+        {
+            return Err(MetaRejectionReason::Conflict {
+                resource: format!("tablet {}", published.tablet_id),
+                reason: format!(
+                    "stored descriptor (state {}, generation {}) is not the {} precursor of \
+                     the publication (state {}, generation {})",
+                    stored.state,
+                    stored.generation,
+                    precursor_state,
+                    published.state,
+                    published.generation
+                ),
+            });
+        }
+        Ok(stored)
+    }
+
+    /// Fails when any routable tablet of `published.table_id` outside
+    /// `participants` overlaps `published`'s bounds (two serving tablets
+    /// covering one key would double-serve reads).
+    fn require_no_routable_overlap(
+        &self,
+        published: &TabletDescriptor,
+        participants: &BTreeSet<TabletId>,
+    ) -> Result<(), MetaRejectionReason> {
+        let overlapping =
+            self.tablets
+                .values()
+                .map(|record| &record.descriptor)
+                .find(|descriptor| {
+                    !participants.contains(&descriptor.tablet_id)
+                        && descriptor.table_id == published.table_id
+                        && descriptor.state.is_routable()
+                        && descriptor.partition.overlaps(&published.partition)
+                });
+        if let Some(other) = overlapping {
+            return Err(MetaRejectionReason::Conflict {
+                resource: format!("tablet {}", published.tablet_id),
+                reason: format!("bounds overlap routable tablet {}", other.tablet_id),
+            });
+        }
+        Ok(())
+    }
+
+    /// Applies one raft-node-id allocation (see
+    /// [`MetaCommand::AllocateRaftNodeIds`]): draws `count` ids from the
+    /// monotonic counter, skipping ids already in use, and records the base
+    /// under the command id for idempotent replay.
+    fn apply_allocate_raft_node_ids(
+        &mut self,
+        count: u32,
+        command_id: Option<[u8; 16]>,
+    ) -> Result<(), MetaRejectionReason> {
+        if count == 0 || count > MAX_RAFT_NODE_ID_ALLOCATION {
+            return Err(MetaRejectionReason::Invalid {
+                reason: format!(
+                    "raft node id allocation count {count} is outside \
+                     1..={MAX_RAFT_NODE_ID_ALLOCATION}"
+                ),
+            });
+        }
+        if let Some(id) = command_id {
+            if self.raft_id_allocations.contains_key(&hex_encode(&id)) {
+                // Idempotent replay of an already-applied allocation.
+                return Ok(());
+            }
+        }
+        let mut used = BTreeSet::new();
+        for record in self.nodes.values() {
+            used.insert(raft_node_id(&record.descriptor.node_id));
+        }
+        for record in self.tablets.values() {
+            for replica in &record.descriptor.replicas {
+                used.insert(replica.raft_node_id);
+            }
+        }
+        for placement in self.placements.values() {
+            for replica in &placement.replicas {
+                used.insert(replica.raft_node_id);
+            }
+        }
+        let count = u64::from(count);
+        let mut base = self.next_raft_node_id.max(FIRST_RAFT_NODE_ID);
+        let mut skips = 0u64;
+        loop {
+            let end = base
+                .checked_add(count)
+                .ok_or_else(|| MetaRejectionReason::Conflict {
+                    resource: "raft node id allocator".to_owned(),
+                    reason: "allocation overflows u64".to_owned(),
+                })?;
+            match used.range(base..end).next() {
+                None => break,
+                Some(conflicting) => {
+                    skips += 1;
+                    if skips > RAFT_ID_ALLOCATION_SCAN_LIMIT {
+                        return Err(MetaRejectionReason::Conflict {
+                            resource: "raft node id allocator".to_owned(),
+                            reason: format!(
+                                "collision skip scan exceeded {RAFT_ID_ALLOCATION_SCAN_LIMIT} \
+                                 allocated ids"
+                            ),
+                        });
+                    }
+                    base = conflicting + 1;
+                }
+            }
+        }
+        let end = base + count;
+        self.next_raft_node_id = end;
+        if let Some(id) = command_id {
+            let key = hex_encode(&id);
+            self.raft_id_allocations.insert(key.clone(), base);
+            self.raft_id_allocation_order.push_back(key);
+            while self.raft_id_allocation_order.len() > RAFT_ID_ALLOCATION_RECORD_LIMIT {
+                if let Some(oldest) = self.raft_id_allocation_order.pop_front() {
+                    self.raft_id_allocations.remove(&oldest);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// One registered node's descriptor.
@@ -1906,6 +2385,20 @@ impl MetaState {
     /// The bounded refusal journal, oldest first.
     pub fn rejections(&self) -> &VecDeque<MetaRejection> {
         &self.rejections
+    }
+
+    /// The next id the meta-owned raft-node-id allocator hands out.
+    pub fn next_raft_node_id(&self) -> u64 {
+        self.next_raft_node_id
+    }
+
+    /// The base of the range allocated by the command with id `command_id`,
+    /// when the allocation record is still retained
+    /// ([`RAFT_ID_ALLOCATION_RECORD_LIMIT`]).
+    pub fn raft_id_allocation(&self, command_id: &[u8; 16]) -> Option<u64> {
+        self.raft_id_allocations
+            .get(&hex_encode(command_id))
+            .copied()
     }
 }
 
@@ -2291,6 +2784,12 @@ fn migrate_state(state: v1::MetaState) -> MetaState {
         feature_level: state.feature_level,
         feature_activations: state.feature_activations,
         rejections: state.rejections,
+        // v1 pre-dates the meta-owned raft-id allocator; the counter starts
+        // fresh (ad-hoc replica raft ids of v1 deployments stay as recorded
+        // in their descriptors and are skipped by the collision scan).
+        next_raft_node_id: FIRST_RAFT_NODE_ID,
+        raft_id_allocations: BTreeMap::new(),
+        raft_id_allocation_order: VecDeque::new(),
     }
 }
 
@@ -2889,6 +3388,34 @@ impl<T: RaftTransport> MetaGroup<T> {
             .clone()
     }
 
+    /// Allocates `count` fresh per-group raft node ids from the meta-owned
+    /// allocator (spec section 12.1), returning them in ascending order.
+    /// Tablet replica raft ids come from this allocator — never the ad-hoc
+    /// node-id projection the meta group itself uses (see
+    /// [`MetaCommand::AllocateRaftNodeIds`]). The allocation is idempotent
+    /// under its command id and durable in replicated state, so ids are
+    /// never reused across failovers and restarts.
+    pub async fn allocate_raft_node_ids(
+        &self,
+        count: u32,
+        control: &ExecutionControl,
+    ) -> Result<Vec<RaftNodeId>, MetaError> {
+        let command_id = new_command_id()?;
+        self.propose(
+            command_id,
+            MetaCommand::AllocateRaftNodeIds { count },
+            control,
+        )
+        .await?;
+        let state = self.state();
+        let base = state.raft_id_allocation(&command_id).ok_or_else(|| {
+            MetaError::InvalidRequest(
+                "raft node id allocation record missing after commit".to_owned(),
+            )
+        })?;
+        Ok((base..base + u64::from(count)).collect())
+    }
+
     /// The local applied watermark (monotonic per applied command).
     pub fn metadata_version(&self) -> MetadataVersion {
         self.sink
@@ -2900,6 +3427,14 @@ impl<T: RaftTransport> MetaGroup<T> {
     /// Graceful shutdown of the underlying group.
     pub async fn shutdown(&self) -> Result<(), MetaError> {
         self.group.shutdown().await.map_err(MetaError::Consensus)
+    }
+
+    /// Process-free crash simulation: stops the raft task without the
+    /// graceful storage close (see [`ConsensusGroup::crash`]); everything
+    /// fsynced survives, which is exactly the split/merge crash-resume
+    /// contract.
+    pub async fn crash(self) {
+        self.group.crash().await;
     }
 }
 
@@ -3411,6 +3946,13 @@ mod stage3a_tests {
                     home_raft_group: group_id(9),
                 },
             },
+            MetaCommand::PublishSplit {
+                command: split_publish_command(),
+            },
+            MetaCommand::PublishMerge {
+                command: merge_publish_command(),
+            },
+            MetaCommand::AllocateRaftNodeIds { count: 3 },
         ];
         for command in commands {
             let record = MetaCommandRecord::new(command);
@@ -3499,6 +4041,7 @@ mod stage3a_tests {
             MetaCommand::DropDatabase {
                 database_id: DatabaseId::from_bytes([0xEE; 16]),
             },
+            MetaCommand::AllocateRaftNodeIds { count: 3 },
         ]
     }
 
@@ -3510,8 +4053,10 @@ mod stage3a_tests {
             let id = u8::try_from(index + 1).unwrap();
             apply(&mut state, &registry, id, command).unwrap();
         }
-        assert_eq!(state.metadata_version, MetadataVersion(15));
+        assert_eq!(state.metadata_version, MetadataVersion(16));
         assert!(state.rejections().is_empty());
+        // The allocator command appended to the sequence handed out three ids.
+        assert_eq!(state.next_raft_node_id(), FIRST_RAFT_NODE_ID + 3);
 
         let node = state.node_record(node_id(1)).unwrap();
         assert_eq!(node.descriptor.state, NodeState::Draining);
@@ -3610,6 +4155,959 @@ mod stage3a_tests {
             serde_json::to_vec(&a).unwrap(),
             serde_json::to_vec(&b).unwrap()
         );
+    }
+
+    // -- split/merge publish adoption (spec sections 12.5-12.6) --------------
+
+    fn key(bytes: &[u8]) -> Key {
+        Key::from_bytes(bytes.to_vec())
+    }
+
+    fn voter_on(node: u8, raft: u64) -> ReplicaDescriptor {
+        ReplicaDescriptor {
+            node_id: node_id(node),
+            role: ReplicaRole::Voter,
+            raft_node_id: raft,
+        }
+    }
+
+    /// The pre-split source: table 1, [a, z), `Active` at generation 5.
+    fn split_source() -> TabletDescriptor {
+        TabletDescriptor {
+            tablet_id: TabletId::from_bytes([0x51; 16]),
+            table_id: TableId(1),
+            raft_group_id: group_id(0x51),
+            partition: PartitionBounds::new(Bound::Included(key(b"a")), Bound::Excluded(key(b"z")))
+                .unwrap(),
+            replicas: vec![voter_on(1, 101), voter_on(2, 102)],
+            leader_hint: None,
+            generation: 5,
+            state: TabletState::Active,
+        }
+    }
+
+    fn split_plan() -> crate::split::SplitPlan {
+        crate::split::TabletSplitPlanner::new("/unused")
+            .plan(
+                &split_source(),
+                crate::split::SplitKeySelection::Explicit(key(b"m")),
+                ts(150),
+                [
+                    crate::split::ChildAllocation {
+                        tablet_id: TabletId::from_bytes([0x52; 16]),
+                        raft_group_id: group_id(0x52),
+                        replicas: vec![voter_on(1, 201), voter_on(2, 202)],
+                    },
+                    crate::split::ChildAllocation {
+                        tablet_id: TabletId::from_bytes([0x53; 16]),
+                        raft_group_id: group_id(0x53),
+                        replicas: vec![voter_on(1, 301), voter_on(2, 302)],
+                    },
+                ],
+            )
+            .unwrap()
+    }
+
+    fn split_publish_command() -> SplitPublishCommand {
+        SplitPublishCommand::from_plan(&split_plan()).unwrap()
+    }
+
+    /// Seeds a state with the database/table, the `Splitting` source, and
+    /// the `Creating` children of [`split_plan`], returning the plan.
+    fn seed_split_publish(
+        state: &mut MetaState,
+        registry: &FeatureRegistry,
+    ) -> crate::split::SplitPlan {
+        apply(
+            state,
+            registry,
+            1,
+            MetaCommand::CreateDatabase {
+                descriptor: database(1, "app"),
+            },
+        )
+        .unwrap();
+        apply(
+            state,
+            registry,
+            2,
+            MetaCommand::SetTableSchema {
+                record: schema_record(1, 1, 1),
+            },
+        )
+        .unwrap();
+        let plan = split_plan();
+        apply(
+            state,
+            registry,
+            3,
+            MetaCommand::SetTabletDescriptor {
+                descriptor: plan.source.clone(),
+            },
+        )
+        .unwrap();
+        let marked = plan
+            .source
+            .published_transition(TabletState::Splitting)
+            .unwrap();
+        apply(
+            state,
+            registry,
+            4,
+            MetaCommand::SetTabletDescriptor { descriptor: marked },
+        )
+        .unwrap();
+        for (index, child) in plan.child_descriptors().into_iter().enumerate() {
+            apply(
+                state,
+                registry,
+                5 + u8::try_from(index).unwrap(),
+                MetaCommand::SetTabletDescriptor { descriptor: child },
+            )
+            .unwrap();
+        }
+        plan
+    }
+
+    /// The merge sources: table 1, adjacent [a, m) at generation 4 and
+    /// [m, z) at generation 6, placed on the same two nodes.
+    fn merge_sources() -> [TabletDescriptor; 2] {
+        let source =
+            |byte: u8, low: Bound<Key>, high: Bound<Key>, generation: u64, raft_base: u64| {
+                TabletDescriptor {
+                    tablet_id: TabletId::from_bytes([byte; 16]),
+                    table_id: TableId(1),
+                    raft_group_id: group_id(byte),
+                    partition: PartitionBounds::new(low, high).unwrap(),
+                    replicas: vec![voter_on(1, raft_base), voter_on(2, raft_base + 1)],
+                    leader_hint: None,
+                    generation,
+                    state: TabletState::Active,
+                }
+            };
+        [
+            source(
+                0x61,
+                Bound::Included(key(b"a")),
+                Bound::Excluded(key(b"m")),
+                4,
+                101,
+            ),
+            source(
+                0x62,
+                Bound::Included(key(b"m")),
+                Bound::Excluded(key(b"z")),
+                6,
+                201,
+            ),
+        ]
+    }
+
+    fn merge_plan() -> crate::merge::MergePlan {
+        let [first, second] = merge_sources();
+        crate::merge::MergePlanner::new("/unused")
+            .plan(
+                crate::merge::MergeInputs {
+                    first,
+                    second,
+                    first_schema: SchemaVersion(1),
+                    second_schema: SchemaVersion(1),
+                    active_schema_job: None,
+                    first_size_bytes: 1_000,
+                    second_size_bytes: 2_000,
+                    max_merged_size_bytes: 1_000_000,
+                },
+                ts(150),
+                crate::split::ChildAllocation {
+                    tablet_id: TabletId::from_bytes([0x63; 16]),
+                    raft_group_id: group_id(0x63),
+                    replicas: vec![voter_on(1, 301), voter_on(2, 302)],
+                },
+            )
+            .unwrap()
+    }
+
+    fn merge_publish_command() -> MergePublishCommand {
+        MergePublishCommand::from_plan(&merge_plan()).unwrap()
+    }
+
+    /// Seeds a state with the database/table, the `Merging` sources, and the
+    /// `Creating` replacement of [`merge_plan`], returning the plan.
+    fn seed_merge_publish(
+        state: &mut MetaState,
+        registry: &FeatureRegistry,
+    ) -> crate::merge::MergePlan {
+        apply(
+            state,
+            registry,
+            1,
+            MetaCommand::CreateDatabase {
+                descriptor: database(1, "app"),
+            },
+        )
+        .unwrap();
+        apply(
+            state,
+            registry,
+            2,
+            MetaCommand::SetTableSchema {
+                record: schema_record(1, 1, 1),
+            },
+        )
+        .unwrap();
+        let plan = merge_plan();
+        for (index, source) in plan.sources.iter().enumerate() {
+            let id = 3 + 2 * u8::try_from(index).unwrap();
+            apply(
+                state,
+                registry,
+                id,
+                MetaCommand::SetTabletDescriptor {
+                    descriptor: source.clone(),
+                },
+            )
+            .unwrap();
+            let marked = source.published_transition(TabletState::Merging).unwrap();
+            apply(
+                state,
+                registry,
+                id + 1,
+                MetaCommand::SetTabletDescriptor { descriptor: marked },
+            )
+            .unwrap();
+        }
+        apply(
+            state,
+            registry,
+            7,
+            MetaCommand::SetTabletDescriptor {
+                descriptor: plan.replacement_descriptor(),
+            },
+        )
+        .unwrap();
+        plan
+    }
+
+    #[test]
+    fn publish_split_applies_atomically_and_replays_idempotently() {
+        let registry = registry_with("ann-v2", 7);
+        let mut state = MetaState::default();
+        let plan = seed_split_publish(&mut state, &registry);
+        let command = SplitPublishCommand::from_plan(&plan).unwrap();
+        apply(
+            &mut state,
+            &registry,
+            10,
+            MetaCommand::PublishSplit {
+                command: command.clone(),
+            },
+        )
+        .unwrap();
+        // One atomic publication: children Active, source Retiring, all at
+        // the publication generation (g + 2 = 7), learners promoted.
+        let source = state.tablet(plan.source.tablet_id).unwrap().clone();
+        assert_eq!(source.state, TabletState::Retiring);
+        assert_eq!(source.generation, 7);
+        for child in &command.children {
+            let stored = state.tablet(child.tablet_id).unwrap();
+            assert_eq!(stored, child);
+            assert_eq!(stored.state, TabletState::Active);
+            assert_eq!(stored.generation, 7);
+            assert!(stored.replicas.iter().all(|r| r.role == ReplicaRole::Voter));
+        }
+        assert!(state.rejections().is_empty());
+        // Idempotent replay (a resumed split re-publishes after a crash in
+        // the barrier): a different command id carrying the identical
+        // publication is a no-op.
+        let version = state.metadata_version;
+        apply(
+            &mut state,
+            &registry,
+            11,
+            MetaCommand::PublishSplit { command },
+        )
+        .unwrap();
+        assert!(state.rejections().is_empty());
+        assert_eq!(state.tablet(plan.source.tablet_id).unwrap(), &source);
+        assert_eq!(
+            state
+                .tablet_record(plan.source.tablet_id)
+                .unwrap()
+                .metadata_version,
+            version
+        );
+    }
+
+    #[test]
+    fn publish_split_rejection_matrix() {
+        let registry = registry_with("ann-v2", 7);
+
+        // The source was never marked Splitting (only the database, table,
+        // and Active source are seeded).
+        let mut state = MetaState::default();
+        apply(
+            &mut state,
+            &registry,
+            1,
+            MetaCommand::CreateDatabase {
+                descriptor: database(1, "app"),
+            },
+        )
+        .unwrap();
+        apply(
+            &mut state,
+            &registry,
+            2,
+            MetaCommand::SetTableSchema {
+                record: schema_record(1, 1, 1),
+            },
+        )
+        .unwrap();
+        apply(
+            &mut state,
+            &registry,
+            3,
+            MetaCommand::SetTabletDescriptor {
+                descriptor: split_source(),
+            },
+        )
+        .unwrap();
+        let error = apply(
+            &mut state,
+            &registry,
+            21,
+            MetaCommand::PublishSplit {
+                command: split_publish_command(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, MetaRejectionReason::Conflict { .. }));
+        assert_eq!(state.rejections().len(), 1);
+        assert_eq!(state.rejections()[0].command_id, Some(cmd_id(21)));
+
+        // A child descriptor is missing.
+        let mut state = MetaState::default();
+        let plan = seed_split_publish(&mut state, &registry);
+        apply(
+            &mut state,
+            &registry,
+            20,
+            MetaCommand::RemoveTabletDescriptor {
+                tablet_id: plan.child_descriptors()[1].tablet_id,
+                generation: 6,
+            },
+        )
+        .unwrap();
+        let error = apply(
+            &mut state,
+            &registry,
+            21,
+            MetaCommand::PublishSplit {
+                command: split_publish_command(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, MetaRejectionReason::NotFound { .. }));
+
+        // A child is not in Creating.
+        let mut state = MetaState::default();
+        let plan = seed_split_publish(&mut state, &registry);
+        let mut rogue = plan.child_descriptors()[0].clone();
+        rogue.state = TabletState::Active;
+        rogue.generation = 7;
+        for replica in &mut rogue.replicas {
+            replica.role = ReplicaRole::Voter;
+        }
+        apply(
+            &mut state,
+            &registry,
+            20,
+            MetaCommand::SetTabletDescriptor { descriptor: rogue },
+        )
+        .unwrap();
+        let error = apply(
+            &mut state,
+            &registry,
+            21,
+            MetaCommand::PublishSplit {
+                command: split_publish_command(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, MetaRejectionReason::Conflict { .. }));
+
+        // The publication generation does not follow the stored precursors.
+        let mut state = MetaState::default();
+        seed_split_publish(&mut state, &registry);
+        let mut command = split_publish_command();
+        command.source.generation += 1;
+        for child in &mut command.children {
+            child.generation += 1;
+        }
+        let error = apply(
+            &mut state,
+            &registry,
+            21,
+            MetaCommand::PublishSplit { command },
+        )
+        .unwrap_err();
+        assert!(matches!(error, MetaRejectionReason::Conflict { .. }));
+
+        // The child bounds do not partition the source at the split key.
+        let mut state = MetaState::default();
+        seed_split_publish(&mut state, &registry);
+        let mut command = split_publish_command();
+        command.split_key = key(b"n");
+        let error = apply(
+            &mut state,
+            &registry,
+            21,
+            MetaCommand::PublishSplit { command },
+        )
+        .unwrap_err();
+        assert!(matches!(error, MetaRejectionReason::Invalid { .. }));
+
+        // Another routable tablet of the table overlaps a child.
+        let mut state = MetaState::default();
+        seed_split_publish(&mut state, &registry);
+        let overlapping = TabletDescriptor {
+            tablet_id: TabletId::from_bytes([0x70; 16]),
+            table_id: TableId(1),
+            raft_group_id: group_id(0x70),
+            partition: PartitionBounds::new(Bound::Included(key(b"a")), Bound::Excluded(key(b"b")))
+                .unwrap(),
+            replicas: vec![voter_on(1, 901)],
+            leader_hint: None,
+            generation: 1,
+            state: TabletState::Active,
+        };
+        apply(
+            &mut state,
+            &registry,
+            20,
+            MetaCommand::SetTabletDescriptor {
+                descriptor: overlapping,
+            },
+        )
+        .unwrap();
+        let error = apply(
+            &mut state,
+            &registry,
+            21,
+            MetaCommand::PublishSplit {
+                command: split_publish_command(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, MetaRejectionReason::Conflict { .. }));
+
+        // The table does not exist.
+        let mut state = MetaState::default();
+        let error = apply(
+            &mut state,
+            &registry,
+            21,
+            MetaCommand::PublishSplit {
+                command: split_publish_command(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, MetaRejectionReason::NotFound { .. }));
+    }
+
+    #[test]
+    fn publish_merge_applies_atomically_with_lagging_generations_and_replays() {
+        let registry = registry_with("ann-v2", 7);
+        let mut state = MetaState::default();
+        let plan = seed_merge_publish(&mut state, &registry);
+        let command = MergePublishCommand::from_plan(&plan).unwrap();
+        apply(
+            &mut state,
+            &registry,
+            10,
+            MetaCommand::PublishMerge {
+                command: command.clone(),
+            },
+        )
+        .unwrap();
+        // The command-wide generation is max(g1, g2) + 2 = 8: the source
+        // marked at generation 5 jumps to 8 with the rest.
+        let replacement = state.tablet(command.replacement.tablet_id).unwrap();
+        assert_eq!(replacement.state, TabletState::Active);
+        assert_eq!(replacement.generation, 8);
+        for source in &command.sources {
+            let stored = state.tablet(source.tablet_id).unwrap();
+            assert_eq!(stored.state, TabletState::Retiring);
+            assert_eq!(stored.generation, 8);
+        }
+        assert!(state.rejections().is_empty());
+        // Idempotent replay.
+        apply(
+            &mut state,
+            &registry,
+            11,
+            MetaCommand::PublishMerge { command },
+        )
+        .unwrap();
+        assert!(state.rejections().is_empty());
+    }
+
+    #[test]
+    fn publish_merge_rejection_matrix() {
+        let registry = registry_with("ann-v2", 7);
+
+        // A source was never marked Merging (it is stored Active, one
+        // generation above the mark it never took).
+        let mut state = MetaState::default();
+        let plan = seed_merge_publish(&mut state, &registry);
+        let mut active = plan.sources[0].clone();
+        active.generation = 6;
+        apply(
+            &mut state,
+            &registry,
+            20,
+            MetaCommand::SetTabletDescriptor { descriptor: active },
+        )
+        .unwrap();
+        let error = apply(
+            &mut state,
+            &registry,
+            21,
+            MetaCommand::PublishMerge {
+                command: merge_publish_command(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, MetaRejectionReason::Conflict { .. }));
+
+        // The replacement descriptor is missing.
+        let mut state = MetaState::default();
+        let plan = seed_merge_publish(&mut state, &registry);
+        apply(
+            &mut state,
+            &registry,
+            20,
+            MetaCommand::RemoveTabletDescriptor {
+                tablet_id: plan.replacement_descriptor().tablet_id,
+                generation: 7,
+            },
+        )
+        .unwrap();
+        let error = apply(
+            &mut state,
+            &registry,
+            21,
+            MetaCommand::PublishMerge {
+                command: merge_publish_command(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, MetaRejectionReason::NotFound { .. }));
+
+        // The replacement is not in Creating.
+        let mut state = MetaState::default();
+        let plan = seed_merge_publish(&mut state, &registry);
+        let mut rogue = plan.replacement_descriptor();
+        rogue.state = TabletState::Active;
+        rogue.generation = 8;
+        for replica in &mut rogue.replicas {
+            replica.role = ReplicaRole::Voter;
+        }
+        apply(
+            &mut state,
+            &registry,
+            20,
+            MetaCommand::SetTabletDescriptor { descriptor: rogue },
+        )
+        .unwrap();
+        let error = apply(
+            &mut state,
+            &registry,
+            21,
+            MetaCommand::PublishMerge {
+                command: merge_publish_command(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, MetaRejectionReason::Conflict { .. }));
+
+        // The replacement's stored generation is off the generation math
+        // (remove the seeded descriptor, re-create it one generation low).
+        let mut state = MetaState::default();
+        let plan = seed_merge_publish(&mut state, &registry);
+        let mut rogue = plan.replacement_descriptor();
+        rogue.generation -= 1;
+        apply(
+            &mut state,
+            &registry,
+            19,
+            MetaCommand::RemoveTabletDescriptor {
+                tablet_id: rogue.tablet_id,
+                generation: 7,
+            },
+        )
+        .unwrap();
+        apply(
+            &mut state,
+            &registry,
+            20,
+            MetaCommand::SetTabletDescriptor { descriptor: rogue },
+        )
+        .unwrap();
+        let error = apply(
+            &mut state,
+            &registry,
+            21,
+            MetaCommand::PublishMerge {
+                command: merge_publish_command(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, MetaRejectionReason::Conflict { .. }));
+
+        // The replacement bounds are not the union of the sources.
+        let mut state = MetaState::default();
+        seed_merge_publish(&mut state, &registry);
+        let mut command = merge_publish_command();
+        command.replacement.partition = command.sources[0].partition.clone();
+        let error = apply(
+            &mut state,
+            &registry,
+            21,
+            MetaCommand::PublishMerge { command },
+        )
+        .unwrap_err();
+        assert!(matches!(error, MetaRejectionReason::Invalid { .. }));
+
+        // Another routable tablet of the table overlaps the replacement.
+        let mut state = MetaState::default();
+        seed_merge_publish(&mut state, &registry);
+        let overlapping = TabletDescriptor {
+            tablet_id: TabletId::from_bytes([0x70; 16]),
+            table_id: TableId(1),
+            raft_group_id: group_id(0x70),
+            partition: PartitionBounds::new(Bound::Included(key(b"b")), Bound::Excluded(key(b"c")))
+                .unwrap(),
+            replicas: vec![voter_on(1, 901)],
+            leader_hint: None,
+            generation: 1,
+            state: TabletState::Active,
+        };
+        apply(
+            &mut state,
+            &registry,
+            20,
+            MetaCommand::SetTabletDescriptor {
+                descriptor: overlapping,
+            },
+        )
+        .unwrap();
+        let error = apply(
+            &mut state,
+            &registry,
+            21,
+            MetaCommand::PublishMerge {
+                command: merge_publish_command(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, MetaRejectionReason::Conflict { .. }));
+    }
+
+    // -- meta-owned raft-node-id allocation -----------------------------------
+
+    #[test]
+    fn allocate_raft_node_ids_is_monotonic_unique_and_replay_safe() {
+        let registry = registry_with("ann-v2", 7);
+        let mut state = MetaState::default();
+        apply(
+            &mut state,
+            &registry,
+            1,
+            MetaCommand::AllocateRaftNodeIds { count: 3 },
+        )
+        .unwrap();
+        assert_eq!(
+            state.raft_id_allocation(&cmd_id(1)),
+            Some(FIRST_RAFT_NODE_ID)
+        );
+        assert_eq!(state.next_raft_node_id(), FIRST_RAFT_NODE_ID + 3);
+        apply(
+            &mut state,
+            &registry,
+            2,
+            MetaCommand::AllocateRaftNodeIds { count: 2 },
+        )
+        .unwrap();
+        // The ranges never overlap and the counter only advances.
+        assert_eq!(
+            state.raft_id_allocation(&cmd_id(2)),
+            Some(FIRST_RAFT_NODE_ID + 3)
+        );
+        assert_eq!(state.next_raft_node_id(), FIRST_RAFT_NODE_ID + 5);
+        // Replaying the first command id is a no-op: no double allocation.
+        apply(
+            &mut state,
+            &registry,
+            1,
+            MetaCommand::AllocateRaftNodeIds { count: 3 },
+        )
+        .unwrap();
+        assert_eq!(state.next_raft_node_id(), FIRST_RAFT_NODE_ID + 5);
+        assert_eq!(state.raft_id_allocations.len(), 2);
+        // Bounds are enforced and journaled.
+        let error = apply(
+            &mut state,
+            &registry,
+            3,
+            MetaCommand::AllocateRaftNodeIds { count: 0 },
+        )
+        .unwrap_err();
+        assert!(matches!(error, MetaRejectionReason::Invalid { .. }));
+        let error = apply(
+            &mut state,
+            &registry,
+            4,
+            MetaCommand::AllocateRaftNodeIds {
+                count: MAX_RAFT_NODE_ID_ALLOCATION + 1,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, MetaRejectionReason::Invalid { .. }));
+        assert_eq!(state.rejections().len(), 2);
+        assert_eq!(state.next_raft_node_id(), FIRST_RAFT_NODE_ID + 5);
+    }
+
+    #[test]
+    fn allocator_skips_ids_in_use_and_survives_restarts() {
+        let registry = registry_with("ann-v2", 7);
+        let mut state = MetaState::default();
+        apply(
+            &mut state,
+            &registry,
+            1,
+            MetaCommand::CreateDatabase {
+                descriptor: database(1, "app"),
+            },
+        )
+        .unwrap();
+        apply(
+            &mut state,
+            &registry,
+            2,
+            MetaCommand::SetTableSchema {
+                record: schema_record(1, 1, 1),
+            },
+        )
+        .unwrap();
+        // Register the replica nodes first (placements validate node
+        // references); their projections are far above the ids below.
+        for (id, node) in [(3, 1), (4, 2)] {
+            apply(
+                &mut state,
+                &registry,
+                id,
+                MetaCommand::RegisterNode {
+                    descriptor: descriptor(node, &[]),
+                },
+            )
+            .unwrap();
+        }
+        // Tablet replicas hold raft ids 1 and 3; a placement holds 5.
+        let mut tablet = tablet(1, 1, 1);
+        tablet.replicas = vec![voter_on(1, 1), voter_on(2, 3)];
+        apply(
+            &mut state,
+            &registry,
+            5,
+            MetaCommand::SetTabletDescriptor { descriptor: tablet },
+        )
+        .unwrap();
+        apply(
+            &mut state,
+            &registry,
+            6,
+            MetaCommand::SetReplicaPlacement {
+                placement: ReplicaPlacement {
+                    raft_group_id: group_id(8),
+                    replicas: vec![voter_on(1, 5)],
+                    metadata_version: MetadataVersion::ZERO,
+                },
+            },
+        )
+        .unwrap();
+        // The allocation [1, 4) collides at 1 and 3, [4, 7) at 5: the first
+        // free window of three is [6, 9).
+        apply(
+            &mut state,
+            &registry,
+            7,
+            MetaCommand::AllocateRaftNodeIds { count: 3 },
+        )
+        .unwrap();
+        assert_eq!(state.raft_id_allocation(&cmd_id(7)), Some(6));
+        assert_eq!(state.next_raft_node_id(), 9);
+        // A registered node's projection is skipped too: force the counter
+        // onto it and watch the allocation step over it.
+        apply(
+            &mut state,
+            &registry,
+            8,
+            MetaCommand::RegisterNode {
+                descriptor: descriptor(9, &[]),
+            },
+        )
+        .unwrap();
+        state.next_raft_node_id = raft_node_id(&node_id(9));
+        apply(
+            &mut state,
+            &registry,
+            9,
+            MetaCommand::AllocateRaftNodeIds { count: 2 },
+        )
+        .unwrap();
+        assert_eq!(
+            state.raft_id_allocation(&cmd_id(9)),
+            Some(raft_node_id(&node_id(9)) + 1)
+        );
+
+        // Restart durability: the counter and the replay records live in the
+        // durable checkpoint.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut sink = MetaApplySink::open(tmp.path(), registry.clone()).unwrap();
+        ApplySink::apply(
+            &mut sink,
+            &applied(
+                1,
+                meta_envelope(1, MetaCommand::AllocateRaftNodeIds { count: 4 }),
+            ),
+        )
+        .unwrap();
+        drop(sink);
+        let mut reopened = MetaApplySink::open(tmp.path(), registry).unwrap();
+        assert_eq!(reopened.state().next_raft_node_id(), FIRST_RAFT_NODE_ID + 4);
+        // The replay record survived: the same command id does not allocate
+        // again, and a fresh command continues above the first range.
+        ApplySink::apply(
+            &mut reopened,
+            &applied(
+                2,
+                meta_envelope(1, MetaCommand::AllocateRaftNodeIds { count: 4 }),
+            ),
+        )
+        .unwrap();
+        assert_eq!(reopened.state().next_raft_node_id(), FIRST_RAFT_NODE_ID + 4);
+        ApplySink::apply(
+            &mut reopened,
+            &applied(
+                3,
+                meta_envelope(2, MetaCommand::AllocateRaftNodeIds { count: 1 }),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.state().raft_id_allocation(&cmd_id(2)),
+            Some(FIRST_RAFT_NODE_ID + 4)
+        );
+    }
+
+    #[test]
+    fn register_node_rejects_a_projection_collision_with_replica_raft_ids() {
+        let registry = registry_with("ann-v2", 7);
+        let mut state = MetaState::default();
+        apply(
+            &mut state,
+            &registry,
+            1,
+            MetaCommand::CreateDatabase {
+                descriptor: database(1, "app"),
+            },
+        )
+        .unwrap();
+        apply(
+            &mut state,
+            &registry,
+            2,
+            MetaCommand::SetTableSchema {
+                record: schema_record(1, 1, 1),
+            },
+        )
+        .unwrap();
+        let mut tablet = tablet(1, 1, 1);
+        tablet.replicas = vec![voter_on(1, 4242)];
+        apply(
+            &mut state,
+            &registry,
+            3,
+            MetaCommand::SetTabletDescriptor { descriptor: tablet },
+        )
+        .unwrap();
+        // A node whose raft-id projection is already a tablet replica's id
+        // is refused: tablet groups address replicas by id, and the meta
+        // group addresses its members by projection — a collision would
+        // attach two raft nodes under one id on a node hosting both.
+        let mut colliding = descriptor(7, &[]);
+        let mut bytes = [0xAB; 16];
+        bytes[..8].copy_from_slice(&4242_u64.to_le_bytes());
+        colliding.node_id = NodeId::from_bytes(bytes);
+        let error = apply(
+            &mut state,
+            &registry,
+            4,
+            MetaCommand::RegisterNode {
+                descriptor: colliding.clone(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, MetaRejectionReason::Conflict { .. }));
+        assert_eq!(state.rejections().len(), 1);
+        // A non-colliding registration still succeeds, and an identical
+        // re-registration stays a no-op.
+        apply(
+            &mut state,
+            &registry,
+            5,
+            MetaCommand::RegisterNode {
+                descriptor: descriptor(8, &[]),
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn set_tablet_descriptor_rejects_structurally_invalid_descriptors() {
+        let registry = registry_with("ann-v2", 7);
+        let mut state = MetaState::default();
+        apply(
+            &mut state,
+            &registry,
+            1,
+            MetaCommand::CreateDatabase {
+                descriptor: database(1, "app"),
+            },
+        )
+        .unwrap();
+        apply(
+            &mut state,
+            &registry,
+            2,
+            MetaCommand::SetTableSchema {
+                record: schema_record(1, 1, 1),
+            },
+        )
+        .unwrap();
+        // Duplicate raft ids within one group are refused at apply.
+        let mut tablet = tablet(1, 1, 1);
+        tablet.replicas = vec![voter_on(1, 7), voter_on(2, 7)];
+        let error = apply(
+            &mut state,
+            &registry,
+            3,
+            MetaCommand::SetTabletDescriptor { descriptor: tablet },
+        )
+        .unwrap_err();
+        assert!(matches!(error, MetaRejectionReason::Invalid { .. }));
+        assert_eq!(state.rejections().len(), 1);
     }
 
     // -- feature activation gating at apply ----------------------------------
@@ -4491,7 +5989,7 @@ mod stage3a_tests {
         // replaying the log.
         let mut reopened = MetaApplySink::open(tmp.path(), registry).unwrap();
         assert_eq!(reopened.state(), &before);
-        assert_eq!(reopened.metadata_version(), MetadataVersion(15));
+        assert_eq!(reopened.metadata_version(), MetadataVersion(16));
         assert_eq!(reopened.applied_position(), position);
 
         // Crash-window replay: redelivering an entry at or below the
@@ -4506,14 +6004,14 @@ mod stage3a_tests {
         assert_eq!(reopened.state(), &before);
         // A new entry above the watermark applies and checkpoints.
         let next = meta_envelope(
-            16,
+            17,
             MetaCommand::SetClusterSetting {
                 key: "jobs.max_concurrent".to_owned(),
                 value: serde_json::json!(8),
             },
         );
-        ApplySink::apply(&mut reopened, &applied(16, next)).unwrap();
-        assert_eq!(reopened.metadata_version(), MetadataVersion(16));
+        ApplySink::apply(&mut reopened, &applied(17, next)).unwrap();
+        assert_eq!(reopened.metadata_version(), MetadataVersion(17));
         assert_eq!(reopened.state().settings().max_concurrent_jobs, 8);
 
         // A present-but-corrupt checkpoint fails closed.
@@ -4581,8 +6079,8 @@ mod stage3a_tests {
             assert!(receipt.metadata_version > last_version);
             last_version = receipt.metadata_version;
         }
-        assert_eq!(last_version, MetadataVersion(15));
-        assert_eq!(meta.metadata_version(), MetadataVersion(15));
+        assert_eq!(last_version, MetadataVersion(16));
+        assert_eq!(meta.metadata_version(), MetadataVersion(16));
         let state = meta.state();
         assert_eq!(state.feature_level(), ClusterFeatureLevel(7));
         assert_eq!(state.settings().max_concurrent_jobs, 4);
