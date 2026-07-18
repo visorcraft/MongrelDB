@@ -107,16 +107,20 @@ durable root ([ADR-0001](architecture/adr/0001-storage-ownership-and-modes.md)):
   Recovery, WAL opening, open-generation advancement, and table mounting run
   exactly once, on the first attach; concurrent attaches wait on that one
   initialization instead of racing a second open.
-- **Handles are cheap.** Cloning or dropping a handle has no storage side
-  effects; storage closes when the last core reference drops. The full
-  `Database` API is available through `Deref`: a handle behaves like a
-  `Database` facade over the shared core, and two handles over the same root
-  return the same `Arc<DatabaseCore>` from `handle.core()`.
+- **Handles are cheap and capability-bounded.** Dropping a handle has no
+  storage side effects; storage closes when the last core reference drops.
+  Handles do not `Deref` to `Database` and never expose raw table handles.
+  `shares_core_with` verifies shared ownership without exposing the core.
 - **Per-handle identity.** Every handle carries a `HandleIdentity`
   (`handle.identity()`) and a `HandleAccess` (`handle.access()`); the core
-  never stores one mutable "current principal". `OpenIdentity` today is
-  `Credentialless` (rejected, fail closed, when the database catalog has
-  `require_auth` enabled) or `ServicePrincipal { principal_id }`.
+  never stores one mutable "current principal". `OpenIdentity` supports
+  credentialless, catalog credentials, and scoped service principals.
+  Catalog roles and permissions resolve live on every sensitive operation;
+  dropped users and revoked roles affect existing handles immediately.
+- **Read-only is enforced.** `open_shared_with_access` binds
+  `HandleAccess::read_only()` to the handle. Every DML, DDL, catalog mutation,
+  shutdown, and other write exposed by the handle returns `ReadOnlyHandle`.
+  Queries continue through the principal-aware RLS and masking path.
 - **Exclusivity holds both ways.** A shared core takes the same lease an
   exclusive `Database::open` takes: `Database::open` on the same root fails
   with `DatabaseLocked` while shared handles exist, and `open_shared` fails
@@ -130,12 +134,6 @@ durable root ([ADR-0001](architecture/adr/0001-storage-ownership-and-modes.md)):
   rejects further operations, and a later attach re-initializes a fresh core.
   `Database::shutdown()` on a shared facade is rejected with
   `MongrelError::Conflict`; use the handle's `shutdown`.
-
-Not enforced yet (per-request enforcement arrives with Stage 1D sessions):
-credentialed `HandleIdentity::CatalogUser` attaches, and the
-`HandleAccess::read_only()` restriction — Stage 1A issues read-write handles
-and never consults the handle identity for shared-table authorization. Shared
-cores also reject auth-mode transitions such as `enable_auth`.
 
 The exclusive model is unchanged alongside this: `Database::open` still owns
 its root alone, sharing one `Arc<Database>` across workers remains valid, and

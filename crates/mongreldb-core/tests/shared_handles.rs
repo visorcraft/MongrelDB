@@ -5,11 +5,12 @@
 //! last-drop closes), S1A-003 (stable file identity), and S1A-004
 //! (lifecycle: drain-on-shutdown, operation guards).
 
+use mongreldb_core::auth::Permission;
 use mongreldb_core::schema::{ColumnDef, ColumnFlags, Schema, TypeId};
 use mongreldb_core::{
-    Database, DatabaseManager, HandleIdentity, LifecycleState, MongrelError, OpenIdentity, Value,
+    Database, DatabaseManager, HandleAccess, HandleIdentity, LifecycleState, MongrelError,
+    OpenIdentity, PolicyCommand, RowPolicy, SecretString, SecurityCatalog, SecurityExpr, Value,
 };
-use std::sync::Arc;
 use std::time::Duration;
 use tempfile::tempdir;
 
@@ -35,6 +36,62 @@ fn fresh_root() -> tempfile::TempDir {
     dir
 }
 
+fn fresh_auth_root() -> tempfile::TempDir {
+    let dir = tempdir().unwrap();
+    let database =
+        Database::create_with_credentials(dir.path(), "admin", "admin-password").unwrap();
+    database.create_table("items", id_schema()).unwrap();
+    database.create_role("reader").unwrap();
+    database
+        .grant_permission(
+            "reader",
+            Permission::Select {
+                table: "items".into(),
+            },
+        )
+        .unwrap();
+    database.create_role("writer").unwrap();
+    database
+        .grant_permission(
+            "writer",
+            Permission::Insert {
+                table: "items".into(),
+            },
+        )
+        .unwrap();
+    for username in ["alice", "bob"] {
+        database.create_user(username, "user-password").unwrap();
+        database.grant_role(username, "reader").unwrap();
+        database.grant_role(username, "writer").unwrap();
+    }
+    drop(database);
+    dir
+}
+
+fn owner_schema() -> Schema {
+    Schema {
+        columns: vec![
+            ColumnDef {
+                id: 1,
+                name: "id".into(),
+                ty: TypeId::Int64,
+                flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
+                embedding_source: None,
+            },
+            ColumnDef {
+                id: 2,
+                name: "owner".into(),
+                ty: TypeId::Bytes,
+                flags: ColumnFlags::empty(),
+                default_value: None,
+                embedding_source: None,
+            },
+        ],
+        ..Schema::default()
+    }
+}
+
 #[test]
 fn open_shared_handles_reference_the_same_core() {
     let dir = fresh_root();
@@ -45,7 +102,7 @@ fn open_shared_handles_reference_the_same_core() {
         .open_shared(dir.path(), OpenIdentity::Credentialless)
         .unwrap();
     assert!(
-        Arc::ptr_eq(&alice.core(), &worker.core()),
+        alice.shares_core_with(&worker),
         "both handles must reference the exact same process-local DatabaseCore"
     );
     assert_eq!(alice.lifecycle_state(), LifecycleState::Open);
@@ -62,16 +119,9 @@ fn writes_through_one_handle_are_visible_to_the_other() {
         .unwrap();
 
     writer.create_table("items", id_schema()).unwrap();
-    writer
-        .transaction(|transaction| {
-            transaction.put("items", vec![(1, Value::Int64(1))])?;
-            transaction.put("items", vec![(1, Value::Int64(2))])?;
-            Ok(())
-        })
-        .unwrap();
-
-    let table = reader.table("items").unwrap();
-    assert_eq!(table.lock().count(), 2);
+    writer.put("items", vec![(1, Value::Int64(1))]).unwrap();
+    writer.put("items", vec![(1, Value::Int64(2))]).unwrap();
+    assert_eq!(reader.count("items").unwrap(), 2);
 }
 
 #[test]
@@ -96,7 +146,7 @@ fn per_handle_identity_is_retained() {
         }
     );
     assert!(
-        Arc::ptr_eq(&anonymous.core(), &service.core()),
+        anonymous.shares_core_with(&service),
         "distinct identities still share one core"
     );
 }
@@ -114,13 +164,8 @@ fn dropping_one_handle_keeps_storage_open_for_the_rest() {
     drop(first);
 
     // Storage is unaffected by the drop: the surviving handle still writes.
-    second
-        .transaction(|transaction| {
-            transaction.put("items", vec![(1, Value::Int64(9))])?;
-            Ok(())
-        })
-        .unwrap();
-    assert_eq!(second.table("items").unwrap().lock().count(), 1);
+    second.put("items", vec![(1, Value::Int64(9))]).unwrap();
+    assert_eq!(second.count("items").unwrap(), 1);
     assert_eq!(second.lifecycle_state(), LifecycleState::Open);
 
     // Last drop closes storage: an exclusive open succeeds afterwards.
@@ -176,22 +221,16 @@ fn concurrent_open_shared_initializes_exactly_once() {
         .into_iter()
         .map(|thread| thread.join().unwrap())
         .collect();
-    let first_core = handles[0].core();
     for handle in &handles[1..] {
         assert!(
-            Arc::ptr_eq(&first_core, &handle.core()),
+            handles[0].shares_core_with(handle),
             "every racer must land on the one initialized core"
         );
     }
     // The shared core works for every racer.
     handles[0].create_table("items", id_schema()).unwrap();
-    handles[3]
-        .transaction(|transaction| {
-            transaction.put("items", vec![(1, Value::Int64(4))])?;
-            Ok(())
-        })
-        .unwrap();
-    assert_eq!(handles[7].table("items").unwrap().lock().count(), 1);
+    handles[3].put("items", vec![(1, Value::Int64(4))]).unwrap();
+    assert_eq!(handles[7].count("items").unwrap(), 1);
 }
 
 #[test]
@@ -204,12 +243,7 @@ fn shutdown_drains_operations_and_closes_the_core() {
         .open_shared(dir.path(), OpenIdentity::Credentialless)
         .unwrap();
     operator.create_table("items", id_schema()).unwrap();
-    operator
-        .transaction(|transaction| {
-            transaction.put("items", vec![(1, Value::Int64(1))])?;
-            Ok(())
-        })
-        .unwrap();
+    operator.put("items", vec![(1, Value::Int64(1))]).unwrap();
 
     // An in-flight operation holds the drain open.
     let guard = operator.operation_guard().unwrap();
@@ -233,8 +267,8 @@ fn shutdown_drains_operations_and_closes_the_core() {
         .open_shared(dir.path(), OpenIdentity::Credentialless)
         .unwrap();
     assert_eq!(reopened.lifecycle_state(), LifecycleState::Open);
-    assert_eq!(reopened.table("items").unwrap().lock().count(), 1);
-    assert!(!Arc::ptr_eq(&operator.core(), &reopened.core()));
+    assert_eq!(reopened.count("items").unwrap(), 1);
+    assert!(!operator.shares_core_with(&reopened));
 }
 
 #[test]
@@ -247,15 +281,193 @@ fn exclusive_database_reports_identity_and_open_lifecycle() {
 }
 
 #[test]
-fn shared_facades_reject_auth_mode_transitions() {
+fn read_only_handle_rejects_writes_and_allows_reads() {
     let dir = fresh_root();
-    let handle = DatabaseManager::global()
+    let writer = DatabaseManager::global()
         .open_shared(dir.path(), OpenIdentity::Credentialless)
         .unwrap();
-    // Fail closed: one shared handle must not flip the core's enforcement
-    // mode out from under the other handles.
+    writer.create_table("items", id_schema()).unwrap();
+    writer.put("items", vec![(1, Value::Int64(1))]).unwrap();
+    let reader = DatabaseManager::global()
+        .open_shared_with_access(
+            dir.path(),
+            OpenIdentity::Credentialless,
+            HandleAccess::read_only(),
+        )
+        .unwrap();
+    assert_eq!(reader.count("items").unwrap(), 1);
     assert!(matches!(
-        handle.enable_auth("admin", "password"),
-        Err(MongrelError::Conflict(_))
+        reader.put("items", vec![(1, Value::Int64(2))]),
+        Err(MongrelError::ReadOnlyHandle { .. })
     ));
+    assert!(matches!(
+        reader.create_table("forbidden", id_schema()),
+        Err(MongrelError::ReadOnlyHandle { .. })
+    ));
+}
+
+#[test]
+fn catalog_credentials_attach_and_revocation_is_live() {
+    let dir = fresh_auth_root();
+    let manager = DatabaseManager::global();
+    assert!(matches!(
+        manager.open_shared(
+            dir.path(),
+            OpenIdentity::CatalogCredentials {
+                username: "alice".into(),
+                password: SecretString::new("wrong"),
+            },
+        ),
+        Err(MongrelError::InvalidCredentials { .. })
+    ));
+    let admin = manager
+        .open_shared(
+            dir.path(),
+            OpenIdentity::CatalogCredentials {
+                username: "admin".into(),
+                password: SecretString::new("admin-password"),
+            },
+        )
+        .unwrap();
+    let alice = manager
+        .open_shared(
+            dir.path(),
+            OpenIdentity::CatalogCredentials {
+                username: "alice".into(),
+                password: SecretString::new("user-password"),
+            },
+        )
+        .unwrap();
+    alice.put("items", vec![(1, Value::Int64(1))]).unwrap();
+    admin.revoke_role("alice", "writer").unwrap();
+    assert!(matches!(
+        alice.put("items", vec![(1, Value::Int64(2))]),
+        Err(MongrelError::PermissionDenied { .. })
+    ));
+
+    admin.drop_user("bob").unwrap();
+    assert_eq!(alice.count("items").unwrap(), 1);
+}
+
+#[test]
+fn service_principal_scopes_are_enforced() {
+    let dir = fresh_auth_root();
+    let service = DatabaseManager::global()
+        .open_shared(
+            dir.path(),
+            OpenIdentity::ScopedServicePrincipal {
+                principal_id: [9; 16],
+                permissions: vec![
+                    Permission::Select {
+                        table: "items".into(),
+                    },
+                    Permission::Insert {
+                        table: "items".into(),
+                    },
+                ],
+            },
+        )
+        .unwrap();
+    service.put("items", vec![(1, Value::Int64(7))]).unwrap();
+    assert_eq!(service.count("items").unwrap(), 1);
+    assert!(matches!(
+        service.create_table("forbidden", id_schema()),
+        Err(MongrelError::PermissionDenied { .. })
+    ));
+}
+
+#[test]
+fn catalog_users_get_distinct_rls_results_from_one_core() {
+    let dir = tempdir().unwrap();
+    let database =
+        Database::create_with_credentials(dir.path(), "admin", "admin-password").unwrap();
+    database.create_table("docs", owner_schema()).unwrap();
+    database
+        .transaction(|transaction| {
+            transaction.put(
+                "docs",
+                vec![(1, Value::Int64(1)), (2, Value::Bytes(b"alice".to_vec()))],
+            )?;
+            transaction.put(
+                "docs",
+                vec![(1, Value::Int64(2)), (2, Value::Bytes(b"bob".to_vec()))],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    database.create_role("reader").unwrap();
+    database
+        .grant_permission(
+            "reader",
+            Permission::Select {
+                table: "docs".into(),
+            },
+        )
+        .unwrap();
+    for username in ["alice", "bob"] {
+        database.create_user(username, "user-password").unwrap();
+        database.grant_role(username, "reader").unwrap();
+    }
+    database
+        .set_security_catalog(SecurityCatalog {
+            rls_tables: vec!["docs".into()],
+            policies: vec![RowPolicy {
+                name: "owner_only".into(),
+                table: "docs".into(),
+                command: PolicyCommand::All,
+                subjects: vec!["public".into()],
+                permissive: true,
+                using: Some(SecurityExpr::ColumnEqCurrentUser { column: 2 }),
+                with_check: Some(SecurityExpr::ColumnEqCurrentUser { column: 2 }),
+            }],
+            masks: Vec::new(),
+        })
+        .unwrap();
+    assert_eq!(
+        database
+            .count_for("docs", database.principal().as_ref())
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        database
+            .rows_for("docs", database.resolve_principal("alice").as_ref())
+            .unwrap()
+            .len(),
+        1
+    );
+    drop(database);
+
+    let admin = DatabaseManager::global()
+        .open_shared(
+            dir.path(),
+            OpenIdentity::CatalogCredentials {
+                username: "admin".into(),
+                password: SecretString::new("admin-password"),
+            },
+        )
+        .unwrap();
+    let attach = |username: &str| {
+        DatabaseManager::global()
+            .open_shared(
+                dir.path(),
+                OpenIdentity::CatalogCredentials {
+                    username: username.into(),
+                    password: SecretString::new("user-password"),
+                },
+            )
+            .unwrap()
+    };
+    let alice = attach("alice");
+    let bob = attach("bob");
+    assert!(alice.shares_core_with(&bob));
+    assert_eq!(admin.count("docs").unwrap(), 2);
+    assert_eq!(alice.count("docs").unwrap(), 1);
+    assert_eq!(bob.count("docs").unwrap(), 1);
+    let alice_rows = alice.rows("docs").unwrap();
+    let bob_rows = bob.rows("docs").unwrap();
+    assert_eq!(alice_rows.len(), 1);
+    assert_eq!(bob_rows.len(), 1);
+    assert_eq!(alice_rows[0].columns.get(&1), Some(&Value::Int64(1)));
+    assert_eq!(bob_rows[0].columns.get(&1), Some(&Value::Int64(2)));
 }

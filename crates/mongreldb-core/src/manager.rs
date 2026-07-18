@@ -143,6 +143,16 @@ impl DatabaseManager {
         root: impl AsRef<std::path::Path>,
         identity: OpenIdentity,
     ) -> Result<DatabaseHandle> {
+        self.open_shared_with_access(root, identity, HandleAccess::read_write())
+    }
+
+    /// Attach with an explicit per-handle read-only or read-write restriction.
+    pub fn open_shared_with_access(
+        self: &'static DatabaseManager,
+        root: impl AsRef<std::path::Path>,
+        identity: OpenIdentity,
+        access: HandleAccess,
+    ) -> Result<DatabaseHandle> {
         let identity_key = DatabaseFileIdentity::for_path(root.as_ref())?;
         let core = loop {
             let mut entries = self.entries.lock();
@@ -196,11 +206,57 @@ impl DatabaseManager {
                 }
             }
         };
-        let facade = Database::from_core(core, None, true);
+        let unbound = Database::from_core(Arc::clone(&core), None, true);
+        let (handle_identity, principal, service_permissions) = match identity {
+            OpenIdentity::Credentialless => {
+                if unbound.require_auth_enabled() {
+                    return Err(crate::error::MongrelError::AuthRequired);
+                }
+                (crate::handle::HandleIdentity::Credentialless, None, None)
+            }
+            OpenIdentity::ServicePrincipal { principal_id } => {
+                let permissions = Vec::new();
+                let principal = service_principal(principal_id, permissions.clone());
+                (
+                    crate::handle::HandleIdentity::ServicePrincipal { principal_id },
+                    Some(principal),
+                    Some(permissions),
+                )
+            }
+            OpenIdentity::ScopedServicePrincipal {
+                principal_id,
+                permissions,
+            } => {
+                let principal = service_principal(principal_id, permissions.clone());
+                (
+                    crate::handle::HandleIdentity::ServicePrincipal { principal_id },
+                    Some(principal),
+                    Some(permissions),
+                )
+            }
+            OpenIdentity::CatalogCredentials { username, password } => {
+                if !unbound.require_auth_enabled() {
+                    return Err(crate::error::MongrelError::AuthNotRequired);
+                }
+                let principal = unbound
+                    .authenticate_principal(&username, password.expose())?
+                    .ok_or_else(|| crate::error::MongrelError::InvalidCredentials {
+                        username: username.clone(),
+                    })?;
+                let identity = crate::handle::HandleIdentity::CatalogUser {
+                    username: principal.username.clone(),
+                    user_id: principal.user_id,
+                    created_version: principal.created_epoch,
+                };
+                (identity, Some(principal), None)
+            }
+        };
+        let facade = Database::from_core(core, principal, true);
         Ok(DatabaseHandle::new(
             facade,
-            identity.handle_identity(),
-            HandleAccess::default(),
+            handle_identity,
+            access,
+            service_permissions,
         ))
     }
 
@@ -232,6 +288,20 @@ impl DatabaseManager {
         if owned {
             entries.remove(identity);
         }
+    }
+}
+
+fn service_principal(
+    principal_id: [u8; 16],
+    permissions: Vec<crate::auth::Permission>,
+) -> crate::auth::Principal {
+    crate::auth::Principal {
+        user_id: 0,
+        created_epoch: 0,
+        username: format!("service:{principal_id:02x?}"),
+        is_admin: false,
+        roles: Vec::new(),
+        permissions,
     }
 }
 

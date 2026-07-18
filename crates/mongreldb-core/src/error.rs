@@ -70,6 +70,8 @@ pub enum MongrelError {
     TriggerValidation(String),
     #[error("read-only replica: writes must be applied by ReplicationFollower")]
     ReadOnlyReplica,
+    #[error("read-only database handle cannot perform {operation}")]
+    ReadOnlyHandle { operation: &'static str },
     #[error("authentication required: this database has require_auth enabled; reopen with open_with_credentials / open_encrypted_with_credentials")]
     AuthRequired,
     #[error("authentication not required: this database does not have require_auth enabled; use the plain open/create constructors")]
@@ -129,7 +131,9 @@ impl MongrelError {
             // The operating system refuses to hand the parent's handles to
             // the forked child: an ownership denial, closest to an
             // authorization failure (no credential can fix it).
-            MongrelError::ForkedProcess { .. } => ErrorCategory::PermissionDenied,
+            MongrelError::ForkedProcess { .. } | MongrelError::ReadOnlyHandle { .. } => {
+                ErrorCategory::PermissionDenied
+            }
             // A codec failure means the payload does not match the durable /
             // log format this binary reads and writes — a format-version
             // disagreement (§11.8 advertises log/snapshot format min/max).

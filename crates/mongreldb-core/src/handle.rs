@@ -8,18 +8,35 @@
 //! storage; the core closes when the last reference drops or when
 //! [`DatabaseHandle::shutdown`] drains it (S1A-004).
 //!
-//! The full storage API is available through `Deref<Target = Database>`: a
-//! handle behaves exactly like a `Database` facade over the shared core, with
-//! per-handle identity layered on top. The core itself never stores one
-//! mutable "current principal" (spec §4.6) — identity lives here, on the
-//! handle.
+//! Handles expose only principal-aware operations. They never dereference to
+//! the raw [`Database`] facade or return mutable table handles.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::core::{LifecycleState, OperationGuard};
-use crate::database::{Database, DatabaseCore};
-use crate::error::Result;
+use crate::database::Database;
+use crate::error::{MongrelError, Result};
+
+/// A password that zeroizes its allocation and never reveals itself through
+/// `Debug` output.
+pub struct SecretString(zeroize::Zeroizing<String>);
+
+impl SecretString {
+    pub fn new(secret: impl Into<String>) -> Self {
+        Self(zeroize::Zeroizing::new(secret.into()))
+    }
+
+    pub(crate) fn expose(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretString([REDACTED])")
+    }
+}
 
 /// The per-caller identity bound to one handle (spec §10.1, S1A-001).
 ///
@@ -45,34 +62,30 @@ pub enum HandleIdentity {
 
 /// The identity requested when attaching a shared handle (spec §2.2).
 ///
-/// Stage 1A supports credentialless and service-principal attaches. Catalog
-/// users authenticate through an attached handle (Stage 1D session work adds
-/// credentialed attaches).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Catalog credentials are verified against the live shared catalog before a
+/// handle is issued. The password allocation is zeroized when attach returns.
+#[derive(Debug)]
 pub enum OpenIdentity {
     /// Attach without credentials. Rejected (fail closed) when the database
     /// catalog has `require_auth` enabled.
     Credentialless,
     /// Attach as a non-catalog service principal.
     ServicePrincipal { principal_id: [u8; 16] },
-}
-
-impl OpenIdentity {
-    pub(crate) fn handle_identity(&self) -> HandleIdentity {
-        match self {
-            OpenIdentity::Credentialless => HandleIdentity::Credentialless,
-            OpenIdentity::ServicePrincipal { principal_id } => HandleIdentity::ServicePrincipal {
-                principal_id: *principal_id,
-            },
-        }
-    }
+    /// Attach as a service principal restricted to these exact permissions.
+    ScopedServicePrincipal {
+        principal_id: [u8; 16],
+        permissions: Vec<crate::auth::Permission>,
+    },
+    /// Authenticate one catalog user on the existing shared core.
+    CatalogCredentials {
+        username: String,
+        password: SecretString,
+    },
 }
 
 /// Per-handle access restriction (spec §2.2: "each handle may have its own
 /// principal and read-only restriction").
 ///
-/// Stage 1A issues read-write handles; the read-only restriction is enforced
-/// once per-handle admission lands with Stage 1D sessions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HandleAccess {
     read_only: bool,
@@ -102,19 +115,25 @@ impl HandleAccess {
 /// dropping a handle has no storage side effects; storage closes when the
 /// last core reference drops or [`Self::shutdown`] runs.
 pub struct DatabaseHandle {
-    /// The facade carrying this handle's auth context (principal-less for
-    /// Stage 1A attaches) over the shared core. `Deref` exposes its full API.
+    /// The facade carrying this handle's live authorization context.
     database: Database,
     identity: HandleIdentity,
     access: HandleAccess,
+    service_permissions: Option<Vec<crate::auth::Permission>>,
 }
 
 impl DatabaseHandle {
-    pub(crate) fn new(database: Database, identity: HandleIdentity, access: HandleAccess) -> Self {
+    pub(crate) fn new(
+        database: Database,
+        identity: HandleIdentity,
+        access: HandleAccess,
+        service_permissions: Option<Vec<crate::auth::Permission>>,
+    ) -> Self {
         Self {
             database,
             identity,
             access,
+            service_permissions,
         }
     }
 
@@ -128,10 +147,9 @@ impl DatabaseHandle {
         self.access
     }
 
-    /// The shared storage core behind this handle. Two handles over the same
-    /// root return `Arc`s to the *same* core.
-    pub fn core(&self) -> Arc<DatabaseCore> {
-        self.database.core()
+    /// Whether two handles reference the exact same process-local core.
+    pub fn shares_core_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.database.core(), &other.database.core())
     }
 
     /// The current lifecycle state of the shared core (S1A-004).
@@ -146,21 +164,141 @@ impl DatabaseHandle {
         self.database.operation_guard()
     }
 
+    fn authorize_write(&self, operation: &'static str) -> Result<()> {
+        if self.access.is_read_only() {
+            Err(MongrelError::ReadOnlyHandle { operation })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn authorize_permission(&self, permission: &crate::auth::Permission) -> Result<()> {
+        if let Some(permissions) = &self.service_permissions {
+            if !permissions
+                .iter()
+                .any(|granted| granted.satisfies(permission))
+            {
+                return Err(MongrelError::PermissionDenied {
+                    required: permission.clone(),
+                    principal: match &self.identity {
+                        HandleIdentity::ServicePrincipal { principal_id } => {
+                            format!("service:{principal_id:02x?}")
+                        }
+                        _ => "service".into(),
+                    },
+                });
+            }
+        }
+        self.database.require(permission)
+    }
+
+    /// Execute an authorized native query with live roles, RLS, masks, and
+    /// column grants.
+    pub fn query(
+        &self,
+        table: &str,
+        query: &crate::query::Query,
+        projection: Option<&[u16]>,
+    ) -> Result<Vec<crate::memtable::Row>> {
+        self.database
+            .query_for_current_principal(table, query, projection)
+    }
+
+    /// Count rows visible to this handle after live authorization and RLS.
+    pub fn count(&self, table: &str) -> Result<u64> {
+        self.database
+            .count_for(table, self.database.principal().as_ref())
+    }
+
+    /// Return all rows visible to this handle after RLS and masks.
+    pub fn rows(&self, table: &str) -> Result<Vec<crate::memtable::Row>> {
+        self.database
+            .rows_for(table, self.database.principal().as_ref())
+    }
+
+    /// Create a table through this handle's live principal.
+    pub fn create_table(&self, name: &str, schema: crate::schema::Schema) -> Result<u64> {
+        self.authorize_write("create table")?;
+        self.authorize_permission(&crate::auth::Permission::Ddl)?;
+        self.database.create_table(name, schema)
+    }
+
+    /// Atomically insert one row through this handle's live principal.
+    pub fn put(
+        &self,
+        table: &str,
+        cells: Vec<(u16, crate::memtable::Value)>,
+    ) -> Result<Option<i64>> {
+        self.authorize_write("put")?;
+        self.database
+            .transaction_for_current_principal(|transaction| transaction.put(table, cells))
+    }
+
+    /// Atomically delete one row through this handle's live principal.
+    pub fn delete(&self, table: &str, row_id: crate::RowId) -> Result<()> {
+        self.authorize_write("delete")?;
+        self.database
+            .transaction_for_current_principal(|transaction| transaction.delete(table, row_id))
+    }
+
+    /// Create a catalog user. Admin only.
+    pub fn create_user(&self, username: &str, password: &str) -> Result<crate::auth::UserEntry> {
+        self.authorize_write("create user")?;
+        self.authorize_permission(&crate::auth::Permission::Admin)?;
+        self.database.create_user(username, password)
+    }
+
+    /// Drop a catalog user. Admin only.
+    pub fn drop_user(&self, username: &str) -> Result<()> {
+        self.authorize_write("drop user")?;
+        self.authorize_permission(&crate::auth::Permission::Admin)?;
+        self.database.drop_user(username)
+    }
+
+    /// Create a role. Admin only.
+    pub fn create_role(&self, role: &str) -> Result<crate::auth::RoleEntry> {
+        self.authorize_write("create role")?;
+        self.authorize_permission(&crate::auth::Permission::Admin)?;
+        self.database.create_role(role)
+    }
+
+    /// Grant a role to a catalog user. Admin only.
+    pub fn grant_role(&self, username: &str, role: &str) -> Result<()> {
+        self.authorize_write("grant role")?;
+        self.authorize_permission(&crate::auth::Permission::Admin)?;
+        self.database.grant_role(username, role)
+    }
+
+    /// Revoke a role from a catalog user. Admin only.
+    pub fn revoke_role(&self, username: &str, role: &str) -> Result<()> {
+        self.authorize_write("revoke role")?;
+        self.authorize_permission(&crate::auth::Permission::Admin)?;
+        self.database.revoke_role(username, role)
+    }
+
+    /// Grant one permission to a role. Admin only.
+    pub fn grant_permission(&self, role: &str, permission: crate::auth::Permission) -> Result<()> {
+        self.authorize_write("grant permission")?;
+        self.authorize_permission(&crate::auth::Permission::Admin)?;
+        self.database.grant_permission(role, permission)
+    }
+
+    /// Revoke one permission from a role. Admin only.
+    pub fn revoke_permission(&self, role: &str, permission: crate::auth::Permission) -> Result<()> {
+        self.authorize_write("revoke permission")?;
+        self.authorize_permission(&crate::auth::Permission::Admin)?;
+        self.database.revoke_permission(role, permission)
+    }
+
     /// Shut the shared core down (spec §10.1, S1A-004): drain in-flight
     /// operations within `drain_deadline`, sync durable state, release the
     /// file lock, and mark the core `Closed`. Every handle — including this
     /// one — then rejects further operations. Dropping a handle never closes
     /// storage; only this method or the last core drop does.
     pub fn shutdown(&self, drain_deadline: Duration) -> Result<()> {
+        self.authorize_write("shutdown")?;
+        self.authorize_permission(&crate::auth::Permission::Admin)?;
         self.database.core().shutdown(drain_deadline)
-    }
-}
-
-impl std::ops::Deref for DatabaseHandle {
-    type Target = Database;
-
-    fn deref(&self) -> &Database {
-        &self.database
     }
 }
 

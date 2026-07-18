@@ -86,6 +86,89 @@ impl ProcessOpenState {
     }
 }
 
+fn embedding_error(error: crate::embedding::EmbeddingError) -> MongrelError {
+    match error {
+        crate::embedding::EmbeddingError::LimitExceeded {
+            resource,
+            requested,
+            limit,
+        } => MongrelError::ResourceLimitExceeded {
+            resource,
+            requested,
+            limit,
+        },
+        crate::embedding::EmbeddingError::Execution(message) => {
+            if message.contains("deadline") {
+                MongrelError::DeadlineExceeded
+            } else {
+                MongrelError::Cancelled
+            }
+        }
+        error => MongrelError::Other(error.to_string()),
+    }
+}
+
+fn render_embedding_input(
+    schema: &Schema,
+    spec: &crate::embedding::GeneratedEmbeddingSpec,
+    cells: &[(u16, crate::memtable::Value)],
+) -> Result<String> {
+    let mut values = Vec::with_capacity(spec.source_columns.len());
+    for source_id in &spec.source_columns {
+        let column = schema
+            .columns
+            .iter()
+            .find(|column| column.id == *source_id)
+            .ok_or_else(|| MongrelError::Schema(format!("unknown embedding source {source_id}")))?;
+        let value = cells
+            .iter()
+            .find(|(id, _)| id == source_id)
+            .map(|(_, value)| embedding_input_value(value))
+            .transpose()?
+            .unwrap_or_default();
+        values.push((column.name.as_str(), value));
+    }
+    if spec.input_template.is_empty() {
+        return Ok(values
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect::<Vec<_>>()
+            .join("\n"));
+    }
+    let mut rendered = spec.input_template.clone();
+    for (name, value) in values {
+        rendered = rendered.replace(&format!("{{{name}}}"), &value);
+    }
+    if rendered.contains('{') || rendered.contains('}') {
+        return Err(MongrelError::Schema(
+            "embedding input template contains an unknown placeholder".into(),
+        ));
+    }
+    Ok(rendered)
+}
+
+fn embedding_input_value(value: &crate::memtable::Value) -> Result<String> {
+    use crate::memtable::Value;
+    match value {
+        Value::Null => Ok(String::new()),
+        Value::Bool(value) => Ok(value.to_string()),
+        Value::Int64(value) => Ok(value.to_string()),
+        Value::Float64(value) => Ok(value.to_string()),
+        Value::Bytes(value) | Value::Json(value) => String::from_utf8(value.clone())
+            .map_err(|_| MongrelError::InvalidArgument("embedding source is not UTF-8".into())),
+        Value::Decimal(value) => Ok(value.to_string()),
+        Value::Interval {
+            months,
+            days,
+            nanos,
+        } => Ok(format!("{months}:{days}:{nanos}")),
+        Value::Uuid(value) => Ok(value.iter().map(|byte| format!("{byte:02x}")).collect()),
+        Value::Embedding(_) => Err(MongrelError::InvalidArgument(
+            "embedding columns cannot be embedding text sources".into(),
+        )),
+    }
+}
+
 #[derive(Default)]
 struct ProcessOpenRegistry {
     next_lease_id: OpenLeaseId,
@@ -1470,6 +1553,9 @@ pub(crate) enum OpenModeGate {
     /// Normal embedded/server open: `ClusterReplica` markers are rejected with
     /// [`crate::storage_mode::StorageModeError::ClusterReplicaRequiresClusterRuntime`].
     Normal,
+    /// Process-local shared core. Authentication binds to each issued handle,
+    /// so core recovery and table mounting proceed without a caller principal.
+    SharedCore,
     /// Offline backup validator: any mode opens, forced read-only.
     OfflineValidation,
     /// Cluster node runtime: the marker must exist and equal this
@@ -2074,7 +2160,7 @@ impl Database {
             None,
             0,
             CoreResourceConfig::default(),
-            OpenModeGate::Normal,
+            OpenModeGate::SharedCore,
         )
     }
 
@@ -3074,7 +3160,9 @@ impl Database {
         };
         match (&mode_gate, &storage_mode) {
             (OpenModeGate::Create(_), _) => {}
-            (OpenModeGate::Normal, mode) => crate::storage_mode::check_open(mode.as_ref(), false)?,
+            (OpenModeGate::Normal | OpenModeGate::SharedCore, mode) => {
+                crate::storage_mode::check_open(mode.as_ref(), false)?
+            }
             (OpenModeGate::OfflineValidation, mode) => {
                 crate::storage_mode::check_open(mode.as_ref(), true)?
             }
@@ -3112,7 +3200,7 @@ impl Database {
             // A freshly created cluster replica rejects user writes from the
             // start: mutations arrive through the replicated apply path only.
             OpenModeGate::Create(mode) => mode.cluster_identity().is_some(),
-            OpenModeGate::Normal => false,
+            OpenModeGate::Normal | OpenModeGate::SharedCore => false,
         } || if existing {
             match durable_root.open_regular(Path::new(META_DIR).join("replica")) {
                 Ok(_) => true,
@@ -3233,7 +3321,7 @@ impl Database {
         } else {
             0
         };
-        let principal = if cat.require_auth {
+        let principal = if cat.require_auth && !matches!(&mode_gate, OpenModeGate::SharedCore) {
             let supplied = principal.as_ref().ok_or(MongrelError::AuthRequired)?;
             Some(
                 Self::resolve_bound_principal_from_catalog(&cat, supplied)
@@ -3413,9 +3501,17 @@ impl Database {
         // from the catalog; `enable_auth` / `refresh_principal` update it live.
         let auth_state = crate::auth_state::AuthState::new(cat.require_auth, principal.clone());
         let security_coordinator = security_coordinator(&root, cat.security_version);
-        let auth_checker: Option<Arc<dyn crate::auth_state::TableAuthChecker>> = Some(Arc::new(
-            crate::auth_state::DefaultTableAuthChecker::new(auth_state.clone()),
-        ));
+        let auth_checker: Option<Arc<dyn crate::auth_state::TableAuthChecker>> =
+            if matches!(&mode_gate, OpenModeGate::SharedCore) {
+                // Shared tables are reachable only through DatabaseHandle's
+                // principal-explicit boundary. A core-wide checker cannot
+                // represent multiple simultaneous principals.
+                None
+            } else {
+                Some(Arc::new(crate::auth_state::DefaultTableAuthChecker::new(
+                    auth_state.clone(),
+                )))
+            };
 
         // Open every live table against the shared context. Mounted tables have
         // no private WAL (B1) — `open_in` just loads the manifest/runs and
@@ -3606,6 +3702,113 @@ impl Database {
     /// is desired. Application-supplied vectors need no registration.
     pub fn embedding_providers(&self) -> &crate::embedding::EmbeddingProviderRegistry {
         &self.embedding_providers
+    }
+
+    /// Remove a provider only when no live schema references it.
+    pub fn unregister_embedding_provider(&self, provider_id: &str) -> Result<bool> {
+        let references = self
+            .catalog
+            .read()
+            .tables
+            .iter()
+            .flat_map(|table| &table.schema.columns)
+            .filter(|column| {
+                column
+                    .embedding_source
+                    .as_ref()
+                    .and_then(crate::embedding::EmbeddingSource::provider_id)
+                    == Some(provider_id)
+            })
+            .count();
+        self.embedding_providers
+            .unregister_unreferenced(provider_id, references)
+            .map_err(embedding_error)
+    }
+
+    fn materialize_generated_embeddings(
+        &self,
+        staging: &mut [(u64, crate::txn::Staged)],
+        control: Option<&crate::ExecutionControl>,
+    ) -> Result<()> {
+        let schemas = {
+            let catalog = self.catalog.read();
+            catalog
+                .tables
+                .iter()
+                .map(|table| (table.table_id, table.schema.clone()))
+                .collect::<HashMap<_, _>>()
+        };
+        let fallback_control = crate::ExecutionControl::new(None);
+        let control = control.unwrap_or(&fallback_control);
+        for (table_id, staged) in staging {
+            let (cells, mut update_changed_columns) = match staged {
+                crate::txn::Staged::Put(cells) => (cells, None),
+                crate::txn::Staged::Update {
+                    new_row,
+                    changed_columns,
+                    ..
+                } => (new_row, Some(changed_columns)),
+                crate::txn::Staged::Delete(_) | crate::txn::Staged::Truncate => continue,
+            };
+            let schema = schemas.get(table_id).ok_or_else(|| {
+                MongrelError::Schema(format!("table id {table_id} disappeared during embedding"))
+            })?;
+            for target in &schema.columns {
+                let Some(crate::embedding::EmbeddingSource::GeneratedColumn { spec }) =
+                    target.embedding_source.as_ref()
+                else {
+                    continue;
+                };
+                let text = render_embedding_input(schema, spec, cells)?;
+                let reservation_bytes = text
+                    .len()
+                    .saturating_add((spec.dimension as usize).saturating_mul(4));
+                let _reservation = self
+                    .memory_governor
+                    .try_reserve(
+                        reservation_bytes as u64,
+                        crate::memory::MemoryClass::AiCandidates,
+                    )
+                    .map_err(|error| MongrelError::ResourceLimitExceeded {
+                        resource: "embedding memory",
+                        requested: reservation_bytes,
+                        limit: match error {
+                            crate::memory::MemoryError::Exhausted { available, .. } => {
+                                available as usize
+                            }
+                            _ => 0,
+                        },
+                    })?;
+                let source =
+                    crate::embedding::EmbeddingSource::GeneratedColumn { spec: spec.clone() };
+                let vectors = self
+                    .embedding_providers
+                    .embed_controlled(
+                        &source,
+                        &[text.as_str()],
+                        spec.dimension,
+                        control,
+                        "generated-column-write",
+                        crate::embedding::EmbeddingLimits::default(),
+                    )
+                    .map_err(embedding_error)?;
+                cells.retain(|(column, _)| *column != target.id);
+                cells.push((
+                    target.id,
+                    crate::memtable::Value::Embedding(vectors.into_iter().next().ok_or_else(
+                        || MongrelError::Other("embedding provider returned no vector".into()),
+                    )?),
+                ));
+                if let Some(changed_columns) = update_changed_columns.as_deref_mut() {
+                    changed_columns.push(target.id);
+                }
+            }
+            if let Some(changed_columns) = update_changed_columns {
+                changed_columns.sort_unstable();
+                changed_columns.dedup();
+            }
+        }
+        Ok(())
     }
 
     /// Acquire exclusive row locks for `SELECT ... FOR UPDATE` (spec §10.2).
@@ -3877,7 +4080,11 @@ impl Database {
         let fresh = catalog::read_durable(&self.durable_root, self.meta_dek.as_ref())?
             .ok_or_else(|| MongrelError::NotFound("catalog vanished during write".into()))?;
         let principal = self.principal.read().clone();
-        let principal = if fresh.require_auth {
+        let principal = if fresh.require_auth
+            && principal
+                .as_ref()
+                .is_some_and(|principal| principal.user_id != 0)
+        {
             principal
                 .as_ref()
                 .and_then(|principal| Self::resolve_bound_principal_from_catalog(&fresh, principal))
@@ -4374,7 +4581,11 @@ impl Database {
         let checkpoint = catalog::write_atomic(&self.root, &catalog, self.meta_dek.as_ref());
         let version = catalog.security_version;
         let principal = self.principal.read().clone();
-        let principal = if catalog.require_auth {
+        let principal = if catalog.require_auth
+            && principal
+                .as_ref()
+                .is_some_and(|principal| principal.user_id != 0)
+        {
             principal.as_ref().and_then(|principal| {
                 Self::resolve_bound_principal_from_catalog(&catalog, principal)
             })
@@ -4662,7 +4873,7 @@ impl Database {
             return self.require(permission);
         };
         let resolved;
-        let principal = if self.auth_state.require_auth() || principal.user_id != 0 {
+        let principal = if principal.user_id != 0 {
             resolved = Self::resolve_bound_principal_from_catalog(&self.catalog.read(), principal)
                 .ok_or(MongrelError::AuthRequired)?;
             &resolved
@@ -4694,8 +4905,12 @@ impl Database {
             return Ok(());
         }
         let supplied = principal.ok_or(MongrelError::AuthRequired)?;
-        let current = Self::resolve_bound_principal_from_catalog(&catalog, supplied)
-            .ok_or(MongrelError::AuthRequired)?;
+        let current = if supplied.user_id == 0 {
+            supplied.clone()
+        } else {
+            Self::resolve_bound_principal_from_catalog(&catalog, supplied)
+                .ok_or(MongrelError::AuthRequired)?
+        };
         if current.has_permission(permission) {
             Ok(())
         } else {
@@ -4758,7 +4973,7 @@ impl Database {
         };
         let catalog = self.catalog.read();
         let resolved;
-        let principal = if catalog.require_auth || principal.user_id != 0 {
+        let principal = if principal.user_id != 0 {
             resolved = Self::resolve_bound_principal_from_catalog(&catalog, principal)
                 .ok_or(MongrelError::AuthRequired)?;
             &resolved
@@ -5077,7 +5292,7 @@ impl Database {
         let Some(principal) = principal else {
             return Ok(None);
         };
-        if catalog.require_auth || catalog_bound || principal.user_id != 0 {
+        if catalog_bound || principal.user_id != 0 {
             return Self::resolve_bound_principal_from_catalog(catalog, &principal)
                 .map(Some)
                 .ok_or(MongrelError::AuthRequired);
@@ -5539,10 +5754,15 @@ impl Database {
         projection: Option<&[u16]>,
     ) -> Result<Vec<crate::memtable::Row>> {
         let condition_columns = crate::query::condition_columns(&query.conditions);
+        let catalog_bound = self
+            .principal
+            .read()
+            .as_ref()
+            .is_some_and(|principal| principal.user_id != 0);
         self.with_authorized_read(
             table_name,
             None,
-            true,
+            catalog_bound,
             |table, snapshot, allowed, principal| {
                 let allowed_columns = self.select_column_ids_for(table_name, principal)?;
                 self.require_columns_for(
@@ -5585,7 +5805,19 @@ impl Database {
         projection: Option<&[u16]>,
         control: &crate::ExecutionControl,
     ) -> Result<Vec<crate::memtable::Row>> {
-        self.query_for_principal_controlled(table_name, query, projection, None, true, control)
+        let catalog_bound = self
+            .principal
+            .read()
+            .as_ref()
+            .is_some_and(|principal| principal.user_id != 0);
+        self.query_for_principal_controlled(
+            table_name,
+            query,
+            projection,
+            None,
+            catalog_bound,
+            control,
+        )
     }
 
     fn query_for_principal_controlled(
@@ -7717,6 +7949,9 @@ impl Database {
     /// `require_auth` flag and cached principal, so changes via `enable_auth`
     /// / `refresh_principal` propagate to already-mounted tables.
     fn table_auth_checker(&self) -> Option<Arc<dyn crate::auth_state::TableAuthChecker>> {
+        if self.shared {
+            return None;
+        }
         Some(Arc::new(crate::auth_state::DefaultTableAuthChecker::new(
             self.auth_state.clone(),
         )))
@@ -7740,6 +7975,12 @@ impl Database {
             Some(principal) => principal,
             None => return Ok(()),
         };
+        // Service principals are runtime identities, not catalog users. Their
+        // immutable scopes are stored on the handle and never re-resolved by
+        // username.
+        if previous.user_id == 0 {
+            return Ok(());
+        }
         let observed_version = self.security_coordinator.version.load(Ordering::Acquire);
         self.refresh_security_catalog_if_stale(observed_version)?;
         let cat = self.catalog.read();
@@ -9136,10 +9377,9 @@ impl Database {
 
     fn transaction_principal_snapshot(&self) -> (Option<crate::auth::Principal>, bool) {
         let principal = self.principal.read().clone();
-        let catalog_bound = principal.as_ref().is_some_and(|principal| {
-            let catalog = self.catalog.read();
-            catalog.require_auth || principal.user_id != 0
-        });
+        let catalog_bound = principal
+            .as_ref()
+            .is_some_and(|principal| principal.user_id != 0);
         (principal, catalog_bound)
     }
 
@@ -9147,10 +9387,9 @@ impl Database {
         &self,
         principal: Option<crate::auth::Principal>,
     ) -> crate::txn::Transaction<'_> {
-        let catalog_bound = principal.as_ref().is_some_and(|principal| {
-            let catalog = self.catalog.read();
-            catalog.require_auth || principal.user_id != 0
-        });
+        let catalog_bound = principal
+            .as_ref()
+            .is_some_and(|principal| principal.user_id != 0);
         let txn_id = self.alloc_txn_id();
         let read = Snapshot::at(self.epoch.visible());
         crate::txn::Transaction::new(self, txn_id, read, crate::txn::IsolationLevel::default())
@@ -9190,10 +9429,9 @@ impl Database {
         bridge: &'a dyn ExternalTriggerBridge,
         principal: Option<crate::auth::Principal>,
     ) -> crate::txn::Transaction<'a> {
-        let catalog_bound = principal.as_ref().is_some_and(|principal| {
-            let catalog = self.catalog.read();
-            catalog.require_auth || principal.user_id != 0
-        });
+        let catalog_bound = principal
+            .as_ref()
+            .is_some_and(|principal| principal.user_id != 0);
         let txn_id = self.alloc_txn_id();
         let read = Snapshot::at(self.epoch.visible());
         crate::txn::Transaction::new(self, txn_id, read, crate::txn::IsolationLevel::default())
@@ -11321,6 +11559,10 @@ impl Database {
             return Err(MongrelError::ReadOnlyReplica);
         }
         commit_prepare_checkpoint(control, 0)?;
+        // Generated vectors are materialized before any WAL append. Provider
+        // failure therefore aborts the whole source write, while replicas
+        // receive the committed vector and never invoke the provider.
+        self.materialize_generated_embeddings(&mut staging, control)?;
         let observed_security_version = self.security_coordinator.version.load(Ordering::Acquire);
         self.refresh_security_catalog_if_stale(observed_security_version)?;
         let trigger_binding = trigger_catalog_binding(&self.catalog.read());
@@ -11329,8 +11571,7 @@ impl Database {
         }
         {
             let catalog = self.catalog.read();
-            if catalog.require_auth
-                || principal_catalog_bound
+            if principal_catalog_bound
                 || security_principal
                     .as_ref()
                     .is_some_and(|principal| principal.user_id != 0)

@@ -107,8 +107,10 @@ pub use database::{
     TableReadGeneration, DEFAULT_MEMORY_BUDGET_BYTES, DEFAULT_TEMP_DISK_BUDGET_BYTES,
 };
 pub use embedding::{
-    EmbeddingError, EmbeddingModelMeta, EmbeddingProvider, EmbeddingProviderRegistry,
-    EmbeddingSource, FixedVectorProvider,
+    EmbeddingError, EmbeddingFailurePolicy, EmbeddingFuture, EmbeddingLimits, EmbeddingModelMeta,
+    EmbeddingNormalization, EmbeddingProvider, EmbeddingProviderRegistry, EmbeddingRequest,
+    EmbeddingResponse, EmbeddingSource, FixedVectorProvider, GeneratedEmbeddingSpec,
+    ProviderHealth, ProviderStatus,
 };
 pub use encryption::{Cipher, PlaintextCipher};
 pub use engine::{
@@ -122,7 +124,7 @@ pub use external_table::{
     ExternalTableDefinition, ExternalTableEntry, ModuleArg, ModuleCapabilities,
 };
 pub use gc::{CheckReport, DoctorReport, GcReport, GcVersionsReport};
-pub use handle::{DatabaseHandle, HandleAccess, HandleIdentity, OpenIdentity};
+pub use handle::{DatabaseHandle, HandleAccess, HandleIdentity, OpenIdentity, SecretString};
 pub use index::{
     AnnIndex, BitmapIndex, ColumnLearnedRange, FmIndex, HotIndex, IndexFamilyGeneration,
     IndexGeneration, LearnedIndex, SparseIndex,

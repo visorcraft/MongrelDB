@@ -471,13 +471,65 @@ impl Schema {
     /// Validate AI column/index representation and embedding values.
     pub fn validate_ai(&self) -> Result<()> {
         for column in &self.columns {
-            if let TypeId::Embedding { dim } = column.ty {
-                if dim == 0 || dim > Self::MAX_EMBEDDING_DIM {
+            let TypeId::Embedding { dim } = column.ty else {
+                if column.embedding_source.is_some() {
                     return Err(MongrelError::Schema(format!(
-                        "embedding column '{}' dimension must be between 1 and {}",
-                        column.name,
-                        Self::MAX_EMBEDDING_DIM
+                        "non-embedding column '{}' cannot define an embedding source",
+                        column.name
                     )));
+                }
+                continue;
+            };
+            if dim == 0 || dim > Self::MAX_EMBEDDING_DIM {
+                return Err(MongrelError::Schema(format!(
+                    "embedding column '{}' dimension must be between 1 and {}",
+                    column.name,
+                    Self::MAX_EMBEDDING_DIM
+                )));
+            }
+            match column.embedding_source.as_ref() {
+                None | Some(crate::embedding::EmbeddingSource::SuppliedByApplication) => {}
+                Some(crate::embedding::EmbeddingSource::LocalModel {
+                    provider_id,
+                    model_id,
+                    model_version,
+                }) => {
+                    if provider_id.is_empty() || model_id.is_empty() || model_version.is_empty() {
+                        return Err(MongrelError::Schema(format!(
+                            "embedding column '{}' requires provider, model, and version identities",
+                            column.name
+                        )));
+                    }
+                }
+                Some(crate::embedding::EmbeddingSource::GeneratedColumn { spec }) => {
+                    if spec.provider_id.is_empty()
+                        || spec.model_id.is_empty()
+                        || spec.model_version.is_empty()
+                        || spec.source_columns.is_empty()
+                    {
+                        return Err(MongrelError::Schema(format!(
+                            "generated embedding column '{}' has incomplete identity or sources",
+                            column.name
+                        )));
+                    }
+                    if spec.dimension != dim {
+                        return Err(MongrelError::Schema(format!(
+                            "generated embedding column '{}' dimension {} does not match column dimension {}",
+                            column.name, spec.dimension, dim
+                        )));
+                    }
+                    let mut sources = std::collections::HashSet::new();
+                    for source_id in &spec.source_columns {
+                        if *source_id == column.id
+                            || !sources.insert(*source_id)
+                            || !self.columns.iter().any(|source| source.id == *source_id)
+                        {
+                            return Err(MongrelError::Schema(format!(
+                                "generated embedding column '{}' has invalid source column {}",
+                                column.name, source_id
+                            )));
+                        }
+                    }
                 }
             }
         }
