@@ -48,7 +48,11 @@ background-generation state is implied.
 2. **MongrelDB-Kit may offer bundled local models.** Register them under a
    stable provider ID via `EmbeddingProviderRegistry::register_new`.
 3. **The server may register local or remote providers.** Process-local
-   registry only; nothing is implied about a specific cloud vendor.
+   registry only; nothing is implied about a specific cloud vendor. Async
+   runtime callers use `embed_async_controlled`; providers marked `Blocking`
+   run on a bounded Tokio blocking pool, while `Remote` providers implement
+   the async transport hook. Both paths honor execution cancellation and
+   deadlines.
 4. **Core storage remains independent of any embedding vendor.** There is no
    built-in OpenAI/Anthropic/etc. client in `mongreldb-core`.
 5. **ANN indexes operate only on committed vectors.** Provider/model metadata

@@ -142,10 +142,10 @@ pub use memory::{
 };
 pub use memtable::{Memtable, Row, Value};
 pub use migrate_mysql::{
-    dialect_matrix, map_mysql_type, plan_mysql_migration, run_migrate_pipeline, CdcOp,
-    DialectFeature, DialectSupport, MemoryMigrateIo, MigrateIo, MigrateRunReport, MigrateStage,
-    MigrateTablePlan, MysqlMigratePlan, MysqlWireRequest, SourceRow, TypeMapping,
-    DEFAULT_COPY_BATCH, DUAL_WRITE_WARNING,
+    dialect_matrix, map_mysql_type, plan_mysql_migration, run_migrate_pipeline,
+    run_migrate_pipeline_controlled, CdcOp, DialectFeature, DialectSupport, MemoryMigrateIo,
+    MigrateIo, MigrateRunReport, MigrateStage, MigrateTablePlan, MysqlMigratePlan,
+    MysqlWireRequest, SourceRow, TypeMapping, DEFAULT_COPY_BATCH, DUAL_WRITE_WARNING,
 };
 pub use mutable_run::MutableRun;
 pub use node_governor::{GovernorAction, NodeMemoryGovernor, NodePressureInputs};
@@ -160,9 +160,12 @@ pub use procedure::{
     ProcedureEntry, ProcedureMode, ProcedureParam, ProcedureStep, ProcedureValue, StoredProcedure,
 };
 pub use security_hardening::{
-    node_cert_matches_id, redact_secrets, validate_jwt_claims, JwtClaims, JwtError,
-    JwtValidationConfig, KeyRotationRecord, KmsWrappedKey, ScramVerifier, ServiceToken,
-    ServiceTokenRegistry,
+    node_cert_matches_id, redact_secrets, validate_jwt_claims, verify_jwt, IssuedServiceToken, Jwk,
+    JwksCache, JwksDocument, JwksFetch, JwksProvider, JwtAlgorithm, JwtClaims, JwtError,
+    JwtValidationConfig, KeyManagementError, KeyManagementHealth, KeyManagementProvider,
+    KeyRotationJournal, KeyRotationPhase, KeyRotationRecord, KmsWrappedKey,
+    ScramChannelBindingPolicy, ScramServerSession, ScramVerifier, SecurityHardeningError,
+    ServiceToken, ServiceTokenRegistry, UnsupportedKeyManagementProvider, VerifiedJwt,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]

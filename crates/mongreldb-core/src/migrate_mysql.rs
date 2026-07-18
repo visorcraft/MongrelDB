@@ -384,6 +384,15 @@ pub trait MigrateIo {
     fn checksum_rows(&self, table: &str) -> Result<(String, String), String>;
     /// Apply one CDC event (insert/update/delete as row map + op).
     fn apply_cdc(&mut self, table: &str, op: CdcOp, row: &SourceRow) -> Result<(), String>;
+    /// Poll the source for more binlog events when lag remains after the
+    /// initial catch-up batch. Implementations must block/back off rather than
+    /// busy-spin and must honor `control`.
+    fn poll_cdc(
+        &mut self,
+        _control: &crate::ExecutionControl,
+    ) -> Result<Vec<(String, CdcOp, SourceRow)>, String> {
+        Err("CDC source cannot poll remaining binlog events".into())
+    }
     /// Current CDC lag in events remaining (0 = caught up).
     fn cdc_lag(&self) -> u64;
 }
@@ -429,6 +438,22 @@ pub fn run_migrate_pipeline(
     io: &mut dyn MigrateIo,
     copy_batch: u64,
     cdc_events: &[(String, CdcOp, SourceRow)],
+) -> Result<MigrateRunReport, String> {
+    run_migrate_pipeline_controlled(
+        plan,
+        io,
+        copy_batch,
+        cdc_events,
+        &crate::ExecutionControl::new(None),
+    )
+}
+
+pub fn run_migrate_pipeline_controlled(
+    plan: &MysqlMigratePlan,
+    io: &mut dyn MigrateIo,
+    copy_batch: u64,
+    cdc_events: &[(String, CdcOp, SourceRow)],
+    control: &crate::ExecutionControl,
 ) -> Result<MigrateRunReport, String> {
     let batch = copy_batch.max(1);
     let mut completed = Vec::new();
@@ -502,14 +527,29 @@ pub fn run_migrate_pipeline(
     completed.push(MigrateStage::Validate);
 
     for (table, op, row) in cdc_events {
+        control.checkpoint().map_err(|error| error.to_string())?;
         io.apply_cdc(table, *op, row)?;
     }
-    // Drain remaining lag reported by the source.
-    let mut spins = 0u32;
+    // Drain remaining lag by polling real source progress. Positive lag with
+    // no events or no decreasing watermark is a hard error, never a CPU spin.
     while io.cdc_lag() > 0 {
-        spins += 1;
-        if spins > 10_000 {
-            return Err(format!("CDC lag did not reach zero (lag={})", io.cdc_lag()));
+        control.checkpoint().map_err(|error| error.to_string())?;
+        let before = io.cdc_lag();
+        let events = io.poll_cdc(control)?;
+        if events.is_empty() {
+            return Err(format!(
+                "CDC source made no progress while lag remained {before}"
+            ));
+        }
+        for (table, op, row) in events {
+            control.checkpoint().map_err(|error| error.to_string())?;
+            io.apply_cdc(&table, op, &row)?;
+        }
+        let after = io.cdc_lag();
+        if after >= before {
+            return Err(format!(
+                "CDC source watermark did not advance: before={before} after={after}"
+            ));
         }
     }
     completed.push(MigrateStage::CdcCatchUp);
@@ -542,6 +582,8 @@ pub struct MemoryMigrateIo {
     pub ddl: Vec<String>,
     /// Pending CDC lag counter (decremented by apply_cdc or set by tests).
     pub lag: u64,
+    /// Events returned by subsequent source polls.
+    pub cdc_queue: Vec<(String, CdcOp, SourceRow)>,
 }
 
 impl MigrateIo for MemoryMigrateIo {
@@ -632,6 +674,14 @@ impl MigrateIo for MemoryMigrateIo {
 
     fn cdc_lag(&self) -> u64 {
         self.lag
+    }
+
+    fn poll_cdc(
+        &mut self,
+        control: &crate::ExecutionControl,
+    ) -> Result<Vec<(String, CdcOp, SourceRow)>, String> {
+        control.checkpoint().map_err(|error| error.to_string())?;
+        Ok(std::mem::take(&mut self.cdc_queue))
     }
 }
 
@@ -733,5 +783,45 @@ mod tests {
             s,
             MigrateStage::BoundedCopy | MigrateStage::CdcCatchUp | MigrateStage::Cutover
         )));
+    }
+
+    #[test]
+    fn positive_cdc_lag_polls_events_instead_of_spinning() {
+        let plan = MysqlMigratePlan {
+            source_display: "src".into(),
+            target: "dst".into(),
+            schema_only: false,
+            tables: Vec::new(),
+            stages: MigrateStage::PIPELINE.to_vec(),
+        };
+        let mut row = SourceRow::new();
+        row.insert("id".into(), "1".into());
+        let mut io = MemoryMigrateIo {
+            lag: 1,
+            cdc_queue: vec![("orders".into(), CdcOp::Insert, row)],
+            ..MemoryMigrateIo::default()
+        };
+        let report = run_migrate_pipeline(&plan, &mut io, 10, &[]).unwrap();
+        assert!(report.cut_over);
+        assert_eq!(io.cdc_lag(), 0);
+    }
+
+    #[test]
+    fn positive_cdc_lag_without_events_fails_closed() {
+        let plan = MysqlMigratePlan {
+            source_display: "src".into(),
+            target: "dst".into(),
+            schema_only: false,
+            tables: Vec::new(),
+            stages: MigrateStage::PIPELINE.to_vec(),
+        };
+        let mut io = MemoryMigrateIo {
+            lag: 1,
+            ..MemoryMigrateIo::default()
+        };
+        assert_eq!(
+            run_migrate_pipeline(&plan, &mut io, 10, &[]).unwrap_err(),
+            "CDC source made no progress while lag remained 1"
+        );
     }
 }
