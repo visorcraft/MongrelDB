@@ -1,6 +1,6 @@
 [package]
 name = "mongreldb-ffi"
-version = "0.59.0"
+version = "0.59.1"
 edition = "2021"
 publish = false
 license = "MIT OR Apache-2.0"
@@ -20,11 +20,11 @@ name = "mongreldb"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-mongreldb-core = { path = "../mongreldb-core", version = "0.59.0" }
+mongreldb-core = { path = "../mongreldb-core", version = "0.59.1" }
 # SQL execution (DataFusion) lives in mongreldb-query, not core. The FFI
 # drives it through an internal tokio runtime, mirroring mongreldb-kit and
 # the NAPI addon.
-mongreldb-query = { path = "../mongreldb-query", version = "0.59.0" }
+mongreldb-query = { path = "../mongreldb-query", version = "0.59.1" }
 # Migration planning/checksum (shared with all language bindings via kit-core).
 # Resolved from crates.io since the FFI is a standalone crate.
 mongreldb-kit-core = "=0.58.4"
