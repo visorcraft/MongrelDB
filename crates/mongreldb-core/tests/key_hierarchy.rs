@@ -5,8 +5,6 @@
 //! per-page nonces — entirely through the public `Table` API plus the public
 //! `read_header`.
 
-#![cfg(feature = "encryption")]
-
 use mongreldb_core::{
     schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId},
     sorted_run::{read_column_dir, read_header},

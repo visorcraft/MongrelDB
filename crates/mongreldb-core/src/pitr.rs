@@ -19,13 +19,10 @@ const FORMAT_VERSION: u16 = 2;
 const MANIFEST_FILE: &str = "pitr.json";
 const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_CHUNK_BYTES: u64 = 1024 * 1024 * 1024;
-#[cfg(feature = "encryption")]
 const MANIFEST_AUTH_DOMAIN: &[u8] = b"mongreldb/pitr/manifest-auth/v2\0";
 const CHAIN_DOMAIN: &[u8] = b"mongreldb/pitr/chunk-chain/v2\0";
 const GENESIS_DOMAIN: &[u8] = b"mongreldb/pitr/genesis/v2\0";
-#[cfg(feature = "encryption")]
 const CHUNK_KEY_DOMAIN: &[u8] = b"mongreldb/pitr/chunk/v2";
-#[cfg(feature = "encryption")]
 const MANIFEST_KEY_DOMAIN: &[u8] = b"mongreldb/pitr/manifest/v2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1053,7 +1050,6 @@ fn encode_or_reuse_chunk_v2(
     Ok(bytes)
 }
 
-#[cfg(feature = "encryption")]
 fn encrypt_chunk_payload(
     kek: &crate::encryption::Kek,
     plaintext: &[u8],
@@ -1065,14 +1061,6 @@ fn encrypt_chunk_payload(
     let key = kek.derive_subkey(CHUNK_KEY_DOMAIN);
     let cipher = crate::encryption::AesCipher::new(key.as_ref())?;
     Ok((true, Some(nonce), cipher.encrypt_page(&nonce, plaintext)?))
-}
-
-#[cfg(not(feature = "encryption"))]
-fn encrypt_chunk_payload(
-    _kek: &crate::encryption::Kek,
-    _plaintext: &[u8],
-) -> Result<(bool, Option<[u8; 12]>, Vec<u8>)> {
-    unreachable!("Kek is unconstructable without the encryption feature")
 }
 
 fn decode_chunk(
@@ -1148,7 +1136,6 @@ fn decode_chunk(
     })
 }
 
-#[cfg(feature = "encryption")]
 fn decrypt_chunk_payload(
     kek: &crate::encryption::Kek,
     nonce: &[u8; 12],
@@ -1158,15 +1145,6 @@ fn decrypt_chunk_payload(
 
     let key = kek.derive_subkey(CHUNK_KEY_DOMAIN);
     crate::encryption::AesCipher::new(key.as_ref())?.decrypt_page(nonce, ciphertext)
-}
-
-#[cfg(not(feature = "encryption"))]
-fn decrypt_chunk_payload(
-    _kek: &crate::encryption::Kek,
-    _nonce: &[u8; 12],
-    _ciphertext: &[u8],
-) -> Result<Vec<u8>> {
-    unreachable!("Kek is unconstructable without the encryption feature")
 }
 
 fn validate_chunk(
@@ -1378,7 +1356,6 @@ fn derive_archive_kek(
     .map(Some)
 }
 
-#[cfg(feature = "encryption")]
 fn derive_kek_from_salt(
     source: &mut std::fs::File,
     passphrase: &str,
@@ -1392,16 +1369,6 @@ fn derive_kek_from_salt(
         ));
     }
     crate::encryption::Kek::derive(passphrase, &salt)
-}
-
-#[cfg(not(feature = "encryption"))]
-fn derive_kek_from_salt(
-    _source: &mut std::fs::File,
-    _passphrase: &str,
-) -> Result<crate::encryption::Kek> {
-    Err(MongrelError::Encryption(
-        "encryption feature is disabled".into(),
-    ))
 }
 
 fn verify_manifest_authentication(
@@ -1435,7 +1402,6 @@ fn manifest_authentication(
     .map(Some)
 }
 
-#[cfg(feature = "encryption")]
 fn manifest_auth_bytes(manifest: &PitrArchiveManifest) -> Result<Vec<u8>> {
     let mut unsigned = manifest.clone();
     unsigned.authentication = None;
@@ -1443,7 +1409,6 @@ fn manifest_auth_bytes(manifest: &PitrArchiveManifest) -> Result<Vec<u8>> {
         .map_err(|error| MongrelError::Other(format!("PITR manifest encode: {error}")))
 }
 
-#[cfg(feature = "encryption")]
 fn sign_manifest_mac(
     manifest: &PitrArchiveManifest,
     kek: &crate::encryption::Kek,
@@ -1458,15 +1423,6 @@ fn sign_manifest_mac(
     Ok(hex_bytes(&mac.finalize().into_bytes()))
 }
 
-#[cfg(not(feature = "encryption"))]
-fn sign_manifest_mac(
-    _manifest: &PitrArchiveManifest,
-    _kek: &crate::encryption::Kek,
-) -> Result<String> {
-    unreachable!("Kek is unconstructable without the encryption feature")
-}
-
-#[cfg(feature = "encryption")]
 fn verify_manifest_mac(manifest: &PitrArchiveManifest, kek: &crate::encryption::Kek) -> Result<()> {
     use hmac::Mac as _;
 
@@ -1482,14 +1438,6 @@ fn verify_manifest_mac(manifest: &PitrArchiveManifest, kek: &crate::encryption::
     mac.update(&manifest_auth_bytes(manifest)?);
     mac.verify_slice(&expected)
         .map_err(|_| MongrelError::Decryption("PITR manifest authentication failed".into()))
-}
-
-#[cfg(not(feature = "encryption"))]
-fn verify_manifest_mac(
-    _manifest: &PitrArchiveManifest,
-    _kek: &crate::encryption::Kek,
-) -> Result<()> {
-    unreachable!("Kek is unconstructable without the encryption feature")
 }
 
 fn validate_sha256(value: &str, label: &str) -> Result<()> {
@@ -1773,22 +1721,12 @@ fn open_recovery_staging(root: &DurableRoot, credentials: PitrCredentials<'_>) -
         PitrCredentials::None | PitrCredentials::User { .. } => {
             Database::open_replica_recovery_durable(root)
         }
-        #[cfg(feature = "encryption")]
         PitrCredentials::Encryption(passphrase) => {
             Database::open_encrypted_replica_recovery_durable(root, passphrase)
         }
-        #[cfg(not(feature = "encryption"))]
-        PitrCredentials::Encryption(_) => Err(MongrelError::Encryption(
-            "encryption feature is disabled".into(),
-        )),
-        #[cfg(feature = "encryption")]
         PitrCredentials::EncryptionAndUser { passphrase, .. } => {
             Database::open_encrypted_replica_recovery_durable(root, passphrase)
         }
-        #[cfg(not(feature = "encryption"))]
-        PitrCredentials::EncryptionAndUser { .. } => Err(MongrelError::Encryption(
-            "encryption feature is disabled".into(),
-        )),
     }
 }
 
@@ -2141,7 +2079,6 @@ mod tests {
         assert_eq!(reused, encoded);
     }
 
-    #[cfg(feature = "encryption")]
     #[test]
     fn matching_encrypted_orphan_chunk_is_reused_exactly() {
         let directory = tempfile::tempdir().unwrap();
@@ -2700,7 +2637,6 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "encryption")]
     #[test]
     fn encrypted_chunks_use_distinct_random_nonces() {
         let source = tempfile::tempdir().unwrap();
@@ -2736,7 +2672,6 @@ mod tests {
         assert_ne!(nonces[0], nonces[1]);
     }
 
-    #[cfg(feature = "encryption")]
     #[test]
     fn encrypted_legacy_archive_is_refused() {
         let source = tempfile::tempdir().unwrap();

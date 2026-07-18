@@ -743,7 +743,6 @@ fn main() {
             operational_projection_rows.saturating_add(trace.projection_rows);
     }
     let operational_build_ms = operational_started.elapsed().as_millis();
-    #[cfg(feature = "encryption")]
     let encrypted_profile = {
         let encrypted_rows = rows.min(env_usize("MONGRELDB_AI_BENCH_ENCRYPTED_ROWS", 10_000));
         let encrypted_dir = tempfile::tempdir().unwrap();
@@ -786,8 +785,6 @@ fn main() {
             .unwrap();
         serde_json::json!({"enabled": true, "rows": encrypted_rows, "build_ms": build_ms, "exact_rerank_us": started.elapsed().as_micros(), "hits": hits.len(), "encrypted_columns": ["embedding", "sparse", "members"]})
     };
-    #[cfg(not(feature = "encryption"))]
-    let encrypted_profile = serde_json::json!({"enabled": false});
     let realistic_profile = realistic_profile();
     let relevance_suite = ai_relevance_suite::run();
     let git_sha = std::process::Command::new("git")
@@ -828,7 +825,7 @@ fn main() {
         "hardware": {"arch": std::env::consts::ARCH, "os": std::env::consts::OS, "label": std::env::var("MONGRELDB_BENCH_HARDWARE").unwrap_or_default()},
         "rustc": rustc,
         "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
-        "features": if cfg!(feature = "encryption") { "all" } else { "default" },
+        "features": "all",
         "warmup_queries": 5.min(rows),
         "rows": rows,
         "queries": queries,

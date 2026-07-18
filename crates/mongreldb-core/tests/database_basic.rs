@@ -183,7 +183,6 @@ fn create_refuses_existing_database_without_replacing_catalog() {
     assert!(!db.require_auth_enabled());
 }
 
-#[cfg(feature = "encryption")]
 #[test]
 fn encrypted_create_refuses_existing_database_without_rewriting_keys() {
     let dir = tempdir().unwrap();
@@ -201,7 +200,6 @@ fn encrypted_create_refuses_existing_database_without_rewriting_keys() {
     assert!(db.table_names().iter().any(|name| name == "orders"));
 }
 
-#[cfg(feature = "encryption")]
 #[test]
 fn encrypted_large_schema_catalog_reopens() {
     let dir = tempdir().unwrap();
@@ -220,7 +218,6 @@ fn encrypted_large_schema_catalog_reopens() {
     assert_eq!(reopened.table_names().len(), 128);
 }
 
-#[cfg(feature = "encryption")]
 #[test]
 fn encrypted_credentialed_create_refuses_existing_database_without_rewriting_keys() {
     let dir = tempdir().unwrap();
@@ -244,7 +241,6 @@ fn encrypted_credentialed_create_refuses_existing_database_without_rewriting_key
     assert!(db.table_names().iter().any(|name| name == "orders"));
 }
 
-#[cfg(feature = "encryption")]
 #[test]
 fn database_encrypted_opens_reject_malformed_salt_without_panicking() {
     for credentialed in [false, true] {

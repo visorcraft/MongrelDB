@@ -171,7 +171,7 @@ Latest local release-build measurements are in
   buffers (one memcpy, no per-element builder) for the all-non-null case.
 - **Compaction:** Merges sorted runs with snapshot retention (readers pinning
   old epochs still see consistent data).
-- **Encryption:** Optional page-level AES-256-GCM (`encryption` feature).
+- **Encryption:** Page-level AES-256-GCM (always available in `mongreldb-core`).
   See [Encryption](#encryption) below.
 - **Result cache:** Fine-grained invalidation (footprint + condition-column
   based, not coarse epoch wipe). Persistent on-disk tier (`_rcache/`). Wired
@@ -234,8 +234,7 @@ in-process, policy-unaware engine API. `MongrelClient` and
 
 ## Encryption
 
-MongrelDB supports optional page-level encryption via AES-256-GCM (enabled
-with the `encryption` feature). The **secret is a passphrase or a raw key
+MongrelDB supports page-level encryption via AES-256-GCM (always compiled into `mongreldb-core`). The **secret is a passphrase or a raw key
 file** - there is no KMS integration or environment-variable mechanism.
 
 ### Key hierarchy
@@ -269,8 +268,8 @@ let db = Table::open_encrypted(dir, "my-passphrase")?;
 ```
 
 ```sh
-# Build with encryption support
-cargo build --release --features encryption
+# Build (encryption is always included)
+cargo build --release -p mongreldb-core
 ```
 
 ### What is and isn't encrypted

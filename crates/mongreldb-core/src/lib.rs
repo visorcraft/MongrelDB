@@ -226,5 +226,4 @@ pub use trigger::{
 pub use txn::{IsolationLevel, OwnedRow, PutResult, UpsertAction, UpsertActionKind, UpsertResult};
 pub use wal::{AddedRun, DdlOp, Op, Record, SharedWal, Wal, WalReader, SYSTEM_TXN_ID};
 
-#[cfg(feature = "encryption")]
 pub use encryption::{AesCipher, ColumnKeyDescriptor, EncryptionDescriptor, Kek};

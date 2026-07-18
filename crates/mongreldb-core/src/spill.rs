@@ -134,7 +134,7 @@ pub enum SpillError {
     /// An encrypted spill file was opened by a manager without a meta DEK.
     #[error("encrypted spill file requires the database encryption key")]
     EncryptionRequired,
-    /// A meta DEK was configured but the `encryption` feature is disabled.
+    /// A meta DEK was configured (encrypted path).
     #[error("spill encryption requires the `encryption` feature")]
     EncryptionDisabled,
     /// Sealing a frame failed.
@@ -373,10 +373,6 @@ impl SpillManager {
         meta_dek: Option<[u8; DEK_LEN]>,
     ) -> Result<Self, SpillError> {
         config.validate()?;
-        #[cfg(not(feature = "encryption"))]
-        if meta_dek.is_some() {
-            return Err(SpillError::EncryptionDisabled);
-        }
         let manager = Self {
             inner: Arc::new(ManagerInner {
                 db_root: db_root.try_clone()?,
@@ -1027,7 +1023,6 @@ impl Iterator for SpillReader {
 }
 
 /// Maps the crypto stack's `MongrelError` onto the typed spill errors.
-#[cfg(feature = "encryption")]
 fn map_crypto(error: MongrelError) -> SpillError {
     match error {
         MongrelError::Encryption(message) => SpillError::Encryption(message),
@@ -1039,7 +1034,6 @@ fn map_crypto(error: MongrelError) -> SpillError {
 /// Seals one frame's plaintext payload with the page-cipher stack when a meta
 /// DEK is present (fresh random nonce per frame, the `encrypt_blob` idiom);
 /// passes plaintext through otherwise.
-#[cfg(feature = "encryption")]
 fn seal_payload(dek: Option<&[u8; DEK_LEN]>, plaintext: &[u8]) -> Result<Vec<u8>, SpillError> {
     match dek {
         Some(dek) => crate::encryption::encrypt_blob(dek, plaintext).map_err(map_crypto),
@@ -1049,16 +1043,8 @@ fn seal_payload(dek: Option<&[u8; DEK_LEN]>, plaintext: &[u8]) -> Result<Vec<u8>
 
 /// Fail-closed stub: [`SpillManager::open`] rejects a DEK without the
 /// `encryption` feature, so this is unreachable in practice.
-#[cfg(not(feature = "encryption"))]
-fn seal_payload(dek: Option<&[u8; DEK_LEN]>, plaintext: &[u8]) -> Result<Vec<u8>, SpillError> {
-    match dek {
-        Some(_) => Err(SpillError::EncryptionDisabled),
-        None => Ok(plaintext.to_vec()),
-    }
-}
 
 /// Inverse of [`seal_payload`]: authenticates and opens a sealed frame.
-#[cfg(feature = "encryption")]
 fn open_payload(dek: Option<&[u8; DEK_LEN]>, stored: &[u8]) -> Result<Vec<u8>, SpillError> {
     match dek {
         Some(dek) => crate::encryption::decrypt_blob(dek, stored).map_err(map_crypto),
@@ -1067,13 +1053,6 @@ fn open_payload(dek: Option<&[u8; DEK_LEN]>, stored: &[u8]) -> Result<Vec<u8>, S
 }
 
 /// Fail-closed stub — see [`seal_payload`].
-#[cfg(not(feature = "encryption"))]
-fn open_payload(dek: Option<&[u8; DEK_LEN]>, stored: &[u8]) -> Result<Vec<u8>, SpillError> {
-    match dek {
-        Some(_) => Err(SpillError::EncryptionDisabled),
-        None => Ok(stored.to_vec()),
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -1505,7 +1484,6 @@ mod tests {
         assert!(matches!(corrupt, MongrelError::Other(_)));
     }
 
-    #[cfg(feature = "encryption")]
     mod encrypted {
         use super::*;
         use crate::encryption::{meta_dek_for, Kek, SALT_LEN};
@@ -1580,15 +1558,5 @@ mod tests {
             let frames: Vec<Vec<u8>> = handle.reader().unwrap().collect::<Result<_, _>>().unwrap();
             assert_eq!(frames, vec![b"secret".to_vec()]);
         }
-    }
-
-    #[cfg(not(feature = "encryption"))]
-    #[test]
-    fn dek_without_the_encryption_feature_fails_closed() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = DurableRoot::open(dir.path()).unwrap();
-        let error =
-            SpillManager::open(&root, SpillConfig::new(1 << 20), Some([1u8; DEK_LEN])).unwrap_err();
-        assert!(matches!(error, SpillError::EncryptionDisabled));
     }
 }

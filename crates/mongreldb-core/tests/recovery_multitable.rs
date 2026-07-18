@@ -459,7 +459,6 @@ fn ddl_recovery_completes_a_partial_table_directory() {
     assert!(table_dir.join("schema.json").is_file());
 }
 
-#[cfg(feature = "encryption")]
 #[test]
 fn encrypted_create_table_recovers_when_dir_missing_after_ddl_sync() {
     // Simulate a crash on an ENCRYPTED database between the shared-WAL DDL

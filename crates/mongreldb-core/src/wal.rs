@@ -11,7 +11,6 @@ use crate::rowid::RowId;
 use crate::schema::{ColumnDef, Schema};
 use crate::{MongrelError, Result};
 use crc::{Crc, CRC_32_ISCSI};
-#[cfg(feature = "encryption")]
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -657,20 +656,12 @@ fn wal_head_auth(
     wal_dek: Option<&Zeroizing<[u8; 32]>>,
 ) -> Result<[u8; 32]> {
     if let Some(key) = wal_dek {
-        #[cfg(feature = "encryption")]
         {
             let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&key[..])
                 .map_err(|error| MongrelError::Encryption(error.to_string()))?;
             mac.update(WAL_HEAD_AUTH_DOMAIN);
             mac.update(body);
             return Ok(mac.finalize().into_bytes().into());
-        }
-        #[cfg(not(feature = "encryption"))]
-        {
-            let _ = key;
-            return Err(MongrelError::Encryption(
-                "encryption feature disabled but a WAL DEK was supplied".into(),
-            ));
         }
     }
     let mut hash = Sha256::new();
@@ -1325,14 +1316,7 @@ fn reader_for_segment(
     wal_dek: Option<&Zeroizing<[u8; 32]>>,
 ) -> Result<WalReader> {
     let cipher = match wal_dek {
-        #[cfg(feature = "encryption")]
         Some(key) => Some(SharedWal::cipher_from_dek(key)?),
-        #[cfg(not(feature = "encryption"))]
-        Some(_) => {
-            return Err(MongrelError::Encryption(
-                "encryption feature disabled but a WAL DEK was supplied".into(),
-            ));
-        }
         None => None,
     };
     let file = wal_root.open_regular(segment_filename(segment_no))?;
@@ -1649,7 +1633,6 @@ pub(crate) fn validate_shared_transaction_framing(records: &[Record]) -> Result<
 
 impl SharedWal {
     /// Build a per-segment frame cipher from the WAL DEK (encryption feature).
-    #[cfg(feature = "encryption")]
     fn cipher_from_dek(dek: &Zeroizing<[u8; 32]>) -> Result<Box<dyn crate::encryption::Cipher>> {
         Ok(Box::new(crate::encryption::AesCipher::new(&dek[..])?))
     }
@@ -1683,14 +1666,7 @@ impl SharedWal {
             });
         }
         let cipher = match &wal_dek {
-            #[cfg(feature = "encryption")]
             Some(dk) => Some(Self::cipher_from_dek(dk)?),
-            #[cfg(not(feature = "encryption"))]
-            Some(_) => {
-                return Err(MongrelError::Encryption(
-                    "encryption feature disabled but a WAL DEK was supplied".into(),
-                ))
-            }
             None => None,
         };
         let active = Wal::create_chained_in(&wal_root, 0, epoch_created, cipher, [0; 32])?;
@@ -1811,14 +1787,7 @@ impl SharedWal {
             .map(|record| record.seq.0)
             .unwrap_or(epoch_created.0);
         let cipher = match &wal_dek {
-            #[cfg(feature = "encryption")]
             Some(dk) => Some(Self::cipher_from_dek(dk)?),
-            #[cfg(not(feature = "encryption"))]
-            Some(_) => {
-                return Err(MongrelError::Encryption(
-                    "encryption feature disabled but a WAL DEK was supplied".into(),
-                ))
-            }
             None => None,
         };
         let mut active = Wal::create_chained_in(
@@ -1992,7 +1961,6 @@ impl SharedWal {
         self.durable_seq = self.durable_seq.max(highest);
         let previous_segment_hash = hash_segment(&self.wal_root, self.active_segment_no)?;
         let cipher = match &self.wal_dek {
-            #[cfg(feature = "encryption")]
             Some(dk) => Some(Self::cipher_from_dek(dk)?),
             _ => None,
         };
@@ -2728,7 +2696,6 @@ mod shared_wal_tests {
         assert!(SharedWal::open(dir.path(), Epoch(2), None).is_err());
     }
 
-    #[cfg(feature = "encryption")]
     #[test]
     fn encrypted_sessions_continue_one_global_sequence() {
         let dek = || Zeroizing::new([7_u8; 32]);
@@ -2771,7 +2738,6 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    #[cfg(feature = "encryption")]
     fn frame_ranges(bytes: &[u8]) -> Vec<std::ops::Range<usize>> {
         let mut ranges = Vec::new();
         let mut offset = HEADER_LEN as usize;
@@ -3166,7 +3132,6 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "encryption")]
     #[test]
     fn encrypted_frames_reject_reorder_replay_deletion_and_cross_segment_move() {
         fn cipher(key: &[u8; 32]) -> Box<dyn crate::encryption::Cipher> {
@@ -3230,7 +3195,6 @@ mod tests {
         assert!(replay_with_cipher(&other, Some(cipher(&key))).is_err());
     }
 
-    #[cfg(feature = "encryption")]
     #[test]
     fn wal_nonce_is_segment_deterministic() {
         // Two segments with different segment_no must never share a frame nonce

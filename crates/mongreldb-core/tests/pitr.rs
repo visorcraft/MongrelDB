@@ -385,7 +385,6 @@ fn fixed_manifest_temp_name_does_not_block_pitr_archive() {
     assert_eq!(manifest.chunks.len(), 1);
 }
 
-#[cfg(feature = "encryption")]
 #[test]
 fn fixed_manifest_temp_name_does_not_block_encrypted_pitr_archive() {
     let source = tempdir().unwrap();
@@ -406,7 +405,6 @@ fn fixed_manifest_temp_name_does_not_block_encrypted_pitr_archive() {
     assert!(manifest.authentication.is_some());
 }
 
-#[cfg(feature = "encryption")]
 #[test]
 fn encrypted_pitr_reuses_base_key_material() {
     let source = tempdir().unwrap();
@@ -439,7 +437,6 @@ fn encrypted_pitr_reuses_base_key_material() {
     assert_eq!(ids(&restored), vec![1, 2]);
 }
 
-#[cfg(feature = "encryption")]
 #[test]
 fn encrypted_pitr_chunks_hide_plaintext_and_reject_tampering() {
     let source = tempdir().unwrap();
@@ -496,7 +493,6 @@ fn encrypted_pitr_chunks_hide_plaintext_and_reject_tampering() {
     assert!(!tampered_destination.exists());
 }
 
-#[cfg(feature = "encryption")]
 #[test]
 fn encrypted_pitr_rejects_valid_looking_manifest_rewrite() {
     let source = tempdir().unwrap();

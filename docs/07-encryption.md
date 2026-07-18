@@ -24,15 +24,8 @@ That's it. Everything else - key derivation, per-page encryption, key wrapping
 
 ## Enabling the Feature
 
-Encryption is behind a Cargo feature flag. Add it to your `Cargo.toml`:
+Encryption support is always compiled into `mongreldb-core`.
 
-```toml
-[dependencies]
-mongreldb-core = { path = "...", features = ["encryption"] }
-```
-
-Without the `encryption` feature, `create_encrypted` and `open_encrypted` are
-not available.
 
 ## What Actually Happens Behind the Scenes
 

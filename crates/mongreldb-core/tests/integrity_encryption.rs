@@ -5,7 +5,6 @@
 //! rejection, reopen after flush, encrypted-indexable columns (bitmap and range
 //! queries), result-cache persistence, deterministic tokens across runs, and
 //! checks for plaintext leakage or incorrect decryption.
-#![cfg(feature = "encryption")]
 
 use mongreldb_core::query::{Condition, Query};
 use mongreldb_core::schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};

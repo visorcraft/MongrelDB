@@ -305,7 +305,6 @@ fn check_detects_orphan_run_file() {
     );
 }
 
-#[cfg(feature = "encryption")]
 #[test]
 fn check_detects_run_mac_tamper_on_encrypted_db() {
     let dir = tempdir().unwrap();

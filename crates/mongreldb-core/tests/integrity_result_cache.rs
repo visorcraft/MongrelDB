@@ -719,7 +719,6 @@ fn mixed_put_and_flush_invalidates_cache_correctly() {
     assert_eq!(r2.len(), 51, "post-flush cache must see committed row");
 }
 
-#[cfg(feature = "encryption")]
 #[test]
 fn encrypted_table_result_cache_does_not_leak_plaintext() {
     let dir = tempdir().unwrap();
@@ -761,7 +760,6 @@ fn encrypted_table_result_cache_does_not_leak_plaintext() {
     }
 }
 
-#[cfg(feature = "encryption")]
 #[test]
 fn encrypted_table_wrong_key_rejects_open_but_cache_files_stay_opaque() {
     let dir = tempdir().unwrap();

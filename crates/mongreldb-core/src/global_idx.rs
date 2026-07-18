@@ -170,15 +170,10 @@ pub fn path(dir: &Path) -> PathBuf {
 /// plaintext checkpoint embeds index keys / PGM segment values derived from
 /// user data, so for an encrypted table it must not hit disk in the clear.
 fn encode_file(plain: Vec<u8>, dek: Option<&[u8; 32]>) -> Result<Vec<u8>> {
-    #[cfg(feature = "encryption")]
     {
         if let Some(k) = dek {
             return crate::encryption::encrypt_blob(k, &plain);
         }
-    }
-    #[cfg(not(feature = "encryption"))]
-    {
-        let _ = dek;
     }
     Ok(plain)
 }
@@ -187,15 +182,10 @@ fn encode_file(plain: Vec<u8>, dek: Option<&[u8; 32]>) -> Result<Vec<u8>> {
 /// to decrypt (wrong key, tamper, or corruption) so the caller simply rebuilds
 /// from the runs.
 fn decode_file(raw: Vec<u8>, dek: Option<&[u8; 32]>) -> Option<Vec<u8>> {
-    #[cfg(feature = "encryption")]
     {
         if let Some(k) = dek {
             return crate::encryption::decrypt_blob(k, &raw).ok();
         }
-    }
-    #[cfg(not(feature = "encryption"))]
-    {
-        let _ = dek;
     }
     Some(raw)
 }

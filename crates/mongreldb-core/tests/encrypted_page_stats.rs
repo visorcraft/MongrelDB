@@ -4,7 +4,6 @@
 //! into the cleartext column directory. Covers: range-query result parity
 //! with plaintext tables across multiple pages, absence of plaintext bounds
 //! in the file bytes, and tamper rejection of the envelope.
-#![cfg(feature = "encryption")]
 
 use mongreldb_core::query::{Condition, Query};
 use mongreldb_core::schema::{ColumnDef, ColumnFlags, Schema, TypeId};

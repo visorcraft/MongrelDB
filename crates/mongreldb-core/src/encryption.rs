@@ -11,7 +11,6 @@
 //! requires unwrapping its run's DEK with the table KEK.
 
 use crate::error::{MongrelError, Result};
-#[cfg(feature = "encryption")]
 use zeroize::Zeroizing;
 
 /// DEK length (AES-256 = 32 bytes). Always available.
@@ -75,7 +74,6 @@ impl Cipher for PlaintextCipher {
     }
 }
 
-#[cfg(feature = "encryption")]
 mod aes {
     use super::{Cipher, MongrelError, Result};
     use aes_gcm::aead::{Aead, Payload};
@@ -154,10 +152,8 @@ mod aes {
     }
 }
 
-#[cfg(feature = "encryption")]
 pub use aes::AesCipher;
 
-#[cfg(feature = "encryption")]
 mod key {
     use super::{fill_random, Cipher, MongrelError, Result, DEK_LEN};
     use aes_gcm::aead::{Aead, KeyInit};
@@ -638,7 +634,6 @@ mod key {
     }
 }
 
-#[cfg(feature = "encryption")]
 pub use key::{
     build_page_nonce, build_run_cipher, decrypt_blob, encrypt_blob, generate_dek, hmac_token,
     ope_token_f64, ope_token_i64, random_nonce_prefix, random_salt, run_metadata_mac,
@@ -648,9 +643,7 @@ pub use key::{
 
 /// Per-run encryption material assembled at write/read time: the page cipher
 /// (over the unwrapped DEK), the nonce prefix, and (write path only) the
-/// serialized descriptor to embed in the run. Carries only trait-object +
-/// primitive fields so it is constructible without the `encryption` feature's
-/// concrete crypto types.
+/// serialized descriptor to embed in the run.
 pub struct RunEncryption {
     pub cipher: Box<dyn Cipher>,
     pub nonce_prefix: [u8; 12],
@@ -660,55 +653,16 @@ pub struct RunEncryption {
     pub mac_key: Option<[u8; 32]>,
 }
 
-/// Placeholder KEK when the `encryption` feature is disabled. It has no public
-/// constructor, so it can never exist — encrypted tables are therefore
-/// impossible without the feature, and all plumbing types
-/// (`Option<Arc<Kek>>` etc.) remain valid without a cfg gate.
-#[cfg(not(feature = "encryption"))]
-pub struct Kek {
-    _private: (),
-}
-
-/// Unreachable stub — a [`Kek`] cannot be constructed without the `encryption`
-/// feature, so the writer never reaches this path when encryption is disabled.
-#[cfg(not(feature = "encryption"))]
-#[doc(hidden)]
-pub fn setup_run_encryption(
-    _kek: &Kek,
-    _indexable_columns: &[(u16, u8)],
-) -> crate::Result<RunEncryption> {
-    unreachable!("Kek is unconstructable without the encryption feature")
-}
-
-/// Unreachable stub — see [`setup_run_encryption`].
-#[cfg(not(feature = "encryption"))]
-#[doc(hidden)]
-pub fn build_run_cipher(_kek: &Kek, _descriptor_bytes: &[u8]) -> crate::Result<RunEncryption> {
-    unreachable!("Kek is unconstructable without the encryption feature")
-}
-
 /// Derive the DB-wide meta DEK from an optional KEK. `None` when the KEK is
-/// absent (plaintext DB) or when encryption is disabled at compile time.
-#[cfg(feature = "encryption")]
+/// absent (plaintext DB).
 pub fn meta_dek_for(kek: Option<&Kek>) -> Option<[u8; DEK_LEN]> {
     kek.map(|k| *k.derive_meta_key())
 }
 
-#[cfg(not(feature = "encryption"))]
-pub fn meta_dek_for(_kek: Option<&Kek>) -> Option<[u8; DEK_LEN]> {
-    None
-}
-
 /// Derive the shared-WAL frame DEK from an optional KEK. `None` when the KEK is
-/// absent or encryption is disabled.
-#[cfg(feature = "encryption")]
+/// absent (plaintext DB).
 pub fn wal_dek_for(kek: Option<&Kek>) -> Option<Zeroizing<[u8; DEK_LEN]>> {
     kek.map(|k| k.derive_shared_wal_key())
-}
-
-#[cfg(not(feature = "encryption"))]
-pub fn wal_dek_for(_kek: Option<&Kek>) -> Option<zeroize::Zeroizing<[u8; DEK_LEN]>> {
-    None
 }
 
 #[cfg(test)]
@@ -724,7 +678,6 @@ mod tests {
         assert_eq!(pt, b"hello");
     }
 
-    #[cfg(feature = "encryption")]
     #[test]
     fn aes_round_trip() {
         let c = AesCipher::new(&[7u8; 32]).unwrap();
@@ -735,7 +688,6 @@ mod tests {
         assert_eq!(pt, b"secret page");
     }
 
-    #[cfg(feature = "encryption")]
     #[test]
     fn kek_derive_is_deterministic_for_same_passphrase_and_salt() {
         let salt = random_salt().unwrap();
@@ -748,7 +700,6 @@ mod tests {
         assert_eq!(w1, w2, "same passphrase+salt must yield same KEK");
     }
 
-    #[cfg(feature = "encryption")]
     #[test]
     fn kek_differs_for_different_salt() {
         let s1 = random_salt().unwrap();
@@ -762,7 +713,6 @@ mod tests {
         assert_ne!(w1, w2, "different salts must yield different KEKs");
     }
 
-    #[cfg(feature = "encryption")]
     #[test]
     fn dek_wrap_unwrap_round_trip() {
         let salt = random_salt().unwrap();
@@ -775,7 +725,6 @@ mod tests {
         assert_eq!(unwrapped.as_ref(), dek.as_ref());
     }
 
-    #[cfg(feature = "encryption")]
     #[test]
     fn unwrap_rejects_wrong_passphrase() {
         let salt = random_salt().unwrap();
@@ -787,7 +736,6 @@ mod tests {
         assert!(dec_kek.unwrap_dek(&wrapped, &np).is_err());
     }
 
-    #[cfg(feature = "encryption")]
     #[test]
     fn page_nonce_overlays_column_and_page() {
         let np = random_nonce_prefix().unwrap();
@@ -798,7 +746,6 @@ mod tests {
         assert_eq!(n[10..12], [0x06, 0x05]);
     }
 
-    #[cfg(feature = "encryption")]
     #[test]
     fn page_nonce_unique_per_column_and_page() {
         let np = random_nonce_prefix().unwrap();
@@ -810,7 +757,6 @@ mod tests {
         assert_ne!(b, c);
     }
 
-    #[cfg(feature = "encryption")]
     #[test]
     fn column_key_is_deterministic_from_kek() {
         let salt = random_salt().unwrap();
@@ -824,7 +770,6 @@ mod tests {
         assert_ne!(c1.as_ref(), c3.as_ref());
     }
 
-    #[cfg(feature = "encryption")]
     #[test]
     fn hmac_token_collides_only_for_equal_values() {
         let salt = random_salt().unwrap();
@@ -840,7 +785,6 @@ mod tests {
         assert_ne!(a, hmac_token(&ck2, b"hello"));
     }
 
-    #[cfg(feature = "encryption")]
     #[test]
     fn ope_token_i64_preserves_order() {
         let salt = random_salt().unwrap();
@@ -860,7 +804,6 @@ mod tests {
     /// (`a*m + b`) gave equally-spaced tokens for equally-spaced inputs, which a
     /// two-known-plaintext / GCD attacker inverts trivially. The prefix-keyed
     /// construction must not have constant token gaps.
-    #[cfg(feature = "encryption")]
     #[test]
     fn ope_token_is_non_linear() {
         let salt = random_salt().unwrap();
@@ -880,7 +823,6 @@ mod tests {
         assert_eq!(ope_token_i64(&ck, 100), ope_token_i64(&ck, 100));
     }
 
-    #[cfg(feature = "encryption")]
     #[test]
     fn ope_token_f64_preserves_order() {
         let salt = random_salt().unwrap();
@@ -905,7 +847,6 @@ mod tests {
     /// Regression for the Phase 10 review CRITICAL: within one run the DEK and
     /// every column key must be wrapped under DISTINCT nonces, or AES-GCM nonce
     /// reuse under the KEK is catastrophic.
-    #[cfg(feature = "encryption")]
     #[test]
     fn wrap_nonces_are_distinct_within_a_run() {
         use super::key::{wrap_nonce, WRAP_KIND_COLUMN, WRAP_KIND_DEK};
@@ -942,7 +883,6 @@ mod tests {
     /// DISTINCT DEKs under the same KEK — otherwise two WAL files sharing the
     /// same key + the same `segment_no=0` nonce space is catastrophic AES-GCM
     /// nonce reuse (review fix from P2 peer review).
-    #[cfg(feature = "encryption")]
     #[test]
     fn wal_deks_are_domain_separated() {
         let salt = random_salt().unwrap();

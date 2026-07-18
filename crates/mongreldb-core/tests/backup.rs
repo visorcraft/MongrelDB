@@ -245,7 +245,6 @@ fn backup_rejects_nested_stage_symlink_without_writing_outside() {
     assert!(!destination.exists());
 }
 
-#[cfg(feature = "encryption")]
 #[test]
 fn encrypted_hot_backup_reopens_with_same_passphrase() {
     let source = tempdir().unwrap();
@@ -355,7 +354,6 @@ fn validate_restore_passes_on_sound_backup_and_catches_corruption() {
     assert!(validate_restore(&destination).is_err());
 }
 
-#[cfg(feature = "encryption")]
 #[test]
 fn encrypted_backup_manifest_carries_encryption_metadata() {
     let source = tempdir().unwrap();

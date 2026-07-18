@@ -13,7 +13,7 @@ name = "comp_bench"
 path = "src/comp_bench.rs"
 
 [dependencies]
-mongreldb-core = { path = "../mongreldb-core", version = "0.60.2", features = ["encryption"] }
+mongreldb-core = { path = "../mongreldb-core", version = "0.60.2" }
 mongreldb-query = { path = "../mongreldb-query", version = "0.60.2" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 duckdb = { version = "1.1", features = ["bundled"] }

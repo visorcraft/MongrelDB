@@ -133,7 +133,6 @@ fn main() {
         }
         // Encrypted variant of "shared-commit": same restart semantics must
         // hold with page-level AES-256-GCM. Fixed test-only passphrase.
-        #[cfg(feature = "encryption")]
         "shared-commit-encrypted" => {
             const PASSPHRASE: &str = "crash-harness-test-passphrase";
             let value: i64 = args.next().and_then(|v| v.parse().ok()).unwrap_or(1);

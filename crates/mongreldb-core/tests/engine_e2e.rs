@@ -258,7 +258,6 @@ fn compaction_preserves_visible_state() {
     assert_eq!(before, after, "compaction must not change the visible set");
 }
 
-#[cfg(feature = "encryption")]
 #[test]
 fn encrypted_flush_and_read_round_trips() {
     let dir = tempdir().unwrap();

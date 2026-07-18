@@ -320,7 +320,6 @@ fn current_unix_nanos() -> u64 {
         .as_nanos() as u64
 }
 
-#[cfg(feature = "encryption")]
 fn read_encryption_salt(
     root: &crate::durable_file::DurableRoot,
 ) -> Result<[u8; crate::encryption::SALT_LEN]> {
@@ -2295,7 +2294,6 @@ impl Database {
 
     /// Create a fresh encrypted database, deriving the DB-wide KEK from a
     /// passphrase (Argon2id + HKDF). The salt is persisted at `_meta/keys`.
-    #[cfg(feature = "encryption")]
     pub fn create_encrypted(root: impl AsRef<Path>, passphrase: &str) -> Result<Self> {
         let (root, lock) = Self::begin_create(root)?;
         let salt = crate::encryption::random_salt()?;
@@ -2311,7 +2309,6 @@ impl Database {
 
     /// Create a fresh encrypted database, deriving the DB-wide KEK from a raw
     /// high-entropy key via HKDF. The salt is persisted at `_meta/keys`.
-    #[cfg(feature = "encryption")]
     pub fn create_with_key(root: impl AsRef<Path>, key: &[u8]) -> Result<Self> {
         let (root, lock) = Self::begin_create(root)?;
         let salt = crate::encryption::random_salt()?;
@@ -2411,7 +2408,6 @@ impl Database {
     }
 
     /// Open an existing encrypted database with a passphrase.
-    #[cfg(feature = "encryption")]
     pub fn open_encrypted(root: impl AsRef<Path>, passphrase: &str) -> Result<Self> {
         let (root, lock) = Self::begin_open(root, 0)?;
         let salt = read_encryption_salt(lock.durable_root.as_deref().ok_or_else(|| {
@@ -2429,7 +2425,6 @@ impl Database {
 
     /// Open an existing encrypted database with a configurable cross-process
     /// lock timeout. Mirrors [`open_with_options`](Self::open_with_options).
-    #[cfg(feature = "encryption")]
     pub fn open_encrypted_with_options(
         root: impl AsRef<Path>,
         passphrase: &str,
@@ -2455,7 +2450,6 @@ impl Database {
     }
 
     /// Open an existing encrypted database using a raw high-entropy key.
-    #[cfg(feature = "encryption")]
     pub fn open_with_key(root: impl AsRef<Path>, key: &[u8]) -> Result<Self> {
         let (root, lock) = Self::begin_open(root, 0)?;
         let salt = read_encryption_salt(lock.durable_root.as_deref().ok_or_else(|| {
@@ -2517,7 +2511,6 @@ impl Database {
 
     /// Open an existing encrypted database that has `require_auth = true`,
     /// combining the encryption passphrase flow with credential verification.
-    #[cfg(feature = "encryption")]
     pub fn open_encrypted_with_credentials(
         root: impl AsRef<Path>,
         passphrase: &str,
@@ -2543,7 +2536,6 @@ impl Database {
     /// Open an encrypted + credentialed database with a configurable
     /// cross-process lock timeout. Mirrors
     /// [`open_encrypted_with_options`](Self::open_encrypted_with_options).
-    #[cfg(feature = "encryption")]
     pub fn open_encrypted_with_credentials_and_options(
         root: impl AsRef<Path>,
         passphrase: &str,
@@ -2813,7 +2805,6 @@ impl Database {
     /// Create a fresh encrypted database with `require_auth = true` and a
     /// single admin user. Composes encryption-at-rest with credential
     /// enforcement.
-    #[cfg(feature = "encryption")]
     pub fn create_encrypted_with_credentials(
         root: impl AsRef<Path>,
         passphrase: &str,
@@ -2929,7 +2920,6 @@ impl Database {
         Self::open_replica_recovery_inner(root, None, lock)
     }
 
-    #[cfg(feature = "encryption")]
     pub(crate) fn open_encrypted_replica_recovery_durable(
         root: &crate::durable_file::DurableRoot,
         passphrase: &str,
@@ -6182,16 +6172,10 @@ impl Database {
     /// Domain-separated authentication key for server idempotency state.
     /// Encrypted databases derive it from the in-memory KEK. Plain databases
     /// return `None`; their server persists a random key under the pinned root.
-    #[cfg(feature = "encryption")]
     pub fn derive_server_idempotency_key(&self) -> Option<zeroize::Zeroizing<[u8; 32]>> {
         self.kek
             .as_deref()
             .map(|kek| kek.derive_subkey(b"mongreldb/server/idempotency/v1"))
-    }
-
-    #[cfg(not(feature = "encryption"))]
-    pub fn derive_server_idempotency_key(&self) -> Option<zeroize::Zeroizing<[u8; 32]>> {
-        None
     }
 
     pub fn is_read_only_replica(&self) -> bool {
@@ -15073,10 +15057,7 @@ fn validate_shared_wal_recovery_plan(
                     entry.table_id
                 )));
             }
-            #[cfg(feature = "encryption")]
             let idx_dek = kek.as_ref().map(|key| key.derive_idx_key());
-            #[cfg(not(feature = "encryption"))]
-            let idx_dek: Option<zeroize::Zeroizing<[u8; 32]>> = None;
             crate::global_idx::read_durable_for(
                 durable_root,
                 &relative_dir,

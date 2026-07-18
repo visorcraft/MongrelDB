@@ -302,7 +302,6 @@ fn governor_spill_trigger_issues_a_grant_and_the_operator_spills() {
     assert!(governor.stats().spill_triggers >= 1);
 }
 
-#[cfg(feature = "encryption")]
 mod encrypted {
     use super::*;
     use mongreldb_core::encryption::{meta_dek_for, Kek, SALT_LEN};

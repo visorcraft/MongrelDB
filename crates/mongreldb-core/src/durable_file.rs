@@ -1695,7 +1695,6 @@ where
 
 /// Write an authoritative file through a unique synced temporary and durable
 /// atomic replacement.
-#[cfg_attr(not(feature = "encryption"), allow(dead_code))]
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     write_atomic_with_after(path, bytes, || {})
 }

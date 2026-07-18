@@ -687,12 +687,6 @@ impl JobRegistry {
     /// database metadata key, `None` writes the integrity-tagged plaintext
     /// frame. Without the `encryption` feature, `Some` is rejected.
     pub fn open(dir: &Path, meta_dek: Option<&[u8; META_DEK_LEN]>) -> Result<Self, JobError> {
-        #[cfg(not(feature = "encryption"))]
-        if meta_dek.is_some() {
-            return Err(JobError::Storage(
-                "a metadata key was supplied but the `encryption` feature is disabled".to_string(),
-            ));
-        }
         let root = DurableRoot::open(dir)?;
         let mut inner = match read_durable(&root, meta_dek)? {
             Some(snapshot) => validate_snapshot(snapshot)?,
@@ -1301,7 +1295,6 @@ fn plaintext_frame(body: &[u8]) -> Vec<u8> {
     out
 }
 
-#[cfg(feature = "encryption")]
 fn seal(body: &[u8], meta_dek: Option<&[u8; META_DEK_LEN]>) -> Result<Vec<u8>, JobError> {
     match meta_dek {
         Some(dek) => crate::encryption::encrypt_blob(dek, body)
@@ -1310,17 +1303,6 @@ fn seal(body: &[u8], meta_dek: Option<&[u8; META_DEK_LEN]>) -> Result<Vec<u8>, J
     }
 }
 
-#[cfg(not(feature = "encryption"))]
-fn seal(body: &[u8], meta_dek: Option<&[u8; META_DEK_LEN]>) -> Result<Vec<u8>, JobError> {
-    if meta_dek.is_some() {
-        return Err(JobError::Storage(
-            "a metadata key was supplied but the `encryption` feature is disabled".to_string(),
-        ));
-    }
-    Ok(plaintext_frame(body))
-}
-
-#[cfg(feature = "encryption")]
 fn open_payload(
     bytes: &[u8],
     meta_dek: Option<&[u8; META_DEK_LEN]>,
@@ -1338,19 +1320,6 @@ fn open_payload(
         }
         None => parse_plaintext(bytes),
     }
-}
-
-#[cfg(not(feature = "encryption"))]
-fn open_payload(
-    bytes: &[u8],
-    meta_dek: Option<&[u8; META_DEK_LEN]>,
-) -> Result<JobsSnapshot, JobError> {
-    if meta_dek.is_some() {
-        return Err(JobError::Storage(
-            "a metadata key was supplied but the `encryption` feature is disabled".to_string(),
-        ));
-    }
-    parse_plaintext(bytes)
 }
 
 /// Write the registry file through the catalog's checksum + atomic-rename

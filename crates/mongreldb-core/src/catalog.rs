@@ -462,17 +462,11 @@ impl Catalog {
     }
 }
 
-#[cfg(feature = "encryption")]
 fn seal(body: &[u8], meta_dek: Option<&[u8; META_DEK_LEN]>) -> Result<Vec<u8>> {
     match meta_dek {
         Some(dek) => crate::encryption::encrypt_blob(dek, body),
         None => Ok(plaintext_frame(body)),
     }
-}
-
-#[cfg(not(feature = "encryption"))]
-fn seal(body: &[u8], _meta_dek: Option<&[u8; META_DEK_LEN]>) -> Result<Vec<u8>> {
-    Ok(plaintext_frame(body))
 }
 
 fn plaintext_frame(body: &[u8]) -> Vec<u8> {
@@ -543,7 +537,6 @@ where
     Ok(())
 }
 
-#[cfg(feature = "encryption")]
 fn open_payload(bytes: &[u8], meta_dek: Option<&[u8; META_DEK_LEN]>) -> Result<Option<Catalog>> {
     match meta_dek {
         Some(dek) => match crate::encryption::decrypt_blob(dek, bytes) {
@@ -552,11 +545,6 @@ fn open_payload(bytes: &[u8], meta_dek: Option<&[u8; META_DEK_LEN]>) -> Result<O
         },
         None => parse_plaintext(bytes),
     }
-}
-
-#[cfg(not(feature = "encryption"))]
-fn open_payload(bytes: &[u8], _meta_dek: Option<&[u8; META_DEK_LEN]>) -> Result<Option<Catalog>> {
-    parse_plaintext(bytes)
 }
 
 pub(crate) fn encode(catalog: &Catalog) -> Result<Vec<u8>> {

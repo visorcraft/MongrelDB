@@ -232,7 +232,6 @@ fn controlled_rename_rejection_keeps_original_table_after_reopen() {
     assert!(reopened.table("after").is_err());
 }
 
-#[cfg(feature = "encryption")]
 #[test]
 fn catalog_encrypted_is_authenticated() {
     let dir = tempdir().unwrap();
@@ -251,7 +250,6 @@ fn catalog_encrypted_is_authenticated() {
     assert!(catalog::read(dir.path(), Some(&dek)).unwrap().is_none());
 }
 
-#[cfg(feature = "encryption")]
 #[test]
 fn catalog_encrypted_wrong_key_returns_none() {
     let dir = tempdir().unwrap();

@@ -7,7 +7,7 @@ description = "HTTP client library for MongrelDB Server."
 repository = "https://github.com/visorcraft/MongrelDB"
 
 [dependencies]
-mongreldb-core = { path = "../mongreldb-core", version = "0.60.2", features = ["encryption"] }
+mongreldb-core = { path = "../mongreldb-core", version = "0.60.2" }
 mongreldb-query = { path = "../mongreldb-query", version = "0.60.2" }
 reqwest = { version = "0.12", features = ["blocking", "json"] }
 arrow = "58"

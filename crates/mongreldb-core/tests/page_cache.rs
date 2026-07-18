@@ -112,7 +112,6 @@ fn persistent_cache_survives_reopen() {
 
 // Uses the encryption-only `Table::create_encrypted` API, so gate it behind the
 // `encryption` feature (the rest of this file builds without it).
-#[cfg(feature = "encryption")]
 #[test]
 fn cache_does_not_break_encrypted_reads() {
     // The cache stores raw ciphertext bytes and decrypts AFTER the lookup, so an

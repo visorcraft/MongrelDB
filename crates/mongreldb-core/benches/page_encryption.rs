@@ -5,7 +5,7 @@
 //! pages the engine writes, so the encryption overhead can be compared directly
 //! against the decode/materialize cost measured by the other benches.
 //!
-//! Run: `cargo bench -p mongreldb-core --bench page_encryption --features encryption`
+//! Run: `cargo bench -p mongreldb-core --bench page_encryption`
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use mongreldb_core::encryption::{AesCipher, Cipher};

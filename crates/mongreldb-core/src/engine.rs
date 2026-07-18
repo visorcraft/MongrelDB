@@ -1063,7 +1063,6 @@ impl ResultCache {
     }
 
     /// Encrypt cache data: `[nonce: 12B][ciphertext + GCM tag]`.
-    #[cfg(feature = "encryption")]
     fn encrypt_cache(&self, plaintext: &[u8], dek: &Zeroizing<[u8; DEK_LEN]>) -> Option<Vec<u8>> {
         use crate::encryption::Cipher;
         let cipher = crate::encryption::AesCipher::new(&dek[..]).ok()?;
@@ -1076,13 +1075,7 @@ impl ResultCache {
         Some(out)
     }
 
-    #[cfg(not(feature = "encryption"))]
-    fn encrypt_cache(&self, _plaintext: &[u8], _dek: &Zeroizing<[u8; DEK_LEN]>) -> Option<Vec<u8>> {
-        None
-    }
-
     /// Decrypt cache data: reads nonce from first 12 bytes.
-    #[cfg(feature = "encryption")]
     fn decrypt_cache(&self, bytes: &[u8], dek: &Zeroizing<[u8; DEK_LEN]>) -> Option<Vec<u8>> {
         use crate::encryption::Cipher;
         if bytes.len() < 28 {
@@ -1092,11 +1085,6 @@ impl ResultCache {
         let nonce: [u8; 12] = bytes[..12].try_into().ok()?;
         let ct = &bytes[12..];
         cipher.decrypt_page(&nonce, ct).ok()
-    }
-
-    #[cfg(not(feature = "encryption"))]
-    fn decrypt_cache(&self, _bytes: &[u8], _dek: &Zeroizing<[u8; DEK_LEN]>) -> Option<Vec<u8>> {
-        None
     }
 
     /// Scan the cache directory and pre-load all entries into memory. Called
@@ -1325,7 +1313,6 @@ type DekaOpt = Option<Zeroizing<[u8; DEK_LEN]>>;
 
 fn derive_subkeys(kek: Option<&Kek>, _table_id: u64) -> (DekaOpt, DekaOpt) {
     let _ = kek;
-    #[cfg(feature = "encryption")]
     {
         if let Some(k) = kek {
             return (
@@ -1337,7 +1324,6 @@ fn derive_subkeys(kek: Option<&Kek>, _table_id: u64) -> (DekaOpt, DekaOpt) {
     (None, None)
 }
 
-#[cfg(feature = "encryption")]
 fn read_table_encryption_salt_root(
     root: &crate::durable_file::DurableRoot,
 ) -> Result<[u8; crate::encryption::SALT_LEN]> {
@@ -1359,21 +1345,14 @@ fn read_table_encryption_salt_root(
 }
 
 /// Create a boxed cipher from a DEK (encryption feature only).
-#[cfg(feature = "encryption")]
 fn make_cipher(dek: &Zeroizing<[u8; DEK_LEN]>) -> Box<dyn crate::encryption::Cipher> {
     Box::new(crate::encryption::AesCipher::new(&dek[..]).expect("DEK is 32 bytes"))
-}
-
-#[cfg(not(feature = "encryption"))]
-fn make_cipher(_dek: &Zeroizing<[u8; DEK_LEN]>) -> Box<dyn crate::encryption::Cipher> {
-    Box::new(crate::encryption::PlaintextCipher)
 }
 
 fn build_column_keys(kek: Option<&Kek>, schema: &Schema) -> HashMap<u16, ([u8; 32], u8)> {
     let Some(kek) = kek else {
         return HashMap::new();
     };
-    #[cfg(feature = "encryption")]
     {
         use crate::encryption::{SCHEME_HMAC_EQ, SCHEME_OPE_RANGE};
         schema
@@ -1394,11 +1373,6 @@ fn build_column_keys(kek: Option<&Kek>, schema: &Schema) -> HashMap<u16, ([u8; 3
                 (c.id, (key, scheme))
             })
             .collect()
-    }
-    #[cfg(not(feature = "encryption"))]
-    {
-        let _ = (kek, schema);
-        HashMap::new()
     }
 }
 
@@ -1557,7 +1531,6 @@ impl Table {
     /// between `put` and `flush`; call `flush()` (which rotates the WAL) before
     /// treating sensitive data as fully at-rest-protected. Full WAL encryption
     /// is deferred.
-    #[cfg(feature = "encryption")]
     pub fn create_encrypted(
         dir: impl AsRef<Path>,
         schema: Schema,
@@ -1581,7 +1554,6 @@ impl Table {
     /// instead of a passphrase. Skips Argon2id — the key must already be
     /// high-entropy (>= 32 bytes of random data). ~0.1ms vs ~50ms for the
     /// passphrase path.
-    #[cfg(feature = "encryption")]
     pub fn create_with_key(
         dir: impl AsRef<Path>,
         schema: Schema,
@@ -1602,7 +1574,6 @@ impl Table {
     }
 
     /// Open an existing encrypted table using a raw key.
-    #[cfg(feature = "encryption")]
     pub fn open_with_key(dir: impl AsRef<Path>, key: &[u8]) -> Result<Self> {
         let root = Arc::new(crate::durable_file::DurableRoot::open(dir.as_ref())?);
         let salt = read_table_encryption_salt_root(&root)?;
@@ -1768,7 +1739,6 @@ impl Table {
 
     /// Open an existing encrypted table. `passphrase` must match the one used at
     /// create time (combined with the persisted salt to re-derive the KEK).
-    #[cfg(feature = "encryption")]
     pub fn open_encrypted(dir: impl AsRef<Path>, passphrase: &str) -> Result<Self> {
         let root = Arc::new(crate::durable_file::DurableRoot::open(dir.as_ref())?);
         let salt = read_table_encryption_salt_root(&root)?;
@@ -3751,7 +3721,6 @@ impl Table {
         if self.column_keys.is_empty() {
             return row.clone();
         }
-        #[cfg(feature = "encryption")]
         {
             use crate::encryption::SCHEME_HMAC_EQ;
             let mut tok = row.clone();
@@ -3766,10 +3735,6 @@ impl Table {
                 }
             }
             tok
-        }
-        #[cfg(not(feature = "encryption"))]
-        {
-            row.clone()
         }
     }
 
@@ -10826,27 +10791,15 @@ impl Table {
     /// The index-checkpoint DEK (KEK-derived) for encrypted tables; `None` for
     /// plaintext tables. The checkpoint embeds index keys / PGM segment values
     /// derived from user data, so an encrypted table must encrypt it at rest.
-    #[cfg(feature = "encryption")]
     fn idx_dek(&self) -> Option<Zeroizing<[u8; DEK_LEN]>> {
         self.kek.as_ref().map(|k| k.derive_idx_key())
-    }
-
-    #[cfg(not(feature = "encryption"))]
-    fn idx_dek(&self) -> Option<Zeroizing<[u8; DEK_LEN]>> {
-        None
     }
 
     /// Manifest (and other DB-wide metadata) meta DEK, derived from the KEK so
     /// the on-disk manifest is encrypted + authenticated at rest for encrypted
     /// tables. `None` for plaintext.
-    #[cfg(feature = "encryption")]
     fn manifest_meta_dek(&self) -> Option<[u8; DEK_LEN]> {
         self.kek.as_ref().map(|k| *k.derive_meta_key())
-    }
-
-    #[cfg(not(feature = "encryption"))]
-    fn manifest_meta_dek(&self) -> Option<[u8; DEK_LEN]> {
-        None
     }
 
     /// `(column_id, scheme)` for every ENCRYPTED_INDEXABLE column — passed to
@@ -10862,12 +10815,10 @@ impl Table {
     /// per the column's scheme). Returns `None` for plaintext columns. Indexes
     /// over such columns store tokens, and queries tokenize literals the same
     /// way — so lookups never decrypt the stored (encrypted) page payloads.
-    #[cfg(feature = "encryption")]
     fn tokenize_value(&self, column_id: u16, v: &Value) -> Option<Value> {
         self.tokenize_value_enc(column_id, v)
     }
 
-    #[cfg(feature = "encryption")]
     fn tokenize_value_enc(&self, column_id: u16, v: &Value) -> Option<Value> {
         use crate::encryption::{hmac_token, ope_token_f64, ope_token_i64, SCHEME_HMAC_EQ};
         let (key, scheme) = self.column_keys.get(&column_id)?;
@@ -10888,7 +10839,6 @@ impl Table {
     /// Tokenize an already-encoded lookup key (equality queries pass the
     /// encoded search value; HMAC-eq columns wrap it under the column key).
     fn index_lookup_key_bytes(&self, column_id: u16, encoded: &[u8]) -> Vec<u8> {
-        #[cfg(feature = "encryption")]
         {
             use crate::encryption::{hmac_token, SCHEME_HMAC_EQ};
             if let Some((key, scheme)) = self.column_keys.get(&column_id) {
@@ -11741,7 +11691,6 @@ fn bulk_index_key(
     i: usize,
 ) -> Option<Vec<u8>> {
     let encoded = columnar::encode_key_native(ty, col, i)?;
-    #[cfg(feature = "encryption")]
     {
         use crate::encryption::{hmac_token, ope_token_f64, ope_token_i64, SCHEME_HMAC_EQ};
         if let Some((key, scheme)) = column_keys.get(&column_id) {
@@ -11756,10 +11705,6 @@ fn bulk_index_key(
                 _ => hmac_token(key, &encoded).to_vec(),
             });
         }
-    }
-    #[cfg(not(feature = "encryption"))]
-    {
-        let _ = (column_id, column_keys, col);
     }
     Some(encoded)
 }
@@ -11935,10 +11880,7 @@ fn preflight_standalone_open(
             ));
         }
     }
-    #[cfg(feature = "encryption")]
     let idx_dek = kek.as_ref().map(|key| key.derive_idx_key());
-    #[cfg(not(feature = "encryption"))]
-    let idx_dek: Option<Zeroizing<[u8; DEK_LEN]>> = None;
     match idx_root {
         Some(root) => {
             global_idx::read_root(root, manifest.table_id, schema, idx_dek.as_deref())?;

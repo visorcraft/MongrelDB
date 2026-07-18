@@ -32,7 +32,7 @@ tempfile = "3"
 [dev-dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
-mongreldb-core = { path = "../mongreldb-core", version = "0.60.2", features = ["encryption"] }
+mongreldb-core = { path = "../mongreldb-core", version = "0.60.2" }
 
 [[bench]]
 name = "sql_cancellation"

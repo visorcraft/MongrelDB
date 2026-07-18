@@ -494,7 +494,6 @@ fn persistent_cache_epoch_visibility() {
     );
 }
 
-#[cfg(feature = "encryption")]
 mod encrypted {
     use super::*;
     use mongreldb_core::query::{Condition, Query};

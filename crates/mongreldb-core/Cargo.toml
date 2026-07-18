@@ -33,12 +33,12 @@ mongreldb-types = { path = "../mongreldb-types", version = "0.60.2" }
 mongreldb-log = { path = "../mongreldb-log", version = "0.60.2" }
 mongreldb-fault = { path = "../mongreldb-fault", version = "0.60.2" }
 
-# Optional: native page-level encryption (AES-256-GCM) with the key hierarchy
-# (Argon2id + HKDF KEK -> wrapped per-file DEK).
-aes-gcm = { version = "0.10", optional = true }
+# Page-level AES-256-GCM encryption and the key hierarchy
+# (Argon2id + HKDF KEK -> wrapped per-file DEK). Always required.
+aes-gcm = "0.10"
 argon2 = { version = "0.5", default-features = false, features = ["alloc", "password-hash"] }
-hkdf = { version = "0.12", optional = true }
-hmac = { version = "0.12", optional = true }
+hkdf = "0.12"
+hmac = "0.12"
 fs2 = "0.4.3"
 tokio = { version = "1.52.3", features = ["sync", "rt", "time"] }
 
@@ -47,11 +47,6 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 
 [target.'cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple", target_os = "redox"))'.dependencies]
 rustix = { version = "1.1", features = ["fs"] }
-
-[features]
-default = []
-# Enable page-level AES-256-GCM encryption and the key hierarchy.
-encryption = ["dep:aes-gcm", "dep:hkdf", "dep:hmac"]
 
 [dev-dependencies]
 tempfile = "3"
@@ -87,4 +82,3 @@ harness = false
 [[bench]]
 name = "page_encryption"
 harness = false
-required-features = ["encryption"]

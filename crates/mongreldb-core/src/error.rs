@@ -44,7 +44,7 @@ pub enum MongrelError {
     Schema(String),
     #[error("column not found: {0}")]
     ColumnNotFound(String),
-    #[error("encryption is required for this table but the `encryption` feature is disabled")]
+    #[error("encryption is required for this table but no encryption key was provided")]
     EncryptionDisabled,
     #[error("encryption error: {0}")]
     Encryption(String),

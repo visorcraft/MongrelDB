@@ -1,5 +1,4 @@
 //! WAL + cache encryption tests.
-#![cfg(feature = "encryption")]
 
 use mongreldb_core::schema::*;
 use mongreldb_core::{Table, Value};

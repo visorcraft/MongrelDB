@@ -182,7 +182,6 @@ fn compute_run_mac(
     header_bytes: &[u8],
     dir_bytes: &[u8],
 ) -> Option<[u8; RUN_MAC_LEN]> {
-    #[cfg(feature = "encryption")]
     {
         if let Some(e) = enc {
             if let Some(mac_key) = &e.mac_key {
@@ -194,10 +193,6 @@ fn compute_run_mac(
                 ));
             }
         }
-    }
-    #[cfg(not(feature = "encryption"))]
-    {
-        let _ = (enc, header_bytes, dir_bytes);
     }
     None
 }
@@ -1226,7 +1221,6 @@ fn read_encryption_descriptor_bytes_from_file(
 /// tag is missing (a run written before run-metadata MACs existed) or does not
 /// match (tampering, or the wrong key). The on-disk page payloads are AEAD-
 /// authenticated separately, so they are not covered here.
-#[cfg(feature = "encryption")]
 fn verify_run_mac(
     file: &mut File,
     header: &RunHeader,
@@ -1258,17 +1252,6 @@ fn verify_run_mac(
             "run metadata authentication failed — tampered run or wrong key".into(),
         ));
     }
-    Ok(())
-}
-
-#[cfg(not(feature = "encryption"))]
-fn verify_run_mac(
-    _file: &mut File,
-    _header: &RunHeader,
-    _dir: &[ColumnPageHeader],
-    _kek: &Kek,
-    _desc_bytes: &[u8],
-) -> Result<()> {
     Ok(())
 }
 

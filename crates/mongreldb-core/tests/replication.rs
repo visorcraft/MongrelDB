@@ -333,7 +333,6 @@ fn auth_enable_applies_to_the_live_follower_handle() {
     ));
 }
 
-#[cfg(feature = "encryption")]
 #[test]
 fn encrypted_replica_bootstrap_and_incremental_apply() {
     let dir = tempfile::tempdir().unwrap();

@@ -2832,11 +2832,8 @@ fn parse_permission(s: &str) -> napi::Result<mongreldb_core::auth::Permission> {
     })
 }
 
-/// Encrypted constructors. The `encryption` feature is **on by default**; build
-/// with `--no-default-features` to omit it. Kept as a whole separate impl block
-/// because a per-method `#[cfg]` inside a `#[napi] impl` would leave a dangling
-/// `#[napi]` registration symbol when the feature is disabled.
-#[cfg(feature = "encryption")]
+/// Encrypted constructors (page-level AES-256-GCM). Crypto is always available
+/// in mongreldb-core; these factories open/create databases that use it.
 #[napi]
 impl Database {
     /// Create a fresh encrypted database (page-level AES-256-GCM; the database

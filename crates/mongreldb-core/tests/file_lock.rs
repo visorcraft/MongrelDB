@@ -179,7 +179,6 @@ fn concurrent_credentialed_open_has_one_winner() {
     }));
 }
 
-#[cfg(feature = "encryption")]
 #[test]
 fn concurrent_encrypted_open_has_one_winner() {
     let dir = tempdir().unwrap();
@@ -291,7 +290,6 @@ fn failed_credentialed_open_releases_reservation() {
     Database::open_with_credentials(dir.path(), "admin", "correct").unwrap();
 }
 
-#[cfg(feature = "encryption")]
 #[test]
 fn failed_encrypted_open_releases_reservation() {
     let dir = tempdir().unwrap();
@@ -300,7 +298,6 @@ fn failed_encrypted_open_releases_reservation() {
     Database::open_encrypted(dir.path(), "correct").unwrap();
 }
 
-#[cfg(feature = "encryption")]
 #[test]
 fn failed_raw_key_open_releases_reservation() {
     let dir = tempdir().unwrap();

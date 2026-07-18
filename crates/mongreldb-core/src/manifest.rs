@@ -8,7 +8,6 @@
 //! rename so the new manifest is durable across a crash (review fix #19).
 
 use crate::encryption::DEK_LEN;
-#[cfg(feature = "encryption")]
 use crate::encryption::{decrypt_blob, encrypt_blob};
 use crate::{MongrelError, Result};
 use serde::{Deserialize, Serialize};
@@ -342,7 +341,6 @@ fn read_file(file: fs::File, meta_dek: Option<&[u8; META_DEK_LEN]>) -> Result<Ma
     Ok(manifest)
 }
 
-#[cfg(feature = "encryption")]
 fn seal(body: &[u8], meta_dek: Option<&[u8; META_DEK_LEN]>) -> Result<Vec<u8>> {
     match meta_dek {
         Some(dek) => encrypt_blob(dek, body),
@@ -350,22 +348,11 @@ fn seal(body: &[u8], meta_dek: Option<&[u8; META_DEK_LEN]>) -> Result<Vec<u8>> {
     }
 }
 
-#[cfg(not(feature = "encryption"))]
-fn seal(body: &[u8], _meta_dek: Option<&[u8; META_DEK_LEN]>) -> Result<Vec<u8>> {
-    Ok(body.to_vec())
-}
-
-#[cfg(feature = "encryption")]
 fn open_payload(bytes: &[u8], meta_dek: Option<&[u8; META_DEK_LEN]>) -> Result<Vec<u8>> {
     match meta_dek {
         Some(dek) => decrypt_blob(dek, bytes),
         None => Ok(bytes.to_vec()),
     }
-}
-
-#[cfg(not(feature = "encryption"))]
-fn open_payload(bytes: &[u8], _meta_dek: Option<&[u8; META_DEK_LEN]>) -> Result<Vec<u8>> {
-    Ok(bytes.to_vec())
 }
 
 #[cfg(test)]
@@ -492,7 +479,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "encryption")]
     #[test]
     fn encrypted_manifest_roundtrips_and_rejects_wrong_key() {
         let dir = tempdir().unwrap();

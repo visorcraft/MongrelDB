@@ -217,7 +217,6 @@ fn repeated_kill9_cycles_preserve_rows_and_wal_sequence() {
 
 /// The encrypted matrix of the restart cycle: encryption must not change
 /// unclean-shutdown recovery semantics.
-#[cfg(feature = "encryption")]
 #[test]
 fn repeated_kill9_cycles_preserve_rows_and_wal_sequence_encrypted() {
     let dir = TempDir::new().unwrap();

@@ -2528,7 +2528,6 @@ fn parse_idempotency_plaintext(bytes: &[u8]) -> Result<Vec<StoredIdempotencyReco
     decode_idempotency(body)
 }
 
-#[cfg(feature = "encryption")]
 fn seal_idempotency(
     body: &[u8],
     meta_dek: Option<&[u8; crate::catalog::META_DEK_LEN]>,
@@ -2539,20 +2538,6 @@ fn seal_idempotency(
     }
 }
 
-#[cfg(not(feature = "encryption"))]
-fn seal_idempotency(
-    body: &[u8],
-    meta_dek: Option<&[u8; crate::catalog::META_DEK_LEN]>,
-) -> Result<Vec<u8>> {
-    if meta_dek.is_some() {
-        return Err(MongrelError::Encryption(
-            "a metadata key was supplied but the `encryption` feature is disabled".into(),
-        ));
-    }
-    Ok(plaintext_idempotency_frame(body))
-}
-
-#[cfg(feature = "encryption")]
 fn open_idempotency_payload(
     bytes: &[u8],
     meta_dek: Option<&[u8; crate::catalog::META_DEK_LEN]>,
@@ -2570,19 +2555,6 @@ fn open_idempotency_payload(
         }
         None => parse_idempotency_plaintext(bytes),
     }
-}
-
-#[cfg(not(feature = "encryption"))]
-fn open_idempotency_payload(
-    bytes: &[u8],
-    meta_dek: Option<&[u8; crate::catalog::META_DEK_LEN]>,
-) -> Result<Vec<StoredIdempotencyRecord>> {
-    if meta_dek.is_some() {
-        return Err(MongrelError::Encryption(
-            "a metadata key was supplied but the `encryption` feature is disabled".into(),
-        ));
-    }
-    parse_idempotency_plaintext(bytes)
 }
 
 /// Wall-clock microseconds since the Unix epoch (saturating), for expiry.

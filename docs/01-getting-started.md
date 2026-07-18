@@ -52,7 +52,7 @@ mongreldb-query = "0.58.4"  # SQL frontend
 For encryption support, add the `encryption` feature:
 
 ```toml
-mongreldb-core = { version = "0.58.4", features = ["encryption"] }
+mongreldb-core = "0.60.2"
 ```
 
 To build against a local checkout of the engine instead, use path dependencies

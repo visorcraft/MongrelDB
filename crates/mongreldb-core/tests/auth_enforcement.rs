@@ -1083,7 +1083,6 @@ fn old_catalog_without_require_auth_deserializes_to_false() {
 
 /// Encrypted + credentialed databases compose: the passphrase protects the
 /// bytes, the credentials protect the operations.
-#[cfg(feature = "encryption")]
 #[test]
 fn encrypted_and_credentialed_compose() {
     let dir = tempdir().unwrap();
