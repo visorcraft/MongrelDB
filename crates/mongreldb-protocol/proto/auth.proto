@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package mongreldb.v1;
+
+import "common.proto";
+
+service AuthService {
+  rpc Authenticate(AuthenticateRequest) returns (AuthenticateResponse);
+}
+
+message AuthenticateRequest {
+  RequestContext context = 1;
+  oneof credential {
+    PasswordCredential password = 2;
+    ServiceTokenCredential service_token = 3;
+    OidcCredential oidc = 4;
+  }
+}
+
+message PasswordCredential {
+  string username = 1;
+  string password = 2;
+}
+
+message ServiceTokenCredential {
+  string token_id = 1;
+  string secret = 2;
+}
+
+message OidcCredential {
+  string compact_jws = 1;
+}
+
+message AuthenticateResponse {
+  AuthenticatedIdentity identity = 1;
+}

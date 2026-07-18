@@ -27,6 +27,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.1
         with:
           cache-targets: false
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: python3 scripts/verify-component-versions
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -45,6 +46,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.1
         with:
           workspaces: crates/mongreldb-server
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: cargo test --all-targets --all-features
 
   # HTTP client crate (standalone - own workspace). The retention contract
@@ -63,6 +65,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.1
         with:
           workspaces: crates/mongreldb-client
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-targets --all-features
 

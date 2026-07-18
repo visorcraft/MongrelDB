@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package mongreldb.v1;
+
+message Empty {}
+
+message ApiVersion {
+  uint32 major = 1;
+  uint32 minor = 2;
+}
+
+message RequestContext {
+  ApiVersion version = 1;
+  string request_id = 2;
+  uint64 deadline_unix_micros = 3;
+  string idempotency_key = 4;
+}
+
+message ErrorDetail {
+  uint32 category_code = 1;
+  string category = 2;
+  string message = 3;
+  bool retryable = 4;
+  map<string, string> metadata = 5;
+}
+
+message AuthenticatedIdentity {
+  uint64 principal_id = 1;
+  string principal_name = 2;
+  repeated string roles = 3;
+  repeated string scopes = 4;
+}
+
+message ArrowFrame {
+  bytes ipc = 1;
+  uint64 sequence = 2;
+  bool end_of_stream = 3;
+}

@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package mongreldb.v1;
+
+import "common.proto";
+
+service SessionService {
+  rpc OpenSession(OpenSessionRequest) returns (OpenSessionResponse);
+  rpc CloseSession(CloseSessionRequest) returns (Empty);
+}
+
+message OpenSessionRequest {
+  RequestContext context = 1;
+  AuthenticatedIdentity identity = 2;
+  bytes database_id = 3;
+}
+
+message OpenSessionResponse {
+  bytes session_id = 1;
+}
+
+message CloseSessionRequest {
+  RequestContext context = 1;
+  bytes session_id = 2;
+}

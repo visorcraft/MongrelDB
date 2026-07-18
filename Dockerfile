@@ -1,5 +1,9 @@
 FROM rust:1-bookworm AS build
 
+RUN apt-get update \
+	&& apt-get install -y --no-install-recommends protobuf-compiler \
+	&& rm -rf /var/lib/apt/lists/*
+
 WORKDIR /src
 COPY . .
 RUN cargo build --release --locked --manifest-path crates/mongreldb-server/Cargo.toml --bin mongreldb-server

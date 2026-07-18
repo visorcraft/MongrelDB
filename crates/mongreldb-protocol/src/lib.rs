@@ -21,5 +21,11 @@ pub mod request;
 pub mod services;
 pub mod session;
 
+/// Generated Protobuf messages and tonic client/server stubs for the native
+/// HTTP/2 transport.
+pub mod native {
+    tonic::include_proto!("mongreldb.v1");
+}
+
 #[cfg(test)]
 pub(crate) mod test_support;

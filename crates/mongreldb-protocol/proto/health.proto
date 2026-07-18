@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package mongreldb.v1;
+
+import "common.proto";
+
+service HealthService {
+  rpc Status(HealthRequest) returns (HealthResponse);
+}
+
+message HealthRequest {
+  RequestContext context = 1;
+}
+
+message HealthResponse {
+  bool serving = 1;
+  string detail = 2;
+}

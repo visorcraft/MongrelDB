@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package mongreldb.v1;
+
+import "common.proto";
+
+service AdminService {
+  rpc ExecuteAdmin(ExecuteAdminRequest) returns (Empty);
+}
+
+message ExecuteAdminRequest {
+  RequestContext context = 1;
+  bytes session_id = 2;
+  bytes command = 3;
+}

@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+package mongreldb.v1;
+
+import "common.proto";
+
+service CatalogService {
+  rpc GetSchema(GetSchemaRequest) returns (GetSchemaResponse);
+}
+
+message GetSchemaRequest {
+  RequestContext context = 1;
+  bytes database_id = 2;
+  string table = 3;
+}
+
+message ColumnSchema {
+  string name = 1;
+  string data_type = 2;
+  bool nullable = 3;
+}
+
+message GetSchemaResponse {
+  string table = 1;
+  uint64 schema_version = 2;
+  repeated ColumnSchema columns = 3;
+}

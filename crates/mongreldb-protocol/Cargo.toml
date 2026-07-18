@@ -9,5 +9,11 @@ description = "MongrelDB versioned protocol messages and service definitions (S1
 
 [dependencies]
 mongreldb-types = { path = "../mongreldb-types", version = "0.60.3" }
+prost = "0.14"
 serde = { version = "1", features = ["derive"] }
 thiserror = "1"
+tonic = "0.14.6"
+tonic-prost = "0.14.6"
+
+[build-dependencies]
+tonic-prost-build = "0.14.6"

@@ -45,6 +45,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2.9.1
 
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
       # Treat an existing immutable crate version as success. Retry when the
       # crates.io index has not yet observed a just-published dependency, or
       # when crates.io rate-limits new-crate publishes (HTTP 429).
@@ -201,8 +203,7 @@ jobs:
         with:
           workspaces: crates/mongreldb-server
 
-      - if: matrix.apt != ''
-        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt }}
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler ${{ matrix.apt }}
 
       - run: cargo build --release --bin mongreldb-server --target ${{ matrix.target }}
         working-directory: crates/mongreldb-server
@@ -234,6 +235,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.1
         with:
           workspaces: crates/mongreldb-server
+
+      - run: brew install protobuf
 
       - run: cargo build --release --bin mongreldb-server --target x86_64-apple-darwin
         working-directory: crates/mongreldb-server

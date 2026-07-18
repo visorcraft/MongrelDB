@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package mongreldb.v1;
+
+import "common.proto";
+
+service TransactionService {
+  rpc Begin(BeginTransactionRequest) returns (BeginTransactionResponse);
+  rpc Commit(TransactionRequest) returns (Empty);
+  rpc Rollback(TransactionRequest) returns (Empty);
+}
+
+enum IsolationLevel {
+  ISOLATION_LEVEL_UNSPECIFIED = 0;
+  ISOLATION_LEVEL_READ_COMMITTED = 1;
+  ISOLATION_LEVEL_REPEATABLE_READ = 2;
+  ISOLATION_LEVEL_SERIALIZABLE = 3;
+}
+
+message BeginTransactionRequest {
+  RequestContext context = 1;
+  bytes session_id = 2;
+  IsolationLevel isolation = 3;
+}
+
+message BeginTransactionResponse {
+  bytes transaction_id = 1;
+}
+
+message TransactionRequest {
+  RequestContext context = 1;
+  bytes session_id = 2;
+}
