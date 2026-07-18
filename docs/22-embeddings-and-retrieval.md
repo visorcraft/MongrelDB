@@ -9,11 +9,12 @@ storage and ANN indexes never hard-code an external embedding vendor.
 pub enum EmbeddingSource {
     SuppliedByApplication,
     LocalModel {
-        model_path: PathBuf,
+        provider_id: String,
         model_id: String,
+        model_version: String,
     },
     GeneratedColumn {
-        provider: String,
+        spec: GeneratedEmbeddingSpec,
     },
 }
 ```
@@ -21,25 +22,38 @@ pub enum EmbeddingSource {
 | Source | Who produces vectors | Needs registry provider? |
 |--------|----------------------|---------------------------|
 | `SuppliedByApplication` (default) | Client / application | No |
-| `LocalModel` | Kit or operator-loaded local model | Yes (`model_id`) |
-| `GeneratedColumn` | Server-registered provider (local or remote) | Yes (`provider`) |
+| `LocalModel` | Kit or operator-loaded local model | Yes (`provider_id`) |
+| `GeneratedColumn` | Server-registered synchronous provider | Yes (`spec.provider_id`) |
 
 Column catalog metadata may record an optional `embedding_source` on
-`ColumnDef`. Storage still accepts plain `Value::Embedding` arrays on write.
+`ColumnDef`. `GeneratedColumn` stores provider/model identity, model version,
+source columns, input template, dimension, normalization, and failure policy.
+It never stores a node-local model path.
+
+During insert or update, the commit path expands triggers and constraint
+actions, applies write permissions and row-level security, builds canonical
+provider input from the final source cells, reserves AI memory, validates the
+provider result, and stages the vector before any WAL append. Provider failure,
+cancellation, timeout, count mismatch, dimension mismatch, non-finite output,
+or normalization mismatch aborts the complete source write. Replication carries
+the materialized vector, so followers do not invoke the provider.
+
+Only synchronous `AbortWrite` generation is currently exposed. No pending or
+background-generation state is implied.
 
 ## Recommended behavior
 
 1. **Users may supply vectors directly.** This is the default path for dense
    ANN. Dimension and finiteness checks still apply at the write edge.
 2. **MongrelDB-Kit may offer bundled local models.** Register them under a
-   stable `model_id` via `EmbeddingProviderRegistry::register`.
+   stable provider ID via `EmbeddingProviderRegistry::register_new`.
 3. **The server may register local or remote providers.** Process-local
    registry only; nothing is implied about a specific cloud vendor.
 4. **Core storage remains independent of any embedding vendor.** There is no
    built-in OpenAI/Anthropic/etc. client in `mongreldb-core`.
-5. **ANN indexes operate only on vectors and model metadata.** Generations
-   may record `model_id` / source kind via `EmbeddingModelMeta`; the graph
-   itself is built from stored `Value::Embedding` cells.
+5. **ANN indexes operate only on committed vectors.** Provider/model metadata
+   is available through `EmbeddingModelMeta`; the graph itself is built from
+   stored `Value::Embedding` cells.
 6. **Sparse retrieval remains available with no embedding model.** The sparse
    inverted index is model-agnostic (SPLADE-style weights or any tokenizer).
 
@@ -58,6 +72,7 @@ If no real model is available:
 ## APIs
 
 - `mongreldb_core::EmbeddingSource`
+- `mongreldb_core::GeneratedEmbeddingSpec`
 - `mongreldb_core::EmbeddingProvider` / `EmbeddingProviderRegistry`
 - `Database::embedding_providers()`
 - Server: `SHOW RESOURCE GROUPS` includes registered `embedding_providers`

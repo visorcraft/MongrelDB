@@ -10698,6 +10698,7 @@ impl Database {
         txn_id: u64,
         staging: &mut Vec<(u64, crate::txn::Staged)>,
         read_epoch: Epoch,
+        principal: Option<&crate::auth::Principal>,
         control: Option<&crate::ExecutionControl>,
     ) -> Result<()> {
         use crate::constraint::{encode_composite_key, validate_checks, FkAction};
@@ -10707,19 +10708,20 @@ impl Database {
 
         commit_prepare_checkpoint(control, 0)?;
         let snapshot = Snapshot::at(read_epoch);
-        let cat = self.catalog.read();
+        let cat = self.catalog.read().clone();
 
         // Collect live (id, name, constraints-bearing?) for staged tables.
-        let live: Vec<(u64, &str, &crate::schema::Schema)> = cat
+        let live: Vec<(u64, String, crate::schema::Schema)> = cat
             .tables
             .iter()
             .filter(|entry| matches!(entry.state, TableState::Live | TableState::Building { .. }))
-            .map(|e| (e.table_id, e.name.as_str(), &e.schema))
+            .map(|e| (e.table_id, e.name.clone(), e.schema.clone()))
             .collect();
 
         // Fast path: bail if no live table declares any constraints at all.
         let any_constraints = live.iter().any(|(_, _, s)| !s.constraints.is_empty());
         if !any_constraints {
+            self.materialize_generated_embeddings(staging, control)?;
             return Ok(());
         }
 
@@ -10774,7 +10776,7 @@ impl Database {
                 let Some(tname) = live
                     .iter()
                     .find(|(id, _, _)| *id == table_id)
-                    .map(|(_, name, _)| *name)
+                    .map(|(_, name, _)| name.as_str())
                 else {
                     continue;
                 };
@@ -10907,7 +10909,7 @@ impl Database {
                 let Some(tname) = live
                     .iter()
                     .find(|(t, _, _)| *t == table_id)
-                    .map(|(_, n, _)| *n)
+                    .map(|(_, n, _)| n.as_str())
                 else {
                     continue;
                 };
@@ -11015,6 +11017,13 @@ impl Database {
             staging.extend(new_ops);
         }
 
+        // Constraint actions can add writes. Re-authorize the final write set
+        // before generated-value providers receive any row content, then
+        // materialize vectors before Phase B validates the committed cells.
+        self.validate_write_permissions(staging, principal, control)?;
+        self.validate_security_writes(staging, read_epoch, principal, control)?;
+        self.materialize_generated_embeddings(staging, control)?;
+
         // Rows staged for deletion in THIS transaction (now including cascaded
         // deletes). Used to exclude the old version of an updated row from
         // unique-existence scans.
@@ -11032,8 +11041,7 @@ impl Database {
         // ── Phase B: validate the fully-expanded staging set.
         for (operation_index, (table_id, op)) in staging.iter().enumerate() {
             commit_prepare_checkpoint(control, operation_index)?;
-            let Some((_, tname, schema)) = live.iter().find(|(t, _, _)| t == table_id).copied()
-            else {
+            let Some((_, tname, schema)) = live.iter().find(|(t, _, _)| t == table_id) else {
                 continue;
             };
             let cells_map: HashMap<u16, crate::memtable::Value>;
@@ -11166,7 +11174,7 @@ impl Database {
                         };
                         for (child_id, child_name, child_schema) in &live {
                             for fk in &child_schema.constraints.foreign_keys {
-                                if fk.ref_table != tname || fk.on_update != FkAction::Restrict {
+                                if fk.ref_table != *tname || fk.on_update != FkAction::Restrict {
                                     continue;
                                 }
                                 let Some(old_key) =
@@ -11241,7 +11249,7 @@ impl Database {
                     };
                     for (child_id, child_name, child_schema) in &live {
                         for fk in &child_schema.constraints.foreign_keys {
-                            if fk.ref_table != tname || fk.on_delete != FkAction::Restrict {
+                            if fk.ref_table != *tname || fk.on_delete != FkAction::Restrict {
                                 continue;
                             }
                             let Some(parent_key) =
@@ -11275,7 +11283,7 @@ impl Database {
                     // unsupported.
                     for (child_id, child_name, child_schema) in &live {
                         for fk in &child_schema.constraints.foreign_keys {
-                            if fk.ref_table != tname {
+                            if fk.ref_table != *tname {
                                 continue;
                             }
                             let child_rows = load_rows(*child_id)?;
@@ -11559,10 +11567,6 @@ impl Database {
             return Err(MongrelError::ReadOnlyReplica);
         }
         commit_prepare_checkpoint(control, 0)?;
-        // Generated vectors are materialized before any WAL append. Provider
-        // failure therefore aborts the whole source write, while replicas
-        // receive the committed vector and never invoke the provider.
-        self.materialize_generated_embeddings(&mut staging, control)?;
         let observed_security_version = self.security_coordinator.version.load(Ordering::Acquire);
         self.refresh_security_catalog_if_stale(observed_security_version)?;
         let trigger_binding = trigger_catalog_binding(&self.catalog.read());
@@ -11717,13 +11721,23 @@ impl Database {
         // the claim instead of racing to a write-write conflict; the
         // first-committer-wins index below remains the safety net.
         self.acquire_unique_key_claims(txn_id, &staging, control)?;
+        // Fail unauthorized source writes before constraint expansion reads
+        // existing rows. Constraint-generated writes are checked again inside
+        // `validate_constraints` before any embedding provider is invoked.
+        self.validate_write_permissions(&staging, security_principal.as_ref(), control)?;
+        self.validate_security_writes(&staging, read_epoch, security_principal.as_ref(), control)?;
         // Validate declarative constraints (unique / FK / check) under the read
         // snapshot, outside the WAL mutex. Trigger-produced writes are included
         // here, so the batch either satisfies every declared constraint or is
-        // rejected atomically.
-        self.validate_constraints(txn_id, &mut staging, read_epoch, control)?;
-        self.validate_write_permissions(&staging, security_principal.as_ref(), control)?;
-        self.validate_security_writes(&staging, read_epoch, security_principal.as_ref(), control)?;
+        // rejected atomically. This also materializes generated vectors after
+        // all trigger and constraint-action writes exist, but before WAL append.
+        self.validate_constraints(
+            txn_id,
+            &mut staging,
+            read_epoch,
+            security_principal.as_ref(),
+            control,
+        )?;
         let mut normalized = Vec::with_capacity(staging.len() * 2);
         for (staged_index, (table_id, op)) in staging.into_iter().enumerate() {
             commit_prepare_checkpoint(control, staged_index)?;

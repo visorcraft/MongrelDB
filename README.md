@@ -496,7 +496,9 @@ today remain the embedded single-node engine with the optional HTTP daemon
 (whose `GET /wal/stream` follower replication still serves read replicas). See
 [Architecture Foundations](docs/18-architecture-foundations.md) and
 [Single-Node Subsystems](docs/19-single-node-subsystems.md) for the
-user-facing contracts.
+user-facing contracts. See
+[Architecture implementation status](docs/architecture/implementation-status.md)
+for the audit status, evidence gaps, and exact qualification rule.
 
 ## License
 
