@@ -8,10 +8,10 @@
 # npm/crates.io both refuse to republish an existing version, so the tag must
 # be a new version.
 #
-# mongreldb-query is published alongside mongreldb-core (MongrelDB Kit's Rust
-# crate depends on it for its SQL surface — Database::sql()/sql_arrow() and
-# view/analyze/vacuum migration ops). mongreldb-core publishes first, since
-# mongreldb-query depends on it and crates.io strips path deps at publish time.
+# Publish order is bottom-up: crates.io strips path deps at publish time, so
+# each package's versioned path deps must already exist on the index.
+# Foundation (types/fault/sim) → log/protocol → core → query → consensus →
+# cluster → client → server. mongreldb-query ships with core (Kit SQL surface).
 #
 # Job graph (max parallelism, native arch runners — no QEMU):
 #   wave 1 (parallel): publish-crate · image-amd64 · image-arm64
@@ -45,18 +45,44 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2.9.1
 
-      # Local release preparation may publish these first to unblock Kit.
-      # Treat an existing immutable crate version as success.
+      # Treat an existing immutable crate version as success. Retry when the
+      # crates.io index has not yet observed a just-published dependency.
       - name: Publish Rust crates
         run: |
           publish_crate() {
-            local output
-            output="$(cargo publish "$@" 2>&1)" && { echo "$output"; return 0; }
-            echo "$output"
-            echo "$output" | grep -qE 'already exists|already published'
+            local attempt output
+            for attempt in 1 2 3 4 5 6 7 8; do
+              if output="$(cargo publish "$@" 2>&1)"; then
+                echo "$output"
+                return 0
+              fi
+              echo "$output"
+              if echo "$output" | grep -qE 'already exists|already published'; then
+                return 0
+              fi
+              if echo "$output" | grep -qE 'no matching package named|failed to select a version for the requirement'; then
+                echo "dependency not yet on crates.io index (attempt $attempt); sleeping 20s"
+                sleep 20
+                continue
+              fi
+              return 1
+            done
+            return 1
           }
+          # Leaves first (no first-party deps).
+          publish_crate -p mongreldb-types
+          publish_crate -p mongreldb-fault
+          publish_crate -p mongreldb-sim
+          # Depend on types.
+          publish_crate -p mongreldb-log
+          publish_crate -p mongreldb-protocol
+          # Core + query (query depends on core + types).
           publish_crate -p mongreldb-core
           publish_crate -p mongreldb-query
+          # Cluster stack (consensus → cluster; both need core foundation).
+          publish_crate -p mongreldb-consensus
+          publish_crate -p mongreldb-cluster
+          # Standalone crates (not workspace members).
           publish_crate --manifest-path crates/mongreldb-client/Cargo.toml
           publish_crate --manifest-path crates/mongreldb-server/Cargo.toml
         env:
