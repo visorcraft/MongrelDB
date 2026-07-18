@@ -9,8 +9,9 @@ Checks, in order:
    crate workspace: every first-party package built from this repository
    (source == null) reports the workspace version.
 3. Standalone workspaces that resolve the published mongreldb-kit train agree
-   on one kit version; agreement of the resolved core/query/kit/kit-core
-   components is delegated to verify-release-component-versions.py.
+   on one kit version. Engine packages (core/query) must match the workspace
+   train; kit packages may lag/lead and are only checked for internal
+   agreement via verify-release-component-versions.py.
 """
 
 import json
@@ -157,7 +158,9 @@ def main() -> None:
                 f" {sorted(kit_versions)}"
             )
             failed = True
-        elif kit_versions and delegate_kit_train(kit_files, kit_versions.pop()):
+        elif kit_files and delegate_kit_train(kit_files, expected):
+            # Pass the engine workspace version as --expected. Kit may lag;
+            # the release train script only requires kit internal agreement.
             failed = True
     if failed:
         raise SystemExit(1)

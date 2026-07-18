@@ -2229,9 +2229,9 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-kit-core"
-version = "0.60.0"
+version = "0.60.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0bb386354669ae60dd96d497fc16c23426444b9928beffbad7f2c888ea1bc11a"
+checksum = "8ed95a6db809cd709c25d7ec2d7e2b8f41739570521f0864c87622a99ebeae36"
 dependencies = [
  "hex",
  "regex",
@@ -2966,7 +2966,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys",

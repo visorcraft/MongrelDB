@@ -25,8 +25,8 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 # upstream Kit crate.
 # crates.io kit; monorepo engine patches below force the ANN checkpoint fix
 # (and other core/query fixes) without a sibling mongreldb-kit checkout.
-kit = { package = "mongreldb-kit", version = "=0.60.0" }
-mongreldb-kit-core = "=0.60.0"
+kit = { package = "mongreldb-kit", version = "=0.60.2" }
+mongreldb-kit-core = "=0.60.2"
 parking_lot = "0.12"
 serde_json = { version = "1", features = ["preserve_order"] }
 
