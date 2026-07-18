@@ -2102,6 +2102,26 @@ impl Table {
                 db.sparse = loaded.sparse;
                 db.minhash = loaded.minhash;
                 db.learned_range = Arc::new(loaded.learned_range);
+                // Checkpoints omit empty secondary indexes (e.g. ANN with no
+                // vectors yet). Re-seed any schema-declared maps that were
+                // skipped so retrievers like ANN do not fail with "has no
+                // ANN index" after reopen.
+                let (bitmap0, ann0, fm0, sparse0, minhash0) = empty_indexes(&db.schema);
+                for (cid, idx) in bitmap0 {
+                    db.bitmap.entry(cid).or_insert(idx);
+                }
+                for (cid, idx) in ann0 {
+                    db.ann.entry(cid).or_insert(idx);
+                }
+                for (cid, idx) in fm0 {
+                    db.fm.entry(cid).or_insert(idx);
+                }
+                for (cid, idx) in sparse0 {
+                    db.sparse.entry(cid).or_insert(idx);
+                }
+                for (cid, idx) in minhash0 {
+                    db.minhash.entry(cid).or_insert(idx);
+                }
                 // `pk_by_row` stays lazy (`pk_by_row_complete == false`): the
                 // first delete rebuilds it from the loaded HOT.
             }
