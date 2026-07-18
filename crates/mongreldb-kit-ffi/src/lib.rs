@@ -38,9 +38,11 @@ pub mod sql;
 // ── re-exports ────────────────────────────────────────────────────────────
 pub use build_info::mongreldb_kit_build_info;
 pub use database::{
-    mongreldb_kit_create, mongreldb_kit_create_encrypted, mongreldb_kit_create_with_credentials,
+    mongreldb_kit_create, mongreldb_kit_create_encrypted,
+    mongreldb_kit_create_encrypted_with_credentials, mongreldb_kit_create_with_credentials,
     mongreldb_kit_database_free, mongreldb_kit_open, mongreldb_kit_open_encrypted,
-    mongreldb_kit_open_with_credentials, mongreldb_kit_refresh_sql_session,
+    mongreldb_kit_open_encrypted_with_credentials, mongreldb_kit_open_with_credentials,
+    mongreldb_kit_refresh_sql_session,
 };
 pub use error::{
     mongreldb_kit_free_error_string, mongreldb_kit_free_json, mongreldb_kit_last_error,

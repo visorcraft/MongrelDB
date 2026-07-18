@@ -270,6 +270,107 @@ pub unsafe extern "C" fn mongreldb_kit_create_with_credentials(
     }
 }
 
+/// Open an encrypted Kit database with passphrase + credentials.
+///
+/// # Safety
+/// All arguments must be NUL-terminated UTF-8 C strings.
+#[no_mangle]
+pub unsafe extern "C" fn mongreldb_kit_open_encrypted_with_credentials(
+    path: *const c_char,
+    passphrase: *const c_char,
+    user: *const c_char,
+    password: *const c_char,
+) -> mongreldb_kit_database_t {
+    clear();
+    let path_str = match parse_cstr(path, "path") {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let pass = match parse_cstr(passphrase, "passphrase") {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let user = match parse_cstr(user, "user") {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let password = match parse_cstr(password, "password") {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    match KitDatabase::open_encrypted_with_credentials(Path::new(path_str), pass, user, password) {
+        Ok(db) => FFIKitDatabase {
+            db: Rc::new(RefCell::new(db)),
+        }
+        .into_handle(),
+        Err(e) => {
+            set_error(&e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Create an encrypted Kit database with passphrase + admin credentials.
+///
+/// # Safety
+/// All arguments must be NUL-terminated UTF-8 C strings.
+#[no_mangle]
+pub unsafe extern "C" fn mongreldb_kit_create_encrypted_with_credentials(
+    path: *const c_char,
+    schema_json: *const c_char,
+    passphrase: *const c_char,
+    admin_user: *const c_char,
+    admin_password: *const c_char,
+) -> mongreldb_kit_database_t {
+    clear();
+    let path_str = match parse_cstr(path, "path") {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let schema_str = match parse_cstr(schema_json, "schema_json") {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let pass = match parse_cstr(passphrase, "passphrase") {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let admin_user = match parse_cstr(admin_user, "admin_user") {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let admin_password = match parse_cstr(admin_password, "admin_password") {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let schema: kit::Schema = match serde_json::from_str(schema_str) {
+        Ok(s) => s,
+        Err(e) => {
+            set_error_msg(
+                KitErrorCode::Schema,
+                format!("failed to parse schema_json: {e}"),
+            );
+            return std::ptr::null_mut();
+        }
+    };
+    match KitDatabase::create_encrypted_with_credentials(
+        Path::new(path_str),
+        schema,
+        pass,
+        admin_user,
+        admin_password,
+    ) {
+        Ok(db) => FFIKitDatabase {
+            db: Rc::new(RefCell::new(db)),
+        }
+        .into_handle(),
+        Err(e) => {
+            set_error(&e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
 /// Rebuild the cached SQL session so it sees the current table set. Call after
 /// a migration that creates or drops tables. Returns 0 on success.
 ///

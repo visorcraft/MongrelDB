@@ -66,6 +66,82 @@ public class NativeDB implements AutoCloseable {
         return db;
     }
 
+    /** Opens an AES-256-GCM encrypted database with a passphrase. */
+    public static NativeDB openEncrypted(String path, String passphrase) {
+        ensureNative();
+        long h = nativeOpenEncrypted(path, passphrase);
+        if (h == 0) {
+            throw new RuntimeException("Failed to open encrypted database: " + path);
+        }
+        NativeDB db = new NativeDB();
+        db.handle = h;
+        return db;
+    }
+
+    /** Creates an AES-256-GCM encrypted database with a passphrase. */
+    public static NativeDB createEncrypted(String path, String schemaJson, String passphrase) {
+        ensureNative();
+        long h = nativeCreateEncrypted(path, schemaJson, passphrase);
+        if (h == 0) {
+            throw new RuntimeException("Failed to create encrypted database: " + path);
+        }
+        NativeDB db = new NativeDB();
+        db.handle = h;
+        return db;
+    }
+
+    /** Opens a database with storage-layer username/password credentials. */
+    public static NativeDB openWithCredentials(String path, String username, String password) {
+        ensureNative();
+        long h = nativeOpenWithCredentials(path, username, password);
+        if (h == 0) {
+            throw new RuntimeException("Failed to open credentialed database: " + path);
+        }
+        NativeDB db = new NativeDB();
+        db.handle = h;
+        return db;
+    }
+
+    /** Creates a credentialed database (require_auth + admin user). */
+    public static NativeDB createWithCredentials(
+            String path, String schemaJson, String username, String password) {
+        ensureNative();
+        long h = nativeCreateWithCredentials(path, schemaJson, username, password);
+        if (h == 0) {
+            throw new RuntimeException("Failed to create credentialed database: " + path);
+        }
+        NativeDB db = new NativeDB();
+        db.handle = h;
+        return db;
+    }
+
+    /** Opens encrypted + credentialed database (passphrase and username/password). */
+    public static NativeDB openEncryptedWithCredentials(
+            String path, String passphrase, String username, String password) {
+        ensureNative();
+        long h = nativeOpenEncryptedWithCredentials(path, passphrase, username, password);
+        if (h == 0) {
+            throw new RuntimeException("Failed to open encrypted credentialed database: " + path);
+        }
+        NativeDB db = new NativeDB();
+        db.handle = h;
+        return db;
+    }
+
+    /** Creates encrypted + credentialed database (passphrase and admin user). */
+    public static NativeDB createEncryptedWithCredentials(
+            String path, String schemaJson, String passphrase, String username, String password) {
+        ensureNative();
+        long h = nativeCreateEncryptedWithCredentials(
+                path, schemaJson, passphrase, username, password);
+        if (h == 0) {
+            throw new RuntimeException("Failed to create encrypted credentialed database: " + path);
+        }
+        NativeDB db = new NativeDB();
+        db.handle = h;
+        return db;
+    }
+
     private NativeDB() {}
 
     /**
@@ -182,6 +258,17 @@ public class NativeDB implements AutoCloseable {
     private static native long nativeOpen(String path);
     private static native String nativeBuildInfo();
     private static native long nativeCreate(String path, String schemaJson);
+    private static native long nativeOpenEncrypted(String path, String passphrase);
+    private static native long nativeCreateEncrypted(
+            String path, String schemaJson, String passphrase);
+    private static native long nativeOpenWithCredentials(
+            String path, String username, String password);
+    private static native long nativeCreateWithCredentials(
+            String path, String schemaJson, String username, String password);
+    private static native long nativeOpenEncryptedWithCredentials(
+            String path, String passphrase, String username, String password);
+    private static native long nativeCreateEncryptedWithCredentials(
+            String path, String schemaJson, String passphrase, String username, String password);
     private static native void nativeClose(long handle);
     private static native String nativeSqlRows(long handle, String sql);
     private static native byte[] nativeSqlArrow(long handle, String sql);

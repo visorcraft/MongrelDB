@@ -149,6 +149,199 @@ pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativ
     }
 }
 
+/// Open encrypted Kit database. Java: `native long nativeOpenEncrypted(String path, String passphrase)`.
+#[no_mangle]
+pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeOpenEncrypted(
+    mut env: JNIEnv,
+    _class: JClass,
+    path: JString,
+    passphrase: JString,
+) -> jlong {
+    let path_str = jstring_to_string(&mut env, path);
+    let pass = jstring_to_string(&mut env, passphrase);
+    match KitDatabase::open_encrypted(Path::new(&path_str), &pass) {
+        Ok(db) => db_to_handle(JniDatabase {
+            db: Rc::new(RefCell::new(db)),
+        }),
+        Err(e) => {
+            throw_kit_error(&mut env, &e);
+            0
+        }
+    }
+}
+
+/// Create encrypted Kit database.
+/// Java: `native long nativeCreateEncrypted(String path, String schemaJson, String passphrase)`.
+#[no_mangle]
+pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeCreateEncrypted(
+    mut env: JNIEnv,
+    _class: JClass,
+    path: JString,
+    schema_json: JString,
+    passphrase: JString,
+) -> jlong {
+    let path_str = jstring_to_string(&mut env, path);
+    let schema_str = jstring_to_string(&mut env, schema_json);
+    let pass = jstring_to_string(&mut env, passphrase);
+    let schema: mongreldb_kit::Schema = match serde_json::from_str(&schema_str) {
+        Ok(s) => s,
+        Err(e) => {
+            throw_java(
+                &mut env,
+                "com/visorcraft/mongreldb/QueryException",
+                &format!("failed to parse schema JSON: {e}"),
+            );
+            return 0;
+        }
+    };
+    match KitDatabase::create_encrypted(Path::new(&path_str), schema, &pass) {
+        Ok(db) => db_to_handle(JniDatabase {
+            db: Rc::new(RefCell::new(db)),
+        }),
+        Err(e) => {
+            throw_kit_error(&mut env, &e);
+            0
+        }
+    }
+}
+
+/// Open with credentials. Java: `native long nativeOpenWithCredentials(String path, String user, String password)`.
+#[no_mangle]
+pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeOpenWithCredentials(
+    mut env: JNIEnv,
+    _class: JClass,
+    path: JString,
+    user: JString,
+    password: JString,
+) -> jlong {
+    let path_str = jstring_to_string(&mut env, path);
+    let user_str = jstring_to_string(&mut env, user);
+    let pass_str = jstring_to_string(&mut env, password);
+    match KitDatabase::open_with_credentials(Path::new(&path_str), &user_str, &pass_str) {
+        Ok(db) => db_to_handle(JniDatabase {
+            db: Rc::new(RefCell::new(db)),
+        }),
+        Err(e) => {
+            throw_kit_error(&mut env, &e);
+            0
+        }
+    }
+}
+
+/// Create with credentials.
+/// Java: `native long nativeCreateWithCredentials(String path, String schemaJson, String user, String password)`.
+#[no_mangle]
+pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeCreateWithCredentials(
+    mut env: JNIEnv,
+    _class: JClass,
+    path: JString,
+    schema_json: JString,
+    user: JString,
+    password: JString,
+) -> jlong {
+    let path_str = jstring_to_string(&mut env, path);
+    let schema_str = jstring_to_string(&mut env, schema_json);
+    let user_str = jstring_to_string(&mut env, user);
+    let pass_str = jstring_to_string(&mut env, password);
+    let schema: mongreldb_kit::Schema = match serde_json::from_str(&schema_str) {
+        Ok(s) => s,
+        Err(e) => {
+            throw_java(
+                &mut env,
+                "com/visorcraft/mongreldb/QueryException",
+                &format!("failed to parse schema JSON: {e}"),
+            );
+            return 0;
+        }
+    };
+    match KitDatabase::create_with_credentials(Path::new(&path_str), schema, &user_str, &pass_str)
+    {
+        Ok(db) => db_to_handle(JniDatabase {
+            db: Rc::new(RefCell::new(db)),
+        }),
+        Err(e) => {
+            throw_kit_error(&mut env, &e);
+            0
+        }
+    }
+}
+
+/// Open encrypted + credentials.
+/// Java: `native long nativeOpenEncryptedWithCredentials(String path, String passphrase, String user, String password)`.
+#[no_mangle]
+pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeOpenEncryptedWithCredentials(
+    mut env: JNIEnv,
+    _class: JClass,
+    path: JString,
+    passphrase: JString,
+    user: JString,
+    password: JString,
+) -> jlong {
+    let path_str = jstring_to_string(&mut env, path);
+    let pass = jstring_to_string(&mut env, passphrase);
+    let user_str = jstring_to_string(&mut env, user);
+    let pass_str = jstring_to_string(&mut env, password);
+    match KitDatabase::open_encrypted_with_credentials(
+        Path::new(&path_str),
+        &pass,
+        &user_str,
+        &pass_str,
+    ) {
+        Ok(db) => db_to_handle(JniDatabase {
+            db: Rc::new(RefCell::new(db)),
+        }),
+        Err(e) => {
+            throw_kit_error(&mut env, &e);
+            0
+        }
+    }
+}
+
+/// Create encrypted + credentials.
+/// Java: `native long nativeCreateEncryptedWithCredentials(String path, String schemaJson, String passphrase, String user, String password)`.
+#[no_mangle]
+pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeCreateEncryptedWithCredentials(
+    mut env: JNIEnv,
+    _class: JClass,
+    path: JString,
+    schema_json: JString,
+    passphrase: JString,
+    user: JString,
+    password: JString,
+) -> jlong {
+    let path_str = jstring_to_string(&mut env, path);
+    let schema_str = jstring_to_string(&mut env, schema_json);
+    let pass = jstring_to_string(&mut env, passphrase);
+    let user_str = jstring_to_string(&mut env, user);
+    let pass_str = jstring_to_string(&mut env, password);
+    let schema: mongreldb_kit::Schema = match serde_json::from_str(&schema_str) {
+        Ok(s) => s,
+        Err(e) => {
+            throw_java(
+                &mut env,
+                "com/visorcraft/mongreldb/QueryException",
+                &format!("failed to parse schema JSON: {e}"),
+            );
+            return 0;
+        }
+    };
+    match KitDatabase::create_encrypted_with_credentials(
+        Path::new(&path_str),
+        schema,
+        &pass,
+        &user_str,
+        &pass_str,
+    ) {
+        Ok(db) => db_to_handle(JniDatabase {
+            db: Rc::new(RefCell::new(db)),
+        }),
+        Err(e) => {
+            throw_kit_error(&mut env, &e);
+            0
+        }
+    }
+}
+
 /// Closes and frees the database handle. Java: `native void close(long handle)`.
 #[no_mangle]
 pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativeClose(

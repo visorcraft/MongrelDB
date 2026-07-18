@@ -72,6 +72,14 @@ mongreldb_kit_database_t *mongreldb_kit_create_with_credentials(
     const char *path, const char *schema_json,
     const char *admin_user, const char *admin_password);
 
+/* Encrypted + credentials (AES-256-GCM at rest + require_auth admin). */
+mongreldb_kit_database_t *mongreldb_kit_open_encrypted_with_credentials(
+    const char *path, const char *passphrase,
+    const char *user, const char *password);
+mongreldb_kit_database_t *mongreldb_kit_create_encrypted_with_credentials(
+    const char *path, const char *schema_json, const char *passphrase,
+    const char *admin_user, const char *admin_password);
+
 /* Rebuild the SQL session after schema changes. Returns MDB_OK (0) on success. */
 int32_t mongreldb_kit_refresh_sql_session(mongreldb_kit_database_t *db);
 
