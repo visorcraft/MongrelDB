@@ -46,12 +46,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.1
 
       # Treat an existing immutable crate version as success. Retry when the
-      # crates.io index has not yet observed a just-published dependency.
+      # crates.io index has not yet observed a just-published dependency, or
+      # when crates.io rate-limits new-crate publishes (HTTP 429).
       - name: Publish Rust crates
         run: |
           publish_crate() {
-            local attempt output
-            for attempt in 1 2 3 4 5 6 7 8; do
+            local attempt output wait_until now sleep_s
+            for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
               if output="$(cargo publish "$@" 2>&1)"; then
                 echo "$output"
                 return 0
@@ -63,6 +64,22 @@ jobs:
               if echo "$output" | grep -qE 'no matching package named|failed to select a version for the requirement'; then
                 echo "dependency not yet on crates.io index (attempt $attempt); sleeping 20s"
                 sleep 20
+                continue
+              fi
+              if echo "$output" | grep -qE 'status 429|Too Many Requests'; then
+                # Prefer the Retry-After wall-clock in the error body when present.
+                wait_until="$(echo "$output" | sed -n 's/.*try again after \([^ ]* [^ ]* [^ ]* [^ ]* [^ ]*\).*/\1/p' | head -1)"
+                if [ -n "$wait_until" ]; then
+                  now="$(date -u +%s)"
+                  sleep_s=$(( $(date -u -d "$wait_until" +%s 2>/dev/null || echo "$now") - now + 15 ))
+                  if [ "$sleep_s" -lt 30 ]; then sleep_s=30; fi
+                  if [ "$sleep_s" -gt 900 ]; then sleep_s=900; fi
+                  echo "crates.io rate limit (attempt $attempt); sleeping ${sleep_s}s until after $wait_until"
+                  sleep "$sleep_s"
+                else
+                  echo "crates.io rate limit (attempt $attempt); sleeping 120s"
+                  sleep 120
+                fi
                 continue
               fi
               return 1
