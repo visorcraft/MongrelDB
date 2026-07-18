@@ -17,7 +17,10 @@
 #![deny(clippy::all)]
 
 use base64::Engine as _;
-use mongreldb_core::query::{AnnRerankRequest, Condition, Query, VectorMetric};
+use mongreldb_core::query::{
+    AnnRerankRequest, Condition, Fusion, NamedRetriever, Query, Rerank, Retriever, SearchRequest,
+    SetMember, VectorMetric,
+};
 use mongreldb_core::schema::{
     AlterColumn, ColumnDef, ColumnFlags, DefaultExpr, IndexDef, IndexKind, Schema, TypeId,
 };
@@ -1033,6 +1036,193 @@ fn build_conditions(specs: &[ConditionSpec]) -> napi::Result<Vec<Condition>> {
     specs.iter().map(build_condition).collect()
 }
 
+fn finite_f32s(values: &[f64], field: &str) -> napi::Result<Vec<f32>> {
+    values
+        .iter()
+        .map(|value| {
+            let value = *value as f32;
+            value.is_finite().then_some(value).ok_or_else(|| {
+                napi::Error::new(
+                    napi::Status::InvalidArg,
+                    format!("{field} values must be finite"),
+                )
+            })
+        })
+        .collect()
+}
+
+fn build_search_request(spec: &SearchSpecJs) -> napi::Result<SearchRequest> {
+    let limit = spec.limit as usize;
+    if limit == 0 || limit > mongreldb_core::query::MAX_FINAL_LIMIT {
+        return Err(napi::Error::new(
+            napi::Status::InvalidArg,
+            format!(
+                "search limit must be between 1 and {}",
+                mongreldb_core::query::MAX_FINAL_LIMIT
+            ),
+        ));
+    }
+    if spec.retrievers.is_empty() {
+        return Err(napi::Error::new(
+            napi::Status::InvalidArg,
+            "search requires at least one retriever",
+        ));
+    }
+    let must = match &spec.must {
+        Some(conds) => build_conditions(conds)?,
+        None => Vec::new(),
+    };
+    let mut retrievers = Vec::with_capacity(spec.retrievers.len());
+    for r in &spec.retrievers {
+        let k = r.k as usize;
+        if k == 0 || k > mongreldb_core::query::MAX_RETRIEVER_K {
+            return Err(napi::Error::new(
+                napi::Status::InvalidArg,
+                format!(
+                    "retriever k must be between 1 and {}",
+                    mongreldb_core::query::MAX_RETRIEVER_K
+                ),
+            ));
+        }
+        if r.name.is_empty() || r.name.len() > mongreldb_core::query::MAX_RETRIEVER_NAME_BYTES {
+            return Err(napi::Error::new(
+                napi::Status::InvalidArg,
+                "retriever name must be non-empty and within the byte limit",
+            ));
+        }
+        if !r.weight.is_finite()
+            || r.weight < 0.0
+            || r.weight > mongreldb_core::query::MAX_RETRIEVER_WEIGHT
+        {
+            return Err(napi::Error::new(
+                napi::Status::InvalidArg,
+                "retriever weight must be finite, non-negative, and within limit",
+            ));
+        }
+        let retriever = match r.kind.as_str() {
+            "ann" => {
+                let embedding = r.embedding.as_ref().ok_or_else(|| {
+                    napi::Error::new(napi::Status::InvalidArg, "ann retriever requires embedding")
+                })?;
+                let query = finite_f32s(embedding, "embedding")?;
+                if query.is_empty() {
+                    return Err(napi::Error::new(
+                        napi::Status::InvalidArg,
+                        "ann retriever requires a non-empty embedding",
+                    ));
+                }
+                Retriever::Ann {
+                    column_id: r.column_id,
+                    query,
+                    k,
+                }
+            }
+            "sparse" => {
+                let tokens = r.sparse_tokens.clone().unwrap_or_default();
+                let weights = r.sparse_weights.clone().unwrap_or_default();
+                if tokens.len() != weights.len() && !weights.is_empty() {
+                    return Err(napi::Error::new(
+                        napi::Status::InvalidArg,
+                        "sparse_tokens and sparse_weights length mismatch",
+                    ));
+                }
+                let query: Vec<(u32, f32)> = if weights.is_empty() {
+                    tokens.into_iter().map(|t| (t, 1.0)).collect()
+                } else {
+                    tokens
+                        .into_iter()
+                        .zip(weights)
+                        .map(|(t, w)| (t, w as f32))
+                        .collect()
+                };
+                Retriever::Sparse {
+                    column_id: r.column_id,
+                    query,
+                    k,
+                }
+            }
+            "minhash" => {
+                let members = r
+                    .members
+                    .clone()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(SetMember::String)
+                    .collect();
+                Retriever::MinHash {
+                    column_id: r.column_id,
+                    members,
+                    k,
+                }
+            }
+            other => {
+                return Err(napi::Error::new(
+                    napi::Status::InvalidArg,
+                    format!("unknown retriever kind {other:?}; expected ann, sparse, or minhash"),
+                ))
+            }
+        };
+        retrievers.push(NamedRetriever {
+            name: r.name.clone(),
+            weight: r.weight,
+            retriever,
+        });
+    }
+    let fusion = Fusion::ReciprocalRank {
+        constant: spec.fusion_constant.unwrap_or(60).max(1),
+    };
+    let rerank = match &spec.rerank {
+        None => None,
+        Some(rr) => {
+            let candidate_limit = rr.candidate_limit as usize;
+            if candidate_limit < limit || candidate_limit > mongreldb_core::query::MAX_RETRIEVER_K {
+                return Err(napi::Error::new(
+                    napi::Status::InvalidArg,
+                    "rerank candidate_limit is out of range",
+                ));
+            }
+            let metric = match rr.metric.as_str() {
+                "cosine" => VectorMetric::Cosine,
+                "dot_product" | "dot" => VectorMetric::DotProduct,
+                "euclidean" | "l2" => VectorMetric::Euclidean,
+                _ => {
+                    return Err(napi::Error::new(
+                        napi::Status::InvalidArg,
+                        "metric must be cosine, dot_product, or euclidean",
+                    ))
+                }
+            };
+            Some(Rerank::ExactVector {
+                embedding_column: rr.embedding_column,
+                query: finite_f32s(&rr.query, "rerank query")?,
+                metric,
+                candidate_limit,
+                weight: rr.weight,
+            })
+        }
+    };
+    let projection = spec.projection.clone();
+    if let Some(proj) = &projection {
+        if proj.len() > mongreldb_core::query::MAX_PROJECTION_COLUMNS {
+            return Err(napi::Error::new(
+                napi::Status::InvalidArg,
+                format!(
+                    "projection exceeds {} columns",
+                    mongreldb_core::query::MAX_PROJECTION_COLUMNS
+                ),
+            ));
+        }
+    }
+    Ok(SearchRequest {
+        must,
+        retrievers,
+        fusion,
+        rerank,
+        limit,
+        projection,
+    })
+}
+
 #[cfg(test)]
 mod condition_limit_tests {
     use super::*;
@@ -1131,6 +1321,65 @@ pub struct AnnRerankHitJs {
     pub row_id: BigInt,
     pub hamming_distance: u32,
     pub exact_score: f64,
+}
+
+/// One named retriever for [`NativeTable::search`].
+///
+/// `kind`: `"ann" | "sparse" | "minhash"`.
+#[napi(object)]
+pub struct RetrieverSpecJs {
+    pub kind: String,
+    pub column_id: u16,
+    pub name: String,
+    pub weight: f64,
+    pub k: u32,
+    pub embedding: Option<Vec<f64>>,
+    pub sparse_tokens: Option<Vec<u32>>,
+    pub sparse_weights: Option<Vec<f64>>,
+    pub members: Option<Vec<String>>,
+}
+
+/// Optional exact-vector rerank after fusion.
+#[napi(object)]
+pub struct RerankSpecJs {
+    pub embedding_column: u16,
+    pub query: Vec<f64>,
+    /// `"cosine" | "dot_product" | "euclidean"`.
+    pub metric: String,
+    pub candidate_limit: u32,
+    pub weight: f64,
+}
+
+/// Hybrid search request for [`NativeTable::search`].
+#[napi(object)]
+pub struct SearchSpecJs {
+    pub must: Option<Vec<ConditionSpec>>,
+    pub retrievers: Vec<RetrieverSpecJs>,
+    /// Reciprocal-rank fusion constant (default 60).
+    pub fusion_constant: Option<u32>,
+    pub rerank: Option<RerankSpecJs>,
+    pub limit: u32,
+    pub projection: Option<Vec<u16>>,
+}
+
+#[napi(object)]
+pub struct SearchComponentJs {
+    pub retriever_name: String,
+    pub rank: u32,
+    pub raw_score_kind: String,
+    pub raw_score_value: f64,
+    pub contribution: f64,
+}
+
+#[napi(object)]
+pub struct SearchHitJs {
+    pub row_id: BigInt,
+    pub cells: RowJs,
+    pub fused_score: f64,
+    pub final_score: f64,
+    pub final_rank: u32,
+    pub exact_rerank_score: Option<f64>,
+    pub components: Vec<SearchComponentJs>,
 }
 
 #[napi(object)]
@@ -3399,6 +3648,69 @@ impl TableHandle {
         let handle = self.core()?.table(&self.name).map_err(to_napi)?;
         let g = handle.lock();
         Ok(rows.iter().map(|r| row_to_js_table(&g, r)).collect())
+    }
+
+    /// Hybrid scored search: retrievers + reciprocal-rank fusion + optional
+    /// exact-vector rerank. Same engine path as C `mongreldb_table_search`,
+    /// Kit `Transaction::search`, and daemon `POST /kit/search`.
+    #[napi]
+    pub fn search(&self, request: SearchSpecJs) -> napi::Result<Vec<SearchHitJs>> {
+        let core_request = build_search_request(&request)?;
+        let hits = self
+            .core()?
+            .search_for_current_principal(&self.name, &core_request)
+            .map_err(to_napi)?;
+        let handle = self.core()?.table(&self.name).map_err(to_napi)?;
+        let g = handle.lock();
+        Ok(hits
+            .into_iter()
+            .map(|hit| {
+                let mut row = std::collections::HashMap::new();
+                for (id, value) in &hit.cells {
+                    row.insert(*id, value.clone());
+                }
+                // Reuse row_to_js_table via a temporary memtable row.
+                let core_row = mongreldb_core::memtable::Row {
+                    row_id: hit.row_id,
+                    committed_epoch: mongreldb_core::Epoch(0),
+                    columns: row,
+                    deleted: false,
+                };
+                let cells = row_to_js_table(&g, &core_row);
+                SearchHitJs {
+                    row_id: BigInt::from(hit.row_id.0),
+                    cells,
+                    fused_score: hit.fused_score,
+                    final_score: hit.final_score,
+                    final_rank: hit.final_rank as u32,
+                    exact_rerank_score: hit.exact_rerank_score.map(f64::from),
+                    components: hit
+                        .components
+                        .iter()
+                        .map(|c| {
+                            let (kind, value) = match c.raw_score {
+                                mongreldb_core::query::RetrieverScore::AnnHammingDistance(d) => {
+                                    ("ann_hamming_distance".into(), f64::from(d))
+                                }
+                                mongreldb_core::query::RetrieverScore::SparseDotProduct(v) => {
+                                    ("sparse_dot_product".into(), v)
+                                }
+                                mongreldb_core::query::RetrieverScore::MinHashEstimatedJaccard(
+                                    v,
+                                ) => ("minhash_estimated_jaccard".into(), f64::from(v)),
+                            };
+                            SearchComponentJs {
+                                retriever_name: c.retriever_name.to_string(),
+                                rank: c.rank as u32,
+                                raw_score_kind: kind,
+                                raw_score_value: value,
+                                contribution: c.contribution,
+                            }
+                        })
+                        .collect(),
+                }
+            })
+            .collect())
     }
 
     /// Return one stable row-id-ordered page. Each page keeps the native query
