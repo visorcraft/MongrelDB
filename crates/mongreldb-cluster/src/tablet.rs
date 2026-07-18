@@ -492,6 +492,31 @@ pub enum ReplicaRole {
     /// Non-voting member receiving the log; promoted to voter during the
     /// movement protocol (spec section 12.7).
     Learner,
+    /// Non-voting specialized read replica (spec §13.5, Stage 4E).
+    ReadReplica,
+    /// Non-voting AI-optimized read replica (larger ANN indexes).
+    AiReadReplica,
+    /// Non-voting analytics replica (columnar projections, longer history).
+    AnalyticsReplica,
+    /// Non-voting backup replica (snapshot retention).
+    BackupReplica,
+}
+
+impl ReplicaRole {
+    /// Whether this role counts toward Raft quorum (only [`Self::Voter`]).
+    pub const fn counts_toward_quorum(self) -> bool {
+        matches!(self, Self::Voter)
+    }
+
+    /// Whether the replica applies the committed log (all roles do).
+    pub const fn applies_log(self) -> bool {
+        true
+    }
+
+    /// Whether lag-based routing may select this replica for reads.
+    pub const fn serves_reads(self) -> bool {
+        !matches!(self, Self::BackupReplica)
+    }
 }
 
 impl fmt::Display for ReplicaRole {
@@ -499,6 +524,10 @@ impl fmt::Display for ReplicaRole {
         let name = match self {
             Self::Voter => "Voter",
             Self::Learner => "Learner",
+            Self::ReadReplica => "ReadReplica",
+            Self::AiReadReplica => "AiReadReplica",
+            Self::AnalyticsReplica => "AnalyticsReplica",
+            Self::BackupReplica => "BackupReplica",
         };
         f.write_str(name)
     }
@@ -1520,12 +1549,17 @@ pub fn check_generation(
     }
     let tablet_id = descriptor.tablet_id;
     let current_generation = descriptor.generation;
+    // Review N2: a request generation *newer* than the replica's descriptor
+    // means the replica is behind (StaleMetadata), even while Splitting —
+    // only an *older* request against a splitting source is TabletSplit.
     Err(match descriptor.state {
-        TabletState::Splitting => RoutingError::TabletSplit {
-            tablet_id,
-            used_generation,
-            current_generation,
-        },
+        TabletState::Splitting if used_generation < current_generation => {
+            RoutingError::TabletSplit {
+                tablet_id,
+                used_generation,
+                current_generation,
+            }
+        }
         TabletState::Retiring | TabletState::Retired => RoutingError::TabletMoved {
             tablet_id,
             used_generation,
@@ -1558,6 +1592,10 @@ pub const TABLET_TEMP_DIR: &str = "temp";
 /// Raft log subdirectory of one group directory.
 pub const GROUP_RAFT_DIR: &str = "raft";
 /// Snapshot subdirectory of one group directory.
+///
+/// Historical name kept for layout docs; the consensus state machine stores
+/// snapshots under `groups/<id>/raft/snapshot` (review **N3**). Prefer
+/// [`TabletLayout::raft_snapshot_dir`].
 pub const GROUP_SNAPSHOTS_DIR: &str = "snapshots";
 /// Name of the versioned, checksummed tablet metadata file.
 pub const TABLET_META_FILENAME: &str = "tablet.json";
@@ -1655,9 +1693,16 @@ impl TabletLayout {
         self.group_dir().join(GROUP_RAFT_DIR)
     }
 
-    /// `groups/<raft-group-id>/snapshots`.
+    /// Legacy layout path `groups/<raft-group-id>/snapshots` (unused by the
+    /// consensus SM). Prefer [`Self::raft_snapshot_dir`] (review **N3**).
     pub fn snapshots_dir(&self) -> PathBuf {
         self.group_dir().join(GROUP_SNAPSHOTS_DIR)
+    }
+
+    /// `groups/<raft-group-id>/raft/snapshot` — the path the consensus state
+    /// machine actually writes (review **N3** reconciliation).
+    pub fn raft_snapshot_dir(&self) -> PathBuf {
+        self.raft_dir().join("snapshot")
     }
 
     /// `tablets/<tablet-id>/tablet.json`.
@@ -1833,6 +1878,76 @@ fn tablet_checksum(tablet: &TabletDescriptor) -> Result<String, ClusterError> {
         detail: format!("encode: {error}"),
     })?;
     Ok(hex_encode(&Sha256::digest(&bytes)))
+}
+
+/// Scan `<node_data>/tablets/*/tablet.json` and load every valid descriptor.
+///
+/// Used by the §15 `SHOW TABLETS` / `SHOW REPLICAS` admin surface when a
+/// tablet runtime has persisted local metadata. Missing tablets dir is an
+/// empty list (standalone or not yet hosting tablets); corrupt individual
+/// files are skipped and counted in the returned issues.
+pub fn list_tablets_on_disk(
+    node_data: impl AsRef<Path>,
+) -> Result<(Vec<TabletDescriptor>, Vec<String>), ClusterError> {
+    let root = node_data.as_ref().join(TABLETS_DIR);
+    if !root.is_dir() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let mut tablets = Vec::new();
+    let mut issues = Vec::new();
+    let entries = fs::read_dir(&root).map_err(ClusterError::Io)?;
+    for entry in entries {
+        let entry = entry.map_err(ClusterError::Io)?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let meta = path.join(TABLET_META_FILENAME);
+        if !meta.is_file() {
+            continue;
+        }
+        // Load without TabletLayout identity check (group id unknown until
+        // decode). Verify format/checksum via the same envelope path.
+        match load_tablet_meta_file(&meta) {
+            Ok(descriptor) => tablets.push(descriptor),
+            Err(error) => issues.push(format!("{}: {error}", meta.display())),
+        }
+    }
+    tablets.sort_by_key(|t| t.tablet_id);
+    Ok((tablets, issues))
+}
+
+fn load_tablet_meta_file(path: &Path) -> Result<TabletDescriptor, ClusterError> {
+    let Some(bytes) = crate::node::read_meta_file(path)? else {
+        return Err(ClusterError::CorruptMetadata {
+            file: TABLET_META_FILENAME,
+            detail: format!("missing {}", path.display()),
+        });
+    };
+    let file: TabletMetaFile = crate::node::decode_json(TABLET_META_FILENAME, &bytes)?;
+    if file.format_version < MIN_SUPPORTED_TABLET_META_FORMAT_VERSION
+        || file.format_version > TABLET_META_FORMAT_VERSION
+    {
+        return Err(ClusterError::UnsupportedFormatVersion {
+            file: TABLET_META_FILENAME,
+            found: file.format_version,
+            min: MIN_SUPPORTED_TABLET_META_FORMAT_VERSION,
+            max: TABLET_META_FORMAT_VERSION,
+        });
+    }
+    if file.checksum != tablet_checksum(&file.tablet)? {
+        return Err(ClusterError::CorruptMetadata {
+            file: TABLET_META_FILENAME,
+            detail: "checksum mismatch".to_owned(),
+        });
+    }
+    file.tablet
+        .validate()
+        .map_err(|e| ClusterError::CorruptMetadata {
+            file: TABLET_META_FILENAME,
+            detail: e.to_string(),
+        })?;
+    Ok(file.tablet)
 }
 
 /// Process-local registry of owned tablet storage cores (spec section 12.3:
@@ -2733,6 +2848,27 @@ mod tests {
         assert_eq!(error.category(), ErrorCategory::StaleMetadata);
         let error = check_generation(&tablet, 8).unwrap_err();
         assert!(matches!(error, RoutingError::StaleMetadata { .. }));
+
+        // Review N2: newer generation while Splitting is StaleMetadata
+        // (replica behind), not TabletSplit.
+        let error = check_generation(&splitting, 9).unwrap_err();
+        assert!(
+            matches!(error, RoutingError::StaleMetadata { .. }),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn list_tablets_on_disk_reads_real_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let desc = descriptor(TabletState::Active);
+        let layout = TabletLayout::new(dir.path(), desc.tablet_id, desc.raft_group_id);
+        layout.create(&desc).unwrap();
+        let (listed, issues) = list_tablets_on_disk(dir.path()).unwrap();
+        assert!(issues.is_empty());
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].tablet_id, desc.tablet_id);
+        assert_eq!(listed[0].replicas.len(), desc.replicas.len());
     }
 
     // -- tablet layout (spec 12.3) ---------------------------------------------

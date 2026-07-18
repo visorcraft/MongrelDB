@@ -382,3 +382,180 @@ async fn cluster_endpoints_require_admin_and_audit_authorization_failures() {
         );
     }
 }
+
+/// Drive §15 admin SQL through the real `/sql` entry with AppState: on-disk
+/// tablets surface in SHOW TABLETS, SHOW RESOURCE GROUPS exercises scheduler +
+/// node governor + AI helpers, BACKUP/RESTORE submit live ops jobs, RESTORE
+/// builds a plan from a published cluster backup when present.
+#[tokio::test]
+async fn admin_sql_show_and_backup_restore_use_live_state() {
+    use mongreldb_cluster::cluster_backup::{
+        run_cluster_backup, BackupSource, ClusterBackupError, ClusterBackupRequest,
+        TabletSnapshotArtifact,
+    };
+    use mongreldb_cluster::tablet::{
+        ReplicaDescriptor, ReplicaRole, TabletDescriptor, TabletLayout, TabletState,
+    };
+    use mongreldb_types::hlc::HlcTimestamp;
+    use mongreldb_types::ids::{ClusterId, DatabaseId, MetadataVersion, RaftGroupId, TableId, TabletId};
+    use std::collections::BTreeMap;
+
+    let directory = tempdir().unwrap();
+    let database =
+        Arc::new(Database::create_with_credentials(directory.path(), "admin", "admin-pw").unwrap());
+
+    // Persist one real tablet descriptor under the database root.
+    let tablet_id = TabletId::from_bytes({
+        let mut b = [0u8; 16];
+        b[15] = 7;
+        b
+    });
+    let raft = RaftGroupId::from_bytes({
+        let mut b = [0u8; 16];
+        b[15] = 8;
+        b
+    });
+    let node = NodeId::from_bytes({
+        let mut b = [0u8; 16];
+        b[15] = 1;
+        b
+    });
+    let desc = TabletDescriptor {
+        tablet_id,
+        table_id: TableId::new(3),
+        raft_group_id: raft,
+        partition: mongreldb_cluster::tablet::PartitionBounds::unbounded(),
+        replicas: vec![ReplicaDescriptor {
+            node_id: node,
+            role: ReplicaRole::Voter,
+            raft_node_id: 1,
+        }],
+        leader_hint: Some(node),
+        generation: 2,
+        state: TabletState::Active,
+    };
+    let layout = TabletLayout::new(directory.path(), tablet_id, raft);
+    layout.create(&desc).unwrap();
+
+    // Publish a real cluster backup for RESTORE plan_restore.
+    struct Src;
+    impl BackupSource for Src {
+        fn capture_tablet(
+            &self,
+            tablet: &TabletDescriptor,
+            _backup_ts: HlcTimestamp,
+        ) -> Result<TabletSnapshotArtifact, ClusterBackupError> {
+            Ok(TabletSnapshotArtifact {
+                snapshot_payload: format!("snap-{}", tablet.tablet_id).into_bytes(),
+                extra_files: BTreeMap::new(),
+                covered_commit_ts: HlcTimestamp {
+                    physical_micros: 1_000,
+                    logical: 0,
+                    node_tiebreaker: 1,
+                },
+                log_continuation_term: 1,
+                log_continuation_index: 1,
+                log_archive: None,
+            })
+        }
+    }
+    let backup_dir = directory.path().join("backup-out");
+    run_cluster_backup(
+        &ClusterBackupRequest {
+            cluster_id: ClusterId::from_bytes([0xAA; 16]),
+            database_id: DatabaseId::from_bytes([0xBB; 16]),
+            meta_version: MetadataVersion::new(1),
+            backup_ts: Some(HlcTimestamp {
+                physical_micros: 1_000,
+                logical: 0,
+                node_tiebreaker: 1,
+            }),
+            tablets: vec![desc.clone()],
+            destination: backup_dir.clone(),
+            encryption: None,
+        },
+        &Src,
+    )
+    .unwrap();
+
+    let app = build_app_full(
+        Arc::clone(&database),
+        std::iter::empty(),
+        None,
+        None,
+        true,
+    );
+    let admin = "Basic YWRtaW46YWRtaW4tcHc=";
+
+    async fn sql_json(app: &axum::Router, admin: &str, sql: &str) -> Value {
+        let response = app
+            .clone()
+            .oneshot(authorized_request(
+                "POST",
+                "/sql",
+                json!({ "sql": sql }),
+                admin,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "sql={sql}");
+        json_body(response).await
+    }
+
+    let tablets = sql_json(&app, admin, "SHOW TABLETS").await;
+    assert_eq!(tablets["command"], "SHOW TABLETS");
+    assert_eq!(tablets["tablets"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        tablets["tablets"][0]["tablet_id"].as_str().unwrap(),
+        tablet_id.to_string()
+    );
+    assert_eq!(tablets["tablets"][0]["generation"], 2);
+
+    let replicas = sql_json(&app, admin, "SHOW REPLICAS").await;
+    assert_eq!(replicas["replicas"].as_array().unwrap().len(), 1);
+    assert_eq!(replicas["replicas"][0]["counts_toward_quorum"], true);
+
+    let resources = sql_json(&app, admin, "SHOW RESOURCE GROUPS").await;
+    assert!(resources["node_governor"].is_object());
+    assert!(resources["node_governor"]["actions"].is_array());
+    assert!(resources["scheduler"].is_object());
+    assert!(resources["ai"]["adaptive_local_k_example"].as_u64().unwrap() >= 1);
+
+    let cluster = sql_json(&app, admin, "SHOW CLUSTER").await;
+    assert_eq!(cluster["multi_region"]["multi_leader_default"], false);
+    assert!(cluster["multi_region"]["total_voters"].as_u64().unwrap() >= 1);
+
+    let backup = sql_json(&app, admin, "BACKUP DATABASE TO '/tmp/unused'").await;
+    assert_eq!(backup["status"], "accepted");
+    assert!(backup["job"]["job_id"].as_str().unwrap().contains("backup"));
+
+    let restore = sql_json(
+        &app,
+        admin,
+        &format!("RESTORE DATABASE FROM '{}'", backup_dir.display()),
+    )
+    .await;
+    assert_eq!(restore["status"], "accepted");
+    assert_eq!(
+        restore["job"]["kind"].as_str().unwrap(),
+        "restore_verification"
+    );
+    assert!(
+        restore["restore_plan"]["tablet_count"].as_u64().unwrap() >= 1,
+        "restore plan must come from published backup: {restore}"
+    );
+    assert!(restore["restore_plan"]["target_cluster_id"].is_string());
+
+    let jobs = sql_json(&app, admin, "SHOW JOBS").await;
+    let job_list = jobs["jobs"].as_array().unwrap();
+    assert!(
+        job_list.iter().any(|j| j["source"] == "ops"),
+        "expected ops jobs in SHOW JOBS: {jobs}"
+    );
+
+    let backups = sql_json(&app, admin, "SHOW BACKUPS").await;
+    assert!(
+        !backups["backups"].as_array().unwrap().is_empty(),
+        "SHOW BACKUPS must list submitted backup jobs: {backups}"
+    );
+}

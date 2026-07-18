@@ -60,4 +60,17 @@ pub enum ConsensusError {
     /// The request was malformed for the group's current state.
     #[error("invalid request: {0}")]
     InvalidRequest(String),
+    /// Consumer's `after` fell behind the snapshot purge point (review **N5**).
+    /// Previously `read_committed` silently returned an empty/hole-skipping
+    /// stream; callers must refresh from a snapshot and resume.
+    #[error(
+        "committed-log gap: after.index {after_index} is at or behind last_purged.index {purged_index}; \
+         install a snapshot and resume past the purge point"
+    )]
+    LogPurgedGap {
+        /// The caller's cursor index.
+        after_index: u64,
+        /// Highest index known purged by snapshot.
+        purged_index: u64,
+    },
 }

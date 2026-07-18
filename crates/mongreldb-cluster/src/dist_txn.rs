@@ -780,6 +780,18 @@ pub enum StatusRejectionReason {
     /// `MarkPreparing` named a tablet that is not a participant.
     #[error("tablet {0} is not a participant of the transaction")]
     UnknownParticipant(TabletId),
+    /// Commit apply re-validation failed: `commit_ts` is not strictly greater
+    /// than every prepare/observed timestamp (review finding **D2**).
+    #[error(
+        "invalid commit_ts {commit_ts}: must be strictly greater than max_observed {max_observed} \
+         and every prepare timestamp"
+    )]
+    InvalidCommitTs {
+        /// The refused commit timestamp.
+        commit_ts: HlcTimestamp,
+        /// The record's max observed timestamp.
+        max_observed: HlcTimestamp,
+    },
 }
 
 /// One journaled coordinator rejection.
@@ -1088,13 +1100,22 @@ impl TxnStatusApplySink {
                 }
             },
             CoordinatorCommand::Commit { txn_id, commit_ts } => {
-                match self.state.records.get_mut(txn_id) {
+                // Pre-check without a long-lived mut borrow so journal can run.
+                let pre = self.state.records.get(txn_id).map(|record| {
+                    (
+                        record.state.is_terminal(),
+                        record.state.clone(),
+                        record.max_observed,
+                        record.prepare_ts.values().any(|ts| *commit_ts <= *ts)
+                            || *commit_ts <= record.max_observed,
+                    )
+                });
+                match pre {
                     None => {
                         self.journal(command, *txn_id, StatusRejectionReason::UnknownTxn(*txn_id));
                         Ok(())
                     }
-                    Some(record) if record.state.is_terminal() => {
-                        let existing = record.state.clone();
+                    Some((true, existing, _, _)) => {
                         self.journal(
                             command,
                             *txn_id,
@@ -1102,10 +1123,24 @@ impl TxnStatusApplySink {
                         );
                         Ok(())
                     }
-                    Some(record) => {
-                        record.state = DistributedTxnState::Committed {
-                            commit_ts: *commit_ts,
-                        };
+                    Some((false, _, max_observed, true)) => {
+                        // Review D2: re-validate commit_ts at apply.
+                        self.journal(
+                            command,
+                            *txn_id,
+                            StatusRejectionReason::InvalidCommitTs {
+                                commit_ts: *commit_ts,
+                                max_observed,
+                            },
+                        );
+                        Ok(())
+                    }
+                    Some((false, _, _, false)) => {
+                        if let Some(record) = self.state.records.get_mut(txn_id) {
+                            record.state = DistributedTxnState::Committed {
+                                commit_ts: *commit_ts,
+                            };
+                        }
                         Ok(())
                     }
                 }
@@ -4496,6 +4531,82 @@ mod tests {
                 coordinator_envelope([8u8; 16], CoordinatorCommand::Begin { record: bad }, 500,)
             ))
             .is_err());
+    }
+
+    #[test]
+    fn status_sink_rejects_commit_ts_not_after_max_observed() {
+        // Review D2: coordinator apply re-validates commit_ts.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut sink = TxnStatusApplySink::open(tmp.path()).unwrap();
+        let txn = xid(42);
+        sink.apply(&applied(
+            1,
+            coordinator_envelope(
+                [1u8; 16],
+                CoordinatorCommand::Begin {
+                    record: record(txn, vec![participant(91, 1)]),
+                },
+                100,
+            ),
+        ))
+        .unwrap();
+        sink.apply(&applied(
+            2,
+            coordinator_envelope(
+                [2u8; 16],
+                CoordinatorCommand::MarkPreparing {
+                    txn_id: txn,
+                    tablet_id: tid(1),
+                    prepare_ts: ts(150),
+                    observed: ts(160),
+                },
+                150,
+            ),
+        ))
+        .unwrap();
+        // commit_ts == max_observed (160) must fail; must be strictly greater.
+        sink.apply(&applied(
+            3,
+            coordinator_envelope(
+                [3u8; 16],
+                CoordinatorCommand::Commit {
+                    txn_id: txn,
+                    commit_ts: ts(160),
+                },
+                160,
+            ),
+        ))
+        .unwrap();
+        assert!(
+            matches!(
+                sink.state().rejections.back().map(|r| &r.reason),
+                Some(StatusRejectionReason::InvalidCommitTs { .. })
+            ),
+            "expected InvalidCommitTs, got {:?}",
+            sink.state().rejections
+        );
+        // Transaction remains non-terminal (still Preparing).
+        assert!(matches!(
+            sink.record(&txn).unwrap().state,
+            DistributedTxnState::Preparing
+        ));
+        // Strictly greater commit_ts succeeds.
+        sink.apply(&applied(
+            4,
+            coordinator_envelope(
+                [4u8; 16],
+                CoordinatorCommand::Commit {
+                    txn_id: txn,
+                    commit_ts: ts(161),
+                },
+                161,
+            ),
+        ))
+        .unwrap();
+        assert_eq!(
+            sink.record(&txn).unwrap().state,
+            DistributedTxnState::Committed { commit_ts: ts(161) }
+        );
     }
 
     #[test]

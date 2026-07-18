@@ -886,10 +886,24 @@ impl MongrelLogStore {
                     index
                 );
             }
+            // Review m5: a 0-length (or sub-header) active segment left by a
+            // crash between create and header write must not receive entry
+            // frames at offset 0 — roll a fresh segment whenever the active
+            // file is empty so the next reopen always sees a valid header.
             let need_segment = inner.active.is_none()
+                || inner.active_len == 0
                 || (inner.active_entry_count > 0
                     && inner.active_len >= inner.config.segment_roll_bytes);
             if need_segment {
+                // Drop a headerless empty file before rolling so it cannot
+                // be re-adopted as active on the next open.
+                if inner.active_len == 0 {
+                    if let Some(last) = inner.segments.last().map(|s| s.path.clone()) {
+                        let _ = std::fs::remove_file(&last);
+                        inner.segments.pop();
+                        inner.active = None;
+                    }
+                }
                 Self::roll_segment(&mut inner, index)?;
             }
             let body = encode_versioned(&entry)?;
@@ -993,6 +1007,13 @@ impl MongrelLogStore {
             .next()
             .map(|(_, (_, loc))| *loc);
         if let Some(victim) = first_victim {
+            // Review N1: victim segments are deleted *before* the directory
+            // fsync. A crash in between can resurrect truncated *uncommitted*
+            // entries on reopen. That is benign under raft (uncommitted
+            // entries may reappear; they are re-truncated by the next leader
+            // append and can never be committed under their old term). Do not
+            // "fix" this by fsyncing the directory first — that would make
+            // a crash leave an empty hole the open path cannot recover.
             // Delete every segment after the victim's segment.
             for meta in inner.segments.drain(victim.segment + 1..) {
                 std::fs::remove_file(&meta.path).map_err(StoreError::io(&meta.path, "delete"))?;

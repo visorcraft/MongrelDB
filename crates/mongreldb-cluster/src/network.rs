@@ -39,6 +39,12 @@
 //!
 //! [`TransportSecurity::PlaintextForTesting`] exists for loopback tests only.
 //!
+//! Certificate rotation (review **N8**) is restart-bound this wave:
+//! `TrustConfig` loads at boot and the TLS acceptor is not hot-reloaded.
+//! webpki still rejects expired certs at handshake, so an expired node cert
+//! takes the node out of the cluster until restart with fresh material.
+//! Online rotation is an S5E ops-job follow-up.
+//!
 //! # Failure semantics
 //!
 //! Connect failures surface to openraft as `Unreachable`, timeouts as

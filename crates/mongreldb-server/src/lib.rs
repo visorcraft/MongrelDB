@@ -234,6 +234,16 @@ struct AppState {
     reloadable: Arc<ReloadableConfig>,
     /// Graceful-drain coordination and last-outcome record (§10.7).
     drain: Arc<DrainControl>,
+    /// Stage 4 hierarchical scheduler (admission fairness / tenant quotas).
+    scheduler: std::sync::Mutex<mongreldb_core::HierarchicalScheduler>,
+    /// Stage 4 node memory governor (cross-tablet pressure actions).
+    node_governor: std::sync::Mutex<mongreldb_core::NodeMemoryGovernor>,
+    /// Stage 4 AI index generation registry (readiness/routing metadata).
+    ai_generations: std::sync::Mutex<mongreldb_core::AiIndexGenerationRegistry>,
+    /// Stage 4 multi-region placement policy (default single-leader).
+    multi_region: std::sync::Mutex<mongreldb_cluster::multi_region::MultiRegionPolicy>,
+    /// Stage 5 online ops job store (backup, restore, movement, …).
+    ops_jobs: std::sync::Mutex<mongreldb_core::OpsJobStore>,
 }
 
 /// A `Duration` config value (millisecond granularity) that
@@ -718,6 +728,18 @@ pub fn build_app_with_sessions_and_control(
         cursor_mac_key: CursorMacKey::default(),
         reloadable,
         drain: Arc::new(DrainControl::default()),
+        scheduler: std::sync::Mutex::new(mongreldb_core::HierarchicalScheduler::new()),
+        node_governor: std::sync::Mutex::new(mongreldb_core::NodeMemoryGovernor::new(
+            mongreldb_core::MemoryGovernor::new(mongreldb_core::GovernorConfig::new(
+                12 * 1024 * 1024 * 1024,
+            ))
+            .expect("default node memory governor config"),
+        )),
+        ai_generations: std::sync::Mutex::new(mongreldb_core::AiIndexGenerationRegistry::new()),
+        multi_region: std::sync::Mutex::new(
+            mongreldb_cluster::multi_region::MultiRegionPolicy::default(),
+        ),
+        ops_jobs: std::sync::Mutex::new(mongreldb_core::OpsJobStore::new()),
     });
     let router = axum::Router::new()
         .route("/health", get(health))
@@ -6636,6 +6658,13 @@ async fn execute_sql(
         idempotency,
         pagination,
     } = request;
+    // §15 admin SQL surface: intercept before the ordinary SQL path so
+    // SHOW CLUSTER / ALTER NODE DRAIN / … never open tablet files from the
+    // query gateway (spec §12.10 / §15).
+    if let Some(response) = cluster_admin::try_admin_sql(state, principal, &req.sql) {
+        drop(sql_permit);
+        return (response, None);
+    }
     // Keep a direct handle until the durable receipt is persisted. Finished
     // tombstone eviction must not make a committed idempotent write ambiguous.
     let idempotency_query = idempotency.as_ref().map(|_| query.clone());

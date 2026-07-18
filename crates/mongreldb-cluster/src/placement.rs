@@ -188,19 +188,43 @@ impl VoterChange {
 /// three before it may shrink. The movement protocol of [`plan_rebalance`]
 /// is add-first (learner, catch up, promote, then remove), so the removal
 /// it plans is always judged against the post-promote voter count.
+///
+/// When health is unknown, pass the configured voter count for both
+/// arguments (legacy behaviour). Prefer [`check_move_safety_healthy`] when
+/// the runtime reports per-replica reachability (review finding **m10**).
 pub fn check_move_safety(current_voters: u32, change: VoterChange) -> Result<(), PlacementError> {
-    if current_voters == 0 {
+    check_move_safety_healthy(current_voters, current_voters, change)
+}
+
+/// Like [`check_move_safety`], but judges removal/demotion against
+/// **healthy** voter counts (spec §12.7 / review **m10**).
+///
+/// - `configured_voters` — voters in the committed configuration.
+/// - `healthy_voters` — of those, how many are currently reachable.
+///
+/// Removal is refused when either (a) the configured post-removal set would
+/// fall below the configured quorum, or (b) the healthy post-removal set
+/// would fall below the configured quorum (zero failure margin on a
+/// degraded group). Growing the group is always allowed so repair can proceed.
+pub fn check_move_safety_healthy(
+    configured_voters: u32,
+    healthy_voters: u32,
+    change: VoterChange,
+) -> Result<(), PlacementError> {
+    if configured_voters == 0 {
         return Err(PlacementError::EmptyGroup);
     }
+    let healthy_voters = healthy_voters.min(configured_voters);
     match change {
         VoterChange::AddVoter | VoterChange::AddLearner | VoterChange::PromoteLearner => Ok(()),
         VoterChange::DemoteVoter | VoterChange::RemoveVoter => {
-            let remaining = current_voters - 1;
-            let quorum = quorum_size(current_voters);
-            if remaining < quorum {
+            let remaining_configured = configured_voters - 1;
+            let remaining_healthy = healthy_voters.saturating_sub(1);
+            let quorum = quorum_size(configured_voters);
+            if remaining_configured < quorum || remaining_healthy < quorum {
                 return Err(PlacementError::QuorumViolation {
-                    current_voters,
-                    remaining,
+                    current_voters: healthy_voters,
+                    remaining: remaining_healthy.min(remaining_configured),
                     quorum,
                     change: change.name(),
                 });
@@ -496,6 +520,10 @@ fn per_mille(value: u64, maximum: u64) -> u64 {
 }
 
 /// Fieldwise maxima of the reported loads.
+///
+/// Callers should pass only `Up` nodes (review **N9**): a dead node with
+/// extreme load must not compress every score. [`plan_rebalance`] filters
+/// before calling this helper.
 fn load_maxima(loads: &[NodeLoad]) -> NodeLoad {
     let mut maxima = NodeLoad::default();
     for load in loads {
@@ -642,9 +670,21 @@ pub fn plan_rebalance(
     if config.max_concurrent_moves == 0 {
         return plan;
     }
-    let maxima = load_maxima(loads);
+    // N9: only Up nodes contribute to load maxima (dead extreme load must
+    // not compress every score).
+    let up_ids: BTreeSet<NodeId> = nodes
+        .iter()
+        .filter(|n| n.state == NodeState::Up)
+        .map(|n| n.node_id)
+        .collect();
+    let up_loads: Vec<NodeLoad> = loads
+        .iter()
+        .filter(|l| up_ids.contains(&l.node_id))
+        .copied()
+        .collect();
+    let maxima = load_maxima(&up_loads);
     let mut planned_loads: BTreeMap<NodeId, NodeLoad> =
-        loads.iter().map(|load| (load.node_id, *load)).collect();
+        up_loads.iter().map(|load| (load.node_id, *load)).collect();
     let current_scores = |planned_loads: &BTreeMap<NodeId, NodeLoad>| -> BTreeMap<NodeId, u64> {
         nodes
             .iter()

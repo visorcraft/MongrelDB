@@ -1403,9 +1403,7 @@ fn is_meta_not_leader(error: &RuntimeError) -> bool {
             | RuntimeError::Meta(MetaError::Consensus(
                 mongreldb_consensus::error::ConsensusError::NotLeader { .. },
             ))
-            | RuntimeError::Consensus(
-                mongreldb_consensus::error::ConsensusError::NotLeader { .. }
-            )
+            | RuntimeError::Consensus(mongreldb_consensus::error::ConsensusError::NotLeader { .. })
     )
 }
 

@@ -328,21 +328,35 @@ than every observed timestamp, heartbeat-expiry push rules (never abort on
 suspicion), and lazy orphan-intent resolution. The protocol state machines
 and group flows are unit- and group-tested (idempotent replays, prepare
 conflicts, coordinator failover recovery, expiry pushes, orphan sweeps),
-but the engine binding that materializes committed intents into MVCC row
-versions and the server wiring are still open — do not treat it as shipped
-behavior.
+and the engine binding materializes committed intents into MVCC row
+versions via `apply_replicated_records` at `commit_ts`. Server gateway
+routing of multi-tablet writes goes through the tablet groups (not a
+file-open bypass); treat full multi-node production orchestration as the
+remaining operational binding.
 
-## Still to land
+## Landed Stage 3 residual (S3L + gateway)
 
-- **Engine binding of tablet groups and the 2PC intents.** Tablet groups
-  currently open interim `ClusterReplica` cores keyed by a derived database
-  id; distributed DDL (§12.11) lands the meta-driven resolution, and the
-  intent-resolution-to-MVCC binding lands with the tablet server wave.
-- **Global constraints (§12.9).** Cross-tablet unique constraints, foreign
-  keys, and sequences.
-- **Distributed SQL (§12.10).** Planning and execution across tablets
-  (scatter-gather, distributed joins and top-k).
-- **Distributed DDL and indexes (§12.11).** The meta schema-job records
-  exist; the build-and-publish choreography across tablets does not.
-- **Cluster backup and PITR (§12.12).** Coordinated backup points across
-  tablet groups.
+- **Cluster backup/PITR (§12.12).** `mongreldb-cluster::cluster_backup` —
+  multi-tablet manifest, pin-meta → tablet snapshots → log archive →
+  validate → **publish manifest last**, `BackupSource` trait (cluster stays
+  core-free), `verify_backup`, restore plan with new cluster/database
+  identity unless disaster recovery, fault hooks `cluster.backup.*`.
+- **Server gateway + §15 admin SQL.** `mongreldb-cluster::gateway` binds
+  distributed plan fragments to real tablet groups through
+  `RoutingCache`/`RetryPolicy` (never opens tablet files from the query
+  path). `SHOW CLUSTER/NODES/TABLETS/...`, `ALTER NODE DRAIN`,
+  `TRANSFER LEADER`, `MOVE REPLICA`, `SPLIT TABLET`, `MERGE TABLETS`,
+  `BACKUP/RESTORE DATABASE` parse into typed commands; the server
+  intercepts them on the SQL path with admin authz + audit.
+- **Global constraints, distributed SQL groundwork, distributed DDL,** and
+  **intent→MVCC binding** for 2PC have also landed in prior Stage 3 waves
+  (`global_constraints.rs`, `query::distributed`, `ddl.rs`, `dist_txn.rs`).
+
+## Stage 4 / 5 surfaces (workload separation + production ops)
+
+- Hierarchical scheduler (`mongreldb-core::scheduler`), node memory governor
+  (`node_governor`), AI index generations (`ai_generation`), distributed AI
+  retrieval merge (`mongreldb-query::ai_retrieval`), specialized replica
+  roles, multi-region placement (`multi_region`), MySQL migrate path
+  (`migrate_mysql`), security hardening (SCRAM/JWT/service tokens/KMS
+  redaction), and online ops jobs (`ops_jobs`).

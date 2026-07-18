@@ -215,27 +215,22 @@ retry writes only with an idempotency key or an unambiguous not-proposed
 status. An ambiguous write is never replayed automatically without a
 durable idempotency key.
 
-## Still to land
+## Landed since the first Stage 2 tour
 
-- **A real RPC transport.** Today the only transport is the in-memory one
-  used by tests and deterministic simulation; the networked transport
-  (with TLS from the cluster trust configuration) is a later Stage 2 wave.
-- **Live engine integration.** The engine `ApplySink` binding has landed
-  (`engine_sink.rs`): committed `ReplicatedCommand`s apply to a
-  `ClusterReplica`-marked core through the same WAL-recovery apply path the
-  engine already used. Still open: the server wiring that runs one group
-  per database in production, switching those cores from the default
-  `StandaloneCommitLog` to `RaftCommitLog`, and an online `hot_backup`
-  against a live replica core — every replica open is read-only and
-  `hot_backup` requires `Admin`, so replica backups currently stage offline
-  from a quiesced root (see the gate table).
-- **Cluster CLI.** The bootstrap records and join flow exist in
-  `mongreldb-cluster`; the `mongreldb cluster init/join/status`,
-  `node drain`, and `node remove` commands are not wired yet.
-- **Rolling upgrades.** Version advertising, feature levels, and the
-  upgrade-planning/rollback-assessment machinery (ADR-0010) have landed in
-  `mongreldb-cluster::meta` with unit tests; the executed N→N+1 upgrade
-  choreography waits on the real transport.
+- **Real RPC transport.** TCP + TLS 1.3 mTLS with node-id-bound certificates
+  (`mongreldb-cluster::network`) — wrong-CA / no-cert / id-mismatch rejected;
+  `PlaintextForTesting` escape hatch for tests only.
+- **Cluster CLI and admin HTTP.** `mongreldb-server cluster init/join/status`,
+  `node drain` / `node remove`, plus `GET /admin/cluster/status` and
+  `POST /admin/cluster/node/{drain,remove}` (audited; standalone mode
+  reports cleanly).
+- **Live engine integration.** `engine_sink.rs` applies committed
+  `ReplicatedCommand`s into `ClusterReplica` cores; spill translation
+  re-tags spilled rows so replicas never see leader-local `added_runs`.
+- **Rolling-upgrade planning.** Version advertising, feature levels, and
+  upgrade/rollback assessment (ADR-0010) are unit-tested; the executed
+  multi-node upgrade choreography still waits on production orchestration
+  (Stage 5 online-ops jobs).
 
 ## Stage 2 gate status
 

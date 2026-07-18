@@ -538,6 +538,18 @@ impl<T: RaftTransport> ConsensusGroup<T> {
     ) -> Result<LeaderDiskReceipt, ConsensusError> {
         self.ensure_open()?;
         self.check_control(control)?;
+        // Review N10: refuse non-leaders before registering a LeaderDisk
+        // waiter. A follower that accepted the same command id via
+        // replication could otherwise surface a LeaderDisk receipt whose
+        // durability is honest (local fsync) but not "leader-local".
+        {
+            let metrics = self.raft.metrics().borrow().clone();
+            if metrics.current_leader != Some(self.config.node_id) {
+                return Err(ConsensusError::NotLeader {
+                    leader: metrics.current_leader,
+                });
+            }
+        }
         envelope.verify()?;
         let commit_ts = self.stamp_commit_ts()?;
         let command_id = envelope.command_id;
@@ -751,11 +763,23 @@ impl<T: RaftTransport> ConsensusGroup<T> {
     /// applied watermark (applied is always `<=` committed, so this never
     /// exposes an uncommitted entry). Command-less entries (blank,
     /// membership) are skipped.
+    ///
+    /// Review **N5**: if `after` falls at or behind the snapshot purge point
+    /// the gap is reported as [`ConsensusError::LogPurgedGap`] instead of a
+    /// silent hole-skip.
     pub fn read_committed(
         &self,
         after: LogPosition,
         limit: usize,
     ) -> Result<Vec<mongreldb_log::commit_log::CommittedEntry>, ConsensusError> {
+        if let Some(purged) = self.shared_log.last_purged_log_id()? {
+            if after.index > 0 && after.index <= purged.index {
+                return Err(ConsensusError::LogPurgedGap {
+                    after_index: after.index,
+                    purged_index: purged.index,
+                });
+            }
+        }
         let record = self.sm.applied_record()?;
         let bound = record
             .last_applied
@@ -789,7 +813,21 @@ impl<T: RaftTransport> ConsensusGroup<T> {
     /// position, then returns its framed bytes. Snapshot building is driven
     /// by the group's snapshot policy; this forces one (log compaction and
     /// follower catch-up, spec section 11.5).
+    ///
+    /// Uses a 10 s default wait (historical). Prefer
+    /// [`Self::snapshot_with_timeout`] (or pass the caller's
+    /// [`ExecutionControl`] deadline via that helper) when the caller has a
+    /// tighter budget — review **N4**.
     pub async fn snapshot(&self) -> Result<ConsensusSnapshot, ConsensusError> {
+        self.snapshot_with_timeout(Duration::from_secs(10)).await
+    }
+
+    /// Like [`Self::snapshot`], but the wait for the snapshot to cover the
+    /// applied watermark is bounded by `timeout` (review **N4**).
+    pub async fn snapshot_with_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<ConsensusSnapshot, ConsensusError> {
         self.ensure_open()?;
         let applied = self.sm.applied_record()?;
         let Some(last_applied) = applied.last_applied else {
@@ -809,7 +847,7 @@ impl<T: RaftTransport> ConsensusGroup<T> {
             .snapshot()
             .await
             .map_err(|e| ConsensusError::Raft(e.to_string()))?;
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + timeout;
         loop {
             if let Some((meta, framed)) = self.sm.current_snapshot()? {
                 let covers = meta

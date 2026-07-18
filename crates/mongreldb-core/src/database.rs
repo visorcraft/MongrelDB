@@ -5733,7 +5733,10 @@ impl Database {
         for named in &request.retrievers {
             columns.push(named.retriever.column_id());
         }
-        if let Some(crate::query::Rerank::ExactVector { embedding_column, .. }) = &request.rerank {
+        if let Some(crate::query::Rerank::ExactVector {
+            embedding_column, ..
+        }) = &request.rerank
+        {
             columns.push(*embedding_column);
         }
         if let Some(proj) = &request.projection {
@@ -5771,12 +5774,17 @@ impl Database {
                     let row = crate::memtable::Row {
                         row_id: hit.row_id,
                         committed_epoch: crate::Epoch(0),
-                        columns: hit.cells.iter().cloned().collect::<std::collections::HashMap<u16, crate::Value>>(),
+                        columns: hit
+                            .cells
+                            .iter()
+                            .cloned()
+                            .collect::<std::collections::HashMap<u16, crate::Value>>(),
                         deleted: false,
                     };
                     let mut rows = self.secure_rows_for(table_name, vec![row], principal)?;
                     if let Some(mut row) = rows.pop() {
-                        row.columns.retain(|column, _| allowed_columns.contains(column));
+                        row.columns
+                            .retain(|column, _| allowed_columns.contains(column));
                         hit.cells = row.columns.into_iter().collect::<Vec<_>>();
                         hit.cells.sort_by_key(|(column, _)| *column);
                         secured.push(hit);

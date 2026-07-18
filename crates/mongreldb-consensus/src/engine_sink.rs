@@ -137,6 +137,23 @@ impl EngineApplySink {
         })
     }
 
+    /// Seeds the in-memory apply watermark from the state machine's
+    /// persisted `AppliedRecord` after open (review finding **m8**).
+    ///
+    /// Without this, a restart leaves `last_applied = ZERO` until the next
+    /// apply, so the next engine snapshot would embed a wrong
+    /// `last_included` / `commit_ts` even though the raft SM watermark is
+    /// correct. Callers that open the SM after the sink (e.g.
+    /// [`open_engine_group`]) must invoke this once with the loaded record.
+    pub fn seed_watermark(
+        &mut self,
+        last_applied: LogPosition,
+        last_commit_ts: Option<HlcTimestamp>,
+    ) {
+        self.last_applied = last_applied;
+        self.last_commit_ts = last_commit_ts;
+    }
+
     /// The live database (for read-path inspection; raft-gated writes only).
     pub fn database(&self) -> Option<Arc<mongreldb_core::Database>> {
         self.db.clone()
@@ -495,6 +512,14 @@ pub fn open_engine_group(config: &EngineGroupConfig) -> Result<EngineGroupParts,
         sink.clone() as Arc<Mutex<dyn ApplySink>>,
         config.idempotency_retention,
     )?;
+    // Review m8: recover the engine-side watermark from the SM's durable
+    // applied record so the next snapshot does not advertise ZERO.
+    let record = state_machine
+        .applied_record()
+        .map_err(|e| MongrelError::Other(e.to_string()))?;
+    sink.lock()
+        .map_err(|_| MongrelError::Other("engine sink lock poisoned".into()))?
+        .seed_watermark(record.position(), record.last_applied_commit_ts);
     Ok(EngineGroupParts {
         log_store,
         state_machine,

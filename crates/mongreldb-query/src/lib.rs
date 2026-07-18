@@ -21,6 +21,7 @@
 //! # Ok(()) }
 //! ```
 
+pub mod ai_retrieval;
 pub mod arrow_conv;
 mod commands;
 pub mod distributed;
@@ -36,6 +37,10 @@ mod scored_sql;
 mod shadow;
 mod udf;
 
+pub use ai_retrieval::{
+    adaptive_local_k, merge_candidates, AiConsistencyAudit, AiRetrievalError, AiWorkBudget,
+    FusionMethod, LocalCandidate, MergedCandidate,
+};
 pub use error::{MongrelQueryError, Result};
 pub use external_modules::{
     ExternalBaseWrite, ExternalExecutionContext, ExternalModuleDescriptor, ExternalModuleIndex,

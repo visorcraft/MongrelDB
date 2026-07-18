@@ -5,11 +5,15 @@
 //! backup, and rolling-upgrade coordination.
 
 pub mod bootstrap;
+pub mod cluster_backup;
 pub mod ddl;
+pub mod dist_ssi;
 pub mod dist_txn;
+pub mod gateway;
 pub mod global_constraints;
 pub mod merge;
 pub mod meta;
+pub mod multi_region;
 pub mod network;
 pub mod node;
 pub mod placement;

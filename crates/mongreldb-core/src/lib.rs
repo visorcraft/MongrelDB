@@ -8,6 +8,7 @@
 #![allow(clippy::module_inception)]
 #![recursion_limit = "2048"]
 
+pub mod ai_generation;
 pub mod auth;
 pub mod auth_state;
 pub mod backup;
@@ -15,6 +16,7 @@ pub mod be_tree;
 pub mod cache;
 pub mod catalog;
 pub mod catalog_cmds;
+pub mod certification;
 pub mod cluster_import;
 pub mod columnar;
 pub mod commit_log;
@@ -40,7 +42,10 @@ pub mod manager;
 pub mod manifest;
 pub mod memory;
 pub mod memtable;
+pub mod migrate_mysql;
 pub mod mutable_run;
+pub mod node_governor;
+pub mod ops_jobs;
 pub mod page;
 pub mod pitr;
 pub mod pma;
@@ -53,8 +58,10 @@ pub mod resource;
 pub mod retention;
 pub(crate) mod row_id_set;
 pub mod rowid;
+pub mod scheduler;
 pub mod schema;
 pub mod security;
+pub mod security_hardening;
 pub mod sorted_run;
 pub mod spill;
 pub mod storage_mode;
@@ -67,6 +74,10 @@ pub mod wal;
 pub(crate) const MAX_READ_GENERATION_LAYERS: usize = 8;
 
 pub use crate::core::{DatabaseFileIdentity, LifecycleController, LifecycleState, OperationGuard};
+pub use ai_generation::{
+    evaluate_readiness, readiness_action, AiIndexGeneration, AiIndexGenerationRegistry, IndexId,
+    IndexReadinessError, ReadinessAction,
+};
 pub use auth::{
     hash_password, verify_password, ColumnAccess, ColumnOperation, Permission, Principal,
     RoleEntry, UserEntry,
@@ -79,6 +90,9 @@ pub use catalog::{
     MaterializedViewEntry,
 };
 pub use catalog_cmds::{required_permission, CatalogCommand, CatalogCommandRecord, CatalogDelta};
+pub use certification::{
+    certification_inventory, inventory_smoke, CertificationCategory, CertificationClass,
+};
 pub use cluster_import::{
     cluster_import_prepare, hash_rows_canonical, ImportPlan, ImportTablePlan,
 };
@@ -120,7 +134,15 @@ pub use memory::{
     MemoryGovernor, Reclaimable, Reservation, SpillGrant,
 };
 pub use memtable::{Memtable, Row, Value};
+pub use migrate_mysql::{
+    dialect_matrix, map_mysql_type, plan_mysql_migration, run_migrate_pipeline, CdcOp,
+    DialectFeature, DialectSupport, MemoryMigrateIo, MigrateIo, MigrateRunReport, MigrateStage,
+    MigrateTablePlan, MysqlMigratePlan, MysqlWireRequest, SourceRow, TypeMapping,
+    DEFAULT_COPY_BATCH, DUAL_WRITE_WARNING,
+};
 pub use mutable_run::MutableRun;
+pub use node_governor::{GovernorAction, NodeMemoryGovernor, NodePressureInputs};
+pub use ops_jobs::{OpsJob, OpsJobError, OpsJobKind, OpsJobState, OpsJobStore};
 pub use page::{CachedPage, Encoding, PageStat};
 pub use pitr::{
     read_pitr_manifest, restore_pitr, PitrArchiveManifest, PitrArchiveReport, PitrChunkRef,
@@ -129,6 +151,11 @@ pub use pitr::{
 pub use procedure::{
     ProcedureBody, ProcedureCallOutput, ProcedureCallResult, ProcedureCallRow, ProcedureCondition,
     ProcedureEntry, ProcedureMode, ProcedureParam, ProcedureStep, ProcedureValue, StoredProcedure,
+};
+pub use security_hardening::{
+    node_cert_matches_id, redact_secrets, validate_jwt_claims, JwtClaims, JwtError,
+    JwtValidationConfig, KeyRotationRecord, KmsWrappedKey, ScramVerifier, ServiceToken,
+    ServiceTokenRegistry,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -166,6 +193,10 @@ pub use retention::{
     SnapshotRegistry,
 };
 pub use rowid::{RowId, RowIdAllocator};
+pub use scheduler::{
+    ClassConfig, ClassStats, HierarchicalScheduler, SchedulerError, SchedulerStats, TenantQuota,
+    WorkItem,
+};
 pub use schema::{
     AlterColumn, ColumnDef, ColumnFlags, DefaultExpr, IndexDef, IndexKind, Schema, TypeId,
 };

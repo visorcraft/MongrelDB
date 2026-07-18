@@ -46,6 +46,15 @@
 //!   merge phase's progress record is durable (`merge.json`), in
 //!   `MergePhase` declaration order.
 //!
+//! Cluster backup (instrumented in `mongreldb-cluster`):
+//!
+//! - `cluster.backup.before` / `cluster.backup.after` — bracket a full run.
+//! - `cluster.backup.pin` — after the meta version is pinned.
+//! - `cluster.backup.tablet` — after each tablet snapshot is written.
+//! - `cluster.backup.validate` — after full validation, before publish.
+//! - `cluster.backup.publish.before` / `cluster.backup.publish.after` —
+//!   bracket atomic manifest publication (spec §12.12 step 6: publish last).
+//!
 //! Reserved for later waves (do not instrument yet):
 //!
 //! - `txn.prepare.before` / `txn.prepare.after`

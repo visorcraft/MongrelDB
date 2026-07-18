@@ -140,10 +140,23 @@ impl AppliedCommand {
 ///
 /// Implementations must be deterministic: every replica applies the same
 /// commands in the same order.
+///
+/// # Idempotency / redelivery contract
+///
+/// The state machine skips an entry when (a) its log index is at or below
+/// the persisted watermark, or (b) its command id is in the bounded recent
+/// set (default 4096). A client retry that is re-proposed under a *new* log
+/// index after more than 4096 intervening commands fails both checks and is
+/// dispatched to the sink a second time (review finding **m3**). Landed
+/// sinks tolerate this: the engine's visible-epoch watermark makes
+/// re-apply a no-op, and the meta LWW guards converge deterministically.
+/// Propose-side dedup by command id is the durable fix for wasted work; until
+/// then, sinks must not assume "exactly once under aging".
 pub trait ApplySink: Send + 'static {
     /// Dispatches one committed command. Never called twice for the same
     /// command ID unless the command crossed the crash window documented in
-    /// the module docs (the engine ledger deduplicates that case).
+    /// the module docs, or aged out of the bounded recent set (see above;
+    /// the engine ledger / meta LWW deduplicates those cases).
     fn apply(&mut self, command: &AppliedCommand) -> Result<(), StateMachineError>;
 
     /// Serializes the sink's applied state for inclusion in a snapshot.
@@ -293,6 +306,7 @@ impl SharedStateMachine {
     fn snapshot_dir(&self) -> PathBuf {
         self.raft_dir.join("snapshot")
     }
+
     /// The current apply checkpoint.
     pub(crate) fn applied_record(&self) -> Result<AppliedRecord, StateMachineError> {
         Ok(self.lock()?.record.clone())
@@ -427,6 +441,15 @@ impl SharedStateMachine {
     /// Installs framed snapshot bytes (staging → verify → replace → update
     /// last-applied → remove old state; spec section 11.5). Returns the
     /// restored apply checkpoint.
+    ///
+    /// # Freshness guard (review finding **m4**)
+    ///
+    /// Rejects a snapshot whose restored position is strictly behind the
+    /// current applied record. The openraft-driven install path only offers
+    /// newer snapshots; this out-of-band path (`RaftCommitLog::install_snapshot`
+    /// / [`install_local_snapshot`](Self::install_local_snapshot)) must not
+    /// silently regress the watermark. Equal positions are accepted
+    /// (idempotent re-install).
     pub(crate) fn install_framed_snapshot(
         &self,
         snapshot_id: &str,
@@ -439,6 +462,22 @@ impl SharedStateMachine {
         let snapshot: SmSnapshot = decode_versioned(Path::new("<snapshot>"), &body)?;
         mongreldb_fault::inject("raft.snapshot.install.before")
             .map_err(|f| StateMachineError::Sink(f.to_string()))?;
+
+        // Freshness: refuse a strictly-stale snapshot (m4).
+        {
+            let current = self.applied_record()?;
+            let incoming = snapshot.record.position();
+            let current_pos = current.position();
+            if incoming.index < current_pos.index
+                || (incoming.index == current_pos.index && incoming.term < current_pos.term)
+            {
+                return Err(StateMachineError::Corrupt(format!(
+                    "refusing stale snapshot install: snapshot position term={} index={} \
+                     is behind current applied term={} index={}",
+                    incoming.term, incoming.index, current_pos.term, current_pos.index
+                )));
+            }
+        }
 
         // Stage the new snapshot file before touching live state.
         write_frame_file(
@@ -553,6 +592,12 @@ pub struct MongrelStateMachine {
 }
 
 impl MongrelStateMachine {
+    /// The durable apply checkpoint (public so engine sinks can seed their
+    /// in-memory watermark after open — review finding m8).
+    pub fn applied_record(&self) -> Result<AppliedRecord, StateMachineError> {
+        self.shared.applied_record()
+    }
+
     /// Opens (creating if needed) the state machine under `<group_dir>/raft/`.
     pub fn open(
         group_dir: &Path,

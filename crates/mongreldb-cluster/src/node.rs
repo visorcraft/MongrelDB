@@ -117,7 +117,14 @@ pub enum ClusterError {
     )]
     NotInitialized,
     /// Another bootstrap workflow holds the bootstrap lock file.
-    #[error("another bootstrap workflow holds the lock {0}")]
+    ///
+    /// Recovery (review **N7**): if no bootstrap is running, remove the
+    /// stale `cluster-meta/bootstrap.lock` (content is pid + timestamp for
+    /// diagnosis) and retry `cluster init` / `join` / `drain`.
+    #[error(
+        "another bootstrap workflow holds the lock {0}; if no init/join/drain is running, \
+         remove that lock file (it holds pid+timestamp) and retry"
+    )]
     BootstrapInProgress(PathBuf),
     /// The target node is absent from the local membership record.
     #[error("node {node} is not present in the cluster membership record")]

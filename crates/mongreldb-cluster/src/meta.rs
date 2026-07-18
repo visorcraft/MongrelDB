@@ -496,6 +496,10 @@ pub const MIN_SUPPORTED_META_STATE_FORMAT_VERSION: u32 = 1;
 pub const COMMAND_TYPE_META_COMMAND: u32 = 4;
 /// Bound on [`MetaState::rejections`] (mirrors the engine catalog's
 /// `COMMAND_HISTORY_LIMIT`).
+/// Bound on the meta rejection journal (review **N6**): proposers read the
+/// journal immediately after local apply via `client_write`, so age-out before
+/// the proposer observes a rejection is not a production hazard. Growing the
+/// journal unboundedly would be worse.
 pub const META_REJECTION_LIMIT: usize = 256;
 /// First per-group raft node id the meta-owned allocator hands out (spec
 /// section 12.1: the meta control plane owns the node-id ↔ raft-id mapping
@@ -1192,6 +1196,13 @@ pub enum MetaCommand {
         record: TableSchemaRecord,
     },
     /// Publishes a tablet descriptor (last-writer-wins by `generation`).
+    ///
+    /// Review **m7**: LWW is the *intended* concurrency model for
+    /// `SetTabletDescriptor` / `SetTableSchema`. Only `UpdateNodeState` and
+    /// `UpdateSchemaJob` carry `expected_version` CAS tokens. Two admins
+    /// doing read-modify-write on one tablet descriptor can lose updates
+    /// silently when the later write carries a higher generation — tooling
+    /// must re-read before rewrite, or use a CAS-guarded command when added.
     SetTabletDescriptor {
         /// The tablet descriptor to publish.
         descriptor: TabletDescriptor,
