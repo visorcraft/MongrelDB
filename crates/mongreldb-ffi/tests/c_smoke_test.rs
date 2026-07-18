@@ -8,7 +8,13 @@ fn c_smoke_test() {
     let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let header = crate_root.join("include/mongreldb.h");
     let c_source = crate_root.join("tests/c_test.c");
-    let lib_path = crate_root.join("target/release");
+    // Respect CARGO_TARGET_DIR (CI Clean release qualification sets this to
+    // /tmp/mongreldb-qualification-target). Without it, link looks under
+    // crates/mongreldb-ffi/target/release and fails with -lmongreldb missing.
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| crate_root.join("target"));
+    let lib_path = target_dir.join("release");
     let sanitize = std::env::var_os("MONGRELDB_C_SANITIZE").is_some();
     let binary = if sanitize {
         "/tmp/mongreldb_c_smoke_sanitize"
@@ -25,6 +31,18 @@ fn c_smoke_test() {
         .status()
         .expect("failed to build C library");
     assert!(status.success(), "failed to build C library");
+
+    assert!(
+        lib_path.join("libmongreldb.so").exists()
+            || lib_path.join("libmongreldb.a").exists()
+            || lib_path.join("libmongreldb.dylib").exists()
+            || lib_path.join("mongreldb.dll").exists()
+            || lib_path.join("libmongreldb.dll").exists()
+            || lib_path.join("libmongreldb.dll.a").exists(),
+        "libmongreldb not found under {} after cargo build --release (CARGO_TARGET_DIR={:?})",
+        lib_path.display(),
+        std::env::var_os("CARGO_TARGET_DIR")
+    );
 
     // Compile the C test, linking against the shared library.
     let mut compiler = Command::new("cc");

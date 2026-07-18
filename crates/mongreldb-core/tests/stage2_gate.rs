@@ -839,18 +839,12 @@ fn ai_and_sql_results_match_standalone_at_the_same_snapshot() {
         replica.table("items").unwrap().lock().flush(),
         Err(MongrelError::ReadOnlyReplica)
     ));
-    let expected_native: Vec<Option<NativeAggResult>> = expected_aggregates
-        .iter()
-        .cloned()
-        .map(Some)
-        .collect();
+    let expected_native: Vec<Option<NativeAggResult>> =
+        expected_aggregates.iter().cloned().map(Some).collect();
     assert_eq!(native_aggregates(&replica, watermark), expected_native);
     // Standalone after flush uses the sorted-run pushdown path.
     standalone.table("items").unwrap().lock().flush().unwrap();
-    assert_eq!(
-        native_aggregates(&standalone, watermark),
-        expected_native
-    );
+    assert_eq!(native_aggregates(&standalone, watermark), expected_native);
     assert_eq!(
         fallback_aggregates(&replica, watermark),
         expected_aggregates

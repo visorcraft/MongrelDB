@@ -2187,7 +2187,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-fault"
-version = "0.59.0"
+version = "0.59.1"
 dependencies = [
  "thiserror 1.0.69",
 ]
@@ -2223,7 +2223,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-log"
-version = "0.59.0"
+version = "0.59.1"
 dependencies = [
  "mongreldb-types",
  "serde",
@@ -2245,6 +2245,7 @@ dependencies = [
  "futures",
  "getrandom 0.2.17",
  "mongreldb-core",
+ "mongreldb-types",
  "parking_lot",
  "regex",
  "serde",
@@ -2258,7 +2259,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-types"
-version = "0.59.0"
+version = "0.59.1"
 dependencies = [
  "getrandom 0.2.17",
  "serde",
