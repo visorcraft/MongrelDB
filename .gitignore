@@ -2,6 +2,7 @@
 target/
 /.cargo/
 PLAN.md
+TODO.md
 AGENTS.md
 CLAUDE.md
 /.claude/
