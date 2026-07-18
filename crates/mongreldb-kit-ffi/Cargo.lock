@@ -2172,9 +2172,9 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-core"
-version = "0.58.4"
+version = "0.59.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "973d980e364a76fde4745def08ea2241263eb46018591b808a0c95d08d836b3d"
+checksum = "babf9b90dc873193b77b3d69f9a7d8445561f17279aa1774b9a756988d2edbc9"
 dependencies = [
  "aes-gcm",
  "arc-swap",
@@ -2207,9 +2207,9 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-kit"
-version = "0.58.4"
+version = "0.59.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "418c6fc1c4365ece0c41a915bc9af3f5efff8d9b3284f7452b42599e53c98b33"
+checksum = "6028f5b6af6a0039a67bacca74471285c4d084a1b63954604c2791e36afa92d3"
 dependencies = [
  "arrow",
  "bincode",
@@ -2227,9 +2227,9 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-kit-core"
-version = "0.58.4"
+version = "0.59.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e0e15b7638c39970b50aa77c4b3af5f87166bbfdbf67a4816be44ec495b39336"
+checksum = "1d35080fcc66ba7f9b6242dd6ddafbbeb0b5d38eb29fb98e225ce25d8187c4a9"
 dependencies = [
  "hex",
  "regex",
@@ -2253,9 +2253,9 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-query"
-version = "0.58.4"
+version = "0.59.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9f9a6912be2381a4f0722eec6ae0d6c3c448b356150424bc2f5e71f6c242dbd"
+checksum = "583e3adff650aaafc7cf3a937434d2050b4512dc94eb287183b3cc2e9809b58e"
 dependencies = [
  "aes-gcm",
  "arrow",
@@ -3035,9 +3035,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.52.4"
+version = "1.53.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "317fafbbe3f02fc663dad00ea6186197de963cd4190e86a26d8d0fae095539af"
+checksum = "d988bcd52dbe076d3d46903332f58c912b87a2c49b1428419a5845154762ffee"
 dependencies = [
  "bytes",
  "pin-project-lite",
@@ -3046,9 +3046,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-macros"
-version = "2.7.0"
+version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "385a6cb71ab9ab790c5fe8d67f1645e6c450a7ce006a33de03daa956cf70a496"
+checksum = "6328af13490e73a9b4694030fafd93f8c8c6a9dede33e821c3fc63eddf8042ba"
 dependencies = [
  "proc-macro2",
  "quote",
