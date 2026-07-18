@@ -16,6 +16,7 @@
 //!   invalidation check (S1D-005).
 
 pub mod envelope;
+pub mod native_transport;
 pub mod prepared;
 pub mod request;
 pub mod services;
@@ -25,6 +26,27 @@ pub mod session;
 /// HTTP/2 transport.
 pub mod native {
     tonic::include_proto!("mongreldb.v1");
+}
+
+pub const NATIVE_API_MAJOR: u32 = 1;
+pub const NATIVE_API_MINOR: u32 = 0;
+
+/// Fail closed when a native request omits its version or uses another major
+/// protocol generation. Newer minor versions remain forward-compatible
+/// through Protobuf unknown-field handling.
+pub fn validate_native_context(
+    context: Option<&native::RequestContext>,
+) -> Result<(), tonic::Status> {
+    let version = context
+        .and_then(|context| context.version.as_ref())
+        .ok_or_else(|| tonic::Status::invalid_argument("native API version is required"))?;
+    if version.major != NATIVE_API_MAJOR {
+        return Err(tonic::Status::failed_precondition(format!(
+            "unsupported native API major {}; supported major is {}",
+            version.major, NATIVE_API_MAJOR
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

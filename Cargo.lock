@@ -2869,8 +2869,10 @@ version = "0.60.3"
 dependencies = [
  "mongreldb-types",
  "prost",
+ "rcgen",
  "serde",
  "thiserror 1.0.69",
+ "tokio",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
@@ -4293,6 +4295,7 @@ dependencies = [
  "socket2",
  "sync_wrapper",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tower",
  "tower-layer",
