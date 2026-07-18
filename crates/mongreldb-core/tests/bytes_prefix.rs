@@ -17,6 +17,7 @@ fn schema() -> Schema {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 2,
@@ -24,6 +25,7 @@ fn schema() -> Schema {
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
         ],
         indexes: vec![IndexDef {

@@ -26,6 +26,7 @@ pub mod core;
 pub mod cursor;
 pub mod database;
 pub mod durable_file;
+pub mod embedding;
 pub mod encryption;
 pub mod engine;
 pub mod epoch;
@@ -104,6 +105,10 @@ pub use database::{
     ExternalTriggerBridge, ExternalTriggerWrite, ExternalTriggerWriteResult, OpenOptions,
     ReadAuthorization, TableGenerationStats, TableGuard, TableHandle, TablePinsReport,
     TableReadGeneration, DEFAULT_MEMORY_BUDGET_BYTES, DEFAULT_TEMP_DISK_BUDGET_BYTES,
+};
+pub use embedding::{
+    EmbeddingError, EmbeddingModelMeta, EmbeddingProvider, EmbeddingProviderRegistry,
+    EmbeddingSource, FixedVectorProvider,
 };
 pub use encryption::{Cipher, PlaintextCipher};
 pub use engine::{

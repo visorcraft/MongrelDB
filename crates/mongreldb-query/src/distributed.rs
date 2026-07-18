@@ -63,8 +63,8 @@ use crate::query_registry::{CancelOutcome, RegisteredSqlQuery, SqlQueryOptions, 
 pub const DEFAULT_BROADCAST_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Default per-fragment maximum spill allowance (spec section 12.10: "every
-/// plan includes ... a maximum spill allowance"). Wiring this allowance to
-/// the core spill governor lands with the execution binding wave.
+/// plan includes ... a maximum spill allowance"). Bound to the core
+/// [`mongreldb_core::SpillManager`] via [`FragmentControl::begin_spill`].
 pub const DEFAULT_MAX_SPILL_BYTES_PER_FRAGMENT: u64 = 256 * 1024 * 1024;
 
 /// Rows per `RecordBatch` emitted by coordinator merge operators.
@@ -1451,6 +1451,19 @@ pub struct FragmentControl {
     pub control: ExecutionControl,
     /// Maximum spill allowance stamped by the planner (spec section 12.10).
     pub max_spill_bytes: u64,
+}
+
+impl FragmentControl {
+    /// Open a core spill session for this fragment against `manager`, capped
+    /// at [`Self::max_spill_bytes`]. Query operators that sort/join/aggregate
+    /// under pressure call this instead of inventing a second spill path.
+    pub fn begin_spill(
+        &self,
+        manager: &mongreldb_core::SpillManager,
+        query_id: mongreldb_types::ids::QueryId,
+    ) -> Result<mongreldb_core::SpillSession, mongreldb_core::SpillError> {
+        manager.begin_query(query_id, self.max_spill_bytes)
+    }
 }
 
 /// Tie information for scored (top-k) streams, carried on a producer's
@@ -3978,6 +3991,29 @@ mod tests {
             .fragments
             .iter()
             .all(|fragment| fragment.max_spill_bytes == 1_234));
+    }
+
+    #[test]
+    fn fragment_control_begin_spill_opens_core_spill_session() {
+        use mongreldb_core::ExecutionControl;
+        use mongreldb_types::ids::QueryId;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Real shipped path: Database::create owns the SpillManager.
+        let db = mongreldb_core::Database::create(dir.path()).unwrap();
+        let control = FragmentControl {
+            control: ExecutionControl::new(None),
+            max_spill_bytes: 64 * 1024,
+        };
+        let session = control
+            .begin_spill(db.spill_manager(), QueryId::from_bytes([0xAB; 16]))
+            .expect("begin_spill binds planner allowance to core SpillManager");
+        let stats = db.spill_manager().stats();
+        assert_eq!(
+            stats.global_budget_bytes,
+            db.spill_manager().config().global_bytes
+        );
+        drop(session);
     }
 
     #[test]

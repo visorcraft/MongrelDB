@@ -423,6 +423,7 @@ async fn admin_sql_show_and_backup_restore_use_live_state() {
     let desc = TabletDescriptor {
         tablet_id,
         table_id: TableId::new(3),
+        database_id: mongreldb_types::ids::DatabaseId::ZERO,
         raft_group_id: raft,
         partition: mongreldb_cluster::tablet::PartitionBounds::unbounded(),
         replicas: vec![ReplicaDescriptor {

@@ -532,12 +532,35 @@ pub(crate) fn try_admin_sql(
                     "readiness_action_example": format!("{readiness:?}"),
                 })
             });
+            let groups: Vec<Value> = state
+                .resource_groups
+                .names()
+                .into_iter()
+                .filter_map(|name| {
+                    state.resource_groups.get(&name).map(|g| {
+                        json!({
+                            "name": g.name,
+                            "max_concurrency": g.max_concurrency,
+                            "max_queue": g.max_queue,
+                            "memory_bytes": g.memory_bytes,
+                            "temporary_disk_bytes": g.temporary_disk_bytes,
+                            "work_units": g.work_units,
+                            "cpu_weight": g.cpu_weight,
+                            "priority": g.priority,
+                            "max_result_bytes": g.max_result_bytes,
+                        })
+                    })
+                })
+                .collect();
+            let embedding_providers = state.embedding_providers.list_ids();
             Json(json!({
                 "command": "SHOW RESOURCE GROUPS",
-                "resource_groups": mongreldb_core::WorkloadClass::ALL
+                "resource_groups": groups,
+                "workload_classes": mongreldb_core::WorkloadClass::ALL
                     .iter()
                     .map(|c| c.name())
                     .collect::<Vec<_>>(),
+                "embedding_providers": embedding_providers,
                 "scheduler": stats.map(|s| json!({
                     "tenants": s.tenants,
                     "per_class": s.per_class,

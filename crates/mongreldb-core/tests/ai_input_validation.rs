@@ -13,6 +13,7 @@ fn schema(dim: u32) -> Schema {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 2,
@@ -20,6 +21,7 @@ fn schema(dim: u32) -> Schema {
                 ty: TypeId::Embedding { dim },
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
         ],
         indexes: vec![IndexDef {
@@ -68,6 +70,7 @@ fn conflicting_representation_indexes_are_rejected() {
         ty: TypeId::Bytes,
         flags: ColumnFlags::empty(),
         default_value: None,
+        embedding_source: None,
     });
     for (name, kind) in [("sparse", IndexKind::Sparse), ("set", IndexKind::MinHash)] {
         schema.indexes.push(IndexDef {
@@ -92,6 +95,7 @@ fn specialized_columns_require_decodable_value_variants() {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 2,
@@ -99,6 +103,7 @@ fn specialized_columns_require_decodable_value_variants() {
                 ty: TypeId::Bytes,
                 flags: nullable,
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 3,
@@ -106,6 +111,7 @@ fn specialized_columns_require_decodable_value_variants() {
                 ty: TypeId::Bytes,
                 flags: nullable,
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 4,
@@ -113,6 +119,7 @@ fn specialized_columns_require_decodable_value_variants() {
                 ty: TypeId::Bytes,
                 flags: nullable,
                 default_value: None,
+                embedding_source: None,
             },
         ],
         indexes: vec![
@@ -219,6 +226,7 @@ fn cross_table_transaction_rejects_specialized_value_before_commit() {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 2,
@@ -226,6 +234,7 @@ fn cross_table_transaction_rejects_specialized_value_before_commit() {
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
         ],
         indexes: vec![IndexDef {

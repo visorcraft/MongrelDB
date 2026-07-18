@@ -28,6 +28,7 @@ fn schema() -> Schema {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 2,
@@ -35,6 +36,7 @@ fn schema() -> Schema {
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
         ],
         indexes: vec![IndexDef {
@@ -103,6 +105,7 @@ fn minhash_intersects_with_another_condition() {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 2,
@@ -110,6 +113,7 @@ fn minhash_intersects_with_another_condition() {
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 3,
@@ -117,6 +121,7 @@ fn minhash_intersects_with_another_condition() {
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
         ],
         indexes: vec![
@@ -213,6 +218,7 @@ fn minhash_scale_timing() {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 2,
@@ -220,6 +226,7 @@ fn minhash_scale_timing() {
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
         ],
         indexes: vec![IndexDef {

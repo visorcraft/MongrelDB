@@ -17,6 +17,7 @@ fn million_row_handle() -> (tempfile::TempDir, TableHandle) {
             ty: TypeId::Int64,
             flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
             default_value: None,
+            embedding_source: None,
         }],
         ..Schema::default()
     };

@@ -16,6 +16,7 @@ fn schema() -> Schema {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 2,
@@ -23,6 +24,7 @@ fn schema() -> Schema {
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 3,
@@ -30,6 +32,7 @@ fn schema() -> Schema {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 4,
@@ -37,6 +40,7 @@ fn schema() -> Schema {
                 ty: TypeId::Float64,
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 5,
@@ -44,6 +48,7 @@ fn schema() -> Schema {
                 ty: TypeId::Float64,
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
         ],
         indexes: vec![
@@ -366,6 +371,7 @@ fn vec_schema() -> Schema {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 2,
@@ -373,6 +379,7 @@ fn vec_schema() -> Schema {
                 ty: TypeId::Embedding { dim: 8 },
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
         ],
         indexes: vec![mongreldb_core::schema::IndexDef {
@@ -440,6 +447,7 @@ fn cities_schema() -> Schema {
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 2,
@@ -447,6 +455,7 @@ fn cities_schema() -> Schema {
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
         ],
         indexes: vec![mongreldb_core::schema::IndexDef {
@@ -553,6 +562,7 @@ async fn streaming_scan_emits_multiple_batches() {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 2,
@@ -560,6 +570,7 @@ async fn streaming_scan_emits_multiple_batches() {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
         ],
         indexes: vec![],
@@ -631,6 +642,7 @@ async fn multi_run_streams_and_limit_short_circuits() {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 2,
@@ -638,6 +650,7 @@ async fn multi_run_streams_and_limit_short_circuits() {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
         ],
         indexes: vec![IndexDef {
@@ -698,6 +711,7 @@ async fn cursor_page_pruning_is_exact() {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 2,
@@ -705,6 +719,7 @@ async fn cursor_page_pruning_is_exact() {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
         ],
         indexes: vec![],
@@ -771,6 +786,7 @@ async fn zero_copy_preserves_nulls() {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 2,
@@ -778,6 +794,7 @@ async fn zero_copy_preserves_nulls() {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
                 default_value: None,
+                embedding_source: None,
             },
         ],
         indexes: vec![],
@@ -1488,6 +1505,7 @@ async fn scored_search_table_functions_return_projected_rows_and_scores() {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 2,
@@ -1495,6 +1513,7 @@ async fn scored_search_table_functions_return_projected_rows_and_scores() {
                 ty: TypeId::Embedding { dim: 8 },
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 3,
@@ -1502,6 +1521,7 @@ async fn scored_search_table_functions_return_projected_rows_and_scores() {
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 4,
@@ -1509,6 +1529,7 @@ async fn scored_search_table_functions_return_projected_rows_and_scores() {
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
         ],
         indexes: vec![
@@ -1670,6 +1691,7 @@ async fn create_minhash_index_after_rows_backfills_candidates() {
                         ty: TypeId::Int64,
                         flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                         default_value: None,
+                        embedding_source: None,
                     },
                     ColumnDef {
                         id: 2,
@@ -1677,6 +1699,7 @@ async fn create_minhash_index_after_rows_backfills_candidates() {
                         ty: TypeId::Bytes,
                         flags: ColumnFlags::empty(),
                         default_value: None,
+                        embedding_source: None,
                     },
                 ],
                 indexes: vec![],

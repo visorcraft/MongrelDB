@@ -19,6 +19,7 @@ fn ai_schema() -> Schema {
                     .with(ColumnFlags::PRIMARY_KEY)
                     .with(ColumnFlags::AUTO_INCREMENT),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 2,
@@ -26,6 +27,7 @@ fn ai_schema() -> Schema {
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
         ],
         indexes: vec![],
@@ -47,6 +49,7 @@ fn ai_int_schema() -> Schema {
                     .with(ColumnFlags::PRIMARY_KEY)
                     .with(ColumnFlags::AUTO_INCREMENT),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 2,
@@ -54,6 +57,7 @@ fn ai_int_schema() -> Schema {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
         ],
         indexes: vec![],
@@ -209,6 +213,7 @@ fn rejects_invalid_auto_inc_schema() {
                 .with(ColumnFlags::PRIMARY_KEY)
                 .with(ColumnFlags::AUTO_INCREMENT),
             default_value: None,
+            embedding_source: None,
         }],
         indexes: vec![],
         colocation: vec![],
@@ -434,6 +439,7 @@ fn no_pk_schema() -> Schema {
             ty: TypeId::Bytes,
             flags: ColumnFlags::empty(),
             default_value: None,
+            embedding_source: None,
         }],
         indexes: vec![],
         colocation: vec![],

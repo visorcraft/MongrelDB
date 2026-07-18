@@ -12,6 +12,7 @@ fn schema(name: &str, fk_action: Option<FkAction>) -> Schema {
         ty: TypeId::Int64,
         flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
         default_value: None,
+        embedding_source: None,
     }];
     let mut constraints = TableConstraints::default();
     if let Some(on_update) = fk_action {
@@ -21,6 +22,7 @@ fn schema(name: &str, fk_action: Option<FkAction>) -> Schema {
             ty: TypeId::Int64,
             flags: ColumnFlags::empty(),
             default_value: None,
+            embedding_source: None,
         });
         constraints.foreign_keys.push(ForeignKey {
             id: 1,

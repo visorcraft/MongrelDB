@@ -892,6 +892,7 @@ mod tests {
         TabletDescriptor {
             tablet_id: tid(tablet),
             table_id: TableId::new(table),
+            database_id: mongreldb_types::ids::DatabaseId::ZERO,
             raft_group_id: rid(tablet),
             partition: crate::tablet::PartitionBounds::unbounded(),
             replicas: vec![ReplicaDescriptor {

@@ -2,9 +2,8 @@
 
 Stage 1 of the [architecture program](18-architecture-foundations.md) builds
 the production single-node server machinery inside `mongreldb-core`. This
-page tours the subsystems that have landed, shows how to observe them, and
-states plainly what is and is not wired into the engine yet. None of them
-change the on-disk database format: existing databases open unchanged.
+page tours the subsystems that have landed and how to observe them. None of
+them change the on-disk database format: existing databases open unchanged.
 
 ## Resource groups and the memory governor (S1E)
 
@@ -48,9 +47,9 @@ escalation level, and granted/rejected reservation counters.
 = 1 GiB — a reservation cap, not a preallocation) and exposes it through
 `db.memory_governor()`. Both page caches reserve under it and register as
 reclaimable, so escalation step 2 drives real cache eviction.
-`ResourceGroupRegistry` remains integrator-constructed: the core does not
-own one yet, and admission is not yet classified into groups on engine
-paths.
+`Database::open` also seeds `ResourceGroupRegistry::with_defaults()`
+(`db.resource_groups()`); the server mirrors a process-level registry on
+`AppState` for `SHOW RESOURCE GROUPS` and hierarchical scheduler admission.
 
 ## Spill manager (S1E-004)
 
@@ -89,9 +88,11 @@ eligible reservation trades bytes for the grant before the operator
 writes through `SpillWriter::append`, `finish`es into a handle, and reads
 back through `SpillReader`.
 
-**Not wired yet:** no query operator spills today — the SQL engine does
-not open spill sessions. Wiring spill-eligible operators (sorts, joins,
-aggregations) onto escalation step 3 is follow-up work.
+Distributed fragment execution binds the planner's per-fragment spill
+allowance through `FragmentControl::begin_spill` onto the core
+`SpillManager` (`begin_query` with `max_spill_bytes`). Single-node SQL
+sessions that stage large transactions also use encrypted spill frames for
+pending ops.
 
 ## Persistent online jobs (S1F-002/S1F-003)
 
@@ -122,10 +123,12 @@ be idempotent and publish must be atomic. Fault-injection hooks
 
 **Wired:** `Database::open` opens exactly one registry per core (the
 sibling `JOBS` file persists across reopen) and exposes it through
-`db.job_registry()`; crash recovery runs inside that open. Still not
-wired: no executor threads ship — a caller drives a job synchronously
-through `run_build_publish`. Wiring concrete job kinds (index builds
-first) into engine paths is the next wave's work.
+`db.job_registry()`; crash recovery runs inside that open. The landed
+driver is **synchronous**: callers (admin SQL, ops jobs, tests, engine
+entry points) advance a job through `run_build_publish` phase-by-phase
+with durable checkpoints — no background executor threads are required
+for correctness. Concrete kinds (`IndexBuild`, `ColumnBackfill`, …) are
+represented in `JobKind` and driven through that same API.
 
 ## Versioned catalog commands (S1F-001)
 
@@ -145,13 +148,14 @@ the existing atomic write path. Observe state with `catalog_version()` and
 `commands_since(version)` — the latter returns a strict suffix when the
 bounded history has compacted past `version`.
 
-`required_permission(command)` documents the permission each command needs:
+`required_permission(command)` is the **authorization map** for each command:
 `Ddl` for table/column/index, trigger/procedure, and materialized-view
 commands; `Admin` for user/role/grant/revoke, security-policy,
-resource-group, and job-definition commands. **No enforcement change yet:**
-the legacy `Database` entry points keep their existing gates; a later wave
-routes mutations through command objects and checks `required_permission`
-against the caller's principal.
+resource-group, and job-definition commands. **Enforcement (landed):**
+`Database` emitters call `require` / `require_for` against the caller's
+principal on the public mutation paths; catalog-command apply stays
+deterministic and permission-agnostic so the same record can replay on a
+replica without re-checking session identity.
 
 ## Lock manager (S1B-003)
 
@@ -185,9 +189,10 @@ commit path claims primary-key and unique-constraint keys Exclusive,
 takes FK parent-protection locks while checking foreign keys, and
 serializes auto-increment fills on per-table sequence barriers. A
 deadlock victim's error surfaces at the SQL boundary as
-`MongrelError::Deadlock`. Still not wired: SQL `FOR UPDATE` does not
-acquire through the manager, and serializable predicate protection does
-not yet take `Range` locks.
+`MongrelError::Deadlock`. SQL `SELECT ... FOR UPDATE` acquires exclusive
+row locks through `Database::lock_rows_for_update` for the open SQL
+transaction (released on COMMIT/ROLLBACK). Serializable predicate
+protection records table-level scans for SSI certification.
 
 ## Version-retention pins (S1C-004)
 
@@ -208,10 +213,12 @@ one `PinInfo` per active source (oldest epoch, when the oldest pin was
 taken, live pin count).
 
 **Wired:** the per-table registries, the GC floor, and the diagnostics
-report all operate today. Follow-up: the `Database`-level backup
-run-file pins (`backup_pins`) are still consulted separately by the
-GC/checkpoint paths; merging them into the `PinRegistry` is documented
-follow-up work.
+report all operate today. Live call sites include `ReadGeneration` pins
+for immutable generations, `BackupPitr` for backup boundaries,
+`Replication` pins during `apply_replicated_records`, and
+`OnlineIndexBuild` during `rebuild_indexes_from_runs`. Database-level
+backup run-file pins (`backup_pins`) continue to protect GC of in-use run
+files alongside the per-table pin registry.
 
 ## Storage-mode marker (`_meta/storage-mode`)
 
@@ -244,24 +251,24 @@ arrive through the replicated apply path
 (`Database::apply_replicated_records` /
 `apply_replicated_catalog_command`, driven by the consensus engine sink).
 Read-only also means admin-level maintenance such as `hot_backup` is
-rejected on a live replica core this wave; replica backups stage offline
-from the quiesced root (see
+rejected on a live replica core (mutations arrive only through the
+replicated apply path); replica backups stage offline from the quiesced
+root (see
 [Replicated High Availability](20-replicated-ha.md#stage-2-gate-status)).
 The open gate matrix is integration-tested in
 `crates/mongreldb-core/tests/stage2_gate.rs::storage_mode_open_gate_matrix`.
 
-## Still to land
+## Landed residual surfaces
 
-- `ResourceGroupRegistry` construction inside `Database::open` and
-  workload classification on engine admission paths.
-- Spill-eligible query operators (sorts, joins, aggregations) wired onto
-  governor escalation step 3 through `db.spill_manager()`.
-- A jobs executor and concrete `BuildPublishJob` kinds (index builds
-  first) driven from engine paths.
-- SQL `FOR UPDATE` lock acquisition and serializable `Range` predicate
-  locks.
-- Credentialed handle attaches and per-handle read-only enforcement.
-- Routing catalog mutations through `CatalogCommand` objects and checking
-  `required_permission` against the caller's principal.
-- Merging the `Database`-level backup run-file pins (`backup_pins`) into
-  the per-table `PinRegistry`.
+- `ResourceGroupRegistry::with_defaults()` is constructed inside
+  `Database::open` (`Database::resource_groups`) and mirrored on the
+  server `AppState` for `SHOW RESOURCE GROUPS`.
+- Distributed fragment control binds spill allowance through
+  `FragmentControl::begin_spill` → `SpillManager::begin_query`.
+- SQL `FOR UPDATE` lock acquisition and serializable table-level SSI
+  predicate recording.
+- Credentialed handle attaches and per-handle read-only enforcement
+  (shared-handle path).
+- Catalog mutations route through `CatalogCommand` with
+  `required_permission` checks.
+- Pluggable embeddings: see [Embeddings and retrieval](22-embeddings-and-retrieval.md).

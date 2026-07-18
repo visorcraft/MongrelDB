@@ -100,6 +100,7 @@ fn column(id: u16, name: &str, ty: TypeId, primary_key: bool) -> ColumnDef {
             ColumnFlags::empty()
         },
         default_value: None,
+        embedding_source: None,
     }
 }
 

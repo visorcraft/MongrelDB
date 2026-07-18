@@ -18,11 +18,10 @@
 //! endpoints, trust material) and refuses to run when a persisted identity
 //! names a different cluster (S2A-001, [`ClusterError::ClusterIdentityMismatch`]).
 //!
-//! Trust material is caller-supplied PEM: [`TrustConfig::generate`] fails
-//! closed with [`ClusterError::Unsupported`] until the mTLS stage lands — no
-//! CA is implemented here. The node key is never logged: [`TrustConfig`]'s
-//! `Debug` implementation redacts it, and [`cluster_status`] returns a
-//! key-free [`TrustSummary`].
+//! Trust material is PEM: callers may supply PEMs via [`TrustConfig::from_pems`]
+//! or mint a bootstrap CA + first node cert with [`TrustConfig::generate`].
+//! The node key is never logged: [`TrustConfig`]'s `Debug` implementation
+//! redacts it, and [`cluster_status`] returns a key-free [`TrustSummary`].
 //!
 //! Every durable write is atomic (synced temporary file, rename, directory
 //! fsync; see [`crate::node`]), every durable file carries a format version
@@ -63,10 +62,9 @@ pub const JOIN_RECORD_FORMAT_VERSION: u32 = 1;
 
 /// Cluster CA/trust configuration (S2A-002).
 ///
-/// All material is caller-supplied PEM; [`TrustConfig::generate`] fails
-/// closed until the mTLS stage implements CA issuance. `node_key_pem` is the
-/// node's private key: it is redacted from `Debug` output and must never be
-/// logged by callers.
+/// Trust PEMs may be operator-supplied ([`Self::from_pems`]) or minted
+/// ([`Self::generate`]). `node_key_pem` is the node's private key: it is
+/// redacted from `Debug` output and must never be logged by callers.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TrustConfig {
@@ -98,13 +96,65 @@ impl TrustConfig {
         Ok(config)
     }
 
-    /// Mint fresh CA and node certificates. Not implemented: CA issuance
-    /// lands with the mTLS stage, so this fails closed.
-    pub fn generate(_allowed_node_ids: Vec<NodeId>) -> Result<Self, ClusterError> {
-        Err(ClusterError::Unsupported(
-            "generating cluster CA/trust material lands with the mTLS stage; \
-             supply existing PEMs via TrustConfig::from_pems",
-        ))
+    /// Mint a fresh cluster CA and a node certificate for the first admitted
+    /// node id (CN/SAN = [`crate::network::node_cert_name`]). Remaining
+    /// `allowed_node_ids` are admitted for handshake identity checks; mint
+    /// per-node certs for them via ops tooling as they join.
+    ///
+    /// Production deployments may still supply PEMs via [`Self::from_pems`];
+    /// this path is for bootstrap and test fixtures without external PKI.
+    pub fn generate(allowed_node_ids: Vec<NodeId>) -> Result<Self, ClusterError> {
+        if allowed_node_ids.is_empty() {
+            return Err(ClusterError::InvalidTrustMaterial(
+                "allowed_node_ids is empty; an empty list admits no peers",
+            ));
+        }
+        let ca_key = rcgen::KeyPair::generate()
+            .map_err(|_| ClusterError::InvalidTrustMaterial("CA key generation failed"))?;
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new())
+            .map_err(|_| ClusterError::InvalidTrustMaterial("CA certificate params invalid"))?;
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "MongrelDB Cluster CA");
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+            rcgen::KeyUsagePurpose::DigitalSignature,
+        ];
+        let ca_cert = ca_params
+            .self_signed(&ca_key)
+            .map_err(|_| ClusterError::InvalidTrustMaterial("CA self-sign failed"))?;
+        let ca_cert_pem = ca_cert.pem();
+
+        let node_id = allowed_node_ids[0];
+        let node_name = crate::network::node_cert_name(&node_id);
+        let node_key = rcgen::KeyPair::generate()
+            .map_err(|_| ClusterError::InvalidTrustMaterial("node key generation failed"))?;
+        let mut node_params = rcgen::CertificateParams::new(vec![node_name.clone()])
+            .map_err(|_| ClusterError::InvalidTrustMaterial("node certificate params invalid"))?;
+        node_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, node_name);
+        node_params.key_usages = vec![
+            rcgen::KeyUsagePurpose::DigitalSignature,
+            rcgen::KeyUsagePurpose::KeyEncipherment,
+        ];
+        node_params.extended_key_usages = vec![
+            rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+            rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        let node_cert = node_params
+            .signed_by(&node_key, &ca_cert, &ca_key)
+            .map_err(|_| ClusterError::InvalidTrustMaterial("node certificate signing failed"))?;
+        let config = Self {
+            ca_cert_pem,
+            node_cert_pem: node_cert.pem(),
+            node_key_pem: node_key.serialize_pem(),
+            allowed_node_ids,
+        };
+        config.validate()?;
+        Ok(config)
     }
 
     /// Fail-closed structural validation: every PEM must carry armor, and
@@ -669,10 +719,22 @@ mod tests {
     }
 
     #[test]
-    fn trust_generate_fails_closed_until_mtls() {
-        let error = TrustConfig::generate(vec![NodeId::new_random()]).unwrap_err();
+    fn trust_generate_mints_valid_pems() {
+        let node = NodeId::new_random();
+        let trust = TrustConfig::generate(vec![node]).expect("generate");
+        assert!(trust.ca_cert_pem.contains("BEGIN CERTIFICATE"));
+        assert!(trust.node_cert_pem.contains("BEGIN CERTIFICATE"));
+        assert!(trust.node_key_pem.contains("BEGIN"));
+        assert_eq!(trust.allowed_node_ids, vec![node]);
+        // Must be loadable as real mTLS material.
+        crate::network::TlsConfig::from_trust(&trust).expect("tls from generated trust");
+    }
+
+    #[test]
+    fn trust_generate_rejects_empty_admission() {
+        let error = TrustConfig::generate(vec![]).unwrap_err();
         assert!(
-            matches!(error, ClusterError::Unsupported(_)),
+            matches!(error, ClusterError::InvalidTrustMaterial(_)),
             "unexpected: {error}"
         );
     }

@@ -175,6 +175,7 @@ fn app_rows_schema() -> Schema {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 2,
@@ -182,6 +183,7 @@ fn app_rows_schema() -> Schema {
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
         ],
         indexes: vec![],
@@ -335,6 +337,7 @@ fn app_txn_schema() -> Schema {
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 2,
@@ -342,6 +345,7 @@ fn app_txn_schema() -> Schema {
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
                 default_value: None,
+                embedding_source: None,
             },
         ],
         indexes: vec![],
@@ -445,6 +449,7 @@ fn orders_schema() -> Schema {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 2,
@@ -452,6 +457,7 @@ fn orders_schema() -> Schema {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
         ],
         indexes: vec![],
@@ -471,6 +477,7 @@ fn customers_schema() -> Schema {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 2,
@@ -478,6 +485,7 @@ fn customers_schema() -> Schema {
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
         ],
         indexes: vec![],
@@ -616,6 +624,7 @@ async fn join_and_planning_diagnostics() {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 2,
@@ -623,6 +632,7 @@ async fn join_and_planning_diagnostics() {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
         ],
         indexes: vec![IndexDef {

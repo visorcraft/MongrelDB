@@ -4,12 +4,13 @@ Stage 3 of the [architecture program](18-architecture-foundations.md)
 partitions one logical database across independently replicated **tablets**:
 a dedicated meta Raft group owns the control plane, every table declares a
 partition key, tablets carry the data, and a placement engine keeps replicas
-balanced and quorum-safe. This page tours the landed machinery in
-`mongreldb-cluster` and states plainly what is still in progress. The Stage 2
-replication machinery it builds on (one Raft group per database, durability
-levels, read consistency, failover) is described in
-[Replicated High Availability](20-replicated-ha.md); the single-node
-subsystems in [Single-Node Subsystems](19-single-node-subsystems.md).
+balanced and quorum-safe. This page tours the machinery in
+`mongreldb-cluster` and the Stage 3 gate surfaces (meta, tablets, dist txn,
+gateway, cluster backup). The Stage 2 replication machinery it builds on
+(one Raft group per database, durability levels, read consistency, failover)
+is described in [Replicated High Availability](20-replicated-ha.md); the
+single-node subsystems in
+[Single-Node Subsystems](19-single-node-subsystems.md).
 
 The normative decisions live in three ADRs:
 [ADR-0006](architecture/adr/0006-tablet-partitioning-model.md) (tablet
@@ -247,11 +248,13 @@ Production deployments must run `TransportSecurity::Mtls`:
   `PlaintextForTesting` exists for loopback tests only — an unauthenticated
   raft port lets any process inject votes and entries into the group.
 
-Trust material is operator-supplied PEM (CA generation is not implemented in
-the binary — `TrustConfig::generate` fails closed) loaded from a trust
-directory (`ca-cert.pem`, `node-cert.pem`, `node-key.pem`) and persisted to
+Trust material is PEM (CA + node cert + key) loaded from a trust directory
+(`ca-cert.pem`, `node-cert.pem`, `node-key.pem`) and persisted to
 `<db-dir>/cluster-meta/trust.json`; keep that directory on owner-only
-storage. The checked-in test fixtures under
+storage. Operators may supply PEMs via `TrustConfig::from_pems`, or mint a
+bootstrap CA and first node cert with `TrustConfig::generate`. Live rotation
+uses `NodeRuntime::reload_trust` / `TcpTransport::reload_security` without a
+full restart. The checked-in test fixtures under
 `crates/mongreldb-cluster/tests/fixtures/` document the exact certificate
 shape (EC P-256, `basicConstraints=CA:FALSE`, EKU serverAuth+clientAuth)
 and regenerate with `./regenerate.sh` (OpenSSL 3.x); they are test-only
@@ -285,10 +288,11 @@ registered in the transport's dispatch registry under its meta-allocated
 occupies). Shutdown drains the listener first, then stops every group
 (fsync, raft stop), then releases the tablet ownership guards.
 
-The engine binding of tablet groups is interim: each group binds a
-`ClusterReplica` core whose database id is derived deterministically from
-the raft group id (stable across restarts, identical on every replica)
-until distributed DDL lands the meta-driven table-to-database resolution.
+Each tablet group binds a `ClusterReplica` core. Database id resolution
+order (`resolve_tablet_database_id`): non-zero `TabletDescriptor.database_id`
+from meta publish, else live meta `table_id → database_id`, else a
+deterministic raft-group-derived id for legacy pre-metadata tablets
+(stable across restarts and identical on every replica).
 
 ## Tablet split and merge (spec §12.5/§12.6)
 
@@ -330,9 +334,11 @@ and group flows are unit- and group-tested (idempotent replays, prepare
 conflicts, coordinator failover recovery, expiry pushes, orphan sweeps),
 and the engine binding materializes committed intents into MVCC row
 versions via `apply_replicated_records` at `commit_ts`. Server gateway
-routing of multi-tablet writes goes through the tablet groups (not a
-file-open bypass); treat full multi-node production orchestration as the
-remaining operational binding.
+routing of multi-tablet writes goes through tablet groups via
+`RoutingCache`/`RetryPolicy` (never a file-open bypass). Multi-node
+operation uses `NodeRuntime` (identity, mTLS transport, meta + tablet
+group lifecycle) and §15 admin SQL for drain, leader transfer, movement,
+split/merge, and backup/restore.
 
 ## Landed Stage 3 residual (S3L + gateway)
 

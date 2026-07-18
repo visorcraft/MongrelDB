@@ -353,6 +353,7 @@ impl SchemaBuilder {
             ty,
             flags,
             default_value: None,
+            embedding_source: None,
         });
         Ok(())
     }

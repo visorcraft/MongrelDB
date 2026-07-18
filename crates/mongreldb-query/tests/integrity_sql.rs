@@ -26,6 +26,7 @@ fn main_schema() -> Schema {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 2,
@@ -33,6 +34,7 @@ fn main_schema() -> Schema {
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 3,
@@ -40,6 +42,7 @@ fn main_schema() -> Schema {
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 4,
@@ -47,6 +50,7 @@ fn main_schema() -> Schema {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 5,
@@ -54,6 +58,7 @@ fn main_schema() -> Schema {
                 ty: TypeId::Float64,
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
         ],
         indexes: vec![
@@ -102,6 +107,7 @@ fn ann_schema() -> Schema {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 2,
@@ -109,6 +115,7 @@ fn ann_schema() -> Schema {
                 ty: TypeId::Embedding { dim: 8 },
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
         ],
         indexes: vec![IndexDef {
@@ -134,6 +141,7 @@ fn orders_schema() -> Schema {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 2,
@@ -141,6 +149,7 @@ fn orders_schema() -> Schema {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
         ],
         indexes: vec![],
@@ -160,6 +169,7 @@ fn customers_schema() -> Schema {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 2,
@@ -167,6 +177,7 @@ fn customers_schema() -> Schema {
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
         ],
         indexes: vec![],
@@ -842,6 +853,7 @@ async fn schema_evolution_reads_null_for_old_rows() {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 2,
@@ -849,6 +861,7 @@ async fn schema_evolution_reads_null_for_old_rows() {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
         ],
         indexes: vec![],

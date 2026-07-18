@@ -44,6 +44,7 @@ fn main() {
             ColumnFlags::empty()
         },
         default_value: None,
+        embedding_source: None,
     };
     let mut table = Table::create(
         dir.path(),

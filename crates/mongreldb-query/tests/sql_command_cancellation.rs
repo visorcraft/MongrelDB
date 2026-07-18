@@ -762,6 +762,7 @@ async fn foreign_key_check_stream_checkpoint_is_cancellable() {
             ty: TypeId::Int64,
             flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
             default_value: None,
+            embedding_source: None,
         }],
         indexes: Vec::new(),
         colocation: Vec::new(),
@@ -775,6 +776,7 @@ async fn foreign_key_check_stream_checkpoint_is_cancellable() {
         ty: TypeId::Int64,
         flags: ColumnFlags::empty(),
         default_value: None,
+        embedding_source: None,
     });
     child_schema.constraints.foreign_keys.push(ForeignKey {
         id: 1,

@@ -23,6 +23,7 @@ fn table() -> (tempfile::TempDir, Table) {
             ColumnFlags::empty()
         },
         default_value: None,
+        embedding_source: None,
     };
     let schema = Schema {
         columns: vec![
@@ -337,6 +338,7 @@ fn ann_table(dim: u32) -> (tempfile::TempDir, Table) {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 2,
@@ -344,6 +346,7 @@ fn ann_table(dim: u32) -> (tempfile::TempDir, Table) {
                 ty: TypeId::Embedding { dim },
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
         ],
         indexes: vec![IndexDef {
@@ -414,6 +417,7 @@ fn set_table(member_count: usize) -> (tempfile::TempDir, Table) {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 2,
@@ -421,6 +425,7 @@ fn set_table(member_count: usize) -> (tempfile::TempDir, Table) {
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
         ],
         indexes: vec![IndexDef {
@@ -690,6 +695,7 @@ fn authorized_lock_wait_observes_deadline() {
                     ty: TypeId::Int64,
                     flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                     default_value: None,
+                    embedding_source: None,
                 }],
                 ..Schema::default()
             },
@@ -739,6 +745,7 @@ fn scored_read_generation_does_not_hold_write_lock() {
                     ty: TypeId::Int64,
                     flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                     default_value: None,
+                    embedding_source: None,
                 }],
                 ..Schema::default()
             },
@@ -805,6 +812,7 @@ fn scored_read_generation_pins_run_files_across_compaction_gc() {
                         ty: TypeId::Int64,
                         flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                         default_value: None,
+                        embedding_source: None,
                     },
                     ColumnDef {
                         id: 2,
@@ -812,6 +820,7 @@ fn scored_read_generation_pins_run_files_across_compaction_gc() {
                         ty: TypeId::Bytes,
                         flags: ColumnFlags::empty(),
                         default_value: None,
+                        embedding_source: None,
                     },
                 ],
                 indexes: vec![IndexDef {
@@ -927,6 +936,7 @@ fn read_generations_are_immutable_shared_and_cow_free() {
                     ty: TypeId::Int64,
                     flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                     default_value: None,
+                    embedding_source: None,
                 }],
                 ..Schema::default()
             },

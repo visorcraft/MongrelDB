@@ -26,6 +26,7 @@ fn int_pk_schema() -> Schema {
             ty: TypeId::Int64,
             flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
             default_value: None,
+            embedding_source: None,
         }],
         indexes: vec![],
         colocation: vec![],
@@ -44,6 +45,7 @@ fn two_column_schema() -> Schema {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 2,
@@ -51,6 +53,7 @@ fn two_column_schema() -> Schema {
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
         ],
         ..Schema::default()
@@ -67,6 +70,7 @@ fn three_column_schema() -> Schema {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 2,
@@ -74,6 +78,7 @@ fn three_column_schema() -> Schema {
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 3,
@@ -81,6 +86,7 @@ fn three_column_schema() -> Schema {
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
         ],
         ..Schema::default()
@@ -256,6 +262,7 @@ fn secure_native_wrappers_apply_rls_masks_and_live_revocation() {
                         ty: TypeId::Int64,
                         flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                         default_value: None,
+                        embedding_source: None,
                     },
                     ColumnDef {
                         id: 2,
@@ -263,6 +270,7 @@ fn secure_native_wrappers_apply_rls_masks_and_live_revocation() {
                         ty: TypeId::Bytes,
                         flags: ColumnFlags::empty(),
                         default_value: None,
+                        embedding_source: None,
                     },
                     ColumnDef {
                         id: 3,
@@ -270,6 +278,7 @@ fn secure_native_wrappers_apply_rls_masks_and_live_revocation() {
                         ty: TypeId::Bytes,
                         flags: ColumnFlags::empty(),
                         default_value: None,
+                        embedding_source: None,
                     },
                     ColumnDef {
                         id: 4,
@@ -277,6 +286,7 @@ fn secure_native_wrappers_apply_rls_masks_and_live_revocation() {
                         ty: TypeId::Embedding { dim: 2 },
                         flags: ColumnFlags::empty(),
                         default_value: None,
+                        embedding_source: None,
                     },
                     ColumnDef {
                         id: 5,
@@ -284,6 +294,7 @@ fn secure_native_wrappers_apply_rls_masks_and_live_revocation() {
                         ty: TypeId::Int64,
                         flags: ColumnFlags::empty(),
                         default_value: None,
+                        embedding_source: None,
                     },
                 ],
                 indexes: vec![IndexDef {

@@ -14,6 +14,7 @@ fn id_schema() -> Schema {
             ty: TypeId::Int64,
             flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
             default_value: None,
+            embedding_source: None,
         }],
         ..Schema::default()
     }
@@ -417,6 +418,7 @@ fn open_pins_canonical_root_when_alias_is_replaced() {
                     ty: TypeId::Int64,
                     flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                     default_value: None,
+                    embedding_source: None,
                 }],
                 ..Schema::default()
             },
@@ -523,6 +525,7 @@ fn durable_extension_state_stays_on_pinned_root_after_root_swap() {
                     ty: TypeId::Int64,
                     flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                     default_value: None,
+                    embedding_source: None,
                 }],
                 ..Schema::default()
             },

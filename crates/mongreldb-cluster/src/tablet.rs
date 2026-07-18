@@ -584,6 +584,12 @@ pub struct TabletDescriptor {
     pub tablet_id: TabletId,
     /// Table the tablet belongs to.
     pub table_id: TableId,
+    /// Logical database owning the table (meta-resolved). When zero on a
+    /// legacy descriptor, the runtime resolves via meta
+    /// `table_id → database_id` before falling back to a deterministic
+    /// raft-group-derived id for pre-metadata tablets only.
+    #[serde(default = "crate::tablet::zero_database_id")]
+    pub database_id: mongreldb_types::ids::DatabaseId,
     /// Raft group replicating the tablet.
     pub raft_group_id: RaftGroupId,
     /// Key range the tablet covers.
@@ -596,6 +602,10 @@ pub struct TabletDescriptor {
     pub generation: u64,
     /// Lifecycle state; transitions go through [`Self::try_transition`].
     pub state: TabletState,
+}
+
+fn zero_database_id() -> mongreldb_types::ids::DatabaseId {
+    mongreldb_types::ids::DatabaseId::ZERO
 }
 
 impl TabletDescriptor {
@@ -2095,6 +2105,7 @@ mod tests {
         TabletDescriptor {
             tablet_id: tablet_id(9),
             table_id: TableId::new(3),
+            database_id: mongreldb_types::ids::DatabaseId::ZERO,
             raft_group_id: group_id(7),
             partition: bounds(
                 Bound::Included(text_key("a")),

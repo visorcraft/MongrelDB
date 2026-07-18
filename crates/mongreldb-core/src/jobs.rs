@@ -2,11 +2,13 @@
 //!
 //! This module delivers the Stage 1F job framework: the S1F-002 job state
 //! machine with a persisted registry, and the S1F-003 build-and-publish
-//! driver as a reusable protocol others implement (index builds first).
-//! Wiring concrete job kinds into engine paths (index build, backfill, ...)
-//! is the next wave's integration work; this wave deliberately contains no
-//! executor threads — a caller drives a job synchronously through
-//! [`run_build_publish`], and the engine scheduler arrives with the wiring.
+//! driver ([`run_build_publish`]) as a reusable protocol for every
+//! [`JobKind`] (index builds, backfills, validation, …).
+//!
+//! **Design (landed):** jobs are advanced **synchronously** by the caller
+//! (admin/ops entry points, tests, engine paths). There is no separate
+//! background executor thread pool — phase checkpoints make resume after
+//! crash or pause correct without one.
 //!
 //! # State machine (S1F-002)
 //!
@@ -28,8 +30,8 @@
 //! RollingBack -> Failed        (rollback finished; terminal)
 //! ```
 //!
-//! `Succeeded` and `Failed` are terminal. There is no retry edge in this
-//! wave: a failed job is resubmitted as a new job id.
+//! `Succeeded` and `Failed` are terminal. There is no in-place retry edge:
+//! a failed job is resubmitted as a new job id.
 //!
 //! # Persistence
 //!
@@ -65,7 +67,7 @@
 //! - `Cancelling -> Failed`: the crash itself completed the cancellation.
 //! - `RollingBack -> Failed`: the crash interrupted rollback; the recorded
 //!   error is annotated. Unpublished generations orphaned by an interrupted
-//!   rollback are reclaimed by the integration wave's publish/GC paths.
+//!   rollback are reclaimed by the publish/GC paths of the driving surface.
 //!
 //! `Paused`, `Pending`, `Succeeded`, and `Failed` records reopen unchanged.
 //!
@@ -212,9 +214,10 @@ impl JobState {
     }
 }
 
-/// The S1F-002 job kinds (spec section 10.6). Wiring each kind into engine
-/// paths is the next wave's work; the framework is kind-agnostic beyond
-/// light target validation in [`JobRegistry::submit`].
+/// The S1F-002 job kinds (spec section 10.6). The framework is kind-agnostic
+/// beyond light target validation in [`JobRegistry::submit`]; each kind is
+/// driven through [`run_build_publish`] (or an equivalent phase driver) by
+/// the calling surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobKind {
     /// Online secondary-index build (the S1F-003 reference case).
@@ -312,7 +315,7 @@ pub struct JobRecord {
 }
 
 /// Typed errors of the jobs framework. `From<JobError> for MongrelError`
-/// below maps them onto the engine error for the integration wave.
+/// maps them onto the engine error taxonomy for callers.
 #[derive(Debug, thiserror::Error)]
 pub enum JobError {
     /// No record with this id exists.
@@ -652,8 +655,8 @@ struct RegistryInner {
 ///
 /// The registry takes no lock of its own: the database directory's
 /// `_meta/.lock` (held by the owning `Database`) already rejects concurrent
-/// independent handles, and the integration wave will open at most one
-/// registry per storage core.
+/// independent handles, and `Database::open` constructs exactly one registry
+/// per storage core.
 pub struct JobRegistry {
     root: DurableRoot,
     meta_dek: Option<[u8; META_DEK_LEN]>,

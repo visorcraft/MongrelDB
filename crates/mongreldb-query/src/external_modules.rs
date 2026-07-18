@@ -1249,6 +1249,7 @@ fn json_column(id: u16, name: &str, ty: TypeId, nullable: bool) -> CoreColumnDef
             ColumnFlags::empty()
         },
         default_value: None,
+        embedding_source: None,
     }
 }
 
@@ -1459,6 +1460,7 @@ fn catalog_column(id: u16, name: &str, ty: TypeId, nullable: bool) -> CoreColumn
             ColumnFlags::empty()
         },
         default_value: None,
+        embedding_source: None,
     }
 }
 
@@ -2219,6 +2221,7 @@ fn kv_store_schema() -> CoreSchema {
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             },
             CoreColumnDef {
                 id: 2,
@@ -2226,6 +2229,7 @@ fn kv_store_schema() -> CoreSchema {
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
                 default_value: None,
+                embedding_source: None,
             },
         ],
         indexes: Vec::new(),
@@ -2669,6 +2673,7 @@ fn fts_docs_schema() -> CoreSchema {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             },
             CoreColumnDef {
                 id: 2,
@@ -2676,6 +2681,7 @@ fn fts_docs_schema() -> CoreSchema {
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
                 default_value: None,
+                embedding_source: None,
             },
             CoreColumnDef {
                 id: 3,
@@ -2683,6 +2689,7 @@ fn fts_docs_schema() -> CoreSchema {
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
                 default_value: None,
+                embedding_source: None,
             },
             CoreColumnDef {
                 id: 4,
@@ -2690,6 +2697,7 @@ fn fts_docs_schema() -> CoreSchema {
                 ty: TypeId::Float64,
                 flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
                 default_value: None,
+                embedding_source: None,
             },
             CoreColumnDef {
                 id: 5,
@@ -2697,6 +2705,7 @@ fn fts_docs_schema() -> CoreSchema {
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
                 default_value: None,
+                embedding_source: None,
             },
             CoreColumnDef {
                 id: 6,
@@ -2704,6 +2713,7 @@ fn fts_docs_schema() -> CoreSchema {
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
                 default_value: None,
+                embedding_source: None,
             },
         ],
         indexes: Vec::new(),
@@ -3644,6 +3654,7 @@ fn rtree_rects_schema() -> CoreSchema {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             },
             rect_column(2, "min_x"),
             rect_column(3, "max_x"),
@@ -3668,6 +3679,7 @@ fn rect_column(id: u16, name: &str) -> CoreColumnDef {
         ty: TypeId::Float64,
         flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
         default_value: None,
+        embedding_source: None,
     }
 }
 
@@ -3737,6 +3749,7 @@ impl ExternalTableModule for SeriesModule {
                         ty: TypeId::Int64,
                         flags: ColumnFlags::empty(),
                         default_value: None,
+                        embedding_source: None,
                     },
                     CoreColumnDef {
                         id: 2,
@@ -3744,6 +3757,7 @@ impl ExternalTableModule for SeriesModule {
                         ty: TypeId::Int64,
                         flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
                         default_value: None,
+                        embedding_source: None,
                     },
                     CoreColumnDef {
                         id: 3,
@@ -3751,6 +3765,7 @@ impl ExternalTableModule for SeriesModule {
                         ty: TypeId::Int64,
                         flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
                         default_value: None,
+                        embedding_source: None,
                     },
                     CoreColumnDef {
                         id: 4,
@@ -3758,6 +3773,7 @@ impl ExternalTableModule for SeriesModule {
                         ty: TypeId::Int64,
                         flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
                         default_value: None,
+                        embedding_source: None,
                     },
                 ],
                 indexes: Vec::new(),

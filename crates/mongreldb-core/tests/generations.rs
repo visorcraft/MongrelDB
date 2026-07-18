@@ -20,6 +20,7 @@ fn pk_schema() -> Schema {
             ty: TypeId::Int64,
             flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
             default_value: None,
+            embedding_source: None,
         }],
         indexes: vec![],
         colocation: vec![],
@@ -41,6 +42,7 @@ fn versioned_schema() -> Schema {
             ColumnFlags::empty().with(ColumnFlags::NULLABLE)
         },
         default_value: None,
+        embedding_source: None,
     };
     Schema {
         schema_id: 1,
@@ -62,6 +64,7 @@ fn ann_schema() -> Schema {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 2,
@@ -69,6 +72,7 @@ fn ann_schema() -> Schema {
                 ty: TypeId::Embedding { dim: 8 },
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
         ],
         indexes: vec![IndexDef {

@@ -14,6 +14,7 @@ fn pk(id: u16, name: &str, ty: TypeId) -> ColumnDef {
         ty,
         flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
         default_value: None,
+        embedding_source: None,
     }
 }
 
@@ -24,6 +25,7 @@ fn default_col(id: u16, name: &str, ty: TypeId, dv: DefaultExpr) -> ColumnDef {
         ty,
         flags: ColumnFlags::empty(),
         default_value: Some(dv),
+        embedding_source: None,
     }
 }
 
@@ -34,6 +36,7 @@ fn nullable_default_col(id: u16, name: &str, ty: TypeId, dv: DefaultExpr) -> Col
         ty,
         flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
         default_value: Some(dv),
+        embedding_source: None,
     }
 }
 

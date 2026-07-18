@@ -36,6 +36,7 @@ impl ExternalTableModule for ServerRowsModule {
                         ty: TypeId::Int64,
                         flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                         default_value: None,
+                        embedding_source: None,
                     },
                     ColumnDef {
                         id: 2,
@@ -43,6 +44,7 @@ impl ExternalTableModule for ServerRowsModule {
                         ty: TypeId::Bytes,
                         flags: ColumnFlags::empty(),
                         default_value: None,
+                        embedding_source: None,
                     },
                 ],
                 indexes: Vec::new(),
@@ -480,6 +482,7 @@ async fn legacy_drop_table_preserves_durable_commit_outcome() {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             }],
             ..Schema::default()
         },
@@ -506,6 +509,7 @@ async fn legacy_drop_table_returns_exact_commit_receipt() {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             }],
             ..Schema::default()
         },
@@ -589,6 +593,7 @@ async fn history_retention_cannot_restore_lost_history() {
                     ty: TypeId::Int64,
                     flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                     default_value: None,
+                    embedding_source: None,
                 },
                 ColumnDef {
                     id: 2,
@@ -596,6 +601,7 @@ async fn history_retention_cannot_restore_lost_history() {
                     ty: TypeId::Int64,
                     flags: ColumnFlags::empty(),
                     default_value: None,
+                    embedding_source: None,
                 },
             ],
             indexes: Vec::new(),

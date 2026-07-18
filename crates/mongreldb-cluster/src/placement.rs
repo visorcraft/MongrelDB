@@ -1090,6 +1090,7 @@ mod tests {
         TabletDescriptor {
             tablet_id: tablet_id(byte),
             table_id: TableId::new(7),
+            database_id: mongreldb_types::ids::DatabaseId::ZERO,
             raft_group_id: RaftGroupId::from_bytes([byte.wrapping_add(64); 16]),
             partition: PartitionBounds::unbounded(),
             replicas: voters

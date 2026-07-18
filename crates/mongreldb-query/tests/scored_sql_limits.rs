@@ -17,6 +17,7 @@ async fn session() -> (tempfile::TempDir, MongrelSession) {
                     ty: TypeId::Int64,
                     flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                     default_value: None,
+                    embedding_source: None,
                 },
                 ColumnDef {
                     id: 2,
@@ -24,6 +25,7 @@ async fn session() -> (tempfile::TempDir, MongrelSession) {
                     ty: TypeId::Embedding { dim: 8 },
                     flags: ColumnFlags::empty(),
                     default_value: None,
+                    embedding_source: None,
                 },
                 ColumnDef {
                     id: 3,
@@ -31,6 +33,7 @@ async fn session() -> (tempfile::TempDir, MongrelSession) {
                     ty: TypeId::Bytes,
                     flags: ColumnFlags::empty(),
                     default_value: None,
+                    embedding_source: None,
                 },
             ],
             indexes: vec![

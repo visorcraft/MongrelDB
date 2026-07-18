@@ -1781,6 +1781,10 @@ struct SqlTransactionState {
     /// transaction's `track_predicate_read` at `COMMIT` so core certification
     /// treats a concurrent write on any of them as a phantom invalidation.
     predicate_reads: std::collections::BTreeSet<String>,
+    /// Lock-manager identity for `SELECT ... FOR UPDATE` holds acquired during
+    /// this SQL transaction. Allocated lazily on first FOR UPDATE; released on
+    /// COMMIT/ROLLBACK via [`Database::release_txn_locks`].
+    for_update_txn_id: Option<u64>,
 }
 
 /// `(sql, snapshot_epoch) → cached result batches`.
@@ -2711,6 +2715,63 @@ impl MongrelSession {
             .unwrap_or_else(|| *self.session_isolation.read());
         let reads = transaction.predicate_reads.iter().cloned().collect();
         (isolation, reads)
+    }
+
+    /// Drop the open SQL transaction state and release any `FOR UPDATE` locks.
+    pub(crate) fn clear_sql_transaction(&self) {
+        let lock_txn = {
+            let mut transaction = self.transaction.lock();
+            let id = transaction.for_update_txn_id.take();
+            *transaction = SqlTransactionState::default();
+            id
+        };
+        if let (Some(txn_id), Some(db)) = (lock_txn, self.database.as_ref()) {
+            db.release_txn_locks(txn_id);
+        }
+    }
+
+    /// Ensure a lock-manager txn id exists for FOR UPDATE holds in the open
+    /// SQL transaction. Errors if no transaction is open.
+    pub(crate) fn ensure_for_update_txn_id(&self) -> Result<u64> {
+        let db = self.database.as_ref().ok_or_else(|| {
+            MongrelQueryError::Schema("FOR UPDATE requires a Database-backed session".into())
+        })?;
+        let mut transaction = self.transaction.lock();
+        if transaction.staged_ops.is_none() {
+            return Err(MongrelQueryError::Schema(
+                "FOR UPDATE requires an open transaction (BEGIN)".into(),
+            ));
+        }
+        if let Some(id) = transaction.for_update_txn_id {
+            return Ok(id);
+        }
+        let id = db.allocate_lock_txn_id()?;
+        transaction.for_update_txn_id = Some(id);
+        Ok(id)
+    }
+
+    /// Apply `SELECT ... FOR UPDATE` locks for a simple single-table SELECT:
+    /// exclusive row locks on every currently visible matching row of `table`.
+    pub(crate) fn apply_for_update_locks(&self, table: &str) -> Result<()> {
+        let db = self.database.as_ref().ok_or_else(|| {
+            MongrelQueryError::Schema("FOR UPDATE requires a Database-backed session".into())
+        })?;
+        let txn_id = self.ensure_for_update_txn_id()?;
+        let handle = db.table(table)?;
+        let table_id = {
+            let t = handle.lock();
+            t.table_id()
+        };
+        let row_ids: Vec<mongreldb_core::RowId> = {
+            let t = handle.lock();
+            let snap = t.snapshot();
+            t.visible_rows(snap)?
+                .into_iter()
+                .map(|row| row.row_id)
+                .collect()
+        };
+        db.lock_rows_for_update(txn_id, table_id, &row_ids, None)?;
+        Ok(())
     }
 
     /// Feed every base table a DataFusion plan scans into the SSI predicate
@@ -4171,6 +4232,7 @@ impl MongrelSession {
         // result cache like the normal path. Returns None (→ fall through) for
         // any shape it cannot serve exactly.
         if let Some(batches) = self.try_direct_dispatch(sql, query)? {
+            self.maybe_apply_for_update(sql)?;
             if result_cacheable {
                 query.checkpoint()?;
                 self.cache.lock().insert(key, Arc::new(batches.clone()));
@@ -4217,11 +4279,61 @@ impl MongrelSession {
                 t.scan_mode = mongreldb_core::trace::ScanMode::ExternalModule;
             });
         }
+        self.maybe_apply_for_update(sql)?;
         if result_cacheable {
             query.checkpoint()?;
             self.cache.lock().insert(key, Arc::new(batches.clone()));
         }
         Ok(batches)
+    }
+
+    /// When `sql` is `SELECT ... FOR UPDATE`, acquire exclusive row locks on
+    /// the referenced base table for the open SQL transaction (spec §10.2).
+    fn maybe_apply_for_update(&self, sql: &str) -> Result<()> {
+        use sqlparser::ast::{LockType, SetExpr, Statement, TableFactor};
+        use sqlparser::dialect::PostgreSqlDialect;
+        use sqlparser::parser::Parser;
+
+        let Ok(stmts) = Parser::parse_sql(&PostgreSqlDialect {}, sql) else {
+            return Ok(());
+        };
+        let Some(Statement::Query(query)) = stmts.into_iter().next() else {
+            return Ok(());
+        };
+        let wants_update = query
+            .locks
+            .iter()
+            .any(|lock| matches!(lock.lock_type, LockType::Update));
+        if !wants_update {
+            return Ok(());
+        }
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            return Err(MongrelQueryError::Schema(
+                "FOR UPDATE requires a simple SELECT".into(),
+            ));
+        };
+        if select.from.len() != 1 {
+            return Err(MongrelQueryError::Schema(
+                "FOR UPDATE currently supports a single base table".into(),
+            ));
+        }
+        let table = match &select.from[0].relation {
+            TableFactor::Table { name, .. } => {
+                // ObjectName displays as schema.table; take the last segment.
+                let full = name.to_string();
+                full.rsplit('.')
+                    .next()
+                    .unwrap_or(&full)
+                    .trim_matches('"')
+                    .to_string()
+            }
+            _ => {
+                return Err(MongrelQueryError::Schema(
+                    "FOR UPDATE requires a base table (not a subquery)".into(),
+                ));
+            }
+        };
+        self.apply_for_update_locks(&table)
     }
 
     /// [`Self::run`] with a captured [`mongreldb_core::trace::QueryTrace`].
@@ -5869,6 +5981,7 @@ fn parse_create_table(sql: &str) -> Result<(String, mongreldb_core::schema::Sche
             ty,
             flags,
             default_value: None,
+            embedding_source: None,
         });
     }
 

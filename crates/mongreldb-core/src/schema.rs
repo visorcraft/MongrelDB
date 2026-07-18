@@ -166,6 +166,14 @@ pub struct ColumnDef {
     /// old catalogs without this field deserialize to `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_value: Option<DefaultExpr>,
+    /// How dense embedding values for this column are produced. Only meaningful
+    /// when `ty` is [`TypeId::Embedding`]. Defaults to
+    /// [`crate::embedding::EmbeddingSource::SuppliedByApplication`] when absent
+    /// (old catalogs and application-written vectors). Storage never hard-codes
+    /// an external vendor from this field — see
+    /// [`crate::embedding::EmbeddingProviderRegistry`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_source: Option<crate::embedding::EmbeddingSource>,
 }
 
 /// Metadata updates supported by native ALTER COLUMN.
@@ -178,6 +186,10 @@ pub struct AlterColumn {
     /// `Some(Some(expr))` = set/replace default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_value: Option<Option<DefaultExpr>>,
+    /// `None` = leave embedding source unchanged, `Some(None)` = clear to
+    /// application-supplied default, `Some(Some(source))` = set/replace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_source: Option<Option<crate::embedding::EmbeddingSource>>,
 }
 
 impl AlterColumn {
@@ -187,6 +199,7 @@ impl AlterColumn {
             ty: None,
             flags: None,
             default_value: None,
+            embedding_source: None,
         }
     }
 
@@ -196,6 +209,7 @@ impl AlterColumn {
             ty: Some(ty),
             flags: None,
             default_value: None,
+            embedding_source: None,
         }
     }
 
@@ -205,6 +219,7 @@ impl AlterColumn {
             ty: None,
             flags: Some(flags),
             default_value: None,
+            embedding_source: None,
         }
     }
 
@@ -214,6 +229,7 @@ impl AlterColumn {
             ty: None,
             flags: None,
             default_value: Some(Some(expr)),
+            embedding_source: None,
         }
     }
 
@@ -223,6 +239,18 @@ impl AlterColumn {
             ty: None,
             flags: None,
             default_value: Some(None),
+            embedding_source: None,
+        }
+    }
+
+    /// Set or replace the embedding source metadata for an embedding column.
+    pub fn set_embedding_source(source: crate::embedding::EmbeddingSource) -> Self {
+        Self {
+            name: None,
+            ty: None,
+            flags: None,
+            default_value: None,
+            embedding_source: Some(Some(source)),
         }
     }
 }
@@ -951,6 +979,7 @@ mod tests {
             ty,
             flags,
             default_value: None,
+            embedding_source: None,
         }
     }
 
@@ -1118,6 +1147,7 @@ mod tests {
             ty,
             flags,
             default_value: Some(dv),
+            embedding_source: None,
         }
     }
 

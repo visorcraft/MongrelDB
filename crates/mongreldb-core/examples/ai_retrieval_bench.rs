@@ -101,6 +101,7 @@ fn schema() -> Schema {
             ColumnFlags::empty()
         },
         default_value: None,
+        embedding_source: None,
     };
     Schema {
         schema_id: 1,
@@ -163,6 +164,7 @@ fn realistic_profile() -> serde_json::Value {
             ColumnFlags::empty()
         },
         default_value: None,
+        embedding_source: None,
     };
     let mut table = Table::create(
         dir.path(),

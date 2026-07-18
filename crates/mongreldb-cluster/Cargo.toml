@@ -16,6 +16,7 @@ tokio = { version = "1.52.3", features = ["sync", "rt", "time", "macros", "net",
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging"] }
 rustls-pemfile = "2"
+rcgen = "0.13"
 # openraft types appear verbatim in the consensus `RaftTransport` trait
 # surface (request/response and RPC error types) and are not re-exported, so
 # implementing the trait here requires the direct edge; the version and

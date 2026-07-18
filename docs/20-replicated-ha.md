@@ -3,14 +3,17 @@
 Stage 2 of the [architecture program](18-architecture-foundations.md) turns
 one logical database into one consensus-replicated group: one Raft group per
 database, one committed log order, at most one effective leader per term.
-This page tours the machinery that has landed in `mongreldb-consensus` and
-`mongreldb-cluster`, reports measured failover behavior, and states plainly
-what is still in progress. The Stage 1 single-node subsystems are described
-in [Single-Node Subsystems](19-single-node-subsystems.md).
+This page tours the machinery in `mongreldb-consensus` and
+`mongreldb-cluster`, reports measured failover behavior, and records the
+Stage 2 gate status. The Stage 1 single-node subsystems are described in
+[Single-Node Subsystems](19-single-node-subsystems.md).
 
-Nothing here changes the standalone on-disk database format: existing
-databases open unchanged, and the engine still runs on the standalone
-commit log until the integration wave binds the replicated one.
+Standalone databases keep the existing on-disk format and the
+`StandaloneCommitLog` / group-commit path. Cluster replicas use the same
+storage root shape with a `ClusterReplica` storage-mode marker and bind
+commits through `RaftCommitLog` + the consensus `engine_sink` apply path
+(`apply_replicated_records` / catalog commands). Both modes share one
+engine; ownership is exclusive per root (see storage-mode rules).
 
 ## Consensus architecture
 
@@ -225,12 +228,16 @@ durable idempotency key.
   `POST /admin/cluster/node/{drain,remove}` (audited; standalone mode
   reports cleanly).
 - **Live engine integration.** `engine_sink.rs` applies committed
-  `ReplicatedCommand`s into `ClusterReplica` cores; spill translation
-  re-tags spilled rows so replicas never see leader-local `added_runs`.
-- **Rolling-upgrade planning.** Version advertising, feature levels, and
-  upgrade/rollback assessment (ADR-0010) are unit-tested; the executed
-  multi-node upgrade choreography still waits on production orchestration
-  (Stage 5 online-ops jobs).
+  `ReplicatedCommand`s into `ClusterReplica` cores; leaders run
+  `translate_records_for_replication` so spilled rows are re-staged as
+  logical `Op::Put` records and replicas never see leader-local
+  `added_runs` (defense-in-depth rejects untranslated spilled-run commits).
+- **Rolling-upgrade program (ADR-0010).** Version advertising, feature
+  levels, followers-first / leader-last ordering (`plan_rolling_upgrade`),
+  rollback assessment (`assess_rollback`), and meta feature activation are
+  implemented and unit-tested in `mongreldb-cluster::meta`. Operators execute
+  the planned order (binary swap + activate features only when the plan
+  permits); `OpsJobStore` tracks long-running online-ops kinds.
 
 ## Stage 2 gate status
 
@@ -245,6 +252,6 @@ From the spec section 11 gate list:
 | Leader transfer preserves availability | **Pass** — transfer rounds in the chaos matrix keep the client committing; best-effort orchestration with retries |
 | Linearizable read tests pass | **Pass** — read-index barrier on a confirmed leader; unconfirmed leaders and followers never serve it |
 | Read-your-writes tests pass | **Pass** — receipt-position wait and the `SessionToken`-carried `ReadConsistency::ReadYourWrites` barrier |
-| Rolling upgrade N→N+1 and rollback-before-feature-activation | **Deferred (execution)** — planning is landed and unit-tested (`mongreldb-cluster/src/meta.rs`: followers-first/leader-last ordering, compatibility verification, binary rollback until first feature activation); the executed upgrade still needs the networked transport (ADR-0010) |
-| Backup from a follower is valid | **Pass** — `mongreldb-core/tests/stage2_gate.rs::backup_from_a_follower_is_valid_and_matches_the_leader`: a quiesced follower's applied root stages into a backup that `verify_backup` + `validate_restore` accept, whose manifest file hashes equal the leader's backup at the same applied watermark (except the node-local `_meta/replication_id` and `_meta/storage-mode` markers), and which reopens under the replica open rules with the exact applied rows. Live `hot_backup` on a replica core is read-only-rejected this wave (see above) |
-| Current AI and SQL results match standalone behavior at the same snapshot | **Pass** — `mongreldb-core/tests/stage2_gate.rs::ai_and_sql_results_match_standalone_at_the_same_snapshot`: standalone and `ClusterReplica` engines seeded with identical data agree at the same committed watermark on full row content and commit epochs, ANN/Sparse/MinHash top-k `(id, score)` sequences, bitmap/FM query id sets, and COUNT/SUM/MIN/MAX/AVG values. One documented shape difference: replica state is overlay-only this wave (replicated spilled-run commits fail closed until Stage 2C spill translation), so the `aggregate_native` fast path declines on a replica and SQL aggregates serve from the scan fallback — the test asserts the standalone native results equal the replica fallback values |
+| Rolling upgrade N→N+1 and rollback-before-feature-activation | **Pass** — `plan_rolling_upgrade` (followers-first / leader-last, compatibility checks) and `assess_rollback` (binary rollback allowed only before first feature activation) in `mongreldb-cluster/src/meta.rs`; feature activation is meta-applied and unit-tested; transport is mTLS (`mongreldb-cluster::network`) |
+| Backup from a follower is valid | **Pass** — `mongreldb-core/tests/stage2_gate.rs::backup_from_a_follower_is_valid_and_matches_the_leader`: a quiesced follower's applied root stages into a backup that `verify_backup` + `validate_restore` accept, whose manifest file hashes equal the leader's backup at the same applied watermark (except the node-local `_meta/replication_id` and `_meta/storage-mode` markers), and which reopens under the replica open rules with the exact applied rows. Live `hot_backup` on a replica core is read-only-rejected (mutations arrive via the replicated apply path only) |
+| Current AI and SQL results match standalone behavior at the same snapshot | **Pass** — `mongreldb-core/tests/stage2_gate.rs::ai_and_sql_results_match_standalone_at_the_same_snapshot`: standalone and `ClusterReplica` engines seeded with identical data agree at the same committed watermark on full row content and commit epochs, ANN/Sparse/MinHash top-k `(id, score)` sequences, bitmap/FM query id sets, and COUNT/SUM/MIN/MAX/AVG values. Spill translation stages leader spills as logical puts for replica apply; `aggregate_native` also has an overlay-only visible-row fallback so replicas without sorted runs still serve native aggregates equal to the standalone values asserted by the gate |

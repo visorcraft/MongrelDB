@@ -27,49 +27,46 @@
 //! the same record against the same catalog version is an idempotent no-op
 //! (see [`Catalog::apply_command`]).
 //!
-//! # Authorization boundary (spec §4.6)
+//! # Authorization boundary (spec §4.6) — landed design
 //!
-//! [`required_permission`] documents the permission every command requires,
-//! mirroring the checks the legacy `Database` entry points perform today:
+//! [`required_permission`] is the **permission map** for every command:
 //!
 //! - table/column/index, trigger/procedure, and materialized-view commands
 //!   require [`Permission::Ddl`];
 //! - user/role/grant/revoke, RLS-policy/column-mask, resource-group, and
 //!   job-definition commands require [`Permission::Admin`].
 //!
-//! This wave introduces **no enforcement changes**: the existing `require` /
-//! `require_for` gates on the legacy paths are untouched. When a later wave
-//! routes mutations through command objects, the emitter MUST check
-//! `required_permission` against the caller's principal before proposing a
-//! command, so authorization is evaluated against the current replicated
-//! security metadata and revocation stays effective without reopening the
-//! storage core.
+//! **Enforcement sits on the emitter, not in pure apply.** `Database`
+//! mutation entry points call `require` / `require_for` against the caller's
+//! principal (using the same map) before proposing or applying catalog work.
+//! [`apply`] / [`Catalog::apply_command`] remain deterministic and
+//! principal-free so a replica can replay an already-authorized record
+//! without re-evaluating session identity. Emitters that propose
+//! `CatalogCommand`s MUST check `required_permission` against the current
+//! principal so revocation stays effective without reopening the core.
 //!
-//! # Forward references — reconciled
+//! # Canonical type aliases
 //!
-//! The forward-reference placeholders called out here in earlier waves are
-//! now reconciled to their canonical types:
+//! - [`ResourceGroupDef`] is a compatibility alias for
+//!   [`crate::resource::ResourceGroup`]. `SetResourceGroup` keeps name-only
+//!   validation; full group invariants live in
+//!   [`crate::resource::ResourceGroup::validate`].
+//! - [`JobDefinition`] is the catalog-level job-definition record; `kind` /
+//!   `state` re-export the S1F-002 types in [`crate::jobs`]. `SetJobState`
+//!   only guards terminal states; the full transition machine belongs to the
+//!   `JOBS` registry.
 //!
-//! - [`ResourceGroupDef`] is a compatibility alias for the S1E-002
-//!   [`crate::resource::ResourceGroup`] (the serde shape of that canonical
-//!   type is the durable contract). `SetResourceGroup` keeps the legacy
-//!   name-only validation; S1E-002's own invariants live in
-//!   [`crate::resource::ResourceGroup::validate`], not on this path.
-//! - [`JobDefinition`] keeps the catalog-level job-definition record, with its
-//!   `kind`/`state` fields re-exported from the canonical S1F-002 types in
-//!   [`crate::jobs`]. `SetJobState` only guards the terminal states; the full
-//!   transition machine belongs to the `JOBS` registry.
+//! Released CATALOG files carry none of these keys (serde-defaulted fields),
+//! so they open unchanged.
 //!
-//! Released CATALOG files carry none of these keys (the fields are
-//! serde-defaulted in `Catalog`), so they open unchanged.
-//!
-//! # Surface intentionally left on the legacy path this wave
+//! # Surfaces not expressed as catalog commands
 //!
 //! Databases (the catalog is single-database; `db_epoch`/id counters remain
 //! engine-managed), external tables, hidden CTAS building-table states,
 //! SQLite pragmas (`user_version`/`application_id`), and `require_auth`
-//! bootstrap. `db_epoch` is NOT bumped by command application — epochs stay
-//! the commit sequencer's authority; `catalog_version` orders commands.
+//! bootstrap stay on direct `Database`/`Catalog` fields. `db_epoch` is NOT
+//! bumped by command application — epochs stay the commit sequencer's
+//! authority; `catalog_version` orders commands.
 
 use crate::auth::{Permission, RoleEntry, UserEntry};
 use crate::catalog::{Catalog, CatalogEntry, MaterializedViewEntry, TableState};
@@ -641,8 +638,8 @@ impl CatalogDelta {
 }
 
 /// The permission the emitting layer must hold to propose `command`
-/// (spec §4.6 authorization-boundary note; no enforcement change this wave —
-/// see module docs).
+/// (spec §4.6). Pure map: `Database` enforces via `require` / `require_for`
+/// before mutation; apply paths do not re-check principals (see module docs).
 pub fn required_permission(command: &CatalogCommand) -> Permission {
     match command {
         CatalogCommand::CreateTable { .. }
@@ -1543,6 +1540,7 @@ mod tests {
                     ty: TypeId::Int64,
                     flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                     default_value: None,
+                    embedding_source: None,
                 },
                 ColumnDef {
                     id: 2,
@@ -1550,6 +1548,7 @@ mod tests {
                     ty: TypeId::Bytes,
                     flags: ColumnFlags::empty(),
                     default_value: None,
+                    embedding_source: None,
                 },
             ],
             indexes: vec![],

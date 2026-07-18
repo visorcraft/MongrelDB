@@ -39,11 +39,10 @@
 //!
 //! [`TransportSecurity::PlaintextForTesting`] exists for loopback tests only.
 //!
-//! Certificate rotation (review **N8**) is restart-bound this wave:
-//! `TrustConfig` loads at boot and the TLS acceptor is not hot-reloaded.
-//! webpki still rejects expired certs at handshake, so an expired node cert
-//! takes the node out of the cluster until restart with fresh material.
-//! Online rotation is an S5E ops-job follow-up.
+//! Certificate rotation (review **N8**): mTLS material may be hot-reloaded via
+//! [`TcpTransport::reload_security`] / `NodeRuntime::reload_trust` without
+//! restarting the accept task (new handshakes pick up rotated PEMs). webpki
+//! still rejects expired certs at handshake.
 //!
 //! # Failure semantics
 //!
@@ -791,7 +790,9 @@ async fn read_frame_inner<S: AsyncRead + Unpin>(
 /// connection; see the module documentation for the rationale and bounds.
 pub struct TcpTransport {
     config: TransportConfig,
-    security: TransportSecurity,
+    /// Shared with the accept loop so [`Self::reload_security`] rotates mTLS
+    /// material without restarting the node (N8).
+    security: Arc<std::sync::RwLock<TransportSecurity>>,
     peers: Arc<Mutex<HashMap<RaftNodeId, PeerEndpoint>>>,
     registry: TransportRegistry,
 }
@@ -801,10 +802,32 @@ impl TcpTransport {
     pub fn new(config: TransportConfig, security: TransportSecurity) -> Self {
         Self {
             config,
-            security,
+            security: Arc::new(std::sync::RwLock::new(security)),
             peers: Arc::new(Mutex::new(HashMap::new())),
             registry: TransportRegistry::new(),
         }
+    }
+
+    /// Hot-reload mTLS material. New handshakes use the updated PEMs;
+    /// established connections keep their current TLS session until close.
+    pub fn reload_security(&self, security: TransportSecurity) {
+        *self
+            .security
+            .write()
+            .expect("transport security lock poisoned") = security;
+    }
+
+    /// Snapshot of the current security mode (for diagnostics / peer endpoints).
+    pub fn security(&self) -> TransportSecurity {
+        self.security
+            .read()
+            .expect("transport security lock poisoned")
+            .clone()
+    }
+
+    /// Shared security slot for [`TransportServer::bind_shared`].
+    pub fn security_handle(&self) -> Arc<std::sync::RwLock<TransportSecurity>> {
+        Arc::clone(&self.security)
     }
 
     /// The registry a [`TransportServer`] binds to dispatch inbound RPCs to
@@ -939,7 +962,12 @@ impl TcpTransport {
             Err(_) => return Err(TransportError::Timeout(self.config.connect_timeout)),
         };
         let _ = tcp.set_nodelay(true);
-        match &self.security {
+        let security = self
+            .security
+            .read()
+            .expect("transport security lock poisoned")
+            .clone();
+        match security {
             TransportSecurity::PlaintextForTesting => Ok(ClientStream::Plain(tcp)),
             TransportSecurity::Mtls(tls) => {
                 let server_name = peer_server_name(peer)?;
@@ -1150,7 +1178,10 @@ impl fmt::Debug for TcpTransport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TcpTransport")
             .field("config", &self.config)
-            .field("security", &self.security)
+            .field(
+                "security",
+                &*self.security.read().unwrap_or_else(|e| e.into_inner()),
+            )
             .field("peers", &self.peers.lock().map(|peers| peers.len()))
             .field("registry", &self.registry)
             .finish()
@@ -1177,6 +1208,11 @@ pub struct TransportServer {
     local_addr: SocketAddr,
     shutdown: Option<watch::Sender<bool>>,
     task: Option<JoinHandle<()>>,
+    /// Shared with [`TcpTransport`] so mTLS material can rotate without
+    /// restarting the accept task (N8). Held so the accept task and any
+    /// future status APIs observe the same slot.
+    #[allow(dead_code)]
+    security: Arc<std::sync::RwLock<TransportSecurity>>,
 }
 
 impl TransportServer {
@@ -1189,12 +1225,29 @@ impl TransportServer {
         registry: TransportRegistry,
         config: TransportConfig,
     ) -> Result<Self, TransportError> {
+        Self::bind_shared(
+            address,
+            Arc::new(std::sync::RwLock::new(security)),
+            registry,
+            config,
+        )
+        .await
+    }
+
+    /// Like [`Self::bind`], sharing the security slot with a [`TcpTransport`]
+    /// so [`TcpTransport::reload_security`] affects new inbound handshakes.
+    pub async fn bind_shared(
+        address: &str,
+        security: Arc<std::sync::RwLock<TransportSecurity>>,
+        registry: TransportRegistry,
+        config: TransportConfig,
+    ) -> Result<Self, TransportError> {
         let listener = TcpListener::bind(address).await?;
         let local_addr = listener.local_addr()?;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let task = tokio::spawn(Self::accept_loop(
             listener,
-            security,
+            Arc::clone(&security),
             registry,
             config,
             shutdown_rx,
@@ -1203,6 +1256,7 @@ impl TransportServer {
             local_addr,
             shutdown: Some(shutdown_tx),
             task: Some(task),
+            security,
         })
     }
 
@@ -1224,7 +1278,7 @@ impl TransportServer {
 
     async fn accept_loop(
         listener: TcpListener,
-        security: TransportSecurity,
+        security: Arc<std::sync::RwLock<TransportSecurity>>,
         registry: TransportRegistry,
         config: TransportConfig,
         mut shutdown: watch::Receiver<bool>,
@@ -1240,9 +1294,13 @@ impl TransportServer {
                         Ok((stream, _peer)) => {
                             match permits.clone().try_acquire_owned() {
                                 Ok(permit) => {
+                                    let current = security
+                                        .read()
+                                        .expect("transport security lock poisoned")
+                                        .clone();
                                     connections.spawn(Self::serve_connection(
                                         stream,
-                                        security.clone(),
+                                        current,
                                         registry.clone(),
                                         config.clone(),
                                         permit,
@@ -1753,6 +1811,28 @@ mod tests {
     }
 
     // -- peer directory ---------------------------------------------------------
+
+    #[test]
+    fn reload_security_swaps_material_for_new_handshakes() {
+        let transport = TcpTransport::new(
+            TransportConfig::default(),
+            TransportSecurity::PlaintextForTesting,
+        );
+        assert!(matches!(
+            transport.security(),
+            TransportSecurity::PlaintextForTesting
+        ));
+        let node = node_id(1);
+        let tls = node1_tls(&[node]);
+        transport.reload_security(TransportSecurity::Mtls(tls));
+        assert!(matches!(transport.security(), TransportSecurity::Mtls(_)));
+        // Shared handle used by TransportServer::bind_shared observes the same slot.
+        let handle = transport.security_handle();
+        assert!(matches!(
+            &*handle.read().expect("lock"),
+            TransportSecurity::Mtls(_)
+        ));
+    }
 
     #[test]
     fn peer_directory_crud() {

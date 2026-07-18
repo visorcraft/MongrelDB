@@ -340,6 +340,7 @@ async fn kit_ai_routes_require_every_used_column() {
                     ty: TypeId::Int64,
                     flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                     default_value: None,
+                    embedding_source: None,
                 },
                 ColumnDef {
                     id: 2,
@@ -347,6 +348,7 @@ async fn kit_ai_routes_require_every_used_column() {
                     ty: TypeId::Bytes,
                     flags: ColumnFlags::empty(),
                     default_value: None,
+                    embedding_source: None,
                 },
                 ColumnDef {
                     id: 3,
@@ -354,6 +356,7 @@ async fn kit_ai_routes_require_every_used_column() {
                     ty: TypeId::Bytes,
                     flags: ColumnFlags::empty(),
                     default_value: None,
+                    embedding_source: None,
                 },
                 ColumnDef {
                     id: 4,
@@ -361,6 +364,7 @@ async fn kit_ai_routes_require_every_used_column() {
                     ty: TypeId::Embedding { dim: 2 },
                     flags: ColumnFlags::empty(),
                     default_value: None,
+                    embedding_source: None,
                 },
                 ColumnDef {
                     id: 5,
@@ -368,6 +372,7 @@ async fn kit_ai_routes_require_every_used_column() {
                     ty: TypeId::Bytes,
                     flags: ColumnFlags::empty(),
                     default_value: None,
+                    embedding_source: None,
                 },
                 ColumnDef {
                     id: 6,
@@ -375,6 +380,7 @@ async fn kit_ai_routes_require_every_used_column() {
                     ty: TypeId::Bytes,
                     flags: ColumnFlags::empty(),
                     default_value: None,
+                    embedding_source: None,
                 },
             ],
             indexes: vec![
@@ -538,6 +544,7 @@ async fn kit_ai_deadline_bounds_table_lock_wait_and_releases_worker() {
                     ty: TypeId::Int64,
                     flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                     default_value: None,
+                    embedding_source: None,
                 },
                 ColumnDef {
                     id: 2,
@@ -545,6 +552,7 @@ async fn kit_ai_deadline_bounds_table_lock_wait_and_releases_worker() {
                     ty: TypeId::Bytes,
                     flags: ColumnFlags::empty(),
                     default_value: None,
+                    embedding_source: None,
                 },
             ],
             indexes: vec![IndexDef {

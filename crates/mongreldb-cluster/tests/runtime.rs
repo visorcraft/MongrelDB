@@ -189,6 +189,7 @@ fn tablet_descriptor(
     TabletDescriptor {
         tablet_id,
         table_id,
+        database_id: DatabaseId::ZERO,
         raft_group_id,
         partition: PartitionBounds::unbounded(),
         replicas,
@@ -1003,6 +1004,7 @@ async fn create_tablet_on_cluster(
     let raft_ids = meta.allocate_raft_node_ids(3, &control).await.unwrap();
     let tablet = TabletDescriptor {
         tablet_id: TabletId::new_random(),
+        database_id: mongreldb_types::ids::DatabaseId::ZERO,
         table_id,
         raft_group_id: RaftGroupId::new_random(),
         partition,

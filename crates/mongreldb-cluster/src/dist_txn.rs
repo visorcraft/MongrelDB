@@ -4323,6 +4323,7 @@ mod tests {
         let tablet = TabletDescriptor {
             tablet_id: tid(7),
             table_id: TableId::new(3),
+            database_id: mongreldb_types::ids::DatabaseId::ZERO,
             raft_group_id: gid(42),
             partition: PartitionBounds::unbounded(),
             replicas: Vec::new(),

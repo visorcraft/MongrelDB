@@ -194,17 +194,18 @@ Negative / costs:
 
 ## Reversal Strategy
 
-The native protocol is additive; nothing durable depends on it until Stage 2
-replication writes envelope-encoded commands. Reversal is therefore possible
-in stages:
+The native protocol is additive. Stage 2+ replication now writes
+envelope-encoded commands; older release trains that never saw those
+commands remain reversible as follows:
 
-- **Before Stage 2:** remove the native listener and `mongreldb-protocol`;
-  HTTP/JSON + Kit remain the whole surface. No data migration is needed
-  because the adapter model keeps storage formats untouched.
-- **After durable commands exist:** envelope-decoding is versioned and
-  fail-closed, so even a full protocol rollback leaves persisted commands
-  readable by any build that supports their `format_version`. A rollback build
-  simply refuses newer versions instead of corrupting state.
+- **Standalone / pre-replication roots:** remove the native listener and
+  `mongreldb-protocol`; HTTP/JSON + Kit remain the whole surface. No data
+  migration is needed because the adapter model keeps storage formats
+  untouched.
+- **After durable commands exist (current HA/cluster):** envelope-decoding is
+  versioned and fail-closed, so even a full protocol rollback leaves persisted
+  commands readable by any build that supports their `format_version`. A
+  rollback build simply refuses newer versions instead of corrupting state.
 - **Compatibility floor:** HTTP/JSON + Kit are never removed as part of this
   decision, so clients always have a working surface to fall back to. The
   irreversible step is external operational reliance on native-only features

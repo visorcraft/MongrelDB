@@ -82,6 +82,7 @@ async fn compact_status_preserves_durable_outcome_after_detailed_eviction() {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             }],
             ..Schema::default()
         },
@@ -346,6 +347,7 @@ async fn buffered_output_limit_preserves_and_reports_earlier_commits() {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             }],
             ..Schema::default()
         },
@@ -416,6 +418,7 @@ async fn arrow_stream_output_limits_are_visible_through_query_status() {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             }],
             ..Schema::default()
         },
@@ -825,6 +828,7 @@ async fn buffered_cancel_after_earlier_commit_reports_durable_outcome() {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             }],
             ..Schema::default()
         },
@@ -962,6 +966,7 @@ async fn dropping_arrow_stream_cancels_and_cleans_registry_entry() {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             }],
             ..Schema::default()
         },
@@ -1303,6 +1308,7 @@ async fn commit_fence_returns_too_late_and_preserves_commit_after_response_drop(
                     ty: TypeId::Int64,
                     flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                     default_value: None,
+                    embedding_source: None,
                 }],
                 ..Schema::default()
             },
@@ -1408,6 +1414,7 @@ async fn cancel_after_autocommit_reports_committed_outcome() {
                     ty: TypeId::Int64,
                     flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                     default_value: None,
+                    embedding_source: None,
                 }],
                 ..Schema::default()
             },
@@ -1514,6 +1521,7 @@ async fn deadline_after_autocommit_reports_committed_outcome() {
                     ty: TypeId::Int64,
                     flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                     default_value: None,
+                    embedding_source: None,
                 }],
                 ..Schema::default()
             },

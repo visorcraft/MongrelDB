@@ -18,6 +18,7 @@ fn setup_db() -> (tempfile::TempDir, Arc<Database>) {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 2,
@@ -25,6 +26,7 @@ fn setup_db() -> (tempfile::TempDir, Arc<Database>) {
                 ty: TypeId::Float64,
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 3,
@@ -32,6 +34,7 @@ fn setup_db() -> (tempfile::TempDir, Arc<Database>) {
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
         ],
         indexes: vec![],

@@ -68,6 +68,7 @@ fn database() -> (tempfile::TempDir, Arc<Database>) {
                         ty: TypeId::Int64,
                         flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                         default_value: None,
+                        embedding_source: None,
                     },
                     ColumnDef {
                         id: 2,
@@ -75,6 +76,7 @@ fn database() -> (tempfile::TempDir, Arc<Database>) {
                         ty: TypeId::Int64,
                         flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
                         default_value: None,
+                        embedding_source: None,
                     },
                 ],
                 ..Schema::default()
@@ -554,6 +556,7 @@ async fn write_keys_are_scoped_to_authenticated_owner() {
                     ty: TypeId::Int64,
                     flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                     default_value: None,
+                    embedding_source: None,
                 }],
                 ..Schema::default()
             },

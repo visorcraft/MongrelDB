@@ -27,16 +27,14 @@
 //! by the meta control plane, spec section 12.1); opening a group fails
 //! closed when a replica's raft id is already attached locally.
 //!
-//! # Engine binding of tablet groups (interim)
+//! # Engine binding of tablet groups
 //!
 //! The consensus engine sink binds each group to a `ClusterReplica` storage
-//! core keyed by `(cluster_id, node_id, database_id)`. The tablet descriptor
-//! names a table, not a database, and the meta-driven table-to-database
-//! resolution lands with distributed DDL (spec section 12.11); until then the
-//! runtime derives the sink's database id deterministically from the group's
-//! raft group id ([`tablet_database_id`]), which is stable across restarts
-//! and identical on every replica of the group (so snapshot validation
-//! agrees).
+//! core keyed by `(cluster_id, node_id, database_id)`. Resolution order
+//! ([`resolve_tablet_database_id`]): descriptor-carried `database_id` (meta
+//! publish), live meta `table_id → database_id` when this node is a meta
+//! member, else a deterministic raft-group-derived id for legacy pre-metadata
+//! tablets (stable across restarts and identical on every replica).
 //!
 //! # Split/merge integration (spec sections 12.5-12.6)
 //!
@@ -266,12 +264,28 @@ pub struct RuntimeStatus {
     pub tablets: Vec<TabletGroupStatus>,
 }
 
-/// The engine sink's database binding of a tablet group: derived from the
-/// raft group id so every replica of the group — and every restart of one
-/// replica — binds identically. Interim until meta-driven table-to-database
-/// resolution lands (spec section 12.11; see the module docs).
-fn tablet_database_id(raft_group_id: RaftGroupId) -> DatabaseId {
-    DatabaseId::from_bytes(*raft_group_id.as_bytes())
+/// Resolve the engine sink's database binding for a tablet.
+///
+/// Order: (1) descriptor-carried `database_id` when non-zero (meta-published),
+/// (2) live meta table→database lookup when this node hosts meta, (3)
+/// deterministic raft-group-derived id only for legacy descriptors that predate
+/// the field (stable across restarts and identical on every replica).
+fn resolve_tablet_database_id(
+    descriptor: &crate::tablet::TabletDescriptor,
+    meta_state: Option<&crate::meta::MetaState>,
+) -> DatabaseId {
+    if descriptor.database_id != DatabaseId::ZERO {
+        return descriptor.database_id;
+    }
+    if let Some(state) = meta_state {
+        if let Some(table) = state.table(descriptor.table_id) {
+            if table.database_id != DatabaseId::ZERO {
+                return table.database_id;
+            }
+        }
+    }
+    // Legacy fallback: raft-group-derived id (pre-metadata tablets).
+    DatabaseId::from_bytes(*descriptor.raft_group_id.as_bytes())
 }
 
 /// The text identifier of a tablet group (session tokens carry it, spec
@@ -837,6 +851,8 @@ struct TabletOpenContext<'a> {
     timing: Option<GroupTiming>,
     identity: &'a NodeIdentity,
     peers: &'a BTreeMap<NodeId, String>,
+    /// Snapshot of meta state when available (table→database resolution).
+    meta_state: Option<crate::meta::MetaState>,
 }
 
 /// A running cluster node: identity, transport, meta group, and tablet
@@ -871,9 +887,9 @@ impl NodeRuntime {
             );
             peers.insert(*node_id, address.clone());
         }
-        let server = TransportServer::bind(
+        let server = TransportServer::bind_shared(
             &config.listen_address,
-            config.security.clone(),
+            transport.security_handle(),
             transport.registry(),
             config.transport.clone(),
         )
@@ -956,6 +972,7 @@ impl NodeRuntime {
             timing: config.timing,
             identity,
             peers,
+            meta_state: None,
         };
         for (tablet_id, raft_group_id) in scan_tablet_layouts(&config.node_data)? {
             let layout = TabletLayout::new(config.node_data.clone(), tablet_id, raft_group_id);
@@ -1006,12 +1023,13 @@ impl NodeRuntime {
             );
         }
         let ownership = TabletOwnershipRegistry::global().try_reserve(layout)?;
+        let database_id = resolve_tablet_database_id(descriptor, context.meta_state.as_ref());
         let engine_config = EngineGroupConfig::new(
             context.node_data.to_path_buf(),
             descriptor.raft_group_id,
             context.identity.cluster_id,
             context.identity.node_id,
-            tablet_database_id(descriptor.raft_group_id),
+            database_id,
         );
         let ledger = TabletLedger::open(&engine_config.group_dir())?;
         let sink = Arc::new(Mutex::new(TabletGroupSink {
@@ -1041,6 +1059,21 @@ impl NodeRuntime {
     /// This node's persisted identity.
     pub fn identity(&self) -> &NodeIdentity {
         &self.identity
+    }
+
+    /// Hot-reload mTLS trust material without restarting the node (N8).
+    /// New inbound/outbound handshakes use the reloaded PEMs; existing TLS
+    /// sessions continue until the peer reconnects.
+    pub fn reload_trust(
+        &mut self,
+        trust: crate::bootstrap::TrustConfig,
+    ) -> Result<(), RuntimeError> {
+        let tls = crate::network::TlsConfig::from_trust(&trust)
+            .map_err(|e| RuntimeError::InvalidRequest(format!("reload trust: {e}")))?;
+        let security = crate::network::TransportSecurity::Mtls(tls);
+        self.transport.reload_security(security.clone());
+        self.security = security;
+        Ok(())
     }
 
     /// The advertised RPC address of this node.
@@ -1172,6 +1205,7 @@ impl NodeRuntime {
             timing: self.timing,
             identity: &self.identity,
             peers: &self.peers,
+            meta_state: self.meta.as_ref().map(|m| m.state()),
         };
         let group =
             Self::open_tablet_group(&context, self.transport.clone(), &layout, descriptor).await?;
@@ -2137,7 +2171,7 @@ impl NodeRuntime {
 
 /// The default merge-size threshold feeding [`MergeInputs`] when the runtime
 /// plans a merge (spec section 12.6's "combined size under threshold").
-/// Operator-tunable thresholds are a follow-up wave's configuration knob.
+/// Callers may pass a different threshold into [`MergeInputs`] when planning.
 pub const DEFAULT_MAX_MERGED_SIZE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The current wall clock as an HLC timestamp (split/merge pin timestamps;

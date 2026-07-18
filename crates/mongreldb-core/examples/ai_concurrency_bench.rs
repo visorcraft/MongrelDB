@@ -37,6 +37,7 @@ fn schema(dimension: usize) -> Schema {
             ColumnFlags::empty()
         },
         default_value: None,
+        embedding_source: None,
     };
     Schema {
         schema_id: 1,

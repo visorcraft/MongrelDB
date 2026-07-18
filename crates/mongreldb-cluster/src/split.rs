@@ -372,6 +372,7 @@ impl ChildPlan {
     ) -> TabletDescriptor {
         TabletDescriptor {
             tablet_id: self.layout.tablet_id(),
+            database_id: mongreldb_types::ids::DatabaseId::ZERO,
             table_id,
             raft_group_id: self.layout.raft_group_id(),
             partition: self.bounds.clone(),
@@ -1854,6 +1855,7 @@ mod tests {
         TabletDescriptor {
             tablet_id: tablet_id(1),
             table_id: TableId::new(3),
+            database_id: mongreldb_types::ids::DatabaseId::ZERO,
             raft_group_id: group_id(1),
             partition: PartitionBounds::new(
                 Bound::Included(text_key("a")),

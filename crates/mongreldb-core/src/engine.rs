@@ -2204,6 +2204,12 @@ impl Table {
         &mut self,
         control: Option<&crate::ExecutionControl>,
     ) -> Result<()> {
+        // S1C-004: online index rebuild pins the current visible epoch so
+        // version GC cannot reclaim rows while the rebuild scans them.
+        let _index_build_pin = Arc::clone(self.pin_registry()).pin(
+            crate::retention::PinSource::OnlineIndexBuild,
+            self.current_epoch(),
+        );
         self.hot = HotIndex::new();
         self.pk_by_row.clear();
         let (bitmap, ann, fm, sparse, minhash) = empty_indexes(&self.schema);
@@ -7589,7 +7595,8 @@ impl Table {
         self.data_generation = self.data_generation.wrapping_add(1);
     }
 
-    pub(crate) fn table_id(&self) -> u64 {
+    /// Stable catalog table id for this mounted table.
+    pub fn table_id(&self) -> u64 {
         self.table_id
     }
 
@@ -9608,10 +9615,14 @@ impl Table {
             }
         }
         // 2. COUNT(*) ⇒ survivor count from the cursor's page plans, no decode.
+        //    Overlay-only replicas (no sorted run yet) fall through to a
+        //    visible-row scan so aggregate_native still serves correctly.
         if matches!(agg, NativeAgg::Count) && column.is_none() {
-            return Ok(self
-                .scan_cursor(snapshot, Vec::new(), conditions)?
-                .map(|c| NativeAggResult::Count(c.remaining_rows() as u64)));
+            if let Some(c) = self.scan_cursor(snapshot, Vec::new(), conditions)? {
+                return Ok(Some(NativeAggResult::Count(c.remaining_rows() as u64)));
+            }
+            let rows = self.visible_rows_filtered(snapshot, conditions, control)?;
+            return Ok(Some(NativeAggResult::Count(rows.len() as u64)));
         }
         // 3. Accumulate the projected column. COUNT(col) excludes nulls — the
         //    accumulator's count is the non-null count, which `pack_*` returns.
@@ -9620,22 +9631,81 @@ impl Table {
             None => return Ok(None),
         };
         let ty = self.column_type(cid);
-        let Some(mut cursor) = self.scan_cursor(snapshot, vec![(cid, ty.clone())], conditions)?
-        else {
-            return Ok(None);
-        };
+        if let Some(mut cursor) = self.scan_cursor(snapshot, vec![(cid, ty.clone())], conditions)? {
+            execution_checkpoint(control, 0)?;
+            return match ty {
+                TypeId::Int64 | TypeId::TimestampNanos | TypeId::Date32 => {
+                    let (count, sum, mn, mx) = accumulate_int(cursor.as_mut(), control)?;
+                    Ok(Some(pack_int(agg, count, sum, mn, mx)))
+                }
+                TypeId::Float64 => {
+                    let (count, sum, mn, mx) = accumulate_float(cursor.as_mut(), control)?;
+                    Ok(Some(pack_float(agg, count, sum, mn, mx)))
+                }
+                _ => Ok(None),
+            };
+        }
+        // Overlay-only / replica path: fold over visible rows in memory.
+        let rows = self.visible_rows_filtered(snapshot, conditions, control)?;
         execution_checkpoint(control, 0)?;
         match ty {
             TypeId::Int64 | TypeId::TimestampNanos | TypeId::Date32 => {
-                let (count, sum, mn, mx) = accumulate_int(cursor.as_mut(), control)?;
+                let mut count = 0u64;
+                let mut sum = 0i128;
+                let mut mn = i64::MAX;
+                let mut mx = i64::MIN;
+                for row in &rows {
+                    if let Some(Value::Int64(v)) = row.columns.get(&cid) {
+                        count += 1;
+                        sum += i128::from(*v);
+                        mn = mn.min(*v);
+                        mx = mx.max(*v);
+                    }
+                }
                 Ok(Some(pack_int(agg, count, sum, mn, mx)))
             }
             TypeId::Float64 => {
-                let (count, sum, mn, mx) = accumulate_float(cursor.as_mut(), control)?;
+                let mut count = 0u64;
+                let mut sum = 0.0f64;
+                let mut mn = f64::INFINITY;
+                let mut mx = f64::NEG_INFINITY;
+                for row in &rows {
+                    if let Some(Value::Float64(v)) = row.columns.get(&cid) {
+                        count += 1;
+                        sum += *v;
+                        mn = mn.min(*v);
+                        mx = mx.max(*v);
+                    }
+                }
                 Ok(Some(pack_float(agg, count, sum, mn, mx)))
             }
             _ => Ok(None),
         }
+    }
+
+    /// Visible rows matching `conditions`, for overlay-only aggregate fallbacks.
+    fn visible_rows_filtered(
+        &self,
+        snapshot: Snapshot,
+        conditions: &[crate::query::Condition],
+        control: Option<&crate::ExecutionControl>,
+    ) -> Result<Vec<Row>> {
+        let rows = if let Some(control) = control {
+            self.visible_rows_controlled(snapshot, control)?
+        } else {
+            self.visible_rows(snapshot)?
+        };
+        if conditions.is_empty() {
+            return Ok(rows);
+        }
+        Ok(rows
+            .into_iter()
+            .filter(|row| {
+                conditions
+                    .iter()
+                    .all(|cond| condition_matches_row(cond, row, &self.schema))
+            })
+            .collect())
     }
 
     /// Phase 7.1 metadata fast path: answer an unfiltered `MIN`/`MAX`/`COUNT(col)`
@@ -10242,6 +10312,9 @@ impl Table {
         if let Some(default_change) = &change.default_value {
             next.default_value = default_change.clone();
         }
+        if let Some(source_change) = &change.embedding_source {
+            next.embedding_source = source_change.clone();
+        }
 
         validate_alter_column_type(&self.schema, &old, &next, self.has_stored_versions())?;
         if old.flags.contains(ColumnFlags::NULLABLE)
@@ -10367,6 +10440,7 @@ impl Table {
             ty,
             flags,
             default_value,
+            embedding_source: None,
         });
         next_schema.schema_id = next_schema
             .schema_id

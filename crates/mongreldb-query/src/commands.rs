@@ -849,6 +849,7 @@ pub(crate) async fn try_run_command(
             transaction.aborted = false;
             transaction.savepoints.clear();
             transaction.predicate_reads.clear();
+            transaction.for_update_txn_id = None;
             // Explicit mode > pending SET TRANSACTION > session default. The
             // resolved level stays recorded so a mid-transaction SET
             // TRANSACTION can replace it and COMMIT can read it back.
@@ -905,7 +906,7 @@ pub(crate) async fn try_run_command(
                         // acknowledgement was lost. Discard every savepoint
                         // and let the statement guard leave the transaction
                         // aborted until a full ROLLBACK.
-                        *session.transaction.lock() = Default::default();
+                        session.clear_sql_transaction();
                         return Err(error);
                     }
                     if matches!(
@@ -915,7 +916,7 @@ pub(crate) async fn try_run_command(
                             ..
                         }
                     ) {
-                        *session.transaction.lock() = Default::default();
+                        session.clear_sql_transaction();
                         if let Err(refresh_error) = sync_committed_statement(
                             session,
                             db,
@@ -953,7 +954,7 @@ pub(crate) async fn try_run_command(
                 }
                 session.fire_test_hook(SqlTestHookPoint::AfterDurableCommit);
             }
-            *session.transaction.lock() = Default::default();
+            session.clear_sql_transaction();
             if let Err(error) =
                 sync_committed_statement(session, db, &external_tables, changes, None, query)
             {
@@ -996,7 +997,7 @@ pub(crate) async fn try_run_command(
                 transaction.savepoints.truncate(pos + 1);
                 transaction.aborted = false;
             } else {
-                *session.transaction.lock() = Default::default();
+                session.clear_sql_transaction();
             }
             Vec::new()
         }
@@ -2371,6 +2372,7 @@ fn create_table_as_select<'a>(
                     ColumnFlags::empty().with(ColumnFlags::NULLABLE)
                 },
                 default_value: None,
+                embedding_source: None,
             });
         }
 
@@ -4796,6 +4798,7 @@ fn view_schema_from_columns(
             ty,
             flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
             default_value: None,
+            embedding_source: None,
         });
     }
     Ok((
@@ -7438,6 +7441,7 @@ fn core_column_from_sql(
         ty: sql_type_to_core(&col.data_type)?,
         flags,
         default_value,
+        embedding_source: None,
     })
 }
 
@@ -11266,9 +11270,8 @@ mod ssi_sql_tests {
 
     /// Two writers interleaved on a LockManager deadlock; the deterministic
     /// victim's `LockError::Deadlock` surfaces at the SQL error boundary as
-    /// `MongrelError::Deadlock` (taxonomy category 9). SQL `FOR UPDATE` is
-    /// not wired to the lock manager this wave, so the interleave is driven
-    /// directly.
+    /// `MongrelError::Deadlock` (taxonomy category 9). Direct manager probe
+    /// (the SQL FOR UPDATE path also uses these exclusive row keys).
     #[test]
     fn lock_manager_deadlock_surfaces_as_deadlock_at_the_sql_boundary() {
         use mongreldb_core::locks::{LockKey, LockManager, LockMode, LockRequest};
@@ -11314,5 +11317,72 @@ mod ssi_sql_tests {
         manager.release_all(2);
         assert_eq!(waiter.join().unwrap(), Ok(()));
         manager.release_all(1);
+    }
+
+    #[tokio::test]
+    async fn select_for_update_requires_open_transaction_and_locks_rows() {
+        use mongreldb_core::schema::{ColumnDef, ColumnFlags, Schema, TypeId};
+        use mongreldb_core::Database;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let db = Arc::new(Database::create(dir.path()).unwrap());
+        db.create_table(
+            "items",
+            Schema {
+                schema_id: 1,
+                columns: vec![
+                    ColumnDef {
+                        id: 1,
+                        name: "id".into(),
+                        ty: TypeId::Int64,
+                        flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                        default_value: None,
+                        embedding_source: None,
+                    },
+                    ColumnDef {
+                        id: 2,
+                        name: "v".into(),
+                        ty: TypeId::Int64,
+                        flags: ColumnFlags::empty(),
+                        default_value: None,
+                        embedding_source: None,
+                    },
+                ],
+                indexes: vec![],
+                colocation: vec![],
+                constraints: Default::default(),
+                clustered: false,
+            },
+        )
+        .unwrap();
+        {
+            let handle = db.table("items").unwrap();
+            let mut t = handle.lock();
+            t.put(vec![
+                (1, mongreldb_core::Value::Int64(1)),
+                (2, mongreldb_core::Value::Int64(10)),
+            ])
+            .unwrap();
+            t.commit().unwrap();
+        }
+
+        let session = MongrelSession::open(Arc::clone(&db)).unwrap();
+        // Outside a transaction FOR UPDATE fails closed.
+        let err = session
+            .run("SELECT * FROM items FOR UPDATE")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("open transaction") || err.to_string().contains("BEGIN"),
+            "unexpected: {err}"
+        );
+
+        session.run("BEGIN").await.unwrap();
+        session
+            .run("SELECT * FROM items FOR UPDATE")
+            .await
+            .expect("FOR UPDATE inside BEGIN acquires row locks");
+        session.run("COMMIT").await.unwrap();
     }
 }

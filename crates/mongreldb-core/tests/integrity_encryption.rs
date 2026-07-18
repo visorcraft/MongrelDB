@@ -22,6 +22,7 @@ fn schema_with_indexable_bitmap() -> Schema {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 2,
@@ -31,6 +32,7 @@ fn schema_with_indexable_bitmap() -> Schema {
                     .with(ColumnFlags::ENCRYPTED)
                     .with(ColumnFlags::ENCRYPTED_INDEXABLE),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 3,
@@ -40,6 +42,7 @@ fn schema_with_indexable_bitmap() -> Schema {
                     .with(ColumnFlags::ENCRYPTED)
                     .with(ColumnFlags::NULLABLE),
                 default_value: None,
+                embedding_source: None,
             },
         ],
         indexes: vec![IndexDef {
@@ -65,6 +68,7 @@ fn schema_with_indexable_range() -> Schema {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 2,
@@ -74,6 +78,7 @@ fn schema_with_indexable_range() -> Schema {
                     .with(ColumnFlags::ENCRYPTED)
                     .with(ColumnFlags::ENCRYPTED_INDEXABLE),
                 default_value: None,
+                embedding_source: None,
             },
         ],
         indexes: vec![IndexDef {
@@ -99,6 +104,7 @@ fn schema_plain_encrypted_mix() -> Schema {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 2,
@@ -106,6 +112,7 @@ fn schema_plain_encrypted_mix() -> Schema {
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 3,
@@ -113,6 +120,7 @@ fn schema_plain_encrypted_mix() -> Schema {
                 ty: TypeId::Bytes,
                 flags: ColumnFlags::empty().with(ColumnFlags::ENCRYPTED),
                 default_value: None,
+                embedding_source: None,
             },
         ],
         indexes: vec![IndexDef {

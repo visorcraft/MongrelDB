@@ -100,6 +100,7 @@ async fn procedure_ddl_preserves_durable_commit_outcome() {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             }],
             ..Schema::default()
         },
@@ -155,6 +156,7 @@ async fn procedure_call_idempotency_restarts_and_rejects_mismatch() {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             }],
             ..Schema::default()
         },
@@ -335,6 +337,7 @@ async fn procedure_replay_reauthorizes_and_user_recreation_cannot_inherit_receip
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             }],
             ..Schema::default()
         },

@@ -595,6 +595,7 @@ fn build_schema(spec: SchemaSpec) -> napi::Result<Schema> {
                 ty,
                 flags,
                 default_value,
+                embedding_source: None,
             })
         })
         .collect::<napi::Result<Vec<_>>>()?;
@@ -2404,6 +2405,7 @@ impl Database {
                     ty: Some(ty),
                     flags: Some(flags),
                     default_value: Some(default_value),
+                    embedding_source: None,
                 },
             )
             .map_err(to_napi)?;

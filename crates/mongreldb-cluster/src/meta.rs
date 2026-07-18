@@ -2451,10 +2451,16 @@ mod v1 {
         Offline,
     }
 
+    fn zero_database_id() -> DatabaseId {
+        DatabaseId::ZERO
+    }
+
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct TabletDescriptor {
         pub tablet_id: TabletId,
         pub table_id: TableId,
+        #[serde(default = "zero_database_id")]
+        pub database_id: DatabaseId,
         pub raft_group_id: RaftGroupId,
         pub partition: PartitionBounds,
         pub replicas: Vec<ReplicaDescriptor>,
@@ -2653,6 +2659,7 @@ fn migrate_tablet(tablet: v1::TabletDescriptor) -> TabletRecord {
         descriptor: TabletDescriptor {
             tablet_id: tablet.tablet_id,
             table_id: tablet.table_id,
+            database_id: tablet.database_id,
             raft_group_id: tablet.raft_group_id,
             partition: migrate_bounds(tablet.partition),
             replicas: tablet.replicas.into_iter().map(migrate_replica).collect(),
@@ -3771,6 +3778,7 @@ mod stage3a_tests {
         TabletDescriptor {
             tablet_id: TabletId::from_bytes([byte; 16]),
             table_id: TableId(table),
+            database_id: mongreldb_types::ids::DatabaseId::ZERO,
             raft_group_id: group_id(9),
             partition: PartitionBounds {
                 low: Bound::Unbounded,
@@ -4187,6 +4195,7 @@ mod stage3a_tests {
         TabletDescriptor {
             tablet_id: TabletId::from_bytes([0x51; 16]),
             table_id: TableId(1),
+            database_id: mongreldb_types::ids::DatabaseId::ZERO,
             raft_group_id: group_id(0x51),
             partition: PartitionBounds::new(Bound::Included(key(b"a")), Bound::Excluded(key(b"z")))
                 .unwrap(),
@@ -4288,6 +4297,7 @@ mod stage3a_tests {
                 TabletDescriptor {
                     tablet_id: TabletId::from_bytes([byte; 16]),
                     table_id: TableId(1),
+                    database_id: mongreldb_types::ids::DatabaseId::ZERO,
                     raft_group_id: group_id(byte),
                     partition: PartitionBounds::new(low, high).unwrap(),
                     replicas: vec![voter_on(1, raft_base), voter_on(2, raft_base + 1)],
@@ -4584,6 +4594,7 @@ mod stage3a_tests {
         let overlapping = TabletDescriptor {
             tablet_id: TabletId::from_bytes([0x70; 16]),
             table_id: TableId(1),
+            database_id: mongreldb_types::ids::DatabaseId::ZERO,
             raft_group_id: group_id(0x70),
             partition: PartitionBounds::new(Bound::Included(key(b"a")), Bound::Excluded(key(b"b")))
                 .unwrap(),
@@ -4796,6 +4807,7 @@ mod stage3a_tests {
         let overlapping = TabletDescriptor {
             tablet_id: TabletId::from_bytes([0x70; 16]),
             table_id: TableId(1),
+            database_id: mongreldb_types::ids::DatabaseId::ZERO,
             raft_group_id: group_id(0x70),
             partition: PartitionBounds::new(Bound::Included(key(b"b")), Bound::Excluded(key(b"c")))
                 .unwrap(),
@@ -6573,6 +6585,7 @@ mod reconciliation_tests {
         v1::TabletDescriptor {
             tablet_id: tablet_id(byte),
             table_id: TableId(3),
+            database_id: mongreldb_types::ids::DatabaseId::ZERO,
             raft_group_id: group_id(9),
             partition: v1::PartitionBounds {
                 start: Some(b"a".to_vec()),

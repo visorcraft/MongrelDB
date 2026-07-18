@@ -1340,6 +1340,7 @@ mod tests {
                 ty: MTy::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             }],
             indexes: vec![],
             colocation: vec![],
@@ -1362,6 +1363,7 @@ mod tests {
                     ty: MTy::Int64,
                     flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                     default_value: None,
+                    embedding_source: None,
                 },
                 ColumnDef {
                     id: 2,
@@ -1369,6 +1371,7 @@ mod tests {
                     ty: MTy::Int64,
                     flags: ColumnFlags::empty(),
                     default_value: None,
+                    embedding_source: None,
                 },
             ],
             indexes: vec![IndexDef {

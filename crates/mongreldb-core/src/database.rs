@@ -1592,6 +1592,14 @@ pub struct DatabaseCore {
     /// and sealed with the database meta DEK when encryption is enabled. Its
     /// startup sweep ran during open; per-query sessions draw from it.
     spill_manager: crate::spill::SpillManager,
+    /// S1E-002: workload resource groups for admission (concurrency, memory,
+    /// temp disk, work units). Seeded with class defaults at open; operators
+    /// reconfigure through [`Database::resource_groups`].
+    resource_groups: crate::resource::ResourceGroupRegistry,
+    /// Optional pluggable embedding providers (local models / registered
+    /// backends). Empty by default — dense ANN uses application-supplied
+    /// vectors; sparse retrieval needs no provider.
+    embedding_providers: crate::embedding::EmbeddingProviderRegistry,
     /// S1F-002: the durable job registry (sibling `JOBS` file). Exactly one
     /// per core; jobs recovered mid-`Running` by a crash come back `Paused`.
     job_registry: Arc<crate::jobs::JobRegistry>,
@@ -3524,6 +3532,8 @@ impl Database {
             page_cache,
             decoded_cache,
             spill_manager,
+            resource_groups: crate::resource::ResourceGroupRegistry::with_defaults(),
+            embedding_providers: crate::embedding::EmbeddingProviderRegistry::new(),
             job_registry,
             commit_lock,
             shared_wal,
@@ -3595,6 +3605,40 @@ impl Database {
         &self.memory_governor
     }
 
+    /// Workload resource-group registry (S1E-002). Seeded with defaults for
+    /// every [`crate::resource::WorkloadClass`] at open.
+    pub fn resource_groups(&self) -> &crate::resource::ResourceGroupRegistry {
+        &self.resource_groups
+    }
+
+    /// Process-local embedding provider registry. Core storage never hard-codes
+    /// an external vendor; register local/remote providers here when generation
+    /// is desired. Application-supplied vectors need no registration.
+    pub fn embedding_providers(&self) -> &crate::embedding::EmbeddingProviderRegistry {
+        &self.embedding_providers
+    }
+
+    /// Acquire exclusive row locks for `SELECT ... FOR UPDATE` (spec §10.2).
+    /// Locks are held until the transaction ends (`release_txn_locks` /
+    /// commit / abort). Requires an open transaction id from the SQL session.
+    pub fn lock_rows_for_update(
+        &self,
+        txn_id: u64,
+        table_id: u64,
+        row_ids: &[crate::rowid::RowId],
+        control: Option<&crate::ExecutionControl>,
+    ) -> Result<()> {
+        for &row_id in row_ids {
+            self.acquire_txn_lock(
+                txn_id,
+                crate::locks::LockKey::row(table_id, row_id),
+                crate::locks::LockMode::Exclusive,
+                control,
+            )?;
+        }
+        Ok(())
+    }
+
     /// The core's node-level spill manager (S1E-004), rooted at
     /// `<db-root>/temp/spill`. Query engines open per-query spill sessions
     /// from it.
@@ -3646,7 +3690,8 @@ impl Database {
     /// S1B-004 step 12: release every lock `txn_id` holds (commit, abort, and
     /// rollback all funnel here). Idempotent — releasing a transaction with
     /// no holds is a no-op.
-    pub(crate) fn release_txn_locks(&self, txn_id: u64) {
+    /// Release every lock held by `txn_id` (COMMIT/ROLLBACK/FOR UPDATE end).
+    pub fn release_txn_locks(&self, txn_id: u64) {
         self.lock_manager.release_all(txn_id);
     }
 
@@ -3994,9 +4039,53 @@ impl Database {
                 return Err(error);
             }
         }
+        // S1C-004: pin the pre-apply visible epoch for the duration of apply so
+        // concurrent GC cannot reclaim versions a catch-up reader still needs.
+        let replication_pins: Vec<crate::retention::PinGuard> = {
+            let tables = self.tables.read();
+            let floor = Epoch(self.epoch.visible().0);
+            tables
+                .values()
+                .map(|handle| {
+                    let t = handle.lock();
+                    Arc::clone(t.pin_registry())
+                        .pin(crate::retention::PinSource::Replication, floor)
+                })
+                .collect()
+        };
         let tables = self.tables.read().clone();
         let catalog = self.catalog.read().clone();
         recover_shared_wal(&self.durable_root, &tables, &catalog, &self.epoch, records)?;
+        // Replica-side commit-ts ledger: record the leader-assigned commit
+        // epoch's physical time from any CommitTimestamp op, else stamp from
+        // the local HLC so `commit_ts_for_epoch` serves PITR/read-your-writes
+        // on replicas (Stage 2 residual).
+        if let Some(Op::TxnCommit { epoch, .. }) = records.last().map(|r| &r.op) {
+            let commit_ts = records
+                .iter()
+                .rev()
+                .find_map(|record| match &record.op {
+                    Op::CommitTimestamp { unix_nanos } => {
+                        Some(mongreldb_types::hlc::HlcTimestamp {
+                            physical_micros: unix_nanos / 1_000,
+                            logical: 0,
+                            node_tiebreaker: 0,
+                        })
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| {
+                    self.hlc
+                        .now()
+                        .unwrap_or(mongreldb_types::hlc::HlcTimestamp {
+                            physical_micros: 0,
+                            logical: 0,
+                            node_tiebreaker: 0,
+                        })
+                });
+            self.record_commit_ts(Epoch(*epoch), commit_ts);
+        }
+        drop(replication_pins);
         Ok(true)
     }
 
@@ -14315,6 +14404,13 @@ impl Database {
         crate::txn::allocate_txn_id(&self.next_txn_id)
     }
 
+    /// Allocate a lock-manager transaction id for SQL `SELECT ... FOR UPDATE`
+    /// (or other multi-statement lock holds). Released via
+    /// [`Self::release_txn_locks`].
+    pub fn allocate_lock_txn_id(&self) -> Result<u64> {
+        self.alloc_txn_id()
+    }
+
     /// Set the per-table spill threshold (bytes). When a transaction's staged
     /// bytes for a single table exceed this, the rows are written as a
     /// uniform-epoch pending run instead of streamed Put records (spec §8.5).
@@ -18805,6 +18901,7 @@ mod write_permission_tests {
                 flags: crate::schema::ColumnFlags::empty()
                     .with(crate::schema::ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             }],
             ..Schema::default()
         }
@@ -18858,6 +18955,7 @@ mod generation_metrics_tests {
                     ty: TypeId::Int64,
                     flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                     default_value: None,
+                    embedding_source: None,
                 }],
                 ..Schema::default()
             },
@@ -19021,6 +19119,7 @@ mod core_resource_tests {
                 flags: crate::schema::ColumnFlags::empty()
                     .with(crate::schema::ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             }],
             ..Schema::default()
         }
@@ -19039,6 +19138,41 @@ mod core_resource_tests {
             DEFAULT_TEMP_DISK_BUDGET_BYTES
         );
         assert!(db.job_registry().list().is_empty());
+        // S1E-002: class defaults seeded at open; no external embedding vendor.
+        assert_eq!(
+            db.resource_groups().len(),
+            crate::resource::WorkloadClass::ALL.len()
+        );
+        assert!(db.resource_groups().get("control").is_some());
+        assert!(db.embedding_providers().list_ids().is_empty());
+        // Application-supplied path refuses generation (no silent hashed vectors).
+        let err = db
+            .embedding_providers()
+            .embed(
+                &crate::embedding::EmbeddingSource::SuppliedByApplication,
+                &["text"],
+                4,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::embedding::EmbeddingError::SuppliedByApplication
+        ));
+    }
+
+    #[test]
+    fn lock_rows_for_update_acquires_exclusive_row_locks() {
+        use crate::locks::LockKey;
+        use crate::rowid::RowId;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::create(dir.path()).unwrap();
+        let txn_id = db.allocate_lock_txn_id().unwrap();
+        let rid = RowId(42);
+        db.lock_rows_for_update(txn_id, 7, &[rid], None).unwrap();
+        assert!(db.lock_manager().holds(txn_id, &LockKey::row(7, rid)));
+        db.release_txn_locks(txn_id);
+        assert!(!db.lock_manager().holds(txn_id, &LockKey::row(7, rid)));
     }
 
     #[test]
@@ -19161,6 +19295,7 @@ mod version_pin_tests {
                 flags: crate::schema::ColumnFlags::empty()
                     .with(crate::schema::ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             }],
             ..Schema::default()
         }
@@ -19285,6 +19420,7 @@ mod lock_manager_tests {
             ty,
             flags,
             default_value: None,
+            embedding_source: None,
         }
     }
 
@@ -19738,6 +19874,7 @@ mod lifecycle_tests {
                 flags: crate::schema::ColumnFlags::empty()
                     .with(crate::schema::ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             }],
             ..Schema::default()
         }
@@ -19830,6 +19967,7 @@ mod commit_ts_ledger_tests {
                 flags: crate::schema::ColumnFlags::empty()
                     .with(crate::schema::ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             }],
             ..Schema::default()
         }
@@ -19944,6 +20082,7 @@ mod stage2e_storage_mode_tests {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             }],
             ..Schema::default()
         }
@@ -20130,6 +20269,7 @@ mod stage2e_replicated_apply_tests {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             }],
             ..Schema::default()
         }
@@ -20318,6 +20458,7 @@ mod stage2c_spill_translation_tests {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             }],
             ..Schema::default()
         }

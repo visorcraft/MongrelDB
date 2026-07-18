@@ -196,6 +196,7 @@ fn schema() -> Schema {
             ColumnFlags::empty()
         },
         default_value: None,
+        embedding_source: None,
     };
     let index = |name: &str, column_id, kind| IndexDef {
         name: name.into(),

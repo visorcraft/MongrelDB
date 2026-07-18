@@ -122,6 +122,7 @@ async fn trigger_ddl_preserves_durable_commit_outcome() {
             ty: TypeId::Int64,
             flags: pk_flags(),
             default_value: None,
+            embedding_source: None,
         }],
         Vec::new(),
     );
@@ -135,6 +136,7 @@ async fn trigger_ddl_preserves_durable_commit_outcome() {
                 ty: TypeId::Int64,
                 flags: pk_flags(),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 2,
@@ -142,6 +144,7 @@ async fn trigger_ddl_preserves_durable_commit_outcome() {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty(),
                 default_value: None,
+                embedding_source: None,
             },
         ],
         Vec::new(),
@@ -403,6 +406,7 @@ fn col_def(id: u16, name: &str, ty: TypeId, flags: ColumnFlags) -> ColumnDef {
         ty,
         flags,
         default_value: None,
+        embedding_source: None,
     }
 }
 

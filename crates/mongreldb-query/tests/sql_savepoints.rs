@@ -19,6 +19,7 @@ fn session() -> (tempfile::TempDir, MongrelSession) {
                     ty: TypeId::Int64,
                     flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                     default_value: None,
+                    embedding_source: None,
                 }],
                 ..Schema::default()
             },
@@ -377,6 +378,7 @@ fn rollback_to_deadlock_child() {
                         ty: TypeId::Int64,
                         flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                         default_value: None,
+                        embedding_source: None,
                     }],
                     ..Schema::default()
                 },

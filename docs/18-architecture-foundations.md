@@ -1,16 +1,26 @@
 # Architecture Foundations
 
-MongrelDB is executing the "Best Practical Architecture" program, which grows
-the embedded single-node engine toward a production single-node server and,
-later, replicated and sharded clusters. The target design is recorded as ten
+MongrelDB implements the "Best Practical Architecture" program: the same
+codebase supports embedded exclusive/shared-handle use, a production
+single-node server, replicated HA, and a sharded tablet cluster with
+workload-isolated AI/analytics execution. The design is recorded as ten
 [Architecture Decision Records](architecture/adr/README.md) (ADRs). This page
-summarizes the foundation contracts that are already visible to users of the
-public API — the Stage 0 contracts, plus the landed Stage 1A shared-handle
-surface.
+summarizes the Stage 0 foundation contracts that remain visible on every
+public API (commit log, taxonomy, build identity, storage ownership).
 
-Decided but **not implemented**: Raft consensus, tablet sharding, and
-distributed transactions. The ADRs are design decisions, not shipped behavior;
-the engine today remains embedded single-node with an optional HTTP daemon.
+**Landed stages (see later docs for operations):**
+
+| Stage | Doc | Surface |
+|---|---|---|
+| 0 foundations | this page | commit log, taxonomy, modes, ADRs |
+| 1 single-node | [19](19-single-node-subsystems.md) | resource groups, spill, locks, jobs |
+| 2 HA | [20](20-replicated-ha.md) | Raft per database, mTLS, snapshots |
+| 3 sharded | [21](21-sharded-cluster.md) | meta, tablets, dist txn, gateway |
+| 4 AI/workload | [22](22-embeddings-and-retrieval.md) + Stage 4 in TODO | scheduler, ANN/sparse, multi-region |
+| 5 ops | TODO Stage 5 | migrate, security, certification |
+
+Embedded single-node and the HTTP daemon remain first-class; they are no
+longer the only runtime modes.
 
 ## Commit visibility goes through a commit log
 

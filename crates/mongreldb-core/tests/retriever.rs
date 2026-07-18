@@ -17,6 +17,7 @@ fn schema() -> Schema {
             ColumnFlags::empty()
         },
         default_value: None,
+        embedding_source: None,
     };
     Schema {
         schema_id: 1,
@@ -31,6 +32,7 @@ fn schema() -> Schema {
                 ty: TypeId::TimestampNanos,
                 flags: ColumnFlags::empty().with(ColumnFlags::NULLABLE),
                 default_value: None,
+                embedding_source: None,
             },
         ],
         indexes: vec![

@@ -1618,6 +1618,7 @@ pub async fn kit_create_table(
                 Ok(v) => v,
                 Err(resp) => return *resp,
             },
+            embedding_source: None,
         });
     }
     let mut names = std::collections::HashSet::new();
@@ -4334,6 +4335,7 @@ mod tests {
             ty,
             flags: ColumnFlags::empty(),
             default_value: None,
+            embedding_source: None,
         }
     }
 

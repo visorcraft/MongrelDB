@@ -22,6 +22,7 @@ fn session() -> (tempfile::TempDir, Arc<MongrelSession>) {
                     ty: TypeId::Int64,
                     flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                     default_value: None,
+                    embedding_source: None,
                 }],
                 ..Schema::default()
             },
@@ -268,6 +269,7 @@ async fn cancellation_during_core_commit_prepare_wins_before_fence() {
                     ty: TypeId::Int64,
                     flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                     default_value: None,
+                    embedding_source: None,
                 }],
                 ..Schema::default()
             },

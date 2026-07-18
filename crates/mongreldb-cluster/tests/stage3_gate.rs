@@ -76,6 +76,7 @@ fn tablet(id: u8, low: u8, high: u8) -> TabletDescriptor {
     TabletDescriptor {
         tablet_id: tid(id),
         table_id: TableId::new(1),
+        database_id: mongreldb_types::ids::DatabaseId::ZERO,
         raft_group_id: rid(id),
         partition: PartitionBounds::new(
             Bound::Included(key_byte(low)),

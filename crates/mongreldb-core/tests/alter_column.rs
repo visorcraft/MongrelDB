@@ -16,6 +16,7 @@ fn schema(nullable_v: bool) -> Schema {
                 ty: TypeId::Int64,
                 flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             },
             ColumnDef {
                 id: 2,
@@ -23,6 +24,7 @@ fn schema(nullable_v: bool) -> Schema {
                 ty: TypeId::Bytes,
                 flags: v_flags,
                 default_value: None,
+                embedding_source: None,
             },
         ],
         indexes: vec![],

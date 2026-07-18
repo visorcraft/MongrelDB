@@ -62,6 +62,9 @@ vector similarity, range queries, and more.
 21. **[Sharded Cluster](21-sharded-cluster.md)** - Stage 3 machinery: the
     meta control plane, tablet model and partitioning, placement and
     rebalancing, the mTLS transport, and cluster operations
+22. **[Embeddings and Retrieval](22-embeddings-and-retrieval.md)** -
+    pluggable `EmbeddingSource` / provider registry; ANN on real vectors
+    only; sparse retrieval with no embedding model
 
 ## Quick Reference
 

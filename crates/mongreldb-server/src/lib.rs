@@ -244,6 +244,13 @@ struct AppState {
     multi_region: std::sync::Mutex<mongreldb_cluster::multi_region::MultiRegionPolicy>,
     /// Stage 5 online ops job store (backup, restore, movement, …).
     ops_jobs: std::sync::Mutex<mongreldb_core::OpsJobStore>,
+    /// Workload resource groups for admission (mirrors the core defaults;
+    /// operators reconfigure via admin SQL / API).
+    resource_groups: mongreldb_core::ResourceGroupRegistry,
+    /// Optional embedding providers registered with the server process.
+    /// Empty by default — application-supplied vectors and sparse retrieval
+    /// need no vendor.
+    embedding_providers: mongreldb_core::EmbeddingProviderRegistry,
 }
 
 /// A `Duration` config value (millisecond granularity) that
@@ -740,6 +747,8 @@ pub fn build_app_with_sessions_and_control(
             mongreldb_cluster::multi_region::MultiRegionPolicy::default(),
         ),
         ops_jobs: std::sync::Mutex::new(mongreldb_core::OpsJobStore::new()),
+        resource_groups: mongreldb_core::ResourceGroupRegistry::with_defaults(),
+        embedding_providers: mongreldb_core::EmbeddingProviderRegistry::new(),
     });
     let router = axum::Router::new()
         .route("/health", get(health))
@@ -3653,6 +3662,7 @@ async fn create_table(
             ty,
             flags,
             default_value: None,
+            embedding_source: None,
         });
     }
     let schema = Schema {
@@ -7978,6 +7988,7 @@ mod wal_stream_tests {
                 flags: mongreldb_core::schema::ColumnFlags::empty()
                     .with(mongreldb_core::schema::ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             }],
             indexes: vec![],
             colocation: vec![],
@@ -8023,6 +8034,7 @@ mod wal_stream_tests {
                     flags: mongreldb_core::schema::ColumnFlags::empty()
                         .with(mongreldb_core::schema::ColumnFlags::PRIMARY_KEY),
                     default_value: None,
+                    embedding_source: None,
                 }],
                 indexes: vec![],
                 colocation: vec![],
@@ -8114,6 +8126,7 @@ mod metrics_tests {
                 flags: mongreldb_core::schema::ColumnFlags::empty()
                     .with(mongreldb_core::schema::ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             }],
             indexes: vec![],
             colocation: vec![],
@@ -8596,6 +8609,7 @@ mod session_tests {
                 flags: mongreldb_core::schema::ColumnFlags::empty()
                     .with(mongreldb_core::schema::ColumnFlags::PRIMARY_KEY),
                 default_value: None,
+                embedding_source: None,
             }],
             indexes: vec![],
             colocation: vec![],

@@ -28,8 +28,11 @@
 //! validates the record, applies it deterministically, bumps
 //! `catalog_version`, and appends it to the bounded history;
 //! [`Catalog::apply_command_and_checkpoint`] additionally rewrites this
-//! checkpoint. The legacy `Database` mutation paths still write the catalog
-//! directly this wave; they route through commands in a later wave.
+//! checkpoint. `Database` mutation entry points authorize via `require` /
+//! `require_for` (see [`crate::catalog_cmds::required_permission`]) and then
+//! either apply a `CatalogCommand` or update catalog fields with the same
+//! checkpoint path — pure apply stays principal-free for deterministic
+//! replica replay.
 
 use crate::error::{MongrelError, Result};
 use crate::external_table::ExternalTableEntry;

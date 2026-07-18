@@ -63,6 +63,7 @@ fn items_schema() -> Schema {
             ty: TypeId::Int64,
             flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
             default_value: None,
+            embedding_source: None,
         }],
         indexes: vec![],
         colocation: vec![],
