@@ -439,6 +439,18 @@ mongreldb_database_t *mongreldb_create_with_credentials(
     const char *path, const char *username, const char *password);
 mongreldb_database_t *mongreldb_open_with_credentials(
     const char *path, const char *username, const char *password);
+/** AES-256-GCM encrypted create/open (passphrase → KEK). */
+mongreldb_database_t *mongreldb_create_encrypted(
+    const char *path, const char *passphrase);
+mongreldb_database_t *mongreldb_open_encrypted(
+    const char *path, const char *passphrase);
+/** Encrypted + require_auth bootstrap / open (passphrase + admin user). */
+mongreldb_database_t *mongreldb_create_encrypted_with_credentials(
+    const char *path, const char *passphrase,
+    const char *username, const char *password);
+mongreldb_database_t *mongreldb_open_encrypted_with_credentials(
+    const char *path, const char *passphrase,
+    const char *username, const char *password);
 int32_t mongreldb_database_close(mongreldb_database_t *db);
 void mongreldb_database_free(mongreldb_database_t *db);
 int32_t mongreldb_database_compact(mongreldb_database_t *db);

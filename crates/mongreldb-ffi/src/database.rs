@@ -178,6 +178,134 @@ pub unsafe extern "C" fn mongreldb_open_with_credentials(
     }
 }
 
+/// Create a fresh AES-256-GCM encrypted database (passphrase → KEK).
+///
+/// # Safety
+/// `path` and `passphrase` must be NUL-terminated UTF-8 C strings.
+#[no_mangle]
+pub unsafe extern "C" fn mongreldb_create_encrypted(
+    path: *const c_char,
+    passphrase: *const c_char,
+) -> mongreldb_database_t {
+    clear();
+    let path = match require_path(path) {
+        Ok(p) => p,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let passphrase = match require_str_named(passphrase, "passphrase") {
+        Ok(p) => p,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    match CoreDatabase::create_encrypted(&path, &passphrase) {
+        Ok(db) => FFIDatabase::new(db).into_handle(),
+        Err(e) => {
+            set_error(&e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Open an existing AES-256-GCM encrypted database with a passphrase.
+///
+/// # Safety
+/// `path` and `passphrase` must be NUL-terminated UTF-8 C strings.
+#[no_mangle]
+pub unsafe extern "C" fn mongreldb_open_encrypted(
+    path: *const c_char,
+    passphrase: *const c_char,
+) -> mongreldb_database_t {
+    clear();
+    let path = match require_path(path) {
+        Ok(p) => p,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let passphrase = match require_str_named(passphrase, "passphrase") {
+        Ok(p) => p,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    match CoreDatabase::open_encrypted(&path, &passphrase) {
+        Ok(db) => FFIDatabase::new(db).into_handle(),
+        Err(e) => {
+            set_error(&e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Create a fresh encrypted database with `require_auth = true` and one admin.
+///
+/// # Safety
+/// All string arguments must be NUL-terminated UTF-8 C strings.
+#[no_mangle]
+pub unsafe extern "C" fn mongreldb_create_encrypted_with_credentials(
+    path: *const c_char,
+    passphrase: *const c_char,
+    user: *const c_char,
+    password: *const c_char,
+) -> mongreldb_database_t {
+    clear();
+    let path = match require_path(path) {
+        Ok(p) => p,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let passphrase = match require_str_named(passphrase, "passphrase") {
+        Ok(p) => p,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let user = match require_str_named(user, "user") {
+        Ok(u) => u,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let password = match require_str_named(password, "password") {
+        Ok(p) => p,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    match CoreDatabase::create_encrypted_with_credentials(&path, &passphrase, &user, &password) {
+        Ok(db) => FFIDatabase::new(db).into_handle(),
+        Err(e) => {
+            set_error(&e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Open an encrypted + credentialed database (passphrase and admin credentials).
+///
+/// # Safety
+/// All string arguments must be NUL-terminated UTF-8 C strings.
+#[no_mangle]
+pub unsafe extern "C" fn mongreldb_open_encrypted_with_credentials(
+    path: *const c_char,
+    passphrase: *const c_char,
+    user: *const c_char,
+    password: *const c_char,
+) -> mongreldb_database_t {
+    clear();
+    let path = match require_path(path) {
+        Ok(p) => p,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let passphrase = match require_str_named(passphrase, "passphrase") {
+        Ok(p) => p,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let user = match require_str_named(user, "user") {
+        Ok(u) => u,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let password = match require_str_named(password, "password") {
+        Ok(p) => p,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    match CoreDatabase::open_encrypted_with_credentials(&path, &passphrase, &user, &password) {
+        Ok(db) => FFIDatabase::new(db).into_handle(),
+        Err(e) => {
+            set_error(&e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
 /// Close the database (flush + release). Optional — the handle is also
 /// reclaimed by [`mongreldb_database_free`]. Returns 0 on success.
 ///

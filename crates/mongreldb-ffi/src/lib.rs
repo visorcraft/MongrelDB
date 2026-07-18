@@ -76,10 +76,12 @@ pub use database::mongreldb_free_string;
 
 // Database lifecycle.
 pub use database::{
-    mongreldb_create, mongreldb_create_table, mongreldb_create_with_credentials,
-    mongreldb_database_close, mongreldb_database_compact, mongreldb_database_compact_table,
-    mongreldb_database_free, mongreldb_database_table_names, mongreldb_drop_table, mongreldb_open,
-    mongreldb_open_with_credentials, mongreldb_rename_table,
+    mongreldb_create, mongreldb_create_encrypted, mongreldb_create_encrypted_with_credentials,
+    mongreldb_create_table, mongreldb_create_with_credentials, mongreldb_database_close,
+    mongreldb_database_compact, mongreldb_database_compact_table, mongreldb_database_free,
+    mongreldb_database_table_names, mongreldb_drop_table, mongreldb_open, mongreldb_open_encrypted,
+    mongreldb_open_encrypted_with_credentials, mongreldb_open_with_credentials,
+    mongreldb_rename_table,
 };
 
 // SQL execution (DataFusion via MongrelSession; returns Arrow IPC file bytes).
