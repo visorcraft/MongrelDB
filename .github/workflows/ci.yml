@@ -152,9 +152,28 @@ jobs:
       contents: write
     env:
       QUAL_DIR: /tmp/mongreldb-qualification
-      CARGO_TARGET_DIR: /tmp/mongreldb-qualification-target
+      # Keep the target on the main volume (not a tiny /tmp tmpfs) and shrink
+      # debug artifacts — this job sequentially builds workspace + server +
+      # client + FFI and otherwise OOMs the runner disk ("No space left on device").
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target-qualification
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@v7
+      - name: Free disk space
+        run: |
+          # Drop unused hosted-image toolchains so Arrow/DataFusion debug
+          # builds have room. Safe no-ops if a path is already gone.
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/powershell \
+            /usr/share/swift || true
+          sudo docker system prune -af || true
+          df -h
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: stable
@@ -171,6 +190,7 @@ jobs:
             rustc --version
             cargo --version
             node --version
+            df -h
           } > "$QUAL_DIR/versions.txt"
       - name: Root format
         run: cargo fmt --check 2>&1 | tee "$QUAL_DIR/cargo-fmt.log"
@@ -178,6 +198,14 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tee "$QUAL_DIR/cargo-clippy.log"
       - name: Root tests
         run: cargo test --workspace --all-features 2>&1 | tee "$QUAL_DIR/cargo-test.log"
+      - name: Reclaim debug intermediates
+        # Drop incremental-style leftovers and large debug deps after the
+        # workspace suite; later steps still rebuild what they need.
+        run: |
+          rm -rf "$CARGO_TARGET_DIR/debug/incremental" \
+                 "$CARGO_TARGET_DIR/debug/examples" \
+                 "$CARGO_TARGET_DIR/debug/build" || true
+          df -h
       - name: Server tests
         run: |
           cargo clippy --manifest-path crates/mongreldb-server/Cargo.toml --all-targets --all-features -- -D warnings 2>&1 | tee "$QUAL_DIR/server-clippy.log"
@@ -193,6 +221,12 @@ jobs:
           npm run build 2>&1 | tee "$QUAL_DIR/node-build.log"
           npm test 2>&1 | tee "$QUAL_DIR/node-test.log"
           node smoke.mjs 2>&1 | tee "$QUAL_DIR/node-smoke.log"
+      - name: Reclaim before release FFI builds
+        run: |
+          # Release FFI builds need headroom; drop the debug tree now that
+          # clippy/tests finished.
+          rm -rf "$CARGO_TARGET_DIR/debug" || true
+          df -h
       - name: FFI checks
         run: |
           cargo build --manifest-path crates/mongreldb-ffi/Cargo.toml --release 2>&1 | tee "$QUAL_DIR/ffi-build.log"
