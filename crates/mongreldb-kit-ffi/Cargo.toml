@@ -1,6 +1,6 @@
 [package]
 name = "mongreldb-kit-ffi"
-version = "0.60.1"
+version = "0.60.2"
 edition = "2021"
 publish = false
 license = "MIT OR Apache-2.0"
@@ -23,10 +23,10 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 # lib name (`mongreldb_kit`). Without the rename, integration tests
 # `use mongreldb_kit::*` would be ambiguous between our FFI crate and the
 # upstream Kit crate.
-# Path deps so kit-ffi tracks monorepo engine fixes (e.g. empty ANN checkpoint
-# reopen) instead of a stale crates.io core pin.
-kit = { package = "mongreldb-kit", path = "../../../mongreldb-kit/crates/mongreldb-kit", version = "0.60.0" }
-mongreldb-kit-core = { path = "../../../mongreldb-kit/crates/mongreldb-kit-core", version = "0.60.0" }
+# crates.io kit; monorepo engine patches below force the ANN checkpoint fix
+# (and other core/query fixes) without a sibling mongreldb-kit checkout.
+kit = { package = "mongreldb-kit", version = "=0.60.0" }
+mongreldb-kit-core = "=0.60.0"
 parking_lot = "0.12"
 serde_json = { version = "1", features = ["preserve_order"] }
 

@@ -2701,7 +2701,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-client"
-version = "0.60.1"
+version = "0.60.2"
 dependencies = [
  "arrow",
  "base64",
@@ -2718,7 +2718,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-cluster"
-version = "0.60.1"
+version = "0.60.2"
 dependencies = [
  "getrandom 0.2.17",
  "mongreldb-consensus",
@@ -2740,7 +2740,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-consensus"
-version = "0.60.1"
+version = "0.60.2"
 dependencies = [
  "bincode",
  "mongreldb-core",
@@ -2757,7 +2757,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-core"
-version = "0.60.1"
+version = "0.60.2"
 dependencies = [
  "aes-gcm",
  "arc-swap",
@@ -2793,14 +2793,14 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-fault"
-version = "0.60.1"
+version = "0.60.2"
 dependencies = [
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "mongreldb-log"
-version = "0.60.1"
+version = "0.60.2"
 dependencies = [
  "mongreldb-types",
  "serde",
@@ -2810,7 +2810,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-protocol"
-version = "0.60.1"
+version = "0.60.2"
 dependencies = [
  "mongreldb-types",
  "serde",
@@ -2819,7 +2819,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-query"
-version = "0.60.1"
+version = "0.60.2"
 dependencies = [
  "aes-gcm",
  "arrow",
@@ -2845,7 +2845,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-server"
-version = "0.60.1"
+version = "0.60.2"
 dependencies = [
  "arrow",
  "axum",
@@ -2875,7 +2875,7 @@ dependencies = [
 
 [[package]]
 name = "mongreldb-types"
-version = "0.60.1"
+version = "0.60.2"
 dependencies = [
  "getrandom 0.2.17",
  "serde",

@@ -1,6 +1,6 @@
 [package]
 name = "mongreldb-jni"
-version = "0.60.1"
+version = "0.60.2"
 edition = "2021"
 publish = false
 license = "MIT OR Apache-2.0"
@@ -17,10 +17,10 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # The Kit crate wraps the engine with schema model, migrations, and query
-# builder execution. Path deps so JNI tracks monorepo engine fixes instead of
-# a stale crates.io core pin (same approach as mongreldb-kit-ffi).
-mongreldb-kit = { path = "../../../mongreldb-kit/crates/mongreldb-kit", version = "0.60.0" }
-mongreldb-kit-core = { path = "../../../mongreldb-kit/crates/mongreldb-kit-core", version = "0.60.0" }
+# builder execution. crates.io kit; monorepo engine patches force local
+# core/query (e.g. empty ANN checkpoint reopen) without a sibling kit tree.
+mongreldb-kit = "=0.60.0"
+mongreldb-kit-core = "=0.60.0"
 # The jni crate provides Rust bindings to the JNI API.
 jni = { version = "0.21", features = ["invocation"] }
 serde_json = { version = "1", features = ["preserve_order"] }

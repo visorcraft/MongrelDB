@@ -8,6 +8,6 @@ repository.workspace = true
 description = "MongrelDB versioned protocol messages and service definitions (S1D)."
 
 [dependencies]
-mongreldb-types = { path = "../mongreldb-types", version = "0.60.1" }
+mongreldb-types = { path = "../mongreldb-types", version = "0.60.2" }
 serde = { version = "1", features = ["derive"] }
 thiserror = "1"
