@@ -1041,9 +1041,6 @@ fn seal_payload(dek: Option<&[u8; DEK_LEN]>, plaintext: &[u8]) -> Result<Vec<u8>
     }
 }
 
-/// Fail-closed stub: [`SpillManager::open`] rejects a DEK without the
-/// `encryption` feature, so this is unreachable in practice.
-
 /// Inverse of [`seal_payload`]: authenticates and opens a sealed frame.
 fn open_payload(dek: Option<&[u8; DEK_LEN]>, stored: &[u8]) -> Result<Vec<u8>, SpillError> {
     match dek {
@@ -1051,8 +1048,6 @@ fn open_payload(dek: Option<&[u8; DEK_LEN]>, stored: &[u8]) -> Result<Vec<u8>, S
         None => Ok(stored.to_vec()),
     }
 }
-
-/// Fail-closed stub — see [`seal_payload`].
 
 #[cfg(test)]
 mod tests {

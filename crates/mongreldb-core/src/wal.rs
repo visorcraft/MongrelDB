@@ -1632,7 +1632,7 @@ pub(crate) fn validate_shared_transaction_framing(records: &[Record]) -> Result<
 }
 
 impl SharedWal {
-    /// Build a per-segment frame cipher from the WAL DEK (encryption feature).
+    /// Build a per-segment frame cipher from the WAL DEK.
     fn cipher_from_dek(dek: &Zeroizing<[u8; 32]>) -> Result<Box<dyn crate::encryption::Cipher>> {
         Ok(Box::new(crate::encryption::AesCipher::new(&dek[..])?))
     }

@@ -1344,7 +1344,7 @@ fn read_table_encryption_salt_root(
     Ok(salt)
 }
 
-/// Create a boxed cipher from a DEK (encryption feature only).
+/// Create a boxed cipher from a DEK.
 fn make_cipher(dek: &Zeroizing<[u8; DEK_LEN]>) -> Box<dyn crate::encryption::Cipher> {
     Box::new(crate::encryption::AesCipher::new(&dek[..]).expect("DEK is 32 bytes"))
 }
