@@ -110,7 +110,7 @@ pub use embedding::{
     EmbeddingError, EmbeddingFailurePolicy, EmbeddingFuture, EmbeddingLimits, EmbeddingModelMeta,
     EmbeddingNormalization, EmbeddingProvider, EmbeddingProviderRegistry, EmbeddingRequest,
     EmbeddingResponse, EmbeddingSource, FixedVectorProvider, GeneratedEmbeddingSpec,
-    ProviderHealth, ProviderStatus,
+    ProviderExecutionMode, ProviderHealth, ProviderStatus,
 };
 pub use encryption::{Cipher, PlaintextCipher};
 pub use engine::{

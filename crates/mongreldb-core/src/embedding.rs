@@ -153,6 +153,20 @@ pub enum ProviderHealth {
     Unavailable,
 }
 
+/// Where provider work executes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProviderExecutionMode {
+    /// Short work that cooperatively checks [`crate::ExecutionControl`].
+    #[default]
+    Cooperative,
+    /// CPU-heavy or blocking local work. The registry runs it on its bounded
+    /// blocking pool.
+    Blocking,
+    /// A genuinely asynchronous remote transport implemented by
+    /// [`EmbeddingProvider::embed_async`].
+    Remote,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EmbeddingLimits {
     pub max_texts: usize,
@@ -196,6 +210,10 @@ pub trait EmbeddingProvider: Send + Sync {
     fn normalization(&self) -> EmbeddingNormalization;
     fn preprocessing_version(&self) -> &str;
 
+    fn execution_mode(&self) -> ProviderExecutionMode {
+        ProviderExecutionMode::Cooperative
+    }
+
     fn health(&self) -> ProviderHealth {
         ProviderHealth::Ready
     }
@@ -227,9 +245,23 @@ pub struct ProviderStatus {
     pub health: ProviderHealth,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct EmbeddingProviderRegistry {
     inner: Arc<RwLock<BTreeMap<String, ProviderEntry>>>,
+    blocking_slots: Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for EmbeddingProviderRegistry {
+    fn default() -> Self {
+        let concurrency = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1)
+            .clamp(1, 32);
+        Self {
+            inner: Arc::new(RwLock::new(BTreeMap::new())),
+            blocking_slots: Arc::new(tokio::sync::Semaphore::new(concurrency)),
+        }
+    }
 }
 
 impl std::fmt::Debug for EmbeddingProviderRegistry {
@@ -243,6 +275,14 @@ impl std::fmt::Debug for EmbeddingProviderRegistry {
 impl EmbeddingProviderRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Registry with an explicit blocking-provider concurrency ceiling.
+    pub fn with_max_blocking_concurrency(max_concurrency: usize) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(BTreeMap::new())),
+            blocking_slots: Arc::new(tokio::sync::Semaphore::new(max_concurrency.max(1))),
+        }
     }
 
     pub fn register_new(
@@ -411,6 +451,115 @@ impl EmbeddingProviderRegistry {
         )?;
         Ok(response.vectors)
     }
+
+    /// Async provider execution for server/runtime callers.
+    ///
+    /// Blocking local providers run under a bounded semaphore on Tokio's
+    /// blocking pool. Remote providers must implement `embed_async`; both
+    /// paths stop waiting when the execution control is cancelled or expires.
+    pub async fn embed_async_controlled(
+        &self,
+        source: &EmbeddingSource,
+        texts: &[&str],
+        expected_dim: u32,
+        control: &crate::ExecutionControl,
+        trace_id: &str,
+        limits: EmbeddingLimits,
+    ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        control
+            .checkpoint()
+            .map_err(|error| EmbeddingError::Execution(error.to_string()))?;
+        validate_request(texts, expected_dim, limits)?;
+        let provider = self.resolve(source)?;
+        validate_identity(source, provider.as_ref())?;
+        if provider.health() == ProviderHealth::Unavailable {
+            return Err(EmbeddingError::ProviderFailed {
+                provider: provider.provider_id().to_owned(),
+                message: "provider unavailable".into(),
+            });
+        }
+        if provider.dimension() != expected_dim {
+            return Err(EmbeddingError::DimensionMismatch {
+                expected: expected_dim,
+                got: provider.dimension(),
+            });
+        }
+
+        let response = match provider.execution_mode() {
+            ProviderExecutionMode::Cooperative | ProviderExecutionMode::Remote => {
+                let request = EmbeddingRequest {
+                    texts,
+                    control,
+                    trace_id,
+                };
+                tokio::select! {
+                    result = provider.embed_async(request) => result?,
+                    _ = control.cancelled() => {
+                        return Err(execution_stopped(control));
+                    }
+                }
+            }
+            ProviderExecutionMode::Blocking => {
+                let permit = tokio::select! {
+                    result = Arc::clone(&self.blocking_slots).acquire_owned() => {
+                        result.map_err(|_| EmbeddingError::Execution(
+                            "embedding blocking executor closed".into()
+                        ))?
+                    }
+                    _ = control.cancelled() => {
+                        return Err(execution_stopped(control));
+                    }
+                };
+                let provider = Arc::clone(&provider);
+                let owned_texts = texts
+                    .iter()
+                    .map(|text| (*text).to_owned())
+                    .collect::<Vec<_>>();
+                let owned_control = control.clone();
+                let owned_trace_id = trace_id.to_owned();
+                let task = tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    let text_refs = owned_texts.iter().map(String::as_str).collect::<Vec<_>>();
+                    provider.embed(EmbeddingRequest {
+                        texts: &text_refs,
+                        control: &owned_control,
+                        trace_id: &owned_trace_id,
+                    })
+                });
+                tokio::select! {
+                    result = task => {
+                        result
+                            .map_err(|error| EmbeddingError::Execution(
+                                format!("embedding blocking task failed: {error}")
+                            ))??
+                    }
+                    _ = control.cancelled() => {
+                        return Err(execution_stopped(control));
+                    }
+                }
+            }
+        };
+
+        control
+            .checkpoint()
+            .map_err(|error| EmbeddingError::Execution(error.to_string()))?;
+        validate_response(
+            provider.as_ref(),
+            texts.len(),
+            expected_dim,
+            limits,
+            &response.vectors,
+        )?;
+        Ok(response.vectors)
+    }
+}
+
+fn execution_stopped(control: &crate::ExecutionControl) -> EmbeddingError {
+    let message = control
+        .checkpoint()
+        .expect_err("cancelled future completed without an execution error")
+        .to_string();
+    EmbeddingError::Execution(message)
 }
 
 fn validate_identity(
@@ -614,6 +763,41 @@ impl EmbeddingModelMeta {
 mod tests {
     use super::*;
 
+    struct SlowBlockingProvider;
+
+    impl EmbeddingProvider for SlowBlockingProvider {
+        fn provider_id(&self) -> &str {
+            "slow-blocking"
+        }
+        fn model_id(&self) -> &str {
+            "slow"
+        }
+        fn model_version(&self) -> &str {
+            "1"
+        }
+        fn dimension(&self) -> u32 {
+            2
+        }
+        fn normalization(&self) -> EmbeddingNormalization {
+            EmbeddingNormalization::None
+        }
+        fn preprocessing_version(&self) -> &str {
+            "slow-v1"
+        }
+        fn execution_mode(&self) -> ProviderExecutionMode {
+            ProviderExecutionMode::Blocking
+        }
+        fn embed(
+            &self,
+            request: EmbeddingRequest<'_>,
+        ) -> Result<EmbeddingResponse, EmbeddingError> {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            Ok(EmbeddingResponse {
+                vectors: request.texts.iter().map(|_| vec![1.0, 2.0]).collect(),
+            })
+        }
+    }
+
     fn provider() -> Arc<FixedVectorProvider> {
         Arc::new(FixedVectorProvider {
             id: "local-test".into(),
@@ -734,6 +918,33 @@ mod tests {
                 expected: 1,
                 got: 0
             })
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_path_bounds_blocking_provider_and_honors_deadline() {
+        let registry = EmbeddingProviderRegistry::with_max_blocking_concurrency(1);
+        registry
+            .register_new(Arc::new(SlowBlockingProvider))
+            .unwrap();
+        let source = EmbeddingSource::LocalModel {
+            provider_id: "slow-blocking".into(),
+            model_id: "slow".into(),
+            model_version: "1".into(),
+        };
+        let control = crate::ExecutionControl::with_timeout(std::time::Duration::from_millis(5));
+        assert!(matches!(
+            registry
+                .embed_async_controlled(
+                    &source,
+                    &["text"],
+                    2,
+                    &control,
+                    "deadline-test",
+                    EmbeddingLimits::default(),
+                )
+                .await,
+            Err(EmbeddingError::Execution(_))
         ));
     }
 }
