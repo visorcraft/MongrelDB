@@ -51,6 +51,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.1
         with:
           workspaces: crates/mongreldb-server
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Server scale test
         run: cargo test --release --test scale_test -- --nocapture
 

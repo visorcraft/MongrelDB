@@ -51,6 +51,7 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 24
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Capture source identity
         run: |
           mkdir -p "$QUAL_DIR"
