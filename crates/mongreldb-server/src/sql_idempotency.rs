@@ -873,7 +873,13 @@ pub(crate) struct CapacityFileGuard(std::fs::File);
 impl CapacityFileGuard {
     pub(crate) async fn acquire(files: &StoreFiles) -> io::Result<Self> {
         let file = files.open_lock(CAPACITY_LOCK_FILE)?;
-        tokio::task::spawn_blocking(move || file.lock_exclusive().map(|()| Self(file)))
+        tokio::task::spawn_blocking(move || loop {
+            match file.lock_exclusive() {
+                Ok(()) => return Ok(Self(file)),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        })
             .await
             .map_err(io::Error::other)?
     }
