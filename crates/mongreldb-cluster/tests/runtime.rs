@@ -34,6 +34,7 @@ use mongreldb_cluster::tablet::{
     ReplicaDescriptor, ReplicaRole, RoutingError, TablePartitioningRecord, TabletDescriptor,
     TabletState,
 };
+use mongreldb_consensus::error::ConsensusError;
 use mongreldb_consensus::group::{ConsensusGroup, GroupCommitReceipt};
 use mongreldb_consensus::identity::{raft_node_id, CommandKind, RaftNodeId};
 use mongreldb_consensus::read::{ReadConsistency, SessionToken};
@@ -1008,55 +1009,73 @@ async fn meta_leader_index(nodes: &[NodeRuntime]) -> usize {
 /// (a restarted split driver must lead the meta group to propose).
 async fn ensure_meta_leader(nodes: &[NodeRuntime], index: usize) {
     let target = raft_node_id(&nodes[index].identity().node_id);
-    let leader = nodes[index]
-        .meta_group()
-        .unwrap()
-        .group()
-        .wait_leader(LEADER_TIMEOUT)
-        .await
-        .unwrap();
-    if leader == target {
-        return;
+    let deadline = std::time::Instant::now() + LEADER_TIMEOUT;
+    loop {
+        let leader = nodes[index]
+            .meta_group()
+            .unwrap()
+            .group()
+            .wait_leader(LEADER_TIMEOUT)
+            .await
+            .unwrap();
+        if leader == target {
+            return;
+        }
+        let leader_index = nodes
+            .iter()
+            .position(|node| raft_node_id(&node.identity().node_id) == leader)
+            .expect("the meta leader is one of the runtimes");
+        match nodes[leader_index]
+            .meta_group()
+            .unwrap()
+            .group()
+            .transfer_leader(target, LEADER_TIMEOUT)
+            .await
+        {
+            Ok(()) => return,
+            Err(ConsensusError::NotLeader { .. }) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(error) => panic!("meta leadership transfer failed: {error}"),
+        }
     }
-    let leader_index = nodes
-        .iter()
-        .position(|node| raft_node_id(&node.identity().node_id) == leader)
-        .expect("the meta leader is one of the runtimes");
-    nodes[leader_index]
-        .meta_group()
-        .unwrap()
-        .group()
-        .transfer_leader(target, LEADER_TIMEOUT)
-        .await
-        .unwrap();
 }
 
 /// Transfers a tablet group's leadership onto `index` when needed (child
 /// state installs propose through the driver's local group).
 async fn ensure_tablet_leader(nodes: &[NodeRuntime], tablet_id: TabletId, index: usize) {
     let target = nodes[index].tablet_group(tablet_id).unwrap().node_id();
-    let leader = nodes[index]
-        .tablet_group(tablet_id)
-        .unwrap()
-        .wait_leader(LEADER_TIMEOUT)
-        .await
-        .unwrap();
-    if leader == target {
-        return;
+    let deadline = std::time::Instant::now() + LEADER_TIMEOUT;
+    loop {
+        let leader = nodes[index]
+            .tablet_group(tablet_id)
+            .unwrap()
+            .wait_leader(LEADER_TIMEOUT)
+            .await
+            .unwrap();
+        if leader == target {
+            return;
+        }
+        let leader_index = nodes
+            .iter()
+            .position(|node| {
+                node.tablet_group(tablet_id)
+                    .is_some_and(|group| group.node_id() == leader)
+            })
+            .expect("the tablet leader is one of the runtimes");
+        match nodes[leader_index]
+            .tablet_group(tablet_id)
+            .unwrap()
+            .transfer_leader(target, LEADER_TIMEOUT)
+            .await
+        {
+            Ok(()) => return,
+            Err(ConsensusError::NotLeader { .. }) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(error) => panic!("tablet leadership transfer failed: {error}"),
+        }
     }
-    let leader_index = nodes
-        .iter()
-        .position(|node| {
-            node.tablet_group(tablet_id)
-                .is_some_and(|group| group.node_id() == leader)
-        })
-        .expect("the tablet leader is one of the runtimes");
-    nodes[leader_index]
-        .tablet_group(tablet_id)
-        .unwrap()
-        .transfer_leader(target, LEADER_TIMEOUT)
-        .await
-        .unwrap();
 }
 
 /// Creates one tablet spanning every node: replica raft ids from the
