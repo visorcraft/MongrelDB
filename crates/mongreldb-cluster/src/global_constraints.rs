@@ -3822,7 +3822,9 @@ mod tests {
 
     // -- 3-node in-memory cells -------------------------------------------------
 
-    const LEADER_TIMEOUT: Duration = Duration::from_secs(15);
+    // Windows CI runs many three-node cells concurrently and can starve Raft
+    // timers during debug builds. Keep the wait bounded but allow slow hosts.
+    const LEADER_TIMEOUT: Duration = Duration::from_secs(60);
     const STATUS_GROUP: u8 = 90;
     const DATA_GROUP: u8 = 91;
     const PARENT_GROUP: u8 = 92;
