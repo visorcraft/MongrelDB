@@ -454,7 +454,7 @@ async fn native_runtime_serves_all_services_over_tls_http2() {
     let deadline = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
-        .saturating_add(Duration::from_millis(100))
+        .saturating_add(Duration::from_secs(5))
         .as_micros() as u64;
     let mut deadline_stream = client
         .query()
@@ -471,7 +471,7 @@ async fn native_runtime_serves_all_services_over_tls_http2() {
         .await
         .unwrap()
         .into_inner();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::sleep(Duration::from_millis(5_200)).await;
     let deadline_error = loop {
         match tokio::time::timeout(Duration::from_secs(5), deadline_stream.message())
             .await
