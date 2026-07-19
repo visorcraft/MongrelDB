@@ -489,7 +489,23 @@ impl Schema {
             }
             match column.embedding_source.as_ref() {
                 None | Some(crate::embedding::EmbeddingSource::SuppliedByApplication) => {}
-                Some(crate::embedding::EmbeddingSource::LocalModel {
+                Some(crate::embedding::EmbeddingSource::LocalModel { model_id, .. }) => {
+                    if model_id.is_empty() {
+                        return Err(MongrelError::Schema(format!(
+                            "legacy local embedding column '{}' requires a model identity",
+                            column.name
+                        )));
+                    }
+                }
+                Some(crate::embedding::EmbeddingSource::GeneratedColumn { provider }) => {
+                    if provider.is_empty() {
+                        return Err(MongrelError::Schema(format!(
+                            "legacy generated embedding column '{}' requires a provider identity",
+                            column.name
+                        )));
+                    }
+                }
+                Some(crate::embedding::EmbeddingSource::ConfiguredModel {
                     provider_id,
                     model_id,
                     model_version,
@@ -501,7 +517,7 @@ impl Schema {
                         )));
                     }
                 }
-                Some(crate::embedding::EmbeddingSource::GeneratedColumn { spec }) => {
+                Some(crate::embedding::EmbeddingSource::GeneratedColumnSpec { spec }) => {
                     if spec.provider_id.is_empty()
                         || spec.model_id.is_empty()
                         || spec.model_version.is_empty()

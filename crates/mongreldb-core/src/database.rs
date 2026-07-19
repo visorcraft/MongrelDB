@@ -3760,7 +3760,7 @@ impl Database {
                 MongrelError::Schema(format!("table id {table_id} disappeared during embedding"))
             })?;
             for target in &schema.columns {
-                let Some(crate::embedding::EmbeddingSource::GeneratedColumn { spec }) =
+                let Some(crate::embedding::EmbeddingSource::GeneratedColumnSpec { spec }) =
                     target.embedding_source.as_ref()
                 else {
                     continue;
@@ -3786,7 +3786,7 @@ impl Database {
                         },
                     })?;
                 let source =
-                    crate::embedding::EmbeddingSource::GeneratedColumn { spec: spec.clone() };
+                    crate::embedding::EmbeddingSource::GeneratedColumnSpec { spec: spec.clone() };
                 let vectors = self
                     .embedding_providers
                     .embed_controlled(

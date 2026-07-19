@@ -2496,6 +2496,7 @@ mod tests {
     fn archive_publication_stays_in_pinned_parent_after_rename() {
         let source = tempfile::tempdir().unwrap();
         let parent_root = tempfile::tempdir().unwrap();
+        let canonical_parent_root = parent_root.path().canonicalize().unwrap();
         let requested_parent = parent_root.path().join("requested");
         let moved_parent = parent_root.path().join("moved");
         std::fs::create_dir(&requested_parent).unwrap();
@@ -2510,7 +2511,10 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(report.archive, destination);
+        assert_eq!(
+            report.archive,
+            canonical_parent_root.join("requested").join("archive")
+        );
         assert!(moved_parent.join("archive").is_dir());
         assert!(!requested_parent.join("archive").exists());
     }

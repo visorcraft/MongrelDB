@@ -127,7 +127,7 @@ fn schema() -> Schema {
                 ty: TypeId::Embedding { dim: 2 },
                 flags: ColumnFlags::empty(),
                 default_value: None,
-                embedding_source: Some(EmbeddingSource::GeneratedColumn {
+                embedding_source: Some(EmbeddingSource::GeneratedColumnSpec {
                     spec: GeneratedEmbeddingSpec {
                         provider_id: "text-test".into(),
                         model_id: "length-and-sum".into(),

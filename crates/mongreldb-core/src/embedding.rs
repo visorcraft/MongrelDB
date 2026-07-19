@@ -53,13 +53,25 @@ pub struct GeneratedEmbeddingSpec {
 pub enum EmbeddingSource {
     #[default]
     SuppliedByApplication,
-    /// A local provider resolved from node configuration. No path is stored.
+    /// Compatibility shape for 0.60.3 Kit clients. The node-local path is
+    /// accepted in memory but never serialized into replicated schema.
     LocalModel {
+        model_id: String,
+        #[serde(skip)]
+        model_path: std::path::PathBuf,
+    },
+    /// Compatibility shape for explicit Kit embedding calls. Ordinary writes
+    /// do not materialize this legacy source.
+    GeneratedColumn {
+        provider: String,
+    },
+    /// A local provider resolved from node configuration. No path is stored.
+    ConfiguredModel {
         provider_id: String,
         model_id: String,
         model_version: String,
     },
-    GeneratedColumn {
+    GeneratedColumnSpec {
         spec: GeneratedEmbeddingSpec,
     },
 }
@@ -68,16 +80,18 @@ impl EmbeddingSource {
     pub fn label(&self) -> &str {
         match self {
             Self::SuppliedByApplication => "supplied_by_application",
-            Self::LocalModel { .. } => "local_model",
-            Self::GeneratedColumn { .. } => "generated_column",
+            Self::LocalModel { .. } | Self::ConfiguredModel { .. } => "local_model",
+            Self::GeneratedColumn { .. } | Self::GeneratedColumnSpec { .. } => "generated_column",
         }
     }
 
     pub fn provider_id(&self) -> Option<&str> {
         match self {
             Self::SuppliedByApplication => None,
-            Self::LocalModel { provider_id, .. } => Some(provider_id),
-            Self::GeneratedColumn { spec } => Some(&spec.provider_id),
+            Self::LocalModel { model_id, .. } => Some(model_id),
+            Self::GeneratedColumn { provider } => Some(provider),
+            Self::ConfiguredModel { provider_id, .. } => Some(provider_id),
+            Self::GeneratedColumnSpec { spec } => Some(&spec.provider_id),
         }
     }
 
@@ -85,15 +99,18 @@ impl EmbeddingSource {
         match self {
             Self::SuppliedByApplication => None,
             Self::LocalModel { model_id, .. } => Some(model_id),
-            Self::GeneratedColumn { spec } => Some(&spec.model_id),
+            Self::GeneratedColumn { .. } => None,
+            Self::ConfiguredModel { model_id, .. } => Some(model_id),
+            Self::GeneratedColumnSpec { spec } => Some(&spec.model_id),
         }
     }
 
     pub fn model_version(&self) -> Option<&str> {
         match self {
             Self::SuppliedByApplication => None,
-            Self::LocalModel { model_version, .. } => Some(model_version),
-            Self::GeneratedColumn { spec } => Some(&spec.model_version),
+            Self::LocalModel { .. } | Self::GeneratedColumn { .. } => None,
+            Self::ConfiguredModel { model_version, .. } => Some(model_version),
+            Self::GeneratedColumnSpec { spec } => Some(&spec.model_version),
         }
     }
 
@@ -305,6 +322,13 @@ impl EmbeddingProviderRegistry {
             },
         );
         Ok(1)
+    }
+
+    /// Compatibility entry point for 0.60.3 Kit clients. Duplicate IDs keep
+    /// the existing provider instead of silently replacing it.
+    #[deprecated(note = "use register_new and handle duplicate provider IDs")]
+    pub fn register(&self, provider: Arc<dyn EmbeddingProvider>) {
+        let _ = self.register_new(provider);
     }
 
     pub fn replace(
@@ -566,7 +590,7 @@ fn validate_identity(
     source: &EmbeddingSource,
     provider: &dyn EmbeddingProvider,
 ) -> Result<(), EmbeddingError> {
-    if let EmbeddingSource::GeneratedColumn { spec } = source {
+    if let EmbeddingSource::GeneratedColumnSpec { spec } = source {
         if spec.normalization != provider.normalization() {
             return Err(EmbeddingError::NormalizationMismatch);
         }
@@ -809,7 +833,7 @@ mod tests {
     }
 
     fn source() -> EmbeddingSource {
-        EmbeddingSource::GeneratedColumn {
+        EmbeddingSource::GeneratedColumnSpec {
             spec: GeneratedEmbeddingSpec {
                 provider_id: "local-test".into(),
                 model_id: "fixed".into(),
@@ -873,6 +897,23 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn legacy_local_model_path_is_process_local_only() {
+        let source = EmbeddingSource::LocalModel {
+            model_id: "legacy".into(),
+            model_path: "/node-only/model.onnx".into(),
+        };
+        let encoded = serde_json::to_string(&source).unwrap();
+        assert!(!encoded.contains("node-only"));
+        assert_eq!(
+            serde_json::from_str::<EmbeddingSource>(&encoded).unwrap(),
+            EmbeddingSource::LocalModel {
+                model_id: "legacy".into(),
+                model_path: std::path::PathBuf::new(),
+            }
+        );
+    }
+
     struct WrongCount;
     impl EmbeddingProvider for WrongCount {
         fn provider_id(&self) -> &str {
@@ -907,7 +948,7 @@ mod tests {
     fn rejects_wrong_output_count() {
         let registry = EmbeddingProviderRegistry::new();
         registry.register_new(Arc::new(WrongCount)).unwrap();
-        let source = EmbeddingSource::LocalModel {
+        let source = EmbeddingSource::ConfiguredModel {
             provider_id: "wrong".into(),
             model_id: "wrong-model".into(),
             model_version: "1".into(),
@@ -927,7 +968,7 @@ mod tests {
         registry
             .register_new(Arc::new(SlowBlockingProvider))
             .unwrap();
-        let source = EmbeddingSource::LocalModel {
+        let source = EmbeddingSource::ConfiguredModel {
             provider_id: "slow-blocking".into(),
             model_id: "slow".into(),
             model_version: "1".into(),
