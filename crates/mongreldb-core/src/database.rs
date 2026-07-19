@@ -18,7 +18,7 @@ use crate::procedure::{
 };
 use crate::retention::{OwnedSnapshotGuard, SnapshotGuard, SnapshotRegistry};
 use crate::rowid::RowId;
-use crate::schema::{AlterColumn, ColumnDef, Schema, TypeId};
+use crate::schema::{AlterColumn, ColumnDef, ColumnFlags, Schema, TypeId};
 use crate::trigger::{
     StoredTrigger, TriggerCondition, TriggerConfig, TriggerEntry, TriggerEvent, TriggerExpr,
     TriggerRaiseAction, TriggerStep, TriggerTarget, TriggerTiming, TriggerValue,
@@ -13916,6 +13916,132 @@ impl Database {
         }
         self.finish_durable_publish(epoch, &mut _epoch_guard, &receipt, checkpoint)?;
         Ok(epoch)
+    }
+
+    /// Add a column through the database catalog and shared WAL.
+    ///
+    /// This is the catalog-aware counterpart to [`Table::add_column`]. The
+    /// mounted table schema, catalog image, and recovery record advance as one
+    /// durable DDL commit.
+    pub fn add_column(
+        &self,
+        table_name: &str,
+        name: &str,
+        ty: TypeId,
+        flags: ColumnFlags,
+        default_value: Option<crate::schema::DefaultExpr>,
+    ) -> Result<ColumnDef> {
+        self.add_column_with_id(table_name, name, ty, flags, default_value, None)
+    }
+
+    /// Add a catalog-aware column with an optional caller-assigned stable id.
+    pub fn add_column_with_id(
+        &self,
+        table_name: &str,
+        name: &str,
+        ty: TypeId,
+        flags: ColumnFlags,
+        default_value: Option<crate::schema::DefaultExpr>,
+        requested_id: Option<u16>,
+    ) -> Result<ColumnDef> {
+        use crate::wal::DdlOp;
+        use std::sync::atomic::Ordering;
+
+        self.require(&crate::auth::Permission::Ddl)?;
+        if self.poisoned.load(Ordering::Relaxed) {
+            return Err(MongrelError::Other(
+                "database poisoned by fsync error".into(),
+            ));
+        }
+        let _operation = self.admit_operation()?;
+        let _schema_barrier = self.acquire_schema_barrier_exclusive()?;
+        let _ddl = self.ddl_lock.lock();
+        let _security_write = self.security_write()?;
+        self.require(&crate::auth::Permission::Ddl)?;
+        let table_id = {
+            let catalog = self.catalog.read();
+            catalog
+                .live(table_name)
+                .ok_or_else(|| MongrelError::NotFound(format!("table {table_name:?} not found")))?
+                .table_id
+        };
+        let handle =
+            self.tables.read().get(&table_id).cloned().ok_or_else(|| {
+                MongrelError::NotFound(format!("table {table_name:?} not mounted"))
+            })?;
+        let durable_epoch = std::cell::Cell::new(None);
+        let result: Result<ColumnDef> = (|| {
+            let mut table = handle.lock();
+            let (column, prepared_schema) =
+                table.prepare_add_column(name, ty, flags, default_value, requested_id)?;
+            let command = crate::catalog_cmds::CatalogCommand::AddColumn {
+                table: table_name.to_string(),
+                column: column.clone(),
+            };
+            crate::catalog_cmds::apply(&self.catalog.read(), &command)?;
+
+            let commit_lock = Arc::clone(&self.commit_lock);
+            let _commit = commit_lock.lock();
+            let epoch = self.epoch.bump_assigned();
+            let mut epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
+            let txn_id = self.alloc_txn_id()?;
+            let column_json = DdlOp::encode_column(&column)?;
+            let mut next_catalog = self.catalog.read().clone();
+            let catalog_entry_index = next_catalog
+                .tables
+                .iter()
+                .position(|entry| entry.table_id == table_id)
+                .ok_or_else(|| MongrelError::NotFound(format!("table {table_name:?} not found")))?;
+            self.apply_catalog_command_to(&mut next_catalog, command)?;
+            next_catalog.tables[catalog_entry_index].schema = prepared_schema.clone();
+            next_catalog.db_epoch = next_catalog.db_epoch.max(epoch.0);
+            let commit_seq = {
+                let mut wal = self.shared_wal.lock();
+                let append: Result<u64> = (|| {
+                    wal.append(
+                        txn_id,
+                        table_id,
+                        crate::wal::Op::Ddl(DdlOp::AlterTable {
+                            table_id,
+                            column_json,
+                        }),
+                    )?;
+                    append_catalog_snapshot(&mut wal, txn_id, &next_catalog)?;
+                    wal.append_commit(txn_id, epoch, &[])
+                })();
+                append.map_err(|error| self.commit_outcome_unknown(epoch, error))?
+            };
+            let receipt = self.await_durable_commit(txn_id, commit_seq, epoch)?;
+            durable_epoch.set(Some(epoch));
+
+            table.apply_altered_schema_prepared(prepared_schema);
+            let schema = table.schema().clone();
+            let table_checkpoint = table.checkpoint_altered_schema();
+            drop(table);
+            next_catalog.tables[catalog_entry_index].schema = schema;
+            let catalog_result =
+                catalog::write_atomic(&self.root, &next_catalog, self.meta_dek.as_ref());
+            *self.catalog.write() = next_catalog;
+            self.publish_committed(&receipt, epoch)?;
+            epoch_guard.disarm();
+            if let Err(error) = table_checkpoint.and(catalog_result) {
+                self.poisoned.store(true, Ordering::Relaxed);
+                self.lifecycle.poison();
+                return Err(MongrelError::DurableCommit {
+                    epoch: epoch.0,
+                    message: error.to_string(),
+                });
+            }
+            Ok(column)
+        })();
+        result.map_err(|error| match (durable_epoch.get(), error) {
+            (_, error @ MongrelError::DurableCommit { .. }) => error,
+            (Some(epoch), error) => MongrelError::DurableCommit {
+                epoch: epoch.0,
+                message: error.to_string(),
+            },
+            (None, error) => error,
+        })
     }
 
     pub fn alter_column(

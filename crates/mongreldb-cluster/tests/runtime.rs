@@ -1522,6 +1522,13 @@ async fn drive_split_to(
     let control = ExecutionControl::default();
     let mut published = None;
     loop {
+        // Child state installs and catch-up deltas propose through the
+        // driver's local child groups. Pull leadership onto the driver
+        // before the first step after a restart, not after that step has
+        // already tried to propose.
+        for child in active_or_creating(nodes, driver, source) {
+            ensure_tablet_leader(nodes, child, driver).await;
+        }
         let (phase, command) = split_step_retry(
             nodes,
             &mut driver,
@@ -1545,14 +1552,6 @@ async fn drive_split_to(
                 }
             }
             _ => {}
-        }
-        // Child state installs and catch-up deltas propose through the
-        // driver's local child groups: after the children exist (and after
-        // any restart re-elects), pull their leadership onto the driver.
-        if phase >= SplitPhase::ChildrenCreated {
-            for child in active_or_creating(nodes, driver, source) {
-                ensure_tablet_leader(nodes, child, driver).await;
-            }
         }
         if phase == target {
             return published;

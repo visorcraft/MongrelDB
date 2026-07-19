@@ -10395,6 +10395,23 @@ impl Table {
         requested_id: Option<u16>,
     ) -> Result<u16> {
         self.ensure_writable()?;
+        let previous_schema = self.schema.clone();
+        let (column, schema) =
+            self.prepare_add_column(name, ty, flags, default_value, requested_id)?;
+        self.apply_altered_schema_prepared(schema);
+        self.checkpoint_standalone_schema_change(previous_schema)?;
+        Ok(column.id)
+    }
+
+    pub(crate) fn prepare_add_column(
+        &mut self,
+        name: &str,
+        ty: TypeId,
+        flags: ColumnFlags,
+        default_value: Option<crate::schema::DefaultExpr>,
+        requested_id: Option<u16>,
+    ) -> Result<(ColumnDef, Schema)> {
+        self.ensure_writable()?;
         if self.schema.columns.iter().any(|c| c.name == name) {
             return Err(MongrelError::Schema(format!(
                 "column {name} already exists"
@@ -10417,25 +10434,23 @@ impl Table {
                 .checked_add(1)
                 .ok_or_else(|| MongrelError::Schema("column id space exhausted".into()))?
         };
-        let previous_schema = self.schema.clone();
-        let mut next_schema = previous_schema.clone();
-        next_schema.columns.push(ColumnDef {
+        let column = ColumnDef {
             id,
             name: name.to_string(),
             ty,
             flags,
             default_value,
             embedding_source: None,
-        });
+        };
+        let mut next_schema = self.schema.clone();
+        next_schema.columns.push(column.clone());
         next_schema.schema_id = next_schema
             .schema_id
             .checked_add(1)
             .ok_or_else(|| MongrelError::Schema("schema id space exhausted".into()))?;
         next_schema.validate_auto_increment()?;
         next_schema.validate_defaults()?;
-        self.apply_altered_schema_prepared(next_schema);
-        self.checkpoint_standalone_schema_change(previous_schema)?;
-        Ok(id)
+        Ok((column, next_schema))
     }
 
     /// Declare a `LearnedRange` (PGM) index on an existing numeric column and

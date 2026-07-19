@@ -2353,8 +2353,6 @@ impl Database {
                 "non-null column added without default",
             ));
         }
-        let handle = self.core()?.table(&table).map_err(to_napi)?;
-        let mut g = handle.lock();
         let ty = to_type_id(
             &column.ty,
             column.embedding_dim,
@@ -2362,8 +2360,10 @@ impl Database {
         )?;
         let flags = to_column_flags(&column);
         let default_value = build_default_expr(&column, &ty)?;
-        let id = g
+        let added = self
+            .core()?
             .add_column_with_id(
+                &table,
                 &column.name,
                 ty,
                 flags,
@@ -2375,7 +2375,7 @@ impl Database {
                 },
             )
             .map_err(to_napi)?;
-        Ok(BigInt::from(id as u64))
+        Ok(BigInt::from(added.id as u64))
     }
 
     /// Alter an existing column's native schema metadata. The source column is

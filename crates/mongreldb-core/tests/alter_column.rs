@@ -98,6 +98,64 @@ fn database_alter_column_updates_catalog_and_reopens() {
 }
 
 #[test]
+fn database_add_column_updates_catalog_and_can_be_altered() {
+    let dir = tempdir().unwrap();
+    {
+        let db = Database::create(dir.path()).unwrap();
+        db.create_table("t", schema(false)).unwrap();
+        db.transaction(|tx| {
+            tx.put(
+                "t",
+                vec![(1, Value::Int64(1)), (2, Value::Bytes(b"a".to_vec()))],
+            )
+        })
+        .unwrap();
+
+        let added = db
+            .add_column_with_id(
+                "t",
+                "extra",
+                TypeId::Int64,
+                ColumnFlags::empty().with(ColumnFlags::NULLABLE),
+                None,
+                Some(3),
+            )
+            .unwrap();
+        assert_eq!(added.id, 3);
+        assert_eq!(
+            db.catalog_snapshot()
+                .live("t")
+                .unwrap()
+                .schema
+                .column("extra")
+                .unwrap()
+                .id,
+            3
+        );
+
+        let altered = db
+            .alter_column("t", "extra", AlterColumn::rename("renamed_extra"))
+            .unwrap();
+        assert_eq!(altered.id, 3);
+        assert_eq!(altered.name, "renamed_extra");
+    }
+
+    let reopened = Database::open(dir.path()).unwrap();
+    let catalog = reopened.catalog_snapshot();
+    let catalog_column = catalog
+        .live("t")
+        .unwrap()
+        .schema
+        .column("renamed_extra")
+        .unwrap();
+    assert_eq!(catalog_column.id, 3);
+    let table = reopened.table("t").unwrap();
+    let table = table.lock();
+    assert_eq!(table.schema().column("renamed_extra").unwrap().id, 3);
+    assert_eq!(table.count(), 1);
+}
+
+#[test]
 fn set_not_null_rejects_existing_nulls() {
     let dir = tempdir().unwrap();
     let db = Database::create(dir.path()).unwrap();

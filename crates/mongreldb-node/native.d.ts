@@ -206,6 +206,57 @@ export interface AnnRerankHitJs {
   hammingDistance: number
   exactScore: number
 }
+/**
+ * One named retriever for [`NativeTable::search`].
+ *
+ * `kind`: `"ann" | "sparse" | "minhash"`.
+ */
+export interface RetrieverSpecJs {
+  kind: string
+  columnId: number
+  name: string
+  weight: number
+  k: number
+  embedding?: Array<number>
+  sparseTokens?: Array<number>
+  sparseWeights?: Array<number>
+  members?: Array<string>
+}
+/** Optional exact-vector rerank after fusion. */
+export interface RerankSpecJs {
+  embeddingColumn: number
+  query: Array<number>
+  /** `"cosine" | "dot_product" | "euclidean"`. */
+  metric: string
+  candidateLimit: number
+  weight: number
+}
+/** Hybrid search request for [`NativeTable::search`]. */
+export interface SearchSpecJs {
+  must?: Array<ConditionSpec>
+  retrievers: Array<RetrieverSpecJs>
+  /** Reciprocal-rank fusion constant (default 60). */
+  fusionConstant?: number
+  rerank?: RerankSpecJs
+  limit: number
+  projection?: Array<number>
+}
+export interface SearchComponentJs {
+  retrieverName: string
+  rank: number
+  rawScoreKind: string
+  rawScoreValue: number
+  contribution: number
+}
+export interface SearchHitJs {
+  rowId: bigint
+  cells: RowJs
+  fusedScore: number
+  finalScore: number
+  finalRank: number
+  exactRerankScore?: number
+  components: Array<SearchComponentJs>
+}
 export interface OwnedRowJs {
   cells: Array<Cell>
 }
@@ -602,6 +653,12 @@ export declare class TableHandle {
   deleteByPkInt64(value: bigint): void
   /** Hybrid index query. */
   query(conditions: Array<ConditionSpec>): Array<RowJs>
+  /**
+   * Hybrid scored search: retrievers + reciprocal-rank fusion + optional
+   * exact-vector rerank. Same engine path as C `mongreldb_table_search`,
+   * Kit `Transaction::search`, and daemon `POST /kit/search`.
+   */
+  search(request: SearchSpecJs): Array<SearchHitJs>
   /**
    * Return one stable row-id-ordered page. Each page keeps the native query
    * result ceiling while `offset` allows callers to reach the full table.
