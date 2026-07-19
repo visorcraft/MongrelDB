@@ -1429,6 +1429,7 @@ fn remove_unpublished_header_only_segment(
     {
         return Ok(false);
     }
+    drop(reader);
     wal_root.remove_file(segment_filename(orphan_no))?;
     Ok(true)
 }

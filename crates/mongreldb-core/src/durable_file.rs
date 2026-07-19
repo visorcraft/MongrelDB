@@ -871,11 +871,14 @@ impl DurableRoot {
         #[cfg(windows)]
         {
             let (path, _ancestors) = self.windows_path(relative.as_ref())?;
-            match std::fs::remove_file(&path) {
-                Ok(()) => sync_directory(path.parent().unwrap_or(&self.canonical_path)),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-                Err(error) => Err(error),
-            }
+            let file = match open_windows_for_delete(&path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(error),
+            };
+            ensure_windows_regular(&file, &path).map_err(mongrel_error_to_io)?;
+            delete_windows_handle(file)?;
+            sync_directory(path.parent().unwrap_or(&self.canonical_path))
         }
 
         #[cfg(not(any(
@@ -1015,17 +1018,16 @@ impl DurableRoot {
 
         #[cfg(windows)]
         {
-            let (path, mut ancestors) = self.windows_path(relative.as_ref())?;
-            let directory = match open_windows_nofollow(&path) {
+            let (path, _ancestors) = self.windows_path(relative.as_ref())?;
+            let directory = match open_windows_for_delete(&path) {
                 Ok(directory) => directory,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
                 Err(error) => return Err(error),
             };
             ensure_windows_directory(&directory, &path).map_err(mongrel_error_to_io)?;
             remove_windows_directory_contents(&path, &directory)?;
-            ancestors.push(directory);
-            std::fs::remove_dir(&path)?;
-            return sync_directory(path.parent().unwrap_or(&self.canonical_path));
+            delete_windows_handle(directory)?;
+            sync_directory(path.parent().unwrap_or(&self.canonical_path))
         }
 
         #[allow(unreachable_code)]
@@ -1281,23 +1283,22 @@ fn remove_unix_directory_contents(directory: &rustix::fd::OwnedFd) -> io::Result
 
 #[cfg(windows)]
 fn remove_windows_directory_contents(path: &Path, _directory: &std::fs::File) -> io::Result<()> {
-    for entry in std::fs::read_dir(path)? {
-        let entry = entry?;
-        let child_path = entry.path();
-        let child = open_windows_nofollow(&child_path)?;
+    let child_paths = std::fs::read_dir(path)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<io::Result<Vec<_>>>()?;
+    for child_path in child_paths {
+        let child = open_windows_for_delete(&child_path)?;
         let metadata =
             ensure_windows_not_reparse(&child, &child_path).map_err(mongrel_error_to_io)?;
         if metadata.is_dir() {
             remove_windows_directory_contents(&child_path, &child)?;
-            std::fs::remove_dir(&child_path)?;
-        } else if metadata.is_file() {
-            std::fs::remove_file(&child_path)?;
-        } else {
+        } else if !metadata.is_file() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "refuses non-regular durable entry",
             ));
         }
+        delete_windows_handle(child)?;
     }
     sync_directory(path)
 }
@@ -1534,6 +1535,47 @@ fn open_windows_nofollow(path: &Path) -> io::Result<std::fs::File> {
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
     options.open(path)
+}
+
+#[cfg(windows)]
+fn open_windows_for_delete(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Foundation::GENERIC_READ;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        FILE_SHARE_WRITE,
+    };
+
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .access_mode(GENERIC_READ | DELETE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    options.open(path)
+}
+
+#[cfg(windows)]
+fn delete_windows_handle(file: std::fs::File) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
+    };
+
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    let deleted = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileDispositionInfo,
+            std::ptr::from_ref(&disposition).cast(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    };
+    if deleted == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    drop(file);
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1986,6 +2028,21 @@ mod windows_tests {
             first.file_identity().unwrap(),
             second.file_identity().unwrap()
         );
+    }
+
+    #[test]
+    fn descriptor_removal_deletes_validated_files_and_trees() {
+        let root = tempfile::tempdir().unwrap();
+        let durable = DurableRoot::open(root.path()).unwrap();
+        durable.create_directory_all("stale/nested").unwrap();
+        durable.write_new("stale/nested/chunk", b"stale").unwrap();
+        durable.write_new("orphan", b"stale").unwrap();
+
+        durable.remove_file("orphan").unwrap();
+        durable.remove_directory_all("stale").unwrap();
+
+        assert!(!root.path().join("orphan").exists());
+        assert!(!root.path().join("stale").exists());
     }
 }
 
