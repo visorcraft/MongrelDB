@@ -119,6 +119,7 @@ impl TestCluster {
                 && leaders
                     .values()
                     .all(|l| *l == *leaders.values().next().unwrap())
+                && among.contains(leaders.values().next().unwrap())
             {
                 return *leaders.values().next().unwrap();
             }
