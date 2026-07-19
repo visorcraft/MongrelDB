@@ -6463,8 +6463,9 @@ impl Database {
         let _commit = self.commit_lock.lock();
         let mut wal = self.shared_wal.lock();
         wal.group_sync()?;
+        let io_root = self.durable_root.io_path()?;
         let wal_dek = crate::encryption::wal_dek_for(self.kek.as_deref());
-        let records = crate::wal::SharedWal::replay_with_dek(&self.root, wal_dek.as_ref())?;
+        let records = crate::wal::SharedWal::replay_with_dek(&io_root, wal_dek.as_ref())?;
         let epoch = records
             .iter()
             .filter_map(|record| match &record.op {
@@ -6474,7 +6475,7 @@ impl Database {
             .max()
             .unwrap_or(0)
             .max(self.epoch.committed().0);
-        let files = crate::replication::capture_files(&self.root)?;
+        let files = crate::replication::capture_files(&io_root)?;
         let source_id = crate::replication::replication_identity_durable(&self.durable_root)?;
         drop(wal);
         Ok(crate::replication::ReplicationSnapshot::new(
@@ -6511,7 +6512,8 @@ impl Database {
         let destination_name = child.file_name().ok_or_else(|| {
             MongrelError::InvalidArgument("durable backup child has no filename".into())
         })?;
-        let prepared = prepare_backup_destination_in(&self.root, parent, destination_name)?;
+        let source_root = self.durable_root.io_path()?;
+        let prepared = prepare_backup_destination_in(&source_root, parent, destination_name)?;
         self.hot_backup_prepared(prepared, control, || true)
     }
 
@@ -6527,7 +6529,8 @@ impl Database {
     where
         F: FnOnce() -> bool,
     {
-        let prepared = prepare_backup_destination(&self.root, destination.as_ref())?;
+        let source_root = self.durable_root.io_path()?;
+        let prepared = prepare_backup_destination(&source_root, destination.as_ref())?;
         self.hot_backup_prepared(prepared, control, before_publish)
     }
 
@@ -6569,13 +6572,13 @@ impl Database {
             wal.group_sync()?;
             let epoch = self.epoch.committed().0;
             let boundary_unix_nanos = current_unix_nanos();
+            let source_root = self.durable_root.io_path()?;
 
             let pin_nonce = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos();
-            let file_pin_root = self
-                .root
+            let file_pin_root = source_root
                 .join(META_DIR)
                 .join("backup-pins")
                 .join(format!("{}-{pin_nonce}", std::process::id()));
@@ -6637,7 +6640,7 @@ impl Database {
                 .collect();
             let mut copied = Vec::new();
             copy_backup_boundary(
-                &self.root,
+                &source_root,
                 prepared.stage.as_deref().ok_or_else(|| {
                     MongrelError::Other("backup staging root was already released".into())
                 })?,
@@ -14844,6 +14847,7 @@ impl Database {
 
     fn check_inner(&self, control: Option<&crate::ExecutionControl>) -> Result<Vec<CheckIssue>> {
         let mut issues = Vec::new();
+        let io_root = self.durable_root.io_path()?;
         let cat = self.catalog.read();
         let manifest_meta_dek = crate::encryption::meta_dek_for(self.kek.as_deref());
         for (table_index, entry) in cat.tables.iter().enumerate() {
@@ -14855,7 +14859,7 @@ impl Database {
             if !matches!(entry.state, TableState::Live) {
                 continue;
             }
-            let tdir = self.root.join(TABLES_DIR).join(entry.table_id.to_string());
+            let tdir = io_root.join(TABLES_DIR).join(entry.table_id.to_string());
             let mut err = |sev: &str, desc: String| {
                 issues.push(CheckIssue {
                     table_id: entry.table_id,
@@ -14963,7 +14967,7 @@ impl Database {
             .iter()
             .map(|entry| entry.name.clone())
             .collect::<std::collections::HashSet<_>>();
-        let vtab_dir = self.root.join(VTAB_DIR);
+        let vtab_dir = io_root.join(VTAB_DIR);
         if let Ok(entries) = std::fs::read_dir(&vtab_dir) {
             for (entry_index, entry) in entries.flatten().enumerate() {
                 if entry_index % 256 == 0 {
