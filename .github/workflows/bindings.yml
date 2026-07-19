@@ -46,13 +46,53 @@ concurrency:
 
 permissions:
   contents: read
+  pull-requests: read
 
 env:
   RUST_VERSION: "1.97.1"
 
 jobs:
+  changes:
+    name: Binding paths
+    runs-on: ubuntu-latest
+    outputs:
+      shared: ${{ steps.filter.outputs.shared }}
+      node: ${{ steps.filter.outputs.node }}
+      ffi: ${{ steps.filter.outputs.ffi }}
+      kit_ffi: ${{ steps.filter.outputs.kit_ffi }}
+      jni: ${{ steps.filter.outputs.jni }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            shared:
+              - ".github/workflows/bindings.yml"
+              - "Cargo.toml"
+              - "crates/mongreldb-core/src/**"
+              - "crates/mongreldb-core/Cargo.toml"
+              - "crates/mongreldb-core/build.rs"
+              - "crates/mongreldb-query/src/**"
+              - "crates/mongreldb-query/Cargo.toml"
+              - "crates/mongreldb-query/build.rs"
+              - "crates/mongreldb-types/src/**"
+              - "crates/mongreldb-types/Cargo.toml"
+              - "crates/mongreldb-log/src/**"
+              - "crates/mongreldb-log/Cargo.toml"
+            node:
+              - "crates/mongreldb-node/**"
+            ffi:
+              - "crates/mongreldb-ffi/**"
+            kit_ffi:
+              - "crates/mongreldb-kit-ffi/**"
+            jni:
+              - "crates/mongreldb-jni/**"
+
   node:
     name: Node
+    needs: changes
+    if: needs.changes.outputs.shared == 'true' || needs.changes.outputs.node == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -74,6 +114,8 @@ jobs:
 
   ffi:
     name: C FFI
+    needs: changes
+    if: needs.changes.outputs.shared == 'true' || needs.changes.outputs.ffi == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -91,6 +133,8 @@ jobs:
 
   kit-ffi:
     name: Kit FFI
+    needs: changes
+    if: needs.changes.outputs.shared == 'true' || needs.changes.outputs.kit_ffi == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -108,6 +152,8 @@ jobs:
 
   jni:
     name: JNI
+    needs: changes
+    if: needs.changes.outputs.shared == 'true' || needs.changes.outputs.jni == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
