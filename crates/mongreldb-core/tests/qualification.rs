@@ -138,7 +138,9 @@ fn seed_rows(db: &Database, rows: usize) -> Vec<RowId> {
 /// Gate item: "One million-row overlapping read/write test has bounded RSS
 /// and commit p99." Env-scaled via `MONGRELDB_QUAL_ROWS` (default 100,000 for
 /// CI; 1,000,000 for the full gate), `MONGRELDB_QUAL_WRITERS` (4),
-/// `MONGRELDB_QUAL_READERS` (4), `MONGRELDB_QUAL_COMMIT_P99_MS` (500).
+/// `MONGRELDB_QUAL_READERS` (4), `MONGRELDB_QUAL_COMMIT_P99_MS` (500 release,
+/// 1,000 debug). Release mode owns the performance gate; the debug default is
+/// a sanity bound for loaded cross-platform CI.
 #[test]
 fn overlapping_read_write_bounded_rss_and_commit_p99() {
     let _serial = SERIAL.lock().unwrap();
@@ -146,8 +148,11 @@ fn overlapping_read_write_bounded_rss_and_commit_p99() {
     let rows = env_usize("MONGRELDB_QUAL_ROWS", 100_000);
     let writers = env_usize("MONGRELDB_QUAL_WRITERS", 4);
     let readers = env_usize("MONGRELDB_QUAL_READERS", 4);
-    let commit_p99_max =
-        Duration::from_millis(env_usize("MONGRELDB_QUAL_COMMIT_P99_MS", 500) as u64);
+    let default_commit_p99_ms = if cfg!(debug_assertions) { 1_000 } else { 500 };
+    let commit_p99_max = Duration::from_millis(env_usize(
+        "MONGRELDB_QUAL_COMMIT_P99_MS",
+        default_commit_p99_ms,
+    ) as u64);
     assert!(rows >= 1_000, "the workload needs a meaningful row count");
     assert!(writers > 0 && readers > 0);
 
