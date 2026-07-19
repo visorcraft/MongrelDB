@@ -524,6 +524,43 @@ impl DurableRoot {
         self.sync_relative_parent(relative)
     }
 
+    /// Write an immutable file and publish its name only after its contents
+    /// are durable. Concurrent creators get `AlreadyExists` and can safely
+    /// read the complete winner.
+    pub fn write_new_atomic(&self, relative: impl AsRef<Path>, bytes: &[u8]) -> io::Result<()> {
+        let relative = relative.as_ref();
+        let (_, name) = checked_parent(relative)?;
+        for _ in 0..128 {
+            let mut nonce = [0_u8; 8];
+            getrandom::getrandom(&mut nonce)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            let suffix = nonce
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let temporary = relative.with_file_name(format!(
+                ".{}.tmp-{}-{suffix}",
+                name.to_string_lossy(),
+                std::process::id()
+            ));
+            match self.write_new(&temporary, bytes) {
+                Ok(()) => {
+                    let result = self.rename_file_new(&temporary, relative);
+                    if result.is_err() {
+                        let _ = self.remove_file(&temporary);
+                    }
+                    return result;
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate durable temporary file",
+        ))
+    }
+
     pub(crate) fn create_regular_new(
         &self,
         relative: impl AsRef<Path>,
@@ -1890,6 +1927,48 @@ where
             io::ErrorKind::Unsupported,
             "durable atomic replacement is unsupported on this platform",
         ))
+    }
+}
+
+#[cfg(test)]
+mod common_tests {
+    use super::*;
+    use std::io::Read;
+    use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn atomic_new_file_publishes_one_complete_winner() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = Arc::new(DurableRoot::open(directory.path()).unwrap());
+        let barrier = Arc::new(Barrier::new(2));
+        let writers = [b'a', b'b'].map(|byte| {
+            let root = Arc::clone(&root);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                root.write_new_atomic("key", &[byte; 32])
+            })
+        });
+        let results = writers.map(|writer| writer.join().unwrap());
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| {
+                    result
+                        .as_ref()
+                        .is_err_and(|error| error.kind() == io::ErrorKind::AlreadyExists)
+                })
+                .count(),
+            1
+        );
+        let mut bytes = Vec::new();
+        root.open_regular("key")
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert!(bytes == [b'a'; 32] || bytes == [b'b'; 32]);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 }
 

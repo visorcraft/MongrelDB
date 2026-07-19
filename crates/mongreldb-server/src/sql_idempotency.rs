@@ -323,7 +323,7 @@ fn load_or_create_plaintext_integrity_key(root: &DurableRoot) -> io::Result<Zero
     let mut key = Zeroizing::new([0u8; 32]);
     mongreldb_core::encryption::fill_random(key.as_mut())
         .map_err(|error| io::Error::other(error.to_string()))?;
-    match root.write_new(INTEGRITY_KEY_FILE, key.as_ref()) {
+    match root.write_new_atomic(INTEGRITY_KEY_FILE, key.as_ref()) {
         Ok(()) => Ok(key),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => read_integrity_key(root),
         Err(error) => Err(error),
