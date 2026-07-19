@@ -300,6 +300,11 @@ fn read_only_handle_rejects_writes_and_allows_reads() {
         reader.put("items", vec![(1, Value::Int64(2))]),
         Err(MongrelError::ReadOnlyHandle { .. })
     ));
+    let row_id = reader.rows("items").unwrap()[0].row_id;
+    assert!(matches!(
+        reader.delete("items", row_id),
+        Err(MongrelError::ReadOnlyHandle { .. })
+    ));
     assert!(matches!(
         reader.create_table("forbidden", id_schema()),
         Err(MongrelError::ReadOnlyHandle { .. })
@@ -338,6 +343,15 @@ fn catalog_credentials_attach_and_revocation_is_live() {
             },
         )
         .unwrap();
+    let bob = manager
+        .open_shared(
+            dir.path(),
+            OpenIdentity::CatalogCredentials {
+                username: "bob".into(),
+                password: SecretString::new("user-password"),
+            },
+        )
+        .unwrap();
     alice.put("items", vec![(1, Value::Int64(1))]).unwrap();
     admin.revoke_role("alice", "writer").unwrap();
     assert!(matches!(
@@ -346,6 +360,7 @@ fn catalog_credentials_attach_and_revocation_is_live() {
     ));
 
     admin.drop_user("bob").unwrap();
+    assert!(bob.count("items").is_err());
     assert_eq!(alice.count("items").unwrap(), 1);
 }
 

@@ -3,7 +3,8 @@
 //! The seven services below are the server's contract with its protocol
 //! adapters (native RPC, HTTP/JSON, Kit, MySQL wire): adapters translate
 //! wire requests into the canonical model of [`crate::request`] and call
-//! these traits; the server wave implements them.
+//! these traits. The server also implements the generated gRPC services in
+//! `mongreldb_server::native`.
 //!
 //! # Errors
 //!
@@ -67,8 +68,8 @@ pub struct ExecuteResponse {
     pub rows_affected: u64,
     /// Result frames: Arrow IPC byte chunks, the buffered form of the
     /// [`ArrowFrameStream`] contract. Empty for commands without a result
-    /// set. The protocol crate fixes framing only; real Arrow record-batch
-    /// encoding lands in the server wave.
+    /// set. The protocol crate fixes framing; the server encodes real Arrow
+    /// record batches into these frames.
     pub frames: Vec<Vec<u8>>,
 }
 
@@ -146,8 +147,8 @@ pub struct HealthStatus {
 ///
 /// Each frame is one Arrow IPC byte chunk carried on the wire as the
 /// payload of a [`crate::envelope::ProtocolEnvelope`] (spec section 4.10);
-/// the protocol crate fixes the framing contract only — real Arrow
-/// record-batch encoding lands in the server wave. `Ok(Some(frame))` yields
+/// the protocol crate fixes the framing contract; the server supplies real
+/// Arrow record-batch encoding. `Ok(Some(frame))` yields
 /// one chunk, `Ok(None)` ends the stream, and `Err` is terminal (the stream
 /// yields nothing further).
 pub trait ArrowFrameStream: Send {

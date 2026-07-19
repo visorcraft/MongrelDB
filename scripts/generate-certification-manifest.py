@@ -9,7 +9,11 @@ import subprocess
 
 
 TESTS = {
-    "format": ("cargo fmt --check", "cargo-fmt.log"),
+    "component_versions": (
+        "python3 scripts/verify-component-versions",
+        "component-versions.log",
+    ),
+    "format": ("cargo fmt --all -- --check", "cargo-fmt.log"),
     "clippy": (
         "cargo clippy --workspace --all-targets --all-features -- -D warnings",
         "cargo-clippy.log",

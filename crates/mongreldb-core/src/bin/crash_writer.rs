@@ -17,6 +17,7 @@ use mongreldb_core::schema::{ColumnDef, ColumnFlags, Schema, TypeId};
 use mongreldb_core::{Database, Table, Value};
 use std::io::Write;
 use std::process::exit;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 fn schema() -> Schema {
@@ -152,11 +153,101 @@ fn main() {
             signal("SHARED_READY");
             spin();
         }
+        // Stop inside one canonical durable hook. The parent kills this
+        // process while the hook callback holds the exact boundary, then
+        // reopens and validates the published or recoverable state.
+        "durable-hook" => {
+            let hook = args.next().unwrap_or_else(|| {
+                eprintln!("durable-hook requires a hook name");
+                exit(2);
+            });
+            let hook = durable_hook(&hook);
+            match hook {
+                "wal.append.before"
+                | "wal.append.after"
+                | "wal.fsync.before"
+                | "wal.fsync.after"
+                | "commit.publish.before"
+                | "commit.publish.after" => {
+                    let db = database_with_row(&dir);
+                    arm_crash_hook(hook);
+                    let mut transaction = db.begin();
+                    transaction
+                        .put("items", vec![(1, Value::Int64(2))])
+                        .expect("stage hook row");
+                    let _ = transaction.commit();
+                }
+                "catalog.publish.before" | "catalog.publish.after" => {
+                    let db = database_with_row(&dir);
+                    arm_crash_hook(hook);
+                    let _ = db.create_table("published", schema());
+                }
+                "snapshot.install.before" | "snapshot.install.after" => {
+                    let leader = database_with_row(&dir.join("leader"));
+                    let snapshot = leader.replication_snapshot().expect("snapshot");
+                    arm_crash_hook(hook);
+                    let _ = snapshot.install(dir.join("follower"));
+                }
+                "index.publish.before" | "index.publish.after" => {
+                    let db = database_with_row(&dir);
+                    db.table("items")
+                        .expect("items")
+                        .lock()
+                        .set_mutable_run_spill_bytes(1);
+                    arm_crash_hook(hook);
+                    let _ = db.table("items").expect("items").lock().flush();
+                }
+                _ => unreachable!(),
+            }
+            panic!("durable hook {hook} was not hit");
+        }
         other => {
             eprintln!("unknown mode: {other}");
             exit(2);
         }
     }
+}
+
+fn database_with_row(path: &std::path::Path) -> Database {
+    let db = Database::create(path).expect("create database");
+    db.create_table("items", schema()).expect("create table");
+    db.transaction(|transaction| {
+        transaction.put("items", vec![(1, Value::Int64(1))])?;
+        Ok(())
+    })
+    .expect("commit baseline row");
+    db
+}
+
+fn durable_hook(name: &str) -> &'static str {
+    match name {
+        "wal.append.before" => "wal.append.before",
+        "wal.append.after" => "wal.append.after",
+        "wal.fsync.before" => "wal.fsync.before",
+        "wal.fsync.after" => "wal.fsync.after",
+        "commit.publish.before" => "commit.publish.before",
+        "commit.publish.after" => "commit.publish.after",
+        "catalog.publish.before" => "catalog.publish.before",
+        "catalog.publish.after" => "catalog.publish.after",
+        "snapshot.install.before" => "snapshot.install.before",
+        "snapshot.install.after" => "snapshot.install.after",
+        "index.publish.before" => "index.publish.before",
+        "index.publish.after" => "index.publish.after",
+        other => {
+            eprintln!("unknown durable hook: {other}");
+            exit(2);
+        }
+    }
+}
+
+fn arm_crash_hook(hook: &'static str) {
+    mongreldb_fault::activate(
+        hook,
+        mongreldb_fault::Action::Callback(Arc::new(|_| {
+            signal("HOOK_READY");
+            spin();
+        })),
+    );
 }
 
 fn signal(msg: &str) {

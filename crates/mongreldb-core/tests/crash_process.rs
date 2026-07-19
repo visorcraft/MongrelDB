@@ -235,3 +235,70 @@ fn repeated_kill9_cycles_preserve_rows_and_wal_sequence_encrypted() {
         drop(db);
     }
 }
+
+#[test]
+fn every_canonical_durable_hook_survives_real_kill9() {
+    const HOOKS: &[&str] = &[
+        "wal.append.before",
+        "wal.append.after",
+        "wal.fsync.before",
+        "wal.fsync.after",
+        "commit.publish.before",
+        "commit.publish.after",
+        "catalog.publish.before",
+        "catalog.publish.after",
+        "snapshot.install.before",
+        "snapshot.install.after",
+        "index.publish.before",
+        "index.publish.after",
+    ];
+
+    for hook in HOOKS {
+        let dir = TempDir::new().unwrap();
+        spawn_and_kill_args(
+            &["durable-hook".into(), (*hook).into()],
+            "HOOK_READY",
+            dir.path(),
+        );
+        match *hook {
+            "snapshot.install.before" | "snapshot.install.after" => {
+                let leader = Database::open(dir.path().join("leader"))
+                    .unwrap_or_else(|error| panic!("{hook}: reopen leader: {error}"));
+                let follower_path = dir.path().join("follower");
+                if !follower_path.exists() {
+                    leader
+                        .replication_snapshot()
+                        .unwrap()
+                        .install(&follower_path)
+                        .unwrap_or_else(|error| panic!("{hook}: retry snapshot install: {error}"));
+                }
+                let follower = Database::open(&follower_path)
+                    .unwrap_or_else(|error| panic!("{hook}: reopen follower: {error}"));
+                assert!(follower.is_read_only_replica(), "{hook}");
+                assert_eq!(follower.table("items").unwrap().lock().count(), 1, "{hook}");
+            }
+            "index.publish.before" | "index.publish.after" => {
+                let db = Database::open(dir.path())
+                    .unwrap_or_else(|error| panic!("{hook}: reopen database: {error}"));
+                assert_eq!(db.table("items").unwrap().lock().count(), 1, "{hook}");
+                assert!(db.check().is_empty(), "{hook}");
+            }
+            "catalog.publish.before" | "catalog.publish.after" => {
+                let db = Database::open(dir.path())
+                    .unwrap_or_else(|error| panic!("{hook}: reopen database: {error}"));
+                assert!(db.table("published").is_ok(), "{hook}");
+                assert!(db.check().is_empty(), "{hook}");
+            }
+            _ => {
+                let db = Database::open(dir.path())
+                    .unwrap_or_else(|error| panic!("{hook}: reopen database: {error}"));
+                let count = db.table("items").unwrap().lock().count();
+                assert!((1..=2).contains(&count), "{hook}: row count {count}");
+                assert!(db.check().is_empty(), "{hook}");
+                if matches!(*hook, "commit.publish.before" | "commit.publish.after") {
+                    assert_eq!(count, 2, "{hook}: durable row was lost");
+                }
+            }
+        }
+    }
+}

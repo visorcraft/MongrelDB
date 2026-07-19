@@ -10,10 +10,10 @@
 //! # Leadership transfer
 //!
 //! openraft 0.9 has no dedicated transfer-leadership RPC, so transfer is
-//! orchestrated: the old leader suppresses its own candidacy
-//! (`Raft::runtime_config().elect(false)`, restored afterwards), the transport asks the
-//! target to start an election (`Raft::trigger().elect()`), and the target
-//! wins the next election round once the old leader's lease lapses. This is
+//! orchestrated: the old leader pauses heartbeats and suppresses its own
+//! candidacy, the transport asks the target to start an election, and the
+//! target wins once the old leader's lease lapses. Runtime settings are
+//! restored afterwards. This is
 //! best-effort — it completes when the target is a healthy voter — and is
 //! used only for planned failover and rolling upgrade (ADR-0010), never
 //! required for correctness.
@@ -55,6 +55,15 @@ use mongreldb_log::envelope::CommandEnvelope;
 use mongreldb_types::hlc::{HlcClock, HlcTimestamp, WallClockSource};
 
 pub use openraft::ServerState as RaftServerState;
+
+struct LeadershipTransferRuntime<'a>(&'a MongrelRaft);
+
+impl Drop for LeadershipTransferRuntime<'_> {
+    fn drop(&mut self) {
+        self.0.runtime_config().heartbeat(true);
+        self.0.runtime_config().elect(true);
+    }
+}
 
 /// Wall clock in microseconds since the Unix epoch (the group HLC clock's
 /// default time source; mirrors `HlcClock::new`'s).
@@ -1008,23 +1017,40 @@ impl<T: RaftTransport> ConsensusGroup<T> {
                 "transfer target {target} is not a voter"
             )));
         }
-        // Keep this node from campaigning during the handoff so the target
-        // does not race the old leader through repeated elections (openraft's
-        // leader lease makes the first campaign rounds fail by design).
-        // Always restored before returning.
+        // Stop renewing follower leases and keep this node from campaigning
+        // during the handoff. A single forced election can lose while the old
+        // lease is still live, so retry within the caller's one deadline.
+        self.raft.runtime_config().heartbeat(false);
         self.raft.runtime_config().elect(false);
-        let result = async {
-            self.transport.trigger_election(target).await?;
-            self.raft
-                .wait(Some(timeout))
-                .current_leader(target, "leadership transfer")
-                .await
-                .map_err(|_| ConsensusError::DeadlineExceeded)?;
-            Ok(())
+        let _runtime = LeadershipTransferRuntime(&self.raft);
+        async {
+            let deadline = Instant::now() + timeout;
+            let attempt_timeout = self
+                .config
+                .election_timeout_max
+                .saturating_mul(2)
+                .max(Duration::from_millis(10));
+            loop {
+                self.transport.trigger_election(target).await?;
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(ConsensusError::DeadlineExceeded);
+                }
+                if self
+                    .raft
+                    .wait(Some(remaining.min(attempt_timeout)))
+                    .current_leader(target, "leadership transfer")
+                    .await
+                    .is_ok()
+                {
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    return Err(ConsensusError::DeadlineExceeded);
+                }
+            }
         }
-        .await;
-        self.raft.runtime_config().elect(true);
-        result
+        .await
     }
 
     /// Observability metrics (spec section 14.4).

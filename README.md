@@ -455,16 +455,16 @@ crates/mongreldb-log/     CommitLog commit authority + versioned CommandEnvelope
 crates/mongreldb-fault/   named fault-injection hooks with barrier coordination
 crates/mongreldb-sim/     deterministic simulator (seeded RNG, virtual clock,
                           network, disk) for distributed-behavior tests
-crates/mongreldb-protocol/ versioned Stage 1D protocol: canonical request model,
-                          wire envelope, service traits, and session model
+crates/mongreldb-protocol/ versioned request model, Protobuf schemas, TLS 1.3
+                          HTTP/2 transport, service traits, and session model
 crates/mongreldb-consensus/ openraft adapter (Stage 2): ConsensusGroup,
                           RaftCommitLog, durable checksummed storage, engine
                           sink to a ClusterReplica core
 crates/mongreldb-cluster/ node identity/bootstrap, routing cache + retry
                           policy, feature levels, rolling-upgrade planning
 crates/mongreldb-node/    NAPI addon (typed object API; built via `napi`)
-crates/mongreldb-server/  HTTP daemon (axum/tokio; SQL + native query + typed Kit API)
-crates/mongreldb-client/  typed HTTP client for the daemon (SQL/native + Kit API)
+crates/mongreldb-server/  HTTP/Kit daemon plus native gRPC service runtime
+crates/mongreldb-client/  typed HTTP/Kit and pooled native gRPC client
 crates/mongreldb-ffi/     C ABI over the engine core (SQL, migrations, foundation for native bindings)
 crates/mongreldb-kit-ffi/ C ABI over MongrelDB Kit (schema model, migration runner, query builder)
 crates/mongreldb-jni/     JNI shim for the JVM (Java, Kotlin, Scala)

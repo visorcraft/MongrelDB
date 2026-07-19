@@ -286,7 +286,9 @@ jobs:
             df -h
           } > "$QUAL_DIR/versions.txt"
       - name: Root format
-        run: python3 scripts/run-certification-command.py "$QUAL_DIR/cargo-fmt.log" cargo fmt --check
+        run: python3 scripts/run-certification-command.py "$QUAL_DIR/cargo-fmt.log" cargo fmt --all -- --check
+      - name: Component versions
+        run: python3 scripts/run-certification-command.py "$QUAL_DIR/component-versions.log" python3 scripts/verify-component-versions
       - name: Root clippy
         run: python3 scripts/run-certification-command.py "$QUAL_DIR/cargo-clippy.log" cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Root tests
@@ -382,6 +384,7 @@ jobs:
         run: |
           rustup toolchain install nightly --profile minimal
           cargo install cargo-fuzz --locked
+          # shellcheck disable=SC2016
           python3 scripts/run-certification-command.py "$QUAL_DIR/fuzz-smoke.log" \
             bash -c 'cd fuzz && for target in protocol_envelope wal consensus_snapshot cursor_token sql_adapter_packet; do cargo +nightly fuzz run "$target" -- -max_total_time=10; done'
       - name: Crash recovery matrix
