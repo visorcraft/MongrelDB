@@ -14,8 +14,8 @@
 //! All durable writes are atomic: a unique temporary file is written and
 //! fsynced, then atomically renamed into place (or hard-linked for
 //! create-if-absent creation), followed by a directory fsync — the same idiom
-//! the storage core uses for its catalog checkpoints, implemented locally
-//! because this crate does not depend on the storage core. Loading verifies
+//! the storage core uses for its catalog checkpoints, backed by the shared
+//! bottom-layer durability helper. Loading verifies
 //! the format version and the payload: unknown versions, unknown fields,
 //! corrupt payloads, and reserved all-zero identifiers all fail closed (spec
 //! section 4.10).
@@ -815,7 +815,7 @@ fn write_temp_file(dir: &Path, filename: &str, bytes: &[u8]) -> io::Result<PathB
 
 /// Fsync a directory so a rename/link inside it becomes durable.
 pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
-    File::open(dir)?.sync_all()
+    mongreldb_types::durability::sync_directory(dir)
 }
 
 #[cfg(test)]

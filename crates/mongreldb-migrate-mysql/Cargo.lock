@@ -3011,6 +3011,7 @@ dependencies = [
  "mongreldb-core",
  "mongreldb-protocol",
  "mongreldb-server",
+ "mongreldb-types",
  "mysql_async",
  "rcgen",
  "rustls",
@@ -3101,6 +3102,7 @@ dependencies = [
  "getrandom 0.2.17",
  "serde",
  "thiserror 1.0.69",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

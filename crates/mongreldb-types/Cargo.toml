@@ -5,9 +5,12 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
-description = "MongrelDB shared identifiers, HLC timestamps, and the stable cross-language error taxonomy."
+description = "MongrelDB shared identifiers, HLC timestamps, durability primitives, and error taxonomy."
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 thiserror = "1"
 getrandom = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem"] }

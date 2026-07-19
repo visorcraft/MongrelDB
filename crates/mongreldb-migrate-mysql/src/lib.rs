@@ -1293,7 +1293,7 @@ impl CheckpointStore {
             file.sync_all()?;
         }
         std::fs::rename(temp, &self.path)?;
-        std::fs::File::open(parent)?.sync_all()?;
+        mongreldb_types::durability::sync_directory(parent)?;
         Ok(())
     }
 }

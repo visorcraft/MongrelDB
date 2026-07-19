@@ -258,9 +258,7 @@ pub(crate) fn read_frame_file(path: &Path, magic: &[u8; 8]) -> Result<Option<Vec
 
 /// Fsyncs a directory so a rename/create inside it is durable.
 pub(crate) fn fsync_dir(dir: &Path) -> Result<(), StoreError> {
-    File::open(dir)
-        .and_then(|d| d.sync_all())
-        .map_err(StoreError::io(dir, "dir fsync"))
+    mongreldb_types::durability::sync_directory(dir).map_err(StoreError::io(dir, "dir fsync"))
 }
 
 // ---------------------------------------------------------------------------

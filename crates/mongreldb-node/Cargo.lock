@@ -2206,6 +2206,7 @@ dependencies = [
  "aes-gcm",
  "arc-swap",
  "argon2",
+ "base64",
  "bincode",
  "bytemuck",
  "bytes",
@@ -2222,11 +2223,13 @@ dependencies = [
  "parking_lot",
  "rayon",
  "regex",
+ "ring",
  "roaring",
  "rustix",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "subtle",
  "thiserror 1.0.69",
  "tokio",
  "windows-sys 0.61.2",
@@ -2305,6 +2308,7 @@ dependencies = [
  "getrandom 0.2.17",
  "serde",
  "thiserror 1.0.69",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
