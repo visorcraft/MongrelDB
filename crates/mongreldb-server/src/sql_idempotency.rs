@@ -876,7 +876,9 @@ impl CapacityFileGuard {
         loop {
             match file.try_lock_exclusive() {
                 Ok(()) => return Ok(Self(file)),
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                Err(error)
+                    if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
+                {
                     tokio::time::sleep(Duration::from_millis(1)).await;
                 }
                 Err(error) => return Err(error),
