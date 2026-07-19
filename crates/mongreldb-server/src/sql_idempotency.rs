@@ -149,7 +149,7 @@ pub(crate) enum BeginResult {
         created_at_ms: Option<u64>,
     },
     Full,
-    Unavailable,
+    Unavailable(String),
 }
 
 pub(crate) struct SqlIdempotencyStore {
@@ -395,8 +395,13 @@ impl SqlIdempotencyStore {
         binding: SqlIdempotencyBinding,
     ) -> BeginResult {
         if !self.available.load(Ordering::Acquire) {
-            if self.integrity.is_none() || self.files.ensure_directory().is_err() {
-                return BeginResult::Unavailable;
+            if self.integrity.is_none() {
+                return BeginResult::Unavailable("integrity key unavailable".into());
+            }
+            if let Err(error) = self.files.ensure_directory() {
+                return BeginResult::Unavailable(format!(
+                    "idempotency directory unavailable: {error}"
+                ));
             }
             self.available.store(true, Ordering::Release);
         }
@@ -435,8 +440,11 @@ impl SqlIdempotencyStore {
             ExistingEntry::None => {}
         }
         let _capacity_guard = self.synchronization.capacity_lock.lock().await;
-        let Ok(_capacity_file_guard) = CapacityFileGuard::acquire(&self.files).await else {
-            return BeginResult::Unavailable;
+        let _capacity_file_guard = match CapacityFileGuard::acquire(&self.files).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                return BeginResult::Unavailable(format!("capacity lock unavailable: {error}"));
+            }
         };
         self.prune_expired_receipts();
         match self.read_entry(&scope, scope_hash, owner_hash) {
@@ -482,10 +490,15 @@ impl SqlIdempotencyStore {
             authentication: [0; 32],
         };
         let Some(integrity) = self.integrity.as_deref() else {
-            return BeginResult::Unavailable;
+            return BeginResult::Unavailable("integrity key unavailable".into());
         };
-        let Ok(authentication) = intent_authentication(integrity, &intent) else {
-            return BeginResult::Unavailable;
+        let authentication = match intent_authentication(integrity, &intent) {
+            Ok(authentication) => authentication,
+            Err(error) => {
+                return BeginResult::Unavailable(format!(
+                    "intent authentication unavailable: {error}"
+                ));
+            }
         };
         intent.authentication = authentication;
         match persist_claim(&self.files, self.intent_name(&scope), &intent) {
@@ -509,7 +522,11 @@ impl SqlIdempotencyStore {
                     },
                 };
             }
-            Err(_) => return BeginResult::Unavailable,
+            Err(error) => {
+                return BeginResult::Unavailable(format!(
+                    "intent persistence unavailable: {error}"
+                ));
+            }
         }
         self.synchronization
             .active_scopes
@@ -876,7 +893,11 @@ impl CapacityFileGuard {
         tokio::task::spawn_blocking(move || loop {
             match file.lock_exclusive() {
                 Ok(()) => return Ok(Self(file)),
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                    ) => {}
                 Err(error) => return Err(error),
             }
         })
@@ -1110,12 +1131,12 @@ mod tests {
             .build()
             .unwrap();
         let (label, execution) = match runtime.block_on(store.begin("alice", &key, binding(1))) {
-            BeginResult::Execute(execution) => ("execute", Some(execution)),
-            BeginResult::Indeterminate { .. } => ("indeterminate", None),
-            BeginResult::Full => ("full", None),
-            BeginResult::Replay { .. } => ("replay", None),
-            BeginResult::Mismatch => ("mismatch", None),
-            BeginResult::Unavailable => ("unavailable", None),
+            BeginResult::Execute(execution) => ("execute".into(), Some(execution)),
+            BeginResult::Indeterminate { .. } => ("indeterminate".into(), None),
+            BeginResult::Full => ("full".into(), None),
+            BeginResult::Replay { .. } => ("replay".into(), None),
+            BeginResult::Mismatch => ("mismatch".into(), None),
+            BeginResult::Unavailable(reason) => (format!("unavailable: {reason}"), None),
         };
         std::fs::write(outcome, label).unwrap();
         drop(execution);
@@ -1258,7 +1279,7 @@ mod tests {
         ));
         assert!(matches!(
             store.begin("alice", "key", binding(1)).await,
-            BeginResult::Unavailable
+            BeginResult::Unavailable(_)
         ));
     }
 
@@ -1558,7 +1579,7 @@ mod tests {
         symlink(&outside_lock, lock_store.files.absolute(CAPACITY_LOCK_FILE)).unwrap();
         assert!(matches!(
             lock_store.begin("alice", "key", binding(3)).await,
-            BeginResult::Unavailable
+            BeginResult::Unavailable(_)
         ));
     }
 

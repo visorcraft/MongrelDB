@@ -348,7 +348,7 @@ impl NativeRuntime {
                 ErrorCategory::ResourceExhausted,
                 "idempotency store is full",
             )),
-            crate::sql_idempotency::BeginResult::Unavailable => Err(structured_status(
+            crate::sql_idempotency::BeginResult::Unavailable(_reason) => Err(structured_status(
                 Code::Unavailable,
                 ErrorCategory::ReplicaUnavailable,
                 "idempotency store is unavailable",

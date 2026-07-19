@@ -5059,7 +5059,7 @@ async fn begin_sql_idempotency(
             "SQL idempotency receipt store is full",
             true,
         )),
-        sql_idempotency::BeginResult::Unavailable => Err(registered_sql_error_response(
+        sql_idempotency::BeginResult::Unavailable(_reason) => Err(registered_sql_error_response(
             registration,
             query_id,
             StatusCode::SERVICE_UNAVAILABLE,
