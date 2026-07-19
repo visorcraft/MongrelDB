@@ -253,6 +253,39 @@ async fn tablet_leader<'a>(nodes: &[&'a NodeRuntime], tablet_id: TabletId) -> &'
         .expect("the leader is one of the runtimes")
 }
 
+async fn create_bootstrapped_tablet(
+    nodes: &mut [&mut NodeRuntime],
+    tablet: &TabletDescriptor,
+    partitioning: &TablePartitioningRecord,
+    peers: &[(NodeId, String)],
+    control: &ExecutionControl,
+) {
+    let deadline = std::time::Instant::now() + LEADER_TIMEOUT;
+    loop {
+        let leader = nodes[0]
+            .meta_group()
+            .unwrap()
+            .group()
+            .wait_leader(LEADER_TIMEOUT)
+            .await
+            .unwrap();
+        let runtime = nodes
+            .iter()
+            .position(|node| raft_node_id(&node.identity().node_id) == leader)
+            .expect("the meta leader is one of the runtimes");
+        match nodes[runtime]
+            .create_tablet(tablet, partitioning, Some(peers), true, control)
+            .await
+        {
+            Ok(()) => return,
+            Err(error) if is_meta_not_leader(&error) && std::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(error) => panic!("create_tablet failed: {error}"),
+        }
+    }
+}
+
 /// Publishes the database and table schema the tablet descriptor references
 /// (meta apply enforces the reference).
 async fn publish_schema(node: &NodeRuntime, database_id: DatabaseId, table_id: TableId) {
@@ -409,16 +442,14 @@ async fn three_node_runtime_cluster_end_to_end() {
         .create_tablet(&tablet, &partitioning, None, false, &control)
         .await
         .unwrap();
-    node1
-        .create_tablet(
-            &tablet,
-            &partitioning,
-            Some(peers.as_slice()),
-            true,
-            &control,
-        )
-        .await
-        .unwrap();
+    create_bootstrapped_tablet(
+        &mut [&mut node1, &mut node2, &mut node3],
+        &tablet,
+        &partitioning,
+        peers.as_slice(),
+        &control,
+    )
+    .await;
 
     // The meta descriptor reflects the tablet and its replicas.
     let published = node1
@@ -629,10 +660,14 @@ async fn replica_join_workflow_promotes_a_new_voter() {
         .create_tablet(&tablet, &partitioning, None, false, &control)
         .await
         .unwrap();
-    node1
-        .create_tablet(&tablet, &partitioning, Some(&peers[..3]), true, &control)
-        .await
-        .unwrap();
+    create_bootstrapped_tablet(
+        &mut [&mut node1, &mut node2, &mut node3],
+        &tablet,
+        &partitioning,
+        &peers[..3],
+        &control,
+    )
+    .await;
 
     // Node 4 creates its local replica as a learner (descriptor generation 2
     // naming it), then the tablet leader drives the section 12.7 movement
@@ -1042,17 +1077,16 @@ async fn create_tablet_on_cluster(
             (replica.node_id, address)
         })
         .collect();
-    nodes[leader]
-        .create_tablet(
-            &tablet,
-            &partitioning,
-            Some(peers.as_slice()),
-            true,
-            &control,
-        )
-        .await
-        .unwrap();
-    nodes[leader]
+    let mut runtimes: Vec<&mut NodeRuntime> = nodes.iter_mut().collect();
+    create_bootstrapped_tablet(
+        &mut runtimes,
+        &tablet,
+        &partitioning,
+        peers.as_slice(),
+        &control,
+    )
+    .await;
+    nodes[0]
         .tablet_group(tablet.tablet_id)
         .unwrap()
         .wait_leader(LEADER_TIMEOUT)
