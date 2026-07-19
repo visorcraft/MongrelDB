@@ -11,8 +11,10 @@ service SessionService {
 
 message OpenSessionRequest {
   RequestContext context = 1;
+  // Deprecated diagnostic echo. Servers authorize only auth_token.
   AuthenticatedIdentity identity = 2;
   bytes database_id = 3;
+  bytes auth_token = 4;
 }
 
 message OpenSessionResponse {

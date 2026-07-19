@@ -68,3 +68,24 @@ jobs:
           name: sim-failed-seeds-${{ github.run_id }}
           path: target/sim-failures/
           if-no-files-found: ignore
+
+  fuzz:
+    name: Extended parser fuzz
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: fuzz
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - run: cargo install cargo-fuzz --locked
+      - name: Extended fuzz
+        working-directory: fuzz
+        run: |
+          for target in protocol_envelope wal consensus_snapshot cursor_token sql_adapter_packet; do
+            cargo fuzz run "$target" -- -max_total_time=600
+          done

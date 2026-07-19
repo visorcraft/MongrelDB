@@ -397,7 +397,9 @@ async fn admin_sql_show_and_backup_restore_use_live_state() {
         ReplicaDescriptor, ReplicaRole, TabletDescriptor, TabletLayout, TabletState,
     };
     use mongreldb_types::hlc::HlcTimestamp;
-    use mongreldb_types::ids::{ClusterId, DatabaseId, MetadataVersion, RaftGroupId, TableId, TabletId};
+    use mongreldb_types::ids::{
+        ClusterId, DatabaseId, MetadataVersion, RaftGroupId, TableId, TabletId,
+    };
     use std::collections::BTreeMap;
 
     let directory = tempdir().unwrap();
@@ -479,13 +481,7 @@ async fn admin_sql_show_and_backup_restore_use_live_state() {
     )
     .unwrap();
 
-    let app = build_app_full(
-        Arc::clone(&database),
-        std::iter::empty(),
-        None,
-        None,
-        true,
-    );
+    let app = build_app_full(Arc::clone(&database), std::iter::empty(), None, None, true);
     let admin = "Basic YWRtaW46YWRtaW4tcHc=";
 
     async fn sql_json(app: &axum::Router, admin: &str, sql: &str) -> Value {
@@ -520,7 +516,12 @@ async fn admin_sql_show_and_backup_restore_use_live_state() {
     assert!(resources["node_governor"].is_object());
     assert!(resources["node_governor"]["actions"].is_array());
     assert!(resources["scheduler"].is_object());
-    assert!(resources["ai"]["adaptive_local_k_example"].as_u64().unwrap() >= 1);
+    assert!(
+        resources["ai"]["adaptive_local_k_example"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
 
     let cluster = sql_json(&app, admin, "SHOW CLUSTER").await;
     assert_eq!(cluster["multi_region"]["multi_leader_default"], false);

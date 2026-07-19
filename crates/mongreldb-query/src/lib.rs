@@ -2932,6 +2932,17 @@ impl MongrelSession {
         Ok(())
     }
 
+    /// Refresh one core table in this session after catalog DDL performed
+    /// outside the SQL command path.
+    pub fn refresh_database_table(&self, name: &str) -> Result<()> {
+        let db = self.database.as_ref().ok_or(MongrelQueryError::Core(
+            mongreldb_core::MongrelError::NotFound("no database".into()),
+        ))?;
+        self.refresh_registered_table(db, name)?;
+        self.clear_cache();
+        Ok(())
+    }
+
     fn refresh_registered_table(&self, db: &Arc<Database>, name: &str) -> Result<()> {
         self.ctx
             .deregister_table(name)

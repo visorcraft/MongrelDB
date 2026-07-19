@@ -40,12 +40,21 @@ mod audit;
 pub mod cluster_admin;
 mod kit;
 mod metrics;
+pub mod native;
+pub mod oidc;
 mod pre_cancel;
 mod prepared;
 mod procedure;
+pub mod remote_embedding;
 mod sessions;
 mod sql_idempotency;
 mod sql_pages;
+
+/// Parser-only entry point used by the release fuzz harness.
+#[doc(hidden)]
+pub fn fuzz_validate_sql_cursor(value: &str, owner: &str, key: &[u8; 32]) {
+    sql_pages::fuzz_validate_cursor(value, owner, key);
+}
 mod trigger;
 
 pub use sessions::{spawn_session_reaper, SessionStore};
@@ -517,9 +526,25 @@ pub struct ServerControl {
     reloadable: Arc<ReloadableConfig>,
     db: Arc<Database>,
     audit: Arc<audit::AuditLog>,
+    sql_idempotency: Arc<sql_idempotency::SqlIdempotencyStore>,
 }
 
 impl ServerControl {
+    /// Shared registry used by every HTTP and native SQL session.
+    pub fn query_registry(&self) -> Arc<SqlQueryRegistry> {
+        Arc::clone(&self.query_registry)
+    }
+
+    /// Native adapters share HTTP's durable SQL idempotency authority.
+    pub fn native_runtime(
+        &self,
+        db: Arc<Database>,
+        sessions: Arc<SessionStore>,
+    ) -> native::NativeRuntime {
+        native::NativeRuntime::new(db, sessions, Arc::clone(&self.query_registry))
+            .with_sql_idempotency(Arc::clone(&self.sql_idempotency))
+    }
+
     pub async fn shutdown(&self) -> usize {
         self.accepting_sql.store(false, Ordering::Release);
         self.query_registry
@@ -690,6 +715,7 @@ pub fn build_app_with_sessions_and_control(
         reloadable: Arc::clone(&reloadable),
         db: Arc::clone(&db),
         audit: Arc::clone(&audit),
+        sql_idempotency: Arc::clone(&sql_idempotency),
     };
     let state = Arc::new(AppState {
         idem: kit::IdempotencyStore::new_with_integrity(

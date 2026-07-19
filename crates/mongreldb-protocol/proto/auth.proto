@@ -6,6 +6,8 @@ import "common.proto";
 
 service AuthService {
   rpc Authenticate(AuthenticateRequest) returns (AuthenticateResponse);
+  rpc BeginScram(BeginScramRequest) returns (BeginScramResponse);
+  rpc FinishScram(FinishScramRequest) returns (FinishScramResponse);
 }
 
 message AuthenticateRequest {
@@ -14,6 +16,7 @@ message AuthenticateRequest {
     PasswordCredential password = 2;
     ServiceTokenCredential service_token = 3;
     OidcCredential oidc = 4;
+    MysqlCachingSha2Credential mysql_caching_sha2 = 5;
   }
 }
 
@@ -31,6 +34,39 @@ message OidcCredential {
   string compact_jws = 1;
 }
 
+message MysqlCachingSha2Credential {
+  string username = 1;
+  bytes nonce = 2;
+  bytes proof = 3;
+}
+
 message AuthenticateResponse {
   AuthenticatedIdentity identity = 1;
+  // Short-lived opaque capability required by OpenSession. The identity
+  // fields are diagnostic only and cannot be replayed as authority.
+  bytes auth_token = 2;
+}
+
+message BeginScramRequest {
+  RequestContext context = 1;
+  string username = 2;
+  string client_first_bare = 3;
+  string client_nonce = 4;
+}
+
+message BeginScramResponse {
+  bytes exchange_id = 1;
+  string server_first = 2;
+}
+
+message FinishScramRequest {
+  RequestContext context = 1;
+  bytes exchange_id = 2;
+  string client_final_without_proof = 3;
+  string client_proof = 4;
+}
+
+message FinishScramResponse {
+  string server_final = 1;
+  AuthenticateResponse authentication = 2;
 }

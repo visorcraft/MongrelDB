@@ -80,8 +80,8 @@ pub use ai_generation::{
     IndexReadinessError, ReadinessAction,
 };
 pub use auth::{
-    hash_password, verify_password, ColumnAccess, ColumnOperation, Permission, Principal,
-    RoleEntry, UserEntry,
+    hash_password, verify_password, ColumnAccess, ColumnOperation, MysqlCachingSha2Verifier,
+    Permission, Principal, RoleEntry, UserEntry,
 };
 pub use backup::{verify_backup, BackupFile, BackupManifest, BackupReport};
 pub use be_tree::BeTree;
@@ -91,9 +91,7 @@ pub use catalog::{
     MaterializedViewEntry,
 };
 pub use catalog_cmds::{required_permission, CatalogCommand, CatalogCommandRecord, CatalogDelta};
-pub use certification::{
-    certification_inventory, inventory_smoke, CertificationCategory, CertificationClass,
-};
+pub use certification::{CertificationManifest, CertificationStatus, CertificationTest};
 pub use cluster_import::{
     cluster_import_prepare, hash_rows_canonical, ImportPlan, ImportTablePlan,
 };
@@ -164,8 +162,9 @@ pub use security_hardening::{
     JwksCache, JwksDocument, JwksFetch, JwksProvider, JwtAlgorithm, JwtClaims, JwtError,
     JwtValidationConfig, KeyManagementError, KeyManagementHealth, KeyManagementProvider,
     KeyRotationJournal, KeyRotationPhase, KeyRotationRecord, KmsWrappedKey,
-    ScramChannelBindingPolicy, ScramServerSession, ScramVerifier, SecurityHardeningError,
-    ServiceToken, ServiceTokenRegistry, UnsupportedKeyManagementProvider, VerifiedJwt,
+    ScramChannelBindingPolicy, ScramClientSession, ScramServerSession, ScramVerifier,
+    SecurityHardeningError, ServiceToken, ServiceTokenRegistry, UnsupportedKeyManagementProvider,
+    VerifiedJwt,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]

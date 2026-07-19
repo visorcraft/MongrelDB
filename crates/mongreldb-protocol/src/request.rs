@@ -163,6 +163,17 @@ pub enum AuthenticatedIdentity {
         /// Stable name of the internal component, e.g. `"replication"`.
         name: String,
     },
+    /// Externally authenticated service/OIDC identity mapped to one catalog
+    /// user. Immutable user identity prevents username recreation from
+    /// inheriting an existing session.
+    ExternalPrincipal {
+        provider: String,
+        subject: String,
+        username: String,
+        user_id: u64,
+        created_version: u64,
+        scopes: Vec<String>,
+    },
 }
 
 /// MVCC isolation level requested by [`ExecuteCommand::Begin`].

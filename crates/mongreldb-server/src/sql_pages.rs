@@ -352,6 +352,10 @@ fn parse_cursor(value: &str, owner: &str, key: &[u8; 32]) -> Result<ParsedCursor
     })
 }
 
+pub(crate) fn fuzz_validate_cursor(value: &str, owner: &str, key: &[u8; 32]) {
+    let _ = parse_cursor(value, owner, key);
+}
+
 fn prune(state: &mut StoreState) {
     let now = Instant::now();
     state.entries.retain(|_, entry| {

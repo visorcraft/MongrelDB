@@ -13,14 +13,18 @@ use mongreldb_cluster::bootstrap::{
     JoinInvite, TrustConfig,
 };
 use mongreldb_cluster::node::{Locality, NodeCapacity, NodeIdentity};
-use mongreldb_core::Database;
+use mongreldb_core::{Database, JwtAlgorithm, JwtValidationConfig, ServiceToken};
+use mongreldb_protocol::native_transport::{
+    NativeRpcServer, NativeRpcServerConfig, NativeRpcServices,
+};
 use mongreldb_server::{
     build_app_with_sessions_and_control, cluster_admin, spawn_auto_compactor, spawn_session_reaper,
     SessionStore,
 };
+use mongreldb_server::{native::NativeExternalAuth, oidc::HttpsJwksProvider};
 use mongreldb_types::ids::{ClusterId, NodeId};
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -36,6 +40,14 @@ struct Args {
     max_connections: Option<usize>,
     max_sessions: usize,
     session_idle_timeout_secs: u64,
+    native_port: Option<u16>,
+    tls_certificate: Option<String>,
+    tls_private_key: Option<String>,
+    tls_client_ca: Option<String>,
+    service_token_file: Option<String>,
+    oidc_issuer: Option<String>,
+    oidc_audience: Option<String>,
+    oidc_allowed_hosts: BTreeSet<String>,
     passphrase: Option<String>,
     daemon: bool,
     pidfile: Option<String>,
@@ -60,6 +72,14 @@ OPTIONS:
     --max-connections <n>       Max concurrent connections
     --max-sessions <n>          Max live sessions for cross-request txns (default 256)
     --session-idle-timeout <s>  Idle session reaping timeout in seconds (default 300)
+    --native-port <port>        Native gRPC listener port
+    --tls-cert <path>           Native listener PEM certificate
+    --tls-key <path>            Native listener PEM private key
+    --tls-client-ca <path>      Require native client certificates from this CA
+    --service-tokens <path>     JSON array of Argon2id service-token records
+    --oidc-issuer <url>         Native OIDC issuer (HTTPS)
+    --oidc-audience <audience>  Native OIDC audience
+    --oidc-allow-host <host>    Allowed OIDC/JWKS host (repeatable)
     --passphrase <passphrase>   Open an encrypted database
     --daemon                    Fork into the background (daemonize)
     --pidfile <path>            PID file path (default: <db_dir>/mongreldb.pid)
@@ -189,6 +209,14 @@ fn parse_args() -> Result<Args, String> {
     let mut max_connections: Option<usize> = None;
     let mut max_sessions: usize = 256;
     let mut session_idle_timeout_secs: u64 = 300;
+    let mut native_port = None;
+    let mut tls_certificate = None;
+    let mut tls_private_key = None;
+    let mut tls_client_ca = None;
+    let mut service_token_file = None;
+    let mut oidc_issuer = None;
+    let mut oidc_audience = None;
+    let mut oidc_allowed_hosts = BTreeSet::new();
     let mut passphrase: Option<String> = None;
     let mut daemon = false;
     let mut pidfile: Option<String> = None;
@@ -243,6 +271,64 @@ fn parse_args() -> Result<Args, String> {
                     .map_err(|_| format!("--session-idle-timeout: invalid value '{v}'"))?;
                 i += 2;
             }
+            "--native-port" => {
+                let value = raw.get(i + 1).ok_or("--native-port requires a value")?;
+                native_port = Some(
+                    value
+                        .parse::<u16>()
+                        .map_err(|_| format!("--native-port: invalid port '{value}'"))?,
+                );
+                i += 2;
+            }
+            "--tls-cert" => {
+                tls_certificate =
+                    Some(raw.get(i + 1).ok_or("--tls-cert requires a value")?.clone());
+                i += 2;
+            }
+            "--tls-key" => {
+                tls_private_key = Some(raw.get(i + 1).ok_or("--tls-key requires a value")?.clone());
+                i += 2;
+            }
+            "--tls-client-ca" => {
+                tls_client_ca = Some(
+                    raw.get(i + 1)
+                        .ok_or("--tls-client-ca requires a value")?
+                        .clone(),
+                );
+                i += 2;
+            }
+            "--service-tokens" => {
+                service_token_file = Some(
+                    raw.get(i + 1)
+                        .ok_or("--service-tokens requires a value")?
+                        .clone(),
+                );
+                i += 2;
+            }
+            "--oidc-issuer" => {
+                oidc_issuer = Some(
+                    raw.get(i + 1)
+                        .ok_or("--oidc-issuer requires a value")?
+                        .clone(),
+                );
+                i += 2;
+            }
+            "--oidc-audience" => {
+                oidc_audience = Some(
+                    raw.get(i + 1)
+                        .ok_or("--oidc-audience requires a value")?
+                        .clone(),
+                );
+                i += 2;
+            }
+            "--oidc-allow-host" => {
+                oidc_allowed_hosts.insert(
+                    raw.get(i + 1)
+                        .ok_or("--oidc-allow-host requires a value")?
+                        .clone(),
+                );
+                i += 2;
+            }
             "--passphrase" => {
                 let v = raw.get(i + 1).ok_or("--passphrase requires a value")?;
                 passphrase = Some(v.clone());
@@ -278,6 +364,23 @@ fn parse_args() -> Result<Args, String> {
 
     let db_dir = db_dir.ok_or_else(|| format!("a database directory is required\n\n{USAGE}"))?;
     let port = port.unwrap_or(DEFAULT_PORT);
+    if native_port.is_some() != (tls_certificate.is_some() && tls_private_key.is_some()) {
+        return Err("--native-port, --tls-cert, and --tls-key must be configured together".into());
+    }
+    if tls_client_ca.is_some() && native_port.is_none() {
+        return Err("--tls-client-ca requires --native-port".into());
+    }
+    if (service_token_file.is_some() || oidc_issuer.is_some() || oidc_audience.is_some())
+        && native_port.is_none()
+    {
+        return Err("native authentication options require --native-port".into());
+    }
+    if oidc_issuer.is_some() != oidc_audience.is_some() {
+        return Err("--oidc-issuer and --oidc-audience must be configured together".into());
+    }
+    if oidc_issuer.is_some() && oidc_allowed_hosts.is_empty() {
+        return Err("--oidc-issuer requires at least one --oidc-allow-host".into());
+    }
 
     Ok(Args {
         db_dir,
@@ -287,6 +390,14 @@ fn parse_args() -> Result<Args, String> {
         max_connections,
         max_sessions,
         session_idle_timeout_secs,
+        native_port,
+        tls_certificate,
+        tls_private_key,
+        tls_client_ca,
+        service_token_file,
+        oidc_issuer,
+        oidc_audience,
+        oidc_allowed_hosts,
         passphrase,
         daemon,
         pidfile,
@@ -443,6 +554,61 @@ fn main() {
     runtime.block_on(run_server(args, pidfile, db));
 }
 
+fn load_native_external_auth(args: &Args) -> Result<Option<NativeExternalAuth>, String> {
+    if args.service_token_file.is_none() && args.oidc_issuer.is_none() {
+        return Ok(None);
+    }
+    let mut auth = NativeExternalAuth::new();
+    if let Some(path) = &args.service_token_file {
+        let metadata = std::fs::metadata(path)
+            .map_err(|error| format!("service-token file {path}: {error}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o077 != 0 {
+                return Err(format!(
+                    "service-token file {path} must not be group/world accessible"
+                ));
+            }
+        }
+        let tokens: Vec<ServiceToken> = serde_json::from_slice(
+            &std::fs::read(path).map_err(|error| format!("service-token file {path}: {error}"))?,
+        )
+        .map_err(|error| format!("service-token file {path}: {error}"))?;
+        let mut ids = BTreeSet::new();
+        for token in tokens {
+            if !ids.insert(token.token_id.clone()) {
+                return Err(format!(
+                    "service-token file {path} contains duplicate token id {}",
+                    token.token_id
+                ));
+            }
+            auth.upsert_service_token(token)
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    if let (Some(issuer), Some(audience)) = (&args.oidc_issuer, &args.oidc_audience) {
+        let provider = HttpsJwksProvider::new(
+            args.oidc_allowed_hosts.clone(),
+            std::time::Duration::from_secs(10),
+            1024 * 1024,
+        )
+        .map_err(|error| error.to_string())?;
+        auth = auth.with_oidc(
+            JwtValidationConfig {
+                issuer: issuer.clone(),
+                audience: audience.clone(),
+                skew_seconds: 60,
+                allowed_algorithms: vec![JwtAlgorithm::Rs256, JwtAlgorithm::Es256],
+                max_token_age_seconds: 3600,
+                required_scopes: Vec::new(),
+            },
+            provider,
+        );
+    }
+    Ok(Some(auth))
+}
+
 async fn run_server(args: Args, pidfile: String, db: Arc<Database>) {
     // §5.9: background cost-aware compaction (run-count trigger).
     spawn_auto_compactor(Arc::clone(&db));
@@ -454,6 +620,10 @@ async fn run_server(args: Args, pidfile: String, db: Arc<Database>) {
         std::time::Duration::from_secs(args.session_idle_timeout_secs),
     ));
     spawn_session_reaper(Arc::clone(&sessions));
+    let native_external_auth = load_native_external_auth(&args).unwrap_or_else(|error| {
+        eprintln!("failed to configure native authentication: {error}");
+        std::process::exit(1);
+    });
 
     let (app, server_control) = build_app_with_sessions_and_control(
         db.clone(),
@@ -461,8 +631,65 @@ async fn run_server(args: Args, pidfile: String, db: Arc<Database>) {
         args.auth_token.clone(),
         args.max_connections,
         args.user_auth,
-        sessions,
+        Arc::clone(&sessions),
     );
+    let (native_result_tx, mut native_result_rx) = tokio::sync::mpsc::channel(1);
+    let mut native_result_guard = Some(native_result_tx);
+    let mut native_shutdown = None;
+    let mut native_task = None;
+    if let Some(port) = args.native_port {
+        let certificate_path = args.tls_certificate.as_deref().expect("validated above");
+        let private_key_path = args.tls_private_key.as_deref().expect("validated above");
+        let read_pem = |path: &str| {
+            std::fs::read(path).unwrap_or_else(|error| {
+                eprintln!("failed to read native TLS file {path}: {error}");
+                std::process::exit(1);
+            })
+        };
+        let mut runtime = server_control.native_runtime(Arc::clone(&db), Arc::clone(&sessions));
+        if let Some(auth) = native_external_auth {
+            runtime = runtime.with_external_auth(auth);
+        }
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        native_shutdown = Some(shutdown_tx);
+        let result_tx = native_result_guard.take().expect("native result sender");
+        let address = SocketAddr::from(([127, 0, 0, 1], port));
+        let server = NativeRpcServer::new(NativeRpcServerConfig {
+            address,
+            certificate_pem: read_pem(certificate_path),
+            private_key_pem: read_pem(private_key_path),
+            client_ca_pem: args.tls_client_ca.as_deref().map(read_pem),
+            max_connections: args.max_connections.unwrap_or(1_024),
+            max_concurrent_streams: 1_024,
+            max_in_flight_per_connection: 1_024,
+            request_timeout: std::time::Duration::from_secs(30),
+            idle_timeout: std::time::Duration::from_secs(args.session_idle_timeout_secs),
+            keepalive_interval: std::time::Duration::from_secs(30),
+            keepalive_timeout: std::time::Duration::from_secs(10),
+        });
+        native_task = Some(tokio::spawn(async move {
+            let result = server
+                .serve_with_shutdown(
+                    NativeRpcServices {
+                        auth: runtime.clone(),
+                        session: runtime.clone(),
+                        query: runtime.clone(),
+                        transaction: runtime.clone(),
+                        catalog: runtime.clone(),
+                        admin: runtime.clone(),
+                        health: runtime,
+                    },
+                    async move {
+                        let _ = shutdown_rx.await;
+                    },
+                )
+                .await;
+            let _ = result_tx
+                .send(result.map_err(|error| error.to_string()))
+                .await;
+        }));
+        eprintln!("mongreldb native RPC listening on https://{address}");
+    }
 
     if args.auth_token.is_some() {
         eprintln!("token authentication enabled (Authorization: Bearer <token>)");
@@ -525,6 +752,9 @@ async fn run_server(args: Args, pidfile: String, db: Arc<Database>) {
             _ = sigterm.recv() => {
                 eprintln!("received SIGTERM, shutting down gracefully...");
             }
+            result = native_result_rx.recv() => {
+                eprintln!("native RPC server stopped: {}", native_result_message(result));
+            }
         }
     }
 
@@ -541,14 +771,31 @@ async fn run_server(args: Args, pidfile: String, db: Arc<Database>) {
             _ = tokio::signal::ctrl_c() => {
                 eprintln!("received SIGINT, shutting down gracefully...");
             }
+            result = native_result_rx.recv() => {
+                eprintln!("native RPC server stopped: {}", native_result_message(result));
+            }
         }
     }
 
+    if let Some(shutdown) = native_shutdown {
+        let _ = shutdown.send(());
+    }
+    if let Some(task) = native_task {
+        let _ = task.await;
+    }
     let stuck_queries = server_control.shutdown().await;
     if stuck_queries > 0 {
         eprintln!("[shutdown] {stuck_queries} SQL query(s) exceeded cancellation grace");
     }
     shutdown(&db, &pidfile, args.daemon);
+}
+
+fn native_result_message(result: Option<Result<(), String>>) -> String {
+    match result {
+        Some(Ok(())) => "listener exited".into(),
+        Some(Err(error)) => error,
+        None => "result channel closed".into(),
+    }
 }
 
 /// Flush all tables, checkpoint to a stable on-disk state, and remove the

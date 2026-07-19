@@ -40,10 +40,9 @@ impl std::fmt::Debug for SecretString {
 
 /// The per-caller identity bound to one handle (spec §10.1, S1A-001).
 ///
-/// This is a label the core never consults for shared-table authorization in
-/// Stage 1A (the embedded enforcement path reads the facade's auth state, and
-/// shared cores reject auth-mode transitions); per-request enforcement over
-/// handles arrives with Stage 1D sessions.
+/// Catalog identities pin one user generation and are re-resolved against the
+/// live catalog on each authorized operation. Service identities carry only
+/// their explicitly granted scopes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HandleIdentity {
     /// No credentials were supplied for this handle.

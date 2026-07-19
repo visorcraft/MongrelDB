@@ -683,9 +683,7 @@ pub(crate) fn try_admin_sql(
             let job = state
                 .ops_jobs
                 .lock()
-                .map(|mut store| {
-                    store.submit(mongreldb_core::OpsJobKind::Backup, params)
-                })
+                .map(|mut store| store.submit(mongreldb_core::OpsJobKind::Backup, params))
                 .ok();
             // Also drive hierarchical scheduler so control path is exercised.
             if let Ok(mut sched) = state.scheduler.lock() {
@@ -721,15 +719,9 @@ pub(crate) fn try_admin_sql(
 
             let mut params = std::collections::BTreeMap::new();
             params.insert("source".into(), source.clone());
-            params.insert(
-                "disaster_recovery".into(),
-                disaster_recovery.to_string(),
-            );
+            params.insert("disaster_recovery".into(), disaster_recovery.to_string());
             let job = state.ops_jobs.lock().ok().map(|mut store| {
-                store.submit(
-                    mongreldb_core::OpsJobKind::RestoreVerification,
-                    params,
-                )
+                store.submit(mongreldb_core::OpsJobKind::RestoreVerification, params)
             });
 
             // Live plan from a published backup when the path exists; otherwise

@@ -166,5 +166,18 @@ mod tests {
             DatabaseId::new_random(),
             42,
         ));
+        assert_serde_round_trip(&Session::new(
+            SessionId::from_bytes([0x45; 16]),
+            AuthenticatedIdentity::ExternalPrincipal {
+                provider: "oidc".to_owned(),
+                subject: "alice".to_owned(),
+                username: "alice".to_owned(),
+                user_id: 7,
+                created_version: 8,
+                scopes: vec!["query".to_owned()],
+            },
+            DatabaseId::new_random(),
+            43,
+        ));
     }
 }

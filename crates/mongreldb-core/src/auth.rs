@@ -10,6 +10,44 @@
 //! [`Database::check_permission`].
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
+
+/// Stored verifier for MySQL 8's `caching_sha2_password` fast-auth exchange.
+///
+/// This is SHA256(SHA256(password)), never the plaintext password.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MysqlCachingSha2Verifier {
+    stage2: [u8; 32],
+}
+
+impl MysqlCachingSha2Verifier {
+    pub fn from_password(password: &str) -> Self {
+        let stage1 = Sha256::digest(password.as_bytes());
+        Self {
+            stage2: Sha256::digest(stage1).into(),
+        }
+    }
+
+    pub fn verify(&self, nonce: &[u8], proof: &[u8]) -> bool {
+        if proof.is_empty() {
+            return bool::from(self.stage2.ct_eq(&Self::from_password("").stage2));
+        }
+        let Ok(proof) = <&[u8; 32]>::try_from(proof) else {
+            return false;
+        };
+        let mask = Sha256::new()
+            .chain_update(self.stage2)
+            .chain_update(nonce)
+            .finalize();
+        let mut stage1 = [0_u8; 32];
+        for (output, (proof, mask)) in stage1.iter_mut().zip(proof.iter().zip(mask)) {
+            *output = proof ^ mask;
+        }
+        let candidate: [u8; 32] = Sha256::digest(stage1).into();
+        bool::from(candidate.ct_eq(&self.stage2))
+    }
+}
 
 /// A stored user with Argon2id-hashed credentials.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,6 +60,14 @@ pub struct UserEntry {
     /// `PasswordVerifier::verify`).
     #[serde(skip_serializing_if = "String::is_empty", default)]
     pub password_hash: String,
+    /// SCRAM-SHA-256 verifier for native challenge/response authentication.
+    /// Older catalogs and callers that supplied only a PHC hash have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scram_sha_256: Option<crate::security_hardening::ScramVerifier>,
+    /// MySQL wire compatibility verifier. Authentication still produces the
+    /// same live catalog principal and requires TLS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mysql_caching_sha2: Option<MysqlCachingSha2Verifier>,
     /// Role names granted to this user.
     #[serde(default)]
     pub roles: Vec<String>,
@@ -276,6 +322,18 @@ pub fn hash_password(password: &str) -> Result<String, String> {
     Ok(hash.to_string())
 }
 
+/// Build independently salted SCRAM-SHA-256 verifier material.
+pub fn scram_verifier(password: &str) -> Result<crate::security_hardening::ScramVerifier, String> {
+    let mut salt = [0_u8; 16];
+    getrandom::getrandom(&mut salt).map_err(|error| error.to_string())?;
+    crate::security_hardening::ScramVerifier::from_password(
+        password,
+        &salt,
+        crate::security_hardening::SCRAM_SHA_256_MIN_ITERATIONS,
+    )
+    .map_err(|error| error.to_string())
+}
+
 /// Verify a password against a stored PHC hash. Returns `Ok(true)` on match,
 /// `Ok(false)` on mismatch, `Err` on malformed hash.
 pub fn verify_password(password: &str, phc_hash: &str) -> Result<bool, String> {
@@ -297,6 +355,25 @@ mod tests {
         let hash = hash_password(password).unwrap();
         assert!(verify_password(password, &hash).unwrap());
         assert!(!verify_password("wrong password", &hash).unwrap());
+    }
+
+    #[test]
+    fn caching_sha2_verifier_accepts_only_matching_proof() {
+        let verifier = MysqlCachingSha2Verifier::from_password("password");
+        let nonce = b"12345678901234567890";
+        let stage1 = Sha256::digest(b"password");
+        let stage2 = Sha256::digest(stage1);
+        let mask = Sha256::new()
+            .chain_update(stage2)
+            .chain_update(nonce)
+            .finalize();
+        let proof = stage1
+            .iter()
+            .zip(mask)
+            .map(|(left, right)| left ^ right)
+            .collect::<Vec<_>>();
+        assert!(verifier.verify(nonce, &proof));
+        assert!(!verifier.verify(nonce, &[0; 32]));
     }
 
     #[test]

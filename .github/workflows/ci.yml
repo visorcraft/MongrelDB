@@ -69,6 +69,95 @@ jobs:
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-targets --all-features
 
+  cross-platform:
+    name: Architecture tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2.9.1
+      - if: runner.os == 'macOS'
+        run: brew install protobuf
+      - if: runner.os == 'Windows'
+        run: choco install protoc --yes --no-progress
+      - run: cargo test --workspace --all-features
+      - run: cargo test --manifest-path crates/mongreldb-server/Cargo.toml --all-targets --all-features
+      - run: cargo test --manifest-path crates/mongreldb-client/Cargo.toml --all-targets --all-features
+
+  mysql-wire:
+    name: MySQL wire external-client compatibility
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/mongreldb-mysql-wire
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: crates/mongreldb-mysql-wire
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all-targets
+
+  mysql-migration:
+    name: Real MySQL snapshot and binlog migration
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/mongreldb-migrate-mysql
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: crates/mongreldb-migrate-mysql
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Start TLS MySQL 8.4 source
+        working-directory: .
+        run: bash scripts/start-test-mysql.sh
+      - run: cargo clippy --all-targets -- -D warnings
+      - name: Run real source integration
+        env:
+          MONGRELDB_TEST_MYSQL_HOST: localhost
+          MONGRELDB_TEST_MYSQL_PORT: "33060"
+          MONGRELDB_TEST_MYSQL_PASSWORD: mongreldb-test
+          MONGRELDB_TEST_MYSQL_CA: ${{ github.workspace }}/target/mysql-tls/ca.pem
+        run: cargo test --test mysql_container -- --nocapture
+
+  fuzz:
+    name: Parser fuzz smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: fuzz
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - run: cargo install cargo-fuzz --locked
+      - name: Fuzz five trust boundaries
+        working-directory: fuzz
+        run: |
+          for target in protocol_envelope wal consensus_snapshot cursor_token sql_adapter_packet; do
+            cargo fuzz run "$target" -- -max_total_time=10
+          done
+
   node:
     runs-on: ubuntu-latest
     defaults:
@@ -147,6 +236,7 @@ jobs:
 
   qualification:
     name: Clean release qualification
+    needs: cross-platform
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -196,11 +286,13 @@ jobs:
             df -h
           } > "$QUAL_DIR/versions.txt"
       - name: Root format
-        run: cargo fmt --check 2>&1 | tee "$QUAL_DIR/cargo-fmt.log"
+        run: python3 scripts/run-certification-command.py "$QUAL_DIR/cargo-fmt.log" cargo fmt --check
       - name: Root clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tee "$QUAL_DIR/cargo-clippy.log"
+        run: python3 scripts/run-certification-command.py "$QUAL_DIR/cargo-clippy.log" cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Root tests
-        run: cargo test --workspace --all-features 2>&1 | tee "$QUAL_DIR/cargo-test.log"
+        run: python3 scripts/run-certification-command.py "$QUAL_DIR/cargo-test.log" cargo test --workspace --all-features
+      - name: Root release tests
+        run: python3 scripts/run-certification-command.py "$QUAL_DIR/cargo-test-release.log" cargo test --workspace --release --all-features
       - name: Reclaim debug intermediates
         # Drop incremental-style leftovers and large debug deps after the
         # workspace suite; later steps still rebuild what they need.
@@ -212,18 +304,32 @@ jobs:
       - name: Server tests
         run: |
           cargo clippy --manifest-path crates/mongreldb-server/Cargo.toml --all-targets --all-features -- -D warnings 2>&1 | tee "$QUAL_DIR/server-clippy.log"
-          cargo test --manifest-path crates/mongreldb-server/Cargo.toml --all-targets --all-features 2>&1 | tee "$QUAL_DIR/server-test.log"
+          python3 scripts/run-certification-command.py "$QUAL_DIR/server-test.log" cargo test --manifest-path crates/mongreldb-server/Cargo.toml --all-targets --all-features
       - name: Client checks
         run: |
           cargo clippy --manifest-path crates/mongreldb-client/Cargo.toml --all-targets --all-features -- -D warnings 2>&1 | tee "$QUAL_DIR/client-clippy.log"
-          cargo test --manifest-path crates/mongreldb-client/Cargo.toml --all-targets --all-features 2>&1 | tee "$QUAL_DIR/client-test.log"
+          python3 scripts/run-certification-command.py "$QUAL_DIR/client-test.log" cargo test --manifest-path crates/mongreldb-client/Cargo.toml --all-targets --all-features
+      - name: MySQL wire checks
+        run: |
+          cargo clippy --manifest-path crates/mongreldb-mysql-wire/Cargo.toml --all-targets -- -D warnings 2>&1 | tee "$QUAL_DIR/mysql-wire-clippy.log"
+          python3 scripts/run-certification-command.py "$QUAL_DIR/mysql-wire-test.log" cargo test --manifest-path crates/mongreldb-mysql-wire/Cargo.toml --all-targets
+      - name: Real MySQL migration checks
+        env:
+          MONGRELDB_TEST_MYSQL_HOST: localhost
+          MONGRELDB_TEST_MYSQL_PORT: "33060"
+          MONGRELDB_TEST_MYSQL_PASSWORD: mongreldb-test
+          MONGRELDB_TEST_MYSQL_CA: ${{ github.workspace }}/target/mysql-tls/ca.pem
+        run: |
+          bash scripts/start-test-mysql.sh 2>&1 | tee "$QUAL_DIR/mysql-container-start.log"
+          cargo clippy --manifest-path crates/mongreldb-migrate-mysql/Cargo.toml --all-targets -- -D warnings 2>&1 | tee "$QUAL_DIR/mysql-migrate-clippy.log"
+          python3 scripts/run-certification-command.py "$QUAL_DIR/mysql-migrate-test.log" cargo test --manifest-path crates/mongreldb-migrate-mysql/Cargo.toml --test mysql_container -- --nocapture
       - name: Node checks
         working-directory: crates/mongreldb-node
         run: |
           npm ci 2>&1 | tee "$QUAL_DIR/node-ci.log"
           npm run build 2>&1 | tee "$QUAL_DIR/node-build.log"
-          npm test 2>&1 | tee "$QUAL_DIR/node-test.log"
-          node smoke.mjs 2>&1 | tee "$QUAL_DIR/node-smoke.log"
+          python3 "$GITHUB_WORKSPACE/scripts/run-certification-command.py" "$QUAL_DIR/node-test.log" npm test
+          python3 "$GITHUB_WORKSPACE/scripts/run-certification-command.py" "$QUAL_DIR/node-smoke.log" node smoke.mjs
       - name: Reclaim before release FFI builds
         run: |
           # Release FFI builds need headroom; drop the debug tree now that
@@ -233,11 +339,11 @@ jobs:
       - name: FFI checks
         run: |
           cargo build --manifest-path crates/mongreldb-ffi/Cargo.toml --release 2>&1 | tee "$QUAL_DIR/ffi-build.log"
-          cargo test --manifest-path crates/mongreldb-ffi/Cargo.toml --release 2>&1 | tee "$QUAL_DIR/ffi-test.log"
-          MONGRELDB_C_SANITIZE=1 cargo test --manifest-path crates/mongreldb-ffi/Cargo.toml --release --test c_smoke_test 2>&1 | tee "$QUAL_DIR/ffi-sanitizer.log"
+          python3 scripts/run-certification-command.py "$QUAL_DIR/ffi-test.log" cargo test --manifest-path crates/mongreldb-ffi/Cargo.toml --release
+          python3 scripts/run-certification-command.py "$QUAL_DIR/ffi-sanitizer.log" env MONGRELDB_C_SANITIZE=1 cargo test --manifest-path crates/mongreldb-ffi/Cargo.toml --release --test c_smoke_test
           cargo build --manifest-path crates/mongreldb-kit-ffi/Cargo.toml --release 2>&1 | tee "$QUAL_DIR/kit-ffi-build.log"
-          cargo test --manifest-path crates/mongreldb-kit-ffi/Cargo.toml --release 2>&1 | tee "$QUAL_DIR/kit-ffi-test.log"
-          cargo build --manifest-path crates/mongreldb-jni/Cargo.toml --release 2>&1 | tee "$QUAL_DIR/jni-build.log"
+          python3 scripts/run-certification-command.py "$QUAL_DIR/kit-ffi-test.log" cargo test --manifest-path crates/mongreldb-kit-ffi/Cargo.toml --release
+          python3 scripts/run-certification-command.py "$QUAL_DIR/jni-build.log" cargo build --manifest-path crates/mongreldb-jni/Cargo.toml --release
       - name: Python MinHash wire fixture
         run: |
           cargo build --manifest-path crates/mongreldb-server/Cargo.toml --release > "$QUAL_DIR/ai-wire-server.log" 2>&1
@@ -260,17 +366,39 @@ jobs:
             --example ai_retrieval_bench \
             > "$QUAL_DIR/ai-benchmark-100k.json" 2> "$QUAL_DIR/ai-benchmark-100k.log"
           cp docs/ai/ci-benchmark-thresholds.json "$QUAL_DIR/"
-          python3 scripts/validate-ai-benchmark.py \
+          python3 scripts/run-certification-command.py "$QUAL_DIR/ai-benchmark-validation.log" \
+            python3 scripts/validate-ai-benchmark.py \
             "$QUAL_DIR/ai-benchmark-100k.json" \
             docs/ai/ci-benchmark-thresholds.json \
-            --expected-sha "$GITHUB_SHA" 2>&1 \
-            | tee "$QUAL_DIR/ai-benchmark-validation.log"
+            --expected-sha "$GITHUB_SHA"
           MONGRELDB_AI_CONCURRENCY_ROWS=10000 MONGRELDB_AI_CONCURRENCY_OPS=25 \
             cargo run -p mongreldb-core --release --all-features \
             --example ai_concurrency_bench \
             > "$QUAL_DIR/ai-concurrency.json" 2> "$QUAL_DIR/ai-concurrency.log"
-          python3 scripts/validate-ai-concurrency.py "$QUAL_DIR/ai-concurrency.json" 2>&1 | tee "$QUAL_DIR/ai-concurrency-validation.log"
+          python3 scripts/run-certification-command.py "$QUAL_DIR/ai-concurrency-validation.log" \
+            python3 scripts/validate-ai-concurrency.py "$QUAL_DIR/ai-concurrency.json"
           test -z "$(git status --porcelain)"
+      - name: Fuzz smoke
+        run: |
+          rustup toolchain install nightly --profile minimal
+          cargo install cargo-fuzz --locked
+          python3 scripts/run-certification-command.py "$QUAL_DIR/fuzz-smoke.log" \
+            bash -c 'cd fuzz && for target in protocol_envelope wal consensus_snapshot cursor_token sql_adapter_packet; do cargo +nightly fuzz run "$target" -- -max_total_time=10; done'
+      - name: Crash recovery matrix
+        run: python3 scripts/run-certification-command.py "$QUAL_DIR/crash-matrix.log" cargo test -p mongreldb-core --test fault_injection --test crash --test crash_process
+      - name: Create certification manifest
+        run: |
+          tar \
+            --exclude=deps --exclude=build --exclude=incremental --exclude=examples \
+            -C "$CARGO_TARGET_DIR/release" \
+            -czf "$QUAL_DIR/qualified-artifacts.tar.gz" .
+          python3 scripts/run-certification-command.py "$QUAL_DIR/packaged-artifact-test.log" \
+            bash scripts/qualify-packaged-artifacts.sh "$QUAL_DIR/qualified-artifacts.tar.gz" "$GITHUB_WORKSPACE"
+          python3 scripts/generate-certification-manifest.py \
+            --evidence-dir "$QUAL_DIR" \
+            --artifact "$QUAL_DIR/qualified-artifacts.tar.gz" \
+            --output "$QUAL_DIR/certification-manifest.json" \
+            --commit "$GITHUB_SHA"
       - uses: actions/upload-artifact@v7
         if: always()
         with:

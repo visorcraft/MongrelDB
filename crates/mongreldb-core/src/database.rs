@@ -2917,6 +2917,10 @@ impl Database {
         // Build the initial catalog with require_auth = true and one admin user.
         let password_hash =
             crate::auth::hash_password(admin_password).map_err(MongrelError::Other)?;
+        let scram_sha_256 =
+            crate::auth::scram_verifier(admin_password).map_err(MongrelError::Other)?;
+        let mysql_caching_sha2 =
+            crate::auth::MysqlCachingSha2Verifier::from_password(admin_password);
         let mut cat = Catalog::empty();
         cat.require_auth = true;
         cat.next_user_id = 2;
@@ -2924,6 +2928,8 @@ impl Database {
             id: 1,
             username: admin_username.to_string(),
             password_hash,
+            scram_sha_256: Some(scram_sha_256),
+            mysql_caching_sha2: Some(mysql_caching_sha2),
             roles: Vec::new(),
             is_admin: true,
             created_epoch: 0,
@@ -7250,6 +7256,19 @@ impl Database {
             .map(|user| (user.id, user.created_epoch))
     }
 
+    /// SCRAM verifier material for the current catalog user generation.
+    pub fn user_scram_verifier(
+        &self,
+        username: &str,
+    ) -> Option<crate::security_hardening::ScramVerifier> {
+        self.catalog
+            .read()
+            .users
+            .iter()
+            .find(|user| user.username == username)
+            .and_then(|user| user.scram_sha_256.clone())
+    }
+
     /// Current catalog authorization generation. Retry bindings can include
     /// this value to fail closed after roles, grants, or row policies change.
     pub fn security_version(&self) -> u64 {
@@ -7265,7 +7284,9 @@ impl Database {
     pub fn create_user(&self, username: &str, password: &str) -> Result<crate::auth::UserEntry> {
         self.require(&crate::auth::Permission::Admin)?;
         let hash = crate::auth::hash_password(password).map_err(MongrelError::Other)?;
-        self.create_user_with_password_hash(username, hash)
+        let scram = crate::auth::scram_verifier(password).map_err(MongrelError::Other)?;
+        let mysql = crate::auth::MysqlCachingSha2Verifier::from_password(password);
+        self.create_user_with_password_hash_inner(username, hash, Some((scram, mysql)), None)
     }
 
     /// Create a user from a password hash prepared before a commit fence.
@@ -7274,7 +7295,7 @@ impl Database {
         username: &str,
         hash: String,
     ) -> Result<crate::auth::UserEntry> {
-        self.create_user_with_password_hash_inner(username, hash, None)
+        self.create_user_with_password_hash_inner(username, hash, None, None)
     }
 
     pub fn create_user_with_password_hash_controlled<F>(
@@ -7286,23 +7307,39 @@ impl Database {
     where
         F: FnMut() -> Result<()>,
     {
-        self.create_user_with_password_hash_inner(username, hash, Some(&mut before_publish))
+        self.create_user_with_password_hash_inner(username, hash, None, Some(&mut before_publish))
     }
 
     fn create_user_with_password_hash_inner(
         &self,
         username: &str,
         hash: String,
+        verifiers: Option<(
+            crate::security_hardening::ScramVerifier,
+            crate::auth::MysqlCachingSha2Verifier,
+        )>,
         before_publish: Option<&mut dyn FnMut() -> Result<()>>,
     ) -> Result<crate::auth::UserEntry> {
         // S1F-001: the mutation is a versioned catalog command; its required
         // permission is checked against the caller principal first (identical
         // to the legacy hardcoded Admin gate).
-        let command = crate::catalog_cmds::CatalogCommand::CreateUser {
-            username: username.to_string(),
-            password_hash: hash.clone(),
-            is_admin: false,
-            created_epoch: 0, // stamped after the commit epoch is assigned
+        let command = match &verifiers {
+            Some((scram_sha_256, mysql_caching_sha2)) => {
+                crate::catalog_cmds::CatalogCommand::CreateUserWithAuthVerifiers {
+                    username: username.to_string(),
+                    password_hash: hash.clone(),
+                    scram_sha_256: scram_sha_256.clone(),
+                    mysql_caching_sha2: mysql_caching_sha2.clone(),
+                    is_admin: false,
+                    created_epoch: 0,
+                }
+            }
+            None => crate::catalog_cmds::CatalogCommand::CreateUser {
+                username: username.to_string(),
+                password_hash: hash.clone(),
+                is_admin: false,
+                created_epoch: 0,
+            },
         };
         self.require(&crate::catalog_cmds::required_permission(&command))?;
         let _ddl = self.ddl_lock.lock();
@@ -7311,11 +7348,23 @@ impl Database {
         let _commit = self.commit_lock.lock();
         let epoch = self.epoch.bump_assigned();
         let mut _epoch_guard = EpochGuard::new(self.epoch.as_ref(), epoch);
-        let command = crate::catalog_cmds::CatalogCommand::CreateUser {
-            username: username.to_string(),
-            password_hash: hash,
-            is_admin: false,
-            created_epoch: epoch.0,
+        let command = match verifiers {
+            Some((scram_sha_256, mysql_caching_sha2)) => {
+                crate::catalog_cmds::CatalogCommand::CreateUserWithAuthVerifiers {
+                    username: username.to_string(),
+                    password_hash: hash,
+                    scram_sha_256,
+                    mysql_caching_sha2,
+                    is_admin: false,
+                    created_epoch: epoch.0,
+                }
+            }
+            None => crate::catalog_cmds::CatalogCommand::CreateUser {
+                username: username.to_string(),
+                password_hash: hash,
+                is_admin: false,
+                created_epoch: epoch.0,
+            },
         };
         let mut next_catalog = self.catalog.read().clone();
         let delta = self.apply_catalog_command_to(&mut next_catalog, command)?;
@@ -7384,7 +7433,9 @@ impl Database {
     ) -> Result<Epoch> {
         self.require(&crate::auth::Permission::Admin)?;
         let hash = crate::auth::hash_password(new_password).map_err(MongrelError::Other)?;
-        self.alter_user_password_hash_with_epoch(username, hash)
+        let scram = crate::auth::scram_verifier(new_password).map_err(MongrelError::Other)?;
+        let mysql = crate::auth::MysqlCachingSha2Verifier::from_password(new_password);
+        self.alter_user_password_hash_with_epoch_inner(username, hash, Some((scram, mysql)), None)
     }
 
     pub fn alter_user_password_hash_with_epoch(
@@ -7392,7 +7443,7 @@ impl Database {
         username: &str,
         hash: String,
     ) -> Result<Epoch> {
-        self.alter_user_password_hash_with_epoch_inner(username, hash, None)
+        self.alter_user_password_hash_with_epoch_inner(username, hash, None, None)
     }
 
     pub fn alter_user_password_hash_with_epoch_controlled<F>(
@@ -7404,18 +7455,37 @@ impl Database {
     where
         F: FnMut() -> Result<()>,
     {
-        self.alter_user_password_hash_with_epoch_inner(username, hash, Some(&mut before_publish))
+        self.alter_user_password_hash_with_epoch_inner(
+            username,
+            hash,
+            None,
+            Some(&mut before_publish),
+        )
     }
 
     fn alter_user_password_hash_with_epoch_inner(
         &self,
         username: &str,
         hash: String,
+        verifiers: Option<(
+            crate::security_hardening::ScramVerifier,
+            crate::auth::MysqlCachingSha2Verifier,
+        )>,
         before_publish: Option<&mut dyn FnMut() -> Result<()>>,
     ) -> Result<Epoch> {
-        let command = crate::catalog_cmds::CatalogCommand::AlterUserPassword {
-            username: username.to_string(),
-            password_hash: hash,
+        let command = match verifiers {
+            Some((scram_sha_256, mysql_caching_sha2)) => {
+                crate::catalog_cmds::CatalogCommand::AlterUserPasswordWithAuthVerifiers {
+                    username: username.to_string(),
+                    password_hash: hash,
+                    scram_sha_256,
+                    mysql_caching_sha2,
+                }
+            }
+            None => crate::catalog_cmds::CatalogCommand::AlterUserPassword {
+                username: username.to_string(),
+                password_hash: hash,
+            },
         };
         self.require(&crate::catalog_cmds::required_permission(&command))?;
         let _ddl = self.ddl_lock.lock();
@@ -7486,6 +7556,25 @@ impl Database {
         }
         after_verify();
         Ok(Self::resolve_user_principal_from_catalog(&catalog, user))
+    }
+
+    /// Verify a MySQL 8 `caching_sha2_password` proof and resolve the same
+    /// live catalog principal used by native SCRAM authentication.
+    pub fn authenticate_mysql_caching_sha2_principal(
+        &self,
+        username: &str,
+        nonce: &[u8],
+        proof: &[u8],
+    ) -> Option<crate::auth::Principal> {
+        let catalog = self.catalog.read();
+        let user = catalog
+            .users
+            .iter()
+            .find(|user| user.username == username)?;
+        if !user.mysql_caching_sha2.as_ref()?.verify(nonce, proof) {
+            return None;
+        }
+        Self::resolve_user_principal_from_catalog(&catalog, user)
     }
 
     /// Grant admin privileges to a user (bypasses all permission checks).
@@ -8031,6 +8120,10 @@ impl Database {
         }
         let password_hash =
             crate::auth::hash_password(admin_password).map_err(MongrelError::Other)?;
+        let scram_sha_256 =
+            crate::auth::scram_verifier(admin_password).map_err(MongrelError::Other)?;
+        let mysql_caching_sha2 =
+            crate::auth::MysqlCachingSha2Verifier::from_password(admin_password);
         let _ddl = self.ddl_lock.lock();
         let _security_write = self.security_write()?;
         let _commit = self.commit_lock.lock();
@@ -8060,6 +8153,8 @@ impl Database {
             id,
             username: admin_username.to_string(),
             password_hash,
+            scram_sha_256: Some(scram_sha_256),
+            mysql_caching_sha2: Some(mysql_caching_sha2),
             roles: Vec::new(),
             is_admin: true,
             created_epoch: epoch.0,

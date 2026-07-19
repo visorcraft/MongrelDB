@@ -476,29 +476,23 @@ docs/architecture/adr/    Architecture Decision Records (10 ADRs + index) for th
 BENCHMARKS.md             latest local performance measurements and commands
 ```
 
-The Stage 0 foundation wave of that program is already in the tree: commits in
-`mongreldb-core` reach durability through the `CommitLog` interface, where a
-`StandaloneCommitLog` wrapping the shared-WAL group commit is the single commit
-authority and reader visibility is gated on the returned `CommitReceipt`. Named
-fault-injection hooks (disabled by default, one atomic load when disarmed)
-guard the WAL append/fsync, commit-publish, catalog-publish, snapshot-install,
-and index-publish boundaries. Stage 1 single-node machinery — shared cores
-behind per-identity handles, a memory governor, persistent online jobs,
-versioned catalog commands, and a lock manager — has landed on top, and the
-Stage 2 consensus core is in the tree: `mongreldb-consensus` replicates one
-database as a Raft group (`RaftCommitLog` with Quorum/LeaderDisk durability,
-failover p95 under one second in the qualification suite) and
-`mongreldb-cluster` carries node identity, routing, and upgrade planning — see
-[Replicated High Availability](docs/20-replicated-ha.md). The ADRs' remaining
-target modes are still **decisions, not shipped behavior**: tablet sharding
-and distributed transactions are not implemented, and production deployments
-today remain the embedded single-node engine with the optional HTTP daemon
-(whose `GET /wal/stream` follower replication still serves read replicas). See
-[Architecture Foundations](docs/18-architecture-foundations.md) and
-[Single-Node Subsystems](docs/19-single-node-subsystems.md) for the
-user-facing contracts. See
+The architecture program is integrated through Stage 5. Stage 0 provides the
+single `CommitLog` authority and named durability fault hooks. Stage 1 provides
+identity-enforcing shared handles, resource governance, persistent jobs,
+versioned catalog commands, and locks. Stage 2 provides Raft replication and
+mTLS transport. Stage 3 provides the meta control plane, tablets, placement,
+distributed transactions, split/merge, distributed SQL groundwork, backup,
+and gateway administration. Stage 4 adds workload scheduling and generated and
+distributed AI retrieval. Stage 5 adds TLS 1.3 native gRPC, production
+authentication paths, real MySQL snapshot/binlog migration, a packet-compatible
+MySQL listener, and executable release certification. See
+[Architecture Foundations](docs/18-architecture-foundations.md),
+[Single-Node Subsystems](docs/19-single-node-subsystems.md),
+[Replicated High Availability](docs/20-replicated-ha.md), and
+[Native RPC and MySQL compatibility](docs/23-native-rpc-and-mysql-compatibility.md).
+See
 [Architecture implementation status](docs/architecture/implementation-status.md)
-for the audit status, evidence gaps, and exact qualification rule.
+for the distinction between integrated code and exact-SHA qualified evidence.
 
 ## License
 

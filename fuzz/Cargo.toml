@@ -1,0 +1,53 @@
+[package]
+name = "mongreldb-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+mongreldb-core = { path = "../crates/mongreldb-core" }
+mongreldb-log = { path = "../crates/mongreldb-log" }
+mongreldb-protocol = { path = "../crates/mongreldb-protocol" }
+mongreldb-server = { path = "../crates/mongreldb-server" }
+prost = "0.14"
+
+[[bin]]
+name = "protocol_envelope"
+path = "fuzz_targets/protocol_envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wal"
+path = "fuzz_targets/wal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "consensus_snapshot"
+path = "fuzz_targets/consensus_snapshot.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cursor_token"
+path = "fuzz_targets/cursor_token.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sql_adapter_packet"
+path = "fuzz_targets/sql_adapter_packet.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

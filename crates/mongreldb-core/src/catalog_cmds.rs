@@ -322,6 +322,36 @@ pub enum CatalogCommand {
     ReplaceProcedure {
         procedure: StoredProcedure,
     },
+    /// Create a user with both Argon2id and SCRAM-SHA-256 credentials.
+    CreateUserWithScram {
+        username: String,
+        password_hash: String,
+        scram_sha_256: crate::security_hardening::ScramVerifier,
+        is_admin: bool,
+        created_epoch: u64,
+    },
+    /// Replace both password credential forms atomically.
+    AlterUserPasswordWithScram {
+        username: String,
+        password_hash: String,
+        scram_sha_256: crate::security_hardening::ScramVerifier,
+    },
+    /// Create a user with native SCRAM and MySQL 8 compatibility verifiers.
+    CreateUserWithAuthVerifiers {
+        username: String,
+        password_hash: String,
+        scram_sha_256: crate::security_hardening::ScramVerifier,
+        mysql_caching_sha2: crate::auth::MysqlCachingSha2Verifier,
+        is_admin: bool,
+        created_epoch: u64,
+    },
+    /// Replace all password verifier forms atomically.
+    AlterUserPasswordWithAuthVerifiers {
+        username: String,
+        password_hash: String,
+        scram_sha_256: crate::security_hardening::ScramVerifier,
+        mysql_caching_sha2: crate::auth::MysqlCachingSha2Verifier,
+    },
 }
 
 /// A [`CatalogCommand`] plus its versioning envelope (spec §4.10).
@@ -660,8 +690,12 @@ pub fn required_permission(command: &CatalogCommand) -> Permission {
         | CatalogCommand::DropMaterializedView { .. }
         | CatalogCommand::RefreshMaterializedView { .. } => Permission::Ddl,
         CatalogCommand::CreateUser { .. }
+        | CatalogCommand::CreateUserWithScram { .. }
+        | CatalogCommand::CreateUserWithAuthVerifiers { .. }
         | CatalogCommand::DropUser { .. }
         | CatalogCommand::AlterUserPassword { .. }
+        | CatalogCommand::AlterUserPasswordWithScram { .. }
+        | CatalogCommand::AlterUserPasswordWithAuthVerifiers { .. }
         | CatalogCommand::SetUserAdmin { .. }
         | CatalogCommand::CreateRole { .. }
         | CatalogCommand::DropRole { .. }
@@ -895,6 +929,8 @@ pub fn apply(catalog: &Catalog, command: &CatalogCommand) -> Result<CatalogDelta
                 id,
                 username: username.clone(),
                 password_hash: password_hash.clone(),
+                scram_sha_256: None,
+                mysql_caching_sha2: None,
                 roles: Vec::new(),
                 is_admin: *is_admin,
                 created_epoch: *created_epoch,
@@ -917,6 +953,88 @@ pub fn apply(catalog: &Catalog, command: &CatalogCommand) -> Result<CatalogDelta
             let user = find_user(catalog, username)?;
             let mut user = user.clone();
             user.password_hash = password_hash.clone();
+            user.scram_sha_256 = None;
+            user.mysql_caching_sha2 = None;
+            Ok(CatalogDelta::UserUpserted(user))
+        }
+        CatalogCommand::CreateUserWithScram {
+            username,
+            password_hash,
+            scram_sha_256,
+            is_admin,
+            created_epoch,
+        } => {
+            if username.is_empty() {
+                return Err(MongrelError::InvalidArgument(
+                    "username must not be empty".into(),
+                ));
+            }
+            if catalog.users.iter().any(|user| user.username == *username) {
+                return Err(MongrelError::InvalidArgument(format!(
+                    "user {username:?} already exists"
+                )));
+            }
+            Ok(CatalogDelta::UserUpserted(UserEntry {
+                id: catalog.next_user_id.max(1),
+                username: username.clone(),
+                password_hash: password_hash.clone(),
+                scram_sha_256: Some(scram_sha_256.clone()),
+                mysql_caching_sha2: None,
+                roles: Vec::new(),
+                is_admin: *is_admin,
+                created_epoch: *created_epoch,
+            }))
+        }
+        CatalogCommand::AlterUserPasswordWithScram {
+            username,
+            password_hash,
+            scram_sha_256,
+        } => {
+            let mut user = find_user(catalog, username)?.clone();
+            user.password_hash = password_hash.clone();
+            user.scram_sha_256 = Some(scram_sha_256.clone());
+            user.mysql_caching_sha2 = None;
+            Ok(CatalogDelta::UserUpserted(user))
+        }
+        CatalogCommand::CreateUserWithAuthVerifiers {
+            username,
+            password_hash,
+            scram_sha_256,
+            mysql_caching_sha2,
+            is_admin,
+            created_epoch,
+        } => {
+            if username.is_empty() {
+                return Err(MongrelError::InvalidArgument(
+                    "username must not be empty".into(),
+                ));
+            }
+            if catalog.users.iter().any(|user| user.username == *username) {
+                return Err(MongrelError::InvalidArgument(format!(
+                    "user {username:?} already exists"
+                )));
+            }
+            Ok(CatalogDelta::UserUpserted(UserEntry {
+                id: catalog.next_user_id.max(1),
+                username: username.clone(),
+                password_hash: password_hash.clone(),
+                scram_sha_256: Some(scram_sha_256.clone()),
+                mysql_caching_sha2: Some(mysql_caching_sha2.clone()),
+                roles: Vec::new(),
+                is_admin: *is_admin,
+                created_epoch: *created_epoch,
+            }))
+        }
+        CatalogCommand::AlterUserPasswordWithAuthVerifiers {
+            username,
+            password_hash,
+            scram_sha_256,
+            mysql_caching_sha2,
+        } => {
+            let mut user = find_user(catalog, username)?.clone();
+            user.password_hash = password_hash.clone();
+            user.scram_sha_256 = Some(scram_sha_256.clone());
+            user.mysql_caching_sha2 = Some(mysql_caching_sha2.clone());
             Ok(CatalogDelta::UserUpserted(user))
         }
         CatalogCommand::SetUserAdmin { username, is_admin } => {

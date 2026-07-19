@@ -1,0 +1,29 @@
+[package]
+name = "mongreldb-migrate-mysql"
+version = "0.60.3"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+description = "Online MySQL to MongrelDB migration runtime"
+repository = "https://github.com/visorcraft/MongrelDB"
+
+[dependencies]
+arrow = "58"
+futures = "0.3"
+mongreldb-client = { path = "../mongreldb-client", version = "0.60.3" }
+mongreldb-core = { path = "../mongreldb-core", version = "0.60.3" }
+mongreldb-protocol = { path = "../mongreldb-protocol", version = "0.60.3" }
+mysql_async = { version = "0.37", default-features = false, features = ["binlog", "default-rustls-ring"] }
+rustls = { version = "0.23", features = ["ring"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "rt-multi-thread", "time"] }
+
+[dev-dependencies]
+mongreldb-server = { path = "../mongreldb-server", version = "0.60.3" }
+rcgen = "0.13"
+tempfile = "3"
+
+[workspace]

@@ -1,4 +1,5 @@
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use mongreldb_protocol::native;
@@ -22,6 +23,20 @@ impl native::auth_service_server::AuthService for TestServices {
         &self,
         _: Request<native::AuthenticateRequest>,
     ) -> Result<Response<native::AuthenticateResponse>, Status> {
+        unimplemented()
+    }
+
+    async fn begin_scram(
+        &self,
+        _: Request<native::BeginScramRequest>,
+    ) -> Result<Response<native::BeginScramResponse>, Status> {
+        unimplemented()
+    }
+
+    async fn finish_scram(
+        &self,
+        _: Request<native::FinishScramRequest>,
+    ) -> Result<Response<native::FinishScramResponse>, Status> {
         unimplemented()
     }
 }
@@ -120,6 +135,13 @@ impl native::catalog_service_server::CatalogService for TestServices {
     ) -> Result<Response<native::GetSchemaResponse>, Status> {
         unimplemented()
     }
+
+    async fn create_table(
+        &self,
+        _: Request<native::CreateTableRequest>,
+    ) -> Result<Response<native::CreateTableResponse>, Status> {
+        unimplemented()
+    }
 }
 
 #[tonic::async_trait]
@@ -179,9 +201,11 @@ async fn real_tls_http2_listener_validates_ca_and_hostname() {
             certificate_pem: certificate_pem.clone(),
             private_key_pem,
             client_ca_pem: None,
+            max_connections: 1,
             max_concurrent_streams: 32,
             max_in_flight_per_connection: 32,
             request_timeout: Duration::from_secs(2),
+            idle_timeout: Duration::from_millis(100),
             keepalive_interval: Duration::from_secs(10),
             keepalive_timeout: Duration::from_secs(2),
         })
@@ -231,6 +255,28 @@ async fn real_tls_http2_listener_validates_ca_and_hostname() {
         .unwrap()
         .into_inner();
     assert!(response.serving);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let replacement = NativeRpcConnection::connect(&valid_config).await.unwrap();
+    assert!(
+        replacement
+            .client()
+            .health()
+            .status(native::HealthRequest {
+                context: Some(native::RequestContext {
+                    version: Some(native::ApiVersion {
+                        major: NATIVE_API_MAJOR,
+                        minor: 0,
+                    }),
+                    request_id: "health-after-idle".into(),
+                    deadline_unix_micros: 0,
+                    idempotency_key: String::new(),
+                }),
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .serving
+    );
 
     assert!(NativeRpcConnection::connect(&client_config(
         address.port(),
@@ -247,6 +293,30 @@ async fn real_tls_http2_listener_validates_ca_and_hostname() {
     ))
     .await
     .is_err());
+
+    let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+    roots.add_parsable_certificates(
+        rustls_pemfile::certs(&mut std::io::BufReader::new(
+            certified.cert.pem().as_bytes(),
+        ))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap(),
+    );
+    let mut tls12 = tokio_rustls::rustls::ClientConfig::builder_with_protocol_versions(&[
+        &tokio_rustls::rustls::version::TLS12,
+    ])
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    tls12.alpn_protocols = vec![b"h2".to_vec()];
+    let tcp = tokio::net::TcpStream::connect(address).await.unwrap();
+    let domain = tokio_rustls::rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    assert!(
+        tokio_rustls::TlsConnector::from(Arc::new(tls12))
+            .connect(domain, tcp)
+            .await
+            .is_err(),
+        "TLS 1.2 must be rejected"
+    );
 
     let _ = shutdown_tx.send(());
     server.await.unwrap().unwrap();

@@ -209,6 +209,27 @@ impl SessionEntry {
             .map(|binding| (statement_id, binding))
     }
 
+    pub(crate) fn prepared_binding_by_id(
+        &self,
+        statement_id: u64,
+    ) -> Option<(String, PreparedStatementBinding)> {
+        let statement_id = StatementId::new(statement_id);
+        let name = self
+            .prepared_names
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .find_map(|(name, id)| (*id == statement_id).then(|| name.clone()))?;
+        let binding = self
+            .record
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .prepared_statements
+            .get(&statement_id)
+            .cloned()?;
+        Some((name, binding))
+    }
+
     /// Record (or replace) a prepared-statement binding under a server-side
     /// statement name (S1D-005).
     pub(crate) fn insert_prepared_binding(&self, name: String, binding: PreparedStatementBinding) {
@@ -355,6 +376,27 @@ impl SessionStore {
             return None;
         }
         Some(Arc::clone(entry))
+    }
+
+    /// Native RPC session ids are bearer capabilities delivered only over
+    /// TLS. The authenticated identity was fixed when the session was
+    /// created, so native requests do not accept a caller-supplied owner.
+    pub(crate) fn get_by_token(&self, token: &str) -> Option<Arc<SessionEntry>> {
+        let guard = self.sessions.lock().ok()?;
+        let entry = guard.get(token)?;
+        (!entry.is_closed()).then(|| Arc::clone(entry))
+    }
+
+    pub(crate) fn close_by_token(&self, token: &str) -> bool {
+        let Ok(mut guard) = self.sessions.lock() else {
+            return false;
+        };
+        if let Some(entry) = guard.remove(token) {
+            entry.mark_closed();
+            true
+        } else {
+            false
+        }
     }
 
     /// Remove and drop a session, marking it closed first so any request that

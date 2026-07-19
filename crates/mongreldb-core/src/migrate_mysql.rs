@@ -209,9 +209,13 @@ fn feat(feature: &str, support: DialectSupport, detail: &str) -> DialectFeature 
 pub fn map_mysql_type(mysql_type: &str) -> TypeMapping {
     let upper = mysql_type.trim().to_ascii_uppercase();
     let (mongrel, lossy, notes) = match upper.as_str() {
-        "TINYINT" | "TINYINT(1)" | "BOOL" | "BOOLEAN" => ("Bool", false, ""),
+        "TINYINT(1)" | "BOOL" | "BOOLEAN" => ("Bool", false, ""),
+        "TINYINT" => ("Int8", false, ""),
+        "TINYINT UNSIGNED" => ("UInt8", false, ""),
         "SMALLINT" => ("Int16", false, ""),
+        "SMALLINT UNSIGNED" => ("UInt16", false, ""),
         "INT" | "INTEGER" | "MEDIUMINT" => ("Int32", false, ""),
+        "INT UNSIGNED" | "INTEGER UNSIGNED" | "MEDIUMINT UNSIGNED" => ("UInt32", false, ""),
         "BIGINT" => ("Int64", false, ""),
         "BIGINT UNSIGNED" => ("UInt64", false, ""),
         "FLOAT" => ("Float32", false, ""),
@@ -692,6 +696,8 @@ mod tests {
     #[test]
     fn maps_common_types() {
         assert_eq!(map_mysql_type("BIGINT").mongrel_type, "Int64");
+        assert_eq!(map_mysql_type("TINYINT").mongrel_type, "Int8");
+        assert_eq!(map_mysql_type("INT UNSIGNED").mongrel_type, "UInt32");
         assert_eq!(map_mysql_type("VARCHAR(255)").mongrel_type, "Utf8");
         assert_eq!(map_mysql_type("JSON").mongrel_type, "Json");
         assert!(map_mysql_type("GEOMETRY").mongrel_type == "Unsupported");

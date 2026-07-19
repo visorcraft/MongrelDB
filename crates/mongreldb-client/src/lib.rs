@@ -10,6 +10,8 @@
 //!   constraints).
 //! - Legacy SQL read ([`MongrelClient::sql`]) returns Arrow IPC batches.
 
+pub mod native;
+
 use std::io::{Cursor, Read};
 
 use arrow::ipc::reader::FileReader;
@@ -55,6 +57,14 @@ pub enum ClientError {
         message: String,
         status: Option<Box<RemoteQueryStatus>>,
         cancel_outcome: Option<RemoteCancelOutcome>,
+    },
+    #[error("native RPC {code}: {category}: {message}")]
+    Native {
+        code: String,
+        category_code: Option<u32>,
+        category: String,
+        message: String,
+        retryable: bool,
     },
 }
 

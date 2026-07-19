@@ -8,7 +8,9 @@ workload-isolated AI/analytics execution. The design is recorded as ten
 summarizes the Stage 0 foundation contracts that remain visible on every
 public API (commit log, taxonomy, build identity, storage ownership).
 
-**Landed stages (see later docs for operations):**
+**Integrated stages (see
+[implementation status](architecture/implementation-status.md) for exact-SHA
+qualification):**
 
 | Stage | Doc | Surface |
 |---|---|---|
@@ -16,8 +18,8 @@ public API (commit log, taxonomy, build identity, storage ownership).
 | 1 single-node | [19](19-single-node-subsystems.md) | resource groups, spill, locks, jobs |
 | 2 HA | [20](20-replicated-ha.md) | Raft per database, mTLS, snapshots |
 | 3 sharded | [21](21-sharded-cluster.md) | meta, tablets, dist txn, gateway |
-| 4 AI/workload | [22](22-embeddings-and-retrieval.md) + Stage 4 in TODO | scheduler, ANN/sparse, multi-region |
-| 5 ops | TODO Stage 5 | migrate, security, certification |
+| 4 AI/workload | [22](22-embeddings-and-retrieval.md) | scheduler, generated embeddings, ANN/sparse, multi-region |
+| 5 ops | [23](23-native-rpc-and-mysql-compatibility.md) | native RPC, security, MySQL migration/wire, executable certification |
 
 Embedded single-node and the HTTP daemon remain first-class; they are no
 longer the only runtime modes.

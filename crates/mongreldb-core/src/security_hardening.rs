@@ -107,6 +107,92 @@ pub struct ScramServerSession {
     expected_channel_binding: Vec<u8>,
 }
 
+/// Client half of one SCRAM-SHA-256 exchange. The password is zeroized when
+/// the exchange finishes or is dropped.
+pub struct ScramClientSession {
+    password: Zeroizing<String>,
+    client_first_bare: String,
+    client_nonce: String,
+    expected_server_signature: Option<[u8; 32]>,
+}
+
+impl ScramClientSession {
+    pub fn begin(
+        username: &str,
+        password: impl Into<String>,
+        client_nonce: &str,
+    ) -> Result<Self, SecurityHardeningError> {
+        validate_scram_nonce(client_nonce)?;
+        if username.is_empty() || username.bytes().any(|byte| matches!(byte, b',' | b'=')) {
+            return Err(SecurityHardeningError::ScramMessage(
+                "username must not be empty or contain ',' or '='".into(),
+            ));
+        }
+        Ok(Self {
+            password: Zeroizing::new(password.into()),
+            client_first_bare: format!("n={username},r={client_nonce}"),
+            client_nonce: client_nonce.into(),
+            expected_server_signature: None,
+        })
+    }
+
+    pub fn client_first_bare(&self) -> &str {
+        &self.client_first_bare
+    }
+
+    pub fn respond(
+        &mut self,
+        server_first: &str,
+    ) -> Result<(String, String), SecurityHardeningError> {
+        let combined_nonce = scram_attribute(server_first, "r")?;
+        if !combined_nonce.starts_with(&self.client_nonce)
+            || combined_nonce.len() == self.client_nonce.len()
+        {
+            return Err(SecurityHardeningError::ScramMessage(
+                "server nonce does not extend client nonce".into(),
+            ));
+        }
+        let salt = STANDARD
+            .decode(scram_attribute(server_first, "s")?)
+            .map_err(|_| SecurityHardeningError::ScramMessage("invalid SCRAM salt".into()))?;
+        let iterations = scram_attribute(server_first, "i")?
+            .parse::<u32>()
+            .map_err(|_| SecurityHardeningError::ScramMessage("invalid iteration count".into()))?;
+        if iterations < SCRAM_SHA_256_MIN_ITERATIONS {
+            return Err(SecurityHardeningError::ScramIterations(iterations));
+        }
+        let client_final = format!("c=biws,r={combined_nonce}");
+        let auth_message = format!("{},{server_first},{client_final}", self.client_first_bare);
+        let salted_password = pbkdf2_hmac_sha256(self.password.as_bytes(), &salt, iterations);
+        let client_key = hmac_sha256(&salted_password, b"Client Key");
+        let stored_key = Sha256::digest(client_key);
+        let client_signature = hmac_sha256(&stored_key, auth_message.as_bytes());
+        let mut proof = [0_u8; 32];
+        for (output, (key, signature)) in proof
+            .iter_mut()
+            .zip(client_key.iter().zip(client_signature))
+        {
+            *output = key ^ signature;
+        }
+        let server_key = hmac_sha256(&salted_password, b"Server Key");
+        self.expected_server_signature = Some(hmac_sha256(&server_key, auth_message.as_bytes()));
+        Ok((client_final, STANDARD.encode(proof)))
+    }
+
+    pub fn verify_server_final(&self, server_final: &str) -> Result<(), SecurityHardeningError> {
+        let expected = self.expected_server_signature.ok_or_else(|| {
+            SecurityHardeningError::ScramMessage("client response missing".into())
+        })?;
+        let actual = STANDARD
+            .decode(scram_attribute(server_final, "v")?)
+            .map_err(|_| SecurityHardeningError::ScramProof)?;
+        if actual.len() != expected.len() || !bool::from(actual.as_slice().ct_eq(&expected)) {
+            return Err(SecurityHardeningError::ScramProof);
+        }
+        Ok(())
+    }
+}
+
 impl ScramServerSession {
     pub fn begin(
         verifier: ScramVerifier,
@@ -1083,6 +1169,24 @@ mod tests {
             ),
             Err(SecurityHardeningError::ScramChannelBinding)
         ));
+    }
+
+    #[test]
+    fn scram_client_and_server_complete_same_exchange() {
+        let verifier = ScramVerifier::from_password("secret", b"0123456789abcdef", 4096).unwrap();
+        let mut client = ScramClientSession::begin("alice", "secret", "clientnonce").unwrap();
+        let server = ScramServerSession::begin(
+            verifier,
+            client.client_first_bare(),
+            "clientnonce",
+            "servernonce",
+            ScramChannelBindingPolicy::Disabled,
+            Vec::new(),
+        )
+        .unwrap();
+        let (client_final, proof) = client.respond(server.server_first_message()).unwrap();
+        let server_final = server.finish(&client_final, &proof).unwrap();
+        client.verify_server_final(&server_final).unwrap();
     }
 
     #[test]

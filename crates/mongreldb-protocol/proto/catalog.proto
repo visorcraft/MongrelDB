@@ -6,12 +6,14 @@ import "common.proto";
 
 service CatalogService {
   rpc GetSchema(GetSchemaRequest) returns (GetSchemaResponse);
+  rpc CreateTable(CreateTableRequest) returns (CreateTableResponse);
 }
 
 message GetSchemaRequest {
   RequestContext context = 1;
   bytes database_id = 2;
   string table = 3;
+  bytes session_id = 4;
 }
 
 message ColumnSchema {
@@ -24,4 +26,75 @@ message GetSchemaResponse {
   string table = 1;
   uint64 schema_version = 2;
   repeated ColumnSchema columns = 3;
+}
+
+message CreateTableRequest {
+  RequestContext context = 1;
+  bytes session_id = 2;
+  string table = 3;
+  uint64 schema_id = 4;
+  repeated CreateColumn columns = 5;
+  repeated UniqueConstraint uniques = 6;
+  repeated ForeignKey foreign_keys = 7;
+}
+
+enum ColumnType {
+  COLUMN_TYPE_UNSPECIFIED = 0;
+  COLUMN_TYPE_BOOL = 1;
+  COLUMN_TYPE_INT8 = 2;
+  COLUMN_TYPE_INT16 = 3;
+  COLUMN_TYPE_INT32 = 4;
+  COLUMN_TYPE_INT64 = 5;
+  COLUMN_TYPE_UINT8 = 6;
+  COLUMN_TYPE_UINT16 = 7;
+  COLUMN_TYPE_UINT32 = 8;
+  COLUMN_TYPE_UINT64 = 9;
+  COLUMN_TYPE_FLOAT32 = 10;
+  COLUMN_TYPE_FLOAT64 = 11;
+  COLUMN_TYPE_TIMESTAMP_NANOS = 12;
+  COLUMN_TYPE_DATE32 = 13;
+  COLUMN_TYPE_DATE64 = 14;
+  COLUMN_TYPE_TIME64 = 15;
+  COLUMN_TYPE_BYTES = 16;
+  COLUMN_TYPE_JSON = 17;
+  COLUMN_TYPE_DECIMAL128 = 18;
+}
+
+message CreateColumn {
+  uint32 id = 1;
+  string name = 2;
+  ColumnType data_type = 3;
+  bool nullable = 4;
+  bool primary_key = 5;
+  uint32 decimal_precision = 6;
+  sint32 decimal_scale = 7;
+  bool auto_increment = 8;
+}
+
+message UniqueConstraint {
+  uint32 id = 1;
+  string name = 2;
+  repeated uint32 columns = 3;
+}
+
+enum ForeignKeyAction {
+  FOREIGN_KEY_ACTION_UNSPECIFIED = 0;
+  FOREIGN_KEY_ACTION_RESTRICT = 1;
+  FOREIGN_KEY_ACTION_CASCADE = 2;
+  FOREIGN_KEY_ACTION_SET_NULL = 3;
+}
+
+message ForeignKey {
+  uint32 id = 1;
+  string name = 2;
+  repeated uint32 columns = 3;
+  string referenced_table = 4;
+  repeated uint32 referenced_columns = 5;
+  ForeignKeyAction on_delete = 6;
+  ForeignKeyAction on_update = 7;
+}
+
+message CreateTableResponse {
+  uint64 table_id = 1;
+  uint64 schema_version = 2;
 }

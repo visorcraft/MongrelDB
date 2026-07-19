@@ -39,16 +39,22 @@ message ExecuteResponse {
   bytes query_id = 1;
   uint64 rows_affected = 2;
   repeated ArrowFrame frames = 3;
+  bool idempotency_replayed = 4;
+  bool committed = 5;
+  uint64 commit_epoch = 6;
+  bytes original_query_id = 7;
 }
 
 message CancelQueryRequest {
   RequestContext context = 1;
   bytes query_id = 2;
+  bytes session_id = 3;
 }
 
 message GetQueryStatusRequest {
   RequestContext context = 1;
   bytes query_id = 2;
+  bytes session_id = 3;
 }
 
 enum QueryPhase {
