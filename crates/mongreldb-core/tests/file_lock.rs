@@ -32,10 +32,11 @@ fn tree_bytes(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
             if path.is_dir() {
                 visit(root, &path, files);
             } else {
-                files.push((
-                    path.strip_prefix(root).unwrap().to_path_buf(),
-                    std::fs::read(path).unwrap(),
-                ));
+                let relative = path.strip_prefix(root).unwrap();
+                if relative == Path::new("_meta").join(".lock") {
+                    continue;
+                }
+                files.push((relative.to_path_buf(), std::fs::read(path).unwrap()));
             }
         }
     }
