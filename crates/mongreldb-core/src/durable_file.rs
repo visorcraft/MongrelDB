@@ -1941,7 +1941,7 @@ mod common_tests {
         let directory = tempfile::tempdir().unwrap();
         let root = Arc::new(DurableRoot::open(directory.path()).unwrap());
         let barrier = Arc::new(Barrier::new(2));
-        let writers = [b'a', b'b'].map(|byte| {
+        let writers = (*b"ab").map(|byte| {
             let root = Arc::clone(&root);
             let barrier = Arc::clone(&barrier);
             std::thread::spawn(move || {
