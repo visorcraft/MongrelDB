@@ -13,6 +13,10 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  RUST_VERSION: "1.97.1"
+  RUST_NIGHTLY: "nightly-2026-07-16"
+
 jobs:
   rust:
     runs-on: ubuntu-latest
@@ -22,7 +26,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_VERSION }}
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2.9.1
         with:
@@ -42,7 +46,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2.9.1
         with:
           workspaces: crates/mongreldb-server
@@ -60,7 +64,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_VERSION }}
           components: clippy
       - uses: Swatinem/rust-cache@v2.9.1
         with:
@@ -81,7 +85,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2.9.1
       - if: runner.os == 'macOS'
         run: brew install protobuf
@@ -101,7 +105,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_VERSION }}
           components: clippy
       - uses: Swatinem/rust-cache@v2.9.1
         with:
@@ -120,7 +124,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_VERSION }}
           components: clippy
       - uses: Swatinem/rust-cache@v2.9.1
         with:
@@ -145,7 +149,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: nightly
+          toolchain: ${{ env.RUST_NIGHTLY }}
       - uses: Swatinem/rust-cache@v2.9.1
         with:
           workspaces: fuzz
@@ -167,7 +171,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2.9.1
         with:
           workspaces: crates/mongreldb-node
@@ -190,7 +194,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2.9.1
         with:
           workspaces: crates/mongreldb-ffi
@@ -210,7 +214,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2.9.1
         with:
           workspaces: crates/mongreldb-kit-ffi
@@ -228,7 +232,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2.9.1
         with:
           workspaces: crates/mongreldb-jni
@@ -269,7 +273,7 @@ jobs:
           df -h
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_VERSION }}
           components: rustfmt, clippy
       - uses: actions/setup-node@v6
         with:
@@ -382,11 +386,11 @@ jobs:
           test -z "$(git status --porcelain)"
       - name: Fuzz smoke
         run: |
-          rustup toolchain install nightly --profile minimal
+          rustup toolchain install "$RUST_NIGHTLY" --profile minimal
           cargo install cargo-fuzz --locked
           # shellcheck disable=SC2016
           python3 scripts/run-certification-command.py "$QUAL_DIR/fuzz-smoke.log" \
-            bash -c 'cd fuzz && for target in protocol_envelope wal consensus_snapshot cursor_token sql_adapter_packet; do cargo +nightly fuzz run "$target" -- -max_total_time=10; done'
+            bash -c 'cd fuzz && for target in protocol_envelope wal consensus_snapshot cursor_token sql_adapter_packet; do cargo +"$RUST_NIGHTLY" fuzz run "$target" -- -max_total_time=10; done'
       - name: Crash recovery matrix
         run: python3 scripts/run-certification-command.py "$QUAL_DIR/crash-matrix.log" cargo test -p mongreldb-core --test fault_injection --test crash --test crash_process
       - name: Create certification manifest

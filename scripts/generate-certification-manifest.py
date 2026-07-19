@@ -68,7 +68,7 @@ TESTS = {
         "python3 scripts/validate-ai-concurrency.py",
         "ai-concurrency-validation.log",
     ),
-    "fuzz_smoke": ("cargo +nightly fuzz run", "fuzz-smoke.log"),
+    "fuzz_smoke": ("cargo +nightly-2026-07-16 fuzz run", "fuzz-smoke.log"),
     "crash_matrix": (
         "cargo test -p mongreldb-core --test fault_injection --test crash --test crash_process",
         "crash-matrix.log",
