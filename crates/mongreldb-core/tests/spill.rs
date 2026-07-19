@@ -219,22 +219,14 @@ fn cleanup_on_drop_error_and_cancel_paths() {
 fn startup_sweep_removes_stale_files() {
     let dir = tempdir().unwrap();
     let query_id = QueryId::new_random();
-    let stale;
-    {
-        let first = manager(&dir, 1 << 20);
-        let session = first.begin_query(query_id, 1 << 20).unwrap();
-        let mut writer = session.new_writer().unwrap();
-        writer.append(b"left behind by a crash").unwrap();
-        let handle = writer.finish().unwrap();
-        stale = only_file(&dir, query_id);
-        // Leak everything, as a crashed process would.
-        std::mem::forget(session);
-        std::mem::forget(handle);
-        std::mem::forget(first);
-    }
+    let stale_dir = query_dir(&dir, query_id);
+    std::fs::create_dir_all(&stale_dir).unwrap();
+    let stale = stale_dir.join("chunk-000000.spill");
+    std::fs::write(&stale, b"left behind by a crash").unwrap();
     assert!(stale.exists());
 
-    // The next process's manager sweeps the stale namespace at open.
+    // A crashed process leaves files but no live handles. The next process's
+    // manager sweeps that stale namespace at open.
     let second = manager(&dir, 1 << 20);
     assert!(
         !stale.exists(),
