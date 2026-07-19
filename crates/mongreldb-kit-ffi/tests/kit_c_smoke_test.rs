@@ -9,13 +9,28 @@ fn kit_c_smoke_test() {
     let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let header = crate_root.join("include/mongreldb_kit.h");
     let c_source = crate_root.join("tests/kit_c_test.c");
-    let lib_path = crate_root.join("target/release");
+    let test_binary = std::env::current_exe().expect("failed to locate test binary");
+    let lib_path = test_binary
+        .parent()
+        .and_then(|deps| deps.parent())
+        .expect("test binary is not under target/release/deps");
 
     assert!(header.exists(), "mongreldb_kit.h not found at {:?}", header);
     assert!(
         c_source.exists(),
         "kit_c_test.c not found at {:?}",
         c_source
+    );
+    assert!(
+        lib_path.join("libmongreldb_kit.so").exists()
+            || lib_path.join("libmongreldb_kit.a").exists()
+            || lib_path.join("libmongreldb_kit.dylib").exists()
+            || lib_path.join("mongreldb_kit.dll").exists()
+            || lib_path.join("libmongreldb_kit.dll").exists()
+            || lib_path.join("libmongreldb_kit.dll.a").exists(),
+        "libmongreldb_kit not found under {} (CARGO_TARGET_DIR={:?})",
+        lib_path.display(),
+        std::env::var_os("CARGO_TARGET_DIR")
     );
 
     // Compile the C test, linking against the shared library.
