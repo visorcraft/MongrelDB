@@ -212,6 +212,12 @@ impl StoreFiles {
         }
     }
 
+    fn prepare(&self) -> io::Result<()> {
+        self.ensure_directory()?;
+        drop(self.open_lock(CAPACITY_LOCK_FILE)?);
+        Ok(())
+    }
+
     pub(crate) fn path(&self) -> PathBuf {
         self.root.canonical_path().join(&self.directory)
     }
@@ -361,7 +367,7 @@ impl SqlIdempotencyStore {
         max_entries: usize,
     ) -> Self {
         let files = StoreFiles::new(root, "_sql_idempotency");
-        let available = integrity.is_some() && files.ensure_directory().is_ok();
+        let available = integrity.is_some() && files.prepare().is_ok();
         let synchronization = synchronization_for(&files.path());
         Self {
             files,
@@ -398,9 +404,9 @@ impl SqlIdempotencyStore {
             if self.integrity.is_none() {
                 return BeginResult::Unavailable("integrity key unavailable".into());
             }
-            if let Err(error) = self.files.ensure_directory() {
+            if let Err(error) = self.files.prepare() {
                 return BeginResult::Unavailable(format!(
-                    "idempotency directory unavailable: {error}"
+                    "idempotency store unavailable: {error}"
                 ));
             }
             self.available.store(true, Ordering::Release);
@@ -1208,6 +1214,15 @@ mod tests {
         assert_eq!(capacity, ["execute", "full"]);
     }
 
+    #[test]
+    fn store_initialization_publishes_capacity_lock() {
+        let directory = tempdir().unwrap();
+        let store = SqlIdempotencyStore::new(directory.path(), Duration::from_secs(60), 8);
+
+        assert!(store.files.absolute(CAPACITY_LOCK_FILE).is_file());
+        assert!(store.available.load(Ordering::Acquire));
+    }
+
     #[tokio::test]
     async fn replay_is_owner_bound_and_mismatched_reuse_is_rejected() {
         let directory = tempdir().unwrap();
@@ -1576,7 +1591,9 @@ mod tests {
         ));
         let outside_lock = lock_outside.path().join("capacity.lock");
         std::fs::write(&outside_lock, b"outside").unwrap();
-        symlink(&outside_lock, lock_store.files.absolute(CAPACITY_LOCK_FILE)).unwrap();
+        let capacity_lock = lock_store.files.absolute(CAPACITY_LOCK_FILE);
+        std::fs::remove_file(&capacity_lock).unwrap();
+        symlink(&outside_lock, capacity_lock).unwrap();
         assert!(matches!(
             lock_store.begin("alice", "key", binding(3)).await,
             BeginResult::Unavailable(_)

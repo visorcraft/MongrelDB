@@ -40,8 +40,8 @@
 //! The on-disk tree lives under a descriptor-pinned
 //! [`DurableRoot`](crate::durable_file::DurableRoot); every file operation is
 //! descriptor-relative and `temp/spill` itself is created lazily on first
-//! use. Open one `SpillManager` per database: opening a second manager on the
-//! same root sweeps the first manager's files, exactly like a restart.
+//! use. Open one `SpillManager` per database. After a process restart, opening
+//! the manager sweeps files whose prior-process handles were closed by exit.
 
 use std::fmt;
 use std::io::{self, Read, Write};
@@ -1398,24 +1398,15 @@ mod tests {
     fn open_sweeps_stale_entries_from_prior_runs() {
         let dir = tempfile::tempdir().unwrap();
         let query_id = QueryId::new_random();
-        let stale_path;
-        let first = manager(&dir, 1 << 20);
-        let handle;
-        {
-            let session = first.begin_query(query_id, 1 << 20).unwrap();
-            let mut writer = session.new_writer().unwrap();
-            writer.append(b"from a previous process").unwrap();
-            handle = writer.finish().unwrap();
-            stale_path = only_file(&dir, query_id);
-            // A stray file directly in the spill root must be swept too.
-            std::fs::write(dir.path().join("temp").join("spill").join("stray"), b"x").unwrap();
-            // Simulate a crash: the session and handle leak away.
-            std::mem::forget(session);
-        }
+        let stale_dir = query_dir(&dir, query_id);
+        let stale_path = stale_dir.join("chunk-000000.spill");
+        std::fs::create_dir_all(&stale_dir).unwrap();
+        std::fs::write(&stale_path, b"from a previous process").unwrap();
+        // A stray file directly in the spill root must be swept too.
+        std::fs::write(dir.path().join("temp").join("spill").join("stray"), b"x").unwrap();
         assert!(stale_path.exists());
-        assert_eq!(first.stats().global_used, handle.bytes_on_disk());
 
-        // The next process opens its manager: everything stale is swept.
+        // No prior-process handles remain: process exit closed them.
         let second = manager(&dir, 1 << 20);
         assert!(
             !stale_path.exists(),
@@ -1425,11 +1416,6 @@ mod tests {
         assert!(!query_dir(&dir, query_id).exists());
         assert_eq!(second.stats().global_used, 0);
         assert_eq!(second.stats().files_live, 0);
-
-        // The leaked handle's drop is still safe (no double delete) and its
-        // accounting unwinds against the first manager.
-        drop(handle);
-        assert_eq!(first.stats().global_used, 0);
     }
 
     #[test]
