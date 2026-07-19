@@ -1,4 +1,6 @@
-use std::ffi::{OsStr, OsString};
+#[cfg(unix)]
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -1027,7 +1029,7 @@ impl DurableRoot {
             ensure_windows_directory(&directory, &path).map_err(mongrel_error_to_io)?;
             remove_windows_directory_contents(&path, &directory)?;
             delete_windows_handle(directory)?;
-            sync_directory(path.parent().unwrap_or(&self.canonical_path))
+            return sync_directory(path.parent().unwrap_or(&self.canonical_path));
         }
 
         #[allow(unreachable_code)]
@@ -1727,7 +1729,7 @@ pub(crate) fn create_directory(path: &Path) -> io::Result<()> {
         std::fs::create_dir(&stage)?;
         match rename(&stage, path) {
             Ok(()) => Ok(()),
-            Err(error) if path.is_dir() => {
+            Err(_error) if path.is_dir() => {
                 let _ = std::fs::remove_dir(&stage);
                 Ok(())
             }
