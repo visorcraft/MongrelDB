@@ -4966,7 +4966,9 @@ mod tests {
 
     // -- 3-node in-memory cell -----------------------------------------------
 
-    const LEADER_TIMEOUT: Duration = Duration::from_secs(15);
+    // Loaded Windows debug runners can take well beyond 15 seconds to settle
+    // several concurrently-tested in-memory Raft groups.
+    const LEADER_TIMEOUT: Duration = Duration::from_secs(60);
     const STATUS_GROUP: u8 = 90;
     const P1_GROUP: u8 = 91;
     const P2_GROUP: u8 = 92;
@@ -5092,10 +5094,12 @@ mod tests {
         }
     }
 
-    fn leader_index<M: GroupMember>(members: &[M]) -> usize {
+    async fn leader_index<M: GroupMember>(members: &[M]) -> usize {
+        let member_refs: Vec<&M> = members.iter().collect();
+        let leader = wait_leader_among(&member_refs).await;
         members
             .iter()
-            .position(|member| member.current_leader() == Some(member.node_id()))
+            .position(|member| member.node_id() == leader)
             .expect("a settled group has a leader member")
     }
 
@@ -5422,7 +5426,7 @@ mod tests {
             .await
             .unwrap();
         // Kill the coordinator-group leader between prepare and decision.
-        let leader = leader_index(&cell.status);
+        let leader = leader_index(&cell.status).await;
         let victim = cell.status.remove(leader);
         victim.crash().await;
         let survivor_refs: Vec<&TxnStatusGroup<InMemoryTransport>> = cell.status.iter().collect();
@@ -5511,7 +5515,7 @@ mod tests {
             .await
             .unwrap();
         // Kill P1's leader after it durably prepared.
-        let p1_leader = leader_index(cell.p1());
+        let p1_leader = leader_index(cell.p1()).await;
         let victim = cell
             .participants
             .get_mut(&gid(P1_GROUP))
@@ -5829,7 +5833,7 @@ mod tests {
         assert_eq!(record.txn_id, request.txn_id);
         // Session-token read-your-writes: propose directly, then read the
         // record back from ANOTHER member behind the session token.
-        let leader = leader_index(&cell.status);
+        let leader = leader_index(&cell.status).await;
         let heartbeat = driver.now().unwrap();
         let expiry = later(heartbeat, TEN_MINUTES);
         let (receipt, rejection) = cell.status[leader]
@@ -6156,7 +6160,7 @@ mod tests {
             .await
             .unwrap();
         // Kill the coordinator-group leader between prepare and decision.
-        let leader = leader_index(&cell.status);
+        let leader = leader_index(&cell.status).await;
         let victim = cell.status.remove(leader);
         victim.crash().await;
         let survivor_refs: Vec<&TxnStatusGroup<InMemoryTransport>> = cell.status.iter().collect();
