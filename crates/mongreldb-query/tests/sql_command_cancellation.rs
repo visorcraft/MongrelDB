@@ -1257,7 +1257,7 @@ async fn gc_publish_fence_is_too_late() {
         .unwrap();
     let table_id = database.table_id("doomed").unwrap();
     let table_dir = dir.path().join("tables").join(table_id.to_string());
-    database.drop_table("doomed").unwrap();
+    session.run("DROP TABLE doomed").await.unwrap();
 
     let (barrier, reached, hook) = blocking_hook(SqlTestHookPoint::InsideCommitCritical);
     session.set_test_hook(Some(hook));
