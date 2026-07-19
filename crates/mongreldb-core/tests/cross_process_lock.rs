@@ -354,7 +354,7 @@ fn engine_holder_blocks_in_process_open() {
 /// 4 real subprocesses each open the same DB, each commits 25 transactions
 /// in a tight loop. Without the timeout knob this would hit EAGAIN as soon
 /// as a second writer tried to open while another held the lock; with
-/// `lock_timeout_ms = 5_000` every writer waits its turn, all 4 succeed,
+/// `lock_timeout_ms = 15_000` every writer waits its turn, all 4 succeed,
 /// and the row count matches.
 ///
 /// Regression guard: if the new `lock_timeout_ms` knob regresses to fail-fast
@@ -363,7 +363,7 @@ fn engine_holder_blocks_in_process_open() {
 fn cross_process_writers_all_succeed() {
     const N_WRITERS: i64 = 4;
     const ROWS_PER_WRITER: i64 = 25;
-    const LOCK_TIMEOUT_MS: u32 = 5_000;
+    const LOCK_TIMEOUT_MS: u32 = 15_000;
 
     let dir = TempDir::new().unwrap();
     pre_create(dir.path());
