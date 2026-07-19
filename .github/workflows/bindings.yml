@@ -1,0 +1,109 @@
+name: Bindings
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - ".github/workflows/bindings.yml"
+      - "crates/mongreldb-node/**"
+      - "crates/mongreldb-ffi/**"
+      - "crates/mongreldb-kit-ffi/**"
+      - "crates/mongreldb-jni/**"
+      - "crates/mongreldb-core/**"
+      - "crates/mongreldb-query/**"
+      - "crates/mongreldb-types/**"
+      - "crates/mongreldb-log/**"
+  pull_request:
+    branches: [master]
+    paths:
+      - ".github/workflows/bindings.yml"
+      - "crates/mongreldb-node/**"
+      - "crates/mongreldb-ffi/**"
+      - "crates/mongreldb-kit-ffi/**"
+      - "crates/mongreldb-jni/**"
+      - "crates/mongreldb-core/**"
+      - "crates/mongreldb-query/**"
+      - "crates/mongreldb-types/**"
+      - "crates/mongreldb-log/**"
+
+concurrency:
+  group: bindings-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  RUST_VERSION: "1.97.1"
+
+jobs:
+  node:
+    name: Node
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/mongreldb-node
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: crates/mongreldb-node
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+
+  ffi:
+    name: C FFI
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/mongreldb-ffi
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: crates/mongreldb-ffi
+      - run: cargo build --release
+      - run: cargo test --release
+
+  kit-ffi:
+    name: Kit FFI
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/mongreldb-kit-ffi
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: crates/mongreldb-kit-ffi
+      - run: cargo build --release
+      - run: cargo test --release
+
+  jni:
+    name: JNI
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/mongreldb-jni
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: crates/mongreldb-jni
+      - run: cargo build --release

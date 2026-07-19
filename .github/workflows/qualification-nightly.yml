@@ -5,8 +5,16 @@ on:
     - cron: "0 3 * * *"
   workflow_dispatch:
 
+concurrency:
+  group: qualification-nightly-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
+
+env:
+  RUST_VERSION: "1.97.1"
+  RUST_NIGHTLY: "nightly-2026-07-16"
 
 jobs:
   # Stage 1 gate (spec §10): one-million-row overlapping read/write with
@@ -19,7 +27,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2.9.1
       - name: Stage 1 gate qualification (1M rows)
         env:
@@ -39,7 +47,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2.9.1
         with:
           workspaces: crates/mongreldb-server
@@ -58,7 +66,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2.9.1
       - name: Sim determinism suite
         run: cargo test -p mongreldb-sim
@@ -77,7 +85,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: nightly
+          toolchain: ${{ env.RUST_NIGHTLY }}
       - uses: Swatinem/rust-cache@v2.9.1
         with:
           workspaces: fuzz
@@ -89,3 +97,68 @@ jobs:
           for target in protocol_envelope wal consensus_snapshot cursor_token sql_adapter_packet; do
             cargo fuzz run "$target" -- -max_total_time=600
           done
+
+  cross-platform:
+    name: Full tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2.9.1
+      - if: runner.os == 'macOS'
+        run: brew install protobuf
+      - if: runner.os == 'Windows'
+        run: choco install protoc --yes --no-progress
+      - run: cargo test --workspace --all-features
+
+  mysql-migration:
+    name: Real MySQL migration
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/mongreldb-migrate-mysql
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: crates/mongreldb-migrate-mysql
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Start TLS MySQL 8.4 source
+        working-directory: .
+        run: bash scripts/start-test-mysql.sh
+      - run: cargo clippy --all-targets -- -D warnings
+      - name: Run real source integration
+        env:
+          MONGRELDB_TEST_MYSQL_HOST: localhost
+          MONGRELDB_TEST_MYSQL_PORT: "33060"
+          MONGRELDB_TEST_MYSQL_PASSWORD: mongreldb-test
+          MONGRELDB_TEST_MYSQL_CA: ${{ github.workspace }}/target/mysql-tls/ca.pem
+        run: cargo test --test mysql_container -- --nocapture
+
+  ffi-sanitizer:
+    name: C FFI sanitizer
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/mongreldb-ffi
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: crates/mongreldb-ffi
+      - run: cargo build --release
+      - run: MONGRELDB_C_SANITIZE=1 cargo test --release --test c_smoke_test

@@ -1,0 +1,189 @@
+name: Clean release qualification
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+concurrency:
+  group: release-qualification-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  RUST_VERSION: "1.97.1"
+  RUST_NIGHTLY: "nightly-2026-07-16"
+
+jobs:
+  qualification:
+    name: Clean release qualification
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash --noprofile --norc -eo pipefail {0}
+    permissions:
+      contents: write
+    env:
+      QUAL_DIR: /tmp/mongreldb-qualification
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target-qualification
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v7
+      - name: Free disk space
+        run: |
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/powershell \
+            /usr/share/swift || true
+          sudo docker system prune -af || true
+          df -h
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - name: Capture source identity
+        run: |
+          mkdir -p "$QUAL_DIR"
+          git status --porcelain > "$QUAL_DIR/git-status.txt"
+          {
+            git rev-parse HEAD
+            rustc --version
+            cargo --version
+            node --version
+            df -h
+          } > "$QUAL_DIR/versions.txt"
+      - name: Root format
+        run: python3 scripts/run-certification-command.py "$QUAL_DIR/cargo-fmt.log" cargo fmt --all -- --check
+      - name: Component versions
+        run: python3 scripts/run-certification-command.py "$QUAL_DIR/component-versions.log" python3 scripts/verify-component-versions
+      - name: Root clippy
+        run: python3 scripts/run-certification-command.py "$QUAL_DIR/cargo-clippy.log" cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Root tests
+        run: python3 scripts/run-certification-command.py "$QUAL_DIR/cargo-test.log" cargo test --workspace --all-features
+      - name: Root release tests
+        run: python3 scripts/run-certification-command.py "$QUAL_DIR/cargo-test-release.log" cargo test --workspace --release --all-features
+      - name: Reclaim debug intermediates
+        run: |
+          rm -rf "$CARGO_TARGET_DIR/debug/incremental" \
+                 "$CARGO_TARGET_DIR/debug/examples" \
+                 "$CARGO_TARGET_DIR/debug/build" || true
+          df -h
+      - name: Server tests
+        run: |
+          cargo clippy --manifest-path crates/mongreldb-server/Cargo.toml --all-targets --all-features -- -D warnings 2>&1 | tee "$QUAL_DIR/server-clippy.log"
+          python3 scripts/run-certification-command.py "$QUAL_DIR/server-test.log" cargo test --manifest-path crates/mongreldb-server/Cargo.toml --all-targets --all-features
+      - name: Client checks
+        run: |
+          cargo clippy --manifest-path crates/mongreldb-client/Cargo.toml --all-targets --all-features -- -D warnings 2>&1 | tee "$QUAL_DIR/client-clippy.log"
+          python3 scripts/run-certification-command.py "$QUAL_DIR/client-test.log" cargo test --manifest-path crates/mongreldb-client/Cargo.toml --all-targets --all-features
+      - name: MySQL wire checks
+        run: |
+          cargo clippy --manifest-path crates/mongreldb-mysql-wire/Cargo.toml --all-targets -- -D warnings 2>&1 | tee "$QUAL_DIR/mysql-wire-clippy.log"
+          python3 scripts/run-certification-command.py "$QUAL_DIR/mysql-wire-test.log" cargo test --manifest-path crates/mongreldb-mysql-wire/Cargo.toml --all-targets
+      - name: Real MySQL migration checks
+        env:
+          MONGRELDB_TEST_MYSQL_HOST: localhost
+          MONGRELDB_TEST_MYSQL_PORT: "33060"
+          MONGRELDB_TEST_MYSQL_PASSWORD: mongreldb-test
+          MONGRELDB_TEST_MYSQL_CA: ${{ github.workspace }}/target/mysql-tls/ca.pem
+        run: |
+          bash scripts/start-test-mysql.sh 2>&1 | tee "$QUAL_DIR/mysql-container-start.log"
+          cargo clippy --manifest-path crates/mongreldb-migrate-mysql/Cargo.toml --all-targets -- -D warnings 2>&1 | tee "$QUAL_DIR/mysql-migrate-clippy.log"
+          python3 scripts/run-certification-command.py "$QUAL_DIR/mysql-migrate-test.log" cargo test --manifest-path crates/mongreldb-migrate-mysql/Cargo.toml --test mysql_container -- --nocapture
+      - name: Node checks
+        working-directory: crates/mongreldb-node
+        run: |
+          npm ci 2>&1 | tee "$QUAL_DIR/node-ci.log"
+          npm run build 2>&1 | tee "$QUAL_DIR/node-build.log"
+          python3 "$GITHUB_WORKSPACE/scripts/run-certification-command.py" "$QUAL_DIR/node-test.log" npm test
+          python3 "$GITHUB_WORKSPACE/scripts/run-certification-command.py" "$QUAL_DIR/node-smoke.log" node smoke.mjs
+      - name: Reclaim before release FFI builds
+        run: |
+          rm -rf "$CARGO_TARGET_DIR/debug" || true
+          df -h
+      - name: FFI checks
+        run: |
+          cargo build --manifest-path crates/mongreldb-ffi/Cargo.toml --release 2>&1 | tee "$QUAL_DIR/ffi-build.log"
+          python3 scripts/run-certification-command.py "$QUAL_DIR/ffi-test.log" cargo test --manifest-path crates/mongreldb-ffi/Cargo.toml --release
+          python3 scripts/run-certification-command.py "$QUAL_DIR/ffi-sanitizer.log" env MONGRELDB_C_SANITIZE=1 cargo test --manifest-path crates/mongreldb-ffi/Cargo.toml --release --test c_smoke_test
+          cargo build --manifest-path crates/mongreldb-kit-ffi/Cargo.toml --release 2>&1 | tee "$QUAL_DIR/kit-ffi-build.log"
+          python3 scripts/run-certification-command.py "$QUAL_DIR/kit-ffi-test.log" cargo test --manifest-path crates/mongreldb-kit-ffi/Cargo.toml --release
+          python3 scripts/run-certification-command.py "$QUAL_DIR/jni-build.log" cargo build --manifest-path crates/mongreldb-jni/Cargo.toml --release
+      - name: Python MinHash wire fixture
+        run: |
+          cargo build --manifest-path crates/mongreldb-server/Cargo.toml --release > "$QUAL_DIR/ai-wire-server.log" 2>&1
+          "$CARGO_TARGET_DIR/release/mongreldb-server" "$RUNNER_TEMP/mongreldb-ai-wire" --port 8080 >> "$QUAL_DIR/ai-wire-server.log" 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid"' EXIT
+          for _ in {1..60}; do
+            if curl --fail --silent http://127.0.0.1:8080/health >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          curl --fail --silent http://127.0.0.1:8080/health >/dev/null
+          PYTHONDONTWRITEBYTECODE=1 MONGRELDB_DB_PATH="$RUNNER_TEMP/mongreldb-ai-wire" python3 tools/ai-wire/demo_minhash.py 2>&1 | tee "$QUAL_DIR/ai-wire-minhash.log"
+      - name: AI benchmark
+        run: |
+          MONGRELDB_AI_QUALIFICATION=1 \
+            MONGRELDB_AI_BENCH_ROWS=100000 MONGRELDB_AI_BENCH_QUERIES=50 \
+            cargo run -p mongreldb-core --release --all-features \
+            --example ai_retrieval_bench \
+            > "$QUAL_DIR/ai-benchmark-100k.json" 2> "$QUAL_DIR/ai-benchmark-100k.log"
+          cp docs/ai/ci-benchmark-thresholds.json "$QUAL_DIR/"
+          python3 scripts/run-certification-command.py "$QUAL_DIR/ai-benchmark-validation.log" \
+            python3 scripts/validate-ai-benchmark.py \
+            "$QUAL_DIR/ai-benchmark-100k.json" \
+            docs/ai/ci-benchmark-thresholds.json \
+            --expected-sha "$GITHUB_SHA"
+          MONGRELDB_AI_CONCURRENCY_ROWS=10000 MONGRELDB_AI_CONCURRENCY_OPS=25 \
+            cargo run -p mongreldb-core --release --all-features \
+            --example ai_concurrency_bench \
+            > "$QUAL_DIR/ai-concurrency.json" 2> "$QUAL_DIR/ai-concurrency.log"
+          python3 scripts/run-certification-command.py "$QUAL_DIR/ai-concurrency-validation.log" \
+            python3 scripts/validate-ai-concurrency.py "$QUAL_DIR/ai-concurrency.json"
+          test -z "$(git status --porcelain)"
+      - name: Fuzz smoke
+        run: |
+          rustup toolchain install "$RUST_NIGHTLY" --profile minimal
+          cargo install cargo-fuzz --locked
+          # shellcheck disable=SC2016
+          python3 scripts/run-certification-command.py "$QUAL_DIR/fuzz-smoke.log" \
+            bash -c 'cd fuzz && for target in protocol_envelope wal consensus_snapshot cursor_token sql_adapter_packet; do cargo +"$RUST_NIGHTLY" fuzz run "$target" -- -max_total_time=10; done'
+      - name: Crash recovery matrix
+        run: python3 scripts/run-certification-command.py "$QUAL_DIR/crash-matrix.log" cargo test -p mongreldb-core --test fault_injection --test crash --test crash_process
+      - name: Create certification manifest
+        run: |
+          tar \
+            --exclude=deps --exclude=build --exclude=incremental --exclude=examples \
+            -C "$CARGO_TARGET_DIR/release" \
+            -czf "$QUAL_DIR/qualified-artifacts.tar.gz" .
+          python3 scripts/run-certification-command.py "$QUAL_DIR/packaged-artifact-test.log" \
+            bash scripts/qualify-packaged-artifacts.sh "$QUAL_DIR/qualified-artifacts.tar.gz" "$GITHUB_WORKSPACE"
+          python3 scripts/generate-certification-manifest.py \
+            --evidence-dir "$QUAL_DIR" \
+            --artifact "$QUAL_DIR/qualified-artifacts.tar.gz" \
+            --output "$QUAL_DIR/certification-manifest.json" \
+            --commit "$GITHUB_SHA"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: mongreldb-clean-qualification-${{ github.sha }}
+          path: /tmp/mongreldb-qualification/
+      - name: Package release evidence
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: tar -C "$QUAL_DIR" -czf /tmp/mongreldb-clean-qualification.tar.gz .
+      - uses: softprops/action-gh-release@v3
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          files: /tmp/mongreldb-clean-qualification.tar.gz
