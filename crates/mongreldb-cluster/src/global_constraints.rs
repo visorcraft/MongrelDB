@@ -4091,7 +4091,7 @@ mod tests {
 
     // -- unique constraint integration -----------------------------------------
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn unique_insert_commits_claim_and_row_atomically() {
         let cell = boot_cell().await;
         let driver = GlobalConstraintDriver::new(driver_config());
@@ -4146,7 +4146,7 @@ mod tests {
         cell.shutdown().await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn duplicate_unique_insert_retry_yields_one_outcome() {
         let cell = boot_cell().await;
         let driver = GlobalConstraintDriver::new(driver_config());
@@ -4188,7 +4188,7 @@ mod tests {
         cell.shutdown().await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn committed_claim_blocks_a_later_conflicting_claim() {
         let cell = boot_cell().await;
         let driver = GlobalConstraintDriver::new(driver_config());
@@ -4532,7 +4532,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn child_insert_with_live_parent_commits_probe_and_row() {
         let cell = boot_cell().await;
         let driver = GlobalConstraintDriver::new(driver_config());
@@ -4567,7 +4567,7 @@ mod tests {
         cell.shutdown().await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn child_insert_with_missing_parent_fails_before_any_write() {
         let cell = boot_cell().await;
         let driver = GlobalConstraintDriver::new(driver_config());
@@ -4813,7 +4813,7 @@ mod tests {
         cell.shutdown().await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn cascade_bound_trip_applies_nothing() {
         let cell = boot_cell().await;
         let driver = GlobalConstraintDriver::new(driver_config());

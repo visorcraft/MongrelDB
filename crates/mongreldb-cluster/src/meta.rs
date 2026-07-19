@@ -3903,6 +3903,42 @@ mod stage3a_tests {
         }
     }
 
+    async fn propose_to_settled_leader(
+        groups: &BTreeMap<u8, MetaGroup<InMemoryTransport>>,
+        members: &[u8],
+        command_id: [u8; 16],
+        command: MetaCommand,
+        control: &ExecutionControl,
+    ) -> MetaCommandReceipt {
+        let deadline = Instant::now() + LEADER_TIMEOUT;
+        loop {
+            let member_refs = members
+                .iter()
+                .map(|member| &groups[member])
+                .collect::<Vec<_>>();
+            let leader = wait_consensus_leader(&member_refs).await;
+            let leader_byte = members
+                .iter()
+                .copied()
+                .find(|member| raft_id(*member) == leader)
+                .expect("settled leader belongs to the live member set");
+            match groups[&leader_byte]
+                .propose(command_id, command.clone(), control)
+                .await
+            {
+                Ok(receipt) => return receipt,
+                Err(MetaError::Consensus(ConsensusError::NotLeader { .. })) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "meta leader kept changing during proposal"
+                    );
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => panic!("meta proposal failed: {error}"),
+            }
+        }
+    }
+
     // -- serde + record plumbing -------------------------------------------
 
     #[test]
@@ -6341,7 +6377,7 @@ mod stage3a_tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn three_node_meta_group_converges_after_leader_failover() {
         let tmp = tempfile::tempdir().unwrap();
         let transport = Arc::new(InMemoryTransport::new());
@@ -6362,14 +6398,6 @@ mod stage3a_tests {
             .map(|byte| (node_id(*byte), format!("127.0.0.1:710{byte}")))
             .collect();
         groups[&1].bootstrap(&members).await.unwrap();
-        let leader_byte = {
-            let leader = wait_consensus_leader(&[&groups[&1], &groups[&2], &groups[&3]]).await;
-            [1_u8, 2, 3]
-                .into_iter()
-                .find(|byte| raft_id(*byte) == leader)
-                .unwrap()
-        };
-
         let control = ExecutionControl::default();
         let mut proposals: Vec<MetaCommand> = [1_u8, 2, 3]
             .iter()
@@ -6415,10 +6443,8 @@ mod stage3a_tests {
         let mut last_index = 0_u64;
         for (seq, command) in proposals.into_iter().enumerate() {
             let id = u8::try_from(seq + 1).unwrap();
-            let receipt = groups[&leader_byte]
-                .propose(cmd_id(id), command, &control)
-                .await
-                .unwrap();
+            let receipt =
+                propose_to_settled_leader(&groups, &[1, 2, 3], cmd_id(id), command, &control).await;
             last_index = receipt.receipt.position.index;
         }
         for byte in [1_u8, 2, 3] {
@@ -6433,20 +6459,18 @@ mod stage3a_tests {
 
         // Fail over: stop the leader; the survivors elect a new one and keep
         // accepting commands.
+        let leader_byte = {
+            let leader = wait_consensus_leader(&[&groups[&1], &groups[&2], &groups[&3]]).await;
+            [1_u8, 2, 3]
+                .into_iter()
+                .find(|byte| raft_id(*byte) == leader)
+                .unwrap()
+        };
         groups[&leader_byte].shutdown().await.unwrap();
         let survivors: Vec<u8> = [1_u8, 2, 3]
             .into_iter()
             .filter(|byte| *byte != leader_byte)
             .collect();
-        let new_leader_byte = {
-            let leader =
-                wait_consensus_leader(&[&groups[&survivors[0]], &groups[&survivors[1]]]).await;
-            survivors
-                .iter()
-                .copied()
-                .find(|byte| raft_id(*byte) == leader)
-                .unwrap()
-        };
         let mut new_index = last_index;
         for (seq, command) in [
             MetaCommand::SubmitSchemaJob {
@@ -6464,10 +6488,8 @@ mod stage3a_tests {
         .enumerate()
         {
             let id = u8::try_from(seq + 100).unwrap();
-            let receipt = groups[&new_leader_byte]
-                .propose(cmd_id(id), command, &control)
-                .await
-                .unwrap();
+            let receipt =
+                propose_to_settled_leader(&groups, &survivors, cmd_id(id), command, &control).await;
             new_index = receipt.receipt.position.index;
         }
         for byte in &survivors {
