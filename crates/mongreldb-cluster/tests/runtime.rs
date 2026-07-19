@@ -323,6 +323,55 @@ async fn publish_schema(node: &NodeRuntime, database_id: DatabaseId, table_id: T
     .unwrap();
 }
 
+async fn publish_tablet_descriptor_on_meta_leader(
+    nodes: &[&NodeRuntime],
+    descriptor: &TabletDescriptor,
+    control: &ExecutionControl,
+) {
+    let deadline = std::time::Instant::now() + LEADER_TIMEOUT;
+    loop {
+        let leader = nodes[0]
+            .meta_group()
+            .unwrap()
+            .group()
+            .wait_leader(LEADER_TIMEOUT)
+            .await
+            .unwrap();
+        let runtime = nodes
+            .iter()
+            .find(|node| raft_node_id(&node.identity().node_id) == leader)
+            .expect("the meta leader is one of the runtimes");
+        match runtime.publish_tablet_descriptor(descriptor, control).await {
+            Ok(_) => return,
+            Err(error) if is_meta_not_leader(&error) && std::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(error) => panic!("publish_tablet_descriptor failed: {error}"),
+        }
+    }
+}
+
+async fn wait_for_tablet_descriptor(node: &NodeRuntime, tablet_id: TabletId) -> TabletDescriptor {
+    let deadline = std::time::Instant::now() + LEADER_TIMEOUT;
+    loop {
+        if let Some(descriptor) = node
+            .meta_group()
+            .unwrap()
+            .state()
+            .tablet(tablet_id)
+            .cloned()
+        {
+            return descriptor;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "tablet descriptor did not reach node {}",
+            node.identity().node_id
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// The heavy multi-node TCP tests run one at a time: parallel 3-node
 /// clusters with sub-second election timers starve each other's heartbeats
 /// under full-suite load and churn leadership, which the protocols tolerate
@@ -452,23 +501,7 @@ async fn three_node_runtime_cluster_end_to_end() {
     .await;
 
     // The meta descriptor reflects the tablet and its replicas.
-    let deadline = std::time::Instant::now() + LEADER_TIMEOUT;
-    let published = loop {
-        if let Some(published) = node1
-            .meta_group()
-            .unwrap()
-            .state()
-            .tablet(tablet_id)
-            .cloned()
-        {
-            break published;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "tablet descriptor did not reach node 1"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    };
+    let published = wait_for_tablet_descriptor(&node1, tablet_id).await;
     assert_eq!(published, tablet);
     assert_eq!(published.replicas.len(), 3);
 
@@ -715,17 +748,8 @@ async fn replica_join_workflow_promotes_a_new_voter() {
         .find(|replica| replica.node_id == identities[3].node_id)
         .unwrap()
         .role = ReplicaRole::Voter;
-    leader
-        .publish_tablet_descriptor(&promoted, &control)
-        .await
-        .unwrap();
-    let published = node1
-        .meta_group()
-        .unwrap()
-        .state()
-        .tablet(tablet_id)
-        .unwrap()
-        .clone();
+    publish_tablet_descriptor_on_meta_leader(&nodes, &promoted, &control).await;
+    let published = wait_for_tablet_descriptor(&node1, tablet_id).await;
     assert_eq!(published, promoted);
     assert_eq!(published.replicas.len(), 4);
     assert_eq!(published.voter_count(), 4);
