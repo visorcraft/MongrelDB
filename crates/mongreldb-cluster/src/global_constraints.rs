@@ -4747,7 +4747,7 @@ mod tests {
 
     // -- cascade execution -------------------------------------------------------
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn cascade_applies_every_level_in_one_transaction() {
         let cell = boot_cell().await;
         let driver = GlobalConstraintDriver::new(driver_config());
