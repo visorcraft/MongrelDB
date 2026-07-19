@@ -75,6 +75,33 @@ TESTS = {
     ),
 }
 
+ARCHITECTURE_TASKS = {
+    "R1": ("workspace_tests", "workspace_release_tests"),
+    "R2": (
+        "workspace_tests",
+        "server_tests",
+        "client_tests",
+        "packaged_artifact_conformance",
+    ),
+    "R3": ("workspace_tests", "server_tests", "packaged_artifact_conformance"),
+    "R4": (
+        "mysql_wire_client_compat",
+        "mysql_snapshot_binlog",
+        "packaged_artifact_conformance",
+    ),
+    "R5": ("workspace_tests", "workspace_release_tests"),
+    "R6": ("workspace_tests", "server_tests"),
+    "R7": ("fuzz_smoke", "crash_matrix", "packaged_artifact_conformance"),
+    "R8": ("format", "workspace_tests", "packaged_artifact_conformance"),
+    "R9": (
+        "workspace_tests",
+        "server_tests",
+        "client_tests",
+        "packaged_artifact_conformance",
+    ),
+    "R10": tuple(TESTS),
+}
+
 IMPLEMENTATION_STATUS = Path("docs/architecture/implementation-status.md")
 
 
@@ -148,6 +175,14 @@ def main() -> None:
         "artifact_sha256": hashlib.sha256(args.artifact.read_bytes()).hexdigest(),
         "implementation_status_sha256": implementation_status_sha256(),
         "rust_version": rust_version,
+        "architecture_tasks": [
+            {
+                "id": task_id,
+                "status": "qualified",
+                "evidence": list(evidence),
+            }
+            for task_id, evidence in ARCHITECTURE_TASKS.items()
+        ],
         "tests": [
             {
                 "id": test_id,

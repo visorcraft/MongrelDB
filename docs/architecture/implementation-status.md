@@ -10,7 +10,8 @@ Status meanings:
 - **Integrated**: a production path exists, but the release qualification gate
   is incomplete.
 - **Qualified**: exact-SHA CI and packaged-artifact evidence passed. This state
-  is recorded in the generated certification artifact.
+  is recorded per R1-R10 task in the generated certification artifact's
+  `architecture_tasks` field.
 
 Source rows remain Integrated until evidence exists. The generated manifest
 binds this file through `implementation_status_sha256`, so CI fails if the

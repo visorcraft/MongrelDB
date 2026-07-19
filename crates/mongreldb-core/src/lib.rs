@@ -91,7 +91,10 @@ pub use catalog::{
     MaterializedViewEntry,
 };
 pub use catalog_cmds::{required_permission, CatalogCommand, CatalogCommandRecord, CatalogDelta};
-pub use certification::{CertificationManifest, CertificationStatus, CertificationTest};
+pub use certification::{
+    ArchitectureQualification, ArchitectureStatus, CertificationManifest, CertificationStatus,
+    CertificationTest,
+};
 pub use cluster_import::{
     cluster_import_prepare, hash_rows_canonical, ImportPlan, ImportTablePlan,
 };
