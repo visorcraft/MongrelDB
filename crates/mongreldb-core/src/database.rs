@@ -3112,7 +3112,7 @@ impl Database {
         loop {
             match f.try_lock_exclusive() {
                 Ok(()) => return Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(e) if Self::is_file_lock_contended(&e) => {
                     if !recorded_wait {
                         DATABASE_OPEN_WAIT_COUNT.fetch_add(1, Ordering::Relaxed);
                         recorded_wait = true;
@@ -3136,6 +3136,20 @@ impl Database {
                 Err(e) => return Err(e),
             }
         }
+    }
+
+    fn is_file_lock_contended(error: &std::io::Error) -> bool {
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            return true;
+        }
+        #[cfg(windows)]
+        {
+            // LockFileEx reports ERROR_LOCK_VIOLATION without mapping it to
+            // ErrorKind::WouldBlock.
+            return error.raw_os_error() == Some(33);
+        }
+        #[cfg(not(windows))]
+        false
     }
 
     #[allow(clippy::too_many_arguments)]
