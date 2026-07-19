@@ -9,10 +9,17 @@ on:
       - "crates/mongreldb-ffi/**"
       - "crates/mongreldb-kit-ffi/**"
       - "crates/mongreldb-jni/**"
-      - "crates/mongreldb-core/**"
-      - "crates/mongreldb-query/**"
-      - "crates/mongreldb-types/**"
-      - "crates/mongreldb-log/**"
+      - "Cargo.toml"
+      - "crates/mongreldb-core/src/**"
+      - "crates/mongreldb-core/Cargo.toml"
+      - "crates/mongreldb-core/build.rs"
+      - "crates/mongreldb-query/src/**"
+      - "crates/mongreldb-query/Cargo.toml"
+      - "crates/mongreldb-query/build.rs"
+      - "crates/mongreldb-types/src/**"
+      - "crates/mongreldb-types/Cargo.toml"
+      - "crates/mongreldb-log/src/**"
+      - "crates/mongreldb-log/Cargo.toml"
   pull_request:
     branches: [master]
     paths:
@@ -21,10 +28,17 @@ on:
       - "crates/mongreldb-ffi/**"
       - "crates/mongreldb-kit-ffi/**"
       - "crates/mongreldb-jni/**"
-      - "crates/mongreldb-core/**"
-      - "crates/mongreldb-query/**"
-      - "crates/mongreldb-types/**"
-      - "crates/mongreldb-log/**"
+      - "Cargo.toml"
+      - "crates/mongreldb-core/src/**"
+      - "crates/mongreldb-core/Cargo.toml"
+      - "crates/mongreldb-core/build.rs"
+      - "crates/mongreldb-query/src/**"
+      - "crates/mongreldb-query/Cargo.toml"
+      - "crates/mongreldb-query/build.rs"
+      - "crates/mongreldb-types/src/**"
+      - "crates/mongreldb-types/Cargo.toml"
+      - "crates/mongreldb-log/src/**"
+      - "crates/mongreldb-log/Cargo.toml"
 
 concurrency:
   group: bindings-${{ github.ref }}
