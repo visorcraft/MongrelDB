@@ -23,8 +23,6 @@ jobs:
     defaults:
       run:
         shell: bash --noprofile --norc -eo pipefail {0}
-    permissions:
-      contents: write
     env:
       QUAL_DIR: /tmp/mongreldb-qualification
       CARGO_TARGET_DIR: ${{ github.workspace }}/target-qualification
@@ -48,6 +46,10 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2.9.1
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          key: release-qualification-main
       - uses: actions/setup-node@v6
         with:
           node-version: 24
@@ -71,6 +73,8 @@ jobs:
         run: python3 scripts/run-certification-command.py "$QUAL_DIR/cargo-clippy.log" cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Root tests
         run: python3 scripts/run-certification-command.py "$QUAL_DIR/cargo-test.log" cargo test --workspace --all-features
+      - name: Crash recovery matrix
+        run: python3 scripts/run-certification-command.py "$QUAL_DIR/crash-matrix.log" cargo test -p mongreldb-core --test fault_injection --test crash --test crash_process
       - name: Root release tests
         run: python3 scripts/run-certification-command.py "$QUAL_DIR/cargo-test-release.log" cargo test --workspace --release --all-features
       - name: Reclaim debug intermediates
@@ -108,18 +112,6 @@ jobs:
           npm run build 2>&1 | tee "$QUAL_DIR/node-build.log"
           python3 "$GITHUB_WORKSPACE/scripts/run-certification-command.py" "$QUAL_DIR/node-test.log" npm test
           python3 "$GITHUB_WORKSPACE/scripts/run-certification-command.py" "$QUAL_DIR/node-smoke.log" node smoke.mjs
-      - name: Reclaim before release FFI builds
-        run: |
-          rm -rf "$CARGO_TARGET_DIR/debug" || true
-          df -h
-      - name: FFI checks
-        run: |
-          cargo build --manifest-path crates/mongreldb-ffi/Cargo.toml --release 2>&1 | tee "$QUAL_DIR/ffi-build.log"
-          python3 scripts/run-certification-command.py "$QUAL_DIR/ffi-test.log" cargo test --manifest-path crates/mongreldb-ffi/Cargo.toml --release
-          python3 scripts/run-certification-command.py "$QUAL_DIR/ffi-sanitizer.log" env MONGRELDB_C_SANITIZE=1 cargo test --manifest-path crates/mongreldb-ffi/Cargo.toml --release --test c_smoke_test
-          cargo build --manifest-path crates/mongreldb-kit-ffi/Cargo.toml --release 2>&1 | tee "$QUAL_DIR/kit-ffi-build.log"
-          python3 scripts/run-certification-command.py "$QUAL_DIR/kit-ffi-test.log" cargo test --manifest-path crates/mongreldb-kit-ffi/Cargo.toml --release
-          python3 scripts/run-certification-command.py "$QUAL_DIR/jni-build.log" cargo build --manifest-path crates/mongreldb-jni/Cargo.toml --release
       - name: Python MinHash wire fixture
         run: |
           cargo build --manifest-path crates/mongreldb-server/Cargo.toml --release > "$QUAL_DIR/ai-wire-server.log" 2>&1
@@ -161,14 +153,93 @@ jobs:
           # shellcheck disable=SC2016
           python3 scripts/run-certification-command.py "$QUAL_DIR/fuzz-smoke.log" \
             bash -c 'cd fuzz && for target in protocol_envelope wal consensus_snapshot cursor_token sql_adapter_packet; do cargo +"$RUST_NIGHTLY" fuzz run "$target" -- -max_total_time=10; done'
-      - name: Crash recovery matrix
-        run: python3 scripts/run-certification-command.py "$QUAL_DIR/crash-matrix.log" cargo test -p mongreldb-core --test fault_injection --test crash --test crash_process
-      - name: Create certification manifest
+      - name: Package release candidates
         run: |
           tar \
             --exclude=deps --exclude=build --exclude=incremental --exclude=examples \
             -C "$CARGO_TARGET_DIR/release" \
             -czf "$QUAL_DIR/qualified-artifacts.tar.gz" .
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: mongreldb-qualification-main-${{ github.sha }}
+          path: /tmp/mongreldb-qualification/
+
+  ffi:
+    name: FFI checks (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - binding: c
+            name: C FFI
+            crate: mongreldb-ffi
+          - binding: kit
+            name: Kit FFI
+            crate: mongreldb-kit-ffi
+          - binding: jni
+            name: JNI
+            crate: mongreldb-jni
+    env:
+      QUAL_DIR: /tmp/mongreldb-qualification
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target-qualification
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2.9.1
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          key: release-qualification-${{ matrix.binding }}
+          workspaces: crates/${{ matrix.crate }}
+      - name: C FFI tests
+        if: matrix.binding == 'c'
+        run: |
+          python3 scripts/run-certification-command.py "$QUAL_DIR/ffi-test.log" cargo test --manifest-path crates/mongreldb-ffi/Cargo.toml --release
+          python3 scripts/run-certification-command.py "$QUAL_DIR/ffi-sanitizer.log" env MONGRELDB_C_SANITIZE=1 cargo test --manifest-path crates/mongreldb-ffi/Cargo.toml --release --test c_smoke_test
+          cp "$CARGO_TARGET_DIR/release/libmongreldb.so" "$QUAL_DIR/"
+      - name: Kit FFI tests
+        if: matrix.binding == 'kit'
+        run: |
+          cargo build --manifest-path crates/mongreldb-kit-ffi/Cargo.toml --release
+          python3 scripts/run-certification-command.py "$QUAL_DIR/kit-ffi-test.log" cargo test --manifest-path crates/mongreldb-kit-ffi/Cargo.toml --release
+      - name: JNI build
+        if: matrix.binding == 'jni'
+        run: python3 scripts/run-certification-command.py "$QUAL_DIR/jni-build.log" cargo build --manifest-path crates/mongreldb-jni/Cargo.toml --release
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: mongreldb-qualification-${{ matrix.binding }}-${{ github.sha }}
+          path: /tmp/mongreldb-qualification/
+
+  certification:
+    name: Certification evidence
+    needs: [qualification, ffi]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      QUAL_DIR: /tmp/mongreldb-qualification
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: mongreldb-qualification-*-${{ github.sha }}
+          path: /tmp/mongreldb-qualification/
+          merge-multiple: true
+      - name: Create certification manifest
+        run: |
+          artifact_dir="$RUNNER_TEMP/qualified-artifacts"
+          mkdir -p "$artifact_dir"
+          tar -xzf "$QUAL_DIR/qualified-artifacts.tar.gz" -C "$artifact_dir"
+          cp "$QUAL_DIR/libmongreldb.so" "$artifact_dir/"
+          tar -C "$artifact_dir" -czf "$QUAL_DIR/qualified-artifacts.tar.gz" .
           python3 scripts/run-certification-command.py "$QUAL_DIR/packaged-artifact-test.log" \
             bash scripts/qualify-packaged-artifacts.sh "$QUAL_DIR/qualified-artifacts.tar.gz" "$GITHUB_WORKSPACE"
           python3 scripts/generate-certification-manifest.py \
@@ -177,7 +248,6 @@ jobs:
             --output "$QUAL_DIR/certification-manifest.json" \
             --commit "$GITHUB_SHA"
       - uses: actions/upload-artifact@v7
-        if: always()
         with:
           name: mongreldb-clean-qualification-${{ github.sha }}
           path: /tmp/mongreldb-qualification/
