@@ -15141,6 +15141,12 @@ impl Database {
         let checkpoint = self.checkpoint_catalog_after_durable(next_catalog);
         self.finish_durable_publish(maintenance_epoch, &mut epoch_guard, &receipt, checkpoint)?;
 
+        // Release DOCTOR's own table guards and handle clones before moving
+        // the directory. Windows refuses to rename files held open by the
+        // final mounted Table instance.
+        drop(table_guards);
+        drop(handles);
+
         // The catalog drop is durable. Directory placement is secondary but
         // still uses a write-through rename. A failure reports the known
         // catalog outcome and leaves a harmless orphan under `tables/`.
