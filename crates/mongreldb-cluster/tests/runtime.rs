@@ -452,13 +452,23 @@ async fn three_node_runtime_cluster_end_to_end() {
     .await;
 
     // The meta descriptor reflects the tablet and its replicas.
-    let published = node1
-        .meta_group()
-        .unwrap()
-        .state()
-        .tablet(tablet_id)
-        .unwrap()
-        .clone();
+    let deadline = std::time::Instant::now() + LEADER_TIMEOUT;
+    let published = loop {
+        if let Some(published) = node1
+            .meta_group()
+            .unwrap()
+            .state()
+            .tablet(tablet_id)
+            .cloned()
+        {
+            break published;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "tablet descriptor did not reach node 1"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
     assert_eq!(published, tablet);
     assert_eq!(published.replicas.len(), 3);
 
