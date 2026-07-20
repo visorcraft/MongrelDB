@@ -63,7 +63,7 @@ jobs:
       jni: ${{ steps.filter.outputs.jni }}
     steps:
       - uses: actions/checkout@v7
-      - uses: dorny/paths-filter@v3
+      - uses: dorny/paths-filter@v4
         id: filter
         with:
           filters: |
@@ -105,7 +105,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.1
         with:
           workspaces: crates/mongreldb-node
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
       - run: npm ci
