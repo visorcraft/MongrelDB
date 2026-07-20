@@ -148,16 +148,13 @@ jobs:
         working-directory: .
         run: |
           mkdir -p dist/mongreldb-native/lib dist/mongreldb-native/include
-          # Copy the shared and static libs, stripping the target dir prefix.
-          cp crates/mongreldb-ffi/target/${{ matrix.target }}/release/libmongreldb.so \
-             crates/mongreldb-ffi/target/${{ matrix.target }}/release/libmongreldb.a \
-             dist/mongreldb-native/lib/ 2>/dev/null || true
-          cp crates/mongreldb-ffi/target/${{ matrix.target }}/release/libmongreldb.dylib \
-             crates/mongreldb-ffi/target/${{ matrix.target }}/release/libmongreldb.a \
-             dist/mongreldb-native/lib/ 2>/dev/null || true
+          cp target/${{ matrix.target }}/release/libmongreldb.a dist/mongreldb-native/lib/
+          if [ -f target/${{ matrix.target }}/release/libmongreldb.so ]; then
+            cp target/${{ matrix.target }}/release/libmongreldb.so dist/mongreldb-native/lib/
+          else
+            cp target/${{ matrix.target }}/release/libmongreldb.dylib dist/mongreldb-native/lib/
+          fi
           cp crates/mongreldb-ffi/include/mongreldb.h dist/mongreldb-native/include/
-          # Also copy the staticlib under a .lib alias for MSVC consumers who
-          # grab the cross-compiled archive (harmless on non-Windows).
           tar -czf dist/${{ matrix.archive }} -C dist mongreldb-native
 
       - name: Package (Windows)
@@ -166,13 +163,11 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist/mongreldb-native/lib dist/mongreldb-native/include
-          cp crates/mongreldb-ffi/target/${{ matrix.target }}/release/mongreldb.dll \
-             crates/mongreldb-ffi/target/${{ matrix.target }}/release/mongreldb.dll.lib \
-             dist/mongreldb-native/lib/ 2>/dev/null || true
-          cp crates/mongreldb-ffi/target/${{ matrix.target }}/release/mongreldb.dll.lib \
-             dist/mongreldb-native/lib/mongreldb.lib 2>/dev/null || true
-          cp crates/mongreldb-ffi/target/${{ matrix.target }}/release/libmongreldb.a \
-             dist/mongreldb-native/lib/ 2>/dev/null || true
+          cp target/${{ matrix.target }}/release/mongreldb.dll \
+             target/${{ matrix.target }}/release/mongreldb.dll.lib \
+             dist/mongreldb-native/lib/
+          cp target/${{ matrix.target }}/release/mongreldb.dll.lib \
+             dist/mongreldb-native/lib/mongreldb.lib
           cp crates/mongreldb-ffi/include/mongreldb.h dist/mongreldb-native/include/
           (cd dist && 7z a ${{ matrix.archive }} mongreldb-native)
 
@@ -262,12 +257,15 @@ jobs:
         working-directory: .
         run: |
           mkdir -p dist/mongreldb-kit-native/lib dist/mongreldb-kit-native/include
-          cp crates/mongreldb-kit-ffi/target/${{ matrix.target }}/release/libmongreldb_kit.so \
-             crates/mongreldb-kit-ffi/target/${{ matrix.target }}/release/libmongreldb_kit.a \
-             dist/mongreldb-kit-native/lib/ 2>/dev/null || true
-          cp crates/mongreldb-kit-ffi/target/${{ matrix.target }}/release/libmongreldb_kit.dylib \
-             crates/mongreldb-kit-ffi/target/${{ matrix.target }}/release/libmongreldb_kit.a \
-             dist/mongreldb-kit-native/lib/ 2>/dev/null || true
+          cp crates/mongreldb-kit-ffi/target/${{ matrix.target }}/release/libmongreldb_kit.a \
+             dist/mongreldb-kit-native/lib/
+          if [ -f crates/mongreldb-kit-ffi/target/${{ matrix.target }}/release/libmongreldb_kit.so ]; then
+            cp crates/mongreldb-kit-ffi/target/${{ matrix.target }}/release/libmongreldb_kit.so \
+               dist/mongreldb-kit-native/lib/
+          else
+            cp crates/mongreldb-kit-ffi/target/${{ matrix.target }}/release/libmongreldb_kit.dylib \
+               dist/mongreldb-kit-native/lib/
+          fi
           cp crates/mongreldb-kit-ffi/include/mongreldb_kit.h dist/mongreldb-kit-native/include/
           tar -czf dist/${{ matrix.archive }} -C dist mongreldb-kit-native
 
@@ -279,9 +277,9 @@ jobs:
           mkdir -p dist/mongreldb-kit-native/lib dist/mongreldb-kit-native/include
           cp crates/mongreldb-kit-ffi/target/${{ matrix.target }}/release/mongreldb_kit.dll \
              crates/mongreldb-kit-ffi/target/${{ matrix.target }}/release/mongreldb_kit.dll.lib \
-             dist/mongreldb-kit-native/lib/ 2>/dev/null || true
+             dist/mongreldb-kit-native/lib/
           cp crates/mongreldb-kit-ffi/target/${{ matrix.target }}/release/mongreldb_kit.dll.lib \
-             dist/mongreldb-kit-native/lib/mongreldb_kit.lib 2>/dev/null || true
+             dist/mongreldb-kit-native/lib/mongreldb_kit.lib
           cp crates/mongreldb-kit-ffi/include/mongreldb_kit.h dist/mongreldb-kit-native/include/
           (cd dist && 7z a ${{ matrix.archive }} mongreldb-kit-native)
 
