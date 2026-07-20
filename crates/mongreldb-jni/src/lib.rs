@@ -18,7 +18,7 @@
 //! The handle uses `Rc<RefCell>` (single-threaded). Each thread should create
 //! its own `NativeDB` instance. Cross-thread sharing requires a `Mutex`.
 
-use jni::objects::{JClass, JObject, JString, JValue};
+use jni::objects::{JClass, JObject, JString, JThrowable, JValue};
 use jni::sys::{jbyteArray, jlong, jstring};
 use jni::JNIEnv;
 use mongreldb_kit::Database as KitDatabase;
@@ -113,7 +113,7 @@ fn throw_query_exception(env: &mut JNIEnv, message: &str, category: ErrorCategor
                 JValue::Int(category.code() as i32),
             ],
         )?;
-        env.throw(obj)?;
+        env.throw(JThrowable::from(obj))?;
         Ok(())
     })();
     if ok.is_err() {
