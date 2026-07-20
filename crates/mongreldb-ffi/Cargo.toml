@@ -21,6 +21,8 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 mongreldb-core = { path = "../mongreldb-core", version = "0.60.3" }
+# Stable 20-category taxonomy (FND-007) for structural binding surfaces.
+mongreldb-types = { path = "../mongreldb-types", version = "0.60.3" }
 # SQL execution (DataFusion) lives in mongreldb-query, not core. The FFI
 # drives it through an internal tokio runtime, mirroring mongreldb-kit and
 # the NAPI addon.

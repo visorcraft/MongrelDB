@@ -61,10 +61,18 @@
 //!   rotation phase is durable, in `KeyRotationPhase` declaration order;
 //!   crash-resume tests arm these.
 //!
-//! Reserved for later waves (do not instrument yet):
+//! Transaction prepare and decision (instrumented in `mongreldb-core` single-
+//! node commit and `mongreldb-cluster` distributed 2PC):
 //!
-//! - `txn.prepare.before` / `txn.prepare.after`
-//! - `txn.decision.before` / `txn.decision.after`
+//! - `txn.prepare.before` / `txn.prepare.after` — bracket entry into the
+//!   prepare state (single-node `Preparing`, or durable participant prepare
+//!   in 2PC). `before` aborts before prepare becomes public/durable;
+//!   `after` fires once prepare has been entered.
+//! - `txn.decision.before` / `txn.decision.after` — bracket the durable
+//!   commit/abort decision (single-node enter `CommitCritical` → published
+//!   `Committed` receipt, or 2PC coordinator `Commit`/`Abort` proposal).
+//!   `before` aborts before the decision can become durable; `after` fires
+//!   only after the decision is durable and must not undo it.
 //!
 //! # Test coordination
 //!

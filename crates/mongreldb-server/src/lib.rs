@@ -36,8 +36,10 @@ use serde_json::json;
 use sha2::Digest;
 use zeroize::Zeroizing;
 
+mod admission;
 mod audit;
 pub mod cluster_admin;
+pub mod cluster_runtime;
 mod kit;
 mod metrics;
 pub mod native;
@@ -98,6 +100,11 @@ fn status_for_error(e: &mongreldb_core::MongrelError) -> StatusCode {
         MongrelError::NotFound(_) => StatusCode::NOT_FOUND,
         MongrelError::DeadlineExceeded => StatusCode::GATEWAY_TIMEOUT,
         MongrelError::WorkBudgetExceeded => StatusCode::TOO_MANY_REQUESTS,
+        // Admission overflow (scheduler queue / tenant quota) and similar
+        // hard resource caps: fail closed with 503 (ResourceExhausted).
+        MongrelError::ResourceLimitExceeded { .. } | MongrelError::Full(_) => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
         MongrelError::Cancelled => client_closed_request_status(),
         MongrelError::CursorStale(_) => StatusCode::CONFLICT,
         MongrelError::CursorExpired => StatusCode::GONE,
@@ -228,6 +235,7 @@ struct AppState {
     /// Bounded projected results retained for stable SQL continuation cursors.
     sql_pages: sql_pages::SqlPageStore,
     /// Admission control for ordinary SQL, separate from AI workers.
+    /// Outer node hard cap; hierarchical scheduler enforces fairness inside.
     sql_semaphore: Arc<tokio::sync::Semaphore>,
     /// Admission control for retained-page work. Never competes with SQL.
     sql_page_semaphore: Arc<tokio::sync::Semaphore>,
@@ -244,8 +252,9 @@ struct AppState {
     reloadable: Arc<ReloadableConfig>,
     /// Graceful-drain coordination and last-outcome record (§10.7).
     drain: Arc<DrainControl>,
-    /// Stage 4 hierarchical scheduler (admission fairness / tenant quotas).
-    scheduler: std::sync::Mutex<mongreldb_core::HierarchicalScheduler>,
+    /// Stage 4 hierarchical scheduler bridge (class/tenant admission; S1E-002).
+    /// Outer bound remains `sql_semaphore`; this enforces fairness inside it.
+    scheduler: admission::SchedulerAdmission,
     /// Stage 4 node memory governor (cross-tablet pressure actions).
     node_governor: std::sync::Mutex<mongreldb_core::NodeMemoryGovernor>,
     /// Stage 4 AI index generation registry (readiness/routing metadata).
@@ -261,6 +270,11 @@ struct AppState {
     /// Empty by default — application-supplied vectors and sparse retrieval
     /// need no vendor.
     embedding_providers: mongreldb_core::EmbeddingProviderRegistry,
+    /// Live cluster node runtime when the operator enabled cluster mode
+    /// (`--cluster-node-data` / `MONGRELDB_CLUSTER_NODE_DATA`). Standalone
+    /// servers leave this `None`; admin SQL that needs live groups then
+    /// fails closed.
+    cluster_runtime: Option<cluster_runtime::ClusterRuntimeHandle>,
 }
 
 /// A `Duration` config value (millisecond granularity) that
@@ -528,6 +542,8 @@ pub struct ServerControl {
     db: Arc<Database>,
     audit: Arc<audit::AuditLog>,
     sql_idempotency: Arc<sql_idempotency::SqlIdempotencyStore>,
+    /// Live cluster runtime (same handle as `AppState`); shut down after SQL.
+    cluster_runtime: Option<cluster_runtime::ClusterRuntimeHandle>,
 }
 
 impl ServerControl {
@@ -565,7 +581,19 @@ impl ServerControl {
         }
         let stuck = stuck_queries.len();
         self.metrics.add_sql_stuck_after_cancel(stuck);
+        if let Some(runtime) = &self.cluster_runtime {
+            if let Err(error) = runtime.shutdown().await {
+                eprintln!("[cluster-runtime] shutdown error: {error}");
+            } else {
+                eprintln!("[cluster-runtime] shutdown complete");
+            }
+        }
         stuck
+    }
+
+    /// Live cluster runtime handle when the daemon started in cluster mode.
+    pub fn cluster_runtime(&self) -> Option<&cluster_runtime::ClusterRuntimeHandle> {
+        self.cluster_runtime.as_ref()
     }
 
     /// Re-read the environment-driven mutable subset of server configuration
@@ -666,6 +694,31 @@ pub fn build_app_with_sessions_and_control(
     user_auth: bool,
     sessions: Arc<sessions::SessionStore>,
 ) -> (axum::Router, ServerControl) {
+    build_app_with_sessions_control_and_cluster(
+        db,
+        external_modules,
+        auth_token,
+        max_connections,
+        user_auth,
+        sessions,
+        None,
+    )
+}
+
+/// Build the daemon router with an optional live [`cluster_runtime::ClusterRuntimeHandle`].
+///
+/// Used by the product cluster path (`--cluster-node-data`) and by tests that
+/// assert admin SQL against a started `NodeRuntime`. Standalone callers pass
+/// `None` (or use [`build_app_with_sessions_and_control`]).
+pub fn build_app_with_sessions_control_and_cluster(
+    db: Arc<Database>,
+    external_modules: impl IntoIterator<Item = Arc<dyn ExternalTableModule>>,
+    auth_token: Option<String>,
+    max_connections: Option<usize>,
+    user_auth: bool,
+    sessions: Arc<sessions::SessionStore>,
+    cluster_runtime: Option<cluster_runtime::ClusterRuntimeHandle>,
+) -> (axum::Router, ServerControl) {
     db.set_replication_wal_retention_segments(default_replication_wal_segments());
     if let Err(error) = db.set_history_retention_epochs(default_history_retention_epochs()) {
         eprintln!("[history] failed to configure retention: {error}");
@@ -717,7 +770,11 @@ pub fn build_app_with_sessions_and_control(
         db: Arc::clone(&db),
         audit: Arc::clone(&audit),
         sql_idempotency: Arc::clone(&sql_idempotency),
+        cluster_runtime: cluster_runtime.clone(),
     };
+    // Share the database MemoryGovernor so evaluate sees live reservations
+    // and EvictCaches drives the same reclaimable page caches (S4B).
+    let node_memory_governor = db.memory_governor().clone();
     let state = Arc::new(AppState {
         idem: kit::IdempotencyStore::new_with_integrity(
             idempotency_root,
@@ -762,12 +819,14 @@ pub fn build_app_with_sessions_and_control(
         cursor_mac_key: CursorMacKey::default(),
         reloadable,
         drain: Arc::new(DrainControl::default()),
-        scheduler: std::sync::Mutex::new(mongreldb_core::HierarchicalScheduler::new()),
+        // Class configs seeded from resource-group defaults; env may tighten
+        // InteractiveSql max_queue / max_concurrency for tests/operators.
+        scheduler: {
+            let groups = mongreldb_core::ResourceGroupRegistry::with_defaults();
+            admission::SchedulerAdmission::from_resource_groups(&groups)
+        },
         node_governor: std::sync::Mutex::new(mongreldb_core::NodeMemoryGovernor::new(
-            mongreldb_core::MemoryGovernor::new(mongreldb_core::GovernorConfig::new(
-                12 * 1024 * 1024 * 1024,
-            ))
-            .expect("default node memory governor config"),
+            node_memory_governor,
         )),
         ai_generations: std::sync::Mutex::new(mongreldb_core::AiIndexGenerationRegistry::new()),
         multi_region: std::sync::Mutex::new(
@@ -776,6 +835,7 @@ pub fn build_app_with_sessions_and_control(
         ops_jobs: std::sync::Mutex::new(mongreldb_core::OpsJobStore::new()),
         resource_groups: mongreldb_core::ResourceGroupRegistry::with_defaults(),
         embedding_providers: mongreldb_core::EmbeddingProviderRegistry::new(),
+        cluster_runtime,
     });
     let router = axum::Router::new()
         .route("/health", get(health))
@@ -5307,20 +5367,96 @@ fn register_controlled_query(
     Err(error)
 }
 
+/// Acquire outer node semaphore + hierarchical class admission for interactive SQL.
+///
+/// Choice (S1E-002): `sql_semaphore` is the absolute node hard cap; the
+/// hierarchical scheduler enforces class/tenant fairness inside that bound.
+/// QueueFull / TenantQuota map to ResourceExhausted (HTTP 503). Cancel while
+/// waiting cancels the scheduler work id. RAII complete frees class slots.
+///
+/// S4B: best-effort node governor evaluate runs before admission so
+/// `ReduceAdmission` / cache eviction take effect under pressure.
 async fn acquire_sql_permit(
     state: &AppState,
     session: &MongrelSession,
     query: &RegisteredSqlQuery,
-) -> std::result::Result<tokio::sync::OwnedSemaphorePermit, mongreldb_query::MongrelQueryError> {
+) -> std::result::Result<admission::SqlAdmissionGuard, mongreldb_query::MongrelQueryError> {
+    refresh_node_pressure(state);
+
     session.fire_test_hook(mongreldb_query::SqlTestHookPoint::WaitingForSqlPermit);
-    tokio::select! {
+
+    // Outer node hard cap.
+    let permit = tokio::select! {
         permit = Arc::clone(&state.sql_semaphore).acquire_owned() => permit.map_err(|_| {
             mongreldb_query::MongrelQueryError::InvalidQueryState(
                 "SQL admission semaphore closed".into(),
             )
-        }),
-        _ = query.control().cancelled() => Err(cancellation_checkpoint_error(query)),
-    }
+        })?,
+        _ = query.control().cancelled() => {
+            return Err(cancellation_checkpoint_error(query));
+        }
+    };
+
+    let class = mongreldb_core::WorkloadClass::InteractiveSql;
+    let priority = admission::priority_for_class(&state.resource_groups, class);
+    let types_query_id = mongreldb_types::ids::QueryId::from_bytes(*query.id().as_bytes());
+
+    // Class-aware admission with oneshot waiters (no poll stealing).
+    let work = match state
+        .scheduler
+        .submit_and_wait(
+            admission::AdmitRequest {
+                tenant: "default",
+                class,
+                priority,
+                deadline: None,
+                query_id: Some(types_query_id),
+                tag: "sql",
+            },
+            query.control().cancelled(),
+        )
+        .await
+    {
+        Ok(work) => work,
+        Err(admission::AdmitError::Rejected(error)) => {
+            return Err(admission::scheduler_error_to_query(error));
+        }
+        Err(admission::AdmitError::Cancelled) => {
+            return Err(cancellation_checkpoint_error(query));
+        }
+        Err(admission::AdmitError::PressureRejected { resource }) => {
+            return Err(admission::admit_error_to_query(
+                admission::AdmitError::PressureRejected { resource },
+            ));
+        }
+    };
+
+    Ok(admission::SqlAdmissionGuard::new(permit, work))
+}
+
+/// Best-effort S4B evaluate: live DB reservations, AI semaphore saturation,
+/// optional process RSS. Poisoned locks / missing metrics never fail the request.
+fn refresh_node_pressure(state: &AppState) {
+    let Ok(mut governor) = state.node_governor.lock() else {
+        return;
+    };
+    let db_gov = state.db.memory_governor();
+    let ai_capacity = default_ai_max_concurrent();
+    let inputs = admission::build_pressure_inputs(&admission::PressureInputSources {
+        db_reserved_bytes: db_gov.total_used(),
+        db_max_bytes: db_gov.max_bytes(),
+        node_configured_max_bytes: governor.governor.max_bytes(),
+        tablet_reserved_bytes: governor.tablet_reserved_bytes(),
+        ai_capacity,
+        ai_available: state.ai_semaphore.available_permits(),
+        process_rss_bytes: admission::process_rss_bytes(),
+    });
+    admission::refresh_pressure(
+        &mut governor,
+        &inputs,
+        &state.scheduler,
+        Some(db_gov),
+    );
 }
 
 fn caller_may_manage_query(
@@ -6717,7 +6853,7 @@ async fn execute_sql(
     request: ResolvedSqlRequest,
     query: RegisteredSqlQuery,
     query_id: QueryId,
-    sql_permit: tokio::sync::OwnedSemaphorePermit,
+    sql_permit: admission::SqlAdmissionGuard,
 ) -> (Response, Option<mongreldb_types::hlc::HlcTimestamp>) {
     let ResolvedSqlRequest {
         request: req,
@@ -6728,7 +6864,7 @@ async fn execute_sql(
     // §15 admin SQL surface: intercept before the ordinary SQL path so
     // SHOW CLUSTER / ALTER NODE DRAIN / … never open tablet files from the
     // query gateway (spec §12.10 / §15).
-    if let Some(response) = cluster_admin::try_admin_sql(state, principal, &req.sql) {
+    if let Some(response) = cluster_admin::try_admin_sql(state, principal, &req.sql).await {
         drop(sql_permit);
         return (response, None);
     }
@@ -7110,7 +7246,7 @@ fn sql_arrow_stream_response(batches: mongreldb_query::MongrelRecordBatchStream)
 fn sql_arrow_stream_response_controlled(
     batches: mongreldb_query::MongrelRecordBatchStream,
     completion: SqlStreamCompletion,
-    sql_permit: tokio::sync::OwnedSemaphorePermit,
+    sql_permit: admission::SqlAdmissionGuard,
     limits: (usize, usize),
     state: &AppState,
     query_id: QueryId,

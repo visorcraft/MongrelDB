@@ -109,6 +109,16 @@ where
         + Send
         + 'static,
 {
+    // S4B: evaluate node pressure and refuse AI work under RejectOversizedAi.
+    crate::refresh_node_pressure(&state);
+    if let Err(error) = state.scheduler.check_ai_admitted() {
+        let resource = match error {
+            crate::admission::AdmitError::PressureRejected { resource } => resource,
+            _ => "ai_memory_pressure",
+        };
+        return Err(crate::admission::pressure_reject_to_core(resource));
+    }
+
     let started = std::time::Instant::now();
     let permit = tokio::time::timeout(timeout, state.ai_semaphore.clone().acquire_owned())
         .await

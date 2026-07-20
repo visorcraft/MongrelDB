@@ -67,7 +67,8 @@ pub mod value;
 // Error accessors.
 pub use error::{
     mongreldb_error_details_v1, mongreldb_free_error_string, mongreldb_last_error,
-    mongreldb_last_error_code, mongreldb_last_error_details_v1,
+    mongreldb_last_error_category, mongreldb_last_error_category_code, mongreldb_last_error_code,
+    mongreldb_last_error_details_v1,
 };
 
 // String free.

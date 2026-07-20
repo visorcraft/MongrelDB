@@ -411,9 +411,19 @@ typedef struct {
 const char *mongreldb_last_error(void);
 int32_t mongreldb_last_error_code(void);
 
+/* Stable Stage 0 error taxonomy (FND-007 / spec 9.7). category_code is in
+ * 1..=20 and is NEVER reused, even if a category is retired. Prefer these
+ * over parsing mongreldb_last_error() message text. */
+uint32_t mongreldb_last_error_category_code(void);
+/* Display name (e.g. "permission denied"); owned by the FFI layer, valid
+ * until the next mongreldb call on this thread. NULL when unset. */
+const char *mongreldb_last_error_category(void);
+
 /* Structured error metadata. Text fields are always NUL-terminated. Check
  * outcome_known before treating committed=0 as proof that no write occurred.
- * The struct is copied from thread-local storage and remains owned by caller. */
+ * The struct is copied from thread-local storage and remains owned by caller.
+ * category_code / category_name are additive taxonomy fields (0 / empty when
+ * no mapping is available). */
 typedef struct mongreldb_error_details_v1 {
     size_t struct_size;
     uint32_t version;
@@ -435,6 +445,9 @@ typedef struct mongreldb_error_details_v1 {
     int32_t cancellation_reason;
     char query_id[33];
     char server_state[32];
+    /* Taxonomy: 1..=20, or 0 when unset. Codes are never reused. */
+    uint32_t category_code;
+    char category_name[32];
 } mongreldb_error_details_v1;
 
 int32_t mongreldb_last_error_details_v1(

@@ -19,8 +19,8 @@ use mongreldb_protocol::native_transport::{
 };
 use mongreldb_server::vault_kms::{VaultTransitConfig, VaultTransitKeyManagementProvider};
 use mongreldb_server::{
-    build_app_with_sessions_and_control, cluster_admin, spawn_auto_compactor, spawn_session_reaper,
-    SessionStore,
+    build_app_with_sessions_control_and_cluster, cluster_admin, cluster_runtime,
+    spawn_auto_compactor, spawn_session_reaper, SessionStore,
 };
 use mongreldb_server::{native::NativeExternalAuth, oidc::HttpsJwksProvider};
 use mongreldb_types::ids::{ClusterId, NodeId};
@@ -56,6 +56,10 @@ struct Args {
     vault_ca_certificate: Option<String>,
     daemon: bool,
     pidfile: Option<String>,
+    /// When set, start a live cluster [`NodeRuntime`] from this node-data dir.
+    cluster_node_data: Option<String>,
+    /// Optional cluster RPC listen address (`host:port`).
+    cluster_rpc_listen: Option<String>,
 }
 
 const DEFAULT_PORT: u16 = 8453;
@@ -92,6 +96,11 @@ OPTIONS:
     --vault-ca-cert <path>      Additional Vault CA certificate
     --daemon                    Fork into the background (daemonize)
     --pidfile <path>            PID file path (default: <db_dir>/mongreldb.pid)
+    --cluster-node-data <dir>   Enable cluster mode: start NodeRuntime from this
+                                provisioned node-data directory (after
+                                `cluster init` / `cluster join`)
+    --cluster-rpc-listen <addr> Cluster raft RPC listen address (host:port;
+                                default 127.0.0.1:17443 or env)
     -h, --help                  Print this help message
 
 SUBCOMMANDS (one-shot; they do not start the daemon):
@@ -105,6 +114,10 @@ ENVIRONMENT:
     MONGRELDB_DB_PASSWORD       Database-handle password (set with DB_USERNAME)
     MONGRELDB_VAULT_TOKEN       Vault token, removed from environment at startup
     MONGRELDB_VAULT_NAMESPACE   Optional Vault Enterprise namespace
+    MONGRELDB_CLUSTER_NODE_DATA Same as --cluster-node-data
+    MONGRELDB_CLUSTER_RPC_LISTEN Same as --cluster-rpc-listen
+    MONGRELDB_CLUSTER_PLAINTEXT_TEST=1
+                                Test-only: plaintext cluster transport (NON-PRODUCTION)
 ";
 
 struct DatabaseCredentials {
@@ -285,6 +298,8 @@ fn parse_args() -> Result<Args, String> {
     let mut vault_ca_certificate = None;
     let mut daemon = false;
     let mut pidfile: Option<String> = None;
+    let mut cluster_node_data: Option<String> = None;
+    let mut cluster_rpc_listen: Option<String> = None;
 
     // Skip the program name (raw[0]).
     let mut i = 1;
@@ -440,6 +455,20 @@ fn parse_args() -> Result<Args, String> {
                 pidfile = Some(v.clone());
                 i += 2;
             }
+            "--cluster-node-data" => {
+                let v = raw
+                    .get(i + 1)
+                    .ok_or("--cluster-node-data requires a value")?;
+                cluster_node_data = Some(v.clone());
+                i += 2;
+            }
+            "--cluster-rpc-listen" => {
+                let v = raw
+                    .get(i + 1)
+                    .ok_or("--cluster-rpc-listen requires a value")?;
+                cluster_rpc_listen = Some(v.clone());
+                i += 2;
+            }
             // Positional: first is db_dir, second (if numeric) is port for backward compat.
             other => {
                 if db_dir.is_none() {
@@ -514,6 +543,8 @@ fn parse_args() -> Result<Args, String> {
         vault_ca_certificate,
         daemon,
         pidfile,
+        cluster_node_data,
+        cluster_rpc_listen,
     })
 }
 
@@ -776,13 +807,59 @@ async fn run_server(args: Args, pidfile: String, db: Arc<Database>) {
         std::process::exit(1);
     });
 
-    let (app, server_control) = build_app_with_sessions_and_control(
+    // Optional Stage 2/3 product path: host a live NodeRuntime when the
+    // operator supplied cluster node data (CLI and/or env). Fail closed on
+    // start if the directory is not provisioned.
+    let cluster_handle = match cluster_runtime::cluster_node_data_from_env(
+        args.cluster_node_data.clone(),
+    ) {
+        Some(node_data) => {
+            let options = cluster_runtime::ClusterRuntimeOptions::resolve(
+                node_data,
+                args.cluster_rpc_listen.clone(),
+            );
+            eprintln!(
+                "cluster mode: starting NodeRuntime from {} (rpc listen {})",
+                options.node_data.display(),
+                options.rpc_listen
+            );
+            if options.plaintext_test {
+                eprintln!(
+                    "WARNING: MONGRELDB_CLUSTER_PLAINTEXT_TEST=1 — plaintext \
+                     cluster transport is for tests only (NON-PRODUCTION)"
+                );
+            }
+            match cluster_runtime::ClusterRuntimeHandle::start(options).await {
+                Ok(handle) => {
+                    match handle.runtime_status_json().await {
+                        Ok(status) => eprintln!(
+                            "cluster runtime live: node_id={} rpc={} meta={} tablets={}",
+                            status["node_id"],
+                            status["rpc_address"],
+                            status["meta_present"],
+                            status["tablet_count"]
+                        ),
+                        Err(error) => eprintln!("cluster runtime started but status failed: {error}"),
+                    }
+                    Some(handle)
+                }
+                Err(error) => {
+                    eprintln!("failed to start cluster NodeRuntime: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        None => None,
+    };
+
+    let (app, server_control) = build_app_with_sessions_control_and_cluster(
         db.clone(),
         std::iter::empty(),
         args.auth_token.clone(),
         args.max_connections,
         args.user_auth,
         Arc::clone(&sessions),
+        cluster_handle,
     );
     let (native_result_tx, mut native_result_rx) = tokio::sync::mpsc::channel(1);
     let mut native_result_guard = Some(native_result_tx);

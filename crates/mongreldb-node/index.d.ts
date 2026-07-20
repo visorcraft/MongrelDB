@@ -32,6 +32,24 @@ export interface NativeQueryError extends Error {
   terminalState: string | null;
 }
 
+/**
+ * Structured engine failure (e.g. transaction commit). Carries the Stage 0
+ * taxonomy (FND-007): `category` is the Display name, `categoryCode` is the
+ * never-reused numeric code in 1..=20.
+ */
+export interface EngineError extends Error {
+  code: string;
+  retryable: boolean;
+  /** Taxonomy Display name, e.g. `"transaction conflict"`. */
+  category: string;
+  /** Stable taxonomy code in `1..=20` (never reused). */
+  categoryCode: number;
+  outcomeKnown: boolean;
+  committed: boolean | null;
+  epoch: bigint | null;
+  epochText: string | null;
+}
+
 /** Structured rejection from daemon-backed operations. */
 export interface RemoteQueryError extends Error, NativeRemoteQueryErrorDetails {
   remoteQueryError: NativeRemoteQueryErrorDetails;

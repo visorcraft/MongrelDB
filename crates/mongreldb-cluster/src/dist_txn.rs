@@ -175,6 +175,16 @@ fn command_id_for(tag: &str, txn_id: &TransactionId, extra: &[u8]) -> [u8; 16] {
     digest[..16].try_into().expect("sha256 digest is 32 bytes")
 }
 
+/// FND-006 post-fence `txn.decision.after`: the decision is already durable.
+/// Never map a hook failure to [`DistTxnError::Fault`] (which looks pre-fence);
+/// surface [`DistTxnError::OutcomeAmbiguous`] so clients re-probe the record.
+fn post_decision_after_hook(txn_id: TransactionId) -> Result<(), DistTxnError> {
+    mongreldb_fault::inject("txn.decision.after").map_err(|fault| DistTxnError::OutcomeAmbiguous {
+        txn_id,
+        detail: format!("txn.decision.after: {fault}"),
+    })
+}
+
 /// FNV-1a 64-bit, mirroring the engine's WITHOUT ROWID derivation (the core
 /// crate sits above the cluster crate in the dependency graph, so the tiny
 /// pure function is mirrored rather than imported).
@@ -244,6 +254,9 @@ pub enum DistTxnError {
     /// The coordinator's HLC clock could not produce a timestamp.
     #[error("coordinator clock failure: {0}")]
     Clock(String),
+    /// Injected fault at a named durable prepare/decision boundary (FND-006).
+    #[error(transparent)]
+    Fault(#[from] mongreldb_fault::Fault),
 }
 
 /// Why a command record payload could not be decoded. Decode failures fail
@@ -2993,6 +3006,10 @@ impl DistTxnDriver {
     /// timestamp + durability proof). A refusal (conflict, stale versions,
     /// lost resolution race) is [`DistTxnError::PrepareRejected`]; an
     /// idempotent replay returns the original stored prepare timestamp.
+    ///
+    /// FND-006: `txn.prepare.before`/`txn.prepare.after` bracket the durable
+    /// intent persistence. A `before` failure never proposes; `after` fires
+    /// only after the prepare token is durable.
     pub async fn prepare_participant<T: RaftTransport, G: IntentGroupMember<T>>(
         &self,
         intents: &[G],
@@ -3010,6 +3027,8 @@ impl DistTxnDriver {
                 writes.participant.raft_group_id
             )));
         }
+        // FND-006: abort before the participant prepare becomes durable.
+        mongreldb_fault::inject("txn.prepare.before")?;
         let prepare_ts = self.now()?;
         let mut staged = writes.intents.clone();
         for intent in &mut staged {
@@ -3054,14 +3073,17 @@ impl DistTxnDriver {
                 "prepare committed but no intent record is visible".to_owned(),
             )
         })?;
-        Ok(PrepareToken {
+        let token = PrepareToken {
             txn_id: *txn_id,
             tablet_id: writes.participant.tablet_id,
             raft_group_id: writes.participant.raft_group_id,
             prepare_ts: stored.prepare_ts,
             position: receipt.position,
             command_id,
-        })
+        };
+        // FND-006: prepare is durable; after may report failure without undoing it.
+        mongreldb_fault::inject("txn.prepare.after")?;
+        Ok(token)
     }
 
     /// Records one participant's prepare on the coordinator record
@@ -3121,6 +3143,10 @@ impl DistTxnDriver {
     /// answers only after the decision is durable. The durable record is
     /// authoritative: if a race already decided the transaction, the
     /// recorded decision is returned (commit) or surfaced (abort).
+    ///
+    /// FND-006: `txn.decision.before` fires before the durable Commit
+    /// proposal; `txn.decision.after` fires in [`Self::finalize_decision`]
+    /// once the terminal decision is durable.
     pub async fn decide_commit<T: RaftTransport, G: IntentGroupMember<T>>(
         &self,
         status: &[TxnStatusGroup<T>],
@@ -3138,6 +3164,8 @@ impl DistTxnDriver {
             minimum = minimum.max(*timestamp);
         }
         let commit_ts = self.hlc.next_after(minimum);
+        // FND-006: abort before the commit decision can become durable.
+        mongreldb_fault::inject("txn.decision.before")?;
         let command_id = command_id_for(TAG_COMMIT, txn_id, &[]);
         retry_across_members(
             status,
@@ -3201,6 +3229,9 @@ impl DistTxnDriver {
                     control,
                 )
                 .await;
+                // FND-006: decision is durable; after must not undo it or
+                // report a false pre-fence Fault (spec §4.7).
+                post_decision_after_hook(*txn_id)?;
                 Ok(TxnOutcome {
                     txn_id: *txn_id,
                     commit_ts,
@@ -3219,6 +3250,9 @@ impl DistTxnDriver {
                     control,
                 )
                 .await;
+                // FND-006: abort is durable — still return Aborted even if the
+                // after hook fails (never mask with Fault).
+                let _ = post_decision_after_hook(*txn_id);
                 Err(DistTxnError::Aborted(reason))
             }
             state => Err(DistTxnError::OutcomeAmbiguous {
@@ -3233,6 +3267,9 @@ impl DistTxnDriver {
     /// durable final state; the caller maps `Aborted` to
     /// [`DistTxnError::Aborted`] and a raced `Committed` to the commit
     /// outcome.
+    ///
+    /// FND-006: `txn.decision.before`/`txn.decision.after` bracket the durable
+    /// abort decision the same way as the commit path.
     async fn finalize_abort<T: RaftTransport, G: IntentGroupMember<T>>(
         &self,
         status: &[TxnStatusGroup<T>],
@@ -3241,6 +3278,8 @@ impl DistTxnDriver {
         reason: AbortReason,
         control: &ExecutionControl,
     ) -> Result<DistributedTxnState, DistTxnError> {
+        // FND-006: abort before the abort decision can become durable.
+        mongreldb_fault::inject("txn.decision.before")?;
         let command_id = command_id_for(TAG_ABORT, txn_id, &[]);
         retry_across_members(
             status,
@@ -3290,6 +3329,8 @@ impl DistTxnDriver {
                     control,
                 )
                 .await;
+                // FND-006: raced commit is durable — after fails as ambiguous.
+                post_decision_after_hook(*txn_id)?;
                 Ok(DistributedTxnState::Committed { commit_ts })
             }
             DistributedTxnState::Aborted { reason } => {
@@ -3303,6 +3344,8 @@ impl DistTxnDriver {
                     control,
                 )
                 .await;
+                // FND-006: abort is durable; preserve Aborted over Fault.
+                let _ = post_decision_after_hook(*txn_id);
                 Ok(DistributedTxnState::Aborted { reason })
             }
             state => Err(DistTxnError::OutcomeAmbiguous {

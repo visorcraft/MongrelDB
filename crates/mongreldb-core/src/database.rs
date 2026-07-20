@@ -13063,6 +13063,15 @@ impl Database {
                     ))
                 })?,
             };
+            // FND-006: `txn.decision.before` fires immediately before the
+            // durable commit decision (enter CommitCritical / WAL proposal).
+            // A Fail aborts while still Preparing — nothing durable yet.
+            if let Err(fault) = mongreldb_fault::inject("txn.decision.before") {
+                for (_, _, pending) in &prepared_external {
+                    let _ = std::fs::remove_file(pending);
+                }
+                return Err(crate::commit_log::fault_as_io(fault));
+            }
             if let Some(state) = &context.state {
                 state.enter_commit_critical();
             }
@@ -13223,6 +13232,15 @@ impl Database {
         if let Some(state) = &context.state {
             state.committed(receipt.clone());
         }
+        // FND-006: `txn.decision.after` fires only after the decision is
+        // durable and the Committed receipt is published. A Fail must not
+        // undo the decision — surface as DurableCommit (post-fence).
+        mongreldb_fault::inject("txn.decision.after").map_err(|fault| {
+            MongrelError::DurableCommit {
+                epoch: new_epoch.0,
+                message: fault.to_string(),
+            }
+        })?;
         Ok((new_epoch, committed_row_ids))
     }
 

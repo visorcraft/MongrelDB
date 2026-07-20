@@ -18,11 +18,12 @@
 //! The handle uses `Rc<RefCell>` (single-threaded). Each thread should create
 //! its own `NativeDB` instance. Cross-thread sharing requires a `Mutex`.
 
-use jni::objects::{JClass, JString};
+use jni::objects::{JClass, JObject, JString, JValue};
 use jni::sys::{jbyteArray, jlong, jstring};
 use jni::JNIEnv;
 use mongreldb_kit::Database as KitDatabase;
 use mongreldb_kit_core::Migration;
+use mongreldb_types::errors::ErrorCategory;
 use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
@@ -31,6 +32,51 @@ use std::rc::Rc;
 /// Kit Database can be borrowed mutably (for migrations and transactions).
 struct JniDatabase {
     db: Rc<RefCell<KitDatabase>>,
+}
+
+// ── Error taxonomy (FND-007) ──────────────────────────────────────────────
+
+/// Map a Kit error onto the stable Stage 0 taxonomy (spec 9.7). Mirrors the
+/// core `MongrelError::category()` precedents used by the C FFI and NAPI.
+pub(crate) fn kit_error_category(e: &mongreldb_kit::KitError) -> ErrorCategory {
+    use mongreldb_kit::KitError;
+    match e {
+        KitError::PermissionDenied(_) => ErrorCategory::PermissionDenied,
+        KitError::InvalidCredentials(_) | KitError::AuthRequired(_) => {
+            ErrorCategory::Unauthenticated
+        }
+        KitError::AuthNotRequired(_) => ErrorCategory::ClusterVersionMismatch,
+        KitError::Conflict(_) | KitError::Duplicate(_) => ErrorCategory::TransactionConflict,
+        KitError::ForeignKey(_) | KitError::Restrict(_) | KitError::TransactionAborted { .. } => {
+            ErrorCategory::TransactionAborted
+        }
+        KitError::Cancelled { .. } => ErrorCategory::Cancelled,
+        KitError::DeadlineExceeded { .. } => ErrorCategory::DeadlineExceeded,
+        KitError::OutcomeUnknown { .. } => ErrorCategory::CommitOutcomeUnknown,
+        KitError::CommitOutcome { outcome, .. } => {
+            if outcome.committed {
+                ErrorCategory::CommitOutcomeUnknown
+            } else {
+                ErrorCategory::TransactionAborted
+            }
+        }
+        KitError::DatabaseLocked(_)
+        | KitError::QueryRegistryFull { .. }
+        | KitError::ResultLimitExceeded { .. } => ErrorCategory::ResourceExhausted,
+        KitError::Validation(_) | KitError::TriggerValidation(_) | KitError::Migration(_) => {
+            ErrorCategory::SchemaVersionMismatch
+        }
+        KitError::Integrity(_) => ErrorCategory::StaleMetadata,
+        KitError::CapabilityUnsupported(_) | KitError::Unsupported(_) => {
+            ErrorCategory::ClusterVersionMismatch
+        }
+        KitError::QueryConflict { .. } => ErrorCategory::ClusterVersionMismatch,
+        KitError::QueryFailed { .. }
+        | KitError::RemoteProtocol { .. }
+        | KitError::SerializationFailed { .. }
+        | KitError::Transport { .. }
+        | KitError::Storage(_) => ErrorCategory::ReplicaUnavailable,
+    }
 }
 
 // ── JNI helpers ───────────────────────────────────────────────────────────
@@ -50,14 +96,36 @@ fn throw_java(env: &mut JNIEnv, class: &str, message: &str) {
     let _ = env.throw_new(class, message);
 }
 
-/// Map a KitError to a Java exception and throw it. Returns the jlong/error
-/// value the JNI function should return (0 for handles, empty for void).
+/// Throw `QueryException(message, category, categoryCode)` when the class is
+/// available; fall back to the single-string constructor / `throw_new`.
+fn throw_query_exception(env: &mut JNIEnv, message: &str, category: ErrorCategory) {
+    const CLASS: &str = "com/visorcraft/mongreldb/QueryException";
+    let ok = (|| -> jni::errors::Result<()> {
+        let class = env.find_class(CLASS)?;
+        let msg = env.new_string(message)?;
+        let cat = env.new_string(category.name())?;
+        let obj = env.new_object(
+            class,
+            "(Ljava/lang/String;Ljava/lang/String;I)V",
+            &[
+                JValue::Object(&JObject::from(msg)),
+                JValue::Object(&JObject::from(cat)),
+                JValue::Int(category.code() as i32),
+            ],
+        )?;
+        env.throw(obj)?;
+        Ok(())
+    })();
+    if ok.is_err() {
+        // Class missing or constructor unavailable: message-only fallback.
+        throw_java(env, CLASS, message);
+    }
+}
+
+/// Map a KitError to a Java exception and throw it. Surfaces the FND-007
+/// taxonomy on `QueryException.category` / `categoryCode`.
 fn throw_kit_error(env: &mut JNIEnv, e: &mongreldb_kit::KitError) {
-    throw_java(
-        env,
-        "com/visorcraft/mongreldb/QueryException",
-        &format!("{e}"),
-    );
+    throw_query_exception(env, &format!("{e}"), kit_error_category(e));
 }
 
 /// SAFETY: cast a jlong handle back to the JniDatabase wrapper.
@@ -712,6 +780,79 @@ fn query_dispatch(env: &mut JNIEnv, handle: jlong, query_json: JString, kind: &s
         Err(e) => {
             throw_kit_error(env, &e);
             std::ptr::null_mut()
+        }
+    }
+}
+
+#[cfg(test)]
+mod taxonomy_tests {
+    use super::kit_error_category;
+    use mongreldb_kit::KitError;
+    use mongreldb_types::errors::ErrorCategory;
+
+    #[test]
+    fn permission_denied_and_resource_map_to_stable_codes() {
+        assert_eq!(
+            kit_error_category(&KitError::PermissionDenied("alice lacks Admin".into())),
+            ErrorCategory::PermissionDenied
+        );
+        assert_eq!(
+            kit_error_category(&KitError::PermissionDenied("x".into())).code(),
+            20
+        );
+        assert_eq!(
+            kit_error_category(&KitError::PermissionDenied("x".into())).name(),
+            "permission denied"
+        );
+
+        assert_eq!(
+            kit_error_category(&KitError::DatabaseLocked("busy".into())),
+            ErrorCategory::ResourceExhausted
+        );
+        assert_eq!(
+            kit_error_category(&KitError::DatabaseLocked("busy".into())).code(),
+            18
+        );
+
+        assert_eq!(
+            kit_error_category(&KitError::Integrity("missing table".into())),
+            ErrorCategory::StaleMetadata
+        );
+        assert_eq!(
+            kit_error_category(&KitError::Integrity("missing table".into())).code(),
+            3
+        );
+    }
+
+    #[test]
+    fn auth_conflict_and_outcome_map() {
+        assert_eq!(
+            kit_error_category(&KitError::InvalidCredentials("bob".into())),
+            ErrorCategory::Unauthenticated
+        );
+        assert_eq!(
+            kit_error_category(&KitError::Conflict("ww".into())),
+            ErrorCategory::TransactionConflict
+        );
+        let unknown = KitError::OutcomeUnknown {
+            query_id: "q".into(),
+            message: "fsync".into(),
+            metadata: Box::default(),
+        };
+        assert_eq!(
+            kit_error_category(&unknown),
+            ErrorCategory::CommitOutcomeUnknown
+        );
+        assert_eq!(kit_error_category(&unknown).code(), 12);
+    }
+
+    #[test]
+    fn taxonomy_codes_are_1_through_20_never_reused() {
+        let codes: Vec<u32> = ErrorCategory::ALL.iter().map(|c| c.code()).collect();
+        assert_eq!(codes, (1..=20).collect::<Vec<_>>());
+        for category in ErrorCategory::ALL {
+            assert_eq!(ErrorCategory::from_code(category.code()), Some(category));
+            assert_eq!(category.name(), category.to_string());
         }
     }
 }

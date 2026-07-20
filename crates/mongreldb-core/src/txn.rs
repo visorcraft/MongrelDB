@@ -1152,6 +1152,11 @@ impl<'db> Transaction<'db> {
     /// the state handle (`Committed` is set by the sequencer once published;
     /// pre-fence errors abort here; post-fence unknown outcomes leave
     /// `CommitCritical` intact).
+    ///
+    /// FND-006: `txn.prepare.before`/`txn.prepare.after` bracket the
+    /// transition into `Preparing`. A `before` failure never enters prepare;
+    /// an `after` failure leaves `Preparing` and is classified as a pre-fence
+    /// abort (nothing durable yet).
     fn commit_full(
         mut self,
         control: Option<&crate::ExecutionControl>,
@@ -1162,7 +1167,19 @@ impl<'db> Transaction<'db> {
             self.state.abort(AbortReason::Error(message.clone()));
             return Err(MongrelError::Full(message));
         }
+        // FND-006: arm before the formal prepare transition so a Fail aborts
+        // while still Active (no Preparing/Committed observation).
+        if let Err(fault) = mongreldb_fault::inject("txn.prepare.before") {
+            let error = crate::commit_log::fault_as_io(fault);
+            classify_commit_error(&self.state, &error);
+            return Err(error);
+        }
         self.state.begin_prepare();
+        if let Err(fault) = mongreldb_fault::inject("txn.prepare.after") {
+            let error = crate::commit_log::fault_as_io(fault);
+            classify_commit_error(&self.state, &error);
+            return Err(error);
+        }
         let context = TxnCommitContext {
             isolation: self.isolation,
             read_ts: self.read_ts,
