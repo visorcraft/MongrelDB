@@ -30,7 +30,8 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: python3 scripts/verify-component-versions
       - run: cargo fmt --check
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      # Exclude mongreldb-perf: bundled DuckDB debug builds exhaust runner disk.
+      - run: cargo clippy --workspace --all-targets --all-features --exclude mongreldb-perf -- -D warnings
       - run: cargo test -p mongreldb-core --all-features
 
   workspace-tests:
@@ -43,7 +44,11 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2.9.1
       - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - run: cargo test --workspace --all-features --exclude mongreldb-core
+      # mongreldb-perf is a benchmark harness with bundled DuckDB/SQLite C++
+      # deps; building it in debug OOMs GitHub-hosted runners ("No space left
+      # on device"). It has no unit tests — run via `cargo run -p mongreldb-perf`
+      # when benchmarking.
+      - run: cargo test --workspace --all-features --exclude mongreldb-core --exclude mongreldb-perf
 
   server:
     name: Server tests
