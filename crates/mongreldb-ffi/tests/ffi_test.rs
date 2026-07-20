@@ -605,7 +605,69 @@ fn ffi_error_on_nonexistent_table() {
         let code = mongreldb_last_error_code();
         assert!(code < 0, "error code should be negative, got {}", code);
 
+        // FND-007: NotFound maps to taxonomy StaleMetadata (code 3).
+        assert_eq!(mongreldb_last_error_category_code(), 3);
+        assert_eq!(rust_str(mongreldb_last_error_category()), "stale metadata");
+
         mongreldb_database_free(db);
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ffi_taxonomy_permission_denied_category_code() {
+    let dir = make_tempdir();
+    let path = dir.to_str().unwrap();
+
+    unsafe {
+        // Bootstrap require_auth with an admin, then open as a user lacking grants.
+        let db = mongreldb_create(cstr(path));
+        assert!(!db.is_null());
+        assert_eq!(
+            mongreldb_enable_auth(db, cstr("admin"), cstr("admin-pw")),
+            0,
+            "{}",
+            rust_str(mongreldb_last_error())
+        );
+        assert_eq!(mongreldb_create_user(db, cstr("bob"), cstr("bob-pw")), 0);
+        mongreldb_database_free(db);
+
+        let bob = mongreldb_open_with_credentials(cstr(path), cstr("bob"), cstr("bob-pw"));
+        assert!(!bob.is_null(), "{}", rust_str(mongreldb_last_error()));
+
+        // Creating a table requires Admin/DDL — bob has no roles.
+        let builder = mongreldb_schema_begin();
+        let col = mongreldb_column_def {
+            id: 1,
+            name: cstr("id"),
+            ty: mongreldb_type_id::Int64 as i32,
+            flags: MONGRELDB_COL_PRIMARY_KEY,
+            embedding_dim: 0,
+            decimal_precision: 0,
+            decimal_scale: 0,
+            enum_variants: StringArray {
+                items: std::ptr::null(),
+                len: 0,
+            },
+        };
+        assert_eq!(mongreldb_schema_add_column(builder, &col), 0);
+        let schema = mongreldb_schema_build(builder);
+        mongreldb_schema_builder_free(builder);
+        let mut table_id = 0u64;
+        let ret = mongreldb_create_table(bob, cstr("t"), schema, &mut table_id);
+        assert_eq!(ret, -6, "expected Unauthorized: {}", rust_str(mongreldb_last_error()));
+        // Taxonomy distinguishes permission denied (20) from unauthenticated (19).
+        assert_eq!(mongreldb_last_error_category_code(), 20);
+        assert_eq!(
+            rust_str(mongreldb_last_error_category()),
+            "permission denied"
+        );
+        let mut details = mongreldb_error_details_v1::default();
+        assert_eq!(mongreldb_last_error_details_v1(&mut details), 0);
+        assert_eq!(details.category_code, 20);
+
+        mongreldb_database_free(bob);
     }
 
     let _ = std::fs::remove_dir_all(&dir);

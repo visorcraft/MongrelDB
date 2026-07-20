@@ -2225,6 +2225,7 @@ dependencies = [
  "mongreldb-core",
  "mongreldb-kit-core",
  "mongreldb-query",
+ "mongreldb-types",
  "parking_lot",
  "serde_json",
  "tokio",

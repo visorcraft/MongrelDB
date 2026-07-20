@@ -185,6 +185,36 @@ impl ErrorCategory {
         }
     }
 
+    /// Stable snake-phrase name matching [`Display`] / the daemon HTTP
+    /// `error.category` field (e.g. `"permission denied"`).
+    ///
+    /// Prefer this (or [`Display`]) for cross-language surfaces; the Rust
+    /// variant identifiers remain the serde/text wire names.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::NotLeader => "not leader",
+            Self::LeaderUnknown => "leader unknown",
+            Self::StaleMetadata => "stale metadata",
+            Self::ReplicaUnavailable => "replica unavailable",
+            Self::QuorumUnavailable => "quorum unavailable",
+            Self::TransactionConflict => "transaction conflict",
+            Self::TransactionAborted => "transaction aborted",
+            Self::SerializationFailure => "serialization failure",
+            Self::Deadlock => "deadlock",
+            Self::DeadlineExceeded => "deadline exceeded",
+            Self::Cancelled => "cancelled",
+            Self::CommitOutcomeUnknown => "commit outcome unknown",
+            Self::CommitTooLate => "commit too late",
+            Self::TabletMoved => "tablet moved",
+            Self::TabletSplitting => "tablet splitting",
+            Self::SchemaVersionMismatch => "schema version mismatch",
+            Self::ClusterVersionMismatch => "cluster version mismatch",
+            Self::ResourceExhausted => "resource exhausted",
+            Self::Unauthenticated => "unauthenticated",
+            Self::PermissionDenied => "permission denied",
+        }
+    }
+
     /// Resolves a stable [`Self::code`] back to its category.
     ///
     /// Returns `None` for codes this build does not know (never emitted by
@@ -652,6 +682,16 @@ mod tests {
             "permission denied: principal \"alice\" lacks Admin"
         );
         assert_eq!(error.code(), ErrorCategory::PermissionDenied.code());
+    }
+
+    #[test]
+    fn name_matches_display_for_every_category() {
+        for category in ErrorCategory::ALL {
+            assert_eq!(category.name(), category.to_string());
+            assert!(!category.name().is_empty());
+            // Fixed-size FFI/JNI buffers (32) must fit every name + NUL.
+            assert!(category.name().len() < 32, "{category:?}");
+        }
     }
 
     #[test]

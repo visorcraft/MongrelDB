@@ -72,6 +72,10 @@ static void expect_invalid(int32_t rc, const char *message) {
     assert(details.code == MDB_ERR_INVALID_ARGUMENT);
     assert(details.outcome_known == 1);
     assert(details.committed == 0);
+    /* FND-007: InvalidArgument → ClusterVersionMismatch (code 17). */
+    assert(mongreldb_last_error_category_code() == 17);
+    assert(details.category_code == 17);
+    assert(strcmp(mongreldb_last_error_category(), "cluster version mismatch") == 0);
 }
 
 static void test_invalid_discriminants(mongreldb_database_t *db) {

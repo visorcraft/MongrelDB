@@ -153,6 +153,9 @@ mod core_open_error_tests {
         assert_eq!(durable.committed, Some(true));
         assert_eq!(durable.epoch, Some(7));
         assert!(!durable.retryable);
+        // FND-007: taxonomy category + stable code (never reused).
+        assert_eq!(durable.category, "commit outcome unknown");
+        assert_eq!(durable.category_code, 12);
 
         let unknown =
             core_commit_error_details(&mongreldb_core::MongrelError::CommitOutcomeUnknown {
@@ -164,24 +167,59 @@ mod core_open_error_tests {
         assert_eq!(unknown.committed, None);
         assert_eq!(unknown.epoch, Some(9));
         assert!(!unknown.retryable);
+        assert_eq!(unknown.category, "commit outcome unknown");
+        assert_eq!(unknown.category_code, 12);
+    }
+
+    #[test]
+    fn commit_error_details_expose_taxonomy_category_code() {
+        let conflict = core_commit_error_details(&mongreldb_core::MongrelError::Conflict(
+            "write-write".into(),
+        ));
+        assert_eq!(conflict.code, CORE_CONFLICT_CODE);
+        assert_eq!(conflict.category, "transaction conflict");
+        assert_eq!(conflict.category_code, 6);
+        assert!(conflict.retryable);
+
+        let denied = core_commit_error_details(&mongreldb_core::MongrelError::PermissionDenied {
+            required: mongreldb_core::auth::Permission::Admin,
+            principal: "alice".into(),
+        });
+        assert_eq!(denied.category, "permission denied");
+        assert_eq!(denied.category_code, 20);
+        assert!(!denied.retryable);
+
+        let cancelled = core_commit_error_details(&mongreldb_core::MongrelError::Cancelled);
+        assert_eq!(cancelled.category, "cancelled");
+        assert_eq!(cancelled.category_code, 11);
     }
 }
 
 struct CoreCommitErrorDetails {
     code: &'static str,
     retryable: bool,
+    /// Stage 0 taxonomy Display name (FND-007), e.g. `"transaction conflict"`.
     category: &'static str,
+    /// Stable taxonomy code in `1..=20` (never reused).
+    category_code: u32,
     outcome_known: bool,
     committed: Option<bool>,
     epoch: Option<u64>,
 }
 
+fn core_taxonomy(error: &mongreldb_core::MongrelError) -> (&'static str, u32) {
+    let category = error.category();
+    (category.name(), category.code())
+}
+
 fn core_commit_error_details(error: &mongreldb_core::MongrelError) -> CoreCommitErrorDetails {
+    let (category, category_code) = core_taxonomy(error);
     match error {
         mongreldb_core::MongrelError::Conflict(_) => CoreCommitErrorDetails {
             code: CORE_CONFLICT_CODE,
             retryable: true,
-            category: "conflict",
+            category,
+            category_code,
             outcome_known: true,
             committed: Some(false),
             epoch: None,
@@ -189,7 +227,8 @@ fn core_commit_error_details(error: &mongreldb_core::MongrelError) -> CoreCommit
         mongreldb_core::MongrelError::DurableCommit { epoch, .. } => CoreCommitErrorDetails {
             code: CORE_COMMIT_OUTCOME_CODE,
             retryable: false,
-            category: "commit",
+            category,
+            category_code,
             outcome_known: true,
             committed: Some(true),
             epoch: Some(*epoch),
@@ -198,7 +237,8 @@ fn core_commit_error_details(error: &mongreldb_core::MongrelError) -> CoreCommit
             CoreCommitErrorDetails {
                 code: CORE_COMMIT_OUTCOME_UNKNOWN_CODE,
                 retryable: false,
-                category: "outcome_unknown",
+                category,
+                category_code,
                 outcome_known: false,
                 committed: None,
                 epoch: Some(*epoch),
@@ -206,8 +246,10 @@ fn core_commit_error_details(error: &mongreldb_core::MongrelError) -> CoreCommit
         }
         _ => CoreCommitErrorDetails {
             code: CORE_ERROR_CODE,
-            retryable: false,
-            category: "core",
+            // Prefer taxonomy retryability over the coarse "core" bucket.
+            retryable: error.category().is_retryable(),
+            category,
+            category_code,
             outcome_known: true,
             committed: Some(false),
             epoch: None,
@@ -223,7 +265,10 @@ fn throw_core_commit_error<T>(env: &Env, error: mongreldb_core::MongrelError) ->
     ))?;
     js_error.set_named_property("code", details.code)?;
     js_error.set_named_property("retryable", details.retryable)?;
+    // FND-007: structural taxonomy (name + never-reused code). Programmatic
+    // handling keys off these, never the message text.
     js_error.set_named_property("category", details.category)?;
+    js_error.set_named_property("categoryCode", details.category_code)?;
     js_error.set_named_property("outcomeKnown", details.outcome_known)?;
     js_error.set_named_property("committed", details.committed)?;
     js_error.set_named_property("epoch", details.epoch.map(BigInt::from))?;

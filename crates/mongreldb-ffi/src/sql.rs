@@ -122,6 +122,40 @@ fn fill_error_details(
     copy_c_text(&mut details.server_state, server_state);
 }
 
+/// Map a query-layer error onto the stable Stage 0 taxonomy (FND-007). Mirrors
+/// the daemon's `query_error_category` so C and HTTP agree.
+fn query_error_category(
+    error: &mongreldb_query::MongrelQueryError,
+) -> mongreldb_types::errors::ErrorCategory {
+    use mongreldb_query::MongrelQueryError;
+    use mongreldb_types::errors::ErrorCategory;
+    match error {
+        MongrelQueryError::Core(error) => error.category(),
+        MongrelQueryError::QueryCancelled { .. } => ErrorCategory::Cancelled,
+        MongrelQueryError::DeadlineExceeded { .. } => ErrorCategory::DeadlineExceeded,
+        MongrelQueryError::CommitOutcome { committed, .. } => {
+            if *committed {
+                ErrorCategory::CommitOutcomeUnknown
+            } else {
+                ErrorCategory::TransactionAborted
+            }
+        }
+        MongrelQueryError::OutcomeUnknown { .. } => ErrorCategory::CommitOutcomeUnknown,
+        MongrelQueryError::TransactionAborted => ErrorCategory::TransactionAborted,
+        MongrelQueryError::NoSqlTransaction => ErrorCategory::TransactionAborted,
+        MongrelQueryError::SavepointNotFound { .. } => ErrorCategory::StaleMetadata,
+        MongrelQueryError::QueryRegistryFull | MongrelQueryError::ResultLimitExceeded { .. } => {
+            ErrorCategory::ResourceExhausted
+        }
+        MongrelQueryError::QueryIdConflict { .. }
+        | MongrelQueryError::InvalidQueryState(_)
+        | MongrelQueryError::Arrow(_)
+        | MongrelQueryError::DataFusion(_) => ErrorCategory::ClusterVersionMismatch,
+        MongrelQueryError::Schema(_) => ErrorCategory::SchemaVersionMismatch,
+        _ => ErrorCategory::ReplicaUnavailable,
+    }
+}
+
 fn set_query_error(error: &mongreldb_query::MongrelQueryError) -> ErrorCode {
     use mongreldb_query::MongrelQueryError;
     if let MongrelQueryError::Core(error) = error {
@@ -134,6 +168,7 @@ fn set_query_error(error: &mongreldb_query::MongrelQueryError) -> ErrorCode {
         retryable: u8::from(matches!(error, MongrelQueryError::QueryRegistryFull)),
         ..Default::default()
     };
+    crate::error::apply_category(&mut details, query_error_category(error));
     match error {
         MongrelQueryError::QueryCancelled {
             query_id,

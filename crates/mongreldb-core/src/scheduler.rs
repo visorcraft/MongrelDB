@@ -330,12 +330,25 @@ impl HierarchicalScheduler {
     }
 
     /// Cancel queued work (or mark so a concurrent poll drops it).
+    ///
+    /// Queued items are removed from the class heap immediately so
+    /// [`ClassConfig::max_queue`] capacity is freed for new submits (not only
+    /// after a later poll drains a cancelled marker).
     pub fn cancel(&mut self, work_id: u64) -> Result<(), SchedulerError> {
         if let Some(item) = self.items.remove(&work_id) {
             if let Some(t) = self.tenants.get_mut(&item.tenant) {
                 t.queued = t.queued.saturating_sub(1);
             }
-            self.cancelled.insert(work_id, ());
+            if let Some(queue) = self.queues.get_mut(&item.class) {
+                // BinaryHeap has no arbitrary remove; rebuild without this id.
+                let remaining: BinaryHeap<HeapEntry> = queue
+                    .heap
+                    .drain()
+                    .filter(|entry| entry.work_id != work_id)
+                    .collect();
+                queue.heap = remaining;
+            }
+            self.cancelled.remove(&work_id);
             return Ok(());
         }
         if self.running_meta.contains_key(&work_id) {
@@ -594,6 +607,41 @@ mod tests {
         sched.cancel(id).unwrap();
         let batch = sched.poll(10);
         assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn cancel_frees_queue_capacity_immediately() {
+        let mut sched = HierarchicalScheduler::new();
+        sched.set_class_config(
+            WorkloadClass::InteractiveSql,
+            ClassConfig {
+                max_queue: 1,
+                weight: 64,
+                reserved_slots: 0,
+                max_concurrency: 1,
+            },
+        );
+        // Occupy the single concurrency slot.
+        let running = sched
+            .submit("t", WorkloadClass::InteractiveSql, 1, None, None, "run")
+            .unwrap();
+        let batch = sched.poll(1);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].work_id, running);
+
+        let queued = sched
+            .submit("t", WorkloadClass::InteractiveSql, 1, None, None, "q")
+            .unwrap();
+        assert!(matches!(
+            sched.submit("t", WorkloadClass::InteractiveSql, 1, None, None, "full"),
+            Err(SchedulerError::QueueFull { .. })
+        ));
+        sched.cancel(queued).unwrap();
+        // Capacity free without needing a poll to drain a cancelled marker.
+        sched
+            .submit("t", WorkloadClass::InteractiveSql, 1, None, None, "again")
+            .unwrap();
+        assert_eq!(sched.stats().per_class["interactive_sql"].queued, 1);
     }
 
     #[test]

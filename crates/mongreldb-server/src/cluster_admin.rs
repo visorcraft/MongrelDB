@@ -151,6 +151,9 @@ fn resolve_target_node(state: &AppState, requested: Option<&str>) -> Result<Node
 
 /// `GET /admin/cluster/status` — identity, membership, node descriptors, and
 /// version info; reports `standalone` when no cluster identity exists.
+/// When a live [`crate::cluster_runtime::ClusterRuntimeHandle`] is configured,
+/// the report also carries a `runtime` object (node id, RPC address, tablet
+/// count, meta present).
 pub(crate) async fn status(
     State(state): State<Arc<AppState>>,
     OptionalPrincipal(principal): OptionalPrincipal,
@@ -158,8 +161,28 @@ pub(crate) async fn status(
     if let Err(response) = require_admin(&state, &principal, "admin.cluster.status") {
         return *response;
     }
-    match status_report(state.db.root()) {
-        Ok(report) => Json(report).into_response(),
+    let root = cluster_status_root(&state);
+    match status_report(root) {
+        Ok(mut report) => {
+            if let Some(runtime) = &state.cluster_runtime {
+                match runtime.runtime_status_json().await {
+                    Ok(runtime_status) => {
+                        if let Some(object) = report.as_object_mut() {
+                            object.insert("runtime".into(), runtime_status);
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(object) = report.as_object_mut() {
+                            object.insert(
+                                "runtime".into(),
+                                json!({ "live": false, "error": error.to_string() }),
+                            );
+                        }
+                    }
+                }
+            }
+            Json(report).into_response()
+        }
         Err(error) => {
             state.audit.record(
                 request_owner(&state, &principal),
@@ -169,6 +192,43 @@ pub(crate) async fn status(
             cluster_error_response(&error)
         }
     }
+}
+
+/// Prefer the live runtime's node-data directory when cluster mode is on;
+/// otherwise the database root (historical co-located layout).
+fn cluster_status_root(state: &AppState) -> &std::path::Path {
+    state
+        .cluster_runtime
+        .as_ref()
+        .map(|runtime| runtime.node_data())
+        .unwrap_or_else(|| state.db.root())
+}
+
+/// Fail-closed response when transfer/split/merge is issued without a live
+/// NodeRuntime (standalone default, or cluster mode not configured).
+fn runtime_not_running_response(command: &str, fields: Value) -> Response {
+    let mut body = fields;
+    if let Some(object) = body.as_object_mut() {
+        object.insert("command".into(), json!(command));
+        object.insert("status".into(), json!("error"));
+        object.insert("error".into(), json!("cluster runtime not running"));
+        object.insert("category".into(), json!("unavailable"));
+    }
+    (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
+}
+
+/// Structured error from a live runtime operation (missing tablet, not leader, …).
+fn runtime_op_error_response(command: &str, error: String) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "command": command,
+            "status": "error",
+            "error": error,
+            "category": "failed_precondition",
+        })),
+    )
+        .into_response()
 }
 
 /// Optional body of `POST /admin/cluster/node/drain`: the member to move from
@@ -294,11 +354,15 @@ pub(crate) async fn remove(
 ///
 /// Returns `None` when the text is ordinary SQL (caller falls through).
 /// Returns `Some(response)` for recognised admin commands. SHOW helpers are
-/// available without requiring a fully-booted tablet runtime; mutating
-/// commands that need live groups return a structured "accepted for job"
-/// shape until the online-ops job runner (S5E) owns them, except
-/// `ALTER NODE DRAIN` which reuses the existing bootstrap path.
-pub(crate) fn try_admin_sql(
+/// available without requiring a fully-booted tablet runtime. Mutating
+/// commands that need live groups (`TRANSFER LEADER`, `SPLIT TABLET`,
+/// `MERGE TABLETS`) fail closed with `"cluster runtime not running"` when
+/// no [`crate::cluster_runtime::ClusterRuntimeHandle`] is configured, and
+/// drive the live runtime when it is. `MOVE REPLICA` returns a clear
+/// not-yet-live error while a runtime is present (no direct placement API
+/// on the product path yet) and the same fail-closed error when absent.
+/// `ALTER NODE DRAIN` reuses the existing bootstrap path.
+pub(crate) async fn try_admin_sql(
     state: &AppState,
     principal: &Option<mongreldb_core::Principal>,
     sql: &str,
@@ -329,9 +393,10 @@ pub(crate) fn try_admin_sql(
         format!("command={}", admin_command_name(&command)),
     );
 
+    let status_root = cluster_status_root(state);
     let response = match command {
-        AdminCommand::ShowCluster => match status_report(state.db.root()) {
-            Ok(report) => {
+        AdminCommand::ShowCluster => match status_report(status_root) {
+            Ok(mut report) => {
                 // Stage 4 multi-region policy is server-reachable via admin SQL.
                 let multi = state
                     .multi_region
@@ -350,6 +415,23 @@ pub(crate) fn try_admin_sql(
                         })
                     })
                     .unwrap_or_else(|_| json!({ "error": "multi_region lock poisoned" }));
+                if let Some(runtime) = &state.cluster_runtime {
+                    match runtime.runtime_status_json().await {
+                        Ok(runtime_status) => {
+                            if let Some(object) = report.as_object_mut() {
+                                object.insert("runtime".into(), runtime_status);
+                            }
+                        }
+                        Err(error) => {
+                            if let Some(object) = report.as_object_mut() {
+                                object.insert(
+                                    "runtime".into(),
+                                    json!({ "live": false, "error": error.to_string() }),
+                                );
+                            }
+                        }
+                    }
+                }
                 Json(json!({
                     "command": "SHOW CLUSTER",
                     "result": report,
@@ -359,7 +441,7 @@ pub(crate) fn try_admin_sql(
             }
             Err(error) => cluster_error_response(&error),
         },
-        AdminCommand::ShowNodes => match bootstrap::cluster_status(state.db.root()) {
+        AdminCommand::ShowNodes => match bootstrap::cluster_status(status_root) {
             Ok(status) => Json(json!({
                 "command": "SHOW NODES",
                 "nodes": component(&status.member_endpoints),
@@ -376,7 +458,7 @@ pub(crate) fn try_admin_sql(
         },
         AdminCommand::ShowTablets { table } => {
             let (tablets, issues) =
-                mongreldb_cluster::tablet::list_tablets_on_disk(state.db.root())
+                mongreldb_cluster::tablet::list_tablets_on_disk(status_root)
                     .unwrap_or_else(|e| (Vec::new(), vec![e.to_string()]));
             let rows: Vec<Value> = tablets
                 .iter()
@@ -408,7 +490,7 @@ pub(crate) fn try_admin_sql(
         }
         AdminCommand::ShowReplicas { tablet_id } => {
             let (tablets, issues) =
-                mongreldb_cluster::tablet::list_tablets_on_disk(state.db.root())
+                mongreldb_cluster::tablet::list_tablets_on_disk(status_root)
                     .unwrap_or_else(|e| (Vec::new(), vec![e.to_string()]));
             let mut replicas = Vec::new();
             for t in &tablets {
@@ -507,18 +589,48 @@ pub(crate) fn try_admin_sql(
             .into_response()
         }
         AdminCommand::ShowResourceGroups => {
-            let sched = state.scheduler.lock().ok();
-            let stats = sched.as_ref().map(|s| s.stats());
-            // Drive node governor on the live admin path (Stage 4B reachability).
+            let stats = Some(state.scheduler.stats());
+            // Drive node governor with live inputs and apply actions (S4B).
             let governor = state.node_governor.lock().ok().map(|mut gov| {
-                let inputs = mongreldb_core::NodePressureInputs {
-                    query_reserved_bytes: gov.tablet_reserved_bytes(),
-                    ..mongreldb_core::NodePressureInputs::default()
-                };
-                let actions = gov.evaluate(&inputs);
+                let db_gov = state.db.memory_governor();
+                let ai_capacity = std::env::var("MONGRELDB_AI_MAX_CONCURRENT")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|v: &usize| *v > 0)
+                    .unwrap_or(4);
+                let inputs = crate::admission::build_pressure_inputs(
+                    &crate::admission::PressureInputSources {
+                        db_reserved_bytes: db_gov.total_used(),
+                        db_max_bytes: db_gov.max_bytes(),
+                        node_configured_max_bytes: gov.governor.max_bytes(),
+                        tablet_reserved_bytes: gov.tablet_reserved_bytes(),
+                        ai_capacity,
+                        ai_available: state.ai_semaphore.available_permits(),
+                        process_rss_bytes: crate::admission::process_rss_bytes(),
+                    },
+                );
+                let actions = crate::admission::refresh_pressure(
+                    &mut gov,
+                    &inputs,
+                    &state.scheduler,
+                    Some(db_gov),
+                );
+                let pressure = state.scheduler.pressure().snapshot();
                 json!({
                     "tablet_reserved_bytes": gov.tablet_reserved_bytes(),
+                    "query_reserved_bytes": inputs.query_reserved_bytes,
+                    "configured_max_bytes": inputs.configured_max_bytes,
+                    "os_pressure": inputs.os_pressure,
                     "actions": actions.iter().map(|a| format!("{a:?}")).collect::<Vec<_>>(),
+                    "applied": {
+                        "reject_ai": pressure.reject_ai,
+                        "reduced_admission": pressure.reduced_admission,
+                        "move_tablet_noops": pressure.move_tablet_noops,
+                        "last_evict_bytes": pressure.last_evict_bytes,
+                        "evaluate_count": pressure.evaluate_count,
+                    },
+                    // MoveTabletLeaders is a no-op outside cluster tablet routing.
+                    "move_tablet_leaders": "noop_outside_cluster_mode",
                 })
             });
             // AI index readiness registry + retrieval planner knobs (S4C/S4D).
@@ -602,7 +714,7 @@ pub(crate) fn try_admin_sql(
                 "admin.sql.drain",
                 format!("node_id={node_id}"),
             );
-            match bootstrap::node_drain(state.db.root(), node_id) {
+            match bootstrap::node_drain(status_root, node_id) {
                 Ok(descriptor) => {
                     state.audit.record(
                         owner,
@@ -625,55 +737,136 @@ pub(crate) fn try_admin_sql(
                 }
             }
         }
-        AdminCommand::TransferLeader { tablet_id, to } => Json(json!({
-            "command": "TRANSFER LEADER",
-            "tablet_id": tablet_id.to_string(),
-            "to": to.to_string(),
-            "status": "accepted",
-            "note": "submitted as a persistent job when the tablet group is live",
-        }))
-        .into_response(),
+        AdminCommand::TransferLeader { tablet_id, to } => {
+            match &state.cluster_runtime {
+                None => runtime_not_running_response(
+                    "TRANSFER LEADER",
+                    json!({
+                        "tablet_id": tablet_id.to_string(),
+                        "to": to.to_string(),
+                    }),
+                ),
+                Some(runtime) => match runtime.transfer_leader(tablet_id, to).await {
+                    Ok(body) => Json(body).into_response(),
+                    Err(error) => runtime_op_error_response("TRANSFER LEADER", error.to_string()),
+                },
+            }
+        }
         AdminCommand::MoveReplica {
             tablet_id,
             from,
             to,
-        } => Json(json!({
-            "command": "MOVE REPLICA",
-            "tablet_id": tablet_id.to_string(),
-            "from": from.to_string(),
-            "to": to.to_string(),
-            "status": "accepted",
-        }))
-        .into_response(),
+        } => {
+            // No direct placement call on NodeRuntime yet; fail closed with a
+            // clear status whether or not the runtime is live so operators are
+            // never told the move was accepted.
+            let detail = if state.cluster_runtime.is_some() {
+                "move replica is not yet live on the product path"
+            } else {
+                "cluster runtime not running"
+            };
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "command": "MOVE REPLICA",
+                    "tablet_id": tablet_id.to_string(),
+                    "from": from.to_string(),
+                    "to": to.to_string(),
+                    "status": "error",
+                    "error": detail,
+                    "category": "unavailable",
+                })),
+            )
+                .into_response()
+        }
         AdminCommand::SplitTablet {
             tablet_id,
             at_key_hex,
-        } => Json(json!({
-            "command": "SPLIT TABLET",
-            "tablet_id": tablet_id.to_string(),
-            "at_key_hex": at_key_hex,
-            "status": "accepted",
-        }))
-        .into_response(),
-        AdminCommand::MergeTablets { left, right } => Json(json!({
-            "command": "MERGE TABLETS",
-            "left": left.to_string(),
-            "right": right.to_string(),
-            "status": "accepted",
-        }))
-        .into_response(),
+        } => match &state.cluster_runtime {
+            None => runtime_not_running_response(
+                "SPLIT TABLET",
+                json!({
+                    "tablet_id": tablet_id.to_string(),
+                    "at_key_hex": at_key_hex,
+                }),
+            ),
+            Some(runtime) => match runtime.split_tablet(tablet_id, at_key_hex).await {
+                Ok(body) => Json(body).into_response(),
+                Err(error) => runtime_op_error_response("SPLIT TABLET", error.to_string()),
+            },
+        },
+        AdminCommand::MergeTablets { left, right } => match &state.cluster_runtime {
+            None => runtime_not_running_response(
+                "MERGE TABLETS",
+                json!({
+                    "left": left.to_string(),
+                    "right": right.to_string(),
+                }),
+            ),
+            Some(runtime) => match runtime.merge_tablets(left, right).await {
+                Ok(body) => Json(body).into_response(),
+                Err(error) => runtime_op_error_response("MERGE TABLETS", error.to_string()),
+            },
+        },
         AdminCommand::JobControl { action, job_id } => {
             let verb = match action {
                 JobAction::Pause => "PAUSE",
                 JobAction::Resume => "RESUME",
                 JobAction::Cancel => "CANCEL",
             };
-            Json(json!({
-                "command": format!("{verb} JOB"),
-                "job_id": job_id,
-                "status": "accepted",
-            }))
-            .into_response()
+            // Fail closed: never report accepted unless the ops store applied
+            // the transition (review finding: silent accepted stubs).
+            match action {
+                JobAction::Cancel => {
+                    return Some(
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(json!({
+                                "error": "cancel job is not yet live on the product path",
+                                "command": format!("{verb} JOB"),
+                                "job_id": job_id,
+                                "category": "resource exhausted",
+                                "category_code": 18,
+                            })),
+                        )
+                            .into_response(),
+                    );
+                }
+                JobAction::Pause | JobAction::Resume => {
+                    let result = state.ops_jobs.lock().map(|mut store| match action {
+                        JobAction::Pause => store.pause(&job_id).map(|j| j.state),
+                        JobAction::Resume => store.start(&job_id).map(|j| j.state),
+                        JobAction::Cancel => unreachable!(),
+                    });
+                    match result {
+                        Ok(Ok(job_state)) => Json(json!({
+                            "command": format!("{verb} JOB"),
+                            "job_id": job_id,
+                            "status": "ok",
+                            "state": format!("{job_state:?}"),
+                        }))
+                        .into_response(),
+                        Ok(Err(error)) => (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({
+                                "error": error.to_string(),
+                                "command": format!("{verb} JOB"),
+                                "job_id": job_id,
+                            })),
+                        )
+                            .into_response(),
+                        Err(_) => (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({
+                                "error": "ops job store lock poisoned",
+                                "command": format!("{verb} JOB"),
+                                "job_id": job_id,
+                            })),
+                        )
+                            .into_response(),
+                    }
+                }
+            }
         }
         AdminCommand::BackupDatabase { destination } => {
             let mut params = std::collections::BTreeMap::new();
@@ -685,17 +878,9 @@ pub(crate) fn try_admin_sql(
                 .lock()
                 .map(|mut store| store.submit(mongreldb_core::OpsJobKind::Backup, params))
                 .ok();
-            // Also drive hierarchical scheduler so control path is exercised.
-            if let Ok(mut sched) = state.scheduler.lock() {
-                let _ = sched.submit(
-                    "system",
-                    mongreldb_core::WorkloadClass::Backup,
-                    50,
-                    None,
-                    None,
-                    "backup-database",
-                );
-            }
+            // Do not fire-and-forget HierarchicalScheduler::submit here: orphan
+            // Backup work items steal fairness slots until a later poll/complete
+            // (review finding). Ops store owns the job lifecycle.
             Json(json!({
                 "command": "BACKUP DATABASE",
                 "destination": destination,
@@ -756,17 +941,7 @@ pub(crate) fn try_admin_sql(
                 }),
             };
 
-            if let Ok(mut sched) = state.scheduler.lock() {
-                let _ = sched.submit(
-                    "system",
-                    mongreldb_core::WorkloadClass::Backup,
-                    40,
-                    None,
-                    None,
-                    "restore-database",
-                );
-            }
-
+            // No fire-and-forget scheduler submit (see BACKUP DATABASE).
             Json(json!({
                 "command": "RESTORE DATABASE",
                 "source": source,
