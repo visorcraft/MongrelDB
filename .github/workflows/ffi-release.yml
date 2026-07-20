@@ -6,7 +6,8 @@
 # The mongreldb-ffi crate is `publish = false` (it is a cdylib/staticlib
 # artifact, not a consumable Rust crate), so it is never sent to crates.io.
 # Instead, each release produces per-platform archives containing:
-#   lib/   - libmongreldb.{so,dylib,dll} + libmongreldb.{a,lib}
+#   lib/   - shared + static libraries (musl targets are static-only because
+#            Rust drops the unsupported `cdylib` crate type for that target)
 #   include/mongreldb.h
 #
 # Triggered on the same `v*` tag push as release.yml. Runs in parallel with
@@ -149,7 +150,9 @@ jobs:
         run: |
           mkdir -p dist/mongreldb-native/lib dist/mongreldb-native/include
           cp target/${{ matrix.target }}/release/libmongreldb.a dist/mongreldb-native/lib/
-          if [ -f target/${{ matrix.target }}/release/libmongreldb.so ]; then
+          if [ "${{ matrix.target }}" = x86_64-unknown-linux-musl ]; then
+            : # Rust emits the staticlib and drops cdylib for musl.
+          elif [ -f target/${{ matrix.target }}/release/libmongreldb.so ]; then
             cp target/${{ matrix.target }}/release/libmongreldb.so dist/mongreldb-native/lib/
           else
             cp target/${{ matrix.target }}/release/libmongreldb.dylib dist/mongreldb-native/lib/
@@ -259,7 +262,9 @@ jobs:
           mkdir -p dist/mongreldb-kit-native/lib dist/mongreldb-kit-native/include
           cp crates/mongreldb-kit-ffi/target/${{ matrix.target }}/release/libmongreldb_kit.a \
              dist/mongreldb-kit-native/lib/
-          if [ -f crates/mongreldb-kit-ffi/target/${{ matrix.target }}/release/libmongreldb_kit.so ]; then
+          if [ "${{ matrix.target }}" = x86_64-unknown-linux-musl ]; then
+            : # Rust emits the staticlib and drops cdylib for musl.
+          elif [ -f crates/mongreldb-kit-ffi/target/${{ matrix.target }}/release/libmongreldb_kit.so ]; then
             cp crates/mongreldb-kit-ffi/target/${{ matrix.target }}/release/libmongreldb_kit.so \
                dist/mongreldb-kit-native/lib/
           else
