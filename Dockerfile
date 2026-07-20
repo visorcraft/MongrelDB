@@ -14,7 +14,7 @@ RUN apt-get update \
 	&& apt-get install -y --no-install-recommends ca-certificates \
 	&& rm -rf /var/lib/apt/lists/*
 
-COPY --from=build /src/crates/mongreldb-server/target/release/mongreldb-server /usr/local/bin/mongreldb-server
+COPY --from=build /src/target/release/mongreldb-server /usr/local/bin/mongreldb-server
 
 VOLUME ["/data"]
 EXPOSE 8453

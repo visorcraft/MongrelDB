@@ -28,6 +28,20 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag receiving assets (for example v0.61.1)'
+        required: true
+      checkout_ref:
+        description: 'Git ref to build (defaults to tag)'
+        required: false
+        default: ''
+      assets_only:
+        description: 'Skip immutable registry publishing'
+        required: true
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -38,6 +52,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.checkout_ref || inputs.tag || github.ref }}
 
       - uses: dtolnay/rust-toolchain@v1
         with:
@@ -51,6 +67,7 @@ jobs:
       # crates.io index has not yet observed a just-published dependency, or
       # when crates.io rate-limits new-crate publishes (HTTP 429).
       - name: Publish Rust crates
+        if: ${{ !inputs.assets_only }}
         run: |
           publish_crate() {
             local attempt output wait_until now sleep_s
@@ -113,6 +130,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.checkout_ref || inputs.tag || github.ref }}
 
       - uses: docker/setup-buildx-action@v4
 
@@ -128,12 +147,14 @@ jobs:
           platforms: linux/amd64
           push: true
           provenance: false
-          tags: ghcr.io/visorcraft/mongreldb-server:${{ github.ref_name }}-amd64
+          tags: ghcr.io/visorcraft/mongreldb-server:${{ inputs.tag || github.ref_name }}-amd64
 
   image-arm64:
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.checkout_ref || inputs.tag || github.ref }}
 
       - uses: docker/setup-buildx-action@v4
 
@@ -149,7 +170,7 @@ jobs:
           platforms: linux/arm64
           push: true
           provenance: false
-          tags: ghcr.io/visorcraft/mongreldb-server:${{ github.ref_name }}-arm64
+          tags: ghcr.io/visorcraft/mongreldb-server:${{ inputs.tag || github.ref_name }}-arm64
 
   image-manifest:
     needs: [image-amd64, image-arm64]
@@ -165,10 +186,10 @@ jobs:
 
       - run: |
           docker buildx imagetools create \
-            -t ghcr.io/visorcraft/mongreldb-server:${{ github.ref_name }} \
+            -t ghcr.io/visorcraft/mongreldb-server:${{ inputs.tag || github.ref_name }} \
             -t ghcr.io/visorcraft/mongreldb-server:latest \
-            ghcr.io/visorcraft/mongreldb-server:${{ github.ref_name }}-amd64 \
-            ghcr.io/visorcraft/mongreldb-server:${{ github.ref_name }}-arm64
+            ghcr.io/visorcraft/mongreldb-server:${{ inputs.tag || github.ref_name }}-amd64 \
+            ghcr.io/visorcraft/mongreldb-server:${{ inputs.tag || github.ref_name }}-arm64
 
   release-linux-binaries:
     needs: publish-crate
@@ -193,6 +214,8 @@ jobs:
             ar: aarch64-linux-gnu-ar
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.checkout_ref || inputs.tag || github.ref }}
 
       - uses: dtolnay/rust-toolchain@v1
         with:
@@ -214,11 +237,12 @@ jobs:
 
       - run: |
           mkdir -p dist
-          cp crates/mongreldb-server/target/${{ matrix.target }}/release/mongreldb-server dist/${{ matrix.asset }}
+          cp target/${{ matrix.target }}/release/mongreldb-server dist/${{ matrix.asset }}
           chmod +x dist/${{ matrix.asset }}
 
       - uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
           files: dist/${{ matrix.asset }}
 
   release-darwin-binaries:
@@ -226,6 +250,8 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.checkout_ref || inputs.tag || github.ref }}
 
       - uses: dtolnay/rust-toolchain@v1
         with:
@@ -246,15 +272,16 @@ jobs:
 
       - run: |
           mkdir -p dist
-          cp crates/mongreldb-server/target/aarch64-apple-darwin/release/mongreldb-server dist/mongreldb-server-darwin-arm64
+          cp target/aarch64-apple-darwin/release/mongreldb-server dist/mongreldb-server-darwin-arm64
           lipo -create \
-            crates/mongreldb-server/target/x86_64-apple-darwin/release/mongreldb-server \
-            crates/mongreldb-server/target/aarch64-apple-darwin/release/mongreldb-server \
+            target/x86_64-apple-darwin/release/mongreldb-server \
+            target/aarch64-apple-darwin/release/mongreldb-server \
             -output dist/mongreldb-server-darwin-universal
           chmod +x dist/mongreldb-server-darwin-arm64 dist/mongreldb-server-darwin-universal
 
       - uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
           files: |
             dist/mongreldb-server-darwin-arm64
             dist/mongreldb-server-darwin-universal
