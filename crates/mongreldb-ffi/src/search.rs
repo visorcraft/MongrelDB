@@ -7,7 +7,7 @@
 use crate::cstr::cstr_to_string;
 use crate::error::{clear, set_error, set_error_msg, ErrorCode};
 use crate::query::{build_condition, mongreldb_condition};
-use crate::table::{as_table, row_to_cells, FFIResult, mongreldb_result_t, mongreldb_table_t};
+use crate::table::{as_table, mongreldb_result_t, mongreldb_table_t, row_to_cells, FFIResult};
 use crate::value::EmbeddingSlice;
 use mongreldb_core::query::{
     Fusion, NamedRetriever, Rerank, Retriever, SearchRequest, VectorMetric, MAX_FINAL_LIMIT,
@@ -374,10 +374,7 @@ pub unsafe extern "C" fn mongreldb_table_search(
         Ok(r) => r,
         Err(_) => return std::ptr::null_mut(),
     };
-    let hits = match table
-        .db
-        .search_for_current_principal(&table.name, &request)
-    {
+    let hits = match table.db.search_for_current_principal(&table.name, &request) {
         Ok(hits) => hits,
         Err(e) => {
             set_error(&e);
@@ -403,7 +400,10 @@ pub unsafe extern "C" fn mongreldb_table_search(
             Some(proj) => proj
                 .iter()
                 .map(|cid| {
-                    let v = columns.get(cid).cloned().unwrap_or(mongreldb_core::Value::Null);
+                    let v = columns
+                        .get(cid)
+                        .cloned()
+                        .unwrap_or(mongreldb_core::Value::Null);
                     (*cid, v)
                 })
                 .collect(),

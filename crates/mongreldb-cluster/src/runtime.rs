@@ -46,18 +46,11 @@
 //! meta-owned allocator ([`MetaGroup::allocate_raft_node_ids`]), and
 //! [`NodeRuntime::abort_split`] unwinds an unpublished split.
 //!
-//! The data plane is the interim [`TabletLedger`]: the cluster crate has no
-//! storage-engine dependency (the consensus crate does not re-export core
-//! row types), so the engine's applied keyspace is opaque here. The ledger
-//! is a partition-keyed row store the runtime owns outright, replicated
-//! through the tablet's own raft group as [`COMMAND_TYPE_TABLET_DATA`]
-//! catalog commands and applied on every replica by the composite
-//! [`TabletGroupSink`] — real replication and durability, bound to the
-//! local engine-backed groups, without naming a core type. When the engine
-//! grows a tablet-aware keyspace API (Stage 3C's applied MVCC state), the
-//! [`crate::split::TabletKeyspace`] / [`crate::split::ChildStateSink`]
-//! seams rebind to it and the ledger retires; the split/merge protocol
-//! drivers are unchanged.
+//! Tablet row commands apply into a hidden clustered table owned by the
+//! consensus [`EngineApplySink`]. Split/merge reads pinned core MVCC views,
+//! catches up by diffing pinned and current engine generations, and installs
+//! children through their Raft groups. The cluster crate stays core-free:
+//! the consensus adapter exposes only encoded key/row-image bytes.
 //!
 //! # Graceful shutdown
 //!
@@ -73,17 +66,20 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use mongreldb_consensus::engine_sink::{
-    open_engine_sink, EngineApplySink, EngineGroupConfig, EngineSinkError,
+    open_engine_sink, EngineApplySink, EngineGroupConfig, EngineSinkError, EngineTabletPin,
+    TabletDataCommand, TabletDataCommandRecord, TabletDataMutation, COMMAND_TYPE_TABLET_DATA,
 };
 use mongreldb_consensus::error::ConsensusError;
 use mongreldb_consensus::group::{ConsensusGroup, GroupCommitReceipt, GroupConfig, GroupMetrics};
-use mongreldb_consensus::identity::{raft_node_id, CommandKind, RaftNodeId, ReplicatedCommand};
-use mongreldb_consensus::state_machine::{AppliedCommand, ApplySink, StateMachineError};
-use mongreldb_log::commit_log::{ExecutionControl, LogPosition};
+use mongreldb_consensus::identity::{raft_node_id, CommandKind, RaftNodeId};
+use mongreldb_consensus::raft_log::RaftCommitLog;
+use mongreldb_consensus::state_machine::ApplySink;
+use mongreldb_log::commit_log::{CommitLog, ExecutionControl, LogPosition};
 use mongreldb_log::envelope::CommandEnvelope;
 use mongreldb_types::hlc::HlcTimestamp;
 use mongreldb_types::ids::{DatabaseId, MetadataVersion, NodeId, RaftGroupId, TabletId};
 use openraft::BasicNode;
+#[cfg(test)]
 use serde::{Deserialize, Serialize};
 
 use crate::merge::{
@@ -92,13 +88,14 @@ use crate::merge::{
 };
 use crate::meta::{MetaCommand, MetaError, MetaGroup, MetaGroupConfig, MetaRejectionReason};
 use crate::network::{
-    PeerEndpoint, TcpTransport, TransportConfig, TransportError, TransportSecurity, TransportServer,
+    InternalRpcHandler, PeerEndpoint, TcpTransport, TransportConfig, TransportError,
+    TransportSecurity, TransportServer,
 };
 use crate::node::{ClusterError, NodeIdentity};
 use crate::split::{
     abort_split, split_progress, ChildAllocation, ChildStateSink, SnapshotPin, SplitAbortReport,
     SplitError, SplitExecutor, SplitKeySelection, SplitPhase, SplitPlan, SplitPublishCommand,
-    TabletDataError, TabletKeyspace, TabletMetaPlane, TabletSplitPlanner,
+    TabletDataError, TabletKeyspace, TabletMetaPlane, TabletMutation, TabletSplitPlanner,
 };
 use crate::tablet::{
     Key, ReplicaDescriptor, TablePartitioningRecord, TabletDescriptor, TabletError, TabletLayout,
@@ -284,100 +281,27 @@ fn tablet_group_name(tablet_id: TabletId) -> String {
     format!("tablet-{}", tablet_id.to_hex())
 }
 
-// ---------------------------------------------------------------------------
-// The interim tablet data plane (see the module docs)
-// ---------------------------------------------------------------------------
-
-/// `CommandEnvelope::command_type` of tablet data commands (upsert/replace
-/// of partition-keyed rows). Envelope discriminants are never reused (spec
-/// section 4.10): 1 is the engine transaction command, 2 the engine catalog
-/// command, 3 the maintenance command, 4 the meta control-plane command.
-pub const COMMAND_TYPE_TABLET_DATA: u32 = 5;
-
-/// The format version of [`TabletDataCommandRecord`] payloads this build
-/// writes.
-pub const TABLET_DATA_COMMAND_FORMAT_VERSION: u32 = 1;
-/// The oldest [`TabletDataCommandRecord`] format version this build accepts.
-pub const MIN_SUPPORTED_TABLET_DATA_COMMAND_FORMAT_VERSION: u32 = 1;
-
-/// One mutation of a tablet's applied keyspace (spec section 12.3).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TabletDataCommand {
-    /// Inserts or replaces the newest version of each key.
-    Upsert {
-        /// The key/value pairs, in commit order.
-        entries: Vec<(Key, Vec<u8>)>,
-    },
-    /// Atomically replaces the whole applied keyspace (the split/merge child
-    /// state install: staged beside live state, then installed in one
-    /// command — never a partial overwrite).
-    Replace {
-        /// The complete replacement contents.
-        rows: Vec<(Key, Vec<u8>)>,
-    },
-}
-
-/// The versioned payload of one [`COMMAND_TYPE_TABLET_DATA`] envelope.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TabletDataCommandRecord {
-    /// Format version; see [`TABLET_DATA_COMMAND_FORMAT_VERSION`].
-    pub format_version: u32,
-    /// The command.
-    pub command: TabletDataCommand,
-}
-
-impl TabletDataCommandRecord {
-    /// Wraps `command` at the current format version.
-    pub fn new(command: TabletDataCommand) -> Self {
-        Self {
-            format_version: TABLET_DATA_COMMAND_FORMAT_VERSION,
-            command,
-        }
-    }
-
-    /// Serializes the record (JSON).
-    pub fn encode(&self) -> Vec<u8> {
-        serde_json::to_vec(self).expect("tablet data command encoding is total")
-    }
-
-    /// Parses and verifies a record produced by [`Self::encode`]; unknown
-    /// versions and malformed payloads fail closed.
-    pub fn decode(payload: &[u8]) -> Result<Self, StateMachineError> {
-        let record: Self = serde_json::from_slice(payload)
-            .map_err(|error| StateMachineError::Corrupt(format!("tablet data command: {error}")))?;
-        if record.format_version < MIN_SUPPORTED_TABLET_DATA_COMMAND_FORMAT_VERSION
-            || record.format_version > TABLET_DATA_COMMAND_FORMAT_VERSION
-        {
-            return Err(StateMachineError::Corrupt(format!(
-                "tablet data command format version {} is outside \
-                 {MIN_SUPPORTED_TABLET_DATA_COMMAND_FORMAT_VERSION}..=\
-                 {TABLET_DATA_COMMAND_FORMAT_VERSION}",
-                record.format_version
-            )));
-        }
-        Ok(record)
-    }
-}
-
-/// Name of the ledger's durable checkpoint inside `<group dir>/raft/state/`.
+/// v0.60.3 ledger filename, retained only for one-way migration.
 pub const TABLET_LEDGER_FILENAME: &str = "tablet-ledger.json";
-/// The ledger checkpoint format version this build writes.
+/// v0.60.3 ledger fixture format.
+#[cfg(test)]
 pub const TABLET_LEDGER_FORMAT_VERSION: u32 = 1;
-/// The oldest ledger checkpoint format version this build accepts.
+/// Oldest v0.60.3 ledger fixture format.
+#[cfg(test)]
 pub const MIN_SUPPORTED_TABLET_LEDGER_FORMAT_VERSION: u32 = 1;
 
 /// The ceiling timestamp ("visible at any time"): one above every legal
 /// physical-micros value.
+#[cfg(test)]
 const MAX_TIMESTAMP: HlcTimestamp = HlcTimestamp {
     physical_micros: u64::MAX,
     logical: u32::MAX,
     node_tiebreaker: u32::MAX,
 };
 
-/// The durable ledger checkpoint: the applied keyspace (per-key version
-/// chains) plus the log watermark it reflects — the same crash-window
-/// replay dedup idiom as [`crate::meta::MetaApplySink`].
+/// v0.60.3 migration fixture.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg(test)]
 struct TabletLedgerCheckpoint {
     /// Checkpoint format version; see [`TABLET_LEDGER_FORMAT_VERSION`].
     format_version: u32,
@@ -387,17 +311,10 @@ struct TabletLedgerCheckpoint {
     rows: BTreeMap<Key, Vec<(HlcTimestamp, Vec<u8>)>>,
 }
 
-/// The applied keyspace of one tablet replica (see the module docs): an
-/// MVCC-lite, partition-keyed row store applied from the tablet group's
-/// committed raft log. Versions are kept per key so the split/merge
-/// executors can pin a snapshot at `split_ts`/`merge_ts` and read the
-/// before/after sides of the timeline; chains compact against the oldest
-/// live pin (a pin protects exactly the at-or-below view).
-///
-/// Persistence mirrors [`crate::meta::MetaApplySink`]: the checkpoint is
-/// rewritten atomically after every applied entry, and redelivery at or
-/// below the durable watermark is skipped, so applies never double-apply.
+/// Test-only model of the v0.60.3 ledger. Production opens migrate its JSON
+/// checkpoint into the core engine before starting Raft.
 #[derive(Debug)]
+#[cfg(test)]
 pub struct TabletLedger {
     rows: BTreeMap<Key, Vec<(HlcTimestamp, Vec<u8>)>>,
     /// Registered snapshot pins (timestamp -> live pin count).
@@ -406,10 +323,9 @@ pub struct TabletLedger {
     state_dir: PathBuf,
 }
 
+#[cfg(test)]
 impl TabletLedger {
-    /// Opens (creating if needed) the ledger under `group_dir`, loading the
-    /// persisted checkpoint when present. A present but undecodable or
-    /// unsupported-version checkpoint fails closed (spec section 4.10).
+    /// Opens the v0.60.3 fixture.
     pub fn open(group_dir: &Path) -> Result<Self, RuntimeError> {
         let state_dir = group_dir.join("raft").join("state");
         std::fs::create_dir_all(&state_dir).map_err(RuntimeError::Io)?;
@@ -458,7 +374,17 @@ impl TabletLedger {
         match command {
             TabletDataCommand::Upsert { entries } => {
                 for (key, value) in entries {
-                    self.insert_version(key.clone(), commit_ts, value.clone());
+                    self.insert_version(Key::from_bytes(key.clone()), commit_ts, value.clone());
+                }
+            }
+            TabletDataCommand::Delete { keys } => {
+                if !self.pins.is_empty() {
+                    return Err(RuntimeError::InvalidRequest(
+                        "legacy tablet ledger Delete with live snapshot pins".to_owned(),
+                    ));
+                }
+                for key in keys {
+                    self.rows.remove(&Key::from_bytes(key.clone()));
                 }
             }
             TabletDataCommand::Replace { rows } => {
@@ -473,7 +399,7 @@ impl TabletLedger {
                 }
                 self.rows.clear();
                 for (key, value) in rows {
-                    self.insert_version(key.clone(), commit_ts, value.clone());
+                    self.insert_version(Key::from_bytes(key.clone()), commit_ts, value.clone());
                 }
             }
         }
@@ -521,13 +447,10 @@ impl TabletLedger {
         self.position
     }
 
-    /// Registers a snapshot pin at `ts`; the matching [`LedgerPin`] guard
-    /// releases it.
     fn pin(&mut self, ts: HlcTimestamp) {
         *self.pins.entry(ts).or_insert(0) += 1;
     }
 
-    /// Releases one pin at `ts`.
     fn unpin(&mut self, ts: HlcTimestamp) {
         if let Some(count) = self.pins.get_mut(&ts) {
             *count -= 1;
@@ -588,19 +511,27 @@ impl TabletLedger {
             .sum()
     }
 
-    /// The checkpoint bytes, for the composite group snapshot.
-    fn snapshot_bytes(&self) -> Result<Vec<u8>, StateMachineError> {
+    fn snapshot_bytes(
+        &self,
+    ) -> Result<Vec<u8>, mongreldb_consensus::state_machine::StateMachineError> {
         serde_json::to_vec(&TabletLedgerCheckpoint {
             format_version: TABLET_LEDGER_FORMAT_VERSION,
             position: self.position,
             rows: self.rows.clone(),
         })
-        .map_err(|error| StateMachineError::Sink(format!("tablet ledger snapshot: {error}")))
+        .map_err(|error| {
+            mongreldb_consensus::state_machine::StateMachineError::Sink(format!(
+                "tablet ledger snapshot: {error}"
+            ))
+        })
     }
 
-    /// Installs checkpoint bytes produced by [`Self::snapshot_bytes`]
-    /// (fail closed on unknown versions or malformed payloads).
-    fn install_bytes(&mut self, bytes: &[u8]) -> Result<(), StateMachineError> {
+    fn install_bytes(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<(), mongreldb_consensus::state_machine::StateMachineError> {
+        use mongreldb_consensus::state_machine::StateMachineError;
+
         let checkpoint: TabletLedgerCheckpoint =
             serde_json::from_slice(bytes).map_err(|error| {
                 StateMachineError::Corrupt(format!("tablet ledger snapshot: {error}"))
@@ -617,65 +548,35 @@ impl TabletLedger {
         self.rows = checkpoint.rows;
         self.position = checkpoint.position;
         self.persist()
-            .map_err(|error| StateMachineError::Sink(format!("tablet ledger install: {error}")))
+            .map_err(|error| StateMachineError::Sink(error.to_string()))
     }
 }
 
-/// A [`TabletLedger`] snapshot pin ([`crate::split::SnapshotPin`]); dropping
-/// releases it.
-struct LedgerPin {
-    ts: HlcTimestamp,
-    ledger: Arc<Mutex<TabletLedger>>,
-}
-
-impl SnapshotPin for LedgerPin {
-    fn pinned_at(&self) -> HlcTimestamp {
-        self.ts
-    }
-}
-
-impl Drop for LedgerPin {
-    fn drop(&mut self) {
-        self.ledger
-            .lock()
-            .expect("tablet ledger lock poisoned")
-            .unpin(self.ts);
-    }
-}
-
-/// The composite apply sink of one tablet group: engine commands delegate
-/// to the consensus [`EngineApplySink`]; [`COMMAND_TYPE_TABLET_DATA`]
-/// commands apply to the [`TabletLedger`]. Snapshots frame both halves, so
-/// raft catch-up installs engine state and ledger atomically together.
-pub struct TabletGroupSink {
-    engine: Arc<Mutex<EngineApplySink>>,
-    ledger: Arc<Mutex<TabletLedger>>,
-}
-
-/// The composite snapshot framing version.
-const TABLET_GROUP_SNAPSHOT_FORMAT_VERSION: u32 = 1;
-
-/// `[version u32 LE][engine_len u64 LE][engine bytes][ledger bytes]`.
+#[cfg(test)]
 fn encode_group_snapshot(engine: &[u8], ledger: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(12 + engine.len() + ledger.len());
-    out.extend_from_slice(&TABLET_GROUP_SNAPSHOT_FORMAT_VERSION.to_le_bytes());
+    out.extend_from_slice(&1_u32.to_le_bytes());
     out.extend_from_slice(&(engine.len() as u64).to_le_bytes());
     out.extend_from_slice(engine);
     out.extend_from_slice(ledger);
     out
 }
 
-fn decode_group_snapshot(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>), StateMachineError> {
+#[cfg(test)]
+fn decode_group_snapshot(
+    bytes: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>), mongreldb_consensus::state_machine::StateMachineError> {
+    use mongreldb_consensus::state_machine::StateMachineError;
+
     if bytes.len() < 12 {
         return Err(StateMachineError::Corrupt(
             "tablet group snapshot: truncated frame".to_owned(),
         ));
     }
     let version = u32::from_le_bytes(bytes[..4].try_into().expect("4 bytes"));
-    if version != TABLET_GROUP_SNAPSHOT_FORMAT_VERSION {
+    if version != 1 {
         return Err(StateMachineError::Corrupt(format!(
-            "tablet group snapshot format version {version} is not \
-             {TABLET_GROUP_SNAPSHOT_FORMAT_VERSION}"
+            "tablet group snapshot format version {version} is not 1"
         )));
     }
     let engine_len = u64::from_le_bytes(bytes[4..12].try_into().expect("8 bytes")) as usize;
@@ -690,85 +591,12 @@ fn decode_group_snapshot(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>), StateMachin
     ))
 }
 
-impl TabletGroupSink {
-    /// The ledger half (read-path inspection, the split/merge keyspace seam).
-    pub fn ledger(&self) -> Arc<Mutex<TabletLedger>> {
-        self.ledger.clone()
-    }
-}
-
-impl ApplySink for TabletGroupSink {
-    fn apply(&mut self, command: &AppliedCommand) -> Result<(), StateMachineError> {
-        if let ReplicatedCommandRef::Catalog(envelope) = replicated_envelope(&command.command) {
-            if envelope.command_type == COMMAND_TYPE_TABLET_DATA {
-                envelope.verify().map_err(|error| {
-                    StateMachineError::Corrupt(format!("tablet data envelope: {error}"))
-                })?;
-                let record = TabletDataCommandRecord::decode(&envelope.payload)?;
-                let commit_ts = command.commit_ts().unwrap_or(HlcTimestamp::ZERO);
-                return self
-                    .ledger
-                    .lock()
-                    .map_err(|_| StateMachineError::Sink("tablet ledger lock poisoned".to_owned()))?
-                    .apply(&record.command, commit_ts, command.position)
-                    .map_err(|error| StateMachineError::Sink(error.to_string()));
-            }
-        }
-        self.engine
-            .lock()
-            .map_err(|_| StateMachineError::Sink("engine sink lock poisoned".to_owned()))?
-            .apply(command)
-    }
-
-    fn snapshot(&self) -> Result<Vec<u8>, StateMachineError> {
-        let engine = self
-            .engine
-            .lock()
-            .map_err(|_| StateMachineError::Sink("engine sink lock poisoned".to_owned()))?
-            .snapshot()?;
-        let ledger = self
-            .ledger
-            .lock()
-            .map_err(|_| StateMachineError::Sink("tablet ledger lock poisoned".to_owned()))?
-            .snapshot_bytes()?;
-        Ok(encode_group_snapshot(&engine, &ledger))
-    }
-
-    fn install(&mut self, data: &[u8]) -> Result<(), StateMachineError> {
-        let (engine, ledger) = decode_group_snapshot(data)?;
-        self.engine
-            .lock()
-            .map_err(|_| StateMachineError::Sink("engine sink lock poisoned".to_owned()))?
-            .install(&engine)?;
-        self.ledger
-            .lock()
-            .map_err(|_| StateMachineError::Sink("tablet ledger lock poisoned".to_owned()))?
-            .install_bytes(&ledger)
-    }
-}
-
-/// Borrowed view of one replicated command's envelope, for command-type
-/// dispatch in [`TabletGroupSink::apply`].
-enum ReplicatedCommandRef<'a> {
-    Catalog(&'a CommandEnvelope),
-    Other,
-}
-
-fn replicated_envelope(command: &ReplicatedCommand) -> ReplicatedCommandRef<'_> {
-    match command {
-        ReplicatedCommand::Catalog(catalog) => ReplicatedCommandRef::Catalog(&catalog.envelope),
-        _ => ReplicatedCommandRef::Other,
-    }
-}
-
-/// One tablet group hosted on this node: the consensus group over the
-/// composite engine+ledger sink, the descriptor it was opened with, and the
-/// ownership reservation (spec section 12.3: one tablet storage core is
-/// owned by one node process).
+/// One tablet group hosted on this node: its consensus group, engine MVCC
+/// sink, descriptor, and ownership reservation.
 struct TabletGroup {
     group: Arc<ConsensusGroup<TcpTransport>>,
     descriptor: TabletDescriptor,
-    sink: Arc<Mutex<TabletGroupSink>>,
+    sink: Arc<Mutex<EngineApplySink>>,
     _ownership: TabletOwnershipGuard<'static>,
 }
 
@@ -825,6 +653,42 @@ fn scan_tablet_layouts(node_data: &Path) -> Result<Vec<(TabletId, RaftGroupId)>,
     Ok(found)
 }
 
+fn active_snapshot_timestamp(
+    node_data: &Path,
+    tablet_id: TabletId,
+) -> Result<Option<HlcTimestamp>, RuntimeError> {
+    let mut found = None;
+    for (source_id, raft_group_id) in scan_tablet_layouts(node_data)? {
+        let layout = TabletLayout::new(node_data.to_path_buf(), source_id, raft_group_id);
+        let timestamp = if let Some(progress) = split_progress(&layout)?.filter(|progress| {
+            progress.source.tablet_id == tablet_id && progress.phase < SplitPhase::Published
+        }) {
+            Some(progress.split_ts)
+        } else {
+            merge_progress(&layout)?
+                .filter(|progress| {
+                    progress.phase < MergePhase::Published
+                        && progress
+                            .sources
+                            .iter()
+                            .any(|source| source.tablet_id == tablet_id)
+                })
+                .map(|progress| progress.merge_ts)
+        };
+        if let Some(timestamp) = timestamp {
+            if found
+                .replace(timestamp)
+                .is_some_and(|prior| prior != timestamp)
+            {
+                return Err(RuntimeError::InvalidRequest(format!(
+                    "tablet {tablet_id} appears in conflicting split/merge progress"
+                )));
+            }
+        }
+    }
+    Ok(found)
+}
+
 /// The peer endpoint of one node under the runtime's security mode.
 fn peer_endpoint(security: &TransportSecurity, node_id: NodeId, address: &str) -> PeerEndpoint {
     match security {
@@ -856,6 +720,27 @@ pub struct NodeRuntime {
     server: Option<TransportServer>,
     meta: Option<Arc<MetaGroup<TcpTransport>>>,
     tablets: BTreeMap<TabletId, TabletGroup>,
+}
+
+/// Cloneable client side of the node-internal cluster RPC path.
+#[derive(Clone)]
+pub struct NodeInternalRpcClient {
+    transport: Arc<TcpTransport>,
+}
+
+impl NodeInternalRpcClient {
+    /// Sends one opaque request to `target` under cluster mTLS.
+    pub async fn call(
+        &self,
+        target: NodeId,
+        service_id: u32,
+        body: Vec<u8>,
+    ) -> Result<Vec<u8>, RuntimeError> {
+        self.transport
+            .internal_rpc(raft_node_id(&target), service_id, body)
+            .await
+            .map_err(Into::into)
+    }
 }
 
 impl NodeRuntime {
@@ -971,7 +856,7 @@ impl NodeRuntime {
         Ok(groups)
     }
 
-    /// Opens one tablet group over the engine sink: validates this node's
+    /// Opens one tablet group over the engine MVCC sink: validates this node's
     /// replica, reserves the tablet directory, registers replica endpoints,
     /// and starts the raft task (which attaches itself to the transport
     /// registry).
@@ -1018,11 +903,30 @@ impl NodeRuntime {
             context.identity.node_id,
             database_id,
         );
-        let ledger = TabletLedger::open(&engine_config.group_dir())?;
-        let sink = Arc::new(Mutex::new(TabletGroupSink {
-            engine: open_engine_sink(&engine_config)?,
-            ledger: Arc::new(Mutex::new(ledger)),
-        }));
+        let sink = open_engine_sink(&engine_config)?;
+        {
+            let mut engine = sink
+                .lock()
+                .map_err(|_| RuntimeError::InvalidRequest("engine sink lock poisoned".into()))?;
+            engine.initialize_tablet_keyspace()?;
+            let legacy_path = engine_config
+                .group_dir()
+                .join("raft")
+                .join("state")
+                .join(TABLET_LEDGER_FILENAME);
+            if legacy_path.is_file() {
+                let bytes = std::fs::read(&legacy_path)?;
+                engine.migrate_legacy_tablet_ledger(
+                    &bytes,
+                    active_snapshot_timestamp(context.node_data, descriptor.tablet_id)?,
+                )?;
+                std::fs::remove_file(&legacy_path)?;
+                if let Some(parent) = legacy_path.parent() {
+                    std::fs::File::open(parent)?.sync_all()?;
+                }
+            }
+            engine.finish_legacy_tablet_migration()?;
+        }
         let mut group_config = GroupConfig::new(
             tablet_group_name(descriptor.tablet_id),
             replica.raft_node_id,
@@ -1034,9 +938,13 @@ impl NodeRuntime {
             timing.apply(&mut group_config);
         }
         let dyn_sink: Arc<Mutex<dyn ApplySink>> = sink.clone();
-        let group = ConsensusGroup::create(group_config, transport, dyn_sink).await?;
+        let group = Arc::new(ConsensusGroup::create(group_config, transport, dyn_sink).await?);
+        let commit_log: Arc<dyn CommitLog> = Arc::new(RaftCommitLog::new(group.clone()));
+        sink.lock()
+            .map_err(|_| RuntimeError::InvalidRequest("engine sink lock poisoned".into()))?
+            .bind_commit_log(commit_log)?;
         Ok(TabletGroup {
-            group: Arc::new(group),
+            group,
             descriptor: descriptor.clone(),
             sink,
             _ownership: ownership,
@@ -1068,6 +976,43 @@ impl NodeRuntime {
         &self.rpc_address
     }
 
+    /// Attaches the server's authenticated node-internal service endpoint.
+    ///
+    /// One handler is installed per durable node identity. Reattaching
+    /// replaces the prior endpoint atomically.
+    pub fn attach_internal_rpc_handler(
+        &self,
+        service_id: u32,
+        handler: Arc<dyn InternalRpcHandler>,
+    ) {
+        self.transport.registry().attach_internal(
+            raft_node_id(&self.identity.node_id),
+            service_id,
+            handler,
+        );
+    }
+
+    /// Sends one authenticated node-internal RPC through the cluster
+    /// transport.
+    pub async fn internal_rpc(
+        &self,
+        target: NodeId,
+        service_id: u32,
+        body: Vec<u8>,
+    ) -> Result<Vec<u8>, RuntimeError> {
+        self.transport
+            .internal_rpc(raft_node_id(&target), service_id, body)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Cloneable node-internal RPC client for gateway fan-out.
+    pub fn internal_rpc_client(&self) -> NodeInternalRpcClient {
+        NodeInternalRpcClient {
+            transport: Arc::clone(&self.transport),
+        }
+    }
+
     /// This node's meta group member, when it is a meta member.
     pub fn meta_group(&self) -> Option<&MetaGroup<TcpTransport>> {
         self.meta.as_deref()
@@ -1078,16 +1023,11 @@ impl NodeRuntime {
         self.tablets.get(&tablet_id).map(|tablet| &*tablet.group)
     }
 
-    /// The applied keyspace ledger of one tablet hosted on this node (the
-    /// interim data plane; see the module docs).
-    pub fn tablet_ledger(&self, tablet_id: TabletId) -> Option<Arc<Mutex<TabletLedger>>> {
-        self.tablets.get(&tablet_id).map(|tablet| {
-            tablet
-                .sink
-                .lock()
-                .expect("tablet sink lock poisoned")
-                .ledger()
-        })
+    /// The engine MVCC sink of one locally hosted tablet.
+    fn tablet_sink(&self, tablet_id: TabletId) -> Option<Arc<Mutex<EngineApplySink>>> {
+        self.tablets
+            .get(&tablet_id)
+            .map(|tablet| tablet.sink.clone())
     }
 
     /// The descriptor a hosted tablet group was opened with.
@@ -1152,7 +1092,7 @@ impl NodeRuntime {
 
     /// Creates (or validates the existing) local replica of `descriptor`:
     /// allocates the section 12.3 layout, opens the [`ConsensusGroup`] over
-    /// the composite engine+ledger sink, registers the group in the
+    /// the engine sink, registers the group in the
     /// transport registry, and — when `bootstrap_voters` is `Some` and the
     /// group is still pristine — bootstraps it with that voter set (call on
     /// exactly one replica). Idempotent for an identical descriptor; a
@@ -1507,15 +1447,18 @@ impl NodeRuntime {
                 "this node hosts no tablet {tablet_id}"
             )));
         }
-        let keyspace = match self.tablet_ledger(tablet_id) {
-            Some(ledger) => RuntimeKeyspace { ledger },
-            // The group is gone but the layout remains: the on-disk ledger
-            // checkpoint is written on every apply, so it is exactly as
-            // fresh as the live one (and the remaining retire step never
-            // reads it).
-            None => RuntimeKeyspace {
-                ledger: Arc::new(Mutex::new(TabletLedger::open(&source_layout.group_dir())?)),
+        let keyspace = RuntimeKeyspace {
+            sink: if progress
+                .as_ref()
+                .is_some_and(|record| record.phase >= SplitPhase::Published)
+            {
+                None
+            } else {
+                Some(self.tablet_sink(tablet_id).ok_or_else(|| {
+                    RuntimeError::InvalidRequest(format!("this node hosts no tablet {tablet_id}"))
+                })?)
             },
+            pinned: None,
         };
         let plane = RuntimeMetaPlane {
             meta: meta.clone(),
@@ -1543,6 +1486,11 @@ impl NodeRuntime {
         // The retire step's teardown removes the source directory; the local
         // group must not be running when that happens.
         if executor.phase() == SplitPhase::Published {
+            if let Some(sink) = self.tablet_sink(tablet_id) {
+                sink.lock()
+                    .map_err(|_| RuntimeError::InvalidRequest("engine sink lock poisoned".into()))?
+                    .release_tablet_snapshot()?;
+            }
             self.drop_hosted_tablet(tablet_id).await?;
         }
         let phase = tokio::task::spawn_blocking(move || executor.step())
@@ -1550,6 +1498,13 @@ impl NodeRuntime {
             .map_err(|error| {
                 RuntimeError::InvalidRequest(format!("split driver task failed: {error}"))
             })??;
+        if phase == SplitPhase::Published {
+            if let Some(sink) = self.tablet_sink(tablet_id) {
+                sink.lock()
+                    .map_err(|_| RuntimeError::InvalidRequest("engine sink lock poisoned".into()))?
+                    .release_tablet_snapshot()?;
+            }
+        }
         if matches!(phase, SplitPhase::MarkedSplitting | SplitPhase::Published) {
             self.refresh_local_descriptor(&source_layout)?;
         }
@@ -1642,6 +1597,11 @@ impl NodeRuntime {
             .map_err(|error| {
                 RuntimeError::InvalidRequest(format!("split abort task failed: {error}"))
             })??;
+        if let Some(sink) = self.tablet_sink(tablet_id) {
+            sink.lock()
+                .map_err(|_| RuntimeError::InvalidRequest("engine sink lock poisoned".into()))?
+                .release_tablet_snapshot()?;
+        }
         // The source's local replica metadata follows the restored
         // descriptor (the abort persisted it already).
         self.refresh_local_descriptor(&source_layout)?;
@@ -1713,12 +1673,19 @@ impl NodeRuntime {
             )));
         }
         let keyspace_of = |layout: &TabletLayout| -> Result<RuntimeKeyspace, RuntimeError> {
-            match self.tablet_ledger(layout.tablet_id()) {
-                Some(ledger) => Ok(RuntimeKeyspace { ledger }),
-                None => Ok(RuntimeKeyspace {
-                    ledger: Arc::new(Mutex::new(TabletLedger::open(&layout.group_dir())?)),
-                }),
-            }
+            Ok(RuntimeKeyspace {
+                sink: if retired_only {
+                    None
+                } else {
+                    Some(self.tablet_sink(layout.tablet_id()).ok_or_else(|| {
+                        RuntimeError::InvalidRequest(format!(
+                            "this node hosts no tablet {}",
+                            layout.tablet_id()
+                        ))
+                    })?)
+                },
+                pinned: None,
+            })
         };
         let (first_keyspace, second_keyspace) =
             (keyspace_of(&first_layout)?, keyspace_of(&second_layout)?);
@@ -1769,6 +1736,15 @@ impl NodeRuntime {
         // The retire step tears both sources down; neither local group may
         // be running then.
         if executor.phase() == MergePhase::Published {
+            for tablet_id in [first, second] {
+                if let Some(sink) = self.tablet_sink(tablet_id) {
+                    sink.lock()
+                        .map_err(|_| {
+                            RuntimeError::InvalidRequest("engine sink lock poisoned".into())
+                        })?
+                        .release_tablet_snapshot()?;
+                }
+            }
             self.drop_hosted_tablet(first).await?;
             self.drop_hosted_tablet(second).await?;
         }
@@ -1777,6 +1753,17 @@ impl NodeRuntime {
             .map_err(|error| {
                 RuntimeError::InvalidRequest(format!("merge driver task failed: {error}"))
             })??;
+        if phase == MergePhase::Published {
+            for tablet_id in [first, second] {
+                if let Some(sink) = self.tablet_sink(tablet_id) {
+                    sink.lock()
+                        .map_err(|_| {
+                            RuntimeError::InvalidRequest("engine sink lock poisoned".into())
+                        })?
+                        .release_tablet_snapshot()?;
+                }
+            }
+        }
         if matches!(phase, MergePhase::MarkedMerging | MergePhase::Published) {
             self.refresh_local_descriptor(&first_layout)?;
             self.refresh_local_descriptor(&second_layout)?;
@@ -1818,7 +1805,7 @@ impl NodeRuntime {
     }
 
     /// Plans a fresh merge of the pair against the meta state and the local
-    /// ledgers (spec section 12.6's requirement list): same table/schema,
+    /// engine keyspaces (spec section 12.6's requirement list): same table/schema,
     /// adjacent ranges, identical placement, no active schema job, combined
     /// size under the threshold. The replacement lands on the sources' node
     /// set with fresh meta-allocated raft ids.
@@ -1848,14 +1835,14 @@ impl NodeRuntime {
             .find(|job| job.table_id == first_desc.table_id && !job.state.is_terminal())
             .map(|job| job.job_id);
         let size_of = |tablet_id: TabletId| -> Result<u64, RuntimeError> {
-            Ok(self
-                .tablet_ledger(tablet_id)
+            self.tablet_sink(tablet_id)
                 .ok_or_else(|| {
                     RuntimeError::InvalidRequest(format!("this node hosts no tablet {tablet_id}"))
                 })?
                 .lock()
-                .expect("tablet ledger lock poisoned")
-                .size_bytes())
+                .map_err(|_| RuntimeError::InvalidRequest("engine sink lock poisoned".into()))?
+                .tablet_size_bytes()
+                .map_err(RuntimeError::from)
         };
         let replica_count = first_desc.replicas.len();
         let raft_ids = meta
@@ -2025,9 +2012,9 @@ impl NodeRuntime {
         Ok(report)
     }
 
-    /// Writes rows into a hosted tablet's applied keyspace (the interim data
-    /// plane; see the module docs): one raft-replicated upsert, committed
-    /// and applied on every replica. The proposal rides the local group, so
+    /// Writes rows into a hosted tablet's engine MVCC keyspace: one
+    /// raft-replicated upsert, committed and applied on every replica. The
+    /// proposal rides the local group, so
     /// it must be the leader — a [`ConsensusError::NotLeader`] surfaces with
     /// the leader hint for the caller to route by.
     pub async fn write_tablet_rows(
@@ -2041,7 +2028,10 @@ impl NodeRuntime {
             COMMAND_TYPE_TABLET_DATA,
             new_data_command_id()?,
             TabletDataCommandRecord::new(TabletDataCommand::Upsert {
-                entries: entries.to_vec(),
+                entries: entries
+                    .iter()
+                    .map(|(key, value)| (key.as_bytes().to_vec(), value.clone()))
+                    .collect(),
             })
             .encode(),
         );
@@ -2055,14 +2045,17 @@ impl NodeRuntime {
     /// The current applied rows of a hosted tablet (the local replica's
     /// point-in-time view; run a read barrier first for linearizability).
     pub fn tablet_rows(&self, tablet_id: TabletId) -> Result<BTreeMap<Key, Vec<u8>>, RuntimeError> {
-        let ledger = self.tablet_ledger(tablet_id).ok_or_else(|| {
+        let sink = self.tablet_sink(tablet_id).ok_or_else(|| {
             RuntimeError::InvalidRequest(format!("this node hosts no tablet {tablet_id}"))
         })?;
-        let rows = ledger
+        let rows = sink
             .lock()
-            .expect("tablet ledger lock poisoned")
-            .current_rows();
-        Ok(rows)
+            .map_err(|_| RuntimeError::InvalidRequest("engine sink lock poisoned".into()))?
+            .tablet_rows()?;
+        Ok(rows
+            .into_iter()
+            .map(|(key, value)| (Key::from_bytes(key), value))
+            .collect())
     }
 
     /// Point-in-time node status: identity, groups with roles, and applied
@@ -2109,6 +2102,16 @@ impl NodeRuntime {
                     first_error = Some(error.into());
                 }
             }
+            let close_result = tablet
+                .sink
+                .lock()
+                .map_err(|_| RuntimeError::InvalidRequest("engine sink lock poisoned".to_owned()))
+                .and_then(|mut sink| sink.close().map_err(RuntimeError::from));
+            if let Err(error) = close_result {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
         }
         if let Some(meta) = self.meta.take() {
             if let Err(error) = meta.shutdown().await {
@@ -2133,12 +2136,16 @@ impl NodeRuntime {
         // Stop accepting RPCs immediately (no drain).
         drop(self.server.take());
         for (_, tablet) in std::mem::take(&mut self.tablets) {
-            match Arc::try_unwrap(tablet.group) {
+            let TabletGroup { group, sink, .. } = tablet;
+            match Arc::try_unwrap(group) {
                 Ok(group) => group.crash().await,
                 Err(group) => {
                     let _ = group.shutdown().await;
                 }
             }
+            if let Ok(mut sink) = sink.lock() {
+                let _ = sink.crash();
+            };
         }
         if let Some(meta) = self.meta.take() {
             match Arc::try_unwrap(meta) {
@@ -2255,52 +2262,92 @@ impl MergeMetaPlane for RuntimeMetaPlane {
     }
 }
 
-/// The [`TabletKeyspace`] binding over a hosted tablet's applied ledger
-/// (the interim data plane; see the module docs).
+/// The [`TabletKeyspace`] binding over one hosted tablet's core MVCC table.
 struct RuntimeKeyspace {
-    ledger: Arc<Mutex<TabletLedger>>,
+    sink: Option<Arc<Mutex<EngineApplySink>>>,
+    pinned: Option<(HlcTimestamp, u64)>,
+}
+
+struct RuntimeSnapshotPin {
+    ts: HlcTimestamp,
+    _engine: EngineTabletPin,
+}
+
+impl SnapshotPin for RuntimeSnapshotPin {
+    fn pinned_at(&self) -> HlcTimestamp {
+        self.ts
+    }
 }
 
 impl TabletKeyspace for RuntimeKeyspace {
     fn pin_snapshot(&mut self, ts: HlcTimestamp) -> Result<Box<dyn SnapshotPin>, TabletDataError> {
-        self.ledger
+        let pin = self
+            .sink
+            .as_ref()
+            .ok_or_else(|| TabletDataError::Keyspace("tablet engine is not open".to_owned()))?
             .lock()
-            .map_err(|_| TabletDataError::Keyspace("tablet ledger lock poisoned".to_owned()))?
-            .pin(ts);
-        Ok(Box::new(LedgerPin {
-            ts,
-            ledger: self.ledger.clone(),
-        }))
+            .map_err(|_| TabletDataError::Keyspace("engine sink lock poisoned".to_owned()))?
+            .pin_tablet_snapshot(ts)
+            .map_err(|error| TabletDataError::Keyspace(error.to_string()))?;
+        self.pinned = Some((ts, pin.epoch()));
+        Ok(Box::new(RuntimeSnapshotPin { ts, _engine: pin }))
     }
 
     fn snapshot_at(
         &self,
         ts: HlcTimestamp,
     ) -> Result<crate::split::RecordStream<'_>, TabletDataError> {
-        let ledger = self
-            .ledger
+        let (_, epoch) = self
+            .pinned
+            .filter(|(pinned, _)| *pinned == ts)
+            .ok_or_else(|| {
+                TabletDataError::Keyspace(format!("tablet snapshot {ts:?} is not pinned"))
+            })?;
+        let rows = self
+            .sink
+            .as_ref()
+            .ok_or_else(|| TabletDataError::Keyspace("tablet engine is not open".to_owned()))?
             .lock()
-            .map_err(|_| TabletDataError::Keyspace("tablet ledger lock poisoned".to_owned()))?;
-        Ok(Box::new(ledger.rows_at(ts).into_iter()))
+            .map_err(|_| TabletDataError::Keyspace("engine sink lock poisoned".to_owned()))?
+            .tablet_rows_at_epoch(epoch)
+            .map_err(|error| TabletDataError::Keyspace(error.to_string()))?;
+        Ok(Box::new(
+            rows.into_iter()
+                .map(|(key, value)| (Key::from_bytes(key), value)),
+        ))
     }
 
     fn deltas_after(
         &self,
         ts: HlcTimestamp,
-    ) -> Result<crate::split::RecordStream<'_>, TabletDataError> {
-        let ledger = self
-            .ledger
+    ) -> Result<crate::split::MutationStream<'_>, TabletDataError> {
+        let (_, epoch) = self
+            .pinned
+            .filter(|(pinned, _)| *pinned == ts)
+            .ok_or_else(|| {
+                TabletDataError::Keyspace(format!("tablet snapshot {ts:?} is not pinned"))
+            })?;
+        let deltas = self
+            .sink
+            .as_ref()
+            .ok_or_else(|| TabletDataError::Keyspace("tablet engine is not open".to_owned()))?
             .lock()
-            .map_err(|_| TabletDataError::Keyspace("tablet ledger lock poisoned".to_owned()))?;
-        Ok(Box::new(ledger.deltas_after(ts).into_iter()))
+            .map_err(|_| TabletDataError::Keyspace("engine sink lock poisoned".to_owned()))?
+            .tablet_deltas_after_epoch(epoch)
+            .map_err(|error| TabletDataError::Keyspace(error.to_string()))?;
+        Ok(Box::new(deltas.into_iter().map(
+            |mutation| match mutation {
+                TabletDataMutation::Upsert(key, value) => {
+                    TabletMutation::Upsert(Key::from_bytes(key), value)
+                }
+                TabletDataMutation::Delete(key) => TabletMutation::Delete(Key::from_bytes(key)),
+            },
+        )))
     }
 }
 
-/// The [`ChildStateSink`] binding over a child/replacement tablet's live
-/// raft group: the staged build is local and the install is one
-/// [`TabletDataCommand::Replace`] committed through the group, so every
-/// child replica applies the identical state atomically; catch-up deltas
-/// ride [`TabletDataCommand::Upsert`] the same way.
+/// The [`ChildStateSink`] binding over a child/replacement tablet's live Raft
+/// group.
 struct RuntimeChildSink {
     group: Arc<ConsensusGroup<TcpTransport>>,
     handle: tokio::runtime::Handle,
@@ -2340,14 +2387,22 @@ impl ChildStateSink for RuntimeChildSink {
     fn install_staged(&mut self) -> Result<(), TabletDataError> {
         let rows = self.staged.take().ok_or(TabletDataError::NoStagedBuild)?;
         self.propose_data(TabletDataCommand::Replace {
-            rows: rows.into_iter().collect(),
+            rows: rows
+                .into_iter()
+                .map(|(key, value)| (key.into_bytes(), value))
+                .collect(),
         })
     }
 
-    fn apply_delta(&mut self, key: &Key, value: &[u8]) -> Result<(), TabletDataError> {
-        self.propose_data(TabletDataCommand::Upsert {
-            entries: vec![(key.clone(), value.to_vec())],
-        })
+    fn apply_delta(&mut self, mutation: &TabletMutation) -> Result<(), TabletDataError> {
+        match mutation {
+            TabletMutation::Upsert(key, value) => self.propose_data(TabletDataCommand::Upsert {
+                entries: vec![(key.as_bytes().to_vec(), value.clone())],
+            }),
+            TabletMutation::Delete(key) => self.propose_data(TabletDataCommand::Delete {
+                keys: vec![key.as_bytes().to_vec()],
+            }),
+        }
     }
 }
 
@@ -2398,7 +2453,7 @@ mod tests {
         ));
     }
 
-    // -- the interim tablet data plane -----------------------------------------
+    // -- v0.60.3 ledger migration fixtures ------------------------------------
 
     fn ts(micros: u64) -> HlcTimestamp {
         HlcTimestamp {
@@ -2414,7 +2469,7 @@ mod tests {
 
     fn upsert(key: &[u8], value: &[u8]) -> TabletDataCommand {
         TabletDataCommand::Upsert {
-            entries: vec![(Key::from_bytes(key.to_vec()), value.to_vec())],
+            entries: vec![(key.to_vec(), value.to_vec())],
         }
     }
 
@@ -2533,7 +2588,7 @@ mod tests {
             .unwrap();
         ledger.pin(ts(150));
         let replace = TabletDataCommand::Replace {
-            rows: vec![(Key::from_bytes(b"b".to_vec()), b"b@2".to_vec())],
+            rows: vec![(b"b".to_vec(), b"b@2".to_vec())],
         };
         assert!(ledger.apply(&replace, ts(200), pos(2)).is_err());
         ledger.unpin(ts(150));

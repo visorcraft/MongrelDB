@@ -302,6 +302,43 @@ impl AnnIndex {
         }
     }
 
+    /// Build-path insertion with cooperative checks inside Dense graph work.
+    /// Malformed historical rows remain quarantined, matching
+    /// [`Self::insert_validated`].
+    pub(crate) fn insert_validated_with_checkpoint<F>(
+        &mut self,
+        vec: &[f32],
+        row_id: RowId,
+        mut checkpoint: F,
+    ) -> Result<()>
+    where
+        F: FnMut() -> Result<()>,
+    {
+        if vec.len() != self.dim || vec.iter().any(|value| !value.is_finite()) {
+            return Ok(());
+        }
+        checkpoint()?;
+        match &mut self.body {
+            AnnBody::BinarySign {
+                bytes_per_vec,
+                active,
+                ..
+            } => {
+                let mut bits = vec![0u8; *bytes_per_vec];
+                for (i, value) in vec.iter().enumerate() {
+                    if *value > 0.0 {
+                        bits[i / 8] |= 1 << (i % 8);
+                    }
+                }
+                active.insert(bits, row_id);
+                Ok(())
+            }
+            AnnBody::Dense { active, .. } => {
+                active.insert_with_checkpoint(vec.to_vec(), row_id, checkpoint)
+            }
+        }
+    }
+
     /// k-nearest by the index metric (Hamming or cosine distance).
     pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<(RowId, AnnDistance)>> {
         self.search_with_context(query, k, None)

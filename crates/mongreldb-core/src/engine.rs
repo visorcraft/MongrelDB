@@ -381,6 +381,21 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// Derives the stable physical row id used by clustered (`WITHOUT ROWID`)
+/// tables from the encoded primary-key value.
+///
+/// Replicated tablet bootstrap uses this helper when it constructs the same
+/// logical row on every replica without going through the user transaction
+/// staging path.
+pub fn clustered_row_id(primary_key: &Value) -> RowId {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in primary_key.encode_key() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    RowId(hash.max(1))
+}
+
 const DEFAULT_SYNC_BYTE_THRESHOLD: u64 = 0; // manual commit only (pure group commit)
 pub(crate) const PAGE_CACHE_CAPACITY: u64 = 64 * 1024 * 1024; // 64 MiB shared page cache
 pub(crate) const DECODED_CACHE_CAPACITY: u64 = 64 * 1024 * 1024; // 64 MiB shared decoded-page cache (Phase 15.4)
@@ -573,6 +588,18 @@ pub struct ReadGeneration {
     deltas: TableDeltas,
     indexes: Arc<IndexGeneration>,
     visible_through: Epoch,
+}
+
+/// One fully-built secondary index staged outside the publication barrier.
+/// The variant carries only the target index. Unrelated live indexes remain
+/// structurally shared when this artifact is installed.
+pub(crate) enum SecondaryIndexArtifact {
+    Bitmap(u16, BitmapIndex),
+    LearnedRange(u16, ColumnLearnedRange),
+    Fm(u16, Box<FmIndex>),
+    Ann(u16, AnnIndex),
+    Sparse(u16, SparseIndex),
+    MinHash(u16, MinHashIndex),
 }
 
 /// The sealed in-memory deltas captured with a [`ReadGeneration`]: memtable,
@@ -1511,6 +1538,159 @@ fn condition_cost_rank(c: &crate::query::Condition) -> u8 {
 }
 
 impl Table {
+    /// Build one hidden secondary index from authoritative visible rows.
+    /// Callers run this against a pinned read generation, outside the final
+    /// publication barrier. `checkpoint` supplies cooperative cancellation,
+    /// resource checks, and progress reporting without coupling the engine to
+    /// the jobs framework.
+    pub(crate) fn build_secondary_index_artifact<F>(
+        &self,
+        definition: &IndexDef,
+        rows: &[Row],
+        mut checkpoint: F,
+    ) -> Result<SecondaryIndexArtifact>
+    where
+        F: FnMut(usize, usize) -> Result<()>,
+    {
+        let mut build_schema = self.schema.clone();
+        build_schema.indexes = vec![definition.clone()];
+        let (mut bitmap, mut ann, mut fm, mut sparse, mut minhash) = empty_indexes(&build_schema);
+        let name_to_id: HashMap<&str, u16> = self
+            .schema
+            .columns
+            .iter()
+            .map(|column| (column.name.as_str(), column.id))
+            .collect();
+        let mut hot = HotIndex::new();
+        let mut accepted = Vec::with_capacity(rows.len());
+
+        for (offset, row) in rows.iter().enumerate() {
+            checkpoint(offset, rows.len())?;
+            if row.deleted {
+                continue;
+            }
+            if let Some(predicate) = &definition.predicate {
+                let columns: HashMap<u16, &Value> =
+                    row.columns.iter().map(|(id, value)| (*id, value)).collect();
+                if !eval_partial_predicate(predicate, &columns, &name_to_id) {
+                    continue;
+                }
+            }
+            accepted.push(row);
+            if definition.kind == IndexKind::LearnedRange {
+                continue;
+            }
+            let effective = if self.column_keys.is_empty() {
+                row.clone()
+            } else {
+                self.tokenized_for_indexes(row)
+            };
+            if definition.kind == IndexKind::Ann {
+                if let (Some(index), Some(vector)) = (
+                    ann.get_mut(&definition.column_id),
+                    effective
+                        .columns
+                        .get(&definition.column_id)
+                        .and_then(Value::as_embedding),
+                ) {
+                    index.insert_validated_with_checkpoint(vector, effective.row_id, || {
+                        checkpoint(offset, rows.len())
+                    })?;
+                }
+            } else {
+                index_into_single(
+                    definition,
+                    &build_schema,
+                    &effective,
+                    &mut hot,
+                    &mut bitmap,
+                    &mut ann,
+                    &mut fm,
+                    &mut sparse,
+                    &mut minhash,
+                );
+            }
+        }
+        checkpoint(rows.len(), rows.len())?;
+
+        let column_id = definition.column_id;
+        match definition.kind {
+            IndexKind::Bitmap => bitmap
+                .remove(&column_id)
+                .map(|index| SecondaryIndexArtifact::Bitmap(column_id, index)),
+            IndexKind::Ann => ann
+                .remove(&column_id)
+                .map(|index| SecondaryIndexArtifact::Ann(column_id, index)),
+            IndexKind::FmIndex => fm
+                .remove(&column_id)
+                .map(|index| SecondaryIndexArtifact::Fm(column_id, Box::new(index))),
+            IndexKind::Sparse => sparse
+                .remove(&column_id)
+                .map(|index| SecondaryIndexArtifact::Sparse(column_id, index)),
+            IndexKind::MinHash => minhash
+                .remove(&column_id)
+                .map(|index| SecondaryIndexArtifact::MinHash(column_id, index)),
+            IndexKind::LearnedRange => {
+                let epsilon = definition
+                    .options
+                    .learned_range
+                    .as_ref()
+                    .map(|options| options.epsilon)
+                    .unwrap_or(16);
+                let column = self
+                    .schema
+                    .columns
+                    .iter()
+                    .find(|column| column.id == column_id)
+                    .ok_or_else(|| {
+                        MongrelError::Schema(format!(
+                            "index {} references unknown column {column_id}",
+                            definition.name
+                        ))
+                    })?;
+                let index = match column.ty {
+                    TypeId::Int64 | TypeId::TimestampNanos | TypeId::Date32 => {
+                        let pairs: Vec<_> = accepted
+                            .iter()
+                            .filter_map(|row| match row.columns.get(&column_id) {
+                                Some(Value::Int64(value)) if !row.deleted => {
+                                    Some((*value, row.row_id.0))
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        ColumnLearnedRange::build_i64_with_epsilon(&pairs, epsilon)
+                    }
+                    TypeId::Float32 | TypeId::Float64 => {
+                        let pairs: Vec<_> = accepted
+                            .iter()
+                            .filter_map(|row| match row.columns.get(&column_id) {
+                                Some(Value::Float64(value)) if !row.deleted => {
+                                    Some((*value, row.row_id.0))
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        ColumnLearnedRange::build_f64_with_epsilon(&pairs, epsilon)
+                    }
+                    ref ty => {
+                        return Err(MongrelError::Schema(format!(
+                            "LearnedRange index {} does not support {ty:?}",
+                            definition.name
+                        )));
+                    }
+                };
+                Some(SecondaryIndexArtifact::LearnedRange(column_id, index))
+            }
+        }
+        .ok_or_else(|| {
+            MongrelError::Other(format!(
+                "failed to construct hidden index {}",
+                definition.name
+            ))
+        })
+    }
+
     pub fn create(dir: impl AsRef<Path>, schema: Schema, table_id: u64) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         crate::durable_file::create_directory_all(&dir)?;
@@ -3172,16 +3352,7 @@ impl Table {
                     pk.id, pk.name
                 ))
             })?;
-        let key_bytes = pk_val.encode_key();
-        // Stable hash (FNV-1a 64-bit) — deterministic across runs and processes.
-        let mut hash: u64 = 0xcbf29ce484222325;
-        for &b in &key_bytes {
-            hash ^= b as u64;
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        // Ensure non-zero (RowId 0 is valid but we want to avoid collision with
-        // allocator-generated ids which start at 0 for non-clustered tables).
-        Ok(RowId(hash.max(1)))
+        Ok(clustered_row_id(pk_val))
     }
 
     /// Apply the metadata for rows that were spilled to a linked uniform-epoch
@@ -10357,21 +10528,44 @@ impl Table {
         let _ = std::fs::remove_dir_all(self.dir.join("_shadow"));
     }
 
-    /// Publish an index-only schema change: install `schema`, rebuild every
-    /// secondary index from currently visible rows, seal/publish a new
-    /// [`ReadGeneration`], and write the table schema + global index
-    /// checkpoint. Callers hold the short final publication barrier.
-    pub(crate) fn publish_index_schema_change(&mut self, schema: Schema) -> Result<()> {
+    /// Publish one hidden index artifact with its prepared schema. Callers
+    /// hold the final commit barrier and have already verified that
+    /// `artifact` covers the table's exact current epoch.
+    pub(crate) fn publish_index_schema_change(
+        &mut self,
+        schema: Schema,
+        artifact: SecondaryIndexArtifact,
+    ) -> Result<()> {
         self.apply_altered_schema_prepared(schema);
-        self.rebuild_indexes_from_runs()?;
-        self.build_learned_ranges()?;
+        self.prune_index_maps_to_schema();
+        match artifact {
+            SecondaryIndexArtifact::Bitmap(column_id, index) => {
+                self.bitmap.insert(column_id, index);
+            }
+            SecondaryIndexArtifact::LearnedRange(column_id, index) => {
+                Arc::make_mut(&mut self.learned_range).insert(column_id, index);
+            }
+            SecondaryIndexArtifact::Fm(column_id, index) => {
+                self.fm.insert(column_id, *index);
+            }
+            SecondaryIndexArtifact::Ann(column_id, index) => {
+                self.ann.insert(column_id, index);
+            }
+            SecondaryIndexArtifact::Sparse(column_id, index) => {
+                self.sparse.insert(column_id, index);
+            }
+            SecondaryIndexArtifact::MinHash(column_id, index) => {
+                self.minhash.insert(column_id, index);
+            }
+        }
         self.indexes_complete = true;
         self.seal_generations();
         let view = Arc::new(self.capture_read_generation());
         self.published.store(Arc::clone(&view));
         checkpoint_current_schema(self)?;
-        let epoch = self.current_epoch();
-        self.checkpoint_indexes(epoch);
+        // The catalog + rows are authoritative. A later flush/checkpoint
+        // persists this derived generation without extending the write fence.
+        self.invalidate_index_checkpoint();
         Ok(())
     }
 
@@ -10382,6 +10576,18 @@ impl Table {
     /// schema + rows.
     pub(crate) fn publish_index_drop(&mut self, schema: Schema) -> Result<()> {
         self.apply_altered_schema_prepared(schema);
+        self.prune_index_maps_to_schema();
+        self.indexes_complete = true;
+        self.seal_generations();
+        let view = Arc::new(self.capture_read_generation());
+        self.published.store(Arc::clone(&view));
+        checkpoint_current_schema(self)?;
+        // Dropped-index maps no longer match any prior checkpoint image.
+        self.invalidate_index_checkpoint();
+        Ok(())
+    }
+
+    fn prune_index_maps_to_schema(&mut self) {
         let keep_bitmap: std::collections::HashSet<u16> = self
             .schema
             .indexes
@@ -10436,14 +10642,6 @@ impl Table {
             let learned = Arc::make_mut(&mut self.learned_range);
             learned.retain(|column_id, _| keep_learned.contains(column_id));
         }
-        self.indexes_complete = true;
-        self.seal_generations();
-        let view = Arc::new(self.capture_read_generation());
-        self.published.store(Arc::clone(&view));
-        checkpoint_current_schema(self)?;
-        // Dropped-index maps no longer match any prior checkpoint image.
-        self.invalidate_index_checkpoint();
-        Ok(())
     }
 
     pub(crate) fn checkpoint_altered_schema(&mut self) -> Result<()> {

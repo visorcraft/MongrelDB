@@ -457,9 +457,8 @@ pub(crate) async fn try_admin_sql(
             Err(error) => cluster_error_response(&error),
         },
         AdminCommand::ShowTablets { table } => {
-            let (tablets, issues) =
-                mongreldb_cluster::tablet::list_tablets_on_disk(status_root)
-                    .unwrap_or_else(|e| (Vec::new(), vec![e.to_string()]));
+            let (tablets, issues) = mongreldb_cluster::tablet::list_tablets_on_disk(status_root)
+                .unwrap_or_else(|e| (Vec::new(), vec![e.to_string()]));
             let rows: Vec<Value> = tablets
                 .iter()
                 .filter(|t| {
@@ -489,9 +488,8 @@ pub(crate) async fn try_admin_sql(
             .into_response()
         }
         AdminCommand::ShowReplicas { tablet_id } => {
-            let (tablets, issues) =
-                mongreldb_cluster::tablet::list_tablets_on_disk(status_root)
-                    .unwrap_or_else(|e| (Vec::new(), vec![e.to_string()]));
+            let (tablets, issues) = mongreldb_cluster::tablet::list_tablets_on_disk(status_root)
+                .unwrap_or_else(|e| (Vec::new(), vec![e.to_string()]));
             let mut replicas = Vec::new();
             for t in &tablets {
                 if tablet_id.is_some_and(|id| id != t.tablet_id) {
@@ -737,21 +735,19 @@ pub(crate) async fn try_admin_sql(
                 }
             }
         }
-        AdminCommand::TransferLeader { tablet_id, to } => {
-            match &state.cluster_runtime {
-                None => runtime_not_running_response(
-                    "TRANSFER LEADER",
-                    json!({
-                        "tablet_id": tablet_id.to_string(),
-                        "to": to.to_string(),
-                    }),
-                ),
-                Some(runtime) => match runtime.transfer_leader(tablet_id, to).await {
-                    Ok(body) => Json(body).into_response(),
-                    Err(error) => runtime_op_error_response("TRANSFER LEADER", error.to_string()),
-                },
-            }
-        }
+        AdminCommand::TransferLeader { tablet_id, to } => match &state.cluster_runtime {
+            None => runtime_not_running_response(
+                "TRANSFER LEADER",
+                json!({
+                    "tablet_id": tablet_id.to_string(),
+                    "to": to.to_string(),
+                }),
+            ),
+            Some(runtime) => match runtime.transfer_leader(tablet_id, to).await {
+                Ok(body) => Json(body).into_response(),
+                Err(error) => runtime_op_error_response("TRANSFER LEADER", error.to_string()),
+            },
+        },
         AdminCommand::MoveReplica {
             tablet_id,
             from,

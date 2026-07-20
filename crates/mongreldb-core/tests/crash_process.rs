@@ -7,6 +7,8 @@
 //!
 //! On Unix, `Child::kill` is documented to send `SIGKILL`, i.e. `kill -9`.
 
+use mongreldb_core::query::{Retriever, RetrieverScore};
+use mongreldb_core::schema::AnnQuantization;
 use mongreldb_core::{Database, Table, Value};
 use std::io::BufRead;
 use std::path::PathBuf;
@@ -300,5 +302,52 @@ fn every_canonical_durable_hook_survives_real_kill9() {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn online_index_publication_hooks_recover_complete_authoritative_state_after_kill9() {
+    for hook in ["index.publish.before", "index.publish.after"] {
+        let dir = TempDir::new().unwrap();
+        spawn_and_kill_args(
+            &["index-ddl-hook".into(), hook.into()],
+            "HOOK_READY",
+            dir.path(),
+        );
+        let db = Database::open(dir.path())
+            .unwrap_or_else(|error| panic!("{hook}: reopen database: {error}"));
+        let handle = db.table("docs").unwrap();
+        let mut table = handle.lock();
+        let index = table
+            .schema()
+            .indexes
+            .iter()
+            .find(|index| index.name == "idx_embedding");
+        if hook == "index.publish.before" {
+            assert!(index.is_none(), "before-boundary crash published schema");
+        } else {
+            assert_eq!(
+                index
+                    .and_then(|index| index.options.ann.as_ref())
+                    .map(|options| options.quantization),
+                Some(AnnQuantization::Dense),
+                "after-boundary crash lost Dense schema"
+            );
+            let hits = table
+                .retrieve(&Retriever::Ann {
+                    column_id: 2,
+                    query: vec![1.0, 0.0, 0.0, 0.0],
+                    k: 1,
+                })
+                .unwrap();
+            assert_eq!(hits.len(), 1);
+            assert!(matches!(
+                hits[0].score,
+                RetrieverScore::AnnCosineDistance(distance) if distance.abs() < 1e-5
+            ));
+        }
+        assert_eq!(table.count(), 1);
+        drop(table);
+        assert!(db.check().is_empty(), "{hook}");
     }
 }

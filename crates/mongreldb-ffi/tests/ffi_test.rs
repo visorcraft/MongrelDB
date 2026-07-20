@@ -660,7 +660,12 @@ fn ffi_taxonomy_permission_denied_category_code() {
         mongreldb_schema_builder_free(builder);
         let mut table_id = 0u64;
         let ret = mongreldb_create_table(bob, cstr("t"), schema, &mut table_id);
-        assert_eq!(ret, -6, "expected Unauthorized: {}", rust_str(mongreldb_last_error()));
+        assert_eq!(
+            ret,
+            -6,
+            "expected Unauthorized: {}",
+            rust_str(mongreldb_last_error())
+        );
         // Taxonomy distinguishes permission denied (20) from unauthenticated (19).
         assert_eq!(mongreldb_last_error_category_code(), 20);
         assert_eq!(

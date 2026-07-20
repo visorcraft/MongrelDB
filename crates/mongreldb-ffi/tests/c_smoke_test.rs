@@ -9,11 +9,12 @@ fn c_smoke_test() {
     let header = crate_root.join("include/mongreldb.h");
     let c_source = crate_root.join("tests/c_test.c");
     // Respect CARGO_TARGET_DIR (CI Clean release qualification sets this to
-    // /tmp/mongreldb-qualification-target). Without it, link looks under
-    // crates/mongreldb-ffi/target/release and fails with -lmongreldb missing.
+    // /tmp/mongreldb-qualification-target). Otherwise use the root workspace
+    // target. Looking under crates/mongreldb-ffi/target can silently link a
+    // stale pre-workspace library with an older ABI.
     let target_dir = std::env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| crate_root.join("target"));
+        .unwrap_or_else(|| crate_root.join("../..").join("target"));
     let lib_path = target_dir.join("release");
     let sanitize = std::env::var_os("MONGRELDB_C_SANITIZE").is_some();
     let binary = if sanitize {

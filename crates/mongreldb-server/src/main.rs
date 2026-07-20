@@ -810,47 +810,48 @@ async fn run_server(args: Args, pidfile: String, db: Arc<Database>) {
     // Optional Stage 2/3 product path: host a live NodeRuntime when the
     // operator supplied cluster node data (CLI and/or env). Fail closed on
     // start if the directory is not provisioned.
-    let cluster_handle = match cluster_runtime::cluster_node_data_from_env(
-        args.cluster_node_data.clone(),
-    ) {
-        Some(node_data) => {
-            let options = cluster_runtime::ClusterRuntimeOptions::resolve(
-                node_data,
-                args.cluster_rpc_listen.clone(),
-            );
-            eprintln!(
-                "cluster mode: starting NodeRuntime from {} (rpc listen {})",
-                options.node_data.display(),
-                options.rpc_listen
-            );
-            if options.plaintext_test {
-                eprintln!(
-                    "WARNING: MONGRELDB_CLUSTER_PLAINTEXT_TEST=1 — plaintext \
-                     cluster transport is for tests only (NON-PRODUCTION)"
+    let cluster_handle =
+        match cluster_runtime::cluster_node_data_from_env(args.cluster_node_data.clone()) {
+            Some(node_data) => {
+                let options = cluster_runtime::ClusterRuntimeOptions::resolve(
+                    node_data,
+                    args.cluster_rpc_listen.clone(),
                 );
-            }
-            match cluster_runtime::ClusterRuntimeHandle::start(options).await {
-                Ok(handle) => {
-                    match handle.runtime_status_json().await {
-                        Ok(status) => eprintln!(
-                            "cluster runtime live: node_id={} rpc={} meta={} tablets={}",
-                            status["node_id"],
-                            status["rpc_address"],
-                            status["meta_present"],
-                            status["tablet_count"]
-                        ),
-                        Err(error) => eprintln!("cluster runtime started but status failed: {error}"),
+                eprintln!(
+                    "cluster mode: starting NodeRuntime from {} (rpc listen {})",
+                    options.node_data.display(),
+                    options.rpc_listen
+                );
+                if options.plaintext_test {
+                    eprintln!(
+                        "WARNING: MONGRELDB_CLUSTER_PLAINTEXT_TEST=1 — plaintext \
+                     cluster transport is for tests only (NON-PRODUCTION)"
+                    );
+                }
+                match cluster_runtime::ClusterRuntimeHandle::start(options).await {
+                    Ok(handle) => {
+                        match handle.runtime_status_json().await {
+                            Ok(status) => eprintln!(
+                                "cluster runtime live: node_id={} rpc={} meta={} tablets={}",
+                                status["node_id"],
+                                status["rpc_address"],
+                                status["meta_present"],
+                                status["tablet_count"]
+                            ),
+                            Err(error) => {
+                                eprintln!("cluster runtime started but status failed: {error}")
+                            }
+                        }
+                        Some(handle)
                     }
-                    Some(handle)
-                }
-                Err(error) => {
-                    eprintln!("failed to start cluster NodeRuntime: {error}");
-                    std::process::exit(1);
+                    Err(error) => {
+                        eprintln!("failed to start cluster NodeRuntime: {error}");
+                        std::process::exit(1);
+                    }
                 }
             }
-        }
-        None => None,
-    };
+            None => None,
+        };
 
     let (app, server_control) = build_app_with_sessions_control_and_cluster(
         db.clone(),

@@ -112,11 +112,7 @@ fn canonical_json<T: Serialize>(value: &T) -> Result<Vec<u8>> {
 fn canonicalize(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
-            let sorted: serde_json::Map<String, serde_json::Value> = map
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect();
-            *map = sorted;
+            map.sort_keys();
             for value in map.values_mut() {
                 canonicalize(value);
             }

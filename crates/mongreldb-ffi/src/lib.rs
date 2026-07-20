@@ -156,16 +156,16 @@ pub use schema::{
     MONGRELDB_COL_EMBEDDING_BINARY_QUANTIZED, MONGRELDB_COL_ENCRYPTED,
     MONGRELDB_COL_ENCRYPTED_INDEXABLE, MONGRELDB_COL_NULLABLE, MONGRELDB_COL_PRIMARY_KEY,
 };
+pub use search::{
+    mongreldb_fusion, mongreldb_fusion_kind, mongreldb_projection, mongreldb_rerank,
+    mongreldb_retriever, mongreldb_retriever_array, mongreldb_retriever_kind,
+    mongreldb_search_metric, mongreldb_search_request, mongreldb_search_request_t,
+};
 pub use table::{
     mongreldb_ann_candidate_distance_kind, mongreldb_ann_rerank_hit, mongreldb_ann_rerank_result_t,
     mongreldb_cell, mongreldb_cell_input, mongreldb_cell_input_array, mongreldb_cell_slice,
     mongreldb_result_t, mongreldb_row, mongreldb_row_input_array, mongreldb_table_t,
     mongreldb_vector_metric,
-};
-pub use search::{
-    mongreldb_fusion, mongreldb_fusion_kind, mongreldb_projection, mongreldb_retriever,
-    mongreldb_retriever_array, mongreldb_retriever_kind, mongreldb_rerank, mongreldb_search_metric,
-    mongreldb_search_request, mongreldb_search_request_t,
 };
 pub use transaction::mongreldb_transaction_t;
 pub use value::{

@@ -193,10 +193,7 @@ pub fn process_rss_bytes() -> Option<u64> {
 /// - cache hit rate / compaction / replication backlogs default to calm values
 ///   when not instrumented (0 backlog, hit rate 1.0)
 pub fn build_pressure_inputs(src: &PressureInputSources) -> NodePressureInputs {
-    let configured_max_bytes = src
-        .db_max_bytes
-        .max(src.node_configured_max_bytes)
-        .max(1);
+    let configured_max_bytes = src.db_max_bytes.max(src.node_configured_max_bytes).max(1);
     let query_reserved_bytes = src
         .db_reserved_bytes
         .saturating_add(src.tablet_reserved_bytes);
@@ -581,9 +578,7 @@ impl Default for SchedulerAdmission {
 
 impl SchedulerAdmissionInner {
     fn lock(&self) -> std::sync::MutexGuard<'_, AdmissionState> {
-        self.state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
+        self.state.lock().unwrap_or_else(|error| error.into_inner())
     }
 }
 
@@ -602,9 +597,7 @@ pub enum AdmitError {
 }
 
 /// Map scheduler rejection onto a ResourceExhausted core error.
-pub fn scheduler_error_to_query(
-    error: SchedulerError,
-) -> mongreldb_query::MongrelQueryError {
+pub fn scheduler_error_to_query(error: SchedulerError) -> mongreldb_query::MongrelQueryError {
     let (resource, requested, limit) = match &error {
         SchedulerError::QueueFull { depth, max, .. } => ("scheduler_queue", *depth + 1, *max),
         SchedulerError::TenantQuota { .. } => ("tenant_quota", 1, 0),
@@ -624,24 +617,31 @@ pub fn admit_error_to_query(error: AdmitError) -> mongreldb_query::MongrelQueryE
         AdmitError::Cancelled => mongreldb_query::MongrelQueryError::InvalidQueryState(
             "SQL admission cancelled while waiting for scheduler slot".into(),
         ),
-        AdmitError::PressureRejected { resource } => {
-            mongreldb_query::MongrelQueryError::Core(
-                mongreldb_core::MongrelError::ResourceLimitExceeded {
-                    resource,
-                    requested: 1,
-                    limit: 0,
-                },
-            )
-        }
+        AdmitError::PressureRejected { resource } => mongreldb_query::MongrelQueryError::Core(
+            mongreldb_core::MongrelError::ResourceLimitExceeded {
+                resource,
+                requested: 1,
+                limit: 0,
+            },
+        ),
     }
 }
 
-/// Map AI pressure rejection onto a core error (kit AI path).
-pub fn pressure_reject_to_core(resource: &'static str) -> mongreldb_core::MongrelError {
-    mongreldb_core::MongrelError::ResourceLimitExceeded {
-        resource,
-        requested: 1,
-        limit: 0,
+/// Map scheduler admission onto the core taxonomy for non-SQL Kit work.
+pub fn admit_error_to_core(error: AdmitError) -> mongreldb_core::MongrelError {
+    match error {
+        AdmitError::Rejected(error) => match scheduler_error_to_query(error) {
+            mongreldb_query::MongrelQueryError::Core(error) => error,
+            error => mongreldb_core::MongrelError::Other(error.to_string()),
+        },
+        AdmitError::Cancelled => mongreldb_core::MongrelError::Cancelled,
+        AdmitError::PressureRejected { resource } => {
+            mongreldb_core::MongrelError::ResourceLimitExceeded {
+                resource,
+                requested: 1,
+                limit: 0,
+            }
+        }
     }
 }
 
@@ -785,7 +785,10 @@ mod tests {
             }
         })
         .await;
-        assert!(queued.is_ok(), "second request must enqueue behind the holder");
+        assert!(
+            queued.is_ok(),
+            "second request must enqueue behind the holder"
+        );
 
         let err = admission
             .submit_and_wait(sql_req("c"), std::future::pending::<()>())
@@ -795,10 +798,7 @@ mod tests {
             AdmitError::Rejected(e) => e,
             other => panic!("expected QueueFull, got {other:?}"),
         };
-        assert!(matches!(
-            rejected,
-            SchedulerError::QueueFull { max: 1, .. }
-        ));
+        assert!(matches!(rejected, SchedulerError::QueueFull { max: 1, .. }));
         let mapped = scheduler_error_to_query(rejected);
         assert!(matches!(
             mapped,
@@ -971,12 +971,8 @@ mod tests {
             mongreldb_core::MemoryGovernor::new(mongreldb_core::GovernorConfig::new(1_000_000))
                 .unwrap(),
         );
-        let actions = refresh_pressure(
-            &mut gov,
-            &high_pressure_inputs(1_000_000),
-            &admission,
-            None,
-        );
+        let actions =
+            refresh_pressure(&mut gov, &high_pressure_inputs(1_000_000), &admission, None);
         assert!(
             actions
                 .iter()
@@ -999,7 +995,10 @@ mod tests {
         let snap = admission.pressure().snapshot();
         assert!(snap.reject_ai);
         assert!(snap.reduced_admission);
-        assert!(snap.move_tablet_noops >= 1, "tablet move must be no-op counted");
+        assert!(
+            snap.move_tablet_noops >= 1,
+            "tablet move must be no-op counted"
+        );
         assert!(snap.evaluate_count >= 1);
 
         assert!(matches!(
@@ -1011,11 +1010,9 @@ mod tests {
 
         // Calm pressure restores AI admission and clears reduce.
         let calm_actions = refresh_pressure(&mut gov, &calm_inputs(1_000_000), &admission, None);
-        assert!(
-            !calm_actions
-                .iter()
-                .any(|a| matches!(a, GovernorAction::RejectOversizedAi))
-        );
+        assert!(!calm_actions
+            .iter()
+            .any(|a| matches!(a, GovernorAction::RejectOversizedAi)));
         let snap = admission.pressure().snapshot();
         assert!(!snap.reject_ai);
         assert!(!snap.reduced_admission);
@@ -1029,12 +1026,7 @@ mod tests {
             mongreldb_core::MemoryGovernor::new(mongreldb_core::GovernorConfig::new(1_000_000))
                 .unwrap(),
         );
-        refresh_pressure(
-            &mut gov,
-            &high_pressure_inputs(1_000_000),
-            &admission,
-            None,
-        );
+        refresh_pressure(&mut gov, &high_pressure_inputs(1_000_000), &admission, None);
 
         let err = admission
             .submit_and_wait(
@@ -1162,7 +1154,8 @@ mod tests {
             }
         }
 
-        let gov = MemoryGovernor::new(GovernorConfig::new(1_000_000).with_reserved_floor(0)).unwrap();
+        let gov =
+            MemoryGovernor::new(GovernorConfig::new(1_000_000).with_reserved_floor(0)).unwrap();
         let cache = Arc::new(FakeCache {
             reclaimable: StdAtomicU64::new(10_000),
         });
@@ -1188,4 +1181,3 @@ mod tests {
         assert_eq!(cache.reclaimable.load(Ordering::Relaxed), 0);
     }
 }
-

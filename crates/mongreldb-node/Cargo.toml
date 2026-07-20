@@ -1,6 +1,6 @@
 [package]
 name = "mongreldb-node"
-version = "0.60.3"
+version = "0.61.0"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
@@ -12,9 +12,9 @@ crate-type = ["cdylib"]
 
 [dependencies]
 bincode = "1"
-mongreldb-core = { path = "../mongreldb-core", version = "0.60.3" }
-mongreldb-query = { path = "../mongreldb-query", version = "0.60.3" }
-napi = { version = "2", default-features = false, features = ["napi8", "tokio_rt"] }
+mongreldb-core = { path = "../mongreldb-core", version = "0.61.0" }
+mongreldb-query = { path = "../mongreldb-query", version = "0.61.0" }
+napi = { version = "2", default-features = false, features = ["dyn-symbols", "napi8", "tokio_rt"] }
 napi-derive = "2"
 parking_lot = "0.12"
 arrow = "58"
@@ -27,7 +27,3 @@ zeroize = "1"
 
 [build-dependencies]
 napi-build = "2"
-
-# Standalone crate (built separately via `napi build`), not a workspace member —
-# keeps `cargo {test,clippy} --workspace` green without a Node toolchain.
-[workspace]

@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # Bump the MongrelDB workspace version everywhere it's pinned: the shared
-# workspace.package.version (covers mongreldb-core/mongreldb-query via
-# `version.workspace = true`), each standalone crate's own version
-# (mongreldb-client/-perf/-server/-node/-ffi/-kit-ffi/-jni) plus their internal
+# workspace.package.version (covers workspace-versioned crates), each
+# explicitly-versioned release crate plus their internal
 # path-dependency pins on mongreldb-core/mongreldb-query, the Node addon's
 # package.json/package-lock.json, the JNI pom.xml, the README JAR filenames,
-# and the ffi-release workflow JAR filenames. Then regenerates every Cargo.lock
-# (root workspace + each standalone crate) so the bump is fully reflected.
+# and the ffi-release workflow JAR filenames. Then regenerates the one root
+# workspace Cargo.lock so the bump is fully reflected.
 #
 # Note: external crates.io deps (mongreldb-kit / mongreldb-kit-core) are NOT
 # bumped — those track the separate mongreldb-kit repo's release cycle.
@@ -33,13 +32,21 @@ fi
 echo "Bumping mongreldb $OLD -> $NEW"
 
 # Every Cargo.toml carrying this workspace's own version and/or a path-dep
-# pin on mongreldb-core/mongreldb-query. Add new standalone crates here.
-# Note: standalone FFI/JNI/kit-ffi crates depend on mongreldb-kit from
+# pin on mongreldb-core/mongreldb-query. Add new release crates here.
+# Note: FFI/JNI/kit-ffi crates depend on mongreldb-kit from
 # crates.io (e.g. "0.48") — those pins are intentionally NOT bumped here
 # because they track the separate mongreldb-kit repo's release cycle.
 CARGO_FILES=(
   Cargo.toml
+  crates/mongreldb-types/Cargo.toml
+  crates/mongreldb-log/Cargo.toml
+  crates/mongreldb-fault/Cargo.toml
+  crates/mongreldb-sim/Cargo.toml
+  crates/mongreldb-protocol/Cargo.toml
+  crates/mongreldb-core/Cargo.toml
   crates/mongreldb-query/Cargo.toml
+  crates/mongreldb-consensus/Cargo.toml
+  crates/mongreldb-cluster/Cargo.toml
   crates/mongreldb-client/Cargo.toml
   crates/mongreldb-perf/Cargo.toml
   crates/mongreldb-server/Cargo.toml
@@ -47,6 +54,8 @@ CARGO_FILES=(
   crates/mongreldb-ffi/Cargo.toml
   crates/mongreldb-kit-ffi/Cargo.toml
   crates/mongreldb-jni/Cargo.toml
+  crates/mongreldb-migrate-mysql/Cargo.toml
+  crates/mongreldb-mysql-wire/Cargo.toml
 )
 for f in "${CARGO_FILES[@]}"; do
   sed -i "s/version = \"$OLD\"/version = \"$NEW\"/g" "$f"
@@ -67,13 +76,8 @@ sed -i "s/\\\\\"engine_version\\\\\":\\\\\"$OLD\\\\\"/\\\\\"engine_version\\\\\"
         s/\\\\\"query_version\\\\\":\\\\\"$OLD\\\\\"/\\\\\"query_version\\\\\":\\\\\"$NEW\\\\\"/" \
   crates/mongreldb-ffi/tests/c_test.c
 
-echo "Regenerating lockfiles (this compiles each crate; can take a while)..."
+echo "Regenerating the workspace lockfile (this can take a while)..."
 cargo check --workspace --all-features >/dev/null
-for d in mongreldb-client mongreldb-server mongreldb-perf mongreldb-node \
-         mongreldb-ffi mongreldb-kit-ffi mongreldb-jni; do
-  echo "  crates/$d"
-  (cd "crates/$d" && cargo check >/dev/null)
-done
 
 # Safety net: catch any file the hardcoded list above missed (e.g. a new
 # crate). Warns rather than fails -- Cargo.lock/target/node_modules always

@@ -1,6 +1,14 @@
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
-const { Database, ConditionKind, ColumnType, ConflictError, minhashMemberHashV1 } = require('./index.js');
+const {
+  AnnQuantizationSpec,
+  Database,
+  ConditionKind,
+  ColumnType,
+  ConflictError,
+  IndexKindSpec,
+  minhashMemberHashV1,
+} = require('./index.js');
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -1039,5 +1047,60 @@ console.log('smoke: AUTO_INCREMENT ✓');
   rmSync(dir, { recursive: true, force: true });
 }
 console.log('smoke: rename_table ✓');
+
+// ── Online ANN create/replace jobs ───────────────────────────────────────
+{
+  const dir = makeTempDir();
+  const db = Database.withPath(dir);
+  db.createTable('vectors', {
+    columns: [
+      { id: 1, name: 'id', ty: ColumnType.Int64, primaryKey: true, nullable: false },
+      {
+        id: 2,
+        name: 'embedding',
+        ty: ColumnType.Embedding,
+        primaryKey: false,
+        nullable: false,
+        embeddingDim: 2,
+      },
+    ],
+    indexes: [],
+  });
+  const table = db.getTable('vectors');
+  table.put([
+    { columnId: 1, int64: 1n },
+    { columnId: 2, embedding: [1, 0] },
+  ]);
+  table.put([
+    { columnId: 1, int64: 2n },
+    { columnId: 2, embedding: [0, 1] },
+  ]);
+  table.commit();
+
+  const createJob = db.startCreateIndex('vectors', {
+    name: 'idx_embedding',
+    columnId: 2,
+    kind: IndexKindSpec.Ann,
+    annQuantization: AnnQuantizationSpec.BinarySign,
+  });
+  assert.equal((await db.waitIndexJob(createJob, 60_000)).state, 'succeeded');
+
+  const replaceJob = db.startReplaceIndex('vectors', 'idx_embedding', {
+    name: 'idx_embedding',
+    columnId: 2,
+    kind: IndexKindSpec.Ann,
+    annQuantization: AnnQuantizationSpec.Dense,
+  });
+  assert.equal((await db.waitIndexJob(replaceJob, 60_000)).state, 'succeeded');
+  assert.equal(
+    table.query([
+      { kind: ConditionKind.Ann, columnId: 2, embedding: [1, 0], k: 2 },
+    ]).length,
+    2,
+  );
+  db.close();
+  rmSync(dir, { recursive: true, force: true });
+}
+console.log('smoke: online Dense ANN replacement ✓');
 
 console.log('All smoke tests passed.');

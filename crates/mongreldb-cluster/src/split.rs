@@ -940,8 +940,20 @@ pub trait SnapshotPin: Send {
 }
 
 /// The boxed record stream the keyspace seams return (snapshot rows or
-/// catch-up deltas, in the documented order).
+/// complete staged builds, in key order).
 pub type RecordStream<'a> = Box<dyn Iterator<Item = (Key, Vec<u8>)> + 'a>;
+
+/// One final-state mutation needed to catch a child up from a pinned view.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TabletMutation {
+    /// Insert or replace one encoded row.
+    Upsert(Key, Vec<u8>),
+    /// Delete one encoded row.
+    Delete(Key),
+}
+
+/// Boxed final-state mutation stream, in key order.
+pub type MutationStream<'a> = Box<dyn Iterator<Item = TabletMutation> + 'a>;
 
 /// The applied keyspace of one tablet replica, as the split (and merge)
 /// executors read it. The runtime wave binds this to the tablet's storage
@@ -956,9 +968,9 @@ pub trait TabletKeyspace {
     /// order.
     fn snapshot_at(&self, ts: HlcTimestamp) -> Result<RecordStream<'_>, TabletDataError>;
 
-    /// Mutations committed after `ts`, oldest first (step 6's catch-up
-    /// stream). Multiple versions of one key arrive in commit order.
-    fn deltas_after(&self, ts: HlcTimestamp) -> Result<RecordStream<'_>, TabletDataError>;
+    /// Final-state mutations needed to advance the pinned view to the current
+    /// view (step 6's catch-up stream).
+    fn deltas_after(&self, ts: HlcTimestamp) -> Result<MutationStream<'_>, TabletDataError>;
 }
 
 /// The child-state sink (spec section 12.5 step 5), staged like the engine's
@@ -977,8 +989,8 @@ pub trait ChildStateSink {
     /// Atomically installs the staged build as the child's applied state.
     fn install_staged(&mut self) -> Result<(), TabletDataError>;
 
-    /// Applies one post-snapshot delta to the installed state (step 6).
-    fn apply_delta(&mut self, key: &Key, value: &[u8]) -> Result<(), TabletDataError>;
+    /// Applies one post-snapshot mutation to the installed state (step 6).
+    fn apply_delta(&mut self, mutation: &TabletMutation) -> Result<(), TabletDataError>;
 }
 
 /// The reference [`TabletKeyspace`]: a shared in-memory multi-version map.
@@ -990,10 +1002,12 @@ pub struct MapKeyspace {
     state: Arc<Mutex<MapKeyspaceState>>,
 }
 
+type VersionChain = Vec<(HlcTimestamp, Option<Vec<u8>>)>;
+
 #[derive(Default)]
 struct MapKeyspaceState {
     /// Version chains per key, ascending timestamps.
-    rows: BTreeMap<Key, Vec<(HlcTimestamp, Vec<u8>)>>,
+    rows: BTreeMap<Key, VersionChain>,
     /// Live snapshot pins.
     pins: usize,
 }
@@ -1008,7 +1022,15 @@ impl MapKeyspace {
     pub fn insert(&self, key: Key, ts: HlcTimestamp, value: Vec<u8>) {
         let mut state = self.state.lock().expect("keyspace lock poisoned");
         let chain = state.rows.entry(key).or_default();
-        chain.push((ts, value));
+        chain.push((ts, Some(value)));
+        chain.sort_by_key(|(version, _)| *version);
+    }
+
+    /// Deletes `key` at `ts`.
+    pub fn delete(&self, key: Key, ts: HlcTimestamp) {
+        let mut state = self.state.lock().expect("keyspace lock poisoned");
+        let chain = state.rows.entry(key).or_default();
+        chain.push((ts, None));
         chain.sort_by_key(|(version, _)| *version);
     }
 
@@ -1025,7 +1047,7 @@ impl MapKeyspace {
             .iter()
             .filter_map(|(key, chain)| {
                 let visible = chain.iter().rfind(|(version, _)| *version <= ts)?;
-                Some((key.clone(), visible.1.clone()))
+                visible.1.as_ref().map(|value| (key.clone(), value.clone()))
             })
             .collect()
     }
@@ -1044,20 +1066,25 @@ impl TabletKeyspace for MapKeyspace {
         Ok(Box::new(self.rows_at(ts).into_iter()))
     }
 
-    fn deltas_after(&self, ts: HlcTimestamp) -> Result<RecordStream<'_>, TabletDataError> {
-        let state = self.state.lock().expect("keyspace lock poisoned");
-        let mut deltas: Vec<(HlcTimestamp, Key, Vec<u8>)> = Vec::new();
-        for (key, chain) in &state.rows {
-            for (version, value) in chain {
-                if *version > ts {
-                    deltas.push((*version, key.clone(), value.clone()));
-                }
+    fn deltas_after(&self, ts: HlcTimestamp) -> Result<MutationStream<'_>, TabletDataError> {
+        let before = self.rows_at(ts);
+        let current = self.rows_at(HlcTimestamp {
+            physical_micros: u64::MAX,
+            logical: u32::MAX,
+            node_tiebreaker: u32::MAX,
+        });
+        let mut deltas = Vec::new();
+        for (key, value) in &current {
+            if before.get(key) != Some(value) {
+                deltas.push(TabletMutation::Upsert(key.clone(), value.clone()));
             }
         }
-        deltas.sort();
-        Ok(Box::new(
-            deltas.into_iter().map(|(_, key, value)| (key, value)),
-        ))
+        for key in before.keys() {
+            if !current.contains_key(key) {
+                deltas.push(TabletMutation::Delete(key.clone()));
+            }
+        }
+        Ok(Box::new(deltas.into_iter()))
     }
 }
 
@@ -1132,9 +1159,16 @@ impl ChildStateSink for MapChildSink {
         Ok(())
     }
 
-    fn apply_delta(&mut self, key: &Key, value: &[u8]) -> Result<(), TabletDataError> {
+    fn apply_delta(&mut self, mutation: &TabletMutation) -> Result<(), TabletDataError> {
         let mut state = self.state.lock().expect("child sink lock poisoned");
-        state.installed.insert(key.clone(), value.to_vec());
+        match mutation {
+            TabletMutation::Upsert(key, value) => {
+                state.installed.insert(key.clone(), value.clone());
+            }
+            TabletMutation::Delete(key) => {
+                state.installed.remove(key);
+            }
+        }
         Ok(())
     }
 }
@@ -1557,9 +1591,12 @@ impl<M: TabletMetaPlane, K: TabletKeyspace, S: ChildStateSink> SplitExecutor<M, 
         self.ensure_snapshot_pin()?;
         let plan = self.plan();
         let deltas = self.keyspace.deltas_after(self.progress.split_ts)?;
-        for (key, value) in deltas {
-            let index = route_child(&plan, &key)?;
-            self.sinks[index].apply_delta(&key, &value)?;
+        for mutation in deltas {
+            let key = match &mutation {
+                TabletMutation::Upsert(key, _) | TabletMutation::Delete(key) => key,
+            };
+            let index = route_child(&plan, key)?;
+            self.sinks[index].apply_delta(&mutation)?;
         }
         Ok(())
     }

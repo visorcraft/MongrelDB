@@ -54,8 +54,10 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -98,6 +100,11 @@ pub const RAFT_MSG_INSTALL_SNAPSHOT_RESPONSE: u32 = 6;
 pub const RAFT_MSG_TRIGGER_ELECTION_REQUEST: u32 = 7;
 /// Election-trigger response frame.
 pub const RAFT_MSG_TRIGGER_ELECTION_RESPONSE: u32 = 8;
+/// Authenticated internal service request frame. The payload names a local
+/// node-level handler and carries one bounded opaque service body.
+pub const INTERNAL_MSG_REQUEST: u32 = 100;
+/// Authenticated internal service response frame.
+pub const INTERNAL_MSG_RESPONSE: u32 = 101;
 
 /// DNS domain node certificate names live under; see [`node_cert_name`].
 pub const NODE_CERT_DOMAIN: &str = "mongreldb.cluster";
@@ -222,9 +229,25 @@ impl PeerEndpoint {
 /// [`TransportServer`]: which local raft nodes inbound RPCs route to.
 /// `RaftTransport::attach`/`detach` registrations land here, so the server's
 /// view of attached groups follows the trait lifecycle exactly.
+type InternalHandlerMap = HashMap<(RaftNodeId, u32), Arc<dyn InternalRpcHandler>>;
+
 #[derive(Clone, Default)]
 pub struct TransportRegistry {
     nodes: Arc<Mutex<HashMap<RaftNodeId, MongrelRaft>>>,
+    internal_handlers: Arc<Mutex<InternalHandlerMap>>,
+}
+
+/// Boxed future returned by [`InternalRpcHandler`].
+pub type InternalRpcFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>>;
+
+/// One node-internal RPC service attached to the identity-bound cluster
+/// transport.
+///
+/// The transport authenticates both nodes before invoking this trait. Service
+/// implementations still validate and bound their own versioned payload.
+pub trait InternalRpcHandler: Send + Sync {
+    /// Handles one opaque service body.
+    fn handle<'a>(&'a self, body: &'a [u8]) -> InternalRpcFuture<'a>;
 }
 
 impl TransportRegistry {
@@ -246,6 +269,40 @@ impl TransportRegistry {
     /// The raft handle registered for `node_id`, if any.
     pub fn get(&self, node_id: RaftNodeId) -> Option<MongrelRaft> {
         self.lock().get(&node_id).cloned()
+    }
+
+    /// Attaches or replaces one node-level internal RPC handler.
+    pub fn attach_internal(
+        &self,
+        node_id: RaftNodeId,
+        service_id: u32,
+        handler: Arc<dyn InternalRpcHandler>,
+    ) {
+        self.internal_handlers
+            .lock()
+            .expect("internal handler registry lock poisoned")
+            .insert((node_id, service_id), handler);
+    }
+
+    /// Detaches one node-level internal RPC handler.
+    pub fn detach_internal(&self, node_id: RaftNodeId, service_id: u32) {
+        self.internal_handlers
+            .lock()
+            .expect("internal handler registry lock poisoned")
+            .remove(&(node_id, service_id));
+    }
+
+    /// Resolves one node-level internal RPC handler.
+    pub fn internal_handler(
+        &self,
+        node_id: RaftNodeId,
+        service_id: u32,
+    ) -> Option<Arc<dyn InternalRpcHandler>> {
+        self.internal_handlers
+            .lock()
+            .expect("internal handler registry lock poisoned")
+            .get(&(node_id, service_id))
+            .cloned()
     }
 
     /// Number of attached nodes.
@@ -705,6 +762,13 @@ struct RpcPayload<T> {
     rpc: T,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct InternalRpcPayload {
+    target: RaftNodeId,
+    service_id: u32,
+    body: Vec<u8>,
+}
+
 /// Writes one envelope frame, bounded by `timeout`.
 async fn write_frame<S: AsyncWrite + Unpin>(
     stream: &mut S,
@@ -865,6 +929,36 @@ impl TcpTransport {
             .expect("peer directory lock poisoned")
             .get(&node_id)
             .cloned()
+    }
+
+    /// Sends one opaque, bounded request to an internal service attached at
+    /// `target`.
+    ///
+    /// Delivery uses the same TLS 1.3 mutual authentication, admitted-node
+    /// identity check, checksummed envelope, connection bound, and timeout as
+    /// Raft control traffic. The service owns its inner payload version.
+    pub async fn internal_rpc(
+        &self,
+        target: RaftNodeId,
+        service_id: u32,
+        body: Vec<u8>,
+    ) -> Result<Vec<u8>, TransportError> {
+        let payload = serde_json::to_vec(&InternalRpcPayload {
+            target,
+            service_id,
+            body,
+        })
+        .map_err(|error| {
+            TransportError::ProtocolViolation(format!("unencodable internal request: {error}"))
+        })?;
+        self.round_trip(
+            target,
+            INTERNAL_MSG_REQUEST,
+            INTERNAL_MSG_RESPONSE,
+            payload,
+            self.config.rpc_timeout,
+        )
+        .await
     }
 
     /// One RPC round trip: connect (with bounded reconnect backoff), write
@@ -1442,6 +1536,28 @@ impl TransportServer {
                             Err(error) => Self::error_frame(format!("raft core error: {error}")),
                         },
                     },
+                }
+            }
+            INTERNAL_MSG_REQUEST => {
+                let request = serde_json::from_slice::<InternalRpcPayload>(payload);
+                match request {
+                    Err(error) => {
+                        Self::error_frame(format!("undecodable internal request payload: {error}"))
+                    }
+                    Ok(request) => {
+                        match registry.internal_handler(request.target, request.service_id) {
+                            None => Self::error_frame(format!(
+                                "node {} has no internal RPC handler for service {}",
+                                request.target, request.service_id
+                            )),
+                            Some(handler) => match handler.handle(&request.body).await {
+                                Ok(response) => (INTERNAL_MSG_RESPONSE, response),
+                                Err(error) => Self::error_frame(format!(
+                                    "internal RPC handler failed: {error}"
+                                )),
+                            },
+                        }
+                    }
                 }
             }
             unknown => Self::error_frame(format!("unknown raft message type {unknown}")),

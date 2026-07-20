@@ -386,6 +386,12 @@ pub enum IndexKindSpec {
     LearnedRange,
 }
 
+#[napi]
+pub enum AnnQuantizationSpec {
+    BinarySign,
+    Dense,
+}
+
 #[napi(object)]
 pub struct ColumnSpec {
     pub id: u16,
@@ -421,6 +427,52 @@ pub struct IndexSpec {
     pub name: String,
     pub column_id: u16,
     pub kind: IndexKindSpec,
+    /// ANN representation. Defaults to BinarySign; ignored for other kinds.
+    pub ann_quantization: Option<AnnQuantizationSpec>,
+}
+
+#[napi(object)]
+pub struct IndexJobInfo {
+    pub job_id: BigInt,
+    pub state: String,
+    pub progress: f64,
+    pub done: BigInt,
+    pub total: BigInt,
+    pub error: Option<String>,
+}
+
+fn index_job_info(record: mongreldb_core::JobRecord) -> IndexJobInfo {
+    IndexJobInfo {
+        job_id: BigInt::from(record.job_id),
+        state: format!("{:?}", record.state).to_ascii_lowercase(),
+        progress: record.progress.fraction,
+        done: BigInt::from(record.progress.done),
+        total: BigInt::from(record.progress.total),
+        error: record.error,
+    }
+}
+
+pub struct IndexJobWaitTask {
+    db: Arc<CoreDatabase>,
+    job_id: u64,
+    timeout: std::time::Duration,
+}
+
+impl napi::Task for IndexJobWaitTask {
+    type Output = Result<mongreldb_core::JobRecord, mongreldb_core::MongrelError>;
+    type JsValue = IndexJobInfo;
+
+    fn compute(&mut self) -> napi::Result<Self::Output> {
+        Ok(self
+            .db
+            .job_registry()
+            .wait_terminal(self.job_id, self.timeout)
+            .map_err(mongreldb_core::MongrelError::from))
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> napi::Result<Self::JsValue> {
+        output.map(index_job_info).map_err(to_napi)
+    }
 }
 
 /// Result of a `compactAll` operation.
@@ -644,24 +696,7 @@ fn build_schema(spec: SchemaSpec) -> napi::Result<Schema> {
             })
         })
         .collect::<napi::Result<Vec<_>>>()?;
-    let indexes = spec
-        .indexes
-        .into_iter()
-        .map(|i| IndexDef {
-            name: i.name,
-            column_id: i.column_id,
-            kind: match i.kind {
-                IndexKindSpec::Bitmap => IndexKind::Bitmap,
-                IndexKindSpec::FmIndex => IndexKind::FmIndex,
-                IndexKindSpec::Ann => IndexKind::Ann,
-                IndexKindSpec::Sparse => IndexKind::Sparse,
-                IndexKindSpec::MinHash => IndexKind::MinHash,
-                IndexKindSpec::LearnedRange => IndexKind::LearnedRange,
-            },
-            predicate: None,
-            options: Default::default(),
-        })
-        .collect();
+    let indexes = spec.indexes.into_iter().map(index_definition).collect();
     Ok(Schema {
         schema_id: 1,
         columns,
@@ -670,6 +705,38 @@ fn build_schema(spec: SchemaSpec) -> napi::Result<Schema> {
         constraints: Default::default(),
         clustered: false,
     })
+}
+
+fn index_definition(spec: IndexSpec) -> IndexDef {
+    let kind = match spec.kind {
+        IndexKindSpec::Bitmap => IndexKind::Bitmap,
+        IndexKindSpec::FmIndex => IndexKind::FmIndex,
+        IndexKindSpec::Ann => IndexKind::Ann,
+        IndexKindSpec::Sparse => IndexKind::Sparse,
+        IndexKindSpec::MinHash => IndexKind::MinHash,
+        IndexKindSpec::LearnedRange => IndexKind::LearnedRange,
+    };
+    IndexDef {
+        name: spec.name,
+        column_id: spec.column_id,
+        kind,
+        predicate: None,
+        options: mongreldb_core::schema::IndexOptions {
+            ann: (kind == IndexKind::Ann).then_some(mongreldb_core::schema::AnnOptions {
+                quantization: match spec
+                    .ann_quantization
+                    .unwrap_or(AnnQuantizationSpec::BinarySign)
+                {
+                    AnnQuantizationSpec::BinarySign => {
+                        mongreldb_core::schema::AnnQuantization::BinarySign
+                    }
+                    AnnQuantizationSpec::Dense => mongreldb_core::schema::AnnQuantization::Dense,
+                },
+                ..mongreldb_core::schema::AnnOptions::default()
+            }),
+            ..mongreldb_core::schema::IndexOptions::default()
+        },
+    }
 }
 
 fn procedure_from_spec(spec: ProcedureSpec) -> napi::Result<mongreldb_core::StoredProcedure> {
@@ -1659,7 +1726,7 @@ fn native_query_status(status: mongreldb_query::QueryStatus) -> NativeQueryStatu
 pub struct NativeSqlQuery {
     id: mongreldb_query::QueryId,
     query: mongreldb_query::RegisteredSqlQuery,
-    session: std::sync::Weak<mongreldb_query::MongrelSession>,
+    session: Arc<mongreldb_query::MongrelSession>,
     sql: String,
     max_output_rows: usize,
     max_output_bytes: usize,
@@ -1678,12 +1745,7 @@ impl Drop for NativeSqlQuery {
 
 impl NativeSqlQuery {
     fn session(&self) -> napi::Result<Arc<mongreldb_query::MongrelSession>, String> {
-        self.session.upgrade().ok_or_else(|| {
-            napi::Error::new(
-                CORE_DATABASE_CLOSED_CODE.to_owned(),
-                format!("{CORE_DATABASE_CLOSED_CODE}: database was closed before SQL execution"),
-            )
-        })
+        Ok(Arc::clone(&self.session))
     }
 }
 
@@ -1764,7 +1826,7 @@ impl Database {
         Ok(NativeSqlQuery {
             id,
             query: retained_query,
-            session: Arc::downgrade(&session),
+            session,
             sql,
             max_output_rows: options.max_output_rows.unwrap_or(1_000_000) as usize,
             max_output_bytes: options.max_output_bytes.unwrap_or(64 * 1024 * 1024) as usize,
@@ -1870,18 +1932,13 @@ impl NativeSqlQuery {
 /// A handle to one table inside a [`Database`].
 #[napi]
 pub struct TableHandle {
-    db: std::sync::Weak<CoreDatabase>,
+    db: Arc<CoreDatabase>,
     name: String,
 }
 
 impl TableHandle {
     fn core(&self) -> napi::Result<Arc<CoreDatabase>> {
-        self.db.upgrade().ok_or_else(|| {
-            napi::Error::new(
-                napi::Status::GenericFailure,
-                format!("{CORE_DATABASE_CLOSED_CODE}: database is closed"),
-            )
-        })
+        Ok(Arc::clone(&self.db))
     }
 }
 
@@ -2174,6 +2231,83 @@ impl Database {
         Ok(BigInt::from(id))
     }
 
+    /// Persist and asynchronously build one secondary index.
+    #[napi]
+    pub fn start_create_index(&self, table: String, index: IndexSpec) -> napi::Result<BigInt> {
+        let job_id = self
+            .core()?
+            .start_create_index(&table, index_definition(index))
+            .map_err(to_napi)?;
+        Ok(BigInt::from(job_id))
+    }
+
+    /// Persist and asynchronously replace one secondary index.
+    #[napi]
+    pub fn start_replace_index(
+        &self,
+        table: String,
+        expected_old_name: String,
+        index: IndexSpec,
+    ) -> napi::Result<BigInt> {
+        let job_id = self
+            .core()?
+            .start_replace_index(&table, &expected_old_name, index_definition(index))
+            .map_err(to_napi)?;
+        Ok(BigInt::from(job_id))
+    }
+
+    /// Resume a crash-recovered or paused index-build job.
+    #[napi]
+    pub fn resume_index_build(&self, job_id: BigInt) -> napi::Result<()> {
+        self.core()?
+            .resume_index_build(bigint_to_u64(&job_id)?)
+            .map_err(to_napi)
+    }
+
+    /// Cancel one pending or running job.
+    #[napi]
+    pub fn cancel_job(&self, job_id: BigInt) -> napi::Result<()> {
+        self.core()?
+            .job_registry()
+            .cancel(bigint_to_u64(&job_id)?)
+            .map_err(mongreldb_core::MongrelError::from)
+            .map_err(to_napi)
+    }
+
+    /// Read durable index-job state and progress.
+    #[napi]
+    pub fn index_job(&self, job_id: BigInt) -> napi::Result<IndexJobInfo> {
+        let job_id = bigint_to_u64(&job_id)?;
+        let record = self
+            .core()?
+            .job_registry()
+            .get(job_id)
+            .ok_or_else(|| napi::Error::new(napi::Status::InvalidArg, "job not found"))?;
+        if record.kind != mongreldb_core::JobKind::IndexBuild {
+            return Err(napi::Error::new(
+                napi::Status::InvalidArg,
+                "job is not an index build",
+            ));
+        }
+        Ok(index_job_info(record))
+    }
+
+    /// Wait off the JavaScript event loop until an index build is terminal.
+    #[napi]
+    pub fn wait_index_job(
+        &self,
+        job_id: BigInt,
+        timeout_ms: Option<u32>,
+    ) -> napi::Result<AsyncTask<IndexJobWaitTask>> {
+        Ok(AsyncTask::new(IndexJobWaitTask {
+            db: self.core()?,
+            job_id: bigint_to_u64(&job_id)?,
+            timeout: std::time::Duration::from_millis(u64::from(
+                timeout_ms.unwrap_or(24 * 60 * 60 * 1_000),
+            )),
+        }))
+    }
+
     /// Drop a table by name.
     #[napi]
     pub fn drop_table(&self, name: String) -> napi::Result<()> {
@@ -2193,10 +2327,7 @@ impl Database {
         // Validate the table exists now; per-op calls re-resolve it by name.
         self.core()?.table_id(&name).map_err(to_napi)?;
         let database = self.core()?;
-        Ok(TableHandle {
-            db: Arc::downgrade(&database),
-            name,
-        })
+        Ok(TableHandle { db: database, name })
     }
 
     /// Alias for [`Database::get_table`] matching the spec's `database.table(name)`.
@@ -2210,7 +2341,7 @@ impl Database {
     pub fn begin(&self) -> napi::Result<Transaction> {
         let database = self.core()?;
         Ok(Transaction {
-            db: Arc::downgrade(&database),
+            db: database,
             state: Arc::new(parking_lot::Mutex::new(NodeTransactionState::default())),
         })
     }
@@ -3017,6 +3148,7 @@ fn native_cols_to_ipc_from_batches_controlled(
                 let length = 256.min(batch.num_rows() - offset);
                 rows = rows.saturating_add(length);
                 if rows > max_rows {
+                    query.fail_result_limit();
                     return Err(NativeOutputFailure::ResultLimit(format!(
                         "SQL result exceeds {max_rows} rows or {max_bytes} bytes"
                     )));
@@ -3031,6 +3163,7 @@ fn native_cols_to_ipc_from_batches_controlled(
             .map_err(|error| NativeOutputFailure::Serialization(error.to_string()))
     })();
     if output.exceeded {
+        query.fail_result_limit();
         return Err(NativeOutputFailure::ResultLimit(format!(
             "SQL result exceeds {max_rows} rows or {max_bytes} bytes"
         )));
@@ -3308,7 +3441,7 @@ mod native_ipc_tests {
 
         let mut database = Database::with_path(path.clone()).unwrap();
         let table = TableHandle {
-            db: Arc::downgrade(&database.core().unwrap()),
+            db: database.core().unwrap(),
             name: "unused".into(),
         };
         database.close().unwrap();
@@ -3391,7 +3524,7 @@ mod native_ipc_tests {
         let handle = super::NativeSqlQuery {
             id,
             query: query.clone(),
-            session: Arc::downgrade(&session),
+            session: Arc::clone(&session),
             sql: "SELECT 1".into(),
             max_output_rows: 1,
             max_output_bytes: 1024,
@@ -4241,18 +4374,13 @@ fn query_arrow_inner(
 /// atomically. On conflict, `commit` throws a `ConflictError`.
 #[napi]
 pub struct Transaction {
-    db: std::sync::Weak<CoreDatabase>,
+    db: Arc<CoreDatabase>,
     state: Arc<parking_lot::Mutex<NodeTransactionState>>,
 }
 
 impl Transaction {
     fn core(&self) -> napi::Result<Arc<CoreDatabase>> {
-        self.db.upgrade().ok_or_else(|| {
-            napi::Error::new(
-                napi::Status::GenericFailure,
-                format!("{CORE_DATABASE_CLOSED_CODE}: database is closed"),
-            )
-        })
+        Ok(Arc::clone(&self.db))
     }
 
     fn active_state(&self) -> napi::Result<parking_lot::MutexGuard<'_, NodeTransactionState>> {
@@ -4423,7 +4551,7 @@ impl Transaction {
     pub fn new(db: &Database) -> napi::Result<Self> {
         let database = db.core()?;
         Ok(Self {
-            db: Arc::downgrade(&database),
+            db: database,
             state: Arc::new(parking_lot::Mutex::new(NodeTransactionState::default())),
         })
     }
@@ -4636,7 +4764,7 @@ impl Transaction {
         self.core()?.table(&name).map_err(to_napi)?;
         let database = self.core()?;
         Ok(TxnTable {
-            db: Arc::downgrade(&database),
+            db: database,
             state: Arc::clone(&self.state),
             table: name,
         })
@@ -4648,19 +4776,14 @@ impl Transaction {
 /// parent's `commit`/`rollback` still apply.
 #[napi]
 pub struct TxnTable {
-    db: std::sync::Weak<CoreDatabase>,
+    db: Arc<CoreDatabase>,
     state: Arc<parking_lot::Mutex<NodeTransactionState>>,
     table: String,
 }
 
 impl TxnTable {
     fn core(&self) -> napi::Result<Arc<CoreDatabase>> {
-        self.db.upgrade().ok_or_else(|| {
-            napi::Error::new(
-                napi::Status::GenericFailure,
-                format!("{CORE_DATABASE_CLOSED_CODE}: database is closed"),
-            )
-        })
+        Ok(Arc::clone(&self.db))
     }
 
     fn active_state(&self) -> napi::Result<parking_lot::MutexGuard<'_, NodeTransactionState>> {
@@ -5013,7 +5136,7 @@ impl TypedColumn {
 /// flush** — the contract is the opposite of `put()`.
 #[napi]
 pub struct WriteBuffer {
-    db: std::sync::Weak<CoreDatabase>,
+    db: Arc<CoreDatabase>,
     table_name: String,
     buffer: Vec<Vec<(u16, Value)>>,
     threshold: usize,
@@ -5021,12 +5144,7 @@ pub struct WriteBuffer {
 
 impl WriteBuffer {
     fn core(&self) -> napi::Result<Arc<CoreDatabase>> {
-        self.db.upgrade().ok_or_else(|| {
-            napi::Error::new(
-                napi::Status::GenericFailure,
-                format!("{CORE_DATABASE_CLOSED_CODE}: database is closed"),
-            )
-        })
+        Ok(Arc::clone(&self.db))
     }
 }
 

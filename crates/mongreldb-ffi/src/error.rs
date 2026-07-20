@@ -540,7 +540,10 @@ mod tests {
         };
         let code = set_error(&err);
         assert_eq!(code, ErrorCode::Unauthorized);
-        assert_eq!(mongreldb_last_error_code(), ErrorCode::Unauthorized.as_return());
+        assert_eq!(
+            mongreldb_last_error_code(),
+            ErrorCode::Unauthorized.as_return()
+        );
         assert_eq!(
             mongreldb_last_error_category_code(),
             ErrorCategory::PermissionDenied.code()
@@ -616,7 +619,10 @@ mod tests {
             "unauthenticated"
         );
         // ABI ErrorCode stays Unauthorized for both auth failures.
-        assert_eq!(mongreldb_last_error_code(), ErrorCode::Unauthorized.as_return());
+        assert_eq!(
+            mongreldb_last_error_code(),
+            ErrorCode::Unauthorized.as_return()
+        );
         clear();
     }
 

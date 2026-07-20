@@ -263,7 +263,7 @@ pub enum IndexKind {
     Bitmap,
     /// FM-index / wavelet tree for arbitrary substring + ranked access.
     FmIndex,
-    /// Quantized-vector ANN (binary / PQ). For `Embedding` columns.
+    /// Binary-sign or full-precision Dense ANN for `Embedding` columns.
     Ann,
     /// Learned zonemap (PGM) for ordered range predicates.
     LearnedRange,
@@ -273,7 +273,7 @@ pub enum IndexKind {
     Sparse,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ann: Option<AnnOptions>,
@@ -283,7 +283,7 @@ pub struct IndexOptions {
     pub learned_range: Option<LearnedRangeOptions>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnnOptions {
     #[serde(default = "default_ann_m")]
     pub m: usize,
@@ -325,7 +325,7 @@ const fn default_ann_ef_search() -> usize {
     64
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MinHashOptions {
     #[serde(default = "default_minhash_permutations")]
     pub permutations: usize,
@@ -349,7 +349,7 @@ const fn default_minhash_bands() -> usize {
     32
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LearnedRangeOptions {
     #[serde(default = "default_learned_range_epsilon")]
     pub epsilon: usize,
@@ -367,7 +367,7 @@ const fn default_learned_range_epsilon() -> usize {
     16
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexDef {
     pub name: String,
     pub column_id: u16,

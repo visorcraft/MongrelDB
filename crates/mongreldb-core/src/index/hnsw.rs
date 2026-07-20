@@ -14,6 +14,10 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
 
 type Dist = u32;
+/// Hard bound for graph hierarchy depth. Besides matching practical HNSW
+/// implementations, this makes graph-memory admission finite and prevents a
+/// pathological RNG sample from requesting an enormous layer vector.
+pub(crate) const MAX_HNSW_LEVEL: i32 = 32;
 
 /// Hamming distance (popcount of XOR) over packed-bit vectors.
 fn hamming(a: &[u8], b: &[u8]) -> Dist {
@@ -91,7 +95,7 @@ impl Hnsw {
     fn random_level(&mut self) -> i32 {
         let u = self.next_uniform();
         let ml = 1.0 / (self.m.max(2) as f64).ln();
-        (-u.ln() * ml) as i32
+        ((-u.ln() * ml) as i32).clamp(0, MAX_HNSW_LEVEL)
     }
 
     /// Insert a quantized vector bound to `row_id`.
@@ -450,12 +454,27 @@ impl DenseHnsw {
     fn random_level(&mut self) -> i32 {
         let u = self.next_uniform();
         let ml = 1.0 / (self.m.max(2) as f64).ln();
-        (-u.ln() * ml) as i32
+        ((-u.ln() * ml) as i32).clamp(0, MAX_HNSW_LEVEL)
     }
 
     /// Insert a full-precision vector bound to `row_id`.
     pub fn insert(&mut self, vec: Vec<f32>, row_id: RowId) {
+        self.insert_with_checkpoint(vec, row_id, || Ok(()))
+            .expect("unlimited Dense HNSW insertion cannot fail");
+    }
+
+    /// Insert with cooperative checks inside graph traversal and rewiring.
+    pub(crate) fn insert_with_checkpoint<F>(
+        &mut self,
+        vec: Vec<f32>,
+        row_id: RowId,
+        mut checkpoint: F,
+    ) -> Result<()>
+    where
+        F: FnMut() -> Result<()>,
+    {
         debug_assert_eq!(vec.len(), self.dim, "dense vector length mismatch");
+        checkpoint()?;
         let node = self.vectors.len();
         let level = self.random_level();
         self.vectors.push(vec.clone());
@@ -465,16 +484,22 @@ impl DenseHnsw {
         if self.entry.is_none() {
             self.entry = Some(node);
             self.max_level = level;
-            return;
+            return Ok(());
         }
         let entry = self.entry.unwrap();
         let mut ep: Vec<(f32, usize)> = vec![(cosine_distance(&vec, &self.vectors[entry]), entry)];
 
         for lc in ((level + 1)..=self.max_level).rev() {
-            ep = self.search_layer(&vec, ep, 1, lc);
+            ep = self.search_layer_with_checkpoint(&vec, ep, 1, lc, &mut checkpoint)?;
         }
         for lc in (0..=level.min(self.max_level)).rev() {
-            let candidates = self.search_layer(&vec, ep.clone(), self.ef_construction, lc);
+            let candidates = self.search_layer_with_checkpoint(
+                &vec,
+                ep.clone(),
+                self.ef_construction,
+                lc,
+                &mut checkpoint,
+            )?;
             let m_layer = if lc == 0 { self.m * 2 } else { self.m };
             let mut chosen = candidates.clone();
             chosen.sort_by(|(da, _), (db, _)| da.total_cmp(db));
@@ -482,6 +507,7 @@ impl DenseHnsw {
             let neighbors: Vec<usize> = chosen.iter().map(|(_, n)| *n).collect();
             self.graph[node][lc as usize] = neighbors.clone();
             for &n in &neighbors {
+                checkpoint()?;
                 let adj = &mut self.graph[n][lc as usize];
                 adj.push(node);
                 if adj.len() > m_layer {
@@ -502,6 +528,7 @@ impl DenseHnsw {
             self.max_level = level;
             self.entry = Some(node);
         }
+        Ok(())
     }
 
     /// k-nearest neighbors of `query` (cosine distance). `ef` controls beam
@@ -541,35 +568,47 @@ impl DenseHnsw {
             .collect())
     }
 
-    fn search_layer(
+    fn search_layer_with_checkpoint<F>(
         &self,
         query: &[f32],
         entry_points: Vec<(f32, usize)>,
         ef: usize,
         layer: i32,
-    ) -> Vec<(f32, usize)> {
+        checkpoint: &mut F,
+    ) -> Result<Vec<(f32, usize)>>
+    where
+        F: FnMut() -> Result<()>,
+    {
         let mut visited: HashSet<usize> = entry_points.iter().map(|(_, n)| *n).collect();
         let mut candidates: BinaryHeap<Reverse<(DistF32, usize)>> = entry_points
             .iter()
-            .map(|(d, n)| Reverse((DistF32(*d), *n)))
+            .map(|(distance, node)| Reverse((DistF32(*distance), *node)))
             .collect();
         let mut results: BinaryHeap<(DistF32, usize)> = entry_points
             .iter()
-            .map(|(d, n)| (DistF32(*d), *n))
+            .map(|(distance, node)| (DistF32(*distance), *node))
             .collect();
 
-        while let Some(Reverse((cd, c))) = candidates.pop() {
-            let worst = results.peek().map(|(d, _)| d.0).unwrap_or(f32::INFINITY);
-            if cd.0 > worst && results.len() >= ef {
+        while let Some(Reverse((candidate_distance, candidate))) = candidates.pop() {
+            checkpoint()?;
+            let worst = results
+                .peek()
+                .map(|(distance, _)| distance.0)
+                .unwrap_or(f32::INFINITY);
+            if candidate_distance.0 > worst && results.len() >= ef {
                 break;
             }
-            for &e in &self.graph[c][layer as usize] {
-                if visited.insert(e) {
-                    let d = cosine_distance(query, &self.vectors[e]);
-                    let w = results.peek().map(|(dd, _)| dd.0).unwrap_or(f32::INFINITY);
-                    if d < w || results.len() < ef {
-                        candidates.push(Reverse((DistF32(d), e)));
-                        results.push((DistF32(d), e));
+            for &neighbor in &self.graph[candidate][layer as usize] {
+                checkpoint()?;
+                if visited.insert(neighbor) {
+                    let distance = cosine_distance(query, &self.vectors[neighbor]);
+                    let worst = results
+                        .peek()
+                        .map(|(distance, _)| distance.0)
+                        .unwrap_or(f32::INFINITY);
+                    if distance < worst || results.len() < ef {
+                        candidates.push(Reverse((DistF32(distance), neighbor)));
+                        results.push((DistF32(distance), neighbor));
                         if results.len() > ef {
                             results.pop();
                         }
@@ -577,7 +616,10 @@ impl DenseHnsw {
                 }
             }
         }
-        results.into_iter().map(|(d, n)| (d.0, n)).collect()
+        Ok(results
+            .into_iter()
+            .map(|(distance, node)| (distance.0, node))
+            .collect())
     }
 
     fn search_layer_with_context(

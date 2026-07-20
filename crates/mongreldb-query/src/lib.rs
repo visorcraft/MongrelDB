@@ -38,8 +38,10 @@ mod shadow;
 mod udf;
 
 pub use ai_retrieval::{
-    adaptive_local_k, merge_candidates, AiConsistencyAudit, AiRetrievalError, AiWorkBudget,
-    FusionMethod, LocalCandidate, MergedCandidate,
+    adaptive_local_k, merge_candidates, AiConsistencyAudit, AiFanoutRequest, AiRetrievalError,
+    AiRpcClient, AiTabletExecutor, AiTabletHit, AiTabletQuery, AiWorkBudget, DistributedAiResult,
+    FusionMethod, LocalCandidate, LoopbackAiRpcClient, MergedCandidate, RemoteAiEndpoint,
+    RemoteAiTransport, REMOTE_AI_SERVICE_ID,
 };
 pub use error::{MongrelQueryError, Result};
 pub use external_modules::{

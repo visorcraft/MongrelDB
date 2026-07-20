@@ -13,7 +13,10 @@
 //! Built automatically by `cargo test` (it is a bin target of this package);
 //! located at `$CARGO_BIN_EXE_crash_writer`.
 
-use mongreldb_core::schema::{ColumnDef, ColumnFlags, Schema, TypeId};
+use mongreldb_core::schema::{
+    AnnOptions, AnnQuantization, ColumnDef, ColumnFlags, IndexDef, IndexKind, IndexOptions, Schema,
+    TypeId,
+};
 use mongreldb_core::{Database, Table, Value};
 use std::io::Write;
 use std::process::exit;
@@ -201,10 +204,81 @@ fn main() {
             }
             panic!("durable hook {hook} was not hit");
         }
+        // Real online-index DDL crash at its exact durable boundary. Unlike
+        // `durable-hook`'s generic checkpoint case, this proves catalog plus
+        // hidden-generation recovery for create-index itself.
+        "index-ddl-hook" => {
+            let hook = args.next().unwrap_or_else(|| {
+                eprintln!("index-ddl-hook requires a hook name");
+                exit(2);
+            });
+            let hook = durable_hook(&hook);
+            if !matches!(hook, "index.publish.before" | "index.publish.after") {
+                eprintln!("index-ddl-hook requires an index publication hook");
+                exit(2);
+            }
+            let db = Database::create(&dir).expect("create database");
+            db.create_table("docs", embedding_schema())
+                .expect("create docs");
+            db.transaction(|transaction| {
+                transaction.put(
+                    "docs",
+                    vec![
+                        (1, Value::Int64(1)),
+                        (2, Value::Embedding(vec![1.0, 0.0, 0.0, 0.0])),
+                    ],
+                )?;
+                Ok(())
+            })
+            .expect("insert docs row");
+            arm_crash_hook(hook);
+            let _ = db.create_index("docs", dense_index());
+            panic!("index DDL hook {hook} was not hit");
+        }
         other => {
             eprintln!("unknown mode: {other}");
             exit(2);
         }
+    }
+}
+
+fn embedding_schema() -> Schema {
+    Schema {
+        columns: vec![
+            ColumnDef {
+                id: 1,
+                name: "id".into(),
+                ty: TypeId::Int64,
+                flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
+                embedding_source: None,
+            },
+            ColumnDef {
+                id: 2,
+                name: "embedding".into(),
+                ty: TypeId::Embedding { dim: 4 },
+                flags: ColumnFlags::empty(),
+                default_value: None,
+                embedding_source: None,
+            },
+        ],
+        ..Schema::default()
+    }
+}
+
+fn dense_index() -> IndexDef {
+    IndexDef {
+        name: "idx_embedding".into(),
+        column_id: 2,
+        kind: IndexKind::Ann,
+        predicate: None,
+        options: IndexOptions {
+            ann: Some(AnnOptions {
+                quantization: AnnQuantization::Dense,
+                ..AnnOptions::default()
+            }),
+            ..IndexOptions::default()
+        },
     }
 }
 

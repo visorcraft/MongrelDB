@@ -122,12 +122,8 @@ async fn standalone_transfer_and_split_fail_closed() {
     let tablet = TabletId::from_bytes([0x11; 16]);
     let node = NodeId::from_bytes([0x22; 16]);
 
-    let (status, body) = sql_json(
-        &app,
-        admin,
-        &format!("TRANSFER LEADER {tablet} TO {node}"),
-    )
-    .await;
+    let (status, body) =
+        sql_json(&app, admin, &format!("TRANSFER LEADER {tablet} TO {node}")).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert_eq!(body["status"], "error");
     assert_eq!(body["error"], "cluster runtime not running");
@@ -137,12 +133,7 @@ async fn standalone_transfer_and_split_fail_closed() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert_eq!(body["error"], "cluster runtime not running");
 
-    let (status, body) = sql_json(
-        &app,
-        admin,
-        &format!("MERGE TABLETS {tablet} {tablet}"),
-    )
-    .await;
+    let (status, body) = sql_json(&app, admin, &format!("MERGE TABLETS {tablet} {tablet}")).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert_eq!(body["error"], "cluster runtime not running");
 
@@ -162,8 +153,7 @@ async fn live_runtime_status_and_missing_tablet_ops() {
     let data = directory.path();
     let listen = free_addr();
     let identity = bootstrap_cluster(data, &listen);
-    let database =
-        Arc::new(Database::create_with_credentials(data, "admin", "admin-pw").unwrap());
+    let database = Arc::new(Database::create_with_credentials(data, "admin", "admin-pw").unwrap());
 
     let handle = ClusterRuntimeHandle::start(ClusterRuntimeOptions {
         node_data: data.to_path_buf(),
@@ -267,8 +257,7 @@ async fn transfer_leader_on_live_single_replica_tablet() {
     let data = directory.path();
     let listen = free_addr();
     let identity = bootstrap_cluster(data, &listen);
-    let database =
-        Arc::new(Database::create_with_credentials(data, "admin", "admin-pw").unwrap());
+    let database = Arc::new(Database::create_with_credentials(data, "admin", "admin-pw").unwrap());
 
     let handle = ClusterRuntimeHandle::start(ClusterRuntimeOptions {
         node_data: data.to_path_buf(),
@@ -281,8 +270,7 @@ async fn transfer_leader_on_live_single_replica_tablet() {
 
     let table_id = TableId::new(1);
     let database_id = DatabaseId::from_bytes([0x42; 16]);
-    let tablet_id =
-        seed_single_replica_tablet(&handle, &identity, table_id, database_id).await;
+    let tablet_id = seed_single_replica_tablet(&handle, &identity, table_id, database_id).await;
 
     let sessions = Arc::new(mongreldb_server::SessionStore::new(
         32,
@@ -384,13 +372,7 @@ async fn seed_single_replica_tablet(
     let partitioning =
         TablePartitioningRecord::automatic_default(table_id, vec![ColumnId::new(1)], 16);
     runtime
-        .create_tablet(
-            &descriptor,
-            &partitioning,
-            Some(&peers),
-            true,
-            &control,
-        )
+        .create_tablet(&descriptor, &partitioning, Some(&peers), true, &control)
         .await
         .expect("create single-replica tablet");
     runtime

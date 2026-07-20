@@ -26,7 +26,12 @@
 //!   worker lease expiry that cleans abandoned fragments, and real in-memory
 //!   merge operators (k-way [`MergeSort`](FragmentOperator::MergeSort),
 //!   [`FinalAggregate`](FragmentOperator::FinalAggregate) combine, distributed
-//!   top-k) used until the remote Arrow IPC transport lands.
+//!   top-k).
+//! * Remote execution — [`RemoteFragmentTransport`] and
+//!   [`RemoteFragmentEndpoint`] use a versioned, bounded Arrow IPC pull
+//!   protocol. One batch per pull provides backpressure; query-scoped
+//!   cancellation and adaptive top-k refill cross the same authenticated
+//!   node-internal RPC carrier.
 //!
 //! # Integration point with DataFusion
 //!
@@ -40,6 +45,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap, HashMap};
+use std::io::Cursor;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -48,8 +54,11 @@ use arrow::array::{
 };
 use arrow::compute::{concat_batches, interleave, take};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::ipc::reader::StreamReader;
+use arrow::ipc::writer::StreamWriter;
 use arrow::row::{RowConverter, SortField};
 use arrow::util::display::array_value_to_string;
+use bincode::Options;
 use futures::stream::{self, BoxStream, FuturesUnordered, StreamExt};
 use mongreldb_core::{CancellationReason, ExecutionControl, RowId};
 use mongreldb_types::ids::{MetadataVersion, QueryId, TabletId};
@@ -66,6 +75,8 @@ pub const DEFAULT_BROADCAST_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 /// plan includes ... a maximum spill allowance"). Bound to the core
 /// [`mongreldb_core::SpillManager`] via [`FragmentControl::begin_spill`].
 pub const DEFAULT_MAX_SPILL_BYTES_PER_FRAGMENT: u64 = 256 * 1024 * 1024;
+/// Maximum server-issued authorization envelope forwarded to a worker.
+pub const MAX_FRAGMENT_AUTHORIZATION_CONTEXT_BYTES: usize = 64 * 1024;
 
 /// Rows per `RecordBatch` emitted by coordinator merge operators.
 const COORDINATOR_OUTPUT_BATCH_ROWS: usize = 8_192;
@@ -107,6 +118,12 @@ pub enum DistributedError {
     /// Arrow kernel failure inside a merge operator.
     #[error("arrow error: {0}")]
     Arrow(String),
+    /// A remote fragment transport call failed.
+    #[error("remote fragment transport error: {0}")]
+    RemoteTransport(String),
+    /// A remote fragment peer violated the versioned wire contract.
+    #[error("remote fragment protocol error: {0}")]
+    RemoteProtocol(String),
 }
 
 /// Result alias for distributed planning and coordination.
@@ -1284,7 +1301,7 @@ fn aggregate_output_name(aggregate: &AggregateExpr) -> String {
 /// One ranked row in the top-k model: the score plus the exact tie-break
 /// identity (spec section 12.10: final score descending, tablet id ascending,
 /// [`RowId`] ascending).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TopKCandidate {
     /// Score mapped onto an order-preserving `u64` key (higher wins).
     pub score: u64,
@@ -1451,6 +1468,9 @@ pub struct FragmentControl {
     pub control: ExecutionControl,
     /// Maximum spill allowance stamped by the planner (spec section 12.10).
     pub max_spill_bytes: u64,
+    /// Opaque server-issued user/session authorization envelope. Worker
+    /// executors validate it before touching tablet data.
+    pub authorization_context: Arc<[u8]>,
 }
 
 impl FragmentControl {
@@ -1469,7 +1489,7 @@ impl FragmentControl {
 /// Tie information for scored (top-k) streams, carried on a producer's
 /// terminal frame (spec section 12.10: "bounded local top-k plus tie
 /// information").
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ScoreBound {
     /// Not a scored stream, or the producer cannot report bounds; the
     /// coordinator treats such producers as exhausted.
@@ -1515,9 +1535,9 @@ pub struct TopKRefill {
     pub unseen_bound: Option<u64>,
 }
 
-/// Executes one fragment on its worker. The real binding runs tablet
-/// fragments against a `ClusterReplica` core in a later wave; this wave ships
-/// [`InMemoryFragmentExecutor`] as the reference implementation.
+/// Executes one fragment on its worker. Server/engine bindings install an
+/// implementation behind [`RemoteFragmentEndpoint`];
+/// [`InMemoryFragmentExecutor`] remains the deterministic reference executor.
 #[async_trait::async_trait]
 pub trait FragmentExecutor: Send + Sync {
     /// Runs the fragment. `inputs` carries one resolved stream per
@@ -1537,40 +1557,45 @@ pub trait FragmentExecutor: Send + Sync {
         fragment: &PlanFragment,
         offset: usize,
         limit: usize,
+        control: FragmentControl,
     ) -> DistributedResult<TopKRefill> {
-        let _ = (fragment, offset, limit);
+        let _ = (fragment, offset, limit, control);
         Err(DistributedError::Unsupported(
             "top-k refill is not implemented by this executor".to_owned(),
         ))
     }
 }
 
-/// Moves fragments and cancellation between the coordinator and workers
-/// (spec section 12.10). The Arrow IPC transport with backpressure is the
-/// remote-transport wave's job; this wave ships the in-memory implementation.
+/// Moves fragments, refill, and cancellation between the coordinator and
+/// workers (spec section 12.10). Implementations include the deterministic
+/// [`InMemoryTransport`] and the bounded Arrow IPC
+/// [`RemoteFragmentTransport`].
 #[async_trait::async_trait]
 pub trait FragmentTransport: Send + Sync {
     /// Starts a fragment on its assigned worker and returns its output
     /// stream.
     async fn execute_fragment(
         &self,
+        query_id: QueryId,
         fragment: &PlanFragment,
         inputs: Vec<FragmentStream>,
         control: FragmentControl,
     ) -> DistributedResult<FragmentStream>;
 
     /// Best-effort cancellation of a running (or abandoned) fragment.
-    fn cancel_fragment(&self, fragment_id: FragmentId) -> DistributedResult<()>;
+    fn cancel_fragment(&self, query_id: QueryId, fragment_id: FragmentId) -> DistributedResult<()>;
 
     /// Fetches the next top-k batch of a fragment's tablet (adaptive
     /// refill). Transports without a refill binding leave the default.
-    fn refill_top_k(
+    async fn refill_top_k(
         &self,
+        query_id: QueryId,
         fragment: &PlanFragment,
         offset: usize,
         limit: usize,
+        control: FragmentControl,
     ) -> DistributedResult<TopKRefill> {
-        let _ = (fragment, offset, limit);
+        let _ = (query_id, fragment, offset, limit, control);
         Err(DistributedError::Unsupported(
             "top-k refill over this transport is not bound in this wave".to_owned(),
         ))
@@ -1645,6 +1670,7 @@ impl InMemoryTransport {
 impl FragmentTransport for InMemoryTransport {
     async fn execute_fragment(
         &self,
+        _query_id: QueryId,
         fragment: &PlanFragment,
         inputs: Vec<FragmentStream>,
         control: FragmentControl,
@@ -1658,7 +1684,11 @@ impl FragmentTransport for InMemoryTransport {
             .await
     }
 
-    fn cancel_fragment(&self, fragment_id: FragmentId) -> DistributedResult<()> {
+    fn cancel_fragment(
+        &self,
+        _query_id: QueryId,
+        fragment_id: FragmentId,
+    ) -> DistributedResult<()> {
         self.cancelled.lock().push(fragment_id);
         if let Some(control) = self.controls.lock().get(&fragment_id) {
             control.cancel(CancellationReason::ClientRequest);
@@ -1666,21 +1696,930 @@ impl FragmentTransport for InMemoryTransport {
         Ok(())
     }
 
-    fn refill_top_k(
+    async fn refill_top_k(
         &self,
+        _query_id: QueryId,
         fragment: &PlanFragment,
         offset: usize,
         limit: usize,
+        control: FragmentControl,
     ) -> DistributedResult<TopKRefill> {
         self.refills
             .lock()
             .push((fragment.fragment_id, offset, limit));
         self.executor_for(&fragment.assignment)
-            .refill_top_k(fragment, offset, limit)
+            .refill_top_k(fragment, offset, limit, control)
     }
 }
 
-/// In-memory per-`(table, tablet)` record-batch store backing
+// ---------------------------------------------------------------------------
+// Remote Arrow IPC fragment transport
+// ---------------------------------------------------------------------------
+
+/// Version of the private cluster fragment protocol.
+///
+/// This is an internal wire generation, not a MongrelDB release or database
+/// format version. Peers fail closed when it differs.
+pub const REMOTE_FRAGMENT_PROTOCOL_VERSION: u16 = 1;
+/// Stable service discriminator inside the cluster's authenticated internal
+/// RPC multiplexer.
+pub const REMOTE_FRAGMENT_SERVICE_ID: u32 = 1;
+
+/// Default maximum encoded request or response body for one fragment RPC.
+pub const DEFAULT_REMOTE_FRAGMENT_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Default maximum number of fragment streams held by one worker.
+pub const DEFAULT_REMOTE_FRAGMENT_EXECUTIONS: usize = 1_024;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RemoteFragmentEnvelope {
+    version: u16,
+    request: RemoteFragmentRequest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum RemoteFragmentRequest {
+    Start {
+        query_id: QueryId,
+        fragment: PlanFragment,
+        inputs: Vec<Vec<RemoteBatchFrame>>,
+        max_spill_bytes: u64,
+        authorization_context: Vec<u8>,
+        deadline_ms: Option<u64>,
+    },
+    Pull {
+        query_id: QueryId,
+        fragment_id: FragmentId,
+    },
+    Cancel {
+        query_id: QueryId,
+        fragment_id: FragmentId,
+    },
+    RefillTopK {
+        query_id: QueryId,
+        fragment: PlanFragment,
+        offset: usize,
+        limit: usize,
+        authorization_context: Vec<u8>,
+        deadline_ms: Option<u64>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RemoteFragmentResponseEnvelope {
+    version: u16,
+    response: RemoteFragmentResponse,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum RemoteFragmentResponse {
+    Started,
+    Frame(Option<RemoteBatchFrame>),
+    Cancelled,
+    TopKRefill {
+        rows: Vec<TopKCandidate>,
+        payload: Vec<u8>,
+        unseen_bound: Option<u64>,
+    },
+    Error(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RemoteBatchFrame {
+    ipc: Vec<u8>,
+    score_bound: ScoreBound,
+}
+
+type RemoteExecutionKey = (QueryId, FragmentId);
+
+struct RemoteExecution {
+    stream: tokio::sync::Mutex<Option<FragmentStream>>,
+    control: ExecutionControl,
+}
+
+/// Worker-side endpoint for the internal fragment protocol.
+///
+/// The cluster transport supplies authenticated node-to-node delivery. This
+/// endpoint owns bounded active cursors and returns one Arrow IPC batch per
+/// pull. Pull framing provides backpressure without buffering a whole result
+/// on either peer.
+pub struct RemoteFragmentEndpoint {
+    executor: Arc<dyn FragmentExecutor>,
+    executions: parking_lot::Mutex<HashMap<RemoteExecutionKey, Arc<RemoteExecution>>>,
+    max_executions: usize,
+    max_message_bytes: usize,
+}
+
+impl RemoteFragmentEndpoint {
+    /// Creates a bounded worker endpoint.
+    pub fn new(executor: Arc<dyn FragmentExecutor>) -> Self {
+        Self::with_limits(
+            executor,
+            DEFAULT_REMOTE_FRAGMENT_EXECUTIONS,
+            DEFAULT_REMOTE_FRAGMENT_MESSAGE_BYTES,
+        )
+    }
+
+    /// Creates a worker endpoint with explicit cursor and frame bounds.
+    pub fn with_limits(
+        executor: Arc<dyn FragmentExecutor>,
+        max_executions: usize,
+        max_message_bytes: usize,
+    ) -> Self {
+        Self {
+            executor,
+            executions: parking_lot::Mutex::new(HashMap::new()),
+            max_executions: max_executions.max(1),
+            max_message_bytes: max_message_bytes.max(1),
+        }
+    }
+
+    /// Number of live remote fragment cursors.
+    pub fn active_executions(&self) -> usize {
+        self.executions.lock().len()
+    }
+
+    /// Handles one authenticated internal RPC body.
+    pub async fn handle(&self, bytes: &[u8]) -> DistributedResult<Vec<u8>> {
+        if bytes.len() > self.max_message_bytes {
+            return Err(DistributedError::RemoteProtocol(format!(
+                "fragment request is {} bytes; limit is {}",
+                bytes.len(),
+                self.max_message_bytes
+            )));
+        }
+        let envelope: RemoteFragmentEnvelope = decode_remote_wire(bytes, self.max_message_bytes)?;
+        if envelope.version != REMOTE_FRAGMENT_PROTOCOL_VERSION {
+            return Err(DistributedError::RemoteProtocol(format!(
+                "unsupported fragment protocol version {}; supported version is {}",
+                envelope.version, REMOTE_FRAGMENT_PROTOCOL_VERSION
+            )));
+        }
+        let response = match self.handle_request(envelope.request).await {
+            Ok(response) => response,
+            Err(error) => RemoteFragmentResponse::Error(error.to_string()),
+        };
+        encode_remote_wire(
+            &RemoteFragmentResponseEnvelope {
+                version: REMOTE_FRAGMENT_PROTOCOL_VERSION,
+                response,
+            },
+            self.max_message_bytes,
+        )
+    }
+
+    async fn handle_request(
+        &self,
+        request: RemoteFragmentRequest,
+    ) -> DistributedResult<RemoteFragmentResponse> {
+        match request {
+            RemoteFragmentRequest::Start {
+                query_id,
+                fragment,
+                inputs,
+                max_spill_bytes,
+                authorization_context,
+                deadline_ms,
+            } => {
+                if authorization_context.len() > MAX_FRAGMENT_AUTHORIZATION_CONTEXT_BYTES {
+                    return Err(DistributedError::RemoteProtocol(format!(
+                        "fragment authorization context is {} bytes; limit is {}",
+                        authorization_context.len(),
+                        MAX_FRAGMENT_AUTHORIZATION_CONTEXT_BYTES
+                    )));
+                }
+                let key = (query_id, fragment.fragment_id);
+                {
+                    let executions = self.executions.lock();
+                    if executions.contains_key(&key) {
+                        return Err(DistributedError::RemoteProtocol(format!(
+                            "fragment {} for query {query_id} is already running",
+                            fragment.fragment_id
+                        )));
+                    }
+                    if executions.len() >= self.max_executions {
+                        return Err(DistributedError::Reservation {
+                            fragment_id: fragment.fragment_id,
+                            reason: format!(
+                                "worker holds {} remote fragments; limit is {}",
+                                executions.len(),
+                                self.max_executions
+                            ),
+                        });
+                    }
+                }
+                let inputs = inputs
+                    .into_iter()
+                    .map(|frames| {
+                        frames
+                            .into_iter()
+                            .map(|frame| decode_remote_frame(frame, self.max_message_bytes))
+                            .collect::<DistributedResult<Vec<_>>>()
+                            .map(|frames| {
+                                Box::pin(stream::iter(frames.into_iter().map(Ok))) as FragmentStream
+                            })
+                    })
+                    .collect::<DistributedResult<Vec<_>>>()?;
+                let control = deadline_ms.map_or_else(
+                    || ExecutionControl::new(None),
+                    |milliseconds| {
+                        ExecutionControl::with_timeout(Duration::from_millis(milliseconds))
+                    },
+                );
+                let execution = Arc::new(RemoteExecution {
+                    stream: tokio::sync::Mutex::new(None),
+                    control: control.clone(),
+                });
+                {
+                    let mut executions = self.executions.lock();
+                    if executions.contains_key(&key) {
+                        return Err(DistributedError::RemoteProtocol(format!(
+                            "fragment {} for query {query_id} raced another start",
+                            fragment.fragment_id
+                        )));
+                    }
+                    if executions.len() >= self.max_executions {
+                        return Err(DistributedError::Reservation {
+                            fragment_id: fragment.fragment_id,
+                            reason: "remote fragment limit reached during start".to_owned(),
+                        });
+                    }
+                    executions.insert(key, Arc::clone(&execution));
+                }
+                let stream = match self
+                    .executor
+                    .execute(
+                        &fragment,
+                        inputs,
+                        FragmentControl {
+                            control,
+                            max_spill_bytes,
+                            authorization_context: authorization_context.into(),
+                        },
+                    )
+                    .await
+                {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        self.executions.lock().remove(&key);
+                        return Err(error);
+                    }
+                };
+                if self.executions.lock().get(&key).is_none() {
+                    return Err(DistributedError::Cancelled(
+                        CancellationReason::ClientRequest,
+                    ));
+                }
+                if let Err(error) = checkpoint(&execution.control) {
+                    self.executions.lock().remove(&key);
+                    return Err(error);
+                }
+                *execution.stream.lock().await = Some(stream);
+                Ok(RemoteFragmentResponse::Started)
+            }
+            RemoteFragmentRequest::Pull {
+                query_id,
+                fragment_id,
+            } => {
+                let key = (query_id, fragment_id);
+                let execution = self.executions.lock().get(&key).cloned().ok_or_else(|| {
+                    DistributedError::RemoteProtocol(format!(
+                        "fragment {fragment_id} for query {query_id} is not running"
+                    ))
+                })?;
+                let next = {
+                    checkpoint(&execution.control)?;
+                    let mut stream = execution.stream.lock().await;
+                    let stream = stream.as_mut().ok_or_else(|| {
+                        DistributedError::RemoteProtocol(format!(
+                            "fragment {fragment_id} for query {query_id} is not ready"
+                        ))
+                    })?;
+                    stream.next().await.transpose()?
+                };
+                match next {
+                    Some(frame) => Ok(RemoteFragmentResponse::Frame(Some(encode_remote_frame(
+                        &frame,
+                        self.max_message_bytes,
+                    )?))),
+                    None => {
+                        self.executions.lock().remove(&key);
+                        Ok(RemoteFragmentResponse::Frame(None))
+                    }
+                }
+            }
+            RemoteFragmentRequest::Cancel {
+                query_id,
+                fragment_id,
+            } => {
+                if let Some(execution) = self.executions.lock().remove(&(query_id, fragment_id)) {
+                    execution.control.cancel(CancellationReason::ClientRequest);
+                }
+                Ok(RemoteFragmentResponse::Cancelled)
+            }
+            RemoteFragmentRequest::RefillTopK {
+                query_id: _,
+                fragment,
+                offset,
+                limit,
+                authorization_context,
+                deadline_ms,
+            } => {
+                if authorization_context.len() > MAX_FRAGMENT_AUTHORIZATION_CONTEXT_BYTES {
+                    return Err(DistributedError::RemoteProtocol(format!(
+                        "fragment authorization context is {} bytes; limit is {}",
+                        authorization_context.len(),
+                        MAX_FRAGMENT_AUTHORIZATION_CONTEXT_BYTES
+                    )));
+                }
+                let control = deadline_ms.map_or_else(
+                    || ExecutionControl::new(None),
+                    |milliseconds| {
+                        ExecutionControl::with_timeout(Duration::from_millis(milliseconds))
+                    },
+                );
+                let refill = self.executor.refill_top_k(
+                    &fragment,
+                    offset,
+                    limit,
+                    FragmentControl {
+                        control,
+                        max_spill_bytes: fragment.max_spill_bytes,
+                        authorization_context: authorization_context.into(),
+                    },
+                )?;
+                let payload = encode_record_batch(&refill.payload, self.max_message_bytes)?;
+                Ok(RemoteFragmentResponse::TopKRefill {
+                    rows: refill.rows,
+                    payload,
+                    unseen_bound: refill.unseen_bound,
+                })
+            }
+        }
+    }
+}
+
+/// One authenticated request/response carrier for remote fragment bodies.
+///
+/// Production implements this over the cluster's node-identity-bound mTLS
+/// transport. Tests may use [`LoopbackFragmentRpcClient`] to isolate the
+/// query-side protocol.
+#[async_trait::async_trait]
+pub trait FragmentRpcClient: Send + Sync {
+    /// Performs one bounded internal RPC.
+    async fn call(&self, request: Vec<u8>) -> DistributedResult<Vec<u8>>;
+}
+
+/// In-process carrier for protocol and endpoint tests.
+pub struct LoopbackFragmentRpcClient {
+    endpoint: Arc<RemoteFragmentEndpoint>,
+}
+
+impl LoopbackFragmentRpcClient {
+    /// Wraps one worker endpoint.
+    pub fn new(endpoint: Arc<RemoteFragmentEndpoint>) -> Self {
+        Self { endpoint }
+    }
+}
+
+#[async_trait::async_trait]
+impl FragmentRpcClient for LoopbackFragmentRpcClient {
+    async fn call(&self, request: Vec<u8>) -> DistributedResult<Vec<u8>> {
+        self.endpoint.handle(&request).await
+    }
+}
+
+/// Coordinator-side Arrow IPC transport for tablet fragments.
+///
+/// Each tablet route names an authenticated RPC carrier. Output is pulled one
+/// batch at a time, so consumer polling is the backpressure mechanism.
+pub struct RemoteFragmentTransport {
+    default_client: Option<Arc<dyn FragmentRpcClient>>,
+    clients: parking_lot::RwLock<HashMap<TabletId, Arc<dyn FragmentRpcClient>>>,
+    active: Arc<parking_lot::Mutex<HashMap<RemoteExecutionKey, Arc<dyn FragmentRpcClient>>>>,
+    max_message_bytes: usize,
+}
+
+impl RemoteFragmentTransport {
+    /// Creates a transport whose tablets use `default_client`.
+    pub fn new(default_client: Arc<dyn FragmentRpcClient>) -> Self {
+        Self::with_message_limit(default_client, DEFAULT_REMOTE_FRAGMENT_MESSAGE_BYTES)
+    }
+
+    /// Creates a transport with an explicit per-call body bound.
+    pub fn with_message_limit(
+        default_client: Arc<dyn FragmentRpcClient>,
+        max_message_bytes: usize,
+    ) -> Self {
+        Self {
+            default_client: Some(default_client),
+            clients: parking_lot::RwLock::new(HashMap::new()),
+            active: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            max_message_bytes: max_message_bytes.max(1),
+        }
+    }
+
+    /// Creates a fail-closed transport with no fallback route.
+    pub fn routed() -> Self {
+        Self {
+            default_client: None,
+            clients: parking_lot::RwLock::new(HashMap::new()),
+            active: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            max_message_bytes: DEFAULT_REMOTE_FRAGMENT_MESSAGE_BYTES,
+        }
+    }
+
+    /// Routes one tablet through a specific peer carrier.
+    pub fn with_client(self, tablet: TabletId, client: Arc<dyn FragmentRpcClient>) -> Self {
+        self.clients.write().insert(tablet, client);
+        self
+    }
+
+    fn client_for(&self, fragment: &PlanFragment) -> DistributedResult<Arc<dyn FragmentRpcClient>> {
+        let tablet = tablet_of(fragment)?;
+        self.clients
+            .read()
+            .get(&tablet)
+            .cloned()
+            .or_else(|| self.default_client.as_ref().map(Arc::clone))
+            .ok_or_else(|| {
+                DistributedError::RemoteTransport(format!(
+                    "no authenticated fragment route for tablet {tablet}"
+                ))
+            })
+    }
+
+    async fn call(
+        &self,
+        client: &Arc<dyn FragmentRpcClient>,
+        request: RemoteFragmentRequest,
+    ) -> DistributedResult<RemoteFragmentResponse> {
+        remote_call(client, request, self.max_message_bytes).await
+    }
+}
+
+struct RemoteStreamState {
+    client: Arc<dyn FragmentRpcClient>,
+    key: RemoteExecutionKey,
+    active: Arc<parking_lot::Mutex<HashMap<RemoteExecutionKey, Arc<dyn FragmentRpcClient>>>>,
+    max_message_bytes: usize,
+    complete: bool,
+    yielded_error: bool,
+}
+
+impl RemoteStreamState {
+    fn mark_complete(&mut self) {
+        self.complete = true;
+    }
+}
+
+impl Drop for RemoteStreamState {
+    fn drop(&mut self) {
+        self.active.lock().remove(&self.key);
+        if self.complete {
+            return;
+        }
+        let request = RemoteFragmentRequest::Cancel {
+            query_id: self.key.0,
+            fragment_id: self.key.1,
+        };
+        let client = Arc::clone(&self.client);
+        let max_message_bytes = self.max_message_bytes;
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = remote_call(&client, request, max_message_bytes).await;
+            });
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl FragmentTransport for RemoteFragmentTransport {
+    async fn execute_fragment(
+        &self,
+        query_id: QueryId,
+        fragment: &PlanFragment,
+        inputs: Vec<FragmentStream>,
+        control: FragmentControl,
+    ) -> DistributedResult<FragmentStream> {
+        let client = self.client_for(fragment)?;
+        let mut wire_inputs = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            let frames = drain_stream(input, &control.control).await?;
+            wire_inputs.push(
+                frames
+                    .iter()
+                    .map(|frame| encode_remote_frame(frame, self.max_message_bytes))
+                    .collect::<DistributedResult<Vec<_>>>()?,
+            );
+        }
+        let key = (query_id, fragment.fragment_id);
+        self.active.lock().insert(key, Arc::clone(&client));
+        let start = self.call(
+            &client,
+            RemoteFragmentRequest::Start {
+                query_id,
+                fragment: fragment.clone(),
+                inputs: wire_inputs,
+                max_spill_bytes: control.max_spill_bytes,
+                authorization_context: control.authorization_context.to_vec(),
+                deadline_ms: control
+                    .control
+                    .remaining_duration()
+                    .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64),
+            },
+        );
+        let response = tokio::select! {
+            response = start => response,
+            _ = control.control.cancelled() => {
+                let _ = remote_call(
+                    &client,
+                    RemoteFragmentRequest::Cancel {
+                        query_id,
+                        fragment_id: fragment.fragment_id,
+                    },
+                    self.max_message_bytes,
+                ).await;
+                Err(DistributedError::Cancelled(control.control.reason()))
+            }
+        };
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                self.active.lock().remove(&key);
+                return Err(error);
+            }
+        };
+        match response {
+            RemoteFragmentResponse::Started => {}
+            other => {
+                self.active.lock().remove(&key);
+                return Err(unexpected_remote_response("Started", &other));
+            }
+        }
+        let state = RemoteStreamState {
+            client,
+            key,
+            active: Arc::clone(&self.active),
+            max_message_bytes: self.max_message_bytes,
+            complete: false,
+            yielded_error: false,
+        };
+        let output = stream::unfold(state, |mut state| async move {
+            if state.complete || state.yielded_error {
+                return None;
+            }
+            let response = remote_call(
+                &state.client,
+                RemoteFragmentRequest::Pull {
+                    query_id: state.key.0,
+                    fragment_id: state.key.1,
+                },
+                state.max_message_bytes,
+            )
+            .await;
+            match response {
+                Ok(RemoteFragmentResponse::Frame(Some(frame))) => {
+                    let item = decode_remote_frame(frame, state.max_message_bytes);
+                    if item.is_err() {
+                        state.yielded_error = true;
+                    }
+                    Some((item, state))
+                }
+                Ok(RemoteFragmentResponse::Frame(None)) => {
+                    state.mark_complete();
+                    None
+                }
+                Ok(other) => {
+                    state.yielded_error = true;
+                    Some((Err(unexpected_remote_response("Frame", &other)), state))
+                }
+                Err(error) => {
+                    state.yielded_error = true;
+                    Some((Err(error), state))
+                }
+            }
+        });
+        Ok(Box::pin(output))
+    }
+
+    fn cancel_fragment(&self, query_id: QueryId, fragment_id: FragmentId) -> DistributedResult<()> {
+        let key = (query_id, fragment_id);
+        let Some(client) = self.active.lock().remove(&key) else {
+            return Ok(());
+        };
+        let max_message_bytes = self.max_message_bytes;
+        let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
+            DistributedError::RemoteTransport(format!(
+                "cannot schedule fragment cancellation outside Tokio: {error}"
+            ))
+        })?;
+        runtime.spawn(async move {
+            let _ = remote_call(
+                &client,
+                RemoteFragmentRequest::Cancel {
+                    query_id,
+                    fragment_id,
+                },
+                max_message_bytes,
+            )
+            .await;
+        });
+        Ok(())
+    }
+
+    async fn refill_top_k(
+        &self,
+        query_id: QueryId,
+        fragment: &PlanFragment,
+        offset: usize,
+        limit: usize,
+        control: FragmentControl,
+    ) -> DistributedResult<TopKRefill> {
+        let client = self.client_for(fragment)?;
+        match self
+            .call(
+                &client,
+                RemoteFragmentRequest::RefillTopK {
+                    query_id,
+                    fragment: fragment.clone(),
+                    offset,
+                    limit,
+                    authorization_context: control.authorization_context.to_vec(),
+                    deadline_ms: control
+                        .control
+                        .remaining_duration()
+                        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64),
+                },
+            )
+            .await?
+        {
+            RemoteFragmentResponse::TopKRefill {
+                rows,
+                payload,
+                unseen_bound,
+            } => Ok(TopKRefill {
+                rows,
+                payload: decode_record_batch(&payload, self.max_message_bytes)?,
+                unseen_bound,
+            }),
+            other => Err(unexpected_remote_response("TopKRefill", &other)),
+        }
+    }
+}
+
+async fn remote_call(
+    client: &Arc<dyn FragmentRpcClient>,
+    request: RemoteFragmentRequest,
+    max_message_bytes: usize,
+) -> DistributedResult<RemoteFragmentResponse> {
+    let request = encode_remote_wire(
+        &RemoteFragmentEnvelope {
+            version: REMOTE_FRAGMENT_PROTOCOL_VERSION,
+            request,
+        },
+        max_message_bytes,
+    )?;
+    let response = client.call(request).await?;
+    let envelope: RemoteFragmentResponseEnvelope =
+        decode_remote_wire(&response, max_message_bytes)?;
+    if envelope.version != REMOTE_FRAGMENT_PROTOCOL_VERSION {
+        return Err(DistributedError::RemoteProtocol(format!(
+            "peer answered with fragment protocol version {}; supported version is {}",
+            envelope.version, REMOTE_FRAGMENT_PROTOCOL_VERSION
+        )));
+    }
+    match envelope.response {
+        RemoteFragmentResponse::Error(message) => Err(DistributedError::RemoteTransport(message)),
+        response => Ok(response),
+    }
+}
+
+fn remote_wire_options() -> impl Options {
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+}
+
+fn encode_remote_wire<T: Serialize>(
+    value: &T,
+    max_message_bytes: usize,
+) -> DistributedResult<Vec<u8>> {
+    let bytes = remote_wire_options()
+        .serialize(value)
+        .map_err(|error| DistributedError::RemoteProtocol(error.to_string()))?;
+    if bytes.len() > max_message_bytes {
+        return Err(DistributedError::RemoteProtocol(format!(
+            "encoded fragment message is {} bytes; limit is {max_message_bytes}",
+            bytes.len()
+        )));
+    }
+    Ok(bytes)
+}
+
+fn decode_remote_wire<T: for<'de> Deserialize<'de>>(
+    bytes: &[u8],
+    max_message_bytes: usize,
+) -> DistributedResult<T> {
+    if bytes.len() > max_message_bytes {
+        return Err(DistributedError::RemoteProtocol(format!(
+            "fragment message is {} bytes; limit is {max_message_bytes}",
+            bytes.len()
+        )));
+    }
+    remote_wire_options()
+        .with_limit(max_message_bytes as u64)
+        .deserialize(bytes)
+        .map_err(|error| DistributedError::RemoteProtocol(error.to_string()))
+}
+
+fn encode_record_batch(
+    batch: &RecordBatch,
+    max_message_bytes: usize,
+) -> DistributedResult<Vec<u8>> {
+    let mut ipc = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut ipc, &batch.schema())?;
+        writer.write(batch)?;
+        writer.finish()?;
+    }
+    if ipc.len() > max_message_bytes {
+        return Err(DistributedError::RemoteProtocol(format!(
+            "Arrow IPC batch is {} bytes; limit is {max_message_bytes}",
+            ipc.len()
+        )));
+    }
+    Ok(ipc)
+}
+
+fn decode_record_batch(ipc: &[u8], max_message_bytes: usize) -> DistributedResult<RecordBatch> {
+    if ipc.len() > max_message_bytes {
+        return Err(DistributedError::RemoteProtocol(format!(
+            "Arrow IPC batch is {} bytes; limit is {max_message_bytes}",
+            ipc.len()
+        )));
+    }
+    let mut reader = StreamReader::try_new(Cursor::new(ipc), None)?;
+    let batch = reader.next().transpose()?.ok_or_else(|| {
+        DistributedError::RemoteProtocol("Arrow IPC frame contains no record batch".to_owned())
+    })?;
+    if reader.next().transpose()?.is_some() {
+        return Err(DistributedError::RemoteProtocol(
+            "Arrow IPC frame contains more than one record batch".to_owned(),
+        ));
+    }
+    Ok(batch)
+}
+
+fn encode_remote_frame(
+    frame: &BatchFrame,
+    max_message_bytes: usize,
+) -> DistributedResult<RemoteBatchFrame> {
+    Ok(RemoteBatchFrame {
+        ipc: encode_record_batch(&frame.batch, max_message_bytes)?,
+        score_bound: frame.score_bound,
+    })
+}
+
+fn decode_remote_frame(
+    frame: RemoteBatchFrame,
+    max_message_bytes: usize,
+) -> DistributedResult<BatchFrame> {
+    Ok(BatchFrame {
+        batch: decode_record_batch(&frame.ipc, max_message_bytes)?,
+        score_bound: frame.score_bound,
+    })
+}
+
+fn unexpected_remote_response(expected: &str, actual: &RemoteFragmentResponse) -> DistributedError {
+    DistributedError::RemoteProtocol(format!(
+        "expected remote {expected} response, got {actual:?}"
+    ))
+}
+
+/// Batch source consumed by the reference fragment operator engine.
+///
+/// Implementations validate `control.authorization_context` before reading.
+pub trait FragmentTableSource: Send + Sync {
+    /// Reads one table slice from a hosted tablet.
+    fn scan(
+        &self,
+        table: &str,
+        tablet: TabletId,
+        include_row_id: bool,
+        control: Option<&FragmentControl>,
+    ) -> DistributedResult<Vec<RecordBatch>>;
+
+    /// Returns the empty-result schema for one table, when known.
+    fn schema(&self, table: &str, tablet: TabletId) -> DistributedResult<Option<SchemaRef>>;
+}
+
+/// Resolves the local storage owner for one hosted tablet.
+pub trait FragmentDatabaseProvider: Send + Sync {
+    /// Returns `None` when this node does not host `tablet`.
+    fn database(&self, tablet: TabletId) -> Option<Arc<mongreldb_core::Database>>;
+}
+
+/// Validates the forwarded server-issued authorization envelope.
+pub trait FragmentAuthorizationResolver: Send + Sync {
+    /// Resolves the exact principal for the local database. `None` is valid
+    /// only for a credentialless database.
+    fn resolve(
+        &self,
+        database: &mongreldb_core::Database,
+        context: &[u8],
+    ) -> DistributedResult<Option<mongreldb_core::Principal>>;
+}
+
+/// Core MVCC-backed tablet source used by remote SQL workers.
+pub struct CoreFragmentTableSource {
+    databases: Arc<dyn FragmentDatabaseProvider>,
+    authorization: Arc<dyn FragmentAuthorizationResolver>,
+}
+
+impl CoreFragmentTableSource {
+    /// Creates an authorized core-backed source.
+    pub fn new(
+        databases: Arc<dyn FragmentDatabaseProvider>,
+        authorization: Arc<dyn FragmentAuthorizationResolver>,
+    ) -> Self {
+        Self {
+            databases,
+            authorization,
+        }
+    }
+}
+
+impl FragmentTableSource for CoreFragmentTableSource {
+    fn scan(
+        &self,
+        table: &str,
+        tablet: TabletId,
+        include_row_id: bool,
+        control: Option<&FragmentControl>,
+    ) -> DistributedResult<Vec<RecordBatch>> {
+        let control = control.ok_or_else(|| {
+            DistributedError::RemoteProtocol(
+                "core tablet scan requires fragment authorization control".to_owned(),
+            )
+        })?;
+        checkpoint(&control.control)?;
+        let database = self.databases.database(tablet).ok_or_else(|| {
+            DistributedError::RemoteTransport(format!("this node does not host tablet {tablet}"))
+        })?;
+        let principal = self
+            .authorization
+            .resolve(&database, &control.authorization_context)?;
+        let schema = database
+            .table(table)
+            .map_err(|error| DistributedError::RemoteTransport(error.to_string()))?
+            .lock()
+            .schema()
+            .clone();
+        let rows = database
+            .query_as_principal_controlled(
+                table,
+                &mongreldb_core::Query {
+                    conditions: Vec::new(),
+                    // Fragment scans are an internal streaming input, not a
+                    // public final-result window. Capping this at
+                    // MAX_FINAL_LIMIT silently dropped every row after
+                    // 10,000 before aggregation, sorting, or exchange.
+                    limit: None,
+                    offset: 0,
+                },
+                None,
+                principal.as_ref(),
+                &control.control,
+            )
+            .map_err(|error| DistributedError::RemoteTransport(error.to_string()))?;
+        let batch = crate::arrow_conv::rows_to_batch(&rows, &schema)
+            .map_err(|error| DistributedError::Arrow(error.to_string()))?;
+        if !include_row_id {
+            return Ok(vec![batch]);
+        }
+        let mut fields = batch.schema().fields().iter().cloned().collect::<Vec<_>>();
+        fields.push(Arc::new(Field::new(
+            TOPK_ROWID_COLUMN,
+            DataType::UInt64,
+            false,
+        )));
+        let mut columns = batch.columns().to_vec();
+        columns.push(Arc::new(UInt64Array::from(
+            rows.iter().map(|row| row.row_id.0).collect::<Vec<_>>(),
+        )));
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
+        Ok(vec![batch])
+    }
+
+    fn schema(&self, _table: &str, _tablet: TabletId) -> DistributedResult<Option<SchemaRef>> {
+        // `scan` always returns one (possibly empty) batch with the authorized
+        // schema, so this fallback is never needed.
+        Ok(None)
+    }
+}
+
+/// In-memory per-`(table, tablet)` record-batch source backing
 /// [`InMemoryFragmentExecutor`].
 #[derive(Default)]
 pub struct InMemoryTableStore {
@@ -1728,13 +2667,29 @@ impl InMemoryTableStore {
     }
 }
 
+impl FragmentTableSource for InMemoryTableStore {
+    fn scan(
+        &self,
+        table: &str,
+        tablet: TabletId,
+        _include_row_id: bool,
+        _control: Option<&FragmentControl>,
+    ) -> DistributedResult<Vec<RecordBatch>> {
+        Ok(self.snapshot(table, tablet))
+    }
+
+    fn schema(&self, table: &str, _tablet: TabletId) -> DistributedResult<Option<SchemaRef>> {
+        Ok(self.schema(table))
+    }
+}
+
 /// Reference [`FragmentExecutor`] over an [`InMemoryTableStore`]. Interprets
 /// scans, projections, partial aggregates, local merge sorts, bounded local
 /// top-ks (with exact tie information), and limits for real; exchange
 /// sources drain their input streams; join operators reject (their execution
 /// binding lands with the tablet wave — plan shape is fully tested).
 pub struct InMemoryFragmentExecutor {
-    store: Arc<InMemoryTableStore>,
+    store: Arc<dyn FragmentTableSource>,
     /// Wire batch for the local top-k: at most this many rows are emitted
     /// before reporting a bound (`None` = emit `k`, which never needs a
     /// refill). Smaller values exercise the coordinator's adaptive refill.
@@ -1758,16 +2713,31 @@ impl InMemoryFragmentExecutor {
         }
     }
 
+    /// Uses an arbitrary authorized tablet source with the same operator
+    /// engine as the deterministic in-memory reference.
+    pub fn from_source(store: Arc<dyn FragmentTableSource>) -> Self {
+        Self {
+            store,
+            topk_emit_batch: None,
+        }
+    }
+
     /// Replays the scan (+ projection) of a fragment from the store.
-    fn scan_batches(&self, fragment: &PlanFragment) -> DistributedResult<Vec<RecordBatch>> {
+    fn scan_batches(
+        &self,
+        fragment: &PlanFragment,
+        control: Option<&FragmentControl>,
+    ) -> DistributedResult<Vec<RecordBatch>> {
         let tablet = tablet_of(fragment)?;
         let scan = fragment
             .operators
             .iter()
             .find_map(|operator| match operator {
                 FragmentOperator::TabletScan {
-                    table, projection, ..
-                } => Some((table, projection)),
+                    table,
+                    predicate,
+                    projection,
+                } => Some((table, predicate, projection)),
                 _ => None,
             })
             .ok_or_else(|| {
@@ -1776,14 +2746,24 @@ impl InMemoryFragmentExecutor {
                     fragment.fragment_id
                 ))
             })?;
-        let mut batches = self.store.snapshot(scan.0, tablet);
+        if scan.1.is_some() {
+            return Err(DistributedError::Unsupported(
+                "tablet predicate execution is not bound to the fragment operator engine"
+                    .to_owned(),
+            ));
+        }
+        let include_row_id = fragment
+            .operators
+            .iter()
+            .any(|operator| matches!(operator, FragmentOperator::DistributedTopK { .. }));
+        let mut batches = self.store.scan(scan.0, tablet, include_row_id, control)?;
         if batches.is_empty() {
-            if let Some(schema) = self.store.schema(scan.0) {
+            if let Some(schema) = self.store.schema(scan.0, tablet)? {
                 batches = vec![RecordBatch::new_empty(schema)];
             }
         }
-        if !scan.1.is_empty() {
-            batches = project_batches(&batches, scan.1)?;
+        if !scan.2.is_empty() {
+            batches = project_batches(&batches, scan.2)?;
         }
         Ok(batches)
     }
@@ -1804,7 +2784,7 @@ impl FragmentExecutor for InMemoryFragmentExecutor {
             checkpoint(&control.control)?;
             match operator {
                 FragmentOperator::TabletScan { .. } => {
-                    batches = self.scan_batches(fragment)?;
+                    batches = self.scan_batches(fragment, Some(&control))?;
                 }
                 FragmentOperator::RemoteExchangeSource { .. } => {
                     let input = inputs.next().ok_or_else(|| {
@@ -1872,6 +2852,7 @@ impl FragmentExecutor for InMemoryFragmentExecutor {
         fragment: &PlanFragment,
         offset: usize,
         limit: usize,
+        control: FragmentControl,
     ) -> DistributedResult<TopKRefill> {
         let tablet = tablet_of(fragment)?;
         let score = fragment
@@ -1887,7 +2868,7 @@ impl FragmentExecutor for InMemoryFragmentExecutor {
                     fragment.fragment_id
                 ))
             })?;
-        let batches = self.scan_batches(fragment)?;
+        let batches = self.scan_batches(fragment, Some(&control))?;
         let input = prepare_top_k(&batches, &score.column, tablet)?;
         let (rows, payload, unseen_bound) = input.emit(offset, limit);
         Ok(TopKRefill {
@@ -2974,9 +3955,18 @@ struct InFlight {
 }
 
 /// Per-query execution state tracked by the coordinator.
-#[derive(Default)]
 struct ExecutionState {
+    query_id: QueryId,
     in_flight: Mutex<HashMap<FragmentId, InFlight>>,
+}
+
+impl ExecutionState {
+    fn new(query_id: QueryId) -> Self {
+        Self {
+            query_id,
+            in_flight: Mutex::new(HashMap::new()),
+        }
+    }
 }
 
 /// One producer stream feeding a coordinator (root) fragment.
@@ -3072,6 +4062,23 @@ impl Coordinator {
     /// [`FragmentOperator::DistributedLimit`]) run over the producer streams
     /// for real.
     pub async fn execute(&self, plan: &DistributedPlan) -> DistributedResult<Vec<RecordBatch>> {
+        self.execute_with_authorization(plan, &[]).await
+    }
+
+    /// Executes a plan while forwarding a bounded, server-issued
+    /// authorization envelope to every tablet worker.
+    pub async fn execute_with_authorization(
+        &self,
+        plan: &DistributedPlan,
+        authorization_context: &[u8],
+    ) -> DistributedResult<Vec<RecordBatch>> {
+        if authorization_context.len() > MAX_FRAGMENT_AUTHORIZATION_CONTEXT_BYTES {
+            return Err(DistributedError::InvalidPlan(format!(
+                "fragment authorization context is {} bytes; limit is {}",
+                authorization_context.len(),
+                MAX_FRAGMENT_AUTHORIZATION_CONTEXT_BYTES
+            )));
+        }
         let registry_id = to_registry_query_id(&plan.query_id)?;
         let registered = self
             .registry
@@ -3082,7 +4089,9 @@ impl Coordinator {
             .map_err(|error| {
                 DistributedError::InvalidPlan(format!("query registration failed: {error}"))
             })?;
-        let result = self.execute_registered(plan, &registered).await;
+        let result = self
+            .execute_registered(plan, &registered, authorization_context.into())
+            .await;
         match &result {
             Ok(_) => {
                 let _ = registered.try_complete();
@@ -3104,7 +4113,7 @@ impl Coordinator {
             let in_flight = state.in_flight.lock();
             for (fragment_id, inflight) in in_flight.iter() {
                 inflight.control.cancel(CancellationReason::ClientRequest);
-                let _ = self.transport.cancel_fragment(*fragment_id);
+                let _ = self.transport.cancel_fragment(*query_id, *fragment_id);
             }
         }
         Ok(matches!(
@@ -3144,7 +4153,7 @@ impl Coordinator {
                 if let Some(inflight) = inflight {
                     inflight.control.cancel(CancellationReason::ServerShutdown);
                     drop(inflight);
-                    let _ = self.transport.cancel_fragment(fragment_id);
+                    let _ = self.transport.cancel_fragment(state.query_id, fragment_id);
                     cleaned += 1;
                 }
             }
@@ -3156,16 +4165,19 @@ impl Coordinator {
         &self,
         plan: &DistributedPlan,
         registered: &RegisteredSqlQuery,
+        authorization_context: Arc<[u8]>,
     ) -> DistributedResult<Vec<RecordBatch>> {
         validate_plan_shape(plan)?;
         let root = plan
             .root_fragment_id()
             .ok_or_else(|| DistributedError::InvalidPlan("plan has no root fragment".to_owned()))?;
-        let state = Arc::new(ExecutionState::default());
+        let state = Arc::new(ExecutionState::new(plan.query_id));
         self.executions
             .lock()
             .insert(plan.query_id, Arc::clone(&state));
-        let result = self.run_plan(plan, root, registered, &state).await;
+        let result = self
+            .run_plan(plan, root, registered, &state, authorization_context)
+            .await;
         self.executions.lock().remove(&plan.query_id);
         result
     }
@@ -3176,6 +4188,7 @@ impl Coordinator {
         root: FragmentId,
         registered: &RegisteredSqlQuery,
         state: &Arc<ExecutionState>,
+        authorization_context: Arc<[u8]>,
     ) -> DistributedResult<Vec<RecordBatch>> {
         let parent = registered.control().clone();
         let layers = fragment_layers(plan, root)?;
@@ -3225,6 +4238,7 @@ impl Coordinator {
                 let fragment_control = FragmentControl {
                     control,
                     max_spill_bytes: fragment.max_spill_bytes,
+                    authorization_context: Arc::clone(&authorization_context),
                 };
                 let transport = Arc::clone(&self.transport);
                 tasks.push(async move {
@@ -3232,7 +4246,7 @@ impl Coordinator {
                     let drain_control = fragment_control.control.clone();
                     let result = async {
                         let stream = transport
-                            .execute_fragment(&fragment, inputs, fragment_control)
+                            .execute_fragment(plan.query_id, &fragment, inputs, fragment_control)
                             .await?;
                         drain_stream(stream, &drain_control).await
                     }
@@ -3276,7 +4290,8 @@ impl Coordinator {
             }
         }
         checkpoint(&parent)?;
-        self.run_root(plan, root, &outputs, &parent).await
+        self.run_root(plan, root, &outputs, &parent, authorization_context)
+            .await
     }
 
     /// Cancels every in-flight fragment control and notifies the transport
@@ -3289,7 +4304,9 @@ impl Coordinator {
             }
         }
         for fragment in &plan.fragments {
-            let _ = self.transport.cancel_fragment(fragment.fragment_id);
+            let _ = self
+                .transport
+                .cancel_fragment(plan.query_id, fragment.fragment_id);
         }
     }
 
@@ -3300,6 +4317,7 @@ impl Coordinator {
         root: FragmentId,
         outputs: &HashMap<FragmentId, Vec<BatchFrame>>,
         parent: &ExecutionControl,
+        authorization_context: Arc<[u8]>,
     ) -> DistributedResult<Vec<RecordBatch>> {
         let fragment = &plan.fragments[root as usize];
         let mut inputs: Vec<ProducerInput> = Vec::new();
@@ -3356,7 +4374,17 @@ impl Coordinator {
                     });
                 }
                 FragmentOperator::DistributedTopK { k, score } => {
-                    current = RootData::Batches(self.coordinator_top_k(plan, &current, *k, score)?);
+                    current = RootData::Batches(
+                        self.coordinator_top_k(
+                            plan,
+                            &current,
+                            *k,
+                            score,
+                            parent,
+                            &authorization_context,
+                        )
+                        .await?,
+                    );
                 }
                 FragmentOperator::DistributedLimit { limit } => {
                     let batches = current.flatten();
@@ -3376,12 +4404,14 @@ impl Coordinator {
     /// (spec section 12.10): merges every producer's bounded local top-k
     /// under the exact tie-break, refilling tablets whose unseen-score bound
     /// could still contribute winners through the transport.
-    fn coordinator_top_k(
+    async fn coordinator_top_k(
         &self,
         plan: &DistributedPlan,
         data: &RootData,
         k: usize,
         score: &SortKey,
+        control: &ExecutionControl,
+        authorization_context: &[u8],
     ) -> DistributedResult<Vec<RecordBatch>> {
         // A pre-combined input (chained after another coordinator operator)
         // is a single synthetic stream that never refills.
@@ -3457,11 +4487,20 @@ impl Coordinator {
             for tablet in merge.refill {
                 let fragment_id = fragment_of[&tablet];
                 let already = shards[&tablet].rows.len();
-                let refill = self.transport.refill_top_k(
-                    &plan.fragments[fragment_id as usize],
-                    already,
-                    k,
-                )?;
+                let refill = self
+                    .transport
+                    .refill_top_k(
+                        plan.query_id,
+                        &plan.fragments[fragment_id as usize],
+                        already,
+                        k,
+                        FragmentControl {
+                            control: control.child_with_deadline(None),
+                            max_spill_bytes: plan.fragments[fragment_id as usize].max_spill_bytes,
+                            authorization_context: authorization_context.into(),
+                        },
+                    )
+                    .await?;
                 let entry = shards.get_mut(&tablet).expect("shard exists");
                 if refill.rows.is_empty() && refill.unseen_bound == entry.unseen_bound {
                     return Err(DistributedError::InvalidPlan(format!(
@@ -4004,6 +5043,7 @@ mod tests {
         let control = FragmentControl {
             control: ExecutionControl::new(None),
             max_spill_bytes: 64 * 1024,
+            authorization_context: Arc::from([]),
         };
         let session = control
             .begin_spill(db.spill_manager(), QueryId::from_bytes([0xAB; 16]))
@@ -4766,6 +5806,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_arrow_ipc_transport_gathers_with_pull_backpressure() {
+        let store = Arc::new(InMemoryTableStore::new());
+        let tablets = [tablet(1), tablet(2), tablet(3)];
+        store.insert("t", tablets[0], i64_batch(&[("v", vec![1, 2])]));
+        store.insert("t", tablets[1], i64_batch(&[("v", vec![3])]));
+        let executor: Arc<dyn FragmentExecutor> = Arc::new(InMemoryFragmentExecutor::new(store));
+        let endpoint = Arc::new(RemoteFragmentEndpoint::new(executor));
+        let client: Arc<dyn FragmentRpcClient> =
+            Arc::new(LoopbackFragmentRpcClient::new(Arc::clone(&endpoint)));
+        let transport: Arc<dyn FragmentTransport> = Arc::new(RemoteFragmentTransport::new(client));
+        let coordinator = Coordinator::new(transport, Arc::new(SqlQueryRegistry::default()));
+        let (plan, _) = scan_plan("t");
+
+        let batches = coordinator.execute(&plan).await.unwrap();
+        let mut values = collect_i64(&batches, "v");
+        values.sort_unstable();
+        assert_eq!(values, vec![1, 2, 3]);
+        assert_eq!(
+            endpoint.active_executions(),
+            0,
+            "terminal pulls release every worker cursor"
+        );
+    }
+
+    #[tokio::test]
     async fn merge_sort_matches_single_node_sort() {
         let store = Arc::new(InMemoryTableStore::new());
         let tablets = [tablet(1), tablet(2), tablet(3)];
@@ -5002,6 +6067,27 @@ mod tests {
             !transport.refill_log().is_empty(),
             "bounded emission must trigger adaptive refill"
         );
+
+        // The same bounded producer over the remote protocol must cross the
+        // refill RPC and preserve the exact winners.
+        let executor: Arc<dyn FragmentExecutor> = Arc::new(
+            InMemoryFragmentExecutor::with_topk_emit_batch(Arc::clone(&store), 2),
+        );
+        let endpoint = Arc::new(RemoteFragmentEndpoint::new(executor));
+        let client: Arc<dyn FragmentRpcClient> =
+            Arc::new(LoopbackFragmentRpcClient::new(Arc::clone(&endpoint)));
+        let coordinator = Coordinator::new(
+            Arc::new(RemoteFragmentTransport::new(client)),
+            Arc::new(SqlQueryRegistry::default()),
+        );
+        let plan = distribute(&desc(topk), &locator, &metadata).unwrap();
+        let batches = coordinator.execute(&plan).await.unwrap();
+        let actual = collect_u64(&batches, "score")
+            .into_iter()
+            .zip(collect_i64(&batches, "payload"))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+        assert_eq!(endpoint.active_executions(), 0);
     }
 
     #[tokio::test]
@@ -5040,6 +6126,37 @@ mod tests {
             let control = transport.control_for(fragment_id).unwrap();
             assert_eq!(control.reason(), CancellationReason::ClientRequest);
         }
+    }
+
+    #[tokio::test]
+    async fn remote_cancellation_reaches_worker_during_fragment_start() {
+        let barrier = Arc::new(tokio::sync::Barrier::new(4));
+        let executor: Arc<dyn FragmentExecutor> = Arc::new(BlockingExecutor {
+            barrier: Arc::clone(&barrier),
+        });
+        let endpoint = Arc::new(RemoteFragmentEndpoint::new(executor));
+        let client: Arc<dyn FragmentRpcClient> =
+            Arc::new(LoopbackFragmentRpcClient::new(Arc::clone(&endpoint)));
+        let coordinator = Arc::new(Coordinator::new(
+            Arc::new(RemoteFragmentTransport::new(client)),
+            Arc::new(SqlQueryRegistry::default()),
+        ));
+        let (plan, _) = scan_plan("t");
+        let task = {
+            let coordinator = Arc::clone(&coordinator);
+            let plan = plan.clone();
+            tokio::spawn(async move { coordinator.execute(&plan).await })
+        };
+        tokio::time::timeout(Duration::from_secs(30), barrier.wait())
+            .await
+            .expect("all remote workers entered fragment start");
+        assert!(coordinator.cancel_query(&plan.query_id).unwrap());
+        let result = tokio::time::timeout(Duration::from_secs(30), task)
+            .await
+            .expect("remote cancellation must not hang")
+            .unwrap();
+        assert!(matches!(result, Err(DistributedError::Cancelled(_))));
+        assert_eq!(endpoint.active_executions(), 0);
     }
 
     #[tokio::test]

@@ -1,19 +1,26 @@
 [workspace]
 members = [
+    "crates/mongreldb-client",
     "crates/mongreldb-cluster",
     "crates/mongreldb-consensus",
     "crates/mongreldb-core",
     "crates/mongreldb-fault",
+    "crates/mongreldb-ffi",
     "crates/mongreldb-log",
+    "crates/mongreldb-migrate-mysql",
+    "crates/mongreldb-mysql-wire",
+    "crates/mongreldb-node",
+    "crates/mongreldb-perf",
     "crates/mongreldb-protocol",
     "crates/mongreldb-query",
+    "crates/mongreldb-server",
     "crates/mongreldb-sim",
     "crates/mongreldb-types",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.60.3"
+version = "0.61.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 rust-version = "1.88"

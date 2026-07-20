@@ -775,6 +775,119 @@ mod tests {
     }
 
     #[test]
+    fn database_reopen_discards_prior_cache_and_rebuilds_binary_ann_from_rows() {
+        use crate::query::{Retriever, RetrieverScore};
+        use crate::schema::{AnnOptions, AnnQuantization};
+        use crate::{Database, Value};
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().to_path_buf();
+        let schema = Schema {
+            columns: vec![
+                ColumnDef {
+                    id: 1,
+                    name: "id".into(),
+                    ty: TypeId::Int64,
+                    flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                    default_value: None,
+                    embedding_source: None,
+                },
+                ColumnDef {
+                    id: 2,
+                    name: "embedding".into(),
+                    ty: TypeId::Embedding { dim: 4 },
+                    flags: ColumnFlags::empty(),
+                    default_value: None,
+                    embedding_source: None,
+                },
+            ],
+            indexes: vec![IndexDef {
+                name: "idx_embedding".into(),
+                column_id: 2,
+                kind: IndexKind::Ann,
+                predicate: None,
+                options: IndexOptions {
+                    ann: Some(AnnOptions {
+                        quantization: AnnQuantization::BinarySign,
+                        ..AnnOptions::default()
+                    }),
+                    ..IndexOptions::default()
+                },
+            }],
+            ..Schema::default()
+        };
+
+        let (table_id, expected) = {
+            let db = Database::create(&db_path).unwrap();
+            db.create_table("docs", schema).unwrap();
+            for (id, vector) in [
+                (1, vec![1.0, -1.0, 1.0, -1.0]),
+                (2, vec![-1.0, 1.0, -1.0, 1.0]),
+            ] {
+                let mut transaction = db.begin();
+                transaction
+                    .put(
+                        "docs",
+                        vec![(1, Value::Int64(id)), (2, Value::Embedding(vector))],
+                    )
+                    .unwrap();
+                transaction.commit().unwrap();
+            }
+            let handle = db.table("docs").unwrap();
+            let mut table = handle.lock();
+            table.set_mutable_run_spill_bytes(1);
+            table.flush().unwrap();
+            let expected = table
+                .retrieve(&Retriever::Ann {
+                    column_id: 2,
+                    query: vec![1.0, -1.0, 1.0, -1.0],
+                    k: 2,
+                })
+                .unwrap()
+                .into_iter()
+                .map(|hit| (hit.row_id, hit.score))
+                .collect::<Vec<_>>();
+            (table.table_id(), expected)
+        };
+
+        let table_dir = db_path
+            .join(crate::database::TABLES_DIR)
+            .join(table_id.to_string());
+        let bytes = std::fs::read(path(&table_dir)).unwrap();
+        let footer_start = bytes.len() - 40;
+        let mut body: GlobalIdxBody = bincode::deserialize(&bytes[8..footer_start]).unwrap();
+        body.format_version = IDX_VERSION - 1;
+        write_body(&table_dir, &body);
+
+        let db = Database::open(&db_path).unwrap();
+        let handle = db.table("docs").unwrap();
+        let mut table = handle.lock();
+        let rebuilt = table
+            .retrieve(&Retriever::Ann {
+                column_id: 2,
+                query: vec![1.0, -1.0, 1.0, -1.0],
+                k: 2,
+            })
+            .unwrap()
+            .into_iter()
+            .map(|hit| (hit.row_id, hit.score))
+            .collect::<Vec<_>>();
+        assert_eq!(rebuilt.len(), expected.len());
+        for ((actual_row, actual_score), (expected_row, expected_score)) in
+            rebuilt.into_iter().zip(expected)
+        {
+            assert_eq!(actual_row, expected_row);
+            assert!(matches!(
+                (actual_score, expected_score),
+                (
+                    RetrieverScore::AnnHammingDistance(actual),
+                    RetrieverScore::AnnHammingDistance(expected)
+                ) if actual == expected
+            ));
+        }
+    }
+
+    #[test]
     fn detects_corruption() {
         let dir = tempdir().unwrap();
         let hot = HotIndex::new();

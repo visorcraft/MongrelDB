@@ -4,7 +4,7 @@
 //! drive the same failure handling as real durability errors.
 
 use mongreldb_core::{schema::*, Database, MongrelError, Query, Value};
-use mongreldb_log::{CommandEnvelope, CommitLog, DurabilityLevel, ExecutionControl, LogPosition};
+use mongreldb_log::{CommandEnvelope, DurabilityLevel, ExecutionControl, LogPosition};
 use mongreldb_types::hlc::HlcTimestamp;
 use tempfile::tempdir;
 

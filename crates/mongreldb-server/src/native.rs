@@ -11,7 +11,7 @@ use arrow::ipc::writer::StreamWriter;
 use futures::{Stream, StreamExt};
 use mongreldb_core::{
     Database, JwksCache, JwtValidationConfig, MongrelError, Principal, ServiceToken,
-    ServiceTokenRegistry,
+    ServiceTokenRegistry, WorkloadClass,
 };
 use mongreldb_protocol::native;
 use mongreldb_protocol::request::AuthenticatedIdentity;
@@ -100,6 +100,9 @@ pub struct NativeRuntime {
     auth_grants: Arc<Mutex<HashMap<Vec<u8>, AuthGrant>>>,
     scram_exchanges: Arc<Mutex<HashMap<Vec<u8>, PendingScram>>>,
     external_auth: Option<NativeExternalAuth>,
+    sql_semaphore: Arc<tokio::sync::Semaphore>,
+    scheduler: crate::admission::SchedulerAdmission,
+    sql_priority: u8,
 }
 
 impl NativeRuntime {
@@ -108,6 +111,7 @@ impl NativeRuntime {
         sessions: Arc<SessionStore>,
         query_registry: Arc<SqlQueryRegistry>,
     ) -> Self {
+        let groups = mongreldb_core::ResourceGroupRegistry::with_defaults();
         Self {
             db,
             sessions,
@@ -116,7 +120,27 @@ impl NativeRuntime {
             auth_grants: Arc::new(Mutex::new(HashMap::new())),
             scram_exchanges: Arc::new(Mutex::new(HashMap::new())),
             external_auth: None,
+            sql_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                crate::default_sql_max_concurrent(),
+            )),
+            scheduler: crate::admission::SchedulerAdmission::from_resource_groups(&groups),
+            sql_priority: crate::admission::priority_for_class(
+                &groups,
+                WorkloadClass::InteractiveSql,
+            ),
         }
+    }
+
+    pub(crate) fn with_sql_admission(
+        mut self,
+        semaphore: Arc<tokio::sync::Semaphore>,
+        scheduler: crate::admission::SchedulerAdmission,
+        priority: u8,
+    ) -> Self {
+        self.sql_semaphore = semaphore;
+        self.scheduler = scheduler;
+        self.sql_priority = priority;
+        self
     }
 
     pub(crate) fn with_sql_idempotency(
@@ -266,6 +290,43 @@ impl NativeRuntime {
         };
         let session = entry.session();
         let query = session.register_query(options).map_err(query_status)?;
+        let permit = tokio::select! {
+            permit = Arc::clone(&self.sql_semaphore).acquire_owned() => {
+                permit.map_err(|_| Status::unavailable("native SQL admission closed"))?
+            }
+            _ = query.control().cancelled() => {
+                let error = query.checkpoint().err().unwrap_or_else(|| {
+                    MongrelQueryError::InvalidQueryState(
+                        "cancelled native SQL query remained runnable".into(),
+                    )
+                });
+                query.fail();
+                return Err(query_status(error));
+            }
+        };
+        let types_query_id = mongreldb_types::ids::QueryId::from_bytes(*query.id().as_bytes());
+        let work = match self
+            .scheduler
+            .submit_and_wait(
+                crate::admission::AdmitRequest {
+                    tenant: &entry.owner,
+                    class: WorkloadClass::InteractiveSql,
+                    priority: self.sql_priority,
+                    deadline: request_timeout(context)?,
+                    query_id: Some(types_query_id),
+                    tag: "native-sql",
+                },
+                query.control().cancelled(),
+            )
+            .await
+        {
+            Ok(work) => work,
+            Err(error) => {
+                query.fail();
+                return Err(query_status(crate::admission::admit_error_to_query(error)));
+            }
+        };
+        let _admission = crate::admission::SqlAdmissionGuard::new(permit, work);
         let batches = session
             .run_with_query_for_serialization(&sql, query)
             .await

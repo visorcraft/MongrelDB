@@ -381,14 +381,14 @@ Prebuilt `libmongreldb` (core engine), `libmongreldb_kit` (Kit layer), and `libm
 
 | Platform | C/C++ archives | JVM JAR |
 |---|---|---|
-| Linux x64 (glibc) | `mongreldb-native-linux-x64-gnu.tar.gz` + `mongreldb-kit-native-linux-x64-gnu.tar.gz` | `mongreldb-jni-0.60.3-linux-x64.jar` |
-| Linux x64 (musl) | `mongreldb-native-linux-x64-musl.tar.gz` + `mongreldb-kit-native-linux-x64-musl.tar.gz` | `mongreldb-jni-0.60.3-linux-x64-musl.jar` |
-| Linux arm64 (glibc) | `mongreldb-native-linux-arm64-gnu.tar.gz` + `mongreldb-kit-native-linux-arm64-gnu.tar.gz` | `mongreldb-jni-0.60.3-linux-arm64.jar` |
-| macOS arm64 | `mongreldb-native-darwin-arm64.tar.gz` + `mongreldb-kit-native-darwin-arm64.tar.gz` | `mongreldb-jni-0.60.3-darwin-arm64.jar` |
-| macOS x64 | `mongreldb-native-darwin-x64.tar.gz` + `mongreldb-kit-native-darwin-x64.tar.gz` | `mongreldb-jni-0.60.3-darwin-x64.jar` |
-| Windows x64 | `mongreldb-native-windows-x64.zip` + `mongreldb-kit-native-windows-x64.zip` | `mongreldb-jni-0.60.3-windows-x64.jar` |
+| Linux x64 (glibc) | `mongreldb-native-linux-x64-gnu.tar.gz` + `mongreldb-kit-native-linux-x64-gnu.tar.gz` | `mongreldb-jni-0.61.0-linux-x64.jar` |
+| Linux x64 (musl) | `mongreldb-native-linux-x64-musl.tar.gz` + `mongreldb-kit-native-linux-x64-musl.tar.gz` | `mongreldb-jni-0.61.0-linux-x64-musl.jar` |
+| Linux arm64 (glibc) | `mongreldb-native-linux-arm64-gnu.tar.gz` + `mongreldb-kit-native-linux-arm64-gnu.tar.gz` | `mongreldb-jni-0.61.0-linux-arm64.jar` |
+| macOS arm64 | `mongreldb-native-darwin-arm64.tar.gz` + `mongreldb-kit-native-darwin-arm64.tar.gz` | `mongreldb-jni-0.61.0-darwin-arm64.jar` |
+| macOS x64 | `mongreldb-native-darwin-x64.tar.gz` + `mongreldb-kit-native-darwin-x64.tar.gz` | `mongreldb-jni-0.61.0-darwin-x64.jar` |
+| Windows x64 | `mongreldb-native-windows-x64.zip` + `mongreldb-kit-native-windows-x64.zip` | `mongreldb-jni-0.61.0-windows-x64.jar` |
 
-A fat JAR (`mongreldb-jni-0.60.3.jar`) with all platforms bundled is also published. Each C/C++ archive contains `lib/` (shared + static libraries) and `include/` (the C header). Download from the [releases page](https://github.com/visorcraft/MongrelDB/releases). See the C, C++, .NET, Java, Kotlin, and Scala client READMEs for linking instructions.
+A fat JAR (`mongreldb-jni-0.61.0.jar`) with all platforms bundled is also published. Each C/C++ archive contains `lib/` (shared + static libraries) and `include/` (the C header). Download from the [releases page](https://github.com/visorcraft/MongrelDB/releases). See the C, C++, .NET, Java, Kotlin, and Scala client READMEs for linking instructions.
 
 ## Node.js addon
 
@@ -485,7 +485,7 @@ crates/mongreldb-jni/     JNI shim for the JVM (Java, Kotlin, Scala)
 crates/mongreldb-perf/    cross-engine benchmark vs SQLite/DuckDB (standalone)
 crates/mongreldb-core/examples/hybrid_query.rs
                           runnable ann ∩ fm ∩ bitmap hybrid-query demo
-docs/architecture/adr/    Architecture Decision Records (10 ADRs + index) for the
+docs/architecture/adr/    Architecture Decision Records (11 ADRs + index) for the
                           "Best Practical Architecture" program
 BENCHMARKS.md             latest local performance measurements and commands
 ```
@@ -495,9 +495,10 @@ single `CommitLog` authority and named durability fault hooks. Stage 1 provides
 identity-enforcing shared handles, resource governance, persistent jobs,
 versioned catalog commands, and locks. Stage 2 provides Raft replication and
 mTLS transport. Stage 3 provides the meta control plane, tablets, placement,
-distributed transactions, split/merge, distributed SQL groundwork, backup,
-and gateway administration. Stage 4 adds workload scheduling and generated and
-distributed AI retrieval. Stage 5 adds TLS 1.3 native gRPC, production
+distributed transactions, split/merge, distributed SQL planning plus bounded
+remote Arrow IPC fragment transport, backup, and gateway administration.
+Stage 4 adds workload scheduling and generated and remote distributed AI
+retrieval. Stage 5 adds TLS 1.3 native gRPC, production
 authentication paths, real MySQL snapshot/binlog migration, a packet-compatible
 MySQL listener, and executable release certification. See
 [Architecture Foundations](docs/18-architecture-foundations.md),

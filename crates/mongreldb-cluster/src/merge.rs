@@ -63,7 +63,7 @@ use crate::meta::MetaRejectionReason;
 use crate::node::ClusterError;
 use crate::split::{
     ChildAllocation, ChildPlan, ChildProgress, ChildStateSink, SnapshotPin, SourceRetentionGuard,
-    TabletDataError, TabletKeyspace, TabletMetaPlane,
+    TabletDataError, TabletKeyspace, TabletMetaPlane, TabletMutation,
 };
 use crate::tablet::{Key, ReplicaRole, TabletDescriptor, TabletError, TabletLayout, TabletState};
 
@@ -989,11 +989,14 @@ impl<M: MergeMetaPlane, K: TabletKeyspace, S: ChildStateSink> MergeExecutor<M, K
         self.ensure_snapshot_pins()?;
         for index in 0..2 {
             let deltas = self.keyspaces[index].deltas_after(self.progress.merge_ts)?;
-            for (key, value) in deltas {
-                if !self.progress.sources[index].partition.contains(&key) {
-                    return Err(MergeError::KeyOutsideSource(key));
+            for mutation in deltas {
+                let key = match &mutation {
+                    TabletMutation::Upsert(key, _) | TabletMutation::Delete(key) => key,
+                };
+                if !self.progress.sources[index].partition.contains(key) {
+                    return Err(MergeError::KeyOutsideSource(key.clone()));
                 }
-                self.sink.apply_delta(&key, &value)?;
+                self.sink.apply_delta(&mutation)?;
             }
         }
         Ok(())

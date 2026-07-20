@@ -111,14 +111,6 @@ where
 {
     // S4B: evaluate node pressure and refuse AI work under RejectOversizedAi.
     crate::refresh_node_pressure(&state);
-    if let Err(error) = state.scheduler.check_ai_admitted() {
-        let resource = match error {
-            crate::admission::AdmitError::PressureRejected { resource } => resource,
-            _ => "ai_memory_pressure",
-        };
-        return Err(crate::admission::pressure_reject_to_core(resource));
-    }
-
     let started = std::time::Instant::now();
     let permit = tokio::time::timeout(timeout, state.ai_semaphore.clone().acquire_owned())
         .await
@@ -128,10 +120,34 @@ where
     if remaining.is_zero() {
         return Err(MongrelError::DeadlineExceeded);
     }
+    let class = mongreldb_core::WorkloadClass::AiRetrieval;
+    let priority = crate::admission::priority_for_class(&state.resource_groups, class);
+    let scheduled = tokio::time::timeout(
+        remaining,
+        state.scheduler.submit_and_wait(
+            crate::admission::AdmitRequest {
+                tenant: "default",
+                class,
+                priority,
+                deadline: Some(remaining),
+                query_id: Some(mongreldb_types::ids::QueryId::new_random()),
+                tag: "kit-ai",
+            },
+            std::future::pending(),
+        ),
+    )
+    .await
+    .map_err(|_| MongrelError::DeadlineExceeded)?
+    .map_err(crate::admission::admit_error_to_core)?;
+    let remaining = timeout.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        return Err(MongrelError::DeadlineExceeded);
+    }
     let worker_context = context.clone();
     let mut cancel = CancelOnDrop(Some(context.clone()));
     let mut task = tokio::task::spawn_blocking(move || {
         let _permit = permit;
+        let _scheduled = scheduled;
         work(&worker_context)
     });
     let result = match tokio::time::timeout(remaining, &mut task).await {

@@ -1,6 +1,6 @@
 [package]
 name = "mongreldb-kit-ffi"
-version = "0.60.3"
+version = "0.61.0"
 edition = "2021"
 publish = false
 license = "MIT OR Apache-2.0"
@@ -33,10 +33,10 @@ serde_json = { version = "1", features = ["preserve_order"] }
 [dev-dependencies]
 cc = "1"
 
-# Standalone crate - not a workspace member.
-[workspace]
 
 # Force Kit's transitive engine deps onto this monorepo's sources.
+[workspace]
+
 [patch.crates-io]
 mongreldb-core = { path = "../mongreldb-core" }
 mongreldb-query = { path = "../mongreldb-query" }

@@ -40,6 +40,10 @@ export const enum IndexKindSpec {
    */
   LearnedRange = 5
 }
+export const enum AnnQuantizationSpec {
+  BinarySign = 0,
+  Dense = 1
+}
 export interface ColumnSpec {
   id: number
   name: string
@@ -80,6 +84,16 @@ export interface IndexSpec {
   name: string
   columnId: number
   kind: IndexKindSpec
+  /** ANN representation. Defaults to BinarySign; ignored for other kinds. */
+  annQuantization?: AnnQuantizationSpec
+}
+export interface IndexJobInfo {
+  jobId: bigint
+  state: string
+  progress: number
+  done: bigint
+  total: bigint
+  error?: string
 }
 /** Result of a `compactAll` operation. */
 export interface CompactStats {
@@ -432,6 +446,18 @@ export declare class Database {
   refreshPrincipal(): void
   /** Create a new table with the given schema. */
   createTable(name: string, schema: SchemaSpec): bigint
+  /** Persist and asynchronously build one secondary index. */
+  startCreateIndex(table: string, index: IndexSpec): bigint
+  /** Persist and asynchronously replace one secondary index. */
+  startReplaceIndex(table: string, expectedOldName: string, index: IndexSpec): bigint
+  /** Resume a crash-recovered or paused index-build job. */
+  resumeIndexBuild(jobId: bigint): void
+  /** Cancel one pending or running job. */
+  cancelJob(jobId: bigint): void
+  /** Read durable index-job state and progress. */
+  indexJob(jobId: bigint): IndexJobInfo
+  /** Wait off the JavaScript event loop until an index build is terminal. */
+  waitIndexJob(jobId: bigint, timeoutMs?: number | undefined | null): Promise<unknown>
   /** Drop a table by name. */
   dropTable(name: string): void
   /**

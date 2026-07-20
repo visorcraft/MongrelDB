@@ -405,9 +405,7 @@ impl SqlIdempotencyStore {
                 return BeginResult::Unavailable("integrity key unavailable".into());
             }
             if let Err(error) = self.files.prepare() {
-                return BeginResult::Unavailable(format!(
-                    "idempotency store unavailable: {error}"
-                ));
+                return BeginResult::Unavailable(format!("idempotency store unavailable: {error}"));
             }
             self.available.store(true, Ordering::Release);
         }
@@ -907,8 +905,8 @@ impl CapacityFileGuard {
                 Err(error) => return Err(error),
             }
         })
-            .await
-            .map_err(io::Error::other)?
+        .await
+        .map_err(io::Error::other)?
     }
 }
 

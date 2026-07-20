@@ -25,7 +25,8 @@ use mongreldb_cluster::bootstrap::{self, ClusterStatus, TrustConfig};
 use mongreldb_cluster::network::{TlsConfig, TransportConfig, TransportSecurity};
 use mongreldb_cluster::node::{ClusterError, NodeIdentity};
 use mongreldb_cluster::runtime::{
-    GroupTiming, MetaMembership, NodeRuntime, NodeRuntimeConfig, RuntimeError, RuntimeStatus,
+    GroupTiming, MetaMembership, NodeInternalRpcClient, NodeRuntime, NodeRuntimeConfig,
+    RuntimeError, RuntimeStatus,
 };
 use mongreldb_cluster::tablet::Key;
 use mongreldb_log::commit_log::ExecutionControl;
@@ -136,8 +137,8 @@ impl ClusterRuntimeHandle {
     /// runtime, and wrap it. Fails closed when the node has not been
     /// provisioned (`cluster init` / `cluster join`).
     pub async fn start(options: ClusterRuntimeOptions) -> Result<Self, ClusterRuntimeError> {
-        let _identity = NodeIdentity::load(&options.node_data)?
-            .ok_or(ClusterError::NotInitialized)?;
+        let _identity =
+            NodeIdentity::load(&options.node_data)?.ok_or(ClusterError::NotInitialized)?;
         let status = bootstrap::cluster_status(&options.node_data)?;
         let listen = resolve_listen_address(&options.rpc_listen)?;
         let security = resolve_security(&options.node_data, options.plaintext_test)?;
@@ -196,9 +197,7 @@ impl ClusterRuntimeHandle {
             ))
         })?;
         let target = descriptor.replica_on(to).ok_or_else(|| {
-            ClusterRuntimeError::Config(format!(
-                "node {to} is not a replica of tablet {tablet_id}"
-            ))
+            ClusterRuntimeError::Config(format!("node {to} is not a replica of tablet {tablet_id}"))
         })?;
         let group = runtime.tablet_group(tablet_id).ok_or_else(|| {
             ClusterRuntimeError::Config(format!(
@@ -238,9 +237,7 @@ impl ClusterRuntimeHandle {
             )));
         }
         let control = ExecutionControl::default();
-        let published = runtime
-            .split_tablet(tablet_id, split_key, &control)
-            .await?;
+        let published = runtime.split_tablet(tablet_id, split_key, &control).await?;
         Ok(json!({
             "command": "SPLIT TABLET",
             "tablet_id": tablet_id.to_string(),
@@ -284,6 +281,29 @@ impl ClusterRuntimeHandle {
     /// Direct access for tests that need to seed tablets onto the live runtime.
     pub fn runtime_mutex(&self) -> Arc<Mutex<Option<NodeRuntime>>> {
         Arc::clone(&self.inner)
+    }
+
+    /// Installs one authenticated node-internal RPC service.
+    pub async fn attach_internal_rpc_handler(
+        &self,
+        service_id: u32,
+        handler: Arc<dyn mongreldb_cluster::network::InternalRpcHandler>,
+    ) -> Result<(), ClusterRuntimeError> {
+        let guard = self.inner.lock().await;
+        let runtime = guard
+            .as_ref()
+            .ok_or_else(|| ClusterRuntimeError::Config("cluster runtime not running".into()))?;
+        runtime.attach_internal_rpc_handler(service_id, handler);
+        Ok(())
+    }
+
+    /// Gets a cloneable client for authenticated internal fan-out.
+    pub async fn internal_rpc_client(&self) -> Result<NodeInternalRpcClient, ClusterRuntimeError> {
+        let guard = self.inner.lock().await;
+        let runtime = guard
+            .as_ref()
+            .ok_or_else(|| ClusterRuntimeError::Config("cluster runtime not running".into()))?;
+        Ok(runtime.internal_rpc_client())
     }
 
     /// Graceful shutdown: stop the runtime once. Additional calls are no-ops.
@@ -376,7 +396,10 @@ fn load_persisted_trust(node_data: &Path) -> Result<Option<TrustConfig>, Cluster
             envelope.format_version
         )));
     }
-    envelope.trust.validate().map_err(ClusterRuntimeError::from)?;
+    envelope
+        .trust
+        .validate()
+        .map_err(ClusterRuntimeError::from)?;
     Ok(Some(envelope.trust))
 }
 
@@ -451,9 +474,7 @@ fn fast_timing() -> GroupTiming {
 fn parse_key_hex(text: &str) -> Result<Key, ClusterRuntimeError> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return Err(ClusterRuntimeError::Config(
-            "split key hex is empty".into(),
-        ));
+        return Err(ClusterRuntimeError::Config("split key hex is empty".into()));
     }
     if !trimmed.len().is_multiple_of(2) {
         return Err(ClusterRuntimeError::Config(
@@ -463,12 +484,12 @@ fn parse_key_hex(text: &str) -> Result<Key, ClusterRuntimeError> {
     let mut bytes = Vec::with_capacity(trimmed.len() / 2);
     let chars: Vec<char> = trimmed.chars().collect();
     for chunk in chars.chunks(2) {
-        let hi = chunk[0]
-            .to_digit(16)
-            .ok_or_else(|| ClusterRuntimeError::Config(format!("invalid split key hex `{text}`")))?;
-        let lo = chunk[1]
-            .to_digit(16)
-            .ok_or_else(|| ClusterRuntimeError::Config(format!("invalid split key hex `{text}`")))?;
+        let hi = chunk[0].to_digit(16).ok_or_else(|| {
+            ClusterRuntimeError::Config(format!("invalid split key hex `{text}`"))
+        })?;
+        let lo = chunk[1].to_digit(16).ok_or_else(|| {
+            ClusterRuntimeError::Config(format!("invalid split key hex `{text}`"))
+        })?;
         bytes.push(((hi << 4) | lo) as u8);
     }
     Ok(Key::from_bytes(bytes))
@@ -603,8 +624,13 @@ mod tests {
         {
             Ok(_) => panic!("expected NotInitialized without cluster init"),
             Err(err) => assert!(
-                matches!(err, ClusterRuntimeError::Cluster(ClusterError::NotInitialized))
-                    || err.to_string().to_ascii_lowercase().contains("not initialized")
+                matches!(
+                    err,
+                    ClusterRuntimeError::Cluster(ClusterError::NotInitialized)
+                ) || err
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("not initialized")
                     || err.to_string().contains("NotInitialized"),
                 "expected NotInitialized, got {err}"
             ),

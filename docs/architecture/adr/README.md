@@ -19,6 +19,7 @@ cluster formats are merged.
 | [0008](0008-catalog-control-plane-ownership.md) | Catalog/control-plane ownership | Accepted |
 | [0009](0009-ai-index-replication-and-rebuild-policy.md) | AI index replication/rebuild policy | Accepted |
 | [0010](0010-rolling-upgrade-compatibility.md) | Rolling upgrade compatibility | Accepted |
+| [0011](0011-release-workspace-and-lock-boundaries.md) | Release workspace and lock boundaries | Accepted |
 
 ## Format
 

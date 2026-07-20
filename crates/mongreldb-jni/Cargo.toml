@@ -1,6 +1,6 @@
 [package]
 name = "mongreldb-jni"
-version = "0.60.3"
+version = "0.61.0"
 edition = "2021"
 publish = false
 license = "MIT OR Apache-2.0"
@@ -22,15 +22,15 @@ crate-type = ["cdylib"]
 mongreldb-kit = "=0.60.3"
 mongreldb-kit-core = "=0.60.3"
 # Stable 20-category taxonomy (FND-007) for structural binding surfaces.
-mongreldb-types = { path = "../mongreldb-types", version = "0.60.3" }
+mongreldb-types = { path = "../mongreldb-types", version = "0.61.0" }
 # The jni crate provides Rust bindings to the JNI API.
 jni = { version = "0.21", features = ["invocation"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 
-# Standalone crate - not a workspace member.
-[workspace]
 
 # Force Kit's transitive engine deps onto this monorepo's sources.
+[workspace]
+
 [patch.crates-io]
 mongreldb-core = { path = "../mongreldb-core" }
 mongreldb-query = { path = "../mongreldb-query" }

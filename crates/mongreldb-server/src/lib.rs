@@ -40,6 +40,7 @@ mod admission;
 mod audit;
 pub mod cluster_admin;
 pub mod cluster_runtime;
+pub mod fragment_rpc;
 mod kit;
 mod metrics;
 pub mod native;
@@ -542,6 +543,9 @@ pub struct ServerControl {
     db: Arc<Database>,
     audit: Arc<audit::AuditLog>,
     sql_idempotency: Arc<sql_idempotency::SqlIdempotencyStore>,
+    sql_semaphore: Arc<tokio::sync::Semaphore>,
+    scheduler: admission::SchedulerAdmission,
+    sql_priority: u8,
     /// Live cluster runtime (same handle as `AppState`); shut down after SQL.
     cluster_runtime: Option<cluster_runtime::ClusterRuntimeHandle>,
 }
@@ -560,6 +564,11 @@ impl ServerControl {
     ) -> native::NativeRuntime {
         native::NativeRuntime::new(db, sessions, Arc::clone(&self.query_registry))
             .with_sql_idempotency(Arc::clone(&self.sql_idempotency))
+            .with_sql_admission(
+                Arc::clone(&self.sql_semaphore),
+                self.scheduler.clone(),
+                self.sql_priority,
+            )
     }
 
     pub async fn shutdown(&self) -> usize {
@@ -760,6 +769,13 @@ pub fn build_app_with_sessions_control_and_cluster(
         default_sql_idempotency_ttl(),
         default_sql_idempotency_max_entries(),
     ));
+    let resource_groups = mongreldb_core::ResourceGroupRegistry::with_defaults();
+    let scheduler = admission::SchedulerAdmission::from_resource_groups(&resource_groups);
+    let sql_semaphore = Arc::new(tokio::sync::Semaphore::new(default_sql_max_concurrent()));
+    let sql_priority = admission::priority_for_class(
+        &resource_groups,
+        mongreldb_core::WorkloadClass::InteractiveSql,
+    );
     let server_control = ServerControl {
         query_registry: Arc::clone(&query_registry),
         sessions: Arc::clone(&sessions),
@@ -770,6 +786,9 @@ pub fn build_app_with_sessions_control_and_cluster(
         db: Arc::clone(&db),
         audit: Arc::clone(&audit),
         sql_idempotency: Arc::clone(&sql_idempotency),
+        sql_semaphore: Arc::clone(&sql_semaphore),
+        scheduler: scheduler.clone(),
+        sql_priority,
         cluster_runtime: cluster_runtime.clone(),
     };
     // Share the database MemoryGovernor so evaluate sees live reservations
@@ -807,7 +826,7 @@ pub fn build_app_with_sessions_control_and_cluster(
             default_sql_page_max_bytes(),
             default_sql_page_max_entries_per_owner(),
         ),
-        sql_semaphore: Arc::new(tokio::sync::Semaphore::new(default_sql_max_concurrent())),
+        sql_semaphore,
         sql_page_semaphore: Arc::new(tokio::sync::Semaphore::new(
             default_sql_page_max_concurrent(),
         )),
@@ -821,10 +840,7 @@ pub fn build_app_with_sessions_control_and_cluster(
         drain: Arc::new(DrainControl::default()),
         // Class configs seeded from resource-group defaults; env may tighten
         // InteractiveSql max_queue / max_concurrency for tests/operators.
-        scheduler: {
-            let groups = mongreldb_core::ResourceGroupRegistry::with_defaults();
-            admission::SchedulerAdmission::from_resource_groups(&groups)
-        },
+        scheduler,
         node_governor: std::sync::Mutex::new(mongreldb_core::NodeMemoryGovernor::new(
             node_memory_governor,
         )),
@@ -833,7 +849,7 @@ pub fn build_app_with_sessions_control_and_cluster(
             mongreldb_cluster::multi_region::MultiRegionPolicy::default(),
         ),
         ops_jobs: std::sync::Mutex::new(mongreldb_core::OpsJobStore::new()),
-        resource_groups: mongreldb_core::ResourceGroupRegistry::with_defaults(),
+        resource_groups,
         embedding_providers: mongreldb_core::EmbeddingProviderRegistry::new(),
         cluster_runtime,
     });
@@ -5451,12 +5467,7 @@ fn refresh_node_pressure(state: &AppState) {
         ai_available: state.ai_semaphore.available_permits(),
         process_rss_bytes: admission::process_rss_bytes(),
     });
-    admission::refresh_pressure(
-        &mut governor,
-        &inputs,
-        &state.scheduler,
-        Some(db_gov),
-    );
+    admission::refresh_pressure(&mut governor, &inputs, &state.scheduler, Some(db_gov));
 }
 
 fn caller_may_manage_query(

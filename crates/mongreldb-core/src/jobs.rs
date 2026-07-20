@@ -5,10 +5,11 @@
 //! driver ([`run_build_publish`]) as a reusable protocol for every
 //! [`JobKind`] (index builds, backfills, validation, …).
 //!
-//! **Design (landed):** jobs are advanced **synchronously** by the caller
-//! (admin/ops entry points, tests, engine paths). There is no separate
-//! background executor thread pool — phase checkpoints make resume after
-//! crash or pause correct without one.
+//! **Design (landed):** the framework supports synchronous drivers and
+//! surface-owned executors. Online index DDL persists `Pending`, returns its
+//! id, and drives this protocol on a named background thread. Other job kinds
+//! may still be advanced synchronously by their owning surface. Durable phase
+//! checkpoints make either model reconstructible after crash or pause.
 //!
 //! # State machine (S1F-002)
 //!
@@ -126,7 +127,7 @@
 //! parks the job); `after` fires after the phase body succeeded but before
 //! its checkpoint is durable (a failure re-runs the phase on resume).
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -148,6 +149,8 @@ const JOBS_FORMAT_VERSION: u16 = 1;
 const MAX_JOBS_BYTES: u64 = 64 * 1024 * 1024;
 /// Upper bound on one job's opaque checkpoint payload.
 const MAX_CHECKPOINT_BYTES: usize = 1024 * 1024;
+/// Upper bound on one job's durable, driver-defined submission payload.
+const MAX_DEFINITION_BYTES: usize = 1024 * 1024;
 /// Default bound on concurrently active (worker-holding) jobs.
 pub const DEFAULT_MAX_CONCURRENT_JOBS: usize = 2;
 
@@ -300,6 +303,11 @@ pub struct JobRecord {
     pub kind: JobKind,
     pub state: JobState,
     pub target: JobTarget,
+    /// Complete versioned driver definition needed to reconstruct this job
+    /// after restart. Generic jobs may omit it; resumable production drivers
+    /// should not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition: Option<Vec<u8>>,
     pub progress: JobProgress,
     /// Wall-clock creation time, microseconds since the Unix epoch.
     pub created_at_micros: u64,
@@ -366,6 +374,13 @@ pub enum JobError {
     /// A build phase reported a job-logic failure.
     #[error("job phase failed: {0}")]
     Phase(String),
+    /// A build phase was denied a bounded resource reservation.
+    #[error("job resource limit exceeded for {resource}: requested {requested}, limit {limit}")]
+    ResourceLimitExceeded {
+        resource: &'static str,
+        requested: usize,
+        limit: usize,
+    },
     /// A named fault-injection hook fired at a phase boundary.
     #[error("injected fault: {0}")]
     InjectedFault(String),
@@ -384,6 +399,9 @@ pub enum JobError {
     /// Filesystem failure on the registry file.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// A state waiter reached its deadline before the requested state.
+    #[error("timed out waiting for job {job_id} to become terminal")]
+    WaitTimeout { job_id: u64 },
 }
 
 impl From<JobError> for MongrelError {
@@ -397,7 +415,17 @@ impl From<JobError> for MongrelError {
                 limit,
             },
             JobError::InvalidProgress(message) => MongrelError::InvalidArgument(message),
+            JobError::ResourceLimitExceeded {
+                resource,
+                requested,
+                limit,
+            } => MongrelError::ResourceLimitExceeded {
+                resource,
+                requested,
+                limit,
+            },
             JobError::Io(error) => MongrelError::Io(error),
+            JobError::WaitTimeout { .. } => MongrelError::DeadlineExceeded,
             other => MongrelError::Other(other.to_string()),
         }
     }
@@ -666,6 +694,7 @@ pub struct JobRegistry {
     /// `resume()` consults it so a paused job cannot be requeued while its
     /// previous drive is still draining toward the park point.
     active_drives: Mutex<HashSet<u64>>,
+    state_changed: Condvar,
     max_concurrent_jobs: usize,
 }
 
@@ -702,6 +731,7 @@ impl JobRegistry {
             inner: Mutex::new(inner),
             tokens: Mutex::new(HashMap::new()),
             active_drives: Mutex::new(HashSet::new()),
+            state_changed: Condvar::new(),
             max_concurrent_jobs: DEFAULT_MAX_CONCURRENT_JOBS,
         };
         if recovered {
@@ -718,6 +748,19 @@ impl JobRegistry {
 
     /// Submit a new job in `Pending` and persist it before returning its id.
     pub fn submit(&self, kind: JobKind, target: JobTarget) -> Result<u64, JobError> {
+        self.submit_with_definition(kind, target, None)
+    }
+
+    /// Submit a new job with the complete versioned driver definition.
+    ///
+    /// The payload is persisted in the initial `Pending` record, before the
+    /// id is returned, so a restart can reconstruct work that never began.
+    pub fn submit_with_definition(
+        &self,
+        kind: JobKind,
+        target: JobTarget,
+        definition: Option<Vec<u8>>,
+    ) -> Result<u64, JobError> {
         if target.table.is_empty() {
             return Err(JobError::InvalidProgress(
                 "job target table must not be empty".to_string(),
@@ -727,6 +770,15 @@ impl JobRegistry {
             return Err(JobError::InvalidProgress(
                 "an index-build job requires a target index".to_string(),
             ));
+        }
+        if definition
+            .as_ref()
+            .is_some_and(|payload| payload.len() > MAX_DEFINITION_BYTES)
+        {
+            return Err(JobError::CheckpointTooLarge {
+                bytes: definition.as_ref().map_or(0, Vec::len),
+                limit: MAX_DEFINITION_BYTES,
+            });
         }
         let mut next = self.inner.lock().clone();
         let now = unix_micros();
@@ -742,6 +794,7 @@ impl JobRegistry {
                 kind,
                 state: JobState::Pending,
                 target,
+                definition,
                 progress: JobProgress::default(),
                 created_at_micros: now,
                 updated_at_micros: now,
@@ -764,6 +817,32 @@ impl JobRegistry {
     /// Every record, ordered by job id.
     pub fn list(&self) -> Vec<JobRecord> {
         self.inner.lock().jobs.values().cloned().collect()
+    }
+
+    /// Wait until one job reaches a terminal state without polling sleeps.
+    pub fn wait_terminal(
+        &self,
+        job_id: u64,
+        timeout: std::time::Duration,
+    ) -> Result<JobRecord, JobError> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut inner = self.inner.lock();
+        loop {
+            let record = inner
+                .jobs
+                .get(&job_id)
+                .ok_or(JobError::NotFound { job_id })?;
+            if record.state.is_terminal() {
+                return Ok(record.clone());
+            }
+            if self
+                .state_changed
+                .wait_until(&mut inner, deadline)
+                .timed_out()
+            {
+                return Err(JobError::WaitTimeout { job_id });
+            }
+        }
     }
 
     /// The job's cooperative cancellation token, if the job exists.
@@ -965,6 +1044,7 @@ impl JobRegistry {
     fn persist_and_swap(&self, next: RegistryInner) -> Result<(), JobError> {
         self.persist_locked(&next)?;
         *self.inner.lock() = next;
+        self.state_changed.notify_all();
         Ok(())
     }
 
@@ -1247,6 +1327,18 @@ fn recover_after_crash(inner: &mut RegistryInner) -> bool {
 fn validate_snapshot(snapshot: JobsSnapshot) -> Result<RegistryInner, JobError> {
     let mut jobs = BTreeMap::new();
     for record in snapshot.jobs {
+        if record
+            .definition
+            .as_ref()
+            .is_some_and(|payload| payload.len() > MAX_DEFINITION_BYTES)
+        {
+            return Err(JobError::Storage(format!(
+                "job {} definition is {} bytes, limit is {}",
+                record.job_id,
+                record.definition.as_ref().map_or(0, Vec::len),
+                MAX_DEFINITION_BYTES
+            )));
+        }
         if jobs.insert(record.job_id, record).is_some() {
             return Err(JobError::Storage(
                 "duplicate job id in registry file".to_string(),

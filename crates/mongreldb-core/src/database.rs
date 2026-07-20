@@ -1884,11 +1884,14 @@ pub struct DatabaseCore {
     /// but defers the fsync to one leader here, so concurrent commits share a
     /// single fsync (spec §9.3). Shared with mounted tables.
     group: Arc<crate::txn::GroupCommit>,
-    /// FND-004 (spec §9.4): the standalone commit-log authority wrapping
-    /// `shared_wal` + `group`. The commit sequencer routes WAL appends and
-    /// group-commit durability through it, and reader-visibility publication
-    /// (`publish_in_order`) is gated on its commit receipts.
-    commit_log: Arc<crate::commit_log::StandaloneCommitLog>,
+    /// FND-004 (spec §9.4): configured commit authority. Standalone cores bind
+    /// `StandaloneCommitLog`; cluster runtime replaces it with the tablet
+    /// group's `RaftCommitLog` after group construction.
+    commit_log: RwLock<Arc<dyn mongreldb_log::CommitLog>>,
+    /// Standalone WAL adapter used only by local standalone mutation paths.
+    /// Cluster replicas reject those paths and receive mutations through
+    /// committed apply.
+    standalone_commit_log: Arc<crate::commit_log::StandaloneCommitLog>,
     /// The node's single HLC timestamp authority (spec §4.1, §8.2; ADR-0003).
     /// Transaction read timestamps are captured at `begin`, and commit
     /// timestamps are allocated here under the sequencer lock (strictly after
@@ -3952,7 +3955,7 @@ impl Database {
         // S1B-005: durable idempotency ledger (sibling `TXN_IDEMPOTENCY` file
         // via `DurableRoot::write_atomic`, mirroring `jobs.rs`'s `JOBS`).
         let idempotency = crate::txn::IdempotencyLedger::open(Arc::clone(&durable_root), meta_dek)?;
-        let commit_log = Arc::new(crate::commit_log::StandaloneCommitLog::new(
+        let standalone_commit_log = Arc::new(crate::commit_log::StandaloneCommitLog::new(
             Arc::clone(&shared_wal),
             Arc::clone(&group),
             Arc::clone(&epoch),
@@ -3962,6 +3965,7 @@ impl Database {
             wal_dek.clone(),
             Arc::clone(&hlc),
         ));
+        let commit_log: Arc<dyn mongreldb_log::CommitLog> = standalone_commit_log.clone();
 
         // Build the shared auth state early — it's cloned into every mounted
         // Table's SharedCtx so the Table layer can enforce permissions without
@@ -4102,7 +4106,8 @@ impl Database {
             lock_manager: Arc::new(crate::locks::LockManager::new()),
             poisoned,
             group,
-            commit_log,
+            commit_log: RwLock::new(commit_log),
+            standalone_commit_log,
             hlc,
             idempotency,
             commit_ts_ledger: Mutex::new(commit_ts_ledger_from_recovery(&recovery_records)),
@@ -4425,8 +4430,48 @@ impl Database {
     /// commit path proposes through it and visibility publication is gated on
     /// its receipts; Stage 2 swaps this standalone adapter for the replicated
     /// implementation behind the same `CommitLog` trait.
-    pub fn commit_log(&self) -> Arc<crate::commit_log::StandaloneCommitLog> {
-        Arc::clone(&self.commit_log)
+    pub fn commit_log(&self) -> Arc<dyn mongreldb_log::CommitLog> {
+        Arc::clone(&self.commit_log.read())
+    }
+
+    /// Bind a cluster replica core to its owning consensus commit authority.
+    ///
+    /// Standalone roots reject substitution. Cluster replica user mutations
+    /// remain read-only; this binding exposes the same authoritative log to
+    /// runtime diagnostics and future proposal surfaces while committed apply
+    /// stays the only engine mutation path.
+    pub fn bind_cluster_commit_log(
+        &self,
+        commit_log: Arc<dyn mongreldb_log::CommitLog>,
+    ) -> Result<()> {
+        match self.storage_mode()? {
+            Some(crate::storage_mode::StorageMode::ClusterReplica { .. }) => {
+                *self.commit_log.write() = commit_log;
+                Ok(())
+            }
+            mode => Err(MongrelError::InvalidArgument(format!(
+                "commit-log substitution requires ClusterReplica storage, got {mode:?}"
+            ))),
+        }
+    }
+
+    /// Break the cluster commit-log binding during replica-runtime teardown.
+    ///
+    /// The replacement standalone adapter is retained only as an inert
+    /// lifecycle anchor. Cluster replica writes remain rejected, and a
+    /// restarted runtime must bind its new Raft authority before serving.
+    pub fn detach_cluster_commit_log(&self) -> Result<()> {
+        match self.storage_mode()? {
+            Some(crate::storage_mode::StorageMode::ClusterReplica { .. }) => {
+                let standalone: Arc<dyn mongreldb_log::CommitLog> =
+                    self.standalone_commit_log.clone();
+                *self.commit_log.write() = standalone;
+                Ok(())
+            }
+            mode => Err(MongrelError::InvalidArgument(format!(
+                "commit-log detachment requires ClusterReplica storage, got {mode:?}"
+            ))),
+        }
     }
 
     /// The node's HLC timestamp authority (spec §8.2, ADR-0003). Transaction
@@ -4891,7 +4936,11 @@ impl Database {
                 added_runs: Vec::new(),
             },
         ));
-        self.apply_replicated_records(&records)
+        let applied = self.apply_replicated_records(&records)?;
+        if applied {
+            self.record_commit_ts(Epoch(epoch), commit_ts);
+        }
+        Ok(applied)
     }
 
     /// Stage 2E (spec sections 10.6, 11.5): apply one committed replicated
@@ -5158,7 +5207,7 @@ impl Database {
         epoch: Epoch,
     ) -> Result<mongreldb_log::CommitReceipt> {
         match self
-            .commit_log
+            .standalone_commit_log
             .seal_transaction(txn_id, epoch, commit_seq, None)
         {
             Ok(receipt) => {
@@ -5187,10 +5236,12 @@ impl Database {
         epoch: Epoch,
         commit_ts: mongreldb_types::hlc::HlcTimestamp,
     ) -> Result<mongreldb_log::CommitReceipt> {
-        match self
-            .commit_log
-            .seal_transaction(txn_id, epoch, commit_seq, Some(commit_ts))
-        {
+        match self.standalone_commit_log.seal_transaction(
+            txn_id,
+            epoch,
+            commit_seq,
+            Some(commit_ts),
+        ) {
             Ok(receipt) => {
                 self.record_commit_ts(epoch, receipt.commit_ts);
                 Ok(receipt)
@@ -5233,6 +5284,22 @@ impl Database {
     /// already issued.
     pub fn commit_ts_for_epoch(&self, epoch: Epoch) -> Option<mongreldb_types::hlc::HlcTimestamp> {
         self.commit_ts_ledger.lock().get(&epoch.0).copied()
+    }
+
+    /// Newest retained commit epoch whose HLC timestamp is not after `timestamp`.
+    ///
+    /// The mapping is bounded by [`COMMIT_TS_LEDGER_CAP`]. Callers needing an
+    /// older historical point must treat `None` as unavailable, never guess an
+    /// epoch.
+    pub fn epoch_at_or_before_commit_ts(
+        &self,
+        timestamp: mongreldb_types::hlc::HlcTimestamp,
+    ) -> Option<Epoch> {
+        self.commit_ts_ledger
+            .lock()
+            .iter()
+            .rev()
+            .find_map(|(epoch, commit_ts)| (*commit_ts <= timestamp).then_some(Epoch(*epoch)))
     }
 
     fn commit_outcome_unknown(&self, epoch: Epoch, error: impl std::fmt::Display) -> MongrelError {
@@ -6307,6 +6374,28 @@ impl Database {
         )
     }
 
+    /// Execute a secured native read as an explicitly validated principal.
+    ///
+    /// Protocol adapters use this after resolving a session-bound identity.
+    pub fn query_as_principal_controlled(
+        &self,
+        table_name: &str,
+        query: &crate::query::Query,
+        projection: Option<&[u16]>,
+        principal: Option<&crate::auth::Principal>,
+        control: &crate::ExecutionControl,
+    ) -> Result<Vec<crate::memtable::Row>> {
+        let catalog_bound = principal.is_some_and(|principal| principal.user_id != 0);
+        self.query_for_principal_controlled(
+            table_name,
+            query,
+            projection,
+            principal,
+            catalog_bound,
+            control,
+        )
+    }
+
     fn query_for_principal_controlled(
         &self,
         table_name: &str,
@@ -6527,6 +6616,22 @@ impl Database {
         table_name: &str,
         request: &crate::query::SearchRequest,
     ) -> Result<Vec<crate::query::SearchHit>> {
+        let principal = self.principal_snapshot();
+        self.search_for_principal_with_context(table_name, request, principal.as_ref(), None)
+    }
+
+    /// Run a hybrid scored search as an explicitly validated principal.
+    ///
+    /// Protocol adapters use this after validating their session-bound
+    /// identity. RLS, column grants, masks, cancellation, deadlines, and work
+    /// limits remain enforced inside the storage authorization boundary.
+    pub fn search_for_principal_with_context(
+        &self,
+        table_name: &str,
+        request: &crate::query::SearchRequest,
+        principal: Option<&crate::auth::Principal>,
+        context: Option<&crate::query::AiExecutionContext>,
+    ) -> Result<Vec<crate::query::SearchHit>> {
         let mut columns = crate::query::condition_columns(&request.must);
         for named in &request.retrievers {
             columns.push(named.retriever.column_id());
@@ -6542,16 +6647,17 @@ impl Database {
         }
         columns.sort_unstable();
         columns.dedup();
+        let catalog_bound = principal.is_some_and(|principal| principal.user_id != 0);
         self.with_authorized_scored_read_context_at(
             table_name,
-            None,
-            true,
+            principal,
+            catalog_bound,
             Some(&ReadAuthorization {
                 operation: crate::auth::ColumnOperation::Select,
                 columns: columns.clone(),
                 permissions: Vec::new(),
             }),
-            None,
+            context,
             None,
             |table, snapshot, authorization, principal| {
                 self.require_columns_for(
@@ -6564,7 +6670,7 @@ impl Database {
                     request,
                     snapshot,
                     authorization,
-                    None,
+                    context,
                 )?;
                 let allowed_columns = self.select_column_ids_for(table_name, principal)?;
                 let mut secured: Vec<crate::query::SearchHit> = Vec::with_capacity(hits.len());
@@ -13085,7 +13191,7 @@ impl Database {
             // transaction command (records + commit marker). The commit path
             // proposes through it; durability and the receipt follow below.
             let commit_seq = self
-                .commit_log
+                .standalone_commit_log
                 .append_transaction(
                     &mut wal,
                     txn_id,

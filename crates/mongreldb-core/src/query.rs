@@ -145,7 +145,7 @@ impl AiExecutionContext {
 }
 
 /// One predicate over the row-id space.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Condition {
     /// Primary-key exact match (encoded key bytes).
     Pk(Vec<u8>),
@@ -219,7 +219,7 @@ pub enum Condition {
 
 /// Ordered candidate generator. Unlike [`Condition`], retrieval preserves the
 /// index score and rank.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Retriever {
     Ann {
         column_id: u16,
@@ -311,7 +311,7 @@ impl PartialEq for AnnCandidateDistance {
 
 impl Eq for AnnCandidateDistance {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum VectorMetric {
     Cosine,
     DotProduct,
@@ -368,7 +368,7 @@ pub struct SetSimilarityTrace {
     pub verified_count: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SearchRequest {
     pub must: Vec<Condition>,
     pub retrievers: Vec<NamedRetriever>,
@@ -385,7 +385,7 @@ pub struct SearchAfter {
     pub returned_count: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Rerank {
     ExactVector {
         embedding_column: u16,
@@ -396,14 +396,14 @@ pub enum Rerank {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NamedRetriever {
     pub name: String,
     pub weight: f64,
     pub retriever: Retriever,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub enum Fusion {
     ReciprocalRank { constant: u32 },
 }

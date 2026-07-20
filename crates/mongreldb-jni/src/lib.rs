@@ -322,8 +322,7 @@ pub extern "system" fn Java_com_visorcraft_mongreldb_native_1mode_NativeDB_nativ
             return 0;
         }
     };
-    match KitDatabase::create_with_credentials(Path::new(&path_str), schema, &user_str, &pass_str)
-    {
+    match KitDatabase::create_with_credentials(Path::new(&path_str), schema, &user_str, &pass_str) {
         Ok(db) => db_to_handle(JniDatabase {
             db: Rc::new(RefCell::new(db)),
         }),

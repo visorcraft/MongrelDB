@@ -354,15 +354,29 @@ split/merge, and backup/restore.
   `TRANSFER LEADER`, `MOVE REPLICA`, `SPLIT TABLET`, `MERGE TABLETS`,
   `BACKUP/RESTORE DATABASE` parse into typed commands; the server
   intercepts them on the SQL path with admin authz + audit.
-- **Global constraints, distributed SQL groundwork, distributed DDL,** and
-  **intent→MVCC binding** for 2PC have also landed in prior Stage 3 waves
-  (`global_constraints.rs`, `query::distributed`, `ddl.rs`, `dist_txn.rs`).
+- **Distributed SQL transport.** `query::distributed` executes tablet
+  fragments through a versioned, bounded Arrow IPC pull protocol. Pull
+  supplies result backpressure; cancellation, deadlines, server-issued
+  authorization context, and adaptive top-k refill cross the node-internal
+  transport. `server::fragment_rpc` converts gateway `BoundPlan` routes into
+  fail-closed per-tablet RPC clients. The reference operator executor covers
+  scans, projections, aggregation, merge sort, top-k, and limits; opaque
+  predicate and join execution still reject instead of silently returning a
+  wrong result.
+- **Distributed AI transport.** Typed tablet requests and masked results fan
+  out over a separate internal service. Workers enforce authorization/RLS
+  before local top-k. The coordinator enforces candidate, retained-memory,
+  and deadline budgets, cancels outstanding peers on failure, then performs a
+  deterministic merge while preserving exact-rerank payloads.
+- **Global constraints, distributed DDL,** and **intent→MVCC binding** for 2PC
+  also landed in prior Stage 3 waves (`global_constraints.rs`, `ddl.rs`,
+  `dist_txn.rs`).
 
 ## Stage 4 / 5 surfaces (workload separation + production ops)
 
 - Hierarchical scheduler (`mongreldb-core::scheduler`), node memory governor
-  (`node_governor`), AI index generations (`ai_generation`), distributed AI
-  retrieval merge (`mongreldb-query::ai_retrieval`), specialized replica
+  (`node_governor`), AI index generations (`ai_generation`), remote
+  distributed AI retrieval (`mongreldb-query::ai_retrieval`), specialized replica
   roles, multi-region placement (`multi_region`), MySQL migrate path
   (`migrate_mysql`), security hardening (SCRAM/JWT/service tokens/KMS
   redaction), and online ops jobs (`ops_jobs`).
