@@ -1323,7 +1323,10 @@ pub struct RowJs {
 #[napi(object)]
 pub struct AnnRerankHitJs {
     pub row_id: BigInt,
-    pub hamming_distance: u32,
+    /// `"hamming"` for BinarySign ANN candidates; `"cosine"` for Dense.
+    pub candidate_distance_kind: String,
+    /// Hamming distance (integral) or cosine distance (`1 - similarity`).
+    pub candidate_distance: f64,
     pub exact_score: f64,
 }
 
@@ -3694,6 +3697,9 @@ impl TableHandle {
                                 mongreldb_core::query::RetrieverScore::AnnHammingDistance(d) => {
                                     ("ann_hamming_distance".into(), f64::from(d))
                                 }
+                                mongreldb_core::query::RetrieverScore::AnnCosineDistance(d) => {
+                                    ("ann_cosine_distance".into(), f64::from(d))
+                                }
                                 mongreldb_core::query::RetrieverScore::SparseDotProduct(v) => {
                                     ("sparse_dot_product".into(), v)
                                 }
@@ -3800,10 +3806,22 @@ impl TableHandle {
             )
             .map(|hits| {
                 hits.into_iter()
-                    .map(|hit| AnnRerankHitJs {
-                        row_id: BigInt::from(hit.row_id.0),
-                        hamming_distance: hit.hamming_distance,
-                        exact_score: f64::from(hit.exact_score),
+                    .map(|hit| {
+                        let (candidate_distance_kind, candidate_distance) =
+                            match hit.candidate_distance {
+                                mongreldb_core::query::AnnCandidateDistance::Hamming(d) => {
+                                    ("hamming".into(), f64::from(d))
+                                }
+                                mongreldb_core::query::AnnCandidateDistance::Cosine(d) => {
+                                    ("cosine".into(), f64::from(d))
+                                }
+                            };
+                        AnnRerankHitJs {
+                            row_id: BigInt::from(hit.row_id.0),
+                            candidate_distance_kind,
+                            candidate_distance,
+                            exact_score: f64::from(hit.exact_score),
+                        }
                     })
                     .collect()
             })

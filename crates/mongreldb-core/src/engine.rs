@@ -5240,7 +5240,17 @@ impl Table {
                             seen.insert(*row_id)
                                 && eligibility.get(row_id).copied().unwrap_or(false)
                         })
-                        .map(|(row_id, score)| (row_id, RetrieverScore::AnnHammingDistance(score)))
+                        .map(|(row_id, score)| {
+                            let score = match score {
+                                crate::index::AnnDistance::Hamming(d) => {
+                                    RetrieverScore::AnnHammingDistance(d)
+                                }
+                                crate::index::AnnDistance::Cosine(d) => {
+                                    RetrieverScore::AnnCosineDistance(d)
+                                }
+                            };
+                            (row_id, score)
+                        })
                         .collect();
                     if filtered.len() >= *k || breadth >= cap {
                         if filtered.len() < *k && index.len() > cap && breadth >= cap {
@@ -6252,7 +6262,8 @@ impl Table {
         context: Option<&crate::query::AiExecutionContext>,
     ) -> Result<Vec<crate::query::AnnRerankHit>> {
         use crate::query::{
-            AnnRerankHit, Retriever, RetrieverScore, VectorMetric, MAX_FINAL_LIMIT, MAX_RETRIEVER_K,
+            AnnCandidateDistance, AnnRerankHit, Retriever, RetrieverScore, VectorMetric,
+            MAX_FINAL_LIMIT, MAX_RETRIEVER_K,
         };
         if request.candidate_k == 0 || request.limit == 0 {
             return Err(MongrelError::InvalidArgument(
@@ -6282,7 +6293,12 @@ impl Table {
         let distances: std::collections::HashMap<_, _> = hits
             .iter()
             .filter_map(|hit| match hit.score {
-                RetrieverScore::AnnHammingDistance(distance) => Some((hit.row_id, distance)),
+                RetrieverScore::AnnHammingDistance(distance) => {
+                    Some((hit.row_id, AnnCandidateDistance::Hamming(distance)))
+                }
+                RetrieverScore::AnnCosineDistance(distance) => {
+                    Some((hit.row_id, AnnCandidateDistance::Cosine(distance)))
+                }
                 _ => None,
             })
             .collect();
@@ -6373,9 +6389,12 @@ impl Table {
                     "exact ANN score must be finite".into(),
                 ));
             }
+            let Some(candidate_distance) = distances.get(&row_id).copied() else {
+                continue;
+            };
             reranked.push(AnnRerankHit {
                 row_id,
-                hamming_distance: distances.get(&row_id).copied().unwrap_or_default(),
+                candidate_distance,
                 exact_score,
             });
         }
@@ -10338,6 +10357,95 @@ impl Table {
         let _ = std::fs::remove_dir_all(self.dir.join("_shadow"));
     }
 
+    /// Publish an index-only schema change: install `schema`, rebuild every
+    /// secondary index from currently visible rows, seal/publish a new
+    /// [`ReadGeneration`], and write the table schema + global index
+    /// checkpoint. Callers hold the short final publication barrier.
+    pub(crate) fn publish_index_schema_change(&mut self, schema: Schema) -> Result<()> {
+        self.apply_altered_schema_prepared(schema);
+        self.rebuild_indexes_from_runs()?;
+        self.build_learned_ranges()?;
+        self.indexes_complete = true;
+        self.seal_generations();
+        let view = Arc::new(self.capture_read_generation());
+        self.published.store(Arc::clone(&view));
+        checkpoint_current_schema(self)?;
+        let epoch = self.current_epoch();
+        self.checkpoint_indexes(epoch);
+        Ok(())
+    }
+
+    /// Drop one secondary index from the live maps without rewriting table
+    /// rows. Installs `schema` (already missing the dropped index), prunes
+    /// maps, publishes a new generation, and invalidates the derived
+    /// global-index checkpoint so reopen rebuilds from the authoritative
+    /// schema + rows.
+    pub(crate) fn publish_index_drop(&mut self, schema: Schema) -> Result<()> {
+        self.apply_altered_schema_prepared(schema);
+        let keep_bitmap: std::collections::HashSet<u16> = self
+            .schema
+            .indexes
+            .iter()
+            .filter(|index| index.kind == IndexKind::Bitmap)
+            .map(|index| index.column_id)
+            .collect();
+        let keep_ann: std::collections::HashSet<u16> = self
+            .schema
+            .indexes
+            .iter()
+            .filter(|index| index.kind == IndexKind::Ann)
+            .map(|index| index.column_id)
+            .collect();
+        let keep_fm: std::collections::HashSet<u16> = self
+            .schema
+            .indexes
+            .iter()
+            .filter(|index| index.kind == IndexKind::FmIndex)
+            .map(|index| index.column_id)
+            .collect();
+        let keep_sparse: std::collections::HashSet<u16> = self
+            .schema
+            .indexes
+            .iter()
+            .filter(|index| index.kind == IndexKind::Sparse)
+            .map(|index| index.column_id)
+            .collect();
+        let keep_minhash: std::collections::HashSet<u16> = self
+            .schema
+            .indexes
+            .iter()
+            .filter(|index| index.kind == IndexKind::MinHash)
+            .map(|index| index.column_id)
+            .collect();
+        let keep_learned: std::collections::HashSet<u16> = self
+            .schema
+            .indexes
+            .iter()
+            .filter(|index| index.kind == IndexKind::LearnedRange)
+            .map(|index| index.column_id)
+            .collect();
+        self.bitmap
+            .retain(|column_id, _| keep_bitmap.contains(column_id));
+        self.ann.retain(|column_id, _| keep_ann.contains(column_id));
+        self.fm.retain(|column_id, _| keep_fm.contains(column_id));
+        self.sparse
+            .retain(|column_id, _| keep_sparse.contains(column_id));
+        self.minhash
+            .retain(|column_id, _| keep_minhash.contains(column_id));
+        {
+            let learned = Arc::make_mut(&mut self.learned_range);
+            learned.retain(|column_id, _| keep_learned.contains(column_id));
+        }
+        self.indexes_complete = true;
+        self.seal_generations();
+        let view = Arc::new(self.capture_read_generation());
+        self.published.store(Arc::clone(&view));
+        checkpoint_current_schema(self)?;
+        // Dropped-index maps no longer match any prior checkpoint image.
+        self.invalidate_index_checkpoint();
+        Ok(())
+    }
+
     pub(crate) fn checkpoint_altered_schema(&mut self) -> Result<()> {
         checkpoint_current_schema(self)
     }
@@ -11456,11 +11564,12 @@ fn empty_indexes(schema: &Schema) -> SecondaryIndexes {
                 let options = idef.options.ann.clone().unwrap_or_default();
                 ann.insert(
                     idef.column_id,
-                    AnnIndex::with_options(
+                    AnnIndex::with_quantization(
                         dim,
                         options.m,
                         options.ef_construction,
                         options.ef_search,
+                        options.quantization,
                     ),
                 );
             }

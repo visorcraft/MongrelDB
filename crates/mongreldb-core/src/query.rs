@@ -23,6 +23,9 @@ pub const MAX_RAW_INDEX_CANDIDATES: usize = 250_000;
 pub const MAX_RETRIEVER_NAME_BYTES: usize = 128;
 pub(crate) const VECTOR_WORK_QUANTUM: usize = 64;
 pub(crate) const HAMMING_WORK_QUANTUM: usize = 64;
+/// Work quantum for dense float-component distance accounting (one unit per
+/// this many `f32` components inspected during ANN search).
+pub(crate) const FLOAT_WORK_QUANTUM: usize = 64;
 pub(crate) const PARSE_WORK_QUANTUM: usize = 64;
 
 pub(crate) fn work_units(items: usize, quantum: usize) -> usize {
@@ -279,9 +282,34 @@ impl SetMember {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RetrieverScore {
     AnnHammingDistance(u32),
+    /// Cosine distance (`1 - cosine_similarity`) from a Dense ANN index.
+    /// Ranking is ascending (lower is better), same as Hamming.
+    AnnCosineDistance(f32),
     SparseDotProduct(f64),
     MinHashEstimatedJaccard(f32),
 }
+
+/// ANN candidate distance from the index before exact-vector reranking.
+///
+/// Ranking is ascending for both variants (lower is better). A single result
+/// set comes from one ANN index mode, so mixed variants are invalid.
+#[derive(Debug, Clone, Copy)]
+pub enum AnnCandidateDistance {
+    Hamming(u32),
+    Cosine(f32),
+}
+
+impl PartialEq for AnnCandidateDistance {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Hamming(a), Self::Hamming(b)) => a == b,
+            (Self::Cosine(a), Self::Cosine(b)) => a.total_cmp(b) == std::cmp::Ordering::Equal,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for AnnCandidateDistance {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VectorMetric {
@@ -302,7 +330,7 @@ pub struct AnnRerankRequest {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AnnRerankHit {
     pub row_id: crate::RowId,
-    pub hamming_distance: u32,
+    pub candidate_distance: AnnCandidateDistance,
     pub exact_score: f32,
 }
 
@@ -972,6 +1000,22 @@ mod tests {
             hi: 10,
         });
         assert_eq!(q.conditions.len(), 2);
+    }
+
+    #[test]
+    fn ann_candidate_distance_variants_are_metric_distinct() {
+        assert_eq!(
+            AnnCandidateDistance::Hamming(3),
+            AnnCandidateDistance::Hamming(3)
+        );
+        assert_ne!(
+            AnnCandidateDistance::Hamming(0),
+            AnnCandidateDistance::Cosine(0.0)
+        );
+        assert_eq!(
+            AnnCandidateDistance::Cosine(0.25),
+            AnnCandidateDistance::Cosine(0.25)
+        );
     }
 
     /// Phase 19.6: order-independent canonicalization — the same conditions in a

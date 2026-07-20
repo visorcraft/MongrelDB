@@ -151,6 +151,21 @@ fn full_command_sequence() -> Vec<CatalogCommand> {
                 options: Default::default(),
             },
         },
+        // ReplaceIndex is a single durable command (never Add+Remove). CAS on
+        // expected_schema_sequence: CreateTable stamps schema_id=table_id (0),
+        // AlterColumn bumps to 1, AddIndex bumps to 2.
+        CatalogCommand::ReplaceIndex {
+            table: "t".into(),
+            expected_schema_sequence: 2,
+            expected_old_name: "idx_secret".into(),
+            new_definition: IndexDef {
+                name: "idx_secret".into(),
+                column_id: 2,
+                kind: IndexKind::Bitmap,
+                predicate: None,
+                options: Default::default(),
+            },
+        },
         CatalogCommand::CreateTrigger {
             trigger: test_trigger("trg"),
         },

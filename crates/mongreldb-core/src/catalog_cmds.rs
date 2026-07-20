@@ -175,6 +175,18 @@ pub enum CatalogCommand {
         table: String,
         name: String,
     },
+    /// Atomically replace one index definition with another. Publication is
+    /// compare-and-swap on `expected_schema_sequence` (`Schema::schema_id`):
+    /// concurrent DDL that advanced the sequence fails closed with
+    /// [`MongrelError::Conflict`] and leaves the newer schema untouched.
+    /// This is a single durable command — never compose from
+    /// [`Self::AddIndex`] + [`Self::RemoveIndex`].
+    ReplaceIndex {
+        table: String,
+        expected_schema_sequence: u64,
+        expected_old_name: String,
+        new_definition: IndexDef,
+    },
     // ── Users, roles, grants ──────────────────────────────────────────
     /// Create a user. `id` is allocated deterministically from
     /// `next_user_id` (minimum 1) at apply time.
@@ -680,6 +692,7 @@ pub fn required_permission(command: &CatalogCommand) -> Permission {
         | CatalogCommand::DropColumn { .. }
         | CatalogCommand::AddIndex { .. }
         | CatalogCommand::RemoveIndex { .. }
+        | CatalogCommand::ReplaceIndex { .. }
         | CatalogCommand::CreateTrigger { .. }
         | CatalogCommand::DropTrigger { .. }
         | CatalogCommand::CreateProcedure { .. }
@@ -886,6 +899,7 @@ pub fn apply(catalog: &Catalog, command: &CatalogCommand) -> Result<CatalogDelta
             index.validate_options()?;
             let mut schema = schema.clone();
             schema.indexes.push(index.clone());
+            bump_schema_sequence(&mut schema)?;
             // validate_ai enforces column existence + kind/type compatibility.
             schema.validate_ai()?;
             Ok(CatalogDelta::SchemaReplaced {
@@ -903,6 +917,56 @@ pub fn apply(catalog: &Catalog, command: &CatalogCommand) -> Result<CatalogDelta
             }
             let mut schema = schema.clone();
             schema.indexes.retain(|index| index.name != *name);
+            bump_schema_sequence(&mut schema)?;
+            Ok(CatalogDelta::SchemaReplaced {
+                table_id: entry.table_id,
+                schema,
+            })
+        }
+        CatalogCommand::ReplaceIndex {
+            table,
+            expected_schema_sequence,
+            expected_old_name,
+            new_definition,
+        } => {
+            let entry = live_entry(catalog, table)?;
+            let schema = &entry.schema;
+            if schema.schema_id != *expected_schema_sequence {
+                return Err(MongrelError::Conflict(format!(
+                    "index replace on {table}: expected schema sequence {expected_schema_sequence}, found {}",
+                    schema.schema_id
+                )));
+            }
+            if !schema
+                .indexes
+                .iter()
+                .any(|index| index.name == *expected_old_name)
+            {
+                return Err(MongrelError::NotFound(format!(
+                    "index {expected_old_name} does not exist on {table}"
+                )));
+            }
+            if new_definition.name != *expected_old_name
+                && schema
+                    .indexes
+                    .iter()
+                    .any(|index| index.name == new_definition.name)
+            {
+                return Err(MongrelError::InvalidArgument(format!(
+                    "index {} already exists on {table}",
+                    new_definition.name
+                )));
+            }
+            new_definition.validate_options()?;
+            let mut schema = schema.clone();
+            let position = schema
+                .indexes
+                .iter()
+                .position(|index| index.name == *expected_old_name)
+                .expect("presence checked above");
+            schema.indexes[position] = new_definition.clone();
+            bump_schema_sequence(&mut schema)?;
+            schema.validate_ai()?;
             Ok(CatalogDelta::SchemaReplaced {
                 table_id: entry.table_id,
                 schema,
@@ -1465,6 +1529,16 @@ fn live_entry<'a>(catalog: &'a Catalog, table: &str) -> Result<&'a CatalogEntry>
     catalog
         .live(table)
         .ok_or_else(|| MongrelError::NotFound(format!("table {table:?} not found")))
+}
+
+/// Advance `Schema::schema_id` so concurrent index DDL can CAS against a
+/// single sequence number at publication.
+fn bump_schema_sequence(schema: &mut Schema) -> Result<()> {
+    schema.schema_id = schema
+        .schema_id
+        .checked_add(1)
+        .ok_or_else(|| MongrelError::Schema("schema id space exhausted".into()))?;
+    Ok(())
 }
 
 fn find_user<'a>(catalog: &'a Catalog, username: &str) -> Result<&'a UserEntry> {

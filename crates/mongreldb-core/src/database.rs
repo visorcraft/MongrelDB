@@ -6,6 +6,12 @@
 //! P1 scope: per-table WALs remain (collapsed into one shared WAL in P2); the
 //! win here is one consistent commit clock across tables and one reopen path.
 
+// Online secondary-index DDL (create / drop / replace) as a child module so it
+// can reach private `DatabaseCore` fields while keeping the public surface on
+// [`Database`].
+#[path = "index_ddl.rs"]
+mod index_ddl;
+
 use crate::catalog::{self, Catalog, CatalogEntry, TableState, META_DEK_LEN};
 use crate::engine::{SharedCtx, Table};
 use crate::epoch::{Epoch, EpochAuthority, EpochGuard, MaintenanceReceipt, Snapshot};

@@ -25,8 +25,8 @@ use axum::Json;
 use hmac::{Hmac, Mac};
 use mongreldb_core::constraint::TableConstraints;
 use mongreldb_core::query::{
-    AnnRerankRequest, Condition, Fusion, NamedRetriever, Query, Retriever, RetrieverScore,
-    SearchRequest, SetMember, SetSimilarityRequest, VectorMetric,
+    AnnCandidateDistance, AnnRerankRequest, Condition, Fusion, NamedRetriever, Query, Retriever,
+    RetrieverScore, SearchRequest, SetMember, SetSimilarityRequest, VectorMetric,
 };
 use mongreldb_core::schema::{
     ColumnDef, ColumnFlags, DefaultExpr, IndexDef, IndexKind, Schema, TypeId,
@@ -2226,12 +2226,22 @@ fn retriever_score_json(score: RetrieverScore) -> Jval {
         RetrieverScore::AnnHammingDistance(value) => {
             json!({"kind":"ann_hamming_distance","value":value})
         }
+        RetrieverScore::AnnCosineDistance(value) => {
+            json!({"kind":"ann_cosine_distance","value":value})
+        }
         RetrieverScore::SparseDotProduct(value) => {
             json!({"kind":"sparse_dot_product","value":value})
         }
         RetrieverScore::MinHashEstimatedJaccard(value) => {
             json!({"kind":"minhash_estimated_jaccard","value":value})
         }
+    }
+}
+
+fn ann_candidate_distance_json(distance: AnnCandidateDistance) -> Jval {
+    match distance {
+        AnnCandidateDistance::Hamming(value) => json!({"kind":"hamming","value":value}),
+        AnnCandidateDistance::Cosine(value) => json!({"kind":"cosine","value":value}),
     }
 }
 
@@ -2370,7 +2380,7 @@ pub async fn kit_ann_rerank(
         Ok(hits) => Json(json!({
             "hits": hits.into_iter().map(|hit| json!({
                 "row_id": hit.row_id.0.to_string(),
-                "hamming_distance": hit.hamming_distance,
+                "candidate_distance": ann_candidate_distance_json(hit.candidate_distance),
                 "exact_score": hit.exact_score,
             })).collect::<Vec<_>>()
         }))
@@ -3889,6 +3899,28 @@ pub(crate) fn value_to_json(v: &Value) -> Jval {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ann_candidate_distance_json_uses_tagged_kinds() {
+        let hamming = ann_candidate_distance_json(AnnCandidateDistance::Hamming(7));
+        assert_eq!(hamming["kind"], "hamming");
+        assert_eq!(hamming["value"], 7);
+        let cosine = ann_candidate_distance_json(AnnCandidateDistance::Cosine(0.125));
+        assert_eq!(cosine["kind"], "cosine");
+        assert!((cosine["value"].as_f64().unwrap() - 0.125).abs() < 1e-6);
+        // Dense cosine must never be encoded under the hamming name.
+        assert_ne!(cosine["kind"], "hamming");
+    }
+
+    #[test]
+    fn retriever_score_json_keeps_binary_and_dense_distinct() {
+        let hamming = retriever_score_json(RetrieverScore::AnnHammingDistance(2));
+        assert_eq!(hamming["kind"], "ann_hamming_distance");
+        assert_eq!(hamming["value"], 2);
+        let cosine = retriever_score_json(RetrieverScore::AnnCosineDistance(0.5));
+        assert_eq!(cosine["kind"], "ann_cosine_distance");
+        assert!((cosine["value"].as_f64().unwrap() - 0.5).abs() < 1e-6);
+    }
 
     #[test]
     fn trigger_error_code_uses_typed_variant_only() {

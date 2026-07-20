@@ -276,6 +276,10 @@ fn ffi_exact_ann_rerank_returns_scored_hit() {
         let mut hit = mongreldb_ann_rerank_hit::default();
         assert_eq!(mongreldb_ann_rerank_result_hit(result, 0, &mut hit), 0);
         assert_eq!(hit.row_id, first_row_id);
+        assert_eq!(
+            hit.candidate_distance_kind,
+            mongreldb_ann_candidate_distance_kind::Hamming as i32
+        );
         assert_eq!(hit.exact_score, 1.0);
         mongreldb_ann_rerank_result_free(result);
 

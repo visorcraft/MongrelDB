@@ -29,7 +29,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 pub const IDX_MAGIC: [u8; 8] = *b"MONGRIDX";
-pub const IDX_VERSION: u16 = 3;
+pub const IDX_VERSION: u16 = 4;
 pub const IDX_DIR: &str = "_idx";
 pub const IDX_FILENAME: &str = "global.idx";
 const MAX_INDEX_RECORDS: usize = 65_536;
@@ -445,6 +445,27 @@ fn read_file(
                 else {
                     return Ok(None);
                 };
+                // Restore only when quantization, dimension, and ANN options
+                // match the authoritative schema. Mismatch → discard the whole
+                // derived checkpoint; table open rebuilds from rows.
+                let expected_dim = schema
+                    .columns
+                    .iter()
+                    .find(|c| c.id == rec.column_id)
+                    .and_then(|c| match c.ty {
+                        crate::schema::TypeId::Embedding { dim } => Some(dim as usize),
+                        _ => None,
+                    })
+                    .unwrap_or(0);
+                let options = schema
+                    .indexes
+                    .iter()
+                    .find(|index| index.column_id == rec.column_id && index.kind == IndexKind::Ann)
+                    .and_then(|index| index.options.ann.clone())
+                    .unwrap_or_default();
+                if !idx.matches_schema(expected_dim, &options) {
+                    return Ok(None);
+                }
                 ann.insert(rec.column_id, idx);
             }
             K_SPARSE => {
@@ -574,11 +595,19 @@ mod tests {
     use super::*;
     use crate::index::{AnnIndex, BitmapIndex, FmIndex, HotIndex, SparseIndex};
     use crate::rowid::RowId;
-    use crate::schema::{IndexDef, IndexOptions};
+    use crate::schema::{ColumnDef, ColumnFlags, IndexDef, IndexOptions, TypeId};
     use tempfile::tempdir;
 
     fn indexed_schema() -> Schema {
         Schema {
+            columns: vec![ColumnDef {
+                id: 11,
+                name: "embedding".into(),
+                ty: TypeId::Embedding { dim: 8 },
+                flags: ColumnFlags::empty(),
+                default_value: None,
+                embedding_source: None,
+            }],
             indexes: [
                 (7, IndexKind::Bitmap),
                 (9, IndexKind::FmIndex),
@@ -597,6 +626,38 @@ mod tests {
             .collect(),
             ..Schema::default()
         }
+    }
+
+    #[test]
+    fn ann_option_mismatch_discards_checkpoint() {
+        let dir = tempdir().unwrap();
+        let mut ann_map = HashMap::new();
+        let mut ann = AnnIndex::new(8);
+        ann.insert(&[1.0; 8], RowId(0)).unwrap();
+        ann_map.insert(11u16, ann);
+        let hot = HotIndex::new();
+        let snap = IndexSnapshot {
+            hot: &hot,
+            bitmap: &HashMap::new(),
+            ann: &ann_map,
+            fm: &HashMap::new(),
+            sparse: &HashMap::new(),
+            minhash: &HashMap::new(),
+            learned_range: &HashMap::new(),
+        };
+        write_atomic(dir.path(), 1, 1, snap, None).unwrap();
+
+        // Schema declares Dense while checkpoint is BinarySign → rebuild.
+        let mut schema = indexed_schema();
+        schema.indexes.iter_mut().for_each(|index| {
+            if index.kind == IndexKind::Ann {
+                index.options.ann = Some(crate::schema::AnnOptions {
+                    quantization: crate::schema::AnnQuantization::Dense,
+                    ..Default::default()
+                });
+            }
+        });
+        assert!(read(dir.path(), 1, &schema, None).unwrap().is_none());
     }
 
     fn write_body(dir: &Path, body: &GlobalIdxBody) {
@@ -747,6 +808,68 @@ mod tests {
         assert!(read(dir.path(), 1, &Schema::default(), None)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn dense_encrypted_checkpoint_roundtrips_and_rejects_tamper() {
+        let dir = tempdir().unwrap();
+        let dek = [0x42u8; 32];
+        let mut ann_map = HashMap::new();
+        // Match `indexed_schema` embedding dim (8).
+        let mut ann =
+            AnnIndex::with_quantization(8, 8, 32, 16, crate::schema::AnnQuantization::Dense);
+        let a = [1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let b = [0.0f32, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        ann.insert(&a, RowId(0)).unwrap();
+        ann.insert(&b, RowId(1)).unwrap();
+        ann_map.insert(11u16, ann);
+        let hot = HotIndex::new();
+        let snap = IndexSnapshot {
+            hot: &hot,
+            bitmap: &HashMap::new(),
+            ann: &ann_map,
+            fm: &HashMap::new(),
+            sparse: &HashMap::new(),
+            minhash: &HashMap::new(),
+            learned_range: &HashMap::new(),
+        };
+        write_atomic(dir.path(), 1, 1, snap, Some(&dek)).unwrap();
+
+        let mut schema = indexed_schema();
+        // Schema must list only the ANN column index that we actually wrote;
+        // `record_matches_schema` still requires kind/column presence.
+        schema.indexes.retain(|index| index.kind == IndexKind::Ann);
+        schema.indexes.iter_mut().for_each(|index| {
+            if index.kind == IndexKind::Ann {
+                index.options.ann = Some(crate::schema::AnnOptions {
+                    quantization: crate::schema::AnnQuantization::Dense,
+                    m: 8,
+                    ef_construction: 32,
+                    ef_search: 16,
+                });
+            }
+        });
+        // Wrong DEK / missing DEK fails closed.
+        assert!(read(dir.path(), 1, &schema, None).unwrap().is_none());
+        assert!(read(dir.path(), 1, &schema, Some(&[0u8; 32]))
+            .unwrap()
+            .is_none());
+
+        let loaded = read(dir.path(), 1, &schema, Some(&dek)).unwrap().unwrap();
+        let hits = loaded.ann[&11].search(&a, 1).unwrap();
+        assert_eq!(hits[0].0, RowId(0));
+        assert!(matches!(
+            hits[0].1,
+            crate::index::AnnDistance::Cosine(d) if d.abs() < 1e-5
+        ));
+
+        // Tamper ciphertext — authentication must fail closed.
+        let p = path(dir.path());
+        let mut bytes = std::fs::read(&p).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xFF;
+        std::fs::write(&p, bytes).unwrap();
+        assert!(read(dir.path(), 1, &schema, Some(&dek)).unwrap().is_none());
     }
 
     #[test]

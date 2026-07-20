@@ -14,9 +14,10 @@ use datafusion::physical_plan::{
 };
 use datafusion::prelude::SessionContext;
 use mongreldb_core::query::{
-    AnnRerankRequest, Condition, Fusion, NamedRetriever, Retriever, RetrieverScore, SearchRequest,
-    SetSimilarityRequest, VectorMetric,
+    AnnCandidateDistance, AnnRerankRequest, Condition, Fusion, NamedRetriever, Retriever,
+    RetrieverScore, SearchRequest, SetSimilarityRequest, VectorMetric,
 };
+use mongreldb_core::schema::{AnnQuantization, IndexKind};
 use mongreldb_core::{Database, Principal, Schema, Table, TypeId, Value};
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -706,11 +707,13 @@ impl TableFunctionImpl for ScoredFunction {
                 .map_err(|error| DataFusionError::Plan(error.to_string()))?;
         }
         let retriever = parse_retriever(self.kind, column_id, &query, k)?;
+        let ann_quantization = ann_quantization_for_column(&schema, column_id);
         let extra = match self.kind {
-            Kind::Ann => vec![
-                Field::new("search_rank", DataType::UInt64, false),
-                Field::new("ann_distance", DataType::UInt32, false),
-            ],
+            Kind::Ann => {
+                let mut fields = vec![Field::new("search_rank", DataType::UInt64, false)];
+                fields.push(ann_score_field(ann_quantization));
+                fields
+            }
             Kind::Sparse => vec![
                 Field::new("search_rank", DataType::UInt64, false),
                 Field::new("sparse_score", DataType::Float32, false),
@@ -789,15 +792,13 @@ impl TableFunctionImpl for ScoredFunction {
                 arrays.push(Arc::new(UInt64Array::from(ranks)) as ArrayRef);
                 match kind {
                     Kind::Ann => {
-                        fields.push(Field::new("ann_distance", DataType::UInt32, false));
-                        arrays.push(Arc::new(UInt32Array::from(
-                            rows.iter()
-                                .map(|row| match scores[&row.row_id].1 {
-                                    RetrieverScore::AnnHammingDistance(score) => score,
-                                    _ => unreachable!(),
-                                })
-                                .collect::<Vec<_>>(),
-                        )));
+                        append_ann_score_column(
+                            ann_quantization,
+                            &rows,
+                            &scores,
+                            &mut fields,
+                            &mut arrays,
+                        )?;
                     }
                     Kind::Sparse => {
                         append_float_score(
@@ -905,15 +906,11 @@ impl ScoredFunction {
             limit,
             metric,
         };
-        let provider_schema = output_schema(
-            &schema,
-            &projection,
-            vec![
-                Field::new("search_rank", DataType::UInt64, false),
-                Field::new("hamming_distance", DataType::UInt32, false),
-                Field::new("exact_score", DataType::Float32, false),
-            ],
-        )?;
+        let ann_quantization = ann_quantization_for_column(&schema, vector_column_id);
+        let mut extra = vec![Field::new("search_rank", DataType::UInt64, false)];
+        extra.push(exact_ann_candidate_field(ann_quantization));
+        extra.push(Field::new("exact_score", DataType::Float32, false));
+        let provider_schema = output_schema(&schema, &projection, extra)?;
         let database = self.database.clone();
         let principal = self.principal.clone();
         let principal_catalog_bound = self.principal_catalog_bound;
@@ -960,7 +957,7 @@ impl ScoredFunction {
                     .map(|(rank, hit)| {
                         (
                             hit.row_id,
-                            (rank as u64 + 1, hit.hamming_distance, hit.exact_score),
+                            (rank as u64 + 1, hit.candidate_distance, hit.exact_score),
                         )
                     })
                     .collect::<HashMap<_, _>>();
@@ -975,23 +972,52 @@ impl ScoredFunction {
                 )
                 .map_err(|error| DataFusionError::Execution(error.to_string()))?;
                 let mut arrays = base.columns().to_vec();
-                arrays.extend([
-                    Arc::new(UInt64Array::from(
-                        rows.iter()
-                            .map(|row| scores[&row.row_id].0)
-                            .collect::<Vec<_>>(),
-                    )) as ArrayRef,
-                    Arc::new(UInt32Array::from(
-                        rows.iter()
-                            .map(|row| scores[&row.row_id].1)
-                            .collect::<Vec<_>>(),
-                    )) as ArrayRef,
-                    Arc::new(Float32Array::from(
-                        rows.iter()
-                            .map(|row| scores[&row.row_id].2)
-                            .collect::<Vec<_>>(),
-                    )) as ArrayRef,
-                ]);
+                arrays.push(Arc::new(UInt64Array::from(
+                    rows.iter()
+                        .map(|row| scores[&row.row_id].0)
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef);
+                match ann_quantization {
+                    AnnQuantization::BinarySign => {
+                        arrays.push(Arc::new(UInt32Array::from(
+                            rows.iter()
+                                .map(|row| match scores[&row.row_id].1 {
+                                    AnnCandidateDistance::Hamming(distance) => distance,
+                                    AnnCandidateDistance::Cosine(_) => unreachable!(
+                                        "dense candidate distance on BinarySign ANN index"
+                                    ),
+                                })
+                                .collect::<Vec<_>>(),
+                        )) as ArrayRef);
+                    }
+                    AnnQuantization::Dense => {
+                        arrays.push(Arc::new(Float32Array::from(
+                            rows.iter()
+                                .map(|row| match scores[&row.row_id].1 {
+                                    AnnCandidateDistance::Cosine(distance) => {
+                                        if distance.is_finite() {
+                                            Ok(distance)
+                                        } else {
+                                            Err(DataFusionError::Execution(
+                                                "ann_cosine_distance must be finite".into(),
+                                            ))
+                                        }
+                                    }
+                                    AnnCandidateDistance::Hamming(_) => {
+                                        Err(DataFusionError::Execution(
+                                            "binary candidate distance on Dense ANN index".into(),
+                                        ))
+                                    }
+                                })
+                                .collect::<DFResult<Vec<_>>>()?,
+                        )) as ArrayRef);
+                    }
+                }
+                arrays.push(Arc::new(Float32Array::from(
+                    rows.iter()
+                        .map(|row| scores[&row.row_id].2)
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef);
                 RecordBatch::try_new(Arc::clone(&batch_schema), arrays)
                     .map_err(DataFusionError::from)
             },
@@ -1351,6 +1377,82 @@ fn append_float_score(
     Ok(())
 }
 
+/// Resolve ANN quantization for `column_id` from the authoritative schema.
+/// Missing ANN options default to BinarySign (engine default).
+pub(crate) fn ann_quantization_for_column(schema: &Schema, column_id: u16) -> AnnQuantization {
+    schema
+        .indexes
+        .iter()
+        .find(|index| index.column_id == column_id && index.kind == IndexKind::Ann)
+        .and_then(|index| index.options.ann.as_ref())
+        .map(|options| options.quantization)
+        .unwrap_or(AnnQuantization::BinarySign)
+}
+
+fn ann_score_field(quantization: AnnQuantization) -> Field {
+    match quantization {
+        AnnQuantization::BinarySign => Field::new("ann_distance", DataType::UInt32, false),
+        AnnQuantization::Dense => Field::new("ann_cosine_distance", DataType::Float32, false),
+    }
+}
+
+fn exact_ann_candidate_field(quantization: AnnQuantization) -> Field {
+    match quantization {
+        // Binary exact path keeps the historical candidate column name.
+        AnnQuantization::BinarySign => Field::new("hamming_distance", DataType::UInt32, false),
+        AnnQuantization::Dense => Field::new("ann_cosine_distance", DataType::Float32, false),
+    }
+}
+
+fn append_ann_score_column(
+    quantization: AnnQuantization,
+    rows: &[mongreldb_core::Row],
+    scores: &HashMap<mongreldb_core::RowId, (usize, RetrieverScore)>,
+    fields: &mut Vec<Field>,
+    arrays: &mut Vec<ArrayRef>,
+) -> DFResult<()> {
+    match quantization {
+        AnnQuantization::BinarySign => {
+            fields.push(Field::new("ann_distance", DataType::UInt32, false));
+            arrays.push(Arc::new(UInt32Array::from(
+                rows.iter()
+                    .map(|row| match scores[&row.row_id].1 {
+                        RetrieverScore::AnnHammingDistance(score) => score,
+                        RetrieverScore::AnnCosineDistance(_) => {
+                            unreachable!("dense score on BinarySign ANN index")
+                        }
+                        _ => unreachable!("non-ANN score for ann_search_scored"),
+                    })
+                    .collect::<Vec<_>>(),
+            )));
+            Ok(())
+        }
+        AnnQuantization::Dense => {
+            let values = rows
+                .iter()
+                .map(|row| match scores[&row.row_id].1 {
+                    RetrieverScore::AnnCosineDistance(score) => {
+                        score.is_finite().then_some(score).ok_or_else(|| {
+                            DataFusionError::Execution(
+                                "ann_cosine_distance exceeds finite f32 range".into(),
+                            )
+                        })
+                    }
+                    RetrieverScore::AnnHammingDistance(_) => Err(DataFusionError::Execution(
+                        "binary Hamming score on Dense ANN index".into(),
+                    )),
+                    _ => Err(DataFusionError::Execution(
+                        "non-ANN score for ann_search_scored".into(),
+                    )),
+                })
+                .collect::<DFResult<Vec<_>>>()?;
+            fields.push(Field::new("ann_cosine_distance", DataType::Float32, false));
+            arrays.push(Arc::new(Float32Array::from(values)));
+            Ok(())
+        }
+    }
+}
+
 fn parse_retriever(kind: Kind, column_id: u16, query: &str, k: usize) -> DFResult<Retriever> {
     Ok(match kind {
         Kind::Ann => Retriever::Ann {
@@ -1472,6 +1574,9 @@ fn score_json(score: RetrieverScore) -> serde_json::Value {
         RetrieverScore::AnnHammingDistance(value) => {
             serde_json::json!({"kind":"ann_hamming_distance","value":value})
         }
+        RetrieverScore::AnnCosineDistance(value) => {
+            serde_json::json!({"kind":"ann_cosine_distance","value":value})
+        }
         RetrieverScore::SparseDotProduct(value) => {
             serde_json::json!({"kind":"sparse_dot_product","value":value})
         }
@@ -1523,5 +1628,112 @@ fn integer_literal(expr: &Expr) -> DFResult<i64> {
         }
         Expr::Literal(ScalarValue::UInt32(Some(value)), _) => Ok(*value as i64),
         _ => Err(DataFusionError::Plan("k must be an integer literal".into())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mongreldb_core::schema::{
+        AnnOptions, ColumnDef, ColumnFlags, IndexDef, IndexOptions, Schema,
+    };
+    use mongreldb_core::TypeId;
+
+    fn schema_with_ann(quantization: AnnQuantization) -> Schema {
+        Schema {
+            schema_id: 1,
+            columns: vec![
+                ColumnDef {
+                    id: 1,
+                    name: "id".into(),
+                    ty: TypeId::Int64,
+                    flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                    default_value: None,
+                    embedding_source: None,
+                },
+                ColumnDef {
+                    id: 2,
+                    name: "embedding".into(),
+                    ty: TypeId::Embedding { dim: 8 },
+                    flags: ColumnFlags::empty(),
+                    default_value: None,
+                    embedding_source: None,
+                },
+            ],
+            indexes: vec![IndexDef {
+                name: "ann".into(),
+                column_id: 2,
+                kind: IndexKind::Ann,
+                predicate: None,
+                options: IndexOptions {
+                    ann: Some(AnnOptions {
+                        quantization,
+                        ..AnnOptions::default()
+                    }),
+                    ..IndexOptions::default()
+                },
+            }],
+            colocation: vec![],
+            constraints: Default::default(),
+            clustered: false,
+        }
+    }
+
+    #[test]
+    fn scored_sql_column_choice_follows_ann_quantization() {
+        assert_eq!(
+            ann_score_field(AnnQuantization::BinarySign).name(),
+            "ann_distance"
+        );
+        assert_eq!(
+            ann_score_field(AnnQuantization::BinarySign).data_type(),
+            &DataType::UInt32
+        );
+        assert_eq!(
+            ann_score_field(AnnQuantization::Dense).name(),
+            "ann_cosine_distance"
+        );
+        assert_eq!(
+            ann_score_field(AnnQuantization::Dense).data_type(),
+            &DataType::Float32
+        );
+        assert_eq!(
+            exact_ann_candidate_field(AnnQuantization::BinarySign).name(),
+            "hamming_distance"
+        );
+        assert_eq!(
+            exact_ann_candidate_field(AnnQuantization::Dense).name(),
+            "ann_cosine_distance"
+        );
+    }
+
+    #[test]
+    fn ann_quantization_selected_from_index_schema() {
+        let binary = schema_with_ann(AnnQuantization::BinarySign);
+        let dense = schema_with_ann(AnnQuantization::Dense);
+        assert_eq!(
+            ann_quantization_for_column(&binary, 2),
+            AnnQuantization::BinarySign
+        );
+        assert_eq!(
+            ann_quantization_for_column(&dense, 2),
+            AnnQuantization::Dense
+        );
+        assert_eq!(
+            ann_quantization_for_column(&dense, 99),
+            AnnQuantization::BinarySign
+        );
+    }
+
+    #[test]
+    fn score_json_uses_distinct_ann_kinds() {
+        let hamming = score_json(RetrieverScore::AnnHammingDistance(3));
+        assert_eq!(hamming["kind"], "ann_hamming_distance");
+        assert_eq!(hamming["value"], 3);
+        let cosine = score_json(RetrieverScore::AnnCosineDistance(0.25));
+        assert_eq!(cosine["kind"], "ann_cosine_distance");
+        assert!((cosine["value"].as_f64().unwrap() - 0.25).abs() < 1e-6);
+        // Dense must never be cast into the Hamming kind/name.
+        assert_ne!(cosine["kind"], "ann_hamming_distance");
     }
 }

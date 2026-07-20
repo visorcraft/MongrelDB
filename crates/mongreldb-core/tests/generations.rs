@@ -476,7 +476,7 @@ fn ann_index_generation_view_is_stable_across_writes() {
     assert_eq!(ann2.search(&[1.0; 8], 8).unwrap().len(), 8);
     assert_eq!(
         ann2.search(&[1.0; 8], 8).unwrap()[0].1,
-        0,
+        mongreldb_core::AnnDistance::Hamming(0),
         "exact rerank distance"
     );
     assert_eq!(view2.indexes().ann().applied_through(), Epoch(2));
@@ -513,7 +513,10 @@ fn compaction_merges_deltas_into_base_and_preserves_ann_recall() {
     for query in [[1.0f32; 8], [-1.0; 8]] {
         let hits = ann.search(&query, 16).unwrap();
         assert_eq!(hits.len(), 16, "all rows present after compaction");
-        let exact = hits.iter().filter(|(_, distance)| *distance == 0).count();
+        let exact = hits
+            .iter()
+            .filter(|(_, distance)| *distance == mongreldb_core::AnnDistance::Hamming(0))
+            .count();
         assert_eq!(exact, 8, "same-sign rows still resolve at distance 0");
     }
 }

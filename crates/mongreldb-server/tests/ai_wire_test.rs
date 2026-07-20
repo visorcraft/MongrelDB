@@ -192,7 +192,9 @@ async fn kit_ai_indexes_work_over_wire_and_validate_values() {
     .await;
     assert_eq!(status, 200, "{body}");
     assert!(body["hits"][0]["exact_score"].as_f64().unwrap().is_finite());
-    assert!(body["hits"][0]["hamming_distance"].is_number());
+    assert_eq!(body["hits"][0]["candidate_distance"]["kind"], "hamming");
+    assert!(body["hits"][0]["candidate_distance"]["value"].is_number());
+    assert!(body["hits"][0]["hamming_distance"].is_null());
 
     let search = serde_json::json!({
         "table":"docs",

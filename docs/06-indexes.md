@@ -125,22 +125,46 @@ Condition::FmContains { column_id: 4, pattern: b"database".to_vec() }
 ### HNSW - Vector Similarity Search
 
 **What it does:** Generates approximate nearest-neighbor candidates from an
-embedding column using binary-sign Hamming distance. Exact cosine, dot-product,
-or L2 reranking is available as a bounded second stage.
+embedding column. Two quantizations are supported:
 
-**How it works:** Builds a multi-layer graph where similar vectors are
+| Quantization | Stored representation | Distance (lower is better) | SQL/Arrow score field |
+|---|---|---|---|
+| `binary_sign` (default) | 1 bit per dimension | Hamming | `ann_distance: UInt32` |
+| `dense` | full finite `f32` vectors | cosine distance `1 - cosine_similarity` | `ann_cosine_distance: Float32` |
+
+Exact cosine, dot-product, or L2 reranking over stored full-precision vectors
+is available as a bounded second stage for either mode. Product quantization is
+not implemented.
+
+**How it works:** Builds a multi-layer HNSW graph where similar vectors are
 connected by edges. Search walks the graph toward the query and returns a
-bounded candidate set.
+bounded candidate set. Equal distances break ties by `RowId`. Dense indexes
+use substantially more memory and checkpoint space than BinarySign.
 
-**When to use:** Embedding columns for AI/ML applications - semantic search,
+**Online DDL:** `Database::create_index`, `replace_index`, and `drop_index`
+(and SQL `CREATE INDEX` / `DROP INDEX`) build or remove a secondary index
+generation without rewriting the table. Replacement (for example BinarySign →
+Dense) is online except for a short final publication barrier. Prefer
+`replace_index` over drop-then-create: schema validation allows only one ANN
+representation per column.
+
+**When to use:** Embedding columns for AI/ML applications — semantic search,
 recommendation, deduplication, clustering.
 
 **Example:**
 ```rust
-// HNSW is built automatically from Value::Embedding data during put/bulk_load
+// HNSW is built automatically from Value::Embedding data during put/bulk_load.
+// Optional: create or replace with explicit quantization.
+// Database::replace_index("docs", "idx_embed", IndexDef { ... quantization: Dense })?;
 
 // Query
 Condition::Ann { column_id: 6, query: vec![0.1, 0.45, 0.78, ...], k: 10 }
+```
+
+```sql
+CREATE INDEX idx_prompts_embed_ann
+ON prompts USING ann (embedding)
+WITH (quantization = 'dense', m = 16, ef_construction = 64, ef_search = 64);
 ```
 
 ### PMA Mutable-Run Tier

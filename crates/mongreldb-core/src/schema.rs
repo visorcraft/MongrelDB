@@ -311,6 +311,8 @@ impl Default for AnnOptions {
 pub enum AnnQuantization {
     #[default]
     BinarySign,
+    /// Full-precision f32 vectors with cosine distance (`1 - cosine_similarity`).
+    Dense,
 }
 
 const fn default_ann_m() -> usize {

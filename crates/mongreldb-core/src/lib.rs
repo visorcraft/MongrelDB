@@ -128,8 +128,8 @@ pub use external_table::{
 pub use gc::{CheckReport, DoctorReport, GcReport, GcVersionsReport};
 pub use handle::{DatabaseHandle, HandleAccess, HandleIdentity, OpenIdentity, SecretString};
 pub use index::{
-    AnnIndex, BitmapIndex, ColumnLearnedRange, FmIndex, HotIndex, IndexFamilyGeneration,
-    IndexGeneration, LearnedIndex, SparseIndex,
+    AnnDistance, AnnIndex, BitmapIndex, ColumnLearnedRange, FmIndex, HotIndex,
+    IndexFamilyGeneration, IndexGeneration, LearnedIndex, SparseIndex,
 };
 pub use jobs::{
     CancellationToken, JobError, JobKind, JobProgress, JobRecord, JobRegistry, JobState, JobTarget,

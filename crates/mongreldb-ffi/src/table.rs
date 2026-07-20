@@ -34,12 +34,28 @@ pub enum mongreldb_vector_metric {
     Euclidean = 2,
 }
 
+/// Kind tag for [`mongreldb_ann_rerank_hit`] candidate distance payload.
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum mongreldb_ann_candidate_distance_kind {
+    Hamming = 0,
+    Cosine = 1,
+}
+
 /// One exact ANN rerank hit.
+///
+/// `candidate_distance_kind` selects which payload is valid:
+/// - [`mongreldb_ann_candidate_distance_kind::Hamming`] → `hamming_distance`
+/// - [`mongreldb_ann_candidate_distance_kind::Cosine`] → `cosine_distance`
+///
+/// Dense cosine distances are never encoded as Hamming integers.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct mongreldb_ann_rerank_hit {
     pub row_id: u64,
+    pub candidate_distance_kind: i32,
     pub hamming_distance: u32,
+    pub cosine_distance: f32,
     pub exact_score: f32,
 }
 
@@ -494,10 +510,24 @@ pub unsafe extern "C" fn mongreldb_table_ann_rerank(
     };
     let hits = hits
         .into_iter()
-        .map(|hit| mongreldb_ann_rerank_hit {
-            row_id: hit.row_id.0,
-            hamming_distance: hit.hamming_distance,
-            exact_score: hit.exact_score,
+        .map(|hit| {
+            use mongreldb_core::query::AnnCandidateDistance;
+            match hit.candidate_distance {
+                AnnCandidateDistance::Hamming(distance) => mongreldb_ann_rerank_hit {
+                    row_id: hit.row_id.0,
+                    candidate_distance_kind: mongreldb_ann_candidate_distance_kind::Hamming as i32,
+                    hamming_distance: distance,
+                    cosine_distance: 0.0,
+                    exact_score: hit.exact_score,
+                },
+                AnnCandidateDistance::Cosine(distance) => mongreldb_ann_rerank_hit {
+                    row_id: hit.row_id.0,
+                    candidate_distance_kind: mongreldb_ann_candidate_distance_kind::Cosine as i32,
+                    hamming_distance: 0,
+                    cosine_distance: distance,
+                    exact_score: hit.exact_score,
+                },
+            }
         })
         .collect();
     Box::into_raw(Box::new(FFIAnnRerankResult { hits })) as mongreldb_ann_rerank_result_t

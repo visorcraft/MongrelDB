@@ -203,7 +203,10 @@ export interface RowJs {
 }
 export interface AnnRerankHitJs {
   rowId: bigint
-  hammingDistance: number
+  /** `"hamming"` for BinarySign ANN candidates; `"cosine"` for Dense. */
+  candidateDistanceKind: string
+  /** Hamming distance (integral) or cosine distance (`1 - similarity`). */
+  candidateDistance: number
   exactScore: number
 }
 /**

@@ -5127,9 +5127,26 @@ fn alter_table(
             rebuild_table(session, db, &table_name, schema, query)?;
         }
         AlterTableOperation::DropIndex { name } => {
-            let mut schema = table_schema(db, &table_name)?;
-            remove_index_defs(&mut schema, &name.value);
-            rebuild_table(session, db, &table_name, schema, query)?;
+            let schema = table_schema(db, &table_name)?;
+            let prefix = format!("{}_", name.value);
+            let to_drop: Vec<String> = schema
+                .indexes
+                .iter()
+                .filter(|idx| idx.name == name.value || idx.name.starts_with(&prefix))
+                .map(|idx| idx.name.clone())
+                .collect();
+            if to_drop.is_empty() {
+                return Err(MongrelQueryError::Schema(format!(
+                    "index {} does not exist on {table_name}",
+                    name.value
+                )));
+            }
+            query.checkpoint()?;
+            for drop_name in to_drop {
+                db.drop_index(&table_name, &drop_name)?;
+                query.checkpoint()?;
+            }
+            post_commit_result(query, session.refresh_registered_table(db, &table_name))?;
         }
         AlterTableOperation::AddConstraint { constraint, .. } => {
             add_table_constraint(session, db, &table_name, constraint, query)?;
@@ -5137,16 +5154,29 @@ fn alter_table(
         AlterTableOperation::DropConstraint {
             name, if_exists, ..
         } => {
-            let mut schema = table_schema(db, &table_name)?;
-            let old_len = schema.indexes.len();
-            remove_index_defs(&mut schema, &name.value);
-            if schema.indexes.len() == old_len && !if_exists {
+            let schema = table_schema(db, &table_name)?;
+            let prefix = format!("{}_", name.value);
+            let to_drop: Vec<String> = schema
+                .indexes
+                .iter()
+                .filter(|idx| idx.name == name.value || idx.name.starts_with(&prefix))
+                .map(|idx| idx.name.clone())
+                .collect();
+            if to_drop.is_empty() {
+                if if_exists {
+                    return Ok(());
+                }
                 return Err(MongrelQueryError::Schema(format!(
                     "constraint/index {} does not exist",
                     name.value
                 )));
             }
-            rebuild_table(session, db, &table_name, schema, query)?;
+            query.checkpoint()?;
+            for drop_name in to_drop {
+                db.drop_index(&table_name, &drop_name)?;
+                query.checkpoint()?;
+            }
+            post_commit_result(query, session.refresh_registered_table(db, &table_name))?;
         }
         AlterTableOperation::EnableRowLevelSecurity => {
             let mut security = db.security_catalog();
@@ -5290,20 +5320,24 @@ fn add_table_constraint(
 ) -> Result<()> {
     match constraint {
         TableConstraint::Index(idx) => {
-            let mut schema = table_schema(db, table)?;
+            let schema = table_schema(db, table)?;
             let name = idx.name.map(|n| n.value).unwrap_or_else(|| {
                 idx.columns
                     .first()
                     .map(|c| format!("idx_{}", c.column.expr))
                     .unwrap_or_else(|| "idx".to_string())
             });
-            add_index_defs(
-                &mut schema,
-                &name,
-                idx.columns,
-                index_kind_from_sql(idx.index_type.as_ref())?,
-            )?;
-            rebuild_table(session, db, table, schema, query)
+            let kind = index_kind_from_sql(idx.index_type.as_ref())?;
+            let mut staged = schema.clone();
+            add_index_defs(&mut staged, &name, idx.columns, kind)?;
+            query.checkpoint()?;
+            for definition in staged.indexes.into_iter().skip(schema.indexes.len()) {
+                definition.validate_options()?;
+                db.create_index(table, definition)?;
+                query.checkpoint()?;
+            }
+            post_commit_result(query, session.refresh_registered_table(db, table))?;
+            Ok(())
         }
         TableConstraint::FulltextOrSpatial(idx) => {
             if !idx.fulltext {
@@ -5311,13 +5345,21 @@ fn add_table_constraint(
                     "SPATIAL indexes are not supported".into(),
                 ));
             }
-            let mut schema = table_schema(db, table)?;
+            let schema = table_schema(db, table)?;
             let name = idx
                 .opt_index_name
                 .map(|n| n.value)
                 .unwrap_or_else(|| "fulltext_idx".to_string());
-            add_index_defs(&mut schema, &name, idx.columns, IndexKind::FmIndex)?;
-            rebuild_table(session, db, table, schema, query)
+            let mut staged = schema.clone();
+            add_index_defs(&mut staged, &name, idx.columns, IndexKind::FmIndex)?;
+            query.checkpoint()?;
+            for definition in staged.indexes.into_iter().skip(schema.indexes.len()) {
+                definition.validate_options()?;
+                db.create_index(table, definition)?;
+                query.checkpoint()?;
+            }
+            post_commit_result(query, session.refresh_registered_table(db, table))?;
+            Ok(())
         }
         TableConstraint::PrimaryKey(pk) => Err(MongrelQueryError::Schema(format!(
             "adding primary keys after table creation is not supported: {pk}"
@@ -5366,7 +5408,7 @@ fn create_index(
     // Serialize the partial-index predicate (if any) as a SQL string.
     let predicate = index.predicate.as_ref().map(|expr| expr.to_string());
     let table = object_name(&index.table_name)?;
-    let mut schema = table_schema(db, &table)?;
+    let schema = table_schema(db, &table)?;
     let name = index
         .name
         .as_ref()
@@ -5389,23 +5431,31 @@ fn create_index(
     }
     let kind = index_kind_from_sql(index.using.as_ref())?;
     let options = parse_index_options(kind, &index.with)?;
-    add_index_defs(&mut schema, &name, index.columns, kind)?;
-    // Attach the predicate to the newly created index defs.
-    if let Some(pred) = &predicate {
-        for idx in schema.indexes.iter_mut() {
-            if idx.name.starts_with(&name) {
-                idx.predicate = Some(pred.clone());
+    // Build IndexDef list without mutating the live schema or rewriting the
+    // table — core online index create installs the generation in place.
+    let mut definitions = Vec::new();
+    {
+        let mut staged = schema.clone();
+        add_index_defs(&mut staged, &name, index.columns, kind)?;
+        for idx in staged.indexes.into_iter().skip(schema.indexes.len()) {
+            let mut def = idx;
+            if let Some(pred) = &predicate {
+                def.predicate = Some(pred.clone());
             }
+            def.options = options.clone();
+            def.validate_options()?;
+            definitions.push(def);
         }
     }
-    for idx in schema.indexes.iter_mut() {
-        if idx.name == name || idx.name.starts_with(&format!("{name}_")) {
-            idx.options = options.clone();
-            idx.validate_options()?;
-        }
+    query.checkpoint()?;
+    for definition in definitions {
+        // Core create_index drives JobKind::IndexBuild to a durable outcome.
+        db.create_index(&table, definition)?;
+        query.checkpoint()?;
     }
-    rebuild_table(session, db, &table, schema, query)?;
     session.clear_cache();
+    // Refresh registered providers so subsequent SQL sees the new index.
+    let _ = session.refresh_registered_table(db, &table);
     Ok(())
 }
 
@@ -5427,10 +5477,15 @@ fn drop_index(
                 ))
             })?,
         };
-        let mut schema = table_schema(db, &table_name)?;
-        let old_len = schema.indexes.len();
-        remove_index_defs(&mut schema, &index_name);
-        if schema.indexes.len() == old_len {
+        let schema = table_schema(db, &table_name)?;
+        let prefix = format!("{index_name}_");
+        let to_drop: Vec<String> = schema
+            .indexes
+            .iter()
+            .filter(|idx| idx.name == index_name || idx.name.starts_with(&prefix))
+            .map(|idx| idx.name.clone())
+            .collect();
+        if to_drop.is_empty() {
             if if_exists {
                 continue;
             }
@@ -5438,7 +5493,14 @@ fn drop_index(
                 "index {index_name} does not exist on {table_name}"
             )));
         }
-        rebuild_table(session, db, &table_name, schema, query)?;
+        query.checkpoint()?;
+        for drop_name in to_drop {
+            // Core drop_index removes the schema entry + generation atomically
+            // without rewriting table rows.
+            db.drop_index(&table_name, &drop_name)?;
+            query.checkpoint()?;
+        }
+        let _ = session.refresh_registered_table(db, &table_name);
     }
     session.clear_cache();
     Ok(())
@@ -8401,13 +8463,6 @@ fn add_index_defs(
     Ok(())
 }
 
-fn remove_index_defs(schema: &mut CoreSchema, name: &str) {
-    let prefix = format!("{name}_");
-    schema
-        .indexes
-        .retain(|idx| idx.name != name && !idx.name.starts_with(&prefix));
-}
-
 fn find_index_table(db: &Arc<Database>, index: &str) -> Result<Option<String>> {
     let mut found = None;
     for table in db.table_names() {
@@ -8473,15 +8528,19 @@ fn parse_index_options(kind: IndexKind, expressions: &[Expr]) -> Result<IndexOpt
                 },
                 _ => String::new(),
             };
-            if quantization != "binary_sign" {
-                return Err(MongrelQueryError::Schema(
-                    "ANN quantization must be 'binary_sign'".into(),
-                ));
-            }
+            let quantization = match quantization.as_str() {
+                "binary_sign" => AnnQuantization::BinarySign,
+                "dense" => AnnQuantization::Dense,
+                other => {
+                    return Err(MongrelQueryError::Schema(format!(
+                        "ANN quantization must be 'binary_sign' or 'dense', got {other:?}"
+                    )));
+                }
+            };
             options
                 .ann
                 .get_or_insert_with(AnnOptions::default)
-                .quantization = AnnQuantization::BinarySign;
+                .quantization = quantization;
             continue;
         }
         let value = expr_to_usize(right).ok_or_else(|| {
@@ -10998,6 +11057,21 @@ mod tests {
             .unwrap();
         assert_eq!((ann.m, ann.ef_construction, ann.ef_search), (8, 32, 17));
         assert_eq!(ann.quantization, AnnQuantization::BinarySign);
+
+        let statement = Parser::parse_sql(
+            &GenericDialect {},
+            "CREATE INDEX ann ON docs USING ann (embedding) WITH (quantization = 'dense')",
+        )
+        .unwrap()
+        .remove(0);
+        let Statement::CreateIndex(index) = statement else {
+            panic!("expected CREATE INDEX")
+        };
+        let dense = parse_index_options(IndexKind::Ann, &index.with)
+            .unwrap()
+            .ann
+            .unwrap();
+        assert_eq!(dense.quantization, AnnQuantization::Dense);
     }
 }
 

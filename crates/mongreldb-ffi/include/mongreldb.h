@@ -157,6 +157,12 @@ typedef enum {
     MDB_VECTOR_EUCLIDEAN = 2,
 } mongreldb_vector_metric;
 
+/* ANN candidate distance kind for mongreldb_ann_rerank_hit. */
+typedef enum {
+    MDB_ANN_CANDIDATE_HAMMING = 0,
+    MDB_ANN_CANDIDATE_COSINE  = 1,
+} mongreldb_ann_candidate_distance_kind;
+
 /* ── Value tagged union ─────────────────────────────────────────────────── */
 
 typedef enum {
@@ -303,9 +309,17 @@ typedef struct {
     mongreldb_cell_slice cells;
 } mongreldb_row;
 
+/*
+ * Exact ANN rerank hit. candidate_distance_kind selects the valid payload:
+ *   MDB_ANN_CANDIDATE_HAMMING → hamming_distance
+ *   MDB_ANN_CANDIDATE_COSINE  → cosine_distance (1 - cosine_similarity)
+ * Dense cosine is never encoded as a Hamming integer.
+ */
 typedef struct {
     uint64_t row_id;
+    int32_t candidate_distance_kind; /* mongreldb_ann_candidate_distance_kind */
     uint32_t hamming_distance;
+    float cosine_distance;
     float exact_score;
 } mongreldb_ann_rerank_hit;
 

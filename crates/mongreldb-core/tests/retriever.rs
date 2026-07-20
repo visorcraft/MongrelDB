@@ -1,8 +1,11 @@
 use mongreldb_core::query::{
-    AnnRerankRequest, Condition, Fusion, NamedRetriever, Query, Retriever, RetrieverScore,
-    SearchRequest, SetMember, SetSimilarityRequest, VectorMetric,
+    AnnCandidateDistance, AnnRerankRequest, Condition, Fusion, NamedRetriever, Query, Retriever,
+    RetrieverScore, SearchRequest, SetMember, SetSimilarityRequest, VectorMetric,
 };
-use mongreldb_core::schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
+use mongreldb_core::schema::{
+    AnnOptions, AnnQuantization, ColumnDef, ColumnFlags, IndexDef, IndexKind, IndexOptions, Schema,
+    TypeId,
+};
 use mongreldb_core::{Table, Value};
 use tempfile::tempdir;
 
@@ -407,6 +410,102 @@ fn ann_candidates_can_be_exactly_reranked() {
         .unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].exact_score, 16.0);
+    assert!(matches!(
+        hits[0].candidate_distance,
+        AnnCandidateDistance::Hamming(_)
+    ));
+}
+
+fn dense_schema() -> Schema {
+    let mut schema = schema();
+    for index in &mut schema.indexes {
+        if index.kind == IndexKind::Ann {
+            index.options = IndexOptions {
+                ann: Some(AnnOptions {
+                    quantization: AnnQuantization::Dense,
+                    ..AnnOptions::default()
+                }),
+                ..IndexOptions::default()
+            };
+        }
+    }
+    schema
+}
+
+#[test]
+fn dense_ann_returns_cosine_scores_and_rerank_candidate() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path(), dense_schema(), 1).unwrap();
+    table
+        .put(vec![
+            (1, Value::Int64(1)),
+            (
+                2,
+                Value::Embedding(vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            ),
+            (
+                3,
+                Value::Bytes(bincode::serialize(&vec![(1u32, 1.0f32)]).unwrap()),
+            ),
+            (4, members(&["a"])),
+        ])
+        .unwrap();
+    table
+        .put(vec![
+            (1, Value::Int64(2)),
+            (
+                2,
+                Value::Embedding(vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            ),
+            (
+                3,
+                Value::Bytes(bincode::serialize(&vec![(2u32, 1.0f32)]).unwrap()),
+            ),
+            (4, members(&["b"])),
+        ])
+        .unwrap();
+    table.commit().unwrap();
+
+    let hits = table
+        .retrieve(&Retriever::Ann {
+            column_id: 2,
+            query: vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            k: 2,
+        })
+        .unwrap();
+    assert_eq!(hits.len(), 2);
+    assert!(matches!(
+        hits[0].score,
+        RetrieverScore::AnnCosineDistance(d) if d.abs() < 1e-5
+    ));
+    assert!(hits
+        .windows(2)
+        .all(|window| match (window[0].score, window[1].score) {
+            (RetrieverScore::AnnCosineDistance(a), RetrieverScore::AnnCosineDistance(b)) => {
+                a.total_cmp(&b) != std::cmp::Ordering::Greater
+            }
+            _ => false,
+        }));
+    // Dense public scores must never surface as Hamming.
+    assert!(!hits
+        .iter()
+        .any(|hit| matches!(hit.score, RetrieverScore::AnnHammingDistance(_))));
+
+    let reranked = table
+        .ann_rerank(&AnnRerankRequest {
+            column_id: 2,
+            query: vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            candidate_k: 2,
+            limit: 1,
+            metric: VectorMetric::Cosine,
+        })
+        .unwrap();
+    assert_eq!(reranked.len(), 1);
+    assert!(matches!(
+        reranked[0].candidate_distance,
+        AnnCandidateDistance::Cosine(d) if d.abs() < 1e-5
+    ));
+    assert!((reranked[0].exact_score - 1.0).abs() < 1e-5);
 }
 
 #[test]

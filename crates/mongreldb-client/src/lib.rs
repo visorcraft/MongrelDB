@@ -3058,8 +3058,19 @@ pub struct KitAnnRerankResponse {
 #[serde(deny_unknown_fields)]
 pub struct KitAnnRerankHit {
     pub row_id: String,
-    pub hamming_distance: u32,
+    pub candidate_distance: KitAnnCandidateDistance,
     pub exact_score: f32,
+}
+
+/// Tagged ANN candidate distance from `/kit/ann_rerank`.
+///
+/// `kind` is `"hamming"` (BinarySign) or `"cosine"` (Dense). `value` holds the
+/// numeric distance; Hamming values are integral, cosine is `1 - similarity`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KitAnnCandidateDistance {
+    pub kind: String,
+    pub value: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]

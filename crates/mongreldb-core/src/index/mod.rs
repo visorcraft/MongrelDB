@@ -16,7 +16,7 @@ pub mod minhash;
 pub mod pgm;
 pub mod sparse;
 
-pub use ann::AnnIndex;
+pub use ann::{AnnDistance, AnnIndex};
 pub use bitmap::BitmapIndex;
 pub use fm_index::FmIndex;
 pub use generation::{IndexFamilyGeneration, IndexGeneration};

@@ -15,7 +15,13 @@ FROM ann_search_scored('docs', 'embedding', '[1,-1,1,-1]', 20, 'id,body')
 ORDER BY ann_distance, id;
 ```
 
-Exact float-vector reranking is available when binary ANN recall is not enough:
+BinarySign ANN indexes emit non-null `ann_distance` (`UInt32` Hamming). Dense
+ANN indexes emit non-null `ann_cosine_distance` (`Float32`, `1 - cosine_similarity`)
+instead — selected from the authoritative index schema. Dense scores are never
+cast into the Hamming column.
+
+Exact float-vector reranking is available when candidate recall needs float
+refinement:
 
 ```sql
 SELECT id, hamming_distance, exact_score
@@ -24,6 +30,10 @@ FROM ann_search_exact(
 )
 ORDER BY search_rank;
 ```
+
+For Dense indexes, `ann_search_exact` returns `ann_cosine_distance` in place of
+`hamming_distance` for the ANN candidate field; `exact_score` keeps its
+metric-dependent meaning.
 
 ```sql
 SELECT id, sparse_score
