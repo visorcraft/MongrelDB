@@ -400,6 +400,17 @@ fn core_value_json(value: &Value) -> serde_json::Value {
                 })
                 .collect(),
         ),
+        Value::GeneratedEmbedding(value) => serde_json::Value::Array(
+            value
+                .vector
+                .iter()
+                .map(|v| {
+                    serde_json::Number::from_f64(*v as f64)
+                        .map(serde_json::Value::Number)
+                        .unwrap_or(serde_json::Value::Null)
+                })
+                .collect(),
+        ),
         Value::Decimal(d) => serde_json::Value::String(d.to_string()),
         Value::Uuid(_) | Value::Json(_) => serde_json::Value::Null,
         Value::Interval {

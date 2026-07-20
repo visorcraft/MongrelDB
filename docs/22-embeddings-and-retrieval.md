@@ -8,12 +8,17 @@ storage and ANN indexes never hard-code an external embedding vendor.
 ```rust
 pub enum EmbeddingSource {
     SuppliedByApplication,
-    LocalModel {
+    // Legacy Kit compatibility shapes:
+    LocalModel { model_id: String, model_path: PathBuf },
+    GeneratedColumn { provider: String },
+    // Portable provider identity:
+    ConfiguredModel {
         provider_id: String,
         model_id: String,
         model_version: String,
     },
-    GeneratedColumn {
+    // Transactional generated writes:
+    GeneratedColumnSpec {
         spec: GeneratedEmbeddingSpec,
     },
 }
@@ -22,13 +27,15 @@ pub enum EmbeddingSource {
 | Source | Who produces vectors | Needs registry provider? |
 |--------|----------------------|---------------------------|
 | `SuppliedByApplication` (default) | Client / application | No |
-| `LocalModel` | Kit or operator-loaded local model | Yes (`provider_id`) |
-| `GeneratedColumn` | Server-registered synchronous provider | Yes (`spec.provider_id`) |
+| `LocalModel` / `GeneratedColumn` | Legacy explicit Kit helper | Yes |
+| `ConfiguredModel` | Operator-configured local model | Yes (`provider_id`) |
+| `GeneratedColumnSpec` | Server-registered synchronous provider | Yes (`spec.provider_id`) |
 
 Column catalog metadata may record an optional `embedding_source` on
-`ColumnDef`. `GeneratedColumn` stores provider/model identity, model version,
-source columns, input template, dimension, normalization, and failure policy.
-It never stores a node-local model path.
+`ColumnDef`. `GeneratedColumnSpec` stores provider/model identity, model
+version, source columns, input template, dimension, normalization, and failure
+policy. It never stores a node-local model path. MongrelDB-Kit exposes this
+schema in Rust, TypeScript, and Python.
 
 During insert or update, the commit path expands triggers and constraint
 actions, applies write permissions and row-level security, builds canonical
@@ -36,10 +43,18 @@ provider input from the final source cells, reserves AI memory, validates the
 provider result, and stages the vector before any WAL append. Provider failure,
 cancellation, timeout, count mismatch, dimension mismatch, non-finite output,
 or normalization mismatch aborts the complete source write. Replication carries
-the materialized vector, so followers do not invoke the provider.
+the materialized vector and its provenance, so followers do not invoke the
+provider.
 
-Only synchronous `AbortWrite` generation is currently exposed. No pending or
-background-generation state is implied.
+Each generated cell is stored as `Value::GeneratedEmbedding`. Its durable
+metadata records provider ID, model ID/version, preprocessing version, a
+SHA-256 source fingerprint, generation status, last error category, and
+attempt count. The metadata survives WAL replay, replication, sorted-run
+flush, and reopen.
+
+Only synchronous `AbortWrite` generation is currently exposed, so committed
+generated cells have `Ready`, no last error, and attempt count `1`. No pending
+background job is implied.
 
 ## Recommended behavior
 
@@ -57,7 +72,7 @@ background-generation state is implied.
    built-in OpenAI/Anthropic/etc. client in `mongreldb-core`.
 5. **ANN indexes operate only on committed vectors.** Provider/model metadata
    is available through `EmbeddingModelMeta`; the graph itself is built from
-   stored `Value::Embedding` cells.
+   stored `Value::Embedding` or `Value::GeneratedEmbedding` cells.
 6. **Sparse retrieval remains available with no embedding model.** The sparse
    inverted index is model-agnostic (SPLADE-style weights or any tokenizer).
 
@@ -77,6 +92,8 @@ If no real model is available:
 
 - `mongreldb_core::EmbeddingSource`
 - `mongreldb_core::GeneratedEmbeddingSpec`
+- `mongreldb_core::GeneratedEmbeddingMetadata`
+- `mongreldb_core::GeneratedEmbeddingValue`
 - `mongreldb_core::EmbeddingProvider` / `EmbeddingProviderRegistry`
 - `Database::embedding_providers()`
 - Server: `SHOW RESOURCE GROUPS` includes registered `embedding_providers`

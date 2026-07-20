@@ -3868,6 +3868,18 @@ pub(crate) fn value_to_json(v: &Value) -> Jval {
                 .collect();
             Jval::Array(arr)
         }
+        Value::GeneratedEmbedding(value) => {
+            let arr: Vec<Jval> = value
+                .vector
+                .iter()
+                .map(|x| {
+                    serde_json::Number::from_f64(*x as f64)
+                        .map(Jval::Number)
+                        .unwrap_or(Jval::Null)
+                })
+                .collect();
+            Jval::Array(arr)
+        }
         Value::Decimal(d) => Jval::String(d.to_string()),
         Value::Uuid(_) | Value::Json(_) => Jval::Null,
         Value::Interval { .. } => Jval::Null,

@@ -1382,6 +1382,20 @@ pub struct RemoteSqlReceipt {
     pub outcome: RemoteQueryOutcome,
     #[serde(default)]
     pub terminal_error: Option<RemoteTerminalError>,
+    #[serde(default)]
+    pub commit_receipt: Option<RemoteCommitReceipt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteCommitReceipt {
+    pub transaction_id: String,
+    pub commit_ts_physical_micros: u64,
+    pub commit_ts_logical: u32,
+    pub commit_ts_node_tiebreaker: u32,
+    pub log_term: u64,
+    pub log_index: u64,
+    pub durability: String,
 }
 
 fn exact_epoch(text: Option<&str>, numeric: Option<u64>) -> Result<Option<u64>, String> {
@@ -6224,6 +6238,21 @@ fn value_to_json(value: &mongreldb_core::Value) -> ClientResult<serde_json::Valu
         Value::Bytes(value) => tagged_hex_value("bytes", value),
         Value::Embedding(values) => serde_json::Value::Array(
             values
+                .iter()
+                .map(|value| {
+                    serde_json::Number::from_f64(f64::from(*value))
+                        .map(serde_json::Value::Number)
+                        .ok_or_else(|| {
+                            ClientError::Decode(
+                                "legacy put rejects non-finite embedding values".into(),
+                            )
+                        })
+                })
+                .collect::<ClientResult<Vec<_>>>()?,
+        ),
+        Value::GeneratedEmbedding(value) => serde_json::Value::Array(
+            value
+                .vector
                 .iter()
                 .map(|value| {
                     serde_json::Number::from_f64(f64::from(*value))

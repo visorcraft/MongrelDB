@@ -7,9 +7,9 @@ storage disk.
 
 ## The Short Version
 
-You control encryption with a **passphrase** - a string you choose. There's no
-key file to manage, no environment variable to set, no cloud KMS to configure.
-If you have the passphrase, you can read the data. If you don't, you can't.
+You can control encryption with a passphrase, a high-entropy raw key, or a
+HashiCorp Vault Transit key. If the required secret or KMS is unavailable,
+opening the database fails closed.
 
 ```rust
 // Create an encrypted database
@@ -19,8 +19,8 @@ let db = Db::create_encrypted("./mydb", schema, 1, "my-secret-passphrase")?;
 let db = Db::open_encrypted("./mydb", "my-secret-passphrase")?;
 ```
 
-That's it. Everything else - key derivation, per-page encryption, key wrapping
-- happens automatically.
+Everything else - key derivation, per-page encryption, and key wrapping -
+happens automatically.
 
 ## Enabling the Feature
 
@@ -85,6 +85,29 @@ high-entropy (generate one with `openssl rand 32 > my.key`).
 
 Both paths produce the same KEK; all downstream encryption (sorted runs, WAL,
 cache) is identical regardless of which method you used.
+
+**HashiCorp Vault Transit** (externally wrapped random root key):
+
+```bash
+MONGRELDB_VAULT_TOKEN=... mongreldb-server ./mydb \
+  --vault-url https://vault.example \
+  --vault-mount transit \
+  --vault-key mongreldb-production
+```
+
+Use `--vault-ca-cert <path>` for an additional private CA and
+`MONGRELDB_VAULT_NAMESPACE` for Vault Enterprise. The token is removed from
+the daemon environment before worker threads start. `_meta/kms_key.json`
+contains only the provider identity and Vault ciphertext.
+MongrelDB rejects KMS envelope files over 1 MiB and Vault responses over
+64 KiB.
+
+Embedded callers use `Database::create_with_kms` and
+`Database::open_with_kms`. `Database::rotate_kms_key` rewraps the stable random
+database root key under a new Vault Transit key while reads and writes remain
+online. The seven-phase journal under `_meta/_key_rotation.json` resumes after
+crashes; `Database::retry_kms_key_rotation` explicitly retries a durable
+`Failed` rotation.
 
 **Note:** For encrypted tables, the WAL is also encrypted (frame-level
 AES-256-GCM). For plaintext tables, the WAL stores rows unencrypted.

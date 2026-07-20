@@ -55,6 +55,12 @@
 //! - `cluster.backup.publish.before` / `cluster.backup.publish.after` —
 //!   bracket atomic manifest publication (spec §12.12 step 6: publish last).
 //!
+//! KMS root-key rotation (instrumented in `mongreldb-core`):
+//!
+//! - `kms.rotation.phase.1` … `kms.rotation.phase.7` — fired after each
+//!   rotation phase is durable, in `KeyRotationPhase` declaration order;
+//!   crash-resume tests arm these.
+//!
 //! Reserved for later waves (do not instrument yet):
 //!
 //! - `txn.prepare.before` / `txn.prepare.after`

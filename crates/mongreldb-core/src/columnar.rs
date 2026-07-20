@@ -16,10 +16,12 @@ use crate::error::{MongrelError, Result};
 use crate::memtable::Value;
 use crate::page::Encoding;
 use crate::schema::TypeId;
+use bincode::Options as _;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 
 const MAX_PAGE_DECOMPRESSED_BYTES: usize = 64 * 1024 * 1024;
+const GENERATED_EMBEDDING_TRAILER_MAGIC: &[u8; 4] = b"GEM1";
 
 /// Encode a column's values into a single page.
 pub fn encode_column(ty: TypeId, values: &[Value]) -> Result<Vec<u8>> {
@@ -207,6 +209,9 @@ pub fn decode_column(ty: TypeId, page: &[u8], n: usize, le: bool) -> Result<Vec<
         };
         out.push(val);
     }
+    if matches!(ty, TypeId::Embedding { .. }) && cur < payload.len() {
+        decode_generated_embedding_trailer(&payload[cur..], &mut out)?;
+    }
     Ok(out)
 }
 
@@ -237,28 +242,84 @@ fn fixed_encode(
 
 fn embedding_encode(values: &[Value], dim: u32) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(values.len() * dim as usize * 4);
+    let mut metadata = Vec::with_capacity(values.len());
     for v in values {
-        match v {
-            Value::Embedding(vec) => {
-                if vec.len() != dim as usize {
+        match v.as_embedding() {
+            Some(vector) => {
+                if vector.len() != dim as usize {
                     return Err(MongrelError::Schema(format!(
                         "embedding dimension mismatch: expected {dim}, got {}",
-                        vec.len()
+                        vector.len()
                     )));
                 }
-                for x in vec {
+                for x in vector {
                     out.extend_from_slice(&x.to_bits().to_be_bytes());
                 }
             }
-            Value::Null => {
+            None if matches!(v, Value::Null) => {
                 for _ in 0..dim {
                     out.extend_from_slice(&0u32.to_be_bytes());
                 }
             }
-            _ => return Err(type_mismatch(TypeId::Embedding { dim }, v)),
+            None => return Err(type_mismatch(TypeId::Embedding { dim }, v)),
         }
+        metadata.push(v.generated_embedding_metadata().cloned());
+    }
+    if metadata.iter().any(Option::is_some) {
+        let encoded = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .serialize(&metadata)
+            .map_err(|error| MongrelError::Other(format!("embedding metadata encode: {error}")))?;
+        out.extend_from_slice(GENERATED_EMBEDDING_TRAILER_MAGIC);
+        out.extend_from_slice(
+            &u32::try_from(encoded.len())
+                .map_err(|_| MongrelError::Full("embedding metadata page is too large".into()))?
+                .to_be_bytes(),
+        );
+        out.extend_from_slice(&encoded);
     }
     Ok(out)
+}
+
+fn decode_generated_embedding_trailer(trailer: &[u8], values: &mut [Value]) -> Result<()> {
+    if trailer.len() < 8 || &trailer[..4] != GENERATED_EMBEDDING_TRAILER_MAGIC {
+        return Err(MongrelError::InvalidArgument(
+            "invalid generated embedding metadata trailer".into(),
+        ));
+    }
+    let encoded_len = u32::from_be_bytes(trailer[4..8].try_into().unwrap()) as usize;
+    if trailer.len() != 8 + encoded_len {
+        return Err(MongrelError::InvalidArgument(
+            "generated embedding metadata trailer length mismatch".into(),
+        ));
+    }
+    let metadata: Vec<Option<crate::embedding::GeneratedEmbeddingMetadata>> =
+        bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_limit(encoded_len as u64)
+            .reject_trailing_bytes()
+            .deserialize(&trailer[8..])
+            .map_err(|error| MongrelError::Other(format!("embedding metadata decode: {error}")))?;
+    if metadata.len() != values.len() {
+        return Err(MongrelError::InvalidArgument(
+            "generated embedding metadata row count mismatch".into(),
+        ));
+    }
+    for (value, metadata) in values.iter_mut().zip(metadata) {
+        let Some(metadata) = metadata else {
+            continue;
+        };
+        let Value::Embedding(vector) = value else {
+            return Err(MongrelError::InvalidArgument(
+                "generated embedding metadata targets a null row".into(),
+            ));
+        };
+        *value = Value::GeneratedEmbedding(Box::new(crate::embedding::GeneratedEmbeddingValue {
+            vector: std::mem::take(vector),
+            metadata,
+        }));
+    }
+    Ok(())
 }
 
 fn bytes_encode(values: &[Value]) -> Result<Vec<u8>> {
@@ -309,10 +370,11 @@ fn advance_null(ty: &TypeId, payload: &[u8], cur: &mut usize) -> Result<()> {
         TypeId::Date64 | TypeId::Time64 => 8,
         TypeId::Interval => 20,
         TypeId::Uuid => 16,
+        TypeId::Embedding { dim } => *dim as usize * std::mem::size_of::<f32>(),
         TypeId::Json | TypeId::Enum { .. } => return Ok(()), // variable-length, same as Bytes
         // Variable-length types: null rows have no payload bytes; the offsets
         // table covers them, so nothing to advance here.
-        TypeId::Bytes | TypeId::Embedding { .. } => return Ok(()),
+        TypeId::Bytes => return Ok(()),
         _ => return Ok(()),
     };
     if *cur + w > payload.len() {
@@ -742,7 +804,7 @@ mod tests {
         let vals = vec![
             Value::Embedding(vec![1.0, -2.5, 3.0]),
             Value::Null,
-            Value::Embedding(vec![0.0; 3]),
+            Value::Embedding(vec![4.0, 5.0, 6.0]),
         ];
         let page = encode_column(TypeId::Embedding { dim: 3 }, &vals).unwrap();
         let back = decode_column(TypeId::Embedding { dim: 3 }, &page, vals.len(), false).unwrap();

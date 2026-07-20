@@ -7929,7 +7929,9 @@ fn trigger_values_equal(left: &Value, right: &Value) -> bool {
         (Value::Int64(a), Value::Int64(b)) => a == b,
         (Value::Float64(a), Value::Float64(b)) => a.to_bits() == b.to_bits(),
         (Value::Bytes(a), Value::Bytes(b)) => a == b,
-        (Value::Embedding(a), Value::Embedding(b)) => {
+        (a, b) if a.as_embedding().is_some() && b.as_embedding().is_some() => {
+            let a = a.as_embedding().unwrap();
+            let b = b.as_embedding().unwrap();
             a.len() == b.len()
                 && a.iter()
                     .zip(b.iter())
@@ -7947,6 +7949,7 @@ fn trigger_message(value: Value) -> String {
         Value::Float64(value) => value.to_string(),
         Value::Bytes(value) => String::from_utf8_lossy(&value).into_owned(),
         Value::Embedding(value) => format!("{value:?}"),
+        Value::GeneratedEmbedding(value) => format!("{:?}", value.vector),
         Value::Decimal(value) => value.to_string(),
         Value::Interval {
             months,
@@ -8759,6 +8762,17 @@ fn core_value_json(value: &Value) -> serde_json::Value {
             }),
         Value::Embedding(value) => serde_json::Value::Array(
             value
+                .iter()
+                .map(|v| {
+                    serde_json::Number::from_f64(*v as f64)
+                        .map(serde_json::Value::Number)
+                        .unwrap_or(serde_json::Value::Null)
+                })
+                .collect(),
+        ),
+        Value::GeneratedEmbedding(value) => serde_json::Value::Array(
+            value
+                .vector
                 .iter()
                 .map(|v| {
                     serde_json::Number::from_f64(*v as f64)
@@ -9907,6 +9921,10 @@ fn value_encoded_key_len(value: &Value) -> usize {
         Value::Int64(_) | Value::Float64(_) => 8,
         Value::Bytes(value) | Value::Json(value) => value.len(),
         Value::Embedding(value) => value.len().saturating_mul(std::mem::size_of::<f32>()),
+        Value::GeneratedEmbedding(value) => value
+            .vector
+            .len()
+            .saturating_mul(std::mem::size_of::<f32>()),
         Value::Decimal(_) | Value::Uuid(_) => 16,
         Value::Interval { .. } => 20,
     }

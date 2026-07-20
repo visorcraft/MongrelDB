@@ -406,6 +406,13 @@ impl Tri {
                     Tri::True
                 }
             }
+            Value::GeneratedEmbedding(v) => {
+                if v.vector.is_empty() {
+                    Tri::False
+                } else {
+                    Tri::True
+                }
+            }
             Value::Interval { .. } => Tri::Unknown,
             Value::Uuid(_) | Value::Json(_) => Tri::Unknown,
             Value::Decimal(d) => {
@@ -474,7 +481,9 @@ pub(crate) fn value_cmp(a: &Value, b: &Value) -> Option<Ordering> {
         (Value::Int64(x), Value::Float64(y)) => (*x as f64).partial_cmp(y),
         (Value::Float64(x), Value::Int64(y)) => x.partial_cmp(&(*y as f64)),
         (Value::Bytes(x), Value::Bytes(y)) => Some(x.cmp(y)),
-        (Value::Embedding(x), Value::Embedding(y)) => {
+        (x, y) if x.as_embedding().is_some() && y.as_embedding().is_some() => {
+            let x = x.as_embedding().unwrap();
+            let y = y.as_embedding().unwrap();
             for (a, b) in x.iter().zip(y.iter()) {
                 match a.partial_cmp(b)? {
                     Ordering::Equal => continue,

@@ -4,12 +4,14 @@ use std::time::Duration;
 
 use mongreldb_core::schema::{ColumnDef, ColumnFlags, Schema, TypeId};
 use mongreldb_core::{
-    CancellationReason, Database, EmbeddingError, EmbeddingFailurePolicy, EmbeddingNormalization,
-    EmbeddingProvider, EmbeddingRequest, EmbeddingResponse, EmbeddingSource, ExecutionControl,
-    GeneratedEmbeddingSpec, Permission, PolicyCommand, RowPolicy, SecurityCatalog, SecurityExpr,
-    StoredTrigger, TriggerCell, TriggerDefinition, TriggerEvent, TriggerProgram, TriggerStep,
-    TriggerTarget, TriggerTiming, TriggerValue, Value,
+    CancellationReason, Database, EmbeddingError, EmbeddingFailurePolicy,
+    EmbeddingGenerationStatus, EmbeddingNormalization, EmbeddingProvider, EmbeddingRequest,
+    EmbeddingResponse, EmbeddingSource, ExecutionControl, GeneratedEmbeddingSpec, Permission,
+    PolicyCommand, RowPolicy, SecurityCatalog, SecurityExpr, StoredTrigger, TriggerCell,
+    TriggerDefinition, TriggerEvent, TriggerProgram, TriggerStep, TriggerTarget, TriggerTiming,
+    TriggerValue, Value,
 };
+use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 
 #[derive(Clone, Copy)]
@@ -145,6 +147,22 @@ fn schema() -> Schema {
     }
 }
 
+fn assert_generated(value: &Value, vector: &[f32], source: &str) {
+    assert_eq!(value.as_embedding(), Some(vector));
+    let metadata = value.generated_embedding_metadata().unwrap();
+    assert_eq!(metadata.provider_id, "text-test");
+    assert_eq!(metadata.model_id, "length-and-sum");
+    assert_eq!(metadata.model_version, "1");
+    assert_eq!(metadata.preprocessing_version, "raw-utf8-v1");
+    assert_eq!(
+        metadata.source_fingerprint,
+        <[u8; 32]>::from(Sha256::digest(source.as_bytes()))
+    );
+    assert_eq!(metadata.status, EmbeddingGenerationStatus::Ready);
+    assert_eq!(metadata.last_error_category, None);
+    assert_eq!(metadata.attempt_count, 1);
+}
+
 #[test]
 fn insert_and_update_materialize_generated_embeddings() {
     let dir = tempdir().unwrap();
@@ -164,10 +182,7 @@ fn insert_and_update_materialize_generated_embeddings() {
     insert.commit().unwrap();
 
     let row = db.rows_for("documents", None).unwrap().remove(0);
-    assert_eq!(
-        row.columns.get(&3),
-        Some(&Value::Embedding(vec![3.0, 312.0]))
-    );
+    assert_generated(row.columns.get(&3).unwrap(), &[3.0, 312.0], "cat");
 
     let mut update = db.begin();
     update
@@ -179,10 +194,13 @@ fn insert_and_update_materialize_generated_embeddings() {
     update.commit().unwrap();
 
     let row = db.rows_for("documents", None).unwrap().remove(0);
-    assert_eq!(
-        row.columns.get(&3),
-        Some(&Value::Embedding(vec![5.0, 545.0]))
-    );
+    assert_generated(row.columns.get(&3).unwrap(), &[5.0, 545.0], "horse");
+
+    db.table("documents").unwrap().lock().flush().unwrap();
+    drop(db);
+    let reopened = Database::open(dir.path()).unwrap();
+    let row = reopened.rows_for("documents", None).unwrap().remove(0);
+    assert_generated(row.columns.get(&3).unwrap(), &[5.0, 545.0], "horse");
 }
 
 #[test]
@@ -331,10 +349,7 @@ fn triggers_run_before_generated_embedding_materialization() {
 
     let row = db.rows_for("documents", None).unwrap().remove(0);
     assert_eq!(row.columns.get(&2), Some(&Value::Bytes(b"dog".to_vec())));
-    assert_eq!(
-        row.columns.get(&3),
-        Some(&Value::Embedding(vec![3.0, 314.0]))
-    );
+    assert_generated(row.columns.get(&3).unwrap(), &[3.0, 314.0], "dog");
 }
 
 #[test]
@@ -421,8 +436,5 @@ fn replication_applies_committed_vectors_without_provider() {
     let follower = Database::open(&follower_path).unwrap();
     assert!(follower.embedding_providers().list_ids().is_empty());
     let row = follower.rows_for("documents", None).unwrap().remove(0);
-    assert_eq!(
-        row.columns.get(&3),
-        Some(&Value::Embedding(vec![3.0, 312.0]))
-    );
+    assert_generated(row.columns.get(&3).unwrap(), &[3.0, 312.0], "cat");
 }

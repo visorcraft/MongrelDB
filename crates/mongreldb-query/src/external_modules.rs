@@ -77,6 +77,10 @@ fn external_value_bytes(value: &Value) -> usize {
         Value::Int64(_) | Value::Float64(_) => 8,
         Value::Bytes(value) | Value::Json(value) => value.len(),
         Value::Embedding(value) => value.len().saturating_mul(std::mem::size_of::<f32>()),
+        Value::GeneratedEmbedding(value) => value
+            .vector
+            .len()
+            .saturating_mul(std::mem::size_of::<f32>()),
         Value::Decimal(_) | Value::Uuid(_) => 16,
         Value::Interval { .. } => 20,
     }

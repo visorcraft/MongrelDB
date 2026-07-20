@@ -49,6 +49,7 @@ pub mod remote_embedding;
 mod sessions;
 mod sql_idempotency;
 mod sql_pages;
+pub mod vault_kms;
 
 /// Parser-only entry point used by the release fuzz harness.
 #[doc(hidden)]

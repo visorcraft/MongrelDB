@@ -39,9 +39,30 @@ pub enum Value {
     Uuid([u8; 16]),
     /// JSON value stored as a UTF-8 byte sequence.
     Json(Vec<u8>),
+    /// Generated embedding with durable source and model provenance.
+    ///
+    /// Kept last so existing bincode enum discriminants remain stable.
+    GeneratedEmbedding(Box<crate::embedding::GeneratedEmbeddingValue>),
 }
 
 impl Value {
+    pub fn as_embedding(&self) -> Option<&[f32]> {
+        match self {
+            Self::Embedding(values) => Some(values),
+            Self::GeneratedEmbedding(value) => Some(&value.vector),
+            _ => None,
+        }
+    }
+
+    pub fn generated_embedding_metadata(
+        &self,
+    ) -> Option<&crate::embedding::GeneratedEmbeddingMetadata> {
+        match self {
+            Self::GeneratedEmbedding(value) => Some(&value.metadata),
+            _ => None,
+        }
+    }
+
     /// Lexicographically-comparable byte encoding for index keys (PK HOT,
     /// bitmaps). Big-endian for integers so byte order matches value order.
     pub fn encode_key(&self) -> Vec<u8> {
@@ -54,6 +75,13 @@ impl Value {
             Value::Embedding(v) => {
                 let mut out = Vec::with_capacity(v.len() * 4);
                 for x in v {
+                    out.extend_from_slice(&x.to_bits().to_be_bytes());
+                }
+                out
+            }
+            Value::GeneratedEmbedding(value) => {
+                let mut out = Vec::with_capacity(value.vector.len() * 4);
+                for x in &value.vector {
                     out.extend_from_slice(&x.to_bits().to_be_bytes());
                 }
                 out
@@ -82,6 +110,14 @@ impl Value {
             Value::Int64(_) | Value::Float64(_) => 8,
             Value::Bytes(bytes) | Value::Json(bytes) => 16 + bytes.len() as u64,
             Value::Embedding(values) => 16 + (values.len() as u64) * 4,
+            Value::GeneratedEmbedding(value) => {
+                16 + (value.vector.len() as u64) * 4
+                    + value.metadata.provider_id.len() as u64
+                    + value.metadata.model_id.len() as u64
+                    + value.metadata.model_version.len() as u64
+                    + value.metadata.preprocessing_version.len() as u64
+                    + 48
+            }
             Value::Decimal(_) | Value::Uuid(_) => 16,
             Value::Interval { .. } => 20,
         }

@@ -5974,7 +5974,7 @@ impl Table {
             let score_started = std::time::Instant::now();
             let mut scores = std::collections::HashMap::with_capacity(vectors.len());
             for (row_id, value) in vectors {
-                let Value::Embedding(vector) = value else {
+                let Some(vector) = value.as_embedding() else {
                     continue;
                 };
                 let score = match metric {
@@ -5984,7 +5984,7 @@ impl Table {
                         }
                         query
                             .iter()
-                            .zip(&vector)
+                            .zip(vector)
                             .map(|(left, right)| f64::from(*left) * f64::from(*right))
                             .sum::<f64>()
                     }
@@ -5994,7 +5994,7 @@ impl Table {
                         }
                         let dot = query
                             .iter()
-                            .zip(&vector)
+                            .zip(vector)
                             .map(|(left, right)| f64::from(*left) * f64::from(*right))
                             .sum::<f64>();
                         let norm = vector
@@ -6014,7 +6014,7 @@ impl Table {
                         }
                         query
                             .iter()
-                            .zip(&vector)
+                            .zip(vector)
                             .map(|(left, right)| (f64::from(*left) - f64::from(*right)).powi(2))
                             .sum::<f64>()
                             .sqrt()
@@ -6318,7 +6318,7 @@ impl Table {
         };
         let mut reranked = Vec::with_capacity(values.len().min(request.limit));
         for (row_id, value) in values {
-            let Value::Embedding(vector) = value else {
+            let Some(vector) = value.as_embedding() else {
                 continue;
             };
             let exact_score = match request.metric {
@@ -6329,7 +6329,7 @@ impl Table {
                     request
                         .query
                         .iter()
-                        .zip(&vector)
+                        .zip(vector)
                         .map(|(left, right)| f64::from(*left) * f64::from(*right))
                         .sum::<f64>()
                 }
@@ -6340,7 +6340,7 @@ impl Table {
                     let dot = request
                         .query
                         .iter()
-                        .zip(&vector)
+                        .zip(vector)
                         .map(|(left, right)| f64::from(*left) * f64::from(*right))
                         .sum::<f64>();
                     let norm = vector
@@ -6361,7 +6361,7 @@ impl Table {
                     request
                         .query
                         .iter()
-                        .zip(&vector)
+                        .zip(vector)
                         .map(|(left, right)| (f64::from(*left) - f64::from(*right)).powi(2))
                         .sum::<f64>()
                         .sqrt()
@@ -11572,7 +11572,7 @@ fn index_into(
                 }
             }
             IndexKind::Ann => {
-                if let (Some(a), Value::Embedding(v)) = (ann.get_mut(&idef.column_id), val) {
+                if let (Some(a), Some(v)) = (ann.get_mut(&idef.column_id), val.as_embedding()) {
                     a.insert_validated(v, row.row_id);
                 }
             }
@@ -11632,7 +11632,7 @@ fn index_into_single(
             }
         }
         IndexKind::Ann => {
-            if let (Some(a), Value::Embedding(v)) = (ann.get_mut(&idef.column_id), val) {
+            if let (Some(a), Some(v)) = (ann.get_mut(&idef.column_id), val.as_embedding()) {
                 a.insert_validated(v, row.row_id);
             }
         }

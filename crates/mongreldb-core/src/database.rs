@@ -24,16 +24,20 @@ use crate::trigger::{
     TriggerRaiseAction, TriggerStep, TriggerTarget, TriggerTiming, TriggerValue,
 };
 use parking_lot::{Mutex, RwLock};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 
 pub const TABLES_DIR: &str = "tables";
 pub const VTAB_DIR: &str = "_vtab";
 pub const META_DIR: &str = "_meta";
 pub const KEYS_FILENAME: &str = "keys";
+pub const KMS_KEY_FILENAME: &str = "kms_key.json";
+const MAX_KMS_KEY_ENVELOPE_BYTES: usize = 1024 * 1024;
 pub const HISTORY_RETENTION_FILENAME: &str = "history_retention";
 pub const CTAS_BUILD_TABLE_PREFIX: &str = "__mongreldb_ctas_build_";
 
@@ -163,7 +167,7 @@ fn embedding_input_value(value: &crate::memtable::Value) -> Result<String> {
             nanos,
         } => Ok(format!("{months}:{days}:{nanos}")),
         Value::Uuid(value) => Ok(value.iter().map(|byte| format!("{byte:02x}")).collect()),
-        Value::Embedding(_) => Err(MongrelError::InvalidArgument(
+        Value::Embedding(_) | Value::GeneratedEmbedding(_) => Err(MongrelError::InvalidArgument(
             "embedding columns cannot be embedding text sources".into(),
         )),
     }
@@ -419,6 +423,152 @@ fn read_encryption_salt(
     let mut salt = [0_u8; crate::encryption::SALT_LEN];
     file.read_exact(&mut salt)?;
     Ok(salt)
+}
+
+fn read_kms_key_envelope(
+    root: &crate::durable_file::DurableRoot,
+) -> Result<crate::security_hardening::KmsDatabaseKeyEnvelope> {
+    let file = root
+        .open_regular(Path::new(META_DIR).join(KMS_KEY_FILENAME))
+        .map_err(|error| MongrelError::NotFound(format!("KMS key envelope: {error}")))?;
+    let mut bytes = Vec::new();
+    file.take((MAX_KMS_KEY_ENVELOPE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_KMS_KEY_ENVELOPE_BYTES {
+        return Err(MongrelError::Encryption(
+            "KMS key envelope exceeds 1 MiB".into(),
+        ));
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| MongrelError::Encryption(format!("invalid KMS key envelope: {error}")))
+}
+
+fn write_kms_key_envelope(
+    root: &Path,
+    envelope: &crate::security_hardening::KmsDatabaseKeyEnvelope,
+) -> Result<()> {
+    let bytes = serde_json::to_vec(envelope)
+        .map_err(|error| MongrelError::Encryption(format!("encode KMS key envelope: {error}")))?;
+    if bytes.len() > MAX_KMS_KEY_ENVELOPE_BYTES {
+        return Err(MongrelError::Encryption(
+            "KMS key envelope exceeds 1 MiB".into(),
+        ));
+    }
+    Ok(crate::durable_file::write_atomic(
+        &root.join(META_DIR).join(KMS_KEY_FILENAME),
+        &bytes,
+    )?)
+}
+
+fn unwrap_kms_database_key(
+    provider: &dyn crate::security_hardening::KeyManagementProvider,
+    envelope: &crate::security_hardening::KmsDatabaseKeyEnvelope,
+) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+    if provider.provider_id() != envelope.provider_id {
+        return Err(MongrelError::Encryption(format!(
+            "KMS provider mismatch: database requires {:?}, got {:?}",
+            envelope.provider_id,
+            provider.provider_id()
+        )));
+    }
+    let key = provider
+        .unwrap_key(&envelope.wrapped_key)
+        .map_err(|error| MongrelError::Encryption(error.to_string()))?;
+    if key.len() != crate::encryption::DEK_LEN {
+        return Err(MongrelError::Encryption(format!(
+            "KMS returned {} key bytes, expected {}",
+            key.len(),
+            crate::encryption::DEK_LEN
+        )));
+    }
+    Ok(key)
+}
+
+fn create_kms_kek(
+    root: &Path,
+    provider: &dyn crate::security_hardening::KeyManagementProvider,
+    kms_key_id: &str,
+) -> Result<Arc<crate::encryption::Kek>> {
+    if kms_key_id.is_empty() {
+        return Err(MongrelError::InvalidArgument(
+            "KMS key id must not be empty".into(),
+        ));
+    }
+    let salt = crate::encryption::random_salt()?;
+    let mut raw_key = zeroize::Zeroizing::new([0_u8; crate::encryption::DEK_LEN]);
+    crate::encryption::fill_random(raw_key.as_mut())?;
+    let wrapped_key = provider
+        .wrap_key(kms_key_id, raw_key.as_ref())
+        .map_err(|error| MongrelError::Encryption(error.to_string()))?;
+    let envelope = crate::security_hardening::KmsDatabaseKeyEnvelope {
+        provider_id: provider.provider_id().to_owned(),
+        wrapped_key,
+    };
+    crate::durable_file::write_atomic(&root.join(META_DIR).join(KEYS_FILENAME), &salt)?;
+    write_kms_key_envelope(root, &envelope)?;
+    Ok(Arc::new(crate::encryption::Kek::from_raw_key(
+        raw_key.as_ref(),
+        &salt,
+    )?))
+}
+
+fn open_kms_kek(
+    root: &crate::durable_file::DurableRoot,
+    provider: &dyn crate::security_hardening::KeyManagementProvider,
+) -> Result<Arc<crate::encryption::Kek>> {
+    let salt = read_encryption_salt(root)?;
+    let envelope = read_kms_key_envelope(root)?;
+    let raw_key = unwrap_kms_database_key(provider, &envelope)?;
+    Ok(Arc::new(crate::encryption::Kek::from_raw_key(
+        raw_key.as_ref(),
+        &salt,
+    )?))
+}
+
+fn persist_key_rotation(
+    journal: &crate::security_hardening::KeyRotationJournal,
+    record: &crate::security_hardening::KeyRotationRecord,
+) -> Result<()> {
+    journal
+        .persist(record)
+        .map_err(|error| MongrelError::Encryption(error.to_string()))
+}
+
+fn fail_key_rotation<T>(
+    journal: &crate::security_hardening::KeyRotationJournal,
+    record: &mut crate::security_hardening::KeyRotationRecord,
+    error: impl ToString,
+) -> Result<T> {
+    let message = error.to_string();
+    record.fail(&message);
+    persist_key_rotation(journal, record)?;
+    Err(MongrelError::Encryption(message))
+}
+
+fn advance_key_rotation(
+    journal: &crate::security_hardening::KeyRotationJournal,
+    record: &mut crate::security_hardening::KeyRotationRecord,
+) -> Result<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as u64;
+    record
+        .advance(now)
+        .map_err(|error| MongrelError::Encryption(error.to_string()))?;
+    persist_key_rotation(journal, record)?;
+    let hook = match record.phase {
+        crate::security_hardening::KeyRotationPhase::WrappingNewKey => "kms.rotation.phase.1",
+        crate::security_hardening::KeyRotationPhase::DualRead => "kms.rotation.phase.2",
+        crate::security_hardening::KeyRotationPhase::Reencrypting => "kms.rotation.phase.3",
+        crate::security_hardening::KeyRotationPhase::Validating => "kms.rotation.phase.4",
+        crate::security_hardening::KeyRotationPhase::Published => "kms.rotation.phase.5",
+        crate::security_hardening::KeyRotationPhase::RetiringOldKey => "kms.rotation.phase.6",
+        crate::security_hardening::KeyRotationPhase::Succeeded => "kms.rotation.phase.7",
+        crate::security_hardening::KeyRotationPhase::Pending
+        | crate::security_hardening::KeyRotationPhase::Failed => return Ok(()),
+    };
+    mongreldb_fault::inject(hook).map_err(|error| MongrelError::Encryption(error.to_string()))
 }
 
 fn incremental_aggregate_cache_key(
@@ -1055,6 +1205,7 @@ fn cdc_row_json_bytes(row: &crate::memtable::Row) -> usize {
             Value::Bytes(values) => values.len(),
             Value::Json(values) => values.len(),
             Value::Embedding(values) => values.len(),
+            Value::GeneratedEmbedding(value) => value.vector.len(),
             _ => 1,
         };
         bytes.saturating_add(values.saturating_mul(value_slot))
@@ -1689,6 +1840,7 @@ pub struct DatabaseCore {
     /// per core; jobs recovered mid-`Running` by a crash come back `Paused`.
     job_registry: Arc<crate::jobs::JobRegistry>,
     commit_lock: Arc<Mutex<()>>,
+    kms_rotation_lock: Mutex<()>,
     /// One shared WAL multiplexing every table's records (spec §7.2). Owned
     /// behind a `Mutex` so the transaction layer can append + group-sync. Shared
     /// (via `Arc`) with every mounted `Table` so single-table `put`/`commit`
@@ -2408,6 +2560,23 @@ impl Database {
         )
     }
 
+    /// Create a fresh encrypted database whose random root key is wrapped by
+    /// an external KMS provider.
+    pub fn create_with_kms(
+        root: impl AsRef<Path>,
+        provider: &dyn crate::security_hardening::KeyManagementProvider,
+        kms_key_id: &str,
+    ) -> Result<Self> {
+        let (root, lock) = Self::begin_create(root)?;
+        let kek = create_kms_kek(&root, provider, kms_key_id)?;
+        Self::create_inner(
+            root,
+            Some(kek),
+            lock,
+            crate::storage_mode::StorageMode::Standalone,
+        )
+    }
+
     /// Create a fresh plaintext database owned by the cluster node runtime
     /// (spec section 5.3): the durable marker records
     /// [`crate::storage_mode::StorageMode::ClusterReplica`], so normal
@@ -2551,6 +2720,241 @@ impl Database {
         )
     }
 
+    /// Open a KMS-encrypted database. Provider identity must match the durable
+    /// envelope and unwrapping fails closed.
+    pub fn open_with_kms(
+        root: impl AsRef<Path>,
+        provider: &dyn crate::security_hardening::KeyManagementProvider,
+    ) -> Result<Self> {
+        Self::open_with_kms_and_options(root, provider, OpenOptions::default())
+    }
+
+    /// Open a KMS-encrypted database with non-default open options.
+    pub fn open_with_kms_and_options(
+        root: impl AsRef<Path>,
+        provider: &dyn crate::security_hardening::KeyManagementProvider,
+        options: OpenOptions,
+    ) -> Result<Self> {
+        let (root, lock) = Self::begin_open(root, options.lock_timeout_ms)?;
+        let kek = open_kms_kek(
+            lock.durable_root.as_deref().ok_or_else(|| {
+                MongrelError::Other("database root descriptor was not pinned".into())
+            })?,
+            provider,
+        )?;
+        let gate = if options.offline_validation {
+            OpenModeGate::OfflineValidation
+        } else {
+            OpenModeGate::Normal
+        };
+        Self::open_inner_locked(
+            root,
+            Some(kek),
+            lock,
+            CoreResourceConfig::from_options(&options)?,
+            gate,
+        )
+    }
+
+    /// Rewrap the database root key under another KMS key without stopping
+    /// reads or writes. Data files stay encrypted under the same random root
+    /// key; only its external envelope changes.
+    pub fn rotate_kms_key(
+        &self,
+        provider: &dyn crate::security_hardening::KeyManagementProvider,
+        new_kms_key_id: &str,
+    ) -> Result<crate::security_hardening::KeyRotationRecord> {
+        let _rotation_guard = self.core.kms_rotation_lock.lock();
+        if new_kms_key_id.is_empty() {
+            return Err(MongrelError::InvalidArgument(
+                "KMS key id must not be empty".into(),
+            ));
+        }
+        let durable_root = Arc::clone(&self.core.durable_root);
+        let root = durable_root.io_path()?;
+        let envelope = read_kms_key_envelope(&durable_root)?;
+        if envelope.provider_id != provider.provider_id() {
+            return Err(MongrelError::Encryption(format!(
+                "KMS provider mismatch: database requires {:?}, got {:?}",
+                envelope.provider_id,
+                provider.provider_id()
+            )));
+        }
+        let journal = crate::security_hardening::KeyRotationJournal::new(root.join(META_DIR));
+        if let Some(record) = journal
+            .load()
+            .map_err(|error| MongrelError::Encryption(error.to_string()))?
+            .filter(|record| record.phase != crate::security_hardening::KeyRotationPhase::Succeeded)
+        {
+            if record.to_key_id != new_kms_key_id {
+                return Err(MongrelError::Conflict(format!(
+                    "KMS rotation to {:?} is already in progress",
+                    record.to_key_id
+                )));
+            }
+            return self.run_kms_key_rotation(provider, &durable_root, &root, &journal, record);
+        }
+        let now_micros = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64;
+        let mut record = crate::security_hardening::KeyRotationRecord::new(
+            envelope.wrapped_key.key_version.clone(),
+            String::new(),
+            now_micros,
+        );
+        record.from_key_id = envelope.wrapped_key.kms_key_id.clone();
+        record.to_key_id = new_kms_key_id.to_owned();
+        persist_key_rotation(&journal, &record)?;
+        self.run_kms_key_rotation(provider, &durable_root, &root, &journal, record)
+    }
+
+    /// Retry a rotation that durably entered `Failed`.
+    pub fn retry_kms_key_rotation(
+        &self,
+        provider: &dyn crate::security_hardening::KeyManagementProvider,
+    ) -> Result<crate::security_hardening::KeyRotationRecord> {
+        let _rotation_guard = self.core.kms_rotation_lock.lock();
+        let durable_root = Arc::clone(&self.core.durable_root);
+        let root = durable_root.io_path()?;
+        let journal = crate::security_hardening::KeyRotationJournal::new(root.join(META_DIR));
+        let mut record = journal
+            .load()
+            .map_err(|error| MongrelError::Encryption(error.to_string()))?
+            .ok_or_else(|| MongrelError::NotFound("KMS rotation journal".into()))?;
+        if record.phase != crate::security_hardening::KeyRotationPhase::Failed {
+            return Err(MongrelError::Conflict(
+                "KMS rotation is not in Failed state".into(),
+            ));
+        }
+        record.retry();
+        persist_key_rotation(&journal, &record)?;
+        self.run_kms_key_rotation(provider, &durable_root, &root, &journal, record)
+    }
+
+    fn run_kms_key_rotation(
+        &self,
+        provider: &dyn crate::security_hardening::KeyManagementProvider,
+        durable_root: &crate::durable_file::DurableRoot,
+        root: &Path,
+        journal: &crate::security_hardening::KeyRotationJournal,
+        mut record: crate::security_hardening::KeyRotationRecord,
+    ) -> Result<crate::security_hardening::KeyRotationRecord> {
+        use crate::security_hardening::{KeyRotationPhase, KmsDatabaseKeyEnvelope};
+        loop {
+            match record.phase {
+                KeyRotationPhase::Pending => advance_key_rotation(journal, &mut record)?,
+                KeyRotationPhase::WrappingNewKey => {
+                    if record.staged_wrapped_key.is_none() {
+                        let current = read_kms_key_envelope(durable_root)?;
+                        let wrapped =
+                            match provider.rewrap_key(&current.wrapped_key, &record.to_key_id) {
+                                Ok(wrapped) => wrapped,
+                                Err(error) => {
+                                    return fail_key_rotation(journal, &mut record, error);
+                                }
+                            };
+                        record.to_version = wrapped.key_version.clone();
+                        record.staged_wrapped_key = Some(wrapped);
+                        persist_key_rotation(journal, &record)?;
+                    }
+                    advance_key_rotation(journal, &mut record)?;
+                }
+                KeyRotationPhase::DualRead => {
+                    let old_envelope = read_kms_key_envelope(durable_root)?;
+                    let new_envelope = KmsDatabaseKeyEnvelope {
+                        provider_id: provider.provider_id().to_owned(),
+                        wrapped_key: record.staged_wrapped_key.clone().ok_or_else(|| {
+                            MongrelError::Encryption(
+                                "KMS rotation has no staged wrapped key".into(),
+                            )
+                        })?,
+                    };
+                    let old_raw = match unwrap_kms_database_key(provider, &old_envelope) {
+                        Ok(key) => key,
+                        Err(error) => {
+                            return fail_key_rotation(journal, &mut record, error);
+                        }
+                    };
+                    let new_raw = match unwrap_kms_database_key(provider, &new_envelope) {
+                        Ok(key) => key,
+                        Err(error) => {
+                            return fail_key_rotation(journal, &mut record, error);
+                        }
+                    };
+                    if !bool::from(old_raw.as_slice().ct_eq(new_raw.as_slice())) {
+                        return fail_key_rotation(
+                            journal,
+                            &mut record,
+                            "KMS rewrap changed the database root key",
+                        );
+                    }
+                    advance_key_rotation(journal, &mut record)?;
+                }
+                KeyRotationPhase::Reencrypting => {
+                    // Envelope rotation keeps the database root key stable, so
+                    // pages, WAL records, and active readers need no rewrite.
+                    advance_key_rotation(journal, &mut record)?;
+                }
+                KeyRotationPhase::Validating => {
+                    let new_envelope = KmsDatabaseKeyEnvelope {
+                        provider_id: provider.provider_id().to_owned(),
+                        wrapped_key: record.staged_wrapped_key.clone().ok_or_else(|| {
+                            MongrelError::Encryption(
+                                "KMS rotation has no staged wrapped key".into(),
+                            )
+                        })?,
+                    };
+                    let new_raw = match unwrap_kms_database_key(provider, &new_envelope) {
+                        Ok(key) => key,
+                        Err(error) => {
+                            return fail_key_rotation(journal, &mut record, error);
+                        }
+                    };
+                    let salt = read_encryption_salt(durable_root)?;
+                    let candidate = crate::encryption::Kek::from_raw_key(new_raw.as_ref(), &salt)?;
+                    let candidate_meta = candidate.derive_meta_key();
+                    let Some(active_meta) = self.core.meta_dek.as_ref() else {
+                        return fail_key_rotation(
+                            journal,
+                            &mut record,
+                            "KMS metadata exists on a plaintext database",
+                        );
+                    };
+                    if !bool::from(candidate_meta.as_ref().ct_eq(active_meta.as_slice())) {
+                        return fail_key_rotation(
+                            journal,
+                            &mut record,
+                            "KMS rewrap validation failed",
+                        );
+                    }
+                    advance_key_rotation(journal, &mut record)?;
+                }
+                KeyRotationPhase::Published => {
+                    let envelope = KmsDatabaseKeyEnvelope {
+                        provider_id: provider.provider_id().to_owned(),
+                        wrapped_key: record.staged_wrapped_key.clone().ok_or_else(|| {
+                            MongrelError::Encryption(
+                                "KMS rotation has no staged wrapped key".into(),
+                            )
+                        })?,
+                    };
+                    write_kms_key_envelope(root, &envelope)?;
+                    advance_key_rotation(journal, &mut record)?;
+                }
+                KeyRotationPhase::RetiringOldKey => {
+                    advance_key_rotation(journal, &mut record)?;
+                }
+                KeyRotationPhase::Succeeded => return Ok(record),
+                KeyRotationPhase::Failed => {
+                    return Err(MongrelError::Encryption(
+                        "failed KMS rotation must be explicitly retried".into(),
+                    ));
+                }
+            }
+        }
+    }
+
     /// Open an existing plaintext database that has `require_auth = true`,
     /// verifying the supplied credentials up front and caching the resolved
     /// [`Principal`] on the returned handle. Every subsequent operation will
@@ -2647,6 +3051,31 @@ impl Database {
             lock,
             CoreResourceConfig::from_options(&options)?,
             gate,
+        )
+    }
+
+    /// Open a KMS-encrypted database and authenticate the returned handle.
+    pub fn open_with_kms_and_credentials(
+        root: impl AsRef<Path>,
+        provider: &dyn crate::security_hardening::KeyManagementProvider,
+        username: &str,
+        password: &str,
+    ) -> Result<Self> {
+        let (root, lock) = Self::begin_open(root, 0)?;
+        let kek = open_kms_kek(
+            lock.durable_root.as_deref().ok_or_else(|| {
+                MongrelError::Other("database root descriptor was not pinned".into())
+            })?,
+            provider,
+        )?;
+        Self::open_inner_with_credentials_locked(
+            root,
+            Some(kek),
+            username,
+            password,
+            lock,
+            CoreResourceConfig::default(),
+            OpenModeGate::Normal,
         )
     }
 
@@ -2901,6 +3330,19 @@ impl Database {
         let salt = crate::encryption::random_salt()?;
         crate::durable_file::write_atomic(&root.join(META_DIR).join(KEYS_FILENAME), &salt)?;
         let kek = Arc::new(crate::encryption::Kek::derive(passphrase, &salt)?);
+        Self::create_inner_with_credentials(root, Some(kek), admin_username, admin_password, lock)
+    }
+
+    /// Create a KMS-encrypted database with an authenticated admin handle.
+    pub fn create_with_kms_and_credentials(
+        root: impl AsRef<Path>,
+        provider: &dyn crate::security_hardening::KeyManagementProvider,
+        kms_key_id: &str,
+        admin_username: &str,
+        admin_password: &str,
+    ) -> Result<Self> {
+        let (root, lock) = Self::begin_create(root)?;
+        let kek = create_kms_kek(&root, provider, kms_key_id)?;
         Self::create_inner_with_credentials(root, Some(kek), admin_username, admin_password, lock)
     }
 
@@ -3642,6 +4084,7 @@ impl Database {
             embedding_providers: crate::embedding::EmbeddingProviderRegistry::new(),
             job_registry,
             commit_lock,
+            kms_rotation_lock: Mutex::new(()),
             shared_wal,
             next_txn_id: txn_ids,
             tables: RwLock::new(tables),
@@ -3801,6 +4244,10 @@ impl Database {
                     })?;
                 let source =
                     crate::embedding::EmbeddingSource::GeneratedColumnSpec { spec: spec.clone() };
+                let provider = self
+                    .embedding_providers
+                    .resolve(&source)
+                    .map_err(embedding_error)?;
                 let vectors = self
                     .embedding_providers
                     .embed_controlled(
@@ -3815,9 +4262,23 @@ impl Database {
                 cells.retain(|(column, _)| *column != target.id);
                 cells.push((
                     target.id,
-                    crate::memtable::Value::Embedding(vectors.into_iter().next().ok_or_else(
-                        || MongrelError::Other("embedding provider returned no vector".into()),
-                    )?),
+                    crate::memtable::Value::GeneratedEmbedding(Box::new(
+                        crate::embedding::GeneratedEmbeddingValue {
+                            vector: vectors.into_iter().next().ok_or_else(|| {
+                                MongrelError::Other("embedding provider returned no vector".into())
+                            })?,
+                            metadata: crate::embedding::GeneratedEmbeddingMetadata {
+                                provider_id: provider.provider_id().to_owned(),
+                                model_id: provider.model_id().to_owned(),
+                                model_version: provider.model_version().to_owned(),
+                                preprocessing_version: provider.preprocessing_version().to_owned(),
+                                source_fingerprint: Sha256::digest(text.as_bytes()).into(),
+                                status: crate::embedding::EmbeddingGenerationStatus::Ready,
+                                last_error_category: None,
+                                attempt_count: 1,
+                            },
+                        },
+                    )),
                 ));
                 if let Some(changed_columns) = update_changed_columns.as_deref_mut() {
                     changed_columns.push(target.id);
@@ -16544,6 +17005,10 @@ fn value_matches_type(value: &crate::Value, ty: crate::TypeId) -> bool {
             | (crate::Value::Float64(_), crate::TypeId::Float64)
             | (crate::Value::Bytes(_), crate::TypeId::Bytes)
             | (crate::Value::Embedding(_), crate::TypeId::Embedding { .. })
+            | (
+                crate::Value::GeneratedEmbedding(_),
+                crate::TypeId::Embedding { .. }
+            )
     )
 }
 
@@ -16972,7 +17437,9 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::Int64(a), Value::Int64(b)) => a == b,
         (Value::Float64(a), Value::Float64(b)) => a.to_bits() == b.to_bits(),
         (Value::Bytes(a), Value::Bytes(b)) => a == b,
-        (Value::Embedding(a), Value::Embedding(b)) => {
+        (a, b) if a.as_embedding().is_some() && b.as_embedding().is_some() => {
+            let a = a.as_embedding().unwrap();
+            let b = b.as_embedding().unwrap();
             a.len() == b.len()
                 && a.iter()
                     .zip(b.iter())
@@ -17001,7 +17468,7 @@ fn value_order(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {
         }
         (Value::Float64(a), Value::Float64(b)) => Some(a.total_cmp(b)),
         (Value::Bytes(a), Value::Bytes(b)) => Some(a.cmp(b)),
-        (Value::Embedding(_), Value::Embedding(_)) => None,
+        (a, b) if a.as_embedding().is_some() && b.as_embedding().is_some() => None,
         _ => None,
     }
 }
@@ -17014,6 +17481,7 @@ fn trigger_message(value: Value) -> String {
         Value::Float64(value) => value.to_string(),
         Value::Bytes(value) => String::from_utf8_lossy(&value).into_owned(),
         Value::Embedding(value) => format!("{value:?}"),
+        Value::GeneratedEmbedding(value) => format!("{:?}", value.vector),
         Value::Decimal(value) => value.to_string(),
         Value::Interval {
             months,

@@ -87,6 +87,10 @@ fn value_to_string(v: &Value) -> String {
             let inner: Vec<String> = v.iter().map(|x| x.to_string()).collect();
             format!("[{}]", inner.join(","))
         }
+        Value::GeneratedEmbedding(value) => {
+            let inner: Vec<String> = value.vector.iter().map(|x| x.to_string()).collect();
+            format!("[{}]", inner.join(","))
+        }
         Value::Decimal(d) => d.to_string(),
         Value::Interval {
             months,

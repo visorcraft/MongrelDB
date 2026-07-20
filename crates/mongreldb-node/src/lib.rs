@@ -830,6 +830,9 @@ fn from_value(v: &Value, column_id: u16) -> Cell {
             Err(_) => cell.bytes = Some(Buffer::from(b.clone())),
         },
         Value::Embedding(e) => cell.embedding = Some(e.iter().map(|x| *x as f64).collect()),
+        Value::GeneratedEmbedding(value) => {
+            cell.embedding = Some(value.vector.iter().map(|x| *x as f64).collect());
+        }
         Value::Decimal(_) | Value::Interval { .. } | Value::Uuid(_) | Value::Json(_) => {
             // These types don't have a Cell representation yet; encode as null.
         }

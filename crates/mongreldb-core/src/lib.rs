@@ -108,10 +108,11 @@ pub use database::{
     TableReadGeneration, DEFAULT_MEMORY_BUDGET_BYTES, DEFAULT_TEMP_DISK_BUDGET_BYTES,
 };
 pub use embedding::{
-    EmbeddingError, EmbeddingFailurePolicy, EmbeddingFuture, EmbeddingLimits, EmbeddingModelMeta,
-    EmbeddingNormalization, EmbeddingProvider, EmbeddingProviderRegistry, EmbeddingRequest,
-    EmbeddingResponse, EmbeddingSource, FixedVectorProvider, GeneratedEmbeddingSpec,
-    ProviderExecutionMode, ProviderHealth, ProviderStatus,
+    EmbeddingError, EmbeddingFailurePolicy, EmbeddingFuture, EmbeddingGenerationStatus,
+    EmbeddingLimits, EmbeddingModelMeta, EmbeddingNormalization, EmbeddingProvider,
+    EmbeddingProviderRegistry, EmbeddingRequest, EmbeddingResponse, EmbeddingSource,
+    FixedVectorProvider, GeneratedEmbeddingMetadata, GeneratedEmbeddingSpec,
+    GeneratedEmbeddingValue, ProviderExecutionMode, ProviderHealth, ProviderStatus,
 };
 pub use encryption::{Cipher, PlaintextCipher};
 pub use engine::{
@@ -164,7 +165,7 @@ pub use security_hardening::{
     node_cert_matches_id, redact_secrets, validate_jwt_claims, verify_jwt, IssuedServiceToken, Jwk,
     JwksCache, JwksDocument, JwksFetch, JwksProvider, JwtAlgorithm, JwtClaims, JwtError,
     JwtValidationConfig, KeyManagementError, KeyManagementHealth, KeyManagementProvider,
-    KeyRotationJournal, KeyRotationPhase, KeyRotationRecord, KmsWrappedKey,
+    KeyRotationJournal, KeyRotationPhase, KeyRotationRecord, KmsDatabaseKeyEnvelope, KmsWrappedKey,
     ScramChannelBindingPolicy, ScramClientSession, ScramServerSession, ScramVerifier,
     SecurityHardeningError, ServiceToken, ServiceTokenRegistry, UnsupportedKeyManagementProvider,
     VerifiedJwt,

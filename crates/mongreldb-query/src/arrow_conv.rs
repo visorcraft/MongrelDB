@@ -331,8 +331,8 @@ pub fn build_array(ty: TypeId, values: &[Value]) -> Result<ArrayRef> {
             let fbb = Float32Builder::new();
             let mut b = FixedSizeListBuilder::new(fbb, dim as i32);
             for v in values {
-                match v {
-                    Value::Embedding(x) if x.len() == dim as usize => {
+                match v.as_embedding() {
+                    Some(x) if x.len() == dim as usize => {
                         for fv in x {
                             b.values().append_value(*fv);
                         }

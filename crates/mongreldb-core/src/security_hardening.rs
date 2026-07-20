@@ -779,6 +779,13 @@ pub struct KmsWrappedKey {
     pub algorithm: String,
 }
 
+/// Durable database root-key envelope. Plaintext key bytes are never stored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KmsDatabaseKeyEnvelope {
+    pub provider_id: String,
+    pub wrapped_key: KmsWrappedKey,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyManagementHealth {
     Ready,
@@ -880,6 +887,12 @@ pub enum KeyRotationPhase {
 pub struct KeyRotationRecord {
     pub from_version: String,
     pub to_version: String,
+    #[serde(default)]
+    pub from_key_id: String,
+    #[serde(default)]
+    pub to_key_id: String,
+    #[serde(default)]
+    pub staged_wrapped_key: Option<KmsWrappedKey>,
     pub started_unix_micros: u64,
     pub completed_unix_micros: Option<u64>,
     pub phase: KeyRotationPhase,
@@ -896,6 +909,9 @@ impl KeyRotationRecord {
         Self {
             from_version: from_version.into(),
             to_version: to_version.into(),
+            from_key_id: String::new(),
+            to_key_id: String::new(),
+            staged_wrapped_key: None,
             started_unix_micros,
             completed_unix_micros: None,
             phase: KeyRotationPhase::Pending,

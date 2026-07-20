@@ -699,7 +699,7 @@ impl Schema {
                 _ => {}
             }
             if let TypeId::Embedding { dim } = &column.ty {
-                let Value::Embedding(values) = value else {
+                let Some(values) = value.as_embedding() else {
                     if matches!(value, Value::Null) {
                         continue;
                     }
@@ -978,6 +978,7 @@ pub(crate) fn value_matches_type(v: &Value, ty: TypeId) -> bool {
             | (Value::Decimal(_), TypeId::Decimal128 { .. })
             | (Value::Json(_), TypeId::Json)
             | (Value::Embedding(_), TypeId::Embedding { .. })
+            | (Value::GeneratedEmbedding(_), TypeId::Embedding { .. })
             | (Value::Interval { .. }, TypeId::Interval)
     )
 }

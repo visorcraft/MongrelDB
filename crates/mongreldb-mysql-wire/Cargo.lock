@@ -3264,6 +3264,7 @@ version = "0.60.3"
 dependencies = [
  "arrow",
  "axum",
+ "base64 0.22.1",
  "bincode",
  "fs2",
  "futures",

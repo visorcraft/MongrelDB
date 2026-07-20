@@ -17,6 +17,7 @@ use mongreldb_core::{Database, JwtAlgorithm, JwtValidationConfig, ServiceToken};
 use mongreldb_protocol::native_transport::{
     NativeRpcServer, NativeRpcServerConfig, NativeRpcServices,
 };
+use mongreldb_server::vault_kms::{VaultTransitConfig, VaultTransitKeyManagementProvider};
 use mongreldb_server::{
     build_app_with_sessions_and_control, cluster_admin, spawn_auto_compactor, spawn_session_reaper,
     SessionStore,
@@ -49,6 +50,10 @@ struct Args {
     oidc_audience: Option<String>,
     oidc_allowed_hosts: BTreeSet<String>,
     passphrase: Option<String>,
+    vault_url: Option<String>,
+    vault_mount: Option<String>,
+    vault_key: Option<String>,
+    vault_ca_certificate: Option<String>,
     daemon: bool,
     pidfile: Option<String>,
 }
@@ -81,6 +86,10 @@ OPTIONS:
     --oidc-audience <audience>  Native OIDC audience
     --oidc-allow-host <host>    Allowed OIDC/JWKS host (repeatable)
     --passphrase <passphrase>   Open an encrypted database
+    --vault-url <https-url>     Encrypt with HashiCorp Vault Transit
+    --vault-mount <mount>       Vault Transit mount name
+    --vault-key <key>           Vault Transit key name
+    --vault-ca-cert <path>      Additional Vault CA certificate
     --daemon                    Fork into the background (daemonize)
     --pidfile <path>            PID file path (default: <db_dir>/mongreldb.pid)
     -h, --help                  Print this help message
@@ -94,6 +103,8 @@ SUBCOMMANDS (one-shot; they do not start the daemon):
 ENVIRONMENT:
     MONGRELDB_DB_USERNAME       Database-handle username (set with DB_PASSWORD)
     MONGRELDB_DB_PASSWORD       Database-handle password (set with DB_USERNAME)
+    MONGRELDB_VAULT_TOKEN       Vault token, removed from environment at startup
+    MONGRELDB_VAULT_NAMESPACE   Optional Vault Enterprise namespace
 ";
 
 struct DatabaseCredentials {
@@ -142,12 +153,62 @@ fn take_database_credentials_from_env() -> Result<Option<DatabaseCredentials>, S
     database_credentials_from_values(username, password)
 }
 
+fn take_vault_environment(
+    configured: bool,
+) -> Result<(Option<Zeroizing<String>>, Option<String>), String> {
+    let token = std::env::var_os("MONGRELDB_VAULT_TOKEN");
+    let namespace = std::env::var_os("MONGRELDB_VAULT_NAMESPACE");
+    std::env::remove_var("MONGRELDB_VAULT_TOKEN");
+    std::env::remove_var("MONGRELDB_VAULT_NAMESPACE");
+    if !configured {
+        if token.is_some() || namespace.is_some() {
+            return Err("Vault environment requires --vault-url".into());
+        }
+        return Ok((None, None));
+    }
+    let token = token
+        .ok_or("MONGRELDB_VAULT_TOKEN is required with --vault-url")?
+        .into_string()
+        .map_err(|_| "MONGRELDB_VAULT_TOKEN must be valid UTF-8")?;
+    if token.is_empty() {
+        return Err("MONGRELDB_VAULT_TOKEN must not be empty".into());
+    }
+    let namespace = namespace
+        .map(|value| {
+            value
+                .into_string()
+                .map_err(|_| "MONGRELDB_VAULT_NAMESPACE must be valid UTF-8".to_string())
+        })
+        .transpose()?;
+    Ok((Some(Zeroizing::new(token)), namespace))
+}
+
 fn open_or_create_database(
     db_dir: &str,
     passphrase: Option<&str>,
+    kms: Option<(&dyn mongreldb_core::KeyManagementProvider, &str)>,
     credentials: Option<DatabaseCredentials>,
 ) -> mongreldb_core::Result<Database> {
     let catalog_exists = std::path::Path::new(db_dir).join("CATALOG").exists();
+    if let Some((provider, key_id)) = kms {
+        return match (catalog_exists, credentials.as_ref()) {
+            (true, Some(credentials)) => Database::open_with_kms_and_credentials(
+                db_dir,
+                provider,
+                &credentials.username,
+                credentials.password.as_str(),
+            ),
+            (false, Some(credentials)) => Database::create_with_kms_and_credentials(
+                db_dir,
+                provider,
+                key_id,
+                &credentials.username,
+                credentials.password.as_str(),
+            ),
+            (true, None) => Database::open_with_kms(db_dir, provider),
+            (false, None) => Database::create_with_kms(db_dir, provider, key_id),
+        };
+    }
     match (catalog_exists, passphrase, credentials.as_ref()) {
         (true, Some(passphrase), Some(credentials)) => Database::open_encrypted_with_credentials(
             db_dir,
@@ -218,6 +279,10 @@ fn parse_args() -> Result<Args, String> {
     let mut oidc_audience = None;
     let mut oidc_allowed_hosts = BTreeSet::new();
     let mut passphrase: Option<String> = None;
+    let mut vault_url = None;
+    let mut vault_mount = None;
+    let mut vault_key = None;
+    let mut vault_ca_certificate = None;
     let mut daemon = false;
     let mut pidfile: Option<String> = None;
 
@@ -334,6 +399,38 @@ fn parse_args() -> Result<Args, String> {
                 passphrase = Some(v.clone());
                 i += 2;
             }
+            "--vault-url" => {
+                vault_url = Some(
+                    raw.get(i + 1)
+                        .ok_or("--vault-url requires a value")?
+                        .clone(),
+                );
+                i += 2;
+            }
+            "--vault-mount" => {
+                vault_mount = Some(
+                    raw.get(i + 1)
+                        .ok_or("--vault-mount requires a value")?
+                        .clone(),
+                );
+                i += 2;
+            }
+            "--vault-key" => {
+                vault_key = Some(
+                    raw.get(i + 1)
+                        .ok_or("--vault-key requires a value")?
+                        .clone(),
+                );
+                i += 2;
+            }
+            "--vault-ca-cert" => {
+                vault_ca_certificate = Some(
+                    raw.get(i + 1)
+                        .ok_or("--vault-ca-cert requires a value")?
+                        .clone(),
+                );
+                i += 2;
+            }
             "--daemon" => {
                 daemon = true;
                 i += 1;
@@ -381,6 +478,18 @@ fn parse_args() -> Result<Args, String> {
     if oidc_issuer.is_some() && oidc_allowed_hosts.is_empty() {
         return Err("--oidc-issuer requires at least one --oidc-allow-host".into());
     }
+    let vault_configured = vault_url.is_some() || vault_mount.is_some() || vault_key.is_some();
+    if vault_configured && !(vault_url.is_some() && vault_mount.is_some() && vault_key.is_some()) {
+        return Err(
+            "--vault-url, --vault-mount, and --vault-key must be configured together".into(),
+        );
+    }
+    if vault_ca_certificate.is_some() && !vault_configured {
+        return Err("--vault-ca-cert requires --vault-url".into());
+    }
+    if passphrase.is_some() && vault_configured {
+        return Err("--passphrase and --vault-url are mutually exclusive".into());
+    }
 
     Ok(Args {
         db_dir,
@@ -399,6 +508,10 @@ fn parse_args() -> Result<Args, String> {
         oidc_audience,
         oidc_allowed_hosts,
         passphrase,
+        vault_url,
+        vault_mount,
+        vault_key,
+        vault_ca_certificate,
         daemon,
         pidfile,
     })
@@ -511,6 +624,22 @@ fn main() {
             std::process::exit(1);
         }
     };
+    let (vault_token, vault_namespace) = match take_vault_environment(args.vault_url.is_some()) {
+        Ok(environment) => environment,
+        Err(error) => {
+            eprintln!("Vault configuration: {error}");
+            std::process::exit(1);
+        }
+    };
+    let vault_ca_certificate = args
+        .vault_ca_certificate
+        .as_ref()
+        .map(std::fs::read)
+        .transpose()
+        .unwrap_or_else(|error| {
+            eprintln!("failed to read Vault CA certificate: {error}");
+            std::process::exit(1);
+        });
 
     let pidfile = resolve_pidfile(&args);
 
@@ -521,12 +650,34 @@ fn main() {
         }
     }
 
+    let vault_provider = args.vault_url.as_ref().map(|endpoint| {
+        VaultTransitKeyManagementProvider::new(VaultTransitConfig {
+            endpoint: endpoint.clone(),
+            mount: args.vault_mount.clone().unwrap_or_default(),
+            token: vault_token.expect("validated Vault configuration requires a token"),
+            namespace: vault_namespace,
+            timeout: std::time::Duration::from_secs(10),
+            ca_certificate_pem: vault_ca_certificate,
+        })
+        .unwrap_or_else(|error| {
+            eprintln!("failed to configure Vault KMS: {error}");
+            std::process::exit(1);
+        })
+    });
+    let kms = vault_provider.as_ref().map(|provider| {
+        (
+            provider as &dyn mongreldb_core::KeyManagementProvider,
+            args.vault_key.as_deref().unwrap_or_default(),
+        )
+    });
+
     // Credential ownership is moved into this call. Its password is zeroized
     // immediately after open/create returns, before any worker thread starts.
     let db = Arc::new(
         open_or_create_database(
             &args.db_dir,
             args.passphrase.as_deref(),
+            kms,
             database_credentials,
         )
         .unwrap_or_else(|e| {
@@ -1350,9 +1501,13 @@ mod tests {
     fn credentialed_plain_database_create_reopen_and_http_auth_validation() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().to_str().unwrap();
-        let database =
-            open_or_create_database(path, None, Some(credentials("admin", "database-password")))
-                .unwrap();
+        let database = open_or_create_database(
+            path,
+            None,
+            None,
+            Some(credentials("admin", "database-password")),
+        )
+        .unwrap();
         assert!(database.require_auth_enabled());
         assert_eq!(
             database.principal_snapshot().unwrap().username,
@@ -1363,16 +1518,23 @@ mod tests {
         assert!(validate_http_auth_configuration(&database, None, true).is_ok());
         drop(database);
 
-        let reopened =
-            open_or_create_database(path, None, Some(credentials("admin", "database-password")))
-                .unwrap();
+        let reopened = open_or_create_database(
+            path,
+            None,
+            None,
+            Some(credentials("admin", "database-password")),
+        )
+        .unwrap();
         assert_eq!(reopened.principal_snapshot().unwrap().username, "admin");
         drop(reopened);
 
-        assert!(
-            open_or_create_database(path, None, Some(credentials("admin", "wrong-password")),)
-                .is_err()
-        );
+        assert!(open_or_create_database(
+            path,
+            None,
+            None,
+            Some(credentials("admin", "wrong-password")),
+        )
+        .is_err());
     }
 
     #[test]
@@ -1382,6 +1544,7 @@ mod tests {
         let database = open_or_create_database(
             path,
             Some("encryption-passphrase"),
+            None,
             Some(credentials("admin", "database-password")),
         )
         .unwrap();
@@ -1391,6 +1554,7 @@ mod tests {
         let reopened = open_or_create_database(
             path,
             Some("encryption-passphrase"),
+            None,
             Some(credentials("admin", "database-password")),
         )
         .unwrap();

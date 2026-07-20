@@ -264,22 +264,8 @@ pub fn value_to_c(v: &Value, backing: &mut Vec<Vec<u8>>) -> CValue {
                 payload: CValuePayload { bytes: slice },
             }
         }
-        Value::Embedding(e) => {
-            // Embeddings are f32; store them as raw bytes in the backing store
-            // and expose a typed pointer so the C side reads f32 directly.
-            let bytes: Vec<u8> = bytemuck_cast_f32(e);
-            backing.push(bytes);
-            let ptr = backing.last().unwrap().as_ptr() as *const f32;
-            CValue {
-                tag: CValueTag::Embedding as i32,
-                payload: CValuePayload {
-                    embedding: EmbeddingSlice {
-                        data: ptr,
-                        len: e.len(),
-                    },
-                },
-            }
-        }
+        Value::Embedding(e) => embedding_to_c(e, backing),
+        Value::GeneratedEmbedding(value) => embedding_to_c(&value.vector, backing),
         Value::Decimal(d) => CValue {
             tag: CValueTag::Decimal as i32,
             payload: CValuePayload {
@@ -312,6 +298,23 @@ pub fn value_to_c(v: &Value, backing: &mut Vec<Vec<u8>>) -> CValue {
                 payload: CValuePayload { json: slice },
             }
         }
+    }
+}
+
+fn embedding_to_c(embedding: &[f32], backing: &mut Vec<Vec<u8>>) -> CValue {
+    // Embeddings are f32; store them as raw bytes in the backing store and
+    // expose a typed pointer so the C side reads f32 directly.
+    let bytes = bytemuck_cast_f32(embedding);
+    backing.push(bytes);
+    let ptr = backing.last().unwrap().as_ptr() as *const f32;
+    CValue {
+        tag: CValueTag::Embedding as i32,
+        payload: CValuePayload {
+            embedding: EmbeddingSlice {
+                data: ptr,
+                len: embedding.len(),
+            },
+        },
     }
 }
 

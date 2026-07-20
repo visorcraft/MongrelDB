@@ -33,6 +33,34 @@ pub enum EmbeddingFailurePolicy {
     AbortWrite,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EmbeddingGenerationStatus {
+    Ready,
+    Pending,
+    Failed,
+}
+
+/// Durable provenance for a generated embedding value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GeneratedEmbeddingMetadata {
+    pub provider_id: String,
+    pub model_id: String,
+    pub model_version: String,
+    pub preprocessing_version: String,
+    pub source_fingerprint: [u8; 32],
+    pub status: EmbeddingGenerationStatus,
+    pub last_error_category: Option<mongreldb_types::errors::ErrorCategory>,
+    pub attempt_count: u32,
+}
+
+/// Generated vector and its durable provenance.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GeneratedEmbeddingValue {
+    pub vector: Vec<f32>,
+    pub metadata: GeneratedEmbeddingMetadata,
+}
+
 /// Portable generated-column contract stored in schema.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GeneratedEmbeddingSpec {

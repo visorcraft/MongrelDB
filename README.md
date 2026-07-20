@@ -234,16 +234,18 @@ in-process, policy-unaware engine API. `MongrelClient` and
 
 ## Encryption
 
-MongrelDB supports page-level encryption via AES-256-GCM (always compiled into `mongreldb-core`). The **secret is a passphrase or a raw key
-file** - there is no KMS integration or environment-variable mechanism.
+MongrelDB supports page-level encryption via AES-256-GCM (always compiled into
+`mongreldb-core`). The database root key may come from a passphrase, a raw key
+file, or a HashiCorp Vault Transit envelope. The daemon reads the Vault token
+from `MONGRELDB_VAULT_TOKEN` and removes it from the environment at startup.
 
 ### Key hierarchy
 
 ```
-passphrase + salt (16-byte random, in _meta/keys)   |   raw key file (≥32 bytes)
-  │                                                      │
-  ▼  Argon2id (19 MiB, t=2) + HKDF-SHA256               ▼  HKDF-SHA256 only
-  └─────────────► KEK (256-bit, table-level, never persisted) ◄───────────┘
+passphrase + salt        raw key file        Vault-wrapped random root key
+  │                          │                            │
+  ▼ Argon2id + HKDF          ▼ HKDF                      ▼ Vault unwrap + HKDF
+  └──────────────────────► KEK (256-bit, never persisted) ◄────────────────┘
         │
         ├──► per-run DEK (random; AES-256-GCM-wrapped in the run descriptor) → page payloads
         ├──► WAL key              → WAL frame AEAD (_wal/)
