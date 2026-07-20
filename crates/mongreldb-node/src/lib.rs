@@ -1726,7 +1726,7 @@ fn native_query_status(status: mongreldb_query::QueryStatus) -> NativeQueryStatu
 pub struct NativeSqlQuery {
     id: mongreldb_query::QueryId,
     query: mongreldb_query::RegisteredSqlQuery,
-    session: Arc<mongreldb_query::MongrelSession>,
+    session: std::sync::Weak<mongreldb_query::MongrelSession>,
     sql: String,
     max_output_rows: usize,
     max_output_bytes: usize,
@@ -1745,7 +1745,12 @@ impl Drop for NativeSqlQuery {
 
 impl NativeSqlQuery {
     fn session(&self) -> napi::Result<Arc<mongreldb_query::MongrelSession>, String> {
-        Ok(Arc::clone(&self.session))
+        self.session.upgrade().ok_or_else(|| {
+            napi::Error::new(
+                CORE_DATABASE_CLOSED_CODE.to_owned(),
+                format!("{CORE_DATABASE_CLOSED_CODE}: database was closed before SQL execution"),
+            )
+        })
     }
 }
 
@@ -1826,7 +1831,7 @@ impl Database {
         Ok(NativeSqlQuery {
             id,
             query: retained_query,
-            session,
+            session: Arc::downgrade(&session),
             sql,
             max_output_rows: options.max_output_rows.unwrap_or(1_000_000) as usize,
             max_output_bytes: options.max_output_bytes.unwrap_or(64 * 1024 * 1024) as usize,
@@ -1932,13 +1937,18 @@ impl NativeSqlQuery {
 /// A handle to one table inside a [`Database`].
 #[napi]
 pub struct TableHandle {
-    db: Arc<CoreDatabase>,
+    db: std::sync::Weak<CoreDatabase>,
     name: String,
 }
 
 impl TableHandle {
     fn core(&self) -> napi::Result<Arc<CoreDatabase>> {
-        Ok(Arc::clone(&self.db))
+        self.db.upgrade().ok_or_else(|| {
+            napi::Error::new(
+                napi::Status::GenericFailure,
+                format!("{CORE_DATABASE_CLOSED_CODE}: database is closed"),
+            )
+        })
     }
 }
 
@@ -2327,7 +2337,10 @@ impl Database {
         // Validate the table exists now; per-op calls re-resolve it by name.
         self.core()?.table_id(&name).map_err(to_napi)?;
         let database = self.core()?;
-        Ok(TableHandle { db: database, name })
+        Ok(TableHandle {
+            db: Arc::downgrade(&database),
+            name,
+        })
     }
 
     /// Alias for [`Database::get_table`] matching the spec's `database.table(name)`.
@@ -2341,7 +2354,7 @@ impl Database {
     pub fn begin(&self) -> napi::Result<Transaction> {
         let database = self.core()?;
         Ok(Transaction {
-            db: database,
+            db: Arc::downgrade(&database),
             state: Arc::new(parking_lot::Mutex::new(NodeTransactionState::default())),
         })
     }
@@ -3385,23 +3398,11 @@ mod native_ipc_tests {
     use super::{
         native_cols_to_ipc_from_batches_controlled, native_query_status, query_phase_name,
         query_terminal_state_name, Database, TableHandle, CORE_DATABASE_CLOSED_CODE,
-        CORE_DATABASE_LOCKED_CODE,
     };
     use arrow::array::Int64Array;
     use arrow::record_batch::RecordBatch;
     use mongreldb_query::{QueryTerminalErrorCategory, SqlQueryOptions, SqlQueryRegistry};
     use std::sync::Arc;
-
-    fn assert_locked(path: &str) {
-        let error = match Database::open(path.to_owned()) {
-            Ok(mut database) => {
-                database.close().unwrap();
-                panic!("database reopened while a dependent handle was alive")
-            }
-            Err(error) => error,
-        };
-        assert_eq!(error.status, CORE_DATABASE_LOCKED_CODE);
-    }
 
     fn assert_reopens(path: &str) {
         let mut database = Database::open(path.to_owned()).unwrap();
@@ -3436,32 +3437,44 @@ mod native_ipc_tests {
     }
 
     #[test]
-    fn native_close_defers_unlock_for_dependent_handles() {
+    fn native_close_invalidates_dependent_handles_and_unlocks() {
         let path = close_test_path("dependents");
 
         let mut database = Database::with_path(path.clone()).unwrap();
         let table = TableHandle {
-            db: database.core().unwrap(),
+            db: Arc::downgrade(&database.core().unwrap()),
             name: "unused".into(),
         };
         database.close().unwrap();
-        assert_locked(&path);
-        drop(table);
+        assert!(table
+            .core()
+            .unwrap_err()
+            .reason
+            .contains(CORE_DATABASE_CLOSED_CODE));
         assert_reopens(&path);
+        drop(table);
 
         let mut database = Database::open(path.clone()).unwrap();
         let transaction = database.begin().unwrap();
         database.close().unwrap();
-        assert_locked(&path);
-        drop(transaction);
+        assert!(transaction
+            .core()
+            .unwrap_err()
+            .reason
+            .contains(CORE_DATABASE_CLOSED_CODE));
         assert_reopens(&path);
+        drop(transaction);
 
         let mut database = Database::open(path.clone()).unwrap();
         let query = database.start_sql("SELECT 1".into(), None).unwrap();
         database.close().unwrap();
-        assert_locked(&path);
-        drop(query);
+        let error = match query.session() {
+            Ok(_) => panic!("SQL handle retained a closed database"),
+            Err(error) => error,
+        };
+        assert_eq!(error.status, CORE_DATABASE_CLOSED_CODE);
         assert_reopens(&path);
+        drop(query);
         std::fs::remove_dir_all(path).unwrap();
     }
 
@@ -3524,7 +3537,7 @@ mod native_ipc_tests {
         let handle = super::NativeSqlQuery {
             id,
             query: query.clone(),
-            session: Arc::clone(&session),
+            session: Arc::downgrade(&session),
             sql: "SELECT 1".into(),
             max_output_rows: 1,
             max_output_bytes: 1024,
@@ -4374,13 +4387,18 @@ fn query_arrow_inner(
 /// atomically. On conflict, `commit` throws a `ConflictError`.
 #[napi]
 pub struct Transaction {
-    db: Arc<CoreDatabase>,
+    db: std::sync::Weak<CoreDatabase>,
     state: Arc<parking_lot::Mutex<NodeTransactionState>>,
 }
 
 impl Transaction {
     fn core(&self) -> napi::Result<Arc<CoreDatabase>> {
-        Ok(Arc::clone(&self.db))
+        self.db.upgrade().ok_or_else(|| {
+            napi::Error::new(
+                napi::Status::GenericFailure,
+                format!("{CORE_DATABASE_CLOSED_CODE}: database is closed"),
+            )
+        })
     }
 
     fn active_state(&self) -> napi::Result<parking_lot::MutexGuard<'_, NodeTransactionState>> {
@@ -4551,7 +4569,7 @@ impl Transaction {
     pub fn new(db: &Database) -> napi::Result<Self> {
         let database = db.core()?;
         Ok(Self {
-            db: database,
+            db: Arc::downgrade(&database),
             state: Arc::new(parking_lot::Mutex::new(NodeTransactionState::default())),
         })
     }
@@ -4764,7 +4782,7 @@ impl Transaction {
         self.core()?.table(&name).map_err(to_napi)?;
         let database = self.core()?;
         Ok(TxnTable {
-            db: database,
+            db: Arc::downgrade(&database),
             state: Arc::clone(&self.state),
             table: name,
         })
@@ -4776,14 +4794,19 @@ impl Transaction {
 /// parent's `commit`/`rollback` still apply.
 #[napi]
 pub struct TxnTable {
-    db: Arc<CoreDatabase>,
+    db: std::sync::Weak<CoreDatabase>,
     state: Arc<parking_lot::Mutex<NodeTransactionState>>,
     table: String,
 }
 
 impl TxnTable {
     fn core(&self) -> napi::Result<Arc<CoreDatabase>> {
-        Ok(Arc::clone(&self.db))
+        self.db.upgrade().ok_or_else(|| {
+            napi::Error::new(
+                napi::Status::GenericFailure,
+                format!("{CORE_DATABASE_CLOSED_CODE}: database is closed"),
+            )
+        })
     }
 
     fn active_state(&self) -> napi::Result<parking_lot::MutexGuard<'_, NodeTransactionState>> {
@@ -5136,7 +5159,7 @@ impl TypedColumn {
 /// flush** — the contract is the opposite of `put()`.
 #[napi]
 pub struct WriteBuffer {
-    db: Arc<CoreDatabase>,
+    db: std::sync::Weak<CoreDatabase>,
     table_name: String,
     buffer: Vec<Vec<(u16, Value)>>,
     threshold: usize,
@@ -5144,7 +5167,12 @@ pub struct WriteBuffer {
 
 impl WriteBuffer {
     fn core(&self) -> napi::Result<Arc<CoreDatabase>> {
-        Ok(Arc::clone(&self.db))
+        self.db.upgrade().ok_or_else(|| {
+            napi::Error::new(
+                napi::Status::GenericFailure,
+                format!("{CORE_DATABASE_CLOSED_CODE}: database is closed"),
+            )
+        })
     }
 }
 
