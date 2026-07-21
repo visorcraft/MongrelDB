@@ -990,7 +990,10 @@ impl ScoredFunction {
                                 .collect::<Vec<_>>(),
                         )) as ArrayRef);
                     }
-                    AnnQuantization::Dense => {
+                    // Dense and Product both report an f32 distance (cosine for
+                    // Dense, ADC for Product). Product is gated behind
+                    // validate_options until its backend lands.
+                    AnnQuantization::Dense | AnnQuantization::Product { .. } => {
                         arrays.push(Arc::new(Float32Array::from(
                             rows.iter()
                                 .map(|row| match scores[&row.row_id].1 {
@@ -1393,6 +1396,10 @@ fn ann_score_field(quantization: AnnQuantization) -> Field {
     match quantization {
         AnnQuantization::BinarySign => Field::new("ann_distance", DataType::UInt32, false),
         AnnQuantization::Dense => Field::new("ann_cosine_distance", DataType::Float32, false),
+        // Product quantization reports an ADC (asymmetric distance computation)
+        // distance as f32. Field is forward-ready; PQ is gated behind
+        // validate_options until the backend lands.
+        AnnQuantization::Product { .. } => Field::new("ann_distance", DataType::Float32, false),
     }
 }
 
@@ -1401,6 +1408,7 @@ fn exact_ann_candidate_field(quantization: AnnQuantization) -> Field {
         // Binary exact path keeps the historical candidate column name.
         AnnQuantization::BinarySign => Field::new("hamming_distance", DataType::UInt32, false),
         AnnQuantization::Dense => Field::new("ann_cosine_distance", DataType::Float32, false),
+        AnnQuantization::Product { .. } => Field::new("ann_distance", DataType::Float32, false),
     }
 }
 
@@ -1447,6 +1455,29 @@ fn append_ann_score_column(
                 })
                 .collect::<DFResult<Vec<_>>>()?;
             fields.push(Field::new("ann_cosine_distance", DataType::Float32, false));
+            arrays.push(Arc::new(Float32Array::from(values)));
+            Ok(())
+        }
+        // Product quantization reports an f32 ADC distance. Gated behind
+        // validate_options until the PQ backend lands; the field shape is
+        // forward-ready.
+        AnnQuantization::Product { .. } => {
+            let values = rows
+                .iter()
+                .map(|row| match scores[&row.row_id].1 {
+                    RetrieverScore::AnnCosineDistance(score) => {
+                        score.is_finite().then_some(score).ok_or_else(|| {
+                            DataFusionError::Execution(
+                                "ann_distance exceeds finite f32 range".into(),
+                            )
+                        })
+                    }
+                    _ => Err(DataFusionError::Execution(
+                        "non-ADC score for Product ANN index".into(),
+                    )),
+                })
+                .collect::<DFResult<Vec<_>>>()?;
+            fields.push(Field::new("ann_distance", DataType::Float32, false));
             arrays.push(Arc::new(Float32Array::from(values)));
             Ok(())
         }

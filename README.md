@@ -39,7 +39,7 @@ Native conditions compose as strict intersections:
 | **Bitmap** | Roaring bitmap | Equality on low-cardinality columns |
 | **PGM** | Learned (shrinking-cone, ε-bounded) | Range queries |
 | **FM-index** | BWT + wavelet tree | Substring containment |
-| **ANN** | HNSW: BinarySign (Hamming) or Dense (cosine distance) | Approximate nearest neighbor candidates |
+| **ANN** | HNSW / DiskANN / IVF × BinarySign / Dense / Product quantization | Approximate nearest neighbor candidates |
 | **Sparse** | Inverted token lists | SPLADE-style learned-sparse retrieval (top-k by sparse dot product) |
 | **MinHash** | LSH set-similarity | AI dedup/join primitives |
 
@@ -106,23 +106,35 @@ Scored SQL uses the same controls through `MONGRELDB_SQL_AI_TIMEOUT_MS`,
 `MONGRELDB_SQL_AI_MAX_CONCURRENT`.
 
 Index options preserve existing defaults when omitted. `CREATE INDEX ... WITH
-(...)` and Kit schema definitions can tune ANN `m`, `ef_construction`,
-`ef_search`, and `quantization` (`binary_sign` default, or `dense`); MinHash
-`permutations` and `bands`; and learned-range `epsilon`.
+(...)` and Kit schema definitions can tune ANN `algorithm`, `quantization`,
+`m`, `ef_construction`, `ef_search`; DiskANN `diskann_r` / `diskann_l` /
+`beam_width` / `diskann_alpha`; IVF `nlist` / `nprobe`; product-quantization
+`num_subvectors` / `bits_per_subvector` / `pq_training_samples` / `pq_seed` /
+`pq_rerank_factor`; MinHash `permutations` and `bands`; and learned-range
+`epsilon`.
 
-ANN modes:
+The ANN algorithm and quantization are chosen independently:
 
-- **BinarySign** stores 1-bit sign vectors and reports Hamming distance
-  (`ann_distance: UInt32`).
-- **Dense** stores full finite `f32` vectors and reports cosine distance
-  `1 - cosine_similarity` (`ann_cosine_distance: Float32`). Dense uses more
-  memory and checkpoint space than BinarySign.
+- **Algorithms** (`algorithm = 'hnsw'` default, `'diskann'`, `'ivf'`) select
+  the graph/structure search walks.
+- **Quantizations** (`quantization = 'binary_sign'` default, `'dense'`,
+  `'product'`) select how vectors are represented:
+  - **BinarySign** stores 1-bit sign vectors and reports Hamming distance
+    (`ann_distance: UInt32`).
+  - **Dense** stores full finite `f32` vectors and reports cosine distance
+    `1 - cosine_similarity` (`ann_cosine_distance: Float32`).
+  - **Product** stores 8-bit PQ codes per subvector against a trained codebook
+    and reports ADC distance (`ann_distance: Float32`); optional exact rerank
+    over reconstructed approximations.
 
-Both modes use HNSW and are approximate unless an exact rerank is requested.
-Online `Database::create_index` / `replace_index` / `drop_index` (and SQL
-CREATE/DROP INDEX) publish a new index generation without copying the table;
-publication takes a short commit barrier. Product quantization remains
-unimplemented.
+Supported combinations: `hnsw × {binary_sign, dense, product}`,
+`diskann × dense`, `ivf × dense`. See `docs/06-indexes.md` for details.
+
+All modes are approximate unless an exact rerank is requested. Online
+`Database::create_index` / `replace_index` / `drop_index` (and SQL CREATE/DROP
+INDEX) publish a new index generation without copying the table; publication
+takes a short commit barrier. An algorithm or quantization change never
+silently rewrites an existing index.
 
 All language clients can declare `bitmap`, `fm_index`, `ann`,
 `learned_range`, `minhash`, and `sparse` indexes through `/kit/create_table`,
@@ -390,14 +402,14 @@ Prebuilt `libmongreldb` (core engine), `libmongreldb_kit` (Kit layer), and `libm
 
 | Platform | C/C++ archives | JVM JAR |
 |---|---|---|
-| Linux x64 (glibc) | `mongreldb-native-linux-x64-gnu.tar.gz` + `mongreldb-kit-native-linux-x64-gnu.tar.gz` | `mongreldb-jni-0.62.0-linux-x64.jar` |
-| Linux x64 (musl) | `mongreldb-native-linux-x64-musl.tar.gz` + `mongreldb-kit-native-linux-x64-musl.tar.gz` | `mongreldb-jni-0.62.0-linux-x64-musl.jar` |
-| Linux arm64 (glibc) | `mongreldb-native-linux-arm64-gnu.tar.gz` + `mongreldb-kit-native-linux-arm64-gnu.tar.gz` | `mongreldb-jni-0.62.0-linux-arm64.jar` |
-| macOS arm64 | `mongreldb-native-darwin-arm64.tar.gz` + `mongreldb-kit-native-darwin-arm64.tar.gz` | `mongreldb-jni-0.62.0-darwin-arm64.jar` |
-| macOS x64 | `mongreldb-native-darwin-x64.tar.gz` + `mongreldb-kit-native-darwin-x64.tar.gz` | `mongreldb-jni-0.62.0-darwin-x64.jar` |
-| Windows x64 | `mongreldb-native-windows-x64.zip` + `mongreldb-kit-native-windows-x64.zip` | `mongreldb-jni-0.62.0-windows-x64.jar` |
+| Linux x64 (glibc) | `mongreldb-native-linux-x64-gnu.tar.gz` + `mongreldb-kit-native-linux-x64-gnu.tar.gz` | `mongreldb-jni-0.63.0-linux-x64.jar` |
+| Linux x64 (musl) | `mongreldb-native-linux-x64-musl.tar.gz` + `mongreldb-kit-native-linux-x64-musl.tar.gz` | `mongreldb-jni-0.63.0-linux-x64-musl.jar` |
+| Linux arm64 (glibc) | `mongreldb-native-linux-arm64-gnu.tar.gz` + `mongreldb-kit-native-linux-arm64-gnu.tar.gz` | `mongreldb-jni-0.63.0-linux-arm64.jar` |
+| macOS arm64 | `mongreldb-native-darwin-arm64.tar.gz` + `mongreldb-kit-native-darwin-arm64.tar.gz` | `mongreldb-jni-0.63.0-darwin-arm64.jar` |
+| macOS x64 | `mongreldb-native-darwin-x64.tar.gz` + `mongreldb-kit-native-darwin-x64.tar.gz` | `mongreldb-jni-0.63.0-darwin-x64.jar` |
+| Windows x64 | `mongreldb-native-windows-x64.zip` + `mongreldb-kit-native-windows-x64.zip` | `mongreldb-jni-0.63.0-windows-x64.jar` |
 
-A fat JAR (`mongreldb-jni-0.62.0.jar`) with all platforms bundled is also published. Each C/C++ archive contains `lib/` (shared + static libraries) and `include/` (the C header). Download from the [releases page](https://github.com/visorcraft/MongrelDB/releases). See the C, C++, .NET, Java, Kotlin, and Scala client READMEs for linking instructions.
+A fat JAR (`mongreldb-jni-0.63.0.jar`) with all platforms bundled is also published. Each C/C++ archive contains `lib/` (shared + static libraries) and `include/` (the C header). Download from the [releases page](https://github.com/visorcraft/MongrelDB/releases). See the C, C++, .NET, Java, Kotlin, and Scala client READMEs for linking instructions.
 
 ## Node.js addon
 

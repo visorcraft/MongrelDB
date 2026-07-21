@@ -483,6 +483,7 @@ async fn native_runtime_serves_all_services_over_tls_http2() {
                         ef_construction: 96,
                         ef_search: 48,
                         quantization: AnnQuantization::Dense,
+                        ..AnnOptions::default()
                     }),
                     ..IndexOptions::default()
                 },

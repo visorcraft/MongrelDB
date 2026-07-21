@@ -128,7 +128,17 @@ typedef enum {
 typedef enum {
     MDB_ANN_QUANTIZATION_BINARY_SIGN = 0,
     MDB_ANN_QUANTIZATION_DENSE       = 1,
+    /* Phase 2: product quantization. Reads the pq_* fields of
+     * mongreldb_index_options_v2. */
+    MDB_ANN_QUANTIZATION_PRODUCT     = 2,
 } mongreldb_ann_quantization;
+
+/* Phase 2: ANN graph/structure algorithm. Orthogonal to quantization. */
+typedef enum {
+    MDB_ANN_ALGORITHM_HNSW    = 0,
+    MDB_ANN_ALGORITHM_DISKANN = 1,
+    MDB_ANN_ALGORITHM_IVF     = 2,
+} mongreldb_ann_algorithm;
 
 /* ── FK action ──────────────────────────────────────────────────────────── */
 
@@ -263,7 +273,11 @@ typedef struct {
 } mongreldb_index_def;
 
 /* Version 1 secondary-index options. Set struct_size and version. Numeric
- * zero values select engine defaults. predicate may be NULL. */
+ * zero values select engine defaults. predicate may be NULL.
+ *
+ * Legacy HNSW-only ABI: always selects HNSW and BinarySign/Dense. DiskANN/IVF
+ * algorithms and product quantization require mongreldb_index_options_v2 via
+ * mongreldb_schema_add_index_v3. */
 typedef struct {
     size_t struct_size;
     uint32_t version;
@@ -276,6 +290,43 @@ typedef struct {
     size_t minhash_bands;
     size_t learned_range_epsilon;
 } mongreldb_index_options_v1;
+
+/* Version 2 secondary-index options (Phase 2): swappable ANN algorithms
+ * (HNSW / DiskANN / IVF) and product quantization. Set struct_size and
+ * version = 2. Numeric zero values select engine defaults.
+ *
+ * - ann_algorithm selects the graph algorithm. DiskANN reads diskann_*,
+ *   IVF reads ivf_*.
+ * - ann_quantization == MDB_ANN_QUANTIZATION_PRODUCT reads the pq_* fields.
+ *
+ * Use through mongreldb_schema_add_index_v3. */
+typedef struct {
+    size_t struct_size;
+    uint32_t version;
+    const char *predicate;
+    size_t ann_m;
+    size_t ann_ef_construction;
+    size_t ann_ef_search;
+    int32_t ann_quantization;
+    size_t minhash_permutations;
+    size_t minhash_bands;
+    size_t learned_range_epsilon;
+    int32_t ann_algorithm;
+    /* DiskANN (read when ann_algorithm == MDB_ANN_ALGORITHM_DISKANN). */
+    size_t diskann_r;
+    size_t diskann_l;
+    size_t diskann_beam_width;
+    uint32_t diskann_alpha; /* alpha x 100 (120 = 1.2). 0 = default. */
+    /* IVF (read when ann_algorithm == MDB_ANN_ALGORITHM_IVF). */
+    size_t ivf_nlist;
+    size_t ivf_nprobe;
+    /* Product quantization (read when ann_quantization == ..._PRODUCT). */
+    uint16_t pq_num_subvectors;
+    uint8_t pq_bits; /* 0 = default (8). Only 8 is supported. */
+    size_t pq_training_samples;
+    uint64_t pq_seed;
+    size_t pq_rerank_factor;
+} mongreldb_index_options_v2;
 
 typedef struct {
     uint16_t id;
@@ -730,6 +781,10 @@ int32_t mongreldb_schema_add_index(
 int32_t mongreldb_schema_add_index_v2(
     mongreldb_schema_builder_t *builder, const mongreldb_index_def *idx,
     const mongreldb_index_options_v1 *options);
+/* Phase 2: swappable ANN (HNSW / DiskANN / IVF) + product quantization. */
+int32_t mongreldb_schema_add_index_v3(
+    mongreldb_schema_builder_t *builder, const mongreldb_index_def *idx,
+    const mongreldb_index_options_v2 *options);
 int32_t mongreldb_schema_set_embedding_source_json(
     mongreldb_schema_builder_t *builder, uint16_t column_id,
     const char *source_json);

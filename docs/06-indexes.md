@@ -122,49 +122,105 @@ IndexDef { name: "content_fm".into(), column_id: 4, kind: IndexKind::FmIndex }
 Condition::FmContains { column_id: 4, pattern: b"database".to_vec() }
 ```
 
-### HNSW - Vector Similarity Search
+### ANN - Vector Similarity Search
 
 **What it does:** Generates approximate nearest-neighbor candidates from an
-embedding column. Two quantizations are supported:
+embedding column. The algorithm (how search walks the index) and the
+quantization (how vectors are represented) are chosen independently.
+
+**Algorithms** (`algorithm = '…'` in `WITH (...)`):
+
+| Algorithm | Structure | Best for |
+|---|---|---|
+| `hnsw` (default) | Multi-layer Hierarchical Navigable Small World graph | General-purpose, low-latency, in-memory |
+| `diskann` | Single-layer Vamana robust-pruned graph (bounded degree R) | Large indexes, diverse-neighbor quality |
+| `ivf` | Inverted file: k-means centroids + per-cell lists (probe nprobe) | Large indexes, tunable recall/speed tradeoff |
+
+**Quantizations** (`quantization = '…'` in `WITH (...)`):
 
 | Quantization | Stored representation | Distance (lower is better) | SQL/Arrow score field |
 |---|---|---|---|
 | `binary_sign` (default) | 1 bit per dimension | Hamming | `ann_distance: UInt32` |
 | `dense` | full finite `f32` vectors | cosine distance `1 - cosine_similarity` | `ann_cosine_distance: Float32` |
+| `product` | 8-bit PQ codes per subvector (trained codebook) | ADC (asymmetric); optional exact rerank | `ann_distance: Float32` |
+
+**Supported combinations:** `hnsw × {binary_sign, dense, product}`,
+`diskann × dense`, `ivf × dense`. Other combinations are rejected at create
+time (fail-closed) until their backends are wired.
 
 Exact cosine, dot-product, or L2 reranking over stored full-precision vectors
-is available as a bounded second stage for either mode. Product quantization is
-not implemented.
+is available as a bounded second stage for any mode. Product quantization
+compresses vectors ~96× (a 768-dim f32 vector with 32 subvectors becomes 32
+bytes) at the cost of approximate ADC distance; enable `pq_rerank_factor` to
+rerank the top candidates exactly.
 
-**How it works:** Builds a multi-layer HNSW graph where similar vectors are
-connected by edges. Search walks the graph toward the query and returns a
-bounded candidate set. Equal distances break ties by `RowId`. Dense indexes
-use substantially more memory and checkpoint space than BinarySign.
+**How it works:**
+- **HNSW** builds a multi-layer graph where similar vectors are connected by
+  edges; search walks toward the query.
+- **DiskANN** builds a single flat graph with robust-pruned R-degree neighbors
+  and a fixed entry point; search is a greedy beam walk.
+- **IVF** trains k-means centroids, assigns each vector to its nearest
+  centroid's inverted list, and probes the nprobe nearest lists at query time.
+- **Product quantization** trains per-subvector codebooks and encodes each
+  vector to one byte per subvector; search computes an ADC lookup table from
+  the query and sums table lookups per candidate.
+
+Equal distances break ties by `RowId` in every mode. Dense and product indexes
+use more memory and checkpoint space than BinarySign; product recovers most of
+that gap via code compression.
 
 **Online DDL:** `Database::create_index`, `replace_index`, and `drop_index`
 (and SQL `CREATE INDEX` / `DROP INDEX`) build or remove a secondary index
 generation without rewriting the table. Replacement (for example BinarySign →
-Dense) is online except for a short final publication barrier. Prefer
-`replace_index` over drop-then-create: schema validation allows only one ANN
-representation per column.
+Dense, or HNSW → DiskANN) is online except for a short final publication
+barrier. Prefer `replace_index` over drop-then-create: schema validation allows
+only one ANN representation per column. An algorithm or quantization change
+never silently rewrites an existing index — it builds a hidden generation and
+publishes atomically.
 
 **When to use:** Embedding columns for AI/ML applications — semantic search,
 recommendation, deduplication, clustering.
 
 **Example:**
 ```rust
-// HNSW is built automatically from Value::Embedding data during put/bulk_load.
-// Optional: create or replace with explicit quantization.
-// Database::replace_index("docs", "idx_embed", IndexDef { ... quantization: Dense })?;
+// ANN is built automatically from Value::Embedding data during put/bulk_load.
+// Optional: create or replace with explicit algorithm + quantization.
+// Database::replace_index("docs", "idx_embed", IndexDef {
+//     options: IndexOptions { ann: Some(AnnOptions {
+//         algorithm: AnnAlgorithm::DiskAnn,
+//         quantization: AnnQuantization::Dense,
+//         diskann: Some(DiskAnnOptions { r: 64, l: 128, beam_width: 8, alpha: 120 }),
+//         ..AnnOptions::default()
+//     }), ..IndexOptions::default() },
+//     ..Default::default()
+// })?;
 
 // Query
 Condition::Ann { column_id: 6, query: vec![0.1, 0.45, 0.78, ...], k: 10 }
 ```
 
 ```sql
+-- HNSW + Dense (default algorithm)
 CREATE INDEX idx_prompts_embed_ann
 ON prompts USING ann (embedding)
 WITH (quantization = 'dense', m = 16, ef_construction = 64, ef_search = 64);
+
+-- DiskANN + Dense
+CREATE INDEX idx_prompts_embed_diskann
+ON prompts USING ann (embedding)
+WITH (algorithm = 'diskann', quantization = 'dense',
+      diskann_r = 64, diskann_l = 128, beam_width = 8, diskann_alpha = 120);
+
+-- IVF + Dense
+CREATE INDEX idx_prompts_embed_ivf
+ON prompts USING ann (embedding)
+WITH (algorithm = 'ivf', quantization = 'dense', nlist = 256, nprobe = 8);
+
+-- HNSW + Product quantization
+CREATE INDEX idx_prompts_embed_pq
+ON prompts USING ann (embedding)
+WITH (quantization = 'product', num_subvectors = 32, bits_per_subvector = 8,
+      pq_training_samples = 256000, pq_seed = 42, pq_rerank_factor = 5);
 ```
 
 ### PMA Mutable-Run Tier

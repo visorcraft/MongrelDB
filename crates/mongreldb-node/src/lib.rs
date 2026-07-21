@@ -390,6 +390,59 @@ pub enum IndexKindSpec {
 pub enum AnnQuantizationSpec {
     BinarySign,
     Dense,
+    /// Product quantization (Phase 2 surface; the PQ backend is gated until
+    /// implemented). When selected, `product_num_subvectors` is required.
+    Product,
+}
+
+/// ANN graph/structure algorithm. Orthogonal to [`AnnQuantizationSpec`].
+#[napi]
+pub enum AnnAlgorithmSpec {
+    /// Hierarchical Navigable Small World (default).
+    Hnsw,
+    /// DiskANN / Vamana single-layer robust-pruned graph.
+    DiskAnn,
+    /// Inverted file index (k-means centroids + inverted lists).
+    Ivf,
+}
+
+/// DiskANN (Vamana) build parameters. Used when `ann_algorithm == DiskAnn`.
+#[napi(object)]
+pub struct DiskAnnOptionsSpec {
+    /// Maximum graph degree R. Zero selects the default (64).
+    pub r: Option<u32>,
+    /// Search-list size L during build. Zero selects the default (128).
+    pub l: Option<u32>,
+    /// Query-time beam width. Zero selects the default (8).
+    pub beam_width: Option<u32>,
+    /// alpha × 100 (120 = 1.2). Zero selects the default.
+    pub alpha: Option<u32>,
+}
+
+/// IVF build and query parameters. Used when `ann_algorithm == Ivf`.
+#[napi(object)]
+pub struct IvfOptionsSpec {
+    /// Number of inverted lists (k-means centroids). Zero selects the default (256).
+    pub nlist: Option<u32>,
+    /// Number of lists to probe at query time. Zero selects the default (8).
+    pub nprobe: Option<u32>,
+}
+
+/// Product-quantizer training parameters. Used when
+/// `ann_quantization == Product`.
+#[napi(object)]
+pub struct ProductQuantizerOptionsSpec {
+    /// Number of subvectors. Required; must evenly divide the column dimension.
+    pub num_subvectors: u16,
+    /// Bits per subvector code. Defaults to 8 (the only supported value).
+    pub bits: Option<u8>,
+    /// Cap on training samples. Zero selects the default.
+    pub training_samples: Option<u32>,
+    /// Deterministic training seed. Zero selects the default.
+    pub seed: Option<BigInt>,
+    /// Exact-rerank factor (top k × factor candidates reranked against Dense).
+    /// Zero selects the default (5).
+    pub rerank_factor: Option<u32>,
 }
 
 #[napi(object)]
@@ -431,6 +484,15 @@ pub struct IndexSpec {
     pub kind: IndexKindSpec,
     /// ANN representation. Defaults to BinarySign; ignored for other kinds.
     pub ann_quantization: Option<AnnQuantizationSpec>,
+    /// ANN graph/structure algorithm (Phase 2). Defaults to HNSW; ignored for
+    /// other kinds. Orthogonal to `ann_quantization`.
+    pub ann_algorithm: Option<AnnAlgorithmSpec>,
+    /// DiskANN tuning; read when `ann_algorithm == DiskAnn`.
+    pub diskann: Option<DiskAnnOptionsSpec>,
+    /// IVF tuning; read when `ann_algorithm == Ivf`.
+    pub ivf: Option<IvfOptionsSpec>,
+    /// Product-quantizer training; read when `ann_quantization == Product`.
+    pub product: Option<ProductQuantizerOptionsSpec>,
     pub predicate: Option<String>,
     pub ann_m: Option<u32>,
     pub ann_ef_construction: Option<u32>,
@@ -755,7 +817,66 @@ fn index_definition(spec: IndexSpec) -> IndexDef {
                         mongreldb_core::schema::AnnQuantization::BinarySign
                     }
                     AnnQuantizationSpec::Dense => mongreldb_core::schema::AnnQuantization::Dense,
+                    AnnQuantizationSpec::Product => {
+                        // num_subvectors is required for Product; the PQ
+                        // backend itself is gated behind validate_options
+                        // until Phase 3, but the option shape is wired. A
+                        // missing `product` spec leaves num_subvectors = 0,
+                        // which validate_options rejects with a clear message.
+                        let num_subvectors =
+                            spec.product.as_ref().map(|p| p.num_subvectors).unwrap_or(0);
+                        let bits = spec.product.as_ref().and_then(|p| p.bits).unwrap_or(8);
+                        mongreldb_core::schema::AnnQuantization::Product {
+                            num_subvectors,
+                            bits,
+                        }
+                    }
                 },
+                algorithm: match spec.ann_algorithm.unwrap_or(AnnAlgorithmSpec::Hnsw) {
+                    AnnAlgorithmSpec::Hnsw => mongreldb_core::schema::AnnAlgorithm::Hnsw,
+                    AnnAlgorithmSpec::DiskAnn => mongreldb_core::schema::AnnAlgorithm::DiskAnn,
+                    AnnAlgorithmSpec::Ivf => mongreldb_core::schema::AnnAlgorithm::Ivf,
+                },
+                diskann: spec.diskann.as_ref().map(|options| {
+                    let defaults = mongreldb_core::schema::DiskAnnOptions::default();
+                    mongreldb_core::schema::DiskAnnOptions {
+                        r: options.r.map(|v| v as usize).unwrap_or(defaults.r),
+                        l: options.l.map(|v| v as usize).unwrap_or(defaults.l),
+                        beam_width: options
+                            .beam_width
+                            .map(|v| v as usize)
+                            .unwrap_or(defaults.beam_width),
+                        alpha: options.alpha.unwrap_or(defaults.alpha),
+                    }
+                }),
+                ivf: spec.ivf.as_ref().map(|options| {
+                    let defaults = mongreldb_core::schema::IvfOptions::default();
+                    mongreldb_core::schema::IvfOptions {
+                        nlist: options.nlist.map(|v| v as usize).unwrap_or(defaults.nlist),
+                        nprobe: options
+                            .nprobe
+                            .map(|v| v as usize)
+                            .unwrap_or(defaults.nprobe),
+                    }
+                }),
+                product: spec.product.as_ref().map(|options| {
+                    let defaults = mongreldb_core::schema::ProductQuantizerOptions::default();
+                    mongreldb_core::schema::ProductQuantizerOptions {
+                        training_samples: options
+                            .training_samples
+                            .map(|v| v as usize)
+                            .unwrap_or(defaults.training_samples),
+                        seed: options
+                            .seed
+                            .as_ref()
+                            .map(|v| v.get_u64().1)
+                            .unwrap_or(defaults.seed),
+                        rerank_factor: options
+                            .rerank_factor
+                            .map(|v| v as usize)
+                            .unwrap_or(defaults.rerank_factor),
+                    }
+                }),
                 m: spec
                     .ann_m
                     .map(|value| value as usize)

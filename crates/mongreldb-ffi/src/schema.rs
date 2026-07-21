@@ -15,8 +15,9 @@ use crate::error::{clear, set_error_msg, ErrorCode};
 use mongreldb_core::constraint::{FkAction, ForeignKey, TableConstraints, UniqueConstraint};
 use mongreldb_core::embedding::EmbeddingSource;
 use mongreldb_core::schema::{
-    AnnOptions, AnnQuantization, ColumnDef, ColumnFlags, IndexDef, IndexKind, IndexOptions,
-    LearnedRangeOptions, MinHashOptions, Schema, TypeId,
+    AnnAlgorithm, AnnOptions, AnnQuantization, ColumnDef, ColumnFlags, DiskAnnOptions, IndexDef,
+    IndexKind, IndexOptions, IvfOptions, LearnedRangeOptions, MinHashOptions,
+    ProductQuantizerOptions, Schema, TypeId,
 };
 use std::ffi::CString;
 use std::os::raw::{c_char, c_void};
@@ -176,6 +177,12 @@ pub struct mongreldb_index_def {
 
 /// Versioned secondary-index options. Zero-valued numeric fields select the
 /// engine default. `predicate` may be NULL for a full index.
+///
+/// This is the legacy HNSW-only ABI. It always selects the HNSW algorithm and
+/// the BinarySign/Dense quantizations. DiskANN/IVF algorithms and product
+/// quantization require [`mongreldb_index_options_v2`] via
+/// [`mongreldb_schema_add_index_v3`]. Existing callers using
+/// [`mongreldb_schema_add_index_v2`] are unaffected.
 #[repr(C)]
 pub struct mongreldb_index_options_v1 {
     pub struct_size: usize,
@@ -189,6 +196,47 @@ pub struct mongreldb_index_options_v1 {
     pub minhash_permutations: usize,
     pub minhash_bands: usize,
     pub learned_range_epsilon: usize,
+}
+
+/// Swappable-ANN index options (Phase 2). Extends v1 with the algorithm
+/// selector and per-algorithm/quantization tuning fields. Zero-valued numeric
+/// fields select the engine default. A non-default `ann_algorithm` selects
+/// DiskANN or IVF; the corresponding `diskann_*`/`ivf_*` fields are then read,
+/// and `ann_quantization == 2` (product) reads the `pq_*` fields.
+///
+/// Use through [`mongreldb_schema_add_index_v3`].
+#[repr(C)]
+pub struct mongreldb_index_options_v2 {
+    pub struct_size: usize,
+    pub version: u32,
+    pub predicate: *const c_char,
+    pub ann_m: usize,
+    pub ann_ef_construction: usize,
+    pub ann_ef_search: usize,
+    /// 0 = BinarySign, 1 = Dense cosine, 2 = product (reads `pq_*`).
+    pub ann_quantization: i32,
+    pub minhash_permutations: usize,
+    pub minhash_bands: usize,
+    pub learned_range_epsilon: usize,
+    /// 0 = HNSW (default), 1 = DiskANN, 2 = IVF.
+    pub ann_algorithm: i32,
+    // DiskANN (read when ann_algorithm == 1).
+    pub diskann_r: usize,
+    pub diskann_l: usize,
+    pub diskann_beam_width: usize,
+    /// alpha × 100 (120 = 1.2). 0 selects the default.
+    pub diskann_alpha: u32,
+    // IVF (read when ann_algorithm == 2).
+    pub ivf_nlist: usize,
+    pub ivf_nprobe: usize,
+    // Product quantization (read when ann_quantization == 2).
+    pub pq_num_subvectors: u16,
+    /// Bits per subvector code. 0 selects the default (8). Only 8 is supported.
+    pub pq_bits: u8,
+    pub pq_training_samples: usize,
+    pub pq_seed: u64,
+    /// Exact-rerank factor. 0 selects the default.
+    pub pq_rerank_factor: usize,
 }
 
 /// A multi-column uniqueness constraint.
@@ -304,6 +352,115 @@ fn ann_quantization_from_c(value: i32) -> Result<AnnQuantization, ErrorCode> {
             format!("invalid ANN quantization {value}"),
         )),
     }
+}
+
+/// v2 quantization decoder including product quantization (code 2). The PQ
+/// representation fields are read from the v2 options struct.
+fn ann_quantization_v2_from_c(
+    value: i32,
+    options: &mongreldb_index_options_v2,
+) -> Result<AnnQuantization, ErrorCode> {
+    match value {
+        0 => Ok(AnnQuantization::BinarySign),
+        1 => Ok(AnnQuantization::Dense),
+        2 => Ok(AnnQuantization::Product {
+            num_subvectors: if options.pq_num_subvectors == 0 {
+                return Err(set_error_msg(
+                    ErrorCode::InvalidArgument,
+                    "product quantization requires pq_num_subvectors > 0",
+                ));
+            } else {
+                options.pq_num_subvectors
+            },
+            bits: if options.pq_bits == 0 {
+                8
+            } else {
+                options.pq_bits
+            },
+        }),
+        _ => Err(set_error_msg(
+            ErrorCode::InvalidArgument,
+            format!("invalid ANN quantization {value}"),
+        )),
+    }
+}
+
+fn ann_algorithm_from_c(value: i32) -> Result<AnnAlgorithm, ErrorCode> {
+    match value {
+        0 => Ok(AnnAlgorithm::Hnsw),
+        1 => Ok(AnnAlgorithm::DiskAnn),
+        2 => Ok(AnnAlgorithm::Ivf),
+        _ => Err(set_error_msg(
+            ErrorCode::InvalidArgument,
+            format!("invalid ANN algorithm {value}"),
+        )),
+    }
+}
+
+/// Read DiskAnn options from v2, applying defaults for zero fields.
+fn diskann_options_from_c(options: &mongreldb_index_options_v2) -> Option<DiskAnnOptions> {
+    let defaults = DiskAnnOptions::default();
+    Some(DiskAnnOptions {
+        r: if options.diskann_r == 0 {
+            defaults.r
+        } else {
+            options.diskann_r
+        },
+        l: if options.diskann_l == 0 {
+            defaults.l
+        } else {
+            options.diskann_l
+        },
+        beam_width: if options.diskann_beam_width == 0 {
+            defaults.beam_width
+        } else {
+            options.diskann_beam_width
+        },
+        alpha: if options.diskann_alpha == 0 {
+            defaults.alpha
+        } else {
+            options.diskann_alpha
+        },
+    })
+}
+
+/// Read IVF options from v2, applying defaults for zero fields.
+fn ivf_options_from_c(options: &mongreldb_index_options_v2) -> Option<IvfOptions> {
+    let defaults = IvfOptions::default();
+    Some(IvfOptions {
+        nlist: if options.ivf_nlist == 0 {
+            defaults.nlist
+        } else {
+            options.ivf_nlist
+        },
+        nprobe: if options.ivf_nprobe == 0 {
+            defaults.nprobe
+        } else {
+            options.ivf_nprobe
+        },
+    })
+}
+
+/// Read product-quantizer training options from v2, applying defaults.
+fn product_options_from_c(options: &mongreldb_index_options_v2) -> Option<ProductQuantizerOptions> {
+    let defaults = ProductQuantizerOptions::default();
+    Some(ProductQuantizerOptions {
+        training_samples: if options.pq_training_samples == 0 {
+            defaults.training_samples
+        } else {
+            options.pq_training_samples
+        },
+        seed: if options.pq_seed == 0 {
+            defaults.seed
+        } else {
+            options.pq_seed
+        },
+        rerank_factor: if options.pq_rerank_factor == 0 {
+            defaults.rerank_factor
+        } else {
+            options.pq_rerank_factor
+        },
+    })
 }
 
 fn fk_action_from_c(action: i32) -> Result<FkAction, ErrorCode> {
@@ -474,6 +631,13 @@ impl SchemaBuilder {
                             options.ann_ef_search
                         },
                         quantization: ann_quantization_from_c(options.ann_quantization)?,
+                        // The v1 ABI predates swappable algorithms; it always
+                        // selects HNSW. DiskANN/IVF/PQ tuning is exposed only
+                        // through the v2 ABI (mongreldb_schema_add_index_v3).
+                        algorithm: defaults.algorithm,
+                        diskann: None,
+                        ivf: None,
+                        product: None,
                     });
                 }
                 IndexKind::MinHash => {
@@ -510,6 +674,114 @@ impl SchemaBuilder {
             }
         } else {
             None
+        };
+        let index = IndexDef {
+            name,
+            column_id: i.column_id,
+            kind,
+            predicate,
+            options: index_options,
+        };
+        index.validate_options().map_err(|error| {
+            set_error_msg(
+                ErrorCode::InvalidArgument,
+                format!("invalid index options: {error}"),
+            )
+        })?;
+        self.indexes.push(index);
+        Ok(())
+    }
+
+    /// Append a secondary index with the swappable-ANN v2 options (Phase 2).
+    /// Exposes algorithm selection (HNSW / DiskANN / IVF) and product
+    /// quantization. Other index kinds read the same fields as v1.
+    pub fn add_index_with_options_v2(
+        &mut self,
+        i: &mongreldb_index_def,
+        options: &mongreldb_index_options_v2,
+    ) -> Result<(), ErrorCode> {
+        let name = cstr_to_string_lossy(i.name, "index name")?;
+        let kind = index_kind_from_c(i.kind)?;
+        if options.struct_size != std::mem::size_of::<mongreldb_index_options_v2>()
+            || options.version != 2
+        {
+            return Err(set_error_msg(
+                ErrorCode::InvalidArgument,
+                "invalid mongreldb_index_options_v2 size or version",
+            ));
+        }
+        let mut index_options = IndexOptions::default();
+        match kind {
+            IndexKind::Ann => {
+                let defaults = AnnOptions::default();
+                let algorithm = ann_algorithm_from_c(options.ann_algorithm)?;
+                let quantization = ann_quantization_v2_from_c(options.ann_quantization, options)?;
+                index_options.ann = Some(AnnOptions {
+                    m: if options.ann_m == 0 {
+                        defaults.m
+                    } else {
+                        options.ann_m
+                    },
+                    ef_construction: if options.ann_ef_construction == 0 {
+                        defaults.ef_construction
+                    } else {
+                        options.ann_ef_construction
+                    },
+                    ef_search: if options.ann_ef_search == 0 {
+                        defaults.ef_search
+                    } else {
+                        options.ann_ef_search
+                    },
+                    quantization,
+                    algorithm,
+                    diskann: if algorithm == AnnAlgorithm::DiskAnn {
+                        diskann_options_from_c(options)
+                    } else {
+                        None
+                    },
+                    ivf: if algorithm == AnnAlgorithm::Ivf {
+                        ivf_options_from_c(options)
+                    } else {
+                        None
+                    },
+                    product: if matches!(quantization, AnnQuantization::Product { .. }) {
+                        product_options_from_c(options)
+                    } else {
+                        None
+                    },
+                });
+            }
+            IndexKind::MinHash => {
+                let defaults = MinHashOptions::default();
+                index_options.minhash = Some(MinHashOptions {
+                    permutations: if options.minhash_permutations == 0 {
+                        defaults.permutations
+                    } else {
+                        options.minhash_permutations
+                    },
+                    bands: if options.minhash_bands == 0 {
+                        defaults.bands
+                    } else {
+                        options.minhash_bands
+                    },
+                });
+            }
+            IndexKind::LearnedRange => {
+                let defaults = LearnedRangeOptions::default();
+                index_options.learned_range = Some(LearnedRangeOptions {
+                    epsilon: if options.learned_range_epsilon == 0 {
+                        defaults.epsilon
+                    } else {
+                        options.learned_range_epsilon
+                    },
+                });
+            }
+            IndexKind::Bitmap | IndexKind::FmIndex | IndexKind::Sparse => {}
+        }
+        let predicate = if options.predicate.is_null() {
+            None
+        } else {
+            Some(cstr_to_string_lossy(options.predicate, "index predicate")?)
         };
         let index = IndexDef {
             name,
@@ -713,6 +985,34 @@ pub unsafe extern "C" fn mongreldb_schema_add_index_v2(
             .as_return();
     }
     match builder.add_index_with_options(&*idx, Some(&*options)) {
+        Ok(()) => 0,
+        Err(error) => error.as_return(),
+    }
+}
+
+/// Add an index with the swappable-ANN v2 options (Phase 2): HNSW / DiskANN /
+/// IVF algorithms and product quantization. `options` must point to a valid
+/// [`mongreldb_index_options_v2`] with `struct_size` and `version == 2`.
+///
+/// # Safety
+/// `builder`, `idx`, and `options` must point to valid values. String pointers
+/// must be valid NUL-terminated UTF-8 for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn mongreldb_schema_add_index_v3(
+    builder: mongreldb_schema_builder_t,
+    idx: *const mongreldb_index_def,
+    options: *const mongreldb_index_options_v2,
+) -> i32 {
+    clear();
+    let Some(builder) = as_builder_mut(builder) else {
+        return set_error_msg(ErrorCode::InvalidArgument, "schema builder handle is null")
+            .as_return();
+    };
+    if idx.is_null() || options.is_null() {
+        return set_error_msg(ErrorCode::InvalidArgument, "schema index argument is null")
+            .as_return();
+    }
+    match builder.add_index_with_options_v2(&*idx, &*options) {
         Ok(()) => 0,
         Err(error) => error.as_return(),
     }
@@ -937,7 +1237,149 @@ mod tests {
                 ef_construction: 96,
                 ef_search: 48,
                 quantization: AnnQuantization::Dense,
+                ..AnnOptions::default()
             })
         );
+    }
+
+    #[test]
+    fn v2_index_options_route_algorithm_and_quantization() {
+        let mut builder = SchemaBuilder::new();
+        let column_name = CString::new("embedding").unwrap();
+        builder
+            .add_column(&mongreldb_column_def {
+                id: 1,
+                name: column_name.as_ptr(),
+                ty: mongreldb_type_id::Embedding as i32,
+                flags: 0,
+                embedding_dim: 384,
+                decimal_precision: 0,
+                decimal_scale: 0,
+                enum_variants: StringArray::default(),
+            })
+            .unwrap();
+
+        let index_name = CString::new("embedding_ann").unwrap();
+        builder
+            .add_index_with_options_v2(
+                &mongreldb_index_def {
+                    name: index_name.as_ptr(),
+                    column_id: 1,
+                    kind: mongreldb_index_kind::Ann as i32,
+                },
+                &mongreldb_index_options_v2 {
+                    struct_size: std::mem::size_of::<mongreldb_index_options_v2>(),
+                    version: 2,
+                    predicate: std::ptr::null(),
+                    ann_m: 16,
+                    ann_ef_construction: 64,
+                    ann_ef_search: 64,
+                    ann_quantization: 1, // Dense
+                    minhash_permutations: 0,
+                    minhash_bands: 0,
+                    learned_range_epsilon: 0,
+                    ann_algorithm: 1, // DiskAnn
+                    diskann_r: 128,
+                    diskann_l: 256,
+                    diskann_beam_width: 4,
+                    diskann_alpha: 130,
+                    ivf_nlist: 0,
+                    ivf_nprobe: 0,
+                    pq_num_subvectors: 0,
+                    pq_bits: 0,
+                    pq_training_samples: 0,
+                    pq_seed: 0,
+                    pq_rerank_factor: 0,
+                },
+            )
+            // Phase 4 wired DiskANN+Dense; the v2 decoder routes correctly and
+            // validate_options accepts it. Confirm the field plumbing.
+            .unwrap();
+        let schema = builder.finish();
+        let ann = schema.indexes[0].options.ann.as_ref().unwrap();
+        assert_eq!(ann.algorithm, AnnAlgorithm::DiskAnn);
+        assert_eq!(ann.quantization, AnnQuantization::Dense);
+        let diskann = ann.diskann.as_ref().expect("diskann options");
+        assert_eq!(
+            (diskann.r, diskann.l, diskann.beam_width, diskann.alpha),
+            (128, 256, 4, 130)
+        );
+        // A second run with HNSW + Dense confirms the non-DiskANN field path.
+        let mut builder = SchemaBuilder::new();
+        let column_name = CString::new("embedding").unwrap();
+        builder
+            .add_column(&mongreldb_column_def {
+                id: 1,
+                name: column_name.as_ptr(),
+                ty: mongreldb_type_id::Embedding as i32,
+                flags: 0,
+                embedding_dim: 384,
+                decimal_precision: 0,
+                decimal_scale: 0,
+                enum_variants: StringArray::default(),
+            })
+            .unwrap();
+        let index_name = CString::new("embedding_ann").unwrap();
+        builder
+            .add_index_with_options_v2(
+                &mongreldb_index_def {
+                    name: index_name.as_ptr(),
+                    column_id: 1,
+                    kind: mongreldb_index_kind::Ann as i32,
+                },
+                &mongreldb_index_options_v2 {
+                    struct_size: std::mem::size_of::<mongreldb_index_options_v2>(),
+                    version: 2,
+                    predicate: std::ptr::null(),
+                    ann_m: 16,
+                    ann_ef_construction: 64,
+                    ann_ef_search: 64,
+                    ann_quantization: 1, // Dense
+                    minhash_permutations: 0,
+                    minhash_bands: 0,
+                    learned_range_epsilon: 0,
+                    ann_algorithm: 0, // HNSW
+                    diskann_r: 0,
+                    diskann_l: 0,
+                    diskann_beam_width: 0,
+                    diskann_alpha: 0,
+                    ivf_nlist: 0,
+                    ivf_nprobe: 0,
+                    pq_num_subvectors: 0,
+                    pq_bits: 0,
+                    pq_training_samples: 0,
+                    pq_seed: 0,
+                    pq_rerank_factor: 0,
+                },
+            )
+            .unwrap();
+        let schema = builder.finish();
+        let ann = schema.indexes[0].options.ann.as_ref().unwrap();
+        assert_eq!(ann.algorithm, AnnAlgorithm::Hnsw);
+        assert_eq!(ann.quantization, AnnQuantization::Dense);
+        assert!(ann.diskann.is_none());
+        assert!(ann.ivf.is_none());
+        assert!(ann.product.is_none());
+    }
+
+    #[test]
+    fn v2_index_options_rejects_bad_size_or_version() {
+        let mut builder = SchemaBuilder::new();
+        let index_name = CString::new("x").unwrap();
+        let err = builder
+            .add_index_with_options_v2(
+                &mongreldb_index_def {
+                    name: index_name.as_ptr(),
+                    column_id: 1,
+                    kind: mongreldb_index_kind::Bitmap as i32,
+                },
+                &mongreldb_index_options_v2 {
+                    struct_size: 0,
+                    version: 2,
+                    ..unsafe { std::mem::zeroed() }
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, ErrorCode::InvalidArgument));
     }
 }
