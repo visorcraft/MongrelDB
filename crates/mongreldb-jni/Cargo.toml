@@ -19,8 +19,8 @@ crate-type = ["cdylib"]
 # The Kit crate wraps the engine with schema model, migrations, and query
 # builder execution. Engine 0.63.0 and Kit 0.63.0 are both published on
 # crates.io and aligned, so the adapter resolves everything from the registry.
-mongreldb-kit = "=0.63.0"
-mongreldb-kit-core = "=0.63.0"
+mongreldb-kit = "=0.63.1"
+mongreldb-kit-core = "=0.63.1"
 # Stable 20-category taxonomy (FND-007) for structural binding surfaces.
 mongreldb-types = "0.63.0"
 # The jni crate provides Rust bindings to the JNI API.
