@@ -6,6 +6,7 @@ TODO.md
 AGENTS.md
 CLAUDE.md
 /.claude/
+/.zcode/
 
 # Build artifacts
 *.so
