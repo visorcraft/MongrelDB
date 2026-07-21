@@ -32,8 +32,9 @@ or a documented complete-JSON escape hatch.
 | Surface | Required coverage |
 |---|---|
 | Schema indexes | `bitmap`, `fm_index`, `ann`, `learned_range`, `minhash`, and `sparse` |
-| Index options | Partial `predicate`; ANN `m`, `ef_construction`, `ef_search`, and `quantization`; MinHash `permutations` and `bands`; learned-range `epsilon` |
+| Index options | Partial `predicate`; ANN `algorithm`, `m`, `ef_construction`, `ef_search`, `quantization`, DiskANN `diskann_r/l/beam_width/alpha`, IVF `nlist/nprobe`, product `num_subvectors/bits_per_subvector/pq_*`; MinHash `permutations` and `bands`; learned-range `epsilon` |
 | Dense ANN | `quantization: "dense"`, which selects full-precision cosine distance |
+| Swappable ANN algorithms | `algorithm: "hnsw"` (default), `"diskann"`, or `"ivf"`; product quantization `quantization: "product"` with trained codebooks |
 | Embedding source | Application-supplied vectors plus portable `configured_model` and `generated_column_spec` metadata |
 | Complex writes | Dense vector arrays, sparse `[token_id, weight]` pairs, and MinHash member arrays |
 | Query conditions | `bitmap_in`, `fm_contains_all`, `ann`, `sparse_match`, `minhash_similar`, and `minhash_similar_members`, in addition to the live baseline above |
