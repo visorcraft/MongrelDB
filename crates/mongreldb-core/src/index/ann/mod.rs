@@ -11,9 +11,9 @@
 //! S1C-003 base+delta layout: the index is an immutable **base** HNSW graph
 //! (the single consolidated frozen layer) plus zero or more immutable frozen
 //! delta graphs plus one small active mutable delta graph. Search runs
-//! per-layer HNSW candidate lists, merges them keeping each row's exact
-//! minimum distance (exact rerank over the stored vectors), and truncates to
-//! `k` — so recall is independent of how the rows are split across layers.
+//! per-layer HNSW candidate lists, merges them keeping each row's minimum
+//! reported distance, and truncates to `k`. Candidate generation remains
+//! approximate.
 //! [`AnnIndex::merge_deltas_into_base`] is the compaction step: it merges
 //! every frozen delta into a new base graph. Deleted rows keep stale graph
 //! entries (HNSW has no cheap node removal); readers apply the
@@ -38,7 +38,7 @@ pub(crate) mod product;
 use crate::index::ann::backend::{AnnBackend, AnnBackendCheckpoint, BackendMetric};
 use crate::index::hnsw::{DenseHnsw, Hnsw};
 use crate::rowid::RowId;
-use crate::schema::{AnnOptions, AnnQuantization, ProductQuantizerOptions};
+use crate::schema::{AnnOptions, AnnQuantization};
 use crate::{MongrelError, Result};
 use bincode::Options;
 use std::collections::HashMap;
@@ -100,6 +100,7 @@ pub struct AnnIndex {
     ef_construction: usize,
     ef_search: usize,
     quantization: AnnQuantization,
+    options: AnnOptions,
     /// Immutable frozen layers (base + deltas). Empty until the first seal.
     frozen: Arc<Vec<Arc<dyn AnnBackend>>>,
     /// Small mutable delta writers insert into.
@@ -114,6 +115,7 @@ impl Clone for AnnIndex {
             ef_construction: self.ef_construction,
             ef_search: self.ef_search,
             quantization: self.quantization,
+            options: self.options.clone(),
             frozen: Arc::clone(&self.frozen),
             active: self.active.clone_box(),
         }
@@ -166,12 +168,17 @@ impl AnnIndex {
         options: &AnnOptions,
     ) -> Self {
         let active = new_backend(dim, m, ef_construction, options);
+        let mut options = options.clone();
+        options.m = m;
+        options.ef_construction = ef_construction;
+        options.ef_search = ef_search;
         Self {
             dim,
             m,
             ef_construction,
             ef_search,
             quantization: options.quantization,
+            options,
             frozen: Arc::new(Vec::new()),
             active,
         }
@@ -203,11 +210,7 @@ impl AnnIndex {
         expected_dim: usize,
         options: &crate::schema::AnnOptions,
     ) -> bool {
-        self.dim == expected_dim
-            && self.quantization == options.quantization
-            && self.m == options.m
-            && self.ef_construction == options.ef_construction
-            && self.ef_search == options.ef_search
+        self.dim == expected_dim && self.options == *options
     }
 
     fn validate_query(&self, vec: &[f32]) -> Result<()> {
@@ -339,7 +342,7 @@ impl AnnIndex {
 
     /// k-nearest among rows accepted by `visible` — the S1C-003
     /// visibility/tombstone filter applied across the base, frozen deltas,
-    /// and active delta. Candidates are merged and reranked exactly as in
+    /// and active delta. Candidates are merged and ordered as in
     /// [`Self::search_with_context`]; each layer is over-fetched (see
     /// [`FILTERED_SEARCH_OVERFETCH`]) so visible rows ranked behind filtered
     /// ones still surface.
@@ -471,6 +474,7 @@ impl AnnIndex {
             m: self.m,
             ef_construction: self.ef_construction,
             ef_search: self.ef_search,
+            options: AnnCheckpointOptions::from(&self.options),
             payload,
         })
         .expect("ann index serializable")
@@ -516,6 +520,14 @@ impl AnnIndex {
     }
 
     fn from_checkpoint(checkpoint: AnnCheckpoint) -> std::result::Result<Self, String> {
+        let options = AnnOptions::from(checkpoint.options);
+        if options.quantization != checkpoint.quantization
+            || options.m != checkpoint.m
+            || options.ef_construction != checkpoint.ef_construction
+            || options.ef_search != checkpoint.ef_search
+        {
+            return Err("ANN checkpoint options mismatch header".into());
+        }
         match (checkpoint.quantization, checkpoint.payload) {
             (
                 AnnQuantization::BinarySign,
@@ -535,10 +547,7 @@ impl AnnIndex {
                     checkpoint.dim,
                     checkpoint.m,
                     checkpoint.ef_construction,
-                    &AnnOptions {
-                        quantization: AnnQuantization::BinarySign,
-                        ..AnnOptions::default()
-                    },
+                    &options,
                 );
                 Ok(Self {
                     dim: checkpoint.dim,
@@ -546,6 +555,7 @@ impl AnnIndex {
                     ef_construction: checkpoint.ef_construction,
                     ef_search: checkpoint.ef_search,
                     quantization: AnnQuantization::BinarySign,
+                    options,
                     frozen: Arc::new(vec![Arc::new(graph) as Arc<dyn AnnBackend>]),
                     active,
                 })
@@ -562,10 +572,7 @@ impl AnnIndex {
                     checkpoint.dim,
                     checkpoint.m,
                     checkpoint.ef_construction,
-                    &AnnOptions {
-                        quantization: AnnQuantization::Dense,
-                        ..AnnOptions::default()
-                    },
+                    &options,
                 );
                 Ok(Self {
                     dim: checkpoint.dim,
@@ -573,6 +580,7 @@ impl AnnIndex {
                     ef_construction: checkpoint.ef_construction,
                     ef_search: checkpoint.ef_search,
                     quantization: AnnQuantization::Dense,
+                    options,
                     frozen: Arc::new(vec![Arc::new(graph) as Arc<dyn AnnBackend>]),
                     active,
                 })
@@ -597,13 +605,26 @@ impl AnnIndex {
                 {
                     return Err("ANN Product checkpoint codebook/header mismatch".into());
                 }
+                let product = options.product.clone().unwrap_or_default();
+                if options.algorithm != crate::schema::AnnAlgorithm::Hnsw
+                    || product.rerank_factor != rerank_factor
+                    || product.seed != quantizer.seed()
+                {
+                    return Err("ANN Product checkpoint options mismatch payload".into());
+                }
                 let backend = pq_backend::PqBackend::from_checkpoint(
                     checkpoint.dim,
                     cb_nsv,
                     bits,
-                    rerank_factor,
+                    &product,
                     quantizer,
                     codes,
+                )?;
+                let active = new_backend(
+                    checkpoint.dim,
+                    checkpoint.m,
+                    checkpoint.ef_construction,
+                    &options,
                 );
                 Ok(Self {
                     dim: checkpoint.dim,
@@ -614,23 +635,9 @@ impl AnnIndex {
                         num_subvectors,
                         bits,
                     },
+                    options,
                     frozen: Arc::new(vec![Arc::new(backend) as Arc<dyn AnnBackend>]),
-                    active: new_backend(
-                        checkpoint.dim,
-                        checkpoint.m,
-                        checkpoint.ef_construction,
-                        &AnnOptions {
-                            quantization: AnnQuantization::Product {
-                                num_subvectors,
-                                bits,
-                            },
-                            product: Some(ProductQuantizerOptions {
-                                rerank_factor,
-                                ..ProductQuantizerOptions::default()
-                            }),
-                            ..AnnOptions::default()
-                        },
-                    ),
+                    active,
                 })
             }
             (
@@ -643,24 +650,19 @@ impl AnnIndex {
                     graph,
                 },
             ) => {
-                if graph.dim() != checkpoint.dim {
-                    return Err("ANN DiskAnn checkpoint graph dim mismatch header".into());
+                let diskann = options.diskann.clone().unwrap_or_default();
+                if options.algorithm != crate::schema::AnnAlgorithm::DiskAnn
+                    || (diskann.r, diskann.l, diskann.beam_width, diskann.alpha)
+                        != (r, l, beam_width, alpha)
+                    || !graph.matches_checkpoint(checkpoint.dim, &diskann)
+                {
+                    return Err("ANN DiskAnn checkpoint options mismatch payload".into());
                 }
                 let active = new_backend(
                     checkpoint.dim,
                     checkpoint.m,
                     checkpoint.ef_construction,
-                    &AnnOptions {
-                        algorithm: crate::schema::AnnAlgorithm::DiskAnn,
-                        quantization: AnnQuantization::Dense,
-                        diskann: Some(crate::schema::DiskAnnOptions {
-                            r,
-                            l,
-                            beam_width,
-                            alpha,
-                        }),
-                        ..AnnOptions::default()
-                    },
+                    &options,
                 );
                 Ok(Self {
                     dim: checkpoint.dim,
@@ -668,6 +670,7 @@ impl AnnIndex {
                     ef_construction: checkpoint.ef_construction,
                     ef_search: checkpoint.ef_search,
                     quantization: AnnQuantization::Dense,
+                    options,
                     frozen: Arc::new(vec![Arc::new(graph) as Arc<dyn AnnBackend>]),
                     active,
                 })
@@ -682,13 +685,26 @@ impl AnnIndex {
                     seed,
                 },
             ) => {
+                let ivf = options.ivf.clone().unwrap_or_default();
+                if options.algorithm != crate::schema::AnnAlgorithm::Ivf
+                    || (ivf.nlist, ivf.nprobe) != (nlist, nprobe)
+                {
+                    return Err("ANN IVF checkpoint options mismatch payload".into());
+                }
                 let backend = ivf::IvfBackend::from_checkpoint(
                     checkpoint.dim,
                     nlist,
                     nprobe,
+                    ivf.training_samples,
                     centroids,
                     lists,
                     seed,
+                )?;
+                let active = new_backend(
+                    checkpoint.dim,
+                    checkpoint.m,
+                    checkpoint.ef_construction,
+                    &options,
                 );
                 Ok(Self {
                     dim: checkpoint.dim,
@@ -696,22 +712,9 @@ impl AnnIndex {
                     ef_construction: checkpoint.ef_construction,
                     ef_search: checkpoint.ef_search,
                     quantization: AnnQuantization::Dense,
+                    options,
                     frozen: Arc::new(vec![Arc::new(backend) as Arc<dyn AnnBackend>]),
-                    active: new_backend(
-                        checkpoint.dim,
-                        checkpoint.m,
-                        checkpoint.ef_construction,
-                        &AnnOptions {
-                            algorithm: crate::schema::AnnAlgorithm::Ivf,
-                            quantization: AnnQuantization::Dense,
-                            ivf: Some(crate::schema::IvfOptions {
-                                nlist,
-                                nprobe,
-                                ..Default::default()
-                            }),
-                            ..AnnOptions::default()
-                        },
-                    ),
+                    active,
                 })
             }
             _ => Err("ANN checkpoint quantization/payload tag mismatch".into()),
@@ -767,9 +770,9 @@ impl AnnIndex {
 ///
 /// - Hnsw + BinarySign → Hamming HNSW
 /// - Hnsw + Dense → cosine HNSW
-/// - Hnsw + Product → flat PQ backend (ADC over codes + optional exact rerank)
+/// - Hnsw + Product → flat PQ backend (ADC + approximate reconstructed rerank)
 /// - DiskAnn + Dense → Vamana single-layer graph (Phase 4)
-/// - IVF remains fail-closed until Phase 5.
+/// - Ivf + Dense → inverted-file backend
 fn new_backend(
     dim: usize,
     m: usize,
@@ -864,7 +867,50 @@ struct AnnCheckpoint {
     m: usize,
     ef_construction: usize,
     ef_search: usize,
+    options: AnnCheckpointOptions,
     payload: AnnCheckpointPayload,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct AnnCheckpointOptions {
+    m: usize,
+    ef_construction: usize,
+    ef_search: usize,
+    quantization: AnnQuantization,
+    algorithm: crate::schema::AnnAlgorithm,
+    diskann: Option<crate::schema::DiskAnnOptions>,
+    ivf: Option<crate::schema::IvfOptions>,
+    product: Option<crate::schema::ProductQuantizerOptions>,
+}
+
+impl From<&AnnOptions> for AnnCheckpointOptions {
+    fn from(options: &AnnOptions) -> Self {
+        Self {
+            m: options.m,
+            ef_construction: options.ef_construction,
+            ef_search: options.ef_search,
+            quantization: options.quantization,
+            algorithm: options.algorithm,
+            diskann: options.diskann.clone(),
+            ivf: options.ivf.clone(),
+            product: options.product.clone(),
+        }
+    }
+}
+
+impl From<AnnCheckpointOptions> for AnnOptions {
+    fn from(options: AnnCheckpointOptions) -> Self {
+        Self {
+            m: options.m,
+            ef_construction: options.ef_construction,
+            ef_search: options.ef_search,
+            quantization: options.quantization,
+            algorithm: options.algorithm,
+            diskann: options.diskann,
+            ivf: options.ivf,
+            product: options.product,
+        }
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -908,7 +954,7 @@ mod tests {
     use super::*;
     use crate::index::hnsw::cosine_distance;
     use crate::query::AiExecutionContext;
-    use crate::schema::AnnOptions;
+    use crate::schema::{AnnOptions, ProductQuantizerOptions};
 
     #[test]
     fn custom_search_breadth_survives_checkpoint() {
@@ -1525,6 +1571,20 @@ mod tests {
             before[0].0, after[0].0,
             "top result must survive checkpoint"
         );
+        assert!(thawed.matches_schema(dim, &index.options));
+    }
+
+    #[test]
+    fn product_checkpoint_rejects_corrupt_codes() {
+        let mut index = product_index(16, 8);
+        index.insert(&[1.0; 16], RowId(7)).unwrap();
+        let mut checkpoint: AnnCheckpoint = bincode::deserialize(&index.freeze()).unwrap();
+        let AnnCheckpointPayload::Product { codes, .. } = &mut checkpoint.payload else {
+            panic!("expected Product checkpoint");
+        };
+        codes.get_mut(&RowId(7)).unwrap().pop();
+        let corrupt = bincode::serialize(&checkpoint).unwrap();
+        assert!(AnnIndex::thaw(&corrupt).is_err());
     }
 
     #[test]
@@ -1696,7 +1756,7 @@ mod tests {
             ivf: Some(crate::schema::IvfOptions {
                 nlist,
                 nprobe,
-                ..Default::default()
+                training_samples: 12_345,
             }),
             product: None,
         };
@@ -1749,6 +1809,7 @@ mod tests {
         let after = thawed.search(&query, 5).unwrap();
         assert_eq!(before.len(), after.len());
         assert_eq!(before[0].0, after[0].0);
+        assert!(thawed.matches_schema(dim, &index.options));
     }
 
     #[test]

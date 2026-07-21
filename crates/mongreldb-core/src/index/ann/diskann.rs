@@ -75,8 +75,23 @@ impl DiskAnnBackend {
         }
     }
 
-    pub(crate) fn dim(&self) -> usize {
-        self.dim
+    pub(crate) fn matches_checkpoint(&self, dim: usize, options: &DiskAnnOptions) -> bool {
+        self.dim == dim
+            && (self.r, self.l, self.beam_width, self.alpha)
+                == (options.r, options.l, options.beam_width, options.alpha)
+            && self.vectors.len() == self.row_ids.len()
+            && self.vectors.len() == self.graph.len()
+            && self.entry.is_none_or(|entry| entry < self.vectors.len())
+            && self
+                .vectors
+                .iter()
+                .all(|vector| vector.len() == dim && vector.iter().all(|v| v.is_finite()))
+            && self.graph.iter().all(|neighbors| {
+                neighbors.len() <= self.r
+                    && neighbors
+                        .iter()
+                        .all(|neighbor| *neighbor < self.vectors.len())
+            })
     }
 
     fn distance(&self, a: usize, query: &[f32]) -> f32 {
@@ -100,14 +115,14 @@ impl DiskAnnBackend {
         // Min-heap of (dist, node) candidates to expand.
         let mut candidates: BinaryHeap<Reverse<(DistF32, usize)>> =
             BinaryHeap::from([Reverse((DistF32(entry_dist), entry))]);
-        // Max-heap of (dist, node) results (top-ef closest so far).
-        let mut results: BinaryHeap<(DistF32, usize)> =
-            BinaryHeap::from([(DistF32(entry_dist), entry)]);
+        // Max-heap keeps the worst distance and highest RowId at the top.
+        let mut results: BinaryHeap<(DistF32, RowId, usize)> =
+            BinaryHeap::from([(DistF32(entry_dist), self.row_ids[entry], entry)]);
         while let Some(Reverse((cd, c))) = candidates.pop() {
             if let Some(context) = context {
                 context.checkpoint()?;
             }
-            let worst = results.peek().map(|(d, _)| d.0).unwrap_or(f32::INFINITY);
+            let worst = results.peek().map(|(d, _, _)| d.0).unwrap_or(f32::INFINITY);
             if cd.0 > worst && results.len() >= ef {
                 break;
             }
@@ -120,10 +135,13 @@ impl DiskAnnBackend {
                         ))?;
                     }
                     let d = self.distance(neighbor, query);
-                    let worst = results.peek().map(|(dd, _)| dd.0).unwrap_or(f32::INFINITY);
-                    if d < worst || results.len() < ef {
+                    let worst = results
+                        .peek()
+                        .map(|(distance, row_id, _)| (*distance, *row_id))
+                        .unwrap_or((DistF32(f32::INFINITY), RowId(u64::MAX)));
+                    if (DistF32(d), self.row_ids[neighbor]) < worst || results.len() < ef {
                         candidates.push(Reverse((DistF32(d), neighbor)));
-                        results.push((DistF32(d), neighbor));
+                        results.push((DistF32(d), self.row_ids[neighbor], neighbor));
                         if results.len() > ef {
                             results.pop();
                         }
@@ -131,8 +149,14 @@ impl DiskAnnBackend {
                 }
             }
         }
-        let mut out: Vec<(f32, usize)> = results.into_iter().map(|(d, n)| (d.0, n)).collect();
-        out.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut out: Vec<(f32, usize)> = results
+            .into_iter()
+            .map(|(distance, _, node)| (distance.0, node))
+            .collect();
+        out.sort_by(|(da, na), (db, nb)| {
+            da.total_cmp(db)
+                .then_with(|| self.row_ids[*na].cmp(&self.row_ids[*nb]))
+        });
         Ok(out)
     }
 
@@ -167,7 +191,7 @@ impl DiskAnnBackend {
             // Snapshot this node's adjacency + vector so we can re-prune
             // without holding a mutable borrow of self.graph across the
             // (immutable) distance reads.
-            let over_capacity = self.graph[n].len() > self.r;
+            let over_capacity = self.graph[n].len() >= self.r;
             if !over_capacity {
                 self.graph[n].push(node);
                 continue;
@@ -177,7 +201,7 @@ impl DiskAnnBackend {
                 .iter()
                 .map(|&x| (cosine_distance(&nv, &self.vectors[x]), x))
                 .collect();
-            adj_candidates.push((0.0, node));
+            adj_candidates.push((cosine_distance(&nv, &self.vectors[node]), node));
             let r = self.r;
             let alpha = self.alpha;
             let pruned = robust_prune_owned(&self.vectors, &mut adj_candidates, r, alpha);
@@ -386,6 +410,27 @@ mod tests {
             .search(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 1, 16, None)
             .unwrap();
         assert_eq!(top[0].0, RowId(0));
+    }
+
+    #[test]
+    fn equal_distances_break_ties_by_row_id_before_top_k() {
+        let mut b = backend(8);
+        b.insert_vec(vec![1.0; 8], RowId(100));
+        b.insert_vec(vec![1.0; 8], RowId(1));
+        let top = b.search(&[1.0; 8], 1, 16, None).unwrap();
+        assert_eq!(top[0].0, RowId(1));
+    }
+
+    #[test]
+    fn insertion_never_exceeds_degree_bound() {
+        let mut b = backend(8);
+        for id in 0..100u64 {
+            let mut vector = vec![0.0; 8];
+            vector[id as usize % 8] = 1.0;
+            vector[(id as usize + 3) % 8] = id as f32 / 100.0;
+            b.insert_vec(vector, RowId(id));
+        }
+        assert!(b.graph.iter().all(|neighbors| neighbors.len() <= b.r));
     }
 
     #[test]

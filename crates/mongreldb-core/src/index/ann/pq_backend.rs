@@ -116,25 +116,25 @@ impl PqBackend {
         dim: usize,
         num_subvectors: usize,
         bits: u8,
-        rerank_factor: usize,
+        options: &ProductQuantizerOptions,
         quantizer: ProductQuantizer,
         codes: BTreeMap<RowId, Vec<u8>>,
-    ) -> Self {
-        let training = ProductQuantizerOptions {
-            seed: quantizer.seed(),
-            rerank_factor,
-            ..ProductQuantizerOptions::default()
-        };
-        Self {
+    ) -> std::result::Result<Self, String> {
+        if !quantizer.matches_checkpoint(dim, num_subvectors, bits)
+            || codes.values().any(|code| code.len() != num_subvectors)
+        {
+            return Err("ANN Product checkpoint contains invalid codebook or codes".into());
+        }
+        Ok(Self {
             dim,
             num_subvectors,
             bits,
-            rerank_factor,
-            training,
+            rerank_factor: options.rerank_factor,
+            training: options.clone(),
             quantizer: Some(quantizer),
             codes,
             pending: BTreeMap::new(),
-        }
+        })
     }
 
     fn k(&self) -> usize {
@@ -219,7 +219,7 @@ impl AnnBackend for PqBackend {
         }
         // Ascending distance, ties by RowId.
         scored.sort_by(|(da, ra), (db, rb)| da.total_cmp(db).then_with(|| ra.cmp(rb)));
-        // Optional exact rerank over reconstructed approximations for the
+        // Optional approximate rerank over reconstructed vectors for the
         // frozen-layer candidates (active-delta candidates are already exact).
         let rerank_set = if self.rerank_factor > 0 {
             (k.saturating_mul(self.rerank_factor)).min(scored.len())

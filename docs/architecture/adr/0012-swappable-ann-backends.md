@@ -41,7 +41,7 @@ six call sites.
      implementations, now behind the trait.
    - `PqBackend` — flat product quantization: active delta buffers Dense
      vectors, trains the codebook at freeze, emits compact codes. Search is
-     bounded ADC + optional exact rerank.
+     bounded ADC + optional approximate reconstructed-vector rerank.
    - `DiskAnnBackend` — Vamana single-layer robust-pruned graph.
    - `IvfBackend` — k-means centroids + inverted lists.
 
@@ -50,7 +50,9 @@ six call sites.
    of frozen layers) produces a byte-identical result to a base-only build.
    This preserves the existing merge/consolidation guarantee.
 
-5. Checkpoint versioning: `_idx/global.idx` format bumped 4 → 5. Prior-format
+5. Checkpoint versioning: `_idx/global.idx` format is 6. Format 5 introduced
+   backend payloads; format 6 persists and validates the complete ANN option
+   bag. Prior-format
    files are discarded at open and rebuilt from authoritative schema + sorted
    runs (the existing `format_version` escape hatch). The checkpoint payload
    carries one variant per backend; the outer envelope carries the quantization

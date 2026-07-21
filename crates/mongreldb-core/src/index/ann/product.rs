@@ -119,6 +119,18 @@ impl ProductQuantizer {
         self.seed
     }
 
+    pub(crate) fn matches_checkpoint(&self, dim: usize, num_subvectors: usize, bits: u8) -> bool {
+        bits == 8
+            && self.dim == dim
+            && self.num_subvectors == num_subvectors
+            && self.bits == bits
+            && num_subvectors > 0
+            && dim.is_multiple_of(num_subvectors)
+            && self.subvector_dim == dim / num_subvectors
+            && self.codebooks.len() == dim.saturating_mul(1usize << bits)
+            && self.codebooks.iter().all(|value| value.is_finite())
+    }
+
     /// Encode a `dim`-length f32 vector into `num_subvectors` bytes (one
     /// centroid index per subvector at bits=8).
     pub(crate) fn encode(&self, vec: &[f32]) -> Vec<u8> {
@@ -160,8 +172,8 @@ impl ProductQuantizer {
     }
 
     /// ADC distance from a query (via its [`adc_table`]) to an encoded vector.
-    /// Lower is better. This is an approximate squared-L2 distance; callers
-    /// that need cosine semantics rerank the top candidates exactly.
+    /// Lower is better. This is an approximate squared-L2 distance. A caller
+    /// can only rerank exactly if it separately retained the source vectors.
     pub(crate) fn adc_distance(table: &[f32], code: &[u8], num_subvectors: usize, k: usize) -> f32 {
         let mut total = 0.0f32;
         for s in 0..num_subvectors {
@@ -171,7 +183,7 @@ impl ProductQuantizer {
     }
 
     /// Reconstruct the full-precision approximation of an encoded vector
-    /// (centroid concatenation). Used by tests and by exact rerank when the
+    /// (centroid concatenation). Used by tests and approximate reranking when the
     /// Dense source is not retained.
     pub(crate) fn reconstruct(&self, code: &[u8]) -> Vec<f32> {
         debug_assert_eq!(code.len(), self.num_subvectors, "code length mismatch");

@@ -20,7 +20,7 @@
 //!   replays `entries()`).
 //!
 //! The orchestrator ([`super::AnnIndex`]) is responsible for dimension,
-//! finite-value, and zero-norm validation, for over-fetch + exact rerank across
+//! finite-value and zero-norm validation, and for over-fetch + merge across
 //! frozen + active layers, and for truncation/tie-breaking by `RowId`. Backends
 //! only ever see already-validated f32 vectors on the insert/search path; the
 //! BinarySign quantization (f32 → sign bit) lives in the backend itself so the

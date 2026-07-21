@@ -124,13 +124,13 @@ The ANN algorithm and quantization are chosen independently:
   - **Dense** stores full finite `f32` vectors and reports cosine distance
     `1 - cosine_similarity` (`ann_cosine_distance: Float32`).
   - **Product** stores 8-bit PQ codes per subvector against a trained codebook
-    and reports ADC distance (`ann_distance: Float32`); optional exact rerank
-    over reconstructed approximations.
+    and reports ADC distance (`ann_distance: Float32`); optional reranking over
+    reconstructed approximations improves quality but is not exact.
 
 Supported combinations: `hnsw × {binary_sign, dense, product}`,
 `diskann × dense`, `ivf × dense`. See `docs/06-indexes.md` for details.
 
-All modes are approximate unless an exact rerank is requested. Online
+All ANN candidate searches are approximate. Online
 `Database::create_index` / `replace_index` / `drop_index` (and SQL CREATE/DROP
 INDEX) publish a new index generation without copying the table; publication
 takes a short commit barrier. An algorithm or quantization change never

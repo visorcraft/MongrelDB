@@ -142,17 +142,17 @@ quantization (how vectors are represented) are chosen independently.
 |---|---|---|---|
 | `binary_sign` (default) | 1 bit per dimension | Hamming | `ann_distance: UInt32` |
 | `dense` | full finite `f32` vectors | cosine distance `1 - cosine_similarity` | `ann_cosine_distance: Float32` |
-| `product` | 8-bit PQ codes per subvector (trained codebook) | ADC (asymmetric); optional exact rerank | `ann_distance: Float32` |
+| `product` | 8-bit PQ codes per subvector (trained codebook) | ADC (asymmetric); optional approximate reconstructed-vector rerank | `ann_distance: Float32` |
 
 **Supported combinations:** `hnsw × {binary_sign, dense, product}`,
 `diskann × dense`, `ivf × dense`. Other combinations are rejected at create
 time (fail-closed) until their backends are wired.
 
-Exact cosine, dot-product, or L2 reranking over stored full-precision vectors
-is available as a bounded second stage for any mode. Product quantization
-compresses vectors ~96× (a 768-dim f32 vector with 32 subvectors becomes 32
-bytes) at the cost of approximate ADC distance; enable `pq_rerank_factor` to
-rerank the top candidates exactly.
+Product quantization compresses vectors ~96× (a 768-dim f32 vector with 32
+subvectors becomes 32 bytes) at the cost of approximate ADC distance. Setting
+`pq_rerank_factor` reranks a bounded candidate set using reconstructed
+approximate vectors. MongrelDB does not retain the original Dense vectors in
+this backend, so this rerank is not exact.
 
 **How it works:**
 - **HNSW** builds a multi-layer graph where similar vectors are connected by

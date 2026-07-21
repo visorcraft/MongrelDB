@@ -31,15 +31,11 @@ use std::path::{Path, PathBuf};
 pub const IDX_MAGIC: [u8; 8] = *b"MONGRIDX";
 /// Checkpoint format version.
 ///
-/// `5` — bumped for Phase 2 (swappable ANN backends). The `AnnCheckpoint`
-/// payload envelope is unchanged on the wire for existing HNSW graphs, but
-/// the bump is the documented escape hatch: any prior-format file (including a
-/// future DiskANN/IVF/PQ payload variant) is discarded at open and rebuilt
-/// from authoritative schema + sorted runs (see the `format_version` check
-/// below). Format numbers are private cache integers, never product/wire/
-/// catalog compatibility promises — see `/external/MONGRELDB_TODO.md`
-/// "Version clarification".
-pub const IDX_VERSION: u16 = 5;
+/// `6` — persists the complete ANN option bag and validates it against each
+/// backend payload. Prior derived caches are discarded and rebuilt from
+/// authoritative schema + sorted runs. Format numbers are private cache
+/// integers, never product/wire/catalog compatibility promises.
+pub const IDX_VERSION: u16 = 6;
 pub const IDX_DIR: &str = "_idx";
 pub const IDX_FILENAME: &str = "global.idx";
 const MAX_INDEX_RECORDS: usize = 65_536;

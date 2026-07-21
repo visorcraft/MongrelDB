@@ -182,7 +182,7 @@ impl Hnsw {
             ep = self.search_layer_with_context(query_bits, ep, 1, lc, context)?;
         }
         let mut results = self.search_layer_with_context(query_bits, ep, ef, 0, context)?;
-        results.sort_by_key(|(d, _)| *d);
+        results.sort_by_key(|(distance, node)| (*distance, self.row_ids[*node]));
         Ok(results
             .into_iter()
             .take(k)
@@ -204,23 +204,29 @@ impl Hnsw {
             .iter()
             .map(|(d, n)| Reverse((*d, *n)))
             .collect();
-        let mut results: BinaryHeap<(Dist, usize)> =
-            entry_points.iter().map(|(d, n)| (*d, *n)).collect();
+        let mut results: BinaryHeap<(Dist, RowId, usize)> = entry_points
+            .iter()
+            .map(|(d, n)| (*d, self.row_ids[*n], *n))
+            .collect();
         // BinaryHeap is a max-heap; for `results` we want to pop the farthest,
         // which is the max — exactly the default behavior.
 
         while let Some(Reverse((cd, c))) = candidates.pop() {
-            let worst = results.peek().map(|(d, _)| *d).unwrap_or(Dist::MAX);
+            let worst = results.peek().map(|(d, _, _)| *d).unwrap_or(Dist::MAX);
             if cd > worst && results.len() >= ef {
                 break;
             }
             for &e in &self.graph[c][layer as usize] {
                 if visited.insert(e) {
                     let d = hamming(query_bits, &self.vectors[e]);
-                    let w = results.peek().map(|(dd, _)| *dd).unwrap_or(Dist::MAX);
-                    if d < w || results.len() < ef {
+                    let key = (d, self.row_ids[e]);
+                    let worst_key = results
+                        .peek()
+                        .map(|(distance, row_id, _)| (*distance, *row_id))
+                        .unwrap_or((Dist::MAX, RowId(u64::MAX)));
+                    if key < worst_key || results.len() < ef {
                         candidates.push(Reverse((d, e)));
-                        results.push((d, e));
+                        results.push((d, self.row_ids[e], e));
                         if results.len() > ef {
                             results.pop();
                         }
@@ -228,7 +234,11 @@ impl Hnsw {
                 }
             }
         }
-        results.into_vec()
+        results
+            .into_vec()
+            .into_iter()
+            .map(|(distance, _, node)| (distance, node))
+            .collect()
     }
 
     fn search_layer_with_context(
@@ -244,13 +254,15 @@ impl Hnsw {
             .iter()
             .map(|(d, n)| Reverse((*d, *n)))
             .collect();
-        let mut results: BinaryHeap<(Dist, usize)> =
-            entry_points.iter().map(|(d, n)| (*d, *n)).collect();
+        let mut results: BinaryHeap<(Dist, RowId, usize)> = entry_points
+            .iter()
+            .map(|(d, n)| (*d, self.row_ids[*n], *n))
+            .collect();
         while let Some(Reverse((cd, c))) = candidates.pop() {
             if let Some(context) = context {
                 context.checkpoint()?;
             }
-            let worst = results.peek().map(|(d, _)| *d).unwrap_or(Dist::MAX);
+            let worst = results.peek().map(|(d, _, _)| *d).unwrap_or(Dist::MAX);
             if cd > worst && results.len() >= ef {
                 break;
             }
@@ -263,10 +275,14 @@ impl Hnsw {
                         ))?;
                     }
                     let d = hamming(query_bits, &self.vectors[e]);
-                    let w = results.peek().map(|(dd, _)| *dd).unwrap_or(Dist::MAX);
-                    if d < w || results.len() < ef {
+                    let key = (d, self.row_ids[e]);
+                    let worst_key = results
+                        .peek()
+                        .map(|(distance, row_id, _)| (*distance, *row_id))
+                        .unwrap_or((Dist::MAX, RowId(u64::MAX)));
+                    if key < worst_key || results.len() < ef {
                         candidates.push(Reverse((d, e)));
-                        results.push((d, e));
+                        results.push((d, self.row_ids[e], e));
                         if results.len() > ef {
                             results.pop();
                         }
@@ -274,7 +290,11 @@ impl Hnsw {
                 }
             }
         }
-        Ok(results.into_vec())
+        Ok(results
+            .into_vec()
+            .into_iter()
+            .map(|(distance, _, node)| (distance, node))
+            .collect())
     }
 }
 
@@ -285,11 +305,12 @@ mod tests {
     #[test]
     fn finds_exact_match_at_distance_zero() {
         let mut h = Hnsw::new(2, 8, 32);
-        h.insert(vec![0b1010_1010, 0b0000_1111], RowId(0));
-        h.insert(vec![0b0101_0101, 0b1111_0000], RowId(1));
-        h.insert(vec![0b1010_1010, 0b0000_1111], RowId(2));
+        h.insert(vec![0b1010_1010, 0b0000_1111], RowId(100));
+        h.insert(vec![0b0101_0101, 0b1111_0000], RowId(2));
+        h.insert(vec![0b1010_1010, 0b0000_1111], RowId(1));
         let top = h.search(&[0b1010_1010, 0b0000_1111], 1, 32);
         assert_eq!(top[0].1, 0); // identical ⇒ distance 0
+        assert_eq!(top[0].0, RowId(1));
     }
 
     #[test]
@@ -564,7 +585,10 @@ impl DenseHnsw {
             ep = self.search_layer_with_context(query, ep, 1, lc, context)?;
         }
         let mut results = self.search_layer_with_context(query, ep, ef, 0, context)?;
-        results.sort_by(|(da, _), (db, _)| da.total_cmp(db));
+        results.sort_by(|(da, na), (db, nb)| {
+            da.total_cmp(db)
+                .then_with(|| self.row_ids[*na].cmp(&self.row_ids[*nb]))
+        });
         Ok(results
             .into_iter()
             .take(k)
@@ -588,16 +612,16 @@ impl DenseHnsw {
             .iter()
             .map(|(distance, node)| Reverse((DistF32(*distance), *node)))
             .collect();
-        let mut results: BinaryHeap<(DistF32, usize)> = entry_points
+        let mut results: BinaryHeap<(DistF32, RowId, usize)> = entry_points
             .iter()
-            .map(|(distance, node)| (DistF32(*distance), *node))
+            .map(|(distance, node)| (DistF32(*distance), self.row_ids[*node], *node))
             .collect();
 
         while let Some(Reverse((candidate_distance, candidate))) = candidates.pop() {
             checkpoint()?;
             let worst = results
                 .peek()
-                .map(|(distance, _)| distance.0)
+                .map(|(distance, _, _)| distance.0)
                 .unwrap_or(f32::INFINITY);
             if candidate_distance.0 > worst && results.len() >= ef {
                 break;
@@ -608,11 +632,11 @@ impl DenseHnsw {
                     let distance = cosine_distance(query, &self.vectors[neighbor]);
                     let worst = results
                         .peek()
-                        .map(|(distance, _)| distance.0)
-                        .unwrap_or(f32::INFINITY);
-                    if distance < worst || results.len() < ef {
+                        .map(|(distance, row_id, _)| (*distance, *row_id))
+                        .unwrap_or((DistF32(f32::INFINITY), RowId(u64::MAX)));
+                    if (DistF32(distance), self.row_ids[neighbor]) < worst || results.len() < ef {
                         candidates.push(Reverse((DistF32(distance), neighbor)));
-                        results.push((DistF32(distance), neighbor));
+                        results.push((DistF32(distance), self.row_ids[neighbor], neighbor));
                         if results.len() > ef {
                             results.pop();
                         }
@@ -622,7 +646,7 @@ impl DenseHnsw {
         }
         Ok(results
             .into_iter()
-            .map(|(distance, node)| (distance.0, node))
+            .map(|(distance, _, node)| (distance.0, node))
             .collect())
     }
 
@@ -639,15 +663,15 @@ impl DenseHnsw {
             .iter()
             .map(|(d, n)| Reverse((DistF32(*d), *n)))
             .collect();
-        let mut results: BinaryHeap<(DistF32, usize)> = entry_points
+        let mut results: BinaryHeap<(DistF32, RowId, usize)> = entry_points
             .iter()
-            .map(|(d, n)| (DistF32(*d), *n))
+            .map(|(d, n)| (DistF32(*d), self.row_ids[*n], *n))
             .collect();
         while let Some(Reverse((cd, c))) = candidates.pop() {
             if let Some(context) = context {
                 context.checkpoint()?;
             }
-            let worst = results.peek().map(|(d, _)| d.0).unwrap_or(f32::INFINITY);
+            let worst = results.peek().map(|(d, _, _)| d.0).unwrap_or(f32::INFINITY);
             if cd.0 > worst && results.len() >= ef {
                 break;
             }
@@ -660,10 +684,13 @@ impl DenseHnsw {
                         ))?;
                     }
                     let d = cosine_distance(query, &self.vectors[e]);
-                    let w = results.peek().map(|(dd, _)| dd.0).unwrap_or(f32::INFINITY);
-                    if d < w || results.len() < ef {
+                    let worst = results
+                        .peek()
+                        .map(|(distance, row_id, _)| (*distance, *row_id))
+                        .unwrap_or((DistF32(f32::INFINITY), RowId(u64::MAX)));
+                    if (DistF32(d), self.row_ids[e]) < worst || results.len() < ef {
                         candidates.push(Reverse((DistF32(d), e)));
-                        results.push((DistF32(d), e));
+                        results.push((DistF32(d), self.row_ids[e], e));
                         if results.len() > ef {
                             results.pop();
                         }
@@ -671,7 +698,7 @@ impl DenseHnsw {
                 }
             }
         }
-        Ok(results.into_iter().map(|(d, n)| (d.0, n)).collect())
+        Ok(results.into_iter().map(|(d, _, n)| (d.0, n)).collect())
     }
 }
 
@@ -696,12 +723,12 @@ mod dense_tests {
     #[test]
     fn dense_finds_exact_match() {
         let mut h = DenseHnsw::new(3, 8, 32);
-        h.insert(vec![1.0, 0.0, 0.0], RowId(0));
-        h.insert(vec![0.0, 1.0, 0.0], RowId(1));
-        h.insert(vec![1.0, 0.0, 0.0], RowId(2));
+        h.insert(vec![1.0, 0.0, 0.0], RowId(100));
+        h.insert(vec![0.0, 1.0, 0.0], RowId(2));
+        h.insert(vec![1.0, 0.0, 0.0], RowId(1));
         let top = h.search(&[1.0, 0.0, 0.0], 1, 32);
         assert_eq!(top[0].1, 0.0);
-        assert!(top[0].0 == RowId(0) || top[0].0 == RowId(2));
+        assert_eq!(top[0].0, RowId(1));
     }
 
     #[test]

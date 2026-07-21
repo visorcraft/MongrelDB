@@ -101,20 +101,40 @@ impl IvfBackend {
         dim: usize,
         nlist: usize,
         nprobe: usize,
+        training_samples: usize,
         centroids: Vec<Vec<f32>>,
         lists: BTreeMap<usize, Vec<(RowId, Vec<f32>)>>,
         seed: u64,
-    ) -> Self {
-        Self {
+    ) -> std::result::Result<Self, String> {
+        if dim == 0
+            || nlist == 0
+            || nprobe == 0
+            || nprobe > nlist
+            || training_samples == 0
+            || centroids.is_empty()
+            || centroids.len() > nlist
+            || centroids
+                .iter()
+                .any(|centroid| centroid.len() != dim || centroid.iter().any(|v| !v.is_finite()))
+            || lists.iter().any(|(cell, rows)| {
+                *cell >= centroids.len()
+                    || rows.iter().any(|(_, vector)| {
+                        vector.len() != dim || vector.iter().any(|v| !v.is_finite())
+                    })
+            })
+        {
+            return Err("ANN IVF checkpoint contains invalid centroids or lists".into());
+        }
+        Ok(Self {
             dim,
             nlist,
             nprobe,
-            training_samples: IvfOptions::default().training_samples,
+            training_samples,
             centroids: Some(centroids),
             lists,
             pending: BTreeMap::new(),
             seed,
-        }
+        })
     }
 }
 
