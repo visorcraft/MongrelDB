@@ -1,6 +1,6 @@
 [package]
 name = "mongreldb-server"
-version = "0.62.0"
+version = "0.63.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "HTTP daemon for MongrelDB — serves SQL, native queries, and typed Kit API over HTTP for multi-process access."
@@ -15,21 +15,21 @@ name = "mongreldb_server"
 path = "src/lib.rs"
 
 [dependencies]
-mongreldb-core = { path = "../mongreldb-core", version = "0.62.0" }
-mongreldb-query = { path = "../mongreldb-query", version = "0.62.0" }
-mongreldb-protocol = { path = "../mongreldb-protocol", version = "0.62.0" }
+mongreldb-core = { path = "../mongreldb-core", version = "0.63.0" }
+mongreldb-query = { path = "../mongreldb-query", version = "0.63.0" }
+mongreldb-protocol = { path = "../mongreldb-protocol", version = "0.63.0" }
 # The protocol crate's public API is parameterized over these shared ids/HLC
 # types (DatabaseId, TransactionId, HlcTimestamp, MetadataVersion, ...); the
 # server must name them to build protocol records.
-mongreldb-types = { path = "../mongreldb-types", version = "0.62.0" }
+mongreldb-types = { path = "../mongreldb-types", version = "0.63.0" }
 # Commit receipts surfaced by the core's idempotent-commit path are typed over
 # the commit log's `CommitReceipt`/`DurabilityLevel`; the server names them
 # when echoing receipt fields back in idempotent-write responses (S1B-005).
-mongreldb-log = { path = "../mongreldb-log", version = "0.62.0" }
+mongreldb-log = { path = "../mongreldb-log", version = "0.63.0" }
 # Cluster bootstrap workflows (spec section 11.1, S2A-002): the `cluster`/`node`
 # CLI subcommands and the `/admin/cluster/*` endpoints map onto this crate's
 # node-identity and membership functions.
-mongreldb-cluster = { path = "../mongreldb-cluster", version = "0.62.0" }
+mongreldb-cluster = { path = "../mongreldb-cluster", version = "0.63.0" }
 axum = "0.8"
 tower = { version = "0.5", features = ["limit"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
@@ -55,6 +55,6 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage
 [dev-dependencies]
 tower = "0.5"
 tempfile = "3"
-mongreldb-client = { path = "../mongreldb-client", version = "0.62.0" }
+mongreldb-client = { path = "../mongreldb-client", version = "0.63.0" }
 datafusion = "54.0.0"
 rcgen = "0.13"
