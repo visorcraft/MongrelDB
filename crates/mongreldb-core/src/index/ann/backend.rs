@@ -56,6 +56,15 @@ pub(crate) enum AnnBackendCheckpoint {
     HnswBinarySign { bytes_per_vec: usize, graph: Hnsw },
     /// Dense cosine HNSW graph (full-precision f32 vectors).
     HnswDense { graph: DenseHnsw },
+    /// DiskANN (Vamana) single-layer graph over Dense vectors (Phase 4).
+    DiskAnn {
+        dim: usize,
+        r: usize,
+        l: usize,
+        beam_width: usize,
+        alpha: u32,
+        graph: crate::index::ann::diskann::DiskAnnBackend,
+    },
     /// Product-quantized flat backend: trained codebook + RowId-keyed codes.
     Product {
         dim: usize,

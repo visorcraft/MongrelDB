@@ -659,6 +659,8 @@ impl IndexDef {
                 // algorithm field is Hnsw for compatibility; graph-accelerated
                 // PQ composes on top of the representation in a later phase.
                 (AnnAlgorithm::Hnsw, AnnQuantization::Product { .. }) => true,
+                // Phase 4: DiskANN (Vamana) over Dense vectors.
+                (AnnAlgorithm::DiskAnn, AnnQuantization::Dense) => true,
                 _ => false,
             };
             if !supported {
