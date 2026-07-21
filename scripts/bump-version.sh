@@ -106,4 +106,11 @@ Then, per AGENTS.md "Releases":
   git tag -a v$NEW -m "v$NEW — <one-line summary>"
   git push origin master && git push origin v$NEW
 CI publishes to npm and crates.io automatically on the tag push.
+
+After crates.io contains $NEW, refresh the standalone aggregate locks and
+commit them before dispatching ffi-release.yml from master:
+  cargo update --manifest-path crates/mongreldb-jni/Cargo.toml -p mongreldb-core --precise $NEW
+  cargo update --manifest-path crates/mongreldb-jni/Cargo.toml -p mongreldb-query --precise $NEW
+  cargo update --manifest-path crates/mongreldb-kit-ffi/Cargo.toml -p mongreldb-core --precise $NEW
+  cargo update --manifest-path crates/mongreldb-kit-ffi/Cargo.toml -p mongreldb-query --precise $NEW
 EOF

@@ -10,8 +10,8 @@
 #            Rust drops the unsupported `cdylib` crate type for that target)
 #   include/mongreldb.h
 #
-# Triggered on the same `v*` tag push as release.yml. Runs in parallel with
-# the other release jobs (it does not depend on crates.io or npm publishing).
+# Dispatched after the engine crates reach crates.io. The standalone FFI/JNI
+# locks resolve registry engine crates, so this cannot race the tag publish.
 #
 # Platform matrix (6 targets, all built natively - no QEMU):
 #   linux-x64-gnu      ubuntu-latest     x86_64-unknown-linux-gnu
@@ -23,9 +23,6 @@
 name: FFI Release
 
 on:
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
     inputs:
       tag:
