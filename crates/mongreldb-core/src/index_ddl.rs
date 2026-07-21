@@ -808,6 +808,39 @@ impl Database {
             }
             if let Some(def) = &definition {
                 def.validate_options()?;
+                // Product-quantization divisibility: num_subvectors must evenly
+                // divide the column dimension. This can't be checked in
+                // validate_options (no column context), so it's enforced here
+                // at DDL submit time — fail closed with a typed Schema error
+                // rather than a panic inside ProductQuantizer::train at freeze.
+                if let crate::schema::AnnQuantization::Product { num_subvectors, .. } = def
+                    .options
+                    .ann
+                    .as_ref()
+                    .map(|o| o.quantization)
+                    .unwrap_or_default()
+                {
+                    let dim = entry
+                        .schema
+                        .columns
+                        .iter()
+                        .find(|c| c.id == def.column_id)
+                        .and_then(|c| match c.ty {
+                            crate::schema::TypeId::Embedding { dim } => Some(dim as usize),
+                            _ => None,
+                        })
+                        .ok_or_else(|| {
+                            JobError::Phase(format!(
+                                "ANN index {} references a non-embedding column",
+                                def.name
+                            ))
+                        })?;
+                    if dim == 0 || dim % num_subvectors as usize != 0 {
+                        return Err(MongrelError::Schema(format!(
+                            "product quantization num_subvectors ({num_subvectors}) must evenly divide the column dimension ({dim})"
+                        )));
+                    }
+                }
             }
             // Pure apply against a clone of the schema image (via catalog
             // command) catches name/column/AI conflicts fail closed.
@@ -1792,6 +1825,98 @@ mod tests {
         assert!(!hits
             .iter()
             .any(|hit| matches!(hit.score, RetrieverScore::AnnCosineDistance(_))));
+    }
+
+    #[test]
+    fn replace_hnsw_with_diskann_changes_algorithm_online() {
+        // The TODO requires algorithm changes (not just quantization) to go
+        // through online replace_index. This test replaces an HNSW+Dense index
+        // with DiskANN+Dense and verifies search works after the swap.
+        let _lock = lock_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::create(dir.path()).unwrap();
+        db.create_table("docs", embedding_schema(AnnQuantization::Dense))
+            .unwrap();
+        put_row(&db, "docs", 1, vec![1.0, 0.0, 0.0, 0.0]);
+        put_row(&db, "docs", 2, vec![0.0, 1.0, 0.0, 0.0]);
+
+        let new_def = IndexDef {
+            name: "idx_embed_ann".into(),
+            column_id: 2,
+            kind: IndexKind::Ann,
+            predicate: None,
+            options: IndexOptions {
+                ann: Some(AnnOptions {
+                    m: 8,
+                    ef_construction: 32,
+                    ef_search: 16,
+                    quantization: AnnQuantization::Dense,
+                    algorithm: crate::schema::AnnAlgorithm::DiskAnn,
+                    diskann: Some(crate::schema::DiskAnnOptions {
+                        r: 8,
+                        l: 16,
+                        beam_width: 4,
+                        alpha: 120,
+                    }),
+                    ..AnnOptions::default()
+                }),
+                ..IndexOptions::default()
+            },
+        };
+        let job_id = db.replace_index("docs", "idx_embed_ann", new_def).unwrap();
+        let record = db.job_registry().get(job_id).unwrap();
+        assert_eq!(record.state, crate::jobs::JobState::Succeeded);
+
+        let handle = db.table("docs").unwrap();
+        let mut table = handle.lock();
+        let hits = table
+            .retrieve(&Retriever::Ann {
+                column_id: 2,
+                query: vec![1.0, 0.0, 0.0, 0.0],
+                k: 2,
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        // DiskANN scores by cosine distance (f32), matching Dense.
+        assert!(matches!(
+            hits[0].score,
+            RetrieverScore::AnnCosineDistance(d) if d.abs() < 1e-5
+        ));
+    }
+
+    #[test]
+    fn product_quantization_dimension_divisibility_rejected_at_ddl() {
+        // The PQ divisibility check must fire at DDL submit time with a typed
+        // Schema error, not as a panic inside ProductQuantizer::train at freeze.
+        let _lock = lock_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::create(dir.path()).unwrap();
+        db.create_table("docs", embedding_schema(AnnQuantization::Dense))
+            .unwrap();
+        // dim=4, num_subvectors=3 — does not divide. Must be rejected.
+        let bad_def = IndexDef {
+            name: "idx_bad_pq".into(),
+            column_id: 2,
+            kind: IndexKind::Ann,
+            predicate: None,
+            options: IndexOptions {
+                ann: Some(AnnOptions {
+                    quantization: AnnQuantization::Product {
+                        num_subvectors: 3,
+                        bits: 8,
+                    },
+                    product: Some(crate::schema::ProductQuantizerOptions::default()),
+                    ..AnnOptions::default()
+                }),
+                ..IndexOptions::default()
+            },
+        };
+        let err = db.create_index("docs", bad_def).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("must evenly divide the column dimension"),
+            "expected divisibility error, got: {err}"
+        );
     }
 
     #[test]

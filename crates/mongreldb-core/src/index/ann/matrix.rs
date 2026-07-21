@@ -29,6 +29,7 @@ fn options_for(algorithm: AnnAlgorithm, quantization: AnnQuantization) -> AnnOpt
         ivf: (algorithm == AnnAlgorithm::Ivf).then_some(IvfOptions {
             nlist: 8,
             nprobe: 4,
+            ..Default::default()
         }),
         product: matches!(quantization, AnnQuantization::Product { .. }).then_some(
             ProductQuantizerOptions {

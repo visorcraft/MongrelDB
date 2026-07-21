@@ -438,6 +438,7 @@ fn ivf_options_from_c(options: &mongreldb_index_options_v2) -> Option<IvfOptions
         } else {
             options.ivf_nprobe
         },
+        training_samples: defaults.training_samples,
     })
 }
 

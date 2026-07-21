@@ -704,7 +704,11 @@ impl AnnIndex {
                         &AnnOptions {
                             algorithm: crate::schema::AnnAlgorithm::Ivf,
                             quantization: AnnQuantization::Dense,
-                            ivf: Some(crate::schema::IvfOptions { nlist, nprobe }),
+                            ivf: Some(crate::schema::IvfOptions {
+                                nlist,
+                                nprobe,
+                                ..Default::default()
+                            }),
                             ..AnnOptions::default()
                         },
                     ),
@@ -1689,7 +1693,11 @@ mod tests {
             quantization: AnnQuantization::Dense,
             algorithm: crate::schema::AnnAlgorithm::Ivf,
             diskann: None,
-            ivf: Some(crate::schema::IvfOptions { nlist, nprobe }),
+            ivf: Some(crate::schema::IvfOptions {
+                nlist,
+                nprobe,
+                ..Default::default()
+            }),
             product: None,
         };
         AnnIndex::with_full_options(dim, 16, 64, 64, &options)

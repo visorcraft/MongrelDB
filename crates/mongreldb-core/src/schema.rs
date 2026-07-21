@@ -422,6 +422,10 @@ pub struct IvfOptions {
     /// Number of lists to probe at query time. Default 8. Must be <= `nlist`.
     #[serde(default = "default_ivf_nprobe")]
     pub nprobe: usize,
+    /// Cap on training samples drawn from the active delta for k-means.
+    /// Default 256_000. Training cost is bounded by this value.
+    #[serde(default = "default_ivf_training_samples")]
+    pub training_samples: usize,
 }
 
 impl Default for IvfOptions {
@@ -429,6 +433,7 @@ impl Default for IvfOptions {
         Self {
             nlist: default_ivf_nlist(),
             nprobe: default_ivf_nprobe(),
+            training_samples: default_ivf_training_samples(),
         }
     }
 }
@@ -438,6 +443,9 @@ const fn default_ivf_nlist() -> usize {
 }
 const fn default_ivf_nprobe() -> usize {
     8
+}
+const fn default_ivf_training_samples() -> usize {
+    256_000
 }
 
 /// Product-quantizer training parameters. Used only when
@@ -453,9 +461,10 @@ pub struct ProductQuantizerOptions {
     /// byte-identical codebooks (checkpoint reproducibility).
     #[serde(default = "default_pq_seed")]
     pub seed: u64,
-    /// Exact-rerank factor: the top `k * rerank_factor` ADC candidates are
-    /// reranked against retained Dense vectors. `0` disables rerank (ADC only).
-    /// Default 5.
+    /// Rerank factor: the top `k * rerank_factor` ADC candidates are reranked
+    /// using reconstructed approximate vectors (centroid concatenation) for
+    /// improved ranking quality. `0` disables rerank (ADC only). Default 5.
+    /// This is not a true exact rerank — see `pq_backend.rs` docs.
     #[serde(default = "default_pq_rerank_factor")]
     pub rerank_factor: usize,
 }
@@ -1760,6 +1769,7 @@ mod tests {
             ivf: Some(IvfOptions {
                 nlist: 16,
                 nprobe: 32,
+                ..Default::default()
             }),
             ..AnnOptions::default()
         };

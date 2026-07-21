@@ -4,11 +4,16 @@
 //! ranks candidates by asymmetric distance computation (ADC) over a trained
 //! codebook. This is the "flat PQ" formulation (FAISS `IndexPQ`): search is a
 //! bounded scan of all codes against the query's ADC lookup table, optionally
-//! followed by exact rerank over reconstructed approximations.
+//! followed by a second-stage rerank. The rerank uses **reconstructed
+//! approximate vectors** (centroid concatenation), not the original Dense
+//! vectors — the Dense source is dropped at freeze to deliver PQ's memory
+//! savings. The rerank improves ranking quality over plain ADC but is itself
+//! approximate; a future enhancement may optionally retain Dense vectors for
+//! the rerank window to provide true exact rerank at higher memory cost.
 //!
-//! Flat PQ is correct and bounded: recall depends only on codebook quality
-//! (subvector count, training data), not on graph structure, so it is the
-//! natural baseline for PQ. Graph-accelerated PQ (HNSW or IVF over codes)
+//! Flat PQ is correct and bounded: recall depends primarily on codebook
+//! quality (subvector count, training data), not on graph structure, so it is
+//! the natural baseline for PQ. Graph-accelerated PQ (HNSW or IVF over codes)
 //! composes on top of this representation in a later phase.
 //!
 //! ## Determinism

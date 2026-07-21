@@ -19,13 +19,15 @@
 //! foundation for the merge/consolidation guarantee that a rebuilt base
 //! matches a base-only build.
 //!
-//! ## Exact rerank
+//! ## Rerank
 //!
-//! ADC distance is approximate. For recall-critical workloads the orchestrator
-//! retains the original Dense vectors and reranks the top `k * rerank_factor`
-//! ADC candidates exactly (cosine distance), matching the base+delta exact
-//! rerank guarantee in [`super`]. Rerank is the orchestrator's responsibility;
-//! this module only trains, encodes, and scores.
+//! ADC distance is approximate. The PQ backend optionally reranks the top
+//! `k * rerank_factor` ADC candidates using **reconstructed approximate
+//! vectors** (centroid concatenation), which improves ranking quality over
+//! plain ADC. This is not a true exact rerank — the original Dense vectors are
+//! dropped at freeze to deliver PQ's memory savings. A future enhancement may
+//! optionally retain Dense vectors for the rerank window to provide true exact
+//! rerank at higher memory cost.
 
 use crate::schema::ProductQuantizerOptions;
 
@@ -63,12 +65,15 @@ impl ProductQuantizer {
         if samples.is_empty() || dim == 0 || num_subvectors == 0 {
             return None;
         }
-        assert_eq!(bits, 8, "only 8-bit product quantization is supported");
-        assert_eq!(
+        debug_assert_eq!(bits, 8, "only 8-bit product quantization is supported");
+        debug_assert_eq!(
             dim % num_subvectors,
             0,
             "num_subvectors must evenly divide dim"
         );
+        if bits != 8 || !dim.is_multiple_of(num_subvectors) {
+            return None;
+        }
         let subvector_dim = dim / num_subvectors;
         let k = 1usize << bits; // 256 at bits=8
                                 // Deterministic sample selection + ordering. The seed is mixed in so

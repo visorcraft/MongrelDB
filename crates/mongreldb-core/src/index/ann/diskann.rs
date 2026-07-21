@@ -6,10 +6,16 @@
 //! that favors diversity (a candidate is pruned if it is closer to an already
 //! selected neighbor than to the query by factor `alpha`).
 //!
-//! Search is a greedy beam walk from a fixed entry point: at each step the
-//! `beam_width` closest unvisited candidates are expanded. This is the
-//! standard DiskANN search (Jayaram Subramanya et al.), bounded by the
-//! work-budget/deadline via [`AiExecutionContext`].
+//! Search is a greedy beam walk from a fixed entry point. The `beam_width`
+//! parameter floors the search candidate-list size (ensuring at least that
+//! many candidates are considered per expansion round); in our embedded model
+//! there is no separate on-disk vector file, so `beam_width` does not bound
+//! SSD I/O as in the original DiskANN paper — it is a search-quality floor.
+//! Search is bounded by the work-budget/deadline via [`AiExecutionContext`]
+//! (checkpoint + work-consume per candidate expansion). The build path is
+//! currently uninterruptible within a single vector insertion (coarse
+//! per-row cancellation only); a future enhancement may thread the context
+//! through the build search calls.
 //!
 //! ## Determinism
 //!

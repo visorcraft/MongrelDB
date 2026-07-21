@@ -857,6 +857,7 @@ fn index_definition(spec: IndexSpec) -> IndexDef {
                             .nprobe
                             .map(|v| v as usize)
                             .unwrap_or(defaults.nprobe),
+                        training_samples: defaults.training_samples,
                     }
                 }),
                 product: spec.product.as_ref().map(|options| {

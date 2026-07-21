@@ -34,6 +34,9 @@ pub(crate) struct IvfBackend {
     dim: usize,
     nlist: usize,
     nprobe: usize,
+    /// Cap on training samples for k-means centroid training. Bounds the
+    /// O(iterations × samples × nlist × dim) training cost.
+    training_samples: usize,
     /// `None` for the active delta (centroids trained at freeze); `Some` for a
     /// frozen layer.
     centroids: Option<Vec<Vec<f32>>>,
@@ -54,6 +57,7 @@ impl IvfBackend {
             dim,
             nlist: options.nlist,
             nprobe: options.nprobe,
+            training_samples: options.training_samples,
             centroids: None,
             lists: BTreeMap::new(),
             pending: BTreeMap::new(),
@@ -62,12 +66,25 @@ impl IvfBackend {
     }
 
     /// Train centroids from buffered vectors, assign each to its nearest
-    /// centroid, and return the frozen representation.
+    /// centroid, and return the frozen representation. Training samples are
+    /// capped by `training_samples` to bound k-means cost.
     fn freeze_active(&self) -> Option<FrozenIvf> {
         if self.pending.is_empty() {
             return None;
         }
-        let samples: Vec<&[f32]> = self.pending.values().map(|v| v.as_slice()).collect();
+        // Cap training samples to bound the O(iterations × N × nlist × dim)
+        // k-means cost. Uses deterministic stride sampling matching the PQ
+        // backend's approach.
+        let all_samples: Vec<&[f32]> = self.pending.values().map(|v| v.as_slice()).collect();
+        let samples: Vec<&[f32]> = if all_samples.len() > self.training_samples {
+            let stride = all_samples.len() / self.training_samples;
+            let start = (splitmix64(self.seed) as usize) % stride.max(1);
+            (0..self.training_samples)
+                .map(|i| all_samples[(start + i * stride) % all_samples.len()])
+                .collect()
+        } else {
+            all_samples
+        };
         // Cap effective nlist by sample count so tiny training sets don't
         // produce empty cells.
         let effective_nlist = self.nlist.min(samples.len());
@@ -92,6 +109,7 @@ impl IvfBackend {
             dim,
             nlist,
             nprobe,
+            training_samples: IvfOptions::default().training_samples,
             centroids: Some(centroids),
             lists,
             pending: BTreeMap::new(),
@@ -218,6 +236,7 @@ impl AnnBackend for IvfBackend {
             &IvfOptions {
                 nlist: self.nlist,
                 nprobe: self.nprobe,
+                training_samples: self.training_samples,
             },
             self.seed,
         ))
@@ -235,6 +254,7 @@ impl AnnBackend for IvfBackend {
             dim: self.dim,
             nlist: self.nlist,
             nprobe: self.nprobe,
+            training_samples: self.training_samples,
             centroids: None,
             lists: BTreeMap::new(),
             pending,
@@ -343,7 +363,15 @@ mod tests {
     use super::*;
 
     fn backend(dim: usize, nlist: usize, nprobe: usize) -> IvfBackend {
-        IvfBackend::new(dim, &IvfOptions { nlist, nprobe }, 0x9E37_79B9_7F4A_7C15)
+        IvfBackend::new(
+            dim,
+            &IvfOptions {
+                nlist,
+                nprobe,
+                ..Default::default()
+            },
+            0x9E37_79B9_7F4A_7C15,
+        )
     }
 
     #[test]
