@@ -19,8 +19,8 @@ crate-type = ["cdylib"]
 # The Kit crate wraps the engine with schema model, migrations, and query
 # builder execution. crates.io kit; monorepo engine patches force local
 # core/query (e.g. empty ANN checkpoint reopen) without a sibling kit tree.
-mongreldb-kit = "=0.62.0"
-mongreldb-kit-core = "=0.62.0"
+mongreldb-kit = "=0.63.0"
+mongreldb-kit-core = "=0.63.0"
 # Stable 20-category taxonomy (FND-007) for structural binding surfaces.
 mongreldb-types = { path = "../mongreldb-types", version = "0.63.0" }
 # The jni crate provides Rust bindings to the JNI API.
