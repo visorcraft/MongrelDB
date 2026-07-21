@@ -1300,7 +1300,10 @@ mod tests {
         assert_eq!(ann.algorithm, AnnAlgorithm::DiskAnn);
         assert_eq!(ann.quantization, AnnQuantization::Dense);
         let diskann = ann.diskann.as_ref().expect("diskann options");
-        assert_eq!((diskann.r, diskann.l, diskann.beam_width, diskann.alpha), (128, 256, 4, 130));
+        assert_eq!(
+            (diskann.r, diskann.l, diskann.beam_width, diskann.alpha),
+            (128, 256, 4, 130)
+        );
         // A second run with HNSW + Dense confirms the non-DiskANN field path.
         let mut builder = SchemaBuilder::new();
         let column_name = CString::new("embedding").unwrap();
