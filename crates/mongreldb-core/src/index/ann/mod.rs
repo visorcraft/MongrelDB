@@ -29,6 +29,7 @@
 
 pub(crate) mod backend;
 pub(crate) mod diskann;
+pub(crate) mod ivf;
 pub(crate) mod pq_backend;
 pub(crate) mod product;
 
@@ -443,6 +444,23 @@ impl AnnIndex {
                 alpha,
                 graph,
             },
+            (
+                AnnQuantization::Dense,
+                AnnBackendCheckpoint::Ivf {
+                    dim: _,
+                    nlist,
+                    nprobe,
+                    centroids,
+                    lists,
+                    seed,
+                },
+            ) => AnnCheckpointPayload::Ivf {
+                nlist,
+                nprobe,
+                centroids,
+                lists,
+                seed,
+            },
             _ => unreachable!("quantization/backend tag mismatch in freeze"),
         };
         bincode::serialize(&AnnCheckpoint {
@@ -652,6 +670,44 @@ impl AnnIndex {
                     active,
                 })
             }
+            (
+                AnnQuantization::Dense,
+                AnnCheckpointPayload::Ivf {
+                    nlist,
+                    nprobe,
+                    centroids,
+                    lists,
+                    seed,
+                },
+            ) => {
+                let backend = ivf::IvfBackend::from_checkpoint(
+                    checkpoint.dim,
+                    nlist,
+                    nprobe,
+                    centroids,
+                    lists,
+                    seed,
+                );
+                Ok(Self {
+                    dim: checkpoint.dim,
+                    m: checkpoint.m,
+                    ef_construction: checkpoint.ef_construction,
+                    ef_search: checkpoint.ef_search,
+                    quantization: AnnQuantization::Dense,
+                    frozen: Arc::new(vec![Arc::new(backend) as Arc<dyn AnnBackend>]),
+                    active: new_backend(
+                        checkpoint.dim,
+                        checkpoint.m,
+                        checkpoint.ef_construction,
+                        &AnnOptions {
+                            algorithm: crate::schema::AnnAlgorithm::Ivf,
+                            quantization: AnnQuantization::Dense,
+                            ivf: Some(crate::schema::IvfOptions { nlist, nprobe }),
+                            ..AnnOptions::default()
+                        },
+                    ),
+                })
+            }
             _ => Err("ANN checkpoint quantization/payload tag mismatch".into()),
         }
     }
@@ -725,11 +781,13 @@ fn new_backend(
         }
         (AnnAlgorithm::DiskAnn, AnnQuantization::Dense) => {
             let diskann = options.diskann.clone().unwrap_or_default();
-            // Fixed seed for deterministic graph construction (entry-point
-            // selection + robust-prune tie-breaks). Matches the engine's
-            // canonical HNSW/PQ seed.
             const DISKANN_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
             Box::new(diskann::DiskAnnBackend::new(dim, &diskann, DISKANN_SEED))
+        }
+        (AnnAlgorithm::Ivf, AnnQuantization::Dense) => {
+            let ivf = options.ivf.clone().unwrap_or_default();
+            const IVF_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+            Box::new(ivf::IvfBackend::new(dim, &ivf, IVF_SEED))
         }
         (
             _,
@@ -828,6 +886,14 @@ enum AnnCheckpointPayload {
         beam_width: usize,
         alpha: u32,
         graph: diskann::DiskAnnBackend,
+    },
+    /// IVF centroids + inverted lists over Dense vectors (Phase 5).
+    Ivf {
+        nlist: usize,
+        nprobe: usize,
+        centroids: Vec<Vec<f32>>,
+        lists: std::collections::BTreeMap<usize, Vec<(RowId, Vec<f32>)>>,
+        seed: u64,
     },
 }
 
@@ -1599,6 +1665,104 @@ mod tests {
             q[(batch * 4) % dim] = 1.0;
             queries.push(q);
         }
+        let before: Vec<_> = queries
+            .iter()
+            .map(|q| index.search(q, 4).unwrap())
+            .collect();
+        index.merge_deltas_into_base();
+        assert_eq!(index.frozen_layer_count(), 1);
+        for (q, expected) in queries.iter().zip(before) {
+            let after = index.search(q, 4).unwrap();
+            assert_eq!(after.len(), expected.len());
+        }
+    }
+
+    // ── IVF (Phase 5) ────────────────────────────────────────────────────
+
+    fn ivf_index(dim: usize, nlist: usize, nprobe: usize) -> AnnIndex {
+        let options = AnnOptions {
+            m: 16,
+            ef_construction: 64,
+            ef_search: 64,
+            quantization: AnnQuantization::Dense,
+            algorithm: crate::schema::AnnAlgorithm::Ivf,
+            diskann: None,
+            ivf: Some(crate::schema::IvfOptions { nlist, nprobe }),
+            product: None,
+        };
+        AnnIndex::with_full_options(dim, 16, 64, 64, &options)
+    }
+
+    #[test]
+    fn ivf_index_searches_and_finds_cluster_members() {
+        let dim = 16;
+        let mut index = ivf_index(dim, 4, 2);
+        for cluster in 0..4u32 {
+            for member in 0..8u32 {
+                let mut v = vec![0f32; dim];
+                v[(cluster as usize) * 4] = 1.0;
+                v[(cluster as usize) * 4 + 1] = (member as f32) * 0.001;
+                index
+                    .insert(&v, RowId((cluster * 8 + member) as u64))
+                    .unwrap();
+            }
+        }
+        let mut query = vec![0f32; dim];
+        query[8] = 1.0; // cluster 2
+        let top = index.search(&query, 4).unwrap();
+        assert_eq!(top.len(), 4);
+        for (row_id, _) in &top {
+            assert!(
+                (16..24).contains(&row_id.0),
+                "expected cluster 2 members, got row {}",
+                row_id.0
+            );
+        }
+    }
+
+    #[test]
+    fn ivf_checkpoint_round_trips() {
+        let dim = 16;
+        let mut index = ivf_index(dim, 4, 2);
+        for i in 0..16u64 {
+            let mut v = vec![0f32; dim];
+            v[(i as usize) % dim] = 1.0;
+            index.insert(&v, RowId(i)).unwrap();
+        }
+        let frozen = index.freeze();
+        let thawed = AnnIndex::thaw(&frozen).unwrap();
+        assert_eq!(thawed.dim(), dim);
+        assert_eq!(thawed.len(), 16);
+        let mut query = vec![0f32; dim];
+        query[0] = 1.0;
+        let before = index.search(&query, 5).unwrap();
+        let after = thawed.search(&query, 5).unwrap();
+        assert_eq!(before.len(), after.len());
+        assert_eq!(before[0].0, after[0].0);
+    }
+
+    #[test]
+    fn ivf_consolidation_preserves_results() {
+        let dim = 16;
+        let mut index = ivf_index(dim, 4, 2);
+        for batch in 0..3u32 {
+            for member in 0..8u32 {
+                let mut v = vec![0f32; dim];
+                v[(batch as usize) * 4 % dim] = 1.0;
+                v[1] = (member as f32) * 0.001;
+                index
+                    .insert(&v, RowId((batch * 8 + member) as u64))
+                    .unwrap();
+            }
+            index.seal();
+        }
+        let queries: Vec<Vec<f32>> = (0..3)
+            .map(|batch| {
+                let mut q = vec![0f32; dim];
+                q[(batch * 4) % dim] = 1.0;
+                q
+            })
+            .collect();
         let before: Vec<_> = queries
             .iter()
             .map(|q| index.search(q, 4).unwrap())

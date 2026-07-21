@@ -74,6 +74,15 @@ pub(crate) enum AnnBackendCheckpoint {
         quantizer: ProductQuantizer,
         codes: BTreeMap<RowId, Vec<u8>>,
     },
+    /// IVF backend (Phase 5): trained centroids + per-cell inverted lists.
+    Ivf {
+        dim: usize,
+        nlist: usize,
+        nprobe: usize,
+        centroids: Vec<Vec<f32>>,
+        lists: BTreeMap<usize, Vec<(RowId, Vec<f32>)>>,
+        seed: u64,
+    },
 }
 
 /// The contract every concrete ANN algorithm implements. The orchestrator

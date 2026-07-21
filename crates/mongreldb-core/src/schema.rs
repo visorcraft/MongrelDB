@@ -661,6 +661,8 @@ impl IndexDef {
                 (AnnAlgorithm::Hnsw, AnnQuantization::Product { .. }) => true,
                 // Phase 4: DiskANN (Vamana) over Dense vectors.
                 (AnnAlgorithm::DiskAnn, AnnQuantization::Dense) => true,
+                // Phase 5: IVF (k-means centroids + inverted lists) over Dense.
+                (AnnAlgorithm::Ivf, AnnQuantization::Dense) => true,
                 _ => false,
             };
             if !supported {
