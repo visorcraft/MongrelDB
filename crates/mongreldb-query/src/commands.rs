@@ -13,9 +13,9 @@ use mongreldb_core::memtable::{Row, Value};
 use mongreldb_core::procedure::{ProcedureCallOutput, ProcedureCallRow, StoredProcedure};
 use mongreldb_core::rowid::RowId;
 use mongreldb_core::schema::{
-    AlterColumn, AnnOptions, AnnQuantization, ColumnDef as CoreColumnDef, ColumnFlags, DefaultExpr,
-    IndexDef, IndexKind, IndexOptions, LearnedRangeOptions, MinHashOptions, Schema as CoreSchema,
-    TypeId,
+    AlterColumn, AnnAlgorithm, AnnOptions, AnnQuantization, ColumnDef as CoreColumnDef,
+    ColumnFlags, DefaultExpr, DiskAnnOptions, IndexDef, IndexKind, IndexOptions, IvfOptions,
+    LearnedRangeOptions, MinHashOptions, ProductQuantizerOptions, Schema as CoreSchema, TypeId,
 };
 use mongreldb_core::Database;
 use mongreldb_core::{
@@ -8500,6 +8500,12 @@ fn index_kind_from_sql(using: Option<&sqlparser::ast::IndexType>) -> Result<Inde
 
 fn parse_index_options(kind: IndexKind, expressions: &[Expr]) -> Result<IndexOptions> {
     let mut options = IndexOptions::default();
+    // Product-quantization representation fields arrive as separate integer
+    // options; assemble them into the `AnnQuantization::Product` variant after
+    // the loop once both are known.
+    let mut pq_pending_num_subvectors: Option<u16> = None;
+    let mut pq_pending_bits: Option<u8> = None;
+    let mut pq_requested = false;
     for expression in expressions {
         let Expr::BinaryOp { left, op, right } = expression else {
             return Err(MongrelQueryError::Schema(
@@ -8510,15 +8516,16 @@ fn parse_index_options(kind: IndexKind, expressions: &[Expr]) -> Result<IndexOpt
             return Err(MongrelQueryError::Schema(
                 "index WITH options must use name = integer".into(),
             ));
-        }
+        };
         let Expr::Identifier(name) = left.as_ref() else {
             return Err(MongrelQueryError::Schema(
                 "index option name must be an identifier".into(),
             ));
         };
         let option_name = name.value.to_ascii_lowercase();
-        if kind == IndexKind::Ann && option_name == "quantization" {
-            let quantization = match right.as_ref() {
+        // String-valued ANN options: `quantization` and `algorithm`.
+        if kind == IndexKind::Ann && (option_name == "quantization" || option_name == "algorithm") {
+            let string_value = match right.as_ref() {
                 Expr::Identifier(value) => value.value.clone(),
                 Expr::Value(value) => match &value.value {
                     SqlValue::SingleQuotedString(value) | SqlValue::DoubleQuotedString(value) => {
@@ -8528,19 +8535,46 @@ fn parse_index_options(kind: IndexKind, expressions: &[Expr]) -> Result<IndexOpt
                 },
                 _ => String::new(),
             };
-            let quantization = match quantization.as_str() {
-                "binary_sign" => AnnQuantization::BinarySign,
-                "dense" => AnnQuantization::Dense,
-                other => {
-                    return Err(MongrelQueryError::Schema(format!(
-                        "ANN quantization must be 'binary_sign' or 'dense', got {other:?}"
-                    )));
+            match option_name.as_str() {
+                "quantization" => {
+                    let quantization = match string_value.as_str() {
+                        "binary_sign" => AnnQuantization::BinarySign,
+                        "dense" => AnnQuantization::Dense,
+                        "product" => {
+                            pq_requested = true;
+                            // Assembled after the loop; use BinarySign as a
+                            // placeholder so the intermediate state is valid.
+                            AnnQuantization::BinarySign
+                        }
+                        other => {
+                            return Err(MongrelQueryError::Schema(format!(
+                                "ANN quantization must be 'binary_sign', 'dense', or 'product', got {other:?}"
+                            )));
+                        }
+                    };
+                    options
+                        .ann
+                        .get_or_insert_with(AnnOptions::default)
+                        .quantization = quantization;
                 }
-            };
-            options
-                .ann
-                .get_or_insert_with(AnnOptions::default)
-                .quantization = quantization;
+                "algorithm" => {
+                    let algorithm = match string_value.as_str() {
+                        "hnsw" => AnnAlgorithm::Hnsw,
+                        "diskann" => AnnAlgorithm::DiskAnn,
+                        "ivf" => AnnAlgorithm::Ivf,
+                        other => {
+                            return Err(MongrelQueryError::Schema(format!(
+                                "ANN algorithm must be 'hnsw', 'diskann', or 'ivf', got {other:?}"
+                            )));
+                        }
+                    };
+                    options
+                        .ann
+                        .get_or_insert_with(AnnOptions::default)
+                        .algorithm = algorithm;
+                }
+                _ => unreachable!("guarded by outer if"),
+            }
             continue;
         }
         let value = expr_to_usize(right).ok_or_else(|| {
@@ -8559,6 +8593,96 @@ fn parse_index_options(kind: IndexKind, expressions: &[Expr]) -> Result<IndexOpt
                     .ann
                     .get_or_insert_with(AnnOptions::default)
                     .ef_search = value
+            }
+            // DiskANN tuning (Phase 2 surface; the backend lands in Phase 4).
+            (IndexKind::Ann, "diskann_r") => {
+                options
+                    .ann
+                    .get_or_insert_with(AnnOptions::default)
+                    .diskann
+                    .get_or_insert_with(DiskAnnOptions::default)
+                    .r = value;
+            }
+            (IndexKind::Ann, "diskann_l") => {
+                options
+                    .ann
+                    .get_or_insert_with(AnnOptions::default)
+                    .diskann
+                    .get_or_insert_with(DiskAnnOptions::default)
+                    .l = value;
+            }
+            (IndexKind::Ann, "beam_width") => {
+                options
+                    .ann
+                    .get_or_insert_with(AnnOptions::default)
+                    .diskann
+                    .get_or_insert_with(DiskAnnOptions::default)
+                    .beam_width = value;
+            }
+            (IndexKind::Ann, "diskann_alpha") => {
+                options
+                    .ann
+                    .get_or_insert_with(AnnOptions::default)
+                    .diskann
+                    .get_or_insert_with(DiskAnnOptions::default)
+                    .alpha = value as u32;
+            }
+            // IVF tuning (Phase 2 surface; the backend lands in Phase 5).
+            (IndexKind::Ann, "nlist") => {
+                options
+                    .ann
+                    .get_or_insert_with(AnnOptions::default)
+                    .ivf
+                    .get_or_insert_with(IvfOptions::default)
+                    .nlist = value;
+            }
+            (IndexKind::Ann, "nprobe") => {
+                options
+                    .ann
+                    .get_or_insert_with(AnnOptions::default)
+                    .ivf
+                    .get_or_insert_with(IvfOptions::default)
+                    .nprobe = value;
+            }
+            // Product-quantization representation (stored on the variant).
+            (IndexKind::Ann, "num_subvectors") => {
+                pq_pending_num_subvectors = Some(u16::try_from(value).map_err(|_| {
+                    MongrelQueryError::Schema(format!(
+                        "num_subvectors must fit in u16, got {value}"
+                    ))
+                })?);
+            }
+            (IndexKind::Ann, "bits_per_subvector") => {
+                pq_pending_bits = Some(u8::try_from(value).map_err(|_| {
+                    MongrelQueryError::Schema(format!(
+                        "bits_per_subvector must fit in u8, got {value}"
+                    ))
+                })?);
+            }
+            // Product-quantizer training (Phase 2 surface; PQ lands in Phase 3).
+            (IndexKind::Ann, "pq_training_samples") => {
+                options
+                    .ann
+                    .get_or_insert_with(AnnOptions::default)
+                    .product
+                    .get_or_insert_with(ProductQuantizerOptions::default)
+                    .training_samples = value;
+            }
+            (IndexKind::Ann, "pq_seed") => {
+                options
+                    .ann
+                    .get_or_insert_with(AnnOptions::default)
+                    .product
+                    .get_or_insert_with(ProductQuantizerOptions::default)
+                    .seed = value as u64;
+            }
+            (IndexKind::Ann, "pq_rerank_factor") => {
+                options
+                    .ann
+                    .get_or_insert_with(AnnOptions::default)
+                    .product
+                    .get_or_insert_with(ProductQuantizerOptions::default)
+                    .rerank_factor = value;
             }
             (IndexKind::MinHash, "permutations") => {
                 options
@@ -8584,6 +8708,27 @@ fn parse_index_options(kind: IndexKind, expressions: &[Expr]) -> Result<IndexOpt
                 )))
             }
         }
+    }
+    // Assemble the Product quantization variant from the pending representation
+    // fields once both are known. `quantization = 'product'` without
+    // `num_subvectors` is rejected here (and again by validate_options).
+    if pq_requested {
+        if kind != IndexKind::Ann {
+            return Err(MongrelQueryError::Schema(
+                "product quantization options are only valid for ANN indexes".into(),
+            ));
+        }
+        let num_subvectors = pq_pending_num_subvectors.ok_or_else(|| {
+            MongrelQueryError::Schema("quantization = 'product' requires num_subvectors".into())
+        })?;
+        let bits = pq_pending_bits.unwrap_or(8);
+        options
+            .ann
+            .get_or_insert_with(AnnOptions::default)
+            .quantization = AnnQuantization::Product {
+            num_subvectors,
+            bits,
+        };
     }
     Ok(options)
 }
@@ -11072,6 +11217,112 @@ mod tests {
             .ann
             .unwrap();
         assert_eq!(dense.quantization, AnnQuantization::Dense);
+    }
+
+    #[test]
+    fn parse_index_options_ann_algorithm_and_diskann() {
+        let statement = Parser::parse_sql(
+            &GenericDialect {},
+            "CREATE INDEX ann ON docs USING ann (embedding) WITH (algorithm = 'diskann', quantization = 'dense', diskann_r = 128, diskann_l = 256, beam_width = 4, diskann_alpha = 130)",
+        )
+        .unwrap()
+        .remove(0);
+        let Statement::CreateIndex(index) = statement else {
+            panic!("expected CREATE INDEX")
+        };
+        let ann = parse_index_options(IndexKind::Ann, &index.with)
+            .unwrap()
+            .ann
+            .unwrap();
+        assert_eq!(ann.algorithm, AnnAlgorithm::DiskAnn);
+        assert_eq!(ann.quantization, AnnQuantization::Dense);
+        let diskann = ann.diskann.expect("diskann options");
+        assert_eq!(
+            (diskann.r, diskann.l, diskann.beam_width, diskann.alpha),
+            (128, 256, 4, 130)
+        );
+    }
+
+    #[test]
+    fn parse_index_options_ann_ivf() {
+        let statement = Parser::parse_sql(
+            &GenericDialect {},
+            "CREATE INDEX ann ON docs USING ann (embedding) WITH (algorithm = 'ivf', quantization = 'dense', nlist = 512, nprobe = 16)",
+        )
+        .unwrap()
+        .remove(0);
+        let Statement::CreateIndex(index) = statement else {
+            panic!("expected CREATE INDEX")
+        };
+        let ann = parse_index_options(IndexKind::Ann, &index.with)
+            .unwrap()
+            .ann
+            .unwrap();
+        assert_eq!(ann.algorithm, AnnAlgorithm::Ivf);
+        let ivf = ann.ivf.expect("ivf options");
+        assert_eq!((ivf.nlist, ivf.nprobe), (512, 16));
+    }
+
+    #[test]
+    fn parse_index_options_ann_product_quantization_assembles_variant() {
+        let statement = Parser::parse_sql(
+            &GenericDialect {},
+            "CREATE INDEX ann ON docs USING ann (embedding) WITH (algorithm = 'hnsw', quantization = 'product', num_subvectors = 32, bits_per_subvector = 8, pq_training_samples = 10000, pq_seed = 42, pq_rerank_factor = 3)",
+        )
+        .unwrap()
+        .remove(0);
+        let Statement::CreateIndex(index) = statement else {
+            panic!("expected CREATE INDEX")
+        };
+        let ann = parse_index_options(IndexKind::Ann, &index.with)
+            .unwrap()
+            .ann
+            .unwrap();
+        assert_eq!(
+            ann.quantization,
+            AnnQuantization::Product {
+                num_subvectors: 32,
+                bits: 8
+            }
+        );
+        let product = ann.product.expect("product options");
+        assert_eq!(
+            (
+                product.training_samples,
+                product.seed,
+                product.rerank_factor
+            ),
+            (10000, 42, 3)
+        );
+    }
+
+    #[test]
+    fn parse_index_options_ann_product_without_num_subvectors_errors() {
+        let statement = Parser::parse_sql(
+            &GenericDialect {},
+            "CREATE INDEX ann ON docs USING ann (embedding) WITH (quantization = 'product')",
+        )
+        .unwrap()
+        .remove(0);
+        let Statement::CreateIndex(index) = statement else {
+            panic!("expected CREATE INDEX")
+        };
+        let err = parse_index_options(IndexKind::Ann, &index.with).unwrap_err();
+        assert!(err.to_string().contains("num_subvectors"));
+    }
+
+    #[test]
+    fn parse_index_options_ann_unknown_algorithm_errors() {
+        let statement = Parser::parse_sql(
+            &GenericDialect {},
+            "CREATE INDEX ann ON docs USING ann (embedding) WITH (algorithm = 'quantum')",
+        )
+        .unwrap()
+        .remove(0);
+        let Statement::CreateIndex(index) = statement else {
+            panic!("expected CREATE INDEX")
+        };
+        assert!(parse_index_options(IndexKind::Ann, &index.with).is_err());
     }
 }
 

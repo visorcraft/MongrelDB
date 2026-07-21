@@ -293,6 +293,24 @@ pub struct AnnOptions {
     pub ef_search: usize,
     #[serde(default)]
     pub quantization: AnnQuantization,
+    /// Graph/structure algorithm. Orthogonal to [`AnnQuantization`]:
+    /// `algorithm` chooses how search walks the index; `quantization` chooses
+    /// how vectors are represented. Defaults to HNSW for backward
+    /// compatibility with existing schemas.
+    #[serde(default)]
+    pub algorithm: AnnAlgorithm,
+    /// DiskANN (Vamana) tuning. Required when `algorithm == DiskAnn`; ignored
+    /// otherwise. `None` with `algorithm == DiskAnn` selects engine defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diskann: Option<DiskAnnOptions>,
+    /// IVF tuning. Required when `algorithm == Ivf`; ignored otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ivf: Option<IvfOptions>,
+    /// Product-quantizer training parameters. Used only when
+    /// `quantization == Product`; ignored otherwise. The PQ representation
+    /// itself (subvector count, bits) is declared on the `Product` variant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product: Option<ProductQuantizerOptions>,
 }
 
 impl Default for AnnOptions {
@@ -302,10 +320,34 @@ impl Default for AnnOptions {
             ef_construction: default_ann_ef_construction(),
             ef_search: default_ann_ef_search(),
             quantization: AnnQuantization::BinarySign,
+            algorithm: AnnAlgorithm::default(),
+            diskann: None,
+            ivf: None,
+            product: None,
         }
     }
 }
 
+/// ANN graph/structure algorithm. The vector representation is chosen
+/// separately via [`AnnQuantization`]; any supported combination may be used.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnnAlgorithm {
+    /// Hierarchical Navigable Small World (Malkov & Yashunin). The original
+    /// and default MongrelDB ANN algorithm.
+    #[default]
+    Hnsw,
+    /// DiskANN / Vamana: a single-layer robust-pruned graph with bounded-degree
+    /// neighbors, designed for large-scale indexes with bounded I/O.
+    DiskAnn,
+    /// Inverted file index: k-means-trained centroids partition the space into
+    /// `nlist` lists; search probes the `nprobe` nearest lists.
+    Ivf,
+}
+
+/// Vector representation for an ANN index. Orthogonal to [`AnnAlgorithm`]:
+/// the algorithm chooses how search walks the index; quantization chooses how
+/// vectors are stored and how distance is computed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AnnQuantization {
@@ -313,6 +355,129 @@ pub enum AnnQuantization {
     BinarySign,
     /// Full-precision f32 vectors with cosine distance (`1 - cosine_similarity`).
     Dense,
+    /// Product quantization: vectors are split into `num_subvectors` groups,
+    /// each encoded to `bits`-bit codes against trained codebooks (k-means
+    /// centroids per subvector). Distance is asymmetric (ADC). Optional exact
+    /// rerank over retained Dense vectors is configured via
+    /// [`ProductQuantizerOptions`].
+    Product {
+        /// Number of subvectors. Must evenly divide the column dimension.
+        num_subvectors: u16,
+        /// Bits per subvector code. `8` (256 centroids/subvector) is the
+        /// supported value; higher bit widths are rejected for now.
+        bits: u8,
+    },
+}
+
+/// DiskANN (Vamana) build parameters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiskAnnOptions {
+    /// Maximum graph degree `R` (the robust-prune degree bound). Default 64.
+    #[serde(default = "default_diskann_r")]
+    pub r: usize,
+    /// Search-list size `L` during build (controls build quality/time).
+    /// Default 128. Must be >= `r`.
+    #[serde(default = "default_diskann_l")]
+    pub l: usize,
+    /// Search beam width at query time (number of candidate vectors fetched
+    /// per I/O round). Default 8.
+    #[serde(default = "default_diskann_beam_width")]
+    pub beam_width: usize,
+    /// Robust-prune distance threshold `alpha` × 100 (stored as integer for
+    /// `Eq`; 120 = alpha 1.2). Default 120. Range [100, 300].
+    #[serde(default = "default_diskann_alpha")]
+    pub alpha: u32,
+}
+
+impl Default for DiskAnnOptions {
+    fn default() -> Self {
+        Self {
+            r: default_diskann_r(),
+            l: default_diskann_l(),
+            beam_width: default_diskann_beam_width(),
+            alpha: default_diskann_alpha(),
+        }
+    }
+}
+
+const fn default_diskann_r() -> usize {
+    64
+}
+const fn default_diskann_l() -> usize {
+    128
+}
+const fn default_diskann_beam_width() -> usize {
+    8
+}
+const fn default_diskann_alpha() -> u32 {
+    120
+}
+
+/// IVF build and query parameters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IvfOptions {
+    /// Number of inverted lists (k-means centroids). Default 256. Must be >= 1.
+    #[serde(default = "default_ivf_nlist")]
+    pub nlist: usize,
+    /// Number of lists to probe at query time. Default 8. Must be <= `nlist`.
+    #[serde(default = "default_ivf_nprobe")]
+    pub nprobe: usize,
+}
+
+impl Default for IvfOptions {
+    fn default() -> Self {
+        Self {
+            nlist: default_ivf_nlist(),
+            nprobe: default_ivf_nprobe(),
+        }
+    }
+}
+
+const fn default_ivf_nlist() -> usize {
+    256
+}
+const fn default_ivf_nprobe() -> usize {
+    8
+}
+
+/// Product-quantizer training parameters. Used only when
+/// [`AnnQuantization::Product`] is selected; the representation
+/// (subvector count, bits) is declared on the variant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProductQuantizerOptions {
+    /// Cap on training samples drawn from the pinned read generation.
+    /// Default 256_000. Training cost is bounded by this value.
+    #[serde(default = "default_pq_training_samples")]
+    pub training_samples: usize,
+    /// Deterministic training seed. Same seed + same training data yields
+    /// byte-identical codebooks (checkpoint reproducibility).
+    #[serde(default = "default_pq_seed")]
+    pub seed: u64,
+    /// Exact-rerank factor: the top `k * rerank_factor` ADC candidates are
+    /// reranked against retained Dense vectors. `0` disables rerank (ADC only).
+    /// Default 5.
+    #[serde(default = "default_pq_rerank_factor")]
+    pub rerank_factor: usize,
+}
+
+impl Default for ProductQuantizerOptions {
+    fn default() -> Self {
+        Self {
+            training_samples: default_pq_training_samples(),
+            seed: default_pq_seed(),
+            rerank_factor: default_pq_rerank_factor(),
+        }
+    }
+}
+
+const fn default_pq_training_samples() -> usize {
+    256_000
+}
+const fn default_pq_seed() -> u64 {
+    0x9E37_79B9_7F4A_7C15
+}
+const fn default_pq_rerank_factor() -> usize {
+    5
 }
 
 const fn default_ann_m() -> usize {
@@ -403,6 +568,99 @@ impl IndexDef {
                 return Err(MongrelError::Schema(format!(
                     "invalid ANN options for index {}",
                     self.name
+                )));
+            }
+            // Algorithm-scoped options are validated when present; defaults are
+            // always valid. DiskANN/IVF bounds are independent of column dim.
+            if let Some(diskann) = &options.diskann {
+                if diskann.r == 0
+                    || diskann.l < diskann.r
+                    || diskann.r > 1024
+                    || diskann.l > 1_048_576
+                    || diskann.beam_width == 0
+                    || diskann.beam_width > 1024
+                    || !(100..=300).contains(&diskann.alpha)
+                {
+                    return Err(MongrelError::Schema(format!(
+                        "invalid DiskANN options for index {}",
+                        self.name
+                    )));
+                }
+            }
+            if let Some(ivf) = &options.ivf {
+                if ivf.nlist == 0
+                    || ivf.nprobe == 0
+                    || ivf.nprobe > ivf.nlist
+                    || ivf.nlist > 1_048_576
+                {
+                    return Err(MongrelError::Schema(format!(
+                        "invalid IVF options for index {}",
+                        self.name
+                    )));
+                }
+            }
+            // Algorithm/option consistency: per-algorithm option bags are only
+            // meaningful for their own algorithm. A stray bag on the wrong
+            // algorithm is rejected (fail closed) rather than silently ignored.
+            if options.diskann.is_some() && options.algorithm != AnnAlgorithm::DiskAnn {
+                return Err(MongrelError::Schema(format!(
+                    "DiskANN options supplied for non-DiskANN algorithm on index {}",
+                    self.name
+                )));
+            }
+            if options.ivf.is_some() && options.algorithm != AnnAlgorithm::Ivf {
+                return Err(MongrelError::Schema(format!(
+                    "IVF options supplied for non-IVF algorithm on index {}",
+                    self.name
+                )));
+            }
+            if options.product.is_some()
+                && !matches!(options.quantization, AnnQuantization::Product { .. })
+            {
+                return Err(MongrelError::Schema(format!(
+                    "product-quantizer options supplied for non-Product quantization on index {}",
+                    self.name
+                )));
+            }
+            // PQ representation bounds. Dimension-divisibility is checked at
+            // create time (the column dim is not visible here).
+            if let AnnQuantization::Product {
+                num_subvectors,
+                bits,
+            } = options.quantization
+            {
+                if num_subvectors == 0 || bits != 8 {
+                    return Err(MongrelError::Schema(format!(
+                        "invalid product quantization for index {} (num_subvectors > 0, bits == 8)",
+                        self.name
+                    )));
+                }
+            }
+            if let Some(product) = &options.product {
+                if product.training_samples == 0 || product.rerank_factor > 1024 {
+                    return Err(MongrelError::Schema(format!(
+                        "invalid product-quantizer training options for index {}",
+                        self.name
+                    )));
+                }
+            }
+            // Implemented algorithm/quantization combinations. New backends
+            // land behind their own validation gate; requesting one before its
+            // backend is wired fails closed with a typed Schema error rather
+            // than silently falling back to HNSW. See Phase 2 plan.
+            //
+            // Written as an explicit match (not `matches!`) so each newly
+            // supported combination is a visible arm as Phases 3-5 land.
+            #[allow(clippy::match_like_matches_macro)]
+            let supported = match (options.algorithm, options.quantization) {
+                (AnnAlgorithm::Hnsw, AnnQuantization::BinarySign) => true,
+                (AnnAlgorithm::Hnsw, AnnQuantization::Dense) => true,
+                _ => false,
+            };
+            if !supported {
+                return Err(MongrelError::Schema(format!(
+                    "ANN algorithm {:?} with quantization {:?} is not supported on index {}",
+                    options.algorithm, options.quantization, self.name
                 )));
             }
         }
@@ -1346,5 +1604,179 @@ mod tests {
         let old_json = r#"{"id":0,"name":"y","ty":{"kind":"bytes"},"flags":{"bits":0}}"#;
         let old: ColumnDef = serde_json::from_str(old_json).unwrap();
         assert!(old.default_value.is_none());
+    }
+
+    // ── Phase 2: swappable ANN options validation ─────────────────────────
+
+    fn ann_index_def(name: &str, options: AnnOptions) -> IndexDef {
+        IndexDef {
+            name: name.into(),
+            column_id: 1,
+            kind: IndexKind::Ann,
+            predicate: None,
+            options: IndexOptions {
+                ann: Some(options),
+                minhash: None,
+                learned_range: None,
+            },
+        }
+    }
+
+    #[test]
+    fn ann_options_default_is_hnsw_binary_sign() {
+        let options = AnnOptions::default();
+        assert_eq!(options.algorithm, AnnAlgorithm::Hnsw);
+        assert_eq!(options.quantization, AnnQuantization::BinarySign);
+        assert!(options.diskann.is_none());
+        assert!(options.ivf.is_none());
+        assert!(options.product.is_none());
+        assert!(ann_index_def("d", options).validate_options().is_ok());
+    }
+
+    #[test]
+    fn ann_options_hnsw_dense_is_supported() {
+        let options = AnnOptions {
+            algorithm: AnnAlgorithm::Hnsw,
+            quantization: AnnQuantization::Dense,
+            ..AnnOptions::default()
+        };
+        assert!(ann_index_def("d", options).validate_options().is_ok());
+    }
+
+    #[test]
+    fn ann_options_diskann_binary_sign_rejected_as_unsupported() {
+        // Phase 2 wires the option surface only; DiskANN/Dense lands in Phase 4.
+        // Until then any non-{Hnsw×BinarySign, Hnsw×Dense} combo fails closed.
+        let options = AnnOptions {
+            algorithm: AnnAlgorithm::DiskAnn,
+            quantization: AnnQuantization::BinarySign,
+            diskann: Some(DiskAnnOptions::default()),
+            ..AnnOptions::default()
+        };
+        let err = ann_index_def("d", options).validate_options().unwrap_err();
+        assert!(err.to_string().contains("not supported"));
+    }
+
+    #[test]
+    fn ann_options_product_rejected_as_unsupported() {
+        let options = AnnOptions {
+            algorithm: AnnAlgorithm::Hnsw,
+            quantization: AnnQuantization::Product {
+                num_subvectors: 8,
+                bits: 8,
+            },
+            product: Some(ProductQuantizerOptions::default()),
+            ..AnnOptions::default()
+        };
+        assert!(ann_index_def("d", options).validate_options().is_err());
+    }
+
+    #[test]
+    fn ann_options_diskann_fields_rejected_without_diskann_algorithm() {
+        // Stray per-algorithm bag on the wrong algorithm fails closed.
+        let options = AnnOptions {
+            algorithm: AnnAlgorithm::Hnsw,
+            quantization: AnnQuantization::Dense,
+            diskann: Some(DiskAnnOptions::default()),
+            ..AnnOptions::default()
+        };
+        let err = ann_index_def("d", options).validate_options().unwrap_err();
+        assert!(err.to_string().contains("DiskANN options"));
+    }
+
+    #[test]
+    fn ann_options_ivf_fields_rejected_without_ivf_algorithm() {
+        let options = AnnOptions {
+            algorithm: AnnAlgorithm::Hnsw,
+            quantization: AnnQuantization::Dense,
+            ivf: Some(IvfOptions::default()),
+            ..AnnOptions::default()
+        };
+        let err = ann_index_def("d", options).validate_options().unwrap_err();
+        assert!(err.to_string().contains("IVF options"));
+    }
+
+    #[test]
+    fn ann_options_product_fields_rejected_without_product_quantization() {
+        let options = AnnOptions {
+            algorithm: AnnAlgorithm::Hnsw,
+            quantization: AnnQuantization::Dense,
+            product: Some(ProductQuantizerOptions::default()),
+            ..AnnOptions::default()
+        };
+        let err = ann_index_def("d", options).validate_options().unwrap_err();
+        assert!(err.to_string().contains("product-quantizer options"));
+    }
+
+    #[test]
+    fn ann_options_diskann_bounds_validated() {
+        let options = AnnOptions {
+            algorithm: AnnAlgorithm::DiskAnn,
+            quantization: AnnQuantization::Dense,
+            diskann: Some(DiskAnnOptions {
+                r: 0,
+                ..DiskAnnOptions::default()
+            }),
+            ..AnnOptions::default()
+        };
+        // Reaches the DiskANN bounds check before the supported-combo check.
+        let err = ann_index_def("d", options).validate_options().unwrap_err();
+        assert!(err.to_string().contains("DiskANN options"));
+    }
+
+    #[test]
+    fn ann_options_ivf_nprobe_exceeding_nlist_rejected() {
+        let options = AnnOptions {
+            algorithm: AnnAlgorithm::Ivf,
+            quantization: AnnQuantization::Dense,
+            ivf: Some(IvfOptions {
+                nlist: 16,
+                nprobe: 32,
+            }),
+            ..AnnOptions::default()
+        };
+        let err = ann_index_def("d", options).validate_options().unwrap_err();
+        assert!(err.to_string().contains("IVF options"));
+    }
+
+    #[test]
+    fn ann_options_product_bits_other_than_eight_rejected() {
+        let options = AnnOptions {
+            algorithm: AnnAlgorithm::Hnsw,
+            quantization: AnnQuantization::Product {
+                num_subvectors: 8,
+                bits: 4,
+            },
+            ..AnnOptions::default()
+        };
+        let err = ann_index_def("d", options).validate_options().unwrap_err();
+        assert!(err.to_string().contains("product quantization"));
+    }
+
+    #[test]
+    fn ann_options_round_trip_through_serde() {
+        let options = AnnOptions {
+            algorithm: AnnAlgorithm::DiskAnn,
+            quantization: AnnQuantization::Dense,
+            m: 24,
+            ef_construction: 96,
+            ef_search: 48,
+            diskann: Some(DiskAnnOptions {
+                r: 96,
+                l: 200,
+                beam_width: 4,
+                alpha: 115,
+            }),
+            ivf: None,
+            product: None,
+        };
+        let json = serde_json::to_string(&options).unwrap();
+        let de: AnnOptions = serde_json::from_str(&json).unwrap();
+        assert_eq!(de, options);
+        // Defaults deserialize when fields are absent (backward compat).
+        let minimal = r#"{"m":16,"ef_construction":64,"ef_search":64,"quantization":"binary_sign","algorithm":"hnsw"}"#;
+        let legacy: AnnOptions = serde_json::from_str(minimal).unwrap();
+        assert_eq!(legacy.algorithm, AnnAlgorithm::Hnsw);
+        assert!(legacy.diskann.is_none());
     }
 }

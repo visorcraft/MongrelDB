@@ -969,6 +969,7 @@ mod tests {
                     m: 8,
                     ef_construction: 32,
                     ef_search: 16,
+                    ..Default::default()
                 });
             }
         });

@@ -533,6 +533,13 @@ impl AnnIndex {
 }
 
 /// Construct a fresh empty active backend for `quantization`.
+///
+/// Only implemented representations are handled. `Product` and any not-yet-wired
+/// algorithm/quantization combination is rejected up-front by
+/// [`crate::schema::IndexDef::validate_options`], so this constructor is never
+/// reached for them from a validated path. The `Product` arm is therefore a
+/// defense-in-depth unreachable; if a future caller bypasses validation it
+/// fails loudly rather than silently picking a different representation.
 fn new_backend(
     dim: usize,
     m: usize,
@@ -545,6 +552,9 @@ fn new_backend(
             Box::new(Hnsw::new(bytes_per_vec, m, ef_construction))
         }
         AnnQuantization::Dense => Box::new(DenseHnsw::new(dim, m, ef_construction)),
+        AnnQuantization::Product { .. } => {
+            unreachable!("Product quantization is rejected by IndexDef::validate_options; new_backend only handles implemented representations")
+        }
     }
 }
 
@@ -893,6 +903,7 @@ mod tests {
                 ef_construction: 32,
                 ef_search: 17,
                 quantization: AnnQuantization::Dense,
+                ..AnnOptions::default()
             }
         ));
     }

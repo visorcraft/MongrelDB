@@ -42,7 +42,58 @@ export const enum IndexKindSpec {
 }
 export const enum AnnQuantizationSpec {
   BinarySign = 0,
-  Dense = 1
+  Dense = 1,
+  /**
+   * Product quantization (Phase 2 surface; the PQ backend is gated until
+   * implemented). When selected, `product_num_subvectors` is required.
+   */
+  Product = 2
+}
+/** ANN graph/structure algorithm. Orthogonal to [`AnnQuantizationSpec`]. */
+export const enum AnnAlgorithmSpec {
+  /** Hierarchical Navigable Small World (default). */
+  Hnsw = 0,
+  /** DiskANN / Vamana single-layer robust-pruned graph. */
+  DiskAnn = 1,
+  /** Inverted file index (k-means centroids + inverted lists). */
+  Ivf = 2
+}
+/** DiskANN (Vamana) build parameters. Used when `ann_algorithm == DiskAnn`. */
+export interface DiskAnnOptionsSpec {
+  /** Maximum graph degree R. Zero selects the default (64). */
+  r?: number
+  /** Search-list size L during build. Zero selects the default (128). */
+  l?: number
+  /** Query-time beam width. Zero selects the default (8). */
+  beamWidth?: number
+  /** alpha × 100 (120 = 1.2). Zero selects the default. */
+  alpha?: number
+}
+/** IVF build and query parameters. Used when `ann_algorithm == Ivf`. */
+export interface IvfOptionsSpec {
+  /** Number of inverted lists (k-means centroids). Zero selects the default (256). */
+  nlist?: number
+  /** Number of lists to probe at query time. Zero selects the default (8). */
+  nprobe?: number
+}
+/**
+ * Product-quantizer training parameters. Used when
+ * `ann_quantization == Product`.
+ */
+export interface ProductQuantizerOptionsSpec {
+  /** Number of subvectors. Required; must evenly divide the column dimension. */
+  numSubvectors: number
+  /** Bits per subvector code. Defaults to 8 (the only supported value). */
+  bits?: number
+  /** Cap on training samples. Zero selects the default. */
+  trainingSamples?: number
+  /** Deterministic training seed. Zero selects the default. */
+  seed?: bigint
+  /**
+   * Exact-rerank factor (top k × factor candidates reranked against Dense).
+   * Zero selects the default (5).
+   */
+  rerankFactor?: number
 }
 export interface ColumnSpec {
   id: number
@@ -88,6 +139,17 @@ export interface IndexSpec {
   kind: IndexKindSpec
   /** ANN representation. Defaults to BinarySign; ignored for other kinds. */
   annQuantization?: AnnQuantizationSpec
+  /**
+   * ANN graph/structure algorithm (Phase 2). Defaults to HNSW; ignored for
+   * other kinds. Orthogonal to `ann_quantization`.
+   */
+  annAlgorithm?: AnnAlgorithmSpec
+  /** DiskANN tuning; read when `ann_algorithm == DiskAnn`. */
+  diskann?: DiskAnnOptionsSpec
+  /** IVF tuning; read when `ann_algorithm == Ivf`. */
+  ivf?: IvfOptionsSpec
+  /** Product-quantizer training; read when `ann_quantization == Product`. */
+  product?: ProductQuantizerOptionsSpec
   predicate?: string
   annM?: number
   annEfConstruction?: number

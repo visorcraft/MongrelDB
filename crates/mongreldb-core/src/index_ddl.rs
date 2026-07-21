@@ -145,9 +145,17 @@ impl IndexBuildJob<'_> {
                     ))
                 })?;
             let options = self.definition().options.ann.clone().unwrap_or_default();
+            // Per-representation stored-vector bytes. BinarySign packs 1 bit/dim;
+            // Dense stores f32. Product stores 8-bit codes per subvector plus,
+            // when rerank is enabled, the retained Dense source — accounted as
+            // Dense-equivalent (conservative upper bound) until the PQ backend
+            // lands with its own precise cost model. Product is currently
+            // rejected by validate_options, so this arm is unreachable from a
+            // validated build.
             let vector_bytes = match options.quantization {
                 crate::schema::AnnQuantization::BinarySign => dim.div_ceil(8),
                 crate::schema::AnnQuantization::Dense => dim.saturating_mul(4),
+                crate::schema::AnnQuantization::Product { .. } => dim.saturating_mul(4),
             };
             let levels = (crate::index::hnsw::MAX_HNSW_LEVEL as u64).saturating_add(1);
             let adjacency_slots = (options.m as u64)
@@ -1101,6 +1109,7 @@ mod tests {
                         ef_construction: 32,
                         ef_search: 16,
                         quantization,
+                        ..AnnOptions::default()
                     }),
                     ..IndexOptions::default()
                 },
@@ -1191,6 +1200,7 @@ mod tests {
                     ef_construction: 32,
                     ef_search: 16,
                     quantization: AnnQuantization::Dense,
+                    ..AnnOptions::default()
                 }),
                 ..IndexOptions::default()
             },
@@ -1239,6 +1249,7 @@ mod tests {
                     ef_construction: 32,
                     ef_search: 16,
                     quantization: AnnQuantization::Dense,
+                    ..AnnOptions::default()
                 }),
                 ..IndexOptions::default()
             },
@@ -1724,6 +1735,7 @@ mod tests {
                     ef_construction: 32,
                     ef_search: 16,
                     quantization: AnnQuantization::BinarySign,
+                    ..AnnOptions::default()
                 }),
                 ..IndexOptions::default()
             },

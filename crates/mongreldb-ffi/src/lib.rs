@@ -107,9 +107,10 @@ pub use migrate::{
 // Schema builder.
 pub use schema::{
     mongreldb_schema_add_column, mongreldb_schema_add_foreign_key, mongreldb_schema_add_index,
-    mongreldb_schema_add_index_v2, mongreldb_schema_add_unique, mongreldb_schema_begin,
-    mongreldb_schema_build, mongreldb_schema_builder_free, mongreldb_schema_free,
-    mongreldb_schema_set_clustered, mongreldb_schema_set_embedding_source_json,
+    mongreldb_schema_add_index_v2, mongreldb_schema_add_index_v3, mongreldb_schema_add_unique,
+    mongreldb_schema_begin, mongreldb_schema_build, mongreldb_schema_builder_free,
+    mongreldb_schema_free, mongreldb_schema_set_clustered,
+    mongreldb_schema_set_embedding_source_json,
 };
 
 // Query builder.
@@ -153,10 +154,10 @@ pub use query::mongreldb_query_t;
 pub use schema::{
     mongreldb_ann_quantization, mongreldb_column_def, mongreldb_fk_action, mongreldb_foreign_key,
     mongreldb_index_def, mongreldb_index_kind, mongreldb_index_options_v1,
-    mongreldb_schema_builder_t, mongreldb_schema_t, mongreldb_type_id, mongreldb_unique_constraint,
-    StringArray, U16Slice, MONGRELDB_COL_AUTO_INCREMENT, MONGRELDB_COL_EMBEDDING_BINARY_QUANTIZED,
-    MONGRELDB_COL_ENCRYPTED, MONGRELDB_COL_ENCRYPTED_INDEXABLE, MONGRELDB_COL_NULLABLE,
-    MONGRELDB_COL_PRIMARY_KEY,
+    mongreldb_index_options_v2, mongreldb_schema_builder_t, mongreldb_schema_t, mongreldb_type_id,
+    mongreldb_unique_constraint, StringArray, U16Slice, MONGRELDB_COL_AUTO_INCREMENT,
+    MONGRELDB_COL_EMBEDDING_BINARY_QUANTIZED, MONGRELDB_COL_ENCRYPTED,
+    MONGRELDB_COL_ENCRYPTED_INDEXABLE, MONGRELDB_COL_NULLABLE, MONGRELDB_COL_PRIMARY_KEY,
 };
 pub use search::{
     mongreldb_fusion, mongreldb_fusion_kind, mongreldb_projection, mongreldb_rerank,
