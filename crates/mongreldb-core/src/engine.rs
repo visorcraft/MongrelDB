@@ -5559,7 +5559,13 @@ impl Table {
         crate::trace::QueryTrace::record(|trace| {
             match retriever {
                 Retriever::Ann { .. } => {
-                    trace.ann_candidate_nanos = trace.ann_candidate_nanos.saturating_add(elapsed)
+                    trace.ann_candidate_nanos = trace.ann_candidate_nanos.saturating_add(elapsed);
+                    if let Retriever::Ann { column_id, .. } = retriever {
+                        if let Some(index) = self.ann.get(column_id) {
+                            trace.ann_algorithm = Some(index.algorithm());
+                            trace.ann_quantization = Some(index.quantization());
+                        }
+                    }
                 }
                 Retriever::Sparse { .. } => {
                     trace.sparse_candidate_nanos =

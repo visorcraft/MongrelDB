@@ -2779,6 +2779,16 @@ fn execute_kit_search(
             "rls_policy_columns_decoded": trace.rls_policy_columns_decoded,
             "authorization_retries": trace.authorization_retries,
             "hard_filter_nanos": trace.hard_filter_nanos,
+            "ann_algorithm": trace.ann_algorithm.map(|algorithm| match algorithm {
+                mongreldb_core::schema::AnnAlgorithm::Hnsw => "hnsw",
+                mongreldb_core::schema::AnnAlgorithm::DiskAnn => "diskann",
+                mongreldb_core::schema::AnnAlgorithm::Ivf => "ivf",
+            }),
+            "ann_quantization": trace.ann_quantization.map(|quantization| match quantization {
+                mongreldb_core::schema::AnnQuantization::BinarySign => "binary_sign",
+                mongreldb_core::schema::AnnQuantization::Dense => "dense",
+                mongreldb_core::schema::AnnQuantization::Product { .. } => "product",
+            }),
             "ann_candidate_nanos": trace.ann_candidate_nanos,
             "ann_candidate_cap_hit": trace.ann_candidate_cap_hit,
             "sparse_candidate_nanos": trace.sparse_candidate_nanos,

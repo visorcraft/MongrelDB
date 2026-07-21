@@ -3,8 +3,8 @@ use mongreldb_core::query::{
     RetrieverScore, SearchRequest, SetMember, SetSimilarityRequest, VectorMetric,
 };
 use mongreldb_core::schema::{
-    AnnOptions, AnnQuantization, ColumnDef, ColumnFlags, IndexDef, IndexKind, IndexOptions, Schema,
-    TypeId,
+    AnnAlgorithm, AnnOptions, AnnQuantization, ColumnDef, ColumnFlags, IndexDef, IndexKind,
+    IndexOptions, Schema, TypeId,
 };
 use mongreldb_core::{Table, Value};
 use tempfile::tempdir;
@@ -539,7 +539,10 @@ fn hybrid_search_filters_unions_and_fuses_deterministically() {
         limit: 10,
         projection: Some(vec![1]),
     };
-    let hits = table.search(&request).unwrap();
+    let (hits, trace) = mongreldb_core::trace::QueryTrace::capture(|| table.search(&request));
+    let hits = hits.unwrap();
+    assert_eq!(trace.ann_algorithm, Some(AnnAlgorithm::Hnsw));
+    assert_eq!(trace.ann_quantization, Some(AnnQuantization::BinarySign));
     assert_eq!(hits.len(), 2);
     assert_eq!(hits[0].row_id.0, 0);
     assert_eq!(hits[1].row_id.0, 1);

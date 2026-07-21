@@ -200,6 +200,10 @@ pub struct QueryTrace {
     pub authorization_retries: usize,
     /// AI retrieval stage timings and bounded cardinalities.
     pub hard_filter_nanos: u64,
+    /// ANN backend selected by the authoritative index schema.
+    pub ann_algorithm: Option<crate::schema::AnnAlgorithm>,
+    /// ANN representation selected by the authoritative index schema.
+    pub ann_quantization: Option<crate::schema::AnnQuantization>,
     pub ann_candidate_nanos: u64,
     pub ann_candidate_cap_hit: bool,
     pub sparse_candidate_nanos: u64,

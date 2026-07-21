@@ -204,6 +204,10 @@ impl AnnIndex {
         self.quantization
     }
 
+    pub fn algorithm(&self) -> crate::schema::AnnAlgorithm {
+        self.options.algorithm
+    }
+
     /// True when this index's options and dimension match the schema declaration.
     pub(crate) fn matches_schema(
         &self,
