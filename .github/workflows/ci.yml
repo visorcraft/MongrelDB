@@ -38,6 +38,7 @@ jobs:
     name: Other workspace tests
     runs-on: ubuntu-latest
     env:
+      CARGO_BUILD_JOBS: "1"
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@v7
