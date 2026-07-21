@@ -4,8 +4,8 @@
 # explicitly-versioned release crate plus their internal
 # path-dependency pins on mongreldb-core/mongreldb-query, the Node addon's
 # package.json/package-lock.json, the JNI pom.xml, the README JAR filenames,
-# and the ffi-release workflow JAR filenames. Then regenerates the one root
-# workspace Cargo.lock so the bump is fully reflected.
+# and the ffi-release workflow JAR filenames. Then regenerates the root and
+# standalone Cargo.lock files so the bump is fully reflected.
 #
 # Note: external crates.io deps (mongreldb-kit / mongreldb-kit-core) are NOT
 # bumped — those track the separate mongreldb-kit repo's release cycle.
@@ -78,6 +78,8 @@ sed -i "s/\\\\\"engine_version\\\\\":\\\\\"$OLD\\\\\"/\\\\\"engine_version\\\\\"
 
 echo "Regenerating the workspace lockfile (this can take a while)..."
 cargo check --workspace --all-features >/dev/null
+cargo metadata --manifest-path crates/mongreldb-kit-ffi/Cargo.toml --format-version 1 >/dev/null
+cargo metadata --manifest-path crates/mongreldb-jni/Cargo.toml --format-version 1 >/dev/null
 
 # Safety net: catch any file the hardcoded list above missed (e.g. a new
 # crate). Warns rather than fails -- Cargo.lock/target/node_modules always
