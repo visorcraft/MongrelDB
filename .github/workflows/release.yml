@@ -71,7 +71,7 @@ jobs:
         run: |
           publish_crate() {
             local attempt output wait_until now sleep_s
-            for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            for attempt in $(seq 1 60); do
               if output="$(cargo publish "$@" 2>&1)"; then
                 echo "$output"
                 return 0
