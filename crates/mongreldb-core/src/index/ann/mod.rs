@@ -30,6 +30,8 @@
 pub(crate) mod backend;
 pub(crate) mod diskann;
 pub(crate) mod ivf;
+#[cfg(test)]
+mod matrix;
 pub(crate) mod pq_backend;
 pub(crate) mod product;
 

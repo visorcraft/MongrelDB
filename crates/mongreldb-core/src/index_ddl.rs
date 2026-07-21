@@ -145,36 +145,69 @@ impl IndexBuildJob<'_> {
                     ))
                 })?;
             let options = self.definition().options.ann.clone().unwrap_or_default();
-            // Per-representation stored-vector bytes. BinarySign packs 1 bit/dim;
-            // Dense stores f32. Product stores 8-bit codes per subvector plus,
-            // when rerank is enabled, the retained Dense source — accounted as
-            // Dense-equivalent (conservative upper bound) until the PQ backend
-            // lands with its own precise cost model. Product is currently
-            // rejected by validate_options, so this arm is unreachable from a
-            // validated build.
+            // Per-representation stored-vector bytes.
             let vector_bytes = match options.quantization {
                 crate::schema::AnnQuantization::BinarySign => dim.div_ceil(8),
                 crate::schema::AnnQuantization::Dense => dim.saturating_mul(4),
-                crate::schema::AnnQuantization::Product { .. } => dim.saturating_mul(4),
+                // PQ codes are one byte per subvector; the active delta also
+                // buffers the Dense source for training, so account Dense.
+                crate::schema::AnnQuantization::Product { num_subvectors, .. } => {
+                    dim.saturating_mul(4).max(num_subvectors as u64)
+                }
             };
-            let levels = (crate::index::hnsw::MAX_HNSW_LEVEL as u64).saturating_add(1);
-            let adjacency_slots = (options.m as u64)
-                .saturating_mul(2)
-                .saturating_add((options.m as u64).saturating_mul(levels.saturating_sub(1)));
-            let per_node = vector_bytes
-                .saturating_add(std::mem::size_of::<RowId>() as u64)
-                .saturating_add(levels.saturating_mul(std::mem::size_of::<Vec<usize>>() as u64))
-                .saturating_add(
-                    adjacency_slots.saturating_mul(std::mem::size_of::<usize>() as u64),
-                );
-            // Persistent graph plus transient construction clones/heaps/sets.
-            estimate = estimate
-                .saturating_add(per_node.saturating_mul(rows.len() as u64).saturating_mul(2));
+            // Algorithm-specific per-node graph/structure cost.
+            let (per_node_struct, transient) = match options.algorithm {
+                crate::schema::AnnAlgorithm::Hnsw => {
+                    let levels = (crate::index::hnsw::MAX_HNSW_LEVEL as u64).saturating_add(1);
+                    let adjacency_slots = (options.m as u64).saturating_mul(2).saturating_add(
+                        (options.m as u64).saturating_mul(levels.saturating_sub(1)),
+                    );
+                    let per_node = vector_bytes
+                        .saturating_add(std::mem::size_of::<RowId>() as u64)
+                        .saturating_add(
+                            levels.saturating_mul(std::mem::size_of::<Vec<usize>>() as u64),
+                        )
+                        .saturating_add(
+                            adjacency_slots.saturating_mul(std::mem::size_of::<usize>() as u64),
+                        );
+                    let transient = (options.ef_construction as u64)
+                        .saturating_mul(dim.saturating_add(32))
+                        .saturating_mul(8);
+                    (per_node, transient)
+                }
+                crate::schema::AnnAlgorithm::DiskAnn => {
+                    // Single-layer graph: degree R neighbors per node.
+                    let r = options.diskann.as_ref().map(|d| d.r as u64).unwrap_or(64);
+                    let per_node = vector_bytes
+                        .saturating_add(std::mem::size_of::<RowId>() as u64)
+                        .saturating_add(r.saturating_mul(std::mem::size_of::<usize>() as u64));
+                    let transient = options
+                        .diskann
+                        .as_ref()
+                        .map(|d| {
+                            (d.l as u64)
+                                .saturating_mul(dim.saturating_add(32))
+                                .saturating_mul(8)
+                        })
+                        .unwrap_or(0);
+                    (per_node, transient)
+                }
+                crate::schema::AnnAlgorithm::Ivf => {
+                    // Vectors stored per-node in inverted lists; centroids are
+                    // a fixed nlist * dim overhead.
+                    let nlist = options.ivf.as_ref().map(|o| o.nlist as u64).unwrap_or(256);
+                    let per_node = vector_bytes.saturating_add(std::mem::size_of::<RowId>() as u64);
+                    let transient = nlist.saturating_mul(dim.saturating_mul(4));
+                    (per_node, transient)
+                }
+            };
+            // Persistent structure plus transient construction clones/heaps/sets.
             estimate = estimate.saturating_add(
-                (options.ef_construction as u64)
-                    .saturating_mul(dim.saturating_add(32))
-                    .saturating_mul(8),
+                per_node_struct
+                    .saturating_mul(rows.len() as u64)
+                    .saturating_mul(2),
             );
+            estimate = estimate.saturating_add(transient);
         }
 
         let requested = usize::try_from(estimate).unwrap_or(usize::MAX);

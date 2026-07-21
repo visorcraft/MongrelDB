@@ -1292,11 +1292,16 @@ mod tests {
                     pq_rerank_factor: 0,
                 },
             )
-            // Phase 2 wires the option surface only; DiskANN+Dense fails closed
-            // at validate_options until the backend lands in Phase 4.
-            .unwrap_err();
-        // The v2 decoder itself routes correctly: re-run with a supported combo
-        // (HNSW + Dense) to confirm the field plumbing.
+            // Phase 4 wired DiskANN+Dense; the v2 decoder routes correctly and
+            // validate_options accepts it. Confirm the field plumbing.
+            .unwrap();
+        let schema = builder.finish();
+        let ann = schema.indexes[0].options.ann.as_ref().unwrap();
+        assert_eq!(ann.algorithm, AnnAlgorithm::DiskAnn);
+        assert_eq!(ann.quantization, AnnQuantization::Dense);
+        let diskann = ann.diskann.as_ref().expect("diskann options");
+        assert_eq!((diskann.r, diskann.l, diskann.beam_width, diskann.alpha), (128, 256, 4, 130));
+        // A second run with HNSW + Dense confirms the non-DiskANN field path.
         let mut builder = SchemaBuilder::new();
         let column_name = CString::new("embedding").unwrap();
         builder
