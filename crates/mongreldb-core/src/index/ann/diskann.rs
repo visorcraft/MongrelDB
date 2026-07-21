@@ -40,6 +40,8 @@ use crate::Result;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
 
+pub(crate) const SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+
 /// One DiskANN (Vamana) backend: a single-layer graph over full-precision
 /// Dense vectors.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -81,16 +83,21 @@ impl DiskAnnBackend {
                 == (options.r, options.l, options.beam_width, options.alpha)
             && self.vectors.len() == self.row_ids.len()
             && self.vectors.len() == self.graph.len()
+            && self.entry.is_some() == !self.vectors.is_empty()
             && self.entry.is_none_or(|entry| entry < self.vectors.len())
+            && self.seed == SEED
             && self
                 .vectors
                 .iter()
                 .all(|vector| vector.len() == dim && vector.iter().all(|v| v.is_finite()))
-            && self.graph.iter().all(|neighbors| {
+            && self.graph.iter().enumerate().all(|(node, neighbors)| {
+                let mut unique = HashSet::with_capacity(neighbors.len());
                 neighbors.len() <= self.r
-                    && neighbors
-                        .iter()
-                        .all(|neighbor| *neighbor < self.vectors.len())
+                    && neighbors.iter().all(|neighbor| {
+                        *neighbor < self.vectors.len()
+                            && *neighbor != node
+                            && unique.insert(*neighbor)
+                    })
             })
     }
 
@@ -431,6 +438,24 @@ mod tests {
             b.insert_vec(vector, RowId(id));
         }
         assert!(b.graph.iter().all(|neighbors| neighbors.len() <= b.r));
+    }
+
+    #[test]
+    fn malformed_checkpoint_graph_is_rejected() {
+        let options = DiskAnnOptions {
+            r: 16,
+            l: 32,
+            beam_width: 4,
+            alpha: 120,
+        };
+        let mut b = backend(8);
+        b.insert_vec(vec![1.0; 8], RowId(1));
+        b.entry = None;
+        assert!(!b.matches_checkpoint(8, &options));
+
+        b.entry = Some(0);
+        b.graph[0] = vec![0];
+        assert!(!b.matches_checkpoint(8, &options));
     }
 
     #[test]

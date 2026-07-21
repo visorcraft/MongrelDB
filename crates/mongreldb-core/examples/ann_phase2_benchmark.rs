@@ -21,7 +21,7 @@ fn options(name: &str) -> AnnOptions {
     match name {
         "hnsw-binary" => {}
         "hnsw-dense" => options.quantization = AnnQuantization::Dense,
-        "hnsw-product" => {
+        "flat-product" => {
             options.quantization = AnnQuantization::Product {
                 num_subvectors: 16,
                 bits: 8,
@@ -58,7 +58,7 @@ fn vector(row: usize) -> Vec<f32> {
             state = state
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
-            ((state >> 40) as i32 as f32) / i32::MAX as f32
+            ((state >> 32) as u32 as f32) / u32::MAX as f32 * 2.0 - 1.0
         })
         .collect()
 }
@@ -88,13 +88,14 @@ fn main() {
     let name = std::env::args().nth(1).expect("backend argument required");
     let options = options(&name);
     let build_started = Instant::now();
-    let mut index = AnnIndex::with_full_options(
+    let mut index = AnnIndex::try_with_full_options(
         DIM,
         options.m,
         options.ef_construction,
         options.ef_search,
         &options,
-    );
+    )
+    .unwrap();
     for row in 0..ROWS {
         index.insert(&vector(row), RowId(row as u64)).unwrap();
     }

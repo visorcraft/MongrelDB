@@ -293,10 +293,9 @@ pub struct AnnOptions {
     pub ef_search: usize,
     #[serde(default)]
     pub quantization: AnnQuantization,
-    /// Graph/structure algorithm. Orthogonal to [`AnnQuantization`]:
-    /// `algorithm` chooses how search walks the index; `quantization` chooses
-    /// how vectors are represented. Defaults to HNSW for backward
-    /// compatibility with existing schemas.
+    /// Graph/structure selector. Algorithm and quantization are separate
+    /// fields, but only explicitly validated pairs are supported. Product uses
+    /// `Hnsw` as its compatibility selector while executing on flat PQ.
     #[serde(default)]
     pub algorithm: AnnAlgorithm,
     /// DiskANN (Vamana) tuning. Required when `algorithm == DiskAnn`; ignored
@@ -345,9 +344,8 @@ pub enum AnnAlgorithm {
     Ivf,
 }
 
-/// Vector representation for an ANN index. Orthogonal to [`AnnAlgorithm`]:
-/// the algorithm chooses how search walks the index; quantization chooses how
-/// vectors are stored and how distance is computed.
+/// Vector representation for an ANN index. This is a separate schema field
+/// from [`AnnAlgorithm`], but only explicitly validated pairs are supported.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AnnQuantization {
@@ -357,8 +355,8 @@ pub enum AnnQuantization {
     Dense,
     /// Product quantization: vectors are split into `num_subvectors` groups,
     /// each encoded to `bits`-bit codes against trained codebooks (k-means
-    /// centroids per subvector). Distance is asymmetric (ADC). Optional exact
-    /// rerank over retained Dense vectors is configured via
+    /// centroids per subvector). Distance is asymmetric (ADC). Optional
+    /// approximate rerank over reconstructed vectors is configured via
     /// [`ProductQuantizerOptions`].
     Product {
         /// Number of subvectors. Must evenly divide the column dimension.

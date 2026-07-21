@@ -30,9 +30,9 @@ six call sites.
    `match` arm on `AnnBody` collapses to a single trait call.
 
 2. The algorithm (hnsw / diskann / ivf) and the quantization
-   (binary_sign / dense / product) are **independent** choices on
-   `AnnOptions`. The algorithm chooses how search walks the index; the
-   quantization chooses how vectors are represented. `validate_options`
+   (binary_sign / dense / product) are separate fields on `AnnOptions`.
+   Supported pairs are explicit. Product currently routes to flat PQ while
+   retaining `hnsw` as its compatibility selector. `validate_options`
    rejects unsupported combinations fail-closed (a typed Schema error),
    never a silent fallback to HNSW.
 

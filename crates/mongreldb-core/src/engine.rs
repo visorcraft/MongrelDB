@@ -1613,6 +1613,10 @@ impl Table {
         }
         checkpoint(rows.len(), rows.len())?;
 
+        if let Some(index) = ann.get_mut(&definition.column_id) {
+            index.seal_with_checkpoint(|| checkpoint(rows.len(), rows.len()))?;
+        }
+
         let column_id = definition.column_id;
         match definition.kind {
             IndexKind::Bitmap => bitmap
@@ -5564,6 +5568,7 @@ impl Table {
                         if let Some(index) = self.ann.get(column_id) {
                             trace.ann_algorithm = Some(index.algorithm());
                             trace.ann_quantization = Some(index.quantization());
+                            trace.ann_backend = Some(index.backend_name());
                         }
                     }
                 }

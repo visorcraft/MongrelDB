@@ -11,11 +11,11 @@ deterministic 64-dimensional vectors, 100 queries, and `k = 10`.
 
 | Backend | Build (µs) | Peak RSS (bytes) | Checkpoint (bytes) | Query p50 (µs) | Query p95 (µs) |
 |---|---:|---:|---:|---:|---:|
-| HNSW + BinarySign | 15,026 | 4,075,520 | 156,224 | 11 | 11 |
-| HNSW + Dense | 85,196 | 4,526,080 | 283,192 | 48 | 51 |
-| HNSW + Product | 14,285 | 3,768,320 | 82,091 | 27 | 28 |
-| DiskANN + Dense | 225,933 | 5,132,288 | 345,200 | 65 | 68 |
-| IVF + Dense | 2,854 | 3,821,568 | 143,883 | 7 | 8 |
+| HNSW + BinarySign | 40,016 | 4,136,960 | 156,224 | 44 | 49 |
+| HNSW + Dense | 72,122 | 4,534,272 | 283,192 | 55 | 58 |
+| Flat Product | 13,305 | 3,772,416 | 82,091 | 26 | 27 |
+| DiskANN + Dense | 201,607 | 5,378,048 | 385,392 | 68 | 70 |
+| IVF + Dense | 2,781 | 3,870,720 | 143,883 | 6 | 7 |
 
 `Peak RSS` is Linux `VmHWM` for the isolated process. `Checkpoint` is the exact
 byte length returned by `AnnIndex::freeze`, representing persisted disk
@@ -27,5 +27,8 @@ Reproduce one row with:
 cargo run --release -p mongreldb-core --example ann_phase2_benchmark -- hnsw-binary
 ```
 
-Valid backend arguments are `hnsw-binary`, `hnsw-dense`, `hnsw-product`,
+Valid backend arguments are `hnsw-binary`, `hnsw-dense`, `flat-product`,
 `diskann-dense`, and `ivf-dense`.
+
+These rows replace the superseded positive-only generator run and identify the
+Product backend as flat PQ rather than HNSW.

@@ -125,8 +125,8 @@ Condition::FmContains { column_id: 4, pattern: b"database".to_vec() }
 ### ANN - Vector Similarity Search
 
 **What it does:** Generates approximate nearest-neighbor candidates from an
-embedding column. The algorithm (how search walks the index) and the
-quantization (how vectors are represented) are chosen independently.
+embedding column. Algorithm and quantization are separate schema fields, with
+only the combinations listed below implemented.
 
 **Algorithms** (`algorithm = '…'` in `WITH (...)`):
 
@@ -153,6 +153,8 @@ subvectors becomes 32 bytes) at the cost of approximate ADC distance. Setting
 `pq_rerank_factor` reranks a bounded candidate set using reconstructed
 approximate vectors. MongrelDB does not retain the original Dense vectors in
 this backend, so this rerank is not exact.
+Product currently uses a flat PQ scan. Its required `algorithm = 'hnsw'`
+value is a compatibility selector and does not create an HNSW graph.
 
 **How it works:**
 - **HNSW** builds a multi-layer graph where similar vectors are connected by
@@ -216,7 +218,7 @@ CREATE INDEX idx_prompts_embed_ivf
 ON prompts USING ann (embedding)
 WITH (algorithm = 'ivf', quantization = 'dense', nlist = 256, nprobe = 8);
 
--- HNSW + Product quantization
+-- Flat Product quantization (`hnsw` is the compatibility selector)
 CREATE INDEX idx_prompts_embed_pq
 ON prompts USING ann (embedding)
 WITH (quantization = 'product', num_subvectors = 32, bits_per_subvector = 8,

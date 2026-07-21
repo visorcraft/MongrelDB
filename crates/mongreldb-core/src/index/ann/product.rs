@@ -30,6 +30,7 @@
 //! rerank at higher memory cost.
 
 use crate::schema::ProductQuantizerOptions;
+use crate::Result;
 
 /// One trained product quantizer. Codebooks are `num_subvectors` blocks of
 /// `2^bits` centroids, each centroid `subvector_dim` f32 values.
@@ -62,8 +63,20 @@ impl ProductQuantizer {
         samples: &[&[f32]],
         options: &ProductQuantizerOptions,
     ) -> Option<Self> {
+        Self::train_with_checkpoint(dim, num_subvectors, bits, samples, options, &mut || Ok(()))
+            .expect("infallible product-training checkpoint")
+    }
+
+    pub(crate) fn train_with_checkpoint(
+        dim: usize,
+        num_subvectors: usize,
+        bits: u8,
+        samples: &[&[f32]],
+        options: &ProductQuantizerOptions,
+        checkpoint: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<Self>> {
         if samples.is_empty() || dim == 0 || num_subvectors == 0 {
-            return None;
+            return Ok(None);
         }
         debug_assert_eq!(bits, 8, "only 8-bit product quantization is supported");
         debug_assert_eq!(
@@ -72,7 +85,7 @@ impl ProductQuantizer {
             "num_subvectors must evenly divide dim"
         );
         if bits != 8 || !dim.is_multiple_of(num_subvectors) {
-            return None;
+            return Ok(None);
         }
         let subvector_dim = dim / num_subvectors;
         let k = 1usize << bits; // 256 at bits=8
@@ -82,23 +95,31 @@ impl ProductQuantizer {
         let selected = select_samples(samples, options.training_samples, options.seed);
         let mut codebooks = vec![0.0f32; num_subvectors * k * subvector_dim];
         for s in 0..num_subvectors {
+            checkpoint()?;
             let sub_start = s * subvector_dim;
             let sub_samples: Vec<&[f32]> = selected
                 .iter()
                 .map(|vec| &vec[sub_start..sub_start + subvector_dim])
                 .collect();
-            let centroids = kmeans_train(&sub_samples, subvector_dim, k, options.seed, s as u64);
+            let centroids = kmeans_train(
+                &sub_samples,
+                subvector_dim,
+                k,
+                options.seed,
+                s as u64,
+                checkpoint,
+            )?;
             codebooks[s * k * subvector_dim..(s + 1) * k * subvector_dim]
                 .copy_from_slice(&centroids);
         }
-        Some(Self {
+        Ok(Some(Self {
             dim,
             num_subvectors,
             subvector_dim,
             bits,
             codebooks,
             seed: options.seed,
-        })
+        }))
     }
 
     pub(crate) fn dim(&self) -> usize {
@@ -251,7 +272,14 @@ fn select_samples<'a>(samples: &[&'a [f32]], cap: usize, seed: u64) -> Vec<&'a [
 /// samples (k-means++ is non-deterministic under ties without care; a fixed
 /// stride seed is reproducible and adequate for PQ). Up to 25 Lloyd
 /// iterations; converges early when no centroid moves.
-fn kmeans_train(samples: &[&[f32]], dim: usize, k: usize, seed: u64, salt: u64) -> Vec<f32> {
+fn kmeans_train(
+    samples: &[&[f32]],
+    dim: usize,
+    k: usize,
+    seed: u64,
+    salt: u64,
+    checkpoint: &mut dyn FnMut() -> Result<()>,
+) -> Result<Vec<f32>> {
     // Cap effective k by sample count: empty clusters collapse to the first
     // sample (keeps the codebook well-defined for tiny training sets).
     let effective_k = k.min(samples.len().max(1));
@@ -265,8 +293,10 @@ fn kmeans_train(samples: &[&[f32]], dim: usize, k: usize, seed: u64, salt: u64) 
     // Fill any remaining centroids (k > samples) with zeros so the codebook
     // is fully populated; they will never be the nearest centroid.
     for iter in 0..25 {
-        let (assignments, inertia) = assign_samples(samples, &centroids, dim, k);
-        let new_centroids = update_centroids(&assignments, samples, dim, k, &centroids);
+        checkpoint()?;
+        let (assignments, inertia) = assign_samples(samples, &centroids, dim, k, checkpoint)?;
+        let new_centroids =
+            update_centroids(&assignments, samples, dim, k, &centroids, checkpoint)?;
         let moved = centroids
             .iter()
             .zip(new_centroids.iter())
@@ -278,7 +308,7 @@ fn kmeans_train(samples: &[&[f32]], dim: usize, k: usize, seed: u64, salt: u64) 
             break;
         }
     }
-    centroids
+    Ok(centroids)
 }
 
 /// Assign each sample to its nearest centroid. Returns (assignments, inertia).
@@ -287,10 +317,14 @@ fn assign_samples(
     centroids: &[f32],
     dim: usize,
     k: usize,
-) -> (Vec<usize>, f32) {
+    checkpoint: &mut dyn FnMut() -> Result<()>,
+) -> Result<(Vec<usize>, f32)> {
     let mut assignments = Vec::with_capacity(samples.len());
     let mut inertia = 0.0f32;
-    for sample in samples {
+    for (index, sample) in samples.iter().enumerate() {
+        if index.is_multiple_of(64) {
+            checkpoint()?;
+        }
         let mut best = 0usize;
         let mut best_dist = f32::INFINITY;
         for c in 0..k {
@@ -304,7 +338,7 @@ fn assign_samples(
         inertia += best_dist;
         assignments.push(best);
     }
-    (assignments, inertia)
+    Ok((assignments, inertia))
 }
 
 /// Recompute centroids as the mean of assigned samples. Empty clusters keep
@@ -315,10 +349,14 @@ fn update_centroids(
     dim: usize,
     k: usize,
     previous: &[f32],
-) -> Vec<f32> {
+    checkpoint: &mut dyn FnMut() -> Result<()>,
+) -> Result<Vec<f32>> {
     let mut sums = vec![0.0f32; k * dim];
     let mut counts = vec![0u32; k];
-    for (sample, &cluster) in samples.iter().zip(assignments.iter()) {
+    for (index, (sample, &cluster)) in samples.iter().zip(assignments.iter()).enumerate() {
+        if index.is_multiple_of(64) {
+            checkpoint()?;
+        }
         for (i, value) in sample.iter().enumerate() {
             sums[cluster * dim + i] += value;
         }
@@ -336,7 +374,7 @@ fn update_centroids(
             out[c * dim..(c + 1) * dim].copy_from_slice(&previous[c * dim..(c + 1) * dim]);
         }
     }
-    out
+    Ok(out)
 }
 
 /// splitmix64 — a deterministic, portable 64-bit PRNG for seed derivation.

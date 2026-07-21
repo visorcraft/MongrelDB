@@ -157,9 +157,8 @@ impl AnnIndex {
         Self::with_full_options(dim, m, ef_construction, ef_search, &options)
     }
 
-    /// Full-options constructor: selects the backend from `options.quantization`
-    /// (and `options.product` for Product). Used by the engine build path so
-    /// product-quantized indexes carry their training configuration.
+    /// Full-options constructor for already-validated engine schemas.
+    /// External callers should use [`Self::try_with_full_options`].
     pub fn with_full_options(
         dim: usize,
         m: usize,
@@ -184,6 +183,50 @@ impl AnnIndex {
         }
     }
 
+    /// Checked constructor for callers that do not already hold a validated schema.
+    pub fn try_with_full_options(
+        dim: usize,
+        m: usize,
+        ef_construction: usize,
+        ef_search: usize,
+        options: &AnnOptions,
+    ) -> Result<Self> {
+        if dim == 0 {
+            return Err(MongrelError::Schema(
+                "ANN embedding dimension must be greater than zero".into(),
+            ));
+        }
+        let mut effective = options.clone();
+        effective.m = m;
+        effective.ef_construction = ef_construction;
+        effective.ef_search = ef_search;
+        crate::schema::IndexDef {
+            name: "ann".into(),
+            column_id: 0,
+            kind: crate::schema::IndexKind::Ann,
+            predicate: None,
+            options: crate::schema::IndexOptions {
+                ann: Some(effective.clone()),
+                ..crate::schema::IndexOptions::default()
+            },
+        }
+        .validate_options()?;
+        if let AnnQuantization::Product { num_subvectors, .. } = effective.quantization {
+            if !dim.is_multiple_of(num_subvectors as usize) {
+                return Err(MongrelError::Schema(format!(
+                    "product quantization num_subvectors {num_subvectors} must divide embedding dimension {dim}"
+                )));
+            }
+        }
+        Ok(Self::with_full_options(
+            dim,
+            m,
+            ef_construction,
+            ef_search,
+            &effective,
+        ))
+    }
+
     pub fn dim(&self) -> usize {
         self.dim
     }
@@ -206,6 +249,15 @@ impl AnnIndex {
 
     pub fn algorithm(&self) -> crate::schema::AnnAlgorithm {
         self.options.algorithm
+    }
+
+    pub fn backend_name(&self) -> &'static str {
+        match (self.options.algorithm, self.quantization) {
+            (_, AnnQuantization::Product { .. }) => "flat_pq",
+            (crate::schema::AnnAlgorithm::Hnsw, _) => "hnsw",
+            (crate::schema::AnnAlgorithm::DiskAnn, _) => "diskann",
+            (crate::schema::AnnAlgorithm::Ivf, _) => "ivf",
+        }
     }
 
     /// True when this index's options and dimension match the schema declaration.
@@ -488,6 +540,9 @@ impl AnnIndex {
     /// graph by replaying every layer's entries into a fresh backend. This is
     /// the same path the pre-trait `freeze` used.
     fn consolidated_backend_checkpoint(&self) -> AnnBackendCheckpoint {
+        if self.active.is_empty() && self.frozen.len() == 1 {
+            return self.frozen[0].freeze();
+        }
         let template = self
             .frozen
             .first()
@@ -726,15 +781,25 @@ impl AnnIndex {
     }
 
     pub(crate) fn seal(&mut self) {
+        self.seal_with_checkpoint(always_ok)
+            .expect("infallible ANN seal checkpoint");
+    }
+
+    pub(crate) fn seal_with_checkpoint<F>(&mut self, mut checkpoint: F) -> Result<()>
+    where
+        F: FnMut() -> Result<()>,
+    {
         if self.active.is_empty() {
-            return;
+            return Ok(());
         }
+        self.active.finalize(&mut checkpoint)?;
         let empty = self.active.empty_active();
         let sealed = std::mem::replace(&mut self.active, empty);
         Arc::make_mut(&mut self.frozen).push(Arc::from(sealed));
         if self.frozen.len() >= crate::MAX_READ_GENERATION_LAYERS {
             self.consolidate_frozen();
         }
+        Ok(())
     }
 
     /// Compaction step (S1C-003): merge every frozen delta into a single new
@@ -774,7 +839,7 @@ impl AnnIndex {
 ///
 /// - Hnsw + BinarySign → Hamming HNSW
 /// - Hnsw + Dense → cosine HNSW
-/// - Hnsw + Product → flat PQ backend (ADC + approximate reconstructed rerank)
+/// - Hnsw + Product → flat PQ compatibility backend (no HNSW graph)
 /// - DiskAnn + Dense → Vamana single-layer graph (Phase 4)
 /// - Ivf + Dense → inverted-file backend
 fn new_backend(
@@ -794,8 +859,7 @@ fn new_backend(
         }
         (AnnAlgorithm::DiskAnn, AnnQuantization::Dense) => {
             let diskann = options.diskann.clone().unwrap_or_default();
-            const DISKANN_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
-            Box::new(diskann::DiskAnnBackend::new(dim, &diskann, DISKANN_SEED))
+            Box::new(diskann::DiskAnnBackend::new(dim, &diskann, diskann::SEED))
         }
         (AnnAlgorithm::Ivf, AnnQuantization::Dense) => {
             let ivf = options.ivf.clone().unwrap_or_default();
@@ -803,7 +867,7 @@ fn new_backend(
             Box::new(ivf::IvfBackend::new(dim, &ivf, IVF_SEED))
         }
         (
-            _,
+            AnnAlgorithm::Hnsw,
             AnnQuantization::Product {
                 num_subvectors,
                 bits,
@@ -965,6 +1029,21 @@ mod tests {
         let index = AnnIndex::with_options(8, 8, 32, 17);
         assert_eq!(index.ef_search(), 17);
         assert_eq!(AnnIndex::thaw(&index.freeze()).unwrap().ef_search(), 17);
+    }
+
+    #[test]
+    fn checked_constructor_rejects_unsupported_combination() {
+        let options = AnnOptions {
+            algorithm: crate::schema::AnnAlgorithm::Ivf,
+            quantization: AnnQuantization::Product {
+                num_subvectors: 4,
+                bits: 8,
+            },
+            ivf: Some(crate::schema::IvfOptions::default()),
+            product: Some(ProductQuantizerOptions::default()),
+            ..AnnOptions::default()
+        };
+        assert!(AnnIndex::try_with_full_options(8, 16, 64, 64, &options).is_err());
     }
 
     #[test]
@@ -1579,6 +1658,45 @@ mod tests {
     }
 
     #[test]
+    fn product_search_charges_work_after_finalization() {
+        let mut index = product_index(16, 8);
+        for row_id in 0..16 {
+            index
+                .insert(&[row_id as f32 + 1.0; 16], RowId(row_id))
+                .unwrap();
+        }
+        index.seal();
+        assert_eq!(index.backend_name(), "flat_pq");
+        let context = AiExecutionContext::new(None, 0);
+        assert!(matches!(
+            index.search_with_context(&[1.0; 16], 1, Some(&context)),
+            Err(MongrelError::WorkBudgetExceeded)
+        ));
+    }
+
+    #[test]
+    fn product_finalization_is_cooperatively_cancelled() {
+        let mut index = product_index(16, 8);
+        for row_id in 0..16 {
+            index
+                .insert(&[row_id as f32 + 1.0; 16], RowId(row_id))
+                .unwrap();
+        }
+        let mut calls = 0;
+        let result = index.seal_with_checkpoint(|| {
+            calls += 1;
+            if calls > 2 {
+                Err(MongrelError::Cancelled)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(result, Err(MongrelError::Cancelled)));
+        assert_eq!(index.frozen_layer_count(), 0);
+        assert_eq!(index.len(), 16);
+    }
+
+    #[test]
     fn product_checkpoint_rejects_corrupt_codes() {
         let mut index = product_index(16, 8);
         index.insert(&[1.0; 16], RowId(7)).unwrap();
@@ -1641,7 +1759,10 @@ mod tests {
             let mut q = vec![0f32; dim];
             q[(batch * 4) % dim] = 1.0;
             let after = index.search(&q, 4).unwrap();
-            assert_eq!(after.len(), expected.len());
+            assert_eq!(
+                after.iter().map(|hit| hit.0).collect::<Vec<_>>(),
+                expected.iter().map(|hit| hit.0).collect::<Vec<_>>()
+            );
         }
     }
 
@@ -1743,7 +1864,10 @@ mod tests {
         assert_eq!(index.frozen_layer_count(), 1);
         for (q, expected) in queries.iter().zip(before) {
             let after = index.search(q, 4).unwrap();
-            assert_eq!(after.len(), expected.len());
+            assert_eq!(
+                after.iter().map(|hit| hit.0).collect::<Vec<_>>(),
+                expected.iter().map(|hit| hit.0).collect::<Vec<_>>()
+            );
         }
     }
 
@@ -1817,7 +1941,23 @@ mod tests {
     }
 
     #[test]
-    fn ivf_consolidation_preserves_results() {
+    fn ivf_search_charges_work_after_finalization() {
+        let mut index = ivf_index(16, 4, 2);
+        for row_id in 0..16 {
+            index
+                .insert(&[row_id as f32 + 1.0; 16], RowId(row_id))
+                .unwrap();
+        }
+        index.seal();
+        let context = AiExecutionContext::new(None, 0);
+        assert!(matches!(
+            index.search_with_context(&[1.0; 16], 1, Some(&context)),
+            Err(MongrelError::WorkBudgetExceeded)
+        ));
+    }
+
+    #[test]
+    fn ivf_consolidation_preserves_cluster_recall() {
         let dim = 16;
         let mut index = ivf_index(dim, 4, 2);
         for batch in 0..3u32 {
@@ -1838,15 +1978,14 @@ mod tests {
                 q
             })
             .collect();
-        let before: Vec<_> = queries
-            .iter()
-            .map(|q| index.search(q, 4).unwrap())
-            .collect();
         index.merge_deltas_into_base();
         assert_eq!(index.frozen_layer_count(), 1);
-        for (q, expected) in queries.iter().zip(before) {
+        for (batch, q) in queries.iter().enumerate() {
             let after = index.search(q, 4).unwrap();
-            assert_eq!(after.len(), expected.len());
+            assert_eq!(after.len(), 4);
+            assert!(after
+                .iter()
+                .all(|hit| ((batch * 8) as u64..(batch * 8 + 8) as u64).contains(&hit.0 .0)));
         }
     }
 }

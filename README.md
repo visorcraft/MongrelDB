@@ -113,10 +113,11 @@ Index options preserve existing defaults when omitted. `CREATE INDEX ... WITH
 `pq_rerank_factor`; MinHash `permutations` and `bands`; and learned-range
 `epsilon`.
 
-The ANN algorithm and quantization are chosen independently:
+The ANN algorithm and quantization are separate schema fields, with an explicit
+supported-combination matrix:
 
 - **Algorithms** (`algorithm = 'hnsw'` default, `'diskann'`, `'ivf'`) select
-  the graph/structure search walks.
+  the graph/structure search walks for BinarySign and Dense.
 - **Quantizations** (`quantization = 'binary_sign'` default, `'dense'`,
   `'product'`) select how vectors are represented:
   - **BinarySign** stores 1-bit sign vectors and reports Hamming distance
@@ -129,6 +130,8 @@ The ANN algorithm and quantization are chosen independently:
 
 Supported combinations: `hnsw × {binary_sign, dense, product}`,
 `diskann × dense`, `ivf × dense`. See `docs/06-indexes.md` for details.
+Product currently uses a flat PQ backend; `algorithm = 'hnsw'` is its
+compatibility selector, not an HNSW graph.
 
 All ANN candidate searches are approximate. Online
 `Database::create_index` / `replace_index` / `drop_index` (and SQL CREATE/DROP

@@ -115,6 +115,11 @@ pub(crate) trait AnnBackend: Send + Sync {
         checkpoint: &mut dyn FnMut() -> Result<()>,
     ) -> Result<()>;
 
+    /// Finish backend-specific training before an active delta becomes frozen.
+    fn finalize(&mut self, checkpoint: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+        checkpoint()
+    }
+
     /// k-nearest candidates from this backend's graph. Returns raw
     /// `(row_id, distance)` pairs as `f64` so a single return type spans both
     /// metrics; the orchestrator converts to [`super::AnnDistance`] based on

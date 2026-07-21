@@ -69,8 +69,16 @@ impl IvfBackend {
     /// centroid, and return the frozen representation. Training samples are
     /// capped by `training_samples` to bound k-means cost.
     fn freeze_active(&self) -> Option<FrozenIvf> {
+        self.freeze_active_with_checkpoint(&mut || Ok(()))
+            .expect("infallible IVF-training checkpoint")
+    }
+
+    fn freeze_active_with_checkpoint(
+        &self,
+        checkpoint: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<FrozenIvf>> {
         if self.pending.is_empty() {
-            return None;
+            return Ok(None);
         }
         // Cap training samples to bound the O(iterations × N × nlist × dim)
         // k-means cost. Uses deterministic stride sampling matching the PQ
@@ -88,13 +96,16 @@ impl IvfBackend {
         // Cap effective nlist by sample count so tiny training sets don't
         // produce empty cells.
         let effective_nlist = self.nlist.min(samples.len());
-        let centroids = kmeans(&samples, self.dim, effective_nlist, self.seed);
+        let centroids = kmeans(&samples, self.dim, effective_nlist, self.seed, checkpoint)?;
         let mut lists: BTreeMap<usize, Vec<(RowId, Vec<f32>)>> = BTreeMap::new();
-        for (row_id, vec) in &self.pending {
+        for (index, (row_id, vec)) in self.pending.iter().enumerate() {
+            if index.is_multiple_of(64) {
+                checkpoint()?;
+            }
             let cell = nearest_centroid(vec, &centroids);
             lists.entry(cell).or_default().push((*row_id, vec.clone()));
         }
-        Some((centroids, lists))
+        Ok(Some((centroids, lists)))
     }
 
     pub(crate) fn from_checkpoint(
@@ -167,6 +178,17 @@ impl AnnBackend for IvfBackend {
         Ok(())
     }
 
+    fn finalize(&mut self, checkpoint: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+        if self.centroids.is_none() {
+            if let Some((centroids, lists)) = self.freeze_active_with_checkpoint(checkpoint)? {
+                self.centroids = Some(centroids);
+                self.lists = lists;
+                self.pending.clear();
+            }
+        }
+        checkpoint()
+    }
+
     fn search(
         &self,
         query: &[f32],
@@ -178,6 +200,12 @@ impl AnnBackend for IvfBackend {
         // Frozen layer: probe the nprobe nearest centroids' lists.
         if let Some(centroids) = &self.centroids {
             if !centroids.is_empty() {
+                if let Some(context) = context {
+                    context.consume(crate::query::work_units(
+                        self.dim.saturating_mul(centroids.len()),
+                        crate::query::FLOAT_WORK_QUANTUM,
+                    ))?;
+                }
                 // Rank centroids by distance to the query, take nprobe nearest.
                 let mut centroid_dists: Vec<(f32, usize)> = centroids
                     .iter()
@@ -191,7 +219,11 @@ impl AnnBackend for IvfBackend {
                         for (i, (row_id, vec)) in list.iter().enumerate() {
                             if let Some(context) = context {
                                 if i.is_multiple_of(64) {
-                                    context.checkpoint()?;
+                                    let count = (list.len() - i).min(64);
+                                    context.consume(crate::query::work_units(
+                                        self.dim.saturating_mul(count),
+                                        crate::query::FLOAT_WORK_QUANTUM,
+                                    ))?;
                                 }
                             }
                             scored.push((cosine_distance(query, vec), *row_id));
@@ -204,7 +236,11 @@ impl AnnBackend for IvfBackend {
         for (i, (row_id, vec)) in self.pending.iter().enumerate() {
             if let Some(context) = context {
                 if i.is_multiple_of(64) {
-                    context.checkpoint()?;
+                    let count = (self.pending.len() - i).min(64);
+                    context.consume(crate::query::work_units(
+                        self.dim.saturating_mul(count),
+                        crate::query::FLOAT_WORK_QUANTUM,
+                    ))?;
                 }
             }
             scored.push((cosine_distance(query, vec), *row_id));
@@ -295,9 +331,15 @@ impl AnnBackend for IvfBackend {
 
 /// Full-vector k-means. Stride-seeded centroids (deterministic), up to 25
 /// Lloyd iterations, empty clusters retain their previous centroid.
-fn kmeans(samples: &[&[f32]], dim: usize, k: usize, seed: u64) -> Vec<Vec<f32>> {
+fn kmeans(
+    samples: &[&[f32]],
+    dim: usize,
+    k: usize,
+    seed: u64,
+    checkpoint: &mut dyn FnMut() -> Result<()>,
+) -> Result<Vec<Vec<f32>>> {
     if samples.is_empty() {
-        return vec![vec![0.0f32; dim]];
+        return Ok(vec![vec![0.0f32; dim]]);
     }
     let effective_k = k.min(samples.len()).max(1);
     let mut centroids = vec![vec![0.0f32; dim]; k];
@@ -307,9 +349,13 @@ fn kmeans(samples: &[&[f32]], dim: usize, k: usize, seed: u64) -> Vec<Vec<f32>> 
         centroids[c] = src.to_vec();
     }
     for _iter in 0..25 {
+        checkpoint()?;
         let mut sums = vec![vec![0.0f32; dim]; k];
         let mut counts = vec![0u32; k];
-        for sample in samples {
+        for (index, sample) in samples.iter().enumerate() {
+            if index.is_multiple_of(64) {
+                checkpoint()?;
+            }
             let nearest = nearest_centroid(sample, &centroids);
             for (i, value) in sample.iter().enumerate() {
                 sums[nearest][i] += value;
@@ -331,7 +377,7 @@ fn kmeans(samples: &[&[f32]], dim: usize, k: usize, seed: u64) -> Vec<Vec<f32>> 
             break;
         }
     }
-    centroids
+    Ok(centroids)
 }
 
 /// Index of the nearest centroid to `vec`.

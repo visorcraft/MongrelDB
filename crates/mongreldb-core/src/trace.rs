@@ -204,6 +204,8 @@ pub struct QueryTrace {
     pub ann_algorithm: Option<crate::schema::AnnAlgorithm>,
     /// ANN representation selected by the authoritative index schema.
     pub ann_quantization: Option<crate::schema::AnnQuantization>,
+    /// Concrete backend executing the ANN candidate search.
+    pub ann_backend: Option<&'static str>,
     pub ann_candidate_nanos: u64,
     pub ann_candidate_cap_hit: bool,
     pub sparse_candidate_nanos: u64,

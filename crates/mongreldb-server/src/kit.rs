@@ -2789,6 +2789,7 @@ fn execute_kit_search(
                 mongreldb_core::schema::AnnQuantization::Dense => "dense",
                 mongreldb_core::schema::AnnQuantization::Product { .. } => "product",
             }),
+            "ann_backend": trace.ann_backend,
             "ann_candidate_nanos": trace.ann_candidate_nanos,
             "ann_candidate_cap_hit": trace.ann_candidate_cap_hit,
             "sparse_candidate_nanos": trace.sparse_candidate_nanos,

@@ -67,6 +67,8 @@ pub(crate) struct PqBackend {
     pending: BTreeMap<RowId, Vec<f32>>,
 }
 
+type FrozenProduct = (ProductQuantizer, BTreeMap<RowId, Vec<u8>>);
+
 impl PqBackend {
     /// Build a fresh empty active delta. The codebook is trained at freeze
     /// from the buffered vectors.
@@ -91,23 +93,38 @@ impl PqBackend {
     /// Train the codebook from the buffered Dense vectors, encode each, and
     /// return the frozen representation. Returns `None` if no vectors were
     /// buffered (empty freeze).
-    fn freeze_active(&self) -> Option<(ProductQuantizer, BTreeMap<RowId, Vec<u8>>)> {
+    fn freeze_active(&self) -> Option<FrozenProduct> {
+        self.freeze_active_with_checkpoint(&mut || Ok(()))
+            .expect("infallible product-training checkpoint")
+    }
+
+    fn freeze_active_with_checkpoint(
+        &self,
+        checkpoint: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<FrozenProduct>> {
         if self.pending.is_empty() {
-            return None;
+            return Ok(None);
         }
         let samples: Vec<&[f32]> = self.pending.values().map(|v| v.as_slice()).collect();
-        let quantizer = ProductQuantizer::train(
+        let Some(quantizer) = ProductQuantizer::train_with_checkpoint(
             self.dim,
             self.num_subvectors,
             self.bits,
             &samples,
             &self.training,
-        )?;
+            checkpoint,
+        )?
+        else {
+            return Ok(None);
+        };
         let mut codes = BTreeMap::new();
-        for (row_id, vec) in &self.pending {
+        for (index, (row_id, vec)) in self.pending.iter().enumerate() {
+            if index.is_multiple_of(64) {
+                checkpoint()?;
+            }
             codes.insert(*row_id, quantizer.encode(vec));
         }
-        Some((quantizer, codes))
+        Ok(Some((quantizer, codes)))
     }
 
     /// Reconstruct a backend directly from a checkpoint payload (codebook +
@@ -178,6 +195,17 @@ impl AnnBackend for PqBackend {
         Ok(())
     }
 
+    fn finalize(&mut self, checkpoint: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+        if self.quantizer.is_none() {
+            if let Some((quantizer, codes)) = self.freeze_active_with_checkpoint(checkpoint)? {
+                self.quantizer = Some(quantizer);
+                self.codes = codes;
+                self.pending.clear();
+            }
+        }
+        checkpoint()
+    }
+
     fn search(
         &self,
         query: &[f32],
@@ -191,7 +219,11 @@ impl AnnBackend for PqBackend {
             for (i, (row_id, vec)) in self.pending.iter().enumerate() {
                 if let Some(context) = context {
                     if i.is_multiple_of(64) {
-                        context.checkpoint()?;
+                        let count = (self.pending.len() - i).min(64);
+                        context.consume(crate::query::work_units(
+                            self.dim.saturating_mul(count),
+                            crate::query::FLOAT_WORK_QUANTUM,
+                        ))?;
                     }
                 }
                 scored.push((squared_l2(query, vec), *row_id));
@@ -200,12 +232,22 @@ impl AnnBackend for PqBackend {
         // Frozen layer: ADC over codes against the query lookup table.
         if let Some(quantizer) = &self.quantizer {
             if !self.codes.is_empty() {
+                if let Some(context) = context {
+                    context.consume(crate::query::work_units(
+                        self.dim.saturating_mul(self.k()),
+                        crate::query::FLOAT_WORK_QUANTUM,
+                    ))?;
+                }
                 let table = quantizer.adc_table(query);
                 let k_codes = self.k();
                 for (i, (row_id, code)) in self.codes.iter().enumerate() {
                     if let Some(context) = context {
                         if i.is_multiple_of(64) {
-                            context.checkpoint()?;
+                            let count = (self.codes.len() - i).min(64);
+                            context.consume(crate::query::work_units(
+                                self.num_subvectors.saturating_mul(count),
+                                crate::query::FLOAT_WORK_QUANTUM,
+                            ))?;
                         }
                     }
                     let dist =
@@ -228,21 +270,29 @@ impl AnnBackend for PqBackend {
         };
         if self.rerank_factor > 0 && rerank_set > k {
             if let Some(quantizer) = &self.quantizer {
-                let mut reranked: Vec<(f32, RowId)> = scored[..rerank_set]
-                    .iter()
-                    .map(|(_, row_id)| {
-                        // Active-delta entries are exact already; only
-                        // frozen-layer (coded) entries benefit from rerank.
-                        if let Some(vec) = self.pending.get(row_id) {
-                            (squared_l2(query, vec), *row_id)
-                        } else if let Some(code) = self.codes.get(row_id) {
-                            let recon = quantizer.reconstruct(code);
-                            (squared_l2(query, &recon), *row_id)
-                        } else {
-                            (f32::INFINITY, *row_id)
+                let mut reranked = Vec::with_capacity(rerank_set);
+                for (index, (_, row_id)) in scored[..rerank_set].iter().enumerate() {
+                    if let Some(context) = context {
+                        if index.is_multiple_of(64) {
+                            let count = (rerank_set - index).min(64);
+                            context.consume(crate::query::work_units(
+                                self.dim.saturating_mul(count),
+                                crate::query::FLOAT_WORK_QUANTUM,
+                            ))?;
                         }
-                    })
-                    .collect();
+                    }
+                    // Active-delta entries are exact already; only
+                    // frozen-layer (coded) entries benefit from rerank.
+                    let scored_row = if let Some(vec) = self.pending.get(row_id) {
+                        (squared_l2(query, vec), *row_id)
+                    } else if let Some(code) = self.codes.get(row_id) {
+                        let recon = quantizer.reconstruct(code);
+                        (squared_l2(query, &recon), *row_id)
+                    } else {
+                        (f32::INFINITY, *row_id)
+                    };
+                    reranked.push(scored_row);
+                }
                 reranked.sort_by(|(da, ra), (db, rb)| da.total_cmp(db).then_with(|| ra.cmp(rb)));
                 return Ok(reranked
                     .into_iter()

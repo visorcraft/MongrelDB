@@ -543,6 +543,7 @@ fn hybrid_search_filters_unions_and_fuses_deterministically() {
     let hits = hits.unwrap();
     assert_eq!(trace.ann_algorithm, Some(AnnAlgorithm::Hnsw));
     assert_eq!(trace.ann_quantization, Some(AnnQuantization::BinarySign));
+    assert_eq!(trace.ann_backend, Some("hnsw"));
     assert_eq!(hits.len(), 2);
     assert_eq!(hits[0].row_id.0, 0);
     assert_eq!(hits[1].row_id.0, 1);
