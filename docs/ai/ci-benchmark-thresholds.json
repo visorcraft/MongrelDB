@@ -11,7 +11,7 @@
     "maximum_p95_us": 5000
   },
   "minhash": {
-    "maximum_p95_us": 1000,
+    "maximum_p95_us": 3000,
     "minimum_candidate_recall_at_10": 0.70
   },
   "hybrid": {

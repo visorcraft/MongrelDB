@@ -30,7 +30,7 @@ jobs:
         shell: bash --noprofile --norc -eo pipefail {0}
     env:
       QUAL_DIR: /tmp/mongreldb-qualification
-      CARGO_TARGET_DIR: ${{ github.workspace }}/target-qualification
+      CARGO_TARGET_DIR: /tmp/mongreldb-target-qualification
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
       CARGO_PROFILE_TEST_DEBUG: "0"
@@ -77,19 +77,21 @@ jobs:
           git status --porcelain --untracked-files=all | tee "$QUAL_DIR/git-status-before-ai.txt"
           test ! -s "$QUAL_DIR/git-status-before-ai.txt"
           source_sha="$(git rev-parse HEAD)"
+          git fetch --no-tags --depth=1 origin "$GITHUB_SHA"
+          git show "$GITHUB_SHA:docs/ai/ci-benchmark-thresholds.json" \
+            > "$QUAL_DIR/ci-benchmark-thresholds.json"
           MONGRELDB_AI_QUALIFICATION=1 \
             MONGRELDB_AI_BENCH_ROWS=100000 MONGRELDB_AI_BENCH_QUERIES=50 \
-            cargo run -p mongreldb-core --release --all-features \
+            cargo run --locked -p mongreldb-core --release --all-features \
             --example ai_retrieval_bench \
             > "$QUAL_DIR/ai-benchmark-100k.json" 2> "$QUAL_DIR/ai-benchmark-100k.log"
-          cp docs/ai/ci-benchmark-thresholds.json "$QUAL_DIR/"
           python3 scripts/run-certification-command.py "$QUAL_DIR/ai-benchmark-validation.log" \
             python3 scripts/validate-ai-benchmark.py \
             "$QUAL_DIR/ai-benchmark-100k.json" \
-            docs/ai/ci-benchmark-thresholds.json \
+            "$QUAL_DIR/ci-benchmark-thresholds.json" \
             --expected-sha "$source_sha"
           MONGRELDB_AI_CONCURRENCY_ROWS=10000 MONGRELDB_AI_CONCURRENCY_OPS=25 \
-            cargo run -p mongreldb-core --release --all-features \
+            cargo run --locked -p mongreldb-core --release --all-features \
             --example ai_concurrency_bench \
             > "$QUAL_DIR/ai-concurrency.json" 2> "$QUAL_DIR/ai-concurrency.log"
           python3 scripts/run-certification-command.py "$QUAL_DIR/ai-concurrency-validation.log" \
