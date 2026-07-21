@@ -2,6 +2,11 @@ name: Clean release qualification
 
 on:
   workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Source ref to qualify
+        required: false
+        type: string
   push:
     tags: ["v*"]
 
@@ -31,6 +36,8 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
       - name: Free disk space
         run: |
           sudo rm -rf \
@@ -65,6 +72,28 @@ jobs:
             node --version
             df -h
           } > "$QUAL_DIR/versions.txt"
+      - name: AI benchmark
+        run: |
+          git status --porcelain --untracked-files=all | tee "$QUAL_DIR/git-status-before-ai.txt"
+          test ! -s "$QUAL_DIR/git-status-before-ai.txt"
+          source_sha="$(git rev-parse HEAD)"
+          MONGRELDB_AI_QUALIFICATION=1 \
+            MONGRELDB_AI_BENCH_ROWS=100000 MONGRELDB_AI_BENCH_QUERIES=50 \
+            cargo run -p mongreldb-core --release --all-features \
+            --example ai_retrieval_bench \
+            > "$QUAL_DIR/ai-benchmark-100k.json" 2> "$QUAL_DIR/ai-benchmark-100k.log"
+          cp docs/ai/ci-benchmark-thresholds.json "$QUAL_DIR/"
+          python3 scripts/run-certification-command.py "$QUAL_DIR/ai-benchmark-validation.log" \
+            python3 scripts/validate-ai-benchmark.py \
+            "$QUAL_DIR/ai-benchmark-100k.json" \
+            docs/ai/ci-benchmark-thresholds.json \
+            --expected-sha "$source_sha"
+          MONGRELDB_AI_CONCURRENCY_ROWS=10000 MONGRELDB_AI_CONCURRENCY_OPS=25 \
+            cargo run -p mongreldb-core --release --all-features \
+            --example ai_concurrency_bench \
+            > "$QUAL_DIR/ai-concurrency.json" 2> "$QUAL_DIR/ai-concurrency.log"
+          python3 scripts/run-certification-command.py "$QUAL_DIR/ai-concurrency-validation.log" \
+            python3 scripts/validate-ai-concurrency.py "$QUAL_DIR/ai-concurrency.json"
       - name: Root format
         run: python3 scripts/run-certification-command.py "$QUAL_DIR/cargo-fmt.log" cargo fmt --all -- --check
       - name: Component versions
@@ -126,26 +155,6 @@ jobs:
           done
           curl --fail --silent http://127.0.0.1:8080/health >/dev/null
           PYTHONDONTWRITEBYTECODE=1 MONGRELDB_DB_PATH="$RUNNER_TEMP/mongreldb-ai-wire" python3 tools/ai-wire/demo_minhash.py 2>&1 | tee "$QUAL_DIR/ai-wire-minhash.log"
-      - name: AI benchmark
-        run: |
-          MONGRELDB_AI_QUALIFICATION=1 \
-            MONGRELDB_AI_BENCH_ROWS=100000 MONGRELDB_AI_BENCH_QUERIES=50 \
-            cargo run -p mongreldb-core --release --all-features \
-            --example ai_retrieval_bench \
-            > "$QUAL_DIR/ai-benchmark-100k.json" 2> "$QUAL_DIR/ai-benchmark-100k.log"
-          cp docs/ai/ci-benchmark-thresholds.json "$QUAL_DIR/"
-          python3 scripts/run-certification-command.py "$QUAL_DIR/ai-benchmark-validation.log" \
-            python3 scripts/validate-ai-benchmark.py \
-            "$QUAL_DIR/ai-benchmark-100k.json" \
-            docs/ai/ci-benchmark-thresholds.json \
-            --expected-sha "$GITHUB_SHA"
-          MONGRELDB_AI_CONCURRENCY_ROWS=10000 MONGRELDB_AI_CONCURRENCY_OPS=25 \
-            cargo run -p mongreldb-core --release --all-features \
-            --example ai_concurrency_bench \
-            > "$QUAL_DIR/ai-concurrency.json" 2> "$QUAL_DIR/ai-concurrency.log"
-          python3 scripts/run-certification-command.py "$QUAL_DIR/ai-concurrency-validation.log" \
-            python3 scripts/validate-ai-concurrency.py "$QUAL_DIR/ai-concurrency.json"
-          test -z "$(git status --porcelain)"
       - name: Fuzz smoke
         run: |
           rustup toolchain install "$RUST_NIGHTLY" --profile minimal
@@ -155,6 +164,8 @@ jobs:
             bash -c 'cd fuzz && for target in protocol_envelope wal consensus_snapshot cursor_token sql_adapter_packet; do cargo +"$RUST_NIGHTLY" fuzz run "$target" -- -max_total_time=10; done'
       - name: Package release candidates
         run: |
+          git status --porcelain --untracked-files=all | tee "$QUAL_DIR/git-status-final.txt"
+          test ! -s "$QUAL_DIR/git-status-final.txt"
           tar \
             --exclude=deps --exclude=build --exclude=incremental --exclude=examples \
             -C "$CARGO_TARGET_DIR/release" \
@@ -187,6 +198,8 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_VERSION }}
