@@ -23,6 +23,9 @@
 name: FFI Release
 
 on:
+  push:
+    tags:
+      - 'v*'
   workflow_dispatch:
     inputs:
       tag:
