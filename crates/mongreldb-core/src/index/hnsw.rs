@@ -77,6 +77,10 @@ impl Hnsw {
         (self.m, self.ef_construction)
     }
 
+    pub(crate) fn bytes_per_vec(&self) -> usize {
+        self.bytes_per_vec
+    }
+
     pub(crate) fn entries(&self) -> impl Iterator<Item = (Vec<u8>, RowId)> + '_ {
         self.vectors
             .iter()

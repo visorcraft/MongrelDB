@@ -18,7 +18,18 @@
 //! every frozen delta into a new base graph. Deleted rows keep stale graph
 //! entries (HNSW has no cheap node removal); readers apply the
 //! visibility/tombstone filter via [`AnnIndex::search_filtered`].
+//!
+//! ## Swappable backend contract (Phase 2)
+//!
+//! Concrete ANN algorithms implement [`backend::AnnBackend`]. The orchestrator
+//! ([`AnnIndex`]) is algorithm-agnostic: it holds a base+delta list of boxed
+//! backends and routes build/insert/search/checkpoint/reopen through the trait.
+//! DiskANN and IVF land as additional `AnnBackend` implementations without
+//! modifying this module.
 
+pub(crate) mod backend;
+
+use crate::index::ann::backend::{AnnBackend, AnnBackendCheckpoint, BackendMetric};
 use crate::index::hnsw::{DenseHnsw, Hnsw};
 use crate::rowid::RowId;
 use crate::schema::AnnQuantization;
@@ -69,47 +80,38 @@ impl AnnDistance {
     }
 }
 
-/// Vector store keyed by [`RowId`], backed by HNSW graphs in the S1C-003
+/// Vector store keyed by [`RowId`], backed by an ANN backend in the S1C-003
 /// base+delta layout: `frozen` holds the immutable base (after consolidation,
-/// a single layer) plus immutable frozen deltas, `active` is the small
-/// mutable delta writers insert into.
-#[derive(Clone)]
+/// a single layer) plus immutable frozen deltas, `active` is the small mutable
+/// delta writers insert into.
+///
+/// `frozen` entries are `Arc`-shared (immutable, cheap to clone across the
+/// read generation); `active` is a uniquely-owned boxed backend so inserts can
+/// mutate it. [`Clone`] is implemented manually via [`AnnBackend::clone_box`].
 pub struct AnnIndex {
     dim: usize,
     m: usize,
     ef_construction: usize,
     ef_search: usize,
     quantization: AnnQuantization,
-    body: AnnBody,
+    /// Immutable frozen layers (base + deltas). Empty until the first seal.
+    frozen: Arc<Vec<Arc<dyn AnnBackend>>>,
+    /// Small mutable delta writers insert into.
+    active: Box<dyn AnnBackend>,
 }
 
-#[derive(Clone)]
-enum AnnBody {
-    BinarySign {
-        bytes_per_vec: usize,
-        frozen: Arc<Vec<Arc<Hnsw>>>,
-        active: Hnsw,
-    },
-    Dense {
-        frozen: Arc<Vec<Arc<DenseHnsw>>>,
-        active: DenseHnsw,
-    },
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct AnnCheckpoint {
-    quantization: AnnQuantization,
-    dim: usize,
-    m: usize,
-    ef_construction: usize,
-    ef_search: usize,
-    payload: AnnCheckpointPayload,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-enum AnnCheckpointPayload {
-    BinarySign { bytes_per_vec: usize, graph: Hnsw },
-    Dense { graph: DenseHnsw },
+impl Clone for AnnIndex {
+    fn clone(&self) -> Self {
+        Self {
+            dim: self.dim,
+            m: self.m,
+            ef_construction: self.ef_construction,
+            ef_search: self.ef_search,
+            quantization: self.quantization,
+            frozen: Arc::clone(&self.frozen),
+            active: self.active.clone_box(),
+        }
+    }
 }
 
 impl AnnIndex {
@@ -134,27 +136,15 @@ impl AnnIndex {
         ef_search: usize,
         quantization: AnnQuantization,
     ) -> Self {
-        let body = match quantization {
-            AnnQuantization::BinarySign => {
-                let bytes_per_vec = dim.div_ceil(8);
-                AnnBody::BinarySign {
-                    bytes_per_vec,
-                    frozen: Arc::new(Vec::new()),
-                    active: Hnsw::new(bytes_per_vec, m, ef_construction),
-                }
-            }
-            AnnQuantization::Dense => AnnBody::Dense {
-                frozen: Arc::new(Vec::new()),
-                active: DenseHnsw::new(dim, m, ef_construction),
-            },
-        };
+        let active = new_backend(dim, m, ef_construction, quantization);
         Self {
             dim,
             m,
             ef_construction,
             ef_search,
             quantization,
-            body,
+            frozen: Arc::new(Vec::new()),
+            active,
         }
     }
 
@@ -216,38 +206,31 @@ impl AnnIndex {
             ));
         }
         self.validate_query(vec)?;
-        let bytes_per_vec = match &self.body {
-            AnnBody::BinarySign { bytes_per_vec, .. } => *bytes_per_vec,
-            AnnBody::Dense { .. } => unreachable!("quantization/body mismatch"),
-        };
-        let mut out = vec![0u8; bytes_per_vec];
-        for (i, v) in vec.iter().enumerate() {
-            if *v > 0.0 {
-                out[i / 8] |= 1 << (i % 8);
-            }
-        }
-        Ok(out)
+        let bytes_per_vec = self.dim.div_ceil(8);
+        Ok(quantize_f32_to_binary_sign(vec, bytes_per_vec))
     }
 
     /// Insert a quantized vector for `row_id` (BinarySign only).
     pub fn insert_quantized(&mut self, bits: Vec<u8>, row_id: RowId) -> Result<()> {
-        match &mut self.body {
-            AnnBody::BinarySign {
-                bytes_per_vec,
-                active,
-                ..
-            } => {
-                if bits.len() != *bytes_per_vec {
+        match self.quantization {
+            AnnQuantization::BinarySign => {
+                let bytes_per_vec = self.dim.div_ceil(8);
+                if bits.len() != bytes_per_vec {
                     return Err(MongrelError::InvalidArgument(format!(
                         "quantized vector length must be {}, got {}",
                         bytes_per_vec,
                         bits.len()
                     )));
                 }
-                active.insert(bits, row_id);
+                // Reconstruct an f32 vector that re-quantizes to `bits`, then
+                // route through the uniform trait entrypoint. The sign bits
+                // after quantization are identical to `bits`.
+                let reconstructed = binary_sign_bits_to_f32(&bits, self.dim);
+                self.active
+                    .insert_validated(&reconstructed, row_id, &mut always_ok)?;
                 Ok(())
             }
-            AnnBody::Dense { .. } => Err(MongrelError::InvalidArgument(
+            _ => Err(MongrelError::InvalidArgument(
                 "insert_quantized is only valid for BinarySign ANN indexes".into(),
             )),
         }
@@ -256,24 +239,7 @@ impl AnnIndex {
     /// Convenience: insert a full-precision vector (quantizes for BinarySign).
     pub fn insert(&mut self, vec: &[f32], row_id: RowId) -> Result<()> {
         self.validate_query(vec)?;
-        match &mut self.body {
-            AnnBody::BinarySign {
-                bytes_per_vec,
-                active,
-                ..
-            } => {
-                let mut bits = vec![0u8; *bytes_per_vec];
-                for (i, v) in vec.iter().enumerate() {
-                    if *v > 0.0 {
-                        bits[i / 8] |= 1 << (i % 8);
-                    }
-                }
-                active.insert(bits, row_id);
-            }
-            AnnBody::Dense { active, .. } => {
-                active.insert(vec.to_vec(), row_id);
-            }
-        }
+        self.active.insert_validated(vec, row_id, &mut always_ok)?;
         Ok(())
     }
 
@@ -282,27 +248,10 @@ impl AnnIndex {
             // Historical malformed rows are quarantined from the derived index.
             return;
         }
-        match &mut self.body {
-            AnnBody::BinarySign {
-                bytes_per_vec,
-                active,
-                ..
-            } => {
-                let mut bits = vec![0u8; *bytes_per_vec];
-                for (i, value) in vec.iter().enumerate() {
-                    if *value > 0.0 {
-                        bits[i / 8] |= 1 << (i % 8);
-                    }
-                }
-                active.insert(bits, row_id);
-            }
-            AnnBody::Dense { active, .. } => {
-                active.insert(vec.to_vec(), row_id);
-            }
-        }
+        let _ = self.active.insert_validated(vec, row_id, &mut always_ok);
     }
 
-    /// Build-path insertion with cooperative checks inside Dense graph work.
+    /// Build-path insertion with cooperative checks inside graph work.
     /// Malformed historical rows remain quarantined, matching
     /// [`Self::insert_validated`].
     pub(crate) fn insert_validated_with_checkpoint<F>(
@@ -318,25 +267,7 @@ impl AnnIndex {
             return Ok(());
         }
         checkpoint()?;
-        match &mut self.body {
-            AnnBody::BinarySign {
-                bytes_per_vec,
-                active,
-                ..
-            } => {
-                let mut bits = vec![0u8; *bytes_per_vec];
-                for (i, value) in vec.iter().enumerate() {
-                    if *value > 0.0 {
-                        bits[i / 8] |= 1 << (i % 8);
-                    }
-                }
-                active.insert(bits, row_id);
-                Ok(())
-            }
-            AnnBody::Dense { active, .. } => {
-                active.insert_with_checkpoint(vec.to_vec(), row_id, checkpoint)
-            }
-        }
+        self.active.insert_validated(vec, row_id, &mut checkpoint)
     }
 
     /// k-nearest by the index metric (Hamming or cosine distance).
@@ -345,9 +276,9 @@ impl AnnIndex {
     }
 
     /// Base+delta search: each layer (base graph, frozen deltas, active
-    /// delta) contributes its HNSW candidate list, the lists are merged
-    /// keeping each row's exact minimum distance, and the merged list is
-    /// truncated to `k`. Equal distances break ties by [`RowId`].
+    /// delta) contributes its candidate list, the lists are merged keeping
+    /// each row's exact minimum distance, and the merged list is truncated to
+    /// `k`. Equal distances break ties by [`RowId`].
     pub fn search_with_context(
         &self,
         query: &[f32],
@@ -355,63 +286,26 @@ impl AnnIndex {
         context: Option<&crate::query::AiExecutionContext>,
     ) -> Result<Vec<(RowId, AnnDistance)>> {
         self.validate_query(query)?;
-        match &self.body {
-            AnnBody::BinarySign { frozen, active, .. } => {
-                let q = self.quantize(query)?;
-                let mut best = HashMap::<RowId, u32>::new();
-                for graph in frozen
-                    .iter()
-                    .map(Arc::as_ref)
-                    .chain(std::iter::once(active))
-                {
-                    for (row_id, distance) in
-                        graph.search_with_context(&q, k, self.ef_search, context)?
-                    {
-                        best.entry(row_id)
-                            .and_modify(|current| *current = (*current).min(distance))
-                            .or_insert(distance);
-                    }
-                }
-                let mut results: Vec<_> = best
-                    .into_iter()
-                    .map(|(row_id, d)| (row_id, AnnDistance::Hamming(d)))
-                    .collect();
-                results.sort_by(|left, right| {
-                    left.1.cmp_rank(&right.1).then_with(|| left.0.cmp(&right.0))
-                });
-                results.truncate(k);
-                Ok(results)
-            }
-            AnnBody::Dense { frozen, active } => {
-                let mut best = HashMap::<RowId, f32>::new();
-                for graph in frozen
-                    .iter()
-                    .map(Arc::as_ref)
-                    .chain(std::iter::once(active))
-                {
-                    for (row_id, distance) in
-                        graph.search_with_context(query, k, self.ef_search, context)?
-                    {
-                        best.entry(row_id)
-                            .and_modify(|current| {
-                                if distance.total_cmp(current).is_lt() {
-                                    *current = distance;
-                                }
-                            })
-                            .or_insert(distance);
-                    }
-                }
-                let mut results: Vec<_> = best
-                    .into_iter()
-                    .map(|(row_id, d)| (row_id, AnnDistance::Cosine(d)))
-                    .collect();
-                results.sort_by(|left, right| {
-                    left.1.cmp_rank(&right.1).then_with(|| left.0.cmp(&right.0))
-                });
-                results.truncate(k);
-                Ok(results)
+        let mut best: HashMap<RowId, f64> = HashMap::new();
+        for graph in self
+            .frozen
+            .iter()
+            .map(|layer| layer.as_ref())
+            .chain(std::iter::once(self.active.as_ref()))
+        {
+            for (row_id, distance) in graph.search(query, k, self.ef_search, context)? {
+                best.entry(row_id)
+                    .and_modify(|current| *current = current.min(distance))
+                    .or_insert(distance);
             }
         }
+        let mut results: Vec<_> = best
+            .into_iter()
+            .map(|(row_id, d)| (row_id, self.distance_from_backend(d)))
+            .collect();
+        results.sort_by(|left, right| left.1.cmp_rank(&right.1).then_with(|| left.0.cmp(&right.0)));
+        results.truncate(k);
+        Ok(results)
     }
 
     /// k-nearest among rows accepted by `visible` — the S1C-003
@@ -430,124 +324,58 @@ impl AnnIndex {
         let overfetch = k
             .saturating_mul(FILTERED_SEARCH_OVERFETCH)
             .max(k.saturating_add(16));
-        match &self.body {
-            AnnBody::BinarySign { frozen, active, .. } => {
-                let q = self.quantize(query)?;
-                let mut best = HashMap::<RowId, u32>::new();
-                for graph in frozen
-                    .iter()
-                    .map(Arc::as_ref)
-                    .chain(std::iter::once(active))
-                {
-                    let fetch = overfetch.min(graph.len());
-                    for (row_id, distance) in graph.search(&q, fetch, self.ef_search.max(fetch)) {
-                        if !visible(row_id) {
-                            continue;
-                        }
-                        best.entry(row_id)
-                            .and_modify(|current| *current = (*current).min(distance))
-                            .or_insert(distance);
-                    }
+        let mut best: HashMap<RowId, f64> = HashMap::new();
+        for graph in self
+            .frozen
+            .iter()
+            .map(|layer| layer.as_ref())
+            .chain(std::iter::once(self.active.as_ref()))
+        {
+            let fetch = overfetch.min(graph.len());
+            for (row_id, distance) in graph.search(query, fetch, self.ef_search.max(fetch), None)? {
+                if !visible(row_id) {
+                    continue;
                 }
-                let mut results: Vec<_> = best
-                    .into_iter()
-                    .map(|(row_id, d)| (row_id, AnnDistance::Hamming(d)))
-                    .collect();
-                results.sort_by(|left, right| {
-                    left.1.cmp_rank(&right.1).then_with(|| left.0.cmp(&right.0))
-                });
-                results.truncate(k);
-                Ok(results)
-            }
-            AnnBody::Dense { frozen, active } => {
-                let mut best = HashMap::<RowId, f32>::new();
-                for graph in frozen
-                    .iter()
-                    .map(Arc::as_ref)
-                    .chain(std::iter::once(active))
-                {
-                    let fetch = overfetch.min(graph.len());
-                    for (row_id, distance) in graph.search(query, fetch, self.ef_search.max(fetch))
-                    {
-                        if !visible(row_id) {
-                            continue;
-                        }
-                        best.entry(row_id)
-                            .and_modify(|current| {
-                                if distance.total_cmp(current).is_lt() {
-                                    *current = distance;
-                                }
-                            })
-                            .or_insert(distance);
-                    }
-                }
-                let mut results: Vec<_> = best
-                    .into_iter()
-                    .map(|(row_id, d)| (row_id, AnnDistance::Cosine(d)))
-                    .collect();
-                results.sort_by(|left, right| {
-                    left.1.cmp_rank(&right.1).then_with(|| left.0.cmp(&right.0))
-                });
-                results.truncate(k);
-                Ok(results)
+                best.entry(row_id)
+                    .and_modify(|current| *current = current.min(distance))
+                    .or_insert(distance);
             }
         }
+        let mut results: Vec<_> = best
+            .into_iter()
+            .map(|(row_id, d)| (row_id, self.distance_from_backend(d)))
+            .collect();
+        results.sort_by(|left, right| left.1.cmp_rank(&right.1).then_with(|| left.0.cmp(&right.0)));
+        results.truncate(k);
+        Ok(results)
     }
 
     pub fn len(&self) -> usize {
-        match &self.body {
-            AnnBody::BinarySign { frozen, active, .. } => {
-                active.len() + frozen.iter().map(|graph| graph.len()).sum::<usize>()
-            }
-            AnnBody::Dense { frozen, active } => {
-                active.len() + frozen.iter().map(|graph| graph.len()).sum::<usize>()
-            }
-        }
+        self.active.len() + self.frozen.iter().map(|graph| graph.len()).sum::<usize>()
     }
 
     pub fn is_empty(&self) -> bool {
-        match &self.body {
-            AnnBody::BinarySign { frozen, active, .. } => active.is_empty() && frozen.is_empty(),
-            AnnBody::Dense { frozen, active } => active.is_empty() && frozen.is_empty(),
-        }
+        self.active.is_empty() && self.frozen.is_empty()
     }
 
-    /// Checkpoint the whole HNSW graph (O(N) load, no O(N log N) rebuild).
+    /// Checkpoint the whole graph (O(N) load, no O(N log N) rebuild).
     pub fn freeze(&self) -> Vec<u8> {
-        let payload = match &self.body {
-            AnnBody::BinarySign {
-                bytes_per_vec,
-                frozen,
-                active,
-            } => {
-                let mut graph = Hnsw::new(*bytes_per_vec, self.m, self.ef_construction);
-                for layer in frozen
-                    .iter()
-                    .map(Arc::as_ref)
-                    .chain(std::iter::once(active))
-                {
-                    for (bits, row_id) in layer.entries() {
-                        graph.insert(bits, row_id);
-                    }
-                }
-                AnnCheckpointPayload::BinarySign {
-                    bytes_per_vec: *bytes_per_vec,
+        let backend_checkpoint = self.consolidated_backend_checkpoint();
+        let payload = match (self.quantization, backend_checkpoint) {
+            (
+                AnnQuantization::BinarySign,
+                AnnBackendCheckpoint::HnswBinarySign {
+                    bytes_per_vec,
                     graph,
-                }
-            }
-            AnnBody::Dense { frozen, active } => {
-                let mut graph = DenseHnsw::new(self.dim, self.m, self.ef_construction);
-                for layer in frozen
-                    .iter()
-                    .map(Arc::as_ref)
-                    .chain(std::iter::once(active))
-                {
-                    for (vec, row_id) in layer.entries() {
-                        graph.insert(vec, row_id);
-                    }
-                }
+                },
+            ) => AnnCheckpointPayload::BinarySign {
+                bytes_per_vec,
+                graph,
+            },
+            (AnnQuantization::Dense, AnnBackendCheckpoint::HnswDense { graph }) => {
                 AnnCheckpointPayload::Dense { graph }
             }
+            _ => unreachable!("quantization/backend tag mismatch in freeze"),
         };
         bincode::serialize(&AnnCheckpoint {
             quantization: self.quantization,
@@ -558,6 +386,27 @@ impl AnnIndex {
             payload,
         })
         .expect("ann index serializable")
+    }
+
+    /// Build a single checkpoint for the consolidated (base + deltas + active)
+    /// graph by replaying every layer's entries into a fresh backend. This is
+    /// the same path the pre-trait `freeze` used.
+    fn consolidated_backend_checkpoint(&self) -> AnnBackendCheckpoint {
+        let template = self
+            .frozen
+            .first()
+            .map(|layer| layer.as_ref())
+            .unwrap_or_else(|| self.active.as_ref());
+        let mut entries: Vec<(Vec<u8>, RowId)> = Vec::new();
+        for graph in self
+            .frozen
+            .iter()
+            .map(|layer| layer.as_ref())
+            .chain(std::iter::once(self.active.as_ref()))
+        {
+            entries.extend(graph.entries());
+        }
+        template.rebuild_from_entries(&entries).freeze()
     }
 
     /// Rehydrate from bytes produced by [`AnnIndex::freeze`].
@@ -592,19 +441,22 @@ impl AnnIndex {
                     return Err("ANN BinarySign checkpoint graph options mismatch header".into());
                 }
                 if bytes_per_vec != checkpoint.dim.div_ceil(8) {
-                    return Err("ANN BinarySign checkpoint bytes_per_vec mismatch".into());
+                    return Err("ANN BinarySign checkpoint bytes_per_vec mismatch header".into());
                 }
+                let active = new_backend(
+                    checkpoint.dim,
+                    checkpoint.m,
+                    checkpoint.ef_construction,
+                    AnnQuantization::BinarySign,
+                );
                 Ok(Self {
                     dim: checkpoint.dim,
                     m: checkpoint.m,
                     ef_construction: checkpoint.ef_construction,
                     ef_search: checkpoint.ef_search,
                     quantization: AnnQuantization::BinarySign,
-                    body: AnnBody::BinarySign {
-                        bytes_per_vec,
-                        frozen: Arc::new(vec![Arc::new(graph)]),
-                        active: Hnsw::new(bytes_per_vec, checkpoint.m, checkpoint.ef_construction),
-                    },
+                    frozen: Arc::new(vec![Arc::new(graph) as Arc<dyn AnnBackend>]),
+                    active,
                 })
             }
             (AnnQuantization::Dense, AnnCheckpointPayload::Dense { graph }) => {
@@ -615,20 +467,20 @@ impl AnnIndex {
                 if graph.dim() != checkpoint.dim {
                     return Err("ANN Dense checkpoint graph dim mismatch header".into());
                 }
+                let active = new_backend(
+                    checkpoint.dim,
+                    checkpoint.m,
+                    checkpoint.ef_construction,
+                    AnnQuantization::Dense,
+                );
                 Ok(Self {
                     dim: checkpoint.dim,
                     m: checkpoint.m,
                     ef_construction: checkpoint.ef_construction,
                     ef_search: checkpoint.ef_search,
                     quantization: AnnQuantization::Dense,
-                    body: AnnBody::Dense {
-                        frozen: Arc::new(vec![Arc::new(graph)]),
-                        active: DenseHnsw::new(
-                            checkpoint.dim,
-                            checkpoint.m,
-                            checkpoint.ef_construction,
-                        ),
-                    },
+                    frozen: Arc::new(vec![Arc::new(graph) as Arc<dyn AnnBackend>]),
+                    active,
                 })
             }
             _ => Err("ANN checkpoint quantization/payload tag mismatch".into()),
@@ -636,99 +488,113 @@ impl AnnIndex {
     }
 
     pub(crate) fn seal(&mut self) {
-        match &mut self.body {
-            AnnBody::BinarySign {
-                bytes_per_vec,
-                frozen,
-                active,
-            } => {
-                if active.is_empty() {
-                    return;
-                }
-                let sealed = std::mem::replace(
-                    active,
-                    Hnsw::new(*bytes_per_vec, self.m, self.ef_construction),
-                );
-                Arc::make_mut(frozen).push(Arc::new(sealed));
-                if frozen.len() >= crate::MAX_READ_GENERATION_LAYERS {
-                    Self::consolidate_binary(bytes_per_vec, frozen, self.m, self.ef_construction);
-                }
-            }
-            AnnBody::Dense { frozen, active } => {
-                if active.is_empty() {
-                    return;
-                }
-                let sealed = std::mem::replace(
-                    active,
-                    DenseHnsw::new(self.dim, self.m, self.ef_construction),
-                );
-                Arc::make_mut(frozen).push(Arc::new(sealed));
-                if frozen.len() >= crate::MAX_READ_GENERATION_LAYERS {
-                    Self::consolidate_dense(self.dim, frozen, self.m, self.ef_construction);
-                }
-            }
+        if self.active.is_empty() {
+            return;
+        }
+        let empty = self.active.empty_active();
+        let sealed = std::mem::replace(&mut self.active, empty);
+        Arc::make_mut(&mut self.frozen).push(Arc::from(sealed));
+        if self.frozen.len() >= crate::MAX_READ_GENERATION_LAYERS {
+            self.consolidate_frozen();
         }
     }
 
     /// Compaction step (S1C-003): merge every frozen delta into a single new
     /// immutable base graph. The active delta is left untouched.
     pub fn merge_deltas_into_base(&mut self) {
-        match &mut self.body {
-            AnnBody::BinarySign {
-                bytes_per_vec,
-                frozen,
-                ..
-            } => Self::consolidate_binary(bytes_per_vec, frozen, self.m, self.ef_construction),
-            AnnBody::Dense { frozen, .. } => {
-                Self::consolidate_dense(self.dim, frozen, self.m, self.ef_construction)
-            }
-        }
+        self.consolidate_frozen();
     }
 
-    fn consolidate_binary(
-        bytes_per_vec: &usize,
-        frozen: &mut Arc<Vec<Arc<Hnsw>>>,
-        m: usize,
-        ef_construction: usize,
-    ) {
-        if frozen.is_empty() {
+    fn consolidate_frozen(&mut self) {
+        if self.frozen.is_empty() {
             return;
         }
-        let mut graph = Hnsw::new(*bytes_per_vec, m, ef_construction);
-        for layer in frozen.iter() {
-            for (bits, row_id) in layer.entries() {
-                graph.insert(bits, row_id);
-            }
+        let template = self.frozen[0].clone();
+        let mut entries: Vec<(Vec<u8>, RowId)> = Vec::new();
+        for layer in self.frozen.iter() {
+            entries.extend(layer.entries());
         }
-        *frozen = Arc::new(vec![Arc::new(graph)]);
-    }
-
-    fn consolidate_dense(
-        dim: usize,
-        frozen: &mut Arc<Vec<Arc<DenseHnsw>>>,
-        m: usize,
-        ef_construction: usize,
-    ) {
-        if frozen.is_empty() {
-            return;
-        }
-        let mut graph = DenseHnsw::new(dim, m, ef_construction);
-        for layer in frozen.iter() {
-            for (vec, row_id) in layer.entries() {
-                graph.insert(vec, row_id);
-            }
-        }
-        *frozen = Arc::new(vec![Arc::new(graph)]);
+        let consolidated: Arc<dyn AnnBackend> = Arc::from(template.rebuild_from_entries(&entries));
+        self.frozen = Arc::new(vec![consolidated]);
     }
 
     /// Number of immutable layers (base + frozen deltas). `0` when nothing
     /// has been sealed yet; `1` after [`Self::merge_deltas_into_base`].
     pub fn frozen_layer_count(&self) -> usize {
-        match &self.body {
-            AnnBody::BinarySign { frozen, .. } => frozen.len(),
-            AnnBody::Dense { frozen, .. } => frozen.len(),
+        self.frozen.len()
+    }
+
+    fn distance_from_backend(&self, distance: f64) -> AnnDistance {
+        match self.active.metric() {
+            BackendMetric::Hamming => AnnDistance::Hamming(distance as u32),
+            BackendMetric::Cosine => AnnDistance::Cosine(distance as f32),
         }
     }
+}
+
+/// Construct a fresh empty active backend for `quantization`.
+fn new_backend(
+    dim: usize,
+    m: usize,
+    ef_construction: usize,
+    quantization: AnnQuantization,
+) -> Box<dyn AnnBackend> {
+    match quantization {
+        AnnQuantization::BinarySign => {
+            let bytes_per_vec = dim.div_ceil(8);
+            Box::new(Hnsw::new(bytes_per_vec, m, ef_construction))
+        }
+        AnnQuantization::Dense => Box::new(DenseHnsw::new(dim, m, ef_construction)),
+    }
+}
+
+/// Pack an f32 vector into the BinarySign representation (1 bit per dim, the
+/// sign bit). This is the single quantization authority for BinarySign.
+pub(crate) fn quantize_f32_to_binary_sign(vec: &[f32], bytes_per_vec: usize) -> Vec<u8> {
+    let mut out = vec![0u8; bytes_per_vec];
+    for (i, value) in vec.iter().enumerate() {
+        if *value > 0.0 {
+            out[i / 8] |= 1 << (i % 8);
+        }
+    }
+    out
+}
+
+/// Reconstruct an f32 vector of `dim` dims that re-quantizes to `bits`, so the
+/// trait's uniform `insert_validated(&[f32], …)` entrypoint can carry a
+/// pre-quantized BinarySign vector through the same quantization path. Each
+/// set bit becomes `+1.0`; each clear bit becomes `-1.0`. The resulting sign
+/// bits are identical to `bits` after [`quantize_f32_to_binary_sign`].
+fn binary_sign_bits_to_f32(bits: &[u8], dim: usize) -> Vec<f32> {
+    (0..dim)
+        .map(|i| {
+            if bits[i / 8] & (1 << (i % 8)) != 0 {
+                1.0
+            } else {
+                -1.0
+            }
+        })
+        .collect()
+}
+
+fn always_ok() -> Result<()> {
+    Ok(())
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct AnnCheckpoint {
+    quantization: AnnQuantization,
+    dim: usize,
+    m: usize,
+    ef_construction: usize,
+    ef_search: usize,
+    payload: AnnCheckpointPayload,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+enum AnnCheckpointPayload {
+    BinarySign { bytes_per_vec: usize, graph: Hnsw },
+    Dense { graph: DenseHnsw },
 }
 
 #[cfg(test)]
@@ -1203,5 +1069,61 @@ mod tests {
             bin.search(&[1.0; 8], 1).unwrap()[0].1,
             AnnDistance::Hamming(0)
         );
+    }
+
+    // ── Backend contract ────────────────────────────────────────────────
+
+    /// The swappable backend contract preserves BinarySign behavior when a
+    /// pre-quantized vector is inserted through the trait entrypoint and
+    /// searched with an f32 query.
+    #[test]
+    fn binary_sign_round_trips_through_backend_trait() {
+        let prototype = [
+            1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0,
+        ];
+        let mut index = AnnIndex::new(16);
+        index.insert(&prototype, RowId(0)).unwrap();
+        let bits = index.quantize(&prototype).unwrap();
+        let mut prequant = AnnIndex::new(16);
+        prequant.insert_quantized(bits, RowId(42)).unwrap();
+        assert_eq!(prequant.len(), 1);
+        assert_eq!(prequant.search(&prototype, 1).unwrap()[0].0, RowId(42));
+    }
+
+    /// Consolidation through the trait produces a base matching a fresh
+    /// single-graph build (deterministic seed + replay order).
+    #[test]
+    fn dense_backend_consolidation_matches_base_only_through_trait() {
+        let mut base_only = dense_index(16);
+        let mut layered = dense_index(16);
+        for id in 0..24u64 {
+            let mut v = vec![0f32; 16];
+            v[(id as usize) * 7 % 16] = 1.0;
+            base_only.insert(&v, RowId(id)).unwrap();
+            layered.insert(&v, RowId(id)).unwrap();
+            if (id + 1) % 6 == 0 {
+                layered.seal();
+            }
+        }
+        base_only.merge_deltas_into_base();
+        layered.merge_deltas_into_base();
+        let q = {
+            let mut v = vec![0f32; 16];
+            v[3] = 1.0;
+            v
+        };
+        let base = base_only.search(&q, 10).unwrap();
+        let merged = layered.search(&q, 10).unwrap();
+        assert_eq!(merged.len(), base.len());
+        for (i, (got, expected)) in merged.iter().zip(base.iter()).enumerate() {
+            assert_eq!(
+                got.0, expected.0,
+                "row {i} mismatch after trait consolidation"
+            );
+            assert_eq!(
+                got.1, expected.1,
+                "distance {i} mismatch after trait consolidation"
+            );
+        }
     }
 }
