@@ -11762,12 +11762,12 @@ fn empty_indexes(schema: &Schema) -> SecondaryIndexes {
                 let options = idef.options.ann.clone().unwrap_or_default();
                 ann.insert(
                     idef.column_id,
-                    AnnIndex::with_quantization(
+                    AnnIndex::with_full_options(
                         dim,
                         options.m,
                         options.ef_construction,
                         options.ef_search,
-                        options.quantization,
+                        &options,
                     ),
                 );
             }

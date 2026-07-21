@@ -26,10 +26,12 @@
 //! BinarySign quantization (f32 → sign bit) lives in the backend itself so the
 //! trait surface is uniform.
 
+use crate::index::ann::product::ProductQuantizer;
 use crate::index::hnsw::{DenseHnsw, Hnsw};
 use crate::query::AiExecutionContext;
 use crate::rowid::RowId;
 use crate::Result;
+use std::collections::BTreeMap;
 
 /// The distance metric a backend ranks results by. Mirrors [`super::AnnDistance`]
 /// but lives in the backend layer so a backend can report its metric before the
@@ -54,6 +56,15 @@ pub(crate) enum AnnBackendCheckpoint {
     HnswBinarySign { bytes_per_vec: usize, graph: Hnsw },
     /// Dense cosine HNSW graph (full-precision f32 vectors).
     HnswDense { graph: DenseHnsw },
+    /// Product-quantized flat backend: trained codebook + RowId-keyed codes.
+    Product {
+        dim: usize,
+        num_subvectors: usize,
+        bits: u8,
+        rerank_factor: usize,
+        quantizer: ProductQuantizer,
+        codes: BTreeMap<RowId, Vec<u8>>,
+    },
 }
 
 /// The contract every concrete ANN algorithm implements. The orchestrator

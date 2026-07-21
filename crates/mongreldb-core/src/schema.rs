@@ -655,6 +655,10 @@ impl IndexDef {
             let supported = match (options.algorithm, options.quantization) {
                 (AnnAlgorithm::Hnsw, AnnQuantization::BinarySign) => true,
                 (AnnAlgorithm::Hnsw, AnnQuantization::Dense) => true,
+                // Phase 3: product quantization (flat ADC backend). The
+                // algorithm field is Hnsw for compatibility; graph-accelerated
+                // PQ composes on top of the representation in a later phase.
+                (AnnAlgorithm::Hnsw, AnnQuantization::Product { .. }) => true,
                 _ => false,
             };
             if !supported {
@@ -1658,7 +1662,10 @@ mod tests {
     }
 
     #[test]
-    fn ann_options_product_rejected_as_unsupported() {
+    fn ann_options_product_with_hnsw_is_supported() {
+        // Phase 3: Hnsw × Product routes to the flat-PQ backend. The algorithm
+        // field stays Hnsw for compatibility; graph-accelerated PQ composes on
+        // top of the representation in a later phase.
         let options = AnnOptions {
             algorithm: AnnAlgorithm::Hnsw,
             quantization: AnnQuantization::Product {
@@ -1668,7 +1675,24 @@ mod tests {
             product: Some(ProductQuantizerOptions::default()),
             ..AnnOptions::default()
         };
-        assert!(ann_index_def("d", options).validate_options().is_err());
+        assert!(ann_index_def("d", options).validate_options().is_ok());
+    }
+
+    #[test]
+    fn ann_options_product_with_diskann_still_rejected() {
+        // DiskANN + Product is not yet wired (DiskANN lands in Phase 4).
+        let options = AnnOptions {
+            algorithm: AnnAlgorithm::DiskAnn,
+            quantization: AnnQuantization::Product {
+                num_subvectors: 8,
+                bits: 8,
+            },
+            diskann: Some(DiskAnnOptions::default()),
+            product: Some(ProductQuantizerOptions::default()),
+            ..AnnOptions::default()
+        };
+        let err = ann_index_def("d", options).validate_options().unwrap_err();
+        assert!(err.to_string().contains("not supported"));
     }
 
     #[test]

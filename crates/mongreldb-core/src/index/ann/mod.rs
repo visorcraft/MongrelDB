@@ -28,11 +28,13 @@
 //! modifying this module.
 
 pub(crate) mod backend;
+pub(crate) mod pq_backend;
+pub(crate) mod product;
 
 use crate::index::ann::backend::{AnnBackend, AnnBackendCheckpoint, BackendMetric};
 use crate::index::hnsw::{DenseHnsw, Hnsw};
 use crate::rowid::RowId;
-use crate::schema::AnnQuantization;
+use crate::schema::{AnnOptions, AnnQuantization, ProductQuantizerOptions};
 use crate::{MongrelError, Result};
 use bincode::Options;
 use std::collections::HashMap;
@@ -136,13 +138,36 @@ impl AnnIndex {
         ef_search: usize,
         quantization: AnnQuantization,
     ) -> Self {
-        let active = new_backend(dim, m, ef_construction, quantization);
+        // Legacy entrypoint for BinarySign/Dense. Product quantization
+        // requires the full option bag (num_subvectors, training params); use
+        // [`Self::with_full_options`] for that.
+        let options = AnnOptions {
+            m,
+            ef_construction,
+            ef_search,
+            quantization,
+            ..AnnOptions::default()
+        };
+        Self::with_full_options(dim, m, ef_construction, ef_search, &options)
+    }
+
+    /// Full-options constructor: selects the backend from `options.quantization`
+    /// (and `options.product` for Product). Used by the engine build path so
+    /// product-quantized indexes carry their training configuration.
+    pub fn with_full_options(
+        dim: usize,
+        m: usize,
+        ef_construction: usize,
+        ef_search: usize,
+        options: &AnnOptions,
+    ) -> Self {
+        let active = new_backend(dim, m, ef_construction, options);
         Self {
             dim,
             m,
             ef_construction,
             ef_search,
-            quantization,
+            quantization: options.quantization,
             frozen: Arc::new(Vec::new()),
             active,
         }
@@ -375,6 +400,31 @@ impl AnnIndex {
             (AnnQuantization::Dense, AnnBackendCheckpoint::HnswDense { graph }) => {
                 AnnCheckpointPayload::Dense { graph }
             }
+            (
+                AnnQuantization::Product {
+                    num_subvectors,
+                    bits,
+                },
+                AnnBackendCheckpoint::Product {
+                    dim: _,
+                    num_subvectors: cb_nsv,
+                    bits: cb_bits,
+                    rerank_factor,
+                    quantizer,
+                    codes,
+                },
+            ) => {
+                if num_subvectors as usize != cb_nsv || bits != cb_bits {
+                    unreachable!("Product checkpoint num_subvectors/bits mismatch in freeze");
+                }
+                AnnCheckpointPayload::Product {
+                    num_subvectors: cb_nsv,
+                    bits: cb_bits,
+                    rerank_factor,
+                    quantizer,
+                    codes,
+                }
+            }
             _ => unreachable!("quantization/backend tag mismatch in freeze"),
         };
         bincode::serialize(&AnnCheckpoint {
@@ -447,7 +497,10 @@ impl AnnIndex {
                     checkpoint.dim,
                     checkpoint.m,
                     checkpoint.ef_construction,
-                    AnnQuantization::BinarySign,
+                    &AnnOptions {
+                        quantization: AnnQuantization::BinarySign,
+                        ..AnnOptions::default()
+                    },
                 );
                 Ok(Self {
                     dim: checkpoint.dim,
@@ -471,7 +524,10 @@ impl AnnIndex {
                     checkpoint.dim,
                     checkpoint.m,
                     checkpoint.ef_construction,
-                    AnnQuantization::Dense,
+                    &AnnOptions {
+                        quantization: AnnQuantization::Dense,
+                        ..AnnOptions::default()
+                    },
                 );
                 Ok(Self {
                     dim: checkpoint.dim,
@@ -481,6 +537,62 @@ impl AnnIndex {
                     quantization: AnnQuantization::Dense,
                     frozen: Arc::new(vec![Arc::new(graph) as Arc<dyn AnnBackend>]),
                     active,
+                })
+            }
+            (
+                AnnQuantization::Product {
+                    num_subvectors,
+                    bits,
+                },
+                AnnCheckpointPayload::Product {
+                    num_subvectors: cb_nsv,
+                    bits: cb_bits,
+                    rerank_factor,
+                    quantizer,
+                    codes,
+                },
+            ) => {
+                if num_subvectors as usize != cb_nsv
+                    || bits != cb_bits
+                    || quantizer.dim() != checkpoint.dim
+                    || quantizer.num_subvectors() != cb_nsv
+                {
+                    return Err("ANN Product checkpoint codebook/header mismatch".into());
+                }
+                let backend = pq_backend::PqBackend::from_checkpoint(
+                    checkpoint.dim,
+                    cb_nsv,
+                    bits,
+                    rerank_factor,
+                    quantizer,
+                    codes,
+                );
+                Ok(Self {
+                    dim: checkpoint.dim,
+                    m: checkpoint.m,
+                    ef_construction: checkpoint.ef_construction,
+                    ef_search: checkpoint.ef_search,
+                    quantization: AnnQuantization::Product {
+                        num_subvectors,
+                        bits,
+                    },
+                    frozen: Arc::new(vec![Arc::new(backend) as Arc<dyn AnnBackend>]),
+                    active: new_backend(
+                        checkpoint.dim,
+                        checkpoint.m,
+                        checkpoint.ef_construction,
+                        &AnnOptions {
+                            quantization: AnnQuantization::Product {
+                                num_subvectors,
+                                bits,
+                            },
+                            product: Some(ProductQuantizerOptions {
+                                rerank_factor,
+                                ..ProductQuantizerOptions::default()
+                            }),
+                            ..AnnOptions::default()
+                        },
+                    ),
                 })
             }
             _ => Err("ANN checkpoint quantization/payload tag mismatch".into()),
@@ -532,28 +644,34 @@ impl AnnIndex {
     }
 }
 
-/// Construct a fresh empty active backend for `quantization`.
+/// Construct a fresh empty active backend for the given options.
 ///
-/// Only implemented representations are handled. `Product` and any not-yet-wired
-/// algorithm/quantization combination is rejected up-front by
-/// [`crate::schema::IndexDef::validate_options`], so this constructor is never
-/// reached for them from a validated path. The `Product` arm is therefore a
-/// defense-in-depth unreachable; if a future caller bypasses validation it
-/// fails loudly rather than silently picking a different representation.
+/// BinarySign → Hamming HNSW; Dense → cosine HNSW; Product → flat PQ backend
+/// (ADC over codes + optional exact rerank). DiskANN/IVF algorithms are still
+/// gated by [`crate::schema::IndexDef::validate_options`].
 fn new_backend(
     dim: usize,
     m: usize,
     ef_construction: usize,
-    quantization: AnnQuantization,
+    options: &AnnOptions,
 ) -> Box<dyn AnnBackend> {
-    match quantization {
+    match options.quantization {
         AnnQuantization::BinarySign => {
             let bytes_per_vec = dim.div_ceil(8);
             Box::new(Hnsw::new(bytes_per_vec, m, ef_construction))
         }
         AnnQuantization::Dense => Box::new(DenseHnsw::new(dim, m, ef_construction)),
-        AnnQuantization::Product { .. } => {
-            unreachable!("Product quantization is rejected by IndexDef::validate_options; new_backend only handles implemented representations")
+        AnnQuantization::Product {
+            num_subvectors,
+            bits,
+        } => {
+            let product_options = options.product.clone().unwrap_or_default();
+            Box::new(pq_backend::PqBackend::new(
+                dim,
+                num_subvectors as usize,
+                bits,
+                &product_options,
+            ))
         }
     }
 }
@@ -603,8 +721,22 @@ struct AnnCheckpoint {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 enum AnnCheckpointPayload {
-    BinarySign { bytes_per_vec: usize, graph: Hnsw },
-    Dense { graph: DenseHnsw },
+    BinarySign {
+        bytes_per_vec: usize,
+        graph: Hnsw,
+    },
+    Dense {
+        graph: DenseHnsw,
+    },
+    /// Product-quantized flat backend (Phase 3): trained codebook +
+    /// RowId-keyed codes + rerank factor.
+    Product {
+        num_subvectors: usize,
+        bits: u8,
+        rerank_factor: usize,
+        quantizer: product::ProductQuantizer,
+        codes: std::collections::BTreeMap<RowId, Vec<u8>>,
+    },
 }
 
 #[cfg(test)]
@@ -1135,6 +1267,153 @@ mod tests {
                 got.1, expected.1,
                 "distance {i} mismatch after trait consolidation"
             );
+        }
+    }
+
+    // ── Product quantization (Phase 3) ───────────────────────────────────
+
+    fn product_index(dim: usize, num_subvectors: usize) -> AnnIndex {
+        let options = AnnOptions {
+            m: 16,
+            ef_construction: 64,
+            ef_search: 64,
+            quantization: AnnQuantization::Product {
+                num_subvectors: num_subvectors as u16,
+                bits: 8,
+            },
+            algorithm: crate::schema::AnnAlgorithm::Hnsw,
+            diskann: None,
+            ivf: None,
+            product: Some(ProductQuantizerOptions {
+                training_samples: 10_000,
+                seed: 42,
+                rerank_factor: 5,
+            }),
+        };
+        AnnIndex::with_full_options(dim, 16, 64, 64, &options)
+    }
+
+    #[test]
+    fn product_index_inserts_and_searches() {
+        let dim = 16;
+        let mut index = product_index(dim, 8);
+        // Four well-separated one-hot clusters so the codebook can separate
+        // them and recall is meaningful even at 8 subvectors.
+        for cluster in 0..4u32 {
+            for member in 0..8u32 {
+                let mut v = vec![0f32; dim];
+                v[(cluster as usize) * 4] = 1.0;
+                // Small jitter to make vectors distinct but same-cluster.
+                v[(cluster as usize) * 4 + 1] = (member as f32) * 0.001;
+                index
+                    .insert(&v, RowId((cluster * 8 + member) as u64))
+                    .unwrap();
+            }
+        }
+        let query = {
+            let mut v = vec![0f32; dim];
+            v[8] = 1.0; // cluster 2 prototype
+            v
+        };
+        let top = index.search(&query, 4).unwrap();
+        assert_eq!(top.len(), 4);
+        // All four cluster-2 members should be in the top-4 (recall against
+        // exact L2 for a one-hot cluster is exact after rerank).
+        for (row_id, _) in &top {
+            let id = row_id.0;
+            assert!(
+                (16..24).contains(&id),
+                "expected cluster 2 members, got row {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn product_index_checkpoint_round_trips() {
+        let dim = 16;
+        let mut index = product_index(dim, 8);
+        for i in 0..16u64 {
+            let mut v = vec![0f32; dim];
+            v[(i as usize) % dim] = 1.0;
+            index.insert(&v, RowId(i)).unwrap();
+        }
+        let frozen = index.freeze();
+        let thawed = AnnIndex::thaw(&frozen).unwrap();
+        assert_eq!(
+            thawed.quantization(),
+            AnnQuantization::Product {
+                num_subvectors: 8,
+                bits: 8
+            }
+        );
+        assert_eq!(thawed.dim(), dim);
+        assert_eq!(thawed.len(), 16);
+        // Search results survive the round-trip.
+        let query = {
+            let mut v = vec![0f32; dim];
+            v[0] = 1.0;
+            v
+        };
+        let before = index.search(&query, 5).unwrap();
+        let after = thawed.search(&query, 5).unwrap();
+        assert_eq!(before.len(), after.len());
+        assert_eq!(
+            before[0].0, after[0].0,
+            "top result must survive checkpoint"
+        );
+    }
+
+    #[test]
+    fn product_index_wrong_dim_fails() {
+        let mut index = product_index(8, 4);
+        assert!(index.insert(&[1.0; 7], RowId(0)).is_err());
+        assert!(index.search(&[1.0; 7], 1).is_err());
+    }
+
+    #[test]
+    fn product_index_non_finite_fails() {
+        let mut index = product_index(8, 4);
+        assert!(index
+            .insert(&[1.0, f32::NAN, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], RowId(0))
+            .is_err());
+        assert!(index
+            .insert(
+                &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, f32::INFINITY],
+                RowId(1)
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn product_index_consolidation_preserves_results() {
+        let dim = 16;
+        let mut index = product_index(dim, 8);
+        // Insert in batches, sealing between, so consolidation has work to do.
+        for batch in 0..3u32 {
+            for member in 0..8u32 {
+                let mut v = vec![0f32; dim];
+                v[(batch as usize) * 4 % dim] = 1.0;
+                v[1] = (member as f32) * 0.001;
+                index
+                    .insert(&v, RowId((batch * 8 + member) as u64))
+                    .unwrap();
+            }
+            index.seal();
+        }
+        let before: Vec<Vec<(RowId, AnnDistance)>> = (0..3)
+            .map(|batch| {
+                let mut q = vec![0f32; dim];
+                q[(batch * 4) as usize % dim] = 1.0;
+                index.search(&q, 4).unwrap()
+            })
+            .collect();
+        index.merge_deltas_into_base();
+        assert_eq!(index.frozen_layer_count(), 1);
+        for (batch, expected) in before.into_iter().enumerate() {
+            let mut q = vec![0f32; dim];
+            q[(batch * 4) % dim] = 1.0;
+            let after = index.search(&q, 4).unwrap();
+            assert_eq!(after.len(), expected.len());
         }
     }
 }
