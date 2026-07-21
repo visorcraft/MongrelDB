@@ -36,6 +36,10 @@ on:
         description: 'Git ref of MongrelDB to build from (defaults to tag; use master when tag lags pin fixes)'
         required: false
         default: ''
+      kit_tag:
+        description: 'MongrelDB-Kit tag to build from (defaults to the engine release tag)'
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -46,11 +50,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.inputs.checkout_ref || github.event.inputs.tag }}
+          ref: ${{ github.event.inputs.checkout_ref || github.event.inputs.tag || github.ref_name }}
       - uses: actions/checkout@v7
         with:
           repository: visorcraft/MongrelDB-Kit
-          ref: ${{ github.event.inputs.tag }}
+          ref: ${{ github.event.inputs.kit_tag || github.event.inputs.tag || github.ref_name }}
           path: .release-kit
       - uses: dtolnay/rust-toolchain@v1
         with:
@@ -58,13 +62,13 @@ jobs:
       - name: Verify aggregate dependency train
         shell: bash
         run: |
-          version="${{ github.event.inputs.tag }}"
+          version="${{ github.event.inputs.tag || github.ref_name }}"
           version="${version#v}"
           mkdir -p target
           cargo metadata --manifest-path crates/mongreldb-jni/Cargo.toml --locked --format-version 1 > target/jni-metadata.json
           cargo metadata --manifest-path crates/mongreldb-kit-ffi/Cargo.toml --locked --format-version 1 > target/kit-ffi-metadata.json
           scripts/verify-release-component-versions.py --expected "$version" target/jni-metadata.json target/kit-ffi-metadata.json
-          test "$(git -C .release-kit describe --tags --exact-match)" = "${{ github.event.inputs.tag }}"
+          test "$(git -C .release-kit describe --tags --exact-match)" = "${{ github.event.inputs.kit_tag || github.event.inputs.tag || github.ref_name }}"
 
   build-native:
     needs: verify-components
@@ -121,7 +125,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.inputs.checkout_ref || github.event.inputs.tag }}
+          ref: ${{ github.event.inputs.checkout_ref || github.event.inputs.tag || github.ref_name }}
 
       - uses: dtolnay/rust-toolchain@v1
         with:
@@ -227,12 +231,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.inputs.checkout_ref || github.event.inputs.tag }}
+          ref: ${{ github.event.inputs.checkout_ref || github.event.inputs.tag || github.ref_name }}
 
       - uses: actions/checkout@v7
         with:
           repository: visorcraft/MongrelDB-Kit
-          ref: ${{ github.event.inputs.tag }}
+          ref: ${{ github.event.inputs.kit_tag || github.event.inputs.tag || github.ref_name }}
           path: .release-kit
 
       - name: Record exact build identities
@@ -304,7 +308,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.inputs.checkout_ref || github.event.inputs.tag }}
+          ref: ${{ github.event.inputs.checkout_ref || github.event.inputs.tag || github.ref_name }}
 
       - run: |
           mkdir -p dist/mongreldb-headers/include
@@ -355,12 +359,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.inputs.checkout_ref || github.event.inputs.tag }}
+          ref: ${{ github.event.inputs.checkout_ref || github.event.inputs.tag || github.ref_name }}
 
       - uses: actions/checkout@v7
         with:
           repository: visorcraft/MongrelDB-Kit
-          ref: ${{ github.event.inputs.tag }}
+          ref: ${{ github.event.inputs.kit_tag || github.event.inputs.tag || github.ref_name }}
           path: .release-kit
 
       - name: Record exact build identities
@@ -445,7 +449,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.inputs.checkout_ref || github.event.inputs.tag }}
+          ref: ${{ github.event.inputs.checkout_ref || github.event.inputs.tag || github.ref_name }}
 
       - uses: actions/setup-java@v5
         with:
@@ -482,7 +486,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.inputs.checkout_ref || github.event.inputs.tag }}
+          ref: ${{ github.event.inputs.checkout_ref || github.event.inputs.tag || github.ref_name }}
 
       - uses: actions/setup-java@v5
         with:
