@@ -23,8 +23,9 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 # lib name (`mongreldb_kit`). Without the rename, integration tests
 # `use mongreldb_kit::*` would be ambiguous between our FFI crate and the
 # upstream Kit crate.
-# crates.io kit; monorepo engine patches below force the ANN checkpoint fix
-# (and other core/query fixes) without a sibling mongreldb-kit checkout.
+# Engine 0.63.0 and Kit 0.63.0 are both published and aligned, so the adapter
+# resolves everything from the registry. Re-add the [patch.crates-io] below
+# when a core/query fix must ship before the next engine release.
 kit = { package = "mongreldb-kit", version = "=0.63.0" }
 mongreldb-kit-core = "=0.63.0"
 parking_lot = "0.12"
@@ -34,9 +35,4 @@ serde_json = { version = "1", features = ["preserve_order"] }
 cc = "1"
 
 
-# Force Kit's transitive engine deps onto this monorepo's sources.
 [workspace]
-
-[patch.crates-io]
-mongreldb-core = { path = "../mongreldb-core" }
-mongreldb-query = { path = "../mongreldb-query" }
