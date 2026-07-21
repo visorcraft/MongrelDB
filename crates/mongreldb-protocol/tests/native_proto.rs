@@ -1,4 +1,4 @@
-use mongreldb_protocol::native::{ApiVersion, HealthRequest, RequestContext};
+use mongreldb_protocol::native::{ApiVersion, CreateTableRequest, HealthRequest, RequestContext};
 use mongreldb_protocol::{validate_native_context, NATIVE_API_MAJOR};
 use prost::Message;
 
@@ -32,6 +32,22 @@ fn protobuf_unknown_field_is_tolerated() {
         decoded.context.unwrap().version.unwrap().major,
         NATIVE_API_MAJOR
     );
+}
+
+#[test]
+fn create_table_carries_complete_schema_json() {
+    let request = CreateTableRequest {
+        context: Some(context(NATIVE_API_MAJOR)),
+        session_id: vec![1, 2, 3],
+        table: "documents".into(),
+        schema_id: 7,
+        columns: Vec::new(),
+        uniques: Vec::new(),
+        foreign_keys: Vec::new(),
+        schema_json: br#"{"schema_id":7,"indexes":[]}"#.to_vec(),
+    };
+    let decoded = CreateTableRequest::decode(request.encode_to_vec().as_slice()).unwrap();
+    assert_eq!(decoded.schema_json, request.schema_json);
 }
 
 #[test]

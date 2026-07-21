@@ -329,6 +329,73 @@ async fn kit_ai_indexes_work_over_wire_and_validate_values() {
 }
 
 #[tokio::test]
+async fn kit_schema_round_trips_all_index_options_and_embedding_source() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(Database::create(dir.path()).unwrap());
+    let app = build_app(db);
+
+    let create = serde_json::json!({
+        "name": "search_docs",
+        "columns": [
+            {"id": 1, "name": "id", "ty": "int64", "primary_key": true},
+            {"id": 2, "name": "embedding", "ty": "embedding(3)", "embedding_source": {
+                "kind": "generated_column_spec",
+                "spec": {
+                    "provider_id": "tenant-embeddings",
+                    "model_id": "text-model",
+                    "model_version": "2026-07",
+                    "source_columns": [4],
+                    "input_template": "{body}",
+                    "dimension": 3,
+                    "normalization": "l2",
+                    "failure_policy": "abort_write"
+                }
+            }},
+            {"id": 3, "name": "status", "ty": "bytes"},
+            {"id": 4, "name": "body", "ty": "bytes"},
+            {"id": 5, "name": "rank", "ty": "int64"},
+            {"id": 6, "name": "members", "ty": "bytes"},
+            {"id": 7, "name": "sparse", "ty": "bytes"}
+        ],
+        "indexes": [
+            {"name": "status_bm", "column_id": 3, "kind": "bitmap", "predicate": "status IS NOT NULL"},
+            {"name": "body_fm", "column_id": 4, "kind": "fm_index"},
+            {"name": "embedding_ann", "column_id": 2, "kind": "ann", "options": {"ann": {
+                "m": 12, "ef_construction": 48, "ef_search": 24, "quantization": "dense"
+            }}},
+            {"name": "rank_range", "column_id": 5, "kind": "learned_range", "options": {"learned_range": {"epsilon": 8}}},
+            {"name": "members_minhash", "column_id": 6, "kind": "minhash", "options": {"minhash": {"permutations": 64, "bands": 16}}},
+            {"name": "sparse_idx", "column_id": 7, "kind": "sparse"}
+        ]
+    });
+    let (status, body) = request(app.clone(), "POST", "/kit/create_table", Some(create)).await;
+    assert_eq!(status, 200, "{body}");
+
+    let (status, schema) = request(app, "GET", "/kit/schema/search_docs", None).await;
+    assert_eq!(status, 200, "{schema}");
+    assert_eq!(
+        schema["columns"][1]["embedding_source"]["kind"],
+        "generated_column_spec"
+    );
+    assert_eq!(
+        schema["columns"][1]["embedding_source"]["spec"]["model_id"],
+        "text-model"
+    );
+    assert_eq!(schema["indexes"].as_array().unwrap().len(), 6);
+    assert_eq!(schema["indexes"][0]["predicate"], "status IS NOT NULL");
+    assert_eq!(
+        schema["indexes"][2]["options"]["ann"]["quantization"],
+        "dense"
+    );
+    assert_eq!(schema["indexes"][2]["options"]["ann"]["m"], 12);
+    assert_eq!(
+        schema["indexes"][3]["options"]["learned_range"]["epsilon"],
+        8
+    );
+    assert_eq!(schema["indexes"][4]["options"]["minhash"]["bands"], 16);
+}
+
+#[tokio::test]
 async fn kit_ai_routes_require_every_used_column() {
     let dir = tempdir().unwrap();
     let db = Arc::new(Database::create_with_credentials(dir.path(), "admin", "admin-pw").unwrap());

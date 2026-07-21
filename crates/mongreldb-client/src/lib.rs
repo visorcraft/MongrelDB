@@ -2591,7 +2591,7 @@ pub struct IndexMeta {
     pub kind: String,
     pub predicate: Option<String>,
     #[serde(default)]
-    pub options: serde_json::Value,
+    pub options: mongreldb_core::schema::IndexOptions,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2603,6 +2603,8 @@ pub struct ColumnMeta {
     pub primary_key: bool,
     pub nullable: bool,
     pub auto_increment: bool,
+    #[serde(default)]
+    pub embedding_source: Option<mongreldb_core::EmbeddingSource>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -5053,10 +5055,10 @@ impl MongrelClient {
         )
     }
 
-    /// Create a constraint-bearing table over HTTP (`POST /kit/create_table`).
-    /// `body` is the full request JSON — `{name, columns:[{id,name,ty,
-    /// primary_key,nullable,auto_increment,…}], constraints:{uniques,…,
-    /// foreign_keys,…, checks:[{id,name,expr}]}}`. Returns the assigned table id.
+    /// Create a table over HTTP (`POST /kit/create_table`) from the complete
+    /// Kit schema JSON. The body may include constraints, all six public index
+    /// kinds and their options, partial predicates, and column embedding
+    /// sources. Returns the assigned table id.
     pub fn kit_create_table(&self, body: &serde_json::Value) -> ClientResult<u64> {
         let response = self.write_response(
             self.client

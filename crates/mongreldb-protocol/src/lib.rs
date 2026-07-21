@@ -29,7 +29,7 @@ pub mod native {
 }
 
 pub const NATIVE_API_MAJOR: u32 = 1;
-pub const NATIVE_API_MINOR: u32 = 0;
+pub const NATIVE_API_MINOR: u32 = 1;
 
 /// Fail closed when a native request omits its version or uses another major
 /// protocol generation. Newer minor versions remain forward-compatible

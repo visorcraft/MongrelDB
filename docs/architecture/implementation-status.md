@@ -1,6 +1,6 @@
 # Architecture implementation status
 
-This is the authoritative status for the unreleased 0.61.1 working tree. A
+This is the authoritative status for the unreleased 0.62.0 working tree. A
 source module or local test alone does not make a feature production-ready.
 
 Status meanings:
@@ -28,7 +28,7 @@ matrix is incomplete or malformed.
 | R7 Production certification | Integrated | `crates/mongreldb-core/src/certification.rs`, `fuzz/`, `scripts/generate-certification-manifest.py`, `scripts/qualify-packaged-artifacts.sh` | release workspace tests, five fuzz targets, kill-at-hook durable crash matrix, packaged server/C ABI conformance | `Qualification nightly / Full tests`, `Qualification nightly / Extended parser fuzz`, `Clean release qualification` |  | Local release tests passed in the dirty working tree. No manifest exists until the clean exact-SHA CI job passes. |
 | R8 Documentation truth | Integrated | this file, public architecture docs | certification manifest validation | `Clean release qualification` |  | Exact-SHA qualification remains required. |
 | R9 Public operational contract | Integrated | public API, operations docs, and this matrix | subsystem and adapter tests | `Clean release qualification` |  | Exact-SHA qualification remains required. |
-| R10 Exact-SHA evidence | Integrated | `scripts/generate-certification-manifest.py` | clean artifact conformance | `Clean release qualification` |  | The 0.61.0 tag started qualification; no successful fresh-checkout 0.61.1 artifact exists. |
+| R10 Exact-SHA evidence | Integrated | `scripts/generate-certification-manifest.py` | clean artifact conformance | `Clean release qualification` |  | Qualification for pre-0.62.0 SHA `b6fc52b` remains in progress; no successful fresh-checkout 0.62.0 artifact exists. |
 
 Public documentation may describe Integrated behavior precisely, but must not
 call it Qualified or production-certified. Updating a row to Qualified requires

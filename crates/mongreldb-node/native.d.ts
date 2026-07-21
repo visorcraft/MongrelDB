@@ -79,6 +79,8 @@ export interface ColumnSpec {
    * tokens / order-preserving encoding (requires an encrypted db).
    */
   encryptedIndexable?: boolean
+  /** Portable `EmbeddingSource` JSON for embedding columns. */
+  embeddingSourceJson?: string
 }
 export interface IndexSpec {
   name: string
@@ -86,6 +88,13 @@ export interface IndexSpec {
   kind: IndexKindSpec
   /** ANN representation. Defaults to BinarySign; ignored for other kinds. */
   annQuantization?: AnnQuantizationSpec
+  predicate?: string
+  annM?: number
+  annEfConstruction?: number
+  annEfSearch?: number
+  minhashPermutations?: number
+  minhashBands?: number
+  learnedRangeEpsilon?: number
 }
 export interface IndexJobInfo {
   jobId: bigint

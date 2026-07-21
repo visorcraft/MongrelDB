@@ -187,10 +187,20 @@ static void test_authenticated_native_reads(void) {
     for (size_t i = 0; i < sizeof(columns) / sizeof(columns[0]); i++) {
         CHECK(mongreldb_schema_add_column(builder, &columns[i]));
     }
+    CHECK(mongreldb_schema_set_embedding_source_json(
+        builder, 4, "{\"kind\":\"supplied_by_application\"}"));
     mongreldb_index_def index = {
         .name = "ann_idx", .column_id = 4, .kind = MDB_INDEX_ANN,
     };
-    CHECK(mongreldb_schema_add_index(builder, &index));
+    mongreldb_index_options_v1 index_options = {
+        .struct_size = sizeof(mongreldb_index_options_v1),
+        .version = 1,
+        .ann_m = 24,
+        .ann_ef_construction = 96,
+        .ann_ef_search = 48,
+        .ann_quantization = MDB_ANN_QUANTIZATION_DENSE,
+    };
+    CHECK(mongreldb_schema_add_index_v2(builder, &index, &index_options));
     mongreldb_schema_t *schema = mongreldb_schema_build(builder);
     assert(schema);
     mongreldb_schema_builder_free(builder);
@@ -342,8 +352,8 @@ static void test_authenticated_native_reads(void) {
 int main(void) {
     char *build_info = mongreldb_build_info();
     assert(build_info != NULL);
-    assert(strstr(build_info, "\"engine_version\":\"0.61.1\"") != NULL);
-    assert(strstr(build_info, "\"query_version\":\"0.61.1\"") != NULL);
+    assert(strstr(build_info, "\"engine_version\":\"0.62.0\"") != NULL);
+    assert(strstr(build_info, "\"query_version\":\"0.62.0\"") != NULL);
     mongreldb_free_string(build_info);
 
     /* ── Database lifecycle ──────────────────────────────────────────── */

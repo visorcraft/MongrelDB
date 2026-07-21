@@ -207,12 +207,33 @@ fn ffi_exact_ann_rerank_returns_scored_hit() {
             assert_eq!(mongreldb_schema_add_column(builder, &column), 0);
         }
         assert_eq!(
-            mongreldb_schema_add_index(
+            mongreldb_schema_set_embedding_source_json(
                 builder,
-                &mongreldb_index_def {
-                    name: cstr("ann_idx"),
-                    column_id: 2,
-                    kind: mongreldb_index_kind::Ann as i32,
+                2,
+                cstr(r#"{"kind":"supplied_by_application"}"#),
+            ),
+            0
+        );
+        let index = mongreldb_index_def {
+            name: cstr("ann_idx"),
+            column_id: 2,
+            kind: mongreldb_index_kind::Ann as i32,
+        };
+        assert_eq!(
+            mongreldb_schema_add_index_v2(
+                builder,
+                &index,
+                &mongreldb_index_options_v1 {
+                    struct_size: std::mem::size_of::<mongreldb_index_options_v1>(),
+                    version: 1,
+                    predicate: std::ptr::null(),
+                    ann_m: 24,
+                    ann_ef_construction: 96,
+                    ann_ef_search: 48,
+                    ann_quantization: mongreldb_ann_quantization::Dense as i32,
+                    minhash_permutations: 0,
+                    minhash_bands: 0,
+                    learned_range_epsilon: 0,
                 },
             ),
             0
@@ -278,7 +299,7 @@ fn ffi_exact_ann_rerank_returns_scored_hit() {
         assert_eq!(hit.row_id, first_row_id);
         assert_eq!(
             hit.candidate_distance_kind,
-            mongreldb_ann_candidate_distance_kind::Hamming as i32
+            mongreldb_ann_candidate_distance_kind::Cosine as i32
         );
         assert_eq!(hit.exact_score, 1.0);
         mongreldb_ann_rerank_result_free(result);

@@ -13,9 +13,15 @@ use mongreldb_cluster::bootstrap::{
     JoinInvite, TrustConfig,
 };
 use mongreldb_cluster::node::{Locality, NodeCapacity, NodeIdentity};
-use mongreldb_core::{Database, JwtAlgorithm, JwtValidationConfig, ServiceToken};
+use mongreldb_core::{
+    Database, EmbeddingNormalization, EmbeddingProviderRegistry, JwtAlgorithm, JwtValidationConfig,
+    ServiceToken,
+};
 use mongreldb_protocol::native_transport::{
     NativeRpcServer, NativeRpcServerConfig, NativeRpcServices,
+};
+use mongreldb_server::remote_embedding::{
+    EnvironmentSecretResolver, RemoteEmbeddingConfig, RemoteEmbeddingProvider,
 };
 use mongreldb_server::vault_kms::{VaultTransitConfig, VaultTransitKeyManagementProvider};
 use mongreldb_server::{
@@ -24,6 +30,7 @@ use mongreldb_server::{
 };
 use mongreldb_server::{native::NativeExternalAuth, oidc::HttpsJwksProvider};
 use mongreldb_types::ids::{ClusterId, NodeId};
+use serde::Deserialize;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -60,6 +67,8 @@ struct Args {
     cluster_node_data: Option<String>,
     /// Optional cluster RPC listen address (`host:port`).
     cluster_rpc_listen: Option<String>,
+    /// Repeatable JSON configuration for a named remote embedding provider.
+    embedding_provider_files: Vec<String>,
 }
 
 const DEFAULT_PORT: u16 = 8453;
@@ -101,6 +110,8 @@ OPTIONS:
                                 `cluster init` / `cluster join`)
     --cluster-rpc-listen <addr> Cluster raft RPC listen address (host:port;
                                 default 127.0.0.1:17443 or env)
+    --embedding-provider <path> Register a remote embedding provider from JSON
+                                (repeatable; secrets are environment references)
     -h, --help                  Print this help message
 
 SUBCOMMANDS (one-shot; they do not start the daemon):
@@ -300,6 +311,7 @@ fn parse_args() -> Result<Args, String> {
     let mut pidfile: Option<String> = None;
     let mut cluster_node_data: Option<String> = None;
     let mut cluster_rpc_listen: Option<String> = None;
+    let mut embedding_provider_files = Vec::new();
 
     // Skip the program name (raw[0]).
     let mut i = 1;
@@ -469,6 +481,13 @@ fn parse_args() -> Result<Args, String> {
                 cluster_rpc_listen = Some(v.clone());
                 i += 2;
             }
+            "--embedding-provider" => {
+                let value = raw
+                    .get(i + 1)
+                    .ok_or("--embedding-provider requires a value")?;
+                embedding_provider_files.push(value.clone());
+                i += 2;
+            }
             // Positional: first is db_dir, second (if numeric) is port for backward compat.
             other => {
                 if db_dir.is_none() {
@@ -545,7 +564,80 @@ fn parse_args() -> Result<Args, String> {
         pidfile,
         cluster_node_data,
         cluster_rpc_listen,
+        embedding_provider_files,
     })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteEmbeddingConfigFile {
+    provider_id: String,
+    model_id: String,
+    model_version: String,
+    preprocessing_version: String,
+    dimension: u32,
+    #[serde(default)]
+    normalization: EmbeddingNormalization,
+    endpoint: String,
+    allowed_hosts: BTreeSet<String>,
+    secret_reference: String,
+    tenant: String,
+    #[serde(default = "default_embedding_timeout_ms")]
+    timeout_ms: u64,
+    #[serde(default = "default_embedding_max_retries")]
+    max_retries: usize,
+    #[serde(default = "default_embedding_max_response_bytes")]
+    max_response_bytes: usize,
+}
+
+const fn default_embedding_timeout_ms() -> u64 {
+    30_000
+}
+
+const fn default_embedding_max_retries() -> usize {
+    2
+}
+
+const fn default_embedding_max_response_bytes() -> usize {
+    16 * 1024 * 1024
+}
+
+fn load_embedding_providers(
+    paths: &[String],
+    registry: &EmbeddingProviderRegistry,
+) -> Result<(), String> {
+    for path in paths {
+        let bytes = std::fs::read(path)
+            .map_err(|error| format!("embedding-provider file {path}: {error}"))?;
+        let config: RemoteEmbeddingConfigFile = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("embedding-provider file {path}: {error}"))?;
+        let provider_id = config.provider_id.clone();
+        let endpoint = reqwest::Url::parse(&config.endpoint)
+            .map_err(|error| format!("embedding-provider file {path}: {error}"))?;
+        let provider = RemoteEmbeddingProvider::new(
+            RemoteEmbeddingConfig {
+                provider_id,
+                model_id: config.model_id,
+                model_version: config.model_version,
+                preprocessing_version: config.preprocessing_version,
+                dimension: config.dimension,
+                normalization: config.normalization,
+                endpoint,
+                allowed_hosts: config.allowed_hosts,
+                secret_reference: config.secret_reference,
+                tenant: config.tenant,
+                timeout: std::time::Duration::from_millis(config.timeout_ms),
+                max_retries: config.max_retries,
+                max_response_bytes: config.max_response_bytes,
+            },
+            Arc::new(EnvironmentSecretResolver),
+        )
+        .map_err(|error| format!("embedding-provider file {path}: {error}"))?;
+        registry
+            .register_new(Arc::new(provider))
+            .map_err(|error| format!("embedding-provider file {path}: {error}"))?;
+    }
+    Ok(())
 }
 
 /// Resolve the pidfile path: explicit `--pidfile`, else `<db_dir>/mongreldb.pid`.
@@ -792,6 +884,12 @@ fn load_native_external_auth(args: &Args) -> Result<Option<NativeExternalAuth>, 
 }
 
 async fn run_server(args: Args, pidfile: String, db: Arc<Database>) {
+    if let Err(error) =
+        load_embedding_providers(&args.embedding_provider_files, db.embedding_providers())
+    {
+        eprintln!("failed to configure embedding providers: {error}");
+        std::process::exit(1);
+    }
     // §5.9: background cost-aware compaction (run-count trigger).
     spawn_auto_compactor(Arc::clone(&db));
 
@@ -1543,6 +1641,33 @@ mod tests {
         )
         .unwrap()
         .unwrap()
+    }
+
+    #[test]
+    fn remote_embedding_provider_files_register_named_models() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("embedding.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "provider_id":"tenant-embeddings",
+                "model_id":"text-model",
+                "model_version":"2026-07",
+                "preprocessing_version":"1",
+                "dimension":384,
+                "normalization":"l2",
+                "endpoint":"https://models.example.test/v1/embeddings",
+                "allowed_hosts":["models.example.test"],
+                "secret_reference":"MODEL_API_TOKEN",
+                "tenant":"tenant-a"
+            }"#,
+        )
+        .unwrap();
+        let registry = EmbeddingProviderRegistry::new();
+        load_embedding_providers(&[path.to_string_lossy().into_owned()], &registry).unwrap();
+        let status = registry.status("tenant-embeddings").unwrap();
+        assert_eq!(status.model_id, "text-model");
+        assert_eq!(status.model_version, "2026-07");
     }
 
     #[test]

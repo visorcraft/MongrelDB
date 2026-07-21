@@ -167,6 +167,7 @@ impl NativeClient {
         Ok(NativeSession {
             pool: Arc::clone(&self.pool),
             session_id,
+            database_id: self.database_id,
             request_timeout: self.request_timeout,
             max_retries: self.max_retries,
         })
@@ -177,6 +178,7 @@ impl NativeClient {
 pub struct NativeSession {
     pool: Arc<NativeRpcClientPool>,
     session_id: Vec<u8>,
+    database_id: [u8; 16],
     request_timeout: Duration,
     max_retries: usize,
 }
@@ -204,18 +206,32 @@ impl NativeSession {
         table: impl Into<String>,
         schema: &mongreldb_core::Schema,
     ) -> ClientResult<native::CreateTableResponse> {
-        if !schema.indexes.is_empty()
+        if schema.columns.iter().any(|column| {
+            matches!(
+                column.embedding_source.as_ref(),
+                Some(mongreldb_core::EmbeddingSource::LocalModel { .. })
+            )
+        }) {
+            return Err(ClientError::Decode(
+                "native CreateTable cannot transport node-local model paths; use ConfiguredModel or GeneratedColumnSpec"
+                    .into(),
+            ));
+        }
+        let full_schema_required = !schema.indexes.is_empty()
             || !schema.constraints.checks.is_empty()
             || schema
                 .columns
                 .iter()
-                .any(|column| column.default_value.is_some() || column.embedding_source.is_some())
-        {
-            return Err(ClientError::Decode(
-                "native CreateTable does not support indexes, checks, defaults, or embeddings"
-                    .into(),
-            ));
-        }
+                .any(|column| column.default_value.is_some() || column.embedding_source.is_some());
+        let legacy_columns = schema
+            .columns
+            .iter()
+            .map(native_column)
+            .collect::<ClientResult<Vec<_>>>();
+        let use_legacy_fields = !full_schema_required && legacy_columns.is_ok();
+        let schema_json = serde_json::to_vec(schema).map_err(|error| {
+            ClientError::Decode(format!("native schema encode failed: {error}"))
+        })?;
         let response = self
             .pool
             .client()
@@ -225,32 +241,64 @@ impl NativeSession {
                 session_id: self.session_id.clone(),
                 table: table.into(),
                 schema_id: schema.schema_id,
-                columns: schema
-                    .columns
-                    .iter()
-                    .map(native_column)
-                    .collect::<ClientResult<Vec<_>>>()?,
-                uniques: schema
-                    .constraints
-                    .uniques
-                    .iter()
-                    .map(|constraint| native::UniqueConstraint {
-                        id: u32::from(constraint.id),
-                        name: constraint.name.clone(),
-                        columns: constraint.columns.iter().map(|id| u32::from(*id)).collect(),
-                    })
-                    .collect(),
-                foreign_keys: schema
-                    .constraints
-                    .foreign_keys
-                    .iter()
-                    .map(native_foreign_key)
-                    .collect(),
+                columns: if use_legacy_fields {
+                    legacy_columns.unwrap_or_default()
+                } else {
+                    Vec::new()
+                },
+                uniques: if use_legacy_fields {
+                    schema
+                        .constraints
+                        .uniques
+                        .iter()
+                        .map(|constraint| native::UniqueConstraint {
+                            id: u32::from(constraint.id),
+                            name: constraint.name.clone(),
+                            columns: constraint.columns.iter().map(|id| u32::from(*id)).collect(),
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+                foreign_keys: if use_legacy_fields {
+                    schema
+                        .constraints
+                        .foreign_keys
+                        .iter()
+                        .map(native_foreign_key)
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+                schema_json,
             })
             .await
             .map_err(native_error)?
             .into_inner();
         Ok(response)
+    }
+
+    pub async fn schema(&self, table: impl Into<String>) -> ClientResult<mongreldb_core::Schema> {
+        let response = self
+            .pool
+            .client()
+            .catalog()
+            .get_schema(native::GetSchemaRequest {
+                context: Some(context(self.request_timeout, None)?),
+                database_id: self.database_id.to_vec(),
+                table: table.into(),
+                session_id: self.session_id.clone(),
+            })
+            .await
+            .map_err(native_error)?
+            .into_inner();
+        if response.schema_json.is_empty() {
+            return Err(ClientError::Decode(
+                "native schema response omitted complete schema_json".into(),
+            ));
+        }
+        serde_json::from_slice(&response.schema_json)
+            .map_err(|error| ClientError::Decode(format!("native schema decode failed: {error}")))
     }
 
     pub async fn prepare(&self, sql: impl Into<String>) -> ClientResult<NativePrepared> {

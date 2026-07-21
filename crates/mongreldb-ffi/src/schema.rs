@@ -13,7 +13,11 @@
 
 use crate::error::{clear, set_error_msg, ErrorCode};
 use mongreldb_core::constraint::{FkAction, ForeignKey, TableConstraints, UniqueConstraint};
-use mongreldb_core::schema::{ColumnDef, ColumnFlags, IndexDef, IndexKind, Schema, TypeId};
+use mongreldb_core::embedding::EmbeddingSource;
+use mongreldb_core::schema::{
+    AnnOptions, AnnQuantization, ColumnDef, ColumnFlags, IndexDef, IndexKind, IndexOptions,
+    LearnedRangeOptions, MinHashOptions, Schema, TypeId,
+};
 use std::ffi::CString;
 use std::os::raw::{c_char, c_void};
 use std::sync::Arc;
@@ -73,6 +77,14 @@ pub enum mongreldb_index_kind {
     LearnedRange = 3,
     MinHash = 4,
     Sparse = 5,
+}
+
+/// ANN vector representation and distance semantics.
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum mongreldb_ann_quantization {
+    BinarySign = 0,
+    Dense = 1,
 }
 
 /// ON DELETE action for a foreign key.
@@ -160,6 +172,23 @@ pub struct mongreldb_index_def {
     pub column_id: u16,
     /// C ABI integer. Invalid values are rejected by the builder.
     pub kind: i32,
+}
+
+/// Versioned secondary-index options. Zero-valued numeric fields select the
+/// engine default. `predicate` may be NULL for a full index.
+#[repr(C)]
+pub struct mongreldb_index_options_v1 {
+    pub struct_size: usize,
+    pub version: u32,
+    pub predicate: *const c_char,
+    pub ann_m: usize,
+    pub ann_ef_construction: usize,
+    pub ann_ef_search: usize,
+    /// 0 = BinarySign, 1 = Dense cosine.
+    pub ann_quantization: i32,
+    pub minhash_permutations: usize,
+    pub minhash_bands: usize,
+    pub learned_range_epsilon: usize,
 }
 
 /// A multi-column uniqueness constraint.
@@ -266,6 +295,17 @@ fn index_kind_from_c(kind: i32) -> Result<IndexKind, ErrorCode> {
     }
 }
 
+fn ann_quantization_from_c(value: i32) -> Result<AnnQuantization, ErrorCode> {
+    match value {
+        0 => Ok(AnnQuantization::BinarySign),
+        1 => Ok(AnnQuantization::Dense),
+        _ => Err(set_error_msg(
+            ErrorCode::InvalidArgument,
+            format!("invalid ANN quantization {value}"),
+        )),
+    }
+}
+
 fn fk_action_from_c(action: i32) -> Result<FkAction, ErrorCode> {
     match action {
         0 => Ok(FkAction::Restrict),
@@ -358,17 +398,133 @@ impl SchemaBuilder {
         Ok(())
     }
 
+    /// Set the portable embedding source for one embedding column.
+    pub fn set_embedding_source_json(
+        &mut self,
+        column_id: u16,
+        source_json: *const c_char,
+    ) -> Result<(), ErrorCode> {
+        let source_json = cstr_to_string_lossy(source_json, "embedding source JSON")?;
+        let source: EmbeddingSource = serde_json::from_str(&source_json).map_err(|error| {
+            set_error_msg(
+                ErrorCode::InvalidArgument,
+                format!("invalid embedding source JSON: {error}"),
+            )
+        })?;
+        let column = self
+            .columns
+            .iter_mut()
+            .find(|column| column.id == column_id)
+            .ok_or_else(|| {
+                set_error_msg(
+                    ErrorCode::InvalidArgument,
+                    format!("embedding source column {column_id} does not exist"),
+                )
+            })?;
+        if !matches!(column.ty, TypeId::Embedding { .. }) {
+            return Err(set_error_msg(
+                ErrorCode::InvalidArgument,
+                format!("embedding source column {column_id} is not an embedding"),
+            ));
+        }
+        column.embedding_source = Some(source);
+        Ok(())
+    }
+
     /// Append a secondary index.
     pub fn add_index(&mut self, i: &mongreldb_index_def) -> Result<(), ErrorCode> {
+        self.add_index_with_options(i, None)
+    }
+
+    /// Append a secondary index with versioned kind-specific options.
+    pub fn add_index_with_options(
+        &mut self,
+        i: &mongreldb_index_def,
+        options: Option<&mongreldb_index_options_v1>,
+    ) -> Result<(), ErrorCode> {
         let name = cstr_to_string_lossy(i.name, "index name")?;
         let kind = index_kind_from_c(i.kind)?;
-        self.indexes.push(IndexDef {
+        let mut index_options = IndexOptions::default();
+        let predicate = if let Some(options) = options {
+            if options.struct_size != std::mem::size_of::<mongreldb_index_options_v1>()
+                || options.version != 1
+            {
+                return Err(set_error_msg(
+                    ErrorCode::InvalidArgument,
+                    "invalid mongreldb_index_options_v1 size or version",
+                ));
+            }
+            match kind {
+                IndexKind::Ann => {
+                    let defaults = AnnOptions::default();
+                    index_options.ann = Some(AnnOptions {
+                        m: if options.ann_m == 0 {
+                            defaults.m
+                        } else {
+                            options.ann_m
+                        },
+                        ef_construction: if options.ann_ef_construction == 0 {
+                            defaults.ef_construction
+                        } else {
+                            options.ann_ef_construction
+                        },
+                        ef_search: if options.ann_ef_search == 0 {
+                            defaults.ef_search
+                        } else {
+                            options.ann_ef_search
+                        },
+                        quantization: ann_quantization_from_c(options.ann_quantization)?,
+                    });
+                }
+                IndexKind::MinHash => {
+                    let defaults = MinHashOptions::default();
+                    index_options.minhash = Some(MinHashOptions {
+                        permutations: if options.minhash_permutations == 0 {
+                            defaults.permutations
+                        } else {
+                            options.minhash_permutations
+                        },
+                        bands: if options.minhash_bands == 0 {
+                            defaults.bands
+                        } else {
+                            options.minhash_bands
+                        },
+                    });
+                }
+                IndexKind::LearnedRange => {
+                    let defaults = LearnedRangeOptions::default();
+                    index_options.learned_range = Some(LearnedRangeOptions {
+                        epsilon: if options.learned_range_epsilon == 0 {
+                            defaults.epsilon
+                        } else {
+                            options.learned_range_epsilon
+                        },
+                    });
+                }
+                IndexKind::Bitmap | IndexKind::FmIndex | IndexKind::Sparse => {}
+            }
+            if options.predicate.is_null() {
+                None
+            } else {
+                Some(cstr_to_string_lossy(options.predicate, "index predicate")?)
+            }
+        } else {
+            None
+        };
+        let index = IndexDef {
             name,
             column_id: i.column_id,
             kind,
-            predicate: None,
-            options: Default::default(),
-        });
+            predicate,
+            options: index_options,
+        };
+        index.validate_options().map_err(|error| {
+            set_error_msg(
+                ErrorCode::InvalidArgument,
+                format!("invalid index options: {error}"),
+            )
+        })?;
+        self.indexes.push(index);
         Ok(())
     }
 
@@ -492,6 +648,27 @@ pub unsafe extern "C" fn mongreldb_schema_add_column(
     }
 }
 
+/// Set a column's portable embedding-source descriptor from JSON.
+///
+/// # Safety
+/// `builder` must be valid and `source_json` must be valid NUL-terminated UTF-8.
+#[no_mangle]
+pub unsafe extern "C" fn mongreldb_schema_set_embedding_source_json(
+    builder: mongreldb_schema_builder_t,
+    column_id: u16,
+    source_json: *const c_char,
+) -> i32 {
+    clear();
+    let Some(builder) = as_builder_mut(builder) else {
+        return set_error_msg(ErrorCode::InvalidArgument, "schema builder handle is null")
+            .as_return();
+    };
+    match builder.set_embedding_source_json(column_id, source_json) {
+        Ok(()) => 0,
+        Err(error) => error.as_return(),
+    }
+}
+
 /// Add a secondary index to a builder.
 ///
 /// # Safety
@@ -512,6 +689,32 @@ pub unsafe extern "C" fn mongreldb_schema_add_index(
     match b.add_index(&*idx) {
         Ok(()) => 0,
         Err(code) => code.as_return(),
+    }
+}
+
+/// Add an index with versioned options without changing the legacy index ABI.
+///
+/// # Safety
+/// `builder`, `idx`, and `options` must point to valid values. String pointers
+/// must be valid NUL-terminated UTF-8 for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn mongreldb_schema_add_index_v2(
+    builder: mongreldb_schema_builder_t,
+    idx: *const mongreldb_index_def,
+    options: *const mongreldb_index_options_v1,
+) -> i32 {
+    clear();
+    let Some(builder) = as_builder_mut(builder) else {
+        return set_error_msg(ErrorCode::InvalidArgument, "schema builder handle is null")
+            .as_return();
+    };
+    if idx.is_null() || options.is_null() {
+        return set_error_msg(ErrorCode::InvalidArgument, "schema index argument is null")
+            .as_return();
+    }
+    match builder.add_index_with_options(&*idx, Some(&*options)) {
+        Ok(()) => 0,
+        Err(error) => error.as_return(),
     }
 }
 
@@ -659,4 +862,82 @@ pub unsafe fn take_schema(schema: mongreldb_schema_t) -> Option<Schema> {
 #[allow(dead_code)]
 pub(crate) fn own_cstring(s: &str) -> CString {
     CString::new(s).unwrap_or_else(|_| CString::new("invalid name").unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn versioned_index_options_and_embedding_source_round_trip() {
+        let mut builder = SchemaBuilder::new();
+        let column_name = CString::new("embedding").unwrap();
+        builder
+            .add_column(&mongreldb_column_def {
+                id: 1,
+                name: column_name.as_ptr(),
+                ty: mongreldb_type_id::Embedding as i32,
+                flags: 0,
+                embedding_dim: 384,
+                decimal_precision: 0,
+                decimal_scale: 0,
+                enum_variants: StringArray::default(),
+            })
+            .unwrap();
+
+        let source = CString::new(
+            r#"{"kind":"configured_model","provider_id":"local","model_id":"gte-small","model_version":"1"}"#,
+        )
+        .unwrap();
+        builder
+            .set_embedding_source_json(1, source.as_ptr())
+            .unwrap();
+
+        let index_name = CString::new("embedding_ann").unwrap();
+        let predicate = CString::new("embedding IS NOT NULL").unwrap();
+        builder
+            .add_index_with_options(
+                &mongreldb_index_def {
+                    name: index_name.as_ptr(),
+                    column_id: 1,
+                    kind: mongreldb_index_kind::Ann as i32,
+                },
+                Some(&mongreldb_index_options_v1 {
+                    struct_size: std::mem::size_of::<mongreldb_index_options_v1>(),
+                    version: 1,
+                    predicate: predicate.as_ptr(),
+                    ann_m: 24,
+                    ann_ef_construction: 96,
+                    ann_ef_search: 48,
+                    ann_quantization: 1,
+                    minhash_permutations: 0,
+                    minhash_bands: 0,
+                    learned_range_epsilon: 0,
+                }),
+            )
+            .unwrap();
+
+        let schema = builder.finish();
+        assert!(matches!(
+            schema.columns[0].embedding_source,
+            Some(EmbeddingSource::ConfiguredModel {
+                ref provider_id,
+                ref model_id,
+                ref model_version,
+            }) if provider_id == "local" && model_id == "gte-small" && model_version == "1"
+        ));
+        assert_eq!(
+            schema.indexes[0].predicate.as_deref(),
+            Some("embedding IS NOT NULL")
+        );
+        assert_eq!(
+            schema.indexes[0].options.ann,
+            Some(AnnOptions {
+                m: 24,
+                ef_construction: 96,
+                ef_search: 48,
+                quantization: AnnQuantization::Dense,
+            })
+        );
+    }
 }

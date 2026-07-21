@@ -125,6 +125,11 @@ typedef enum {
     MDB_INDEX_SPARSE       = 5,
 } mongreldb_index_kind;
 
+typedef enum {
+    MDB_ANN_QUANTIZATION_BINARY_SIGN = 0,
+    MDB_ANN_QUANTIZATION_DENSE       = 1,
+} mongreldb_ann_quantization;
+
 /* ── FK action ──────────────────────────────────────────────────────────── */
 
 typedef enum {
@@ -256,6 +261,21 @@ typedef struct {
     uint16_t column_id;
     int32_t kind;
 } mongreldb_index_def;
+
+/* Version 1 secondary-index options. Set struct_size and version. Numeric
+ * zero values select engine defaults. predicate may be NULL. */
+typedef struct {
+    size_t struct_size;
+    uint32_t version;
+    const char *predicate;
+    size_t ann_m;
+    size_t ann_ef_construction;
+    size_t ann_ef_search;
+    int32_t ann_quantization;
+    size_t minhash_permutations;
+    size_t minhash_bands;
+    size_t learned_range_epsilon;
+} mongreldb_index_options_v1;
 
 typedef struct {
     uint16_t id;
@@ -707,6 +727,12 @@ int32_t mongreldb_schema_add_column(
     mongreldb_schema_builder_t *builder, const mongreldb_column_def *col);
 int32_t mongreldb_schema_add_index(
     mongreldb_schema_builder_t *builder, const mongreldb_index_def *idx);
+int32_t mongreldb_schema_add_index_v2(
+    mongreldb_schema_builder_t *builder, const mongreldb_index_def *idx,
+    const mongreldb_index_options_v1 *options);
+int32_t mongreldb_schema_set_embedding_source_json(
+    mongreldb_schema_builder_t *builder, uint16_t column_id,
+    const char *source_json);
 int32_t mongreldb_schema_add_unique(
     mongreldb_schema_builder_t *builder, const mongreldb_unique_constraint *uc);
 int32_t mongreldb_schema_add_foreign_key(

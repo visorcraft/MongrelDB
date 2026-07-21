@@ -1056,6 +1056,8 @@ impl native::catalog_service_server::CatalogService for NativeRuntime {
             .map_err(core_status)?;
         let table = self.db.table(&request.table).map_err(core_status)?;
         let schema = table.lock().schema().clone();
+        let schema_json = serde_json::to_vec(&schema)
+            .map_err(|error| Status::internal(format!("schema encode failed: {error}")))?;
         Ok(Response::new(native::GetSchemaResponse {
             table: request.table,
             schema_version: schema.schema_id,
@@ -1068,6 +1070,7 @@ impl native::catalog_service_server::CatalogService for NativeRuntime {
                     nullable: column.flags.contains(mongreldb_core::ColumnFlags::NULLABLE),
                 })
                 .collect(),
+            schema_json,
         }))
     }
 
@@ -1083,38 +1086,51 @@ impl native::catalog_service_server::CatalogService for NativeRuntime {
         self.db
             .require_for(principal.as_ref(), &mongreldb_core::Permission::Ddl)
             .map_err(core_status)?;
-        let columns = request
-            .columns
-            .into_iter()
-            .map(native_create_column)
-            .collect::<Result<Vec<_>, _>>()?;
-        let uniques = request
-            .uniques
-            .into_iter()
-            .map(|constraint| {
-                Ok(mongreldb_core::constraint::UniqueConstraint {
-                    id: native_u16(constraint.id, "unique constraint id")?,
-                    name: constraint.name,
-                    columns: native_u16s(constraint.columns, "unique constraint column")?,
+        let mut schema = if request.schema_json.is_empty() {
+            let columns = request
+                .columns
+                .into_iter()
+                .map(native_create_column)
+                .collect::<Result<Vec<_>, _>>()?;
+            let uniques = request
+                .uniques
+                .into_iter()
+                .map(|constraint| {
+                    Ok(mongreldb_core::constraint::UniqueConstraint {
+                        id: native_u16(constraint.id, "unique constraint id")?,
+                        name: constraint.name,
+                        columns: native_u16s(constraint.columns, "unique constraint column")?,
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>, Status>>()?;
-        let foreign_keys = request
-            .foreign_keys
-            .into_iter()
-            .map(native_foreign_key)
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut schema = mongreldb_core::Schema {
-            schema_id: request.schema_id,
-            columns,
-            indexes: Vec::new(),
-            colocation: Vec::new(),
-            constraints: mongreldb_core::constraint::TableConstraints {
-                uniques,
-                foreign_keys,
-                checks: Vec::new(),
-            },
-            clustered: false,
+                .collect::<Result<Vec<_>, Status>>()?;
+            let foreign_keys = request
+                .foreign_keys
+                .into_iter()
+                .map(native_foreign_key)
+                .collect::<Result<Vec<_>, _>>()?;
+            mongreldb_core::Schema {
+                schema_id: request.schema_id,
+                columns,
+                indexes: Vec::new(),
+                colocation: Vec::new(),
+                constraints: mongreldb_core::constraint::TableConstraints {
+                    uniques,
+                    foreign_keys,
+                    checks: Vec::new(),
+                },
+                clustered: false,
+            }
+        } else {
+            let schema: mongreldb_core::Schema = serde_json::from_slice(&request.schema_json)
+                .map_err(|error| {
+                    Status::invalid_argument(format!("invalid schema_json: {error}"))
+                })?;
+            if schema.schema_id != request.schema_id {
+                return Err(Status::invalid_argument(
+                    "schema_json schema_id does not match request schema_id",
+                ));
+            }
+            schema
         };
         if let Ok(existing) = self.db.table(&request.table) {
             let existing = existing.lock().schema().clone();

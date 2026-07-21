@@ -26,6 +26,8 @@ message GetSchemaResponse {
   string table = 1;
   uint64 schema_version = 2;
   repeated ColumnSchema columns = 3;
+  // Complete serialized mongreldb_core::Schema. Authoritative when present.
+  bytes schema_json = 4;
 }
 
 message CreateTableRequest {
@@ -36,6 +38,10 @@ message CreateTableRequest {
   repeated CreateColumn columns = 5;
   repeated UniqueConstraint uniques = 6;
   repeated ForeignKey foreign_keys = 7;
+  // Complete serialized mongreldb_core::Schema. When present, this is
+  // authoritative and preserves indexes, checks, defaults, embedding sources,
+  // colocation, and every column type/flag. Fields 4-7 remain for older peers.
+  bytes schema_json = 8;
 }
 
 enum ColumnType {

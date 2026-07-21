@@ -8,6 +8,11 @@ use axum::body::{to_bytes, Body};
 use axum::http::Request;
 use mongreldb_client::native::NativeClient;
 use mongreldb_core::constraint::{TableConstraints, UniqueConstraint};
+use mongreldb_core::embedding::EmbeddingSource;
+use mongreldb_core::schema::{
+    AnnOptions, AnnQuantization, IndexDef, IndexKind, IndexOptions, LearnedRangeOptions,
+    MinHashOptions,
+};
 use mongreldb_core::{ColumnDef, ColumnFlags, Database, Schema, TypeId};
 use mongreldb_protocol::native;
 use mongreldb_protocol::native_transport::{
@@ -69,7 +74,7 @@ async fn native_runtime_serves_all_services_over_tls_http2() {
         )
         .unwrap();
     let runtime = control
-        .native_runtime(db, Arc::clone(&sessions))
+        .native_runtime(Arc::clone(&db), Arc::clone(&sessions))
         .with_external_auth(external_auth);
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let certificate_pem = certified.cert.pem().into_bytes();
@@ -403,6 +408,137 @@ async fn native_runtime_serves_all_services_over_tls_http2() {
         )
         .await
         .unwrap();
+
+    let full_schema = Schema {
+        schema_id: 0,
+        columns: vec![
+            ColumnDef {
+                id: 0,
+                name: "id".into(),
+                ty: TypeId::Int64,
+                flags: ColumnFlags::empty().with(ColumnFlags::PRIMARY_KEY),
+                default_value: None,
+                embedding_source: None,
+            },
+            ColumnDef {
+                id: 1,
+                name: "text".into(),
+                ty: TypeId::Bytes,
+                flags: ColumnFlags::empty(),
+                default_value: None,
+                embedding_source: None,
+            },
+            ColumnDef {
+                id: 2,
+                name: "embedding".into(),
+                ty: TypeId::Embedding { dim: 3 },
+                flags: ColumnFlags::empty(),
+                default_value: None,
+                embedding_source: Some(EmbeddingSource::ConfiguredModel {
+                    provider_id: "native-provider".into(),
+                    model_id: "dense-model".into(),
+                    model_version: "1".into(),
+                }),
+            },
+            ColumnDef {
+                id: 3,
+                name: "set".into(),
+                ty: TypeId::Bytes,
+                flags: ColumnFlags::empty(),
+                default_value: None,
+                embedding_source: None,
+            },
+            ColumnDef {
+                id: 4,
+                name: "sparse".into(),
+                ty: TypeId::Bytes,
+                flags: ColumnFlags::empty(),
+                default_value: None,
+                embedding_source: None,
+            },
+        ],
+        indexes: vec![
+            IndexDef {
+                name: "by_id".into(),
+                column_id: 0,
+                kind: IndexKind::Bitmap,
+                predicate: Some("id > 0".into()),
+                options: IndexOptions::default(),
+            },
+            IndexDef {
+                name: "by_text".into(),
+                column_id: 1,
+                kind: IndexKind::FmIndex,
+                predicate: None,
+                options: IndexOptions::default(),
+            },
+            IndexDef {
+                name: "by_embedding".into(),
+                column_id: 2,
+                kind: IndexKind::Ann,
+                predicate: None,
+                options: IndexOptions {
+                    ann: Some(AnnOptions {
+                        m: 24,
+                        ef_construction: 96,
+                        ef_search: 48,
+                        quantization: AnnQuantization::Dense,
+                    }),
+                    ..IndexOptions::default()
+                },
+            },
+            IndexDef {
+                name: "by_range".into(),
+                column_id: 0,
+                kind: IndexKind::LearnedRange,
+                predicate: None,
+                options: IndexOptions {
+                    learned_range: Some(LearnedRangeOptions { epsilon: 8 }),
+                    ..IndexOptions::default()
+                },
+            },
+            IndexDef {
+                name: "by_set".into(),
+                column_id: 3,
+                kind: IndexKind::MinHash,
+                predicate: None,
+                options: IndexOptions {
+                    minhash: Some(MinHashOptions {
+                        permutations: 64,
+                        bands: 16,
+                    }),
+                    ..IndexOptions::default()
+                },
+            },
+            IndexDef {
+                name: "by_sparse".into(),
+                column_id: 4,
+                kind: IndexKind::Sparse,
+                predicate: None,
+                options: IndexOptions::default(),
+            },
+        ],
+        colocation: Vec::new(),
+        constraints: TableConstraints::default(),
+        clustered: false,
+    };
+    high_level
+        .create_table("native_ai_documents", &full_schema)
+        .await
+        .unwrap();
+    let returned = high_level.schema("native_ai_documents").await.unwrap();
+    assert_eq!(returned.indexes, full_schema.indexes);
+    assert_eq!(
+        returned.columns[2].embedding_source,
+        full_schema.columns[2].embedding_source
+    );
+    let created = db.table("native_ai_documents").unwrap();
+    let created = created.lock().schema().clone();
+    assert_eq!(created.indexes, full_schema.indexes);
+    assert_eq!(
+        created.columns[2].embedding_source,
+        full_schema.columns[2].embedding_source
+    );
     high_level
         .execute(
             "INSERT INTO native_unique_items VALUES (1, 'same@example.test')",

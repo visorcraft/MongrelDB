@@ -24,6 +24,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use hmac::{Hmac, Mac};
 use mongreldb_core::constraint::TableConstraints;
+use mongreldb_core::embedding::EmbeddingSource;
 use mongreldb_core::query::{
     AnnCandidateDistance, AnnRerankRequest, Condition, Fusion, NamedRetriever, Query, Retriever,
     RetrieverScore, SearchRequest, SetMember, SetSimilarityRequest, VectorMetric,
@@ -1283,6 +1284,7 @@ fn schema_descriptor(schema: &Schema) -> Jval {
                 "primary_key": c.flags.contains(ColumnFlags::PRIMARY_KEY),
                 "nullable": c.flags.contains(ColumnFlags::NULLABLE),
                 "auto_increment": c.flags.contains(ColumnFlags::AUTO_INCREMENT),
+                "embedding_source": c.embedding_source,
             })
         })
         .collect();
@@ -1432,6 +1434,8 @@ pub struct KitIndexDef {
     pub column_id: u16,
     pub kind: String,
     #[serde(default)]
+    pub predicate: Option<String>,
+    #[serde(default)]
     pub options: mongreldb_core::schema::IndexOptions,
 }
 
@@ -1497,6 +1501,8 @@ pub struct KitColumnDef {
     // `default_value` accepts a static JSON scalar, including explicit null.
     #[serde(default)]
     pub default_value: KitStaticDefault,
+    #[serde(default)]
+    pub embedding_source: Option<EmbeddingSource>,
 }
 
 /// Presence-aware default value. `None` means the key was omitted; `Some(Null)`
@@ -1644,7 +1650,7 @@ pub async fn kit_create_table(
                 Ok(v) => v,
                 Err(resp) => return *resp,
             },
-            embedding_source: None,
+            embedding_source: c.embedding_source.clone(),
         });
     }
     let mut names = std::collections::HashSet::new();
@@ -1676,7 +1682,7 @@ pub async fn kit_create_table(
             name: index.name.clone(),
             column_id: index.column_id,
             kind,
-            predicate: None,
+            predicate: index.predicate.clone(),
             options: index.options.clone(),
         });
     }

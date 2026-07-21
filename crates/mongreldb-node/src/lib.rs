@@ -420,6 +420,8 @@ pub struct ColumnSpec {
     /// Encrypt the column but keep it queryable via deterministic equality
     /// tokens / order-preserving encoding (requires an encrypted db).
     pub encrypted_indexable: Option<bool>,
+    /// Portable `EmbeddingSource` JSON for embedding columns.
+    pub embedding_source_json: Option<String>,
 }
 
 #[napi(object)]
@@ -429,6 +431,13 @@ pub struct IndexSpec {
     pub kind: IndexKindSpec,
     /// ANN representation. Defaults to BinarySign; ignored for other kinds.
     pub ann_quantization: Option<AnnQuantizationSpec>,
+    pub predicate: Option<String>,
+    pub ann_m: Option<u32>,
+    pub ann_ef_construction: Option<u32>,
+    pub ann_ef_search: Option<u32>,
+    pub minhash_permutations: Option<u32>,
+    pub minhash_bands: Option<u32>,
+    pub learned_range_epsilon: Option<u32>,
 }
 
 #[napi(object)]
@@ -639,6 +648,10 @@ fn from_column_def(column: &ColumnDef) -> ColumnSpec {
         auto_increment: Some(column.flags.contains(ColumnFlags::AUTO_INCREMENT)),
         encrypted: Some(column.flags.contains(ColumnFlags::ENCRYPTED)),
         encrypted_indexable: Some(column.flags.contains(ColumnFlags::ENCRYPTED_INDEXABLE)),
+        embedding_source_json: column
+            .embedding_source
+            .as_ref()
+            .and_then(|source| serde_json::to_string(source).ok()),
     }
 }
 
@@ -686,13 +699,24 @@ fn build_schema(spec: SchemaSpec) -> napi::Result<Schema> {
             let flags = to_column_flags(&c);
             let ty = to_type_id(&c.ty, c.embedding_dim, c.enum_variants.as_deref())?;
             let default_value = build_default_expr(&c, &ty)?;
+            let embedding_source = c
+                .embedding_source_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(|error| {
+                    napi::Error::new(
+                        napi::Status::InvalidArg,
+                        format!("invalid embedding_source_json: {error}"),
+                    )
+                })?;
             Ok::<ColumnDef, napi::Error>(ColumnDef {
                 id: c.id,
                 name: c.name,
                 ty,
                 flags,
                 default_value,
-                embedding_source: None,
+                embedding_source,
             })
         })
         .collect::<napi::Result<Vec<_>>>()?;
@@ -720,7 +744,7 @@ fn index_definition(spec: IndexSpec) -> IndexDef {
         name: spec.name,
         column_id: spec.column_id,
         kind,
-        predicate: None,
+        predicate: spec.predicate,
         options: mongreldb_core::schema::IndexOptions {
             ann: (kind == IndexKind::Ann).then_some(mongreldb_core::schema::AnnOptions {
                 quantization: match spec
@@ -732,9 +756,45 @@ fn index_definition(spec: IndexSpec) -> IndexDef {
                     }
                     AnnQuantizationSpec::Dense => mongreldb_core::schema::AnnQuantization::Dense,
                 },
-                ..mongreldb_core::schema::AnnOptions::default()
+                m: spec
+                    .ann_m
+                    .map(|value| value as usize)
+                    .unwrap_or_else(|| mongreldb_core::schema::AnnOptions::default().m),
+                ef_construction: spec
+                    .ann_ef_construction
+                    .map(|value| value as usize)
+                    .unwrap_or_else(|| {
+                        mongreldb_core::schema::AnnOptions::default().ef_construction
+                    }),
+                ef_search: spec
+                    .ann_ef_search
+                    .map(|value| value as usize)
+                    .unwrap_or_else(|| mongreldb_core::schema::AnnOptions::default().ef_search),
             }),
-            ..mongreldb_core::schema::IndexOptions::default()
+            minhash: (kind == IndexKind::MinHash).then_some(
+                mongreldb_core::schema::MinHashOptions {
+                    permutations: spec
+                        .minhash_permutations
+                        .map(|value| value as usize)
+                        .unwrap_or_else(|| {
+                            mongreldb_core::schema::MinHashOptions::default().permutations
+                        }),
+                    bands: spec
+                        .minhash_bands
+                        .map(|value| value as usize)
+                        .unwrap_or_else(|| mongreldb_core::schema::MinHashOptions::default().bands),
+                },
+            ),
+            learned_range: (kind == IndexKind::LearnedRange).then_some(
+                mongreldb_core::schema::LearnedRangeOptions {
+                    epsilon: spec
+                        .learned_range_epsilon
+                        .map(|value| value as usize)
+                        .unwrap_or_else(|| {
+                            mongreldb_core::schema::LearnedRangeOptions::default().epsilon
+                        }),
+                },
+            ),
         },
     }
 }

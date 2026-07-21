@@ -4,6 +4,10 @@ Every official MongrelDB language client must verify this behavior matrix
 against a running `mongreldb-server` in CI. The matrix defines the minimum
 round-trip operations that prove a client is wire-compatible.
 
+Index and AI schema shapes also require exact offline wire tests. Dynamic
+clients may use native maps/lists. Typed clients must expose typed structures
+or a documented complete-JSON escape hatch.
+
 ## Required operations
 
 | # | Operation | What it verifies |
@@ -22,6 +26,22 @@ round-trip operations that prove a client is wire-compatible.
 | 12 | **Schema** | `GET /kit/schema/{name}` returns the column descriptors |
 | 13 | **Error: not found** | Requesting a nonexistent table returns the typed 404 error |
 | 14 | **Idempotency** | `POST /kit/txn` with an `idempotency_key`; retry returns the same result |
+
+## Required index and AI wire shapes
+
+| Surface | Required coverage |
+|---|---|
+| Schema indexes | `bitmap`, `fm_index`, `ann`, `learned_range`, `minhash`, and `sparse` |
+| Index options | Partial `predicate`; ANN `m`, `ef_construction`, `ef_search`, and `quantization`; MinHash `permutations` and `bands`; learned-range `epsilon` |
+| Dense ANN | `quantization: "dense"`, which selects full-precision cosine distance |
+| Embedding source | Application-supplied vectors plus portable `configured_model` and `generated_column_spec` metadata |
+| Complex writes | Dense vector arrays, sparse `[token_id, weight]` pairs, and MinHash member arrays |
+| Query conditions | `bitmap_in`, `fm_contains_all`, `ann`, `sparse_match`, `minhash_similar`, and `minhash_similar_members`, in addition to the live baseline above |
+
+Embedding generation is separate from ANN quantization. Any client may supply
+vectors from any model. Automatic generated columns resolve the stored
+`provider_id` through server configuration. Clients never upload executable
+model code to the daemon.
 
 ## Test requirements
 
