@@ -221,8 +221,7 @@ async fn production_cluster_path_installs_fragment_and_ai_workers() {
     assert_eq!(fragment.active_executions(), 0);
     assert_eq!(ai.active_executions(), 0);
 
-    let storage =
-        ServerStorageRuntime::cluster_with_workers(handle.clone(), fragment, ai);
+    let storage = ServerStorageRuntime::cluster_with_workers(handle.clone(), fragment, ai);
     assert!(storage.is_cluster());
     assert!(storage.require_standalone_db().is_err());
     let gateway = storage.cluster_gateway().unwrap();
@@ -271,14 +270,8 @@ async fn standalone_mode_still_serves_local_data_plane() {
     assert!(storage.is_standalone());
 
     let sessions = Arc::new(SessionStore::new(8, Duration::from_secs(30)));
-    let (_app, control) = build_app_with_storage(
-        storage,
-        std::iter::empty(),
-        None,
-        None,
-        false,
-        sessions,
-    );
+    let (_app, control) =
+        build_app_with_storage(storage, std::iter::empty(), None, None, false, sessions);
     assert!(control.storage().is_standalone());
     assert!(control.cluster_runtime().is_none());
     assert!(control.storage().require_standalone_db().is_ok());

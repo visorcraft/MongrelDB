@@ -32,9 +32,8 @@ impl ServicePrincipalDefinition {
         expires_unix: u64,
     ) -> Result<Self> {
         let mut salt_bytes = [0_u8; 16];
-        getrandom::getrandom(&mut salt_bytes).map_err(|e| {
-            MongrelError::InvalidArgument(format!("service principal salt: {e}"))
-        })?;
+        getrandom::getrandom(&mut salt_bytes)
+            .map_err(|e| MongrelError::InvalidArgument(format!("service principal salt: {e}")))?;
         let salt = SaltString::encode_b64(&salt_bytes).map_err(|e| {
             MongrelError::InvalidArgument(format!("service principal salt encode: {e}"))
         })?;
@@ -142,9 +141,11 @@ impl ServicePrincipalStore {
         raw_secret: &str,
     ) -> Result<ServicePrincipalDefinition> {
         let entries = self.entries.read();
-        let entry = entries.get(token_id).ok_or_else(|| MongrelError::InvalidCredentials {
-            username: format!("service:{token_id}"),
-        })?;
+        let entry = entries
+            .get(token_id)
+            .ok_or_else(|| MongrelError::InvalidCredentials {
+                username: format!("service:{token_id}"),
+            })?;
         if !entry.verify_secret(raw_secret, Self::now_unix()) {
             return Err(MongrelError::InvalidCredentials {
                 username: format!("service:{token_id}"),
@@ -160,9 +161,11 @@ impl ServicePrincipalStore {
         creation_version: u64,
     ) -> Result<ServicePrincipalDefinition> {
         let entries = self.entries.read();
-        let entry = entries.get(token_id).ok_or_else(|| MongrelError::InvalidCredentials {
-            username: format!("service:{token_id}"),
-        })?;
+        let entry = entries
+            .get(token_id)
+            .ok_or_else(|| MongrelError::InvalidCredentials {
+                username: format!("service:{token_id}"),
+            })?;
         if entry.principal_id != principal_id || entry.creation_version != creation_version {
             return Err(MongrelError::InvalidCredentials {
                 username: format!("service:{token_id}"),

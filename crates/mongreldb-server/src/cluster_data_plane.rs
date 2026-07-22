@@ -27,8 +27,8 @@ use std::sync::Arc;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use mongreldb_cluster::tablet::Key;
 use mongreldb_cluster::runtime::RuntimeError;
+use mongreldb_cluster::tablet::Key;
 use mongreldb_consensus::engine_sink::{
     TabletPartitionBounds, TabletTableBinding, TabletWriteOperation,
 };
@@ -340,7 +340,10 @@ fn typed_rows_to_batch(
     table: &str,
     typed: &std::collections::BTreeMap<u64, std::collections::BTreeMap<u16, Value>>,
     mongrel_schema: Option<&Schema>,
-) -> Option<(arrow::datatypes::SchemaRef, arrow::record_batch::RecordBatch)> {
+) -> Option<(
+    arrow::datatypes::SchemaRef,
+    arrow::record_batch::RecordBatch,
+)> {
     let _ = table;
     let (col_ids, fields): (Vec<u16>, Vec<arrow::datatypes::Field>) =
         if let Some(ms) = mongrel_schema {
@@ -471,9 +474,11 @@ fn arrow_batches_to_json_rows(batches: &[arrow::record_batch::RecordBatch]) -> V
                     JsonValue::Null
                 } else if let Some(arr) = col.as_any().downcast_ref::<arrow::array::Int64Array>() {
                     JsonValue::from(arr.value(row_idx))
-                } else if let Some(arr) = col.as_any().downcast_ref::<arrow::array::Float64Array>() {
+                } else if let Some(arr) = col.as_any().downcast_ref::<arrow::array::Float64Array>()
+                {
                     JsonValue::from(arr.value(row_idx))
-                } else if let Some(arr) = col.as_any().downcast_ref::<arrow::array::BooleanArray>() {
+                } else if let Some(arr) = col.as_any().downcast_ref::<arrow::array::BooleanArray>()
+                {
                     JsonValue::from(arr.value(row_idx))
                 } else if let Some(arr) = col.as_any().downcast_ref::<arrow::array::StringArray>() {
                     JsonValue::from(arr.value(row_idx))
@@ -632,12 +637,11 @@ async fn try_kit_txn_typed(
         sample_vals.push(first_cells[i + 1].clone());
         i += 2;
     }
-    let binding = match ensure_table_binding(runtime, tablet_id, table, &col_names, &sample_vals)
-        .await
-    {
-        Ok(b) => b,
-        Err(response) => return Some(response),
-    };
+    let binding =
+        match ensure_table_binding(runtime, tablet_id, table, &col_names, &sample_vals).await {
+            Ok(b) => b,
+            Err(response) => return Some(response),
+        };
     let mut operations = Vec::with_capacity(puts.len());
     let mut results = Vec::with_capacity(puts.len());
     for (idx, (_table, cells, returning)) in puts.iter().enumerate() {
@@ -1003,7 +1007,12 @@ async fn execute_insert_typed(
     };
     let sample_vals: Vec<JsonValue> = objects
         .first()
-        .map(|o| col_names.iter().map(|c| o.get(c).cloned().unwrap_or(JsonValue::Null)).collect())
+        .map(|o| {
+            col_names
+                .iter()
+                .map(|c| o.get(c).cloned().unwrap_or(JsonValue::Null))
+                .collect()
+        })
         .unwrap_or_default();
     let binding = ensure_table_binding(runtime, tablet_id, table, &col_names, &sample_vals)
         .await
@@ -1017,14 +1026,9 @@ async fn execute_insert_typed(
             let Some(json_val) = object.get(&col_def.name) else {
                 continue;
             };
-            let value = json_to_core_value(json_val, &col_def.ty)
-                .map_err(|m| {
-                    TypedInsertFallback::Response(sql_error(
-                        StatusCode::BAD_REQUEST,
-                        m,
-                        "bad_request",
-                    ))
-                })?;
+            let value = json_to_core_value(json_val, &col_def.ty).map_err(|m| {
+                TypedInsertFallback::Response(sql_error(StatusCode::BAD_REQUEST, m, "bad_request"))
+            })?;
             if col_def.name == "id" || col_def.flags.contains(ColumnFlags::PRIMARY_KEY) {
                 if let Value::Int64(n) = &value {
                     row_id = *n as u64;
@@ -1053,9 +1057,9 @@ async fn execute_insert_typed(
             },
         }))
         .into_response()),
-        Err(error) => Err(TypedInsertFallback::Response(cluster_runtime_error_response(
-            error,
-        ))),
+        Err(error) => Err(TypedInsertFallback::Response(
+            cluster_runtime_error_response(error),
+        )),
     }
 }
 
@@ -1286,7 +1290,10 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 async fn first_hosted_tablet(runtime: &ClusterRuntimeHandle) -> Result<TabletId, Response> {
-    let ids = runtime.tablet_ids().await.map_err(cluster_runtime_error_response)?;
+    let ids = runtime
+        .tablet_ids()
+        .await
+        .map_err(cluster_runtime_error_response)?;
     ids.into_iter().next().ok_or_else(|| {
         sql_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1552,8 +1559,8 @@ fn parse_insert(sql: &str) -> Result<SimpleSql, ParseError> {
 fn parse_select(sql: &str) -> Result<SimpleSql, ParseError> {
     // SELECT * | col[, col…] FROM table [WHERE col = lit]
     let rest = strip_prefix_ci(sql, "SELECT")?.trim_start();
-    let (columns, rest) = if rest.starts_with('*') {
-        (None, rest[1..].trim_start())
+    let (columns, rest) = if let Some(stripped) = rest.strip_prefix('*') {
+        (None, stripped.trim_start())
     } else {
         let upper = rest.to_ascii_uppercase();
         let from_at = upper.find(" FROM ").ok_or(ParseError)?;
@@ -1793,9 +1800,7 @@ fn take_literal(input: &str) -> Result<(JsonValue, &str), ParseError> {
     if num_str.contains('.') {
         let f: f64 = num_str.parse().map_err(|_| ParseError)?;
         Ok((
-            JsonValue::Number(
-                serde_json::Number::from_f64(f).ok_or(ParseError)?,
-            ),
+            JsonValue::Number(serde_json::Number::from_f64(f).ok_or(ParseError)?),
             &input[end..],
         ))
     } else {
@@ -1813,8 +1818,7 @@ fn strip_prefix_ci<'a>(input: &'a str, prefix: &str) -> Result<&'a str, ParseErr
 }
 
 fn starts_with_ci(input: &str, prefix: &str) -> bool {
-    input.len() >= prefix.len()
-        && input[..prefix.len()].eq_ignore_ascii_case(prefix)
+    input.len() >= prefix.len() && input[..prefix.len()].eq_ignore_ascii_case(prefix)
 }
 
 #[cfg(test)]
@@ -1831,10 +1835,7 @@ mod tests {
                 rows,
             } => {
                 assert_eq!(table, "items");
-                assert_eq!(
-                    columns.unwrap(),
-                    vec!["id".to_string(), "name".to_string()]
-                );
+                assert_eq!(columns.unwrap(), vec!["id".to_string(), "name".to_string()]);
                 assert_eq!(rows.len(), 2);
                 assert_eq!(rows[0][0], json!(1));
                 assert_eq!(rows[0][1], json!("alice"));

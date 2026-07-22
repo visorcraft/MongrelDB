@@ -58,9 +58,8 @@ impl EmbeddingJob {
     }
 
     pub fn to_definition_bytes(&self) -> Result<Vec<u8>, EmbeddingError> {
-        serde_json::to_vec(self).map_err(|error| {
-            EmbeddingError::Execution(format!("serialize EmbeddingJob: {error}"))
-        })
+        serde_json::to_vec(self)
+            .map_err(|error| EmbeddingError::Execution(format!("serialize EmbeddingJob: {error}")))
     }
 
     pub fn from_definition_bytes(bytes: &[u8]) -> Result<Self, EmbeddingError> {
@@ -283,11 +282,7 @@ impl ReEmbeddingCoordinator {
         slot
     }
 
-    pub fn active_slot(
-        &self,
-        table_id: u64,
-        column_id: u16,
-    ) -> Option<EmbeddingGenerationSlot> {
+    pub fn active_slot(&self, table_id: u64, column_id: u16) -> Option<EmbeddingGenerationSlot> {
         self.inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -296,11 +291,7 @@ impl ReEmbeddingCoordinator {
             .cloned()
     }
 
-    pub fn hidden_slot(
-        &self,
-        table_id: u64,
-        column_id: u16,
-    ) -> Option<EmbeddingGenerationSlot> {
+    pub fn hidden_slot(&self, table_id: u64, column_id: u16) -> Option<EmbeddingGenerationSlot> {
         self.inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -345,9 +336,7 @@ impl ReEmbeddingCoordinator {
                 "no active embedding generation for table {table_id} column {column_id}"
             ))
         })?;
-        if source.semantic_identity.fingerprint_sha256()
-            == target_identity.fingerprint_sha256()
-        {
+        if source.semantic_identity.fingerprint_sha256() == target_identity.fingerprint_sha256() {
             return Err(EmbeddingError::Execution(
                 "re-embedding target semantic identity must differ from active source".into(),
             ));
@@ -530,9 +519,9 @@ impl ReEmbeddingCoordinator {
         column_id: u16,
         query_identity: &EmbeddingProviderRef,
     ) -> Result<EmbeddingGenerationSlot, EmbeddingError> {
-        let active = self.active_slot(table_id, column_id).ok_or_else(|| {
-            EmbeddingError::NoActiveAnnIdentity(column_id)
-        })?;
+        let active = self
+            .active_slot(table_id, column_id)
+            .ok_or(EmbeddingError::NoActiveAnnIdentity(column_id))?;
         if active.semantic_identity.fingerprint_sha256() != query_identity.fingerprint_sha256() {
             return Err(EmbeddingError::AnnSemanticIdentityMismatch {
                 column_id,
@@ -544,12 +533,7 @@ impl ReEmbeddingCoordinator {
     }
 
     /// Whether a generation id is the currently published active generation.
-    pub fn is_active_generation(
-        &self,
-        table_id: u64,
-        column_id: u16,
-        generation_id: u64,
-    ) -> bool {
+    pub fn is_active_generation(&self, table_id: u64, column_id: u16, generation_id: u64) -> bool {
         self.active_slot(table_id, column_id)
             .is_some_and(|s| s.generation_id == generation_id)
     }
@@ -675,10 +659,7 @@ pub fn check_provider_readiness(
     } else {
         ProviderReadiness::Ready
     };
-    ProviderReadinessReport {
-        overall,
-        providers,
-    }
+    ProviderReadinessReport { overall, providers }
 }
 
 #[cfg(test)]
@@ -709,9 +690,7 @@ mod tests {
         let active = coord.install_active(1, 3, source.clone());
         assert_eq!(active.semantic_identity, source);
 
-        let job = coord
-            .start_reembedding(1, 3, target.clone(), 10)
-            .unwrap();
+        let job = coord.start_reembedding(1, 3, target.clone(), 10).unwrap();
         assert_eq!(job.state, ReEmbeddingState::Pending);
         assert_eq!(job.source_generation_id, active.generation_id);
         assert_ne!(job.hidden_generation_id, active.generation_id);
@@ -829,7 +808,9 @@ mod tests {
 
     #[test]
     fn ann_excludes_non_ready_status() {
-        assert!(embedding_status_is_ann_eligible(EmbeddingGenerationStatus::Ready));
+        assert!(embedding_status_is_ann_eligible(
+            EmbeddingGenerationStatus::Ready
+        ));
         assert!(!embedding_status_is_ann_eligible(
             EmbeddingGenerationStatus::Pending
         ));

@@ -61,6 +61,7 @@ pub struct AdmitRequest<'a> {
 
 /// Live admission metrics (P1.1-X8): must match scheduler + memory accounting.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[allow(dead_code)] // product metrics snapshot; wired via NodeAdmissionController::metrics
 pub struct AdmissionMetrics {
     /// Per-class running work items (from hierarchical scheduler).
     pub running_by_class: std::collections::BTreeMap<String, usize>,
@@ -118,11 +119,13 @@ impl NodeAdmissionController {
     }
 
     /// Process memory governor used for parent/child reservations.
+    #[allow(dead_code)] // product introspection / tests
     pub fn memory(&self) -> &MemoryGovernor {
         &self.memory
     }
 
     /// Snapshot for admin / tests (must match live reservations).
+    #[allow(dead_code)] // product introspection / tests
     pub fn metrics(&self) -> AdmissionMetrics {
         let stats = self.scheduler.stats();
         let mut running_by_class = std::collections::BTreeMap::new();
@@ -176,7 +179,7 @@ impl NodeAdmissionController {
         let reservation = self
             .memory
             .try_reserve(budget_bytes, memory_class)
-            .map_err(|error| AdmitError::Memory(error))?;
+            .map_err(AdmitError::Memory)?;
         self.parent_reserved_bytes
             .fetch_add(budget_bytes, Ordering::Relaxed);
         let work_id = work.work_id();
@@ -218,7 +221,9 @@ impl NodeAdmissionController {
                 .unwrap_or_else(|error| error.into_inner());
             let budget = parents
                 .get_mut(&parent.work_id)
-                .ok_or(AdmitError::UnknownParent { work_id: parent.work_id })?;
+                .ok_or(AdmitError::UnknownParent {
+                    work_id: parent.work_id,
+                })?;
             let next = budget.used_bytes.saturating_add(bytes);
             if next > budget.budget_bytes {
                 return Err(AdmitError::ChildExceedsParent {
@@ -293,11 +298,13 @@ pub struct ParentAdmission {
 
 impl ParentAdmission {
     /// Scheduler work id (parent key for children).
+    #[allow(dead_code)] // fragment child admission under SQL parent
     pub fn work_id(&self) -> u64 {
         self.work_id
     }
 
     /// Bytes still available for children under this parent.
+    #[allow(dead_code)] // hierarchical budget diagnostics
     pub fn remaining_bytes(&self) -> u64 {
         let parents = self
             .controller
@@ -311,6 +318,7 @@ impl ParentAdmission {
     }
 
     /// Bytes currently charged to children.
+    #[allow(dead_code)] // hierarchical budget diagnostics
     pub fn child_used_bytes(&self) -> u64 {
         let parents = self
             .controller
@@ -335,6 +343,7 @@ impl Drop for ParentAdmission {
 }
 
 /// Child reservation under a parent budget (fragment / tablet-AI call).
+#[allow(dead_code)] // product child-admission surface; drop path is live
 pub struct ChildReservation {
     controller: NodeAdmissionController,
     parent_work_id: u64,
@@ -345,16 +354,19 @@ pub struct ChildReservation {
 
 impl ChildReservation {
     /// Bytes held against the parent.
+    #[allow(dead_code)]
     pub fn bytes(&self) -> u64 {
         self.bytes
     }
 
     /// Memory class this child maps to (for metrics / diagnostics).
+    #[allow(dead_code)]
     pub fn memory_class(&self) -> MemoryClass {
         self.memory_class
     }
 
     /// Explicit release (also runs on drop).
+    #[allow(dead_code)] // Drop is the production path
     pub fn release(mut self) {
         self.finish();
     }
@@ -704,6 +716,7 @@ pub struct SqlAdmissionGuard {
     /// Outer node hard cap.
     _permit: tokio::sync::OwnedSemaphorePermit,
     /// Parent work unit + hierarchical memory budget (P1.1).
+    #[allow(dead_code)] // held for Drop side effects + child admission hooks
     parent: ParentAdmission,
 }
 
@@ -717,11 +730,13 @@ impl SqlAdmissionGuard {
     }
 
     /// Parent work id (for fragment child admission under this SQL request).
+    #[allow(dead_code)] // fragment child admission under SQL parent
     pub fn parent(&self) -> &ParentAdmission {
         &self.parent
     }
 
     /// Work id assigned by the hierarchical scheduler.
+    #[allow(dead_code)] // admin / fragment correlation
     pub fn work_id(&self) -> u64 {
         self.parent.work_id()
     }
@@ -1698,7 +1713,11 @@ mod tests {
             .expect("control reserve must survive AI overload");
         let metrics = controller.metrics();
         assert_eq!(
-            metrics.running_by_class.get("control").copied().unwrap_or(0),
+            metrics
+                .running_by_class
+                .get("control")
+                .copied()
+                .unwrap_or(0),
             1
         );
         assert_eq!(
@@ -1747,7 +1766,9 @@ mod tests {
     // ID: P1.1-X7 RSS remains below configured maximum (pressure rejects AI).
     #[test]
     fn rss_above_configured_maximum_triggers_pressure_actions() {
-        use mongreldb_core::{GovernorConfig, MemoryGovernor, NodeMemoryGovernor, NodePressureInputs};
+        use mongreldb_core::{
+            GovernorConfig, MemoryGovernor, NodeMemoryGovernor, NodePressureInputs,
+        };
 
         let memory = MemoryGovernor::new(GovernorConfig::new(1_000_000)).unwrap();
         let mut node = NodeMemoryGovernor::new(memory);

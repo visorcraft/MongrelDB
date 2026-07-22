@@ -1437,14 +1437,16 @@ fn lower_projection(
     // Non-scan inputs (Aggregate / Sort / Limit / Join / Union): treat pure
     // column renames as identity. The fragment model has no free-standing
     // Projection operator; final output naming is coordinator-side.
-    if columns.is_empty() || matches!(
-        input,
-        LogicalPlanLite::Aggregate { .. }
-            | LogicalPlanLite::Sort { .. }
-            | LogicalPlanLite::Limit { .. }
-            | LogicalPlanLite::Join { .. }
-            | LogicalPlanLite::Union { .. }
-    ) {
+    if columns.is_empty()
+        || matches!(
+            input,
+            LogicalPlanLite::Aggregate { .. }
+                | LogicalPlanLite::Sort { .. }
+                | LogicalPlanLite::Limit { .. }
+                | LogicalPlanLite::Join { .. }
+                | LogicalPlanLite::Union { .. }
+        )
+    {
         return Ok(input);
     }
     Err(DistributedError::Unsupported(
@@ -1453,9 +1455,7 @@ fn lower_projection(
     ))
 }
 
-fn lower_filter(
-    filter: &datafusion::logical_expr::Filter,
-) -> DistributedResult<LogicalPlanLite> {
+fn lower_filter(filter: &datafusion::logical_expr::Filter) -> DistributedResult<LogicalPlanLite> {
     // Require a worker-evaluable predicate shape before accepting it.
     assert_filter_evaluable(&filter.predicate)?;
     let mut input = lower_datafusion_plan(filter.input.as_ref())?;
@@ -1527,9 +1527,7 @@ fn lower_sort(sort: &datafusion::logical_expr::Sort) -> DistributedResult<Logica
     })
 }
 
-fn lower_limit(
-    limit: &datafusion::logical_expr::Limit,
-) -> DistributedResult<LogicalPlanLite> {
+fn lower_limit(limit: &datafusion::logical_expr::Limit) -> DistributedResult<LogicalPlanLite> {
     use datafusion::logical_expr::{FetchType, SkipType};
 
     match limit.get_skip_type() {
@@ -1637,9 +1635,7 @@ fn lower_union(union: &datafusion::logical_expr::Union) -> DistributedResult<Log
 
 /// Mutable access to a base-scan's predicate and projection, including when the
 /// scan is wrapped by a table-scan `fetch` limit.
-fn scan_fields_mut(
-    node: &mut LogicalPlanLite,
-) -> Option<(&mut Option<String>, &mut Vec<String>)> {
+fn scan_fields_mut(node: &mut LogicalPlanLite) -> Option<(&mut Option<String>, &mut Vec<String>)> {
     match node {
         LogicalPlanLite::Scan {
             predicate,
@@ -1709,24 +1705,22 @@ fn assert_filter_evaluable(expr: &datafusion::logical_expr::Expr) -> Distributed
         Expr::Column(_) | Expr::Literal(_, _) | Expr::IsNull(_) | Expr::IsNotNull(_) => Ok(()),
         Expr::Alias(alias) => assert_filter_evaluable(alias.expr.as_ref()),
         Expr::Not(inner) => assert_filter_evaluable(inner.as_ref()),
-        Expr::BinaryExpr(binary) => {
-            match binary.op {
-                Operator::And
-                | Operator::Or
-                | Operator::Eq
-                | Operator::NotEq
-                | Operator::Lt
-                | Operator::LtEq
-                | Operator::Gt
-                | Operator::GtEq => {
-                    assert_filter_evaluable(binary.left.as_ref())?;
-                    assert_filter_evaluable(binary.right.as_ref())
-                }
-                other => Err(DistributedError::Unsupported(format!(
-                    "filter operator {other:?} is not supported for distributed planning"
-                ))),
+        Expr::BinaryExpr(binary) => match binary.op {
+            Operator::And
+            | Operator::Or
+            | Operator::Eq
+            | Operator::NotEq
+            | Operator::Lt
+            | Operator::LtEq
+            | Operator::Gt
+            | Operator::GtEq => {
+                assert_filter_evaluable(binary.left.as_ref())?;
+                assert_filter_evaluable(binary.right.as_ref())
             }
-        }
+            other => Err(DistributedError::Unsupported(format!(
+                "filter operator {other:?} is not supported for distributed planning"
+            ))),
+        },
         Expr::Between(between) => {
             assert_filter_evaluable(between.expr.as_ref())?;
             assert_filter_evaluable(between.low.as_ref())?;
@@ -1900,9 +1894,7 @@ fn aggregate_expr_from_df(
         // COUNT(*) / COUNT(1) have no column; COUNT(col) keeps the column.
         [arg] if function == AggregateFunction::Count => column_name(arg),
         [arg] => Some(column_name(arg).ok_or_else(|| {
-            DistributedError::Unsupported(format!(
-                "aggregate argument must be a column, got {arg}"
-            ))
+            DistributedError::Unsupported(format!("aggregate argument must be a column, got {arg}"))
         })?),
         _ => {
             return Err(DistributedError::Unsupported(
@@ -2602,9 +2594,7 @@ impl RemoteFragmentEndpoint {
     /// Handles one authenticated internal RPC body.
     pub async fn handle(&self, bytes: &[u8]) -> DistributedResult<Vec<u8>> {
         use std::sync::atomic::Ordering::Relaxed;
-        self.metrics
-            .bytes_in
-            .fetch_add(bytes.len() as u64, Relaxed);
+        self.metrics.bytes_in.fetch_add(bytes.len() as u64, Relaxed);
         if bytes.len() > self.max_message_bytes {
             return Err(DistributedError::RemoteProtocol(format!(
                 "fragment request is {} bytes; limit is {}",
@@ -7120,7 +7110,9 @@ mod tests {
     // DataFusionDistributedPlanner (P0.4)
     // -----------------------------------------------------------------------
 
-    fn df_table_source(columns: &[(&str, DataType)]) -> Arc<dyn datafusion::logical_expr::TableSource> {
+    fn df_table_source(
+        columns: &[(&str, DataType)],
+    ) -> Arc<dyn datafusion::logical_expr::TableSource> {
         use datafusion::logical_expr::logical_plan::builder::LogicalTableSource;
         let fields = columns
             .iter()
@@ -7177,9 +7169,7 @@ mod tests {
                                 assert_eq!(aggregates[0].function, AggregateFunction::Sum);
                                 match input.as_ref() {
                                     LogicalPlanLite::Scan {
-                                        table,
-                                        predicate,
-                                        ..
+                                        table, predicate, ..
                                     } => {
                                         assert_eq!(table, "orders");
                                         assert!(
@@ -7212,21 +7202,24 @@ mod tests {
         let distributed = planner.lower(&plan, &locator, &metadata).unwrap();
         assert!(!distributed.fragments.is_empty());
         assert!(distributed.root_fragment_id().is_some());
-        assert!(distributed
-            .fragments
+        assert!(distributed.fragments.iter().any(|fragment| fragment
+            .operators
             .iter()
-            .any(|fragment| fragment
-                .operators
-                .iter()
-                .any(|op| matches!(op, FragmentOperator::TabletScan { .. }))));
+            .any(|op| matches!(op, FragmentOperator::TabletScan { .. }))));
     }
 
     #[test]
     fn datafusion_planner_lowers_join_and_union() {
         use datafusion::logical_expr::{JoinType, LogicalPlanBuilder};
 
-        let left = df_scan("orders", &[("id", DataType::Int64), ("uid", DataType::Int64)]);
-        let right = df_scan("users", &[("id", DataType::Int64), ("name", DataType::Utf8)]);
+        let left = df_scan(
+            "orders",
+            &[("id", DataType::Int64), ("uid", DataType::Int64)],
+        );
+        let right = df_scan(
+            "users",
+            &[("id", DataType::Int64), ("name", DataType::Utf8)],
+        );
         let join = LogicalPlanBuilder::from(left)
             .join(
                 LogicalPlanBuilder::from(right).build().unwrap(),
@@ -7245,8 +7238,12 @@ mod tests {
                 assert_eq!(on.len(), 1);
                 assert_eq!(on[0].left, "uid");
                 assert_eq!(on[0].right, "id");
-                assert!(matches!(left.as_ref(), LogicalPlanLite::Scan { table, .. } if table == "orders"));
-                assert!(matches!(right.as_ref(), LogicalPlanLite::Scan { table, .. } if table == "users"));
+                assert!(
+                    matches!(left.as_ref(), LogicalPlanLite::Scan { table, .. } if table == "orders")
+                );
+                assert!(
+                    matches!(right.as_ref(), LogicalPlanLite::Scan { table, .. } if table == "users")
+                );
             }
             other => panic!("expected join, got {other:?}"),
         }

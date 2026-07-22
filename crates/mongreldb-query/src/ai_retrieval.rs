@@ -609,10 +609,7 @@ pub fn merge_hybrid_contributions(
 
 /// True when `a` is a better contribution than `b` for the same
 /// `(row, retriever)` key.
-fn contribution_better(
-    a: &LocalRetrieverContribution,
-    b: &LocalRetrieverContribution,
-) -> bool {
+fn contribution_better(a: &LocalRetrieverContribution, b: &LocalRetrieverContribution) -> bool {
     a.local_rank < b.local_rank
         || (a.local_rank == b.local_rank
             && (a.raw_score > b.raw_score
@@ -703,7 +700,8 @@ where
     F: FnMut(
         TabletId,
         &str,
-    ) -> Result<(Vec<LocalRetrieverContribution>, RetrieverTabletBound), AiRetrievalError>,
+    )
+        -> Result<(Vec<LocalRetrieverContribution>, RetrieverTabletBound), AiRetrievalError>,
 {
     let mut rounds = 0usize;
     let max_refill_rounds = budget.max_refill_rounds.max(1);
@@ -1993,10 +1991,7 @@ mod tests {
         assert!((fused[0].final_score - 2.0 / 61.0).abs() < 1e-12);
         // Single-score merge_candidates would have preferred row 20 (local_rank 1).
         let single = merge_candidates(
-            &hits
-                .iter()
-                .map(|h| h.candidate.clone())
-                .collect::<Vec<_>>(),
+            &hits.iter().map(|h| h.candidate.clone()).collect::<Vec<_>>(),
             FusionMethod::Rrf { k: 60 },
             &budget,
         )
@@ -2471,13 +2466,8 @@ mod tests {
             expected_model_generation: Some(1),
             ..AiWorkBudget::default()
         };
-        let err = fuse_distributed_hits(
-            &[hit_a],
-            &search,
-            FusionMethod::Rrf { k: 60 },
-            &budget,
-        )
-        .unwrap_err();
+        let err = fuse_distributed_hits(&[hit_a], &search, FusionMethod::Rrf { k: 60 }, &budget)
+            .unwrap_err();
         assert!(
             matches!(err, AiRetrievalError::Protocol(ref msg) if msg.contains("expected 1")),
             "unexpected: {err:?}"

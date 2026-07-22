@@ -376,24 +376,15 @@ mod tests {
         let mut mr = MutableRun::new();
         let early = hlc(100);
         let late = hlc(200);
-        mr.insert_many(vec![
-            hlc_row(1, 1, early, 1),
-            hlc_row(1, 2, late, 2),
-        ]);
+        mr.insert_many(vec![hlc_row(1, 1, early, 1), hlc_row(1, 2, late, 2)]);
         let snap = Snapshot::at_hlc(Epoch(99), early);
         let versions = mr.visible_versions_at(snap);
         assert_eq!(versions.len(), 1);
         assert_eq!(int_of(&versions[0]), 1);
-        assert_eq!(
-            int_of(&mr.get_version_at(RowId(1), snap).unwrap().1),
-            1
-        );
+        assert_eq!(int_of(&mr.get_version_at(RowId(1), snap).unwrap().1), 1);
         let snap2 = Snapshot::at_hlc(Epoch(1), late);
         assert_eq!(int_of(&mr.visible_versions_at(snap2)[0]), 2);
-        assert_eq!(
-            int_of(&mr.get_version_at(RowId(1), snap2).unwrap().1),
-            2
-        );
+        assert_eq!(int_of(&mr.get_version_at(RowId(1), snap2).unwrap().1), 2);
     }
 
     #[test]
@@ -403,28 +394,19 @@ mod tests {
         let late = hlc(200);
         // Lower epoch, later HLC would win under epoch-only newest-of-visible;
         // HLC authority must hide it under an early pin.
-        mr.insert_many(vec![
-            hlc_row(1, 1, late, 99),
-            hlc_row(1, 50, early, 1),
-        ]);
+        mr.insert_many(vec![hlc_row(1, 1, late, 99), hlc_row(1, 50, early, 1)]);
         let snap = Snapshot::at_hlc(Epoch(99), early);
         let versions = mr.visible_versions_at(snap);
         assert_eq!(versions.len(), 1);
         assert_eq!(int_of(&versions[0]), 1);
         assert_eq!(versions[0].commit_ts, Some(early));
-        assert_eq!(
-            int_of(&mr.get_version_at(RowId(1), snap).unwrap().1),
-            1
-        );
+        assert_eq!(int_of(&mr.get_version_at(RowId(1), snap).unwrap().1), 1);
     }
 
     #[test]
     fn epoch_only_snapshot_does_not_observe_hlc_stamped_rows() {
         let mut mr = MutableRun::new();
-        mr.insert_many(vec![
-            hlc_row(1, 1, hlc(50), 1),
-            row(2, 1, 2),
-        ]);
+        mr.insert_many(vec![hlc_row(1, 1, hlc(50), 1), row(2, 1, 2)]);
         let legacy = Snapshot::at(Epoch(99));
         let versions = mr.visible_versions_at(legacy);
         assert_eq!(versions.len(), 1, "only pure-legacy row is visible");

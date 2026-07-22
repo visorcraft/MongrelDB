@@ -207,7 +207,11 @@ impl NodeRuntimeConfig {
     /// Test-only plaintext constructor (P1.3).
     #[cfg(any(test, feature = "dangerous-test-transport"))]
     pub fn plaintext_for_tests(node_data: PathBuf, listen_address: String) -> Self {
-        Self::new_inner(node_data, listen_address, TransportSecurity::PlaintextForTesting)
+        Self::new_inner(
+            node_data,
+            listen_address,
+            TransportSecurity::PlaintextForTesting,
+        )
     }
 
     /// Production constructor requiring mTLS (P1.3).
@@ -219,9 +223,9 @@ impl NodeRuntimeConfig {
         security: TransportSecurity,
     ) -> Result<Self, String> {
         match security {
-            TransportSecurity::PlaintextForTesting => Err(
-                "production NodeRuntimeConfig rejects plaintext cluster transport".into(),
-            ),
+            TransportSecurity::PlaintextForTesting => {
+                Err("production NodeRuntimeConfig rejects plaintext cluster transport".into())
+            }
             other => Ok(Self::new_inner(node_data, listen_address, other)),
         }
     }
@@ -274,7 +278,6 @@ mod node_runtime_config_tests {
         ));
     }
 }
-
 
 /// Status of the meta group member on this node.
 #[derive(Clone, Debug)]

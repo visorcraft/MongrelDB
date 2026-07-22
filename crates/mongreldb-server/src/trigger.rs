@@ -120,7 +120,8 @@ pub async fn create(
         key.as_deref(),
         &idempotency_payload,
         || {
-            state.db()
+            state
+                .db()
                 .create_trigger_as_controlled(trigger, effective_principal.as_ref(), || {
                     validate_trigger_binding(
                         &state,
@@ -204,7 +205,8 @@ pub async fn replace(
         key.as_deref(),
         &idempotency_payload,
         || {
-            state.db()
+            state
+                .db()
                 .create_or_replace_trigger_as_controlled(
                     trigger,
                     effective_principal.as_ref(),
@@ -279,7 +281,8 @@ pub async fn drop_trigger(
         key.as_deref(),
         &idempotency_payload,
         || {
-            state.db()
+            state
+                .db()
                 .drop_triggers_with_epoch_as_controlled(
                     std::slice::from_ref(&name),
                     effective_principal.as_ref(),
@@ -363,7 +366,8 @@ fn preflight_trigger(
     for _ in 0..3 {
         let security_version = state.db().security_version();
         let catalog_epoch = state.db().catalog_snapshot().db_epoch;
-        state.db()
+        state
+            .db()
             .require_for(principal, &Permission::Ddl)
             .map_err(|failure| {
                 Box::new(error(
@@ -525,7 +529,8 @@ fn require_ddl(
     state: &AppState,
     principal: &Option<mongreldb_core::Principal>,
 ) -> Result<(), Box<Response>> {
-    state.db()
+    state
+        .db()
         .require_for(
             request_principal(state, principal).as_ref(),
             &mongreldb_core::Permission::Ddl,

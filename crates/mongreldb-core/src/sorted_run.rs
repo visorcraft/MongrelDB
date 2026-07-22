@@ -1669,8 +1669,7 @@ impl<'a> RunWriter<'a> {
             page_stats: stats,
         });
         if has_commit_ts {
-            let (pages, stats, enc) =
-                value_column_pages(TypeId::Bytes, &commit_ts_vals, &bounds)?;
+            let (pages, stats, enc) = value_column_pages(TypeId::Bytes, &commit_ts_vals, &bounds)?;
             columns.push(ColumnPayload {
                 column_id: SYS_COMMIT_TS,
                 type_id_tag: type_tag(&TypeId::Bytes),
@@ -2574,7 +2573,9 @@ impl RunReader {
         if !self.has_column(SYS_COMMIT_TS) {
             return Ok(None);
         }
-        Ok(decode_commit_ts_value(self.column(SYS_COMMIT_TS)?.get(index)))
+        Ok(decode_commit_ts_value(
+            self.column(SYS_COMMIT_TS)?.get(index),
+        ))
     }
 
     fn find_header(&self, column_id: u16) -> Result<&ColumnPageHeader> {

@@ -173,7 +173,8 @@ async fn lost_streaming_response_after_commit_status_recovery() {
     let db = Arc::new(Database::create(dir.path()).unwrap());
     create_items_table(&db);
     let sessions = Arc::new(SessionStore::new(8, Duration::from_secs(60)));
-    let (connection, shutdown_tx, server) = start_native(Arc::clone(&db), Arc::clone(&sessions)).await;
+    let (connection, shutdown_tx, server) =
+        start_native(Arc::clone(&db), Arc::clone(&sessions)).await;
     let client = connection.client();
     let session_id = open_anonymous_session(&client, &sessions).await;
 
@@ -245,7 +246,8 @@ async fn lost_buffered_write_status_recovery_shows_committed() {
     let db = Arc::new(Database::create(dir.path()).unwrap());
     create_items_table(&db);
     let sessions = Arc::new(SessionStore::new(8, Duration::from_secs(60)));
-    let (connection, shutdown_tx, server) = start_native(Arc::clone(&db), Arc::clone(&sessions)).await;
+    let (connection, shutdown_tx, server) =
+        start_native(Arc::clone(&db), Arc::clone(&sessions)).await;
     let client = connection.client();
     let session_id = open_anonymous_session(&client, &sessions).await;
 
@@ -290,10 +292,7 @@ async fn lost_buffered_write_status_recovery_shows_committed() {
     assert!(status_durable.committed);
     assert_eq!(status_durable.committed_statements, 1);
     assert_eq!(status_durable.terminal_state, "committed");
-    assert_eq!(
-        status_durable.last_commit_epoch,
-        durable.last_commit_epoch
-    );
+    assert_eq!(status_durable.last_commit_epoch, durable.last_commit_epoch);
     assert_eq!(status.phase, native::QueryPhase::Completed as i32);
 
     let _ = shutdown_tx.send(());
@@ -307,7 +306,8 @@ async fn cancel_too_late_returns_structured_outcome() {
     let db = Arc::new(Database::create(dir.path()).unwrap());
     create_items_table(&db);
     let sessions = Arc::new(SessionStore::new(8, Duration::from_secs(60)));
-    let (connection, shutdown_tx, server) = start_native(Arc::clone(&db), Arc::clone(&sessions)).await;
+    let (connection, shutdown_tx, server) =
+        start_native(Arc::clone(&db), Arc::clone(&sessions)).await;
     let client = connection.client();
     let session_id = open_anonymous_session(&client, &sessions).await;
 
@@ -379,7 +379,8 @@ async fn cancel_already_finished_returns_terminal_receipt() {
     let db = Arc::new(Database::create(dir.path()).unwrap());
     create_items_table(&db);
     let sessions = Arc::new(SessionStore::new(8, Duration::from_secs(60)));
-    let (connection, shutdown_tx, server) = start_native(Arc::clone(&db), Arc::clone(&sessions)).await;
+    let (connection, shutdown_tx, server) =
+        start_native(Arc::clone(&db), Arc::clone(&sessions)).await;
     let client = connection.client();
     let session_id = open_anonymous_session(&client, &sessions).await;
 
@@ -436,7 +437,8 @@ async fn cancel_accepted_returns_outcome_and_durable() {
     let db = Arc::new(Database::create(dir.path()).unwrap());
     create_items_table(&db);
     let sessions = Arc::new(SessionStore::new(8, Duration::from_secs(60)));
-    let (connection, shutdown_tx, server) = start_native(Arc::clone(&db), Arc::clone(&sessions)).await;
+    let (connection, shutdown_tx, server) =
+        start_native(Arc::clone(&db), Arc::clone(&sessions)).await;
     let client = connection.client();
     let session_id = open_anonymous_session(&client, &sessions).await;
 

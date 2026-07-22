@@ -13065,7 +13065,8 @@ impl Database {
                             prebuilt[index] = Some(row);
                         }
                         Staged::Delete(row_id) => {
-                            delete_images[index] = t.get(*row_id, self.snapshot_for_epoch(read_epoch));
+                            delete_images[index] =
+                                t.get(*row_id, self.snapshot_for_epoch(read_epoch));
                         }
                         Staged::Put(_) | Staged::Truncate => {}
                         Staged::Update { .. } => {
@@ -21567,7 +21568,11 @@ mod commit_ts_ledger_tests {
         // HLC-stamped versions by design (no dual authority).
         let (snap, _g) = db.snapshot();
         let rows = table.visible_rows(snap).expect("visible rows");
-        assert_eq!(rows.len(), 1, "committed put must be visible under HLC snapshot");
+        assert_eq!(
+            rows.len(),
+            1,
+            "committed put must be visible under HLC snapshot"
+        );
         assert_eq!(rows[0].commit_ts, Some(receipt.commit_ts));
         assert_eq!(db.commit_ts_for_epoch(epoch), Some(receipt.commit_ts));
     }
@@ -21605,7 +21610,7 @@ mod commit_ts_ledger_tests {
         let staged = vec![StagedTxnWrite::Put {
             table_id,
             rows: bincode::serialize(&vec![
-                Row::new(crate::RowId(1), Epoch(0)).with_column(1, Value::Int64(1)),
+                Row::new(crate::RowId(1), Epoch(0)).with_column(1, Value::Int64(1))
             ])
             .unwrap(),
         }
@@ -21617,7 +21622,7 @@ mod commit_ts_ledger_tests {
         let staged2 = vec![StagedTxnWrite::Put {
             table_id,
             rows: bincode::serialize(&vec![
-                Row::new(crate::RowId(2), Epoch(0)).with_column(1, Value::Int64(2)),
+                Row::new(crate::RowId(2), Epoch(0)).with_column(1, Value::Int64(2))
             ])
             .unwrap(),
         }
@@ -21642,8 +21647,7 @@ mod commit_ts_ledger_tests {
         // physical component (logical/tiebreaker may be zero on recovery form).
         let epoch = db.visible_epoch();
         assert_eq!(
-            db.commit_ts_for_epoch(epoch)
-                .map(|ts| ts.physical_micros),
+            db.commit_ts_for_epoch(epoch).map(|ts| ts.physical_micros),
             Some(commit_ts.physical_micros)
         );
     }

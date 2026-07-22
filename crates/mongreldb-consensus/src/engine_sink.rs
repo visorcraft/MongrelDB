@@ -390,8 +390,9 @@ impl TabletWriteCommandRecord {
 
     /// Decodes a record, rejecting malformed and unknown versions.
     pub fn decode(payload: &[u8]) -> Result<Self, StateMachineError> {
-        let record: Self = serde_json::from_slice(payload)
-            .map_err(|error| StateMachineError::Corrupt(format!("tablet write command: {error}")))?;
+        let record: Self = serde_json::from_slice(payload).map_err(|error| {
+            StateMachineError::Corrupt(format!("tablet write command: {error}"))
+        })?;
         if record.format_version < MIN_SUPPORTED_TABLET_WRITE_COMMAND_FORMAT_VERSION
             || record.format_version > TABLET_WRITE_COMMAND_FORMAT_VERSION
         {
@@ -685,18 +686,14 @@ impl EngineApplySink {
     /// Production code must not call this. Used by split/merge and legacy
     /// ledger migration unit tests that still exercise the opaque path.
     #[cfg(test)]
-    pub fn initialize_opaque_tablet_keyspace_for_tests(
-        &mut self,
-    ) -> Result<(), EngineSinkError> {
+    pub fn initialize_opaque_tablet_keyspace_for_tests(&mut self) -> Result<(), EngineSinkError> {
         self.initialize_opaque_tablet_keyspace_unchecked()
     }
 
     /// Creates or validates the opaque tablet keyspace table without the
     /// production legacy gate. Used by install-time migration of historical
     /// opaque group snapshots and by the test-only helper.
-    fn initialize_opaque_tablet_keyspace_unchecked(
-        &mut self,
-    ) -> Result<(), EngineSinkError> {
+    fn initialize_opaque_tablet_keyspace_unchecked(&mut self) -> Result<(), EngineSinkError> {
         let db = self.database_required()?.clone();
         let catalog = db.catalog_snapshot();
         if let Some(entry) = catalog.live(TABLET_KEYSPACE_TABLE) {
@@ -903,7 +900,10 @@ impl EngineApplySink {
             operations.push(TabletWriteOperation::Put {
                 table_id,
                 row_id: *row_id,
-                cells: cells.iter().map(|(id, value)| (*id, value.clone())).collect(),
+                cells: cells
+                    .iter()
+                    .map(|(id, value)| (*id, value.clone()))
+                    .collect(),
             });
         }
         self.apply_tablet_writes(
@@ -937,7 +937,10 @@ impl EngineApplySink {
             if before.get(row_id) != Some(cells) {
                 changes.push(TypedTabletMutation::Put {
                     row_id: *row_id,
-                    cells: cells.iter().map(|(id, value)| (*id, value.clone())).collect(),
+                    cells: cells
+                        .iter()
+                        .map(|(id, value)| (*id, value.clone()))
+                        .collect(),
                 });
             }
         }
@@ -966,10 +969,9 @@ impl EngineApplySink {
                     row_id,
                     cells,
                 },
-                TypedTabletMutation::Delete { row_id } => TabletWriteOperation::Delete {
-                    table_id,
-                    row_id,
-                },
+                TypedTabletMutation::Delete { row_id } => {
+                    TabletWriteOperation::Delete { table_id, row_id }
+                }
             })
             .collect();
         self.apply_tablet_writes(
@@ -1579,10 +1581,7 @@ fn validate_binding_record(binding: &TabletTableBinding) -> Result<(), EngineSin
 
 /// Column-id and type compatibility of a live local table against the binding
 /// schema. Index/constraint sets may grow after bind; column identity is fixed.
-fn validate_bound_user_schema(
-    live: &Schema,
-    expected: &Schema,
-) -> Result<(), EngineSinkError> {
+fn validate_bound_user_schema(live: &Schema, expected: &Schema) -> Result<(), EngineSinkError> {
     if live.columns.len() != expected.columns.len() {
         return Err(MongrelError::Schema(format!(
             "bound tablet user table has {} columns, binding expects {}",
@@ -1622,8 +1621,11 @@ fn build_typed_row(
     row_id: u64,
     cells: Vec<(u16, Value)>,
 ) -> Result<Row, EngineSinkError> {
-    let known: BTreeMap<u16, &ColumnDef> =
-        schema.columns.iter().map(|column| (column.id, column)).collect();
+    let known: BTreeMap<u16, &ColumnDef> = schema
+        .columns
+        .iter()
+        .map(|column| (column.id, column))
+        .collect();
     let mut row = Row::new(RowId(row_id), Epoch(0));
     let mut seen = BTreeSet::new();
     let mut validated_cells = Vec::with_capacity(cells.len());
@@ -3053,10 +3055,12 @@ mod tests {
 
     #[test]
     fn production_init_refuses_opaque_when_legacy_false() {
-        assert!(
-            !OPAQUE_TABLET_KEYSPACE_LEGACY,
-            "production default must refuse opaque __mongreldb_tablet_rows init"
-        );
+        const {
+            assert!(
+                !OPAQUE_TABLET_KEYSPACE_LEGACY,
+                "production default must refuse opaque __mongreldb_tablet_rows init"
+            );
+        }
         let tmp = tempfile::tempdir().unwrap();
         let config = engine_config(tmp.path(), 40);
         let sink = open_engine_sink(&config).unwrap();
@@ -3078,18 +3082,16 @@ mod tests {
         );
 
         // Existing opaque keyspaces remain openable for migration/read.
-        sink.initialize_opaque_tablet_keyspace_for_tests()
-            .unwrap();
+        sink.initialize_opaque_tablet_keyspace_for_tests().unwrap();
         assert!(sink.tablet_keyspace);
         sink.initialize_tablet_keyspace()
             .expect("reopen of existing opaque keyspace must succeed");
-        assert!(
-            sink.database()
-                .unwrap()
-                .catalog_snapshot()
-                .live(TABLET_KEYSPACE_TABLE)
-                .is_some()
-        );
+        assert!(sink
+            .database()
+            .unwrap()
+            .catalog_snapshot()
+            .live(TABLET_KEYSPACE_TABLE)
+            .is_some());
     }
 
     #[test]
@@ -3099,8 +3101,7 @@ mod tests {
         let sink = open_engine_sink(&config).unwrap();
         let mut sink = sink.lock().unwrap();
         // Explicit test API — production initialize_tablet_keyspace is gated off.
-        sink.initialize_opaque_tablet_keyspace_for_tests()
-            .unwrap();
+        sink.initialize_opaque_tablet_keyspace_for_tests().unwrap();
         sink.apply_tablet_data(
             TabletDataCommandRecord::new(TabletDataCommand::Upsert {
                 entries: vec![
@@ -3159,8 +3160,7 @@ mod tests {
         let sink = open_engine_sink(&config).unwrap();
         let mut sink = sink.lock().unwrap();
         // Legacy migration tests create the opaque keyspace via explicit test API.
-        sink.initialize_opaque_tablet_keyspace_for_tests()
-            .unwrap();
+        sink.initialize_opaque_tablet_keyspace_for_tests().unwrap();
         let legacy = serde_json::to_vec(&serde_json::json!({
             "format_version": 1,
             "position": {"term": 2, "index": 9},
@@ -3278,7 +3278,12 @@ mod tests {
         let db = sink.database().unwrap();
         let catalog = db.catalog_snapshot();
         let entry = catalog.live("orders").expect("orders table");
-        let names: Vec<_> = entry.schema.columns.iter().map(|c| c.name.as_str()).collect();
+        let names: Vec<_> = entry
+            .schema
+            .columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
         assert_eq!(names, vec!["id", "name", "score"]);
         assert!(entry
             .schema
@@ -3385,10 +3390,7 @@ mod tests {
                 TabletWriteCommandRecord::new(vec![TabletWriteOperation::Put {
                     table_id: binding.local_table_id,
                     row_id: 5,
-                    cells: vec![
-                        (1, Value::Int64(5)),
-                        (2, Value::Bytes(b"persist".to_vec())),
-                    ],
+                    cells: vec![(1, Value::Int64(5)), (2, Value::Bytes(b"persist".to_vec()))],
                 }]),
                 LogPosition { term: 1, index: 1 },
                 tablet_ts(50),
@@ -3449,11 +3451,7 @@ mod tests {
             }],
         );
         let receipt = group
-            .propose(
-                CommandKind::Catalog,
-                envelope,
-                &ExecutionControl::default(),
-            )
+            .propose(CommandKind::Catalog, envelope, &ExecutionControl::default())
             .await
             .unwrap();
         group
@@ -3470,10 +3468,7 @@ mod tests {
 
         let db = sink.lock().unwrap().database().unwrap();
         let handle = db.table("replicated_orders").unwrap();
-        let visible = handle
-            .lock()
-            .visible_rows(Snapshot::unbounded())
-            .unwrap();
+        let visible = handle.lock().visible_rows(Snapshot::unbounded()).unwrap();
         assert_eq!(visible.len(), 1);
         assert!(visible[0].columns.contains_key(&1));
         assert!(visible[0].columns.contains_key(&2));
@@ -3543,7 +3538,9 @@ mod tests {
         // Opaque split APIs must refuse typed-only tablets.
         let opaque_err = src.tablet_rows().expect_err("opaque path refused");
         assert!(
-            opaque_err.to_string().contains("typed-bound tablet refuses opaque"),
+            opaque_err
+                .to_string()
+                .contains("typed-bound tablet refuses opaque"),
             "unexpected opaque refusal: {opaque_err}"
         );
 
@@ -3552,7 +3549,10 @@ mod tests {
         let snapshot = src
             .export_typed_tablet_snapshot_at_epoch(split_epoch, Some(tablet_ts(100)))
             .unwrap();
-        assert_eq!(snapshot.format_version, TYPED_TABLET_SNAPSHOT_FORMAT_VERSION);
+        assert_eq!(
+            snapshot.format_version,
+            TYPED_TABLET_SNAPSHOT_FORMAT_VERSION
+        );
         assert_eq!(snapshot.binding.logical_table_id, 100);
         assert_eq!(snapshot.binding.schema_version, 2);
         assert_eq!(snapshot.binding.local_table_name, "orders");
@@ -3604,10 +3604,9 @@ mod tests {
         );
         let deltas = src.typed_tablet_deltas_after_epoch(split_epoch).unwrap();
         assert!(
-            deltas.iter().any(|m| matches!(
-                m,
-                TypedTabletMutation::Put { row_id: 1, .. }
-            )),
+            deltas
+                .iter()
+                .any(|m| matches!(m, TypedTabletMutation::Put { row_id: 1, .. })),
             "expected put for row 1: {deltas:?}"
         );
         assert!(
@@ -3617,10 +3616,9 @@ mod tests {
             "expected delete for row 2: {deltas:?}"
         );
         assert!(
-            deltas.iter().any(|m| matches!(
-                m,
-                TypedTabletMutation::Put { row_id: 3, .. }
-            )),
+            deltas
+                .iter()
+                .any(|m| matches!(m, TypedTabletMutation::Put { row_id: 3, .. })),
             "expected put for row 3: {deltas:?}"
         );
 
@@ -3805,7 +3803,9 @@ mod tests {
             .unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("type mismatch") || msg.contains("does not match type") || msg.contains("constraint"),
+            msg.contains("type mismatch")
+                || msg.contains("does not match type")
+                || msg.contains("constraint"),
             "expected type rejection, got: {msg}"
         );
 
@@ -3823,7 +3823,10 @@ mod tests {
             .unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("NULL") || msg.contains("nullable") || msg.contains("constraint") || msg.contains("type mismatch"),
+            msg.contains("NULL")
+                || msg.contains("nullable")
+                || msg.contains("constraint")
+                || msg.contains("type mismatch"),
             "expected NOT NULL rejection, got: {msg}"
         );
 
@@ -3949,7 +3952,11 @@ mod tests {
             })
             .collect();
         ids.sort_unstable();
-        assert_eq!(ids, vec![1, 3], "bitmap eq after typed apply must hit index path");
+        assert_eq!(
+            ids,
+            vec![1, 3],
+            "bitmap eq after typed apply must hit index path"
+        );
     }
 
     // ID: P0.3-X3 Dense ANN works after replicated typed apply.
@@ -4149,7 +4156,11 @@ mod tests {
         let sparse_rows = db
             .query_for_current_principal("hybrid", &sparse_q, Some(&[1, 2, 3]))
             .unwrap();
-        assert_eq!(sparse_rows.len(), 1, "sparse after typed apply: {sparse_rows:?}");
+        assert_eq!(
+            sparse_rows.len(),
+            1,
+            "sparse after typed apply: {sparse_rows:?}"
+        );
         assert!(matches!(
             sparse_rows[0].columns.get(&1),
             Some(Value::Int64(1))
@@ -4407,7 +4418,11 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert_eq!(hits.len(), 1, "local top-k must fill with visible rows: {hits:?}");
+        assert_eq!(
+            hits.len(),
+            1,
+            "local top-k must fill with visible rows: {hits:?}"
+        );
         assert_eq!(
             hits[0].row_id,
             RowId(2),
@@ -4591,10 +4606,8 @@ mod tests {
             schema,
             TabletPartitionBounds::default(),
         );
-        binding.index_generations = BTreeMap::from([
-            ("tag_bm".to_owned(), 4),
-            ("id_bm".to_owned(), 9),
-        ]);
+        binding.index_generations =
+            BTreeMap::from([("tag_bm".to_owned(), 4), ("id_bm".to_owned(), 9)]);
         let binding = src.bind_tablet_user_table(binding).unwrap();
         src.apply_tablet_writes(
             TabletWriteCommandRecord::new(vec![TabletWriteOperation::Put {
@@ -4608,14 +4621,8 @@ mod tests {
         .unwrap();
 
         let snapshot = src.export_typed_tablet_snapshot().unwrap();
-        assert_eq!(
-            snapshot.binding.index_generations.get("tag_bm"),
-            Some(&4)
-        );
-        assert_eq!(
-            snapshot.binding.index_generations.get("id_bm"),
-            Some(&9)
-        );
+        assert_eq!(snapshot.binding.index_generations.get("tag_bm"), Some(&4));
+        assert_eq!(snapshot.binding.index_generations.get("id_bm"), Some(&9));
         let idx_names: Vec<_> = snapshot
             .binding
             .schema

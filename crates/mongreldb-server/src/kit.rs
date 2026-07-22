@@ -806,7 +806,8 @@ pub(crate) fn idempotency_owner(
     authenticated_user: Option<&mongreldb_core::Principal>,
 ) -> std::result::Result<String, Box<Response>> {
     if let Some(principal) = authenticated_user {
-        state.db()
+        state
+            .db()
             .resolve_current_principal(principal)
             .ok_or_else(|| Box::new(kit_core_error(&MongrelError::AuthRequired)))?;
         return Ok(format!(
@@ -816,7 +817,8 @@ pub(crate) fn idempotency_owner(
     }
     if let Some(token) = state.auth_token.as_deref() {
         if state.db().require_auth_enabled()
-            && !state.db()
+            && !state
+                .db()
                 .principal_snapshot()
                 .and_then(|principal| state.db().resolve_current_principal(&principal))
                 .is_some_and(|principal| principal.is_admin)
@@ -2290,7 +2292,8 @@ pub async fn kit_ai_metrics(
     OptionalPrincipal(principal): OptionalPrincipal,
 ) -> Response {
     let principal = request_principal(&state, &principal);
-    if let Err(error) = state.db()
+    if let Err(error) = state
+        .db()
         .require_for(principal.as_ref(), &mongreldb_core::Permission::Admin)
     {
         return kit_core_error(&error);
@@ -2719,7 +2722,8 @@ fn execute_kit_search(
                     Some(&read_context),
                     search_after,
                 )?;
-                state.db()
+                state
+                    .db()
                     .mask_search_hits_for(&req.table, &mut hits, effective_principal)?;
                 Ok(hits)
             },
@@ -2831,7 +2835,8 @@ pub async fn kit_search(
     }
     let principal = request_principal(&state, &principal);
     if req.explain {
-        if let Err(error) = state.db()
+        if let Err(error) = state
+            .db()
             .require_for(principal.as_ref(), &mongreldb_core::Permission::Admin)
         {
             return kit_core_error(&error);
@@ -2968,7 +2973,8 @@ pub async fn kit_query(
         Err(error) => return kit_core_error(&error),
     };
     let schema = handle.lock().schema().clone();
-    let allowed = match state.db()
+    let allowed = match state
+        .db()
         .select_column_ids_for(&req.table, principal.as_ref())
     {
         Ok(allowed) => allowed,
@@ -3062,11 +3068,11 @@ pub async fn kit_query(
     let epoch = cursor
         .map(|cursor| cursor.epoch)
         .unwrap_or_else(|| state.db().visible_epoch().0);
-    let (snapshot, _snapshot_guard) = match state.db().snapshot_at_owned(mongreldb_core::Epoch(epoch))
-    {
-        Ok(snapshot) => snapshot,
-        Err(error) => return kit_core_error(&error),
-    };
+    let (snapshot, _snapshot_guard) =
+        match state.db().snapshot_at_owned(mongreldb_core::Epoch(epoch)) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return kit_core_error(&error),
+        };
     let fetch_limit = limit
         .saturating_add(1)
         .min(mongreldb_core::query::MAX_FINAL_LIMIT);
@@ -3104,7 +3110,8 @@ pub async fn kit_query(
                 after_row_id,
                 query_time_nanos,
             )?;
-            state.db()
+            state
+                .db()
                 .secure_rows_for(&req.table, rows, effective_principal)
         },
     ) {
@@ -3331,7 +3338,8 @@ fn preflight_kit_txn_once(
                     let cells = parse_cells(cells, &schema)
                         .map_err(|message| Box::new(op_error_msg(index, "BAD_REQUEST", message)))?;
                     let columns = cells.iter().map(|(column, _)| *column).collect::<Vec<_>>();
-                    state.db()
+                    state
+                        .db()
                         .require_columns_for(
                             table,
                             mongreldb_core::ColumnOperation::Insert,
@@ -3352,7 +3360,8 @@ fn preflight_kit_txn_once(
                     let cells = parse_cells(cells, &schema)
                         .map_err(|message| Box::new(op_error_msg(index, "BAD_REQUEST", message)))?;
                     let columns = cells.iter().map(|(column, _)| *column).collect::<Vec<_>>();
-                    state.db()
+                    state
+                        .db()
                         .require_columns_for(
                             table,
                             mongreldb_core::ColumnOperation::Insert,
@@ -3369,7 +3378,8 @@ fn preflight_kit_txn_once(
                             .iter()
                             .map(|(column, _)| *column)
                             .collect::<Vec<_>>();
-                        state.db()
+                        state
+                            .db()
                             .require_columns_for(
                                 table,
                                 mongreldb_core::ColumnOperation::Update,
@@ -3382,7 +3392,8 @@ fn preflight_kit_txn_once(
                         require_returning_columns(state, table, &schema, principal)?;
                     }
                 }
-                KitOp::Delete { .. } => state.db()
+                KitOp::Delete { .. } => state
+                    .db()
                     .require_for(
                         principal,
                         &mongreldb_core::Permission::Delete {
@@ -3393,7 +3404,8 @@ fn preflight_kit_txn_once(
                 KitOp::DeleteByPk { pk, .. } => {
                     pk_value(pk, &schema)
                         .map_err(|message| Box::new(op_error_msg(index, "BAD_REQUEST", message)))?;
-                    state.db()
+                    state
+                        .db()
                         .require_for(
                             principal,
                             &mongreldb_core::Permission::Delete {
@@ -3403,7 +3415,8 @@ fn preflight_kit_txn_once(
                         .map_err(|error| Box::new(kit_core_error(&error)))?;
                 }
             }
-            if state.db().table_identity(table).ok() == Some((binding.table_id, binding.schema_id)) {
+            if state.db().table_identity(table).ok() == Some((binding.table_id, binding.schema_id))
+            {
                 stable = Some(binding);
                 break;
             }
@@ -3428,7 +3441,8 @@ fn require_returning_columns(
         .iter()
         .map(|column| column.id)
         .collect::<Vec<_>>();
-    state.db()
+    state
+        .db()
         .require_columns_for(
             table,
             mongreldb_core::ColumnOperation::Select,

@@ -443,4 +443,3 @@ fn replication_applies_committed_vectors_without_provider() {
     let row = follower.rows_for("documents", None).unwrap().remove(0);
     assert_generated(row.columns.get(&3).unwrap(), &[3.0, 312.0], "cat");
 }
-

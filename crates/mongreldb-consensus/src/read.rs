@@ -348,13 +348,9 @@ mod tests {
         ));
 
         // Replica applied_hlc far behind required freshness (100 ms lag vs 50 ms bound).
-        let lagging = evaluate_bounded_staleness(
-            &watermark(5, Some(999_900_000)),
-            Some(20),
-            now,
-            50,
-        )
-        .unwrap_err();
+        let lagging =
+            evaluate_bounded_staleness(&watermark(5, Some(999_900_000)), Some(20), now, 50)
+                .unwrap_err();
         match lagging {
             ReadConsistencyError::StalenessExceeded { max_lag_ms, lag_ms } => {
                 assert_eq!(max_lag_ms, 50);

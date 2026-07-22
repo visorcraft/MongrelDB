@@ -273,13 +273,8 @@ impl TabletDatabaseProvider for RuntimeTabletDatabases {
 struct RuntimeAuthorizationResolver;
 
 impl FragmentAuthorizationResolver for RuntimeAuthorizationResolver {
-    fn resolve(
-        &self,
-        database: &Database,
-        context: &[u8],
-    ) -> DistributedResult<Option<Principal>> {
-        resolve_worker_principal(database, context)
-            .map_err(|error| DistributedError::RemoteProtocol(error))
+    fn resolve(&self, database: &Database, context: &[u8]) -> DistributedResult<Option<Principal>> {
+        resolve_worker_principal(database, context).map_err(DistributedError::RemoteProtocol)
     }
 }
 

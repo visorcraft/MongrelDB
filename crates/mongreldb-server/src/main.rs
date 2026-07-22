@@ -25,8 +25,8 @@ use mongreldb_server::remote_embedding::{
 };
 use mongreldb_server::vault_kms::{VaultTransitConfig, VaultTransitKeyManagementProvider};
 use mongreldb_server::{
-    build_app_with_storage, cluster_admin, cluster_runtime, fragment_rpc,
-    spawn_auto_compactor, spawn_session_reaper, ServerStorageRuntime, SessionStore,
+    build_app_with_storage, cluster_admin, cluster_runtime, fragment_rpc, spawn_auto_compactor,
+    spawn_session_reaper, ServerStorageRuntime, SessionStore,
 };
 use mongreldb_server::{native::NativeExternalAuth, oidc::HttpsJwksProvider};
 use mongreldb_types::ids::{ClusterId, NodeId};
@@ -1036,9 +1036,7 @@ async fn run_server(args: Args, pidfile: String, standalone_db: Option<Arc<Datab
                         std::process::exit(1);
                     }
                 };
-            eprintln!(
-                "cluster workers installed: fragment service + AI service on internal RPC"
-            );
+            eprintln!("cluster workers installed: fragment service + AI service on internal RPC");
             ServerStorageRuntime::cluster_with_workers(handle, fragment_endpoint, ai_endpoint)
         }
         None => {
@@ -1094,10 +1092,7 @@ async fn run_server(args: Args, pidfile: String, standalone_db: Option<Arc<Datab
         };
         let read_pem = |path: &std::path::Path| {
             std::fs::read(path).unwrap_or_else(|error| {
-                eprintln!(
-                    "failed to read native TLS file {}: {error}",
-                    path.display()
-                );
+                eprintln!("failed to read native TLS file {}: {error}", path.display());
                 std::process::exit(1);
             })
         };

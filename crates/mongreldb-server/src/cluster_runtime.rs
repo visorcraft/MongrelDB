@@ -804,13 +804,15 @@ mod tests {
     fn p13_x2_production_gate_refuses_plaintext_when_disallowed() {
         let err = admit_plaintext_cluster_transport(true, false).expect_err("must refuse");
         assert!(
-            err.to_string().contains("plaintext cluster transport is refused"),
+            err.to_string()
+                .contains("plaintext cluster transport is refused"),
             "{err}"
         );
         // Allowed escape hatch (test builds / dangerous-test-transport).
         admit_plaintext_cluster_transport(true, true).expect("allowed when admitted");
         // Production mTLS path does not request plaintext.
-        admit_plaintext_cluster_transport(false, false).expect("mTLS path never needs escape hatch");
+        admit_plaintext_cluster_transport(false, false)
+            .expect("mTLS path never needs escape hatch");
     }
 
     /// P1.3-X2: production start path (`plaintext_test: false`) requires usable mTLS.

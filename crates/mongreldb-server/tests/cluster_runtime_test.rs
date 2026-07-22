@@ -1,10 +1,11 @@
 //! Server-hosted NodeRuntime product path (Stage 2/3):
 //! - After `cluster init`, start the app with a live runtime under plaintext
 //!   test mode and assert status / SHOW CLUSTER report a live runtime.
-//! - TRANSFER LEADER / SPLIT TABLET without a hosted tablet return structured
-//!   errors (not silent `"accepted"`).
-//! - Standalone mode still fails closed with `"cluster runtime not running"`.
-//! - TRANSFER LEADER against a real single-replica tablet succeeds.
+//! - TRANSFER LEADER / SPLIT TABLET accept immediately as durable ops jobs
+//!   (P1.6: HTTP returns `status: accepted` + `job_id`, not hold-to-complete).
+//! - Standalone mode still fails closed for MERGE / MOVE REPLICA when the
+//!   cluster runtime is not running.
+//! - TRANSFER LEADER against a real single-replica tablet accepts an ops job.
 
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
@@ -19,9 +20,7 @@ use mongreldb_cluster::tablet::{
 use mongreldb_core::Database;
 use mongreldb_log::commit_log::ExecutionControl;
 use mongreldb_server::cluster_runtime::{ClusterRuntimeHandle, ClusterRuntimeOptions};
-use mongreldb_server::{
-    build_app, build_app_full, build_app_with_storage, ServerStorageRuntime,
-};
+use mongreldb_server::{build_app, build_app_full, build_app_with_storage, ServerStorageRuntime};
 use mongreldb_types::hlc::HlcTimestamp;
 use mongreldb_types::ids::{
     DatabaseId, MetadataVersion, NodeId, RaftGroupId, SchemaVersion, TableId, TabletId,
@@ -115,7 +114,7 @@ fn command_id(seq: u8) -> [u8; 16] {
 }
 
 #[tokio::test]
-async fn standalone_transfer_and_split_fail_closed() {
+async fn standalone_transfer_and_split_accept_ops_jobs() {
     let directory = tempdir().unwrap();
     let database =
         Arc::new(Database::create_with_credentials(directory.path(), "admin", "admin-pw").unwrap());
@@ -124,17 +123,25 @@ async fn standalone_transfer_and_split_fail_closed() {
     let tablet = TabletId::from_bytes([0x11; 16]);
     let node = NodeId::from_bytes([0x22; 16]);
 
+    // P1.6: transfer/split accept immediately as durable ops jobs (execution is
+    // separate from the HTTP accept path).
     let (status, body) =
         sql_json(&app, admin, &format!("TRANSFER LEADER {tablet} TO {node}")).await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    assert_eq!(body["status"], "error");
-    assert_eq!(body["error"], "cluster runtime not running");
-    assert_ne!(body["status"], "accepted");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "accepted");
+    assert_eq!(body["command"], "TRANSFER LEADER");
+    assert_eq!(body["kind"], "transfer_leader");
+    assert_eq!(body["state"], "pending");
+    assert!(body["job_id"].as_str().unwrap().contains("transfer_leader"));
 
     let (status, body) = sql_json(&app, admin, &format!("SPLIT TABLET {tablet}")).await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    assert_eq!(body["error"], "cluster runtime not running");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "accepted");
+    assert_eq!(body["command"], "SPLIT TABLET");
+    assert_eq!(body["kind"], "split_tablet");
+    assert!(body["job_id"].as_str().unwrap().contains("split_tablet"));
 
+    // MERGE still requires a live runtime (synchronous product path).
     let (status, body) = sql_json(&app, admin, &format!("MERGE TABLETS {tablet} {tablet}")).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert_eq!(body["error"], "cluster runtime not running");
@@ -206,33 +213,24 @@ async fn live_runtime_status_and_missing_tablet_ops() {
     );
 
     let missing = TabletId::from_bytes([0xCD; 16]);
+    // P1.6: missing-tablet transfer/split still accept as ops jobs; execution
+    // fails later when the worker runs (HTTP accept is not validation).
     let (code, body) = sql_json(
         &app,
         admin,
         &format!("TRANSFER LEADER {missing} TO {}", identity.node_id),
     )
     .await;
-    assert_eq!(code, StatusCode::CONFLICT, "{body}");
-    assert_eq!(body["status"], "error");
-    assert!(
-        body["error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("hosts no live tablet"),
-        "{body}"
-    );
-    assert_ne!(body["status"], "accepted");
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "accepted");
+    assert_eq!(body["kind"], "transfer_leader");
+    assert!(body["job_id"].is_string(), "{body}");
 
     let (code, body) = sql_json(&app, admin, &format!("SPLIT TABLET {missing}")).await;
-    assert_eq!(code, StatusCode::CONFLICT, "{body}");
-    assert_eq!(body["status"], "error");
-    assert!(
-        body["error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("hosts no live tablet"),
-        "{body}"
-    );
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "accepted");
+    assert_eq!(body["kind"], "split_tablet");
+    assert!(body["job_id"].is_string(), "{body}");
 
     let (code, body) = sql_json(
         &app,
@@ -289,7 +287,7 @@ async fn transfer_leader_on_live_single_replica_tablet() {
     );
     let admin = "Bearer cluster-token";
 
-    // Transfer to self is a documented no-op success on a single-voter group.
+    // P1.6: transfer accepts immediately as a durable ops job (worker executes later).
     let (code, body) = sql_json(
         &app,
         admin,
@@ -297,8 +295,11 @@ async fn transfer_leader_on_live_single_replica_tablet() {
     )
     .await;
     assert_eq!(code, StatusCode::OK, "{body}");
-    assert_eq!(body["status"], "ok");
+    assert_eq!(body["status"], "accepted");
     assert_eq!(body["command"], "TRANSFER LEADER");
+    assert_eq!(body["kind"], "transfer_leader");
+    assert_eq!(body["state"], "pending");
+    assert!(body["job_id"].as_str().unwrap().contains("transfer_leader"));
 
     control.shutdown().await;
 }

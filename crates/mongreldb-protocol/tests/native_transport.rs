@@ -350,8 +350,7 @@ async fn native_mtls_accepts_client_certificate() {
     client_params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "client");
-    client_params.extended_key_usages =
-        vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+    client_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
     let client_cert = client_params
         .signed_by(&client_key, &ca_cert, &ca_key)
         .unwrap();

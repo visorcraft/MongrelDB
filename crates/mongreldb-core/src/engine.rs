@@ -597,7 +597,7 @@ pub(crate) enum SecondaryIndexArtifact {
     Bitmap(u16, BitmapIndex),
     LearnedRange(u16, ColumnLearnedRange),
     Fm(u16, Box<FmIndex>),
-    Ann(u16, AnnIndex),
+    Ann(u16, Box<AnnIndex>),
     Sparse(u16, SparseIndex),
     MinHash(u16, MinHashIndex),
 }
@@ -1626,7 +1626,7 @@ impl Table {
                 .map(|index| SecondaryIndexArtifact::Bitmap(column_id, index)),
             IndexKind::Ann => ann
                 .remove(&column_id)
-                .map(|index| SecondaryIndexArtifact::Ann(column_id, index)),
+                .map(|index| SecondaryIndexArtifact::Ann(column_id, Box::new(index))),
             IndexKind::FmIndex => fm
                 .remove(&column_id)
                 .map(|index| SecondaryIndexArtifact::Fm(column_id, Box::new(index))),
@@ -3269,7 +3269,12 @@ impl Table {
                         if probe {
                             if let Some(old_rid) = self.hot.get(&key) {
                                 if old_rid != r.row_id {
-                                    self.tombstone_row(old_rid, r.committed_epoch, r.commit_ts, true);
+                                    self.tombstone_row(
+                                        old_rid,
+                                        r.committed_epoch,
+                                        r.commit_ts,
+                                        true,
+                                    );
                                 }
                             }
                         }
@@ -5698,16 +5703,18 @@ impl Table {
             let mem = self.memtable.get_version_at(row_id, snapshot);
             let mutable = self.mutable_run.get_version_at(row_id, snapshot);
             let overlay = match (mem, mutable) {
-                (Some(left), Some(right)) => Some(if Snapshot::version_is_newer(
-                    left.1.committed_epoch,
-                    left.1.commit_ts,
-                    right.1.committed_epoch,
-                    right.1.commit_ts,
-                ) {
-                    left
-                } else {
-                    right
-                }),
+                (Some(left), Some(right)) => Some(
+                    if Snapshot::version_is_newer(
+                        left.1.committed_epoch,
+                        left.1.commit_ts,
+                        right.1.committed_epoch,
+                        right.1.commit_ts,
+                    ) {
+                        left
+                    } else {
+                        right
+                    },
+                ),
                 (Some(value), None) | (None, Some(value)) => Some(value),
                 (None, None) => None,
             };
@@ -7027,16 +7034,18 @@ impl Table {
             let mem = self.memtable.get_version_at(row_id, snapshot);
             let mutable = self.mutable_run.get_version_at(row_id, snapshot);
             let overlay = match (mem, mutable) {
-                (Some((_, a)), Some((_, b))) => Some(if Snapshot::version_is_newer(
-                    a.committed_epoch,
-                    a.commit_ts,
-                    b.committed_epoch,
-                    b.commit_ts,
-                ) {
-                    a
-                } else {
-                    b
-                }),
+                (Some((_, a)), Some((_, b))) => Some(
+                    if Snapshot::version_is_newer(
+                        a.committed_epoch,
+                        a.commit_ts,
+                        b.committed_epoch,
+                        b.commit_ts,
+                    ) {
+                        a
+                    } else {
+                        b
+                    },
+                ),
                 (Some((_, value)), None) | (None, Some((_, value))) => Some(value),
                 (None, None) => None,
             };
@@ -7139,16 +7148,18 @@ impl Table {
                 let mem = self.memtable.get_version_at(RowId(rid), snapshot);
                 let mrun = self.mutable_run.get_version_at(RowId(rid), snapshot);
                 let newest = match (mem, mrun) {
-                    (Some((_, mr)), Some((_, rr))) => Some(if Snapshot::version_is_newer(
-                        mr.committed_epoch,
-                        mr.commit_ts,
-                        rr.committed_epoch,
-                        rr.commit_ts,
-                    ) {
-                        mr
-                    } else {
-                        rr
-                    }),
+                    (Some((_, mr)), Some((_, rr))) => Some(
+                        if Snapshot::version_is_newer(
+                            mr.committed_epoch,
+                            mr.commit_ts,
+                            rr.committed_epoch,
+                            rr.commit_ts,
+                        ) {
+                            mr
+                        } else {
+                            rr
+                        },
+                    ),
                     (Some((_, mr)), None) => Some(mr),
                     (None, Some((_, rr))) => Some(rr),
                     (None, None) => None,
@@ -8137,8 +8148,14 @@ impl Table {
         crate::epoch::GcFloor {
             transaction_snapshot: project(transaction),
             history_retention: project(history),
-            backup_pitr: project(self.pins.oldest_for(crate::retention::PinSource::BackupPitr)),
-            replication: project(self.pins.oldest_for(crate::retention::PinSource::Replication)),
+            backup_pitr: project(
+                self.pins
+                    .oldest_for(crate::retention::PinSource::BackupPitr),
+            ),
+            replication: project(
+                self.pins
+                    .oldest_for(crate::retention::PinSource::Replication),
+            ),
             read_generation: project(
                 self.pins
                     .oldest_for(crate::retention::PinSource::ReadGeneration),
@@ -10779,7 +10796,7 @@ impl Table {
                 self.fm.insert(column_id, *index);
             }
             SecondaryIndexArtifact::Ann(column_id, index) => {
-                self.ann.insert(column_id, index);
+                self.ann.insert(column_id, *index);
             }
             SecondaryIndexArtifact::Sparse(column_id, index) => {
                 self.sparse.insert(column_id, index);
@@ -12115,8 +12132,7 @@ fn index_into(
                         if !crate::embedding_jobs::embedding_status_is_ann_eligible(meta.status) {
                             continue;
                         }
-                        if a
-                            .bind_or_check_semantic_identity(&meta.semantic_identity)
+                        if a.bind_or_check_semantic_identity(&meta.semantic_identity)
                             .is_err()
                         {
                             continue;
@@ -12187,8 +12203,7 @@ fn index_into_single(
                     if !crate::embedding_jobs::embedding_status_is_ann_eligible(meta.status) {
                         return;
                     }
-                    if a
-                        .bind_or_check_semantic_identity(&meta.semantic_identity)
+                    if a.bind_or_check_semantic_identity(&meta.semantic_identity)
                         .is_err()
                     {
                         return;

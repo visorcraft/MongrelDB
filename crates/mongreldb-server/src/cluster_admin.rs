@@ -122,9 +122,10 @@ fn accept_ops_job(
         .get("metadata_version")
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
-    let result = state.ops_jobs.lock().map(|mut store| {
-        store.submit_with(kind, params, idempotency_key, metadata_version)
-    });
+    let result = state
+        .ops_jobs
+        .lock()
+        .map(|mut store| store.submit_with(kind, params, idempotency_key, metadata_version));
     match result {
         Ok(Ok(job)) => {
             state.audit.record(
@@ -398,14 +399,14 @@ pub(crate) async fn remove(
 ///
 /// Returns `None` when the text is ordinary SQL (caller falls through).
 /// Returns `Some(response)` for recognised admin commands. SHOW helpers are
-/// available without requiring a fully-booted tablet runtime. Mutating
-/// commands that need live groups (`TRANSFER LEADER`, `SPLIT TABLET`,
-/// `MERGE TABLETS`) fail closed with `"cluster runtime not running"` when
-/// no [`crate::cluster_runtime::ClusterRuntimeHandle`] is configured, and
-/// drive the live runtime when it is. `MOVE REPLICA` returns a clear
-/// not-yet-live error while a runtime is present (no direct placement API
-/// on the product path yet) and the same fail-closed error when absent.
-/// `ALTER NODE DRAIN` reuses the existing bootstrap path.
+/// available without requiring a fully-booted tablet runtime. Long ops
+/// (`TRANSFER LEADER`, `SPLIT TABLET`, backup/restore) accept immediately as
+/// durable ops jobs (P1.6). `MERGE TABLETS` still requires a live
+/// [`crate::cluster_runtime::ClusterRuntimeHandle`] and fails closed when
+/// none is configured. `MOVE REPLICA` returns a clear not-yet-live error
+/// while a runtime is present (no direct placement API on the product path
+/// yet) and the same fail-closed error when absent. `ALTER NODE DRAIN`
+/// reuses the existing bootstrap path.
 pub(crate) async fn try_admin_sql(
     state: &AppState,
     principal: &Option<mongreldb_core::Principal>,
@@ -591,7 +592,8 @@ pub(crate) async fn try_admin_sql(
             .into_response()
         }
         AdminCommand::ShowJobs => {
-            let engine_jobs: Vec<Value> = state.db()
+            let engine_jobs: Vec<Value> = state
+                .db()
                 .job_registry()
                 .list()
                 .into_iter()
@@ -656,12 +658,8 @@ pub(crate) async fn try_admin_sql(
                         process_rss_bytes: crate::admission::process_rss_bytes(),
                     },
                 );
-                let actions = crate::admission::refresh_pressure(
-                    &mut gov,
-                    &inputs,
-                    &state.scheduler,
-                    db_gov,
-                );
+                let actions =
+                    crate::admission::refresh_pressure(&mut gov, &inputs, &state.scheduler, db_gov);
                 let pressure = state.scheduler.pressure().snapshot();
                 json!({
                     "tablet_reserved_bytes": gov.tablet_reserved_bytes(),
@@ -788,8 +786,15 @@ pub(crate) async fn try_admin_sql(
             let mut params = std::collections::BTreeMap::new();
             params.insert("tablet_id".into(), tablet_id.to_string());
             params.insert("to".into(), to.to_string());
-            accept_ops_job(state, &owner, "TRANSFER LEADER", mongreldb_core::OpsJobKind::TransferLeader, params, None)
-        },
+            accept_ops_job(
+                state,
+                &owner,
+                "TRANSFER LEADER",
+                mongreldb_core::OpsJobKind::TransferLeader,
+                params,
+                None,
+            )
+        }
         AdminCommand::MoveReplica {
             tablet_id,
             from,
@@ -835,7 +840,7 @@ pub(crate) async fn try_admin_sql(
                 params,
                 None,
             )
-        },
+        }
         AdminCommand::MergeTablets { left, right } => match state.cluster_runtime() {
             None => runtime_not_running_response(
                 "MERGE TABLETS",
@@ -910,10 +915,11 @@ pub(crate) async fn try_admin_sql(
             if let Some(dest) = &destination {
                 params.insert("destination".into(), dest.clone());
             }
-            let job = state
-                .ops_jobs
-                .lock()
-                .ok().and_then(|mut store| store.submit(mongreldb_core::OpsJobKind::Backup, params).ok());
+            let job = state.ops_jobs.lock().ok().and_then(|mut store| {
+                store
+                    .submit(mongreldb_core::OpsJobKind::Backup, params)
+                    .ok()
+            });
             // Do not fire-and-forget HierarchicalScheduler::submit here: orphan
             // Backup work items steal fairness slots until a later poll/complete
             // (review finding). Ops store owns the job lifecycle.
@@ -942,7 +948,9 @@ pub(crate) async fn try_admin_sql(
             params.insert("source".into(), source.clone());
             params.insert("disaster_recovery".into(), disaster_recovery.to_string());
             let job = state.ops_jobs.lock().ok().and_then(|mut store| {
-                store.submit(mongreldb_core::OpsJobKind::Restore, params).ok()
+                store
+                    .submit(mongreldb_core::OpsJobKind::Restore, params)
+                    .ok()
             });
 
             // Live plan from a published backup when the path exists; otherwise

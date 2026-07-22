@@ -314,7 +314,12 @@ impl Table {
 
 /// Compare two versions for recency: HLC when both stamped, else local epoch.
 fn cmp_version_order(a: &Row, b: &Row) -> std::cmp::Ordering {
-    if Snapshot::version_is_newer(a.committed_epoch, a.commit_ts, b.committed_epoch, b.commit_ts) {
+    if Snapshot::version_is_newer(
+        a.committed_epoch,
+        a.commit_ts,
+        b.committed_epoch,
+        b.commit_ts,
+    ) {
         std::cmp::Ordering::Greater
     } else if Snapshot::version_is_newer(
         b.committed_epoch,
@@ -625,7 +630,10 @@ mod tests {
         let early = stamped(1, 99, hlc(100), 1);
         let late = stamped(1, 1, hlc(200), 2);
         assert_eq!(cmp_version_order(&early, &late), std::cmp::Ordering::Less);
-        assert_eq!(cmp_version_order(&late, &early), std::cmp::Ordering::Greater);
+        assert_eq!(
+            cmp_version_order(&late, &early),
+            std::cmp::Ordering::Greater
+        );
         // Unstamped falls back to epoch.
         let a = crate::memtable::Row::new(crate::rowid::RowId(1), Epoch(1));
         let b = crate::memtable::Row::new(crate::rowid::RowId(1), Epoch(3));

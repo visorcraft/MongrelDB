@@ -21,89 +21,23 @@ use std::collections::{BTreeMap, BTreeSet};
 /// `scripts/generate-certification-manifest.py::MANDATORY_ARCHITECTURE_TASKS`.
 pub const MANDATORY_ARCHITECTURE_TASK_IDS: &[&str] = &[
     // Stage 0
-    "FND-001",
-    "FND-002",
-    "FND-003",
-    "FND-004",
-    "FND-005",
-    "FND-006",
-    "FND-007",
+    "FND-001", "FND-002", "FND-003", "FND-004", "FND-005", "FND-006", "FND-007",
     // Stage 1
-    "S1A-001",
-    "S1A-002",
-    "S1A-003",
-    "S1A-004",
-    "S1B-001",
-    "S1B-002",
-    "S1B-003",
-    "S1B-004",
-    "S1B-005",
-    "S1C-001",
-    "S1C-002",
-    "S1C-003",
-    "S1C-004",
-    "S1D-001",
-    "S1D-002",
-    "S1D-003",
-    "S1D-004",
-    "S1D-005",
-    "S1D-006",
-    "S1D-007",
-    "S1E-001",
-    "S1E-002",
-    "S1E-003",
-    "S1E-004",
-    "S1F-001",
-    "S1F-002",
-    "S1F-003",
-    "S1G",
-    // Stage 2
-    "S2A-001",
-    "S2A-002",
-    "S2B-001",
-    "S2B-002",
-    "S2B-003",
-    "S2B-004",
-    "S2C",
-    "S2D",
-    "S2E",
-    "S2F",
-    "S2G",
-    "S2H",
-    // Stage 3
-    "S3A",
-    "S3B",
-    "S3C",
-    "S3D",
-    "S3E",
-    "S3F",
-    "S3G",
-    "S3H",
-    "S3I",
-    "S3J",
-    "S3K",
-    "S3L",
+    "S1A-001", "S1A-002", "S1A-003", "S1A-004", "S1B-001", "S1B-002", "S1B-003", "S1B-004",
+    "S1B-005", "S1C-001", "S1C-002", "S1C-003", "S1C-004", "S1D-001", "S1D-002", "S1D-003",
+    "S1D-004", "S1D-005", "S1D-006", "S1D-007", "S1E-001", "S1E-002", "S1E-003", "S1E-004",
+    "S1F-001", "S1F-002", "S1F-003", "S1G", // Stage 2
+    "S2A-001", "S2A-002", "S2B-001", "S2B-002", "S2B-003", "S2B-004", "S2C", "S2D", "S2E", "S2F",
+    "S2G", "S2H", // Stage 3
+    "S3A", "S3B", "S3C", "S3D", "S3E", "S3F", "S3G", "S3H", "S3I", "S3J", "S3K", "S3L",
     // Stage 4
-    "S4A",
-    "S4B",
-    "S4C",
-    "S4D",
-    "S4E",
-    "S4F",
-    "S4G",
-    // Stage 5
-    "S5A",
-    "S5B",
-    "S5C",
-    "S5D",
-    "S5E",
-    "S5F",
+    "S4A", "S4B", "S4C", "S4D", "S4E", "S4F", "S4G", // Stage 5
+    "S5A", "S5B", "S5C", "S5D", "S5E", "S5F",
 ];
 
 /// Optional residual R1–R10 aliases from the previous audit matrix.
-pub const RESIDUAL_ALIAS_TASK_IDS: &[&str] = &[
-    "R1", "R2", "R3", "R4", "R5", "R6", "R7", "R8", "R9", "R10",
-];
+pub const RESIDUAL_ALIAS_TASK_IDS: &[&str] =
+    &["R1", "R2", "R3", "R4", "R5", "R6", "R7", "R8", "R9", "R10"];
 
 /// Evidence classes that may justify a Qualified promotion (audit §12 / P0.9-T3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -438,11 +372,23 @@ mod tests {
             covered += stage.task_ids().len();
         }
         assert_eq!(covered, MANDATORY_ARCHITECTURE_TASK_IDS.len());
-        assert_eq!(ArchitectureStage::Stage0Foundations.task_ids()[0], "FND-001");
-        assert_eq!(ArchitectureStage::Stage0Foundations.task_ids().last(), Some(&"FND-007"));
+        assert_eq!(
+            ArchitectureStage::Stage0Foundations.task_ids()[0],
+            "FND-001"
+        );
+        assert_eq!(
+            ArchitectureStage::Stage0Foundations.task_ids().last(),
+            Some(&"FND-007")
+        );
         assert_eq!(ArchitectureStage::Stage1SingleNode.task_ids()[0], "S1A-001");
-        assert_eq!(ArchitectureStage::Stage1SingleNode.task_ids().last(), Some(&"S1G"));
-        assert_eq!(ArchitectureStage::Stage5AdaptersOps.task_ids().last(), Some(&"S5F"));
+        assert_eq!(
+            ArchitectureStage::Stage1SingleNode.task_ids().last(),
+            Some(&"S1G")
+        );
+        assert_eq!(
+            ArchitectureStage::Stage5AdaptersOps.task_ids().last(),
+            Some(&"S5F")
+        );
     }
 
     #[test]
@@ -496,8 +442,7 @@ mod tests {
         let mut no_evidence = stage_manifest(ArchitectureStatus::Integrated);
         no_evidence.architecture_tasks[0].status = ArchitectureStatus::Qualified;
         no_evidence.architecture_tasks[0].evidence.clear();
-        no_evidence.architecture_tasks[0].evidence_classes =
-            vec![EvidenceClass::SourceIntegration];
+        no_evidence.architecture_tasks[0].evidence_classes = vec![EvidenceClass::SourceIntegration];
         assert!(no_evidence
             .validate("abc", "def")
             .unwrap_err()
@@ -516,8 +461,7 @@ mod tests {
     #[test]
     fn validation_rejects_integrated_with_evidence_classes() {
         let mut manifest = stage_manifest(ArchitectureStatus::Integrated);
-        manifest.architecture_tasks[0].evidence_classes =
-            vec![EvidenceClass::SourceIntegration];
+        manifest.architecture_tasks[0].evidence_classes = vec![EvidenceClass::SourceIntegration];
         assert!(manifest
             .validate("abc", "def")
             .unwrap_err()
@@ -572,12 +516,14 @@ mod tests {
         unknown_evidence.architecture_tasks[0].evidence = vec!["missing".into()];
         assert!(unknown_evidence.validate("abc", "def").is_err());
         let mut unknown_task = stage_manifest(ArchitectureStatus::Integrated);
-        unknown_task.architecture_tasks.push(ArchitectureQualification {
-            id: "NOT-A-STAGE".into(),
-            status: ArchitectureStatus::Integrated,
-            evidence: Vec::new(),
-            evidence_classes: Vec::new(),
-        });
+        unknown_task
+            .architecture_tasks
+            .push(ArchitectureQualification {
+                id: "NOT-A-STAGE".into(),
+                status: ArchitectureStatus::Integrated,
+                evidence: Vec::new(),
+                evidence_classes: Vec::new(),
+            });
         assert!(unknown_task
             .validate("abc", "def")
             .unwrap_err()

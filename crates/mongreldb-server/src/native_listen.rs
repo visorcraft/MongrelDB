@@ -56,7 +56,9 @@ impl NativeListenInput {
     /// Merge CLI values with environment variables. CLI wins on conflict.
     pub fn from_cli_and_env(mut cli: NativeListenInput) -> Self {
         if cli.listen.is_none() {
-            cli.listen = std::env::var("MONGRELDB_NATIVE_LISTEN").ok().filter(|s| !s.trim().is_empty());
+            cli.listen = std::env::var("MONGRELDB_NATIVE_LISTEN")
+                .ok()
+                .filter(|s| !s.trim().is_empty());
         }
         if cli.native_port.is_none() {
             if let Ok(port) = std::env::var("MONGRELDB_NATIVE_PORT") {
@@ -114,12 +116,10 @@ impl NativeListenInput {
         let has_tls = self.tls_cert.is_some() && self.tls_key.is_some();
         let incomplete_tls = self.tls_cert.is_some() != self.tls_key.is_some();
         if incomplete_tls {
-            return Err(
-                "native TLS requires both certificate and private key \
+            return Err("native TLS requires both certificate and private key \
                  (MONGRELDB_NATIVE_TLS_CERT / MONGRELDB_NATIVE_TLS_KEY, or \
                  --tls-cert / --tls-key)"
-                    .into(),
-            );
+                .into());
         }
 
         if !is_loopback_addr(listen.ip()) && !has_tls {

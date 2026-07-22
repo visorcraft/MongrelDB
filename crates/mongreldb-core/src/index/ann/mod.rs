@@ -250,11 +250,13 @@ impl AnnIndex {
                 Ok(true)
             }
             Some(existing) if existing == identity => Ok(false),
-            Some(existing) => Err(crate::embedding::EmbeddingError::AnnSemanticIdentityMismatch {
-                column_id: 0,
-                expected: existing.fingerprint_sha256(),
-                got: identity.fingerprint_sha256(),
-            }),
+            Some(existing) => Err(
+                crate::embedding::EmbeddingError::AnnSemanticIdentityMismatch {
+                    column_id: 0,
+                    expected: existing.fingerprint_sha256(),
+                    got: identity.fingerprint_sha256(),
+                },
+            ),
         }
     }
 

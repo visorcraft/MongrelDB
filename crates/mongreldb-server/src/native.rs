@@ -114,12 +114,11 @@ impl NativeRuntime {
         query_registry: Arc<SqlQueryRegistry>,
     ) -> Self {
         let groups = mongreldb_core::ResourceGroupRegistry::with_defaults();
-        let memory = mongreldb_core::MemoryGovernor::new(
-            mongreldb_core::GovernorConfig::new(512 * 1024 * 1024),
-        )
+        let memory = mongreldb_core::MemoryGovernor::new(mongreldb_core::GovernorConfig::new(
+            512 * 1024 * 1024,
+        ))
         .expect("default native node memory governor");
-        let node_admission =
-            crate::admission::NodeAdmissionController::new(&groups, memory);
+        let node_admission = crate::admission::NodeAdmissionController::new(&groups, memory);
         let scheduler = node_admission.scheduler().clone();
         Self {
             db,
@@ -876,12 +875,7 @@ impl native::query_service_server::QueryService for NativeRuntime {
         }
         let durable = status
             .as_ref()
-            .map(|status| {
-                proto_durable(
-                    &status.durable_outcome,
-                    status.serialization_outcome,
-                )
-            })
+            .map(|status| proto_durable(&status.durable_outcome, status.serialization_outcome))
             .unwrap_or_default();
         Ok(Response::new(native::ExecuteResponse {
             query_id,

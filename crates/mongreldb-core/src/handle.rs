@@ -392,11 +392,7 @@ impl DatabaseHandle {
     ///
     /// Requires DDL permission (and fails on a read-only handle). Uses the
     /// same product path as SQL `CREATE INDEX` (`Database::create_index`).
-    pub fn create_index(
-        &self,
-        table: &str,
-        definition: crate::schema::IndexDef,
-    ) -> Result<u64> {
+    pub fn create_index(&self, table: &str, definition: crate::schema::IndexDef) -> Result<u64> {
         self.authorize_write("create index")?;
         self.authorize_permission(&crate::auth::Permission::Ddl)?;
         self.database.create_index(table, definition)
@@ -637,11 +633,7 @@ impl<'a> AuthorizedMongrelSession<'a> {
     }
 
     /// Create a secondary index (P1.4-X5).
-    pub fn create_index(
-        &self,
-        table: &str,
-        definition: crate::schema::IndexDef,
-    ) -> Result<u64> {
+    pub fn create_index(&self, table: &str, definition: crate::schema::IndexDef) -> Result<u64> {
         self.handle.create_index(table, definition)
     }
 
@@ -748,9 +740,7 @@ impl<'a> AuthorizedTransaction<'a> {
     ) -> Result<crate::txn::OwnedRow> {
         self.handle.authorize_write("update")?;
         self.handle.resolve_service_authority()?;
-        let mut images = self
-            .txn_mut()?
-            .update_many(table, vec![(row_id, cells)])?;
+        let mut images = self.txn_mut()?.update_many(table, vec![(row_id, cells)])?;
         images
             .pop()
             .ok_or_else(|| MongrelError::NotFound(format!("row {row_id:?} not found for update")))

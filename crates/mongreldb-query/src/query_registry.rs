@@ -2009,10 +2009,7 @@ mod tests {
         assert!(status.durable_outcome.committed);
         assert_eq!(status.durable_outcome.last_commit_epoch, Some(73));
         assert_eq!(status.durable_outcome.committed_statements, 1);
-        assert_eq!(
-            status.serialization_outcome,
-            SerializationOutcome::Failed
-        );
+        assert_eq!(status.serialization_outcome, SerializationOutcome::Failed);
         assert_eq!(
             status.terminal_error.unwrap().code,
             "SERIALIZATION_FAILED_AFTER_COMMIT"

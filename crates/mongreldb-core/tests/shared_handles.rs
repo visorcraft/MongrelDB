@@ -359,10 +359,7 @@ fn p14_full_crud_batch_and_authorized_transaction() {
     let assigned = handle
         .put_batch(
             "items",
-            vec![
-                vec![(1, Value::Int64(2))],
-                vec![(1, Value::Int64(3))],
-            ],
+            vec![vec![(1, Value::Int64(2))], vec![(1, Value::Int64(3))]],
         )
         .unwrap();
     assert_eq!(assigned.len(), 2);
@@ -382,10 +379,7 @@ fn p14_full_crud_batch_and_authorized_transaction() {
         .update("items", row_id, vec![(1, Value::Int64(20))])
         .unwrap();
     assert_eq!(
-        post.columns
-            .iter()
-            .find(|(id, _)| *id == 1)
-            .map(|(_, v)| v),
+        post.columns.iter().find(|(id, _)| *id == 1).map(|(_, v)| v),
         Some(&Value::Int64(20))
     );
     assert!(handle
@@ -559,10 +553,7 @@ fn p14_x6_procedure_and_trigger_via_authorized_session() {
     handle
         .put(
             "users",
-            vec![
-                (1, Value::Int64(1)),
-                (2, Value::Bytes(b"active".to_vec())),
-            ],
+            vec![(1, Value::Int64(1)), (2, Value::Bytes(b"active".to_vec()))],
         )
         .unwrap();
 
@@ -1042,9 +1033,7 @@ fn p01_x6_recreated_token_does_not_revive_old_handle() {
             creation_version: first.creation_version,
         }
     );
-    old_handle
-        .put("items", vec![(1, Value::Int64(1))])
-        .unwrap();
+    old_handle.put("items", vec![(1, Value::Int64(1))]).unwrap();
     admin.revoke_service_principal("recreate").unwrap();
     let second = admin
         .register_service_principal(
@@ -1085,9 +1074,7 @@ fn p01_x6_recreated_token_does_not_revive_old_handle() {
             creation_version: second.creation_version,
         }
     );
-    new_handle
-        .put("items", vec![(1, Value::Int64(3))])
-        .unwrap();
+    new_handle.put("items", vec![(1, Value::Int64(3))]).unwrap();
 }
 
 #[test]
@@ -1287,9 +1274,7 @@ fn p14_session_returns_authorized_mongrel_session() {
         )
         .unwrap();
     let session = admin.session().unwrap();
-    session
-        .put("items", vec![(1, Value::Int64(42))])
-        .unwrap();
+    session.put("items", vec![(1, Value::Int64(42))]).unwrap();
     assert_eq!(session.count("items").unwrap(), 1);
     let mut txn = session.begin().unwrap();
     txn.put("items", vec![(1, Value::Int64(43))]).unwrap();

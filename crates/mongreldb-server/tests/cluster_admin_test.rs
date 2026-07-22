@@ -556,7 +556,10 @@ async fn admin_sql_show_and_backup_restore_use_live_state() {
     assert!(
         job_list.iter().any(|j| {
             j["source"] == "ops"
-                && j["progress"].as_str().map(|p| !p.is_empty()).unwrap_or(false)
+                && j["progress"]
+                    .as_str()
+                    .map(|p| !p.is_empty())
+                    .unwrap_or(false)
         }),
         "ops jobs must expose non-empty progress: {jobs}"
     );

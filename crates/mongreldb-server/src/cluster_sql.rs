@@ -49,6 +49,7 @@ impl GatewayPlanningContext {
     }
 
     /// Pin the control-plane metadata version this plan is valid for.
+    #[allow(dead_code)] // builder for gateway install paths
     pub fn with_metadata_version(mut self, version: MetadataVersion) -> Self {
         self.version = version;
         self
@@ -77,6 +78,7 @@ impl GatewayPlanningContext {
     }
 
     /// True when at least one table layout is registered.
+    #[allow(dead_code)] // used by try_plan_cluster_sql and install gates
     pub fn has_tables(&self) -> bool {
         !self.tablets.is_empty()
     }
@@ -123,6 +125,7 @@ pub async fn plan_public_sql(
 }
 
 /// Plan public SQL with an explicit query id (cancellation / audit correlation).
+#[allow(dead_code)] // cancellation / audit correlation entry
 pub async fn plan_public_sql_with_id(
     sql: &str,
     context: &GatewayPlanningContext,
@@ -132,6 +135,7 @@ pub async fn plan_public_sql_with_id(
 }
 
 /// Lower an already-resolved DataFusion plan (e.g. from a session frontend).
+#[allow(dead_code)] // session frontend entry
 pub fn plan_public_logical(
     plan: &datafusion::logical_expr::LogicalPlan,
     context: &GatewayPlanningContext,
@@ -144,6 +148,7 @@ pub fn plan_public_logical(
 /// Outcome of attempting the cluster SQL gateway path before the fail-closed
 /// standalone refusal.
 #[derive(Debug)]
+#[allow(dead_code)] // gateway pre-check surface
 pub enum ClusterSqlAttempt {
     /// Distributed plan produced successfully (execution may still be pending
     /// fragment routes / workers).
@@ -159,6 +164,7 @@ pub enum ClusterSqlAttempt {
 /// Call this from the public `/sql` cluster path **before** refusing the
 /// standalone data plane. Returns [`ClusterSqlAttempt::NoLayout`] when the
 /// process has no registered cluster tables yet.
+#[allow(dead_code)] // public /sql cluster path pre-check
 pub async fn try_plan_cluster_sql(
     sql: &str,
     context: Option<&GatewayPlanningContext>,
@@ -177,6 +183,7 @@ pub async fn try_plan_cluster_sql(
 
 /// Shared handle stored on the server when operators / tests install planning
 /// layouts for the gateway.
+#[allow(dead_code)] // AppState install hook for planning layouts
 pub type SharedPlanningContext = Arc<std::sync::RwLock<Option<GatewayPlanningContext>>>;
 
 #[cfg(test)]

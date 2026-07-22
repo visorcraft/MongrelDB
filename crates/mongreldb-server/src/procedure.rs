@@ -216,7 +216,8 @@ async fn call_inner(
                         &message,
                     ))
                 })?;
-            match state.db()
+            match state
+                .db()
                 .call_procedure_as_bound(&procedure, args, principal.as_ref())
             {
                 Ok(result) => Ok(json!({
@@ -251,7 +252,8 @@ fn authorized_procedure_revision(
 ) -> Result<(StoredProcedure, u64), Box<Response>> {
     for _ in 0..3 {
         let security_version = state.db().security_version();
-        if let Err(failure) = state.db()
+        if let Err(failure) = state
+            .db()
             .require_for(principal, &mongreldb_core::Permission::All)
         {
             return Err(Box::new(error(
@@ -282,7 +284,8 @@ fn require_ddl(
     state: &AppState,
     principal: &Option<mongreldb_core::Principal>,
 ) -> Result<(), Box<Response>> {
-    state.db()
+    state
+        .db()
         .require_for(
             request_principal(state, principal).as_ref(),
             &mongreldb_core::Permission::Ddl,

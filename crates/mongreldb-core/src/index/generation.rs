@@ -168,6 +168,7 @@ impl Default for IndexGeneration {
 impl IndexGeneration {
     /// Capture one generation from the writer's (freshly sealed) per-family
     /// index maps at the epoch + HLC watermarks (P0.5-T5).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn capture(
         bitmap: &HashMap<u16, BitmapIndex>,
         range: &Arc<HashMap<u16, ColumnLearnedRange>>,

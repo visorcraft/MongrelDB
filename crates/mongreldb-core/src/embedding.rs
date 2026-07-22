@@ -75,7 +75,12 @@ impl EmbeddingProviderRef {
         hasher.finalize().into()
     }
     pub fn versioned_identity_key(&self) -> (&str, &str, &str, &str) {
-        (&self.provider_id, &self.provider_version, &self.model_id, &self.model_version)
+        (
+            &self.provider_id,
+            &self.provider_version,
+            &self.model_id,
+            &self.model_version,
+        )
     }
 }
 
@@ -214,9 +219,18 @@ pub enum EmbeddingError {
     #[error("embedding model version mismatch: expected {expected:?}, got {got:?}")]
     ModelVersionMismatch { expected: String, got: String },
     #[error("embedding provider {provider:?} replacement under versioned identity (provider_version={provider_version:?}, model_id={model_id:?}, model_version={model_version:?}) changed cryptographic semantic fingerprints; bump provider/model version for a new semantic space")]
-    SemanticIdentityImmutable { provider: String, provider_version: String, model_id: String, model_version: String },
+    SemanticIdentityImmutable {
+        provider: String,
+        provider_version: String,
+        model_id: String,
+        model_version: String,
+    },
     #[error("ANN generation semantic identity mismatch for column {column_id}: expected fingerprint {expected:x?}, got {got:x?}")]
-    AnnSemanticIdentityMismatch { column_id: u16, expected: [u8; 32], got: [u8; 32] },
+    AnnSemanticIdentityMismatch {
+        column_id: u16,
+        expected: [u8; 32],
+        got: [u8; 32],
+    },
     #[error("embedding output count mismatch: expected {expected}, got {got}")]
     OutputCountMismatch { expected: usize, got: usize },
     #[error("embedding dimension mismatch: expected {expected}, got {got}")]
@@ -300,7 +314,9 @@ pub trait EmbeddingProvider: Send + Sync {
     fn dimension(&self) -> u32;
     fn normalization(&self) -> EmbeddingNormalization;
     fn preprocessing_version(&self) -> &str;
-    fn provider_version(&self) -> &str { "1" }
+    fn provider_version(&self) -> &str {
+        "1"
+    }
     fn model_artifact_sha256(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(b"model-artifact:");
@@ -506,11 +522,22 @@ impl EmbeddingProviderRegistry {
             .get(provider_id)
             .map(|entry| Arc::clone(&entry.provider))
     }
-    pub fn get_with_generation(&self, provider_id: &str) -> Option<(u64, Arc<dyn EmbeddingProvider>)> {
-        self.inner.read().unwrap_or_else(|e| e.into_inner()).get(provider_id).map(|e| (e.generation, Arc::clone(&e.provider)))
+    pub fn get_with_generation(
+        &self,
+        provider_id: &str,
+    ) -> Option<(u64, Arc<dyn EmbeddingProvider>)> {
+        self.inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(provider_id)
+            .map(|e| (e.generation, Arc::clone(&e.provider)))
     }
     pub fn generation(&self, provider_id: &str) -> Option<u64> {
-        self.inner.read().unwrap_or_else(|e| e.into_inner()).get(provider_id).map(|e| e.generation)
+        self.inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(provider_id)
+            .map(|e| e.generation)
     }
     pub fn list_ids(&self) -> Vec<String> {
         self.inner
@@ -533,21 +560,36 @@ impl EmbeddingProviderRegistry {
             semantic_identity: entry.provider.semantic_identity(),
         })
     }
-    pub fn resolve(&self, source: &EmbeddingSource) -> Result<Arc<dyn EmbeddingProvider>, EmbeddingError> {
+    pub fn resolve(
+        &self,
+        source: &EmbeddingSource,
+    ) -> Result<Arc<dyn EmbeddingProvider>, EmbeddingError> {
         Ok(self.resolve_with_generation(source)?.1)
     }
-    pub fn resolve_with_generation(&self, source: &EmbeddingSource) -> Result<(u64, Arc<dyn EmbeddingProvider>), EmbeddingError> {
-        let provider_id = source.provider_id().ok_or(EmbeddingError::SuppliedByApplication)?;
-        self.get_with_generation(provider_id).ok_or_else(|| EmbeddingError::ProviderNotFound(provider_id.to_owned()))
+    pub fn resolve_with_generation(
+        &self,
+        source: &EmbeddingSource,
+    ) -> Result<(u64, Arc<dyn EmbeddingProvider>), EmbeddingError> {
+        let provider_id = source
+            .provider_id()
+            .ok_or(EmbeddingError::SuppliedByApplication)?;
+        self.get_with_generation(provider_id)
+            .ok_or_else(|| EmbeddingError::ProviderNotFound(provider_id.to_owned()))
     }
-    pub fn resolve_by_semantic_identity(&self, identity: &EmbeddingProviderRef) -> Result<(u64, Arc<dyn EmbeddingProvider>), EmbeddingError> {
+    pub fn resolve_by_semantic_identity(
+        &self,
+        identity: &EmbeddingProviderRef,
+    ) -> Result<(u64, Arc<dyn EmbeddingProvider>), EmbeddingError> {
         let providers = self.inner.read().unwrap_or_else(|e| e.into_inner());
         for entry in providers.values() {
             if &entry.provider.semantic_identity() == identity {
                 return Ok((entry.generation, Arc::clone(&entry.provider)));
             }
         }
-        Err(EmbeddingError::ProviderNotFound(format!("semantic identity provider_id={} model_id={} model_version={}", identity.provider_id, identity.model_id, identity.model_version)))
+        Err(EmbeddingError::ProviderNotFound(format!(
+            "semantic identity provider_id={} model_id={} model_version={}",
+            identity.provider_id, identity.model_id, identity.model_version
+        )))
     }
 
     pub fn embed(
@@ -867,37 +909,90 @@ pub struct FixedVectorProvider {
     pub preprocessing_sha256: Option<[u8; 32]>,
 }
 impl FixedVectorProvider {
-    pub fn new(id: impl Into<String>, model_id: impl Into<String>, model_version: impl Into<String>, normalization: EmbeddingNormalization, vector: Vec<f32>) -> Self {
-        Self { id: id.into(), model_id: model_id.into(), model_version: model_version.into(), normalization, vector, provider_version: "1".into(), model_artifact_sha256: None, tokenizer_sha256: None, preprocessing_sha256: None }
+    pub fn new(
+        id: impl Into<String>,
+        model_id: impl Into<String>,
+        model_version: impl Into<String>,
+        normalization: EmbeddingNormalization,
+        vector: Vec<f32>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            model_id: model_id.into(),
+            model_version: model_version.into(),
+            normalization,
+            vector,
+            provider_version: "1".into(),
+            model_artifact_sha256: None,
+            tokenizer_sha256: None,
+            preprocessing_sha256: None,
+        }
     }
-    pub fn with_artifact_sha256(mut self, sha: [u8; 32]) -> Self { self.model_artifact_sha256 = Some(sha); self }
+    pub fn with_artifact_sha256(mut self, sha: [u8; 32]) -> Self {
+        self.model_artifact_sha256 = Some(sha);
+        self
+    }
 }
 impl EmbeddingProvider for FixedVectorProvider {
-    fn provider_id(&self) -> &str { &self.id }
-    fn model_id(&self) -> &str { &self.model_id }
-    fn model_version(&self) -> &str { &self.model_version }
-    fn dimension(&self) -> u32 { self.vector.len() as u32 }
-    fn normalization(&self) -> EmbeddingNormalization { self.normalization }
-    fn preprocessing_version(&self) -> &str { "fixed-test-v1" }
-    fn provider_version(&self) -> &str { &self.provider_version }
+    fn provider_id(&self) -> &str {
+        &self.id
+    }
+    fn model_id(&self) -> &str {
+        &self.model_id
+    }
+    fn model_version(&self) -> &str {
+        &self.model_version
+    }
+    fn dimension(&self) -> u32 {
+        self.vector.len() as u32
+    }
+    fn normalization(&self) -> EmbeddingNormalization {
+        self.normalization
+    }
+    fn preprocessing_version(&self) -> &str {
+        "fixed-test-v1"
+    }
+    fn provider_version(&self) -> &str {
+        &self.provider_version
+    }
     fn model_artifact_sha256(&self) -> [u8; 32] {
         self.model_artifact_sha256.unwrap_or_else(|| {
-            let mut h = Sha256::new(); h.update(b"model-artifact:"); h.update(self.model_id.as_bytes()); h.update([0]); h.update(self.model_version.as_bytes()); h.finalize().into()
+            let mut h = Sha256::new();
+            h.update(b"model-artifact:");
+            h.update(self.model_id.as_bytes());
+            h.update([0]);
+            h.update(self.model_version.as_bytes());
+            h.finalize().into()
         })
     }
     fn tokenizer_sha256(&self) -> [u8; 32] {
         self.tokenizer_sha256.unwrap_or_else(|| {
-            let mut h = Sha256::new(); h.update(b"tokenizer:"); h.update(self.model_id.as_bytes()); h.update([0]); h.update(b"fixed-test-v1"); h.finalize().into()
+            let mut h = Sha256::new();
+            h.update(b"tokenizer:");
+            h.update(self.model_id.as_bytes());
+            h.update([0]);
+            h.update(b"fixed-test-v1");
+            h.finalize().into()
         })
     }
     fn preprocessing_sha256(&self) -> [u8; 32] {
         self.preprocessing_sha256.unwrap_or_else(|| {
-            let mut h = Sha256::new(); h.update(b"preprocessing:"); h.update(b"fixed-test-v1"); h.update([0]); h.update([self.normalization as u8]); h.finalize().into()
+            let mut h = Sha256::new();
+            h.update(b"preprocessing:");
+            h.update(b"fixed-test-v1");
+            h.update([0]);
+            h.update([self.normalization as u8]);
+            h.finalize().into()
         })
     }
     fn embed(&self, request: EmbeddingRequest<'_>) -> Result<EmbeddingResponse, EmbeddingError> {
-        request.control.checkpoint().map_err(|e| EmbeddingError::Execution(e.to_string()))?;
-        Ok(EmbeddingResponse { vectors: request.texts.iter().map(|_| self.vector.clone()).collect() })
+        request
+            .control
+            .checkpoint()
+            .map_err(|e| EmbeddingError::Execution(e.to_string()))?;
+        Ok(EmbeddingResponse {
+            vectors: request.texts.iter().map(|_| self.vector.clone()).collect(),
+        })
     }
 }
 
@@ -928,9 +1023,19 @@ impl EmbeddingModelMeta {
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TextSearchOptions { pub k: usize }
-impl Default for TextSearchOptions { fn default() -> Self { Self { k: 10 } } }
-impl TextSearchOptions { pub fn new(k: usize) -> Self { Self { k } } }
+pub struct TextSearchOptions {
+    pub k: usize,
+}
+impl Default for TextSearchOptions {
+    fn default() -> Self {
+        Self { k: 10 }
+    }
+}
+impl TextSearchOptions {
+    pub fn new(k: usize) -> Self {
+        Self { k }
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TextRetrieveProvenance {
     pub semantic_identity: EmbeddingProviderRef,
@@ -984,7 +1089,13 @@ mod tests {
     }
 
     fn provider() -> Arc<FixedVectorProvider> {
-        Arc::new(FixedVectorProvider::new("local-test", "fixed", "1", EmbeddingNormalization::L2, vec![0.0, 1.0]))
+        Arc::new(FixedVectorProvider::new(
+            "local-test",
+            "fixed",
+            "1",
+            EmbeddingNormalization::L2,
+            vec![0.0, 1.0],
+        ))
     }
 
     fn source() -> EmbeddingSource {

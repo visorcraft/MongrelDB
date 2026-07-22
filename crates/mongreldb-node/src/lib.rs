@@ -4051,6 +4051,7 @@ impl TableHandle {
                 let core_row = mongreldb_core::memtable::Row {
                     row_id: hit.row_id,
                     committed_epoch: mongreldb_core::Epoch(0),
+                    commit_ts: None,
                     columns: row,
                     deleted: false,
                 };

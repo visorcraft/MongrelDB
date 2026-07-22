@@ -40,8 +40,8 @@ mod admission;
 mod audit;
 pub mod cluster_admin;
 mod cluster_data_plane;
-mod cluster_sql;
 pub mod cluster_runtime;
+mod cluster_sql;
 pub mod fragment_rpc;
 mod kit;
 mod metrics;
@@ -327,6 +327,7 @@ impl AppState {
     }
 
     /// Clone of the standalone engine handle.
+    #[allow(dead_code)] // convenience for handlers that need owned Arc
     fn db_arc(&self) -> Arc<Database> {
         Arc::clone(self.db())
     }
@@ -949,9 +950,9 @@ pub fn build_app_with_storage(
     // P1.1 NodeAdmissionController also uses this governor for parent/child budgets.
     let node_memory_governor = match storage.standalone_db() {
         Some(db) => db.memory_governor().clone(),
-        None => mongreldb_core::MemoryGovernor::new(
-            mongreldb_core::GovernorConfig::new(512 * 1024 * 1024),
-        )
+        None => mongreldb_core::MemoryGovernor::new(mongreldb_core::GovernorConfig::new(
+            512 * 1024 * 1024,
+        ))
         .expect("default cluster node memory governor"),
     };
     let node_admission =
@@ -1318,7 +1319,8 @@ async fn wal_stream(
     OptionalPrincipal(principal): OptionalPrincipal,
     axum::extract::Query(params): axum::extract::Query<WalStreamParams>,
 ) -> Result<Response, StatusCode> {
-    state.db()
+    state
+        .db()
         .require_for(
             request_principal(&state, &principal).as_ref(),
             &mongreldb_core::Permission::Admin,
@@ -1520,7 +1522,8 @@ async fn events_stream(
     use std::collections::VecDeque;
     use std::convert::Infallible;
 
-    state.db()
+    state
+        .db()
         .require_for(
             request_principal(&state, &principal).as_ref(),
             &mongreldb_core::Permission::Admin,
@@ -4162,7 +4165,7 @@ async fn list_tables(
             })
             .collect::<Vec<_>>(),
     )
-        .into_response()
+    .into_response()
 }
 
 async fn drop_table(

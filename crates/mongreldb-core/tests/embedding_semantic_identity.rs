@@ -231,7 +231,8 @@ fn provider_generation_stored_with_vector_and_ann_binds_identity() {
     db.embedding_providers()
         .register_new(Arc::new(FingerprintProvider::new("1", 0xAA, 1.0)))
         .unwrap();
-    db.create_table("documents", documents_schema(true)).unwrap();
+    db.create_table("documents", documents_schema(true))
+        .unwrap();
 
     let mut txn = db.begin();
     txn.put(
@@ -269,7 +270,8 @@ fn query_time_embedding_selects_active_generation_and_returns_provenance() {
     db.embedding_providers()
         .register_new(Arc::new(FingerprintProvider::new("1", 0xAA, 1.0)))
         .unwrap();
-    db.create_table("documents", documents_schema(true)).unwrap();
+    db.create_table("documents", documents_schema(true))
+        .unwrap();
 
     for (id, text) in [(1i64, "cat"), (2, "cats"), (3, "dog")] {
         let mut txn = db.begin();
@@ -335,8 +337,14 @@ fn reembedding_publish_atomic_old_model_rejected_and_resume() {
         .start_reembedding(1, 3, b.clone(), 5)
         .expect("start re-embedding");
     assert_eq!(job.state, ReEmbeddingState::Pending);
-    assert_eq!(job.source_identity.fingerprint_sha256(), a.fingerprint_sha256());
-    assert_eq!(job.target_identity.fingerprint_sha256(), b.fingerprint_sha256());
+    assert_eq!(
+        job.source_identity.fingerprint_sha256(),
+        a.fingerprint_sha256()
+    );
+    assert_eq!(
+        job.target_identity.fingerprint_sha256(),
+        b.fingerprint_sha256()
+    );
 
     // Interrupted backfill: process two rows, then resume.
     let partial = coord.build_reembedding_batch(job.job_id, 2).unwrap();

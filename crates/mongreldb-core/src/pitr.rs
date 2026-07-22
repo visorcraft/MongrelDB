@@ -1530,7 +1530,6 @@ fn hex_bytes(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-
 fn is_zero(value: &u64) -> bool {
     *value == 0
 }
@@ -2094,8 +2093,14 @@ mod tests {
                     bytes: 100,
                     sha256: first_sha,
                     commits: vec![
-                        PitrCommitPoint { epoch: 11, unix_nanos: 110 },
-                        PitrCommitPoint { epoch: 12, unix_nanos: 120 },
+                        PitrCommitPoint {
+                            epoch: 11,
+                            unix_nanos: 110,
+                        },
+                        PitrCommitPoint {
+                            epoch: 12,
+                            unix_nanos: 120,
+                        },
                     ],
                     commit_ledger: Vec::new(),
                     commit_hlcs: Vec::new(),
@@ -2111,7 +2116,10 @@ mod tests {
                     records: 2,
                     bytes: 100,
                     sha256: second_sha,
-                    commits: vec![PitrCommitPoint { epoch: 13, unix_nanos: 130 }],
+                    commits: vec![PitrCommitPoint {
+                        epoch: 13,
+                        unix_nanos: 130,
+                    }],
                     commit_ledger: Vec::new(),
                     commit_hlcs: Vec::new(),
                     first_sequence: 30,
@@ -2142,7 +2150,10 @@ mod tests {
                     },
                 ),
             ],
-            commits: vec![PitrCommitPoint { epoch: 11, unix_nanos: 110 }],
+            commits: vec![PitrCommitPoint {
+                epoch: 11,
+                unix_nanos: 110,
+            }],
             first_sequence: 20,
             last_sequence: 21,
             previous_chain_sha256: "11".repeat(32),
@@ -2854,18 +2865,30 @@ mod tests {
             node_tiebreaker: 0,
         }];
 
-        let mid = mongreldb_types::hlc::HlcTimestamp { physical_micros: 2_000, logical: 0, node_tiebreaker: 0 };
+        let mid = mongreldb_types::hlc::HlcTimestamp {
+            physical_micros: 2_000,
+            logical: 0,
+            node_tiebreaker: 0,
+        };
         assert_eq!(
             resolve_target_epoch(&manifest, PitrTarget::Hlc(mid)).unwrap(),
             12,
             "HLC at second commit must land on epoch 12"
         );
-        let before_second = mongreldb_types::hlc::HlcTimestamp { physical_micros: 1_500, logical: 0, node_tiebreaker: 0 };
+        let before_second = mongreldb_types::hlc::HlcTimestamp {
+            physical_micros: 1_500,
+            logical: 0,
+            node_tiebreaker: 0,
+        };
         assert_eq!(
             resolve_target_epoch(&manifest, PitrTarget::Hlc(before_second)).unwrap(),
             11
         );
-        let latest = mongreldb_types::hlc::HlcTimestamp { physical_micros: 9_999, logical: 0, node_tiebreaker: 0 };
+        let latest = mongreldb_types::hlc::HlcTimestamp {
+            physical_micros: 9_999,
+            logical: 0,
+            node_tiebreaker: 0,
+        };
         assert_eq!(
             resolve_target_epoch(&manifest, PitrTarget::Hlc(latest)).unwrap(),
             13

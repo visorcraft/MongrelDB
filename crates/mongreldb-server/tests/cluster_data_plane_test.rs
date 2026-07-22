@@ -164,19 +164,10 @@ async fn json_body(response: axum::response::Response) -> Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
-async fn sql_json(
-    app: &axum::Router,
-    token: &str,
-    sql: &str,
-) -> (StatusCode, Value) {
+async fn sql_json(app: &axum::Router, token: &str, sql: &str) -> (StatusCode, Value) {
     let response = app
         .clone()
-        .oneshot(authorized(
-            "POST",
-            "/sql",
-            json!({ "sql": sql }),
-            token,
-        ))
+        .oneshot(authorized("POST", "/sql", json!({ "sql": sql }), token))
         .await
         .unwrap();
     let status = response.status();
@@ -201,8 +192,7 @@ async fn cluster_mode_insert_and_read_via_raft() {
 
     let table_id = TableId::new(1);
     let database_id = DatabaseId::from_bytes([0x42; 16]);
-    let tablet_id =
-        seed_single_replica_tablet(&handle, &identity, table_id, database_id).await;
+    let tablet_id = seed_single_replica_tablet(&handle, &identity, table_id, database_id).await;
 
     // Production-style worker install: public DF SQL must use these workers
     // (FAC-DS-2), not a per-request ephemeral InMemoryTransport.
@@ -210,11 +200,8 @@ async fn cluster_mode_insert_and_read_via_raft() {
         mongreldb_server::fragment_rpc::install_production_cluster_workers(&handle)
             .await
             .expect("install fragment + AI workers");
-    let storage = ServerStorageRuntime::cluster_with_workers(
-        handle.clone(),
-        fragment_endpoint,
-        ai_endpoint,
-    );
+    let storage =
+        ServerStorageRuntime::cluster_with_workers(handle.clone(), fragment_endpoint, ai_endpoint);
     assert!(storage.is_cluster());
     assert!(storage.require_standalone_db().is_err());
     assert!(storage.standalone_db().is_none());
@@ -283,9 +270,9 @@ async fn cluster_mode_insert_and_read_via_raft() {
     // Cross-check: tablet group applied index is at least the reported commit_index.
     let status = handle.runtime_status_json().await.expect("status");
     let tablets = status["tablets"].as_array().cloned().unwrap_or_default();
-    let tablet_status = tablets.iter().find(|t| {
-        t["tablet_id"].as_str() == Some(tablet_id.to_string().as_str())
-    });
+    let tablet_status = tablets
+        .iter()
+        .find(|t| t["tablet_id"].as_str() == Some(tablet_id.to_string().as_str()));
     if let Some(ts) = tablet_status {
         let applied = ts["applied_index"].as_u64().unwrap_or(0);
         assert!(
@@ -320,7 +307,9 @@ async fn cluster_mode_insert_and_read_via_raft() {
     // row_id 1 from the id column.
     let cells = typed.get(&1).expect("row id 1");
     assert!(
-        cells.values().any(|v| matches!(v, mongreldb_core::Value::Bytes(b) if b == b"alice")),
+        cells
+            .values()
+            .any(|v| matches!(v, mongreldb_core::Value::Bytes(b) if b == b"alice")),
         "expected alice bytes cell, have {cells:?}"
     );
 
@@ -352,7 +341,10 @@ async fn cluster_mode_insert_and_read_via_raft() {
     let rows = agg["rows"]
         .as_array()
         .expect("Coordinator execute must return rows, not plan-only");
-    assert!(!rows.is_empty(), "Coordinator execute must return rows: {agg}");
+    assert!(
+        !rows.is_empty(),
+        "Coordinator execute must return rows: {agg}"
+    );
     // Correct aggregate value after 1 INSERT (AC §7.8).
     let count = rows[0]
         .as_object()

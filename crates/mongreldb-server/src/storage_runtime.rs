@@ -263,7 +263,10 @@ mod tests {
         let standalone = ServerStorageRuntime::standalone(Arc::clone(&db));
         assert!(standalone.is_standalone());
         assert!(!standalone.is_cluster());
-        assert!(Arc::ptr_eq(standalone.require_standalone_db().unwrap(), &db));
+        assert!(Arc::ptr_eq(
+            standalone.require_standalone_db().unwrap(),
+            &db
+        ));
         assert_eq!(standalone.mode_name(), "standalone");
     }
 

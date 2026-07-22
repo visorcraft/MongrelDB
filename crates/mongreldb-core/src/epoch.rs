@@ -78,10 +78,7 @@ impl Snapshot {
     /// HLC stamps — epoch-only snapshots intentionally hide HLC-stamped versions.
     #[inline]
     pub fn unbounded() -> Self {
-        Self::at_hlc(
-            Epoch(u64::MAX),
-            mongreldb_types::hlc::HlcTimestamp::MAX,
-        )
+        Self::at_hlc(Epoch(u64::MAX), mongreldb_types::hlc::HlcTimestamp::MAX)
     }
 
     /// Whether this snapshot uses HLC as the cluster-wide visibility authority.
@@ -203,9 +200,7 @@ impl GcFloor {
     }
 
     /// Stable `(source_label, hlc)` pairs for diagnostics.
-    pub fn sources(
-        &self,
-    ) -> [(&'static str, mongreldb_types::hlc::HlcTimestamp); 6] {
+    pub fn sources(&self) -> [(&'static str, mongreldb_types::hlc::HlcTimestamp); 6] {
         [
             ("transaction_snapshot", self.transaction_snapshot),
             ("history_retention", self.history_retention),
@@ -573,7 +568,8 @@ mod tests {
         let wall = Arc::new(AtomicU64::new(10_000));
         let wall_src = {
             let wall = Arc::clone(&wall);
-            Arc::new(move || wall.load(AtomicOrdering::Relaxed)) as mongreldb_types::hlc::WallClockSource
+            Arc::new(move || wall.load(AtomicOrdering::Relaxed))
+                as mongreldb_types::hlc::WallClockSource
         };
         let clock = HlcClock::with_time_source(1, Duration::from_micros(1_000), wall_src);
         let remote = HlcTimestamp {
@@ -581,7 +577,10 @@ mod tests {
             logical: 0,
             node_tiebreaker: 2,
         };
-        assert!(clock.observe(remote).is_err(), "5ms skew must exceed 1ms bound");
+        assert!(
+            clock.observe(remote).is_err(),
+            "5ms skew must exceed 1ms bound"
+        );
         assert!(
             clock.now().is_err(),
             "further allocation stays rejected after skew trip"
