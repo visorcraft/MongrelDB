@@ -163,7 +163,7 @@ jobs:
           cargo install cargo-fuzz --locked
           # shellcheck disable=SC2016
           python3 scripts/run-certification-command.py "$QUAL_DIR/fuzz-smoke.log" \
-            bash -c 'cd fuzz && for target in protocol_envelope wal consensus_snapshot cursor_token sql_adapter_packet; do cargo +"$RUST_NIGHTLY" fuzz run "$target" -- -max_total_time=10; done'
+            bash -c 'cd fuzz && for target in protocol_envelope wal consensus_snapshot cursor_token sql_adapter_packet; do corpus="$RUNNER_TEMP/fuzz-corpus/$target"; mkdir -p "$corpus"; cargo +"$RUST_NIGHTLY" fuzz run "$target" "$corpus" -- -max_total_time=10; done'
       - name: Package release candidates
         run: |
           git status --porcelain --untracked-files=all | tee "$QUAL_DIR/git-status-final.txt"
