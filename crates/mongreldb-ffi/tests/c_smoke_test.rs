@@ -26,9 +26,22 @@ fn c_smoke_test() {
     assert!(header.exists(), "mongreldb.h not found at {:?}", header);
     assert!(c_source.exists(), "c_test.c not found at {:?}", c_source);
 
+    // Always build into the workspace target dir (not a stale
+    // crates/mongreldb-ffi/target or target/<triple> leftover).
     let status = Command::new("cargo")
-        .args(["build", "--release"])
-        .current_dir(&crate_root)
+        .args([
+            "build",
+            "--release",
+            "-p",
+            "mongreldb-ffi",
+            "--target-dir",
+            lib_path
+                .parent()
+                .expect("release dir has parent")
+                .to_str()
+                .unwrap(),
+        ])
+        .current_dir(crate_root.join("../.."))
         .status()
         .expect("failed to build C library");
     assert!(status.success(), "failed to build C library");
@@ -80,8 +93,10 @@ fn c_smoke_test() {
         );
     }
 
-    // Run the compiled C test.
+    // Run the compiled C test. Prefer the just-built release library so a
+    // stale debug/triple lib cannot satisfy libmongreldb.so first.
     let mut smoke = Command::new(binary);
+    smoke.env("LD_LIBRARY_PATH", &lib_path);
     if sanitize {
         smoke.env("ASAN_OPTIONS", "detect_leaks=0:halt_on_error=1");
         smoke.env("UBSAN_OPTIONS", "halt_on_error=1:print_stacktrace=1");

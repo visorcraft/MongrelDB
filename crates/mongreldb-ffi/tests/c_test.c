@@ -352,8 +352,14 @@ static void test_authenticated_native_reads(void) {
 int main(void) {
     char *build_info = mongreldb_build_info();
     assert(build_info != NULL);
-    assert(strstr(build_info, "\"engine_version\":\"0.63.1\"") != NULL);
-    assert(strstr(build_info, "\"query_version\":\"0.63.1\"") != NULL);
+    /* Version is checked against CARGO_PKG_VERSION of the linked library
+     * after bump-version; print the payload so CI mismatches are obvious. */
+    if (strstr(build_info, "\"engine_version\":\"0.63.1\"") == NULL ||
+        strstr(build_info, "\"query_version\":\"0.63.1\"") == NULL) {
+        fprintf(stderr, "unexpected mongreldb_build_info: %s\n", build_info);
+        mongreldb_free_string(build_info);
+        return 1;
+    }
     mongreldb_free_string(build_info);
 
     /* ── Database lifecycle ──────────────────────────────────────────── */

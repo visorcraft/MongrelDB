@@ -404,15 +404,17 @@ mod tests {
     }
 
     #[test]
-    fn epoch_only_snapshot_does_not_observe_hlc_stamped_rows() {
+    fn epoch_only_snapshot_sees_hlc_stamped_rows_by_epoch() {
         let mut mr = MutableRun::new();
         mr.insert_many(vec![hlc_row(1, 1, hlc(50), 1), row(2, 1, 2)]);
         let legacy = Snapshot::at(Epoch(99));
         let versions = mr.visible_versions_at(legacy);
-        assert_eq!(versions.len(), 1, "only pure-legacy row is visible");
-        assert_eq!(versions[0].row_id, RowId(2));
-        assert!(versions[0].commit_ts.is_none());
-        assert!(mr.get_version_at(RowId(1), legacy).is_none());
+        assert_eq!(
+            versions.len(),
+            2,
+            "dual-model: epoch pin sees HLC rows by epoch"
+        );
+        assert!(mr.get_version_at(RowId(1), legacy).is_some());
         assert!(mr.get_version_at(RowId(2), legacy).is_some());
     }
 }

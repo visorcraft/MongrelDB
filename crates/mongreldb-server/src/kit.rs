@@ -2313,6 +2313,93 @@ pub async fn kit_ai_metrics(
     .into_response()
 }
 
+/// Kit text → embed → ANN retrieve under the active semantic identity (P0.7).
+///
+/// Public wire for language clients that cannot call core `retrieve_text`
+/// in-process. Request body:
+/// `{ "table", "embedding_column", "text", "k"?: number, "deadline_ms"?, "max_work"? }`.
+#[derive(Debug, Deserialize)]
+pub struct KitRetrieveTextRequest {
+    pub table: String,
+    pub embedding_column: u16,
+    pub text: String,
+    #[serde(default)]
+    pub k: Option<usize>,
+    #[serde(default)]
+    pub deadline_ms: Option<u64>,
+    #[serde(default)]
+    pub max_work: Option<usize>,
+}
+
+pub async fn kit_retrieve_text(
+    State(state): State<Arc<AppState>>,
+    OptionalPrincipal(principal): OptionalPrincipal,
+    Json(req): Json<KitRetrieveTextRequest>,
+) -> Response {
+    let (timeout, context) = match ai_execution_options(req.deadline_ms, req.max_work) {
+        Ok(options) => options,
+        Err(error) => return kit_core_error(&error),
+    };
+    let principal = request_principal(&state, &principal);
+    let column_id = req.embedding_column;
+    if let Err(error) = state.db().require_columns_for(
+        &req.table,
+        mongreldb_core::ColumnOperation::Select,
+        &[column_id],
+        principal.as_ref(),
+    ) {
+        return kit_core_error(&error);
+    }
+    let k = req.k.unwrap_or(10);
+    if k == 0 {
+        return kit_bad_request("k must be greater than zero".into());
+    }
+    let table_name = req.table;
+    let text = req.text;
+    let worker_state = Arc::clone(&state);
+    let result = run_ai(state, timeout, context, move |_context| {
+        worker_state.db().retrieve_text_for_principal(
+            &table_name,
+            column_id,
+            &text,
+            mongreldb_core::embedding::TextSearchOptions::new(k),
+            principal.as_ref(),
+        )
+    })
+    .await;
+    match result {
+        Ok(retrieved) => {
+            let provenance = &retrieved.provenance;
+            let identity = &provenance.semantic_identity;
+            Json(json!({
+                "hits": retrieved.hits.into_iter().map(|hit| json!({
+                    "row_id": hit.row_id.0.to_string(),
+                    "rank": hit.rank,
+                    "score": retriever_score_json(hit.score),
+                })).collect::<Vec<_>>(),
+                "provenance": {
+                    "embedding_column": provenance.embedding_column,
+                    "provider_registry_generation": provenance.provider_registry_generation,
+                    "query_source_fingerprint": cursor_hex(&provenance.query_source_fingerprint),
+                    "semantic_identity": {
+                        "provider_id": identity.provider_id,
+                        "provider_version": identity.provider_version,
+                        "model_id": identity.model_id,
+                        "model_version": identity.model_version,
+                        "model_artifact_sha256": cursor_hex(&identity.model_artifact_sha256),
+                        "tokenizer_sha256": cursor_hex(&identity.tokenizer_sha256),
+                        "preprocessing_sha256": cursor_hex(&identity.preprocessing_sha256),
+                        "dimension": identity.dimension,
+                        "normalization": format!("{:?}", identity.normalization),
+                    },
+                },
+            }))
+            .into_response()
+        }
+        Err(error) => kit_core_error(&error),
+    }
+}
+
 pub async fn kit_retrieve(
     State(state): State<Arc<AppState>>,
     OptionalPrincipal(principal): OptionalPrincipal,

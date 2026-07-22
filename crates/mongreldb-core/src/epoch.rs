@@ -81,10 +81,12 @@ impl Snapshot {
         Self::at_hlc(Epoch(u64::MAX), mongreldb_types::hlc::HlcTimestamp::MAX)
     }
 
-    /// Whether this snapshot uses HLC as the cluster-wide visibility authority.
+    /// Whether this snapshot pins an explicit HLC watermark (non-ZERO).
     ///
-    /// `false` means legacy epoch-only (`commit_ts == ZERO`): HLC-stamped rows
-    /// are intentionally not observed.
+    /// When true, row visibility prefers HLC comparison. When false (legacy
+    /// epoch-only pin), HLC-stamped rows remain visible by **epoch** so
+    /// dual-model migration does not hide newly stamped commits from APIs
+    /// that still pin `Snapshot::at(epoch)` (P0.5 dual-model read path).
     #[inline]
     pub fn uses_hlc_authority(&self) -> bool {
         self.commit_ts != mongreldb_types::hlc::HlcTimestamp::ZERO
@@ -100,10 +102,12 @@ impl Snapshot {
         page_epoch <= self.epoch
     }
 
-    /// Row visibility under HLC-authoritative MVCC (P0.5-T7).
+    /// Row visibility under HLC-authoritative MVCC (P0.5).
     ///
-    /// See the type-level authority table. Alias of the same rule used by every
-    /// product visibility path that has access to both stamps.
+    /// - HLC-pinned snapshot + HLC-stamped row → compare HLC (sole cluster rule).
+    /// - Epoch-only snapshot + HLC-stamped row → compare **epoch** (dual-model
+    ///   migration: do not hide stamped commits from `Snapshot::at`).
+    /// - Row without HLC → compare epoch.
     #[inline]
     pub fn observes_version(
         &self,
@@ -112,7 +116,7 @@ impl Snapshot {
     ) -> bool {
         match (self.uses_hlc_authority(), row_commit_ts) {
             (true, Some(ts)) => ts <= self.commit_ts,
-            (false, Some(_)) => false,
+            (false, Some(_)) => row_epoch <= self.epoch,
             (_, None) => row_epoch <= self.epoch,
         }
     }
@@ -491,11 +495,14 @@ mod tests {
         let snap = Snapshot::at_hlc(Epoch(10), early);
         assert!(!snap.observes_version(Epoch(5), Some(late)));
         assert!(snap.observes_version(Epoch(5), Some(early)));
-        // Legacy epoch-only snapshot must not reclaim HLC-stamped rows via epoch.
+        // Legacy epoch-only snapshot still sees HLC-stamped rows by epoch
+        // (dual-model migration); HLC authority applies only when the snap is
+        // HLC-pinned.
         let legacy = Snapshot::at(Epoch(99));
         assert!(!legacy.uses_hlc_authority());
-        assert!(!legacy.observes_version(Epoch(1), Some(early)));
+        assert!(legacy.observes_version(Epoch(1), Some(early)));
         assert!(legacy.observes_version(Epoch(1), None));
+        assert!(!legacy.observes_version(Epoch(100), Some(early)));
     }
 
     #[test]

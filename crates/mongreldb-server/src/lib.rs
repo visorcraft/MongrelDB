@@ -1093,6 +1093,7 @@ pub fn build_app_with_storage(
         .route("/kit/txn", post(kit::kit_txn))
         .route("/kit/query", post(kit::kit_query))
         .route("/kit/retrieve", post(kit::kit_retrieve))
+        .route("/kit/retrieve_text", post(kit::kit_retrieve_text))
         .route("/kit/ann_rerank", post(kit::kit_ann_rerank))
         .route("/kit/ai/metrics", get(kit::kit_ai_metrics))
         .route("/kit/set_similarity", post(kit::kit_set_similarity))
@@ -5930,6 +5931,18 @@ fn query_cancel_outcome(status: &mongreldb_query::QueryStatus) -> Option<&'stati
     }
 }
 
+/// Structural HLC fields for HTTP durable recovery (P0.6 / 0.64 client surface).
+fn hlc_json(ts: Option<mongreldb_types::hlc::HlcTimestamp>) -> serde_json::Value {
+    match ts {
+        Some(ts) if ts != mongreldb_types::hlc::HlcTimestamp::ZERO => json!({
+            "physical_micros": ts.physical_micros,
+            "logical": ts.logical,
+            "node_tiebreaker": ts.node_tiebreaker,
+        }),
+        _ => serde_json::Value::Null,
+    }
+}
+
 fn query_outcome_json(status: Option<&mongreldb_query::QueryStatus>) -> serde_json::Value {
     let Some(status) = status else {
         return json!({
@@ -5937,11 +5950,14 @@ fn query_outcome_json(status: Option<&mongreldb_query::QueryStatus>) -> serde_js
             "committed_statements": 0,
             "last_commit_epoch": null,
             "last_commit_epoch_text": null,
+            "last_commit_hlc": null,
             "first_commit_statement_index": null,
             "last_commit_statement_index": null,
             "completed_statements": 0,
             "statement_index": 0,
             "serialization": "not_started",
+            "serialization_state": "not_started",
+            "terminal_state": null,
         });
     };
     if status.outcome_unknown {
@@ -5950,23 +5966,30 @@ fn query_outcome_json(status: Option<&mongreldb_query::QueryStatus>) -> serde_js
             "committed_statements": null,
             "last_commit_epoch": null,
             "last_commit_epoch_text": null,
+            "last_commit_hlc": null,
             "first_commit_statement_index": null,
             "last_commit_statement_index": null,
             "completed_statements": null,
             "statement_index": null,
             "serialization": "unknown",
+            "serialization_state": "unknown",
+            "terminal_state": null,
         });
     }
+    let serialization = serialization_outcome_name(status.serialization_outcome);
     json!({
         "committed": status.durable_outcome.committed,
-        "committed_statements": (!status.outcome_unknown).then_some(status.durable_outcome.committed_statements),
-        "last_commit_epoch": (!status.outcome_unknown).then_some(status.durable_outcome.last_commit_epoch).flatten(),
-        "last_commit_epoch_text": (!status.outcome_unknown).then_some(epoch_text(status.durable_outcome.last_commit_epoch)).flatten(),
-        "first_commit_statement_index": (!status.outcome_unknown).then_some(status.durable_outcome.first_commit_statement_index).flatten(),
-        "last_commit_statement_index": (!status.outcome_unknown).then_some(status.durable_outcome.last_commit_statement_index).flatten(),
-        "completed_statements": (!status.outcome_unknown).then_some(status.completed_statements),
-        "statement_index": (!status.outcome_unknown).then_some(status.statement_index),
-        "serialization": serialization_outcome_name(status.serialization_outcome),
+        "committed_statements": status.durable_outcome.committed_statements,
+        "last_commit_epoch": status.durable_outcome.last_commit_epoch,
+        "last_commit_epoch_text": epoch_text(status.durable_outcome.last_commit_epoch),
+        "last_commit_hlc": hlc_json(status.durable_outcome.commit_ts),
+        "first_commit_statement_index": status.durable_outcome.first_commit_statement_index,
+        "last_commit_statement_index": status.durable_outcome.last_commit_statement_index,
+        "completed_statements": status.completed_statements,
+        "statement_index": status.statement_index,
+        "serialization": serialization,
+        "serialization_state": serialization,
+        "terminal_state": status.terminal_state().map(terminal_state_name),
     })
 }
 
@@ -6391,6 +6414,11 @@ async fn query_status(
         "committed_statements": (!status.outcome_unknown).then_some(status.durable_outcome.committed_statements),
         "last_commit_epoch": (!status.outcome_unknown).then_some(status.durable_outcome.last_commit_epoch).flatten(),
         "last_commit_epoch_text": (!status.outcome_unknown).then_some(epoch_text(status.durable_outcome.last_commit_epoch)).flatten(),
+        "last_commit_hlc": if !status.outcome_unknown {
+            hlc_json(status.durable_outcome.commit_ts)
+        } else {
+            serde_json::Value::Null
+        },
         "first_commit_statement_index": (!status.outcome_unknown).then_some(status.durable_outcome.first_commit_statement_index).flatten(),
         "last_commit_statement_index": (!status.outcome_unknown).then_some(status.durable_outcome.last_commit_statement_index).flatten(),
         "cancellation_reason": cancellation_reason_name(status.cancellation_reason),
@@ -6399,6 +6427,9 @@ async fn query_status(
         "cancel_outcome": cancel_outcome,
         "retryable": retryable,
         "outcome": outcome,
+        // Nested durable object (parity with native DurableOutcome) for clients
+        // that prefer a single structural recovery payload (0.64).
+        "durable": outcome,
         "terminal_error": terminal_error,
         "trace": {
             "queue_duration_us": status.queue_duration.as_micros(),

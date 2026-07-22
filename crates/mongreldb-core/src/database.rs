@@ -21697,14 +21697,15 @@ mod commit_ts_ledger_tests {
         assert_eq!(rows[0].commit_ts, Some(commit_ts));
         assert!(table.get(rows[0].row_id, hlc_snap).is_some());
 
-        // (b) Epoch-only snapshot does NOT claim equal authority for HLC rows.
+        // (b) Epoch-only snapshot still sees HLC-stamped rows by epoch (dual-model).
         let legacy = Snapshot::at(Epoch(u64::MAX));
         assert!(!legacy.uses_hlc_authority());
-        assert!(
-            table.visible_rows(legacy).expect("visible").is_empty(),
-            "epoch-only snapshot must not observe HLC-stamped product rows"
+        assert_eq!(
+            table.visible_rows(legacy).expect("visible").len(),
+            1,
+            "epoch pin sees HLC-stamped rows by epoch during dual-model migration"
         );
-        assert!(table.get(rows[0].row_id, legacy).is_none());
+        assert!(table.get(rows[0].row_id, legacy).is_some());
     }
 
     #[test]

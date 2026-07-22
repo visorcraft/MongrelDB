@@ -10429,14 +10429,22 @@ impl Table {
     ) -> Result<Option<ApproxResult>> {
         use crate::query::Condition;
         self.ensure_reservoir_complete()?;
-        let snapshot = self.snapshot();
+        // Approx stats estimate the current live population. Prefer the table
+        // snapshot, but if HLC dual-model visibility filters the entire
+        // reservoir sample (epoch-only vs HLC-stamped), fall back to an
+        // unbounded product snapshot so Count/Sum estimates remain available.
+        let mut snapshot = self.snapshot();
         let n_pop = self.count();
         let sample_rids: Vec<u64> = self.reservoir.row_ids().to_vec();
         if sample_rids.is_empty() {
             return Ok(None);
         }
         // Materialize the live, non-deleted sampled rows.
-        let live_sample = self.rows_for_rids(&sample_rids, snapshot)?;
+        let mut live_sample = self.rows_for_rids(&sample_rids, snapshot)?;
+        if live_sample.is_empty() {
+            snapshot = Snapshot::unbounded();
+            live_sample = self.rows_for_rids(&sample_rids, snapshot)?;
+        }
         let s = live_sample.len();
         if s == 0 {
             return Ok(None);

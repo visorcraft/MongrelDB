@@ -522,7 +522,7 @@ mod tests {
     }
 
     #[test]
-    fn epoch_only_snapshot_does_not_observe_hlc_stamped_rows() {
+    fn epoch_only_snapshot_sees_hlc_stamped_rows_by_epoch() {
         use mongreldb_types::hlc::HlcTimestamp;
         let mut m = Memtable::new();
         let ts = HlcTimestamp {
@@ -534,11 +534,15 @@ mod tests {
         m.upsert(Row::new(RowId(2), Epoch(1)).with_column(1, Value::Int64(2)));
         let legacy = crate::epoch::Snapshot::at(Epoch(99));
         let versions = m.visible_versions_at(legacy);
-        assert_eq!(versions.len(), 1, "only pure-legacy row is visible");
-        assert_eq!(versions[0].row_id, RowId(2));
-        assert!(versions[0].commit_ts.is_none());
-        assert!(m.get_version_at(RowId(1), legacy).is_none());
+        assert_eq!(
+            versions.len(),
+            2,
+            "dual-model: epoch pin sees HLC rows by epoch"
+        );
+        assert!(m.get_version_at(RowId(1), legacy).is_some());
         assert!(m.get_version_at(RowId(2), legacy).is_some());
+        let future = crate::epoch::Snapshot::at(Epoch(0));
+        assert!(m.get_version_at(RowId(1), future).is_none());
     }
 
     #[test]

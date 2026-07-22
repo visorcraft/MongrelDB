@@ -651,32 +651,19 @@ impl EngineApplySink {
         Ok(())
     }
 
-    /// Initializes the hidden clustered table used by tablet split/merge.
+    /// Initializes the hidden clustered table used by tablet split/merge and
+    /// the cluster tablet KV envelope.
     ///
     /// This is deterministic replica bootstrap, not user DDL. The table then
     /// follows the ordinary replicated apply, WAL, MVCC, sorted-run, and
     /// engine-snapshot paths.
     ///
-    /// **Legacy path.** Gated by [`OPAQUE_TABLET_KEYSPACE_LEGACY`] (production
-    /// default `false`). Prefer [`Self::bind_tablet_user_table`] for new
-    /// user-table tablets.
-    ///
-    /// When the gate is off:
-    /// - **Existing** opaque `__mongreldb_tablet_rows` tables still open (read /
-    ///   migrate / split-merge catch-up on historical data).
-    /// - **Creating** a new opaque keyspace fails so production cannot init
-    ///   opaque envelopes for new tablets — callers must bind a typed schema.
+    /// **Production user data** should still use [`Self::bind_tablet_user_table`]
+    /// (typed Put/Delete). The opaque envelope remains required for cluster
+    /// tablet bootstrap and split/merge until RuntimeKeyspace is fully typed
+    /// (P0.3-T6 executor). [`OPAQUE_TABLET_KEYSPACE_LEGACY`] gates only
+    /// *advertising* opaque as the preferred public path — not this bootstrap.
     pub fn initialize_tablet_keyspace(&mut self) -> Result<(), EngineSinkError> {
-        if !OPAQUE_TABLET_KEYSPACE_LEGACY {
-            let catalog = self.database_required()?.catalog_snapshot();
-            if catalog.live(TABLET_KEYSPACE_TABLE).is_none() {
-                return Err(MongrelError::InvalidArgument(
-                    "opaque tablet keyspace is disabled; bind a typed TabletTableBinding".into(),
-                )
-                .into());
-            }
-            // Existing opaque keyspace: validate and mark ready for legacy ops.
-        }
         self.initialize_opaque_tablet_keyspace_unchecked()
     }
 
@@ -3054,44 +3041,26 @@ mod tests {
     }
 
     #[test]
-    fn production_init_refuses_opaque_when_legacy_false() {
-        const {
-            assert!(
-                !OPAQUE_TABLET_KEYSPACE_LEGACY,
-                "production default must refuse opaque __mongreldb_tablet_rows init"
-            );
-        }
+    fn tablet_keyspace_bootstrap_still_creates_cluster_envelope() {
+        // Cluster tablet roots still need the opaque KV envelope for
+        // split/merge; typed bind is the production *user-table* path.
         let tmp = tempfile::tempdir().unwrap();
         let config = engine_config(tmp.path(), 40);
         let sink = open_engine_sink(&config).unwrap();
         let mut sink = sink.lock().unwrap();
-        let err = sink
-            .initialize_tablet_keyspace()
-            .expect_err("production initialize_tablet_keyspace must fail for new tablets");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("opaque tablet keyspace is disabled"),
-            "unexpected error: {msg}"
-        );
         assert!(!sink.tablet_keyspace);
-        assert!(!sink.has_typed_user_table());
-        let catalog = sink.database().unwrap().catalog_snapshot();
-        assert!(
-            catalog.live(TABLET_KEYSPACE_TABLE).is_none(),
-            "production must not create opaque tablet keyspace when legacy is false"
-        );
-
-        // Existing opaque keyspaces remain openable for migration/read.
-        sink.initialize_opaque_tablet_keyspace_for_tests().unwrap();
-        assert!(sink.tablet_keyspace);
         sink.initialize_tablet_keyspace()
-            .expect("reopen of existing opaque keyspace must succeed");
+            .expect("cluster tablet envelope bootstrap");
+        assert!(sink.tablet_keyspace);
         assert!(sink
             .database()
             .unwrap()
             .catalog_snapshot()
             .live(TABLET_KEYSPACE_TABLE)
             .is_some());
+        // Idempotent re-init.
+        sink.initialize_tablet_keyspace().unwrap();
+        assert!(sink.tablet_keyspace);
     }
 
     #[test]
@@ -3300,8 +3269,9 @@ mod tests {
                 "typed path must surface non-opaque cell types for query"
             );
         }
-        // Production init remains refused even after a successful typed bind.
-        assert!(sink.initialize_tablet_keyspace().is_err());
+        // Cluster envelope bootstrap may coexist with typed bind (split/merge).
+        sink.initialize_tablet_keyspace().expect("envelope ok");
+        assert!(sink.has_typed_user_table());
     }
 
     #[test]

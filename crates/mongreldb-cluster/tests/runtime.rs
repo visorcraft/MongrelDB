@@ -781,7 +781,16 @@ async fn runtime_failure_modes_fail_closed() {
     let control = ExecutionControl::default();
 
     // Starting on an unprovisioned directory fails closed (S2A-001).
-    let config = NodeRuntimeConfig::new(tmp.path().join("unprovisioned"), free_addr());
+    let config = NodeRuntimeConfig {
+        node_data: tmp.path().join("unprovisioned"),
+        security: TransportSecurity::PlaintextForTesting,
+        transport: transport_config(),
+        listen_address: free_addr(),
+        rpc_address: None,
+        peers: Vec::new(),
+        meta: None,
+        timing: Some(fast_timing()),
+    };
     assert!(matches!(
         NodeRuntime::start(config).await,
         Err(RuntimeError::Cluster(

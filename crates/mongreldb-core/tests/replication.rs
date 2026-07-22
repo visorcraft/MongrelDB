@@ -193,10 +193,9 @@ fn bootstrap_incremental_apply_and_read_only_enforcement() {
     let follower = Database::open(&follower_path).unwrap();
     assert!(follower.visible_epoch().0 >= applied_epoch);
     let table = follower.table("items").unwrap();
-    let rows = table
-        .lock()
-        .visible_rows(Snapshot::at(follower.visible_epoch()))
-        .unwrap();
+    // HLC-stamped commits require an HLC-aware (or unbounded) snapshot —
+    // epoch-only Snapshot::at hides HLC versions under P0.5 dual-model rules.
+    let rows = table.lock().visible_rows(Snapshot::unbounded()).unwrap();
     assert_eq!(rows.len(), 2);
     assert_eq!(table.lock().count(), 2);
     assert_eq!(follower.table("extra").unwrap().lock().count(), 1);
