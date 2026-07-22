@@ -426,7 +426,7 @@ jobs:
           mvn -B -ntp package
           # Rename to include platform in the filename.
           mkdir -p ../../../dist
-          cp target/mongreldb-jni-0.64.0.jar ../../../dist/mongreldb-jni-0.64.0-${{ matrix.os }}-${{ matrix.arch }}.jar
+          cp target/mongreldb-jni-0.64.1.jar ../../../dist/mongreldb-jni-0.64.1-${{ matrix.os }}-${{ matrix.arch }}.jar
 
       - uses: actions/upload-artifact@v7
         with:
@@ -466,12 +466,12 @@ jobs:
           cp -r ../../../staging/native/* src/main/resources/native/
           mvn -B -ntp package
           mkdir -p ../../../dist
-          cp target/mongreldb-jni-0.64.0.jar ../../../dist/mongreldb-jni-0.64.0.jar
+          cp target/mongreldb-jni-0.64.1.jar ../../../dist/mongreldb-jni-0.64.1.jar
 
       - uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
-          files: dist/mongreldb-jni-0.64.0.jar
+          files: dist/mongreldb-jni-0.64.1.jar
 
   # Publish the fat JAR (with all bundled native libraries) to Maven Central.
   # Runs after build-jni-fat assembles the fat JAR; re-uses its checkout and
