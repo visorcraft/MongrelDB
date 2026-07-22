@@ -6024,6 +6024,17 @@ fn sql_terminal_idempotency_receipt(
             completed_statements: status.completed_statements,
             statement_index: status.statement_index,
             serialization: serialization_outcome_name(status.serialization_outcome).to_owned(),
+            // Mirrors of the query-status outcome surface (0.64). The HLC is
+            // attached with the core ledger receipt
+            // (`SqlDurableReceipt::attach_commit_receipt`) so the replayed
+            // response and the restored query status report the same stamp.
+            last_commit_hlc: None,
+            serialization_state: Some(
+                serialization_outcome_name(status.serialization_outcome).to_owned(),
+            ),
+            terminal_state: status
+                .terminal_state()
+                .map(|state| terminal_state_name(state).to_owned()),
         },
         terminal_error: status.terminal_error.as_ref().map(|error| {
             sql_idempotency::SqlReceiptTerminalError {
@@ -7407,7 +7418,7 @@ async fn execute_sql(
             let key = idempotency.key().to_owned();
             let binding = idempotency.binding().clone();
             let ttl = idempotency.ttl();
-            receipt.commit_receipt = tokio::task::spawn_blocking(move || {
+            let commit_receipt = tokio::task::spawn_blocking(move || {
                 sql_idempotency::record_core_idempotency_commit(&db, &owner, &key, &binding, ttl)
             })
             .await
@@ -7415,6 +7426,7 @@ async fn execute_sql(
                 eprintln!("[idempotency] core ledger record task failed: {error}");
                 None
             });
+            receipt.attach_commit_receipt(commit_receipt);
         }
         let commit_ts = receipt
             .commit_receipt
@@ -8271,6 +8283,9 @@ mod query_response_tests {
                 completed_statements: 1,
                 statement_index: 0,
                 serialization: "failed".into(),
+                last_commit_hlc: None,
+                serialization_state: None,
+                terminal_state: None,
             },
             terminal_error: Some(sql_idempotency::SqlReceiptTerminalError {
                 code: "SERIALIZATION_FAILED_AFTER_COMMIT".into(),
@@ -8320,6 +8335,9 @@ mod query_response_tests {
                 completed_statements: 1,
                 statement_index: 1,
                 serialization: "failed".into(),
+                last_commit_hlc: None,
+                serialization_state: None,
+                terminal_state: None,
             },
             terminal_error: Some(sql_idempotency::SqlReceiptTerminalError {
                 code: "QUERY_CANCELLED_AFTER_COMMIT".into(),
@@ -8365,6 +8383,9 @@ mod query_response_tests {
                 completed_statements: 1,
                 statement_index: 0,
                 serialization: "succeeded".into(),
+                last_commit_hlc: None,
+                serialization_state: None,
+                terminal_state: None,
             },
             terminal_error: None,
             commit_receipt: None,
@@ -8403,6 +8424,9 @@ mod query_response_tests {
                 completed_statements: 1,
                 statement_index: 0,
                 serialization: "succeeded".into(),
+                last_commit_hlc: None,
+                serialization_state: None,
+                terminal_state: None,
             },
             terminal_error: None,
             commit_receipt: None,

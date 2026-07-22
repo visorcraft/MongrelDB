@@ -5053,22 +5053,18 @@ impl Database {
         for write in writes {
             let op = match write {
                 StagedTxnWrite::Put { table_id, rows } => {
-                    // P0.5: stamp the shared decision HLC onto every staged row
-                    // version so live apply and WAL recovery observe the same
-                    // commit_ts (replicas never allocate a replacement stamp).
-                    let mut decoded: Vec<crate::memtable::Row> = bincode::deserialize(&rows)
-                        .map_err(|e| {
+                    // `Row::commit_ts` is `#[serde(skip)]` (0.63.1 WAL bincode
+                    // layout), so the shared decision HLC cannot ride the Put
+                    // payload. It travels in the trailing `Op::CommitTimestamp`
+                    // record (physical micros) and is restamped onto every row
+                    // version by the apply/recovery path, keeping live apply
+                    // and WAL recovery on the identical stamp.
+                    let decoded: Vec<crate::memtable::Row> =
+                        bincode::deserialize(&rows).map_err(|e| {
                             MongrelError::Other(format!(
                                 "staged txn put rows could not be decoded: {e}"
                             ))
                         })?;
-                    for row in &mut decoded {
-                        // Never stamp HLC::ZERO — that would pin versions under a
-                        // zero snapshot and hide them from product reads (P0.5).
-                        if commit_ts != mongreldb_types::hlc::HlcTimestamp::ZERO {
-                            row.commit_ts = Some(commit_ts);
-                        }
-                    }
                     let stamped = bincode::serialize(&decoded).map_err(|e| {
                         MongrelError::Other(format!("staged txn put rows serialize: {e}"))
                     })?;
@@ -5113,8 +5109,10 @@ impl Database {
 
     /// Apply a committed distributed transaction at a shared `commit_ts`
     /// (P0.5-T4). Replicas must not allocate a local replacement timestamp —
-    /// the caller's decision HLC is stamped into the durable ledger and onto
-    /// every row version recovered from the synthetic WAL records.
+    /// the caller's decision HLC goes into the durable ledger, and every row
+    /// version recovered from the synthetic WAL records is restamped from the
+    /// transaction's `Op::CommitTimestamp` record (physical micros; the WAL
+    /// `Put` payload cannot carry the full HLC under the 0.63.1 layout).
     pub fn apply_committed_transaction(
         &self,
         transaction_id: u64,
@@ -21639,8 +21637,17 @@ mod commit_ts_ledger_tests {
         let row2 = table
             .get(crate::RowId(2), Snapshot::unbounded())
             .expect("applied row 2");
-        assert_eq!(row1.commit_ts, Some(commit_ts));
-        assert_eq!(row2.commit_ts, Some(commit_ts));
+        // The durable WAL `Put` payload does not carry `Row::commit_ts`
+        // (0.63.1 bincode layout); rows are restamped from the txn's
+        // `Op::CommitTimestamp` ledger record, which carries physical micros
+        // only. Both applies must observe that identical recovery form.
+        let recovery_form = mongreldb_types::hlc::HlcTimestamp {
+            physical_micros: commit_ts.physical_micros,
+            logical: 0,
+            node_tiebreaker: 0,
+        };
+        assert_eq!(row1.commit_ts, Some(recovery_form));
+        assert_eq!(row2.commit_ts, Some(recovery_form));
         assert_eq!(row1.commit_ts, row2.commit_ts);
         drop(table);
         // Latest applied epoch's ledger entry matches the shared decision HLC

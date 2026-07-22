@@ -449,13 +449,14 @@ impl NativeRuntime {
             return;
         };
         if let Some(mut receipt) = super::sql_terminal_idempotency_receipt(&status) {
-            receipt.commit_receipt = crate::sql_idempotency::record_core_idempotency_commit(
+            let commit_receipt = crate::sql_idempotency::record_core_idempotency_commit(
                 &self.db,
                 execution.owner(),
                 execution.key(),
                 execution.binding(),
                 execution.ttl(),
             );
+            receipt.attach_commit_receipt(commit_receipt);
             execution.commit(receipt);
         } else if super::can_abort_idempotency_intent(&status) {
             execution.abort();

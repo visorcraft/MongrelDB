@@ -45,6 +45,17 @@ pub(crate) struct SqlReceiptOutcome {
     pub(crate) completed_statements: usize,
     pub(crate) statement_index: usize,
     pub(crate) serialization: String,
+    /// Additive (0.64 client surface): mirrors the query-status outcome
+    /// fields so a replayed receipt's `outcome` is byte-for-byte the same
+    /// shape the status endpoint reports. `serde(default, skip_serializing_if)`
+    /// keeps the byte form of pre-existing receipts identical so their
+    /// authentication tags still verify.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) last_commit_hlc: Option<mongreldb_types::hlc::HlcTimestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) serialization_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) terminal_state: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,6 +124,21 @@ pub(crate) struct SqlDurableReceipt {
     /// authentication tags still verify.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) commit_receipt: Option<SqlCommitReceipt>,
+}
+
+impl SqlDurableReceipt {
+    /// Attach the core ledger's commit receipt (S1B-005) and mirror its HLC
+    /// into the outcome's `last_commit_hlc`. The replay restore sources the
+    /// status surface's commit timestamp from this same receipt, so the
+    /// replayed response `outcome` and the query-status `outcome` carry the
+    /// identical stamp.
+    pub(crate) fn attach_commit_receipt(&mut self, commit_receipt: Option<SqlCommitReceipt>) {
+        self.outcome.last_commit_hlc = commit_receipt
+            .as_ref()
+            .map(SqlCommitReceipt::commit_ts)
+            .filter(|ts| *ts != mongreldb_types::hlc::HlcTimestamp::ZERO);
+        self.commit_receipt = commit_receipt;
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1108,6 +1134,9 @@ mod tests {
                 completed_statements: 1,
                 statement_index: 0,
                 serialization: "succeeded".into(),
+                last_commit_hlc: None,
+                serialization_state: Some("succeeded".into()),
+                terminal_state: Some("committed".into()),
             },
             terminal_error: None,
             commit_receipt: None,

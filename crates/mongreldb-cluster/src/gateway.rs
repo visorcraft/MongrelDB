@@ -418,7 +418,7 @@ pub fn parse_admin_sql(sql: &str) -> Result<Option<AdminCommand>, GatewayError> 
 
     // SHOW ...
     if upper.starts_with("SHOW ") {
-        return parse_show(&tokens).map(Some);
+        return parse_show(&tokens);
     }
     // ALTER NODE DRAIN ...
     if upper.starts_with("ALTER NODE DRAIN") {
@@ -451,14 +451,14 @@ pub fn parse_admin_sql(sql: &str) -> Result<Option<AdminCommand>, GatewayError> 
     Ok(None)
 }
 
-fn parse_show(tokens: &[&str]) -> Result<AdminCommand, GatewayError> {
+fn parse_show(tokens: &[&str]) -> Result<Option<AdminCommand>, GatewayError> {
     let kind = tokens
         .get(1)
         .ok_or_else(|| GatewayError::InvalidAdminSql("SHOW requires a target".into()))?
         .to_ascii_uppercase();
     match kind.as_str() {
-        "CLUSTER" => Ok(AdminCommand::ShowCluster),
-        "NODES" => Ok(AdminCommand::ShowNodes),
+        "CLUSTER" => Ok(Some(AdminCommand::ShowCluster)),
+        "NODES" => Ok(Some(AdminCommand::ShowNodes)),
         "TABLETS" => {
             let table = if tokens.len() >= 4 && tokens[2].eq_ignore_ascii_case("FOR") {
                 if !tokens[3].eq_ignore_ascii_case("TABLE") {
@@ -470,7 +470,7 @@ fn parse_show(tokens: &[&str]) -> Result<AdminCommand, GatewayError> {
             } else {
                 None
             };
-            Ok(AdminCommand::ShowTablets { table })
+            Ok(Some(AdminCommand::ShowTablets { table }))
         }
         "REPLICAS" => {
             let tablet_id = if tokens.len() >= 4 && tokens[2].eq_ignore_ascii_case("FOR") {
@@ -483,25 +483,25 @@ fn parse_show(tokens: &[&str]) -> Result<AdminCommand, GatewayError> {
             } else {
                 None
             };
-            Ok(AdminCommand::ShowReplicas { tablet_id })
+            Ok(Some(AdminCommand::ShowReplicas { tablet_id }))
         }
-        "TRANSACTIONS" => Ok(AdminCommand::ShowTransactions),
-        "QUERIES" => Ok(AdminCommand::ShowQueries),
-        "JOBS" => Ok(AdminCommand::ShowJobs),
+        "TRANSACTIONS" => Ok(Some(AdminCommand::ShowTransactions)),
+        "QUERIES" => Ok(Some(AdminCommand::ShowQueries)),
+        "JOBS" => Ok(Some(AdminCommand::ShowJobs)),
         "RESOURCE" => {
             if tokens
                 .get(2)
                 .is_some_and(|t| t.eq_ignore_ascii_case("GROUPS"))
             {
-                Ok(AdminCommand::ShowResourceGroups)
+                Ok(Some(AdminCommand::ShowResourceGroups))
             } else {
                 Err(GatewayError::InvalidAdminSql("SHOW RESOURCE GROUPS".into()))
             }
         }
-        "BACKUPS" => Ok(AdminCommand::ShowBackups),
-        other => Err(GatewayError::InvalidAdminSql(format!(
-            "unknown SHOW target {other}"
-        ))),
+        "BACKUPS" => Ok(Some(AdminCommand::ShowBackups)),
+        // Not an admin target: ordinary SQL SHOW (SHOW TABLES, SHOW COLUMNS,
+        // ...) falls through to the normal SQL path.
+        _ => Ok(None),
     }
 }
 
@@ -836,6 +836,9 @@ mod tests {
             parse_admin_sql("SHOW CLUSTER").unwrap(),
             Some(AdminCommand::ShowCluster)
         );
+        // Ordinary SQL SHOW targets are not admin SQL: they fall through to
+        // the normal SQL path (DataFusion handles SHOW TABLES).
+        assert_eq!(parse_admin_sql("SHOW TABLES").unwrap(), None);
         assert_eq!(
             parse_admin_sql("show nodes;").unwrap(),
             Some(AdminCommand::ShowNodes)
