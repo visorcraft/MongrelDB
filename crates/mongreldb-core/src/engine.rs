@@ -3711,9 +3711,9 @@ impl Table {
         let tombstone = Row {
             row_id,
             committed_epoch: epoch,
-            commit_ts,
             columns: std::collections::HashMap::new(),
             deleted: true,
+            commit_ts,
         };
         self.memtable.upsert(tombstone);
         self.pk_by_row.remove(&row_id);
@@ -5797,9 +5797,9 @@ impl Table {
                     Row {
                         row_id: *row_id,
                         committed_epoch: snapshot.epoch,
-                        commit_ts: None,
                         columns: std::collections::HashMap::new(),
                         deleted: false,
+                        commit_ts: None,
                     },
                 )
             })

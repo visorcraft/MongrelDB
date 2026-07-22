@@ -968,9 +968,9 @@ mod spilled_wal_encoding_tests {
             .map(|row_id| crate::memtable::Row {
                 row_id: crate::rowid::RowId(row_id),
                 committed_epoch: Epoch::ZERO,
-                commit_ts: None,
                 columns: [(1, Value::Bytes(vec![0; 64]))].into_iter().collect(),
                 deleted: false,
+                commit_ts: None,
             })
             .collect::<Vec<_>>();
         let mut total = 0;
@@ -6860,13 +6860,13 @@ impl Database {
                     let row = crate::memtable::Row {
                         row_id: hit.row_id,
                         committed_epoch: crate::Epoch(0),
-                        commit_ts: None,
                         columns: hit
                             .cells
                             .iter()
                             .cloned()
                             .collect::<std::collections::HashMap<u16, crate::Value>>(),
                         deleted: false,
+                        commit_ts: None,
                     };
                     let mut rows = self.secure_rows_for(table_name, vec![row], principal)?;
                     if let Some(mut row) = rows.pop() {

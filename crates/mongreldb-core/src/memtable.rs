@@ -126,16 +126,23 @@ impl Value {
 }
 
 /// One logical row held in the memtable. A `deleted` row is a tombstone.
+///
+/// Field order of the **bincode WAL `Put` payload** is fixed as
+/// `(row_id, committed_epoch, columns, deleted)` — the 0.63.1 layout.
+/// [`Self::commit_ts`] is in-memory only (`#[serde(skip)]`); durable HLC for
+/// WAL recovery is `Op::CommitTimestamp`, and sorted runs use the
+/// `SYS_COMMIT_TS` system column (with its own legacy-compatible path).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Row {
     pub row_id: RowId,
     pub committed_epoch: Epoch,
-    /// Optional HLC stamp (P0.5 dual-model). Always encoded for bincode WAL
-    /// payloads — do not use `skip_serializing_if` (non-self-describing format).
-    #[serde(default)]
-    pub commit_ts: Option<mongreldb_types::hlc::HlcTimestamp>,
     pub columns: HashMap<u16, Value>,
     pub deleted: bool,
+    /// Optional HLC stamp (P0.5 dual-model). Not encoded in WAL `Put` bincode
+    /// payloads — see struct-level docs. Kept last so call sites and future
+    /// wire evolution treat the 0.63.1 fields as the stable prefix.
+    #[serde(skip)]
+    pub commit_ts: Option<mongreldb_types::hlc::HlcTimestamp>,
 }
 
 impl Row {
@@ -143,9 +150,9 @@ impl Row {
         Self {
             row_id,
             committed_epoch,
-            commit_ts: None,
             columns: HashMap::new(),
             deleted: false,
+            commit_ts: None,
         }
     }
 
@@ -157,9 +164,9 @@ impl Row {
         Self {
             row_id,
             committed_epoch,
-            commit_ts: Some(commit_ts),
             columns: HashMap::new(),
             deleted: false,
+            commit_ts: Some(commit_ts),
         }
     }
 
@@ -231,9 +238,9 @@ impl Memtable {
         let row = Row {
             row_id,
             committed_epoch: epoch,
-            commit_ts: None,
             columns,
             deleted: true,
+            commit_ts: None,
         };
         self.upsert(row);
     }
@@ -565,6 +572,57 @@ mod tests {
         let (_, row) = m.get_version_at(RowId(1), snap).expect("visible");
         assert_eq!(row.columns.get(&1), Some(&Value::Int64(1)));
         assert_eq!(row.commit_ts, Some(early));
+    }
+
+    /// WAL `Put` payloads must keep the 0.63.1 bincode layout
+    /// `(row_id, committed_epoch, columns, deleted)`. `commit_ts` is
+    /// in-memory only (`#[serde(skip)]`) so a 0.63.1-shaped blob still opens.
+    #[test]
+    fn wal_put_row_bincode_matches_0_63_1_layout() {
+        use mongreldb_types::hlc::HlcTimestamp;
+        use serde::{Deserialize, Serialize};
+
+        #[derive(Serialize, Deserialize)]
+        struct LegacyRow {
+            row_id: RowId,
+            committed_epoch: Epoch,
+            columns: HashMap<u16, Value>,
+            deleted: bool,
+        }
+
+        let legacy = LegacyRow {
+            row_id: RowId(7),
+            committed_epoch: Epoch(3),
+            columns: [(1, Value::Int64(42))].into_iter().collect(),
+            deleted: false,
+        };
+        let bytes = bincode::serialize(&legacy).expect("legacy encode");
+
+        let decoded: Row = bincode::deserialize(&bytes).expect("0.63.1 payload must decode");
+        assert_eq!(decoded.row_id, RowId(7));
+        assert_eq!(decoded.committed_epoch, Epoch(3));
+        assert_eq!(decoded.columns.get(&1), Some(&Value::Int64(42)));
+        assert!(!decoded.deleted);
+        assert!(decoded.commit_ts.is_none());
+
+        // Round-trip through Row: commit_ts is not on the wire.
+        let stamped = HlcTimestamp {
+            physical_micros: 1_700_000_000_000,
+            logical: 2,
+            node_tiebreaker: 9,
+        };
+        let mut live = Row::new_with_hlc(RowId(7), Epoch(3), stamped);
+        live.columns.insert(1, Value::Int64(42));
+        let wire = bincode::serialize(&live).expect("row encode");
+        assert_eq!(
+            wire, bytes,
+            "WAL Put encoding must match the 0.63.1 four-field layout"
+        );
+        let again: Row = bincode::deserialize(&wire).expect("row decode");
+        assert!(
+            again.commit_ts.is_none(),
+            "commit_ts is restored from Op::CommitTimestamp, not the Put blob"
+        );
     }
 
     #[test]

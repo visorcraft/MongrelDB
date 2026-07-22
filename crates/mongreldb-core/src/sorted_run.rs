@@ -2134,9 +2134,9 @@ impl RunVisibleVersionCursor {
         Ok(Row {
             row_id: version.row_id,
             committed_epoch: version.committed_epoch,
-            commit_ts,
             columns,
             deleted: version.deleted,
+            commit_ts,
         })
     }
 }
@@ -3008,9 +3008,9 @@ impl RunReader {
         Ok(Row {
             row_id,
             committed_epoch,
-            commit_ts,
             columns,
             deleted,
+            commit_ts,
         })
     }
 
@@ -3924,9 +3924,9 @@ impl RunReader {
         Ok(Row {
             row_id,
             committed_epoch: epoch,
-            commit_ts,
             columns,
             deleted,
+            commit_ts,
         })
     }
 
@@ -3995,9 +3995,9 @@ impl RunReader {
             rows.push(Row {
                 row_id,
                 committed_epoch: epoch,
-                commit_ts,
                 columns,
                 deleted,
+                commit_ts,
             });
         }
         Ok(rows)

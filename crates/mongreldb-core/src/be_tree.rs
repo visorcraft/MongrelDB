@@ -50,9 +50,9 @@ impl Message {
                 Row {
                     row_id: *row_id,
                     committed_epoch: *epoch,
-                    commit_ts: None,
                     columns: HashMap::new(),
                     deleted: true,
+                    commit_ts: None,
                 },
             ),
         }
@@ -228,9 +228,9 @@ impl BeTree {
             Message::Tombstone { row_id, epoch } => Row {
                 row_id,
                 committed_epoch: epoch,
-                commit_ts: None,
                 columns: HashMap::new(),
                 deleted: true,
+                commit_ts: None,
             },
         };
         let i = rows.partition_point(|r| (r.row_id, r.committed_epoch) < key);

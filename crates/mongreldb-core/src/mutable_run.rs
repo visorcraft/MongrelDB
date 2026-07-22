@@ -260,9 +260,9 @@ mod tests {
         Row {
             row_id: RowId(id),
             committed_epoch: Epoch(epoch),
-            commit_ts: None,
             columns: std::collections::HashMap::new(),
             deleted: true,
+            commit_ts: None,
         }
     }
 
